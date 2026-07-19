@@ -7,8 +7,8 @@ knobs, scoring, recall) is in
 
 The stored vector column is the source of truth; ANN indexes are derived,
 per-segment aux overlays behind an engine seam. Exact flat KNN, cosine
-raw-column normalization, full-precision rescoring, and rebuilds all read or
-regenerate from the column.
+raw-column normalization, full-precision rescoring, and creation of missing
+overlays all read or regenerate from the column.
 
 ## Overlay Lifecycle
 
@@ -38,9 +38,10 @@ whole selected commit. If any requested vector build fails, staged overlay
 files are deleted and no partial vector overlay entries are retained for a
 later plain commit to publish.
 
-Rebuilding with new options does not require reindexing documents: drop the
-segment overlay entry and run a selected commit to rebuild from the stored
-vector column.
+Rebuilding does not require document reindexing at the storage level, but the
+current public API cannot remove an existing per-segment overlay. The writer
+has an internal drop/rebuild seam; exposing a safe collection-level rebuild is
+future work.
 
 ## Build Policy
 

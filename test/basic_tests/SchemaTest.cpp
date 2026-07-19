@@ -401,6 +401,13 @@ TEST_F(SchemaTest, directPropertyTypeValidation) {
   }
   {
     SchemaBuilder b;
+    auto& f = b.field("title");
+    f.type = FieldClass::TEXT;
+    f.column = true;  // the full-text handler does not write a value column
+    EXPECT_THROW(b.build(), SchemaError);
+  }
+  {
+    SchemaBuilder b;
     auto& f = b.field("vec");
     f.type = FieldClass::VECTOR;
     f.dims = -1;

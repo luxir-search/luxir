@@ -2,8 +2,16 @@
 
 Solux speaks plain JSON over HTTP. Start the server, `curl` a document in,
 `curl` a search out. There is no schema to define up front, no client library
-to install, and no cluster to stand up first. This page gets you from nothing
-to a working search in a few commands.
+to install, and no cluster to stand up first. Once the source build is ready,
+this page gets you to a working search in a few commands.
+
+## Get Solux
+
+Solux is currently a source preview, not a packaged binary or container. Its
+presets assume a prepared Linux/GCC/vcpkg development environment; the current
+setup and its limitations are in [Build Setup](../dev/build-setup.md). The
+release result is `build/gcc-release/bin/solux`. The commands below assume that
+binary is on your `PATH`.
 
 ## Start the server
 
@@ -24,12 +32,16 @@ Check it's alive:
 curl http://localhost:9400/health
 ```
 
-## Index your first document
+## Index documents
 
 ```bash
 curl -X POST http://localhost:9400/collections/main/_update \
   -H 'Content-Type: application/json' \
-  -d '{"docs":[{"id":"1","title_w":"the left hand of darkness","author_s":"Le Guin","year_i":1969}],"commit":{}}'
+  -d '{"docs":[
+        {"id":"1","title_w":"the left hand of darkness","author_s":"Le Guin","year_i":1969},
+        {"id":"2","title_w":"a wizard of earthsea","author_s":"Le Guin"},
+        {"id":"3","title_w":"the dispossessed","author_s":"Le Guin","year_i":1974}
+      ],"commit":{}}'
 ```
 
 ```json
@@ -52,7 +64,7 @@ later when you want control - you do not need one to start.
 
 ```
 POST /collections/main/_query
-{"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"]}
+{"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
 ```
 
 ```json
@@ -66,9 +78,9 @@ object never carries `null` placeholders, so what you see is exactly what the
 document has.
 
 Prefer a uniform shape instead? Add `"document_format": "columns"` to the
-request and every requested field appears in every doc, with an explicit
-`null` where the document has no value - handy when feeding rows into a
-table. (Over gRPC, responses are natively columnar; this setting picks the
+request and every supported projected field appears in every doc, with an
+explicit `null` where the document has no value - handy when feeding rows into
+a table. (Over gRPC, responses are natively columnar; this setting picks the
 placement there too.)
 
 ### Counts are exact
@@ -106,9 +118,8 @@ POST /collections/main/_query
 
 When you're the one writing the query, a bare string anywhere a query object
 goes is an expression in the [Solux query language](query-language.md):
-fielded terms, AND/OR/NOT, ranges, and a function form that reaches every
-query type. Unlike `simple_query`, malformed input is a parse error, not a
-guess:
+fielded terms, AND/OR/NOT, ranges, and function forms for most structured query
+types. Unlike `simple_query`, malformed input is a parse error, not a guess:
 
 ```
 POST /collections/main/_query
@@ -130,8 +141,8 @@ arrives, without buffering the whole thing:
 
 ```
 POST /collections/main/_update      (Content-Type: application/x-ndjson)
-{"id": "2", "title_w": "a wizard of earthsea"}
-{"id": "3", "title_w": "the dispossessed"}
+{"id": "4", "title_w": "the lathe of heaven", "author_s": "Le Guin", "year_i": 1971}
+{"id": "5", "title_w": "always coming home", "author_s": "Le Guin", "year_i": 1985}
 {"_end_": {"commit": {}}}
 ```
 
@@ -162,14 +173,16 @@ POST /collections/main/_query?format=docs
 {"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}
 ```
 
-```json
+```ndjson
 {"id":"1","title_w":"the left hand of darkness"}
 {"id":"2","title_w":"a wizard of earthsea"}
 {"id":"3","title_w":"the dispossessed"}
+{"id":"4","title_w":"the lathe of heaven"}
+{"id":"5","title_w":"always coming home"}
 ```
 
 Ask for `get_number` and a `_header_` line leads the stream so tools know the
-total up front: `{"_header_":{"found":3}}`. Execution warnings, when there are
+total up front: `{"_header_":{"found":5}}`. Execution warnings, when there are
 any, also arrive in a `_header_` - degraded execution is never silent. Header
 lines are recognized (and skipped) by ingest, so export pipes straight back
 into `/_update`:
@@ -209,16 +222,18 @@ POST /collections/books/_query
 {"found":1,"docs":[{"id":"a"}]}
 ```
 
-The same server holds as many collections as you like, each fully isolated.
-(Auto-create is on by default; set `--no-ingest.auto-create-collection` if you'd
-rather a write to an unknown collection be rejected.)
+The same server holds multiple collections as independent index namespaces.
+They share the process scheduler and memory, and Solux does not currently
+provide per-collection tenant quotas or authorization boundaries. Auto-create
+is on by default; set `--no-ingest.auto-create-collection` if a write to an
+unknown collection should be rejected.
 
 ## Committing
 
 Changes become visible on commit. You have three ways, use whichever fits:
 
 - In a JSON update body: `"commit": {}`.
-- On the URL: `POST /collections/main/_update?commit=true`.
+- On an NDJSON request URL: `POST /collections/main/_update?commit=true`.
 - At the end of a stream: `{"_end_": {"commit": {}}}`.
 
 ## See what the server understood
@@ -240,4 +255,12 @@ you expect.
 
 ## Where to go next
 
+- [Documents and values](documents.md) - field naming, IDs, nulls, arrays, and coercion.
+- [Indexing](indexing.md) - update, delete, commit, error, and stream semantics.
+- [Searching](searching.md) - request and response shapes, filters, ops, and metrics.
+- [Structured queries](query-reference.md) - every query arm and option.
+- [Faceting](faceting.md) - field facets, range facets, and nested analytics.
 - [Vector search](vector-search.md) - dense-vector and hybrid retrieval.
+- [Geo search](geo-search.md) - bounding boxes and distance queries.
+- [HTTP conventions](http-api.md) - framing, validation, and error behavior.
+- [Operating Solux](operations.md) - persistence, resource controls, and security.

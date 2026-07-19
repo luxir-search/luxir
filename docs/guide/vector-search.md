@@ -10,13 +10,179 @@ This page is the user-visible contract: how ANN indexes get built, the query
 knobs, score semantics, and recall. For how it works inside the engine, see
 [design/vector-search.md](../design/vector-search.md).
 
-## Indexing
+## Define a vector field
+
+The default `_v` suffix recognizes a vector value, but it is storage-only until
+a similarity metric is selected. Define dimensions and a metric explicitly for
+a searchable field:
+
+```bash
+curl http://localhost:9400/collections/books/_schema -d '{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 3,
+      "metric": "cosine"
+    }
+  }
+}'
+```
+
+Supported metrics are `l2`, `ip` (inner product), and `cosine`. A positive
+`dims` rejects wrong-sized values at ingest; when dimensions are omitted, the
+first vector in each segment establishes them. Explicit dimensions are easier
+to operate because a bad producer fails immediately against a collection-wide
+contract.
+
+## Index vectors through typed gRPC values
+
+Document vectors currently require the typed protobuf `Val.vec` arm. A bare
+array inside an HTTP document is decoded as a generic numeric array and is not
+promoted to `Vector`, so HTTP vector ingest is not implemented yet. kNN query
+vectors over HTTP do work because `KnnQuery.query` has a statically known vector
+type.
+
+The protobuf text shape of a row update is:
+
+```proto
+collection { name: "books" }
+docs {
+  fields { key: "id" value { s: "b1" } }
+  fields { key: "title_w" value { s: "dune" } }
+  fields { key: "kind_s" value { s: "fiction" } }
+  fields {
+    key: "embedding_v"
+    value { vec { f32 { v: 0.8 v: 0.1 v: 0.1 } } }
+  }
+}
+commit {}
+```
+
+Generated clients construct the same `UpdateRequest` and send it through
+`Indexer.Update` or `Indexer.UpdateStream`. Set `multi: true` for several
+vectors per document and populate `Val.arr_vec` with several `Vector.f32`
+values. Search collapses them to one hit per document using that document's
+best similarity.
+
+## Query vectors
+
+```http
+POST /collections/books/_query
+
+{
+  "query": {
+    "knn": {
+      "field":"embedding_v",
+      "query":[0.75,0.15,0.10],
+      "k":20
+    }
+  },
+  "limit":10,
+  "get_scores":true,
+  "fields":["id","title_w"]
+}
+```
+
+`k` is the number of nearest-neighbor documents produced by the query node;
+the surrounding `top_docs.limit` controls how many are returned. With no ANN
+overlay, or with `exact: true`, the engine scans the full-precision vector
+column. Once an ANN overlay exists, the default path may use it segment by
+segment and then rescore candidates from the full-precision column.
+
+## Filter inside kNN
+
+Put ordinary named filters on the same `top_docs` operation:
+
+```json
+{
+  "query": {
+    "knn": {
+      "field":"embedding_v",
+      "query":[0.75,0.15,0.10],
+      "k":20
+    }
+  },
+  "filter":[{"name":"fiction","query":"kind_s:fiction"}],
+  "limit":20,
+  "fields":["id","title_w"]
+}
+```
+
+The filter is part of vector candidate search, not a post-pass over an
+unfiltered top 20. When enough matching documents exist and the ANN search can
+reach them within its effort cap, `k: 20` means 20 filtered neighbors rather
+than 20 minus whatever a later filter discarded. Adaptive `nprobe` can deepen
+automatically when filters or multi-value collapse underfill the result.
+
+## Hybrid search with RRF
+
+Reciprocal rank fusion combines independently ranked sources without forcing
+BM25 and vector similarity onto an invented common score scale:
+
+```http
+POST /collections/books/_query
+
+{
+  "ops": {
+    "hybrid": {
+      "fusion": {
+        "sources": {
+          "lexical": {
+            "query": {"match":{"title_w":"dune"}},
+            "limit": 100
+          },
+          "semantic": {
+            "query": {
+              "knn": {
+                "field":"embedding_v",
+                "query":[0.75,0.15,0.10],
+                "k":100
+              }
+            },
+            "limit": 100
+          }
+        },
+        "filter": [{"name":"fiction","query":"kind_s:fiction"}],
+        "rrf": {"k":60},
+        "limit": 10,
+        "get_scores": true,
+        "fields": ["id","title_w"]
+      }
+    }
+  }
+}
+```
+
+For document `d`, RRF computes `sum(1 / (k + rank))` over sources containing
+`d`, with ranks starting at one. The fusion-level filter is shared by every
+source and computed once per segment. A source may add its own `filter`; the
+shared and source-specific filters are ANDed. Source `query`, `filter`, `sorts`,
+and `limit` define its ranking; response-shape fields belong on the fusion.
+Fusion-level sub-ops are not implemented, so its `ops` map must be empty.
+
+RRF source limits are candidate-pool decisions. A document outside a source's
+limit cannot contribute from that source, so choose pools large enough for the
+recall required by the final fused `limit`.
+
+## Build ANN overlays
 
 ANN aux indexes are built at commit time, when `build_aux_indexes` on the
 commit selects a vector field or `"*"`. Plain commits without vector selectors
 never build them. Once a segment has a vector aux index, it follows the
 segment: later commits carry it forward, and delete-only commits keep it
 (deleted documents' vectors are filtered out at query time).
+
+Build every eligible missing vector overlay while committing:
+
+```json
+{"commit":{"build_aux_indexes":["*"]}}
+```
+
+Or select one overlay by its `vec.` name:
+
+```json
+{"commit":{"build_aux_indexes":["vec.embedding_v"]}}
+```
 
 A commit whose aux build fails has no side effects: nothing partial is
 published, and the caller sees the error and decides whether to retry.
@@ -32,9 +198,10 @@ the vector fields being built, when it passes the same size thresholds. If a
 merge-time build fails, the merged segment is published without the aux index
 and that field is served by exact scan until a later explicit build succeeds.
 
-Rebuilding with new options does not require reindexing documents: drop the
-segment's aux index entry and run a selected commit to rebuild from the stored
-vector column.
+There is no public command to remove or rebuild an overlay that already exists
+on a segment. New and merged segments build from their full-precision vector
+columns; an existing segment without an overlay can receive one through a later
+selected commit.
 
 ## Querying
 
@@ -92,7 +259,8 @@ vectors.
 Cosine fields normalize on write by default (`normalize_on_write=true`), so
 reading the vector column back returns the unit vector, not necessarily the
 originally submitted bytes. Zero and near-zero cosine vectors are skipped at
-index time with a warning, since they have no direction. If a cosine field
+index time, since they have no direction; this is currently reported only as a
+server-log warning, not in the update response. If a cosine field
 sets `normalize_on_write=false`, the stored column keeps the raw submitted
 vectors (exact retrieval) and candidate rescoring normalizes the stored vector
 at query time instead.
@@ -115,5 +283,6 @@ calibrated per deployment, not carried between models.
 - IVF+PQ is the only ANN index type. No HNSW yet.
 - Filters are always applied inside the vector search. There is no cost-based
   choice yet between filtered ANN search and exact search over the filtered
-  set, and no automatic exact fallback when a selective filter starves the
-  ANN search.
+  set, and no automatic exact fallback when a selective filter still starves
+  the ANN search after breadth deepening. Use `exact: true` when exact filtered
+  top-k is the required contract.

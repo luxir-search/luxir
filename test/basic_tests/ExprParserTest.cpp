@@ -604,7 +604,8 @@ TEST_F(ExprParserTest, functionErrors) {
                  "unknown query function 'geo_distance'");
   expectContains(parseErr("match(x, min_match=abc)"), "expects a number");
   expectContains(parseErr("match(x, operator=XOR)"), "expects AND or OR");
-  expectContains(parseErr("knn(field=status, query=[1,2])"), "cannot express");
+  expectContains(parseErr("knn(field=status, query=[1,2])"),
+                 "unknown query function 'knn'");
   expectContains(parseErr("match(a"), "unterminated match(...) call");
   expectContains(parseErr("simple_query(x, fields=title)"), "expects a list");
 }

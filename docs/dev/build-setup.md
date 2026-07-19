@@ -1,41 +1,147 @@
 # Build Setup
 
-Detailed build/environment notes. For the common build and test commands, see CLAUDE.md.
+Detailed build and environment notes for a source checkout.
+
+Solux does not yet have a packaged binary, container image, or turnkey
+clean-machine installer. The checked-in presets describe the current developer
+environment rather than a portable distribution: Linux/x86-64, GCC, and vcpkg
+roots at `/opt/vcpkg` (plus `/opt/vcpkg_asan` for ASan). The commands below are
+the reproducible shape of that environment, but vcpkg itself and the compiler
+snapshot are not pinned by this repository yet.
 
 ## Development Requirements
 
-- C++23 compatible compiler (GCC or Clang)
-- CMake 3.16+
+- C++26-capable GCC and matching libstdc++; the currently verified environment
+  uses a GCC 16 development snapshot
+- CMake 3.25+ (the preset file uses schema version 6) and Ninja
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
 - Host tools: pkg-config and gfortran matching the selected GCC major version
-- Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog
+- Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog, CLI11,
+  LZ4, FAISS, glaze, GTL, GoogleTest, and Google Benchmark. The compiler
+  supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
 
-Before installing vcpkg packages, run `deps/make_deps.sh` (idempotent): it
-fetches the pinned simdcomp sources, applies Solux's local patches to the
-vcpkg roots (triplet compile flags, FAISS SIMD opt level) and to simdcomp,
-and builds the simdcomp static libs. Then install packages per
-[deps/README.txt](../../deps/README.txt). `deps/apply_patches.sh` is the
-patch-application step on its own.
+The build uses `-march=native`; a release binary is intended for the machine
+class on which its dependencies and Solux itself were built.
 
-The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker (mold), and a
-precompiled header are auto-enabled by CMakeLists.txt. Each preset builds into its own
-`build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`.
+## Prepare a checkout
 
-Presets: gcc/clang x debug/release x +/-asan = 8 presets. Always use the **gcc** presets;
-FAISS/OpenMP are only installed in the gcc vcpkg repos. The clang presets are disabled unless
-`SOLUX_ENABLE_CLANG=1`.
+Initialize the code-generation submodule first:
+
+```bash
+git submodule update --init
+```
+
+Install or clone vcpkg at `/opt/vcpkg` and bootstrap it. The absolute path is
+part of the current GCC presets:
+
+```bash
+sudo git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg
+sudo chown -R "$(id -un):$(id -gn)" /opt/vcpkg
+/opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+```
+
+Run Solux's dependency setup before installing packages. It fetches pinned
+FastPFOR and applies the required triplet and FAISS patches to the vcpkg root:
+
+```bash
+./deps/make_deps.sh /opt/vcpkg
+```
+
+Then install the current vcpkg set:
+
+```bash
+cd /opt/vcpkg
+./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark \
+  xxhash gtl protobuf grpc spdlog lz4 cli11 faiss glaze
+```
+
+On Ubuntu, the remaining host packages include TBB, pkg-config, Ninja, and a
+Fortran compiler whose major matches GCC:
+
+```bash
+sudo apt install libtbb-dev pkg-config ninja-build "gfortran-$(gcc -dumpversion)"
+```
+
+See [deps/README.txt](../../deps/README.txt) for why the local vcpkg patches and
+the matching Fortran compiler are correctness requirements, not optional
+tuning. A clean-machine setup can still require adjustment as upstream vcpkg
+ports move; this is the principal source-distribution gap today.
+
+The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker
+(mold), and a precompiled header are used when available. Each preset builds
+into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`.
+
+Use the GCC presets. The Clang presets are disabled unless
+`SOLUX_ENABLE_CLANG=1`, and the current FAISS/OpenMP dependency roots are not
+prepared for them.
 
 ## Fresh checkout / after `rm -rf build/`
 
-Generated protobuf headers (`build/<preset>/protos/*.pb.h`) only exist after a build, and
-IDE code insight (CLion uses clangd) parses the real sources that `#include` them. So on a
-fresh checkout or after deleting `build/`: configure the preset (CLion does this automatically
-on load), then **build once** to generate them, otherwise clangd reports the generated headers
-as missing. Each preset you open in the IDE needs its own one-time build. The repo-root
-`.clangd` makes clangd ignore the GCC precompiled header (it cannot read a `.gch`); the
-gcc/ninja build still uses the PCH normally.
+Generated API and descriptor headers only exist after a build, and IDE code
+insight parses sources that include them. On a fresh checkout or after deleting
+`build/`, configure and build once before treating missing generated headers as
+an IDE problem. Each preset needs its own initial generation. The repo-root
+`.clangd` makes clangd ignore the GCC precompiled header; the GCC/Ninja build
+still uses the PCH normally.
 
 Delete any non-preset CLion "Debug" profile -- it has no vcpkg toolchain and will fail.
+
+## Build and test
+
+Use the non-ASan debug build for normal iteration:
+
+```bash
+cmake --preset gcc-debug
+cmake --build --preset gcc-debug
+./build/gcc-debug/bin/solux_test
+```
+
+Build the optimized server with:
+
+```bash
+cmake --preset gcc-release
+cmake --build --preset gcc-release
+./build/gcc-release/bin/solux
+```
+
+Before committing memory-sensitive work, run the ASan build:
+
+The ASan presets use a separate `/opt/vcpkg_asan` root whose dependencies must
+also be built with ASan. Clone and bootstrap a second vcpkg tree, rerun
+`deps/make_deps.sh /opt/vcpkg /opt/vcpkg_asan`, and install the same package set
+there before configuring the preset. See `deps/README.txt` for the required
+instrumented triplet.
+
+```bash
+cmake --preset gcc-debug-asan
+cmake --build --preset gcc-debug-asan
+ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/solux_test
+```
+
+The binaries for every preset are under `build/<preset>/bin/`.
+
+## Measure on your workload
+
+Solux does not yet publish a portable performance envelope. Hardware, corpus,
+query mix, vector model, and requested exactness all materially change the
+result, so evaluate the release build on representative inputs.
+
+The built-in benchmark mode creates production-scale corpora and can take
+substantial setup time and memory:
+
+```bash
+ulimit -v 32000000
+./build/gcc-release/bin/solux_test --bench --benchmark_filter='-BM_Vector'
+```
+
+The negative filter excludes the slow vector families. For a quick path/code
+coverage pass over the small unit-test corpus, use:
+
+```bash
+./build/gcc-debug/bin/solux_test --gtest_filter='Benchmarks.all'
+```
+
+Treat those as harnesses, not published comparative results.
 
 ## Time-zone database at runtime
 
@@ -45,3 +151,6 @@ zones only. The loaded tzdb version is logged at startup. Keep the zoneinfo
 data and the C++ runtime consistent across a fleet: identical tzdb version
 strings do not guarantee identical transition decoding across different
 parser implementations.
+
+See [Operating Solux](../guide/operations.md) for persistence, ports, security,
+and resource controls after the binary is built.

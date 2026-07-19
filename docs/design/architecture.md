@@ -19,24 +19,25 @@ can use an entire modern machine.
   SIMD are assumptions, not afterthoughts: work-stealing parallelism
   throughout, memory-mapped immutable data, vectorized codecs, and
   allocation discipline on every hot path.
-- **Scales up before it scales out.** One process is designed to use the
-  largest instances available - hundreds of cores, terabytes of memory -
-  with no heap ceiling and no per-node coordination tax.
-  Capacity comes from scaling up first; availability and cost are
-  addressed separately (replication, scale-to-zero) rather than by sharding first.
+- **Scales up before it scales out.** One process is designed around large
+  machines, many cores, and a memory-mapped address space, with no managed-heap
+  ceiling or per-node coordination tax. Maximum validated machine size and
+  workload-specific throughput are not yet published claims.
+  Capacity comes from scaling up first. Replication and scale-to-zero are
+  separate future layers rather than reasons to shard first; neither is
+  shipped in the current single-node server.
 - **One engine, one algebra.** Lexical queries, vector similarity, filters,
-  facets, statistics, and fusion are nodes in one request tree: multiple of
-  anything, nested under anything, one round trip.
+  facets, statistics, and fusion are nodes in one request tree. A result page
+  with ranking and analytics is one request and one round trip.
 - **Frugal with memory.** Native code with no garbage collector, arenas and
   pools instead of general-purpose allocation on hot paths, and an index
   served from memory-mapped files.
 
 ## Data model
 
-Documents live in **collections** (grouped into **libraries** for
-multi-tenancy). A collection is stored as a **shard** holding one index; an
-index is a set of **immutable segments** plus a small metadata file naming
-the current commit point.
+Documents live in **collections**. A collection is stored as a **shard**
+holding one index; an index is a set of **immutable segments** plus a small
+metadata file naming the current commit point.
 
 Immutability is the load-bearing decision:
 
@@ -63,8 +64,9 @@ every core busy even when work is skewed.
 - **Indexing** is a flow-graph pipeline: document processing, inversion,
   segment flushing, merging, and commit sequencing are independent stages.
   Ingest never waits behind a merge, and a commit does not stop the world.
-  Updates are automatically parallelized - clients do not need to utilize
-  multiple connections / threads to benefit.
+  Independent updates are automatically parallelized. The HTTP NDJSON path
+  currently allows one internal batch in flight per connection, so several
+  producer streams are needed to saturate a many-core host.
 - **Merging** parallelizes inside a single merge, not just across merges:
   every field merges as its own task, because the segment format does not
   tie index structures to specific files - concurrent tasks write their own
@@ -75,21 +77,22 @@ every core busy even when work is skewed.
 
 ### Asynchronous network IO
 
-Both API surfaces are event-driven end to end; no thread is ever parked on
-a connection.
+Both API surfaces multiplex connections with event loops. Search and streaming
+response paths keep connection handling separate from long-running engine work.
 
 - A small pool of io threads multiplexes all connections: the HTTP server
   is an asynchronous proactor, and the gRPC server runs
   on completion queues.
-- Engine work is dispatched onto the work-stealing scheduler,
-  so a long query cannot starve the network and a busy network
-  cannot starve queries.
+- Search work is dispatched onto the work-stealing scheduler, so a long query
+  cannot starve the network and a busy network cannot starve queries. The gRPC
+  unary update path currently waits for indexing on its completion-queue
+  handler; it is the exception to the non-blocking transport model.
 - Ingest is streaming and incremental: NDJSON bodies are parsed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is
   still on the wire. Responses stream back the same way, a chunk at a time.
-  For HTTP/JSON clients, there is no max batch size,
-  and one does not need to batch documents for throughput.
+  For HTTP/JSON clients, there is no maximum stream size and no required
+  user-visible bulk-request boundary.
 
 ### Memory-mapped, zero-copy reads
 
@@ -120,12 +123,18 @@ from memory, a cold one faults in on demand.
 
 ## Search execution
 
-A request is a tree of named **ops** - top-docs, facets, statistics,
-fusion - over a query tree, and composition is uniform: queries nest under
-facets (bucket domains and filters), facets nest under queries and under
-other facets, and fusion consumes whole ops as sources. One request
-describes the whole page you want to render; the engine executes it in one
-parallel pass over the index.
+A request is a tree of named **ops** - top-docs, facets, statistics, and
+fusion - over a query tree. Top-docs can own facets and statistics over their
+complete match domain; string/ID facets can own per-bucket metrics and nested
+string/ID facets; fusion consumes ranked top-docs sources. One request
+describes the whole page you want to render; the engine executes its named
+operations in parallel over the same index view.
+
+Execution profiling follows that tree rather than wrapping the engine in a
+black-box timer. Instrumented operations emit per-segment strategy, selection
+inputs, timing, and human-readable decisions on request. Profiling is opt-in;
+string facets are the first instrumented operation, and other nodes can adopt
+the same hook without changing dispatch or response assembly.
 
 Execution adapts to what the request actually consumes. A top-k request
 that does not ask for an exact total runs with block-max pruning: postings
@@ -137,9 +146,9 @@ from a hidden accuracy knob.
 
 Vector search composes the same way. A kNN query is just a query, with a
 scorer that participates in the boolean tree like any term. Filters apply
-inside the vector search - never as a post-pass that returns fewer results
-than you asked for - and hybrid ranking combines lexical and vector evidence
-in a single request.
+inside the vector search rather than as a post-pass over a fixed unfiltered
+top-k, and hybrid ranking combines lexical and vector evidence in a single
+request.
 
 ## Vector search, natively integrated
 
@@ -158,11 +167,12 @@ contract.
 
 ## API surfaces from one source of truth
 
-The engine speaks gRPC and JSON over HTTP, and both derive from the same
-schema, so they cannot drift apart. The JSON is designed as a public API in
-its own right: human-writable and template-friendly, snake_case throughout,
-untagged values, and strict unknown-key errors with positions so typos are
-caught instead of ignored. Shorthand request forms echo back as their
-canonical structured equivalents (`?explain=request`), so the API teaches
-the API. Ingest streams over gRPC or HTTP (NDJSON).
-
+The engine speaks gRPC and JSON over HTTP. Both share the protobuf message
+vocabulary and semantic model, while HTTP deliberately applies its own public
+JSON dialect. That dialect is human-writable and template-friendly,
+snake_case throughout, uses untagged values, and reports unknown keys with
+positions so typos are caught instead of ignored. Not every protobuf value has
+an HTTP spelling yet; vector document values are the notable current gap.
+Shorthand request forms echo back as their canonical structured equivalents
+(`?explain=request`), so the API teaches the API. Ingest streams over gRPC or
+HTTP (NDJSON).

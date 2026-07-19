@@ -418,6 +418,12 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
       }
     }
 
+    if (r.type == FieldClass::TEXT && column) {
+      throw SchemaError(
+        "column=true is not supported for analyzed text fields; use string for a sortable/facetable lexical value "
+        "(field: " + std::string(name) + ")");
+    }
+
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||

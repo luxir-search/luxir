@@ -4,7 +4,7 @@ Solux works without a schema: field types come from name suffixes (`title_w`,
 `year_i`, `tags_ss` - see the [Quickstart](quickstart.md)). When you want real
 field names without suffixes, a custom analyzer, or typed vector fields, you
 define a schema. The schema API speaks the same JSON in both directions: what
-`GET` returns is exactly what you `PUT`.
+`GET` returns is exactly what you `POST`.
 
 ## Read the schema
 
@@ -47,6 +47,28 @@ curl http://localhost:9400/collections/main/_schema
 ```
 
 (Abbreviated - the default schema defines templates for every suffix.)
+
+The complete suffix set is:
+
+| Suffix | Type and default behavior |
+|---|---|
+| `_s` | Indexed exact string with a column. |
+| `_sc` | Column-only exact string. |
+| `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
+| `_i`, `_is` | Integer column, single- or multi-valued. |
+| `_f`, `_fs` | Float column, single- or multi-valued. |
+| `_d`, `_ds` | Double column, single- or multi-valued. |
+| `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_w` | Stored text split on whitespace, case- and accent-sensitive. |
+| `_wl` | Stored Unicode-word text with NFKC case folding; accents preserved. |
+| `_t` | Stored Unicode-word text with NFKC case and accent folding. |
+| `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
+
+Numeric suffixes are column-backed but do not build a points index by default;
+range and exact-match queries still work by scanning the column. Define a
+concrete field with `index: "range"` when those operations need a points index.
+There is no default geo suffix because coordinate fields benefit from an
+unambiguous explicit definition.
 
 Two sections:
 
@@ -105,11 +127,12 @@ posting a `GET` body back is a no-op under either mode.
 
 | Key | Meaning |
 |---|---|
-| `type` | `string`, `text`, `int`, `float`, `double`, `date`, `bin`, `vector`, `geo_point`, `id` |
+| `type` | `string`, `text`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
-| `column` | store values in a per-field column (sorting, faceting, analytics); default on for everything but `text` |
+| `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types; `column:true` is rejected for analyzed text |
 | `multi` | multi-valued |
 | `stored` | keep raw values for retrieval; default on for `text` only |
+| `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
 | `analyzer` | `text` only: `{"tokenizer": ..., "filters": [...]}`; tokenizers: `whitespace`, `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none` |
@@ -117,6 +140,14 @@ posting a `GET` body back is a no-op under either mode.
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default" - and the schema you read back stays as sparse as the one you
 wrote.
+
+`column` and `stored` solve different problems. A column is a typed,
+per-field structure used by sorting, faceting, analytics, numeric/geo queries,
+and vector search. Stored fields preserve document values for retrieval in
+compressed chunks. Analyzed text has postings and stored retrieval but no
+per-document value column; use a parallel `string` field when the same source
+value must also sort or facet. Scalar types generally return their values from
+columns without a second stored copy.
 
 Mistakes are errors, not surprises: an unknown property, type, tokenizer, or
 filter name gets a `400` naming the valid choices; redefining `id` as anything

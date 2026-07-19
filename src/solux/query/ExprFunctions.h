@@ -11,12 +11,11 @@
 
 #include "solux/api/solux_types.hpp"
 
-// Metadata for the expr language's function-call form: every query type is
-// callable as name(main value, arg=value, ...), where the function name is the
-// Query oneof arm's JSON name and argument names are the message's field
-// names.  One vocabulary across protobuf, JSON, and the query string - a new
-// proto query type is callable the day it lands, with no parser tables to
-// update beyond naming its arm below.
+// Metadata for the expr language's function-call form. Callable query types use
+// name(main value, arg=value, ...), where the function name is the Query oneof
+// arm's JSON name and argument names are the message's field names. One
+// vocabulary spans protobuf, JSON, and the query string, but each new arm must
+// explicitly opt into callability below.
 //
 // Member names come from glaze pure reflection over the aggregate message
 // structs.  That is deliberately meta-independent (member_names / to_tie never
@@ -37,7 +36,7 @@ inline constexpr std::array<std::string_view, 16> ARM_NAMES = {
     "all",            // bool - callable as all(), handled specially
     "exists",         // ExistsQuery
     "phrase",         // PhraseQuery
-    "knn",            // KnnQuery
+    "knn",            // KnnQuery - structured-only (Vector is not expressible)
     "constant_score", // ConstantScoreQuery
     "prefix",         // PrefixQuery
     "fuzzy",          // FuzzyQuery
@@ -78,17 +77,23 @@ inline constexpr std::string_view jsonName(std::string_view member) {
 
 // Emplace the message arm named `name` in q and invoke f on the fresh
 // message.  Returns false when no callable message arm has that name; the
-// caller owns the error (and the special cases: "all" is the bool arm and
-// "expr" is deliberately not callable).
+// caller owns the error. "all" is the bool-arm special case; expr, knn, and
+// geo queries deliberately remain structured-only.
 template <typename F>
 bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
   bool called = false;
   auto tryArm = [&]<size_t I>() {
     using Arm = std::variant_alternative_t<I, decltype(api::Query::kind)>;
-    if constexpr (std::is_class_v<Arm> && !std::is_same_v<Arm, std::monostate> &&
-                  !std::is_same_v<Arm, api::ExprQuery> &&
-                  !std::is_same_v<Arm, api::GeoBoxQuery> &&
-                  !std::is_same_v<Arm, api::GeoDistanceQuery>) {
+    if constexpr (std::is_same_v<Arm, api::Match> ||
+                  std::is_same_v<Arm, api::BooleanQuery> ||
+                  std::is_same_v<Arm, api::ExistsQuery> ||
+                  std::is_same_v<Arm, api::PhraseQuery> ||
+                  std::is_same_v<Arm, api::ConstantScoreQuery> ||
+                  std::is_same_v<Arm, api::PrefixQuery> ||
+                  std::is_same_v<Arm, api::FuzzyQuery> ||
+                  std::is_same_v<Arm, api::SimpleQuery> ||
+                  std::is_same_v<Arm, api::RangeQuery> ||
+                  std::is_same_v<Arm, api::BoostQuery>) {
       if (!called && name == ARM_NAMES[I]) {
         called = true;
         f(q.kind.template emplace<I>());

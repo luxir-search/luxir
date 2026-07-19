@@ -295,10 +295,10 @@ Inside `constant_score`, a child boost is discarded; a boost outside
 
 ## Functions
 
-Every query type can be written as a function call. The function name is
-the query's JSON name and the arguments are its JSON fields, so the
-structured API documentation doubles as the function reference - including
-for query types added after this page was written:
+Most structured query types can be written as a function call. The function
+name is the query's JSON name and the arguments are its JSON fields, so the
+[structured query reference](query-reference.md) doubles as the function
+reference:
 
 ```
 match(dune messiah, field=title_w, operator=AND, min_match=2)
@@ -314,6 +314,11 @@ boolean(required=[status_s:active], optional=[title_w:dune, title_w:messiah], mi
 simple_query($user_input, fields=[title_w, body_w], operator=AND)
 all()
 ```
+
+`expr` is already the surrounding language and is written inline. `geo_box`
+and `geo_distance` currently have no function form; use their structured JSON
+objects. New structured query arms are not automatically callable until their
+expression behavior is declared.
 
 Arguments work like Python's: at most one positional argument, then
 `name=value` pairs. The positional slot is the query's main value and takes

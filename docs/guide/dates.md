@@ -98,7 +98,7 @@ POST /collections/main/_query
  "ops": {"per_day": {"range_facet": {
    "field": "when_dt",
    "start": "NOW/DAY-7DAYS", "end": "NOW/DAY+1DAY",
-   "calendar_gap": {"n": 1, "unit": "DAY"}}}}}
+   "calendar_gap": {"n": 1, "unit": "day"}}}}}
 ```
 
 Buckets are returned in order, zero counts included, with `[start, end)`

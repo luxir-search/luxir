@@ -147,8 +147,8 @@ message Fusion {
   int32 batch_size = 8;
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
 
-  // Sub-ops run over the union of source matches (intersected with the
-  // fusion-level filter), not just the fused top-N.
+  // Reserved for future fusion sub-ops. Current servers reject a non-empty
+  // map; callers must leave it empty.
   map<string, SearchOp> ops = 15;
 }
 
@@ -343,16 +343,18 @@ message BooleanQuery {
   int32 min_match = 5;
 }
 
-// Matches documents where `field` has a term starting with `prefix`.
-// The prefix is used exactly as provided.  An empty prefix matches documents
-// that have at least one indexed term for the field.
+// Matches documents where `field` has a term starting with `prefix`. TEXT
+// fields apply multi-term normalization/folding without tokenization; STRING
+// and ID fields use the bytes exactly. An empty prefix matches documents that
+// have at least one indexed term for the field.
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
 }
 
-// Matches indexed terms within byte-wise Levenshtein distance of `term`.
-// The term is used verbatim. Scoring queries use blended BM25 statistics;
+// Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT
+// fields apply multi-term normalization/folding without tokenization; STRING
+// and ID fields use it verbatim. Scoring queries use blended BM25 statistics;
 // filter queries use constant scores.
 message FuzzyQuery {
   string field = 1;
@@ -362,8 +364,9 @@ message FuzzyQuery {
   optional int32 max_edits = 3;
   // Leading bytes that must match exactly. Unset = 1; 0 = no required prefix.
   optional int32 prefix_length = 4;
-  // Max scored term expansions, closest terms first. Unset/0 = complete.
-  // Positive values consent to truncation. Negative values are rejected.
+  // Max term expansions, closest terms first. Unset/0 = default 50. A
+  // positive value requests that cap; the operator/clause budget may lower it
+  // with a warning. Negative values are rejected.
   int32 max_expansions = 5;
 }
 
@@ -395,9 +398,10 @@ message PhraseQuery {
 // +required / -prohibited prefixes (may not mix with AND/OR at one level),
 // ranges field:[a TO b] / {a TO b} and comparisons field:>=v, trailing * for
 // prefix, term~N for fuzzy (bare ~ = auto), *:* matches everything, and the
-// function form name(main value, arg=value, ...) reaching every query type by
-// its JSON name.  $name references a value bound in `vars`.  Unfielded bare
-// words are a parse error.
+// function form name(main value, arg=value, ...) reaching the callable query
+// types by their JSON names (kNN and geo queries currently require structured
+// messages). $name references a value bound in `vars`. Unfielded bare words
+// are a parse error.
 message ExprQuery {
   string q = 1;  // the expression
 
@@ -609,10 +613,11 @@ message CommitParams {
   // while a positive value will not wait for the commit before the response is sent.
   uint64 commit_within_us = 1;
 
-  // Rebuild aux indexes as part of this commit.
-  //   []                 - no rebuild
-  //   ["*"]              - rebuild every eligible aux index in the schema
-  //   ["vec.title_v"]    - rebuild this one (matched against AuxIndexInfo.name)
+  // Build missing aux overlays as part of this commit. An overlay already
+  // present on a segment is retained rather than rebuilt.
+  //   []                 - request no aux builds
+  //   ["*"]              - build every eligible missing vector overlay
+  //   ["vec.title_v"]    - build this missing overlay (matched by AuxIndexInfo.name)
   //   ["vec.*"]          - (future) glob-match by prefix
   repeated string build_aux_indexes = 2;
 
@@ -635,16 +640,15 @@ message UpdateRequest {
   // streaming RPCs.
   string request_id = 1;
 
-  // stream_id is optional.  When in streaming mode,
-  // Update messages in the same logical stream will be processed serially.  A stream_id of 0
+  // Reserved for future stream scheduling. Current servers ignore stream_id;
+  // use request_id to correlate responses rather than depending on order.
   int64 stream_id = 2;
 
   Target collection = 3;
 
-  // Same pair, same contract as DocList: document i is columns row i merged
-  // with docs[i], and a field name never appears in both.  Pure row ingest =
-  // docs only; pure columnar = columns only.  Using the same field order for
-  // each row makes row ingest slightly more efficient.
+  // Current update handling consumes row maps in docs. The columns member is
+  // reserved for a future aligned-column ingest path; callers must leave it
+  // empty because a non-empty value is not indexed yet.
   repeated Map docs = 4;
   map<string, Column> columns = 5;
 
@@ -986,7 +990,7 @@ message FieldDef {
     INT = 2;
     FLOAT = 3;
     DOUBLE = 4;
-    BIN = 5;
+    BIN = 5;       // reserved; the current engine has no usable BIN field handler
     ID = 6;        // unique id field with co-located version
     VECTOR = 7;    // dense float vector, stored as a fixed-size binary column
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
