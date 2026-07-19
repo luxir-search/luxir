@@ -47,6 +47,11 @@ message SearchRequest {
   // Return per-piece execution details for instrumented operations. Profiling
   // is request-wide so every operation observes the same instrumentation mode.
   bool profile = 7;
+
+  // Intra-request parallelism: 0 = auto (engine decides), 1 = single-threaded.
+  // Values above 1 are reserved for a future parallelism budget and are
+  // rejected for now.
+  int32 max_parallel = 8;
 }
 
 enum ResponseFormat {

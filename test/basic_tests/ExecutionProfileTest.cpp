@@ -174,4 +174,36 @@ TEST_F(ExecutionProfileTest, reportsSparseReaderForArrayDomains) {
   EXPECT_EQ("array domain, sparse column skips", pieces[0].details[0]);
 }
 
+TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
+  CollectionHelper helper("profile-serial");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 64; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 8)));
+    if (i % 16 == 15) helper.indexAll(docs, UpdateMessage::COMMIT), docs.clear();
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("profile-serial").profile().facet("cats", "cat_s").limit(-1);
+  req->execute((int32_t)1);
+  ASSERT_OK(req);
+
+  const auto& pieces = profileOp(*req).pieces;
+  ASSERT_GT(pieces.size(), 1u);
+  for (const auto& piece : pieces) {
+    EXPECT_EQ(pieces[0].thread_id, piece.thread_id);
+  }
+}
+
+TEST_F(ExecutionProfileTest, maxParallelAboveOneIsRejected) {
+  CollectionHelper helper("profile-reject");
+  helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("profile-reject").facet("cats", "cat_s").limit(-1);
+  req->execute((int32_t)2);
+  ASSERT_FALSE(req->responses.empty());
+  EXPECT_NE(std::string_view::npos,
+            req->responses.back()->proto.error.find("max_parallel"));
+}
+
 } // namespace solux::test

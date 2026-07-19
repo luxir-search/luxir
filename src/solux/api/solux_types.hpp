@@ -342,6 +342,7 @@ struct SearchRequest {                                          // needs Target
   std::string_view time_zone;
   ResponseFormat response_format = ResponseFormat::ENVELOPE;
   bool profile = false;
+  std::int32_t max_parallel = 0;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct Bucket {

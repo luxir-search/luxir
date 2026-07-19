@@ -23,7 +23,12 @@ public:
   }
 
   // Most users should use this entry point to submit a search request.
-  void submit(SearchRequest& req, bool parallel = true);
+  // maxParallel: 0 = auto (engine decides; today that means parallel),
+  // 1 = single-threaded, >1 reserved (rejected as a request error).
+  void submit(SearchRequest& req, int32_t maxParallel = 0);
+  // bool converts to int silently and would flip meaning (false -> 0 = auto);
+  // force old call sites to say what they mean.
+  void submit(SearchRequest& req, bool) = delete;
 
 
   SearchEngine(const SearchEngine&) = delete;

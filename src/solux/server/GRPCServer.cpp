@@ -590,7 +590,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // requestActive keeps pipelined requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   call.server.getSoluxNode().getTaskArena().enqueue([&req, &engine] {
-    engine.submit(req, true);
+    engine.submit(req, req.proto.max_parallel);
   });
 }
 

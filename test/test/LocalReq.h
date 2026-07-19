@@ -173,7 +173,12 @@ public:
   OpCursor& stats(std::string_view name, std::string_view field) { return rootCursor_.stats(name, field); }
 
   LocalReq& execute(bool parallel = true) {
-    engine.submit(*this, parallel);
+    engine.submit(*this, parallel ? 0 : 1);
+    return *this;
+  }
+
+  LocalReq& execute(int32_t maxParallel) {
+    engine.submit(*this, maxParallel);
     return *this;
   }
 

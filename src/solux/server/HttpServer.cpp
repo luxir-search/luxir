@@ -810,7 +810,7 @@ private:
 
     // Dispatch the synchronous engine.submit() off the strand so the io thread
     // is not blocked for the query's duration.  reply() posts results back here.
-    node_.getTaskArena().enqueue([sreq, &engine] { engine.submit(*sreq, true); });
+    node_.getTaskArena().enqueue([sreq, &engine] { engine.submit(*sreq, sreq->proto.max_parallel); });
   }
 
   void handleUpdate(const std::string& body, const std::string& coll) {

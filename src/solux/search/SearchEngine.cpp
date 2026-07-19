@@ -6,6 +6,10 @@ namespace solux {
 void SearchEngine::submitBody(SearchRequest& req) {
   try {
     if (!req.timeZone) throw std::runtime_error(req.timeZoneError);
+    if (req.maxParallel > 1) {
+      throw std::runtime_error(
+          "max_parallel values above 1 are not implemented; use 0 (auto) or 1 (single-threaded)");
+    }
     getResources(req);
     // LOG_DEBUG("submitBody: IndexReader commitTime={}", req.reader->commitTime());
     req.lastResponse = SearchResponse::create(req, true);
@@ -67,10 +71,11 @@ void SearchEngine::submitBody(SearchRequest& req) {
   req.bodyDone();
 }
 
-void SearchEngine::submit(SearchRequest& req, bool parallel) {
+void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
+  req.maxParallel = maxParallel;
   std::optional<oneapi::tbb::task_group> stackTg;
-  if (parallel && req.tg == nullptr) {
+  if (maxParallel != 1 && req.tg == nullptr) {
     req.tg = &stackTg.emplace();
   }
   submitBody(req);
