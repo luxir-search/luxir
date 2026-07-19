@@ -14,9 +14,14 @@
 #include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
 #include "solux/util/geo.h"
+#include "solux/util/heap.h"
 
 #include <array>
 #include <atomic>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <oneapi/tbb/task_group.h>
 
 // This file is only included in IndexWriter.cpp
@@ -137,19 +142,6 @@ class SegmentMerger {
     }
   };
 
-  // One field's merge work, self-contained so it can run as a task: owned copies
-  // of the per-segment SegFieldInfos (their names/locations point into the open
-  // source segments, not into FieldReader scratch), plus its admission price -
-  // estimated peak RAM (see fieldMergeCost) and peak concurrent output streams
-  // (see fieldMergeStreams; concurrently held streams cannot share a file, so the
-  // stream cap is what bounds the merged segment's file count).
-  struct Batch {
-    int64_t cost = 0;
-    int32_t streams = 0;
-    std::string name;
-    std::vector<MergeFieldInfo> fields;
-  };
-
   // Runs the per-field merge batches as parallel TBB tasks under IndexRamBudget
   // admission.  Strategy: work waits, threads don't.
   //  - Batches are enumerated up front and sorted largest-cost-first, so the
@@ -171,14 +163,48 @@ class SegmentMerger {
   // Failure containment is unchanged: a throwing batch cancels the group, wait()
   // rethrows the first exception, and the caller's merge-failure handling applies.
   class MergeAdmissionDriver {
-    SegmentMerger& merger;
-    IndexRamBudget& budget;
-    oneapi::tbb::task_group_context context;
-    oneapi::tbb::task_group tg;
-    std::mutex mutex;
-    std::vector<Batch> pending;
-    int32_t inFlight = 0;
-    int32_t inFlightStreams = 0;
+  public:
+    class HeldStreams {
+      MergeAdmissionDriver* driver = nullptr;
+      int32_t streams = 0;
+
+    public:
+      HeldStreams() = default;
+      HeldStreams(MergeAdmissionDriver& driver, int32_t streams)
+        : driver(&driver), streams(streams) {}
+      HeldStreams(const HeldStreams&) = delete;
+      HeldStreams& operator=(const HeldStreams&) = delete;
+      HeldStreams(HeldStreams&& other) noexcept
+        : driver(other.driver), streams(other.streams) {
+        other.driver = nullptr;
+        other.streams = 0;
+      }
+      HeldStreams& operator=(HeldStreams&& other) noexcept {
+        if (this != &other) {
+          release();
+          driver = other.driver;
+          streams = other.streams;
+          other.driver = nullptr;
+          other.streams = 0;
+        }
+        return *this;
+      }
+      ~HeldStreams() { release(); }
+
+      void release() {
+        MergeAdmissionDriver* target = driver;
+        if (target == nullptr) return;
+        int32_t released = streams;
+        driver = nullptr;
+        streams = 0;
+        {
+          const std::lock_guard<std::mutex> lock(target->mutex);
+          assert(target->inFlightStreams >= released);
+          target->inFlightStreams -= released;
+        }
+        target->admitLoop();
+      }
+    };
 
     class BatchAdmission {
       MergeAdmissionDriver* driver = nullptr;
@@ -214,6 +240,24 @@ class SegmentMerger {
         releaseResources(false);
       }
 
+      IndexRamBudget::Guard takeRamGuard() {
+        return std::move(ramGuard);
+      }
+
+      bool repriceRam(int64_t bytes) {
+        int64_t oldBytes = ramGuard.size();
+        if (!ramGuard.tryResize(bytes)) return false;
+        if (bytes < oldBytes) driver->admitLoop();
+        return true;
+      }
+
+      HeldStreams takeStreams() {
+        assert(driver != nullptr);
+        HeldStreams held(*driver, streams);
+        streams = 0;
+        return held;
+      }
+
       void completeAndAdmit() {
         releaseResources(true);
       }
@@ -244,6 +288,24 @@ class SegmentMerger {
       }
     };
 
+    struct Batch {
+      int64_t cost = 0;
+      int32_t streams = 0;
+      std::string name;
+      std::vector<MergeFieldInfo> fields;
+      std::function<void(MergeAdmissionDriver&, Batch&, BatchAdmission&)> body;
+    };
+
+  private:
+    SegmentMerger& merger;
+    IndexRamBudget& budget;
+    oneapi::tbb::task_group_context context;
+    oneapi::tbb::task_group tg;
+    std::mutex mutex;
+    std::vector<Batch> pending;
+    int32_t inFlight = 0;
+    int32_t inFlightStreams = 0;
+
   public:
     MergeAdmissionDriver(SegmentMerger& merger, IndexRamBudget& budget, std::vector<Batch>&& batches)
       : merger(merger), budget(budget), context(), tg(context), pending(std::move(batches)) {}
@@ -270,6 +332,27 @@ class SegmentMerger {
         tg.wait();
       }
       tg.wait();
+    }
+
+    void addBatches(std::vector<Batch>&& batches) {
+      bool accepted = false;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (!context.is_group_execution_cancelled()) {
+          pending.reserve(pending.size() + batches.size());
+          for (auto& batch : batches) {
+            pending.push_back(std::move(batch));
+          }
+          std::sort(pending.begin(), pending.end(), [](const Batch& a, const Batch& b) {
+            if (a.cost != b.cost) return a.cost > b.cost;
+            return a.name < b.name;
+          });
+          accepted = true;
+        }
+      }
+      if (accepted) {
+        admitLoop();
+      }
     }
 
   private:
@@ -329,8 +412,23 @@ class SegmentMerger {
           return false;
         }
 
-        batch = std::move(pending.front());
-        pending.erase(pending.begin());
+        // Only force-admit a batch whose streams fit: unlike RAM, stream slots
+        // must never overdraw (they bound the segment's file count).  Returning
+        // false with pending work is safe from livelock only because held
+        // streams (a partition coordinator's) imply that coordinator still has
+        // running tasks or pending zero-stream range batches - one of which is
+        // always admittable here.
+        size_t selected = pending.size();
+        for (size_t i = 0; i < pending.size(); i++) {
+          if (inFlightStreams + pending[i].streams <= MergeCostModel::MAX_STREAMS) {
+            selected = i;
+            break;
+          }
+        }
+        if (selected == pending.size()) return false;
+
+        batch = std::move(pending[selected]);
+        pending.erase(pending.begin() + (int64_t) selected);
         IndexRamBudget::Guard guard = budget.forceAcquire(batch.cost);
         inFlight++;
         inFlightStreams += batch.streams;
@@ -347,7 +445,7 @@ class SegmentMerger {
       mutable BatchAdmission admission;
 
       void operator()() const {
-        driver->merger.mergeField(batch.fields);
+        batch.body(*driver, batch, admission);
         Signal::emit("segmentMergeBody");
         admission.completeAndAdmit();
       }
@@ -365,6 +463,9 @@ class SegmentMerger {
   std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
+  int64_t termPartitionMinBytes;
+  int64_t termPartitionMinRangeBytes;
+  int32_t termPartitionMaxRanges;
 
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
@@ -373,10 +474,17 @@ public:
 
 
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
-                PostingsWriter& postingsWriter, IndexRamBudget& ramBudget)
-  : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget)
+                PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
+                int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
+                int32_t termPartitionMaxRanges)
+  : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
+    termPartitionMinBytes(termPartitionMinBytes),
+    termPartitionMinRangeBytes(termPartitionMinRangeBytes),
+    termPartitionMaxRanges(termPartitionMaxRanges)
   {
     assert(preaders.size() == liveDocs.size());
+    assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
+    assert(termPartitionMaxRanges >= 2 && termPartitionMaxRanges <= MergeCostModel::MAX_TERM_RANGES);
   }
 
   void merge() {
@@ -426,9 +534,9 @@ public:
     // IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
     IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs);
 
-    std::vector<Batch> batches;
+    std::vector<MergeAdmissionDriver::Batch> batches;
     while (fieldPQ.size() > 0) {
-      Batch batch;
+      MergeAdmissionDriver::Batch batch;
       batch.fields.reserve(segs.size());
       auto currField = fieldPQ.top().fieldReader->name();
       batch.name = std::string((std::string_view)currField);
@@ -452,10 +560,15 @@ public:
 
       batch.cost = estimateCost(batch.fields);
       batch.streams = estimateStreams(batch.fields);
+      batch.body = [this](MergeAdmissionDriver& driver, MergeAdmissionDriver::Batch& current,
+                          MergeAdmissionDriver::BatchAdmission& admission) {
+        mergeField(current.fields, driver, admission);
+      };
       batches.push_back(std::move(batch));
     }
 
-    std::sort(batches.begin(), batches.end(), [](const Batch& a, const Batch& b) {
+    std::sort(batches.begin(), batches.end(), [](const MergeAdmissionDriver::Batch& a,
+                                                  const MergeAdmissionDriver::Batch& b) {
       if (a.cost != b.cost) {
         return a.cost > b.cost;
       }
@@ -539,8 +652,8 @@ private:
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
-      // Text postings merge streams; what accumulates is the norms build
-      // (normBytes ~1 byte per doc-with-field plus its DocStream).
+      // Text postings stream. What accumulates is the norms build (roughly one
+      // byte per doc-with-field plus its DocStream).
       return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
@@ -714,7 +827,455 @@ private:
     }
   }
 
-  void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos) {
+  struct TermRangePlan {
+    std::optional<std::string> lower;
+    std::optional<std::string> upper;
+    uint64_t bytes = 0;
+    uint64_t safetyBytes = 0;
+  };
+
+  int64_t partitionCoordinatorCost(std::span<MergeFieldInfo*> fields) const {
+    int64_t docsWithField = 0;
+    int64_t dictionaryBytes = 0;
+    for (const auto* field : fields) {
+      const auto& info = field->segFieldInfo;
+      docsWithField += info.docsWithField;
+      if (info.nTerms == 0) continue;
+      assert(info.termBlockIndexLoc.filenum() == info.termsLoc.filenum());
+      assert(info.termBlockIndexLoc.offset() >= info.termsLoc.offset());
+      dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset()
+          - info.termsLoc.offset());
+    }
+    return docsWithField * 2 + dictionaryBytes;
+  }
+
+  std::optional<std::vector<TermRangePlan>> planTermRanges(
+      std::span<MergeFieldInfo*> compactFields, MemPool& pool) {
+    struct SafetyBlock {
+      TermsEnum::BlockEstimate block;
+      size_t next = SIZE_MAX;
+    };
+    struct WeightedTerm {
+      size_t block;
+      uint64_t bytes;
+    };
+
+    int64_t sourceTerms = 0;
+    for (auto* field : compactFields) {
+      sourceTerms += field->segFieldInfo.nTerms;
+    }
+    int64_t minimumPartitionBlocks =
+        (sourceTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE + 1;
+    if (minimumPartitionBlocks > (int64_t) TrieBuilder::MAX_BLOCKS) return std::nullopt;
+
+    std::vector<SafetyBlock> safetyBlocks;
+    for (auto* field : compactFields) {
+      if (field->segFieldInfo.nTerms == 0) continue;
+      TermsEnum terms(pool, *field->seg->postingsReader, field->segFieldInfo);
+      auto blocks = terms.estimateTermBlocks();
+      size_t sourceStart = safetyBlocks.size();
+      for (auto& block : blocks) {
+        safetyBlocks.push_back({std::move(block), SIZE_MAX});
+      }
+      for (size_t i = sourceStart; i + 1 < safetyBlocks.size(); i++) {
+        safetyBlocks[i].next = i + 1;
+      }
+    }
+    if (safetyBlocks.empty()) return std::nullopt;
+
+    std::vector<WeightedTerm> weighted;
+    weighted.reserve(safetyBlocks.size());
+    for (size_t i = 0; i < safetyBlocks.size(); i++) {
+      weighted.push_back({i, safetyBlocks[i].block.bytes});
+    }
+    auto termFor = [&](const WeightedTerm& entry) -> const std::string& {
+      return safetyBlocks[entry.block].block.firstTerm;
+    };
+
+    std::sort(weighted.begin(), weighted.end(), [&](const WeightedTerm& a, const WeightedTerm& b) {
+      return termFor(a) < termFor(b);
+    });
+    size_t out = 0;
+    for (size_t i = 0; i < weighted.size(); i++) {
+      WeightedTerm& entry = weighted[i];
+      if (out != 0 && termFor(weighted[out - 1]) == termFor(entry)) {
+        uint64_t& bytes = weighted[out - 1].bytes;
+        bytes = UINT64_MAX - bytes < entry.bytes ? UINT64_MAX : bytes + entry.bytes;
+      } else {
+        if (out != i) weighted[out] = entry;
+        out++;
+      }
+    }
+    weighted.resize(out);
+
+    uint64_t totalBytes = 0;
+    for (const auto& entry : weighted) {
+      totalBytes = UINT64_MAX - totalBytes < entry.bytes
+          ? UINT64_MAX : totalBytes + entry.bytes;
+    }
+    if (totalBytes < (uint64_t) termPartitionMinBytes || totalBytes == 0) {
+      return std::nullopt;
+    }
+
+    uint64_t quotient = totalBytes / (uint64_t) termPartitionMinRangeBytes;
+    int32_t desiredRanges = (int32_t) std::min<uint64_t>(
+        (uint64_t) termPartitionMaxRanges, std::max<uint64_t>(2, quotient));
+
+    auto buildPlan = [&](int32_t rangeTarget) {
+      std::vector<std::string> splits;
+      splits.reserve((size_t) rangeTarget - 1);
+      uint64_t accumulated = 0;
+      int32_t nextCut = 1;
+      for (const auto& entry : weighted) {
+        const std::string& term = termFor(entry);
+        while (nextCut < rangeTarget
+               && accumulated >= (totalBytes / (uint64_t) rangeTarget) * (uint64_t) nextCut) {
+          if (splits.empty() || splits.back() != term) {
+            splits.push_back(term);
+          }
+          nextCut++;
+        }
+        accumulated = UINT64_MAX - accumulated < entry.bytes
+            ? UINT64_MAX : accumulated + entry.bytes;
+      }
+      if (splits.empty()) return std::vector<TermRangePlan>{};
+
+      std::vector<TermRangePlan> plan(splits.size() + 1);
+      for (size_t i = 0; i < plan.size(); i++) {
+        if (i != 0) plan[i].lower = splits[i - 1];
+        if (i < splits.size()) plan[i].upper = splits[i];
+      }
+      for (const auto& entry : weighted) {
+        const std::string& term = termFor(entry);
+        size_t range = (size_t) (std::upper_bound(splits.begin(), splits.end(), term)
+            - splits.begin());
+        uint64_t& bytes = plan[range].bytes;
+        bytes = UINT64_MAX - bytes < entry.bytes ? UINT64_MAX : bytes + entry.bytes;
+      }
+      for (const auto& source : safetyBlocks) {
+        const auto& block = source.block;
+        for (auto& range : plan) {
+          bool startsBeforeRangeEnd = !range.upper.has_value()
+              || block.firstTerm < *range.upper;
+          bool endsAfterRangeStart = !range.lower.has_value()
+              || source.next == SIZE_MAX
+              || *range.lower < safetyBlocks[source.next].block.firstTerm;
+          if (!startsBeforeRangeEnd || !endsAfterRangeStart) continue;
+          range.safetyBytes = UINT64_MAX - range.safetyBytes < block.safetyBytes
+              ? UINT64_MAX : range.safetyBytes + block.safetyBytes;
+        }
+      }
+      for (auto& range : plan) range.bytes = std::max(range.bytes, range.safetyBytes);
+      return plan;
+    };
+
+    std::vector<TermRangePlan> plan;
+    int64_t budgetBytes = ramBudget.totalBytes();
+    for (;;) {
+      plan = buildPlan(desiredRanges);
+      if (plan.size() < 2) return std::nullopt;
+      uint64_t largest = 0;
+      for (const auto& range : plan) largest = std::max(largest, range.bytes);
+      if (budgetBytes != 0 && desiredRanges > 2
+          && largest > (uint64_t) budgetBytes / 4) {
+        desiredRanges--;
+        continue;
+      }
+      if (budgetBytes != 0 && largest > (uint64_t) budgetBytes / 2) {
+        return std::nullopt;
+      }
+      break;
+    }
+
+    int64_t worstBlocks = (sourceTerms + Postings::TERMS_BLOCK_SIZE - 1)
+        / Postings::TERMS_BLOCK_SIZE + (int64_t) plan.size() - 1;
+    if (worstBlocks > (int64_t) TrieBuilder::MAX_BLOCKS) return std::nullopt;
+    return plan;
+  }
+
+  void mergeTerms(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
+                  bool isOrdCol, OrdCollector* ordCollector,
+                  const std::optional<std::string>& lower,
+                  const std::optional<std::string>& upper, MemPool& pool) {
+    struct TermsEnumIdx {
+      TermsEnum tenum;
+      size_t idx;
+    };
+    std::vector<TermsEnumIdx> tenums;
+    tenums.reserve(compactFields.size());
+    std::vector<TermsEnumIdx*> tenumPtrs;
+    tenumPtrs.reserve(compactFields.size());
+
+    for (size_t idx = 0; idx < compactFields.size(); idx++) {
+      auto* field = compactFields[idx];
+      tenums.emplace_back(TermsEnumIdx{
+          TermsEnum(pool, *field->seg->postingsReader, field->segFieldInfo), idx});
+      bool positioned = lower.has_value()
+          ? tenums.back().tenum.seekCeil(*lower) : tenums.back().tenum.nextTerm();
+      if (positioned && (!upper.has_value() || tenums.back().tenum.term() < *upper)) {
+        tenumPtrs.push_back(&tenums.back());
+      }
+    }
+
+    auto termCmp = [](const TermsEnumIdx& a, const TermsEnumIdx& b) {
+      int cmp = b.tenum.term() <=> a.tenum.term();
+      return cmp < 0 || (cmp == 0 && b.idx < a.idx);
+    };
+    IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenumPtrs);
+
+    char termBuf[PackedTerm::MAX_BYTES];
+    while (termPQ.size() > 0) {
+      TermsEnumIdx& first = termPQ.top();
+      PackedTerm term(termBuf);
+      first.tenum.term().copyTo(term);
+      int32_t termOrd = textWriter.startTerm(term);
+
+      do {
+        TermsEnumIdx& entry = termPQ.top();
+        DocsEnum docsEnum(pool, *compactFields[entry.idx]->seg->postingsReader, entry.tenum);
+        if (isOrdCol) {
+          assert(ordCollector != nullptr);
+          addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,
+                      *ordCollector, termOrd);
+        } else {
+          addDocsPos(textWriter, docsEnum, *compactFields[entry.idx]->seg);
+        }
+
+        bool next = entry.tenum.nextTerm();
+        if (next && (!upper.has_value() || entry.tenum.term() < *upper)) {
+          termPQ.updateTop();
+        } else {
+          termPQ.removeTop();
+        }
+      } while (termPQ.size() > 0 && termPQ.top().tenum.term() == term);
+
+      textWriter.endTerm(term);
+    }
+  }
+
+  class PartitionCoordinator {
+    struct RangeOutput {
+      TermRangePlan plan;
+      RAMFile termsFile;
+      RAMFile docsFile;
+      RAMFile posFile;
+      TextWriter::RangeResult result;
+      seg_location docsBase;
+      seg_location posBase;
+
+      RangeOutput(TermRangePlan&& plan, int32_t ord)
+        : plan(std::move(plan)),
+          termsFile("merge-range-terms-" + std::to_string(ord)),
+          docsFile("merge-range-docs-" + std::to_string(ord)),
+          posFile("merge-range-pos-" + std::to_string(ord)) {}
+    };
+
+    SegmentMerger& merger;
+    MergeAdmissionDriver& driver;
+    IndexRamBudget::Guard ramGuard;
+    MergeAdmissionDriver::HeldStreams heldStreams;
+    std::vector<MergeFieldInfo> fields;
+    std::vector<MergeFieldInfo*> compactFields;
+    std::vector<TermRangePlan> plans;
+    MemPool pool;
+    Stream normBytes;
+    DocStream normDocsWithField;
+    NormsWriter::PreparedNorms preparedNorms;
+    PostingsWriter::IndexFieldInfo* outputFieldInfo = nullptr;
+    std::array<OutputStreamPtr, 3> streams;
+    std::vector<std::unique_ptr<RangeOutput>> outputs;
+    std::mutex completionMutex;
+    int32_t completed = 0;
+    int32_t flags;
+
+  public:
+    PartitionCoordinator(SegmentMerger& merger, MergeAdmissionDriver& driver,
+                         std::vector<MergeFieldInfo>&& fields,
+                         std::vector<TermRangePlan>&& plans, int32_t flags)
+      : merger(merger), driver(driver), fields(std::move(fields)), plans(std::move(plans)),
+        normDocsWithField(pool), flags(flags) {
+      std::vector<MergeFieldInfo*> bySegment(merger.segs.size());
+      for (auto& field : this->fields) bySegment[(size_t) field.seg->ord] = &field;
+      compactFields.reserve(this->fields.size());
+      for (auto* field : bySegment) {
+        if (field != nullptr) compactFields.push_back(field);
+      }
+    }
+
+    void start(const std::shared_ptr<PartitionCoordinator>& self,
+               MergeAdmissionDriver::BatchAdmission& admission) {
+      int32_t numNormDocsWithField = 0;
+      merger.buildMergedNorms(compactFields, normBytes, normDocsWithField,
+                              numNormDocsWithField, pool);
+
+      outputFieldInfo = &merger.postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
+      outputFieldInfo->type = FieldType::TEXT;
+      outputFieldInfo->flags = flags;
+      preparedNorms = NormsWriter::prepare(pool, merger.postingsWriter, *outputFieldInfo,
+                                           normBytes, normDocsWithField,
+                                           numNormDocsWithField);
+      streams = merger.postingsWriter.getOutputStreams<3>();
+
+      ramGuard = admission.takeRamGuard();
+      heldStreams = admission.takeStreams();
+
+      outputs.reserve(plans.size());
+      for (size_t i = 0; i < plans.size(); i++) {
+        outputs.push_back(std::make_unique<RangeOutput>(std::move(plans[i]), (int32_t) i));
+      }
+
+      std::vector<MergeAdmissionDriver::Batch> batches;
+      batches.reserve(outputs.size());
+      for (size_t i = 0; i < outputs.size(); i++) {
+        MergeAdmissionDriver::Batch batch;
+        batch.cost = outputs[i]->plan.bytes > (uint64_t) INT64_MAX
+            ? INT64_MAX : (int64_t) outputs[i]->plan.bytes;
+        batch.streams = 0;
+        batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
+            + "#" + std::to_string(i);
+        batch.body = [self, i](MergeAdmissionDriver&, MergeAdmissionDriver::Batch&,
+                               MergeAdmissionDriver::BatchAdmission&) {
+          self->mergeRange(i);
+        };
+        batches.push_back(std::move(batch));
+      }
+      driver.addBatches(std::move(batches));
+    }
+
+  private:
+    void mergeRange(size_t rangeOrd) {
+      RangeOutput& output = *outputs[rangeOrd];
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      MemPool& rangePool = poolGuard.pool();
+
+      OutputStream termsOut(&output.termsFile);
+      OutputStream docsOut(&output.docsFile);
+      OutputStream posOut(&output.posFile);
+      PostingsWriter::IndexFieldInfo rangeFieldInfo{};
+      rangeFieldInfo.type = FieldType::TEXT;
+      rangeFieldInfo.flags = flags;
+
+      TextWriter writer(merger.postingsWriter, termsOut, docsOut, posOut);
+      writer.startField(&rangeFieldInfo);
+      if (FieldType::hasPositions(flags)) {
+        writer.setNorms(preparedNorms.textView());
+      }
+      merger.mergeTerms(writer, compactFields, false, nullptr,
+                        output.plan.lower, output.plan.upper, rangePool);
+      output.result = writer.finishTermRun();
+      termsOut.flush(true);
+      docsOut.flush(true);
+      posOut.flush(true);
+
+      bool last;
+      {
+        const std::lock_guard<std::mutex> lock(completionMutex);
+        if (output.result.nTerms != 0) {
+          output.docsBase = streams[1]->slocation();
+          streams[1]->appendFile(output.docsFile);
+          output.posBase = streams[2]->slocation();
+          streams[2]->appendFile(output.posFile);
+        }
+        completed++;
+        last = completed == (int32_t) outputs.size();
+      }
+      if (last) stitch();
+    }
+
+    void stitch() {
+      OutputStream& termsOut = *streams[0];
+      std::vector<uint64_t> blockOffsets;
+      std::vector<TermRangeRow> rows;
+      TrieBuilder trieBuilder;
+      std::string previousLastTerm;
+      int32_t termOrd = 0;
+      int32_t blockOrd = 0;
+      int64_t sumDocFreq = 0;
+      int64_t sumTotalTermFreq = 0;
+
+      for (auto& outputPtr : outputs) {
+        RangeOutput& output = *outputPtr;
+        auto& result = output.result;
+        if (result.nTerms == 0) continue;
+
+        seg_location termsBase = termsOut.slocation();
+        if (blockOrd != 0) {
+          trieBuilder.add(TextWriter::separatorKey(previousLastTerm, result.firstTerm),
+                          (uint32_t) blockOrd);
+        }
+        assert(result.separatorKeys.size() == (size_t) result.nBlocks - 1);
+        for (size_t i = 0; i < result.separatorKeys.size(); i++) {
+          trieBuilder.add(result.separatorKeys[i], (uint32_t) blockOrd + (uint32_t) i + 1);
+        }
+
+        rows.push_back(TermRangeRow{
+            (uint32_t) termOrd, (uint32_t) blockOrd, output.docsBase, output.posBase,
+            termsBase, result.docsBytes, result.posBytes});
+        termsOut.appendFile(output.termsFile);
+        blockOffsets.insert(blockOffsets.end(), result.termBlockOffsets.begin(),
+                            result.termBlockOffsets.end());
+        termOrd += result.nTerms;
+        blockOrd += result.nBlocks;
+        sumDocFreq += result.sumDocFreq;
+        sumTotalTermFreq += result.sumTotalTermFreq;
+        previousLastTerm = result.lastTerm;
+      }
+
+      outputFieldInfo->nTerms = termOrd;
+      outputFieldInfo->sumDocFreq = sumDocFreq;
+      outputFieldInfo->sumTotalTermFreq = sumTotalTermFreq;
+      if (termOrd == 0) {
+        outputFieldInfo->flags &= ~FieldType::TERM_RANGES;
+        outputFieldInfo->termBlockIndexLoc = {0, 0};
+        outputFieldInfo->termsLoc = {0, 0};
+        outputFieldInfo->docsLoc = {0, 0};
+        outputFieldInfo->posLoc = {0, 0};
+        outputFieldInfo->trieLoc = {0, 0};
+        outputFieldInfo->trieRootOff = 0;
+        outputFieldInfo->rangeTableLoc = {0, 0};
+      } else {
+        assert(rows.size() >= 1);
+        assert(blockOrd == (int32_t) blockOffsets.size());
+        outputFieldInfo->termsLoc = rows[0].termsBase;
+        outputFieldInfo->docsLoc = rows[0].docsBase;
+        outputFieldInfo->posLoc = rows[0].posBase;
+        outputFieldInfo->termBlockIndexLoc = termsOut.slocation();
+        termsOut.write(blockOffsets.data(), blockOffsets.size() * sizeof(blockOffsets[0]));
+
+        outputFieldInfo->trieRootOff = (int64_t) trieBuilder.finish();
+        const std::vector<char>& trieBytes = trieBuilder.bytes();
+        assert(blockOffsets.size() * sizeof(blockOffsets[0]) + trieBytes.size()
+               >= SVB_OVERREAD_PAD);
+        outputFieldInfo->trieLoc = termsOut.slocation();
+        termsOut.write(trieBytes.data(), trieBytes.size());
+
+        termsOut.align(8);
+        outputFieldInfo->rangeTableLoc = termsOut.slocation();
+        termsOut.writeInt((int32_t) rows.size());
+        termsOut.writeInt(blockOrd);
+        for (const auto& range : rows) {
+          termsOut.writeInt((int32_t) range.firstTermOrd);
+          termsOut.writeInt((int32_t) range.firstBlockOrd);
+          termsOut.writeLong((int64_t) range.docsBase.raw());
+          termsOut.writeLong((int64_t) range.posBase.raw());
+          termsOut.writeLong((int64_t) range.termsBase.raw());
+          termsOut.writeLong((int64_t) range.docsBytes);
+          termsOut.writeLong((int64_t) range.posBytes);
+        }
+        outputFieldInfo->flags |= FieldType::TERM_RANGES;
+      }
+
+      for (auto& stream : streams) stream.reset();
+      NormsWriter::writeValues(pool, merger.postingsWriter, *outputFieldInfo,
+                               preparedNorms, normDocsWithField);
+      heldStreams.release();
+      ramGuard.release();
+    }
+  };
+
+  void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos,
+                  MergeAdmissionDriver& admissionDriver,
+                  MergeAdmissionDriver::BatchAdmission& admission) {
     int32_t nDocs = postingsWriter.getMaxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
@@ -758,10 +1319,26 @@ private:
         LOG_ERROR("Field types don't match! {} {}", (int)type, (int)field->segFieldInfo.type);
         // now what?
       }
-      allFlags |= field->segFieldInfo.flags;
+      allFlags |= field->segFieldInfo.flags & ~FieldType::TERM_RANGES;
     }
     bool isText = type == FieldType::Type::TEXT;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
+    if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
+      int64_t serialCost = estimateCost(mergeFieldInfos);
+      int64_t coordinatorCost = partitionCoordinatorCost(compactFields);
+      if (admission.repriceRam(std::max(serialCost, coordinatorCost))) {
+        auto rangePlan = planTermRanges(compactFields, pool);
+        if (rangePlan.has_value()) {
+          if (!admission.repriceRam(coordinatorCost)) std::unreachable();
+          auto coordinator = std::make_shared<PartitionCoordinator>(
+              *this, admissionDriver, std::move(mergeFieldInfos),
+              std::move(*rangePlan), allFlags);
+          coordinator->start(coordinator, admission);
+          return;
+        }
+        if (!admission.repriceRam(serialCost)) std::unreachable();
+      }
+    }
     Stream normBytes;
     DocStream normDocsWithField(pool);
     int32_t numNormDocsWithField = 0;
@@ -798,68 +1375,9 @@ private:
         textWriter.setNorms(preparedNorms.textView());
       }
 
-      // Collect TermsEnum for each segment.  Keep track of the index so we can visit in ascending order one at a time.
-      struct TermsEnumIdx {
-        TermsEnum tenum;
-        size_t idx;
-      };
-      std::vector<TermsEnumIdx> tenums;
-      tenums.reserve(compactFields.size());
-      std::vector<TermsEnumIdx*> tenumPtrs;
-      tenumPtrs.reserve(compactFields.size());
-
-      for (size_t idx = 0; idx<compactFields.size(); idx++) {
-        auto field = compactFields[idx];
-        tenums.emplace_back(TermsEnumIdx{TermsEnum(pool, *field->seg->postingsReader, field->segFieldInfo), idx});
-        // Position on the first term.  If none, don't add to the PQ
-        if (tenums.back().tenum.nextTerm()) {
-          tenumPtrs.push_back(&tenums.back());
-        }
-      }
-
-      auto termCmp = [](const TermsEnumIdx& a, const TermsEnumIdx& b){
-        int cmp = b.tenum.term() <=> a.tenum.term();
-        return cmp < 0 || (cmp == 0 && b.idx < a.idx);  // tiebreak by index so we visit segments in order
-      };
-      // Only enums positioned on a term participate. Some indexed text
-      // segments legitimately have presence/norms but zero terms.
-      IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenumPtrs);
-
-      // iterate through the terms in sorted order
-      char termBuf[PackedTerm::MAX_BYTES];
-      while (termPQ.size() > 0) {
-        TermsEnumIdx& first = termPQ.top();
-        // Copy the term to local storage: it anchors the same-term do-while comparison
-        // below, and advancing the source enum overwrites the enum's term buffer.
-        PackedTerm term(termBuf);
-        first.tenum.term().copyTo(term);
-        auto termOrd = textWriter.startTerm(term);
-
-        do {
-          TermsEnumIdx& entry = termPQ.top();
-          // need to create the docsEnum while the termsEnum is still positioned on the term.
-          DocsEnum docsEnum(pool, *compactFields[entry.idx]->seg->postingsReader, entry.tenum);
-
-          if (isOrdCol) {
-            // this is a string column, so keep track of the ordinals for each doc
-            addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg, ordCollector.value(), termOrd);
-          } else {
-            // text field, so add docs with positions to the textWriter
-            addDocsPos(textWriter, docsEnum, *compactFields[entry.idx]->seg);
-          }
-
-          // advance that entry to the next term, removing from pq if exhausted.
-          if (entry.tenum.nextTerm()) {
-            termPQ.updateTop();
-          } else {
-            termPQ.removeTop();
-          }
-          // continue while more enums are positioned on the same term
-        } while (termPQ.size() > 0 && termPQ.top().tenum.term() == term);
-
-        textWriter.endTerm(term);
-      }
-
+      mergeTerms(textWriter, compactFields, isOrdCol,
+                 isOrdCol ? &ordCollector.value() : nullptr,
+                 std::nullopt, std::nullopt, pool);
       textWriter.endField();
     }
 

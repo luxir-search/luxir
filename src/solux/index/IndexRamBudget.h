@@ -69,6 +69,18 @@ public:
       }
     }
 
+    bool tryResize(int64_t newBytes) {
+      assert(newBytes >= 0);
+      assert(budget != nullptr);
+      if (!budget->tryResize(bytes, newBytes)) return false;
+      bytes = newBytes;
+      return true;
+    }
+
+    int64_t size() const {
+      return bytes;
+    }
+
     explicit operator bool() const {
       return budget != nullptr;
     }
@@ -78,6 +90,18 @@ private:
   mutable std::mutex mutex;
   int64_t total = 0;
   int64_t reserved = 0;
+
+  bool tryResize(int64_t oldBytes, int64_t newBytes) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    assert(oldBytes >= 0 && newBytes >= 0 && reserved >= oldBytes);
+    int64_t withoutGuard = reserved - oldBytes;
+    if (newBytes > oldBytes && total != 0
+        && (withoutGuard > total || newBytes > total - withoutGuard)) {
+      return false;
+    }
+    reserved = withoutGuard + newBytes;
+    return true;
+  }
 
 public:
   explicit IndexRamBudget(int64_t totalBytes = 0) : total(totalBytes) {

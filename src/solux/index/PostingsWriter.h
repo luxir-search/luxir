@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "solux/index/TrieBuilder.h"
@@ -323,6 +324,9 @@ private:
         fieldOutput.writeVlong(finfo.sumTotalTermFreq - finfo.sumDocFreq);  // sumTotalTermFreq >= sumDocFreq
         fieldOutput.writeVal(finfo.trieLoc);
         fieldOutput.writeVlong(finfo.trieRootOff);
+        if ((finfo.flags & FieldType::TERM_RANGES) != 0) {
+          fieldOutput.writeVal(finfo.rangeTableLoc);
+        }
       }
 
       // Things that have an int col: text fields (for norms), int col, float col, double col, string col (for ords)
@@ -411,6 +415,35 @@ public:
 
 // TODO: we need a specialization of this for when positions are not required (indexed string fields)
 class TextWriter {
+public:
+  struct RangeResult {
+    std::vector<uint64_t> termBlockOffsets;
+    std::vector<std::string> separatorKeys;
+    std::string firstTerm;
+    std::string lastTerm;
+    int64_t sumDocFreq = 0;
+    int64_t sumTotalTermFreq = 0;
+    uint64_t docsBytes = 0;
+    uint64_t posBytes = 0;
+    int32_t nTerms = 0;
+    int32_t nBlocks = 0;
+  };
+
+  static std::string separatorKey(std::string_view previous, std::string_view first) {
+    uint32_t minLen = (uint32_t) std::min(previous.size(), first.size());
+    uint32_t mismatch = 0;
+    while (mismatch < minLen
+           && (uint8_t) previous[mismatch] == (uint8_t) first[mismatch]) {
+      mismatch++;
+    }
+    assert(mismatch < first.size());
+    if (mismatch < previous.size()) {
+      assert((uint8_t) previous[mismatch] < (uint8_t) first[mismatch]);
+    }
+    return std::string(first.substr(0, mismatch + 1));
+  }
+
+private:
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo* fieldInfo;
 
@@ -489,6 +522,9 @@ class TextWriter {
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
   TrieBuilder trieBuilder;
+  std::vector<std::string> separatorKeys;
+  std::string firstTermInRun;
+  bool buildTrie = true;
   std::array<char, PackedTerm::MAX_BYTES> lastTermOfPrevBlock{};
   uint32_t lastTermOfPrevBlockLen = 0;
   bool hasLastTermOfPrevBlock = false;
@@ -805,19 +841,16 @@ private:  // some internal utility methods... not for use by indexers
     // with the previous block's last term.  That key is strictly greater than
     // every term in the previous block and <= the first term in this block, so
     // floorBlock routes between-block gaps to the later block.
-    assert(hasLastTermOfPrevBlock);
     auto [firstData, firstLen] = termList[0].unpack();
-    uint32_t minLen = std::min(lastTermOfPrevBlockLen, firstLen);
-    uint32_t mismatch = 0;
-    while (mismatch < minLen
-           && (uint8_t)lastTermOfPrevBlock[mismatch] == (uint8_t)firstData[mismatch]) {
-      mismatch++;
+    assert(hasLastTermOfPrevBlock);
+    std::string key = separatorKey(
+        std::string_view(lastTermOfPrevBlock.data(), lastTermOfPrevBlockLen),
+        std::string_view(firstData, firstLen));
+    if (buildTrie) {
+      trieBuilder.add(key, blockOrd);
+    } else {
+      separatorKeys.push_back(std::move(key));
     }
-    assert(mismatch < firstLen);
-    if (mismatch < lastTermOfPrevBlockLen) {
-      assert((uint8_t)lastTermOfPrevBlock[mismatch] < (uint8_t)firstData[mismatch]);
-    }
-    trieBuilder.add(std::string_view(firstData, mismatch + 1), blockOrd);
   }
 
   void rememberLastTermOfCurrentBlock() {
@@ -925,6 +958,12 @@ public:
   {
   }
 
+  TextWriter(PostingsWriter& postingsWriter, OutputStream& termOutput,
+             OutputStream& docOutput, OutputStream& posOutput)
+  : postingsWriter(postingsWriter), termOutput(termOutput), docOutput(docOutput),
+    posOutput(posOutput), buildTrie(false) {
+  }
+
   // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
   void startField(const std::string& fieldName) {
     PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(fieldName);
@@ -949,6 +988,8 @@ public:
 
     termBlockOffsets.resize(0);
     trieBuilder.reset();
+    separatorKeys.clear();
+    firstTermInRun.clear();
     lastTermOfPrevBlockLen = 0;
     hasLastTermOfPrevBlock = false;
 
@@ -1185,6 +1226,11 @@ public:
     TermRef reference = termList[0];
     auto [firstData, firstLen] = reference.unpack();
     auto [lastData, lastLen] = termList.back().unpack();
+    // numTerms was just bumped by this block, so equality means this is the
+    // run's first non-empty block: capture the run's first term for stitching.
+    if (numTerms == nTerms) {
+      firstTermInRun.assign(firstData, firstLen);
+    }
     uint32_t blockPrefixLen = commonPrefixLen(firstData, firstLen, lastData, lastLen);
     assert(blockPrefixLen <= UINT8_MAX);
 
@@ -1467,21 +1513,42 @@ public:
     }
   }
 
-  // This should only be called once.  Multiple fields are not handled any longer.
-  void endField() {
+  RangeResult finishTermRun() {
     flushTerms(true);
+
+    RangeResult result;
+    result.termBlockOffsets = std::move(termBlockOffsets);
+    result.separatorKeys = std::move(separatorKeys);
+    result.firstTerm = std::move(firstTermInRun);
+    if (numTerms != 0) {
+      result.lastTerm.assign(lastTermOfPrevBlock.data(), lastTermOfPrevBlockLen);
+    }
+    result.sumDocFreq = sumDocFreq;
+    result.sumTotalTermFreq = sumTotalTermFreq;
+    result.docsBytes = (uint64_t) (docOutput.size() - docsLoc);
+    result.posBytes = (uint64_t) (posOutput.size() - posLoc);
+    result.nTerms = numTerms;
+    result.nBlocks = (int32_t) result.termBlockOffsets.size();
+    assert((result.nTerms == 0) == (result.nBlocks == 0));
+    return result;
+  }
+
+  void finalizeField(RangeResult&& result) {
+    assert(buildTrie);
 
     // write index into the blocks of the terms dict
     // TODO: use a more efficient encoding for this array
     //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    fieldInfo->nTerms = numTerms;
-    fieldInfo->sumDocFreq = sumDocFreq;
-    fieldInfo->sumTotalTermFreq = sumTotalTermFreq;
+    fieldInfo->nTerms = result.nTerms;
+    fieldInfo->sumDocFreq = result.sumDocFreq;
+    fieldInfo->sumTotalTermFreq = result.sumTotalTermFreq;
+    fieldInfo->flags &= ~FieldType::TERM_RANGES;
+    fieldInfo->rangeTableLoc = {0, 0};
 
-    if (numTerms == 0) {
-      assert(termBlockOffsets.empty());
+    if (result.nTerms == 0) {
+      assert(result.termBlockOffsets.empty());
       fieldInfo->termBlockIndexLoc = {0, 0};
       fieldInfo->termsLoc = {0, 0};
       fieldInfo->docsLoc = {0, 0};
@@ -1492,7 +1559,8 @@ public:
     }
 
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
-    assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
+    assert((int)result.termBlockOffsets.size()
+           == ((result.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1);
     // Append the trie after the fixed block-offset array.  trieRootOff is
     // relative to trieLoc, while child links inside the trie are backward
     // deltas within this appended byte region.
@@ -1502,14 +1570,21 @@ public:
     // be read with the AVX decoder's tail overread, so the block-offset table
     // plus trie bytes that follow the final block must provide the same slack as
     // pure postings files.
-    assert(termBlockOffsets.size() * sizeof(termBlockOffsets[0]) + trieBytes.size() >= SVB_OVERREAD_PAD);
-    termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
+    assert(result.termBlockOffsets.size() * sizeof(result.termBlockOffsets[0])
+           + trieBytes.size() >= SVB_OVERREAD_PAD);
+    termOutput.write(result.termBlockOffsets.data(),
+                     result.termBlockOffsets.size() * sizeof(result.termBlockOffsets[0]));
     fieldInfo->trieLoc = seg_location(termOutput.streamNumber, termOutput.size());
     termOutput.write(trieBytes.data(), trieBytes.size());
 
     fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
     fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);
     fieldInfo->posLoc = seg_location(posOutput.streamNumber, posLoc);
+  }
+
+  // This should only be called once. Multiple fields are not handled any longer.
+  void endField() {
+    finalizeField(finishTermRun());
   }
 
 

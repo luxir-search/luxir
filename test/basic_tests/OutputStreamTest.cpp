@@ -104,3 +104,25 @@ TEST_F(OutputStreamTest, randWrite) {
   }
 
 }
+
+TEST_F(OutputStreamTest, appendFileContinuesWriting) {
+  RAMFile source("source");
+  OutputStream sourceOut(&source);
+  std::string middle(4097, 'm');
+  sourceOut.write(middle.data(), middle.size());
+  sourceOut.flush(true);
+
+  RAMDir dir;
+  auto file = dir.createFile("target");
+  OutputStream out(file.get());
+  out.writeBytes("before");
+  out.appendFile(source);
+  EXPECT_EQ(0u, source.size());
+  out.writeBytes("after");
+  out.close();
+  dir.finishFile(*file);
+
+  auto input = dir.openFile("target");
+  ASSERT_NE(nullptr, input);
+  EXPECT_EQ(std::string("before") + middle + "after", input->read());
+}

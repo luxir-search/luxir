@@ -64,6 +64,8 @@ public:
   // RANGE query contract. Numeric fields use a 1-D points index. GEO_POINT
   // flushes a 2-D BKD index; its query and merge consumers land in pass C.
   static constexpr flag_type INDEX_RANGE = (1 << 11);
+  // Segment-format marker. It is never supplied by schema configuration.
+  static constexpr flag_type TERM_RANGES = (1 << 12);
 
   const FieldType::Type type_;
   const std::string name_;

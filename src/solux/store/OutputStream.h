@@ -24,6 +24,14 @@ public:
 
   uint32_t filenum() const noexcept { return x >> OFFSET_BITS; }
   uint64_t offset() const noexcept { return x & OFFSET_MASK; }
+  uint64_t raw() const noexcept { return x; }
+  bool isNull() const noexcept { return x == 0; }
+
+  static seg_location fromRaw(uint64_t raw) noexcept {
+    seg_location location;
+    location.x = raw;
+    return location;
+  }
 
   // return filenum, offset pair
   std::pair< uint32_t, uint64_t> decode() const noexcept {
@@ -58,12 +66,8 @@ public:
 
   virtual size_t size() = 0;
 
-  /// appends the input RAMFile by stealing its buffers.
-  /// IMPORTANT: If an OutputStream is attached to this File and will continue to be used after
-  /// this operation, you must call updateFlushedSize() on the OutputStream to update its size tracking.
-  /// Example: out->updateFlushedSize(out->size() + appendedDataSize);
-  /// Without this update, the OutputStream will not know about the appended data and may return
-  /// incorrect size/offset information.
+  /// Appends the input RAMFile by stealing its buffers. OutputStream::appendFile
+  /// is the normal entry point because it also repairs the attached stream.
   virtual void destructiveAppend(RAMFile &in) = 0;
 
   virtual ~File() = default;
@@ -82,9 +86,6 @@ class OutputStream {
   char *start = nullptr;
   char *end = nullptr;
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
-public:
-  // Update flushedSize when external operations change the file size
-  void updateFlushedSize(size_t newSize) { flushedSize = newSize; }
 private:
   File *target;
 public:
@@ -100,9 +101,11 @@ public:
   // classes even if file creation is deferred.
   explicit OutputStream(File* target = nullptr) : target(target) {}
 
-  size_t buffered() const noexcept { return pos - start; }
+  size_t buffered() const noexcept { return start == nullptr ? 0 : (size_t)(pos - start); }
 
-  size_t reserved() const noexcept { return end - pos; }  // the amount of space left in the buffer
+  size_t reserved() const noexcept {
+    return pos == nullptr ? 0 : (size_t)(end - pos);
+  }
   uint32_t reserve(uint32_t needed) {
     if (reserved() < needed) {
       flush();  // TODO: pass down needed amount?
@@ -128,6 +131,10 @@ public:
     assert(target == nullptr);
     target = fileTarget;
   }
+
+  // Flushes both sides, destructively appends file, updates size accounting,
+  // and leaves this stream ready for continued writes.
+  void appendFile(RAMFile& file);
 
   // pretend that numBytes have been written and move ptr() that many bytes forward in the buffer.
   // requires reserved() >= numBytes as a prerequisite.
@@ -259,6 +266,7 @@ class RAMFile : public File {
   friend class OutputStream;
 
   friend class RAMInputFile;
+  friend class FSFile;
 
   using element_type = std::pair<std::unique_ptr<char[]>, size_t>;
 
@@ -270,7 +278,7 @@ class RAMFile : public File {
   }
 
   void flush(OutputStream &os, bool deferNewBuff) override {
-    auto thisBufferSize = os.pos - os.start;
+    auto thisBufferSize = os.start == nullptr ? 0 : (size_t)(os.pos - os.start);
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
 
@@ -343,6 +351,13 @@ public:
     in.buffers.clear();
   }
 };
+
+inline void OutputStream::appendFile(RAMFile& file) {
+  flush(true);
+  target->destructiveAppend(file);
+  flushedSize = target->size();
+  target->flush(*this, false);
+}
 
 class InputFile {
 public:

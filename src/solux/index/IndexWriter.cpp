@@ -1865,7 +1865,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "segment_merge";
       // Do the actual merge.
-      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget);
+      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
+                           termPartitionMinBytes, termPartitionMinRangeBytes,
+                           termPartitionMaxRanges);
       merger.merge();
 
       phase = "new_segment_info";

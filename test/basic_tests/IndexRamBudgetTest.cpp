@@ -55,3 +55,16 @@ TEST(IndexRamBudgetTest, GuardReleasesOnDestructionAndMove) {
   EXPECT_TRUE(budget.tryAcquire(10));
   budget.release(10);
 }
+
+TEST(IndexRamBudgetTest, GuardResizeIsAtomic) {
+  IndexRamBudget budget(10);
+  auto guard = budget.tryAcquireGuard(4);
+  ASSERT_TRUE(guard.has_value());
+
+  EXPECT_TRUE(guard->tryResize(8));
+  EXPECT_EQ(8, budget.reservedBytes());
+  EXPECT_FALSE(guard->tryResize(11));
+  EXPECT_EQ(8, budget.reservedBytes());
+  EXPECT_TRUE(guard->tryResize(3));
+  EXPECT_EQ(3, budget.reservedBytes());
+}

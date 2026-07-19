@@ -14,6 +14,9 @@ struct MergeCostModel {
   static constexpr int64_t LIGHT_BYTES = 1024 * 1024;
   static constexpr int32_t MAX_STREAMS = 16;
   static constexpr int64_t STORED_CHUNK_BUFFER_MULTIPLIER = 5;
+  static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
+  static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
+  static constexpr int32_t MAX_TERM_RANGES = 8;
 
   // Peak checked-out OutputStreams for each writer path.
   static constexpr int32_t TEXT_STREAMS = 3;      // TextWriter owns term/doc/pos streams together.

@@ -1,8 +1,30 @@
 #pragma once
+#include <bit>
+#include <type_traits>
 #include "PostingsReader.h"
 #include "solux/schema/FieldType.h"
 
 namespace solux {
+struct TermRangeTableHeader {
+  uint32_t nRanges;
+  uint32_t totalBlocks;
+};
+
+struct TermRangeRow {
+  uint32_t firstTermOrd;
+  uint32_t firstBlockOrd;
+  seg_location docsBase;
+  seg_location posBase;
+  seg_location termsBase;
+  uint64_t docsBytes;
+  uint64_t posBytes;
+};
+
+static_assert(sizeof(TermRangeTableHeader) == 8);
+static_assert(sizeof(TermRangeRow) == 48);
+static_assert(std::is_trivially_copyable_v<TermRangeRow>);
+static_assert(std::endian::native == std::endian::little);
+
 struct SegFieldInfo {
   enum NormsFormat : uint8_t {
     NORMS_NONE = 0,
@@ -30,6 +52,7 @@ struct SegFieldInfo {
   int64_t sumTotalTermFreq;
   seg_location trieLoc;
   int64_t trieRootOff;
+  seg_location rangeTableLoc;
 
   // column
   seg_location docsWithFieldEndLoc;
@@ -161,6 +184,7 @@ public:
       fieldInfo.type = static_cast<FieldType::Type>(fieldIS.readVint());
       fieldInfo.flags = fieldIS.readVint();
       fieldInfo.docsWithField = fieldIS.readVint();
+      fieldInfo.rangeTableLoc = {0, 0};
       if (fieldInfo.flags & FieldType::INDEX_DOCS) {
         fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
         fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
@@ -171,6 +195,9 @@ public:
         fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.readVlong();
         fieldInfo.trieLoc = fieldIS.readVal<seg_location>();
         fieldInfo.trieRootOff = fieldIS.readVlong();
+        if ((fieldInfo.flags & FieldType::TERM_RANGES) != 0) {
+          fieldInfo.rangeTableLoc = fieldIS.readVal<seg_location>();
+        }
       }
 
       fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();

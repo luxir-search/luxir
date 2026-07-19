@@ -82,7 +82,7 @@ class FSFile : public File {
   }
 
   void flush(OutputStream& os, bool deferNewBuff) override {
-    auto written = (size_t)(os.pos - os.start);
+    auto written = os.start == nullptr ? 0 : (size_t)(os.pos - os.start);
     fileSize_ += written;
     os.flushedSize = fileSize_;
 
@@ -133,11 +133,12 @@ public:
     if (otherSize == 0) return;
 
     openFd();
-    auto tmpBuf = std::make_unique_for_overwrite<char[]>(otherSize);
-    in.copyTo(tmpBuf.get());
-    writeToFd(tmpBuf.get(), otherSize);
+    for (const auto& [buffer, size] : in.buffers) {
+      writeToFd(buffer.get(), size);
+    }
     fileSize_ += otherSize;
-    in.clear();
+    in.fileSize = 0;
+    in.buffers.clear();
   }
 };
 

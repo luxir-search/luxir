@@ -84,6 +84,7 @@ protected:
     fieldReader.readFieldInfo(fieldInfo);
     ASSERT_EQ(hasFreqs, FieldType::hasFreqs(fieldInfo.flags));
     ASSERT_EQ(hasPositions, FieldType::hasPositions(fieldInfo.flags));
+    ASSERT_FALSE(fieldInfo.rangeTableLoc.isNull());
 
     int64_t sumDf = 0;
     int64_t sumTtf = 0;
@@ -187,6 +188,9 @@ TEST_F(TextMergeFuzzTest, bulkPositionDeltaShapes) {
   auto schema = mixedSchema();
   TestIndex index;
   index.iw = std::make_unique<IndexWriter>(index.dir, [schema] { return schema; });
+  index.iw->termPartitionMinBytes = 1;
+  index.iw->termPartitionMinRangeBytes = 1;
+  index.iw->termPartitionMaxRanges = 4;
   TestField pos(index, "pos");
   TestField freq(index, "freq");
   TestField docs(index, "docs");

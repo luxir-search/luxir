@@ -11,6 +11,7 @@
 #include <oneapi/tbb/flow_graph.h>
 #include "solux/index/AuxInfo.h"
 #include "solux/index/IndexRamBudget.h"
+#include "solux/index/MergeCostModel.h"
 #include "solux/store/Directory.h"
 #include "solux/search/IndexReader.h"
 #include "solux/server/SoluxError.h"
@@ -406,6 +407,23 @@ public:
   // Set from SoluxConfig at collection creation.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = 8 * 1024 * 1024;
+
+  // TEXT merge partitioning thresholds. Tests and constrained deployments may
+  // lower these without changing the on-disk behavior of flushes or serial merges.
+  // Debug builds default the byte floors to 1 so every text merge with enough
+  // source term blocks partitions: the whole suite then exercises range tables,
+  // tail blocks, and empty-range edge cases, not just the dedicated tests.
+  // (Splits land on source block-leading terms, so tiny fields still merge
+  // serially for lack of candidates.)  Tests that need serial merges pin the
+  // thresholds high explicitly.
+#ifdef NDEBUG
+  int64_t termPartitionMinBytes = MergeCostModel::MIN_TERM_PARTITION_BYTES;
+  int64_t termPartitionMinRangeBytes = MergeCostModel::MIN_TERM_RANGE_BYTES;
+#else
+  int64_t termPartitionMinBytes = 1;
+  int64_t termPartitionMinRangeBytes = 1;
+#endif
+  int32_t termPartitionMaxRanges = MergeCostModel::MAX_TERM_RANGES;
 
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.

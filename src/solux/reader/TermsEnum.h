@@ -10,6 +10,8 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace solux {
 class TermsEnum {
@@ -68,12 +70,30 @@ class TermsEnum {
   bool metadataRunsParsed = false;
 
   // term index level
-  const int64_t* termBlockOffsets = nullptr;
+  const uint64_t* termBlockOffsets = nullptr;
   InputStream trieIS;
   const char* trieBase;
   int32_t numTermBlocks = 0;
+  const TermRangeRow* rangeRows = nullptr;
+  const TermRangeRow* row = nullptr;
+  int32_t rangeCount = 0;
+  int32_t rowLastTermOrd = -1;
+  int32_t rowEndBlockOrd = 0;  // one past the current row's last block ord
+  // Current row's bases/filenums, cached as enum-local members by selectRow so
+  // the per-block and per-term hot paths never chase the row pointer.
+  int64_t rowTermsBase = 0;
+  int64_t rowDocsBase = 0;
+  int64_t rowPosBase = 0;
+  uint32_t rowDocsFile = 0;
+  uint32_t rowPosFile = 0;
 
 public:
+  struct BlockEstimate {
+    std::string firstTerm;
+    uint64_t bytes;
+    uint64_t safetyBytes;
+  };
+
   struct EncodedImpactFrontier {
     const char* ptr = nullptr;
     uint32_t len = 0;
@@ -103,11 +123,35 @@ public:
     unused(this->pool, this->postingsReader);
     currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
     if (fieldInfo.nTerms == 0) return;
-    numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
-    termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
+    termBlockOffsets = reinterpret_cast<const uint64_t*>(termsIS.ptr());
     trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
     trieBase = trieIS.ptr();
+
+    if (!fieldInfo.rangeTableLoc.isNull()) {
+      InputStream tableIS = postingsReader.getInputStreamSeek(fieldInfo.rangeTableLoc);
+      assert((tableIS.offset() & 7) == 0);
+      const auto* header = reinterpret_cast<const TermRangeTableHeader*>(tableIS.ptr());
+      rangeCount = (int32_t) header->nRanges;
+      numTermBlocks = (int32_t) header->totalBlocks;
+      assert(rangeCount > 0 && numTermBlocks > 0);
+      rangeRows = reinterpret_cast<const TermRangeRow*>(header + 1);
+    } else {
+      numTermBlocks = ((fieldInfo.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1;
+      rangeCount = 1;
+      // Pool-allocated (not a member) so the address survives moves of this
+      // enum; the hot paths read the cached row* members, not this struct.
+      rangeRows = pool.make<TermRangeRow>(TermRangeRow{
+          0, 0, fieldInfo.docsLoc, fieldInfo.posLoc, fieldInfo.termsLoc, 0, 0});
+    }
+#ifndef NDEBUG
+    // readTermBlock reuses termsIS across rows: every row's terms region must
+    // share the block-index stream.
+    for (int32_t i = 0; i < rangeCount; i++) {
+      assert(rangeRows[i].termsBase.filenum() == fieldInfo.termBlockIndexLoc.filenum());
+    }
+#endif
+    selectRow(rangeRows);
   }
 
   int32_t numTerms() const {
@@ -132,6 +176,97 @@ public:
   /// sumTotalTermFreq is the sum of totalTermFreq for all terms in this field (i.e. number of tokens indexed)
   int64_t sumTotalTermFreq() const {
     return fieldInfo.sumTotalTermFreq;
+  }
+
+  int32_t numBlocks() const {
+    return numTermBlocks;
+  }
+
+  int64_t dictionaryBytes() const {
+    if (fieldInfo.nTerms == 0) return 0;
+    assert(fieldInfo.termBlockIndexLoc.filenum() == fieldInfo.termsLoc.filenum());
+    assert(fieldInfo.termBlockIndexLoc.offset() >= fieldInfo.termsLoc.offset());
+    uint64_t bytes = fieldInfo.termBlockIndexLoc.offset() - fieldInfo.termsLoc.offset();
+    assert(bytes <= INT64_MAX);
+    return (int64_t) bytes;
+  }
+
+  std::vector<BlockEstimate> estimateTermBlocks() const {
+    std::vector<BlockEstimate> blocks;
+    blocks.reserve((size_t) numTermBlocks);
+    for (int32_t rangeOrd = 0; rangeOrd < rangeCount; rangeOrd++) {
+      const TermRangeRow& sourceRow = rangeRows[rangeOrd];
+      int32_t firstBlock = (int32_t) sourceRow.firstBlockOrd;
+      int32_t endBlock = rangeOrd + 1 < rangeCount
+          ? (int32_t) rangeRows[rangeOrd + 1].firstBlockOrd : numTermBlocks;
+      int32_t count = endBlock - firstBlock;
+      assert(count > 0);
+
+      std::vector<uint64_t> docsOffsets((size_t) count);
+      std::vector<uint64_t> posOffsets((size_t) count);
+      InputStream input = postingsReader.getInputStream(sourceRow.termsBase.filenum());
+      size_t outputBase = blocks.size();
+      for (int32_t i = 0; i < count; i++) {
+        int32_t blockOrd = firstBlock + i;
+        input.seek(blockLocation(&sourceRow, blockOrd));
+        PackedTerm first = input.readPackedTerm();
+        blocks.push_back({std::string(first.data(), first.size()), 0, 0});
+        docsOffsets[(size_t) i] = input.readVlong();
+        posOffsets[(size_t) i] = input.readVlong();
+      }
+
+      uint64_t precedingBytes = 0;
+      for (int32_t i = 0; i + 1 < count; i++) {
+        assert(docsOffsets[(size_t) i + 1] >= docsOffsets[(size_t) i]);
+        assert(posOffsets[(size_t) i + 1] >= posOffsets[(size_t) i]);
+        uint64_t bytes = docsOffsets[(size_t) i + 1] - docsOffsets[(size_t) i]
+            + posOffsets[(size_t) i + 1] - posOffsets[(size_t) i];
+        blocks[outputBase + (size_t) i].bytes = bytes;
+        blocks[outputBase + (size_t) i].safetyBytes = bytes;
+        precedingBytes += bytes;
+      }
+      uint64_t lastDocsOffset = docsOffsets.back();
+      uint64_t lastPosOffset = posOffsets.back();
+      uint64_t finalBytes;
+      if (!fieldInfo.rangeTableLoc.isNull()) {
+        assert(sourceRow.docsBytes >= lastDocsOffset);
+        assert(sourceRow.posBytes >= lastPosOffset);
+        finalBytes = sourceRow.docsBytes - lastDocsOffset
+            + sourceRow.posBytes - lastPosOffset;
+      } else {
+        InputStream docsInput = postingsReader.getInputStream(sourceRow.docsBase.filenum());
+        uint64_t docsStart = sourceRow.docsBase.offset() + lastDocsOffset;
+        assert(docsStart <= (uint64_t) docsInput.size());
+        finalBytes = (uint64_t) docsInput.size() - docsStart;
+        if (FieldType::hasPositions(fieldInfo.flags)) {
+          InputStream posInput = postingsReader.getInputStream(sourceRow.posBase.filenum());
+          uint64_t posStart = sourceRow.posBase.offset() + lastPosOffset;
+          assert(posStart <= (uint64_t) posInput.size());
+          finalBytes += (uint64_t) posInput.size() - posStart;
+        }
+      }
+      uint64_t finalEstimate = finalBytes;
+      if (count == 1 && fieldInfo.rangeTableLoc.isNull()) {
+        assert(fieldInfo.sumDocFreq >= 0 && fieldInfo.sumTotalTermFreq >= 0);
+        auto addEstimate = [&](uint64_t values, uint64_t bytesPerValue) {
+          uint64_t bytes = values > UINT64_MAX / bytesPerValue
+              ? UINT64_MAX : values * bytesPerValue;
+          finalEstimate = UINT64_MAX - finalEstimate < bytes
+              ? UINT64_MAX : finalEstimate + bytes;
+        };
+        finalEstimate = 0;
+        addEstimate((uint64_t) fieldInfo.sumDocFreq,
+                    FieldType::hasFreqs(fieldInfo.flags) ? 10 : 5);
+        if (FieldType::hasPositions(fieldInfo.flags)) {
+          addEstimate((uint64_t) fieldInfo.sumTotalTermFreq, 5);
+        }
+      }
+      blocks.back().bytes = count > 1
+          ? precedingBytes / (uint64_t) (count - 1) : finalEstimate;
+      blocks.back().safetyBytes = finalBytes;
+    }
+    assert((int32_t) blocks.size() == numTermBlocks);
+    return blocks;
   }
 
   /// returns the 0-based ordinal of the current term.
@@ -240,11 +375,11 @@ public:
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
-      state.docIS = postingsReader.getInputStream(fieldInfo.docsLoc.filenum());
+      state.docIS = postingsReader.getInputStream(rowDocsFile);
       state.docIS.seek(state.docsStart);
       if (state.hasPositions) {
         state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
-        state.posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
+        state.posIS = postingsReader.getInputStream(rowPosFile);
         state.posIS.seek(state.posStart);
       }
     }
@@ -483,6 +618,65 @@ protected:
     return (int32_t) pulsedValues[pulsedValueIndex() + 1];
   }
 
+  const TermRangeRow* rowForBlock(int32_t blockOrd) const {
+    assert(blockOrd >= 0 && blockOrd < numTermBlocks);
+    const TermRangeRow* end = rangeRows + rangeCount;
+    const TermRangeRow* found = std::upper_bound(
+        rangeRows, end, (uint32_t) blockOrd,
+        [](uint32_t value, const TermRangeRow& candidate) {
+          return value < candidate.firstBlockOrd;
+        });
+    assert(found != rangeRows);
+    return found - 1;
+  }
+
+  const TermRangeRow* rowForTerm(int32_t termOrd) const {
+    assert(termOrd >= 0 && termOrd < fieldInfo.nTerms);
+    const TermRangeRow* end = rangeRows + rangeCount;
+    const TermRangeRow* found = std::upper_bound(
+        rangeRows, end, (uint32_t) termOrd,
+        [](uint32_t value, const TermRangeRow& candidate) {
+          return value < candidate.firstTermOrd;
+        });
+    assert(found != rangeRows);
+    return found - 1;
+  }
+
+  // Cold: rows change at most once per range (N <= 8) over a whole-field
+  // iteration, and never for untabled fields.  Kept out of line so the row
+  // bookkeeping adds nothing to readTermBlock's hot code footprint.
+  [[gnu::noinline]] void reselectRowForBlock(int32_t blockOrd) {
+    selectRow(rowForBlock(blockOrd));
+  }
+
+  void selectRow(const TermRangeRow* selected) {
+    row = selected;
+    int32_t rangeOrd = (int32_t) (row - rangeRows);
+    bool hasNext = rangeOrd + 1 < rangeCount;
+    rowLastTermOrd = hasNext
+        ? (int32_t) rangeRows[rangeOrd + 1].firstTermOrd - 1
+        : fieldInfo.nTerms - 1;
+    rowEndBlockOrd = hasNext
+        ? (int32_t) rangeRows[rangeOrd + 1].firstBlockOrd : numTermBlocks;
+    rowTermsBase = (int64_t) row->termsBase.offset();
+    rowDocsBase = (int64_t) row->docsBase.offset();
+    rowPosBase = (int64_t) row->posBase.offset();
+    rowDocsFile = row->docsBase.filenum();
+    rowPosFile = row->posBase.filenum();
+  }
+
+  int64_t blockLocation(const TermRangeRow* selected, int32_t blockOrd) const {
+    uint64_t offset = termBlockOffsets[blockOrd];
+    assert(offset <= INT64_MAX);
+    return (int64_t) selected->termsBase.offset() + (int64_t) offset;
+  }
+
+  PackedTerm firstTermForBlock(int32_t blockOrd) const {
+    const TermRangeRow* selected = rowForBlock(blockOrd);
+    InputStream input = postingsReader.getInputStream(selected->termsBase.filenum());
+    return input.readPackedTerm(blockLocation(selected, blockOrd));
+  }
+
   // Seeks to termBlockIndex and reads the eager block-entry state from the
   // format written by PostingsWriter.flushTerms: header values, hash pointer,
   // prefix/suffix length run pointers, suffix blob pointer, and metadata start.
@@ -490,19 +684,37 @@ protected:
   // any stats/postings metadata.  Those happen on demand in decodeSuffixStarts,
   // decodeStats, and decodePostings.
   void readTermBlock() {
-    termsIS.seek(fieldInfo.termsLoc.offset() + termBlockOffsets[termBlockIndex]);
-    startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
+    // Common case (and always, for a single row): the block stays on the
+    // current row; only re-resolve on a row boundary.  The whole dictionary
+    // (all ranges' terms, the block-offset array, the trie) lives in one
+    // stream, so termsIS never needs reopening - only seeking.
+    if (termBlockIndex < (int32_t) row->firstBlockOrd
+        || termBlockIndex >= rowEndBlockOrd) [[unlikely]] {
+      reselectRowForBlock(termBlockIndex);
+    }
+    termsIS.seek(rowTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
+    startingOrd = (int32_t) row->firstTermOrd
+        + (termBlockIndex - (int32_t) row->firstBlockOrd) * Postings::TERMS_BLOCK_SIZE;
     ordInBlock = 0;
-    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, fieldInfo.nTerms - startingOrd - 1);
-    int64_t blockEndOffset = termBlockIndex + 1 < numTermBlocks
-        ? fieldInfo.termsLoc.offset() + termBlockOffsets[termBlockIndex + 1]
-        : fieldInfo.termBlockIndexLoc.offset();
+    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1,
+                             rowLastTermOrd - startingOrd);
+    int64_t blockEndOffset;
+    if (termBlockIndex + 1 >= numTermBlocks) {
+      blockEndOffset = (int64_t) fieldInfo.termBlockIndexLoc.offset();
+    } else if (termBlockIndex + 1 < rowEndBlockOrd) {
+      blockEndOffset = rowTermsBase + (int64_t) termBlockOffsets[termBlockIndex + 1];
+    } else {
+      // Blocks are contiguous across rows, so the next block starts the
+      // immediately following row.
+      assert(row + 1 == rowForBlock(termBlockIndex + 1));
+      blockEndOffset = blockLocation(row + 1, termBlockIndex + 1);
+    }
     blockEnd = termsIS.ptr(blockEndOffset);
 
     // see PostingsWriter.flushTerms
     startingTerm = termsIS.readPackedTerm();
-    locOfDocsForTermBlock = fieldInfo.docsLoc.offset() + termsIS.readVlong();  // fieldOffset + blockOffset for docs
-    locOfPositionsForTermBlock = fieldInfo.posLoc.offset() + termsIS.readVlong();
+    locOfDocsForTermBlock = rowDocsBase + (int64_t) termsIS.readVlong();
+    locOfPositionsForTermBlock = rowPosBase + (int64_t) termsIS.readVlong();
     blockPrefixLen = (uint8_t) termsIS.readByte();
     memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
     termsIS.skip(sizeof(pulsedMask));
@@ -610,7 +822,7 @@ public:
 
     int32_t nextBlock = termBlockIndex + 1;
     bool beyondCurrentBlock = (nextBlock < numTermBlocks) &&
-        !(target < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + termBlockOffsets[nextBlock]));
+        !(target < firstTermForBlock(nextBlock));
 
     if (beyondCurrentBlock) {
       // Load the block that may contain target, positioning at ord 0.  We
@@ -692,7 +904,9 @@ public:
     assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
     if (targetOrd < ord() || targetOrd > startingOrd + maxOrdInBlock) {
       // even if we were in the right block, we don't have the capability to go backwards or rewind
-      termBlockIndex = uint32_t(targetOrd) / Postings::TERMS_BLOCK_SIZE;
+      const TermRangeRow* selected = rowForTerm(targetOrd);
+      termBlockIndex = (int32_t) selected->firstBlockOrd
+          + (targetOrd - (int32_t) selected->firstTermOrd) / Postings::TERMS_BLOCK_SIZE;
       readTermBlock();
     }
     while (ord() < targetOrd) {

@@ -167,13 +167,10 @@ public:
     // Write the concatenated value bytes.
     {
       valuesOut.flush(true);
-      auto valuesSize = valuesFile.size();
 
       OutputStreamPtr out = postingsWriter.getOutputStream();
-      out->flush(true);
       fieldInfo.columnLoc = out->slocation();
-      out->getFile()->destructiveAppend(valuesFile);
-      out->updateFlushedSize(out->size() + valuesSize);
+      out->appendFile(valuesFile);
       // no metadata for the raw value bytes; columnMetaOff is the size of the column.
       fieldInfo.columnMetaOff = out->size() - fieldInfo.columnLoc.offset();
     }

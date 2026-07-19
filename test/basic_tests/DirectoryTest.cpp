@@ -194,6 +194,26 @@ protected:
     }
   }
 
+  void doAppendFile(Directory& dir) {
+    RAMFile source("source");
+    OutputStream sourceOut(&source);
+    std::string middle(4097, 'm');
+    sourceOut.writeBytes(middle);
+    sourceOut.flush(true);
+
+    auto file = dir.createFile("append");
+    OutputStream out(file.get());
+    out.writeBytes("before");
+    out.appendFile(source);
+    out.writeBytes("after");
+    out.close();
+    dir.finishFile(*file);
+
+    auto input = dir.openFile("append");
+    ASSERT_NE(nullptr, input);
+    EXPECT_EQ(std::string("before") + middle + "after", input->read());
+  }
+
   std::filesystem::path getTempDir() {
     std::string tmpl = (std::filesystem::temp_directory_path() / "solux_test_XXXXXX").string();
     if (mkdtemp(tmpl.data()) == nullptr) {
@@ -266,6 +286,13 @@ TEST_F(DirectoryTest, fsdirDataTypes) {
   auto path = getTempDir();
   FSDirectory dir(path);
   doDataTypes(dir);
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, fsdirAppendFile) {
+  auto path = getTempDir();
+  FSDirectory dir(path);
+  doAppendFile(dir);
   std::filesystem::remove_all(path);
 }
 
