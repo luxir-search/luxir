@@ -28,10 +28,7 @@ public:
   };
 
 private:
-  struct BlockPlan {
-    OrdColumnFormat::PredictedBlockInfo info;
-    uint32_t count = 0;
-  };
+  using BlockPlan = OrdColumnFormat::PredictedBlockPlan;
 
   MemPool& pool;
   PostingsWriter& postingsWriter;
@@ -97,41 +94,6 @@ private:
     assert(slot == ords.size());
   }
 
-  static BlockPlan planBlock(std::span<const uint32_t> values) {
-    assert(!values.empty() && values.size() <= OrdColumnFormat::BLOCK_SIZE);
-
-    auto evaluate = [&](int64_t intercept, int64_t scaledSlope) {
-      int64_t minError = INT64_MAX;
-      int64_t maxError = INT64_MIN;
-      for (uint32_t i = 0; i < values.size(); i++) {
-        int64_t predicted = intercept +
-            (((int64_t)i * scaledSlope) >> OrdColumnFormat::SLOPE_SHIFT);
-        int64_t error = (int64_t)values[i] - predicted;
-        minError = std::min(minError, error);
-        maxError = std::max(maxError, error);
-      }
-      OrdColumnFormat::PredictedBlockInfo info{};
-      info.intercept = intercept + minError;
-      info.scaledSlope = scaledSlope;
-      info.bits = (uint8_t)std::bit_width((uint64_t)(maxError - minError));
-      return info;
-    };
-
-    auto constant = evaluate(values.front(), 0);
-    int64_t scaledSlope = 0;
-    if (values.size() > 1) {
-      scaledSlope = ((int64_t)values.back() - (int64_t)values.front()) *
-                    ((int64_t)1 << OrdColumnFormat::SLOPE_SHIFT) /
-                    (int64_t)(values.size() - 1);
-    }
-    auto linear = evaluate(values.front(), scaledSlope);
-
-    BlockPlan plan;
-    plan.info = linear.bits < constant.bits ? linear : constant;
-    plan.count = (uint32_t)values.size();
-    return plan;
-  }
-
   std::vector<BlockPlan> planPredicted(int32_t indexing,
                                        std::span<const int32_t> rankToDoc,
                                        uint64_t& byteSize) const {
@@ -140,7 +102,8 @@ private:
     uint32_t count = 0;
     auto flush = [&]() {
       if (count == 0) return;
-      BlockPlan plan = planBlock(std::span<const uint32_t>(block.data(), count));
+      BlockPlan plan = OrdColumnFormat::planBlock(
+          std::span<const uint32_t>(block.data(), count));
       byteSize += sizeof(OrdColumnFormat::PredictedBlockInfo);
       if (plan.info.bits != 0) {
         byteSize += LinearPack::byteSize(count, plan.info.bits);
@@ -179,12 +142,11 @@ private:
       if (plan.info.bits != 0) {
         LinearPack::Writer writer(out, plan.info.bits);
         for (uint32_t i = 0; i < count; i++) {
-          int64_t predicted = plan.info.intercept +
-              (((int64_t)i * plan.info.scaledSlope) >> OrdColumnFormat::SLOPE_SHIFT);
-          int64_t residual = (int64_t)block[i] - predicted;
-          assert(residual >= 0 && (uint64_t)residual <=
+          uint64_t residual = OrdColumnFormat::residual(
+              plan.info, i, block[i]);
+          assert(residual <=
                  LinearPack::mask32(plan.info.bits));
-          writer.append((uint64_t)residual);
+          writer.append(residual);
         }
         writer.finish();
       }

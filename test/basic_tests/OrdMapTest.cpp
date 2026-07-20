@@ -1,13 +1,30 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <format>
 #include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "solux/search/OrdMap.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/IntColReader.h"
 
 using namespace solux;
 using namespace solux::test;
+
+namespace {
+
+class OrdMapEncodingGuard {
+  OrdMap::DeltaEncoding saved;
+
+public:
+  explicit OrdMapEncodingGuard(OrdMap::DeltaEncoding encoding)
+      : saved(OrdMap::setDeltaEncodingForTests(encoding)) {}
+  ~OrdMapEncodingGuard() { OrdMap::setDeltaEncodingForTests(saved); }
+};
+
+} // namespace
 
 class OrdMapTest : public ::testing::Test {
 protected:
@@ -536,4 +553,170 @@ TEST_F(OrdMapTest, PackedDeltaRunsCrossWidthBoundaries) {
     EXPECT_EQ(mapping.globalOrd(localOrd), positions[localOrd]);
     previousDelta = delta;
   }
+}
+
+TEST_F(OrdMapTest, FlatAndPredictedParityAcrossBlockBoundary) {
+  constexpr int nTermsPerSegment = 4224;
+  std::vector<Doc> evenDocs;
+  std::vector<Doc> oddDocs;
+  evenDocs.reserve(nTermsPerSegment);
+  oddDocs.reserve(nTermsPerSegment);
+  for (int localOrd = 0; localOrd < nTermsPerSegment; localOrd++) {
+    int even = localOrd * 2;
+    int odd = even + 1;
+    std::string evenTerm = std::format("term{:05}", even);
+    std::string oddTerm = std::format("term{:05}", odd);
+    evenDocs.push_back({{"id", std::format("e{}", even)},
+                        {"flat_s", evenTerm}, {"predicted_s", evenTerm}});
+    oddDocs.push_back({{"id", std::format("o{}", odd)},
+                       {"flat_s", oddTerm}, {"predicted_s", oddTerm}});
+  }
+  ASSERT_TRUE(helper->indexAll(evenDocs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper->indexAll(oddDocs, UpdateMessage::COMMIT).success);
+
+  auto reader = helper->getIndexWriter()->getIndexReader();
+  std::shared_ptr<OrdMap> flat;
+  std::shared_ptr<OrdMap> predicted;
+  {
+    OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::FLAT);
+    flat = reader->getOrdMap("flat_s");
+  }
+  {
+    OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::PREDICTED);
+    predicted = reader->getOrdMap("predicted_s");
+  }
+  ASSERT_NE(flat, nullptr);
+  ASSERT_NE(predicted, nullptr);
+  ASSERT_EQ(flat->numOrds(), nTermsPerSegment * 2);
+  ASSERT_EQ(predicted->numOrds(), flat->numOrds());
+  EXPECT_LT(predicted->sizeInBytes(), flat->sizeInBytes());
+
+  for (int seg = 0; seg < 2; seg++) {
+    auto flatMapping = flat->getSegToGlobal(seg);
+    auto predictedMapping = predicted->getSegToGlobal(seg);
+    ASSERT_EQ(flatMapping.numOrds, nTermsPerSegment);
+    ASSERT_EQ(predictedMapping.numOrds, flatMapping.numOrds);
+    ASSERT_FALSE(flatMapping.predicted());
+    ASSERT_TRUE(predictedMapping.predicted());
+
+    for (int64_t localOrd = 0; localOrd < nTermsPerSegment; localOrd++) {
+      EXPECT_EQ(predictedMapping.deltaAt(localOrd),
+                flatMapping.deltaAt(localOrd));
+      EXPECT_EQ(predictedMapping.globalOrd(localOrd),
+                flatMapping.globalOrd(localOrd));
+    }
+
+    for (uint64_t start : {3968u, 4096u}) {
+      uint64_t flatDeltas[128];
+      uint64_t predictedDeltas[128];
+      flatMapping.unpackDeltas(start, 128, flatDeltas);
+      predictedMapping.unpackDeltas(start, 128, predictedDeltas);
+      for (uint32_t i = 0; i < 128; i++) {
+        EXPECT_EQ(predictedDeltas[i], flatDeltas[i]);
+      }
+    }
+  }
+}
+
+TEST_F(OrdMapTest, PredictedResidualsUseSelect64) {
+  constexpr uint32_t count = 128;
+  std::array<uint64_t, count> deltas;
+  constexpr uint64_t base = 1ull << 40;
+  constexpr uint64_t step = 1ull << 35;
+  for (uint32_t i = 0; i < count; i++) {
+    deltas[i] = base + i + (i >= count / 2 ? step : 0);
+  }
+
+  auto plan = OrdColumnFormat::planBlock(
+      std::span<const uint64_t>(deltas.data(), deltas.size()));
+  ASSERT_GT(plan.info.bits, 32);
+  plan.info.payloadOffset = 0;
+  std::vector<char> payload;
+  LinearPack::Writer writer(payload, plan.info.bits);
+  uint64_t maxResidual = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    uint64_t residual = OrdColumnFormat::residual(plan.info, i, deltas[i]);
+    maxResidual = std::max(maxResidual, residual);
+    writer.append(residual);
+  }
+  writer.finish();
+  ASSERT_GT(maxResidual, UINT32_MAX);
+
+  OrdMap::SegToGlobal mapping;
+  mapping.numOrds = count;
+  mapping.deltas = payload.data();
+  mapping.blockMeta = reinterpret_cast<const char*>(&plan.info);
+  mapping.bits = (uint8_t)std::bit_width(deltas.back());
+  mapping.residualBits = plan.info.bits;
+  mapping.encoding = OrdMap::DeltaEncoding::PREDICTED;
+
+  for (uint32_t i = 0; i < count; i++) {
+    EXPECT_EQ(mapping.deltaAt(i), (int64_t)deltas[i]);
+    EXPECT_EQ(mapping.globalOrd(i), (int64_t)(i + deltas[i]));
+  }
+  uint64_t decoded[count];
+  mapping.unpackDeltas(0, count, decoded);
+  for (uint32_t i = 0; i < count; i++) {
+    EXPECT_EQ(decoded[i], deltas[i]);
+  }
+}
+
+TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
+  const std::array<std::string, 8> values = {
+      "hotel", "alpha", "echo", "charlie",
+      "golf", "bravo", "foxtrot", "delta"};
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int i = segment; i < (int)values.size(); i += 2) {
+      docs.push_back({{"id", std::format("doc{}", i)},
+                      {"flat_s", values[i]}, {"predicted_s", values[i]}});
+    }
+    ASSERT_TRUE(helper->indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+
+  auto reader = helper->getIndexWriter()->getIndexReader();
+  {
+    OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::FLAT);
+    ASSERT_NE(reader->getOrdMap("flat_s"), nullptr);
+  }
+  {
+    OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::PREDICTED);
+    auto ordMap = reader->getOrdMap("predicted_s");
+    ASSERT_NE(ordMap, nullptr);
+    EXPECT_TRUE(ordMap->getSegToGlobal(0).predicted());
+  }
+
+  struct Results {
+    std::vector<std::string> sortedIds;
+    std::vector<std::string> bucketIds;
+    std::vector<int64_t> counts;
+  };
+  auto run = [&](std::string_view field) {
+    auto req = localReq(helper->getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q").allQuery().limit(-1).fields({"id"});
+    qb::sort(top, field, qb::ASC);
+    top.facet("f", field).limit(-1);
+    req->execute(false);
+    EXPECT_OK(req);
+
+    Results results;
+    const auto* docs = req->docList("q");
+    if (docs == nullptr) return results;
+    const auto& ids = std::get<solux::api::ColStr>(
+        docs->columns.at("id").kind).v;
+    for (std::string_view id : ids) results.sortedIds.emplace_back(id);
+    const auto* facet = docs->ops.at("f")->facetResult();
+    const auto& buckets = std::get<solux::api::ColStr>(
+        facet->bucket_ids->kind).v;
+    for (std::string_view bucket : buckets) results.bucketIds.emplace_back(bucket);
+    results.counts.assign(facet->counts.begin(), facet->counts.end());
+    return results;
+  };
+
+  Results flat = run("flat_s");
+  Results predicted = run("predicted_s");
+  EXPECT_EQ(predicted.sortedIds, flat.sortedIds);
+  EXPECT_EQ(predicted.bucketIds, flat.bucketIds);
+  EXPECT_EQ(predicted.counts, flat.counts);
 }

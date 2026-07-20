@@ -1,9 +1,14 @@
 #pragma once
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
 #include "IndexReader.h"
 #include "solux/codec/LinearPack.h"
+#include "solux/codec/OrdColumnFormat.h"
 #include "solux/reader/IntColReader.h"
 
 namespace solux {
@@ -14,16 +19,46 @@ class IndexReader;
 /// This is used for fast sorting and faceting across multiple segments.
 class OrdMap {
 public:
+  enum class DeltaEncoding : uint8_t {
+    DEFAULT,
+    FLAT,
+    PREDICTED
+  };
+
   struct SegToGlobal {
     int64_t numOrds = 0;
     const char* deltas = nullptr;
+    const char* blockMeta = nullptr;
     uint64_t mask = 0;
     uint8_t bits = 0;
+    uint8_t residualBits = 0;
+    DeltaEncoding encoding = DeltaEncoding::FLAT;
+
+    bool predicted() const noexcept {
+      return bits != 0 && encoding == DeltaEncoding::PREDICTED;
+    }
 
     int64_t deltaAt(int64_t segmentOrd) const {
       assert(segmentOrd >= 0 && segmentOrd < numOrds);
-      return (int64_t)LinearPack::select64(
-          deltas, (uint64_t)segmentOrd, bits, mask);
+      if (bits == 0) return 0;
+      if (encoding == DeltaEncoding::FLAT) {
+        return (int64_t)LinearPack::select64(
+            deltas, (uint64_t)segmentOrd, bits, mask);
+      }
+
+      assert(encoding == DeltaEncoding::PREDICTED);
+      uint64_t block = (uint64_t)segmentOrd / OrdColumnFormat::BLOCK_SIZE;
+      uint32_t rankInBlock =
+          (uint32_t)((uint64_t)segmentOrd % OrdColumnFormat::BLOCK_SIZE);
+      OrdColumnFormat::PredictedBlockInfo info;
+      memcpy(&info, blockMeta + block * sizeof(info), sizeof(info));
+      uint64_t residual = LinearPack::select64(
+          deltas + info.payloadOffset, rankInBlock, info.bits,
+          LinearPack::mask64(info.bits));
+      int64_t delta = OrdColumnFormat::predict(info, rankInBlock) +
+                      (int64_t)residual;
+      assert(delta >= 0 && (uint64_t)delta <= LinearPack::mask64(bits));
+      return delta;
     }
 
     int64_t globalOrd(int64_t segmentOrd) const {
@@ -32,11 +67,38 @@ public:
 
     void unpackDeltas(uint64_t start, uint32_t count, uint64_t* values) const {
       assert(start + count <= (uint64_t)numOrds);
-      LinearPack::unpack128(deltas, start, count, bits, mask, values);
+      assert(count <= OrdColumnFormat::BULK_SIZE);
+      if (count == 0) return;
+      if (bits == 0) {
+        std::fill_n(values, count, 0);
+        return;
+      }
+      if (encoding == DeltaEncoding::FLAT) {
+        LinearPack::unpack128(deltas, start, count, bits, mask, values);
+        return;
+      }
+
+      assert(encoding == DeltaEncoding::PREDICTED);
+      uint64_t block = start / OrdColumnFormat::BLOCK_SIZE;
+      uint32_t rankInBlock = (uint32_t)(start % OrdColumnFormat::BLOCK_SIZE);
+      assert(rankInBlock + count <= OrdColumnFormat::BLOCK_SIZE);
+      OrdColumnFormat::PredictedBlockInfo info;
+      memcpy(&info, blockMeta + block * sizeof(info), sizeof(info));
+      LinearPack::unpack128(deltas + info.payloadOffset, rankInBlock, count,
+                            info.bits, LinearPack::mask64(info.bits), values);
+      for (uint32_t i = 0; i < count; i++) {
+        __int128 delta = (__int128)OrdColumnFormat::predict(
+            info, rankInBlock + i) + values[i];
+        assert(delta >= 0 && delta <= std::numeric_limits<int64_t>::max());
+        values[i] = (uint64_t)delta;
+        assert(values[i] <= LinearPack::mask64(bits));
+      }
     }
   };
 
 private:
+  inline static std::atomic<DeltaEncoding> deltaEncodingOverride =
+      DeltaEncoding::DEFAULT;
   std::unique_ptr<char[]> data; // the raw data for the OrdMap
   int64_t start;
   int64_t end;
@@ -73,10 +135,38 @@ public:
       if (nValues > 0 && nValues != (uint64_t)nOrds) {
         uint8_t bits = (uint8_t)dataIS.readVint();
         assert(bits <= 57);
-        uint64_t loc = bits == 0 ? 0 : dataIS.readVlong();
-        const char* deltas = bits == 0 ? nullptr : this->data.get() + start + loc;
-        segToGlobal.push_back({(int64_t)nValues, deltas,
-                               LinearPack::mask64(bits), bits});
+        if (bits == 0) {
+          segToGlobal.push_back({(int64_t)nValues});
+          continue;
+        }
+
+        auto encoding = (DeltaEncoding)dataIS.readVint();
+        assert(encoding == DeltaEncoding::FLAT ||
+               encoding == DeltaEncoding::PREDICTED);
+        uint64_t loc = dataIS.readVlong();
+        const char* deltas = this->data.get() + start + loc;
+        if (encoding == DeltaEncoding::FLAT) {
+          SegToGlobal mapping;
+          mapping.numOrds = (int64_t)nValues;
+          mapping.deltas = deltas;
+          mapping.mask = LinearPack::mask64(bits);
+          mapping.bits = bits;
+          mapping.residualBits = bits;
+          mapping.encoding = encoding;
+          segToGlobal.push_back(mapping);
+        } else {
+          uint64_t blockMetaLoc = dataIS.readVlong();
+          uint8_t residualBits = (uint8_t)dataIS.readVint();
+          assert(residualBits <= 57);
+          SegToGlobal mapping;
+          mapping.numOrds = (int64_t)nValues;
+          mapping.deltas = deltas;
+          mapping.blockMeta = this->data.get() + start + blockMetaLoc;
+          mapping.bits = bits;
+          mapping.residualBits = residualBits;
+          mapping.encoding = encoding;
+          segToGlobal.push_back(mapping);
+        }
       } else {
         if (nValues == (uint64_t)nOrds && firstFull == -1) {
           firstFull = (int)i;
@@ -103,6 +193,12 @@ public:
 
   /// Build an OrdMap for the given field across all segments in the reader.
   static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
+
+  static DeltaEncoding configuredDeltaEncoding();
+
+  static DeltaEncoding setDeltaEncodingForTests(DeltaEncoding value) {
+    return deltaEncodingOverride.exchange(value);
+  }
   
   /// Get the total number of unique terms across all segments
   int64_t numOrds() const { return nOrds; }

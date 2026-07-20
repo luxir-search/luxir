@@ -1,12 +1,16 @@
 #pragma once
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
+#include <string>
+#include <variant>
 #include <vector>
 
 #include "OrdMap.h"
 #include "solux/index/IntColWriter.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/util/heap.h"
+#include "solux/util/log.h"
 
 namespace solux {
 
@@ -23,12 +27,15 @@ namespace solux {
 // [meta-size (int32_t)]  // 4 byte size of metadata, starting at [numSegs], not including this size field.
 //
 // seg1-deltas contains deltas to map segment ords into global ord space.
-// Each segment is encoded as a separate flat exact-bpv LinearPack region.
+// Each segment is encoded as either a flat exact-bpv LinearPack region or
+// predicted 4096-value blocks with exact-bpv LinearPack residual regions.
 //
-// seg1-meta contains LinearPack metadata (bits, offset, nValues)
+// seg1-meta contains delta metadata (bits, encoding, offsets, nValues)
 //   nValues (vLong) = number of values in this column.  if nValues == 0 or numGlobalOrds, no other metadata is present.
-//   bits (vInt) = exact delta width.  bits == 0 is an identity mapping and has no payload.
-//   offset (vLong) = offset from start of OrdMap, present only when bits != 0.
+//   bits (vInt) = maximum delta width.  bits == 0 is an identity mapping and has no payload.
+//   encoding (vInt) = FLAT or PREDICTED, present only when bits != 0.
+//   payload offset (vLong) = offset from start of OrdMap, present only when bits != 0.
+//   predicted block-meta offset (vLong) and max residual bits (vInt) follow for PREDICTED.
 //
 // There is a single firstSegs column that contains the first segment number that the global ord appeared in.
 // There is a single globDeltas column that contains the delta that was used to map from that segment ord to the global ord.
@@ -41,6 +48,27 @@ namespace solux {
 class OrdMapBuilder {
   std::string_view field;
   IndexReader& reader;
+  OrdMap::DeltaEncoding deltaEncoding;
+
+  struct SegmentStat {
+    const char* encoding = "none";
+    uint8_t bits = 0;
+  };
+  std::vector<SegmentStat> segmentStats;
+
+  void logSize() const {
+    std::string segments;
+    for (size_t i = 0; i < segmentStats.size(); i++) {
+      if (i != 0) segments.push_back(',');
+      segments += std::to_string(i);
+      segments.push_back('=');
+      segments += segmentStats[i].encoding;
+      segments.push_back(':');
+      segments += std::to_string(segmentStats[i].bits);
+      segments.push_back('b');
+    }
+    LOG_INFO("OrdMap field={} bytes={} segments=[{}]", field, size, segments);
+  }
 
   struct PackedDeltaRuns {
     struct Run {
@@ -127,23 +155,120 @@ class OrdMapBuilder {
     }
   };
 
+  struct PredictedDeltaBlocks {
+    std::unique_ptr<uint64_t[]> block =
+        std::make_unique_for_overwrite<uint64_t[]>(OrdColumnFormat::BLOCK_SIZE);
+    std::vector<char> payload;
+    std::vector<OrdColumnFormat::PredictedBlockInfo> blocks;
+    uint64_t count = 0;
+    uint64_t lastDelta = 0;
+    uint32_t blockCount = 0;
+    uint8_t maxResidualBits = 0;
+    bool finished = false;
+
+    void flushBlock() {
+      if (blockCount == 0) return;
+      auto plan = OrdColumnFormat::planBlock(
+          std::span<const uint64_t>(block.get(), blockCount));
+      assert(plan.count == blockCount);
+      plan.info.payloadOffset = payload.size();
+      maxResidualBits = std::max(maxResidualBits, plan.info.bits);
+      if (plan.info.bits != 0) {
+        LinearPack::Writer writer(payload, plan.info.bits);
+        uint64_t mask = LinearPack::mask64(plan.info.bits);
+        for (uint32_t i = 0; i < blockCount; i++) {
+          uint64_t residual = OrdColumnFormat::residual(
+              plan.info, i, block[i]);
+          assert(residual <= mask);
+          writer.append(residual);
+        }
+        writer.finish();
+      }
+      blocks.push_back(plan.info);
+      blockCount = 0;
+    }
+
+    void add(int64_t delta) {
+      assert(!finished && delta >= 0);
+      uint64_t value = (uint64_t)delta;
+      assert(count == 0 || value >= lastDelta);
+      assert(std::bit_width(value) <= 57);
+      block[blockCount++] = value;
+      lastDelta = value;
+      count++;
+      if (blockCount == OrdColumnFormat::BLOCK_SIZE) flushBlock();
+    }
+
+    void finish() {
+      assert(!finished && count > 0);
+      flushBlock();
+      block.reset();
+      finished = true;
+      assert(bits() == (uint8_t)std::bit_width(lastDelta));
+      assert(blocks.size() ==
+             (count + OrdColumnFormat::BLOCK_SIZE - 1) /
+                 OrdColumnFormat::BLOCK_SIZE);
+    }
+
+    uint8_t bits() const {
+      return (uint8_t)std::bit_width(lastDelta);
+    }
+
+    uint64_t writeFinal(OutputStream& out) const {
+      assert(finished && bits() != 0);
+      out.write(payload.data(), payload.size());
+      uint64_t blockMetaLoc = out.size();
+      out.write(blocks.data(),
+                blocks.size() * sizeof(OrdColumnFormat::PredictedBlockInfo));
+      return blockMetaLoc;
+    }
+
+    void release() {
+      assert(finished);
+      std::vector<char>().swap(payload);
+      std::vector<OrdColumnFormat::PredictedBlockInfo>().swap(blocks);
+    }
+  };
+
   // Collect TermsEnum for each segment.  Keep track of the index so we can visit in ascending order one at a time.
   struct TermsEnumIdx {
     size_t idx;
     TermsEnum tenum;
-    PackedDeltaRuns deltas;
+    std::variant<PackedDeltaRuns, PredictedDeltaBlocks> deltas;
 
     TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader,
-                 SegFieldInfo& finfo)
-        : idx(idx), tenum(pool, postingsReader, finfo) {}
+                 SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
+        : idx(idx), tenum(pool, postingsReader, finfo) {
+      if (encoding == OrdMap::DeltaEncoding::PREDICTED) {
+        deltas.emplace<PredictedDeltaBlocks>();
+      }
+    }
 
     void addDelta(int64_t delta) {
-      deltas.add(delta);
+      std::visit([&](auto& values) { values.add(delta); }, deltas);
+    }
+
+    void finishDeltas() {
+      std::visit([](auto& values) { values.finish(); }, deltas);
+    }
+
+    uint64_t deltaCount() const {
+      return std::visit([](const auto& values) { return values.count; }, deltas);
+    }
+
+    uint8_t bits() const {
+      return std::visit([](const auto& values) { return values.bits(); }, deltas);
+    }
+
+    void releaseDeltas() {
+      std::visit([](auto& values) { values.release(); }, deltas);
     }
   };
 
 public:
-  OrdMapBuilder(std::string_view field, IndexReader& reader) : field(field), reader(reader) {}
+  OrdMapBuilder(std::string_view field, IndexReader& reader)
+      : field(field), reader(reader),
+        deltaEncoding(OrdMap::configuredDeltaEncoding()) {}
 
   // Build fills these in currently.  In the future, the output may be written to disk.
   std::unique_ptr<char[]> data;
@@ -161,6 +286,7 @@ public:
 
     const auto& segs = reader.segments();
     auto nsegs = segs.size();
+    segmentStats.resize(nsegs);
 
     // the vector isn't in the pool, but the TermsEnumIdx instances will be.
     // This will "own" the TermsEnumIdx instances and call destructors.
@@ -182,7 +308,8 @@ public:
       //       TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& finfo) : idx(idx), tenum(pool, postingsReader, finfo), deltas(pool) {}
 
 
-      allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(i, pool, seg.postingsReader(), *fieldInfo));
+      allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(
+          i, pool, seg.postingsReader(), *fieldInfo, deltaEncoding));
       // position the TermsEnum on the first term
       if (!allTermsEnums.back()->tenum.nextTerm()) {
         // defensive coding, every field should have at least one term.
@@ -193,6 +320,7 @@ public:
     }
 
     if (segsWithValue == 0) {
+      logSize();
       return;
     }
     
@@ -205,9 +333,11 @@ public:
           this->segmentWithValues = i;
           this->numTerms = allTermsEnums[i]->tenum.numTerms();  // Get directly from fieldInfo
           this->isSingleSegment = true;
+          segmentStats[i] = {"identity", 0};
           break;
         }
       }
+      logSize();
       return;
     }
 
@@ -310,21 +440,35 @@ public:
       auto nTerms = tenum ? tenum->tenum.numTerms() : 0;
       metaOut.writeVlong(nTerms);
       if (tenum) {
-        tenum->deltas.finish();
-        assert((int64_t)tenum->deltas.count == nTerms);
+        tenum->finishDeltas();
+        assert((int64_t)tenum->deltaCount() == nTerms);
       }
       if (writeDeltas) {
         needGlobalDeltas = true;
-        uint8_t bits = tenum->deltas.bits();
+        uint8_t bits = tenum->bits();
         assert(bits <= 57);
         metaOut.writeVint(bits);
         if (bits != 0) {
+          metaOut.writeVint((uint8_t)deltaEncoding);
           uint64_t loc = payloadOut.size();
           metaOut.writeVlong(loc);
-          tenum->deltas.writeFinal(payloadOut);
+          if (deltaEncoding == OrdMap::DeltaEncoding::FLAT) {
+            std::get<PackedDeltaRuns>(tenum->deltas).writeFinal(payloadOut);
+            segmentStats[tenum->idx] = {"flat", bits};
+          } else {
+            auto& predicted = std::get<PredictedDeltaBlocks>(tenum->deltas);
+            uint64_t blockMetaLoc = predicted.writeFinal(payloadOut);
+            metaOut.writeVlong(blockMetaLoc);
+            metaOut.writeVint(predicted.maxResidualBits);
+            segmentStats[tenum->idx] = {"predicted", predicted.maxResidualBits};
+          }
+        } else {
+          segmentStats[tenum->idx] = {"identity", 0};
         }
+      } else if (tenum) {
+        segmentStats[tenum->idx] = {"identity", 0};
       }
-      if (tenum) tenum->deltas.release();
+      if (tenum) tenum->releaseDeltas();
     }
     payloadOut.flush(true);
 
@@ -367,8 +511,26 @@ public:
     start = ordMapStart;
     data.reset(new char[size]);
     payloadFile.copyTo(data.get());
+    logSize();
   }
 };
+
+OrdMap::DeltaEncoding OrdMap::configuredDeltaEncoding() {
+  DeltaEncoding override = deltaEncodingOverride.load();
+  if (override != DeltaEncoding::DEFAULT) return override;
+
+  const char* configured = std::getenv("SOLUX_ORDMAP_DELTAS");
+  if (configured == nullptr || *configured == '\0' ||
+      std::string_view(configured) == "flat") {
+    return DeltaEncoding::FLAT;
+  }
+  if (std::string_view(configured) == "predicted") {
+    return DeltaEncoding::PREDICTED;
+  }
+  LOG_WARN("Ignoring invalid SOLUX_ORDMAP_DELTAS='{}'; expected flat or predicted",
+           configured);
+  return DeltaEncoding::FLAT;
+}
 
 
 // In the future, we prob want to be able to accept a span of postings readers as well
