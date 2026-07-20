@@ -2,6 +2,7 @@
 #include "ProtoUpdateMessage.h"
 #include "solux/index/IndexWriter.h"
 
+#include <new>
 #include <variant>
 
 namespace solux {
@@ -77,6 +78,14 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       }
 
       inverter.finishDoc();
+    } catch (const FileIOException&) {
+      // A direct column/stored-fields write may have appended only a prefix.
+      // The inverter must be discarded, not recovered as a document error.
+      throw;
+    } catch (const std::bad_alloc&) {
+      // Output buffering can allocate after bytes have reached the file, so an
+      // allocation failure has the same segment-fatal policy.
+      throw;
     } catch (...) {
       failed++;
       auto* response = msg.getResponse();
@@ -140,68 +149,61 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   // Captured before deletes are queued so an all_or_none failure rolls them back too.
   auto requestMark = inverter.undoMark();
 
-  // Releases the inverter on all paths.  If an exception escapes doc processing
-  // (per-doc recovery catches everything, so realistically only allocation
-  // failure), also roll the whole request back so no partially indexed doc is
-  // left live; the message-level catch in processUpdateBody reports the error.
+  // Releases the inverter on all paths. If an exception escapes document-level
+  // recovery, the append-only segment may contain a partial value. Mark it
+  // failed and send it through the flush pipeline for commit accounting and
+  // cleanup, but never reuse or publish it. The message-level catch in
+  // processUpdateBody reports the error.
   // On the success path, flushOnRelease (set once at the end of the batch below)
   // asks releaseInverter to flush the inverter to a segment if it has grown past
-  // its cap.  On the exception path we release without flushing; the next message
-  // re-checks the size.
+  // its cap.
   struct ReleaseGuard {
     IndexWriter& iw;
     Inverter& inverter;
-    Inverter::UndoMark requestMark;
-    int32_t firstDoc;
     bool flushOnRelease = false;
-    // compare against the count at construction so an unrelated in-flight
-    // exception (e.g. during TBB graph teardown) doesn't look like ours
-    int uncaughtOnEntry = std::uncaught_exceptions();
+    std::exception_ptr failure = nullptr;
     ~ReleaseGuard() {
-      if (std::uncaught_exceptions() > uncaughtOnEntry) {
-        try {
-          inverter.rollbackTo(requestMark);
-          for (int32_t docid = firstDoc; docid <= inverter.getDoc(); docid++) {
-            inverter.deleteDoc(docid);
-          }
-        } catch (...) {
-          // deleteDoc can allocate; swallow rather than terminate during unwind.
-          LOG_ERROR("Rollback after update exception failed; partially indexed docs may remain live.");
-        }
-        iw.releaseInverter(inverter);
+      if (failure != nullptr) {
+        inverter.fail(failure);
+        iw.releaseInverter(inverter, true);
         return;
       }
       iw.releaseInverter(inverter, flushOnRelease);
     }
-  } releaseGuard{iw, inverter, requestMark, inverter.getMaxDoc()};
+  } releaseGuard{iw, inverter};
 
-  // Process deletes before adds (shouldn't matter since we just queue deletes)
-  if (!req->delete_ids.empty()) {
-    for (const auto& id : req->delete_ids) {
-      inverter.deleteId(id, this->updateVersion);
+  try {
+    // Process deletes before adds (shouldn't matter since we just queue deletes)
+    if (!req->delete_ids.empty()) {
+      for (const auto& id : req->delete_ids) {
+        inverter.deleteId(id, this->updateVersion);
+      }
     }
-  }
 
-  // Process document additions
-  if (!req->docs.empty()) {
-    update(*this, inverter, requestMark);
-  }
+    // Process document additions
+    if (!req->docs.empty()) {
+      update(*this, inverter, requestMark);
+    }
 
-  // Size-based auto-flush is checked ONCE here, at the end of the batch - never
-  // mid-request.  A whole update message stays in a single inverter, which keeps
-  // within-request id overwrites correct: IdHandler resolves a repeated id in
-  // memory by directly deleting the superseded doc.  Splitting a request across a
-  // mid-flush segment boundary would break that - every doc in one message shares
-  // one updateVersion, and a cross-segment overwrite delete only supersedes docs
-  // with a STRICTLY lower version (finishCommitBody gates on
-  // seg.minVersion < maxDeleteVersion), so a duplicate id straddling the split
-  // could not delete its earlier, same-version copy and both would stay live.
-  // Keeping the request whole avoids that.  The cost: a single message larger than
-  // the cap is not bounded here (bound those with a max-message-size reject -
-  // separate follow-up).  A non-stop stream is byte-batched into many messages that
-  // accumulate in one reused idle inverter, so the per-message check still bounds
-  // the streaming OOM this feature targets.
-  releaseGuard.flushOnRelease = inverter.shouldFlush(iw.perInverterRamBytes, iw.perInverterMaxDocs);
+    // Size-based auto-flush is checked ONCE here, at the end of the batch - never
+    // mid-request.  A whole update message stays in a single inverter, which keeps
+    // within-request id overwrites correct: IdHandler resolves a repeated id in
+    // memory by directly deleting the superseded doc.  Splitting a request across a
+    // mid-flush segment boundary would break that - every doc in one message shares
+    // one updateVersion, and a cross-segment overwrite delete only supersedes docs
+    // with a STRICTLY lower version (finishCommitBody gates on
+    // seg.minVersion < maxDeleteVersion), so a duplicate id straddling the split
+    // could not delete its earlier, same-version copy and both would stay live.
+    // Keeping the request whole avoids that.  The cost: a single message larger than
+    // the cap is not bounded here (bound those with a max-message-size reject -
+    // separate follow-up).  A non-stop stream is byte-batched into many messages that
+    // accumulate in one reused idle inverter, so the per-message check still bounds
+    // the streaming OOM this feature targets.
+    releaseGuard.flushOnRelease = inverter.shouldFlush(iw.perInverterRamBytes, iw.perInverterMaxDocs);
+  } catch (...) {
+    releaseGuard.failure = std::current_exception();
+    throw;
+  }
 }
 
 } // namespace solux

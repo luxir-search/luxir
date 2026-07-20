@@ -23,13 +23,24 @@ namespace solux::handler {
 class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
 
+protected:
+  enum class ValueStorage {
+    BUFFERED,
+    STREAMED,
+  };
+
+private:
   DocStream docsWithVal;      // set of docs that have this field
   IntStream valSizeStream;    // per-value sizes (one entry per value)
   IntStream valCountStream;   // per-doc value counts (one entry per doc with field; only used if multi-valued)
   // TODO: a RAMFile per field with the current buffer sizes (starting at 1K) is bad for many fields...
   // We should have initial small buffers pool allocated.
   RAMFile valuesFile;
-  OutputStream valuesOut;
+  OutputStream bufferedValuesOut;
+  ValueStorage valueStorage;
+  OutputStreamPtr streamedValuesOut;
+  seg_location streamedValuesLoc;
+  int64_t streamedValuesLength = 0;
   int64_t numDocs = 0;
   int64_t numValuesTotal = 0;
   int32_t minSize = std::numeric_limits<int32_t>::max();
@@ -37,15 +48,23 @@ class StrColHandler : public Inverter::IndexHandler {
 
 public:
   StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
+    : StrColHandler(inverter, fieldName, fieldType, ValueStorage::BUFFERED) {
+  }
+
+protected:
+  StrColHandler(Inverter& inverter, const std::string_view& fieldName,
+                const std::shared_ptr<FieldType>& fieldType, ValueStorage valueStorage)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
       docsWithVal(inverter.pool),
       valSizeStream(inverter.pool),
       valCountStream(inverter.pool),
       valuesFile(fieldName),
-      valuesOut(&valuesFile)
+      bufferedValuesOut(&valuesFile),
+      valueStorage(valueStorage)
   {
   }
 
+public:
   ~StrColHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
@@ -104,9 +123,11 @@ public:
     if (fieldType->flags_ & FieldType::MULTI_VALUED) {
       valCountStream.addVal(inverter.pool, 1);
     }
-    // Column value bytes accumulate in valuesFile (a RAMFile), outside inverter.pool.
-    // The metadata streams (docsWithVal/valSize/valCount) are in inverter.pool.
-    accountExtraRam(inverter, valuesFile.size());
+    // Buffered column bytes accumulate outside inverter.pool. Streamed columns
+    // leave valuesFile empty; their OutputStream storage is owned by Directory.
+    if (valueStorage == ValueStorage::BUFFERED) {
+      accountExtraRam(inverter, valuesFile.size());
+    }
   }
 
   void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
@@ -122,7 +143,9 @@ public:
       addValue(inverter, val);
     }
     valCountStream.addVal(inverter.pool, (int64_t)vals.size());
-    accountExtraRam(inverter, valuesFile.size());
+    if (valueStorage == ValueStorage::BUFFERED) {
+      accountExtraRam(inverter, valuesFile.size());
+    }
   }
 
 protected:
@@ -138,14 +161,37 @@ private:
     int32_t valSize = (int32_t)val.size();
     minSize = std::min(minSize, valSize);
     maxSize = std::max(maxSize, valSize);
-    valuesOut.write(val.data(), valSize);
+    valueOutput(inverter).write(val.data(), valSize);
     valSizeStream.addVal(inverter.pool, valSize);
     numValuesTotal++;
   }
 
+  OutputStream& valueOutput(Inverter& inverter) {
+    if (valueStorage == ValueStorage::BUFFERED) {
+      return bufferedValuesOut;
+    }
+    if (streamedValuesOut == nullptr) {
+      streamedValuesOut = inverter.getPostingsWriter().getOutputStream();
+      streamedValuesLoc = streamedValuesOut->slocation();
+    }
+    return *streamedValuesOut;
+  }
+
 public:
 
+  void finishIndexing(Inverter& inverter) override {
+    unused(inverter);
+    if (streamedValuesOut != nullptr) {
+      streamedValuesLength = (int64_t)streamedValuesOut->size()
+          - (int64_t)streamedValuesLoc.offset();
+      streamedValuesOut.reset();
+    }
+  }
+
   void flush(Inverter& inverter) override {
+    // Inverter calls this for every handler in a pre-flush pass. Keep direct
+    // handler use safe as well if a caller invokes flush() itself.
+    finishIndexing(inverter);
     if (numDocs == 0) {
       return; // drop the field.
     }
@@ -164,15 +210,22 @@ public:
     // minSize was never updated.  Treat that as fixed-size 0.
     bool fixedSize = (numValuesTotal == 0) || (minSize == maxSize);
 
-    // Write the concatenated value bytes.
-    {
-      valuesOut.flush(true);
-
+    // Buffered string/binary columns are copied to a segment output now.
+    // Streamed columns already wrote their bytes during indexing and released
+    // the output in finishIndexing(), before any field flush began.
+    if (valueStorage == ValueStorage::BUFFERED) {
+      bufferedValuesOut.flush(true);
       OutputStreamPtr out = postingsWriter.getOutputStream();
       fieldInfo.columnLoc = out->slocation();
       out->appendFile(valuesFile);
       // no metadata for the raw value bytes; columnMetaOff is the size of the column.
       fieldInfo.columnMetaOff = out->size() - fieldInfo.columnLoc.offset();
+    } else {
+      assert(streamedValuesOut == nullptr);
+      assert(numValuesTotal > 0);
+      assert(!streamedValuesLoc.isNull());
+      fieldInfo.columnLoc = streamedValuesLoc;
+      fieldInfo.columnMetaOff = streamedValuesLength;
     }
 
     // Write endOffsetReader (mono2) if variable-size; otherwise record the fixed value size.

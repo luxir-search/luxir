@@ -1,6 +1,9 @@
 #include "gtest/gtest.h"
 
+#include <algorithm>
 #include <deque>
+#include <filesystem>
+#include <unistd.h>
 
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -13,6 +16,7 @@
 #include "solux/reader/FieldReader.h"
 #include "solux/schema/FieldType.h"
 #include "solux/schema/Schema.h"
+#include "solux/store/FSDirectory.h"
 #include "solux/util/log.h"
 #include "solux/api/build.h"
 
@@ -113,6 +117,121 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
       EXPECT_FLOAT_EQ(expected[docRank][i], span[i]);
     }
   }
+}
+
+// Vector payloads go straight to a segment output; only their metadata streams
+// consume inverter.pool, and the raw float bytes do not inflate extraRamBytes.
+TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto& handler = inverter.getIndexHandler("vec_v");
+
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::Val val;
+  auto& f32 = val.kind.emplace<solux::api::Vector>().f32.emplace();
+  constexpr size_t DIMS = 256 * 1024;
+  float* values = solux::api::build::allocArray(f32.v, DIMS, mr);
+  for (size_t i = 0; i < DIMS; i++) values[i] = (float)i;
+
+  size_t extraBefore = inverter.extraRamBytes;
+  inverter.setDoc(0);
+  indexVal(inverter, handler, val);
+  EXPECT_EQ(extraBefore, inverter.extraRamBytes);
+
+  testIndex.flush();
+  testIndex.initReader();
+  auto& seg = testIndex.reader->segments()[0];
+  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  ASSERT_TRUE(fieldReader.seek("vec_v"));
+  SegFieldInfo fi;
+  fieldReader.readFieldInfo(fi);
+  VectorReader reader(seg.postingsReader(), fi);
+  ASSERT_EQ((int32_t)DIMS, reader.dims());
+  EXPECT_FLOAT_EQ(0.0f, reader.singleVectorAt(0).front());
+  EXPECT_FLOAT_EQ((float)(DIMS - 1), reader.singleVectorAt(0).back());
+}
+
+// A filesystem failure can happen after a prefix of one vector has been
+// written. It is segment-fatal: the inverter is discarded rather than reused
+// for the next request.
+TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
+  std::string pathTemplate =
+      (std::filesystem::temp_directory_path() / "solux_vector_io_XXXXXX").string();
+  ASSERT_NE(nullptr, ::mkdtemp(pathTemplate.data()));
+  std::filesystem::path path(pathTemplate);
+
+  {
+    FSDirectory dir(path);
+    IndexWriter iw(dir);
+
+    auto submit = [&](bool commit) {
+      std::pmr::monotonic_buffer_resource mr;
+      solux::api::UpdateRequest request;
+      auto* docs = solux::api::build::allocArray(request.docs, 1, mr);
+      CollectionHelper::convertDocToProto(
+          flatdoc("vec_v", std::vector<float>(512, 1.0f)), docs[0], mr);
+      if (commit) request.commit.emplace();
+
+      class BlockingMessage : public ProtoUpdateMessage {
+      public:
+        Blocker blocker;
+        explicit BlockingMessage(const RequestProto* request) : ProtoUpdateMessage(request) {}
+        void done(IndexWriter& iw) override {
+          unused(iw);
+          blocker.notify();
+        }
+      } message(&request);
+
+      bool accepted = iw.submitUpdate(&message);
+      EXPECT_TRUE(accepted);
+      if (!accepted) return false;
+      message.blocker.wait();
+      return message.result.ok();
+    };
+
+    std::string firstFile = Postings::getIndexFileName(Postings::getSortableString(1), 0);
+    std::filesystem::path failingTmp = path / (firstFile + ".tmp");
+    std::filesystem::create_symlink("/dev/full", failingTmp);
+
+    EXPECT_FALSE(submit(false));
+    iw.updateGraph.wait_for_all();
+    EXPECT_TRUE(iw.segInfos.empty());
+    EXPECT_TRUE(iw.idleInverters.empty());
+
+    // FSDirectory intentionally ignores non-regular entries during its prefix
+    // sweep. Remove the test-only device symlink before the healthy request.
+    std::filesystem::remove(failingTmp);
+    EXPECT_TRUE(submit(true));
+    iw.updateGraph.wait_for_all();
+    EXPECT_EQ(1, iw.getIndexReader()->maxDoc());
+  }
+
+  std::filesystem::remove_all(path);
+}
+
+// Stored fields and vectors each hold a stream while documents are indexed.
+// Both must release it before the full-text field checks out its three streams,
+// allowing the segment to stay at that three-stream high-water mark.
+TEST_F(VectorColTest, indexingStreamsReleasedBeforeFieldFlush) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  uint64_t segId = inverter.getSegId();
+
+  inverter.startDoc();
+  inverter.getIndexHandler("body_w").index(inverter, std::string_view("one two three"));
+  std::pmr::monotonic_buffer_resource mr;
+  auto val = makeVec(mr, {1.0f, 2.0f, 3.0f});
+  inverter.getIndexHandler("vec_v").index(inverter, val);
+  inverter.finishDoc();
+  testIndex.flush();
+
+  std::vector<std::string> files;
+  testIndex.dir.listFiles(files);
+  std::string dataPrefix = Postings::getIndexFileNamePrefix(segId) + "_";
+  size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const std::string& file) {
+    return file.starts_with(dataPrefix);
+  });
+  EXPECT_EQ(3u, dataFiles);
 }
 
 // Low-level: multi-valued vector round-trip using the default "_vs" suffix.

@@ -174,8 +174,6 @@ public:
     // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
     // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
 
-    // Either reduce the resource for these, or share across different fields (in the same thread)
-    TextWriter textWriter(inverter.getPostingsWriter());
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
@@ -183,16 +181,20 @@ public:
     auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
                                               fieldInfo, normBytes, normDocsWithField,
                                               numDocsWithField);
-    textWriter.startField(&fieldInfo);
-    textWriter.setNorms(preparedNorms.textView());
-    for (size_t tnum = 0; tnum < sz; tnum++) {
-      auto term = terms[tnum];
-      textWriter.startTerm(term);
-      // push all the docs / positions for this term
-      term.val().pushDocs(inverter.pool, textWriter);
-      textWriter.endTerm(term);
+    {
+      // Either reduce the resource for these, or share across different fields (in the same thread)
+      TextWriter textWriter(inverter.getPostingsWriter());
+      textWriter.startField(&fieldInfo);
+      textWriter.setNorms(preparedNorms.textView());
+      for (size_t tnum = 0; tnum < sz; tnum++) {
+        auto term = terms[tnum];
+        textWriter.startTerm(term);
+        // push all the docs / positions for this term
+        term.val().pushDocs(inverter.pool, textWriter);
+        textWriter.endTerm(term);
+      }
+      textWriter.endField();
     }
-    textWriter.endField();
     termsHash.free();  // free up memory early.
 
     NormsWriter::writeValues(inverter.pool, inverter.getPostingsWriter(), fieldInfo,

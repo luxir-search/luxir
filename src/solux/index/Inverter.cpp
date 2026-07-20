@@ -181,15 +181,22 @@ bool Inverter::flush(std::vector<std::string>* filenames) {
                                        [](const IndexHandler* x) {return x->fieldName.size();},
                                        [](const IndexHandler* x, const IndexHandler* y) {return *x < *y;});
 
+  // Relinquish outputs held through indexing before any field flush asks for
+  // its working set of streams. Vector columns publish their directly-written
+  // byte extent here.
+  for (auto fieldHandler : fields) {
+    fieldHandler->finishIndexing(*this);
+  }
+
+  // Stored-fields chunk streams are also held through indexing. Finish all
+  // resources now so their chunk and metadata streams are available for reuse
+  // by normal field flushing.
+  for (auto& [_, writer] : storedFields_) {
+    writer->finish(getMaxDoc());
+  }
 
   for (auto fieldHandler : fields) {
     fieldHandler->flush(*this);
-  }
-
-  // Finalize each stored-fields resource (one per column family used this
-  // segment).
-  for (auto& [_, writer] : storedFields_) {
-    writer->finish(getMaxDoc());
   }
 
   // Handle deleted documents if any

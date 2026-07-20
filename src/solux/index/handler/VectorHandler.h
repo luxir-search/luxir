@@ -34,7 +34,7 @@ class VectorHandler final : public StrColHandler {
 public:
   VectorHandler(Inverter& inverter, const std::string_view& fieldName,
                 const std::shared_ptr<FieldType>& fieldType)
-    : StrColHandler(inverter, fieldName, fieldType) {
+    : StrColHandler(inverter, fieldName, fieldType, ValueStorage::STREAMED) {
     // Caller (Inverter::createIndexHandler) only constructs us for VECTOR-typed
     // fields, which fromProto always builds as VectorFieldType.
     auto* vft = (VectorFieldType*)(fieldType.get());

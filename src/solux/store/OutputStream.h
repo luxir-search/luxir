@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdexcept>
+
 #include "InputStream.h"
 
 namespace solux {
@@ -48,6 +50,14 @@ public:
 };
 
 class RAMFile;
+
+// A filesystem output failure may leave the current append-only value partially
+// written. Indexing code distinguishes this from a document error
+// and aborts the in-progress segment instead of reusing its streams.
+class FileIOException : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 class File {
   friend class OutputStream;

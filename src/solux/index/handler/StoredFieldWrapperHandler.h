@@ -85,6 +85,10 @@ public:
     inner_->index(inverter, vals);
   }
 
+  void finishIndexing(Inverter& inverter) override {
+    inner_->finishIndexing(inverter);
+  }
+
   void flush(Inverter& inverter) override {
     inner_->flush(inverter);
   }

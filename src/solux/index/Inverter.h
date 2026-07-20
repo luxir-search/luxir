@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "solux/util/MemPool.h"
@@ -34,6 +35,7 @@ class Inverter {
 private:
   int currDoc = -1;  // the current document being indexed
   std::vector<int> deleted; // use a docstream for this?
+  std::exception_ptr failure_;
 
   std::function<std::shared_ptr<Schema>()> schemaProvider;
 
@@ -41,7 +43,7 @@ public:
   MemPool pool;
 
   // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
-  // string/vector column RAMFiles). Handlers that hold such memory bump this via
+  // string column RAMFiles). Handlers that hold such memory bump this via
   // IndexHandler::accountExtraRam at their allocation sites, so memSize() is O(1) -
   // no per-doc walk of indexHandlers. Directory-backed postings output streams spill
   // to disk and are deliberately NOT counted.
@@ -100,6 +102,13 @@ public:
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
+  // An exception that escapes request processing makes this append-only
+  // segment unsafe to reuse. The flush pipeline consumes the failed inverter
+  // to preserve commit accounting, but never publishes it.
+  void fail(std::exception_ptr failure) noexcept { failure_ = std::move(failure); }
+  bool failed() const noexcept { return failure_ != nullptr; }
+  const std::exception_ptr& failure() const noexcept { return failure_; }
+
   // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
@@ -152,9 +161,10 @@ public:
     }
 
     // index() implementations should validate a value before mutating any stream
-    // state: a throw is recovered by marking the doc deleted, so streams must stay
-    // appendable for subsequent docs.  Data already appended for the failed doc is
-    // fine (the doc is dead); a throw mid-append of a single value is not.
+    // state: ordinary value errors are recovered by marking the doc deleted, so
+    // streams must stay appendable for subsequent docs. FileIOException and
+    // bad_alloc abort the entire segment because a value may be partially appended.
+    // Data already appended for an ordinary failed doc is fine (the doc is dead).
     // Cross-doc constraints learned from values (e.g. vector dims) must only be
     // committed once a value is actually appended, so a failed doc does not
     // constrain later docs; see VectorHandler.
@@ -186,6 +196,13 @@ public:
         const auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
         index(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
       }
+    }
+
+    // End the indexing phase before any field starts flushing. Handlers that
+    // stream large values directly to segment files use this hook to publish
+    // their extent and return the checked-out stream to PostingsWriter.
+    virtual void finishIndexing(Inverter& inverter) {
+      unused(inverter);
     }
 
     virtual void flush(Inverter &inverter) = 0;

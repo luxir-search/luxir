@@ -36,6 +36,18 @@ void setForceMergeError(UpdateMessage& origin, std::string_view detail) {
   origin.result.setException(error);
 }
 
+void setException(ErrorHolder& result, const std::exception_ptr& failure) {
+  if (result.errored()) return;
+  try {
+    std::rethrow_exception(failure);
+  } catch (const std::exception& e) {
+    result.setException(e);
+  } catch (...) {
+    std::runtime_error error("Unknown non-standard exception while writing segment");
+    result.setException(error);
+  }
+}
+
 } // namespace
 
 
@@ -663,31 +675,41 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
 
   std::vector<std::string> flushedFiles;
-  bool success;
-  try {
-    // uncomment to serialize inverter flushing (for testing purposes)
-    // const std::lock_guard<std::mutex> lock(indexMutex);
-    success = inverter.flush(&flushedFiles);
-  }
-  catch (std::exception& e) {
-    LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
-    // Now what?  This is pretty catastrophic.
+  bool success = false;
+  bool aborted = inverter.failed();
+  if (!aborted) {
+    try {
+      // uncomment to serialize inverter flushing (for testing purposes)
+      // const std::lock_guard<std::mutex> lock(indexMutex);
+      success = inverter.flush(&flushedFiles);
+    } catch (const std::exception& e) {
+      LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
+      inverter.fail(std::current_exception());
+      aborted = true;
+    } catch (...) {
+      LOG_ERROR("Unknown non-standard exception caught while flushing inverter");
+      inverter.fail(std::current_exception());
+      aborted = true;
+    }
   }
 
-  auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
-                                           inverter.getPostingsWriter().getMaxDoc());
-  segInfo->unsyncedFiles = std::move(flushedFiles);
-  segInfo->minVersion = inverter.minVersion;
-  segInfo->maxVersion = inverter.maxVersion;
-  segInfo->schemaGen = currentSchemaGen();
-  // Set liveDocs + liveGen for deleted docs from errors during indexing
-  if (inverter.liveGen > 0) {
-    segInfo->liveGen = inverter.liveGen;
-    segInfo->liveDocs = inverter.liveDocs;
-    assert(segInfo->liveDocs <= segInfo->maxDoc);
-    // We still need to carry over deletes-by-string-id even if liveDocs == 0.
-  } else {
-    segInfo->liveDocs = segInfo->maxDoc;
+  std::unique_ptr<SegInfo> segInfo;
+  if (!aborted) {
+    segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
+                                        inverter.getPostingsWriter().getMaxDoc());
+    segInfo->unsyncedFiles = std::move(flushedFiles);
+    segInfo->minVersion = inverter.minVersion;
+    segInfo->maxVersion = inverter.maxVersion;
+    segInfo->schemaGen = currentSchemaGen();
+    // Set liveDocs + liveGen for deleted docs from errors during indexing
+    if (inverter.liveGen > 0) {
+      segInfo->liveGen = inverter.liveGen;
+      segInfo->liveDocs = inverter.liveDocs;
+      assert(segInfo->liveDocs <= segInfo->maxDoc);
+      // We still need to carry over deletes-by-string-id even if liveDocs == 0.
+    } else {
+      segInfo->liveDocs = segInfo->maxDoc;
+    }
   }
 
   // A segment born with no live docs (every doc failed and was marked deleted)
@@ -709,7 +731,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     INDEX_DEBUG("segmentFlushBody: inverter {} flushed. Adding {}", (void*)&inverter,
-                segInfo ? format_as(*segInfo) : std::string("(empty segment, dropped)"));
+                segInfo ? format_as(*segInfo)
+                        : std::string(aborted ? "(aborted segment)" : "(empty segment, dropped)"));
 
     // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
     std::pair<SegMap::iterator, bool> iter;
@@ -727,7 +750,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     flushingInverters.erase(it);
 
     // move any deletes from the inverter to the relevant commit info.
-    if (inverter.hasDeletions()) {
+    if (!aborted && inverter.hasDeletions()) {
       CommitInfo& commitInfo = inverter.commitInfo ? *inverter.commitInfo : *nextCommitInfo;
       INDEX_DEBUG("segmentFlushBody: inverter={} moving deletes to commitInfo={}", inverter,
                   (void*)&commitInfo);
@@ -751,13 +774,28 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // Release inside the same lock block so a concurrent _maybeMergeSegments
     // can't bump leftToFlush back up between our 0-check and the try_put.
     if (inverter.commitInfo != nullptr) {
+      if (aborted) {
+        setException(inverter.commitInfo->updateMessage->result, inverter.failure());
+      }
       if (--inverter.commitInfo->leftToFlush == 0) {
         _releaseToCommitSequencer(inverter.commitInfo->updateMessage);
       }
     }
   }
 
-  // the inverter (inverterPtr) should go out of scope and be deleted at this point
+  if (aborted) {
+    // Destroy first to close any partially written file, then remove every
+    // finished or temporary file belonging to this never-published segment.
+    uint64_t segId = inverterPtr->getPostingsWriter().segId;
+    inverterPtr.reset();
+    try {
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(segId));
+    } catch (const std::exception& e) {
+      LOG_ERROR("Failed to clean files for aborted segment {}: {}", segId, e.what());
+    }
+  }
+
+  // inverterPtr goes out of scope here on a successful flush.
 }
 
 // This applies deletes and writes out the new segments file.

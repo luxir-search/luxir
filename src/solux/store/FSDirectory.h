@@ -66,7 +66,7 @@ class FSFile : public File {
     if (fd_ >= 0) return;
     fd_ = ::open(tmpPath_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd_ < 0) {
-      throw std::runtime_error("FSFile: failed to create file: " + tmpPath_.string() + ": " + strerror(errno));
+      throw FileIOException("FSFile: failed to create file: " + tmpPath_.string() + ": " + strerror(errno));
     }
   }
 
@@ -74,7 +74,10 @@ class FSFile : public File {
     while (len > 0) {
       auto n = ::write(fd_, data, len);
       if (n < 0) {
-        throw std::runtime_error("FSFile: write failed for: " + path_.string() + ": " + strerror(errno));
+        throw FileIOException("FSFile: write failed for: " + path_.string() + ": " + strerror(errno));
+      }
+      if (n == 0) {
+        throw FileIOException("FSFile: write returned zero for: " + path_.string());
       }
       data += n;
       len -= (size_t)n;
@@ -83,13 +86,13 @@ class FSFile : public File {
 
   void flush(OutputStream& os, bool deferNewBuff) override {
     auto written = os.start == nullptr ? 0 : (size_t)(os.pos - os.start);
-    fileSize_ += written;
-    os.flushedSize = fileSize_;
 
     if (written > 0) {
       openFd();
       writeToFd(os.start, written);
+      fileSize_ += written;
     }
+    os.flushedSize = fileSize_;
 
     if (!deferNewBuff) {
       size_t needed = std::max(START_BUFFER_SIZE, std::min(bufCapacity_ > 0 ? bufCapacity_ << 1 : START_BUFFER_SIZE, MAX_BUFFER_SIZE));
