@@ -247,7 +247,8 @@ inline OpCursor& setQuery(OpCursor& cur, const api::Query& q) {
 }
 
 // Append a sort spec to the cursor op (TopDocs / FieldFacet / RangeFacet).
-inline OpCursor& sort(OpCursor& cur, std::string_view field, SortDir dir) {
+inline OpCursor& sort(OpCursor& cur, std::string_view field,
+                      SortDir dir = SortDir::UNKNOWN) {
   auto& mr = cur.mr();
   std::span<const api::SortSpec>* sorts = nullptr;
   std::visit([&](auto& op) {

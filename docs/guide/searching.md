@@ -134,13 +134,15 @@ Sort a single-valued column field explicitly:
 
 Numeric, date, string, and ID fields with columns are supported. Analyzed text
 has no value column; index the same source into a `string` field when it must
-sort. Missing values sort last. `_score_` and `_docid_` sort specifications are
-reserved but not implemented.
+sort. Missing values sort last. Several sort specifications form an ordered
+lexicographic sort. `_score_` sorts by the query score and `_docid_` sorts by
+reader-local `(segment, docid)` order; either can appear in any position.
 
-The wire accepts several sort specifications, but the current collector does
-not reliably preserve secondary sort values during heap operations. Use one
-sort field for now. Relevance ties also have no stable external tiebreak, so do
-not treat the returned order of tied hits as a pagination token.
+An omitted direction defaults to descending for `_score_` and ascending for
+columns and `_docid_`. After all explicit components tie, results use
+`(segment, docid)` ascending as the final deterministic tiebreak. This reader-
+local identity can change after segment merges, so it is not a durable
+pagination token.
 
 ## One request, several results
 

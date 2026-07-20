@@ -4,7 +4,6 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "solux/search/FieldSortCollector.h"
-// #include "solux/search/FieldSortCollector2.h"
 #include "solux/search/SortField.h"
 #include "solux/schema/FieldType.h"
 #include "solux/util/random.h"
@@ -17,6 +16,19 @@ using namespace solux;
 using namespace solux::test;
 
 class SortCollectorTest : public SoluxTest {
+protected:
+  static std::vector<SortClause> columnPlan(const SortField& field) {
+    return {SortClause(field)};
+  }
+
+  static std::vector<std::string> resultIds(const LocalReq& req) {
+    const auto* docs = req.docList("q");
+    if (docs == nullptr) return {};
+    const auto& col = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+    std::vector<std::string> ids;
+    for (auto id : col.v) ids.emplace_back(id);
+    return ids;
+  }
 };
 
 TEST_F(SortCollectorTest, testPQ) {
@@ -220,7 +232,7 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test collecting segments in order
   {
-    FieldSortCollector collector(2, sf.createComparator(2));
+    FieldSortCollector collector(2, columnPlan(sf));
 
     // collect 2nd segment first: should have [doc2,doc1]
     collect(collector, 0);
@@ -238,7 +250,7 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test collecting segments out of order
   {
-    FieldSortCollector collector(2, sf.createComparator(2));
+    FieldSortCollector collector(2, columnPlan(sf));
 
     // collect 2nd segment first: should have [doc5, doc4]
     collect(collector, 1);
@@ -256,8 +268,8 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test merging collectors in different orders
   {
-    FieldSortCollector collector0(2, sf.createComparator(2));
-    FieldSortCollector collector1(2, sf.createComparator(2));
+    FieldSortCollector collector0(2, columnPlan(sf));
+    FieldSortCollector collector1(2, columnPlan(sf));
 
     collect(collector0, 0);
     collect(collector1, 1);
@@ -271,8 +283,8 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test merging collectors in reverse order this time
   {
-    FieldSortCollector collector0(2, sf.createComparator(2));
-    FieldSortCollector collector1(2, sf.createComparator(2));
+    FieldSortCollector collector0(2, columnPlan(sf));
+    FieldSortCollector collector1(2, columnPlan(sf));
 
     collect(collector0, 0);
     collect(collector1, 1);
@@ -359,7 +371,7 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test collecting segments in order
     {
-      FieldSortCollector collector(topK, sf.createComparator(topK));
+      FieldSortCollector collector(topK, columnPlan(sf));
 
       // collect 2nd segment first: should have [doc5, doc4]
       collect(collector, 0);
@@ -369,7 +381,7 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test collecting segments out of order
     {
-      FieldSortCollector collector(topK, sf.createComparator(topK));
+      FieldSortCollector collector(topK, columnPlan(sf));
 
       // collect 2nd segment first: should have [doc5, doc4]
       collect(collector, 1);
@@ -379,8 +391,8 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test merging collectors in different orders
     {
-      FieldSortCollector collector0(topK, sf.createComparator(topK));
-      FieldSortCollector collector1(topK, sf.createComparator(topK));
+      FieldSortCollector collector0(topK, columnPlan(sf));
+      FieldSortCollector collector1(topK, columnPlan(sf));
       collect(collector0, 0);
       collect(collector1, 1);
       collector0.merge(collector1);
@@ -389,8 +401,8 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test merging collectors in reverse order this time
     {
-      FieldSortCollector collector0(topK, sf.createComparator(topK));
-      FieldSortCollector collector1(topK, sf.createComparator(topK));
+      FieldSortCollector collector0(topK, columnPlan(sf));
+      FieldSortCollector collector1(topK, columnPlan(sf));
       collect(collector0, 0);
       collect(collector1, 1);
       collector1.merge(collector0);
@@ -582,23 +594,276 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
   // rating 4: doc2(50), doc5(100)
   // rating 3: doc3(150)
 
-  // Note: FieldSortCollector currently has a limitation with multi-field sorts
-  // where secondary sort fields are not preserved during heap operations.
-  // This causes tie-breaking to fall back to document ID order.
-  // We'll verify that primary sort (rating DESC) works correctly.
-
+  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
   auto& ratingCol = std::get<solux::api::ColInt>(docs->columns.at("rating_i").kind);
+  std::vector<std::string_view> expectedIds = {"doc4", "doc1", "doc2", "doc5", "doc3"};
+  std::vector<int64_t> expectedPrices = {75, 100, 50, 100, 150};
+  std::vector<int64_t> expectedRatings = {5, 5, 4, 4, 3};
+  ASSERT_EQ(expectedIds, std::vector<std::string_view>(idCol.v.begin(), idCol.v.end()));
+  ASSERT_EQ(expectedPrices, std::vector<int64_t>(priceCol.v.begin(), priceCol.v.end()));
+  ASSERT_EQ(expectedRatings, std::vector<int64_t>(ratingCol.v.begin(), ratingCol.v.end()));
+}
 
-  // First two docs should have rating=5
-  ASSERT_EQ(5, ratingCol.v[0]);
-  ASSERT_EQ(5, ratingCol.v[1]);
+TEST_F(SortCollectorTest, MixedColumnSortsSingleAndMultiSegment) {
+  CollectionHelper helper;
 
-  // Next two docs should have rating=4
-  ASSERT_EQ(4, ratingCol.v[2]);
-  ASSERT_EQ(4, ratingCol.v[3]);
+  auto indexDocs = [&](bool multiSegment) {
+    helper.clear();
+    auto mode = [&](bool last) {
+      return (multiSegment || last) ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
+    };
+    helper.index(flatdoc("id_s", "doc1", "price_i", 100, "rating_i", 5, "cat_s", "b"), mode(false));
+    helper.index(flatdoc("id_s", "doc2", "price_i", 50, "rating_i", 4, "cat_s", "a"), mode(false));
+    helper.index(flatdoc("id_s", "doc3", "price_i", 150, "rating_i", 3, "cat_s", "a"), mode(false));
+    helper.index(flatdoc("id_s", "doc4", "price_i", 75, "rating_i", 5, "cat_s", "c"), mode(false));
+    helper.index(flatdoc("id_s", "doc5", "price_i", 100, "rating_i", 4, "cat_s", "b"), mode(true));
+  };
+  auto run = [&](std::string_view secondary) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
+    qb::sort(cur, "rating_i", qb::DESC);
+    qb::sort(cur, secondary, qb::ASC);
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
 
-  // Last doc should have rating=3
-  ASSERT_EQ(3, ratingCol.v[4]);
+  for (bool multiSegment : {false, true}) {
+    indexDocs(multiSegment);
+    EXPECT_EQ((std::vector<std::string>{"doc4", "doc1", "doc2", "doc5", "doc3"}),
+              run("price_i"));
+    EXPECT_EQ((std::vector<std::string>{"doc1", "doc4", "doc2", "doc5", "doc3"}),
+              run("cat_s"));
+  }
+}
+
+TEST_F(SortCollectorTest, ScoreAndDocClausesInEveryPosition) {
+  CollectionHelper helper;
+  struct ModelDoc {
+    std::string id;
+    int64_t number;
+    std::string text;
+    float score;
+    segdoc doc;
+  };
+  std::vector<ModelDoc> model = {
+    {"a", 0, "b", 2.0f, {0, 0}},
+    {"b", 0, "a", 1.0f, {0, 1}},
+    {"c", 1, "a", 3.0f, {0, 2}},
+    {"d", 0, "a", 3.0f, {1, 0}},
+    {"e", 1, "b", 1.0f, {1, 1}},
+    {"f", 1, "a", 2.0f, {1, 2}},
+  };
+  for (size_t i = 0; i < model.size(); i++) {
+    const auto& doc = model[i];
+    std::string scoreTag = doc.score == 1.0f ? "one" : doc.score == 2.0f ? "two" : "three";
+    helper.index(flatdoc("id_s", doc.id, "number_i", doc.number,
+                         "text_s", doc.text, "score_s", scoreTag),
+                 i == 2 || i + 1 == model.size()
+                   ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  using Spec = std::pair<std::string, qb::SortDir>;
+  std::vector<std::vector<Spec>> cases = {
+    {{"_score_", qb::DESC}, {"number_i", qb::ASC}, {"text_s", qb::ASC}},
+    {{"_score_", qb::ASC}, {"text_s", qb::DESC}, {"number_i", qb::DESC}},
+    {{"number_i", qb::ASC}, {"_score_", qb::DESC}, {"text_s", qb::ASC}},
+    {{"text_s", qb::DESC}, {"_score_", qb::ASC}, {"number_i", qb::DESC}},
+    {{"number_i", qb::ASC}, {"text_s", qb::ASC}, {"_score_", qb::DESC}},
+    {{"text_s", qb::DESC}, {"number_i", qb::DESC}, {"_score_", qb::ASC}},
+    {{"_docid_", qb::ASC}, {"number_i", qb::DESC}, {"text_s", qb::DESC}},
+    {{"_docid_", qb::DESC}, {"text_s", qb::ASC}, {"number_i", qb::ASC}},
+    {{"number_i", qb::ASC}, {"_docid_", qb::DESC}, {"text_s", qb::ASC}},
+    {{"text_s", qb::DESC}, {"_docid_", qb::ASC}, {"number_i", qb::DESC}},
+    {{"number_i", qb::ASC}, {"text_s", qb::ASC}, {"_docid_", qb::DESC}},
+    {{"text_s", qb::DESC}, {"number_i", qb::DESC}, {"_docid_", qb::ASC}},
+  };
+
+  auto compare = [](const ModelDoc& a, const ModelDoc& b, const std::vector<Spec>& specs) {
+    for (const auto& [field, direction] : specs) {
+      int cmp = 0;
+      if (field == "_score_") {
+        cmp = (a.score > b.score) - (a.score < b.score);
+      } else if (field == "_docid_") {
+        cmp = (a.doc > b.doc) - (a.doc < b.doc);
+      } else if (field == "number_i") {
+        cmp = (a.number > b.number) - (a.number < b.number);
+      } else {
+        cmp = (a.text > b.text) - (a.text < b.text);
+      }
+      if (direction == qb::DESC) cmp = -cmp;
+      if (cmp != 0) return cmp < 0;
+    }
+    return a.doc < b.doc;
+  };
+
+  for (const auto& specs : cases) {
+    auto expected = model;
+    std::sort(expected.begin(), expected.end(),
+              [&](const auto& a, const auto& b) { return compare(a, b, specs); });
+
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).fields({"id_s"});
+    cur.rawQuery() = qb::boolean(cur.mr(), {}, {
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "one"), 1.0f),
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "two"), 2.0f),
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "three"), 3.0f),
+    });
+    for (const auto& [field, direction] : specs) qb::sort(cur, field, direction);
+    req->execute(true);
+    ASSERT_OK(req);
+
+    std::vector<std::string> expectedIds;
+    for (const auto& doc : expected) expectedIds.push_back(doc.id);
+    EXPECT_EQ(expectedIds, resultIds(*req)) << "primary=" << specs[0].first;
+  }
+}
+
+TEST_F(SortCollectorTest, SecondaryClauseControlsHeapEviction) {
+  CollectionHelper helper;
+  for (int i = 0; i < 100; i++) {
+    helper.index(flatdoc("id_s", "d" + std::to_string(i),
+                         "tier_i", i % 2, "order_i", 1000 - i),
+                 i == 99 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").limit(5).allQuery().fields({"id_s"});
+  qb::sort(cur, "tier_i", qb::ASC);
+  qb::sort(cur, "order_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"d98", "d96", "d94", "d92", "d90"}),
+            resultIds(*req));
+}
+
+TEST_F(SortCollectorTest, EqualScoreCandidateCanDisplaceHeapBottom) {
+  CollectionHelper helper;
+  for (int i = 0; i < 20; i++) {
+    helper.index(flatdoc("id_s", "d" + std::to_string(i), "rank_i", 20 - i),
+                 i == 19 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").limit(3).allQuery().fields({"id_s"});
+  qb::sort(cur, "_score_", qb::DESC);
+  qb::sort(cur, "rank_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"d19", "d18", "d17"}), resultIds(*req));
+}
+
+TEST_F(SortCollectorTest, CanonicalScoreSortsMatchDefault) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a", "score_s", "low"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "score_s", "high"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "c", "score_s", "high"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d", "score_s", "low"), UpdateMessage::COMMIT);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::vector<float> scores;
+  };
+  auto run = [&](int mode) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(4).getScores().fields({"id_s"});
+    cur.rawQuery() = qb::boolean(cur.mr(), {}, {
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "low"), 1.0f),
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "high"), 2.0f),
+    });
+    if (mode == 1) qb::sort(cur, "_score_", qb::DESC);
+    if (mode == 2) {
+      qb::sort(cur, "_score_", qb::DESC);
+      qb::sort(cur, "_docid_", qb::ASC);
+    }
+    if (mode == 3) qb::sort(cur, "_score_");
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* docs = req->docList("q");
+    const auto& scores = std::get<solux::api::ColFloat>(docs->columns.at("_score_").kind).v;
+    return Result{resultIds(*req), std::vector<float>(scores.begin(), scores.end())};
+  };
+
+  Result baseline = run(0);
+  for (int mode : {1, 2, 3}) {
+    Result actual = run(mode);
+    EXPECT_EQ(baseline.ids, actual.ids);
+    EXPECT_EQ(baseline.scores, actual.scores);
+  }
+}
+
+TEST_F(SortCollectorTest, DocSortAcrossSegmentsAndMissingSecondary) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a", "tier_i", 0, "secondary_i", 2), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "tier_i", 0), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "c", "tier_i", 0, "secondary_i", 1), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "d", "tier_i", 0), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "e", "tier_i", 0, "secondary_i", 3), UpdateMessage::COMMIT);
+
+  auto run = [&](std::vector<std::pair<std::string_view, qb::SortDir>> specs) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
+    for (auto [field, direction] : specs) qb::sort(cur, field, direction);
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
+
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "c", "d", "e"}),
+            run({{"_docid_", qb::ASC}}));
+  EXPECT_EQ((std::vector<std::string>{"e", "d", "c", "b", "a"}),
+            run({{"_docid_", qb::DESC}}));
+  EXPECT_EQ((std::vector<std::string>{"c", "a", "e", "b", "d"}),
+            run({{"tier_i", qb::ASC}, {"secondary_i", qb::ASC}}));
+}
+
+TEST_F(SortCollectorTest, FieldSortReturnsScoresAndColumnDefaultsAscending) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a", "rank_i", 0, "score_s", "one"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "rank_i", 0, "score_s", "three"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "c", "rank_i", 1, "score_s", "two"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d", "rank_i", 1, "score_s", "three"), UpdateMessage::COMMIT);
+
+  auto makeQuery = [](OpCursor& cur) {
+    cur.rawQuery() = qb::boolean(cur.mr(), {}, {
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "one"), 1.0f),
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "two"), 2.0f),
+      qb::constantScore(cur.mr(), qb::match(cur.mr(), "score_s", "three"), 3.0f),
+    });
+  };
+  auto runColumn = [&](qb::SortDir direction, bool omitted) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).fields({"id_s"});
+    makeQuery(cur);
+    if (omitted) qb::sort(cur, "rank_i");
+    else qb::sort(cur, "rank_i", direction);
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
+  EXPECT_EQ(runColumn(qb::ASC, false), runColumn(qb::ASC, true));
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").limit(10).getScores().fields({"id_s"});
+  makeQuery(cur);
+  qb::sort(cur, "rank_i", qb::ASC);
+  qb::sort(cur, "_score_", qb::DESC);
+  req->execute(true);
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"b", "a", "d", "c"}), resultIds(*req));
+  const auto* docs = req->docList("q");
+  const auto& scores = std::get<solux::api::ColFloat>(docs->columns.at("_score_").kind).v;
+  EXPECT_EQ((std::vector<float>{3.0f, 1.0f, 3.0f, 2.0f}),
+            std::vector<float>(scores.begin(), scores.end()));
 }
 
 TEST_F(SortCollectorTest, SortByPriceDescending) {

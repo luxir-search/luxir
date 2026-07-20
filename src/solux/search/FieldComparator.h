@@ -7,6 +7,7 @@
 #include "solux/reader/StrColReader.h"
 #include "solux/search/OrdMap.h"
 #include "solux/util/MemPool.h"
+#include "solux/util/solux_util.h"
 #include <memory>
 #include <vector>
 #include <limits>
@@ -36,13 +37,6 @@ public:
 
   // Copy the value from a different comparator to this comparator
   virtual void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) = 0;
-
-  // Get a comparable value that can be used across segments
-  // This should return a value that maintains the same ordering as compareSlots
-  // For numeric fields, this would be the actual value (possibly negated for DESC)
-  // For other fields, this could be a hash or ordinal that preserves ordering
-  // Only used in FieldSortCollector2.
-  virtual int64_t getComparableValue(int32_t slot) const { return 0; }
 
   enum MissingValue {
     MISSING_FIRST,
@@ -135,11 +129,14 @@ public:
     return (valA > valB) - (valA < valB);
   }
   
-  int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
+  // NOINLINE: keeps the per-doc rejection path a single out-of-line unit with the
+  // column iterator inlined into it, rather than speculative-devirt inlining a
+  // half of it into the collect loop and spilling value()/advance() to calls.
+  SOLUX_NOINLINE int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
     // Get the bottom value from the slot
     assert(bottomSlot >= 0 && bottomSlot < (int32_t)values.size());
     int64_t bottomVal = values[bottomSlot];
-    
+
     // Get the new document's value
     int64_t newVal = getDocValue(newDoc.docId());
 
@@ -150,12 +147,6 @@ public:
     assert(slot >= 0 && slot < (int32_t)values.size());
     int64_t value = getDocValue(doc.docId());
     values[slot] = value;
-  }
-  
-  int64_t getComparableValue(int32_t slot) const override {
-    // For numeric comparator, return the stored value
-    assert(slot >= 0 && slot < (int32_t)values.size());
-    return values[slot];
   }
   
   int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {
@@ -289,7 +280,8 @@ public:
     return (ordA > ordB) - (ordA < ordB);
   }
   
-  int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
+  // NOINLINE: see SimpleNumericFieldComparator::compareBottom.
+  SOLUX_NOINLINE int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
     assert(bottomSlot >= 0 && bottomSlot < (int32_t)globalOrds.size());
     int64_t bottomOrd = globalOrds[bottomSlot];
     int64_t newOrd = getGlobalOrd(newDoc.docId());
@@ -299,11 +291,6 @@ public:
   void copy(int32_t slot, segdoc doc) override {
     assert(slot >= 0 && slot < (int32_t)globalOrds.size());
     globalOrds[slot] = getGlobalOrd(doc.docId());
-  }
-  
-  int64_t getComparableValue(int32_t slot) const override {
-    assert(slot >= 0 && slot < (int32_t)globalOrds.size());
-    return globalOrds[slot];
   }
   
   int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {
@@ -399,7 +386,8 @@ public:
     return sortMultiplier * cmp;
   }
   
-  int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
+  // NOINLINE: see SimpleNumericFieldComparator::compareBottom.
+  SOLUX_NOINLINE int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
     assert(bottomSlot >= 0 && bottomSlot < (int32_t)values.size());
     const auto& bottomVal = values[bottomSlot];
     std::string_view newVal = getDocValue(newDoc.docId());
@@ -410,12 +398,6 @@ public:
   void copy(int32_t slot, segdoc doc) override {
     assert(slot >= 0 && slot < (int32_t)values.size());
     values[slot] = std::string(getDocValue(doc.docId()));
-  }
-  
-  int64_t getComparableValue(int32_t slot) const override {
-    // String comparator can't easily return a single comparable value
-    // Return 0 as placeholder
-    return 0;
   }
   
   int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {

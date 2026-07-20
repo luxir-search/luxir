@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <charconv>
 #include <latch>
 
@@ -191,6 +192,14 @@ int64_t scanIntCol(std::string_view field, IndexReader& reader) {
 static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view shape, std::string_view qfield, std::string_view sfield, bool para) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
+  std::vector<std::string_view> sortFields;
+  for (size_t start = 0; start <= sfield.size();) {
+    size_t end = sfield.find(',', start);
+    sortFields.push_back(sfield.substr(start, end - start));
+    if (end == std::string_view::npos) break;
+    start = end + 1;
+  }
+
   if (solux::unit_tests) {
     nDocs = 200;
   }
@@ -210,7 +219,9 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
 
   // if the sortfield ends in _s, we want to make sure to pre-load the OrdMap
   std::shared_ptr<OrdMap> ordMap;
-  if (sfield.ends_with("_s")) {
+  bool hasStringSort = std::ranges::any_of(
+    sortFields, [](std::string_view field) { return field.ends_with("_s"); });
+  if (hasStringSort) {
     auto reader = helper.getIndexWriter()->getIndexReader();
     /* basic info for the ordMap
     ordMap = reader->getOrdMap(sfield);
@@ -247,8 +258,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
            .getNumber(true)
            .getScores(false)
            .fields({"id"});
-    // sort by some of the string fields
-    qb::sort(topDocs, sfield, qb::DESC);
+    for (auto field : sortFields) qb::sort(topDocs, field, qb::DESC);
 
     req->execute(para);
 
@@ -279,7 +289,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   auto mem = watcher.getDeltaKB();
   state.counters["RSS_delta"] = mem.first / 1024;
   state.counters["RSS_max"] = mem.second / 1024;
-  if (sfield.ends_with("_s")) {
+  if (hasStringSort) {
     state.counters["OrdMapSz"] = ordMap ? (double)ordMap->sizeInBytes() : 0; // size of the OrdMap in bytes
   }
 }
@@ -353,6 +363,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_QueryBuildIndex, build,              nDocs, shape);
 // #ifdef REMOVED
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_scan,        nDocs, shape, "scan","u10_i", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i,             nDocs, shape, "all", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_score,       nDocs, shape, "all", "u10_i,_score_", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_para,        nDocs, shape, "all", "u10_i", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_i", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);

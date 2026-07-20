@@ -158,9 +158,9 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
 - Adaptive execution: requests that do not consume an exact total run with
   block-max pruning (per-block score bounds + MaxScore skipping); requests
   that ask for exact counts run exhaustively.
-- Sorting by one field value (ascending/descending), result limits, and field
-  projection. Secondary sorts, score/doc-id sort specs, and ordered page-after
-  pagination are not implemented yet.
+- Lexicographic sorting by column values, query score, and reader-local
+  `(segment, docid)`, with ascending/descending directions, result limits, and
+  field projection. Ordered page-after pagination is not implemented yet.
 - Row- or column-oriented results per request (`document_format`): JSON
   defaults to row-oriented docs (missing field = absent key), gRPC to dense
   columns (missing = per-column sentinel) for analytics-friendly decoding.

@@ -521,35 +521,40 @@ public:
         facetReq.missing);
   }
 
-  // Build SortField list from a proto SortSpec repeated field.  Schema lookups
-  // that may throw are done here in the parser; the result is passed to the
-  // TopDocsReq ctor.
-  struct ParsedSorts {
-    std::vector<SortField> sortFields;
-    bool useFieldSort = false;
-  };
-  ParsedSorts parseSorts(std::span<const solux::api::SortSpec> sorts) {
-    ParsedSorts out;
+  // Build the copyable sort plan. Schema lookups that may throw are resolved
+  // here before the plan is passed to TopDocsReq.
+  SortPlan parseSorts(std::span<const solux::api::SortSpec> sorts) {
+    SortPlan out;
     if (sorts.empty()) return out;
     out.useFieldSort = true;
-    static ScoreFieldType scoreType;
-    static DocFieldType docType;
     for (const auto& sortSpec : sorts) {
-      SortField::SortOrder order = sortSpec.dir == solux::api::SortSpec_::SortDir::DESC ?
-        SortField::DESC : SortField::ASC;
+      bool defaultDesc = sortSpec.dir == solux::api::SortSpec_::SortDir::UNKNOWN
+        && sortSpec.field == "_score_";
+      SortField::SortOrder order =
+        sortSpec.dir == solux::api::SortSpec_::SortDir::DESC || defaultDesc
+          ? SortField::DESC : SortField::ASC;
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
       if (sortSpec.field == "_score_") {
-        out.sortFields.emplace_back(sortSpec.field, scoreType, order, missing);
+        out.clauses.emplace_back(SortClause::SCORE, order);
       } else if (sortSpec.field == "_docid_") {
-        out.sortFields.emplace_back(sortSpec.field, docType, order, missing);
+        out.clauses.emplace_back(SortClause::DOC, order);
       } else {
         auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field);
         if (!fieldTypePtr) {
           throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field));
         }
-        out.sortFields.emplace_back(sortSpec.field, *fieldTypePtr, order, missing);
+        out.clauses.emplace_back(
+          SortField(sortSpec.field, *fieldTypePtr, order, missing));
       }
     }
+
+    bool scoreDesc = out.clauses[0].getKind() == SortClause::SCORE
+      && out.clauses[0].getOrder() == SortField::DESC;
+    bool canonicalScore = out.clauses.size() == 1 && scoreDesc;
+    bool canonicalScoreDoc = out.clauses.size() == 2 && scoreDesc
+      && out.clauses[1].getKind() == SortClause::DOC
+      && out.clauses[1].getOrder() == SortField::ASC;
+    if (canonicalScore || canonicalScoreDoc) out.useFieldSort = false;
     return out;
   }
 
@@ -657,7 +662,7 @@ public:
 
     auto* qr = solux::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,
-      std::move(parsedSorts.sortFields), parsedSorts.useFieldSort,
+      std::move(parsedSorts),
       filters, filterWeights);
 
     if (firstQuery == nullptr) {

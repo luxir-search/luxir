@@ -39,8 +39,7 @@ public:
   int64_t topCount; // maximum number of docs to return.
   std::span<std::pair<std::string_view, Query*>> filters;
   std::span<Query::Weight*> filterWeights;
-  std::vector<SortField> sortFields;
-  bool useFieldSort = false;
+  SortPlan sortPlan;
 
   // Optional sink for the merged top-K collector.  If set, the Calc invokes
   // it instead of self-emitting via fillQueryTopNResponse, letting another
@@ -65,7 +64,7 @@ public:
     Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
-        return new MergeableCollector(op.topCount, op.useFieldSort, op.sortFields, op.req.reader.get());
+        return new MergeableCollector(op.topCount, op.sortPlan, op.req.reader.get());
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
@@ -418,12 +417,12 @@ public:
   // parser split is parse-phase structure, not a nothrow requirement.)
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::Context& qcontext, Query* query, Query::Weight* weight, int64_t topCount,
-    std::vector<SortField>&& sortFields, bool useFieldSort,
+    SortPlan&& sortPlan,
     std::span<std::pair<std::string_view, Query*>> filters,
     std::span<Query::Weight*> filterWeights)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
       weight(weight), topCount(topCount), filters(filters), filterWeights(filterWeights),
-      sortFields(std::move(sortFields)), useFieldSort(useFieldSort) {
+      sortPlan(std::move(sortPlan)) {
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
