@@ -149,7 +149,7 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   ASSERT_EQ(1u, pieces[0].details.size());  // no upgrade, no divergence note
 }
 
-TEST_F(ExecutionProfileTest, reportsSparseReaderForArrayDomains) {
+TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
   CollectionHelper helper("profile-sparse");
   std::vector<Doc> docs;
   for (int i = 0; i < 256; i++) {
@@ -165,13 +165,13 @@ TEST_F(ExecutionProfileTest, reportsSparseReaderForArrayDomains) {
   req->execute(false);
   ASSERT_OK(req);
 
-  // A 3-doc filtered domain materializes as an ArrDocSet: the column walk must
-  // big-skip with the SparseIterator, and the profile must say so.
+  // A 3-doc filtered domain materializes as an ArrDocSet: the ord column walk
+  // point-selects each domain doc, and the profile must say so.
   const auto& pieces = profileOp(*req).pieces;
   ASSERT_EQ(1u, pieces.size());
   EXPECT_EQ(3, *pieces[0].domain_size);
   ASSERT_GE(pieces[0].details.size(), 1u);
-  EXPECT_EQ("array domain, sparse column skips", pieces[0].details[0]);
+  EXPECT_EQ("array domain, point ord loads", pieces[0].details[0]);
 }
 
 TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {

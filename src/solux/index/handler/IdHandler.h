@@ -231,10 +231,11 @@ public:
       textWriter.startField(&fieldInfo);
       for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
         auto term = terms[tnum];
-        textWriter.startTerm(term);
+        int64_t ord = textWriter.startTerm(term);
+        assert(ord <= INT32_MAX);
         // id is unique: exactly one doc per term, docFreq=1, always pulsed
         textWriter.addDoc(term.val().docId, 1);  // DOCS-only field: record the doc, no freq/position stored
-        ords.add(term.val().docId, tnum + 1); // +1 because 0 means "missing"
+        ords.add(term.val().docId, (uint32_t)ord);
         textWriter.endTerm(term);
       }
       textWriter.endField();

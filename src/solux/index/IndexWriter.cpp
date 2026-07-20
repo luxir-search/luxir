@@ -1800,6 +1800,44 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         }
       }
 
+      // Segment-local ords are signed int32. Admit only sources whose summed
+      // per-field term dictionaries remain below the flush-side limit. Text
+      // dictionaries are exempt because they do not produce an ord column.
+      boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      std::vector<SegInfo*> admitted;
+      admitted.reserve(segs.size());
+      for (SegInfo* seg : segs) {
+        auto postingsReader = getSegmentPostingsReader(*seg);
+        MemPool metadataPool;
+        FieldReader fields(metadataPool, *postingsReader);
+        boost::unordered_flat_map<std::string, int64_t> additions;
+        bool fits = true;
+        while (fields.readNextField()) {
+          SegFieldInfo info;
+          fields.readFieldInfo(info);
+          if (info.type != FieldType::STRING ||
+              (info.flags & FieldType::INDEX_DOCS) == 0 ||
+              (info.flags & FieldType::MULTI_VALUED) == 0) {
+            continue;
+          }
+          std::string name((std::string_view)info.fieldname);
+          int64_t next = additions[name] + info.nTerms;
+          if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
+            fits = false;
+            break;
+          }
+          additions[name] = next;
+        }
+        if (!fits) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged ord dictionary would exceed the safety limit",
+                      seg->segId);
+          continue;
+        }
+        for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        admitted.push_back(seg);
+      }
+      segs.swap(admitted);
+
       // Selection must be complete before changing segment state.  Marking an
       // unselected candidate would permanently block its deletion.
       for (auto* seg : segs) {

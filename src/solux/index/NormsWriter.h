@@ -6,6 +6,7 @@
 #include <span>
 
 #include "DocStream.h"
+#include "ColumnIndexing.h"
 #include "PostingsWriter.h"
 #include "Stream.h"
 
@@ -27,10 +28,6 @@ public:
   };
 
 private:
-  static bool useFlat(int32_t docsWithField, int32_t maxDoc) {
-    return (int64_t)docsWithField * 2 >= (int64_t)maxDoc;
-  }
-
   static void writeTrailingZeroes(OutputStream& out, int64_t len) {
     static const char zeroes[4096] = {};
     while (len > 0) {
@@ -102,7 +99,7 @@ public:
       return prepared;
     }
 
-    prepared.flat = useFlat(docsWithField, maxDoc);
+    prepared.flat = useDocIdIndexing(docsWithField, maxDoc);
     prepared.ordinalNorms = materializeOrdinalNorms(pool, normBytes, docsWithField);
 
     if (docsWithField < maxDoc) {

@@ -82,7 +82,7 @@ class DocsEnum {
   int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
   const char* termImpactFrontierPtr = nullptr;
   uint32_t termImpactFrontierLen = 0;
-  int32_t termOrdinal = -1;  // captured once from the positioned TermsEnum
+  int64_t termOrdinal = -1;  // captured once from the positioned TermsEnum
 
 public:
   // The skip structure is two levels: L0 per-block headers, and L1 group headers
@@ -805,7 +805,7 @@ public:
     return ttf;
   }
 
-  int32_t termOrd() const { return termOrdinal; }
+  int64_t termOrd() const { return termOrdinal; }
 
   bool hasTermImpacts() const {
     return termImpactFrontierPtr != nullptr;

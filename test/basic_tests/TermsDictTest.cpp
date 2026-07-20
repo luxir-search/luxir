@@ -185,7 +185,8 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
 
 MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const SegFieldInfo& fieldInfo) {
   InputStream termsIS = reader.getInputStreamSeek(fieldInfo.termsLoc);
-  int32_t nTerms = std::min(Postings::TERMS_BLOCK_SIZE, fieldInfo.nTerms);
+  int32_t nTerms = (int32_t)std::min<int64_t>(Postings::TERMS_BLOCK_SIZE,
+                                               fieldInfo.nTerms);
   termsIS.readPackedTerm();
   termsIS.readVlong();
   termsIS.readVlong();

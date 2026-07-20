@@ -108,8 +108,7 @@ public:
 
 private:
   // A single-valued STRING field must reject multi-value input before any
-  // append: the ord column would silently become multi-valued while readers
-  // shape results from the schema (and assert on the mismatch).
+  // append: observed-multi segments are only legal for declared-multi fields.
   void checkMultiValued(Inverter& inverter, size_t n) {
     unused(inverter);
     if (n > 1 && !fieldType->multiValued()) {
@@ -156,12 +155,13 @@ public:
     textWriter.startField(&fieldInfo);
     for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
       auto term = terms[tnum];
-      textWriter.startTerm(term);
+      int64_t ord = textWriter.startTerm(term);
+      assert(ord <= INT32_MAX);
       // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
       term.val().forEachDoc(termsHash.getMemPool(), [&](int rank) {
         int32_t docid = full ? rank : rankToDoc[rank];
         textWriter.addDoc(docid, 1);  // DOCS-only field: record the doc, no freq/position stored
-        ords.add(rank, tnum + 1);
+        ords.add(rank, (uint32_t)ord);
       });
       textWriter.endTerm(term);
     }

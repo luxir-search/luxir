@@ -1,6 +1,7 @@
 #pragma once
 #include "solux/search/DocSet.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/OrdColReader.h"
 #include "solux/util/solux_util.h"
 
 namespace solux {
@@ -87,6 +88,86 @@ void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
       }
     } else {
       missing_num++;
+    }
+  }
+}
+
+template <class F>
+void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
+                     int32_t maxDoc, int64_t& missing_num, F&& callback) {
+  if (domain && domain->type == DocSet::Type::ARRAY) {
+    auto arrayDocs = ((ArrDocSet*)domain)->docs();
+    if (ordColReader.docIdIndexed()) {
+      assert(!ordColReader.multiValued());
+      for (int32_t docid : arrayDocs) {
+        int32_t ord = ordColReader.ordAt(docid);
+        if (ord != 0) callback(docid, ord);
+        else missing_num++;
+      }
+      return;
+    }
+
+    const DocsReader& docs = ordColReader.docsReader();
+    screaming::BitSet::Iterator docsIter(docs.bitset());
+    OrdColReader::PointOrds values(ordColReader);
+    bool dense = !docs.hasBitset();
+    int32_t found = -1;
+    for (int32_t docid : arrayDocs) {
+      int32_t docRank;
+      if (dense) {
+        docRank = docid;
+      } else {
+        if (found < docid) found = docsIter.advance(docid);
+        if (found != docid) {
+          missing_num++;
+          continue;
+        }
+        docRank = docsIter.rank();
+      }
+      if (!ordColReader.multiValued()) {
+        callback(docid, values.valueAt(docRank));
+      } else {
+        auto [start, end] = ordColReader.getStartEndValueRank(docRank);
+        for (int64_t rank = start; rank < end; rank++) {
+          callback(docid, values.valueAt(rank));
+        }
+      }
+    }
+    return;
+  }
+
+  const FixedBitSet* bits = domain ? &((BitDocSet*)domain)->bits() : nullptr;
+  if (ordColReader.docIdIndexed()) {
+    assert(!ordColReader.multiValued());
+    OrdColReader::BulkOrds values(ordColReader);
+    int32_t docid = -1;
+    while (docid + 1 < maxDoc) {
+      docid = bits ? bits->nextSetBit(docid + 1) : docid + 1;
+      if (docid >= maxDoc) break;
+      int32_t ord = values.valueAt(docid);
+      if (ord != 0) callback(docid, ord);
+      else missing_num++;
+    }
+    return;
+  }
+
+  OrdColReader::Iterator iter(ordColReader);
+  int32_t docid = -1;
+  while (docid + 1 < maxDoc) {
+    docid = bits ? bits->nextSetBit(docid + 1) : docid + 1;
+    if (docid >= maxDoc) break;
+    if (iter.docId() < docid) iter.advance(docid);
+    if (iter.docId() != docid) {
+      missing_num++;
+      continue;
+    }
+    if (!ordColReader.multiValued()) {
+      callback(docid, iter.value());
+    } else {
+      auto [start, end] = ordColReader.getStartEndValueRank(iter.rank());
+      for (int64_t rank = start; rank < end; rank++) {
+        callback(docid, iter.values().valueAt(rank));
+      }
     }
   }
 }

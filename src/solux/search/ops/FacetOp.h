@@ -11,6 +11,7 @@
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/DocsReader.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/OrdColReader.h"
 #include "solux/reader/PointsReader.h"
 #include "solux/reader/SkipStats.h"
 #include "solux/reader/TermsEnum.h"
@@ -103,6 +104,22 @@ public:
     // (BitDocSet*)/(ArrDocSet*) cast); callback is per value.
     IntColReader intColReader(postingsReader, segFieldInfo);
     forEachIntColValue(domain, intColReader, maxDoc, missing_num, callback);
+    return true;
+  }
+
+  bool facetSegOrdCol(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                      SegFieldInfo& segFieldInfo, auto&& callback) {
+    auto& postingsReader = reader.segments()[segnum].postingsReader();
+    int32_t maxDoc = postingsReader.maxDoc();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    if (!fieldReader.seek(fieldName)) {
+      missing_num += domain ? domain->card() : maxDoc;
+      return false;
+    }
+    fieldReader.readFieldInfo(segFieldInfo);
+    OrdColReader ordColReader(postingsReader, segFieldInfo);
+    forEachOrdValue(domain, ordColReader, maxDoc, missing_num, callback);
     return true;
   }
 };

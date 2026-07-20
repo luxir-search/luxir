@@ -13,6 +13,7 @@
 #include "Query.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/NormsReader.h"
+#include "solux/reader/OrdColReader.h"
 #include "solux/util/solux_util.h"
 
 namespace solux {
@@ -120,14 +121,19 @@ public:
 
       if ((inputFlags & NEED_SCORES) == 0) {
         // Matching does not need norms or BM25 when score() is never read.
-        return targetPool.make<TermQuery::Scorer>(*docsEnum, nullptr, nullptr, boost);
+        return targetPool.make<TermQuery::Scorer>(
+            *docsEnum, (solux::NormsReader*)nullptr,
+            (solux::Similarity::BM25Scorer*)nullptr, boost);
       }
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
       solux::NormsReader* normsReader = nullptr;
       solux::IntColReader* valueReader = nullptr;
+      solux::OrdColReader* ordReader = nullptr;
       if (segFieldInfo->type == FieldType::TEXT) {
         normsReader = targetPool.make<solux::NormsReader>(segment.postingsReader(), *segFieldInfo);
+      } else if (segFieldInfo->ordFormat != SegFieldInfo::ORD_NONE) {
+        ordReader = targetPool.make<solux::OrdColReader>(segment.postingsReader(), *segFieldInfo);
       } else if (segFieldInfo->columnLoc.offset() > 0) {
         valueReader = targetPool.make<solux::IntColReader>(segment.postingsReader(), *segFieldInfo);
       }
@@ -135,8 +141,13 @@ public:
       if (const BlockBounds* bounds = segment.blockBounds(query.getField())) {
         sidecarTerm = bounds->find(docsEnum->termOrd());
       }
-      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader, valueReader,
-                                                simScorer, boost,
+      if (ordReader != nullptr) {
+        return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, ordReader,
+                                                  simScorer, boost,
+                                                  query.shouldUseFrontierBound(), sidecarTerm);
+      }
+      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
+                                                valueReader, simScorer, boost,
                                                 query.shouldUseFrontierBound(), sidecarTerm);
     }
 
@@ -190,6 +201,7 @@ public:
     // normsIter; non-text term queries keep the existing column-backed lookup.
     std::optional<solux::NormsReader::Iterator> normsIter;
     std::optional<solux::IntColReader::Iterator> valueIter;
+    solux::OrdColReader* ordReader = nullptr;
     const uint8_t* flatNormsBase = nullptr;
     solux::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
@@ -219,17 +231,32 @@ public:
     Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
-            : Scorer(docsEnum, normsReader, nullptr, simScorer, boost, useFrontierBound) {
+            : Scorer(docsEnum, normsReader, nullptr, nullptr, simScorer, boost,
+                     useFrontierBound) {
     }
 
     Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
            solux::IntColReader* valueReader, solux::Similarity::BM25Scorer* simScorer,
            float boost = 1.0f, bool useFrontierBound = true)
-            : docsEnum(docsEnum), simScorer(simScorer), boost(boost) {
+            : Scorer(docsEnum, normsReader, valueReader, nullptr, simScorer, boost,
+                     useFrontierBound) {}
+
+    Scorer(solux::DocsEnum& docsEnum, solux::OrdColReader* ordReader,
+           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
+           bool useFrontierBound = true)
+            : Scorer(docsEnum, nullptr, nullptr, ordReader, simScorer, boost,
+                     useFrontierBound) {}
+
+    Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+           solux::IntColReader* valueReader, solux::OrdColReader* ordReader,
+           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
+           bool useFrontierBound = true)
+            : docsEnum(docsEnum), ordReader(ordReader), simScorer(simScorer), boost(boost) {
       unused(useFrontierBound);
       // Scoring needs both BM25 and an encoded norm/value lookup, or neither.
-      assert((simScorer == nullptr) == (normsReader == nullptr && valueReader == nullptr));
-      assert(normsReader == nullptr || valueReader == nullptr);
+      assert((simScorer == nullptr) ==
+             (normsReader == nullptr && valueReader == nullptr && ordReader == nullptr));
+      assert((normsReader != nullptr) + (valueReader != nullptr) + (ordReader != nullptr) <= 1);
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
@@ -252,6 +279,14 @@ public:
             : Scorer(docsEnum, normsReader, valueReader, simScorer, boost, useFrontierBound) {
       buildImpacts(pool, normsReader != nullptr || valueReader != nullptr,
                    useFrontierBound, sidecar);
+    }
+
+    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum,
+           solux::OrdColReader* ordReader, solux::Similarity::BM25Scorer* simScorer,
+           float boost = 1.0f, bool useFrontierBound = true,
+           BlockBounds::TermView sidecar = {})
+            : Scorer(docsEnum, ordReader, simScorer, boost, useFrontierBound) {
+      buildImpacts(pool, ordReader != nullptr, useFrontierBound, sidecar);
     }
 
     bool hasImpacts() const {
@@ -343,6 +378,7 @@ public:
         assert(normDoc == doc);
         return normsIter->value();
       }
+      if (ordReader != nullptr) return ordReader->firstOrdAt(doc);
       int32_t normDoc = valueIter->advance(doc);
       assert(normDoc == doc);
       return valueIter->value();

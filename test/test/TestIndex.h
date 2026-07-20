@@ -9,6 +9,7 @@
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/NormsReader.h"
+#include "solux/reader/OrdColReader.h"
 #include "test/SoluxTest.h"
 #include <vector>
 
@@ -208,6 +209,8 @@ namespace solux::test {
     SegFieldInfo fieldInfo;
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
+    std::unique_ptr<OrdColReader> ordReader;
+    std::unique_ptr<OrdColReader::Iterator> ordIter;
     std::unique_ptr<NormsReader> normsReader;
     std::unique_ptr<NormsReader::Iterator> normsIter;
     std::unique_ptr<TermsEnum> tenum;
@@ -260,16 +263,17 @@ namespace solux::test {
       testIndex.initReader();  // TODO: don't do this for each field, it will invalidate previous pointers!
       currSeg = -1;
       iter.reset();
+      ordIter.reset();
       normsIter.reset();
     }
 
     int64_t nextDoc() {
-      if (iter == nullptr && normsIter == nullptr) {
+      if (iter == nullptr && ordIter == nullptr && normsIter == nullptr) {
         auto found = nextSegment();
         if (!found) return -1; // OR BIG_END. 0x7ffffffff?
       }
       for(;;) {
-        doc = iter ? iter->next() : normsIter->next();
+        doc = iter ? iter->next() : (ordIter ? ordIter->next() : normsIter->next());
         if (doc != IntColReader::ENDDOC) {
           auto* liveDocs = testIndex.reader->segments()[currSeg].liveDocs();
           if (liveDocs && !liveDocs->bitset().get(doc)) {
@@ -287,7 +291,10 @@ namespace solux::test {
     }
 
     int64_t ord() {
-      return v = iter->value();
+      if (!ordReader->multiValued()) return v = ordIter->value();
+      auto [start, end] = ordReader->getStartEndValueRank(ordIter->rank());
+      assert(end == start + 1);
+      return v = ordIter->values().valueAt(start);
     }
 
     void vals(std::vector<int64_t>& target) {
@@ -304,7 +311,15 @@ namespace solux::test {
     }
 
     void ords(std::vector<int64_t>& target) {
-      vals(target);
+      target.clear();
+      if (!ordReader->multiValued()) {
+        target.push_back(ord());
+      } else {
+        auto [start, end] = ordReader->getStartEndValueRank(ordIter->rank());
+        for (int64_t rank = start; rank < end; rank++) {
+          target.push_back(ordIter->values().valueAt(rank));
+        }
+      }
     }
 
     bool nextSegment() {
@@ -328,10 +343,21 @@ namespace solux::test {
           normsIter = std::make_unique<NormsReader::Iterator>(*normsReader);
           colReader.reset();
           iter.reset();
+          ordReader.reset();
+          ordIter.reset();
+        } else if (fieldInfo.ordFormat != SegFieldInfo::ORD_NONE) {
+          ordReader = std::make_unique<OrdColReader>(seg.postingsReader(), fieldInfo);
+          ordIter = std::make_unique<OrdColReader::Iterator>(*ordReader);
+          colReader.reset();
+          iter.reset();
+          normsReader.reset();
+          normsIter.reset();
         } else {
           colReader = std::make_unique<IntColReader>(seg.postingsReader(), fieldInfo); // todo nocommit, when will pool rollback be done?
           // EXPECT_EQ(colReader->docsWithField(), nAdds); // TODO: sum up and only do after final segment has been reached
           iter = std::make_unique<IntColReader::Iterator>(*colReader);
+          ordReader.reset();
+          ordIter.reset();
           normsReader.reset();
           normsIter.reset();
         }

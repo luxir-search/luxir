@@ -32,6 +32,18 @@ struct SegFieldInfo {
     NORMS_SPARSE = 2
   };
 
+  enum OrdFormat : uint8_t {
+    ORD_NONE = 0,
+    ORD_DIRECT = 1,
+    ORD_PREDICTED = 2
+  };
+
+  enum OrdIndexing : uint8_t {
+    ORD_INDEX_NONE = 0,
+    ORD_DOCID = 1,
+    ORD_RANK = 2
+  };
+
   PackedTerm fieldname;
   FieldType::Type type;
   int32_t flags;  // from FieldType
@@ -39,7 +51,7 @@ struct SegFieldInfo {
   seg_location termsLoc;
   seg_location docsLoc;
   seg_location posLoc;
-  int32_t nTerms;
+  int64_t nTerms;
   int32_t docsWithField;
 
   // I don't know if things like nTerms, sumDocFreq, sumTotalTermFreq will stay in fieldInfo
@@ -60,6 +72,9 @@ struct SegFieldInfo {
   int64_t columnMetaOff;     // offset from the start of the column to the metadata
   int64_t numValues;         // total number of values in the column across all docs.
                              // For single-valued fields numValues == docsWithField; for multi-valued it is >=.
+  int32_t ordFormat = ORD_NONE;
+  int32_t ordIndexing = ORD_INDEX_NONE;
+  int32_t ordBits = 0;
 
   // Optional 1-D sorted-leaf points index. Absence is pointsMetaOff == 0;
   // pointsLoc.offset() may be zero for a present index in a nonzero file.
@@ -190,7 +205,7 @@ public:
         fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.docsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.posLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.nTerms = fieldIS.readVint();
+        fieldInfo.nTerms = fieldIS.readVlong();
         fieldInfo.sumDocFreq = fieldInfo.nTerms + fieldIS.readVlong();
         fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.readVlong();
         fieldInfo.trieLoc = fieldIS.readVal<seg_location>();
@@ -204,6 +219,9 @@ public:
       fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
       fieldInfo.columnMetaOff = fieldIS.readVlong();
       fieldInfo.numValues = fieldIS.readVlong();
+      fieldInfo.ordFormat = fieldIS.readVint();
+      fieldInfo.ordIndexing = fieldIS.readVint();
+      fieldInfo.ordBits = fieldIS.readVint();
       fieldInfo.pointsLoc = fieldIS.readVal<seg_location>();
       fieldInfo.pointsMetaOff = fieldIS.readVlong();
       fieldInfo.normsFormat = fieldIS.readVint();

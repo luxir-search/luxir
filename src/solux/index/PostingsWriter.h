@@ -319,7 +319,7 @@ private:
         fieldOutput.writeVal(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
         fieldOutput.writeVal(finfo.docsLoc);
         fieldOutput.writeVal(finfo.posLoc);
-        fieldOutput.writeVint(finfo.nTerms);
+        fieldOutput.writeVlong(finfo.nTerms);
         fieldOutput.writeVlong(finfo.sumDocFreq - finfo.nTerms);            // sumDocFreq >= nTerms
         fieldOutput.writeVlong(finfo.sumTotalTermFreq - finfo.sumDocFreq);  // sumTotalTermFreq >= sumDocFreq
         fieldOutput.writeVal(finfo.trieLoc);
@@ -337,6 +337,9 @@ private:
       fieldOutput.writeVal(finfo.columnLoc);
       fieldOutput.writeVlong(finfo.columnMetaOff);
       fieldOutput.writeVlong(finfo.numValues);
+      fieldOutput.writeVint((uint32_t)finfo.ordFormat);
+      fieldOutput.writeVint((uint32_t)finfo.ordIndexing);
+      fieldOutput.writeVint((uint32_t)finfo.ordBits);
       fieldOutput.writeVal(finfo.pointsLoc);
       fieldOutput.writeVlong(finfo.pointsMetaOff);
       fieldOutput.writeVint((uint32_t)finfo.normsFormat);
@@ -530,7 +533,7 @@ private:
   bool hasLastTermOfPrevBlock = false;
   int64_t sumTotalTermFreq = 0; // updated in endTerm
   int64_t sumDocFreq = 0; // updated in endTerm
-  int32_t numTerms; // currently only updated in flushTerms
+  int64_t numTerms; // currently only updated in flushTerms
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1355,7 +1358,7 @@ public:
   /// The term is copied into block-local storage and only needs to be valid for the
   /// duration of this call.
   // returns 1-based ordinal of term in this field
-  int32_t startTerm(TermRef term) {
+  int64_t startTerm(TermRef term) {
     docsFlushed = 0;
     ttfAcc = 0;
     prevDocBlockLast = 0;  // each term's first doc block starts from base 0
@@ -1375,7 +1378,7 @@ public:
     PackedTerm stored(termBytes.data() + termList.size() * PackedTerm::MAX_BYTES);
     term.copyTo(stored);
     termList.push_back(stored);
-    return numTerms + termList.size();
+    return numTerms + (int64_t)termList.size();
   }
 
   void endTerm(TermRef term) {

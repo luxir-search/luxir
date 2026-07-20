@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 namespace solux {
 
@@ -17,6 +18,13 @@ struct MergeCostModel {
   static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
   static constexpr int32_t MAX_TERM_RANGES = 8;
+  static constexpr int64_t MAX_MERGED_ORD_TERMS =
+      (int64_t)std::numeric_limits<int32_t>::max() - (1 << 20);
+
+  static bool ordTermsFit(int64_t currentTerms, int64_t sourceTerms) {
+    return currentTerms >= 0 && sourceTerms >= 0 &&
+           sourceTerms <= MAX_MERGED_ORD_TERMS - currentTerms;
+  }
 
   // Peak checked-out OutputStreams for each writer path.
   static constexpr int32_t TEXT_STREAMS = 3;      // TextWriter owns term/doc/pos streams together.

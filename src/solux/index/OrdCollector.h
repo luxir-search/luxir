@@ -16,7 +16,7 @@ namespace solux {
 // in increasing order.
 class OrdCollector {
   MemPool& pool;
-  std::vector<int32_t> ords;
+  std::vector<uint32_t> ords;
   bool multiValued_ = false; // multiple values encountered for an index?
   int32_t docsWithValue_ = 0;
 public:
@@ -27,8 +27,9 @@ public:
   {}
 
   // add a 1-based ord for the given index (docid or field-rank)
-  void add(int32_t docid, int32_t ord) {
+  void add(int32_t docid, uint32_t ord) {
     assert(ord > 0 && docid >= 0);
+    assert(ord <= INT32_MAX);
     // For something more memory efficient, look at Solr's UnInvertedField.
     auto v = ords[docid];
     if (v == 0) {
@@ -37,9 +38,9 @@ public:
       return;
     }
     IntDeltaStream* stream;
-    if (v & 0x80000000) {
+    if (v & 0x80000000u) {
       // list of ords in a stream
-      int streamAddr = v & 0x7fffffff;
+      int streamAddr = (int)(v & 0x7fffffffu);
       stream = (IntDeltaStream*)pool.ptr(streamAddr);
     } else {
       multiValued_ = true;
@@ -50,10 +51,10 @@ public:
       // smaller in practice).
       assert((streamAddr & 0x80000000u) == 0);
       stream = new (ptr) IntDeltaStream(pool);
-      stream->addVal(pool, v);
-      ords[docid] = streamAddr | 0x80000000;
+      stream->addVal(pool, (int32_t)v);
+      ords[docid] = (uint32_t)streamAddr | 0x80000000u;
     }
-    stream->addVal(pool, ord);
+    stream->addVal(pool, (int32_t)ord);
   }
 
   bool hasValues(int32_t docid) const {
@@ -80,11 +81,11 @@ public:
     if (v == 0) {
       return;
     }
-    if (v & 0x80000000) {
+    if (v & 0x80000000u) {
       // list of ords in a stream
-      int streamAddr = v & 0x7fffffff;
+      int streamAddr = (int)(v & 0x7fffffffu);
       IntDeltaStream* stream = (IntDeltaStream*)pool.ptr(streamAddr);
-      stream->pushValues(pool, acceptor);
+      stream->pushValues(pool, [&](int32_t ord) { acceptor((uint32_t)ord); });
     } else {
       acceptor(v);
     }

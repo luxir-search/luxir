@@ -791,7 +791,9 @@ private:
   }
 
   // add docs and ordinals from the provided DocsEnum (for string column, record ord in docToOrd for each doc, to be written later)
-  void addDocsOrds(TextWriter& textWriter, DocsEnum& docsEnum, const Segment& seg, OrdCollector& docToOrd, int32_t ord) {
+  void addDocsOrds(TextWriter& textWriter, DocsEnum& docsEnum, const Segment& seg,
+                   OrdCollector& docToOrd, int64_t ord) {
+    assert(ord > 0 && ord <= INT32_MAX);
     for(;;) {
       int32_t docid = docsEnum.nextDoc();
       if (docid == INT_MAX) break;
@@ -803,7 +805,7 @@ private:
       }
       int32_t newDocid = seg.base + mappedDoc;
 
-      docToOrd.add(newDocid, ord);
+      docToOrd.add(newDocid, (uint32_t)ord);
       textWriter.addDoc(newDocid, 1);  // DOCS-only string column: no positions to copy
     }
   }

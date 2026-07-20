@@ -91,7 +91,7 @@ public:
     }
   };
 
-  static uint32_t select32(const char* base, uint32_t idx, uint8_t bits,
+  static uint32_t select32(const char* base, uint64_t idx, uint8_t bits,
                            uint32_t mask) {
     assert(bits <= 32);
     if (bits == 0) return 0;
@@ -111,7 +111,7 @@ public:
     return (word >> (bitPos & 7)) & mask;
   }
 
-  static void unpack128(const char* base, uint32_t idx, uint32_t count,
+  static void unpack128(const char* base, uint64_t idx, uint32_t count,
                         uint8_t bits, uint32_t mask, uint32_t* values) {
     assert(count <= 128);
     for (uint32_t i = 0; i < count; i++) {

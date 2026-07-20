@@ -4,6 +4,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/OrdColReader.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/search/OrdMap.h"
 #include "solux/util/MemPool.h"
@@ -178,11 +179,7 @@ public:
 class GlobalOrdComparator : public FieldComparator {
   std::string fieldName;
   std::shared_ptr<OrdMap> ordMap;
-  // Accessing the ord for a document will be in-order and should use a bulk iterator (which IntColReader::Iterator is)
-  // when the domain consists of many documents.
-  // Accessing the deltas to convert to a global ord will not be in-order, and bulk iterator should not be used.
-  std::optional<IntColReader> reader;
-  std::optional<IntColReader::Iterator> iter;
+  std::optional<OrdColReader> reader;
   std::vector<int64_t> globalOrds; // Storage for global ordinals
   MonoReader* segmentDeltas = nullptr; // Current segment's ord mapping
   int64_t segmentNumOrds = 0;
@@ -200,22 +197,17 @@ public:
     // For string fields, ordinal 0 means missing value
     // For MISSING_FIRST: missing values should sort before all other values
     // For MISSING_LAST: missing values should sort after all other values
-    // Combined with ASC/DESC to determine the actual comparison value
+    // Real ords get the direction multiplier; missing is already placed at
+    // the requested edge and must not be reversed a second time.
     if (missingValue == MISSING_FIRST) {
-      // Missing sorts first
-      missingOrd = reversed ? std::numeric_limits<int64_t>::max() 
-                            : std::numeric_limits<int64_t>::min();
+      missingOrd = std::numeric_limits<int64_t>::min();
     } else {
-      // Missing sorts last  
-      missingOrd = reversed ? std::numeric_limits<int64_t>::min()
-                            : std::numeric_limits<int64_t>::max();
+      missingOrd = std::numeric_limits<int64_t>::max();
     }
   }
   
   void setSegment(int32_t segment, PostingsReader* postingsReader) override {
-    // Reset reader and iterator
     reader.reset();
-    iter.reset();
     segmentDeltas = nullptr;
     segmentNumOrds = 0;
     
@@ -236,24 +228,17 @@ public:
       fieldReader.readFieldInfo(fieldInfo);
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
-        iter.emplace(*reader);
+        assert(!reader->multiValued());
       }
     }
   }
   
   int64_t getGlobalOrd(int32_t docid) {
-    if (!iter.has_value()) {
+    if (!reader.has_value()) {
       return missingOrd;
     }
 
-    if (iter->docId() < docid) {
-      iter->advance(docid);
-    }
-    if (iter->docId() > docid) {
-      return missingOrd;
-    }
-    
-    int64_t segmentOrd = iter->value();
+    int64_t segmentOrd = reader->ordAt(docid);
     if (segmentOrd == 0) {
       // Ordinal 0 means missing value
       return missingOrd;

@@ -533,6 +533,9 @@ public:
       SortField::SortOrder order =
         sortSpec.dir == solux::api::SortSpec_::SortDir::DESC || defaultDesc
           ? SortField::DESC : SortField::ASC;
+      // TODO: expose per-sort missing=first/last/custom. Numerics substitute custom
+      // values directly; string comparators binary-search global terms at setup and
+      // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
       if (sortSpec.field == "_score_") {
         out.clauses.emplace_back(SortClause::SCORE, order);

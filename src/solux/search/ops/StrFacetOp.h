@@ -11,12 +11,11 @@
 namespace solux {
 
 // How the domain will be walked, for the piece's human-readable detail.
-// Must mirror forEachIntColValue's dispatch (DomainIter.h): ARRAY domains
-// big-skip with the SparseIterator; bitset/null domains dense-scan with the
-// block-decoding bulk iterator.
+// ARRAY domains point-select ords; bitset/null domains scan bulk frames for
+// DOCID columns or presence ranks for RANK columns.
 inline const char* domainDesc(DocSet* domain) {
   return domain == nullptr ? "all-docs domain, bulk column scan"
-      : domain->type == DocSet::Type::ARRAY ? "array domain, sparse column skips"
+      : domain->type == DocSet::Type::ARRAY ? "array domain, point ord loads"
                                             : "bitset domain, bulk column scan";
 }
 
@@ -352,8 +351,8 @@ public:
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t val)SOLUX_INLINE {
+        facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+          [&](int32_t docid, int32_t val)SOLUX_INLINE {
             tenum->seekOrd(val - 1);
             std::string_view termView = (std::string_view) tenum->term();
             data.counts.add((std::string) termView, docid);
@@ -444,10 +443,10 @@ public:
 
           // for single-valued, we could get away with int32_t
           std::vector<int64_t> localCounts(segFieldInfo.nTerms);
-          facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
               unused(docid);
-              ord--; // ordMap is zero-based, int columns are one-based
+              int64_t ord = (int64_t)localOrd - 1;
               localCounts[ord]++;
             });
 
@@ -463,10 +462,10 @@ public:
           }
 
         } else if (countMap) {
-          facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
               unused(docid);
-              ord--; // ordMap is zero-based, int columns are one-based
+              int64_t ord = (int64_t)localOrd - 1;
               if (deltas) {
                 ord += deltas->valueAt(ord);
               }
@@ -478,10 +477,10 @@ public:
           // and convert to global ords on overflow.
           if (deltas && (domainSize >> 1) >= segFieldInfo.nTerms) {
             std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
-            facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
                 unused(docid);
-                ord--; // ordMap is zero-based, int columns are one-based
+                int64_t ord = (int64_t)localOrd - 1;
                 if (++localCounts[ord] == 0) {
                   ord += deltas->valueAt(ord);  // convert to global ord
                   countSkinny->increment(ord, std::numeric_limits<uint8_t>::max() + 1);
@@ -496,10 +495,10 @@ public:
             }
           } else {
             // Not many repeats expected, so just collect global ords directly.
-            facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-              [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
                 unused(docid);
-                ord--; // ordMap is zero-based, int columns are one-based
+                int64_t ord = (int64_t)localOrd - 1;
                 if (deltas) {
                   ord += deltas->valueAt(ord);
                 }

@@ -30,7 +30,7 @@ class TermsEnum {
 
   PackedTerm startingTerm;
   int32_t termBlockIndex = -1; // what term block are we currently in
-  int32_t startingOrd = 0;
+  int64_t startingOrd = 0;
   int32_t maxOrdInBlock = -1;
   int64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
   int64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
@@ -77,7 +77,7 @@ class TermsEnum {
   const TermRangeRow* rangeRows = nullptr;
   const TermRangeRow* row = nullptr;
   int32_t rangeCount = 0;
-  int32_t rowLastTermOrd = -1;
+  int64_t rowLastTermOrd = -1;
   int32_t rowEndBlockOrd = 0;  // one past the current row's last block ord
   // Current row's bases/filenums, cached as enum-local members by selectRow so
   // the per-block and per-term hot paths never chase the row pointer.
@@ -111,7 +111,7 @@ public:
     int64_t posStart = 0;
     int64_t totalTermFreq = 0;
     int32_t docFreq = 0;
-    int32_t termOrdinal = -1;
+    int64_t termOrdinal = -1;
     int32_t pulsedDoc = -1;
     int32_t pulsedPos = -1;
     bool hasFreqs = false;
@@ -137,7 +137,7 @@ public:
       assert(rangeCount > 0 && numTermBlocks > 0);
       rangeRows = reinterpret_cast<const TermRangeRow*>(header + 1);
     } else {
-      numTermBlocks = ((fieldInfo.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1;
+      numTermBlocks = (int32_t) (((fieldInfo.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1);
       rangeCount = 1;
       // Pool-allocated (not a member) so the address survives moves of this
       // enum; the hot paths read the cached row* members, not this struct.
@@ -154,7 +154,7 @@ public:
     selectRow(rangeRows);
   }
 
-  int32_t numTerms() const {
+  int64_t numTerms() const {
     return fieldInfo.nTerms;
   }
 
@@ -270,7 +270,7 @@ public:
   }
 
   /// returns the 0-based ordinal of the current term.
-  int32_t ord() const {
+  int64_t ord() const {
     return startingOrd + ordInBlock;
   }
 
@@ -630,7 +630,7 @@ protected:
     return found - 1;
   }
 
-  const TermRangeRow* rowForTerm(int32_t termOrd) const {
+  const TermRangeRow* rowForTerm(int64_t termOrd) const {
     assert(termOrd >= 0 && termOrd < fieldInfo.nTerms);
     const TermRangeRow* end = rangeRows + rangeCount;
     const TermRangeRow* found = std::upper_bound(
@@ -654,7 +654,7 @@ protected:
     int32_t rangeOrd = (int32_t) (row - rangeRows);
     bool hasNext = rangeOrd + 1 < rangeCount;
     rowLastTermOrd = hasNext
-        ? (int32_t) rangeRows[rangeOrd + 1].firstTermOrd - 1
+        ? (int64_t) rangeRows[rangeOrd + 1].firstTermOrd - 1
         : fieldInfo.nTerms - 1;
     rowEndBlockOrd = hasNext
         ? (int32_t) rangeRows[rangeOrd + 1].firstBlockOrd : numTermBlocks;
@@ -693,11 +693,11 @@ protected:
       reselectRowForBlock(termBlockIndex);
     }
     termsIS.seek(rowTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
-    startingOrd = (int32_t) row->firstTermOrd
-        + (termBlockIndex - (int32_t) row->firstBlockOrd) * Postings::TERMS_BLOCK_SIZE;
+    startingOrd = (int64_t) row->firstTermOrd
+        + (int64_t) (termBlockIndex - (int32_t) row->firstBlockOrd) * Postings::TERMS_BLOCK_SIZE;
     ordInBlock = 0;
-    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1,
-                             rowLastTermOrd - startingOrd);
+    maxOrdInBlock = (int32_t) std::min<int64_t>(Postings::TERMS_BLOCK_SIZE - 1,
+                                                rowLastTermOrd - startingOrd);
     int64_t blockEndOffset;
     if (termBlockIndex + 1 >= numTermBlocks) {
       blockEndOffset = (int64_t) fieldInfo.termBlockIndexLoc.offset();
@@ -900,13 +900,13 @@ protected:
 
 public:
   // 0-based ords
-  void seekOrd(int32_t targetOrd) {
+  void seekOrd(int64_t targetOrd) {
     assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
     if (targetOrd < ord() || targetOrd > startingOrd + maxOrdInBlock) {
       // even if we were in the right block, we don't have the capability to go backwards or rewind
       const TermRangeRow* selected = rowForTerm(targetOrd);
-      termBlockIndex = (int32_t) selected->firstBlockOrd
-          + (targetOrd - (int32_t) selected->firstTermOrd) / Postings::TERMS_BLOCK_SIZE;
+      termBlockIndex = (int32_t) ((int64_t) selected->firstBlockOrd
+          + (targetOrd - (int64_t) selected->firstTermOrd) / Postings::TERMS_BLOCK_SIZE);
       readTermBlock();
     }
     while (ord() < targetOrd) {

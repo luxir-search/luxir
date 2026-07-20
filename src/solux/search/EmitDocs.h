@@ -28,6 +28,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include "solux/reader/FieldReader.h"
+#include "solux/reader/OrdColReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
@@ -210,13 +211,13 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
   if (!fieldType.multiValued()) {
     if (isIndexedString) {
       TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-      auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+      auto valHandler = [&](size_t idx, int32_t doc, int32_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         tenum.seekOrd((int32_t) val - 1);
         starget[idxSpan[idx]] = build::arenaStr(mr, (std::string_view) tenum.term());
         if (present) present[idxSpan[idx]] = 1;
       };
-      IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      OrdColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
@@ -228,14 +229,14 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
   } else {
     if (isIndexedString) {
       TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-      auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+      auto valHandler = [&](size_t idx, int32_t doc, int32_t val, int64_t valIdx, int64_t numVals) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         solux::api::ArrStr& target = mtarget[idxSpan[idx]];
         if (valIdx == 0) build::allocArray(target.v, numVals, mr);
         tenum.seekOrd((int32_t) val - 1);
         const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, (std::string_view) tenum.term());
       };
-      IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      OrdColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numVals) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
