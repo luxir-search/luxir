@@ -121,11 +121,11 @@ TEST_F(OrdMapTest, MultipleSegmentsDisjointTerms) {
   
   auto seg1Mapping = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1Mapping.numOrds, 2); // cherry, date
-  EXPECT_NE(seg1Mapping.deltas, nullptr); // needs mapping
+  EXPECT_GT(seg1Mapping.bits, 0); // needs mapping
   
   auto seg2Mapping = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2Mapping.numOrds, 2); // elderberry, fig
-  EXPECT_NE(seg2Mapping.deltas, nullptr); // needs mapping
+  EXPECT_GT(seg2Mapping.bits, 0); // needs mapping
   
   // Should have firstSegs and globDeltas
   EXPECT_NE(ordMap->getFirstSegs(), nullptr);
@@ -212,7 +212,7 @@ TEST_F(OrdMapTest, FieldInSomeSegments) {
   
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 2); // has cherry, date
-  EXPECT_NE(seg2.deltas, nullptr);
+  EXPECT_GT(seg2.bits, 0);
   
   auto seg3 = ordMap->getSegToGlobal(3);
   EXPECT_EQ(seg3.numOrds, 0); // no field1
@@ -290,11 +290,11 @@ TEST_F(OrdMapTest, SegmentWithAllTerms) {
   
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 1); // only banana
-  EXPECT_NE(seg1.deltas, nullptr);
+  EXPECT_GT(seg1.bits, 0);
   
   auto seg3 = ordMap->getSegToGlobal(3);
   EXPECT_EQ(seg3.numOrds, 2); // banana, cherry
-  EXPECT_NE(seg3.deltas, nullptr);
+  EXPECT_GT(seg3.bits, 0);
 }
 
 // Verify Correct Mappings
@@ -325,7 +325,7 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   // Verify segment 0 mapping
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 2);
-  ASSERT_NE(seg0.deltas, nullptr);
+  ASSERT_GT(seg0.bits, 0);
   
   // In segment 0: banana=0, date=1
   // In global: apple=0, banana=1, cherry=2, date=3, elderberry=4
@@ -336,7 +336,7 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   // Verify segment 1 mapping  
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 3);
-  ASSERT_NE(seg1.deltas, nullptr);
+  ASSERT_GT(seg1.bits, 0);
   
   // In segment 1: apple=0, cherry=1, elderberry=2
   // Mapping should be: 0->0, 1->1, 2->2
@@ -347,7 +347,7 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   // Verify segment 2 mapping
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 2);
-  ASSERT_NE(seg2.deltas, nullptr);
+  ASSERT_GT(seg2.bits, 0);
   
   // In segment 2: banana=0, cherry=1
   // Mapping should be: 0->1, 1->1 (updated to match actual correct behavior)
@@ -555,21 +555,24 @@ TEST_F(OrdMapTest, PackedDeltaRunsCrossWidthBoundaries) {
   }
 }
 
-TEST_F(OrdMapTest, FlatAndPredictedParityAcrossBlockBoundary) {
+TEST_F(OrdMapTest, FlatPredictedAndFitParityAcrossBlockBoundary) {
   constexpr int nTermsPerSegment = 4224;
   std::vector<Doc> evenDocs;
   std::vector<Doc> oddDocs;
   evenDocs.reserve(nTermsPerSegment);
   oddDocs.reserve(nTermsPerSegment);
   for (int localOrd = 0; localOrd < nTermsPerSegment; localOrd++) {
-    int even = localOrd * 2;
-    int odd = even + 1;
+    int flip = localOrd % 257 == 128 ? 1 : 0;
+    int even = localOrd * 2 + flip;
+    int odd = localOrd * 2 + 1 - flip;
     std::string evenTerm = std::format("term{:05}", even);
     std::string oddTerm = std::format("term{:05}", odd);
     evenDocs.push_back({{"id", std::format("e{}", even)},
-                        {"flat_s", evenTerm}, {"predicted_s", evenTerm}});
+                        {"flat_s", evenTerm}, {"predicted_s", evenTerm},
+                        {"fit_s", evenTerm}});
     oddDocs.push_back({{"id", std::format("o{}", odd)},
-                       {"flat_s", oddTerm}, {"predicted_s", oddTerm}});
+                       {"flat_s", oddTerm}, {"predicted_s", oddTerm},
+                       {"fit_s", oddTerm}});
   }
   ASSERT_TRUE(helper->indexAll(evenDocs, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper->indexAll(oddDocs, UpdateMessage::COMMIT).success);
@@ -577,6 +580,7 @@ TEST_F(OrdMapTest, FlatAndPredictedParityAcrossBlockBoundary) {
   auto reader = helper->getIndexWriter()->getIndexReader();
   std::shared_ptr<OrdMap> flat;
   std::shared_ptr<OrdMap> predicted;
+  std::shared_ptr<OrdMap> fit;
   {
     OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::FLAT);
     flat = reader->getOrdMap("flat_s");
@@ -585,40 +589,60 @@ TEST_F(OrdMapTest, FlatAndPredictedParityAcrossBlockBoundary) {
     OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::PREDICTED);
     predicted = reader->getOrdMap("predicted_s");
   }
+  {
+    OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::SINGLE_FIT);
+    fit = reader->getOrdMap("fit_s");
+  }
   ASSERT_NE(flat, nullptr);
   ASSERT_NE(predicted, nullptr);
+  ASSERT_NE(fit, nullptr);
   ASSERT_EQ(flat->numOrds(), nTermsPerSegment * 2);
   ASSERT_EQ(predicted->numOrds(), flat->numOrds());
+  ASSERT_EQ(fit->numOrds(), flat->numOrds());
   EXPECT_LT(predicted->sizeInBytes(), flat->sizeInBytes());
+  EXPECT_LT(fit->sizeInBytes(), predicted->sizeInBytes());
 
   for (int seg = 0; seg < 2; seg++) {
     auto flatMapping = flat->getSegToGlobal(seg);
     auto predictedMapping = predicted->getSegToGlobal(seg);
+    auto fitMapping = fit->getSegToGlobal(seg);
     ASSERT_EQ(flatMapping.numOrds, nTermsPerSegment);
     ASSERT_EQ(predictedMapping.numOrds, flatMapping.numOrds);
+    ASSERT_EQ(fitMapping.numOrds, flatMapping.numOrds);
     ASSERT_FALSE(flatMapping.predicted());
     ASSERT_TRUE(predictedMapping.predicted());
+    ASSERT_TRUE(fitMapping.singleFit());
+    EXPECT_EQ(predictedMapping.residualBits, 1);
+    EXPECT_EQ(fitMapping.residualBits, 1);
+    EXPECT_NE(fitMapping.deltas, nullptr);
+    EXPECT_EQ(fitMapping.blockMeta, nullptr);
 
     for (int64_t localOrd = 0; localOrd < nTermsPerSegment; localOrd++) {
       EXPECT_EQ(predictedMapping.deltaAt(localOrd),
                 flatMapping.deltaAt(localOrd));
+      EXPECT_EQ(fitMapping.deltaAt(localOrd), flatMapping.deltaAt(localOrd));
       EXPECT_EQ(predictedMapping.globalOrd(localOrd),
+                flatMapping.globalOrd(localOrd));
+      EXPECT_EQ(fitMapping.globalOrd(localOrd),
                 flatMapping.globalOrd(localOrd));
     }
 
     for (uint64_t start : {3968u, 4096u}) {
       uint64_t flatDeltas[128];
       uint64_t predictedDeltas[128];
+      uint64_t fitDeltas[128];
       flatMapping.unpackDeltas(start, 128, flatDeltas);
       predictedMapping.unpackDeltas(start, 128, predictedDeltas);
+      fitMapping.unpackDeltas(start, 128, fitDeltas);
       for (uint32_t i = 0; i < 128; i++) {
         EXPECT_EQ(predictedDeltas[i], flatDeltas[i]);
+        EXPECT_EQ(fitDeltas[i], flatDeltas[i]);
       }
     }
   }
 }
 
-TEST_F(OrdMapTest, PredictedResidualsUseSelect64) {
+TEST_F(OrdMapTest, PredictedAndFitResidualsUseSelect64) {
   constexpr uint32_t count = 128;
   std::array<uint64_t, count> deltas;
   constexpr uint64_t base = 1ull << 40;
@@ -659,6 +683,62 @@ TEST_F(OrdMapTest, PredictedResidualsUseSelect64) {
   for (uint32_t i = 0; i < count; i++) {
     EXPECT_EQ(decoded[i], deltas[i]);
   }
+
+  auto fit = OrdColumnFormat::planLinearFit(
+      std::span<const uint64_t>(deltas.data(), deltas.size()),
+      OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
+  ASSERT_TRUE(fit);
+  ASSERT_GT(fit->bits, 32);
+  std::vector<char> fitPayload;
+  LinearPack::Writer fitWriter(fitPayload, fit->bits);
+  maxResidual = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    uint64_t residual = OrdColumnFormat::residual(
+        *fit, i, deltas[i], OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
+    maxResidual = std::max(maxResidual, residual);
+    fitWriter.append(residual);
+  }
+  fitWriter.finish();
+  ASSERT_GT(maxResidual, UINT32_MAX);
+
+  OrdMap::SegToGlobal fitMapping;
+  fitMapping.numOrds = count;
+  fitMapping.deltas = fitPayload.data();
+  fitMapping.intercept = fit->intercept;
+  fitMapping.scaledSlope = fit->scaledSlope;
+  fitMapping.mask = LinearPack::mask64(fit->bits);
+  fitMapping.bits = (uint8_t)std::bit_width(deltas.back());
+  fitMapping.residualBits = fit->bits;
+  fitMapping.encoding = OrdMap::DeltaEncoding::SINGLE_FIT;
+
+  for (uint32_t i = 0; i < count; i++) {
+    EXPECT_EQ(fitMapping.deltaAt(i), (int64_t)deltas[i]);
+    EXPECT_EQ(fitMapping.globalOrd(i), (int64_t)(i + deltas[i]));
+  }
+  fitMapping.unpackDeltas(0, count, decoded);
+  for (uint32_t i = 0; i < count; i++) {
+    EXPECT_EQ(decoded[i], deltas[i]);
+  }
+}
+
+TEST(OrdColumnFormatTest, SingleFitShiftAvoidsSegmentScaleDrift) {
+  constexpr uint64_t count = 524289;
+  std::vector<uint64_t> deltas(count);
+  for (uint64_t i = 0; i < count; i++) {
+    uint64_t deviation = i % 8192 == 4096 ? 1 : 0;
+    deltas[i] = i + i / 32768 + deviation;
+  }
+
+  auto shift31 = OrdColumnFormat::planLinearFit(
+      std::span<const uint64_t>(deltas),
+      OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
+  auto shift14 = OrdColumnFormat::planLinearFit(
+      std::span<const uint64_t>(deltas),
+      OrdColumnFormat::BLOCK_SLOPE_SHIFT);
+  ASSERT_TRUE(shift31);
+  ASSERT_TRUE(shift14);
+  EXPECT_EQ(shift31->bits, 1);  // the actual 0/1 deviation
+  EXPECT_GE(shift14->bits, 5);  // fixed-point drift dominates the deviation
 }
 
 TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
@@ -669,7 +749,8 @@ TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
     std::vector<Doc> docs;
     for (int i = segment; i < (int)values.size(); i += 2) {
       docs.push_back({{"id", std::format("doc{}", i)},
-                      {"flat_s", values[i]}, {"predicted_s", values[i]}});
+                      {"flat_s", values[i]}, {"predicted_s", values[i]},
+                      {"fit_s", values[i]}});
     }
     ASSERT_TRUE(helper->indexAll(docs, UpdateMessage::COMMIT).success);
   }
@@ -684,6 +765,16 @@ TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
     auto ordMap = reader->getOrdMap("predicted_s");
     ASSERT_NE(ordMap, nullptr);
     EXPECT_TRUE(ordMap->getSegToGlobal(0).predicted());
+  }
+  {
+    OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::SINGLE_FIT);
+    auto ordMap = reader->getOrdMap("fit_s");
+    ASSERT_NE(ordMap, nullptr);
+    auto mapping = ordMap->getSegToGlobal(0);
+    EXPECT_TRUE(mapping.singleFit());
+    EXPECT_EQ(mapping.residualBits, 0);
+    EXPECT_EQ(mapping.deltas, nullptr);
+    EXPECT_EQ(mapping.blockMeta, nullptr);
   }
 
   struct Results {
@@ -716,7 +807,11 @@ TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
 
   Results flat = run("flat_s");
   Results predicted = run("predicted_s");
+  Results fit = run("fit_s");
   EXPECT_EQ(predicted.sortedIds, flat.sortedIds);
   EXPECT_EQ(predicted.bucketIds, flat.bucketIds);
   EXPECT_EQ(predicted.counts, flat.counts);
+  EXPECT_EQ(fit.sortedIds, flat.sortedIds);
+  EXPECT_EQ(fit.bucketIds, flat.bucketIds);
+  EXPECT_EQ(fit.counts, flat.counts);
 }

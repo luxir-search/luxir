@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <variant>
 #include <vector>
@@ -27,15 +28,17 @@ namespace solux {
 // [meta-size (int32_t)]  // 4 byte size of metadata, starting at [numSegs], not including this size field.
 //
 // seg1-deltas contains deltas to map segment ords into global ord space.
-// Each segment is encoded as either a flat exact-bpv LinearPack region or
-// predicted 4096-value blocks with exact-bpv LinearPack residual regions.
+// Each segment is encoded as a flat exact-bpv LinearPack region, predicted
+// 4096-value blocks, or one whole-segment linear fit with packed residuals.
 //
 // seg1-meta contains delta metadata (bits, encoding, offsets, nValues)
 //   nValues (vLong) = number of values in this column.  if nValues == 0 or numGlobalOrds, no other metadata is present.
 //   bits (vInt) = maximum delta width.  bits == 0 is an identity mapping and has no payload.
-//   encoding (vInt) = FLAT or PREDICTED, present only when bits != 0.
-//   payload offset (vLong) = offset from start of OrdMap, present only when bits != 0.
-//   predicted block-meta offset (vLong) and max residual bits (vInt) follow for PREDICTED.
+//   encoding (vInt) = FLAT, PREDICTED, or SINGLE_FIT, present only when bits != 0.
+//   FLAT: payload offset (vLong).
+//   PREDICTED: payload offset (vLong), block-meta offset (vLong), max residual bits (vInt).
+//   SINGLE_FIT: intercept (long), scaled slope (long), residual bits (vInt),
+//               and payload offset (vLong) when residual bits != 0.
 //
 // There is a single firstSegs column that contains the first segment number that the global ord appeared in.
 // There is a single globDeltas column that contains the delta that was used to map from that segment ord to the global ord.
@@ -81,6 +84,7 @@ class OrdMapBuilder {
     std::vector<Run> runs;
     std::optional<LinearPack::Writer> writer;
     uint64_t count = 0;
+    uint64_t firstDelta = 0;
     uint64_t lastDelta = 0;
 
     void startRun(uint8_t width) {
@@ -100,6 +104,7 @@ class OrdMapBuilder {
       assert(width <= 57);
       if (!writer || width > runs.back().width) startRun(width);
       writer->append(value);
+      if (count == 0) firstDelta = value;
       lastDelta = value;
       count++;
     }
@@ -116,6 +121,52 @@ class OrdMapBuilder {
       return runs.back().width;
     }
 
+    template <class Acceptor>
+    void forEachValue(Acceptor&& acceptor) const {
+      assert(!writer);
+      uint64_t seen = 0;
+      uint64_t values[128];
+      for (size_t runIdx = 0; runIdx < runs.size(); runIdx++) {
+        const auto& run = runs[runIdx];
+        uint64_t endIndex = runIdx + 1 < runs.size()
+            ? runs[runIdx + 1].startIndex : count;
+        uint64_t runCount = endIndex - run.startIndex;
+        const char* base = packed.data() + run.byteOffset;
+        uint64_t mask = LinearPack::mask64(run.width);
+        for (uint64_t start = 0; start < runCount; start += 128) {
+          uint32_t n = (uint32_t)std::min<uint64_t>(128, runCount - start);
+          LinearPack::unpack128(base, start, n, run.width, mask, values);
+          for (uint32_t i = 0; i < n; i++) {
+            acceptor(run.startIndex + start + i, values[i]);
+          }
+          seen += n;
+        }
+      }
+      assert(seen == count);
+    }
+
+    OrdColumnFormat::PredictedBlockInfo planSingleFit() const {
+      assert(!writer && count > 0);
+      auto slope = OrdColumnFormat::endpointSlope(
+          (int64_t)firstDelta, (int64_t)lastDelta, count,
+          OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
+      int64_t scaledSlope = slope.value_or(0);
+      int64_t intercept = (int64_t)firstDelta;
+      __int128 minError = std::numeric_limits<__int128>::max();
+      __int128 maxError = std::numeric_limits<__int128>::min();
+      forEachValue([&](uint64_t index, uint64_t value) {
+        __int128 error = (__int128)value - OrdColumnFormat::predict(
+            intercept, scaledSlope, index,
+            OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
+        minError = std::min(minError, error);
+        maxError = std::max(maxError, error);
+      });
+      auto plan = OrdColumnFormat::finishPlan(
+          intercept, scaledSlope, minError, maxError);
+      assert(plan);
+      return *plan;
+    }
+
     void writeFinal(OutputStream& out) const {
       assert(!writer);
       uint8_t finalBits = bits();
@@ -130,22 +181,28 @@ class OrdMapBuilder {
       }
 
       LinearPack::Writer finalWriter(out, finalBits);
-      uint64_t values[128];
-      for (size_t runIdx = 0; runIdx < runs.size(); runIdx++) {
-        const auto& run = runs[runIdx];
-        uint64_t endIndex = runIdx + 1 < runs.size()
-            ? runs[runIdx + 1].startIndex : count;
-        uint64_t runCount = endIndex - run.startIndex;
-        const char* base = packed.data() + run.byteOffset;
-        uint64_t mask = LinearPack::mask64(run.width);
-        for (uint64_t start = 0; start < runCount; start += 128) {
-          uint32_t n = (uint32_t)std::min<uint64_t>(128, runCount - start);
-          LinearPack::unpack128(base, start, n, run.width, mask, values);
-          for (uint32_t i = 0; i < n; i++) finalWriter.append(values[i]);
-        }
-      }
+      forEachValue([&](uint64_t, uint64_t value) {
+        finalWriter.append(value);
+      });
       uint64_t written = finalWriter.finish();
       assert(written == LinearPack::byteSize(count, finalBits));
+    }
+
+    void writeSingleFit(
+        OutputStream& out,
+        const OrdColumnFormat::PredictedBlockInfo& plan) const {
+      assert(!writer);
+      if (plan.bits == 0) return;
+      LinearPack::Writer residualWriter(out, plan.bits);
+      uint64_t mask = LinearPack::mask64(plan.bits);
+      forEachValue([&](uint64_t index, uint64_t value) {
+        uint64_t residual = OrdColumnFormat::residual(
+            plan, index, value, OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
+        assert(residual <= mask);
+        residualWriter.append(residual);
+      });
+      uint64_t written = residualWriter.finish();
+      assert(written == LinearPack::byteSize(count, plan.bits));
     }
 
     void release() {
@@ -234,11 +291,13 @@ class OrdMapBuilder {
   struct TermsEnumIdx {
     size_t idx;
     TermsEnum tenum;
+    OrdMap::DeltaEncoding encoding;
     std::variant<PackedDeltaRuns, PredictedDeltaBlocks> deltas;
+    std::optional<OrdColumnFormat::PredictedBlockInfo> singleFitPlan;
 
     TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader,
                  SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
-        : idx(idx), tenum(pool, postingsReader, finfo) {
+        : idx(idx), tenum(pool, postingsReader, finfo), encoding(encoding) {
       if (encoding == OrdMap::DeltaEncoding::PREDICTED) {
         deltas.emplace<PredictedDeltaBlocks>();
       }
@@ -250,6 +309,9 @@ class OrdMapBuilder {
 
     void finishDeltas() {
       std::visit([](auto& values) { values.finish(); }, deltas);
+      if (encoding == OrdMap::DeltaEncoding::SINGLE_FIT) {
+        singleFitPlan = std::get<PackedDeltaRuns>(deltas).planSingleFit();
+      }
     }
 
     uint64_t deltaCount() const {
@@ -450,17 +512,33 @@ public:
         metaOut.writeVint(bits);
         if (bits != 0) {
           metaOut.writeVint((uint8_t)deltaEncoding);
-          uint64_t loc = payloadOut.size();
-          metaOut.writeVlong(loc);
           if (deltaEncoding == OrdMap::DeltaEncoding::FLAT) {
+            uint64_t loc = payloadOut.size();
+            metaOut.writeVlong(loc);
             std::get<PackedDeltaRuns>(tenum->deltas).writeFinal(payloadOut);
             segmentStats[tenum->idx] = {"flat", bits};
-          } else {
+          } else if (deltaEncoding == OrdMap::DeltaEncoding::PREDICTED) {
+            uint64_t loc = payloadOut.size();
+            metaOut.writeVlong(loc);
             auto& predicted = std::get<PredictedDeltaBlocks>(tenum->deltas);
             uint64_t blockMetaLoc = predicted.writeFinal(payloadOut);
             metaOut.writeVlong(blockMetaLoc);
             metaOut.writeVint(predicted.maxResidualBits);
             segmentStats[tenum->idx] = {"predicted", predicted.maxResidualBits};
+          } else {
+            assert(deltaEncoding == OrdMap::DeltaEncoding::SINGLE_FIT);
+            assert(tenum->singleFitPlan);
+            const auto& fit = *tenum->singleFitPlan;
+            metaOut.writeLong(fit.intercept);
+            metaOut.writeLong(fit.scaledSlope);
+            metaOut.writeVint(fit.bits);
+            if (fit.bits != 0) {
+              uint64_t loc = payloadOut.size();
+              metaOut.writeVlong(loc);
+              std::get<PackedDeltaRuns>(tenum->deltas)
+                  .writeSingleFit(payloadOut, fit);
+            }
+            segmentStats[tenum->idx] = {"fit", fit.bits};
           }
         } else {
           segmentStats[tenum->idx] = {"identity", 0};
@@ -527,7 +605,10 @@ OrdMap::DeltaEncoding OrdMap::configuredDeltaEncoding() {
   if (std::string_view(configured) == "predicted") {
     return DeltaEncoding::PREDICTED;
   }
-  LOG_WARN("Ignoring invalid SOLUX_ORDMAP_DELTAS='{}'; expected flat or predicted",
+  if (std::string_view(configured) == "fit") {
+    return DeltaEncoding::SINGLE_FIT;
+  }
+  LOG_WARN("Ignoring invalid SOLUX_ORDMAP_DELTAS='{}'; expected flat, predicted, or fit",
            configured);
   return DeltaEncoding::FLAT;
 }

@@ -22,13 +22,16 @@ public:
   enum class DeltaEncoding : uint8_t {
     DEFAULT,
     FLAT,
-    PREDICTED
+    PREDICTED,
+    SINGLE_FIT
   };
 
   struct SegToGlobal {
     int64_t numOrds = 0;
     const char* deltas = nullptr;
     const char* blockMeta = nullptr;
+    int64_t intercept = 0;
+    int64_t scaledSlope = 0;
     uint64_t mask = 0;
     uint8_t bits = 0;
     uint8_t residualBits = 0;
@@ -38,12 +41,26 @@ public:
       return bits != 0 && encoding == DeltaEncoding::PREDICTED;
     }
 
+    bool singleFit() const noexcept {
+      return bits != 0 && encoding == DeltaEncoding::SINGLE_FIT;
+    }
+
     int64_t deltaAt(int64_t segmentOrd) const {
       assert(segmentOrd >= 0 && segmentOrd < numOrds);
       if (bits == 0) return 0;
       if (encoding == DeltaEncoding::FLAT) {
         return (int64_t)LinearPack::select64(
             deltas, (uint64_t)segmentOrd, bits, mask);
+      }
+
+      if (encoding == DeltaEncoding::SINGLE_FIT) {
+        uint64_t residual = LinearPack::select64(
+            deltas, (uint64_t)segmentOrd, residualBits, mask);
+        __int128 delta = (__int128)OrdColumnFormat::predict(
+            intercept, scaledSlope, (uint64_t)segmentOrd,
+            OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT) + residual;
+        assert(delta >= 0 && delta <= LinearPack::mask64(bits));
+        return (int64_t)delta;
       }
 
       assert(encoding == DeltaEncoding::PREDICTED);
@@ -75,6 +92,18 @@ public:
       }
       if (encoding == DeltaEncoding::FLAT) {
         LinearPack::unpack128(deltas, start, count, bits, mask, values);
+        return;
+      }
+
+      if (encoding == DeltaEncoding::SINGLE_FIT) {
+        LinearPack::unpack128(deltas, start, count, residualBits, mask, values);
+        for (uint32_t i = 0; i < count; i++) {
+          __int128 delta = (__int128)OrdColumnFormat::predict(
+              intercept, scaledSlope, start + i,
+              OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT) + values[i];
+          assert(delta >= 0 && delta <= LinearPack::mask64(bits));
+          values[i] = (uint64_t)delta;
+        }
         return;
       }
 
@@ -142,36 +171,55 @@ public:
 
         auto encoding = (DeltaEncoding)dataIS.readVint();
         assert(encoding == DeltaEncoding::FLAT ||
-               encoding == DeltaEncoding::PREDICTED);
-        uint64_t loc = dataIS.readVlong();
-        const char* deltas = this->data.get() + start + loc;
+               encoding == DeltaEncoding::PREDICTED ||
+               encoding == DeltaEncoding::SINGLE_FIT);
         if (encoding == DeltaEncoding::FLAT) {
+          uint64_t loc = dataIS.readVlong();
           SegToGlobal mapping;
           mapping.numOrds = (int64_t)nValues;
-          mapping.deltas = deltas;
+          mapping.deltas = this->data.get() + start + loc;
           mapping.mask = LinearPack::mask64(bits);
           mapping.bits = bits;
           mapping.residualBits = bits;
           mapping.encoding = encoding;
           segToGlobal.push_back(mapping);
-        } else {
+        } else if (encoding == DeltaEncoding::PREDICTED) {
+          uint64_t loc = dataIS.readVlong();
           uint64_t blockMetaLoc = dataIS.readVlong();
           uint8_t residualBits = (uint8_t)dataIS.readVint();
           assert(residualBits <= 57);
           SegToGlobal mapping;
           mapping.numOrds = (int64_t)nValues;
-          mapping.deltas = deltas;
+          mapping.deltas = this->data.get() + start + loc;
           mapping.blockMeta = this->data.get() + start + blockMetaLoc;
           mapping.bits = bits;
           mapping.residualBits = residualBits;
           mapping.encoding = encoding;
+          segToGlobal.push_back(mapping);
+        } else {
+          int64_t intercept = dataIS.readLong();
+          int64_t scaledSlope = dataIS.readLong();
+          uint8_t residualBits = (uint8_t)dataIS.readVint();
+          assert(residualBits <= 57);
+          SegToGlobal mapping;
+          mapping.numOrds = (int64_t)nValues;
+          mapping.intercept = intercept;
+          mapping.scaledSlope = scaledSlope;
+          mapping.mask = LinearPack::mask64(residualBits);
+          mapping.bits = bits;
+          mapping.residualBits = residualBits;
+          mapping.encoding = encoding;
+          if (residualBits != 0) {
+            uint64_t loc = dataIS.readVlong();
+            mapping.deltas = this->data.get() + start + loc;
+          }
           segToGlobal.push_back(mapping);
         }
       } else {
         if (nValues == (uint64_t)nOrds && firstFull == -1) {
           firstFull = (int)i;
         }
-        segToGlobal.push_back({(int64_t)nValues, nullptr, 0, 0});
+        segToGlobal.push_back({(int64_t)nValues});
       }
     }
 
