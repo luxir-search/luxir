@@ -428,11 +428,28 @@ public:
 
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        MonoReader* deltas = nullptr;
+        OrdMap::SegToGlobal mapping;
         if (thisOp().ordMap) {
-          auto segtoGlobal = thisOp().ordMap->getSegToGlobal(segnum);
-          deltas = segtoGlobal.deltas;
+          mapping = thisOp().ordMap->getSegToGlobal(segnum);
+        } else {
+          mapping.numOrds = segFieldInfo.nTerms;
         }
+
+        auto forEachMappedOrd = [&](size_t size, auto&& accept) {
+          uint64_t deltaFrame[128];
+          for (size_t base = 0; base < size; base += 128) {
+            uint32_t count = (uint32_t)std::min<size_t>(128, size - base);
+            if (mapping.bits != 0) {
+              mapping.unpackDeltas(base, count, deltaFrame);
+            }
+            for (uint32_t i = 0; i < count; i++) {
+              int64_t localOrd = (int64_t)base + i;
+              int64_t globalOrd = mapping.bits == 0
+                  ? localOrd : localOrd + (int64_t)deltaFrame[i];
+              accept((size_t)localOrd, globalOrd);
+            }
+          }
+        };
 
         // if we want a vector, then there are enough repeats that we should collect
         // local counts first and then only convert to global ords once.
@@ -450,59 +467,47 @@ public:
               localCounts[ord]++;
             });
 
-          for (size_t i = 0; i < localCounts.size(); i++) {
-            auto count = localCounts[i];
-            auto ord = i;
+          forEachMappedOrd(localCounts.size(), [&](size_t localOrd, int64_t globalOrd) {
+            auto count = localCounts[localOrd];
             if (count > 0) {
-              if (deltas) {
-                ord += deltas->valueAt(ord);
-              }
-              (*countVec)[ord] += count;
+              (*countVec)[globalOrd] += count;
             }
-          }
+          });
 
         } else if (countMap) {
           facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
             [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
               unused(docid);
-              int64_t ord = (int64_t)localOrd - 1;
-              if (deltas) {
-                ord += deltas->valueAt(ord);
-              }
+              int64_t ord = mapping.globalOrd((int64_t)localOrd - 1);
               (*countMap)[ord]++;
             });
         } else {
           assert(countSkinny);
           // If localords != globalOrds and expected number of repeats per value is > 2, use a local skinny counter first
           // and convert to global ords on overflow.
-          if (deltas && (domainSize >> 1) >= segFieldInfo.nTerms) {
+          if (mapping.bits != 0 && (domainSize >> 1) >= segFieldInfo.nTerms) {
             std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
-                unused(docid);
-                int64_t ord = (int64_t)localOrd - 1;
-                if (++localCounts[ord] == 0) {
-                  ord += deltas->valueAt(ord);  // convert to global ord
-                  countSkinny->increment(ord, std::numeric_limits<uint8_t>::max() + 1);
-                }
-              });
-            for (size_t i = 0; i < localCounts.size(); i++) {
-              auto count = localCounts[i];
-              if (count > 0) {
-                int64_t ord = i + deltas->valueAt(i);  // convert to global ord
-                countSkinny->increment(ord, count);
+              unused(docid);
+              int64_t ord = (int64_t)localOrd - 1;
+              if (++localCounts[ord] == 0) {
+                countSkinny->increment(mapping.globalOrd(ord),
+                                       std::numeric_limits<uint8_t>::max() + 1);
               }
-            }
+            });
+            forEachMappedOrd(localCounts.size(), [&](size_t localOrd, int64_t globalOrd) {
+              auto count = localCounts[localOrd];
+              if (count > 0) {
+                countSkinny->increment(globalOrd, count);
+              }
+            });
           } else {
             // Not many repeats expected, so just collect global ords directly.
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
                 unused(docid);
-                int64_t ord = (int64_t)localOrd - 1;
-                if (deltas) {
-                  ord += deltas->valueAt(ord);
-                }
-                countSkinny->increment(ord);
+                countSkinny->increment(mapping.globalOrd((int64_t)localOrd - 1));
               });
           }
         }

@@ -75,6 +75,11 @@ TEST(LinearPackTest, select64EveryWidth) {
       ASSERT_EQ(values[i], LinearPack::select64(encoded.data(), i, bits, mask))
           << "bits=" << (int)bits << " index=" << i;
     }
+    uint64_t decoded[128];
+    LinearPack::unpack128(encoded.data(), 0, 128, bits, mask, decoded);
+    for (uint32_t i = 0; i < 128; i++) EXPECT_EQ(values[i], decoded[i]);
+    LinearPack::unpack128(encoded.data(), 128, count - 128, bits, mask, decoded);
+    for (uint32_t i = 128; i < count; i++) EXPECT_EQ(values[i], decoded[i - 128]);
   }
 }
 

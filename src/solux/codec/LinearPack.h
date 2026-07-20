@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "solux/store/OutputStream.h"
 
@@ -35,6 +36,7 @@ public:
   class Writer {
     OutputStream* out = nullptr;
     char* target = nullptr;
+    std::vector<char>* vectorTarget = nullptr;
     uint64_t pending = 0;
     uint64_t count = 0;
     uint64_t written = 0;
@@ -45,6 +47,8 @@ public:
     void writeByte(uint8_t value) {
       if (out != nullptr) {
         out->write((char)value);
+      } else if (vectorTarget != nullptr) {
+        vectorTarget->push_back((char)value);
       } else {
         *target++ = (char)value;
       }
@@ -58,6 +62,11 @@ public:
 
     Writer(char* target, uint8_t bits) : target(target), bits(bits) {
       assert(target != nullptr);
+      assert(bits <= 57);
+    }
+
+    Writer(std::vector<char>& target, uint8_t bits)
+        : vectorTarget(&target), bits(bits) {
       assert(bits <= 57);
     }
 
@@ -116,6 +125,14 @@ public:
     assert(count <= 128);
     for (uint32_t i = 0; i < count; i++) {
       values[i] = select32(base, idx + i, bits, mask);
+    }
+  }
+
+  static void unpack128(const char* base, uint64_t idx, uint32_t count,
+                        uint8_t bits, uint64_t mask, uint64_t* values) {
+    assert(count <= 128);
+    for (uint32_t i = 0; i < count; i++) {
+      values[i] = select64(base, idx + i, bits, mask);
     }
   }
 };

@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <array>
+#include <format>
 #include "test/CollectionHelper.h"
 #include "solux/search/OrdMap.h"
 #include "solux/search/IndexReader.h"
@@ -98,7 +100,7 @@ TEST_F(OrdMapTest, MultipleSegmentsDisjointTerms) {
   // Check segment mappings
   auto seg0Mapping = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0Mapping.numOrds, 2); // apple, banana
-  EXPECT_NE(seg0Mapping.deltas, nullptr); // needs mapping
+  EXPECT_EQ(seg0Mapping.bits, 0); // global-prefix identity
   
   auto seg1Mapping = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1Mapping.numOrds, 2); // cherry, date
@@ -143,11 +145,11 @@ TEST_F(OrdMapTest, MultipleSegmentsOverlappingTerms) {
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 5); // 5 unique terms: apple, banana, cherry, date, elderberry
   
-  // All segments should need mappings since they have partial terms
+  // The first segment is a global prefix; the others need packed mappings.
   for (int i = 0; i < 3; i++) {
     auto segMapping = ordMap->getSegToGlobal(i);
     EXPECT_GT(segMapping.numOrds, 0);
-    EXPECT_NE(segMapping.deltas, nullptr);
+    EXPECT_EQ(segMapping.bits == 0, i == 0);
   }
   
   // Should have firstSegs and globDeltas
@@ -185,7 +187,7 @@ TEST_F(OrdMapTest, FieldInSomeSegments) {
   // Check mappings - segments without field should have numOrds=0 and null mapping
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 2); // has apple, banana
-  EXPECT_NE(seg0.deltas, nullptr);
+  EXPECT_EQ(seg0.bits, 0); // global-prefix identity
   
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 0); // no field1
@@ -267,7 +269,7 @@ TEST_F(OrdMapTest, SegmentWithAllTerms) {
   // Other segments should still have mappings
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 1); // only apple
-  EXPECT_NE(seg0.deltas, nullptr);
+  EXPECT_EQ(seg0.bits, 0); // global-prefix identity
   
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 1); // only banana
@@ -311,8 +313,8 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   // In segment 0: banana=0, date=1
   // In global: apple=0, banana=1, cherry=2, date=3, elderberry=4
   // So mapping should be: 0->1, 1->2
-  EXPECT_EQ(seg0.deltas->valueAt(0), 1); // banana: seg ord 0 -> global ord 1
-  EXPECT_EQ(seg0.deltas->valueAt(1), 2); // date: seg ord 1 -> global ord 2 (actual correct value)
+  EXPECT_EQ(seg0.deltaAt(0), 1); // banana: seg ord 0 -> global ord 1
+  EXPECT_EQ(seg0.deltaAt(1), 2); // date: seg ord 1 -> global ord 2 (actual correct value)
   
   // Verify segment 1 mapping  
   auto seg1 = ordMap->getSegToGlobal(1);
@@ -321,9 +323,9 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   
   // In segment 1: apple=0, cherry=1, elderberry=2
   // Mapping should be: 0->0, 1->1, 2->2
-  EXPECT_EQ(seg1.deltas->valueAt(0), 0); // apple: seg ord 0 -> global ord 0
-  EXPECT_EQ(seg1.deltas->valueAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
-  EXPECT_EQ(seg1.deltas->valueAt(2), 2); // elderberry: seg ord 2 -> global ord 2 (actual correct value)
+  EXPECT_EQ(seg1.deltaAt(0), 0); // apple: seg ord 0 -> global ord 0
+  EXPECT_EQ(seg1.deltaAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
+  EXPECT_EQ(seg1.deltaAt(2), 2); // elderberry: seg ord 2 -> global ord 2 (actual correct value)
   
   // Verify segment 2 mapping
   auto seg2 = ordMap->getSegToGlobal(2);
@@ -332,8 +334,8 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   
   // In segment 2: banana=0, cherry=1
   // Mapping should be: 0->1, 1->1 (updated to match actual correct behavior)
-  EXPECT_EQ(seg2.deltas->valueAt(0), 1); // banana: seg ord 0 -> global ord 1
-  EXPECT_EQ(seg2.deltas->valueAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
+  EXPECT_EQ(seg2.deltaAt(0), 1); // banana: seg ord 0 -> global ord 1
+  EXPECT_EQ(seg2.deltaAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
 }
 
 // Segment-to-Global Mapping - Null Cases
@@ -372,10 +374,10 @@ TEST_F(OrdMapTest, SegToGlobalNullCases) {
   EXPECT_EQ(seg1.numOrds, 0);
   EXPECT_EQ(seg1.deltas, nullptr); // null for segment without field
   
-  // Segment 2 has subset - should have mapping
+  // Segment 2 is a global-prefix subset, so its mapping is identity.
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 1);
-  EXPECT_NE(seg2.deltas, nullptr); // has mapping for subset
+  EXPECT_EQ(seg2.bits, 0);
   
   // Segment 3 has all terms - should be null
   auto seg3 = ordMap->getSegToGlobal(3);
@@ -440,24 +442,98 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
     // Verify the segment ordinal is valid for this segment
     auto segMapping = ordMap->getSegToGlobal(static_cast<int>(segmentIdx));
 
-    // If the segment has a forward mapping, verify it maps back correctly
-    if (segMapping.deltas != nullptr) {
-      // deltas stores deltas, so we need to add segmentOrd to get the global ordinal
-      auto storedDelta = segMapping.deltas->valueAt(segmentOrd);
-      auto actualGlobalOrd = segmentOrd + storedDelta;
-      
-      // This test verifies the consistency between forward and reverse mappings
-      // If this fails, it indicates a bug in OrdMap delta calculation
-      EXPECT_EQ(actualGlobalOrd, globalOrd)
-        << "Forward/reverse mapping inconsistency detected! "
-        << "GlobalOrd " << globalOrd << " maps to segment " << segmentIdx 
-        << " at segmentOrd " << segmentOrd << " (via reverse mapping), "
-        << "but forward mapping says segmentOrd " << segmentOrd 
-        << " maps to globalOrd " << actualGlobalOrd;
-    } else {
-      // If no forward mapping, this segment must have all terms (identity mapping)
-      EXPECT_EQ(segMapping.numOrds, ordMap->numOrds());
-      EXPECT_EQ(segmentOrd, globalOrd); // identity mapping means delta should be 0
+    auto actualGlobalOrd = segMapping.globalOrd(segmentOrd);
+    EXPECT_EQ(actualGlobalOrd, globalOrd)
+      << "Forward/reverse mapping inconsistency detected! "
+      << "GlobalOrd " << globalOrd << " maps to segment " << segmentIdx
+      << " at segmentOrd " << segmentOrd << " (via reverse mapping), "
+      << "but forward mapping says segmentOrd " << segmentOrd
+      << " maps to globalOrd " << actualGlobalOrd;
+  }
+}
+
+TEST_F(OrdMapTest, GlobalPrefixSubsetUsesIdentityMapping) {
+  helper->index({{"field1_s", "apple"}, {"id", "1"}});
+  helper->index({{"field1_s", "banana"}, {"id", "2"}});
+  helper->commit();
+  helper->index({{"field1_s", "cherry"}, {"id", "3"}});
+  helper->commit();
+
+  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto ordMap = reader->getOrdMap("field1_s");
+  ASSERT_NE(ordMap, nullptr);
+  auto mapping = ordMap->getSegToGlobal(0);
+  EXPECT_EQ(mapping.numOrds, 2);
+  EXPECT_EQ(mapping.bits, 0);
+  EXPECT_EQ(mapping.deltas, nullptr);
+  EXPECT_EQ(mapping.globalOrd(0), 0);
+  EXPECT_EQ(mapping.globalOrd(1), 1);
+}
+
+TEST_F(OrdMapTest, FlatDeltaFramesIncludeSafeTail) {
+  for (int i = 0; i < 300; i += 2) {
+    helper->index({{"field1_s", std::format("term{:04}", i)},
+                   {"id", std::to_string(i)}});
+  }
+  helper->commit();
+  for (int i = 1; i < 300; i += 2) {
+    helper->index({{"field1_s", std::format("term{:04}", i)},
+                   {"id", std::to_string(i)}});
+  }
+  helper->commit();
+
+  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto ordMap = reader->getOrdMap("field1_s");
+  ASSERT_NE(ordMap, nullptr);
+  EXPECT_EQ(ordMap->numOrds(), 300);
+
+  for (int seg = 0; seg < 2; seg++) {
+    auto mapping = ordMap->getSegToGlobal(seg);
+    ASSERT_EQ(mapping.numOrds, 150);
+    ASSERT_GT(mapping.bits, 0);
+    uint64_t deltas[128];
+    mapping.unpackDeltas(0, 128, deltas);
+    for (int i = 0; i < 128; i++) {
+      EXPECT_EQ(mapping.globalOrd(i), i * 2 + seg);
+      EXPECT_EQ(deltas[i], mapping.deltaAt(i));
     }
+    mapping.unpackDeltas(128, 22, deltas);
+    for (int i = 128; i < 150; i++) {
+      EXPECT_EQ(mapping.globalOrd(i), i * 2 + seg);
+      EXPECT_EQ(deltas[i - 128], mapping.deltaAt(i));
+    }
+    EXPECT_EQ(mapping.globalOrd(149), 298 + seg);
+  }
+}
+
+TEST_F(OrdMapTest, PackedDeltaRunsCrossWidthBoundaries) {
+  constexpr std::array<int, 7> positions = {0, 2, 5, 10, 19, 36, 69};
+  for (int pos : positions) {
+    helper->index({{"field1_s", std::format("term{:03}", pos)},
+                   {"id", std::to_string(pos)}});
+  }
+  helper->commit();
+
+  for (int pos = 0; pos < 70; pos++) {
+    helper->index({{"field1_s", std::format("term{:03}", pos)},
+                   {"id", std::format("all{}", pos)}});
+  }
+  helper->commit();
+
+  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto ordMap = reader->getOrdMap("field1_s");
+  ASSERT_NE(ordMap, nullptr);
+  ASSERT_EQ(ordMap->numOrds(), 70);
+
+  auto mapping = ordMap->getSegToGlobal(0);
+  ASSERT_EQ(mapping.numOrds, (int64_t)positions.size());
+  ASSERT_EQ(mapping.bits, 6);
+  int64_t previousDelta = -1;
+  for (int64_t localOrd = 0; localOrd < (int64_t)positions.size(); localOrd++) {
+    int64_t delta = positions[localOrd] - localOrd;
+    EXPECT_GE(delta, previousDelta);
+    EXPECT_EQ(mapping.deltaAt(localOrd), delta);
+    EXPECT_EQ(mapping.globalOrd(localOrd), positions[localOrd]);
+    previousDelta = delta;
   }
 }

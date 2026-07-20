@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <format>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -1127,6 +1128,36 @@ TEST_F(FacetTest, multipleSegments) {
   // Each value should have count of 1
   for (int i = 0; i < 9; i++) {
     EXPECT_EQ(1, facetResult->counts[i]);
+  }
+}
+
+TEST_F(FacetTest, flatOrdMapDeltaFrames) {
+  CollectionHelper helper;
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = seg; i < 300; i += 2) {
+      for (int repeat = 0; repeat < 3; repeat++) {
+        helper.index(flatdoc("id", std::format("{}-{}", i, repeat),
+                             "cat_s", std::format("term{:04}", i)),
+                     UpdateMessage::NO_COMMIT);
+      }
+    }
+    helper.commit();
+  }
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->topDocs().getNumber(true).allQuery();
+  req->facet("f", "cat_s").limit(-1);
+  req->execute(true);
+
+  ASSERT_OK(req);
+  const auto& result = rootFacetResult(*req, "f");
+  const auto& bucketIds = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  ASSERT_EQ(300u, bucketIds.size());
+  ASSERT_EQ(300u, result.counts.size());
+  for (int i = 0; i < 300; i++) {
+    EXPECT_EQ(std::format("term{:04}", i), bucketIds[i]);
+    EXPECT_EQ(3, result.counts[i]);
   }
 }
 

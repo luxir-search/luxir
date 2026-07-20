@@ -181,8 +181,7 @@ class GlobalOrdComparator : public FieldComparator {
   std::shared_ptr<OrdMap> ordMap;
   std::optional<OrdColReader> reader;
   std::vector<int64_t> globalOrds; // Storage for global ordinals
-  MonoReader* segmentDeltas = nullptr; // Current segment's ord mapping
-  int64_t segmentNumOrds = 0;
+  OrdMap::SegToGlobal segmentMapping;
   int64_t sortMultiplier; // 1 for ascending, -1 for descending
   int64_t missingOrd;
 
@@ -208,16 +207,13 @@ public:
   
   void setSegment(int32_t segment, PostingsReader* postingsReader) override {
     reader.reset();
-    segmentDeltas = nullptr;
-    segmentNumOrds = 0;
+    segmentMapping = {};
     
     if (!postingsReader) return;
     
     // Get segment-to-global ordinal mapping from OrdMap
     if (ordMap) {
-      auto segToGlobal = ordMap->getSegToGlobal(segment);
-      segmentNumOrds = segToGlobal.numOrds;
-      segmentDeltas = segToGlobal.deltas;
+      segmentMapping = ordMap->getSegToGlobal(segment);
     }
     
     // Load the ordinal column reader for this segment
@@ -226,6 +222,9 @@ public:
     if (fieldReader.seek(fieldName)) {
       SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);
+      if (!ordMap) {
+        segmentMapping.numOrds = fieldInfo.nTerms;
+      }
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         assert(!reader->multiValued());
@@ -245,13 +244,8 @@ public:
     }
     
     // Convert segment ordinal to global ordinal
-    int64_t globalOrd = segmentOrd;
-    if (segmentDeltas) {
-      // Apply delta to get global ordinal
-      // Note: segmentOrd is 1-based, but deltas array is 0-based
-      globalOrd = segmentOrd + segmentDeltas->valueAt(segmentOrd - 1);
-    }
-    // If no deltas, either single segment or this segment has all terms (identity mapping)
+    // Segment ords are 1-based while the delta array is 0-based.
+    int64_t globalOrd = segmentOrd + segmentMapping.deltaAt(segmentOrd - 1);
     
     // Apply sort multiplier for ascending/descending sort
     return sortMultiplier * globalOrd;

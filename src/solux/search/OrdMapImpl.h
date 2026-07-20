@@ -1,4 +1,8 @@
 #pragma once
+#include <algorithm>
+#include <bit>
+#include <vector>
+
 #include "OrdMap.h"
 #include "solux/index/IntColWriter.h"
 #include "solux/reader/TermsEnum.h"
@@ -19,14 +23,14 @@ namespace solux {
 // [meta-size (int32_t)]  // 4 byte size of metadata, starting at [numSegs], not including this size field.
 //
 // seg1-deltas contains deltas to map segment ords into global ord space.
-// Each seg encoded as separate integer column using monotonic compression (MonoWriter).
+// Each segment is encoded as a separate flat exact-bpv LinearPack region.
 //
-// seg1-meta contains MonoWriter metadata (offset, metaOffset, nValues)
+// seg1-meta contains LinearPack metadata (bits, offset, nValues)
 //   nValues (vLong) = number of values in this column.  if nValues == 0 or numGlobalOrds, no other metadata is present.
-//   offset (vLong) = offset from start of OrdMap (not absolute like the location is in SegFieldInfo)
-//   metaOffset (vLong) = offset from the start of *this* column's start.
+//   bits (vInt) = exact delta width.  bits == 0 is an identity mapping and has no payload.
+//   offset (vLong) = offset from start of OrdMap, present only when bits != 0.
 //
-// There is a single firstSegs column that contains the first segment number that the globa ord appeared in.
+// There is a single firstSegs column that contains the first segment number that the global ord appeared in.
 // There is a single globDeltas column that contains the delta that was used to map from that segment ord to the global ord.
 // Neither of these global columns are monotonic, so they are encoded with IntColWriter.
 //   firstSegs-meta and globalDeltas-meta are similar to the per-segment meta.
@@ -38,26 +42,103 @@ class OrdMapBuilder {
   std::string_view field;
   IndexReader& reader;
 
-  // An alternate encoding could just catenate all of the deltas together in one numeric column (non-monotonic)
-  // that would have less overhead for small segments.
-  struct MonoDeltas {
-    RAMFile file;
-    OutputStream out;
-    MonoWriter writer;
-    explicit MonoDeltas(MemPool& pool) : file("tmp"), out(&file), writer(pool, out) {}
+  struct PackedDeltaRuns {
+    struct Run {
+      uint64_t startIndex;
+      uint8_t width;
+      uint64_t byteOffset;
+    };
+
+    std::vector<char> packed;
+    std::vector<Run> runs;
+    std::optional<LinearPack::Writer> writer;
+    uint64_t count = 0;
+    uint64_t lastDelta = 0;
+
+    void startRun(uint8_t width) {
+      if (writer) writer->finish();
+      runs.push_back({count, width, packed.size()});
+      assert(runs.size() <= 58);
+      writer.emplace(packed, width);
+    }
+
+    void add(int64_t delta) {
+      assert(delta >= 0);
+      auto value = (uint64_t)delta;
+      // Consecutive local ords differ by one while their global ords advance
+      // by at least one, so segment-to-global deltas cannot decrease.
+      assert(count == 0 || value >= lastDelta);
+      uint8_t width = (uint8_t)std::bit_width(value);
+      assert(width <= 57);
+      if (!writer || width > runs.back().width) startRun(width);
+      writer->append(value);
+      lastDelta = value;
+      count++;
+    }
+
+    void finish() {
+      assert(writer);
+      writer->finish();
+      writer.reset();
+      assert(bits() == (uint8_t)std::bit_width(lastDelta));
+    }
+
+    uint8_t bits() const {
+      assert(!runs.empty());
+      return runs.back().width;
+    }
+
+    void writeFinal(OutputStream& out) const {
+      assert(!writer);
+      uint8_t finalBits = bits();
+      assert(finalBits != 0);
+
+      if (runs.size() == 1) {
+        assert(runs[0].startIndex == 0);
+        assert(runs[0].byteOffset == 0);
+        assert(packed.size() == LinearPack::byteSize(count, finalBits));
+        out.write(packed.data(), packed.size());
+        return;
+      }
+
+      LinearPack::Writer finalWriter(out, finalBits);
+      uint64_t values[128];
+      for (size_t runIdx = 0; runIdx < runs.size(); runIdx++) {
+        const auto& run = runs[runIdx];
+        uint64_t endIndex = runIdx + 1 < runs.size()
+            ? runs[runIdx + 1].startIndex : count;
+        uint64_t runCount = endIndex - run.startIndex;
+        const char* base = packed.data() + run.byteOffset;
+        uint64_t mask = LinearPack::mask64(run.width);
+        for (uint64_t start = 0; start < runCount; start += 128) {
+          uint32_t n = (uint32_t)std::min<uint64_t>(128, runCount - start);
+          LinearPack::unpack128(base, start, n, run.width, mask, values);
+          for (uint32_t i = 0; i < n; i++) finalWriter.append(values[i]);
+        }
+      }
+      uint64_t written = finalWriter.finish();
+      assert(written == LinearPack::byteSize(count, finalBits));
+    }
+
+    void release() {
+      assert(!writer);
+      std::vector<char>().swap(packed);
+      std::vector<Run>().swap(runs);
+    }
   };
 
   // Collect TermsEnum for each segment.  Keep track of the index so we can visit in ascending order one at a time.
   struct TermsEnumIdx {
     size_t idx;
     TermsEnum tenum;
-    MonoDeltas deltas;
+    PackedDeltaRuns deltas;
 
-    TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& finfo) : idx(idx), tenum(pool, postingsReader, finfo), deltas(pool) {}
+    TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader,
+                 SegFieldInfo& finfo)
+        : idx(idx), tenum(pool, postingsReader, finfo) {}
 
     void addDelta(int64_t delta) {
-      assert(delta >= 0);
-      deltas.writer.addInt64(delta);
+      deltas.add(delta);
     }
   };
 
@@ -219,50 +300,35 @@ public:
     metaOut.writeVlong(globalOrd + 1);  // numGlobalOrds
     metaOut.writeVlong(allTermsEnums.size());  // numSegs
 
-    bool needGlobalDeltas = true;
     int64_t ordMapStart = 0;  // currently just one ord map per file/buffer, and no header.
-    RAMFile* outFile = nullptr;
-    uint64_t cumulativeSize = 0;
+    RAMFile payloadFile("ordMapPayload");
+    OutputStream payloadOut(&payloadFile);
+    bool needGlobalDeltas = false;
 
-    // find the first non-empty and non-full segment and use its RAMFile as the output.
     for (auto& tenum : allTermsEnums) {
       bool writeDeltas = tenum && tenum->tenum.numTerms() < (globalOrd + 1);
       auto nTerms = tenum ? tenum->tenum.numTerms() : 0;
-      if (outFile == nullptr && writeDeltas) {
-        outFile = &tenum->deltas.file;
+      metaOut.writeVlong(nTerms);
+      if (tenum) {
+        tenum->deltas.finish();
+        assert((int64_t)tenum->deltas.count == nTerms);
       }
       if (writeDeltas) {
-        auto numValues = tenum->deltas.writer.finish();
-        auto thisSize = tenum->deltas.out.size();
-        tenum->deltas.out.flush(true);
-        assert(thisSize == tenum->deltas.file.size());
-        auto [filenum, loc] = tenum->deltas.writer.blockLoc.decode();
-        auto metaOff = tenum->deltas.writer.metaOff;
-        auto adjustedLoc = cumulativeSize + loc;
-
-        if (outFile == nullptr) {
-          outFile = &tenum->deltas.file;
-        } else {
-          outFile->destructiveAppend(tenum->deltas.file);
+        needGlobalDeltas = true;
+        uint8_t bits = tenum->deltas.bits();
+        assert(bits <= 57);
+        metaOut.writeVint(bits);
+        if (bits != 0) {
+          uint64_t loc = payloadOut.size();
+          metaOut.writeVlong(loc);
+          tenum->deltas.writeFinal(payloadOut);
         }
-        cumulativeSize += thisSize;
-        assert(cumulativeSize == outFile->size());
-
-        metaOut.writeVlong(numValues);
-        metaOut.writeVlong(adjustedLoc);
-        metaOut.writeVlong(metaOff);
-      } else {
-        // if empty or full, just write the number of terms.
-        metaOut.writeVlong(nTerms);
       }
+      if (tenum) tenum->deltas.release();
     }
+    payloadOut.flush(true);
 
-    if (outFile == nullptr) {
-      // we don't need to write any deltas for the segments, and that means we don't need
-      // the firstSegs/globDeltas columns either.
-      outFile = &metaOutFile;
-      needGlobalDeltas = false;
-    }
+    uint64_t cumulativeSize = payloadFile.size();
 
     if (needGlobalDeltas) {
       // redundant numValues for the global columns, but it makes reading simpler.
@@ -272,16 +338,19 @@ public:
       metaOut.writeVlong(firstSegsInfo.columnLoc + cumulativeSize);
       metaOut.writeVlong(firstSegsInfo.columnMetaOff);
       cumulativeSize += firstSegsFile.size();
-      outFile->destructiveAppend(firstSegsFile);
-      assert(outFile->size() == cumulativeSize);
+      payloadFile.destructiveAppend(firstSegsFile);
+      assert(payloadFile.size() == cumulativeSize);
 
 
       metaOut.writeVlong(globDeltasInfo.numValues);
       metaOut.writeVlong(globDeltasInfo.columnLoc + cumulativeSize);
       metaOut.writeVlong(globDeltasInfo.columnMetaOff);
       cumulativeSize += globDeltasFile.size();
-      outFile->destructiveAppend(globDeltasFile);  // globDeltasFile is what we were appending metadata to.
-      assert(outFile->size() == cumulativeSize);
+      payloadFile.destructiveAppend(globDeltasFile);
+      assert(payloadFile.size() == cumulativeSize);
+    } else {
+      metaOut.writeVlong(0);
+      metaOut.writeVlong(0);
     }
 
     // finally write the size of the metadata, then we can flush and add to outFile.
@@ -290,16 +359,14 @@ public:
     metaOut.writeInt((int32_t)metaSize);
     metaOut.flush(true);
     cumulativeSize += sizeof(int32_t);
-    if (outFile != &metaOutFile) {
-      outFile->destructiveAppend(metaOutFile);
-    }
+    payloadFile.destructiveAppend(metaOutFile);
 
-    assert(outFile->size() == cumulativeSize);
+    assert(payloadFile.size() == cumulativeSize);
 
-    size = outFile->size();
+    size = payloadFile.size();
     start = ordMapStart;
     data.reset(new char[size]);
-    outFile->copyTo(data.get());
+    payloadFile.copyTo(data.get());
   }
 };
 
