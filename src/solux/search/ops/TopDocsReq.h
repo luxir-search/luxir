@@ -340,6 +340,25 @@ public:
                 // windows without materializing docs or scores.
                 collectCountWindowed(bulk, collectorFilter, builderPtr, *data->scoreCollector,
                                      seg.maxDoc());
+              } else if (op.weight->isConstantScoring()) {
+                // Equal scores reduce ranking to doc order. The bulk scorer
+                // drives the exhaustive count/domain while an independent
+                // scorer visits only this segment's first K matches.
+                auto* captureSupplier = mainScorerSupplier(poolGuard.pool(), seg);
+                int64_t captured = 0;
+                if (captureSupplier != nullptr) {
+                  auto* captureScorer = captureSupplier->get(
+                      poolGuard.pool(), std::numeric_limits<int64_t>::max());
+                  if (captureScorer != nullptr) {
+                    captured = collectFirstKConstant(
+                        segnum, captureScorer, collectorFilter,
+                        *data->scoreCollector, data->scoreCollector->topCount);
+                  }
+                }
+                int64_t count = countMatchesWindowed(
+                    bulk, collectorFilter, builderPtr, seg.maxDoc());
+                assert(count >= captured);
+                data->scoreCollector->hitCount += count - captured;
               } else {
                 collectTopKWindowed(
                   segnum, bulk, collectorFilter, builderPtr, *data->scoreCollector,

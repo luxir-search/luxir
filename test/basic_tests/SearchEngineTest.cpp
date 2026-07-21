@@ -842,6 +842,86 @@ TEST_F(SearchEngineTest, topDocsFilterFoldMatchesPassivePath) {
   expectSameScoreMap(folded.scores, passive.scores);
 }
 
+TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
+  CollectionHelper helper;
+  for (int32_t segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int32_t local = 0; local < 24; local++) {
+      int32_t doc = segment * 24 + local;
+      docs.push_back(flatdoc(
+          "id", "f" + std::to_string(doc),
+          "keep_s", (doc % 4) == 1 ? "no" : "yes",
+          "size_s", (doc % 3) == 0 ? "small" : "big",
+          "group_s", "g" + std::to_string(doc % 3)));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  std::vector<std::string> deleted = {"f2", "f25", "f38"};
+  helper.deleteByIds(deleted, UpdateMessage::COMMIT);
+  ASSERT_GT(helper.getIndexWriter()->getIndexReader()->segments().size(), 1u);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::optional<int64_t> found;
+    std::map<std::string, int64_t> facets;
+  };
+
+  auto run = [&](bool passive, bool twoFilters, int64_t limit,
+                 bool getNumber, bool withFacet) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q").allQuery().fields({"id"}).limit(limit);
+    if (getNumber) topDocs.getNumber();
+    topDocs.matchFilter("keep", "keep_s", "yes");
+    if (twoFilters) topDocs.matchFilter("size", "size_s", "big");
+    if (withFacet) topDocs.facet("groups", "group_s").limit(-1);
+    {
+      TopDocsFilterFoldGuard guard(passive);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* docs = req->docList("q");
+    EXPECT_NE(docs, nullptr);
+    return Result{
+      resultIds(*req, "q"),
+      docs == nullptr ? std::optional<int64_t>{} : docs->found,
+      withFacet ? resultFacetMap(*req, "q", "groups")
+                : std::map<std::string, int64_t>{}
+    };
+  };
+
+  for (bool twoFilters : {false, true}) {
+    for (int64_t limit : {0, 10}) {
+      for (bool getNumber : {false, true}) {
+        bool withFacet = limit > 0 && getNumber;
+        auto bulk = run(false, twoFilters, limit, getNumber, withFacet);
+        auto pull = run(true, twoFilters, limit, getNumber, withFacet);
+        EXPECT_EQ(bulk.ids, pull.ids);
+        EXPECT_EQ(bulk.found, pull.found);
+        EXPECT_EQ(bulk.facets, pull.facets);
+        EXPECT_EQ(bulk.found.has_value(), getNumber);
+        if (limit == 0) {
+          EXPECT_TRUE(bulk.ids.empty());
+        } else {
+          EXPECT_EQ(bulk.ids.size(), 10u);
+          EXPECT_EQ(std::find(bulk.ids.begin(), bulk.ids.end(), "f2"),
+                    bulk.ids.end());
+        }
+        if (withFacet) {
+          int64_t facetDomain = 0;
+          for (const auto& [group, count] : bulk.facets) {
+            unused(group);
+            facetDomain += count;
+          }
+          ASSERT_TRUE(bulk.found.has_value());
+          EXPECT_EQ(facetDomain, *bulk.found);
+          EXPECT_GT(*bulk.found, (int64_t) bulk.ids.size());
+        }
+      }
+    }
+  }
+}
+
 TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
   CollectionHelper helper;
   helper.indexAll(std::array{

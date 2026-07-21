@@ -5900,6 +5900,76 @@ TEST_F(TermScorerTest, bulkCountDomainDisjunctionMatchesPullAcrossFiltersAndDele
   check(arrayFilter.get(), true);
 }
 
+TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
+  const int32_t N = 2 * DocsEnum::L1_DOCS + 97;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "filler";
+    if ((doc % 3) != 1) body += " filter_a";
+    if ((doc % 5) < 3) body += " filter_b";
+    f.add(doc, body);
+    if ((doc % 17) == 0) {
+      testIndex.deleteDoc(doc);
+    }
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  ASSERT_NE(segment.liveDocs(), nullptr);
+  DocSet* liveDocs = &segment.liveDocs()->docset();
+  TermQuery filterA("body_w", "filter_a");
+  TermQuery filterB("body_w", "filter_b");
+  std::array<Query*, 2> filters = {&filterA, &filterB};
+  std::span<Query*> empty;
+
+  for (size_t clauseCount : {1u, 2u}) {
+    std::span<Query*> activeFilters(filters.data(), clauseCount);
+    BooleanQuery bulkCountQ(empty, empty, empty, activeFilters);
+    BooleanQuery pullCountQ(empty, empty, empty, activeFilters);
+    auto* bulkCountWeight = bulkCountQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* pullCountWeight = pullCountQ.createWeight(qContext, Query::NEED_SCORES);
+    expectBulkDomainMatchesPull(
+        bulkCountWeight, pullCountWeight, testIndex.pool, segment, liveDocs);
+
+    BooleanQuery pullScoreQ(empty, empty, empty, activeFilters);
+    auto* pullScoreWeight = pullScoreQ.createWeight(qContext, Query::NEED_SCORES);
+    DocSetBuilder pullBuilder(segment.maxDoc());
+    TopDocsCollector pullCollector(10);
+    auto* pullScorer = pullScoreWeight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(pullScorer, nullptr);
+    collectTopK(0, pullScorer, liveDocs, &pullBuilder, pullCollector,
+                /*allowPruning=*/false);
+    auto pullDomain = pullBuilder.build();
+
+    BooleanQuery bulkScoreQ(empty, empty, empty, activeFilters);
+    auto* bulkScoreWeight = bulkScoreQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = bulkScoreWeight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = supplier->bulkScorer(testIndex.pool);
+    ASSERT_NE(bulk, nullptr);
+    DocSetBuilder bulkBuilder(segment.maxDoc());
+    TopDocsCollector bulkCollector(10);
+    collectTopKWindowed(0, bulk, liveDocs, &bulkBuilder, bulkCollector, nullptr,
+                        segment.maxDoc(), /*allowPruning=*/false);
+    auto bulkDomain = bulkBuilder.build();
+
+    EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
+    auto bulkTop = sortedCollectorDocs(bulkCollector);
+    auto pullTop = sortedCollectorDocs(pullCollector);
+    ASSERT_EQ(bulkTop.size(), pullTop.size());
+    for (size_t i = 0; i < pullTop.size(); i++) {
+      EXPECT_EQ(bulkTop[i].doc, pullTop[i].doc);
+      EXPECT_FLOAT_EQ(bulkTop[i].score, pullTop[i].score);
+    }
+    expectDocSetEqual(bulkDomain.get(), pullDomain.get(), segment.maxDoc());
+  }
+}
+
 TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
   CollectionHelper helper("main");
   const int32_t numTerms = 32;

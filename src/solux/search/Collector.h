@@ -482,29 +482,79 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   }
 }
 
-// allowPruning=false pins theta at lowest so the bulk scorer must visit every
-// matching doc (exact total counts). The collector's rising min-competitive
-// value is deliberately NOT forwarded in that mode - skipped docs cannot be
-// counted. Callers should also pass accumulator=nullptr then, so this
-// segment's threshold does not leak to sibling segments.
-// Count-only collection over the windowed bulk path: no docs or scores are
-// ever materialized, only the per-window match counts. Callers must only use
-// this when the collector keeps nothing but hitCount (topCount == 0) and no
-// doc-set builder is attached.
+inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
+                                     DocSet* filter, TopDocsCollector& collector,
+                                     int64_t topCount) {
+  assert(scorer != nullptr);
+  assert(topCount > 0);
+  int64_t collected = 0;
+  auto collectOne = [&](int32_t doc) {
+    collector.collect(segnum, doc, scorer->score());
+    collected++;
+  };
+
+  if (filter == nullptr || filter->type == DocSet::BITSET) {
+    BitDocSet* bitDocs = (BitDocSet*) filter;
+    auto* domainBits = bitDocs == nullptr ? nullptr : &bitDocs->bits();
+    while (collected < topCount) {
+      int32_t doc = scorer->next();
+      if (doc == PostingsReader::END) {
+        break;
+      }
+      if (domainBits != nullptr && !domainBits->get(doc)) {
+        continue;
+      }
+      collectOne(doc);
+    }
+  } else {
+    for (int32_t doc : ((ArrDocSet*) filter)->docs()) {
+      if (scorer->docId() < doc) {
+        scorer->advance(doc);
+      }
+      if (scorer->docId() != doc) {
+        continue;
+      }
+      collectOne(doc);
+      if (collected >= topCount) {
+        break;
+      }
+    }
+  }
+  return collected;
+}
+
+// Exhaust the windowed bulk path, counting matches and optionally building the
+// complete domain. No docs or scores are otherwise materialized.
+inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
+                                    DocSetBuilder* builder, int32_t maxDoc) {
+  assert(bulk != nullptr);
+  int64_t count = 0;
+  int32_t cursor = 0;
+  while (cursor != PostingsReader::END && cursor < maxDoc) {
+    int32_t next = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);
+    if (next == PostingsReader::END) {
+      break;
+    }
+    assert(next > cursor);
+    cursor = next;
+  }
+  assert(builder == nullptr || count == builder->card());
+  return count;
+}
+
 inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
                                  DocSetBuilder* builder,
                                  TopDocsCollector& collector, int32_t maxDoc) {
   assert(bulk != nullptr);
   assert(collector.topCount == 0);
-  int64_t count = 0;
-  int32_t cursor = 0;
-  while (cursor != PostingsReader::END && cursor < maxDoc) {
-    cursor = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);
-  }
-  assert(builder == nullptr || count == builder->card());
-  collector.hitCount += count;
+  collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
 }
 
+// allowPruning=false pins theta at lowest so the bulk scorer must visit every
+// matching doc (exact total counts). The collector's rising min-competitive
+// value is deliberately NOT forwarded in that mode - skipped docs cannot be
+// counted. Callers should also pass accumulator=nullptr then, so this
+// segment's threshold does not leak to sibling segments.
 template <typename Collector>
 void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                          DocSetBuilder* builder, Collector& collector,

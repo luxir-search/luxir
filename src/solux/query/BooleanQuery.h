@@ -938,7 +938,86 @@ public:
             segment.maxDoc(), mandCost);
       }
 
+      BulkScorer* filterOnlyBulkScorer(MemPool& targetPool) {
+        struct Entry {
+          int64_t cost;
+          BulkScorer* bulk;
+        };
+        boost::container::small_vector<Entry, 16> entries;
+        entries.reserve(filterSuppliers.size());
+        for (auto* supplier : filterSuppliers) {
+          if (supplier == nullptr) {
+            return nullptr;
+          }
+          auto* bulk = supplier->bulkScorer(targetPool);
+          if (bulk == nullptr) {
+            return nullptr;
+          }
+          entries.push_back({supplier->cost(), bulk});
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+        if (entries.size() == 1) {
+          // Wrap even the single-clause case: the wrapper owns the
+          // non-scoring contract (constant-0 score windows, no impact
+          // pruning by the lead).
+          return targetPool.make<BooleanQuery::FilterOnlyBulkScorer>(
+              entries[0].bulk, std::span<uint64_t>{}, std::span<uint64_t>{},
+              0, segment.maxDoc());
+        }
+
+        int32_t maxDoc = segment.maxDoc();
+        size_t wordCount = FixedBitSet::sizeInWords(maxDoc);
+        auto filterWords = targetPool.make_span<uint64_t>(wordCount);
+        auto clauseWords = targetPool.make_span<uint64_t>(wordCount);
+        bool first = true;
+        for (size_t i = 1; i < entries.size(); i++) {
+          DocSetBuilder builder(maxDoc);
+          int64_t count = 0;
+          for (int32_t cursor = 0;
+               cursor != PostingsReader::END && cursor < maxDoc; ) {
+            int32_t next = entries[i].bulk->countNextWindow(
+                count, &builder, nullptr, cursor, maxDoc);
+            if (next == PostingsReader::END) {
+              break;
+            }
+            assert(next > cursor);
+            cursor = next;
+          }
+          assert(count == builder.card());
+          auto docs = builder.build();
+          std::fill(clauseWords.begin(), clauseWords.end(), 0);
+          if (docs->type == DocSet::BITSET) {
+            const auto& bits = ((BitDocSet*) docs.get())->bits();
+            std::copy(bits.words, bits.words + wordCount, clauseWords.begin());
+          } else {
+            for (int32_t doc : ((ArrDocSet*) docs.get())->docs()) {
+              clauseWords[(size_t) doc >> 6] |= 1ULL << (doc & 63);
+            }
+          }
+          if (first) {
+            std::copy(clauseWords.begin(), clauseWords.end(), filterWords.begin());
+            first = false;
+          } else {
+            for (size_t word = 0; word < wordCount; word++) {
+              filterWords[word] &= clauseWords[word];
+            }
+          }
+        }
+
+        int32_t filterCard = 0;
+        for (uint64_t word : filterWords) {
+          filterCard += (int32_t) std::popcount(word);
+        }
+        return targetPool.make<BooleanQuery::FilterOnlyBulkScorer>(
+            entries[0].bulk, filterWords, clauseWords, filterCard, maxDoc);
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override {
+        if (mandatorySources.empty() && optionalSources.empty()
+            && prohibitedSources.empty() && !filterSuppliers.empty()) {
+          return filterOnlyBulkScorer(targetPool);
+        }
         // Scored or not, the bulk intersection remains the right execution for
         // exact conjunction counts. Unscored clauses contribute zero score and
         // zero bounds.
@@ -1574,6 +1653,87 @@ public:
       return upTo;
     }
   }; // MandOptScorer
+
+  class FilterOnlyBulkScorer final : public BulkScorer {
+    BulkScorer* lead;
+    std::span<uint64_t> filterWords;
+    std::span<uint64_t> combinedWords;
+    DocSet* combinedWith = nullptr;
+    int32_t filterCard;
+    int32_t combinedCard = 0;
+    int32_t maxDoc;
+    bool combinedReady = false;
+
+    void combineWith(DocSet* incoming) {
+      if (combinedReady && combinedWith == incoming) {
+        return;
+      }
+      combinedWith = incoming;
+      combinedReady = true;
+      combinedCard = 0;
+      if (incoming->type == DocSet::BITSET) {
+        const auto& incomingBits = ((BitDocSet*) incoming)->bits();
+        for (size_t word = 0; word < filterWords.size(); word++) {
+          combinedWords[word] = filterWords[word] & incomingBits.words[word];
+          combinedCard += (int32_t) std::popcount(combinedWords[word]);
+        }
+      } else {
+        std::fill(combinedWords.begin(), combinedWords.end(), 0);
+        for (int32_t doc : ((ArrDocSet*) incoming)->docs()) {
+          uint64_t mask = 1ULL << (doc & 63);
+          if ((filterWords[(size_t) doc >> 6] & mask) != 0) {
+            combinedWords[(size_t) doc >> 6] |= mask;
+            combinedCard++;
+          }
+        }
+      }
+    }
+
+  public:
+    FilterOnlyBulkScorer(BulkScorer* lead,
+                         std::span<uint64_t> filterWords,
+                         std::span<uint64_t> combinedWords,
+                         int32_t filterCard, int32_t maxDoc)
+      : lead(lead), filterWords(filterWords), combinedWords(combinedWords),
+        filterCard(filterCard), maxDoc(maxDoc) {}
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* incoming,
+                            int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      // Filter clauses are non-scoring: emitted docs carry the Boolean's
+      // constant score (0), never the lead clause's own scores, and the
+      // lead must not prune on its own impacts.
+      unused(minCompetitiveScore);
+      int32_t next;
+      if (filterWords.empty()) {
+        // Single filter clause: the lead already IS the whole filter.
+        next = lead->scoreNextWindow(out, incoming, min, max, 0.0f);
+      } else if (incoming == nullptr) {
+        BitDocSet filter(FixedBitSet(filterWords.data(), maxDoc), filterCard);
+        next = lead->scoreNextWindow(out, &filter, min, max, 0.0f);
+      } else {
+        combineWith(incoming);
+        BitDocSet filter(FixedBitSet(combinedWords.data(), maxDoc), combinedCard);
+        next = lead->scoreNextWindow(out, &filter, min, max, 0.0f);
+      }
+      std::fill(out.scores.begin(), out.scores.begin() + out.size, 0.0f);
+      return next;
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* incoming, int32_t min, int32_t max) override {
+      if (filterWords.empty()) {
+        return lead->countNextWindow(count, domainOut, incoming, min, max);
+      }
+      if (incoming == nullptr) {
+        BitDocSet filter(FixedBitSet(filterWords.data(), maxDoc), filterCard);
+        return lead->countNextWindow(count, domainOut, &filter, min, max);
+      }
+      combineWith(incoming);
+      BitDocSet filter(FixedBitSet(combinedWords.data(), maxDoc), combinedCard);
+      return lead->countNextWindow(count, domainOut, &filter, min, max);
+    }
+  };
 
   class MandOptBulkScorer final : public BulkScorer {
     constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
