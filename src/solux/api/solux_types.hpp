@@ -142,7 +142,8 @@ struct CalendarGap {
 };
 struct SortSpec {
   using SortDir = solux::api::SortSpec_::SortDir;
-  std::string_view field;
+  std::string_view expr;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
   SortDir dir = SortDir::UNKNOWN;
 };
 struct ExistsQuery { std::string_view field; };

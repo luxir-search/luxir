@@ -530,7 +530,7 @@ public:
     out.useFieldSort = true;
     for (const auto& sortSpec : sorts) {
       bool defaultDesc = sortSpec.dir == solux::api::SortSpec_::SortDir::UNKNOWN
-        && sortSpec.field == "_score_";
+        && sortSpec.expr == "_score_";
       SortField::SortOrder order =
         sortSpec.dir == solux::api::SortSpec_::SortDir::DESC || defaultDesc
           ? SortField::DESC : SortField::ASC;
@@ -538,17 +538,17 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (sortSpec.field == "_score_") {
+      if (sortSpec.expr == "_score_") {
         out.clauses.emplace_back(SortClause::SCORE, order);
-      } else if (sortSpec.field == "_docid_") {
+      } else if (sortSpec.expr == "_docid_") {
         out.clauses.emplace_back(SortClause::DOC, order);
       } else {
-        auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field);
+        auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.expr);
         if (!fieldTypePtr) {
-          throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field));
+          throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.expr));
         }
         out.clauses.emplace_back(
-          SortField(sortSpec.field, *fieldTypePtr, order, missing));
+          SortField(sortSpec.expr, *fieldTypePtr, order, missing));
       }
     }
 

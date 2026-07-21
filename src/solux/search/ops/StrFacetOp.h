@@ -670,7 +670,7 @@ public:
         });
       } else {
         // Count and bucket-value sorts are future work; sub-op sort is supported.
-        std::string_view field = thisOp().fieldFacet.sorts[0].field;
+        std::string_view field = thisOp().fieldFacet.sorts[0].expr;
         SearchOp::InlineCalculator* calc = nullptr;
         for (auto* candidate : mergedData->inlineCalcs) {
           if (candidate->getOp().name == field) {

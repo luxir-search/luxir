@@ -86,12 +86,12 @@ protected:
   }
 
   // Append a sort spec to a TopDocs source (realloc-grow preserves prior entries).
-  static void addSort(solux::api::TopDocs& src, std::string_view field,
+  static void addSort(solux::api::TopDocs& src, std::string_view expr,
                       solux::api::SortSpec::SortDir dir, std::pmr::memory_resource& mr) {
     auto old = src.sorts;
     solux::api::SortSpec* a = build::allocArray(src.sorts, old.size() + 1, mr);
     for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
-    a[old.size()].field = build::arenaStr(mr, field);
+    a[old.size()].expr = build::arenaStr(mr, expr);
     a[old.size()].dir = dir;
   }
 

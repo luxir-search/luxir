@@ -247,7 +247,7 @@ inline OpCursor& setQuery(OpCursor& cur, const api::Query& q) {
 }
 
 // Append a sort spec to the cursor op (TopDocs / FieldFacet / RangeFacet).
-inline OpCursor& sort(OpCursor& cur, std::string_view field,
+inline OpCursor& sort(OpCursor& cur, std::string_view expr,
                       SortDir dir = SortDir::UNKNOWN) {
   auto& mr = cur.mr();
   std::span<const api::SortSpec>* sorts = nullptr;
@@ -258,7 +258,7 @@ inline OpCursor& sort(OpCursor& cur, std::string_view field,
   auto old = *sorts;
   api::SortSpec* a = build::allocArray(*sorts, old.size() + 1, mr);
   for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
-  a[old.size()].field = build::arenaStr(mr, field);
+  a[old.size()].expr = build::arenaStr(mr, expr);
   a[old.size()].dir = dir;
   return cur;
 }

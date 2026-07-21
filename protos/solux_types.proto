@@ -160,8 +160,8 @@ message RrfFusion {
 }
 
 message SortSpec {
-  string field = 1;
-  // future: sort by function
+  string expr = 1;
+  map<string, Val> vars = 2;
 
   enum SortDir {
     option allow_alias = true;

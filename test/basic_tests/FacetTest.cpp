@@ -2338,7 +2338,7 @@ protected:
       int sortAvgIdx = -1;  // index into avgOps of the sort key, or -1
       if (!facetOp.sorts.empty()) {
         for (size_t k = 0; k < avgOps.size(); k++)
-          if (avgOps[k].name == facetOp.sorts[0].field) { sortAvgIdx = (int)k; break; }
+          if (avgOps[k].name == facetOp.sorts[0].expr) { sortAvgIdx = (int)k; break; }
       }
       bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts[0].dir == solux::api::SortSpec_::SortDir::DESC;
 

@@ -56,7 +56,7 @@ The top-document fields are:
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `fields` | Fields to retrieve. |
-| `sorts` | Field sort specifications. No list means relevance order. |
+| `sorts` | Value expressions used as sort keys. No list means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
 | `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match domain. |
@@ -127,16 +127,17 @@ Sort a single-valued column field explicitly:
 ```json
 {
   "query": {"all":true},
-  "sorts": [{"field":"year_i","dir":"desc"}],
+  "sorts": [{"expr":"year_i","dir":"desc"}],
   "fields": ["id","title_w","year_i"]
 }
 ```
 
-Numeric, date, string, and ID fields with columns are supported. Analyzed text
-has no value column; index the same source into a `string` field when it must
-sort. Missing values sort last. Several sort specifications form an ordered
-lexicographic sort. `_score_` sorts by the query score and `_docid_` sorts by
-reader-local `(segment, docid)` order; either can appear in any position.
+The `expr` member accepts a bare column name here. Numeric, date, string, and ID
+fields with columns are supported. Analyzed text has no value column; index the
+same source into a `string` field when it must sort. Missing values sort last.
+Several sort specifications form an ordered lexicographic sort. `_score_` sorts
+by the query score and `_docid_` sorts by reader-local `(segment, docid)` order;
+either can appear in any position.
 
 An omitted direction defaults to descending for `_score_` and ascending for
 columns and `_docid_`. After all explicit components tie, results use

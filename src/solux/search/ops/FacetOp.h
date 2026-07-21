@@ -57,9 +57,9 @@ public:
         throw std::runtime_error("facet '" + std::string(facetName) + "': multiple sort fields are not yet supported");
       }
       for (auto& sort : sorts) {
-        auto iter = subOps.find(sort.field);
+        auto iter = subOps.find(sort.expr);
         if (iter == subOps.end()) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': unknown sort field '" + std::string(sort.field) + "'");
+          throw std::runtime_error("facet '" + std::string(facetName) + "': unknown sort field '" + std::string(sort.expr) + "'");
         }
         if (iter->second->canInline()) {
           inlineSubOps.push_back(*iter);

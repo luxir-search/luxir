@@ -138,13 +138,15 @@ Sort a string/ID facet by one of its metric operations:
     "ops": {
       "average_price": {"gen_op":{"name":"avg","args":["price_f"]}}
     },
-    "sorts": [{"field":"average_price","dir":"desc"}]
+    "sorts": [{"expr":"average_price","dir":"desc"}]
   }
 }
 ```
 
-Only one facet sort key is supported. Custom count and bucket-value sort
-specifications are not yet supported; omit `sorts` for the default count order.
+Facet sort expressions are resolved contextually as metric operation names;
+document value expressions are not evaluated for buckets. Only one facet sort
+key is supported. Custom count and bucket-value sort specifications are not yet
+supported; omit `sorts` for the default count order.
 
 ## Nested facets
 
