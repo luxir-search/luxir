@@ -781,7 +781,7 @@ ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
       auto* bulk = supplier->bulkScorer(pool);
       if (bulk != nullptr) {
         result.bulkSegments++;
-        collectTopKWindowed(segnum, bulk, filter, nullptr, collector, nullptr, seg.maxDoc());
+        collectTopKWindowed(segnum, bulk, filter, collector, nullptr, seg.maxDoc());
         continue;
       }
       result.bulkFallbackSegments++;

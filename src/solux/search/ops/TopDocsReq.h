@@ -324,13 +324,10 @@ public:
               collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
             }
           } else {
-            // get_number requests an exact total hit count, which is incompatible with
-            // impact block skipping (skipped docs are not visited, so not counted).
-            // The windowed bulk path is still used - it just runs with theta pinned
-            // (allowPruning=false) so every matching doc is visited: per-clause
-            // window drives beat the doc-at-a-time heap disjunction even without
-            // skipping. The accumulator is withheld too, so this segment's
-            // threshold cannot leak into sibling segments' pruning decisions.
+            // Pruning is enabled only when an exact count can either be omitted
+            // or supplied by an exhaustive count/domain pass or an already-known
+            // domain. Without pruning, windowed scoring still beats the
+            // doc-at-a-time heap disjunction by using per-clause window drives.
             bool allowPruning = op.weight->allowsPruning();
             BulkScorer* bulk = nullptr;
             bulk = supplier->bulkScorer(poolGuard.pool());
@@ -359,17 +356,55 @@ public:
                     bulk, collectorFilter, builderPtr, seg.maxDoc());
                 assert(count >= captured);
                 data->scoreCollector->hitCount += count - captured;
+              } else if (builderPtr != nullptr) {
+                int64_t count = countMatchesWindowed(
+                    bulk, collectorFilter, builderPtr, seg.maxDoc());
+                int64_t before = data->scoreCollector->totalHits();
+                auto* rankingSupplier = mainScorerSupplier(poolGuard.pool(), seg);
+                if (rankingSupplier != nullptr) {
+                  auto* rankingBulk = rankingSupplier->bulkScorer(poolGuard.pool());
+                  if (rankingBulk != nullptr) {
+                    collectTopKWindowed(
+                        segnum, rankingBulk, collectorFilter, *data->scoreCollector,
+                        allowPruning ? &scoreAccumulator : nullptr,
+                        seg.maxDoc(), allowPruning);
+                  } else {
+                    auto* rankingScorer = rankingSupplier->get(
+                        poolGuard.pool(), std::numeric_limits<int64_t>::max());
+                    if (rankingScorer != nullptr) {
+                      collectTopK(
+                          segnum, rankingScorer, collectorFilter, nullptr,
+                          *data->scoreCollector, allowPruning,
+                          allowPruning ? &scoreAccumulator : nullptr);
+                    }
+                  }
+                }
+                int64_t after = data->scoreCollector->totalHits();
+                assert(count >= after - before);
+                data->scoreCollector->hitCount += count - (after - before);
               } else {
                 collectTopKWindowed(
-                  segnum, bulk, collectorFilter, builderPtr, *data->scoreCollector,
-                  (allowPruning && builderPtr == nullptr) ? &scoreAccumulator : nullptr,
-                  seg.maxDoc(), allowPruning);
+                    segnum, bulk, collectorFilter, *data->scoreCollector,
+                    allowPruning ? &scoreAccumulator : nullptr,
+                    seg.maxDoc(), allowPruning);
               }
             } else {
               auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {
+                int64_t before = data->scoreCollector->totalHits();
                 collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->scoreCollector,
                             allowPruning, &scoreAccumulator);
+                // Match-all sub-ops reuse the incoming domain, so there is no
+                // builder or exhaustive bulk pass. Its cardinality supplies
+                // the exact count while the constant scorer ranks only K docs.
+                if (matchEverything && allowPruning && op.topDocsProto.get_number) {
+                  int64_t count = collectorFilter == nullptr
+                      ? seg.maxDoc()
+                      : collectorFilter->card();
+                  int64_t after = data->scoreCollector->totalHits();
+                  assert(count >= after - before);
+                  data->scoreCollector->hitCount += count - (after - before);
+                }
               }
             }
           }

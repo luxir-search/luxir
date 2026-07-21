@@ -12,6 +12,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/reader/Postings.h"
 #include "solux/reader/SkipStats.h"
 #include "solux/search/ops/TopDocsReq.h"
 #include "solux/server/GRPCServer.h"
@@ -133,16 +134,16 @@ api::Query filteredCountBody(std::pmr::memory_resource& mr,
   std::unreachable();
 }
 
-class CountSkipStatsGuard {
+class SkipStatsGuard {
   bool saved;
 
 public:
-  CountSkipStatsGuard() : saved(SkipStats::enabled) {
+  SkipStatsGuard() : saved(SkipStats::enabled) {
     SkipStats::enabled = true;
     SkipStats::reset();
   }
 
-  ~CountSkipStatsGuard() {
+  ~SkipStatsGuard() {
     SkipStats::enabled = saved;
   }
 };
@@ -176,7 +177,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     cur.matchFilter("filter", "filter_w", filterTerm);
   }
 
-  CountSkipStatsGuard statsGuard;
+  SkipStatsGuard statsGuard;
   {
     TopDocsFilterFoldGuard foldGuard(path == FilteredCountPath::MATERIALIZED);
     req->execute(false);
@@ -265,11 +266,109 @@ void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
     }
   }
 }
+
+void appendRepeatedTerm(std::string& body, std::string_view term, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    if (!body.empty()) body.push_back(' ');
+    body.append(term);
+  }
+}
+
+void addPrunableFacetDocs(CollectionHelper& helper, int32_t segmentCount) {
+  const int32_t segmentDocs = 3 * Postings::DOCS_BLOCK_SIZE + 40;
+  for (int32_t segment = 0; segment < segmentCount; segment++) {
+    std::vector<Doc> docs;
+    docs.reserve((size_t) segmentDocs);
+    for (int32_t local = 0; local < segmentDocs; local++) {
+      int32_t doc = segment * segmentDocs + local;
+      std::string body = "common";
+      if (doc < 6) {
+        int32_t rareTf = 8 - doc;
+        appendRepeatedTerm(body, "rare", rareTf);
+        appendRepeatedTerm(body, "pad", 8 - rareTf);
+        body += " medium";
+      } else {
+        if ((doc % 9) == 0) body += " medium";
+        appendRepeatedTerm(body, "filler", 60);
+      }
+      docs.push_back(flatdoc(
+          "id", "p" + std::to_string(doc),
+          "body_w", body,
+          "group_s", "g" + std::to_string(doc % 4)));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+}
+
+void setPrunableDisjunction(OpCursor& cur) {
+  cur.rawQuery() = qb::boolean(
+      cur.mr(), /*required=*/{},
+      /*optional=*/{qb::match(cur.mr(), "body_w", "common"),
+                    qb::match(cur.mr(), "body_w", "medium"),
+                    qb::match(cur.mr(), "body_w", "rare")});
+}
+
+void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
+                                                int32_t segmentCount) {
+  addPrunableFacetDocs(helper, segmentCount);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), (size_t) segmentCount);
+  const int64_t topK = 3;
+
+  auto baseline = localReq(helper.getSearchEngine());
+  baseline->collection("main");
+  auto& baselineRank = baseline->topDocs("rank").getNumber().getScores()
+      .fields({"id"}).limit(topK);
+  setPrunableDisjunction(baselineRank);
+  auto& baselineDomain = baseline->topDocs("domain").getNumber().limit(0);
+  setPrunableDisjunction(baselineDomain);
+  baselineDomain.facet("groups", "group_s").limit(-1);
+  baseline->execute(false);
+  ASSERT_OK(baseline);
+
+  auto actual = localReq(helper.getSearchEngine());
+  actual->collection("main");
+  auto& actualRank = actual->topDocs("rank").getNumber().getScores()
+      .fields({"id"}).limit(topK);
+  setPrunableDisjunction(actualRank);
+  actualRank.facet("groups", "group_s").limit(-1);
+
+  int64_t pruningEvents = 0;
+  int64_t domainWindows = 0;
+  {
+    SkipStatsGuard stats;
+    actual->execute(false);
+    pruningEvents = SkipStats::maxScoreBufferCompactions
+        + SkipStats::maxScoreDeadOuterJumps;
+    domainWindows = SkipStats::bulkDomainWindowsFed;
+  }
+  ASSERT_OK(actual);
+
+  EXPECT_EQ(resultIds(*baseline, "rank"), resultIds(*actual, "rank"));
+  EXPECT_EQ(resultScoreMap(*baseline, "rank"), resultScoreMap(*actual, "rank"));
+  EXPECT_EQ(resultFacetMap(*baseline, "domain", "groups"),
+            resultFacetMap(*actual, "rank", "groups"));
+  EXPECT_EQ(baseline->getMatchCount("rank"), actual->getMatchCount("rank"));
+  EXPECT_EQ(baseline->getMatchCount("domain"), actual->getMatchCount("rank"));
+  EXPECT_GT(actual->getMatchCount("rank"), topK);
+  EXPECT_GT(domainWindows, 0);
+  EXPECT_GT(pruningEvents, 0);
+}
 }  // namespace
 
 class SearchEngineTest : public SoluxTest {
 public:
 };
+
+TEST_F(SearchEngineTest, prunedTopDocsFacetTwoPassMatchesExhaustive) {
+  CollectionHelper helper;
+  expectPrunedFacetTwoPassMatchesExhaustive(helper, 1);
+}
+
+TEST_F(SearchEngineTest, prunedTopDocsFacetTwoPassMatchesExhaustiveMultiSegment) {
+  CollectionHelper helper;
+  expectPrunedFacetTwoPassMatchesExhaustive(helper, 3);
+}
 
 TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   CollectionHelper helper;

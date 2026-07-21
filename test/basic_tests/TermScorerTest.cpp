@@ -752,7 +752,7 @@ DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerm
     }
     int64_t beforeBs1Windows = maxScoreBulk->bs1WindowCount();
     int64_t beforeDomainDriveWindows = maxScoreBulk->domainDriveWindowCount();
-    collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector, nullptr,
+    collectTopKWindowed(segnum, bulk, filter.get(), collector, nullptr,
                         segments[segnum].maxDoc());
     result.bs1Windows += maxScoreBulk->bs1WindowCount() - beforeBs1Windows;
     result.domainDriveWindows += maxScoreBulk->domainDriveWindowCount() - beforeDomainDriveWindows;
@@ -790,11 +790,13 @@ DisjunctionTopKRun runBulkTermDisjunctionTopK(IndexReader& reader,
     }
     if (segmentCollectors) {
       TopDocsCollector segmentCollector(topK);
-      collectTopKWindowed(segnum, bulk, nullptr, nullptr, segmentCollector, accumulator, segments[segnum].maxDoc());
+      collectTopKWindowed(segnum, bulk, nullptr, segmentCollector, accumulator,
+                          segments[segnum].maxDoc());
       visited += segmentCollector.totalHits();
       merged.merge(segmentCollector);
     } else {
-      collectTopKWindowed(segnum, bulk, nullptr, nullptr, single, accumulator, segments[segnum].maxDoc());
+      collectTopKWindowed(segnum, bulk, nullptr, single, accumulator,
+                          segments[segnum].maxDoc());
     }
   }
 
@@ -1456,7 +1458,7 @@ DisjunctionTopKRun runFilteredBulkTermDisjunctionTopK(
     }
     auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
                                             arrayDocSet, liveOnly);
-    collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector, nullptr,
+    collectTopKWindowed(segnum, bulk, filter.get(), collector, nullptr,
                         segments[segnum].maxDoc(), allowPruning);
   }
 
@@ -1489,7 +1491,7 @@ DisjunctionTopKRun runBulkBooleanTopK(IndexReader& reader,
       continue;
     }
     usedCostOrder |= maxScoreBulk->usesCostAwareWindowOrderForTests();
-    collectTopKWindowed(segnum, bulk, nullptr, nullptr, collector, nullptr,
+    collectTopKWindowed(segnum, bulk, nullptr, collector, nullptr,
                         segments[segnum].maxDoc());
   }
 
@@ -1533,7 +1535,7 @@ DisjunctionTopKRun runMandOptSupplierTopK(IndexReader& reader,
     auto* bulk = supplier->bulkScorer(pool);
     if (bulk != nullptr) {
       sawBulk = true;
-      collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector,
+      collectTopKWindowed(segnum, bulk, filter.get(), collector,
                           allowPruning ? &accumulator : nullptr,
                           segments[segnum].maxDoc(), allowPruning);
       continue;
@@ -5373,7 +5375,7 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
     auto* bulk = supplier->bulkScorer(testIndex.pool);
     ASSERT_NE(bulk, nullptr) << "pure scored conjunction should get the bulk path";
     TopDocsCollector bulkCollector(k);
-    collectTopKWindowed(0, bulk, nullptr, nullptr, bulkCollector, nullptr, segment.maxDoc());
+    collectTopKWindowed(0, bulk, nullptr, bulkCollector, nullptr, segment.maxDoc());
 
     auto expected = sortedCollectorDocs(pullCollector);
     auto actual = sortedCollectorDocs(bulkCollector);
@@ -5387,7 +5389,7 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
   auto* bulk = supplier->bulkScorer(testIndex.pool);
   ASSERT_NE(bulk, nullptr);
   TopDocsCollector exactCollector(10);
-  collectTopKWindowed(0, bulk, nullptr, nullptr, exactCollector, nullptr, segment.maxDoc(),
+  collectTopKWindowed(0, bulk, nullptr, exactCollector, nullptr, segment.maxDoc(),
                       /*allowPruning=*/false);
   EXPECT_EQ(exactCollector.totalHits(), bothCount);
 
@@ -5953,9 +5955,17 @@ TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
     auto* bulk = supplier->bulkScorer(testIndex.pool);
     ASSERT_NE(bulk, nullptr);
     DocSetBuilder bulkBuilder(segment.maxDoc());
+    int64_t bulkCount = countMatchesWindowed(
+        bulk, liveDocs, &bulkBuilder, segment.maxDoc());
+
+    auto* rankingSupplier = bulkScoreWeight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(rankingSupplier, nullptr);
+    auto* rankingBulk = rankingSupplier->bulkScorer(testIndex.pool);
+    ASSERT_NE(rankingBulk, nullptr);
     TopDocsCollector bulkCollector(10);
-    collectTopKWindowed(0, bulk, liveDocs, &bulkBuilder, bulkCollector, nullptr,
+    collectTopKWindowed(0, rankingBulk, liveDocs, bulkCollector, nullptr,
                         segment.maxDoc(), /*allowPruning=*/false);
+    ASSERT_EQ(bulkCount, bulkCollector.totalHits());
     auto bulkDomain = bulkBuilder.build();
 
     EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
@@ -6097,7 +6107,7 @@ TEST_F(TermScorerTest, bulkCountDomainConjunctionDenseAndSparseMatchPull) {
   }
 }
 
-TEST_F(TermScorerTest, bulkTopKWithBuilderPinsThetaAndMatchesPullDomain) {
+TEST_F(TermScorerTest, bulkDomainAndTopKTwoPassMatchPull) {
   CollectionHelper helper("main");
   addMaxScoreDisjunctionDocs(helper);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -6127,10 +6137,21 @@ TEST_F(TermScorerTest, bulkTopKWithBuilderPinsThetaAndMatchesPullDomain) {
   auto* bulk = supplier->bulkScorer(pool);
   ASSERT_NE(bulk, nullptr);
   DocSetBuilder bulkBuilder(segment.maxDoc());
+  int64_t bulkCount = countMatchesWindowed(
+      bulk, nullptr, &bulkBuilder, segment.maxDoc());
+
+  auto* rankingSupplier = bulkWeight->scorerSupplier(pool, segment);
+  ASSERT_NE(rankingSupplier, nullptr);
+  auto* rankingBulk = rankingSupplier->bulkScorer(pool);
+  ASSERT_NE(rankingBulk, nullptr);
   TopDocsCollector bulkCollector(topK);
   MaxScoreAccumulator accumulator;
-  collectTopKWindowed(0, bulk, nullptr, &bulkBuilder, bulkCollector, &accumulator,
+  int64_t before = bulkCollector.totalHits();
+  collectTopKWindowed(0, rankingBulk, nullptr, bulkCollector, &accumulator,
                       segment.maxDoc(), /*allowPruning=*/true);
+  int64_t after = bulkCollector.totalHits();
+  ASSERT_GE(bulkCount, after - before);
+  bulkCollector.hitCount += bulkCount - (after - before);
   auto bulkDomainSet = bulkBuilder.build();
 
   EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());

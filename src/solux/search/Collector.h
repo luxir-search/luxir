@@ -550,28 +550,18 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
 }
 
-// allowPruning=false pins theta at lowest so the bulk scorer must visit every
-// matching doc (exact total counts). The collector's rising min-competitive
-// value is deliberately NOT forwarded in that mode - skipped docs cannot be
-// counted. Callers should also pass accumulator=nullptr then, so this
-// segment's threshold does not leak to sibling segments.
+// Rank score windows into a top-k collector. This is intentionally only a
+// ranking primitive; callers that need an exact count or materialized domain
+// compose it with countMatchesWindowed using an independent scorer supplier.
+// allowPruning=false pins theta at lowest so every match is scored.
 template <typename Collector>
 void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
-                         DocSetBuilder* builder, Collector& collector,
-                         MaxScoreAccumulator* accumulator,
+                         Collector& collector, MaxScoreAccumulator* accumulator,
                          int32_t maxDoc, bool allowPruning = true) {
   static_assert(requires(Collector& c) { c.minCompetitiveVal; },
                 "collectTopKWindowed is only for score top-k collectors");
 
   assert(bulk != nullptr);
-  // A domain builder pins theta (exhaustive) and keeps this segment's rising
-  // threshold out of the accumulator; both decisions hoist out of the per-doc
-  // loop so the builder-free path's inner loop stays untouched.
-  if (builder != nullptr) {
-    allowPruning = false;
-    accumulator = nullptr;
-  }
-  int64_t startHitCount = collector.totalHits();
   int32_t cursor = 0;
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
@@ -590,11 +580,6 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
         : localTheta;
     int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc, theta);
 
-    if (builder != nullptr) {
-      for (int32_t i = 0; i < window.size; i++) {
-        builder->add(window.docs[(size_t) i]);
-      }
-    }
     for (int32_t i = 0; i < window.size; i++) {
       float oldMinCompetitiveVal = collector.minCompetitiveVal;
       collector.collect(segnum, window.docs[(size_t) i], window.scores[(size_t) i]);
@@ -609,7 +594,6 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
     assert(next > cursor);
     cursor = next;
   }
-  assert(builder == nullptr || collector.totalHits() - startHitCount == builder->card());
 }
 
 } // namespace solux

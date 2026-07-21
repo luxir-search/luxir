@@ -654,10 +654,12 @@ public:
     if (limit > 0 || topDocsReq.get_scores) {
       requestFlags |= Query::NEED_SCORES;
     }
-    // Competitive-score pruning requires a score-ranked heap and no consumer
-    // that needs the complete match domain.
-    bool allowPruning = limit > 0 && !topDocsReq.get_number
-        && !parsedSorts.useFieldSort && topDocsReq.ops.empty();
+    // Competitive-score pruning requires a score-ranked heap. Sub-ops permit
+    // pruning because a separate exhaustive windowed pass produces their
+    // complete match domain and exact count before the ranking pass. Match-all
+    // reuses the incoming domain and its cardinality instead.
+    bool allowPruning = limit > 0 && !parsedSorts.useFieldSort
+        && (topDocsReq.ops.empty() ? !topDocsReq.get_number : true);
     if (allowPruning) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
