@@ -6,9 +6,12 @@
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/OrdColReader.h"
 #include "solux/reader/StrColReader.h"
+#include "solux/reader/TermsEnum.h"
 #include "solux/search/OrdMap.h"
 #include "solux/util/MemPool.h"
 #include "solux/util/solux_util.h"
+#include <bit>
+#include <cstring>
 #include <memory>
 #include <vector>
 #include <limits>
@@ -23,6 +26,8 @@ public:
 
   // Set the current segment for this comparator
   virtual void setSegment(int32_t segment, PostingsReader* reader) = 0;
+
+  virtual void setBottom(int32_t slot) { unused(slot); }
 
   // compare new document to bottom slot
   virtual int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) = 0;
@@ -293,6 +298,230 @@ public:
   }
   
   ~GlobalOrdComparator() override = default;
+};
+
+class SegmentOrdComparator : public FieldComparator {
+  struct Slot {
+    int32_t ord = 0;
+    int32_t ordGen = -1;
+    char* term = nullptr;
+    char* buffer = nullptr;
+    uint32_t length = 0;
+    uint32_t capacity = 0;
+  };
+
+  std::string fieldName;
+  MemPool termPool;
+  MemPool enumPool;
+  MemPool::save_point enumPoolStart;
+  SegFieldInfo fieldInfo{};
+  std::optional<OrdColReader> reader;
+  std::optional<TermsEnum> termsEnum;
+  std::vector<Slot> slots;
+  int32_t currentSegment = -1;
+  int32_t bottomOrd = 0;
+  int32_t sortMultiplier;
+  int32_t missingSortCmp;
+  bool bottomMissing = true;
+  bool bottomExact = false;
+
+  static int compareTerms(std::string_view a, std::string_view b) {
+    size_t len = std::min(a.size(), b.size());
+    int cmp = memcmp(a.data(), b.data(), len);
+    if (cmp != 0) return cmp;
+    return (a.size() > b.size()) - (a.size() < b.size());
+  }
+
+  std::string_view term(const Slot& slot) const {
+    assert(slot.ord != 0);
+    assert(slot.term != nullptr);
+    return {slot.term, slot.length};
+  }
+
+  int compareMissing(bool aMissing, bool bMissing) const {
+    if (aMissing == bMissing) return 0;
+    return aMissing ? missingSortCmp : -missingSortCmp;
+  }
+
+  int compareSlots(const Slot& a, const Slot& b) const {
+    bool aMissing = a.ord == 0;
+    bool bMissing = b.ord == 0;
+    if (aMissing || bMissing) return compareMissing(aMissing, bMissing);
+    if (a.ordGen == b.ordGen) {
+      return (a.ord > b.ord) - (a.ord < b.ord);
+    }
+    return compareTerms(term(a), term(b));
+  }
+
+  void setMissing(Slot& slot) {
+    slot.ord = 0;
+    slot.ordGen = -1;
+    slot.term = nullptr;
+    slot.length = 0;
+  }
+
+  void copyTerm(Slot& slot, std::string_view value) {
+    if (slot.capacity < value.size() || slot.buffer == nullptr) {
+      size_t capacity = std::bit_ceil(std::max<size_t>(8, value.size()));
+      slot.buffer = termPool.alloc(capacity);
+      slot.capacity = (uint32_t)capacity;
+    }
+    if (!value.empty()) memmove(slot.buffer, value.data(), value.size());
+    slot.term = slot.buffer;
+    slot.length = (uint32_t)value.size();
+  }
+
+  int32_t maxOrdAt(int32_t docid) const {
+    const DocsReader& docs = reader->docsReader();
+    int32_t docRank;
+    if (!docs.hasBitset()) {
+      docRank = docid;
+    } else {
+      screaming::BitSet::Iterator iter(docs.bitset());
+      if (iter.advance(docid) != docid) return 0;
+      docRank = iter.rank();
+    }
+    auto [start, end] = reader->getStartEndValueRank(docRank);
+    assert(start < end);
+    OrdColReader::PointOrds ords(*reader);
+    return ords.valueAt(end - 1);
+  }
+
+  int32_t selectedOrd(int32_t docid) const {
+    if (!reader.has_value()) return 0;
+    if (!reader->multiValued()) return reader->ordAt(docid);
+    return sortMultiplier > 0 ? reader->firstOrdAt(docid) : maxOrdAt(docid);
+  }
+
+public:
+  SegmentOrdComparator(const std::string& fieldName, int numHits,
+                       bool reversed, MissingValue missingValue)
+    : fieldName(fieldName),
+      enumPoolStart(enumPool.getSavePoint()),
+      slots(numHits),
+      sortMultiplier(reversed ? -1 : 1),
+      // GlobalOrdComparator keeps its missing sentinel at the requested edge.
+      missingSortCmp((missingValue == MISSING_FIRST ? -1 : 1) * sortMultiplier) {}
+
+  void setSegment(int32_t segment, PostingsReader* postingsReader) override {
+    termsEnum.reset();
+    reader.reset();
+    enumPool.rewind(enumPoolStart);
+    fieldInfo = {};
+    currentSegment = segment;
+
+    if (!postingsReader) return;
+
+    FieldReader fieldReader(enumPool, *postingsReader);
+    if (!fieldReader.seek(fieldName)) return;
+    fieldReader.readFieldInfo(fieldInfo);
+    if (fieldInfo.nTerms == 0 || fieldInfo.columnLoc.offset() == 0 ||
+        fieldInfo.ordFormat == SegFieldInfo::ORD_NONE) {
+      return;
+    }
+    reader.emplace(*postingsReader, fieldInfo);
+    termsEnum.emplace(enumPool, *postingsReader, fieldInfo);
+  }
+
+  void setBottom(int32_t slot) override {
+    assert(slot >= 0 && slot < (int32_t)slots.size());
+    Slot& bottom = slots[slot];
+    bottomMissing = bottom.ord == 0;
+    bottomExact = false;
+    bottomOrd = 0;
+    if (bottomMissing || !termsEnum.has_value()) return;
+
+    if (bottom.ordGen == currentSegment) {
+      bottomOrd = bottom.ord;
+      bottomExact = true;
+      return;
+    }
+
+    std::string_view value = term(bottom);
+    if (!termsEnum->seekCeil(value)) {
+      assert(fieldInfo.nTerms <= INT32_MAX);
+      bottomOrd = (int32_t)fieldInfo.nTerms;
+      return;
+    }
+    if (termsEnum->term() == value) {
+      bottomOrd = (int32_t)termsEnum->ord() + 1;
+      bottomExact = true;
+      bottom.ord = bottomOrd;
+      bottom.ordGen = currentSegment;
+    } else {
+      bottomOrd = (int32_t)termsEnum->ord();
+    }
+  }
+
+  int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) override {
+    unused(docA, docB);
+    assert(slotA >= 0 && slotA < (int32_t)slots.size());
+    assert(slotB >= 0 && slotB < (int32_t)slots.size());
+    return sortMultiplier * compareSlots(slots[slotA], slots[slotB]);
+  }
+
+  SOLUX_NOINLINE int compareBottom(int32_t bottomSlot, segdoc bottomDoc,
+                                   segdoc newDoc) override {
+    unused(bottomDoc);
+    assert(bottomSlot >= 0 && bottomSlot < (int32_t)slots.size());
+    assert(bottomMissing == (slots[bottomSlot].ord == 0));
+    int32_t docOrd = selectedOrd(newDoc.docId());
+    bool docMissing = docOrd == 0;
+    int cmp;
+    if (bottomMissing || docMissing) {
+      cmp = compareMissing(bottomMissing, docMissing);
+    } else if (bottomExact) {
+      cmp = (bottomOrd > docOrd) - (bottomOrd < docOrd);
+    } else {
+      cmp = bottomOrd >= docOrd ? 1 : -1;
+    }
+    return sortMultiplier * cmp;
+  }
+
+  void copy(int32_t slot, segdoc doc) override {
+    assert(slot >= 0 && slot < (int32_t)slots.size());
+    Slot& target = slots[slot];
+    int32_t ord = selectedOrd(doc.docId());
+    if (ord == 0) {
+      setMissing(target);
+      return;
+    }
+    assert(termsEnum.has_value());
+    termsEnum->seekOrd(ord - 1);
+    copyTerm(target, (std::string_view)termsEnum->term());
+    target.ord = ord;
+    target.ordGen = currentSegment;
+  }
+
+  int compare(int32_t slotA, segdoc docA, FieldComparator& other,
+              int32_t slotB, segdoc docB) override {
+    unused(docA, docB);
+    assert(dynamic_cast<SegmentOrdComparator*>(&other) != nullptr);
+    auto* otherOrd = static_cast<SegmentOrdComparator*>(&other);
+    assert(fieldName == otherOrd->fieldName);
+    assert(slotA >= 0 && slotA < (int32_t)slots.size());
+    assert(slotB >= 0 && slotB < (int32_t)otherOrd->slots.size());
+    return sortMultiplier * compareSlots(slots[slotA], otherOrd->slots[slotB]);
+  }
+
+  void copy(int32_t slot, FieldComparator& other, int32_t otherSlot,
+            segdoc otherDoc) override {
+    unused(otherDoc);
+    assert(dynamic_cast<SegmentOrdComparator*>(&other) != nullptr);
+    auto* otherOrd = static_cast<SegmentOrdComparator*>(&other);
+    assert(fieldName == otherOrd->fieldName);
+    assert(slot >= 0 && slot < (int32_t)slots.size());
+    assert(otherSlot >= 0 && otherSlot < (int32_t)otherOrd->slots.size());
+    Slot& target = slots[slot];
+    const Slot& source = otherOrd->slots[otherSlot];
+    if (source.ord == 0) {
+      setMissing(target);
+      return;
+    }
+    copyTerm(target, otherOrd->term(source));
+    target.ord = source.ord;
+    target.ordGen = source.ordGen;
+  }
 };
 
 // A comparator for non-indexed string columns that compares by value

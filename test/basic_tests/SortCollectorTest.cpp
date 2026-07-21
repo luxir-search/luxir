@@ -11,9 +11,29 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 
 using namespace solux;
 using namespace solux::test;
+
+namespace {
+
+class StringSortModeGuard {
+  StringSortMode saved;
+
+public:
+  explicit StringSortModeGuard(StringSortMode mode)
+      : saved(SortField::setStringSortModeForTests(mode)) {}
+  ~StringSortModeGuard() { SortField::setStringSortModeForTests(saved); }
+};
+
+struct StringSortResult {
+  std::vector<std::string> ids;
+  std::vector<float> scores;
+  bool operator==(const StringSortResult&) const = default;
+};
+
+} // namespace
 
 class SortCollectorTest : public SoluxTest {
 protected:
@@ -487,6 +507,273 @@ TEST_F(SortCollectorTest, SortByStringField) {
   // alice docs should be in docid order (reverse of ascending)
   ASSERT_EQ("alice", nameCol3.v[3]);
   ASSERT_EQ("alice", nameCol3.v[4]);
+}
+
+TEST_F(SortCollectorTest, SegmentOrdMatchesGlobalAcrossDictionaryShapes) {
+  using Value = std::optional<std::string>;
+  struct Corpus {
+    std::string name;
+    std::vector<std::vector<Value>> segments;
+  };
+  std::vector<Corpus> corpora = {
+    {"identical", {{"", "a", "m", std::nullopt},
+                    {"", "a", "m", std::nullopt}}},
+    {"disjoint", {{"", "a", "b", std::nullopt},
+                   {"x", "y", "z", std::nullopt}}},
+    {"interleaved", {{"", "b", "d", std::nullopt},
+                      {"a", "c", "e", std::nullopt}}},
+    {"partial", {{"", "b", "d", "shared", std::nullopt},
+                  {"a", "d", "shared", "z", std::nullopt}}},
+  };
+
+  CollectionHelper helper;
+  auto run = [&](StringSortMode mode, qb::SortDir direction, int32_t limit) {
+    StringSortModeGuard guard(mode);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(limit).getScores().allQuery().fields({"id_s"});
+    qb::sort(cur, "name_s", direction);
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* docs = req->docList("q");
+    const auto& scoreCol =
+        std::get<solux::api::ColFloat>(docs->columns.at("_score_").kind).v;
+    return StringSortResult{
+        resultIds(*req), std::vector<float>(scoreCol.begin(), scoreCol.end())};
+  };
+
+  for (const auto& corpus : corpora) {
+    helper.clear();
+    int32_t docCount = 0;
+    for (size_t segment = 0; segment < corpus.segments.size(); segment++) {
+      const auto& values = corpus.segments[segment];
+      for (size_t doc = 0; doc < values.size(); doc++) {
+        std::string id = corpus.name + "_" + std::to_string(segment) + "_" +
+                         std::to_string(doc);
+        UpdateMessage::CommitType update = doc + 1 == values.size()
+            ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
+        if (values[doc].has_value()) {
+          helper.index(flatdoc("id_s", id, "name_s", *values[doc]), update);
+        } else {
+          helper.index(flatdoc("id_s", id), update);
+        }
+        docCount++;
+      }
+    }
+
+    for (qb::SortDir direction : {qb::ASC, qb::DESC}) {
+      for (int32_t limit : {3, docCount, docCount + 3}) {
+        StringSortResult expected = run(StringSortMode::GLOBAL, direction, limit);
+        StringSortResult actual = run(StringSortMode::SEGMENT, direction, limit);
+        EXPECT_EQ(expected, actual)
+            << corpus.name << " direction=" << (direction == qb::ASC ? "asc" : "desc")
+            << " limit=" << limit;
+      }
+    }
+  }
+}
+
+TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a", "name_s", "b"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "b", "name_s", "a"), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  size_t cacheSize = reader->getOrdMapCacheSize();
+
+  StrFieldType fieldType("name_s");
+  StringSortModeGuard segmentGuard(StringSortMode::SEGMENT);
+  SortField sortField("name_s", fieldType, SortField::ASC);
+  {
+    StringSortModeGuard globalGuard(StringSortMode::GLOBAL);
+    auto comparator = sortField.createComparator(2, reader.get());
+    EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(comparator.get()));
+  }
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").limit(2).allQuery().fields({"id_s"});
+  qb::sort(cur, "name_s", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"b", "a"}), resultIds(*req));
+  EXPECT_EQ(cacheSize, reader->getOrdMapCacheSize());
+}
+
+TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "exact", "name_s", "b"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "between", "name_s", "c"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "before", "name_s", "0"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "past", "name_s", "z"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "empty", "name_s", ""), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "missing"), UpdateMessage::COMMIT);
+
+  helper.index(flatdoc("id_s", "a", "name_s", "a"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "name_s", "b"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d", "name_s", "d"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "missing2"), UpdateMessage::COMMIT);
+
+  helper.index(flatdoc("id_s", "empty2", "name_s", ""), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "q", "name_s", "q"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "missing3"), UpdateMessage::COMMIT);
+
+  helper.index(flatdoc("id_s", "absent"), UpdateMessage::COMMIT);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto compare = [&](int32_t pivotDoc, int32_t targetSegment, int32_t candidateDoc,
+                     FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST,
+                     bool reversed = false) {
+    SegmentOrdComparator comparator("name_s", 1, reversed, missing);
+    comparator.setSegment(0, &reader->segments()[0].postingsReader());
+    comparator.copy(0, segdoc(0, pivotDoc));
+    comparator.setSegment(targetSegment,
+                          &reader->segments()[targetSegment].postingsReader());
+    comparator.setBottom(0);
+    return comparator.compareBottom(0, segdoc(0, pivotDoc),
+                                    segdoc(targetSegment, candidateDoc));
+  };
+
+  EXPECT_GT(compare(0, 1, 0), 0);  // exact promotion: b > a
+  EXPECT_EQ(compare(0, 1, 1), 0);  // exact promotion: b == b
+  EXPECT_LT(compare(0, 1, 2), 0);  // exact promotion: b < d
+  EXPECT_GT(compare(1, 1, 1), 0);  // absent pivot c > lower bound b
+  EXPECT_LT(compare(1, 1, 2), 0);  // absent pivot c < ceiling d
+  EXPECT_LT(compare(2, 1, 0), 0);  // pivot before first term
+  EXPECT_GT(compare(3, 1, 2), 0);  // pivot past last term
+  EXPECT_LT(compare(1, 1, 3), 0);  // missing candidate sorts last
+  EXPECT_GT(compare(5, 1, 0), 0);  // missing bottom sorts last
+  EXPECT_EQ(compare(5, 1, 3), 0);
+  EXPECT_GT(compare(1, 1, 3, FieldComparator::MISSING_FIRST), 0);
+  EXPECT_LT(compare(5, 1, 0, FieldComparator::MISSING_FIRST), 0);
+  EXPECT_LT(compare(4, 2, 2), 0);  // empty term is not missing
+  EXPECT_GT(compare(5, 2, 0), 0);
+  EXPECT_LT(compare(1, 3, 0), 0);  // absent field: every candidate is missing
+  EXPECT_LT(compare(0, 1, 0, FieldComparator::MISSING_LAST, true), 0);
+}
+
+TEST_F(SortCollectorTest, SegmentOrdCollectorReuseAcrossAdversarialSegments) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "s0b", "name_s", "b"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "s0c", "name_s", "c"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "s0z", "name_s", "z"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "s1m", "name_s", "m"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "s1n", "name_s", "n"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "missing"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "s3a", "name_s", "a"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "s3d", "name_s", "d"), UpdateMessage::COMMIT);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  StrFieldType fieldType("name_s");
+  SortField field("name_s", fieldType, SortField::ASC,
+                  FieldComparator::MISSING_LAST, StringSortMode::SEGMENT);
+  FieldSortCollector collector(4, columnPlan(field), reader.get());
+  auto collectSegment = [&](int32_t segment) {
+    auto& postings = reader->segments()[segment].postingsReader();
+    collector.setSegment(segment, &postings);
+    for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
+      collector.collect(segment, doc, 1.0f);
+    }
+  };
+  for (int32_t segment : {0, 2, 1, 3}) collectSegment(segment);
+
+  auto results = collector.sort();
+  std::vector<segdoc> actual;
+  for (const auto& result : results) actual.push_back(result.doc);
+  EXPECT_EQ((std::vector<segdoc>{{3, 0}, {0, 0}, {0, 1}, {3, 1}}), actual);
+}
+
+TEST_F(SortCollectorTest, SegmentOrdPairwiseMergeOwnsCopiedTerms) {
+  CollectionHelper helper;
+  std::vector<std::vector<std::optional<std::string>>> values = {
+      {{"b"}, {"f"}, std::nullopt},
+      {{"a"}, {"e"}, {"i"}},
+      {{"c"}, {"g"}, std::nullopt},
+      {{"d"}, {"h"}, {"i"}},
+  };
+  std::vector<std::pair<segdoc, std::optional<std::string>>> model;
+  for (size_t segment = 0; segment < values.size(); segment++) {
+    for (size_t doc = 0; doc < values[segment].size(); doc++) {
+      std::string id = "s" + std::to_string(segment) + "d" + std::to_string(doc);
+      UpdateMessage::CommitType update = doc + 1 == values[segment].size()
+          ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
+      if (values[segment][doc].has_value()) {
+        helper.index(flatdoc("id_s", id, "name_s", *values[segment][doc]), update);
+      } else {
+        helper.index(flatdoc("id_s", id), update);
+      }
+      model.emplace_back(segdoc((int32_t)segment, (int32_t)doc), values[segment][doc]);
+    }
+  }
+  std::sort(model.begin(), model.end(), [](const auto& a, const auto& b) {
+    if (!a.second.has_value() || !b.second.has_value()) {
+      if (a.second.has_value() != b.second.has_value()) return a.second.has_value();
+    } else if (*a.second != *b.second) {
+      return *a.second < *b.second;
+    }
+    return a.first < b.first;
+  });
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  StrFieldType fieldType("name_s");
+  SortField field("name_s", fieldType, SortField::ASC,
+                  FieldComparator::MISSING_LAST, StringSortMode::SEGMENT);
+  auto run = [&](bool reverse) {
+    auto makeCollector = [&]() {
+      return std::make_unique<FieldSortCollector>(8, columnPlan(field), reader.get());
+    };
+    auto left = makeCollector();
+    auto right = makeCollector();
+    auto collect = [&](FieldSortCollector& collector, int32_t segment) {
+      auto& postings = reader->segments()[segment].postingsReader();
+      collector.setSegment(segment, &postings);
+      for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
+        collector.collect(segment, doc, 1.0f);
+      }
+    };
+    collect(*left, 0);
+    collect(*left, 2);
+    collect(*right, 1);
+    collect(*right, 3);
+    auto& destination = reverse ? right : left;
+    auto& source = reverse ? left : right;
+    destination->merge(*source);
+    source.reset();
+    auto sorted = destination->sort();
+    std::vector<segdoc> actual;
+    for (const auto& result : sorted) actual.push_back(result.doc);
+    return actual;
+  };
+
+  std::vector<segdoc> expected;
+  for (size_t i = 0; i < 8; i++) expected.push_back(model[i].first);
+  EXPECT_EQ(expected, run(false));
+  EXPECT_EQ(expected, run(true));
+}
+
+TEST_F(SortCollectorTest, SegmentOrdMultiValuedSelectsMinAscAndMaxDesc) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "d1", "tags_ss", vecs("m", "z")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d2", "tags_ss", vecs("a", "y")),
+               UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "d3", "tags_ss", vecs("b", "c")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d4"), UpdateMessage::COMMIT);
+
+  auto run = [&](qb::SortDir direction) {
+    StringSortModeGuard guard(StringSortMode::SEGMENT);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
+    qb::sort(cur, "tags_ss", direction);
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
+
+  EXPECT_EQ((std::vector<std::string>{"d2", "d3", "d1", "d4"}), run(qb::ASC));
+  EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d3", "d4"}), run(qb::DESC));
 }
 
 TEST_F(SortCollectorTest, SortByPriceAscending) {

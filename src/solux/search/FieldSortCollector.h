@@ -90,6 +90,7 @@ public:
         clause.comparator->setSegment(segment, reader);
       }
     }
+    if (topCount > 0 && pq->size() == (size_t)topCount) setBottom();
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier),
@@ -177,6 +178,7 @@ private:
     int32_t slot = (int32_t)pq->size();
     copy(slot, doc);
     pq->insert(SortDoc(doc, score, slot));
+    if (pq->size() == (size_t)topCount) setBottom();
   }
 
   SOLUX_NOINLINE int compareCurrentDoc(const SortDoc& bottom, segdoc doc, float score) const {
@@ -188,6 +190,14 @@ private:
     copy(bottom.slot, doc);
     bottom = SortDoc(doc, score, bottom.slot);
     pq->updateTop();
+    setBottom();
+  }
+
+  void setBottom() {
+    int32_t slot = pq->top().slot;
+    for (auto& clause : clauses) {
+      if (clause.comparator != nullptr) clause.comparator->setBottom(slot);
+    }
   }
 
 public:

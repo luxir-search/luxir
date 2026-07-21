@@ -3,12 +3,21 @@
 #include "solux/search/FieldComparator.h"
 #include "solux/search/IndexReader.h"
 #include "solux/schema/FieldType.h"
+#include "solux/util/log.h"
+#include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace solux {
+
+enum class StringSortMode : uint8_t {
+    DEFAULT,
+    GLOBAL,
+    SEGMENT
+};
 
 class SortField {
 public:
@@ -22,15 +31,22 @@ private:
     SortOrder order;
     FieldComparator::MissingValue missingValue;
     const FieldType* fieldType;
+    StringSortMode stringSortMode;
+    inline static std::atomic<StringSortMode> stringSortModeOverride =
+        StringSortMode::DEFAULT;
     
 public:
     // Single constructor that always requires FieldType reference
     SortField(std::string_view field, const FieldType& fieldType, SortOrder order = DESC,
-              FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST)
+              FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST,
+              StringSortMode stringSortMode = configuredStringSortMode())
         : fieldName(std::string(field)),
           order(order),
           missingValue(missing),
-          fieldType(&fieldType) {}
+          fieldType(&fieldType),
+          stringSortMode(stringSortMode) {
+        assert(stringSortMode != StringSortMode::DEFAULT);
+    }
     
 public:
     
@@ -43,6 +59,28 @@ public:
         return order == DESC; 
     }
     FieldComparator::MissingValue getMissingValue() const { return missingValue; }
+    StringSortMode getStringSortMode() const { return stringSortMode; }
+
+    static StringSortMode configuredStringSortMode() {
+        StringSortMode override = stringSortModeOverride.load();
+        if (override != StringSortMode::DEFAULT) return override;
+
+        const char* configured = std::getenv("SOLUX_STRING_SORT");
+        if (configured == nullptr || *configured == '\0' ||
+            std::string_view(configured) == "global") {
+            return StringSortMode::GLOBAL;
+        }
+        if (std::string_view(configured) == "segment") {
+            return StringSortMode::SEGMENT;
+        }
+        LOG_WARN("Ignoring invalid SOLUX_STRING_SORT='{}'; expected global or segment",
+                 configured);
+        return StringSortMode::GLOBAL;
+    }
+
+    static StringSortMode setStringSortModeForTests(StringSortMode value) {
+        return stringSortModeOverride.exchange(value);
+    }
     
     std::unique_ptr<FieldComparator> createComparator(int numHits, IndexReader* reader = nullptr) const {
         // Handle regular field types based on FieldType
@@ -64,6 +102,12 @@ public:
             case FieldType::Type::TEXT: {
                 // Use FieldType information to determine if this is an indexed string field
                 if (const_cast<FieldType*>(fieldType)->isSet(FieldType::INDEX_DOCS)) {
+                    if (stringSortMode == StringSortMode::SEGMENT &&
+                        (!reader || reader->segments().size() > 1)) {
+                        return std::make_unique<SegmentOrdComparator>(
+                            fieldName, numHits, isReversed(), missingValue
+                        );
+                    }
                     // Use GlobalOrdComparator for indexed string fields
                     // Build OrdMap only if needed (multi-segment case)
                     std::shared_ptr<OrdMap> ordMap;

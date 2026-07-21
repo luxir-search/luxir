@@ -2,12 +2,22 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/search/SortField.h"
 
 using namespace solux;
 using namespace solux::test;
 
 static void BM_StringSort(benchmark::State& state, int64_t nDocs,
-                          std::string_view shape, qb::SortDir direction) {
+                          std::string_view shape, qb::SortDir direction,
+                          StringSortMode mode) {
+  class ModeGuard {
+    StringSortMode saved;
+  public:
+    explicit ModeGuard(StringSortMode mode)
+        : saved(SortField::setStringSortModeForTests(mode)) {}
+    ~ModeGuard() { SortField::setStringSortModeForTests(saved); }
+  } guard(mode);
+
   if (solux::unit_tests) nDocs = 200;
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
@@ -51,7 +61,11 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
 static constexpr int64_t STRING_SORT_DOCS = 10'000'000;
 static constexpr const char* STRING_SORT_SHAPE = "9555";
 
-SOLUX_BENCHMARK_CAPTURE(BM_StringSort, asc, STRING_SORT_DOCS,
-                        STRING_SORT_SHAPE, qb::ASC);
-SOLUX_BENCHMARK_CAPTURE(BM_StringSort, desc, STRING_SORT_DOCS,
-                        STRING_SORT_SHAPE, qb::DESC);
+SOLUX_BENCHMARK_CAPTURE(BM_StringSort, global_asc, STRING_SORT_DOCS,
+                        STRING_SORT_SHAPE, qb::ASC, StringSortMode::GLOBAL);
+SOLUX_BENCHMARK_CAPTURE(BM_StringSort, global_desc, STRING_SORT_DOCS,
+                        STRING_SORT_SHAPE, qb::DESC, StringSortMode::GLOBAL);
+SOLUX_BENCHMARK_CAPTURE(BM_StringSort, segment_asc, STRING_SORT_DOCS,
+                        STRING_SORT_SHAPE, qb::ASC, StringSortMode::SEGMENT);
+SOLUX_BENCHMARK_CAPTURE(BM_StringSort, segment_desc, STRING_SORT_DOCS,
+                        STRING_SORT_SHAPE, qb::DESC, StringSortMode::SEGMENT);
