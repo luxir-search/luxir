@@ -96,6 +96,175 @@ OpCursor& facetMissing(OpCursor& cur) {
   std::get<solux::api::FieldFacet>(cur.rawOp().kind).missing = true;
   return cur;
 }
+
+enum class FilteredCountShape {
+  TERM,
+  INTERSECTION,
+  UNION,
+  PHRASE,
+};
+
+std::string_view filteredCountShapeName(FilteredCountShape shape) {
+  switch (shape) {
+    case FilteredCountShape::TERM: return "term";
+    case FilteredCountShape::INTERSECTION: return "intersection";
+    case FilteredCountShape::UNION: return "union";
+    case FilteredCountShape::PHRASE: return "phrase";
+  }
+  std::unreachable();
+}
+
+api::Query filteredCountBody(std::pmr::memory_resource& mr,
+                             FilteredCountShape shape) {
+  switch (shape) {
+    case FilteredCountShape::TERM:
+      return qb::match(mr, "body_w", "alpha");
+    case FilteredCountShape::INTERSECTION:
+      return qb::boolean(mr,
+          {qb::match(mr, "body_w", "alpha"),
+           qb::match(mr, "body_w", "beta")});
+    case FilteredCountShape::UNION:
+      return qb::boolean(mr, {},
+          {qb::match(mr, "body_w", "beta"),
+           qb::match(mr, "body_w", "gamma")});
+    case FilteredCountShape::PHRASE:
+      return qb::phraseWords(mr, "body_w", {"quick", "fox"});
+  }
+  std::unreachable();
+}
+
+class CountSkipStatsGuard {
+  bool saved;
+
+public:
+  CountSkipStatsGuard() : saved(SkipStats::enabled) {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+
+  ~CountSkipStatsGuard() {
+    SkipStats::enabled = saved;
+  }
+};
+
+struct FilteredCountResult {
+  int64_t count;
+  int64_t denseWindows;
+  int64_t disjGroupWindows;
+  int64_t sparseFallbacks;
+};
+
+enum class FilteredCountPath {
+  FOLDED,
+  PLAIN_INTERSECTION,
+  MATERIALIZED,
+};
+
+FilteredCountResult runFilteredCount(SearchEngine& engine,
+                                     FilteredCountShape shape,
+                                     std::string_view filterTerm,
+                                     FilteredCountPath path) {
+  auto req = localReq(engine);
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(0);
+  api::Query body = filteredCountBody(cur.mr(), shape);
+  if (path == FilteredCountPath::PLAIN_INTERSECTION) {
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        {body, qb::match(cur.mr(), "filter_w", filterTerm)});
+  } else {
+    cur.rawQuery() = body;
+    cur.matchFilter("filter", "filter_w", filterTerm);
+  }
+
+  CountSkipStatsGuard statsGuard;
+  {
+    TopDocsFilterFoldGuard foldGuard(path == FilteredCountPath::MATERIALIZED);
+    req->execute(false);
+  }
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return {
+    req->getMatchCount("q"),
+    SkipStats::conjDenseCountWindows,
+    SkipStats::conjDisjGroupCountWindows,
+    SkipStats::conjCountFallbacks,
+  };
+}
+
+void indexFilteredCountDocs(CollectionHelper& helper, bool multiSegment) {
+  constexpr int32_t segmentDocs = DocsEnum::L1_DOCS + 193;
+  int32_t segmentCount = multiSegment ? 2 : 1;
+  for (int32_t segment = 0; segment < segmentCount; segment++) {
+    std::vector<Doc> docs;
+    docs.reserve(segmentDocs);
+    for (int32_t local = 0; local < segmentDocs; local++) {
+      int32_t doc = segment * segmentDocs + local;
+      std::string body;
+      if ((doc & 1) == 0) body += "alpha ";
+      if ((doc % 3) != 0) body += "beta ";
+      if ((doc % 5) != 0) body += "gamma ";
+      body += (doc % 4) == 0 ? "quick fox" : "quick noise fox";
+
+      std::string filter = (doc % 8) == 0 ? "other" : "fat";
+      if ((doc % 1021) == 0) filter += " rare";
+      docs.push_back(flatdoc(
+          "id", "fc_" + std::to_string(doc),
+          "body_w", body, "filter_w", filter));
+    }
+    auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
+    ASSERT_TRUE(result.success) << result.error_message;
+  }
+}
+
+void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
+  CollectionHelper helper;
+  indexFilteredCountDocs(helper, multiSegment);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), multiSegment ? 2u : 1u);
+
+  constexpr std::array<FilteredCountShape, 4> shapes = {
+    FilteredCountShape::TERM,
+    FilteredCountShape::INTERSECTION,
+    FilteredCountShape::UNION,
+    FilteredCountShape::PHRASE,
+  };
+  constexpr std::array<std::string_view, 2> filters = {"fat", "rare"};
+  for (FilteredCountShape shape : shapes) {
+    int64_t fatCount = 0;
+    for (std::string_view filter : filters) {
+      auto folded = runFilteredCount(
+          engine, shape, filter, FilteredCountPath::FOLDED);
+      auto plain = runFilteredCount(
+          engine, shape, filter, FilteredCountPath::PLAIN_INTERSECTION);
+      auto materialized = runFilteredCount(
+          engine, shape, filter, FilteredCountPath::MATERIALIZED);
+      SCOPED_TRACE(std::string(filteredCountShapeName(shape)) + "/"
+                   + std::string(filter));
+      EXPECT_GT(plain.count, 0);
+      EXPECT_EQ(folded.count, plain.count);
+      EXPECT_EQ(folded.count, materialized.count);
+
+      if (filter == "fat") {
+        fatCount = folded.count;
+        if (shape == FilteredCountShape::PHRASE) {
+          EXPECT_EQ(folded.denseWindows, 0);
+          EXPECT_EQ(folded.disjGroupWindows, 0);
+          EXPECT_EQ(folded.sparseFallbacks, 0);
+        } else {
+          EXPECT_TRUE(folded.denseWindows > 0
+                      || folded.disjGroupWindows > 0);
+        }
+        if (shape == FilteredCountShape::UNION) {
+          EXPECT_GT(folded.disjGroupWindows, 0);
+        }
+      } else {
+        EXPECT_LT(folded.count, fatCount);
+        EXPECT_EQ(folded.denseWindows, 0);
+        EXPECT_EQ(folded.disjGroupWindows, 0);
+        EXPECT_EQ(folded.sparseFallbacks, 0);
+      }
+    }
+  }
+}
 }  // namespace
 
 class SearchEngineTest : public SoluxTest {
@@ -840,6 +1009,14 @@ TEST_F(SearchEngineTest, topDocsFilterFoldMatchesPassivePath) {
   EXPECT_EQ(folded.count, passive.count);
   EXPECT_EQ(folded.facets, passive.facets);
   expectSameScoreMap(folded.scores, passive.scores);
+}
+
+TEST_F(SearchEngineTest, filteredCountBulkIntersectionSingleSegment) {
+  expectFilteredCountEquivalence(soluxNode->getSearchEngine(), false);
+}
+
+TEST_F(SearchEngineTest, filteredCountBulkIntersectionMultiSegment) {
+  expectFilteredCountEquivalence(soluxNode->getSearchEngine(), true);
 }
 
 TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {

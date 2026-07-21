@@ -39,6 +39,10 @@ struct ScoreWindow {
 // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
 class BulkScorer {
 public:
+  virtual bool willCountDense() const {
+    return false;
+  }
+
   // Produce the next window of verified competitive candidates in [min, max),
   // intersected with filter (null = all), filtered by minCompetitiveScore.
   // Returns the docid to resume from (first window not produced), or PostingsReader::END.

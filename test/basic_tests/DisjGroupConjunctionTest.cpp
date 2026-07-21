@@ -252,16 +252,26 @@ TEST_F(DisjGroupConjunctionTest, bulkAndOpaquePathsMatch) {
     EXPECT_EQ(opaqueScored.ids, bulkScored.ids) << (int) shape;
     EXPECT_EQ(opaqueScored.scores, bulkScored.scores) << (int) shape;
 
-    bool eligible = shape != Shape::FILTER && shape != Shape::MIN_MATCH_TWO
+    // Filtered COUNT now runs through the same windowed disj-group intersection
+    // (filtered-search step 1), so FILTER is count-eligible.  The scored path is
+    // deliberately unchanged, so FILTER stays score-ineligible.  MIN_MATCH_TWO
+    // and PHRASE_MEMBER are ineligible for both (non-decomposable disjunction /
+    // phrase member -> opaque sparse path).
+    bool countEligible = shape != Shape::MIN_MATCH_TWO
+        && shape != Shape::PHRASE_MEMBER;
+    bool scoreEligible = shape != Shape::FILTER && shape != Shape::MIN_MATCH_TWO
         && shape != Shape::PHRASE_MEMBER;
     EXPECT_EQ(0, opaqueCount.groupCountWindows) << (int) shape;
     EXPECT_EQ(0, opaqueScored.groupScoreWindows) << (int) shape;
-    if (eligible) {
+    if (countEligible) {
       EXPECT_GT(bulkCount.groupCountWindows, 0) << (int) shape;
       EXPECT_GT(bulkCount.bulkFillCalls, 0) << (int) shape;
-      EXPECT_GT(bulkScored.groupScoreWindows, 0) << (int) shape;
     } else {
       EXPECT_EQ(0, bulkCount.groupCountWindows) << (int) shape;
+    }
+    if (scoreEligible) {
+      EXPECT_GT(bulkScored.groupScoreWindows, 0) << (int) shape;
+    } else {
       EXPECT_EQ(0, bulkScored.groupScoreWindows) << (int) shape;
     }
   }

@@ -863,14 +863,16 @@ public:
                               leadCost != std::numeric_limits<int64_t>::max());
       }
 
-      // Bulk path for pure scored conjunctions (>= 2 mandatory clauses, nothing
-      // else).  Clauses are created in ascending cost order (the sparsest
-      // leads, as in assembleRequired); any two-phase member bails to the pull
-      // ConjunctionScorer, which owns the verifier machinery.
-      BulkScorer* conjunctionBulkScorer(MemPool& targetPool) {
+      // Build a bulk conjunction from the required clause boundaries. For a
+      // filtered count, filters are ordinary zero-scoring conjuncts and a
+      // constraining optional group is one disjunction conjunct. The scored
+      // path keeps its existing pure-mandatory and single-phase gate.
+      BulkScorer* conjunctionBulkScorer(MemPool& targetPool,
+                                        bool filteredCount) {
         struct Entry {
           int64_t cost;
           Query::ScorerSupplier* supplier;
+          bool optionalGroup;
         };
         boost::container::small_vector<Entry, 16> entries;
         for (auto* source : mandatorySources) {
@@ -878,7 +880,39 @@ public:
           if (supplier == nullptr) {
             return nullptr;  // a required clause cannot match this segment
           }
-          entries.push_back({supplier->cost(), supplier});
+          entries.push_back({supplier->cost(), supplier, false});
+        }
+        if (filteredCount) {
+          for (auto* supplier : filterSuppliers) {
+            if (supplier == nullptr) {
+              return nullptr;
+            }
+            entries.push_back({supplier->cost(), supplier, false});
+          }
+        }
+
+        boost::container::small_vector<Query::ScorerSupplier*, 16>
+            optionalGroupSuppliers;
+        boost::container::small_vector<int64_t, 16> optionalGroupCosts;
+        bool hasOptionalGroup = filteredCount && minShouldMatch >= 1
+            && !optionalSources.empty();
+        if (hasOptionalGroup) {
+          for (auto* source : optionalSources) {
+            auto* supplier = source->scorerSupplier(targetPool, segment);
+            if (supplier == nullptr) {
+              continue;
+            }
+            optionalGroupSuppliers.push_back(supplier);
+            optionalGroupCosts.push_back(supplier->cost());
+          }
+          if (optionalGroupSuppliers.empty()) {
+            return nullptr;
+          }
+          entries.push_back({optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
+                             nullptr, true});
+        }
+        if (entries.size() < 2) {
+          return nullptr;
         }
         int64_t leadCost = std::numeric_limits<int64_t>::max();
         for (auto& e : entries) leadCost = std::min(leadCost, e.cost);
@@ -886,8 +920,29 @@ public:
                   [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
         auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
         for (size_t i = 0; i < entries.size(); i++) {
-          auto* scorer = entries[i].supplier->get(targetPool, leadCost);
-          if (scorer == nullptr || scorer->hasTwoPhase()) {
+          Query::Scorer* scorer;
+          if (entries[i].optionalGroup) {
+            auto* members = targetPool.make_arr<Query::Scorer*>(
+                optionalGroupSuppliers.size());
+            size_t memberCount = 0;
+            for (auto* supplier : optionalGroupSuppliers) {
+              auto* member = supplier->get(targetPool, leadCost);
+              if (member != nullptr) {
+                members[memberCount++] = member;
+              }
+            }
+            if (memberCount == 0) {
+              return nullptr;
+            }
+            scorer = memberCount == 1
+              ? members[0]
+              : targetPool.make<BooleanQuery::DisjunctionScorer>(
+                  targetPool,
+                  std::span<Query::Scorer*>(members, memberCount));
+          } else {
+            scorer = entries[i].supplier->get(targetPool, leadCost);
+          }
+          if (scorer == nullptr || (!filteredCount && scorer->hasTwoPhase())) {
             return nullptr;
           }
           arr[i] = scorer;
@@ -1018,12 +1073,20 @@ public:
             && prohibitedSources.empty() && !filterSuppliers.empty()) {
           return filterOnlyBulkScorer(targetPool);
         }
-        // Scored or not, the bulk intersection remains the right execution for
-        // exact conjunction counts. Unscored clauses contribute zero score and
-        // zero bounds.
+        // Filtered counts use the windowed intersection only when its dense
+        // count path is available. Sparse counts stay on the pull scorer.
+        bool hasFilteredCountBody = !mandatorySources.empty()
+            || (minShouldMatch >= 1 && !optionalSources.empty());
+        if (!needsScores && hasFilteredCountBody
+            && optionalSources.empty() == (minShouldMatch < 1)
+            && prohibitedSources.empty() && !filterSuppliers.empty()
+            && minShouldMatch <= 1) {
+          auto* bulk = conjunctionBulkScorer(targetPool, true);
+          return bulk != nullptr && bulk->willCountDense() ? bulk : nullptr;
+        }
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
-          return conjunctionBulkScorer(targetPool);
+          return conjunctionBulkScorer(targetPool, false);
         }
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
             && !optionalSources.empty() && prohibitedSources.empty()
@@ -1284,11 +1347,40 @@ public:
       return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
     }
 
-    // Single-clause boolean shapes delegate to the wrapped clause; compound
-    // shapes have no cheap exact count (clause overlap is unknown).
+    // Single-clause boolean shapes delegate to the wrapped clause. Filtered
+    // count-only conjunctions exhaust the same per-window bulk intersection
+    // used by collection, with filter clauses kept as lazy zero-score members.
     int64_t count(solux::IndexReader::Segment& segment) override {
-      if (!prohibitedWeights.empty() || !filterWeights.empty() || minShouldMatch > 1) {
+      if (!prohibitedWeights.empty() || minShouldMatch > 1) {
         return -1;
+      }
+      bool hasFilteredCountBody = !mandatoryWeights.empty()
+          || (minShouldMatch >= 1 && !optionalWeights.empty());
+      if (!filterWeights.empty()) {
+        if (!hasFilteredCountBody || needsScores || segment.liveDocs() != nullptr) {
+          return -1;
+        }
+        auto guard = MemPool::threadLocalPoolGuard();
+        auto* supplier = scorerSupplier(guard.pool(), segment);
+        if (supplier == nullptr) {
+          return 0;
+        }
+        auto* bulk = supplier->bulkScorer(guard.pool());
+        if (bulk == nullptr) {
+          return -1;
+        }
+        int64_t count = 0;
+        for (int32_t cursor = 0;
+             cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+          int32_t next = bulk->countNextWindow(
+              count, nullptr, nullptr, cursor, segment.maxDoc());
+          if (next == PostingsReader::END) {
+            break;
+          }
+          assert(next > cursor);
+          cursor = next;
+        }
+        return count;
       }
       if (mandatoryWeights.size() == 1 && optionalWeights.empty()) {
         return mandatoryWeights[0]->count(segment);
@@ -3521,6 +3613,10 @@ public:
       }
       denseCountPath = allTermClauses && maxDoc >= kWindowSize
           && leadCost >= std::max<int64_t>(1, (int64_t) maxDoc / kDenseThresholdInverse);
+    }
+
+    bool willCountDense() const override {
+      return denseCountPath;
     }
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
