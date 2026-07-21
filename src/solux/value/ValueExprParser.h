@@ -153,7 +153,7 @@ private:
     }
     const api::Val& value = **view;
     ValueNode node;
-    node.kind = ValueNodeKind::CONSTANT;
+    node.kind = ValueNodeKind::VARIABLE;
     node.sourcePos = pos;
     node.text = program->copyString(name);
     if (const auto* integer = std::get_if<int64_t>(&value.kind)) {
@@ -209,21 +209,30 @@ private:
   uint32_t parseColumn(std::string_view name, size_t pos) {
     FieldType* field = opts.schema->getFieldTypePtr(name);
     if (field == nullptr) fail(pos, fmt::format("unknown field '{}'", name));
-    if (!field->hasColumn()) {
-      fail(pos, fmt::format("field '{}' has no column values", name));
-    }
     bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
                    field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-    if (!numeric) fail(pos, fmt::format("field '{}' is not numeric", name));
+    bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING ||
+                          field->type() == FieldType::TEXT;
+    if (!numeric && !stringSortable) fail(pos, fmt::format("field '{}' is not sortable", name));
+    if (numeric && !field->hasColumn()) {
+      fail(pos, fmt::format("field '{}' has no column values", name));
+    }
+    if (stringSortable && !field->hasColumn() && !field->indexed()) {
+      fail(pos, fmt::format("field '{}' has no sortable values", name));
+    }
 
     ValueNode node;
     node.kind = ValueNodeKind::COLUMN;
     node.columnType = field->type();
     node.columnMultiValued = field->multiValued();
-    bool floating = field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-    node.type = field->multiValued()
-        ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
-        : (floating ? ValueType::DOUBLE : ValueType::INT64);
+    if (!numeric) {
+      node.type = ValueType::COLUMN_ONLY;
+    } else {
+      bool floating = field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
+      node.type = field->multiValued()
+          ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
+          : (floating ? ValueType::DOUBLE : ValueType::INT64);
+    }
     node.sourcePos = pos;
     node.text = program->copyString(name);
     return append(node);

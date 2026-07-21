@@ -15,15 +15,27 @@
 namespace solux {
 namespace {
 
+void requireNumeric(std::span<const ValueType> args) {
+  for (ValueType type : args) {
+    if (type == ValueType::COLUMN_ONLY) {
+      throw std::runtime_error(
+          "a non-numeric column is only valid as the complete sort expression");
+    }
+  }
+}
+
 ValueType unarySame(std::span<const ValueType> args) {
+  requireNumeric(args);
   return args[0];
 }
 
 ValueType unaryDouble(std::span<const ValueType> args) {
+  requireNumeric(args);
   return valueArray(args[0]) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
 }
 
 ValueType binaryNumeric(std::span<const ValueType> args) {
+  requireNumeric(args);
   if (valueArray(args[0]) && valueArray(args[1])) {
     throw std::runtime_error(
         "array-to-array arithmetic is not implicit; reduce one side with min(), max(), or avg()");
@@ -35,6 +47,7 @@ ValueType binaryNumeric(std::span<const ValueType> args) {
 }
 
 ValueType defType(std::span<const ValueType> args) {
+  requireNumeric(args);
   if (valueArray(args[0]) != valueArray(args[1])) {
     throw std::runtime_error("both arguments must be scalars or both must be arrays");
   }
@@ -44,6 +57,7 @@ ValueType defType(std::span<const ValueType> args) {
 }
 
 ValueType minMaxType(std::span<const ValueType> args) {
+  requireNumeric(args);
   if (args.size() == 1) {
     if (!valueArray(args[0])) throw std::runtime_error("the one-argument form requires an array");
     return valueScalarType(args[0]);
@@ -52,6 +66,7 @@ ValueType minMaxType(std::span<const ValueType> args) {
 }
 
 ValueType avgType(std::span<const ValueType> args) {
+  requireNumeric(args);
   if (!valueArray(args[0])) throw std::runtime_error("avg() requires a numeric array");
   return ValueType::DOUBLE;
 }
@@ -594,7 +609,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
-    if (node.kind == ValueNodeKind::CONSTANT) {
+    if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
       bound.bounds = constantBounds(program, index);
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
@@ -705,7 +720,8 @@ ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float s
 ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   switch (node.kind) {
-    case ValueNodeKind::CONSTANT: return evalConstant(index, docid, score);
+    case ValueNodeKind::CONSTANT:
+    case ValueNodeKind::VARIABLE: return evalConstant(index, docid, score);
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
     case ValueNodeKind::DOCID: return ValueResult::integer(docid);
@@ -737,7 +753,7 @@ void BoundValueProgram::evalBatch(std::span<const int32_t> docids,
 ValueResult BoundValueProgram::evalArrayElement(const ValueArrayRef& array, int64_t element) {
   const ValueNode& node = program.nodes[array.node];
   if (element < 0 || element >= array.size) throw std::runtime_error("ValueExpr array index out of range");
-  if (node.kind == ValueNodeKind::CONSTANT) {
+  if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
     if (node.type == ValueType::INT64_ARRAY) {
       return ValueResult::integer(program.intArrays[node.arrayOffset + element]);
     }

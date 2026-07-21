@@ -321,6 +321,11 @@ public:
             auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
             if (scorer != nullptr) {
               data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+              std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
+              if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
+                expressionBindings.emplace(
+                    *data->fieldCollector, poolGuard.pool(), seg.postingsReader());
+              }
               collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
             }
           } else {

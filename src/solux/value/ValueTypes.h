@@ -12,6 +12,7 @@ enum class ValueType : uint8_t {
   DOUBLE,
   INT64_ARRAY,
   DOUBLE_ARRAY,
+  COLUMN_ONLY,
 };
 
 inline bool valueArray(ValueType type) {
@@ -36,6 +37,7 @@ inline std::string_view valueTypeName(ValueType type) {
     case ValueType::DOUBLE: return "double";
     case ValueType::INT64_ARRAY: return "int64 array";
     case ValueType::DOUBLE_ARRAY: return "double array";
+    case ValueType::COLUMN_ONLY: return "non-numeric column";
   }
   return "unknown";
 }

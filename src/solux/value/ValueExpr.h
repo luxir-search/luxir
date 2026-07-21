@@ -24,6 +24,7 @@ class PostingsReader;
 
 enum class ValueNodeKind : uint8_t {
   CONSTANT,
+  VARIABLE,
   COLUMN,
   SCORE,
   DOCID,

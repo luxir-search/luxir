@@ -13,6 +13,8 @@
 
 namespace solux {
 
+class ValueProgram;
+
 enum class StringSortMode : uint8_t {
     DEFAULT,
     GLOBAL,
@@ -137,13 +139,15 @@ public:
     enum Kind {
         COLUMN,
         SCORE,
-        DOC
+        DOC,
+        EXPR
     };
 
 private:
     Kind kind;
     SortField::SortOrder order;
     std::optional<SortField> sortField;
+    const ValueProgram* valueProgram = nullptr;
 
 public:
     explicit SortClause(SortField field)
@@ -151,14 +155,21 @@ public:
 
     SortClause(Kind kind, SortField::SortOrder order)
         : kind(kind), order(order) {
-        assert(kind != COLUMN);
+        assert(kind == SCORE || kind == DOC);
     }
+
+    SortClause(const ValueProgram& valueProgram, SortField::SortOrder order)
+        : kind(EXPR), order(order), valueProgram(&valueProgram) {}
 
     Kind getKind() const { return kind; }
     SortField::SortOrder getOrder() const { return order; }
     const SortField& getSortField() const {
         assert(kind == COLUMN);
         return *sortField;
+    }
+    const ValueProgram& getValueProgram() const {
+        assert(kind == EXPR);
+        return *valueProgram;
     }
 };
 

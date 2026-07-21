@@ -132,15 +132,44 @@ Sort a single-valued column field explicitly:
 }
 ```
 
-The `expr` member accepts a bare column name here. Numeric, date, string, and ID
-fields with columns are supported. Analyzed text has no value column; index the
-same source into a `string` field when it must sort. Missing values sort last.
-Several sort specifications form an ordered lexicographic sort. `_score_` sorts
-by the query score and `_docid_` sorts by reader-local `(segment, docid)` order;
-either can appear in any position.
+The `expr` member accepts either a bare field name or a numeric value expression.
+Numeric, date, string, and ID field names retain the direct column-sort path.
+Use `col("name")` when a field name is reserved or is not an identifier. Analyzed
+text has no sortable value unless it is indexed for string sorting or copied to
+a `string` column.
 
-An omitted direction defaults to descending for `_score_` and ascending for
-columns and `_docid_`. After all explicit components tie, results use
+Value expressions support numeric constants, `$name` values from the sort's
+`vars` map, the reserved `score` leaf, and these functions:
+
+- Arithmetic: `add`, `sub`, `mul`, and `div`.
+- Defaults: `def(value, fallback)` substitutes only when `value` is missing.
+- Unary math: `neg`, `abs`, `sqrt`, `log`, and `log1p`.
+- Multi-valued reducers: `min`, `max`, and `avg`. An array-valued root must use
+  one of these explicit reducers. The two-argument `min` and `max` forms compare
+  scalar values and are useful for clamping.
+
+For example:
+
+```json
+{
+  "expr": "add(popularity_i,mul(score,$weight))",
+  "vars": {"weight": 0.25},
+  "dir": "desc"
+}
+```
+
+Integer-only arithmetic remains int64; a double operand promotes that operation
+to double. Array arithmetic permits scalar broadcasting but does not implicitly
+zip two arrays. NaN, infinity, invalid math domains, division by zero, and int64
+overflow are rejected rather than becoming sortable sentinels.
+
+Missing values sort last in both directions. Several sort specifications form
+an ordered lexicographic sort. `score` and `_score_` sort by the query score, and
+`_docid_` sorts by reader-local `(segment, docid)` order; any can appear in any
+position.
+
+An omitted direction defaults to descending for `score`/`_score_` and ascending
+for every other key. After all explicit components tie, results use
 `(segment, docid)` ascending as the final deterministic tiebreak. This reader-
 local identity can change after segment merges, so it is not a durable
 pagination token.

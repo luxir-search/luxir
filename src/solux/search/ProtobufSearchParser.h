@@ -23,6 +23,7 @@
 #include "solux/schema/ValCoerce.h"
 #include "solux/util/NumericUtils.h"
 #include "solux/util/Overloaded.h"
+#include "solux/value/ValueExprParser.h"
 
 namespace solux {
 
@@ -529,8 +530,12 @@ public:
     if (sorts.empty()) return out;
     out.useFieldSort = true;
     for (const auto& sortSpec : sorts) {
+      ValueExprOptions options{req.schema.get(), sortSpec.vars};
+      ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
+      const ValueNode& root = program->root();
+      bool scoreRoot = root.kind == ValueNodeKind::SCORE;
       bool defaultDesc = sortSpec.dir == solux::api::SortSpec_::SortDir::UNKNOWN
-        && sortSpec.expr == "_score_";
+        && scoreRoot;
       SortField::SortOrder order =
         sortSpec.dir == solux::api::SortSpec_::SortDir::DESC || defaultDesc
           ? SortField::DESC : SortField::ASC;
@@ -538,17 +543,26 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (sortSpec.expr == "_score_") {
+      if (root.kind == ValueNodeKind::COLUMN) {
+        auto fieldTypePtr = req.schema->getFieldTypeEx(root.text);
+        out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
+      } else if (root.kind == ValueNodeKind::SCORE) {
         out.clauses.emplace_back(SortClause::SCORE, order);
-      } else if (sortSpec.expr == "_docid_") {
+      } else if (root.kind == ValueNodeKind::DOCID) {
         out.clauses.emplace_back(SortClause::DOC, order);
+      } else if (root.kind == ValueNodeKind::CONSTANT) {
+        throw std::runtime_error(fmt::format(
+            "sort expression '{}' reads as the numeric constant {}; to sort a numeric-looking "
+            "field name, write col(\"{}\")",
+            sortSpec.expr, root.text, root.text));
       } else {
-        auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.expr);
-        if (!fieldTypePtr) {
-          throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.expr));
+        if (valueArray(root.type)) {
+          throw std::runtime_error(fmt::format(
+              "sort expression '{}' produces a {}; choose an explicit reducer such as "
+              "min(...), max(...), or avg(...)",
+              sortSpec.expr, valueTypeName(root.type)));
         }
-        out.clauses.emplace_back(
-          SortField(sortSpec.expr, *fieldTypePtr, order, missing));
+        out.clauses.emplace_back(*program, order);
       }
     }
 
