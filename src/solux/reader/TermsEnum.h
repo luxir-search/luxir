@@ -142,7 +142,7 @@ public:
       // Pool-allocated (not a member) so the address survives moves of this
       // enum; the hot paths read the cached row* members, not this struct.
       rangeRows = pool.make<TermRangeRow>(TermRangeRow{
-          0, 0, fieldInfo.docsLoc, fieldInfo.posLoc, fieldInfo.termsLoc, 0, 0});
+          0, 0, 0, fieldInfo.docsLoc, fieldInfo.posLoc, fieldInfo.termsLoc, 0, 0});
     }
 #ifndef NDEBUG
     // readTermBlock reuses termsIS across rows: every row's terms region must
@@ -634,8 +634,8 @@ protected:
     assert(termOrd >= 0 && termOrd < fieldInfo.nTerms);
     const TermRangeRow* end = rangeRows + rangeCount;
     const TermRangeRow* found = std::upper_bound(
-        rangeRows, end, (uint32_t) termOrd,
-        [](uint32_t value, const TermRangeRow& candidate) {
+        rangeRows, end, (uint64_t) termOrd,
+        [](uint64_t value, const TermRangeRow& candidate) {
           return value < candidate.firstTermOrd;
         });
     assert(found != rangeRows);

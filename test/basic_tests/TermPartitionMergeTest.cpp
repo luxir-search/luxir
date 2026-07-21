@@ -155,7 +155,7 @@ void verifySeeks(MemPool& pool, PostingsReader& reader, const SegFieldInfo& info
     const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
     const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
     for (uint32_t i = 1; i < header->nRanges; i++) {
-      int32_t nextOrd = (int32_t) rows[i].firstTermOrd;
+      int64_t nextOrd = (int64_t) rows[i].firstTermOrd;
       ASSERT_GT(nextOrd, 0);
       TermsEnum cross(pool, reader, info);
       ASSERT_TRUE(cross.seek(expected.terms[(size_t) nextOrd - 1].term));
@@ -195,7 +195,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
     const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
     const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
     for (uint32_t i = 0; i + 1 < header->nRanges; i++) {
-      uint32_t rangeTerms = rows[i + 1].firstTermOrd - rows[i].firstTermOrd;
+      uint64_t rangeTerms = rows[i + 1].firstTermOrd - rows[i].firstTermOrd;
       hasMidFieldTail |= (rangeTerms % Postings::TERMS_BLOCK_SIZE) != 0;
     }
   }

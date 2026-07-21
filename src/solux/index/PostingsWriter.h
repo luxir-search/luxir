@@ -428,7 +428,7 @@ public:
     int64_t sumTotalTermFreq = 0;
     uint64_t docsBytes = 0;
     uint64_t posBytes = 0;
-    int32_t nTerms = 0;
+    int64_t nTerms = 0;
     int32_t nBlocks = 0;
   };
 

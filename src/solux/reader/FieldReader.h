@@ -11,8 +11,9 @@ struct TermRangeTableHeader {
 };
 
 struct TermRangeRow {
-  uint32_t firstTermOrd;
+  uint64_t firstTermOrd;
   uint32_t firstBlockOrd;
+  uint32_t padding = 0;
   seg_location docsBase;
   seg_location posBase;
   seg_location termsBase;
@@ -21,7 +22,7 @@ struct TermRangeRow {
 };
 
 static_assert(sizeof(TermRangeTableHeader) == 8);
-static_assert(sizeof(TermRangeRow) == 48);
+static_assert(sizeof(TermRangeRow) == 56);
 static_assert(std::is_trivially_copyable_v<TermRangeRow>);
 static_assert(std::endian::native == std::endian::little);
 

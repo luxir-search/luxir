@@ -1030,7 +1030,7 @@ private:
       TermsEnumIdx& first = termPQ.top();
       PackedTerm term(termBuf);
       first.tenum.term().copyTo(term);
-      int32_t termOrd = textWriter.startTerm(term);
+      int64_t termOrd = textWriter.startTerm(term);
 
       do {
         TermsEnumIdx& entry = termPQ.top();
@@ -1190,7 +1190,7 @@ private:
       std::vector<TermRangeRow> rows;
       TrieBuilder trieBuilder;
       std::string previousLastTerm;
-      int32_t termOrd = 0;
+      int64_t termOrd = 0;
       int32_t blockOrd = 0;
       int64_t sumDocFreq = 0;
       int64_t sumTotalTermFreq = 0;
@@ -1211,7 +1211,7 @@ private:
         }
 
         rows.push_back(TermRangeRow{
-            (uint32_t) termOrd, (uint32_t) blockOrd, output.docsBase, output.posBase,
+            (uint64_t) termOrd, (uint32_t) blockOrd, 0, output.docsBase, output.posBase,
             termsBase, result.docsBytes, result.posBytes});
         termsOut.appendFile(output.termsFile);
         blockOffsets.insert(blockOffsets.end(), result.termBlockOffsets.begin(),
@@ -1256,8 +1256,9 @@ private:
         termsOut.writeInt((int32_t) rows.size());
         termsOut.writeInt(blockOrd);
         for (const auto& range : rows) {
-          termsOut.writeInt((int32_t) range.firstTermOrd);
+          termsOut.writeLong((int64_t) range.firstTermOrd);
           termsOut.writeInt((int32_t) range.firstBlockOrd);
+          termsOut.writeInt((int32_t) range.padding);
           termsOut.writeLong((int64_t) range.docsBase.raw());
           termsOut.writeLong((int64_t) range.posBase.raw());
           termsOut.writeLong((int64_t) range.termsBase.raw());

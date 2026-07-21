@@ -183,6 +183,63 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
   fieldReader.readFieldInfo(fieldInfo);
 }
 
+constexpr uint64_t HIGH_RANGE_ORD = (uint64_t{1} << 32) + 17;
+
+class RangeInspectTermsEnum : public TermsEnum {
+public:
+  using TermsEnum::TermsEnum;
+  using TermsEnum::rowForTerm;
+  using TermsEnum::selectRow;
+};
+
+void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
+                               std::unique_ptr<PostingsReader>& reader,
+                               SegFieldInfo& fieldInfo) {
+  PostingsWriter postingsWriter(dir, 0, 1);
+  auto& finfo = postingsWriter.addField("f");
+  finfo.type = FieldType::TEXT;
+  finfo.flags = FieldType::INDEX_DOCS;
+  {
+    TextWriter writer(postingsWriter);
+    writer.startField(&finfo);
+    for (int32_t i = 0; i < 3 * Postings::TERMS_BLOCK_SIZE; i++) {
+      char term[16];
+      snprintf(term, sizeof(term), "t%03d", i);
+      TermRef termRef(pool, term, 4);
+      writer.startTerm(termRef);
+      writer.addDoc(0, 1);
+      writer.endTerm(termRef);
+    }
+    writer.endField();
+  }
+
+  {
+    auto tableOut = postingsWriter.getOutputStream();
+    tableOut->align(8);
+    finfo.flags |= FieldType::TERM_RANGES;
+    finfo.rangeTableLoc = tableOut->slocation();
+    finfo.nTerms = (int64_t) HIGH_RANGE_ORD + 2 * Postings::TERMS_BLOCK_SIZE;
+    finfo.sumDocFreq = finfo.nTerms;
+    finfo.sumTotalTermFreq = finfo.nTerms;
+
+    const TermRangeTableHeader header{3, 3};
+    const TermRangeRow rows[] = {
+      {0, 0, 0, finfo.docsLoc, finfo.posLoc, finfo.termsLoc, 0, 0},
+      {HIGH_RANGE_ORD, 1, 0, finfo.docsLoc, finfo.posLoc, finfo.termsLoc, 0, 0},
+      {HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE, 2, 0,
+       finfo.docsLoc, finfo.posLoc, finfo.termsLoc, 0, 0}
+    };
+    tableOut->write(&header, sizeof(header));
+    tableOut->write(rows, sizeof(rows));
+  }
+  postingsWriter.finish();
+
+  reader = std::make_unique<PostingsReader>(dir, 0);
+  FieldReader fieldReader(pool, *reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  fieldReader.readFieldInfo(fieldInfo);
+}
+
 MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const SegFieldInfo& fieldInfo) {
   InputStream termsIS = reader.getInputStreamSeek(fieldInfo.termsLoc);
   int32_t nTerms = (int32_t)std::min<int64_t>(Postings::TERMS_BLOCK_SIZE,
@@ -273,6 +330,37 @@ IteratedStats readQueryPostingsStats(MemPool& pool, IndexReader& reader,
 
 class TermsDictTest : public SoluxTest {
 };
+
+TEST_F(TermsDictTest, RangeTableSeeksAcross64BitTermOrdinals) {
+  RAMDir dir;
+  MemPool pool;
+  std::unique_ptr<PostingsReader> reader;
+  SegFieldInfo fieldInfo;
+  buildRawHighOrdRangeField(dir, pool, reader, fieldInfo);
+
+  ASSERT_GT(fieldInfo.nTerms, (int64_t) UINT32_MAX);
+  RangeInspectTermsEnum terms(pool, *reader, fieldInfo);
+  const TermRangeRow* first = terms.rowForTerm((int64_t) HIGH_RANGE_ORD - 1);
+  const TermRangeRow* second = terms.rowForTerm((int64_t) HIGH_RANGE_ORD);
+  const TermRangeRow* third = terms.rowForTerm(
+      (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE);
+  EXPECT_EQ(first->firstTermOrd, 0u);
+  EXPECT_EQ(second->firstTermOrd, HIGH_RANGE_ORD);
+  EXPECT_EQ(third->firstTermOrd, HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE);
+
+  terms.selectRow(second);
+  terms.seekOrd((int64_t) HIGH_RANGE_ORD + 5);
+  EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + 5);
+  EXPECT_EQ((std::string_view) terms.term(), "t037");
+
+  terms.seekOrd((int64_t) HIGH_RANGE_ORD + 2 * Postings::TERMS_BLOCK_SIZE - 1);
+  EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + 2 * Postings::TERMS_BLOCK_SIZE - 1);
+  EXPECT_EQ((std::string_view) terms.term(), "t095");
+
+  terms.seekOrd((int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE - 1);
+  EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE - 1);
+  EXPECT_EQ((std::string_view) terms.term(), "t063");
+}
 
 TEST_F(TermsDictTest, DecodesEscapedPrefixAndSuffixLengths) {
   TestIndex ti;
