@@ -277,3 +277,56 @@ TEST_F(BooleanParserFlattenTest, topDocsExprAndNamedFilterCompose) {
   expectResponseScoresNear(responseScores(*req, "twin"),
                            responseScores(*req, "folded"));
 }
+
+TEST_F(BooleanParserFlattenTest, absentQueryIsMatchAllAndNormalizesAway) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "d1", "body_w", "a", "keep_s", "yes"),
+    flatdoc("id", "d2", "body_w", "b", "keep_s", "yes"),
+    flatdoc("id", "d3", "body_w", "c", "keep_s", "no"),
+  }, UpdateMessage::COMMIT);
+
+  // Filter-only search: no query at all. The fold's match-all placeholder
+  // must be eliminated, leaving the filter as the sole (required) clause.
+  auto shapeReq = localReq(soluxNode->getSearchEngine());
+  shapeReq->collection("main");
+  shapeReq->topDocs("q").withStats().fields({"id"}).limit(-1)
+      .matchFilter("keep", "keep_s", "yes");
+  shapeReq->schema = helper.collection().getSchema();
+  shapeReq->reader = helper.getIndexWriter()->getIndexReader();
+  ProtobufSearchParser parser(*shapeReq);
+  SearchOp* root = parser.parse();
+  auto* topDocs = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+  ASSERT_NE(topDocs, nullptr);
+  auto plan = shape(topDocs->query);
+  EXPECT_EQ(0, plan.mandatoryCount);
+  EXPECT_EQ(1, plan.filterCount);
+  EXPECT_EQ(BooleanQuery::R5_MATCH_ALL_ELIMINATE,
+            plan.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->topDocs("q").withStats().fields({"id"}).limit(-1)
+      .matchFilter("keep", "keep_s", "yes");
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(2, req->getMatchCount("q"));
+  EXPECT_EQ(2, req->getDocs("q").size());
+
+  // No query and no filters selects everything.
+  auto browse = localReq(soluxNode->getSearchEngine());
+  browse->collection("main");
+  browse->topDocs("q").withStats().fields({"id"}).limit(-1);
+  browse->execute();
+  ASSERT_OK(browse);
+  EXPECT_EQ(3, browse->getMatchCount("q"));
+
+  // An explicitly empty Query (unset oneof) behaves like `all`.
+  auto empty = localReq(soluxNode->getSearchEngine());
+  empty->collection("main");
+  auto& td = empty->topDocs("q").withStats().fields({"id"}).limit(-1);
+  td.rawQuery();
+  empty->execute();
+  ASSERT_OK(empty);
+  EXPECT_EQ(3, empty->getMatchCount("q"));
+}

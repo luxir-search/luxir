@@ -57,6 +57,12 @@ public:
       return docid;
     }
 
+    int32_t advance(int32_t target) override {
+      assert(docId() < target);
+      docid = target > lastDoc ? PostingsReader::END : target;
+      return docid;
+    }
+
     /// doc we are positioned on
     int32_t docId() override {
       return docid;

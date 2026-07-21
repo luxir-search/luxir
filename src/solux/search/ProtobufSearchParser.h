@@ -16,6 +16,7 @@
 #include "ops/StatsOp.h"
 #include "ops/FusionOp.h"
 #include "ops/TopDocsReq.h"
+#include "solux/query/AllQuery.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/ProtobufQueryParser.h"
@@ -599,10 +600,12 @@ public:
       req.requestPool, *req.schema,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
     ProtobufQueryParser parser(parseContext);
-    if (!topDocsReq.query.has_value()) {
-      throw std::runtime_error("TopDocs requires a query");
-    }
-    Query* query = parser.parse(*topDocsReq.query);
+    // An absent query selects all documents: the domain is then whatever the
+    // filters carve out (browse / filter-only search). Boolean normalization
+    // eliminates the match-all when filters fold in beside it.
+    Query* query = topDocsReq.query.has_value()
+      ? parser.parse(*topDocsReq.query)
+      : req.requestPool.make<AllQuery>();
     int64_t offset = topDocsReq.offset;
     unused(offset); // TODO
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;

@@ -687,3 +687,106 @@ TEST_F(BooleanNormalizeTest, constantScoreIsOpaqueWhenScoringAndTransparentInFil
   EXPECT_EQ(BooleanQuery::R1_REQUIRED_INLINE,
             filteredView.ruleMask & BooleanQuery::R1_REQUIRED_INLINE);
 }
+
+TEST_F(BooleanNormalizeTest, matchAllEliminatedBesideRequiredClauses) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "a b", "b", "c"};
+  buildBodyIndex(testIndex, bodies);
+
+  AllQuery all;
+  TermQuery a("body_w", "a");
+
+  // Folded filter shape: mandatory match-all beside a filter clause.
+  Query* mandatory[] = {&all};
+  Query* filter[] = {&a};
+  BooleanQuery filtered(mandatory, {}, {}, filter);
+  auto view = shape(filtered);
+  EXPECT_EQ(0, view.mandatoryCount);
+  EXPECT_EQ(1, view.filterCount);
+  EXPECT_EQ(BooleanQuery::R5_MATCH_ALL_ELIMINATE,
+            view.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
+  BooleanQuery filterOnly({}, {}, {}, filter);
+  EXPECT_EQ(2, countHits(*testIndex.reader, filtered));
+  expectScoresNear(collectScores(*testIndex.reader, filterOnly),
+                   collectScores(*testIndex.reader, filtered));
+
+  // Conjunction shape: elimination leaves a sole scoring clause for R4.
+  Query* both[] = {&all, &a};
+  BooleanQuery conjunction(both, {}, {}, {});
+  auto conjunctionView = shape(conjunction);
+  EXPECT_EQ(BooleanQuery::R5_MATCH_ALL_ELIMINATE,
+            conjunctionView.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
+  EXPECT_EQ(BooleanQuery::R4_SINGLE_CLAUSE_UNWRAP,
+            conjunctionView.ruleMask & BooleanQuery::R4_SINGLE_CLAUSE_UNWRAP);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)), conjunctionView.singleChildType);
+  Query* termOnly[] = {&a};
+  BooleanQuery termBoolean(termOnly, {}, {}, {});
+  expectScoresNear(collectScores(*testIndex.reader, termBoolean),
+                   collectScores(*testIndex.reader, conjunction));
+
+  // Filter-list sweep removes every bare match-all.
+  AllQuery all2;
+  Query* filterWithAll[] = {&all, &all2, &a};
+  BooleanQuery filterSwept({}, {}, {}, filterWithAll);
+  auto sweptView = shape(filterSwept);
+  EXPECT_EQ(1, sweptView.filterCount);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)), sweptView.filterTypes[0]);
+  EXPECT_EQ(2, countHits(*testIndex.reader, filterSwept));
+}
+
+TEST_F(BooleanNormalizeTest, matchAllKeptAsSoleDomain) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "a b", "b", "c"};
+  buildBodyIndex(testIndex, bodies);
+
+  AllQuery all;
+  TermQuery a("body_w", "a");
+  TermQuery b("body_w", "b");
+
+  // Sole required clause: the match-all IS the domain.
+  Query* mandatory[] = {&all};
+  BooleanQuery browse(mandatory, {}, {}, {});
+  auto browseView = shape(browse);
+  EXPECT_EQ(1, browseView.mandatoryCount);
+  EXPECT_EQ(0u, browseView.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
+  EXPECT_EQ(4, countHits(*testIndex.reader, browse));
+
+  // A match-all filter under pure optionals carries the domain: optionals
+  // are rank-only, so eliminating it would shrink the match set.
+  Query* optional[] = {&a};
+  Query* allFilter[] = {&all};
+  BooleanQuery ranked({}, optional, {}, allFilter);
+  auto rankedView = shape(ranked);
+  EXPECT_EQ(1, rankedView.filterCount);
+  EXPECT_EQ(0u, rankedView.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
+  EXPECT_EQ(4, countHits(*testIndex.reader, ranked));
+
+  // Complement carrier beside exclusions stays.
+  Query* prohibited[] = {&b};
+  BooleanQuery complement(mandatory, {}, prohibited, {});
+  auto complementView = shape(complement);
+  EXPECT_EQ(1, complementView.mandatoryCount);
+  EXPECT_EQ(0u, complementView.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
+  EXPECT_EQ(2, countHits(*testIndex.reader, complement));
+}
+
+TEST_F(BooleanNormalizeTest, allQueryScorerAdvances) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "a b", "b", "c", "d", "e"};
+  buildBodyIndex(testIndex, bodies);
+
+  AllQuery all;
+  MemPool pool;
+  Query::Context context(pool, *testIndex.reader);
+  auto* weight = all.createWeight(context, 0);
+  auto& segment = context.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  ASSERT_NE(scorer, nullptr);
+
+  EXPECT_EQ(0, scorer->next());
+  EXPECT_EQ(3, scorer->advance(3));
+  EXPECT_EQ(3, scorer->docId());
+  EXPECT_EQ(4, scorer->next());
+  EXPECT_EQ(5, scorer->advance(5));
+  EXPECT_EQ(PostingsReader::END, scorer->advance(6));
+}

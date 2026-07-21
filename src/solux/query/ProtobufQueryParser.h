@@ -402,7 +402,8 @@ public:
       [&](const solux::api::BooleanQuery& b) -> solux::Query* { return parseBoolean(b); },
       [&](const solux::api::ConstantScoreQuery& c) -> solux::Query* { return parseConstantScore(c); },
       [&](const solux::api::BoostQuery& b) -> solux::Query* { return parseBoost(b); },
-      [&](std::monostate) -> solux::Query* { throw std::runtime_error("query oneof not set"); },
+      // Unset oneof selects all documents, same as the explicit `all` arm.
+      [&](std::monostate) -> solux::Query* { return pool.make<solux::AllQuery>(); },
     }, pquery.kind);
   }
 

@@ -93,7 +93,7 @@ enum DocFormat {
 }
 
 message TopDocs {
-  Query query = 1;
+  Query query = 1;            // unset selects all documents (browse / filter-only search)
   // A set of named filters on the main query.
   repeated NamedQuery filter = 2;
   int64 offset = 3;
@@ -175,6 +175,7 @@ message SortSpec {
 }
 
 message Query {
+  // An unset kind selects all documents, same as `all`.
   oneof kind {
     Match match = 1;                // selects all documents with a value match in the specified field
     BooleanQuery boolean = 2;

@@ -35,6 +35,7 @@ public:
     R2_DISJUNCTION_FLATTEN = 1u << 1,
     R3_REQUIRED_DISJUNCTION_HOIST = 1u << 2,
     R4_SINGLE_CLAUSE_UNWRAP = 1u << 3,
+    R5_MATCH_ALL_ELIMINATE = 1u << 4,
   };
 
   // Snapshot of the query-pointer plan immediately before duplicate removal
@@ -168,6 +169,30 @@ private:
     }
   }
 
+  // R5: a bare match-all in a required list is the conjunction's identity.
+  // scoreProfile() treats AUTO_UNIFORM mandatory clauses as membership-only,
+  // so removal never changes scores. The last required clause always stays:
+  // a sole match-all IS the domain (browse-all, complement carrier), and
+  // optionals never gate matching once any required clause exists, so
+  // removing their match-all domain would change the match set. Wrapped
+  // match-alls (Boost/ConstantScore) are explicit scores and stay.
+  static void eliminateMatchAll(NormalizedBoolean& plan) {
+    auto sweep = [&plan](ClauseList& list) {
+      size_t i = 0;
+      while (i < list.size()) {
+        if (plan.mandatory.size() + plan.filter.size() <= 1) return;
+        if (dynamic_cast<AllQuery*>(list[i]) != nullptr) {
+          list.erase(list.begin() + (ptrdiff_t) i);
+          plan.ruleMask |= R5_MATCH_ALL_ELIMINATE;
+          continue;
+        }
+        i++;
+      }
+    };
+    sweep(plan.filter);
+    sweep(plan.mandatory);
+  }
+
   static void flattenDisjunctions(NormalizedBoolean& plan, MemPool& pool) {
     if (plan.minShouldMatch > 1) return;
     size_t i = 0;
@@ -200,6 +225,7 @@ private:
 
     normalizeRequiredList(plan, plan.mandatory, /*parentIsFilter=*/false, pool);
     normalizeRequiredList(plan, plan.filter, /*parentIsFilter=*/true, pool);
+    eliminateMatchAll(plan);
     flattenDisjunctions(plan, pool);
 
     // A sole required disjunction can become the positive side beside filters
