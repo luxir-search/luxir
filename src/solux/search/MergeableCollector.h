@@ -23,13 +23,13 @@ public:
   bool useFieldSort;
 
   MergeableCollector(size_t topCount, const SortPlan& sortPlan,
-                     IndexReader* reader)
+                     IndexReader* reader, bool needsScores)
     : useFieldSort(sortPlan.useFieldSort) {
     if (!useFieldSort) {
       scoreCollector = std::make_unique<TopDocsCollector>(topCount);
     } else {
       fieldCollector = std::make_unique<FieldSortCollector>(
-        topCount, sortPlan.clauses, reader);
+        topCount, sortPlan.clauses, reader, needsScores);
     }
   }
 

@@ -445,6 +445,9 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   if constexpr (requires { collector.topCount; }) {
     needScores = collector.topCount > 0;
   }
+  if constexpr (requires { collector.needsScores; }) {
+    needScores = needScores && collector.needsScores;
+  }
 
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*)filter;

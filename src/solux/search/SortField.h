@@ -176,6 +176,7 @@ public:
 struct SortPlan {
     std::vector<SortClause> clauses;
     bool useFieldSort = false;
+    bool rankNeedsScores = true;
 };
 
 } // namespace solux

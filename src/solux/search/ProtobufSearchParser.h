@@ -529,6 +529,7 @@ public:
     SortPlan out;
     if (sorts.empty()) return out;
     out.useFieldSort = true;
+    out.rankNeedsScores = false;
     for (const auto& sortSpec : sorts) {
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
       ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
@@ -548,6 +549,7 @@ public:
         out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
       } else if (root.kind == ValueNodeKind::SCORE) {
         out.clauses.emplace_back(SortClause::SCORE, order);
+        out.rankNeedsScores = true;
       } else if (root.kind == ValueNodeKind::DOCID) {
         out.clauses.emplace_back(SortClause::DOC, order);
       } else if (root.kind == ValueNodeKind::CONSTANT) {
@@ -563,6 +565,7 @@ public:
               sortSpec.expr, valueTypeName(root.type)));
         }
         out.clauses.emplace_back(*program, order);
+        out.rankNeedsScores |= program->needsScore;
       }
     }
 
@@ -661,11 +664,10 @@ public:
     // hang off it - the expansion cap is a property of the query).  A
     // count-/domain-only request (limit 0, no get_scores) reads no score, so
     // it skips norms/impacts/BM25 and lets boolean prep pick non-scoring
-    // iterators.  Ranked requests (limit > 0) need scores to order docs even
-    // when get_scores doesn't return them; field sorts keep that conservative
-    // behavior for now.
+    // iterators. Ranked requests need scores only when their normalized sort
+    // plan consumes score (default ranking, SCORE, or a score-dependent EXPR).
     int32_t requestFlags = 0;
-    if (limit > 0 || topDocsReq.get_scores) {
+    if (topDocsReq.get_scores || (limit > 0 && parsedSorts.rankNeedsScores)) {
       requestFlags |= Query::NEED_SCORES;
     }
     // Competitive-score pruning requires a score-ranked heap. Sub-ops permit

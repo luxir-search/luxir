@@ -135,6 +135,7 @@ public:
   FieldComparator* soleColumn = nullptr;
   RuntimeClause* soleExpr = nullptr;
   bool hasExpr = false;
+  bool needsScores = true;
   bool needsSort = true;
   std::unique_ptr<DirectPQ<SortDoc, FieldSortComparatorFunctor>> pq;
 
@@ -181,8 +182,8 @@ public:
 
 public:
   FieldSortCollector(int64_t topCount, const std::vector<SortClause>& clauses,
-                     IndexReader* reader = nullptr)
-    : topCount(topCount), topDocs(topCount) {
+                     IndexReader* reader = nullptr, bool needsScores = true)
+    : topCount(topCount), topDocs(topCount), needsScores(needsScores) {
     assert(topCount >= 0);
     assert(!clauses.empty());
 

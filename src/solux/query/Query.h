@@ -583,6 +583,7 @@ public:
 
     /// True when the request permits scorer-level competitive pruning.
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
+    bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
     /// Optional execution-time preparation for weights that need the domain for
     /// all segments before they can create a scorer for any individual segment,

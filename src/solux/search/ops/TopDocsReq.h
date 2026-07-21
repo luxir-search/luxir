@@ -64,7 +64,8 @@ public:
     Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
-        return new MergeableCollector(op.topCount, op.sortPlan, op.req.reader.get());
+        return new MergeableCollector(
+            op.topCount, op.sortPlan, op.req.reader.get(), op.weight->needsScores());
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
