@@ -21,6 +21,7 @@
 #include "solux/query/QueryBuilder.h"
 #include "solux/query/SimpleQueryParser.h"
 #include "solux/schema/Schema.h"
+#include "solux/value/ValueLex.h"
 
 namespace solux {
 
@@ -246,17 +247,13 @@ private:
   // ---- keywords / identifiers ----
 
   static bool identStart(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    return value::lex::identifierStart(c);
   }
-  static bool identChar(char c) { return identStart(c) || (c >= '0' && c <= '9'); }
-  static bool digit(char c) { return c >= '0' && c <= '9'; }
+  static bool identChar(char c) { return value::lex::identifierChar(c); }
+  static bool digit(char c) { return value::lex::digit(c); }
 
   static bool isIdentifier(std::string_view s) {
-    if (s.empty() || !identStart(s[0])) return false;
-    for (char c : s) {
-      if (!identChar(c)) return false;
-    }
-    return true;
+    return value::lex::identifier(s);
   }
 
   static bool isStop(char c, std::string_view stops) {
@@ -391,33 +388,8 @@ private:
   // escape set is deliberately small - \" \' \\ - any other byte after '\'
   // keeps the backslash literally.  Errors on an unterminated quote.
   std::string_view scanQuoted() {
-    size_t openPos = cur.position();
-    char quote = cur.peek();
-    cur.advance();
-    size_t start = cur.position();
-    std::pmr::vector<char> buf(&mr);
-    bool anyEscape = false;
-    for (;;) {
-      if (cur.atEnd()) fail(openPos, "unterminated quoted string");
-      char c = cur.peek();
-      if (c == '\\') {
-        char next = cur.peekAt(1);
-        if (next == '"' || next == '\'' || next == '\\') {
-          buf.push_back(next);
-          cur.advance(2);
-          anyEscape = true;
-          continue;
-        }
-      } else if (c == quote) {
-        break;
-      }
-      buf.push_back(c);
-      cur.advance();
-    }
-    std::string_view body = anyEscape ? arenaStr(std::string_view(buf.data(), buf.size()))
-                                      : cur.slice(start, cur.position());
-    cur.advance();  // past the closing quote
-    return body;
+    return value::lex::scanQuoted(cur, mr,
+        [&](size_t pos, std::string_view msg) { fail(pos, msg); });
   }
 
   float parseScoreNumber(std::string_view text, size_t pos) {
@@ -475,8 +447,7 @@ private:
   // re-parsed as syntax).
   const api::Val* parseVarRef() {
     size_t pos = cur.position();
-    cur.advance();  // past '$'
-    std::string_view name = cur.takeWhile([](char c) { return identChar(c); });
+    std::string_view name = value::lex::scanVariable(cur);
     if (name.empty()) fail(pos, "'$' must be followed by a variable name");
     const ::hpp_proto::indirect_view<api::Val>* v = opts.vars.find(name);
     if (v == nullptr) {
@@ -1009,8 +980,9 @@ private:
       }
 
       cur.skipWs();
-      if (cur.consume(')')) return;
-      if (!cur.consume(',')) {
+      auto separator = value::lex::consumeListSeparator(cur);
+      if (separator == value::lex::ListSeparator::CLOSE) return;
+      if (separator != value::lex::ListSeparator::COMMA) {
         fail(cur.position(), fmt::format("expected ',' or ')' in {}(...)", fn));
       }
     }
@@ -1021,8 +993,8 @@ private:
   // when 'a' really is one (and then errors as unknown, teaching the quote).
   std::string_view tryNamedArg() {
     size_t save = cur.position();
-    std::string_view name = cur.takeWhile([](char c) { return identChar(c); });
-    if (name.empty() || !identStart(name[0])) {
+    std::string_view name = value::lex::scanIdentifier(cur);
+    if (name.empty()) {
       cur.seek(save);
       return {};
     }
@@ -1149,11 +1121,13 @@ private:
       }
       fail(pos, fmt::format("variable for '{}' is not a number", argName));
     }
-    Token t = scanToken(ARG_STOPS, /*stopAtColon=*/false);
+    std::string_view text = value::lex::scanNumber(cur);
     T out{};
-    auto [p, ec] = std::from_chars(t.text.data(), t.text.data() + t.text.size(), out);
-    if (ec != std::errc() || p != t.text.data() + t.text.size()) {
-      fail(pos, fmt::format("argument '{}' expects a number (got '{}')", argName, t.text));
+    auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+    bool delimited = cur.atEnd() || cur.wsLen() > 0 || ARG_STOPS.find(cur.peek()) != std::string_view::npos;
+    if (text.empty() || !delimited || ec != std::errc() || p != text.data() + text.size() ||
+        (std::is_floating_point_v<T> && !std::isfinite(out))) {
+      fail(pos, fmt::format("argument '{}' expects a number (finite value required)", argName));
     }
     return out;
   }
