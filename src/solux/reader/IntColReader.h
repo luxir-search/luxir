@@ -211,6 +211,15 @@ public:
     int64_t blockOffset;  // byte offset of compressed block from the start of the column
   };
 
+  // Segment-wide extrema trailer contract. Values are in the column's stored
+  // int64 representation: raw for INT/DATE, sortable-encoded for FLOAT/DOUBLE.
+  // Consumers doing interval math must decode floating endpoints first.
+  struct EncodedBounds {
+    int64_t min = 0;
+    int64_t max = 0;
+    bool hasValues = false;
+  };
+
 
 private:
   DocsReader docs;
@@ -303,6 +312,10 @@ public:
   
   int64_t getMax() const {
     return columnMax;
+  }
+
+  EncodedBounds encodedBounds() const {
+    return {columnMin, columnMax, nvals > 0};
   }
 
   int64_t numBlocks() const {

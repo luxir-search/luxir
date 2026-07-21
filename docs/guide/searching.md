@@ -122,7 +122,7 @@ float column when requested.
 
 ## Sorting
 
-Sort a single-valued column field explicitly:
+Sort a column field explicitly:
 
 ```json
 {
@@ -136,7 +136,9 @@ The `expr` member accepts either a bare field name or a numeric value expression
 Numeric, date, string, and ID field names retain the direct column-sort path.
 Use `col("name")` when a field name is reserved or is not an identifier. Analyzed
 text has no sortable value unless it is indexed for string sorting or copied to
-a `string` column.
+a `string` column. A bare multi-valued column also retains its existing column
+comparator behavior. Array values produced inside a composed expression require
+an explicit reducer.
 
 Value expressions support numeric constants, `$name` values from the sort's
 `vars` map, the reserved `score` leaf, and these functions:
@@ -144,9 +146,9 @@ Value expressions support numeric constants, `$name` values from the sort's
 - Arithmetic: `add`, `sub`, `mul`, and `div`.
 - Defaults: `def(value, fallback)` substitutes only when `value` is missing.
 - Unary math: `neg`, `abs`, `sqrt`, `log`, and `log1p`.
-- Multi-valued reducers: `min`, `max`, and `avg`. An array-valued root must use
-  one of these explicit reducers. The two-argument `min` and `max` forms compare
-  scalar values and are useful for clamping.
+- Multi-valued reducers: `min`, `max`, and `avg`. A composed array-valued root
+  must use one of these explicit reducers. The two-argument `min` and `max`
+  forms compare scalar values and are useful for clamping.
 
 For example:
 

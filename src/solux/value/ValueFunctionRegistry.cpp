@@ -560,18 +560,20 @@ ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
   return out;
 }
 
-[[noreturn]] void throwBindInvalid(const ValueNode& node, const ValueBounds& bounds) {
-  if (node.text == "log") {
+[[noreturn]] void throwBindInvalid(const ValueProgram& program, const ValueNode& node,
+                                   const ValueBounds& bounds) {
+  if (node.kind == ValueNodeKind::FUNCTION && node.text == "log") {
+    std::string_view argument = program.nodes[node.children[0]].text;
     throw std::runtime_error(fmt::format(
         "log() is invalid over the segment bounds of '{}'; use log(max({}, 1)) to clamp "
         "or log1p({}) when that is the intended transform",
-        node.text, node.text, node.text));
+        argument, argument, argument));
   }
-  if (node.text == "log1p") {
+  if (node.kind == ValueNodeKind::FUNCTION && node.text == "log1p") {
     throw std::runtime_error(
         "log1p() is invalid for a value <= -1 in this segment; clamp its argument first");
   }
-  if (node.text == "sqrt") {
+  if (node.kind == ValueNodeKind::FUNCTION && node.text == "sqrt") {
     throw std::runtime_error(
         "sqrt() is invalid for a negative value in this segment; clamp its argument first");
   }
@@ -627,20 +629,21 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
         bound.column.emplace(postings, info);
         bound.iterator.emplace(*bound.column);
         bool missing = bound.column->docsWithValue() < postings.maxDoc();
-        if (bound.column->numValues() == 0) {
+        auto encoded = bound.column->encodedBounds();
+        if (!encoded.hasValues) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);
         } else if (node.columnType == FieldType::FLOAT) {
-          double min = (double)sortableInt32ToFloat((int32_t)bound.column->getMin());
-          double max = (double)sortableInt32ToFloat((int32_t)bound.column->getMax());
+          double min = (double)sortableInt32ToFloat((int32_t)encoded.min);
+          double max = (double)sortableInt32ToFloat((int32_t)encoded.max);
           bound.bounds = ValueBounds::floating(min, max, missing);
           bound.bounds.type = node.type;
         } else if (node.columnType == FieldType::DOUBLE) {
-          double min = sortableInt64ToDouble(bound.column->getMin());
-          double max = sortableInt64ToDouble(bound.column->getMax());
+          double min = sortableInt64ToDouble(encoded.min);
+          double max = sortableInt64ToDouble(encoded.max);
           bound.bounds = ValueBounds::floating(min, max, missing);
           bound.bounds.type = node.type;
         } else {
-          bound.bounds = ValueBounds::integer(bound.column->getMin(), bound.column->getMax(), missing);
+          bound.bounds = ValueBounds::integer(encoded.min, encoded.max, missing);
           bound.bounds.type = node.type;
         }
         if (valueDouble(node.type) && bounded(bound.bounds) &&
@@ -662,7 +665,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
           node, std::span<const ValueBounds>(children.data(), node.childCount));
     }
     if (bound.bounds.certainty == BoundsCertainty::INVALID) {
-      throwBindInvalid(node, bound.bounds);
+      throwBindInvalid(program, node, bound.bounds);
     }
   }
 }

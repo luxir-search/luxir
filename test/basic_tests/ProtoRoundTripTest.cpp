@@ -289,6 +289,72 @@ TEST(ProtoRoundTrip, PhraseSlopValues) {
   EXPECT_EQ(0, absent.slop);
 }
 
+P::SearchRequest buildSortExpressionRequest(std::pmr::memory_resource& mr) {
+  P::SearchRequest request;
+  P::SearchOp* queryOp = B::mapSlot<P::SearchOp>(request.ops, 1, "q", mr);
+  auto& top = queryOp->kind.emplace<P::TopDocs>();
+  P::SortSpec* topSort = B::allocArray(top.sorts, 1, mr);
+  topSort[0].expr = B::arenaStr(mr, "add(price_i,$factor)");
+  topSort[0].dir = P::SortSpec_::SortDir::DESC;
+  P::Val* factor = B::mapSlot<P::Val>(topSort[0].vars, 1, "factor", mr);
+  factor->kind = 2.5;
+
+  P::SearchOp* facetOp = B::mapSlot<P::SearchOp>(top.ops, 1, "categories", mr);
+  auto& facet = facetOp->kind.emplace<P::FieldFacet>();
+  facet.field = B::arenaStr(mr, "category_s");
+  P::SortSpec* facetSort = B::allocArray(facet.sorts, 1, mr);
+  facetSort[0].expr = B::arenaStr(mr, "count");
+  facetSort[0].dir = P::SortSpec_::SortDir::ASC;
+  P::Val* ignored = B::mapSlot<P::Val>(facetSort[0].vars, 1, "tie", mr);
+  ignored->kind = int64_t{7};
+  return request;
+}
+
+void verifySortExpressionRequest(const P::SearchRequest& request) {
+  const auto* queryView = request.ops.find("q");
+  ASSERT_NE(queryView, nullptr);
+  const auto* top = std::get_if<P::TopDocs>(&(*queryView)->kind);
+  ASSERT_NE(top, nullptr);
+  ASSERT_EQ(1, top->sorts.size());
+  EXPECT_EQ("add(price_i,$factor)", top->sorts[0].expr);
+  const auto* factorView = top->sorts[0].vars.find("factor");
+  ASSERT_NE(factorView, nullptr);
+  EXPECT_DOUBLE_EQ(2.5, std::get<double>((**factorView).kind));
+
+  const auto* facetView = top->ops.find("categories");
+  ASSERT_NE(facetView, nullptr);
+  const auto* facet = std::get_if<P::FieldFacet>(&(*facetView)->kind);
+  ASSERT_NE(facet, nullptr);
+  ASSERT_EQ(1, facet->sorts.size());
+  EXPECT_EQ("count", facet->sorts[0].expr);
+  const auto* tieView = facet->sorts[0].vars.find("tie");
+  ASSERT_NE(tieView, nullptr);
+  EXPECT_EQ(7, std::get<int64_t>((**tieView).kind));
+}
+
+TEST(ProtoRoundTrip, SortExpressionVarsAndFacetSort) {
+  std::pmr::monotonic_buffer_resource source;
+  P::SearchRequest request = buildSortExpressionRequest(source);
+  verifySortExpressionRequest(request);
+
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(encode(request, wire));
+  std::pmr::monotonic_buffer_resource binaryArena;
+  P::SearchRequest binary;
+  auto padded = P::copyToPaddedInput(std::span<const std::byte>(wire), binaryArena);
+  ASSERT_TRUE(decode(binary, padded, binaryArena));
+  verifySortExpressionRequest(binary);
+
+  std::string json;
+  ASSERT_TRUE(write_json(request, json));
+  EXPECT_NE(json.find("\"expr\""), std::string::npos) << json;
+  EXPECT_NE(json.find("\"vars\""), std::string::npos) << json;
+  std::pmr::monotonic_buffer_resource jsonArena;
+  P::SearchRequest decodedJson;
+  ASSERT_TRUE(read_json(decodedJson, json, jsonArena)) << json;
+  verifySortExpressionRequest(decodedJson);
+}
+
 // ---- build-by-backing: assemble a non-owning SearchResponse with the build.h helpers, then
 // round-trip it. Hand-written on purpose - this tests the build API (slots, allocArray, arenaStr,
 // SpanBuilder incl. builder-dies-before-serialize, nested ops), not the schema.

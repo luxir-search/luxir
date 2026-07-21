@@ -14,6 +14,7 @@
 
 #include <initializer_list>
 #include <span>
+#include <type_traits>
 #include <vector>
 
 #include "LocalReq.h"
@@ -26,6 +27,7 @@ namespace api = solux::api;
 namespace build = solux::api::build;
 
 using SortDir = api::SortSpec_::SortDir;
+inline constexpr SortDir UNKNOWN = SortDir::UNKNOWN;
 inline constexpr SortDir ASC = SortDir::ASC;
 inline constexpr SortDir DESC = SortDir::DESC;
 using MatchOp = api::Match_::Operator;
@@ -260,6 +262,25 @@ inline OpCursor& sort(OpCursor& cur, std::string_view expr,
   for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
   a[old.size()].expr = build::arenaStr(mr, expr);
   a[old.size()].dir = dir;
+  return cur;
+}
+
+// Append a sort with one scalar variable. More variables can be supplied by
+// constructing SortSpec::vars directly with build::mapSlot and the final cap.
+template <typename T>
+inline OpCursor& sortVar(OpCursor& cur, std::string_view expr,
+                         std::string_view name, T value,
+                         SortDir dir = SortDir::UNKNOWN) {
+  static_assert(std::is_same_v<T, int64_t> || std::is_same_v<T, double>);
+  sort(cur, expr, dir);
+  std::span<const api::SortSpec>* sorts = nullptr;
+  std::visit([&](auto& op) {
+    if constexpr (requires { op.sorts; }) sorts = &op.sorts;
+  }, cur.rawOp().kind);
+  assert(sorts != nullptr && !sorts->empty());
+  auto& spec = const_cast<api::SortSpec&>(sorts->back());
+  api::Val* variable = build::mapSlot<api::Val>(spec.vars, 1, name, cur.mr());
+  variable->kind = value;
   return cur;
 }
 
