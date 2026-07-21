@@ -67,15 +67,15 @@ public:
 
         const char* configured = std::getenv("SOLUX_STRING_SORT");
         if (configured == nullptr || *configured == '\0' ||
-            std::string_view(configured) == "global") {
-            return StringSortMode::GLOBAL;
-        }
-        if (std::string_view(configured) == "segment") {
+            std::string_view(configured) == "segment") {
             return StringSortMode::SEGMENT;
+        }
+        if (std::string_view(configured) == "global") {
+            return StringSortMode::GLOBAL;
         }
         LOG_WARN("Ignoring invalid SOLUX_STRING_SORT='{}'; expected global or segment",
                  configured);
-        return StringSortMode::GLOBAL;
+        return StringSortMode::SEGMENT;
     }
 
     static StringSortMode setStringSortModeForTests(StringSortMode value) {
