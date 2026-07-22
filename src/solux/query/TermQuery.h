@@ -990,6 +990,7 @@ public:
     static_assert((kWindowSize % 64) == 0);
 
     TermQuery::Scorer* scorer;
+    WindowFilter* windowFilter = nullptr;
     std::span<uint64_t> windowBits;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
@@ -1069,7 +1070,8 @@ public:
     }
 
     bool acceptsDoc(DocSet* filter, int32_t doc) const {
-      return filter == nullptr || filter->get(doc);
+      return (filter == nullptr || filter->get(doc))
+          && (windowFilter == nullptr || windowFilter->accepts(doc));
     }
 
     void prepareOutputWindow(ScoreWindow& out) {
@@ -1089,6 +1091,12 @@ public:
           maxDoc(maxDoc) {
     }
 
+    bool attachWindowFilter(WindowFilter* filter) override {
+      assert(windowFilter == nullptr);
+      windowFilter = filter;
+      return true;
+    }
+
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
       max = std::min(max, maxDoc);
@@ -1100,12 +1108,19 @@ public:
       }
 
       setWindowBounds(min, max);
+      if (windowFilter != nullptr
+          && windowFilter->prepare(windowStart, windowEnd) == 0) {
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
       clearWindowBits();
       scorer->fillWindowBits(windowBits, windowStart, windowEnd);
       if (filter != nullptr && filter->type == DocSet::BITSET) {
         applyDomainBits(&((BitDocSet*) filter)->bits());
       } else if (filter != nullptr) {
         applyDocSetFilter(filter);
+      }
+      if (windowFilter != nullptr) {
+        windowFilter->intersect(windowBits);
       }
       if (domainOut != nullptr) {
         skipCount(SkipStats::bulkDomainWindowsFed);
@@ -1171,6 +1186,10 @@ public:
         }
 
         prepareOutputWindow(out);
+        if (windowFilter != nullptr
+            && windowFilter->prepare(windowStart, windowEnd) == 0) {
+          return windowEnd >= max ? PostingsReader::END : windowEnd;
+        }
         int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
         float blockScores[Postings::DOCS_BLOCK_SIZE];
         int32_t n = 0;

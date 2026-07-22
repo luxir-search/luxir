@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <bit>
 #include <cstring>
 #include <cstdint>
 #include <cmath>
@@ -27,6 +29,7 @@ namespace solux {
 
 class DocSet;
 class DocSetBuilder;
+class WindowFilter;
 
 struct ScoreWindow {
   int32_t min = 0;
@@ -40,6 +43,14 @@ struct ScoreWindow {
 class BulkScorer {
 public:
   virtual bool willCountDense() const {
+    return false;
+  }
+
+  // Attach a lazy, window-local filter to scored execution. The filter is
+  // prepared by the bulk scorer only after it has selected the final
+  // production-window bounds. Unsupported bulk scorers reject the attach.
+  virtual bool attachWindowFilter(WindowFilter* filter) {
+    unused(filter);
     return false;
   }
 
@@ -815,6 +826,69 @@ public:
       return PostingsReader::END;
     }
   };
+};
+
+// Lazy intersection of direct filter-term scorers over one L1-sized
+// production window. Unlike DocSet this has no segment-wide identity or
+// cardinality: accepts() is valid only for the most recently prepared window.
+class WindowFilter {
+  static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+  static constexpr int32_t kWindowWords = kWindowSize / 64;
+  static_assert((kWindowSize % 64) == 0);
+
+  std::span<Query::Scorer*> scorers;
+  std::span<uint64_t> currentBits;
+  std::span<uint64_t> scratchBits;
+  int32_t windowStart = 0;
+  int32_t windowEnd = 0;
+
+public:
+  WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers)
+      : scorers(scorers),
+        currentBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
+                    (size_t) kWindowWords),
+        scratchBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
+                    (size_t) kWindowWords) {
+    assert(!scorers.empty());
+  }
+
+  int32_t prepare(int32_t start, int32_t end) {
+    assert(start >= 0);
+    assert(end >= start);
+    assert(end - start <= kWindowSize);
+    windowStart = start;
+    windowEnd = end;
+
+    std::fill(currentBits.begin(), currentBits.end(), 0);
+    scorers[0]->fillWindowBits(currentBits, start, end);
+    for (size_t i = 1; i < scorers.size(); i++) {
+      std::fill(scratchBits.begin(), scratchBits.end(), 0);
+      scorers[i]->fillWindowBits(scratchBits, start, end);
+      for (size_t word = 0; word < currentBits.size(); word++) {
+        currentBits[word] &= scratchBits[word];
+      }
+    }
+
+    int32_t card = 0;
+    for (uint64_t bits : currentBits) {
+      card += (int32_t) std::popcount(bits);
+    }
+    return card;
+  }
+
+  bool accepts(int32_t doc) const {
+    assert(doc >= windowStart && doc < windowEnd);
+    int32_t index = doc - windowStart;
+    return (currentBits[(size_t) (index >> 6)]
+            & (1ULL << (index & 63))) != 0;
+  }
+
+  void intersect(std::span<uint64_t> bits) const {
+    assert(bits.size() == currentBits.size());
+    for (size_t word = 0; word < bits.size(); word++) {
+      bits[word] &= currentBits[word];
+    }
+  }
 };
 
 namespace query_detail {

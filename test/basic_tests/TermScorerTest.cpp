@@ -3842,7 +3842,15 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
   std::array<Query*, 1> optOnly = {&opt};
   std::array<Query*, 1> filterOnly = {&filterTerm};
   std::array<Query*, 1> prohibitedOnly = {&prohibited};
-  expectNoBulk(mandOnly, optOnly, empty, filterOnly, 0);
+  {
+    // A direct-term filter no longer forces the pull fallback: the dense
+    // filter routes MandOpt to the window-mask bulk.
+    BooleanQuery query(std::span<Query*>(mandOnly), optOnly, empty, filterOnly, 0);
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_NE(supplier->bulkScorer(testIndex.pool), nullptr);
+  }
   expectNoBulk(mandOnly, optOnly, prohibitedOnly, empty, 0);
   expectNoBulk(mandOnly, optOnly, empty, empty, 1);
 
@@ -6269,6 +6277,219 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
     mmCount++;
   }
   EXPECT_EQ(mmCount, (N + 14) / 15);
+}
+
+TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
+  CollectionHelper helper("main");
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 512; doc++) {
+    std::string body = "pad";
+    if ((doc % 2) == 0) body += " filter_a";
+    if ((doc % 3) == 0) body += " filter_b";
+    docs.push_back(flatdoc("id", "wf_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto& segment = context.topReader.segments()[0];
+  TermQuery filterA("body_w", "filter_a");
+  TermQuery filterB("body_w", "filter_b");
+  auto* supplierA = filterA.createWeight(context, 0)->scorerSupplier(pool, segment);
+  auto* supplierB = filterB.createWeight(context, 0)->scorerSupplier(pool, segment);
+  auto scorers = pool.make_span<Query::Scorer*>(2);
+  scorers[0] = supplierA->get(pool, std::numeric_limits<int64_t>::max());
+  scorers[1] = supplierB->get(pool, std::numeric_limits<int64_t>::max());
+  WindowFilter filter(pool, scorers);
+
+  EXPECT_EQ(filter.prepare(1, 6), 0);
+  for (int32_t doc = 1; doc < 6; doc++) {
+    EXPECT_FALSE(filter.accepts(doc));
+  }
+
+  int32_t expectedCard = 0;
+  for (int32_t doc = 211; doc < 389; doc++) {
+    expectedCard += (doc % 6) == 0;
+  }
+  EXPECT_EQ(filter.prepare(211, 389), expectedCard);
+  for (int32_t doc = 211; doc < 389; doc++) {
+    EXPECT_EQ(filter.accepts(doc), (doc % 6) == 0) << "doc=" << doc;
+  }
+}
+
+TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
+  CollectionHelper helper("main");
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 1024; doc++) {
+    std::string body = "quick fox pad";
+    if ((doc % 2) == 0) body += " keep";
+    if ((doc % 64) == 0) body += " selective";
+    if ((doc % 3) == 0) appendRepeatedTerm(body, "body_a", 1 + doc % 5);
+    if ((doc % 5) == 0) body += " body_b";
+    if ((doc % 7) == 0) body += " bonus";
+    if ((doc % 8) == 1) appendRepeatedTerm(body, "union_a", 1 + doc % 4);
+    if ((doc % 8) == 2) appendRepeatedTerm(body, "union_b", 1 + doc % 6);
+    docs.push_back(flatdoc("id", "route_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  constexpr int32_t topK = 20;
+
+  auto runBulk = [&](Query& query, std::type_index expectedType) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto& segment = context.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+    if (bulk != nullptr) {
+      EXPECT_EQ(std::type_index(typeid(*bulk)), expectedType);
+    }
+    TopDocsCollector collector(topK);
+    if (bulk != nullptr) {
+      collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
+                          segment.maxDoc(), true);
+    }
+    return QueryTopKRun{collector.totalHits(), sortedCollectorDocs(collector)};
+  };
+
+  auto countBulk = [&](Query& query) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto& segment = context.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+    int64_t count = 0;
+    for (int32_t cursor = 0;
+         bulk != nullptr && cursor != PostingsReader::END
+             && cursor < segment.maxDoc(); ) {
+      int32_t next = bulk->countNextWindow(
+          count, nullptr, nullptr, cursor, segment.maxDoc());
+      if (next == PostingsReader::END) break;
+      EXPECT_GT(next, cursor);
+      cursor = next;
+    }
+    return count;
+  };
+
+  TermQuery bodyA("body_w", "body_a");
+  TermQuery bodyB("body_w", "body_b");
+  TermQuery bonus("body_w", "bonus");
+  TermQuery unionA("body_w", "union_a");
+  TermQuery unionB("body_w", "union_b");
+  TermQuery keep("body_w", "keep");
+
+  std::vector<Query*> oneMandatory = {&bodyA};
+  std::vector<Query*> twoMandatory = {&bodyA, &bodyB};
+  std::vector<Query*> oneOptional = {&bonus};
+  std::vector<Query*> unionOptional = {&unionA, &unionB};
+  std::vector<Query*> filters = {&keep};
+  BooleanQuery termQuery(oneMandatory, {}, {}, filters);
+  BooleanQuery conjunctionQuery(twoMandatory, {}, {}, filters);
+  BooleanQuery mandOptQuery(oneMandatory, oneOptional, {}, filters);
+  BooleanQuery unionQuery({}, unionOptional, {}, filters, 1);
+
+  auto expectedTerm = runQueryTopK(*reader, termQuery, topK, false);
+  auto actualTerm = runBulk(termQuery, typeid(TermQuery::TermBulkScorer));
+  assertTopKEquivalent(expectedTerm.topDocs, actualTerm.topDocs);
+
+  auto expectedConjunction = runQueryTopK(
+      *reader, conjunctionQuery, topK, false);
+  auto actualConjunction = runBulk(
+      conjunctionQuery, typeid(BooleanQuery::ConjunctionBulkScorer));
+  assertTopKEquivalent(expectedConjunction.topDocs, actualConjunction.topDocs);
+
+  auto expectedMandOpt = runQueryTopK(*reader, mandOptQuery, topK, false);
+  auto actualMandOpt = runBulk(
+      mandOptQuery, typeid(BooleanQuery::MandOptBulkScorer));
+  assertTopKEquivalent(expectedMandOpt.topDocs, actualMandOpt.topDocs);
+
+  auto expectedUnion = runQueryTopK(*reader, unionQuery, topK, false);
+  {
+    SkipStatsGuard stats;
+    auto actualUnion = runBulk(
+        unionQuery, typeid(BooleanQuery::MaxScoreBulkScorer));
+    assertTopKEquivalent(expectedUnion.topDocs, actualUnion.topDocs);
+    EXPECT_GT(SkipStats::maxScoreOuterWindows, 0);
+    EXPECT_GT(SkipStats::maxScoreInnerWindows, 0);
+  }
+  EXPECT_EQ(countBulk(unionQuery), expectedUnion.visited);
+
+  TermQuery selective("body_w", "selective");
+  std::vector<Query*> selectiveFilter = {&selective};
+  BooleanQuery selectiveQuery(oneMandatory, {}, {}, selectiveFilter);
+  {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = selectiveQuery.createWeight(context, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(
+        pool, context.topReader.segments()[0]);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_EQ(supplier->bulkScorer(pool), nullptr);
+  }
+
+  std::vector<std::string_view> phraseTerms = {"quick", "fox"};
+  std::vector<int32_t> phrasePositions = {0, 1};
+  PhraseQuery phraseFilter("body_w", phraseTerms, phrasePositions);
+  std::vector<Query*> phraseFilters = {&phraseFilter};
+  BooleanQuery phraseFilterQuery(oneMandatory, {}, {}, phraseFilters);
+  {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = phraseFilterQuery.createWeight(context, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(
+        pool, context.topReader.segments()[0]);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_EQ(supplier->bulkScorer(pool), nullptr);
+  }
+}
+
+TEST_F(TermScorerTest, FilteredConjunctionClampsSparseProductionWindows) {
+  CollectionHelper helper("main");
+  const int32_t nDocs = 4 * DocsEnum::L1_DOCS + 37;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "pad";
+    if ((doc % 2) == 0) body += " keep";
+    if ((doc % 3) == 0) body += " body_a";
+    if ((doc % 5) == 0) body += " body_b";
+    docs.push_back(flatdoc("id", "wide_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  TermQuery bodyA("body_w", "body_a");
+  TermQuery bodyB("body_w", "body_b");
+  TermQuery keep("body_w", "keep");
+  std::vector<Query*> mandatory = {&bodyA, &bodyB};
+  std::vector<Query*> filters = {&keep};
+  BooleanQuery query(mandatory, {}, {}, filters);
+  constexpr int32_t topK = 100;
+  auto expected = runQueryTopK(*reader, query, topK, false);
+
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  auto& segment = context.topReader.segments()[0];
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = supplier->bulkScorer(pool);
+  ASSERT_NE(dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(bulk), nullptr);
+
+  TopDocsCollector collector(topK);
+  collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
+                      segment.maxDoc(), true);
+  QueryTopKRun actual{collector.totalHits(), sortedCollectorDocs(collector)};
+  assertTopKEquivalent(expected.topDocs, actual.topDocs);
 }
 
 TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
