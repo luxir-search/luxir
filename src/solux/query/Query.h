@@ -687,6 +687,17 @@ public:
     virtual std::span<Scorer*> flatConjunctionScorers() {
       return {};
     }
+    /// Whether this scorer's exact iteration protocol can back a WindowFilter.
+    /// Implementations that opt in must provide correct fillWindowBits()
+    /// output and monotonic exact advance().
+    virtual bool supportsWindowFilter() const {
+      return false;
+    }
+    /// Optional docs-only probe specialization. WindowFilter falls back to
+    /// exact advance() when an opted-in scorer does not expose one.
+    virtual DocsEnum* windowFilterProbeDocsEnum() {
+      return nullptr;
+    }
     virtual float matchCost() {
       return 0.0f;
     }
@@ -834,7 +845,7 @@ public:
   };
 };
 
-// Lazy intersection of direct filter-term scorers over one L1-sized
+// Lazy intersection of direct filter scorers over one L1-sized
 // production window. Unlike DocSet this has no segment-wide identity or
 // cardinality: accepts() is valid only for the most recently prepared window.
 class WindowFilter {
@@ -843,7 +854,7 @@ class WindowFilter {
   static_assert((kWindowSize % 64) == 0);
 
   std::span<Query::Scorer*> scorers;
-  std::span<DocsEnum*> scorerEnums;
+  std::span<DocsEnum*> probeEnums;
   std::span<uint64_t> currentBits;
   std::span<uint64_t> scratchBits;
   int32_t windowStart = 0;
@@ -852,17 +863,19 @@ class WindowFilter {
 
 public:
   WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers,
-               std::span<DocsEnum*> scorerEnums,
                bool probeMode = false)
       : scorers(scorers),
-        scorerEnums(scorerEnums),
+        probeEnums(pool.make_span<DocsEnum*>(scorers.size())),
         currentBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
                     (size_t) kWindowWords),
         scratchBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
                     (size_t) kWindowWords),
         probeMode(probeMode) {
     assert(!scorers.empty());
-    assert(scorerEnums.size() == scorers.size());
+    for (size_t i = 0; i < scorers.size(); i++) {
+      assert(scorers[i]->supportsWindowFilter());
+      probeEnums[i] = scorers[i]->windowFilterProbeDocsEnum();
+    }
   }
 
   bool probes() const {
@@ -900,15 +913,20 @@ public:
             & (1ULL << (index & 63))) != 0;
   }
 
-  // Candidates must arrive in ascending order. Each filter enum advances
+  // Candidates must arrive in ascending order. Each filter scorer advances
   // monotonically, so a later fill resumes from the resulting cursor without
-  // materializing any skipped probe window.
+  // materializing any skipped probe window. Term scorers expose their
+  // DocsEnum for the docs-only fast path; other capable scorers use exact
+  // Scorer::advance().
   bool acceptsProbe(int32_t doc) {
-    assert(scorerEnums.size() == scorers.size());
-    for (auto* docsEnum : scorerEnums) {
-      int32_t filterDoc = docsEnum->docId();
+    assert(probeEnums.size() == scorers.size());
+    for (size_t i = 0; i < scorers.size(); i++) {
+      DocsEnum* docsEnum = probeEnums[i];
+      int32_t filterDoc = docsEnum == nullptr
+          ? scorers[i]->docId() : docsEnum->docId();
       if (filterDoc < doc) {
-        filterDoc = docsEnum->advanceDocOnly(doc);
+        filterDoc = docsEnum == nullptr
+            ? scorers[i]->advance(doc) : docsEnum->advanceDocOnly(doc);
       }
       if (filterDoc != doc) {
         return false;

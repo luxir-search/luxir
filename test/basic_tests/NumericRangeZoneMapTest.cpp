@@ -283,6 +283,51 @@ TEST_F(NumericRangeZoneMapTest, countDeclinesDeletedSegment) {
   EXPECT_EQ(weight->count(index.reader->segments()[0]), -1);
 }
 
+TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
+  const int32_t nDocs = 2 * Postings::NUMERIC_BLOCK_SIZE + 257;
+  TestIndex index;
+  Inverter& inverter = index.getInverter();
+  auto& field = inverter.getIndexHandler("window_i");
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    inverter.startDoc();
+    field.index(inverter, doc / Postings::NUMERIC_BLOCK_SIZE);
+    inverter.finishDoc();
+  }
+  index.flush();
+  index.initReader();
+
+  auto makeFilter = [&](MemPool& pool) {
+    Query::Context context(pool, *index.reader);
+    NumericRangeQuery query("window_i", 1, 1);
+    auto* weight = static_cast<NumericRangeQuery::Weight*>(
+        query.createWeight(context, 0));
+    auto* scorer = weight->createZoneMapScorerForTests(
+        pool, context.topReader.segments()[0]);
+    EXPECT_TRUE(scorer->supportsWindowFilter());
+    auto scorers = pool.make_span<Query::Scorer*>(1);
+    scorers[0] = scorer;
+    return scorers;
+  };
+  auto expected = [](int32_t doc) {
+    return doc / Postings::NUMERIC_BLOCK_SIZE == 1;
+  };
+
+  MemPool fillPool;
+  WindowFilter fill(fillPool, makeFilter(fillPool));
+  int32_t start = Postings::NUMERIC_BLOCK_SIZE - DocsEnum::L1_DOCS / 2;
+  int32_t end = start + DocsEnum::L1_DOCS;
+  fill.prepare(start, end);
+  for (int32_t doc = start; doc < end; doc++) {
+    EXPECT_EQ(fill.accepts(doc), expected(doc)) << "doc=" << doc;
+  }
+
+  MemPool probePool;
+  WindowFilter probe(probePool, makeFilter(probePool), true);
+  for (int32_t doc = 0; doc < nDocs; doc += 7) {
+    EXPECT_EQ(probe.acceptsProbe(doc), expected(doc)) << "doc=" << doc;
+  }
+}
+
 TEST_F(NumericRangeZoneMapTest, materializeFiltersBitAndArrayDomains) {
   constexpr int32_t N = 20'000;
   constexpr int32_t ODD_WINDOW_START = 37;

@@ -392,7 +392,7 @@ public:
   static inline bool disableWindowDispatchForTests = false;
   static inline bool disablePartitionLatchForTests = false;
   static inline bool disableMandOptBulkForTests = false;
-  // A/B toggle: send scored TOP_k with direct-term filters back to the pull
+  // A/B toggle: send scored TOP_k with direct window-capable filters to the pull
   // ConjunctionScorer instead of the window-filter bulk route.
   static inline bool disableFilteredScoredBulkForTests = false;
   // A/B toggle for exact probe-vs-fill equivalence tests.
@@ -702,15 +702,14 @@ public:
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
-        bool directTermFilters = false;
+        bool directWindowFilters = false;
         if (mandatorySources.empty() && !filterSuppliers.empty()
             && reqScorer != nullptr) {
           auto filterScorers = reqScorer->flatConjunctionScorers();
-          directTermFilters = filterScorers.size() == filterSuppliers.size()
+          directWindowFilters = filterScorers.size() == filterSuppliers.size()
               && std::all_of(filterScorers.begin(), filterScorers.end(),
                              [](Query::Scorer* scorer) {
-                               return dynamic_cast<TermQuery::Scorer*>(scorer)
-                                   != nullptr;
+                               return scorer->supportsWindowFilter();
                              });
         }
         bool flatTermDisjunction = optCount >= 2
@@ -725,7 +724,7 @@ public:
         bool useFilteredUnionWand = !disableFilteredUnionWandForTests
             && needsScores && minShouldMatch == 1
             && mandatorySources.empty() && prohibitedSources.empty()
-            && directTermFilters && flatTermDisjunction
+            && directWindowFilters && flatTermDisjunction
             && req.scoringCount == 0
             && filterDensityRoutesToPull(req.cost, segment.maxDoc());
         bool plainExternalDisjunction = externallyDriven && needsScores
@@ -1094,31 +1093,27 @@ public:
             aggregateClauseCost, !needsScores);
       }
 
-      BulkScorer* attachDirectTermFilters(MemPool& targetPool,
-                                          BulkScorer* bulk,
-                                          int64_t bodyCost,
-                                          int64_t filterCost) {
+      BulkScorer* attachDirectFilters(MemPool& targetPool,
+                                      BulkScorer* bulk,
+                                      int64_t bodyCost,
+                                      int64_t filterCost) {
         if (bulk == nullptr || filterSuppliers.empty()) {
           return nullptr;
         }
 
         auto filterScorers = targetPool.make_span<Query::Scorer*>(
             filterSuppliers.size());
-        auto filterEnums = targetPool.make_span<DocsEnum*>(
-            filterSuppliers.size());
         for (size_t i = 0; i < filterSuppliers.size(); i++) {
           auto* scorer = filterSuppliers[i]->get(targetPool, bodyCost);
-          auto* termScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
-          if (termScorer == nullptr) {
+          if (scorer == nullptr || !scorer->supportsWindowFilter()) {
             return nullptr;
           }
-          filterScorers[i] = termScorer;
-          filterEnums[i] = &termScorer->docsEnum;
+          filterScorers[i] = scorer;
         }
         bool probe = !disableFilterMaskProbeForTests && filterCost > 0
             && bodyCost <= (filterCost - 1) / kMaskProbeAdvanceWeight;
         auto* windowFilter = targetPool.make<WindowFilter>(
-            targetPool, filterScorers, filterEnums, probe);
+            targetPool, filterScorers, probe);
         return bulk->attachWindowFilter(windowFilter) ? bulk : nullptr;
       }
 
@@ -1234,7 +1229,7 @@ public:
           case BodyShape::NONE:
             std::unreachable();
         }
-        return attachDirectTermFilters(targetPool, bulk, bodyCost, filterCost);
+        return attachDirectFilters(targetPool, bulk, bodyCost, filterCost);
       }
 
       BulkScorer* filterOnlyBulkScorer(MemPool& targetPool) {
@@ -2960,9 +2955,6 @@ public:
     }
 
     std::span<Query::Scorer*> flatConjunctionScorers() override {
-      for (auto* scorer : conjunctionClauses) {
-        if (dynamic_cast<TermQuery::Scorer*>(scorer) == nullptr) return {};
-      }
       return conjunctionClauses;
     }
 

@@ -17,6 +17,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "solux/query/TermQuery.h"
+#include "solux/query/NumericRangeQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
@@ -152,6 +153,19 @@ struct FilterMaskProbeGuard {
 
   ~FilterMaskProbeGuard() {
     BooleanQuery::disableFilterMaskProbeForTests = saved;
+  }
+};
+
+struct FilteredScoredBulkGuard {
+  bool saved;
+
+  explicit FilteredScoredBulkGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredScoredBulkForTests) {
+    BooleanQuery::disableFilteredScoredBulkForTests = disabled;
+  }
+
+  ~FilteredScoredBulkGuard() {
+    BooleanQuery::disableFilteredScoredBulkForTests = saved;
   }
 };
 
@@ -6377,14 +6391,9 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
   auto scorers = pool.make_span<Query::Scorer*>(2);
   scorers[0] = supplierA->get(pool, std::numeric_limits<int64_t>::max());
   scorers[1] = supplierB->get(pool, std::numeric_limits<int64_t>::max());
-  auto* termScorerA = dynamic_cast<TermQuery::Scorer*>(scorers[0]);
-  auto* termScorerB = dynamic_cast<TermQuery::Scorer*>(scorers[1]);
-  ASSERT_NE(termScorerA, nullptr);
-  ASSERT_NE(termScorerB, nullptr);
-  auto scorerEnums = pool.make_span<DocsEnum*>(2);
-  scorerEnums[0] = &termScorerA->docsEnum;
-  scorerEnums[1] = &termScorerB->docsEnum;
-  WindowFilter filter(pool, scorers, scorerEnums);
+  ASSERT_TRUE(scorers[0]->supportsWindowFilter());
+  ASSERT_TRUE(scorers[1]->supportsWindowFilter());
+  WindowFilter filter(pool, scorers);
 
   EXPECT_EQ(filter.prepare(1, 6), 0);
   for (int32_t doc = 1; doc < 6; doc++) {
@@ -6573,6 +6582,135 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
   }
 }
 
+TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
+  CollectionHelper helper("range_filter_shapes");
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 257;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "pad";
+    if ((doc % 2) == 0) body += " term_filter";
+    if ((doc % 29) == 0) {
+      appendRepeatedTerm(body, "term_body", 1 + (doc / 29) % 11);
+    }
+    if ((doc % 47) == 0) {
+      appendRepeatedTerm(body, "union_a", 1 + (doc / 47) % 7);
+    }
+    if ((doc % 53) == 0) {
+      appendRepeatedTerm(body, "union_b", 1 + (doc / 53) % 9);
+    }
+    if ((doc % 31) == 0) {
+      appendRepeatedTerm(body, "conj_sparse", 1 + (doc / 31) % 13);
+    }
+    if ((doc % 3) == 0) body += " conj_dense";
+    docs.push_back(flatdoc("id", "range_shape_" + std::to_string(doc),
+                           "body_w", body, "range_i",
+                           (int64_t)(doc % 1000)));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->maxDoc(), nDocs);
+  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+
+  NumericRangeQuery fatRange("range_i", 0, 799);
+  TermQuery termFilter("body_w", "term_filter");
+  std::vector<Query*> rangeFilter = {&fatRange};
+  std::vector<Query*> termRangeFilters = {&fatRange, &termFilter};
+
+  TermQuery termBody("body_w", "term_body");
+  std::vector<Query*> termMandatory = {&termBody};
+  BooleanQuery termRange(termMandatory, {}, {}, rangeFilter);
+  BooleanQuery termTermRange(termMandatory, {}, {}, termRangeFilters);
+
+  TermQuery unionA("body_w", "union_a");
+  TermQuery unionB("body_w", "union_b");
+  std::vector<Query*> unionOptional = {&unionA, &unionB};
+  BooleanQuery unionRange({}, unionOptional, {}, rangeFilter, 1);
+  BooleanQuery unionTermRange({}, unionOptional, {}, termRangeFilters, 1);
+
+  TermQuery conjSparse("body_w", "conj_sparse");
+  TermQuery conjDense("body_w", "conj_dense");
+  std::vector<Query*> conjunctionMandatory = {&conjSparse, &conjDense};
+  BooleanQuery conjunctionRange(
+      conjunctionMandatory, {}, {}, rangeFilter);
+  BooleanQuery conjunctionTermRange(
+      conjunctionMandatory, {}, {}, termRangeFilters);
+
+  struct ShapeCase {
+    const char* name;
+    Query* query;
+    std::type_index bulkType;
+    bool probeReachable;
+  };
+  std::array cases = {
+    ShapeCase{"term/range", &termRange,
+              typeid(TermQuery::TermBulkScorer), true},
+    ShapeCase{"term/term+range", &termTermRange,
+              typeid(TermQuery::TermBulkScorer), true},
+    ShapeCase{"union/range", &unionRange,
+              typeid(BooleanQuery::MaxScoreBulkScorer), false},
+    ShapeCase{"union/term+range", &unionTermRange,
+              typeid(BooleanQuery::MaxScoreBulkScorer), false},
+    ShapeCase{"conjunction/range", &conjunctionRange,
+              typeid(BooleanQuery::ConjunctionBulkScorer), true},
+    ShapeCase{"conjunction/term+range", &conjunctionTermRange,
+              typeid(BooleanQuery::ConjunctionBulkScorer), true},
+  };
+
+  struct Run {
+    std::vector<segdoc> docs;
+    std::type_index bulkType;
+    int64_t fillCalls;
+  };
+  auto run = [&](Query& query, bool pull, bool forceFill) {
+    FilteredScoredBulkGuard bulkGuard(pull);
+    FilterMaskProbeGuard probeGuard(forceFill);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = context.topReader.segments()[0];
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
+    EXPECT_EQ(bulk == nullptr, pull);
+    TopDocsCollector collector(50);
+    if (bulk != nullptr) {
+      collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
+                          segment.maxDoc(), true);
+    } else if (supplier != nullptr) {
+      auto* scorer = supplier->get(
+          pool, std::numeric_limits<int64_t>::max());
+      if (scorer != nullptr) {
+        collectTopK(0, scorer, nullptr, nullptr, collector, true);
+      }
+    }
+    std::vector<segdoc> resultDocs;
+    for (const auto& hit : sortedCollectorDocs(collector)) {
+      resultDocs.push_back(hit.doc);
+    }
+    std::sort(resultDocs.begin(), resultDocs.end());
+    return Run{std::move(resultDocs),
+               bulk == nullptr ? std::type_index(typeid(void))
+                               : std::type_index(typeid(*bulk)),
+               SkipStats::countBulkFillCalls};
+  };
+
+  for (const auto& shape : cases) {
+    SCOPED_TRACE(shape.name);
+    Run pull = run(*shape.query, true, false);
+    Run attached = run(*shape.query, false, false);
+    EXPECT_EQ(attached.bulkType, shape.bulkType);
+    EXPECT_EQ(attached.docs, pull.docs);
+    if (shape.probeReachable) {
+      Run fill = run(*shape.query, false, true);
+      EXPECT_EQ(fill.bulkType, shape.bulkType);
+      EXPECT_EQ(fill.docs, pull.docs);
+      EXPECT_GT(fill.fillCalls, attached.fillCalls);
+    }
+  }
+}
+
 TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   CollectionHelper helper("main");
   std::vector<Doc> docs;
@@ -6713,7 +6851,8 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
   int32_t filterCount = 0;
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body = "wand_common";
-    if ((doc % 41) == 0) {
+    bool matchesFilter = (doc % 41) == 0;
+    if (matchesFilter) {
       body += " wand_filter";
       int32_t filterOrd = filterCount++;
       if (filterOrd < 120) {
@@ -6724,8 +6863,13 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
       }
     }
     appendRepeatedTerm(body, "wand_pad", 12 + doc % 37);
-    docs.push_back(flatdoc("id", "wand_" + std::to_string(doc),
-                           "body_w", body));
+    if (matchesFilter) {
+      docs.push_back(flatdoc("id", "wand_" + std::to_string(doc),
+                             "body_w", body, "wand_filter_i", (int64_t)1));
+    } else {
+      docs.push_back(flatdoc("id", "wand_" + std::to_string(doc),
+                             "body_w", body));
+    }
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -6738,16 +6882,15 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
   TermQuery peakA("body_w", "wand_peak_a");
   TermQuery peakB("body_w", "wand_peak_b");
   TermQuery filter("body_w", "wand_filter");
+  NumericRangeQuery rangeFilter("wand_filter_i", 1, 1);
   std::vector<Query*> optional = {&common, &peakA, &peakB};
-  std::vector<Query*> filters = {&filter};
-  BooleanQuery query({}, optional, {}, filters, 1);
 
   struct Run {
     std::vector<TopDocsCollector::ScoreDoc> topDocs;
     int64_t advancePrunes;
     int64_t candidatePrunes;
   };
-  auto run = [&](bool disableWand) {
+  auto run = [&](BooleanQuery& query, bool disableWand) {
     FilteredUnionWandGuard wandGuard(disableWand);
     SkipStatsGuard stats;
     MemPool pool;
@@ -6771,19 +6914,26 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
                SkipStats::wandCandidatePrunes};
   };
 
-  Run disjunction = run(true);
-  Run wand = run(false);
-  ASSERT_EQ(disjunction.topDocs.size(), wand.topDocs.size());
-  std::vector<segdoc> disjunctionDocs;
-  std::vector<segdoc> wandDocs;
-  for (const auto& hit : disjunction.topDocs) disjunctionDocs.push_back(hit.doc);
-  for (const auto& hit : wand.topDocs) wandDocs.push_back(hit.doc);
-  std::sort(disjunctionDocs.begin(), disjunctionDocs.end());
-  std::sort(wandDocs.begin(), wandDocs.end());
-  EXPECT_EQ(disjunctionDocs, wandDocs);
-  EXPECT_EQ(disjunction.advancePrunes, 0);
-  EXPECT_EQ(disjunction.candidatePrunes, 0);
-  EXPECT_GT(wand.advancePrunes, 0);
+  for (Query* filterQuery : std::array<Query*, 2>{&filter, &rangeFilter}) {
+    SCOPED_TRACE(filterQuery == &filter ? "term filter" : "range filter");
+    std::vector<Query*> filters = {filterQuery};
+    BooleanQuery query({}, optional, {}, filters, 1);
+    Run disjunction = run(query, true);
+    Run wand = run(query, false);
+    ASSERT_EQ(disjunction.topDocs.size(), wand.topDocs.size());
+    std::vector<segdoc> disjunctionDocs;
+    std::vector<segdoc> wandDocs;
+    for (const auto& hit : disjunction.topDocs) {
+      disjunctionDocs.push_back(hit.doc);
+    }
+    for (const auto& hit : wand.topDocs) wandDocs.push_back(hit.doc);
+    std::sort(disjunctionDocs.begin(), disjunctionDocs.end());
+    std::sort(wandDocs.begin(), wandDocs.end());
+    EXPECT_EQ(disjunctionDocs, wandDocs);
+    EXPECT_EQ(disjunction.advancePrunes, 0);
+    EXPECT_EQ(disjunction.candidatePrunes, 0);
+    EXPECT_GT(wand.advancePrunes, 0);
+  }
 }
 
 TEST_F(TermScorerTest, FilteredConjunctionClampsSparseProductionWindows) {

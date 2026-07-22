@@ -61,6 +61,9 @@ struct PointsMaterialize {
     bits.words[lastWord] &= ~lastMask;
   }
 
+  // Materialized doc sets are exact and source-agnostic, so both scorer
+  // representations can serve a WindowFilter regardless of which query
+  // produced the points traversal.
   class PointsArrayScorer final : public Query::ConstantScorer {
     std::span<const int32_t> docs;
     int64_t index = -1;
@@ -86,6 +89,7 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
+    bool supportsWindowFilter() const override { return true; }
 
   protected:
     void exhaust() override { index = (int64_t)docs.size(); }
@@ -116,6 +120,7 @@ struct PointsMaterialize {
       return seek(target);
     }
     int32_t docId() override { return docid; }
+    bool supportsWindowFilter() const override { return true; }
   };
 
   class PointsArrayBulkScorer final : public BulkScorer {

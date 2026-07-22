@@ -737,6 +737,14 @@ public:
       docsEnum.intoBitSet(windowBits, windowStart, windowEnd);
     }
 
+    bool supportsWindowFilter() const override {
+      return true;
+    }
+
+    DocsEnum* windowFilterProbeDocsEnum() override {
+      return &docsEnum;
+    }
+
     void setMinCompetitiveScore(float minScore) override {
       bool rose = minScore > minCompetitiveScore;
       minCompetitiveScore = minScore;

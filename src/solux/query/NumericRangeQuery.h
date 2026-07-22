@@ -111,6 +111,7 @@ public:
       return docid;
     }
     int32_t docId() override { return docid; }
+    bool supportsWindowFilter() const override { return true; }
   };
 
   enum class BlockRelation : uint8_t {
@@ -379,7 +380,8 @@ public:
       std::fill(iterBits.begin(), iterBits.end(), 0);
     }
 
-    void fillWindowBits(std::span<uint64_t> words, int32_t min, int32_t max) {
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
       assert(min >= 0 && min <= max && max <= maxDoc);
       if (reader.multiValued()) {
         fillMulti(words, min, max);
@@ -397,6 +399,7 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
+    bool supportsWindowFilter() const override { return true; }
 
   protected:
     // The current iteration window is behind docid, so emptying the doc
