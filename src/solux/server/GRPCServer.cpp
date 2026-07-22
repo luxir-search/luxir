@@ -582,16 +582,16 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *solux::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
   req.requestState = std::move(requestState);
   req.parent = &call;
-  // Run the (synchronous) submit on the task arena, NOT this completion-queue
-  // thread: the cq thread must keep processing WRITE completions for response
-  // flow control to advance, and a long query must not head-of-line block the
-  // other calls served by this cq.  The call outlives the request because its
+  // Run the (synchronous) submit off this completion-queue thread (via
+  // dispatch()): the cq thread must keep processing WRITE completions for
+  // response flow control to advance, and a long query must not head-of-line
+  // block the other calls served by this cq.  max_parallel=-1 opts out and runs
+  // the query inline right here (a scheduling-overhead baseline that accepts
+  // both costs).  The call outlives the request because its
   // outstanding-response count stays positive until the final reply, and
   // requestActive keeps pipelined requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-  call.server.getSoluxNode().getTaskArena().enqueue([&req, &engine] {
-    engine.submit(req, req.proto.max_parallel);
-  });
+  engine.dispatch(req, req.proto.max_parallel);
 }
 
 

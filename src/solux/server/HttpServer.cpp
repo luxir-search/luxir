@@ -808,9 +808,12 @@ private:
     // context survives the request's teardown on the task-arena thread.
     sreq->ioPin = makeIoPin();
 
-    // Dispatch the synchronous engine.submit() off the strand so the io thread
-    // is not blocked for the query's duration.  reply() posts results back here.
-    node_.getTaskArena().enqueue([sreq, &engine] { engine.submit(*sreq, sreq->proto.max_parallel); });
+    // Route by max_parallel: dispatch() moves the synchronous engine.submit()
+    // off the strand so this io thread is not blocked for the query's duration.
+    // max_parallel=-1 deliberately IS inline: the whole query runs right here
+    // on the strand thread (a scheduling-overhead baseline; blocks this
+    // connection's io until it completes).  reply() posts results back here.
+    engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
 
   void handleUpdate(const std::string& body, const std::string& coll) {

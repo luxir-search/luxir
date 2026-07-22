@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
+#include <future>
 #include <memory_resource>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "solux/api/padded_input.h"
@@ -194,16 +197,72 @@ TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
   }
 }
 
-TEST_F(ExecutionProfileTest, maxParallelAboveOneIsRejected) {
+TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
   CollectionHelper helper("profile-reject");
   helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
 
+  for (int32_t maxParallel : {2, -2}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("profile-reject").facet("cats", "cat_s").limit(-1);
+    req->execute(maxParallel);
+    ASSERT_FALSE(req->responses.empty());
+    EXPECT_NE(std::string_view::npos,
+              req->responses.back()->proto.error.find("max_parallel")) << maxParallel;
+  }
+}
+
+TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsInlineOnCallingThread) {
+  CollectionHelper helper("profile-inline");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 32; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 4)));
+    if (i % 16 == 15) helper.indexAll(docs, UpdateMessage::COMMIT), docs.clear();
+  }
+
   auto req = localReq(helper.getSearchEngine());
-  req->collection("profile-reject").facet("cats", "cat_s").limit(-1);
-  req->execute((int32_t)2);
-  ASSERT_FALSE(req->responses.empty());
-  EXPECT_NE(std::string_view::npos,
-            req->responses.back()->proto.error.find("max_parallel"));
+  req->collection("profile-inline").profile().facet("cats", "cat_s").limit(-1);
+  helper.getSearchEngine().dispatch(*req.get(), -1);
+  // -1 = the calling thread: the whole request completed inside dispatch(), so
+  // the response is readable with no wait/synchronization at all.
+  ASSERT_OK(req);
+  const auto& pieces = profileOp(*req).pieces;
+  ASSERT_GT(pieces.size(), 1u);
+  for (const auto& piece : pieces) {
+    EXPECT_EQ(pieces[0].thread_id, piece.thread_id);
+  }
+}
+
+namespace {
+
+// dispatch() is asynchronous for max_parallel >= 0; record the replying thread
+// and use the promise as a completion latch (reply() runs before set_value, so
+// the future's readiness orders `responses` for the test thread).
+class DispatchReq : public LocalReq {
+public:
+  std::promise<std::thread::id> replied;
+  using LocalReq::LocalReq;
+  ReplyStatus reply(SearchResponse& response) override {
+    ReplyStatus status = LocalReq::reply(response);
+    replied.set_value(std::this_thread::get_id());
+    return status;
+  }
+};
+
+} // namespace
+
+TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
+  CollectionHelper helper("profile-pool");
+  helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
+
+  auto* arena = createArena();
+  auto req = LocalReqHandle(
+      solux::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
+  auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
+  req->collection("profile-pool").facet("cats", "cat_s").limit(-1);
+  helper.getSearchEngine().dispatch(*req.get(), 1);
+  ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
+  EXPECT_NE(std::this_thread::get_id(), repliedOn.get());
+  ASSERT_OK(req);
 }
 
 } // namespace solux::test

@@ -33,6 +33,9 @@ void SoluxConfig::addOptions(CLI::App& app) {
       ->default_val(server.http.port);
   app.add_option("--server.http.threads", server.http.threads, "Number of HTTP server threads (0 = auto)")
       ->default_val(server.http.threads);
+  app.add_option("--server.search-threads", server.search_threads,
+                 "Threads for serial (max_parallel=1) search execution (0 = auto)")
+      ->default_val(server.search_threads);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);

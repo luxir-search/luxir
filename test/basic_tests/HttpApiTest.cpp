@@ -185,6 +185,23 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
       response.body());
 }
 
+TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"mp1","http_mp_s":"x"},{"id":"mp2","http_mp_s":"x"},{"id":"mp3","http_mp_s":"y"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  // -1 = inline on the strand, 1 = serial search pool, 0 = TBB arena; same answer.
+  for (std::string mp : {"-1", "0", "1"}) {
+    auto response = httpRequest(port(), http::verb::post, "/collections/main/_query",
+        R"({"max_parallel":)" + mp +
+        R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    EXPECT_EQ(
+        R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n",
+        response.body()) << "max_parallel=" << mp;
+  }
+}
+
 TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
   SoluxTest::clearCollection("http_route_a");
   SoluxTest::clearCollection("http_route_b");

@@ -126,15 +126,19 @@ minimum of one:
 solux --server.http.threads=8 --server.grpc.threads=8
 ```
 
-These are network event-loop/completion-queue threads, not the search worker
-pool. Search work runs on a shared work-stealing scheduler so long queries do
+These are network event-loop/completion-queue threads, not the search
+executors. Parallel search work runs on a shared work-stealing scheduler and
+serial (`max_parallel: 1`) requests on a plain thread pool
+(`--server.search-threads`, default = hardware threads), so long queries do
 not occupy connection threads. The current gRPC unary update handler waits for
 indexing on its completion-queue thread; streaming update and search use their
 separate flow-control paths.
 
 Search requests normally use automatic intra-request parallelism. Set the
 request-level `max_parallel` to `1` for single-threaded diagnosis or controlled
-profiling; `0` is automatic and values above `1` are not implemented yet.
+profiling; `-1` additionally skips the executor handoff and runs the request on
+the receiving transport thread (isolates scheduling overhead; blocks that
+thread). `0` is automatic and values above `1` are not implemented yet.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above

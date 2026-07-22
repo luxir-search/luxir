@@ -14,6 +14,19 @@ struct ServerConfig {
   // clamped to 1 by the servers.
   int64_t stream_buffer_bytes = 1 << 20;
 
+  // Threads for the serial-search executor shared by both transports: requests
+  // with max_parallel=1 run here.  A plain pool, deliberately NOT a TBB arena -
+  // idle pool threads sleep, while idle arena workers spin/steal and impose a
+  // per-request cpu floor that scales with arena width (max_parallel=0 requests
+  // parallelize inside the shared TBB arena as before).
+  int search_threads = 0;  // 0 = auto (hardware concurrency)
+
+  /// Resolve search_threads: 0 means auto (hardware concurrency, minimum 1).
+  int resolveSearchThreads() const {
+    if (search_threads > 0) return search_threads;
+    return std::max(1u, std::thread::hardware_concurrency());
+  }
+
   struct Grpc {
     // <0 means "derive from the HTTP port" (http.port + 1), resolved in normalize().
     // An explicit --server.grpc.port / -p overrides.

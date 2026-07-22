@@ -261,8 +261,11 @@ Request-wide settings require the full form because the shorthand root is a
 `freshness_us` bounds how stale an index view may be; `0` requires the latest
 commit. `time_zone` supplies the civil frame for every date query and facet in
 the request. `max_parallel: 0` lets the engine choose intra-request parallelism
-and is the default; `1` executes the request on one worker thread. Values above
-`1` are reserved and currently rejected. The path collection overrides any
+and is the default; `1` executes the request on one worker thread; `-1`
+executes it inline on the transport thread that received it (no scheduler
+handoff at all - useful for isolating scheduling overhead, at the cost of
+blocking that connection's thread). Values above `1` are reserved and
+currently rejected. The path collection overrides any
 collection target in the HTTP body.
 
 `request_id` is echoed by gRPC responses for correlation within a bidirectional

@@ -22,9 +22,16 @@ public:
   SearchEngine(SoluxNode& node): node(node) {
   }
 
-  // Most users should use this entry point to submit a search request.
+  // Transport entry point: route the request to the executor its max_parallel
+  // asks for, then submit().  -1 executes inline on the calling thread (no
+  // cross-thread hop at all - the caller eats the query's latency); 1 posts to
+  // the node's serial search pool (plain threads, no TBB); everything else
+  // enqueues on the shared TBB task arena, where auto requests parallelize.
+  void dispatch(SearchRequest& req, int32_t maxParallel);
+
+  // Synchronous execution on the calling thread (dispatch() routes here).
   // maxParallel: 0 = auto (engine decides; today that means parallel),
-  // 1 = single-threaded, >1 reserved (rejected as a request error).
+  // 1 / -1 = single-threaded, >1 reserved (rejected as a request error).
   void submit(SearchRequest& req, int32_t maxParallel = 0);
   // bool converts to int silently and would flip meaning (false -> 0 = auto);
   // force old call sites to say what they mean.
