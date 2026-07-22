@@ -63,6 +63,7 @@ class SimpleNumericFieldComparator : public FieldComparator {
   int64_t missingValueSubstitute;
   int64_t lastValue = 0;  // TODO: cache the last value lookup in compareBottom so we don't have to re-fetch if competitive
   segdoc lastDoc = {-1, -1};
+  bool multiValued = false;
 
 public:
   SimpleNumericFieldComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
@@ -70,25 +71,24 @@ public:
       values(numHits),
       sortMultiplier(reversed ? -1 : 1) {
     
+    // Missing placement is a fixed edge regardless of direction (the string
+    // comparators and expression sort keys follow the same convention), so
+    // the substitute is chosen in the TRANSFORMED key space: getDocValue
+    // ~-maps present values for descending sorts, and an untransformed
+    // extreme lands at the same output edge either way.
     missingValueSubstitute = (missingValue == MISSING_FIRST)
                                ? std::numeric_limits<int64_t>::min()
                                : std::numeric_limits<int64_t>::max();
-
-    if (reversed) {
-      // ~x == -(x+1) but without the signed-overflow UB: -(INT64_MAX+1) and
-      // negating INT64_MIN both overflow.  ~x is an order-reversing bijection
-      // over the whole int64 range, exactly the descending transform we want.
-      missingValueSubstitute = ~missingValueSubstitute;
-    }
   }
   
   void setSegment(int32_t segment, PostingsReader* postingsReader) override {
     // Reset reader and iterator
     reader.reset();
     iter.reset();
-    
+    multiValued = false;
+
     if (!postingsReader) return;
-    
+
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(poolGuard.pool(), *postingsReader);
     if (fieldReader.seek(fieldName)) {
@@ -97,10 +97,11 @@ public:
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         iter.emplace(*reader);
+        multiValued = reader->multiValued();
       }
     }
   }
-  
+
   virtual int64_t getDocValue(int32_t docid) {
     if (!iter.has_value()) {
       return missingValueSubstitute;
@@ -112,7 +113,13 @@ public:
     if (iter->docId() > docid) {
       return missingValueSubstitute;
     }
-    int64_t value = iter->value();
+    // Multi-valued numeric columns store per-doc values unsorted, so the
+    // cheap deterministic sort key is the FIRST stored value (storage order).
+    // min/max over unsorted values would scan every value per doc; callers
+    // that want that spell it explicitly (min(f)/max(f) sort expressions).
+    int64_t value = multiValued
+        ? iter->values().valueAt(reader->getStartValueRank(iter->rank()))
+        : iter->value();
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier
     // but this will be a predictable branch anyway.

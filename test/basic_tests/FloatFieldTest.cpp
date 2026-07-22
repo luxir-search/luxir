@@ -130,10 +130,10 @@ TEST_F(FloatFieldTest, sortFloat) {
   auto asc = sortBy(qb::ASC);
   ASSERT_EQ((std::vector<std::string>{"b", "c", "d", "a", "e"}), asc);
 
-  // missing values sort as if +infinity (same contract as int fields):
-  // last under ASC, first under DESC
+  // missing values sort at a fixed edge regardless of direction (same
+  // convention as string and expression sort keys): last under ASC and DESC
   auto desc = sortBy(qb::DESC);
-  ASSERT_EQ((std::vector<std::string>{"e", "a", "d", "c", "b"}), desc);
+  ASSERT_EQ((std::vector<std::string>{"a", "d", "c", "b", "e"}), desc);
 }
 
 TEST_F(FloatFieldTest, sortDouble) {

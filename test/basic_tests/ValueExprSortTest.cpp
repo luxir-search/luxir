@@ -71,6 +71,35 @@ TEST_F(ValueExprSortTest, directionsMissingLastDefAndVariable) {
             run("add(def(price_i,$fallback),1)", qb::ASC, 0));
 }
 
+TEST_F(ValueExprSortTest, bareMultiValuedIntSortsByFirstValue) {
+  // Multi-valued numeric columns store per-doc values unsorted, so the bare
+  // field sort key is the FIRST stored value; min/max are explicit reducers.
+  // Data chosen so first-value order, per-doc min order, per-doc max order,
+  // and the flat value stream's leading entries all rank the docs differently.
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a", "values_is", vec_i(9, 4)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "values_is", vec_i(8, 7)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "c", "values_is", vec_i(1, 20)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d"), UpdateMessage::COMMIT);
+
+  auto run = [&](std::string_view expression, qb::SortDir direction) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
+    qb::sort(top, expression, direction);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return ids(*req);
+  };
+
+  // First values: a=9, b=8, c=1; d missing sorts last both directions.
+  EXPECT_EQ((std::vector<std::string>{"c", "b", "a", "d"}), run("values_is", qb::ASC));
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "c", "d"}), run("values_is", qb::DESC));
+  // Explicit reducers see every value: mins a=4, b=7, c=1; maxes a=9, b=8, c=20.
+  EXPECT_EQ((std::vector<std::string>{"c", "a", "b", "d"}), run("min(values_is)", qb::ASC));
+  EXPECT_EQ((std::vector<std::string>{"c", "a", "b", "d"}), run("max(values_is)", qb::DESC));
+}
+
 TEST_F(ValueExprSortTest, multiSortFallsThroughToSegmentDocOrder) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "first", "x_i", 1, "y_i", 2),

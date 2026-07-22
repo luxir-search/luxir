@@ -136,9 +136,17 @@ The `expr` member accepts either a bare field name or a numeric value expression
 Numeric, date, string, and ID field names retain the direct column-sort path.
 Use `col("name")` when a field name is reserved or is not an identifier. Analyzed
 text has no sortable value unless it is indexed for string sorting or copied to
-a `string` column. A bare multi-valued column also retains its existing column
-comparator behavior. Array values produced inside a composed expression require
+a `string` column. Documents missing the sort value always sort last, under
+both directions. Array values produced inside a composed expression require
 an explicit reducer.
+
+A bare multi-valued string field sorts by its smallest value ascending and its
+largest value descending (string values are stored as a per-document sorted
+set, so either edge is free to read). A bare multi-valued numeric field sorts
+by its FIRST stored value: numeric values are stored in insertion order, so
+the first value is the one key that needs no per-document scan. Sort by
+`min(f)` or `max(f)` when you want edge semantics on a numeric field and are
+willing to pay the scan.
 
 Value expressions support numeric constants, `$name` values from the sort's
 `vars` map, the reserved `score` leaf, and these functions:
