@@ -526,6 +526,50 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
   return collected;
 }
 
+inline void collectConstantTopKAndDomain(
+    int32_t segnum, Query::Scorer* scorer, DocSet* filter,
+    DocSetBuilder& builder, TopDocsCollector& collector) {
+  assert(scorer != nullptr);
+  assert(collector.topCount > 0);
+  skipCount(SkipStats::constantPullDomainCollections);
+  int64_t collected = 0;
+  auto collectOne = [&](int32_t doc) {
+    builder.add(doc);
+    if (collected < collector.topCount) {
+      collector.collect(segnum, doc, scorer->score());
+    } else {
+      collector.hitCount++;
+    }
+    collected++;
+  };
+
+  if (filter == nullptr || filter->type == DocSet::BITSET) {
+    BitDocSet* bitDocs = (BitDocSet*) filter;
+    auto* domainBits = bitDocs == nullptr ? nullptr : &bitDocs->bits();
+    for (;;) {
+      int32_t doc = scorer->next();
+      if (doc == PostingsReader::END) {
+        break;
+      }
+      if (domainBits != nullptr && !domainBits->get(doc)) {
+        continue;
+      }
+      collectOne(doc);
+    }
+  } else {
+    assert(filter->type == DocSet::ARRAY);
+    for (int32_t doc : ((ArrDocSet*) filter)->docs()) {
+      if (scorer->docId() < doc) {
+        scorer->advance(doc);
+      }
+      if (scorer->docId() != doc) {
+        continue;
+      }
+      collectOne(doc);
+    }
+  }
+}
+
 // Exhaust the windowed bulk path, counting matches and optionally building the
 // complete domain. No docs or scores are otherwise materialized.
 inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,

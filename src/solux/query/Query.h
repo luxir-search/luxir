@@ -569,6 +569,7 @@ public:
     /// parent requested, traits say what is true of the built weight.
     static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
+    static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
 
     /// Raw execution trait bitmask.
     int32_t getFlags() const noexcept { return traits; }
@@ -580,6 +581,10 @@ public:
     /// set this when built without NEED_SCORES; wrappers and compounds set it
     /// from their scoring semantics. Advisory: false is always safe.
     bool isConstantScoring() const noexcept { return (traits & IS_CONSTANT_SCORING) != 0; }
+
+    bool prefersPullForSparseArrayDomain() const noexcept {
+      return (traits & PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN) != 0;
+    }
 
     /// True when the request permits scorer-level competitive pruning.
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }

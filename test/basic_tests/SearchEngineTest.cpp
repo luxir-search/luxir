@@ -354,6 +354,61 @@ void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
   EXPECT_GT(domainWindows, 0);
   EXPECT_GT(pruningEvents, 0);
 }
+
+void indexSparseConstantDispatchDocs(CollectionHelper& helper) {
+  std::vector<Doc> docs;
+  docs.reserve(1024);
+  for (int32_t doc = 0; doc < 1024; doc++) {
+    docs.push_back(flatdoc(
+        "id", "sc_" + std::to_string(doc),
+        "limit_s", doc < 32 ? "yes" : "no",
+        "over_s", doc < 33 ? "yes" : "no",
+        "all_s", "yes",
+        "group_s", "g" + std::to_string(doc % 4)));
+  }
+  auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(result.success) << result.error_message;
+}
+
+struct SparseConstantDispatchResult {
+  std::vector<std::string> ids;
+  std::map<std::string, int64_t> facets;
+  int64_t found = 0;
+  int64_t pullCollections = 0;
+  int64_t domainWindows = 0;
+  int64_t bulkFillCalls = 0;
+};
+
+SparseConstantDispatchResult runSparseConstantDispatch(
+    SearchEngine& engine, std::string_view filterField,
+    bool passive, bool secondFilter = false) {
+  auto req = localReq(engine);
+  req->collection("main");
+  auto& topDocs = req->topDocs("q").allQuery().getNumber()
+      .fields({"id"}).limit(10);
+  if (!filterField.empty()) {
+    topDocs.matchFilter("filter", filterField, "yes");
+  }
+  if (secondFilter) {
+    topDocs.matchFilter("all", "all_s", "yes");
+  }
+  topDocs.facet("groups", "group_s").limit(-1);
+
+  SparseConstantDispatchResult result;
+  {
+    SkipStatsGuard stats;
+    TopDocsFilterFoldGuard fold(passive);
+    req->execute(false);
+    result.pullCollections = SkipStats::constantPullDomainCollections;
+    result.domainWindows = SkipStats::bulkDomainWindowsFed;
+    result.bulkFillCalls = SkipStats::countBulkFillCalls;
+  }
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  result.ids = resultIds(*req, "q");
+  result.facets = resultFacetMap(*req, "q", "groups");
+  result.found = req->getMatchCount("q");
+  return result;
+}
 }  // namespace
 
 class SearchEngineTest : public SoluxTest {
@@ -1116,6 +1171,75 @@ TEST_F(SearchEngineTest, filteredCountBulkIntersectionSingleSegment) {
 
 TEST_F(SearchEngineTest, filteredCountBulkIntersectionMultiSegment) {
   expectFilteredCountEquivalence(soluxNode->getSearchEngine(), true);
+}
+
+TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) {
+  CollectionHelper helper;
+  indexSparseConstantDispatchDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), 1u);
+  ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
+  ASSERT_EQ(DocSetBuilder::arrayLimitFor(1024), 32);
+
+  auto atLimitBaseline = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), "limit_s", true);
+  auto atLimit = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), "limit_s", false);
+  EXPECT_EQ(atLimit.pullCollections, 1);
+  EXPECT_EQ(atLimit.domainWindows, 0);
+  EXPECT_EQ(atLimit.bulkFillCalls, 0);
+  EXPECT_EQ(atLimit.found, 32);
+  EXPECT_EQ(atLimit.ids, atLimitBaseline.ids);
+  EXPECT_EQ(atLimit.found, atLimitBaseline.found);
+  EXPECT_EQ(atLimit.facets, atLimitBaseline.facets);
+
+  auto overLimitBaseline = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), "over_s", true);
+  auto overLimit = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), "over_s", false);
+  EXPECT_EQ(overLimit.pullCollections, 0);
+  EXPECT_GT(overLimit.domainWindows, 0);
+  EXPECT_EQ(overLimit.found, 33);
+  EXPECT_EQ(overLimit.ids, overLimitBaseline.ids);
+  EXPECT_EQ(overLimit.found, overLimitBaseline.found);
+  EXPECT_EQ(overLimit.facets, overLimitBaseline.facets);
+}
+
+TEST_F(SearchEngineTest, sparseConstantPullDispatchExcludesMultiFilterPlans) {
+  CollectionHelper helper;
+  indexSparseConstantDispatchDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), 1u);
+  ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
+
+  auto baseline = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), "limit_s", true, true);
+  auto actual = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), "limit_s", false, true);
+  EXPECT_EQ(actual.pullCollections, 0);
+  EXPECT_GT(actual.domainWindows, 0);
+  EXPECT_EQ(actual.ids, baseline.ids);
+  EXPECT_EQ(actual.found, baseline.found);
+  EXPECT_EQ(actual.facets, baseline.facets);
+}
+
+TEST_F(SearchEngineTest, sparseConstantPullDispatchLeavesMatchAllShortcutUntouched) {
+  CollectionHelper helper;
+  indexSparseConstantDispatchDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), 1u);
+  ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
+
+  auto actual = runSparseConstantDispatch(
+      soluxNode->getSearchEngine(), {}, false);
+  EXPECT_EQ(actual.pullCollections, 0);
+  EXPECT_EQ(actual.found, 1024);
+  int64_t facetTotal = 0;
+  for (const auto& [group, count] : actual.facets) {
+    unused(group);
+    facetTotal += count;
+  }
+  EXPECT_EQ(facetTotal, actual.found);
 }
 
 TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {

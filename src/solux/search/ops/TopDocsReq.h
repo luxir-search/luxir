@@ -336,8 +336,21 @@ public:
             // doc-at-a-time heap disjunction by using per-clause window drives.
             bool allowPruning = op.weight->allowsPruning();
             BulkScorer* bulk = nullptr;
-            bulk = supplier->bulkScorer(poolGuard.pool());
-            if (bulk != nullptr) {
+            bool useSparseConstantPull =
+                builderPtr != nullptr
+                && data->scoreCollector->topCount > 0
+                && op.weight->isConstantScoring()
+                && op.weight->prefersPullForSparseArrayDomain()
+                && supplier->cost() <= DocSetBuilder::arrayLimitFor(seg.maxDoc());
+            if (useSparseConstantPull) {
+              auto* scorer = supplier->get(
+                  poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              if (scorer != nullptr) {
+                collectConstantTopKAndDomain(
+                    segnum, scorer, collectorFilter, *builder,
+                    *data->scoreCollector);
+              }
+            } else if ((bulk = supplier->bulkScorer(poolGuard.pool())) != nullptr) {
               if (data->scoreCollector->topCount == 0) {
                 // limit 0: the collector keeps nothing but the total, so count
                 // windows without materializing docs or scores.

@@ -5936,6 +5936,55 @@ TEST_F(TermScorerTest, bulkCountDomainDisjunctionMatchesPullAcrossFiltersAndDele
   check(arrayFilter.get(), true);
 }
 
+TEST_F(TermScorerTest, constantTopKAndDomainMatchesExhaustivePullWithFilters) {
+  const int32_t N = 256;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    f.add(doc, (doc & 1) == 0 ? "needle filler" : "filler");
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "needle");
+  auto* weight = query.createWeight(qContext, 0);
+  ASSERT_TRUE(weight->isConstantScoring());
+  auto bitsetFilter = makeEveryNthDocSet(N, 3, false);
+  auto arrayFilter = makeEveryNthDocSet(N, 5, true);
+
+  for (DocSet* filter : {bitsetFilter.get(), arrayFilter.get()}) {
+    DocSetBuilder expectedBuilder(N);
+    TopDocsCollector expectedCollector(10);
+    auto* expectedScorer = weight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(expectedScorer, nullptr);
+    collectTopK(0, expectedScorer, filter, &expectedBuilder,
+                expectedCollector, false);
+    auto expectedDomain = expectedBuilder.build();
+
+    DocSetBuilder actualBuilder(N);
+    TopDocsCollector actualCollector(10);
+    auto* actualScorer = weight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(actualScorer, nullptr);
+    collectConstantTopKAndDomain(
+        0, actualScorer, filter, actualBuilder, actualCollector);
+    auto actualDomain = actualBuilder.build();
+
+    EXPECT_EQ(actualCollector.totalHits(), expectedCollector.totalHits());
+    auto expectedTop = sortedCollectorDocs(expectedCollector);
+    auto actualTop = sortedCollectorDocs(actualCollector);
+    ASSERT_EQ(actualTop.size(), expectedTop.size());
+    for (size_t i = 0; i < expectedTop.size(); i++) {
+      EXPECT_EQ(actualTop[i].doc, expectedTop[i].doc);
+      EXPECT_FLOAT_EQ(actualTop[i].score, expectedTop[i].score);
+    }
+    expectDocSetEqual(actualDomain.get(), expectedDomain.get(), N);
+  }
+}
+
 TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
   const int32_t N = 2 * DocsEnum::L1_DOCS + 97;
   TestIndex testIndex;

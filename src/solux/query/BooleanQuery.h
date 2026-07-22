@@ -1502,6 +1502,11 @@ public:
         if (!w->isConstantScoring()) constant = false;
       }
       if (constant) traits |= IS_CONSTANT_SCORING;
+      if (query.mandatory.empty() && query.optional.empty()
+          && query.prohibited.empty() && query.filter.size() == 1
+          && dynamic_cast<TermQuery*>(query.filter[0]) != nullptr) {
+        traits |= PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN;
+      }
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {

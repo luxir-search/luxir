@@ -193,10 +193,6 @@ class DocSetBuilder {
     return count;
   }
 
-  int32_t arrayLimit() const {
-    return (max + 31) >> 5;
-  }
-
   void promoteToBits() {
     assert(!bits);
     bitDocs.emplace(max);
@@ -273,8 +269,14 @@ public:
   std::vector<int32_t> docs;
   std::optional<RAMBitDocSet> bitDocs;
   FixedBitSet* bits = nullptr;
-  DocSetBuilder(int32_t max) : max(max) {
-    //docs.reserve(max/32);
+  DocSetBuilder(int32_t max) : max(max) {}
+
+  static int32_t arrayLimitFor(int32_t maxDoc) noexcept {
+    return (maxDoc + 31) >> 5;
+  }
+
+  int32_t arrayLimit() const noexcept {
+    return arrayLimitFor(max);
   }
 
   void add(int32_t docid) SOLUX_INLINE {
@@ -286,7 +288,7 @@ public:
       bitDocs->card_++;
       return;
     }
-    if (docs.size() * 32 < (size_t)max) {
+    if (docs.size() < (size_t) arrayLimit()) {
       docs.emplace_back(docid);
       return;
     }
