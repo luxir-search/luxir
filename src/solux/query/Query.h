@@ -837,19 +837,30 @@ class WindowFilter {
   static_assert((kWindowSize % 64) == 0);
 
   std::span<Query::Scorer*> scorers;
+  std::span<DocsEnum*> scorerEnums;
   std::span<uint64_t> currentBits;
   std::span<uint64_t> scratchBits;
   int32_t windowStart = 0;
   int32_t windowEnd = 0;
+  bool probeMode;
 
 public:
-  WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers)
+  WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers,
+               std::span<DocsEnum*> scorerEnums,
+               bool probeMode = false)
       : scorers(scorers),
+        scorerEnums(scorerEnums),
         currentBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
                     (size_t) kWindowWords),
         scratchBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
-                    (size_t) kWindowWords) {
+                    (size_t) kWindowWords),
+        probeMode(probeMode) {
     assert(!scorers.empty());
+    assert(scorerEnums.size() == scorers.size());
+  }
+
+  bool probes() const {
+    return probeMode;
   }
 
   int32_t prepare(int32_t start, int32_t end) {
@@ -881,6 +892,23 @@ public:
     int32_t index = doc - windowStart;
     return (currentBits[(size_t) (index >> 6)]
             & (1ULL << (index & 63))) != 0;
+  }
+
+  // Candidates must arrive in ascending order. Each filter enum advances
+  // monotonically, so a later fill resumes from the resulting cursor without
+  // materializing any skipped probe window.
+  bool acceptsProbe(int32_t doc) {
+    assert(scorerEnums.size() == scorers.size());
+    for (auto* docsEnum : scorerEnums) {
+      int32_t filterDoc = docsEnum->docId();
+      if (filterDoc < doc) {
+        filterDoc = docsEnum->advanceDocOnly(doc);
+      }
+      if (filterDoc != doc) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void intersect(std::span<uint64_t> bits) const {

@@ -252,14 +252,12 @@ TEST_F(DisjGroupConjunctionTest, bulkAndOpaquePathsMatch) {
     EXPECT_EQ(opaqueScored.ids, bulkScored.ids) << (int) shape;
     EXPECT_EQ(opaqueScored.scores, bulkScored.scores) << (int) shape;
 
-    // Filtered COUNT now runs through the same windowed disj-group intersection
-    // (filtered-search step 1), so FILTER is count-eligible.  The scored path is
-    // deliberately unchanged, so FILTER stays score-ineligible.  MIN_MATCH_TWO
-    // and PHRASE_MEMBER are ineligible for both (non-decomposable disjunction /
-    // phrase member -> opaque sparse path).
+    // Filtered COUNT and scored filter-mask execution both support decomposed
+    // direct-term groups. MIN_MATCH_TWO and PHRASE_MEMBER are ineligible for
+    // both (non-decomposable disjunction / phrase member -> opaque sparse path).
     bool countEligible = shape != Shape::MIN_MATCH_TWO
         && shape != Shape::PHRASE_MEMBER;
-    bool scoreEligible = shape != Shape::FILTER && shape != Shape::MIN_MATCH_TWO
+    bool scoreEligible = shape != Shape::MIN_MATCH_TWO
         && shape != Shape::PHRASE_MEMBER;
     EXPECT_EQ(0, opaqueCount.groupCountWindows) << (int) shape;
     EXPECT_EQ(0, opaqueScored.groupScoreWindows) << (int) shape;
@@ -278,7 +276,7 @@ TEST_F(DisjGroupConjunctionTest, bulkAndOpaquePathsMatch) {
 
   for (Shape shape : {Shape::TWO_GROUPS, Shape::THREE_GROUPS,
                       Shape::GROUP_AND_TERM, Shape::ROUNDING_ORDER,
-                      Shape::ABSENT_TERM}) {
+                      Shape::ABSENT_TERM, Shape::FILTER}) {
     Run opaqueTopK = run(shape, true, true, true);
     Run bulkTopK = run(shape, false, true, true);
     EXPECT_EQ(opaqueTopK.ids, bulkTopK.ids) << (int) shape;

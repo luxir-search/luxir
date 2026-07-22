@@ -142,6 +142,19 @@ struct MandOptBulkGuard {
   }
 };
 
+struct FilterMaskProbeGuard {
+  bool saved;
+
+  explicit FilterMaskProbeGuard(bool disabled)
+    : saved(BooleanQuery::disableFilterMaskProbeForTests) {
+    BooleanQuery::disableFilterMaskProbeForTests = disabled;
+  }
+
+  ~FilterMaskProbeGuard() {
+    BooleanQuery::disableFilterMaskProbeForTests = saved;
+  }
+};
+
 struct PhraseMatchCountGuard {
   bool savedEnabled;
   int64_t savedCalls;
@@ -6302,7 +6315,14 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
   auto scorers = pool.make_span<Query::Scorer*>(2);
   scorers[0] = supplierA->get(pool, std::numeric_limits<int64_t>::max());
   scorers[1] = supplierB->get(pool, std::numeric_limits<int64_t>::max());
-  WindowFilter filter(pool, scorers);
+  auto* termScorerA = dynamic_cast<TermQuery::Scorer*>(scorers[0]);
+  auto* termScorerB = dynamic_cast<TermQuery::Scorer*>(scorers[1]);
+  ASSERT_NE(termScorerA, nullptr);
+  ASSERT_NE(termScorerB, nullptr);
+  auto scorerEnums = pool.make_span<DocsEnum*>(2);
+  scorerEnums[0] = &termScorerA->docsEnum;
+  scorerEnums[1] = &termScorerB->docsEnum;
+  WindowFilter filter(pool, scorers, scorerEnums);
 
   EXPECT_EQ(filter.prepare(1, 6), 0);
   for (int32_t doc = 1; doc < 6; doc++) {
@@ -6316,6 +6336,178 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
   EXPECT_EQ(filter.prepare(211, 389), expectedCard);
   for (int32_t doc = 211; doc < 389; doc++) {
     EXPECT_EQ(filter.accepts(doc), (doc % 6) == 0) << "doc=" << doc;
+  }
+
+  EXPECT_TRUE(filter.acceptsProbe(390));
+  EXPECT_FALSE(filter.acceptsProbe(391));
+  EXPECT_TRUE(filter.acceptsProbe(396));
+
+  expectedCard = 0;
+  for (int32_t doc = 397; doc < 449; doc++) {
+    expectedCard += (doc % 6) == 0;
+  }
+  EXPECT_EQ(filter.prepare(397, 449), expectedCard);
+  for (int32_t doc = 397; doc < 449; doc++) {
+    EXPECT_EQ(filter.accepts(doc), (doc % 6) == 0) << "doc=" << doc;
+  }
+}
+
+TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
+  CollectionHelper helper("filter_mask_probe_score");
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 257;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "pad";
+    if ((doc % 2) == 0) body += " keep";
+    if ((doc % 37) == 0) appendRepeatedTerm(body, "term_sparse", 1 + doc % 5);
+    if ((doc % 601) == 0) appendRepeatedTerm(body, "conj_sparse", 1 + doc % 7);
+    if ((doc % 3) == 0) body += " conj_dense group_dense";
+    if ((doc % 97) == 0) appendRepeatedTerm(body, "union_a", 1 + doc % 3);
+    if ((doc % 103) == 0) appendRepeatedTerm(body, "union_b", 1 + doc % 4);
+    docs.push_back(flatdoc("id", "probe_score_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->maxDoc(), nDocs);
+  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+
+  TermQuery keep("body_w", "keep");
+  std::vector<Query*> filters = {&keep};
+
+  TermQuery termSparse("body_w", "term_sparse");
+  std::vector<Query*> termMandatory = {&termSparse};
+  BooleanQuery termQuery(termMandatory, {}, {}, filters);
+
+  TermQuery conjSparse("body_w", "conj_sparse");
+  TermQuery conjDense("body_w", "conj_dense");
+  std::vector<Query*> conjunctionMandatory = {&conjSparse, &conjDense};
+  BooleanQuery conjunctionQuery(conjunctionMandatory, {}, {}, filters);
+
+  TermQuery unionA("body_w", "union_a");
+  TermQuery unionB("body_w", "union_b");
+  TermQuery groupDense("body_w", "group_dense");
+  std::vector<Query*> unionOptional = {&unionA, &unionB};
+  BooleanQuery unionBody({}, unionOptional, {}, {}, 1);
+  std::vector<Query*> groupedMandatory = {&unionBody, &groupDense};
+  BooleanQuery groupedConjunctionQuery(groupedMandatory, {}, {}, filters);
+
+  struct ScoredRun {
+    QueryTopKRun result;
+    int64_t filterFillCalls;
+  };
+  auto run = [&](Query& query, bool forceFill, std::type_index expectedType) {
+    FilterMaskProbeGuard probeGuard(forceFill);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto& segment = context.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+    if (bulk != nullptr) {
+      EXPECT_EQ(std::type_index(typeid(*bulk)), expectedType);
+    }
+    TopDocsCollector collector(2048);
+    if (bulk != nullptr) {
+      collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
+                          segment.maxDoc(), true);
+    }
+    return ScoredRun{
+      {collector.totalHits(), sortedCollectorDocs(collector)},
+      SkipStats::countBulkFillCalls
+    };
+  };
+
+  auto assertProbeFillEquivalent = [&](Query& query, std::type_index expectedType) {
+    auto probe = run(query, false, expectedType);
+    auto fill = run(query, true, expectedType);
+    EXPECT_EQ(probe.filterFillCalls, 0);
+    EXPECT_GT(fill.filterFillCalls, 0);
+    EXPECT_EQ(probe.result.visited, fill.result.visited);
+    assertQueryTopKExact(probe.result, fill.result);
+  };
+
+  assertProbeFillEquivalent(termQuery, typeid(TermQuery::TermBulkScorer));
+  assertProbeFillEquivalent(conjunctionQuery,
+                            typeid(BooleanQuery::ConjunctionBulkScorer));
+  assertProbeFillEquivalent(groupedConjunctionQuery,
+                            typeid(BooleanQuery::ConjunctionBulkScorer));
+}
+
+TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
+  CollectionHelper helper("filter_mask_probe_count");
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 129;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "pad";
+    if ((doc % 2) == 0) body += " keep";
+    if ((doc % 37) == 0) body += " term_sparse";
+    if ((doc % 601) == 0) body += " conj_sparse";
+    if ((doc % 3) == 0) body += " conj_dense";
+    docs.push_back(flatdoc("id", "probe_count_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->maxDoc(), nDocs);
+  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+
+  TermQuery keep("body_w", "keep");
+  std::vector<Query*> filters = {&keep};
+  TermQuery termSparse("body_w", "term_sparse");
+  std::vector<Query*> termMandatory = {&termSparse};
+  BooleanQuery termQuery(termMandatory, {}, {}, filters);
+  TermQuery conjSparse("body_w", "conj_sparse");
+  TermQuery conjDense("body_w", "conj_dense");
+  std::vector<Query*> conjunctionMandatory = {&conjSparse, &conjDense};
+  BooleanQuery conjunctionQuery(conjunctionMandatory, {}, {}, filters);
+
+  struct CountRun {
+    int64_t count;
+    std::unique_ptr<DocSet> domain;
+    int64_t fillCalls;
+  };
+  auto run = [&](Query& query, bool forceFill, std::type_index expectedType) {
+    FilterMaskProbeGuard probeGuard(forceFill);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto& segment = context.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+    if (bulk != nullptr) {
+      EXPECT_EQ(std::type_index(typeid(*bulk)), expectedType);
+    }
+    DocSetBuilder builder(segment.maxDoc());
+    int64_t count = bulk == nullptr
+        ? 0 : countMatchesWindowed(bulk, nullptr, &builder, segment.maxDoc());
+    return CountRun{count, builder.build(), SkipStats::countBulkFillCalls};
+  };
+
+  auto assertProbeFillEquivalent = [&](Query& query, std::type_index expectedType) {
+    auto probe = run(query, false, expectedType);
+    auto fill = run(query, true, expectedType);
+    EXPECT_GT(fill.fillCalls, probe.fillCalls);
+    EXPECT_EQ(probe.count, fill.count);
+    expectDocSetEqual(probe.domain.get(), fill.domain.get(), nDocs);
+  };
+
+  {
+    SCOPED_TRACE("term");
+    assertProbeFillEquivalent(termQuery, typeid(TermQuery::TermBulkScorer));
+  }
+  {
+    SCOPED_TRACE("conjunction");
+    assertProbeFillEquivalent(conjunctionQuery,
+                              typeid(BooleanQuery::ConjunctionBulkScorer));
   }
 }
 

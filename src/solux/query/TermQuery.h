@@ -1069,9 +1069,31 @@ public:
       return total;
     }
 
-    bool acceptsDoc(DocSet* filter, int32_t doc) const {
-      return (filter == nullptr || filter->get(doc))
-          && (windowFilter == nullptr || windowFilter->accepts(doc));
+    bool acceptsDoc(DocSet* filter, int32_t doc) {
+      if (filter != nullptr && !filter->get(doc)) {
+        return false;
+      }
+      return windowFilter == nullptr
+          || (windowFilter->probes() ? windowFilter->acceptsProbe(doc)
+                                     : windowFilter->accepts(doc));
+    }
+
+    void applyWindowFilterProbe() {
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          if (!windowFilter->acceptsProbe(windowStart + index)) {
+            windowBits[(size_t) word] &= ~(1ULL << bit);
+          }
+          bits &= bits - 1;
+        }
+      }
     }
 
     void prepareOutputWindow(ScoreWindow& out) {
@@ -1108,7 +1130,7 @@ public:
       }
 
       setWindowBounds(min, max);
-      if (windowFilter != nullptr
+      if (windowFilter != nullptr && !windowFilter->probes()
           && windowFilter->prepare(windowStart, windowEnd) == 0) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
@@ -1120,7 +1142,11 @@ public:
         applyDocSetFilter(filter);
       }
       if (windowFilter != nullptr) {
-        windowFilter->intersect(windowBits);
+        if (windowFilter->probes()) {
+          applyWindowFilterProbe();
+        } else {
+          windowFilter->intersect(windowBits);
+        }
       }
       if (domainOut != nullptr) {
         skipCount(SkipStats::bulkDomainWindowsFed);
@@ -1186,7 +1212,7 @@ public:
         }
 
         prepareOutputWindow(out);
-        if (windowFilter != nullptr
+        if (windowFilter != nullptr && !windowFilter->probes()
             && windowFilter->prepare(windowStart, windowEnd) == 0) {
           return windowEnd >= max ? PostingsReader::END : windowEnd;
         }

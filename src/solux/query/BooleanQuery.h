@@ -395,6 +395,8 @@ public:
   // A/B toggle: send scored TOP_k with direct-term filters back to the pull
   // ConjunctionScorer instead of the window-filter bulk route.
   static inline bool disableFilteredScoredBulkForTests = false;
+  // A/B toggle for exact probe-vs-fill equivalence tests.
+  static inline bool disableFilterMaskProbeForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
   // until the approximations agree). For benchmarking the two-phase win only.
@@ -410,6 +412,9 @@ public:
   // (filter leads) wins. Measured crossover on the 5M sweep: 1% filter
   // (journalist) wants pull, 10% (city) wants mask.
   static constexpr int64_t kMaskFilterDensityInverse = 32;
+  // Relative cost of one monotonic filter advance vs streaming one filter
+  // posting. Probe when leadCost * this weight is below filterCost.
+  static constexpr int64_t kMaskProbeAdvanceWeight = 6;
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
@@ -1054,22 +1059,29 @@ public:
 
       BulkScorer* attachDirectTermFilters(MemPool& targetPool,
                                           BulkScorer* bulk,
-                                          int64_t bodyCost) {
+                                          int64_t bodyCost,
+                                          int64_t filterCost) {
         if (bulk == nullptr || filterSuppliers.empty()) {
           return nullptr;
         }
 
         auto filterScorers = targetPool.make_span<Query::Scorer*>(
             filterSuppliers.size());
+        auto filterEnums = targetPool.make_span<DocsEnum*>(
+            filterSuppliers.size());
         for (size_t i = 0; i < filterSuppliers.size(); i++) {
           auto* scorer = filterSuppliers[i]->get(targetPool, bodyCost);
-          if (dynamic_cast<TermQuery::Scorer*>(scorer) == nullptr) {
+          auto* termScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
+          if (termScorer == nullptr) {
             return nullptr;
           }
-          filterScorers[i] = scorer;
+          filterScorers[i] = termScorer;
+          filterEnums[i] = &termScorer->docsEnum;
         }
+        bool probe = !disableFilterMaskProbeForTests && filterCost > 0
+            && bodyCost <= (filterCost - 1) / kMaskProbeAdvanceWeight;
         auto* windowFilter = targetPool.make<WindowFilter>(
-            targetPool, filterScorers);
+            targetPool, filterScorers, filterEnums, probe);
         return bulk->attachWindowFilter(windowFilter) ? bulk : nullptr;
       }
 
@@ -1185,7 +1197,7 @@ public:
           case BodyShape::NONE:
             std::unreachable();
         }
-        return attachDirectTermFilters(targetPool, bulk, bodyCost);
+        return attachDirectTermFilters(targetPool, bulk, bodyCost, filterCost);
       }
 
       BulkScorer* filterOnlyBulkScorer(MemPool& targetPool) {
@@ -3061,9 +3073,13 @@ public:
     bool hasDisjGroup = false;
     bool denseCountPath = false;
 
-    bool acceptsDoc(DocSet* filter, int32_t doc) const {
-      return (filter == nullptr || filter->get(doc))
-          && (windowFilter == nullptr || windowFilter->accepts(doc));
+    bool acceptsDoc(DocSet* filter, int32_t doc) {
+      if (filter != nullptr && !filter->get(doc)) {
+        return false;
+      }
+      return windowFilter == nullptr
+          || (windowFilter->probes() ? windowFilter->acceptsProbe(doc)
+                                     : windowFilter->accepts(doc));
     }
 
     TermQuery::Scorer* termClauseMember(size_t clause, size_t member) {
@@ -3373,11 +3389,12 @@ public:
         }
 
         // Produce this window: chunks of lead docs, one pass per other clause.
-        if (windowFilter != nullptr && upTo - leadDoc >= kWindowSize) {
+        if (windowFilter != nullptr && !windowFilter->probes()
+            && upTo - leadDoc >= kWindowSize) {
           upTo = leadDoc + kWindowSize - 1;
         }
         out.max = upTo + 1;
-        if (windowFilter != nullptr
+        if (windowFilter != nullptr && !windowFilter->probes()
             && windowFilter->prepare(leadDoc, upTo + 1) == 0) {
           out.min = leadDoc;
           return upTo + 1;
@@ -3401,14 +3418,16 @@ public:
             break;
           }
           lastDecided = candDocs[(size_t) n - 1];
-          if (filter != nullptr || windowFilter != nullptr) {
+          bool fillFilter = windowFilter != nullptr && !windowFilter->probes();
+          if (filter != nullptr || fillFilter) {
             int32_t w = 0;
             for (int32_t i = 0; i < n; i++) {
-              if (acceptsDoc(filter, candDocs[(size_t) i])) {
-                candDocs[(size_t) w] = candDocs[(size_t) i];
-                candScores[(size_t) w] = candScores[(size_t) i];
-                w++;
-              }
+              int32_t doc = candDocs[(size_t) i];
+              if (filter != nullptr && !filter->get(doc)) continue;
+              if (fillFilter && !windowFilter->accepts(doc)) continue;
+              candDocs[(size_t) w] = doc;
+              candScores[(size_t) w] = candScores[(size_t) i];
+              w++;
             }
             n = w;
           }
@@ -3436,11 +3455,13 @@ public:
             n = w;
           }
           for (int32_t i = 0; i < n; i++) {
-            if (candScores[(size_t) i] >= this->minCompetitiveScore) {
-              outDocs[(size_t) out.size] = candDocs[(size_t) i];
-              outScores[(size_t) out.size] = candScores[(size_t) i];
-              out.size++;
-            }
+            if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
+            int32_t doc = candDocs[(size_t) i];
+            if (windowFilter != nullptr && windowFilter->probes()
+                && !windowFilter->acceptsProbe(doc)) continue;
+            outDocs[(size_t) out.size] = doc;
+            outScores[(size_t) out.size] = candScores[(size_t) i];
+            out.size++;
           }
         }
         return upTo + 1;
@@ -3497,11 +3518,12 @@ public:
         }
 
         skipCount(SkipStats::conjDisjGroupScoreWindows);
-        if (windowFilter != nullptr && upTo - leadDoc >= kWindowSize) {
+        if (windowFilter != nullptr && !windowFilter->probes()
+            && upTo - leadDoc >= kWindowSize) {
           upTo = leadDoc + kWindowSize - 1;
         }
         out.max = upTo + 1;
-        if (windowFilter != nullptr
+        if (windowFilter != nullptr && !windowFilter->probes()
             && windowFilter->prepare(leadDoc, upTo + 1) == 0) {
           out.min = leadDoc;
           return upTo + 1;
@@ -3517,12 +3539,15 @@ public:
           if (n == 0) break;
           lastDecided = candDocs[(size_t) n - 1];
 
-          if (filter != nullptr || windowFilter != nullptr) {
+          bool fillFilter = windowFilter != nullptr && !windowFilter->probes();
+          if (filter != nullptr || fillFilter) {
             int32_t write = 0;
             for (int32_t i = 0; i < n; i++) {
-              if (!acceptsDoc(filter, candDocs[(size_t) i])) continue;
+              int32_t doc = candDocs[(size_t) i];
+              if (filter != nullptr && !filter->get(doc)) continue;
+              if (fillFilter && !windowFilter->accepts(doc)) continue;
               if (write != i) {
-                candDocs[(size_t) write] = candDocs[(size_t) i];
+                candDocs[(size_t) write] = doc;
                 candScores[(size_t) write] = candScores[(size_t) i];
               }
               write++;
@@ -3559,7 +3584,10 @@ public:
 
           for (int32_t i = 0; i < n; i++) {
             if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
-            outDocs[(size_t) out.size] = candDocs[(size_t) i];
+            int32_t doc = candDocs[(size_t) i];
+            if (windowFilter != nullptr && windowFilter->probes()
+                && !windowFilter->acceptsProbe(doc)) continue;
+            outDocs[(size_t) out.size] = doc;
             outScores[(size_t) out.size] = candScores[(size_t) i];
             out.size++;
           }
@@ -3714,7 +3742,7 @@ public:
     int32_t countNextWindowSparse(int64_t& count, DocSetBuilder* domainOut,
                                   DocSet* filter, int32_t min, int32_t max) {
       skipCount(SkipStats::conjCountFallbacks);
-      if (windowFilter != nullptr) {
+      if (windowFilter != nullptr && !windowFilter->probes()) {
         int32_t requestedEnd = min + kWindowSize;
         if (requestedEnd < min) {
           requestedEnd = max;
@@ -3833,7 +3861,7 @@ public:
     }
 
     bool attachWindowFilter(WindowFilter* filter) override {
-      if (!allTermScorers) {
+      if (!allTermClauses) {
         return false;
       }
       assert(windowFilter == nullptr);
