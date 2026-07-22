@@ -40,6 +40,10 @@ struct SkipStats {
   // Block-max conjunction: bound evaluations vs ranges actually skipped.
   static inline int64_t conjRangeEvals = 0;
   static inline int64_t conjRangeSkips = 0;
+  // WAND advance-work savings: clauses retained in the non-essential tail by
+  // score, and candidate pivots rejected before being returned to the parent.
+  static inline int64_t wandAdvancePrunes = 0;
+  static inline int64_t wandCandidatePrunes = 0;
   // Competitive conjunction evaluations whose certified horizon was extended
   // by the adaptive geometric back-off.
   static inline int64_t conjEvalBackoffs = 0;
@@ -146,6 +150,8 @@ struct SkipStats {
     posSeeks = 0;
     conjRangeEvals = 0;
     conjRangeSkips = 0;
+    wandAdvancePrunes = 0;
+    wandCandidatePrunes = 0;
     conjEvalBackoffs = 0;
     posBlocksSkipped = 0;
     posBlocksDecoded = 0;

@@ -155,6 +155,19 @@ struct FilterMaskProbeGuard {
   }
 };
 
+struct FilteredUnionWandGuard {
+  bool saved;
+
+  explicit FilteredUnionWandGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredUnionWandForTests) {
+    BooleanQuery::disableFilteredUnionWandForTests = disabled;
+  }
+
+  ~FilteredUnionWandGuard() {
+    BooleanQuery::disableFilteredUnionWandForTests = saved;
+  }
+};
+
 struct PhraseMatchCountGuard {
   bool savedEnabled;
   int64_t savedCalls;
@@ -6641,6 +6654,87 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
     ASSERT_NE(supplier, nullptr);
     EXPECT_EQ(supplier->bulkScorer(pool), nullptr);
   }
+}
+
+TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
+  CollectionHelper helper("filtered_union_wand");
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 257;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  int32_t filterCount = 0;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "wand_common";
+    if ((doc % 41) == 0) {
+      body += " wand_filter";
+      int32_t filterOrd = filterCount++;
+      if (filterOrd < 120) {
+        appendRepeatedTerm(body, "wand_peak_a", 2 + filterOrd % 13);
+      }
+      if ((filterOrd % 3) == 0) {
+        appendRepeatedTerm(body, "wand_peak_b", 2 + filterOrd % 9);
+      }
+    }
+    appendRepeatedTerm(body, "wand_pad", 12 + doc % 37);
+    docs.push_back(flatdoc("id", "wand_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->maxDoc(), nDocs);
+  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+  ASSERT_LT(filterCount,
+            reader->maxDoc() / BooleanQuery::kMaskFilterDensityInverse);
+
+  TermQuery common("body_w", "wand_common");
+  TermQuery peakA("body_w", "wand_peak_a");
+  TermQuery peakB("body_w", "wand_peak_b");
+  TermQuery filter("body_w", "wand_filter");
+  std::vector<Query*> optional = {&common, &peakA, &peakB};
+  std::vector<Query*> filters = {&filter};
+  BooleanQuery query({}, optional, {}, filters, 1);
+
+  struct Run {
+    std::vector<TopDocsCollector::ScoreDoc> topDocs;
+    int64_t advancePrunes;
+    int64_t candidatePrunes;
+  };
+  auto run = [&](bool disableWand) {
+    FilteredUnionWandGuard wandGuard(disableWand);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto& segment = context.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    EXPECT_EQ(supplier == nullptr ? nullptr : supplier->bulkScorer(pool),
+              nullptr);
+    auto* scorer = supplier == nullptr
+        ? nullptr
+        : supplier->get(pool, std::numeric_limits<int64_t>::max());
+    EXPECT_NE(dynamic_cast<BooleanQuery::ConjunctionScorer*>(scorer), nullptr);
+    TopDocsCollector collector(20);
+    if (scorer != nullptr) {
+      collectTopK(0, scorer, nullptr, nullptr, collector, true);
+    }
+    return Run{sortedCollectorDocs(collector),
+               SkipStats::wandAdvancePrunes,
+               SkipStats::wandCandidatePrunes};
+  };
+
+  Run disjunction = run(true);
+  Run wand = run(false);
+  ASSERT_EQ(disjunction.topDocs.size(), wand.topDocs.size());
+  std::vector<segdoc> disjunctionDocs;
+  std::vector<segdoc> wandDocs;
+  for (const auto& hit : disjunction.topDocs) disjunctionDocs.push_back(hit.doc);
+  for (const auto& hit : wand.topDocs) wandDocs.push_back(hit.doc);
+  std::sort(disjunctionDocs.begin(), disjunctionDocs.end());
+  std::sort(wandDocs.begin(), wandDocs.end());
+  EXPECT_EQ(disjunctionDocs, wandDocs);
+  EXPECT_EQ(disjunction.advancePrunes, 0);
+  EXPECT_EQ(disjunction.candidatePrunes, 0);
+  EXPECT_GT(wand.advancePrunes, 0);
 }
 
 TEST_F(TermScorerTest, FilteredConjunctionClampsSparseProductionWindows) {

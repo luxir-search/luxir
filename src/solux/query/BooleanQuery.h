@@ -397,6 +397,9 @@ public:
   static inline bool disableFilteredScoredBulkForTests = false;
   // A/B toggle for exact probe-vs-fill equivalence tests.
   static inline bool disableFilterMaskProbeForTests = false;
+  // A/B toggle: retain the plain pull DisjunctionScorer for sparse filtered
+  // term unions instead of using head/tail WAND candidate formation.
+  static inline bool disableFilteredUnionWandForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
   // until the approximations agree). For benchmarking the two-phase win only.
@@ -518,6 +521,11 @@ public:
       bool finiteB = std::isfinite(b);
       if (finiteA != finiteB) return finiteA;
       return a < b;
+    }
+
+    static bool filterDensityRoutesToPull(int64_t filterCost,
+                                          int32_t maxDoc) {
+      return filterCost < maxDoc / kMaskFilterDensityInverse;
     }
 
     // Match MaxScoreDisjunctionScorer's stable score order when an externally
@@ -694,6 +702,32 @@ public:
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
+        bool directTermFilters = false;
+        if (mandatorySources.empty() && !filterSuppliers.empty()
+            && reqScorer != nullptr) {
+          auto filterScorers = reqScorer->flatConjunctionScorers();
+          directTermFilters = filterScorers.size() == filterSuppliers.size()
+              && std::all_of(filterScorers.begin(), filterScorers.end(),
+                             [](Query::Scorer* scorer) {
+                               return dynamic_cast<TermQuery::Scorer*>(scorer)
+                                   != nullptr;
+                             });
+        }
+        bool flatTermDisjunction = optCount >= 2
+            && std::all_of(optionalScorers.begin(), optionalScorers.end(),
+                           [](Query::Scorer* scorer) {
+                             return dynamic_cast<TermQuery::Scorer*>(scorer)
+                                 != nullptr;
+                           });
+        // The filtered scored-bulk density gate has already selected pull for
+        // this exact shape. The filter remains the conjunction lead; WAND only
+        // replaces the sole scoring disjunction member.
+        bool useFilteredUnionWand = !disableFilteredUnionWandForTests
+            && needsScores && minShouldMatch == 1
+            && mandatorySources.empty() && prohibitedSources.empty()
+            && directTermFilters && flatTermDisjunction
+            && req.scoringCount == 0
+            && filterDensityRoutesToPull(req.cost, segment.maxDoc());
         bool plainExternalDisjunction = externallyDriven && needsScores
           && reqScorer == nullptr && prohibitedSources.empty()
           && minShouldMatch <= 1 && optCount >= 2;
@@ -707,6 +741,9 @@ public:
         if (minShouldMatch <= 1) {
           if (optCount == 1) {
             optScorer = optionalScorers[0];
+          } else if (useFilteredUnionWand) {
+            optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
+              targetPool, optionalScorers, 1);
           } else if (useMaxScoreDisjunction) {
             optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
               targetPool, optionalScorers, segment.maxDoc());
@@ -1176,7 +1213,7 @@ public:
           bodyCost = childSupplier->cost();
         }
         if (shape == BodyShape::NONE
-            || filterCost < segment.maxDoc() / kMaskFilterDensityInverse) {
+            || filterDensityRoutesToPull(filterCost, segment.maxDoc())) {
           return nullptr;
         }
 
@@ -2926,8 +2963,13 @@ public:
 
     void setMinCompetitiveScore(float minScore) override {
       // The threshold applies to the conjunction's SUM; children must not see
-      // it (a child pruning on its own score alone would drop docs whose sum
-      // is competitive).
+      // it when multiple scoring children contribute (a child pruning on its
+      // own score alone would drop docs whose sum is competitive). With one
+      // scoring child its score is the sum, so forwarding is exact. `scorers`
+      // excludes every non-scoring required/filter member by construction.
+      if (scorers.size() == 1) {
+        scorers[0]->setMinCompetitiveScore(minScore);
+      }
       if (minScore > minCompetitiveScore) {
         failStreak = 0;
       }
@@ -5823,8 +5865,12 @@ public:
     // itself. If adding idx would break that invariant, evict the highest-max
     // tail clause so it can be advanced into the head.
     int32_t insertTailWithOverflow(int32_t idx) {
-      if (maxScoreBelowThreshold(tailMaxScore + (double) clauseMax[(size_t) idx])
-          || tailSize + 1 < minMatch) {
+      bool scorePrunable = maxScoreBelowThreshold(
+          tailMaxScore + (double) clauseMax[(size_t) idx]);
+      if (scorePrunable || tailSize + 1 < minMatch) {
+        if (scorePrunable) {
+          skipCount(SkipStats::wandAdvancePrunes);
+        }
         addTail(idx);
         return -1;
       }
@@ -5911,9 +5957,10 @@ public:
     }
 
     bool candidateMatchesPivot() {
-      while (leadMaxScore < (double) minCompetitiveScore || leadSize < minMatch) {
+      while (maxScoreBelowThreshold(leadMaxScore) || leadSize < minMatch) {
         if (maxScoreBelowThreshold(leadMaxScore + tailMaxScore)
             || leadSize + tailSize < minMatch) {
+          skipCount(SkipStats::wandCandidatePrunes);
           return false;
         }
         int32_t idx = popTail();
@@ -5960,7 +6007,7 @@ public:
               tail(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               lead(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               minMatch(minMatch) {
-      assert(minMatch >= 2);
+      assert(minMatch >= 1);
       assert((int32_t)scorers.size() > minMatch);
       // Worst-case relative error of summing scorers.size() non-negative floats in
       // float arithmetic is bounded by (m-1)*u, u = 2^-24; round the double max-sum
@@ -6007,9 +6054,23 @@ public:
       }
     }
 
+    int32_t advanceShallow(int32_t target) override {
+      int32_t upTo = PostingsReader::END;
+      for (auto* scorer : scorers) {
+        if (scorer->docId() != PostingsReader::END) {
+          upTo = std::min(upTo, scorer->advanceShallow(target));
+        }
+      }
+      return upTo;
+    }
+
     float getMaxScore(int32_t upTo) override {
       double sum = 0.0;
       for (auto* scorer : scorers) {
+        int32_t doc = scorer->docId();
+        if (doc == PostingsReader::END || doc > upTo) {
+          continue;
+        }
         float maxScore = scorer->getMaxScore(upTo);
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
@@ -6032,6 +6093,10 @@ public:
     float refineMaxScore(int32_t upTo) override {
       double sum = 0.0;
       for (auto* scorer : scorers) {
+        int32_t doc = scorer->docId();
+        if (doc == PostingsReader::END || doc > upTo) {
+          continue;
+        }
         float maxScore = scorer->refineMaxScore(upTo);
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
