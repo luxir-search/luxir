@@ -22,6 +22,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
 #include "solux/search/Collector.h"
+#include "solux/reader/PosEnum.h"
 
 
 using namespace solux;
@@ -2214,7 +2215,7 @@ TEST_F(TermScorerTest, singleSeg) {
 
     ASSERT_EQ(tenum.seek("to"), true);
 
-    DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+    DocsEnum denum(tenum);
     ASSERT_EQ(denum.numDocs(), 2);
     ASSERT_EQ(denum.totalTermFreq(), 3);
 
@@ -3332,7 +3333,7 @@ TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   TermsEnum tenum = f.createTermsEnum();
   ASSERT_TRUE(tenum.seek("pulse"));
-  DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+  DocsEnum denum(tenum);
   EXPECT_TRUE(denum.hasTermImpacts());
   EXPECT_EQ(denum.numImpactBlocks(), 0);
   std::vector<int32_t> norms;
@@ -4388,7 +4389,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsEnum denum(pool, reader, tenum);
+  DocsEnum denum(tenum);
   EXPECT_FALSE(denum.hasTermImpacts());
 
   Similarity::FieldStats fieldStats;
@@ -5592,8 +5593,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
 
   // Contiguous windows with boundaries that land inside word blocks (4097 is
   // deliberately off the 128-doc grid).
-  DocsEnum denum(testIndex.pool, postingsReader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
   const int32_t bounds[] = {0, 1000, 4097, 6000, N + 100};
   std::vector<int32_t> got;
   for (size_t w = 0; w + 1 < std::size(bounds); w++) {
@@ -5612,8 +5612,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
 
   // A window opening past the enum position: leading docs are consumed
   // unrecorded and the first word block is clipped.
-  DocsEnum denum2(testIndex.pool, postingsReader, tenum);
-  denum2.setTrackPositions(false);
+  DocsEnum denum2(tenum);
   const int32_t from = 50, to = 700;
   std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
   denum2.intoBitSet(bits, from, to);
@@ -5674,8 +5673,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
                           std::initializer_list<int32_t> targets) {
     TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
     ASSERT_TRUE(tenum.seek(term));
-    DocsEnum denum(testIndex.pool, postingsReader, tenum);
-    denum.setTrackPositions(false);
+    DocsEnum denum(tenum);
     int32_t last = -1;
     for (int32_t target : targets) {
       ASSERT_GT(target, last) << term;
@@ -5699,8 +5697,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
 
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("ado_word"));
-  DocsEnum denum(testIndex.pool, postingsReader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
   auto firstWindowDoc = std::lower_bound(wordExpected.begin(), wordExpected.end(), 4096);
   ASSERT_NE(firstWindowDoc, wordExpected.end());
   int32_t from = *firstWindowDoc;
@@ -5860,17 +5857,17 @@ TEST_F(TermScorerTest, docsOnlyEnumProtocolAssertsOnFreqAndPositions) {
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("protocol"));
 
-  DocsEnum denum(testIndex.pool, postingsReader, tenum);
+  DocsEnum denum(tenum);
   auto docs = denum.peekDocBlock();
   ASSERT_FALSE(docs.empty());
   denum.consumeDocOnlyBlock(1);
   ASSERT_DEATH({ (void) denum.termFreq(); }, "");
 
-  DocsEnum denum2(testIndex.pool, postingsReader, tenum);
+  DocsEnum denum2(tenum);
   docs = denum2.peekDocBlock();
   ASSERT_FALSE(docs.empty());
   denum2.consumeDocOnlyBlock(1);
-  ASSERT_DEATH({ denum2.startPositions(); }, "");
+  ASSERT_DEATH({ PosEnum positions(denum2); unused(positions); }, "");
 #endif
 }
 

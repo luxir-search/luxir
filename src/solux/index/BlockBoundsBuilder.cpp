@@ -144,7 +144,7 @@ BlockBoundsBuilder::Result BlockBoundsBuilder::build(
   TermsEnum terms(pool, postingsReader, fieldInfo);
   DocsEnum::GroupImpacts groups;
   while (terms.nextTerm()) {
-    DocsEnum docs(pool, postingsReader, terms);
+    DocsEnum docs(terms);
     uint32_t blocks = (uint32_t) docs.numImpactBlocks();
     if (blocks < 4) continue;
     uint32_t groupCount = (uint32_t) docs.numImpactGroups();

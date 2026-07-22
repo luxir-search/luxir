@@ -12,6 +12,7 @@
 #include "solux/index/IndexWriter.h"
 #include "solux/query/Query.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/PosEnum.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/PostingsReader.h"
@@ -124,7 +125,7 @@ std::string repeatedTerm(std::string_view term, int32_t tf) {
   return text;
 }
 
-IteratedStats iterateStats(DocsEnum& docsEnum, bool readPositions) {
+IteratedStats iterateStats(DocsEnum& docsEnum, PosEnum* posEnum = nullptr) {
   IteratedStats stats;
   for (;;) {
     int32_t doc = docsEnum.nextDoc();
@@ -135,10 +136,10 @@ IteratedStats iterateStats(DocsEnum& docsEnum, bool readPositions) {
     stats.df++;
     int32_t tf = docsEnum.termFreq();
     stats.ttf += tf;
-    if (readPositions) {
-      docsEnum.startPositions();
+    if (posEnum != nullptr) {
+      posEnum->startPositions();
       for (int32_t i = 0; i < tf; i++) {
-        EXPECT_NE(docsEnum.nextPosition(), DocsEnum::END);
+        EXPECT_NE(posEnum->nextPosition(), PosEnum::END);
       }
     }
   }
@@ -318,8 +319,12 @@ IteratedStats readQueryPostingsStats(MemPool& pool, IndexReader& reader,
     if (termsEnum == nullptr || !termsEnum->seek(term)) {
       continue;
     }
-    DocsEnum docsEnum(pool, reader.segments()[(size_t) i].postingsReader(), *termsEnum);
-    IteratedStats segmentStats = iterateStats(docsEnum, readPositions);
+    DocsEnum docsEnum(*termsEnum);
+    std::unique_ptr<PosEnum> posEnum;
+    if (readPositions) {
+      posEnum = std::make_unique<PosEnum>(docsEnum);
+    }
+    IteratedStats segmentStats = iterateStats(docsEnum, posEnum.get());
     stats.df += segmentStats.df;
     stats.ttf += segmentStats.ttf;
   }
@@ -480,7 +485,7 @@ TEST_F(TermsDictTest, PulsedMaskEdgesPreserveDocsOnlyPostingsAndStats) {
     ASSERT_TRUE(tenum.seek(terms[i])) << terms[i];
     EXPECT_EQ(tenum.docFreq(), dfs[i]) << terms[i];
     EXPECT_EQ(tenum.totalTermFreq(), dfs[i]) << terms[i];
-    DocsEnum docsEnum(guard.pool(), seg->postingsReader(), tenum);
+    DocsEnum docsEnum(tenum);
     EXPECT_EQ(docsEnum.numDocs(), dfs[i]) << terms[i];
     EXPECT_EQ(docsEnum.totalTermFreq(), dfs[i]) << terms[i];
   }
@@ -513,8 +518,9 @@ TEST_F(TermsDictTest, AllDefaultMetadataRunsPreservePulsedMultiBlockPostings) {
     ASSERT_EQ((std::string_view) tenum.term(), term.name);
     int32_t dictDf = tenum.docFreq();
     int64_t dictTtf = tenum.totalTermFreq();
-    DocsEnum docsEnum(pool, *reader, tenum);
-    IteratedStats stats = iterateStats(docsEnum, true);
+    DocsEnum docsEnum(tenum);
+    PosEnum posEnum(docsEnum);
+    IteratedStats stats = iterateStats(docsEnum, &posEnum);
     EXPECT_EQ(stats.df, 1) << term.name;
     EXPECT_EQ(stats.ttf, 1) << term.name;
     EXPECT_EQ(dictDf, stats.df) << term.name;
@@ -550,8 +556,9 @@ TEST_F(TermsDictTest, MixedMetadataRunsKeepNonUniformRowsExplicit) {
     ASSERT_TRUE(tenum.nextTerm()) << term.name;
     int32_t dictDf = tenum.docFreq();
     int64_t dictTtf = tenum.totalTermFreq();
-    DocsEnum docsEnum(pool, *reader, tenum);
-    IteratedStats stats = iterateStats(docsEnum, true);
+    DocsEnum docsEnum(tenum);
+    PosEnum posEnum(docsEnum);
+    IteratedStats stats = iterateStats(docsEnum, &posEnum);
     EXPECT_EQ(dictDf, stats.df) << term.name;
     EXPECT_EQ(dictTtf, stats.ttf) << term.name;
     EXPECT_EQ(stats.ttf, expectedTtf(fieldInfo.flags, term)) << term.name;
@@ -593,7 +600,11 @@ TEST_F(TermsDictTest, StatsAccessorsMatchDocsEnumAcrossIndexLevels) {
       ASSERT_EQ((std::string_view) tenum.term(), term.name);
       int32_t dictDf = tenum.docFreq();
       int64_t dictTtf = tenum.totalTermFreq();
-      DocsEnum docsEnum(pool, *reader, tenum);
+      DocsEnum docsEnum(tenum);
+      std::unique_ptr<PosEnum> posEnum;
+      if (FieldType::hasPositions(flags)) {
+        posEnum = std::make_unique<PosEnum>(docsEnum);
+      }
 
       int32_t seenDocs = 0;
       int64_t seenTtf = 0;
@@ -604,9 +615,9 @@ TEST_F(TermsDictTest, StatsAccessorsMatchDocsEnumAcrossIndexLevels) {
         seenDocs++;
         seenTtf += expectedTf;
         if (FieldType::hasPositions(flags)) {
-          docsEnum.startPositions();
+          posEnum->startPositions();
           for (int32_t i = 0; i < expectedTf; i++) {
-            ASSERT_EQ(docsEnum.nextPosition(), i * 2) << term.name;
+            ASSERT_EQ(posEnum->nextPosition(), i * 2) << term.name;
           }
         }
       }
@@ -700,11 +711,12 @@ TEST_F(TermsDictTest, LastTermBlockMetadataRunsDecodeUnderAsan) {
     ASSERT_TRUE(tenum.seek(term.name)) << term.name;
     EXPECT_EQ(tenum.docFreq(), 1) << term.name;
     EXPECT_EQ(tenum.totalTermFreq(), 1) << term.name;
-    DocsEnum docsEnum(pool, *reader, tenum);
+    DocsEnum docsEnum(tenum);
+    PosEnum posEnum(docsEnum);
     ASSERT_EQ(docsEnum.nextDoc(), term.docs[0].docid) << term.name;
     EXPECT_EQ(docsEnum.termFreq(), 1) << term.name;
-    docsEnum.startPositions();
-    EXPECT_EQ(docsEnum.nextPosition(), 0) << term.name;
+    posEnum.startPositions();
+    EXPECT_EQ(posEnum.nextPosition(), 0) << term.name;
     EXPECT_EQ(docsEnum.nextDoc(), DocsEnum::END) << term.name;
   }
 }
@@ -729,13 +741,17 @@ TEST_F(TermsDictTest, PulsedDocsEnumReadsDocOnlyAndPositions) {
     TermsEnum tenum(pool, *reader, fieldInfo);
     for (std::string_view name : {"a", "c"}) {
       ASSERT_TRUE(tenum.seek(name)) << name;
-      DocsEnum docsEnum(pool, *reader, tenum);
+      DocsEnum docsEnum(tenum);
+      std::unique_ptr<PosEnum> posEnum;
+      if (FieldType::hasPositions(flags)) {
+        posEnum = std::make_unique<PosEnum>(docsEnum);
+      }
       int32_t expectedDoc = name == "a" ? 7 : 19;
       ASSERT_EQ(docsEnum.nextDoc(), expectedDoc) << name;
       EXPECT_EQ(docsEnum.termFreq(), 1) << name;
       if (FieldType::hasPositions(flags)) {
-        docsEnum.startPositions();
-        EXPECT_EQ(docsEnum.nextPosition(), 0) << name;
+        posEnum->startPositions();
+        EXPECT_EQ(posEnum->nextPosition(), 0) << name;
       }
       EXPECT_EQ(docsEnum.nextDoc(), DocsEnum::END) << name;
     }
@@ -778,8 +794,12 @@ TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {
     EXPECT_EQ(tenum.docFreq(), 7);
     EXPECT_EQ(tenum.totalTermFreq(), expectedTtf);
 
-    DocsEnum docsEnum(pool, segment.postingsReader(), tenum);
-    IteratedStats stats = iterateStats(docsEnum, FieldType::hasPositions(level.flags));
+    DocsEnum docsEnum(tenum);
+    std::unique_ptr<PosEnum> posEnum;
+    if (FieldType::hasPositions(level.flags)) {
+      posEnum = std::make_unique<PosEnum>(docsEnum);
+    }
+    IteratedStats stats = iterateStats(docsEnum, posEnum.get());
     EXPECT_EQ(stats.df, 7);
     EXPECT_EQ(stats.ttf, expectedTtf);
   }

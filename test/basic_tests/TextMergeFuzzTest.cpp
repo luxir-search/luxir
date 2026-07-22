@@ -3,6 +3,7 @@
 #include "solux/index/PostingsWriter.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/reader/PosEnum.h"
 #include "solux/schema/Schema.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
@@ -92,7 +93,11 @@ protected:
     for (const auto& [term, postings] : oracle) {
       ASSERT_TRUE(terms.nextTerm()) << field << " missing " << term;
       ASSERT_EQ(term, std::string_view(terms.term())) << field;
-      DocsEnum docs(index.pool, segment.postingsReader(), terms);
+      DocsEnum docs(terms);
+      std::unique_ptr<PosEnum> posEnum;
+      if (hasPositions) {
+        posEnum = std::make_unique<PosEnum>(docs);
+      }
       ASSERT_EQ((int32_t) postings.size(), docs.numDocs()) << field << " " << term;
       int64_t ttf = expectedTtf(postings, hasFreqs);
       ASSERT_EQ(ttf, docs.totalTermFreq()) << field << " " << term;
@@ -106,12 +111,12 @@ protected:
         int32_t tf = hasFreqs ? (int32_t) posting.positions.size() : 1;
         ASSERT_EQ(tf, docs.termFreq()) << field << " " << term << " doc " << posting.doc;
         if (hasPositions) {
-          docs.startPositions();
+          posEnum->startPositions();
           for (int32_t position : posting.positions) {
-            ASSERT_EQ(position, docs.nextPosition())
+            ASSERT_EQ(position, posEnum->nextPosition())
                 << term << " doc " << posting.doc;
           }
-          ASSERT_EQ(DocsEnum::END, docs.nextPosition());
+          ASSERT_EQ(PosEnum::END, posEnum->nextPosition());
         }
       }
       ASSERT_EQ(DocsEnum::END, docs.nextDoc()) << field << " " << term;
@@ -143,7 +148,7 @@ protected:
         std::string_view term(terms.term());
         if (!term.starts_with("uid")) continue;
         int32_t sourceId = (int32_t) std::stoi(std::string(term.substr(3)));
-        DocsEnum docs(index.pool, segment.postingsReader(), terms);
+        DocsEnum docs(terms);
         int32_t localDoc = docs.nextDoc();
         ASSERT_NE(DocsEnum::END, localDoc);
         ASSERT_EQ(-1, sourceIds[(size_t) localDoc]);
@@ -364,10 +369,11 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   sourceFields.readFieldInfo(sourceInfo);
   TermsEnum sourceTerms(pool, sourceReader, sourceInfo);
   ASSERT_TRUE(sourceTerms.nextTerm());
-  DocsEnum sourceDocs(pool, sourceReader, sourceTerms);
+  DocsEnum sourceDocs(sourceTerms);
+  PosEnum sourcePositions(sourceDocs);
   ASSERT_EQ(0, sourceDocs.nextDoc());
   ASSERT_EQ(3, sourceDocs.termFreq());
-  sourceDocs.startPositions();
+  sourcePositions.startPositions();
 
   RAMDir targetDir;
   PostingsWriter targetPostings(targetDir, 1, 1);
@@ -382,7 +388,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
     writer.startDoc(0);
     std::vector<int32_t> copied;
     for (;;) {
-      auto deltas = sourceDocs.nextPositionDeltaSpan();
+      auto deltas = sourcePositions.nextPositionDeltaSpan();
       if (deltas.empty()) break;
       copied.insert(copied.end(), deltas.begin(), deltas.end());
       writer.appendPositionDeltas(deltas);
@@ -401,12 +407,13 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   targetFields.readFieldInfo(targetInfo);
   TermsEnum targetTerms(pool, targetReader, targetInfo);
   ASSERT_TRUE(targetTerms.nextTerm());
-  DocsEnum targetDocs(pool, targetReader, targetTerms);
+  DocsEnum targetDocs(targetTerms);
+  PosEnum targetPositions(targetDocs);
   ASSERT_EQ(0, targetDocs.nextDoc());
   ASSERT_EQ(3, targetDocs.termFreq());
-  targetDocs.startPositions();
-  ASSERT_EQ(0, targetDocs.nextPosition());
-  ASSERT_EQ(0, targetDocs.nextPosition());
-  ASSERT_EQ(300, targetDocs.nextPosition());
-  ASSERT_EQ(DocsEnum::END, targetDocs.nextPosition());
+  targetPositions.startPositions();
+  ASSERT_EQ(0, targetPositions.nextPosition());
+  ASSERT_EQ(0, targetPositions.nextPosition());
+  ASSERT_EQ(300, targetPositions.nextPosition());
+  ASSERT_EQ(PosEnum::END, targetPositions.nextPosition());
 }

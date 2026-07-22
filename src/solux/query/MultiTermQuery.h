@@ -226,14 +226,11 @@ public:
             std::span<uint64_t> bitWords(words, nWords);
 
             for (const auto& state : states) {
-              DocsEnum docsEnum(targetPool, state);
-              docsEnum.setTrackPositions(false);
+              DocsEnum docsEnum(state);
               docsEnum.intoBitSet(bitWords, 0, maxDoc);
             }
             while (fenum->next()) {
-              DocsEnum docsEnum(
-                  targetPool, segment.postingsReader(), fenum->terms());
-              docsEnum.setTrackPositions(false);
+              DocsEnum docsEnum(fenum->terms());
               docsEnum.intoBitSet(bitWords, 0, maxDoc);
             }
             return targetPool.make<MultiTermQuery::Scorer>(bits, maxDoc, boost);
@@ -245,8 +242,7 @@ public:
         auto* docsEnums = (DocsEnum*) targetPool.alloc(
             states.size() * sizeof(DocsEnum), alignof(DocsEnum));
         for (size_t i = 0; i < states.size(); i++) {
-          new (&docsEnums[i]) DocsEnum(targetPool, states[i]);
-          docsEnums[i].setTrackPositions(false);
+          new (&docsEnums[i]) DocsEnum(states[i]);
         }
         constexpr size_t windowWords = (size_t) DocsEnum::L1_DOCS / 64;
         auto windowBits = targetPool.make_span<uint64_t>(windowWords);
@@ -266,7 +262,7 @@ public:
       while (fenum->next()) {
         anyTerm = true;
         {
-          DocsEnum docsEnum(targetPool, segment.postingsReader(), fenum->terms());
+          DocsEnum docsEnum(fenum->terms());
           for (int32_t doc = docsEnum.nextDoc(); doc != PostingsReader::END; doc = docsEnum.nextDoc()) {
             bits.set(doc);
           }

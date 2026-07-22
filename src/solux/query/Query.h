@@ -187,15 +187,12 @@ struct CachedTermInfo {
 
   /// Construct an independent DocsEnum from the immutable state captured by the
   /// original term seek. No dictionary re-seek or shared mutable enum is involved.
-  DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment,
-                        bool trackPositions = true) {
+  DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
     auto* state = postingsStates[segment.ord];
     if (state == nullptr) {
       return nullptr;
     }
-    auto* docsEnum = targetPool.make<DocsEnum>(targetPool, *state);
-    docsEnum->setTrackPositions(trackPositions);
-    return docsEnum;
+    return targetPool.make<DocsEnum>(*state);
   }
 
   int32_t docFreq(int32_t segmentOrd) const {

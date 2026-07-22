@@ -11,6 +11,7 @@
 #include "ImpactsIndex.h"
 #include "Query.h"
 #include "solux/reader/NormsReader.h"
+#include "solux/reader/PosEnum.h"
 
 namespace solux {
 
@@ -32,6 +33,7 @@ public:
 
   struct RepeatGroup {
     DocsEnum* docsEnum = nullptr;
+    PosEnum* posEnum = nullptr;
     int32_t* buf = nullptr;
     int32_t cap = 0;
     int32_t count = 0;
@@ -100,8 +102,13 @@ public:
       if (segFieldInfo == nullptr) return nullptr;
 
       auto querySlotEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
+      auto querySlotPosEnums = targetPool.make_span<PosEnum*>(cachedTermInfos.size());
       auto queryTerms = query.getTerms();
-      std::vector<DocsEnum*> distinct;
+      struct TermEnums {
+        DocsEnum* docs;
+        PosEnum* positions;
+      };
+      std::vector<TermEnums> distinct;
       distinct.reserve(cachedTermInfos.size());
       bool dedupRepeats = !ScorerControls::disableRepeatDedupForTests || query.getSlop() > 0;
       for (int32_t i = 0; i < (int32_t) cachedTermInfos.size(); i++) {
@@ -116,12 +123,15 @@ public:
         }
         if (first != i) {
           querySlotEnums[(size_t) i] = querySlotEnums[(size_t) first];
+          querySlotPosEnums[(size_t) i] = querySlotPosEnums[(size_t) first];
           continue;
         }
         DocsEnum* docsEnum = cachedTermInfos[(size_t) i]->useDocsEnum(targetPool, segment);
         if (docsEnum == nullptr) return nullptr;
+        PosEnum* posEnum = targetPool.make<PosEnum>(*docsEnum);
         querySlotEnums[(size_t) i] = docsEnum;
-        distinct.push_back(docsEnum);
+        querySlotPosEnums[(size_t) i] = posEnum;
+        distinct.push_back({docsEnum, posEnum});
       }
 
       auto byCost = [](DocsEnum* a, DocsEnum* b) {
@@ -132,10 +142,17 @@ public:
         return false;
       };
       if (!ScorerControls::disableSortForTests) {
-        std::stable_sort(distinct.begin(), distinct.end(), byCost);
+        std::stable_sort(distinct.begin(), distinct.end(), [&](const TermEnums& a,
+                                                               const TermEnums& b) {
+          return byCost(a.docs, b.docs);
+        });
       }
-      auto conjunctionEnums = targetPool.copy_span(
-          std::span<DocsEnum*>(distinct.data(), distinct.size()));
+      auto conjunctionEnums = targetPool.make_span<DocsEnum*>(distinct.size());
+      auto conjunctionPosEnums = targetPool.make_span<PosEnum*>(distinct.size());
+      for (size_t i = 0; i < distinct.size(); i++) {
+        conjunctionEnums[i] = distinct[i].docs;
+        conjunctionPosEnums[i] = distinct[i].positions;
+      }
 
       std::vector<int32_t> order(querySlotEnums.size());
       for (size_t i = 0; i < order.size(); i++) order[i] = (int32_t) i;
@@ -149,11 +166,13 @@ public:
         });
       }
       auto slotEnums = targetPool.make_span<DocsEnum*>(order.size());
+      auto slotPosEnums = targetPool.make_span<PosEnum*>(order.size());
       auto positions = targetPool.make_span<int32_t>(order.size());
       auto ordinals = targetPool.make_span<int32_t>(order.size());
       for (size_t k = 0; k < order.size(); k++) {
         int32_t ord = order[k];
         slotEnums[k] = querySlotEnums[(size_t) ord];
+        slotPosEnums[k] = querySlotPosEnums[(size_t) ord];
         positions[k] = query.getPositions()[(size_t) ord];
         ordinals[k] = ord;
       }
@@ -181,6 +200,7 @@ public:
       auto groups = targetPool.make_span<RepeatGroup>(groupSlots.size());
       for (size_t g = 0; g < groupSlots.size(); g++) {
         groups[g].docsEnum = slotEnums[(size_t) groupSlots[g][0]];
+        groups[g].posEnum = slotPosEnums[(size_t) groupSlots[g][0]];
         groups[g].slots = targetPool.copy_span(
             std::span<int32_t>(groupSlots[g].data(), groupSlots[g].size()));
       }
@@ -214,11 +234,13 @@ public:
 
       if (query.getSlop() > 0) {
         return targetPool.make<SloppyScorer>(
-            targetPool, slotEnums, positions, ordinals, conjunctionEnums, normsReader,
+            targetPool, slotEnums, slotPosEnums, positions, ordinals,
+            conjunctionEnums, conjunctionPosEnums, normsReader,
             simScorer, impacts, impactMultiplicities, slotGroup, groups, query.getSlop());
       }
       return targetPool.make<Scorer>(
-          targetPool, slotEnums, positions, ordinals, conjunctionEnums, normsReader,
+          targetPool, slotEnums, slotPosEnums, positions, ordinals,
+          conjunctionEnums, conjunctionPosEnums, normsReader,
           simScorer, impacts, impactMultiplicities, slotGroup, groups, 0);
     }
 
@@ -261,7 +283,7 @@ public:
 
     template<class S>
     int32_t doNextPosition(S& scorer, int32_t target) {
-      auto docsEnums = scorer.slotEnums;
+      auto posEnums = scorer.slotPosEnums;
       auto positions = scorer.positions;
       outer:
       for (;;) {
@@ -270,9 +292,9 @@ public:
           return PostingsReader::END;
         }
 
-        for (int j = 1; j < docsEnums.size(); j++) {
+        for (int j = 1; j < posEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
-          int32_t p = docsEnums[j]->advancePosition((int32_t) adjustedTarget);
+          int32_t p = posEnums[j]->advancePosition((int32_t) adjustedTarget);
           assert(p >= adjustedTarget);
           if (p > adjustedTarget) {
             target = p - positions[j];
@@ -281,7 +303,7 @@ public:
               return PostingsReader::END;
             }
             adjustedTarget = target + positions[0];
-            p = docsEnums[0]->advancePosition(adjustedTarget);
+            p = posEnums[0]->advancePosition(adjustedTarget);
             target = p - positions[0];
             goto outer;
           }
@@ -294,7 +316,7 @@ public:
 
     template<class S>
     int32_t doNextPositionRepeats(S& scorer, int32_t target) {
-      auto docsEnums = scorer.slotEnums;
+      auto posEnums = scorer.slotPosEnums;
       auto positions = scorer.positions;
       outer:
       for (;;) {
@@ -303,7 +325,7 @@ public:
           return PostingsReader::END;
         }
 
-        for (int j = 1; j < docsEnums.size(); j++) {
+        for (int j = 1; j < posEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
           int32_t p = scorer.repeatSlotAdvance(j, adjustedTarget);
           assert(p >= adjustedTarget);
@@ -358,11 +380,11 @@ public:
         }
       }
       skipCount(SkipStats::phraseVerifies);
-      for (auto* docsEnum : scorer.conjunctionEnums) docsEnum->startPositions();
+      for (auto* posEnum : scorer.conjunctionPosEnums) posEnum->startPositions();
       bool matched;
       if (scorer.groups.empty()) {
         matched = doNextPosition(
-            scorer, scorer.slotEnums[0]->advancePosition(scorer.positions[0])
+            scorer, scorer.slotPosEnums[0]->advancePosition(scorer.positions[0])
                         - scorer.positions[0]) != PostingsReader::END;
       } else {
         scorer.resetRepeatGroups();
@@ -378,7 +400,7 @@ public:
     int32_t numMatches(S& scorer) {
       while (pos != PostingsReader::END) {
         if (scorer.groups.empty()) {
-          doNextPosition(scorer, scorer.slotEnums[0]->nextPosition() - scorer.positions[0]);
+          doNextPosition(scorer, scorer.slotPosEnums[0]->nextPosition() - scorer.positions[0]);
         } else {
           doNextPositionRepeats(
               scorer, scorer.repeatSlotNext(0) - scorer.positions[0]);
@@ -459,7 +481,7 @@ public:
     template<class S>
     bool advanceSlot(S& scorer, int32_t slot) {
       int32_t position = scorer.slotGroup[(size_t) slot] < 0
-          ? scorer.slotEnums[(size_t) slot]->nextPosition()
+          ? scorer.slotPosEnums[(size_t) slot]->nextPosition()
           : scorer.repeatSlotNext(slot);
       if (position == PostingsReader::END) return false;
       setPosition(scorer, slot, position);
@@ -502,13 +524,13 @@ public:
       for (const RepeatGroup& group : scorer.groups) {
         if (group.docsEnum->termFreq() < (int32_t) group.slots.size()) return false;
       }
-      for (auto* docsEnum : scorer.conjunctionEnums) docsEnum->startPositions();
+      for (auto* posEnum : scorer.conjunctionPosEnums) posEnum->startPositions();
       scorer.resetRepeatGroups();
       endPosition = std::numeric_limits<int64_t>::min();
 
       for (int32_t slot = 0; slot < (int32_t) scorer.slotEnums.size(); slot++) {
         if (scorer.slotGroup[(size_t) slot] >= 0) continue;
-        int32_t position = scorer.slotEnums[(size_t) slot]->nextPosition();
+        int32_t position = scorer.slotPosEnums[(size_t) slot]->nextPosition();
         if (position == PostingsReader::END) return false;
         setPosition(scorer, slot, position);
       }
@@ -651,9 +673,11 @@ public:
     friend MatcherPolicy;
 
     std::span<DocsEnum*> slotEnums;
+    std::span<PosEnum*> slotPosEnums;
     std::span<const int32_t> positions;
     std::span<const int32_t> ordinals;
     std::span<DocsEnum*> conjunctionEnums;
+    std::span<PosEnum*> conjunctionPosEnums;
     MemPool* pool;
     std::span<const int32_t> slotGroup;
     std::span<RepeatGroup> groups;
@@ -718,7 +742,7 @@ public:
       assert(groupId >= 0);
       RepeatGroup& group = groups[(size_t) groupId];
       while (group.filled == 0 && group.filled < group.count) {
-        group.buf[group.filled++] = group.docsEnum->nextPosition();
+        group.buf[group.filled++] = group.posEnum->nextPosition();
       }
       slotCursor[(size_t) slot] = 0;
       return group.buf[0];
@@ -726,12 +750,12 @@ public:
 
     int32_t repeatSlotAdvance(int32_t slot, int32_t target) {
       int32_t groupId = slotGroup[(size_t) slot];
-      if (groupId < 0) return slotEnums[(size_t) slot]->advancePosition(target);
+      if (groupId < 0) return slotPosEnums[(size_t) slot]->advancePosition(target);
       RepeatGroup& group = groups[(size_t) groupId];
       int32_t idx = slotCursor[(size_t) slot];
       for (;;) {
         while (idx >= group.filled && group.filled < group.count) {
-          group.buf[group.filled++] = group.docsEnum->nextPosition();
+          group.buf[group.filled++] = group.posEnum->nextPosition();
         }
         if (group.buf[idx] >= target) break;
         idx++;
@@ -742,13 +766,13 @@ public:
 
     int32_t repeatSlotNext(int32_t slot) {
       int32_t groupId = slotGroup[(size_t) slot];
-      if (groupId < 0) return slotEnums[(size_t) slot]->nextPosition();
+      if (groupId < 0) return slotPosEnums[(size_t) slot]->nextPosition();
       RepeatGroup& group = groups[(size_t) groupId];
       int32_t idx = slotCursor[(size_t) slot];
       if (idx >= group.count) return PostingsReader::END;
       idx++;
       while (idx >= group.filled && group.filled < group.count) {
-        group.buf[group.filled++] = group.docsEnum->nextPosition();
+        group.buf[group.filled++] = group.posEnum->nextPosition();
       }
       slotCursor[(size_t) slot] = idx;
       return group.buf[idx];
@@ -809,14 +833,17 @@ public:
     }
 
     PhraseScorer(MemPool& targetPool, std::span<DocsEnum*> slotEnums,
+                 std::span<PosEnum*> slotPosEnums,
                  std::span<const int32_t> positions, std::span<const int32_t> ordinals,
-                 std::span<DocsEnum*> conjunctionEnums, NormsReader* normsReader,
+                 std::span<DocsEnum*> conjunctionEnums,
+                 std::span<PosEnum*> conjunctionPosEnums, NormsReader* normsReader,
                  Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
                  std::span<const int32_t> impactMultiplicities,
                  std::span<const int32_t> slotGroup, std::span<RepeatGroup> groups,
                  int32_t slop)
-        : slotEnums(slotEnums), positions(positions), ordinals(ordinals),
-          conjunctionEnums(conjunctionEnums), pool(&targetPool), slotGroup(slotGroup),
+        : slotEnums(slotEnums), slotPosEnums(slotPosEnums), positions(positions),
+          ordinals(ordinals), conjunctionEnums(conjunctionEnums),
+          conjunctionPosEnums(conjunctionPosEnums), pool(&targetPool), slotGroup(slotGroup),
           groups(groups), simScorer(simScorer), impacts(impacts),
           impactMultiplicities(impactMultiplicities), matcher(slop) {
       if (!groups.empty()) slotCursor = targetPool.make_span<int32_t>(slotEnums.size());

@@ -13,6 +13,7 @@
 #include "solux/query/TermQuery.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/search/Similarity.h"
+#include "solux/reader/PosEnum.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -422,7 +423,7 @@ protected:
     fieldReader.readFieldInfo(fieldInfo);
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot")) << label;
-    DocsEnum denum(pool, reader, tenum);
+    DocsEnum denum(tenum);
     assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers,
                         expectedGroupFrontiers);
   }
@@ -451,7 +452,7 @@ protected:
                                    const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     TermsEnum tenum = f.createTermsEnum();
     ASSERT_TRUE(tenum.seek("hot")) << label;
-    DocsEnum denum(f.testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+    DocsEnum denum(tenum);
     assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers,
                         expectedGroupFrontiers);
   }
@@ -461,7 +462,8 @@ protected:
                         int maxDoc, int indexIter, int walk) {
     SCOPED_TRACE(::testing::Message() << "indexIter=" << indexIter << " term=" << term << " walk=" << walk);
 
-    DocsEnum denum(testIndex.pool, reader, tenum);
+    DocsEnum denum(tenum);
+    PosEnum posEnum(denum);
     ASSERT_EQ(denum.numDocs(), (int) model.size()) << term;
 
     auto byDoc = [](const Posting& p, int32_t v) { return p.docid < v; };
@@ -484,13 +486,13 @@ protected:
       ASSERT_EQ(denum.termFreq(), model[j].tf) << term << " tf at doc " << cur;
 
       if (rng.rbool()) {
-        denum.startPositions();
+        posEnum.startPositions();
         int toRead = (int) rng.rint(0, model[j].tf + 1);
         for (int k = 0; k < toRead; k++) {
-          ASSERT_EQ(denum.nextPosition(), model[j].firstPos + k) << term << " pos " << k << " doc " << cur;
+          ASSERT_EQ(posEnum.nextPosition(), model[j].firstPos + k) << term << " pos " << k << " doc " << cur;
         }
         if (toRead == model[j].tf) {
-          ASSERT_EQ(denum.nextPosition(), DocsEnum::END) << term << " pos end doc " << cur;
+          ASSERT_EQ(posEnum.nextPosition(), PosEnum::END) << term << " pos end doc " << cur;
         }
       }
       i = j + 1;
@@ -559,10 +561,10 @@ TEST_F(DocsEnumAdvanceTest, advanceDocsOnly) {
 
   TermsEnum tenum = f.createTermsEnum();
   ASSERT_TRUE(tenum.seek("x"));
-  ASSERT_EQ(DocsEnum(testIndex.pool, f.currentSegment()->postingsReader(), tenum).numDocs(), N);
+  ASSERT_EQ(DocsEnum(tenum).numDocs(), N);
 
   // Random forward walk on one enum (resumes the skip cursor, never restarts at 0).
-  DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+  DocsEnum denum(tenum);
   int32_t cur = -1;
   while (cur != DocsEnum::END) {
     int32_t target = cur + 1 + (int32_t) rng.rint(0, rng.rbool() ? 5 : N);
@@ -608,7 +610,7 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsEnum denum(pool, reader, tenum);
+  DocsEnum denum(tenum);
 
   for (int32_t target : {0, 1, DocsEnum::L1_DOCS - 1, DocsEnum::L1_DOCS,
                          DocsEnum::L1_DOCS + 1, N - 2, N - 1}) {
@@ -632,8 +634,7 @@ TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -670,8 +671,7 @@ TEST_F(DocsEnumAdvanceTest, nextDocOnlyWalksResidentWordBlock) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
   ASSERT_EQ(denum.advanceDocOnly(1), 2);
   ASSERT_EQ(denum.nextDocOnly(), 3);
   ASSERT_EQ(denum.advanceDocOnly(64), 65);
@@ -696,8 +696,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -741,8 +740,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   SkipStats::enabled = true;
   SkipStats::reset();
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
   const int32_t from = 50;
   const int32_t to = 260;
   std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
@@ -751,8 +749,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   EXPECT_EQ(denum.docId(), 231);
   EXPECT_EQ(denum.nextDocOnly(), 264);
 
-  DocsEnum single(pool, reader, tenum);
-  single.setTrackPositions(false);
+  DocsEnum single(tenum);
   const int32_t singleFrom = 132;
   const int32_t singleTo = 133;
   std::vector<uint64_t> singleBits((size_t) (singleTo - singleFrom + 63) / 64, 0);
@@ -783,8 +780,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -825,8 +821,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("gapword"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -863,8 +858,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundar
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("runprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -900,8 +894,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowing
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("mixedprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -951,15 +944,14 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetRandomPartitionsMatchNextDocOracle) {
 
   const int32_t maxDoc = docs.back() + 97;
   std::vector<uint64_t> oracleBits((size_t) (maxDoc + 63) / 64, 0);
-  DocsEnum oracle(pool, reader, tenum);
+  DocsEnum oracle(tenum);
   for (int32_t doc = oracle.nextDoc(); doc != DocsEnum::END; doc = oracle.nextDoc()) {
     ASSERT_LT(doc, maxDoc);
     oracleBits[(size_t) doc >> 6] |= 1ULL << (doc & 63);
   }
 
   for (int32_t iter = 0; iter < 12; iter++) {
-    DocsEnum denum(pool, reader, tenum);
-    denum.setTrackPositions(false);
+    DocsEnum denum(tenum);
     std::vector<uint64_t> gotBits(oracleBits.size(), 0);
     int32_t from = 0;
     while (from < maxDoc) {
@@ -1000,8 +992,7 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("runprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -1041,8 +1032,7 @@ TEST_F(DocsEnumAdvanceTest, residentDocOnlyBlockPeekAndConsumeMaterializeSpan) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
   ASSERT_EQ(denum.advanceDocOnly(64), 65);
 
   auto expectedStart = std::lower_bound(docs.begin(), docs.end(), 65);
@@ -1193,7 +1183,7 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
     fieldReader.readFieldInfo(fieldInfo);
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot"));
-    DocsEnum denum(pool, reader, tenum);
+    DocsEnum denum(tenum);
 
     DocsEnum::GroupImpactCursor cursor;
     DocsEnum::GroupImpactHeader firstHeader;
@@ -1271,8 +1261,7 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsEnum denum(pool, reader, tenum);
-  denum.setTrackPositions(false);
+  DocsEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -1395,7 +1384,8 @@ protected:
     SCOPED_TRACE(::testing::Message() << "term=" << term << " readMode=" << readMode);
     TermsEnum tenum = f.createTermsEnum();
     ASSERT_TRUE(tenum.seek(term));
-    DocsEnum denum(f.testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+    DocsEnum denum(tenum);
+    PosEnum posEnum(denum);
 
     int32_t landings = 0;
     for (int32_t target : targets) {
@@ -1410,13 +1400,13 @@ protected:
                      : (landings % 4 == 0 ? 1 : 0);
       landings++;
       if (readMode == 2 && toRead == 0) continue;
-      denum.startPositions();
+      posEnum.startPositions();
       int32_t firstPos = firstPosFor(term, doc);
       for (int32_t k = 0; k < toRead; k++) {
-        ASSERT_EQ(denum.nextPosition(), firstPos + k) << "doc " << doc << " pos " << k;
+        ASSERT_EQ(posEnum.nextPosition(), firstPos + k) << "doc " << doc << " pos " << k;
       }
       if (toRead == tf) {
-        ASSERT_EQ(denum.nextPosition(), DocsEnum::END) << "doc " << doc << " pos end";
+        ASSERT_EQ(posEnum.nextPosition(), PosEnum::END) << "doc " << doc << " pos end";
       }
     }
   }

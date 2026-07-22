@@ -117,7 +117,7 @@ TEST_F(BlockBoundsTest, sourceWalkGeometryAndQueryIdentity) {
   MemPool pool;
   TermsEnum terms(pool, attached.segments()[0].postingsReader(), info);
   ASSERT_TRUE(terms.seek("common"));
-  DocsEnum docs(pool, attached.segments()[0].postingsReader(), terms);
+  DocsEnum docs(terms);
   EXPECT_EQ(terms.ord(), docs.termOrd());
   auto view = bounds->find(docs.termOrd());
   ASSERT_TRUE(view);
@@ -270,7 +270,7 @@ TEST_F(BlockBoundsTest, boostGuardsAndGeometryStateAreIndependent) {
   MemPool pool;
   TermsEnum terms(pool, reader.segments()[0].postingsReader(), info);
   ASSERT_TRUE(terms.seek("common"));
-  DocsEnum docs(pool, reader.segments()[0].postingsReader(), terms);
+  DocsEnum docs(terms);
   auto* field = reader.segments()[0].blockBounds(fixture.field);
   ASSERT_NE(nullptr, field);
   auto view = field->find(docs.termOrd());

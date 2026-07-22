@@ -404,7 +404,7 @@ public:
         fieldReader.readFieldInfo(segFieldInfo);
         TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
         while (tenum.nextTerm()) {
-          DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+          DocsEnum denum(tenum);
           int64_t count = 0;
           if (domain && domainCard < denum.numDocs()) {
             // Domain smaller than this term's postings: drive from the domain and

@@ -747,7 +747,7 @@ public:
             fieldReader.readFieldInfo(segFieldInfo);
             TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
             if (tenum.seek(key)) {
-              DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+              DocsEnum denum(tenum);
               while (true) {
                 auto doc = denum.nextDoc();
                 if (doc == DocsEnum::END) {

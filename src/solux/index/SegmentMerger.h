@@ -8,6 +8,7 @@
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/PosEnum.h"
 #include "solux/reader/NormsReader.h"
 #include "solux/reader/PointsReader.h"
 #include "solux/reader/StoredFieldsReader.h"
@@ -731,10 +732,11 @@ private:
       return;
     }
 
+    PosEnum positions(docsEnum);
     std::array<int32_t, Postings::DOCS_BLOCK_SIZE> mappedDocs;
     int32_t docid = docsEnum.nextDoc();
     while (docid != INT_MAX) {
-      auto block = docsEnum.currentPositionDocBlock();
+      auto block = docsEnum.currentDocFreqBlock();
       int32_t blockCount = (int32_t) block.docs.size();
       assert(blockCount > 0);
       assert(block.tfreqs.size() == block.docs.size());
@@ -757,12 +759,12 @@ private:
       }
 
       if (allLive) {
-        docsEnum.beginPositionDeltaBatch(blockCount);
+        positions.beginPositionDeltaBatch(blockCount);
         textWriter.addDocsWithPositions(
             std::span<const int32_t>(mappedDocs.data(), (size_t) blockCount),
             block.tfreqs,
             [&](int64_t maxCount) {
-              return docsEnum.nextPositionDeltaBatchSpan(maxCount);
+              return positions.nextPositionDeltaBatchSpan(maxCount);
             });
         docid = docsEnum.nextDoc();
         continue;
@@ -777,9 +779,9 @@ private:
           int32_t newDocid = seg.base + mappedDoc;
           int32_t tf = docsEnum.termFreq();
           textWriter.startDoc(newDocid);
-          docsEnum.startPositions();
+          positions.startPositions();
           for (;;) {
-            auto deltas = docsEnum.nextPositionDeltaSpan();
+            auto deltas = positions.nextPositionDeltaSpan();
             if (deltas.empty()) break;
             textWriter.appendPositionDeltas(deltas);
           }
@@ -1034,7 +1036,7 @@ private:
 
       do {
         TermsEnumIdx& entry = termPQ.top();
-        DocsEnum docsEnum(pool, *compactFields[entry.idx]->seg->postingsReader, entry.tenum);
+        DocsEnum docsEnum(entry.tenum);
         if (isOrdCol) {
           assert(ordCollector != nullptr);
           addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,

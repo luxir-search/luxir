@@ -7,6 +7,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/PosEnum.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/NormsReader.h"
 #include "solux/reader/OrdColReader.h"
@@ -380,12 +381,13 @@ namespace solux::test {
     }
     DocsEnum createDocsEnum(TermsEnum& termsEnum) {
       if (currSeg < 0) { nextSegment(); }
-      return DocsEnum(testIndex.pool, currentSegment()->postingsReader(), termsEnum);
+      return DocsEnum(termsEnum);
     }
 
     // the format of the array is [docid, termfreq, pos1, pos2, ..., docid2, termfreq2, ...]
     std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target, TermsEnum& termsEnum) {
       DocsEnum docsEnum = createDocsEnum(termsEnum);
+      PosEnum posEnum(docsEnum);
       target.resize(0);
       auto numDocs = 0;
       for (;;) {
@@ -394,11 +396,11 @@ namespace solux::test {
         numDocs++;
         target.push_back(docid);
         target.push_back(docsEnum.termFreq());
-        docsEnum.startPositions();
+        posEnum.startPositions();
         for (int32_t i = 0; i < docsEnum.termFreq(); i++) {
-          target.push_back(docsEnum.nextPosition());
+          target.push_back(posEnum.nextPosition());
         }
-        EXPECT_EQ(docsEnum.nextPosition(), DocsEnum::END);
+        EXPECT_EQ(posEnum.nextPosition(), PosEnum::END);
       }
       EXPECT_EQ(numDocs, docsEnum.numDocs());
       return target;
@@ -410,16 +412,17 @@ namespace solux::test {
     }
 
     std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target, DocsEnum& docsEnum) {
+      PosEnum posEnum(docsEnum);
       target.resize(0);
       int32_t docid = docsEnum.nextDoc();
       if (docid == DocsEnum::END) {
         return target;
       }
       target.push_back(docid);
-      docsEnum.startPositions();
+      posEnum.startPositions();
       for(;;) {
-        int32_t pos = docsEnum.nextPosition();
-        if (pos != DocsEnum::END) {
+        int32_t pos = posEnum.nextPosition();
+        if (pos != PosEnum::END) {
           target.push_back(pos);
         }
       }

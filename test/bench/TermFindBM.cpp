@@ -409,7 +409,7 @@ bool lookupTermStatsPostings(MemPool& pool, IndexReader& reader, CachedFieldInfo
       continue;
     }
     found = true;
-    DocsEnum docsEnum(pool, reader.segments()[i].postingsReader(), *termsEnum);
+    DocsEnum docsEnum(*termsEnum);
     result.docFreq += docsEnum.numDocs();
     result.totalTermFreq += docsEnum.totalTermFreq();
   }
@@ -793,7 +793,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
       if (found) {
         // hits++;
         fingerprint += tenum.term().size();
-        DocsEnum docsEnum(pool, postingsReader, tenum);
+        DocsEnum docsEnum(tenum);
         auto df = docsEnum.numDocs();
         // sumdf += df;
         fingerprint += df;

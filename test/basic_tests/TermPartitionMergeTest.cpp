@@ -2,6 +2,7 @@
 
 #include "solux/index/SegmentMerger.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/PosEnum.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "test/SegmentTest.h"
@@ -110,14 +111,15 @@ FieldSnapshot snapshotField(MemPool& pool, Segment& segment) {
     term.docFreq = terms.docFreq();
     term.totalTermFreq = terms.totalTermFreq();
     terms.readTermImpactFrontier(term.impactNorms, term.impactTfs);
-    DocsEnum docs(pool, segment.postingsReader(), terms);
+    DocsEnum docs(terms);
+    PosEnum positions(docs);
     for (int32_t doc = docs.nextDoc(); doc != DocsEnum::END; doc = docs.nextDoc()) {
       PostingSnapshot posting{doc, docs.termFreq(), {}};
-      docs.startPositions();
+      positions.startPositions();
       for (int32_t i = 0; i < posting.tf; i++) {
-        posting.positions.push_back(docs.nextPosition());
+        posting.positions.push_back(positions.nextPosition());
       }
-      EXPECT_EQ(DocsEnum::END, docs.nextPosition());
+      EXPECT_EQ(PosEnum::END, positions.nextPosition());
       term.postings.push_back(std::move(posting));
     }
     snapshot.terms.push_back(std::move(term));
@@ -211,11 +213,12 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
     term.docFreq = terms.docFreq();
     term.totalTermFreq = terms.totalTermFreq();
     terms.readTermImpactFrontier(term.impactNorms, term.impactTfs);
-    DocsEnum docs(pool, outputReader, terms);
+    DocsEnum docs(terms);
+    PosEnum positions(docs);
     for (int32_t doc = docs.nextDoc(); doc != DocsEnum::END; doc = docs.nextDoc()) {
       PostingSnapshot posting{doc, docs.termFreq(), {}};
-      docs.startPositions();
-      for (int32_t i = 0; i < posting.tf; i++) posting.positions.push_back(docs.nextPosition());
+      positions.startPositions();
+      for (int32_t i = 0; i < posting.tf; i++) posting.positions.push_back(positions.nextPosition());
       term.postings.push_back(std::move(posting));
     }
     snapshot.terms.push_back(std::move(term));

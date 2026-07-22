@@ -14,28 +14,22 @@
 #include <vector>
 
 namespace solux {
+class PosEnum;
+
 // TODO: templatize to be able to instrument, implement checkindex, etc...
 // TODO: investigate writing a version of this based on continuations and see how it performs?
 // TODO: some of this internal state could be removed... we only need some of it in the constructor?
 // Implementation note: moving block reading of docs and positions to cpp files and just leaving the hot path
 // in the header resulted in >3% performance loss for docs, and >5% loss for positions.
 class DocsEnum {
-  // Position ordinals are indexes into the term-global positions list for non-pulsed positions.
-  // Thus the max posOrd should thus be totalTermFreq (except in the case of a single pulsed term,
-  // in which case there is nothing to read from the posFile anyway).
-  int32_t* posBuf;       // the list of decoded position deltas (may be partial)
+  friend class PosEnum;
+
   int32_t* docBuf;       // the list of decoded docs (may be partial)
   int32_t* tfreqBuf;     // the list of decoded term freqs
 
-  int64_t posOrd = 0;         // the ordinal of the current position we are on
   int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
-  int64_t cumulativeTermFreq; // Synonym for posOrdEnd.  Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
+  int64_t cumulativeTermFreq = 0; // Synonym for posOrdEnd.  Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
   bool positionBatchActive = false;
-
-  int32_t posBufIdx = 0; // index of the next value to read in the position buffer
-  int32_t posBufEnd;     // one-past the last decoded position delta (but may be past the deltas for *this* doc
-  int32_t posBufLimit;   // one-past the last delta in the current doc or merge batch
-  int32_t pos;           // current position
 
   int32_t docOrd = 0;    // the ordinal of the current document we are on for this term
   int32_t docBufIdx = 0; // index of the next value to read in the docs buffer
@@ -66,11 +60,10 @@ class DocsEnum {
 
 
   InputStream docIS;
-  InputStream posIS;
-  MemPool* pool;
+  InputStream positionInput;
   bool hasFreqs;      // field indexes term freqs (else tfreq is implicitly 1)
   bool hasPositions;  // field indexes positions (else there is no position stream)
-  bool trackPositions; // keep cumulative-tf/position state current for startPositions()
+  bool positionTrackingEnabled = false;
   bool hasNorms;      // text fields with positions carry encoded length norms
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
@@ -80,6 +73,10 @@ class DocsEnum {
   int64_t endOfDocs;
 
   int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
+  int32_t pulsedPosition = 0;
+  int64_t pendingPosBlockOrd = 0;
+  int64_t pendingPosAbsoluteOffset = 0;
+  bool pendingPosSeekValid = false;
   const char* termImpactFrontierPtr = nullptr;
   uint32_t termImpactFrontierLen = 0;
   int64_t termOrdinal = -1;  // captured once from the positioned TermsEnum
@@ -119,7 +116,7 @@ public:
     }
   };
 
-  struct PositionDocBlock {
+  struct DocFreqBlock {
     std::span<const int32_t> docs;
     std::span<const int32_t> tfreqs;
   };
@@ -194,16 +191,7 @@ private:
   // +7: expandDocWords writes branchless 8-wide rows, spilling up to 7 slots
   // past the last doc.
   int32_t db[Postings::DOCS_BLOCK_SIZE + 7];  // temporary...
-  int32_t pb[Postings::POSITIONS_BLOCK_SIZE];
   int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
-
-  // returns the ord of the last position in the last full block.. i.e. for 150 positions, it would return 127 (0-127 are in first block)
-  // for 10, it would return -1 (there are no block encoded positions)
-  static int64_t lastBlockEncodedPosOrd(uint64_t ttf) {
-    // A ttf of 127 means we don't have a full block... so return -1.
-    // A ttf of 128 through (128+127) means ords 0-127 are in first block and we would want to return 127.
-    return (ttf & ~(Postings::POSITIONS_BLOCK_SIZE-1)) - 1;
-  }
 
   static uint32_t readVint15(const char*& pos, const char* end) {
     assert(pos + 2 <= end);
@@ -575,7 +563,7 @@ private:
 
   int32_t advanceScoredNoPositionsFromReadyBlock(int32_t target) {
     assert(docid < target);
-    assert(!trackPositions);
+    assert(!positionTrackingEnabled);
     assert(!docsOnlyConsumed);
     assert(!docBlockResident);
     assert(!scoredWordProbeActive);
@@ -612,13 +600,20 @@ private:
     return docid;
   }
 
+  // Called once by PosEnum's constructor to switch on the alignment
+  // bookkeeping (cumulativeTermFreq/posOrdStart/deferred repair) that the
+  // doc/freq decode hot path otherwise skips entirely.
+  void enablePositionTracking() {
+    positionTrackingEnabled = true;
+  }
+
   void clearPendingPositionRepair() {
     posRepairDirty = false;
     posRepairStart = posRepairEnd = 0;
   }
 
   void markPendingPositionRepair(int32_t start, int32_t end) {
-    if (!trackPositions || start >= end) {
+    if (!positionTrackingEnabled || start >= end) {
       return;
     }
     if (posRepairDirty) {
@@ -662,65 +657,21 @@ private:
     clearPendingPositionRepair();
   }
 
-  bool ensurePositionDeltaAvailable() {
-    if (posBufIdx < posBufLimit) {
-      return true;
-    }
-
-    int64_t leftToRead = cumulativeTermFreq - posOrd;
-    if (leftToRead <= 0) {
-      assert(posOrd == cumulativeTermFreq);
-      return false;
-    }
-
-    if (posBufEnd > posBufLimit) {
-      posBufLimit = (int32_t) std::min(
-          (int64_t) posBufEnd, (int64_t) posBufIdx + leftToRead);
-      return true;
-    }
-
-    assert(posBufLimit == posBufEnd);
-    if (posOrd <= lastBlockEncodedPosOrd(ttf)) {
-      uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-      auto bytesRead = IndexCodec::posCodec.decodeBlock(
-          posIS.ptr(), posIS.left(), (uint32_t*) posBuf, outSz);
-      posIS.skip(bytesRead);
-      assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
-      skipCount(SkipStats::posBlocksDecoded);
-      posBufIdx = 0;
-      posBufEnd = (int32_t) outSz;
-      posBufLimit = (int32_t) std::min((int64_t) posBufEnd, leftToRead);
-    } else {
-      assert(leftToRead < Postings::POSITIONS_BLOCK_SIZE);
-      posBufIdx = 0;
-      posBufEnd = (int32_t) leftToRead;
-      posBufLimit = posBufEnd;
-      for (int32_t i = posBufIdx; i < posBufEnd; i++) {
-        posBuf[i] = (int32_t) posIS.readVint();
-      }
-    }
-    return true;
-  }
-
 public:
-  /// sentinel value used for both docs and positions
+  /// sentinel value used for docs
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
-  DocsEnum(MemPool& pool, const TermsEnum::PostingsState& state,
-           int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : docIS(state.docIS), posIS(state.posIS), pool(&pool),
+  explicit DocsEnum(const TermsEnum::PostingsState& state)
+  : docIS(state.docIS), positionInput(state.posIS),
     hasFreqs(state.hasFreqs), hasPositions(state.hasPositions),
     docfreq(state.docFreq), ttf(state.totalTermFreq),
     docsSize(state.docsEnd - state.docsStart), startOfDocs(state.docsStart),
-    endOfDocs(state.docsEnd), posStartLoc(state.posStart),
+    endOfDocs(state.docsEnd), posStartLoc(state.posStart), pulsedPosition(state.pulsedPos),
     termImpactFrontierPtr(state.termImpactFrontier.ptr),
     termImpactFrontierLen(state.termImpactFrontier.len), termOrdinal(state.termOrdinal)
   {
-    unused(docsScratch, posScratch, tfreqScratch);
     docBuf=db;
-    posBuf=pb;
     tfreqBuf=tb;
-    trackPositions = hasPositions;
     hasNorms = hasPositions;
     assert(endOfDocs >= startOfDocs);
     docid = -1;
@@ -730,35 +681,26 @@ public:
       assert(docfreq == 1);
       tfreq = 1;
       assert(ttf == 1);
-      // fill buffers with the single pulsed doc (+ position, if the field indexes them)
+      // Fill the doc/freq buffers. PosEnum initializes the pulsed position lazily.
       docBuf[0] = state.pulsedDoc;
       docBufEnd = 1;
       tfreqBuf[0] = 1;
       tfreqBufEnd = 1;
-      posBufIdx = 0;
-      if (hasPositions) {
-        posBuf[0] = state.pulsedPos;
-        posBufLimit = posBufEnd = 1;
-      } else {
-        posBufLimit = posBufEnd = 0;
-      }
       cumulativeTermFreq = 0;  // this will be incremented in nextDoc()
-      // std::cout << "Pulsed posting: id=" << docid << "pos=" << posBuf[0] << std::endl;
 
     } else {
-      pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3  // todo: revisit
+      tfreq = -1;  // unnecessary initialization, but it avoids a maybe-uninitialized warning with -O3
       assert(endOfDocs - startOfDocs == docsSize);
       docBufEnd = 0;
       numDocBlocks = (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
       numDocGroups = (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
 
       if (hasPositions) {
-        assert(posIS.offset() == posStartLoc);
+        assert(positionInput.offset() == posStartLoc);
       }
 
       assert(docIS.offset() == startOfDocs);
 
-      posBufLimit = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
       nextL0Block = 0;
       nextL0Base = 0;
@@ -771,28 +713,13 @@ public:
     }
   }
 
-  // Capture the positioned term once, then initialize through the immutable
-  // state constructor used by the query cache.
-  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
-           int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-      : DocsEnum(pool, tenum.postingsState(), docsScratch, posScratch, tfreqScratch) {
-    assert(&postingsReader == &tenum.postingsReader);
-  }
+  explicit DocsEnum(TermsEnum& termsEnum) : DocsEnum(termsEnum.postingsState()) {}
 
   DocsEnum(const DocsEnum& other) = delete;
 
   /// whether this field indexes positions (false for DOCS / DOCS_AND_FREQS fields)
   bool indexHasPositions() const {
     return hasPositions;
-  }
-
-  void setTrackPositions(bool enabled) {
-    assert(!(enabled && docBlockResident));  // resident state never serves positions
-    assert(!scoredWordProbeActive);
-    trackPositions = enabled && hasPositions;
-    if (!trackPositions) {
-      clearPendingPositionRepair();
-    }
   }
 
   /// number of documents containing the term
@@ -942,7 +869,7 @@ private:
           tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
         }
         if constexpr (!DOCS_ONLY) {
-          if (trackPositions) {
+          if (positionTrackingEnabled) {
             // cumulativeTermFreq still sits at the block start here: the
             // boundary discard above re-anchored it, and only the per-doc
             // advance below moves it. Constant loop bound: this sum is on the
@@ -975,7 +902,7 @@ private:
         docBufIdx = 0;
         docBufEnd = leftToRead;
         if constexpr (!DOCS_ONLY) {
-          if (trackPositions) {
+          if (positionTrackingEnabled) {
             int64_t blockTfSum = 0;
             for (int i = 0; i < leftToRead; i++) {
               blockTfSum += tfreqBuf[i];
@@ -1016,7 +943,7 @@ private:
       } else {
         tfreq = 1;
       }
-      if (trackPositions) {
+      if (positionTrackingEnabled) {
         markPendingPositionRepair(docBufIdx - 1, docBufIdx);
       }
     }
@@ -1272,7 +1199,7 @@ private:
   void enterDocOnlyResidentBlock(int32_t blockStartOrd, uint32_t docBase,
                                  uint32_t blockLast, int32_t numWords) {
     assert(!docBlockResident);
-    assert(!trackPositions);
+    assert(!positionTrackingEnabled);
     assert(bodyReady);
     assert(docIS.ptr() < docIS.ptr(endOfDocs));
 
@@ -1307,7 +1234,7 @@ private:
 
   bool tryEnterDocOnlyResidentBlock(int32_t target) {
     assert(!docBlockResident);
-    assert(!trackPositions);
+    assert(!positionTrackingEnabled);
     if (docfreq - docOrd < Postings::DOCS_BLOCK_SIZE) {
       return false;
     }
@@ -1468,7 +1395,7 @@ public:
   // Whole word-encoded blocks below upTo are OR'd straight from the stream;
   // everything else decodes and scatters per doc.
   void intoBitSet(std::span<uint64_t> bits, int32_t bitsBase, int32_t upTo) {
-    assert(!trackPositions);
+    assert(!positionTrackingEnabled);
     assert(!scoredWordProbeActive);
     docsOnlyConsumed = true;
     for (;;) {
@@ -1612,7 +1539,7 @@ public:
     }
     docid = docBuf[limit - 1];
     blockMode = true;
-    if (trackPositions) {
+    if (positionTrackingEnabled) {
       // Preserve this API's contract: block consumers do not repair position
       // metadata. Since the current doc changed, any deferred repair for the
       // previous cursor position is no longer meaningful.
@@ -1624,7 +1551,7 @@ public:
     assert(target > docid);
     assert(!docsOnlyConsumed);
     assert(!docBlockResident);
-    assert(!trackPositions);
+    assert(!positionTrackingEnabled);
     assert(!scoredWordProbeActive);
     skipCount(SkipStats::advanceCalls);
 
@@ -1753,6 +1680,7 @@ public:
     assert(!scoredWordProbeActive);
     blockMode = false;
     clearPendingPositionRepair();
+    pendingPosSeekValid = false;
     const char* const streamStart = docIS.ptr(0);
     const char* const end = docIS.ptr(endOfDocs);
     const char* p = docIS.ptr();
@@ -1784,23 +1712,14 @@ public:
           docIS.seek(body - streamStart);
           docOrd = block * Postings::DOCS_BLOCK_SIZE;
           tfreqOrd = docOrd;
-          cumulativeTermFreq = cumTf;  // restores position alignment; unused when !trackPositions
-          if (trackPositions) {
-            // This doc block's first position is cumTf % POSITIONS_BLOCK_SIZE
-            // positions into the position block at posByteOff.  Seek there
-            // directly instead of letting startPositions walk the intervening
-            // blocks - unless the stream already sits at or past that block
-            // (then the buffered state is still the cheapest path forward).
-            int64_t posBlockStartOrd = cumTf - (cumTf % Postings::POSITIONS_BLOCK_SIZE);
-            int64_t streamOrd = posOrd + (posBufEnd - posBufIdx);
-            if (posBlockStartOrd > streamOrd) {
-              posIS.seek(posStartLoc + (int64_t) blockPosByteOff);
-              posOrd = posBlockStartOrd;
-              // Full buffer reset (a stale posBufLimit reads past posBuf - see
-              // the startPositions whole-block skip note).
-              posBufIdx = posBufEnd = posBufLimit = 0;
-              skipCount(SkipStats::posSeeks);
-            }
+          cumulativeTermFreq = cumTf;  // restores position alignment; unused when !positionTrackingEnabled
+          if (positionTrackingEnabled) {
+            // Publish a forward seek anchor. PosEnum applies it lazily before
+            // serving positions, preserving the direct skip optimization
+            // without making the doc cursor mutate position decoder state.
+            pendingPosBlockOrd = cumTf - (cumTf % Postings::POSITIONS_BLOCK_SIZE);
+            pendingPosAbsoluteOffset = posStartLoc + (int64_t) blockPosByteOff;
+            pendingPosSeekValid = true;
           }
           docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) prevLastDoc;
           docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;   // force a decode on the next nextDoc()
@@ -1912,7 +1831,7 @@ private:
     assert(!scoredWordProbeActive);
     skipCount(SkipStats::advanceCalls);
     if constexpr (DOCS_ONLY) {
-      assert(!trackPositions);
+      assert(!positionTrackingEnabled);
       docsOnlyConsumed = true;
       if (docBlockResident) {
         if (advanceDocOnlyResident(target)) {
@@ -1967,12 +1886,12 @@ private:
         tfreq = tfreqBuf[j];
         tfreqOrd += consumed;
         tfreqBufIdx = j + 1;
-        if (trackPositions) {
+        if (positionTrackingEnabled) {
           markPendingPositionRepair(start, j + 1);
         }
       } else {
         tfreq = 1;
-        if (trackPositions) {
+        if (positionTrackingEnabled) {
           markPendingPositionRepair(start, j + 1);
         }
       }
@@ -2359,96 +2278,18 @@ public:
     }
   }
 
-  void startPositions() {
-    assert(!docBlockResident);
-    assert(!docsOnlyConsumed);
-    assert(!scoredWordProbeActive);
-    assert(!positionBatchActive);
-    assert(hasPositions);  // positions are only queried on fields that index them
-    assert(trackPositions);
-    materializePendingPositionRepair();
-    pos = -1;
-    while (posOrd < posOrdStart) {
-      // need to skip some positions.
-      auto numToSkip = posOrdStart - posOrd;
-      auto leftInBlock = posBufEnd - posBufIdx;
-
-      if (numToSkip <= leftInBlock) {
-        // std::cout << "skipping within position block: id=" << docid << " numToSkip=" << numToSkip << std::endl;
-        // our start is within current decoded block
-        posBufIdx += numToSkip;
-        posOrd += numToSkip;
-        posBufLimit = std::min(posBufIdx + tfreq, posBufEnd);
-        return;
-      }
-
-      // skip to end of block first.
-      // some of these calculations may be redundant, but it's just to make it easier to think about for now.
-      // Hopefully optimizer can take care of inefficiencies.
-      posOrd += leftInBlock;
-      numToSkip -= leftInBlock;
-      posBufIdx = posBufEnd;
-
-      if (numToSkip >= Postings::POSITIONS_BLOCK_SIZE) {
-        // Skip the entire encoded block from its header - no unpack. posOrd is
-        // block-aligned here (initial state or driven to a boundary above), and
-        // numToSkip >= a full block guarantees the next block is block-encoded,
-        // exactly as the old decode-and-discard relied on.
-        auto bytesSkipped = IndexCodec::posCodec.skipBlock(posIS.ptr(), posIS.left());
-        posIS.skip(bytesSkipped);
-        posOrd += Postings::POSITIONS_BLOCK_SIZE;
-        skipCount(SkipStats::posBlocksSkipped);
-        // Fully reset buffer state: a skip that lands exactly on posOrdStart
-        // exits the loop without another decode, and nextPosition() must then
-        // take its fresh-decode path (a stale posBufLimit < posBufEnd would
-        // send it into the still-buffered branch and read past posBuf).
-        posBufIdx = posBufEnd = posBufLimit = 0;
-        continue;
-      }
-
-
-      // At this point, we need to skip less than a block of positions, but we need to know
-      // if it is block encoded or vInt encoded.  Compare to last block encoded ord to tell.
-      // Boundary conditions: if posOrdStart=127 then it is the last in the block and we
-      // do want to decode the block (hence do tail logic otherwise)
-      if (posOrdStart > lastBlockEncodedPosOrd(ttf)) {
-        // std::cout << "skipping in position tail: id=" << docid << " numToSkip=" << numToSkip << std::endl;
-        for (int i=0; i<numToSkip; i++) {
-          auto delta = posIS.readVint();
-          unused(delta);
-          // TODO: a faster skipVint (potentially)? inlining should already eliminate the dead code though.
-        }
-        posOrd += numToSkip;
-        assert (posOrd == posOrdStart); // nocommit, trivial
-        posBufIdx = posBufEnd = posBufLimit = 0;
-        return;
-      }
-
-      // OK load block of positions.  This could be optimized by only loading the relevant part.
-      // If this enum wants all positions, we should just decode everything.
-      uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-      auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
-      posIS.skip(bytesRead);
-      assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
-      skipCount(SkipStats::posBlocksDecoded);
-      posBufIdx = 0;
-      posBufEnd = outSz;
-      posBufLimit = std::min(posBufEnd, tfreq);
-    }
-  }
-
   // The current decoded block begins at the already-positioned doc.  The
   // caller may inspect remaps before choosing beginPositionDeltaBatch() or the
   // ordinary per-doc position path.  The spans remain valid until the next
   // doc-block decode.
-  PositionDocBlock currentPositionDocBlock() {
+  DocFreqBlock currentDocFreqBlock() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
     assert(!scoredWordProbeActive);
     assert(!positionBatchActive);
     assert(hasPositions);
     assert(hasFreqs);
-    assert(trackPositions);
+    assert(positionTrackingEnabled);
     assert(!blockMode);
     assert(docid >= 0 && docid != PostingsReader::END);
     int32_t start = docBufIdx - 1;
@@ -2460,19 +2301,18 @@ public:
     };
   }
 
-  // Align once at the first current doc, then make the requested consecutive
-  // docs one position-delta run.  Document and cumulative-tf cursors land on
-  // the run's last doc before the deltas are pulled.
-  void beginPositionDeltaBatch(int32_t docCount) {
+private:
+  // Move the doc/freq cursor across a position batch after PosEnum has aligned
+  // the position stream at the first current doc.
+  int64_t beginPositionDeltaBatchDocs(int32_t docCount) {
     assert(docCount > 0);
     assert(!positionBatchActive);
-    assert(hasPositions && hasFreqs && trackPositions);
+    assert(hasPositions && hasFreqs && positionTrackingEnabled);
     assert(!blockMode);
     int32_t start = docBufIdx - 1;
     int32_t limit = start + docCount;
     assert(start >= 0 && limit <= docBufEnd);
 
-    startPositions();
     int64_t tfSum = 0;
     for (int32_t i = start; i < limit; i++) {
       tfSum += (uint32_t) tfreqBuf[i];
@@ -2491,86 +2331,12 @@ public:
     cumulativeTermFreq += tfSum - (uint32_t) tfreqBuf[start];
     posOrdStart = cumulativeTermFreq - tfreq;
     clearPendingPositionRepair();
-    posBufLimit = (int32_t) std::min(
-        (int64_t) posBufEnd, (int64_t) posBufIdx + cumulativeTermFreq - posOrd);
-    assert(cumulativeTermFreq > posOrd);
     if (docsSize != 0 && limit == docBufEnd) {
       assert(cumulativeTermFreq == nextL0CumTf);
     }
     positionBatchActive = true;
+    return cumulativeTermFreq;
   }
-
-  // Return at most maxCount raw deltas from the active cross-doc run.  Limiting
-  // the pull lets TextWriter split one source block at output doc-block edges.
-  std::span<const int32_t> nextPositionDeltaBatchSpan(int64_t maxCount) {
-    assert(positionBatchActive);
-    assert(maxCount > 0);
-    if (!ensurePositionDeltaAvailable()) {
-      positionBatchActive = false;
-      return {};
-    }
-    int32_t start = posBufIdx;
-    int64_t available = posBufLimit - posBufIdx;
-    int32_t count = (int32_t) std::min(available, maxCount);
-    posBufIdx += count;
-    posOrd += count;
-    assert(posOrd <= cumulativeTermFreq);
-    if (posOrd == cumulativeTermFreq) {
-      positionBatchActive = false;
-    }
-    return {posBuf + start, (size_t) count};
-  }
-
-  int32_t nextPosition() {
-    assert(!docBlockResident);
-    assert(!scoredWordProbeActive);
-    assert(!positionBatchActive);
-    if (!ensurePositionDeltaAvailable()) {
-      pos = PostingsReader::END;
-      return pos;
-    }
-    // std::cout << "RETN pos buffer docid=" << docid << " posOrd=" << posOrd << " posBufIdx=" << posBufIdx << std::endl;
-    auto delta = posBuf[posBufIdx++];
-    // We could possibly move posOrd update and only update at block end.
-    // Would need to adjust/account for where we started in a block though.
-    // And given that there is no data dependency in this hot loop, it's unclear if it would help at all.
-    posOrd++;
-    pos += delta;
-    return pos;
-  }
-
-  // The returned run is limited to the current doc and remains valid until the
-  // next call that refills the position buffer.  An empty span ends the doc.
-  // Do not mix this with nextPosition() within one doc: this path deliberately
-  // does not reconstruct the absolute-position accumulator.
-  std::span<const int32_t> nextPositionDeltaSpan() {
-    assert(!docBlockResident);
-    assert(!scoredWordProbeActive);
-    assert(!positionBatchActive);
-    if (!ensurePositionDeltaAvailable()) {
-      return {};
-    }
-    int32_t start = posBufIdx;
-    posBufIdx = posBufLimit;
-    posOrd += posBufLimit - start;
-    return {posBuf + start, (size_t) (posBufLimit - start)};
-  }
-
-  int32_t advancePosition(int32_t target) {
-    assert(!docBlockResident);
-    assert(!scoredWordProbeActive);
-    while (pos < target) {
-      nextPosition();
-    }
-    return pos;
-  }
-
-  // We could also think about exposing the position deltas?
-  // Or, we could sum the positions in a block (for a doc) and then it would make bulk access
-  // easier / more efficient.
-  // Also think about bulk copying of positions when merging?  Would only work for first segment unless
-  // we supported multiple position lists.  Hence prob only worth it when merging small segment into large.
-  // How to do position skipping?  Could always pre-pend last position in a block?
 };
 
 }

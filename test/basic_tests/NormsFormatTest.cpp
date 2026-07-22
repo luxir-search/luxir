@@ -59,7 +59,7 @@ void assertTermScores(TestIndex& testIndex, std::string_view field, std::string_
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum termsEnum(expectedPool, seg.postingsReader(), fieldInfo);
   ASSERT_TRUE(termsEnum.seek(term));
-  DocsEnum docsEnum(expectedPool, seg.postingsReader(), termsEnum);
+  DocsEnum docsEnum(termsEnum);
 
   Similarity::FieldStats fieldStats;
   fieldStats.sumTotalTermFreq = termsEnum.sumTotalTermFreq();

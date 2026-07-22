@@ -2,6 +2,7 @@
 #include <tuple>
 #include "solux/index/PostingsWriter.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/PosEnum.h"
 #include "solux/util/random.h"
 #include "gtest/gtest.h"
 
@@ -31,6 +32,7 @@ public:
   std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsEnum> docsEnum;
+  std::unique_ptr<PosEnum> posEnum;
 
   Rng r;
   Rng r2;
@@ -76,6 +78,7 @@ public:
   void initWriter() {
     dir = RAMDir();  // remove all files?
 
+    posEnum.reset();
     docsEnum.reset();
     tenum.reset();
     fieldReader.reset();
@@ -169,7 +172,7 @@ public:
         maxRead = 0;  // for now, don't read any (simplate skipping)
       }
       if (maxRead > 0 || r2.rbool()) { // sometimes call startPositions even if we aren't going to read positions
-        docsEnum->startPositions();
+        posEnum->startPositions();
       }
     } else {
       writer->startDoc(docid);
@@ -186,7 +189,7 @@ public:
       if (read) {
         if (maxRead > 0) {
           maxRead--;
-          auto pos = docsEnum->nextPosition();
+          auto pos = posEnum->nextPosition();
           // std::cout << "\t\tread pos=" << pos << std::endl;
           ASSERT_EQ(position, pos);
         }
@@ -214,7 +217,8 @@ public:
       if (numDocs > 0) {
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
-        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tenum);
+        docsEnum = std::make_unique<DocsEnum>(*tenum);
+        posEnum = std::make_unique<PosEnum>(*docsEnum);
         numDocsRead = docsEnum->numDocs();
       }
     } else {
@@ -300,7 +304,11 @@ public:
       TermsEnum tenum(pool, *reader, fieldInfo);
       while (tenum.nextTerm()) {
         totTerms++;
-        DocsEnum docsEnum(pool, *reader, tenum);
+        DocsEnum docsEnum(tenum);
+        std::unique_ptr<PosEnum> posEnum;
+        if (percentReadPositions > 0) {
+          posEnum = std::make_unique<PosEnum>(docsEnum);
+        }
         auto ndocs = docsEnum.numDocs();
         for (int i = 0; i < ndocs; i++) {
           auto id = docsEnum.nextDoc();
@@ -312,9 +320,9 @@ public:
 
           if (readPositions) {
             auto tfreq = docsEnum.termFreq();
-            docsEnum.startPositions();
+            posEnum->startPositions();
             for (int j = 0; j < tfreq; j++) {
-              auto pos = docsEnum.nextPosition();
+              auto pos = posEnum->nextPosition();
               ret += pos;
               totPositions++;
               // std::cout << "p fingerprint+=" << pos << " total=" << ret << std::endl;

@@ -2682,7 +2682,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
 
     if (termsEnum.seekForward(deleteId)) {
       // Found the ID term, now get documents containing this ID
-      DocsEnum docsEnum(pool, reader, termsEnum);
+      DocsEnum docsEnum(termsEnum);
 
       for (int32_t docId = docsEnum.next(); docId != DocsEnum::END; docId = docsEnum.next()) {
         if (currLiveBits && !currLiveBits->get(docId)) {
