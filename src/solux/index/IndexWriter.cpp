@@ -114,7 +114,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
     schemaGen_ = indexInfo.schema_gen;
-    updateBase = indexInfo.update_version + 1;
+    updateNumber = indexInfo.update_version;
     segInfos.reserve(indexInfo.segments.size());
     lastCommittedSegIds.reserve(indexInfo.segments.size());
 
@@ -178,9 +178,10 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
 
   // then make sure that the updates are finished in order so all updates are done before a commit is processed.
   updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
-    [this](UpdateMessage* msg) -> size_t {
-      INDEX_DEBUG("updateSequencerNode: msg={} updateVersion={}", (void*)msg, msg->updateVersion);
-      return msg->updateVersion - this->updateBase - 1; // get a 0 based sequence number for the sequencer node;
+    [](UpdateMessage* msg) -> size_t {
+      INDEX_DEBUG("updateSequencerNode: msg={} updateVersion={} updateOrdinal={}",
+                  (void*)msg, msg->updateVersion, msg->updateOrdinal);
+      return msg->updateOrdinal;
     });
 
   // updates flow into the updateFinishNode in order which is single threaded and ensures that updates are finished in order.
@@ -576,23 +577,36 @@ void IndexWriter::commit(UpdateMessage::CommitType commitType) {
 
 void IndexWriter::initiateCommit(UpdateMessage& msg) {
   INDEX_DEBUG("initiateCommit: msg={} STARTING", (void*)&msg);
+  auto emptyCommitInfo = std::make_unique<CommitInfo>();
+  Signal::emit("initiateCommit", &msg);
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+
+    // Finish container growth before transferring commit state.  Once the
+    // transfer starts, only graph admission can fail.
+    if (!msg.publishOnly) {
+      flushingInverters.reserve(flushingInverters.size() + idleInverters.size());
+      if (msg.waitForMerges) {
+        waitingForMerges.reserve(waitingForMerges.size() + 1);
+      }
+    }
 
     // A merge publication must not flush or consume state from later client
     // updates.  It only needs a fresh CommitInfo for generation assignment and
     // durable publication of the segment layout already in segInfos.
     if (msg.publishOnly) {
-      msg.commitInfo = std::make_unique<CommitInfo>();
+      msg.commitInfo = std::move(emptyCommitInfo);
       msg.commitInfo->updateMessage = &msg;
+      msg.commitNum = commitNumber;
       _releaseToCommitSequencer(&msg);
+      commitNumber++;
       return;
     }
 
     // Grab the global commit info and move it to the UpdateMessage.
     msg.commitInfo = std::move(nextCommitInfo);
-    nextCommitInfo = std::make_unique<CommitInfo>();
+    nextCommitInfo = std::move(emptyCommitInfo);
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
 
@@ -648,23 +662,39 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
 
     INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
 
+    // updateFinishNode is serial and segment-flush completion needs indexMutex,
+    // so this is the commit's single admission point.  No ordinal is consumed
+    // until all state above is installed.  An immediate commit increments the
+    // counter only after the sequencer accepts it.
+    msg.commitNum = commitNumber;
     // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
     // we need to kick it off here.
     if (commitInfo.leftToFlush == 0) {
-      _releaseToCommitSequencer(&msg);
+      try {
+        _releaseToCommitSequencer(&msg);
+      } catch (...) {
+        if (msg.waitForMerges) {
+          std::erase(waitingForMerges, &msg);
+        }
+        nextCommitInfo = std::move(msg.commitInfo);
+        throw;
+      }
     }
+    commitNumber++;
   } // end mutex protected section
 }
 
 // Caller must hold indexMutex.
 void IndexWriter::_releaseToCommitSequencer(UpdateMessage* msg) {
-  if (msg->waitForMerges) {
-    auto it = std::find(waitingForMerges.begin(), waitingForMerges.end(), msg);
-    if (it != waitingForMerges.end()) {
-      waitingForMerges.erase(it);
-    }
+  if (!commitSequencerNode->try_put(msg)) {
+    throw std::runtime_error("Commit sequencer rejected an admitted commit");
   }
-  commitSequencerNode->try_put(msg);
+  if (!msg->waitForMerges) return;
+
+  auto it = std::find(waitingForMerges.begin(), waitingForMerges.end(), msg);
+  if (it != waitingForMerges.end()) {
+    waitingForMerges.erase(it);
+  }
 }
 
 // Inverter for the segment should already be in the flushingInverters list.
@@ -826,6 +856,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
 
   auto maxDeleteVersion = msg.commitInfo->multiDeletesData.getLargestVersion();
+  msg.commitInfo->highestUpdateVersion = msg.updateVersion;
 
   std::vector<SegInfo*> segs;
   std::vector<SegInfo*> segsToApplyDeletes;
@@ -995,6 +1026,12 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
         segsToKeep.push_back(seg);
       }
     }
+  }
+  // The manifest makes every retained segment durable, including a segment
+  // auto-flushed by a later update while this commit was in flight.
+  for (auto* seg : segsToKeep) {
+    commitInfo.highestUpdateVersion =
+      std::max(commitInfo.highestUpdateVersion, seg->maxVersion);
   }
   // Sort segsToKeep by segId now (rather than later in writeIndexInfoFile) so
   // every commit-stage step - buildAuxIndexes, IndexInfo serialization, and
@@ -1580,7 +1617,8 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
     // write share single values.
     assert(commitInfo->indexGen > 0);
     thisIndexGen = commitInfo->indexGen;
-    updateVersion = commitInfo->updateMessage->updateVersion;
+    assert(commitInfo->highestUpdateVersion >= commitInfo->updateMessage->updateVersion);
+    updateVersion = commitInfo->highestUpdateVersion;
   }
   else {
     // Test-only path (no commitInfo): assign on the fly, including the
@@ -1598,7 +1636,7 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
       for (auto seg : segs) lastCommittedSegIds.push_back(seg->segId);
     }
     thisIndexGen = ++indexGen;
-    updateVersion = updateBase + 1;
+    updateVersion = updateNumber;
   }
 
   // Build the IndexInfo message NON-OWNING into a scratch arena, then encode. Segment +
@@ -1949,6 +1987,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
       auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+      newSegInfo->minVersion = segs.front()->minVersion;
+      newSegInfo->maxVersion = segs.front()->maxVersion;
+      for (size_t i = 1; i < segs.size(); i++) {
+        newSegInfo->minVersion = std::min(newSegInfo->minVersion, segs[i]->minVersion);
+        newSegInfo->maxVersion = std::max(newSegInfo->maxVersion, segs[i]->maxVersion);
+      }
       phase = "schema_generation";
       newSegInfo->schemaGen = currentSchemaGen();
       phase = "postings_finish";
@@ -2342,7 +2386,7 @@ void IndexWriter::testDeleteAllData() {
 
 
 
-  // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
+  // Don't touch commitNumber or updateOrdinal: the TBB graph relies on exact session-local ordinals.
 }
 
 // TEST HOOKS: safe only against a QUIESCED writer.  indexMutex here does not
@@ -2402,8 +2446,8 @@ void IndexWriter::debugInfo() {
     std::lock_guard<std::mutex> lock(indexMutex);
     LOG_INFO("IndexWriter: segInfos.size={} idleInverters.size={} busyInverters.size={} flushingInverters.size={}",
              segInfos.size(), idleInverters.size(), busyInverters.size(), flushingInverters.size());
-    LOG_INFO("\tupdateNumber={} commitNumber={} lastCommitTime={} lastAdvertisedCommitTime={}",
-             updateNumber, commitNumber, lastCommitTime.load(), lastAdvertisedCommitTime.load());
+    LOG_INFO("\tupdateNumber={} updateOrdinal={} commitNumber={} lastCommitTime={} lastAdvertisedCommitTime={}",
+             updateNumber, updateOrdinal, commitNumber, lastCommitTime.load(), lastAdvertisedCommitTime.load());
     LOG_INFO("\tmergePolicy->outstandingMerges={}", mergePolicy->outstandingMerges);
     for (auto& [segId, seg] : segInfos) {
       LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", segId, seg->maxDoc, seg->mergeLevel,

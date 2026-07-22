@@ -6,6 +6,7 @@
 #include <thread>
 #include <random>
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <set>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include "solux/util/Signal.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
@@ -49,6 +51,35 @@ public:
 };
 
 namespace {
+
+class TimedCommitMessage final : public UpdateMessage {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool completed = false;
+
+public:
+  TimedCommitMessage() {
+    commit = COMMIT;
+  }
+
+  void handle(IndexWriter& iw) override {
+    unused(iw);
+  }
+
+  void done(IndexWriter& iw) override {
+    unused(iw);
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      completed = true;
+    }
+    condition.notify_one();
+  }
+
+  bool waitFor(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return condition.wait_for(lock, timeout, [this]() { return completed; });
+  }
+};
 
 bool waitForMergesCommit(IndexWriter& iw) {
   class BlockingWaitForMergesCommit final : public UpdateMessage {
@@ -96,6 +127,91 @@ bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
 }
 
 } // namespace
+
+
+TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
+  auto dir = std::make_unique<RAMDir>();
+  {
+    IndexWriter writer(*dir);
+    writer.mergePolicy->setMergeFactor(2);
+
+    // Models a later update that auto-flushed while an earlier commit was in
+    // flight. Merge it first to ensure the merged segment preserves the source
+    // version envelope used to derive the manifest high-water.
+    auto flushAtVersion = [&](uint64_t version, std::string_view value) {
+      auto& inverter = writer.obtainInverter(version);
+      auto& fieldHandler = inverter.getIndexHandler(field);
+      inverter.startDoc();
+      fieldHandler.index(inverter, value);
+      inverter.finishDoc();
+      writer.releaseInverter(inverter, true);
+      writer.updateGraph.wait_for_all();
+    };
+    flushAtVersion(9, "first higher version segment");
+    flushAtVersion(10, "second higher version segment");
+    writer.commit();
+    auto info = solux::test::readDurableIndexInfo(*dir);
+    EXPECT_EQ(info->segments.size(), 1u);
+    EXPECT_EQ(info->update_version, 10u);
+  }
+
+  auto writer = std::make_unique<IndexWriter>(*dir);
+  auto msg = std::make_unique<TimedCommitMessage>();
+  ASSERT_TRUE(writer->submitUpdate(msg.get()));
+
+  if (!msg->waitFor(std::chrono::seconds(3))) {
+    (void)writer.release();
+    (void)msg.release();
+    (void)dir.release();
+    FAIL() << "first commit after reload did not complete";
+  }
+  writer->updateGraph.wait_for_all();
+  EXPECT_FALSE(msg->result.errored());
+  EXPECT_EQ(msg->updateVersion, 11u);
+  EXPECT_EQ(solux::test::readDurableIndexInfo(*dir)->update_version, 11u);
+}
+
+
+TEST_F(IndexWriterTest, failedCommitAdmissionDoesNotLeaveSequencerHole) {
+  auto dir = std::make_unique<RAMDir>();
+  auto writer = std::make_unique<IndexWriter>(*dir);
+  auto failed = std::make_unique<TimedCommitMessage>();
+
+  Signal::listen("initiateCommit", [](void*, void*, void*) -> void* {
+    throw std::runtime_error("injected commit admission failure");
+  });
+  bool accepted;
+  bool completed;
+  size_t suppressed;
+  {
+    ExpectLog quiet("injected commit admission failure");
+    accepted = writer->submitUpdate(failed.get());
+    completed = accepted && failed->waitFor(std::chrono::seconds(3));
+    suppressed = quiet.suppressed();
+  }
+  Signal::unlisten("initiateCommit");
+  if (!completed) {
+    (void)writer.release();
+    (void)failed.release();
+    (void)dir.release();
+    FAIL() << "commit with injected admission failure did not complete";
+  }
+  ASSERT_TRUE(accepted);
+  EXPECT_GT(suppressed, 0u);
+  ASSERT_TRUE(failed->result.errored());
+
+  auto subsequent = std::make_unique<TimedCommitMessage>();
+  ASSERT_TRUE(writer->submitUpdate(subsequent.get()));
+  if (!subsequent->waitFor(std::chrono::seconds(3))) {
+    (void)writer.release();
+    (void)failed.release();
+    (void)subsequent.release();
+    (void)dir.release();
+    FAIL() << "commit after failed admission did not complete";
+  }
+  writer->updateGraph.wait_for_all();
+  EXPECT_FALSE(subsequent->result.errored());
+}
 
 
 TEST_F(IndexWriterTest, simple) {

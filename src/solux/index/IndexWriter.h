@@ -294,9 +294,9 @@ public:
 
   // The last updateNumber generated (the first update number generated will be 1)
   uint64_t updateNumber = 0;
-  // Read from the index when this IW instance was created.  Does not change.
-  // sequence numbers for TBB serializers are calculated via updateVersion - updateBase - 1.
-  uint64_t updateBase = 0;
+
+  // Next session-local tag for updateSequencerNode.
+  uint64_t updateOrdinal = 0;
 
   // Used for sequencing update messages containing commits.
   // Not used for index_gen since not every commit will end up changing the index.
@@ -498,12 +498,10 @@ private:
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = ++updateNumber;
-    if (msg.commit != UpdateMessage::NO_COMMIT) {
-      msg.commitNum = commitNumber++;
-    } else {
-      msg.commitNum = 0;
-    }
-    INDEX_DEBUG("startUpdateBody: msg={} updateVersion={} commitNum={}", (void*)&msg, msg.updateVersion, msg.commitNum);
+    msg.updateOrdinal = updateOrdinal++;
+    msg.commitNum = 0;
+    INDEX_DEBUG("startUpdateBody: msg={} updateVersion={} updateOrdinal={} commitNum={}",
+                (void*)&msg, msg.updateVersion, msg.updateOrdinal, msg.commitNum);
   }
 
   void processUpdateBody(UpdateMessage& msg) {
@@ -525,7 +523,7 @@ private:
       try {
         initiateCommit(msg);
       } catch (std::exception& e) {
-        LOG_ERROR("finishUpdateBody Exception Caught: exception={}", (void*)&msg, e.what());
+        LOG_ERROR("finishUpdateBody Exception Caught: msg={} exception={}", (void*)&msg, e.what());
         msg.result.setException(e);
         doneWithMessage = true;
       }

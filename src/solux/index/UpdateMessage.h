@@ -82,7 +82,8 @@ public:
   bool waitForMerges = false;
 
   /// Filled in by the IndexWriter when the message is received.  Do not change.
-  uint64_t updateVersion;             // The version of this update, used to ensure updates are processed in order when needed
+  uint64_t updateVersion;             // Durable version used for document and delete ordering
+  uint64_t updateOrdinal;             // Session-local, 0-based update sequencer tag
   uint64_t commitNum;                 // The 0-based commit number of this update, used to ensure commits are finished in order
   std::unique_ptr<CommitInfo> commitInfo;  // Commit info for this update, if any.  This is set by the IndexWriter when the commit is processed.
 
