@@ -49,12 +49,19 @@ public:
       } value{};
       bool valid = false;
     };
-    std::vector<ExprSlot> exprSlots;
-    BoundValueProgram* expression = nullptr;
-    mutable ValueResult cachedResult;
-    mutable segdoc cachedDoc;
-    mutable uint32_t cachedScoreBits = 0;
-    mutable bool cacheValid = false;
+    // EXPR-only state lives behind one pointer so COLUMN/SCORE/DOC clauses
+    // stay compact in the clauses array the per-doc walk strides over.
+    struct ExprState {
+      std::vector<ExprSlot> slots;
+      BoundValueProgram* expression = nullptr;
+      ValueResult cachedResult;
+      segdoc cachedDoc;
+      uint32_t cachedScoreBits = 0;
+      bool cacheValid = false;
+      bool isDouble = false;
+      bool desc = false;
+    };
+    std::unique_ptr<ExprState> expr;
 
     RuntimeClause(const SortClause& descriptor, int32_t topCount,
                   IndexReader* reader)
@@ -62,66 +69,70 @@ public:
       if (descriptor.getKind() == SortClause::COLUMN) {
         comparator = descriptor.getSortField().createComparator(topCount, reader);
       } else if (descriptor.getKind() == SortClause::EXPR) {
-        exprSlots.resize((size_t)topCount);
+        expr = std::make_unique<ExprState>();
+        expr->slots.resize((size_t)topCount);
+        expr->isDouble =
+            descriptor.getValueProgram().root().type == ValueType::DOUBLE;
+        expr->desc = descriptor.getOrder() == SortField::DESC;
       }
     }
 
-    bool isDoubleExpr() const {
-      return descriptor.getValueProgram().root().type == ValueType::DOUBLE;
+    void resetCache() {
+      if (expr != nullptr) expr->cacheValid = false;
     }
-
-    void resetCache() { cacheValid = false; }
 
     const ValueResult& current(segdoc doc, float score) const {
-      assert(expression != nullptr);
+      ExprState& state = *expr;
+      assert(state.expression != nullptr);
       uint32_t scoreBits = std::bit_cast<uint32_t>(score);
-      if (!cacheValid || cachedDoc != doc || cachedScoreBits != scoreBits) {
-        cachedResult = expression->evalPoint(doc.docId(), score);
-        cachedDoc = doc;
-        cachedScoreBits = scoreBits;
-        cacheValid = true;
+      if (!state.cacheValid || state.cachedDoc != doc
+          || state.cachedScoreBits != scoreBits) {
+        state.cachedResult = state.expression->evalPoint(doc.docId(), score);
+        state.cachedDoc = doc;
+        state.cachedScoreBits = scoreBits;
+        state.cacheValid = true;
       }
-      return cachedResult;
+      return state.cachedResult;
     }
 
-    void copyCurrent(int32_t slot, segdoc doc, float score) {
+    SOLUX_NOINLINE void copyCurrent(int32_t slot, segdoc doc, float score) {
       const ValueResult& result = current(doc, score);
-      ExprSlot& target = exprSlots[(size_t)slot];
+      ExprSlot& target = expr->slots[(size_t)slot];
       target.valid = result.valid;
       if (!result.valid) return;
-      if (isDoubleExpr()) target.value.doubleValue = result.doubleValue;
+      if (expr->isDouble) target.value.doubleValue = result.doubleValue;
       else target.value.intValue = result.intValue;
     }
 
     void copyFrom(int32_t slot, const RuntimeClause& other, int32_t otherSlot) {
-      exprSlots[(size_t)slot] = other.exprSlots[(size_t)otherSlot];
+      expr->slots[(size_t)slot] = other.expr->slots[(size_t)otherSlot];
     }
 
     int compareValues(const ExprSlot& left, const ExprSlot& right) const {
       if (left.valid != right.valid) return left.valid ? -1 : 1;
       if (!left.valid) return 0;
-      int cmp = isDoubleExpr()
+      int cmp = expr->isDouble
           ? (left.value.doubleValue > right.value.doubleValue)
               - (left.value.doubleValue < right.value.doubleValue)
           : (left.value.intValue > right.value.intValue)
               - (left.value.intValue < right.value.intValue);
-      if (descriptor.getOrder() == SortField::DESC) cmp = -cmp;
+      if (expr->desc) cmp = -cmp;
       return cmp;
     }
 
-    int compareSlots(int32_t left, const RuntimeClause& other, int32_t right) const {
-      return compareValues(exprSlots[(size_t)left], other.exprSlots[(size_t)right]);
+    SOLUX_NOINLINE int compareSlots(int32_t left, const RuntimeClause& other, int32_t right) const {
+      return compareValues(expr->slots[(size_t)left], other.expr->slots[(size_t)right]);
     }
 
-    int compareCurrent(int32_t left, segdoc doc, float score) const {
+    SOLUX_NOINLINE int compareCurrent(int32_t left, segdoc doc, float score) const {
       const ValueResult& result = current(doc, score);
       ExprSlot candidate;
       candidate.valid = result.valid;
       if (result.valid) {
-        if (isDoubleExpr()) candidate.value.doubleValue = result.doubleValue;
+        if (expr->isDouble) candidate.value.doubleValue = result.doubleValue;
         else candidate.value.intValue = result.intValue;
       }
-      return compareValues(exprSlots[(size_t)left], candidate);
+      return compareValues(expr->slots[(size_t)left], candidate);
     }
   };
 
@@ -152,7 +163,7 @@ public:
         for (RuntimeClause& clause : collector.clauses) {
           if (clause.descriptor.getKind() != SortClause::EXPR) continue;
           owned.push_back(clause.descriptor.getValueProgram().bind(pool, postings));
-          clause.expression = owned.back().get();
+          clause.expr->expression = owned.back().get();
           clause.resetCache();
         }
       } catch (...) {
@@ -173,7 +184,7 @@ public:
     void clearPointers() {
       for (RuntimeClause& clause : collector.clauses) {
         if (clause.descriptor.getKind() == SortClause::EXPR) {
-          clause.expression = nullptr;
+          clause.expr->expression = nullptr;
           clause.resetCache();
         }
       }

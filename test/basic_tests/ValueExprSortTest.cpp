@@ -257,7 +257,7 @@ TEST_F(ValueExprSortTest, collectorReuseAndPairwiseMergeKeepOnlyValues) {
           collector.collect(segment, doc, 0.0f);
         }
       }
-      EXPECT_EQ(nullptr, collector.clauses[0].expression);
+      EXPECT_EQ(nullptr, collector.clauses[0].expr->expression);
     };
     collectSegment(*left, 0);
     collectSegment(*left, 2);
