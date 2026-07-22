@@ -185,14 +185,15 @@ struct CachedTermInfo {
   Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
   std::span<const TermsEnum::PostingsState*> postingsStates = {};
 
-  /// Construct an independent DocsEnum from the immutable state captured by the
+  /// Construct an independent tiered docs enum from the immutable state captured by the
   /// original term seek. No dictionary re-seek or shared mutable enum is involved.
-  DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
+  template<DocsEnumTier Tier>
+  BasicDocsEnum<Tier>* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
     auto* state = postingsStates[segment.ord];
     if (state == nullptr) {
       return nullptr;
     }
-    return targetPool.make<DocsEnum>(*state);
+    return targetPool.make<BasicDocsEnum<Tier>>(*state);
   }
 
   int32_t docFreq(int32_t segmentOrd) const {
@@ -661,7 +662,7 @@ public:
     virtual int32_t approximationDocId() {
       return docId();
     }
-    virtual std::span<DocsEnum*> approximationEnums() {
+    virtual std::span<DocsPosEnum*> approximationEnums() {
       return {};
     }
     virtual bool matches() {
@@ -692,7 +693,7 @@ public:
     }
     /// Optional docs-only probe specialization. WindowFilter falls back to
     /// exact advance() when an opted-in scorer does not expose one.
-    virtual DocsEnum* windowFilterProbeDocsEnum() {
+    virtual DocsFreqEnum* windowFilterProbeDocsEnum() {
       return nullptr;
     }
     virtual float matchCost() {
@@ -846,12 +847,12 @@ public:
 // production window. Unlike DocSet this has no segment-wide identity or
 // cardinality: accepts() is valid only for the most recently prepared window.
 class WindowFilter {
-  static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+  static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
   static constexpr int32_t kWindowWords = kWindowSize / 64;
   static_assert((kWindowSize % 64) == 0);
 
   std::span<Query::Scorer*> scorers;
-  std::span<DocsEnum*> probeEnums;
+  std::span<DocsFreqEnum*> probeEnums;
   std::span<uint64_t> currentBits;
   std::span<uint64_t> scratchBits;
   int32_t windowStart = 0;
@@ -862,7 +863,7 @@ public:
   WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers,
                bool probeMode = false)
       : scorers(scorers),
-        probeEnums(pool.make_span<DocsEnum*>(scorers.size())),
+        probeEnums(pool.make_span<DocsFreqEnum*>(scorers.size())),
         currentBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
                     (size_t) kWindowWords),
         scratchBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
@@ -913,12 +914,12 @@ public:
   // Candidates must arrive in ascending order. Each filter scorer advances
   // monotonically, so a later fill resumes from the resulting cursor without
   // materializing any skipped probe window. Term scorers expose their
-  // DocsEnum for the docs-only fast path; other capable scorers use exact
+  // postings enum for the docs-only fast path; other capable scorers use exact
   // Scorer::advance().
   bool acceptsProbe(int32_t doc) {
     assert(probeEnums.size() == scorers.size());
     for (size_t i = 0; i < scorers.size(); i++) {
-      DocsEnum* docsEnum = probeEnums[i];
+      DocsFreqEnum* docsEnum = probeEnums[i];
       int32_t filterDoc = docsEnum == nullptr
           ? scorers[i]->docId() : docsEnum->docId();
       if (filterDoc < doc) {

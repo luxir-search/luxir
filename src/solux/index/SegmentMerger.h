@@ -712,26 +712,21 @@ private:
     assert(newDocId == seg.numLive); // Make sure we got the right number of live documents
   }
 
-  // add docs (with positions, or just freqs for positionless fields) from the provided DocsEnum
-  void addDocsPos(TextWriter& textWriter, DocsEnum& docsEnum, const Segment& seg) {
-    bool hasPositions = docsEnum.indexHasPositions();
-    if (!hasPositions) {
-      for (;;) {
-        int32_t docid = docsEnum.nextDoc();
-        if (docid == INT_MAX) break;
+  void addDocsFreq(TextWriter& textWriter, DocsFreqEnum& docsEnum, const Segment& seg) {
+    for (;;) {
+      int32_t docid = docsEnum.nextDoc();
+      if (docid == INT_MAX) break;
 
-        // predictable branch for deleted vs not
-        int mappedDoc = seg.remap.empty() ? docid : seg.remap[docid];
-        if (mappedDoc == -1) {
-          continue; // Document is deleted
-        }
-        // No positions to copy; record the doc with the source term freq directly.
-        // termFreq() is 1 for DOCS-only fields, the real freq for DOCS_AND_FREQS.
-        textWriter.addDoc(seg.base + mappedDoc, docsEnum.termFreq());
+      int mappedDoc = seg.remap.empty() ? docid : seg.remap[docid];
+      if (mappedDoc == -1) {
+        continue;
       }
-      return;
+      // termFreq() is 1 for DOCS-only fields, the real freq for DOCS_AND_FREQS.
+      textWriter.addDoc(seg.base + mappedDoc, docsEnum.termFreq());
     }
+  }
 
+  void addDocsPos(TextWriter& textWriter, DocsPosEnum& docsEnum, const Segment& seg) {
     PosEnum positions(docsEnum);
     std::array<int32_t, Postings::DOCS_BLOCK_SIZE> mappedDocs;
     int32_t docid = docsEnum.nextDoc();
@@ -792,8 +787,9 @@ private:
     }
   }
 
-  // add docs and ordinals from the provided DocsEnum (for string column, record ord in docToOrd for each doc, to be written later)
-  void addDocsOrds(TextWriter& textWriter, DocsEnum& docsEnum, const Segment& seg,
+  // Add docs and ordinals from the provided postings enum (for string columns,
+  // record ord in docToOrd for each doc, to be written later).
+  void addDocsOrds(TextWriter& textWriter, DocsOnlyEnum& docsEnum, const Segment& seg,
                    OrdCollector& docToOrd, int64_t ord) {
     assert(ord > 0 && ord <= INT32_MAX);
     for(;;) {
@@ -997,10 +993,10 @@ private:
     return plan;
   }
 
-  void mergeTerms(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
-                  bool isOrdCol, OrdCollector* ordCollector,
-                  const std::optional<std::string>& lower,
-                  const std::optional<std::string>& upper, MemPool& pool) {
+  template<DocsEnumTier Tier>
+  void mergeTermsTier(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
+                      OrdCollector* ordCollector, const std::optional<std::string>& lower,
+                      const std::optional<std::string>& upper, MemPool& pool) {
     struct TermsEnumIdx {
       TermsEnum tenum;
       size_t idx;
@@ -1036,11 +1032,13 @@ private:
 
       do {
         TermsEnumIdx& entry = termPQ.top();
-        DocsEnum docsEnum(entry.tenum);
-        if (isOrdCol) {
+        BasicDocsEnum<Tier> docsEnum(entry.tenum);
+        if constexpr (Tier == DocsEnumTier::DOCS) {
           assert(ordCollector != nullptr);
           addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,
                       *ordCollector, termOrd);
+        } else if constexpr (Tier == DocsEnumTier::FREQS) {
+          addDocsFreq(textWriter, docsEnum, *compactFields[entry.idx]->seg);
         } else {
           addDocsPos(textWriter, docsEnum, *compactFields[entry.idx]->seg);
         }
@@ -1054,6 +1052,23 @@ private:
       } while (termPQ.size() > 0 && termPQ.top().tenum.term() == term);
 
       textWriter.endTerm(term);
+    }
+  }
+
+  void mergeTerms(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
+                  bool isOrdCol, bool hasPositions, OrdCollector* ordCollector,
+                  const std::optional<std::string>& lower,
+                  const std::optional<std::string>& upper, MemPool& pool) {
+    if (isOrdCol) {
+      mergeTermsTier<DocsEnumTier::DOCS>(
+          textWriter, compactFields, ordCollector, lower, upper, pool);
+    } else if (hasPositions) {
+      mergeTermsTier<DocsEnumTier::POSITIONS>(
+          textWriter, compactFields, ordCollector, lower, upper, pool);
+    } else {
+      // This non-ord path also covers ID fields, not only positionless text.
+      mergeTermsTier<DocsEnumTier::FREQS>(
+          textWriter, compactFields, ordCollector, lower, upper, pool);
     }
   }
 
@@ -1164,7 +1179,7 @@ private:
       if (FieldType::hasPositions(flags)) {
         writer.setNorms(preparedNorms.textView());
       }
-      merger.mergeTerms(writer, compactFields, false, nullptr,
+      merger.mergeTerms(writer, compactFields, false, FieldType::hasPositions(flags), nullptr,
                         output.plan.lower, output.plan.upper, rangePool);
       output.result = writer.finishTermRun();
       termsOut.flush(true);
@@ -1380,7 +1395,7 @@ private:
         textWriter.setNorms(preparedNorms.textView());
       }
 
-      mergeTerms(textWriter, compactFields, isOrdCol,
+      mergeTerms(textWriter, compactFields, isOrdCol, FieldType::hasPositions(allFlags),
                  isOrdCol ? &ordCollector.value() : nullptr,
                  std::nullopt, std::nullopt, pool);
       textWriter.endField();

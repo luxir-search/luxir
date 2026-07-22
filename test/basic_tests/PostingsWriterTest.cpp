@@ -30,7 +30,7 @@ protected:
   std::unique_ptr<PostingsReader> reader;
   std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
-  std::unique_ptr<DocsEnum> docsEnum;
+  std::unique_ptr<DocsPosEnum> docsEnum;
   std::unique_ptr<PosEnum> posEnum;
 
   Rng rng_start;
@@ -149,7 +149,7 @@ protected:
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
         posEnum.reset();
-        docsEnum = std::make_unique<DocsEnum>(*tenum);
+        docsEnum = std::make_unique<DocsPosEnum>(*tenum);
         posEnum = std::make_unique<PosEnum>(*docsEnum);
         numDocsRead = docsEnum->numDocs();
       }
@@ -314,7 +314,7 @@ TEST_F(PostingsTest, basic) {
       LOG_TRACE("\tTERM={} ord={}", tenum.term(), tenum.ord());
       // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
 
-      DocsEnum docsEnum(tenum);
+      DocsPosEnum docsEnum(tenum);
       PosEnum posEnum(docsEnum);
       auto ndocs = docsEnum.numDocs();
       LOG_TRACE("\t\tnumDocs={} totalTermFreq={}" , docsEnum.numDocs(), docsEnum.totalTermFreq());
@@ -416,40 +416,47 @@ TEST_F(PostingsTest, levelLadder) {
     ASSERT_EQ(fieldInfo.sumDocFreq, expectedSumDf) << "level " << level;
     ASSERT_EQ(fieldInfo.sumTotalTermFreq, expectedSumTtf) << "level " << level;
 
-    TermsEnum tenum(pool, reader, fieldInfo);
-    for (auto& t : terms) {
-      ASSERT_TRUE(tenum.nextTerm()) << "level " << level << " term " << t.name;
-      ASSERT_EQ(tenum.term(), t.name);
-      DocsEnum de(tenum);
-      std::unique_ptr<PosEnum> posEnum;
-      if (hasPositions) {
-        posEnum = std::make_unique<PosEnum>(de);
-      }
-      ASSERT_EQ(de.numDocs(), (int)t.docs.size()) << "level " << level << " term " << t.name;
+    auto check = [&]<DocsEnumTier Tier>() {
+      TermsEnum tenum(pool, reader, fieldInfo);
+      for (auto& t : terms) {
+        ASSERT_TRUE(tenum.nextTerm()) << "level " << level << " term " << t.name;
+        ASSERT_EQ(tenum.term(), t.name);
+        BasicDocsEnum<Tier> de(tenum);
+        std::unique_ptr<PosEnum> posEnum;
+        if constexpr (Tier == DocsEnumTier::POSITIONS) {
+          posEnum = std::make_unique<PosEnum>(de);
+        }
+        ASSERT_EQ(de.numDocs(), (int)t.docs.size()) << "level " << level << " term " << t.name;
 
-      int64_t expectedTtf = 0;
-      for (auto& d : t.docs) expectedTtf += hasFreqs ? d.tf : 1;
-      ASSERT_EQ(de.totalTermFreq(), expectedTtf) << "level " << level << " term " << t.name;
+        int64_t expectedTtf = 0;
+        for (auto& d : t.docs) expectedTtf += hasFreqs ? d.tf : 1;
+        ASSERT_EQ(de.totalTermFreq(), expectedTtf) << "level " << level << " term " << t.name;
 
-      for (auto& d : t.docs) {
-        ASSERT_EQ(de.nextDoc(), d.id) << "level " << level << " term " << t.name;
-        int expectedTf = hasFreqs ? d.tf : 1;
-        ASSERT_EQ(de.termFreq(), expectedTf)
-            << "level " << level << " term " << t.name << " doc " << d.id;
-        if (hasPositions) {
-          // The written deltas are 1, then 2,2,...; because positions reset per
-          // doc, occurrence o lands at 2*o. Reading past tf positions is outside
-          // the codec contract.
-          posEnum->startPositions();
-          for (int o = 0; o < expectedTf; o++) {
-            ASSERT_EQ(posEnum->nextPosition(), 2 * o)
-                << "level " << level << " term " << t.name << " doc " << d.id << " occ " << o;
+        for (auto& d : t.docs) {
+          ASSERT_EQ(de.nextDoc(), d.id) << "level " << level << " term " << t.name;
+          int expectedTf = hasFreqs ? d.tf : 1;
+          ASSERT_EQ(de.termFreq(), expectedTf)
+              << "level " << level << " term " << t.name << " doc " << d.id;
+          if constexpr (Tier == DocsEnumTier::POSITIONS) {
+            // The written deltas are 1, then 2,2,...; because positions reset per
+            // doc, occurrence o lands at 2*o. Reading past tf positions is outside
+            // the codec contract.
+            posEnum->startPositions();
+            for (int o = 0; o < expectedTf; o++) {
+              ASSERT_EQ(posEnum->nextPosition(), 2 * o)
+                  << "level " << level << " term " << t.name << " doc " << d.id << " occ " << o;
+            }
           }
         }
+        ASSERT_EQ(de.nextDoc(), INT_MAX) << "level " << level << " term " << t.name;
       }
-      ASSERT_EQ(de.nextDoc(), INT_MAX) << "level " << level << " term " << t.name;
+      ASSERT_FALSE(tenum.nextTerm());
+    };
+    if (hasPositions) {
+      check.template operator()<DocsEnumTier::POSITIONS>();
+    } else {
+      check.template operator()<DocsEnumTier::FREQS>();
     }
-    ASSERT_FALSE(tenum.nextTerm());
   }
 }
 
@@ -580,7 +587,7 @@ TEST_F(PostingsTest, blockPositions) {
   ASSERT_EQ(tenum.ord(), 0);
   ASSERT_EQ(tenum.term(), std::string_view("term1"));
 
-  DocsEnum docsEnum(tenum);
+  DocsPosEnum docsEnum(tenum);
   PosEnum posEnum(docsEnum);
   ASSERT_EQ(docsEnum.numDocs(), 2);
   ASSERT_EQ(docsEnum.totalTermFreq(), nPos + nPos2);
@@ -663,7 +670,7 @@ TEST_F(PostingsTest, blockTerms) {
     ASSERT_EQ(tenum.term(), tstr);
 
 
-    DocsEnum docsEnum(tenum);
+    DocsPosEnum docsEnum(tenum);
     PosEnum posEnum(docsEnum);
     ASSERT_EQ(docsEnum.numDocs(), 1);
     ASSERT_EQ(docsEnum.totalTermFreq(), 2);
@@ -774,25 +781,25 @@ TEST_F(PostingsTest, seekForward) {
     ASSERT_FALSE(tenum.seekForward("zzzzz"));
   }
 
-  // Test 6: seekForward with seek+DocsEnum interleaved (simulates applyDeletes)
+  // Test 6: seekForward with postings iteration interleaved (simulates applyDeletes)
   {
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek(makeTerm(2)));
-    DocsEnum docsEnum1(tenum);
+    DocsOnlyEnum docsEnum1(tenum);
     ASSERT_EQ(docsEnum1.next(), 2);
 
     ASSERT_TRUE(tenum.seekForward(makeTerm(4)));
-    DocsEnum docsEnum2(tenum);
+    DocsOnlyEnum docsEnum2(tenum);
     ASSERT_EQ(docsEnum2.next(), 4);
 
-    // Same block seek after DocsEnum
+    // Same block seek after postings iteration
     ASSERT_TRUE(tenum.seekForward(makeTerm(7)));
-    DocsEnum docsEnum3(tenum);
+    DocsOnlyEnum docsEnum3(tenum);
     ASSERT_EQ(docsEnum3.next(), 7);
 
-    // Cross-block seek after DocsEnum
+    // Cross-block seek after postings iteration
     ASSERT_TRUE(tenum.seekForward(makeTerm(40)));
-    DocsEnum docsEnum4(tenum);
+    DocsOnlyEnum docsEnum4(tenum);
     ASSERT_EQ(docsEnum4.next(), 40);
   }
 
@@ -809,7 +816,7 @@ TEST_F(PostingsTest, seekForward) {
     ASSERT_TRUE(tenum.seekForward(makeTerm(34)));
   }
 
-  // Test 8: seekForward every term with DocsEnum (exact applyDeletes pattern)
+  // Test 8: seekForward every term with postings iteration (exact applyDeletes pattern)
   {
     TermsEnum tenum(pool, reader, fieldInfo);
     bool first = true;
@@ -819,12 +826,12 @@ TEST_F(PostingsTest, seekForward) {
       first = false;
       ASSERT_TRUE(found) << "failed at term " << i;
       ASSERT_EQ(tenum.term(), t);
-      DocsEnum docsEnum(tenum);
+      DocsOnlyEnum docsEnum(tenum);
       ASSERT_EQ(docsEnum.next(), i);
     }
   }
 
-  // Test 8b: same but skipping every other term (with DocsEnum)
+  // Test 8b: same but skipping every other term (with postings iteration)
   {
     TermsEnum tenum(pool, reader, fieldInfo);
     bool first = true;
@@ -834,16 +841,16 @@ TEST_F(PostingsTest, seekForward) {
       first = false;
       ASSERT_TRUE(found) << "skip-2 failed at term " << i;
       ASSERT_EQ(tenum.term(), t);
-      DocsEnum docsEnum(tenum);
+      DocsOnlyEnum docsEnum(tenum);
       ASSERT_EQ(docsEnum.next(), i);
     }
   }
 
-  // Test 9: seekForward with alternating found/not-found + DocsEnum
+  // Test 9: seekForward with alternating found/not-found + postings iteration
   {
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek(makeTerm(0)));
-    DocsEnum de0(tenum);
+    DocsOnlyEnum de0(tenum);
     ASSERT_EQ(de0.next(), 0);
 
     for (int i = 1; i < nTerms; i++) {
@@ -855,7 +862,7 @@ TEST_F(PostingsTest, seekForward) {
       auto t = makeTerm(i);
       ASSERT_TRUE(tenum.seekForward(t)) << "should find term " << i;
       ASSERT_EQ(tenum.term(), t);
-      DocsEnum de(tenum);
+      DocsOnlyEnum de(tenum);
       ASSERT_EQ(de.next(), i);
     }
   }
@@ -900,26 +907,26 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
 
-  // Test: seek first, then seekForward every remaining term with DocsEnum
+  // Test: seek first, then seekForward every remaining term with postings iteration
   {
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek(ids[0]));
-    DocsEnum de0(tenum);
+    DocsOnlyEnum de0(tenum);
     ASSERT_EQ(de0.next(), 0);
 
     for (int i = 1; i < nTerms; i++) {
       ASSERT_TRUE(tenum.seekForward(ids[i])) << "failed at term " << ids[i] << " (index " << i << ")";
       ASSERT_EQ(tenum.term(), ids[i]);
-      DocsEnum de(tenum);
+      DocsOnlyEnum de(tenum);
       ASSERT_EQ(de.next(), i);
     }
   }
 
-  // Test: alternating found/not-found with DocsEnum (sparse delete pattern)
+  // Test: alternating found/not-found with postings iteration (sparse delete pattern)
   {
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek(ids[0]));
-    DocsEnum de0(tenum);
+    DocsOnlyEnum de0(tenum);
     ASSERT_EQ(de0.next(), 0);
 
     for (int i = 1; i < nTerms; i++) {
@@ -931,7 +938,7 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
 
       ASSERT_TRUE(tenum.seekForward(ids[i])) << "should find " << ids[i];
       ASSERT_EQ(tenum.term(), ids[i]);
-      DocsEnum de(tenum);
+      DocsOnlyEnum de(tenum);
       ASSERT_EQ(de.next(), i);
     }
   }
@@ -945,7 +952,7 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
       first = false;
       ASSERT_TRUE(found) << "skip-2 failed for " << ids[i];
       ASSERT_EQ(tenum.term(), ids[i]);
-      DocsEnum de(tenum);
+      DocsOnlyEnum de(tenum);
       ASSERT_EQ(de.next(), i);
     }
   }
@@ -1027,7 +1034,7 @@ TEST_F(PostingsTest, seekForwardRandom) {
         if (found) {
           ASSERT_EQ(tenum.ord(), idx) << "trial=" << trial << " seq=" << s << " q='" << q << "'";
           ASSERT_EQ(tenum.term(), q) << "trial=" << trial << " seq=" << s << " q='" << q << "'";
-          DocsEnum de(tenum);
+          DocsOnlyEnum de(tenum);
           ASSERT_EQ(de.next(), idx) << "trial=" << trial << " seq=" << s << " q='" << q << "'";
         }
       }

@@ -336,7 +336,7 @@ TEST_F(PForTest, pfordRoundTrip) {
 
 // Delta-coded docs with a cross-block base: a block whose first id is coded as a
 // delta from the previous block's last id must round-trip when decoded with the
-// same base.  Mirrors how PostingsWriter/DocsEnum carry the base across blocks.
+// same base. Mirrors how the postings writer and reader carry it across blocks.
 TEST_F(PForTest, pfordBaseCarry) {
   SoluxPFORd fp;
 

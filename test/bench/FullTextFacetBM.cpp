@@ -346,7 +346,7 @@ ScoreTopKResult runClusteredDisjunctionTopK(IndexReader& reader, int32_t topK,
     } else {
       int32_t windowSize = mode == DisjunctionMaxScoreMode::Global
         ? std::numeric_limits<int32_t>::max()
-        : DocsEnum::L1_DOCS;
+        : DocsEnumMeta::L1_DOCS;
       scorer = pool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
         pool, std::span<Query::Scorer*>(arr, (size_t) count),
         segments[segnum].maxDoc(), windowSize);
@@ -579,7 +579,7 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
     // the later windows where its per-window max is just tf 1.  One clustered clause
     // is enough to separate windowed from global; common/beta are demoted disjuncts.
     int32_t alphaHotTf = 0;
-    if (doc < DocsEnum::L1_DOCS && (doc % 2) == 0) {
+    if (doc < DocsEnumMeta::L1_DOCS && (doc % 2) == 0) {
       alphaHotTf = (int32_t) std::max<int64_t>(2, 132 - doc / 2);
     }
 
@@ -1218,7 +1218,7 @@ static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
   state.counters["visited"] = visited;
   state.counters["nonessential_lookups"] = nonEssentialLookups;
   state.counters["mode"] = (int32_t) mode;
-  state.counters["window"] = mode == DisjunctionMaxScoreMode::Windowed ? DocsEnum::L1_DOCS : 0;
+  state.counters["window"] = mode == DisjunctionMaxScoreMode::Windowed ? DocsEnumMeta::L1_DOCS : 0;
   state.counters["reused"] = reuseIndex;
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
   auto mem = watcher.getDeltaKB();

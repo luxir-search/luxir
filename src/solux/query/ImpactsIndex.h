@@ -53,7 +53,7 @@ private:
   };
 
   MemPool* pool = nullptr;
-  const DocsEnum* docsEnum = nullptr;
+  const DocsEnumMeta* docsEnum = nullptr;
   Similarity::BM25Scorer* simScorer = nullptr;
   float boost = 1.0f;
   bool useFrontierBound = true;
@@ -72,9 +72,9 @@ private:
   int32_t* groupMaxTfs = nullptr;
   int32_t* groupMinNorms = nullptr;
   mutable Chunk** chunks = nullptr;  // lazily parsed per group
-  mutable DocsEnum::GroupImpactCursor groupCursor;
+  mutable DocsEnumMeta::GroupImpactCursor groupCursor;
 
-  static constexpr int32_t GROUP = DocsEnum::L1_PERIOD;
+  static constexpr int32_t GROUP = DocsEnumMeta::L1_PERIOD;
 
   int32_t blockCountForGroup(int32_t g) const {
     return std::min(GROUP, count - g * GROUP);
@@ -84,7 +84,7 @@ private:
     return boost * simScorer->score((float) tf, (int64_t) norm);
   }
 
-  float scoreFrontier(const DocsEnum::GroupImpactHeader& header) const {
+  float scoreFrontier(const DocsEnumMeta::GroupImpactHeader& header) const {
     if (useFrontierBound && !header.frontierNorms.empty()) {
       return simScorer->scoreFrontier(header.frontierNorms, header.frontierTfBytes,
                                       header.frontierTfWidth, boost);
@@ -107,7 +107,7 @@ private:
     }
     docsEnum->readGroupImpactHeadersThrough(
         groupCursor, g, true,
-        [&](const DocsEnum::GroupImpactHeader& header) {
+        [&](const DocsEnumMeta::GroupImpactHeader& header) {
           int32_t idx = groupHeadersParsed;
           assert(header.group == idx);
           groupLastDocs[idx] = header.lastDoc;
@@ -159,7 +159,7 @@ private:
     chunk->maxTfs = pool->make_arr<int32_t>((size_t) chunk->blockCount);
     chunk->minNorms = pool->make_arr<int32_t>((size_t) chunk->blockCount);
 
-    DocsEnum::GroupBlockImpactScratch scratch;
+    DocsEnumMeta::GroupBlockImpactScratch scratch;
     docsEnum->visitGroupBlockImpacts(
         g, groupBodyOffs[g], groupBaseLastDocs[g], scratch,
         [&](int32_t block, int32_t lastDoc, int32_t maxTf, int32_t minNorm,
@@ -192,7 +192,7 @@ private:
 public:
   static inline bool forceEagerForTests = false;
 
-  void build(MemPool& pool_, DocsEnum& docsEnum_, Similarity::BM25Scorer& simScorer_,
+  void build(MemPool& pool_, DocsEnumMeta& docsEnum_, Similarity::BM25Scorer& simScorer_,
              float boost_, bool useFrontierBound_ = true,
              BlockBounds::TermView sidecar_ = {}) {
     pool = &pool_;
@@ -236,7 +236,7 @@ public:
       return;
     }
 
-    static thread_local DocsEnum::GroupImpacts groups;  // reused; reset by readGroupImpacts
+    static thread_local DocsEnumMeta::GroupImpacts groups;  // reused; reset by readGroupImpacts
     docsEnum_.readGroupImpacts(groups);
     if (groups.lastDocs.empty()) {
       return;
@@ -596,18 +596,19 @@ public:
   // parsing them, so a term-wide skip costs a group-table scan, not a
   // per-block walk (Lucene ImpactsDISI's getSkipUpTo shape).  Returns `doc`
   // itself when its own block competes (or lies past the impact data), and
-  // DocsEnum::END when nothing later can compete. lastDoc and impact certify
+  // DocsEnumMeta::END when nothing later can compete. lastDoc and impact certify
   // the competitive landing block; past the impact data they permanently
   // certify the remainder of the posting list.
   CompetitiveTarget firstCompetitiveTarget(int32_t doc, float minScore,
                                             int64_t& skippedBlocks) const {
     if (globalMax < minScore) {
       skippedBlocks += count;
-      return {DocsEnum::END, DocsEnum::END, std::numeric_limits<float>::infinity()};
+      return {DocsEnumMeta::END, DocsEnumMeta::END,
+              std::numeric_limits<float>::infinity()};
     }
     int32_t g = groupContainingFrom(-1, doc);
     if (g >= groupCount) {
-      return {doc, DocsEnum::END, std::numeric_limits<float>::infinity()};
+      return {doc, DocsEnumMeta::END, std::numeric_limits<float>::infinity()};
     }
     for (;;) {
       ensureGroupHeadersThrough(g);
@@ -628,7 +629,8 @@ public:
         skippedBlocks += blockCountForGroup(g);
       }
       if (g + 1 >= groupCount) {
-        return {DocsEnum::END, DocsEnum::END, std::numeric_limits<float>::infinity()};
+        return {DocsEnumMeta::END, DocsEnumMeta::END,
+                std::numeric_limits<float>::infinity()};
       }
       doc = groupLastDocs[g] + 1;
       g++;

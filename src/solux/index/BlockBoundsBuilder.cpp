@@ -104,7 +104,7 @@ BlockBoundsBuilder::Result BlockBoundsBuilder::build(
       uint32_t blocks = ((uint32_t) terms.docFreq() + Postings::DOCS_BLOCK_SIZE - 1)
           / Postings::DOCS_BLOCK_SIZE;
       if (blocks < 4) continue;
-      uint32_t groups = (blocks + DocsEnum::L1_PERIOD - 1) / DocsEnum::L1_PERIOD;
+      uint32_t groups = (blocks + DocsEnumMeta::L1_PERIOD - 1) / DocsEnumMeta::L1_PERIOD;
       admitted++;
       recordBytes += BlockBounds::TERM_HEADER_SIZE
           + (uint64_t) (groups + blocks) * BlockBounds::RECORD_SIZE;
@@ -142,9 +142,9 @@ BlockBoundsBuilder::Result BlockBoundsBuilder::build(
   uint64_t totalGroups = 0;
   uint64_t totalBlocks = 0;
   TermsEnum terms(pool, postingsReader, fieldInfo);
-  DocsEnum::GroupImpacts groups;
+  DocsEnumMeta::GroupImpacts groups;
   while (terms.nextTerm()) {
-    DocsEnum docs(terms);
+    DocsOnlyEnum docs(terms);
     uint32_t blocks = (uint32_t) docs.numImpactBlocks();
     if (blocks < 4) continue;
     uint32_t groupCount = (uint32_t) docs.numImpactGroups();
@@ -177,7 +177,7 @@ BlockBoundsBuilder::Result BlockBoundsBuilder::build(
     std::vector<float> blockD;
     blockLastDocs.reserve(blocks);
     blockD.reserve(blocks);
-    DocsEnum::GroupBlockImpactScratch scratch;
+    DocsEnumMeta::GroupBlockImpactScratch scratch;
     for (uint32_t g = 0; g < groupCount; g++) {
       docs.visitGroupBlockImpacts(
           (int32_t) g, groups.bodyOffsets[g], groups.baseLastDocs[g], scratch,
@@ -202,7 +202,7 @@ BlockBoundsBuilder::Result BlockBoundsBuilder::build(
       throw std::runtime_error("BlockBoundsBuilder: block count mismatch");
     }
     for (uint32_t g = 0; g < groupCount; g++) {
-      uint32_t lastBlock = std::min(blocks, (g + 1) * (uint32_t) DocsEnum::L1_PERIOD) - 1;
+      uint32_t lastBlock = std::min(blocks, (g + 1) * (uint32_t) DocsEnumMeta::L1_PERIOD) - 1;
       if (groups.lastDocs[g] != blockLastDocs[lastBlock]) {
         throw std::runtime_error("BlockBoundsBuilder: source lastDoc mismatch");
       }

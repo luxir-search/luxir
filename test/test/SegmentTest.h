@@ -31,7 +31,7 @@ public:
   std::unique_ptr<PostingsReader> reader;
   std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
-  std::unique_ptr<DocsEnum> docsEnum;
+  std::unique_ptr<DocsPosEnum> docsEnum;
   std::unique_ptr<PosEnum> posEnum;
 
   Rng r;
@@ -217,7 +217,7 @@ public:
       if (numDocs > 0) {
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
-        docsEnum = std::make_unique<DocsEnum>(*tenum);
+        docsEnum = std::make_unique<DocsPosEnum>(*tenum);
         posEnum = std::make_unique<PosEnum>(*docsEnum);
         numDocsRead = docsEnum->numDocs();
       }
@@ -293,46 +293,44 @@ public:
 
   // return fingerprint, #terms read, #docs read, #positions read
   std::tuple<int64_t,int64_t,int64_t,int64_t> readFingerprint(int percentReadPositions) {
-    int64_t totTerms = 0;
-    int64_t totDocs = 0;
-    int64_t totPositions = 0;
-    int64_t ret = 0;
-    FieldReader fieldReader(pool, *reader);
-    SegFieldInfo fieldInfo;
-    while (fieldReader.readNextField()) {
-      fieldReader.readFieldInfo(fieldInfo);
-      TermsEnum tenum(pool, *reader, fieldInfo);
-      while (tenum.nextTerm()) {
-        totTerms++;
-        DocsEnum docsEnum(tenum);
-        std::unique_ptr<PosEnum> posEnum;
-        if (percentReadPositions > 0) {
-          posEnum = std::make_unique<PosEnum>(docsEnum);
-        }
-        auto ndocs = docsEnum.numDocs();
-        for (int i = 0; i < ndocs; i++) {
-          auto id = docsEnum.nextDoc();
-          ret += id;
-          totDocs++;
-          // std::cout << "d fingerprint+=" << id << " total=" << ret << std::endl;
-
-          bool readPositions = percentReadPositions>0;  // todo: impl percentages
-
-          if (readPositions) {
-            auto tfreq = docsEnum.termFreq();
-            posEnum->startPositions();
-            for (int j = 0; j < tfreq; j++) {
-              auto pos = posEnum->nextPosition();
-              ret += pos;
-              totPositions++;
-              // std::cout << "p fingerprint+=" << pos << " total=" << ret << std::endl;
+    auto read = [&]<DocsEnumTier Tier>() {
+      int64_t totTerms = 0;
+      int64_t totDocs = 0;
+      int64_t totPositions = 0;
+      int64_t ret = 0;
+      FieldReader fieldReader(pool, *reader);
+      SegFieldInfo fieldInfo;
+      while (fieldReader.readNextField()) {
+        fieldReader.readFieldInfo(fieldInfo);
+        TermsEnum tenum(pool, *reader, fieldInfo);
+        while (tenum.nextTerm()) {
+          totTerms++;
+          BasicDocsEnum<Tier> docsEnum(tenum);
+          std::unique_ptr<PosEnum> posEnum;
+          if constexpr (Tier == DocsEnumTier::POSITIONS) {
+            posEnum = std::make_unique<PosEnum>(docsEnum);
+          }
+          auto ndocs = docsEnum.numDocs();
+          for (int i = 0; i < ndocs; i++) {
+            auto id = docsEnum.nextDoc();
+            ret += id;
+            totDocs++;
+            if constexpr (Tier == DocsEnumTier::POSITIONS) {
+              auto tfreq = docsEnum.termFreq();
+              posEnum->startPositions();
+              for (int j = 0; j < tfreq; j++) {
+                ret += posEnum->nextPosition();
+                totPositions++;
+              }
             }
           }
-
         }
       }
-    }
-    return {ret, totTerms, totDocs, totPositions};
+      return std::tuple{ret, totTerms, totDocs, totPositions};
+    };
+    return percentReadPositions > 0
+        ? read.template operator()<DocsEnumTier::POSITIONS>()
+        : read.template operator()<DocsEnumTier::DOCS>();
   }
 
 

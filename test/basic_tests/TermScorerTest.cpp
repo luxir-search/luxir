@@ -502,7 +502,7 @@ void addMaxScoreDisjunctionDocs(CollectionHelper& helper) {
 }
 
 DisjunctionTopKRun runMaxScoreDisjunctionTopK(IndexReader& reader, int32_t topK,
-                                              int32_t windowSize = DocsEnum::L1_DOCS) {
+                                              int32_t windowSize = DocsEnumMeta::L1_DOCS) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   TermQuery common("body_w", "common");
@@ -1021,7 +1021,7 @@ std::vector<std::string> makeSweepTermStrings(int32_t numTerms) {
 }
 
 void addSweepDisjunctionDocs(CollectionHelper& helper, int32_t numTerms) {
-  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 211;
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 211;
   auto terms = makeSweepTermStrings(numTerms);
   helper.clear();
   std::vector<Doc> docs;
@@ -1100,10 +1100,10 @@ void addWindowDispatchRandomDocs(CollectionHelper& helper, int32_t nDocs, int32_
       if ((nextRand() & ((1U << (term + 1)) - 1U)) == 0U) {
         match = true;
       }
-      if (doc == DocsEnum::L1_DOCS && term == 0) {
+      if (doc == DocsEnumMeta::L1_DOCS && term == 0) {
         match = true;
       }
-      if (doc == 2 * DocsEnum::L1_DOCS && term == 1) {
+      if (doc == 2 * DocsEnumMeta::L1_DOCS && term == 1) {
         match = true;
       }
       if (match) {
@@ -1121,7 +1121,7 @@ void addWindowDispatchRandomDocs(CollectionHelper& helper, int32_t nDocs, int32_
 }
 
 void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
-  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 100;
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 100;
   helper.clear();
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
@@ -1133,10 +1133,10 @@ void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
       used++;
     };
 
-    if (doc == DocsEnum::L1_DOCS) add("wd_at_end_a");
-    if (doc == 2 * DocsEnum::L1_DOCS) add("wd_at_end_b");
+    if (doc == DocsEnumMeta::L1_DOCS) add("wd_at_end_a");
+    if (doc == 2 * DocsEnumMeta::L1_DOCS) add("wd_at_end_b");
     if (doc == 0) add("wd_top2_end_a");
-    if (doc == DocsEnum::L1_DOCS) add("wd_top2_end_b");
+    if (doc == DocsEnumMeta::L1_DOCS) add("wd_top2_end_b");
     if (doc == 17) {
       add("wd_same_a");
       add("wd_same_b");
@@ -1145,14 +1145,14 @@ void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
     if (doc == 7000 || doc == 11000) add("wd_exhaust_b");
     if (doc == 1000) add("wd_rare_driver");
     if (doc >= 7000 && (doc % 3) == 0) add("wd_common_late");
-    if (doc < DocsEnum::L1_DOCS) add("wd_half_exact_a");
-    if (doc >= DocsEnum::L1_DOCS / 2 && doc < DocsEnum::L1_DOCS) add("wd_half_exact_b");
-    if (doc < DocsEnum::L1_DOCS) add("wd_half_inside_a");
-    if (doc >= DocsEnum::L1_DOCS / 2 - 1 && doc < DocsEnum::L1_DOCS) {
+    if (doc < DocsEnumMeta::L1_DOCS) add("wd_half_exact_a");
+    if (doc >= DocsEnumMeta::L1_DOCS / 2 && doc < DocsEnumMeta::L1_DOCS) add("wd_half_exact_b");
+    if (doc < DocsEnumMeta::L1_DOCS) add("wd_half_inside_a");
+    if (doc >= DocsEnumMeta::L1_DOCS / 2 - 1 && doc < DocsEnumMeta::L1_DOCS) {
       add("wd_half_inside_b");
     }
     if (doc == 0 || doc == 3000) add("wd_half_gap_a");
-    if (doc >= DocsEnum::L1_DOCS / 2 && doc < DocsEnum::L1_DOCS) add("wd_half_gap_b");
+    if (doc >= DocsEnumMeta::L1_DOCS / 2 && doc < DocsEnumMeta::L1_DOCS) add("wd_half_gap_b");
     if ((doc % 2) == 0) add("wd_latch_low");
     if (doc >= 1000 && doc < 12000 && (doc % 2) == 0) add("wd_latch_a");
     if (doc >= 7000 && doc < 12000 && (doc % 2) == 0) add("wd_latch_b");
@@ -2215,7 +2215,7 @@ TEST_F(TermScorerTest, singleSeg) {
 
     ASSERT_EQ(tenum.seek("to"), true);
 
-    DocsEnum denum(tenum);
+    DocsFreqEnum denum(tenum);
     ASSERT_EQ(denum.numDocs(), 2);
     ASSERT_EQ(denum.totalTermFreq(), 3);
 
@@ -2830,8 +2830,8 @@ TEST_F(TermScorerTest, termImpactMaxScoreBounds) {
     if (target >= N) {
       return PostingsReader::END;
     }
-    int32_t group = target / DocsEnum::L1_DOCS;
-    return std::min(N - 1, (group + 1) * DocsEnum::L1_DOCS - 1);
+    int32_t group = target / DocsEnumMeta::L1_DOCS;
+    return std::min(N - 1, (group + 1) * DocsEnumMeta::L1_DOCS - 1);
   };
   for (int32_t target : {0, 1, 127, 128, 129, 3 * Postings::DOCS_BLOCK_SIZE + 5, N - 1}) {
     EXPECT_EQ(shallowScorer->advanceShallow(target), expectedGroupLastDoc(target)) << target;
@@ -3064,7 +3064,7 @@ TEST_F(TermScorerTest, cachedPostingsStateKeepsCurrentTermFrontierAfterTermsEnum
 }
 
 TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
-  const int32_t N = 2 * DocsEnum::L1_DOCS + 55;
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 55;
   constexpr int32_t TERM_COUNT = 5;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -3119,12 +3119,12 @@ TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
       EXPECT_FLOAT_EQ(lazy->impacts.maxGroupImpactInRange(g, g),
                       eager->impacts.maxGroupImpactInRange(g, g)) << "group=" << g;
     }
-    for (int32_t target : {N - 1, 0, 127, 128, DocsEnum::L1_DOCS + 3,
+    for (int32_t target : {N - 1, 0, 127, 128, DocsEnumMeta::L1_DOCS + 3,
                            N / 2, PostingsReader::END}) {
       EXPECT_EQ(lazy->impacts.blockContaining(target), eager->impacts.blockContaining(target))
           << "target=" << target;
     }
-    for (int32_t target : {0, Postings::DOCS_BLOCK_SIZE + 5, DocsEnum::L1_DOCS + 9}) {
+    for (int32_t target : {0, Postings::DOCS_BLOCK_SIZE + 5, DocsEnumMeta::L1_DOCS + 9}) {
       for (float minScore : {0.0f, lazy->impacts.globalMaxImpact() * 0.5f,
                              lazy->impacts.globalMaxImpact() + 0.001f}) {
         int64_t lazySkipped = 0;
@@ -3143,7 +3143,7 @@ TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges) {
-  const int32_t postingCount = 2 * DocsEnum::L1_DOCS + 19;
+  const int32_t postingCount = 2 * DocsEnumMeta::L1_DOCS + 19;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3163,9 +3163,9 @@ TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges
   int32_t groupCount = scorer->impacts.groupContainingFrom(-1, PostingsReader::END);
   ASSERT_GT(groupCount, 1);
   for (int32_t g = 0; g < groupCount; g++) {
-    int32_t fromBlock = g * DocsEnum::L1_PERIOD;
+    int32_t fromBlock = g * DocsEnumMeta::L1_PERIOD;
     int32_t toBlock = std::min(scorer->impacts.blockCount() - 1,
-                               fromBlock + DocsEnum::L1_PERIOD - 1);
+                               fromBlock + DocsEnumMeta::L1_PERIOD - 1);
     float blockBound = fromBlock == scorer->impacts.blockCount() - 1
         ? scorer->impacts.maxImpactFrom(fromBlock)
         : scorer->impacts.maxImpactInRange(fromBlock, toBlock);
@@ -3177,7 +3177,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
-  const int32_t postingCount = 3 * DocsEnum::L1_DOCS + 37;
+  const int32_t postingCount = 3 * DocsEnumMeta::L1_DOCS + 37;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3194,16 +3194,16 @@ TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
   ASSERT_NE(scorer, nullptr);
 
   std::array<std::pair<int32_t, int32_t>, 4> ranges = {{
-    {1, DocsEnum::L1_PERIOD - 2},
-    {3, DocsEnum::L1_PERIOD + 5},
-    {DocsEnum::L1_PERIOD + 7, 2 * DocsEnum::L1_PERIOD + 1},
-    {2 * DocsEnum::L1_PERIOD + 3, scorer->impacts.blockCount() - 2}
+    {1, DocsEnumMeta::L1_PERIOD - 2},
+    {3, DocsEnumMeta::L1_PERIOD + 5},
+    {DocsEnumMeta::L1_PERIOD + 7, 2 * DocsEnumMeta::L1_PERIOD + 1},
+    {2 * DocsEnumMeta::L1_PERIOD + 3, scorer->impacts.blockCount() - 2}
   }};
   for (auto [fromBlock, toBlock] : ranges) {
     ASSERT_LT(fromBlock, toBlock);
     float blockBound = scorer->impacts.maxImpactInRange(fromBlock, toBlock);
-    int32_t fromGroup = fromBlock / DocsEnum::L1_PERIOD;
-    int32_t toGroup = toBlock / DocsEnum::L1_PERIOD;
+    int32_t fromGroup = fromBlock / DocsEnumMeta::L1_PERIOD;
+    int32_t toGroup = toBlock / DocsEnumMeta::L1_PERIOD;
     float groupBound = scorer->impacts.maxGroupImpactInRange(fromGroup, toGroup);
     EXPECT_GE(groupBound + 1e-6f, blockBound)
         << "fromBlock=" << fromBlock << " toBlock=" << toBlock;
@@ -3211,7 +3211,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
 }
 
 TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
-  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 113;
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 113;
   CollectionHelper helper("max_score_setup_group_bounds");
   addDenseManyClauseDisjunctionDocs(helper, nDocs, 8);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -3242,7 +3242,7 @@ TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
 }
 
 TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
-  const int32_t nDocs = 8 * DocsEnum::L1_DOCS + 19;
+  const int32_t nDocs = 8 * DocsEnumMeta::L1_DOCS + 19;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3271,7 +3271,7 @@ TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
   EXPECT_EQ(SkipStats::impactGroupHeaderParses, 0);
   EXPECT_TRUE(std::isfinite(scorer->getMaxScoreForSetup(PostingsReader::END)));
   EXPECT_EQ(SkipStats::impactGroupHeaderParses, 0);
-  EXPECT_EQ(scorer->advanceShallowForSetup(0), DocsEnum::L1_DOCS - 1);
+  EXPECT_EQ(scorer->advanceShallowForSetup(0), DocsEnumMeta::L1_DOCS - 1);
   EXPECT_GT(SkipStats::impactGroupHeaderParses, 0);
   EXPECT_LT(SkipStats::impactGroupHeaderParses, scorer->impacts.numGroups());
 
@@ -3279,12 +3279,12 @@ TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
   int64_t skipped = 0;
   EXPECT_EQ(scorer->impacts.firstCompetitiveTarget(
                 0, scorer->impacts.globalMaxImpact() + 1.0f, skipped).doc,
-            DocsEnum::END);
+            DocsEnumMeta::END);
   EXPECT_EQ(SkipStats::impactGroupHeaderParses, parsedBeforeDeath);
 }
 
 TEST_F(TermScorerTest, lazySetupAndMainShallowCursorsCanInterleaveNonMonotone) {
-  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 17;
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 17;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3308,17 +3308,17 @@ TEST_F(TermScorerTest, lazySetupAndMainShallowCursorsCanInterleaveNonMonotone) {
 
   auto groupEnd = [&](int32_t target) {
     if (target >= nDocs) return PostingsReader::END;
-    int32_t group = target / DocsEnum::L1_DOCS;
-    return std::min(nDocs - 1, (group + 1) * DocsEnum::L1_DOCS - 1);
+    int32_t group = target / DocsEnumMeta::L1_DOCS;
+    return std::min(nDocs - 1, (group + 1) * DocsEnumMeta::L1_DOCS - 1);
   };
 
-  EXPECT_EQ(scorer->advanceShallowForSetup(2 * DocsEnum::L1_DOCS + 7),
-            groupEnd(2 * DocsEnum::L1_DOCS + 7));
+  EXPECT_EQ(scorer->advanceShallowForSetup(2 * DocsEnumMeta::L1_DOCS + 7),
+            groupEnd(2 * DocsEnumMeta::L1_DOCS + 7));
   EXPECT_EQ(scorer->advanceShallow(3), groupEnd(3));
-  EXPECT_EQ(scorer->advanceShallowForSetup(DocsEnum::L1_DOCS + 9),
-            groupEnd(DocsEnum::L1_DOCS + 9));
-  EXPECT_EQ(scorer->advanceShallow(2 * DocsEnum::L1_DOCS + 11),
-            groupEnd(2 * DocsEnum::L1_DOCS + 11));
+  EXPECT_EQ(scorer->advanceShallowForSetup(DocsEnumMeta::L1_DOCS + 9),
+            groupEnd(DocsEnumMeta::L1_DOCS + 9));
+  EXPECT_EQ(scorer->advanceShallow(2 * DocsEnumMeta::L1_DOCS + 11),
+            groupEnd(2 * DocsEnumMeta::L1_DOCS + 11));
   EXPECT_EQ(scorer->advanceShallow(10), groupEnd(10));
 }
 
@@ -3333,7 +3333,7 @@ TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   TermsEnum tenum = f.createTermsEnum();
   ASSERT_TRUE(tenum.seek("pulse"));
-  DocsEnum denum(tenum);
+  DocsFreqEnum denum(tenum);
   EXPECT_TRUE(denum.hasTermImpacts());
   EXPECT_EQ(denum.numImpactBlocks(), 0);
   std::vector<int32_t> norms;
@@ -3360,7 +3360,7 @@ TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
 }
 
 TEST_F(TermScorerTest, mandOptSingleOptionalSparseAndDenseTopKMatchesExhaustive) {
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 113;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 113;
   for (bool denseOpt : {false, true}) {
     SCOPED_TRACE(denseOpt ? "dense optional" : "sparse optional");
     TestIndex testIndex;
@@ -3464,11 +3464,11 @@ TEST_F(TermScorerTest, mandOptWindowWalkBacksOffWhenNothingSkips) {
 }
 
 TEST_F(TermScorerTest, mandOptConjunctionTransitionReturnsIntersectionUntilOptionalExhausts) {
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 31;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 31;
   const std::vector<int32_t> optDocs = {
     17,
     Postings::DOCS_BLOCK_SIZE + 11,
-    DocsEnum::L1_DOCS + 23
+    DocsEnumMeta::L1_DOCS + 23
   };
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -3517,7 +3517,7 @@ TEST_F(TermScorerTest, mandOptConjunctionTransitionReturnsIntersectionUntilOptio
 }
 
 TEST_F(TermScorerTest, mandOptThresholdRiseReclassifiesCurrentWindow) {
-  const int32_t nDocs = DocsEnum::L1_DOCS + 19;
+  const int32_t nDocs = DocsEnumMeta::L1_DOCS + 19;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3750,7 +3750,7 @@ TEST_F(TermScorerTest, mandOptTwoPhaseOptionalScoresOnlyConfirmedMatches) {
 
 TEST_F(TermScorerTest, mandOptBulkMatchesPullAcrossClauseCountsFiltersAndDeletes) {
   CollectionHelper helper("main");
-  const int32_t segDocs = DocsEnum::L1_DOCS + 257;
+  const int32_t segDocs = DocsEnumMeta::L1_DOCS + 257;
   std::vector<std::string> deleteIds;
   for (int32_t seg = 0; seg < 3; seg++) {
     std::vector<Doc> docs;
@@ -3904,7 +3904,7 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
 }
 
 TEST_F(TermScorerTest, mandOptBulkHybridEngagesForDenseMandSparseOptHighTheta) {
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 31;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 31;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -4088,7 +4088,7 @@ TEST_F(TermScorerTest, mandOptKeepsThetaOutOfMandatoryTermScorer) {
 }
 
 TEST_F(TermScorerTest, mandOptBulkCapacityWindowAndCountDomainUseMandDocs) {
-  const int32_t nDocs = DocsEnum::L1_DOCS;
+  const int32_t nDocs = DocsEnumMeta::L1_DOCS;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -4336,7 +4336,7 @@ TEST_F(TermScorerTest, mandOptNearThetaRefineSkipsCoarseCompetitiveGroup) {
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsHandleFinalPartialGroup) {
-  const int32_t postingCount = DocsEnum::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 17;
+  const int32_t postingCount = DocsEnumMeta::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 17;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -4354,7 +4354,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFinalPartialGroup) {
 
   int32_t groupCount = scorer->impacts.groupContainingFrom(-1, PostingsReader::END);
   ASSERT_EQ(groupCount, 2);
-  int32_t fromBlock = DocsEnum::L1_PERIOD;
+  int32_t fromBlock = DocsEnumMeta::L1_PERIOD;
   int32_t toBlock = scorer->impacts.blockCount() - 1;
   ASSERT_LT(fromBlock, toBlock);
   EXPECT_FLOAT_EQ(scorer->impacts.maxGroupImpactFrom(1),
@@ -4362,7 +4362,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFinalPartialGroup) {
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
-  const int32_t N = DocsEnum::L1_DOCS + 19;
+  const int32_t N = DocsEnumMeta::L1_DOCS + 19;
   RAMDir dir;
   MemPool pool;
   PostingsWriter postingsWriter(dir, 0, N + 16);
@@ -4389,7 +4389,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsEnum denum(tenum);
+  DocsFreqEnum denum(tenum);
   EXPECT_FALSE(denum.hasTermImpacts());
 
   Similarity::FieldStats fieldStats;
@@ -4548,7 +4548,7 @@ TEST_F(TermScorerTest, phraseImpactShallowStillUsesBlockGranularity) {
 }
 
 TEST_F(TermScorerTest, phraseRepeatedTermLazyBoundsCoverScores) {
-  const int32_t N = DocsEnum::L1_DOCS + 37;
+  const int32_t N = DocsEnumMeta::L1_DOCS + 37;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -4576,7 +4576,7 @@ TEST_F(TermScorerTest, phraseRepeatedTermLazyBoundsCoverScores) {
   ASSERT_NE(upTo, PostingsReader::END);
   float bound = boundScorer->getMaxScore(upTo);
   ASSERT_TRUE(std::isfinite(bound));
-  EXPECT_EQ(boundScorer->advanceShallow(DocsEnum::L1_DOCS + 5), N - 1);
+  EXPECT_EQ(boundScorer->advanceShallow(DocsEnumMeta::L1_DOCS + 5), N - 1);
   EXPECT_EQ(boundScorer->advanceShallow(3), upTo);
 
   auto* scoreScorer = dynamic_cast<PhraseQuery::Scorer*>(
@@ -5284,7 +5284,7 @@ TEST_F(TermScorerTest, negatedOptionalChildComposesWithWindowedAndGlobalMaxScore
 }
 
 TEST_F(TermScorerTest, termCompetitiveBlockCertificateTracksThetaAndBoundaries) {
-  const int32_t nDocs = DocsEnum::L1_DOCS + 2 * Postings::DOCS_BLOCK_SIZE + 17;
+  const int32_t nDocs = DocsEnumMeta::L1_DOCS + 2 * Postings::DOCS_BLOCK_SIZE + 17;
   CollectionHelper helper("term_competitive_certificate");
   addNegatedThetaDocs(helper, nDocs);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -5593,7 +5593,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
 
   // Contiguous windows with boundaries that land inside word blocks (4097 is
   // deliberately off the 128-doc grid).
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
   const int32_t bounds[] = {0, 1000, 4097, 6000, N + 100};
   std::vector<int32_t> got;
   for (size_t w = 0; w + 1 < std::size(bounds); w++) {
@@ -5612,7 +5612,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
 
   // A window opening past the enum position: leading docs are consumed
   // unrecorded and the first word block is clipped.
-  DocsEnum denum2(tenum);
+  DocsOnlyEnum denum2(tenum);
   const int32_t from = 50, to = 700;
   std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
   denum2.intoBitSet(bits, from, to);
@@ -5631,7 +5631,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
 }
 
 TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
-  const int32_t N = 3 * DocsEnum::L1_DOCS + 257;
+  const int32_t N = 3 * DocsEnumMeta::L1_DOCS + 257;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -5673,7 +5673,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
                           std::initializer_list<int32_t> targets) {
     TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
     ASSERT_TRUE(tenum.seek(term));
-    DocsEnum denum(tenum);
+    DocsOnlyEnum denum(tenum);
     int32_t last = -1;
     for (int32_t target : targets) {
       ASSERT_GT(target, last) << term;
@@ -5697,7 +5697,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
 
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("ado_word"));
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
   auto firstWindowDoc = std::lower_bound(wordExpected.begin(), wordExpected.end(), 4096);
   ASSERT_NE(firstWindowDoc, wordExpected.end());
   int32_t from = *firstWindowDoc;
@@ -5723,7 +5723,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
 }
 
 TEST_F(TermScorerTest, conjunctionDenseCountMatchesPullWithFilters) {
-  const int32_t N = 2 * DocsEnum::L1_DOCS + 321;
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 321;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -5765,7 +5765,7 @@ TEST_F(TermScorerTest, conjunctionDenseCountMatchesPullWithFilters) {
 }
 
 TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
-  const int32_t N = 3 * DocsEnum::L1_DOCS + 17;
+  const int32_t N = 3 * DocsEnumMeta::L1_DOCS + 17;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -5798,7 +5798,7 @@ TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
 }
 
 TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
-  const int32_t N = 2 * DocsEnum::L1_DOCS + 200;
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 200;
   // Keep srare's docFreq below the dense gate so the leapfrog fallback runs.
   const int32_t rareMax =
       N / BooleanQuery::ConjunctionBulkScorer::kDenseThresholdInverse - 1;
@@ -5857,13 +5857,13 @@ TEST_F(TermScorerTest, docsOnlyEnumProtocolAssertsOnFreqAndPositions) {
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("protocol"));
 
-  DocsEnum denum(tenum);
+  DocsFreqEnum denum(tenum);
   auto docs = denum.peekDocBlock();
   ASSERT_FALSE(docs.empty());
   denum.consumeDocOnlyBlock(1);
   ASSERT_DEATH({ (void) denum.termFreq(); }, "");
 
-  DocsEnum denum2(tenum);
+  DocsPosEnum denum2(tenum);
   docs = denum2.peekDocBlock();
   ASSERT_FALSE(docs.empty());
   denum2.consumeDocOnlyBlock(1);
@@ -5902,7 +5902,7 @@ TEST_F(TermScorerTest, countBulkFillWithDeletesMatchesPull) {
 }
 
 TEST_F(TermScorerTest, bulkCountDomainDisjunctionMatchesPullAcrossFiltersAndDeletes) {
-  const int32_t N = 2 * DocsEnum::L1_DOCS + 97;
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 97;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -5997,7 +5997,7 @@ TEST_F(TermScorerTest, constantTopKAndDomainMatchesExhaustivePullWithFilters) {
 }
 
 TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
-  const int32_t N = 2 * DocsEnum::L1_DOCS + 97;
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 97;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -6077,7 +6077,7 @@ TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
 TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
   CollectionHelper helper("main");
   const int32_t numTerms = 32;
-  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 37;
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 37;
   const int32_t filterStep = 512;
   addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -6125,7 +6125,7 @@ TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
 
 TEST_F(TermScorerTest, bulkCountDomainConjunctionDenseAndSparseMatchPull) {
   {
-    const int32_t N = 2 * DocsEnum::L1_DOCS + 321;
+    const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 321;
     TestIndex testIndex;
     TestField f(testIndex, "body_w");
     f.startIndexing();
@@ -6160,7 +6160,7 @@ TEST_F(TermScorerTest, bulkCountDomainConjunctionDenseAndSparseMatchPull) {
   }
 
   {
-    const int32_t N = 2 * DocsEnum::L1_DOCS + 200;
+    const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 200;
     const int32_t rareMax =
         N / BooleanQuery::ConjunctionBulkScorer::kDenseThresholdInverse - 1;
     TestIndex testIndex;
@@ -6254,7 +6254,7 @@ TEST_F(TermScorerTest, bulkDomainAndTopKTwoPassMatchPull) {
 }
 
 TEST_F(TermScorerTest, queryPrepMaterializeBulkDomainMatchesPull) {
-  const int32_t N = 2 * DocsEnum::L1_DOCS + 77;
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 77;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -6422,7 +6422,7 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
 
 TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
   CollectionHelper helper("filter_mask_probe_score");
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 257;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -6439,7 +6439,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
   helper.indexAll(docs, UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   ASSERT_EQ(reader->maxDoc(), nDocs);
-  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+  ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 
   TermQuery keep("body_w", "keep");
   std::vector<Query*> filters = {&keep};
@@ -6508,7 +6508,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
 
 TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
   CollectionHelper helper("filter_mask_probe_count");
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 129;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 129;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -6523,7 +6523,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
   helper.indexAll(docs, UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   ASSERT_EQ(reader->maxDoc(), nDocs);
-  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+  ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 
   TermQuery keep("body_w", "keep");
   std::vector<Query*> filters = {&keep};
@@ -6581,7 +6581,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
 
 TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
   CollectionHelper helper("range_filter_shapes");
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 257;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -6607,7 +6607,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
   helper.indexAll(docs, UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   ASSERT_EQ(reader->maxDoc(), nDocs);
-  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+  ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 
   NumericRangeQuery fatRange("range_i", 0, 799);
   TermQuery termFilter("body_w", "term_filter");
@@ -6842,7 +6842,7 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
 
 TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
   CollectionHelper helper("filtered_union_wand");
-  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 257;
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   int32_t filterCount = 0;
@@ -6871,7 +6871,7 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
   helper.indexAll(docs, UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   ASSERT_EQ(reader->maxDoc(), nDocs);
-  ASSERT_GT(reader->maxDoc(), DocsEnum::L1_DOCS);
+  ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
   ASSERT_LT(filterCount,
             reader->maxDoc() / BooleanQuery::kMaskFilterDensityInverse);
 
@@ -6935,7 +6935,7 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
 
 TEST_F(TermScorerTest, FilteredConjunctionClampsSparseProductionWindows) {
   CollectionHelper helper("main");
-  const int32_t nDocs = 4 * DocsEnum::L1_DOCS + 37;
+  const int32_t nDocs = 4 * DocsEnumMeta::L1_DOCS + 37;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -7137,7 +7137,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
   int64_t compactionDrops = 0;
   for (int32_t clauses : {2, 3, 6}) {
     std::span<const std::string_view> terms(views.data(), (size_t) clauses);
-    for (int32_t topK : {5, 11, 3 * DocsEnum::L1_DOCS + 500}) {
+    for (int32_t topK : {5, 11, 3 * DocsEnumMeta::L1_DOCS + 500}) {
       auto expected = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, topK);
       SkipStatsGuard stats;
       auto actual = runFilteredBulkTermDisjunctionTopK(*reader, terms, topK);
@@ -7179,7 +7179,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRand
     CollectionHelper helper(tinySegment ? "window_dispatch_random_tiny"
                                         : "window_dispatch_random_large");
     const int32_t maxClauses = 8;
-    int32_t nDocs = tinySegment ? 997 : 2 * DocsEnum::L1_DOCS + 333;
+    int32_t nDocs = tinySegment ? 997 : 2 * DocsEnumMeta::L1_DOCS + 333;
     addWindowDispatchRandomDocs(helper, nDocs, maxClauses);
     if (!tinySegment) {
       std::vector<std::string> deleteIds;
@@ -7231,7 +7231,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryCasesMatchDisable
   CollectionHelper helper("window_dispatch_boundary");
   addWindowDispatchBoundaryDocs(helper);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  const int32_t maxDoc = 3 * DocsEnum::L1_DOCS + 100;
+  const int32_t maxDoc = 3 * DocsEnumMeta::L1_DOCS + 100;
 
   auto assertParity = [&](std::span<const std::string_view> terms,
                           int32_t minDoc, int32_t max, float theta) {
@@ -7244,11 +7244,11 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryCasesMatchDisable
   std::array<std::string_view, 2> top1AtWindowEnd = {"wd_at_end_a", "wd_at_end_b"};
   auto atWindowEnd = assertParity(top1AtWindowEnd, 0, maxDoc, 0.0f);
   ASSERT_EQ(atWindowEnd.docs.size(), 2);
-  EXPECT_EQ(atWindowEnd.docs[0], DocsEnum::L1_DOCS);
-  EXPECT_EQ(atWindowEnd.docs[1], 2 * DocsEnum::L1_DOCS);
+  EXPECT_EQ(atWindowEnd.docs[0], DocsEnumMeta::L1_DOCS);
+  EXPECT_EQ(atWindowEnd.docs[1], 2 * DocsEnumMeta::L1_DOCS);
 
   std::array<std::string_view, 2> top1AtOuterEnd = {"wd_at_end_a", "wd_at_end_b"};
-  auto atOuterEnd = assertParity(top1AtOuterEnd, 0, DocsEnum::L1_DOCS, 0.0f);
+  auto atOuterEnd = assertParity(top1AtOuterEnd, 0, DocsEnumMeta::L1_DOCS, 0.0f);
   EXPECT_TRUE(atOuterEnd.docs.empty());
 
   std::array<std::string_view, 2> top2AtWindowEnd = {"wd_top2_end_a", "wd_top2_end_b"};
@@ -7260,7 +7260,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryCasesMatchDisable
   EXPECT_EQ(sameTopRun.top2Conversions, 0);
 
   std::array<std::string_view, 2> allEnd = {"wd_same_a", "wd_same_b"};
-  auto allEndRun = assertParity(allEnd, 2 * DocsEnum::L1_DOCS + 10, maxDoc, 0.0f);
+  auto allEndRun = assertParity(allEnd, 2 * DocsEnumMeta::L1_DOCS + 10, maxDoc, 0.0f);
   EXPECT_TRUE(allEndRun.docs.empty());
 
   std::array<std::string_view, 2> exhausting = {"wd_exhaust_a", "wd_exhaust_b"};
@@ -7301,7 +7301,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchBoundaryCounters) {
   CollectionHelper helper("partition_latch_boundary");
   addWindowDispatchBoundaryDocs(helper);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  const int32_t maxDoc = 3 * DocsEnum::L1_DOCS + 100;
+  const int32_t maxDoc = 3 * DocsEnumMeta::L1_DOCS + 100;
   std::array<std::string_view, 3> terms = {"wd_latch_low", "wd_latch_a", "wd_latch_b"};
 
   auto setup = [&](MemPool& pool, Query::Context& qContext) {
@@ -7404,7 +7404,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchSkipStatsCountersFire) {
   CollectionHelper helper("window_dispatch_stats");
   addWindowDispatchBoundaryDocs(helper);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  const int32_t maxDoc = 3 * DocsEnum::L1_DOCS + 100;
+  const int32_t maxDoc = 3 * DocsEnumMeta::L1_DOCS + 100;
 
   std::array<std::string_view, 2> deadTerms = {"wd_dead_dense_a", "wd_dead_dense_b"};
   auto deadRun = collectBulkWindows(*reader, deadTerms, 0, maxDoc, 1.0e30f, false);
@@ -7636,8 +7636,8 @@ TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFilteredWindow) {
   CollectionHelper helper("main");
-  const int32_t windowStart = DocsEnum::L1_DOCS;
-  const int32_t windowEnd = 2 * DocsEnum::L1_DOCS;
+  const int32_t windowStart = DocsEnumMeta::L1_DOCS;
+  const int32_t windowEnd = 2 * DocsEnumMeta::L1_DOCS;
   const int32_t nDocs = windowEnd + 31;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
@@ -7692,8 +7692,8 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFiltere
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction) {
   CollectionHelper helper("main");
-  const int32_t windowStart = DocsEnum::L1_DOCS;
-  const int32_t windowEnd = 2 * DocsEnum::L1_DOCS;
+  const int32_t windowStart = DocsEnumMeta::L1_DOCS;
+  const int32_t windowEnd = 2 * DocsEnumMeta::L1_DOCS;
   const int32_t nDocs = windowEnd + 31;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
@@ -7770,7 +7770,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
   const int32_t clauses = 5;
   addSweepDisjunctionDocs(helper, clauses);
   std::vector<std::string> deleteIds;
-  for (int32_t doc = 0; doc < 3 * DocsEnum::L1_DOCS + 211; doc += 13) {
+  for (int32_t doc = 0; doc < 3 * DocsEnumMeta::L1_DOCS + 211; doc += 13) {
     deleteIds.push_back("sweep_" + std::to_string(doc));
   }
   helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
@@ -7859,7 +7859,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
 TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
   CollectionHelper helper("main");
   const int32_t numTerms = 32;
-  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 37;
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 37;
   const int32_t topK = 50;
   const int32_t filterStep = 512;
   addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
@@ -7883,7 +7883,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
 TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
   CollectionHelper helper("main");
   const int32_t numTerms = 16;
-  const int32_t nDocs = 4 * DocsEnum::L1_DOCS + 53;
+  const int32_t nDocs = 4 * DocsEnumMeta::L1_DOCS + 53;
   const int32_t topK = 75;
   addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
   std::vector<std::string> deleteIds;
@@ -8087,7 +8087,7 @@ TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
   EXPECT_EQ(exactCollector.totalHits(), (int64_t) N);
 }
 
-// Regression: CachedTermInfo used to cache a mutable DocsEnum prototype. A scorer could
+// Regression: CachedTermInfo used to cache a mutable postings-enum prototype. A scorer could
 // consume that prototype before another weight cloned it. The cache now holds immutable
 // positioned-term state, so every scorer starts independently without another seek.
 TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {

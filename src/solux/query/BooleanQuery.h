@@ -2034,7 +2034,7 @@ public:
   };
 
   class MandOptBulkScorer final : public BulkScorer {
-    constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
+    constexpr static int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     static_assert((kWindowSize % 64) == 0);
 
@@ -2636,7 +2636,7 @@ public:
       };
 
       Query::Scorer* scorer = nullptr;
-      DocsEnum* docsEnum = nullptr;
+      DocsPosEnum* docsEnum = nullptr;
       int64_t cost = 0;
       Kind kind = Kind::SINGLE_PHASE;
 
@@ -2878,7 +2878,7 @@ public:
                       std::span<Query::Scorer*> scoringScorers)
             : scorers(scoringScorers), conjunctionClauses(allScorers) {
       assert(allScorers.size() == allCosts.size());
-      auto flattened = pool.make_span<std::span<DocsEnum*>>(allScorers.size());
+      auto flattened = pool.make_span<std::span<DocsPosEnum*>>(allScorers.size());
       size_t approximationCount = 0;
       size_t verifierCount = 0;
       bool expanded = false;
@@ -2900,7 +2900,7 @@ public:
         Query::Scorer* scorer = allScorers[i];
         bool twoPhase = !disableTwoPhaseForTests && scorer->hasTwoPhase();
         if (!flattened[i].empty()) {
-          for (DocsEnum* docsEnum : flattened[i]) {
+          for (DocsPosEnum* docsEnum : flattened[i]) {
             approximations[approximationIndex++] = {
               nullptr, docsEnum, docsEnum->numDocs(), ApproxSlot::Kind::DOCS_ENUM};
           }
@@ -3071,7 +3071,7 @@ public:
 
   private:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
-    static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+    static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     static constexpr int32_t kWindowWords = kWindowSize / 64;
     static constexpr int32_t kDenseLeapfrogThreshold = kWindowSize / 32;
     static_assert((kWindowSize % 64) == 0);
@@ -4204,7 +4204,7 @@ public:
     }
 
     static int32_t normalizeWindowSize(int32_t requestedWindowSize) {
-      return requestedWindowSize > 0 ? requestedWindowSize : DocsEnum::L1_DOCS;
+      return requestedWindowSize > 0 ? requestedWindowSize : DocsEnumMeta::L1_DOCS;
     }
 
     void sortByClauseMax() {
@@ -4467,7 +4467,7 @@ public:
   public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreDisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers,
-                              int32_t maxDoc, int32_t windowSize = DocsEnum::L1_DOCS)
+                              int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS)
             : pool(pool),
               scorers(scorers),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -4563,7 +4563,7 @@ public:
     static inline bool disableDisjConjBulkForTests = false;
 
   private:
-    constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
+    constexpr static int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
     // Domain-drive gate weights: drive only when card*nClauses*W < SUM(clause.cost()).

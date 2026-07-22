@@ -193,8 +193,8 @@ std::shared_ptr<BlockBounds> BlockBounds::open(
     uint32_t groups = readU32(record);
     uint32_t blocks = readU32(record + 4);
     float scale = readF32(record + 8);
-    uint64_t expectedGroups = ((uint64_t) blocks + DocsEnum::L1_PERIOD - 1)
-        / DocsEnum::L1_PERIOD;
+    uint64_t expectedGroups = ((uint64_t) blocks + DocsEnumMeta::L1_PERIOD - 1)
+        / DocsEnumMeta::L1_PERIOD;
     if (blocks < 4 || groups != expectedGroups
         || !std::isfinite(scale) || !(scale >= 1.0f)) return fail("bad term geometry");
     uint64_t recordEnd = off + TERM_HEADER_SIZE + (uint64_t) (groups + blocks) * RECORD_SIZE;
@@ -222,8 +222,8 @@ std::shared_ptr<BlockBounds> BlockBounds::open(
       }
       prevBlockDoc = doc;
       maxD = std::max(maxD, d);
-      if ((b + 1) % DocsEnum::L1_PERIOD == 0 || b + 1 == blocks) {
-        uint32_t g = b / DocsEnum::L1_PERIOD;
+      if ((b + 1) % DocsEnumMeta::L1_PERIOD == 0 || b + 1 == blocks) {
+        uint32_t g = b / DocsEnumMeta::L1_PERIOD;
         if ((int32_t) readU32(record + TERM_HEADER_SIZE + (uint64_t) g * RECORD_SIZE) != doc) {
           return fail("group/block lastDoc mismatch");
         }

@@ -215,7 +215,7 @@ public:
     writeSegmentInfo();
     // TODO: implement compound files for small files
 
-    // The StreamVByte AVX tail decoder used by DocsEnum may read up to
+    // The StreamVByte AVX tail decoder used by postings iteration may read up to
     // SVB_OVERREAD_PAD bytes past the encoded data. Reserve that slack at the end of
     // every pure-data file so the read stays in bounds. File 0 ends with the field
     // index and segment info just written above, which already provide far more
@@ -1045,7 +1045,7 @@ public:
     uint32_t minNorm = buildImpactFrontier(Postings::DOCS_BLOCK_SIZE);
 
     // Doc-part encoding decision (token byte + body; see Postings::DOC_BLOCK_*
-    // and DocsEnum). Dense blocks store doc ids as a bitset over (base, lastDoc]
+    // and the postings reader). Dense blocks store doc ids as a bitset over (base, lastDoc]
     // instead of PFor deltas, and a fully consecutive block stores nothing at
     // all. Storage rule as in Lucene: the bitset wins whenever it costs no more
     // than the next-larger packed width, biasing ties toward the bitset (its
@@ -1442,7 +1442,7 @@ public:
       posdeltas.resize(0);
 
       // Finish docs (and, for fields that index them, term freqs) that were not block encoded.
-      // StreamVByte tail layout (see DocsEnum::nextDoc):
+      // StreamVByte tail layout (see DocsEnumImpl::nextDoc):
       //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
       // Docs are d1 encoded; freqs are plain StreamVByte values.
       // TODO: when ttf==docfreq (all tf==1) the freq stream is constant 1 and can be dropped for

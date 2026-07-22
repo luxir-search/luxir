@@ -192,7 +192,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
 }
 
 void indexFilteredCountDocs(CollectionHelper& helper, bool multiSegment) {
-  constexpr int32_t segmentDocs = DocsEnum::L1_DOCS + 193;
+  constexpr int32_t segmentDocs = DocsEnumMeta::L1_DOCS + 193;
   int32_t segmentCount = multiSegment ? 2 : 1;
   for (int32_t segment = 0; segment < segmentCount; segment++) {
     std::vector<Doc> docs;

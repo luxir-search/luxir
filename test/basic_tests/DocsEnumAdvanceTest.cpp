@@ -18,7 +18,7 @@
 using namespace solux;
 using namespace solux::test;
 
-// Fuzz for DocsEnum advance() and friends.
+// Fuzz for postings-enum advance() and friends.
 // Builds randomized indexes and replays random nextDoc()/advance()/position-read sequences against an
 // independent model, checking doc id, term freq, and positions every step.
 class DocsEnumAdvanceTest : public SoluxTest {
@@ -26,7 +26,7 @@ protected:
   struct Posting { int32_t docid; int32_t firstPos; int32_t tf; };
 
   static constexpr int VOCAB_SIZE = 40;       // t%9 sets density 1, 1/2, ... 1/256
-  static constexpr int INDEX_ITERATIONS = 5;  // increase with WALKS_PER_TERM when changing DocsEnum
+  static constexpr int INDEX_ITERATIONS = 5;  // increase with WALKS_PER_TERM when changing the cursor
   static constexpr int WALKS_PER_TERM = 6;
 
   static int32_t impactTfForDoc(int32_t docid) {
@@ -66,13 +66,13 @@ protected:
   }
 
   // Model frontiers over any span size: DOCS_BLOCK_SIZE for L0 block headers,
-  // DocsEnum::L1_DOCS for L1 group headers.
-  static DocsEnum::ImpactFrontiers expectedSpanFrontiers(int32_t numDocs,
+  // DocsEnumMeta::L1_DOCS for L1 group headers.
+  static DocsEnumMeta::ImpactFrontiers expectedSpanFrontiers(int32_t numDocs,
                                                          bool hasFreqs,
                                                          bool hasNorms,
                                                          int32_t spanDocs) {
     int32_t numSpans = (numDocs + spanDocs - 1) / spanDocs;
-    DocsEnum::ImpactFrontiers expected;
+    DocsEnumMeta::ImpactFrontiers expected;
     expected.offsets.reserve((size_t) numSpans + 1);
     std::array<int32_t, 256> maxTfPerNorm;
     for (int32_t span = 0; span < numSpans; span++) {
@@ -101,13 +101,13 @@ protected:
     return expected;
   }
 
-  static DocsEnum::ImpactFrontiers expectedRawSpanFrontiers(const std::vector<uint8_t>& norms,
+  static DocsEnumMeta::ImpactFrontiers expectedRawSpanFrontiers(const std::vector<uint8_t>& norms,
                                                             const std::vector<int32_t>& tfs,
                                                             int32_t spanDocs) {
     assert(norms.size() == tfs.size());
     int32_t numDocs = (int32_t) tfs.size();
     int32_t numSpans = (numDocs + spanDocs - 1) / spanDocs;
-    DocsEnum::ImpactFrontiers expected;
+    DocsEnumMeta::ImpactFrontiers expected;
     expected.offsets.reserve((size_t) numSpans + 1);
     std::array<int32_t, 256> maxTfPerNorm;
     for (int32_t span = 0; span < numSpans; span++) {
@@ -283,7 +283,7 @@ protected:
 
   static int32_t modelCeil(const std::vector<int32_t>& docs, int32_t target) {
     auto it = std::lower_bound(docs.begin(), docs.end(), target);
-    return it == docs.end() ? DocsEnum::END : *it;
+    return it == docs.end() ? DocsEnumMeta::END : *it;
   }
 
   void writeRawSingleTerm(RAMDir& dir, MemPool& pool, std::string_view term,
@@ -331,7 +331,7 @@ protected:
     return want;
   }
 
-  void appendIntoBitSetWindow(DocsEnum& denum, const std::vector<int32_t>& docs,
+  void appendIntoBitSetWindow(DocsOnlyEnum& denum, const std::vector<int32_t>& docs,
                               int32_t from, int32_t to,
                               std::vector<int32_t>& got) {
     ASSERT_LT(from, to);
@@ -342,17 +342,17 @@ protected:
     got.insert(got.end(), window.begin(), window.end());
   }
 
-  void assertImpactHeaders(DocsEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
+  void assertImpactHeaders(DocsOnlyEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
                            const std::vector<int32_t>& expectedBlockMinNorm,
                            std::string_view label,
-                           const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr,
-                           const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
+                           const DocsEnumMeta::ImpactFrontiers* expectedFrontiers = nullptr,
+                           const DocsEnumMeta::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     std::vector<int32_t> blockMaxTf;
     std::vector<int32_t> groupSpanImpacts;
     std::vector<int32_t> blockLastDocs;
     std::vector<int32_t> blockMinNorm;
     std::vector<int32_t> groupSpanMinNorms;
-    DocsEnum::ImpactFrontiers frontiers;
+    DocsEnumMeta::ImpactFrontiers frontiers;
     denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts, &blockLastDocs, &blockMinNorm,
                          &groupSpanMinNorms,
                          expectedFrontiers == nullptr ? nullptr : &frontiers);
@@ -367,13 +367,13 @@ protected:
     }
 
     // The group-header-only scan must agree with the full walk.
-    DocsEnum::GroupImpacts groups;
+    DocsEnumMeta::GroupImpacts groups;
     denum.readGroupImpacts(groups);
     ASSERT_EQ(groups.spanMaxTfs, groupSpanImpacts) << label;
     ASSERT_EQ(groups.spanMinNorms, groupSpanMinNorms) << label;
     std::vector<int32_t> expectedGroupLastDocs;
-    for (size_t block = 0; block < blockLastDocs.size(); block += DocsEnum::L1_PERIOD) {
-      size_t last = std::min(block + DocsEnum::L1_PERIOD, blockLastDocs.size()) - 1;
+    for (size_t block = 0; block < blockLastDocs.size(); block += DocsEnumMeta::L1_PERIOD) {
+      size_t last = std::min(block + DocsEnumMeta::L1_PERIOD, blockLastDocs.size()) - 1;
       expectedGroupLastDocs.push_back(blockLastDocs[last]);
     }
     ASSERT_EQ(groups.lastDocs, expectedGroupLastDocs) << label;
@@ -387,8 +387,8 @@ protected:
   void checkRawImpactHeaders(FieldType::flag_type flags, const std::vector<int32_t>& expectedBlockMaxTf,
                              const std::vector<int32_t>& expectedBlockMinNorm, int32_t numDocs,
                              std::string_view label,
-                             const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr,
-                             const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
+                             const DocsEnumMeta::ImpactFrontiers* expectedFrontiers = nullptr,
+                             const DocsEnumMeta::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     RAMDir dir;
     MemPool pool;
     PostingsWriter postingsWriter(dir, 0, numDocs + Postings::DOCS_BLOCK_SIZE + 100);
@@ -423,7 +423,7 @@ protected:
     fieldReader.readFieldInfo(fieldInfo);
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot")) << label;
-    DocsEnum denum(tenum);
+    DocsOnlyEnum denum(tenum);
     assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers,
                         expectedGroupFrontiers);
   }
@@ -448,11 +448,11 @@ protected:
   void assertImpactHeadersForField(TestField& f, const std::vector<int32_t>& expectedBlockMaxTf,
                                    const std::vector<int32_t>& expectedBlockMinNorm,
                                    std::string_view label,
-                                   const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr,
-                                   const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
+                                   const DocsEnumMeta::ImpactFrontiers* expectedFrontiers = nullptr,
+                                   const DocsEnumMeta::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     TermsEnum tenum = f.createTermsEnum();
     ASSERT_TRUE(tenum.seek("hot")) << label;
-    DocsEnum denum(tenum);
+    DocsOnlyEnum denum(tenum);
     assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers,
                         expectedGroupFrontiers);
   }
@@ -462,7 +462,7 @@ protected:
                         int maxDoc, int indexIter, int walk) {
     SCOPED_TRACE(::testing::Message() << "indexIter=" << indexIter << " term=" << term << " walk=" << walk);
 
-    DocsEnum denum(tenum);
+    DocsPosEnum denum(tenum);
     PosEnum posEnum(denum);
     ASSERT_EQ(denum.numDocs(), (int) model.size()) << term;
 
@@ -480,9 +480,9 @@ protected:
         cur = denum.advance(target);
         j = (size_t) (std::lower_bound(model.begin(), model.end(), target, byDoc) - model.begin());
       }
-      int32_t expected = j < model.size() ? model[j].docid : DocsEnum::END;
+      int32_t expected = j < model.size() ? model[j].docid : DocsEnumMeta::END;
       ASSERT_EQ(cur, expected) << term;
-      if (cur == DocsEnum::END) break;
+      if (cur == DocsEnumMeta::END) break;
       ASSERT_EQ(denum.termFreq(), model[j].tf) << term << " tf at doc " << cur;
 
       if (rng.rbool()) {
@@ -561,21 +561,21 @@ TEST_F(DocsEnumAdvanceTest, advanceDocsOnly) {
 
   TermsEnum tenum = f.createTermsEnum();
   ASSERT_TRUE(tenum.seek("x"));
-  ASSERT_EQ(DocsEnum(tenum).numDocs(), N);
+  ASSERT_EQ(DocsFreqEnum(tenum).numDocs(), N);
 
   // Random forward walk on one enum (resumes the skip cursor, never restarts at 0).
-  DocsEnum denum(tenum);
+  DocsFreqEnum denum(tenum);
   int32_t cur = -1;
-  while (cur != DocsEnum::END) {
+  while (cur != DocsEnumMeta::END) {
     int32_t target = cur + 1 + (int32_t) rng.rint(0, rng.rbool() ? 5 : N);
     cur = denum.advance(target);
-    ASSERT_EQ(cur, target < N ? target : DocsEnum::END) << "advance(" << target << ")";  // dense -> exact
-    if (cur != DocsEnum::END) { ASSERT_EQ(denum.termFreq(), 1); }
+    ASSERT_EQ(cur, target < N ? target : DocsEnumMeta::END) << "advance(" << target << ")";  // dense -> exact
+    if (cur != DocsEnumMeta::END) { ASSERT_EQ(denum.termFreq(), 1); }
   }
 }
 
 TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
-  const int32_t N = DocsEnum::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 13;
+  const int32_t N = DocsEnumMeta::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 13;
   RAMDir dir;
   MemPool pool;
   PostingsWriter postingsWriter(dir, 0, N + Postings::DOCS_BLOCK_SIZE + 100);
@@ -610,14 +610,14 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsEnum denum(tenum);
+  DocsFreqEnum denum(tenum);
 
-  for (int32_t target : {0, 1, DocsEnum::L1_DOCS - 1, DocsEnum::L1_DOCS,
-                         DocsEnum::L1_DOCS + 1, N - 2, N - 1}) {
+  for (int32_t target : {0, 1, DocsEnumMeta::L1_DOCS - 1, DocsEnumMeta::L1_DOCS,
+                         DocsEnumMeta::L1_DOCS + 1, N - 2, N - 1}) {
     ASSERT_EQ(denum.advance(target), target) << target;
     ASSERT_EQ(denum.termFreq(), 1) << target;
   }
-  ASSERT_EQ(denum.advance(N), DocsEnum::END);
+  ASSERT_EQ(denum.advance(N), DocsEnumMeta::END);
 }
 
 TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
@@ -634,7 +634,7 @@ TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -645,7 +645,7 @@ TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
     ASSERT_GT(target, cur);
     cur = denum.advanceDocOnly(target);
     ASSERT_EQ(cur, modelCeil(docs, target)) << "target=" << target;
-    if (cur == DocsEnum::END) {
+    if (cur == DocsEnumMeta::END) {
       break;
     }
   }
@@ -671,7 +671,7 @@ TEST_F(DocsEnumAdvanceTest, nextDocOnlyWalksResidentWordBlock) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
   ASSERT_EQ(denum.advanceDocOnly(1), 2);
   ASSERT_EQ(denum.nextDocOnly(), 3);
   ASSERT_EQ(denum.advanceDocOnly(64), 65);
@@ -696,7 +696,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -740,7 +740,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   SkipStats::enabled = true;
   SkipStats::reset();
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
   const int32_t from = 50;
   const int32_t to = 260;
   std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
@@ -749,7 +749,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   EXPECT_EQ(denum.docId(), 231);
   EXPECT_EQ(denum.nextDocOnly(), 264);
 
-  DocsEnum single(tenum);
+  DocsOnlyEnum single(tenum);
   const int32_t singleFrom = 132;
   const int32_t singleTo = 133;
   std::vector<uint64_t> singleBits((size_t) (singleTo - singleFrom + 63) / 64, 0);
@@ -780,7 +780,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -794,7 +794,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
   appendIntoBitSetWindow(denum, docs, 160, 192, got);
 
   EXPECT_EQ(got, docs);
-  EXPECT_EQ(denum.docId(), DocsEnum::END);
+  EXPECT_EQ(denum.docId(), DocsEnumMeta::END);
   EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
   EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 1);
   EXPECT_GE(SkipStats::countBulkFillWordBlocks, 5);
@@ -821,7 +821,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("gapword"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -858,7 +858,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundar
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("runprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -871,7 +871,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundar
   appendIntoBitSetWindow(denum, docs, 127, 128, got);
 
   EXPECT_EQ(got, docs);
-  EXPECT_EQ(denum.docId(), DocsEnum::END);
+  EXPECT_EQ(denum.docId(), DocsEnumMeta::END);
   EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
   EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 1);
   EXPECT_GE(SkipStats::countBulkFillWordBlocks, 4);
@@ -894,7 +894,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowing
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("mixedprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -907,7 +907,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowing
   appendIntoBitSetWindow(denum, docs, 260, docs.back() + 1, got);
 
   EXPECT_EQ(got, docs);
-  EXPECT_EQ(denum.docId(), DocsEnum::END);
+  EXPECT_EQ(denum.docId(), DocsEnumMeta::END);
   EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 3);
   EXPECT_EQ(SkipStats::docBlocksDecoded, 1);
   SkipStats::enabled = savedStats;
@@ -944,14 +944,14 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetRandomPartitionsMatchNextDocOracle) {
 
   const int32_t maxDoc = docs.back() + 97;
   std::vector<uint64_t> oracleBits((size_t) (maxDoc + 63) / 64, 0);
-  DocsEnum oracle(tenum);
-  for (int32_t doc = oracle.nextDoc(); doc != DocsEnum::END; doc = oracle.nextDoc()) {
+  DocsOnlyEnum oracle(tenum);
+  for (int32_t doc = oracle.nextDoc(); doc != DocsEnumMeta::END; doc = oracle.nextDoc()) {
     ASSERT_LT(doc, maxDoc);
     oracleBits[(size_t) doc >> 6] |= 1ULL << (doc & 63);
   }
 
   for (int32_t iter = 0; iter < 12; iter++) {
-    DocsEnum denum(tenum);
+    DocsOnlyEnum denum(tenum);
     std::vector<uint64_t> gotBits(oracleBits.size(), 0);
     int32_t from = 0;
     while (from < maxDoc) {
@@ -992,7 +992,7 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("runprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -1032,7 +1032,7 @@ TEST_F(DocsEnumAdvanceTest, residentDocOnlyBlockPeekAndConsumeMaterializeSpan) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
   ASSERT_EQ(denum.advanceDocOnly(64), 65);
 
   auto expectedStart = std::lower_bound(docs.begin(), docs.end(), 65);
@@ -1121,14 +1121,14 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
   std::vector<int32_t> expectedDocsOnlyImpacts = expectedBlockMaxTf(N, false);
   std::vector<int32_t> expectedNorms = expectedBlockMinNorm(N, true);
   std::vector<int32_t> expectedNoNorms = expectedBlockMinNorm(N, false);
-  DocsEnum::ImpactFrontiers expectedFrontiers =
+  DocsEnumMeta::ImpactFrontiers expectedFrontiers =
       expectedSpanFrontiers(N, true, true, Postings::DOCS_BLOCK_SIZE);
-  DocsEnum::ImpactFrontiers expectedNoFrontiers =
+  DocsEnumMeta::ImpactFrontiers expectedNoFrontiers =
       expectedSpanFrontiers(N, true, false, Postings::DOCS_BLOCK_SIZE);
-  DocsEnum::ImpactFrontiers expectedGroupFrontiers =
-      expectedSpanFrontiers(N, true, true, DocsEnum::L1_DOCS);
-  DocsEnum::ImpactFrontiers expectedNoGroupFrontiers =
-      expectedSpanFrontiers(N, true, false, DocsEnum::L1_DOCS);
+  DocsEnumMeta::ImpactFrontiers expectedGroupFrontiers =
+      expectedSpanFrontiers(N, true, true, DocsEnumMeta::L1_DOCS);
+  DocsEnumMeta::ImpactFrontiers expectedNoGroupFrontiers =
+      expectedSpanFrontiers(N, true, false, DocsEnumMeta::L1_DOCS);
 
   {
     TestIndex testIndex;
@@ -1183,13 +1183,13 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
     fieldReader.readFieldInfo(fieldInfo);
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot"));
-    DocsEnum denum(tenum);
+    DocsOnlyEnum denum(tenum);
 
-    DocsEnum::GroupImpactCursor cursor;
-    DocsEnum::GroupImpactHeader firstHeader;
+    DocsEnumMeta::GroupImpactCursor cursor;
+    DocsEnumMeta::GroupImpactHeader firstHeader;
     ASSERT_EQ(denum.readGroupImpactHeadersThrough(
                   cursor, 0, false,
-                  [&](const DocsEnum::GroupImpactHeader& header) {
+                  [&](const DocsEnumMeta::GroupImpactHeader& header) {
                     firstHeader = header;
                   }),
               1);
@@ -1197,9 +1197,9 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
     ASSERT_EQ(firstHeader.frontierTfWidth, expectedWidth);
     ASSERT_EQ(firstHeader.spanMaxTf, expectedMaxTf);
 
-    DocsEnum::ImpactFrontiers expectedGroups =
-        expectedRawSpanFrontiers(norms, tfs, DocsEnum::L1_DOCS);
-    DocsEnum::GroupImpacts groups;
+    DocsEnumMeta::ImpactFrontiers expectedGroups =
+        expectedRawSpanFrontiers(norms, tfs, DocsEnumMeta::L1_DOCS);
+    DocsEnumMeta::GroupImpacts groups;
     denum.readGroupImpacts(groups);
     ASSERT_EQ(groups.frontiers.offsets, expectedGroups.offsets);
     ASSERT_EQ(groups.frontiers.norms, expectedGroups.norms);
@@ -1217,32 +1217,32 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
     ASSERT_EQ(groupSpanMinNorms, expectedGroupSpanMinNorms(blockMinNorms));
   };
 
-  std::vector<uint8_t> normsOne((size_t) DocsEnum::L1_DOCS, 7);
-  std::vector<int32_t> tfsOne((size_t) DocsEnum::L1_DOCS, 5);
+  std::vector<uint8_t> normsOne((size_t) DocsEnumMeta::L1_DOCS, 7);
+  std::vector<int32_t> tfsOne((size_t) DocsEnumMeta::L1_DOCS, 5);
   run("N=1 u16", normsOne, tfsOne, 1, 2, 5);
 
-  std::vector<uint8_t> normsFull((size_t) DocsEnum::L1_DOCS);
-  std::vector<int32_t> tfsFull((size_t) DocsEnum::L1_DOCS);
-  for (int32_t doc = 0; doc < DocsEnum::L1_DOCS; doc++) {
+  std::vector<uint8_t> normsFull((size_t) DocsEnumMeta::L1_DOCS);
+  std::vector<int32_t> tfsFull((size_t) DocsEnumMeta::L1_DOCS);
+  for (int32_t doc = 0; doc < DocsEnumMeta::L1_DOCS; doc++) {
     uint8_t norm = (uint8_t) (doc & 255);
     normsFull[(size_t) doc] = norm;
     tfsFull[(size_t) doc] = (int32_t) norm + 1;
   }
   run("N=256 absolute tfs", normsFull, tfsFull, 256, 2, 256);
 
-  std::vector<uint8_t> normsU16((size_t) DocsEnum::L1_DOCS, 3);
-  std::vector<int32_t> tfsU16((size_t) DocsEnum::L1_DOCS, 1);
+  std::vector<uint8_t> normsU16((size_t) DocsEnumMeta::L1_DOCS, 3);
+  std::vector<int32_t> tfsU16((size_t) DocsEnumMeta::L1_DOCS, 1);
   tfsU16[17] = 65535;
   run("u16 boundary", normsU16, tfsU16, 1, 2, 65535);
 
-  std::vector<uint8_t> normsU32((size_t) DocsEnum::L1_DOCS, 3);
-  std::vector<int32_t> tfsU32((size_t) DocsEnum::L1_DOCS, 1);
+  std::vector<uint8_t> normsU32((size_t) DocsEnumMeta::L1_DOCS, 3);
+  std::vector<int32_t> tfsU32((size_t) DocsEnumMeta::L1_DOCS, 1);
   tfsU32[19] = 65536;
   run("u32 escape", normsU32, tfsU32, 1, 4, 65536);
 }
 
 TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
-  const int32_t N = 10 * DocsEnum::L1_DOCS + 77;
+  const int32_t N = 10 * DocsEnumMeta::L1_DOCS + 77;
   std::vector<uint8_t> norms((size_t) N);
   std::vector<int32_t> tfs((size_t) N);
   for (int32_t doc = 0; doc < N; doc++) {
@@ -1261,13 +1261,13 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsEnum denum(tenum);
+  DocsOnlyEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;
   SkipStats::reset();
-  for (int32_t target : {17, DocsEnum::L1_DOCS + 9, 3 * DocsEnum::L1_DOCS + 123,
-                         6 * DocsEnum::L1_DOCS + 7, 9 * DocsEnum::L1_DOCS + 31,
+  for (int32_t target : {17, DocsEnumMeta::L1_DOCS + 9, 3 * DocsEnumMeta::L1_DOCS + 123,
+                         6 * DocsEnumMeta::L1_DOCS + 7, 9 * DocsEnumMeta::L1_DOCS + 31,
                          N - 1}) {
     ASSERT_EQ(denum.advance(target), target);
     ASSERT_EQ(denum.termFreq(), tfs[(size_t) target]);
@@ -1352,7 +1352,7 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
 // merger regenerates the anchors by replaying positions through TextWriter).
 class PositionSeekTest : public DocsEnumAdvanceTest {
 protected:
-  static constexpr int32_t N = 2 * DocsEnum::L1_DOCS + 300;  // 66 full doc blocks + tail
+  static constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 300;  // 66 full doc blocks + tail
 
   static int32_t tfFor(std::string_view term, int32_t globalDoc) {
     if (term == "one") return 1;
@@ -1384,15 +1384,15 @@ protected:
     SCOPED_TRACE(::testing::Message() << "term=" << term << " readMode=" << readMode);
     TermsEnum tenum = f.createTermsEnum();
     ASSERT_TRUE(tenum.seek(term));
-    DocsEnum denum(tenum);
+    DocsPosEnum denum(tenum);
     PosEnum posEnum(denum);
 
     int32_t landings = 0;
     for (int32_t target : targets) {
       if (target <= denum.docId()) continue;
       int32_t doc = denum.advance(target);
-      ASSERT_EQ(doc, target < N ? target : DocsEnum::END) << "advance(" << target << ")";
-      if (doc == DocsEnum::END) break;
+      ASSERT_EQ(doc, target < N ? target : DocsEnumMeta::END) << "advance(" << target << ")";
+      if (doc == DocsEnumMeta::END) break;
       int32_t tf = tfFor(term, doc);
       ASSERT_EQ(denum.termFreq(), tf) << "doc " << doc;
       int32_t toRead = readMode == 0 ? tf
@@ -1472,7 +1472,7 @@ TEST_F(PositionSeekTest, positionSeekAlignments) {
 }
 
 // A conjunction's advance() must route through the skip list (TermQuery::Scorer
-// forwards advance() to DocsEnum::advance()).  The sparse term leads and advance()s
+// forwards advance() to DocsEnumImpl::advance()).  The sparse term leads and advance()s
 // the dense one across many blocks; some sparse docs are not dense, exercising the
 // advance-overshoot/re-advance path.  The result must equal the true intersection.
 TEST_F(DocsEnumAdvanceTest, conjunctionLeapfrog) {

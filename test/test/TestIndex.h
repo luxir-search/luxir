@@ -379,20 +379,20 @@ namespace solux::test {
       if (currSeg < 0) { nextSegment(); }
       return TermsEnum(testIndex.pool, currentSegment()->postingsReader(), fieldInfo);
     }
-    DocsEnum createDocsEnum(TermsEnum& termsEnum) {
+    DocsPosEnum createDocsEnum(TermsEnum& termsEnum) {
       if (currSeg < 0) { nextSegment(); }
-      return DocsEnum(termsEnum);
+      return DocsPosEnum(termsEnum);
     }
 
     // the format of the array is [docid, termfreq, pos1, pos2, ..., docid2, termfreq2, ...]
     std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target, TermsEnum& termsEnum) {
-      DocsEnum docsEnum = createDocsEnum(termsEnum);
+      DocsPosEnum docsEnum = createDocsEnum(termsEnum);
       PosEnum posEnum(docsEnum);
       target.resize(0);
       auto numDocs = 0;
       for (;;) {
         auto docid = docsEnum.nextDoc();
-        if (docid == DocsEnum::END) break;
+        if (docid == DocsEnumMeta::END) break;
         numDocs++;
         target.push_back(docid);
         target.push_back(docsEnum.termFreq());
@@ -411,11 +411,12 @@ namespace solux::test {
       return readDocsAndPositions(target, termsEnum);
     }
 
-    std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target, DocsEnum& docsEnum) {
+    std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target,
+                                               DocsPosEnum& docsEnum) {
       PosEnum posEnum(docsEnum);
       target.resize(0);
       int32_t docid = docsEnum.nextDoc();
-      if (docid == DocsEnum::END) {
+      if (docid == DocsEnumMeta::END) {
         return target;
       }
       target.push_back(docid);

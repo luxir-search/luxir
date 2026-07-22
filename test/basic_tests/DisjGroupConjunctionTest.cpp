@@ -72,7 +72,7 @@ public:
   };
 
   CollectionHelper helper;
-  static constexpr int32_t numDocs = 2 * DocsEnum::L1_DOCS + 257;
+  static constexpr int32_t numDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
 
   static api::Query termGroup(std::pmr::memory_resource& mr,
                               std::initializer_list<std::string_view> terms,

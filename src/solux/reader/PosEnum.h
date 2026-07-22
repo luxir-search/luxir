@@ -5,10 +5,10 @@
 namespace solux {
 
 // Position ordinals are indexes into the term-global positions list for
-// non-pulsed positions. DocsEnum owns doc/freq alignment; PosEnum owns the
+// non-pulsed positions. DocsEnumImpl owns doc/freq alignment; PosEnum owns the
 // mutable position stream and decoder state.
 class PosEnum {
-  DocsEnum& docsEnum;
+  DocsPosEnum& docsEnum;
   InputStream posIS;
   int32_t* posBuf;
   int64_t posOrd = 0;
@@ -93,7 +93,7 @@ class PosEnum {
 public:
   static constexpr int32_t END = PostingsReader::END;
 
-  explicit PosEnum(DocsEnum& docsEnum)
+  explicit PosEnum(DocsPosEnum& docsEnum)
       : docsEnum(docsEnum), posIS(docsEnum.positionInput), posBuf(pb) {
     assert(docsEnum.hasPositions);
     assert(!docsEnum.positionTrackingEnabled);

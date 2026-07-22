@@ -111,9 +111,9 @@ FieldSnapshot snapshotField(MemPool& pool, Segment& segment) {
     term.docFreq = terms.docFreq();
     term.totalTermFreq = terms.totalTermFreq();
     terms.readTermImpactFrontier(term.impactNorms, term.impactTfs);
-    DocsEnum docs(terms);
+    DocsPosEnum docs(terms);
     PosEnum positions(docs);
-    for (int32_t doc = docs.nextDoc(); doc != DocsEnum::END; doc = docs.nextDoc()) {
+    for (int32_t doc = docs.nextDoc(); doc != DocsEnumMeta::END; doc = docs.nextDoc()) {
       PostingSnapshot posting{doc, docs.termFreq(), {}};
       positions.startPositions();
       for (int32_t i = 0; i < posting.tf; i++) {
@@ -213,9 +213,9 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
     term.docFreq = terms.docFreq();
     term.totalTermFreq = terms.totalTermFreq();
     terms.readTermImpactFrontier(term.impactNorms, term.impactTfs);
-    DocsEnum docs(terms);
+    DocsPosEnum docs(terms);
     PosEnum positions(docs);
-    for (int32_t doc = docs.nextDoc(); doc != DocsEnum::END; doc = docs.nextDoc()) {
+    for (int32_t doc = docs.nextDoc(); doc != DocsEnumMeta::END; doc = docs.nextDoc()) {
       PostingSnapshot posting{doc, docs.termFreq(), {}};
       positions.startPositions();
       for (int32_t i = 0; i < posting.tf; i++) posting.positions.push_back(positions.nextPosition());

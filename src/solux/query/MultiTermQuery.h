@@ -66,10 +66,10 @@ public:
   // cursor. Windows and conjunction-driven advances are monotone, so a postings
   // block is decoded at most once.
   class LazyScorer final : public Query::ConstantScorer {
-    static constexpr int32_t WINDOW_SIZE = DocsEnum::L1_DOCS;
+    static constexpr int32_t WINDOW_SIZE = DocsEnumMeta::L1_DOCS;
     static constexpr int32_t WINDOW_WORDS = WINDOW_SIZE / 64;
 
-    std::span<DocsEnum> docsEnums;
+    std::span<DocsOnlyEnum> docsEnums;
     std::span<uint64_t> windowBits;
     int32_t maxDoc;
     int32_t docid = -1;
@@ -155,7 +155,7 @@ public:
     }
 
   public:
-    LazyScorer(std::span<DocsEnum> docsEnums,
+    LazyScorer(std::span<DocsOnlyEnum> docsEnums,
                std::span<uint64_t> windowBits, int32_t maxDoc, float constantScore)
       : Query::ConstantScorer(constantScore), docsEnums(docsEnums),
         windowBits(windowBits), maxDoc(maxDoc) {
@@ -226,11 +226,11 @@ public:
             std::span<uint64_t> bitWords(words, nWords);
 
             for (const auto& state : states) {
-              DocsEnum docsEnum(state);
+              DocsOnlyEnum docsEnum(state);
               docsEnum.intoBitSet(bitWords, 0, maxDoc);
             }
             while (fenum->next()) {
-              DocsEnum docsEnum(fenum->terms());
+              DocsOnlyEnum docsEnum(fenum->terms());
               docsEnum.intoBitSet(bitWords, 0, maxDoc);
             }
             return targetPool.make<MultiTermQuery::Scorer>(bits, maxDoc, boost);
@@ -238,13 +238,13 @@ public:
         }
         if (states.empty()) return nullptr;
 
-        static_assert(std::is_trivially_destructible_v<DocsEnum>);
-        auto* docsEnums = (DocsEnum*) targetPool.alloc(
-            states.size() * sizeof(DocsEnum), alignof(DocsEnum));
+        static_assert(std::is_trivially_destructible_v<DocsOnlyEnum>);
+        auto* docsEnums = (DocsOnlyEnum*) targetPool.alloc(
+            states.size() * sizeof(DocsOnlyEnum), alignof(DocsOnlyEnum));
         for (size_t i = 0; i < states.size(); i++) {
-          new (&docsEnums[i]) DocsEnum(states[i]);
+          new (&docsEnums[i]) DocsOnlyEnum(states[i]);
         }
-        constexpr size_t windowWords = (size_t) DocsEnum::L1_DOCS / 64;
+        constexpr size_t windowWords = (size_t) DocsEnumMeta::L1_DOCS / 64;
         auto windowBits = targetPool.make_span<uint64_t>(windowWords);
         return targetPool.make<MultiTermQuery::LazyScorer>(
             std::span(docsEnums, states.size()), windowBits, maxDoc, boost);
@@ -257,12 +257,12 @@ public:
       FixedBitSet bits(words, maxDoc);
 
       bool anyTerm = false;
-      // Reclaim each term's DocsEnum allocations before scanning the next term.
+      // Reclaim each term's postings-enum allocations before scanning the next term.
       auto savepoint = targetPool.getSavePoint();
       while (fenum->next()) {
         anyTerm = true;
         {
-          DocsEnum docsEnum(fenum->terms());
+          DocsOnlyEnum docsEnum(fenum->terms());
           for (int32_t doc = docsEnum.nextDoc(); doc != PostingsReader::END; doc = docsEnum.nextDoc()) {
             bits.set(doc);
           }

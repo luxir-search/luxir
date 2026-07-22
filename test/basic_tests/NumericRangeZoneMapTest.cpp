@@ -314,8 +314,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
 
   MemPool fillPool;
   WindowFilter fill(fillPool, makeFilter(fillPool));
-  int32_t start = Postings::NUMERIC_BLOCK_SIZE - DocsEnum::L1_DOCS / 2;
-  int32_t end = start + DocsEnum::L1_DOCS;
+  int32_t start = Postings::NUMERIC_BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
+  int32_t end = start + DocsEnumMeta::L1_DOCS;
   fill.prepare(start, end);
   for (int32_t doc = start; doc < end; doc++) {
     EXPECT_EQ(fill.accepts(doc), expected(doc)) << "doc=" << doc;

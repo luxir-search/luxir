@@ -32,7 +32,7 @@ public:
   };
 
   struct RepeatGroup {
-    DocsEnum* docsEnum = nullptr;
+    DocsPosEnum* docsEnum = nullptr;
     PosEnum* posEnum = nullptr;
     int32_t* buf = nullptr;
     int32_t cap = 0;
@@ -101,11 +101,11 @@ public:
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
       if (segFieldInfo == nullptr) return nullptr;
 
-      auto querySlotEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
+      auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());
       auto querySlotPosEnums = targetPool.make_span<PosEnum*>(cachedTermInfos.size());
       auto queryTerms = query.getTerms();
       struct TermEnums {
-        DocsEnum* docs;
+        DocsPosEnum* docs;
         PosEnum* positions;
       };
       std::vector<TermEnums> distinct;
@@ -126,7 +126,8 @@ public:
           querySlotPosEnums[(size_t) i] = querySlotPosEnums[(size_t) first];
           continue;
         }
-        DocsEnum* docsEnum = cachedTermInfos[(size_t) i]->useDocsEnum(targetPool, segment);
+        DocsPosEnum* docsEnum = cachedTermInfos[(size_t) i]
+            ->useDocsEnum<DocsEnumTier::POSITIONS>(targetPool, segment);
         if (docsEnum == nullptr) return nullptr;
         PosEnum* posEnum = targetPool.make<PosEnum>(*docsEnum);
         querySlotEnums[(size_t) i] = docsEnum;
@@ -134,7 +135,7 @@ public:
         distinct.push_back({docsEnum, posEnum});
       }
 
-      auto byCost = [](DocsEnum* a, DocsEnum* b) {
+      auto byCost = [](DocsPosEnum* a, DocsPosEnum* b) {
         if (a->numDocs() != b->numDocs()) return a->numDocs() < b->numDocs();
         if (a->totalTermFreq() != b->totalTermFreq()) {
           return a->totalTermFreq() < b->totalTermFreq();
@@ -147,7 +148,7 @@ public:
           return byCost(a.docs, b.docs);
         });
       }
-      auto conjunctionEnums = targetPool.make_span<DocsEnum*>(distinct.size());
+      auto conjunctionEnums = targetPool.make_span<DocsPosEnum*>(distinct.size());
       auto conjunctionPosEnums = targetPool.make_span<PosEnum*>(distinct.size());
       for (size_t i = 0; i < distinct.size(); i++) {
         conjunctionEnums[i] = distinct[i].docs;
@@ -158,14 +159,14 @@ public:
       for (size_t i = 0; i < order.size(); i++) order[i] = (int32_t) i;
       if (!ScorerControls::disableSortForTests) {
         std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
-          DocsEnum* ea = querySlotEnums[(size_t) a];
-          DocsEnum* eb = querySlotEnums[(size_t) b];
+          DocsPosEnum* ea = querySlotEnums[(size_t) a];
+          DocsPosEnum* eb = querySlotEnums[(size_t) b];
           if (byCost(ea, eb)) return true;
           if (byCost(eb, ea)) return false;
           return a < b;
         });
       }
-      auto slotEnums = targetPool.make_span<DocsEnum*>(order.size());
+      auto slotEnums = targetPool.make_span<DocsPosEnum*>(order.size());
       auto slotPosEnums = targetPool.make_span<PosEnum*>(order.size());
       auto positions = targetPool.make_span<int32_t>(order.size());
       auto ordinals = targetPool.make_span<int32_t>(order.size());
@@ -217,9 +218,9 @@ public:
         const BlockBounds* sidecarField = segment.blockBounds(query.getField());
         bool allBuilt = true;
         for (size_t i = 0; i < conjunctionEnums.size(); i++) {
-          DocsEnum* docsEnum = conjunctionEnums[i];
+          DocsPosEnum* docsEnum = conjunctionEnums[i];
           int32_t multiplicity = 0;
-          for (DocsEnum* slotEnum : slotEnums) {
+          for (DocsPosEnum* slotEnum : slotEnums) {
             if (slotEnum == docsEnum) multiplicity++;
           }
           multiplicities[i] = multiplicity;
@@ -617,7 +618,7 @@ public:
       if (scorer.minCompetitiveScore > 0.0f && scorer.simScorer != nullptr
           && !ScorerControls::disableDocBoundForTests) {
         int64_t maxFreq = 1;
-        for (DocsEnum* docsEnum : scorer.slotEnums) {
+        for (DocsPosEnum* docsEnum : scorer.slotEnums) {
           maxFreq += (int64_t) docsEnum->termFreq() - 1;
         }
         float boundFreq = S::roundUpToFloat(maxFreq);
@@ -672,11 +673,11 @@ public:
   class PhraseScorer final : public Query::Scorer {
     friend MatcherPolicy;
 
-    std::span<DocsEnum*> slotEnums;
+    std::span<DocsPosEnum*> slotEnums;
     std::span<PosEnum*> slotPosEnums;
     std::span<const int32_t> positions;
     std::span<const int32_t> ordinals;
-    std::span<DocsEnum*> conjunctionEnums;
+    std::span<DocsPosEnum*> conjunctionEnums;
     std::span<PosEnum*> conjunctionPosEnums;
     MemPool* pool;
     std::span<const int32_t> slotGroup;
@@ -832,10 +833,10 @@ public:
       return rounded;
     }
 
-    PhraseScorer(MemPool& targetPool, std::span<DocsEnum*> slotEnums,
+    PhraseScorer(MemPool& targetPool, std::span<DocsPosEnum*> slotEnums,
                  std::span<PosEnum*> slotPosEnums,
                  std::span<const int32_t> positions, std::span<const int32_t> ordinals,
-                 std::span<DocsEnum*> conjunctionEnums,
+                 std::span<DocsPosEnum*> conjunctionEnums,
                  std::span<PosEnum*> conjunctionPosEnums, NormsReader* normsReader,
                  Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
                  std::span<const int32_t> impactMultiplicities,
@@ -854,7 +855,7 @@ public:
       }
       if constexpr (MatcherPolicy::IS_SLOPPY) {
         double averageTf = 0.0;
-        for (DocsEnum* docsEnum : slotEnums) {
+        for (DocsPosEnum* docsEnum : slotEnums) {
           int32_t numDocs = docsEnum->numDocs();
           averageTf += numDocs > 0
               ? (double) docsEnum->totalTermFreq() / (double) numDocs : 1.0;
@@ -908,7 +909,7 @@ public:
       return doApproximationAdvance(target);
     }
     int32_t approximationDocId() override { return docid; }
-    std::span<DocsEnum*> approximationEnums() override { return conjunctionEnums; }
+    std::span<DocsPosEnum*> approximationEnums() override { return conjunctionEnums; }
     bool matches() override {
 #ifndef NDEBUG
       markTwoPhase();
@@ -918,7 +919,7 @@ public:
     bool matchesAt(int32_t doc) override {
 #ifndef NDEBUG
       markExternal();
-      for (DocsEnum* docsEnum : conjunctionEnums) assert(docsEnum->docId() == doc);
+      for (DocsPosEnum* docsEnum : conjunctionEnums) assert(docsEnum->docId() == doc);
 #endif
       docid = doc;
       return doMatches();

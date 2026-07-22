@@ -10,78 +10,48 @@
 #include <bit>
 #include <cstring>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace solux {
+enum class DocsEnumTier : uint8_t { DOCS, FREQS, POSITIONS };
+
+template<DocsEnumTier Tier>
+class BasicDocsEnum;
+
+using DocsOnlyEnum = BasicDocsEnum<DocsEnumTier::DOCS>;
+using DocsFreqEnum = BasicDocsEnum<DocsEnumTier::FREQS>;
+using DocsPosEnum = BasicDocsEnum<DocsEnumTier::POSITIONS>;
+
 class PosEnum;
 
-// TODO: templatize to be able to instrument, implement checkindex, etc...
-// TODO: investigate writing a version of this based on continuations and see how it performs?
-// TODO: some of this internal state could be removed... we only need some of it in the constructor?
-// Implementation note: moving block reading of docs and positions to cpp files and just leaving the hot path
-// in the header resulted in >3% performance loss for docs, and >5% loss for positions.
-class DocsEnum {
+// Tier-erased metadata shared by every postings cursor. This class contains no
+// decoded-doc, term-frequency, or position cursor state; it only exposes the
+// immutable postings layout needed to build impact indexes.
+class DocsEnumMeta {
   friend class PosEnum;
 
-  int32_t* docBuf;       // the list of decoded docs (may be partial)
-  int32_t* tfreqBuf;     // the list of decoded term freqs
-
-  int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
-  int64_t cumulativeTermFreq = 0; // Synonym for posOrdEnd.  Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
-  bool positionBatchActive = false;
-
-  int32_t docOrd = 0;    // the ordinal of the current document we are on for this term
-  int32_t docBufIdx = 0; // index of the next value to read in the docs buffer
-  int32_t docBufEnd;     // index of one-past the last valid element
-  int32_t docid;         // current docid
-  bool blockMode = false;
-  bool docsOnlyConsumed = false;
-  bool docBlockResident = false;
-  bool scoredWordProbeActive = false;
-  const char* residentWordsPtr = nullptr;
-  uint32_t residentDocBase = 0;
-  uint32_t residentBlockLast = 0;
-  int32_t residentBlockStartOrd = 0;
-  int32_t residentNumWords = 0;  // zero means a contiguous resident block
-  const char* scoredProbeWordsPtr = nullptr;
-  uint32_t scoredProbeDocBase = 0;
-  uint32_t scoredProbeBlockLast = 0;
-  int32_t scoredProbeBlockStartOrd = 0;
-  int32_t scoredProbeNumWords = 0;  // zero means a contiguous scored probe block
-
-  // For term freqs, since they are parallel to docs, we don't actually need
-  // all of these variables.  But it sets the stage for separating the two
-  // more and using different encodings / block sizes for them.
-  int32_t tfreqOrd = 0;      // ordinal of the current term freq (parallel to docOrd)
-  int32_t tfreqBufIdx = 0;   // index of the next valid value
-  int32_t tfreqBufEnd;       // index of one-past the last valid element
-  int32_t tfreq;
-
-
+protected:
   InputStream docIS;
-  InputStream positionInput;
-  bool hasFreqs;      // field indexes term freqs (else tfreq is implicitly 1)
-  bool hasPositions;  // field indexes positions (else there is no position stream)
-  bool positionTrackingEnabled = false;
-  bool hasNorms;      // text fields with positions carry encoded length norms
-  int32_t docfreq; // number of docs containing this term
-  int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
-
-  int64_t docsSize;  // size of the postings in the doc file for the given term
+  bool hasFreqs;
+  bool hasPositions;
+  bool hasNorms;
+  int32_t docfreq;
+  int64_t ttf;
+  int64_t docsSize;
   int64_t startOfDocs;
   int64_t endOfDocs;
-
-  int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
-  int32_t pulsedPosition = 0;
-  int64_t pendingPosBlockOrd = 0;
-  int64_t pendingPosAbsoluteOffset = 0;
-  bool pendingPosSeekValid = false;
   const char* termImpactFrontierPtr = nullptr;
   uint32_t termImpactFrontierLen = 0;
-  int64_t termOrdinal = -1;  // captured once from the positioned TermsEnum
+  int64_t termOrdinal = -1;
+  int32_t numDocBlocks = 0;
+  int32_t numDocGroups = 0;
 
 public:
+  /// sentinel value used for docs
+  static constexpr int32_t END = std::numeric_limits<int32_t>::max();
+
   // The skip structure is two levels: L0 per-block headers, and L1 group headers
   // every L1_PERIOD blocks (see skipToBlock). There is deliberately NO level 2
   // (a coarser index above L1). Measured 2026-07-05 with the skip-effectiveness
@@ -116,11 +86,6 @@ public:
     }
   };
 
-  struct DocFreqBlock {
-    std::span<const int32_t> docs;
-    std::span<const int32_t> tfreqs;
-  };
-
   struct GroupBlockImpactScratch {
     static constexpr int32_t FRONTIER_CAP = 256;
     int32_t frontierTfs[FRONTIER_CAP];
@@ -139,7 +104,7 @@ public:
     int32_t lastDoc = 0;
     int32_t spanMaxTf = 1;
     int32_t spanMinNorm = 0;
-    int64_t bodyOffset = 0;   // relative to startOfDocs
+    int64_t bodyOffset = 0;
     int32_t baseLastDoc = 0;
     bool frontierSpilled = false;
     std::span<const uint8_t> frontierNorms;
@@ -147,55 +112,39 @@ public:
     uint32_t frontierTfWidth = 0;
   };
 
-  // Scoped scored-word probe state for TermQuery::Scorer::applyToCandidates.
-  // A successful probe consumes the block body from the stream and decodes its
-  // freq block, but deliberately leaves doc ids as resident words until the
-  // caller finishes the scope. During that scope no normal DocsEnum method is
-  // legal: exposing lazy materialization through advance()/score()/peek would
-  // recreate the old scored-path resident-state tax. That is the opposite of
-  // the docs-only design, where docsOnlyConsumed is a one-way latch that makes
-  // termFreq()/positions permanently illegal after freq blocks are skipped.
-  struct ScoredWordProbe {
-    uint32_t docBase;
-    int32_t blockLast;
-    int32_t blockStartOrd;
-    int32_t numWords;       // 0 contiguous, >0 word-bitset
-    const char* words;      // null for contiguous
-    std::span<const int32_t> freqs;
-    struct RankCursor {
-      int32_t wordIndex;
-      int32_t ordBeforeWord;
-    };
+  struct GroupImpacts {
+    std::vector<int32_t> lastDocs;
+    std::vector<int32_t> spanMaxTfs;
+    std::vector<int32_t> spanMinNorms;
+    std::vector<int64_t> bodyOffsets;
+    std::vector<int32_t> baseLastDocs;
+    ImpactFrontiers frontiers;
   };
 
-private:
+protected:
+  explicit DocsEnumMeta(const TermsEnum::PostingsState& state)
+      : docIS(state.docIS), hasFreqs(state.hasFreqs),
+        hasPositions(state.hasPositions), hasNorms(state.hasPositions),
+        docfreq(state.docFreq), ttf(state.totalTermFreq),
+        docsSize(state.docsEnd - state.docsStart), startOfDocs(state.docsStart),
+        endOfDocs(state.docsEnd),
+        termImpactFrontierPtr(state.termImpactFrontier.ptr),
+        termImpactFrontierLen(state.termImpactFrontier.len),
+        termOrdinal(state.termOrdinal) {
+    assert(endOfDocs >= startOfDocs);
+    if (docsSize != 0) {
+      numDocBlocks =
+          (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
+      numDocGroups = (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
+    }
+  }
 
-  int32_t numDocBlocks = 0;
-  int32_t numDocGroups = 0;
-  int32_t nextL0Block = 0;     // block whose header is at docIS, unless bodyReady is true
-  uint32_t nextL0Base = 0;     // last doc before nextL0Block
-  int64_t nextL0CumTf = 0;     // cumulative tf before nextL0Block
-  int32_t nextL1Group = 0;     // group whose header is next when nextL0Block is on a group boundary
-  uint32_t nextL1Base = 0;     // last doc before nextL1Group
-  int64_t nextL1CumTf = 0;     // cumulative tf before nextL1Group
-  bool bodyReady = false;      // docIS already points at the current block body after an L0 walk
-
-  // Position metadata repair can be deferred while a positions-tracking enum is
-  // only being advanced through decoded docs. The dirty range is always within
-  // the current decoded doc/freq block; block skips and block-boundary decodes
-  // re-anchor cumulativeTermFreq from L0 metadata and clear it.
-  bool posRepairDirty = false;
-  int32_t posRepairStart = 0;  // inclusive index in tfreqBuf/docBuf
-  int32_t posRepairEnd = 0;    // exclusive index; current doc is end - 1
-
-  // +7: expandDocWords writes branchless 8-wide rows, spilling up to 7 slots
-  // past the last doc.
-  int32_t db[Postings::DOCS_BLOCK_SIZE + 7];  // temporary...
-  int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
+  DocsEnumMeta(const DocsEnumMeta&) = delete;
 
   static uint32_t readVint15(const char*& pos, const char* end) {
     assert(pos + 2 <= end);
-    uint16_t s = (uint16_t) (uint8_t) pos[0] | (uint16_t) ((uint16_t) (uint8_t) pos[1] << 8);
+    uint16_t s = (uint16_t) (uint8_t) pos[0]
+                 | (uint16_t) ((uint16_t) (uint8_t) pos[1] << 8);
     pos += 2;
     if ((s & 0x8000u) == 0) {
       return s;
@@ -205,7 +154,8 @@ private:
 
   static uint64_t readVlong15(const char*& pos, const char* end) {
     assert(pos + 2 <= end);
-    uint16_t s = (uint16_t) (uint8_t) pos[0] | (uint16_t) ((uint16_t) (uint8_t) pos[1] << 8);
+    uint16_t s = (uint16_t) (uint8_t) pos[0]
+                 | (uint16_t) ((uint16_t) (uint8_t) pos[1] << 8);
     pos += 2;
     if ((s & 0x8000u) == 0) {
       return s;
@@ -251,9 +201,499 @@ private:
     header.frontierTfBytes = {tfs, tfBytes};
     header.frontierTfWidth = width;
     header.spanMinNorm = (int32_t) norms[0];
-    header.spanMaxTf = (int32_t) readPackedL1Tf(header.frontierTfBytes, width, count - 1);
+    header.spanMaxTf =
+        (int32_t) readPackedL1Tf(header.frontierTfBytes, width, count - 1);
     header.frontierSpilled = false;
   }
+
+private:
+  void initGroupImpactCursor(GroupImpactCursor& cursor) const {
+    cursor.next = docsSize == 0 ? nullptr : docIS.ptr(startOfDocs);
+    cursor.prevGroupLastDoc = 0;
+    cursor.nextGroup = 0;
+    cursor.initialized = true;
+  }
+
+  GroupImpactHeader parseNextGroupImpactHeader(GroupImpactCursor& cursor) const {
+    assert(docsSize != 0);
+    if (!cursor.initialized) {
+      initGroupImpactCursor(cursor);
+    }
+    assert(cursor.nextGroup >= 0 && cursor.nextGroup < numDocGroups);
+    const char* const streamStart = docIS.ptr(0);
+    const char* const end = docIS.ptr(endOfDocs);
+    const char* p = cursor.next;
+    GroupImpactHeader header;
+    header.group = cursor.nextGroup;
+    header.baseLastDoc = (int32_t) cursor.prevGroupLastDoc;
+
+    uint32_t groupHeaderLen = InputStream::readVint(p, end);
+    const char* groupHeaderEnd = p + groupHeaderLen;
+    assert(groupHeaderEnd <= end);
+    header.lastDoc =
+        (int32_t) (cursor.prevGroupLastDoc + readVint15(p, groupHeaderEnd));
+    uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
+    if (hasPositions) {
+      auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
+      unused(groupCumTfDelta);
+    }
+    if (hasFreqs && hasNorms) {
+      decodePackedL1Frontier(p, groupHeaderEnd, header);
+    } else if (hasFreqs) {
+      header.spanMaxTf = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+    } else if (hasNorms) {
+      header.spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+    }
+    assert(p == groupHeaderEnd);
+    header.bodyOffset = (int64_t) (groupHeaderEnd - streamStart) - startOfDocs;
+    cursor.next = groupHeaderEnd + (int64_t) groupByteLen;
+    assert(cursor.next <= end);
+    cursor.prevGroupLastDoc = (uint32_t) header.lastDoc;
+    cursor.nextGroup++;
+    return header;
+  }
+
+public:
+  bool indexHasPositions() const { return hasPositions; }
+  int32_t numDocs() { return docfreq; }
+  int32_t totalTermFreq() { return ttf; }
+  int64_t termOrd() const { return termOrdinal; }
+  bool hasTermImpacts() const { return termImpactFrontierPtr != nullptr; }
+
+  std::span<const char> encodedTermImpactFrontier() const {
+    return {termImpactFrontierPtr, (size_t) termImpactFrontierLen};
+  }
+
+  template <typename Visitor>
+  int32_t visitTermImpactFrontier(Visitor&& visitor) const {
+    if (!hasTermImpacts()) {
+      return 0;
+    }
+    const char* p = termImpactFrontierPtr;
+    const char* end = termImpactFrontierPtr + termImpactFrontierLen;
+    uint32_t count = InputStream::readVint(p, end);
+    int32_t tf = 0;
+    for (uint32_t i = 0; i < count; i++) {
+      assert(p < end);
+      int32_t norm = (int32_t) (uint8_t) *p++;
+      tf += (int32_t) InputStream::readVint(p, end);
+      visitor(tf, norm);
+    }
+    assert(p == end);
+    return (int32_t) count;
+  }
+
+  int32_t readTermImpactFrontier(std::vector<int32_t>& norms,
+                                 std::vector<int32_t>& tfs) const {
+    norms.resize(0);
+    tfs.resize(0);
+    return visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+      tfs.push_back(tf);
+      norms.push_back(norm);
+    });
+  }
+
+  // Read stored impact data without decoding postings bodies.  DOCS-only fields
+  // do not store impact fields, so their per-block maxTf and group span impacts are
+  // synthesized as 1; fields without norms synthesize minNorm/spanMinNorm as 0.
+  void readBlockMaxTf(std::vector<int32_t>& blockMaxTf,
+                      std::vector<int32_t>* groupSpanImpacts = nullptr,
+                      std::vector<int32_t>* blockLastDocs = nullptr,
+                      std::vector<int32_t>* blockMinNorms = nullptr,
+                      std::vector<int32_t>* groupSpanMinNorms = nullptr,
+                      ImpactFrontiers* impactFrontiers = nullptr) const {
+    blockMaxTf.resize(0);
+    if (groupSpanImpacts != nullptr) {
+      groupSpanImpacts->resize(0);
+    }
+    if (blockLastDocs != nullptr) {
+      blockLastDocs->resize(0);
+    }
+    if (blockMinNorms != nullptr) {
+      blockMinNorms->resize(0);
+    }
+    if (groupSpanMinNorms != nullptr) {
+      groupSpanMinNorms->resize(0);
+    }
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->clear();
+    }
+    if (docsSize == 0) {
+      return;
+    }
+
+    blockMaxTf.reserve(numDocBlocks);
+    if (groupSpanImpacts != nullptr) {
+      groupSpanImpacts->reserve(numDocGroups);
+    }
+    if (blockLastDocs != nullptr) {
+      blockLastDocs->reserve(numDocBlocks);
+    }
+    if (blockMinNorms != nullptr) {
+      blockMinNorms->reserve(numDocBlocks);
+    }
+    if (groupSpanMinNorms != nullptr) {
+      groupSpanMinNorms->reserve(numDocGroups);
+    }
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->offsets.reserve((size_t) numDocBlocks + 1);
+    }
+
+    const char* const end = docIS.ptr(endOfDocs);
+    const char* p = docIS.ptr(startOfDocs);
+    uint32_t prevGroupLastDoc = 0;
+    uint32_t prevBlockLastDoc = 0;
+
+    for (int32_t group = 0; group < numDocGroups; group++) {
+      int32_t groupStartBlock = group * L1_PERIOD;
+      int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
+
+      uint32_t groupHeaderLen = InputStream::readVint(p, end);
+      const char* groupHeaderEnd = p + groupHeaderLen;
+      assert(groupHeaderEnd <= end);
+      uint32_t groupLastDoc = prevGroupLastDoc + readVint15(p, groupHeaderEnd);
+      uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
+      if (hasPositions) {
+        auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
+        unused(groupCumTfDelta);
+      }
+      // The group corner (max tf, min norm) is the staircase's last tf and
+      // first norm for freqs+norms fields; stored directly otherwise.
+      int32_t spanImpact = 1;
+      int32_t spanMinNorm = 0;
+      if (hasFreqs && hasNorms) {
+        GroupImpactHeader packed;
+        decodePackedL1Frontier(p, groupHeaderEnd, packed);
+        spanMinNorm = packed.spanMinNorm;
+        spanImpact = packed.spanMaxTf;
+      } else if (hasFreqs) {
+        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      } else if (hasNorms) {
+        spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      }
+      assert(p == groupHeaderEnd);
+      if (groupSpanImpacts != nullptr) {
+        groupSpanImpacts->push_back(spanImpact);
+      }
+      if (groupSpanMinNorms != nullptr) {
+        groupSpanMinNorms->push_back(spanMinNorm);
+      }
+
+      const char* const groupBody = groupHeaderEnd;
+      const char* const groupEnd = groupBody + (int64_t) groupByteLen;
+      assert(groupEnd <= end);
+      p = groupBody;
+
+      for (int32_t i = 0; i < groupBlockCount; i++) {
+        uint32_t headerLen = InputStream::readVint(p, groupEnd);
+        const char* headerEnd = p + headerLen;
+        assert(headerEnd <= groupEnd);
+        uint32_t blockLastDocValue = prevBlockLastDoc + readVint15(p, headerEnd);
+        uint64_t blockByteLen = readVlong15(p, headerEnd);
+        if (hasPositions) {
+          auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
+          unused(blockCumTfDelta);
+          auto blockPosByteOff = InputStream::readVlong(p, headerEnd);
+          unused(blockPosByteOff);
+        }
+        int32_t maxTf = 1;
+        int32_t minNorm = 0;
+        if (impactFrontiers != nullptr) {
+          impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+        }
+        if (hasFreqs && hasNorms) {
+          uint32_t frontierCount = InputStream::readVint(p, headerEnd);
+          assert(frontierCount > 0);
+          int32_t tf = 0;
+          for (uint32_t j = 0; j < frontierCount; j++) {
+            assert(p < headerEnd);
+            int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
+            p++;
+            tf += (int32_t) InputStream::readVint(p, headerEnd);  // tf delta
+            assert(norm >= 0 && norm <= 255);
+            assert(tf > 0);
+            if (j == 0) {
+              minNorm = norm;
+            }
+            maxTf = tf;
+            if (impactFrontiers != nullptr) {
+              impactFrontiers->norms.push_back(norm);
+              impactFrontiers->tfs.push_back(tf);
+            }
+          }
+        } else if (hasFreqs) {
+          maxTf = (int32_t) InputStream::readVint(p, headerEnd);
+        } else if (hasNorms) {
+          minNorm = (int32_t) InputStream::readVint(p, headerEnd);
+        }
+        assert(p == headerEnd);
+        blockMaxTf.push_back(maxTf);
+        if (blockLastDocs != nullptr) {
+          blockLastDocs->push_back((int32_t) blockLastDocValue);
+        }
+        if (blockMinNorms != nullptr) {
+          blockMinNorms->push_back(minNorm);
+        }
+        p = headerEnd + (int64_t) blockByteLen;
+        assert(p <= groupEnd);
+        prevBlockLastDoc = blockLastDocValue;
+      }
+
+      assert(p == groupEnd);
+      prevGroupLastDoc = groupLastDoc;
+      assert(prevBlockLastDoc == prevGroupLastDoc);
+    }
+
+    assert((int32_t) blockMaxTf.size() == numDocBlocks);
+    assert(blockMinNorms == nullptr || (int32_t) blockMinNorms->size() == numDocBlocks);
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+      assert((int32_t) impactFrontiers->offsets.size() == numDocBlocks + 1);
+      assert(impactFrontiers->tfs.size() == impactFrontiers->norms.size());
+    }
+    assert(p == end);
+  }
+
+
+  int32_t numImpactBlocks() const { return numDocBlocks; }
+  int32_t numImpactGroups() const { return numDocGroups; }
+
+  template <typename Visitor>
+  int32_t readGroupImpactHeadersThrough(GroupImpactCursor& cursor,
+                                        int32_t throughGroup,
+                                        bool countLazyParses,
+                                        Visitor&& visitor) const {
+    if (docsSize == 0 || throughGroup < 0) {
+      return 0;
+    }
+    if (!cursor.initialized) {
+      initGroupImpactCursor(cursor);
+    }
+    int32_t parsed = 0;
+    int32_t stop = std::min(throughGroup, numDocGroups - 1);
+    while (cursor.nextGroup <= stop) {
+      GroupImpactHeader header = parseNextGroupImpactHeader(cursor);
+      if (countLazyParses) {
+        skipCount(SkipStats::impactGroupHeaderParses);
+      }
+      visitor(header);
+      parsed++;
+    }
+    if (cursor.nextGroup == numDocGroups) {
+      assert(cursor.next == docIS.ptr(endOfDocs));
+    }
+    return parsed;
+  }
+
+  void readGroupImpacts(GroupImpacts& out) const {
+    out.lastDocs.resize(0);
+    out.spanMaxTfs.resize(0);
+    out.spanMinNorms.resize(0);
+    out.bodyOffsets.resize(0);
+    out.baseLastDocs.resize(0);
+    out.frontiers.clear();
+    if (docsSize == 0) {
+      return;
+    }
+    out.lastDocs.reserve(numDocGroups);
+    out.spanMaxTfs.reserve(numDocGroups);
+    out.spanMinNorms.reserve(numDocGroups);
+    out.bodyOffsets.reserve(numDocGroups);
+    out.baseLastDocs.reserve(numDocGroups);
+    out.frontiers.offsets.reserve((size_t) numDocGroups + 1);
+
+    GroupImpactCursor cursor;
+    initGroupImpactCursor(cursor);
+    while (cursor.nextGroup < numDocGroups) {
+      GroupImpactHeader header = parseNextGroupImpactHeader(cursor);
+      out.baseLastDocs.push_back(header.baseLastDoc);
+      out.lastDocs.push_back(header.lastDoc);
+      out.spanMaxTfs.push_back(header.spanMaxTf);
+      out.spanMinNorms.push_back(header.spanMinNorm);
+      out.bodyOffsets.push_back(header.bodyOffset);
+      out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
+      for (uint32_t i = 0; i < (uint32_t) header.frontierNorms.size(); i++) {
+        out.frontiers.norms.push_back((int32_t) header.frontierNorms[i]);
+        out.frontiers.tfs.push_back((int32_t) readPackedL1Tf(
+            header.frontierTfBytes, header.frontierTfWidth, i));
+      }
+    }
+    assert(cursor.next == docIS.ptr(endOfDocs));
+    out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
+  }
+
+  template <typename Visitor>
+  void visitGroupBlockImpacts(int32_t groupIndex, int64_t bodyOffset,
+                              int32_t baseLastDoc,
+                              GroupBlockImpactScratch& scratch,
+                              Visitor&& visitor) const {
+    int32_t groupStartBlock = groupIndex * L1_PERIOD;
+    int32_t groupBlockCount =
+        std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
+    assert(groupBlockCount > 0);
+
+    const char* const end = docIS.ptr(endOfDocs);
+    const char* p = docIS.ptr(startOfDocs + bodyOffset);
+    uint32_t prevBlockLastDoc = (uint32_t) baseLastDoc;
+    for (int32_t i = 0; i < groupBlockCount; i++) {
+      uint32_t headerLen = InputStream::readVint(p, end);
+      const char* headerEnd = p + headerLen;
+      assert(headerEnd <= end);
+      uint32_t blockLastDocValue = prevBlockLastDoc + readVint15(p, headerEnd);
+      uint64_t blockByteLen = readVlong15(p, headerEnd);
+      if (hasPositions) {
+        auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
+        unused(blockCumTfDelta);
+        auto blockPosByteOff = InputStream::readVlong(p, headerEnd);
+        unused(blockPosByteOff);
+      }
+      int32_t maxTf = 1;
+      int32_t minNorm = 0;
+      int32_t frontierStored = 0;
+      bool frontierSpilled = false;
+      if (hasFreqs && hasNorms) {
+        uint32_t frontierCount = InputStream::readVint(p, headerEnd);
+        frontierSpilled =
+            frontierCount > (uint32_t) GroupBlockImpactScratch::FRONTIER_CAP;
+        if (frontierSpilled) {
+          skipCount(SkipStats::impactL0GroupParseScratchSpills);
+        }
+        assert(frontierCount > 0);
+        int32_t tf = 0;
+        for (uint32_t j = 0; j < frontierCount; j++) {
+          assert(p < headerEnd);
+          int32_t norm = (int32_t) (uint8_t) *p++;
+          tf += (int32_t) InputStream::readVint(p, headerEnd);
+          if (j == 0) {
+            minNorm = norm;
+          }
+          maxTf = tf;
+          if (!frontierSpilled) {
+            scratch.frontierNorms[frontierStored] = norm;
+            scratch.frontierTfs[frontierStored] = tf;
+            frontierStored++;
+          }
+        }
+      } else if (hasFreqs) {
+        maxTf = (int32_t) InputStream::readVint(p, headerEnd);
+      } else if (hasNorms) {
+        minNorm = (int32_t) InputStream::readVint(p, headerEnd);
+      }
+      assert(p == headerEnd);
+      visitor(i, (int32_t) blockLastDocValue, maxTf, minNorm,
+              std::span<const int32_t>(scratch.frontierTfs,
+                                       (size_t) frontierStored),
+              std::span<const int32_t>(scratch.frontierNorms,
+                                       (size_t) frontierStored),
+              frontierSpilled);
+      p = headerEnd + (int64_t) blockByteLen;
+      assert(p <= end);
+      prevBlockLastDoc = blockLastDocValue;
+    }
+  }
+};
+
+// TODO: templatize to be able to instrument, implement checkindex, etc...
+// TODO: investigate writing a version of this based on continuations and see how it performs?
+// TODO: some of this internal state could be removed... we only need some of it in the constructor?
+// Implementation note: moving block reading of docs and positions to cpp files and just leaving the hot path
+// in the header resulted in >3% performance loss for docs, and >5% loss for positions.
+class DocsEnumImpl : public DocsEnumMeta {
+  friend class PosEnum;
+  template<DocsEnumTier Tier>
+  friend class BasicDocsEnum;
+
+  int32_t* docBuf;       // the list of decoded docs (may be partial)
+  int32_t* tfreqBuf;     // the list of decoded term freqs
+
+  int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
+  int64_t cumulativeTermFreq = 0; // Synonym for posOrdEnd.  Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
+  bool positionBatchActive = false;
+  bool positionTrackingEnabled = false;
+
+  int32_t docOrd = 0;    // the ordinal of the current document we are on for this term
+  int32_t docBufIdx = 0; // index of the next value to read in the docs buffer
+  int32_t docBufEnd;     // index of one-past the last valid element
+  int32_t docid;         // current docid
+  bool blockMode = false;
+  bool docsOnlyConsumed = false;
+  bool docBlockResident = false;
+  bool scoredWordProbeActive = false;
+  const char* residentWordsPtr = nullptr;
+  uint32_t residentDocBase = 0;
+  uint32_t residentBlockLast = 0;
+  int32_t residentBlockStartOrd = 0;
+  int32_t residentNumWords = 0;  // zero means a contiguous resident block
+  const char* scoredProbeWordsPtr = nullptr;
+  uint32_t scoredProbeDocBase = 0;
+  uint32_t scoredProbeBlockLast = 0;
+  int32_t scoredProbeBlockStartOrd = 0;
+  int32_t scoredProbeNumWords = 0;  // zero means a contiguous scored probe block
+
+  // For term freqs, since they are parallel to docs, we don't actually need
+  // all of these variables.  But it sets the stage for separating the two
+  // more and using different encodings / block sizes for them.
+  int32_t tfreqOrd = 0;      // ordinal of the current term freq (parallel to docOrd)
+  int32_t tfreqBufIdx = 0;   // index of the next valid value
+  int32_t tfreqBufEnd;       // index of one-past the last valid element
+  int32_t tfreq;
+
+  InputStream positionInput;
+
+  int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
+  int32_t pulsedPosition = 0;
+  int64_t pendingPosBlockOrd = 0;
+  int64_t pendingPosAbsoluteOffset = 0;
+  bool pendingPosSeekValid = false;
+
+public:
+  struct DocFreqBlock {
+    std::span<const int32_t> docs;
+    std::span<const int32_t> tfreqs;
+  };
+
+  // Scoped scored-word probe state for TermQuery::Scorer::applyToCandidates.
+  // A successful probe consumes the block body from the stream and decodes its
+  // freq block, but deliberately leaves doc ids as resident words until the
+  // caller finishes the scope. During that scope no normal postings-cursor method is
+  // legal: exposing lazy materialization through advance()/score()/peek would
+  // recreate the old scored-path resident-state tax. That is the opposite of
+  // the docs-only design, where docsOnlyConsumed is a one-way latch that makes
+  // termFreq()/positions permanently illegal after freq blocks are skipped.
+  struct ScoredWordProbe {
+    uint32_t docBase;
+    int32_t blockLast;
+    int32_t blockStartOrd;
+    int32_t numWords;       // 0 contiguous, >0 word-bitset
+    const char* words;      // null for contiguous
+    std::span<const int32_t> freqs;
+    struct RankCursor {
+      int32_t wordIndex;
+      int32_t ordBeforeWord;
+    };
+  };
+
+private:
+  int32_t nextL0Block = 0;     // block whose header is at docIS, unless bodyReady is true
+  uint32_t nextL0Base = 0;     // last doc before nextL0Block
+  int64_t nextL0CumTf = 0;     // cumulative tf before nextL0Block
+  int32_t nextL1Group = 0;     // group whose header is next when nextL0Block is on a group boundary
+  uint32_t nextL1Base = 0;     // last doc before nextL1Group
+  int64_t nextL1CumTf = 0;     // cumulative tf before nextL1Group
+  bool bodyReady = false;      // docIS already points at the current block body after an L0 walk
+
+  // Position metadata repair can be deferred while a positions-tracking enum is
+  // only being advanced through decoded docs. The dirty range is always within
+  // the current decoded doc/freq block; block skips and block-boundary decodes
+  // re-anchor cumulativeTermFreq from L0 metadata and clear it.
+  bool posRepairDirty = false;
+  int32_t posRepairStart = 0;  // inclusive index in tfreqBuf/docBuf
+  int32_t posRepairEnd = 0;    // exclusive index; current doc is end - 1
+
+  // +7: expandDocWords writes branchless 8-wide rows, spilling up to 7 slots
+  // past the last doc.
+  int32_t db[Postings::DOCS_BLOCK_SIZE + 7];  // temporary...
+  int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
 
   static bool isL1Boundary(int32_t block) {
     return (block % L1_PERIOD) == 0;
@@ -658,22 +1098,13 @@ private:
   }
 
 public:
-  /// sentinel value used for docs
-  static constexpr int32_t END = std::numeric_limits<int32_t>::max();
-
-  explicit DocsEnum(const TermsEnum::PostingsState& state)
-  : docIS(state.docIS), positionInput(state.posIS),
-    hasFreqs(state.hasFreqs), hasPositions(state.hasPositions),
-    docfreq(state.docFreq), ttf(state.totalTermFreq),
-    docsSize(state.docsEnd - state.docsStart), startOfDocs(state.docsStart),
-    endOfDocs(state.docsEnd), posStartLoc(state.posStart), pulsedPosition(state.pulsedPos),
-    termImpactFrontierPtr(state.termImpactFrontier.ptr),
-    termImpactFrontierLen(state.termImpactFrontier.len), termOrdinal(state.termOrdinal)
+protected:
+  explicit DocsEnumImpl(const TermsEnum::PostingsState& state)
+  : DocsEnumMeta(state), positionInput(state.posIS),
+    posStartLoc(state.posStart), pulsedPosition(state.pulsedPos)
   {
     docBuf=db;
     tfreqBuf=tb;
-    hasNorms = hasPositions;
-    assert(endOfDocs >= startOfDocs);
     docid = -1;
 
     if (docsSize == 0) {
@@ -692,8 +1123,6 @@ public:
       tfreq = -1;  // unnecessary initialization, but it avoids a maybe-uninitialized warning with -O3
       assert(endOfDocs - startOfDocs == docsSize);
       docBufEnd = 0;
-      numDocBlocks = (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
-      numDocGroups = (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
 
       if (hasPositions) {
         assert(positionInput.offset() == posStartLoc);
@@ -713,65 +1142,12 @@ public:
     }
   }
 
-  explicit DocsEnum(TermsEnum& termsEnum) : DocsEnum(termsEnum.postingsState()) {}
+  explicit DocsEnumImpl(TermsEnum& termsEnum)
+      : DocsEnumImpl(termsEnum.postingsState()) {}
 
-  DocsEnum(const DocsEnum& other) = delete;
+  DocsEnumImpl(const DocsEnumImpl& other) = delete;
 
-  /// whether this field indexes positions (false for DOCS / DOCS_AND_FREQS fields)
-  bool indexHasPositions() const {
-    return hasPositions;
-  }
-
-  /// number of documents containing the term
-  int32_t numDocs() {
-    return docfreq;
-  }
-
-  /// sum of term freq across all documents (i.e. total number of appearances for this term)
-  int32_t totalTermFreq() {
-    return ttf;
-  }
-
-  int64_t termOrd() const { return termOrdinal; }
-
-  bool hasTermImpacts() const {
-    return termImpactFrontierPtr != nullptr;
-  }
-
-  std::span<const char> encodedTermImpactFrontier() const {
-    return {termImpactFrontierPtr, (size_t) termImpactFrontierLen};
-  }
-
-  template <typename Visitor>
-  int32_t visitTermImpactFrontier(Visitor&& visitor) const {
-    if (!hasTermImpacts()) {
-      return 0;
-    }
-    const char* p = termImpactFrontierPtr;
-    const char* end = termImpactFrontierPtr + termImpactFrontierLen;
-    uint32_t count = InputStream::readVint(p, end);
-    int32_t tf = 0;
-    for (uint32_t i = 0; i < count; i++) {
-      assert(p < end);
-      int32_t norm = (int32_t) (uint8_t) *p;
-      p++;
-      tf += (int32_t) InputStream::readVint(p, end);
-      visitor(tf, norm);
-    }
-    assert(p == end);
-    return (int32_t) count;
-  }
-
-  int32_t readTermImpactFrontier(std::vector<int32_t>& norms,
-                                 std::vector<int32_t>& tfs) const {
-    norms.resize(0);
-    tfs.resize(0);
-    return visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
-      tfs.push_back(tf);
-      norms.push_back(norm);
-    });
-  }
-
+public:
   /// the document this iterator is currently positions on
   int32_t docId() {
     assert(!scoredWordProbeActive);
@@ -1449,7 +1825,7 @@ public:
   // past the returned span. It may call nextDoc() to decode the next block, and
   // therefore may position docId()/termFreq() at the first returned doc. It does
   // not keep position/cumulative-tf metadata synchronized because score-only
-  // block consumers do not need it. Spans are valid until the next DocsEnum call.
+  // block consumers do not need it. Spans are valid until the next cursor call.
   // Impact threshold ownership remains with TermQuery::Scorer; this exposes raw
   // decoded postings and does not know minCompetitiveScore.
   std::pair<std::span<const int32_t>, std::span<const int32_t>> peekDocFreqBlock() {
@@ -1915,369 +2291,6 @@ public:
     return advanceImpl<true>(target);
   }
 
-  // Read stored impact data without decoding postings bodies.  DOCS-only fields
-  // do not store impact fields, so their per-block maxTf and group span impacts are
-  // synthesized as 1; fields without norms synthesize minNorm/spanMinNorm as 0.
-  void readBlockMaxTf(std::vector<int32_t>& blockMaxTf,
-                      std::vector<int32_t>* groupSpanImpacts = nullptr,
-                      std::vector<int32_t>* blockLastDocs = nullptr,
-                      std::vector<int32_t>* blockMinNorms = nullptr,
-                      std::vector<int32_t>* groupSpanMinNorms = nullptr,
-                      ImpactFrontiers* impactFrontiers = nullptr) const {
-    blockMaxTf.resize(0);
-    if (groupSpanImpacts != nullptr) {
-      groupSpanImpacts->resize(0);
-    }
-    if (blockLastDocs != nullptr) {
-      blockLastDocs->resize(0);
-    }
-    if (blockMinNorms != nullptr) {
-      blockMinNorms->resize(0);
-    }
-    if (groupSpanMinNorms != nullptr) {
-      groupSpanMinNorms->resize(0);
-    }
-    if (impactFrontiers != nullptr) {
-      impactFrontiers->clear();
-    }
-    if (docsSize == 0) {
-      return;
-    }
-
-    blockMaxTf.reserve(numDocBlocks);
-    if (groupSpanImpacts != nullptr) {
-      groupSpanImpacts->reserve(numDocGroups);
-    }
-    if (blockLastDocs != nullptr) {
-      blockLastDocs->reserve(numDocBlocks);
-    }
-    if (blockMinNorms != nullptr) {
-      blockMinNorms->reserve(numDocBlocks);
-    }
-    if (groupSpanMinNorms != nullptr) {
-      groupSpanMinNorms->reserve(numDocGroups);
-    }
-    if (impactFrontiers != nullptr) {
-      impactFrontiers->offsets.reserve((size_t) numDocBlocks + 1);
-    }
-
-    const char* const end = docIS.ptr(endOfDocs);
-    const char* p = docIS.ptr(startOfDocs);
-    uint32_t prevGroupLastDoc = 0;
-    uint32_t prevBlockLastDoc = 0;
-
-    for (int32_t group = 0; group < numDocGroups; group++) {
-      int32_t groupStartBlock = group * L1_PERIOD;
-      int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
-
-      uint32_t groupHeaderLen = InputStream::readVint(p, end);
-      const char* groupHeaderEnd = p + groupHeaderLen;
-      assert(groupHeaderEnd <= end);
-      uint32_t groupLastDoc = prevGroupLastDoc + readVint15(p, groupHeaderEnd);
-      uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
-      if (hasPositions) {
-        auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
-        unused(groupCumTfDelta);
-      }
-      // The group corner (max tf, min norm) is the staircase's last tf and
-      // first norm for freqs+norms fields; stored directly otherwise.
-      int32_t spanImpact = 1;
-      int32_t spanMinNorm = 0;
-      if (hasFreqs && hasNorms) {
-        GroupImpactHeader packed;
-        decodePackedL1Frontier(p, groupHeaderEnd, packed);
-        spanMinNorm = packed.spanMinNorm;
-        spanImpact = packed.spanMaxTf;
-      } else if (hasFreqs) {
-        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-      } else if (hasNorms) {
-        spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-      }
-      assert(p == groupHeaderEnd);
-      if (groupSpanImpacts != nullptr) {
-        groupSpanImpacts->push_back(spanImpact);
-      }
-      if (groupSpanMinNorms != nullptr) {
-        groupSpanMinNorms->push_back(spanMinNorm);
-      }
-
-      const char* const groupBody = groupHeaderEnd;
-      const char* const groupEnd = groupBody + (int64_t) groupByteLen;
-      assert(groupEnd <= end);
-      p = groupBody;
-
-      for (int32_t i = 0; i < groupBlockCount; i++) {
-        uint32_t headerLen = InputStream::readVint(p, groupEnd);
-        const char* headerEnd = p + headerLen;
-        assert(headerEnd <= groupEnd);
-        uint32_t blockLastDocValue = prevBlockLastDoc + readVint15(p, headerEnd);
-        uint64_t blockByteLen = readVlong15(p, headerEnd);
-        if (hasPositions) {
-          auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
-          unused(blockCumTfDelta);
-          auto blockPosByteOff = InputStream::readVlong(p, headerEnd);
-          unused(blockPosByteOff);
-        }
-        int32_t maxTf = 1;
-        int32_t minNorm = 0;
-        if (impactFrontiers != nullptr) {
-          impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
-        }
-        if (hasFreqs && hasNorms) {
-          uint32_t frontierCount = InputStream::readVint(p, headerEnd);
-          assert(frontierCount > 0);
-          int32_t tf = 0;
-          for (uint32_t j = 0; j < frontierCount; j++) {
-            assert(p < headerEnd);
-            int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
-            p++;
-            tf += (int32_t) InputStream::readVint(p, headerEnd);  // tf delta
-            assert(norm >= 0 && norm <= 255);
-            assert(tf > 0);
-            if (j == 0) {
-              minNorm = norm;
-            }
-            maxTf = tf;
-            if (impactFrontiers != nullptr) {
-              impactFrontiers->norms.push_back(norm);
-              impactFrontiers->tfs.push_back(tf);
-            }
-          }
-        } else if (hasFreqs) {
-          maxTf = (int32_t) InputStream::readVint(p, headerEnd);
-        } else if (hasNorms) {
-          minNorm = (int32_t) InputStream::readVint(p, headerEnd);
-        }
-        assert(p == headerEnd);
-        blockMaxTf.push_back(maxTf);
-        if (blockLastDocs != nullptr) {
-          blockLastDocs->push_back((int32_t) blockLastDocValue);
-        }
-        if (blockMinNorms != nullptr) {
-          blockMinNorms->push_back(minNorm);
-        }
-        p = headerEnd + (int64_t) blockByteLen;
-        assert(p <= groupEnd);
-        prevBlockLastDoc = blockLastDocValue;
-      }
-
-      assert(p == groupEnd);
-      prevGroupLastDoc = groupLastDoc;
-      assert(prevBlockLastDoc == prevGroupLastDoc);
-    }
-
-    assert((int32_t) blockMaxTf.size() == numDocBlocks);
-    assert(blockMinNorms == nullptr || (int32_t) blockMinNorms->size() == numDocBlocks);
-    if (impactFrontiers != nullptr) {
-      impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
-      assert((int32_t) impactFrontiers->offsets.size() == numDocBlocks + 1);
-      assert(impactFrontiers->tfs.size() == impactFrontiers->norms.size());
-    }
-    assert(p == end);
-  }
-
-  /// total number of doc blocks (L0) for this term - sizes impact indexes
-  int32_t numImpactBlocks() const {
-    return numDocBlocks;
-  }
-
-  int32_t numImpactGroups() const {
-    return numDocGroups;
-  }
-
-  // Group-level impact scan: walks ONLY the L1 group headers, hopping each
-  // group's body via its byte length - ~df/4096 steps instead of the whole-
-  // list walk readBlockMaxTf does.  Emits per group: last doc, the group's
-  // stored impact frontier (with its (maxTf, minNorm) corner derived for
-  // consumers that want a single span), and what a later lazy parse of that
-  // group's L0 headers needs (body offset relative to startOfDocs, delta
-  // bases).  Fields without freqs+norms have empty frontier ranges.
-  struct GroupImpacts {
-    std::vector<int32_t> lastDocs;
-    std::vector<int32_t> spanMaxTfs;
-    std::vector<int32_t> spanMinNorms;
-    std::vector<int64_t> bodyOffsets;   // relative to startOfDocs
-    std::vector<int32_t> baseLastDocs;  // last doc before the group (L0 delta base)
-    ImpactFrontiers frontiers;          // per-group frontier staircases
-  };
-
-private:
-  void initGroupImpactCursor(GroupImpactCursor& cursor) const {
-    cursor.next = docsSize == 0 ? nullptr : docIS.ptr(startOfDocs);
-    cursor.prevGroupLastDoc = 0;
-    cursor.nextGroup = 0;
-    cursor.initialized = true;
-  }
-
-  GroupImpactHeader parseNextGroupImpactHeader(GroupImpactCursor& cursor) const {
-    assert(docsSize != 0);
-    if (!cursor.initialized) {
-      initGroupImpactCursor(cursor);
-    }
-    assert(cursor.nextGroup >= 0 && cursor.nextGroup < numDocGroups);
-    const char* const streamStart = docIS.ptr(0);
-    const char* const end = docIS.ptr(endOfDocs);
-    const char* p = cursor.next;
-    GroupImpactHeader header;
-    header.group = cursor.nextGroup;
-    header.baseLastDoc = (int32_t) cursor.prevGroupLastDoc;
-
-    uint32_t groupHeaderLen = InputStream::readVint(p, end);
-    const char* groupHeaderEnd = p + groupHeaderLen;
-    assert(groupHeaderEnd <= end);
-    header.lastDoc = (int32_t) (cursor.prevGroupLastDoc + readVint15(p, groupHeaderEnd));
-    uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
-    if (hasPositions) {
-      auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
-      unused(groupCumTfDelta);
-    }
-    if (hasFreqs && hasNorms) {
-      decodePackedL1Frontier(p, groupHeaderEnd, header);
-    } else if (hasFreqs) {
-      header.spanMaxTf = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-    } else if (hasNorms) {
-      header.spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-    }
-    assert(p == groupHeaderEnd);
-    header.bodyOffset = (int64_t) (groupHeaderEnd - streamStart) - startOfDocs;
-    cursor.next = groupHeaderEnd + (int64_t) groupByteLen;
-    assert(cursor.next <= end);
-    cursor.prevGroupLastDoc = (uint32_t) header.lastDoc;
-    cursor.nextGroup++;
-    return header;
-  }
-
-public:
-  template <typename Visitor>
-  int32_t readGroupImpactHeadersThrough(GroupImpactCursor& cursor, int32_t throughGroup,
-                                        bool countLazyParses, Visitor&& visitor) const {
-    if (docsSize == 0 || throughGroup < 0) {
-      return 0;
-    }
-    if (!cursor.initialized) {
-      initGroupImpactCursor(cursor);
-    }
-    int32_t parsed = 0;
-    int32_t stop = std::min(throughGroup, numDocGroups - 1);
-    while (cursor.nextGroup <= stop) {
-      GroupImpactHeader header = parseNextGroupImpactHeader(cursor);
-      if (countLazyParses) {
-        skipCount(SkipStats::impactGroupHeaderParses);
-      }
-      visitor(header);
-      parsed++;
-    }
-    if (cursor.nextGroup == numDocGroups) {
-      assert(cursor.next == docIS.ptr(endOfDocs));
-    }
-    return parsed;
-  }
-
-  void readGroupImpacts(GroupImpacts& out) const {
-    out.lastDocs.resize(0);
-    out.spanMaxTfs.resize(0);
-    out.spanMinNorms.resize(0);
-    out.bodyOffsets.resize(0);
-    out.baseLastDocs.resize(0);
-    out.frontiers.clear();
-    if (docsSize == 0) {
-      return;
-    }
-    out.lastDocs.reserve(numDocGroups);
-    out.spanMaxTfs.reserve(numDocGroups);
-    out.spanMinNorms.reserve(numDocGroups);
-    out.bodyOffsets.reserve(numDocGroups);
-    out.baseLastDocs.reserve(numDocGroups);
-    out.frontiers.offsets.reserve((size_t) numDocGroups + 1);
-
-    // Pulsed terms have no doc stream (docsSize == 0, docIS never opened):
-    // emit the same empty output the pre-cursor walk produced.
-    if (docsSize != 0) {
-      GroupImpactCursor cursor;
-      initGroupImpactCursor(cursor);
-      while (cursor.nextGroup < numDocGroups) {
-        GroupImpactHeader header = parseNextGroupImpactHeader(cursor);
-        out.baseLastDocs.push_back(header.baseLastDoc);
-        out.lastDocs.push_back(header.lastDoc);
-        out.spanMaxTfs.push_back(header.spanMaxTf);
-        out.spanMinNorms.push_back(header.spanMinNorm);
-        out.bodyOffsets.push_back(header.bodyOffset);
-        out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
-        for (uint32_t i = 0; i < (uint32_t) header.frontierNorms.size(); i++) {
-          out.frontiers.norms.push_back((int32_t) header.frontierNorms[i]);
-          out.frontiers.tfs.push_back(
-              (int32_t) readPackedL1Tf(header.frontierTfBytes, header.frontierTfWidth, i));
-        }
-      }
-      assert(cursor.next == docIS.ptr(endOfDocs));
-    }
-    out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
-  }
-
-  // Parse ONE group's L0 block headers, located by readGroupImpacts output.
-  template <typename Visitor>
-  void visitGroupBlockImpacts(int32_t groupIndex, int64_t bodyOffset, int32_t baseLastDoc,
-                              GroupBlockImpactScratch& scratch, Visitor&& visitor) const {
-    int32_t groupStartBlock = groupIndex * L1_PERIOD;
-    int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
-    assert(groupBlockCount > 0);
-
-    const char* const end = docIS.ptr(endOfDocs);
-    const char* p = docIS.ptr(startOfDocs + bodyOffset);
-    uint32_t prevBlockLastDoc = (uint32_t) baseLastDoc;
-    for (int32_t i = 0; i < groupBlockCount; i++) {
-      uint32_t headerLen = InputStream::readVint(p, end);
-      const char* headerEnd = p + headerLen;
-      assert(headerEnd <= end);
-      uint32_t blockLastDocValue = prevBlockLastDoc + readVint15(p, headerEnd);
-      uint64_t blockByteLen = readVlong15(p, headerEnd);
-      if (hasPositions) {
-        auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
-        unused(blockCumTfDelta);
-        auto blockPosByteOff = InputStream::readVlong(p, headerEnd);
-        unused(blockPosByteOff);
-      }
-      int32_t maxTf = 1;
-      int32_t minNorm = 0;
-      int32_t frontierStored = 0;
-      bool frontierSpilled = false;
-      if (hasFreqs && hasNorms) {
-        uint32_t frontierCount = InputStream::readVint(p, headerEnd);
-        frontierSpilled = frontierCount > (uint32_t) GroupBlockImpactScratch::FRONTIER_CAP;
-        if (frontierSpilled) skipCount(SkipStats::impactL0GroupParseScratchSpills);
-        assert(frontierCount > 0);
-        int32_t tf = 0;
-        for (uint32_t j = 0; j < frontierCount; j++) {
-          assert(p < headerEnd);
-          int32_t norm = (int32_t) (uint8_t) *p;
-          p++;
-          tf += (int32_t) InputStream::readVint(p, headerEnd);
-          if (j == 0) {
-            minNorm = norm;
-          }
-          maxTf = tf;
-          if (!frontierSpilled) {
-            scratch.frontierNorms[frontierStored] = norm;
-            scratch.frontierTfs[frontierStored] = tf;
-            frontierStored++;
-          }
-        }
-      } else if (hasFreqs) {
-        maxTf = (int32_t) InputStream::readVint(p, headerEnd);
-      } else if (hasNorms) {
-        minNorm = (int32_t) InputStream::readVint(p, headerEnd);
-      }
-      assert(p == headerEnd);
-      visitor(i, (int32_t) blockLastDocValue, maxTf, minNorm,
-              std::span<const int32_t>(scratch.frontierTfs, (size_t) frontierStored),
-              std::span<const int32_t>(scratch.frontierNorms, (size_t) frontierStored),
-              frontierSpilled);
-      p = headerEnd + (int64_t) blockByteLen;
-      assert(p <= end);
-      prevBlockLastDoc = blockLastDocValue;
-    }
-  }
-
   // The current decoded block begins at the already-positioned doc.  The
   // caller may inspect remaps before choosing beginPositionDeltaBatch() or the
   // ordinary per-doc position path.  The spans remain valid until the next
@@ -2338,5 +2351,33 @@ private:
     return cumulativeTermFreq;
   }
 };
+
+// Caller-visible tiers deliberately share the exact DocsEnumImpl implementation
+// and storage. Tier-specific storage and API pruning are a separate change.
+template<DocsEnumTier Tier>
+class BasicDocsEnum final : public DocsEnumImpl {
+public:
+  static constexpr DocsEnumTier TIER = Tier;
+
+  explicit BasicDocsEnum(const TermsEnum::PostingsState& state)
+      : DocsEnumImpl(state) {}
+  explicit BasicDocsEnum(TermsEnum& termsEnum) : DocsEnumImpl(termsEnum) {}
+
+  BasicDocsEnum(const BasicDocsEnum&) = delete;
+};
+
+// The pre-decomposition implementation was 1376 bytes on this 64-bit target.
+// Splitting out metadata must not add state or change the full layout.
+static_assert(sizeof(DocsEnumMeta) == 96);
+static_assert(sizeof(DocsEnumImpl) == 1376);
+static_assert(sizeof(DocsEnumMeta) < sizeof(DocsEnumImpl));
+static_assert(sizeof(DocsOnlyEnum) == sizeof(DocsEnumImpl));
+static_assert(sizeof(DocsFreqEnum) == sizeof(DocsEnumImpl));
+static_assert(sizeof(DocsPosEnum) == sizeof(DocsEnumImpl));
+static_assert(std::is_trivially_destructible_v<DocsEnumMeta>);
+static_assert(std::is_trivially_destructible_v<DocsEnumImpl>);
+static_assert(std::is_trivially_destructible_v<DocsOnlyEnum>);
+static_assert(std::is_trivially_destructible_v<DocsFreqEnum>);
+static_assert(std::is_trivially_destructible_v<DocsPosEnum>);
 
 }

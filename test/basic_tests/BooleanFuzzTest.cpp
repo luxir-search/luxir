@@ -563,7 +563,7 @@ TEST_F(BooleanFuzzTest, phraseMultiDoc) {
 // full postings blocks with members that exhaust mid-stream, against a
 // counted oracle.
 TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
-  const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 300;
+  const int32_t numDocs = 2 * DocsEnumMeta::L1_DOCS + 300;
   int64_t expectNegated = 0;
   int64_t expectMandOpt = 0;
   std::vector<Doc> docs;
@@ -920,7 +920,7 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
 }
 
 TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
-  const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
+  const int32_t numDocs = 2 * DocsEnumMeta::L1_DOCS + 513;
   // bc_rare stays below the dense gate so the sparse combo hits the fallback.
   const int32_t rareMax =
       numDocs / BooleanQuery::ConjunctionBulkScorer::kDenseThresholdInverse - 1;
@@ -1035,7 +1035,7 @@ TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
 }
 
 TEST_F(BooleanFuzzTest, mandOptBulkCountMatchesPullOnMixedBlockShapes) {
-  const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
+  const int32_t numDocs = 2 * DocsEnumMeta::L1_DOCS + 513;
   std::vector<Doc> docs;
   docs.reserve((size_t) numDocs);
   for (int32_t doc = 0; doc < numDocs; doc++) {
@@ -1043,7 +1043,7 @@ TEST_F(BooleanFuzzTest, mandOptBulkCountMatchesPullOnMixedBlockShapes) {
     if ((doc % 17) == 0) body += " bm_mand_sparse";
     if ((doc % 4) != 1) body += " bm_opt_word";
     if ((doc % 10) == 0) body += " bm_opt_packed";
-    if (doc < DocsEnum::L1_DOCS && (doc % 257) == 17) body += " bm_opt_tail";
+    if (doc < DocsEnumMeta::L1_DOCS && (doc % 257) == 17) body += " bm_opt_tail";
     body += " filler";
     docs.push_back(flatdoc("id", "bm" + std::to_string(doc), "body_w", body));
   }

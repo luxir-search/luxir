@@ -404,18 +404,18 @@ public:
         fieldReader.readFieldInfo(segFieldInfo);
         TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
         while (tenum.nextTerm()) {
-          DocsEnum denum(tenum);
+          DocsOnlyEnum denum(tenum);
           int64_t count = 0;
           if (domain && domainCard < denum.numDocs()) {
             // Domain smaller than this term's postings: drive from the domain and
-            // advance() the DocsEnum, so it can skip whole doc blocks (a big win
+            // advance() the postings enum, so it can skip whole doc blocks (a big win
             // for a common term vs a narrow domain once postings skip data lands;
             // already a win for an array domain by avoiding a get() per term doc,
             // and neutral for a bitset domain, before skip data).  advance() is
             // forward-only, so only call it when the enum is behind the target.
             if (domainArr) {
               for (int32_t dd : domainArr->docs()) {
-                if (denum.docId() < dd && denum.advance(dd) == DocsEnum::END) break;
+                if (denum.docId() < dd && denum.advance(dd) == DocsEnumMeta::END) break;
                 if (denum.docId() == dd) count++;
               }
             } else {
@@ -424,14 +424,14 @@ public:
               while (dd + 1 < maxDoc) {
                 dd = domainBits->nextSetBit(dd + 1);
                 if (dd >= maxDoc) break;
-                if (denum.docId() < dd && denum.advance(dd) == DocsEnum::END) break;
+                if (denum.docId() < dd && denum.advance(dd) == DocsEnumMeta::END) break;
                 if (denum.docId() == dd) count++;
               }
             }
           } else {
             // Dense or null domain: walk the term's postings and probe the domain
             // (O(1) bitset get, binary search for an array domain, all docs if null).
-            for (int32_t doc = denum.nextDoc(); doc != DocsEnum::END; doc = denum.nextDoc()) {
+            for (int32_t doc = denum.nextDoc(); doc != DocsEnumMeta::END; doc = denum.nextDoc()) {
               if (domainBits) {
                 if (!domainBits->get(doc)) continue;
               } else if (domainArr && !domainArr->get(doc)) {

@@ -63,7 +63,7 @@ std::vector<std::pair<int32_t, uint32_t>> queryScores(IndexReader& reader,
   Query::Weight* weight = query.createWeight(context, Query::NEED_SCORES);
   Query::Scorer* scorer = weight->createScorer(pool, reader.segments()[0]);
   std::vector<std::pair<int32_t, uint32_t>> out;
-  for (int32_t doc = scorer->next(); doc != DocsEnum::END; doc = scorer->next()) {
+  for (int32_t doc = scorer->next(); doc != DocsEnumMeta::END; doc = scorer->next()) {
     out.emplace_back(doc, std::bit_cast<uint32_t>(scorer->score()));
   }
   return out;
@@ -117,7 +117,7 @@ TEST_F(BlockBoundsTest, sourceWalkGeometryAndQueryIdentity) {
   MemPool pool;
   TermsEnum terms(pool, attached.segments()[0].postingsReader(), info);
   ASSERT_TRUE(terms.seek("common"));
-  DocsEnum docs(terms);
+  DocsOnlyEnum docs(terms);
   EXPECT_EQ(terms.ord(), docs.termOrd());
   auto view = bounds->find(docs.termOrd());
   ASSERT_TRUE(view);
@@ -133,7 +133,7 @@ TEST_F(BlockBoundsTest, sourceWalkGeometryAndQueryIdentity) {
         similarity.k1, similarity.b, SmallFloat::decodeLengthByte((uint8_t) norm),
         bounds->envelopeAvgdl());
   }
-  DocsEnum::GroupImpacts groups;
+  DocsEnumMeta::GroupImpacts groups;
   docs.readGroupImpacts(groups);
   ASSERT_EQ(groups.lastDocs.size(), (size_t) view.groupCount());
   for (int32_t g = 0; g < view.groupCount(); g++) {
@@ -147,7 +147,7 @@ TEST_F(BlockBoundsTest, sourceWalkGeometryAndQueryIdentity) {
     }
   }
   int32_t block = 0;
-  DocsEnum::GroupBlockImpactScratch scratch;
+  DocsEnumMeta::GroupBlockImpactScratch scratch;
   for (int32_t g = 0; g < view.groupCount(); g++) {
     docs.visitGroupBlockImpacts(
         g, groups.bodyOffsets[(size_t) g], groups.baseLastDocs[(size_t) g], scratch,
@@ -270,7 +270,7 @@ TEST_F(BlockBoundsTest, boostGuardsAndGeometryStateAreIndependent) {
   MemPool pool;
   TermsEnum terms(pool, reader.segments()[0].postingsReader(), info);
   ASSERT_TRUE(terms.seek("common"));
-  DocsEnum docs(terms);
+  DocsOnlyEnum docs(terms);
   auto* field = reader.segments()[0].blockBounds(fixture.field);
   ASSERT_NE(nullptr, field);
   auto view = field->find(docs.termOrd());

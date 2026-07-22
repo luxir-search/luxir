@@ -112,7 +112,8 @@ public:
         // term doesn't exist in any segment
         return nullptr;
       }
-      solux::DocsEnum* docsEnum = cachedTermInfo->useDocsEnum(targetPool, segment);
+      solux::DocsFreqEnum* docsEnum = cachedTermInfo->useDocsEnum<DocsEnumTier::FREQS>(
+          targetPool, segment);
       if (docsEnum == nullptr) {
         // term doesn't exist in this segment
         return nullptr;
@@ -195,7 +196,7 @@ public:
 
   class Scorer final : public Query::Scorer {
   public:
-    solux::DocsEnum& docsEnum;
+    solux::DocsFreqEnum& docsEnum;
     // Both absent when scores are not needed; score() is 0. Text fields use
     // normsIter; non-text term queries keep the existing column-backed lookup.
     std::optional<solux::NormsReader::Iterator> normsIter;
@@ -227,26 +228,26 @@ public:
     int32_t competitiveUpTo = PostingsReader::END;
     float competitiveBound = 0.0f;
 
-    Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+    Scorer(solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, nullptr, nullptr, simScorer, boost,
                      useFrontierBound) {
     }
 
-    Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+    Scorer(solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::IntColReader* valueReader, solux::Similarity::BM25Scorer* simScorer,
            float boost = 1.0f, bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, valueReader, nullptr, simScorer, boost,
                      useFrontierBound) {}
 
-    Scorer(solux::DocsEnum& docsEnum, solux::OrdColReader* ordReader,
+    Scorer(solux::DocsFreqEnum& docsEnum, solux::OrdColReader* ordReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
             : Scorer(docsEnum, nullptr, nullptr, ordReader, simScorer, boost,
                      useFrontierBound) {}
 
-    Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+    Scorer(solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::IntColReader* valueReader, solux::OrdColReader* ordReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
@@ -264,14 +265,14 @@ public:
       competitiveBound = std::numeric_limits<float>::infinity();
     }
 
-    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+    Scorer(solux::MemPool& pool, solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true, BlockBounds::TermView sidecar = {})
             : Scorer(docsEnum, normsReader, simScorer, boost, useFrontierBound) {
       buildImpacts(pool, normsReader != nullptr, useFrontierBound, sidecar);
     }
 
-    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+    Scorer(solux::MemPool& pool, solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::IntColReader* valueReader, solux::Similarity::BM25Scorer* simScorer,
            float boost = 1.0f, bool useFrontierBound = true,
            BlockBounds::TermView sidecar = {})
@@ -280,7 +281,7 @@ public:
                    useFrontierBound, sidecar);
     }
 
-    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum,
+    Scorer(solux::MemPool& pool, solux::DocsFreqEnum& docsEnum,
            solux::OrdColReader* ordReader, solux::Similarity::BM25Scorer* simScorer,
            float boost = 1.0f, bool useFrontierBound = true,
            BlockBounds::TermView sidecar = {})
@@ -410,7 +411,7 @@ public:
       return (1ULL << bits) - 1ULL;
     }
 
-    static uint64_t probeWord(const DocsEnum::ScoredWordProbe& probe, int32_t wordIndex) {
+    static uint64_t probeWord(const DocsFreqEnum::ScoredWordProbe& probe, int32_t wordIndex) {
       assert(probe.numWords > 0);
       assert(wordIndex >= 0 && wordIndex < probe.numWords);
       uint64_t word;
@@ -418,8 +419,8 @@ public:
       return word;
     }
 
-    static void advanceRankCursorToWord(const DocsEnum::ScoredWordProbe& probe,
-                                        DocsEnum::ScoredWordProbe::RankCursor& cursor,
+    static void advanceRankCursorToWord(const DocsFreqEnum::ScoredWordProbe& probe,
+                                        DocsFreqEnum::ScoredWordProbe::RankCursor& cursor,
                                         int32_t wordIndex) {
       assert(cursor.wordIndex <= wordIndex);
       while (cursor.wordIndex < wordIndex) {
@@ -428,8 +429,8 @@ public:
       }
     }
 
-    static void findProbeLandingGEQ(const DocsEnum::ScoredWordProbe& probe, int32_t target,
-                                    DocsEnum::ScoredWordProbe::RankCursor cursor,
+    static void findProbeLandingGEQ(const DocsFreqEnum::ScoredWordProbe& probe, int32_t target,
+                                    DocsFreqEnum::ScoredWordProbe::RankCursor cursor,
                                     int32_t& landing, int32_t& ordAfter) {
       assert(probe.numWords > 0);
       assert(target >= (int32_t) probe.docBase);
@@ -481,7 +482,7 @@ public:
       while (i < size) {
         int32_t target = docs[i];
         if (current < target) {
-          DocsEnum::ScoredWordProbe probe;
+          DocsFreqEnum::ScoredWordProbe probe;
           if (docsEnum.advanceOrBeginScoredWordProbe(target, probe)) {
             assert(target >= (int32_t) probe.docBase);
             assert(target <= probe.blockLast);
@@ -520,7 +521,7 @@ public:
               // forward. That popcounts each completed 64-doc word at most
               // once per block sweep instead of recomputing the ordinal from
               // word zero for every hit.
-              DocsEnum::ScoredWordProbe::RankCursor cursor = {
+              DocsFreqEnum::ScoredWordProbe::RankCursor cursor = {
                 0, probe.blockStartOrd
               };
               while (i < size && docs[i] <= probe.blockLast) {
@@ -563,7 +564,7 @@ public:
             }
 
             // A begun probe has consumed the stream past this block, and no
-            // normal DocsEnum method is legal until it is finished. Always
+            // normal postings-enum method is legal until it is finished. Always
             // close it before returning to the max-score window planner, which
             // reads docId() for the next window and may promote this same term
             // to the essential fillScoreBlock side. If the candidate buffer
@@ -740,7 +741,7 @@ public:
       return true;
     }
 
-    DocsEnum* windowFilterProbeDocsEnum() override {
+    DocsFreqEnum* windowFilterProbeDocsEnum() override {
       return &docsEnum;
     }
 
@@ -992,7 +993,7 @@ public:
   };
 
   class TermBulkScorer final : public BulkScorer {
-    static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+    static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     static constexpr int32_t kWindowWords = kWindowSize / 64;
     static_assert((kWindowSize % 64) == 0);
 

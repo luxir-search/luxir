@@ -75,8 +75,10 @@ protected:
     return total;
   }
 
-  void verifyField(TestIndex& index, std::string_view field, const Oracle& oracle,
-                   bool hasFreqs, bool hasPositions) {
+  template<DocsEnumTier Tier>
+  void verifyFieldTier(TestIndex& index, std::string_view field, const Oracle& oracle,
+                       bool hasFreqs) {
+    constexpr bool hasPositions = Tier == DocsEnumTier::POSITIONS;
     ASSERT_EQ(1u, index.reader->segments().size());
     Segment& segment = index.reader->segments()[0];
     FieldReader fieldReader(index.pool, segment.postingsReader());
@@ -93,9 +95,9 @@ protected:
     for (const auto& [term, postings] : oracle) {
       ASSERT_TRUE(terms.nextTerm()) << field << " missing " << term;
       ASSERT_EQ(term, std::string_view(terms.term())) << field;
-      DocsEnum docs(terms);
+      BasicDocsEnum<Tier> docs(terms);
       std::unique_ptr<PosEnum> posEnum;
-      if (hasPositions) {
+      if constexpr (hasPositions) {
         posEnum = std::make_unique<PosEnum>(docs);
       }
       ASSERT_EQ((int32_t) postings.size(), docs.numDocs()) << field << " " << term;
@@ -110,7 +112,7 @@ protected:
         ASSERT_EQ(posting.doc, docs.nextDoc()) << field << " " << term;
         int32_t tf = hasFreqs ? (int32_t) posting.positions.size() : 1;
         ASSERT_EQ(tf, docs.termFreq()) << field << " " << term << " doc " << posting.doc;
-        if (hasPositions) {
+        if constexpr (hasPositions) {
           posEnum->startPositions();
           for (int32_t position : posting.positions) {
             ASSERT_EQ(position, posEnum->nextPosition())
@@ -119,13 +121,22 @@ protected:
           ASSERT_EQ(PosEnum::END, posEnum->nextPosition());
         }
       }
-      ASSERT_EQ(DocsEnum::END, docs.nextDoc()) << field << " " << term;
+      ASSERT_EQ(DocsEnumMeta::END, docs.nextDoc()) << field << " " << term;
       sumDf += (int64_t) postings.size();
       sumTtf += ttf;
     }
     ASSERT_FALSE(terms.nextTerm()) << field;
     ASSERT_EQ(sumDf, fieldInfo.sumDocFreq) << field;
     ASSERT_EQ(sumTtf, fieldInfo.sumTotalTermFreq) << field;
+  }
+
+  void verifyField(TestIndex& index, std::string_view field, const Oracle& oracle,
+                   bool hasFreqs, bool hasPositions) {
+    if (hasPositions) {
+      verifyFieldTier<DocsEnumTier::POSITIONS>(index, field, oracle, hasFreqs);
+    } else {
+      verifyFieldTier<DocsEnumTier::FREQS>(index, field, oracle, hasFreqs);
+    }
   }
 
   void buildOracle(TestIndex& index, const std::vector<std::string>& bodies,
@@ -148,12 +159,12 @@ protected:
         std::string_view term(terms.term());
         if (!term.starts_with("uid")) continue;
         int32_t sourceId = (int32_t) std::stoi(std::string(term.substr(3)));
-        DocsEnum docs(terms);
+        DocsOnlyEnum docs(terms);
         int32_t localDoc = docs.nextDoc();
-        ASSERT_NE(DocsEnum::END, localDoc);
+        ASSERT_NE(DocsEnumMeta::END, localDoc);
         ASSERT_EQ(-1, sourceIds[(size_t) localDoc]);
         sourceIds[(size_t) localDoc] = sourceId;
-        ASSERT_EQ(DocsEnum::END, docs.nextDoc());
+        ASSERT_EQ(DocsEnumMeta::END, docs.nextDoc());
       }
 
       LiveDocs* liveDocs = segment.liveDocs();
@@ -369,7 +380,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   sourceFields.readFieldInfo(sourceInfo);
   TermsEnum sourceTerms(pool, sourceReader, sourceInfo);
   ASSERT_TRUE(sourceTerms.nextTerm());
-  DocsEnum sourceDocs(sourceTerms);
+  DocsPosEnum sourceDocs(sourceTerms);
   PosEnum sourcePositions(sourceDocs);
   ASSERT_EQ(0, sourceDocs.nextDoc());
   ASSERT_EQ(3, sourceDocs.termFreq());
@@ -407,7 +418,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   targetFields.readFieldInfo(targetInfo);
   TermsEnum targetTerms(pool, targetReader, targetInfo);
   ASSERT_TRUE(targetTerms.nextTerm());
-  DocsEnum targetDocs(targetTerms);
+  DocsPosEnum targetDocs(targetTerms);
   PosEnum targetPositions(targetDocs);
   ASSERT_EQ(0, targetDocs.nextDoc());
   ASSERT_EQ(3, targetDocs.termFreq());
