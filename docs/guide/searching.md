@@ -242,8 +242,8 @@ full fusion operation with several ranked sources.
 
 ## Request-level controls
 
-Request-wide settings require the full form because the shorthand root is a
-`top_docs` message:
+Request-wide settings work in both body forms - alongside `ops` in the full
+form, or mixed directly with query keys at the shorthand root:
 
 ```json
 {
@@ -257,6 +257,14 @@ Request-wide settings require the full form because the shorthand root is a
   }
 }
 ```
+
+```json
+{"query": "published_dt:>=NOW/DAY", "limit": 10, "time_zone": "America/Denver", "max_parallel": 1}
+```
+
+In the shorthand, an `ops` key holds the query's sub-operations (facets and
+metrics over its result domain), exactly as it does inside a full-form
+`top_docs`.
 
 `freshness_us` bounds how stale an index view may be; `0` requires the latest
 commit. `time_zone` supplies the civil frame for every date query and facet in

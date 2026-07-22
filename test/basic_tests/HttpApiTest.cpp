@@ -185,6 +185,25 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
       response.body());
 }
 
+TEST_F(HttpApiTest, shorthandCarriesRequestLevelKeys) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"sh1","http_sh_s":"x","title_w":"dune saga"},{"id":"sh2","http_sh_s":"y","title_w":"dune"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  // request-level keys (max_parallel, time_zone) mix with shorthand TopDocs keys
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+      R"({"query":"title_w:dune","limit":0,"get_number":true,"max_parallel":-1,"time_zone":"UTC"})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("found":2)"), std::string::npos) << res.body();
+
+  // "ops" beside shorthand keys = the op's sub-ops (facets over the query domain)
+  auto facet = httpRequest(port(), http::verb::post, "/collections/main/_query",
+      R"({"query":"title_w:dune","limit":0,"max_parallel":1,"ops":{"cats":{"field_facet":{"field":"http_sh_s","limit":-1}}}})");
+  ASSERT_EQ(200, facet.result_int()) << facet.body();
+  EXPECT_NE(facet.body().find(R"("buckets":[{"val":"x","count":1},{"val":"y","count":1}])"),
+            std::string::npos) << facet.body();
+}
+
 TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"mp1","http_mp_s":"x"},{"id":"mp2","http_mp_s":"x"},{"id":"mp3","http_mp_s":"y"}],"commit":{}})");

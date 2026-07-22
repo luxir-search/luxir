@@ -63,6 +63,45 @@ TEST(JsonDialect, ValReadsUntagged) {
     EXPECT_EQ(std::get<std::string_view>((**m.fields.find("b")).kind), "x"); }
 }
 
+TEST(JsonDialect, SearchRequestUnifiedRoot) {
+  std::pmr::monotonic_buffer_resource mr;
+
+  // full form: ops binds to the request
+  { P::SearchRequest r;
+    ASSERT_TRUE(P::read_json(r, R"({"ops":{"a":{"top_docs":{"limit":3}}},"time_zone":"UTC"})", mr));
+    ASSERT_EQ(1u, r.ops.size());
+    EXPECT_EQ(3, *std::get<P::TopDocs>((**r.ops.find("a")).kind).limit);
+    EXPECT_EQ("UTC", r.time_zone); }
+
+  // shorthand: root TopDocs keys register as ops["q"]; request-level keys mix in
+  { P::SearchRequest r;
+    ASSERT_TRUE(P::read_json(r,
+        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","get_number":true})", mr));
+    EXPECT_EQ(-1, r.max_parallel);
+    EXPECT_EQ("UTC", r.time_zone);
+    ASSERT_EQ(1u, r.ops.size());
+    const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
+    EXPECT_EQ(5, *td.limit);
+    EXPECT_TRUE(td.get_number);
+    ASSERT_TRUE(td.query.has_value());
+    EXPECT_EQ("title_w:dune", std::get<P::ExprQuery>(td.query->kind).q); }
+
+  // shorthand + "ops": ops are the shorthand op's SUB-ops (facets under the query)
+  { P::SearchRequest r;
+    ASSERT_TRUE(P::read_json(r,
+        R"({"ops":{"cats":{"field_facet":{"field":"cat_s"}}},"query":"title_w:dune"})", mr));
+    ASSERT_EQ(1u, r.ops.size());
+    const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
+    ASSERT_EQ(1u, td.ops.size());
+    EXPECT_EQ("cat_s", std::get<P::FieldFacet>((**td.ops.find("cats")).kind).field); }
+
+  // unknown root key stays a strict error in every form
+  { P::SearchRequest r;
+    EXPECT_FALSE(P::read_json(r, R"({"query":"title_w:dune","limt":10})", mr)); }
+  { P::SearchRequest r;
+    EXPECT_FALSE(P::read_json(r, R"({"ops":{},"bogus":1})", mr)); }
+}
+
 TEST(JsonDialect, ValWritesUntagged) {
   std::pmr::monotonic_buffer_resource mr;
   P::Val v;

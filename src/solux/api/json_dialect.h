@@ -500,4 +500,106 @@ struct to<JSON, solux::api::Val> {
   }
 };
 
+// ----- SearchRequest: full form, root top_docs shorthand, or both at one root -----
+// Read accepts request-level keys (request_id, collection, ops, freshness_us,
+// time_zone, response_format, profile, max_parallel) and TopDocs keys mixed at
+// the root: any TopDocs key lazily creates the shorthand op, registered as
+// ops["q"]. "ops" is ambiguous until the scan ends - it is SearchRequest.ops in
+// the full form but the shorthand op's SUB-ops once any TopDocs key appears -
+// so it parses into value.ops and moves to the shorthand op at the end (both
+// sides are the same map type). Unknown keys error in one strict pass; writes
+// stay canonical (echo mode always shows the full form).
+//
+// The two key lists hand-mirror the message definitions; a field added to
+// SearchRequest or TopDocs in the proto must be added here or shorthand
+// requests carrying it fail with unknown_key (strict, so the gap is loud).
+template <>
+struct from<JSON, solux::api::SearchRequest> {
+  template <auto Opts>
+  static void op(solux::api::SearchRequest &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    namespace api = solux::api;
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    api::SearchOp *shorthandOp = nullptr;
+    api::TopDocs *td = nullptr;
+    auto shorthand = [&]() -> api::TopDocs & {
+      if (td == nullptr) {
+        void *addr = ctx.memory_resource().allocate(sizeof(api::SearchOp), alignof(api::SearchOp));
+        shorthandOp = new (addr) api::SearchOp();
+        td = &shorthandOp->kind.template emplace<api::TopDocs>();
+      }
+      return *td;
+    };
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          // request-level keys
+          if (key == "request_id") {
+            util::from_json<O>(value.request_id, ctx, vit, vend);
+          } else if (key == "collection") {
+            util::from_json<O>(value.collection, ctx, vit, vend);
+          } else if (key == "ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "freshness_us") {
+            util::from_json<O>(value.freshness_us, ctx, vit, vend);
+          } else if (key == "time_zone") {
+            util::from_json<O>(value.time_zone, ctx, vit, vend);
+          } else if (key == "response_format") {
+            util::from_json<O>(value.response_format, ctx, vit, vend);
+          } else if (key == "profile") {
+            util::from_json<O>(value.profile, ctx, vit, vend);
+          } else if (key == "max_parallel") {
+            util::from_json<O>(value.max_parallel, ctx, vit, vend);
+          // shorthand top_docs keys
+          } else if (key == "query") {
+            from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+                shorthand().query, ctx, vit, vend);
+          } else if (key == "filter") {
+            decltype(auto) filter = ::hpp_proto::detail::as_modifiable(ctx, shorthand().filter);
+            glz::util::parse_repeated<O>(false, filter, ctx, vit, vend);
+          } else if (key == "offset") {
+            util::from_json<O>(shorthand().offset, ctx, vit, vend);
+          } else if (key == "limit") {
+            util::from_json<O>(shorthand().limit, ctx, vit, vend);
+          } else if (key == "fields") {
+            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, shorthand().fields);
+            glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+          } else if (key == "sorts") {
+            decltype(auto) sorts = ::hpp_proto::detail::as_modifiable(ctx, shorthand().sorts);
+            glz::util::parse_repeated<O>(false, sorts, ctx, vit, vend);
+          } else if (key == "batch_size") {
+            util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
+          } else if (key == "document_format") {
+            util::from_json<O>(shorthand().document_format, ctx, vit, vend);
+          } else if (key == "get_number") {
+            util::from_json<O>(shorthand().get_number, ctx, vit, vend);
+          } else if (key == "get_scores") {
+            util::from_json<O>(shorthand().get_scores, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+    if (td == nullptr) {
+      return;
+    }
+    // Shorthand: whatever "ops" carried belongs to the op (sub-ops), and the
+    // request's ops map becomes the single shorthand entry.  Runs regardless
+    // of ctx.error: the scan can end with the benign end-of-input sentinel
+    // set (the root '}' is often the last byte), and on a real error the
+    // caller discards the request - packaging is arena-only either way.
+    td->ops = value.ops;
+    using OpPair = std::pair<std::string_view, ::hpp_proto::indirect_view<api::SearchOp>>;
+    void *addr = ctx.memory_resource().allocate(sizeof(OpPair), alignof(OpPair));
+    auto *pair = new (addr) OpPair{"q", ::hpp_proto::indirect_view<api::SearchOp>(shorthandOp)};
+    value.ops = api::map_view<std::string_view, ::hpp_proto::indirect_view<api::SearchOp>>(
+        std::span<const OpPair>(pair, 1));
+  }
+};
+
 } // namespace glz

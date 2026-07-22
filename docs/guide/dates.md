@@ -56,12 +56,11 @@ give it a civil frame:
 ```
 POST /collections/main/_query
 {"time_zone": "America/Denver",
- "ops": {"q": {"top_docs": {"query":
-   {"range": {"field": "when_dt", "gte": "NOW/DAY"}}}}}}
+ "query": {"range": {"field": "when_dt", "gte": "NOW/DAY"}}}
 ```
 
-(`time_zone` is a request-level setting, so it needs the full `ops` request
-form rather than the single-query shorthand.)
+(`time_zone` is a request-level setting; it mixes directly with query keys in
+the shorthand shown here, and sits beside `ops` in the full request form.)
 
 The zone can be an IANA name (case-sensitive) or a fixed offset such as
 `+05:30`. It changes three things:
