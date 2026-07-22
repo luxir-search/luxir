@@ -12,7 +12,6 @@
 #include "solux/index/IndexRamBudget.h"
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
-#include <boost/asio/thread_pool.hpp>
 #include "solux/search/SearchEngine.h"
 #include "solux/SoluxConfig.h"
 #include "solux/util/SharedLazyMap.h"
@@ -179,12 +178,6 @@ public:
     return taskArena;
   }
 
-  // Serial-search executor: max_parallel=1 requests run here.  Plain threads,
-  // not a TBB arena - see ServerConfig::search_threads for why.
-  boost::asio::thread_pool& getSearchPool() {
-    return searchPool;
-  }
-
   IndexRamBudget& getIndexRamBudget() {
     return indexRamBudget;
   }
@@ -210,7 +203,6 @@ private:
   std::unique_ptr<DirectoryFactory> dirFactory;
 
   oneapi::tbb::task_arena taskArena;
-  boost::asio::thread_pool searchPool;
 };
 
 }

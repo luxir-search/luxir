@@ -1,8 +1,6 @@
 #include "SearchEngine.h"
 #include "ProtobufSearchParser.h"
 
-#include <boost/asio/post.hpp>
-
 namespace solux {
 
 void SearchEngine::submitBody(SearchRequest& req) {
@@ -77,9 +75,11 @@ void SearchEngine::submitBody(SearchRequest& req) {
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
   if (maxParallel == -1) {
     submit(req, maxParallel);
-  } else if (maxParallel == 1) {
-    boost::asio::post(node.getSearchPool(), [this, &req] { submit(req, 1); });
   } else {
+    // 0 and 1 both run on the shared arena; 1 just skips the task_group, so
+    // "don't parallelize me" never moves the request outside the TBB-governed
+    // thread set (a second executor would contend with arena work the market
+    // cannot see).  -1 is the no-scheduler lane when that isolation matters.
     node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
   }
 }

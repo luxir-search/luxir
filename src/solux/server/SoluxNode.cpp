@@ -180,8 +180,7 @@ bool Collection::loadSchema() {
 
 SoluxNode::SoluxNode(SoluxConfig config)
   : config(std::move(config)),
-    indexRamBudget(this->config.index.max_index_ram_mb * 1024 * 1024),
-    searchPool((size_t)this->config.server.resolveSearchThreads()) {
+    indexRamBudget(this->config.index.max_index_ram_mb * 1024 * 1024) {
   preWarmTimeZoneDatabase();
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
