@@ -215,6 +215,11 @@ struct CachedFieldInfo {
 
 
 // NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
+// Scored TOP_k filter routing crossover, shared by the boolean window-mask
+// gate and the filter cache's scored-route gate: below maxDoc/this the pull
+// side (filter leads) wins. Measured on the 5M sweep: 1% filter density.
+inline constexpr int64_t kMaskFilterDensityInverse = 32;
+
 class Query {
 public:
   class Context;

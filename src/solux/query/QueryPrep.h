@@ -622,6 +622,19 @@ inline Query::ScorerSupplier* filterSupplier(
     return source.scorerSupplier(targetPool, segment);
   }
 
+  // Density gates routing here just as it does for uncached filters: below
+  // the mask crossover the landed pull/wand formation owns the regime, and a
+  // cached set displacing it measures 7-16% slower on the 5M sweep. Gate on
+  // the supplier's own cost estimate BEFORE any cache traffic so the sparse
+  // scored path pays no probe and no build; the same estimate feeds
+  // filterDensityRoutesToPull. Sparse entries still populate through the
+  // facet/domain consumers, which serve them at any density.
+  auto* uncached = source.scorerSupplier(targetPool, segment);
+  if (uncached == nullptr || uncached->cost()
+      < segment.maxDoc() / kMaskFilterDensityInverse) {
+    return uncached;
+  }
+
   auto probe = use->probe((size_t) segment.ord);
   std::shared_ptr<const FilterCache::SegmentValue> value;
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
@@ -630,7 +643,7 @@ inline Query::ScorerSupplier* filterSupplier(
     auto raw = materializeRawFilter(weight, prepared, segment);
     value = use->publishRaw((size_t) segment.ord, probe, std::move(raw));
   } else {
-    return source.scorerSupplier(targetPool, segment);
+    return uncached;
   }
 
   DocSet* effective = use->effectiveDocSet(

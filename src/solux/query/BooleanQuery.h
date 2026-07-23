@@ -414,7 +414,7 @@ public:
   // route degenerates toward an unpruned scored scan and the pull conjunction
   // (filter leads) wins. Measured crossover on the 5M sweep: 1% filter
   // (journalist) wants pull, 10% (city) wants mask.
-  static constexpr int64_t kMaskFilterDensityInverse = 32;
+  static constexpr int64_t kMaskFilterDensityInverse = solux::kMaskFilterDensityInverse;
   // Relative cost of one monotonic filter advance vs streaming one filter
   // posting. Probe when leadCost * this weight is below filterCost.
   static constexpr int64_t kMaskProbeAdvanceWeight = 6;

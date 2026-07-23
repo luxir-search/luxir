@@ -1148,11 +1148,11 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   for (int32_t i = 0; i < 1000; i++) {
     firstPhase.push_back(solux::test::flatdoc(
         "id", "old-" + std::to_string(i), "body_w", "body",
-        "filter_w", i < 17 ? "keep" : "drop"));
+        "filter_w", i < 50 ? "keep" : "drop"));
   }
   ASSERT_TRUE(helper.indexAll(firstPhase, UpdateMessage::COMMIT).success);
-  EXPECT_EQ(17, runCachedSearch(node, collection, "keep").count);
-  EXPECT_EQ(17, runCachedSearch(node, collection, "keep").count);
+  EXPECT_EQ(50, runCachedSearch(node, collection, "keep").count);
+  EXPECT_EQ(50, runCachedSearch(node, collection, "keep").count);
   ASSERT_GT(firstCache->counters().readerStableHits
                 + firstCache->counters().hits,
             0u);
@@ -1173,7 +1173,7 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   std::vector<std::string> expectedIds;
   secondPhase.reserve(1000);
   for (int32_t i = 0; i < 1000; i++) {
-    bool keep = i >= 977;
+    bool keep = i >= 950;
     std::string id = "new-" + std::to_string(i);
     secondPhase.push_back(solux::test::flatdoc(
         "id", id, "body_w", "body",
@@ -1184,7 +1184,7 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   ASSERT_TRUE(helper.indexAll(secondPhase, UpdateMessage::COMMIT).success);
   auto actual = runCachedSearch(node, collection, "keep");
   EXPECT_EQ(expectedIds, actual.ids);
-  EXPECT_EQ(23, actual.count);
+  EXPECT_EQ(50, actual.count);
   auto counters = secondCache->counters();
   EXPECT_GT(counters.misses, 0u);
   EXPECT_EQ(0u, counters.hits);
@@ -1497,6 +1497,14 @@ TEST(FilterCacheIntegrationTest, nestedKnnDomainDoesNotRecordAdmission) {
 }
 
 TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
+  // An ArrDocSet entry is by construction below the scored-route density
+  // crossover, so composition is observed through the op-level domain path,
+  // which serves cached entries at any density.
+  struct FoldGuard {
+    bool saved = TopDocsReq::disableTopDocsFilterFoldForTests;
+    FoldGuard() { TopDocsReq::disableTopDocsFilterFoldForTests = true; }
+    ~FoldGuard() { TopDocsReq::disableTopDocsFilterFoldForTests = saved; }
+  } foldGuard;
   SoluxConfig config;
   config.filterCacheBytes = 4 * 1024 * 1024;
   SoluxNode node(config);
