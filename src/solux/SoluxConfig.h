@@ -89,6 +89,12 @@ struct IngestConfig {
   int64_t stream_batch_size = 1 * 1024 * 1024;
   int64_t stream_batch_docs = 10000;
 
+  // Maximum number of streaming NDJSON batches submitted by one connection at
+  // once.  0 derives the window from the node task arena; 1 is strict serial
+  // batch submission.  Staging memory grows roughly with this window, and live
+  // inverter memory grows with min(window, arena concurrency).
+  int64_t max_inflight_batches = 0;
+
   // Effective per-record cap: max_record if set, else the buffered-body cap.
   int64_t maxRecordBytes() const { return max_record != 0 ? max_record : max_request_body; }
 

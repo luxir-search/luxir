@@ -543,7 +543,21 @@ private:
     }
 
     if (doneWithMessage) {
-      msg.done(*this);
+      try {
+        msg.done(*this);
+      } catch (const std::exception& e) {
+        try {
+          LOG_ERROR("finishUpdateBody completion threw: msg={} exception={}",
+                    (void*)&msg, e.what());
+        } catch (...) {
+        }
+      } catch (...) {
+        try {
+          LOG_ERROR("finishUpdateBody completion threw: msg={} unknown exception",
+                    (void*)&msg);
+        } catch (...) {
+        }
+      }
     }
   }
 

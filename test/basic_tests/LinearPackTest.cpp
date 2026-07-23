@@ -66,7 +66,7 @@ TEST(LinearPackTest, unpackMatchesSelectEveryUint32Width) {
 TEST(LinearPackTest, contiguousLittleEndianLayout) {
   std::vector<uint64_t> values = {1, 2, 3, 4};
   std::vector<char> encoded = packToBuffer(values, 3);
-  ASSERT_EQ(9, encoded.size());
+  ASSERT_EQ(2 + LinearPack::TAIL_PAD, encoded.size());
   EXPECT_EQ(0xd1, (uint8_t)encoded[0]);
   EXPECT_EQ(0x08, (uint8_t)encoded[1]);
   for (size_t i = 2; i < encoded.size(); i++) EXPECT_EQ(0, encoded[i]);

@@ -279,7 +279,7 @@ TEST(FilterCacheTest, publishHitsEmptyAndForcesCardinality) {
   auto probe = building->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
   EXPECT_EQ(0u, cache.counters().builds);
-  auto value = building->publishRaw(0, probe, docs(1024, {}));
+  auto value = building->publishRaw(0, probe, docs(1024, {}), 1);
   EXPECT_EQ(1u, cache.counters().builds);
   ASSERT_NE(nullptr, value);
   EXPECT_EQ(0, value->card());
@@ -298,7 +298,7 @@ TEST(FilterCacheTest, publishHitsEmptyAndForcesCardinality) {
   ASSERT_TRUE(lazyUse->wasAdmitted());
   auto lazyProbe = lazyUse->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, lazyProbe.kind());
-  auto lazyValue = lazyUse->publishRaw(0, lazyProbe, bitDocs(1024, 42));
+  auto lazyValue = lazyUse->publishRaw(0, lazyProbe, bitDocs(1024, 42), 1);
   EXPECT_EQ(1, lazyValue->card());
   EXPECT_EQ(1, lazyValue->docSet()->cachedCard());
 }
@@ -342,7 +342,7 @@ TEST(FilterCacheTest, publicationRevalidatesPurgeCoreAndIdentity) {
 
   std::array newSegments{FilterCache::SegmentIdentity{2, 100}};
   cache.onReaderPublished(5, newSegments);
-  auto local = oldUse->publishRaw(0, claim, docs(100, {3, 7}));
+  auto local = oldUse->publishRaw(0, claim, docs(100, {3, 7}), 1);
   EXPECT_EQ(2, local->card());
   EXPECT_EQ(0u, cache.bytesUsed());
   EXPECT_GE(cache.counters().publishRejects, 1u);
@@ -371,7 +371,7 @@ TEST(FilterCacheTest, oldSchemaPopulationCannotHitNewSchemaKey) {
   // request may still finish against the same reader snapshot.
   FilterCache::UseRegistry newRequest(cache, 4, segments);
   auto* newUse = newRequest.get(keyFor(query, 11));
-  oldUse->publishRaw(0, oldClaim, docs(100, {3, 7}));
+  oldUse->publishRaw(0, oldClaim, docs(100, {3, 7}), 1);
 
   EXPECT_NE(FilterCache::Probe::Kind::HIT, newUse->probe(0).kind());
 }
@@ -386,8 +386,8 @@ TEST(FilterCacheTest, byproductOfferIsFirstWins) {
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* cacheUse = request.get(key);
 
-  auto first = cacheUse->offerRaw(0, docs(100, {1, 2}));
-  auto second = cacheUse->offerRaw(0, docs(100, {9}));
+  auto first = cacheUse->offerRaw(0, docs(100, {1, 2}), 1);
+  auto second = cacheUse->offerRaw(0, docs(100, {9}), 1);
   EXPECT_EQ(2, first->card());
   EXPECT_EQ(2, second->card());
   EXPECT_EQ(1u, cache.counters().byproductInserts);
@@ -411,10 +411,10 @@ TEST(FilterCacheTest, fullBytesDefeatMapHashCollision) {
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* firstUse = request.get(first);
   auto firstProbe = firstUse->probe(0);
-  firstUse->publishRaw(0, firstProbe, docs(100, {1}));
+  firstUse->publishRaw(0, firstProbe, docs(100, {1}), 1);
   auto* secondUse = request.get(second);
   auto secondProbe = secondUse->probe(0);
-  secondUse->publishRaw(0, secondProbe, docs(100, {2}));
+  secondUse->publishRaw(0, secondProbe, docs(100, {2}), 1);
   EXPECT_EQ(2u, cache.entryCountForTest());
 
   FilterCache::UseRegistry hits(cache, 1, segments);
@@ -437,7 +437,7 @@ TEST(FilterCacheTest, entryCapRejectsAndMatchAllDoesNotPopulate) {
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* tooLarge = request.get(FilterKey("large"));
   auto tooLargeProbe = tooLarge->probe(0);
-  tooLarge->publishRaw(0, tooLargeProbe, docs(100, {1}));
+  tooLarge->publishRaw(0, tooLargeProbe, docs(100, {1}), 1);
   EXPECT_EQ(0u, cache.bytesUsed());
 
   config.maxEntryBytes = 1024 * 1024;
@@ -448,18 +448,18 @@ TEST(FilterCacheTest, entryCapRejectsAndMatchAllDoesNotPopulate) {
   auto allProbe = allUse->probe(0);
   DocSetBuilder builder(100);
   for (int32_t i = 0; i < 100; i++) builder.add(i);
-  allUse->publishRaw(0, allProbe, builder.build());
+  allUse->publishRaw(0, allProbe, builder.build(), 1);
   EXPECT_EQ(0u, allCache.bytesUsed());
 
   config.minSegmentDocs = 101;
   FilterCache tinyCache(config);
   tinyCache.onReaderPublished(1, segments);
   FilterCache::UseRegistry tinyRequest(tinyCache, 1, segments);
-  tinyRequest.get(FilterKey("tiny"))->offerRaw(0, docs(100, {1, 2}));
+  tinyRequest.get(FilterKey("tiny"))->offerRaw(0, docs(100, {1, 2}), 1);
   EXPECT_EQ(0u, tinyCache.bytesUsed());
 }
 
-TEST(FilterCacheTest, evictsPerSegmentToLowWatermarkAndPinsRetiredValue) {
+TEST(FilterCacheTest, evictsLowerBenefitDensityAndPinsRetiredValue) {
   auto sample = bitDocs(1024, 1);
   size_t charge = sample->ramBytesUsed();
   FilterCacheConfig config = testConfig();
@@ -470,15 +470,16 @@ TEST(FilterCacheTest, evictsPerSegmentToLowWatermarkAndPinsRetiredValue) {
   FilterCache cache(config);
   std::array segments{FilterCache::SegmentIdentity{1, 1024}};
   cache.onReaderPublished(1, segments);
-  FilterKey first("oldest");
-  FilterKey second("newest");
+  FilterKey first("cheap");
+  FilterKey second("expensive");
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* firstUse = request.get(first);
   auto firstProbe = firstUse->probe(0);
-  auto pinned = firstUse->publishRaw(0, firstProbe, std::move(sample));
+  auto pinned = firstUse->publishRaw(
+      0, firstProbe, std::move(sample), 10);
   auto* secondUse = request.get(second);
   auto secondProbe = secondUse->probe(0);
-  secondUse->publishRaw(0, secondProbe, bitDocs(1024, 2));
+  secondUse->publishRaw(0, secondProbe, bitDocs(1024, 2), 10'000);
 
   EXPECT_EQ(charge, cache.bytesUsed());
   EXPECT_EQ(1u, cache.counters().evictions);
@@ -486,6 +487,87 @@ TEST(FilterCacheTest, evictsPerSegmentToLowWatermarkAndPinsRetiredValue) {
   FilterCache::UseRegistry verify(cache, 1, segments);
   EXPECT_NE(FilterCache::Probe::Kind::HIT, verify.get(first)->probe(0).kind());
   EXPECT_EQ(FilterCache::Probe::Kind::HIT, verify.get(second)->probe(0).kind());
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, densityIncludesEffectiveResidencyForTinyPayloads) {
+  auto tiny = docs(4096, {1});
+  auto large = bitDocs(4096, 2);
+  size_t tinyCharge = tiny->ramBytesUsed();
+  size_t largeCharge = large->ramBytesUsed();
+  constexpr uint32_t TINY_COST = 100;
+  constexpr uint32_t LARGE_COST = 1000;
+  // Payload-only density ranks tiny first, which is the pathology this test
+  // excludes once fixed/value and per-entry residency are included.
+  ASSERT_GT((double) TINY_COST / (double) tinyCharge,
+            (double) LARGE_COST / (double) largeCharge);
+
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = largeCharge + 1;
+  config.maxBytes = tinyCharge + largeCharge - 1;
+  config.lowWatermarkBytes = largeCharge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  cache.onReaderPublished(1, segments);
+  FilterKey tinyKey("tiny-density");
+  FilterKey largeKey("wide-density");
+  ASSERT_EQ(tinyKey.bytes().capacity(), largeKey.bytes().capacity());
+
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* tinyUse = request.get(tinyKey);
+  auto tinyProbe = tinyUse->probe(0);
+  tinyUse->publishRaw(0, tinyProbe, std::move(tiny), TINY_COST);
+  auto* largeUse = request.get(largeKey);
+  auto largeProbe = largeUse->probe(0);
+  largeUse->publishRaw(0, largeProbe, std::move(large), LARGE_COST);
+
+  EXPECT_EQ(largeCharge, cache.bytesUsed());
+  EXPECT_EQ(1u, cache.counters().evictions);
+  FilterCache::UseRegistry verify(cache, 1, segments);
+  EXPECT_NE(FilterCache::Probe::Kind::HIT,
+            verify.get(tinyKey)->probe(0).kind());
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            verify.get(largeKey)->probe(0).kind());
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, inflationClockEventuallyAgesOutColdExpensiveValue) {
+  auto sample = bitDocs(1024, 1);
+  size_t charge = sample->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  FilterKey expensive("cold-expensive");
+
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(expensive);
+    auto probe = use->probe(0);
+    use->publishRaw(0, probe, std::move(sample), 100);
+  }
+
+  for (int i = 0; i < 12; i++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(
+        FilterKey("cheap-" + std::to_string(i)));
+    auto probe = use->probe(0);
+    use->publishRaw(0, probe, bitDocs(1024, i + 2), 9);
+  }
+
+  EXPECT_EQ(charge, cache.bytesUsed());
+  EXPECT_EQ(12u, cache.counters().evictions);
+  FilterCache::UseRegistry verify(cache, 1, segments);
+  EXPECT_NE(FilterCache::Probe::Kind::HIT,
+            verify.get(expensive)->probe(0).kind());
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            verify.get(FilterKey("cheap-11"))->probe(0).kind());
+  ASSERT_NO_THROW(cache.validateForTest());
 }
 
 TEST(FilterCacheTest, purgeDetachesButRequestPinSurvives) {
@@ -497,7 +579,7 @@ TEST(FilterCacheTest, purgeDetachesButRequestPinSurvives) {
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* cacheUse = request.get(FilterKey("pin"));
   auto probe = cacheUse->probe(0);
-  auto pinned = cacheUse->publishRaw(0, probe, docs(100, {8}));
+  auto pinned = cacheUse->publishRaw(0, probe, docs(100, {8}), 1);
   ASSERT_GT(cache.bytesUsed(), 0u);
 
   std::array replacement{FilterCache::SegmentIdentity{2, 100}};
@@ -538,7 +620,7 @@ TEST(FilterCacheTest, metadataBytesAreAccountedAndSweepNonemptyEntries) {
   auto* firstUse = firstRequest.get(first);
   auto firstProbe = firstUse->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, firstProbe.kind());
-  firstUse->publishRaw(0, firstProbe, docs(100, {1}));
+  firstUse->publishRaw(0, firstProbe, docs(100, {1}), 1);
   EXPECT_GT(cache.metadataBytesUsed(), first.bytes().size());
   EXPECT_GT(cache.bytesUsed(), 0u);
 
@@ -600,7 +682,7 @@ TEST(FilterCacheTest, largeKeyBelowCapAdmitsAndHits) {
   auto* use = populate.get(key);
   auto probe = use->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
-  use->publishRaw(0, probe, docs(100, {3, 7}));
+  use->publishRaw(0, probe, docs(100, {3, 7}), 1);
 
   EXPECT_EQ(1u, cache.entryCountForTest());
   EXPECT_GT(cache.metadataBytesUsed(), key.bytes().size());
@@ -627,7 +709,7 @@ TEST(FilterCacheTest, concurrentHitEvictAndPublish) {
       auto* cacheUse = request.get(key);
       auto probe = cacheUse->probe(0);
       if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
-        cacheUse->publishRaw(0, probe, bitDocs(4096, doc));
+        cacheUse->publishRaw(0, probe, bitDocs(4096, doc), 1);
       } else if (probe.kind() == FilterCache::Probe::Kind::HIT) {
         EXPECT_GT(probe.card(), 0);
       }
@@ -638,7 +720,7 @@ TEST(FilterCacheTest, concurrentHitEvictAndPublish) {
     }
     for (int i = 0; i < 500; i++) {
       FilterCache::UseRegistry request(cache, 1, segments);
-      request.get(key)->offerRaw(0, bitDocs(4096, 3));
+      request.get(key)->offerRaw(0, bitDocs(4096, 3), 1);
     }
   };
   auto evictor = [&] {
@@ -682,7 +764,7 @@ TEST(FilterCacheTest, concurrentPublicationsFinishBelowLowWatermark) {
       auto* use = request.get(FilterKey("parallel-" + std::to_string(i)));
       auto probe = use->probe(0);
       ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
-      use->publishRaw(0, probe, bitDocs(4096, i + 1));
+      use->publishRaw(0, probe, bitDocs(4096, i + 1), 1);
     });
   }
   start.store(true, std::memory_order_release);
@@ -810,7 +892,7 @@ TEST(FilterCacheTest, requestCachesLiveAndDomainCompositionsSeparately) {
       reader->segments()[0].segInfo.seg_id, reader->segments()[0].maxDoc()}};
   FilterCache::UseRegistry request(*cache, reader->coreGen(), identities);
   auto* use = request.get(FilterKey("domain-composition"));
-  auto raw = use->offerRaw(0, docs(3, {0, 1}));
+  auto raw = use->offerRaw(0, docs(3, {0, 1}), 1);
   auto domain = docs(3, {1, 2});
 
   DocSet* domainEffective = use->effectiveDocSet(
@@ -850,7 +932,7 @@ TEST(FilterCacheTest, readerStableUseRejectsRawByproductPublication) {
   auto* use = request.get(FilterKey("reader-live-exact"),
                           FilterKeyScope::READER_STABLE);
 
-  EXPECT_THROW(use->offerRaw(0, docs(32, {1, 3})), std::logic_error);
+  EXPECT_THROW(use->offerRaw(0, docs(32, {1, 3}), 1), std::logic_error);
   EXPECT_EQ(1u, cache.counters().publishRejects);
   EXPECT_EQ(0u, cache.bytesUsed());
 }
@@ -893,6 +975,74 @@ TEST(FilterCacheTest, readerProbeCountsDeferredBypassesAndMisses) {
   EXPECT_EQ(0u, cache->entryCountForTest());
 }
 
+TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addTermDoc(writer, "first");
+  addTermDoc(writer, "second");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto domains = canonicalDomains(*reader);
+
+  auto publishReader = [&](FilterCache& cache, const FilterKey& key,
+                           uint32_t buildCostMicros) {
+    FilterCache::UseRegistry request(cache, *reader);
+    auto* use = request.get(key, FilterKeyScope::READER_STABLE);
+    auto probe = use->probeReaderStable(*reader, domains);
+    EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
+    return use->publishReaderStable(
+        probe, oneDocPerSegment(*reader), buildCostMicros);
+  };
+  auto publishSegment = [&](FilterCache& cache, const FilterKey& key,
+                            uint32_t buildCostMicros) {
+    FilterCache::UseRegistry request(cache, *reader);
+    auto* use = request.get(key);
+    auto probe = use->probe(0);
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    return use->publishRaw(
+        0, probe, bitDocs(reader->segments()[0].maxDoc(), 0),
+        buildCostMicros);
+  };
+
+  FilterCacheConfig sizingConfig = testConfig();
+  sizingConfig.admissionThreshold = 1;
+  FilterCache sizing(sizingConfig);
+  sizing.onReaderPublished(*reader);
+  auto sizingReader = publishReader(
+      sizing, FilterKey("sizing-reader"), 1);
+  auto sizingSegment = publishSegment(
+      sizing, FilterKey("sizing-segment"), 1);
+  size_t readerCharge = sizingReader->ramBytesUsed();
+  size_t segmentCharge = sizingSegment->ramBytesUsed();
+
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = std::max(readerCharge, segmentCharge) + 1;
+  config.maxBytes = readerCharge + segmentCharge - 1;
+  config.lowWatermarkBytes = std::max(readerCharge, segmentCharge);
+  FilterCache cache(config);
+  cache.onReaderPublished(*reader);
+  FilterKey readerKey("reader-cheap");
+  FilterKey segmentKey("segment-expensive");
+  auto readerValue = publishReader(cache, readerKey, 1);
+  auto segmentValue = publishSegment(
+      cache, segmentKey, std::numeric_limits<uint32_t>::max());
+
+  EXPECT_EQ(segmentCharge, cache.bytesUsed());
+  EXPECT_EQ(1u, cache.counters().evictions);
+  EXPECT_EQ(0u, cache.counters().readerStableRetires);
+  EXPECT_NE(nullptr, readerValue);
+  EXPECT_NE(nullptr, segmentValue);
+  FilterCache::UseRegistry verify(cache, *reader);
+  EXPECT_NE(FilterCache::ReaderProbe::Kind::HIT,
+            verify.get(readerKey, FilterKeyScope::READER_STABLE)
+                ->probeReaderStable(*reader, domains).kind());
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            verify.get(segmentKey)->probe(0).kind());
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
 TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   SoluxConfig nodeConfig;
   nodeConfig.filterCacheBytes = 0;
@@ -918,7 +1068,8 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, residentClaim.kind());
   EXPECT_EQ(0u, cache->counters().builds);
   auto residentValue = residentUse->publishReaderStable(
-      residentClaim, oneDocPerSegment(*reader));
+      residentClaim, oneDocPerSegment(*reader),
+      std::numeric_limits<uint32_t>::max());
   EXPECT_EQ(1u, cache->counters().builds);
   EXPECT_THROW(residentValue->docSet(
       0, {reader->segments()[0].segInfo.seg_id + 1,
@@ -939,7 +1090,8 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   EXPECT_EQ(1u, cache->counters().readerStableRetires);
   EXPECT_EQ(entryIdentity, cache->entryIdentityForTest(residentKey));
 
-  lateUse->publishReaderStable(lateClaim, oneDocPerSegment(*reader));
+  lateUse->publishReaderStable(
+      lateClaim, oneDocPerSegment(*reader), 1);
   EXPECT_EQ(0u, cache->bytesUsed());
   EXPECT_EQ(1u, cache->counters().publishRejects);
   ASSERT_NO_THROW(cache->validateForTest());
@@ -988,7 +1140,7 @@ TEST(FilterCacheTest, readerPublishRaceCannotResurrectStaleValue) {
     start.arrive_and_wait();
     for (int i = 0; i < ENTRY_COUNT; i++) {
       uses[(size_t)i]->publishReaderStable(
-          claims[(size_t)i], oneDocPerSegment(*reader));
+          claims[(size_t)i], oneDocPerSegment(*reader), 1);
     }
   });
   std::thread publication([&] {
@@ -2175,7 +2327,7 @@ void validateConcurrentByproductPublication() {
         builder.add(tid + 1);
         auto raw = builder.build();
         phase.arrive_and_wait();
-        use->offerRaw(0, std::move(raw));
+        use->offerRaw(0, std::move(raw), 1);
         phase.arrive_and_wait();
         phase.arrive_and_wait();
       }
@@ -2233,7 +2385,7 @@ void validateStalePublicationRejection() {
   cache.onReaderPublished(7, replacement);
   DocSetBuilder builder(256);
   builder.add(3);
-  use->publishRaw(0, claim, builder.build());
+  use->publishRaw(0, claim, builder.build(), 1);
   cache.validateForTest();
   if (cache.bytesUsed() != 0) {
     throw std::logic_error(
@@ -2264,7 +2416,7 @@ void validateConcurrentSweepPurgeAccounting() {
     auto* use = request.get(FilterKey("sweep-purge-" + std::to_string(i)));
     DocSetBuilder builder(256);
     builder.add(i % 255);
-    use->offerRaw(0, builder.build());
+    use->offerRaw(0, builder.build(), 1);
   }
 
   std::atomic<bool> sweepStarted{false};

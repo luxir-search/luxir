@@ -215,12 +215,14 @@ public:
     writeSegmentInfo();
     // TODO: implement compound files for small files
 
-    // The StreamVByte AVX tail decoder used by postings iteration may read up to
+    // The StreamVByte AVX tail decoder used by postings iteration, and the
+    // LinearPack bulk decoder used by ord columns, may read up to
     // SVB_OVERREAD_PAD bytes past the encoded data. Reserve that slack at the end of
-    // every pure-data file so the read stays in bounds. File 0 ends with the field
-    // index and segment info just written above, which already provide far more
-    // trailing slack, so it is skipped. Padding past its segment-info size marker
-    // would also break the end-relative read in PostingsReader.
+    // every pure-data file so the read stays in bounds (ord columns write no pad
+    // of their own). File 0 ends with the field index and segment info just
+    // written above, which already provide far more trailing slack, so it is
+    // skipped. Padding past its segment-info size marker would also break the
+    // end-relative read in PostingsReader.
     if (files.size() > 1) {
       static const char svbPad[SVB_OVERREAD_PAD] = {};
       for (size_t i = 1; i < files.size(); i++) {

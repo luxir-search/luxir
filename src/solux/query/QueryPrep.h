@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <span>
@@ -13,6 +15,14 @@
 #include "solux/search/DocSet.h"
 
 namespace solux::QueryPrep {
+
+inline uint32_t elapsedBuildMicros(
+    std::chrono::steady_clock::time_point start) {
+  auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - start).count();
+  return (uint32_t) std::min<int64_t>(
+      elapsed, std::numeric_limits<uint32_t>::max());
+}
 
 // Convenience path for callers that just need a scorer and are not doing
 // parent-level planning. INT64_MAX means there is no external lead iterator
@@ -551,6 +561,7 @@ inline std::vector<PreparedSource> prepareFilterSources(
       if (probe.kind() == FilterCache::ReaderProbe::Kind::HIT) {
         value = probe.sharedValue();
       } else if (probe.kind() == FilterCache::ReaderProbe::Kind::BUILD) {
+        auto buildStart = std::chrono::steady_clock::now();
         auto prepared = weight->prepare(ctx);
         Query::SegmentSource& segmentSource = prepared != nullptr
             ? static_cast<Query::SegmentSource&>(*prepared)
@@ -564,7 +575,9 @@ inline std::vector<PreparedSource> prepareFilterSources(
           liveExact.push_back(materialize(
               segmentSource, ctx.reader.segments()[segmentOrd], canonical));
         }
-        value = use->publishReaderStable(probe, std::move(liveExact));
+        uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+        value = use->publishReaderStable(
+            probe, std::move(liveExact), buildCostMicros);
       }
       if (value != nullptr) {
         source.prepared = std::make_unique<ReaderStablePreparedWeight>(
@@ -640,8 +653,11 @@ inline Query::ScorerSupplier* filterSupplier(
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
     value = use->pinnedValue((size_t) segment.ord);
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+    auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
-    value = use->publishRaw((size_t) segment.ord, probe, std::move(raw));
+    uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+    value = use->publishRaw(
+        (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
   } else {
     return uncached;
   }
@@ -674,23 +690,28 @@ inline MaterializedFilter materializeEffectiveFilter(
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
     value = use->pinnedValue((size_t) segment.ord);
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+    auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
+    uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
     value = use->publishRawByproduct(
-        (size_t) segment.ord, probe, std::move(raw));
+        (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
   } else {
-    auto effective = materialize(weight, prepared, segment, domain);
     // A non-folded raw materialization is free by-product population. A
     // domain-composed set must never enter the raw cache.
     if (domain == nullptr
-        && use->scope() != FilterKeyScope::READER_STABLE
         && use->wasAdmitted()
         && !weight.needsScores() && !weight.allowsPruning()) {
-      value = use->offerRaw((size_t) segment.ord, std::move(effective));
+      auto buildStart = std::chrono::steady_clock::now();
+      auto effective = materialize(weight, prepared, segment, domain);
+      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+      value = use->offerRaw(
+          (size_t) segment.ord, std::move(effective), buildCostMicros);
       DocSet* docs = use->effectiveDocSet(
           (size_t) segment.ord, reader, value);
       return MaterializedFilter(docs);
     }
-    return MaterializedFilter(std::move(effective));
+    return MaterializedFilter(
+        materialize(weight, prepared, segment, domain));
   }
 
   DocSet* effective = use->effectiveDocSet(

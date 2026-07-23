@@ -14,7 +14,10 @@ namespace solux {
 
 class LinearPack {
 public:
-  static constexpr uint8_t TAIL_PAD = 7;
+  // A 16-byte SIMD load on the last packed group (bulk decode, bits 11-25) can
+  // read up to 10 bytes past the final value at 11-12 bits; select's u64 load
+  // needs only 7. Pad to the larger so both stay in bounds at a file tail.
+  static constexpr uint8_t TAIL_PAD = 10;
 
   static constexpr uint64_t packedByteSize(uint64_t count, uint8_t bits) {
     assert(bits <= 57);
@@ -88,16 +91,24 @@ public:
       count++;
     }
 
-    uint64_t finish() {
+    // writeTailPad appends TAIL_PAD zero bytes so a standalone buffer (e.g. an
+    // in-RAM OrdMap column) can be read with the bulk/point loads' overread.
+    // Index files reserve their own trailing slack (SVB_OVERREAD_PAD per data
+    // file) and pass false, keeping the pad -- an artifact of the reader's SIMD
+    // load width, not of the data -- out of the on-disk format.
+    uint64_t finish(bool writeTailPad = true) {
       assert(!finished);
       if (pendingBits != 0) {
         writeByte((uint8_t)pending);
       }
-      for (uint8_t i = 0; i < TAIL_PAD; i++) {
-        writeByte(0);
+      if (writeTailPad) {
+        for (uint8_t i = 0; i < TAIL_PAD; i++) {
+          writeByte(0);
+        }
       }
       finished = true;
-      assert(written == byteSize(count, bits));
+      assert(written == (writeTailPad ? byteSize(count, bits)
+                                      : packedByteSize(count, bits)));
       return written;
     }
   };
@@ -145,16 +156,12 @@ private:
         Phase, (Phase + Bits) & 7, (Phase + 2 * Bits) & 7,
         (Phase + 3 * Bits) & 7);
 
-    // The final packed group plus TAIL_PAD covers these fixed-width loads.
+    // The final packed group plus TAIL_PAD covers these fixed-width loads:
+    // <=10 bits hold 4 values plus a 7-bit phase in 8 bytes; wider widths take
+    // one 16-byte load whose last-group overread is bounded by TAIL_PAD.
     __m128i packed;
     if constexpr (Bits <= 10) {
       packed = _mm_loadl_epi64((const __m128i*)packedStart);
-    } else if constexpr (Bits <= 16) {
-      uint32_t high;
-      memcpy(&high, packedStart + sizeof(uint64_t), sizeof(high));
-      packed = _mm_or_si128(
-          _mm_loadl_epi64((const __m128i*)packedStart),
-          _mm_slli_si128(_mm_cvtsi32_si128((int)high), 8));
     } else {
       packed = _mm_loadu_si128((const __m128i*)packedStart);
     }
