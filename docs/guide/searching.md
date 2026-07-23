@@ -9,7 +9,7 @@ operation named `q`.
 All HTTP searches use:
 
 ```
-POST /collections/{collection}/_query
+POST /collections/{collection}/_search
 ```
 
 ## One result list
@@ -17,7 +17,7 @@ POST /collections/{collection}/_query
 The common request is deliberately shallow:
 
 ```http
-POST /collections/books/_query
+POST /collections/books/_search
 Content-Type: application/json
 
 {
@@ -190,7 +190,7 @@ Use the full request when the response should include analytics as well as
 documents. The simple fields move unchanged one level under `top_docs`:
 
 ```http
-POST /collections/books/_query
+POST /collections/books/_search
 
 {
   "ops": {
@@ -330,7 +330,7 @@ Add `?format=docs` and set `limit: -1` when the consumer wants documents rather
 than response envelopes:
 
 ```bash
-curl -s 'http://localhost:9400/collections/books/_query?format=docs' \
+curl -s 'http://localhost:9400/collections/books/_search?format=docs' \
   -H 'Content-Type: application/json' \
   -d '{"query":{"all":true},"limit":-1,"fields":["id","title_w"]}'
 ```

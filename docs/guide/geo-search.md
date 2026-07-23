@@ -61,7 +61,7 @@ A multi-valued field takes an array of point arrays:
 `geo_box` uses named scalar bounds so latitude and longitude cannot be confused:
 
 ```http
-POST /collections/places/_query
+POST /collections/places/_search
 
 {
   "query": {
@@ -103,7 +103,7 @@ west, rather than rejecting the apparent reversal.
 centers use separate `lat` and `lon` keys:
 
 ```http
-POST /collections/places/_query
+POST /collections/places/_search
 
 {
   "query": {

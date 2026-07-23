@@ -9,7 +9,7 @@ uses the same vocabulary as protobuf.
 | Method and path | Purpose |
 |---|---|
 | `GET /health` | Process liveness. |
-| `POST /collections/{collection}/_query` | Search; bounded JSON request, chunked NDJSON response. |
+| `POST /collections/{collection}/_search` | Search; bounded JSON request, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |

@@ -6,7 +6,7 @@ filters, not merely the hits returned by `limit`. That lets one request return
 the documents for a page and the analytics used to navigate it.
 
 ```http
-POST /collections/books/_query
+POST /collections/books/_search
 
 {
   "ops": {

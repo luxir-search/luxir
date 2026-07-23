@@ -72,13 +72,13 @@ struct HttpSearchRequestState {
   HttpSearchReqProto proto;  // non-owning; backed by `resource`
 };
 
-// Response shape for /_query.  Selected by the request-level proto field
+// Response shape for /_search.  Selected by the request-level proto field
 // SearchRequest.response_format, or the ?format= URL param as an alias (for
 // URL-capable clients; the param cannot express an explicit envelope, so
 // either source selecting DOCS wins).  The engine produces identical DocList
 // batches either way - only the NDJSON line framing differs - and gRPC
 // (framed messages) rejects DOCS outright.
-enum class HttpQueryFormat {
+enum class HttpSearchFormat {
   ENVELOPE,  // default: one NDJSON envelope line per batch ({"docs":[...],...})
   DOCS,      // bare document lines, optional _header_ meta records
 };
@@ -223,7 +223,7 @@ public:
   std::unique_ptr<HttpSearchRequestState> requestState;
   std::shared_ptr<HttpSession> session;
   std::shared_ptr<IoPin> ioPin;
-  HttpQueryFormat format = HttpQueryFormat::ENVELOPE;
+  HttpSearchFormat format = HttpSearchFormat::ENVELOPE;
   // DOCS-format framing state.  Document bodies render unlocked (pure per
   // batch); for multi-op requests - one emitter per op, concurrent replies -
   // replyDocs serializes just the framing decisions and queue posts under a
@@ -514,8 +514,8 @@ private:
     return true;
   }
 
-  static bool parseQueryPath(std::string_view target, std::string& coll) {
-    return parseCollectionPath(target, "/_query", coll);
+  static bool parseSearchPath(std::string_view target, std::string& coll) {
+    return parseCollectionPath(target, "/_search", coll);
   }
 
   static bool parseUpdatePath(std::string_view target, std::string& coll) {
@@ -627,11 +627,11 @@ private:
     std::string coll;
     if (req.method() == http::verb::get && target == "/health") {
       respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
-    } else if (req.method() == http::verb::post && parseQueryPath(target, coll)) {
-      auto format = HttpQueryFormat::ENVELOPE;
+    } else if (req.method() == http::verb::post && parseSearchPath(target, coll)) {
+      auto format = HttpSearchFormat::ENVELOPE;
       if (const std::string* f = findParam(params, "format")) {
         if (*f == "docs") {
-          format = HttpQueryFormat::DOCS;
+          format = HttpSearchFormat::DOCS;
         } else {
           respondSimple(http::status::bad_request, "application/json",
                         renderErrorBody("unknown format '" + *f + "' (valid: docs)"));
@@ -644,14 +644,14 @@ private:
                         renderErrorBody("unknown explain mode '" + *explain + "' (valid: request)"));
           return;
         }
-        if (format != HttpQueryFormat::ENVELOPE) {
+        if (format != HttpSearchFormat::ENVELOPE) {
           respondSimple(http::status::bad_request, "application/json",
                         renderErrorBody("format=docs cannot be combined with explain"));
           return;
         }
         handleExplain(req.body(), coll);
       } else {
-        handleQuery(req.body(), coll, format);
+        handleSearch(req.body(), coll, format);
       }
     } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
       handleUpdate(req.body(), coll);
@@ -772,7 +772,7 @@ private:
     return nullptr;
   }
 
-  void handleQuery(const std::string& body, const std::string& coll, HttpQueryFormat format) {
+  void handleSearch(const std::string& body, const std::string& coll, HttpSearchFormat format) {
     auto* arena = createArena();
     auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
@@ -787,10 +787,10 @@ private:
     // that cannot set query params).  The param cannot express an explicit
     // envelope, so either source selecting DOCS wins - no conflict exists.
     if (requestState->proto.response_format == solux::api::ResponseFormat::DOCS) {
-      format = HttpQueryFormat::DOCS;
+      format = HttpSearchFormat::DOCS;
     }
     bool docsMultiOp = false;
-    if (format == HttpQueryFormat::DOCS) {
+    if (format == HttpSearchFormat::DOCS) {
       if (const char* err = validateDocsFormat(requestState->proto)) {
         releaseArena(arena);
         respondSimple(http::status::bad_request, "application/json", renderErrorBody(err));
@@ -1964,7 +1964,7 @@ void HttpSession::run() {
 }
 
 SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
-  if (format == HttpQueryFormat::DOCS) return replyDocs(response);
+  if (format == HttpSearchFormat::DOCS) return replyDocs(response);
   // The line is rendered into an owned string, so once it is enqueued the proto
   // (and its arena) are dead weight - free them eagerly here instead of deferring
   // to a post-write callback.  Cleanup is unconditional after the try, so a

@@ -154,7 +154,7 @@ TEST_F(HttpApiTest, unknownRouteIs404) {
 }
 
 TEST_F(HttpApiTest, malformedJsonIs400) {
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query", "{not json");
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search", "{not json");
   EXPECT_EQ(400, res.result_int());
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos);
 }
@@ -177,7 +177,7 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
       R"({"docs":[{"id":"f1","http_facet_s":"x"},{"id":"f2","http_facet_s":"x"},{"id":"f3","http_facet_s":"y"},{"id":"f4"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
-  auto response = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   EXPECT_EQ(
@@ -191,13 +191,13 @@ TEST_F(HttpApiTest, shorthandCarriesRequestLevelKeys) {
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   // request-level keys (max_parallel, time_zone) mix with shorthand TopDocs keys
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":"title_w:dune","limit":0,"get_number":true,"max_parallel":-1,"time_zone":"UTC"})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("found":2)"), std::string::npos) << res.body();
 
   // "ops" beside shorthand keys = the op's sub-ops (facets over the query domain)
-  auto facet = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto facet = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":"title_w:dune","limit":0,"max_parallel":1,"ops":{"cats":{"field_facet":{"field":"http_sh_s","limit":-1}}}})");
   ASSERT_EQ(200, facet.result_int()) << facet.body();
   EXPECT_NE(facet.body().find(R"("buckets":[{"val":"x","count":1},{"val":"y","count":1}])"),
@@ -211,7 +211,7 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
 
   // -1 = inline on the strand, 1 = serial search pool, 0 = TBB arena; same answer.
   for (std::string mp : {"-1", "0", "1"}) {
-    auto response = httpRequest(port(), http::verb::post, "/collections/main/_query",
+    auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
         R"({"max_parallel":)" + mp +
         R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
     ASSERT_EQ(200, response.result_int()) << response.body();
@@ -387,12 +387,12 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
-  auto query = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/_query",
+  auto query = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/_search",
       R"({"query":{"match":{"title_w":"good"}},"fields":["id"]})");
   EXPECT_EQ(200, query.result_int()) << query.body();
   EXPECT_NE(query.body().find(R"("g1")"), std::string::npos) << query.body();
 
-  auto badQuery = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/_query",
+  auto badQuery = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/_search",
       R"({"query":{"match":{"title_w":"bad"}},"fields":["id"]})");
   EXPECT_NE(badQuery.body().find("failed to load"), std::string::npos) << badQuery.body();
 
@@ -412,21 +412,21 @@ TEST_F(HttpApiTest, simpleQueryOverJson) {
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   // the simple_query arm parses mechanically from the dialect (no sugar needed)
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"simple_query":{"q":"blade | man","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("s1")"), std::string::npos) << res.body();
   EXPECT_NE(res.body().find(R"("s2")"), std::string::npos) << res.body();
 
   // declared degradations are visible on the wire (clamp-and-declare)
-  auto warned = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto warned = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"simple_query":{"q":"blade~9","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, warned.result_int()) << warned.body();
   EXPECT_NE(warned.body().find(R"("warnings")"), std::string::npos) << warned.body();
   EXPECT_NE(warned.body().find(R"("fuzzy_clamped")"), std::string::npos) << warned.body();
 
   // never-fails: garbage user input is still a 200 with results, not an error
-  auto garbage = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto garbage = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"simple_query":{"q":"re: \"unbalanced ((man","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, garbage.result_int()) << garbage.body();
   EXPECT_NE(garbage.body().find(R"("s2")"), std::string::npos) << garbage.body();
@@ -445,7 +445,7 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   auto result = httpRequest(port(), http::verb::post,
-      "/collections/main/_query",
+      "/collections/main/_search",
       R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},"fields":["id"]})");
   ASSERT_EQ(200, result.result_int()) << result.body();
   EXPECT_NE(result.body().find(R"("ny")"), std::string::npos) << result.body();
@@ -1197,7 +1197,7 @@ TEST_F(HttpApiTest, rootShorthand) {
             "title_w", std::string("gamma")),
   }, UpdateMessage::COMMIT);
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"match":{"status_s":"active"}},"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
 
@@ -1208,7 +1208,7 @@ TEST_F(HttpApiTest, rootShorthand) {
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
   // an unknown root key is rejected with a client-facing error
-  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"match":{"status_s":"active"}},"limt":10})");
   EXPECT_EQ(400, bad.result_int());
   EXPECT_NE(bad.body().find(R"("error")"), std::string::npos);
@@ -1227,7 +1227,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
 
   const std::string body = R"({"query":{"match":{"status_s":"active"}},"fields":["id"]})";
   auto echo = httpRequest(port(), http::verb::post,
-                          "/collections/main/_query?explain=request", body);
+                          "/collections/main/_search?explain=request", body);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   const std::string canonical = echo.body();
   // sugar expanded to canonical match, shorthand lowered into ops, collection applied
@@ -1241,14 +1241,14 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;
 
   // POST-back equivalence: the echo output runs identically to the original body.
-  auto direct = httpRequest(port(), http::verb::post, "/collections/main/_query", body);
-  auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_query", canonical);
+  auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
+  auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_search", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
   EXPECT_EQ(direct.body(), viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
   auto echo2 = httpRequest(port(), http::verb::post,
-                           "/collections/main/_query?explain=request", canonical);
+                           "/collections/main/_search?explain=request", canonical);
   ASSERT_EQ(200, echo2.result_int());
   EXPECT_EQ(canonical, echo2.body());
 }
@@ -1257,26 +1257,26 @@ TEST_F(HttpApiTest, explainRequestEcho) {
 // an open channel - correlation ids, middleware); recognized keys enforce values.
 TEST_F(HttpApiTest, urlParamPolicy) {
   // bad value on a RECOGNIZED key is an author error
-  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_query?explain=foo",
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_search?explain=foo",
                          R"({"limit":1})");
   EXPECT_EQ(400, bad.result_int());
   EXPECT_NE(bad.body().find(R"("error")"), std::string::npos) << bad.body();
 
   // unknown params (e.g. a correlation id) pass through; the query executes
   auto unknown = httpRequest(port(), http::verb::post,
-                             "/collections/main/_query?trace_id=abc-123&_=17",
+                             "/collections/main/_search?trace_id=abc-123&_=17",
                              R"({"limit":1})");
   EXPECT_EQ(200, unknown.result_int()) << unknown.body();
 
   // unknown params compose with explain (last-wins on repeats)
   auto both = httpRequest(port(), http::verb::post,
-                          "/collections/main/_query?trace_id=x&explain=request",
+                          "/collections/main/_search?trace_id=x&explain=request",
                           R"({"limit":1})");
   EXPECT_EQ(200, both.result_int()) << both.body();
   EXPECT_NE(both.body().find(R"("ops")"), std::string::npos) << both.body();
 
   auto malformed = httpRequest(port(), http::verb::post,
-                               "/collections/main/_query?explain=request", "{not json");
+                               "/collections/main/_search?explain=request", "{not json");
   EXPECT_EQ(400, malformed.result_int());
   EXPECT_NE(malformed.body().find(R"("error")"), std::string::npos) << malformed.body();
 
@@ -1334,7 +1334,7 @@ TEST_F(HttpApiTest, explicitColumnsFormatOverHttp) {
     flatdoc("id", std::string("c2"), "title_w", std::string("col fmt")),
   }, UpdateMessage::COMMIT);
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"match":{"title_w":"col"}},"fields":["id","year_i"],"document_format":"columns"})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("year_i":2001)"), std::string::npos) << res.body();
@@ -1516,14 +1516,14 @@ TEST_F(HttpApiTest, schemaDrivesIndexingEndToEnd) {
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   // lowercase filter applied at index time -> query for "dune" matches "DUNE".
-  auto q = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto q = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"match":{"title":"dune"}},"fields":["id"]})");
   ASSERT_EQ(200, q.result_int()) << q.body();
   EXPECT_NE(q.body().find(R"("id":"1")"), std::string::npos) << q.body();
   EXPECT_EQ(q.body().find(R"("id":"2")"), std::string::npos) << q.body();
 
   // Range index installed via the schema answers a range query.
-  auto range = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto range = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":"year:[1900 TO 1970]","fields":["id"]})");
   ASSERT_EQ(200, range.result_int()) << range.body();
   EXPECT_NE(range.body().find(R"("id":"1")"), std::string::npos) << range.body();
@@ -1543,7 +1543,7 @@ TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
   tcp::resolver resolver(cioc);
   net::connect(sock, resolver.resolve("127.0.0.1", std::to_string(port())));
 
-  http::request<http::string_body> req(http::verb::post, "/collections/main/_query", 11);
+  http::request<http::string_body> req(http::verb::post, "/collections/main/_search", 11);
   req.set(http::field::host, "127.0.0.1");
   req.set(http::field::content_type, "application/json");
   req.body() = R"({"query":{"match":{"title_w":"banana"}},"limit":250,"batch_size":50,"fields":["id"]})";
@@ -1569,7 +1569,7 @@ TEST_F(HttpApiTest, docsFormatIsPureDocLines) {
     ch.index(flatdoc("id", "d" + std::to_string(i)), commit);
   }
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs/_query?format=docs",
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs/_search?format=docs",
       R"({"query":{"all":true},"limit":-1,"batch_size":2,"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
 
@@ -1593,7 +1593,7 @@ TEST_F(HttpApiTest, docsFormatSelectableInBody) {
   CollectionHelper ch("http_docs_body");
   ch.index(flatdoc("id", std::string("b1")), UpdateMessage::COMMIT);
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_body/_query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_body/_search",
       R"({"ops":{"q":{"top_docs":{"query":{"all":true},"fields":["id"]}}},"response_format":"docs"})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_EQ(R"({"id":"b1"})" "\n", res.body());
@@ -1607,7 +1607,7 @@ TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
   ch.index(flatdoc("id", std::string("h1")), UpdateMessage::NO_COMMIT);
   ch.index(flatdoc("id", std::string("h2")), UpdateMessage::COMMIT);
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_query?format=docs",
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_search?format=docs",
       R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
@@ -1615,7 +1615,7 @@ TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
   EXPECT_EQ(R"({"_header_":{"found":2}})", lines[0]);
   EXPECT_EQ(std::string::npos, res.body().find("_header_", lines[0].size())) << res.body();
 
-  auto pure = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_query?format=docs",
+  auto pure = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_search?format=docs",
       R"({"query":{"all":true},"limit":-1,"fields":["id"]})");
   EXPECT_EQ(std::string::npos, pure.body().find("_header_")) << pure.body();
   EXPECT_EQ(2u, splitLines(pure.body()).size());
@@ -1623,16 +1623,16 @@ TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
 
 // The docs format rejects requests whose response would need an envelope.
 TEST_F(HttpApiTest, docsFormatValidation) {
-  auto facet = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+  auto facet = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s"}}}})");
   EXPECT_EQ(400, facet.result_int()) << facet.body();
 
-  auto columns = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+  auto columns = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"query":{"all":true},"document_format":"columns","fields":["id"]})");
   EXPECT_EQ(400, columns.result_int()) << columns.body();
   EXPECT_NE(std::string::npos, columns.body().find("format=docs")) << columns.body();
 
-  auto unknown = httpRequest(port(), http::verb::post, "/collections/main/_query?format=lines",
+  auto unknown = httpRequest(port(), http::verb::post, "/collections/main/_search?format=lines",
       R"({"query":{"all":true}})");
   EXPECT_EQ(400, unknown.result_int()) << unknown.body();
 }
@@ -1641,7 +1641,7 @@ TEST_F(HttpApiTest, docsFormatValidation) {
 // with an error line (the docs format has no in-band error representation).
 TEST_F(HttpApiTest, docsFormatErrorBeforeFlushIsHttpError) {
   helper.index(flatdoc("id", std::string("de1")), UpdateMessage::COMMIT);
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"query":{"all":true},"fields":["nosuchfield"]})");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("nosuchfield")) << res.body();
@@ -1690,7 +1690,7 @@ TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
                          std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, res.result_int()) << res.body();
 
-  auto check = httpRequest(port(), http::verb::post, "/collections/http_hdrs/_query?format=docs",
+  auto check = httpRequest(port(), http::verb::post, "/collections/http_hdrs/_search?format=docs",
       R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
   ASSERT_EQ(200, check.result_int()) << check.body();
   auto lines = splitLines(check.body());
@@ -1701,25 +1701,25 @@ TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
 // format=docs validation covers fusion source sub-ops (silently discarding
 // authored ops behind a format flag would be worse than rejecting them).
 TEST_F(HttpApiTest, docsFormatRejectsFusionSourceOps) {
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"ops":{"q":{"fusion":{"sources":{"a":{"query":{"all":true},)"
       R"("ops":{"f":{"field_facet":{"field":"http_facet_s"}}}}},"rrf":{}}}}})");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("nested ops")) << res.body();
 
   auto explain = httpRequest(port(), http::verb::post,
-      "/collections/main/_query?format=docs&explain=request", R"({"query":{"all":true}})");
+      "/collections/main/_search?format=docs&explain=request", R"({"query":{"all":true}})");
   EXPECT_EQ(400, explain.result_int()) << explain.body();
 
   // Body-selected docs must not slip past explain either.
   auto bodyExplain = httpRequest(port(), http::verb::post,
-      "/collections/main/_query?explain=request",
+      "/collections/main/_search?explain=request",
       R"({"ops":{"q":{"top_docs":{"query":{"all":true}}}},"response_format":"docs"})");
   EXPECT_EQ(400, bodyExplain.result_int()) << bodyExplain.body();
 
   // Duplicate op names: the raw ops view keeps both entries (execution is
   // last-wins), so docs framing rejects the ambiguity.
-  auto dup = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+  auto dup = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"ops":{"q":{"top_docs":{"query":{"all":true},"fields":["id"]}},)"
       R"("q":{"top_docs":{"query":{"all":true},"fields":["id"]}}}})");
   EXPECT_EQ(400, dup.result_int()) << dup.body();
@@ -1738,7 +1738,7 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
   for (int i = 0; i < 4; i++) docs.push_back(flatdoc("id", "b" + std::to_string(i), "kind_s", std::string("b")));
   ch.indexAll(docs, UpdateMessage::COMMIT);
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_multi/_query?format=docs",
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_multi/_search?format=docs",
       R"({"ops":{)"
       R"("qa":{"top_docs":{"query":{"match":{"kind_s":"a"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}},)"
       R"("qb":{"top_docs":{"query":{"match":{"kind_s":"b"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}})"
@@ -1775,7 +1775,7 @@ TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
   ch.index(flatdoc("id", std::string("w1"), "tag_s", std::string("v")), UpdateMessage::COMMIT);
 
   // Quoted-with-slop on a non-TEXT field degrades to an exact match and warns.
-  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_warn/_query?format=docs",
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_warn/_search?format=docs",
       R"({"query":{"simple_query":{"q":"\"v\"~2","fields":["tag_s"]}},"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
@@ -1792,12 +1792,12 @@ TEST_F(HttpApiTest, docsFormatZeroResults) {
   CollectionHelper ch("http_docs_zero");
   ch.index(flatdoc("id", std::string("z1")), UpdateMessage::COMMIT);
 
-  auto pure = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_query?format=docs",
+  auto pure = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_search?format=docs",
       R"({"query":{"match":{"id":"nomatch"}},"fields":["id"]})");
   ASSERT_EQ(200, pure.result_int()) << pure.body();
   EXPECT_TRUE(pure.body().empty()) << pure.body();
 
-  auto counted = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_query?format=docs",
+  auto counted = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_search?format=docs",
       R"({"query":{"match":{"id":"nomatch"}},"get_number":true,"fields":["id"]})");
   ASSERT_EQ(200, counted.result_int()) << counted.body();
   EXPECT_EQ(R"({"_header_":{"found":0}})" "\n", counted.body());
@@ -1816,7 +1816,7 @@ TEST_F(HttpApiTest, docsFormatKeepAliveReuse) {
 
   for (int round = 0; round < 2; round++) {
     http::request<http::string_body> req(http::verb::post,
-                                         "/collections/http_docs_ka/_query?format=docs", 11);
+                                         "/collections/http_docs_ka/_search?format=docs", 11);
     req.set(http::field::host, "127.0.0.1");
     req.set(http::field::content_type, "application/json");
     req.keep_alive(true);
@@ -1845,7 +1845,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
     src.index(flatdoc("id", "rt" + std::to_string(i), "num_i", (int64_t)i), commit);
   }
 
-  auto exported = httpRequest(port(), http::verb::post, "/collections/http_rt_src/_query?format=docs",
+  auto exported = httpRequest(port(), http::verb::post, "/collections/http_rt_src/_search?format=docs",
       R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
   ASSERT_EQ(200, exported.result_int()) << exported.body();
   ASSERT_EQ(8u, splitLines(exported.body()).size());  // header + 7 docs
@@ -1855,7 +1855,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
   ASSERT_EQ(200, import.result_int()) << import.body();
 
   // Verify by re-exporting the destination: identical doc lines, same count.
-  auto reexported = httpRequest(port(), http::verb::post, "/collections/http_rt_dst/_query?format=docs",
+  auto reexported = httpRequest(port(), http::verb::post, "/collections/http_rt_dst/_search?format=docs",
       R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
   ASSERT_EQ(200, reexported.result_int()) << reexported.body();
   auto a = splitLines(exported.body());
@@ -1891,7 +1891,7 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
 
   int64_t pausesBefore = streamPauseCount.load();
 
-  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_query", 11);
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
   req.set(http::field::host, "127.0.0.1");
   req.set(http::field::content_type, "application/json");
   req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})";
@@ -1937,7 +1937,7 @@ TEST_F(HttpApiTest, emitterExceptionCompletesWithError) {
   // response arena), and "id" first puts its loader tasks in flight when the
   // unknown field's schema lookup throws - exercising the emitter's task-group
   // join and batch-arena cleanup, not just the error surface.
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"all":true},"batch_size":1,"fields":["id","nosuchfield"]})");
   EXPECT_EQ(200, res.result_int());
   EXPECT_NE(std::string::npos, res.body().find(R"("error":)")) << res.body();
@@ -1971,7 +1971,7 @@ TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
 
   int64_t pausesBefore = streamPauseCount.load();
 
-  http::request<http::string_body> req(http::verb::post, "/collections/http_bp2/_query", 11);
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp2/_search", 11);
   req.set(http::field::host, "127.0.0.1");
   req.set(http::field::content_type, "application/json");
   req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})";

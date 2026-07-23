@@ -63,7 +63,7 @@ later when you want control - you do not need one to start.
 ## Search
 
 ```
-POST /collections/main/_query
+POST /collections/main/_search
 {"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
 ```
 
@@ -89,7 +89,7 @@ Add `get_number` and the response tells you exactly how many documents match,
 not an estimate - even when you only page back a few:
 
 ```
-POST /collections/main/_query
+POST /collections/main/_search
 {"query": {"match": {"author_s": "Le Guin"}}, "fields": ["id"], "get_number": true, "limit": 2}
 ```
 
@@ -106,7 +106,7 @@ It parses operators, quotes, and field terms, and it never returns a parse
 error - malformed input just does its best:
 
 ```
-POST /collections/main/_query
+POST /collections/main/_search
 {"query": {"simple_query": {"q": "darkness | earthsea", "fields": ["title_w"]}}, "fields": ["id"], "get_number": true}
 ```
 
@@ -122,7 +122,7 @@ fielded terms, AND/OR/NOT, ranges, and function forms for most structured query
 types. Unlike `simple_query`, malformed input is a parse error, not a guess:
 
 ```
-POST /collections/main/_query
+POST /collections/main/_search
 {"query": "title_w:(darkness OR earthsea) AND year_i:[1960 TO 1970]", "fields": ["id"], "get_number": true}
 ```
 
@@ -169,7 +169,7 @@ per line, no envelope, no paging. `limit: -1` means every match, streamed over
 one connection; there is no scroll API or cursor token to manage:
 
 ```
-POST /collections/main/_query?format=docs
+POST /collections/main/_search?format=docs
 {"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}
 ```
 
@@ -188,7 +188,7 @@ lines are recognized (and skipped) by ingest, so export pipes straight back
 into `/_update`:
 
 ```bash
-curl -s 'http://localhost:9400/collections/main/_query?format=docs' \
+curl -s 'http://localhost:9400/collections/main/_search?format=docs' \
      -H 'Content-Type: application/json' \
      -d '{"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}' |
 curl -X POST 'http://localhost:9400/collections/backup/_update?commit=true' \
@@ -214,7 +214,7 @@ POST /collections/books/_update
 ```
 
 ```
-POST /collections/books/_query
+POST /collections/books/_search
 {"query": {"match": {"title_w": "dune"}}, "fields": ["id"], "get_number": true}
 ```
 
@@ -242,7 +242,7 @@ Add `?explain=request` to a query and Solux echoes back the canonical request it
 parsed - the shorthand you sent, expanded to the full form:
 
 ```
-POST /collections/main/_query?explain=request
+POST /collections/main/_search?explain=request
 {"query": {"match": {"title_w": "dune"}}}
 ```
 

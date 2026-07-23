@@ -10,7 +10,7 @@ stealing task scheduler, async IO, and SIMD acceleration.
 The ten-second version:
 
 ```
-POST /collections/main/_query
+POST /collections/main/_search
 {"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
 ```
 

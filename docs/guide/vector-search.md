@@ -67,7 +67,7 @@ best similarity.
 ## Query vectors
 
 ```http
-POST /collections/books/_query
+POST /collections/books/_search
 
 {
   "query": {
@@ -120,7 +120,7 @@ Reciprocal rank fusion combines independently ranked sources without forcing
 BM25 and vector similarity onto an invented common score scale:
 
 ```http
-POST /collections/books/_query
+POST /collections/books/_search
 
 {
   "ops": {

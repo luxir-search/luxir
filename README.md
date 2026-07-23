@@ -6,7 +6,7 @@ facets, metrics, and rank fusion are one composable request tree, served over
 an HTTP/JSON API for humans and a typed streaming gRPC API for applications.
 
 ```http
-POST /collections/books/_query
+POST /collections/books/_search
 Content-Type: application/json
 
 {"query":"title_w:(dune OR messiah) AND year_i:>=1965",
@@ -61,7 +61,7 @@ curl -X POST http://localhost:9400/collections/books/_update \
 Search it:
 
 ```bash
-curl -X POST http://localhost:9400/collections/books/_query \
+curl -X POST http://localhost:9400/collections/books/_search \
   -H 'Content-Type: application/json' \
   -d '{"query":{"match":{"title_w":"darkness"}},"fields":["id","author_s","year_i"]}'
 ```
