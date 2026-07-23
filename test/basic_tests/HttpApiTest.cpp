@@ -80,6 +80,17 @@ protected:
     return out;
   }
 
+  static std::optional<int64_t> updateVersionInLine(const std::string& line) {
+    glz::generic_i64 root;
+    if (glz::read_json(root, line) || !root.is_object() ||
+        !root.contains("update_version")) {
+      return std::nullopt;
+    }
+    auto* version = root["update_version"].get_if<int64_t>();
+    if (version == nullptr) return std::nullopt;
+    return *version;
+  }
+
   static void writeRawHttpChunk(beast::tcp_stream& stream, std::string_view body) {
     std::ostringstream os;
     os << std::hex << body.size();
@@ -618,6 +629,256 @@ TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
       .limit(kDocCount).withStats().execute();
   ASSERT_EQ(200, hreq.status());
   EXPECT_EQ((int64_t)kDocCount, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
+  struct RunResult {
+    int64_t plainCount = 0;
+    std::map<std::string, std::string> overwriteDocs;
+    std::string plainResponse;
+    std::string overwriteResponse;
+  };
+
+  auto run = [&](int64_t maxInFlight, RunResult& result) {
+    SoluxConfig config;
+    config.ingest.stream_batch_docs = 3;
+    config.ingest.max_inflight_batches = maxInFlight;
+    SoluxNode node(config);
+    HttpServer localServer(node, 2, 0);
+    localServer.start();
+
+    std::string plainBody;
+    for (int i = 0; i < 128; i++) {
+      plainBody += R"({"id":"plain-)" + std::to_string(i) +
+          R"(","title_w":"plainpipeline"})" "\n";
+    }
+    plainBody += R"({"_end_":{"commit":{}}})" "\n";
+    auto plainUpdate = httpRequest(localServer.getPort(), http::verb::post,
+        "/collections/plain/_update", std::move(plainBody), "application/x-ndjson");
+    ASSERT_EQ(200, plainUpdate.result_int()) << plainUpdate.body();
+    result.plainResponse = plainUpdate.body();
+
+    HttpReq plainQuery(localServer.getPort());
+    plainQuery.collection("plain").matchQuery("title_w", "plainpipeline")
+        .fields({"id"}).limit(128).withStats().execute();
+    ASSERT_EQ(200, plainQuery.status()) << plainQuery.rawResponse();
+    result.plainCount = plainQuery.found();
+
+    static constexpr int kIds = 12;
+    static constexpr int kRounds = 20;
+    std::string overwriteBody = R"({"_update_":{"allow_dups":false}})" "\n";
+    for (int round = 0; round < kRounds; round++) {
+      for (int id = 0; id < kIds; id++) {
+        overwriteBody += R"({"id":"overwrite-)" + std::to_string(id) +
+            R"(","title_w":"overwriteparity","title_s":"round-)" +
+            std::to_string(round) + R"("})" "\n";
+      }
+    }
+    overwriteBody += R"({"_end_":{"commit":{}}})" "\n";
+    auto overwriteUpdate = httpRequest(localServer.getPort(), http::verb::post,
+        "/collections/overwrite/_update", std::move(overwriteBody), "application/x-ndjson");
+    ASSERT_EQ(200, overwriteUpdate.result_int()) << overwriteUpdate.body();
+    result.overwriteResponse = overwriteUpdate.body();
+
+    HttpReq overwriteQuery(localServer.getPort());
+    overwriteQuery.collection("overwrite").matchQuery("title_w", "overwriteparity")
+        .fields({"id", "title_s"}).limit(kIds).withStats().execute();
+    ASSERT_EQ(200, overwriteQuery.status()) << overwriteQuery.rawResponse();
+    ASSERT_EQ((int64_t)kIds, overwriteQuery.found()) << overwriteQuery.rawResponse();
+    for (const auto& doc : overwriteQuery.getDocs()) {
+      const auto* id = find(doc, "id");
+      const auto* value = find(doc, "title_s");
+      ASSERT_NE(nullptr, id);
+      ASSERT_NE(nullptr, value);
+      result.overwriteDocs.emplace(std::get<std::string>(*id), std::get<std::string>(*value));
+    }
+
+    localServer.shutdown();
+  };
+
+  RunResult serial;
+  RunResult pipelined;
+  run(1, serial);
+  run(8, pipelined);
+
+  EXPECT_EQ((int64_t)128, serial.plainCount);
+  EXPECT_EQ(serial.plainCount, pipelined.plainCount);
+  EXPECT_EQ(serial.plainResponse, pipelined.plainResponse);
+  EXPECT_EQ(serial.overwriteResponse, pipelined.overwriteResponse);
+  EXPECT_EQ(serial.overwriteDocs, pipelined.overwriteDocs);
+  ASSERT_EQ((std::size_t)12, pipelined.overwriteDocs.size());
+  for (int id = 0; id < 12; id++) {
+    EXPECT_EQ("round-19", pipelined.overwriteDocs.at("overwrite-" + std::to_string(id)));
+  }
+}
+
+TEST_F(HttpApiTest, ndjsonPipelinedInputFailureDrainsSubmittedPrefix) {
+  SoluxConfig config;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 8;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  static constexpr int kDocCount = 8;
+  std::string body;
+  for (int i = 0; i < kDocCount; i++) {
+    body += R"({"id":"deferred-fail-)" + std::to_string(i) +
+        R"(","title_w":"deferredfailure"})" "\n";
+  }
+  body += "{not json\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/deferred_failure/_update", std::move(body), "application/x-ndjson");
+  ASSERT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos,
+            update.body().find("docs_indexed_so_far=" + std::to_string(kDocCount)))
+      << update.body();
+
+  // The response is itself the drain fence.  Commit the already-finished
+  // updates, then verify every valid record preceding the malformed one.
+  auto commit = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/deferred_failure/_update", R"({"commit":{}})");
+  ASSERT_EQ(200, commit.result_int()) << commit.body();
+
+  HttpReq query(localServer.getPort());
+  query.collection("deferred_failure").matchQuery("title_w", "deferredfailure")
+      .fields({"id"}).limit(kDocCount).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)kDocCount, query.found()) << query.rawResponse();
+
+  localServer.shutdown();
+}
+
+TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
+  struct RunResult {
+    std::string response;
+    int64_t found = 0;
+    std::optional<int64_t> updateVersion;
+  };
+
+  auto run = [&](int64_t maxInFlight, RunResult& result) {
+    SoluxConfig config;
+    config.ingest.stream_batch_docs = 16;
+    config.ingest.max_inflight_batches = maxInFlight;
+    SoluxNode node(config);
+    HttpServer localServer(node, 2, 0);
+    localServer.start();
+
+    std::string body =
+        R"({"id":"header-a","title_w":"headerparity"})" "\n"
+        R"({"_header_":{"found":2}})" "\n"
+        R"({"id":"header-b","title_w":"headerparity"})" "\n"
+        R"({"_end_":{"commit":{}}})" "\n";
+    auto update = httpRequest(localServer.getPort(), http::verb::post,
+        "/collections/header_parity/_update", std::move(body), "application/x-ndjson");
+    ASSERT_EQ(200, update.result_int()) << update.body();
+    auto lines = splitLines(update.body());
+    ASSERT_EQ((std::size_t)1, lines.size()) << update.body();
+    result.response = update.body();
+    result.updateVersion = updateVersionInLine(lines[0]);
+
+    HttpReq query(localServer.getPort());
+    query.collection("header_parity").matchQuery("title_w", "headerparity")
+        .fields({"id"}).limit(2).withStats().execute();
+    ASSERT_EQ(200, query.status()) << query.rawResponse();
+    result.found = query.found();
+
+    localServer.shutdown();
+  };
+
+  RunResult serial;
+  RunResult pipelined;
+  run(1, serial);
+  run(8, pipelined);
+
+  // A fresh writer assigns version 1 to the sole A+B data message.  Treating
+  // _header_ as a barrier would split it and make the response version 2.
+  ASSERT_TRUE(serial.updateVersion.has_value()) << serial.response;
+  EXPECT_EQ((int64_t)1, *serial.updateVersion) << serial.response;
+  EXPECT_EQ((int64_t)2, serial.found);
+  EXPECT_EQ(serial.response, pipelined.response);
+  EXPECT_EQ(serial.updateVersion, pipelined.updateVersion);
+  EXPECT_EQ(serial.found, pipelined.found);
+}
+
+TEST_F(HttpApiTest, ndjsonPipelinedBarriersPreserveIntervalsAndCommit) {
+  SoluxConfig config;
+  config.ingest.stream_batch_docs = 2;
+  config.ingest.max_inflight_batches = 8;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::vector<std::string> expectedFirst;
+  std::vector<std::string> expectedSecond;
+  std::string body = R"({"_update_":{"request_id":"first","return_ids":true}})" "\n";
+  for (int i = 0; i < 12; i++) {
+    std::string id = "barrier-a-" + std::to_string(i);
+    expectedFirst.push_back(id);
+    body += R"({"id":")" + id + R"(","title_w":"pipelinebarrier"})" "\n";
+  }
+  body += "{}\n";
+  body += R"({"_update_":{"request_id":"second","return_ids":true}})" "\n";
+  for (int i = 0; i < 9; i++) {
+    std::string id = "barrier-b-" + std::to_string(i);
+    expectedSecond.push_back(id);
+    body += R"({"id":")" + id + R"(","title_w":"pipelinebarrier"})" "\n";
+  }
+  body += R"({"_end_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/barriers/_update", std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ((std::size_t)2, lines.size()) << update.body();
+  EXPECT_NE(lines[0].find(R"("request_id":"first")"), std::string::npos);
+  EXPECT_NE(lines[1].find(R"("request_id":"second")"), std::string::npos);
+  EXPECT_EQ(expectedFirst, idsInUpdateLine(lines[0])) << update.body();
+  EXPECT_EQ(expectedSecond, idsInUpdateLine(lines[1])) << update.body();
+
+  HttpReq query(localServer.getPort());
+  query.collection("barriers").matchQuery("title_w", "pipelinebarrier")
+      .fields({"id"}).limit(21).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)21, query.found()) << query.rawResponse();
+  auto collection = node.getCollection("barriers");
+  EXPECT_FALSE(readDurableIndexInfo(collection->getShard()->getIndexWriter()->dir)->segments.empty());
+
+  localServer.shutdown();
+}
+
+TEST_F(HttpApiTest, ndjsonDisconnectDrainsPipelinedBatches) {
+  SoluxConfig config;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 8;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string payload(8 * 1024, 'z');
+  std::string body;
+  for (int i = 0; i < 128; i++) {
+    body += R"({"id":"disconnect-)" + std::to_string(i) +
+        R"(","title_w":"disconnectpipeline","blob_sc":")" + payload + R"("})" "\n";
+  }
+
+  net::io_context cioc;
+  beast::tcp_stream stream(cioc);
+  tcp::resolver resolver(cioc);
+  stream.connect(resolver.resolve("127.0.0.1", std::to_string(localServer.getPort())));
+  http::request<http::string_body> request{http::verb::post, "/collections/disconnect/_update", 11};
+  request.set(http::field::host, "127.0.0.1");
+  request.set(http::field::content_type, "application/x-ndjson");
+  request.keep_alive(false);
+  request.body() = std::move(body);
+  request.prepare_payload();
+  http::write(stream, request);
+
+  beast::error_code ec;
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+  stream.socket().close(ec);
+  EXPECT_NO_THROW(localServer.shutdown());
 }
 
 TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {

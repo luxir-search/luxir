@@ -126,6 +126,10 @@ struct HttpStreamBatchState {
   std::size_t docCount = 0;
   std::size_t deleteCount = 0;
   std::size_t firstDocIndex = 0;
+  // The engine receives a raw UpdateMessage pointer.  The in-flight map owns
+  // this batch, and the batch owns the message until the strand folds its
+  // completion.
+  std::shared_ptr<ProtoUpdateMessage> message;
 
   explicit HttpStreamBatchState(std::size_t reserveDocs) : docs(resource) {
     docs.reserve(reserveDocs);
@@ -188,29 +192,45 @@ struct HttpStreamUpdateState {
   HttpStreamGroup group;
   std::map<std::string, HttpStreamWriterTarget> writerCache;
   std::unique_ptr<HttpStreamBatchState> batch;
+  bool batchReady = false;
+  std::map<std::uint64_t, std::shared_ptr<HttpStreamBatchState>> inFlightBatches;
+  std::map<std::uint64_t, HttpStreamBatchResult> completedBatchResults;
   std::optional<HttpStreamControl> pendingControl;
+  std::optional<std::string> inputFailurePending;
   std::shared_ptr<IoPin> ioPin;
   HttpStreamInterval interval;
   std::size_t docsSeen = 0;
   std::size_t docsIndexedSoFar = 0;
+  std::size_t inFlight = 0;
+  std::size_t maxInFlight;
+  std::uint64_t nextSubmitOrdinal = 0;
+  std::uint64_t nextFoldOrdinal = 0;
   bool urlCommit = false;
   bool emitAfterBatch = false;
   bool resetGroupAfterBatch = false;
   bool emittedLine = false;
   bool bodyDone = false;
   bool tailFinished = false;
-  bool updateInFlight = false;
+  bool readInFlight = false;
+  bool barrierPending = false;
+  bool eofPending = false;
   bool urlCommitInFlight = false;
   bool failed = false;
 
   HttpStreamUpdateState(std::size_t batchTargetBytes, std::size_t batchMaxDocs,
-                        std::size_t maxRecordBytes, std::size_t maxRequestBody)
+                        std::size_t maxRecordBytes, std::size_t maxRequestBody,
+                        std::size_t maxInFlight)
     : batchTargetBytes(batchTargetBytes),
       batchMaxDocs(batchMaxDocs),
       maxRequestBody(maxRequestBody),
       framer(maxRecordBytes),
       readBuf(kStreamReadBufBytes),
-      batch(std::make_unique<HttpStreamBatchState>(batchMaxDocs)) {}
+      batch(std::make_unique<HttpStreamBatchState>(batchMaxDocs)),
+      maxInFlight(maxInFlight) {
+    assert(maxInFlight > 0);
+  }
+
+  bool canAdmit() const { return inFlight < maxInFlight && !barrierPending; }
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -415,6 +435,90 @@ private:
   bool lastSeen_ = false;
   bool chunkLastSent_ = false;
   bool errored_ = false;
+  bool terminalStreamingFailure_ = false;
+
+  // Engine completion runs on the update graph.  Extract every non-owning
+  // response field there, then hand an owning result to the session strand.
+  // The in-flight batch entry owns this message; the callback keeps it alive
+  // while that entry is erased, including the case where the strand runs
+  // before done() has returned on the engine thread.
+  class StreamingUpdateMessage final
+    : public ProtoUpdateMessage,
+      public std::enable_shared_from_this<StreamingUpdateMessage> {
+    std::shared_ptr<HttpSession> session_;
+    std::shared_ptr<HttpStreamUpdateState> state_;
+    std::weak_ptr<HttpStreamBatchState> batch_;
+    std::uint64_t ordinal_;
+    HttpStreamBatchResult result_;
+
+  public:
+    StreamingUpdateMessage(const HttpUpdateReqProto* req,
+                           std::shared_ptr<HttpSession> session,
+                           std::shared_ptr<HttpStreamUpdateState> state,
+                           std::uint64_t ordinal,
+                           const std::shared_ptr<HttpStreamBatchState>& batch)
+      : ProtoUpdateMessage(req),
+        session_(std::move(session)),
+        state_(std::move(state)),
+        batch_(batch),
+        ordinal_(ordinal) {
+      result_.docCount = batch->docCount;
+      result_.deleteCount = batch->deleteCount;
+      result_.firstDocIndex = batch->firstDocIndex;
+    }
+
+    void done(IndexWriter& iw) noexcept override {
+      try {
+        unused(iw);
+        try {
+          auto* resp = finishResponse();
+          result_.status = resp->status;
+          result_.updateVersion = resp->update_version;
+          result_.errorMessage = std::string(resp->error_message);
+          result_.ids.reserve(resp->ids.size());
+          for (std::string_view id : resp->ids) result_.ids.emplace_back(id);
+          result_.errors.reserve(resp->errors.size());
+          for (const auto& e : resp->errors) {
+            result_.errors.push_back({std::string(e.id), std::string(e.error_message), e.index});
+          }
+        } catch (const std::exception& e) {
+          result_.failed = true;
+          result_.errorMessage = e.what();
+        } catch (...) {
+          result_.failed = true;
+          result_.errorMessage = "unknown non-standard exception";
+        }
+
+        auto keepAlive = shared_from_this();
+        auto batchGuard = batch_.lock();
+        assert(batchGuard != nullptr);
+        // post still allocates handler storage.  If that allocation fails, the
+        // outer catch protects the shared update graph, but this connection
+        // loses its completion and remains pinned until bounded-drain recovery
+        // is added.
+        net::post(session_->stream_.get_executor(),
+            [session = session_, state = state_, ordinal = ordinal_,
+             keepAlive = std::move(keepAlive), batchGuard,
+             result = std::move(result_)]() mutable {
+              session->onStreamBatchDone(state, ordinal, std::move(result));
+              unused(keepAlive);
+              unused(batchGuard);
+            });
+      } catch (const std::exception& e) {
+        try {
+          LOG_ERROR("StreamingUpdateMessage::done completion handoff failed: msg={} "
+                    "ordinal={} exception={}", (void*)this, ordinal_, e.what());
+        } catch (...) {
+        }
+      } catch (...) {
+        try {
+          LOG_ERROR("StreamingUpdateMessage::done completion handoff failed: msg={} "
+                    "ordinal={} unknown exception", (void*)this, ordinal_);
+        } catch (...) {
+        }
+      }
+    }
+  };
 
   void doRead() {
     parser_.emplace();
@@ -425,6 +529,7 @@ private:
     buffer_.clear();
     bufferedBody_.clear();
     streamUpdate_.reset();
+    terminalStreamingFailure_ = false;
     http::async_read_header(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onRead, shared_from_this()));
   }
@@ -1125,11 +1230,17 @@ private:
 
   void startStreamingUpdate(std::string coll, bool urlCommit) {
     const auto& ingest = node_.getConfig().ingest;
+    std::size_t arenaConcurrency =
+        (std::size_t)std::max(1, node_.getTaskArena().max_concurrency());
+    std::size_t maxInFlight = ingest.max_inflight_batches == 0
+        ? arenaConcurrency + 2
+        : (std::size_t)ingest.max_inflight_batches;
     auto state = std::make_shared<HttpStreamUpdateState>(
         (std::size_t)ingest.stream_batch_size,
         (std::size_t)ingest.stream_batch_docs,
         (std::size_t)ingest.maxRecordBytes(),
-        (std::size_t)ingest.max_request_body);
+        (std::size_t)ingest.max_request_body,
+        maxInFlight);
     state->defaultCollectionName = std::move(coll);
     state->group.collectionName = state->defaultCollectionName;
     state->urlCommit = urlCommit;
@@ -1141,7 +1252,10 @@ private:
 
   void doStreamBodyRead() {
     auto state = streamUpdate_;
-    if (!state || state->failed || state->updateInFlight) return;
+    if (!state || state->failed || state->readInFlight || !state->canAdmit() ||
+        state->batchReady || state->urlCommitInFlight) {
+      return;
+    }
     if (parser_->is_done()) {
       state->bodyDone = true;
       drainStreamRecords();
@@ -1156,13 +1270,20 @@ private:
     // async_read would instead wait until readBuf fills or the body ends, so the `{}`
     // ack would never arrive before EOF and the client would deadlock. Do not "optimize"
     // this to async_read.
+    state->readInFlight = true;
     http::async_read_some(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
   }
 
   void onStreamBodyRead(beast::error_code ec, std::size_t) {
     auto state = streamUpdate_;
-    if (!state || state->failed) return;
+    if (!state) return;
+    state->readInFlight = false;
+    if (state->failed) {
+      parser_.reset();
+      return;
+    }
+    if (state->inputFailurePending) return;
 
     bool needBuffer = ec == http::error::need_buffer;
     if (ec && !needBuffer) {
@@ -1174,7 +1295,7 @@ private:
     if (produced > 0) {
       state->framer.feed(std::string_view(state->readBuf.data(), produced));
       if (state->framer.error()) {
-        failStreamingUpdate(state->framer.message());
+        failStreamingInput(state->framer.message());
         return;
       }
     }
@@ -1287,22 +1408,45 @@ private:
     auto state = streamUpdate_;
     if (state && state->failed) return;
     std::size_t docsIndexed = state ? state->docsIndexedSoFar : 0;
-    if (state) state->failed = true;
-    parser_.reset();
+    if (state) {
+      state->failed = true;
+      state->completedBatchResults.clear();
+      if (state->inFlight == 0) state->ioPin.reset();
+    }
+    // A pipelined batch can fail while the next body read is outstanding.
+    // Beast's composed read still owns the parser in that case; its completion
+    // observes failed and releases it above.
+    if (!state || !state->readInFlight) parser_.reset();
     keepAlive_ = false;
+    terminalStreamingFailure_ = true;
     message += " (docs_indexed_so_far=" + std::to_string(docsIndexed) + ")";
     if (headerSent_) {
       std::string out;
       std::string_view requestId = state ? currentStreamResponseRequestId(*state) : std::string_view();
       std::uint64_t updateVersion = state ? state->interval.lastUpdateVersion : 0;
       if (!renderStreamErrorResponseLine(requestId, updateVersion, message, out)) {
-        doClose();
+        doTerminalStreamingClose();
         return;
       }
       enqueueLine(std::move(out), true);
       return;
     }
     respondSimple(http::status::bad_request, "application/json", renderErrorBody(message));
+  }
+
+  // Fatal input is ordered after every batch submitted before the bad record.
+  // Preserve that stream position by draining and folding the submitted prefix
+  // before rendering the failure and its docs_indexed_so_far count.
+  void failStreamingInput(std::string message) {
+    auto state = streamUpdate_;
+    if (!state || state->failed || state->inputFailurePending) return;
+    if (state->inFlight == 0) {
+      failStreamingUpdate(std::move(message));
+      return;
+    }
+    assert(!state->barrierPending);
+    state->inputFailurePending = std::move(message);
+    state->barrierPending = true;
   }
 
   static bool streamRequestHasInlineOps(const HttpUpdateReqProto& request) {
@@ -1352,70 +1496,63 @@ private:
     }
   }
 
-  void submitPreparedStreamBatch() {
+  bool submitPreparedStreamBatch(bool barrierSubmission = false) {
     auto state = streamUpdate_;
     assert(state != nullptr);
-    assert(!state->updateInFlight);
     assert(state->batch != nullptr);
+    assert(state->batchReady);
+    if (!barrierSubmission && !state->canAdmit()) return false;
+    assert(state->inFlight < state->maxInFlight);
 
     std::string err;
     HttpStreamWriterTarget* target = streamWriterTarget(state->batch->collectionName, err);
     if (target == nullptr) {
       failStreamingUpdate("failed to resolve collection '" + state->batch->collectionName + "': " + err);
-      return;
+      return false;
     }
 
     std::shared_ptr<HttpStreamBatchState> batch(std::move(state->batch));
     state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
-    state->updateInFlight = true;
-
+    state->batchReady = false;
+    std::uint64_t ordinal = state->nextSubmitOrdinal++;
     auto iw = target->indexWriter;
-    auto ioPin = state->ioPin;
-    node_.getTaskArena().enqueue(
-        [self = shared_from_this(), state, batch, iw, ioPin] {
-          HttpStreamBatchResult result;
-          result.docCount = batch->docCount;
-          result.deleteCount = batch->deleteCount;
-          result.firstDocIndex = batch->firstDocIndex;
-          try {
-            class BlockingUpdateMessage : public ProtoUpdateMessage {
-            public:
-              Blocker blocker;
-              explicit BlockingUpdateMessage(const HttpUpdateReqProto* req) : ProtoUpdateMessage(req) {}
-              void done(IndexWriter& iw) override {
-                unused(iw);
-                blocker.notify();
-              }
-            };
+    auto message = std::make_shared<StreamingUpdateMessage>(
+        &batch->proto, shared_from_this(), state, ordinal, batch);
+    batch->message = message;
+    auto [entry, inserted] = state->inFlightBatches.emplace(ordinal, batch);
+    unused(entry);
+    assert(inserted);
+    unused(inserted);
+    state->inFlight++;
 
-            BlockingUpdateMessage msg(&batch->proto);
-            bool success = iw->submitUpdate(&msg);
-            assert(success);
-            unused(success);
-            msg.blocker.wait();
-            auto* resp = msg.finishResponse();
-            result.status = resp->status;
-            result.updateVersion = resp->update_version;
-            result.errorMessage = std::string(resp->error_message);
-            result.ids.reserve(resp->ids.size());
-            for (std::string_view id : resp->ids) result.ids.emplace_back(id);
-            result.errors.reserve(resp->errors.size());
-            for (const auto& e : resp->errors) {
-              result.errors.push_back({std::string(e.id), std::string(e.error_message), e.index});
-            }
-          } catch (const std::exception& e) {
-            result.failed = true;
-            result.errorMessage = e.what();
-          } catch (...) {
-            result.failed = true;
-            result.errorMessage = "unknown non-standard exception";
-          }
-
-          net::post(self->stream_.get_executor(),
-              [self, state, batch, ioPin, result = std::move(result)]() mutable {
-                self->onStreamBatchDone(state, batch, std::move(result));
-              });
-        });
+    // This handler runs on the session strand.  execute enters the node arena
+    // only for the immediate try_put and returns without waiting for indexing.
+    // Consecutive calls therefore reach startUpdateNode in stream order; enqueue
+    // would not preserve the updateVersion ordering required by overwrite.
+    bool success = false;
+    std::string submitError;
+    try {
+      node_.getTaskArena().execute([&] { success = iw->submitUpdate(message.get()); });
+    } catch (const std::exception& e) {
+      submitError = e.what();
+    } catch (...) {
+      submitError = "unknown non-standard exception";
+    }
+    if (!success) {
+      HttpStreamBatchResult result;
+      result.docCount = batch->docCount;
+      result.deleteCount = batch->deleteCount;
+      result.firstDocIndex = batch->firstDocIndex;
+      result.failed = true;
+      result.errorMessage = submitError.empty()
+          ? "update graph rejected the NDJSON batch"
+          : "update graph submission failed: " + submitError;
+      // Dead today: startUpdateNode is a queueing function_node, so try_put
+      // always accepts.  This becomes reentrant under a rejecting policy.
+      onStreamBatchDone(state, ordinal, std::move(result));
+      return false;
+    }
+    return true;
   }
 
   void accountStreamSubmission(HttpStreamBatchState& batch, std::size_t docCount,
@@ -1430,10 +1567,12 @@ private:
     state->interval.submitted = true;
   }
 
-  void submitStreamBatch(const solux::api::CommitParams* commitParams) {
+  bool submitStreamBatch(const solux::api::CommitParams* commitParams,
+                         bool barrierSubmission = false) {
     auto state = streamUpdate_;
     assert(state != nullptr);
     assert(state->batch != nullptr);
+    assert(!state->batchReady);
 
     accountStreamSubmission(*state->batch, state->batch->docs.size(), 0);
     state->batch->proto.docs = state->batch->docs.finish();
@@ -1441,10 +1580,10 @@ private:
     state->batch->proto.all_or_none = state->group.allOrNone();
     state->batch->proto.request_id =
         solux::api::build::arenaStr(state->batch->resource, state->group.requestId);
-    // Only fetch ids while the interval can still retain more (capped at
-    // kMaxRetainedIds); past the cap the engine's ids are discarded in the fold, so
-    // skip the work on later slices of a large group.  Strict read/batch alternation
-    // means the prior slice's fold already ran, so interval.ids is current here.
+    // Once the folded prefix reaches the retention cap, later slices can skip
+    // building ids.  With pipelining, already-submitted earlier slices may not
+    // have folded yet, so a bounded window can still request a few excess id
+    // vectors; ordinal folding below keeps the response cap deterministic.
     state->batch->proto.return_ids =
         state->group.returnIds() && state->interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds;
     state->batch->requestOwner = state->group.request;
@@ -1453,7 +1592,8 @@ private:
       copyCommitParams(state->batch->proto.commit, *commitParams, state->batch->resource);
     }
 
-    submitPreparedStreamBatch();
+    state->batchReady = true;
+    return submitPreparedStreamBatch(barrierSubmission);
   }
 
   bool submitInlineStreamRequest(const std::shared_ptr<HttpStreamControlRequest>& request) {
@@ -1482,7 +1622,11 @@ private:
     }
     state->emitAfterBatch = true;
     state->resetGroupAfterBatch = true;
-    submitPreparedStreamBatch();
+    state->batchReady = true;
+    bool submitted = submitPreparedStreamBatch(true);
+    if (!submitted && !state->failed) {
+      failStreamingUpdate("internal error: failed to submit inline _update_ barrier");
+    }
     return false;
   }
 
@@ -1506,7 +1650,10 @@ private:
     if (state->batch->docs.size() > 0 || commitParams != nullptr) {
       state->emitAfterBatch = true;
       state->resetGroupAfterBatch = true;
-      submitStreamBatch(commitParams);
+      bool submitted = submitStreamBatch(commitParams, true);
+      if (!submitted && !state->failed) {
+        failStreamingUpdate("internal error: failed to submit NDJSON close barrier");
+      }
       return false;
     }
 
@@ -1538,6 +1685,10 @@ private:
   bool applyStreamControl(HttpStreamControl control) {
     auto state = streamUpdate_;
     assert(state != nullptr);
+    assert(state->barrierPending);
+    assert(state->inFlight == 0);
+    assert(control.kind != HttpStreamControlKind::Noop);
+
     if (control.kind == HttpStreamControlKind::Open) {
       if (state->group.open || streamIntervalHasActivity(*state) || state->batch->docs.size() > 0) {
         if (!closeCurrentStreamGroup(nullptr, state->group.open)) {
@@ -1551,76 +1702,17 @@ private:
     return closeCurrentStreamGroup(control.request, true);
   }
 
-  bool processStreamRecord(std::string_view record) {
+  void continueStreamBarrier() {
     auto state = streamUpdate_;
-    assert(state != nullptr);
-    assert(state->batch != nullptr);
+    if (!state || state->failed || !state->barrierPending || state->inFlight != 0) return;
+    assert(state->completedBatchResults.empty());
 
-    solux::api::Map map;
-    std::string err;
-    if (!solux::api::read_json(map, record, state->batch->resource, &err)) {
-      failStreamingUpdate(err.empty() ? "malformed NDJSON record" : err);
-      return false;
-    }
-
-    HttpStreamControl control;
-    bool isControl = false;
-    if (!extractStreamControl(map, control, isControl, record.size(), err)) {
-      failStreamingUpdate(err);
-      return false;
-    }
-
-    if (isControl && control.kind != HttpStreamControlKind::Noop) {
-      return applyStreamControl(std::move(control));
-    }
-
-    if (isControl) {
-      // Noop meta record (e.g. _header_).  It was decoded into the batch
-      // arena, so it must count toward rotation or a stream of meta records
-      // would grow the arena without bound.  With no docs buffered an empty
-      // batch carries no state (proto/collection are populated at submission),
-      // so past the target it is simply replaced - the same rotation
-      // submitStreamBatch performs, minus the submit.  With docs pending, fall
-      // through to the shared accounting and let the normal thresholds rotate.
-      if (state->batch->docs.size() == 0) {
-        state->batch->sourceBytes += record.size();
-        if (state->batch->sourceBytes >= state->batchTargetBytes) {
-          state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
-        }
-        return true;
-      }
-    } else {
-      startImplicitStreamGroup();
-      state->batch->docs.push_back(map);
-    }
-    state->batch->sourceBytes += record.size();
-    if (state->group.allOrNone()) {
-      if (state->batch->sourceBytes > state->maxRequestBody) {
-        failStreamingUpdate("all_or_none NDJSON group exceeds ingest.max-request-body");
-        return false;
-      }
-      return true;
-    }
-    if (state->batch->sourceBytes >= state->batchTargetBytes ||
-        state->batch->docs.size() >= state->batchMaxDocs) {
-      submitStreamBatch(nullptr);
-      return false;
-    }
-    return true;
-  }
-
-  void onStreamBatchDone(const std::shared_ptr<HttpStreamUpdateState>& state,
-                         const std::shared_ptr<HttpStreamBatchState>& batch,
-                         HttpStreamBatchResult result) {
-    unused(batch);
-    if (streamUpdate_ != state || state->failed) return;
-    state->updateInFlight = false;
-    if (result.failed) {
-      failStreamingUpdate("NDJSON update batch failed: " + result.errorMessage);
+    if (state->inputFailurePending) {
+      std::string message = std::move(*state->inputFailurePending);
+      state->inputFailurePending.reset();
+      failStreamingUpdate(std::move(message));
       return;
     }
-
-    foldStreamBatchResult(result);
 
     if (state->emitAfterBatch) {
       state->emitAfterBatch = false;
@@ -1635,6 +1727,134 @@ private:
       HttpStreamControl control = std::move(*state->pendingControl);
       state->pendingControl.reset();
       if (!applyStreamControl(std::move(control))) return;
+    }
+
+    if (state->eofPending) {
+      bool forceEmit = state->group.open || !state->emittedLine;
+      if (!closeCurrentStreamGroup(nullptr, forceEmit)) return;
+      state->eofPending = false;
+      state->barrierPending = false;
+      finishStreamingUpdate();
+      return;
+    }
+
+    state->barrierPending = false;
+    net::post(stream_.get_executor(), [self = shared_from_this(), state] {
+      if (self->streamUpdate_ == state && !state->failed) self->drainStreamRecords();
+    });
+  }
+
+  bool beginStreamControlBarrier(HttpStreamControl control) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    assert(!state->barrierPending);
+    assert(!state->pendingControl);
+    assert(control.kind != HttpStreamControlKind::Noop);
+    state->barrierPending = true;
+    state->pendingControl = std::move(control);
+    continueStreamBarrier();
+    return false;
+  }
+
+  bool processStreamRecord(std::string_view record) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    assert(state->batch != nullptr);
+    assert(!state->batchReady);
+
+    solux::api::Map map;
+    std::string err;
+    if (!solux::api::read_json(map, record, state->batch->resource, &err)) {
+      failStreamingInput(err.empty() ? "malformed NDJSON record" : err);
+      return false;
+    }
+
+    HttpStreamControl control;
+    bool isControl = false;
+    if (!extractStreamControl(map, control, isControl, record.size(), err)) {
+      failStreamingInput(err);
+      return false;
+    }
+
+    if (isControl) {
+      // Noop meta record (e.g. _header_).  It was decoded into the batch
+      // arena, so it must count toward rotation or a stream of meta records
+      // would grow the arena without bound.  With no docs buffered an empty
+      // batch carries no state (proto/collection are populated at submission),
+      // so past the target it is simply replaced - the same rotation
+      // submitStreamBatch performs, minus the submit.  With docs pending the
+      // bytes stay in that batch, but the no-op itself never forces submission.
+      if (control.kind == HttpStreamControlKind::Noop) {
+        state->batch->sourceBytes += record.size();
+        if (state->group.allOrNone() && state->batch->sourceBytes > state->maxRequestBody) {
+          failStreamingInput("all_or_none NDJSON group exceeds ingest.max-request-body");
+          return false;
+        }
+        if (state->batch->docs.size() == 0 &&
+            state->batch->sourceBytes >= state->batchTargetBytes) {
+          state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
+        }
+        return true;
+      }
+      return beginStreamControlBarrier(std::move(control));
+    } else {
+      startImplicitStreamGroup();
+      state->batch->docs.push_back(map);
+    }
+    state->batch->sourceBytes += record.size();
+    if (state->group.allOrNone()) {
+      if (state->batch->sourceBytes > state->maxRequestBody) {
+        failStreamingInput("all_or_none NDJSON group exceeds ingest.max-request-body");
+        return false;
+      }
+      return true;
+    }
+    if (state->batch->sourceBytes >= state->batchTargetBytes ||
+        state->batch->docs.size() >= state->batchMaxDocs) {
+      if (!submitStreamBatch(nullptr)) return false;
+      return state->canAdmit();
+    }
+    return true;
+  }
+
+  void onStreamBatchDone(const std::shared_ptr<HttpStreamUpdateState>& state,
+                         std::uint64_t ordinal,
+                         HttpStreamBatchResult result) {
+    auto entry = state->inFlightBatches.find(ordinal);
+    if (entry == state->inFlightBatches.end()) return;
+    assert(state->inFlight > 0);
+    state->inFlight--;
+    state->inFlightBatches.erase(entry);
+
+    if (state->failed || streamUpdate_ != state) {
+      if (state->inFlight == 0) state->ioPin.reset();
+      return;
+    }
+
+    auto [completed, inserted] =
+        state->completedBatchResults.emplace(ordinal, std::move(result));
+    unused(completed);
+    assert(inserted);
+    unused(inserted);
+    for (;;) {
+      auto next = state->completedBatchResults.find(state->nextFoldOrdinal);
+      if (next == state->completedBatchResults.end()) break;
+      HttpStreamBatchResult nextResult = std::move(next->second);
+      state->completedBatchResults.erase(next);
+      state->nextFoldOrdinal++;
+      if (nextResult.failed) {
+        failStreamingUpdate("NDJSON update batch failed: " + nextResult.errorMessage);
+        return;
+      }
+      foldStreamBatchResult(nextResult);
+    }
+
+    if (state->barrierPending) {
+      continueStreamBarrier();
+      return;
+    }
+    if (state->batchReady && state->canAdmit()) {
+      if (!submitPreparedStreamBatch()) return;
     }
     drainStreamRecords();
   }
@@ -1684,29 +1904,38 @@ private:
 
   void drainStreamRecords() {
     auto state = streamUpdate_;
-    if (!state || state->failed || state->updateInFlight || state->urlCommitInFlight) return;
+    if (!state || state->failed || state->barrierPending || state->urlCommitInFlight) return;
+
+    if (state->batchReady) {
+      if (!state->canAdmit() || !submitPreparedStreamBatch()) return;
+    }
+    if (!state->canAdmit()) return;
 
     std::string_view record;
-    while (state->framer.next(record)) {
+    while (state->canAdmit() && state->framer.next(record)) {
       if (!processStreamRecord(record)) return;
-      if (state->failed || state->updateInFlight) return;
+      if (state->failed || state->barrierPending || state->batchReady) return;
     }
+    if (!state->canAdmit()) return;
 
     if (state->bodyDone) {
       if (!state->tailFinished) {
         state->tailFinished = true;
         if (state->framer.finish(record)) {
           if (!processStreamRecord(record)) return;
-          if (state->failed || state->updateInFlight) return;
+          if (state->failed || state->barrierPending || state->batchReady ||
+              !state->canAdmit()) {
+            return;
+          }
         } else if (state->framer.error()) {
-          failStreamingUpdate(state->framer.message());
+          failStreamingInput(state->framer.message());
           return;
         }
       }
 
-      bool forceEmit = state->group.open || !state->emittedLine;
-      if (!closeCurrentStreamGroup(nullptr, forceEmit)) return;
-      finishStreamingUpdate();
+      state->eofPending = true;
+      state->barrierPending = true;
+      continueStreamBarrier();
       return;
     }
 
@@ -1855,6 +2084,11 @@ private:
     LOG_TRACE("http write: {}", ec.message());
     errored_ = true;
     aborted_.store(true, std::memory_order_relaxed);
+    if (streamUpdate_ && !streamUpdate_->failed) {
+      streamUpdate_->failed = true;
+      streamUpdate_->completedBatchResults.clear();
+      if (streamUpdate_->inFlight == 0) streamUpdate_->ioPin.reset();
+    }
     // Pending entries are just owned strings (their arenas were freed in reply()),
     // so dropping them frees everything.
     int64_t dropped = 0;
@@ -1864,7 +2098,8 @@ private:
     // Wake paused producers so their requests can finish (and be freed); their
     // next reply() observes CANCEL via aborted_.
     maybeFireDrainWaiters();
-    doClose();
+    if (terminalStreamingFailure_) doTerminalStreamingClose();
+    else doClose();
   }
 
   // Strand only.  Hands parked producer resumes to the task arena once the
@@ -1894,7 +2129,8 @@ private:
       headerSent_ = lastSeen_ = chunkLastSent_ = false;
       doRead();
     } else {
-      doClose();
+      if (terminalStreamingFailure_) doTerminalStreamingClose();
+      else doClose();
     }
   }
 
@@ -1909,8 +2145,13 @@ private:
     resp->prepare_payload();
     http::async_write(stream_, *resp,
         [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
-          if (ec) { self->doClose(); return; }
+          if (ec) {
+            if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
+            else self->doClose();
+            return;
+          }
           if (resp->keep_alive()) self->doRead();
+          else if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
           else self->doClose();
         });
   }
@@ -1930,6 +2171,12 @@ private:
   void doClose() {
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+  }
+
+  void doTerminalStreamingClose() {
+    beast::error_code ec;
+    stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
+    stream_.socket().close(ec);
   }
 };
 
