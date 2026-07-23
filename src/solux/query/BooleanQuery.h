@@ -938,12 +938,13 @@ public:
                               leadCost != std::numeric_limits<int64_t>::max());
       }
 
-      // Build a bulk conjunction from the required clause boundaries. For a
-      // filtered count, filters are ordinary zero-scoring conjuncts and a
-      // constraining optional group is one disjunction conjunct. The scored
-      // path keeps its existing pure-mandatory and single-phase gate.
+      // Build a bulk conjunction from the required clause boundaries. During
+      // exhaustive unscored execution, filters are ordinary zero-scoring
+      // conjuncts and a constraining optional group is one disjunction
+      // conjunct. The scored path keeps its existing pure-mandatory and
+      // single-phase gate.
       BulkScorer* conjunctionBulkScorer(MemPool& targetPool,
-                                        bool filteredCount) {
+                                        bool exhaustive) {
         struct Entry {
           int64_t cost;
           Query::ScorerSupplier* supplier;
@@ -957,7 +958,7 @@ public:
           }
           entries.push_back({supplier->cost(), supplier, false});
         }
-        if (filteredCount) {
+        if (exhaustive) {
           for (auto* supplier : filterSuppliers) {
             if (supplier == nullptr) {
               return nullptr;
@@ -969,7 +970,7 @@ public:
         boost::container::small_vector<Query::ScorerSupplier*, 16>
             optionalGroupSuppliers;
         boost::container::small_vector<int64_t, 16> optionalGroupCosts;
-        bool hasOptionalGroup = filteredCount && minShouldMatch >= 1
+        bool hasOptionalGroup = exhaustive && minShouldMatch >= 1
             && !optionalSources.empty();
         if (hasOptionalGroup) {
           for (auto* source : optionalSources) {
@@ -1017,7 +1018,7 @@ public:
           } else {
             scorer = entries[i].supplier->get(targetPool, leadCost);
           }
-          if (scorer == nullptr || (!filteredCount && scorer->hasTwoPhase())) {
+          if (scorer == nullptr || (!exhaustive && scorer->hasTwoPhase())) {
             return nullptr;
           }
           arr[i] = scorer;
@@ -1353,6 +1354,11 @@ public:
         }
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
+          // Two-phase clauses stay on the pull conjunction even unscored: it
+          // flattens phrase approximations into the doc-level leapfrog and
+          // verifies positions only on full agreement, while an opaque
+          // phrase advance() verifies eagerly and loses badly (5x on a
+          // dense-phrase + term conjunction).
           return conjunctionBulkScorer(targetPool, false);
         }
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
@@ -2038,6 +2044,10 @@ public:
       : lead(lead), filterWords(filterWords), combinedWords(combinedWords),
         filterCard(filterCard), maxDoc(maxDoc) {}
 
+    bool supportsMatchWindows() const override {
+      return lead->supportsMatchWindows();
+    }
+
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* incoming,
                             int32_t min, int32_t max,
                             float minCompetitiveScore) override {
@@ -2059,6 +2069,20 @@ public:
       }
       std::fill(out.scores.begin(), out.scores.begin() + out.size, 0.0f);
       return next;
+    }
+
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* incoming,
+                            int32_t min, int32_t max) override {
+      if (filterWords.empty()) {
+        return lead->matchNextWindow(out, incoming, min, max);
+      }
+      if (incoming == nullptr) {
+        BitDocSet filter(FixedBitSet(filterWords.data(), maxDoc), filterCard);
+        return lead->matchNextWindow(out, &filter, min, max);
+      }
+      combineWith(incoming);
+      BitDocSet filter(FixedBitSet(combinedWords.data(), maxDoc), combinedCard);
+      return lead->matchNextWindow(out, &filter, min, max);
     }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
@@ -3778,26 +3802,23 @@ public:
       }
     }
 
-    int32_t countNextWindowDense(int64_t& count, DocSetBuilder* domainOut,
-                                 DocSet* filter, int32_t min, int32_t max) {
-      int32_t windowBase = ratchetDenseWindow(min, max);
+    bool fillDenseWindowBits(DocSet* filter, int32_t min, int32_t max,
+                             int32_t& windowBase, int32_t& windowEnd) {
+      windowBase = ratchetDenseWindow(min, max);
+      windowEnd = windowBase;
       if (windowBase >= max) {
-        return windowBase;
+        return false;
       }
 
       int32_t requestedEnd = windowBase + kWindowSize;
       if (requestedEnd < windowBase) {
         requestedEnd = max;
       }
-      int32_t windowEnd = std::min(requestedEnd, max);
+      windowEnd = std::min(requestedEnd, max);
 
-      skipCount(SkipStats::conjDenseCountWindows);
-      if (denseHasDisjGroup) {
-        skipCount(SkipStats::conjDisjGroupCountWindows);
-      }
       if (windowFilter != nullptr
           && windowFilter->prepare(windowBase, windowEnd) == 0) {
-        return windowEnd >= max ? PostingsReader::END : windowEnd;
+        return false;
       }
       clearWindowBits(windowBits);
       fillDenseClauseWindowBits(0, windowBits, windowBase, windowEnd);
@@ -3828,7 +3849,44 @@ public:
       if (windowFilter != nullptr) {
         windowFilter->intersect(windowBits);
       }
+      return true;
+    }
 
+    void emitWindowBits(ScoreWindow& out, int32_t windowBase,
+                        int32_t windowEnd) const {
+      int32_t innerSize = windowEnd - windowBase;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          assert(out.size < kWindowSize);
+          out.docs[(size_t) out.size] = windowBase + index;
+          out.size++;
+          bits &= bits - 1;
+        }
+      }
+    }
+
+    int32_t countNextWindowDense(int64_t& count, DocSetBuilder* domainOut,
+                                 DocSet* filter, int32_t min, int32_t max) {
+      int32_t windowBase;
+      int32_t windowEnd;
+      bool windowReady = fillDenseWindowBits(
+          filter, min, max, windowBase, windowEnd);
+      if (windowBase >= max) {
+        return windowBase;
+      }
+      skipCount(SkipStats::conjDenseCountWindows);
+      if (denseHasDisjGroup) {
+        skipCount(SkipStats::conjDisjGroupCountWindows);
+      }
+      if (!windowReady) {
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
       if (domainOut != nullptr) {
         domainOut->addWindowWords(windowBits.data(), windowBase, windowEnd);
       }
@@ -3837,27 +3895,27 @@ public:
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
-    template <bool TermFast>
-    int32_t countNextWindowSparse(int64_t& count, DocSetBuilder* domainOut,
-                                  DocSet* filter, int32_t min, int32_t max) {
-      skipCount(SkipStats::conjCountFallbacks);
+    template <bool TermFast, typename Consumer>
+    int32_t visitNextWindowSparse(DocSet* filter, int32_t min, int32_t max,
+                                  int32_t& windowEnd, Consumer consume) {
+      windowEnd = max;
       if (windowFilter != nullptr && !windowFilter->probes()) {
         int32_t requestedEnd = min + kWindowSize;
         if (requestedEnd < min) {
           requestedEnd = max;
         }
-        max = std::min(max, requestedEnd);
-        if (windowFilter->prepare(min, max) == 0) {
-          return max;
+        windowEnd = std::min(max, requestedEnd);
+        if (windowFilter->prepare(min, windowEnd) == 0) {
+          return windowEnd;
         }
       }
       int32_t target = min;
-      while (target < max) {
+      while (target < windowEnd) {
         int32_t doc = scorerDocId<TermFast>(0);
         if (doc < target) {
           doc = scorerCountAdvance<TermFast>(0, target);
         }
-        if (doc >= max) {
+        if (doc >= windowEnd) {
           return doc;  // sound resume point (or END); covers doc == END
         }
         target = doc;
@@ -3879,14 +3937,32 @@ public:
         }
 
         if (acceptsDoc(filter, target)) {
-          count++;
-          if (domainOut != nullptr) {
-            domainOut->add(target);
+          bool keepGoing = consume(target);
+          target++;
+          if (!keepGoing) {
+            windowEnd = target;
+            return target;
           }
+        } else {
+          target++;
         }
-        target++;
       }
-      return target;  // >= max: a failing clause's position or matched doc + 1
+      return target;  // >= windowEnd: failing clause position or matched doc + 1
+    }
+
+    template <bool TermFast>
+    int32_t countNextWindowSparse(int64_t& count, DocSetBuilder* domainOut,
+                                  DocSet* filter, int32_t min, int32_t max) {
+      skipCount(SkipStats::conjCountFallbacks);
+      int32_t windowEnd;
+      return visitNextWindowSparse<TermFast>(
+          filter, min, max, windowEnd, [&](int32_t doc) {
+            count++;
+            if (domainOut != nullptr) {
+              domainOut->add(doc);
+            }
+            return true;
+          });
     }
 
   public:
@@ -3977,6 +4053,10 @@ public:
       return denseCountPath;
     }
 
+    bool supportsMatchWindows() const override {
+      return true;
+    }
+
     bool attachWindowFilter(WindowFilter* filter) override {
       if (!allTermClauses) {
         return false;
@@ -3995,6 +4075,54 @@ public:
       return allTermScorers
           ? scoreNextWindowImpl<true>(out, filter, min, max, minCompetitiveScore)
           : scoreNextWindowImpl<false>(out, filter, min, max, minCompetitiveScore);
+    }
+
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (denseCountPath) {
+        int32_t windowBase;
+        int32_t windowEnd;
+        bool windowReady = fillDenseWindowBits(
+            filter, min, max, windowBase, windowEnd);
+        if (windowBase >= max) {
+          out.max = max;
+          return windowBase;
+        }
+        skipCount(SkipStats::conjDenseMatchWindows);
+        out.min = windowBase;
+        out.max = windowEnd;
+        if (windowReady) {
+          emitWindowBits(out, windowBase, windowEnd);
+        }
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+
+      skipCount(SkipStats::conjMatchFallbacks);
+      int32_t windowEnd;
+      auto emit = [&](int32_t doc) {
+        assert(out.size < kWindowSize);
+        out.docs[(size_t) out.size] = doc;
+        out.size++;
+        return out.size < kWindowSize;
+      };
+      int32_t next = allTermScorers
+          ? visitNextWindowSparse<true>(filter, min, max, windowEnd, emit)
+          : visitNextWindowSparse<false>(filter, min, max, windowEnd, emit);
+      out.max = windowEnd;
+      return next;
     }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,

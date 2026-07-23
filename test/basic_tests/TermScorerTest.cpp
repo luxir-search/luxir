@@ -5779,6 +5779,43 @@ TEST_F(TermScorerTest, conjunctionDenseCountMatchesPullWithFilters) {
   EXPECT_GT(SkipStats::conjDenseCountWindows, 0);
   EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
 
+  DocSetBuilder countedDocs(N);
+  int64_t firstWindowCount = 0;
+  int32_t countNext;
+  {
+    auto queries = makeTermQueries(terms);
+    auto mandatory = queryPointers(queries);
+    BooleanQuery query(mandatory, {}, {}, {});
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* countScorer = supplier->bulkScorer(testIndex.pool);
+    ASSERT_NE(countScorer, nullptr);
+    countNext = countScorer->countNextWindow(
+        firstWindowCount, &countedDocs, nullptr, 0, segment.maxDoc());
+  }
+  {
+    auto queries = makeTermQueries(terms);
+    auto mandatory = queryPointers(queries);
+    BooleanQuery query(mandatory, {}, {}, {});
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* matchScorer = supplier->bulkScorer(testIndex.pool);
+    ASSERT_NE(matchScorer, nullptr);
+    ASSERT_TRUE(matchScorer->supportsMatchWindows());
+    ScoreWindow matches;
+    int32_t matchNext = matchScorer->matchNextWindow(
+        matches, nullptr, 0, segment.maxDoc());
+    EXPECT_EQ(matchNext, countNext);
+    ASSERT_EQ(matches.size, firstWindowCount);
+    auto domain = countedDocs.build();
+    ASSERT_EQ(domain->card(), firstWindowCount);
+    for (int32_t i = 0; i < matches.size; i++) {
+      EXPECT_TRUE(domain->get(matches.docs[(size_t) i]));
+    }
+  }
+
   pull = countPullTermConjunctionSegment(testIndex.pool, qContext, segment, terms, bitsetFilter.get());
   bulk = countBulkTermConjunctionSegment(testIndex.pool, qContext, segment, terms, bitsetFilter.get());
   EXPECT_EQ(bulk, pull);

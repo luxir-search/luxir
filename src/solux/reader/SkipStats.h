@@ -98,11 +98,13 @@ struct SkipStats {
   // straight from the stream, without decoding to the doc buffer.
   static inline int64_t countBulkFillWordBlocks = 0;
   static inline int64_t conjDenseCountWindows = 0;
+  static inline int64_t conjDenseMatchWindows = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
   // Pure disjunction count windows containing exact all-term conjunction members.
   static inline int64_t disjConjGroupCountWindows = 0;
   static inline int64_t conjCountFallbacks = 0;
+  static inline int64_t conjMatchFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t constantPullDomainCollections = 0;
   static inline int64_t numericRangeSparseVerifyArms = 0;
@@ -199,10 +201,12 @@ struct SkipStats {
     countBulkFillContiguousBlocks = 0;
     countBulkFillWordBlocks = 0;
     conjDenseCountWindows = 0;
+    conjDenseMatchWindows = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;
     disjConjGroupCountWindows = 0;
     conjCountFallbacks = 0;
+    conjMatchFallbacks = 0;
     bulkDomainWindowsFed = 0;
     constantPullDomainCollections = 0;
     numericRangeSparseVerifyArms = 0;

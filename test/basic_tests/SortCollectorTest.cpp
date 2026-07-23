@@ -6,13 +6,16 @@
 #include "solux/search/FieldSortCollector.h"
 #include "solux/search/SortField.h"
 #include "solux/search/ops/TopDocsReq.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/schema/FieldType.h"
 #include "solux/util/random.h"
-#include <charconv>
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <utility>
 
 using namespace solux;
 using namespace solux::test;
@@ -47,11 +50,27 @@ public:
   }
 };
 
+class SortSkipStatsGuard {
+  bool saved;
+
+public:
+  SortSkipStatsGuard() : saved(SkipStats::enabled) {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+  ~SortSkipStatsGuard() {
+    SkipStats::enabled = saved;
+  }
+};
+
 struct FieldSortBulkResult {
   std::vector<std::string> ids;
   std::vector<int64_t> ints;
   std::vector<std::string> strings;
   int64_t hitCount = 0;
+  int64_t denseMatchWindows = 0;
+  int64_t sparseMatchWindows = 0;
+  int64_t bulkFillCalls = 0;
 };
 
 } // namespace
@@ -65,7 +84,9 @@ protected:
   static std::vector<std::string> resultIds(const LocalReq& req) {
     const auto* docs = req.docList("q");
     if (docs == nullptr) return {};
-    const auto& col = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+    const auto* column = docs->columns.find("id_s");
+    if (column == nullptr) return {};
+    const auto& col = std::get<solux::api::ColStr>(column->kind);
     std::vector<std::string> ids;
     for (auto id : col.v) ids.emplace_back(id);
     return ids;
@@ -154,6 +175,159 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
   assertParity(false, "sort_i", qb::DESC, 1000);
   assertParity(false, "sort_s", qb::ASC, 17);
   assertParity(true, "sort_s", qb::DESC, 1000);
+}
+
+TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
+  constexpr int32_t segmentDocs = DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper;
+  std::vector<std::string> deleted;
+  for (int32_t segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    docs.reserve(segmentDocs);
+    for (int32_t local = 0; local < segmentDocs; local++) {
+      int32_t doc = segment * segmentDocs + local;
+      std::string id = "c" + std::to_string(doc);
+      std::string body = "alpha beta gamma common quick fox ";
+      body += (local & 1) == 0 ? "zero_a " : "zero_b ";
+      if ((local % 5) != 0) body += "keep ";
+      if ((local % 701) == 0) body += "rare2 ";
+      if ((local % 733) == 0) body += "rare3 ";
+      int64_t sortValue = (doc * 37) % 10007;
+      docs.push_back(flatdoc(
+          "id", id, "id_s", id, "body_w", body,
+          "sort_i", sortValue,
+          "sort_s", "s" + std::to_string(100000 + sortValue)));
+      if ((local % 997) == 0) {
+        deleted.push_back(id);
+      }
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  enum class Shape {
+    DENSE_TWO,
+    DENSE_THREE,
+    SPARSE_TWO,
+    SPARSE_THREE,
+    DISJ_GROUP,
+    PHRASE,
+    FILTERED,
+    FILTER_ONLY,
+    ZERO,
+  };
+  enum class MatchPath {
+    DENSE,
+    SPARSE,
+    FILTER_ONLY,
+    PULL,  // two-phase clauses keep the pull conjunction; no bulk windows
+  };
+
+  auto buildQuery = [](std::pmr::memory_resource& mr, Shape shape) {
+    auto term = [&](std::string_view value) {
+      return qb::match(mr, "body_w", value);
+    };
+    switch (shape) {
+      case Shape::DENSE_TWO:
+        return qb::boolean(mr, {term("alpha"), term("beta")});
+      case Shape::DENSE_THREE:
+        return qb::boolean(
+            mr, {term("alpha"), term("beta"), term("gamma")});
+      case Shape::SPARSE_TWO:
+        return qb::boolean(mr, {term("rare2"), term("common")});
+      case Shape::SPARSE_THREE:
+        return qb::boolean(
+            mr, {term("rare3"), term("alpha"), term("beta")});
+      case Shape::DISJ_GROUP: {
+        auto group = qb::boolean(
+            mr, {}, {term("beta"), term("gamma")});
+        return qb::boolean(mr, {term("alpha"), group});
+      }
+      case Shape::PHRASE:
+        return qb::boolean(
+            mr, {term("alpha"),
+                 qb::phraseWords(mr, "body_w", {"quick", "fox"})});
+      case Shape::FILTERED:
+        return qb::boolean(
+            mr, {term("alpha"), term("beta")}, {}, {}, {term("keep")});
+      case Shape::FILTER_ONLY: {
+        auto disjunction = qb::boolean(
+            mr, {}, {term("rare2"), term("rare3")});
+        return qb::boolean(
+            mr, {}, {}, {}, {disjunction, term("common")});
+      }
+      case Shape::ZERO:
+        return qb::boolean(mr, {term("zero_a"), term("zero_b")});
+    }
+    std::unreachable();
+  };
+
+  auto run = [&](bool disableBulk, Shape shape, std::string_view sortField,
+                 qb::SortDir direction) {
+    FieldSortBulkGuard bulkGuard(disableBulk);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cursor = req->topDocs("q").getNumber().limit(97)
+        .fields({"id_s"});
+    cursor.rawQuery() = buildQuery(cursor.mr(), shape);
+    qb::sort(cursor, sortField, direction);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+    FieldSortBulkResult result;
+    result.hitCount = req->getMatchCount("q");
+    result.ids = resultIds(*req);
+    result.denseMatchWindows = SkipStats::conjDenseMatchWindows;
+    result.sparseMatchWindows = SkipStats::conjMatchFallbacks;
+    result.bulkFillCalls = SkipStats::countBulkFillCalls;
+    return result;
+  };
+
+  auto assertParity = [&](Shape shape, MatchPath expectedPath,
+                          std::string_view sortField,
+                          qb::SortDir direction) {
+    auto pull = run(true, shape, sortField, direction);
+    auto bulk = run(false, shape, sortField, direction);
+    EXPECT_EQ(pull.ids, bulk.ids);
+    EXPECT_EQ(pull.hitCount, bulk.hitCount);
+    if (expectedPath == MatchPath::DENSE) {
+      EXPECT_GT(bulk.denseMatchWindows, 0);
+    } else if (expectedPath == MatchPath::SPARSE) {
+      EXPECT_GT(bulk.sparseMatchWindows, 0);
+    } else if (expectedPath == MatchPath::FILTER_ONLY) {
+      EXPECT_GT(bulk.bulkFillCalls, 0);
+    } else {
+      EXPECT_EQ(bulk.denseMatchWindows, 0);
+      EXPECT_EQ(bulk.sparseMatchWindows, 0);
+    }
+  };
+
+  constexpr std::array<std::pair<std::string_view, qb::SortDir>, 4> sorts = {{
+    {"sort_i", qb::ASC},
+    {"sort_i", qb::DESC},
+    {"sort_s", qb::ASC},
+    {"sort_s", qb::DESC},
+  }};
+  constexpr std::array<std::pair<Shape, MatchPath>, 9> shapes = {{
+    {Shape::DENSE_TWO, MatchPath::DENSE},
+    {Shape::DENSE_THREE, MatchPath::DENSE},
+    {Shape::SPARSE_TWO, MatchPath::SPARSE},
+    {Shape::SPARSE_THREE, MatchPath::SPARSE},
+    {Shape::DISJ_GROUP, MatchPath::DENSE},
+    {Shape::PHRASE, MatchPath::PULL},
+    {Shape::FILTERED, MatchPath::DENSE},
+    {Shape::FILTER_ONLY, MatchPath::FILTER_ONLY},
+    {Shape::ZERO, MatchPath::DENSE},
+  }};
+  for (auto [shape, expectedPath] : shapes) {
+    for (auto [field, direction] : sorts) {
+      SCOPED_TRACE("shape=" + std::to_string((int32_t) shape)
+                   + " field=" + std::string(field)
+                   + " direction=" + std::to_string((int32_t) direction));
+      assertParity(shape, expectedPath, field, direction);
+    }
+  }
 }
 
 TEST_F(SortCollectorTest, testPQ) {
