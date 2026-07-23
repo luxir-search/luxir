@@ -66,13 +66,9 @@ public:
     out.appendTag(FilterKeyTag::TERM);
     out.appendString(field);
     out.appendTerm(term);
-    out.appendFloat(boost);
-    out.appendBool(useFrontierBound);
-    out.appendBool(hasInjectedTermStats);
-    if (hasInjectedTermStats) {
-      out.appendInt64(injectedTermStats.docFreq);
-      out.appendInt64(injectedTermStats.totalTermFreq);
-    }
+    // Membership key: boost, the frontier-bound granularity flag, and
+    // injected scoring stats all shape scores or skipping, never which docs
+    // contain the term, so score-decorated variants share one entry.
     return FilterKeyScope::SEGMENT_STABLE;
   }
 

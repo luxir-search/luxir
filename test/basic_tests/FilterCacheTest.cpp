@@ -1749,6 +1749,18 @@ TEST(FilterKeyTest, booleanOptionalsEncodeOnlyWhenTheyAffectMembership) {
   EXPECT_NE(keyFor(oneOptional), keyFor(twoOptionals));
 }
 
+TEST(FilterKeyTest, termScoreAndExecutionStateStaysOutOfMembershipKey) {
+  TermQuery plain("body_w", "alpha");
+  TermQuery boosted("body_w", "alpha", 2.5f);
+  TermQuery noFrontier("body_w", "alpha", 1.0f, /*useFrontierBound=*/false);
+  TermQuery injected("body_w", "alpha", Similarity::TermStats{123, 456});
+  EXPECT_EQ(keyFor(plain, 7), keyFor(boosted, 7));
+  EXPECT_EQ(keyFor(plain, 7), keyFor(noFrontier, 7));
+  EXPECT_EQ(keyFor(plain, 7), keyFor(injected, 7));
+  TermQuery otherTerm("body_w", "beta");
+  EXPECT_FALSE(keyFor(plain, 7) == keyFor(otherTerm, 7));
+}
+
 TEST(FilterKeyTest, scoreAndExecutionWrappersPreserveMembershipKey) {
   TermQuery term("f", "v");
   BoostQuery boost(&term, 2.0f);
