@@ -48,6 +48,10 @@ public:
     return false;
   }
 
+  virtual bool supportsMatchWindows() const {
+    return false;
+  }
+
   // Attach a lazy, window-local filter to scored execution. The filter is
   // prepared by the bulk scorer only after it has selected the final
   // production-window bounds. Unsupported bulk scorers reject the attach.
@@ -62,6 +66,16 @@ public:
   // The spans in out are valid until the next call.
   virtual int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
                                   float minCompetitiveScore) = 0;
+
+  // Emit the matching docs of the next window in [min, max), intersected
+  // with filter, without scores (out.scores contents are unspecified).
+  // Exhaustive like countNextWindow: there is no competitive threshold.
+  // Returns the resume docid under the same contract as scoreNextWindow.
+  virtual int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                                  int32_t min, int32_t max) {
+    return scoreNextWindow(out, filter, min, max,
+                           std::numeric_limits<float>::lowest());
+  }
 
   // Count (rather than emit) the matches of the next window in [min, max),
   // intersected with filter. Adds to count and returns the resume docid like

@@ -597,6 +597,32 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
 }
 
+// Collect exhaustive match-only windows in doc order. Scores are intentionally
+// absent from this path; collectors receive the unscored sentinel literal.
+template <typename Collector>
+void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
+                              DocSetBuilder* builder, Collector& collector,
+                              int32_t maxDoc) {
+  assert(bulk != nullptr);
+  int32_t cursor = 0;
+  ScoreWindow window;
+  while (cursor != PostingsReader::END && cursor < maxDoc) {
+    int32_t next = bulk->matchNextWindow(window, filter, cursor, maxDoc);
+    for (int32_t i = 0; i < window.size; i++) {
+      int32_t doc = window.docs[(size_t) i];
+      if (builder != nullptr) {
+        builder->add(doc);
+      }
+      collector.collect(segnum, doc, 0.0f);
+    }
+    if (next == PostingsReader::END) {
+      break;
+    }
+    assert(next > cursor);
+    cursor = next;
+  }
+}
+
 // Rank score windows into a top-k collector. This is intentionally only a
 // ranking primitive; callers that need an exact count or materialized domain
 // compose it with countMatchesWindowed using an independent scorer supplier.

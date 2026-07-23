@@ -31,6 +31,8 @@ public:
   // A/B baseline for measuring folded Boolean filters against the former
   // passive TopDocs domain path. Default false means folding is enabled.
   static inline bool disableTopDocsFilterFoldForTests = false;
+  // A/B baseline for unscored field-sort match-window collection.
+  static inline bool disableFieldSortBulkForTests = false;
 
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;
@@ -323,15 +325,34 @@ public:
           if (counted) {
             // fall through to the sub-calc/merge tail below
           } else if (data->useFieldSort) {
-            auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
-            if (scorer != nullptr) {
-              data->fieldCollector->setSegment(segnum, &seg.postingsReader());
-              std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
-              if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
-                expressionBindings.emplace(
-                    *data->fieldCollector, poolGuard.pool(), seg.postingsReader());
+            bool usedBulk = false;
+            if (!disableFieldSortBulkForTests && !data->fieldCollector->needsScores) {
+              auto* bulk = supplier->bulkScorer(poolGuard.pool());
+              if (bulk != nullptr && bulk->supportsMatchWindows()) {
+                data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+                std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
+                if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
+                  expressionBindings.emplace(
+                      *data->fieldCollector, poolGuard.pool(), seg.postingsReader());
+                }
+                collectTopKMatchWindowed(
+                    segnum, bulk, collectorFilter, builderPtr,
+                    *data->fieldCollector, seg.maxDoc());
+                usedBulk = true;
               }
-              collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
+            }
+            if (!usedBulk) {
+              auto* scorer = supplier->get(
+                  poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              if (scorer != nullptr) {
+                data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+                std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
+                if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
+                  expressionBindings.emplace(
+                      *data->fieldCollector, poolGuard.pool(), seg.postingsReader());
+                }
+                collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
+              }
             }
           } else {
             // Pruning is enabled only when an exact count can either be omitted

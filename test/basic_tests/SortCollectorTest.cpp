@@ -5,6 +5,7 @@
 #include "test/QueryBuild.h"
 #include "solux/search/FieldSortCollector.h"
 #include "solux/search/SortField.h"
+#include "solux/search/ops/TopDocsReq.h"
 #include "solux/schema/FieldType.h"
 #include "solux/util/random.h"
 #include <charconv>
@@ -33,6 +34,26 @@ struct StringSortResult {
   bool operator==(const StringSortResult&) const = default;
 };
 
+class FieldSortBulkGuard {
+  bool saved;
+
+public:
+  explicit FieldSortBulkGuard(bool disabled)
+      : saved(TopDocsReq::disableFieldSortBulkForTests) {
+    TopDocsReq::disableFieldSortBulkForTests = disabled;
+  }
+  ~FieldSortBulkGuard() {
+    TopDocsReq::disableFieldSortBulkForTests = saved;
+  }
+};
+
+struct FieldSortBulkResult {
+  std::vector<std::string> ids;
+  std::vector<int64_t> ints;
+  std::vector<std::string> strings;
+  int64_t hitCount = 0;
+};
+
 } // namespace
 
 class SortCollectorTest : public SoluxTest {
@@ -50,6 +71,90 @@ protected:
     return ids;
   }
 };
+
+TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
+  CollectionHelper helper;
+  std::vector<Doc> segment;
+  std::vector<std::string> deleted;
+  for (int32_t i = 0; i < 384; i++) {
+    std::string id = "d" + std::to_string(i);
+    std::string body;
+    if ((i & 1) == 0) body += "alpha ";
+    if (i % 3 == 0) body += "beta ";
+    if (i % 5 == 0) body += "gamma ";
+    if (body.empty()) body = "other";
+    int64_t sortValue = (i * 37) % 503;
+    segment.push_back(flatdoc(
+        "id", id, "id_s", id, "body_w", body,
+        "sort_i", sortValue,
+        "sort_s", "v" + std::to_string(1000 + sortValue)));
+    if (i % 11 == 0) {
+      deleted.push_back(id);
+    }
+    if (segment.size() == 192) {
+      ASSERT_TRUE(helper.indexAll(segment, UpdateMessage::COMMIT).success);
+      segment.clear();
+    }
+  }
+  ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  auto run = [&](bool disableBulk, bool disjConj, std::string_view sortField,
+                 qb::SortDir direction, int32_t limit) {
+    FieldSortBulkGuard guard(disableBulk);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cursor = req->topDocs("q").getNumber().limit(limit)
+        .fields({"id_s", "sort_i", "sort_s"});
+    auto& mr = cursor.mr();
+    if (disjConj) {
+      auto betaGamma = qb::boolean(
+          mr, {qb::match(mr, "body_w", "beta"),
+               qb::match(mr, "body_w", "gamma")});
+      cursor.rawQuery() = qb::boolean(
+          mr, {}, {qb::match(mr, "body_w", "alpha"), betaGamma});
+    } else {
+      cursor.rawQuery() = qb::boolean(
+          mr, {}, {qb::match(mr, "body_w", "alpha"),
+                   qb::match(mr, "body_w", "beta"),
+                   qb::match(mr, "body_w", "gamma")});
+    }
+    qb::sort(cursor, sortField, direction);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+    FieldSortBulkResult result;
+    const auto* docs = req->docList("q");
+    EXPECT_NE(docs, nullptr);
+    if (docs == nullptr) return result;
+    result.hitCount = docs->found.value_or(0);
+    const auto& ids =
+        std::get<solux::api::ColStr>(docs->columns.at("id_s").kind).v;
+    const auto& ints =
+        std::get<solux::api::ColInt>(docs->columns.at("sort_i").kind).v;
+    const auto& strings =
+        std::get<solux::api::ColStr>(docs->columns.at("sort_s").kind).v;
+    result.ids.assign(ids.begin(), ids.end());
+    result.ints.assign(ints.begin(), ints.end());
+    result.strings.reserve(strings.size());
+    for (auto value : strings) result.strings.emplace_back(value);
+    return result;
+  };
+
+  auto assertParity = [&](bool disjConj, std::string_view sortField,
+                          qb::SortDir direction, int32_t limit) {
+    auto pull = run(true, disjConj, sortField, direction, limit);
+    auto bulk = run(false, disjConj, sortField, direction, limit);
+    EXPECT_EQ(pull.ids, bulk.ids);
+    EXPECT_EQ(pull.ints, bulk.ints);
+    EXPECT_EQ(pull.strings, bulk.strings);
+    EXPECT_EQ(pull.hitCount, bulk.hitCount);
+  };
+
+  assertParity(false, "sort_i", qb::ASC, 9);
+  assertParity(false, "sort_i", qb::DESC, 1000);
+  assertParity(false, "sort_s", qb::ASC, 17);
+  assertParity(true, "sort_s", qb::DESC, 1000);
+}
 
 TEST_F(SortCollectorTest, testPQ) {
   // make sure segment takes priority over docid

@@ -5095,12 +5095,18 @@ public:
       }
     }
 
-    int32_t countDisjConjWindow(int64_t& count, DocSetBuilder* domainOut,
-                                DocSet* filter, int32_t min, int32_t max) {
+    bool prepareExhaustiveWindow(int32_t min, int32_t max) {
       setWindowBounds(min, max);
       if (windowFilter != nullptr
           && windowFilter->prepare(windowStart, windowEnd) == 0) {
-        return windowEnd >= max ? PostingsReader::END : windowEnd;
+        return false;
+      }
+      return true;
+    }
+
+    bool fillDisjConjWindowBits(DocSet* filter, int32_t min, int32_t max) {
+      if (!prepareExhaustiveWindow(min, max)) {
+        return false;
       }
       skipCount(SkipStats::disjConjGroupCountWindows);
       fillDisjConjCountBits();
@@ -5112,13 +5118,78 @@ public:
       if (windowFilter != nullptr) {
         windowFilter->intersect(windowBits);
       }
-      if (domainOut != nullptr) {
-        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+      return true;
+    }
+
+    bool fillArrayFilterWindowBits(DocSet* filter, int32_t min, int32_t max) {
+      assert(filter != nullptr && filter->type == DocSet::ARRAY);
+      if (!prepareExhaustiveWindow(min, max)) {
+        return false;
       }
-      for (uint64_t bits : windowBits) {
-        count += std::popcount(bits);
+      clearWindowBits();
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      for (size_t i = 0; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        if (scorer->docId() < windowStart) {
+          scorer->advance(windowStart);
+        }
+        int32_t n;
+        while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                           Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+          for (int32_t j = 0; j < n; j++) {
+            if (acceptsDoc(filter, nullptr, blockDocs[j])) {
+              setWindowBit(blockDocs[j] - windowStart);
+            }
+          }
+        }
       }
-      return windowEnd >= max ? PostingsReader::END : windowEnd;
+      return true;
+    }
+
+    bool fillPlainWindowBits(DocSet* filter, int32_t min, int32_t max) {
+      assert(filter == nullptr || filter->type == DocSet::BITSET);
+      if (!prepareExhaustiveWindow(min, max)) {
+        return false;
+      }
+      clearWindowBits();
+      for (size_t i = 0; i < scorers.size(); i++) {
+        scorers[i]->fillWindowBits(windowBits, windowStart, windowEnd);
+      }
+      if (filter != nullptr) {
+        applyDomainBits(&((BitDocSet*) filter)->bits());
+      }
+      if (windowFilter != nullptr) {
+        windowFilter->intersect(windowBits);
+      }
+      return true;
+    }
+
+    bool fillExhaustiveWindowBits(DocSet* filter, int32_t min, int32_t max) {
+      if (disjConjCountPath) {
+        return fillDisjConjWindowBits(filter, min, max);
+      }
+      if (filter != nullptr && filter->type == DocSet::ARRAY) {
+        return fillArrayFilterWindowBits(filter, min, max);
+      }
+      return fillPlainWindowBits(filter, min, max);
+    }
+
+    void emitWindowBits(ScoreWindow& out) {
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          out.docs[(size_t) out.size] = windowStart + index;
+          out.size++;
+          bits &= bits - 1;
+        }
+      }
     }
 
     void setWindowBit(int32_t index) {
@@ -5601,6 +5672,10 @@ public:
       configureDisjConjCount(pool, enableDisjConjCount);
     }
 
+    bool supportsMatchWindows() const override {
+      return true;
+    }
+
     bool attachWindowFilter(WindowFilter* filter) override {
       assert(windowFilter == nullptr);
       windowFilter = filter;
@@ -5722,6 +5797,47 @@ public:
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (shouldDriveFromDomain(filter)) {
+        setWindowBounds(min, max);
+        domainDriveWindows++;
+        prepareOutputWindow(out);
+        if (windowFilter != nullptr
+            && windowFilter->prepare(windowStart, windowEnd) == 0) {
+          return windowEnd >= max ? PostingsReader::END : windowEnd;
+        }
+        forEachDomainDoc(filter, [&](int32_t doc) {
+          if (matchesAnyClause(doc)) {
+            assert(out.size < kWindowSize);
+            out.docs[(size_t) out.size] = doc;
+            out.size++;
+          }
+        });
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+
+      bool windowReady = fillExhaustiveWindowBits(filter, min, max);
+      prepareOutputWindow(out);
+      if (windowReady) {
+        emitWindowBits(out);
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
     // Exhaustive window count: per-clause block drives OR into the window
     // bitset, then popcount. No score rows, no impact bookkeeping, no
     // candidate materialization - counting needs none of them. Only used for
@@ -5756,60 +5872,8 @@ public:
         });
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
-      if (disjConjCountPath) {
-        return countDisjConjWindow(count, domainOut, filter, min, max);
-      }
-
-      const FixedBitSet* domainBits = nullptr;
-      if (filter != nullptr && filter->type == DocSet::BITSET) {
-        domainBits = &((BitDocSet*) filter)->bits();
-      } else if (filter != nullptr) {
-        setWindowBounds(min, max);
-        if (windowFilter != nullptr
-            && windowFilter->prepare(windowStart, windowEnd) == 0) {
-          return windowEnd >= max ? PostingsReader::END : windowEnd;
-        }
-        clearWindowBits();
-        int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
-        float blockScores[Postings::DOCS_BLOCK_SIZE];
-        for (size_t i = 0; i < scorers.size(); i++) {
-          auto* scorer = scorers[i];
-          if (scorer->docId() < windowStart) {
-            scorer->advance(windowStart);
-          }
-          int32_t n;
-          while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
-                                             Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
-            for (int32_t j = 0; j < n; j++) {
-              if (acceptsDoc(filter, nullptr, blockDocs[j])) {
-                setWindowBit(blockDocs[j] - windowStart);
-              }
-            }
-          }
-        }
-        for (size_t w = 0; w < windowBits.size(); w++) {
-          count += std::popcount(windowBits[w]);
-        }
-        if (domainOut != nullptr) {
-          domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
-        }
+      if (!fillExhaustiveWindowBits(filter, min, max)) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
-      }
-
-      setWindowBounds(min, max);
-      if (windowFilter != nullptr
-          && windowFilter->prepare(windowStart, windowEnd) == 0) {
-        return windowEnd >= max ? PostingsReader::END : windowEnd;
-      }
-      clearWindowBits();
-      for (size_t i = 0; i < scorers.size(); i++) {
-        scorers[i]->fillWindowBits(windowBits, windowStart, windowEnd);
-      }
-      if (domainBits != nullptr) {
-        applyDomainBits(domainBits);
-      }
-      if (windowFilter != nullptr) {
-        windowFilter->intersect(windowBits);
       }
       if (domainOut != nullptr) {
         domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
