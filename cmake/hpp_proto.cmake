@@ -30,6 +30,10 @@ target_compile_features(is_utf8 PUBLIC cxx_std_17)
 # optimization in every preset so validation is fast in debug/asan builds too. Do NOT
 # add -march here: that would pin the binary to the build host and undercut dispatch.
 target_compile_options(is_utf8 PRIVATE -O3)
+# GCC 16 flags is_utf8's own push_options/pop_options target-region macros as a
+# mismatched-pragma warning; it is the vendored dep's code, not ours, so keep it a
+# warning rather than letting the tree's -Werror fail the (clean) asan build on it.
+target_compile_options(is_utf8 PRIVATE -Wno-error=pragmas)
 
 # --- runtime (header-only) interface for consumers of generated code ---
 add_library(hpp_proto_runtime INTERFACE)
