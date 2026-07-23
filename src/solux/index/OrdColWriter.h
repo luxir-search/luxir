@@ -19,6 +19,11 @@
 
 namespace solux {
 
+// Ord columns write no LinearPack tail pad (finish(false)); a column at a data
+// file's tail relies on the SVB_OVERREAD_PAD every data file reserves. Enforce
+// that the shared file pad covers LinearPack's wider bulk-decode overread.
+static_assert(SVB_OVERREAD_PAD >= LinearPack::TAIL_PAD);
+
 class OrdColWriter {
 public:
   enum class FormatOverride : uint8_t {
@@ -106,7 +111,7 @@ private:
           std::span<const uint32_t>(block.data(), count));
       byteSize += sizeof(OrdColumnFormat::PredictedBlockInfo);
       if (plan.info.bits != 0) {
-        byteSize += LinearPack::byteSize(count, plan.info.bits);
+        byteSize += LinearPack::packedByteSize(count, plan.info.bits);
       }
       plans.push_back(plan);
       count = 0;
@@ -124,7 +129,7 @@ private:
     LinearPack::Writer writer(out, bits);
     forEachEncodedValue(indexing, rankToDoc,
                         [&](uint32_t ord) { writer.append(ord); });
-    writer.finish();
+    writer.finish(false);  // segment data files reserve SVB_OVERREAD_PAD
   }
 
   void writePredicted(OutputStream& out, int32_t indexing,
@@ -148,7 +153,7 @@ private:
                  LinearPack::mask32(plan.info.bits));
           writer.append(residual);
         }
-        writer.finish();
+        writer.finish(false);  // blocks are contiguous; file reserves the pad
       }
       count = 0;
     };
@@ -207,7 +212,7 @@ public:
         ? SegFieldInfo::ORD_DOCID : SegFieldInfo::ORD_RANK;
     uint8_t bits = (uint8_t)std::bit_width((uint64_t)fieldInfo.nTerms);
     int64_t encodedValues = indexing == SegFieldInfo::ORD_DOCID ? maxDoc : nValues;
-    uint64_t directSize = LinearPack::byteSize((uint64_t)encodedValues, bits);
+    uint64_t directSize = LinearPack::packedByteSize((uint64_t)encodedValues, bits);
     uint64_t predictedSize = 0;
     std::vector<BlockPlan> plans = planPredicted(indexing, rankToDoc, predictedSize);
 

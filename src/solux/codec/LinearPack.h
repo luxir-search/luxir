@@ -91,16 +91,24 @@ public:
       count++;
     }
 
-    uint64_t finish() {
+    // writeTailPad appends TAIL_PAD zero bytes so a standalone buffer (e.g. an
+    // in-RAM OrdMap column) can be read with the bulk/point loads' overread.
+    // Index files reserve their own trailing slack (SVB_OVERREAD_PAD per data
+    // file) and pass false, keeping the pad -- an artifact of the reader's SIMD
+    // load width, not of the data -- out of the on-disk format.
+    uint64_t finish(bool writeTailPad = true) {
       assert(!finished);
       if (pendingBits != 0) {
         writeByte((uint8_t)pending);
       }
-      for (uint8_t i = 0; i < TAIL_PAD; i++) {
-        writeByte(0);
+      if (writeTailPad) {
+        for (uint8_t i = 0; i < TAIL_PAD; i++) {
+          writeByte(0);
+        }
       }
       finished = true;
-      assert(written == byteSize(count, bits));
+      assert(written == (writeTailPad ? byteSize(count, bits)
+                                      : packedByteSize(count, bits)));
       return written;
     }
   };
