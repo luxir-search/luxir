@@ -256,6 +256,7 @@ private:
     }
   }
 
+public:
   template <uint32_t N>
   static void unpackBlock(const char* base, uint64_t idx, uint32_t count,
                           uint8_t bits, uint32_t mask, uint32_t* values) {

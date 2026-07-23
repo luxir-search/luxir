@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <cassert>
+#include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -16,6 +20,7 @@
 #include "PostingsReader.h"
 #include "solux/codec/LinearPack.h"
 #include "solux/codec/OrdColumnFormat.h"
+#include "solux/util/log.h"
 
 namespace solux {
 
@@ -23,11 +28,25 @@ class OrdColReader {
 public:
   static constexpr uint32_t BLOCK_SIZE = OrdColumnFormat::BLOCK_SIZE;
   static constexpr uint32_t BULK_SIZE = OrdColumnFormat::BULK_SIZE;
+  // Four decode blocks are examined together to amortize loop overhead, but
+  // each 128-value block makes its own bulk-versus-point decision.
+  static constexpr int32_t ORD_BATCH_SIZE = (int32_t)BULK_SIZE * 4;
+  // The measured point-to-bulk cost ratio spans 5.5x to 10x, putting the raw
+  // 128-value crossover at 13-24 hits. Use the conservative end by default.
+  static constexpr int32_t DEFAULT_BULK_MIN_HITS = 24;
   using PredictedBlockInfo = OrdColumnFormat::PredictedBlockInfo;
   static constexpr int32_t ENDDOC = std::numeric_limits<int32_t>::max();
   static constexpr int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
 
+  struct ForEachOrdStats {
+    int64_t pointLoads = 0;
+    int64_t bulkLoads = 0;
+    int32_t pointBlocks = 0;
+    int32_t bulkBlocks = 0;
+  };
+
 private:
+  inline static std::atomic<int32_t> bulkMinHitsOverride = -1;
   DocsReader docs;
   InputStream columnIS;
   const char* blocks = nullptr;
@@ -207,6 +226,201 @@ public:
       return (int32_t)ord;
     }
   };
+
+private:
+  static uint64_t lowBitsMask(int32_t bits) {
+    assert(bits >= 0 && bits <= 64);
+    if (bits == 0) return 0;
+    if (bits == 64) return ~0ULL;
+    return (1ULL << bits) - 1;
+  }
+
+  static uint64_t windowWord(const screaming::FixedBitSet& domainBits,
+                             int32_t word,
+                             int32_t windowEnd) {
+    uint64_t bits = domainBits.words[word];
+    int32_t validBits = windowEnd - (word << 6);
+    if (validBits < 64) bits &= lowBitsMask(validBits);
+    return bits;
+  }
+
+  static void visitSetBits(const screaming::FixedBitSet& domainBits,
+                           int32_t windowStart, int32_t windowEnd,
+                           auto&& visitor) {
+    int32_t wordStart = windowStart >> 6;
+    int32_t wordEnd = (windowEnd + 63) >> 6;
+    for (int32_t word = wordStart; word < wordEnd; word++) {
+      uint64_t bits = windowWord(domainBits, word, windowEnd);
+      int32_t docBase = word << 6;
+      while (bits != 0) {
+        int32_t bit = (int32_t)std::countr_zero(bits);
+        visitor(docBase + bit);
+        bits &= bits - 1;
+      }
+    }
+  }
+
+  static bool bulkBlock(int32_t cardinality, int32_t blockBits,
+                        int32_t bulkMinHits) {
+    return (int64_t)cardinality * BULK_SIZE
+        >= (int64_t)bulkMinHits * blockBits;
+  }
+
+  void forEachPointOrd(auto&& visitDocs, int64_t& missing_num,
+                       auto&& callback, ForEachOrdStats* stats) const {
+    PointOrds values(*this);
+    if (indexing == SegFieldInfo::ORD_DOCID) {
+      assert(!multi);
+      visitDocs([&](int32_t docid) {
+        int32_t ord = values.valueAt(docid);
+        if (stats) stats->pointLoads++;
+        if (ord != 0) callback(docid, ord);
+        else missing_num++;
+      });
+      return;
+    }
+
+    screaming::BitSet::Iterator docsIter(docs.bitset());
+    bool dense = !docs.hasBitset();
+    int32_t found = -1;
+    visitDocs([&](int32_t docid) {
+      int32_t docRank;
+      if (dense) {
+        docRank = docid;
+      } else {
+        if (found < docid) found = docsIter.advance(docid);
+        if (found != docid) {
+          missing_num++;
+          return;
+        }
+        docRank = docsIter.rank();
+      }
+      if (!multi) {
+        callback(docid, values.valueAt(docRank));
+        if (stats) stats->pointLoads++;
+        return;
+      }
+      auto [start, end] = getStartEndValueRank(docRank);
+      for (int64_t rank = start; rank < end; rank++) {
+        callback(docid, values.valueAt(rank));
+        if (stats) stats->pointLoads++;
+      }
+    });
+  }
+
+public:
+  static int32_t configuredBulkMinHits() {
+    int32_t override = bulkMinHitsOverride.load();
+    if (override >= 0) return override;
+
+    const char* configured = std::getenv("SOLUX_ORD_BULK_MIN_HITS");
+    if (configured == nullptr || *configured == '\0') {
+      return DEFAULT_BULK_MIN_HITS;
+    }
+    std::string_view text(configured);
+    int32_t value = -1;
+    auto [end, error] = std::from_chars(
+        text.data(), text.data() + text.size(), value);
+    if (error == std::errc() && end == text.data() + text.size()
+        && value >= 0 && value <= (int32_t)BULK_SIZE) {
+      return value;
+    }
+    LOG_WARN("Ignoring invalid SOLUX_ORD_BULK_MIN_HITS='{}'; expected 0..{}",
+             configured, BULK_SIZE);
+    return DEFAULT_BULK_MIN_HITS;
+  }
+
+  static int32_t setBulkMinHitsForTests(int32_t value) {
+    assert(value >= -1 && value <= (int32_t)BULK_SIZE);
+    return bulkMinHitsOverride.exchange(value);
+  }
+
+  void forEachOrd(std::span<int32_t> domainDocs, int64_t& missing_num,
+                  auto&& callback, ForEachOrdStats* stats = nullptr) const {
+    forEachPointOrd(
+        [&](auto&& visitor) {
+          for (int32_t docid : domainDocs) visitor(docid);
+        },
+        missing_num, callback, stats);
+  }
+
+  void SOLUX_NOINLINE forEachDocIdBitOrd(
+      const screaming::FixedBitSet& domainBits, int32_t maxDoc,
+      int32_t bulkMinHits, int64_t& missing_num,
+      auto&& callback, ForEachOrdStats* stats = nullptr) const {
+    assert(maxDoc == maxdoc);
+    assert(bulkMinHits >= 0 && bulkMinHits <= (int32_t)BULK_SIZE);
+    assert(domainBits.size() >= maxDoc);
+    assert(indexing == SegFieldInfo::ORD_DOCID);
+    assert(!multi);
+    PointOrds pointValues(*this);
+    BulkOrds bulkValues(*this);
+    auto visitRange = [&](int32_t start, int32_t end, bool useBulk) {
+      visitSetBits(domainBits, start, end, [&](int32_t docid) {
+        int32_t ord = useBulk
+            ? bulkValues.valueAt(docid) : pointValues.valueAt(docid);
+        if (stats) {
+          if (useBulk) stats->bulkLoads++;
+          else stats->pointLoads++;
+        }
+        if (ord != 0) callback(docid, ord);
+        else missing_num++;
+      });
+    };
+
+    for (int32_t batchStart = 0; batchStart < maxDoc;
+         batchStart += ORD_BATCH_SIZE) {
+      int32_t batchEnd = std::min(batchStart + ORD_BATCH_SIZE, maxDoc);
+      std::array<int32_t, 4> cardinalities{};
+      std::array<int32_t, 4> blockEnds;
+      std::array<bool, 4> useBulk;
+      int32_t wordStart = batchStart >> 6;
+      int32_t wordEnd = (batchEnd + 63) >> 6;
+      for (int32_t word = wordStart; word < wordEnd; word++) {
+        cardinalities[(word - wordStart) >> 1] += (int32_t)std::popcount(
+            windowWord(domainBits, word, batchEnd));
+      }
+      int32_t nonemptyBlocks = 0;
+      int32_t bulkBlocks = 0;
+      for (int32_t i = 0; i < 4; i++) {
+        int32_t blockStart = batchStart + i * (int32_t)BULK_SIZE;
+        int32_t blockEnd = std::min(
+            blockStart + (int32_t)BULK_SIZE, batchEnd);
+        blockEnds[i] = blockEnd;
+        if (blockStart >= batchEnd) {
+          useBulk[i] = false;
+          continue;
+        }
+        int32_t cardinality = cardinalities[i];
+        useBulk[i] = cardinality != 0 && bulkBlock(
+            cardinality, blockEnd - blockStart, bulkMinHits);
+        if (cardinality != 0) {
+          nonemptyBlocks++;
+          if (useBulk[i]) bulkBlocks++;
+        }
+      }
+
+      if (stats) {
+        stats->bulkBlocks += bulkBlocks;
+        stats->pointBlocks += nonemptyBlocks - bulkBlocks;
+      }
+      if (bulkBlocks == 0) {
+        visitRange(batchStart, batchEnd, false);
+        continue;
+      }
+      if (bulkBlocks == nonemptyBlocks) {
+        visitRange(batchStart, batchEnd, true);
+        continue;
+      }
+
+      for (int32_t i = 0; i < 4; i++) {
+        int32_t blockStart = batchStart + i * (int32_t)BULK_SIZE;
+        int32_t blockEnd = blockEnds[i];
+        if (blockStart >= blockEnd) break;
+        visitRange(blockStart, blockEnd, useBulk[i]);
+      }
+    }
+  }
 
   class Iterator {
     const OrdColReader& col;

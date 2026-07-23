@@ -84,9 +84,10 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
     EXPECT_EQ(64, *piece.cardinality);
     EXPECT_EQ(piece.max_doc, *piece.domain_size);
     EXPECT_EQ(expectedStrategy(*piece.domain_size, *piece.cardinality), piece.strategy);
-    // Unfiltered facet: null domain -> dense scan with the bulk iterator.
+    // Unfiltered facets retain fixed bulk decoding for both rank-indexed and
+    // docid-indexed columns.
     ASSERT_GE(piece.details.size(), 1u);
-    EXPECT_EQ("all-docs domain, bulk column scan", piece.details[0]);
+    EXPECT_EQ("all-docs domain, bulk ord loads", piece.details[0]);
     EXPECT_GT(piece.thread_id, 0);
     EXPECT_LT(piece.elapsed_us, 60'000'000u);
   }

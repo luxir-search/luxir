@@ -11,12 +11,23 @@
 namespace solux {
 
 // How the domain will be walked, for the piece's human-readable detail.
-// ARRAY domains point-select ords; bitset/null domains scan bulk frames for
-// DOCID columns or presence ranks for RANK columns.
+// ARRAY domains point-select ords. Bitset domains adapt for DOCID columns and
+// retain fixed bulk decoding for RANK columns; null domains use fixed bulk.
+inline const char* domainDesc(DocSet* domain, bool docIdIndexed) {
+  if (domain == nullptr) {
+    return "all-docs domain, bulk ord loads";
+  }
+  if (domain->type == DocSet::Type::ARRAY) {
+    return "array domain, point ord loads";
+  }
+  return docIdIndexed ? "bitset domain, adaptive point/bulk ord loads"
+                      : "bitset domain, bulk ord loads";
+}
+
 inline const char* domainDesc(DocSet* domain) {
-  return domain == nullptr ? "all-docs domain, bulk column scan"
+  return domain == nullptr ? "all-docs domain"
       : domain->type == DocSet::Type::ARRAY ? "array domain, point ord loads"
-                                            : "bitset domain, bulk column scan";
+                                            : "bitset domain";
 }
 
 //
@@ -416,7 +427,8 @@ public:
           const char* using_ = countVec ? "vector" : countMap ? "hash" : "skinny";
           profile->wire.cardinality = globVals;
           profile->wire.strategy = want;
-          profile->details.emplace_back(domainDesc(domain));
+          profile->details.emplace_back(domainDesc(
+              domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
           if (repUpgraded) {
             // This piece grew the shared accumulator (and paid the fold).
             profile->details.emplace_back(std::string("upgraded shared counters to ") + using_);

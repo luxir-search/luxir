@@ -8,6 +8,7 @@
 #include "solux/index/MergeCostModel.h"
 #include "solux/index/OrdColWriter.h"
 #include "solux/reader/OrdColReader.h"
+#include "solux/search/ops/DomainIter.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -26,6 +27,17 @@ public:
   explicit OrdFormatGuard(OrdColWriter::FormatOverride value)
       : saved(OrdColWriter::setFormatOverrideForTests(value)) {}
   ~OrdFormatGuard() { OrdColWriter::setFormatOverrideForTests(saved); }
+};
+
+class OrdBulkMinHitsGuard {
+  int32_t saved;
+
+public:
+  explicit OrdBulkMinHitsGuard(int32_t value)
+      : saved(OrdColReader::setBulkMinHitsForTests(value)) {}
+  ~OrdBulkMinHitsGuard() {
+    OrdColReader::setBulkMinHitsForTests(saved);
+  }
 };
 
 struct FacetOutput {
@@ -64,6 +76,16 @@ void verifyPredictedShape(bool descending, bool jitter) {
   EXPECT_EQ(SegFieldInfo::ORD_PREDICTED, field.fieldInfo.ordFormat);
   EXPECT_EQ(SegFieldInfo::ORD_DOCID, field.fieldInfo.ordIndexing);
   EXPECT_EQ(13, field.fieldInfo.ordBits);
+}
+
+std::vector<char> encodeDocOrds(int32_t count, uint8_t bits) {
+  std::vector<char> encoded(LinearPack::byteSize((uint64_t)count, bits));
+  LinearPack::Writer writer(encoded.data(), bits);
+  for (int32_t doc = 0; doc < count; doc++) {
+    writer.append((uint32_t)doc + 1);
+  }
+  writer.finish();
+  return encoded;
 }
 
 } // namespace
@@ -168,6 +190,181 @@ TEST_F(OrdColFormatTest, bitWidthOneAndThirtyTwoDecode) {
   for (int32_t doc = 0; doc < (int32_t)values.size(); doc++) {
     EXPECT_EQ((int32_t)values[doc], reader.ordAt(doc));
   }
+}
+
+TEST_F(OrdColFormatTest, arrayDomainAlwaysUsesPointOrds) {
+  constexpr int32_t count = 1024;
+  std::vector<char> encoded = encodeDocOrds(count, 11);
+  OrdColReader reader(encoded.data(), count, 11);
+  ArrDocSet domain(std::vector<int32_t>{0, 127, 128, 511, 512, 1023});
+  OrdBulkMinHitsGuard threshold(0);
+  OrdColReader::ForEachOrdStats stats;
+  std::vector<std::pair<int32_t, int32_t>> seen;
+  int64_t missing = 0;
+
+  forEachOrdValue(&domain, reader, count, missing,
+      [&](int32_t doc, int32_t ord) {
+        seen.emplace_back(doc, ord);
+      },
+      &stats);
+
+  ASSERT_EQ(domain.docs().size(), seen.size());
+  for (auto [doc, ord] : seen) EXPECT_EQ(doc + 1, ord);
+  EXPECT_EQ(0, missing);
+  EXPECT_EQ((int64_t)seen.size(), stats.pointLoads);
+  EXPECT_EQ(0, stats.bulkLoads);
+  EXPECT_EQ(0, stats.bulkBlocks);
+}
+
+TEST_F(OrdColFormatTest, docIdIndexedBitDomainChoosesPerBlockAtThreshold) {
+  constexpr int32_t count = 256;
+  std::vector<char> encoded = encodeDocOrds(count, 9);
+  OrdColReader reader(encoded.data(), count, 9);
+  ASSERT_TRUE(reader.docIdIndexed());
+  RAMBitDocSet domain(count);
+  for (int32_t doc : {0, 64, 127, 128, 129, 191, 255}) {
+    domain.mutableBits().set(doc);
+  }
+  OrdBulkMinHitsGuard threshold(4);
+  OrdColReader::ForEachOrdStats stats;
+  std::vector<int32_t> seen;
+  int64_t missing = 0;
+
+  forEachOrdValue(&domain, reader, count, missing,
+      [&](int32_t doc, int32_t ord) {
+        EXPECT_EQ(doc + 1, ord);
+        seen.push_back(doc);
+      },
+      &stats);
+
+  EXPECT_EQ((std::vector<int32_t>{0, 64, 127, 128, 129, 191, 255}), seen);
+  EXPECT_EQ(0, missing);
+  EXPECT_EQ(3, stats.pointLoads);
+  EXPECT_EQ(4, stats.bulkLoads);
+  EXPECT_EQ(1, stats.pointBlocks);
+  EXPECT_EQ(1, stats.bulkBlocks);
+}
+
+TEST_F(OrdColFormatTest, bitDomainScalesThresholdForTailBlock) {
+  constexpr int32_t count = 192;
+  std::vector<char> encoded = encodeDocOrds(count, 8);
+  OrdColReader reader(encoded.data(), count, 8);
+  RAMBitDocSet domain(count);
+  for (int32_t doc = 65; doc < 128; doc++) {
+    domain.mutableBits().set(doc);
+  }
+  for (int32_t doc = 128; doc < 160; doc++) {
+    domain.mutableBits().set(doc);
+  }
+  OrdBulkMinHitsGuard threshold(64);
+  OrdColReader::ForEachOrdStats stats;
+  std::vector<int32_t> seen;
+  int64_t missing = 0;
+
+  forEachOrdValue(&domain, reader, count, missing,
+      [&](int32_t doc, int32_t ord) {
+        EXPECT_EQ(doc + 1, ord);
+        seen.push_back(doc);
+      },
+      &stats);
+
+  ASSERT_EQ(95, (int32_t)seen.size());
+  EXPECT_EQ(65, seen.front());
+  EXPECT_EQ(127, seen[62]);
+  EXPECT_EQ(128, seen[63]);
+  EXPECT_EQ(159, seen.back());
+  EXPECT_EQ(63, stats.pointLoads);
+  EXPECT_EQ(32, stats.bulkLoads);
+  EXPECT_EQ(1, stats.pointBlocks);
+  EXPECT_EQ(1, stats.bulkBlocks);
+  EXPECT_EQ(0, missing);
+}
+
+TEST_F(OrdColFormatTest, rankIndexedArrayDomainAlwaysUsesPointOrds) {
+  TestIndex index;
+  TestField field(index, "tags_ss");
+  field.startIndexing();
+  field.addStrings(0, {"a", "b"});
+  field.addStrings(2, {"c"});
+  field.addStrings(5, {"d", "e", "f"});
+  index.flush();
+  field.startReading();
+  ASSERT_EQ(0, field.nextDoc());
+  ASSERT_EQ(SegFieldInfo::ORD_RANK, field.fieldInfo.ordIndexing);
+  ASSERT_TRUE(field.ordReader->multiValued());
+
+  ArrDocSet domain(std::vector<int32_t>{0, 1, 2, 4, 5});
+  OrdBulkMinHitsGuard threshold(0);
+  OrdColReader::ForEachOrdStats stats;
+  std::vector<int32_t> seenDocs;
+  int64_t missing = 0;
+
+  forEachOrdValue(&domain, *field.ordReader, 6, missing,
+      [&](int32_t doc, int32_t ord) {
+        EXPECT_GT(ord, 0);
+        seenDocs.push_back(doc);
+      },
+      &stats);
+
+  EXPECT_EQ((std::vector<int32_t>{0, 0, 2, 5, 5, 5}), seenDocs);
+  EXPECT_EQ(2, missing);
+  EXPECT_EQ(6, stats.pointLoads);
+  EXPECT_EQ(0, stats.bulkLoads);
+  EXPECT_EQ(0, stats.bulkBlocks);
+}
+
+TEST_F(OrdColFormatTest, rankIndexedBitAndAllDomainsKeepFixedBulkOrds) {
+  TestIndex index;
+  TestField field(index, "tags_ss");
+  field.startIndexing();
+  field.addStrings(0, {"a", "b"});
+  field.addStrings(2, {"c"});
+  field.addStrings(5, {"d", "e", "f"});
+  index.flush();
+  field.startReading();
+  ASSERT_EQ(0, field.nextDoc());
+  ASSERT_EQ(SegFieldInfo::ORD_RANK, field.fieldInfo.ordIndexing);
+  ASSERT_TRUE(field.ordReader->multiValued());
+
+  RAMBitDocSet domain(6);
+  for (int32_t doc : {0, 1, 2, 4, 5}) {
+    domain.mutableBits().set(doc);
+  }
+  OrdBulkMinHitsGuard threshold(0);
+  OrdColReader::ForEachOrdStats stats;
+  std::vector<int32_t> seenDocs;
+  int64_t missing = 0;
+
+  forEachOrdValue(&domain, *field.ordReader, 6, missing,
+      [&](int32_t doc, int32_t ord) {
+        EXPECT_GT(ord, 0);
+        seenDocs.push_back(doc);
+      },
+      &stats);
+
+  EXPECT_EQ((std::vector<int32_t>{0, 0, 2, 5, 5, 5}), seenDocs);
+  EXPECT_EQ(2, missing);
+  EXPECT_EQ(0, stats.pointLoads);
+  EXPECT_EQ(6, stats.bulkLoads);
+  EXPECT_EQ(0, stats.pointBlocks);
+  EXPECT_EQ(0, stats.bulkBlocks);
+
+  stats = {};
+  seenDocs.clear();
+  missing = 0;
+  forEachOrdValue(nullptr, *field.ordReader, 6, missing,
+      [&](int32_t doc, int32_t ord) {
+        EXPECT_GT(ord, 0);
+        seenDocs.push_back(doc);
+      },
+      &stats);
+
+  EXPECT_EQ((std::vector<int32_t>{0, 0, 2, 5, 5, 5}), seenDocs);
+  EXPECT_EQ(3, missing);
+  EXPECT_EQ(0, stats.pointLoads);
+  EXPECT_EQ(6, stats.bulkLoads);
+  EXPECT_EQ(0, stats.pointBlocks);
+  EXPECT_EQ(0, stats.bulkBlocks);
 }
 
 TEST_F(OrdColFormatTest, predictedAscendingDescendingAndJitterWithTailBlock) {
