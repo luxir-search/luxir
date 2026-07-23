@@ -107,7 +107,7 @@ public:
       for (auto& docsEnum : docsEnums) {
         int32_t doc = docsEnum.docId();
         if (doc < windowStart) {
-          doc = docsEnum.advanceDocOnly(windowStart);
+          doc = docsEnum.advance(windowStart);
         }
         if (doc >= windowEnd) {
           firstDocAfterWindow = std::min(firstDocAfterWindow, doc);

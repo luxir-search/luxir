@@ -620,7 +620,7 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   ASSERT_EQ(denum.advance(N), DocsEnumMeta::END);
 }
 
-TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
+TEST_F(DocsEnumAdvanceTest, docsTierAdvanceProbesWordBlocksWithoutDecoding) {
   const std::vector<int32_t> docs = makeWordProbeDocs(3);
   RAMDir dir;
   MemPool pool;
@@ -643,7 +643,7 @@ TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
   int32_t cur = -1;
   for (int32_t target : {1, 63, 64, 127, 191, 192, 256, 319, 383, 384, 576}) {
     ASSERT_GT(target, cur);
-    cur = denum.advanceDocOnly(target);
+    cur = denum.advance(target);
     ASSERT_EQ(cur, modelCeil(docs, target)) << "target=" << target;
     if (cur == DocsEnumMeta::END) {
       break;
@@ -657,7 +657,7 @@ TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
   SkipStats::reset();
 }
 
-TEST_F(DocsEnumAdvanceTest, nextDocOnlyWalksResidentWordBlock) {
+TEST_F(DocsEnumAdvanceTest, docsTierNextDocWalksResidentWordBlock) {
   const std::vector<int32_t> docs = makeWordProbeDocs(2);
   RAMDir dir;
   MemPool pool;
@@ -672,14 +672,14 @@ TEST_F(DocsEnumAdvanceTest, nextDocOnlyWalksResidentWordBlock) {
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
   DocsOnlyEnum denum(tenum);
-  ASSERT_EQ(denum.advanceDocOnly(1), 2);
-  ASSERT_EQ(denum.nextDocOnly(), 3);
-  ASSERT_EQ(denum.advanceDocOnly(64), 65);
-  ASSERT_EQ(denum.nextDocOnly(), 66);
-  ASSERT_EQ(denum.advanceDocOnly(127), 128);
-  ASSERT_EQ(denum.nextDocOnly(), 129);
-  ASSERT_EQ(denum.advanceDocOnly(191), 191);
-  ASSERT_EQ(denum.advanceDocOnly(192), 192);
+  ASSERT_EQ(denum.advance(1), 2);
+  ASSERT_EQ(denum.nextDoc(), 3);
+  ASSERT_EQ(denum.advance(64), 65);
+  ASSERT_EQ(denum.nextDoc(), 66);
+  ASSERT_EQ(denum.advance(127), 128);
+  ASSERT_EQ(denum.nextDoc(), 129);
+  ASSERT_EQ(denum.advance(191), 191);
+  ASSERT_EQ(denum.advance(192), 192);
 }
 
 TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow) {
@@ -702,14 +702,14 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
   SkipStats::enabled = true;
   SkipStats::reset();
 
-  ASSERT_EQ(denum.advanceDocOnly(64), 65);
+  ASSERT_EQ(denum.advance(64), 65);
   const int32_t from = 60;
   const int32_t to = 100;
   std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
   denum.intoBitSet(bits, from, to);
   EXPECT_EQ(docsFromBits(bits, from, to), modelWindow(docs, 65, to));
   EXPECT_EQ(denum.docId(), 99);
-  EXPECT_EQ(denum.nextDocOnly(), 101);
+  EXPECT_EQ(denum.nextDoc(), 101);
 
   EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
   EXPECT_GT(SkipStats::docsOnlyWordProbeAdvances, 0);
@@ -747,7 +747,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   denum.intoBitSet(bits, from, to);
   EXPECT_EQ(docsFromBits(bits, from, to), modelWindow(docs, from, to));
   EXPECT_EQ(denum.docId(), 231);
-  EXPECT_EQ(denum.nextDocOnly(), 264);
+  EXPECT_EQ(denum.nextDoc(), 264);
 
   DocsOnlyEnum single(tenum);
   const int32_t singleFrom = 132;
@@ -757,7 +757,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   EXPECT_EQ(docsFromBits(singleBits, singleFrom, singleTo),
             modelWindow(docs, singleFrom, singleTo));
   EXPECT_EQ(single.docId(), 132);
-  EXPECT_EQ(single.nextDocOnly(), 165);
+  EXPECT_EQ(single.nextDoc(), 165);
 
   EXPECT_GT(SkipStats::docBlocksDecoded, 0);
   EXPECT_GT(SkipStats::countBulkFillBlocks, 1);
@@ -833,7 +833,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   // Nothing was reported, so the cursor must not rest on a live doc: a
   // docs-only successor scans from docid + 1 and would skip it.
   EXPECT_LT(denum.docId(), 0);
-  EXPECT_EQ(denum.nextDocOnly(), 65);
+  EXPECT_EQ(denum.nextDoc(), 65);
 
   std::vector<int32_t> got;
   appendIntoBitSetWindow(denum, docs, 64, 100, got);
@@ -998,12 +998,12 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   SkipStats::enabled = true;
   SkipStats::reset();
 
-  ASSERT_EQ(denum.advanceDocOnly(10), 10);
-  ASSERT_EQ(denum.nextDocOnly(), 11);
-  ASSERT_EQ(denum.advanceDocOnly(64), 64);
-  ASSERT_EQ(denum.advanceDocOnly(127), 127);
-  ASSERT_EQ(denum.advanceDocOnly(128), 128);
-  ASSERT_EQ(denum.advanceDocOnly(130), 130);
+  ASSERT_EQ(denum.advance(10), 10);
+  ASSERT_EQ(denum.nextDoc(), 11);
+  ASSERT_EQ(denum.advance(64), 64);
+  ASSERT_EQ(denum.advance(127), 127);
+  ASSERT_EQ(denum.advance(128), 128);
+  ASSERT_EQ(denum.advance(130), 130);
 
   const int32_t from = 120;
   const int32_t to = 140;
@@ -1011,14 +1011,14 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   denum.intoBitSet(bits, from, to);
   EXPECT_EQ(docsFromBits(bits, from, to), modelWindow(docs, 130, to));
   EXPECT_EQ(denum.docId(), 139);
-  EXPECT_EQ(denum.nextDocOnly(), 140);
+  EXPECT_EQ(denum.nextDoc(), 140);
   EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
   EXPECT_GT(SkipStats::docsOnlyWordProbeAdvances, 3);
   SkipStats::enabled = savedStats;
   SkipStats::reset();
 }
 
-TEST_F(DocsEnumAdvanceTest, residentDocOnlyBlockPeekAndConsumeMaterializeSpan) {
+TEST_F(DocsEnumAdvanceTest, residentDocsBlockPeekAndConsumeMaterializeSpan) {
   const std::vector<int32_t> docs = makeWordProbeDocs(1);
   RAMDir dir;
   MemPool pool;
@@ -1033,17 +1033,17 @@ TEST_F(DocsEnumAdvanceTest, residentDocOnlyBlockPeekAndConsumeMaterializeSpan) {
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
   DocsOnlyEnum denum(tenum);
-  ASSERT_EQ(denum.advanceDocOnly(64), 65);
+  ASSERT_EQ(denum.advance(64), 65);
 
   auto expectedStart = std::lower_bound(docs.begin(), docs.end(), 65);
   std::vector<int32_t> expected(expectedStart, docs.end());
-  auto span = denum.peekDocOnlyBlock();
+  auto span = denum.peekDocBlock();
   ASSERT_EQ((int32_t) span.size(), (int32_t) expected.size());
   EXPECT_TRUE(std::equal(span.begin(), span.end(), expected.begin()));
 
-  denum.consumeDocOnlyBlock(5);
+  denum.consumeDocBlock(5);
   ASSERT_EQ(denum.docId(), expected[4]);
-  auto span2 = denum.peekDocOnlyBlock();
+  auto span2 = denum.peekDocBlock();
   ASSERT_EQ((int32_t) span2.size(), (int32_t) expected.size() - 5);
   EXPECT_TRUE(std::equal(span2.begin(), span2.end(), expected.begin() + 5));
 }
@@ -1261,7 +1261,7 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
   fieldReader.readFieldInfo(fieldInfo);
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
-  DocsOnlyEnum denum(tenum);
+  DocsFreqEnum denum(tenum);
 
   bool savedStats = SkipStats::enabled;
   SkipStats::enabled = true;

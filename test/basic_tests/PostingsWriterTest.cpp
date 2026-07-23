@@ -516,7 +516,8 @@ TEST_F(PostingsTest, codecFileOverreadBounds) {
     std::vector<uint32_t> docs(n), freqs(n);
     uint32_t d = 0;
     for (auto& v : docs) { d += rng.rint(1, 100000); v = d; }
-    for (auto& f : freqs) f = rng.rint(1, 1000);
+    constexpr uint32_t widthCases[] = {1u, 0x100u, 0x10000u, 0x1000000u};
+    for (uint32_t i = 0; i < n; i++) freqs[i] = widthCases[i & 3];
     uint32_t kb = svbKeyBytes(n);
     std::vector<uint8_t> dkeys(kb), ddata(n * 4 + 32), tkeys(kb), tdata(n * 4 + 32);
     uint8_t* ddEnd = svb_encode_scalar_d1_init(docs.data(), dkeys.data(), ddata.data(), n, 0);
@@ -532,7 +533,10 @@ TEST_F(PostingsTest, codecFileOverreadBounds) {
     memcpy(p + kb + dDataSz + kb, tdata.data(), tDataSz);
     std::vector<uint32_t> outDocs(n + 8), outFreqs(n + 8);
     uint8_t* de = svb_decode_avx_d1_init(outDocs.data(), p, p + kb, n, 0);
-    svb_decode_avx_simple(outFreqs.data(), de, de + kb, n);
+    uint8_t* te = svb_decode_avx_simple(outFreqs.data(), de, de + kb, n);
+    ASSERT_EQ(svbEncodedBytes(p, n), kb + dDataSz);
+    ASSERT_EQ(svbEncodedBytes(de, n), kb + tDataSz);
+    ASSERT_EQ(te - de, svbEncodedBytes(de, n));
     delete[] buf;
     for (uint32_t i = 0; i < n; i++) {
       ASSERT_EQ(outDocs[i], docs[i]) << "svb docs n=" << n << " i=" << i;

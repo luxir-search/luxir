@@ -28,6 +28,24 @@ namespace solux {
 // Number of control (key) bytes for `count` values: 2 bits each, packed 4 per byte.
 inline uint32_t svbKeyBytes(uint32_t count) { return (count + 3) / 4; }
 
+// Total encoded bytes for one StreamVByte run without decoding its values.
+// Each 2-bit control code stores the data width minus one.  The key stream is
+// followed immediately by the data stream, so callers can skip a tail whose
+// format has no separate byte-length prefix.
+inline uint32_t svbEncodedBytes(const uint8_t* keys, uint32_t count) {
+  const uint32_t keyBytes = svbKeyBytes(count);
+  uint32_t dataBytes = 0;
+  for (uint32_t i = 0; i < count; i += 4) {
+    const uint8_t key = keys[i >> 2];
+    const uint32_t values = count - i < 4 ? count - i : 4;
+    dataBytes += values;
+    for (uint32_t j = 0; j < values; j++) {
+      dataBytes += (key >> (j * 2)) & 3u;
+    }
+  }
+  return keyBytes + dataBytes;
+}
+
 // Bytes the StreamVByte AVX decoders may read past the encoded data (one 16-byte SIMD
 // load on the final group).  Pure-data postings files reserve this much trailing slack.
 inline constexpr uint32_t SVB_OVERREAD_PAD = 16;

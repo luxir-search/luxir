@@ -28,6 +28,31 @@
 using namespace solux;
 using namespace solux::test;
 
+template<typename T>
+concept HasTermFreq = requires(T& docs) { docs.termFreq(); };
+template<typename T>
+concept HasNextDocOnly = requires(T& docs) { docs.nextDocOnly(); };
+template<typename T>
+concept HasAdvanceDocOnly = requires(T& docs) { docs.advanceDocOnly(1); };
+template<typename T>
+concept HasIntoBitSet = requires(T& docs, std::span<uint64_t> bits) {
+  docs.intoBitSet(bits, 0, 1);
+};
+template<typename T>
+concept HasPeekDocBlock = requires(T& docs) { docs.peekDocBlock(); };
+
+static_assert(!HasTermFreq<DocsOnlyEnum>);
+static_assert(!HasNextDocOnly<DocsOnlyEnum>);
+static_assert(!HasAdvanceDocOnly<DocsOnlyEnum>);
+static_assert(!HasNextDocOnly<DocsPosEnum>);
+static_assert(!HasAdvanceDocOnly<DocsPosEnum>);
+static_assert(!HasIntoBitSet<DocsPosEnum>);
+static_assert(!HasPeekDocBlock<DocsPosEnum>);
+static_assert(HasTermFreq<DocsFreqEnum>);
+static_assert(HasNextDocOnly<DocsFreqEnum>);
+static_assert(HasAdvanceDocOnly<DocsFreqEnum>);
+static_assert(HasIntoBitSet<DocsFreqEnum>);
+
 constexpr int32_t kMaxScoreDisjunctionSegDocs = 3 * Postings::DOCS_BLOCK_SIZE + 40;
 
 class TermScorerTest : public SoluxTest {
@@ -5630,7 +5655,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
   EXPECT_EQ(got2, want2);
 }
 
-TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
+TEST_F(TermScorerTest, docsTierAdvanceCoversBlockEncodingsAndSkips) {
   const int32_t N = 3 * DocsEnumMeta::L1_DOCS + 257;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -5677,7 +5702,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
     int32_t last = -1;
     for (int32_t target : targets) {
       ASSERT_GT(target, last) << term;
-      int32_t got = denum.advanceDocOnly(target);
+      int32_t got = denum.advance(target);
       auto it = std::lower_bound(expected.begin(), expected.end(), target);
       int32_t want = it == expected.end() ? PostingsReader::END : *it;
       EXPECT_EQ(got, want) << term << " target=" << target;
@@ -5702,7 +5727,7 @@ TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
   ASSERT_NE(firstWindowDoc, wordExpected.end());
   int32_t from = *firstWindowDoc;
   int32_t to = std::min(from + 777, N);
-  ASSERT_EQ(denum.advanceDocOnly(from), from);
+  ASSERT_EQ(denum.advance(from), from);
   std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
   denum.intoBitSet(bits, from, to);
   std::vector<int32_t> got;
@@ -5835,7 +5860,7 @@ TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
   SkipStats::enabled = savedStats;
 }
 
-TEST_F(TermScorerTest, docsOnlyEnumProtocolAssertsOnFreqAndPositions) {
+TEST_F(TermScorerTest, docsFreqEnumDocsOnlyProtocolAssertsOnFreqAccess) {
 #ifndef NDEBUG
   const int32_t N = 8;
   TestIndex testIndex;
@@ -5862,12 +5887,6 @@ TEST_F(TermScorerTest, docsOnlyEnumProtocolAssertsOnFreqAndPositions) {
   ASSERT_FALSE(docs.empty());
   denum.consumeDocOnlyBlock(1);
   ASSERT_DEATH({ (void) denum.termFreq(); }, "");
-
-  DocsPosEnum denum2(tenum);
-  docs = denum2.peekDocBlock();
-  ASSERT_FALSE(docs.empty());
-  denum2.consumeDocOnlyBlock(1);
-  ASSERT_DEATH({ PosEnum positions(denum2); unused(positions); }, "");
 #endif
 }
 
