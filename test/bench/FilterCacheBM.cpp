@@ -78,7 +78,7 @@ std::shared_ptr<const FilterCache::SegmentValue> populate(
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* use = request.get(key);
   auto probe = use->probe(0);
-  return use->publishRaw(0, probe, denseDocs(segments[0].maxDoc));
+  return use->publishRaw(0, probe, denseDocs(segments[0].maxDoc), 1);
 }
 
 void BM_FilterCacheKeyBuild(benchmark::State& state, size_t clauseCount) {
@@ -210,7 +210,7 @@ void BM_FilterCachePublishDense(benchmark::State& state) {
     std::shared_ptr<const FilterCache::SegmentValue> value;
     {
       BenchTimer timer(state);
-      value = use->publishRaw(0, probe, std::move(docs));
+      value = use->publishRaw(0, probe, std::move(docs), 1);
       benchmark::DoNotOptimize(value);
     }
   }

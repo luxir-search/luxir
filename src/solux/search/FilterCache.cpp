@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <tuple>
@@ -32,9 +33,12 @@ std::vector<FilterCache::SegmentIdentity> readerIdentities(IndexReader& reader) 
 
 FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
                                         uint64_t epoch,
-                                        SegmentIdentity identityForTest)
+                                        SegmentIdentity identityForTest,
+                                        uint32_t buildCostMicros)
   : docs(std::move(docs)),
-    charge((uint32_t) this->docs->ramBytesUsed()), lastUsed(epoch)
+    charge((uint32_t) this->docs->ramBytesUsed()),
+    buildCostMicros(buildCostMicros), lastUsed(epoch),
+    priority(0)
     #ifndef NDEBUG
     , identityForTest(identityForTest)
     #endif
@@ -45,8 +49,10 @@ FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
 
 FilterCache::ReaderValue::ReaderValue(
     uint64_t readerVersion, std::span<const SegmentIdentity> identities,
-    std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch)
-  : readerVersion_(readerVersion), charge(0), lastUsed(epoch) {
+    std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch,
+    uint32_t buildCostMicros)
+  : readerVersion_(readerVersion), charge(0),
+    buildCostMicros(buildCostMicros), lastUsed(epoch), priority(0) {
   if (identities.size() != docs.size()) {
     throw std::invalid_argument(
         "reader-stable DocSets must align with reader segments");
@@ -219,7 +225,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
   auto value = slot->value.load(std::memory_order_acquire);
   if (value != nullptr) {
     uint64_t now = cache->nextEpoch();
-    value->touch(now);
+    value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
     entry->lastUsed.store(now, std::memory_order_relaxed);
     pinValue(segmentOrd, value);
     cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
@@ -315,7 +321,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
   auto value = localEntry->readerValue.load(std::memory_order_acquire);
   if (value != nullptr && value->readerVersion() == readerVersion) {
     uint64_t now = cache->nextEpoch();
-    value->touch(now);
+    value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
     localEntry->lastUsed.store(now, std::memory_order_relaxed);
     cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
     cache->counter.readerStableHits.fetch_add(1, std::memory_order_relaxed);
@@ -348,26 +354,33 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
 
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRaw(size_t segmentOrd, Probe& probe,
-                             std::unique_ptr<DocSet> raw) {
-  return cache->publish(*this, segmentOrd, &probe, std::move(raw), false);
+                             std::unique_ptr<DocSet> raw,
+                             uint32_t buildCostMicros) {
+  return cache->publish(*this, segmentOrd, &probe, std::move(raw), false,
+                        buildCostMicros);
 }
 
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRawByproduct(size_t segmentOrd, Probe& probe,
-                                      std::unique_ptr<DocSet> raw) {
-  return cache->publish(*this, segmentOrd, &probe, std::move(raw), true);
+                                      std::unique_ptr<DocSet> raw,
+                                      uint32_t buildCostMicros) {
+  return cache->publish(*this, segmentOrd, &probe, std::move(raw), true,
+                        buildCostMicros);
 }
 
 std::shared_ptr<const FilterCache::SegmentValue>
-FilterCache::Use::offerRaw(size_t segmentOrd, std::unique_ptr<DocSet> raw) {
-  return cache->publish(*this, segmentOrd, nullptr, std::move(raw), true);
+FilterCache::Use::offerRaw(size_t segmentOrd, std::unique_ptr<DocSet> raw,
+                           uint32_t buildCostMicros) {
+  return cache->publish(*this, segmentOrd, nullptr, std::move(raw), true,
+                        buildCostMicros);
 }
 
 std::shared_ptr<const FilterCache::ReaderValue>
 FilterCache::Use::publishReaderStable(
-    ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact) {
+    ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
+    uint32_t buildCostMicros) {
   auto value = cache->publishReaderValue(
-      *this, probe, std::move(liveExact));
+      *this, probe, std::move(liveExact), buildCostMicros);
   pinReaderValue(value);
   return value;
 }
@@ -507,6 +520,32 @@ FilterCache::FilterCache(FilterCacheConfig config)
 
 uint64_t FilterCache::nextEpoch() {
   return epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+size_t FilterCache::residentValueCount(const FilterEntry& entry) const {
+  size_t count = entry.readerValue.load(std::memory_order_acquire) == nullptr
+      ? 0 : 1;
+  auto slots = entry.slots.load(std::memory_order_acquire);
+  for (const auto& slot : *slots) {
+    if (slot->value.load(std::memory_order_acquire) != nullptr) count++;
+  }
+  return count;
+}
+
+double FilterCache::effectiveValueBytes(
+    const FilterEntry& entry, size_t payloadBytes,
+    size_t residentValueCount) const {
+  assert(residentValueCount != 0);
+  // metadataCharge is the key bytes plus FilterKey/FilterEntry map overhead.
+  // Freeze its current per-resident-value share into the immutable density.
+  return (double) payloadBytes
+      + (double) VALUE_RESIDENCY_OVERHEAD_BYTES
+      + (double) entry.metadataCharge / (double) residentValueCount;
+}
+
+void FilterCache::advanceEvictionClock(double priority) {
+  double clock = evictionClock.load(std::memory_order_relaxed);
+  evictionClock.store(std::max(clock, priority), std::memory_order_relaxed);
 }
 
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
@@ -660,7 +699,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::beginUse(
 
 std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
-    bool byproduct) {
+    bool byproduct, uint32_t buildCostMicros) {
   if (use.scope_ == FilterKeyScope::READER_STABLE) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
     throw std::logic_error(
@@ -670,7 +709,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
   SegmentIdentity identity = segmentOrd < use.readerSegments.size()
       ? use.readerSegments[segmentOrd] : SegmentIdentity{};
   auto local = std::make_shared<SegmentValue>(
-      std::move(raw), nextEpoch(), identity);
+      std::move(raw), nextEpoch(), identity, buildCostMicros);
   use.pinValue(segmentOrd, local);
 
   bool attempted = enabled() && use.entry != nullptr
@@ -686,6 +725,10 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     auto current = slot->value.load(std::memory_order_acquire);
     if (current != nullptr) {
       chosen = current;
+      uint64_t now = nextEpoch();
+      current->touch(
+          now, evictionClock.load(std::memory_order_relaxed));
+      use.entry->lastUsed.store(now, std::memory_order_relaxed);
     } else {
       auto active = activeSegments.load(std::memory_order_acquire);
       const auto& identity = use.readerSegments[segmentOrd];
@@ -703,6 +746,15 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
           && local->card() != slot->maxDoc
           && local->ramBytesUsed() <= config.maxEntryBytes;
       if (valid) {
+        size_t valueCount = residentValueCount(*use.entry) + 1;
+        double effectiveBytes = effectiveValueBytes(
+            *use.entry, local->ramBytesUsed(), valueCount);
+        // Density is written once before release-publication; touches only
+        // combine this frozen value with the current inflation clock.
+        local->density = (double) local->buildCostMicros / effectiveBytes;
+        local->priority.store(
+            evictionClock.load(std::memory_order_relaxed) + local->density,
+            std::memory_order_relaxed);
         // Charge before visibility. Eviction detaches with a value CAS and
         // subtracts this exact immutable charge once; readers can pin the
         // value only after the charge is visible.
@@ -734,15 +786,17 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
 std::shared_ptr<const FilterCache::ReaderValue>
 FilterCache::publishReaderValue(
     Use& use, ReaderProbe& probe,
-    std::vector<std::unique_ptr<DocSet>> liveExact) {
+    std::vector<std::unique_ptr<DocSet>> liveExact,
+    uint32_t buildCostMicros) {
   if (use.scope_ != FilterKeyScope::READER_STABLE) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
     throw std::logic_error(
         "whole-reader publication requires READER_STABLE scope");
   }
-  auto local = std::shared_ptr<const ReaderValue>(new ReaderValue(
+  auto mutableLocal = std::shared_ptr<ReaderValue>(new ReaderValue(
       use.readerVersion, use.readerSegments, std::move(liveExact),
-      nextEpoch()));
+      nextEpoch(), buildCostMicros));
+  std::shared_ptr<const ReaderValue> local = mutableLocal;
   auto localEntry = probe.entry;
   bool inserted = false;
   std::shared_ptr<const ReaderValue> chosen = local;
@@ -753,6 +807,10 @@ FilterCache::publishReaderValue(
     auto current = localEntry->readerValue.load(std::memory_order_acquire);
     if (current != nullptr && current->readerVersion() == use.readerVersion) {
       chosen = current;
+      uint64_t now = nextEpoch();
+      current->touch(
+          now, evictionClock.load(std::memory_order_relaxed));
+      localEntry->lastUsed.store(now, std::memory_order_relaxed);
     } else {
       auto active = activeSegments.load(std::memory_order_acquire);
       bool identitiesMatch = active->segments.size() == use.readerSegments.size();
@@ -767,6 +825,17 @@ FilterCache::publishReaderValue(
           && identitiesMatch
           && local->ramBytesUsed() <= config.maxEntryBytes;
       if (valid) {
+        size_t valueCount = residentValueCount(*localEntry);
+        if (current == nullptr) valueCount++;
+        valueCount = std::max<size_t>(valueCount, 1);
+        double effectiveBytes = effectiveValueBytes(
+            *localEntry, local->ramBytesUsed(), valueCount);
+        mutableLocal->density =
+            (double) mutableLocal->buildCostMicros / effectiveBytes;
+        mutableLocal->priority.store(
+            evictionClock.load(std::memory_order_relaxed)
+                + mutableLocal->density,
+            std::memory_order_relaxed);
         // Charge before visibility. The exchange is the one detach event for
         // any prior whole-reader value; its immutable charge is then retired
         // exactly once. Segment slots are not involved in either operation.
@@ -903,7 +972,7 @@ void FilterCache::sweep() {
     std::shared_ptr<FilterEntry> entry;
     std::shared_ptr<const SegmentValue> segmentValue;
     std::shared_ptr<const ReaderValue> readerValue;
-    uint64_t used;
+    double priority;
   };
   for (;;) {
     // sweeping elects one worker. Publishers set sweepRequested only after
@@ -925,20 +994,20 @@ void FilterCache::sweep() {
           auto readerValue = entry->readerValue.load(std::memory_order_acquire);
           if (readerValue != nullptr) {
             candidates.push_back({nullptr, entry, nullptr, readerValue,
-                                  readerValue->usedEpoch()});
+                                  readerValue->evictionPriority()});
           }
           auto slots = entry->slots.load(std::memory_order_acquire);
           for (const auto& slot : *slots) {
             auto value = slot->value.load(std::memory_order_acquire);
             if (value != nullptr) {
               candidates.push_back({slot, nullptr, value, nullptr,
-                                    value->usedEpoch()});
+                                    value->evictionPriority()});
             }
           }
         }
         std::sort(candidates.begin(), candidates.end(),
                   [](const Candidate& a, const Candidate& b) {
-                    return a.used < b.used;
+                    return a.priority < b.priority;
                   });
         bool detached = false;
         for (const auto& candidate : candidates) {
@@ -952,6 +1021,8 @@ void FilterCache::sweep() {
               residentBytes.fetch_sub(
                   candidate.readerValue->ramBytesUsed(),
                   std::memory_order_relaxed);
+              advanceEvictionClock(
+                  candidate.readerValue->evictionPriority());
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
               detached = true;
             }
@@ -963,6 +1034,8 @@ void FilterCache::sweep() {
               residentBytes.fetch_sub(
                   candidate.segmentValue->ramBytesUsed(),
                   std::memory_order_relaxed);
+              advanceEvictionClock(
+                  candidate.segmentValue->evictionPriority());
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
               detached = true;
             }
@@ -1033,6 +1106,7 @@ void FilterCache::sweepMetadata() {
           if (readerValue != nullptr) {
             residentBytes.fetch_sub(readerValue->ramBytesUsed(),
                                     std::memory_order_relaxed);
+            advanceEvictionClock(readerValue->evictionPriority());
             counter.evictions.fetch_add(1, std::memory_order_relaxed);
           }
         }
@@ -1044,6 +1118,7 @@ void FilterCache::sweepMetadata() {
             if (value != nullptr) {
               residentBytes.fetch_sub(value->ramBytesUsed(),
                                       std::memory_order_relaxed);
+              advanceEvictionClock(value->evictionPriority());
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
             }
           }
@@ -1136,6 +1211,11 @@ void FilterCache::validateForTest() {
 
   size_t expectedResidentBytes = 0;
   size_t expectedMetadataBytes = 0;
+  double clock = evictionClock.load(std::memory_order_relaxed);
+  if (!std::isfinite(clock) || clock < 0) {
+    throw std::logic_error(
+        "FilterCache validation: invalid eviction clock");
+  }
   auto active = activeSegments.load(std::memory_order_acquire);
   uint64_t currentReaderVersion = publishedReaderVersion.load(
       std::memory_order_acquire);
@@ -1161,6 +1241,13 @@ void FilterCache::validateForTest() {
             "FilterCache validation: reader-stable entry owns segment slots");
       }
       if (readerValue != nullptr) {
+        double priority = readerValue->evictionPriority();
+        if (!std::isfinite(readerValue->density)
+            || readerValue->density < 0
+            || !std::isfinite(priority) || priority < 0) {
+          throw std::logic_error(
+              "FilterCache validation: invalid reader-stable priority");
+        }
         if (readerValue->readerVersion() != currentReaderVersion
             || readerValue->readerVersion() != active->readerVersion) {
           throw std::logic_error(
@@ -1202,6 +1289,12 @@ void FilterCache::validateForTest() {
       previousSegId = slot->segId;
       auto value = slot->value.load(std::memory_order_acquire);
       if (value == nullptr) continue;
+      double priority = value->evictionPriority();
+      if (!std::isfinite(value->density) || value->density < 0
+          || !std::isfinite(priority) || priority < 0) {
+        throw std::logic_error(
+            "FilterCache validation: invalid segment priority");
+      }
       if (entry.scope == FilterKeyScope::READER_STABLE) {
         throw std::logic_error(
             "FilterCache validation: reader-stable entry has raw value");

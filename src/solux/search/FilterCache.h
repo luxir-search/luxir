@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -53,7 +54,7 @@ struct FilterCacheConfig {
 // for a key until a bounded frequency ring has admitted it (second sighting by
 // default); a massive one-off key costs one 8-byte ring cell. Oversized keys
 // bypass before ring recording, and key metadata has its own maxMetadataBytes
-// budget. One epoch sweeper trims segment payloads individually and
+// budget. One benefit-density sweeper trims segment payloads individually and
 // ReaderValues as whole units from the high watermark to the low watermark.
 //
 // Query::Context and SearchRequest's request-destructed registry own all
@@ -96,14 +97,17 @@ public:
     // DocSet payload charge only - key bytes are deliberately excluded
     // (entry-lifetime metadataBytes budget, not value lifetime).
     uint32_t charge;
+    uint32_t buildCostMicros;
+    double density = 0;
     mutable std::atomic<uint64_t> lastUsed;
+    mutable std::atomic<double> priority;
     #ifndef NDEBUG
     SegmentIdentity identityForTest;
     #endif
 
   public:
     SegmentValue(std::unique_ptr<DocSet> docs, uint64_t epoch,
-                 SegmentIdentity identityForTest);
+                 SegmentIdentity identityForTest, uint32_t buildCostMicros);
 
     DocSet* docSet() const { return docs.get(); }
     int32_t card() const {
@@ -112,11 +116,17 @@ public:
       return docs->cachedCard();
     }
     size_t ramBytesUsed() const { return charge; }
-    void touch(uint64_t epoch) const {
+    void touch(uint64_t epoch, double evictionClock) const {
       lastUsed.store(epoch, std::memory_order_relaxed);
+      // Concurrent relaxed touches may overwrite one another; that race is a
+      // benign approximation in GDSF, while the sweeper's clock is monotonic.
+      priority.store(evictionClock + density, std::memory_order_relaxed);
     }
     uint64_t usedEpoch() const {
       return lastUsed.load(std::memory_order_relaxed);
+    }
+    double evictionPriority() const {
+      return priority.load(std::memory_order_relaxed);
     }
   };
 
@@ -136,21 +146,29 @@ public:
     uint64_t readerVersion_;
     std::vector<SegmentDocs> segments;
     size_t charge;
+    uint32_t buildCostMicros;
+    double density = 0;
     mutable std::atomic<uint64_t> lastUsed;
+    mutable std::atomic<double> priority;
 
     ReaderValue(uint64_t readerVersion,
                 std::span<const SegmentIdentity> identities,
-                std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch);
+                std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch,
+                uint32_t buildCostMicros);
 
   public:
     uint64_t readerVersion() const { return readerVersion_; }
     size_t ramBytesUsed() const { return charge; }
     DocSet* docSet(size_t segmentOrd, const SegmentIdentity& identity) const;
-    void touch(uint64_t epoch) const {
+    void touch(uint64_t epoch, double evictionClock) const {
       lastUsed.store(epoch, std::memory_order_relaxed);
+      priority.store(evictionClock + density, std::memory_order_relaxed);
     }
     uint64_t usedEpoch() const {
       return lastUsed.load(std::memory_order_relaxed);
+    }
+    double evictionPriority() const {
+      return priority.load(std::memory_order_relaxed);
     }
   };
 
@@ -273,13 +291,17 @@ public:
     // The only insertion APIs accept raw filter membership. Domain and
     // liveDocs composition happen after publication through effectiveDocSet.
     std::shared_ptr<const SegmentValue> publishRaw(
-        size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw);
+        size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
+        uint32_t buildCostMicros);
     std::shared_ptr<const SegmentValue> publishRawByproduct(
-        size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw);
+        size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
+        uint32_t buildCostMicros);
     std::shared_ptr<const SegmentValue> offerRaw(
-        size_t segmentOrd, std::unique_ptr<DocSet> raw);
+        size_t segmentOrd, std::unique_ptr<DocSet> raw,
+        uint32_t buildCostMicros);
     std::shared_ptr<const ReaderValue> publishReaderStable(
-        ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact);
+        ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
+        uint32_t buildCostMicros);
 
     DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader,
                             const std::shared_ptr<const SegmentValue>& value,
@@ -401,6 +423,8 @@ private:
   std::atomic<size_t> residentBytes{0};
   std::atomic<size_t> metadataBytes{0};
   std::atomic<uint64_t> epoch{1};
+  // Only the elected sweeper advances the GDSF inflation clock.
+  std::atomic<double> evictionClock{0};
   std::atomic<uint64_t> publishedCoreGen{0};
   std::atomic<uint64_t> publishedReaderVersion{0};
   std::atomic<uint64_t> readerPublications{0};
@@ -409,7 +433,14 @@ private:
   std::mutex publicationMutex;
   AtomicCounters counter;
 
+  // Approximate value-object, shared_ptr control-block, and segment-slot share.
+  // Metadata is added separately and amortized over resident values.
+  static constexpr size_t VALUE_RESIDENCY_OVERHEAD_BYTES = 256;
+
   uint64_t nextEpoch();
+  size_t residentValueCount(const FilterEntry& entry) const;
+  double effectiveValueBytes(const FilterEntry& entry, size_t payloadBytes,
+                             size_t residentValueCount) const;
   bool isActive(const ActiveSnapshot& snapshot,
                 const SegmentIdentity& identity) const;
   std::shared_ptr<FilterEntry> findEntry(const FilterKey& key);
@@ -425,10 +456,12 @@ private:
                                 std::span<const SegmentIdentity> readerSegments);
   std::shared_ptr<const SegmentValue> publish(
       Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
-      bool byproduct);
+      bool byproduct, uint32_t buildCostMicros);
   std::shared_ptr<const ReaderValue> publishReaderValue(
       Use& use, ReaderProbe& probe,
-      std::vector<std::unique_ptr<DocSet>> liveExact);
+      std::vector<std::unique_ptr<DocSet>> liveExact,
+      uint32_t buildCostMicros);
+  void advanceEvictionClock(double priority);
   void maybeSweep();
   void sweepMetadata();
 
