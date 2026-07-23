@@ -10,6 +10,15 @@ Use the **gcc** presets (FAISS is only in the gcc vcpkg repos). Each preset
 builds into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`. See
 [docs/dev/build-setup.md](docs/dev/build-setup.md) for requirements and IDE/clangd setup.
 
+For a full/clean rebuild redirect to a log to avoid cluttering your context.
+Then always grep for warnings and only dump the full tail on failure.
+
+```bash
+cmake --build --preset gcc-debug > /tmp/build.log 2>&1; ec=$?
+grep -n "warning:" /tmp/build.log
+[ $ec -ne 0 ] && tail -100 /tmp/build.log
+```
+
 ### Iterate (default): non-ASan, fastest edit-build-test
 
 ```bash
@@ -29,12 +38,17 @@ generated `*.pb.h` headers must exist). See [docs/dev/build-setup.md](docs/dev/b
 
 ## Test Commands
 
+Use `--gtest_brief=1 --gtest_print_time=0` for any run where you don't need
+to watch individual tests execute - only failing tests print output, passing
+ones collapse to the final tally. This matters most for agents: gtest's
+per-test/per-suite lines otherwise burn context on every green run.
+
 ```bash
 # Run all tests (iteration build)
-./build/gcc-debug/bin/solux_test
+./build/gcc-debug/bin/solux_test --gtest_brief=1 --gtest_print_time=0
 
 # Run specific test suite
-./build/gcc-debug/bin/solux_test --gtest_filter="IndexWriterTest.*"
+./build/gcc-debug/bin/solux_test --gtest_filter="IndexWriterTest.*" --gtest_brief=1 --gtest_print_time=0
 
 # Run benchmarks (NOTE: builds production-scale corpora - slow setup, use
 # gcc-release and memory caps (ulimit -v 32000000) for real measurements.
@@ -47,7 +61,7 @@ generated `*.pb.h` headers must exist). See [docs/dev/build-setup.md](docs/dev/b
 ./build/gcc-release/bin/solux_test --bench --benchmark_filter='-BM_Vector'
 
 # Run the same suite under ASan before committing
-./build/gcc-debug-asan/bin/solux_test
+./build/gcc-debug-asan/bin/solux_test --gtest_brief=1 --gtest_print_time=0
 ```
 
 ## Code Conventions

@@ -134,14 +134,16 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 #          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   # -Wno-unused-parameter: many virtual overrides must keep base-class signature; renaming params would just be noise.
-  add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+  # -Werror debug-only: NDEBUG (release) strips assert(), which turns every assert-only
+  # local into a false-positive -Wunused-variable; not worth chasing there.
+  add_compile_options(-Wall -Wextra -Wno-unused-parameter "$<$<CONFIG:DEBUG>:-Werror>")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")   # native just for dev... lock down more later?
   add_compile_options(
           "$<$<CONFIG:RELEASE>:-g1>"
 #          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
-  add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+  add_compile_options(-Wall -Wextra -Wno-unused-parameter "$<$<CONFIG:DEBUG>:-Werror>")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__SSSE3__ -arch:AVX")

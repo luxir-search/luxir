@@ -149,7 +149,7 @@ private:
     size_t start = scratch.size();
     scratch.resize(start + (size_t)vec.v.size());
     float invNorm = (float)(1.0 / std::sqrt(normSq));
-    for (int32_t i = 0; i < vec.v.size(); i++) {
+    for (int32_t i = 0; i < (int32_t)vec.v.size(); i++) {
       scratch[start + (size_t)i] = vec.v[i] * invNorm;
     }
     return bytesOf(scratch.data() + start, vec.v.size());
