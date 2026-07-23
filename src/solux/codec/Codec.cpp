@@ -13,7 +13,6 @@
 #include "simdbitpacking.h"   // simdpack (with mask) / simdunpack
 #include "bitpackinghelpers.h"// fastpackwithoutmask / fastunpack (scalar tails)
 #include "util.h"             // gccbits
-#include "deltautil.h"        // Delta::fastDelta / fastinverseDelta2
 
 namespace solux {
 
@@ -389,6 +388,57 @@ void unpackTail(const uint32_t* in, uint32_t len, uint8_t bits, uint32_t* out) {
   }
 }
 
+// --- T4: transposed-lane docid delta (breaks the D1 serial prefix-sum carry) ---
+//
+// The docid decode's dominant cost is undoing the doc-gap delta.  A D1 (adjacent)
+// delta reconstructs with a serial prefix sum whose vector-to-vector running-count
+// broadcast is a loop-carried dependency wider registers cannot break.  T4 instead
+// splits the 128-doc block into 4 lanes of 32 (lane j owns docids [32j, 32j+32)) and
+// stores the gaps transposed: phys[4*m + j] is row m of lane j.  Decode is then a
+// vertical running sum across the 32 rows -- 4 independent lanes, one add per row,
+// no cross-lane carry -- plus a 4-wide lane-base offset and an un-transpose back to
+// natural order.  The residual values are exactly the D1 adjacent-gap multiset,
+// merely permuted, so PForDelta width / exceptions / encoded size are unchanged.
+constexpr uint32_t T4_LANES = 4;
+constexpr uint32_t T4_ROWS = BLOCK_SIZE / T4_LANES;  // 32
+
+// Encode: natural-order docids `doc` -> transposed gap residuals `phys`.  `base` is
+// the previous block's last docid (0 for the first block).  Not perf-critical.
+void t4Delta(const uint32_t* doc, uint32_t base, uint32_t* phys) {
+  for (uint32_t j = 0; j < T4_LANES; ++j) {
+    uint32_t prev = (j == 0) ? base : doc[T4_ROWS * j - 1];
+    for (uint32_t m = 0; m < T4_ROWS; ++m) {
+      const uint32_t d = doc[T4_ROWS * j + m];
+      phys[T4_LANES * m + j] = d - prev;
+      prev = d;
+    }
+  }
+}
+
+// Decode: transposed gap residuals in `p` -> natural-order absolute docids in `p`
+// (in place; every row is read before any is written back).  `base` as above.
+void t4InverseDelta(uint32_t* p, uint32_t base) {
+  const __m128i* in = reinterpret_cast<const __m128i*>(p);
+  __m128i rows[T4_ROWS];
+  __m128i acc = _mm_setzero_si128();
+  for (uint32_t m = 0; m < T4_ROWS; ++m) {   // acc.lane j = doc[32j+m] - laneBase[j]
+    acc = _mm_add_epi32(acc, _mm_loadu_si128(in + m));
+    rows[m] = acc;
+  }
+  // laneBase[j] = base + sum of lane totals below j; lane totals are the last row.
+  uint32_t total[T4_LANES];
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(total), rows[T4_ROWS - 1]);
+  uint32_t off[T4_LANES];
+  off[0] = base;
+  for (uint32_t j = 1; j < T4_LANES; ++j) off[j] = off[j - 1] + total[j - 1];
+  const __m128i offv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(off));
+  for (uint32_t m = 0; m < T4_ROWS; ++m) {   // add lane base, un-transpose to natural order
+    uint32_t t[T4_LANES];
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(t), _mm_add_epi32(rows[m], offv));
+    for (uint32_t j = 0; j < T4_LANES; ++j) p[T4_ROWS * j + m] = t[j];
+  }
+}
+
 }  // namespace
 
 // --- SoluxSIMDFor (frame-of-reference numeric codec) ---
@@ -514,9 +564,9 @@ uint32_t SoluxPFOR::skipBlock(const char* in, uint32_t inSz) {
 void SoluxPFORd::encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz, uint32_t base) {
   unused(inSz);
   assert(inSz == BLOCK_SIZE);
-  FastPForLib::Delta::fastDelta(in, BLOCK_SIZE);  // adjacent delta, in place; in[0] left absolute
-  in[0] -= base;  // code the first id as a delta from the carried base (base==0 for the first block)
-  encodeBlockPFor(in, out, outSz);
+  uint32_t phys[BLOCK_SIZE];
+  t4Delta(in, base, phys);  // transposed-lane gap residuals (see T4 notes above)
+  encodeBlockPFor(phys, out, outSz);
 }
 
 uint32_t SoluxPFORd::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz, uint32_t base) {
@@ -524,8 +574,7 @@ uint32_t SoluxPFORd::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, u
   assert(outSz == BLOCK_SIZE);
   unused(outSz);
   auto ret = decodeBlockPFor(in, out);
-  out[0] += base;  // undo the base before the prefix sum (mirrors encode)
-  FastPForLib::Delta::fastinverseDelta2(out, BLOCK_SIZE);
+  t4InverseDelta(out, base);  // lane-parallel prefix sum + un-transpose -> ascending docids
   return ret;
 }
 
