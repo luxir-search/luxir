@@ -432,10 +432,24 @@ void t4InverseDelta(uint32_t* p, uint32_t base) {
   off[0] = base;
   for (uint32_t j = 1; j < T4_LANES; ++j) off[j] = off[j - 1] + total[j - 1];
   const __m128i offv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(off));
-  for (uint32_t m = 0; m < T4_ROWS; ++m) {   // add lane base, un-transpose to natural order
-    uint32_t t[T4_LANES];
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(t), _mm_add_epi32(rows[m], offv));
-    for (uint32_t j = 0; j < T4_LANES; ++j) p[T4_ROWS * j + m] = t[j];
+  // Add the lane base and un-transpose to natural order.  Each iteration adds the
+  // base to 4 rows, then a 4x4 lane transpose turns those rows (lane-major) into
+  // 4 vectors of consecutive rows per lane -- lane j's rows [mb, mb+4) land
+  // contiguously at p[32j + mb], reconstructing ascending docids.
+  for (uint32_t mb = 0; mb < T4_ROWS; mb += 4) {
+    const __m128i r0 = _mm_add_epi32(rows[mb + 0], offv);
+    const __m128i r1 = _mm_add_epi32(rows[mb + 1], offv);
+    const __m128i r2 = _mm_add_epi32(rows[mb + 2], offv);
+    const __m128i r3 = _mm_add_epi32(rows[mb + 3], offv);
+    const __m128i t0 = _mm_unpacklo_epi32(r0, r1);
+    const __m128i t1 = _mm_unpackhi_epi32(r0, r1);
+    const __m128i t2 = _mm_unpacklo_epi32(r2, r3);
+    const __m128i t3 = _mm_unpackhi_epi32(r2, r3);
+    __m128i* op = reinterpret_cast<__m128i*>(p + mb);
+    _mm_storeu_si128(op + 0 * (T4_ROWS / 4), _mm_unpacklo_epi64(t0, t2));  // lane 0
+    _mm_storeu_si128(op + 1 * (T4_ROWS / 4), _mm_unpackhi_epi64(t0, t2));  // lane 1
+    _mm_storeu_si128(op + 2 * (T4_ROWS / 4), _mm_unpacklo_epi64(t1, t3));  // lane 2
+    _mm_storeu_si128(op + 3 * (T4_ROWS / 4), _mm_unpackhi_epi64(t1, t3));  // lane 3
   }
 }
 
