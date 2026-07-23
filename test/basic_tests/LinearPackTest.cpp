@@ -42,17 +42,24 @@ TEST(LinearPackTest, roundTripEveryUint32Width) {
   }
 }
 
-TEST(LinearPackTest, unpackFullAndPartialFrames) {
-  constexpr uint32_t count = 257;
-  for (uint8_t bits : {0, 1, 7, 17, 31, 32}) {
-    std::vector<uint64_t> values = randomValues(count, bits);
-    std::vector<char> encoded = packToBuffer(values, bits);
-    uint32_t decoded[128];
-    uint32_t mask = LinearPack::mask32(bits);
-    LinearPack::unpack128(encoded.data(), 0, 128, bits, mask, decoded);
-    for (uint32_t i = 0; i < 128; i++) EXPECT_EQ(values[i], decoded[i]);
-    LinearPack::unpack128(encoded.data(), 256, 1, bits, mask, decoded);
-    EXPECT_EQ(values[256], decoded[0]);
+TEST(LinearPackTest, unpackMatchesSelectEveryUint32Width) {
+  for (uint8_t bits = 0; bits <= 32; bits++) {
+    for (uint32_t totalCount : {128u, 205u}) {
+      std::vector<uint64_t> values = randomValues(totalCount, bits);
+      std::vector<char> encoded = packToBuffer(values, bits);
+      uint32_t decoded[128];
+      uint32_t mask = LinearPack::mask32(bits);
+      uint32_t start = totalCount == 128 ? 0 : 128;
+      uint32_t frameCount = totalCount - start;
+      LinearPack::unpack128(
+          encoded.data(), start, frameCount, bits, mask, decoded);
+      for (uint32_t i = 0; i < frameCount; i++) {
+        ASSERT_EQ(
+            LinearPack::select32(encoded.data(), start + i, bits, mask),
+            decoded[i])
+            << "bits=" << (int)bits << " index=" << start + i;
+      }
+    }
   }
 }
 
