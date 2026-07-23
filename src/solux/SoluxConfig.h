@@ -98,6 +98,7 @@ struct IngestConfig {
 
 struct SoluxConfig {
   std::string log_level = "info";
+  size_t filterCacheBytes = 64ULL * 1024 * 1024;
   ServerConfig server;
   StoreConfig store;
   IndexConfig index;

@@ -14,6 +14,13 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::ALL);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
                                  float multiplier = 1.0f) override {
     AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(

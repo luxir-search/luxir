@@ -88,6 +88,48 @@ TEST_F(DocSetTest, intersectThreeBitsets) {
   EXPECT_EQ(collect(*u, 64), (std::vector<int32_t>{5}));
 }
 
+TEST_F(DocSetTest, intersectArrayLeadWithBitset) {
+  ArrDocSet array({3, 7, 11});
+  RAMBitDocSet bits(64);
+  for (int32_t doc : {1, 3, 5, 7, 9, 13}) bits.mutableBits().set(doc);
+  std::array<DocSet*, 2> sets{&bits, &array};
+
+  auto result = DocSet::intersect(sets);
+
+  ASSERT_EQ(result->type, DocSet::ARRAY);
+  EXPECT_EQ(collect(*result, 64), (std::vector<int32_t>{3, 7}));
+}
+
+TEST_F(DocSetTest, intersectBitsetLeadWithArray) {
+  RAMBitDocSet bits(100000);
+  for (int32_t doc = 0; doc < 500; doc++) bits.mutableBits().set(doc * 2);
+  std::vector<int32_t> arrayDocs;
+  for (int32_t doc = 0; doc < 2000; doc++) arrayDocs.emplace_back(doc * 3);
+  ArrDocSet array(std::move(arrayDocs));
+  std::array<DocSet*, 2> sets{&array, &bits};
+
+  auto result = DocSet::intersect(sets);
+
+  ASSERT_EQ(result->type, DocSet::ARRAY);
+  auto matches = collect(*result, 100000);
+  EXPECT_EQ(result->card(), 167);
+  EXPECT_EQ(matches.front(), 0);
+  EXPECT_EQ(matches.back(), 996);
+}
+
+TEST_F(DocSetTest, intersectMixedThreeWay) {
+  ArrDocSet small({4, 8, 12, 16, 20});
+  RAMBitDocSet bits(64);
+  for (int32_t doc : {2, 4, 8, 10, 16, 20, 30}) bits.mutableBits().set(doc);
+  ArrDocSet large({1, 4, 7, 8, 11, 16, 19, 20, 25});
+  std::array<DocSet*, 3> sets{&bits, &large, &small};
+
+  auto result = DocSet::intersect(sets);
+
+  ASSERT_EQ(result->type, DocSet::ARRAY);
+  EXPECT_EQ(collect(*result, 64), (std::vector<int32_t>{4, 8, 16, 20}));
+}
+
 TEST_F(DocSetTest, bitsetResultsHaveCardinality) {
   RAMBitDocSet a(64);
   for (int d : {1, 3, 5, 7}) a.mutableBits().set(d);

@@ -87,11 +87,14 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 //      See see finishCommitBody() for how we handle this.
 
 IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()> schemaProvider,
-                         IndexRamBudget* sharedIndexRamBudget)
+                         IndexRamBudget* sharedIndexRamBudget,
+                         FilterCacheConfig filterCacheConfig)
   : dir(dir),
     schemaProvider_(std::move(schemaProvider)),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
-    indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget) {
+    indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
+    filterCache(std::make_shared<FilterCache>(filterCacheConfig)),
+    originalFilterCacheConfig(filterCacheConfig) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   nextCommitInfo = std::make_unique<CommitInfo>();
   std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
@@ -2333,6 +2336,8 @@ void IndexWriter::testDeleteAllData() {
   INDEX_DEBUG("testDeleteAllData: deleting all data.");
   // wait for things in the execution graph to finish.
   updateGraph.wait_for_all();
+  auto freshFilterCache = std::make_shared<FilterCache>(
+      originalFilterCacheConfig);
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2353,6 +2358,7 @@ void IndexWriter::testDeleteAllData() {
       const std::lock_guard<std::mutex> lock(indexReaderMutex);
       indexReader.reset();
     }
+    filterCache = std::move(freshFilterCache);
 
     // drop all idle inverters (unflushed segments)
     idleInverters.clear();
@@ -2366,9 +2372,8 @@ void IndexWriter::testDeleteAllData() {
     // drop all index files
     dir.clear();
 
-    // Hmmm, what about coreGen, indexGen, and lastSegId?
-    // If we use coreGen or indexGen as cache keys, we shouldn't start over.  We could also mix in the
-    // commitTime of the first or last segment to make sure it's the same index.
+    // Any operation that rewinds seg_id/coreGen/commitTime namespaces MUST
+    // swap or epoch the filter cache before reusing those namespaces.
     lastSegId = 0;
     indexGen = 0;
     coreGen = 0;

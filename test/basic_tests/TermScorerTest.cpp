@@ -6456,7 +6456,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
                            "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = std::make_shared<IndexReader>(helper.getIndexWriter()->dir);
   ASSERT_EQ(reader->maxDoc(), nDocs);
   ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 
@@ -6540,7 +6540,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
                            "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = std::make_shared<IndexReader>(helper.getIndexWriter()->dir);
   ASSERT_EQ(reader->maxDoc(), nDocs);
   ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 
@@ -6624,7 +6624,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
                            (int64_t)(doc % 1000)));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = std::make_shared<IndexReader>(helper.getIndexWriter()->dir);
   ASSERT_EQ(reader->maxDoc(), nDocs);
   ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 

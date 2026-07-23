@@ -20,6 +20,15 @@ public:
 
   std::string_view getPrefix() const { return prefix; }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::PREFIX);
+    out.appendString(field);
+    out.appendTerm(prefix);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
     return pool.make<PrefixTermsEnum>(te, prefix);
   }

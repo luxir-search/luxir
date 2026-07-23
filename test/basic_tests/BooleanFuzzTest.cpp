@@ -17,6 +17,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/TermQuery.h"
 #include "solux/search/DocSet.h"
+#include "solux/search/FilterCache.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -641,6 +642,27 @@ TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
 
 TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
 
+  FilterCacheConfig cacheConfig{
+      .maxBytes = 768,
+      .lowWatermarkBytes = 384,
+      .maxEntryBytes = 256,
+      .minSegmentDocs = 0,
+      .admissionHistorySize = 64,
+      .admissionThreshold = 1,
+      .maxMetadataEntries = 24,
+      .maxMetadataBytes = 4096};
+  auto cache = std::make_shared<FilterCache>(cacheConfig);
+  // Scoped install: the shared collection's writer must get its own cache
+  // back, or this aggressive config (admission on first sighting) leaks into
+  // every later test via readers and namespace-reset swaps.
+  auto savedCache = helper.getIndexWriter()->filterCache;
+  helper.getIndexWriter()->filterCache = cache;
+  struct CacheRestore {
+    solux::test::CollectionHelper& helper;
+    std::shared_ptr<FilterCache> saved;
+    ~CacheRestore() { helper.getIndexWriter()->filterCache = saved; }
+  } cacheRestore{helper, std::move(savedCache)};
+
   const int numDocs = 48;
   std::vector<std::pair<std::string, std::vector<std::string>>> docs;
   for (int i = 0; i < numDocs; i++) {
@@ -752,6 +774,11 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
       break;
     }
   }
+  ASSERT_NO_THROW(cache->validateForTest());
+  auto counters = cache->counters();
+  EXPECT_GT(counters.hits, 0u);
+  EXPECT_GT(counters.builds, 0u);
+  EXPECT_GT(counters.evictions, 0u);
 }
 
 TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {

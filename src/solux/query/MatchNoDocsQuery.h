@@ -11,6 +11,13 @@ class MatchNoDocsQuery final : public solux::Query {
 public:
   MatchNoDocsQuery() {}
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::NONE);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   MatchNoDocsQuery::Weight* createWeight(Context& context, int32_t flags,
                                          float multiplier = 1.0f) override {
     unused(multiplier);

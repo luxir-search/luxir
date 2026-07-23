@@ -16,6 +16,7 @@
 // #define IREADER_DEBUG LOG_DEBUG
 
 namespace solux {
+class FilterCache;
 class OrdMap;
 
 /// LiveDocs holds the live document bitmap for a segment
@@ -214,11 +215,17 @@ public:
     return ordMaps->dataMap.size();
   }
 
-  IndexReader(Directory& dir, IndexReader* previousReader = nullptr);
+  FilterCache* filterCache() const noexcept {
+    return sharedFilterCache.get();
+  }
+
+  IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
+              std::shared_ptr<FilterCache> filterCache = nullptr);
 
 private:
   std::vector<Segment> segs;
   std::vector<std::shared_ptr<AuxReader>> auxReadersList;
+  std::shared_ptr<FilterCache> sharedFilterCache;
   uint64_t coreGeneration = 0;
   int64_t totalMaxDoc = 0;
   int64_t livedocs = 0;

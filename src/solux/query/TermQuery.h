@@ -60,6 +60,22 @@ public:
     return hasInjectedTermStats;
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::TERM);
+    out.appendString(field);
+    out.appendTerm(term);
+    out.appendFloat(boost);
+    out.appendBool(useFrontierBound);
+    out.appendBool(hasInjectedTermStats);
+    if (hasInjectedTermStats) {
+      out.appendInt64(injectedTermStats.docFreq);
+      out.appendInt64(injectedTermStats.totalTermFreq);
+    }
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   const Similarity::TermStats& scoringTermStats(const CachedTermInfo& cachedTermInfo) const {
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }

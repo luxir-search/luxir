@@ -102,7 +102,13 @@ void SearchEngine::getResources(SearchRequest& req) {
 
   // get the index reader
   req.schema = collection->getSchema();
-  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(request.freshness_us);
+  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(
+      request.freshness_us);
+  auto* filterCache = req.reader->filterCache();
+  if (filterCache != nullptr && filterCache->enabled()) {
+    req.filterUses = std::make_shared<FilterCache::UseRegistry>(
+        *filterCache, *req.reader);
+  }
 }
 
 

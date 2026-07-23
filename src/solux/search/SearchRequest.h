@@ -10,6 +10,7 @@
 #include "solux/api/solux_types.hpp"
 #include "solux/api/build.h"
 #include "IndexReader.h"
+#include "FilterCache.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/Clock.h"
 #include "solux/util/DateTime.h"
@@ -76,6 +77,13 @@ public:
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
+  // One Use per distinct filter key for the whole request: duplicate filters
+  // in separate operation trees share the same Use, so per-segment value pins
+  // and request-composed sets are produced once and reused (admission also
+  // counts once as a consequence). shared_ptr because a standalone
+  // Query::Context (tests, non-request embedders) creates and owns its own
+  // registry, while request-backed Contexts all reference this one.
+  std::shared_ptr<FilterCache::UseRegistry> filterUses;
   // Pins the collection schema snapshot for the request.  Schema instances are
   // immutable after publication, so query objects may keep FieldType references
   // derived from this schema for the request lifetime.

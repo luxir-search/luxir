@@ -41,6 +41,17 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::GEO_DISTANCE);
+    out.appendString(field);
+    out.appendDouble(centerLatitude);
+    out.appendDouble(centerLongitude);
+    out.appendDouble(radiusMeters);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   BKDDistanceRelation makeRelation() const {
     return {centerLatitude, centerLongitude, radiusMeters};
   }

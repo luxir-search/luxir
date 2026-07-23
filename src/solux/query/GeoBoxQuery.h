@@ -63,6 +63,19 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::GEO_BOX);
+    out.appendString(field);
+    out.appendInt32(minLatitude);
+    out.appendInt32(maxLatitude);
+    out.appendInt32(minLongitude);
+    out.appendInt32(maxLongitude);
+    out.appendBool(empty);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   BKDBoxRelation makeRelation() const {
     return {minLatitude, maxLatitude, minLongitude, maxLongitude};
   }

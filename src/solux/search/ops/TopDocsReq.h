@@ -39,6 +39,7 @@ public:
   int64_t topCount; // maximum number of docs to return.
   std::span<std::pair<std::string_view, Query*>> filters;
   std::span<Query::Weight*> filterWeights;
+  std::span<FilterCache::Use*> filterUses;
   SortPlan sortPlan;
 
   // Optional sink for the merged top-K collector.  If set, the Calc invokes
@@ -122,7 +123,7 @@ public:
     std::atomic<int32_t> preparedDomainsSeen{0};
     std::vector<DocSet*> baseDomains;
     std::vector<DocSet*> effectiveDomains;
-    std::vector<std::unique_ptr<DocSet>> effectiveDomainsOwned;
+    std::vector<QueryPrep::MaterializedFilter> effectiveDomainsOwned;
     std::vector<std::unique_ptr<Query::Weight::PreparedWeight>> preparedFilterWeights;
     std::unique_ptr<Query::Weight::PreparedWeight> preparedWeight;
 
@@ -155,24 +156,25 @@ public:
       return supplier->get(pool, std::numeric_limits<int64_t>::max());
     }
 
-    std::unique_ptr<DocSet> buildEffectiveDomain(int32_t segnum) {
+    QueryPrep::MaterializedFilter buildEffectiveDomain(int32_t segnum) {
       auto& op = thisOp();
       auto* baseDomain = baseDomains[(size_t)segnum];
-      if (op.filterWeights.empty()) return nullptr;
+      if (op.filterWeights.empty()) return {};
       auto& seg = op.req.reader->segments()[segnum];
 
-      std::vector<std::unique_ptr<DocSet>> filters;
+      std::vector<QueryPrep::MaterializedFilter> filters;
       std::vector<DocSet*> filterPtrs;
       filters.reserve(op.filterWeights.size());
       filterPtrs.reserve(op.filterWeights.size());
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
-        filters.push_back(QueryPrep::materialize(
-          *op.filterWeights[i], preparedFilterWeights[i].get(), seg, baseDomain));
+        filters.push_back(QueryPrep::materializeEffectiveFilter(
+          *op.filterWeights[i], preparedFilterWeights[i].get(),
+          op.filterUses[i], *op.req.reader, seg, baseDomain));
         filterPtrs.push_back(filters.back().get());
       }
-      if (filterPtrs.empty()) return nullptr;
+      if (filterPtrs.empty()) return {};
       if (filterPtrs.size() == 1) return std::move(filters[0]);
-      return DocSet::intersect(filterPtrs);
+      return QueryPrep::MaterializedFilter(DocSet::intersect(filterPtrs));
     }
 
     void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) {
@@ -197,10 +199,10 @@ public:
         std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
         tg != nullptr
       };
-      for (size_t i = 0; i < op.filterWeights.size(); i++) {
-        if (op.filterWeights[i]->needsPrepare()) {
-          preparedFilterWeights[i] = op.filterWeights[i]->prepare(baseCtx);
-        }
+      auto preparedFilters = QueryPrep::prepareFilterSources(
+          op.filterWeights, op.filterUses, baseCtx);
+      for (size_t i = 0; i < preparedFilters.size(); i++) {
+        preparedFilterWeights[i] = std::move(preparedFilters[i].prepared);
       }
 
       for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
@@ -277,13 +279,15 @@ public:
         if (supplier != nullptr) {
           DocSet* filter = domain;
           std::unique_ptr<DocSet> newDomain;
-          // Owns the materialized filter sets; `filter` may alias one directly
-          // (single-filter case), so this must outlive the collection below.
-          std::vector<std::unique_ptr<DocSet>> filters;
+          // Keeps owned sets or request-pinned cache borrows alive; `filter`
+          // may alias one directly, so the handles outlive collection below.
+          std::vector<QueryPrep::MaterializedFilter> filters;
           if (!preparedMode && !thisOp().filterWeights.empty()) {
             std::vector<DocSet*> filterPtrs;
-            for (auto weight : thisOp().filterWeights) {
-              filters.push_back(QueryPrep::materialize(*weight, nullptr, seg, nullptr));
+            for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
+              filters.push_back(QueryPrep::materializeEffectiveFilter(
+                  *thisOp().filterWeights[i], nullptr,
+                  thisOp().filterUses[i], *op.req.reader, seg, nullptr));
               filterPtrs.push_back(filters.back().get());
             }
             if (domain) {
@@ -496,6 +500,13 @@ public:
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
       weight(weight), topCount(topCount), filters(filters), filterWeights(filterWeights),
       sortPlan(std::move(sortPlan)) {
+    if (!filterWeights.empty()) {
+      assert(filterWeights.size() == filters.size());
+      filterUses = qcontext.pool.make_span<FilterCache::Use*>(filters.size());
+      for (size_t i = 0; i < filters.size(); i++) {
+        filterUses[i] = qcontext.getFilterUse(*filters[i].second);
+      }
+    }
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {

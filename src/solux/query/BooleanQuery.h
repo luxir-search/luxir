@@ -425,6 +425,29 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    out.appendTag(FilterKeyTag::BOOLEAN);
+    out.appendInt32(minShouldMatch);
+    FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE;
+    auto appendRole = [&](FilterKeyTag role, std::span<Query*> clauses) {
+      out.appendTag(role);
+      out.appendSize(clauses.size());
+      for (Query* clause : clauses) {
+        scope = strongestFilterKeyScope(
+            scope, clause->appendFilterKey(out, ctx));
+      }
+    };
+    appendRole(FilterKeyTag::BOOLEAN_MANDATORY, mandatory);
+    bool dropOptional = (!mandatory.empty() || !filter.empty())
+        && minShouldMatch < 1;
+    appendRole(FilterKeyTag::BOOLEAN_OPTIONAL,
+               dropOptional ? std::span<Query*>{} : optional);
+    appendRole(FilterKeyTag::BOOLEAN_PROHIBITED, prohibited);
+    appendRole(FilterKeyTag::BOOLEAN_FILTER, filter);
+    return scope;
+  }
+
   ScoreProfile scoreProfile() const override {
     float sum = 0.0f;
     bool explicitScore = false;
@@ -513,6 +536,7 @@ public:
     std::span<Query::Weight*> optionalWeights;
     std::span<Query::Weight*> prohibitedWeights;
     std::span<Query::Weight*> filterWeights;
+    std::span<FilterCache::Use*> filterUses;
     int minShouldMatch = 0;
     bool needsScores = false;
 
@@ -1376,7 +1400,7 @@ public:
       std::vector<uint8_t> mandatoryScores;
       std::vector<QueryPrep::PreparedSource> optionalSources;
       std::vector<QueryPrep::PreparedSource> prohibitedSources;
-      std::vector<std::unique_ptr<DocSet>> filterDomains;
+      std::vector<QueryPrep::MaterializedFilter> filterDomains;
       bool hasFilters = false;
       int minShouldMatch = 0;
       bool needsScores = false;
@@ -1386,7 +1410,7 @@ public:
                             std::span<const uint8_t> mandatoryScores,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
                             std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
-                            std::vector<std::unique_ptr<DocSet>>&& filterDomains,
+                            std::vector<QueryPrep::MaterializedFilter>&& filterDomains,
                             bool hasFilters, int minShouldMatch, bool needsScores)
         : mandatorySources(std::move(mandatorySources)),
           mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
@@ -1440,6 +1464,12 @@ public:
         mergeDuplicateScoringTerms(context.pool, query.optional, &removedOptional);
       auto prohibitedClauses = dropDuplicateFilterTerms(context.pool, query.prohibited);
       auto filterClauses = dropDuplicateFilterTerms(context.pool, query.filter);
+      if (!filterClauses.empty()) {
+        filterUses = context.pool.make_span<FilterCache::Use*>(filterClauses.size());
+        for (size_t i = 0; i < filterClauses.size(); i++) {
+          filterUses[i] = context.getFilterUse(*filterClauses[i]);
+        }
+      }
       createMandatoryWeights(context, mandatoryClauses, flags, multiplier);
       // With a mandatory clause and minShouldMatch unset, optional clauses are
       // a pure score add (MandOpt) - they never affect membership.  Without
@@ -1455,7 +1485,9 @@ public:
         ? std::span<Query::Weight*>{}
         : createWeights(context.pool, context, optionalClauses, flags, multiplier);
       prohibitedWeights = createWeights(context.pool, context, prohibitedClauses, noScore, 1.0f);
-      filterWeights = createWeights(context.pool, context, filterClauses, noScore, 1.0f);
+      int32_t exhaustiveFilterFlags = flags & ~(NEED_SCORES | ALLOW_PRUNING);
+      filterWeights = createWeights(context.pool, context, filterClauses,
+                                    exhaustiveFilterFlags, 1.0f);
       // Solux-defined min_match semantics under duplicate removal, split by
       // the intent the value expresses (Lucene instead refuses to dedup when
       // min_match > 1 and lets duplicates satisfy multiple match slots):
@@ -1505,15 +1537,18 @@ public:
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
-      auto filterSources = QueryPrep::prepareSources(filterWeights, ctx);
-      std::vector<std::unique_ptr<DocSet>> filterDomains(ctx.reader.segments().size());
+      auto filterSources = QueryPrep::prepareFilterSources(
+          filterWeights, filterUses, ctx);
+      std::vector<QueryPrep::MaterializedFilter> filterDomains(
+          ctx.reader.segments().size());
       std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
 
       if (!filterSources.empty()) {
         for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
           auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
-          filterDomains[segnum] = QueryPrep::materializeIntersection(
-            QueryPrep::preparedSpan(filterSources), ctx.reader.segments()[segnum], outerDomain);
+          filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
+            QueryPrep::preparedSpan(filterSources), filterUses, ctx.reader,
+            ctx.reader.segments()[segnum], outerDomain);
           childDomainPtrs[segnum] = filterDomains[segnum].get();
         }
       } else {
@@ -1542,8 +1577,16 @@ public:
       auto mandatorySources = QueryPrep::liveSources(targetPool, mandatoryWeights);
       auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
-      auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
-      auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
+      std::span<Query::ScorerSupplier*> filterSuppliers;
+      if (!filterWeights.empty()) {
+        filterSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
+            filterWeights.size());
+        for (size_t i = 0; i < filterWeights.size(); i++) {
+          filterSuppliers[i] = QueryPrep::filterSupplier(
+              targetPool, *filterWeights[i], nullptr, filterUses[i],
+              context.topReader, segment);
+        }
+      }
       return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
                           optionalSources,
                           prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
@@ -3080,6 +3123,10 @@ public:
       std::span<Query::Scorer*> members;
     };
 
+    struct DenseClause {
+      std::span<Query::Scorer*> members;
+    };
+
     struct BufferedTerm {
       TermQuery::Scorer* scorer = nullptr;
       std::span<int32_t> docs;
@@ -3091,6 +3138,7 @@ public:
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
     std::span<TermClause> termClauses;  // direct terms or decomposed flat unions
+    std::span<DenseClause> denseClauses; // exact window-fill capable clauses
     std::span<float> windowMax;         // per-clause bound over the current window
     std::span<double> suffixMax;        // suffixMax[c] = sum of windowMax[c..n)
     std::span<int32_t> candDocs;
@@ -3109,7 +3157,9 @@ public:
     int64_t skippedWindowCount = 0;
     bool allTermScorers = false;
     bool allTermClauses = false;
+    bool allDenseClauses = false;
     bool hasDisjGroup = false;
+    bool denseHasDisjGroup = false;
     bool denseCountPath = false;
 
     bool acceptsDoc(DocSet* filter, int32_t doc) {
@@ -3134,23 +3184,33 @@ public:
       return doc;
     }
 
-    int32_t termClauseCountAdvance(size_t clause, int32_t target) {
+    int32_t denseClauseDocId(size_t clause) {
       int32_t doc = PostingsReader::END;
-      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
-        auto* scorer = termClauseMember(clause, member);
-        int32_t memberDoc = scorer->docsEnum.docId();
+      for (Query::Scorer* member : denseClauses[clause].members) {
+        doc = std::min(doc, member->docId());
+      }
+      return doc;
+    }
+
+    int32_t denseClauseCountAdvance(size_t clause, int32_t target) {
+      int32_t doc = PostingsReader::END;
+      for (Query::Scorer* member : denseClauses[clause].members) {
+        DocsEnum* probe = member->windowFilterProbeDocsEnum();
+        int32_t memberDoc = probe != nullptr ? probe->docId() : member->docId();
         if (memberDoc < target) {
-          memberDoc = scorer->docsEnum.advanceDocOnly(target);
+          memberDoc = probe != nullptr
+              ? probe->advanceDocOnly(target)
+              : member->advance(target);
         }
         doc = std::min(doc, memberDoc);
       }
       return doc;
     }
 
-    void fillTermClauseWindowBits(size_t clause, std::span<uint64_t> bits,
-                                  int32_t windowBase, int32_t windowEnd) {
-      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
-        termClauseMember(clause, member)->fillWindowBits(bits, windowBase, windowEnd);
+    void fillDenseClauseWindowBits(size_t clause, std::span<uint64_t> bits,
+                                   int32_t windowBase, int32_t windowEnd) {
+      for (Query::Scorer* member : denseClauses[clause].members) {
+        member->fillWindowBits(bits, windowBase, windowEnd);
       }
     }
 
@@ -3670,10 +3730,10 @@ public:
     }
 
     int32_t ratchetDenseWindow(int32_t min, int32_t max) {
-      for (size_t c = 0; c < termClauses.size(); c++) {
-        int32_t doc = termClauseDocId(c);
+      for (size_t c = 0; c < denseClauses.size(); c++) {
+        int32_t doc = denseClauseDocId(c);
         if (doc < min) {
-          doc = termClauseCountAdvance(c, min);
+          doc = denseClauseCountAdvance(c, min);
         }
         if (doc > min) {
           min = doc;
@@ -3700,10 +3760,10 @@ public:
           }
           int32_t doc = windowBase + index;
           bool matched = true;
-          for (size_t c = firstClause; c < termClauses.size(); c++) {
-            int32_t scorerDoc = termClauseDocId(c);
+          for (size_t c = firstClause; c < denseClauses.size(); c++) {
+            int32_t scorerDoc = denseClauseDocId(c);
             if (scorerDoc < doc) {
-              scorerDoc = termClauseCountAdvance(c, doc);
+              scorerDoc = denseClauseCountAdvance(c, doc);
             }
             if (scorerDoc != doc) {
               matched = false;
@@ -3732,7 +3792,7 @@ public:
       int32_t windowEnd = std::min(requestedEnd, max);
 
       skipCount(SkipStats::conjDenseCountWindows);
-      if (hasDisjGroup) {
+      if (denseHasDisjGroup) {
         skipCount(SkipStats::conjDisjGroupCountWindows);
       }
       if (windowFilter != nullptr
@@ -3740,14 +3800,14 @@ public:
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
       clearWindowBits(windowBits);
-      fillTermClauseWindowBits(0, windowBits, windowBase, windowEnd);
-      for (size_t c = 1; c < termClauses.size(); c++) {
+      fillDenseClauseWindowBits(0, windowBits, windowBase, windowEnd);
+      for (size_t c = 1; c < denseClauses.size(); c++) {
         clearWindowBits(clauseBits);
-        fillTermClauseWindowBits(c, clauseBits, windowBase, windowEnd);
+        fillDenseClauseWindowBits(c, clauseBits, windowBase, windowEnd);
         for (int32_t w = 0; w < kWindowWords; w++) {
           windowBits[(size_t) w] &= clauseBits[(size_t) w];
         }
-        if (termClauses.size() >= 3 && c + 1 < termClauses.size()) {
+        if (denseClauses.size() >= 3 && c + 1 < denseClauses.size()) {
           int32_t card = 0;
           for (uint64_t bits : windowBits) {
             card += (int32_t) std::popcount(bits);
@@ -3835,6 +3895,7 @@ public:
         : scorers(scorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
+          denseClauses(pool.make_arr<DenseClause>(scorers.size()), scorers.size()),
           windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
           suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
           candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
@@ -3851,8 +3912,25 @@ public:
       assert(scorers.size() >= 2);
       allTermScorers = true;
       allTermClauses = true;
+      allDenseClauses = true;
       size_t scoreAddends = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
+        std::span<Query::Scorer*> denseMembers;
+        if (scorers[i]->supportsWindowFilter()) {
+          denseMembers = scorers.subspan(i, 1);
+        } else if (!disableDisjGroupBulkForTests) {
+          denseMembers = scorers[i]->flatDisjunctionScorers();
+          for (Query::Scorer* member : denseMembers) {
+            if (!member->supportsWindowFilter()) {
+              denseMembers = {};
+              break;
+            }
+          }
+        }
+        denseClauses[i].members = denseMembers;
+        allDenseClauses &= !denseMembers.empty();
+        denseHasDisjGroup |= denseMembers.size() > 1;
+
         termScorers[i] = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
         allTermScorers &= termScorers[i] != nullptr;
         if (termScorers[i] != nullptr) {
@@ -3891,7 +3969,7 @@ public:
                                                          (size_t) kChunk);
         }
       }
-      denseCountPath = allTermClauses && maxDoc >= kWindowSize
+      denseCountPath = allDenseClauses && maxDoc >= kWindowSize
           && leadCost >= std::max<int64_t>(1, (int64_t) maxDoc / kDenseThresholdInverse);
     }
 

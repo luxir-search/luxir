@@ -23,6 +23,11 @@ public:
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    return child->appendFilterKey(out, ctx);
+  }
+
   // A boost is a pure multiplier: it scales the child's uniform value but
   // never changes its kind, so a boosted automatic constant is still
   // suppressed in required position. constant_score (^=) is the opt-in for

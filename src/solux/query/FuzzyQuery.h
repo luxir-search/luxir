@@ -89,6 +89,23 @@ public:
   int getPrefixLength() const { return prefixLength; }
   int getMaxExpansions() const { return maxExpansions; }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    out.appendTag(FilterKeyTag::FUZZY);
+    out.appendString(field);
+    out.appendTerm(term);
+    out.appendInt32(maxEdits);
+    out.appendInt32(prefixLength);
+    int operatorLimit = ctx.fuzzyMaxExpansions > 0
+        ? ctx.fuzzyMaxExpansions
+        : std::numeric_limits<int>::max();
+    int effectiveLimit = std::min({userExpansionLimit(), operatorLimit,
+                                   FUZZY_CLAUSE_BUDGET});
+    out.appendInt32(effectiveLimit);
+    out.appendFloat(boost);
+    return FilterKeyScope::CORE_STABLE;
+  }
+
 private:
   std::vector<ExpansionCandidate> collectCandidates(Context& context, MemPool& scratch,
                                                      CachedFieldInfo& fieldInfo) const {

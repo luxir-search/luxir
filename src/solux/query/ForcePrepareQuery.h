@@ -15,6 +15,11 @@ class ForcePrepareQuery final : public solux::Query {
 public:
   explicit ForcePrepareQuery(Query* child) : child(child) {}
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    return child->appendFilterKey(out, ctx);
+  }
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override {
     return context.pool.make<ForcePrepareQuery::Weight>(context, *this, flags,

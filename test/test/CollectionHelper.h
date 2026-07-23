@@ -39,6 +39,7 @@ struct IndexResult {
 class CollectionHelper {
 private:
   std::shared_ptr<Collection> collection_;
+  SoluxNode* node_;
 
   // Extract owning copies of the (non-owning) response into the result; called from done(),
   // where the message (and its response arena) are still alive.
@@ -203,8 +204,12 @@ public:
     }
   };
 
-  CollectionHelper(std::string_view name = "main") {
-    collection_ = SoluxTest::soluxNode->getOrCreateCollection(name);
+  CollectionHelper(std::string_view name = "main")
+    : CollectionHelper(*SoluxTest::soluxNode, name) {}
+
+  CollectionHelper(SoluxNode& node, std::string_view name = "main")
+    : node_(&node) {
+    collection_ = node.getOrCreateCollection(name);
     getIndexWriter()->mergePolicy->setMergeFactor(10);  // reset in case other tests forget.
   }
 
@@ -313,7 +318,7 @@ public:
     return readDurableIndexInfo(getIndexWriter()->dir)->segments.size();
   }
 
-  SearchEngine& getSearchEngine() { return SoluxTest::soluxNode->getSearchEngine(); }
+  SearchEngine& getSearchEngine() { return node_->getSearchEngine(); }
 
   /// Given nDocs, mergeFactor, and a base-36 "shape" string, fill docsPerSeg with
   /// per-segment doc counts (largest to smallest). For reusing a prior test/bench index.

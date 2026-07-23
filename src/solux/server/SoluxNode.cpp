@@ -311,7 +311,8 @@ std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
   // Pass a schemaProvider that fetches the schema from the Collection
   auto* colPtr = col.get();
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
-    [colPtr]() { return colPtr->getSchema(); }, &indexRamBudget);
+    [colPtr]() { return colPtr->getSchema(); }, &indexRamBudget,
+    FilterCacheConfig{.maxBytes = config.filterCacheBytes});
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->perInverterMaxDocs = (size_t)config.index.max_inverter_docs;
 

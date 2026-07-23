@@ -24,6 +24,14 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::EXISTS);
+    out.appendString(field);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   class Weight;
 
   Weight* createWeight(Context& context, int32_t flags,

@@ -84,7 +84,8 @@ public:
     return qb::boolean(mr, {}, optional, {}, {}, minMatch);
   }
 
-  static api::Query queryFor(std::pmr::memory_resource& mr, Shape shape) {
+  static api::Query queryFor(std::pmr::memory_resource& mr, Shape shape,
+                             std::string_view filterTerm) {
     std::vector<api::Query> required;
     std::vector<api::Query> filter;
     switch (shape) {
@@ -112,7 +113,7 @@ public:
       case Shape::FILTER:
         required = {termGroup(mr, {"a", "b"}),
                     termGroup(mr, {"c", "d"})};
-        filter = {qb::match(mr, "body_w", "keep")};
+        filter = {qb::match(mr, "body_w", filterTerm)};
         break;
       case Shape::MIN_MATCH_TWO:
         required = {termGroup(mr, {"a", "b", "c"}, 2),
@@ -144,7 +145,11 @@ public:
     } else {
       cur.getNumber().limit(0);
     }
-    cur.rawQuery() = queryFor(cur.mr(), shape);
+    std::string filterTerm = std::string("keep_")
+        + (disabled ? "opaque" : "bulk")
+        + (scored ? "_score" : "_count")
+        + (pruning ? "_topk" : "_all");
+    cur.rawQuery() = queryFor(cur.mr(), shape, filterTerm);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
 
@@ -183,7 +188,11 @@ public:
     docs.reserve((size_t) numDocs);
     for (int32_t doc = 0; doc < numDocs; doc++) {
       std::string body = "filler";
-      if ((doc % 2) == 0) body += " a keep";
+      if ((doc % 2) == 0) {
+        body += " a keep_opaque_count_all keep_bulk_count_all"
+                " keep_opaque_score_all keep_bulk_score_all"
+                " keep_opaque_score_topk keep_bulk_score_topk";
+      }
       if ((doc % 3) == 0) body += " b";
       if ((doc % 4) == 0) body += " c";
       if ((doc % 5) == 0) body += " d";

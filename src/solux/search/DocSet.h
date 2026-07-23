@@ -1,6 +1,8 @@
 #pragma once
 #include <algorithm>
 #include <bit>
+#include <cstddef>
+#include <stdexcept>
 #include <vector>
 #include <span>
 #include <solux/util/screaming.h>
@@ -44,6 +46,10 @@ public:
   }
 
   virtual bool get(int32_t docid) const = 0; // returns true if the docid is in the set
+
+  // Heap bytes owned by this DocSet, including capacity rather than logical
+  // cardinality. Cache accounting uses this after immutable publication.
+  virtual size_t ramBytesUsed() const = 0;
 
   static std::unique_ptr<DocSet> intersect(std::span<DocSet*> sets);
 
@@ -89,6 +95,11 @@ public:
   FixedBitSet& mutableBits() {
     return bits_;
   }
+
+  size_t ramBytesUsed() const override {
+    // The words are borrowed (liveDocs and other mapped views).
+    return sizeof(BitDocSet);
+  }
 };
 
 
@@ -106,6 +117,11 @@ public:
 
   ~RAMBitDocSet() override {
     delete[] bits_.words; // free the allocated memory
+  }
+
+  size_t ramBytesUsed() const override {
+    return sizeof(RAMBitDocSet)
+        + FixedBitSet::sizeInWords(bits_.size()) * sizeof(uint64_t);
   }
 };
 
@@ -130,6 +146,10 @@ public:
   bool get(int32_t docid) const override {
     // do a binary search for the docid
     return std::binary_search(docs_.begin(), docs_.end(), docid);
+  }
+
+  size_t ramBytesUsed() const override {
+    return sizeof(ArrDocSet) + docs_.capacity() * sizeof(int32_t);
   }
 
 };
@@ -351,65 +371,96 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
   std::sort(sets.begin(), sets.end(), [](DocSet* a, DocSet* b) {
     return a->card() < b->card();
   });
-  if (sets[0]->type == BITSET) {
+
+  size_t firstBitset = sets.size();
+  bool allBitsets = true;
+  for (size_t i = 0; i < sets.size(); i++) {
+    if (sets[i]->type == BITSET) {
+      if (firstBitset == sets.size()) {
+        firstBitset = i;
+      }
+    } else {
+      allBitsets = false;
+    }
+  }
+
+  int32_t nbits = -1;
+  if (firstBitset != sets.size()) {
+    nbits = ((BitDocSet*) sets[firstBitset])->bits().size();
+    for (DocSet* set : sets) {
+      if (set->type == BITSET) {
+        if (((BitDocSet*) set)->bits().size() != nbits) {
+          throw std::invalid_argument("DocSet bitset sizes differ");
+        }
+      } else {
+        auto docs = ((ArrDocSet*) set)->docs();
+        if (!docs.empty() && (docs.front() < 0 || docs.back() >= nbits)) {
+          throw std::invalid_argument("DocSet array is outside bitset range");
+        }
+      }
+    }
+  }
+
+  if (allBitsets) {
     auto& firstBits = ((BitDocSet*) sets[0])->bits();
-    auto nbits = firstBits.size();
     auto nWords = firstBits.sizeInWords(nbits);
     auto result = std::make_unique<RAMBitDocSet>(nbits);
     auto& bits = result->mutableBits();
     memcpy(bits.words, firstBits.words, nWords * sizeof(*bits.words));
     for (size_t i = 1; i < sets.size(); i++) {
-      assert(sets[i]->type == BITSET);
       for (size_t word = 0; word < nWords; word++) {
         bits.words[word] &= ((BitDocSet*)sets[i])->bits().words[word];
       }
     }
     return result;
   }
-  // if we get here, we have an array of docids.
-  size_t firstbitset = sets.size();
-  for (auto i = 0u; i < sets.size(); i++) {
-    if (sets[i]->type == BITSET) {
-      firstbitset = i;
-      break;
-    }
-  }
-  std::vector<int32_t> docStore1;
-  std::vector<int32_t> docStore2;
-  std::span<int32_t> firstArr = ((ArrDocSet*)sets[0])->docs();
-  std::vector<int32_t>* outputDocs = &docStore1;
-  std::vector<int32_t>* inputDocs = &docStore2;
-  for (auto doc : firstArr) {
-    bool missing = false;
-    for (size_t setid = firstbitset; setid < sets.size(); setid++) {
-      if (!((BitDocSet*)sets[setid])->bits().get(doc)) {
-        missing = true;
-        break;
+
+  // Mixed representations use the true smallest-cardinality set as the lead.
+  // Iterating it and probing the rest is total for either lead representation.
+  std::vector<int32_t> outputDocs;
+  outputDocs.reserve((size_t) sets[0]->card());
+  auto matchesRest = [&](int32_t doc) {
+    for (size_t i = 1; i < sets.size(); i++) {
+      if (!sets[i]->get(doc)) {
+        return false;
       }
     }
-    if (!missing) {
-      outputDocs->emplace_back(doc);
+    return true;
+  };
+
+  if (sets[0]->type == ARRAY) {
+    for (int32_t doc : ((ArrDocSet*) sets[0])->docs()) {
+      if (matchesRest(doc)) {
+        outputDocs.emplace_back(doc);
+      }
+    }
+  } else {
+    const FixedBitSet& bits = ((BitDocSet*) sets[0])->bits();
+    size_t nWords = FixedBitSet::sizeInWords(bits.size());
+    for (size_t wordIdx = 0; wordIdx < nWords; wordIdx++) {
+      uint64_t word = bits.words[wordIdx];
+      if (wordIdx + 1 == nWords && (bits.size() & 63) != 0) {
+        word &= (1ULL << (bits.size() & 63)) - 1ULL;
+      }
+      while (word != 0) {
+        int32_t doc = (int32_t) ((wordIdx << 6) + std::countr_zero(word));
+        if (matchesRest(doc)) {
+          outputDocs.emplace_back(doc);
+        }
+        word &= word - 1;
+      }
     }
   }
 
-  for (size_t setid = 1; setid < firstbitset; setid++) {
-    std::swap(outputDocs, inputDocs);
-    outputDocs->clear();
-    std::span<int32_t> idocs = *inputDocs;
-    std::span<int32_t> jdocs = ((ArrDocSet*)sets[setid])->docs();
-    std::set_intersection(idocs.begin(), idocs.end(),
-      jdocs.begin(), jdocs.end(),
-      std::back_inserter(*outputDocs));
-  }
-  outputDocs->shrink_to_fit();
-  return std::make_unique<ArrDocSet>(std::move(*outputDocs));
+  outputDocs.shrink_to_fit();
+  return std::make_unique<ArrDocSet>(std::move(outputDocs));
 }
 
 inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {
   assert(sets.size() > 1);
 
-  // If any input is BITSET, the result is a BITSET sized to match.  All
-  // BITSETs must share a size (asserted via memcpy of identical word counts).
+  // If any input is BITSET, the result is a BITSET sized to match. Invalid
+  // mixed ranges and mismatched BITSET sizes are rejected in every build.
   size_t firstBitset = sets.size();
   for (size_t i = 0; i < sets.size(); i++) {
     if (sets[i]->type == BITSET) {
@@ -420,7 +471,7 @@ inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {
 
   if (firstBitset < sets.size()) {
     auto& firstBits = ((BitDocSet*)sets[firstBitset])->bits();
-    auto nbits = firstBits.size();
+    int32_t nbits = firstBits.size();
     auto nWords = firstBits.sizeInWords(nbits);
     auto result = std::make_unique<RAMBitDocSet>(nbits);
     auto& bits = result->mutableBits();
@@ -430,12 +481,17 @@ inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {
       if (i == firstBitset) continue;
       if (sets[i]->type == BITSET) {
         auto& other = ((BitDocSet*)sets[i])->bits();
-        assert(other.size() == nbits);
+        if (other.size() != nbits) {
+          throw std::invalid_argument("DocSet bitset sizes differ");
+        }
         for (size_t w = 0; w < nWords; w++) {
           bits.words[w] |= other.words[w];
         }
       } else {
         for (auto doc : ((ArrDocSet*)sets[i])->docs()) {
+          if (doc < 0 || doc >= nbits) {
+            throw std::invalid_argument("DocSet array is outside bitset range");
+          }
           bits.set(doc);
         }
       }

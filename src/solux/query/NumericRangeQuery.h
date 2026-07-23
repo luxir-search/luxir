@@ -37,6 +37,16 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::NUMERIC_RANGE);
+    out.appendString(field);
+    out.appendInt64(lo);
+    out.appendInt64(hi);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
     float score = constantWhenScored(flags, multiplier);

@@ -1,5 +1,6 @@
 
 #include <gtest/gtest.h>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <filesystem>
@@ -18,6 +19,8 @@
 #include <solux/server/ProtoUpdateMessage.h>
 
 #include "solux/index/IndexWriter.h"
+#include "solux/query/BooleanQuery.h"
+#include "solux/query/TermQuery.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/FieldReader.h"
@@ -287,6 +290,73 @@ TEST_F(IndexWriterTest, getReader) {
   ASSERT_NE(reader, reader2);  // It's possible this could spuriously fail if the sleep wasn't long enough or the system clock is changed.
   ASSERT_EQ(2, reader2->maxDoc());
   ASSERT_EQ(2, reader2->segments().size());
+}
+
+TEST_F(IndexWriterTest, filterCachePublishesOnlyInstalledReaders) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  auto cache = iw.getFilterCache();
+
+  addDoc(iw);
+  iw.commit();
+  auto reader = iw.getIndexReader();
+  EXPECT_EQ(cache.get(), reader->filterCache());
+  uint64_t publications = cache->readerPublicationsForTest();
+  EXPECT_EQ(reader, iw.getIndexReader());
+  EXPECT_EQ(publications, cache->readerPublicationsForTest());
+
+  addDoc(iw);
+  iw.commit();
+  EXPECT_EQ(reader, iw.getIndexReader(10000000));
+  EXPECT_EQ(publications, cache->readerPublicationsForTest());
+
+  auto newer = iw.getIndexReader();
+  EXPECT_NE(reader, newer);
+  EXPECT_EQ(cache.get(), newer->filterCache());
+  EXPECT_EQ(publications + 1, cache->readerPublicationsForTest());
+  EXPECT_EQ(newer, iw.getIndexReader());
+  EXPECT_EQ(publications + 1, cache->readerPublicationsForTest());
+
+  IndexReader standalone(dir);
+  EXPECT_EQ(nullptr, standalone.filterCache());
+}
+
+TEST_F(IndexWriterTest, queryContextOwnsAndDeduplicatesFilterUses) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  auto reader = iw.getIndexReader();
+  MemPool pool;
+  Query::Context context(pool, *reader, {}, nullptr,
+                         {.schemaGen = 9, .coreGen = 0,
+                          .fuzzyMaxExpansions = 10000, .timeZone = {}});
+  TermQuery query("text_w", "test");
+
+  auto* first = context.getFilterUse(query);
+  ASSERT_NE(nullptr, first);
+  EXPECT_EQ(first, context.getFilterUse(query));
+  EXPECT_EQ(1u, context.filterUses->size());
+
+  MemPool otherPool;
+  Query::Context other(otherPool, *reader, {}, nullptr,
+                       context.filterKeyContext,
+                       context.filterUses);
+  EXPECT_EQ(first, other.getFilterUse(query));
+  EXPECT_EQ(1u, other.filterUses->size());
+}
+
+TEST_F(IndexWriterTest, booleanAcquiresUsesAfterFilterNormalization) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  auto reader = iw.getIndexReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery first("text_w", "test");
+  TermQuery duplicate("text_w", "test");
+  std::array<Query*, 2> filters{&first, &duplicate};
+  BooleanQuery query({}, {}, {}, filters);
+
+  ASSERT_NE(nullptr, query.createWeight(context, 0));
+  EXPECT_EQ(1u, context.filterUses->size());
 }
 
 

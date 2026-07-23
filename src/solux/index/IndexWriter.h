@@ -14,6 +14,7 @@
 #include "solux/index/MergeCostModel.h"
 #include "solux/store/Directory.h"
 #include "solux/search/IndexReader.h"
+#include "solux/search/FilterCache.h"
 #include "solux/server/SoluxError.h"
 #include "Inverter.h"
 #include "UpdateMessage.h"
@@ -258,6 +259,12 @@ public:
   std::atomic_uint64_t lastSegId;
 
   std::shared_ptr<IndexReader> indexReader;
+  std::shared_ptr<FilterCache> filterCache;
+  // Construction-time cache config. Namespace rewinds (testDeleteAllData, a
+  // future truncate) rebuild the cache from THIS, not from the installed
+  // cache's config, so a test-assigned replacement cache cannot leak its
+  // policy past a reset of the shared collection.
+  FilterCacheConfig originalFilterCacheConfig;
 
   std::unique_ptr<MergePolicy> mergePolicy;
 
@@ -397,7 +404,8 @@ public:
   // indexRamBudget is the (usually node-wide) pool that parallel merge tasks
   // reserve against; pass null for a private unlimited budget (tests, embedded).
   explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {},
-                       IndexRamBudget* indexRamBudget = nullptr);
+                       IndexRamBudget* indexRamBudget = nullptr,
+                       FilterCacheConfig filterCacheConfig = {});
   ~IndexWriter();
 
   // Per-inverter auto-flush caps (Phase 1). When a non-atomic update indexes past
@@ -459,10 +467,15 @@ public:
     // We should see if there is a TBB friendly way to do this.
     if (needNewReader) {
       auto oldReader = indexReader;  // Keep reference to old reader for potential ordMaps sharing
-      indexReader = std::make_shared<IndexReader>(dir, oldReader.get());
+      indexReader = std::make_shared<IndexReader>(dir, oldReader.get(), filterCache);
+      filterCache->onReaderPublished(*indexReader);
     }
 
     return indexReader;
+  }
+
+  std::shared_ptr<FilterCache> getFilterCache() const {
+    return filterCache;
   }
 
 

@@ -21,6 +21,8 @@
 #include "solux/reader/TermsEnum.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/search/DocSet.h"
+#include "solux/search/FilterCache.h"
+#include "solux/search/FilterKey.h"
 #include "solux/search/Similarity.h"
 #include <boost/unordered/unordered_node_map.hpp>
 #include <google/protobuf/arena.h>
@@ -254,6 +256,14 @@ public:
   // Unknown and custom queries are conservatively variable-scoring.
   virtual ScoreProfile scoreProfile() const { return ScoreProfile::variable(); }
 
+  // Structural membership key: the filter projection of this query, with
+  // score-only state omitted. Consumers that need query identity, such as a
+  // future request cache, must not reuse this method. Queries whose membership
+  // depends on scores must return UNCACHEABLE. Every concrete query must make
+  // an explicit cacheability decision.
+  virtual FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                         const FilterKeyContext& ctx) const = 0;
+
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
@@ -330,6 +340,8 @@ public:
 
     MemPool& pool;
     IndexReader& topReader;
+    std::shared_ptr<FilterCache::UseRegistry> filterUses;
+    FilterKeyContext filterKeyContext;
     // Weight* top = nullptr;  // if we don't need a top-weight, we can reuse a Context for multiple queries in the same request.
 
     std::span<FieldReader> fieldReaders;
@@ -344,18 +356,42 @@ public:
     // split is kept as structure, not a safety requirement.)
     Context(MemPool& pool, IndexReader& topReader,
             std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
-            Limits limits = {}, std::vector<api::Warning>* warnings = nullptr)
+            Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
+            FilterKeyContext filterKeyContext = {},
+            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
       : pool(pool), topReader(topReader),
+        filterUses(std::move(filterUses)),
+        filterKeyContext(filterKeyContext),
         fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)),
         limits(limits), warnings(warnings) {
+      this->filterKeyContext.coreGen = topReader.coreGen();
+      this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
+      auto* filterCache = topReader.filterCache();
+      if (this->filterUses == nullptr && filterCache != nullptr
+          && filterCache->enabled()) {
+        this->filterUses = std::make_shared<FilterCache::UseRegistry>(
+            *filterCache, topReader);
+      }
     }
 
     // Convenience ctor for stack-allocated Contexts (tests, non-arena code):
     // does its own allocation/init inline.
     Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
-            std::vector<api::Warning>* warnings = nullptr)
-      : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()),
+            std::vector<api::Warning>* warnings = nullptr,
+            FilterKeyContext filterKeyContext = {},
+            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
+      : pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
+        filterKeyContext(filterKeyContext),
+        fieldInfoMap(4, pool.getAllocator()),
         limits(limits), warnings(warnings) {
+      this->filterKeyContext.coreGen = topReader.coreGen();
+      this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
+      auto* filterCache = topReader.filterCache();
+      if (this->filterUses == nullptr && filterCache != nullptr
+          && filterCache->enabled()) {
+        this->filterUses = std::make_shared<FilterCache::UseRegistry>(
+            *filterCache, topReader);
+      }
       auto numSegs = topReader.segments().size();
       fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};
       for (size_t i = 0; i < numSegs; i++) {
@@ -364,7 +400,9 @@ public:
     }
 
     static Context* create(google::protobuf::Arena* arena, MemPool& pool, IndexReader& topReader,
-                           Limits limits = {}, std::vector<api::Warning>* warnings = nullptr) {
+                           Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
+                           FilterKeyContext filterKeyContext = {},
+                           std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr) {
       auto numSegs = topReader.segments().size();
       auto* readers = (FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader));
       for (size_t i = 0; i < numSegs; i++) {
@@ -373,7 +411,15 @@ public:
       FieldInfoMap map(4, pool.getAllocator());
       return solux::arenaCreate<Context>(
         *arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map),
-        limits, warnings);
+        limits, warnings, filterKeyContext, std::move(filterUses));
+    }
+
+    FilterCache::Use* getFilterUse(const Query& query) {
+      if (filterUses == nullptr) return nullptr;
+      FilterKeyBuilder builder;
+      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
+      auto key = std::move(builder).finish(scope, filterKeyContext);
+      return key ? filterUses->get(*key, scope) : nullptr;
     }
 
     // code must have static storage duration.

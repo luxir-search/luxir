@@ -114,7 +114,17 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
-IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
+IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
+                         std::shared_ptr<FilterCache> filterCache)
+  // The passed cache wins over succession: the owning IndexWriter passes its
+  // CURRENT cache at every reader construction, and cache-swap events
+  // (namespace rewinds like testDeleteAllData, a future truncate) must
+  // propagate to new readers. Inheriting from previousReader here would pin
+  // the pre-swap cache forever. Succession only fills in when the caller has
+  // no cache (writerless tool/test chains).
+  : sharedFilterCache(filterCache != nullptr
+        ? std::move(filterCache)
+        : (previousReader ? previousReader->sharedFilterCache : nullptr)) {
   // because old segments could be merged away before we have a chance to read them, we need
   // to check if there is a new index info file and retry the open if so.
   // This could be optimized by saving the segments we did read properly in case they are still in the index.

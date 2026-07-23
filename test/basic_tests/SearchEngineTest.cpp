@@ -164,9 +164,10 @@ enum class FilteredCountPath {
 FilteredCountResult runFilteredCount(SearchEngine& engine,
                                      FilteredCountShape shape,
                                      std::string_view filterTerm,
-                                     FilteredCountPath path) {
+                                     FilteredCountPath path,
+                                     std::string_view collection = "main") {
   auto req = localReq(engine);
-  req->collection("main");
+  req->collection(collection);
   auto& cur = req->topDocs("q").getNumber().limit(0);
   api::Query body = filteredCountBody(cur.mr(), shape);
   if (path == FilteredCountPath::PLAIN_INTERSECTION) {
@@ -206,7 +207,14 @@ void indexFilteredCountDocs(CollectionHelper& helper, bool multiSegment) {
       body += (doc % 4) == 0 ? "quick fox" : "quick noise fox";
 
       std::string filter = (doc % 8) == 0 ? "other" : "fat";
-      if ((doc % 1021) == 0) filter += " rare";
+      if ((doc % 8) != 0) {
+        filter += " fat_term_single fat_intersection_single fat_union_single fat_phrase_single"
+                  " fat_term_multi fat_intersection_multi fat_union_multi fat_phrase_multi";
+      }
+      if ((doc % 1021) == 0) {
+        filter += " rare rare_term_single rare_intersection_single rare_union_single rare_phrase_single"
+                  " rare_term_multi rare_intersection_multi rare_union_multi rare_phrase_multi";
+      }
       docs.push_back(flatdoc(
           "id", "fc_" + std::to_string(doc),
           "body_w", body, "filter_w", filter));
@@ -228,10 +236,23 @@ void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
     FilteredCountShape::UNION,
     FilteredCountShape::PHRASE,
   };
-  constexpr std::array<std::string_view, 2> filters = {"fat", "rare"};
-  for (FilteredCountShape shape : shapes) {
+  constexpr std::array<std::string_view, 4> fatSingle = {
+    "fat_term_single", "fat_intersection_single", "fat_union_single", "fat_phrase_single"};
+  constexpr std::array<std::string_view, 4> fatMulti = {
+    "fat_term_multi", "fat_intersection_multi", "fat_union_multi", "fat_phrase_multi"};
+  constexpr std::array<std::string_view, 4> rareSingle = {
+    "rare_term_single", "rare_intersection_single", "rare_union_single", "rare_phrase_single"};
+  constexpr std::array<std::string_view, 4> rareMulti = {
+    "rare_term_multi", "rare_intersection_multi", "rare_union_multi", "rare_phrase_multi"};
+  const auto& fatFilters = multiSegment ? fatMulti : fatSingle;
+  const auto& rareFilters = multiSegment ? rareMulti : rareSingle;
+  for (size_t shapeOrd = 0; shapeOrd < shapes.size(); shapeOrd++) {
+    FilteredCountShape shape = shapes[shapeOrd];
+    std::array<std::string_view, 2> filters{
+        fatFilters[shapeOrd], rareFilters[shapeOrd]};
     int64_t fatCount = 0;
-    for (std::string_view filter : filters) {
+    for (size_t filterOrd = 0; filterOrd < filters.size(); filterOrd++) {
+      std::string_view filter = filters[filterOrd];
       auto folded = runFilteredCount(
           engine, shape, filter, FilteredCountPath::FOLDED);
       auto plain = runFilteredCount(
@@ -244,7 +265,7 @@ void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
       EXPECT_EQ(folded.count, plain.count);
       EXPECT_EQ(folded.count, materialized.count);
 
-      if (filter == "fat") {
+      if (filterOrd == 0) {
         fatCount = folded.count;
         if (shape == FilteredCountShape::PHRASE) {
           EXPECT_EQ(folded.denseWindows, 0);
@@ -356,6 +377,10 @@ void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
 }
 
 void indexSparseConstantDispatchDocs(CollectionHelper& helper) {
+  // These tests assert collector-path counters; filter admission/materialization
+  // is independent work that would otherwise contaminate those counters.
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
   std::vector<Doc> docs;
   docs.reserve(1024);
   for (int32_t doc = 0; doc < 1024; doc++) {
@@ -1171,6 +1196,29 @@ TEST_F(SearchEngineTest, filteredCountBulkIntersectionSingleSegment) {
 
 TEST_F(SearchEngineTest, filteredCountBulkIntersectionMultiSegment) {
   expectFilteredCountEquivalence(soluxNode->getSearchEngine(), true);
+}
+
+TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {
+  constexpr std::string_view collection = "cached_dense_count";
+  CollectionHelper helper(collection);
+  indexFilteredCountDocs(helper, false);
+  auto cache = helper.getIndexWriter()->getFilterCache();
+
+  auto first = runFilteredCount(
+      soluxNode->getSearchEngine(), FilteredCountShape::TERM,
+      "fat_term_single", FilteredCountPath::FOLDED, collection);
+  auto second = runFilteredCount(
+      soluxNode->getSearchEngine(), FilteredCountShape::TERM,
+      "fat_term_single", FilteredCountPath::FOLDED, collection);
+  auto beforeHit = cache->counters();
+  auto hit = runFilteredCount(
+      soluxNode->getSearchEngine(), FilteredCountShape::TERM,
+      "fat_term_single", FilteredCountPath::FOLDED, collection);
+
+  EXPECT_EQ(first.count, second.count);
+  EXPECT_EQ(first.count, hit.count);
+  EXPECT_GT(hit.denseWindows, 0);
+  EXPECT_GT(cache->counters().hits, beforeHit.hits);
 }
 
 TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) {

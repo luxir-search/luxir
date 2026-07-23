@@ -299,6 +299,25 @@ protected:
     return lreq;
   }
 
+  static LocalReq* makeKnnFilterReq(
+      SoluxNode& node, std::string_view field, std::vector<float> queryVec,
+      int32_t k, int32_t nprobe = 0, int32_t refineCandidates = 0,
+      bool exact = false, float minScanFraction = 0.0f) {
+    auto* lreq = LocalReq::create(node.getSearchEngine());
+    auto& cur = lreq->collection("main").topDocs("q");
+    cur.allQuery().fields({"id"}).getNumber().limit(-1);
+    auto& top = std::get<api::TopDocs>(cur.rawOp().kind);
+    auto* filter = build::allocArray(top.filter, 1, cur.mr());
+    filter[0].name = "near";
+    auto* stored = (api::Query*)cur.mr().allocate(
+        sizeof(api::Query), alignof(api::Query));
+    new (stored) api::Query(qb::knn(
+        cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates,
+        minScanFraction));
+    filter[0].query = stored;
+    return lreq;
+  }
+
   // Append a single-match NamedQuery filter to a TopDocs cursor.  No qb helper
   // covers TopDocs.filter / NamedQuery, so build the span on the raw op.
   static void addMatchFilter(OpCursor& cur, std::string_view name,
@@ -1622,6 +1641,91 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
   for (const auto& id : ids) {
     EXPECT_NE(id, "d40") << "deleted doc must not appear despite passing the filter";
     EXPECT_NE(id, "d41") << "blue doc must not pass the red filter";
+  }
+}
+
+TEST_F(KnnQueryTest, filterCacheMatchesUncachedExactAndIvfWithDeletes) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  FilterCacheConfig cacheConfig;
+  cacheConfig.maxBytes = 4 * 1024 * 1024;
+  cacheConfig.minSegmentDocs = 0;
+  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(cacheConfig);
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc(
+        "id", "d" + std::to_string(i),
+        "embedding_v",
+        std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  std::vector<std::string> deletes{"d40"};
+  h.deleteByIds(deletes, UpdateMessage::COMMIT);
+  auto reader = h.getIndexWriter()->getIndexReader();
+  ASSERT_NE(reader->segments()[0].liveDocs(), nullptr);
+  ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr);
+  auto cache = h.getIndexWriter()->getFilterCache();
+
+  auto run = [&](bool exact) {
+    auto* req = makeKnnFilterReq(
+        *soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+        /*nprobe=*/0, /*refineCandidates=*/200, exact,
+        exact ? 0.0f : 1.0f);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    auto ids = resultIds(*req);
+    std::sort(ids.begin(), ids.end());
+    req->done();
+    return ids;
+  };
+
+  for (bool exact : {true, false}) {
+    auto uncached = run(exact);
+    auto beforeBuild = cache->counters();
+    EXPECT_EQ(uncached, run(exact));
+    auto built = cache->counters();
+    EXPECT_GT(built.builds, beforeBuild.builds);
+    EXPECT_EQ(uncached, run(exact));
+    EXPECT_GT(cache->counters().readerStableHits,
+              built.readerStableHits);
+    EXPECT_EQ(uncached.end(),
+              std::find(uncached.begin(), uncached.end(), "d40"));
+  }
+}
+
+TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc(
+        "id", "d" + std::to_string(i),
+        "embedding_v",
+        std::vector<float>{(float)i, (float)(i % 7), 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  std::vector<std::string> deletes{"d40"};
+  h.deleteByIds(deletes, UpdateMessage::COMMIT);
+  auto pinned = h.getIndexWriter()->getIndexReader();
+
+  std::vector<std::string> expected;
+  for (int repeat = 0; repeat < 5; repeat++) {
+    auto* req = makeKnnFilterReq(
+        *soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 8,
+        /*nprobe=*/1, /*refineCandidates=*/40, /*exact=*/false);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    auto ids = resultIds(*req);
+    std::sort(ids.begin(), ids.end());
+    req->done();
+    if (repeat == 0) expected = ids;
+    EXPECT_EQ(expected, ids);
+    EXPECT_EQ(pinned->commitTime(),
+              h.getIndexWriter()->getIndexReader()->commitTime());
   }
 }
 

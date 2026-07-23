@@ -19,6 +19,10 @@ Rough hierarchy:
 void SoluxConfig::addOptions(CLI::App& app) {
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);
+  app.add_option("--filter-cache-bytes", filterCacheBytes,
+                 "Per-shard filter cache payload budget (0 disables it)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("64MB");
 
   // No default_val: leaving the bound field at its sentinel (<0) lets normalize()
   // derive the gRPC port as http.port + 1 unless the user sets one explicitly.

@@ -33,6 +33,18 @@ public:
   bool lowerInclusive() const { return includeLower; }
   bool upperInclusive() const { return includeUpper; }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::TERM_RANGE);
+    out.appendString(field);
+    out.appendOptionalTerm(lower);
+    out.appendBool(includeLower);
+    out.appendOptionalTerm(upper);
+    out.appendBool(includeUpper);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
     return pool.make<RangeTermsEnum>(te, lower, includeLower, upper, includeUpper);
   }

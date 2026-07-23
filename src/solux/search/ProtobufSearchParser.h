@@ -587,7 +587,8 @@ public:
     if (filters.empty()) return {};
     // Filters constrain matches but never contribute to score. Preserve any
     // future request flags, but clear NEED_SCORES.
-    int32_t filterFlags = requestFlags & ~Query::NEED_SCORES;
+    int32_t filterFlags = requestFlags
+        & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto weights = req.requestPool.make_span<Query::Weight*>(filters.size());
     for (size_t i = 0; i < filters.size(); i++) {
       weights[i] = filters[i].second->createWeight(qcontext, filterFlags);
@@ -656,7 +657,10 @@ public:
     // here in the parser and passed to the TopDocsReq ctor.
     auto parsedSorts = parseSorts(topDocsReq.sorts);
     auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader,
-                                            {}, &req.warnings);
+      {}, &req.warnings,
+      FilterKeyContext{.schemaGen = req.schema->gen_,
+                       .timeZone = req.proto.time_zone},
+      req.filterUses);
     // Flags for this request's main query. Filters inherit these after
     // buildFilterWeights clears NEED_SCORES.
     //

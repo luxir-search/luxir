@@ -273,6 +273,32 @@ public:
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::KNN);
+    out.appendString(field);
+    out.appendSize(queryVec.size());
+    for (float value : queryVec) out.appendFloat(value);
+    out.appendInt32(k);
+    out.appendInt32(nprobe);
+    out.appendInt32(refineCandidates);
+    out.appendFloat(minScanFraction);
+    out.appendBool(exact);
+    // The mutable execution policies are resolved into the semantic key
+    // directly. This is intentionally the MVP alternative to maintaining a
+    // policy-generation counter: every value that can change candidate
+    // selection is visible here and key equality remains self-contained.
+    out.appendInt64(std::max((int64_t)1, maxKnnCandidates));
+    out.appendInt32(std::max(0, maxKnnBreadth));
+    out.appendInt32(defaultAnnRefineCount);
+    out.appendInt32(defaultAnnRefineRatio);
+    // Test wrappers may alter candidate selection without a keyable semantic
+    // contract. Production engines are deterministic for a pinned reader.
+    return engineWrapperForTests ? FilterKeyScope::UNCACHEABLE
+                                 : FilterKeyScope::READER_STABLE;
+  }
+
   Query::Weight* createWeight(Query::Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
     return context.pool.make<KnnQuery::Weight>(context, *this, flags, multiplier);

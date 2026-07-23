@@ -60,6 +60,19 @@ public:
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
 
+  FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
+                                 const FilterKeyContext& ctx) const override {
+    unused(ctx);
+    out.appendTag(FilterKeyTag::PHRASE);
+    out.appendString(field);
+    out.appendSize(terms.size());
+    for (std::string_view term : terms) out.appendTerm(term);
+    out.appendSize(positions.size());
+    for (int32_t position : positions) out.appendInt32(position);
+    out.appendInt32(slop);
+    return FilterKeyScope::SEGMENT_STABLE;
+  }
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override {
     return context.pool.make<PhraseQuery::Weight>(context, *this, flags, multiplier);
