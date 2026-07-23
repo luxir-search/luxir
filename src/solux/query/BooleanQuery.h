@@ -3195,7 +3195,7 @@ public:
     int32_t denseClauseCountAdvance(size_t clause, int32_t target) {
       int32_t doc = PostingsReader::END;
       for (Query::Scorer* member : denseClauses[clause].members) {
-        DocsEnum* probe = member->windowFilterProbeDocsEnum();
+        DocsFreqEnum* probe = member->windowFilterProbeDocsEnum();
         int32_t memberDoc = probe != nullptr ? probe->docId() : member->docId();
         if (memberDoc < target) {
           memberDoc = probe != nullptr

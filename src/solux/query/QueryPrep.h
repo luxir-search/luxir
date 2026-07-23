@@ -275,7 +275,7 @@ inline Query::Scorer* createDocSetScorer(MemPool& targetPool, DocSet* docs,
 // Cache hits must retain a bulk implementation as well as pull/window
 // membership; otherwise the same query would lose the dense COUNT route.
 class DocSetBulkScorer final : public BulkScorer {
-  static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+  static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
   static constexpr int32_t kWindowWords = (kWindowSize + 63) >> 6;
 
   DocSet* docs;
