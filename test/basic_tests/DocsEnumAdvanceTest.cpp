@@ -682,6 +682,42 @@ TEST_F(DocsEnumAdvanceTest, docsTierNextDocWalksResidentWordBlock) {
   ASSERT_EQ(denum.advance(192), 192);
 }
 
+// Regression for a stack-buffer-overflow in expandDocWords: it writes a
+// branchless 8-wide row per bitset byte and only advances by the byte's
+// popcount, so db[] needs padding for the LAST byte processed landing
+// entirely past the true end. That happens whenever the block's final doc
+// isn't within that byte's 8-bit range - here docs {0..126, 192} force a
+// bitset block (docBase=0, lastDoc=192, numWords=4) whose last word (word 3)
+// has only bit 0 set, so word 3's top byte (bits 56-63, the very last byte
+// expandDocWords touches) has popcount 0.
+TEST_F(DocsEnumAdvanceTest, docsTierBitsetBlockWithZeroPopcountTailByteDoesNotOverflow) {
+  std::vector<int32_t> docs;
+  for (int32_t d = 0; d <= 126; d++) docs.push_back(d);
+  docs.push_back(192);
+  ASSERT_EQ(docs.size(), (size_t) Postings::DOCS_BLOCK_SIZE);
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "tailzero", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("tailzero"));
+
+  DocsOnlyEnum denum(tenum);
+  int32_t doc = -1;
+  int32_t count = 0;
+  while ((doc = denum.nextDoc()) != DocsEnumMeta::END) {
+    ASSERT_EQ(doc, modelCeil(docs, doc));
+    count++;
+  }
+  ASSERT_EQ(count, (int32_t) docs.size());
+}
+
 TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow) {
   const std::vector<int32_t> docs = makeWordProbeDocs(2);
   RAMDir dir;

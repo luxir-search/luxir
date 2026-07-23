@@ -690,9 +690,12 @@ private:
   int32_t posRepairStart = 0;  // inclusive index in tfreqBuf/docBuf
   int32_t posRepairEnd = 0;    // exclusive index; current doc is end - 1
 
-  // +7: expandDocWords writes branchless 8-wide rows, spilling up to 7 slots
-  // past the last doc.
-  int32_t db[Postings::DOCS_BLOCK_SIZE + 7];  // temporary...
+  // +8: expandDocWords writes branchless 8-wide rows; if the last byte of the
+  // last word has popcount 0 (common - it just means the block's final doc
+  // isn't in that byte's bit range), the unconditional dst[0..7] write for
+  // that byte lands entirely past the true end, needing indices up to
+  // DOCS_BLOCK_SIZE + 7.
+  int32_t db[Postings::DOCS_BLOCK_SIZE + 8];  // temporary...
   int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
 
   static bool isL1Boundary(int32_t block) {
@@ -752,7 +755,7 @@ private:
   // [docBase, lastDoc], see Postings::DOC_BLOCK_*) into docBuf. Exactly
   // DOCS_BLOCK_SIZE bits are set. Each byte emits a branchless 8-wide row
   // (vectorized u8->i32 widen + add); dst advances by the byte's popcount, so
-  // up to 7 slots past the final doc are scribbled (docBuf is padded for it).
+  // up to 8 slots past the final doc are scribbled (docBuf is padded for it).
   void expandDocWords(const char* p, int32_t numWords, uint32_t docBase) {
     int32_t* dst = docBuf;
     for (int32_t w = 0; w < numWords; w++) {
@@ -2373,9 +2376,12 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
   bool docBlockResident = false;
   bool bodyReady = false;
 
-  // +7: expandDocWords writes branchless 8-wide rows, spilling up to 7 slots
-  // past the last doc.
-  int32_t db[Postings::DOCS_BLOCK_SIZE + 7];
+  // +8: expandDocWords writes branchless 8-wide rows; if the last byte of the
+  // last word has popcount 0 (common - it just means the block's final doc
+  // isn't in that byte's bit range), the unconditional dst[0..7] write for
+  // that byte lands entirely past the true end, needing indices up to
+  // DOCS_BLOCK_SIZE + 7.
+  int32_t db[Postings::DOCS_BLOCK_SIZE + 8];
 
   static bool isL1Boundary(int32_t block) {
     return (block % L1_PERIOD) == 0;
@@ -3237,12 +3243,13 @@ public:
   BasicDocsEnum(const BasicDocsEnum&) = delete;
 };
 
-// The pre-decomposition implementation was 1376 bytes on this 64-bit target.
+// The pre-decomposition implementation was 1376 bytes on this 64-bit target
+// (now 1384: the db[] spill-slot fix below added one int32_t of padding).
 // Splitting out metadata must not add state or change the full layout.
 static_assert(sizeof(DocsEnumMeta) == 96);
-static_assert(sizeof(DocsEnumImpl) == 1376);
+static_assert(sizeof(DocsEnumImpl) == 1384);
 static_assert(sizeof(DocsEnumMeta) < sizeof(DocsEnumImpl));
-static_assert(sizeof(DocsOnlyEnum) == 688);
+static_assert(sizeof(DocsOnlyEnum) == 696);
 static_assert(sizeof(DocsOnlyEnum) < sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsFreqEnum) == sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsPosEnum) == sizeof(DocsEnumImpl));
