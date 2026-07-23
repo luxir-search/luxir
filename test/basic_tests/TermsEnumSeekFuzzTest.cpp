@@ -113,7 +113,7 @@ std::vector<std::string> makeTargets(std::mt19937_64& rng, const std::vector<std
 }
 
 SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader, std::string_view fieldName) {
-  FieldReader fieldReader(pool, postingsReader);
+  FieldReader fieldReader(postingsReader);
   EXPECT_TRUE(fieldReader.seek(fieldName));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);

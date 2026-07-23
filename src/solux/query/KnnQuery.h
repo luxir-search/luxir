@@ -384,7 +384,7 @@ public:
       std::vector<SegFieldInfo> segInfoStorage(numSegs);
       std::vector<SegFieldInfo*> segInfos(numSegs, nullptr);
       for (size_t i = 0; i < numSegs; i++) {
-        FieldReader fieldReader(scratch, reader.segments()[i].postingsReader());
+        FieldReader fieldReader(reader.segments()[i].postingsReader());
         if (fieldReader.seek(query.getField())) {
           fieldReader.readFieldInfo(segInfoStorage[i]);
           segInfos[i] = &segInfoStorage[i];

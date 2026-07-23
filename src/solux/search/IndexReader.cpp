@@ -303,7 +303,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
   std::unordered_map<std::string, Similarity::FieldStats> fieldStats;
   for (auto& segment : segs) {
     MemPool pool;
-    FieldReader fields(pool, segment.postingsReader());
+    FieldReader fields(segment.postingsReader());
     while (fields.readNextField()) {
       SegFieldInfo info{};
       fields.readFieldInfo(info);
@@ -317,7 +317,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
   Similarity similarity;
   for (auto& segment : segs) {
     MemPool pool;
-    FieldReader fields(pool, segment.postingsReader());
+    FieldReader fields(segment.postingsReader());
     while (fields.readNextField()) {
       SegFieldInfo info{};
       fields.readFieldInfo(info);

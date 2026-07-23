@@ -91,7 +91,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
 }
 
 SegFieldInfo readBodyInfo(MemPool& pool, Segment& segment) {
-  FieldReader fields(pool, segment.postingsReader());
+  FieldReader fields(segment.postingsReader());
   EXPECT_TRUE(fields.seek("body"));
   SegFieldInfo info;
   fields.readFieldInfo(info);
@@ -186,7 +186,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
 
   PostingsReader outputReader(outputDir, 900);
   MemPool pool;
-  FieldReader fields(pool, outputReader);
+  FieldReader fields(outputReader);
   EXPECT_TRUE(fields.seek("body"));
   SegFieldInfo info;
   fields.readFieldInfo(info);

@@ -4408,7 +4408,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -5605,7 +5605,7 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(testIndex.pool, postingsReader);
+  FieldReader fieldReader(postingsReader);
   ASSERT_TRUE(fieldReader.seek("body_w"));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -5689,7 +5689,7 @@ TEST_F(TermScorerTest, docsTierAdvanceCoversBlockEncodingsAndSkips) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(testIndex.pool, postingsReader);
+  FieldReader fieldReader(postingsReader);
   ASSERT_TRUE(fieldReader.seek("body_w"));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -5875,7 +5875,7 @@ TEST_F(TermScorerTest, docsFreqEnumDocsOnlyProtocolAssertsOnFreqAccess) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(testIndex.pool, postingsReader);
+  FieldReader fieldReader(postingsReader);
   ASSERT_TRUE(fieldReader.seek("body_w"));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);

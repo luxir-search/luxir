@@ -77,7 +77,7 @@ std::vector<std::string> expectedIds(
 SegFieldInfo readFieldInfo(IndexReader::Segment& segment,
                            std::string_view field) {
   MemPool pool;
-  FieldReader reader(pool, segment.postingsReader());
+  FieldReader reader(segment.postingsReader());
   if (!reader.seek(field)) throw std::runtime_error("missing test field");
   SegFieldInfo info{};
   reader.readFieldInfo(info);

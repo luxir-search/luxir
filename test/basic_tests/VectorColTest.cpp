@@ -98,7 +98,7 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
   auto segments = testIndex.reader->segments();
   ASSERT_EQ(1u, segments.size());
   auto& seg = segments[0];
-  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   ASSERT_TRUE(fieldReader.seek("vec_v"));
   SegFieldInfo fi;
   fieldReader.readFieldInfo(fi);
@@ -141,7 +141,7 @@ TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
   testIndex.flush();
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   ASSERT_TRUE(fieldReader.seek("vec_v"));
   SegFieldInfo fi;
   fieldReader.readFieldInfo(fi);
@@ -254,7 +254,7 @@ TEST_F(VectorColTest, multiValuedRoundTrip) {
 
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   ASSERT_TRUE(fieldReader.seek("emb_vs"));
   SegFieldInfo fi;
   fieldReader.readFieldInfo(fi);
@@ -305,7 +305,7 @@ TEST_F(VectorColTest, multiValuedValueRankToDoc) {
 
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   ASSERT_TRUE(fieldReader.seek("emb_vs"));
   SegFieldInfo fi;
   fieldReader.readFieldInfo(fi);
@@ -353,7 +353,7 @@ TEST_F(VectorColTest, multiValuedValDocSurvivesMerge) {
   testIndex.initReader();
   ASSERT_EQ(1u, testIndex.reader->segments().size());
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   ASSERT_TRUE(fieldReader.seek("emb_vs"));
   SegFieldInfo fi;
   fieldReader.readFieldInfo(fi);

@@ -40,7 +40,7 @@ struct FixtureIndex {
 
   SegFieldInfo fieldInfo(IndexReader& reader) {
     MemPool pool;
-    FieldReader fields(pool, reader.segments()[0].postingsReader());
+    FieldReader fields(reader.segments()[0].postingsReader());
     EXPECT_TRUE(fields.seek(field));
     SegFieldInfo info{};
     fields.readFieldInfo(info);

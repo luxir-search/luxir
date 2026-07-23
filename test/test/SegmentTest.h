@@ -103,7 +103,7 @@ public:
     postingsWriter->finish();
 
     reader = std::make_unique<PostingsReader>(dir, 0);
-    fieldReader = std::make_unique<FieldReader>(pool, *reader);
+    fieldReader = std::make_unique<FieldReader>(*reader);
 
     // restore the RNG state
     r = rng_snapshot;
@@ -298,7 +298,7 @@ public:
       int64_t totDocs = 0;
       int64_t totPositions = 0;
       int64_t ret = 0;
-      FieldReader fieldReader(pool, *reader);
+      FieldReader fieldReader(*reader);
       SegFieldInfo fieldInfo;
       while (fieldReader.readNextField()) {
         fieldReader.readFieldInfo(fieldInfo);

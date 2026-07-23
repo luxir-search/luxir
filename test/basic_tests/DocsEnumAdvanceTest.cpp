@@ -417,7 +417,7 @@ protected:
     postingsWriter.finish();
 
     PostingsReader reader(dir, 0);
-    FieldReader fieldReader(pool, reader);
+    FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField()) << label;
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);
@@ -604,7 +604,7 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -627,7 +627,7 @@ TEST_F(DocsEnumAdvanceTest, docsTierAdvanceProbesWordBlocksWithoutDecoding) {
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -664,7 +664,7 @@ TEST_F(DocsEnumAdvanceTest, docsTierNextDocWalksResidentWordBlock) {
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -689,7 +689,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -729,7 +729,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   writeRawSingleTerm(dir, pool, "packedscatter", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -773,7 +773,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -814,7 +814,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   writeRawSingleTerm(dir, pool, "gapword", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -851,7 +851,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundar
   writeRawSingleTerm(dir, pool, "runprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -887,7 +887,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowing
   writeRawSingleTerm(dir, pool, "mixedprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -935,7 +935,7 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetRandomPartitionsMatchNextDocOracle) {
   writeRawSingleTerm(dir, pool, "mixedprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -985,7 +985,7 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   writeRawSingleTerm(dir, pool, "runprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -1025,7 +1025,7 @@ TEST_F(DocsEnumAdvanceTest, residentDocsBlockPeekAndConsumeMaterializeSpan) {
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -1177,7 +1177,7 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
     writeRawPositionsImpactTerm(dir, pool, norms, tfs);
 
     PostingsReader reader(dir, 0);
-    FieldReader fieldReader(pool, reader);
+    FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);
@@ -1255,7 +1255,7 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
   writeRawPositionsImpactTerm(dir, pool, norms, tfs);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);

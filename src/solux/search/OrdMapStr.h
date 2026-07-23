@@ -28,7 +28,7 @@ public:
     auto* tenum = enums[segnum];
     if (!tenum) {
       PostingsReader& postingsReader = index.segments()[segnum].postingsReader();
-      FieldReader fieldReader(pool, postingsReader);
+      FieldReader fieldReader(postingsReader);
       SegFieldInfo* segFieldInfo = pool.make<SegFieldInfo>();
       bool found = fieldReader.seek(fieldName);
       assert(found);

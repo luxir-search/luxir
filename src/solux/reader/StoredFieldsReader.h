@@ -259,7 +259,7 @@ public:
       std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE) {
     auto& pool = MemPool::threadLocal();
     auto guard = pool.rewindScopeGuard();
-    FieldReader fieldReader(pool, postingsReader);
+    FieldReader fieldReader(postingsReader);
     if (!fieldReader.seek(resourceName)) {
       return nullptr;
     }

@@ -118,7 +118,7 @@ public:
         auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        FieldReader fieldReader(postingsReader);
         if (!fieldReader.seek(thisOp().fieldName)) {
           return; // no value for this field in this segment; still a contribution
         }
@@ -331,10 +331,9 @@ public:
       intColIter.reset();
       intColReader.reset();
       auto guard = MemPool::threadLocalPoolGuard();
-      auto& pool = guard.pool();
       SegFieldInfo segFieldInfo;
       auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
-      FieldReader fieldReader(pool, postingsReader);
+      FieldReader fieldReader(postingsReader);
       bool found = fieldReader.seek(thisOp().fieldName);
       if (!found) {
         return; // field not found, nothing to do

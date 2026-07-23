@@ -112,7 +112,7 @@ std::vector<Point> pointsFromColumn(PostingsReader& postingsReader,
 
 SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader,
                            std::string_view field) {
-  FieldReader fields(pool, postingsReader);
+  FieldReader fields(postingsReader);
   if (!fields.seek(field)) throw std::runtime_error("missing test field");
   SegFieldInfo info;
   fields.readFieldInfo(info);

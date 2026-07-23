@@ -68,7 +68,7 @@ double exactMeters(double lat1, double lon1, double lat2, double lon2) {
 
 SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
   MemPool pool;
-  FieldReader fields(pool, segment.postingsReader());
+  FieldReader fields(segment.postingsReader());
   if (!fields.seek(field)) throw std::runtime_error("missing geo test field");
   SegFieldInfo info;
   fields.readFieldInfo(info);

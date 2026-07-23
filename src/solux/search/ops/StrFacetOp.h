@@ -337,7 +337,7 @@ public:
         }
         auto poolGuard = MemPool::threadLocalPoolGuard();
 
-        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        FieldReader fieldReader(postingsReader);
         std::optional<TermsEnum> tenum;
         bool found = fieldReader.seek(thisOp().fieldName);
         if (found) {
@@ -376,7 +376,7 @@ public:
           profile->wire.domain_size = domainSize;
         }
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        FieldReader fieldReader(postingsReader);
         bool found = fieldReader.seek(thisOp().fieldName);
         if (!found) {
           data.missing_num += domainSize;
@@ -740,7 +740,7 @@ public:
           auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
           int32_t maxDoc = postingsReader.maxDoc();
           auto poolGuard = MemPool::threadLocalPoolGuard();
-          FieldReader fieldReader(poolGuard.pool(), postingsReader);
+          FieldReader fieldReader(postingsReader);
           bool found = fieldReader.seek(thisOp().fieldName);
           DocSetBuilder builder(maxDoc);
           if (found) {

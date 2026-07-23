@@ -1782,7 +1782,7 @@ TEST_F(IndexWriterTest, removeFields) {
   auto guard = MemPool::threadLocalPoolGuard();
   // Verify fields from deleted document are gone after merge
   for (const auto& segment : reader->segments()) {
-    FieldReader fieldsReader(guard.pool(), segment.postingsReader());
+    FieldReader fieldsReader(segment.postingsReader());
     EXPECT_TRUE(fieldsReader.seek("id")); // id field should remain
     EXPECT_FALSE(fieldsReader.seek("text_w"));
     EXPECT_FALSE(fieldsReader.seek("string_s"));

@@ -359,7 +359,7 @@ public:
       auto numSegs = topReader.segments().size();
       fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};
       for (size_t i = 0; i < numSegs; i++) {
-        new (&fieldReaders[i]) FieldReader(pool, topReader.segments()[i].postingsReader());
+        new (&fieldReaders[i]) FieldReader(topReader.segments()[i].postingsReader());
       }
     }
 
@@ -368,7 +368,7 @@ public:
       auto numSegs = topReader.segments().size();
       auto* readers = (FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader));
       for (size_t i = 0; i < numSegs; i++) {
-        new (&readers[i]) FieldReader(pool, topReader.segments()[i].postingsReader());
+        new (&readers[i]) FieldReader(topReader.segments()[i].postingsReader());
       }
       FieldInfoMap map(4, pool.getAllocator());
       return solux::arenaCreate<Context>(

@@ -90,7 +90,7 @@ public:
     if (!postingsReader) return;
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), *postingsReader);
+    FieldReader fieldReader(*postingsReader);
     if (fieldReader.seek(fieldName)) {
       SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);
@@ -230,7 +230,7 @@ public:
     
     // Load the ordinal column reader for this segment
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), *postingsReader);
+    FieldReader fieldReader(*postingsReader);
     if (fieldReader.seek(fieldName)) {
       SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);
@@ -419,7 +419,7 @@ public:
 
     if (!postingsReader) return;
 
-    FieldReader fieldReader(enumPool, *postingsReader);
+    FieldReader fieldReader(*postingsReader);
     if (!fieldReader.seek(fieldName)) return;
     fieldReader.readFieldInfo(fieldInfo);
     if (fieldInfo.nTerms == 0 || fieldInfo.columnLoc.offset() == 0 ||
@@ -563,7 +563,7 @@ public:
     if (!postingsReader) return;
     
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), *postingsReader);
+    FieldReader fieldReader(*postingsReader);
     if (fieldReader.seek(fieldName)) {
       SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);

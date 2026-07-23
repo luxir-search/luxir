@@ -336,7 +336,7 @@ TEST_F(StrColTest, strColReaderBasic) {
   testIndex.initReader();
   auto& segment = testIndex.reader->segments()[0];
   auto& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+  FieldReader fieldReader(postingsReader);
   bool found = fieldReader.seek("description_sc");
   ASSERT_TRUE(found);
   
@@ -412,7 +412,7 @@ TEST_F(StrColTest, fixedSizeOptimization) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek("fixed_sc");
     ASSERT_TRUE(found);
 
@@ -456,7 +456,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& seg1 = testIndex.reader->segments()[0];
     auto& pr1 = seg1.postingsReader();
-    FieldReader fr1(MemPool::threadLocal(), pr1);
+    FieldReader fr1(pr1);
     ASSERT_TRUE(fr1.seek("simple_sc"));
     SegFieldInfo sfi1;
     fr1.readFieldInfo(sfi1);
@@ -479,7 +479,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     ASSERT_EQ(1, testIndex.reader->segments().size());  // Should have 1 merged segment
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek("simple_sc");
     ASSERT_TRUE(found) << "Field simple_sc not found after merge";
     
@@ -524,7 +524,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek("content_sc");
     ASSERT_TRUE(found);
     
@@ -575,7 +575,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek("sparse_sc");
     ASSERT_TRUE(found);
     
@@ -627,7 +627,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek("delete_sc");
     ASSERT_TRUE(found);
     
@@ -675,7 +675,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek("fixed_merge_sc");
     ASSERT_TRUE(found);
     
@@ -873,7 +873,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   
   auto& segment = reader->segments()[0];
   auto& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+  FieldReader fieldReader(postingsReader);
   bool found = fieldReader.seek("uniform_ssc");
   ASSERT_TRUE(found);
   
@@ -958,7 +958,7 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
 
   // Variable-size path: endOffsetReader present; BulkValues wraps MonoReader::BulkValues.
   {
-    FieldReader fr(MemPool::threadLocal(), postingsReader);
+    FieldReader fr(postingsReader);
     ASSERT_TRUE(fr.seek("chunks_ssc"));
     SegFieldInfo sfi;
     fr.readFieldInfo(sfi);
@@ -981,7 +981,7 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
 
   // Fixed-size path: no endOffsetReader; BulkValues uses pointer arithmetic.
   {
-    FieldReader fr(MemPool::threadLocal(), postingsReader);
+    FieldReader fr(postingsReader);
     ASSERT_TRUE(fr.seek("uniform_ssc"));
     SegFieldInfo sfi;
     fr.readFieldInfo(sfi);

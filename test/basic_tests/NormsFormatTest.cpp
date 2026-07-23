@@ -28,7 +28,7 @@ struct ScoreHit {
 
 SegFieldInfo readFieldInfo(TestIndex& testIndex, std::string_view field) {
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   EXPECT_TRUE(fieldReader.seek(field));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -53,7 +53,7 @@ void assertTermScores(TestIndex& testIndex, std::string_view field, std::string_
   auto& seg = testIndex.reader->segments()[0];
 
   MemPool expectedPool;
-  FieldReader fieldReader(expectedPool, seg.postingsReader());
+  FieldReader fieldReader(seg.postingsReader());
   ASSERT_TRUE(fieldReader.seek(field));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);

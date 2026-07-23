@@ -620,7 +620,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
                                 : ValueBounds::integer(0, (int64_t)maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
-      FieldReader fields(pool, postings);
+      FieldReader fields(postings);
       if (!fields.seek(node.text)) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else {

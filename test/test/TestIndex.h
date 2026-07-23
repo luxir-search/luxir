@@ -334,7 +334,7 @@ namespace solux::test {
         currSeg++;
 
         Segment &seg = segments[currSeg];
-        FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+        FieldReader fieldReader(seg.postingsReader());
         auto found = fieldReader.seek(name);
         if (!found) continue;
 

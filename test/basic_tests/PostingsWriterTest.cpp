@@ -56,7 +56,7 @@ protected:
     postingsWriter->finish();
 
     reader = std::make_unique<PostingsReader>(dir, 0);
-    fieldReader = std::make_unique<FieldReader>(pool, *reader);
+    fieldReader = std::make_unique<FieldReader>(*reader);
 
     // restore the RNG state
     rng = rng_start;
@@ -304,7 +304,7 @@ TEST_F(PostingsTest, basic) {
 
   PostingsReader reader(dir, 0);
 
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   while (fieldReader.readNextField()) {
     LOG_TRACE("FIELD NAME name={}", fieldReader.name());
     SegFieldInfo fieldInfo;
@@ -399,7 +399,7 @@ TEST_F(PostingsTest, levelLadder) {
     postingsWriter.finish();
 
     PostingsReader reader(dir, 0);
-    FieldReader fieldReader(pool, reader);
+    FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);
@@ -580,7 +580,7 @@ TEST_F(PostingsTest, blockPositions) {
 
   PostingsReader reader(dir, 0);
 
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
   SegFieldInfo fieldInfo;
@@ -658,7 +658,7 @@ TEST_F(PostingsTest, blockTerms) {
   postingsWriter.finish();
   PostingsReader reader(dir, 0);
 
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
   SegFieldInfo fieldInfo;
@@ -722,7 +722,7 @@ TEST_F(PostingsTest, seekForward) {
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -906,7 +906,7 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -1000,7 +1000,7 @@ TEST_F(PostingsTest, seekForwardRandom) {
     postingsWriter.finish();
 
     PostingsReader reader(dir, 0);
-    FieldReader fieldReader(pool, reader);
+    FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);
@@ -1175,7 +1175,7 @@ TEST_F(PostingsTest, intCol) {
   ASSERT_EQ(files.size(), 1);
 
   PostingsReader reader(dir, 0);
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), fname1);
   SegFieldInfo fieldInfo;

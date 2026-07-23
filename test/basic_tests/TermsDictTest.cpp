@@ -180,7 +180,7 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
   postingsWriter.finish();
 
   reader = std::make_unique<PostingsReader>(dir, 0);
-  FieldReader fieldReader(pool, *reader);
+  FieldReader fieldReader(*reader);
   ASSERT_TRUE(fieldReader.readNextField());
   fieldReader.readFieldInfo(fieldInfo);
 }
@@ -237,7 +237,7 @@ void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
   postingsWriter.finish();
 
   reader = std::make_unique<PostingsReader>(dir, 0);
-  FieldReader fieldReader(pool, *reader);
+  FieldReader fieldReader(*reader);
   ASSERT_TRUE(fieldReader.readNextField());
   fieldReader.readFieldInfo(fieldInfo);
 }
@@ -804,7 +804,7 @@ TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {
     IndexReader indexReader(dir);
     ASSERT_EQ(indexReader.segments().size(), 1u);
     auto& segment = indexReader.segments()[0];
-    FieldReader fieldReader(pool, segment.postingsReader());
+    FieldReader fieldReader(segment.postingsReader());
     ASSERT_TRUE(fieldReader.seek("f"));
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);

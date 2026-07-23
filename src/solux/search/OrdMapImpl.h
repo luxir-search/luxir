@@ -359,7 +359,7 @@ public:
     for (auto i=0u; i<nsegs; i++) {
       auto& seg = segs[i];
       // Allocate FieldReader in pool so it has same lifetime as SegFieldInfo
-      auto* fieldReader = pool.make<FieldReader>(pool, seg.postingsReader());
+      auto* fieldReader = pool.make<FieldReader>(seg.postingsReader());
       if (!fieldReader->seek(field)) {
         // Field not found in this segment
         allTermsEnums.emplace_back(nullptr);

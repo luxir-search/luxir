@@ -1847,7 +1847,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       for (SegInfo* seg : segs) {
         auto postingsReader = getSegmentPostingsReader(*seg);
         MemPool metadataPool;
-        FieldReader fields(metadataPool, *postingsReader);
+        FieldReader fields(*postingsReader);
         boost::unordered_flat_map<std::string, int64_t> additions;
         bool fits = true;
         while (fields.readNextField()) {
@@ -2640,7 +2640,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
-  FieldReader fieldReader(pool, reader);
+  FieldReader fieldReader(reader);
   if (!fieldReader.seek("id")) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
     return;
@@ -2651,7 +2651,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   TermsEnum termsEnum(pool, reader, idFieldInfo);
 
   // Also get the "_version_" field for version comparison
-  FieldReader versionFieldReader(pool, reader);
+  FieldReader versionFieldReader(reader);
   SegFieldInfo versionFieldInfo;
   std::optional<IntColReader> versionColReader;
   if (versionFieldReader.seek("_version_")) {

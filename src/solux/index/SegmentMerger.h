@@ -490,7 +490,6 @@ public:
 
   void merge() {
     auto guard = MemPool::threadLocalPoolGuard();
-    auto& pool = guard.pool();
 
     segs.reserve(preaders.size());
     fieldReaders.reserve(preaders.size());  // This is important since we take pointers to these! Pool allocate later...
@@ -503,7 +502,7 @@ public:
       MERGER_DEBUG("SegmentMerger: segment {}, maxDoc={}, liveDocs={}",
                i, preader->maxDoc(), segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc());
       
-      fieldReaders.emplace_back(pool, *preader);
+      fieldReaders.emplace_back(*preader);
       FieldReader& fieldReader = fieldReaders.back();
 
       // position fieldReader on first field and add to segs if it's non-empty

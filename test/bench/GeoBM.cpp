@@ -415,7 +415,7 @@ public:
   SegFieldInfo fieldInfo() {
     MemPool pool;
     auto& segment = index.reader->segments()[0];
-    FieldReader fields(pool, segment.postingsReader());
+    FieldReader fields(segment.postingsReader());
     if (!fields.seek(FIELD)) {
       throw std::logic_error("geo benchmark field is missing");
     }

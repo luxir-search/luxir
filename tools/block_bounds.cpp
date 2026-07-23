@@ -27,8 +27,7 @@ int main(int argc, char** argv) {
         std::chrono::steady_clock::now() - openStart).count();
     uint64_t mappedBytes = 0;
     for (auto& segment : reader.segments()) {
-      MemPool pool;
-      FieldReader fields(pool, segment.postingsReader());
+      FieldReader fields(segment.postingsReader());
       while (fields.readNextField()) {
         std::string field((std::string_view) fields.name());
         if (const BlockBounds* bounds = segment.blockBounds(field)) {
@@ -44,8 +43,7 @@ int main(int argc, char** argv) {
     uint64_t totalBytes = 0;
     double totalWall = 0.0;
     for (auto& segment : reader.segments()) {
-      MemPool pool;
-      FieldReader fields(pool, segment.postingsReader());
+      FieldReader fields(segment.postingsReader());
       while (fields.readNextField()) {
         SegFieldInfo info{};
         fields.readFieldInfo(info);

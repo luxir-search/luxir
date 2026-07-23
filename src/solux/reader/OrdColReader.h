@@ -304,7 +304,7 @@ public:
                               std::string_view field,
                               std::ranges::input_range auto&& sortedIds,
                               auto&& callback) {
-    FieldReader fieldReader(pool, postingsReader);
+    FieldReader fieldReader(postingsReader);
     if (!fieldReader.seek(field)) return;
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);

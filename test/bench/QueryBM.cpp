@@ -162,7 +162,7 @@ int64_t scanIntCol(std::string_view field, IndexReader& reader) {
   for (auto& seg : reader.segments()) {
     // create a fieldReader and look up the field
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), seg.postingsReader());
+    FieldReader fieldReader(seg.postingsReader());
     bool hasField = fieldReader.seek(field);
     if (!hasField) {
       continue;

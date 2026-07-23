@@ -128,8 +128,7 @@ class FieldReader {
 
   // TODO: field number?
 public:
-  FieldReader(MemPool& pool, PostingsReader& postingsReader) {
-    unused(pool);
+  explicit FieldReader(PostingsReader& postingsReader) {
     fieldIS = postingsReader.getInputStream(0);
     fieldIS.seek(postingsReader.segInfoOffset - sizeof(int32_t));
     fieldOffsetsLoc = fieldIS.offset();
@@ -138,10 +137,6 @@ public:
     fieldOffsets = ((uint32_t*)(fieldLocEnd)) - nFields;
     fieldOffsetsLoc -= nFields * sizeof(uint32_t);
   }
-
-  FieldReader(MemPool& pool, PostingsReader& postingsReader, const InputStream& is) : fieldIS(is) {
-    unused(pool, postingsReader);
-  };
 
   int32_t numFields() {
     return nFields;

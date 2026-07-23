@@ -81,7 +81,7 @@ protected:
     constexpr bool hasPositions = Tier == DocsEnumTier::POSITIONS;
     ASSERT_EQ(1u, index.reader->segments().size());
     Segment& segment = index.reader->segments()[0];
-    FieldReader fieldReader(index.pool, segment.postingsReader());
+    FieldReader fieldReader(segment.postingsReader());
     ASSERT_TRUE(fieldReader.seek(field));
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);
@@ -150,7 +150,7 @@ protected:
     for (Segment* source : sources) {
       Segment& segment = *source;
       std::vector<int32_t> sourceIds((size_t) segment.maxDoc(), -1);
-      FieldReader fieldReader(index.pool, segment.postingsReader());
+      FieldReader fieldReader(segment.postingsReader());
       ASSERT_TRUE(fieldReader.seek("pos"));
       SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);
@@ -374,7 +374,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   sourcePostings.finish();
 
   PostingsReader sourceReader(sourceDir, 0);
-  FieldReader sourceFields(pool, sourceReader);
+  FieldReader sourceFields(sourceReader);
   ASSERT_TRUE(sourceFields.readNextField());
   SegFieldInfo sourceInfo;
   sourceFields.readFieldInfo(sourceInfo);
@@ -412,7 +412,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   targetPostings.finish();
 
   PostingsReader targetReader(targetDir, 1);
-  FieldReader targetFields(pool, targetReader);
+  FieldReader targetFields(targetReader);
   ASSERT_TRUE(targetFields.readNextField());
   SegFieldInfo targetInfo;
   targetFields.readFieldInfo(targetInfo);

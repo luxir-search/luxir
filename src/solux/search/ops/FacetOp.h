@@ -91,7 +91,7 @@ public:
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
       // field absent in this segment: every in-domain doc is missing.
@@ -112,7 +112,7 @@ public:
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    FieldReader fieldReader(postingsReader);
     if (!fieldReader.seek(fieldName)) {
       missing_num += domain ? domain->card() : maxDoc;
       return false;
@@ -220,7 +220,7 @@ public:
     for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
       auto& postingsReader = reader.segments()[segnum].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(poolGuard.pool(), postingsReader);
+      FieldReader fieldReader(postingsReader);
       bool found = fieldReader.seek(fieldName);
       if (!found) continue;
 
@@ -395,7 +395,7 @@ public:
         int32_t maxDoc = postingsReader.maxDoc();
         const int64_t domainCard = domain ? domain->card() : maxDoc;  // null domain == all docs
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        FieldReader fieldReader(postingsReader);
         if (!fieldReader.seek(thisOp().fieldName)) {
           // field absent in this segment: all in-domain docs are missing
           data.missing_num += domain ? domain->card() : maxDoc;
@@ -578,7 +578,7 @@ public:
             && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
             && start < end) {
           auto poolGuard = MemPool::threadLocalPoolGuard();
-          FieldReader fieldReader(poolGuard.pool(), segment.postingsReader());
+          FieldReader fieldReader(segment.postingsReader());
           if (fieldReader.seek(thisOp().fieldName)) {
             fieldReader.readFieldInfo(segFieldInfo);
             bool oneDimensionalNumeric = segFieldInfo.type == FieldType::INT

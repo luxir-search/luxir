@@ -198,7 +198,7 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
 
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  FieldReader fieldReader(poolGuard.pool(), postingsReader);
+  FieldReader fieldReader(postingsReader);
   bool found = fieldReader.seek(field);
   if (!found) {
     return;
@@ -378,7 +378,7 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
 
       auto& postingsReader = req.reader->segments()[segNum].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(poolGuard.pool(), postingsReader);
+      FieldReader fieldReader(postingsReader);
       bool found = fieldReader.seek(field);
       if (!found) {
         return;
@@ -432,7 +432,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view f
 
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  FieldReader fieldReader(poolGuard.pool(), postingsReader);
+  FieldReader fieldReader(postingsReader);
   if (!fieldReader.seek(field)) return;
   SegFieldInfo segFieldInfo;
   fieldReader.readFieldInfo(segFieldInfo);
@@ -456,7 +456,7 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view fi
 
   auto& postingsReader = req.reader->segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  FieldReader fieldReader(poolGuard.pool(), postingsReader);
+  FieldReader fieldReader(postingsReader);
   if (!fieldReader.seek(field)) return;
   SegFieldInfo segFieldInfo;
   fieldReader.readFieldInfo(segFieldInfo);

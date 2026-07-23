@@ -119,7 +119,7 @@ int64_t exactCount(IndexReader& reader, std::string_view field,
 std::optional<SegFieldInfo> tryFieldInfo(IndexReader::Segment& segment,
                                          std::string_view field) {
   MemPool pool;
-  FieldReader fields(pool, segment.postingsReader());
+  FieldReader fields(segment.postingsReader());
   if (!fields.seek(field)) return std::nullopt;
   SegFieldInfo info;
   fields.readFieldInfo(info);
