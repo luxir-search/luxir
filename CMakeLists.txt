@@ -193,6 +193,9 @@ target_link_libraries(solux solux_lib)
 add_executable(solux_block_bounds tools/block_bounds.cpp)
 target_link_libraries(solux_block_bounds PRIVATE solux_lib)
 
+add_executable(solux_ord_bulk_bench tools/ord_bulk_bench.cpp)
+target_link_libraries(solux_ord_bulk_bench PRIVATE fmt::fmt)
+
 # Precompiled headers
 # Heavy, rarely-changing external/generated headers shared across translation
 # units. Project headers are intentionally excluded so editing them does not
