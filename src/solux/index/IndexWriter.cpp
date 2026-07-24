@@ -88,7 +88,8 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 
 IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()> schemaProvider,
                          IndexRamBudget* sharedIndexRamBudget,
-                         FilterCacheConfig filterCacheConfig)
+                         FilterCacheConfig filterCacheConfig,
+                         int mergeFactor)
   : dir(dir),
     schemaProvider_(std::move(schemaProvider)),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
@@ -96,6 +97,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     filterCache(std::make_shared<FilterCache>(filterCacheConfig)),
     originalFilterCacheConfig(filterCacheConfig) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
+  mergePolicy->setMergeFactor(mergeFactor);
   nextCommitInfo = std::make_unique<CommitInfo>();
   std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
   if (segFile.get() == nullptr) {

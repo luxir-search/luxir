@@ -210,7 +210,7 @@ public:
   CollectionHelper(SoluxNode& node, std::string_view name = "main")
     : node_(&node) {
     collection_ = node.getOrCreateCollection(name);
-    getIndexWriter()->mergePolicy->setMergeFactor(10);  // reset in case other tests forget.
+    getIndexWriter()->mergePolicy->setMergeFactor(node.getConfig().index.merge_factor);
   }
 
   Collection& collection() { return *collection_; }

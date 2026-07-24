@@ -132,6 +132,29 @@ bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
 } // namespace
 
 
+TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
+  EXPECT_EQ(SoluxConfig{}.index.merge_factor,
+            IndexWriter::MergePolicy::DEFAULT_MERGE_FACTOR);
+
+  SoluxConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  app.parse("--index.merge-factor 1000");
+  ASSERT_EQ(config.index.merge_factor, 1000);
+
+  SoluxNode node(config);
+  solux::test::CollectionHelper main(node);
+  EXPECT_EQ(main.getIndexWriter()->mergePolicy->mergeFactor, 1000);
+  EXPECT_EQ(node.getOrCreateCollection("other")->getShard()->getIndexWriter()->mergePolicy->mergeFactor,
+            1000);
+
+  SoluxConfig invalidConfig;
+  CLI::App invalidApp;
+  invalidConfig.addOptions(invalidApp);
+  EXPECT_THROW(invalidApp.parse("--index.merge-factor 1"), CLI::ValidationError);
+}
+
+
 TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   auto dir = std::make_unique<RAMDir>();
   {

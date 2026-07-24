@@ -58,6 +58,7 @@ struct IndexConfig {
   int64_t max_inverter_ram_mb = 64;              // RAM cap (MiB)
   int64_t max_inverter_docs = 8 * 1024 * 1024;   // doc-count cap
   int64_t max_index_ram_mb = 0;                  // shared index RAM cap (MiB), 0 = unlimited
+  int merge_factor = 10;
 };
 
 struct IngestConfig {

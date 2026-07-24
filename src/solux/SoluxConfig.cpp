@@ -1,4 +1,5 @@
 #include "SoluxConfig.h"
+#include <limits>
 #include "spdlog/spdlog.h"
 
 namespace solux {
@@ -58,6 +59,11 @@ void SoluxConfig::addOptions(CLI::App& app) {
                  "Per-inverter doc-count cap before an auto-flush to a segment")
       ->default_val(index.max_inverter_docs)
       ->check(CLI::PositiveNumber);
+  app.add_option("--index.merge-factor", index.merge_factor,
+                 "Same-level segments required to trigger a merge")
+      ->default_val(index.merge_factor)
+      ->check(CLI::PositiveNumber)
+      ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));
   app.add_option("--max-index-ram", index.max_index_ram_mb,
                  "Shared index RAM cap for merge admission (MiB, 0 = unlimited)")
       ->default_val(index.max_index_ram_mb)

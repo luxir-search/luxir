@@ -405,7 +405,8 @@ public:
   // reserve against; pass null for a private unlimited budget (tests, embedded).
   explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       FilterCacheConfig filterCacheConfig = {});
+                       FilterCacheConfig filterCacheConfig = {},
+                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR);
   ~IndexWriter();
 
   // Per-inverter auto-flush caps (Phase 1). When a non-atomic update indexes past
