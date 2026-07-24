@@ -194,6 +194,7 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   ValueNode logNode;
   logNode.kind = ValueNodeKind::FUNCTION;
   logNode.type = ValueType::DOUBLE;
+  logNode.opcode = ValueOpcode::LOG;
   logNode.text = "log";
   std::array<ValueBounds, 1> logInput{ValueBounds::integer(0, 10)};
   ValueBounds invalid = logarithm->boundsPropagate(logNode, logInput);
@@ -215,6 +216,7 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   ValueNode multiplyNode;
   multiplyNode.kind = ValueNodeKind::FUNCTION;
   multiplyNode.type = ValueType::DOUBLE;
+  multiplyNode.opcode = ValueOpcode::MUL;
   multiplyNode.text = "mul";
   std::array<ValueBounds, 2> factors{
       ValueBounds::floating(1e308, 1e308), ValueBounds::floating(2.0, 2.0)};

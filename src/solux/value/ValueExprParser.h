@@ -277,6 +277,7 @@ private:
 
     ValueNode node;
     node.kind = ValueNodeKind::FUNCTION;
+    node.opcode = function->opcode;
     node.function = function;
     node.children = args;
     node.childCount = count;

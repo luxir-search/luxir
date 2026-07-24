@@ -11,6 +11,23 @@ namespace solux {
 class BoundValueProgram;
 struct ValueNode;
 
+enum class ValueOpcode : uint8_t {
+  NONE,
+  DEF,
+  ADD,
+  SUB,
+  MUL,
+  DIV,
+  NEG,
+  ABS,
+  SQRT,
+  LOG,
+  LOG1P,
+  MIN,
+  MAX,
+  AVG,
+};
+
 struct ValueFunction {
   using ResolveType = ValueType (*)(std::span<const ValueType> args);
   using EvalPoint = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
@@ -24,6 +41,7 @@ struct ValueFunction {
   using EvalElement = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
                                       const ValueArrayRef& array, int64_t index);
 
+  ValueOpcode opcode = ValueOpcode::NONE;
   std::string_view name;
   ResolveType resolveType = nullptr;
   EvalPoint evalPoint = nullptr;

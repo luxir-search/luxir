@@ -98,37 +98,61 @@ ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResul
     double a = left.type == ValueType::DOUBLE ? left.doubleValue : (double)left.intValue;
     double b = right.type == ValueType::DOUBLE ? right.doubleValue : (double)right.intValue;
     double out;
-    if (node.text == "add") out = a + b;
-    else if (node.text == "sub") out = a - b;
-    else if (node.text == "mul") out = a * b;
-    else if (node.text == "div") out = a / b;
-    else if (node.text == "min") out = std::min(a, b);
-    else out = std::max(a, b);
+    switch (node.opcode) {
+      case ValueOpcode::ADD: out = a + b; break;
+      case ValueOpcode::SUB: out = a - b; break;
+      case ValueOpcode::MUL: out = a * b; break;
+      case ValueOpcode::DIV: out = a / b; break;
+      case ValueOpcode::MIN: out = std::min(a, b); break;
+      case ValueOpcode::MAX: out = std::max(a, b); break;
+      default: throw std::runtime_error("invalid binary ValueExpr opcode");
+    }
     if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
     return ValueResult::floating(out);
   }
 
   int64_t out = 0;
   bool overflow = false;
-  if (node.text == "add") overflow = __builtin_add_overflow(left.intValue, right.intValue, &out);
-  else if (node.text == "sub") overflow = __builtin_sub_overflow(left.intValue, right.intValue, &out);
-  else if (node.text == "mul") overflow = __builtin_mul_overflow(left.intValue, right.intValue, &out);
-  else if (node.text == "div") {
-    if (right.intValue == 0) runtimeInvalid(node, docid, "divided by zero");
-    if (left.intValue == std::numeric_limits<int64_t>::min() && right.intValue == -1) {
-      runtimeInvalid(node, docid, "overflowed int64");
-    }
-    out = left.intValue / right.intValue;
-  } else if (node.text == "min") out = std::min(left.intValue, right.intValue);
-  else out = std::max(left.intValue, right.intValue);
+  switch (node.opcode) {
+    case ValueOpcode::ADD:
+      overflow = __builtin_add_overflow(left.intValue, right.intValue, &out);
+      break;
+    case ValueOpcode::SUB:
+      overflow = __builtin_sub_overflow(left.intValue, right.intValue, &out);
+      break;
+    case ValueOpcode::MUL:
+      overflow = __builtin_mul_overflow(left.intValue, right.intValue, &out);
+      break;
+    case ValueOpcode::DIV:
+      if (right.intValue == 0) runtimeInvalid(node, docid, "divided by zero");
+      if (left.intValue == std::numeric_limits<int64_t>::min() && right.intValue == -1) {
+        runtimeInvalid(node, docid, "overflowed int64");
+      }
+      out = left.intValue / right.intValue;
+      break;
+    case ValueOpcode::MIN: out = std::min(left.intValue, right.intValue); break;
+    case ValueOpcode::MAX: out = std::max(left.intValue, right.intValue); break;
+    default: throw std::runtime_error("invalid binary ValueExpr opcode");
+  }
   if (overflow) runtimeInvalid(node, docid, "overflowed int64");
   return ValueResult::integer(out);
+}
+
+bool unaryOpcode(ValueOpcode opcode) {
+  return opcode == ValueOpcode::NEG || opcode == ValueOpcode::ABS
+      || opcode == ValueOpcode::SQRT || opcode == ValueOpcode::LOG
+      || opcode == ValueOpcode::LOG1P;
+}
+
+bool reducerOpcode(ValueOpcode opcode) {
+  return opcode == ValueOpcode::MIN || opcode == ValueOpcode::MAX
+      || opcode == ValueOpcode::AVG;
 }
 
 ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
                               int32_t docid, float score) {
   ValueResult first = program.evalNode(node.children[0], docid, score);
-  if (node.text == "def") {
+  if (node.opcode == ValueOpcode::DEF) {
     ValueResult selected = first.valid ? first : program.evalNode(node.children[1], docid, score);
     if (selected.valid && valueArray(node.type)) {
       return ValueResult::arrayValue(
@@ -138,31 +162,32 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
     return promote(selected, node.type);
   }
 
-  if (node.text == "min" || node.text == "max" || node.text == "avg") {
+  if (reducerOpcode(node.opcode)) {
     bool reducer = node.childCount == 1;
     if (reducer) {
       if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
       ValueResult aggregate = program.evalArrayElement(first.array, 0);
       long double sum = 0.0;
-      if (node.text == "avg") {
+      if (node.opcode == ValueOpcode::AVG) {
         sum = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue : aggregate.intValue;
       }
       for (int64_t i = 1; i < first.array.size; i++) {
         ValueResult next = program.evalArrayElement(first.array, i);
-        if (node.text == "avg") {
+        if (node.opcode == ValueOpcode::AVG) {
           sum += next.type == ValueType::DOUBLE ? next.doubleValue : next.intValue;
         } else if (node.type == ValueType::DOUBLE) {
           double a = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue
                                                         : (double)aggregate.intValue;
           double b = next.type == ValueType::DOUBLE ? next.doubleValue : (double)next.intValue;
-          aggregate = ValueResult::floating(node.text == "min" ? std::min(a, b) : std::max(a, b));
+          aggregate = ValueResult::floating(
+              node.opcode == ValueOpcode::MIN ? std::min(a, b) : std::max(a, b));
         } else {
-          aggregate.intValue = node.text == "min"
+          aggregate.intValue = node.opcode == ValueOpcode::MIN
               ? std::min(aggregate.intValue, next.intValue)
               : std::max(aggregate.intValue, next.intValue);
         }
       }
-      if (node.text == "avg") {
+      if (node.opcode == ValueOpcode::AVG) {
         double out = (double)(sum / first.array.size);
         if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
         return ValueResult::floating(out);
@@ -171,8 +196,7 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
     }
   }
 
-  if (node.text == "neg" || node.text == "abs" || node.text == "sqrt" ||
-      node.text == "log" || node.text == "log1p") {
+  if (unaryOpcode(node.opcode)) {
     if (!first.valid) return ValueResult::missing(node.type);
     if (valueArray(first.type)) {
       return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
@@ -182,16 +206,20 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
       if (first.intValue == std::numeric_limits<int64_t>::min()) {
         runtimeInvalid(node, docid, "overflowed int64");
       }
-      return ValueResult::integer(node.text == "neg" ? -first.intValue
-                                                       : std::abs(first.intValue));
+      return ValueResult::integer(node.opcode == ValueOpcode::NEG
+                                      ? -first.intValue
+                                      : std::abs(first.intValue));
     }
     double input = first.type == ValueType::DOUBLE ? first.doubleValue : (double)first.intValue;
     double out;
-    if (node.text == "neg") out = -input;
-    else if (node.text == "abs") out = std::abs(input);
-    else if (node.text == "sqrt") out = std::sqrt(input);
-    else if (node.text == "log") out = std::log(input);
-    else out = std::log1p(input);
+    switch (node.opcode) {
+      case ValueOpcode::NEG: out = -input; break;
+      case ValueOpcode::ABS: out = std::abs(input); break;
+      case ValueOpcode::SQRT: out = std::sqrt(input); break;
+      case ValueOpcode::LOG: out = std::log(input); break;
+      case ValueOpcode::LOG1P: out = std::log1p(input); break;
+      default: std::unreachable();
+    }
     if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
     return ValueResult::floating(out);
   }
@@ -222,26 +250,31 @@ ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& nod
     return valueArray(value.type) ? program.evalArrayElement(value.array, index) : value;
   };
   ValueResult first = operand(node.children[0]);
-  if (node.text == "def") {
+  if (node.opcode == ValueOpcode::DEF) {
     if (first.valid) return promote(first, valueScalarType(node.type));
     return promote(operand(node.children[1]), valueScalarType(node.type));
   }
-  if (node.text == "neg" || node.text == "abs" || node.text == "sqrt" ||
-      node.text == "log" || node.text == "log1p") {
+  if (unaryOpcode(node.opcode)) {
     ValueNode scalar = node;
     scalar.type = valueScalarType(node.type);
     if (scalar.type == ValueType::INT64) {
       if (first.intValue == std::numeric_limits<int64_t>::min()) {
         runtimeInvalid(node, array.docid, "overflowed int64");
       }
-      return ValueResult::integer(node.text == "neg" ? -first.intValue
-                                                       : std::abs(first.intValue));
+      return ValueResult::integer(node.opcode == ValueOpcode::NEG
+                                      ? -first.intValue
+                                      : std::abs(first.intValue));
     }
     double input = first.type == ValueType::DOUBLE ? first.doubleValue : (double)first.intValue;
-    double out = node.text == "neg" ? -input
-        : node.text == "abs" ? std::abs(input)
-        : node.text == "sqrt" ? std::sqrt(input)
-        : node.text == "log" ? std::log(input) : std::log1p(input);
+    double out;
+    switch (node.opcode) {
+      case ValueOpcode::NEG: out = -input; break;
+      case ValueOpcode::ABS: out = std::abs(input); break;
+      case ValueOpcode::SQRT: out = std::sqrt(input); break;
+      case ValueOpcode::LOG: out = std::log(input); break;
+      case ValueOpcode::LOG1P: out = std::log1p(input); break;
+      default: std::unreachable();
+    }
     if (!std::isfinite(out)) runtimeInvalid(node, array.docid, "produced NaN or infinity");
     return ValueResult::floating(out);
   }
@@ -275,14 +308,17 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
 
   double low = boundMinAsDouble(input);
   double high = boundMaxAsDouble(input);
-  if ((node.text == "neg" || node.text == "abs") && !valueDouble(node.type)) {
+  if ((node.opcode == ValueOpcode::NEG || node.opcode == ValueOpcode::ABS)
+      && !valueDouble(node.type)) {
     if (input.intMin == std::numeric_limits<int64_t>::min() && input.minAttained) {
       return ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW,
                                   input.mayBeMissing);
     }
     ValueBounds out;
-    if (node.text == "neg") out = ValueBounds::integer(-input.intMax, -input.intMin,
-                                                        input.mayBeMissing);
+    if (node.opcode == ValueOpcode::NEG) {
+      out = ValueBounds::integer(-input.intMax, -input.intMin,
+                                 input.mayBeMissing);
+    }
     else if (input.intMin >= 0) out = ValueBounds::integer(input.intMin, input.intMax,
                                                            input.mayBeMissing);
     else if (input.intMax <= 0) out = ValueBounds::integer(-input.intMax, -input.intMin,
@@ -290,7 +326,7 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     else out = ValueBounds::integer(0, std::max(-input.intMin, input.intMax),
                                     input.mayBeMissing);
     out.type = node.type;
-    if (node.text == "neg") {
+    if (node.opcode == ValueOpcode::NEG) {
       out.minAttained = input.maxAttained;
       out.maxAttained = input.minAttained;
     } else if (input.intMin < 0 && input.intMax > 0) {
@@ -300,36 +336,47 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     return out;
   }
 
-  if (node.text == "sqrt" && low < 0.0 && input.minAttained) {
+  if (node.opcode == ValueOpcode::SQRT && low < 0.0 && input.minAttained) {
     return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
   }
-  if (node.text == "log" && low <= 0.0 && input.minAttained) {
+  if (node.opcode == ValueOpcode::LOG && low <= 0.0 && input.minAttained) {
     return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
   }
-  if (node.text == "log1p" && low <= -1.0 && input.minAttained) {
+  if (node.opcode == ValueOpcode::LOG1P && low <= -1.0 && input.minAttained) {
     return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
   }
-  if ((node.text == "sqrt" && low < 0.0) || (node.text == "log" && low <= 0.0) ||
-      (node.text == "log1p" && low <= -1.0)) {
+  if ((node.opcode == ValueOpcode::SQRT && low < 0.0)
+      || (node.opcode == ValueOpcode::LOG && low <= 0.0)
+      || (node.opcode == ValueOpcode::LOG1P && low <= -1.0)) {
     return ValueBounds::unbounded(node.type, input.mayBeMissing);
   }
 
   double outLow;
   double outHigh;
-  if (node.text == "neg") {
-    outLow = -high;
-    outHigh = -low;
-  } else if (node.text == "abs") {
-    outLow = low <= 0.0 && high >= 0.0 ? 0.0 : std::min(std::abs(low), std::abs(high));
-    outHigh = std::max(std::abs(low), std::abs(high));
-  } else if (node.text == "sqrt") {
-    outLow = std::sqrt(low);
-    outHigh = std::sqrt(high);
-  } else if (node.text == "log") {
-    outLow = std::log(low);
-    outHigh = std::log(high);
-  } else {
-    outLow = std::log1p(low);
+  switch (node.opcode) {
+    case ValueOpcode::NEG:
+      outLow = -high;
+      outHigh = -low;
+      break;
+    case ValueOpcode::ABS:
+      outLow = low <= 0.0 && high >= 0.0
+          ? 0.0 : std::min(std::abs(low), std::abs(high));
+      outHigh = std::max(std::abs(low), std::abs(high));
+      break;
+    case ValueOpcode::SQRT:
+      outLow = std::sqrt(low);
+      outHigh = std::sqrt(high);
+      break;
+    case ValueOpcode::LOG:
+      outLow = std::log(low);
+      outHigh = std::log(high);
+      break;
+    case ValueOpcode::LOG1P:
+      outLow = std::log1p(low);
+      outHigh = std::log1p(high);
+      break;
+    default:
+      throw std::runtime_error("invalid unary ValueExpr opcode");
     outHigh = std::log1p(high);
   }
   if (!std::isfinite(outLow) || !std::isfinite(outHigh)) {
@@ -344,10 +391,10 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   }
   ValueBounds out = ValueBounds::floating(outLow, outHigh, input.mayBeMissing);
   out.type = node.type;
-  if (node.text == "neg") {
+  if (node.opcode == ValueOpcode::NEG) {
     out.minAttained = input.maxAttained;
     out.maxAttained = input.minAttained;
-  } else if (node.text == "abs" && low < 0.0 && high > 0.0) {
+  } else if (node.opcode == ValueOpcode::ABS && low < 0.0 && high > 0.0) {
     out.minAttained = false;
     out.maxAttained = input.minAttained || input.maxAttained;
   } else {
@@ -373,36 +420,48 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     int64_t bmax = right.intMax;
     __int128 low = 0;
     __int128 high = 0;
-    if (node.text == "add") {
-      low = (__int128)amin + bmin;
-      high = (__int128)amax + bmax;
-    } else if (node.text == "sub") {
-      low = (__int128)amin - bmax;
-      high = (__int128)amax - bmin;
-    } else if (node.text == "mul") {
-      std::array<__int128, 4> products{
-          (__int128)amin * bmin, (__int128)amin * bmax,
-          (__int128)amax * bmin, (__int128)amax * bmax};
-      low = *std::min_element(products.begin(), products.end());
-      high = *std::max_element(products.begin(), products.end());
-    } else if (node.text == "div") {
-      if (bmin <= 0 && bmax >= 0) {
-        if (bmin == 0 && bmax == 0 && right.minAttained) {
-          return ValueBounds::invalid(node.type, BoundsInvalidity::DIVIDE_BY_ZERO, mayMissing);
-        }
-        return ValueBounds::unbounded(node.type, mayMissing);
+    switch (node.opcode) {
+      case ValueOpcode::ADD:
+        low = (__int128)amin + bmin;
+        high = (__int128)amax + bmax;
+        break;
+      case ValueOpcode::SUB:
+        low = (__int128)amin - bmax;
+        high = (__int128)amax - bmin;
+        break;
+      case ValueOpcode::MUL: {
+        std::array<__int128, 4> products{
+            (__int128)amin * bmin, (__int128)amin * bmax,
+            (__int128)amax * bmin, (__int128)amax * bmax};
+        low = *std::min_element(products.begin(), products.end());
+        high = *std::max_element(products.begin(), products.end());
+        break;
       }
-      std::array<__int128, 4> quotients{
-          (__int128)amin / bmin, (__int128)amin / bmax,
-          (__int128)amax / bmin, (__int128)amax / bmax};
-      low = *std::min_element(quotients.begin(), quotients.end());
-      high = *std::max_element(quotients.begin(), quotients.end());
-    } else if (node.text == "min") {
-      low = std::min(amin, bmin);
-      high = std::min(amax, bmax);
-    } else {
-      low = std::max(amin, bmin);
-      high = std::max(amax, bmax);
+      case ValueOpcode::DIV: {
+        if (bmin <= 0 && bmax >= 0) {
+          if (bmin == 0 && bmax == 0 && right.minAttained) {
+            return ValueBounds::invalid(
+                node.type, BoundsInvalidity::DIVIDE_BY_ZERO, mayMissing);
+          }
+          return ValueBounds::unbounded(node.type, mayMissing);
+        }
+        std::array<__int128, 4> quotients{
+            (__int128)amin / bmin, (__int128)amin / bmax,
+            (__int128)amax / bmin, (__int128)amax / bmax};
+        low = *std::min_element(quotients.begin(), quotients.end());
+        high = *std::max_element(quotients.begin(), quotients.end());
+        break;
+      }
+      case ValueOpcode::MIN:
+        low = std::min(amin, bmin);
+        high = std::min(amax, bmax);
+        break;
+      case ValueOpcode::MAX:
+        low = std::max(amin, bmin);
+        high = std::max(amax, bmax);
+        break;
+      default:
+        throw std::runtime_error("invalid binary ValueExpr opcode");
     }
     if (low < std::numeric_limits<int64_t>::min() ||
         high > std::numeric_limits<int64_t>::max()) {
@@ -425,32 +484,46 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
   double bmax = boundMaxAsDouble(right);
   double low;
   double high;
-  if (node.text == "add") {
-    low = amin + bmin;
-    high = amax + bmax;
-  } else if (node.text == "sub") {
-    low = amin - bmax;
-    high = amax - bmin;
-  } else if (node.text == "mul") {
-    std::array<double, 4> products{amin * bmin, amin * bmax, amax * bmin, amax * bmax};
-    low = *std::min_element(products.begin(), products.end());
-    high = *std::max_element(products.begin(), products.end());
-  } else if (node.text == "div") {
-    if (bmin <= 0.0 && bmax >= 0.0) {
-      if (bmin == 0.0 && bmax == 0.0 && right.minAttained) {
-        return ValueBounds::invalid(node.type, BoundsInvalidity::DIVIDE_BY_ZERO, mayMissing);
-      }
-      return ValueBounds::unbounded(node.type, mayMissing);
+  switch (node.opcode) {
+    case ValueOpcode::ADD:
+      low = amin + bmin;
+      high = amax + bmax;
+      break;
+    case ValueOpcode::SUB:
+      low = amin - bmax;
+      high = amax - bmin;
+      break;
+    case ValueOpcode::MUL: {
+      std::array<double, 4> products{
+          amin * bmin, amin * bmax, amax * bmin, amax * bmax};
+      low = *std::min_element(products.begin(), products.end());
+      high = *std::max_element(products.begin(), products.end());
+      break;
     }
-    std::array<double, 4> quotients{amin / bmin, amin / bmax, amax / bmin, amax / bmax};
-    low = *std::min_element(quotients.begin(), quotients.end());
-    high = *std::max_element(quotients.begin(), quotients.end());
-  } else if (node.text == "min") {
-    low = std::min(amin, bmin);
-    high = std::min(amax, bmax);
-  } else {
-    low = std::max(amin, bmin);
-    high = std::max(amax, bmax);
+    case ValueOpcode::DIV: {
+      if (bmin <= 0.0 && bmax >= 0.0) {
+        if (bmin == 0.0 && bmax == 0.0 && right.minAttained) {
+          return ValueBounds::invalid(
+              node.type, BoundsInvalidity::DIVIDE_BY_ZERO, mayMissing);
+        }
+        return ValueBounds::unbounded(node.type, mayMissing);
+      }
+      std::array<double, 4> quotients{
+          amin / bmin, amin / bmax, amax / bmin, amax / bmax};
+      low = *std::min_element(quotients.begin(), quotients.end());
+      high = *std::max_element(quotients.begin(), quotients.end());
+      break;
+    }
+    case ValueOpcode::MIN:
+      low = std::min(amin, bmin);
+      high = std::min(amax, bmax);
+      break;
+    case ValueOpcode::MAX:
+      low = std::max(amin, bmin);
+      high = std::max(amax, bmax);
+      break;
+    default:
+      throw std::runtime_error("invalid binary ValueExpr opcode");
   }
   if (!std::isfinite(low) || !std::isfinite(high)) {
     bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained;
@@ -467,7 +540,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
 }
 
 ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> args) {
-  if (node.text == "def") {
+  if (node.opcode == ValueOpcode::DEF) {
     const ValueBounds& first = args[0];
     const ValueBounds& second = args[1];
     if (invalid(first)) return retag(first, node.type);
@@ -489,15 +562,13 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
     out.type = node.type;
     return out;
   }
-  if (node.text == "neg" || node.text == "abs" || node.text == "sqrt" ||
-      node.text == "log" || node.text == "log1p") {
+  if (unaryOpcode(node.opcode)) {
     return unaryBounds(node, args[0]);
   }
-  if ((node.text == "min" || node.text == "max" || node.text == "avg") &&
-      node.childCount == 1) {
+  if (reducerOpcode(node.opcode) && node.childCount == 1) {
     ValueBounds out = args[0];
     out.type = node.type;
-    if (node.text == "avg") {
+    if (node.opcode == ValueOpcode::AVG) {
       if (bounded(out)) {
         out.doubleMin = boundMinAsDouble(args[0]);
         out.doubleMax = boundMaxAsDouble(args[0]);
@@ -510,31 +581,31 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
 }
 
 constexpr ValueFunction FUNCTIONS[] = {
-    {"def", defType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::DEF, "def", defType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 2, 2},
-    {"add", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::ADD, "add", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 2, 2},
-    {"sub", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::SUB, "sub", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 2, 2},
-    {"mul", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::MUL, "mul", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 2, 2},
-    {"div", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::DIV, "div", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 2, 2},
-    {"neg", unarySame, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::NEG, "neg", unarySame, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 1},
-    {"abs", unarySame, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::ABS, "abs", unarySame, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 1},
-    {"sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::SQRT, "sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 1},
-    {"log", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::LOG, "log", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 1},
-    {"log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::LOG1P, "log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 1},
-    {"min", minMaxType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::MIN, "min", minMaxType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 2},
-    {"max", minMaxType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::MAX, "max", minMaxType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 2},
-    {"avg", avgType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
+    {ValueOpcode::AVG, "avg", avgType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
      evalFunctionElement, 1, 1},
 };
 
@@ -562,18 +633,18 @@ ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
 
 [[noreturn]] void throwBindInvalid(const ValueProgram& program, const ValueNode& node,
                                    const ValueBounds& bounds) {
-  if (node.kind == ValueNodeKind::FUNCTION && node.text == "log") {
+  if (node.kind == ValueNodeKind::FUNCTION && node.opcode == ValueOpcode::LOG) {
     std::string_view argument = program.nodes[node.children[0]].text;
     throw std::runtime_error(fmt::format(
         "log() is invalid over the segment bounds of '{}'; use log(max({}, 1)) to clamp "
         "or log1p({}) when that is the intended transform",
         argument, argument, argument));
   }
-  if (node.kind == ValueNodeKind::FUNCTION && node.text == "log1p") {
+  if (node.kind == ValueNodeKind::FUNCTION && node.opcode == ValueOpcode::LOG1P) {
     throw std::runtime_error(
         "log1p() is invalid for a value <= -1 in this segment; clamp its argument first");
   }
-  if (node.kind == ValueNodeKind::FUNCTION && node.text == "sqrt") {
+  if (node.kind == ValueNodeKind::FUNCTION && node.opcode == ValueOpcode::SQRT) {
     throw std::runtime_error(
         "sqrt() is invalid for a negative value in this segment; clamp its argument first");
   }
