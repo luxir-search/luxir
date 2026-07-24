@@ -1046,7 +1046,9 @@ public:
           entries.push_back({optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
                              nullptr, true});
         }
-        if (entries.size() < 2) {
+        if (entries.empty()
+            || (entries.size() < 2
+                && (!exhaustive || prohibitedSources.empty()))) {
           return nullptr;
         }
         std::sort(entries.begin(), entries.end(),
@@ -1085,8 +1087,25 @@ public:
           }
           arr[i] = scorer;
         }
+
+        auto* prohibitedArr =
+            targetPool.make_arr<Query::Scorer*>(prohibitedSources.size());
+        size_t prohibitedCount = 0;
+        if (exhaustive) {
+          for (auto* source : prohibitedSources) {
+            auto* supplier = source->scorerSupplier(targetPool, segment);
+            if (supplier == nullptr) {
+              continue;
+            }
+            auto* scorer = supplier->get(targetPool, leadCost);
+            if (scorer != nullptr) {
+              prohibitedArr[prohibitedCount++] = scorer;
+            }
+          }
+        }
         return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
             targetPool, std::span<Query::Scorer*>(arr, entries.size()),
+            std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
             segment.maxDoc(), leadCost, nonLeadCost, !exhaustive);
       }
 
@@ -1400,14 +1419,19 @@ public:
             && prohibitedSources.empty() && !filterSuppliers.empty()) {
           return filterOnlyBulkScorer(targetPool);
         }
-        // Filtered counts use the windowed intersection only when its dense
-        // count path is available. Sparse counts stay on the pull scorer.
+        // Filtered and negated counts use the windowed intersection only when
+        // the positive body and every exclusion support exact dense fills.
+        // Sparse positive bodies stay on the pull scorer.
         bool hasFilteredCountBody = !mandatorySources.empty()
             || (minShouldMatch >= 1 && !optionalSources.empty());
         if (!needsScores && hasFilteredCountBody
             && optionalSources.empty() == (minShouldMatch < 1)
-            && prohibitedSources.empty() && !filterSuppliers.empty()
+            && (!prohibitedSources.empty() || !filterSuppliers.empty())
             && minShouldMatch <= 1) {
+          if (!prohibitedSources.empty()
+              && ConjunctionBulkScorer::disableNegatedCountForTests) {
+            return nullptr;
+          }
           auto* bulk = conjunctionBulkScorer(targetPool, true);
           return bulk != nullptr && bulk->willCountDense() ? bulk : nullptr;
         }
@@ -3237,6 +3261,7 @@ public:
     static constexpr int32_t kDenseThresholdInverse = 512;
     static inline bool disableDisjGroupBulkForTests = false;
     static inline bool disableDenseScoredForTests = false;
+    static inline bool disableNegatedCountForTests = false;
 
   private:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
@@ -3262,9 +3287,12 @@ public:
     };
 
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
+    std::span<Query::Scorer*> prohibitedScorers;
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
     std::span<TermClause> termClauses;  // direct terms or decomposed flat unions
     std::span<DenseClause> denseClauses; // exact window-fill capable clauses
+    std::span<DenseClause> prohibitedDenseClauses;
+    std::span<uint8_t> prohibitedExhausted;
     std::span<float> windowMax;         // per-clause bound over the current window
     std::span<double> suffixMax;        // suffixMax[c] = sum of windowMax[c..n)
     std::span<int32_t> candDocs;
@@ -3287,6 +3315,7 @@ public:
     bool allDenseClauses = false;
     bool hasDisjGroup = false;
     bool denseHasDisjGroup = false;
+    bool negatedCountPath = false;
     bool denseCountPath = false;
     bool denseScoredEligible = false;
     bool denseScoredCostRejected = false;
@@ -3334,17 +3363,18 @@ public:
       return doc;
     }
 
-    int32_t denseClauseDocId(size_t clause) {
+    int32_t denseClauseDocId(const DenseClause& clause) {
       int32_t doc = PostingsReader::END;
-      for (Query::Scorer* member : denseClauses[clause].members) {
+      for (Query::Scorer* member : clause.members) {
         doc = std::min(doc, member->docId());
       }
       return doc;
     }
 
-    int32_t denseClauseCountAdvance(size_t clause, int32_t target) {
+    int32_t denseClauseCountAdvance(
+        const DenseClause& clause, int32_t target) {
       int32_t doc = PostingsReader::END;
-      for (Query::Scorer* member : denseClauses[clause].members) {
+      for (Query::Scorer* member : clause.members) {
         DocsFreqEnum* probe = member->windowFilterProbeDocsEnum();
         int32_t memberDoc = probe != nullptr ? probe->docId() : member->docId();
         if (memberDoc < target) {
@@ -3357,10 +3387,46 @@ public:
       return doc;
     }
 
-    void fillDenseClauseWindowBits(size_t clause, std::span<uint64_t> bits,
+    void fillDenseClauseWindowBits(const DenseClause& clause,
+                                   std::span<uint64_t> bits,
                                    int32_t windowBase, int32_t windowEnd) {
-      for (Query::Scorer* member : denseClauses[clause].members) {
+      for (Query::Scorer* member : clause.members) {
         member->fillWindowBits(bits, windowBase, windowEnd);
+      }
+    }
+
+    void applyProhibitedWindowBits(int32_t windowBase, int32_t windowEnd) {
+      if (!negatedCountPath) {
+        return;
+      }
+      skipCount(SkipStats::negatedCountWindows);
+      for (size_t clause = 0; clause < prohibitedDenseClauses.size(); clause++) {
+        if (prohibitedExhausted[clause] != 0) {
+          continue;
+        }
+        const DenseClause& denseClause = prohibitedDenseClauses[clause];
+        int32_t doc = denseClauseDocId(denseClause);
+        if (doc < windowBase) {
+          doc = denseClauseCountAdvance(denseClause, windowBase);
+        }
+        if (doc == PostingsReader::END) {
+          prohibitedExhausted[clause] = 1;
+          continue;
+        }
+        if (doc >= windowEnd) {
+          continue;
+        }
+
+        clearWindowBits(clauseBits);
+        fillDenseClauseWindowBits(
+            denseClause, clauseBits, windowBase, windowEnd);
+        skipCount(SkipStats::negatedCountExclFills);
+        for (int32_t word = 0; word < kWindowWords; word++) {
+          windowBits[(size_t) word] &= ~clauseBits[(size_t) word];
+        }
+        if (denseClauseDocId(denseClause) == PostingsReader::END) {
+          prohibitedExhausted[clause] = 1;
+        }
       }
     }
 
@@ -3882,9 +3948,9 @@ public:
 
     int32_t ratchetDenseWindow(int32_t min, int32_t max) {
       for (size_t c = 0; c < denseClauses.size(); c++) {
-        int32_t doc = denseClauseDocId(c);
+        int32_t doc = denseClauseDocId(denseClauses[c]);
         if (doc < min) {
-          doc = denseClauseCountAdvance(c, min);
+          doc = denseClauseCountAdvance(denseClauses[c], min);
         }
         if (doc > min) {
           min = doc;
@@ -3912,9 +3978,9 @@ public:
           int32_t doc = windowBase + index;
           bool matched = true;
           for (size_t c = firstClause; c < denseClauses.size(); c++) {
-            int32_t scorerDoc = denseClauseDocId(c);
+            int32_t scorerDoc = denseClauseDocId(denseClauses[c]);
             if (scorerDoc < doc) {
-              scorerDoc = denseClauseCountAdvance(c, doc);
+              scorerDoc = denseClauseCountAdvance(denseClauses[c], doc);
             }
             if (scorerDoc != doc) {
               matched = false;
@@ -3948,10 +4014,12 @@ public:
         return false;
       }
       clearWindowBits(windowBits);
-      fillDenseClauseWindowBits(0, windowBits, windowBase, windowEnd);
+      fillDenseClauseWindowBits(
+          denseClauses[0], windowBits, windowBase, windowEnd);
       for (size_t c = 1; c < denseClauses.size(); c++) {
         clearWindowBits(clauseBits);
-        fillDenseClauseWindowBits(c, clauseBits, windowBase, windowEnd);
+        fillDenseClauseWindowBits(
+            denseClauses[c], clauseBits, windowBase, windowEnd);
         for (int32_t w = 0; w < kWindowWords; w++) {
           windowBits[(size_t) w] &= clauseBits[(size_t) w];
         }
@@ -3967,6 +4035,7 @@ public:
         }
       }
 
+      applyProhibitedWindowBits(windowBase, windowEnd);
       if (filter != nullptr && filter->type == DocSet::BITSET) {
         applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
                                 &((BitDocSet*) filter)->bits());
@@ -4237,12 +4306,20 @@ public:
 
   public:
     ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
+                          std::span<Query::Scorer*> prohibitedScorers,
                           int32_t maxDoc, int64_t leadCost,
                           int64_t nonLeadCost, bool scoredConstruction)
         : scorers(scorers),
+          prohibitedScorers(prohibitedScorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
           denseClauses(pool.make_arr<DenseClause>(scorers.size()), scorers.size()),
+          prohibitedDenseClauses(
+              pool.make_arr<DenseClause>(prohibitedScorers.size()),
+              prohibitedScorers.size()),
+          prohibitedExhausted(
+              pool.make_arr<uint8_t>(prohibitedScorers.size()),
+              prohibitedScorers.size()),
           windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
           suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
           candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
@@ -4256,7 +4333,8 @@ public:
               ((size_t) kChunk + 63) >> 6),
           groupScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
           maxDoc(maxDoc) {
-      assert(scorers.size() >= 2);
+      assert(!scorers.empty());
+      std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
       allTermScorers = true;
       allTermClauses = true;
       allDenseClauses = true;
@@ -4300,6 +4378,23 @@ public:
         hasDisjGroup |= !members.empty();
         scoreAddends += members.empty() ? 1 : members.size();
       }
+      bool allDenseProhibited = true;
+      for (size_t i = 0; i < prohibitedScorers.size(); i++) {
+        std::span<Query::Scorer*> denseMembers;
+        if (prohibitedScorers[i]->supportsWindowFilter()) {
+          denseMembers = prohibitedScorers.subspan(i, 1);
+        } else if (!disableDisjGroupBulkForTests) {
+          denseMembers = prohibitedScorers[i]->flatDisjunctionScorers();
+          for (Query::Scorer* member : denseMembers) {
+            if (!member->supportsWindowFilter()) {
+              denseMembers = {};
+              break;
+            }
+          }
+        }
+        prohibitedDenseClauses[i].members = denseMembers;
+        allDenseProhibited &= !denseMembers.empty();
+      }
       // Bounds cover the same number of float additions as final scoring,
       // including every member contribution inside decomposed unions.
       scoreBoundFactor = 1.0 + (double) scoreAddends * 0x1p-24;
@@ -4316,10 +4411,14 @@ public:
                                                          (size_t) kChunk);
         }
       }
-      denseCountPath = allDenseClauses && maxDoc >= kWindowSize
-          && leadCost >= std::max<int64_t>(1, (int64_t) maxDoc / kDenseThresholdInverse);
+      negatedCountPath = !prohibitedScorers.empty();
+      denseCountPath = allDenseClauses && allDenseProhibited
+          && maxDoc >= kWindowSize
+          && leadCost >= std::max<int64_t>(
+              1, (int64_t) maxDoc / kDenseThresholdInverse);
       denseScoredEligible = scoredConstruction && denseCountPath
-          && allTermScorers && !disableDenseScoredForTests;
+          && !negatedCountPath && allTermScorers
+          && !disableDenseScoredForTests;
       if (denseScoredEligible) {
         denseScoredNorms = termScorers[0]->flatNormsBase;
         for (TermQuery::Scorer* scorer : termScorers) {

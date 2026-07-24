@@ -51,6 +51,32 @@ struct DisjGroupBulkGuard {
   }
 };
 
+struct NegatedCountGuard {
+  bool saved =
+      BooleanQuery::ConjunctionBulkScorer::disableNegatedCountForTests;
+
+  explicit NegatedCountGuard(bool disabled) {
+    BooleanQuery::ConjunctionBulkScorer::disableNegatedCountForTests = disabled;
+  }
+
+  ~NegatedCountGuard() {
+    BooleanQuery::ConjunctionBulkScorer::disableNegatedCountForTests = saved;
+  }
+};
+
+struct SkipStatsEnableGuard {
+  bool saved = SkipStats::enabled;
+
+  SkipStatsEnableGuard() {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+
+  ~SkipStatsEnableGuard() {
+    SkipStats::enabled = saved;
+  }
+};
+
 struct DisjConjBulkGuard {
   bool saved = BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests;
 
@@ -638,6 +664,229 @@ TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
                       qb::boolean(cur.mr(), /*required=*/{}, /*optional=*/nestedOr)});
     EXPECT_EQ(expectNested, countOf(q));
   }
+}
+
+TEST_F(BooleanFuzzTest, negatedDenseCountHandlesWindowsSegmentsDeletesAndDomain) {
+  const int32_t segmentDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  const int32_t totalDocs = 2 * segmentDocs;
+  std::vector<uint8_t> expected((size_t) totalDocs, 0);
+  std::vector<uint8_t> expectedFiltered((size_t) totalDocs, 0);
+  std::vector<uint8_t> expectedSparse((size_t) totalDocs, 0);
+
+  for (int32_t seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve((size_t) segmentDocs);
+    for (int32_t doc = 0; doc < segmentDocs; doc++) {
+      int32_t global = seg * segmentDocs + doc;
+      bool early = doc < DocsEnumMeta::L1_DOCS / 2 && (doc % 5) == 0;
+      bool fullWindow = doc >= DocsEnumMeta::L1_DOCS
+          && doc < 2 * DocsEnumMeta::L1_DOCS;
+      bool periodic = (doc % 17) == 3;
+      bool filtered = (doc % 3) != 1;
+      bool sparse = doc < 8;
+
+      std::string body = "nc_pos";
+      if (early) body += " nc_early";
+      if (fullWindow) body += " nc_full";
+      if (periodic) body += " nc_periodic";
+      if (filtered) body += " nc_filter";
+      if (sparse) body += " nc_sparse";
+      body += " filler";
+      docs.push_back(flatdoc(
+          "id", "nc_" + std::to_string(global), "body_w", body));
+
+      bool keep = !early && !fullWindow && !periodic;
+      expected[(size_t) global] = keep;
+      expectedFiltered[(size_t) global] = keep && filtered;
+      expectedSparse[(size_t) global] = sparse && !early && !periodic;
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+
+  std::array<int32_t, 4> deletedDocs = {
+      7, DocsEnumMeta::L1_DOCS + 9,
+      segmentDocs + 19, totalDocs - 11};
+  std::vector<std::string> deleteIds;
+  for (int32_t global : deletedDocs) {
+    expected[(size_t) global] = 0;
+    expectedFiltered[(size_t) global] = 0;
+    expectedSparse[(size_t) global] = 0;
+    deleteIds.push_back("nc_" + std::to_string(global));
+  }
+  ASSERT_TRUE(
+      helper.deleteByIds(deleteIds, UpdateMessage::COMMIT).success);
+
+  auto expectedCount = [](const std::vector<uint8_t>& docs) {
+    return (int64_t) std::count(docs.begin(), docs.end(), (uint8_t) 1);
+  };
+  auto requestCount = [&](bool withFilter, bool sparse,
+                          bool disableBulk) -> int64_t {
+    NegatedCountGuard guard(disableBulk);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q");
+    cur.getNumber().limit(0);
+    std::vector<api::Query> required = {
+        qb::match(cur.mr(), "body_w", sparse ? "nc_sparse" : "nc_pos")};
+    std::vector<api::Query> prohibited = {
+        qb::match(cur.mr(), "body_w", "nc_early"),
+        qb::match(cur.mr(), "body_w", "nc_full"),
+        qb::match(cur.mr(), "body_w", "nc_periodic")};
+    std::vector<api::Query> filters;
+    if (withFilter) {
+      filters.push_back(qb::match(cur.mr(), "body_w", "nc_filter"));
+    }
+    cur.rawQuery() = qb::boolean(
+        cur.mr(), required, {}, prohibited, filters);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+
+  SkipStatsEnableGuard statsGuard;
+  EXPECT_EQ(requestCount(false, false, false), expectedCount(expected));
+  EXPECT_GT(SkipStats::negatedCountWindows, 0);
+  EXPECT_GT(SkipStats::negatedCountExclFills, 0);
+  EXPECT_GT(SkipStats::conjDenseCountWindows, 0);
+
+  EXPECT_EQ(requestCount(true, false, false),
+            expectedCount(expectedFiltered));
+
+  SkipStats::reset();
+  EXPECT_EQ(requestCount(false, true, false), expectedCount(expectedSparse));
+  EXPECT_EQ(SkipStats::negatedCountWindows, 0);
+  EXPECT_EQ(SkipStats::negatedCountExclFills, 0);
+
+  SkipStats::reset();
+  EXPECT_EQ(requestCount(false, false, true), expectedCount(expected));
+  EXPECT_EQ(SkipStats::negatedCountWindows, 0);
+
+  // Exercise the same negated words as a DocSetBuilder-producing domain pass.
+  NegatedCountGuard bulkEnabled(false);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery positive("body_w", "nc_pos");
+  TermQuery early("body_w", "nc_early");
+  TermQuery full("body_w", "nc_full");
+  TermQuery periodic("body_w", "nc_periodic");
+  std::array<Query*, 1> mandatory = {&positive};
+  std::array<Query*, 3> prohibited = {&early, &full, &periodic};
+  std::span<Query*> empty;
+  BooleanQuery query(mandatory, empty, prohibited, empty);
+  auto* weight = query.createWeight(context, 0);
+  auto segments = context.topReader.segments();
+  ASSERT_EQ(segments.size(), 2u);
+  for (size_t seg = 0; seg < segments.size(); seg++) {
+    auto& segment = segments[seg];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(
+        supplier->bulkScorer(pool));
+    ASSERT_NE(bulk, nullptr);
+    DocSetBuilder builder(segment.maxDoc());
+    int64_t count = 0;
+    DocSet* liveDocs = segment.liveDocs() == nullptr
+        ? nullptr : &segment.liveDocs()->docset();
+    for (int32_t cursor = 0;
+         cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+      int32_t next = bulk->countNextWindow(
+          count, &builder, liveDocs, cursor, segment.maxDoc());
+      if (next == PostingsReader::END) {
+        break;
+      }
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    auto domain = builder.build();
+    EXPECT_EQ(count, domain->card());
+    for (int32_t doc = 0; doc < segment.maxDoc(); doc++) {
+      int32_t global = (int32_t) seg * segmentDocs + doc;
+      EXPECT_EQ(domain->get(doc), expected[(size_t) global] != 0)
+          << "segment=" << seg << " doc=" << doc;
+    }
+  }
+}
+
+TEST_F(BooleanFuzzTest, randomizedNegatedCountMatchesPullOracle) {
+  const int32_t segmentDocs = DocsEnumMeta::L1_DOCS + 257;
+  constexpr int32_t segmentCount = 3;
+  std::vector<std::string> deleteIds;
+  for (int32_t seg = 0; seg < segmentCount; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve((size_t) segmentDocs);
+    for (int32_t doc = 0; doc < segmentDocs; doc++) {
+      int32_t global = seg * segmentDocs + doc;
+      std::string body;
+      if (rng.rint(100) < 90) body += " rn_pos0";
+      if (rng.rint(100) < 65) body += " rn_pos1";
+      if (rng.rint(100) < 40) body += " rn_pos2";
+      for (int32_t excl = 0; excl < 6; excl++) {
+        if (rng.rint(100) < 8 + excl * 11) {
+          body += " rn_ex" + std::to_string(excl);
+        }
+      }
+      if (seg == 0 && doc < 300 && (doc % 7) == 0) {
+        body += " rn_early";
+      }
+      body += " filler";
+      docs.push_back(flatdoc(
+          "id", "rn_" + std::to_string(global), "body_w", body));
+      if ((global % 211) == 17) {
+        deleteIds.push_back("rn_" + std::to_string(global));
+      }
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(
+      helper.deleteByIds(deleteIds, UpdateMessage::COMMIT).success);
+
+  auto requestCount = [&](int32_t positive, std::span<const int32_t> exclusions,
+                          bool includeEarly, bool disableBulk) {
+    NegatedCountGuard guard(disableBulk);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q");
+    cur.getNumber().limit(0);
+    std::vector<api::Query> required = {
+        qb::match(cur.mr(), "body_w",
+                  "rn_pos" + std::to_string(positive))};
+    std::vector<api::Query> prohibited;
+    for (int32_t exclusion : exclusions) {
+      prohibited.push_back(qb::match(
+          cur.mr(), "body_w", "rn_ex" + std::to_string(exclusion)));
+    }
+    if (includeEarly) {
+      prohibited.push_back(qb::match(cur.mr(), "body_w", "rn_early"));
+    }
+    cur.rawQuery() = qb::boolean(cur.mr(), required, {}, prohibited);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+
+  SkipStatsEnableGuard statsGuard;
+  for (int32_t iter = 0; iter < 40; iter++) {
+    int32_t positive = (int32_t) rng.rint(3);
+    std::array<int32_t, 3> exclusions = {
+        (int32_t) rng.rint(6),
+        (int32_t) rng.rint(6),
+        (int32_t) rng.rint(6)};
+    size_t exclusionCount = 1 + (size_t) rng.rint(3);
+    bool includeEarly = rng.rint(2) != 0;
+    int64_t bulk = requestCount(
+        positive,
+        std::span<const int32_t>(exclusions.data(), exclusionCount),
+        includeEarly, false);
+    int64_t pull = requestCount(
+        positive,
+        std::span<const int32_t>(exclusions.data(), exclusionCount),
+        includeEarly, true);
+    EXPECT_EQ(bulk, pull)
+        << "iter=" << iter << " positive=" << positive;
+  }
+  EXPECT_GT(SkipStats::negatedCountWindows, 0);
+  EXPECT_GT(SkipStats::negatedCountExclFills, 0);
 }
 
 TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
