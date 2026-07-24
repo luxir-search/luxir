@@ -250,6 +250,59 @@ TEST_F(BoostQueryTest, flatBoundScorersReportExactBoundsAndExhaust) {
                   unscoredMultiTerm->getMaxScoreForSetup(PostingsReader::END));
 }
 
+TEST_F(BoostQueryTest, optionalBoundsIgnoreNegativeContributions) {
+  TestIndex index;
+  TestField body(index, "body_w");
+  body.startIndexing();
+  body.add(0, "alpha beta");
+  body.add(1, "alpha gamma");
+  body.add(2, "beta gamma");
+  index.flush();
+  body.startReading();
+
+  MemPool pool;
+  Query::Context context(pool, *index.reader);
+  auto& segment = index.reader->segments()[0];
+
+  TermQuery alpha("body_w", "alpha");
+  TermQuery beta("body_w", "beta");
+  TermQuery gamma("body_w", "gamma");
+  ConstantScoreQuery positive(&alpha, 5.0f);
+  ConstantScoreQuery negative(&beta, -7.0f);
+  ConstantScoreQuery negative2(&gamma, -3.0f);
+
+  std::vector<Query*> allNegativeClauses{&negative, &negative2};
+  BooleanQuery allNegative({}, allNegativeClauses, {}, {});
+  auto* allNegativeScorer = allNegative.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, allNegativeScorer);
+  EXPECT_FLOAT_EQ(0.0f, allNegativeScorer->getMaxScore(PostingsReader::END));
+  EXPECT_FLOAT_EQ(0.0f, allNegativeScorer->refineMaxScore(PostingsReader::END));
+
+  std::vector<Query*> disjunctionClauses{&positive, &negative, &negative2};
+  BooleanQuery disjunction({}, disjunctionClauses, {}, {});
+  auto* disjunctionScorer = disjunction.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, disjunctionScorer);
+  EXPECT_FLOAT_EQ(5.0f, disjunctionScorer->getMaxScore(PostingsReader::END));
+
+  std::vector<Query*> required{&positive};
+  std::vector<Query*> optional{&negative};
+  BooleanQuery mandOpt(required, optional, {}, {});
+  auto* mandOptScorer = mandOpt.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, mandOptScorer);
+  EXPECT_FLOAT_EQ(5.0f, mandOptScorer->getMaxScore(PostingsReader::END));
+
+  BooleanQuery minShouldMatch({}, disjunctionClauses, {}, {}, 2);
+  auto* msmScorer = minShouldMatch.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, msmScorer);
+  float msmMax = msmScorer->getMaxScore(PostingsReader::END);
+  EXPECT_GE(msmMax, 5.0f);
+  EXPECT_LT(msmMax, 5.01f);
+}
+
 TEST_F(BoostQueryTest, constantScoreAbsorbsOnlyOuterBoost) {
   TestIndex index;
   TestField body(index, "body_w");

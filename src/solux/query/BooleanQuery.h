@@ -408,6 +408,12 @@ public:
   // theta reaches this fraction of the group-granular range bound.
   static constexpr double kRefineBeta = 0.75;
   static constexpr size_t kCostAwareOrderMinClauses = 4;
+  static float optionalUpperBound(float upper) {
+    if (std::isnan(upper)) {
+      return std::numeric_limits<float>::infinity();
+    }
+    return std::max(0.0f, upper);
+  }
   // Scored TOP_k filter routing: the window-mask bulk needs the collector
   // floor to rise, and that tracks how densely the filter accepts docs, not
   // filter-vs-body cost. Below maxDoc/kMaskFilterDensityInverse the mask
@@ -558,7 +564,8 @@ public:
                                std::span<Query::Scorer*> scorers) {
       auto bounds = targetPool.make_span<float>(scorers.size());
       for (size_t i = 0; i < scorers.size(); i++) {
-        bounds[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
+        bounds[i] = optionalUpperBound(
+            scorers[i]->getMaxScoreForSetup(PostingsReader::END));
       }
       for (size_t i = 1; i < scorers.size(); i++) {
         Query::Scorer* scorer = scorers[i];
@@ -1718,8 +1725,9 @@ public:
       float maxScore = refined ? mand.scorer->refineMaxScore(upTo)
                                : mand.scorer->getMaxScore(upTo);
       if (optCanExist(upTo)) {
-        maxScore += refined ? opt.scorer->refineMaxScore(upTo)
-                            : opt.scorer->getMaxScore(upTo);
+        maxScore += optionalUpperBound(
+            refined ? opt.scorer->refineMaxScore(upTo)
+                    : opt.scorer->getMaxScore(upTo));
       }
       return maxScore;
     }
@@ -2217,8 +2225,9 @@ public:
         auto* opt = opts[i];
         int32_t doc = opt->docId();
         if (doc != PostingsReader::END && doc <= upTo) {
-          sum += (double) (refined ? opt->refineMaxScore(upTo)
-                                   : opt->getMaxScore(upTo));
+          sum += (double) optionalUpperBound(
+              refined ? opt->refineMaxScore(upTo)
+                      : opt->getMaxScore(upTo));
         }
       }
       return sum;
@@ -2288,7 +2297,8 @@ public:
           continue;
         }
         opt->advanceShallowForSetup(windowStart);
-        optWindowMax[i] = opt->getMaxScoreForSetup(windowEnd - 1);
+        optWindowMax[i] = optionalUpperBound(
+            opt->getMaxScoreForSetup(windowEnd - 1));
         optOrder[(size_t) liveOptCount++] = (int32_t) i;
       }
       sortWindowOrder();
@@ -3249,10 +3259,11 @@ public:
 
     float termClauseGetMaxScore(size_t clause, int32_t upTo) {
       float sum = 0.0f;
+      bool disjunction = termClauses[clause].members.size() > 1;
       for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
         float bound = termClauseMember(clause, member)->getMaxScore(upTo);
         if (!std::isfinite(bound)) return std::numeric_limits<float>::infinity();
-        sum += bound;
+        sum += disjunction ? optionalUpperBound(bound) : bound;
       }
       return sum;
     }
@@ -4344,7 +4355,7 @@ public:
       for (auto& member : members) {
         int32_t doc = member.docId();
         if (doc != solux::PostingsReader::END && doc <= upTo) {
-          sum += member.scorer->getMaxScore(upTo);
+          sum += optionalUpperBound(member.scorer->getMaxScore(upTo));
         }
       }
       return sum;
@@ -4355,7 +4366,7 @@ public:
       for (auto& member : members) {
         int32_t doc = member.docId();
         if (doc != solux::PostingsReader::END && doc <= upTo) {
-          sum += member.scorer->refineMaxScore(upTo);
+          sum += optionalUpperBound(member.scorer->refineMaxScore(upTo));
         }
       }
       return sum;
@@ -4536,7 +4547,8 @@ public:
           windowMax[i] = 0.0f;
         } else {
           scorers[i]->advanceShallowForSetup(windowStart);
-          windowMax[i] = scorers[i]->getMaxScoreForSetup(windowEnd - 1);
+          windowMax[i] = optionalUpperBound(
+              scorers[i]->getMaxScoreForSetup(windowEnd - 1));
         }
         windowOrder[i] = (int32_t) i;
       }
@@ -4689,7 +4701,8 @@ public:
       // Float-summation error headroom for the double split bound (see member).
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
-        clauseMax[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
+        clauseMax[i] = optionalUpperBound(
+            scorers[i]->getMaxScoreForSetup(PostingsReader::END));
       }
       sortByClauseMax();
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -4725,7 +4738,7 @@ public:
     float getMaxScore(int32_t upTo) override {
       float sum = 0.0f;
       for (auto* scorer : scorers) {
-        float maxScore = scorer->getMaxScore(upTo);
+        float maxScore = optionalUpperBound(scorer->getMaxScore(upTo));
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
         }
@@ -4737,7 +4750,7 @@ public:
     float refineMaxScore(int32_t upTo) override {
       float sum = 0.0f;
       for (auto* scorer : scorers) {
-        float maxScore = scorer->refineMaxScore(upTo);
+        float maxScore = optionalUpperBound(scorer->refineMaxScore(upTo));
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
         }
@@ -5030,7 +5043,8 @@ public:
           windowMax[i] = 0.0f;
         } else {
           scorers[i]->advanceShallowForSetup(start);
-          windowMax[i] = scorers[i]->getMaxScoreForSetup(end - 1);
+          windowMax[i] = optionalUpperBound(
+              scorers[i]->getMaxScoreForSetup(end - 1));
         }
         windowOrder[i] = (int32_t) i;
       }
@@ -5791,7 +5805,8 @@ public:
       assert(clauseCosts.empty() || scorers.size() == clauseCosts.size());
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
-        clauseMax[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
+        clauseMax[i] = optionalUpperBound(
+            scorers[i]->getMaxScoreForSetup(PostingsReader::END));
       }
       sortByClauseMax();
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -6281,7 +6296,8 @@ public:
       // up by that so it bounds score()'s float accumulation from above.
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
-        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+        clauseMax[i] = optionalUpperBound(
+            scorers[i]->getMaxScore(PostingsReader::END));
       }
     }
 
@@ -6338,7 +6354,7 @@ public:
         if (doc == PostingsReader::END || doc > upTo) {
           continue;
         }
-        float maxScore = scorer->getMaxScore(upTo);
+        float maxScore = optionalUpperBound(scorer->getMaxScore(upTo));
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
         }
@@ -6364,7 +6380,7 @@ public:
         if (doc == PostingsReader::END || doc > upTo) {
           continue;
         }
-        float maxScore = scorer->refineMaxScore(upTo);
+        float maxScore = optionalUpperBound(scorer->refineMaxScore(upTo));
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
         }
