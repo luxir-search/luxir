@@ -75,6 +75,9 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
   const auto& op = profileOp(*req);
   EXPECT_EQ("tags", op.name);
   ASSERT_EQ(3u, op.pieces.size());
+  constexpr std::array<int64_t, 3> localMaxOrds = {64, 2, 1};
+  constexpr std::array<std::string_view, 3> ordMappings = {
+      "identity", "identity", "remapped"};
   for (size_t i = 0; i < op.pieces.size(); i++) {
     const auto& piece = op.pieces[i];
     EXPECT_EQ("segment", piece.kind);
@@ -86,8 +89,11 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
     EXPECT_EQ(expectedStrategy(*piece.domain_size, *piece.cardinality), piece.strategy);
     // Unfiltered facets retain fixed bulk decoding for both rank-indexed and
     // docid-indexed columns.
-    ASSERT_GE(piece.details.size(), 1u);
-    EXPECT_EQ("all-docs domain, bulk ord loads", piece.details[0]);
+    ASSERT_GE(piece.details.size(), 2u);
+    EXPECT_EQ("seg maxOrd=" + std::to_string(localMaxOrds[i])
+                  + " ords=" + std::string(ordMappings[i]),
+              piece.details[0]);
+    EXPECT_EQ("all-docs domain, bulk ord loads", piece.details[1]);
     EXPECT_GT(piece.thread_id, 0);
     EXPECT_LT(piece.elapsed_us, 60'000'000u);
   }
@@ -96,13 +102,13 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
   // the already-upgraded skinny (no-downgrade rule) - all spelled out in the
   // human-readable details rather than typed fields.
   EXPECT_EQ("hash", op.pieces[0].strategy);
-  ASSERT_EQ(1u, op.pieces[0].details.size());
+  ASSERT_EQ(2u, op.pieces[0].details.size());
   EXPECT_EQ("skinny", op.pieces[1].strategy);
-  ASSERT_EQ(2u, op.pieces[1].details.size());
-  EXPECT_EQ("upgraded shared counters to skinny", op.pieces[1].details[1]);
+  ASSERT_EQ(3u, op.pieces[1].details.size());
+  EXPECT_EQ("upgraded shared counters to skinny", op.pieces[1].details[2]);
   EXPECT_EQ("hash", op.pieces[2].strategy);
-  ASSERT_EQ(2u, op.pieces[2].details.size());
-  EXPECT_EQ("want=hash, found=skinny", op.pieces[2].details[1]);
+  ASSERT_EQ(3u, op.pieces[2].details.size());
+  EXPECT_EQ("want=hash, found=skinny", op.pieces[2].details[2]);
 
   std::string json = renderSearchResponseLine(req->responses.back()->proto);
   EXPECT_NE(std::string::npos, json.find(R"("profile":{"ops":[{"name":"tags")"));
@@ -150,7 +156,9 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   EXPECT_EQ(256, *pieces[0].domain_size);
   EXPECT_EQ(1, *pieces[0].cardinality);
   EXPECT_EQ("vector", pieces[0].strategy);
-  ASSERT_EQ(1u, pieces[0].details.size());  // no upgrade, no divergence note
+  ASSERT_EQ(2u, pieces[0].details.size());  // no upgrade, no divergence note
+  EXPECT_EQ("seg maxOrd=1 ords=identity", pieces[0].details[0]);
+  EXPECT_EQ("all-docs domain, bulk ord loads", pieces[0].details[1]);
 }
 
 TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
@@ -174,8 +182,9 @@ TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
   const auto& pieces = profileOp(*req).pieces;
   ASSERT_EQ(1u, pieces.size());
   EXPECT_EQ(3, *pieces[0].domain_size);
-  ASSERT_GE(pieces[0].details.size(), 1u);
-  EXPECT_EQ("array domain, point ord loads", pieces[0].details[0]);
+  ASSERT_GE(pieces[0].details.size(), 2u);
+  EXPECT_EQ("seg maxOrd=1 ords=identity", pieces[0].details[0]);
+  EXPECT_EQ("array domain, point ord loads", pieces[0].details[1]);
 }
 
 TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
