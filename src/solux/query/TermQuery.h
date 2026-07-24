@@ -351,9 +351,20 @@ public:
       return doc;
     }
 
-    int32_t next() override {
-      int32_t doc = docsEnum.nextDoc();
+    int32_t competitivePosting(int32_t doc) {
       return doc <= competitiveUpTo ? doc : skipNonCompetitiveBlocks(doc);
+    }
+
+    int32_t nextCompetitive() {
+      return competitivePosting(docsEnum.nextDoc());
+    }
+
+    int32_t advanceCompetitive(int32_t target) {
+      return competitivePosting(docsEnum.advance(target));
+    }
+
+    int32_t next() override {
+      return nextCompetitive();
     }
 
     int32_t advance(int32_t target) override {
@@ -647,12 +658,12 @@ public:
       int32_t filled = 0;
       int32_t doc = docsEnum.docId();
       if (doc < 0) {
-        doc = skipNonCompetitiveBlocks(docsEnum.nextDoc());
+        doc = nextCompetitive();
       } else if (!includeCurrent) {
         if (doc >= PostingsReader::END - 1) {
           return 0;
         }
-        doc = skipNonCompetitiveBlocks(docsEnum.advance(doc + 1));
+        doc = advanceCompetitive(doc + 1);
       }
       while (filled < count && doc < upTo) {
         docs[filled] = doc;
@@ -664,7 +675,7 @@ public:
           scores[filled] = boost * simScorer->score((float) tf, encodedNorm);
         }
         filled++;
-        doc = skipNonCompetitiveBlocks(docsEnum.nextDoc());
+        doc = nextCompetitive();
       }
       return filled;
     }

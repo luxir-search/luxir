@@ -5404,6 +5404,45 @@ TEST_F(TermScorerTest, termCompetitiveBlockCertificateTracksThetaAndBoundaries) 
   helper.clear();
 }
 
+TEST_F(TermScorerTest, termBulkCompetitiveCertificateConsultsAtBlockTransitions) {
+  const int32_t nDocs = DocsEnumMeta::L1_DOCS + 2 * Postings::DOCS_BLOCK_SIZE + 17;
+  CollectionHelper helper("term_bulk_competitive_certificate");
+  addNegatedThetaDocs(helper, nDocs);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto& segment = context.topReader.segments()[0];
+  TermQuery query("body_w", "mand");
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = supplier->bulkScorer(pool);
+  ASSERT_NE(bulk, nullptr);
+
+  SkipStatsGuard stats;
+  const float theta = std::numeric_limits<float>::denorm_min();
+  int64_t visited = 0;
+  int32_t cursor = 0;
+  while (cursor != PostingsReader::END) {
+    ScoreWindow window;
+    int32_t next =
+        bulk->scoreNextWindow(window, nullptr, cursor, segment.maxDoc(), theta);
+    visited += window.size;
+    if (next == PostingsReader::END) {
+      break;
+    }
+    ASSERT_GT(next, cursor);
+    cursor = next;
+  }
+
+  EXPECT_EQ(visited, nDocs);
+  const int64_t impactBlocks =
+      (nDocs + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
+  EXPECT_EQ(SkipStats::impactCompetitiveColdLookups, impactBlocks);
+  helper.clear();
+}
+
 // The bulk conjunction path must produce the same top-k as the pull
 // ConjunctionScorer (tie-group equivalent), and with pruning disabled
 // (exact-count mode pins the threshold at lowest) it must emit every match.
