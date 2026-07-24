@@ -297,6 +297,20 @@ ValueBounds retag(ValueBounds bounds, ValueType type) {
   return bounds;
 }
 
+ValueBounds promoteBounds(ValueBounds bounds, ValueType type) {
+  if (valueDouble(type) && !valueDouble(bounds.type)
+      && bounded(bounds)) {
+    ValueBounds promoted = ValueBounds::floating(
+        (double)bounds.intMin, (double)bounds.intMax, bounds.mayBeMissing);
+    promoted.type = type;
+    promoted.alwaysMissing = bounds.alwaysMissing;
+    promoted.minAttained = bounds.minAttained;
+    promoted.maxAttained = bounds.maxAttained;
+    return promoted;
+  }
+  return retag(bounds, type);
+}
+
 ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   if (invalid(input)) return retag(input, node.type);
   if (!bounded(input)) {
@@ -544,6 +558,8 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
     const ValueBounds& first = args[0];
     const ValueBounds& second = args[1];
     if (invalid(first)) return retag(first, node.type);
+    if (first.alwaysMissing) return promoteBounds(second, node.type);
+    if (!first.mayBeMissing) return promoteBounds(first, node.type);
     if (invalid(second)) return retag(second, node.type);
     bool mayMissing = first.mayBeMissing && second.mayBeMissing;
     bool alwaysMissing = first.alwaysMissing && second.alwaysMissing;
@@ -766,6 +782,11 @@ const ValueBounds& BoundValueProgram::boundsForScore(
 }
 
 std::string_view BoundValueProgram::firstUnboundedNode() const {
+  const ValueBounds& root = nodes[program.rootNode].bounds;
+  if (root.certainty == BoundsCertainty::BOUNDED
+      && !root.mayBeMissing && !root.alwaysMissing) {
+    return {};
+  }
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueBounds& valueBounds = nodes[index].bounds;
     if (valueBounds.certainty != BoundsCertainty::BOUNDED

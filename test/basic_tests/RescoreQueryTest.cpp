@@ -100,18 +100,34 @@ TEST_F(RescoreQueryTest, grammarExecutionPreservesMembershipAndAllowsNegativeSco
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
-      .exprQuery("rescore(body_w:alpha, neg(popularity_i))")
+      .exprQuery("rescore(body_w:alpha, neg(popularity_i))^2")
       .fields({"id_s"}).getScores().getNumber().limit(-1);
   req->execute(false);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ((std::vector<std::string>{"one", "five"}), resultIds(*req));
   EXPECT_EQ(2, req->getMatchCount());
-  EXPECT_EQ((std::vector<float>{-1.0f, -5.0f}), resultScores(*req));
+  EXPECT_EQ((std::vector<float>{-2.0f, -10.0f}), resultScores(*req));
+
+  auto baseline = localReq(helper.getSearchEngine());
+  baseline->collection("main").topDocs("q").exprQuery("body_w:alpha")
+      .fields({"id_s"}).getScores().limit(-1);
+  baseline->execute(false);
+  ASSERT_TRUE(baseline->ok()) << baseline->errorMsg();
+
+  auto nested = localReq(helper.getSearchEngine());
+  nested->collection("main").topDocs("q")
+      .exprQuery("rescore(rescore(body_w:alpha,neg(score)),neg(score))")
+      .fields({"id_s"}).getScores().limit(-1);
+  nested->execute(false);
+  ASSERT_TRUE(nested->ok()) << nested->errorMsg();
+  EXPECT_EQ(resultIds(*baseline), resultIds(*nested));
+  EXPECT_EQ(resultScores(*baseline), resultScores(*nested));
 }
 
 TEST_F(RescoreQueryTest, missingErrorsNameBothTotalizationChoices) {
   CollectionHelper helper;
-  helper.index(flatdoc("id_s", "present", "body_w", "alpha", "popularity_i", 4),
+  helper.index(flatdoc("id_s", "present", "body_w", "alpha",
+                       "popularity_i", 4, "huge_d", 1e100),
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "missing", "body_w", "alpha"),
                UpdateMessage::COMMIT);
@@ -140,6 +156,11 @@ TEST_F(RescoreQueryTest, missingErrorsNameBothTotalizationChoices) {
   EXPECT_FALSE(absent);
   EXPECT_NE(std::string::npos, absentError.find("always missing"))
       << absentError;
+
+  auto [finite, finiteError] = run("rescore(body_w:alpha, huge_d)");
+  EXPECT_FALSE(finite);
+  EXPECT_NE(std::string::npos, finiteError.find("finite float"))
+      << finiteError;
 }
 
 TEST_F(RescoreQueryTest, normalizationIsIdentityOnly) {
@@ -159,6 +180,8 @@ TEST_F(RescoreQueryTest, normalizationIsIdentityOnly) {
   EXPECT_NE(nullptr, dynamic_cast<TermQuery*>(lower("score")));
   EXPECT_NE(nullptr, dynamic_cast<ConstantScoreQuery*>(lower("2.0")));
   EXPECT_NE(nullptr, dynamic_cast<ConstantScoreQuery*>(lower("add(1,2)")));
+  EXPECT_NE(nullptr, dynamic_cast<ConstantScoreQuery*>(lower("16777216")));
+  EXPECT_NE(nullptr, dynamic_cast<RescoreQuery*>(lower("16777217")));
   EXPECT_NE(nullptr, dynamic_cast<RescoreQuery*>(lower("0.1")));
   EXPECT_NE(nullptr, dynamic_cast<RescoreQuery*>(lower("mul(score,2)")));
 }
@@ -166,6 +189,8 @@ TEST_F(RescoreQueryTest, normalizationIsIdentityOnly) {
 TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "one", "body_w", "alpha", "popularity_i", 3),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "other", "body_w", "beta"),
                UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto schema = helper.collection().getSchema();
@@ -207,20 +232,36 @@ TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
   ValueProgram* absent = parseValue(arena, *schema, "never_i");
   TermQuery term("body_w", "alpha");
   RescoreQuery unbound(&term, absent);
+  FilterKeyContext filterKeyContext;
+  FilterKeyBuilder childKeyBuilder;
+  FilterKeyBuilder rescoreKeyBuilder;
+  FilterKeyScope childScope =
+      term.appendFilterKey(childKeyBuilder, filterKeyContext);
+  FilterKeyScope rescoreScope =
+      unbound.appendFilterKey(rescoreKeyBuilder, filterKeyContext);
+  EXPECT_EQ(childScope, rescoreScope);
+  EXPECT_EQ(std::move(childKeyBuilder).finish(childScope, filterKeyContext),
+            std::move(rescoreKeyBuilder).finish(rescoreScope, filterKeyContext));
+
   Query::Context filterContext(pool, *reader);
-  Query::Scorer* filterScorer = unbound.createWeight(filterContext, 0)
-      ->createScorer(pool, reader->segments()[0]);
+  Query::Weight* filterWeight = unbound.createWeight(filterContext, 0);
+  Query::Context childFilterContext(pool, *reader);
+  Query::Weight* childFilterWeight = term.createWeight(childFilterContext, 0);
+  EXPECT_EQ(childFilterWeight->count(reader->segments()[0]),
+            filterWeight->count(reader->segments()[0]));
+  Query::Scorer* filterScorer =
+      filterWeight->createScorer(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, filterScorer);
   EXPECT_EQ(0, filterScorer->next());
 
   RescoreQuery debugQuery(
-      &term, parseValue(arena, *schema, "def(never_i,score)"));
+      &term, parseValue(arena, *schema, "popularity_i"));
   Query::Context debugContext(pool, *reader);
   Query::Scorer* debugScorer =
       debugQuery.createWeight(debugContext, Query::NEED_SCORES)
           ->createScorer(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, debugScorer);
-  EXPECT_EQ("never_i", debugScorer->pruningBlockerForDebug());
+  EXPECT_EQ("popularity_i", debugScorer->pruningBlockerForDebug());
 
   ForcePrepareQuery preparedChild(&term);
   RescoreQuery preparedQuery(
@@ -262,6 +303,8 @@ TEST_F(RescoreQueryTest, forwardsTwoPhaseVerification) {
   ASSERT_NE(nullptr, scorer);
   ASSERT_TRUE(scorer->hasTwoPhase());
   EXPECT_FALSE(scorer->approximationEnums().empty());
+  EXPECT_TRUE(scorer->flatDisjunctionScorers().empty());
+  EXPECT_TRUE(scorer->flatConjunctionScorers().empty());
 
   std::vector<int32_t> matches;
   for (int32_t doc = scorer->approximationNext();

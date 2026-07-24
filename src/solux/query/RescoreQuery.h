@@ -255,7 +255,13 @@ class RescoreQuery final : public Query {
     }
 
     std::string_view pruningBlockerForDebug() const override {
-      return expression->firstUnboundedNode();
+      std::string_view blocker = expression->firstUnboundedNode();
+      if (!blocker.empty()) return blocker;
+      ScoreBounds output =
+          outputBounds(expression->bounds(expression->program.rootNode),
+                       multiplier);
+      return std::isfinite(output.lo) && std::isfinite(output.hi)
+          ? std::string_view{} : expression->program.root().text;
     }
   };
 
