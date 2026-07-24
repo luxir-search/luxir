@@ -391,7 +391,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
       break;
     default:
       throw std::runtime_error("invalid unary ValueExpr opcode");
-    outHigh = std::log1p(high);
   }
   if (!std::isfinite(outLow) || !std::isfinite(outHigh)) {
     BoundsInvalidity why = std::isnan(outLow) || std::isnan(outHigh)
