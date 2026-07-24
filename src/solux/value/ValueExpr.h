@@ -13,14 +13,13 @@
 
 #include "solux/reader/IntColReader.h"
 #include "solux/schema/FieldType.h"
+#include "solux/search/IndexReader.h"
 #include "solux/util/MemPool.h"
 #include "solux/util/proto.h"
 #include "solux/value/ValueFunctionRegistry.h"
 #include "solux/value/ValueTypes.h"
 
 namespace solux {
-
-class PostingsReader;
 
 enum class ValueNodeKind : uint8_t {
   CONSTANT,
@@ -77,7 +76,7 @@ public:
   }
 
   const ValueNode& root() const { return nodes[rootNode]; }
-  u_ptr<BoundValueProgram> bind(MemPool& pool, PostingsReader& postings) const;
+  u_ptr<BoundValueProgram> bind(MemPool& pool, IndexReader::Segment& segment) const;
 };
 
 struct BoundValueNode {
@@ -93,10 +92,12 @@ struct BoundValueNode {
 class BoundValueProgram {
 public:
   const ValueProgram& program;
+  IndexReader::Segment& segment;
   PostingsReader& postings;
   std::pmr::vector<BoundValueNode> nodes;
 
-  BoundValueProgram(MemPool& pool, const ValueProgram& program, PostingsReader& postings);
+  BoundValueProgram(MemPool& pool, const ValueProgram& program,
+                    IndexReader::Segment& segment);
 
   ValueResult evalPoint(int32_t docid, float score);
   ValueResult evalNode(uint32_t node, int32_t docid, float score);
@@ -119,8 +120,8 @@ public:
   u_ptr<BoundValueProgram> owned;
 
   BoundValueGuard(MemPool& pool, const ValueProgram& program,
-                  PostingsReader& postings, BoundValueProgram*& runtime)
-      : scope(pool), runtime(runtime), owned(program.bind(pool, postings)) {
+                  IndexReader::Segment& segment, BoundValueProgram*& runtime)
+      : scope(pool), runtime(runtime), owned(program.bind(pool, segment)) {
     runtime = owned.get();
   }
 

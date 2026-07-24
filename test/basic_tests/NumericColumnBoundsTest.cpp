@@ -92,7 +92,7 @@ TEST_F(NumericColumnBoundsTest, missingOnlySegmentBindsAsMissing) {
   ValueExprOptions options{helper.collection().getSchema().get(), {}};
   ValueProgram* program = ValueExprParser(options, *arena).parse("price_i");
   MemPool pool;
-  auto bound = program->bind(pool, reader->segments()[1].postingsReader());
+  auto bound = program->bind(pool, reader->segments()[1]);
   EXPECT_TRUE(bound->bounds(program->rootNode).alwaysMissing);
   EXPECT_FALSE(bound->evalPoint(0, 0.0f).valid);
   bound.reset();

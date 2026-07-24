@@ -157,12 +157,12 @@ public:
     std::pmr::vector<u_ptr<BoundValueProgram>> owned;
 
     ExpressionBindings(FieldSortCollector& collector, MemPool& pool,
-                       PostingsReader& postings)
+                       IndexReader::Segment& segment)
         : scope(pool), collector(collector), owned(&pool) {
       try {
         for (RuntimeClause& clause : collector.clauses) {
           if (clause.descriptor.getKind() != SortClause::EXPR) continue;
-          owned.push_back(clause.descriptor.getValueProgram().bind(pool, postings));
+          owned.push_back(clause.descriptor.getValueProgram().bind(pool, segment));
           clause.expr->expression = owned.back().get();
           clause.resetCache();
         }

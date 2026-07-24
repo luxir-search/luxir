@@ -44,13 +44,13 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
                        "den_i", 1), UpdateMessage::COMMIT);
 
   auto reader = helper.getIndexWriter()->getIndexReader();
-  auto& postings = reader->segments()[0].postingsReader();
+  auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;
 
   ValueProgram* program = parseValue(memory, *schema, "add(def(x_i,7),2)");
-  auto bound = program->bind(pool, postings);
+  auto bound = program->bind(pool, segment);
   std::array<int64_t, 3> expected{BIG + 2, 9, -3};
   for (int32_t doc = 0; doc < 3; doc++) {
     ValueResult result = bound->evalPoint(doc, 0.0f);
@@ -77,7 +77,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
            std::pair<std::string_view, double>{"min(values_is)", -3.0},
            {"max(values_is)", 5.0}, {"avg(values_is)", 1.0}}) {
     ValueProgram* reducer = parseValue(memory, *schema, expression);
-    auto reducerBound = reducer->bind(pool, postings);
+    auto reducerBound = reducer->bind(pool, segment);
     ValueResult result = reducerBound->evalPoint(0, 0.0f);
     ASSERT_TRUE(result.valid) << expression;
     double actual = result.type == ValueType::DOUBLE
@@ -87,21 +87,21 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   }
 
   ValueProgram* floating = parseValue(memory, *schema, "add(f_f,2.0)");
-  auto floatingBound = floating->bind(pool, postings);
+  auto floatingBound = floating->bind(pool, segment);
   const ValueBounds& floatBounds = floatingBound->bounds(floating->rootNode);
   ASSERT_EQ(BoundsCertainty::BOUNDED, floatBounds.certainty);
   EXPECT_DOUBLE_EQ(0.5, floatBounds.doubleMin);
   EXPECT_DOUBLE_EQ(6.25, floatBounds.doubleMax);
 
   ValueProgram* date = parseValue(memory, *schema, "when_dt");
-  auto dateBound = date->bind(pool, postings);
+  auto dateBound = date->bind(pool, segment);
   const ValueBounds& dateBounds = dateBound->bounds(date->rootNode);
   EXPECT_EQ(1000, dateBounds.intMin);
   EXPECT_EQ(3000, dateBounds.intMax);
   EXPECT_TRUE(dateBounds.mayBeMissing);
 
   ValueProgram* absent = parseValue(memory, *schema, "absent_i");
-  auto absentBound = absent->bind(pool, postings);
+  auto absentBound = absent->bind(pool, segment);
   const ValueBounds& absentBounds = absentBound->bounds(absent->rootNode);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, absentBounds.certainty);
   EXPECT_TRUE(absentBounds.alwaysMissing);
@@ -117,18 +117,18 @@ TEST_F(ValueExprKernelTest, negativeValuesAndRuntimeFiniteGuard) {
   helper.index(flatdoc("id_s", "pos", "x_i", 4, "den_i", 1),
                UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  auto& postings = reader->segments()[0].postingsReader();
+  auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;
 
   ValueProgram* abs = parseValue(memory, *schema, "abs(x_i)");
-  auto absBound = abs->bind(pool, postings);
+  auto absBound = abs->bind(pool, segment);
   EXPECT_EQ(9, absBound->evalPoint(0, 0.0f).intValue);
   EXPECT_EQ(0, absBound->evalPoint(1, 0.0f).intValue);
 
   ValueProgram* division = parseValue(memory, *schema, "div(1,den_i)");
-  auto divisionBound = division->bind(pool, postings);
+  auto divisionBound = division->bind(pool, segment);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED,
             divisionBound->bounds(division->rootNode).certainty);
   EXPECT_EQ(-1, divisionBound->evalPoint(0, 0.0f).intValue);
@@ -141,14 +141,14 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
   helper.index(flatdoc("id_s", "zero", "x_i", 0), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "one", "x_i", 1), UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  auto& postings = reader->segments()[0].postingsReader();
+  auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;
 
   ValueProgram* logarithm = parseValue(memory, *schema, "log(x_i)");
   try {
-    auto ignored = logarithm->bind(pool, postings);
+    auto ignored = logarithm->bind(pool, segment);
     FAIL() << "expected log bounds failure";
   } catch (const std::runtime_error& error) {
     std::string message = error.what();
@@ -162,26 +162,26 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "x_i", 2), UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  auto& postings = reader->segments()[0].postingsReader();
+  auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;
 
   ValueProgram* program = parseValue(memory, *schema, "add(score,x_i)");
-  auto bound = program->bind(pool, postings);
+  auto bound = program->bind(pool, segment);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, bound->bounds(program->rootNode).certainty);
   ValueResult result = bound->evalPoint(0, 3.5f);
   ASSERT_TRUE(result.valid);
   EXPECT_DOUBLE_EQ(5.5, result.doubleValue);
 
   ValueProgram* squareRoot = parseValue(memory, *schema, "sqrt(score)");
-  auto squareRootBound = squareRoot->bind(pool, postings);
+  auto squareRootBound = squareRoot->bind(pool, segment);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED,
             squareRootBound->bounds(squareRoot->rootNode).certainty);
   EXPECT_THROW(squareRootBound->evalPoint(0, -1.0f), std::runtime_error);
 
   ValueProgram* overflowing = parseValue(memory, *schema, "mul(score,1e308)");
-  auto overflowingBound = overflowing->bind(pool, postings);
+  auto overflowingBound = overflowing->bind(pool, segment);
   EXPECT_THROW(overflowingBound->evalPoint(0, 2.0f), std::runtime_error);
 }
 
@@ -237,6 +237,6 @@ TEST_F(ValueExprKernelTest, nonFiniteColumnEndpointIsRejectedAtBind) {
   ArenaOwner memory;
   MemPool pool;
   ValueProgram* program = parseValue(memory, *schema, "add(weight_d,0.0)");
-  EXPECT_THROW(program->bind(pool, reader->segments()[0].postingsReader()),
+  EXPECT_THROW(program->bind(pool, reader->segments()[0]),
                std::runtime_error);
 }

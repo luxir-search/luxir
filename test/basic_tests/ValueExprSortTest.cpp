@@ -122,6 +122,21 @@ TEST_F(ValueExprSortTest, multiSortFallsThroughToSegmentDocOrder) {
             ids(*req));
 }
 
+TEST_F(ValueExprSortTest, nestedDocidUsesReaderGlobalOrder) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "b"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "c"), UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
+  qb::sort(top, "add(_docid_,0)", qb::DESC);
+  req->execute(true);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ((std::vector<std::string>{"c", "b", "a"}), ids(*req));
+}
+
 TEST_F(ValueExprSortTest, normalizationScoreModesAndStringComparator) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "name_s", "z", "price_i", 2,
@@ -277,11 +292,13 @@ TEST_F(ValueExprSortTest, collectorReuseAndPairwiseMergeKeepOnlyValues) {
     auto left = std::make_unique<FieldSortCollector>(3, clauses, reader.get(), false);
     auto right = std::make_unique<FieldSortCollector>(3, clauses, reader.get(), false);
     auto collectSegment = [&](FieldSortCollector& collector, int32_t segment) {
-      auto& postings = reader->segments()[(size_t)segment].postingsReader();
+      auto& readerSegment = reader->segments()[(size_t)segment];
+      auto& postings = readerSegment.postingsReader();
       MemPool pool;
       collector.setSegment(segment, &postings);
       {
-        FieldSortCollector::ExpressionBindings bindings(collector, pool, postings);
+        FieldSortCollector::ExpressionBindings bindings(
+            collector, pool, readerSegment);
         for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
           collector.collect(segment, doc, 0.0f);
         }

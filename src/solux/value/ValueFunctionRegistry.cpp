@@ -671,13 +671,15 @@ std::span<const ValueFunction> ValueFunctionRegistry::entries() {
   return FUNCTIONS;
 }
 
-u_ptr<BoundValueProgram> ValueProgram::bind(MemPool& pool, PostingsReader& postings) const {
-  return pool.make_unique<BoundValueProgram>(pool, *this, postings);
+u_ptr<BoundValueProgram> ValueProgram::bind(MemPool& pool,
+                                            IndexReader::Segment& segment) const {
+  return pool.make_unique<BoundValueProgram>(pool, *this, segment);
 }
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
-                                     PostingsReader& postings)
-    : program(program), postings(postings), nodes(&pool) {
+                                     IndexReader::Segment& segment)
+    : program(program), segment(segment), postings(segment.postingsReader()),
+      nodes(&pool) {
   nodes.resize(program.nodes.size());
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
@@ -689,7 +691,8 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
     } else if (node.kind == ValueNodeKind::DOCID) {
       int32_t maxDoc = postings.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
-                                : ValueBounds::integer(0, (int64_t)maxDoc - 1);
+                                : ValueBounds::integer(segment.base,
+                                                       segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
       FieldReader fields(postings);
       if (!fields.seek(node.text)) {
@@ -798,7 +801,7 @@ ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float sco
     case ValueNodeKind::VARIABLE: return evalConstant(index, docid, score);
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
-    case ValueNodeKind::DOCID: return ValueResult::integer(docid);
+    case ValueNodeKind::DOCID: return ValueResult::integer(segment.base + docid);
     case ValueNodeKind::FUNCTION: return node.function->evalPoint(*this, node, docid, score);
   }
   throw std::runtime_error("invalid ValueExpr node");

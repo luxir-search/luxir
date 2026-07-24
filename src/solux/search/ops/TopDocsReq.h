@@ -333,7 +333,7 @@ public:
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
                   expressionBindings.emplace(
-                      *data->fieldCollector, poolGuard.pool(), seg.postingsReader());
+                      *data->fieldCollector, poolGuard.pool(), seg);
                 }
                 collectTopKMatchWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
@@ -349,7 +349,7 @@ public:
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
                   expressionBindings.emplace(
-                      *data->fieldCollector, poolGuard.pool(), seg.postingsReader());
+                      *data->fieldCollector, poolGuard.pool(), seg);
                 }
                 collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
               }
