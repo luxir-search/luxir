@@ -71,8 +71,6 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
     EXPECT_TRUE(batch[i].valid);
     EXPECT_EQ(expected[i], batch[i].intValue);
   }
-  bound.reset();
-
   for (auto [expression, expectedValue] : {
            std::pair<std::string_view, double>{"min(values_is)", -3.0},
            {"max(values_is)", 5.0}, {"avg(values_is)", 1.0}}) {
@@ -148,7 +146,7 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
 
   ValueProgram* logarithm = parseValue(memory, *schema, "log(x_i)");
   try {
-    auto ignored = logarithm->bind(pool, segment);
+    logarithm->bind(pool, segment);
     FAIL() << "expected log bounds failure";
   } catch (const std::runtime_error& error) {
     std::string message = error.what();

@@ -154,16 +154,15 @@ public:
   public:
     MemPool::ScopeGuard scope;
     FieldSortCollector& collector;
-    std::pmr::vector<u_ptr<BoundValueProgram>> owned;
 
     ExpressionBindings(FieldSortCollector& collector, MemPool& pool,
                        IndexReader::Segment& segment)
-        : scope(pool), collector(collector), owned(&pool) {
+        : scope(pool), collector(collector) {
       try {
         for (RuntimeClause& clause : collector.clauses) {
           if (clause.descriptor.getKind() != SortClause::EXPR) continue;
-          owned.push_back(clause.descriptor.getValueProgram().bind(pool, segment));
-          clause.expr->expression = owned.back().get();
+          clause.expr->expression =
+              clause.descriptor.getValueProgram().bind(pool, segment);
           clause.resetCache();
         }
       } catch (...) {
@@ -174,7 +173,6 @@ public:
 
     ~ExpressionBindings() {
       clearPointers();
-      owned.clear();
     }
 
     ExpressionBindings(const ExpressionBindings&) = delete;

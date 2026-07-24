@@ -95,7 +95,6 @@ TEST_F(NumericColumnBoundsTest, missingOnlySegmentBindsAsMissing) {
   auto bound = program->bind(pool, reader->segments()[1]);
   EXPECT_TRUE(bound->bounds(program->rootNode).alwaysMissing);
   EXPECT_FALSE(bound->evalPoint(0, 0.0f).valid);
-  bound.reset();
   releaseArena(arena);
 }
 

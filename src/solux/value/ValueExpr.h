@@ -76,7 +76,7 @@ public:
   }
 
   const ValueNode& root() const { return nodes[rootNode]; }
-  u_ptr<BoundValueProgram> bind(MemPool& pool, IndexReader::Segment& segment) const;
+  BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment) const;
 };
 
 struct BoundValueNode {
@@ -97,7 +97,7 @@ public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
   PostingsReader& postings;
-  std::pmr::vector<BoundValueNode> nodes;
+  std::span<BoundValueNode> nodes;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
                     IndexReader::Segment& segment);
@@ -124,17 +124,15 @@ class BoundValueGuard {
 public:
   MemPool::ScopeGuard scope;
   BoundValueProgram*& runtime;
-  u_ptr<BoundValueProgram> owned;
 
   BoundValueGuard(MemPool& pool, const ValueProgram& program,
                   IndexReader::Segment& segment, BoundValueProgram*& runtime)
-      : scope(pool), runtime(runtime), owned(program.bind(pool, segment)) {
-    runtime = owned.get();
+      : scope(pool), runtime(runtime) {
+    runtime = program.bind(pool, segment);
   }
 
   ~BoundValueGuard() {
     runtime = nullptr;
-    owned.reset();
   }
 
   BoundValueGuard(const BoundValueGuard&) = delete;

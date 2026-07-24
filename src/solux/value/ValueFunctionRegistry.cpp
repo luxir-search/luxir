@@ -671,16 +671,15 @@ std::span<const ValueFunction> ValueFunctionRegistry::entries() {
   return FUNCTIONS;
 }
 
-u_ptr<BoundValueProgram> ValueProgram::bind(MemPool& pool,
-                                            IndexReader::Segment& segment) const {
-  return pool.make_unique<BoundValueProgram>(pool, *this, segment);
+BoundValueProgram* ValueProgram::bind(MemPool& pool,
+                                      IndexReader::Segment& segment) const {
+  return pool.make<BoundValueProgram>(pool, *this, segment);
 }
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment)
     : program(program), segment(segment), postings(segment.postingsReader()),
-      nodes(&pool) {
-  nodes.resize(program.nodes.size());
+      nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
