@@ -278,6 +278,10 @@ TEST_F(BoostQueryTest, optionalBoundsIgnoreNegativeContributions) {
   ASSERT_NE(nullptr, allNegativeScorer);
   EXPECT_FLOAT_EQ(0.0f, allNegativeScorer->getMaxScore(PostingsReader::END));
   EXPECT_FLOAT_EQ(0.0f, allNegativeScorer->refineMaxScore(PostingsReader::END));
+  ScoreBounds allNegativeBounds =
+      allNegativeScorer->getScoreBounds(PostingsReader::END);
+  EXPECT_LE(allNegativeBounds.lo, -10.0f);
+  EXPECT_GE(allNegativeBounds.hi, 0.0f);
 
   std::vector<Query*> disjunctionClauses{&positive, &negative, &negative2};
   BooleanQuery disjunction({}, disjunctionClauses, {}, {});
@@ -293,6 +297,19 @@ TEST_F(BoostQueryTest, optionalBoundsIgnoreNegativeContributions) {
       ->createScorer(pool, segment);
   ASSERT_NE(nullptr, mandOptScorer);
   EXPECT_FLOAT_EQ(5.0f, mandOptScorer->getMaxScore(PostingsReader::END));
+  ScoreBounds mandOptBounds = mandOptScorer->getScoreBounds(PostingsReader::END);
+  EXPECT_LE(mandOptBounds.lo, -2.0f);
+  EXPECT_GE(mandOptBounds.hi, 5.0f);
+
+  std::vector<Query*> bothRequired{&positive, &negative};
+  BooleanQuery conjunction(bothRequired, {}, {}, {});
+  auto* conjunctionScorer = conjunction.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, conjunctionScorer);
+  ScoreBounds conjunctionBounds =
+      conjunctionScorer->getScoreBounds(PostingsReader::END);
+  EXPECT_LE(conjunctionBounds.lo, -2.0f);
+  EXPECT_GE(conjunctionBounds.hi, -2.0f);
 
   BooleanQuery minShouldMatch({}, disjunctionClauses, {}, {}, 2);
   auto* msmScorer = minShouldMatch.createWeight(context, Query::NEED_SCORES)

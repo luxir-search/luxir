@@ -982,6 +982,14 @@ public:
       return matcher.getMaxScore(*this, upTo);
     }
 
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return ScoreBounds::nonNegative(getMaxScore(upTo));
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return ScoreBounds::nonNegative(getMaxScore(upTo));
+    }
+
     int32_t advanceShallow(int32_t target) override {
       if (impacts.empty()) return PostingsReader::END;
       shallowTarget = target;

@@ -33,6 +33,15 @@ class DocSet;
 class DocSetBuilder;
 class WindowFilter;
 
+struct ScoreBounds {
+  float lo = -std::numeric_limits<float>::infinity();
+  float hi = std::numeric_limits<float>::infinity();
+
+  static ScoreBounds unknown() { return {}; }
+  static ScoreBounds exact(float value) { return {value, value}; }
+  static ScoreBounds nonNegative(float hi) { return {0.0f, hi}; }
+};
+
 struct ScoreWindow {
   int32_t min = 0;
   int32_t max = 0;
@@ -854,6 +863,13 @@ public:
     virtual float refineMaxScore(int32_t upTo) {
       return getMaxScore(upTo);
     }
+    virtual ScoreBounds getScoreBounds(int32_t upTo) {
+      unused(upTo);
+      return ScoreBounds::unknown();
+    }
+    virtual ScoreBounds refineScoreBounds(int32_t upTo) {
+      return getScoreBounds(upTo);
+    }
     virtual int32_t advanceShallow(int32_t target) {
       unused(target);
       return PostingsReader::END;
@@ -896,6 +912,10 @@ public:
     float getMaxScore(int32_t upTo) override {
       unused(upTo);
       return constantScore;
+    }
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      unused(upTo);
+      return ScoreBounds::exact(constantScore);
     }
     float getMaxScoreForSetup(int32_t upTo) override {
       unused(upTo);

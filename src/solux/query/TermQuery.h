@@ -890,6 +890,10 @@ public:
       return impacts.maxImpactInRangeNoParse(startBlock, upBlock);
     }
 
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return ScoreBounds::nonNegative(getMaxScore(upTo));
+    }
+
     float refineMaxScore(int32_t upTo) override {
       if (simScorer == nullptr) return 0.0f;
       if (!hasImpacts()) {
@@ -920,6 +924,10 @@ public:
       float bound = impacts.maxImpactInRangeParsed(startBlock, upBlock);
       refreshShallowIfParsed();
       return bound;
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return ScoreBounds::nonNegative(refineMaxScore(upTo));
     }
 
     float getMaxScoreForSetup(int32_t upTo) override {

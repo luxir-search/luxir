@@ -414,6 +414,58 @@ public:
     }
     return std::max(0.0f, upper);
   }
+  static ScoreBounds optionalScoreBounds(ScoreBounds bounds) {
+    bounds.lo = std::min(0.0f, bounds.lo);
+    bounds.hi = optionalUpperBound(bounds.hi);
+    return bounds;
+  }
+  static float addScoreBound(float left, float right, bool upper) {
+    float sum = left + right;
+    if (std::isnan(sum)) {
+      return upper ? std::numeric_limits<float>::infinity()
+                   : -std::numeric_limits<float>::infinity();
+    }
+    if (!std::isfinite(sum)) {
+      return sum;
+    }
+    return std::nextafter(
+        sum, upper ? std::numeric_limits<float>::infinity()
+                   : -std::numeric_limits<float>::infinity());
+  }
+  static ScoreBounds addScoreBounds(ScoreBounds left, ScoreBounds right) {
+    return {addScoreBound(left.lo, right.lo, false),
+            addScoreBound(left.hi, right.hi, true)};
+  }
+  static ScoreBounds sumRequiredScoreBounds(std::span<Query::Scorer*> scorers,
+                                            int32_t upTo, bool refined) {
+    if (scorers.empty()) {
+      return ScoreBounds::exact(0.0f);
+    }
+    ScoreBounds sum = refined ? scorers[0]->refineScoreBounds(upTo)
+                              : scorers[0]->getScoreBounds(upTo);
+    for (size_t i = 1; i < scorers.size(); i++) {
+      sum = addScoreBounds(
+          sum, refined ? scorers[i]->refineScoreBounds(upTo)
+                       : scorers[i]->getScoreBounds(upTo));
+    }
+    return sum;
+  }
+  static ScoreBounds sumOptionalScoreBounds(std::span<Query::Scorer*> scorers,
+                                            int32_t upTo, bool refined) {
+    if (scorers.empty()) {
+      return ScoreBounds::exact(0.0f);
+    }
+    ScoreBounds sum = optionalScoreBounds(
+        refined ? scorers[0]->refineScoreBounds(upTo)
+                : scorers[0]->getScoreBounds(upTo));
+    for (size_t i = 1; i < scorers.size(); i++) {
+      sum = addScoreBounds(
+          sum, optionalScoreBounds(
+              refined ? scorers[i]->refineScoreBounds(upTo)
+                      : scorers[i]->getScoreBounds(upTo)));
+    }
+    return sum;
+  }
   // Scored TOP_k filter routing: the window-mask bulk needs the collector
   // floor to rise, and that tracks how densely the filter accepts docs, not
   // filter-vs-body cost. Below maxDoc/kMaskFilterDensityInverse the mask
@@ -1732,6 +1784,17 @@ public:
       return maxScore;
     }
 
+    ScoreBounds scoreBoundsAt(int32_t upTo, bool refined) {
+      ScoreBounds bounds = refined ? mand.scorer->refineScoreBounds(upTo)
+                                   : mand.scorer->getScoreBounds(upTo);
+      if (optCanExist(upTo)) {
+        ScoreBounds optBounds = refined ? opt.scorer->refineScoreBounds(upTo)
+                                        : opt.scorer->getScoreBounds(upTo);
+        bounds = addScoreBounds(bounds, optionalScoreBounds(optBounds));
+      }
+      return bounds;
+    }
+
     void refineWindowNearTheta() {
       if (!(minCompetitiveScore > 0.0f)) {
         return;
@@ -1993,6 +2056,14 @@ public:
 
     float refineMaxScore(int32_t upTo) override {
       return maxScoreAt(upTo, true);
+    }
+
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return scoreBoundsAt(upTo, false);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return scoreBoundsAt(upTo, true);
     }
 
     int32_t advanceShallow(int32_t target) override {
@@ -2669,6 +2740,14 @@ public:
       return mandScorer->refineMaxScore(upTo);
     }
 
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return mandScorer->getScoreBounds(upTo);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return mandScorer->refineScoreBounds(upTo);
+    }
+
     int32_t advanceShallow(int32_t target) override {
       return mandScorer->advanceShallow(target);
     }
@@ -3067,6 +3146,14 @@ public:
         sum += scorer->refineMaxScore(upTo);
       }
       return sum;
+    }
+
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return sumRequiredScoreBounds(scorers, upTo, false);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return sumRequiredScoreBounds(scorers, upTo, true);
     }
 
     int32_t advanceShallow(int32_t target) override {
@@ -4371,6 +4458,31 @@ public:
       }
       return sum;
     }
+
+    ScoreBounds scoreBoundsAt(int32_t upTo, bool refined) {
+      ScoreBounds sum = ScoreBounds::exact(0.0f);
+      bool any = false;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc == solux::PostingsReader::END || doc > upTo) {
+          continue;
+        }
+        ScoreBounds bounds = refined ? member.scorer->refineScoreBounds(upTo)
+                                     : member.scorer->getScoreBounds(upTo);
+        bounds = optionalScoreBounds(bounds);
+        sum = any ? addScoreBounds(sum, bounds) : bounds;
+        any = true;
+      }
+      return any ? sum : ScoreBounds::exact(0.0f);
+    }
+
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return scoreBoundsAt(upTo, false);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return scoreBoundsAt(upTo, true);
+    }
   }; // DisjunctionScorer
 
 
@@ -4757,6 +4869,14 @@ public:
         sum += maxScore;
       }
       return sum;
+    }
+
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return sumOptionalScoreBounds(scorers, upTo, false);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return sumOptionalScoreBounds(scorers, upTo, true);
     }
 
     int64_t visited() const {
@@ -6397,6 +6517,14 @@ public:
       return ret;
     }
 
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return sumOptionalScoreBounds(scorers, upTo, false);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return sumOptionalScoreBounds(scorers, upTo, true);
+    }
+
     int64_t visited() const {
       return visitedCandidates;
     }
@@ -6490,6 +6618,14 @@ public:
         if (s->docId() == docid) score += s->score();
       }
       return score;
+    }
+
+    ScoreBounds getScoreBounds(int32_t upTo) override {
+      return sumOptionalScoreBounds(scorers, upTo, false);
+    }
+
+    ScoreBounds refineScoreBounds(int32_t upTo) override {
+      return sumOptionalScoreBounds(scorers, upTo, true);
     }
   }; // MinShouldMatchScorer
 
