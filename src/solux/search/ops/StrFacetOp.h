@@ -1,14 +1,79 @@
 #pragma once
 
+#include <cstdlib>
+#include <string_view>
 #include <variant>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include "FacetEmit.h"
 #include "FacetOp.h"
+#include "FlatSlotCounter.h"
 #include "SkinnyCounter.h"
+#include "SpanCounter.h"
 #include "solux/util/SegmentMergeDriver.h"
+#include "solux/util/log.h"
 
 namespace solux {
+
+// Test/bench control (SOLUX_FACET_COUNTER). AUTO uses the selector; the rest
+// force a specific representation so the grid can compare reps head to head and
+// measure the crossover thresholds. The FORCE_* modes reuse the selector's own
+// count strategies (they only override which rep is chosen); the sparse SPAN_*/
+// FLAT_* modes take the dedicated sparse fork.
+enum class FacetCounterMode {
+  AUTO, SPAN_GLOBAL, SPAN_LOCAL, FLAT_GLOBAL,
+  FORCE_VECTOR, FORCE_SKINNY, FORCE_HASH,
+  // Force the skinny rep AND its global-vs-local staging strategy, for measuring
+  // the staging crossover on a multi-segment index (moot at one segment).
+  SKINNY_GLOBAL, SKINNY_LOCAL
+};
+
+// The SPAN_*/FLAT_* modes drive the dedicated sparse fork; everything else runs
+// the ordinary selector path (with FORCE_* pinning its rep choice).
+inline bool isSparseForcedMode(FacetCounterMode m) {
+  return m == FacetCounterMode::SPAN_GLOBAL || m == FacetCounterMode::SPAN_LOCAL
+      || m == FacetCounterMode::FLAT_GLOBAL;
+}
+
+// FORCE_SKINNY (auto staging) and SKINNY_GLOBAL/SKINNY_LOCAL (forced staging)
+// all pin the skinny rep in the ordinary selector path.
+inline bool forcesSkinnyRep(FacetCounterMode m) {
+  return m == FacetCounterMode::FORCE_SKINNY
+      || m == FacetCounterMode::SKINNY_GLOBAL
+      || m == FacetCounterMode::SKINNY_LOCAL;
+}
+
+inline FacetCounterMode parseFacetCounterModeEnv() {
+  const char* e = std::getenv("SOLUX_FACET_COUNTER");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "span_global") {
+      return FacetCounterMode::SPAN_GLOBAL;
+    }
+    if (s == "span_local") {
+      return FacetCounterMode::SPAN_LOCAL;
+    }
+    if (s == "flat_global") {
+      return FacetCounterMode::FLAT_GLOBAL;
+    }
+    if (s == "vector") {
+      return FacetCounterMode::FORCE_VECTOR;
+    }
+    if (s == "skinny") {
+      return FacetCounterMode::FORCE_SKINNY;
+    }
+    if (s == "hash") {
+      return FacetCounterMode::FORCE_HASH;
+    }
+    if (s == "skinny_global") {
+      return FacetCounterMode::SKINNY_GLOBAL;
+    }
+    if (s == "skinny_local") {
+      return FacetCounterMode::SKINNY_LOCAL;
+    }
+  }
+  return FacetCounterMode::AUTO;
+}
 
 // How the domain will be walked, for the piece's human-readable detail.
 // ARRAY domains point-select ords. Bitset domains adapt for DOCID columns and
@@ -28,6 +93,35 @@ inline const char* domainDesc(DocSet* domain) {
   return domain == nullptr ? "all-docs domain"
       : domain->type == DocSet::Type::ARRAY ? "array domain, point ord loads"
                                             : "bitset domain";
+}
+
+template<typename Counter>
+inline void collectSparseCounts(
+    Counter& counter, int64_t min, int64_t limit,
+    std::vector<std::pair<int64_t, int64_t>>& ordCounts) {
+  // Overflowed ords are guaranteed to outrank every non-overflowed ord. Fold
+  // their low bits first and clear those slots so a later scan cannot count
+  // them twice.
+  counter.foldOverflow([&](int64_t ord, int64_t total) {
+    if (total >= min) {
+      ordCounts.emplace_back(ord, total);
+    }
+  });
+
+  bool sortingByCountDesc = true;  // FUTURE
+  if (sortingByCountDesc && limit != -1
+      && (int64_t)ordCounts.size() >= limit) {
+    // The top-K is already in hand, so release the potentially large sparse
+    // table instead of scanning it.
+    counter.releaseStorage();
+    return;
+  }
+
+  counter.forEachCount([&](int64_t ord, int64_t count) {
+    if (count >= min) {
+      ordCounts.emplace_back(ord, count);
+    }
+  });
 }
 
 //
@@ -53,12 +147,34 @@ inline const char* domainDesc(DocSet* domain) {
 
 class StrFacetOp : public FieldFacetReq {
 public:
+  static inline FacetCounterMode forcedCounterMode = parseFacetCounterModeEnv();
+
   class MergeableStrData : public solux::MergeableData {
   public:
     using OrdHash = boost::unordered_flat_map<int64_t, int64_t>;
     using CountVector = std::vector<int64_t>;
-    std::variant<std::monostate, OrdHash, SkinnyCounter8, CountVector> counts;
+    std::variant<std::monostate, OrdHash, SkinnyCounter8, CountVector,
+                 SpanCounter, FlatSlotCounter> counts;
     int64_t missing_num = 0; // number of missing values in this segment
+
+    template<typename Counter>
+    static MergeableStrData* mergeSparse(MergeableStrData* a,
+                                         MergeableStrData* b) {
+      auto* acounter = std::get_if<Counter>(&a->counts);
+      auto* bcounter = std::get_if<Counter>(&b->counts);
+      if (!acounter) {
+        std::swap(a, b);
+        std::swap(acounter, bcounter);
+      }
+      // Forced sparse modes are process-global and homogeneous.
+      assert(bcounter != nullptr);
+      if (acounter->distinct() < bcounter->distinct()) {
+        std::swap(a, b);
+        std::swap(acounter, bcounter);
+      }
+      acounter->merge(*bcounter);
+      return a;
+    }
 
     static MergeableStrData* merge(MergeableStrData* a, MergeableStrData* b) {
       // start by updating missing_num of both (we will return one or the other)
@@ -70,6 +186,15 @@ public:
       }
       if (std::holds_alternative<std::monostate>(b->counts)) {
         return a;
+      }
+
+      if (std::holds_alternative<FlatSlotCounter>(a->counts)
+          || std::holds_alternative<FlatSlotCounter>(b->counts)) {
+        return mergeSparse<FlatSlotCounter>(a, b);
+      }
+      if (std::holds_alternative<SpanCounter>(a->counts)
+          || std::holds_alternative<SpanCounter>(b->counts)) {
+        return mergeSparse<SpanCounter>(a, b);
       }
 
       // If either variant is a CountVector, merge the other into it.
@@ -155,7 +280,7 @@ public:
       return a;
     }
 
-    enum class Rep { Vector, Hash, Skinny };
+    enum class Rep { Vector, Hash, Skinny, Span, Flat };
 
     // Make `data.counts` the requested representation, sized for globVals,
     // folding any existing (smaller) counts in.  This is the storage-upgrade a
@@ -198,6 +323,12 @@ public:
             break;
           case Rep::Skinny:
             data.counts.emplace<SkinnyCounter8>(globVals);
+            break;
+          case Rep::Span:
+            data.counts.emplace<SpanCounter>((size_t)globVals);
+            break;
+          case Rep::Flat:
+            data.counts.emplace<FlatSlotCounter>((size_t)globVals);
             break;
         }
       }
@@ -401,6 +532,89 @@ public:
         fieldReader.readFieldInfo(segFieldInfo);
 
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
+        int64_t missing_num = 0;
+        auto& facetReq = (FacetReq&)getOp();
+        OrdMap::SegToGlobal mapping;
+        if (thisOp().ordMap) {
+          mapping = thisOp().ordMap->getSegToGlobal(segnum);
+        } else {
+          mapping.numOrds = segFieldInfo.nTerms;
+        }
+
+        if (profile != nullptr) {
+          // Per-segment ord picture: the segment's local maxOrd (nTerms) and
+          // whether its ords equal the global ords (identity makes local staging
+          // moot for this segment).
+          profile->details.emplace_back(
+              "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
+              + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
+        }
+
+        auto forEachMappedOrd = [&](size_t size, auto&& accept) {
+          uint64_t deltaFrame[128];
+          for (size_t base = 0; base < size; base += 128) {
+            uint32_t count = (uint32_t)std::min<size_t>(128, size - base);
+            if (mapping.bits != 0) {
+              mapping.unpackDeltas(base, count, deltaFrame);
+            }
+            for (uint32_t i = 0; i < count; i++) {
+              int64_t localOrd = (int64_t)base + i;
+              int64_t globalOrd = mapping.bits == 0
+                  ? localOrd : localOrd + (int64_t)deltaFrame[i];
+              accept((size_t)localOrd, globalOrd);
+            }
+          }
+        };
+
+        if (isSparseForcedMode(StrFacetOp::forcedCounterMode)) {
+          bool useFlat =
+              StrFacetOp::forcedCounterMode == FacetCounterMode::FLAT_GLOBAL;
+          MergeableStrData::ensureRep(
+              data, useFlat ? MergeableStrData::Rep::Flat
+                            : MergeableStrData::Rep::Span,
+              globVals);
+          auto* countSpan = std::get_if<SpanCounter>(&data.counts);
+          auto* countFlat = std::get_if<FlatSlotCounter>(&data.counts);
+          assert(useFlat ? countFlat != nullptr : countSpan != nullptr);
+          if (profile != nullptr) {
+            profile->wire.cardinality = globVals;
+            profile->wire.strategy = useFlat ? "flat_global"
+                : StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL
+                    ? "span_global"
+                    : "span_local";
+            profile->details.emplace_back(domainDesc(
+                domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
+          }
+          auto collectGlobal = [&](auto& counter) {
+            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
+                unused(docid);
+                counter.increment(mapping.globalOrd((int64_t)localOrd - 1));
+              });
+          };
+          if (useFlat) {
+            collectGlobal(*countFlat);
+          } else if (StrFacetOp::forcedCounterMode
+                     == FacetCounterMode::SPAN_GLOBAL) {
+            collectGlobal(*countSpan);
+          } else {
+            std::vector<uint32_t> localCounts(segFieldInfo.nTerms);
+            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
+                unused(docid);
+                localCounts[(size_t)((int64_t)localOrd - 1)]++;
+              });
+            forEachMappedOrd(localCounts.size(),
+                             [&](size_t localOrd, int64_t globalOrd) {
+              uint32_t c = localCounts[localOrd];
+              if (c > 0) {
+                countSpan->increment(globalOrd, (int64_t)c);
+              }
+            });
+          }
+          data.missing_num += missing_num;
+          return;
+        }
 
         // want a vector of global ords if the domain size is much larger than the number of unique values
         // such that a skinny counter would have many overflows.
@@ -413,9 +627,18 @@ public:
         // type; ensureRep upgrades data.counts in place to the larger rep we
         // want (folding the old counts in), or keeps/creates it as needed.  Then
         // re-read the active alternative for the scan below.
-        MergeableStrData::Rep rep = wantVec ? MergeableStrData::Rep::Vector
-                                  : wantHash ? MergeableStrData::Rep::Hash
-                                             : MergeableStrData::Rep::Skinny;
+        // FORCE_* pins the rep so the grid can measure each rep at every cell;
+        // AUTO uses the (currently guessed) wantVec/wantHash thresholds.
+        MergeableStrData::Rep rep =
+            StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_VECTOR
+                ? MergeableStrData::Rep::Vector
+          : forcesSkinnyRep(StrFacetOp::forcedCounterMode)
+                ? MergeableStrData::Rep::Skinny
+          : StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_HASH
+                ? MergeableStrData::Rep::Hash
+          : wantVec ? MergeableStrData::Rep::Vector
+          : wantHash ? MergeableStrData::Rep::Hash
+                     : MergeableStrData::Rep::Skinny;
         bool repUpgraded = MergeableStrData::ensureRep(data, rep, globVals);
         auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
         auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
@@ -438,53 +661,35 @@ public:
           }
         }
 
-        int64_t missing_num = 0;
-        auto& facetReq = (FacetReq&)getOp();
-        OrdMap::SegToGlobal mapping;
-        if (thisOp().ordMap) {
-          mapping = thisOp().ordMap->getSegToGlobal(segnum);
-        } else {
-          mapping.numOrds = segFieldInfo.nTerms;
-        }
-
-        auto forEachMappedOrd = [&](size_t size, auto&& accept) {
-          uint64_t deltaFrame[128];
-          for (size_t base = 0; base < size; base += 128) {
-            uint32_t count = (uint32_t)std::min<size_t>(128, size - base);
-            if (mapping.bits != 0) {
-              mapping.unpackDeltas(base, count, deltaFrame);
-            }
-            for (uint32_t i = 0; i < count; i++) {
-              int64_t localOrd = (int64_t)base + i;
-              int64_t globalOrd = mapping.bits == 0
-                  ? localOrd : localOrd + (int64_t)deltaFrame[i];
-              accept((size_t)localOrd, globalOrd);
-            }
-          }
-        };
-
         // if we want a vector, then there are enough repeats that we should collect
         // local counts first and then only convert to global ords once.
         if (countVec) {
-          // TODO: we have a countVec, but if we wanted a map, that means we should
-          // probably not do 2 pass.  Unclear how often this will happen.
-          // NOTE: skip 2 phase if the ords for this segment are the same as global ords!
-
-          // for single-valued, we could get away with int32_t
-          std::vector<int64_t> localCounts(segFieldInfo.nTerms);
-          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
-              unused(docid);
-              int64_t ord = (int64_t)localOrd - 1;
-              localCounts[ord]++;
+          if (mapping.bits == 0) {
+            // Identity segment: local ords ARE global ords, so count straight
+            // into the global vector - no local buffer, no drain copy.
+            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
+                unused(docid);
+                (*countVec)[(int64_t)localOrd - 1]++;
+              });
+          } else {
+            // Remapped segment: count dense local ords once, drain to global.
+            // TODO: we have a countVec, but if we wanted a map, that means we
+            // should probably not do 2 pass.  Unclear how often this happens.
+            // for single-valued, we could get away with int32_t
+            std::vector<int64_t> localCounts(segFieldInfo.nTerms);
+            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
+                unused(docid);
+                localCounts[(int64_t)localOrd - 1]++;
+              });
+            forEachMappedOrd(localCounts.size(), [&](size_t localOrd, int64_t globalOrd) {
+              auto count = localCounts[localOrd];
+              if (count > 0) {
+                (*countVec)[globalOrd] += count;
+              }
             });
-
-          forEachMappedOrd(localCounts.size(), [&](size_t localOrd, int64_t globalOrd) {
-            auto count = localCounts[localOrd];
-            if (count > 0) {
-              (*countVec)[globalOrd] += count;
-            }
-          });
+          }
 
         } else if (countMap) {
           facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
@@ -495,9 +700,17 @@ public:
             });
         } else {
           assert(countSkinny);
-          // If localords != globalOrds and expected number of repeats per value is > 2, use a local skinny counter first
-          // and convert to global ords on overflow.
-          if (mapping.bits != 0 && (domainSize >> 1) >= segFieldInfo.nTerms) {
+          // Stage in local ord space first (then drain once per distinct ord)
+          // only when the ords are remapped (bits != 0 - identity makes it moot)
+          // and enough repeats are expected to amortize. SKINNY_GLOBAL/LOCAL
+          // force the strategy for measuring the crossover; AUTO uses the
+          // repeats>2 heuristic (domainSize/nTerms > 2).
+          FacetCounterMode skinnyMode = StrFacetOp::forcedCounterMode;
+          bool useLocal =
+              skinnyMode == FacetCounterMode::SKINNY_GLOBAL ? false
+            : skinnyMode == FacetCounterMode::SKINNY_LOCAL  ? (mapping.bits != 0)
+            : (mapping.bits != 0 && (domainSize >> 1) >= segFieldInfo.nTerms);
+          if (useLocal) {
             std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
@@ -558,7 +771,9 @@ public:
       } else {
         auto* mapCounts = std::get_if<MergeableStrData::OrdHash>(&mergedData->counts);
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
-        auto* vecCounts   = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
+        auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
+        auto* spanCounts = std::get_if<SpanCounter>(&mergedData->counts);
+        auto* flatCounts = std::get_if<FlatSlotCounter>(&mergedData->counts);
         std::vector<std::pair<int64_t, int64_t>> ordCounts;
         // Collect nonzero counts first. Explicit mincount=0 pads zero-count
         // buckets after sorting/truncating the competitive nonzero buckets.
@@ -576,8 +791,7 @@ public:
               ordCounts.emplace_back(i, (*vecCounts)[i]);
             }
           }
-        } else {
-          assert(skinnyCounts);
+        } else if (skinnyCounts) {
           // first go over the overflow counts
           for (auto [ord, count] : skinnyCounts->overflow) {
             count += skinnyCounts->counts[ord];
@@ -601,7 +815,43 @@ public:
               }
             }
           }
-        }  // end skinnyCounts
+        } else if (spanCounts) {
+          collectSparseCounts(*spanCounts, min, limit, ordCounts);
+        } else {
+          assert(flatCounts);
+          collectSparseCounts(*flatCounts, min, limit, ordCounts);
+        }
+
+        // Bench-only exact per-request counter footprint (set SOLUX_FACET_BYTES).
+        // Process RSS is too coarse for the sparse-cell wins this counter targets,
+        // so report the chosen rep's heap bytes directly. Cached env read = off-path.
+        static const bool logFacetBytes = std::getenv("SOLUX_FACET_BYTES") != nullptr;
+        if (logFacetBytes) {
+          const char* repName = "?";
+          size_t bytes = 0;
+          if (mapCounts) {
+            repName = "hash";
+            bytes = mapCounts->bucket_count()
+                  * (sizeof(MergeableStrData::OrdHash::value_type) + 1);
+          } else if (vecCounts) {
+            repName = "vector";
+            bytes = vecCounts->capacity() * sizeof(int64_t);
+          } else if (skinnyCounts) {
+            repName = "skinny";
+            bytes = skinnyCounts->counts.capacity()
+                  + skinnyCounts->overflow.bucket_count()
+                      * (sizeof(std::pair<int64_t, int64_t>) + 1);
+          } else if (spanCounts) {
+            repName = "span";
+            bytes = spanCounts->bytesUsed();
+          } else if (flatCounts) {
+            repName = "flat";
+            bytes = flatCounts->bytesUsed();
+          }
+          int64_t numOrds = thisOp().ordMap ? thisOp().ordMap->numOrds() : 0;
+          LOG_WARN("FACETBYTES field={} rep={} numOrds={} emitted={} bytes={}",
+                   thisOp().fieldName, repName, numOrds, ordCounts.size(), bytes);
+        }
 
         missing_count = mergedData->missing_num;
 

@@ -150,7 +150,232 @@ public:
   }
 };
 
+class FacetCounterModeGuard {
+  FacetCounterMode saved = StrFacetOp::forcedCounterMode;
+public:
+  ~FacetCounterModeGuard() {
+    StrFacetOp::forcedCounterMode = saved;
+  }
+};
+
 } // namespace
+
+TEST_F(FacetTest, spanCounter) {
+  constexpr size_t maxOrd = 200000;
+  SpanCounter counter(maxOrd);
+
+  counter.increment(3);
+  counter.increment(3, 4);
+  counter.increment(65536);
+  counter.increment(65536, 2);
+  counter.increment(196700, 9);
+  EXPECT_EQ(5, counter.total(3));
+  EXPECT_EQ(3, counter.total(65536));
+  EXPECT_EQ(9, counter.total(196700));
+
+  for (int i = 0; i < 70000; i++) {
+    counter.increment(70000);
+  }
+  counter.increment(131100, 70000);
+  counter.increment(196699, 65536);
+  EXPECT_EQ(70000, counter.total(70000));
+  EXPECT_EQ(70000, counter.total(131100));
+  EXPECT_EQ(65536, counter.total(196699));
+  EXPECT_TRUE(counter.overflow.contains(70000));
+  EXPECT_TRUE(counter.overflow.contains(131100));
+  EXPECT_TRUE(counter.overflow.contains(196699));
+  auto saturated = counter.spans[(size_t)(196699 >> SpanCounter::SPAN_BITS)]
+                              .find((uint16_t)(196699 & SpanCounter::SPAN_MASK));
+  ASSERT_NE(saturated,
+            counter.spans[(size_t)(196699 >> SpanCounter::SPAN_BITS)].end());
+  EXPECT_EQ(0, saturated->second);
+
+  SpanCounter a(maxOrd);
+  a.increment(1, 10);
+  a.increment(70000, 70000);
+  a.increment(190000, 3);
+  SpanCounter b(maxOrd);
+  b.increment(1, 7);
+  b.increment(65540, 5);
+  b.increment(70000, 66000);
+  b.increment(196000, 9);
+
+  a.merge(b);
+  EXPECT_EQ(17, a.total(1));
+  EXPECT_EQ(5, a.total(65540));
+  EXPECT_EQ(136000, a.total(70000));
+  EXPECT_EQ(3, a.total(190000));
+  EXPECT_EQ(9, a.total(196000));
+}
+
+TEST_F(FacetTest, flatSlotCounter) {
+  constexpr size_t largeMaxOrd = (size_t)1 << 34;
+  FlatSlotCounter counter(largeMaxOrd);
+  ASSERT_EQ(5, counter.countBits);
+  ASSERT_EQ(32u, counter.countCap);
+
+  counter.increment(0);
+  counter.increment(0, 4);
+  EXPECT_EQ(5, counter.total(0));
+  size_t zeroOrdSlot = counter.findSlot(0);
+  ASSERT_LT(zeroOrdSlot, counter.capacity);
+  EXPECT_NE(0u, counter.readWord(zeroOrdSlot));
+  EXPECT_EQ(1u, counter.readWord(zeroOrdSlot) >> counter.countBits);
+
+  for (int i = 0; i < 100; i++) {
+    counter.increment(17);
+  }
+  counter.increment(23, 100);
+  EXPECT_EQ(100, counter.total(17));
+  EXPECT_EQ(100, counter.total(23));
+  EXPECT_TRUE(counter.overflow.contains(17));
+  EXPECT_TRUE(counter.overflow.contains(23));
+
+  std::vector<std::pair<int64_t, int64_t>> overflowCounts;
+  collectSparseCounts(counter, 1, 1, overflowCounts);
+  ASSERT_EQ(2u, overflowCounts.size());
+  std::map<int64_t, int64_t> overflowByOrd(overflowCounts.begin(),
+                                           overflowCounts.end());
+  EXPECT_EQ(100, overflowByOrd[17]);
+  EXPECT_EQ(100, overflowByOrd[23]);
+  EXPECT_TRUE(counter.slots.empty());
+
+  FlatSlotCounter grown(1000);
+  for (int64_t ord = 0; ord < 50; ord++) {
+    grown.increment(ord, ord + 1);
+  }
+  EXPECT_EQ(128u, grown.capacity);
+  EXPECT_EQ(50u, grown.distinct());
+  for (int64_t ord = 0; ord < 50; ord++) {
+    EXPECT_EQ(ord + 1, grown.total(ord));
+  }
+
+  FlatSlotCounter a(largeMaxOrd);
+  a.increment(0, 32);
+  a.increment(5, 70);
+  a.increment(100, 3);
+  FlatSlotCounter b(largeMaxOrd);
+  b.increment(0, 7);
+  b.increment(5, 65);
+  b.increment(77, 5);
+  b.increment(200, 96);
+
+  a.merge(b);
+  EXPECT_EQ(39, a.total(0));
+  EXPECT_EQ(135, a.total(5));
+  EXPECT_EQ(5, a.total(77));
+  EXPECT_EQ(3, a.total(100));
+  EXPECT_EQ(96, a.total(200));
+}
+
+TEST_F(FacetTest, spanCounterModesMatchAuto) {
+  CollectionHelper helper;
+  helper.clear();
+  constexpr int segments = 4;
+  constexpr int docsPerSegment = 900;
+  constexpr int categoryCardinality = 2600;
+
+  for (int seg = 0; seg < segments; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve(docsPerSegment);
+    for (int i = 0; i < docsPerSegment; i++) {
+      std::string id = std::format("span-{}-{}", seg, i);
+      std::string category =
+          std::format("cat{:04}", (i * 37 + seg * 613) % categoryCardinality);
+      if (i == 2) {
+        docs.push_back(flatdoc("id", id, "selected_s", "yes"));
+      } else {
+        docs.push_back(flatdoc("id", id, "category_s", category,
+                               "selected_s", i < 3 ? "yes" : "no"));
+      }
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_EQ((size_t)segments,
+            helper.getIndexWriter()->getIndexReader()->segments().size());
+
+  FacetCounterModeGuard guard;
+  auto run = [&](FacetCounterMode mode, int64_t mincount) {
+    StrFacetOp::forcedCounterMode = mode;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs();
+    topDocs.getNumber(true).matchQuery("selected_s", "yes");
+    auto& facet = topDocs.facet("f", "category_s").limit(10).mincount(mincount);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* docs = req->docList("q");
+    EXPECT_NE(nullptr, docs);
+    if (docs == nullptr) {
+      return std::vector<std::byte>{};
+    }
+    const auto* result = docs->ops.at("f")->facetResult();
+    EXPECT_NE(nullptr, result);
+    if (result == nullptr) {
+      return std::vector<std::byte>{};
+    }
+    std::vector<std::byte> encoded;
+    EXPECT_TRUE(api::encode(*result, encoded));
+    return encoded;
+  };
+
+  for (int64_t mincount : {1, 0}) {
+    auto expected = run(FacetCounterMode::AUTO, mincount);
+    EXPECT_EQ(expected, run(FacetCounterMode::SPAN_GLOBAL, mincount));
+    EXPECT_EQ(expected, run(FacetCounterMode::SPAN_LOCAL, mincount));
+    EXPECT_EQ(expected, run(FacetCounterMode::FLAT_GLOBAL, mincount));
+  }
+}
+
+TEST_F(FacetTest, spanCounterTopKOverflowShortCircuit) {
+  // A value appearing > 65536 times overflows the u16 span slot. With a facet
+  // limit <= the number of overflowed values, span emit takes the overflow-first
+  // top-K path (skips the span scan). It must pick the right bucket and must NOT
+  // double-count (the slot low bits + the overflow multiple, counted once).
+  CollectionHelper helper;
+  helper.clear();
+  constexpr int64_t hot = 66000;  // > 65536 -> exactly one overflowed ord
+  std::vector<Doc> docs;
+  docs.reserve(hot + 30);
+  for (int64_t i = 0; i < hot; i++) {
+    docs.push_back(flatdoc("id", std::format("h{}", i), "category_s", "hot"));
+  }
+  for (int i = 0; i < 30; i++) {
+    docs.push_back(flatdoc("id", std::format("c{}", i), "category_s",
+                           std::format("cold{:02}", i % 5)));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  FacetCounterModeGuard guard;
+  auto topBucket = [&](FacetCounterMode mode, int64_t limit) {
+    StrFacetOp::forcedCounterMode = mode;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->facet("f", "category_s").limit(limit);
+    req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    EXPECT_NE(result, nullptr);
+    const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind);
+    return std::pair<std::string, int64_t>(std::string(ids.v[0]), result->counts[0]);
+  };
+
+  // limit 1 <= 1 overflowed ord -> short-circuit fires.
+  for (auto mode : {FacetCounterMode::AUTO, FacetCounterMode::SPAN_GLOBAL,
+                    FacetCounterMode::FLAT_GLOBAL}) {
+    auto [id, cnt] = topBucket(mode, 1);
+    EXPECT_EQ("hot", id);
+    EXPECT_EQ(hot, cnt);  // a double-count bug would report 2*hot
+  }
+  // limit 2 > 1 overflowed ord -> full span scan path; top bucket unchanged.
+  auto [id, cnt] = topBucket(FacetCounterMode::SPAN_GLOBAL, 2);
+  EXPECT_EQ("hot", id);
+  EXPECT_EQ(hot, cnt);
+  std::tie(id, cnt) = topBucket(FacetCounterMode::FLAT_GLOBAL, 2);
+  EXPECT_EQ("hot", id);
+  EXPECT_EQ(hot, cnt);
+}
 
 TEST_F(FacetTest, mergeableStrDataMergeVariants) {
   using Data = StrFacetOp::MergeableStrData;
