@@ -170,6 +170,14 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   ValueProgram* program = parseValue(memory, *schema, "add(score,x_i)");
   auto bound = program->bind(pool, segment);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, bound->bounds(program->rootNode).certainty);
+  ValueBounds scoreInterval = ValueBounds::floating(-2.0, 3.0);
+  scoreInterval.minAttained = false;
+  scoreInterval.maxAttained = false;
+  const ValueBounds& composed = bound->boundsForScore(scoreInterval);
+  ASSERT_EQ(BoundsCertainty::BOUNDED, composed.certainty);
+  EXPECT_DOUBLE_EQ(0.0, composed.doubleMin);
+  EXPECT_DOUBLE_EQ(5.0, composed.doubleMax);
+  EXPECT_EQ(&composed, &bound->boundsForScore(scoreInterval));
   ValueResult result = bound->evalPoint(0, 3.5f);
   ASSERT_TRUE(result.valid);
   EXPECT_DOUBLE_EQ(5.5, result.doubleValue);
@@ -178,6 +186,17 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   auto squareRootBound = squareRoot->bind(pool, segment);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED,
             squareRootBound->bounds(squareRoot->rootNode).certainty);
+  ValueBounds nonNegativeScore = ValueBounds::floating(0.0, 4.0);
+  nonNegativeScore.minAttained = false;
+  nonNegativeScore.maxAttained = false;
+  const ValueBounds& squareRootBounds =
+      squareRootBound->boundsForScore(nonNegativeScore);
+  ASSERT_EQ(BoundsCertainty::BOUNDED, squareRootBounds.certainty);
+  EXPECT_DOUBLE_EQ(0.0, squareRootBounds.doubleMin);
+  EXPECT_DOUBLE_EQ(2.0, squareRootBounds.doubleMax);
+  ValueBounds negativeScore = ValueBounds::floating(-1.0, -1.0);
+  EXPECT_THROW(squareRootBound->boundsForScore(negativeScore),
+               std::runtime_error);
   EXPECT_THROW(squareRootBound->evalPoint(0, -1.0f), std::runtime_error);
 
   ValueProgram* overflowing = parseValue(memory, *schema, "mul(score,1e308)");

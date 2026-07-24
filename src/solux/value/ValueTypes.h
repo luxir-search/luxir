@@ -119,6 +119,8 @@ struct ValueBounds {
   double doubleMin = -std::numeric_limits<double>::infinity();
   double doubleMax = std::numeric_limits<double>::infinity();
 
+  bool operator==(const ValueBounds&) const = default;
+
   static ValueBounds unbounded(ValueType type, bool mayBeMissing = false,
                                bool alwaysMissing = false) {
     ValueBounds out;

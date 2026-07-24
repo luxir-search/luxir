@@ -90,6 +90,9 @@ struct BoundValueNode {
 };
 
 class BoundValueProgram {
+  ValueBounds cachedScoreBounds;
+  bool boundsCached = false;
+
 public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
@@ -105,10 +108,14 @@ public:
                  std::span<ValueResult> results);
   ValueResult evalArrayElement(const ValueArrayRef& array, int64_t index);
   const ValueBounds& bounds(uint32_t node) const { return nodes[node].bounds; }
+  const ValueBounds& boundsForScore(const ValueBounds& scoreBounds);
 
   ValueResult evalColumn(uint32_t node, int32_t docid, float score);
   ValueResult evalConstant(uint32_t node, int32_t docid, float score) const;
   int64_t arraySize(uint32_t node, int32_t docid, float score);
+
+private:
+  void propagateBounds(const ValueBounds& scoreBounds);
 };
 
 // A binding owns only segment-MemPool state. It also clears the caller's

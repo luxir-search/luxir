@@ -730,7 +730,19 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
               missing);
         }
       }
-    } else {
+    }
+  }
+  propagateBounds(ValueBounds::unbounded(ValueType::DOUBLE));
+}
+
+void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
+  for (uint32_t index = 0; index < program.nodes.size(); index++) {
+    const ValueNode& node = program.nodes[index];
+    BoundValueNode& bound = nodes[index];
+    if (node.kind == ValueNodeKind::SCORE) {
+      bound.bounds = scoreBounds;
+      bound.bounds.type = ValueType::DOUBLE;
+    } else if (node.kind == ValueNodeKind::FUNCTION) {
       std::array<ValueBounds, 2> children{};
       for (uint8_t child = 0; child < node.childCount; child++) {
         children[child] = nodes[node.children[child]].bounds;
@@ -742,6 +754,16 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       throwBindInvalid(program, node, bound.bounds);
     }
   }
+  cachedScoreBounds = scoreBounds;
+  boundsCached = true;
+}
+
+const ValueBounds& BoundValueProgram::boundsForScore(
+    const ValueBounds& scoreBounds) {
+  if (!boundsCached || cachedScoreBounds != scoreBounds) {
+    propagateBounds(scoreBounds);
+  }
+  return nodes[program.rootNode].bounds;
 }
 
 ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float score) const {
