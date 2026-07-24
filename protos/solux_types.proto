@@ -195,6 +195,7 @@ message Query {
     GeoBoxQuery geo_box = 13;       // selects GEO_POINT values inside an inclusive bounding box
     GeoDistanceQuery geo_distance = 14; // selects GEO_POINT values within a radius of a center
     BoostQuery boost = 15;          // multiplies every hit score of a wrapped query
+    RescoreQuery rescore = 16;      // preserves matches and replaces each hit's score
 
     // TODO: wildcard query
     // TODO: function?
@@ -221,6 +222,12 @@ message BoostQuery {
   // explicit presence so 0 (legal: matches survive, scores become 0) is
   // representable. Must be finite and >= 0.
   optional float boost = 2;
+}
+
+message RescoreQuery {
+  Query query = 1;
+  string expr = 2;
+  map<string, Val> vars = 3;
 }
 
 // Nearest-neighbor query against a searchable vector field.  Exact flat search

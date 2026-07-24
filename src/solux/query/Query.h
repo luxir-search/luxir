@@ -882,6 +882,9 @@ public:
       skipCount(SkipStats::maxScoreSetupFallbackBlockBounds);
       return advanceShallow(target);
     }
+    virtual std::string_view pruningBlockerForDebug() const {
+      return {};
+    }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };

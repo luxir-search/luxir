@@ -352,6 +352,8 @@ struct from<JSON, solux::api::Query> {
             arm(std::in_place_type<api::GeoDistanceQuery>);
           } else if (key == "boost") {
             arm(std::in_place_type<api::BoostQuery>);
+          } else if (key == "rescore") {
+            arm(std::in_place_type<api::RescoreQuery>);
           } else if (key == "expr") {
             arm(std::in_place_type<api::ExprQuery>);
           } else {

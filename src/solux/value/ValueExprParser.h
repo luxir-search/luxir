@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -62,10 +63,82 @@ public:
     program->rootNode = parseValue();
     cur.skipWs();
     if (!cur.atEnd()) fail(cur.position(), "unexpected trailing input");
+    program->constantScalar = findConstantScalar();
     return program;
   }
 
 private:
+  std::optional<ValueResult> findConstantScalar() const {
+    std::vector<std::optional<ValueBounds>> bounds(program->nodes.size());
+    for (uint32_t index = 0; index < program->nodes.size(); index++) {
+      const ValueNode& node = program->nodes[index];
+      if (node.kind == ValueNodeKind::CONSTANT
+          || node.kind == ValueNodeKind::VARIABLE) {
+        if (node.type == ValueType::INT64) {
+          bounds[index] = ValueBounds::integer(node.intValue, node.intValue);
+        } else if (node.type == ValueType::DOUBLE) {
+          bounds[index] =
+              ValueBounds::floating(node.doubleValue, node.doubleValue);
+        } else if (node.arraySize != 0) {
+          if (node.type == ValueType::INT64_ARRAY) {
+            auto begin = program->intArrays.begin() + node.arrayOffset;
+            auto extrema =
+                std::minmax_element(begin, begin + node.arraySize);
+            ValueBounds value =
+                ValueBounds::integer(*extrema.first, *extrema.second);
+            value.type = node.type;
+            bounds[index] = value;
+          } else {
+            auto begin = program->doubleArrays.begin() + node.arrayOffset;
+            auto extrema =
+                std::minmax_element(begin, begin + node.arraySize);
+            ValueBounds value =
+                ValueBounds::floating(*extrema.first, *extrema.second);
+            value.type = node.type;
+            bounds[index] = value;
+          }
+        }
+      } else if (node.kind == ValueNodeKind::FUNCTION) {
+        std::array<ValueBounds, 2> children;
+        bool independent = true;
+        for (uint8_t child = 0; child < node.childCount; child++) {
+          const auto& childBounds = bounds[node.children[child]];
+          if (!childBounds.has_value()) {
+            independent = false;
+            break;
+          }
+          children[child] = *childBounds;
+        }
+        if (independent) {
+          ValueBounds value = node.function->boundsPropagate(
+              node, std::span<const ValueBounds>(
+                        children.data(), node.childCount));
+          if (value.certainty != BoundsCertainty::INVALID) {
+            bounds[index] = value;
+          }
+        }
+      }
+    }
+
+    const auto& rootBounds = bounds[program->rootNode];
+    ValueType rootType = program->root().type;
+    if (!rootBounds.has_value()
+        || rootBounds->certainty != BoundsCertainty::BOUNDED
+        || rootBounds->mayBeMissing || rootBounds->alwaysMissing
+        || valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
+      return std::nullopt;
+    }
+    if (rootType == ValueType::INT64
+        && rootBounds->intMin == rootBounds->intMax) {
+      return ValueResult::integer(rootBounds->intMin);
+    }
+    if (rootType == ValueType::DOUBLE
+        && rootBounds->doubleMin == rootBounds->doubleMax) {
+      return ValueResult::floating(rootBounds->doubleMin);
+    }
+    return std::nullopt;
+  }
+
   [[noreturn]] void fail(size_t pos, std::string_view message) const {
     size_t from = pos > 20 ? pos - 20 : 0;
     throw std::runtime_error(fmt::format(

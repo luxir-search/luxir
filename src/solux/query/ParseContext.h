@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include <google/protobuf/arena.h>
+
 #include "solux/api/solux_types.hpp"
 #include "solux/schema/Schema.h"
 #include "solux/util/Clock.h"
@@ -20,6 +22,7 @@ namespace solux {
 struct ParseContext {
   MemPool& pool;
   Schema& schema;
+  google::protobuf::Arena& arena;
   // Warning message views must outlive response serialization; warn() copies
   // the message into the pool (whose lifetime spans the request).  May be
   // null when there is nowhere to surface warnings (direct engine tests).
@@ -41,10 +44,11 @@ struct ParseContext {
   // call site cannot silently fall back to UTC.
   CoerceContext coerceContext;
 
-  ParseContext(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
+  ParseContext(MemPool& pool, Schema& schema, google::protobuf::Arena& arena,
+               const CoerceContext& coerceContext,
                std::string_view opName,
                std::vector<api::Warning>* warnings = nullptr)
-    : pool(pool), schema(schema), warnings(warnings), opName(opName),
+    : pool(pool), schema(schema), arena(arena), warnings(warnings), opName(opName),
       coerceContext(coerceContext) {}
 
   // code must be a string with static storage duration (a literal).

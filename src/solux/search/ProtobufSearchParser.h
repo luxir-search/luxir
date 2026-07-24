@@ -615,7 +615,7 @@ public:
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
     ParseContext parseContext{
-      req.requestPool, *req.schema,
+      req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
@@ -751,7 +751,7 @@ public:
     }
 
     ParseContext parseContext{
-      req.requestPool, *req.schema,
+      req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseNamedFilters(parser, fusionProto.filter);

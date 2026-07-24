@@ -17,9 +17,11 @@
 #include "solux/query/GeoBoxQuery.h"
 #include "solux/query/GeoDistanceQuery.h"
 #include "solux/query/KnnQuery.h"
+#include "solux/query/RescoreQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/api/solux_types.hpp"
 #include "solux/util/Overloaded.h"
+#include "solux/value/ValueExprParser.h"
 
 namespace solux {
 
@@ -378,6 +380,61 @@ public:
     return pool.make<solux::BoostQuery>(parse(*boostQuery.query), boost);
   }
 
+  static std::optional<float> constantOutput(const ValueProgram& program) {
+    if (!program.constantScalar.has_value()) {
+      return std::nullopt;
+    }
+    const ValueResult& result = *program.constantScalar;
+    constexpr double MAX_FLOAT = (double)std::numeric_limits<float>::max();
+    if (result.type == ValueType::DOUBLE) {
+      double value = result.doubleValue;
+      if (!std::isfinite(value) || value < -MAX_FLOAT || value > MAX_FLOAT) {
+        throw std::runtime_error(
+            "RescoreQuery constant is outside the finite float score range");
+      }
+      return (float)value;
+    }
+    return (float)result.intValue;
+  }
+
+  static bool exactlyRepresented(const ValueResult& result, float value) {
+    return result.type == ValueType::DOUBLE
+        ? (double)value == result.doubleValue
+        : (long double)value == (long double)result.intValue;
+  }
+
+  solux::Query* parseRescore(const solux::api::RescoreQuery& rescoreQuery) {
+    if (!rescoreQuery.query.has_value()
+        || rescoreQuery.query->kind.index() == 0) {
+      throw std::runtime_error("RescoreQuery requires a child query");
+    }
+    if (rescoreQuery.expr.empty()) {
+      throw std::runtime_error("RescoreQuery requires a non-empty expression");
+    }
+    ValueExprOptions options;
+    options.schema = &schema;
+    options.vars = rescoreQuery.vars;
+    options.nestingBudget = &context.nestingBudget;
+    ValueProgram* program =
+        ValueExprParser(options, context.arena).parse(rescoreQuery.expr);
+    ValueType rootType = program->root().type;
+    if (valueArray(rootType) || rootType == ValueType::COLUMN_ONLY) {
+      throw std::runtime_error(
+          "RescoreQuery expression must produce a scalar numeric value");
+    }
+
+    solux::Query* child = parse(*rescoreQuery.query);
+    if (program->root().kind == ValueNodeKind::SCORE) {
+      return child;
+    }
+    std::optional<float> constant = constantOutput(*program);
+    if (constant.has_value()
+        && exactlyRepresented(*program->constantScalar, *constant)) {
+      return pool.make<solux::ConstantScoreQuery>(child, *constant);
+    }
+    return pool.make<solux::RescoreQuery>(child, program, constant);
+  }
+
   solux::Query* parse(const solux::api::Query& pquery) {
     // The one recursion choke point for structured trees: every nested node
     // passes through here, so the shared budget bounds tree depth no matter
@@ -402,6 +459,9 @@ public:
       [&](const solux::api::BooleanQuery& b) -> solux::Query* { return parseBoolean(b); },
       [&](const solux::api::ConstantScoreQuery& c) -> solux::Query* { return parseConstantScore(c); },
       [&](const solux::api::BoostQuery& b) -> solux::Query* { return parseBoost(b); },
+      [&](const solux::api::RescoreQuery& r) -> solux::Query* {
+        return parseRescore(r);
+      },
       // Unset oneof selects all documents, same as the explicit `all` arm.
       [&](std::monostate) -> solux::Query* { return pool.make<solux::AllQuery>(); },
     }, pquery.kind);

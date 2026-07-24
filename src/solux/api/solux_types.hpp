@@ -99,7 +99,7 @@ namespace solux::api {
 // ---- forward declarations (all messages) ----
 struct Target; struct SearchRequest; struct SearchOp; struct GenOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
-struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
+struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
 struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
@@ -443,6 +443,11 @@ struct BoostQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> boost;
 };
+struct RescoreQuery {
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::string_view expr;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+};
 struct SimpleQuery {
   using Operator = solux::api::Match_::Operator;
   std::string_view q;
@@ -475,10 +480,10 @@ struct ExprQuery {                                             // map value indi
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
-struct Query {                                                 // needs Match,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,Boost
+struct Query {                                                 // needs Match,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,Boost,Rescore
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
-               GeoBoxQuery, GeoDistanceQuery, BoostQuery>
+               GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery>
       kind;
 };
 struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
@@ -502,7 +507,7 @@ struct UpdateRequest {                                         // needs Target,C
 SOLUX_TD(Target) SOLUX_TD(SearchRequest) SOLUX_TD(SearchOp) SOLUX_TD(GenOp) SOLUX_TD(TopDocs)
 SOLUX_TD(Fusion) SOLUX_TD(RrfFusion) SOLUX_TD(SortSpec) SOLUX_TD(Query)
 SOLUX_TD(ExistsQuery)
-SOLUX_TD(ConstantScoreQuery) SOLUX_TD(BoostQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
+SOLUX_TD(ConstantScoreQuery) SOLUX_TD(BoostQuery) SOLUX_TD(RescoreQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
 SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery) SOLUX_TD(RangeQuery)
 SOLUX_TD(GeoBoxQuery) SOLUX_TD(GeoDistanceQuery) SOLUX_TD(ExprQuery)
 SOLUX_TD(Warning) SOLUX_TD(ExecutionProfile) SOLUX_TD(ExecutionProfileOp)
@@ -529,7 +534,7 @@ SOLUX_TD(SchemaRequest) SOLUX_TD(SchemaResponse) SOLUX_TD(UpdateResponse_::Error
                  std::string *error = nullptr);
 SOLUX_ENTRY(Target) SOLUX_ENTRY(SearchRequest) SOLUX_ENTRY(SearchOp) SOLUX_ENTRY(GenOp)
 SOLUX_ENTRY(TopDocs) SOLUX_ENTRY(Fusion) SOLUX_ENTRY(RrfFusion) SOLUX_ENTRY(SortSpec)
-SOLUX_ENTRY(Query) SOLUX_ENTRY(ExistsQuery) SOLUX_ENTRY(ConstantScoreQuery) SOLUX_ENTRY(BoostQuery)
+SOLUX_ENTRY(Query) SOLUX_ENTRY(ExistsQuery) SOLUX_ENTRY(ConstantScoreQuery) SOLUX_ENTRY(BoostQuery) SOLUX_ENTRY(RescoreQuery)
 SOLUX_ENTRY(KnnQuery) SOLUX_ENTRY(Match) SOLUX_ENTRY(NamedQuery) SOLUX_ENTRY(BooleanQuery)
 SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(SimpleQuery)
 SOLUX_ENTRY(RangeQuery) SOLUX_ENTRY(GeoBoxQuery) SOLUX_ENTRY(GeoDistanceQuery) SOLUX_ENTRY(ExprQuery)

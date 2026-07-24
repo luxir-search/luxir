@@ -936,7 +936,13 @@ private:
 
     api::Query* q = allocQuery();
     bool known =
-        expr::withCallableArm(*q, name.text, [&](auto& arm) { parseArgs(name.text, arm); });
+        expr::withCallableArm(*q, name.text, [&](auto& arm) {
+          parseArgs(name.text, arm);
+          if constexpr (std::is_same_v<std::remove_cvref_t<decltype(arm)>,
+                                       api::RescoreQuery>) {
+            arm.vars = opts.vars;
+          }
+        });
     if (!known) fail(name.pos, fmt::format("unknown query function '{}'", name.text));
     return q;
   }
@@ -947,7 +953,7 @@ private:
     if (cur.consume(')')) return;
 
     bool sawNamed = false;
-    bool sawPositional = false;
+    int positionalCount = 0;
     std::pmr::vector<std::string_view> seen(&mr);
     for (;;) {
       cur.skipWs();
@@ -966,17 +972,20 @@ private:
         if (!found) fail(argPos, fmt::format("unknown argument '{}' for {}()", argName, fn));
       } else {
         if (sawNamed) fail(argPos, "positional argument after named arguments");
-        if (sawPositional) {
-          fail(argPos, fmt::format("{}() takes one positional argument; name the others", fn));
-        }
-        sawPositional = true;
-        std::string_view main = expr::mainValueArg(fn);
-        if (main.empty()) {
+        std::string_view arg = positionalCount == 0
+            ? expr::mainValueArg(fn) : expr::valueExprArg(fn);
+        if (arg.empty()) {
+          if (positionalCount != 0) {
+            fail(argPos, fmt::format(
+                "{}() takes one positional argument; name the others", fn));
+          }
           fail(argPos, fmt::format("{}() takes only named arguments (name=value)", fn));
         }
+        positionalCount++;
         bool found = expr::withMember(
-            arm, main, [&](auto& member) { assignPositional(fn, main, argPos, member); });
-        if (!found) fail(argPos, fmt::format("internal: {}() main value '{}' not found", fn, main));
+            arm, arg, [&](auto& member) { assignPositional(fn, arg, argPos, member); });
+        if (!found) fail(argPos, fmt::format(
+            "internal: {}() positional value '{}' not found", fn, arg));
       }
 
       cur.skipWs();
@@ -1019,7 +1028,8 @@ private:
   void assignArg(std::string_view fn, std::string_view argName, size_t argPos, M& member) {
     using T = std::remove_cvref_t<M>;
     if constexpr (std::is_same_v<T, std::string_view>) {
-      member = parseStringValue(argName);
+      member = argName == expr::valueExprArg(fn)
+          ? parseRawText(fn) : parseStringValue(argName);
     } else if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
                          std::is_same_v<T, float> || std::is_same_v<T, double>) {
       member = parseNumberValue<T>(argName);

@@ -765,6 +765,17 @@ const ValueBounds& BoundValueProgram::boundsForScore(
   return nodes[program.rootNode].bounds;
 }
 
+std::string_view BoundValueProgram::firstUnboundedNode() const {
+  for (uint32_t index = 0; index < program.nodes.size(); index++) {
+    const ValueBounds& valueBounds = nodes[index].bounds;
+    if (valueBounds.certainty != BoundsCertainty::BOUNDED
+        || valueBounds.mayBeMissing || valueBounds.alwaysMissing) {
+      return program.nodes[index].text;
+    }
+  }
+  return {};
+}
+
 ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float score) const {
   const ValueNode& node = program.nodes[index];
   if (node.type == ValueType::INT64) return ValueResult::integer(node.intValue);

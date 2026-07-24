@@ -57,6 +57,7 @@ public:
   std::pmr::vector<ValueNode> nodes;
   std::pmr::vector<int64_t> intArrays;
   std::pmr::vector<double> doubleArrays;
+  std::optional<ValueResult> constantScalar;
   uint32_t rootNode = 0;
   bool needsScore = false;
 
@@ -109,6 +110,7 @@ public:
   ValueResult evalArrayElement(const ValueArrayRef& array, int64_t index);
   const ValueBounds& bounds(uint32_t node) const { return nodes[node].bounds; }
   const ValueBounds& boundsForScore(const ValueBounds& scoreBounds);
+  std::string_view firstUnboundedNode() const;
 
   ValueResult evalColumn(uint32_t node, int32_t docid, float score);
   ValueResult evalConstant(uint32_t node, int32_t docid, float score) const;
