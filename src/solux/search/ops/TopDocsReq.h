@@ -257,7 +257,7 @@ public:
       // a new domain and just use the existing one.
       // TODO: put a type field on the query and replace this dynamic cast.
       bool matchEverything = (dynamic_cast<AllQuery*>(op.query) != nullptr) && thisOp().filters.empty();
-      MergeableCollector* data = nullptr;
+      std::unique_ptr<MergeableCollector> data;
       int64_t numSegs = (int64_t)op.req.reader->segments().size();
 
       {
@@ -266,7 +266,8 @@ public:
         auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
-        data = collectorMerger.obtain();
+        // Keep ownership until release so a scoring error cannot orphan it.
+        data.reset(collectorMerger.obtain());
 
         std::optional<DocSetBuilder> builder;
         if (output.size() > 0) {
@@ -476,7 +477,7 @@ public:
       // Releasing the collector as soon as possible can save merging work.
       // On the other hand, it could delay the sub-calculators and spoil
       // the domain (which should be in the CPU cache).
-      auto count = collectorMerger.release(data);
+      auto count = collectorMerger.release(data.release());
       if (count == numSegs) {
         // we are done, so we can call the callback
         // we could use a nested task_group to wait until we are done here as well.
