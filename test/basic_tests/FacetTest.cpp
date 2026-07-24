@@ -208,66 +208,6 @@ TEST_F(FacetTest, spanCounter) {
   EXPECT_EQ(9, a.total(196000));
 }
 
-TEST_F(FacetTest, flatSlotCounter) {
-  constexpr size_t largeMaxOrd = (size_t)1 << 34;
-  FlatSlotCounter counter(largeMaxOrd);
-  ASSERT_EQ(5, counter.countBits);
-  ASSERT_EQ(32u, counter.countCap);
-
-  counter.increment(0);
-  counter.increment(0, 4);
-  EXPECT_EQ(5, counter.total(0));
-  size_t zeroOrdSlot = counter.findSlot(0);
-  ASSERT_LT(zeroOrdSlot, counter.capacity);
-  EXPECT_NE(0u, counter.readWord(zeroOrdSlot));
-  EXPECT_EQ(1u, counter.readWord(zeroOrdSlot) >> counter.countBits);
-
-  for (int i = 0; i < 100; i++) {
-    counter.increment(17);
-  }
-  counter.increment(23, 100);
-  EXPECT_EQ(100, counter.total(17));
-  EXPECT_EQ(100, counter.total(23));
-  EXPECT_TRUE(counter.overflow.contains(17));
-  EXPECT_TRUE(counter.overflow.contains(23));
-
-  std::vector<std::pair<int64_t, int64_t>> overflowCounts;
-  collectSparseCounts(counter, 1, 1, overflowCounts);
-  ASSERT_EQ(2u, overflowCounts.size());
-  std::map<int64_t, int64_t> overflowByOrd(overflowCounts.begin(),
-                                           overflowCounts.end());
-  EXPECT_EQ(100, overflowByOrd[17]);
-  EXPECT_EQ(100, overflowByOrd[23]);
-  EXPECT_TRUE(counter.slots.empty());
-
-  FlatSlotCounter grown(1000);
-  for (int64_t ord = 0; ord < 50; ord++) {
-    grown.increment(ord, ord + 1);
-  }
-  EXPECT_EQ(128u, grown.capacity);
-  EXPECT_EQ(50u, grown.distinct());
-  for (int64_t ord = 0; ord < 50; ord++) {
-    EXPECT_EQ(ord + 1, grown.total(ord));
-  }
-
-  FlatSlotCounter a(largeMaxOrd);
-  a.increment(0, 32);
-  a.increment(5, 70);
-  a.increment(100, 3);
-  FlatSlotCounter b(largeMaxOrd);
-  b.increment(0, 7);
-  b.increment(5, 65);
-  b.increment(77, 5);
-  b.increment(200, 96);
-
-  a.merge(b);
-  EXPECT_EQ(39, a.total(0));
-  EXPECT_EQ(135, a.total(5));
-  EXPECT_EQ(5, a.total(77));
-  EXPECT_EQ(3, a.total(100));
-  EXPECT_EQ(96, a.total(200));
-}
-
 TEST_F(FacetTest, spanCounterModesMatchAuto) {
   CollectionHelper helper;
   helper.clear();
@@ -324,7 +264,6 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
     auto expected = run(FacetCounterMode::AUTO, mincount);
     EXPECT_EQ(expected, run(FacetCounterMode::SPAN_GLOBAL, mincount));
     EXPECT_EQ(expected, run(FacetCounterMode::SPAN_LOCAL, mincount));
-    EXPECT_EQ(expected, run(FacetCounterMode::FLAT_GLOBAL, mincount));
   }
 }
 
@@ -362,17 +301,13 @@ TEST_F(FacetTest, spanCounterTopKOverflowShortCircuit) {
   };
 
   // limit 1 <= 1 overflowed ord -> short-circuit fires.
-  for (auto mode : {FacetCounterMode::AUTO, FacetCounterMode::SPAN_GLOBAL,
-                    FacetCounterMode::FLAT_GLOBAL}) {
+  for (auto mode : {FacetCounterMode::AUTO, FacetCounterMode::SPAN_GLOBAL}) {
     auto [id, cnt] = topBucket(mode, 1);
     EXPECT_EQ("hot", id);
     EXPECT_EQ(hot, cnt);  // a double-count bug would report 2*hot
   }
   // limit 2 > 1 overflowed ord -> full span scan path; top bucket unchanged.
   auto [id, cnt] = topBucket(FacetCounterMode::SPAN_GLOBAL, 2);
-  EXPECT_EQ("hot", id);
-  EXPECT_EQ(hot, cnt);
-  std::tie(id, cnt) = topBucket(FacetCounterMode::FLAT_GLOBAL, 2);
   EXPECT_EQ("hot", id);
   EXPECT_EQ(hot, cnt);
 }

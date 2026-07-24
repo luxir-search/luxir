@@ -7,7 +7,6 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include "FacetEmit.h"
 #include "FacetOp.h"
-#include "FlatSlotCounter.h"
 #include "SkinnyCounter.h"
 #include "SpanCounter.h"
 #include "solux/util/SegmentMergeDriver.h"
@@ -18,21 +17,20 @@ namespace solux {
 // Test/bench control (SOLUX_FACET_COUNTER). AUTO uses the selector; the rest
 // force a specific representation so the grid can compare reps head to head and
 // measure the crossover thresholds. The FORCE_* modes reuse the selector's own
-// count strategies (they only override which rep is chosen); the sparse SPAN_*/
-// FLAT_* modes take the dedicated sparse fork.
+// count strategies (they only override which rep is chosen); the SPAN_* modes
+// take the dedicated sparse fork.
 enum class FacetCounterMode {
-  AUTO, SPAN_GLOBAL, SPAN_LOCAL, FLAT_GLOBAL,
+  AUTO, SPAN_GLOBAL, SPAN_LOCAL,
   FORCE_VECTOR, FORCE_SKINNY, FORCE_HASH,
   // Force the skinny rep AND its global-vs-local staging strategy, for measuring
   // the staging crossover on a multi-segment index (moot at one segment).
   SKINNY_GLOBAL, SKINNY_LOCAL
 };
 
-// The SPAN_*/FLAT_* modes drive the dedicated sparse fork; everything else runs
-// the ordinary selector path (with FORCE_* pinning its rep choice).
+// The SPAN_* modes drive the dedicated sparse fork; everything else runs the
+// ordinary selector path (with FORCE_* pinning its rep choice).
 inline bool isSparseForcedMode(FacetCounterMode m) {
-  return m == FacetCounterMode::SPAN_GLOBAL || m == FacetCounterMode::SPAN_LOCAL
-      || m == FacetCounterMode::FLAT_GLOBAL;
+  return m == FacetCounterMode::SPAN_GLOBAL || m == FacetCounterMode::SPAN_LOCAL;
 }
 
 // FORCE_SKINNY (auto staging) and SKINNY_GLOBAL/SKINNY_LOCAL (forced staging)
@@ -52,9 +50,6 @@ inline FacetCounterMode parseFacetCounterModeEnv() {
     }
     if (s == "span_local") {
       return FacetCounterMode::SPAN_LOCAL;
-    }
-    if (s == "flat_global") {
-      return FacetCounterMode::FLAT_GLOBAL;
     }
     if (s == "vector") {
       return FacetCounterMode::FORCE_VECTOR;
@@ -154,7 +149,7 @@ public:
     using OrdHash = boost::unordered_flat_map<int64_t, int64_t>;
     using CountVector = std::vector<int64_t>;
     std::variant<std::monostate, OrdHash, SkinnyCounter8, CountVector,
-                 SpanCounter, FlatSlotCounter> counts;
+                 SpanCounter> counts;
     int64_t missing_num = 0; // number of missing values in this segment
 
     template<typename Counter>
@@ -188,10 +183,6 @@ public:
         return a;
       }
 
-      if (std::holds_alternative<FlatSlotCounter>(a->counts)
-          || std::holds_alternative<FlatSlotCounter>(b->counts)) {
-        return mergeSparse<FlatSlotCounter>(a, b);
-      }
       if (std::holds_alternative<SpanCounter>(a->counts)
           || std::holds_alternative<SpanCounter>(b->counts)) {
         return mergeSparse<SpanCounter>(a, b);
@@ -280,7 +271,7 @@ public:
       return a;
     }
 
-    enum class Rep { Vector, Hash, Skinny, Span, Flat };
+    enum class Rep { Vector, Hash, Skinny, Span };
 
     // Make `data.counts` the requested representation, sized for globVals,
     // folding any existing (smaller) counts in.  This is the storage-upgrade a
@@ -326,9 +317,6 @@ public:
             break;
           case Rep::Span:
             data.counts.emplace<SpanCounter>((size_t)globVals);
-            break;
-          case Rep::Flat:
-            data.counts.emplace<FlatSlotCounter>((size_t)globVals);
             break;
         }
       }
@@ -567,36 +555,24 @@ public:
         };
 
         if (isSparseForcedMode(StrFacetOp::forcedCounterMode)) {
-          bool useFlat =
-              StrFacetOp::forcedCounterMode == FacetCounterMode::FLAT_GLOBAL;
-          MergeableStrData::ensureRep(
-              data, useFlat ? MergeableStrData::Rep::Flat
-                            : MergeableStrData::Rep::Span,
-              globVals);
+          MergeableStrData::ensureRep(data, MergeableStrData::Rep::Span, globVals);
           auto* countSpan = std::get_if<SpanCounter>(&data.counts);
-          auto* countFlat = std::get_if<FlatSlotCounter>(&data.counts);
-          assert(useFlat ? countFlat != nullptr : countSpan != nullptr);
+          assert(countSpan != nullptr);
           if (profile != nullptr) {
             profile->wire.cardinality = globVals;
-            profile->wire.strategy = useFlat ? "flat_global"
-                : StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL
+            profile->wire.strategy =
+                StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL
                     ? "span_global"
                     : "span_local";
             profile->details.emplace_back(domainDesc(
                 domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
           }
-          auto collectGlobal = [&](auto& counter) {
+          if (StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL) {
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
                 unused(docid);
-                counter.increment(mapping.globalOrd((int64_t)localOrd - 1));
+                countSpan->increment(mapping.globalOrd((int64_t)localOrd - 1));
               });
-          };
-          if (useFlat) {
-            collectGlobal(*countFlat);
-          } else if (StrFacetOp::forcedCounterMode
-                     == FacetCounterMode::SPAN_GLOBAL) {
-            collectGlobal(*countSpan);
           } else {
             std::vector<uint32_t> localCounts(segFieldInfo.nTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
@@ -773,7 +749,6 @@ public:
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
         auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
         auto* spanCounts = std::get_if<SpanCounter>(&mergedData->counts);
-        auto* flatCounts = std::get_if<FlatSlotCounter>(&mergedData->counts);
         std::vector<std::pair<int64_t, int64_t>> ordCounts;
         // Collect nonzero counts first. Explicit mincount=0 pads zero-count
         // buckets after sorting/truncating the competitive nonzero buckets.
@@ -815,11 +790,9 @@ public:
               }
             }
           }
-        } else if (spanCounts) {
-          collectSparseCounts(*spanCounts, min, limit, ordCounts);
         } else {
-          assert(flatCounts);
-          collectSparseCounts(*flatCounts, min, limit, ordCounts);
+          assert(spanCounts);
+          collectSparseCounts(*spanCounts, min, limit, ordCounts);
         }
 
         // Bench-only exact per-request counter footprint (set SOLUX_FACET_BYTES).
@@ -844,9 +817,6 @@ public:
           } else if (spanCounts) {
             repName = "span";
             bytes = spanCounts->bytesUsed();
-          } else if (flatCounts) {
-            repName = "flat";
-            bytes = flatCounts->bytesUsed();
           }
           int64_t numOrds = thisOp().ordMap ? thisOp().ordMap->numOrds() : 0;
           LOG_WARN("FACETBYTES field={} rep={} numOrds={} emitted={} bytes={}",
