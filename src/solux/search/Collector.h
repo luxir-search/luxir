@@ -635,6 +635,7 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                 "collectTopKWindowed is only for score top-k collectors");
 
   assert(bulk != nullptr);
+  bulk->setTopKDepth(collector.topCount);
   int32_t cursor = 0;
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {

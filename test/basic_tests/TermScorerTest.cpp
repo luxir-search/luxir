@@ -169,6 +169,19 @@ struct MandOptBulkGuard {
   }
 };
 
+struct DenseScoredGuard {
+  bool saved;
+
+  explicit DenseScoredGuard(bool disabled)
+    : saved(BooleanQuery::ConjunctionBulkScorer::disableDenseScoredForTests) {
+    BooleanQuery::ConjunctionBulkScorer::disableDenseScoredForTests = disabled;
+  }
+
+  ~DenseScoredGuard() {
+    BooleanQuery::ConjunctionBulkScorer::disableDenseScoredForTests = saved;
+  }
+};
+
 struct FilterMaskProbeGuard {
   bool saved;
 
@@ -5857,6 +5870,128 @@ TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
   EXPECT_LT(SkipStats::countBulkFillCalls,
             SkipStats::conjDenseCountWindows * (int64_t) terms.size());
   SkipStats::enabled = savedStats;
+}
+
+TEST_F(TermScorerTest, conjunctionDenseScoredLatchBackResumesExactScoring) {
+  DenseScoredGuard denseScoredGuard(false);
+  SkipStatsGuard stats;
+
+  const int32_t N = 10 * DocsEnumMeta::L1_DOCS + 37;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    appendRepeatedTerm(body, "latch_a", 1 + (doc % 5));
+    appendRepeatedTerm(body, "latch_b", 1 + ((doc / 7) % 4));
+    appendRepeatedTerm(body, "filler", 1 + (doc % 3));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 2> terms = {"latch_a", "latch_b"};
+  auto queries = makeTermQueries(terms);
+  auto mandatory = queryPointers(queries);
+  std::span<Query*> empty;
+  constexpr int32_t topK = 100;
+
+  BooleanQuery pullQuery(
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      empty, empty, empty);
+  auto* pullWeight = pullQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* pullScorer = pullWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(pullScorer, nullptr);
+  TopDocsCollector pullCollector(topK);
+  collectTopK(0, pullScorer, nullptr, nullptr, pullCollector,
+              /*allowPruning=*/false);
+
+  BooleanQuery bulkQuery(
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      empty, empty, empty);
+  auto* bulkWeight = bulkQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = bulkWeight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(
+      supplier->bulkScorer(testIndex.pool));
+  ASSERT_NE(bulk, nullptr);
+  TopDocsCollector bulkCollector(topK);
+  collectTopKWindowed(0, bulk, nullptr, bulkCollector, nullptr,
+                      segment.maxDoc(), /*allowPruning=*/false);
+
+  EXPECT_EQ(bulk->denseScoredSampleWindowsForTests(), 8);
+  EXPECT_FALSE(bulk->denseScoredCostRejectedForTests());
+  EXPECT_TRUE(bulk->denseScoredLatchedBackForTests());
+  EXPECT_EQ(SkipStats::conjDenseScoredWindows, 8);
+  EXPECT_EQ(SkipStats::conjDenseScoredAdmits, 0);
+  EXPECT_EQ(SkipStats::conjDenseScoredLatchBacks, 1);
+  EXPECT_EQ(SkipStats::conjDenseScoredCostRejects, 0);
+  EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
+  assertTopKEquivalent(
+      sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
+}
+
+TEST_F(TermScorerTest, conjunctionDenseScoredRejectsAsymmetricClauseCosts) {
+  DenseScoredGuard denseScoredGuard(false);
+  SkipStatsGuard stats;
+
+  const int32_t N = DocsEnumMeta::L1_DOCS + 37;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "producer";
+    if ((doc % 10) == 0) body += " lead";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 2> terms = {"lead", "producer"};
+  auto queries = makeTermQueries(terms);
+  auto mandatory = queryPointers(queries);
+  std::span<Query*> empty;
+  constexpr int32_t topK = 100;
+
+  BooleanQuery pullQuery(
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      empty, empty, empty);
+  auto* pullWeight = pullQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* pullScorer = pullWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(pullScorer, nullptr);
+  TopDocsCollector pullCollector(topK);
+  collectTopK(0, pullScorer, nullptr, nullptr, pullCollector,
+              /*allowPruning=*/false);
+
+  BooleanQuery bulkQuery(
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      empty, empty, empty);
+  auto* bulkWeight = bulkQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = bulkWeight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(
+      supplier->bulkScorer(testIndex.pool));
+  ASSERT_NE(bulk, nullptr);
+  TopDocsCollector bulkCollector(topK);
+  collectTopKWindowed(0, bulk, nullptr, bulkCollector, nullptr,
+                      segment.maxDoc(), /*allowPruning=*/false);
+
+  EXPECT_TRUE(bulk->denseScoredCostRejectedForTests());
+  EXPECT_EQ(bulk->denseScoredSampleWindowsForTests(), 0);
+  EXPECT_FALSE(bulk->denseScoredLatchedBackForTests());
+  EXPECT_EQ(SkipStats::conjDenseScoredWindows, 0);
+  EXPECT_EQ(SkipStats::conjDenseScoredAdmits, 0);
+  EXPECT_EQ(SkipStats::conjDenseScoredLatchBacks, 0);
+  EXPECT_EQ(SkipStats::conjDenseScoredCostRejects, 1);
+  EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
+  assertTopKEquivalent(
+      sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
 }
 
 TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {

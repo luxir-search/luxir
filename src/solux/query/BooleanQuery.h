@@ -1049,10 +1049,13 @@ public:
         if (entries.size() < 2) {
           return nullptr;
         }
-        int64_t leadCost = std::numeric_limits<int64_t>::max();
-        for (auto& e : entries) leadCost = std::min(leadCost, e.cost);
         std::sort(entries.begin(), entries.end(),
                   [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+        int64_t leadCost = entries[0].cost;
+        int64_t nonLeadCost = 0;
+        for (size_t i = 1; i < entries.size(); i++) {
+          nonLeadCost += entries[i].cost;
+        }
         auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
         for (size_t i = 0; i < entries.size(); i++) {
           Query::Scorer* scorer;
@@ -1083,7 +1086,8 @@ public:
           arr[i] = scorer;
         }
         return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
-            targetPool, std::span<Query::Scorer*>(arr, entries.size()), segment.maxDoc(), leadCost);
+            targetPool, std::span<Query::Scorer*>(arr, entries.size()),
+            segment.maxDoc(), leadCost, nonLeadCost, !exhaustive);
       }
 
       BulkScorer* mandOptBulkScorer(MemPool& targetPool) {
@@ -3232,6 +3236,7 @@ public:
     // on the 5M benchmark corpus; 32 and 16384 are both ~20% slower).
     static constexpr int32_t kDenseThresholdInverse = 512;
     static inline bool disableDisjGroupBulkForTests = false;
+    static inline bool disableDenseScoredForTests = false;
 
   private:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
@@ -3268,6 +3273,7 @@ public:
     std::span<float> outScores;
     std::span<uint64_t> windowBits;
     std::span<uint64_t> clauseBits;
+    std::span<int32_t> denseFreqs;
     std::span<uint64_t> groupMatchBits;
     std::span<float> groupScores;
     std::span<BufferedTerm> leadGroupTerms;
@@ -3282,6 +3288,29 @@ public:
     bool hasDisjGroup = false;
     bool denseHasDisjGroup = false;
     bool denseCountPath = false;
+    bool denseScoredEligible = false;
+    bool denseScoredCostRejected = false;
+    const uint8_t* denseScoredNorms = nullptr;
+
+    enum class DenseScoredAdmission : uint8_t {
+      SCORE_FIRST,
+      SAMPLING,
+      ADMITTED
+    };
+    DenseScoredAdmission denseScoredAdmission =
+        DenseScoredAdmission::SCORE_FIRST;
+    int32_t denseSampleWindows = 0;
+    int64_t denseSampleLead = 0;
+    int64_t denseSampleSurvivors = 0;
+
+    // Dense-scored admission thresholds were calibrated on the 5M benchmark
+    // corpus. Keep them together so the measured policy remains legible.
+    static constexpr int32_t kDenseScoredMinTopK = 100;
+    static constexpr int32_t kDenseAdmissionSampleWindows = 8;
+    static constexpr int32_t kDenseAdmissionMinLeadPerWindow = 32;
+    static constexpr int32_t kDenseAdmissionMaxSurvivorsPerWindow = 16;
+    static constexpr int32_t kDenseAdmissionMaxSurvivorPercent = 10;
+    static constexpr int32_t kDenseAdmissionMaxNonLeadCostRatio = 8;
 
     bool acceptsDoc(DocSet* filter, int32_t doc) {
       if (filter != nullptr && !filter->get(doc)) {
@@ -3969,6 +3998,149 @@ public:
       }
     }
 
+    std::span<int32_t> denseClauseFreqs(size_t clause) {
+      return denseFreqs.subspan(
+          clause * (size_t) kWindowSize, (size_t) kWindowSize);
+    }
+
+    int32_t ratchetDenseScoredWindow(int32_t min, int32_t max) {
+      for (TermQuery::Scorer* scorer : termScorers) {
+        int32_t doc = scorer->docId();
+        if (doc < min) {
+          doc = scorer->advance(min);
+        }
+        if (doc > min) {
+          min = doc;
+        }
+        if (min >= max) {
+          break;
+        }
+      }
+      return min;
+    }
+
+    bool fillDenseScoredWindowBits(
+        DocSet* filter, int32_t min, int32_t max,
+        int32_t& windowBase, int32_t& windowEnd, int64_t& leadPostings) {
+      windowBase = ratchetDenseScoredWindow(min, max);
+      windowEnd = windowBase;
+      leadPostings = 0;
+      if (windowBase >= max) {
+        return false;
+      }
+
+      int32_t requestedEnd = windowBase + kWindowSize;
+      if (requestedEnd < windowBase) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(requestedEnd, max);
+      if (windowFilter != nullptr
+          && windowFilter->prepare(windowBase, windowEnd) == 0) {
+        return false;
+      }
+
+      clearWindowBits(windowBits);
+      termScorers[0]->fillWindowBitsAndFreqs(
+          windowBits, denseClauseFreqs(0), windowBase, windowEnd);
+      leadPostings = popCountWindowBits();
+      for (size_t c = 1; c < termScorers.size(); c++) {
+        clearWindowBits(clauseBits);
+        termScorers[c]->fillWindowBitsAndFreqs(
+            clauseBits, denseClauseFreqs(c), windowBase, windowEnd);
+        for (int32_t w = 0; w < kWindowWords; w++) {
+          windowBits[(size_t) w] &= clauseBits[(size_t) w];
+        }
+      }
+
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
+        applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
+                                &((BitDocSet*) filter)->bits());
+      } else if (filter != nullptr) {
+        applyDocSetToWindow(windowBits, windowBase, windowEnd, filter);
+      }
+      if (windowFilter != nullptr) {
+        windowFilter->intersect(windowBits);
+      }
+      return true;
+    }
+
+    void finishDenseAdmissionSample(bool terminal) {
+      if (denseScoredAdmission != DenseScoredAdmission::SAMPLING
+          || (denseSampleWindows < kDenseAdmissionSampleWindows && !terminal)) {
+        return;
+      }
+      bool admitted =
+          denseSampleLead
+              >= (int64_t) kDenseAdmissionMinLeadPerWindow * denseSampleWindows
+          && denseSampleSurvivors
+              <= (int64_t) kDenseAdmissionMaxSurvivorsPerWindow
+                     * denseSampleWindows
+          && denseSampleSurvivors * 100
+              <= denseSampleLead * kDenseAdmissionMaxSurvivorPercent;
+      denseScoredAdmission = admitted
+          ? DenseScoredAdmission::ADMITTED
+          : DenseScoredAdmission::SCORE_FIRST;
+      skipCount(admitted ? SkipStats::conjDenseScoredAdmits
+                         : SkipStats::conjDenseScoredLatchBacks);
+    }
+
+    int32_t scoreNextWindowDense(ScoreWindow& out, DocSet* filter,
+                                 int32_t min, int32_t max,
+                                 float minCompetitiveScore) {
+      unused(minCompetitiveScore);
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+
+      int32_t windowBase;
+      int32_t windowEnd;
+      int64_t leadPostings;
+      bool windowReady = fillDenseScoredWindowBits(
+          filter, min, max, windowBase, windowEnd, leadPostings);
+      if (windowBase >= max) {
+        out.max = max;
+        finishDenseAdmissionSample(true);
+        return windowBase;
+      }
+      out.min = windowBase;
+      out.max = windowEnd;
+      if (windowReady) {
+        emitWindowBits(out, windowBase, windowEnd);
+      }
+
+      skipCount(SkipStats::conjDenseScoredWindows);
+      if (denseScoredAdmission == DenseScoredAdmission::SAMPLING) {
+        denseSampleWindows++;
+        denseSampleLead += leadPostings;
+        denseSampleSurvivors += out.size;
+      }
+
+      for (int32_t i = 0; i < out.size; i++) {
+        int32_t doc = out.docs[(size_t) i];
+        int32_t offset = doc - windowBase;
+        int64_t norm = denseScoredNorms[doc];
+        float score = 0.0f;
+        for (size_t c = 0; c < termScorers.size(); c++) {
+          score += termScorers[c]->scoreFreqWithNorm(
+              denseClauseFreqs(c)[(size_t) offset], norm);
+        }
+        out.scores[(size_t) i] = score;
+      }
+      bool terminal = windowEnd >= max;
+      finishDenseAdmissionSample(terminal);
+      return terminal ? PostingsReader::END : windowEnd;
+    }
+
     int32_t countNextWindowDense(int64_t& count, DocSetBuilder* domainOut,
                                  DocSet* filter, int32_t min, int32_t max) {
       int32_t windowBase;
@@ -4065,7 +4237,8 @@ public:
 
   public:
     ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
-                          int32_t maxDoc, int64_t leadCost)
+                          int32_t maxDoc, int64_t leadCost,
+                          int64_t nonLeadCost, bool scoredConstruction)
         : scorers(scorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
@@ -4145,6 +4318,39 @@ public:
       }
       denseCountPath = allDenseClauses && maxDoc >= kWindowSize
           && leadCost >= std::max<int64_t>(1, (int64_t) maxDoc / kDenseThresholdInverse);
+      denseScoredEligible = scoredConstruction && denseCountPath
+          && allTermScorers && !disableDenseScoredForTests;
+      if (denseScoredEligible) {
+        denseScoredNorms = termScorers[0]->flatNormsBase;
+        for (TermQuery::Scorer* scorer : termScorers) {
+          denseScoredEligible &= scorer->simScorer != nullptr
+              && scorer->flatNormsBase != nullptr
+              && scorer->flatNormsBase == denseScoredNorms;
+        }
+        if (denseScoredEligible) {
+          denseScoredCostRejected =
+              nonLeadCost > leadCost * kDenseAdmissionMaxNonLeadCostRatio;
+          denseScoredEligible &= !denseScoredCostRejected;
+        }
+        if (denseScoredEligible) {
+          denseFreqs = pool.make_span<int32_t>(
+              scorers.size() * (size_t) kWindowSize);
+        }
+      }
+    }
+
+    void setTopKDepth(int32_t topK) override {
+      if (topK < kDenseScoredMinTopK
+          || denseScoredAdmission != DenseScoredAdmission::SCORE_FIRST) {
+        return;
+      }
+      if (denseScoredCostRejected) {
+        skipCount(SkipStats::conjDenseScoredCostRejects);
+      }
+      if (!denseScoredEligible) {
+        return;
+      }
+      denseScoredAdmission = DenseScoredAdmission::SAMPLING;
     }
 
     bool willCountDense() const override {
@@ -4166,6 +4372,10 @@ public:
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
                             float minCompetitiveScore) override {
+      if (denseScoredAdmission != DenseScoredAdmission::SCORE_FIRST) {
+        return scoreNextWindowDense(
+            out, filter, min, max, minCompetitiveScore);
+      }
       if (allTermClauses && hasDisjGroup) {
         return scoreNextWindowTermClauses(
             out, filter, min, max, minCompetitiveScore);
@@ -4245,6 +4455,19 @@ public:
 
     int64_t skippedWindows() const {
       return skippedWindowCount;
+    }
+
+    bool denseScoredLatchedBackForTests() const {
+      return denseScoredEligible && denseSampleWindows > 0
+          && denseScoredAdmission == DenseScoredAdmission::SCORE_FIRST;
+    }
+
+    int32_t denseScoredSampleWindowsForTests() const {
+      return denseSampleWindows;
+    }
+
+    bool denseScoredCostRejectedForTests() const {
+      return denseScoredCostRejected;
     }
   }; // ConjunctionBulkScorer
 

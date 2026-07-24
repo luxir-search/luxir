@@ -739,6 +739,57 @@ public:
       return filled;
     }
 
+    // Consume postings below windowEnd while retaining each posting's
+    // frequency at its window-relative doc offset. Unlike fillWindowBits(),
+    // this keeps the enum in frequency-capable mode so the same cursor can
+    // resume ordinary scored execution after the window.
+    void fillWindowBitsAndFreqs(std::span<uint64_t> windowBits,
+                                std::span<int32_t> windowFreqs,
+                                int32_t windowStart, int32_t windowEnd) {
+      assert(windowEnd >= windowStart);
+      assert(windowFreqs.size() >= (size_t) (windowEnd - windowStart));
+      skipCount(SkipStats::countBulkFillCalls);
+      while (windowEnd > windowStart) {
+        auto [blockDocs, blockFreqs] = docsEnum.peekDocFreqBlock();
+        int32_t available = (int32_t) blockDocs.size();
+        if (available == 0) {
+          return;
+        }
+
+        int32_t used = 0;
+        while (used < available && blockDocs[(size_t) used] < windowStart) {
+          used++;
+        }
+        int32_t firstEmit = used;
+        while (used < available && blockDocs[(size_t) used] < windowEnd) {
+          used++;
+        }
+        for (int32_t i = firstEmit; i < used; i++) {
+          int32_t offset = blockDocs[(size_t) i] - windowStart;
+          windowBits[(size_t) (offset >> 6)] |= 1ULL << (offset & 63);
+          windowFreqs[(size_t) offset] = blockFreqs[(size_t) i];
+        }
+        if (used > firstEmit) {
+          skipCount(SkipStats::countBulkFillBlocks);
+          if (SkipStats::enabled) {
+            SkipStats::countBulkFillDocs += used - firstEmit;
+          }
+        }
+        if (used == 0) {
+          return;
+        }
+        docsEnum.consumeDocFreqBlock(used);
+        if (used < available) {
+          return;
+        }
+      }
+    }
+
+    float scoreFreqWithNorm(int32_t freq, int64_t encodedNorm) const {
+      assert(simScorer != nullptr);
+      return boost * simScorer->score((float) freq, encodedNorm);
+    }
+
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       assert(windowEnd >= windowStart);
