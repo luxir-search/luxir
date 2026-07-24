@@ -116,6 +116,11 @@ public:
     EXPECT_NE(nullptr, c);
     return *c;
   }
+  static const api::RescoreQuery& asRescore(const api::Query& q) {
+    const auto* r = std::get_if<api::RescoreQuery>(&q.kind);
+    EXPECT_NE(nullptr, r);
+    return *r;
+  }
   static std::string_view matchVal(const api::Query& q) {
     const auto& m = asMatch(q);
     return m.val.has_value() ? m.val->asString() : std::string_view{};
@@ -481,6 +486,20 @@ TEST_F(ExprParserTest, boostFunctionForm) {
   ASSERT_TRUE(boosted.query.has_value());
   EXPECT_FLOAT_EQ(2.0f, *boosted.boost);
   EXPECT_EQ("dune", matchVal(*boosted.query));
+}
+
+TEST_F(ExprParserTest, rescoreFunctionHasQueryAndValuePositions) {
+  bindVar("factor", api::Val{.kind = 2.0});
+  const auto& rescore =
+      asRescore(*parse("rescore(title:solux, mul(score,$factor))"));
+  ASSERT_TRUE(rescore.query.has_value());
+  EXPECT_EQ("solux", matchVal(*rescore.query));
+  EXPECT_EQ("mul(score,$factor)", rescore.expr);
+  EXPECT_NE(nullptr, rescore.vars.find("factor"));
+
+  const auto& named =
+      asRescore(*parse("rescore(query=title:solux, expr=add(score,count))"));
+  EXPECT_EQ("add(score,count)", named.expr);
 }
 
 TEST_F(ExprParserTest, scoreDecorationErrors) {

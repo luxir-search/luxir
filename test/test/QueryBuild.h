@@ -208,6 +208,17 @@ inline api::Query boost(std::pmr::memory_resource& mr, const api::Query& inner,
   return q;
 }
 
+inline api::Query rescore(std::pmr::memory_resource& mr,
+                          const api::Query& inner, std::string_view expr) {
+  api::Query q;
+  auto& r = q.kind.emplace<api::RescoreQuery>();
+  auto* p = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
+  new (p) api::Query(inner);
+  r.query = p;
+  r.expr = build::arenaStr(mr, expr);
+  return q;
+}
+
 // ---- boolean: copy the clause lists into arena spans ----
 inline void setSpan(std::span<const api::Query>& target, std::pmr::memory_resource& mr,
                     std::span<const api::Query> src) {
