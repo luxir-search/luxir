@@ -87,13 +87,13 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
     EXPECT_EQ(64, *piece.cardinality);
     EXPECT_EQ(piece.max_doc, *piece.domain_size);
     EXPECT_EQ(expectedStrategy(*piece.domain_size, *piece.cardinality), piece.strategy);
-    // Unfiltered facets retain fixed bulk decoding for both rank-indexed and
-    // docid-indexed columns.
+    // An unfiltered facet has an empty domain complement, so every term's count
+    // IS its docFreq: the ord column is never read.
     ASSERT_GE(piece.details.size(), 2u);
     EXPECT_EQ("seg maxOrd=" + std::to_string(localMaxOrds[i])
                   + " ords=" + std::string(ordMappings[i]),
               piece.details[0]);
-    EXPECT_EQ("all-docs domain, bulk ord loads", piece.details[1]);
+    EXPECT_EQ("all-docs domain, docFreq-only dictionary walk", piece.details[1]);
     EXPECT_GT(piece.thread_id, 0);
     EXPECT_LT(piece.elapsed_us, 60'000'000u);
   }
@@ -158,7 +158,7 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   EXPECT_EQ("vector", pieces[0].strategy);
   ASSERT_EQ(2u, pieces[0].details.size());  // no upgrade, no divergence note
   EXPECT_EQ("seg maxOrd=1 ords=identity", pieces[0].details[0]);
-  EXPECT_EQ("all-docs domain, bulk ord loads", pieces[0].details[1]);
+  EXPECT_EQ("all-docs domain, docFreq-only dictionary walk", pieces[0].details[1]);
 }
 
 TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {

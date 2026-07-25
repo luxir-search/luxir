@@ -282,9 +282,9 @@ stream. The custom HTTP response envelope does not currently include it.
 `profile: true` returns an execution profile on the final response. Profiling
 is opt-in and request-wide, but operations adopt instrumentation independently;
 string field facets are the currently instrumented operation. Their profile
-contains one entry per executed segment with the selected counting strategy,
-selection inputs such as cardinality and domain size, thread ID, elapsed
-microseconds, and human-readable details:
+contains one entry per executed segment with the selected counter
+representation, selection inputs such as cardinality and domain size, thread
+ID, elapsed microseconds, and human-readable details:
 
 ```json
 {
@@ -295,25 +295,24 @@ microseconds, and human-readable details:
         "kind": "segment",
         "segment": 0,
         "max_doc": 100000,
-        "strategy": "column",
+        "strategy": "skinny",
         "cardinality": 12000,
         "domain_size": 84000,
         "thread_id": 123,
         "elapsed_us": 714,
-        "details": ["bitset domain, adaptive point/bulk ord loads",
-                    "seg maxOrd=12000 ords=identity",
-                    "counter=skinny"]
+        "details": ["seg maxOrd=12000 ords=identity",
+                    "bitset domain, adaptive point/bulk ord loads"]
       }]
     }]
   }
 }
 ```
 
-`strategy` names how the segment was counted: `column` walks the domain over
-the field's ord column, `complement` walks the domain's complement and
-subtracts from each term's docFreq (cheap when the domain covers most of the
-segment), and `term` intersects each term's postings with the domain. The
-counter representation the counts land in is reported separately in `details`.
+`strategy` names the counter representation the counts land in. *How* the
+segment was counted is an orthogonal choice reported in `details`: walking the
+domain over the field's ord column, walking the domain's complement and
+subtracting from each term's docFreq (cheap when the domain covers most of the
+segment), or intersecting each term's postings with the domain.
 Treat `strategy` and the typed numeric fields as diagnostics, not a stable
 performance promise. `details` is deliberately human-readable and must not be
 machine-parsed. Use `max_parallel: 1` when comparing segment timings without

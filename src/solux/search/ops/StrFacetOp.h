@@ -665,7 +665,7 @@ public:
           // counted is a second, orthogonal dimension, and details is where this
           // proto says it belongs ("terms-index vs column").
           profile->wire.cardinality = globVals;
-          profile->wire.strategy = usingRep;
+          profile->wire.strategy = wantedRep;
           profile->details.emplace_back(
               "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
               + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
