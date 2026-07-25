@@ -53,12 +53,13 @@ struct ScoreWindow {
 // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
 class BulkScorer {
 public:
-  // Supply the requested result depth before scored collection starts.
-  // Most scorers do not need it; admission policies that choose between
-  // exhaustive and competitive execution should use this explicit seam
-  // rather than infer depth from the evolving competitive threshold.
-  virtual void setTopKDepth(int32_t topK) {
-    unused(topK);
+  // Supply the requested result depth and whether competitive pruning is
+  // available before scored collection starts. Most scorers do not need it;
+  // admission policies that choose between exhaustive and competitive
+  // execution should use this explicit seam rather than infer either signal
+  // from the evolving competitive threshold.
+  virtual void setTopKDepth(int32_t topK, bool allowPruning) {
+    unused(topK, allowPruning);
   }
 
   virtual bool willCountDense() const {

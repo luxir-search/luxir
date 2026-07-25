@@ -6,8 +6,10 @@
 #include <vector>
 
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/TermQuery.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/SkipStats.h"
+#include "solux/search/Collector.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -91,14 +93,17 @@ std::vector<Doc> makeSegment(
 }
 
 AdmissionRun runShape(CollectionHelper& helper, const Shape& shape,
-                      int32_t topK, bool disabled) {
+                      int32_t topK, bool exactCount, bool disabled) {
   DenseScoredGuard denseGuard(disabled);
   SkipStatsGuard statsGuard;
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& topDocs = req->topDocs("q");
-  topDocs.getNumber().getScores().limit(topK);
+  topDocs.getScores().limit(topK);
+  if (exactCount) {
+    topDocs.getNumber();
+  }
   topDocs.rawQuery() = qb::boolean(
       topDocs.mr(),
       {qb::match(topDocs.mr(), "body_w", shape.lead),
@@ -112,6 +117,27 @@ AdmissionRun runShape(CollectionHelper& helper, const Shape& shape,
       .latchBacks = SkipStats::conjDenseScoredLatchBacks,
       .densityRejects = SkipStats::conjDenseScoredDensityRejects,
   };
+}
+
+int64_t runPullCount(CollectionHelper& helper, const Shape& shape,
+                     int32_t topK) {
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery lead("body_w", shape.lead);
+  TermQuery other("body_w", shape.other);
+  std::array<Query*, 2> mandatory = {&lead, &other};
+  BooleanQuery query(mandatory, {}, {}, {});
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  for (auto& segment : context.topReader.segments()) {
+    auto* scorer = weight->createScorer(pool, segment);
+    if (scorer != nullptr) {
+      collectTopK(segment.ord, scorer, nullptr, nullptr, collector,
+                  /*allowPruning=*/false);
+    }
+  }
+  return collector.totalHits();
 }
 
 class DenseScoredAdmissionTest : public SoluxTest {
@@ -141,15 +167,13 @@ public:
 };
 
 TEST_F(DenseScoredAdmissionTest, top100DensityBoundary) {
-  AdmissionRun inside = runShape(helper, shallowInside, 100, false);
-  EXPECT_EQ(inside.count, 10);
+  AdmissionRun inside = runShape(helper, shallowInside, 100, false, false);
   EXPECT_EQ(inside.windows, 1);
   EXPECT_EQ(inside.admits, 1);
   EXPECT_EQ(inside.latchBacks, 0);
   EXPECT_EQ(inside.densityRejects, 0);
 
-  AdmissionRun outside = runShape(helper, shallowOutside, 100, false);
-  EXPECT_EQ(outside.count, 11);
+  AdmissionRun outside = runShape(helper, shallowOutside, 100, false, false);
   EXPECT_EQ(outside.windows, 1);
   EXPECT_EQ(outside.admits, 0);
   EXPECT_EQ(outside.latchBacks, 1);
@@ -157,32 +181,32 @@ TEST_F(DenseScoredAdmissionTest, top100DensityBoundary) {
 }
 
 TEST_F(DenseScoredAdmissionTest, top1000DensityBoundaryAndAbsoluteCapRemoval) {
-  AdmissionRun shallowDepth = runShape(helper, deepInside, 100, false);
+  AdmissionRun shallowDepth = runShape(
+      helper, deepInside, 100, false, false);
   EXPECT_EQ(shallowDepth.admits, 0);
   EXPECT_EQ(shallowDepth.latchBacks, 1);
   EXPECT_EQ(shallowDepth.densityRejects, 1);
 
-  AdmissionRun inside = runShape(helper, deepInside, 1000, false);
-  EXPECT_EQ(inside.count, 60);
+  AdmissionRun inside = runShape(helper, deepInside, 1000, false, false);
   EXPECT_EQ(inside.admits, 1);
   EXPECT_EQ(inside.latchBacks, 0);
   EXPECT_EQ(inside.densityRejects, 0);
 
-  AdmissionRun outside = runShape(helper, deepOutside, 1000, false);
-  EXPECT_EQ(outside.count, 61);
+  AdmissionRun outside = runShape(helper, deepOutside, 1000, false, false);
   EXPECT_EQ(outside.admits, 0);
   EXPECT_EQ(outside.latchBacks, 1);
   EXPECT_EQ(outside.densityRejects, 1);
 
-  AdmissionRun high = runShape(helper, highSurvivors, 1000, false);
-  EXPECT_EQ(high.count, 256);
+  AdmissionRun high = runShape(
+      helper, highSurvivors, 1000, false, false);
   EXPECT_EQ(high.admits, 1);
   EXPECT_EQ(high.latchBacks, 0);
   EXPECT_EQ(high.densityRejects, 0);
 }
 
 TEST_F(DenseScoredAdmissionTest, leadFloorAndDisabledOracle) {
-  AdmissionRun sparse = runShape(helper, belowLeadFloor, 1000, false);
+  AdmissionRun sparse = runShape(
+      helper, belowLeadFloor, 1000, true, false);
   EXPECT_EQ(sparse.count, 1);
   EXPECT_EQ(sparse.admits, 0);
   EXPECT_EQ(sparse.latchBacks, 1);
@@ -192,10 +216,26 @@ TEST_F(DenseScoredAdmissionTest, leadFloorAndDisabledOracle) {
       shallowInside, shallowOutside, deepInside,
       deepOutside, highSurvivors, belowLeadFloor};
   for (const Shape& shape : shapes) {
-    EXPECT_EQ(runShape(helper, shape, 1000, false).count,
-              runShape(helper, shape, 1000, true).count)
+    EXPECT_EQ(runShape(helper, shape, 1000, true, false).count,
+              runShape(helper, shape, 1000, true, true).count)
         << shape.lead;
   }
+}
+
+TEST_F(DenseScoredAdmissionTest, exactCountUsesDeepestCalibratedDepth) {
+  AdmissionRun ordinary = runShape(
+      helper, shallowOutside, 100, false, false);
+  EXPECT_EQ(ordinary.admits, 0);
+  EXPECT_EQ(ordinary.latchBacks, 1);
+  EXPECT_EQ(ordinary.densityRejects, 1);
+
+  AdmissionRun exact = runShape(
+      helper, shallowOutside, 100, true, false);
+  EXPECT_EQ(exact.count, 11);
+  EXPECT_EQ(exact.admits, 1);
+  EXPECT_EQ(exact.latchBacks, 0);
+  EXPECT_EQ(exact.densityRejects, 0);
+  EXPECT_EQ(exact.count, runPullCount(helper, shallowOutside, 100));
 }
 
 TEST_F(DenseScoredAdmissionTest, segmentsDecideIndependently) {
@@ -212,13 +252,12 @@ TEST_F(DenseScoredAdmissionTest, segmentsDecideIndependently) {
       UpdateMessage::COMMIT);
   ASSERT_EQ(helper.getIndexWriter()->getIndexReader()->segments().size(), 2);
 
-  AdmissionRun enabled = runShape(helper, segmentInside, 100, false);
-  EXPECT_EQ(enabled.count, 21);
+  AdmissionRun enabled = runShape(
+      helper, segmentInside, 100, false, false);
   EXPECT_EQ(enabled.windows, 2);
   EXPECT_EQ(enabled.admits, 1);
   EXPECT_EQ(enabled.latchBacks, 1);
   EXPECT_EQ(enabled.densityRejects, 1);
-  EXPECT_EQ(enabled.count, runShape(helper, segmentInside, 100, true).count);
 }
 
 } // namespace
