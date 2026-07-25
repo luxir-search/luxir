@@ -1,0 +1,269 @@
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "solux/query/BooleanQuery.h"
+#include "solux/reader/SkipStats.h"
+#include "solux/search/ops/TopDocsReq.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
+#include "test/QueryBuild.h"
+#include "test/SoluxTest.h"
+#include "test/TestUtils.h"
+
+using namespace solux;
+using namespace solux::test;
+
+namespace {
+
+struct IdentityGuard {
+  bool saved = BooleanQuery::disableDisjunctionCountIdentityForTests;
+
+  explicit IdentityGuard(bool disabled) {
+    BooleanQuery::disableDisjunctionCountIdentityForTests = disabled;
+  }
+
+  ~IdentityGuard() {
+    BooleanQuery::disableDisjunctionCountIdentityForTests = saved;
+  }
+};
+
+struct FilterFoldGuard {
+  bool saved = TopDocsReq::disableTopDocsFilterFoldForTests;
+
+  explicit FilterFoldGuard(bool disabled) {
+    TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+  }
+
+  ~FilterFoldGuard() {
+    TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+  }
+};
+
+struct SkipStatsGuard {
+  bool saved = SkipStats::enabled;
+
+  SkipStatsGuard() {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+
+  ~SkipStatsGuard() {
+    SkipStats::enabled = saved;
+    SkipStats::reset();
+  }
+};
+
+} // namespace
+
+class DisjunctionCountIdentityTest : public SoluxTest {
+public:
+  using QueryFactory = std::function<api::Query(OpCursor&)>;
+
+  struct Run {
+    int64_t count = 0;
+    int64_t engagements = 0;
+    int64_t deleteFallbacks = 0;
+    int64_t filterFallbacks = 0;
+    int64_t domainOutputFallbacks = 0;
+    int64_t nonTermFallbacks = 0;
+    int64_t minMatchFallbacks = 0;
+    int64_t requiredFallbacks = 0;
+    int64_t prohibitedFallbacks = 0;
+    int64_t profitabilityFallbacks = 0;
+    int64_t docBlocksDecoded = 0;
+    int64_t bulkFillCalls = 0;
+    int64_t bulkFillDocs = 0;
+    int64_t bulkFillWordBlocks = 0;
+  };
+
+  CollectionHelper helper;
+
+  static api::Query skewedTerms(OpCursor& cursor) {
+    auto& mr = cursor.mr();
+    return qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "common"),
+         qb::match(mr, "body_w", "rare"),
+         qb::match(mr, "body_w", "tiny")});
+  }
+
+  Run run(const QueryFactory& makeQuery, bool disableIdentity = false,
+          bool materializeDomain = false, bool externalFilter = false) {
+    IdentityGuard identityGuard(disableIdentity);
+    FilterFoldGuard filterGuard(externalFilter);
+    SkipStatsGuard statsGuard;
+
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cursor = req->topDocs("q").getNumber().limit(0);
+    cursor.rawQuery() = makeQuery(cursor);
+    if (externalFilter) {
+      cursor.matchFilter("keep", "gate_s", "keep");
+    }
+    if (materializeDomain) {
+      cursor.facet("buckets", "bucket_s").limit(-1);
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+    return {
+      .count = req->getMatchCount(),
+      .engagements = SkipStats::disjCountIdentityEngagements,
+      .deleteFallbacks = SkipStats::disjCountIdentityDeleteFallbacks,
+      .filterFallbacks = SkipStats::disjCountIdentityFilterFallbacks,
+      .domainOutputFallbacks =
+          SkipStats::disjCountIdentityDomainOutputFallbacks,
+      .nonTermFallbacks = SkipStats::disjCountIdentityNonTermFallbacks,
+      .minMatchFallbacks = SkipStats::disjCountIdentityMinMatchFallbacks,
+      .requiredFallbacks = SkipStats::disjCountIdentityRequiredFallbacks,
+      .prohibitedFallbacks =
+          SkipStats::disjCountIdentityProhibitedFallbacks,
+      .profitabilityFallbacks =
+          SkipStats::disjCountIdentityProfitabilityFallbacks,
+      .docBlocksDecoded = SkipStats::docBlocksDecoded,
+      .bulkFillCalls = SkipStats::countBulkFillCalls,
+      .bulkFillDocs = SkipStats::countBulkFillDocs,
+      .bulkFillWordBlocks = SkipStats::countBulkFillWordBlocks,
+    };
+  }
+
+  void SetUp() override {
+    std::vector<Doc> docs;
+    docs.reserve(256);
+    for (int32_t doc = 0; doc < 256; doc++) {
+      std::string body = "phrase lead ";
+      if (doc < 250) body += "common ";
+      if (doc == 0 || doc == 250 || doc == 251) body += "rare ";
+      if (doc == 251 || doc == 252) body += "tiny ";
+      if (doc < 128) body += "left ";
+      if (doc >= 64 && doc < 192) body += "right ";
+      docs.push_back(flatdoc(
+          "id", "d" + std::to_string(doc),
+          "body_w", body,
+          "gate_s", (doc & 1) == 0 ? "keep" : "drop",
+          "bucket_s", (doc & 1) == 0 ? "even" : "odd"));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+};
+
+TEST_F(DisjunctionCountIdentityTest, skewedTermsMatchEnumeratedOracle) {
+  Run enumerated = run(skewedTerms, true);
+  Run identity = run(skewedTerms);
+
+  EXPECT_EQ(253, identity.count);
+  EXPECT_EQ(enumerated.count, identity.count);
+  EXPECT_EQ(0, enumerated.engagements);
+  EXPECT_GT(identity.engagements, 0);
+  EXPECT_LT(identity.docBlocksDecoded, enumerated.docBlocksDecoded);
+}
+
+TEST_F(DisjunctionCountIdentityTest, balancedTermsStayOnWindowEnumeration) {
+  auto balanced = [](OpCursor& cursor) {
+    auto& mr = cursor.mr();
+    return qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "left"),
+         qb::match(mr, "body_w", "right")});
+  };
+  Run enumerated = run(balanced, true);
+  Run normal = run(balanced);
+
+  EXPECT_EQ(192, normal.count);
+  EXPECT_EQ(enumerated.count, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.profitabilityFallbacks, 0);
+  EXPECT_EQ(enumerated.docBlocksDecoded, normal.docBlocksDecoded);
+  EXPECT_EQ(enumerated.bulkFillCalls, normal.bulkFillCalls);
+  EXPECT_EQ(enumerated.bulkFillDocs, normal.bulkFillDocs);
+  EXPECT_EQ(enumerated.bulkFillWordBlocks, normal.bulkFillWordBlocks);
+}
+
+TEST_F(DisjunctionCountIdentityTest, deletesFallBack) {
+  helper.deleteById("d17", UpdateMessage::COMMIT);
+  Run enumerated = run(skewedTerms, true);
+  Run normal = run(skewedTerms);
+
+  EXPECT_EQ(enumerated.count, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.deleteFallbacks, 0);
+}
+
+TEST_F(DisjunctionCountIdentityTest, externalFilterFallsBack) {
+  Run enumerated = run(skewedTerms, true, false, true);
+  Run normal = run(skewedTerms, false, false, true);
+
+  EXPECT_EQ(enumerated.count, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.filterFallbacks, 0);
+}
+
+TEST_F(DisjunctionCountIdentityTest, domainOutputFallsBack) {
+  Run enumerated = run(skewedTerms, true, true);
+  Run normal = run(skewedTerms, false, true);
+
+  EXPECT_EQ(enumerated.count, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.domainOutputFallbacks, 0);
+}
+
+TEST_F(DisjunctionCountIdentityTest, nonTermClauseFallsBack) {
+  auto phraseAndTerm = [](OpCursor& cursor) {
+    auto& mr = cursor.mr();
+    return qb::boolean(mr, {},
+        {qb::phraseWords(mr, "body_w", {"phrase", "lead"}),
+         qb::match(mr, "body_w", "rare")});
+  };
+  Run normal = run(phraseAndTerm);
+
+  EXPECT_EQ(256, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.nonTermFallbacks, 0);
+}
+
+TEST_F(DisjunctionCountIdentityTest, minShouldMatchFallsBack) {
+  auto minMatch = [](OpCursor& cursor) {
+    auto& mr = cursor.mr();
+    return qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "common"),
+         qb::match(mr, "body_w", "rare")}, {}, {}, 2);
+  };
+  Run normal = run(minMatch);
+
+  EXPECT_EQ(1, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.minMatchFallbacks, 0);
+}
+
+TEST_F(DisjunctionCountIdentityTest, requiredClauseFallsBack) {
+  auto required = [](OpCursor& cursor) {
+    auto& mr = cursor.mr();
+    return qb::boolean(mr,
+        {qb::match(mr, "body_w", "common")},
+        {qb::match(mr, "body_w", "rare"),
+         qb::match(mr, "body_w", "right")}, {}, {}, 1);
+  };
+  Run normal = run(required);
+
+  EXPECT_EQ(129, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.requiredFallbacks, 0);
+}
+
+TEST_F(DisjunctionCountIdentityTest, prohibitedClauseFallsBack) {
+  auto prohibited = [](OpCursor& cursor) {
+    auto& mr = cursor.mr();
+    return qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "common"),
+         qb::match(mr, "body_w", "left")},
+        {qb::match(mr, "body_w", "rare")});
+  };
+  Run normal = run(prohibited);
+
+  EXPECT_EQ(249, normal.count);
+  EXPECT_EQ(0, normal.engagements);
+  EXPECT_GT(normal.prohibitedFallbacks, 0);
+}

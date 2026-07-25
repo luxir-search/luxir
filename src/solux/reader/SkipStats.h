@@ -110,6 +110,15 @@ struct SkipStats {
   static inline int64_t conjDisjGroupScoreWindows = 0;
   // Pure disjunction count windows containing exact all-term conjunction members.
   static inline int64_t disjConjGroupCountWindows = 0;
+  static inline int64_t disjCountIdentityEngagements = 0;
+  static inline int64_t disjCountIdentityDeleteFallbacks = 0;
+  static inline int64_t disjCountIdentityFilterFallbacks = 0;
+  static inline int64_t disjCountIdentityDomainOutputFallbacks = 0;
+  static inline int64_t disjCountIdentityNonTermFallbacks = 0;
+  static inline int64_t disjCountIdentityMinMatchFallbacks = 0;
+  static inline int64_t disjCountIdentityRequiredFallbacks = 0;
+  static inline int64_t disjCountIdentityProhibitedFallbacks = 0;
+  static inline int64_t disjCountIdentityProfitabilityFallbacks = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t conjMatchFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
@@ -219,6 +228,15 @@ struct SkipStats {
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;
     disjConjGroupCountWindows = 0;
+    disjCountIdentityEngagements = 0;
+    disjCountIdentityDeleteFallbacks = 0;
+    disjCountIdentityFilterFallbacks = 0;
+    disjCountIdentityDomainOutputFallbacks = 0;
+    disjCountIdentityNonTermFallbacks = 0;
+    disjCountIdentityMinMatchFallbacks = 0;
+    disjCountIdentityRequiredFallbacks = 0;
+    disjCountIdentityProhibitedFallbacks = 0;
+    disjCountIdentityProfitabilityFallbacks = 0;
     conjCountFallbacks = 0;
     conjMatchFallbacks = 0;
     bulkDomainWindowsFed = 0;

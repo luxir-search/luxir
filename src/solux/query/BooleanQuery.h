@@ -397,6 +397,9 @@ public:
   static inline bool disableFilteredScoredBulkForTests = false;
   // A/B toggle for exact probe-vs-fill equivalence tests.
   static inline bool disableFilterMaskProbeForTests = false;
+  // A/B toggle for the exact df(base) + non-member count path used by
+  // count-only skewed term disjunctions.
+  static inline bool disableDisjunctionCountIdentityForTests = false;
   // A/B toggle: retain the plain pull DisjunctionScorer for sparse filtered
   // term unions instead of using head/tail WAND candidate formation.
   static inline bool disableFilteredUnionWandForTests = false;
@@ -1154,8 +1157,12 @@ public:
       BulkScorer* maxScoreBulkScorer(MemPool& targetPool) {
         auto& optionalScorersVec = *targetPool.make_vec<Query::Scorer*>();
         optionalScorersVec.reserve(optionalSources.size());
-        auto* optionalCostsVec = optionalSources.size() >= kCostAwareOrderMinClauses
-          ? targetPool.make_vec<int64_t>() : nullptr;
+        // Count-only identity routing needs every per-segment term df even for
+        // the common two-clause case. Scored execution keeps its existing
+        // four-clause threshold for retaining costs.
+        auto* optionalCostsVec =
+          (!needsScores || optionalSources.size() >= kCostAwareOrderMinClauses)
+            ? targetPool.make_vec<int64_t>() : nullptr;
         if (optionalCostsVec != nullptr) {
           optionalCostsVec->reserve(optionalSources.size());
         }
@@ -1197,7 +1204,8 @@ public:
         }
         return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
             targetPool, optionalScorers, optionalCosts, segment.maxDoc(),
-            aggregateClauseCost, !needsScores);
+            aggregateClauseCost, !needsScores,
+            segment.liveDocs() != nullptr);
       }
 
       BulkScorer* attachDirectFilters(MemPool& targetPool,
@@ -1415,6 +1423,20 @@ public:
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
+        if (!needsScores && optionalSources.size() >= 2) {
+          if (!mandatorySources.empty()) {
+            skipCount(SkipStats::disjCountIdentityRequiredFallbacks);
+          }
+          if (!prohibitedSources.empty()) {
+            skipCount(SkipStats::disjCountIdentityProhibitedFallbacks);
+          }
+          if (!filterSuppliers.empty()) {
+            skipCount(SkipStats::disjCountIdentityFilterFallbacks);
+          }
+          if (minShouldMatch > 1) {
+            skipCount(SkipStats::disjCountIdentityMinMatchFallbacks);
+          }
+        }
         if (mandatorySources.empty() && optionalSources.empty()
             && prohibitedSources.empty() && !filterSuppliers.empty()) {
           return filterOnlyBulkScorer(targetPool);
@@ -5260,6 +5282,18 @@ public:
     constexpr static int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
+    // The identity trades streaming the largest postings list for one scalar
+    // membership probe per doc of the smaller terms. A df RATIO gate misprices
+    // it: the largest clause in a skewed union is dense and word-encoded, so
+    // streaming it is nearly free per doc, and there is far less to save than a
+    // ratio implies. Measured on 5M (smaller-side df -> time vs enumeration):
+    // <100 0.15x, 100-1k 0.29x, 1k-10k 1.01x, 10k-100k 1.15x. So the gate is an
+    // ABSOLUTE probe budget, plus a ratio floor so we only pay it where there is
+    // something to save (tiny-OR-tiny unions are already fast and just fall
+    // back). A ratio-only gate at 32 admitted 95k probes on "the globe
+    // newspaper" and lost 4.6x.
+    constexpr static int64_t kDisjunctionCountIdentityMaxProbes = 1024;
+    constexpr static int64_t kDisjunctionCountIdentityMinDfRatio = 32;
     // Domain-drive gate weights: drive only when card*nClauses*W < SUM(clause.cost()).
     // W is the per-advance penalty (advance cost vs a vectorized block decode). HARDWARE
     // SENSITIVE (vector throughput vs scalar skip cost; ISA): calibrated on an Intel hybrid
@@ -5302,6 +5336,9 @@ public:
     std::span<Query::Scorer*> countTerms;
     std::span<uint64_t> countClauseBits;
     std::span<uint64_t> countTermBits;
+    std::span<Query::Scorer*> disjCountIdentityOthers;
+    TermQuery::Scorer* disjCountIdentityLargest = nullptr;
+    int64_t disjCountIdentityLargestDf = 0;
     WindowFilter* windowFilter = nullptr;
 
     int32_t maxDoc;
@@ -5325,6 +5362,62 @@ public:
     float nextPartitionMcs = std::numeric_limits<float>::infinity();
     double scoreBoundFactor = 1.0;
     bool disjConjCountPath = false;
+
+    void configureDisjunctionCountIdentity(solux::MemPool& pool,
+                                           bool countOnly,
+                                           bool hasDeletes) {
+      if (!countOnly || disableDisjunctionCountIdentityForTests) {
+        return;
+      }
+      if (hasDeletes) {
+        skipCount(SkipStats::disjCountIdentityDeleteFallbacks);
+        return;
+      }
+      assert(clauseCosts.size() == scorers.size());
+
+      size_t largestIndex = 0;
+      int64_t largestDf = -1;
+      int64_t totalDf = 0;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (dynamic_cast<TermQuery::Scorer*>(scorers[i]) == nullptr) {
+          skipCount(SkipStats::disjCountIdentityNonTermFallbacks);
+          return;
+        }
+        int64_t df = clauseCosts[i];
+        assert(df >= 0);
+        if (df > largestDf) {
+          largestDf = df;
+          largestIndex = i;
+        }
+        if (df >= std::numeric_limits<int64_t>::max() - totalDf) {
+          totalDf = std::numeric_limits<int64_t>::max();
+        } else {
+          totalDf += df;
+        }
+      }
+
+      int64_t otherDf = totalDf == std::numeric_limits<int64_t>::max()
+          ? totalDf : totalDf - largestDf;
+      if (otherDf <= 0
+          || otherDf > kDisjunctionCountIdentityMaxProbes
+          || otherDf > largestDf / kDisjunctionCountIdentityMinDfRatio) {
+        skipCount(SkipStats::disjCountIdentityProfitabilityFallbacks);
+        return;
+      }
+
+      disjCountIdentityOthers =
+          pool.make_span<Query::Scorer*>(scorers.size() - 1);
+      size_t other = 0;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (i != largestIndex) {
+          disjCountIdentityOthers[other++] = scorers[i];
+        }
+      }
+      assert(other == disjCountIdentityOthers.size());
+      disjCountIdentityLargest =
+          static_cast<TermQuery::Scorer*>(scorers[largestIndex]);
+      disjCountIdentityLargestDf = largestDf;
+    }
 
     // Exact unscored count decomposition is all-or-nothing. Any opaque or
     // non-term member leaves the existing top-level scorer path in control.
@@ -5687,6 +5780,63 @@ public:
 
     static void clearCountBits(std::span<uint64_t> bits) {
       std::fill(bits.begin(), bits.end(), 0);
+    }
+
+    int32_t nextDisjunctionCountIdentityDoc(int32_t target) {
+      int32_t next = PostingsReader::END;
+      for (auto* scorer : disjCountIdentityOthers) {
+        int32_t doc = scorer->docId();
+        if (doc < target) {
+          doc = scorer->advance(target);
+        }
+        next = std::min(next, doc);
+      }
+      return next;
+    }
+
+    int32_t countDisjunctionIdentity(int64_t& count) {
+      skipCount(SkipStats::disjCountIdentityEngagements);
+      count += disjCountIdentityLargestDf;
+
+      int32_t cursor = 0;
+      while (cursor < maxDoc) {
+        int32_t windowBase = nextDisjunctionCountIdentityDoc(cursor);
+        if (windowBase == PostingsReader::END) {
+          break;
+        }
+        int32_t requestedEnd = windowBase + kWindowSize;
+        if (requestedEnd < windowBase) {
+          requestedEnd = maxDoc;
+        }
+        int32_t identityWindowEnd = std::min(requestedEnd, maxDoc);
+
+        clearWindowBits();
+        for (auto* scorer : disjCountIdentityOthers) {
+          scorer->fillWindowBits(windowBits, windowBase, identityWindowEnd);
+        }
+
+        int32_t candidates = 0;
+        int32_t innerSize = identityWindowEnd - windowBase;
+        for (int32_t word = 0; word < kWindowWords; word++) {
+          uint64_t bits = windowBits[(size_t) word];
+          while (bits != 0) {
+            int32_t bit = (int32_t) std::countr_zero(bits);
+            int32_t index = (word << 6) + bit;
+            if (index >= innerSize) {
+              break;
+            }
+            outDocs[(size_t) candidates++] = windowBase + index;
+            bits &= bits - 1;
+          }
+        }
+
+        std::fill_n(outScores.data(), candidates, 0.0f);
+        int32_t members = disjCountIdentityLargest->applyToCandidates(
+            outDocs.data(), outScores.data(), candidates, true);
+        count += candidates - members;
+        cursor = identityWindowEnd;
+      }
+      return PostingsReader::END;
     }
 
     void fillDisjConjCountBits() {
@@ -6260,7 +6410,7 @@ public:
     MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
                        std::span<int64_t> clauseCosts,
                        int32_t maxDoc, int64_t aggregateClauseCost,
-                       bool enableDisjConjCount)
+                       bool enableDisjConjCount, bool hasDeletes)
             : scorers(scorers),
               clauseCosts(clauseCosts),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -6288,6 +6438,8 @@ public:
         windowOrder[i] = (int32_t) i;
       }
       configureDisjConjCount(pool, enableDisjConjCount);
+      configureDisjunctionCountIdentity(
+          pool, enableDisjConjCount, hasDeletes);
     }
 
     bool supportsMatchWindows() const override {
@@ -6469,6 +6621,22 @@ public:
       }
       if (filter != nullptr && filter->card() == 0) {
         return PostingsReader::END;
+      }
+      if (disjCountIdentityLargest != nullptr
+          && (filter != nullptr || domainOut != nullptr)) {
+        if (filter != nullptr) {
+          skipCount(SkipStats::disjCountIdentityFilterFallbacks);
+        }
+        if (domainOut != nullptr) {
+          skipCount(SkipStats::disjCountIdentityDomainOutputFallbacks);
+        }
+        // The caller will resume this scorer window by window. Latch onto the
+        // ordinary enumeration path so each fallback is counted once.
+        disjCountIdentityLargest = nullptr;
+      }
+      if (disjCountIdentityLargest != nullptr
+          && min == 0 && max == maxDoc) {
+        return countDisjunctionIdentity(count);
       }
       if (domainOut != nullptr) {
         skipCount(SkipStats::bulkDomainWindowsFed);
