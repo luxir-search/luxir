@@ -54,6 +54,10 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
       Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10_s");
       Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u10k_s");
       Inverter::IndexHandler& s7 = inverter.getIndexHandler("med_u1m_s");
+      // Present on ~1% of docs: the sparse-field shape every other string field
+      // here lacks.  Doc-driven counting costs O(domain) no matter how few docs
+      // hold a value, so this is where term-driven counting can pay off.
+      Inverter::IndexHandler& s8 = inverter.getIndexHandler("sparse_u1k_s");
       Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
       Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
       Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
@@ -87,6 +91,10 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
         s.append("medium_length_string_no_SSO");
         s.append(std::to_string(r.rint(1000)));
         s7.index(inverter, s);
+
+        if (r.rint(100) == 0) {
+          s8.index(inverter, std::to_string(r.rint(1000)));
+        }
 
         i1.index(inverter, r.rint(10));
 

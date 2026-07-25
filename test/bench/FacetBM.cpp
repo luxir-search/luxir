@@ -211,5 +211,12 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s",
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", true);
 
+// Sparse field (~1% of docs have a value).  Doc-driven counting walks the whole
+// domain regardless, so total postings stay far below the domain size - the one
+// shape where per-term postings intersection should beat the column walk.
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_sparse_s,    nDocs, shape, "short_u10_s", "sparse_u1k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_sparse_s,   nDocs, shape, "short_u1m_s", "sparse_u1k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, sparse_s,         nDocs, shape, "all", "sparse_u1k_s", false);
+
 SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);

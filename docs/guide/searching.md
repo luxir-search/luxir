@@ -282,7 +282,7 @@ stream. The custom HTTP response envelope does not currently include it.
 `profile: true` returns an execution profile on the final response. Profiling
 is opt-in and request-wide, but operations adopt instrumentation independently;
 string field facets are the currently instrumented operation. Their profile
-contains one entry per executed segment with the selected counter strategy,
+contains one entry per executed segment with the selected counting strategy,
 selection inputs such as cardinality and domain size, thread ID, elapsed
 microseconds, and human-readable details:
 
@@ -295,18 +295,25 @@ microseconds, and human-readable details:
         "kind": "segment",
         "segment": 0,
         "max_doc": 100000,
-        "strategy": "skinny",
+        "strategy": "column",
         "cardinality": 12000,
         "domain_size": 84000,
         "thread_id": 123,
         "elapsed_us": 714,
-        "details": ["all-docs domain, bulk column scan"]
+        "details": ["bitset domain, adaptive point/bulk ord loads",
+                    "seg maxOrd=12000 ords=identity",
+                    "counter=skinny"]
       }]
     }]
   }
 }
 ```
 
+`strategy` names how the segment was counted: `column` walks the domain over
+the field's ord column, `complement` walks the domain's complement and
+subtracts from each term's docFreq (cheap when the domain covers most of the
+segment), and `term` intersects each term's postings with the domain. The
+counter representation the counts land in is reported separately in `details`.
 Treat `strategy` and the typed numeric fields as diagnostics, not a stable
 performance promise. `details` is deliberately human-readable and must not be
 machine-parsed. Use `max_parallel: 1` when comparing segment timings without
