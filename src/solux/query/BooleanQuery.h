@@ -1267,7 +1267,7 @@ public:
         bool probe = !disableFilterMaskProbeForTests && filterCost > 0
             && bodyCost <= (filterCost - 1) / kMaskProbeAdvanceWeight;
         auto* windowFilter = targetPool.make<WindowFilter>(
-            targetPool, filterScorers, probe);
+            targetPool, filterScorers, probe, filterCost);
         return bulk->attachWindowFilter(windowFilter) ? bulk : nullptr;
       }
 
@@ -3419,6 +3419,9 @@ public:
     static constexpr int32_t kDenseAdmissionSampleWindows = 8;
     static constexpr int32_t kDenseAdmissionMinLeadPerWindow = 32;
     static constexpr int32_t kDenseAdmissionMaxNonLeadCostRatio = 8;
+    // Minimum filter density (maxDoc/this) for the dense scored path to stay
+    // eligible when a window filter is attached; see attachWindowFilter.
+    static constexpr int64_t kDenseScoredMinFilterDensityInverse = 16;
     static constexpr int32_t kDenseAdmissionMaxDensityTopK = 1000;
     static constexpr int32_t kDenseAdmissionMinDensityPercent = 10;
     static constexpr int32_t kDenseAdmissionMaxDensityPercent = 60;
@@ -4579,6 +4582,25 @@ public:
       }
       assert(windowFilter == nullptr);
       windowFilter = filter;
+      // The dense scored path fills EVERY clause across the window, so its
+      // cost does not shrink when a filter rejects most docs - only its output
+      // does. Its admission criteria were calibrated unfiltered, where a low
+      // survivor density means the intersection itself is selective and the
+      // fill is cheap per result; under a selective filter the same low
+      // density instead means the filter threw the fill away. Measured on the
+      // 300-query intersection class at TOP_100 (dense-scored off/on, so >1
+      // means the dense path is LOSING):
+      //   unfiltered 1.051 | 42.6% 1.017 | 9.9% 1.038   <- keep dense
+      //   4.98% 0.926 | 3.12% 0.959 | 1.99% 0.897 | 0.99% 0.872 | 0.50% 0.837
+      // so require the filter to be at least maxDoc/16 (6.25%) dense, which
+      // puts every measured point on its winning side.
+      if (filter->cost()
+          < (int64_t) maxDoc / kDenseScoredMinFilterDensityInverse) {
+        if (denseScoredEligible) {
+          skipCount(SkipStats::conjDenseScoredFilterRejects);
+        }
+        denseScoredEligible = false;
+      }
       return true;
     }
 

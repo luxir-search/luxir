@@ -982,17 +982,21 @@ class WindowFilter {
   int32_t windowStart = 0;
   int32_t windowEnd = 0;
   bool probeMode;
+  // Segment-wide COST ESTIMATE of the filter (from its supplier), which is a
+  // different thing from this class's deliberate lack of windowed cardinality:
+  // consumers use it to price whole-segment routing, never to answer accepts().
+  int64_t filterCost = 0;
 
 public:
   WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers,
-               bool probeMode = false)
+               bool probeMode = false, int64_t filterCost = 0)
       : scorers(scorers),
         probeEnums(pool.make_span<DocsFreqEnum*>(scorers.size())),
         currentBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
                     (size_t) kWindowWords),
         scratchBits(pool.make_arr<uint64_t>((size_t) kWindowWords),
                     (size_t) kWindowWords),
-        probeMode(probeMode) {
+        probeMode(probeMode), filterCost(filterCost) {
     assert(!scorers.empty());
     for (size_t i = 0; i < scorers.size(); i++) {
       assert(scorers[i]->supportsWindowFilter());
@@ -1002,6 +1006,10 @@ public:
 
   bool probes() const {
     return probeMode;
+  }
+
+  int64_t cost() const {
+    return filterCost;
   }
 
   int32_t prepare(int32_t start, int32_t end) {
