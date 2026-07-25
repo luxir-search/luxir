@@ -379,66 +379,28 @@ public:
       }
       driver.contribute([&](MergeableStrFacet& data) {
         boost::unordered_flat_map<std::string, int64_t>& counts = data.counts;
-        // Domain shape, resolved once; per term we pick the intersection strategy
-        // from the domain size vs the term docfreq (see the loop below).
-        const FixedBitSet* domainBits = nullptr;
-        ArrDocSet* domainArr = nullptr;
-        if (domain) {
-          if (domain->type == DocSet::Type::BITSET) {
-            domainBits = &static_cast<BitDocSet*>(domain)->bits();
-          } else {
-            domainArr = static_cast<ArrDocSet*>(domain);
-          }
-        }
         SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
-        const int64_t domainCard = domain ? domain->card() : maxDoc;  // null domain == all docs
+        DomainView domainView(domain, maxDoc);
         auto poolGuard = MemPool::threadLocalPoolGuard();
         FieldReader fieldReader(postingsReader);
         if (!fieldReader.seek(thisOp().fieldName)) {
           // field absent in this segment: all in-domain docs are missing
-          data.missing_num += domain ? domain->card() : maxDoc;
+          data.missing_num += domainView.card;
           return;
         }
         fieldReader.readFieldInfo(segFieldInfo);
         TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
         while (tenum.nextTerm()) {
-          DocsOnlyEnum denum(tenum);
-          int64_t count = 0;
-          if (domain && domainCard < denum.numDocs()) {
-            // Domain smaller than this term's postings: drive from the domain and
-            // advance() the postings enum, so it can skip whole doc blocks (a big win
-            // for a common term vs a narrow domain once postings skip data lands;
-            // already a win for an array domain by avoiding a get() per term doc,
-            // and neutral for a bitset domain, before skip data).  advance() is
-            // forward-only, so only call it when the enum is behind the target.
-            if (domainArr) {
-              for (int32_t dd : domainArr->docs()) {
-                if (denum.docId() < dd && denum.advance(dd) == DocsEnumMeta::END) break;
-                if (denum.docId() == dd) count++;
-              }
-            } else {
-              // nextSetBit asserts its arg < maxDoc, so guard dd+1 (DomainIter idiom).
-              int32_t dd = -1;
-              while (dd + 1 < maxDoc) {
-                dd = domainBits->nextSetBit(dd + 1);
-                if (dd >= maxDoc) break;
-                if (denum.docId() < dd && denum.advance(dd) == DocsEnumMeta::END) break;
-                if (denum.docId() == dd) count++;
-              }
-            }
+          int32_t docFreq = tenum.docFreq();
+          int64_t count;
+          if (domainView.compCard == 0) {
+            // Avoid even constructing a postings enum for the all-docs case.
+            count = docFreq;
           } else {
-            // Dense or null domain: walk the term's postings and probe the domain
-            // (O(1) bitset get, binary search for an array domain, all docs if null).
-            for (int32_t doc = denum.nextDoc(); doc != DocsEnumMeta::END; doc = denum.nextDoc()) {
-              if (domainBits) {
-                if (!domainBits->get(doc)) continue;
-              } else if (domainArr && !domainArr->get(doc)) {
-                continue;
-              }
-              count++;
-            }
+            DocsOnlyEnum denum(tenum);
+            count = countTermInDomain(domainView, denum, docFreq);
           }
           // use heterogeneous lookup in the future to avoid creating string when not needed
           if (count > 0 || thisOp().minCount == 0) {
@@ -446,29 +408,8 @@ public:
           }
         }
         if (thisOp().missing) {
-          // missing = in-domain docs that have no value for this field.  The
-          // docs-with-value set is already indexed (the field-length/norms
-          // column), so intersect it with the domain rather than rebuilding a
-          // per-doc set during the term scan.
           DocsReader docsReader(postingsReader, segFieldInfo);
-          int64_t domainCard = domain ? domain->card() : maxDoc;
-          int64_t haveField;
-          if (!docsReader.hasBitset()) {
-            // dense: every doc has the field, so none in the domain are missing.
-            haveField = domainCard;
-          } else if (!domain) {
-            // null domain == all docs, so the intersection is exactly docsWithField.
-            haveField = docsReader.numDocs();
-          } else {
-            haveField = 0;
-            screaming::BitSet::Iterator it(docsReader.bitset());
-            for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) {
-              if (domain->get(doc)) {
-                haveField++;
-              }
-            }
-          }
-          data.missing_num += domainCard - haveField;
+          data.missing_num += countMissingInDomain(domainView, docsReader);
         }
       });
     }

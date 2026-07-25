@@ -182,6 +182,21 @@ public:
     return numTermBlocks;
   }
 
+  // Walk local term ordinals and docFreqs without reconstructing term bytes.
+  // Stats are bulk-decoded once per term block; suffix starts and suffix bytes
+  // remain untouched. The enum is left on the final term.
+  template <class F>
+  void forEachDocFreq(F&& callback) {
+    for (termBlockIndex = 0; termBlockIndex < numTermBlocks; termBlockIndex++) {
+      readTermBlock();
+      decodeStats();
+      for (int32_t i = 0; i <= maxOrdInBlock; i++) {
+        ordInBlock = i;
+        callback(ord(), (int32_t)docFreqs[(size_t)ordInBlock]);
+      }
+    }
+  }
+
   int64_t dictionaryBytes() const {
     if (fieldInfo.nTerms == 0) return 0;
     assert(fieldInfo.termBlockIndexLoc.filenum() == fieldInfo.termsLoc.filenum());
