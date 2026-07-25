@@ -6967,7 +6967,7 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   for (int32_t doc = 0; doc < 1024; doc++) {
     std::string body = "quick fox pad";
     if ((doc % 2) == 0) body += " keep";
-    if ((doc % 64) == 0) body += " selective";
+    if ((doc % 512) == 0) body += " selective";  // below the mask-density gate
     if ((doc % 3) == 0) appendRepeatedTerm(body, "body_a", 1 + doc % 5);
     if ((doc % 5) == 0) body += " body_b";
     if ((doc % 7) == 0) body += " bonus";
@@ -7065,6 +7065,9 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   EXPECT_EQ(countBulk(unionQuery), expectedUnion.visited);
 
   TermQuery selective("body_w", "selective");
+  // The routing assertion below is only meaningful while this filter stays
+  // under the mask-density gate; fail loudly if the constant moves past it.
+  ASSERT_LT(2, 1024 / (int32_t) BooleanQuery::kMaskFilterDensityInverse + 1);
   std::vector<Query*> selectiveFilter = {&selective};
   BooleanQuery selectiveQuery(oneMandatory, {}, {}, selectiveFilter);
   {
@@ -7101,7 +7104,7 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
   int32_t filterCount = 0;
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body = "wand_common";
-    bool matchesFilter = (doc % 41) == 0;
+    bool matchesFilter = (doc % 300) == 0;  // stays under the mask-density gate
     if (matchesFilter) {
       body += " wand_filter";
       int32_t filterOrd = filterCount++;

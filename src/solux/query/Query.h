@@ -249,8 +249,21 @@ struct CachedFieldInfo {
 // NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
 // Scored TOP_k filter routing crossover, shared by the boolean window-mask
 // gate and the filter cache's scored-route gate: below maxDoc/this the pull
-// side (filter leads) wins. Measured on the 5M sweep: 1% filter density.
-inline constexpr int64_t kMaskFilterDensityInverse = 32;
+// side (filter leads) wins. Mask viability tracks FILTER DENSITY - the rate
+// accepted docs surface is the rate the collector floor rises - so a very
+// sparse filter starves theta and degenerates the mask toward an unpruned
+// scan, while a denser filter lets the mask keep MaxScore's pruning.
+// MEASURED CROSSOVER (5M corpus, full 1,010-query set, pull vs forced mask,
+// solux/lucene at TOP_10/TOP_100, zero count mismatches between routes):
+//   1.99%  pull 1.80/1.85   mask 0.85/0.91   -> mask
+//   0.99%  pull 1.70/1.61   mask 0.89/0.97   -> mask
+//   0.50%  pull 1.44/1.24   mask 0.94/1.03   -> mask
+//   0.20%  pull 0.94/0.90   mask 1.03/1.22   -> pull
+//   0.02%  pull 0.44/0.50   mask 1.36/1.82   -> pull
+// 256 puts the threshold at 0.39% (maxDoc/256), so every measured point lands
+// on its winning side. The previous value 32 (3.1%) left the whole 0.4-3%
+// band on pull, where it lost up to 1.85x overall and 2.98x on unions.
+inline constexpr int64_t kMaskFilterDensityInverse = 256;
 
 class Query {
 public:
