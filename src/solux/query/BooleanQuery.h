@@ -403,6 +403,8 @@ public:
   // A/B toggle: retain the plain pull DisjunctionScorer for sparse filtered
   // term unions instead of using head/tail WAND candidate formation.
   static inline bool disableFilteredUnionWandForTests = false;
+  // A/B toggle: keep prohibited scored disjunctions on the pull MandNot path.
+  static inline bool disableBulkExclusionForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
   // until the approximations agree). For benchmarking the two-phase win only.
@@ -1154,7 +1156,8 @@ public:
             segment.maxDoc(), mandCost);
       }
 
-      BulkScorer* maxScoreBulkScorer(MemPool& targetPool) {
+      BulkScorer* maxScoreBulkScorer(MemPool& targetPool,
+                                     bool withBulkExclusion = false) {
         auto& optionalScorersVec = *targetPool.make_vec<Query::Scorer*>();
         optionalScorersVec.reserve(optionalSources.size());
         // Count-only identity routing needs every per-segment term df even for
@@ -1200,11 +1203,48 @@ public:
           optionalCosts = {optionalCostsVec->data(), optionalCostsVec->size()};
         }
         if (optionalScorers.size() < 2) {
+          if (withBulkExclusion) {
+            skipCount(SkipStats::bulkExclusionPositiveSegmentFallbacks);
+          }
           return nullptr;
         }
+
+        std::span<Query::Scorer*> exclusionScorers;
+        if (withBulkExclusion) {
+          auto& exclusions = *targetPool.make_vec<Query::Scorer*>();
+          for (auto* source : prohibitedSources) {
+            auto* supplier = source->scorerSupplier(targetPool, segment);
+            if (supplier == nullptr) {
+              continue;
+            }
+            auto* scorer = supplier->get(
+                targetPool, std::numeric_limits<int64_t>::max());
+            if (scorer == nullptr) {
+              continue;
+            }
+            if (scorer->supportsWindowFilter()) {
+              exclusions.push_back(scorer);
+              continue;
+            }
+            // A prohibited Boolean is decomposable only as a flat OR whose
+            // members each satisfy the same exact window-fill contract.
+            auto members = scorer->flatDisjunctionScorers();
+            if (members.empty()
+                || !std::all_of(
+                    members.begin(), members.end(), [](Query::Scorer* member) {
+                      return member->supportsWindowFilter();
+                    })) {
+              skipCount(SkipStats::bulkExclusionUnsupportedFallbacks);
+              return nullptr;
+            }
+            exclusions.insert(exclusions.end(), members.begin(), members.end());
+          }
+          exclusionScorers = {exclusions.data(), exclusions.size()};
+          skipCount(SkipStats::bulkExclusionEngagements);
+        }
         return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
-            targetPool, optionalScorers, optionalCosts, segment.maxDoc(),
-            aggregateClauseCost, !needsScores,
+            targetPool, optionalScorers, optionalCosts, exclusionScorers,
+            segment.maxDoc(), aggregateClauseCost, !needsScores,
             segment.liveDocs() != nullptr);
       }
 
@@ -1440,6 +1480,23 @@ public:
         if (mandatorySources.empty() && optionalSources.empty()
             && prohibitedSources.empty() && !filterSuppliers.empty()) {
           return filterOnlyBulkScorer(targetPool);
+        }
+        if (needsScores && !prohibitedSources.empty()) {
+          // Normalization hoists +(a b) -c to this exact shape. Required,
+          // filtered, min-match, and single-positive forms retain their
+          // existing pull/conjunction routing.
+          bool maxScoreShape = mandatorySources.empty()
+              && filterSuppliers.empty() && minShouldMatch <= 1
+              && optionalSources.size() >= 2;
+          if (!maxScoreShape) {
+            skipCount(SkipStats::bulkExclusionShapeFallbacks);
+            return nullptr;
+          }
+          if (disableBulkExclusionForTests) {
+            skipCount(SkipStats::bulkExclusionDisabledFallbacks);
+            return nullptr;
+          }
+          return maxScoreBulkScorer(targetPool, true);
         }
         // Filtered and negated counts use the windowed intersection only when
         // the positive body and every exclusion support exact dense fills.
@@ -5339,6 +5396,8 @@ public:
     std::span<Query::Scorer*> disjCountIdentityOthers;
     TermQuery::Scorer* disjCountIdentityLargest = nullptr;
     int64_t disjCountIdentityLargestDf = 0;
+    std::span<Query::Scorer*> exclusionScorers;  // flattened OR
+    std::span<uint64_t> exclusionBits;           // current production window
     WindowFilter* windowFilter = nullptr;
 
     int32_t maxDoc;
@@ -5778,6 +5837,42 @@ public:
       std::fill(windowBits.begin(), windowBits.end(), 0);
     }
 
+    void prepareExclusionWindow() {
+      if (exclusionScorers.empty()) {
+        return;
+      }
+      // This is intentionally not a WindowFilter complement. Exclusions are
+      // sparse OR bits consumed with AND-NOT at candidate formation.
+      assert(windowEnd >= windowStart);
+      assert(windowEnd - windowStart <= kWindowSize);
+      std::fill(exclusionBits.begin(), exclusionBits.end(), 0);
+      skipCount(SkipStats::bulkExclusionWindows);
+      for (Query::Scorer* scorer : exclusionScorers) {
+        scorer->fillWindowBits(exclusionBits, windowStart, windowEnd);
+        skipCount(SkipStats::bulkExclusionFills);
+      }
+    }
+
+    bool isExcluded(int32_t doc) const {
+      if (exclusionBits.empty()) {
+        return false;
+      }
+      assert(doc >= windowStart && doc < windowEnd);
+      int32_t index = doc - windowStart;
+      return (exclusionBits[(size_t) (index >> 6)]
+              & (1ULL << (index & 63))) != 0;
+    }
+
+    void removeExcludedWindowBits(std::span<uint64_t> bits) const {
+      if (exclusionBits.empty()) {
+        return;
+      }
+      assert(bits.size() == exclusionBits.size());
+      for (size_t word = 0; word < bits.size(); word++) {
+        bits[word] &= ~exclusionBits[word];
+      }
+    }
+
     static void clearCountBits(std::span<uint64_t> bits) {
       std::fill(bits.begin(), bits.end(), 0);
     }
@@ -5868,6 +5963,7 @@ public:
           && windowFilter->prepare(windowStart, windowEnd) == 0) {
         return false;
       }
+      prepareExclusionWindow();
       return true;
     }
 
@@ -5885,6 +5981,7 @@ public:
       if (windowFilter != nullptr) {
         windowFilter->intersect(windowBits);
       }
+      removeExcludedWindowBits(windowBits);
       return true;
     }
 
@@ -5929,6 +6026,7 @@ public:
       if (windowFilter != nullptr) {
         windowFilter->intersect(windowBits);
       }
+      removeExcludedWindowBits(windowBits);
       return true;
     }
 
@@ -5976,6 +6074,9 @@ public:
 
     bool acceptsDoc(DocSet* filter, const FixedBitSet* domainBits, int32_t doc) const {
       if (windowFilter != nullptr && !windowFilter->accepts(doc)) {
+        return false;
+      }
+      if (isExcluded(doc)) {
         return false;
       }
       if (filter == nullptr) {
@@ -6084,7 +6185,8 @@ public:
         }
         while (arrayCursor < docs.size() && docs[arrayCursor] < windowEnd) {
           int32_t doc = docs[arrayCursor];
-          if (windowFilter == nullptr || windowFilter->accepts(doc)) {
+          if ((windowFilter == nullptr || windowFilter->accepts(doc))
+              && !isExcluded(doc)) {
             perDoc(doc);
           }
           arrayCursor++;
@@ -6100,7 +6202,8 @@ public:
         if (doc >= windowEnd) {
           break;
         }
-        if (windowFilter == nullptr || windowFilter->accepts(doc)) {
+        if ((windowFilter == nullptr || windowFilter->accepts(doc))
+            && !isExcluded(doc)) {
           perDoc(doc);
         }
       }
@@ -6189,12 +6292,13 @@ public:
     }
 
     bool prepareFilterWindow(ScoreWindow& out) {
-      if (windowFilter == nullptr
-          || windowFilter->prepare(windowStart, windowEnd) != 0) {
-        return true;
+      if (windowFilter != nullptr
+          && windowFilter->prepare(windowStart, windowEnd) == 0) {
+        prepareOutputWindow(out);
+        return false;
       }
-      prepareOutputWindow(out);
-      return false;
+      prepareExclusionWindow();
+      return true;
     }
 
     void recordBufferDrops(int32_t before, int32_t after) {
@@ -6344,7 +6448,8 @@ public:
         scorer->advance(windowStart);
       }
 
-      if (filter == nullptr && windowFilter == nullptr) {
+      if (filter == nullptr && windowFilter == nullptr
+          && exclusionScorers.empty()) {
         int32_t n;
         while ((n = scorer->fillScoreBlock(out.docs.data() + out.size,
                                            out.scores.data() + out.size,
@@ -6409,6 +6514,7 @@ public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
                        std::span<int64_t> clauseCosts,
+                       std::span<Query::Scorer*> exclusionScorers,
                        int32_t maxDoc, int64_t aggregateClauseCost,
                        bool enableDisjConjCount, bool hasDeletes)
             : scorers(scorers),
@@ -6425,6 +6531,11 @@ public:
               windowScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
               outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+              exclusionScorers(exclusionScorers),
+              exclusionBits(
+                  exclusionScorers.empty()
+                    ? std::span<uint64_t>{}
+                    : pool.make_span<uint64_t>((size_t) kWindowWords)),
               maxDoc(maxDoc),
               aggregateClauseCost(aggregateClauseCost) {
       assert(clauseCosts.empty() || scorers.size() == clauseCosts.size());

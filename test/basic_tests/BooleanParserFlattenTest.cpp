@@ -169,6 +169,19 @@ TEST_F(BooleanParserFlattenTest, negationFormsNormalizeToComplements) {
   }
 }
 
+TEST_F(BooleanParserFlattenTest, requiredDisjunctionWithExclusionHoists) {
+  auto view = shape(parseSimple("+(a b) -c"));
+  EXPECT_EQ(0, view.mandatoryCount);
+  EXPECT_EQ(2, view.optionalCount);
+  EXPECT_EQ(1, view.prohibitedCount);
+  EXPECT_EQ(1, view.minShouldMatch);
+  EXPECT_EQ(BooleanQuery::R3_REQUIRED_DISJUNCTION_HOIST,
+            view.ruleMask & BooleanQuery::R3_REQUIRED_DISJUNCTION_HOIST);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)), view.optionalTypes[0]);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)), view.optionalTypes[1]);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)), view.prohibitedTypes[0]);
+}
+
 TEST_F(BooleanParserFlattenTest, conjunctionAndDisjunctionFormsFlatten) {
   TestIndex index;
   buildIndex(index);

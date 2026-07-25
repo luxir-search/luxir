@@ -100,6 +100,13 @@ struct SkipStats {
   static inline int64_t conjDenseCountWindows = 0;
   static inline int64_t negatedCountWindows = 0;
   static inline int64_t negatedCountExclFills = 0;
+  static inline int64_t bulkExclusionEngagements = 0;
+  static inline int64_t bulkExclusionWindows = 0;
+  static inline int64_t bulkExclusionFills = 0;
+  static inline int64_t bulkExclusionDisabledFallbacks = 0;
+  static inline int64_t bulkExclusionShapeFallbacks = 0;
+  static inline int64_t bulkExclusionPositiveSegmentFallbacks = 0;
+  static inline int64_t bulkExclusionUnsupportedFallbacks = 0;
   static inline int64_t conjDenseMatchWindows = 0;
   static inline int64_t conjDenseScoredWindows = 0;
   static inline int64_t conjDenseScoredAdmits = 0;
@@ -219,6 +226,13 @@ struct SkipStats {
     conjDenseCountWindows = 0;
     negatedCountWindows = 0;
     negatedCountExclFills = 0;
+    bulkExclusionEngagements = 0;
+    bulkExclusionWindows = 0;
+    bulkExclusionFills = 0;
+    bulkExclusionDisabledFallbacks = 0;
+    bulkExclusionShapeFallbacks = 0;
+    bulkExclusionPositiveSegmentFallbacks = 0;
+    bulkExclusionUnsupportedFallbacks = 0;
     conjDenseMatchWindows = 0;
     conjDenseScoredWindows = 0;
     conjDenseScoredAdmits = 0;
