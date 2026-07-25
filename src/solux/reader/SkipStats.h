@@ -107,6 +107,8 @@ struct SkipStats {
   static inline int64_t bulkExclusionShapeFallbacks = 0;
   static inline int64_t bulkExclusionPositiveSegmentFallbacks = 0;
   static inline int64_t bulkExclusionUnsupportedFallbacks = 0;
+  static inline int64_t phraseExclusionWindowAdmits = 0;
+  static inline int64_t phraseExclusionWindowRejects = 0;
   static inline int64_t conjDenseMatchWindows = 0;
   static inline int64_t conjDenseScoredWindows = 0;
   static inline int64_t conjDenseScoredAdmits = 0;
@@ -233,6 +235,8 @@ struct SkipStats {
     bulkExclusionShapeFallbacks = 0;
     bulkExclusionPositiveSegmentFallbacks = 0;
     bulkExclusionUnsupportedFallbacks = 0;
+    phraseExclusionWindowAdmits = 0;
+    phraseExclusionWindowRejects = 0;
     conjDenseMatchWindows = 0;
     conjDenseScoredWindows = 0;
     conjDenseScoredAdmits = 0;

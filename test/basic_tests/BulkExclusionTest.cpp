@@ -53,6 +53,8 @@ struct Counters {
   int64_t shapeFallbacks;
   int64_t positiveSegmentFallbacks;
   int64_t unsupportedFallbacks;
+  int64_t phraseAdmits;
+  int64_t phraseRejects;
   int64_t maxScoreWindows;
 };
 
@@ -123,6 +125,8 @@ TopRun runTop(CollectionHelper& helper, bool disabled,
       .positiveSegmentFallbacks =
           SkipStats::bulkExclusionPositiveSegmentFallbacks,
       .unsupportedFallbacks = SkipStats::bulkExclusionUnsupportedFallbacks,
+      .phraseAdmits = SkipStats::phraseExclusionWindowAdmits,
+      .phraseRejects = SkipStats::phraseExclusionWindowRejects,
       .maxScoreWindows = SkipStats::maxScoreInnerWindows,
   };
   return result;
@@ -202,13 +206,22 @@ TEST_F(BulkExclusionTest, scoredDisjunctionEngagesAndMatchesDisabledOracle) {
   EXPECT_EQ(pull.counters.engagements, 0);
 }
 
-TEST_F(BulkExclusionTest, phraseExclusionFallsBack) {
+TEST_F(BulkExclusionTest, phraseExclusionEngagesAndMatchesDisabledOracle) {
   addSegment(helper, "p_", 1000, true, true);
-  TopRun run = runTop(
+  addSegment(helper, "q_", 1000, true, true);
+  TopRun bulk = runTop(
       helper, false, "left", "right", "ex0", /*phraseExclusion=*/true);
-  EXPECT_GT(run.counters.unsupportedFallbacks, 0);
-  EXPECT_EQ(run.counters.engagements, 0);
-  EXPECT_EQ(run.counters.maxScoreWindows, 0);
+  TopRun pull = runTop(
+      helper, true, "left", "right", "ex0", /*phraseExclusion=*/true);
+  expectSameTop(pull, bulk);
+  EXPECT_GT(bulk.counters.phraseAdmits, 0);
+  EXPECT_EQ(bulk.counters.phraseRejects, 0);
+  EXPECT_EQ(bulk.counters.unsupportedFallbacks, 0);
+  EXPECT_GT(bulk.counters.engagements, 0);
+  EXPECT_GT(bulk.counters.windows, 0);
+  EXPECT_GT(bulk.counters.fills, 0);
+  EXPECT_GT(bulk.counters.maxScoreWindows, 0);
+  EXPECT_GT(pull.counters.disabledFallbacks, 0);
 }
 
 TEST_F(BulkExclusionTest, singleTermPositiveKeepsPullPath) {

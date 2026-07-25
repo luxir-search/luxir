@@ -250,12 +250,14 @@ public:
         return targetPool.make<SloppyScorer>(
             targetPool, slotEnums, slotPosEnums, positions, ordinals,
             conjunctionEnums, conjunctionPosEnums, normsReader,
-            simScorer, impacts, impactMultiplicities, slotGroup, groups, query.getSlop());
+            simScorer, impacts, impactMultiplicities, slotGroup, groups,
+            query.getSlop(), (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
       }
       return targetPool.make<Scorer>(
           targetPool, slotEnums, slotPosEnums, positions, ordinals,
           conjunctionEnums, conjunctionPosEnums, normsReader,
-          simScorer, impacts, impactMultiplicities, slotGroup, groups, 0);
+          simScorer, impacts, impactMultiplicities, slotGroup, groups, 0,
+          (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
     }
 
     class Supplier final : public Query::ScorerSupplier {
@@ -278,8 +280,16 @@ public:
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        unused(leadCost);
-        return weight.createScorer(targetPool, segment);
+        Query::Scorer* scorer = weight.createScorer(targetPool, segment);
+        if (scorer == nullptr) return nullptr;
+        if (weight.query.getSlop() > 0) {
+          static_cast<PhraseQuery::SloppyScorer*>(scorer)
+              ->setWindowFillPositiveCost(leadCost);
+        } else {
+          static_cast<PhraseQuery::Scorer*>(scorer)
+              ->setWindowFillPositiveCost(leadCost);
+        }
+        return scorer;
       }
     };
 
@@ -686,6 +696,16 @@ public:
   class PhraseScorer final : public Query::Scorer {
     friend MatcherPolicy;
 
+    // Position-verification price for a windowed exclusion fill, relative to
+    // the positive side's cost. A windowed fill verifies positions for every
+    // approximation hit in the window; the pull path verifies only the docs
+    // that survive the positive leapfrog, so admitting too eagerly loses.
+    // MEASURED on the 70-query neg_phrase population (5M corpus): weight 4.0
+    // admits 8 and gives class 0.90; 1.0 admits 22 and gives 0.77 with one
+    // query at 1.12; 0.25 admits 41 and gives 0.68 but grows a loss tail of
+    // seven queries up to 1.53. 1.0 takes most of the win without the tail.
+    static constexpr double kExclusionWindowFillPositionWeight = 1.0;
+
     std::span<DocsPosEnum*> slotEnums;
     std::span<PosEnum*> slotPosEnums;
     std::span<const int32_t> positions;
@@ -707,6 +727,9 @@ public:
     int32_t checkedDocid = -1;
     bool checkedMatch = false;
     float matchCostEstimate = 0.0f;
+    int64_t windowFillPositiveCost = 0;
+    int64_t approximationCost;
+    bool exclusionWindowFill;
     const uint8_t* flatNormsBase = nullptr;
     int32_t cachedNormDoc = -1;
     uint8_t cachedNorm = 0;
@@ -854,12 +877,14 @@ public:
                  Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
                  std::span<const int32_t> impactMultiplicities,
                  std::span<const int32_t> slotGroup, std::span<RepeatGroup> groups,
-                 int32_t slop)
+                 int32_t slop, bool exclusionWindowFill = false)
         : slotEnums(slotEnums), slotPosEnums(slotPosEnums), positions(positions),
           ordinals(ordinals), conjunctionEnums(conjunctionEnums),
           conjunctionPosEnums(conjunctionPosEnums), pool(&targetPool), slotGroup(slotGroup),
           groups(groups), simScorer(simScorer), impacts(impacts),
-          impactMultiplicities(impactMultiplicities), matcher(slop) {
+          impactMultiplicities(impactMultiplicities), matcher(slop),
+          approximationCost(conjunctionEnums[0]->numDocs()),
+          exclusionWindowFill(exclusionWindowFill) {
       if (!groups.empty()) slotCursor = targetPool.make_span<int32_t>(slotEnums.size());
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) {
@@ -938,6 +963,44 @@ public:
       return doMatches();
     }
     float matchCost() override { return matchCostEstimate; }
+
+    void setWindowFillPositiveCost(int64_t cost) {
+      windowFillPositiveCost = cost;
+    }
+
+    bool supportsWindowFilter() const override {
+      if (!exclusionWindowFill) {
+        return false;
+      }
+      double fillWork = (double) approximationCost
+          * (double) std::max(matchCostEstimate, 1.0f)
+          * kExclusionWindowFillPositionWeight;
+      bool admitted = fillWork <= (double) windowFillPositiveCost;
+      skipCount(admitted ? SkipStats::phraseExclusionWindowAdmits
+                         : SkipStats::phraseExclusionWindowRejects);
+      return admitted;
+    }
+
+    void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
+                        int32_t windowEnd) override {
+#ifndef NDEBUG
+      markSinglePhase();
+#endif
+      skipCount(SkipStats::countBulkFillCalls);
+      if (windowEnd <= windowStart || docid == PostingsReader::END) {
+        return;
+      }
+      if (docid < windowStart) {
+        doApproximationAdvance(windowStart);
+      }
+      while (docid < windowEnd) {
+        if (doMatches()) {
+          int32_t index = docid - windowStart;
+          windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+        }
+        doApproximationNext();
+      }
+    }
 
     int32_t next() override {
 #ifndef NDEBUG

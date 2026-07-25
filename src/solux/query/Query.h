@@ -266,6 +266,10 @@ public:
   /// The request may skip non-competitive matches because it does not require
   /// an exact hit count. Propagated independently of NEED_SCORES.
   static constexpr int32_t ALLOW_PRUNING = 1 << 1;
+  /// Internal planning flag for clauses under Boolean MUST_NOT. It lets
+  /// expensive exact-fill scorers expose the window contract only to
+  /// exclusion consumers, without changing positive-side execution.
+  static constexpr int32_t EXCLUSION_WINDOW_FILL = 1 << 2;
 
   // Query-tree score semantics, derived before Weight creation. This is
   // intentionally separate from Weight::IS_CONSTANT_SCORING: the latter is

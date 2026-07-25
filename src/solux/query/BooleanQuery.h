@@ -1217,8 +1217,7 @@ public:
             if (supplier == nullptr) {
               continue;
             }
-            auto* scorer = supplier->get(
-                targetPool, std::numeric_limits<int64_t>::max());
+            auto* scorer = supplier->get(targetPool, aggregateClauseCost);
             if (scorer == nullptr) {
               continue;
             }
@@ -1656,7 +1655,9 @@ public:
       optionalWeights = dropOptional
         ? std::span<Query::Weight*>{}
         : createWeights(context.pool, context, optionalClauses, flags, multiplier);
-      prohibitedWeights = createWeights(context.pool, context, prohibitedClauses, noScore, 1.0f);
+      prohibitedWeights = createWeights(
+          context.pool, context, prohibitedClauses,
+          noScore | EXCLUSION_WINDOW_FILL, 1.0f);
       int32_t exhaustiveFilterFlags = flags & ~(NEED_SCORES | ALLOW_PRUNING);
       filterWeights = createWeights(context.pool, context, filterClauses,
                                     exhaustiveFilterFlags, 1.0f);
