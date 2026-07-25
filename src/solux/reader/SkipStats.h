@@ -104,6 +104,7 @@ struct SkipStats {
   static inline int64_t conjDenseScoredWindows = 0;
   static inline int64_t conjDenseScoredAdmits = 0;
   static inline int64_t conjDenseScoredLatchBacks = 0;
+  static inline int64_t conjDenseScoredDensityRejects = 0;
   static inline int64_t conjDenseScoredCostRejects = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
@@ -213,6 +214,7 @@ struct SkipStats {
     conjDenseScoredWindows = 0;
     conjDenseScoredAdmits = 0;
     conjDenseScoredLatchBacks = 0;
+    conjDenseScoredDensityRejects = 0;
     conjDenseScoredCostRejects = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;

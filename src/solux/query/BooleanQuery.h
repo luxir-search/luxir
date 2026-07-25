@@ -3331,15 +3331,30 @@ public:
     int32_t denseSampleWindows = 0;
     int64_t denseSampleLead = 0;
     int64_t denseSampleSurvivors = 0;
+    int32_t denseScoredTopK = 0;
 
     // Dense-scored admission thresholds were calibrated on the 5M benchmark
     // corpus. Keep them together so the measured policy remains legible.
     static constexpr int32_t kDenseScoredMinTopK = 100;
     static constexpr int32_t kDenseAdmissionSampleWindows = 8;
     static constexpr int32_t kDenseAdmissionMinLeadPerWindow = 32;
-    static constexpr int32_t kDenseAdmissionMaxSurvivorsPerWindow = 16;
-    static constexpr int32_t kDenseAdmissionMaxSurvivorPercent = 10;
     static constexpr int32_t kDenseAdmissionMaxNonLeadCostRatio = 8;
+    static constexpr int32_t kDenseAdmissionMaxDensityTopK = 1000;
+    static constexpr int32_t kDenseAdmissionMinDensityPercent = 10;
+    static constexpr int32_t kDenseAdmissionMaxDensityPercent = 60;
+    static constexpr int32_t kDenseAdmissionDensityTopKSpan =
+        kDenseAdmissionMaxDensityTopK - kDenseScoredMinTopK;
+    static constexpr int32_t kDenseAdmissionDensityDenominator =
+        100 * kDenseAdmissionDensityTopKSpan;
+
+    static int32_t denseAdmissionDensityNumerator(int32_t topK) {
+      int32_t clampedTopK = std::clamp(
+          topK, kDenseScoredMinTopK, kDenseAdmissionMaxDensityTopK);
+      return kDenseAdmissionMinDensityPercent * kDenseAdmissionDensityTopKSpan
+          + (clampedTopK - kDenseScoredMinTopK)
+              * (kDenseAdmissionMaxDensityPercent
+                  - kDenseAdmissionMinDensityPercent);
+    }
 
     bool acceptsDoc(DocSet* filter, int32_t doc) {
       if (filter != nullptr && !filter->get(doc)) {
@@ -4138,14 +4153,21 @@ public:
           || (denseSampleWindows < kDenseAdmissionSampleWindows && !terminal)) {
         return;
       }
-      bool admitted =
-          denseSampleLead
-              >= (int64_t) kDenseAdmissionMinLeadPerWindow * denseSampleWindows
-          && denseSampleSurvivors
-              <= (int64_t) kDenseAdmissionMaxSurvivorsPerWindow
-                     * denseSampleWindows
-          && denseSampleSurvivors * 100
-              <= denseSampleLead * kDenseAdmissionMaxSurvivorPercent;
+      bool leadAccepted = denseSampleLead
+          >= (int64_t) kDenseAdmissionMinLeadPerWindow * denseSampleWindows;
+      bool densityAccepted =
+          denseSampleSurvivors * kDenseAdmissionDensityDenominator
+          <= denseSampleLead
+              * denseAdmissionDensityNumerator(denseScoredTopK);
+      if (!densityAccepted) {
+        skipCount(SkipStats::conjDenseScoredDensityRejects);
+      }
+      // Construction bounds summed non-lead cost at 8x lead, so total fill is
+      // about 9x lead work; density bounds survivor scoring. An absolute cap
+      // priced neither side and blocked high-lead/deep-k wins: american south
+      // (82.6 survivors/window, density 0.184, ratio 0.489) and to be or not
+      // to be (401.9 survivors/window, density 0.473).
+      bool admitted = leadAccepted && densityAccepted;
       denseScoredAdmission = admitted
           ? DenseScoredAdmission::ADMITTED
           : DenseScoredAdmission::SCORE_FIRST;
@@ -4449,6 +4471,7 @@ public:
       if (!denseScoredEligible) {
         return;
       }
+      denseScoredTopK = topK;
       denseScoredAdmission = DenseScoredAdmission::SAMPLING;
     }
 
