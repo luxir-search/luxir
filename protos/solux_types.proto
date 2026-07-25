@@ -542,12 +542,15 @@ message ExecutionProfilePiece {
   optional sint64 domain_size = 6;
   int64 thread_id = 7;
   uint64 elapsed_us = 8;
-  // Free-form execution notes FOR HUMAN READING, not machine parsing: one
-  // short clause per entry (column reader choice, terms-index vs column,
-  // "want=hash, found=skinny" when the shared accumulator already outgrew
-  // this piece's pick, per-field notes when one piece reads several columns).
-  // Deliberately unstructured so new strategies never need schema changes;
-  // repeated so pretty-printed JSON stays readable without escaped newlines.
+  // Free-form execution notes FOR HUMAN READING: one short clause per entry
+  // (column reader choice, terms-index vs column, "want=hash, found=skinny"
+  // when the shared accumulator already outgrew this piece's pick, per-field
+  // notes when one piece reads several columns).  Not part of the API - the
+  // wording, ordering, and entry count change with the engine, so no consumer
+  // outside this repo should parse it (tests ship with the code and may match
+  // a fragment to confirm a path fired).  Deliberately unstructured so new
+  // strategies never need schema changes; repeated so pretty-printed JSON
+  // stays readable without escaped newlines.
   repeated string details = 9;
 }
 

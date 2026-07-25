@@ -314,8 +314,9 @@ domain over the field's ord column, walking the domain's complement and
 subtracting from each term's docFreq (cheap when the domain covers most of the
 segment), or intersecting each term's postings with the domain.
 Treat `strategy` and the typed numeric fields as diagnostics, not a stable
-performance promise. `details` is deliberately human-readable and must not be
-machine-parsed. Use `max_parallel: 1` when comparing segment timings without
+performance promise. `details` is prose for humans and is not part of the API:
+its wording, ordering, and entry count change with the engine, so do not build
+tooling on it. Use `max_parallel: 1` when comparing segment timings without
 parallel scheduling as a variable.
 
 ## Streaming HTTP responses

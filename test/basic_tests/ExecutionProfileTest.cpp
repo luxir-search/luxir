@@ -34,6 +34,29 @@ const api::ExecutionProfileOp& profileOp(const LocalReq& req) {
   return response.profile->ops[0];
 }
 
+// details is free-form prose for humans and NOT an API, but tests ship with the
+// code, so matching a marker in it is a fine way to confirm the intended path
+// fired.  Match a distinguishing fragment, never a whole rendered line - the
+// wording and the ordering are meant to stay free to change.
+::testing::AssertionResult detailsMention(
+    const api::ExecutionProfilePiece& piece, std::string_view marker) {
+  for (const auto& detail : piece.details) {
+    if (std::string_view(detail).find(marker) != std::string_view::npos) {
+      return ::testing::AssertionSuccess();
+    }
+  }
+  return ::testing::AssertionFailure()
+      << "no detail mentions '" << marker << "'; details are ["
+      << [&] {
+           std::string joined;
+           for (const auto& detail : piece.details) {
+             if (!joined.empty()) joined += " | ";
+             joined += std::string(detail);
+           }
+           return joined;
+         }() << "]";
+}
+
 } // namespace
 
 TEST_F(ExecutionProfileTest, absentUnlessRequested) {
@@ -89,11 +112,9 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
     EXPECT_EQ(expectedStrategy(*piece.domain_size, *piece.cardinality), piece.strategy);
     // An unfiltered facet has an empty domain complement, so every term's count
     // IS its docFreq: the ord column is never read.
-    ASSERT_GE(piece.details.size(), 2u);
-    EXPECT_EQ("seg maxOrd=" + std::to_string(localMaxOrds[i])
-                  + " ords=" + std::string(ordMappings[i]),
-              piece.details[0]);
-    EXPECT_EQ("all-docs domain, docFreq-only dictionary walk", piece.details[1]);
+    EXPECT_TRUE(detailsMention(piece, "maxOrd=" + std::to_string(localMaxOrds[i])
+                                          + " ords=" + std::string(ordMappings[i])));
+    EXPECT_TRUE(detailsMention(piece, "docFreq-only"));
     EXPECT_GT(piece.thread_id, 0);
     EXPECT_LT(piece.elapsed_us, 60'000'000u);
   }
@@ -102,13 +123,10 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
   // the already-upgraded skinny (no-downgrade rule) - all spelled out in the
   // human-readable details rather than typed fields.
   EXPECT_EQ("hash", op.pieces[0].strategy);
-  ASSERT_EQ(2u, op.pieces[0].details.size());
   EXPECT_EQ("skinny", op.pieces[1].strategy);
-  ASSERT_EQ(3u, op.pieces[1].details.size());
-  EXPECT_EQ("upgraded shared counters to skinny", op.pieces[1].details[2]);
+  EXPECT_TRUE(detailsMention(op.pieces[1], "upgraded shared counters to skinny"));
   EXPECT_EQ("hash", op.pieces[2].strategy);
-  ASSERT_EQ(3u, op.pieces[2].details.size());
-  EXPECT_EQ("want=hash, found=skinny", op.pieces[2].details[2]);
+  EXPECT_TRUE(detailsMention(op.pieces[2], "want=hash, found=skinny"));
 
   std::string json = renderSearchResponseLine(req->responses.back()->proto);
   EXPECT_NE(std::string::npos, json.find(R"("profile":{"ops":[{"name":"tags")"));
@@ -156,9 +174,11 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   EXPECT_EQ(256, *pieces[0].domain_size);
   EXPECT_EQ(1, *pieces[0].cardinality);
   EXPECT_EQ("vector", pieces[0].strategy);
-  ASSERT_EQ(2u, pieces[0].details.size());  // no upgrade, no divergence note
-  EXPECT_EQ("seg maxOrd=1 ords=identity", pieces[0].details[0]);
-  EXPECT_EQ("all-docs domain, docFreq-only dictionary walk", pieces[0].details[1]);
+  EXPECT_TRUE(detailsMention(pieces[0], "maxOrd=1 ords=identity"));
+  EXPECT_TRUE(detailsMention(pieces[0], "docFreq-only"));
+  // no upgrade and no divergence note when this piece is the only contributor
+  EXPECT_FALSE(detailsMention(pieces[0], "upgraded"));
+  EXPECT_FALSE(detailsMention(pieces[0], "want="));
 }
 
 TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
@@ -182,9 +202,8 @@ TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
   const auto& pieces = profileOp(*req).pieces;
   ASSERT_EQ(1u, pieces.size());
   EXPECT_EQ(3, *pieces[0].domain_size);
-  ASSERT_GE(pieces[0].details.size(), 2u);
-  EXPECT_EQ("seg maxOrd=1 ords=identity", pieces[0].details[0]);
-  EXPECT_EQ("array domain, point ord loads", pieces[0].details[1]);
+  EXPECT_TRUE(detailsMention(pieces[0], "maxOrd=1 ords=identity"));
+  EXPECT_TRUE(detailsMention(pieces[0], "point ord loads"));
 }
 
 TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
