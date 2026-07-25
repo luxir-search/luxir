@@ -481,6 +481,18 @@ public:
   // Relative cost of one monotonic filter advance vs streaming one filter
   // posting. Probe when leadCost * this weight is below filterCost.
   static constexpr int64_t kMaskProbeAdvanceWeight = 6;
+  // Probing checks candidates one at a time instead of filling the filter's
+  // bits for the window, so it only pays when FILLING is the expensive side -
+  // i.e. on a FAT filter. A thin filter is cheap to fill (few bits, sparse
+  // postings) while probing still costs a scalar advance per candidate, so
+  // the body/filter ratio alone routes wrongly once thin filters reach the
+  // mask. Measured on the 300-query intersection class at TOP_100 (forced
+  // fill / probe, so >1 means probing WINS):
+  //   0.50% 0.938 | 0.99% 0.942 | 1.99% 0.912 | 3.12% 0.959 | 4.98% 0.748
+  //   9.9% 0.989 (tie) | 19.2% 1.072 | 29.9% 1.148 | 42.6% 1.204
+  // so probing additionally requires the filter to cover at least maxDoc/8
+  // (12.5%), which puts every measured point on its winning side.
+  static constexpr int64_t kMaskProbeMinFilterDensityInverse = 8;
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
@@ -1265,6 +1277,8 @@ public:
           filterScorers[i] = scorer;
         }
         bool probe = !disableFilterMaskProbeForTests && filterCost > 0
+            && filterCost >= (int64_t) segment.maxDoc()
+                                 / kMaskProbeMinFilterDensityInverse
             && bodyCost <= (filterCost - 1) / kMaskProbeAdvanceWeight;
         auto* windowFilter = targetPool.make<WindowFilter>(
             targetPool, filterScorers, probe, filterCost);
