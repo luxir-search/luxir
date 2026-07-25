@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <charconv>
@@ -40,13 +41,31 @@ constexpr int32_t kDenseVariantDocsPerTerm = 175;
 constexpr int32_t kDenseVariantTerms = 2;
 constexpr int32_t kStatsMaxDocs = 300000;
 
+int32_t denseTargetTerms() {
+  return solux::unit_tests
+      ? (int32_t)SoluxTest::scaleTestDimension(8, 2)
+      : kDenseTargetTerms;
+}
+
+int32_t denseExactDocsPerTerm() {
+  return solux::unit_tests
+      ? (int32_t)SoluxTest::scaleTestDimension(24, 2)
+      : kDenseExactDocsPerTerm;
+}
+
+int32_t denseVariantDocsPerTerm() {
+  return solux::unit_tests
+      ? (int32_t)SoluxTest::scaleTestDimension(32, 2)
+      : kDenseVariantDocsPerTerm;
+}
+
 // Term corpus shapes.  DECIMAL is synthetic and regular (deep, narrow,
 // digit-only fanout - the id-like shape).  WORDS is a real English
 // vocabulary (natural letter fanout, the term-query shape, dictionary
 // sized).  COMPOUND is word_word pairs from that vocabulary - natural
 // prefix structure scaled to ~1M distinct terms (the shape of shingle /
 // compound / multi-source dictionaries).
-enum class TermSource { DECIMAL, WORDS, COMPOUND };
+enum class TermSource { DECIMAL, WORDS, COMPOUND, COUNT };
 
 std::string makeBenchTerm(int32_t ord) {
   std::string term = "term_00000000";
@@ -176,6 +195,7 @@ public:
   std::vector<std::string> ceilTargets;
   std::vector<int32_t> ceilExpectedOrds;
   int32_t nTerms;
+  int32_t buildEffort;
   uint64_t seed;
   TermSource source;
   int32_t nBlocks = 0;
@@ -184,7 +204,8 @@ public:
   int64_t trieBytes = 0;
 
   TermSeekCorpus(TermSource sourceIn, int32_t termCount, uint64_t seedIn)
-      : nTerms(termCount), seed(seedIn), source(sourceIn) {
+      : nTerms(termCount), buildEffort(SoluxTest::effort),
+        seed(seedIn), source(sourceIn) {
     build();
   }
 
@@ -239,12 +260,14 @@ private:
       return;
     }
 
-    int32_t extraDocsPerDense = kDenseExactDocsPerTerm
-        + kDenseVariantTerms * kDenseVariantDocsPerTerm - 1;
+    int32_t exactDocs = denseExactDocsPerTerm();
+    int32_t variantDocs = denseVariantDocsPerTerm();
+    int32_t extraDocsPerDense =
+        exactDocs + kDenseVariantTerms * variantDocs - 1;
     int32_t maxDenseByDocs = extraDocsPerDense > 0 && kStatsMaxDocs > nTerms
         ? (kStatsMaxDocs - nTerms) / extraDocsPerDense
         : 0;
-    int32_t target = std::min({kDenseTargetTerms, maxDenseByDocs, nTerms});
+    int32_t target = std::min({denseTargetTerms(), maxDenseByDocs, nTerms});
     if (target <= 0) {
       return;
     }
@@ -323,18 +346,20 @@ private:
     for (int32_t ord : denseOrds) {
       dense[(size_t)ord] = 1;
     }
+    int32_t exactDocs = denseExactDocsPerTerm();
+    int32_t variantDocs = denseVariantDocsPerTerm();
     int32_t docid = 0;
     for (int32_t ord = 0; ord < nTerms; ord++) {
       std::string_view term = terms[(size_t)ord];
       if (dense[(size_t)ord]) {
-        for (int32_t docOrd = 0; docOrd < kDenseExactDocsPerTerm; docOrd++) {
+        for (int32_t docOrd = 0; docOrd < exactDocs; docOrd++) {
           inverter.setDoc(docid++);
           std::string body = denseBenchBody(term, docOrd);
           handler.index(inverter, std::string_view(body));
         }
         for (int32_t variant = 0; variant < kDenseVariantTerms; variant++) {
           std::string variantTerm = denseVariantTerm(term, variant);
-          for (int32_t docOrd = 0; docOrd < kDenseVariantDocsPerTerm; docOrd++) {
+          for (int32_t docOrd = 0; docOrd < variantDocs; docOrd++) {
             inverter.setDoc(docid++);
             std::string body = denseVariantBenchBody(variantTerm, docOrd);
             handler.index(inverter, std::string_view(body));
@@ -375,8 +400,11 @@ std::shared_ptr<TermSeekCorpus> getTermSeekCorpus(TermSource source) {
   int32_t nTerms = solux::unit_tests ? kUnitTerms : kBenchTerms;
   uint64_t seed = solux::unit_tests ? SoluxTest::rng_seed : 0x51f15eeda5c0ffeeull;
 
-  static std::shared_ptr<TermSeekCorpus> corpus;
-  if (corpus == nullptr || corpus->source != source || corpus->seed != seed
+  static std::array<std::shared_ptr<TermSeekCorpus>,
+                    (size_t)TermSource::COUNT> corpora;
+  auto& corpus = corpora[(size_t)source];
+  if (corpus == nullptr || corpus->source != source
+      || corpus->buildEffort != SoluxTest::effort || corpus->seed != seed
       || (source == TermSource::DECIMAL && corpus->nTerms != nTerms)) {
     corpus = std::make_shared<TermSeekCorpus>(source, nTerms, seed);
   }
@@ -619,7 +647,9 @@ static void BM_FuzzyTopK(benchmark::State& state) {
   IndexReader& reader = corpus->statsReader();
 
   std::vector<std::string> queries;
-  int32_t queryTarget = solux::unit_tests ? 8 : 64;
+  int32_t queryTarget = solux::unit_tests
+      ? (int32_t)SoluxTest::scaleTestWork(4)
+      : 64;
   int32_t stride = std::max(1, (int32_t)corpus->denseOrds.size() / queryTarget);
   for (int32_t i = 0; i < (int32_t)corpus->denseOrds.size()
        && (int32_t)queries.size() < queryTarget; i += stride) {
@@ -680,7 +710,8 @@ static void BM_FuzzyTopK(benchmark::State& state) {
   state.counters["fp"] = (int64_t)(fingerprint % 100000);
 }
 
-// grouped by source so the single-slot corpus cache builds each corpus once
+// Grouped by source to keep related result rows together. The per-source corpus
+// cache also avoids rebuilding WORDS after the COMPOUND fuzzy cases.
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, decimal, TermSource::DECIMAL);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, decimal, TermSource::DECIMAL);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, decimal, TermSource::DECIMAL);
@@ -711,7 +742,8 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
   int nTerms=1000000;
   uint64_t seed = 1;
   if (solux::unit_tests) {
-    nTerms = SoluxTest::rng.rint(1, Postings::TERMS_BLOCK_SIZE*10);
+    nTerms = SoluxTest::rng.rint(
+        1, (int32_t)SoluxTest::scaleTestWork(Postings::TERMS_BLOCK_SIZE * 10));
     seed = SoluxTest::rng_seed;
   }
   auto fname = "myfield";

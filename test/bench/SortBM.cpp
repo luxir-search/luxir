@@ -18,7 +18,7 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
     ~ModeGuard() { SortField::setStringSortModeForTests(saved); }
   } guard(mode);
 
-  if (solux::unit_tests) nDocs = 200;
+  if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
 

@@ -84,8 +84,20 @@ public:
   static Rng rng;
   static uint64_t global_random_seed;  // same for all tests in a given run
   static uint64_t rng_seed;  // different for each test, but based on global_random_seed
+  // Test work budget selected by --effort. Effort 1 is the quick default;
+  // tests with scalable loops should derive their bounds through the helpers
+  // below so effort N does roughly N times as much total work.
+  static int32_t effort;
   static solux::SoluxNode* soluxNode;
   static bool isDefaultSchema(const std::shared_ptr<Schema>& schema);
+
+  // Scale one independent work dimension linearly with effort.
+  static int64_t scaleTestWork(int64_t atEffortOne);
+
+  // Scale one side of a multi-dimensional space so scaling every side produces
+  // roughly linear total work. For example, with two dimensions and effort 4,
+  // each side doubles.
+  static int64_t scaleTestDimension(int64_t atEffortOne, int32_t dimensions);
 
   // This is called from a listener with a seed that is different for every test.
   inline static void init_test(uint64_t seed) {

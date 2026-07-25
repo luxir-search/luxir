@@ -32,7 +32,7 @@ static const std::vector<std::string> FIELDS_MIXED = {"id", "u10k_i", "short_u10
 
 // Build or reuse the standard bench index; returns whether it was reused.
 static bool setupIndex(CollectionHelper& helper, int64_t& nDocs) {
-  nDocs = solux::unit_tests ? 200 : benchDocs;
+  nDocs = solux::unit_tests ? SoluxTest::scaleTestWork(200) : benchDocs;
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
   bool reuse = helper.indexMatchesShape(docsPerSeg);

@@ -31,7 +31,7 @@ namespace {
 
 constexpr std::string_view FIELD = "geo";
 constexpr int32_t PRODUCTION_DOCS = 500'000;
-constexpr int32_t UNIT_TEST_DOCS = 50'000;
+constexpr int32_t UNIT_TEST_DOCS = 5'000;
 constexpr double PI = 3.14159265358979323846;
 
 enum CorpusShape : uint8_t {
@@ -129,7 +129,9 @@ constexpr std::array<RawPoint, 20> CITY_CENTERS{{
 }};
 
 int32_t documentCount() {
-  return solux::unit_tests ? UNIT_TEST_DOCS : PRODUCTION_DOCS;
+  return solux::unit_tests
+      ? (int32_t)SoluxTest::scaleTestWork(UNIT_TEST_DOCS)
+      : PRODUCTION_DOCS;
 }
 
 std::string_view opName(GeoOp op) {

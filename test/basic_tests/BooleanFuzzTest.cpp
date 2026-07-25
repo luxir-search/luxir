@@ -931,7 +931,8 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     helper.index(flatdoc("id", id, "body_w", text), commit);
   }
 
-  for (int iter = 0; iter < 300; iter++) {
+  int64_t iterations = scaleTestWork(100);
+  for (int64_t iter = 0; iter < iterations; iter++) {
     std::pmr::monotonic_buffer_resource queryArena;
     api::Query rootQuery = genBool(queryArena, 2);
 

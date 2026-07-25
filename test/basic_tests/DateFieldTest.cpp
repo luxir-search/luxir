@@ -220,7 +220,8 @@ TEST_F(DateFieldTest, parseRejectsOutOfRange) {
 TEST_F(DateFieldTest, parseFuzzSafetyAndInvariants) {
   static const char alphabet[] = "0123456789-:.TtZz+ ,/|NOWymwdhHsMILLISECONDS";
   std::string buf;
-  for (int iter = 0; iter < 100000; iter++) {
+  int64_t iterations = scaleTestWork(10'000);
+  for (int64_t iter = 0; iter < iterations; iter++) {
     size_t len = iter % 100 == 0 ? 257 : rng() % 72;  // regularly cross the 256-byte cap
     buf.resize(len);
     for (size_t i = 0; i < len; i++) {

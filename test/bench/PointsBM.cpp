@@ -73,7 +73,9 @@ constexpr std::array<uint16_t, 4> LEAF_SIZES{{128, 256, 512, 1024}};
 constexpr std::array<int32_t, 4> WINDOW_PERMILLE{{10, 100, 500, 900}};
 
 uint64_t pointCount() {
-  return solux::unit_tests ? 64ULL * 1024 : 1'000'000ULL;
+  return solux::unit_tests
+      ? (uint64_t)SoluxTest::scaleTestWork(8 * 1024)
+      : 1'000'000ULL;
 }
 
 int64_t valueAtOrdinal(PointShape shape, uint64_t ordinal) {

@@ -141,6 +141,19 @@ coverage pass over the small unit-test corpus, use:
 ./build/gcc-debug/bin/solux_test --gtest_filter='Benchmarks.all'
 ```
 
+Test runs default to `--effort=1`. Scalable fuzz loops and benchmark unit
+corpora can derive linear work with `SoluxTest::scaleTestWork()` or scale each
+side of a multidimensional space with `SoluxTest::scaleTestDimension()`. Raise
+the budget for a broader pass, for example:
+
+```bash
+./build/gcc-debug-asan/bin/solux_test --effort=4
+```
+
+Effort 4 aims for roughly four times the total scalable work, including when
+multiple loop bounds must each grow by a root of the effort. Explicit
+`--bench` mode continues to use the production benchmark parameters.
+
 Treat those as harnesses, not published comparative results.
 
 ## Time-zone database at runtime

@@ -257,7 +257,8 @@ TEST_F(BKDDistanceRelationTest, randomizedCellAndPointOracle) {
   SplitMix64 rng(0x70d18a4c);
   double earthDistance = geo::haversinMeters(
       std::numeric_limits<double>::max());
-  for (int32_t iteration = 0; iteration < 3000; iteration++) {
+  int64_t iterations = scaleTestWork(500);
+  for (int64_t iteration = 0; iteration < iterations; iteration++) {
     double centerLat = -90.0 + unitDouble(rng) * 180.0;
     double centerLon = -180.0 + unitDouble(rng) * 360.0;
     double radius;

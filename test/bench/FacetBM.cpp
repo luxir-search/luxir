@@ -23,7 +23,7 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
   int mergeFactor = 10;  // TODO: actually get from IW?
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   //
@@ -143,7 +143,7 @@ static void buildRangeFacetBenchIndex(CollectionHelper& helper,
 
 static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
                           std::string_view shape, bool forceWalk) {
-  if (solux::unit_tests) nDocs = 200;
+  if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
   CollectionHelper helper("facet_range_bm");

@@ -244,7 +244,9 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
 
 void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
                   bool skew = false) {
-  int64_t nDocs = solux::unit_tests ? 240 : state.range(0);
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(240)
+      : state.range(0);
   int32_t dims = solux::unit_tests ? 16 : 64;
   int32_t valuesPerDoc = multiValued ? 4 : 1;
   int32_t k = 10;
@@ -432,10 +434,18 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
 }
 
 void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
-  int64_t nDocs = solux::unit_tests ? 240 : 50'000;
+  if (solux::unit_tests && state.threads() > 4) {
+    state.SkipWithMessage("reduced vector unit-test thread sweep");
+    return;
+  }
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestDimension(240, 2)
+      : 50'000;
   int32_t dims = solux::unit_tests ? 16 : 64;
   int32_t nClusters = solux::unit_tests ? 8 : 100;
-  int32_t nQueries = 16;
+  int32_t nQueries = solux::unit_tests
+      ? (int32_t)SoluxTest::scaleTestDimension(4, 2)
+      : 16;
   int32_t nprobe = (int32_t)state.range(0);
   int32_t cand = (int32_t)state.range(1);  // candidate pool size; 0 = adaptive default
   int32_t k = (int32_t)state.range(2);
@@ -578,7 +588,9 @@ void BM_VectorKnnRecallThreadsParallel(benchmark::State& state) {
 // counter for context.  Fixed iteration count: each iteration is a full
 // rebuild, so let it be expensive but bounded.
 void BM_VectorIvfPqBuild(benchmark::State& state) {
-  int64_t nDocs = solux::unit_tests ? 240 : 50'000;
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(240)
+      : 50'000;
   int32_t dims = solux::unit_tests ? 16 : 64;
   int32_t nClusters = solux::unit_tests ? 8 : 100;
 

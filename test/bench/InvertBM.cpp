@@ -21,7 +21,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
   }
 
 
-  int iter = unit_tests ? 10 : 1000;
+  int iter = unit_tests ? (int)SoluxTest::scaleTestWork(10) : 1000;
   int64_t inverterSz = 0;
   RAMDir dir;
   for (auto _ : state) {

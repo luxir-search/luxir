@@ -3204,6 +3204,9 @@ public:
 TEST_F(RandomFacetTest, randomFaceting) {
   // Index build dominates cost, so amortize it: fewer indexes, many more
   // requests, each issuing several queries x a facet per field (many facet
-  // computations, the same field faceted under multiple domains).
-  runRandomTest(8, 400);
+  // computations, the same field faceted under multiple domains). Indexes and
+  // requests are independent work dimensions, so scale each by sqrt(effort).
+  runRandomTest(
+      (int)scaleTestDimension(2, 2),
+      (int)scaleTestDimension(100, 2));
 }

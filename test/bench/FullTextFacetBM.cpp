@@ -973,7 +973,7 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
   int mergeFactor = 10;  // TODO: actually get from IW?
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -1057,7 +1057,7 @@ static void BM_FullTextScoreTopK(benchmark::State& state, int64_t nDocs, std::st
   constexpr int32_t topK = 100;
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -1116,7 +1116,7 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
   constexpr int32_t topK = 100;
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -1172,7 +1172,9 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
 //
 static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
                                                      DisjunctionMaxScoreMode mode) {
-  int64_t clusteredDocs = solux::unit_tests ? 12'000 : 1'000'000;
+  int64_t clusteredDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(2'000)
+      : 1'000'000;
   constexpr int32_t topK = 100;
   std::vector<int32_t> docsPerSeg = {(int32_t) clusteredDocs};
 
@@ -1236,7 +1238,7 @@ static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
   constexpr int32_t topK = 100;
   std::vector<int32_t> docsPerSeg;
   if (solux::unit_tests) {
-    docsPerSeg = {2048, 2048, 2048, 2048};
+    docsPerSeg.assign(4, (int32_t)SoluxTest::scaleTestWork(512));
   } else {
     docsPerSeg.assign(8, 125000);
   }
@@ -1298,7 +1300,9 @@ static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
 // driving once the top-k threshold rises.
 //
 static void BM_FullTextScoreTopKMsmWand(benchmark::State& state, MsmWandMode mode) {
-  int64_t msmDocs = solux::unit_tests ? 10'000 : 1'000'003;
+  int64_t msmDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(2'000)
+      : 1'000'003;
   constexpr int32_t topK = 100;
   std::vector<int32_t> docsPerSeg = {(int32_t) msmDocs};
 
@@ -1351,7 +1355,9 @@ static void BM_FullTextScoreTopKMsmWand(benchmark::State& state, MsmWandMode mod
 // have similar norms, so per-block minNorm should be a useful pruning bound.
 //
 static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
-  int64_t clusteredDocs = solux::unit_tests ? 2000 : 1'000'000;
+  int64_t clusteredDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(1'000)
+      : 1'000'000;
   constexpr int32_t topK = 100;
 
   RAMDir dir;
@@ -1398,7 +1404,9 @@ static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
 static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
                                                   FrontierBoundMode mode, bool zipf) {
   constexpr int32_t topK = 100;
-  int64_t nDocs = solux::unit_tests ? 16000 : 1'000'000;
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(2'000)
+      : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
   // anti-correlated mt0..mt3 (loose corner), vs realistic Zipfian mid-freq terms.
   std::vector<std::string> terms = zipf
@@ -1477,7 +1485,9 @@ enum class SkipQueryClass {
 static void BM_SkipEffectiveness(benchmark::State& state,
                                  SkipQueryClass queryClass,
                                  int32_t topK, bool useFrontier) {
-  int64_t nDocs = solux::unit_tests ? 16000 : 1'000'000;
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(2'000)
+      : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
   // Zipfian body_w: rank 0 densest. t2 ~ head (many blocks), t50 mid, t500 tail,
   // t10000 ~ sparse high-idf tail.
@@ -1547,7 +1557,9 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
                                                 int32_t domainStep,
                                                 bool domainArray) {
   constexpr int32_t topK = 100;
-  int64_t nDocs = solux::unit_tests ? 2000 : 1'000'000;
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(1'000)
+      : 1'000'000;
   int32_t numTerms = corpus == BulkDisjunctionCorpus::Dense ? 32 : 5;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
   std::vector<std::string> terms = makeMtTerms(numTerms);
@@ -1634,7 +1646,9 @@ static void BM_FullTextScoreTopKPhraseFilterConjunction(benchmark::State& state,
   constexpr int32_t topK = 100;
   constexpr int32_t filterStep = 64;
   constexpr int32_t adjacencyStep = 8;
-  int64_t nDocs = solux::unit_tests ? 2000 : 1'000'000;
+  int64_t nDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(1'000)
+      : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
 
   CollectionHelper helper;
@@ -1710,7 +1724,9 @@ static void BM_FullTextScoreTopKPhraseFilterConjunction(benchmark::State& state,
 static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
                                                FrontierCorpus corpus,
                                                FrontierBoundMode mode) {
-  int64_t corpusDocs = solux::unit_tests ? 6000 : 1'000'000;
+  int64_t corpusDocs = solux::unit_tests
+      ? SoluxTest::scaleTestWork(2'000)
+      : 1'000'000;
   constexpr int32_t topK = 100;
   std::string_view qterm = "frontier";
 

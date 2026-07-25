@@ -16,8 +16,8 @@ static void BM_Overwrite(benchmark::State& state, int nThreads, int64_t maxDoc, 
   int64_t totalDocs = maxDoc * 2;  // 2x overwrite ratio
 
   if (solux::unit_tests) {
-    totalDocs = std::min(totalDocs, (int64_t)200);
-    maxDoc = std::min(maxDoc, (int64_t)100);
+    totalDocs = std::min(totalDocs, SoluxTest::scaleTestWork(200));
+    maxDoc = std::min(maxDoc, SoluxTest::scaleTestWork(100));
   }
 
   int64_t docsPerThread = totalDocs / nThreads;

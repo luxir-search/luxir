@@ -115,7 +115,7 @@ static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
   int mergeFactor = 10;  // TODO: actually get from IW?
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   test::CollectionHelper helper;
@@ -201,7 +201,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   }
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   //
@@ -306,7 +306,7 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
   int mergeFactor = 10;  // TODO: actually get from IW?
 
   if (solux::unit_tests) {
-    nDocs = 200;
+    nDocs = SoluxTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;

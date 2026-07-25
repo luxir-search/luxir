@@ -76,7 +76,10 @@ class NumericRangeBenchIndex {
   int32_t numDocs;
 
 public:
-  NumericRangeBenchIndex() : numDocs(solux::unit_tests ? 51'200 : 512'000) {
+  NumericRangeBenchIndex()
+      : numDocs(solux::unit_tests
+            ? (int32_t)SoluxTest::scaleTestWork(5'120)
+            : 512'000) {
     SchemaBuilder b;
     for (const FieldSpec& spec : FIELDS) {
       auto& f = b.field(spec.name);

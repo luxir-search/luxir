@@ -1,9 +1,12 @@
-#include <filesystem>
-#include <thread>
+#include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <limits>
 #include <new>
+#include <thread>
 #include <typeinfo>
 #include "SoluxTest.h"
 #include "GrpcSoluxTest.h"
@@ -51,6 +54,7 @@ namespace solux {
 // we might want to be able to initialize it some other way in the future.
 uint64_t SoluxTest::global_random_seed;
 uint64_t SoluxTest::rng_seed;
+int32_t SoluxTest::effort = 1;
 Rng SoluxTest::rng;
 SoluxNode* SoluxTest::soluxNode;
 
@@ -98,6 +102,28 @@ bool SoluxTest::isDefaultSchema(const std::shared_ptr<Schema>& schema) {
     if (it == schema->fieldTypeMap.end() || !fieldTypesEqual(*it->second, *defaultField)) return false;
   }
   return true;
+}
+
+int64_t SoluxTest::scaleTestWork(int64_t atEffortOne) {
+  assert(effort >= 1);
+  assert(atEffortOne >= 0);
+  if (atEffortOne > std::numeric_limits<int64_t>::max() / effort) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  return atEffortOne * effort;
+}
+
+int64_t SoluxTest::scaleTestDimension(int64_t atEffortOne, int32_t dimensions) {
+  assert(effort >= 1);
+  assert(atEffortOne >= 0);
+  assert(dimensions >= 1);
+  if (atEffortOne == 0) return 0;
+  long double factor = std::pow((long double)effort, 1.0L / dimensions);
+  long double scaled = std::ceil((long double)atEffortOne * factor);
+  if (scaled >= (long double)std::numeric_limits<int64_t>::max()) {
+    return std::numeric_limits<int64_t>::max();
+  }
+  return (int64_t)scaled;
 }
 
 void SoluxTest::clearCollection(std::string_view collectionName) {
@@ -174,6 +200,28 @@ public:
 
 } // end namespace
 
+TEST(SoluxTestHarnessTest, effortScaling) {
+  struct EffortRestore {
+    int32_t saved = solux::SoluxTest::effort;
+    ~EffortRestore() { solux::SoluxTest::effort = saved; }
+  } restore;
+
+  solux::SoluxTest::effort = 1;
+  EXPECT_EQ(0, solux::SoluxTest::scaleTestWork(0));
+  EXPECT_EQ(17, solux::SoluxTest::scaleTestWork(17));
+  EXPECT_EQ(0, solux::SoluxTest::scaleTestDimension(0, 2));
+  EXPECT_EQ(100, solux::SoluxTest::scaleTestDimension(100, 2));
+
+  solux::SoluxTest::effort = 4;
+  EXPECT_EQ(68, solux::SoluxTest::scaleTestWork(17));
+  EXPECT_EQ(200, solux::SoluxTest::scaleTestDimension(100, 2));
+  EXPECT_EQ((std::numeric_limits<int64_t>::max)(),
+            solux::SoluxTest::scaleTestWork((std::numeric_limits<int64_t>::max)()));
+
+  solux::SoluxTest::effort = 8;
+  EXPECT_EQ(200, solux::SoluxTest::scaleTestDimension(100, 3));
+}
+
 // global argc/argv
 int gArgc;
 char** gArgv;
@@ -204,6 +252,9 @@ int main(int argc, char **argv) {
   bool bench = false;
   app.add_flag("-h,--help", help, "Print help message and exit");
   app.add_flag("--bench", bench, "Run benchmarks only (skip unit tests)");
+  app.add_option("--effort", solux::SoluxTest::effort,
+                 "Scale test work from the quick effort=1 default")
+      ->check(CLI::Range(1, (std::numeric_limits<int32_t>::max)()));
 
   try {
     app.parse(argc, argv);
@@ -214,9 +265,10 @@ int main(int argc, char **argv) {
   config.normalize();
   config.apply();
 
-  LOG_INFO("Logging: compile-time={}, runtime={}",
+  LOG_INFO("Logging: compile-time={}, runtime={}, effort={}",
            spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
-           spdlog::level::to_string_view(spdlog::get_level()));
+           spdlog::level::to_string_view(spdlog::get_level()),
+           solux::SoluxTest::effort);
 
   // Build argv from remaining (unrecognized) args for gtest/gbench.
   auto remaining = app.remaining();
