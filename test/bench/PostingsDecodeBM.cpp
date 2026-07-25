@@ -107,8 +107,10 @@ static void BM_postings_unpack(benchmark::State& state, uint8_t gapBits) {
 }
 
 #define REG(g)                                                       \
-  SOLUX_BENCHMARK_CAPTURE(BM_postings_end2end, g/bit, (uint8_t)g);   \
-  SOLUX_BENCHMARK_CAPTURE(BM_postings_unpack, g/bit, (uint8_t)g);
+  TUNING_BENCHMARK_CAPTURE(BM_postings_end2end, g/bit, (uint8_t)g)   \
+      ->UseRealTime();                                                \
+  TUNING_BENCHMARK_CAPTURE(BM_postings_unpack, g/bit, (uint8_t)g)    \
+      ->UseRealTime();
 
 REG(9) REG(13) REG(17)
 

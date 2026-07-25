@@ -1051,7 +1051,7 @@ TEST_F(PostingsTest, randTail) {
   positionsPerDocMax = 11;
   docsPerTermMax = 11;
   termsPerFieldMax = 120;
-  for (int i=0; i<10; i++) {
+  for (int64_t i = 0; i < scaleTestWork(3); i++) {
     auto nFields = rng.rint(1,20);
     initWriter();
     addFields(false, nFields);
@@ -1061,7 +1061,7 @@ TEST_F(PostingsTest, randTail) {
 }
 
 TEST_F(PostingsTest, randManyPos) {
-  for (int i=0; i<10; i++) {
+  for (int64_t i = 0; i < scaleTestWork(3); i++) {
     auto nFields = rng.rint(1,20);
     positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE * 5/2;
     docsPerTermMax = 120;  // less than a doc block
@@ -1075,7 +1075,7 @@ TEST_F(PostingsTest, randManyPos) {
 }
 
 TEST_F(PostingsTest, randManyDocPos) {
-  for (int i=0; i<10; i++) {
+  for (int64_t i = 0; i < scaleTestWork(3); i++) {
     auto nFields = rng.rint(1,20);
     positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE * 5/2;
     docsPerTermMax = Postings::DOCS_BLOCK_SIZE * 5/2;
@@ -1094,7 +1094,7 @@ TEST_F(PostingsTest, randManyTerms) {
   docsPerTermMax = 3;
   termsPerFieldMax = Postings::TERMS_BLOCK_SIZE * 5 / 2;
 
-  for (int i=0; i<10; i++) {
+  for (int64_t i = 0; i < scaleTestWork(3); i++) {
     auto nFields = rng.rint(1,20);
     initWriter();
     addFields(false, nFields);

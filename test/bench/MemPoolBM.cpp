@@ -1,5 +1,4 @@
-#include "benchmark/benchmark.h"
-#include "test/SoluxTest.h"
+#include "bench/solux_bench.h"
 #include <memory_resource>
 #include <latch>
 #include <google/protobuf/arena.h>
@@ -239,11 +238,11 @@ inline void benchAllocFree(benchmark::State& state) {
   }
 };
 
-BENCHMARK(BM_AllocSmall_std);
-BENCHMARK(BM_AllocSmall_std_mono);
-BENCHMARK(BM_AllocSmall_MemPool);
-BENCHMARK(BM_AllocSmall_Arena);
-BENCHMARK(BM_AllocSmall_ArenaPreAlloc);
+TUNING_BENCHMARK(BM_AllocSmall_std);
+TUNING_BENCHMARK(BM_AllocSmall_std_mono);
+TUNING_BENCHMARK(BM_AllocSmall_MemPool);
+TUNING_BENCHMARK(BM_AllocSmall_Arena);
+TUNING_BENCHMARK(BM_AllocSmall_ArenaPreAlloc);
 
 // #define RUN_DISABLED_BENCHMARKS
 #ifdef RUN_DISABLED_BENCHMARKS

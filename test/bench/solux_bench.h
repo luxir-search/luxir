@@ -12,6 +12,15 @@
 #define SOLUX_BENCHMARK(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
 #define SOLUX_BENCHMARK_CAPTURE(...) BENCHMARK_CAPTURE(__VA_ARGS__)->UseRealTime()
 
+// Measurement-only benchmarks used to choose or tune an implementation. They
+// remain registered for explicit --bench runs, but Benchmarks.all excludes the
+// Tuning/ namespace unless the caller supplies --benchmark_filter.
+#define TUNING_BENCHMARK(...) \
+  BENCHMARK(__VA_ARGS__)->Name("Tuning/" #__VA_ARGS__)
+#define TUNING_BENCHMARK_CAPTURE(func, test_case_name, ...) \
+  BENCHMARK_CAPTURE(func, test_case_name, __VA_ARGS__) \
+      ->Name("Tuning/" #func "/" #test_case_name)
+
 namespace solux {
 
 /// Match java's String.hashCode() implementation.

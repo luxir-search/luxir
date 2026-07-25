@@ -488,33 +488,33 @@ using SVstdMap = SimpleMap<std::unordered_map<std::string_view, FakeDocStream, T
 
 // BENCHMARK(BM_invertTemplate<OldTermValHash>); // doesn't work, so we'll use this longer form
 static void BM_mapTermValHash(benchmark::State& state) { BM_invertTemplate<TermValHashShim>(state); }
-BENCHMARK(BM_mapTermValHash);
+TUNING_BENCHMARK(BM_mapTermValHash);
 static void BM_mapPHFlatSet(benchmark::State& state) { BM_invertTemplate<PHFlatSet>(state); }
-BENCHMARK(BM_mapPHFlatSet);
+TUNING_BENCHMARK(BM_mapPHFlatSet);
 static void BM_mapPHFlatParSet(benchmark::State& state) { BM_invertTemplate<PHFlatParSet>(state); }
-BENCHMARK(BM_mapPHFlatParSet);
+TUNING_BENCHMARK(BM_mapPHFlatParSet);
 static void BM_mapPHNodeSet(benchmark::State& state) { BM_invertTemplate<PHNodeSet>(state); }
-BENCHMARK(BM_mapPHNodeSet);
+TUNING_BENCHMARK(BM_mapPHNodeSet);
 static void BM_mapBoostFlatMap(benchmark::State& state) { BM_invertTemplate<BoostFlatMap>(state); }
-BENCHMARK(BM_mapBoostFlatMap);
+TUNING_BENCHMARK(BM_mapBoostFlatMap);
 static void BM_mapPHFlatMap(benchmark::State& state) { BM_invertTemplate<PHFlatMap>(state); }
-BENCHMARK(BM_mapPHFlatMap);
+TUNING_BENCHMARK(BM_mapPHFlatMap);
 static void BM_mapStrPHFlatMap(benchmark::State& state) { BM_invertTemplate<StrPHFlatMap>(state); }
-BENCHMARK(BM_mapStrPHFlatMap);
+TUNING_BENCHMARK(BM_mapStrPHFlatMap);
 static void BM_mapSVPHFlatMap(benchmark::State& state) { BM_invertTemplate<SVPHFlatMap>(state); }
-BENCHMARK(BM_mapSVPHFlatMap);
+TUNING_BENCHMARK(BM_mapSVPHFlatMap);
 static void BM_mapSVBoostFlatMap(benchmark::State& state) { BM_invertTemplate<SVBoostFlatMap>(state); }
-BENCHMARK(BM_mapSVBoostFlatMap);
+TUNING_BENCHMARK(BM_mapSVBoostFlatMap);
 static void BM_mapSVstdMap(benchmark::State& state) { BM_invertTemplate<SVstdMap>(state); }
-BENCHMARK(BM_mapSVstdMap);
+TUNING_BENCHMARK(BM_mapSVstdMap);
 
 #ifdef ROBIN_HOOD_HASHING
 using StrRobinFlatMap = SimpleMap<robin_hood::unordered_flat_map<std::string, FakeDocStream, TestHasher, PackedTermEqual>>;
 using SVRobinFlatMap = SimpleMap<robin_hood::unordered_flat_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
 static void BM_invertStrRobinFlatMap(benchmark::State& state) { BM_invertTemplate<StrRobinFlatMap>(state); }
-BENCHMARK(BM_invertStrRobinFlatMap);
+TUNING_BENCHMARK(BM_invertStrRobinFlatMap);
 static void BM_invertSVRobinFlatMap(benchmark::State& state) { BM_invertTemplate<SVRobinFlatMap>(state); }
-BENCHMARK(BM_invertSVRobinFlatMap);
+TUNING_BENCHMARK(BM_invertSVRobinFlatMap);
 #endif
 
 /*

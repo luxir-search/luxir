@@ -443,17 +443,17 @@ void antiCorrelatedTfLen(int32_t postingOrd, int32_t& tf, int32_t& len) {
   int32_t block = postingOrd / Postings::DOCS_BLOCK_SIZE;
   int32_t local = postingOrd % Postings::DOCS_BLOCK_SIZE;
   if (block == 0) {
-    tf = 180 - (local % 37);
+    tf = 48 - (local % 11);
     len = tf + 2 + (local % 3);
   } else if (local == 0) {
-    tf = 170 - std::min(block, 40);
-    len = 900 + block * 17;
+    tf = 40 - std::min(block, 20);
+    len = 160 + std::min(block, 20) * 5;
   } else if (local == 1) {
     tf = 1;
     len = 2;
   } else {
     tf = 1 + (local % 3 == 0 ? 1 : 0);
-    len = 260 + (local % 41);
+    len = 48 + (local % 17);
   }
   if (len < tf) {
     len = tf;
@@ -3181,7 +3181,8 @@ TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges) {
-  const int32_t postingCount = 2 * DocsEnumMeta::L1_DOCS + 19;
+  const int32_t postingCount =
+      (int32_t)scaleTestWork(1) * DocsEnumMeta::L1_DOCS + 19;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3215,7 +3216,11 @@ TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
-  const int32_t postingCount = 3 * DocsEnumMeta::L1_DOCS + 37;
+  // One structural group plus scalable repeated groups. Effort 1 retains
+  // within-group and cross-group ranges; effort 2 restores the old 3-group
+  // corpus.
+  const int32_t fullGroups = 1 + (int32_t)scaleTestWork(1);
+  const int32_t postingCount = fullGroups * DocsEnumMeta::L1_DOCS + 37;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3231,12 +3236,18 @@ TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
   auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
   ASSERT_NE(scorer, nullptr);
 
-  std::array<std::pair<int32_t, int32_t>, 4> ranges = {{
+  std::vector<std::pair<int32_t, int32_t>> ranges = {
     {1, DocsEnumMeta::L1_PERIOD - 2},
     {3, DocsEnumMeta::L1_PERIOD + 5},
-    {DocsEnumMeta::L1_PERIOD + 7, 2 * DocsEnumMeta::L1_PERIOD + 1},
-    {2 * DocsEnumMeta::L1_PERIOD + 3, scorer->impacts.blockCount() - 2}
-  }};
+    {DocsEnumMeta::L1_PERIOD + 7, 2 * DocsEnumMeta::L1_PERIOD - 2}
+  };
+  for (int32_t group = 2; group < fullGroups; group++) {
+    int32_t boundary = group * DocsEnumMeta::L1_PERIOD;
+    ranges.emplace_back(boundary - DocsEnumMeta::L1_PERIOD + 7,
+                        boundary + 1);
+    ranges.emplace_back(boundary + 3,
+                        boundary + DocsEnumMeta::L1_PERIOD - 2);
+  }
   for (auto [fromBlock, toBlock] : ranges) {
     ASSERT_LT(fromBlock, toBlock);
     float blockBound = scorer->impacts.maxImpactInRange(fromBlock, toBlock);
@@ -3280,7 +3291,8 @@ TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
 }
 
 TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
-  const int32_t nDocs = 8 * DocsEnumMeta::L1_DOCS + 19;
+  const int32_t nDocs =
+      (int32_t)scaleTestWork(4) * DocsEnumMeta::L1_DOCS + 19;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3288,7 +3300,7 @@ TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
     std::string body;
     int32_t tf = doc < 16 ? 80 - (doc % 5) : 1 + (doc % 3);
     appendRepeatedTerm(body, "dense_header", tf);
-    appendRepeatedTerm(body, "filler", doc < 16 ? 3 : 240 + (doc % 17));
+    appendRepeatedTerm(body, "filler", doc < 16 ? 3 : 40 + (doc % 17));
     f.add(doc, body);
   }
   testIndex.flush();
@@ -3398,7 +3410,8 @@ TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
 }
 
 TEST_F(TermScorerTest, mandOptSingleOptionalSparseAndDenseTopKMatchesExhaustive) {
-  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 113;
+  const int32_t nDocs =
+      (int32_t)scaleTestWork(1) * DocsEnumMeta::L1_DOCS + 113;
   for (bool denseOpt : {false, true}) {
     SCOPED_TRACE(denseOpt ? "dense optional" : "sparse optional");
     TestIndex testIndex;
@@ -3407,7 +3420,7 @@ TEST_F(TermScorerTest, mandOptSingleOptionalSparseAndDenseTopKMatchesExhaustive)
     for (int32_t doc = 0; doc < nDocs; doc++) {
       bool hot = doc < 24;
       int32_t reqTf = hot ? 80 - (doc % 7) : 1;
-      int32_t len = hot ? reqTf + 3 : 360 + (doc % 29);
+      int32_t len = hot ? reqTf + 3 : 96 + (doc % 29);
       std::string body;
       int32_t used = 0;
       appendRepeatedTerm(body, "mand_req", reqTf);
@@ -5045,8 +5058,8 @@ TEST_F(TermScorerTest, phraseExactScoreBitGoldens) {
 // with repeated terms and gaps, both execution orders. Docs and score bits
 // must agree exactly.
 TEST_F(TermScorerTest, phraseRepeatedTermDedupFuzzMatchesOracle) {
-  constexpr int32_t kDocs = 500;
-  constexpr int32_t kPhrases = 150;
+  int32_t kDocs = (int32_t)scaleTestDimension(250, 2);
+  int32_t kPhrases = (int32_t)scaleTestDimension(50, 2);
   static constexpr std::string_view kVocab[] = {"a", "b", "c", "d"};
   constexpr size_t kVocabSize = std::size(kVocab);
 
@@ -5092,6 +5105,8 @@ TEST_F(TermScorerTest, phraseRepeatedTermDedupFuzzMatchesOracle) {
     return hits;
   };
 
+  bool sawRepeatedTerm = false;
+  bool sawGap = false;
   for (int32_t q = 0; q < kPhrases; q++) {
     int32_t len = (int32_t) rng.rint(2, 7);
     std::vector<std::string_view> terms;
@@ -5101,10 +5116,15 @@ TEST_F(TermScorerTest, phraseRepeatedTermDedupFuzzMatchesOracle) {
     for (int32_t k = 0; k < len; k++) {
       size_t pick = (size_t) rng.rint(kVocabSize + 2);
       terms.push_back(kVocab[pick >= kVocabSize ? 0 : pick]);
+      sawRepeatedTerm |=
+          std::find(terms.begin(), terms.end() - 1, terms.back())
+          != terms.end() - 1;
       positions.push_back(pos);
       label += terms.back();
       label += " ";
-      pos += 1 + (int32_t) (rng.rint(5) == 0);  // ~20% gapped slot
+      bool gap = rng.rint(5) == 0;
+      sawGap |= gap;
+      pos += 1 + (int32_t)gap;  // ~20% gapped slot
     }
     for (bool sorted : {true, false}) {
       auto expected = run(terms, positions, false, sorted);
@@ -5119,6 +5139,8 @@ TEST_F(TermScorerTest, phraseRepeatedTermDedupFuzzMatchesOracle) {
       }
     }
   }
+  EXPECT_TRUE(sawRepeatedTerm);
+  EXPECT_TRUE(sawGap);
 }
 
 // Block-max conjunction: the summed clause bounds let a scored "+a +b" skip
@@ -6307,7 +6329,8 @@ TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
 TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
   CollectionHelper helper("main");
   const int32_t numTerms = 32;
-  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 37;
+  const int32_t nDocs =
+      (int32_t)scaleTestWork(1) * DocsEnumMeta::L1_DOCS + 37;
   const int32_t filterStep = 512;
   addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -7365,15 +7388,27 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
 
   int64_t sweepWindows = 0;
   int64_t compactionDrops = 0;
-  for (int32_t clauses : {2, 3, 6}) {
+  auto check = [&](int32_t clauses, int32_t topK) {
     std::span<const std::string_view> terms(views.data(), (size_t) clauses);
-    for (int32_t topK : {5, 11, 3 * DocsEnumMeta::L1_DOCS + 500}) {
-      auto expected = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, topK);
-      SkipStatsGuard stats;
-      auto actual = runFilteredBulkTermDisjunctionTopK(*reader, terms, topK);
-      sweepWindows += SkipStats::maxScoreSweepWindows;
-      compactionDrops += SkipStats::maxScoreBufferCompactions;
-      assertSameTopKDocs(expected, actual, topK);
+    auto expected = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, topK);
+    SkipStatsGuard stats;
+    auto actual = runFilteredBulkTermDisjunctionTopK(*reader, terms, topK);
+    sweepWindows += SkipStats::maxScoreSweepWindows;
+    compactionDrops += SkipStats::maxScoreBufferCompactions;
+    assertSameTopKDocs(expected, actual, topK);
+  };
+  if (effort == 1) {
+    for (int32_t clauses : {2, 3, 6}) {
+      check(clauses, 11);
+    }
+    for (int32_t topK : {5, 3 * DocsEnumMeta::L1_DOCS + 500}) {
+      check(6, topK);
+    }
+  } else {
+    for (int32_t clauses : {2, 3, 6}) {
+      for (int32_t topK : {5, 11, 3 * DocsEnumMeta::L1_DOCS + 500}) {
+        check(clauses, topK);
+      }
     }
   }
 
@@ -7424,7 +7459,15 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRand
     bool liveOnly = !tinySegment;
 
     BulkDomainDriveGuard domainGuard(true);
-    for (int32_t clauses = 2; clauses <= maxClauses; clauses++) {
+    std::vector<int32_t> clauseCounts;
+    if (effort == 1) {
+      clauseCounts = {2, 3, 4, maxClauses};
+    } else {
+      for (int32_t clauses = 2; clauses <= maxClauses; clauses++) {
+        clauseCounts.push_back(clauses);
+      }
+    }
+    for (int32_t clauses : clauseCounts) {
       std::span<const std::string_view> terms(views.data(), (size_t) clauses);
       for (int32_t mode = 0; mode < 3; mode++) {
         int32_t filterStep = mode == 0 ? 0 : mode == 1 ? 7 : 11;
@@ -8089,7 +8132,8 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
 TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
   CollectionHelper helper("main");
   const int32_t numTerms = 32;
-  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 37;
+  const int32_t fullGroups = 1 + (int32_t)scaleTestWork(1);
+  const int32_t nDocs = fullGroups * DocsEnumMeta::L1_DOCS + 37;
   const int32_t topK = 50;
   const int32_t filterStep = 512;
   addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
@@ -8113,7 +8157,8 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
 TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
   CollectionHelper helper("main");
   const int32_t numTerms = 16;
-  const int32_t nDocs = 4 * DocsEnumMeta::L1_DOCS + 53;
+  const int32_t nDocs =
+      (int32_t)scaleTestWork(2) * DocsEnumMeta::L1_DOCS + 53;
   const int32_t topK = 75;
   addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
   std::vector<std::string> deleteIds;

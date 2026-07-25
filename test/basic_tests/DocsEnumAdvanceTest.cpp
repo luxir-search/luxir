@@ -25,9 +25,7 @@ class DocsEnumAdvanceTest : public SoluxTest {
 protected:
   struct Posting { int32_t docid; int32_t firstPos; int32_t tf; };
 
-  static constexpr int VOCAB_SIZE = 40;       // t%9 sets density 1, 1/2, ... 1/256
-  static constexpr int INDEX_ITERATIONS = 5;  // increase with WALKS_PER_TERM when changing the cursor
-  static constexpr int WALKS_PER_TERM = 6;
+  static constexpr int VOCAB_SIZE = 40;  // t%9 sets density 1, 1/2, ... 1/256
 
   static int32_t impactTfForDoc(int32_t docid) {
     int32_t block = docid / Postings::DOCS_BLOCK_SIZE;
@@ -543,8 +541,12 @@ protected:
 
 
 TEST_F(DocsEnumAdvanceTest, advanceFuzz) {
-  for (int iter = 0; iter < INDEX_ITERATIONS; iter++) {
-    runAdvanceFuzzIndex(iter, WALKS_PER_TERM);
+  int32_t indexIterations =
+      1 + (int32_t)scaleTestDimension(1, 2);
+  int32_t walksPerTerm =
+      (int32_t)scaleTestDimension(3, 2);
+  for (int32_t iter = 0; iter < indexIterations; iter++) {
+    runAdvanceFuzzIndex(iter, walksPerTerm);
   }
 }
 
@@ -1388,7 +1390,9 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
 // merger regenerates the anchors by replaying positions through TextWriter).
 class PositionSeekTest : public DocsEnumAdvanceTest {
 protected:
-  static constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 300;  // 66 full doc blocks + tail
+  static int32_t docCount() {
+    return (int32_t)scaleTestWork(1) * DocsEnumMeta::L1_DOCS + 300;
+  }
 
   static int32_t tfFor(std::string_view term, int32_t globalDoc) {
     if (term == "one") return 1;
@@ -1427,7 +1431,8 @@ protected:
     for (int32_t target : targets) {
       if (target <= denum.docId()) continue;
       int32_t doc = denum.advance(target);
-      ASSERT_EQ(doc, target < N ? target : DocsEnumMeta::END) << "advance(" << target << ")";
+      ASSERT_EQ(doc, target < docCount() ? target : DocsEnumMeta::END)
+          << "advance(" << target << ")";
       if (doc == DocsEnumMeta::END) break;
       int32_t tf = tfFor(term, doc);
       ASSERT_EQ(denum.termFreq(), tf) << "doc " << doc;
@@ -1448,23 +1453,37 @@ protected:
   }
 
   void checkAllWalks(TestField& f) {
-    // Block/group boundary singles (L1_DOCS = 4096; tail starts at 8448 for one/cst).
-    std::vector<int32_t> boundaries = {1, 2, 127, 128, 130, 258, 4095, 4096, 4097,
-                                       5000, 8191, 8192, 8300, 8447, 8448, 8449,
-                                       8460, N - 1, N};
+    int32_t nDocs = docCount();
+    int32_t tailBlockStart =
+        (nDocs / Postings::DOCS_BLOCK_SIZE) * Postings::DOCS_BLOCK_SIZE;
+    // Codec block boundaries, every L1 boundary, and the final partial block.
+    std::vector<int32_t> boundaries = {
+      1, 2, 127, 128, 130, 258
+    };
+    int32_t fullGroups = (nDocs - 300) / DocsEnumMeta::L1_DOCS;
+    for (int32_t group = 1; group <= fullGroups; group++) {
+      int32_t boundary = group * DocsEnumMeta::L1_DOCS;
+      boundaries.push_back(boundary - 1);
+      boundaries.push_back(boundary);
+      boundaries.push_back(boundary + 1);
+    }
+    boundaries.insert(boundaries.end(), {
+      tailBlockStart - 1, tailBlockStart, tailBlockStart + 1,
+      tailBlockStart + 12, nDocs - 1, nDocs
+    });
     for (std::string_view term : {"one", "cst", "var"}) {
       checkSeekWalk(f, term, boundaries, 0);
       int readMode = 0;
       for (int32_t stride : {997, 313, 129}) {
         std::vector<int32_t> targets;
-        for (int32_t t = stride / 2; t <= N; t += stride) targets.push_back(t);
+        for (int32_t t = stride / 2; t <= nDocs; t += stride) targets.push_back(t);
         checkSeekWalk(f, term, targets, readMode++);
       }
       // Sequential reads resuming after a far seek, then another far seek.
       std::vector<int32_t> mixed;
       mixed.push_back(3000);
       for (int32_t d = 3001; d < 3200; d++) mixed.push_back(d);
-      mixed.push_back(8400);
+      mixed.push_back(nDocs - 92);
       checkSeekWalk(f, term, mixed, 0);
     }
   }
@@ -1479,7 +1498,7 @@ TEST_F(PositionSeekTest, positionSeekAlignments) {
     TestIndex testIndex;
     TestField f(testIndex, "body_w");
     f.startIndexing();
-    addSeekDocs(f, 0, N, 0);
+    addSeekDocs(f, 0, docCount(), 0);
     testIndex.flush();
     f.startReading();
     checkAllWalks(f);
@@ -1487,14 +1506,14 @@ TEST_F(PositionSeekTest, positionSeekAlignments) {
   }
 
   {
-    const int32_t split = 40 * Postings::DOCS_BLOCK_SIZE + 9;
+    const int32_t split = 20 * Postings::DOCS_BLOCK_SIZE + 9;
     TestIndex testIndex;
     TestField f(testIndex, "body_w");
     f.startIndexing();
     addSeekDocs(f, 0, split, 0);
     testIndex.flush();
     f.startIndexing();
-    addSeekDocs(f, 0, N - split, split);
+    addSeekDocs(f, 0, docCount() - split, split);
     testIndex.flush();
 
     testIndex.iw->mergeSegments();

@@ -73,15 +73,15 @@ void BM_IntColBulk(benchmark::State& state, int32_t nDocs, int32_t docDelta, int
 constexpr int32_t nDocs = 65536;
 
 // IntColSparse uses iterators that decode a value at a time.
-BENCHMARK_CAPTURE(BM_IntColSparse, denseIter,   nDocs, 1, 1100, 1);  // docs are dense, iterate over all values
-BENCHMARK_CAPTURE(BM_IntColSparse, sparseIter,  nDocs, 4, 1100, 1);  // docs are sparse, iterate over all values
-BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip3,  nDocs, 1, 1100, 3);  // docs are dense, use skipping of size 3
-BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip27, nDocs, 1, 1100, 27); // docs are dense, use skipping of size 27
-BENCHMARK_CAPTURE(BM_IntColSparse, sparseSkip3, nDocs, 4, 1100, 3);  // docs are sparse, use skipping of size 3
+TUNING_BENCHMARK_CAPTURE(BM_IntColSparse, denseIter,   nDocs, 1, 1100, 1);  // docs are dense, iterate over all values
+TUNING_BENCHMARK_CAPTURE(BM_IntColSparse, sparseIter,  nDocs, 4, 1100, 1);  // docs are sparse, iterate over all values
+TUNING_BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip3,  nDocs, 1, 1100, 3);  // docs are dense, use skipping of size 3
+TUNING_BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip27, nDocs, 1, 1100, 27); // docs are dense, use skipping of size 27
+TUNING_BENCHMARK_CAPTURE(BM_IntColSparse, sparseSkip3, nDocs, 4, 1100, 3);  // docs are sparse, use skipping of size 3
 
 // IntColBulk uses iterators that decode a block at a time.
-BENCHMARK_CAPTURE(BM_IntColBulk,   denseIter,   nDocs, 1, 1100, 1);
-BENCHMARK_CAPTURE(BM_IntColBulk,   sparseIter,  nDocs, 4, 1100, 1);
-BENCHMARK_CAPTURE(BM_IntColBulk,   denseSkip3,  nDocs, 1, 1100, 3);
-BENCHMARK_CAPTURE(BM_IntColBulk,   denseSkip27, nDocs, 1, 1100, 27);
-BENCHMARK_CAPTURE(BM_IntColBulk,   sparseSkip3, nDocs, 4, 1100, 3);
+TUNING_BENCHMARK_CAPTURE(BM_IntColBulk, denseIter,   nDocs, 1, 1100, 1);
+TUNING_BENCHMARK_CAPTURE(BM_IntColBulk, sparseIter,  nDocs, 4, 1100, 1);
+TUNING_BENCHMARK_CAPTURE(BM_IntColBulk, denseSkip3,  nDocs, 1, 1100, 3);
+TUNING_BENCHMARK_CAPTURE(BM_IntColBulk, denseSkip27, nDocs, 1, 1100, 27);
+TUNING_BENCHMARK_CAPTURE(BM_IntColBulk, sparseSkip3, nDocs, 4, 1100, 3);

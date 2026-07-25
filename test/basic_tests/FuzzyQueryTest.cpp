@@ -653,10 +653,13 @@ TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
 TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
   CollectionHelper helper{"main"};
   constexpr int32_t kDocs = 10005;
+  std::vector<Doc> docs;
+  docs.reserve(kDocs);
   for (int32_t i = 0; i < kDocs; i++) {
-    helper.index(flatdoc("id", "d" + std::to_string(i), "body_w", twoEditVariant(i)),
-                 i == kDocs - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+    docs.push_back(
+        flatdoc("id", "d" + std::to_string(i), "body_w", twoEditVariant(i)));
   }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
   // Explicit max_expansions above the operator limit: the operator clamp
   // engages and warns (the default-50 cap sits far below the operator limit).

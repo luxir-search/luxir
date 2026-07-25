@@ -320,12 +320,27 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
     {Shape::FILTER_ONLY, MatchPath::FILTER_ONLY},
     {Shape::ZERO, MatchPath::DENSE},
   }};
-  for (auto [shape, expectedPath] : shapes) {
-    for (auto [field, direction] : sorts) {
-      SCOPED_TRACE("shape=" + std::to_string((int32_t) shape)
-                   + " field=" + std::string(field)
+  if (effort == 1) {
+    // Exercise every scorer shape with one sort, then cover the remaining sort
+    // field/direction combinations with a representative dense conjunction.
+    for (auto [shape, expectedPath] : shapes) {
+      SCOPED_TRACE("shape=" + std::to_string((int32_t) shape));
+      assertParity(shape, expectedPath, sorts[0].first, sorts[0].second);
+    }
+    for (size_t i = 1; i < sorts.size(); i++) {
+      auto [field, direction] = sorts[i];
+      SCOPED_TRACE("field=" + std::string(field)
                    + " direction=" + std::to_string((int32_t) direction));
-      assertParity(shape, expectedPath, field, direction);
+      assertParity(Shape::DENSE_TWO, MatchPath::DENSE, field, direction);
+    }
+  } else {
+    for (auto [shape, expectedPath] : shapes) {
+      for (auto [field, direction] : sorts) {
+        SCOPED_TRACE("shape=" + std::to_string((int32_t) shape)
+                     + " field=" + std::string(field)
+                     + " direction=" + std::to_string((int32_t) direction));
+        assertParity(shape, expectedPath, field, direction);
+      }
     }
   }
 }

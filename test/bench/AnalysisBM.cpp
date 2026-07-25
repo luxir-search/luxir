@@ -50,7 +50,7 @@ static void BM_Tokenize(benchmark::State& state, std::string tokenizer,
 }
 
 // _text = indexing-representative (text only); _off = offset-consuming (highlighter).
-SOLUX_BENCHMARK_CAPTURE(BM_Tokenize<false>, whitespace_text, "whitespace", std::vector<std::string>{});
-SOLUX_BENCHMARK_CAPTURE(BM_Tokenize<true>, whitespace_off, "whitespace", std::vector<std::string>{});
-SOLUX_BENCHMARK_CAPTURE(BM_Tokenize<false>, standard_text, "unicode_word", std::vector<std::string>{"nfkc_cf"});
-SOLUX_BENCHMARK_CAPTURE(BM_Tokenize<true>, standard_off, "unicode_word", std::vector<std::string>{"nfkc_cf"});
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, whitespace_text, "whitespace", std::vector<std::string>{})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, whitespace_off, "whitespace", std::vector<std::string>{})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, standard_text, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, standard_off, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();

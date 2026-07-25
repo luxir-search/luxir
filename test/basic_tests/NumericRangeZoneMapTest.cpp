@@ -206,7 +206,8 @@ TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
 
   // Random bound pairs exercise residual comparisons in crossing blocks.
   SplitMix64 rng(0x5a17e123);
-  for (int32_t i = 0; i < 12; i++) {
+  int32_t randomRanges = (int32_t)scaleTestWork(4);
+  for (int32_t i = 0; i < randomRanges; i++) {
     int64_t a = -150'000 + (int64_t)rng.rint(350'000);
     int64_t b = -150'000 + (int64_t)rng.rint(350'000);
     int64_t lo = std::min(a, b);

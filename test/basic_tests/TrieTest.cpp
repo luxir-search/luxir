@@ -11,6 +11,7 @@
 
 #include "solux/index/TrieBuilder.h"
 #include "solux/reader/TrieReader.h"
+#include "test/SoluxTest.h"
 
 using namespace solux;
 
@@ -309,7 +310,8 @@ TEST(TrieTest, FuzzMatchesReference) {
   bool sawArray = false;
   bool sawReverse = false;
 
-  for (uint32_t round = 0; round < 160; round++) {
+  uint32_t rounds = (uint32_t)SoluxTest::scaleTestWork(40);
+  for (uint32_t round = 0; round < rounds; round++) {
     std::vector<std::string> keys = makeFuzzKeys(rng, round);
     ASSERT_FALSE(keys.empty());
 

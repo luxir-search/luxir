@@ -1431,6 +1431,9 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
   ScoreTopKResult t2 = runMultiTermDisjunctionTopK(*reader, terms, topK, true);
   ScoreTopKResult t1 = runMultiTermDisjunctionTopK(*reader, terms, topK, false);
   assertSameTopK(t2, t1);
+  if (solux::unit_tests && zipf) {
+    ASSERT_LT(t2.visited, t1.visited);
+  }
 
   RSSWatcher watcher;
   int64_t fp = -1;
@@ -1725,18 +1728,37 @@ static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
                                                FrontierCorpus corpus,
                                                FrontierBoundMode mode) {
   int64_t corpusDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(2'000)
+      ? SoluxTest::scaleTestWork(1'000)
       : 1'000'000;
   constexpr int32_t topK = 100;
   std::string_view qterm = "frontier";
 
-  CollectionHelper helper;
+  // Unit mode keeps each corpus in its own collection so the T1/T2 captures
+  // share the identical index. Production benchmark mode retains the original
+  // single-collection lifecycle to avoid holding several million-doc corpora.
+  std::string_view collectionName = "main";
+  if (solux::unit_tests) {
+    collectionName = corpus == FrontierCorpus::AntiCorrelated
+        ? "frontier_bounds_anti_bm"
+        : corpus == FrontierCorpus::Clustered
+            ? "frontier_bounds_clustered_bm"
+            : "frontier_bounds_zipf_bm";
+  }
+  CollectionHelper helper(collectionName);
   bool reuseIndex = false;
   if (corpus == FrontierCorpus::AntiCorrelated) {
-    buildAntiCorrelatedFrontierBenchIndex(helper, corpusDocs);
+    std::array<int32_t, 1> docsPerSeg = {(int32_t)corpusDocs};
+    reuseIndex = solux::unit_tests && helper.indexMatchesShape(docsPerSeg);
+    if (!reuseIndex) {
+      buildAntiCorrelatedFrontierBenchIndex(helper, corpusDocs);
+    }
   } else if (corpus == FrontierCorpus::Clustered) {
-    helper.clear();
-    buildClusteredScoreTopKIndex(*helper.getIndexWriter(), corpusDocs);
+    std::array<int32_t, 1> docsPerSeg = {(int32_t)corpusDocs};
+    reuseIndex = solux::unit_tests && helper.indexMatchesShape(docsPerSeg);
+    if (!reuseIndex) {
+      helper.clear();
+      buildClusteredScoreTopKIndex(*helper.getIndexWriter(), corpusDocs);
+    }
     qterm = "hot";
   } else {
     int mergeFactor = 10;
@@ -1756,6 +1778,10 @@ static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
   ScoreTopKResult frontier = runFullTextScoreTopK(*reader, qterm, topK, true, true);
   assertSameTopK(exhaustive, corner);
   assertSameTopK(exhaustive, frontier);
+  if (solux::unit_tests && corpus == FrontierCorpus::AntiCorrelated) {
+    ASSERT_LT(frontier.visited, corner.visited);
+    ASSERT_GT(frontier.skippedBlocks, corner.skippedBlocks);
+  }
 
   RSSWatcher watcher;
 

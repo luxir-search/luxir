@@ -83,5 +83,5 @@ static void BM_BitSet_block(benchmark::State& state, int32_t blocks, bool getRan
 }
 #endif
 
-BENCHMARK_CAPTURE(BM_BitSet, denseIter, 1, false);
-BENCHMARK_CAPTURE(BM_BitSet, denseIterRank, 1, true);
+TUNING_BENCHMARK_CAPTURE(BM_BitSet, denseIter, 1, false);
+TUNING_BENCHMARK_CAPTURE(BM_BitSet, denseIterRank, 1, true);

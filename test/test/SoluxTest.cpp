@@ -347,14 +347,16 @@ int main(int argc, char **argv) {
 // unit test that runs all benchmarks at a faster speed
 TEST(Benchmarks, all) {
   // if we are running unit tests, we want the benchmarks to run faster
-  std::vector<char *> myargv(gArgv, gArgv + gArgc + 1);
+  std::vector<char *> myargv(gArgv, gArgv + gArgc);
 
   if (solux::unit_tests) {
     std::cout << "Benchmarks being run as part of unit tests. Pass --bench to run just benchmarks with" << std::endl
               << "normal google benchmark defaults." << std::endl;
 
-    bool hasMinTime = std::any_of(myargv.begin(), myargv.end()-1,
+    bool hasMinTime = std::any_of(myargv.begin(), myargv.end(),
         [](char* s){ return std::string_view(s).starts_with("--benchmark_min_time"); });
+    bool hasFilter = std::any_of(myargv.begin(), myargv.end(),
+        [](char* s){ return std::string_view(s).starts_with("--benchmark_filter"); });
 
     if (!hasMinTime && solux::unit_tests) {
       // turn down the time it takes to run tests if the benchmarks are just being run as part of unit tests
@@ -362,10 +364,18 @@ TEST(Benchmarks, all) {
       std::cout << "\tNOTE: setting --benchmark_min_time=1x" << std::endl;
     }
 
+    if (!hasFilter) {
+      // Tuning benchmarks only measure competing implementations. They remain
+      // available to --bench and to an explicit benchmark filter.
+      myargv.push_back(const_cast<char *>("--benchmark_filter=-^Tuning/"));
+      std::cout << "\tNOTE: excluding Tuning/ benchmarks" << std::endl;
+    }
+
     // TODO: should we use file instead of console output when running benchmarks as a unit test?
   }
 
-  int myargc = myargv.size();
+  myargv.push_back(nullptr);
+  int myargc = (int)myargv.size() - 1;
   benchmark::Initialize(&myargc, &(myargv[0]));
   benchmark::RunSpecifiedBenchmarks();
 }
