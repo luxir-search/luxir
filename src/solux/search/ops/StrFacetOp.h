@@ -29,7 +29,7 @@ enum class FacetCounterMode {
 };
 
 enum class StrFacetStrategy {
-  AUTO, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
+  AUTO, TOP_TERMS, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
 };
 
 inline StrFacetStrategy parseStrFacetStrategyEnv() {
@@ -174,6 +174,11 @@ public:
     std::variant<std::monostate, OrdHash, SkinnyCounter8, CountVector,
                  SpanCounter> counts;
     int64_t missing_num = 0; // number of missing values in this segment
+    int64_t topTermsSegs = 0;
+    // Kept apart from missing_num so a mixed domain can discard the deferred
+    // segments' contribution by ignoring it, rather than subtracting it back
+    // out before the replay recomputes it.
+    int64_t topTermsMissing = 0;
 
     template<typename Counter>
     static MergeableStrData* mergeSparse(MergeableStrData* a,
@@ -198,6 +203,10 @@ public:
       // start by updating missing_num of both (we will return one or the other)
       a->missing_num += b->missing_num;
       b->missing_num = a->missing_num;
+      a->topTermsSegs += b->topTermsSegs;
+      b->topTermsSegs = a->topTermsSegs;
+      a->topTermsMissing += b->topTermsMissing;
+      b->topTermsMissing = a->topTermsMissing;
 
       if (std::holds_alternative<std::monostate>(a->counts)) {
         return b;
@@ -407,6 +416,7 @@ public:
 
     ExecutionProfileRun* profileRun;
     std::vector<DocSet*> input;
+    std::vector<uint8_t> topTermsSegments;
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
   public:
@@ -418,6 +428,7 @@ public:
         inlineDriver(op.req.reader->segments().size(),
                      [this](std::unique_ptr<MergeableStrFacetInline> m){ facetResult2(std::move(m)); }) {
       input.resize(op.req.reader->segments().size());
+      topTermsSegments.resize(op.req.reader->segments().size());
       inlineDriver.setCreator([this]() {
         auto* p = new MergeableStrFacetInline;
         for (auto& [key, subop] : thisOp().inlineSubOps) {
@@ -525,6 +536,13 @@ public:
     void calcOrdMap(int32_t segnum, DocSet* domain,
                     ExecutionProfilePieceState* profile) {
       driver.contribute([&](MergeableStrData& data) {
+        countSegment(data, segnum, domain, profile, true);
+      });
+    }
+
+    void countSegment(MergeableStrData& data, int32_t segnum, DocSet* domain,
+                      ExecutionProfilePieceState* profile,
+                      bool allowTopTerms) {
         //write only to different slots, so no need to synchronize
         input[segnum] = domain;
         SegFieldInfo segFieldInfo;
@@ -595,9 +613,25 @@ public:
           }
         }
 
+        // Not a counting strategy like the other three, so it is not a forcible
+        // mode: it answers from the OrdMap's docFreq list and counts nothing.
+        // Forcing any of the three disables it, which is what makes them a
+        // clean A/B baseline.
+        bool topTermsEligible =
+            allowTopTerms
+            && StrFacetOp::forcedStrategy == StrFacetStrategy::AUTO
+            && thisOp().ordMap != nullptr
+            && domainView.compCard == 0
+            && thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
+            && thisOp().limit >= 0
+            && (int64_t)thisOp().ordMap->topTerms().entries.size()
+                >= thisOp().limit;
+
         StrFacetStrategy strategy = StrFacetStrategy::COLUMN_DOMAIN;
         std::string forcedFallback;
-        if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_DOMAIN) {
+        if (topTermsEligible) {
+          strategy = StrFacetStrategy::TOP_TERMS;
+        } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_DOMAIN) {
           strategy = StrFacetStrategy::COLUMN_DOMAIN;
         } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
           if (termsAvailable) {
@@ -620,6 +654,24 @@ public:
           strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
         } else if (termCost < columnCost) {
           strategy = StrFacetStrategy::TERM_DRIVEN;
+        }
+
+        if (strategy == StrFacetStrategy::TOP_TERMS) {
+          if (thisOp().missing) {
+            data.topTermsMissing +=
+                (int64_t)maxDoc - segFieldInfo.docsWithField;
+          }
+          data.topTermsSegs++;
+          topTermsSegments[(size_t)segnum] = 1;
+          if (profile != nullptr) {
+            profile->wire.cardinality = globVals;
+            profile->wire.strategy = "toplist";
+            profile->details.emplace_back(
+                "global docFreq top terms, "
+                + std::to_string(thisOp().ordMap->topTerms().entries.size())
+                + " listed");
+          }
+          return;
         }
 
         bool spanRep = isSparseForcedMode(StrFacetOp::forcedCounterMode);
@@ -905,7 +957,6 @@ public:
           }
         }
         data.missing_num += missing_num;
-      });
     }
 
     void facetResult(std::unique_ptr<MergeableStrData> mergedData) {
@@ -930,13 +981,35 @@ public:
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      auto missing_count = -1;
-
+      auto missing_count = mergedData->missing_num;
       std::vector<std::pair<std::string, int64_t>> countVec;
 
-      if (std::holds_alternative<std::monostate>(mergedData->counts)) {
+      int64_t numSegments = (int64_t)thisOp().reader.segments().size();
+      bool allTopTerms =
+          numSegments > 0 && mergedData->topTermsSegs == numSegments;
+      if (allTopTerms) {
+        missing_count += mergedData->topTermsMissing;
+      } else if (mergedData->topTermsSegs > 0) {
+        // RootOp domains are uniform when there are no deletes, but filtered
+        // and nested domains can cover a whole segment and only part of another.
+        // Keep this slow replay so deferred segments cannot be dropped.  The
+        // deferred segments' topTermsMissing is simply dropped on the floor -
+        // the replay recomputes it into missing_num.
+        mergedData->topTermsSegs = 0;
+        for (int32_t segnum = 0; segnum < numSegments; segnum++) {
+          if (topTermsSegments[(size_t)segnum] == 0) continue;
+          topTermsSegments[(size_t)segnum] = 0;
+          // TOP_TERMS required a full maxDoc domain and a reader without
+          // deletes, so null is the same domain and cannot outlive its owner.
+          countSegment(*mergedData, segnum, nullptr, nullptr, false);
+        }
         missing_count = mergedData->missing_num;
-      } else {
+      }
+
+      bool haveOrdCounts =
+          allTopTerms
+          || !std::holds_alternative<std::monostate>(mergedData->counts);
+      if (haveOrdCounts) {
         auto* mapCounts = std::get_if<MergeableStrData::OrdHash>(&mergedData->counts);
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
         auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
@@ -946,7 +1019,14 @@ public:
         // buckets after sorting/truncating the competitive nonzero buckets.
         auto min = std::max<int64_t>(thisOp().minCount, 1);
 
-        if (mapCounts) {
+        if (allTopTerms) {
+          assert(thisOp().ordMap != nullptr);
+          for (const auto& entry : thisOp().ordMap->topTerms().entries) {
+            if (entry.df < min) break;
+            if ((int64_t)ordCounts.size() == limit) break;
+            ordCounts.emplace_back(entry.ord, entry.df);
+          }
+        } else if (mapCounts) {
           for (auto& [val, count] : *mapCounts) {
             if (count >= min) {
               ordCounts.emplace_back(val, count);
@@ -982,16 +1062,17 @@ public:
               }
             }
           }
-        } else {
-          assert(spanCounts);
+        } else if (spanCounts) {
           collectSparseCounts(*spanCounts, min, limit, ordCounts);
+        } else {
+          assert(false);
         }
 
         // Bench-only exact per-request counter footprint (set SOLUX_FACET_BYTES).
         // Process RSS is too coarse for the sparse-cell wins this counter targets,
         // so report the chosen rep's heap bytes directly. Cached env read = off-path.
         static const bool logFacetBytes = std::getenv("SOLUX_FACET_BYTES") != nullptr;
-        if (logFacetBytes) {
+        if (logFacetBytes && !allTopTerms) {
           const char* repName = "?";
           size_t bytes = 0;
           if (mapCounts) {
@@ -1014,8 +1095,6 @@ public:
           LOG_WARN("FACETBYTES field={} rep={} numOrds={} emitted={} bytes={}",
                    thisOp().fieldName, repName, numOrds, ordCounts.size(), bytes);
         }
-
-        missing_count = mergedData->missing_num;
 
         sortByCountDescAndLimit(ordCounts, limit);
         bool showZeros = (thisOp().minCount == 0);

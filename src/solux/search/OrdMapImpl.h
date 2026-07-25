@@ -52,6 +52,7 @@ class OrdMapBuilder {
   std::string_view field;
   IndexReader& reader;
   OrdMap::DeltaEncoding deltaEncoding;
+  TopTermsBuilder topTermsBuilder;
 
   struct SegmentStat {
     const char* encoding = "none";
@@ -70,7 +71,9 @@ class OrdMapBuilder {
       segments += std::to_string(segmentStats[i].bits);
       segments.push_back('b');
     }
-    LOG_INFO("OrdMap field={} bytes={} segments=[{}]", field, size, segments);
+    LOG_INFO("OrdMap field={} bytes={} topTerms={} unlistedBound={} segments=[{}]",
+             field, size, topTerms.entries.size(), topTerms.unlistedBound,
+             segments);
   }
 
   struct PackedDeltaRuns {
@@ -330,12 +333,14 @@ class OrdMapBuilder {
 public:
   OrdMapBuilder(std::string_view field, IndexReader& reader)
       : field(field), reader(reader),
-        deltaEncoding(OrdMap::configuredDeltaEncoding()) {}
+        deltaEncoding(OrdMap::configuredDeltaEncoding()),
+        topTermsBuilder(TopTermsBuilder::thresholdFor(reader.maxDoc())) {}
 
   // Build fills these in currently.  In the future, the output may be written to disk.
   std::unique_ptr<char[]> data;
   int64_t start = 0;
   int64_t size = 0;
+  TopTerms topTerms;
   
   // For single segment with values case
   bool isSingleSegment = false;
@@ -382,6 +387,7 @@ public:
     }
 
     if (segsWithValue == 0) {
+      topTerms = topTermsBuilder.finish();
       logSize();
       return;
     }
@@ -396,9 +402,16 @@ public:
           this->numTerms = allTermsEnums[i]->tenum.numTerms();  // Get directly from fieldInfo
           this->isSingleSegment = true;
           segmentStats[i] = {"identity", 0};
+          // This leaves the enum on its final term, and this fast path returns
+          // without using it again.
+          allTermsEnums[i]->tenum.forEachDocFreq(
+              [&](int64_t ord, int32_t df) {
+                topTermsBuilder.add(ord, df);
+              });
           break;
         }
       }
+      topTerms = topTermsBuilder.finish();
       logSize();
       return;
     }
@@ -465,8 +478,10 @@ public:
       firstSegs.addInt64(firstSeg);
       globDeltas.addInt64(firstDelta);
 
+      int64_t globalDf = 0;
       do {
         TermsEnumIdx& entry = termPQ.top();
+        globalDf += entry.tenum.docFreq();
         auto delta = globalOrd - entry.tenum.ord();
         entry.addDelta(delta);
 
@@ -480,6 +495,7 @@ public:
         // FUTURE OPT: we could special case when we are down to a single segment.  All deltas
         //             will be the same from then on.
       } while (termPQ.size() > 0 && termPQ.top().tenum.term() == packedTerm);
+      topTermsBuilder.add(globalOrd, globalDf);
     }
 
     auto firstSegsInfo = firstSegs.finish();
@@ -589,6 +605,7 @@ public:
     start = ordMapStart;
     data.reset(new char[size]);
     payloadFile.copyTo(data.get());
+    topTerms = topTermsBuilder.finish();
     logSize();
   }
 };
@@ -623,14 +640,17 @@ std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reade
   
   // Handle single segment with values case
   if (builder.isSingleSegment) {
-    return std::make_shared<OrdMap>(builder.numTerms, builder.segmentWithValues);
+    return std::make_shared<OrdMap>(
+        builder.numTerms, builder.segmentWithValues, std::move(builder.topTerms));
   }
   
   // Handle normal case or no values case
   if (!builder.data) {
     return {};
   }
-  return std::make_shared<OrdMap>(std::move(builder.data), builder.start, builder.size);
+  return std::make_shared<OrdMap>(
+      std::move(builder.data), builder.start, builder.size,
+      std::move(builder.topTerms));
 }
 
 

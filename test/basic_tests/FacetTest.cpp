@@ -350,6 +350,74 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
   }
 }
 
+TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
+  CollectionHelper helper;
+  helper.clear();
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a1", "cat_s", "a", "few_s", "x", "sel_s", "yes"),
+      flatdoc("id", "missing", "few_s", "x", "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "b1", "cat_s", "b", "few_s", "x", "sel_s", "yes"),
+      flatdoc("id", "c1", "cat_s", "c", "sel_s", "no"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a2", "cat_s", "a", "few_s", "y", "sel_s", "yes"),
+      flatdoc("id", "d1", "cat_s", "d", "sel_s", "no"),
+      flatdoc("id", "a3", "cat_s", "a", "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  StrFacetStrategyGuard guard;
+  auto run = [&](StrFacetStrategy strategy, std::string_view field,
+                 int64_t limit, int64_t mincount, bool missing) {
+    StrFacetOp::forcedStrategy = strategy;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& facet = req->facet("f", field).limit(limit).mincount(mincount);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = missing;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return encodeFacetResult(*req, "f");
+  };
+  auto expectMatches = [&](std::string_view field, int64_t limit,
+                           int64_t mincount, bool missing) {
+    auto expected = run(
+        StrFacetStrategy::COLUMN_DOMAIN, field, limit, mincount, missing);
+    EXPECT_EQ(expected, run(
+        StrFacetStrategy::COLUMN_COMPLEMENT, field, limit, mincount, missing));
+    EXPECT_EQ(expected, run(
+        StrFacetStrategy::AUTO, field, limit, mincount, missing));
+  };
+
+  expectMatches("cat_s", 3, 1, false);
+  expectMatches("cat_s", 3, 0, true);
+  expectMatches("cat_s", 3, 2, true);
+  expectMatches("few_s", 10, 0, true);
+  expectMatches("cat_s", -1, 0, true);
+
+  auto runMixedDomain = [&](StrFacetStrategy strategy) {
+    StrFacetOp::forcedStrategy = strategy;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& docs = req->topDocs("q");
+    docs.getNumber(true).matchQuery("sel_s", "yes");
+    auto& facet = docs.facet("f", "cat_s").limit(3).mincount(0);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* result = req->docList("q")->ops.at("f")->facetResult();
+    std::vector<std::byte> encoded;
+    EXPECT_TRUE(api::encode(*result, encoded));
+    return encoded;
+  };
+  EXPECT_EQ(runMixedDomain(StrFacetStrategy::COLUMN_DOMAIN),
+            runMixedDomain(StrFacetStrategy::AUTO));
+
+  ASSERT_TRUE(helper.deleteById("a1", UpdateMessage::COMMIT).success);
+  expectMatches("cat_s", 3, 0, true);
+}
+
 TEST_F(FacetTest, spanCounterTopKOverflowShortCircuit) {
   // A value appearing > 65536 times overflows the u16 span slot. With a facet
   // limit <= the number of overflowed values, span emit takes the overflow-first
@@ -3289,7 +3357,15 @@ TEST_F(RandomFacetTest, randomFaceting) {
   // requests, each issuing several queries x a facet per field (many facet
   // computations, the same field faceted under multiple domains). Indexes and
   // requests are independent work dimensions, so scale each by sqrt(effort).
-  runRandomTest(
-      (int)scaleTestDimension(2, 2),
-      (int)scaleTestDimension(100, 2));
+  StrFacetStrategyGuard guard;
+  for (StrFacetStrategy strategy : {
+      StrFacetStrategy::AUTO,
+      StrFacetStrategy::COLUMN_DOMAIN,
+      StrFacetStrategy::COLUMN_COMPLEMENT,
+      StrFacetStrategy::TERM_DRIVEN}) {
+    StrFacetOp::forcedStrategy = strategy;
+    runRandomTest(
+        (int)scaleTestDimension(2, 2),
+        (int)scaleTestDimension(100, 2));
+  }
 }

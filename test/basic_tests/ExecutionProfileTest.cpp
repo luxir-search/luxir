@@ -156,6 +156,33 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
   }
 }
 
+TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
+  CollectionHelper helper("profile-top-terms");
+  helper.indexAll(std::array{
+      flatdoc("id", "1", "cat_s", "a"),
+      flatdoc("id", "2", "cat_s", "b"),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+      flatdoc("id", "3", "cat_s", "a"),
+      flatdoc("id", "4", "cat_s", "c"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("profile-top-terms").profile()
+      .facet("cats", "cat_s").limit(2);
+  req->execute(false);
+  ASSERT_OK(req);
+
+  const auto& pieces = profileOp(*req).pieces;
+  ASSERT_EQ(2u, pieces.size());
+  for (const auto& piece : pieces) {
+    EXPECT_EQ("toplist", piece.strategy);
+    EXPECT_EQ(3, *piece.cardinality);
+    EXPECT_TRUE(detailsMention(piece, "global docFreq top terms"));
+    EXPECT_TRUE(detailsMention(piece, "3 listed"));
+  }
+}
+
 TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   CollectionHelper helper("profile-vector");
   std::vector<Doc> docs;

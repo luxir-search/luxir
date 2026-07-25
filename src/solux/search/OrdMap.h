@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "IndexReader.h"
+#include "TopTerms.h"
 #include "solux/codec/LinearPack.h"
 #include "solux/codec/OrdColumnFormat.h"
 #include "solux/reader/IntColReader.h"
@@ -134,19 +135,24 @@ private:
 
   int64_t nOrds;
   int firstFull = -1; // first segment that has all the ords, or -1 if none
+  TopTerms topTermList;
   std::vector<SegToGlobal> segToGlobal;    // per-segment mapping from segment ord to global ord
   std::optional<IntColReader> firstSegs;  // for each global ord, what is the first segment it appeared in
   std::optional<IntColReader> globDeltas; // for each global ord, what delta was applied to the segment ord to get the global ord
 
 public:
   // Constructor for single segment with values case (identity mapping)
-  OrdMap(int64_t numOrds, int segmentWithValues) 
-    : data(nullptr), start(0), end(0), nOrds(numOrds), firstFull(segmentWithValues) {
+  OrdMap(int64_t numOrds, int segmentWithValues, TopTerms&& topTerms)
+    : data(nullptr), start(0), end(0), nOrds(numOrds),
+      firstFull(segmentWithValues), topTermList(std::move(topTerms)) {
     // Keep segToGlobal empty - getSegToGlobal will return default values
     // No global columns needed since one segment has all terms
   }
   
-  OrdMap(std::unique_ptr<char[]>&& data, int64_t start, int64_t end) : data(std::move(data)), start(start), end(end) {
+  OrdMap(std::unique_ptr<char[]>&& data, int64_t start, int64_t end,
+         TopTerms&& topTerms)
+      : data(std::move(data)), start(start), end(end),
+        topTermList(std::move(topTerms)) {
     InputStream dataIS(this->data.get() + start, this->data.get() + start + end);
 
     // Read size of metadata to we can skip to the start of it
@@ -250,6 +256,8 @@ public:
   
   /// Get the total number of unique terms across all segments
   int64_t numOrds() const { return nOrds; }
+
+  const TopTerms& topTerms() const { return topTermList; }
 
   /// Returns -1, or the first segment that has all the ords.
   int firstFullSeg() const { return firstFull; }
