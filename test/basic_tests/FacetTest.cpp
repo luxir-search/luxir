@@ -158,6 +158,14 @@ public:
   }
 };
 
+class StrFacetStrategyGuard {
+  StrFacetStrategy saved = StrFacetOp::forcedStrategy;
+public:
+  ~StrFacetStrategyGuard() {
+    StrFacetOp::forcedStrategy = saved;
+  }
+};
+
 } // namespace
 
 TEST_F(FacetTest, spanCounter) {
@@ -264,6 +272,81 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
     auto expected = run(FacetCounterMode::AUTO, mincount);
     EXPECT_EQ(expected, run(FacetCounterMode::SPAN_GLOBAL, mincount));
     EXPECT_EQ(expected, run(FacetCounterMode::SPAN_LOCAL, mincount));
+  }
+}
+
+TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
+  CollectionHelper helper;
+  helper.clear();
+
+  // Segment 0 has a deleted value and a single-term field. Segment 1 shifts
+  // local string ords in the global dictionary and has distinct multi-values.
+  // Segment 2 omits every faceted field.
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "cat_s", "middle", "tags_ss", vecs("x", "y"),
+              "single_s", "only", "sel_s", "yes"),
+      flatdoc("id", "deleted", "cat_s", "deleted-value",
+              "tags_ss", vecs("x", "z"), "single_s", "only",
+              "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "b", "cat_s", "alpha", "tags_ss", vecs("y", "z"),
+              "sel_s", "yes"),
+      flatdoc("id", "c", "cat_s", "zulu", "sel_s", "no"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(
+      flatdoc("id", "absent", "sel_s", "yes"),
+      UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  StrFacetStrategyGuard guard;
+  auto run = [&](StrFacetStrategy strategy, int domainKind) {
+    StrFacetOp::forcedStrategy = strategy;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+
+    auto addFacets = [](auto& cursor) {
+      for (std::string_view field : {"cat_s", "tags_ss", "single_s"}) {
+        auto& facet = cursor.facet(field, field).limit(-1).mincount(0);
+        std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+      }
+    };
+    if (domainKind == 0) {
+      addFacets(*req);
+    } else {
+      auto& top = req->topDocs("q");
+      top.getNumber(true).matchQuery(
+          "sel_s", domainKind == 1 ? "yes" : "does-not-exist");
+      addFacets(top);
+    }
+
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::vector<std::byte>> encoded;
+    for (std::string_view field : {"cat_s", "tags_ss", "single_s"}) {
+      const api::FacetResult* result;
+      if (domainKind == 0) {
+        result = req->responses[0]->proto.ops.at(field)->facetResult();
+      } else {
+        const auto* docs = req->docList("q");
+        EXPECT_NE(nullptr, docs);
+        result = docs == nullptr ? nullptr : docs->ops.at(field)->facetResult();
+      }
+      EXPECT_NE(nullptr, result);
+      encoded.emplace_back();
+      if (result != nullptr) {
+        EXPECT_TRUE(api::encode(*result, encoded.back()));
+      }
+    }
+    return encoded;
+  };
+
+  for (int domainKind : {0, 1, 2}) {
+    auto expected = run(StrFacetStrategy::COLUMN_DOMAIN, domainKind);
+    EXPECT_EQ(expected, run(StrFacetStrategy::COLUMN_COMPLEMENT, domainKind));
+    EXPECT_EQ(expected, run(StrFacetStrategy::TERM_DRIVEN, domainKind));
+    EXPECT_EQ(expected, run(StrFacetStrategy::AUTO, domainKind));
   }
 }
 

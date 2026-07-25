@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 #include <variant>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -26,6 +27,27 @@ enum class FacetCounterMode {
   // the staging crossover on a multi-segment index (moot at one segment).
   SKINNY_GLOBAL, SKINNY_LOCAL
 };
+
+enum class StrFacetStrategy {
+  AUTO, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
+};
+
+inline StrFacetStrategy parseStrFacetStrategyEnv() {
+  const char* e = std::getenv("SOLUX_FACET_STRATEGY");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "column") {
+      return StrFacetStrategy::COLUMN_DOMAIN;
+    }
+    if (s == "complement") {
+      return StrFacetStrategy::COLUMN_COMPLEMENT;
+    }
+    if (s == "term") {
+      return StrFacetStrategy::TERM_DRIVEN;
+    }
+  }
+  return StrFacetStrategy::AUTO;
+}
 
 // The SPAN_* modes drive the dedicated sparse fork; everything else runs the
 // ordinary selector path (with FORCE_* pinning its rep choice).
@@ -143,6 +165,7 @@ inline void collectSparseCounts(
 class StrFacetOp : public FieldFacetReq {
 public:
   static inline FacetCounterMode forcedCounterMode = parseFacetCounterModeEnv();
+  static inline StrFacetStrategy forcedStrategy = parseStrFacetStrategyEnv();
 
   class MergeableStrData : public solux::MergeableData {
   public:
@@ -375,6 +398,13 @@ public:
   }
 
   class Calc : public Calculator {
+    // Guesses in column-read-equivalents pending forced-strategy grid
+    // measurement. Keep these named so the measured crossover fit replaces
+    // constants rather than changing selector structure.
+    static constexpr double DF_COST = 2.0;
+    static constexpr double POSTINGS_SETUP_COST = 30.0;
+    static constexpr double POSTINGS_ADVANCE_COST = 3.0;
+
     ExecutionProfileRun* profileRun;
     std::vector<DocSet*> input;
     SegmentMergeDriver<MergeableStrData> driver;
@@ -520,22 +550,12 @@ public:
         fieldReader.readFieldInfo(segFieldInfo);
 
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
-        int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
         OrdMap::SegToGlobal mapping;
         if (thisOp().ordMap) {
           mapping = thisOp().ordMap->getSegToGlobal(segnum);
         } else {
           mapping.numOrds = segFieldInfo.nTerms;
-        }
-
-        if (profile != nullptr) {
-          // Per-segment ord picture: the segment's local maxOrd (nTerms) and
-          // whether its ords equal the global ords (identity makes local staging
-          // moot for this segment).
-          profile->details.emplace_back(
-              "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
-              + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
         }
 
         auto forEachMappedOrd = [&](size_t size, auto&& accept) {
@@ -554,19 +574,236 @@ public:
           }
         };
 
-        if (isSparseForcedMode(StrFacetOp::forcedCounterMode)) {
-          MergeableStrData::ensureRep(data, MergeableStrData::Rep::Span, globVals);
-          auto* countSpan = std::get_if<SpanCounter>(&data.counts);
-          assert(countSpan != nullptr);
-          if (profile != nullptr) {
-            profile->wire.cardinality = globVals;
-            profile->wire.strategy =
-                StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL
-                    ? "span_global"
-                    : "span_local";
+        DomainView domainView(domain, maxDoc);
+        bool termsAvailable = segFieldInfo.nTerms > 0;
+        double columnCost = (double)domainView.card;
+        double complementCost = std::numeric_limits<double>::infinity();
+        double termCost = std::numeric_limits<double>::infinity();
+        if (termsAvailable) {
+          complementCost = (double)domainView.compCard
+              + (double)segFieldInfo.nTerms * DF_COST
+              + (double)FixedBitSet::sizeInWords(maxDoc);
+          int32_t advanceSide = domainView.bits != nullptr
+              ? std::min(domainView.card, domainView.compCard)
+              : domainView.card;
+          termCost = (double)segFieldInfo.nTerms * POSTINGS_SETUP_COST
+              + std::min((double)segFieldInfo.sumDocFreq,
+                         (double)segFieldInfo.nTerms
+                             * POSTINGS_ADVANCE_COST * (double)advanceSide);
+          if (thisOp().missing && segFieldInfo.docsWithField != maxDoc) {
+            termCost += (double)segFieldInfo.docsWithField;
+          }
+        }
+
+        StrFacetStrategy strategy = StrFacetStrategy::COLUMN_DOMAIN;
+        std::string forcedFallback;
+        if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_DOMAIN) {
+          strategy = StrFacetStrategy::COLUMN_DOMAIN;
+        } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
+          if (termsAvailable) {
+            strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
+          } else {
+            forcedFallback = "forced complement unavailable: no terms dictionary";
+          }
+        } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::TERM_DRIVEN) {
+          if (termsAvailable) {
+            strategy = StrFacetStrategy::TERM_DRIVEN;
+          } else {
+            forcedFallback = "forced term unavailable: no terms dictionary";
+          }
+        } else if (termsAvailable && domainView.compCard == 0) {
+          // At 100% selectivity docFreq is the result. Make this an explicit
+          // shared S2/S3 fast path rather than asking guessed constants whether
+          // avoiding all column and postings reads is worthwhile.
+          strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
+        } else if (complementCost < columnCost && complementCost <= termCost) {
+          strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
+        } else if (termCost < columnCost) {
+          strategy = StrFacetStrategy::TERM_DRIVEN;
+        }
+
+        bool spanRep = isSparseForcedMode(StrFacetOp::forcedCounterMode);
+        MergeableStrData::Rep rep;
+        if (spanRep) {
+          rep = MergeableStrData::Rep::Span;
+        } else {
+          // want a vector of global ords if the domain size is much larger than
+          // the number of unique values, so a skinny counter would overflow often.
+          bool wantVec = (domainSize >> 8) >= globVals;
+          // if unique values greatly outnumber domain docs, use a hashmap.
+          bool wantHash = (globVals >> 6) >= domainSize;
+          rep =
+              StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_VECTOR
+                  ? MergeableStrData::Rep::Vector
+            : forcesSkinnyRep(StrFacetOp::forcedCounterMode)
+                  ? MergeableStrData::Rep::Skinny
+            : StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_HASH
+                  ? MergeableStrData::Rep::Hash
+            : wantVec ? MergeableStrData::Rep::Vector
+            : wantHash ? MergeableStrData::Rep::Hash
+                       : MergeableStrData::Rep::Skinny;
+        }
+
+        bool repUpgraded = MergeableStrData::ensureRep(data, rep, globVals);
+        auto* countSpan = std::get_if<SpanCounter>(&data.counts);
+        auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
+        auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
+        auto* countSkinny = std::get_if<SkinnyCounter8>(&data.counts);
+
+        const char* wantedRep =
+            rep == MergeableStrData::Rep::Vector ? "vector"
+          : rep == MergeableStrData::Rep::Hash ? "hash"
+          : rep == MergeableStrData::Rep::Skinny ? "skinny"
+                                                 : "span";
+        const char* usingRep =
+            countSpan ? "span"
+          : countVec ? "vector"
+          : countMap ? "hash"
+                     : "skinny";
+        if (profile != nullptr) {
+          // wire.strategy stays the counter representation.  How the segment was
+          // counted is a second, orthogonal dimension, and details is where this
+          // proto says it belongs ("terms-index vs column").
+          profile->wire.cardinality = globVals;
+          profile->wire.strategy = usingRep;
+          profile->details.emplace_back(
+              "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
+              + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
+          if (strategy == StrFacetStrategy::COLUMN_DOMAIN) {
             profile->details.emplace_back(domainDesc(
                 domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
+          } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
+            profile->details.emplace_back(domainView.compCard == 0
+                ? "all-docs domain, docFreq-only dictionary walk"
+                : "inverted bitset, adaptive point/bulk ord loads");
+          } else {
+            profile->details.emplace_back(
+                "per-term smallest-side postings intersection");
           }
+          if (!forcedFallback.empty()) {
+            profile->details.emplace_back(forcedFallback);
+          }
+          if (repUpgraded) {
+            profile->details.emplace_back(
+                std::string("upgraded shared counters to ") + usingRep);
+          } else if (wantedRep != std::string_view(usingRep)) {
+            profile->details.emplace_back(
+                std::string("want=") + wantedRep + ", found=" + usingRep);
+          }
+        }
+
+        auto addGlobalCount = [&](int64_t globalOrd, int64_t count) {
+          assert(count > 0);
+          if (countSpan != nullptr) {
+            countSpan->increment(globalOrd, count);
+          } else if (countVec != nullptr) {
+            (*countVec)[(size_t)globalOrd] += count;
+          } else if (countMap != nullptr) {
+            (*countMap)[globalOrd] += count;
+          } else {
+            assert(countSkinny != nullptr);
+            countSkinny->increment(globalOrd, count);
+          }
+        };
+
+        if (strategy != StrFacetStrategy::COLUMN_DOMAIN) {
+          std::vector<int32_t> localCounts((size_t)segFieldInfo.nTerms);
+          TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
+
+          if (domainView.compCard == 0) {
+            // Shared S2/S3 all-docs path: no ord column or postings enum.
+            terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
+              localCounts[(size_t)localOrd] = docFreq;
+            });
+            if (thisOp().missing) {
+              data.missing_num +=
+                  (int64_t)maxDoc - segFieldInfo.docsWithField;
+            }
+          } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
+            size_t numWords = FixedBitSet::sizeInWords(maxDoc);
+            auto* words = (uint64_t*)poolGuard.pool().alloc(
+                numWords * sizeof(uint64_t), alignof(uint64_t));
+            if (domainView.bits != nullptr) {
+              // Word-wise inversion reads the domain's whole word array, so it
+              // must cover the same doc space (liveDocs and every DocSetBuilder
+              // output are sized at maxDoc).
+              assert(domainView.bits->size() == maxDoc);
+              for (size_t i = 0; i < numWords; i++) {
+                words[i] = ~domainView.bits->words[i];
+              }
+            } else {
+              std::memset(words, 0xff, numWords * sizeof(uint64_t));
+              for (int32_t doc : domainView.arr->docs()) {
+                words[(uint32_t)doc >> 6] &=
+                    ~(1ULL << ((uint32_t)doc & 63));
+              }
+            }
+            int32_t trailing = maxDoc & 63;
+            if (trailing != 0) {
+              words[numWords - 1] &= (1ULL << trailing) - 1;
+            }
+            FixedBitSet complementBits(words, maxDoc);
+            BitDocSet complement(complementBits, domainView.compCard);
+            int64_t compMissing = 0;
+            OrdColReader ordColReader(postingsReader, segFieldInfo);
+            forEachOrdValue(
+                &complement, ordColReader, maxDoc, compMissing,
+                [&](int32_t docid, int32_t value) SOLUX_INLINE {
+                  unused(docid);
+                  // Column value 0 is missing; value v maps to term ord v-1.
+                  // Multi-valued ord columns hold distinct ords per doc, so
+                  // this counts the same doc-term pairs as docFreq.
+                  localCounts[(size_t)value - 1]++;
+                });
+
+            terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
+              int32_t complementCount = localCounts[(size_t)localOrd];
+              // Deleted postings are present in both docFreq and the
+              // complement column walk, so the subtraction remains exact.
+              assert(complementCount <= docFreq);
+              localCounts[(size_t)localOrd] = docFreq - complementCount;
+            });
+
+            if (thisOp().missing) {
+              int64_t docsWithValueInComplement =
+                  domainView.compCard - compMissing;
+              int64_t docsWithValueInDomain =
+                  segFieldInfo.docsWithField - docsWithValueInComplement;
+              assert(docsWithValueInDomain >= 0
+                     && docsWithValueInDomain <= domainView.card);
+              data.missing_num +=
+                  domainView.card - docsWithValueInDomain;
+            }
+          } else {
+            terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
+              DocsOnlyEnum postings(terms);
+              localCounts[(size_t)localOrd] =
+                  countTermInDomain(domainView, postings, docFreq);
+            });
+            if (thisOp().missing) {
+              DocsReader docsReader(postingsReader, segFieldInfo);
+              data.missing_num +=
+                  countMissingInDomain(domainView, docsReader);
+            }
+          }
+
+          // SegmentMergeDriver shares one accumulator across segments. S2/S3
+          // always stage in local-ord space and cross the 128-ord mapping frames
+          // only while draining completed direct domain counts.
+          forEachMappedOrd(localCounts.size(),
+                           [&](size_t localOrd, int64_t globalOrd) {
+            int32_t count = localCounts[localOrd];
+            if (count > 0) {
+              addGlobalCount(globalOrd, count);
+            }
+          });
+          return;
+        }
+
+        int64_t missing_num = 0;
+        if (spanRep) {
+          MergeableStrData::ensureRep(data, MergeableStrData::Rep::Span, globVals);
+          assert(countSpan != nullptr);
           if (StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL) {
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
@@ -590,51 +827,6 @@ public:
           }
           data.missing_num += missing_num;
           return;
-        }
-
-        // want a vector of global ords if the domain size is much larger than the number of unique values
-        // such that a skinny counter would have many overflows.
-        bool wantVec = (domainSize >> 8) >= globVals;
-
-        // if the number of unique values is large compared to the domain size, we want to use a hashmap
-        bool wantHash = (globVals >> 6) >= domainSize;
-
-        // A segment that finished before us may have chosen a smaller storage
-        // type; ensureRep upgrades data.counts in place to the larger rep we
-        // want (folding the old counts in), or keeps/creates it as needed.  Then
-        // re-read the active alternative for the scan below.
-        // FORCE_* pins the rep so the grid can measure each rep at every cell;
-        // AUTO uses the (currently guessed) wantVec/wantHash thresholds.
-        MergeableStrData::Rep rep =
-            StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_VECTOR
-                ? MergeableStrData::Rep::Vector
-          : forcesSkinnyRep(StrFacetOp::forcedCounterMode)
-                ? MergeableStrData::Rep::Skinny
-          : StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_HASH
-                ? MergeableStrData::Rep::Hash
-          : wantVec ? MergeableStrData::Rep::Vector
-          : wantHash ? MergeableStrData::Rep::Hash
-                     : MergeableStrData::Rep::Skinny;
-        bool repUpgraded = MergeableStrData::ensureRep(data, rep, globVals);
-        auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
-        auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
-        auto* countSkinny = std::get_if<SkinnyCounter8>(&data.counts);
-        if (profile != nullptr) {
-          const char* want = rep == MergeableStrData::Rep::Vector ? "vector"
-                           : rep == MergeableStrData::Rep::Hash ? "hash"
-                                                                : "skinny";
-          const char* using_ = countVec ? "vector" : countMap ? "hash" : "skinny";
-          profile->wire.cardinality = globVals;
-          profile->wire.strategy = want;
-          profile->details.emplace_back(domainDesc(
-              domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
-          if (repUpgraded) {
-            // This piece grew the shared accumulator (and paid the fold).
-            profile->details.emplace_back(std::string("upgraded shared counters to ") + using_);
-          } else if (want != std::string_view(using_)) {
-            // Accumulator already outgrew our pick (no-downgrade rule).
-            profile->details.emplace_back(std::string("want=") + want + ", found=" + using_);
-          }
         }
 
         // if we want a vector, then there are enough repeats that we should collect
