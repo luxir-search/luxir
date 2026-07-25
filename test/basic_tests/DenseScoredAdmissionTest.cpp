@@ -238,6 +238,22 @@ TEST_F(DenseScoredAdmissionTest, exactCountUsesDeepestCalibratedDepth) {
   EXPECT_EQ(exact.count, runPullCount(helper, shallowOutside, 100));
 }
 
+// Requested depth below the entry gate: with pruning the shape never samples,
+// but an exact count prunes nothing at any depth, so the effective depth (and
+// with it the gate) reads as the deepest calibrated one.
+TEST_F(DenseScoredAdmissionTest, exactCountAdmitsBelowTheShallowEntryGate) {
+  AdmissionRun pruned = runShape(helper, shallowOutside, 10, false, false);
+  EXPECT_EQ(pruned.windows, 0);
+  EXPECT_EQ(pruned.admits, 0);
+  EXPECT_EQ(pruned.latchBacks, 0);
+
+  AdmissionRun exact = runShape(helper, shallowOutside, 10, true, false);
+  EXPECT_EQ(exact.admits, 1);
+  EXPECT_EQ(exact.latchBacks, 0);
+  EXPECT_EQ(exact.densityRejects, 0);
+  EXPECT_EQ(exact.count, runPullCount(helper, shallowOutside, 10));
+}
+
 TEST_F(DenseScoredAdmissionTest, segmentsDecideIndependently) {
   helper.clear();
   constexpr Shape segmentInside{

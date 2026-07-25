@@ -4461,17 +4461,20 @@ public:
     }
 
     void setTopKDepth(int32_t topK, bool allowPruning) override {
-      if (topK < kDenseScoredMinTopK
-          || denseScoredAdmission != DenseScoredAdmission::SCORE_FIRST) {
-        return;
-      }
       // Unpruned collection (an exact total count pins the threshold at its
       // lowest) leaves score-first with no skipping at all, which is the
       // deep-k limit of the density bar. Price it at the deepest calibrated
       // depth: the curve was measured to k=1000, so that is the honest
-      // ceiling even though nothing prunes here.
+      // ceiling even though nothing prunes here. The shallow-k entry gate
+      // exists for the same reason - shallow requests prune hardest - so it
+      // reads the effective depth too: without pruning, requested depth only
+      // sizes the heap, it does not change the work either path must do.
       int32_t effectiveTopK = allowPruning
           ? topK : kDenseAdmissionMaxDensityTopK;
+      if (effectiveTopK < kDenseScoredMinTopK
+          || denseScoredAdmission != DenseScoredAdmission::SCORE_FIRST) {
+        return;
+      }
       if (denseScoredCostRejected) {
         skipCount(SkipStats::conjDenseScoredCostRejects);
       }
