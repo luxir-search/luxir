@@ -1442,6 +1442,53 @@ TEST_F(FacetTest, multipleSegments) {
   }
 }
 
+// A match-all TopDocs answers from its domain instead of iterating a scorer,
+// so the hit count and the facet domain must come out the same at every limit
+// - including limit 0, where there is no top-K collection to fall back on -
+// and must exclude deleted docs, which live only in the domain.
+TEST_F(FacetTest, matchAllCountsFromDomain) {
+  CollectionHelper helper;
+  std::vector<std::string> colors = {"red", "blue", "green"};
+  for (int seg = 0; seg < 3; seg++) {
+    for (int i = 0; i < 4; i++) {
+      helper.index(flatdoc("id", std::to_string(seg * 100 + i),
+                           "color_s", colors[(size_t)(i % 3)]),
+                   UpdateMessage::NO_COMMIT);
+    }
+    helper.commit();
+  }
+  // 12 indexed as red 6 / blue 3 / green 3; deleting two reds and one blue
+  // leaves 9 live docs with a distinct count per color.
+  helper.deleteByIds({{"0", "1", "100"}}, UpdateMessage::COMMIT);
+
+  boost::unordered_flat_map<std::string, int64_t> expected = {
+    {"red", 4}, {"blue", 2}, {"green", 3}
+  };
+
+  for (int64_t limit : {0, 2, 100}) {
+    for (bool para : {false, true}) {
+      auto req = localReq(soluxNode->getSearchEngine());
+      req->collection("main");
+      req->topDocs().allQuery().getNumber(true).limit(limit);
+      req->facet("f", "color_s").limit(10);
+      req->execute(para);
+
+      const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
+      auto why = std::format("limit={} para={}", limit, para);
+      ASSERT_EQ(9, docs->found.value_or(-1)) << why;
+      ASSERT_EQ(std::min(limit, (int64_t)9), (int64_t)docs->row_count) << why;
+
+      const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+      const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+      ASSERT_EQ(3u, bucketIds.v.size()) << why;
+      for (size_t i = 0; i < bucketIds.v.size(); i++) {
+        EXPECT_EQ(expected[std::string(bucketIds.v[i])], facetResult->counts[i])
+          << why << " color=" << bucketIds.v[i];
+      }
+    }
+  }
+}
+
 TEST_F(FacetTest, flatOrdMapDeltaFrames) {
   CollectionHelper helper;
   for (int seg = 0; seg < 2; seg++) {

@@ -33,6 +33,21 @@ public:
     }
   }
 
+  /// Number of docs the active arm keeps; 0 for a count-only collection.
+  int64_t topCount() const {
+    return useFieldSort ? fieldCollector->topCount : scoreCollector->topCount;
+  }
+
+  /// Add matches the active arm did not see individually, for callers that
+  /// derive part of the count instead of collecting it doc by doc.
+  void addHits(int64_t hits) {
+    if (useFieldSort) {
+      fieldCollector->hitCount += hits;
+    } else {
+      scoreCollector->hitCount += hits;
+    }
+  }
+
   static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
     // merge the smaller collector into the larger collector, or if both the same size, merge
     // the less competitive collector into the more competitive collector.

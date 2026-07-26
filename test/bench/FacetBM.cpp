@@ -19,7 +19,7 @@ using namespace solux::test;
 //
 // TODO: optionally go through grpc for searching to see how much overhead that adds.
 //
-static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view shape, std::string_view qfield, std::string_view ffield, bool para) {
+static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view shape, std::string_view qfield, std::string_view ffield, bool para, int64_t topLimit = 10) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
   if (solux::unit_tests) {
@@ -55,7 +55,7 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     } else {
       topDocs.matchQuery(qfield, "0");
     }
-    topDocs.getNumber(true).getScores(false);
+    topDocs.limit(topLimit).getNumber(true).getScores(false);
 
     // add the field we want to facet
     auto& facet = topDocs.facet("f", ffield);
@@ -217,6 +217,14 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s",
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_sparse_s,    nDocs, shape, "short_u10_s", "sparse_u1k_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_sparse_s,   nDocs, shape, "short_u1m_s", "sparse_u1k_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, sparse_s,         nDocs, shape, "all", "sparse_u1k_s", false);
+
+// limit=0: facet-only requests that return no documents, the shape a facet
+// benchmark actually issues.  Worth its own cells because limit>0 and limit=0
+// take different collection paths: with no top-K to fill, everything the
+// request costs is domain and facet work.
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, lim0_u10_i,       nDocs, shape, "all", "u10_i", false, 0);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, lim0_u1m_s,       nDocs, shape, "all", "short_u1m_s", false, 0);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s", "u10_i", false, 0);
 
 SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);

@@ -5,7 +5,6 @@
 #include <limits>
 #include <functional>
 #include "SearchOp.h"
-#include "solux/query/AllQuery.h"
 #include "solux/query/Query.h"
 #include "solux/query/QueryPrep.h"
 #include "solux/reader/IntColReader.h"
@@ -253,33 +252,54 @@ public:
         return;
       }
 
-      // If we have subcalcs and if we determine that we are matching everything, then we can skip collecting
-      // a new domain and just use the existing one.
-      // TODO: put a type field on the query and replace this dynamic cast.
-      bool matchEverything = (dynamic_cast<AllQuery*>(op.query) != nullptr) && thisOp().filters.empty();
+      // A constant-scoring match-all is the identity on its domain: every doc
+      // in the domain matches, all with the same score.  So the domain IS the
+      // result set - its cardinality is the exact hit count, doc order is the
+      // ranking, and sub-ops inherit it unchanged.  None of that needs a
+      // scorer, so the whole collection ladder below is skipped.  (Scores must
+      // be constant for doc order to be the ranking; a rescore over a
+      // match-all matches everything but reorders it.)
+      bool matchEverything = op.weight->matchesAllDocs()
+        && op.weight->isConstantScoring() && op.filterWeights.empty();
       std::unique_ptr<MergeableCollector> data;
       int64_t numSegs = (int64_t)op.req.reader->segments().size();
 
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto& seg = op.qcontext.topReader.segments()[segnum];
-        auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         // Keep ownership until release so a scoring error cannot orphan it.
         data.reset(collectorMerger.obtain());
 
         std::optional<DocSetBuilder> builder;
-        if (output.size() > 0) {
-          // check if the query is a match-all-docs query with a dynamic cast
-          matchEverything = (dynamic_cast<AllQuery*>(op.query) != nullptr) && thisOp().filters.empty();
-          if (!matchEverything) {
-            builder.emplace(seg.maxDoc());
-          }
+        if (output.size() > 0 && !matchEverything) {
+          builder.emplace(seg.maxDoc());
         }
 
-
-        if (supplier != nullptr) {
+        // Field-sorted ranking is the one thing a match-all still has to
+        // iterate for: it orders by column values the domain says nothing
+        // about.  A count-only field sort (limit 0) reads nothing back, so it
+        // takes the domain answer like the score-ranked case.
+        bool rankFromDocOrder = !data->useFieldSort;
+        if (matchEverything && (rankFromDocOrder || data->topCount() == 0)) {
+          int64_t total = domain == nullptr ? seg.maxDoc() : domain->card();
+          int64_t ranked = 0;
+          if (rankFromDocOrder && data->topCount() > 0) {
+            // Equal scores reduce ranking to doc order, so the domain's first
+            // K docs are its top K.
+            auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
+            auto* scorer = supplier == nullptr ? nullptr
+              : supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
+            if (scorer != nullptr) {
+              ranked = collectFirstKConstant(segnum, scorer, domain,
+                                             *data->scoreCollector, data->topCount());
+            }
+          }
+          assert(total >= ranked);
+          data->addHits(total - ranked);
+        } else if (auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
+                   supplier != nullptr) {
           DocSet* filter = domain;
           std::unique_ptr<DocSet> newDomain;
           // Keeps owned sets or request-pinned cache borrows alive; `filter`
@@ -436,20 +456,8 @@ public:
             } else {
               auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {
-                int64_t before = data->scoreCollector->totalHits();
                 collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->scoreCollector,
                             allowPruning, &scoreAccumulator);
-                // Match-all sub-ops reuse the incoming domain, so there is no
-                // builder or exhaustive bulk pass. Its cardinality supplies
-                // the exact count while the constant scorer ranks only K docs.
-                if (matchEverything && allowPruning && op.topDocsProto.get_number) {
-                  int64_t count = collectorFilter == nullptr
-                      ? seg.maxDoc()
-                      : collectorFilter->card();
-                  int64_t after = data->scoreCollector->totalHits();
-                  assert(count >= after - before);
-                  data->scoreCollector->hitCount += count - (after - before);
-                }
               }
             }
           }

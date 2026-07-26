@@ -124,6 +124,29 @@ TEST_F(RescoreQueryTest, grammarExecutionPreservesMembershipAndAllowsNegativeSco
   EXPECT_EQ(resultScores(*baseline), resultScores(*nested));
 }
 
+// A rescore matches whatever its child matched, so over *:* it inherits
+// "matches all docs" - but it reorders what it matched, so TopDocs must not
+// take the match-all shortcut of ranking the domain's first K in doc order.
+TEST_F(RescoreQueryTest, rescoredMatchAllStillRanks) {
+  CollectionHelper helper;
+  for (int i = 1; i <= 4; i++) {
+    helper.index(flatdoc("id_s", std::to_string(i), "popularity_i", i),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .exprQuery("rescore(*:*, popularity_i)")
+      .fields({"id_s"}).getScores().getNumber().limit(2);
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  // Doc order would give 1,2; the rescore ranks by popularity.
+  EXPECT_EQ((std::vector<std::string>{"4", "3"}), resultIds(*req));
+  EXPECT_EQ((std::vector<float>{4.0f, 3.0f}), resultScores(*req));
+  EXPECT_EQ(4, req->getMatchCount());
+}
+
 TEST_F(RescoreQueryTest, missingErrorsNameBothTotalizationChoices) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "present", "body_w", "alpha",

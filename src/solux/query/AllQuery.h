@@ -35,7 +35,7 @@ public:
   public:
     Weight(Context& context, AllQuery& query, int32_t flags, float score)
       : Query::Weight(context, flags), query(query), score(score) {
-      traits |= IS_CONSTANT_SCORING;
+      traits |= IS_CONSTANT_SCORING | MATCHES_ALL_DOCS;
     }
 
     AllQuery::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {

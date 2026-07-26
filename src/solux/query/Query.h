@@ -650,6 +650,7 @@ public:
     static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
+    static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
 
     /// Raw execution trait bitmask.
     int32_t getFlags() const noexcept { return traits; }
@@ -665,6 +666,15 @@ public:
     bool prefersPullForSparseArrayDomain() const noexcept {
       return (traits & PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN) != 0;
     }
+
+    /// True when every doc in the segment matches, so the domain is already
+    /// the match set: callers can take the hit count from the domain's
+    /// cardinality and hand the domain straight to sub-ops without iterating.
+    /// This is a match-set property only - it says nothing about scores, so a
+    /// caller that also wants to shortcut RANKING must check isConstantScoring
+    /// (a rescore over a match-all matches everything but reorders it).
+    /// Advisory: false is always safe.
+    bool matchesAllDocs() const noexcept { return (traits & MATCHES_ALL_DOCS) != 0; }
 
     /// True when the request permits scorer-level competitive pruning.
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
