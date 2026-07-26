@@ -16,8 +16,12 @@ inline constexpr double LAT_DECODE = 1.0 / LAT_SCALE;
 inline constexpr double LON_SCALE = (double)(1ULL << BITS) / 360.0;
 inline constexpr double LON_DECODE = 1.0 / LON_SCALE;
 inline constexpr double EARTH_MEAN_RADIUS_METERS = 6371008.7714;
+// 0.2 m of slack: optimized FP codegen (contraction/FMA) can evaluate
+// axisLat() up to ~0.11 m off the closed form, so 0.1 m is too tight a
+// promise. Consumers only use this to widen relations, so more slack is
+// strictly conservative.
 inline constexpr double AXISLAT_ERROR =
-    180.0 / std::numbers::pi * (0.1 / EARTH_MEAN_RADIUS_METERS);
+    180.0 / std::numbers::pi * (0.2 / EARTH_MEAN_RADIUS_METERS);
 
 struct BoundingBox {
   double minLat;
