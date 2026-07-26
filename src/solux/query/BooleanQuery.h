@@ -3355,6 +3355,7 @@ public:
     static constexpr int32_t kDenseThresholdInverse = 512;
     static inline bool disableDisjGroupBulkForTests = false;
     static inline bool disableDenseScoredForTests = false;
+    static inline bool disableScoredProbeForTests = false;
     static inline bool disableNegatedCountForTests = false;
 
   private:
@@ -3711,6 +3712,29 @@ public:
     }
 
     template <bool TermFast>
+    int32_t scorerAdvanceForClauseProbe(size_t index, int32_t target) {
+      if constexpr (TermFast) {
+        return disableScoredProbeForTests
+            ? termScorers[index]->docsEnum.advance(target)
+            : termScorers[index]->advanceScoredProbe(target);
+      } else {
+        return scorers[index]->advance(target);
+      }
+    }
+
+    template <bool TermFast>
+    int32_t scorerAdvanceLead(int32_t target) {
+      const int64_t before =
+          SkipStats::enabled ? SkipStats::tfreqBlocksDecoded : 0;
+      int32_t doc = scorerAdvance<TermFast>(0, target);
+      if (SkipStats::enabled) {
+        SkipStats::conjScoredLeadFreqDecodes +=
+            SkipStats::tfreqBlocksDecoded - before;
+      }
+      return doc;
+    }
+
+    template <bool TermFast>
     int32_t scorerCountAdvance(size_t index, int32_t target) {
       if constexpr (TermFast) {
         return termScorers[index]->docsEnum.advanceDocOnly(target);
@@ -3775,7 +3799,7 @@ public:
 
       int32_t leadDoc = scorerDocId<TermFast>(0);
       if (leadDoc < min) {
-        leadDoc = scorerAdvance<TermFast>(0, min);
+        leadDoc = scorerAdvanceLead<TermFast>(min);
       }
 
       for (;;) {
@@ -3812,7 +3836,7 @@ public:
             out.max = max;
             return upTo + 1;
           }
-          leadDoc = scorerAdvance<TermFast>(0, upTo + 1);
+          leadDoc = scorerAdvanceLead<TermFast>(upTo + 1);
           continue;
         }
 
@@ -3840,8 +3864,14 @@ public:
             assert(lastDecided >= 0);
             return lastDecided + 1;
           }
+          const int64_t leadFreqDecodesBefore =
+              SkipStats::enabled ? SkipStats::tfreqBlocksDecoded : 0;
           int32_t n = scorerFillScoreBlock<TermFast>(
               0, candDocs.data(), candScores.data(), kChunk, upTo + 1);
+          if (SkipStats::enabled) {
+            SkipStats::conjScoredLeadFreqDecodes +=
+                SkipStats::tfreqBlocksDecoded - leadFreqDecodesBefore;
+          }
           if (n == 0) {
             break;
           }
@@ -3861,6 +3891,29 @@ public:
           }
           for (size_t c = 1; c < scorers.size() && n > 0; c++) {
             const double remaining = suffixMax[c];  // clauses [c, end) add at most this
+            if constexpr (TermFast) {
+              if (!disableScoredProbeForTests) {
+                TermQuery::Scorer* termScorer = termScorers[c];
+                int32_t w = 0;
+                for (int32_t i = 0; i < n; i++) {
+                  int32_t doc = candDocs[(size_t) i];
+                  float sum = candScores[(size_t) i];
+                  if (((double) sum + remaining) * scoreBoundFactor
+                      < (double) this->minCompetitiveScore) {
+                    continue;
+                  }
+                  float clauseScore;
+                  if (!termScorer->matchScoredProbe(doc, clauseScore)) {
+                    continue;
+                  }
+                  candDocs[(size_t) w] = doc;
+                  candScores[(size_t) w] = sum + clauseScore;
+                  w++;
+                }
+                n = w;
+                continue;
+              }
+            }
             int32_t scorerDoc = scorerDocId<TermFast>(c);
             int32_t w = 0;
             for (int32_t i = 0; i < n; i++) {
@@ -3871,7 +3924,7 @@ public:
                 continue;  // cannot compete no matter what the rest contribute
               }
               if (scorerDoc < doc) {
-                scorerDoc = scorerAdvance<TermFast>(c, doc);
+                scorerDoc = scorerAdvanceForClauseProbe<TermFast>(c, doc);
               }
               if (scorerDoc != doc) {
                 continue;  // not in the conjunction
@@ -4716,6 +4769,10 @@ public:
 
     bool denseScoredCostRejectedForTests() const {
       return denseScoredCostRejected;
+    }
+
+    std::span<TermQuery::Scorer*> termScorersForTests() {
+      return termScorers;
     }
   }; // ConjunctionBulkScorer
 

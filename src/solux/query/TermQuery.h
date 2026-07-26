@@ -371,6 +371,29 @@ public:
       return docsEnum.advance(target);
     }
 
+    int32_t advanceScoredProbe(int32_t target) {
+      return docsEnum.advanceScoredProbe(target);
+    }
+
+    bool matchScoredProbe(int32_t target, float& score) SOLUX_INLINE {
+      if (simScorer == nullptr) {
+        int32_t doc = docsEnum.docId();
+        if (doc < target) {
+          doc = docsEnum.advanceScoredProbe(target);
+        }
+        score = 0.0f;
+        return doc == target;
+      }
+      int32_t tf;
+      if (!docsEnum.matchScoredProbe(target, tf)) {
+        return false;
+      }
+      int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
+                                                     : advanceNorm(target);
+      score = boost * simScorer->score((float) tf, encodedNorm);
+      return true;
+    }
+
     /// doc we are positioned on
     int32_t docId() override {
       return docsEnum.docId();
@@ -423,67 +446,6 @@ public:
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
-    static uint64_t lowBitsMask(int32_t bits) {
-      assert(bits >= 0 && bits <= 64);
-      if (bits == 0) {
-        return 0;
-      }
-      if (bits == 64) {
-        return ~0ULL;
-      }
-      return (1ULL << bits) - 1ULL;
-    }
-
-    static uint64_t probeWord(const DocsFreqEnum::ScoredWordProbe& probe, int32_t wordIndex) {
-      assert(probe.numWords > 0);
-      assert(wordIndex >= 0 && wordIndex < probe.numWords);
-      uint64_t word;
-      memcpy(&word, probe.words + (int64_t) wordIndex * 8, 8);
-      return word;
-    }
-
-    static void advanceRankCursorToWord(const DocsFreqEnum::ScoredWordProbe& probe,
-                                        DocsFreqEnum::ScoredWordProbe::RankCursor& cursor,
-                                        int32_t wordIndex) {
-      assert(cursor.wordIndex <= wordIndex);
-      while (cursor.wordIndex < wordIndex) {
-        cursor.ordBeforeWord += (int32_t) std::popcount(probeWord(probe, cursor.wordIndex));
-        cursor.wordIndex++;
-      }
-    }
-
-    static void findProbeLandingGEQ(const DocsFreqEnum::ScoredWordProbe& probe, int32_t target,
-                                    DocsFreqEnum::ScoredWordProbe::RankCursor cursor,
-                                    int32_t& landing, int32_t& ordAfter) {
-      assert(probe.numWords > 0);
-      assert(target >= (int32_t) probe.docBase);
-      assert(target <= probe.blockLast);
-      const int32_t bitIndex = target - (int32_t) probe.docBase;
-      const int32_t wordIndex = bitIndex >> 6;
-      const int32_t bit = bitIndex & 63;
-      advanceRankCursorToWord(probe, cursor, wordIndex);
-
-      for (int32_t w = wordIndex; w < probe.numWords; w++) {
-        uint64_t word = probeWord(probe, w);
-        uint64_t hits = word;
-        if (w == wordIndex) {
-          hits &= ~lowBitsMask(bit);
-        }
-        if (hits != 0) {
-          const int32_t hitBit = (int32_t) std::countr_zero(hits);
-          landing = (int32_t) probe.docBase + (w << 6) + hitBit;
-          ordAfter = cursor.ordBeforeWord
-                     + (int32_t) std::popcount(word & lowBitsMask(hitBit)) + 1;
-          return;
-        }
-        cursor.ordBeforeWord += (int32_t) std::popcount(word);
-        cursor.wordIndex++;
-      }
-      assert(false);
-      landing = probe.blockLast;
-      ordAfter = probe.blockStartOrd + Postings::DOCS_BLOCK_SIZE;
-    }
-
     static void markCandidate(std::span<uint64_t> matchedWords, int32_t index) {
       if (!matchedWords.empty()) {
         matchedWords[(size_t) (index >> 6)] |= 1ULL << (index & 63);
@@ -505,108 +467,7 @@ public:
       while (i < size) {
         int32_t target = docs[i];
         if (current < target) {
-          DocsFreqEnum::ScoredWordProbe probe;
-          if (docsEnum.advanceOrBeginScoredWordProbe(target, probe)) {
-            assert(target >= (int32_t) probe.docBase);
-            assert(target <= probe.blockLast);
-            int32_t lastConsidered = target;
-            int32_t finishDoc = target;
-            int32_t finishOrdAfter = probe.blockStartOrd + 1;
-
-            if (probe.numWords == 0) {
-              const int32_t batchStart = i;
-              while (i < size && docs[i] <= probe.blockLast) {
-                target = docs[i];
-                assert(target >= (int32_t) probe.docBase);
-                const int32_t freqIndex = target - (int32_t) probe.docBase;
-                markCandidate(matchedWords, i);
-                if (simScorer != nullptr) {
-                  int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
-                                                                 : advanceNorm(target);
-                  scores[i] += boost * simScorer->score((float) probe.freqs[(size_t) freqIndex],
-                                                        encodedNorm);
-                }
-                if (required) {
-                  if (write != i) {
-                    docs[write] = docs[i];
-                    scores[write] = scores[i];
-                  }
-                  write++;
-                }
-                lastConsidered = target;
-                finishDoc = target;
-                finishOrdAfter = probe.blockStartOrd + freqIndex + 1;
-                i++;
-              }
-              matches += i - batchStart;
-            } else {
-              // Candidate docs are sorted, so the rank cursor only moves
-              // forward. That popcounts each completed 64-doc word at most
-              // once per block sweep instead of recomputing the ordinal from
-              // word zero for every hit.
-              DocsFreqEnum::ScoredWordProbe::RankCursor cursor = {
-                0, probe.blockStartOrd
-              };
-              while (i < size && docs[i] <= probe.blockLast) {
-                target = docs[i];
-                assert(target >= (int32_t) probe.docBase);
-                const int32_t bitIndex = target - (int32_t) probe.docBase;
-                const int32_t wordIndex = bitIndex >> 6;
-                const int32_t bit = bitIndex & 63;
-                advanceRankCursorToWord(probe, cursor, wordIndex);
-                const uint64_t word = probeWord(probe, wordIndex);
-                const bool matched = (word & (1ULL << bit)) != 0;
-                matches += (int32_t) matched;
-                if (matched) {
-                  markCandidate(matchedWords, i);
-                  const int32_t ordAfter = cursor.ordBeforeWord
-                      + (int32_t) std::popcount(word & lowBitsMask(bit)) + 1;
-                  const int32_t freqIndex = ordAfter - probe.blockStartOrd - 1;
-                  assert(freqIndex >= 0 && freqIndex < Postings::DOCS_BLOCK_SIZE);
-                  if (simScorer != nullptr) {
-                    int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
-                                                                   : advanceNorm(target);
-                    scores[i] += boost * simScorer->score(
-                        (float) probe.freqs[(size_t) freqIndex], encodedNorm);
-                  }
-                }
-                if (required && matched) {
-                  if (write != i) {
-                    docs[write] = docs[i];
-                    scores[write] = scores[i];
-                  }
-                  write++;
-                }
-                lastConsidered = target;
-                i++;
-              }
-
-              if (lastConsidered < probe.blockLast && i == size) {
-                findProbeLandingGEQ(probe, lastConsidered, cursor, finishDoc, finishOrdAfter);
-              }
-            }
-
-            // A begun probe has consumed the stream past this block, and no
-            // normal postings-enum method is legal until it is finished. Always
-            // close it before returning to the max-score window planner, which
-            // reads docId() for the next window and may promote this same term
-            // to the essential fillScoreBlock side. If the candidate buffer
-            // ends inside the block, materialize at the normal advance landing
-            // instead of pretending the whole block was consumed.
-            if (lastConsidered >= probe.blockLast || i < size) {
-              docsEnum.finishScoredWordProbeAtBlockEnd();
-            } else {
-              if (probe.numWords == 0) {
-                finishDoc = lastConsidered;
-                finishOrdAfter = probe.blockStartOrd
-                                 + lastConsidered - (int32_t) probe.docBase + 1;
-              }
-              docsEnum.finishScoredWordProbeAt(finishDoc, finishOrdAfter);
-            }
-            current = docsEnum.docId();
-            continue;
-          }
-          current = docsEnum.docId();
+          current = docsEnum.advanceScoredProbe(target);
         }
         bool matched = current == target;
         matches += (int32_t) matched;

@@ -103,7 +103,7 @@ public:
     assert(!docsEnum.blockMode);
     assert(!docsEnum.docsOnlyConsumed);
     assert(!docsEnum.docBlockResident);
-    assert(!docsEnum.scoredWordProbeActive);
+    assert(!docsEnum.scoredProbeActive);
     assert(!docsEnum.positionBatchActive);
     docsEnum.enablePositionTracking();
 
@@ -120,7 +120,7 @@ public:
   void startPositions() {
     assert(!docsEnum.docBlockResident);
     assert(!docsEnum.docsOnlyConsumed);
-    assert(!docsEnum.scoredWordProbeActive);
+    assert(!docsEnum.scoredProbeActive);
     assert(!docsEnum.positionBatchActive);
     assert(!positionBatchActive);
     assert(docsEnum.positionTrackingEnabled);
@@ -176,7 +176,7 @@ public:
 
   int32_t nextPosition() {
     assert(!docsEnum.docBlockResident);
-    assert(!docsEnum.scoredWordProbeActive);
+    assert(!docsEnum.scoredProbeActive);
     assert(!docsEnum.positionBatchActive);
     assert(!positionBatchActive);
     if (!ensurePositionDeltaAvailable()) {
@@ -191,7 +191,7 @@ public:
 
   std::span<const int32_t> nextPositionDeltaSpan() {
     assert(!docsEnum.docBlockResident);
-    assert(!docsEnum.scoredWordProbeActive);
+    assert(!docsEnum.scoredProbeActive);
     assert(!docsEnum.positionBatchActive);
     assert(!positionBatchActive);
     if (!ensurePositionDeltaAvailable()) {
@@ -205,7 +205,7 @@ public:
 
   int32_t advancePosition(int32_t target) {
     assert(!docsEnum.docBlockResident);
-    assert(!docsEnum.scoredWordProbeActive);
+    assert(!docsEnum.scoredProbeActive);
     while (pos < target) {
       nextPosition();
     }

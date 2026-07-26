@@ -24,6 +24,9 @@ struct SkipStats {
   // the real decode work; blocks_decoded(pruned) / blocks_decoded(exhaustive) is
   // the "% of blocks decoded vs total" headline.
   static inline int64_t docBlocksDecoded = 0;
+  // Full 128-value tfreq block decodes. StreamVByte tails are excluded because
+  // their docs/freq streams have no independently skippable block boundary.
+  static inline int64_t tfreqBlocksDecoded = 0;
   // Per-block L0 headers walked in skipToBlock (within an L1 group). Bounded by
   // ~L1_PERIOD per advance; the within-group skip cost.
   static inline int64_t l0HeaderSteps = 0;
@@ -144,6 +147,17 @@ struct SkipStats {
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
   static inline int64_t docsOnlyWordProbeAdvances = 0;
   static inline int64_t scoredWordProbeAdvances = 0;
+  // Scored resident-probe accounting. Advances count full blocks entered in
+  // packed, contiguous, or word form. A survivor block is counted once, on its
+  // first exact candidate hit; its freq block may then be decoded once lazily.
+  static inline int64_t scoredProbeAdvances = 0;
+  static inline int64_t scoredProbeSurvivorBlocks = 0;
+  static inline int64_t scoredProbeFreqDecodes = 0;
+  static inline int64_t scoredProbeWordExpansions = 0;
+  // Full tfreq blocks decoded while producing the lead candidate batches in a
+  // score-first conjunction. This lets the ownership-boundary invariant
+  // distinguish unavoidable lead work from non-lead probe work.
+  static inline int64_t conjScoredLeadFreqDecodes = 0;
   // MaxScore non-essential sweep economics. Counter writes are aggregate-only:
   // candidate-sized batches are added at call boundaries, never from the
   // per-candidate loops. The generic applyToCandidates totals let the
@@ -173,6 +187,7 @@ struct SkipStats {
 
   static void reset() {
     docBlocksDecoded = 0;
+    tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;
     l1GroupSteps = 0;
     advanceCalls = 0;
@@ -272,6 +287,11 @@ struct SkipStats {
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;
+    scoredProbeAdvances = 0;
+    scoredProbeSurvivorBlocks = 0;
+    scoredProbeFreqDecodes = 0;
+    scoredProbeWordExpansions = 0;
+    conjScoredLeadFreqDecodes = 0;
     applyToCandidatesCalls = 0;
     applyToCandidatesCandidates = 0;
     applyToCandidatesAdvances = 0;

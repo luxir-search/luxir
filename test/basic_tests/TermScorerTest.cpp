@@ -182,6 +182,19 @@ struct DenseScoredGuard {
   }
 };
 
+struct ScoredProbeGuard {
+  bool saved;
+
+  explicit ScoredProbeGuard(bool disabled)
+    : saved(BooleanQuery::ConjunctionBulkScorer::disableScoredProbeForTests) {
+    BooleanQuery::ConjunctionBulkScorer::disableScoredProbeForTests = disabled;
+  }
+
+  ~ScoredProbeGuard() {
+    BooleanQuery::ConjunctionBulkScorer::disableScoredProbeForTests = saved;
+  }
+};
+
 struct FilterMaskProbeGuard {
   bool saved;
 
@@ -6053,6 +6066,152 @@ TEST_F(TermScorerTest, conjunctionDenseScoredRejectsAsymmetricClauseCosts) {
   EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
   assertTopKEquivalent(
       sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
+}
+
+TEST_F(TermScorerTest, conjunctionScoredProbeKeepsBlockWorkSurvivorBounded) {
+  DenseScoredGuard denseScoredGuard(false);
+  ScoredProbeGuard scoredProbeGuard(false);
+
+  const int32_t N = 40000;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "probe_producer";
+    if ((doc % 3) == 0) {
+      appendRepeatedTerm(body, "probe_word", 1 + (doc % 5));
+    }
+    if ((doc % 257) == 0) {
+      appendRepeatedTerm(body, "probe_lead", 1 + (doc % 7));
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 3> terms = {
+      "probe_lead", "probe_word", "probe_producer"
+  };
+  auto queries = makeTermQueries(terms);
+  auto mandatory = queryPointers(queries);
+  std::span<Query*> empty;
+  BooleanQuery query(
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      empty, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(
+      supplier->bulkScorer(testIndex.pool));
+  ASSERT_NE(bulk, nullptr);
+
+  SkipStatsGuard stats;
+  TopDocsCollector collector(100);
+  collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
+                      segment.maxDoc(), /*allowPruning=*/false);
+
+  EXPECT_TRUE(bulk->denseScoredCostRejectedForTests());
+  EXPECT_GT(SkipStats::scoredProbeAdvances, 0);
+  EXPECT_GT(SkipStats::scoredWordProbeAdvances, 0);
+  EXPECT_GT(SkipStats::scoredProbeSurvivorBlocks, 0);
+  EXPECT_LT(SkipStats::scoredProbeFreqDecodes,
+            SkipStats::scoredProbeAdvances);
+  EXPECT_EQ(SkipStats::scoredProbeFreqDecodes,
+            SkipStats::scoredProbeSurvivorBlocks);
+  EXPECT_EQ(SkipStats::scoredProbeWordExpansions, 0);
+  EXPECT_EQ(SkipStats::tfreqBlocksDecoded,
+            SkipStats::conjScoredLeadFreqDecodes
+                + SkipStats::scoredProbeFreqDecodes);
+  EXPECT_LE(SkipStats::tfreqBlocksDecoded,
+            SkipStats::conjScoredLeadFreqDecodes
+                + SkipStats::scoredProbeSurvivorBlocks);
+}
+
+TEST_F(TermScorerTest, conjunctionScoredProbeResumeOwnsPrepositionedTermFreq) {
+  DenseScoredGuard denseScoredGuard(true);
+  ScoredProbeGuard scoredProbeGuard(false);
+
+  constexpr int32_t N = 8192;
+  constexpr int32_t failedDoc = DocsEnumMeta::L1_DOCS;
+  constexpr int32_t resumeDoc = failedDoc + 1;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    if (doc <= resumeDoc) {
+      body = "resume_lead";
+    }
+    if (doc != failedDoc) {
+      appendRepeatedTerm(body, "resume_probe", doc == resumeDoc ? 17 : 1);
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 2> terms = {
+      "resume_lead", "resume_probe"
+  };
+
+  auto pullQueries = makeTermQueries(terms);
+  auto pullMandatory = queryPointers(pullQueries);
+  BooleanQuery pullQuery(pullMandatory, {}, {}, {});
+  auto* pullWeight = pullQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* pull = pullWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(pull, nullptr);
+  ASSERT_EQ(pull->advance(resumeDoc), resumeDoc);
+  const uint32_t expectedScore = std::bit_cast<uint32_t>(pull->score());
+
+  auto bulkQueries = makeTermQueries(terms);
+  auto bulkMandatory = queryPointers(bulkQueries);
+  BooleanQuery bulkQuery(bulkMandatory, {}, {}, {});
+  auto* bulkWeight = bulkQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = bulkWeight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(
+      supplier->bulkScorer(testIndex.pool));
+  ASSERT_NE(bulk, nullptr);
+  auto termScorers = bulk->termScorersForTests();
+  ASSERT_EQ(termScorers.size(), 2);
+
+  SkipStatsGuard stats;
+  ScoreWindow first;
+  int32_t next = bulk->scoreNextWindow(
+      first, nullptr, 0, failedDoc, std::numeric_limits<float>::lowest());
+  ASSERT_EQ(next, failedDoc);
+  ASSERT_EQ(first.size, failedDoc);
+
+  const int64_t decodesBeforeFailure = SkipStats::scoredProbeFreqDecodes;
+  const int64_t survivorsBeforeFailure =
+      SkipStats::scoredProbeSurvivorBlocks;
+  ScoreWindow failed;
+  next = bulk->scoreNextWindow(
+      failed, nullptr, failedDoc, resumeDoc,
+      std::numeric_limits<float>::lowest());
+  ASSERT_EQ(next, resumeDoc);
+  ASSERT_EQ(failed.size, 0);
+  EXPECT_EQ(SkipStats::scoredProbeFreqDecodes, decodesBeforeFailure);
+  EXPECT_EQ(SkipStats::scoredProbeSurvivorBlocks, survivorsBeforeFailure);
+  ASSERT_EQ(termScorers[1]->docId(), resumeDoc);
+
+  ScoreWindow resumed;
+  next = bulk->scoreNextWindow(
+      resumed, nullptr, resumeDoc, resumeDoc + 1,
+      std::numeric_limits<float>::lowest());
+  ASSERT_EQ(next, resumeDoc + 1);
+  ASSERT_EQ(resumed.size, 1);
+  EXPECT_EQ(resumed.docs[0], resumeDoc);
+  EXPECT_EQ(std::bit_cast<uint32_t>(resumed.scores[0]), expectedScore);
+  EXPECT_EQ(SkipStats::scoredProbeFreqDecodes, decodesBeforeFailure + 1);
+  EXPECT_EQ(SkipStats::scoredProbeSurvivorBlocks,
+            survivorsBeforeFailure + 1);
 }
 
 TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
