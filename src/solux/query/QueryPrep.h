@@ -189,6 +189,16 @@ class DocSetScorer final : public Query::Scorer {
   int32_t arrIdx = -1;
   int32_t windowArrIdx = 0;
 
+  int32_t seekBitSet(int32_t target) {
+    if (target >= maxDoc) {
+      return doc = PostingsReader::END;
+    }
+    const auto& bits = ((BitDocSet*) docs)->bits();
+    int32_t found = bits.nextSetBit(target);
+    return doc = found == FixedBitSet::MAX_INDEX
+        ? PostingsReader::END : found;
+  }
+
 public:
   DocSetScorer(DocSet* docs, int32_t maxDoc) : docs(docs), maxDoc(maxDoc) {
     if (docs->type == DocSet::ARRAY) {
@@ -202,38 +212,42 @@ public:
       doc = arrIdx < (int32_t)arrDocs.size() ? arrDocs[arrIdx] : PostingsReader::END;
       return doc;
     }
-    for (doc++; doc < maxDoc; doc++) {
-      if (docs->get(doc)) return doc;
-    }
-    doc = PostingsReader::END;
-    return doc;
+    assert(doc != PostingsReader::END);
+    return seekBitSet(doc + 1);
   }
 
   int32_t advance(int32_t docid) override {
     assert(doc < docid);  // strict Scorer contract; callers guard
     if (docs->type == DocSet::ARRAY) {
-      auto it = std::lower_bound(arrDocs.begin(), arrDocs.end(), docid);
-      if (it == arrDocs.end()) {
+      // Targets are monotonic for a Scorer. Consume the array cursor once
+      // rather than binary-searching the shrinking suffix for every rejected
+      // filter doc; a DocSet lead must remain O(cardinality) over its lifetime.
+      do {
+        arrIdx++;
+      } while (arrIdx < (int32_t) arrDocs.size()
+               && arrDocs[(size_t) arrIdx] < docid);
+      if (arrIdx >= (int32_t) arrDocs.size()) {
         arrIdx = (int32_t)arrDocs.size();
         doc = PostingsReader::END;
       } else {
-        arrIdx = (int32_t)(it - arrDocs.begin());
-        doc = *it;
+        doc = arrDocs[(size_t) arrIdx];
       }
       return doc;
     }
-    doc = std::max(doc + 1, docid);
-    while (doc < maxDoc) {
-      if (docs->get(doc)) return doc;
-      doc++;
-    }
-    doc = PostingsReader::END;
-    return doc;
+    return seekBitSet(docid);
   }
 
   int32_t docId() override { return doc; }
 
   float score() override { return 0.0f; }
+
+  // Exact zero bounds: any formation's bound math can trust this clause
+  // regardless of how it entered the plan.
+  float getMaxScore(int32_t upTo) override { return 0.0f; }
+
+  int32_t advanceShallow(int32_t target) override {
+    return PostingsReader::END;
+  }
 
   bool supportsWindowFilter() const override { return true; }
 
@@ -291,6 +305,7 @@ class DocSetBulkScorer final : public BulkScorer {
   DocSet* docs;
   int32_t maxDoc;
   std::span<int32_t> arrDocs;
+  int32_t sourceArrIdx = 0;
   std::span<int32_t> outDocs;
   std::span<float> outScores;
   std::span<uint64_t> windowBits;
@@ -305,12 +320,17 @@ class DocSetBulkScorer final : public BulkScorer {
     std::fill(windowBits.begin(), windowBits.end(), 0);
     skipCount(SkipStats::countBulkFillCalls);
     if (docs->type == DocSet::ARRAY) {
-      auto it = std::lower_bound(arrDocs.begin(), arrDocs.end(), min);
+      // Windows arrive in nondecreasing order (BulkScorer contract), so
+      // resume from the cursor instead of searching the whole array per
+      // window.
+      auto it = std::lower_bound(arrDocs.begin() + sourceArrIdx,
+                                 arrDocs.end(), min);
       while (it != arrDocs.end() && *it < end) {
         int32_t relative = *it - min;
         windowBits[(size_t) (relative >> 6)] |= 1ULL << (relative & 63);
         ++it;
       }
+      sourceArrIdx = (int32_t) (it - arrDocs.begin());
       return;
     }
 
@@ -623,10 +643,21 @@ inline std::unique_ptr<DocSet> materializeRawFilter(
   return materialize(weight, prepared, segment, nullptr);
 }
 
+enum class FilterSupplierMode : uint8_t {
+  // Scored TOP_k keeps the calibrated density route: sparse filters remain
+  // pull/WAND iterators and do not even touch the cache.
+  DENSITY_ROUTED,
+  // Exhaustive count/match/domain production values exact filter cost and
+  // docs-only iteration. Let an admitted cached DocSet become the required
+  // clause at every density; conjunction ordering then chooses the route.
+  EXHAUSTIVE_CLAUSE
+};
+
 inline Query::ScorerSupplier* filterSupplier(
     MemPool& targetPool, Query::Weight& weight,
     Query::Weight::PreparedWeight* prepared, FilterCache::Use* use,
-    IndexReader& reader, IndexReader::Segment& segment) {
+    IndexReader& reader, IndexReader::Segment& segment,
+    FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED) {
   Query::SegmentSource& source = prepared != nullptr
     ? static_cast<Query::SegmentSource&>(*prepared)
     : static_cast<Query::SegmentSource&>(weight);
@@ -635,16 +666,17 @@ inline Query::ScorerSupplier* filterSupplier(
     return source.scorerSupplier(targetPool, segment);
   }
 
-  // Density gates routing here just as it does for uncached filters: below
-  // the mask crossover the landed pull/wand formation owns the regime, and a
-  // cached set displacing it measures 7-16% slower on the 5M sweep. Gate on
-  // the supplier's own cost estimate BEFORE any cache traffic so the sparse
-  // scored path pays no probe and no build; the same estimate feeds
-  // filterDensityRoutesToPull. Sparse entries still populate through the
-  // facet/domain consumers, which serve them at any density.
+  // In density-routed mode, gate before any cache traffic: below the mask
+  // crossover the scored pull/WAND formation owns the regime, and a cached
+  // set displacing it measures 7-16% slower on the 5M sweep. Exhaustive mode
+  // deliberately bypasses that scored policy so exact cardinality participates
+  // in conjunction planning. Sparse entries also populate through facet/domain
+  // consumers, which serve them at any density.
   auto* uncached = source.scorerSupplier(targetPool, segment);
-  if (uncached == nullptr || uncached->cost()
-      < segment.maxDoc() / kMaskFilterDensityInverse) {
+  if (uncached == nullptr
+      || (mode == FilterSupplierMode::DENSITY_ROUTED
+          && uncached->cost()
+              < segment.maxDoc() / kMaskFilterDensityInverse)) {
     return uncached;
   }
 

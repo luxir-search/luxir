@@ -12,6 +12,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/query/BooleanQuery.h"
 #include "solux/reader/Postings.h"
 #include "solux/reader/SkipStats.h"
 #include "solux/search/ops/TopDocsReq.h"
@@ -31,6 +32,19 @@ public:
   }
   ~TopDocsFilterFoldGuard() {
     TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+  }
+};
+
+class FilterClauseCountGuard {
+  bool saved;
+
+public:
+  explicit FilterClauseCountGuard(bool disabled)
+    : saved(BooleanQuery::disableFilterClauseCountForTests) {
+    BooleanQuery::disableFilterClauseCountForTests = disabled;
+  }
+  ~FilterClauseCountGuard() {
+    BooleanQuery::disableFilterClauseCountForTests = saved;
   }
 };
 
@@ -153,6 +167,9 @@ struct FilteredCountResult {
   int64_t denseWindows;
   int64_t disjGroupWindows;
   int64_t sparseFallbacks;
+  int64_t bulkFillCalls;
+  int64_t docsOnlyWordProbeAdvances;
+  int64_t tfreqBlocksDecoded;
 };
 
 enum class FilteredCountPath {
@@ -189,6 +206,31 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::conjDenseCountWindows,
     SkipStats::conjDisjGroupCountWindows,
     SkipStats::conjCountFallbacks,
+    SkipStats::countBulkFillCalls,
+    SkipStats::docsOnlyWordProbeAdvances,
+    SkipStats::tfreqBlocksDecoded,
+  };
+}
+
+FilteredCountResult runUnfilteredCount(SearchEngine& engine,
+                                       FilteredCountShape shape,
+                                       std::string_view collection) {
+  auto req = localReq(engine);
+  req->collection(collection);
+  auto& cur = req->topDocs("q").getNumber().limit(0);
+  cur.rawQuery() = filteredCountBody(cur.mr(), shape);
+
+  SkipStatsGuard statsGuard;
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return {
+    req->getMatchCount("q"),
+    SkipStats::conjDenseCountWindows,
+    SkipStats::conjDisjGroupCountWindows,
+    SkipStats::conjCountFallbacks,
+    SkipStats::countBulkFillCalls,
+    SkipStats::docsOnlyWordProbeAdvances,
+    SkipStats::tfreqBlocksDecoded,
   };
 }
 
@@ -1219,6 +1261,151 @@ TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {
   EXPECT_EQ(first.count, hit.count);
   EXPECT_GT(hit.denseWindows, 0);
   EXPECT_GT(cache->counters().hits, beforeHit.hits);
+}
+
+TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
+  constexpr std::string_view collection = "cached_sparse_count_clause";
+  constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  int32_t filterCard = 0;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    bool selected = (doc % 100) == 0;
+    filterCard += (int32_t) selected;
+    docs.push_back(flatdoc(
+        "id", "clause_" + std::to_string(doc),
+        "body_w", "alpha beta",
+        "filter_w", selected ? "selected" : "other"));
+  }
+  ASSERT_GT(filterCard, nDocs / BooleanQuery::ConjunctionBulkScorer::
+      kDocSetTermDenseThresholdInverse);
+  ASSERT_LE(filterCard, DocSetBuilder::arrayLimitFor(nDocs));
+  auto indexed = helper.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(indexed.success) << indexed.error_message;
+  auto cache = helper.getIndexWriter()->getFilterCache();
+
+  // Default admission is two sightings: warm through publication, then
+  // measure a true hit whose DocSet is a costed conjunction clause.
+  {
+    FilterClauseCountGuard enabled(false);
+    runFilteredCount(soluxNode->getSearchEngine(),
+                     FilteredCountShape::INTERSECTION, "selected",
+                     FilteredCountPath::FOLDED, collection);
+    runFilteredCount(soluxNode->getSearchEngine(),
+                     FilteredCountShape::INTERSECTION, "selected",
+                     FilteredCountPath::FOLDED, collection);
+  }
+  auto beforeHit = cache->counters();
+  FilteredCountResult routed;
+  {
+    FilterClauseCountGuard enabled(false);
+    routed = runFilteredCount(soluxNode->getSearchEngine(),
+                              FilteredCountShape::INTERSECTION, "selected",
+                              FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(filterCard, routed.count);
+  EXPECT_GT(routed.denseWindows, 0);
+  EXPECT_LE(routed.denseWindows, filterCard);
+  // Every ratcheted window contains a lead-filter doc. The DocSet fill itself
+  // does no postings fill, and the first term fill drops below the crossover,
+  // so full clause fills are bounded by those nonempty filter windows.
+  EXPECT_LE(routed.bulkFillCalls, routed.denseWindows);
+  EXPECT_GT(cache->counters().hits, beforeHit.hits);
+
+  FilteredCountResult legacy;
+  {
+    FilterClauseCountGuard disabled(true);
+    legacy = runFilteredCount(soluxNode->getSearchEngine(),
+                              FilteredCountShape::INTERSECTION, "selected",
+                              FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(routed.count, legacy.count);
+  EXPECT_LE(routed.denseWindows, legacy.denseWindows);
+  // Negative control: the disabled route leaves the cached DocSet as a
+  // call-time domain, so the query clauses perform extra full window fills
+  // before the filter can reject anything.
+  EXPECT_GT(legacy.bulkFillCalls, legacy.denseWindows);
+}
+
+TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
+  constexpr std::string_view collection = "cached_docset_sparse_lead";
+  constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  int32_t filterCard = 0;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    bool selected = (doc % 2048) == 0;
+    filterCard += (int32_t) selected;
+    docs.push_back(flatdoc(
+        "id", "sparse_lead_" + std::to_string(doc),
+        "body_w", "alpha beta",
+        "filter_w", selected ? "selected" : "other"));
+  }
+  ASSERT_LT(filterCard, nDocs / BooleanQuery::ConjunctionBulkScorer::
+      kDocSetTermDenseThresholdInverse);
+  auto indexed = helper.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(indexed.success) << indexed.error_message;
+
+  {
+    FilterClauseCountGuard enabled(false);
+    runFilteredCount(soluxNode->getSearchEngine(),
+                     FilteredCountShape::INTERSECTION, "selected",
+                     FilteredCountPath::FOLDED, collection);
+    runFilteredCount(soluxNode->getSearchEngine(),
+                     FilteredCountShape::INTERSECTION, "selected",
+                     FilteredCountPath::FOLDED, collection);
+  }
+  FilteredCountResult routed;
+  {
+    FilterClauseCountGuard enabled(false);
+    routed = runFilteredCount(soluxNode->getSearchEngine(),
+                              FilteredCountShape::INTERSECTION, "selected",
+                              FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(filterCard, routed.count);
+  EXPECT_EQ(0, routed.denseWindows);
+  EXPECT_GT(routed.sparseFallbacks, 0);
+  EXPECT_GT(routed.docsOnlyWordProbeAdvances, 0);
+  EXPECT_EQ(0, routed.tfreqBlocksDecoded);
+
+  FilteredCountResult legacy;
+  {
+    FilterClauseCountGuard disabled(true);
+    legacy = runFilteredCount(soluxNode->getSearchEngine(),
+                              FilteredCountShape::INTERSECTION, "selected",
+                              FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(routed.count, legacy.count);
+  EXPECT_EQ(0, legacy.sparseFallbacks);
+}
+
+TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {
+  constexpr std::string_view collection = "unfiltered_count_clause_guard";
+  CollectionHelper helper(collection);
+  indexFilteredCountDocs(helper, false);
+
+  FilteredCountResult enabled;
+  {
+    FilterClauseCountGuard guard(false);
+    enabled = runUnfilteredCount(soluxNode->getSearchEngine(),
+                                 FilteredCountShape::INTERSECTION, collection);
+  }
+  FilteredCountResult disabled;
+  {
+    FilterClauseCountGuard guard(true);
+    disabled = runUnfilteredCount(soluxNode->getSearchEngine(),
+                                  FilteredCountShape::INTERSECTION, collection);
+  }
+  EXPECT_EQ(enabled.count, disabled.count);
+  EXPECT_EQ(enabled.denseWindows, disabled.denseWindows);
+  EXPECT_EQ(enabled.disjGroupWindows, disabled.disjGroupWindows);
+  EXPECT_EQ(enabled.sparseFallbacks, disabled.sparseFallbacks);
+  EXPECT_EQ(enabled.bulkFillCalls, disabled.bulkFillCalls);
+  EXPECT_EQ(enabled.docsOnlyWordProbeAdvances,
+            disabled.docsOnlyWordProbeAdvances);
+  EXPECT_EQ(enabled.tfreqBlocksDecoded, disabled.tfreqBlocksDecoded);
 }
 
 TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) {

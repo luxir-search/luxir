@@ -636,7 +636,12 @@ public:
     // query tree owns both matching and preparation. Keep the named filter
     // metadata on TopDocsReq; the toggle preserves the former passive domain
     // path as the benchmark baseline.
-    bool foldFilters = !filters.empty() && !TopDocsReq::disableTopDocsFilterFoldForTests;
+    bool countClauseDisabled =
+        BooleanQuery::disableFilterClauseCountForTests
+        && limit == 0 && topDocsReq.get_number && !topDocsReq.get_scores;
+    bool foldFilters = !filters.empty()
+        && !TopDocsReq::disableTopDocsFilterFoldForTests
+        && !countClauseDisabled;
     if (foldFilters) {
       auto mandatory = req.requestPool.make_span<Query*>(1);
       mandatory[0] = query;

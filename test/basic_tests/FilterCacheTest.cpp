@@ -1182,6 +1182,25 @@ TEST(DocSetScorerTest, windowFilterSupportsBitsetAndArray) {
   check(array);
 }
 
+TEST(DocSetScorerTest, bitsetAndArrayAdvanceVisitOnlyMembers) {
+  constexpr int32_t maxDoc = 1 << 20;
+  RAMBitDocSet bitset(maxDoc);
+  bitset.mutableBits().set(3);
+  bitset.mutableBits().set(65537);
+  bitset.mutableBits().set(maxDoc - 1);
+  ArrDocSet array({3, 65537, maxDoc - 1});
+
+  auto check = [](DocSet& docs) {
+    QueryPrep::DocSetScorer scorer(&docs, maxDoc);
+    EXPECT_EQ(3, scorer.next());
+    EXPECT_EQ(65537, scorer.advance(4096));
+    EXPECT_EQ(maxDoc - 1, scorer.next());
+    EXPECT_EQ(PostingsReader::END, scorer.next());
+  };
+  check(bitset);
+  check(array);
+}
+
 TEST(DocSetScorerTest, bulkScorerCountsAndEmitsBitsetAndArray) {
   RAMBitDocSet bitset(192);
   bitset.mutableBits().set(3);

@@ -405,6 +405,9 @@ public:
   static inline bool disableFilteredUnionWandForTests = false;
   // A/B toggle: keep prohibited scored disjunctions on the pull MandNot path.
   static inline bool disableBulkExclusionForTests = false;
+  // A/B toggle: retain the scored density policy for unscored filter suppliers
+  // instead of letting cached DocSets become exhaustive conjunction clauses.
+  static inline bool disableFilterClauseCountForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
   // until the approximations agree). For benchmarking the two-phase win only.
@@ -1020,11 +1023,21 @@ public:
       // conjunct. The scored path keeps its existing pure-mandatory and
       // single-phase gate.
       BulkScorer* conjunctionBulkScorer(MemPool& targetPool,
-                                        bool exhaustive) {
+                                        bool exhaustive,
+                                        bool* docSetLeads = nullptr,
+                                        bool* docSetSparseBulkEligible =
+                                            nullptr) {
+        if (docSetLeads != nullptr) {
+          *docSetLeads = false;
+        }
+        if (docSetSparseBulkEligible != nullptr) {
+          *docSetSparseBulkEligible = false;
+        }
         struct Entry {
           int64_t cost;
           Query::ScorerSupplier* supplier;
           bool optionalGroup;
+          bool docSetFilter;
         };
         boost::container::small_vector<Entry, 16> entries;
         for (auto* source : mandatorySources) {
@@ -1032,14 +1045,16 @@ public:
           if (supplier == nullptr) {
             return nullptr;  // a required clause cannot match this segment
           }
-          entries.push_back({supplier->cost(), supplier, false});
+          entries.push_back({supplier->cost(), supplier, false, false});
         }
         if (exhaustive) {
           for (auto* supplier : filterSuppliers) {
             if (supplier == nullptr) {
               return nullptr;
             }
-            entries.push_back({supplier->cost(), supplier, false});
+            entries.push_back({
+                supplier->cost(), supplier, false,
+                dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr});
           }
         }
 
@@ -1060,8 +1075,9 @@ public:
           if (optionalGroupSuppliers.empty()) {
             return nullptr;
           }
-          entries.push_back({optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
-                             nullptr, true});
+          entries.push_back({
+              optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
+              nullptr, true, false});
         }
         if (entries.empty()
             || (entries.size() < 2
@@ -1070,6 +1086,9 @@ public:
         }
         std::sort(entries.begin(), entries.end(),
                   [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+        if (docSetLeads != nullptr) {
+          *docSetLeads = entries[0].docSetFilter;
+        }
         int64_t leadCost = entries[0].cost;
         int64_t nonLeadCost = 0;
         for (size_t i = 1; i < entries.size(); i++) {
@@ -1104,6 +1123,15 @@ public:
           }
           arr[i] = scorer;
         }
+        if (docSetSparseBulkEligible != nullptr && entries[0].docSetFilter) {
+          *docSetSparseBulkEligible = true;
+          for (size_t i = 1; i < entries.size(); i++) {
+            if (dynamic_cast<TermQuery::Scorer*>(arr[i]) == nullptr) {
+              *docSetSparseBulkEligible = false;
+              break;
+            }
+          }
+        }
 
         auto* prohibitedArr =
             targetPool.make_arr<Query::Scorer*>(prohibitedSources.size());
@@ -1123,7 +1151,8 @@ public:
         return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
             targetPool, std::span<Query::Scorer*>(arr, entries.size()),
             std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
-            segment.maxDoc(), leadCost, nonLeadCost, !exhaustive);
+            segment.maxDoc(), leadCost, nonLeadCost, !exhaustive,
+            entries[0].docSetFilter);
       }
 
       BulkScorer* mandOptBulkScorer(MemPool& targetPool) {
@@ -1511,9 +1540,9 @@ public:
           }
           return maxScoreBulkScorer(targetPool, true);
         }
-        // Filtered and negated counts use the windowed intersection only when
-        // the positive body and every exclusion support exact dense fills.
-        // Sparse positive bodies stay on the pull scorer.
+        // Filtered and negated counts use the windowed intersection when the
+        // positive body and every exclusion support exact dense fills. A
+        // cached DocSet lead can also drive its sparse conjunction route.
         bool hasFilteredCountBody = !mandatorySources.empty()
             || (minShouldMatch >= 1 && !optionalSources.empty());
         if (!needsScores && hasFilteredCountBody
@@ -1524,8 +1553,23 @@ public:
               && ConjunctionBulkScorer::disableNegatedCountForTests) {
             return nullptr;
           }
-          auto* bulk = conjunctionBulkScorer(targetPool, true);
-          return bulk != nullptr && bulk->willCountDense() ? bulk : nullptr;
+          bool docSetLeads = false;
+          bool docSetSparseBulkEligible = false;
+          auto* bulk =
+              conjunctionBulkScorer(
+                  targetPool, true, &docSetLeads,
+                  &docSetSparseBulkEligible);
+          if (bulk == nullptr) {
+            return nullptr;
+          }
+          // A cached DocSet lead owns the sparse route too: keep this bulk
+          // scorer so countNextWindowSparse can drive from filter membership
+          // while term siblings retain docs-only probes. Prohibited clauses
+          // remain dense-only because sparse AND-NOT is not implemented here.
+          bool keepDocSetLead = !disableFilterClauseCountForTests
+              && prohibitedSources.empty()
+              && docSetLeads && docSetSparseBulkEligible;
+          return (bulk->willCountDense() || keepDocSetLead) ? bulk : nullptr;
         }
         if (needsScores && !filterSuppliers.empty()) {
           return disableFilteredScoredBulkForTests
@@ -1771,7 +1815,10 @@ public:
         for (size_t i = 0; i < filterWeights.size(); i++) {
           filterSuppliers[i] = QueryPrep::filterSupplier(
               targetPool, *filterWeights[i], nullptr, filterUses[i],
-              context.topReader, segment);
+              context.topReader, segment,
+              !needsScores && !disableFilterClauseCountForTests
+                  ? QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE
+                  : QueryPrep::FilterSupplierMode::DENSITY_ROUTED);
         }
       }
       return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
@@ -3353,6 +3400,24 @@ public:
     // docs-only leapfrog until the lead gets quite sparse (measured minimum
     // on the 5M benchmark corpus; 32 and 16384 are both ~20% slower).
     static constexpr int32_t kDenseThresholdInverse = 512;
+    static constexpr int32_t kDenseLeapfrogThreshold =
+        DocsEnumMeta::L1_DOCS / 32;
+    // A DocSet first fill is not enough work to amortize term leapfrogging.
+    // Keep filling through the first query clause, then apply the ordinary
+    // intermediate-cardinality crossover.
+    static constexpr int32_t kDocSetLeadLeapfrogThreshold = 1;
+    // Direct-term tails benefit from sparse filter-led iteration sooner than
+    // disjunction groups. This bar applies only when a DocSet leads and every
+    // remaining clause is a direct term; other conjunctions retain /512.
+    static constexpr int32_t kDocSetTermDenseThresholdInverse = 128;
+    static inline int32_t denseThresholdInverseForTests =
+        kDenseThresholdInverse;
+    static inline int32_t denseLeapfrogThresholdForTests =
+        kDenseLeapfrogThreshold;
+    static inline int32_t docSetLeadLeapfrogThresholdForTests =
+        kDocSetLeadLeapfrogThreshold;
+    static inline int32_t docSetTermDenseThresholdInverseForTests =
+        kDocSetTermDenseThresholdInverse;
     static inline bool disableDisjGroupBulkForTests = false;
     static inline bool disableDenseScoredForTests = false;
     static inline bool disableScoredProbeForTests = false;
@@ -3363,7 +3428,6 @@ public:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
     static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     static constexpr int32_t kWindowWords = kWindowSize / 64;
-    static constexpr int32_t kDenseLeapfrogThreshold = kWindowSize / 32;
     static_assert((kWindowSize % 64) == 0);
 
     struct TermClause {
@@ -3414,6 +3478,8 @@ public:
     bool denseHasDisjGroup = false;
     bool negatedCountPath = false;
     bool denseCountPath = false;
+    bool countLeadIsDocSet = false;
+    bool termTailScorers = false;
     bool denseScoredEligible = false;
     bool denseScoredCostRejected = false;
     const uint8_t* denseScoredNorms = nullptr;
@@ -3761,11 +3827,33 @@ public:
       return doc;
     }
 
-    template <bool TermFast>
+    template <bool TermFast, bool TermTailFast = false>
+    int32_t scorerCountDocId(size_t index) {
+      if constexpr (TermFast) {
+        return termScorers[index]->docsEnum.docId();
+      } else if constexpr (TermTailFast) {
+        return index == 0 ? scorers[0]->docId()
+                          : termScorers[index]->docsEnum.docId();
+      } else {
+        return scorers[index]->docId();
+      }
+    }
+
+    template <bool TermFast, bool TermTailFast = false>
     int32_t scorerCountAdvance(size_t index, int32_t target) {
       if constexpr (TermFast) {
         return termScorers[index]->docsEnum.advanceDocOnly(target);
+      } else if constexpr (TermTailFast) {
+        return index == 0
+            ? scorers[0]->advance(target)
+            : termScorers[index]->docsEnum.advanceDocOnly(target);
       } else {
+        // A DocSet clause makes allTermScorers false, but it must not demote
+        // the remaining terms to generic Scorer::advance (which can decode
+        // frequencies). Preserve the docs-only word-probe route per clause.
+        if (termScorers[index] != nullptr) {
+          return termScorers[index]->docsEnum.advanceDocOnly(target);
+        }
         return scorers[index]->advance(target);
       }
     }
@@ -4193,9 +4281,13 @@ public:
           int32_t doc = windowBase + index;
           bool matched = true;
           for (size_t c = firstClause; c < denseClauses.size(); c++) {
-            int32_t scorerDoc = denseClauseDocId(denseClauses[c]);
+            int32_t scorerDoc = termScorers[c] != nullptr
+                ? termScorers[c]->docsEnum.docId()
+                : denseClauseDocId(denseClauses[c]);
             if (scorerDoc < doc) {
-              scorerDoc = denseClauseCountAdvance(denseClauses[c], doc);
+              scorerDoc = termScorers[c] != nullptr
+                  ? termScorers[c]->docsEnum.advanceDocOnly(doc)
+                  : denseClauseCountAdvance(denseClauses[c], doc);
             }
             if (scorerDoc != doc) {
               matched = false;
@@ -4231,19 +4323,28 @@ public:
       clearWindowBits(windowBits);
       fillDenseClauseWindowBits(
           denseClauses[0], windowBits, windowBase, windowEnd);
-      for (size_t c = 1; c < denseClauses.size(); c++) {
-        clearWindowBits(clauseBits);
-        fillDenseClauseWindowBits(
-            denseClauses[c], clauseBits, windowBase, windowEnd);
-        for (int32_t w = 0; w < kWindowWords; w++) {
-          windowBits[(size_t) w] &= clauseBits[(size_t) w];
+      auto belowLeapfrogThreshold = [&](int32_t threshold) {
+        int32_t card = 0;
+        for (uint64_t bits : windowBits) {
+          card += (int32_t) std::popcount(bits);
         }
-        if (denseClauses.size() >= 3 && c + 1 < denseClauses.size()) {
-          int32_t card = 0;
-          for (uint64_t bits : windowBits) {
-            card += (int32_t) std::popcount(bits);
+        return card < threshold;
+      };
+      if (countLeadIsDocSet && denseClauses.size() >= 2
+          && belowLeapfrogThreshold(
+              docSetLeadLeapfrogThresholdForTests)) {
+        leapfrogRemainingDenseClauses(1, windowBase, windowEnd);
+      } else {
+        for (size_t c = 1; c < denseClauses.size(); c++) {
+          clearWindowBits(clauseBits);
+          fillDenseClauseWindowBits(
+              denseClauses[c], clauseBits, windowBase, windowEnd);
+          for (int32_t w = 0; w < kWindowWords; w++) {
+            windowBits[(size_t) w] &= clauseBits[(size_t) w];
           }
-          if (card < kDenseLeapfrogThreshold) {
+          if (c + 1 < denseClauses.size()
+              && belowLeapfrogThreshold(
+                  denseLeapfrogThresholdForTests)) {
             leapfrogRemainingDenseClauses(c + 1, windowBase, windowEnd);
             break;
           }
@@ -4456,7 +4557,7 @@ public:
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
-    template <bool TermFast, typename Consumer>
+    template <bool TermFast, bool TermTailFast = false, typename Consumer>
     int32_t visitNextWindowSparse(DocSet* filter, int32_t min, int32_t max,
                                   int32_t& windowEnd, Consumer consume) {
       windowEnd = max;
@@ -4472,9 +4573,9 @@ public:
       }
       int32_t target = min;
       while (target < windowEnd) {
-        int32_t doc = scorerDocId<TermFast>(0);
+        int32_t doc = scorerCountDocId<TermFast, TermTailFast>(0);
         if (doc < target) {
-          doc = scorerCountAdvance<TermFast>(0, target);
+          doc = scorerCountAdvance<TermFast, TermTailFast>(0, target);
         }
         if (doc >= windowEnd) {
           return doc;  // sound resume point (or END); covers doc == END
@@ -4483,9 +4584,10 @@ public:
 
         bool matched = true;
         for (size_t c = 1; c < scorers.size(); c++) {
-          int32_t scorerDoc = scorerDocId<TermFast>(c);
+          int32_t scorerDoc = scorerCountDocId<TermFast, TermTailFast>(c);
           if (scorerDoc < target) {
-            scorerDoc = scorerCountAdvance<TermFast>(c, target);
+            scorerDoc =
+                scorerCountAdvance<TermFast, TermTailFast>(c, target);
           }
           if (scorerDoc != target) {
             target = scorerDoc;
@@ -4511,12 +4613,12 @@ public:
       return target;  // >= windowEnd: failing clause position or matched doc + 1
     }
 
-    template <bool TermFast>
+    template <bool TermFast, bool TermTailFast = false>
     int32_t countNextWindowSparse(int64_t& count, DocSetBuilder* domainOut,
                                   DocSet* filter, int32_t min, int32_t max) {
       skipCount(SkipStats::conjCountFallbacks);
       int32_t windowEnd;
-      return visitNextWindowSparse<TermFast>(
+      return visitNextWindowSparse<TermFast, TermTailFast>(
           filter, min, max, windowEnd, [&](int32_t doc) {
             count++;
             if (domainOut != nullptr) {
@@ -4530,7 +4632,8 @@ public:
     ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
                           std::span<Query::Scorer*> prohibitedScorers,
                           int32_t maxDoc, int64_t leadCost,
-                          int64_t nonLeadCost, bool scoredConstruction)
+                          int64_t nonLeadCost, bool scoredConstruction,
+                          bool countLeadIsDocSet)
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
@@ -4555,10 +4658,11 @@ public:
               pool.make_arr<uint64_t>(((size_t) kChunk + 63) >> 6),
               ((size_t) kChunk + 63) >> 6),
           groupScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
-          maxDoc(maxDoc) {
+          maxDoc(maxDoc), countLeadIsDocSet(countLeadIsDocSet) {
       assert(!scorers.empty());
       std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
       allTermScorers = true;
+      termTailScorers = scorers.size() > 1;
       allTermClauses = true;
       allDenseClauses = true;
       size_t scoreAddends = 0;
@@ -4581,6 +4685,9 @@ public:
 
         termScorers[i] = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
         allTermScorers &= termScorers[i] != nullptr;
+        if (i > 0) {
+          termTailScorers &= termScorers[i] != nullptr;
+        }
         if (termScorers[i] != nullptr) {
           termClauses[i].members = scorers.subspan(i, 1);
           scoreAddends++;
@@ -4635,10 +4742,14 @@ public:
         }
       }
       negatedCountPath = !prohibitedScorers.empty();
+      int32_t denseThresholdInverse =
+          countLeadIsDocSet && termTailScorers
+          ? docSetTermDenseThresholdInverseForTests
+          : denseThresholdInverseForTests;
       denseCountPath = allDenseClauses && allDenseProhibited
           && maxDoc >= kWindowSize
           && leadCost >= std::max<int64_t>(
-              1, (int64_t) maxDoc / kDenseThresholdInverse);
+              1, (int64_t) maxDoc / denseThresholdInverse);
       denseScoredEligible = scoredConstruction && denseCountPath
           && !negatedCountPath && allTermScorers
           && !disableDenseScoredForTests;
@@ -4780,7 +4891,11 @@ public:
       };
       int32_t next = allTermScorers
           ? visitNextWindowSparse<true>(filter, min, max, windowEnd, emit)
-          : visitNextWindowSparse<false>(filter, min, max, windowEnd, emit);
+          : termTailScorers
+              ? visitNextWindowSparse<false, true>(
+                  filter, min, max, windowEnd, emit)
+              : visitNextWindowSparse<false>(
+                  filter, min, max, windowEnd, emit);
       out.max = windowEnd;
       return next;
     }
@@ -4802,7 +4917,11 @@ public:
       }
       return allTermScorers
           ? countNextWindowSparse<true>(count, domainOut, filter, min, max)
-          : countNextWindowSparse<false>(count, domainOut, filter, min, max);
+          : termTailScorers
+              ? countNextWindowSparse<false, true>(
+                  count, domainOut, filter, min, max)
+              : countNextWindowSparse<false>(
+                  count, domainOut, filter, min, max);
     }
 
     int64_t skippedWindows() const {
