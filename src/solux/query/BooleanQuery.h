@@ -3356,6 +3356,7 @@ public:
     static inline bool disableDisjGroupBulkForTests = false;
     static inline bool disableDenseScoredForTests = false;
     static inline bool disableScoredProbeForTests = false;
+    static inline bool disableBatchBoundForTests = false;
     static inline bool disableNegatedCountForTests = false;
 
   private:
@@ -3392,6 +3393,7 @@ public:
     std::span<double> suffixMax;        // suffixMax[c] = sum of windowMax[c..n)
     std::span<int32_t> candDocs;
     std::span<float> candScores;
+    std::span<int32_t> boundDrops;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
     std::span<uint64_t> windowBits;
@@ -3674,6 +3676,31 @@ public:
       return write;
     }
 
+    bool remainingBoundCanDrop(double remaining) const {
+      return minCompetitiveScore > 0.0f
+          && remaining * scoreBoundFactor < (double) minCompetitiveScore;
+    }
+
+    int32_t batchCompactByRemainingBound(
+        int32_t size, double remaining) SOLUX_INLINE {
+      for (int32_t i = 0; i < size; i++) {
+        boundDrops[(size_t) i] =
+            (((double) candScores[(size_t) i] + remaining) * scoreBoundFactor
+             < (double) minCompetitiveScore);
+      }
+
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        if (boundDrops[(size_t) i] != 0) continue;
+        if (write != i) {
+          candDocs[(size_t) write] = candDocs[(size_t) i];
+          candScores[(size_t) write] = candScores[(size_t) i];
+        }
+        write++;
+      }
+      return write;
+    }
+
     int32_t applyTermGroupToCandidates(size_t clause, int32_t size) {
       size_t words = ((size_t) size + 63) >> 6;
       std::fill(groupMatchBits.begin(), groupMatchBits.begin() + (ptrdiff_t) words, 0);
@@ -3778,6 +3805,54 @@ public:
       } else {
         return scorers[index]->score();
       }
+    }
+
+    template <bool CheckBound>
+    int32_t SOLUX_INLINE applyScoredProbeToCandidates(
+        TermQuery::Scorer* scorer, int32_t size,
+        double remaining) {
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        int32_t doc = candDocs[(size_t) i];
+        float sum = candScores[(size_t) i];
+        if constexpr (CheckBound) {
+          if (((double) sum + remaining) * scoreBoundFactor
+              < (double) minCompetitiveScore) {
+            continue;
+          }
+        }
+        float clauseScore;
+        if (!scorer->matchScoredProbe(doc, clauseScore)) continue;
+        candDocs[(size_t) write] = doc;
+        candScores[(size_t) write] = sum + clauseScore;
+        write++;
+      }
+      return write;
+    }
+
+    template <bool CheckBound, bool TermFast>
+    int32_t SOLUX_INLINE applyScorerToCandidates(
+        size_t clause, int32_t size, double remaining) {
+      int32_t scorerDoc = scorerDocId<TermFast>(clause);
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        int32_t doc = candDocs[(size_t) i];
+        float sum = candScores[(size_t) i];
+        if constexpr (CheckBound) {
+          if (((double) sum + remaining) * scoreBoundFactor
+              < (double) minCompetitiveScore) {
+            continue;
+          }
+        }
+        if (scorerDoc < doc) {
+          scorerDoc = scorerAdvanceForClauseProbe<TermFast>(clause, doc);
+        }
+        if (scorerDoc != doc) continue;
+        candDocs[(size_t) write] = doc;
+        candScores[(size_t) write] = sum + scorerScore<TermFast>(clause);
+        write++;
+      }
+      return write;
     }
 
     template <bool TermFast>
@@ -3891,49 +3966,24 @@ public:
           }
           for (size_t c = 1; c < scorers.size() && n > 0; c++) {
             const double remaining = suffixMax[c];  // clauses [c, end) add at most this
+            const bool batchBound = !disableBatchBoundForTests;
+            if (batchBound && remainingBoundCanDrop(remaining)) {
+              n = batchCompactByRemainingBound(n, remaining);
+              if (n == 0) continue;
+            }
             if constexpr (TermFast) {
               if (!disableScoredProbeForTests) {
-                TermQuery::Scorer* termScorer = termScorers[c];
-                int32_t w = 0;
-                for (int32_t i = 0; i < n; i++) {
-                  int32_t doc = candDocs[(size_t) i];
-                  float sum = candScores[(size_t) i];
-                  if (((double) sum + remaining) * scoreBoundFactor
-                      < (double) this->minCompetitiveScore) {
-                    continue;
-                  }
-                  float clauseScore;
-                  if (!termScorer->matchScoredProbe(doc, clauseScore)) {
-                    continue;
-                  }
-                  candDocs[(size_t) w] = doc;
-                  candScores[(size_t) w] = sum + clauseScore;
-                  w++;
-                }
-                n = w;
+                n = batchBound
+                    ? applyScoredProbeToCandidates<false>(
+                        termScorers[c], n, remaining)
+                    : applyScoredProbeToCandidates<true>(
+                        termScorers[c], n, remaining);
                 continue;
               }
             }
-            int32_t scorerDoc = scorerDocId<TermFast>(c);
-            int32_t w = 0;
-            for (int32_t i = 0; i < n; i++) {
-              int32_t doc = candDocs[(size_t) i];
-              float sum = candScores[(size_t) i];
-              if (((double) sum + remaining) * scoreBoundFactor
-                  < (double) this->minCompetitiveScore) {
-                continue;  // cannot compete no matter what the rest contribute
-              }
-              if (scorerDoc < doc) {
-                scorerDoc = scorerAdvanceForClauseProbe<TermFast>(c, doc);
-              }
-              if (scorerDoc != doc) {
-                continue;  // not in the conjunction
-              }
-              candDocs[(size_t) w] = doc;
-              candScores[(size_t) w] = sum + scorerScore<TermFast>(c);
-              w++;
-            }
-            n = w;
+            n = batchBound
+                ? applyScorerToCandidates<false, TermFast>(c, n, remaining)
+                : applyScorerToCandidates<true, TermFast>(c, n, remaining);
           }
           for (int32_t i = 0; i < n; i++) {
             if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
@@ -4496,6 +4546,7 @@ public:
           suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
           candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
           candScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
+          boundDrops(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
           outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
           outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
           windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
