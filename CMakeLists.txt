@@ -264,5 +264,16 @@ target_link_libraries(solux_lib PRIVATE faiss)
 target_link_libraries(solux_lib PRIVATE uni_algo)
 
 # Optional, untracked developer-machine additions (extra tools/targets that
-# should not live in the shared build). Silently skipped when absent.
-include(LocalTargets.cmake OPTIONAL)
+# should not live in the shared build). Opt-in: merely having the file present
+# used to put its targets in `all`, so a box set up for bench runs paid for them
+# on every ordinary build. Configure with -DSOLUX_LOCAL_TARGETS=ON to enable
+# (cached per build dir, so a bench build dir sets it once).
+option(SOLUX_LOCAL_TARGETS "Include the untracked LocalTargets.cmake" OFF)
+if(SOLUX_LOCAL_TARGETS)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LocalTargets.cmake")
+    message(STATUS "Solux: including LocalTargets.cmake")
+    include(LocalTargets.cmake)
+  else()
+    message(WARNING "SOLUX_LOCAL_TARGETS=ON but LocalTargets.cmake does not exist")
+  endif()
+endif()
