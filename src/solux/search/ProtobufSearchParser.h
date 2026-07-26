@@ -1,5 +1,16 @@
 #pragma once
 
+// Turns a wire request into the op tree. It has to name every request type, so
+// it pulls the whole ops/, query/ and value/ tree behind it: a single #include
+// of this header costs ~12s and ~2GB to compile.
+//
+// Include it in exactly one place per binary. Today that is SearchEngine.cpp in
+// the engine and SearchParserTest.cpp in the tests - the one TU that asserts on
+// the shape the parser produces. Anything else that wants a knob the parser
+// consults belongs in SearchOverrides.h (a leaf header), and anything that
+// wants to check query behaviour should go through the execute path instead of
+// parsing directly.
+
 #include "solux/util/proto.h"
 #include <algorithm>
 #include <cmath>
@@ -640,7 +651,7 @@ public:
         BooleanQuery::disableFilterClauseCountForTests
         && limit == 0 && topDocsReq.get_number && !topDocsReq.get_scores;
     bool foldFilters = !filters.empty()
-        && !TopDocsReq::disableTopDocsFilterFoldForTests
+        && !disableTopDocsFilterFold
         && !countClauseDisabled;
     if (foldFilters) {
       auto mandatory = req.requestPool.make_span<Query*>(1);

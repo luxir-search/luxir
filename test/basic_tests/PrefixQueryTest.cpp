@@ -18,7 +18,6 @@
 #include "solux/reader/SkipStats.h"
 #include "solux/schema/Schema.h"
 #include "solux/search/Collector.h"
-#include "solux/search/ProtobufSearchParser.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -491,27 +490,6 @@ TEST_F(PrefixQueryE2ETest, textField) {
   EXPECT_EQ(prefixCount("body_w", "ban"), 1);  // banana -> d2
   EXPECT_EQ(prefixCount("body_w", ""), 4);     // every doc has an indexed term
   EXPECT_EQ(prefixCount("body_w", "z"), 0);    // no matches
-}
-
-TEST_F(PrefixQueryE2ETest, getNumberControlsPruningWeightFlag) {
-  auto parseAllowsPruning = [&](bool getNumber) -> std::optional<bool> {
-    auto request = localReq(helper.getSearchEngine());
-    auto& topDocs = request->collection("main").topDocs("q")
-        .prefixQuery("body_w", "ap").limit(10);
-    topDocs.getNumber(getNumber);
-    request->reader = helper.getIndexWriter()->getIndexReader();
-    request->schema = helper.collection().getSchema();
-    ProtobufSearchParser parser(*request);
-    auto* root = static_cast<RootOp*>(parser.parse());
-    auto it = root->subOps.find("q");
-    if (it == root->subOps.end()) return std::nullopt;
-    auto* parsed = dynamic_cast<TopDocsReq*>(it->second);
-    if (parsed == nullptr) return std::nullopt;
-    return parsed->weight->allowsPruning();
-  };
-
-  EXPECT_EQ(std::optional<bool>(true), parseAllowsPruning(false));
-  EXPECT_EQ(std::optional<bool>(false), parseAllowsPruning(true));
 }
 
 TEST_F(PrefixQueryE2ETest, asBooleanFilter) {

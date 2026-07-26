@@ -151,18 +151,18 @@ public:
 };
 
 class FacetCounterModeGuard {
-  FacetCounterMode saved = StrFacetOp::forcedCounterMode;
+  FacetCounterMode saved = forcedFacetCounterMode;
 public:
   ~FacetCounterModeGuard() {
-    StrFacetOp::forcedCounterMode = saved;
+    forcedFacetCounterMode = saved;
   }
 };
 
 class StrFacetStrategyGuard {
-  StrFacetStrategy saved = StrFacetOp::forcedStrategy;
+  StrFacetStrategy saved = forcedStrFacetStrategy;
 public:
   ~StrFacetStrategyGuard() {
-    StrFacetOp::forcedStrategy = saved;
+    forcedStrFacetStrategy = saved;
   }
 };
 
@@ -244,7 +244,7 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
 
   FacetCounterModeGuard guard;
   auto run = [&](FacetCounterMode mode, int64_t mincount) {
-    StrFacetOp::forcedCounterMode = mode;
+    forcedFacetCounterMode = mode;
     auto req = localReq(soluxNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs();
@@ -302,7 +302,7 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
 
   StrFacetStrategyGuard guard;
   auto run = [&](StrFacetStrategy strategy, int domainKind) {
-    StrFacetOp::forcedStrategy = strategy;
+    forcedStrFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
 
@@ -371,7 +371,7 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   StrFacetStrategyGuard guard;
   auto run = [&](StrFacetStrategy strategy, std::string_view field,
                  int64_t limit, int64_t mincount, bool missing) {
-    StrFacetOp::forcedStrategy = strategy;
+    forcedStrFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& facet = req->facet("f", field).limit(limit).mincount(mincount);
@@ -397,7 +397,7 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   expectMatches("cat_s", -1, 0, true);
 
   auto runMixedDomain = [&](StrFacetStrategy strategy) {
-    StrFacetOp::forcedStrategy = strategy;
+    forcedStrFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& docs = req->topDocs("q");
@@ -439,7 +439,7 @@ TEST_F(FacetTest, spanCounterTopKOverflowShortCircuit) {
 
   FacetCounterModeGuard guard;
   auto topBucket = [&](FacetCounterMode mode, int64_t limit) {
-    StrFacetOp::forcedCounterMode = mode;
+    forcedFacetCounterMode = mode;
     auto req = localReq(soluxNode->getSearchEngine());
     req->collection("main");
     req->facet("f", "category_s").limit(limit);
@@ -3410,7 +3410,7 @@ TEST_F(RandomFacetTest, randomFaceting) {
       StrFacetStrategy::COLUMN_DOMAIN,
       StrFacetStrategy::COLUMN_COMPLEMENT,
       StrFacetStrategy::TERM_DRIVEN}) {
-    StrFacetOp::forcedStrategy = strategy;
+    forcedStrFacetStrategy = strategy;
     runRandomTest(
         (int)scaleTestDimension(2, 2),
         (int)scaleTestDimension(100, 2));

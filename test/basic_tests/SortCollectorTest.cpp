@@ -5,7 +5,7 @@
 #include "test/QueryBuild.h"
 #include "solux/search/FieldSortCollector.h"
 #include "solux/search/SortField.h"
-#include "solux/search/ops/TopDocsReq.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/reader/SkipStats.h"
 #include "solux/schema/FieldType.h"
 #include "solux/util/random.h"
@@ -42,11 +42,11 @@ class FieldSortBulkGuard {
 
 public:
   explicit FieldSortBulkGuard(bool disabled)
-      : saved(TopDocsReq::disableFieldSortBulkForTests) {
-    TopDocsReq::disableFieldSortBulkForTests = disabled;
+      : saved(disableFieldSortBulk) {
+    disableFieldSortBulk = disabled;
   }
   ~FieldSortBulkGuard() {
-    TopDocsReq::disableFieldSortBulkForTests = saved;
+    disableFieldSortBulk = saved;
   }
 };
 

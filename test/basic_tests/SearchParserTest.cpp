@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -17,7 +18,9 @@
 #include "solux/query/ParseContext.h"
 #include "solux/query/ProtobufQueryParser.h"
 #include "solux/query/TermQuery.h"
+#include "solux/search/FieldSortCollector.h"
 #include "solux/search/ProtobufSearchParser.h"
+#include "solux/search/ops/RootOp.h"
 #include "solux/search/ops/TopDocsReq.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -28,7 +31,7 @@
 using namespace solux;
 using namespace solux::test;
 
-class BooleanParserFlattenTest : public SoluxTest {
+class SearchParserTest : public SoluxTest {
   using ScoreMap = std::map<std::pair<int32_t, int32_t>, float>;
 
   MemPool parsePool;
@@ -131,7 +134,7 @@ protected:
   }
 };
 
-TEST_F(BooleanParserFlattenTest, negationFormsNormalizeToComplements) {
+TEST_F(SearchParserTest, negationFormsNormalizeToComplements) {
   TestIndex index;
   buildIndex(index);
 
@@ -169,7 +172,7 @@ TEST_F(BooleanParserFlattenTest, negationFormsNormalizeToComplements) {
   }
 }
 
-TEST_F(BooleanParserFlattenTest, requiredDisjunctionWithExclusionHoists) {
+TEST_F(SearchParserTest, requiredDisjunctionWithExclusionHoists) {
   auto view = shape(parseSimple("+(a b) -c"));
   EXPECT_EQ(0, view.mandatoryCount);
   EXPECT_EQ(2, view.optionalCount);
@@ -182,7 +185,7 @@ TEST_F(BooleanParserFlattenTest, requiredDisjunctionWithExclusionHoists) {
   EXPECT_EQ(std::type_index(typeid(TermQuery)), view.prohibitedTypes[0]);
 }
 
-TEST_F(BooleanParserFlattenTest, conjunctionAndDisjunctionFormsFlatten) {
+TEST_F(SearchParserTest, conjunctionAndDisjunctionFormsFlatten) {
   TestIndex index;
   buildIndex(index);
 
@@ -227,7 +230,7 @@ TEST_F(BooleanParserFlattenTest, conjunctionAndDisjunctionFormsFlatten) {
                    collectScores(*index.reader, *parsed));
 }
 
-TEST_F(BooleanParserFlattenTest, boostedGroupUnderAndDistributesBoost) {
+TEST_F(SearchParserTest, boostedGroupUnderAndDistributesBoost) {
   TestIndex index;
   buildIndex(index);
 
@@ -250,7 +253,7 @@ TEST_F(BooleanParserFlattenTest, boostedGroupUnderAndDistributesBoost) {
                    collectScores(*index.reader, *parsed));
 }
 
-TEST_F(BooleanParserFlattenTest, topDocsExprAndNamedFilterCompose) {
+TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "d1", "body_w", "a b", "keep_s", "yes"),
@@ -292,7 +295,7 @@ TEST_F(BooleanParserFlattenTest, topDocsExprAndNamedFilterCompose) {
                            responseScores(*req, "folded"));
 }
 
-TEST_F(BooleanParserFlattenTest, absentQueryIsMatchAllAndNormalizesAway) {
+TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "d1", "body_w", "a", "keep_s", "yes"),
@@ -343,4 +346,134 @@ TEST_F(BooleanParserFlattenTest, absentQueryIsMatchAllAndNormalizesAway) {
   empty->execute();
   ASSERT_OK(empty);
   EXPECT_EQ(3, empty->getMatchCount("q"));
+}
+
+namespace {
+
+struct StringSortModeGuard {
+  StringSortMode saved;
+
+  explicit StringSortModeGuard(StringSortMode mode)
+      : saved(SortField::setStringSortModeForTests(mode)) {}
+  ~StringSortModeGuard() { SortField::setStringSortModeForTests(saved); }
+};
+
+} // namespace
+
+// Sort-plan shape: what the parser derives for each sort expression (clause
+// kind/order, useFieldSort, rankNeedsScores) and the score/pruning flags it
+// puts on the weight. Moved here from ValueExprSortTest so ProtobufSearchParser
+// stays confined to this TU.
+TEST_F(SearchParserTest, normalizationScoreModesAndStringComparator) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "a", "name_s", "z", "price_i", 2,
+                       "popularity_i", 10, "body_w", "term term"),
+               UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "b", "name_s", "a", "price_i", 1,
+                       "popularity_i", 20, "body_w", "term"),
+               UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  StringSortModeGuard stringMode(StringSortMode::SEGMENT);
+
+  auto inspect = [&](std::string_view expression, qb::SortDir direction,
+                     bool getScores, auto&& verify) {
+    auto request = localReq(soluxNode->getSearchEngine());
+    request->collection("main");
+    auto& top = request->topDocs("q").matchQuery("body_w", "term").limit(10);
+    top.getScores(getScores);
+    if (!expression.empty()) qb::sort(top, expression, direction);
+    request->reader = reader;
+    request->schema = helper.collection().getSchema();
+    ProtobufSearchParser parser(*request);
+    auto* root = static_cast<RootOp*>(parser.parse());
+    auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+    ASSERT_NE(parsed, nullptr);
+    verify(*parsed);
+  };
+
+  inspect("price_i", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
+    ASSERT_EQ(1, parsed.sortPlan.clauses.size());
+    EXPECT_EQ(SortClause::COLUMN, parsed.sortPlan.clauses[0].getKind());
+    EXPECT_EQ(SortField::ASC, parsed.sortPlan.clauses[0].getOrder());
+    EXPECT_FALSE(parsed.weight->needsScores());
+  });
+  inspect("name_s", qb::ASC, false, [&](TopDocsReq& parsed) {
+    ASSERT_EQ(SortClause::COLUMN, parsed.sortPlan.clauses[0].getKind());
+    FieldSortCollector collector(2, parsed.sortPlan.clauses, reader.get(), false);
+    EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(collector.soleColumn));
+  });
+  inspect("_docid_", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
+    EXPECT_EQ(SortClause::DOC, parsed.sortPlan.clauses[0].getKind());
+    EXPECT_EQ(SortField::ASC, parsed.sortPlan.clauses[0].getOrder());
+    EXPECT_FALSE(parsed.weight->needsScores());
+  });
+  inspect("_score_", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
+    EXPECT_EQ(SortClause::SCORE, parsed.sortPlan.clauses[0].getKind());
+    EXPECT_EQ(SortField::DESC, parsed.sortPlan.clauses[0].getOrder());
+    EXPECT_FALSE(parsed.sortPlan.useFieldSort);
+    EXPECT_TRUE(parsed.weight->needsScores());
+    EXPECT_TRUE(parsed.weight->allowsPruning());
+  });
+  inspect("add(price_i,1)", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
+    EXPECT_EQ(SortClause::EXPR, parsed.sortPlan.clauses[0].getKind());
+    EXPECT_EQ(SortField::ASC, parsed.sortPlan.clauses[0].getOrder());
+    EXPECT_FALSE(parsed.weight->needsScores());
+    EXPECT_FALSE(parsed.weight->allowsPruning());
+  });
+  inspect("add(price_i,1)", qb::ASC, true, [&](TopDocsReq& parsed) {
+    EXPECT_TRUE(parsed.weight->needsScores());
+  });
+  inspect("add(score,popularity_i)", qb::DESC, false, [&](TopDocsReq& parsed) {
+    EXPECT_TRUE(parsed.sortPlan.rankNeedsScores);
+    EXPECT_TRUE(parsed.weight->needsScores());
+    EXPECT_FALSE(parsed.weight->allowsPruning());
+  });
+  inspect({}, qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
+    EXPECT_TRUE(parsed.sortPlan.rankNeedsScores);
+    EXPECT_TRUE(parsed.weight->needsScores());
+    EXPECT_FALSE(parsed.sortPlan.useFieldSort);
+  });
+
+  auto canonical = localReq(soluxNode->getSearchEngine());
+  canonical->collection("main");
+  auto& top = canonical->topDocs("q").matchQuery("body_w", "term").limit(10);
+  qb::sort(top, "score", qb::DESC);
+  qb::sort(top, "_docid_", qb::ASC);
+  canonical->reader = reader;
+  canonical->schema = helper.collection().getSchema();
+  ProtobufSearchParser parser(*canonical);
+  auto* root = static_cast<RootOp*>(parser.parse());
+  auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+  ASSERT_NE(parsed, nullptr);
+  EXPECT_FALSE(parsed->sortPlan.useFieldSort);
+  EXPECT_TRUE(parsed->weight->allowsPruning());
+}
+
+// Pruning is withdrawn when the request asks for an exact match count.
+TEST_F(SearchParserTest, getNumberControlsPruningWeightFlag) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "d1", "body_w", "apple apricot"),
+    flatdoc("id", "d2", "body_w", "banana"),
+    flatdoc("id", "d3", "body_w", "apricot avocado"),
+  }, UpdateMessage::COMMIT);
+
+  auto parseAllowsPruning = [&](bool getNumber) -> std::optional<bool> {
+    auto request = localReq(helper.getSearchEngine());
+    auto& topDocs = request->collection("main").topDocs("q")
+        .prefixQuery("body_w", "ap").limit(10);
+    topDocs.getNumber(getNumber);
+    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->schema = helper.collection().getSchema();
+    ProtobufSearchParser parser(*request);
+    auto* root = static_cast<RootOp*>(parser.parse());
+    auto it = root->subOps.find("q");
+    if (it == root->subOps.end()) return std::nullopt;
+    auto* parsed = dynamic_cast<TopDocsReq*>(it->second);
+    if (parsed == nullptr) return std::nullopt;
+    return parsed->weight->allowsPruning();
+  };
+
+  EXPECT_EQ(std::optional<bool>(true), parseAllowsPruning(false));
+  EXPECT_EQ(std::optional<bool>(false), parseAllowsPruning(true));
 }

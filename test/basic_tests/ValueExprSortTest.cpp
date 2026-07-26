@@ -9,9 +9,6 @@
 
 #include "solux/api/solux_types.hpp"
 #include "solux/search/FieldSortCollector.h"
-#include "solux/search/ProtobufSearchParser.h"
-#include "solux/search/ops/RootOp.h"
-#include "solux/search/ops/TopDocsReq.h"
 #include "solux/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -29,14 +26,6 @@ std::vector<std::string> ids(const LocalReq& req) {
   const auto& values = std::get<api::ColStr>(docs->columns.at("id_s").kind).v;
   return {values.begin(), values.end()};
 }
-
-struct StringSortModeGuard {
-  StringSortMode saved;
-
-  explicit StringSortModeGuard(StringSortMode mode)
-      : saved(SortField::setStringSortModeForTests(mode)) {}
-  ~StringSortModeGuard() { SortField::setStringSortModeForTests(saved); }
-};
 
 } // namespace
 
@@ -135,91 +124,6 @@ TEST_F(ValueExprSortTest, nestedDocidUsesReaderGlobalOrder) {
   req->execute(true);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ((std::vector<std::string>{"c", "b", "a"}), ids(*req));
-}
-
-TEST_F(ValueExprSortTest, normalizationScoreModesAndStringComparator) {
-  CollectionHelper helper;
-  helper.index(flatdoc("id_s", "a", "name_s", "z", "price_i", 2,
-                       "popularity_i", 10, "body_w", "term term"),
-               UpdateMessage::COMMIT);
-  helper.index(flatdoc("id_s", "b", "name_s", "a", "price_i", 1,
-                       "popularity_i", 20, "body_w", "term"),
-               UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
-  StringSortModeGuard stringMode(StringSortMode::SEGMENT);
-
-  auto inspect = [&](std::string_view expression, qb::SortDir direction,
-                     bool getScores, auto&& verify) {
-    auto request = localReq(soluxNode->getSearchEngine());
-    request->collection("main");
-    auto& top = request->topDocs("q").matchQuery("body_w", "term").limit(10);
-    top.getScores(getScores);
-    if (!expression.empty()) qb::sort(top, expression, direction);
-    request->reader = reader;
-    request->schema = helper.collection().getSchema();
-    ProtobufSearchParser parser(*request);
-    auto* root = static_cast<RootOp*>(parser.parse());
-    auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
-    ASSERT_NE(parsed, nullptr);
-    verify(*parsed);
-  };
-
-  inspect("price_i", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
-    ASSERT_EQ(1, parsed.sortPlan.clauses.size());
-    EXPECT_EQ(SortClause::COLUMN, parsed.sortPlan.clauses[0].getKind());
-    EXPECT_EQ(SortField::ASC, parsed.sortPlan.clauses[0].getOrder());
-    EXPECT_FALSE(parsed.weight->needsScores());
-  });
-  inspect("name_s", qb::ASC, false, [&](TopDocsReq& parsed) {
-    ASSERT_EQ(SortClause::COLUMN, parsed.sortPlan.clauses[0].getKind());
-    FieldSortCollector collector(2, parsed.sortPlan.clauses, reader.get(), false);
-    EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(collector.soleColumn));
-  });
-  inspect("_docid_", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
-    EXPECT_EQ(SortClause::DOC, parsed.sortPlan.clauses[0].getKind());
-    EXPECT_EQ(SortField::ASC, parsed.sortPlan.clauses[0].getOrder());
-    EXPECT_FALSE(parsed.weight->needsScores());
-  });
-  inspect("_score_", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
-    EXPECT_EQ(SortClause::SCORE, parsed.sortPlan.clauses[0].getKind());
-    EXPECT_EQ(SortField::DESC, parsed.sortPlan.clauses[0].getOrder());
-    EXPECT_FALSE(parsed.sortPlan.useFieldSort);
-    EXPECT_TRUE(parsed.weight->needsScores());
-    EXPECT_TRUE(parsed.weight->allowsPruning());
-  });
-  inspect("add(price_i,1)", qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
-    EXPECT_EQ(SortClause::EXPR, parsed.sortPlan.clauses[0].getKind());
-    EXPECT_EQ(SortField::ASC, parsed.sortPlan.clauses[0].getOrder());
-    EXPECT_FALSE(parsed.weight->needsScores());
-    EXPECT_FALSE(parsed.weight->allowsPruning());
-  });
-  inspect("add(price_i,1)", qb::ASC, true, [&](TopDocsReq& parsed) {
-    EXPECT_TRUE(parsed.weight->needsScores());
-  });
-  inspect("add(score,popularity_i)", qb::DESC, false, [&](TopDocsReq& parsed) {
-    EXPECT_TRUE(parsed.sortPlan.rankNeedsScores);
-    EXPECT_TRUE(parsed.weight->needsScores());
-    EXPECT_FALSE(parsed.weight->allowsPruning());
-  });
-  inspect({}, qb::UNKNOWN, false, [&](TopDocsReq& parsed) {
-    EXPECT_TRUE(parsed.sortPlan.rankNeedsScores);
-    EXPECT_TRUE(parsed.weight->needsScores());
-    EXPECT_FALSE(parsed.sortPlan.useFieldSort);
-  });
-
-  auto canonical = localReq(soluxNode->getSearchEngine());
-  canonical->collection("main");
-  auto& top = canonical->topDocs("q").matchQuery("body_w", "term").limit(10);
-  qb::sort(top, "score", qb::DESC);
-  qb::sort(top, "_docid_", qb::ASC);
-  canonical->reader = reader;
-  canonical->schema = helper.collection().getSchema();
-  ProtobufSearchParser parser(*canonical);
-  auto* root = static_cast<RootOp*>(parser.parse());
-  auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
-  ASSERT_NE(parsed, nullptr);
-  EXPECT_FALSE(parsed->sortPlan.useFieldSort);
-  EXPECT_TRUE(parsed->weight->allowsPruning());
 }
 
 TEST_F(ValueExprSortTest, scoreColumnExpressionAndGetScoresOutput) {

@@ -6,6 +6,7 @@
 #include <functional>
 #include "SearchOp.h"
 #include "solux/query/Query.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/query/QueryPrep.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/StoredFieldsReader.h"
@@ -26,12 +27,6 @@ protected:
 
 public:
   class Calc;
-
-  // A/B baseline for measuring folded Boolean filters against the former
-  // passive TopDocs domain path. Default false means folding is enabled.
-  static inline bool disableTopDocsFilterFoldForTests = false;
-  // A/B baseline for unscored field-sort match-window collection.
-  static inline bool disableFieldSortBulkForTests = false;
 
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;
@@ -347,7 +342,7 @@ public:
             // fall through to the sub-calc/merge tail below
           } else if (data->useFieldSort) {
             bool usedBulk = false;
-            if (!disableFieldSortBulkForTests && !data->fieldCollector->needsScores) {
+            if (!disableFieldSortBulk && !data->fieldCollector->needsScores) {
               auto* bulk = supplier->bulkScorer(poolGuard.pool());
               if (bulk != nullptr && bulk->supportsMatchWindows()) {
                 data->fieldCollector->setSegment(segnum, &seg.postingsReader());

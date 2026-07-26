@@ -1,0 +1,106 @@
+#pragma once
+
+#include <cstdlib>
+#include <cstring>
+#include <string_view>
+
+// Execution overrides for the search ops: env-driven bench knobs and A/B
+// baselines that let a test or a bench grid pin a strategy the selector would
+// otherwise choose on its own.
+//
+// These live in their own leaf header on purpose. The op classes (TopDocsReq,
+// StrFacetOp, ...) are heavy - each one transitively pulls the query, value and
+// column trees - and are meant to be included only where a request is actually
+// built. Tests that just want to flip a knob include this instead, and stay off
+// that chain. Keep this header leaf: no op, query or reader includes.
+
+namespace solux {
+
+// A/B baseline for measuring folded Boolean filters against the former passive
+// TopDocs domain path. Default false means folding is enabled.
+inline bool disableTopDocsFilterFold = false;
+
+// A/B baseline for unscored field-sort match-window collection.
+inline bool disableFieldSortBulk = false;
+
+// Test/bench control (SOLUX_FACET_COUNTER). AUTO uses the selector; the rest
+// force a specific representation so the grid can compare reps head to head and
+// measure the crossover thresholds. The FORCE_* modes reuse the selector's own
+// count strategies (they only override which rep is chosen); the SPAN_* modes
+// take the dedicated sparse fork.
+enum class FacetCounterMode {
+  AUTO, SPAN_GLOBAL, SPAN_LOCAL,
+  FORCE_VECTOR, FORCE_SKINNY, FORCE_HASH,
+  // Force the skinny rep AND its global-vs-local staging strategy, for measuring
+  // the staging crossover on a multi-segment index (moot at one segment).
+  SKINNY_GLOBAL, SKINNY_LOCAL
+};
+
+enum class StrFacetStrategy {
+  AUTO, TOP_TERMS, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
+};
+
+inline StrFacetStrategy parseStrFacetStrategyEnv() {
+  const char* e = std::getenv("SOLUX_FACET_STRATEGY");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "column") {
+      return StrFacetStrategy::COLUMN_DOMAIN;
+    }
+    if (s == "complement") {
+      return StrFacetStrategy::COLUMN_COMPLEMENT;
+    }
+    if (s == "term") {
+      return StrFacetStrategy::TERM_DRIVEN;
+    }
+  }
+  return StrFacetStrategy::AUTO;
+}
+
+// The SPAN_* modes drive the dedicated sparse fork; everything else runs the
+// ordinary selector path (with FORCE_* pinning its rep choice).
+inline bool isSparseForcedMode(FacetCounterMode m) {
+  return m == FacetCounterMode::SPAN_GLOBAL || m == FacetCounterMode::SPAN_LOCAL;
+}
+
+// FORCE_SKINNY (auto staging) and SKINNY_GLOBAL/SKINNY_LOCAL (forced staging)
+// all pin the skinny rep in the ordinary selector path.
+inline bool forcesSkinnyRep(FacetCounterMode m) {
+  return m == FacetCounterMode::FORCE_SKINNY
+      || m == FacetCounterMode::SKINNY_GLOBAL
+      || m == FacetCounterMode::SKINNY_LOCAL;
+}
+
+inline FacetCounterMode parseFacetCounterModeEnv() {
+  const char* e = std::getenv("SOLUX_FACET_COUNTER");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "span_global") {
+      return FacetCounterMode::SPAN_GLOBAL;
+    }
+    if (s == "span_local") {
+      return FacetCounterMode::SPAN_LOCAL;
+    }
+    if (s == "vector") {
+      return FacetCounterMode::FORCE_VECTOR;
+    }
+    if (s == "skinny") {
+      return FacetCounterMode::FORCE_SKINNY;
+    }
+    if (s == "hash") {
+      return FacetCounterMode::FORCE_HASH;
+    }
+    if (s == "skinny_global") {
+      return FacetCounterMode::SKINNY_GLOBAL;
+    }
+    if (s == "skinny_local") {
+      return FacetCounterMode::SKINNY_LOCAL;
+    }
+  }
+  return FacetCounterMode::AUTO;
+}
+
+inline FacetCounterMode forcedFacetCounterMode = parseFacetCounterModeEnv();
+inline StrFacetStrategy forcedStrFacetStrategy = parseStrFacetStrategyEnv();
+
+} // namespace solux

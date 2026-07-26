@@ -15,7 +15,8 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/reader/Postings.h"
 #include "solux/reader/SkipStats.h"
-#include "solux/search/ops/TopDocsReq.h"
+#include "solux/reader/DocsEnum.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;
@@ -27,11 +28,11 @@ class TopDocsFilterFoldGuard {
 
 public:
   explicit TopDocsFilterFoldGuard(bool disabled)
-    : saved(TopDocsReq::disableTopDocsFilterFoldForTests) {
-    TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+    : saved(disableTopDocsFilterFold) {
+    disableTopDocsFilterFold = disabled;
   }
   ~TopDocsFilterFoldGuard() {
-    TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+    disableTopDocsFilterFold = saved;
   }
 };
 

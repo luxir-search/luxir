@@ -9,88 +9,12 @@
 #include "FacetEmit.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
+#include "solux/search/SearchOverrides.h"
 #include "SpanCounter.h"
 #include "solux/util/SegmentMergeDriver.h"
 #include "solux/util/log.h"
 
 namespace solux {
-
-// Test/bench control (SOLUX_FACET_COUNTER). AUTO uses the selector; the rest
-// force a specific representation so the grid can compare reps head to head and
-// measure the crossover thresholds. The FORCE_* modes reuse the selector's own
-// count strategies (they only override which rep is chosen); the SPAN_* modes
-// take the dedicated sparse fork.
-enum class FacetCounterMode {
-  AUTO, SPAN_GLOBAL, SPAN_LOCAL,
-  FORCE_VECTOR, FORCE_SKINNY, FORCE_HASH,
-  // Force the skinny rep AND its global-vs-local staging strategy, for measuring
-  // the staging crossover on a multi-segment index (moot at one segment).
-  SKINNY_GLOBAL, SKINNY_LOCAL
-};
-
-enum class StrFacetStrategy {
-  AUTO, TOP_TERMS, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
-};
-
-inline StrFacetStrategy parseStrFacetStrategyEnv() {
-  const char* e = std::getenv("SOLUX_FACET_STRATEGY");
-  if (e != nullptr) {
-    std::string_view s(e);
-    if (s == "column") {
-      return StrFacetStrategy::COLUMN_DOMAIN;
-    }
-    if (s == "complement") {
-      return StrFacetStrategy::COLUMN_COMPLEMENT;
-    }
-    if (s == "term") {
-      return StrFacetStrategy::TERM_DRIVEN;
-    }
-  }
-  return StrFacetStrategy::AUTO;
-}
-
-// The SPAN_* modes drive the dedicated sparse fork; everything else runs the
-// ordinary selector path (with FORCE_* pinning its rep choice).
-inline bool isSparseForcedMode(FacetCounterMode m) {
-  return m == FacetCounterMode::SPAN_GLOBAL || m == FacetCounterMode::SPAN_LOCAL;
-}
-
-// FORCE_SKINNY (auto staging) and SKINNY_GLOBAL/SKINNY_LOCAL (forced staging)
-// all pin the skinny rep in the ordinary selector path.
-inline bool forcesSkinnyRep(FacetCounterMode m) {
-  return m == FacetCounterMode::FORCE_SKINNY
-      || m == FacetCounterMode::SKINNY_GLOBAL
-      || m == FacetCounterMode::SKINNY_LOCAL;
-}
-
-inline FacetCounterMode parseFacetCounterModeEnv() {
-  const char* e = std::getenv("SOLUX_FACET_COUNTER");
-  if (e != nullptr) {
-    std::string_view s(e);
-    if (s == "span_global") {
-      return FacetCounterMode::SPAN_GLOBAL;
-    }
-    if (s == "span_local") {
-      return FacetCounterMode::SPAN_LOCAL;
-    }
-    if (s == "vector") {
-      return FacetCounterMode::FORCE_VECTOR;
-    }
-    if (s == "skinny") {
-      return FacetCounterMode::FORCE_SKINNY;
-    }
-    if (s == "hash") {
-      return FacetCounterMode::FORCE_HASH;
-    }
-    if (s == "skinny_global") {
-      return FacetCounterMode::SKINNY_GLOBAL;
-    }
-    if (s == "skinny_local") {
-      return FacetCounterMode::SKINNY_LOCAL;
-    }
-  }
-  return FacetCounterMode::AUTO;
-}
 
 // How the domain will be walked, for the piece's human-readable detail.
 // ARRAY domains point-select ords. Bitset domains adapt for DOCID columns and
@@ -164,9 +88,6 @@ inline void collectSparseCounts(
 
 class StrFacetOp : public FieldFacetReq {
 public:
-  static inline FacetCounterMode forcedCounterMode = parseFacetCounterModeEnv();
-  static inline StrFacetStrategy forcedStrategy = parseStrFacetStrategyEnv();
-
   class MergeableStrData : public solux::MergeableData {
   public:
     using OrdHash = boost::unordered_flat_map<int64_t, int64_t>;
@@ -619,7 +540,7 @@ public:
         // clean A/B baseline.
         bool topTermsEligible =
             allowTopTerms
-            && StrFacetOp::forcedStrategy == StrFacetStrategy::AUTO
+            && forcedStrFacetStrategy == StrFacetStrategy::AUTO
             && thisOp().ordMap != nullptr
             && domainView.compCard == 0
             && thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
@@ -631,15 +552,15 @@ public:
         std::string forcedFallback;
         if (topTermsEligible) {
           strategy = StrFacetStrategy::TOP_TERMS;
-        } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_DOMAIN) {
+        } else if (forcedStrFacetStrategy == StrFacetStrategy::COLUMN_DOMAIN) {
           strategy = StrFacetStrategy::COLUMN_DOMAIN;
-        } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
+        } else if (forcedStrFacetStrategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
           if (termsAvailable) {
             strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
           } else {
             forcedFallback = "forced complement unavailable: no terms dictionary";
           }
-        } else if (StrFacetOp::forcedStrategy == StrFacetStrategy::TERM_DRIVEN) {
+        } else if (forcedStrFacetStrategy == StrFacetStrategy::TERM_DRIVEN) {
           if (termsAvailable) {
             strategy = StrFacetStrategy::TERM_DRIVEN;
           } else {
@@ -674,7 +595,7 @@ public:
           return;
         }
 
-        bool spanRep = isSparseForcedMode(StrFacetOp::forcedCounterMode);
+        bool spanRep = isSparseForcedMode(forcedFacetCounterMode);
         MergeableStrData::Rep rep;
         if (spanRep) {
           rep = MergeableStrData::Rep::Span;
@@ -685,11 +606,11 @@ public:
           // if unique values greatly outnumber domain docs, use a hashmap.
           bool wantHash = (globVals >> 6) >= domainSize;
           rep =
-              StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_VECTOR
+              forcedFacetCounterMode == FacetCounterMode::FORCE_VECTOR
                   ? MergeableStrData::Rep::Vector
-            : forcesSkinnyRep(StrFacetOp::forcedCounterMode)
+            : forcesSkinnyRep(forcedFacetCounterMode)
                   ? MergeableStrData::Rep::Skinny
-            : StrFacetOp::forcedCounterMode == FacetCounterMode::FORCE_HASH
+            : forcedFacetCounterMode == FacetCounterMode::FORCE_HASH
                   ? MergeableStrData::Rep::Hash
             : wantVec ? MergeableStrData::Rep::Vector
             : wantHash ? MergeableStrData::Rep::Hash
@@ -856,7 +777,7 @@ public:
         if (spanRep) {
           MergeableStrData::ensureRep(data, MergeableStrData::Rep::Span, globVals);
           assert(countSpan != nullptr);
-          if (StrFacetOp::forcedCounterMode == FacetCounterMode::SPAN_GLOBAL) {
+          if (forcedFacetCounterMode == FacetCounterMode::SPAN_GLOBAL) {
             facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int32_t localOrd) SOLUX_INLINE {
                 unused(docid);
@@ -925,7 +846,7 @@ public:
           // and enough repeats are expected to amortize. SKINNY_GLOBAL/LOCAL
           // force the strategy for measuring the crossover; AUTO uses the
           // repeats>2 heuristic (domainSize/nTerms > 2).
-          FacetCounterMode skinnyMode = StrFacetOp::forcedCounterMode;
+          FacetCounterMode skinnyMode = forcedFacetCounterMode;
           bool useLocal =
               skinnyMode == FacetCounterMode::SKINNY_GLOBAL ? false
             : skinnyMode == FacetCounterMode::SKINNY_LOCAL  ? (mapping.bits != 0)

@@ -8,7 +8,7 @@
 
 #include "solux/query/BooleanQuery.h"
 #include "solux/reader/SkipStats.h"
-#include "solux/search/ops/TopDocsReq.h"
+#include "solux/search/SearchOverrides.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -33,14 +33,14 @@ struct IdentityGuard {
 };
 
 struct FilterFoldGuard {
-  bool saved = TopDocsReq::disableTopDocsFilterFoldForTests;
+  bool saved = disableTopDocsFilterFold;
 
   explicit FilterFoldGuard(bool disabled) {
-    TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+    disableTopDocsFilterFold = disabled;
   }
 
   ~FilterFoldGuard() {
-    TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+    disableTopDocsFilterFold = saved;
   }
 };
 

@@ -13,7 +13,7 @@
 #include "solux/query/KnnQuery.h"
 #include "solux/query/VectorEngine.h"
 #include "solux/schema/Schema.h"
-#include "solux/search/ops/TopDocsReq.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -138,11 +138,11 @@ protected:
     bool saved;
 
     explicit TopDocsFilterFoldGuard(bool disabled)
-      : saved(TopDocsReq::disableTopDocsFilterFoldForTests) {
-      TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+      : saved(disableTopDocsFilterFold) {
+      disableTopDocsFilterFold = disabled;
     }
     ~TopDocsFilterFoldGuard() {
-      TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+      disableTopDocsFilterFold = saved;
     }
   };
 

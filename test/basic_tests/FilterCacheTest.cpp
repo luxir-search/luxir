@@ -42,7 +42,7 @@
 #include "solux/query/TermQuery.h"
 #include "solux/query/TermRangeQuery.h"
 #include "solux/search/FilterCache.h"
-#include "solux/search/ops/TopDocsReq.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/server/SoluxNode.h"
 #include "solux/store/Directory.h"
 #include "solux/util/DateTime.h"
@@ -233,11 +233,11 @@ struct FilterFoldGuard {
   bool previous;
 
   explicit FilterFoldGuard(bool disabled)
-    : previous(TopDocsReq::disableTopDocsFilterFoldForTests) {
-    TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+    : previous(disableTopDocsFilterFold) {
+    disableTopDocsFilterFold = disabled;
   }
   ~FilterFoldGuard() {
-    TopDocsReq::disableTopDocsFilterFoldForTests = previous;
+    disableTopDocsFilterFold = previous;
   }
 };
 
@@ -1672,9 +1672,9 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
   // crossover, so composition is observed through the op-level domain path,
   // which serves cached entries at any density.
   struct FoldGuard {
-    bool saved = TopDocsReq::disableTopDocsFilterFoldForTests;
-    FoldGuard() { TopDocsReq::disableTopDocsFilterFoldForTests = true; }
-    ~FoldGuard() { TopDocsReq::disableTopDocsFilterFoldForTests = saved; }
+    bool saved = disableTopDocsFilterFold;
+    FoldGuard() { disableTopDocsFilterFold = true; }
+    ~FoldGuard() { disableTopDocsFilterFold = saved; }
   } foldGuard;
   SoluxConfig config;
   config.filterCacheBytes = 4 * 1024 * 1024;
