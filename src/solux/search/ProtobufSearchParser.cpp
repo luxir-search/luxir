@@ -696,13 +696,27 @@ public:
       requestFlags |= Query::ALLOW_PRUNING;
     }
     auto* weight = query->createWeight(*qcontext, requestFlags);
+    Query::Weight* countWeight = nullptr;
+    Query::Weight* rankingWeight = nullptr;
+    bool exactCountTopK = limit > 0 && topDocsReq.get_number
+        && topDocsReq.ops.empty() && !parsedSorts.useFieldSort
+        && parsedSorts.rankNeedsScores;
+    if (!disableTopKCountComposition && exactCountTopK
+        && !weight->needsPrepare() && weight->canComposeExactCountTopK()) {
+      int32_t countFlags =
+          requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+      int32_t rankingFlags =
+          requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
+      countWeight = query->createWeight(*qcontext, countFlags);
+      rankingWeight = query->createWeight(*qcontext, rankingFlags);
+    }
     auto filterWeights = foldFilters
       ? std::span<Query::Weight*>{}
       : buildFilterWeights(filters, *qcontext, requestFlags);
 
     auto* qr = solux::arenaCreate<TopDocsReq>(
-      req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,
-      std::move(parsedSorts),
+      req.arena, req, name, topDocsReq, *qcontext, query, weight,
+      countWeight, rankingWeight, limit, std::move(parsedSorts),
       filters, filterWeights);
 
     if (firstQuery == nullptr) {

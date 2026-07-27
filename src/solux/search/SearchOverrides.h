@@ -23,6 +23,12 @@ inline bool disableTopDocsFilterFold = false;
 // A/B baseline for unscored field-sort match-window collection.
 inline bool disableFieldSortBulk = false;
 
+// A/B baseline for exact-count score ranking. The default composes an
+// unscored exact-count pass with a competitively pruned top-k pass when the
+// query and per-segment density policy admit it.
+inline bool disableTopKCountComposition =
+    std::getenv("SOLUX_DISABLE_TOPK_COUNT_COMPOSITION") != nullptr;
+
 // Test/bench control (SOLUX_FACET_COUNTER). AUTO uses the selector; the rest
 // force a specific representation so the grid can compare reps head to head and
 // measure the crossover thresholds. The FORCE_* modes reuse the selector's own

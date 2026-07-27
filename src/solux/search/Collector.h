@@ -630,7 +630,8 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 template <typename Collector>
 void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                          Collector& collector, MaxScoreAccumulator* accumulator,
-                         int32_t maxDoc, bool allowPruning = true) {
+                         int32_t maxDoc, bool allowPruning = true,
+                         BulkScorer* exactScorer = nullptr) {
   static_assert(requires(Collector& c) { c.minCompetitiveVal; },
                 "collectTopKWindowed is only for score top-k collectors");
 
@@ -654,9 +655,17 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
         : localTheta;
     int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc, theta);
 
+    if (exactScorer != nullptr && window.size > 0) {
+      assert(exactScorer->supportsExactCandidateScoring());
+      exactScorer->scoreCandidatesExact(
+          window.docs.first((size_t) window.size),
+          window.scores.first((size_t) window.size));
+    }
     for (int32_t i = 0; i < window.size; i++) {
+      int32_t doc = window.docs[(size_t) i];
+      float score = window.scores[(size_t) i];
       float oldMinCompetitiveVal = collector.minCompetitiveVal;
-      collector.collect(segnum, window.docs[(size_t) i], window.scores[(size_t) i]);
+      collector.collect(segnum, doc, score);
       if (accumulator != nullptr && collector.minCompetitiveVal > oldMinCompetitiveVal) {
         accumulator->accumulate(collector.minCompetitiveVal);
       }

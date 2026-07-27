@@ -139,6 +139,9 @@ struct SkipStats {
   static inline int64_t filteredDisjBatchDensityFallbacks = 0;
   static inline int64_t filteredDisjBatchNonDocSetFallbacks = 0;
   static inline int64_t filteredDisjBatchNonTermFallbacks = 0;
+  static inline int64_t exactCountTopKCompositions = 0;
+  static inline int64_t exactCountTopKProfitabilityRejects = 0;
+  static inline int64_t exactCountTopKBulkFallbacks = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t conjMatchFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
@@ -286,6 +289,9 @@ struct SkipStats {
     filteredDisjBatchDensityFallbacks = 0;
     filteredDisjBatchNonDocSetFallbacks = 0;
     filteredDisjBatchNonTermFallbacks = 0;
+    exactCountTopKCompositions = 0;
+    exactCountTopKProfitabilityRejects = 0;
+    exactCountTopKBulkFallbacks = 0;
     conjCountFallbacks = 0;
     conjMatchFallbacks = 0;
     bulkDomainWindowsFed = 0;

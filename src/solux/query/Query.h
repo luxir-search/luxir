@@ -70,6 +70,18 @@ public:
     return false;
   }
 
+  // True when scoreCandidatesExact can rescore an increasing batch of known
+  // matches in the exhaustive path's canonical accumulation order.
+  virtual bool supportsExactCandidateScoring() const {
+    return false;
+  }
+
+  virtual void scoreCandidatesExact(std::span<int32_t> docs,
+                                    std::span<float> scores) {
+    unused(docs, scores);
+    assert(false);
+  }
+
   // Attach a lazy, window-local filter to scored execution. The filter is
   // prepared by the bulk scorer only after it has selected the final
   // production-window bounds. Unsupported bulk scorers reject the attach.
@@ -669,6 +681,11 @@ public:
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
+    // The query shape can supply exact unscored count and competitively
+    // pruned score-ranking passes. Profitability remains a per-segment
+    // decision because a sparse filter can make pruning more expensive than
+    // one exhaustive scored pass.
+    static constexpr int32_t CAN_COMPOSE_EXACT_COUNT_TOPK = 1 << 4;
 
     /// Raw execution trait bitmask.
     int32_t getFlags() const noexcept { return traits; }
@@ -683,6 +700,10 @@ public:
 
     bool prefersPullForSparseArrayDomain() const noexcept {
       return (traits & PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN) != 0;
+    }
+
+    bool canComposeExactCountTopK() const noexcept {
+      return (traits & CAN_COMPOSE_EXACT_COUNT_TOPK) != 0;
     }
 
     /// True when every doc in the segment matches, so the domain is already

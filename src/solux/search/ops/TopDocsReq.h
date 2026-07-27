@@ -28,10 +28,25 @@ protected:
 public:
   class Calc;
 
+  // Exact COUNT + pruned TOP_100 over the 5M/301-union cohort crossed between
+  // glass (0.758%, 1.008 compose/exhaustive) and philadelphia (0.861%, 0.977).
+  // Require an estimated match-candidate cost of at least maxDoc/128
+  // (0.781%). The count supplier already caps a filtered conjunction by its
+  // cheapest required side, so the gate reflects either a sparse filter or a
+  // sparse union body.
+  static constexpr int32_t kExactCountTopKMinCandidateDensityInverse = 128;
+  // On the same cohort, composed/exhaustive was 0.68 at depth 10, 0.96 at
+  // depth 100, and 1.23 at depth 1000 after canonical survivor rescoring.
+  static constexpr int32_t kExactCountTopKMaxDepth = 100;
+  static inline int32_t exactCountTopKMinCandidateDensityInverseForTests =
+      kExactCountTopKMinCandidateDensityInverse;
+
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;
   Query* query;
   Query::Weight* weight;
+  Query::Weight* countWeight;
+  Query::Weight* rankingWeight;
   int64_t topCount; // maximum number of docs to return.
   std::span<std::pair<std::string_view, Query*>> filters;
   std::span<Query::Weight*> filterWeights;
@@ -150,6 +165,57 @@ public:
       auto* supplier = mainScorerSupplier(pool, seg);
       if (supplier == nullptr) return nullptr;
       return supplier->get(pool, std::numeric_limits<int64_t>::max());
+    }
+
+    bool admitExactCountTopK(Query::ScorerSupplier& countSupplier,
+                             DocSet* collectorFilter, int32_t maxDoc) {
+      if (thisOp().topCount > TopDocsReq::kExactCountTopKMaxDepth) {
+        return false;
+      }
+      int32_t densityInverse =
+          TopDocsReq::exactCountTopKMinCandidateDensityInverseForTests;
+      if (densityInverse <= 0) {
+        return false;
+      }
+      int64_t candidateCost = countSupplier.cost();
+      if (collectorFilter != nullptr) {
+        candidateCost = std::min<int64_t>(
+            candidateCost, collectorFilter->card());
+      }
+      return candidateCost >= std::max<int64_t>(
+          1, (int64_t) maxDoc / densityInverse);
+    }
+
+    void countThenCollectTopK(
+        MemPool& pool, int32_t segnum, BulkScorer* countBulk,
+        Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
+        DocSetBuilder* builder, TopDocsCollector& collector,
+        int32_t maxDoc, bool allowPruning,
+        BulkScorer* exactScorer = nullptr) {
+      int64_t count = countMatchesWindowed(
+          countBulk, collectorFilter, builder, maxDoc);
+      int64_t before = collector.totalHits();
+      if (rankingSupplier != nullptr) {
+        auto* rankingBulk = rankingSupplier->bulkScorer(pool);
+        if (rankingBulk != nullptr) {
+          collectTopKWindowed(
+              segnum, rankingBulk, collectorFilter, collector,
+              allowPruning ? &scoreAccumulator : nullptr,
+              maxDoc, allowPruning, exactScorer);
+        } else {
+          auto* rankingScorer = rankingSupplier->get(
+              pool, std::numeric_limits<int64_t>::max());
+          if (rankingScorer != nullptr) {
+            collectTopK(
+                segnum, rankingScorer, collectorFilter, nullptr,
+                collector, allowPruning,
+                allowPruning ? &scoreAccumulator : nullptr);
+          }
+        }
+      }
+      int64_t ranked = collector.totalHits() - before;
+      assert(count >= ranked);
+      collector.hitCount += count - ranked;
     }
 
     QueryPrep::MaterializedFilter buildEffectiveDomain(int32_t segnum) {
@@ -377,13 +443,51 @@ public:
             // doc-at-a-time heap disjunction by using per-clause window drives.
             bool allowPruning = op.weight->allowsPruning();
             BulkScorer* bulk = nullptr;
+            bool composedExactCountTopK = false;
+            if (builderPtr == nullptr
+                && data->scoreCollector->topCount > 0
+                && op.countWeight != nullptr && op.rankingWeight != nullptr) {
+              auto* countSupplier = op.countWeight->scorerSupplier(
+                  poolGuard.pool(), seg);
+              if (countSupplier != nullptr
+                  && admitExactCountTopK(
+                      *countSupplier, collectorFilter, seg.maxDoc())) {
+                auto* countBulk =
+                    countSupplier->bulkScorer(poolGuard.pool());
+                if (countBulk != nullptr) {
+                  auto* rankingSupplier = op.rankingWeight->scorerSupplier(
+                      poolGuard.pool(), seg);
+                  auto* exactScorer = supplier->bulkScorer(poolGuard.pool());
+                  if (exactScorer != nullptr
+                      && exactScorer->supportsExactCandidateScoring()) {
+                    countThenCollectTopK(
+                        poolGuard.pool(), segnum, countBulk, rankingSupplier,
+                        collectorFilter, nullptr, *data->scoreCollector,
+                        seg.maxDoc(), true, exactScorer);
+                    skipCount(SkipStats::exactCountTopKCompositions);
+                    composedExactCountTopK = true;
+                  } else {
+                    skipCount(SkipStats::exactCountTopKBulkFallbacks);
+                  }
+                } else {
+                  skipCount(SkipStats::exactCountTopKBulkFallbacks);
+                }
+              } else if (countSupplier != nullptr) {
+                skipCount(SkipStats::exactCountTopKProfitabilityRejects);
+              } else {
+                skipCount(SkipStats::exactCountTopKBulkFallbacks);
+              }
+            }
             bool useSparseConstantPull =
                 builderPtr != nullptr
                 && data->scoreCollector->topCount > 0
                 && op.weight->isConstantScoring()
                 && op.weight->prefersPullForSparseArrayDomain()
                 && supplier->cost() <= DocSetBuilder::arrayLimitFor(seg.maxDoc());
-            if (useSparseConstantPull) {
+            if (composedExactCountTopK) {
+              // countThenCollectTopK supplied both the exact hit count and
+              // competitively pruned ranking.
+            } else if (useSparseConstantPull) {
               auto* scorer = supplier->get(
                   poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {
@@ -417,31 +521,11 @@ public:
                 assert(count >= captured);
                 data->scoreCollector->hitCount += count - captured;
               } else if (builderPtr != nullptr) {
-                int64_t count = countMatchesWindowed(
-                    bulk, collectorFilter, builderPtr, seg.maxDoc());
-                int64_t before = data->scoreCollector->totalHits();
                 auto* rankingSupplier = mainScorerSupplier(poolGuard.pool(), seg);
-                if (rankingSupplier != nullptr) {
-                  auto* rankingBulk = rankingSupplier->bulkScorer(poolGuard.pool());
-                  if (rankingBulk != nullptr) {
-                    collectTopKWindowed(
-                        segnum, rankingBulk, collectorFilter, *data->scoreCollector,
-                        allowPruning ? &scoreAccumulator : nullptr,
-                        seg.maxDoc(), allowPruning);
-                  } else {
-                    auto* rankingScorer = rankingSupplier->get(
-                        poolGuard.pool(), std::numeric_limits<int64_t>::max());
-                    if (rankingScorer != nullptr) {
-                      collectTopK(
-                          segnum, rankingScorer, collectorFilter, nullptr,
-                          *data->scoreCollector, allowPruning,
-                          allowPruning ? &scoreAccumulator : nullptr);
-                    }
-                  }
-                }
-                int64_t after = data->scoreCollector->totalHits();
-                assert(count >= after - before);
-                data->scoreCollector->hitCount += count - (after - before);
+                countThenCollectTopK(
+                    poolGuard.pool(), segnum, bulk, rankingSupplier,
+                    collectorFilter, builderPtr, *data->scoreCollector,
+                    seg.maxDoc(), allowPruning);
               } else {
                 collectTopKWindowed(
                     segnum, bulk, collectorFilter, *data->scoreCollector,
@@ -518,12 +602,14 @@ public:
   // after construction succeeds, so a throwing arena ctor is safe now - the
   // parser split is parse-phase structure, not a nothrow requirement.)
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
-    Query::Context& qcontext, Query* query, Query::Weight* weight, int64_t topCount,
+    Query::Context& qcontext, Query* query, Query::Weight* weight,
+    Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
     SortPlan&& sortPlan,
     std::span<std::pair<std::string_view, Query*>> filters,
     std::span<Query::Weight*> filterWeights)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
-      weight(weight), topCount(topCount), filters(filters), filterWeights(filterWeights),
+      weight(weight), countWeight(countWeight), rankingWeight(rankingWeight),
+      topCount(topCount), filters(filters), filterWeights(filterWeights),
       sortPlan(std::move(sortPlan)) {
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());

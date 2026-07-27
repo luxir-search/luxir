@@ -1876,6 +1876,17 @@ public:
           && dynamic_cast<TermQuery*>(query.filter[0]) != nullptr) {
         traits |= PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN;
       }
+      bool directTermUnion = mandatoryClauses.empty()
+          && prohibitedClauses.empty() && optionalClauses.size() >= 2
+          && filterClauses.size() <= 1 && minShouldMatch == 1
+          && std::all_of(
+              optionalClauses.begin(), optionalClauses.end(),
+              [](Query* clause) {
+                return dynamic_cast<TermQuery*>(clause) != nullptr;
+              });
+      if (directTermUnion) {
+        traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
+      }
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
@@ -5865,6 +5876,30 @@ public:
 
     bool supportsMatchWindows() const override {
       return true;
+    }
+
+    bool supportsExactCandidateScoring() const override {
+      return true;
+    }
+
+    void scoreCandidatesExact(std::span<int32_t> docs,
+                              std::span<float> scores) override {
+      assert(docs.size() == scores.size());
+      assert(docs.size() <= outDocs.size());
+      std::fill(scores.begin(), scores.end(), 0.0f);
+      size_t words = (docs.size() + 63) >> 6;
+      std::fill(matchedWords.begin(),
+                matchedWords.begin() + (ptrdiff_t) words, 0);
+      auto matches = matchedWords.first(words);
+      for (auto* scorer : termScorers) {
+        scorer->addToCandidates(
+            docs.data(), scores.data(), (int32_t) docs.size(), matches);
+      }
+#ifndef NDEBUG
+      for (size_t i = 0; i < docs.size(); i++) {
+        assert((matches[i >> 6] & (1ULL << (i & 63))) != 0);
+      }
+#endif
     }
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter,

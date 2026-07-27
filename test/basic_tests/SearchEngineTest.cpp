@@ -76,6 +76,19 @@ public:
   }
 };
 
+class TopKCountCompositionGuard {
+  bool saved;
+
+public:
+  explicit TopKCountCompositionGuard(bool disabled)
+    : saved(disableTopKCountComposition) {
+    disableTopKCountComposition = disabled;
+  }
+  ~TopKCountCompositionGuard() {
+    disableTopKCountComposition = saved;
+  }
+};
+
 std::vector<std::string> resultIds(const LocalReq& req, std::string_view opName) {
   std::vector<std::string> out;
   const auto* docs = req.docList(opName);
@@ -1589,6 +1602,62 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
   EXPECT_EQ(0, routed.engagements);
   EXPECT_EQ(0, bodyBulk.engagements);
   EXPECT_LE(routed.phraseVerifies, 9);
+}
+
+TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
+  constexpr std::string_view collection = "exact_count_topk_composition";
+  constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    if ((doc & 1) == 0) body += "alpha ";
+    if ((doc % 3) != 0) body += "beta ";
+    body += "filler";
+    docs.push_back(flatdoc(
+        "id", "compose_" + std::to_string(doc),
+        "body_w", body,
+        "filter_w", (doc % 100) == 0 ? "selected" : "other"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t count;
+    int64_t compositions;
+  };
+  auto run = [&](bool disabled) {
+    TopKCountCompositionGuard compositionGuard(disabled);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().withStats()
+        .fields({"id"}).limit(100);
+    cur.rawQuery() = qb::boolean(cur.mr(), {},
+        {qb::match(cur.mr(), "body_w", "alpha"),
+         qb::match(cur.mr(), "body_w", "beta")});
+    cur.matchFilter("filter", "filter_w", "selected");
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{
+      resultIds(*req, "q"),
+      resultScoreMap(*req, "q"),
+      req->getMatchCount("q"),
+      SkipStats::exactCountTopKCompositions,
+    };
+  };
+
+  run(false);
+  run(false);
+  Result composed = run(false);
+  Result exhaustive = run(true);
+  EXPECT_EQ(exhaustive.count, composed.count);
+  EXPECT_EQ(exhaustive.ids, composed.ids);
+  EXPECT_EQ(exhaustive.scores, composed.scores);
+  EXPECT_GT(composed.compositions, 0);
+  EXPECT_EQ(0, exhaustive.compositions);
 }
 
 TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {
