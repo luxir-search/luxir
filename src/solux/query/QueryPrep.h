@@ -219,19 +219,17 @@ public:
   int32_t advance(int32_t docid) override {
     assert(doc < docid);  // strict Scorer contract; callers guard
     if (docs->type == DocSet::ARRAY) {
-      // Targets are monotonic for a Scorer. Consume the array cursor once
-      // rather than binary-searching the shrinking suffix for every rejected
-      // filter doc; a DocSet lead must remain O(cardinality) over its lifetime.
-      do {
-        arrIdx++;
-      } while (arrIdx < (int32_t) arrDocs.size()
-               && arrDocs[(size_t) arrIdx] < docid);
-      if (arrIdx >= (int32_t) arrDocs.size()) {
-        arrIdx = (int32_t)arrDocs.size();
-        doc = PostingsReader::END;
-      } else {
-        doc = arrDocs[(size_t) arrIdx];
-      }
+      // Targets are monotonic for a Scorer, so only the suffix past the cursor
+      // is live. Gallop adapts to the step size: a lead re-advancing past a
+      // rejected candidate pays one nearby probe, while a non-lead driven by a
+      // sparser clause pays O(log distance) instead of visiting every
+      // intervening member.
+      const int32_t* base = arrDocs.data();
+      const int32_t* found = screaming::gallopLowerBound(
+          base + arrIdx + 1, base + arrDocs.size(), docid);
+      arrIdx = (int32_t) (found - base);
+      doc = arrIdx < (int32_t) arrDocs.size() ? arrDocs[(size_t) arrIdx]
+                                              : PostingsReader::END;
       return doc;
     }
     return seekBitSet(docid);
@@ -259,15 +257,17 @@ public:
     assert(windowStart >= 0 && windowEnd >= windowStart && windowEnd <= maxDoc);
     if (windowEnd <= windowStart) return;
     if (docs->type == DocSet::ARRAY) {
-      auto begin = arrDocs.begin() + windowArrIdx;
-      auto it = std::lower_bound(begin, arrDocs.end(), windowStart);
-      while (it != arrDocs.end() && *it < windowEnd) {
+      const int32_t* base = arrDocs.data();
+      const int32_t* end = base + arrDocs.size();
+      const int32_t* it = screaming::gallopLowerBound(
+          base + windowArrIdx, end, windowStart);
+      while (it != end && *it < windowEnd) {
         int32_t relative = *it - windowStart;
         windowBits[(size_t) (relative >> 6)]
             |= 1ULL << (relative & 63);
         ++it;
       }
-      windowArrIdx = (int32_t) (it - arrDocs.begin());
+      windowArrIdx = (int32_t) (it - base);
       return;
     }
 
@@ -321,16 +321,18 @@ class DocSetBulkScorer final : public BulkScorer {
     skipCount(SkipStats::countBulkFillCalls);
     if (docs->type == DocSet::ARRAY) {
       // Windows arrive in nondecreasing order (BulkScorer contract), so
-      // resume from the cursor instead of searching the whole array per
-      // window.
-      auto it = std::lower_bound(arrDocs.begin() + sourceArrIdx,
-                                 arrDocs.end(), min);
-      while (it != arrDocs.end() && *it < end) {
+      // resume from the cursor; gallop covers the usual one-window step in
+      // a couple of probes.
+      const int32_t* base = arrDocs.data();
+      const int32_t* limit = base + arrDocs.size();
+      const int32_t* it = screaming::gallopLowerBound(
+          base + sourceArrIdx, limit, min);
+      while (it != limit && *it < end) {
         int32_t relative = *it - min;
         windowBits[(size_t) (relative >> 6)] |= 1ULL << (relative & 63);
         ++it;
       }
-      sourceArrIdx = (int32_t) (it - arrDocs.begin());
+      sourceArrIdx = (int32_t) (it - base);
       return;
     }
 
