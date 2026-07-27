@@ -23,6 +23,12 @@ private:
 
   int64_t reconstruct(const NumBlockInfo& info, uint64_t rankInBlock,
                       uint64_t residual) const {
+    // Constant blocks are the common case for unordered numeric data, and
+    // slopeTerm costs two multiplies that produce zero for them. The branch is
+    // per-block-shaped, so it predicts; decodeFrame splits the same way.
+    if (info.scaledSlope == 0) {
+      return (int64_t)(info.baseBits + info.gcd * residual);
+    }
     uint64_t slopeTerm = (uint64_t)NumColumnFormat::slopeTerm(
         rankInBlock, info.scaledSlope);
     return (int64_t)(info.baseBits +
