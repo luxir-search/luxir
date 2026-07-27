@@ -47,6 +47,13 @@ add_executable(protoc-gen-hpp "${HPP_PROTO_DIR}/src/protoc-plugin/hpp_gen.cpp")
 target_include_directories(protoc-gen-hpp PRIVATE "${HPP_PROTO_DIR}/include")
 target_link_libraries(protoc-gen-hpp PRIVATE is_utf8)
 target_compile_features(protoc-gen-hpp PRIVATE cxx_std_23)
+# This single TU is the head of the clean-build critical path: CMake gives every solux_lib
+# and solux_test object an order-only dependency on it (they link solux_proto_concrete,
+# whose sources it generates), so nothing else starts until it links. It is a build-time
+# tool we never debug and it runs in ~40ms, so drop debug info: -g0 takes it from ~14s to
+# ~11.5s. Same reasoning as is_utf8's -O3 above - the vendored build tool gets the flags
+# that suit it, not the tree's preset flags.
+target_compile_options(protoc-gen-hpp PRIVATE -g0)
 
 # hpp_proto_generate(
 #   OUT_VAR <var>            # set in parent scope to the list of generated headers

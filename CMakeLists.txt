@@ -182,7 +182,12 @@ set(CMAKE_JOB_POOL_COMPILE solux_compile)
 # Include protobuf/grpc generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
-file(GLOB_RECURSE Proj_SOURCES src/*.cpp src/*.h)
+# CONFIGURE_DEPENDS: re-glob on build so a newly added src .cpp is picked up without a manual
+# reconfigure. Without it a new file is silently missing from solux_lib in every build dir that
+# has not been reconfigured, and only surfaces as an undefined symbol at link time - which is
+# easy to miss when the preset you are iterating in happens to have been reconfigured already.
+# (test/CMakeLists.txt has had this for the same reason.)
+file(GLOB_RECURSE Proj_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
 add_library(solux_lib STATIC ${Proj_SOURCES})
