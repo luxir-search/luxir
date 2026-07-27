@@ -1532,6 +1532,65 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
   EXPECT_EQ(0, pullTop.scoreWindows);
 }
 
+TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
+  constexpr std::string_view collection = "cached_phrase_disjunction_pull";
+  constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = (doc % 3) == 0
+        ? "to be or not to be" : "to not be or to be";
+    if ((doc % 11) == 0) body += " hamlet";
+    docs.push_back(flatdoc(
+        "id", "phrase_pull_" + std::to_string(doc),
+        "body_w", body,
+        "filter_w", (doc % 1000) == 0 ? "selected" : "other"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t count;
+    int64_t engagements;
+    int64_t phraseVerifies;
+  };
+  auto run = [&](bool disabled) {
+    FilteredDisjunctionBatchGuard guard(disabled);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().withStats()
+        .fields({"id"}).limit(100);
+    cur.rawQuery() = qb::boolean(cur.mr(), {},
+        {qb::phraseWords(
+             cur.mr(), "body_w", {"to", "be", "or", "not", "to", "be"}),
+         qb::match(cur.mr(), "body_w", "hamlet")});
+    cur.matchFilter("filter", "filter_w", "selected");
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{
+      resultIds(*req, "q"),
+      resultScoreMap(*req, "q"),
+      req->getMatchCount("q"),
+      SkipStats::filteredDisjBatchEngagements,
+      SkipStats::phraseVerifies,
+    };
+  };
+
+  run(false);
+  run(false);
+  Result routed = run(false);
+  Result bodyBulk = run(true);
+  EXPECT_EQ(bodyBulk.count, routed.count);
+  EXPECT_EQ(bodyBulk.ids, routed.ids);
+  expectSameScoreMap(bodyBulk.scores, routed.scores);
+  EXPECT_EQ(0, routed.engagements);
+  EXPECT_EQ(0, bodyBulk.engagements);
+  EXPECT_LE(routed.phraseVerifies, 9);
+}
+
 TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {
   constexpr std::string_view collection = "unfiltered_count_clause_guard";
   CollectionHelper helper(collection);

@@ -1006,6 +1006,7 @@ public:
       int minShouldMatch;
       bool needsScores;
       bool allowsPruning;
+      bool twoPhaseDisjunctionPull = false;
     public:
       Supplier(MemPool& pool, IndexReader::Segment& segment,
                std::span<Query::SegmentSource* const> mandatorySources,
@@ -1384,6 +1385,10 @@ public:
           }
           auto* termScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
           if (termScorer == nullptr) {
+            if (scorer->hasTwoPhase()) {
+              twoPhaseDisjunctionPull = true;
+              return nullptr;
+            }
             skipCount(SkipStats::filteredDisjBatchNonTermFallbacks);
             return nullptr;
           }
@@ -1624,6 +1629,9 @@ public:
             && minShouldMatch == 1 && !allowsPruning && needsScores) {
           if (auto* bulk = docSetDisjunctionBulkScorer(targetPool)) {
             return bulk;
+          }
+          if (twoPhaseDisjunctionPull) {
+            return nullptr;
           }
         }
         // Filtered and negated counts use the windowed intersection when the
