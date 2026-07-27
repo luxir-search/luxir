@@ -376,10 +376,7 @@ void appendRepeatedTerm(std::string& body, std::string_view term, int32_t count)
   }
 }
 
-void addNegatedThetaDocs(CollectionHelper& helper, int32_t nDocs) {
-  helper.clear();
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
+void addNegatedThetaDocs(TestField& field, int32_t nDocs) {
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body;
     int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
@@ -390,10 +387,9 @@ void addNegatedThetaDocs(CollectionHelper& helper, int32_t nDocs) {
     if ((doc % 13) == 0) body += " rarebonus rarebonus";
     if ((doc % 7) == 0) body += " excludeone";
     if ((doc % 11) == 0) body += " excludetwo";
-    appendRepeatedTerm(body, "filler", 20 + (doc % 41));
-    docs.push_back(flatdoc("id", "n" + std::to_string(doc), "body_w", body));
+    appendRepeatedTerm(body, "filler", 4 + (doc % 3));
+    field.add(doc, body);
   }
-  helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
 QueryTopKRun runQueryTopK(IndexReader& reader, Query& query, int32_t topK,
@@ -456,17 +452,17 @@ void antiCorrelatedTfLen(int32_t postingOrd, int32_t& tf, int32_t& len) {
   int32_t block = postingOrd / Postings::DOCS_BLOCK_SIZE;
   int32_t local = postingOrd % Postings::DOCS_BLOCK_SIZE;
   if (block == 0) {
-    tf = 48 - (local % 11);
-    len = tf + 2 + (local % 3);
+    tf = 12 - (local % 3);
+    len = tf + 1 + (local % 2);
   } else if (local == 0) {
-    tf = 40 - std::min(block, 20);
-    len = 160 + std::min(block, 20) * 5;
+    tf = 10 - std::min(block, 5);
+    len = 24 + std::min(block, 5) * 2;
   } else if (local == 1) {
     tf = 1;
     len = 2;
   } else {
     tf = 1 + (local % 3 == 0 ? 1 : 0);
-    len = 48 + (local % 17);
+    len = 8 + (local % 5);
   }
   if (len < tf) {
     len = tf;
@@ -484,7 +480,7 @@ void addAntiCorrelatedFrontierDocs(TestField& f, int32_t postingCount) {
       appendRepeatedTerm(body, "frontier", tf);
       appendRepeatedTerm(body, "filler", len - tf);
     } else {
-      appendRepeatedTerm(body, "filler", 20 + (doc % 11));
+      appendRepeatedTerm(body, "filler", 3 + (doc % 3));
     }
     f.add(doc, body);
   }
@@ -694,12 +690,8 @@ std::vector<std::string> makeMtTermStrings(int32_t numTerms) {
   return terms;
 }
 
-void addDenseManyClauseDisjunctionDocs(CollectionHelper& helper, int32_t nDocs, int32_t numTerms) {
-  helper.clear();
+void addDenseManyClauseDisjunctionDocs(TestField& field, int32_t nDocs, int32_t numTerms) {
   std::vector<std::string> terms = makeMtTermStrings(numTerms);
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
-
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body;
     int32_t used = 0;
@@ -711,12 +703,10 @@ void addDenseManyClauseDisjunctionDocs(CollectionHelper& helper, int32_t nDocs, 
       appendRepeatedTerm(body, terms[(size_t) term], tf);
       used += tf;
     }
-    int32_t len = used + 24 + (doc % 37);
+    int32_t len = used + 4 + (doc % 3);
     appendRepeatedTerm(body, "filler", len - used);
-    docs.push_back(flatdoc("id", "bs1_" + std::to_string(doc), "body_w", body));
+    field.add(doc, body);
   }
-
-  helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
 std::unique_ptr<DocSet> makeEveryNthDocSet(int32_t maxDoc, int32_t step, bool arrayDocSet) {
@@ -1071,12 +1061,9 @@ std::vector<std::string> makeSweepTermStrings(int32_t numTerms) {
   return terms;
 }
 
-void addSweepDisjunctionDocs(CollectionHelper& helper, int32_t numTerms) {
+void addSweepDisjunctionDocs(TestField& field, int32_t numTerms) {
   const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 211;
   auto terms = makeSweepTermStrings(numTerms);
-  helper.clear();
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
 
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body;
@@ -1107,12 +1094,10 @@ void addSweepDisjunctionDocs(CollectionHelper& helper, int32_t numTerms) {
       }
     }
 
-    int32_t len = used + 18 + (doc % 19);
+    int32_t len = used + 4 + (doc % 3);
     add("sweep_filler", len - used);
-    docs.push_back(flatdoc("id", "sweep_" + std::to_string(doc), "body_w", body));
+    field.add(doc, body);
   }
-
-  helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
 std::vector<std::string> makeWindowDispatchTermStrings(int32_t numTerms) {
@@ -1124,11 +1109,8 @@ std::vector<std::string> makeWindowDispatchTermStrings(int32_t numTerms) {
   return terms;
 }
 
-void addWindowDispatchRandomDocs(CollectionHelper& helper, int32_t nDocs, int32_t numTerms) {
+void addWindowDispatchRandomDocs(TestField& field, int32_t nDocs, int32_t numTerms) {
   auto terms = makeWindowDispatchTermStrings(numTerms);
-  helper.clear();
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
   uint32_t state = 0x51ed1234U;
   auto nextRand = [&]() {
     state = state * 1664525U + 1013904223U;
@@ -1163,19 +1145,14 @@ void addWindowDispatchRandomDocs(CollectionHelper& helper, int32_t nDocs, int32_
         used += repeats;
       }
     }
-    int32_t len = used + 12 + (doc % 23);
+    int32_t len = used + 4 + (doc % 3);
     appendRepeatedTerm(body, "wd_pad", len - used);
-    docs.push_back(flatdoc("id", "wd_" + std::to_string(doc), "body_w", body));
+    field.add(doc, body);
   }
-
-  helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
-void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
+void addWindowDispatchBoundaryDocs(TestField& field) {
   const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 100;
-  helper.clear();
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body;
     int32_t used = 0;
@@ -1210,11 +1187,10 @@ void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
     if ((doc % 2) == 0) add("wd_dead_dense_a");
     if ((doc % 3) == 0) add("wd_dead_dense_b");
 
-    int32_t len = used + 20 + (doc % 17);
+    int32_t len = used + 4 + (doc % 3);
     appendRepeatedTerm(body, "wd_boundary_pad", len - used);
-    docs.push_back(flatdoc("id", "wd_boundary_" + std::to_string(doc), "body_w", body));
+    field.add(doc, body);
   }
-  helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
 std::vector<int32_t> makeContiguousProbeBlock(int32_t docBase) {
@@ -3132,7 +3108,7 @@ TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
       appendRepeatedTerm(body, terms[(size_t) t], tf);
       used += tf;
     }
-    int32_t len = used + 20 + (int32_t) (state % 80);
+    int32_t len = used + (int32_t) (state % 8);
     appendRepeatedTerm(body, "filler", len - used);
     f.add(doc, body);
   }
@@ -3273,34 +3249,45 @@ TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
 }
 
 TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
-  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 113;
-  CollectionHelper helper("max_score_setup_group_bounds");
-  addDenseManyClauseDisjunctionDocs(helper, nDocs, 8);
-  auto reader = helper.getIndexWriter()->getIndexReader();
-
-  bool savedStats = SkipStats::enabled;
-  SkipStats::enabled = true;
-  SkipStats::reset();
-  {
-    MemPool pool;
-    Query::Context qContext(pool, *reader);
-    std::vector<std::string> terms;
-    std::vector<TermQuery> queries;
-    std::vector<Query*> optional;
-    auto* weight = createDenseDisjunctionWeight(qContext, 8, terms, queries, optional);
-    auto& segment = qContext.topReader.segments()[0];
-    auto* supplier = weight->scorerSupplier(pool, segment);
-    ASSERT_NE(supplier, nullptr);
-    auto* bulk = supplier->bulkScorer(pool);
-    ASSERT_NE(bulk, nullptr);
-    ScoreWindow out;
-    ASSERT_NE(bulk->scoreNextWindow(out, nullptr, 0, segment.maxDoc(),
-                                    std::numeric_limits<float>::lowest()),
-              PostingsReader::END);
+  // Each term has one full L1 group plus a tail posting, so setup bounds
+  // the first window with a non-tail group range.
+  const int32_t nDocs = DocsEnumMeta::L1_DOCS + 1;
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    field.add(doc, "mt0 mt1");
   }
+  testIndex.flush();
+  field.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  SkipStatsGuard stats;
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery shapeQuery("body_w", "mt0");
+  auto* shapeScorer = dynamic_cast<TermQuery::Scorer*>(
+      shapeQuery.createWeight(qContext, Query::NEED_SCORES)
+          ->createScorer(testIndex.pool, segment));
+  ASSERT_NE(shapeScorer, nullptr);
+  ASSERT_EQ(shapeScorer->impacts.numGroups(), 2);
+
+  std::vector<std::string> terms;
+  std::vector<TermQuery> queries;
+  std::vector<Query*> optional;
+  auto* weight = createDenseDisjunctionWeight(qContext, 2, terms, queries, optional);
+  auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(
+      supplier->bulkScorer(testIndex.pool));
+  ASSERT_NE(bulk, nullptr);
+  ScoreWindow out;
+  ASSERT_NE(bulk->scoreNextWindow(out, nullptr, 0, segment.maxDoc(),
+                                  std::numeric_limits<float>::lowest()),
+            PostingsReader::END);
+
   EXPECT_GT(SkipStats::impactGroupBoundNoL0, 0);
   EXPECT_EQ(SkipStats::impactL0GroupParses, 0);
-  SkipStats::enabled = savedStats;
 }
 
 TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
@@ -3310,11 +3297,7 @@ TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
   TestField f(testIndex, "body_w");
   f.startIndexing();
   for (int32_t doc = 0; doc < nDocs; doc++) {
-    std::string body;
-    int32_t tf = doc < 16 ? 80 - (doc % 5) : 1 + (doc % 3);
-    appendRepeatedTerm(body, "dense_header", tf);
-    appendRepeatedTerm(body, "filler", doc < 16 ? 3 : 40 + (doc % 17));
-    f.add(doc, body);
+    f.add(doc, "dense_header filler");
   }
   testIndex.flush();
   f.startReading();
@@ -3354,7 +3337,7 @@ TEST_F(TermScorerTest, lazySetupAndMainShallowCursorsCanInterleaveNonMonotone) {
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body;
     appendRepeatedTerm(body, "interleave", 1 + (doc % 5));
-    appendRepeatedTerm(body, "filler", 20 + (doc % 13));
+    appendRepeatedTerm(body, "filler", 4 + (doc % 3));
     f.add(doc, body);
   }
   testIndex.flush();
@@ -3432,15 +3415,15 @@ TEST_F(TermScorerTest, mandOptSingleOptionalSparseAndDenseTopKMatchesExhaustive)
     f.startIndexing();
     for (int32_t doc = 0; doc < nDocs; doc++) {
       bool hot = doc < 24;
-      int32_t reqTf = hot ? 80 - (doc % 7) : 1;
-      int32_t len = hot ? reqTf + 3 : 96 + (doc % 29);
+      int32_t reqTf = hot ? 8 - (doc % 3) : 1;
+      int32_t len = hot ? reqTf + 2 : 8 + (doc % 3);
       std::string body;
       int32_t used = 0;
       appendRepeatedTerm(body, "mand_req", reqTf);
       used += reqTf;
       bool hasOpt = denseOpt || (doc % 257) == 17;
       if (hasOpt) {
-        int32_t optTf = denseOpt ? 1 : 120;
+        int32_t optTf = denseOpt ? 1 : 12;
         appendRepeatedTerm(body, denseOpt ? "mand_opt_dense" : "mand_opt_sparse", optTf);
         used += optTf;
       }
@@ -3543,10 +3526,10 @@ TEST_F(TermScorerTest, mandOptConjunctionTransitionReturnsIntersectionUntilOptio
     appendRepeatedTerm(body, "conj_req", 1);
     used++;
     if (std::find(optDocs.begin(), optDocs.end(), doc) != optDocs.end()) {
-      appendRepeatedTerm(body, "conj_opt", 120);
-      used += 120;
+      appendRepeatedTerm(body, "conj_opt", 12);
+      used += 12;
     }
-    appendRepeatedTerm(body, "filler", std::max(1, 80 - used));
+    appendRepeatedTerm(body, "filler", std::max(1, 8 - used));
     f.add(doc, body);
   }
   testIndex.flush();
@@ -3589,9 +3572,9 @@ TEST_F(TermScorerTest, mandOptThresholdRiseReclassifiesCurrentWindow) {
     std::string body;
     appendRepeatedTerm(body, "rise_req", 1);
     if ((doc % 200) == 17) {
-      appendRepeatedTerm(body, "rise_opt", 80);
+      appendRepeatedTerm(body, "rise_opt", 8);
     }
-    appendRepeatedTerm(body, "filler", 80);
+    appendRepeatedTerm(body, "filler", 8);
     f.add(doc, body);
   }
   testIndex.flush();
@@ -3674,7 +3657,7 @@ TEST_F(TermScorerTest, mandOptFilterRequiredPushesThetaToRequiredOptional) {
       body += "alpha beta";
     } else {
       body += "alpha beta ";
-      appendRepeatedTerm(body, "filler", 2000 + (doc % 23));
+      appendRepeatedTerm(body, "filler", 20 + (doc % 3));
     }
     f.add(doc, body);
   }
@@ -3813,12 +3796,11 @@ TEST_F(TermScorerTest, mandOptTwoPhaseOptionalScoresOnlyConfirmedMatches) {
 }
 
 TEST_F(TermScorerTest, mandOptBulkMatchesPullAcrossClauseCountsFiltersAndDeletes) {
-  CollectionHelper helper("main");
   const int32_t segDocs = DocsEnumMeta::L1_DOCS + 257;
-  std::vector<std::string> deleteIds;
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
   for (int32_t seg = 0; seg < 3; seg++) {
-    std::vector<Doc> docs;
-    docs.reserve((size_t) segDocs);
+    field.startIndexing();
     for (int32_t local = 0; local < segDocs; local++) {
       int32_t doc = seg * segDocs + local;
       std::string body;
@@ -3828,16 +3810,16 @@ TEST_F(TermScorerTest, mandOptBulkMatchesPullAcrossClauseCountsFiltersAndDeletes
       if ((doc % 10) == 0) appendRepeatedTerm(body, "mob_opt_b", 9);
       if (seg < 2 && (local % 257) == 17) appendRepeatedTerm(body, "mob_opt_c", 25);
       if (seg == 0 && (local % 31) == 3) appendRepeatedTerm(body, "mob_opt_d", 17);
-      appendRepeatedTerm(body, "mob_filler", 12 + (doc % 19));
-      docs.push_back(flatdoc("id", "mob_" + std::to_string(doc), "body_w", body));
+      appendRepeatedTerm(body, "mob_filler", 4 + (doc % 3));
+      field.add(local, body);
       if ((doc % 29) == 11) {
-        deleteIds.push_back("mob_" + std::to_string(doc));
+        testIndex.deleteDoc(local);
       }
     }
-    helper.indexAll(docs, UpdateMessage::COMMIT);
+    testIndex.flush();
   }
-  helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   TermQuery mandDense("body_w", "mob_mand_dense");
   TermQuery mandSparse("body_w", "mob_mand_sparse");
@@ -3977,10 +3959,10 @@ TEST_F(TermScorerTest, mandOptBulkHybridEngagesForDenseMandSparseOptHighTheta) {
     std::string body;
     appendRepeatedTerm(body, "hyb_mand", 1);
     if ((doc % 257) == 17) {
-      appendRepeatedTerm(body, "hyb_opt", 60);
+      appendRepeatedTerm(body, "hyb_opt", 8);
       optDocs.push_back(doc);
     }
-    appendRepeatedTerm(body, "hyb_filler", 80 + (doc % 7));
+    appendRepeatedTerm(body, "hyb_filler", 6 + (doc % 3));
     f.add(doc, body);
   }
   testIndex.flush();
@@ -5174,7 +5156,7 @@ TEST_F(TermScorerTest, blockMaxConjunctionTopKMatchesExhaustive) {
       for (int32_t i = 0; i < 4 + (doc % 5); i++) text += "pad ";
     } else {
       text = "cja cjb ";
-      for (int32_t i = 0; i < 250 + (doc % 37); i++) text += "pad ";
+      for (int32_t i = 0; i < 25 + (doc % 5); i++) text += "pad ";
     }
     f.add(doc, text);
   }
@@ -5255,9 +5237,13 @@ TEST_F(TermScorerTest, conjunctionFailedEvalBackoffEngages) {
 
 TEST_F(TermScorerTest, negatedTopKMatchesExhaustiveAtBothDepths) {
   const int32_t nDocs = 18 * Postings::DOCS_BLOCK_SIZE + 37;
-  CollectionHelper helper("negated_topk_oracle");
-  addNegatedThetaDocs(helper, nDocs);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addNegatedThetaDocs(field, nDocs);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   TermQuery mand("body_w", "mand");
   TermQuery excludeOne("body_w", "excludeone");
@@ -5277,14 +5263,17 @@ TEST_F(TermScorerTest, negatedTopKMatchesExhaustiveAtBothDepths) {
       EXPECT_LT(actual.visited, expected.visited);
     }
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, negatedBoundsComposeThroughNestedScorers) {
   const int32_t nDocs = 16 * Postings::DOCS_BLOCK_SIZE + 29;
-  CollectionHelper helper("negated_nested_oracles");
-  addNegatedThetaDocs(helper, nDocs);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addNegatedThetaDocs(field, nDocs);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   TermQuery mand("body_w", "mand");
   TermQuery join("body_w", "join");
@@ -5317,14 +5306,17 @@ TEST_F(TermScorerTest, negatedBoundsComposeThroughNestedScorers) {
       assertQueryTopKExact(expected, actual);
     }
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, negatedOptionalChildComposesWithWindowedAndGlobalMaxScore) {
   const int32_t nDocs = 18 * Postings::DOCS_BLOCK_SIZE + 41;
-  CollectionHelper helper("negated_maxscore_oracles");
-  addNegatedThetaDocs(helper, nDocs);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addNegatedThetaDocs(field, nDocs);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   TermQuery mand("body_w", "mand");
   TermQuery excludeOne("body_w", "excludeone");
@@ -5353,14 +5345,17 @@ TEST_F(TermScorerTest, negatedOptionalChildComposesWithWindowedAndGlobalMaxScore
       *reader, optional, 10, 256, true, ahead);
   assertTopKEquivalent(positionedExpected.topDocs, positionedWindowed.topDocs);
   EXPECT_EQ(SkipStats::maxScoreSetupFallbackBlockBounds, 0);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, termCompetitiveCertificatesTrackThetaAndBlockTransitions) {
   const int32_t nDocs = DocsEnumMeta::L1_DOCS + 2 * Postings::DOCS_BLOCK_SIZE + 17;
-  CollectionHelper helper("term_competitive_certificate");
-  addNegatedThetaDocs(helper, nDocs);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addNegatedThetaDocs(field, nDocs);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   {
     MemPool pool;
@@ -5471,8 +5466,6 @@ TEST_F(TermScorerTest, termCompetitiveCertificatesTrackThetaAndBlockTransitions)
         (nDocs + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
     EXPECT_EQ(SkipStats::impactCompetitiveColdLookups, impactBlocks);
   }
-
-  helper.clear();
 }
 
 // The bulk conjunction path must produce the same top-k as the pull
@@ -5499,7 +5492,7 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
     } else {
       if (hasA) text += "bca ";
       if (hasB) text += "bcb ";
-      for (int32_t i = 0; i < 250 + (doc % 37); i++) text += "pad ";
+      for (int32_t i = 0; i < 25 + (doc % 5); i++) text += "pad ";
     }
     if (hasA && hasB) bothCount++;
     f.add(doc, text);
@@ -5952,11 +5945,7 @@ TEST_F(TermScorerTest, conjunctionDenseScoredLatchBackResumesExactScoring) {
   TestField f(testIndex, "body_w");
   f.startIndexing();
   for (int32_t doc = 0; doc < N; doc++) {
-    std::string body;
-    appendRepeatedTerm(body, "latch_a", 1 + (doc % 5));
-    appendRepeatedTerm(body, "latch_b", 1 + ((doc / 7) % 4));
-    appendRepeatedTerm(body, "filler", 1 + (doc % 3));
-    f.add(doc, body);
+    f.add(doc, "latch_a latch_b filler");
   }
   testIndex.flush();
   f.startReading();
@@ -6483,16 +6472,19 @@ TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
 }
 
 TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
-  CollectionHelper helper("main");
   const int32_t numTerms = 32;
   const int32_t nDocs =
       (int32_t)scaleTestWork(1) * DocsEnumMeta::L1_DOCS + 37;
   const int32_t filterStep = 512;
-  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
+  testIndex.flush();
+  field.startReading();
 
   MemPool pool;
-  Query::Context qContext(pool, *reader);
+  Query::Context qContext(pool, *testIndex.reader);
   auto& segment = qContext.topReader.segments()[0];
   std::vector<std::string> termStrings = makeMtTermStrings(numTerms);
   std::vector<std::string_view> termViews;
@@ -7201,10 +7193,12 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
 }
 
 TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
-  CollectionHelper helper("filtered_union_wand");
   const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
+  TestIndex testIndex;
+  TestField bodyField(testIndex, "body_w");
+  TestField rangeField(testIndex, "wand_filter_i");
+  bodyField.startIndexing();
+  rangeField.startIndexing();
   int32_t filterCount = 0;
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body = "wand_common";
@@ -7219,17 +7213,13 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
         appendRepeatedTerm(body, "wand_peak_b", 2 + filterOrd % 9);
       }
     }
-    appendRepeatedTerm(body, "wand_pad", 12 + doc % 37);
-    if (matchesFilter) {
-      docs.push_back(flatdoc("id", "wand_" + std::to_string(doc),
-                             "body_w", body, "wand_filter_i", (int64_t)1));
-    } else {
-      docs.push_back(flatdoc("id", "wand_" + std::to_string(doc),
-                             "body_w", body));
-    }
+    appendRepeatedTerm(body, "wand_pad", 4 + doc % 3);
+    bodyField.add(doc, body);
+    if (matchesFilter) rangeField.add(doc, 1);
   }
-  helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  testIndex.flush();
+  testIndex.initReader();
+  auto reader = testIndex.reader;
   ASSERT_EQ(reader->maxDoc(), nDocs);
   ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
   ASSERT_LT(filterCount,
@@ -7295,20 +7285,20 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
 }
 
 TEST_F(TermScorerTest, FilteredConjunctionClampsSparseProductionWindows) {
-  CollectionHelper helper("main");
   const int32_t nDocs = 4 * DocsEnumMeta::L1_DOCS + 37;
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
   for (int32_t doc = 0; doc < nDocs; doc++) {
     std::string body = "pad";
     if ((doc % 2) == 0) body += " keep";
     if ((doc % 3) == 0) body += " body_a";
     if ((doc % 5) == 0) body += " body_b";
-    docs.push_back(flatdoc("id", "wide_" + std::to_string(doc),
-                           "body_w", body));
+    field.add(doc, body);
   }
-  helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   TermQuery bodyA("body_w", "body_a");
   TermQuery bodyB("body_w", "body_b");
@@ -7524,10 +7514,14 @@ TEST_F(TermScorerTest, CompetitiveScoreThresholdSeededMatchesReference) {
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes) {
-  CollectionHelper helper("main");
   const int32_t maxClauses = 6;
-  addSweepDisjunctionDocs(helper, maxClauses);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addSweepDisjunctionDocs(field, maxClauses);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
   auto termStrings = makeSweepTermStrings(maxClauses);
   auto views = termViews(termStrings);
 
@@ -7562,9 +7556,13 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerCostAwareOrderIsGuardedAndExact) {
-  CollectionHelper helper("maxscore_cost_order");
-  addSweepDisjunctionDocs(helper, 4);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addSweepDisjunctionDocs(field, 4);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
 
   std::vector<TermQuery> queries;
   queries.emplace_back("body_w", "sweep0", 8.0f);
@@ -7586,19 +7584,20 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerCostAwareOrderIsGuardedAndExact) {
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRandomizedUnions) {
   for (bool tinySegment : {true, false}) {
-    CollectionHelper helper(tinySegment ? "window_dispatch_random_tiny"
-                                        : "window_dispatch_random_large");
     const int32_t maxClauses = 8;
     int32_t nDocs = tinySegment ? 997 : 2 * DocsEnumMeta::L1_DOCS + 333;
-    addWindowDispatchRandomDocs(helper, nDocs, maxClauses);
+    TestIndex testIndex;
+    TestField field(testIndex, "body_w");
+    field.startIndexing();
+    addWindowDispatchRandomDocs(field, nDocs, maxClauses);
     if (!tinySegment) {
-      std::vector<std::string> deleteIds;
       for (int32_t doc = 5; doc < nDocs; doc += 13) {
-        deleteIds.push_back("wd_" + std::to_string(doc));
+        testIndex.deleteDoc(doc);
       }
-      helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
     }
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    testIndex.flush();
+    field.startReading();
+    auto reader = testIndex.reader;
     auto termStrings = makeWindowDispatchTermStrings(maxClauses);
     auto views = termViews(termStrings);
     bool liveOnly = !tinySegment;
@@ -7641,14 +7640,17 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRand
             << "tiny=" << tinySegment << " clauses=" << clauses << " mode=" << mode;
       }
     }
-    helper.clear();
   }
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryBehavior) {
-  CollectionHelper helper("window_dispatch_boundary");
-  addWindowDispatchBoundaryDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addWindowDispatchBoundaryDocs(field);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
   const int32_t maxDoc = 3 * DocsEnumMeta::L1_DOCS + 100;
 
   auto assertParity = [&](std::span<const std::string_view> terms,
@@ -7821,14 +7823,17 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryBehavior) {
     }
   }
 
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisingTheta) {
-  CollectionHelper helper("partition_latch_oracle");
   const int32_t maxClauses = 8;
-  addSweepDisjunctionDocs(helper, maxClauses);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addSweepDisjunctionDocs(field, maxClauses);
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
   auto termStrings = makeSweepTermStrings(maxClauses);
   auto views = termViews(termStrings);
 
@@ -7846,8 +7851,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisi
       assertSameTopKDocs(exhaustive, enabled, clauses + 3);
     }
   }
-
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, ScoredWordProbeApplyToCandidatesMatchesPerDocAdvanceAcrossBlockShapes) {
@@ -8185,15 +8188,17 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClaus
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
-  CollectionHelper helper("main");
   const int32_t clauses = 5;
-  addSweepDisjunctionDocs(helper, clauses);
-  std::vector<std::string> deleteIds;
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addSweepDisjunctionDocs(field, clauses);
   for (int32_t doc = 0; doc < 3 * DocsEnumMeta::L1_DOCS + 211; doc += 13) {
-    deleteIds.push_back("sweep_" + std::to_string(doc));
+    testIndex.deleteDoc(doc);
   }
-  helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
   auto termStrings = makeSweepTermStrings(clauses);
   auto views = termViews(termStrings);
   std::span<const std::string_view> terms(views.data(), views.size());
@@ -8211,31 +8216,37 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
-  CollectionHelper helper("main");
   const int32_t numTerms = 32;
   const int32_t nDocs = 12 * Postings::DOCS_BLOCK_SIZE + 37;
   const int32_t topK = 100;
-  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
+  testIndex.flush();
+  field.startReading();
 
-  auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK);
+  auto pull = runDenseFilteredPullTopK(*testIndex.reader, numTerms, topK);
   BulkDomainDriveGuard guard(true);
-  auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK);
+  auto bulk = runDenseFilteredBulkTopK(*testIndex.reader, numTerms, topK);
   ASSERT_GT(bulk.bs1Windows, 0);
   assertSameTopKDocs(pull, bulk, topK);
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
-  CollectionHelper helper("main");
   const int32_t numTerms = 32;
   const int32_t nDocs = 12 * Postings::DOCS_BLOCK_SIZE + 37;
-  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
+  testIndex.flush();
+  field.startReading();
 
   float partialThreshold = 0.0f;
   {
     MemPool pool;
-    Query::Context qContext(pool, *reader);
+    Query::Context qContext(pool, *testIndex.reader);
     std::vector<std::string> terms;
     std::vector<TermQuery> queries;
     std::vector<Query*> optional;
@@ -8257,7 +8268,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
 
   {
     MemPool pool;
-    Query::Context qContext(pool, *reader);
+    Query::Context qContext(pool, *testIndex.reader);
     std::vector<std::string> terms;
     std::vector<TermQuery> queries;
     std::vector<Query*> optional;
@@ -8276,23 +8287,29 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
-  CollectionHelper helper("main");
   const int32_t numTerms = 32;
   const int32_t fullGroups = 1 + (int32_t)scaleTestWork(1);
   const int32_t nDocs = fullGroups * DocsEnumMeta::L1_DOCS + 37;
   const int32_t topK = 50;
   const int32_t filterStep = 512;
-  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
+  testIndex.flush();
+  field.startReading();
 
   for (bool arrayDocSet : {false, true}) {
-    auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK, filterStep, arrayDocSet);
+    auto pull = runDenseFilteredPullTopK(
+        *testIndex.reader, numTerms, topK, filterStep, arrayDocSet);
     DisjunctionTopKRun stream;
     {
       BulkDomainDriveGuard guard(true);
-      stream = runDenseFilteredBulkTopK(*reader, numTerms, topK, filterStep, arrayDocSet);
+      stream = runDenseFilteredBulkTopK(
+          *testIndex.reader, numTerms, topK, filterStep, arrayDocSet);
     }
-    auto drive = runDenseFilteredBulkTopK(*reader, numTerms, topK, filterStep, arrayDocSet);
+    auto drive = runDenseFilteredBulkTopK(
+        *testIndex.reader, numTerms, topK, filterStep, arrayDocSet);
 
     ASSERT_GT(drive.domainDriveWindows, 1) << "arrayDocSet=" << arrayDocSet;
     assertSameTopKDocs(stream, drive, topK);
@@ -8301,22 +8318,23 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
-  CollectionHelper helper("main");
   const int32_t numTerms = 16;
   const int32_t nDocs =
       (int32_t)scaleTestWork(2) * DocsEnumMeta::L1_DOCS + 53;
   const int32_t topK = 75;
-  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
-  std::vector<std::string> deleteIds;
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
   for (int32_t doc = 0; doc < nDocs; doc += 11) {
-    deleteIds.push_back("bs1_" + std::to_string(doc));
+    testIndex.deleteDoc(doc);
   }
-  helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  testIndex.flush();
+  field.startReading();
 
-  auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK, 3, false);
+  auto pull = runDenseFilteredPullTopK(*testIndex.reader, numTerms, topK, 3, false);
   BulkDomainDriveGuard guard(true);
-  auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK, 3, false);
+  auto bulk = runDenseFilteredBulkTopK(*testIndex.reader, numTerms, topK, 3, false);
   assertSameTopKDocs(pull, bulk, topK);
 }
 
