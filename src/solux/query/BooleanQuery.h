@@ -3835,6 +3835,11 @@ public:
         return index == 0 ? scorers[0]->docId()
                           : termScorers[index]->docsEnum.docId();
       } else {
+        // Mirror scorerCountAdvance: term clauses in a mixed shape answer
+        // from the docs-only enum directly.
+        if (termScorers[index] != nullptr) {
+          return termScorers[index]->docsEnum.docId();
+        }
         return scorers[index]->docId();
       }
     }

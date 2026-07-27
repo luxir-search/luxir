@@ -181,7 +181,12 @@ inline std::span<Query::ScorerSupplier*> collectSuppliers(MemPool& targetPool,
   return {suppliers, sources.size()};
 }
 
-class DocSetScorer final : public Query::Scorer {
+// ConstantScorer(0) base: exact zero score, max-score, and score bounds in
+// one place, so any formation's bound math can trust this clause regardless
+// of how it entered the plan. The base's min-competitive exhaust hint stays
+// at its no-op default: a filter clause scores nothing, but its membership
+// still gates the conjunction, so it must never self-exhaust.
+class DocSetScorer final : public Query::ConstantScorer {
   DocSet* docs;
   int32_t maxDoc;
   int32_t doc = -1;
@@ -200,7 +205,8 @@ class DocSetScorer final : public Query::Scorer {
   }
 
 public:
-  DocSetScorer(DocSet* docs, int32_t maxDoc) : docs(docs), maxDoc(maxDoc) {
+  DocSetScorer(DocSet* docs, int32_t maxDoc)
+      : ConstantScorer(0.0f), docs(docs), maxDoc(maxDoc) {
     if (docs->type == DocSet::ARRAY) {
       arrDocs = ((ArrDocSet*)docs)->docs();
     }
@@ -236,16 +242,6 @@ public:
   }
 
   int32_t docId() override { return doc; }
-
-  float score() override { return 0.0f; }
-
-  // Exact zero bounds: any formation's bound math can trust this clause
-  // regardless of how it entered the plan.
-  float getMaxScore(int32_t upTo) override { return 0.0f; }
-
-  int32_t advanceShallow(int32_t target) override {
-    return PostingsReader::END;
-  }
 
   bool supportsWindowFilter() const override { return true; }
 
