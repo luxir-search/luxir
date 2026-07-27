@@ -1,5 +1,8 @@
 #include "SearchEngine.h"
 #include "ProtobufSearchParser.h"
+// The parser hands back a SearchOp tree that this TU drives (init / createCalculator), so it
+// needs SearchOp complete. That is the leaf op header, not the six the parser itself needs.
+#include "solux/search/ops/SearchOp.h"
 
 namespace solux {
 
