@@ -7252,7 +7252,8 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
     SkipStatsGuard stats;
     MemPool pool;
     Query::Context context(pool, *reader);
-    auto* weight = query.createWeight(context, Query::NEED_SCORES);
+    auto* weight = query.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto& segment = context.topReader.segments()[0];
     auto* supplier = weight->scorerSupplier(pool, segment);
     EXPECT_NE(supplier, nullptr);

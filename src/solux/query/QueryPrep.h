@@ -648,14 +648,20 @@ enum class FilterSupplierMode : uint8_t {
   // Exhaustive count/match/domain production values exact filter cost and
   // docs-only iteration. Let an admitted cached DocSet become the required
   // clause at every density; conjunction ordering then chooses the route.
-  EXHAUSTIVE_CLAUSE
+  EXHAUSTIVE_CLAUSE,
+  // An exact filtered disjunction can batch sparse cached-DocSet candidates
+  // while preserving the ordinary dense cached-mask route. The caller supplies
+  // the separately measured sparse-density cutoff; only the middle band stays
+  // uncached.
+  SPARSE_BATCH
 };
 
 inline Query::ScorerSupplier* filterSupplier(
     MemPool& targetPool, Query::Weight& weight,
     Query::Weight::PreparedWeight* prepared, FilterCache::Use* use,
     IndexReader& reader, IndexReader::Segment& segment,
-    FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED) {
+    FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
+    int32_t sparseBatchDensityInverse = 0) {
   Query::SegmentSource& source = prepared != nullptr
     ? static_cast<Query::SegmentSource&>(*prepared)
     : static_cast<Query::SegmentSource&>(weight);
@@ -664,17 +670,25 @@ inline Query::ScorerSupplier* filterSupplier(
     return source.scorerSupplier(targetPool, segment);
   }
 
-  // In density-routed mode, gate before any cache traffic: below the mask
-  // crossover the scored pull/WAND formation owns the regime, and a cached
-  // set displacing it measures 7-16% slower on the 5M sweep. Exhaustive mode
-  // deliberately bypasses that scored policy so exact cardinality participates
-  // in conjunction planning. Sparse entries also populate through facet/domain
-  // consumers, which serve them at any density.
+  // Gate before cache traffic. DENSITY_ROUTED leaves sparse scored filters on
+  // pull/WAND (a cached mask measures 7-16% slower on the 5M sweep).
+  // SPARSE_BATCH extends that policy in both directions: its measured sparse
+  // side wants the DocSet candidate vector, while the dense side retains the
+  // existing cached mask. Exhaustive mode deliberately bypasses both scored
+  // policies so exact cardinality participates in conjunction planning. Sparse
+  // entries also populate through facet/domain consumers, which serve them at
+  // any density.
   auto* uncached = source.scorerSupplier(targetPool, segment);
   if (uncached == nullptr
       || (mode == FilterSupplierMode::DENSITY_ROUTED
           && uncached->cost()
-              < segment.maxDoc() / kMaskFilterDensityInverse)) {
+              < segment.maxDoc() / kMaskFilterDensityInverse)
+      || (mode == FilterSupplierMode::SPARSE_BATCH
+          && (sparseBatchDensityInverse <= 0
+              || uncached->cost()
+                  > segment.maxDoc() / sparseBatchDensityInverse
+                  && uncached->cost()
+                      < segment.maxDoc() / kMaskFilterDensityInverse))) {
     return uncached;
   }
 

@@ -49,6 +49,33 @@ public:
   }
 };
 
+class FilteredDisjunctionBatchGuard {
+  bool saved;
+
+public:
+  explicit FilteredDisjunctionBatchGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredDisjunctionBatchForTests) {
+    BooleanQuery::disableFilteredDisjunctionBatchForTests = disabled;
+  }
+  ~FilteredDisjunctionBatchGuard() {
+    BooleanQuery::disableFilteredDisjunctionBatchForTests = saved;
+  }
+};
+
+class FilteredDisjunctionCountCompactionGuard {
+  bool saved;
+
+public:
+  explicit FilteredDisjunctionCountCompactionGuard(bool disabled)
+    : saved(BooleanQuery::
+        disableFilteredDisjunctionCountCompactionForTests) {
+    BooleanQuery::disableFilteredDisjunctionCountCompactionForTests = disabled;
+  }
+  ~FilteredDisjunctionCountCompactionGuard() {
+    BooleanQuery::disableFilteredDisjunctionCountCompactionForTests = saved;
+  }
+};
+
 std::vector<std::string> resultIds(const LocalReq& req, std::string_view opName) {
   std::vector<std::string> out;
   const auto* docs = req.docList(opName);
@@ -171,6 +198,9 @@ struct FilteredCountResult {
   int64_t bulkFillCalls;
   int64_t docsOnlyWordProbeAdvances;
   int64_t tfreqBlocksDecoded;
+  int64_t filteredDisjBatchEngagements;
+  int64_t filteredDisjBatchCountWindows;
+  int64_t filteredDisjBatchScoreWindows;
 };
 
 enum class FilteredCountPath {
@@ -210,6 +240,9 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::countBulkFillCalls,
     SkipStats::docsOnlyWordProbeAdvances,
     SkipStats::tfreqBlocksDecoded,
+    SkipStats::filteredDisjBatchEngagements,
+    SkipStats::filteredDisjBatchCountWindows,
+    SkipStats::filteredDisjBatchScoreWindows,
   };
 }
 
@@ -232,6 +265,9 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
     SkipStats::countBulkFillCalls,
     SkipStats::docsOnlyWordProbeAdvances,
     SkipStats::tfreqBlocksDecoded,
+    SkipStats::filteredDisjBatchEngagements,
+    SkipStats::filteredDisjBatchCountWindows,
+    SkipStats::filteredDisjBatchScoreWindows,
   };
 }
 
@@ -1380,6 +1416,120 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
   }
   EXPECT_EQ(routed.count, legacy.count);
   EXPECT_EQ(0, legacy.sparseFallbacks);
+}
+
+TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
+  constexpr std::string_view collection = "cached_sparse_disjunction_batch";
+  constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  int32_t filterCard = 0;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    bool selected = (doc % 1000) == 0;
+    filterCard += (int32_t) selected;
+    std::string body = (doc & 1) == 0 ? "beta" : "gamma";
+    if ((doc % 7) == 0) {
+      body += " beta gamma";
+    }
+    docs.push_back(flatdoc(
+      "id", "disj_batch_" + std::to_string(doc),
+        "body_w", body,
+        "filter_w", selected ? "selected" : "other",
+        "group_s", (doc & 1) == 0 ? "even" : "odd"));
+  }
+  ASSERT_LE(filterCard, nDocs
+      / BooleanQuery::kFilteredDisjunctionBatchDensityInverse);
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  {
+    FilteredDisjunctionBatchGuard enabled(false);
+    runFilteredCount(soluxNode->getSearchEngine(),
+                     FilteredCountShape::UNION, "selected",
+                     FilteredCountPath::FOLDED, collection);
+    runFilteredCount(soluxNode->getSearchEngine(),
+                     FilteredCountShape::UNION, "selected",
+                     FilteredCountPath::FOLDED, collection);
+  }
+  FilteredCountResult batchCount;
+  {
+    FilteredDisjunctionBatchGuard enabled(false);
+    batchCount = runFilteredCount(
+        soluxNode->getSearchEngine(), FilteredCountShape::UNION,
+        "selected", FilteredCountPath::FOLDED, collection);
+  }
+  FilteredCountResult pullCount;
+  {
+    FilteredDisjunctionBatchGuard disabled(true);
+    pullCount = runFilteredCount(
+        soluxNode->getSearchEngine(), FilteredCountShape::UNION,
+        "selected", FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(filterCard, batchCount.count);
+  EXPECT_EQ(batchCount.count, pullCount.count);
+  EXPECT_GT(batchCount.filteredDisjBatchEngagements, 0);
+  EXPECT_GT(batchCount.filteredDisjBatchCountWindows, 0);
+  EXPECT_LE(batchCount.filteredDisjBatchCountWindows, filterCard);
+  EXPECT_EQ(0, pullCount.filteredDisjBatchEngagements);
+
+  FilteredCountResult uncompactedCount;
+  {
+    FilteredDisjunctionCountCompactionGuard disabled(true);
+    uncompactedCount = runFilteredCount(
+        soluxNode->getSearchEngine(), FilteredCountShape::UNION,
+        "selected", FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(batchCount.count, uncompactedCount.count);
+  EXPECT_GT(uncompactedCount.filteredDisjBatchCountWindows, 0);
+
+  {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().limit(0);
+    cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::UNION);
+    cur.matchFilter("filter", "filter_w", "selected");
+    cur.facet("groups", "group_s").limit(-1);
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(filterCard, req->getMatchCount("q"));
+    EXPECT_EQ((std::map<std::string, int64_t>{{"even", filterCard}}),
+              resultFacetMap(*req, "q", "groups"));
+    EXPECT_GT(SkipStats::filteredDisjBatchCountWindows, 0);
+  }
+
+  struct TopResult {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t count;
+    int64_t scoreWindows;
+  };
+  auto runTopCount = [&](bool disabled) {
+    FilteredDisjunctionBatchGuard guard(disabled);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().withStats()
+        .fields({"id"}).limit(100);
+    cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::UNION);
+    cur.matchFilter("filter", "filter_w", "selected");
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return TopResult{
+      resultIds(*req, "q"),
+      resultScoreMap(*req, "q"),
+      req->getMatchCount("q"),
+      SkipStats::filteredDisjBatchScoreWindows,
+    };
+  };
+  TopResult batchTop = runTopCount(false);
+  TopResult pullTop = runTopCount(true);
+  EXPECT_EQ(filterCard, batchTop.count);
+  EXPECT_EQ(batchTop.count, pullTop.count);
+  EXPECT_EQ(batchTop.ids, pullTop.ids);
+  expectSameScoreMap(pullTop.scores, batchTop.scores);
+  EXPECT_GT(batchTop.scoreWindows, 0);
+  EXPECT_EQ(0, pullTop.scoreWindows);
 }
 
 TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {

@@ -132,6 +132,13 @@ struct SkipStats {
   static inline int64_t disjCountIdentityRequiredFallbacks = 0;
   static inline int64_t disjCountIdentityProhibitedFallbacks = 0;
   static inline int64_t disjCountIdentityProfitabilityFallbacks = 0;
+  static inline int64_t filteredDisjBatchEngagements = 0;
+  static inline int64_t filteredDisjBatchCountWindows = 0;
+  static inline int64_t filteredDisjBatchScoreWindows = 0;
+  static inline int64_t filteredDisjBatchMatchWindows = 0;
+  static inline int64_t filteredDisjBatchDensityFallbacks = 0;
+  static inline int64_t filteredDisjBatchNonDocSetFallbacks = 0;
+  static inline int64_t filteredDisjBatchNonTermFallbacks = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t conjMatchFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
@@ -272,6 +279,13 @@ struct SkipStats {
     disjCountIdentityRequiredFallbacks = 0;
     disjCountIdentityProhibitedFallbacks = 0;
     disjCountIdentityProfitabilityFallbacks = 0;
+    filteredDisjBatchEngagements = 0;
+    filteredDisjBatchCountWindows = 0;
+    filteredDisjBatchScoreWindows = 0;
+    filteredDisjBatchMatchWindows = 0;
+    filteredDisjBatchDensityFallbacks = 0;
+    filteredDisjBatchNonDocSetFallbacks = 0;
+    filteredDisjBatchNonTermFallbacks = 0;
     conjCountFallbacks = 0;
     conjMatchFallbacks = 0;
     bulkDomainWindowsFed = 0;

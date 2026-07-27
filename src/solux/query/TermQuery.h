@@ -513,6 +513,24 @@ public:
       applyToCandidatesImpl(docs, scores, size, false, matchedWords);
     }
 
+    void addMatchesToCandidates(int32_t* docs, int32_t size,
+                                std::span<uint64_t> matchedWords) {
+      assert(size >= 0);
+      assert(matchedWords.size() * 64 >= (size_t) size);
+      int32_t current = docsEnum.docId();
+      int32_t i = 0;
+      while (i < size) {
+        int32_t target = docs[i];
+        if (current < target) {
+          current = docsEnum.advanceDocOnly(target);
+        }
+        if (current == target) {
+          markCandidate(matchedWords, i);
+        }
+        i++;
+      }
+    }
+
     int32_t fillScoreBlockScalar(int32_t* docs, float* scores, int32_t count, int32_t upTo,
                                  bool includeCurrent) {
       assert(count >= 0);
