@@ -202,7 +202,7 @@ public:
         return plan.lowerResidual <= v && v <= plan.upperResidual;
       }
       if (valueRank < rawStart || valueRank >= rawStart + (int64_t)rawCount) {
-        rawStart = reader.decodeRawSubBlock(valueRank, raw, rawCount);
+        rawStart = reader.decodeValueSubBlock(valueRank, raw, rawCount);
       }
       int64_t v = raw[valueRank - rawStart];
       return lo <= v && v <= hi;

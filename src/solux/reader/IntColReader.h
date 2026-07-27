@@ -176,8 +176,6 @@ public:
 class MonoReader {
 public:
   static constexpr uint32_t BLOCK_SIZE = NumColumn::BLOCK_SIZE;
-  static constexpr uint64_t SLOPE_SCALE =
-      1ULL << NumColumnFormat::SLOPE_SHIFT;
   static constexpr int64_t ENDINDEX = NumColumn::ENDINDEX;
   using BlockInfo = NumBlockInfo;
 
@@ -417,7 +415,7 @@ public:
   }
 
   // Decode reconstructed values for packed predicted/wide or raw blocks.
-  int64_t decodeRawSubBlock(int64_t valueRank, int64_t* decoded,
+  int64_t decodeValueSubBlock(int64_t valueRank, int64_t* decoded,
                             uint32_t& count) const {
     return values.decodeFrame(valueRank, decoded, count);
   }

@@ -21,6 +21,10 @@ struct NumBlockInfo {
   uint8_t padding[7] = {};
 };
 static_assert(sizeof(NumBlockInfo) == 40);
+// Readers locate the zone array at metaOff + nBlocks * sizeof(NumBlockInfo),
+// while the writer aligns it to 8. Both agree only while the descriptor is a
+// multiple of 8; otherwise the writer inserts padding the reader never skips.
+static_assert(sizeof(NumBlockInfo) % 8 == 0);
 
 struct NumBlockZone {
   int64_t min = 0;
@@ -91,6 +95,14 @@ struct NumColumnFormat {
         gcd * (uint64_t)plan.fit.intercept;
     plan.info.scaledSlope = plan.fit.scaledSlope;
     plan.info.bits = plan.fit.bits;
+    // Constant blocks must reconstruct as min + gcd * residual: the residual is
+    // then exactly (value - min) / gcd, which is what lets range queries
+    // compare packed residuals against transformed bounds instead of decoding.
+    // Holds because q contains 0 at the block minimum, so a zero-slope fit
+    // lowers its intercept to 0. Asserted because the range query's
+    // residual-domain path silently returns wrong matches if it ever stops
+    // holding.
+    assert(plan.info.scaledSlope != 0 || plan.info.baseBits == (uint64_t)min);
     return plan;
   }
 

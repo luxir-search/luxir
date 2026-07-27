@@ -612,8 +612,8 @@ TEST_F(IntColTest, monoFractionalSlope) {
   NumBlockInfo info;
   memcpy(&info,
          input.ptr(writer.blockLoc.offset() + writer.metaOff), sizeof(info));
-  EXPECT_GT(info.scaledSlope, 7 * (int64_t)MonoReader::SLOPE_SCALE);
-  EXPECT_LT(info.scaledSlope, 8 * (int64_t)MonoReader::SLOPE_SCALE);
+  EXPECT_GT(info.scaledSlope, 7 * (int64_t)(1LL << NumColumnFormat::SLOPE_SHIFT));
+  EXPECT_LT(info.scaledSlope, 8 * (int64_t)(1LL << NumColumnFormat::SLOPE_SHIFT));
   EXPECT_LE(info.bits, 1);
 
   MonoReader reader(
