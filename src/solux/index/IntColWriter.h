@@ -157,14 +157,8 @@ public:
 
 class MonoWriter {
 private:
-  MemPool& pool;
   OutputStream& out;
-  size_t colStart;
-  size_t nAdded = 0;
-
-  std::vector<MonoReader::BlockInfo> blockInfo;
-  std::vector<int64_t> values;
-  std::vector<int32_t> ivalues;
+  NumColumnWriter writer;
 
 public:
   /// "output" column metadata that is filled in / valid after finish() is called.
@@ -172,9 +166,8 @@ public:
   seg_location blockLoc;
   int64_t metaOff;
 
-  MonoWriter(MemPool& pool, OutputStream& out) : pool(pool), out(out) {
-    unused(this->pool);
-    colStart = out.size();
+  MonoWriter(MemPool& pool, OutputStream& out) : out(out), writer(out) {
+    unused(pool);
   }
 
   OutputStream& getOutputStream() {
@@ -182,95 +175,15 @@ public:
   }
 
   void addInt64(int64_t val) {
-    nAdded++;
-    values.push_back(val);
-    // values[nAdded % BLOCK_SIZE] = val;
-    // if (nAdded % BLOCK_SIZE == 0) {
-    if (values.size() == MonoReader::BLOCK_SIZE) {
-      addBlock(values);
-      values.resize(0);
-    }
-  }
-
-  void addBlock(std::span<int64_t> arr) {
-    auto intercept = arr.front();
-    auto max = arr.back();
-
-    double slope = arr.size() == 1 ? 0 : (max - intercept) / (arr.size() - 1);
-    uint64_t scaled_slope = (uint64_t)(slope * MonoReader::SLOPE_SCALE);
-
-    // deltas from the expected (interpolated) value
-    int64_t minDelta = 0;
-    int64_t maxDelta = 0;
-
-    for (size_t i=0; i<arr.size(); i++) {
-      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoReader::SLOPE_SCALE);
-      int64_t delta = arr[i] - expected;
-      minDelta = std::min(minDelta, delta);
-      maxDelta = std::max(maxDelta, delta);
-    }
-
-    auto bits = std::bit_width(uint64_t(maxDelta - minDelta));
-    // We could zig-zag encode to make all of the deltas positive, but we can save a little by just
-    // lowering the intercept by minDelta.  Although this will raise the average delta, it should not
-    // change the maximum number of bits needed to represent the largest.
-    intercept += minDelta;
-    blockInfo.push_back({out.size() - colStart, scaled_slope, intercept, (uint8_t)bits});
-
-    if (bits > 32) {
-      out.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
-      return;
-    }
-
-    // Currently our For codec can only handle 32 bit integers, so we need to make a copy.
-    // We should make a version that can accept 64 bit integers that just use the lower half.
-    ivalues.reserve(arr.size());
-    ivalues.resize(0);
-    for (size_t i=0; i<arr.size(); i++) {
-      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoReader::SLOPE_SCALE);
-      uint32_t delta = (uint32_t)(arr[i] - expected);
-      // if bits=32, this assert may not be true (and we changed delta to be unsigned to account for this)
-      // assert(delta >= 0);
-      assert(int64_t((uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta + intercept) == arr[i]);
-      ivalues.push_back(delta);
-    }
-
-    // TODO: we should probably use a faster codec for random access for this.
-    std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 32);
-    uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
-    IndexCodec::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
-    out.write(compressed_output.data(), compressedSize);
-    // The +32 on compressed_output above is encode-output headroom for tails that
-    // pack up to a word boundary. SoluxSIMDFor decodes exactly the encoded byte
-    // range, so this block needs no reader-side slack. The old
-    // SIMDCompressionAndIntersection codec did read ~31 bytes past the data; that
-    // was removed in the FastPFOR migration and is covered by
-    // PostingsTest.codecFileOverreadBounds. The only postings decoder that
-    // over-reads now is the StreamVByte tail, for which PostingsWriter::finish()
-    // reserves SVB_OVERREAD_PAD trailing bytes per data file.
+    writer.addInt64(val);
   }
 
   // returns number of values written and sets metadata to be read.
   size_t finish() {
-    // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
-    if (!values.empty()) {
-      addBlock(values);
-      values.resize(0);
-    }
-
-    // If we added enough values, ensure alignment of the block meta array.
-    if (nAdded >= 128) {  // This is just a guess and the exact value is not needed for correctness.
-      out.align(8);
-    }
-    // TODO: we should align the blocks as well if we know we will add enough values.
-
-    blockLoc = seg_location(out.streamNumber, colStart);
-    metaOff = out.size() - colStart;
-
-    // the number of blocks can be derived from nAdded.
-    out.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(MonoReader::BlockInfo));
-    return nAdded;
+    auto data = writer.finish(false, false);
+    blockLoc = writer.columnLocation();
+    metaOff = data.columnMetaOff;
+    return (size_t)data.numValues;
   }
 
 };

@@ -591,6 +591,38 @@ TEST_F(IntColTest, testMonoRepeatedValues) {
   ASSERT_EQ(3, r.valueAt(2)) << "Third value should be 3";
 }
 
+TEST_F(IntColTest, monoFractionalSlope) {
+  RAMDir dir;
+  auto file = dir.createFile("mono");
+  OutputStream out(file.get());
+  MemPool pool;
+  MonoWriter writer(pool, out);
+
+  std::vector<int64_t> expected(MonoReader::BLOCK_SIZE);
+  for (int64_t i = 0; i < (int64_t)expected.size(); i++) {
+    expected[(size_t)i] = i * 15 / 2;
+    writer.addInt64(expected[(size_t)i]);
+  }
+  int64_t count = (int64_t)writer.finish();
+  out.close();
+  dir.finishFile(*file);
+
+  auto in = dir.openFile("mono");
+  InputStream input(in->getInputStream());
+  NumBlockInfo info;
+  memcpy(&info,
+         input.ptr(writer.blockLoc.offset() + writer.metaOff), sizeof(info));
+  EXPECT_GT(info.scaledSlope, 7 * (int64_t)MonoReader::SLOPE_SCALE);
+  EXPECT_LT(info.scaledSlope, 8 * (int64_t)MonoReader::SLOPE_SCALE);
+  EXPECT_LE(info.bits, 1);
+
+  MonoReader reader(
+      input, writer.blockLoc.offset(), writer.metaOff, count);
+  for (int64_t i = 0; i < count; i++) {
+    EXPECT_EQ(reader.valueAt(i), expected[(size_t)i]);
+  }
+}
+
 TEST_F(IntColTest, testMonoBig) {
   std::vector<int64_t> vals;
 

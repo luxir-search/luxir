@@ -2,193 +2,11 @@
 
 #include "DocsReader.h"
 #include "PostingsReader.h"
-#include "Postings.h"
-#include "solux/codec/Codec.h"
-#include "solux/codec/LinearPack.h"
 #include "solux/codec/NumColumnFormat.h"
+#include "solux/codec/LinearPack.h"
 #include "solux/store/InputStream.h"
 
 namespace solux {
-
-// Monotonic int column.
-class MonoReader {
-public:
-  constexpr static uint32_t BLOCK_SIZE = 16384;
-  // For monotonic fields, we store the slope of the line and interpolate the values (and store
-  // the delta from the expected value).
-  // Instead of using floating point math when decoding, we use a scaled slope and do integer math.
-  // Our integral slope estimate should be within .25 of the expected value calculated with doubles.
-  // This leaves the rest of the bits to interpolate large values: 2^64/(16384*4) = 2.8e14
-  constexpr static uint64_t SLOPE_SCALE = BLOCK_SIZE * 4;
-
-  constexpr static int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
-
-  // either make this struct packed, or round it out so there won't be any undefined padding between elements.
-  SOLUX_PACKED_START
-  struct BlockInfo {
-    uint64_t blockOffset;
-    uint64_t scaledSlope;
-    int64_t intercept;
-    uint8_t bits;
-    uint8_t _padding[3]={0,0,0};
-  } SOLUX_PACKED_END;
-
-protected:
-  const BlockInfo* blockMeta;  // array of block metadata
-  const char* blocks;          // start of the compressed blocks of data
-  const int64_t nValues;
-
-public:
-  MonoReader(PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
-  {
-    InputStream columnIS = postingsReader.getInputStreamSeek(loc);
-    blocks = columnIS.ptr();
-    blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
-  }
-
-  MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
-  {
-    blocks = columnIS.ptr(loc);
-    blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
-  }
-
-  [[nodiscard]] int64_t numValues() const {
-    return nValues;
-  }
-
-  [[nodiscard]] int64_t valueAt(int64_t index) const {
-    assert (index >= 0 && index < nValues);
-    auto blockNum = (uint64_t)index / BLOCK_SIZE;
-    auto rankInBlock = (uint64_t)index % BLOCK_SIZE;
-    auto& block = blockMeta[blockNum];
-    const char* blockStart = blocks + block.blockOffset;
-    if (block.bits > 32) {
-      return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
-    }
-    // depending on the exact format, valuesInBlock may not be needed.
-    auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint64_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
-    auto delta = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
-    int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
-    return scaled;
-  }
-
-  // Retrieve values[index-1], values[index].  If index is 0, the first value is 0.
-  [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int64_t index) const {
-    // hopefully the compiler can optimize out some of the repeated code involved in getting 2 values?
-    // they may be in different blocks though.
-    auto v1 = index > 0 ? valueAt(index - 1) : 0;
-    auto v2 = valueAt(index);
-    return {v1, v2};
-  }
-
-
-  /// Decodes sub-blocks at a time when one needs a decent percent of the values.
-  class BulkValues {
-    constexpr static uint32_t BULK_DECODE = 128;
-    const BlockInfo* blockMeta;  // array of block metadata
-    const char* blocks;                 // start of the compressed blocks of data
-    int64_t index_ = -1;
-    int64_t max;
-    int64_t decodedStart = -1;
-    int64_t decodedMax = 0;
-    // OPT: when max < BULK_DECODE, we don't need this much space.  We could pool allocate if we need to save more memory.
-    int64_t decoded[BULK_DECODE];
-  public:
-
-    BulkValues(const MonoReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
-    }
-
-    int64_t index() {
-      return index_;
-    }
-
-    int64_t value() {
-      assert (index_ >= decodedStart && index_ < decodedMax);
-      return decoded[index_ - decodedStart];
-    }
-
-    int64_t next() {
-      if (++index_ < decodedMax) {
-        return index_;
-      }
-      if (index_ >= max) {
-        index_ = ENDINDEX;
-        return index_;
-      }
-      decodeBlock(index_);
-      return index_;
-    }
-
-    void decodeBlock(int64_t index) {
-      // it's not clear to me what type of alignment will work for SoluxSIMDFor here.
-      // For now, we'll be conservative and align to 128.
-      assert (index >= 0 && index < max);
-      uint64_t start = uint64_t(index) / BULK_DECODE * BULK_DECODE;
-      assert(index < start + BULK_DECODE);
-      auto bigBlock = start / BLOCK_SIZE;
-      auto littleBlock = start % BLOCK_SIZE / BULK_DECODE;
-      auto& block = blockMeta[bigBlock];
-      uint32_t littleBlockSize = BULK_DECODE * block.bits / 8;
-      const char* subBlockStart = blocks + block.blockOffset + littleBlock * littleBlockSize;
-      decodedStart = start;
-      decodedMax = std::min(decodedStart + BULK_DECODE, max);
-      uint32_t num = decodedMax - decodedStart;
-      if (block.bits <= 32) {
-        uint32_t ints[BULK_DECODE];  // the deltas from the expected value
-
-        if constexpr (BULK_DECODE == 128) {
-          IndexCodec::numericCodec.decodeSingleBlock(subBlockStart, ints, num, block.bits);
-        } else {
-          IndexCodec::numericCodec.decodeWithMeta(subBlockStart, ints, num, block.bits);
-        }
-
-        /* decoding a single value looks like this:
-        auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint64_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
-        auto delta = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
-        int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
-        */
-
-        // rank in big block is just little block times little block size
-        auto rankInBlock = littleBlock * BULK_DECODE;
-        for (uint32_t i = 0; i < num; i++) {
-          // This is really the only difference between IntColReader::BulkValues and MonoReader::BulkValues,
-          // we should try to unify them.
-          int64_t scaled = uint64_t((rankInBlock+i) * block.scaledSlope) / SLOPE_SCALE + block.intercept + ints[i];
-          decoded[i] = scaled;
-        }
-      } else {
-        // 64-bit, temp impl uncompressed. Copy from the 128-aligned decode
-        // base, not the requested index: decodedStart is the aligned start,
-        // so an unaligned advance()/valueAt() would otherwise read values
-        // shifted by (index - start).
-        auto rankInBlock = start % BLOCK_SIZE;
-        memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset) + rankInBlock, num * sizeof(int64_t));
-      }
-    }
-
-    int64_t advance(int64_t target) {
-      assert(target > index_);
-      index_ = target;
-      if (index_ < decodedMax) {
-        return index_;
-      }
-      if (index_ >= max) {
-        index_ = ENDINDEX;
-        return index_;
-      }
-      decodeBlock(index_);
-      return index_;
-    }
-
-    int64_t valueAt(int64_t index) {
-      if (index >= decodedMax || index < decodedStart) {
-        decodeBlock(index);
-      }
-      return decoded[index - decodedStart];
-    }
-
-  };
-};
 
 // Shared numeric-column physical decode layer. Metadata is loaded with memcpy
 // because standalone columns may be relocated to an unaligned file offset.
@@ -350,6 +168,74 @@ public:
       assert(index >= 0 && index < column.numValues());
       if (index < decodedStart || index >= decodedEnd) decode(index);
       return decoded[index - decodedStart];
+    }
+  };
+};
+
+// Monotonic semantic facade over the shared numeric-column physical layer.
+class MonoReader {
+public:
+  static constexpr uint32_t BLOCK_SIZE = NumColumn::BLOCK_SIZE;
+  static constexpr uint64_t SLOPE_SCALE =
+      1ULL << NumColumnFormat::SLOPE_SHIFT;
+  static constexpr int64_t ENDINDEX = NumColumn::ENDINDEX;
+  using BlockInfo = NumBlockInfo;
+
+private:
+  NumColumn values;
+
+public:
+  MonoReader(PostingsReader& postingsReader, seg_location loc, int64_t metaOff,
+             int64_t nValues) {
+    InputStream columnIS = postingsReader.getInputStreamSeek(loc);
+    const char* blocks = columnIS.ptr();
+    values = NumColumn(blocks, blocks + metaOff, nValues);
+  }
+
+  MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff,
+             int64_t nValues) {
+    const char* blocks = columnIS.ptr(loc);
+    values = NumColumn(blocks, blocks + metaOff, nValues);
+  }
+
+  [[nodiscard]] int64_t numValues() const {
+    return values.numValues();
+  }
+
+  [[nodiscard]] int64_t valueAt(int64_t index) const {
+    return values.valueAt(index);
+  }
+
+  // Retrieve values[index-1], values[index]. If index is 0, the first value is
+  // defined as zero.
+  [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int64_t index) const {
+    return {index > 0 ? valueAt(index - 1) : 0, valueAt(index)};
+  }
+
+  class BulkValues {
+    NumColumn::Bulk values;
+
+  public:
+    explicit BulkValues(const MonoReader& column) : values(column.values) {}
+
+    int64_t index() const {
+      return values.index();
+    }
+
+    int64_t value() const {
+      return values.value();
+    }
+
+    int64_t next() {
+      return values.next();
+    }
+
+    int64_t advance(int64_t target) {
+      return values.advance(target);
+    }
+
+    int64_t valueAt(int64_t index) {
+      return values.valueAt(index);
     }
   };
 };
