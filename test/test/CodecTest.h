@@ -1,5 +1,8 @@
 #pragma once
 
+#include <memory>
+#include <string>
+
 #include "solux/codec/Codec.h"
 
 namespace solux {
