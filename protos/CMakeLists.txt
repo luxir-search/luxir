@@ -2,33 +2,12 @@ find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(Threads)
 
-set(PROTO_FILES
-    solux.proto
-    solux_types.proto
-)
-
-add_library(myproto ${PROTO_FILES})
-target_link_libraries(myproto
-    PUBLIC
-        protobuf::libprotobuf
-        gRPC::grpc
-        gRPC::grpc++
-        gRPC::grpc++_reflection
-)
-target_include_directories(myproto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-
-get_target_property(grpc_cpp_plugin_location gRPC::grpc_cpp_plugin LOCATION)
-protobuf_generate(TARGET myproto LANGUAGE cpp PROTOC_OPTIONS --experimental_editions)
-protobuf_generate(TARGET myproto LANGUAGE grpc
-        GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
-        PLUGIN "protoc-gen-grpc=${grpc_cpp_plugin_location}"
-        PROTOC_OPTIONS --experimental_editions)
-
-# The trait-templated hpp solux::proto generation (solux_proto_hpp / solux_proto_hpp_gen)
-# was dropped after the concrete solux::api cutover: no TU includes "protos/solux*.pb.hpp"
-# anymore. The concrete wire model is solux_proto_concrete (below); descriptor-only
-# reflection is solux_fds_gen (below). _pb_inc (protobuf's include dir) is still needed by
-# the FileDescriptorSet protoc command.
+# The protobuf/gRPC C++ codegen target (myproto) is gone with the concrete solux::api
+# cutover: no TU includes solux*.pb.h or solux*.grpc.pb.h anymore, so it was compiling four
+# large generated .cc files into a static library nothing linked. The trait-templated hpp
+# solux::proto generation (solux_proto_hpp) went the same way. The wire model is
+# solux_proto_concrete (below); descriptor-only reflection is solux_fds_gen (below).
+# _pb_inc (protobuf's include dir) is still needed by the FileDescriptorSet protoc command.
 get_target_property(_pb_inc protobuf::libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
 
 # --- FileDescriptorSet for descriptor-only reflection ---
@@ -74,3 +53,15 @@ add_library(solux_proto_concrete STATIC EXCLUDE_FROM_ALL ${_concrete_srcs})
 target_include_directories(solux_proto_concrete PUBLIC "${CMAKE_SOURCE_DIR}/src/solux/api")
 target_link_libraries(solux_proto_concrete PUBLIC hpp_proto::runtime glaze::glaze)
 set_target_properties(solux_proto_concrete PROPERTIES CXX_STANDARD 26 CXX_STANDARD_REQUIRED ON)
+
+# The generated .json.cpp emits `#include "solux_types.hpp"` (the wire MODEL, glaze-free) and
+# then instantiates glaze over those types. The from/to overrides and the Solux JSON dialect
+# live in solux_types_json.hpp, which the generator has no way to name - force-include it so
+# the dialect is in scope before any glz::meta below. The .pb.cpp (binary codec) is
+# deliberately left alone: it must not pay for glaze.
+foreach(_src ${_concrete_srcs})
+  if(_src MATCHES "\\.json\\.cpp$")
+    set_source_files_properties("${_src}" TARGET_DIRECTORY solux_proto_concrete PROPERTIES
+      COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/solux/api/solux_types_json.hpp")
+  endif()
+endforeach()

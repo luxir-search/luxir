@@ -22,9 +22,13 @@
 #include <variant>
 #include <vector>
 
+#include <hpp_proto/field_types.hpp> // bytes_view
 #include <hpp_proto/indirect_view.hpp>
 #include <hpp_proto/optional_indirect.hpp>
-#include <hpp_proto/json.hpp> // for the google::protobuf::NullValue glz below (WKT)
+// NOTE: this header is the wire MODEL only - no glaze, no <hpp_proto/json.hpp>. Almost every
+// engine TU reaches it through Schema.h / Query.h, and the glaze stack costs ~1.5s of frontend
+// per TU. JSON codec metadata (the glz from/to overrides + the dialect) lives in
+// solux_types_json.hpp; include that only in TUs that actually serialize.
 
 // ----- map_view: span-of-pairs with a map read API (last-wins find) -----
 namespace solux::api {
@@ -46,53 +50,11 @@ struct map_view : std::span<const std::pair<K, V>> {
 };
 } // namespace solux::api
 
-// ----- WKT: google.protobuf.NullValue (Val.null arm) + its JSON glz (renders null) -----
+// ----- WKT: google.protobuf.NullValue (Val.null arm) -----
+// Its JSON glz (renders null) is in solux_types_json.hpp.
 namespace google::protobuf {
 enum class NullValue { NULL_VALUE = 0 };
 } // namespace google::protobuf
-namespace glz {
-template <>
-struct to<JSON, google::protobuf::NullValue> {
-  template <auto Opts>
-  GLZ_ALWAYS_INLINE static void op(auto && /*value*/, auto &&...args) {
-    serialize<JSON>::template op<Opts>(std::monostate{}, std::forward<decltype(args)>(args)...);
-  }
-};
-template <>
-struct from<JSON, google::protobuf::NullValue> {
-  template <auto Opts>
-  GLZ_ALWAYS_INLINE static void op(auto &value, auto &&...args) {
-    parse<JSON>::template op<Opts>(std::monostate{}, std::forward<decltype(args)>(args)...);
-    value = google::protobuf::NullValue::NULL_VALUE;
-  }
-};
-
-// optional_indirect_view<T> is the non-owning singular optional message field (TopDocs.query,
-// Match.val, ...). hpp-proto only ships glz for the optional_indirect_view_REF wrapper; the
-// generated glz binds the raw member, so add from/to for the raw view here (arena-allocate on
-// read, mirroring hpp-proto's optional_indirect_view_ref handler).
-template <typename Type>
-struct from<JSON, ::hpp_proto::optional_indirect_view<Type>> {
-  template <auto Opts>
-  static void op(auto &value, ::hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
-    if (!util::parse_null<Opts>(value, ctx, it, end)) {
-      void *addr = ctx.memory_resource().allocate(sizeof(Type), alignof(Type));
-      auto *obj = new (addr) Type; // NOLINT(cppcoreguidelines-owning-memory)
-      parse<JSON>::template op<Opts>(*obj, ctx, it, end);
-      value = obj;
-    }
-  }
-};
-template <typename Type>
-struct to<JSON, ::hpp_proto::optional_indirect_view<Type>> {
-  template <auto Opts, class... Args>
-  GLZ_ALWAYS_INLINE static void op(auto &&value, Args &&...args) noexcept {
-    if (value.has_value()) {
-      to<JSON, Type>::template op<Opts>(*value, std::forward<Args>(args)...);
-    }
-  }
-};
-} // namespace glz
 
 namespace solux::api {
 
@@ -554,9 +516,3 @@ SOLUX_ENTRY(SchemaDef) SOLUX_ENTRY(SchemaRequest) SOLUX_ENTRY(SchemaResponse)
 #undef SOLUX_ENTRY
 
 } // namespace solux::api
-
-// Solux JSON dialect: hand from/to<JSON> overrides of the generated glz::meta
-// (untagged Val, flattened Map, bare-array Vector, ...). Included here so every TU
-// that can instantiate glaze over these types (in practice only the generated
-// .json.cpp) agrees on the dialect.
-#include "json_dialect.h"

@@ -27,6 +27,10 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
 
+// prettify_json is a pure text transform (no api-type serialization), so this TU needs
+// glaze but not the Solux JSON dialect. prettify.hpp is not self-contained: read_iterators
+// comes from core/read.hpp.
+#include <glaze/core/read.hpp>
 #include <glaze/json/prettify.hpp>
 
 #include "solux/util/log.h"

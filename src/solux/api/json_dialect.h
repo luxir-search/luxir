@@ -5,12 +5,12 @@
 //
 // How overriding works: glaze dispatches serialization through glz::from<JSON,T> /
 // glz::to<JSON,T>. The generated metadata drives constrained partial specializations,
-// so an explicit full specialization here always wins. All glaze code is instantiated
-// only in the generated solux_types.json.cpp TU (via the read_json/write_json entry
-// points), which includes this header through solux_types.hpp - so an override here
-// applies everywhere, consistently.
+// so an explicit full specialization here always wins. Most glaze code is instantiated in
+// the generated solux_types.json.cpp TU (via the read_json/write_json entry points), which
+// reaches this header through solux_types_json.hpp - so an override here applies everywhere,
+// consistently.
 //
-// Included by solux_types.hpp (after all message definitions); do not include directly.
+// Included by solux_types_json.hpp (after all message definitions); do not include directly.
 //
 // Dialect decisions encoded here:
 // - Val is a raw JSON value (like google.protobuf.Value's canonical mapping), not a
@@ -42,8 +42,9 @@
 
 #pragma once
 
-// NOTE: relies on solux_types.hpp having defined the solux::api types and included
+// NOTE: relies on solux_types_json.hpp having defined the solux::api types and included
 // <hpp_proto/json.hpp>; kept as a separate file only so JSON-dialect code has one home.
+// Include solux_types_json.hpp, never this directly.
 
 namespace solux::api::jsond {
 template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
