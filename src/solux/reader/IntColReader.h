@@ -80,7 +80,15 @@ public:
 
   // Decode the 128-aligned frame containing rank. Returns the global rank of
   // out[0] and stores the number of valid values in count.
-  int64_t decodeFrame(int64_t rank, int64_t* out, uint32_t& count) const {
+  //
+  // Deliberately out of line. This runs once per 128 values, but it carries
+  // every format variant (raw, packed-narrow with three scale-loop shapes,
+  // packed-wide), so inlining it into a caller's per-value loop bloats that
+  // loop and spills its cursor state to the stack. Measured on dense numeric
+  // faceting: inlined, the per-value path reloads decodedStart/decodedEnd from
+  // stack every iteration and the whole facet is ~25% slower.
+  SOLUX_NOINLINE int64_t decodeFrame(int64_t rank, int64_t* out,
+                                     uint32_t& count) const {
     assert(rank >= 0 && rank < nValues);
     int64_t start = rank / BULK_SIZE * BULK_SIZE;
     int64_t blockNum = start / BLOCK_SIZE;
