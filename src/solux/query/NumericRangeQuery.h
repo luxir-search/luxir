@@ -137,36 +137,37 @@ public:
   };
 
   static BlockPlan classifyBlock(const IntColReader::NumericBlockInfo& block,
+                                 const NumBlockZone& zone,
                                  int64_t lo, int64_t hi) {
     BlockPlan plan;
-    if (block.max < lo || hi < block.min) {
+    if (zone.max < lo || hi < zone.min) {
       return plan;
     }
-    if (lo <= block.min && block.max <= hi) {
+    if (lo <= zone.min && zone.max <= hi) {
       plan.relation = BlockRelation::INSIDE;
       return plan;
     }
 
     plan.relation = BlockRelation::CROSSES;
-    if (block.format > 32) {
+    if (block.bits > 32 || block.scaledSlope != 0) {
       return plan;
     }
 
     // CROSSES guarantees every subtraction below represents a non-negative
     // signed-order distance. Unsigned subtraction makes the full INT64 span
     // exact, and quotient+remainder implements ceil without overflow.
-    uint64_t gcd = (uint64_t)block.gcd;
+    uint64_t gcd = block.gcd;
     assert(gcd != 0);
     uint64_t lower = 0;
-    if (lo > block.min) {
-      uint64_t delta = (uint64_t)lo - (uint64_t)block.min;
+    if (lo > zone.min) {
+      uint64_t delta = (uint64_t)lo - (uint64_t)zone.min;
       lower = delta / gcd + (delta % gcd != 0);
     }
     uint64_t upper;
-    if (hi >= block.max) {
-      upper = ((uint64_t)block.max - (uint64_t)block.min) / gcd;
+    if (hi >= zone.max) {
+      upper = ((uint64_t)zone.max - (uint64_t)zone.min) / gcd;
     } else {
-      upper = ((uint64_t)hi - (uint64_t)block.min) / gcd;
+      upper = ((uint64_t)hi - (uint64_t)zone.min) / gcd;
     }
     // A compressed block's maximum persisted residual fits its format<=32.
     // Saturation keeps a defensive release build correct at both signed
@@ -189,9 +190,9 @@ public:
     explicit CrossingValues(IntColReader& reader) : reader(reader) {}
 
     bool matches(int64_t valueRank, const BlockPlan& plan, int64_t lo, int64_t hi) {
-      int64_t blockNum = valueRank / Postings::NUMERIC_BLOCK_SIZE;
-      const auto& block = reader.blockInfo(blockNum);
-      if (block.format <= 32) {
+      int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
+      auto block = reader.blockInfo(blockNum);
+      if (block.bits <= 32 && block.scaledSlope == 0) {
         if (valueRank < residualStart
             || valueRank >= residualStart + (int64_t)residualCount) {
           residualStart = reader.decodeResidualSubBlock(valueRank, residuals,
@@ -270,9 +271,9 @@ public:
       auto [doc, rank] = firstDocRank(min);
       int64_t nvals = reader.numValues();
       while (doc < max && rank < nvals) {
-        int64_t blockNum = rank / Postings::NUMERIC_BLOCK_SIZE;
+        int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
         int64_t blockEnd = std::min<int64_t>(nvals,
-            (blockNum + 1) * (int64_t)Postings::NUMERIC_BLOCK_SIZE);
+            (blockNum + 1) * (int64_t)IntColReader::BLOCK_SIZE);
         const BlockPlan& plan = plans[(size_t)blockNum];
         if (plan.relation == BlockRelation::OUTSIDE) {
           rank = (int32_t)blockEnd;
@@ -306,9 +307,9 @@ public:
     bool docValuesMatch(int64_t start, int64_t end) {
       int64_t rank = start;
       while (rank < end) {
-        int64_t blockNum = rank / Postings::NUMERIC_BLOCK_SIZE;
+        int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
         int64_t blockEnd = std::min<int64_t>(end,
-            (blockNum + 1) * (int64_t)Postings::NUMERIC_BLOCK_SIZE);
+            (blockNum + 1) * (int64_t)IntColReader::BLOCK_SIZE);
         const BlockPlan& plan = plans[(size_t)blockNum];
         if (plan.relation == BlockRelation::INSIDE) return true;
         if (plan.relation == BlockRelation::CROSSES) {
@@ -863,8 +864,9 @@ public:
 
       auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
       for (int64_t i = 0; i < reader->numBlocks(); i++) {
-        plans[(size_t)i] = classifyBlock(reader->blockInfo(i), query.getLo(),
-                                         query.getHi());
+        plans[(size_t)i] = classifyBlock(
+            reader->blockInfo(i), reader->blockZone(i), query.getLo(),
+            query.getHi());
       }
       bool allMatch = query.getLo() <= colMin && colMax <= query.getHi();
       int64_t cost = estimateCost(*reader, plans);
@@ -936,8 +938,9 @@ public:
       }
       auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
       for (int64_t i = 0; i < reader->numBlocks(); i++) {
-        plans[(size_t)i] = classifyBlock(reader->blockInfo(i), query.getLo(),
-                                         query.getHi());
+        plans[(size_t)i] = classifyBlock(
+            reader->blockInfo(i), reader->blockZone(i), query.getLo(),
+            query.getHi());
       }
       return targetPool.make<ZoneMapScorer>(
           targetPool, *reader, plans, query.getLo(), query.getHi(),
@@ -970,15 +973,16 @@ public:
 
       std::vector<BlockPlan> plans((size_t)reader.numBlocks());
       for (int64_t i = 0; i < reader.numBlocks(); i++) {
-        plans[(size_t)i] = classifyBlock(reader.blockInfo(i), query.getLo(),
-                                         query.getHi());
+        plans[(size_t)i] = classifyBlock(
+            reader.blockInfo(i), reader.blockZone(i), query.getLo(),
+            query.getHi());
       }
       CrossingValues crossing(reader);
       if (!reader.multiValued()) {
         int64_t count = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
           const BlockPlan& plan = plans[(size_t)blockNum];
-          int64_t start = blockNum * (int64_t)Postings::NUMERIC_BLOCK_SIZE;
+          int64_t start = blockNum * (int64_t)IntColReader::BLOCK_SIZE;
           int64_t end = start + reader.valuesInBlock(blockNum);
           if (plan.relation == BlockRelation::INSIDE) {
             count += end - start;
@@ -997,9 +1001,9 @@ public:
         int64_t rank = start;
         bool matched = false;
         while (rank < end && !matched) {
-          int64_t blockNum = rank / Postings::NUMERIC_BLOCK_SIZE;
+          int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
           int64_t blockEnd = std::min<int64_t>(end,
-              (blockNum + 1) * (int64_t)Postings::NUMERIC_BLOCK_SIZE);
+              (blockNum + 1) * (int64_t)IntColReader::BLOCK_SIZE);
           const BlockPlan& plan = plans[(size_t)blockNum];
           if (plan.relation == BlockRelation::INSIDE) {
             matched = true;

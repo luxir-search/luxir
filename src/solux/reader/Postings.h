@@ -15,7 +15,6 @@ public:
   static constexpr int32_t TERMS_BLOCK_SIZE = 32;
   static constexpr int32_t POSITIONS_BLOCK_SIZE = 128;
   static constexpr int32_t DOCS_BLOCK_SIZE =  128;
-  static constexpr int32_t NUMERIC_BLOCK_SIZE = 16384;
 
   // First byte of every full doc-block body selects the doc-id encoding
   // (PostingsWriter::flushDocs writes it; DocsEnum dispatches on it):

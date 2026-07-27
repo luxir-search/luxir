@@ -1,7 +1,7 @@
 #include <vector>
 #include "solux/util/random.h"
 #include "solux/util/solux_util.h"
-#include "solux/reader/Postings.h"
+#include "solux/codec/NumColumnFormat.h"
 #include "test/CodecTest.h"
 #include "bench/solux_bench.h"
 #include <gtest/gtest.h>
@@ -10,7 +10,7 @@
 namespace solux {
 
 //constexpr uint32_t INT_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
-constexpr uint32_t INT_BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
+constexpr uint32_t INT_BLOCK_SIZE = NumColumnFormat::BLOCK_SIZE;
 
 // TODO: how to chose distribution?  bias toward small values?
 // figure out if sorting is needed based on codec?

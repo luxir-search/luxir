@@ -9,6 +9,7 @@
 
 #include "solux/query/NumericRangeQuery.h"
 #include "solux/query/QueryPrep.h"
+#include "solux/reader/FieldReader.h"
 #include "solux/util/NumericUtils.h"
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
@@ -116,7 +117,7 @@ class NumericRangeZoneMapTest : public SoluxTest {};
 
 TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
   constexpr int32_t N = 33'000;
-  constexpr int64_t MULTI_BLOCK = Postings::NUMERIC_BLOCK_SIZE;
+  constexpr int64_t MULTI_BLOCK = IntColReader::BLOCK_SIZE;
 
   std::vector<std::vector<int64_t>> dense((size_t)N);
   std::vector<std::vector<int64_t>> optional((size_t)N);
@@ -285,13 +286,13 @@ TEST_F(NumericRangeZoneMapTest, countDeclinesDeletedSegment) {
 }
 
 TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
-  const int32_t nDocs = 2 * Postings::NUMERIC_BLOCK_SIZE + 257;
+  const int32_t nDocs = 2 * IntColReader::BLOCK_SIZE + 257;
   TestIndex index;
   Inverter& inverter = index.getInverter();
   auto& field = inverter.getIndexHandler("window_i");
   for (int32_t doc = 0; doc < nDocs; doc++) {
     inverter.startDoc();
-    field.index(inverter, doc / Postings::NUMERIC_BLOCK_SIZE);
+    field.index(inverter, doc / IntColReader::BLOCK_SIZE);
     inverter.finishDoc();
   }
   index.flush();
@@ -310,12 +311,12 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
     return scorers;
   };
   auto expected = [](int32_t doc) {
-    return doc / Postings::NUMERIC_BLOCK_SIZE == 1;
+    return doc / IntColReader::BLOCK_SIZE == 1;
   };
 
   MemPool fillPool;
   WindowFilter fill(fillPool, makeFilter(fillPool));
-  int32_t start = Postings::NUMERIC_BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
+  int32_t start = IntColReader::BLOCK_SIZE - DocsEnumMeta::L1_DOCS / 2;
   int32_t end = start + DocsEnumMeta::L1_DOCS;
   fill.prepare(start, end);
   for (int32_t doc = start; doc < end; doc++) {
@@ -363,7 +364,7 @@ TEST_F(NumericRangeZoneMapTest, materializeFiltersBitAndArrayDomains) {
   MemPool pool;
   Query::Context context(pool, *index.reader);
   NumericRangeQuery query("domain_i", 0,
-                          Postings::NUMERIC_BLOCK_SIZE - 1);
+                          IntColReader::BLOCK_SIZE - 1);
   auto* weight = static_cast<NumericRangeQuery::Weight*>(
       query.createWeight(context, 0));
   auto& segment = index.reader->segments()[0];
@@ -424,4 +425,45 @@ TEST_F(NumericRangeZoneMapTest, shuffledFallbackMatchesAllCollectionPaths) {
   auto run = runRange(*index.reader, "shuffled_i", LO, HI);
   expectRun(run, expected);
   EXPECT_FALSE(run.zoneBulkAvailable);
+}
+
+TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
+  constexpr int32_t N = IntColReader::BLOCK_SIZE;
+  constexpr int32_t OUTLIER = N / 2;
+  std::vector<std::vector<int64_t>> values((size_t)N);
+
+  TestIndex index;
+  Inverter& inverter = index.getInverter();
+  auto& field = inverter.getIndexHandler("predicted_cross_i");
+  for (int32_t doc = 0; doc < N; doc++) {
+    int64_t value = (int64_t)doc * 17 + (doc == OUTLIER ? 3 : 0);
+    values[(size_t)doc].push_back(value);
+    inverter.startDoc();
+    field.index(inverter, value);
+    inverter.finishDoc();
+  }
+  index.flush();
+  index.initReader();
+
+  auto& segment = index.reader->segments()[0];
+  FieldReader fields(segment.postingsReader());
+  ASSERT_TRUE(fields.seek("predicted_cross_i"));
+  SegFieldInfo info;
+  fields.readFieldInfo(info);
+  IntColReader column(segment.postingsReader(), info);
+  ASSERT_EQ(column.numBlocks(), 1);
+  EXPECT_NE(column.blockInfo(0).scaledSlope, 0);
+
+  int64_t target = values[(size_t)OUTLIER][0];
+  auto expected = oracle(values, target, target);
+  expectRun(runRange(*index.reader, "predicted_cross_i", target, target),
+            expected);
+
+  MemPool pool;
+  Query::Context context(pool, *index.reader);
+  NumericRangeQuery query("predicted_cross_i", target, target);
+  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+      query.createWeight(context, 0));
+  EXPECT_EQ(collect(weight->createZoneMapScorerForTests(pool, segment)),
+            expected);
 }

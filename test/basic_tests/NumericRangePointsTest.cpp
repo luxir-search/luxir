@@ -300,7 +300,7 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
                            std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<2>(complement), 1);
   auto midPoints = select("arm_sorted", 0,
-                          Postings::NUMERIC_BLOCK_SIZE - 1,
+                          IntColReader::BLOCK_SIZE - 1,
                           std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<3>(midPoints), 1);
   EXPECT_EQ(std::get<4>(midPoints), 0);
@@ -309,7 +309,7 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   EXPECT_EQ(std::get<3>(shuffledPoints), 1);
   EXPECT_FALSE(std::get<5>(shuffledPoints));
   auto zone = select("arm_scan_sorted_i", 0,
-                     Postings::NUMERIC_BLOCK_SIZE - 1,
+                     IntColReader::BLOCK_SIZE - 1,
                      std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<4>(zone), 1);
   EXPECT_EQ(std::get<3>(zone), 0);
@@ -323,11 +323,11 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   EXPECT_EQ(std::get<0>(complement),
             fullScan(*reader, "arm_sorted", 0, 26'000));
   EXPECT_EQ(std::get<0>(midPoints), fullScan(
-      *reader, "arm_sorted", 0, Postings::NUMERIC_BLOCK_SIZE - 1));
+      *reader, "arm_sorted", 0, IntColReader::BLOCK_SIZE - 1));
   EXPECT_EQ(std::get<0>(shuffledPoints),
             fullScan(*reader, "arm_shuffled", 0, 9'999));
   EXPECT_EQ(std::get<0>(zone), fullScan(
-      *reader, "arm_scan_sorted_i", 0, Postings::NUMERIC_BLOCK_SIZE - 1));
+      *reader, "arm_scan_sorted_i", 0, IntColReader::BLOCK_SIZE - 1));
   EXPECT_EQ(std::get<0>(full),
             fullScan(*reader, "arm_scan_shuffled_i", 0, 9'999));
 
@@ -366,12 +366,12 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   checkScoredArm("arm_sorted", 100, 100, 0, true);  // sparse pull, points bulk
   checkScoredArm("arm_sorted", 100, 100,
                  std::numeric_limits<int64_t>::max(), true);  // points array
-  checkScoredArm("arm_sorted", 0, Postings::NUMERIC_BLOCK_SIZE - 1,
+  checkScoredArm("arm_sorted", 0, IntColReader::BLOCK_SIZE - 1,
                  std::numeric_limits<int64_t>::max(), true);  // points bitset
   checkScoredArm("arm_sorted", 0, 26'000,
                  std::numeric_limits<int64_t>::max(), true);  // complement
   checkScoredArm("arm_scan_sorted_i", 0,
-                 Postings::NUMERIC_BLOCK_SIZE - 1,
+                 IntColReader::BLOCK_SIZE - 1,
                  std::numeric_limits<int64_t>::max(), true);  // zone map
   checkScoredArm("arm_scan_shuffled_i", 0, 9'999,
                  std::numeric_limits<int64_t>::max(), false);  // full scan

@@ -228,6 +228,132 @@ TEST_F(IntColTest, wideRangeBlock) {
   }
 }
 
+TEST_F(IntColTest, linearPackFormatCorners) {
+  auto check = [](std::span<const int64_t> expected) {
+    RAMDir dir;
+    auto file = dir.createFile("numeric");
+    OutputStream out(file.get());
+    out.writeStr("odd");
+    IntColWriter writer(out);
+    for (int64_t value : expected) writer.addInt64(value);
+    auto data = writer.finish();
+    out.close();
+    dir.finishFile(*file);
+
+    auto in = dir.openFile("numeric");
+    InputStream input(in->getInputStream());
+    IntColReader reader(
+        input, data.columnLoc, data.columnMetaOff, data.numValues);
+    EXPECT_EQ(reader.numValues(), (int64_t)expected.size());
+    EXPECT_EQ(reader.numBlocks(),
+              ((int64_t)expected.size() + IntColReader::BLOCK_SIZE - 1) /
+                  IntColReader::BLOCK_SIZE);
+
+    IntColReader::SparseValues sparse(reader);
+    IntColReader::BulkValues bulk(reader);
+    for (int64_t i = 0; i < (int64_t)expected.size(); i++) {
+      EXPECT_EQ(sparse.valueAt(i), expected[(size_t)i]) << "rank=" << i;
+      EXPECT_EQ(bulk.valueAt(i), expected[(size_t)i]) << "rank=" << i;
+    }
+    for (int64_t block = 0; block < reader.numBlocks(); block++) {
+      int64_t start = block * IntColReader::BLOCK_SIZE;
+      int64_t end = std::min<int64_t>(
+          start + IntColReader::BLOCK_SIZE, expected.size());
+      auto [minIt, maxIt] = std::minmax_element(
+          expected.begin() + start, expected.begin() + end);
+      NumBlockZone zone = reader.blockZone(block);
+      EXPECT_EQ(zone.min, *minIt);
+      EXPECT_EQ(zone.max, *maxIt);
+    }
+    return reader.blockInfo(0);
+  };
+
+  auto bits0 = check(std::array<int64_t, 1>{42});
+  EXPECT_EQ(bits0.bits, 0);
+  EXPECT_EQ(bits0.scaledSlope, 0);
+
+  auto flatWidth = [&](uint8_t bits) {
+    int64_t max = (int64_t)((1ULL << bits) - 1);
+    return check(std::array<int64_t, 5>{0, max, 1, max, 0});
+  };
+  EXPECT_EQ(flatWidth(1).bits, 1);
+  EXPECT_EQ(flatWidth(32).bits, 32);
+  EXPECT_EQ(flatWidth(33).bits, 33);
+  EXPECT_EQ(flatWidth(57).bits, 57);
+
+  auto raw = check(std::array<int64_t, 5>{
+      0, (int64_t)(1ULL << 58), 1, (int64_t)(1ULL << 58), 0});
+  EXPECT_EQ(raw.bits, NumColumnFormat::RAW_BITS);
+
+  auto gcd = check(std::array<int64_t, 5>{100, 190, 130, 160, 100});
+  EXPECT_EQ(gcd.gcd, 30);
+  EXPECT_EQ(gcd.scaledSlope, 0);
+
+  std::array<int64_t, 257> rising;
+  std::array<int64_t, 257> falling;
+  for (int64_t i = 0; i < (int64_t)rising.size(); i++) {
+    rising[(size_t)i] = 1000 + i * 17 + (i == 128 ? 3 : 0);
+    falling[(size_t)i] = 1000 + ((int64_t)falling.size() - 1 - i) * 17
+        + (i == 128 ? 3 : 0);
+  }
+  EXPECT_GT(check(rising).scaledSlope, 0);
+  EXPECT_LT(check(falling).scaledSlope, 0);
+
+  std::vector<int64_t> tail(IntColReader::BLOCK_SIZE + 17);
+  for (int64_t i = 0; i < (int64_t)tail.size(); i++) {
+    tail[(size_t)i] = i * 5 + i % 7;
+  }
+  check(tail);
+
+  auto extremes = check(std::array<int64_t, 2>{
+      std::numeric_limits<int64_t>::min(),
+      std::numeric_limits<int64_t>::max()});
+  EXPECT_EQ(extremes.gcd, std::numeric_limits<uint64_t>::max());
+
+  auto wrapping = check(std::array<int64_t, 4>{
+      std::numeric_limits<int64_t>::min(),
+      std::numeric_limits<int64_t>::min(),
+      std::numeric_limits<int64_t>::min() + 2,
+      std::numeric_limits<int64_t>::min() + 3});
+  EXPECT_EQ(wrapping.gcd, 1);
+  EXPECT_EQ(wrapping.baseBits,
+            (uint64_t)std::numeric_limits<int64_t>::max());
+}
+
+TEST_F(IntColTest, wrappingBaseBitPattern) {
+  // Literal normalized quotients q=[0,0,2], min=INT64_MIN, gcd=1. The fit
+  // lowers the intercept to -1 and therefore needs an unsigned wrapping base.
+  std::array<char, 16> payload{};
+  LinearPack::Writer writer(payload.data(), 1);
+  writer.append(1);
+  writer.append(0);
+  writer.append(1);
+  writer.finish(false);
+
+  NumBlockInfo info;
+  info.payloadOffset = 0;
+  info.baseBits = (uint64_t)std::numeric_limits<int64_t>::min() +
+      std::numeric_limits<uint64_t>::max();
+  info.gcd = 1;
+  info.scaledSlope = 1 << NumColumnFormat::SLOPE_SHIFT;
+  info.bits = 1;
+
+  std::array<char, sizeof(NumBlockInfo) + 1> unalignedMeta{};
+  memcpy(unalignedMeta.data() + 1, &info, sizeof(info));
+  NumColumn column(payload.data(), unalignedMeta.data() + 1, 3);
+  EXPECT_EQ(column.valueAt(0), std::numeric_limits<int64_t>::min());
+  EXPECT_EQ(column.valueAt(1), std::numeric_limits<int64_t>::min());
+  EXPECT_EQ(column.valueAt(2), std::numeric_limits<int64_t>::min() + 2);
+
+  int64_t decoded[NumColumn::BULK_SIZE];
+  uint32_t count;
+  EXPECT_EQ(column.decodeFrame(1, decoded, count), 0);
+  ASSERT_EQ(count, 3);
+  EXPECT_EQ(decoded[0], std::numeric_limits<int64_t>::min());
+  EXPECT_EQ(decoded[1], std::numeric_limits<int64_t>::min());
+  EXPECT_EQ(decoded[2], std::numeric_limits<int64_t>::min() + 2);
+}
+
 TEST_F(IntColTest, wideRangeUnalignedAdvance) {
   // raw64 (>32-bit-residual) blocks decode 128-value sub-blocks. An advance
   // into the middle of a sub-block must copy from the 128-aligned base, not

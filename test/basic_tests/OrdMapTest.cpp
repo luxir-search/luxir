@@ -6,6 +6,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/index/IntColWriter.h"
 #include "solux/search/OrdMap.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/IntColReader.h"
@@ -466,6 +467,55 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
       << " at segmentOrd " << segmentOrd << " (via reverse mapping), "
       << "but forward mapping says segmentOrd " << segmentOrd
       << " maps to globalOrd " << actualGlobalOrd;
+  }
+}
+
+TEST_F(OrdMapTest, relocatedGlobalColumnsLoadUnalignedMetadata) {
+  RAMFile firstSegsFile("firstSegs");
+  OutputStream firstSegsOut(&firstSegsFile);
+  IntColWriter firstSegs(firstSegsOut);
+  std::array<int64_t, 6> expectedFirstSegs = {0, 1, 2, 0, 1, 2};
+  for (int64_t value : expectedFirstSegs) firstSegs.addInt64(value);
+  auto firstSegsInfo = firstSegs.finish();
+  firstSegsOut.close();
+
+  RAMFile globDeltasFile("globDeltas");
+  OutputStream globDeltasOut(&globDeltasFile);
+  IntColWriter globDeltas(globDeltasOut);
+  std::array<int64_t, 6> expectedGlobDeltas = {0, 0, 1, 1, 2, 2};
+  for (int64_t value : expectedGlobDeltas) globDeltas.addInt64(value);
+  auto globDeltasInfo = globDeltas.finish();
+  globDeltasOut.close();
+
+  // OrdMap appends these standalone columns after its packed segment mappings.
+  // Use a deliberate three-byte mapping payload so both column-relative
+  // alignments are destroyed by relocation.
+  RAMFile payloadFile("ordMapPayload");
+  OutputStream payloadOut(&payloadFile);
+  payloadOut.write("map", 3);
+  payloadOut.close();
+
+  int64_t firstSegsLoc = payloadFile.size() + firstSegsInfo.columnLoc;
+  ASSERT_NE(firstSegsLoc % 8, 0);
+  payloadFile.destructiveAppend(firstSegsFile);
+  int64_t globDeltasLoc = payloadFile.size() + globDeltasInfo.columnLoc;
+  ASSERT_NE(globDeltasLoc % 8, 0);
+  payloadFile.destructiveAppend(globDeltasFile);
+
+  std::vector<char> relocated(payloadFile.size());
+  payloadFile.copyTo(relocated.data());
+  InputStream input(relocated.data(), relocated.data() + relocated.size());
+  IntColReader firstSegsReader(
+      input, firstSegsLoc, firstSegsInfo.columnMetaOff,
+      firstSegsInfo.numValues);
+  IntColReader globDeltasReader(
+      input, globDeltasLoc, globDeltasInfo.columnMetaOff,
+      globDeltasInfo.numValues);
+  IntColReader::SparseValues firstSegValues(firstSegsReader);
+  IntColReader::SparseValues globDeltaValues(globDeltasReader);
+  for (int64_t i = 0; i < (int64_t)expectedFirstSegs.size(); i++) {
+    EXPECT_EQ(firstSegValues.valueAt(i), expectedFirstSegs[(size_t)i]);
+    EXPECT_EQ(globDeltaValues.valueAt(i), expectedGlobDeltas[(size_t)i]);
   }
 }
 

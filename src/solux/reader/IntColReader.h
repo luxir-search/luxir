@@ -4,6 +4,8 @@
 #include "PostingsReader.h"
 #include "Postings.h"
 #include "solux/codec/Codec.h"
+#include "solux/codec/LinearPack.h"
+#include "solux/codec/NumColumnFormat.h"
 #include "solux/store/InputStream.h"
 
 namespace solux {
@@ -11,7 +13,7 @@ namespace solux {
 // Monotonic int column.
 class MonoReader {
 public:
-  constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
+  constexpr static uint32_t BLOCK_SIZE = 16384;
   // For monotonic fields, we store the slope of the line and interpolate the values (and store
   // the delta from the expected value).
   // Instead of using floating point math when decoding, we use a scaled slope and do integer math.
@@ -123,8 +125,8 @@ public:
       assert (index >= 0 && index < max);
       uint64_t start = uint64_t(index) / BULK_DECODE * BULK_DECODE;
       assert(index < start + BULK_DECODE);
-      auto bigBlock = start / Postings::NUMERIC_BLOCK_SIZE;
-      auto littleBlock = start % Postings::NUMERIC_BLOCK_SIZE / BULK_DECODE;
+      auto bigBlock = start / BLOCK_SIZE;
+      auto littleBlock = start % BLOCK_SIZE / BULK_DECODE;
       auto& block = blockMeta[bigBlock];
       uint32_t littleBlockSize = BULK_DECODE * block.bits / 8;
       const char* subBlockStart = blocks + block.blockOffset + littleBlock * littleBlockSize;
@@ -159,7 +161,7 @@ public:
         // base, not the requested index: decodedStart is the aligned start,
         // so an unaligned advance()/valueAt() would otherwise read values
         // shifted by (index - start).
-        auto rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
+        auto rankInBlock = start % BLOCK_SIZE;
         memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset) + rankInBlock, num * sizeof(int64_t));
       }
     }
@@ -188,6 +190,170 @@ public:
   };
 };
 
+// Shared numeric-column physical decode layer. Metadata is loaded with memcpy
+// because standalone columns may be relocated to an unaligned file offset.
+class NumColumn {
+public:
+  static constexpr uint32_t BLOCK_SIZE = NumColumnFormat::BLOCK_SIZE;
+  static constexpr uint32_t BULK_SIZE = NumColumnFormat::BULK_SIZE;
+  static constexpr int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
+
+private:
+  const char* blocks = nullptr;
+  const char* blockMeta = nullptr;
+  int64_t nValues = 0;
+
+  int64_t reconstruct(const NumBlockInfo& info, uint64_t rankInBlock,
+                      uint64_t residual) const {
+    uint64_t slopeTerm = (uint64_t)NumColumnFormat::slopeTerm(
+        rankInBlock, info.scaledSlope);
+    return (int64_t)(info.baseBits +
+        info.gcd * (slopeTerm + residual));
+  }
+
+public:
+  NumColumn() = default;
+
+  NumColumn(const char* blocks, const char* blockMeta, int64_t nValues)
+      : blocks(blocks), blockMeta(blockMeta), nValues(nValues) {}
+
+  int64_t numValues() const {
+    return nValues;
+  }
+
+  int64_t numBlocks() const {
+    return (nValues + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  }
+
+  NumBlockInfo blockInfo(int64_t blockNum) const {
+    assert(blockNum >= 0 && blockNum < numBlocks());
+    NumBlockInfo info;
+    memcpy(&info, blockMeta + blockNum * sizeof(info), sizeof(info));
+    return info;
+  }
+
+  int32_t valuesInBlock(int64_t blockNum) const {
+    assert(blockNum >= 0 && blockNum < numBlocks());
+    int64_t start = blockNum * (int64_t)BLOCK_SIZE;
+    return (int32_t)std::min<int64_t>(BLOCK_SIZE, nValues - start);
+  }
+
+  int64_t valueAt(int64_t rank) const {
+    assert(rank >= 0 && rank < nValues);
+    uint64_t blockNum = (uint64_t)rank / BLOCK_SIZE;
+    uint64_t rankInBlock = (uint64_t)rank % BLOCK_SIZE;
+    NumBlockInfo info = blockInfo((int64_t)blockNum);
+    const char* payload = blocks + info.payloadOffset;
+    if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
+      int64_t value;
+      memcpy(&value, payload + rankInBlock * sizeof(value), sizeof(value));
+      return value;
+    }
+    uint64_t residual = LinearPack::select64(
+        payload, rankInBlock, info.bits, LinearPack::mask64(info.bits));
+    return reconstruct(info, rankInBlock, residual);
+  }
+
+  // Decode the 128-aligned frame containing rank. Returns the global rank of
+  // out[0] and stores the number of valid values in count.
+  int64_t decodeFrame(int64_t rank, int64_t* out, uint32_t& count) const {
+    assert(rank >= 0 && rank < nValues);
+    int64_t start = rank / BULK_SIZE * BULK_SIZE;
+    int64_t blockNum = start / BLOCK_SIZE;
+    uint64_t rankInBlock = (uint64_t)start % BLOCK_SIZE;
+    NumBlockInfo info = blockInfo(blockNum);
+    count = (uint32_t)std::min<int64_t>(BULK_SIZE, nValues - start);
+    const char* payload = blocks + info.payloadOffset;
+
+    if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
+      memcpy(out, payload + rankInBlock * sizeof(int64_t),
+             count * sizeof(int64_t));
+      return start;
+    }
+
+    if (info.bits <= 32) {
+      uint32_t residuals[BULK_SIZE];
+      LinearPack::unpack128(payload, rankInBlock, count, info.bits,
+                            LinearPack::mask32(info.bits), residuals);
+      if (info.gcd == 1 && info.scaledSlope == 0) {
+        for (uint32_t i = 0; i < count; i++) {
+          out[i] = (int64_t)(info.baseBits + residuals[i]);
+        }
+      } else if (info.scaledSlope == 0) {
+        for (uint32_t i = 0; i < count; i++) {
+          out[i] = (int64_t)(info.baseBits +
+              info.gcd * (uint64_t)residuals[i]);
+        }
+      } else {
+        for (uint32_t i = 0; i < count; i++) {
+          out[i] = reconstruct(info, rankInBlock + i, residuals[i]);
+        }
+      }
+      return start;
+    }
+
+    uint64_t mask = LinearPack::mask64(info.bits);
+    for (uint32_t i = 0; i < count; i++) {
+      uint64_t residual = LinearPack::select64(
+          payload, rankInBlock + i, info.bits, mask);
+      out[i] = reconstruct(info, rankInBlock + i, residual);
+    }
+    return start;
+  }
+
+  class Bulk {
+    const NumColumn& column;
+    int64_t index_ = -1;
+    int64_t decodedStart = -1;
+    int64_t decodedEnd = -1;
+    int64_t decoded[BULK_SIZE];
+
+    void decode(int64_t index) {
+      uint32_t count;
+      decodedStart = column.decodeFrame(index, decoded, count);
+      decodedEnd = decodedStart + count;
+    }
+
+  public:
+    explicit Bulk(const NumColumn& column) : column(column) {}
+
+    int64_t index() const {
+      return index_;
+    }
+
+    int64_t value() const {
+      assert(index_ >= decodedStart && index_ < decodedEnd);
+      return decoded[index_ - decodedStart];
+    }
+
+    int64_t next() {
+      if (++index_ >= column.numValues()) {
+        index_ = ENDINDEX;
+        return index_;
+      }
+      if (index_ >= decodedEnd) decode(index_);
+      return index_;
+    }
+
+    int64_t advance(int64_t target) {
+      assert(target > index_);
+      index_ = target;
+      if (index_ >= column.numValues()) {
+        index_ = ENDINDEX;
+        return index_;
+      }
+      if (index_ < decodedStart || index_ >= decodedEnd) decode(index_);
+      return index_;
+    }
+
+    int64_t valueAt(int64_t index) {
+      assert(index >= 0 && index < column.numValues());
+      if (index < decodedStart || index >= decodedEnd) decode(index);
+      return decoded[index - decodedStart];
+    }
+  };
+};
+
 
 // Some logical columns have multiple underlying columns implementing them:
 // A sparse multi-valued integer column:
@@ -197,19 +363,14 @@ public:
 //
 class IntColReader {
 public:
+  static constexpr uint32_t BLOCK_SIZE = NumColumn::BLOCK_SIZE;
   // Sentinel values.  ENDDOC is used when indexing documents, since there are only 2B in a segment.
   constexpr static int32_t ENDDOC = std::numeric_limits<int32_t>::max();
 
   // ENDINDEX is used when indexing values, since there can be more than 2B in a segment due to multi-valued fields.
   constexpr static int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
 
-  struct NumericBlockInfo {
-    int64_t gcd;
-    int64_t min;
-    int64_t max;
-    uint64_t format; // currently number of bits if <= 32.
-    int64_t blockOffset;  // byte offset of compressed block from the start of the column
-  };
+  using NumericBlockInfo = NumBlockInfo;
 
   // Segment-wide extrema trailer contract. Values are in the column's stored
   // int64 representation: raw for INT/DATE, sortable-encoded for FLOAT/DOUBLE.
@@ -224,8 +385,8 @@ public:
 private:
   DocsReader docs;
   InputStream columnIS;
-  const NumericBlockInfo* blockMeta;  // array of block metadata
-  const char* blocks;                 // start of the compressed blocks of data
+  NumColumn values;
+  const char* zoneMeta = nullptr;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
@@ -240,16 +401,15 @@ public:
     nvals = fieldInfo.numValues;
     docsWithField = fieldInfo.docsWithField;
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-    blocks = columnIS.ptr();
-    blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
+    const char* blocks = columnIS.ptr();
+    const char* blockMeta = blocks + fieldInfo.columnMetaOff;
+    values = NumColumn(blocks, blockMeta, nvals);
+    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
     
     // Read min/max values that come after the block metadata
     if (nvals > 0) {
-      // Calculate the number of blocks
-      int64_t numBlocks = (nvals + Postings::NUMERIC_BLOCK_SIZE - 1) / Postings::NUMERIC_BLOCK_SIZE;
-      // Min/max are stored right after the block metadata array as vlongs
-      const char* minMaxPtr = blocks + fieldInfo.columnMetaOff + numBlocks * sizeof(NumericBlockInfo);
-      const char* endPtr = blocks + columnIS.size(); // We need an end pointer for safety
+      const char* minMaxPtr = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+      const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
     }
@@ -261,24 +421,27 @@ public:
 
   IntColReader(InputStream &is, int64_t columnOff, int64_t columnMetaOff) : docs(0), columnIS(is) {
     columnIS.seek(columnOff);
-    blocks = columnIS.ptr();
-    blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + columnMetaOff);
     nvals = 0;  // Initialize to 0 - caller should set this if needed
     docsWithField = 0;
+    const char* blocks = columnIS.ptr();
+    const char* blockMeta = blocks + columnMetaOff;
+    values = NumColumn(blocks, blockMeta, nvals);
+    zoneMeta = blockMeta;
   }
 
   IntColReader(InputStream &is, int64_t columnOff, int64_t columnMetaOff, int64_t numValues) : docs(0), columnIS(is) {
     columnIS.seek(columnOff);
-    blocks = columnIS.ptr();
-    blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + columnMetaOff);
     nvals = numValues;
     docsWithField = static_cast<int32_t>(numValues);
+    const char* blocks = columnIS.ptr();
+    const char* blockMeta = blocks + columnMetaOff;
+    values = NumColumn(blocks, blockMeta, nvals);
+    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
     
     // Read min/max values that come after the block metadata
     if (nvals > 0) {
-      int64_t numBlocks = (nvals + Postings::NUMERIC_BLOCK_SIZE - 1) / Postings::NUMERIC_BLOCK_SIZE;
-      const char* minMaxPtr = blocks + columnMetaOff + numBlocks * sizeof(NumericBlockInfo);
-      const char* endPtr = blocks + columnIS.size();
+      const char* minMaxPtr = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+      const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
     }
@@ -319,18 +482,22 @@ public:
   }
 
   int64_t numBlocks() const {
-    return (nvals + Postings::NUMERIC_BLOCK_SIZE - 1) / Postings::NUMERIC_BLOCK_SIZE;
+    return values.numBlocks();
   }
 
-  const NumericBlockInfo& blockInfo(int64_t blockNum) const {
+  NumericBlockInfo blockInfo(int64_t blockNum) const {
+    return values.blockInfo(blockNum);
+  }
+
+  NumBlockZone blockZone(int64_t blockNum) const {
     assert(blockNum >= 0 && blockNum < numBlocks());
-    return blockMeta[blockNum];
+    NumBlockZone zone;
+    memcpy(&zone, zoneMeta + blockNum * sizeof(zone), sizeof(zone));
+    return zone;
   }
 
   int32_t valuesInBlock(int64_t blockNum) const {
-    assert(blockNum >= 0 && blockNum < numBlocks());
-    int64_t start = blockNum * (int64_t)Postings::NUMERIC_BLOCK_SIZE;
-    return (int32_t)std::min<int64_t>(Postings::NUMERIC_BLOCK_SIZE, nvals - start);
+    return values.valuesInBlock(blockNum);
   }
 
   bool denseDocsWithValue() const {
@@ -349,38 +516,24 @@ public:
   int64_t decodeResidualSubBlock(int64_t valueRank, uint32_t* decoded,
                                  uint32_t& count) const {
     constexpr int64_t SUB_BLOCK_SIZE = 128;
-    static_assert(Postings::NUMERIC_BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
+    static_assert(BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
     assert(valueRank >= 0 && valueRank < nvals);
     int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
-    int64_t blockNum = start / Postings::NUMERIC_BLOCK_SIZE;
-    int64_t rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
-    const auto& block = blockMeta[blockNum];
-    assert(block.format <= 32);
-    uint32_t subBlockBytes = (uint32_t)(SUB_BLOCK_SIZE * (int64_t)block.format / 8);
-    const char* subBlockStart = blocks + block.blockOffset
-        + (rankInBlock / SUB_BLOCK_SIZE) * subBlockBytes;
+    int64_t blockNum = start / BLOCK_SIZE;
+    int64_t rankInBlock = start % BLOCK_SIZE;
+    NumericBlockInfo block = blockInfo(blockNum);
+    assert(block.bits <= 32 && block.scaledSlope == 0);
     count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
-    IndexCodec::numericCodec.decodeSingleBlock(subBlockStart, decoded, count,
-                                                (uint8_t)block.format);
+    LinearPack::unpack128(
+        columnIS.ptr() + block.payloadOffset, rankInBlock, count, block.bits,
+        LinearPack::mask32(block.bits), decoded);
     return start;
   }
 
-  // Raw blocks (format > 32) already contain reconstructed int64 values.
-  // Copy the 128-value sub-block containing valueRank into decoded.
+  // Decode reconstructed values for packed predicted/wide or raw blocks.
   int64_t decodeRawSubBlock(int64_t valueRank, int64_t* decoded,
                             uint32_t& count) const {
-    constexpr int64_t SUB_BLOCK_SIZE = 128;
-    static_assert(Postings::NUMERIC_BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
-    assert(valueRank >= 0 && valueRank < nvals);
-    int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
-    int64_t blockNum = start / Postings::NUMERIC_BLOCK_SIZE;
-    int64_t rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
-    const auto& block = blockMeta[blockNum];
-    assert(block.format > 32);
-    count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
-    memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset)
-        + rankInBlock, count * sizeof(int64_t));
-    return start;
+    return values.decodeFrame(valueRank, decoded, count);
   }
 
   /// Retrieves the [startValueRank, endValueRank) range for the given doc rank.
@@ -406,14 +559,13 @@ public:
   // It needs to support more than int32 indexes because of multi-valued fields
   // (i.e. even if you only have 2B docs, a column could have > 4B values).
   class SparseValues {
-    const NumericBlockInfo* blockMeta;  // array of block metadata
-    const char* blocks;                 // start of the compressed blocks of data
+    const NumColumn& values;
     int64_t index_ = -1;
     int64_t max;
   public:
 
-    SparseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
-    }
+    SparseValues(const IntColReader& col)
+        : values(col.values), max(col.numValues()) {}
 
     int64_t index() {
       return index_;
@@ -432,22 +584,7 @@ public:
 
     // NOTE: rank must be in bounds!
     int64_t valueAt(int64_t index) {
-      assert (index >= 0 && index < max);
-      auto blockNum = (uint64_t)index / Postings::NUMERIC_BLOCK_SIZE;
-      auto rankInBlock = (uint64_t)index % Postings::NUMERIC_BLOCK_SIZE;
-      auto& block = blockMeta[blockNum];
-      const char* blockStart = blocks + block.blockOffset;
-      // depending on the exact format, valuesInBlock may not be needed.
-      auto valuesInBlock = (blockNum == uint64_t(max) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
-      if (block.format <= 32) {
-        auto unscaled = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.format);
-        // unsigned math: delta * gcd can exceed int64 for blocks whose range
-        // spans most of the int64 space (see IntColWriter::addBlock)
-        return int64_t(uint64_t(unscaled) * uint64_t(block.gcd) + uint64_t(block.min));
-      } else {
-        // 64-bit, temp impl uncompressed
-        return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
-      }
+      return values.valueAt(index);
     }
 
     int64_t advance(int64_t target) {
@@ -459,92 +596,30 @@ public:
 
   /// Decodes sub-blocks at a time when one needs a decent percent of the values.
   class BulkValues {
-    constexpr static uint32_t BULK_DECODE = 128;
-    const NumericBlockInfo* blockMeta;  // array of block metadata
-    const char* blocks;                 // start of the compressed blocks of data
-    int64_t index_ = -1;
-    int64_t max;
-    int64_t decodedStart = -1;
-    int64_t decodedMax = 0;
-    // OPT: when max < BULK_DECODE, we don't need this much space.  We could pool allocate if we need to save more memory.
-    int64_t decoded[BULK_DECODE];
+    NumColumn::Bulk values;
   public:
 
-    BulkValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
-    }
+    BulkValues(const IntColReader& col) : values(col.values) {}
 
     int64_t index() {
-      return index_;
+      return values.index();
     }
 
     int64_t value() {
-      assert (index_ >= decodedStart && index_ < decodedMax);
-      return decoded[index_ - decodedStart];
+      return values.value();
     }
 
     int64_t next() {
-      if (++index_ < decodedMax) {
-        return index_;
-      }
-      if (index_ >= max) {
-        index_ = ENDINDEX;
-        return index_;
-      }
-      decodeBlock(index_);
-      return index_;
-    }
-
-    void decodeBlock(int64_t index) {
-      // it's not clear to me what type of alignment will work for SoluxSIMDFor here.
-      // For now, we'll be conservative and align to 128.
-      assert (index >= 0 && index < max);
-      uint64_t start = uint64_t(index) / BULK_DECODE * BULK_DECODE;
-      assert(index < start + BULK_DECODE);
-      auto bigBlock = start / Postings::NUMERIC_BLOCK_SIZE;
-      auto littleBlock = start % Postings::NUMERIC_BLOCK_SIZE / BULK_DECODE;
-      auto& block = blockMeta[bigBlock];
-      uint32_t littleBlockSize = BULK_DECODE * block.format / 8;
-      const char* subBlockStart = blocks + block.blockOffset + littleBlock * littleBlockSize;
-      decodedStart = start;
-      decodedMax = std::min(decodedStart + BULK_DECODE, max);
-      uint32_t num = decodedMax - decodedStart;
-      if (block.format <= 32) {
-        uint32_t ints[BULK_DECODE];
-
-        if constexpr (BULK_DECODE == 128) {
-          IndexCodec::numericCodec.decodeSingleBlock(subBlockStart, ints, num, block.format);
-        } else {
-          IndexCodec::numericCodec.decodeWithMeta(subBlockStart, ints, num, block.format);
-        }
-
-        for (uint32_t i = 0; i < num; i++) {
-          // unsigned math: delta * gcd can exceed int64 for blocks whose range
-          // spans most of the int64 space (see IntColWriter::addBlock)
-          decoded[i] = int64_t(uint64_t(ints[i]) * uint64_t(block.gcd) + uint64_t(block.min));
-        }
-      } else {
-        // 64-bit, temp impl uncompressed. Copy from the 128-aligned decode
-        // base, not the requested index: decodedStart is the aligned start,
-        // so an unaligned advance()/valueAt() would otherwise read values
-        // shifted by (index - start).
-        auto rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
-        memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset) + rankInBlock, num * sizeof(int64_t));
-      }
+      return values.next();
     }
 
     int64_t advance(int64_t target) {
-      assert (target >= 0 && target < max);
-      index_ = target;
-      return target;
+      return values.advance(target);
     }
 
     int64_t valueAt(int64_t index) {
-      if (index >= decodedMax || index < decodedStart) {
-        decodeBlock(index);
-      }
-      return decoded[index - decodedStart];
+      return values.valueAt(index);
     }
-
   };
 
 
