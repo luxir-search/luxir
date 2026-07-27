@@ -71,9 +71,10 @@ The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker
 (mold), and a precompiled header are used when available. Each preset builds
 into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`.
 
-Use the GCC presets. The Clang presets are disabled unless
-`SOLUX_ENABLE_CLANG=1`, and the current FAISS/OpenMP dependency roots are not
-prepared for them.
+The presets are GCC-only. Clang presets existed but were never usable: FAISS and
+OpenMP are only set up in the GCC vcpkg roots, so configuring one failed at
+`find_package(OpenMP)`. Building for Clang means preparing a Clang vcpkg root
+with those dependencies first, then adding the preset back.
 
 ## Fresh checkout / after `rm -rf build/`
 

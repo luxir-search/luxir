@@ -44,19 +44,6 @@
     },
 
     {
-      "name": "base-clang",
-      "hidden": true,
-      "condition": {
-        "type": "equals",
-        "lhs": "$env{SOLUX_ENABLE_CLANG}",
-        "rhs": "1"
-      },
-      "cacheVariables": {
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++"
-      }
-    },
-    {
       "name": "base-gcc",
       "hidden": true,
       "cacheVariables": {
@@ -102,31 +89,6 @@
       "inherits": ["base", "base-gcc", "base-release", "features-asan"],
       "displayName": "GCC Release ASAN",
       "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
-    },
-    {
-      "name": "clang-debug",
-      "inherits": ["base", "base-clang", "base-debug"],
-      "displayName": "Clang Debug",
-      "description": "Clang variant, DISABLED by default (set SOLUX_ENABLE_CLANG=1 to enable). FAISS + OpenMP are only set up in the gcc vcpkg repos, so configuring clang fails at find_package(OpenMP) / faiss here. Use the gcc presets.",
-      "toolchainFile": "/opt/vcpkg_clang/scripts/buildsystems/vcpkg.cmake"
-    },
-    {
-      "name": "clang-release",
-      "inherits": ["base", "base-clang", "base-release"],
-      "displayName": "Clang Release",
-      "toolchainFile": "/opt/vcpkg_clang/scripts/buildsystems/vcpkg.cmake"
-    },
-    {
-      "name": "clang-debug-asan",
-      "inherits": ["base", "base-clang", "base-debug", "features-asan"],
-      "displayName": "Clang Debug ASAN",
-      "toolchainFile": "/opt/vcpkg_clang_asan/scripts/buildsystems/vcpkg.cmake"
-    },
-    {
-      "name": "clang-release-asan",
-      "inherits": ["base", "base-clang", "base-release", "features-asan"],
-      "displayName": "Clang Release ASAN",
-      "toolchainFile": "/opt/vcpkg_clang_asan/scripts/buildsystems/vcpkg.cmake"
     }
   ],
 
