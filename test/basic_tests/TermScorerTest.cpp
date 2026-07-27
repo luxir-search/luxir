@@ -1955,6 +1955,7 @@ void addCrossSegmentAccumulatorDocs(CollectionHelper& helper, std::vector<std::v
 
 DisjunctionTopKRun runCrossSegmentTermTopK(IndexReader& reader, int32_t topK,
                                            bool allowPruning,
+                                           int32_t segmentCount = std::numeric_limits<int32_t>::max(),
                                            MaxScoreAccumulator* accumulator = nullptr) {
   MemPool pool;
   Query::Context qContext(pool, reader);
@@ -1963,7 +1964,9 @@ DisjunctionTopKRun runCrossSegmentTermTopK(IndexReader& reader, int32_t topK,
   TopDocsCollector collector(topK);
 
   auto segments = qContext.topReader.segments();
-  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+  for (int32_t segnum = 0;
+       segnum < (int32_t) segments.size() && segnum < segmentCount;
+       segnum++) {
     auto* scorer = weight->createScorer(pool, segments[segnum]);
     if (scorer == nullptr) continue;
     collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning, accumulator);
@@ -6471,20 +6474,12 @@ TEST_F(TermScorerTest, filterOnlyBulkDomainsMatchPull) {
   }
 }
 
-TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
-  const int32_t numTerms = 32;
-  const int32_t nDocs =
-      (int32_t)scaleTestWork(1) * DocsEnumMeta::L1_DOCS + 37;
+void checkBulkCountDomainDisjunctionDomainDriveMatchesPull(
+    IndexReader& reader, int32_t numTerms) {
   const int32_t filterStep = 512;
-  TestIndex testIndex;
-  TestField field(testIndex, "body_w");
-  field.startIndexing();
-  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
-  testIndex.flush();
-  field.startReading();
 
   MemPool pool;
-  Query::Context qContext(pool, *testIndex.reader);
+  Query::Context qContext(pool, reader);
   auto& segment = qContext.topReader.segments()[0];
   std::vector<std::string> termStrings = makeMtTermStrings(numTerms);
   std::vector<std::string_view> termViews;
@@ -7513,15 +7508,8 @@ TEST_F(TermScorerTest, CompetitiveScoreThresholdSeededMatchesReference) {
   EXPECT_EQ(docs[2], 4);
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes) {
-  const int32_t maxClauses = 6;
-  TestIndex testIndex;
-  TestField field(testIndex, "body_w");
-  field.startIndexing();
-  addSweepDisjunctionDocs(field, maxClauses);
-  testIndex.flush();
-  field.startReading();
-  auto reader = testIndex.reader;
+void checkMaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes(
+    IndexReader& reader, int32_t maxClauses, int32_t effort) {
   auto termStrings = makeSweepTermStrings(maxClauses);
   auto views = termViews(termStrings);
 
@@ -7529,9 +7517,9 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
   int64_t compactionDrops = 0;
   auto check = [&](int32_t clauses, int32_t topK) {
     std::span<const std::string_view> terms(views.data(), (size_t) clauses);
-    auto expected = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, topK);
+    auto expected = runFilteredExhaustiveTermDisjunctionTopK(reader, terms, topK);
     SkipStatsGuard stats;
-    auto actual = runFilteredBulkTermDisjunctionTopK(*reader, terms, topK);
+    auto actual = runFilteredBulkTermDisjunctionTopK(reader, terms, topK);
     sweepWindows += SkipStats::maxScoreSweepWindows;
     compactionDrops += SkipStats::maxScoreBufferCompactions;
     assertSameTopKDocs(expected, actual, topK);
@@ -7555,15 +7543,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
   EXPECT_GT(compactionDrops, 0);
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerCostAwareOrderIsGuardedAndExact) {
-  TestIndex testIndex;
-  TestField field(testIndex, "body_w");
-  field.startIndexing();
-  addSweepDisjunctionDocs(field, 4);
-  testIndex.flush();
-  field.startReading();
-  auto reader = testIndex.reader;
-
+void checkMaxScoreBulkScorerCostAwareOrderIsGuardedAndExact(IndexReader& reader) {
   std::vector<TermQuery> queries;
   queries.emplace_back("body_w", "sweep0", 8.0f);
   queries.emplace_back("body_w", "sweep1");
@@ -7574,9 +7554,9 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerCostAwareOrderIsGuardedAndExact) {
 
   for (int32_t clauses : {3, 4}) {
     std::span<Query*> selected(optional.data(), (size_t) clauses);
-    auto expected = runBooleanTopK(*reader, empty, selected, 11, false);
+    auto expected = runBooleanTopK(reader, empty, selected, 11, false);
     bool usedCostOrder = false;
-    auto actual = runBulkBooleanTopK(*reader, selected, 11, &usedCostOrder);
+    auto actual = runBulkBooleanTopK(reader, selected, 11, &usedCostOrder);
     EXPECT_EQ(clauses >= 4, usedCostOrder);
     assertSameTopKDocs(expected, actual, 11);
   }
@@ -7825,15 +7805,8 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryBehavior) {
 
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisingTheta) {
-  const int32_t maxClauses = 8;
-  TestIndex testIndex;
-  TestField field(testIndex, "body_w");
-  field.startIndexing();
-  addSweepDisjunctionDocs(field, maxClauses);
-  testIndex.flush();
-  field.startReading();
-  auto reader = testIndex.reader;
+void checkMaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisingTheta(
+    IndexReader& reader, int32_t maxClauses) {
   auto termStrings = makeSweepTermStrings(maxClauses);
   auto views = termViews(termStrings);
 
@@ -7841,15 +7814,40 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisi
   for (int32_t clauses = 2; clauses <= maxClauses; clauses++) {
     std::span<const std::string_view> terms(views.data(), (size_t) clauses);
     PartitionLatchGuard disabledLatch(true);
-    auto disabled = runFilteredBulkTermDisjunctionTopK(*reader, terms, clauses + 3);
+    auto disabled = runFilteredBulkTermDisjunctionTopK(reader, terms, clauses + 3);
     {
       PartitionLatchGuard enabledLatch(false);
       SkipStatsGuard stats;
-      auto enabled = runFilteredBulkTermDisjunctionTopK(*reader, terms, clauses + 3);
+      auto enabled = runFilteredBulkTermDisjunctionTopK(reader, terms, clauses + 3);
       assertSameTopKDocs(disabled, enabled, clauses + 3);
-      auto exhaustive = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, clauses + 3);
+      auto exhaustive = runFilteredExhaustiveTermDisjunctionTopK(reader, terms, clauses + 3);
       assertSameTopKDocs(exhaustive, enabled, clauses + 3);
     }
+  }
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerSweepCorpusChecks) {
+  constexpr int32_t maxClauses = 8;
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  addSweepDisjunctionDocs(field, maxClauses);
+  testIndex.flush();
+  field.startReading();
+
+  {
+    SCOPED_TRACE("BufferSweepsMatchExhaustiveAcrossShapes");
+    checkMaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes(
+        *testIndex.reader, 6, effort);
+  }
+  {
+    SCOPED_TRACE("CostAwareOrderIsGuardedAndExact");
+    checkMaxScoreBulkScorerCostAwareOrderIsGuardedAndExact(*testIndex.reader);
+  }
+  {
+    SCOPED_TRACE("PartitionLatchMatchesDisabledAcrossRisingTheta");
+    checkMaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisingTheta(
+        *testIndex.reader, maxClauses);
   }
 }
 
@@ -8056,10 +8054,8 @@ TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
   }
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFilteredWindow) {
-  CollectionHelper helper("main");
-  const int32_t windowStart = DocsEnumMeta::L1_DOCS;
-  const int32_t windowEnd = 2 * DocsEnumMeta::L1_DOCS;
+void addHighThetaTwoClauseDocs(CollectionHelper& helper,
+                               int32_t windowStart, int32_t windowEnd) {
   const int32_t nDocs = windowEnd + 31;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
@@ -8067,37 +8063,25 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFiltere
     std::string body;
     int32_t local = doc - windowStart;
     if (doc >= windowStart && doc < windowEnd) {
-      if ((local % 2) == 0) appendRepeatedTerm(body, "direct_a", 1);
-      if ((local % 3) == 0) appendRepeatedTerm(body, "direct_b", 1);
+      if ((local % 2) == 0) appendRepeatedTerm(body, "high_a", 1);
+      if ((local % 3) == 0) appendRepeatedTerm(body, "high_b", 1);
     } else {
-      appendRepeatedTerm(body, "direct_a", 1);
-      appendRepeatedTerm(body, "direct_b", 1);
+      appendRepeatedTerm(body, "high_a", 1);
+      appendRepeatedTerm(body, "high_b", 1);
     }
-    appendRepeatedTerm(body, "direct_pad", 3);
-    docs.push_back(flatdoc("id", "direct_" + std::to_string(doc), "body_w", body));
+    appendRepeatedTerm(body, "high_pad", 3);
+    docs.push_back(flatdoc("id", "high_" + std::to_string(doc), "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
-  std::array<std::string_view, 2> terms = {"direct_a", "direct_b"};
+}
 
-  auto scores = exhaustiveWindowScores(*reader, terms, windowStart, windowEnd);
-  float maxSingle = std::numeric_limits<float>::lowest();
-  float minBoth = std::numeric_limits<float>::infinity();
-  for (auto hit : scores) {
-    int32_t local = hit.doc - windowStart;
-    if ((local % 6) == 0) {
-      minBoth = std::min(minBoth, hit.score);
-    } else {
-      maxSingle = std::max(maxSingle, hit.score);
-    }
-  }
-  ASSERT_GT(minBoth, maxSingle);
-  float theta = (maxSingle + minBoth) * 0.5f;
-
+void checkMaxScoreBulkScorerSingleEssentialDirectFillMatchesFilteredWindow(
+    IndexReader& reader, std::span<const std::string_view> terms,
+    int32_t windowStart, int32_t windowEnd, float theta) {
   BulkDomainDriveGuard domainDriveGuard(true);
-  auto unfiltered = runSingleEssentialBulkWindow(*reader, terms, windowStart, windowEnd,
+  auto unfiltered = runSingleEssentialBulkWindow(reader, terms, windowStart, windowEnd,
                                                  theta, false);
-  auto filtered = runSingleEssentialBulkWindow(*reader, terms, windowStart, windowEnd,
+  auto filtered = runSingleEssentialBulkWindow(reader, terms, windowStart, windowEnd,
                                                theta, true);
 
   EXPECT_GT(unfiltered.directFills, 0);
@@ -8112,45 +8096,11 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFiltere
   }
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction) {
-  CollectionHelper helper("main");
-  const int32_t windowStart = DocsEnumMeta::L1_DOCS;
-  const int32_t windowEnd = 2 * DocsEnumMeta::L1_DOCS;
-  const int32_t nDocs = windowEnd + 31;
-  std::vector<Doc> docs;
-  docs.reserve((size_t) nDocs);
-  for (int32_t doc = 0; doc < nDocs; doc++) {
-    std::string body;
-    int32_t local = doc - windowStart;
-    if (doc >= windowStart && doc < windowEnd) {
-      if ((local % 2) == 0) appendRepeatedTerm(body, "req_a", 1);
-      if ((local % 3) == 0) appendRepeatedTerm(body, "req_b", 1);
-    } else {
-      appendRepeatedTerm(body, "req_a", 1);
-      appendRepeatedTerm(body, "req_b", 1);
-    }
-    appendRepeatedTerm(body, "req_pad", 3);
-    docs.push_back(flatdoc("id", "req_" + std::to_string(doc), "body_w", body));
-  }
-  helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
-  std::array<std::string_view, 2> terms = {"req_a", "req_b"};
-
-  auto scores = exhaustiveWindowScores(*reader, terms, windowStart, windowEnd);
-  float maxSingle = std::numeric_limits<float>::lowest();
-  float minBoth = std::numeric_limits<float>::infinity();
+void checkMaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction(
+    IndexReader& reader, std::span<const std::string_view> terms,
+    std::span<const WindowScore> scores,
+    int32_t windowStart, int32_t windowEnd, float theta) {
   std::vector<int32_t> expectedDocs;
-  for (auto hit : scores) {
-    int32_t local = hit.doc - windowStart;
-    bool both = (local % 6) == 0;
-    if (both) {
-      minBoth = std::min(minBoth, hit.score);
-    } else {
-      maxSingle = std::max(maxSingle, hit.score);
-    }
-  }
-  ASSERT_GT(minBoth, maxSingle);
-  float theta = (maxSingle + minBoth) * 0.5f;
   for (auto hit : scores) {
     if (hit.score >= theta) {
       expectedDocs.push_back(hit.doc);
@@ -8159,7 +8109,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClaus
   ASSERT_FALSE(expectedDocs.empty());
 
   MemPool pool;
-  Query::Context qContext(pool, *reader);
+  Query::Context qContext(pool, reader);
   auto& segment = qContext.topReader.segments()[0];
   auto* bulk = createBulkTermDisjunctionScorer(pool, qContext, segment, terms);
   ASSERT_NE(bulk, nullptr);
@@ -8181,10 +8131,44 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClaus
   EXPECT_GT(SkipStats::maxScoreBufferCompactions, 0);
 
   MemPool countPool;
-  Query::Context countContext(countPool, *reader);
+  Query::Context countContext(countPool, reader);
   auto& countSegment = countContext.topReader.segments()[0];
   EXPECT_EQ(countBulkTermDisjunctionSegment(countPool, countContext, countSegment, terms, nullptr),
             countPullTermDisjunctionSegment(countPool, countContext, countSegment, terms, nullptr));
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerHighThetaTwoClauseCorpusChecks) {
+  constexpr int32_t windowStart = DocsEnumMeta::L1_DOCS;
+  constexpr int32_t windowEnd = 2 * DocsEnumMeta::L1_DOCS;
+  CollectionHelper helper("main");
+  addHighThetaTwoClauseDocs(helper, windowStart, windowEnd);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  std::array<std::string_view, 2> terms = {"high_a", "high_b"};
+
+  auto scores = exhaustiveWindowScores(*reader, terms, windowStart, windowEnd);
+  float maxSingle = std::numeric_limits<float>::lowest();
+  float minBoth = std::numeric_limits<float>::infinity();
+  for (auto hit : scores) {
+    int32_t local = hit.doc - windowStart;
+    if ((local % 6) == 0) {
+      minBoth = std::min(minBoth, hit.score);
+    } else {
+      maxSingle = std::max(maxSingle, hit.score);
+    }
+  }
+  ASSERT_GT(minBoth, maxSingle);
+  float theta = (maxSingle + minBoth) * 0.5f;
+
+  {
+    SCOPED_TRACE("SingleEssentialDirectFillMatchesFilteredWindow");
+    checkMaxScoreBulkScorerSingleEssentialDirectFillMatchesFilteredWindow(
+        *reader, terms, windowStart, windowEnd, theta);
+  }
+  {
+    SCOPED_TRACE("RequiredPromotionMakesHighThetaTwoClauseConjunction");
+    checkMaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction(
+        *reader, terms, scores, windowStart, windowEnd, theta);
+  }
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
@@ -8215,38 +8199,23 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
   }
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
-  const int32_t numTerms = 32;
-  const int32_t nDocs = 12 * Postings::DOCS_BLOCK_SIZE + 37;
+void checkMaxScoreBulkScorerBs1BitsetFilterMatchesPull(
+    IndexReader& reader, int32_t numTerms) {
   const int32_t topK = 100;
-  TestIndex testIndex;
-  TestField field(testIndex, "body_w");
-  field.startIndexing();
-  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
-  testIndex.flush();
-  field.startReading();
 
-  auto pull = runDenseFilteredPullTopK(*testIndex.reader, numTerms, topK);
+  auto pull = runDenseFilteredPullTopK(reader, numTerms, topK);
   BulkDomainDriveGuard guard(true);
-  auto bulk = runDenseFilteredBulkTopK(*testIndex.reader, numTerms, topK);
+  auto bulk = runDenseFilteredBulkTopK(reader, numTerms, topK);
   ASSERT_GT(bulk.bs1Windows, 0);
   assertSameTopKDocs(pull, bulk, topK);
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
-  const int32_t numTerms = 32;
-  const int32_t nDocs = 12 * Postings::DOCS_BLOCK_SIZE + 37;
-  TestIndex testIndex;
-  TestField field(testIndex, "body_w");
-  field.startIndexing();
-  addDenseManyClauseDisjunctionDocs(field, nDocs, numTerms);
-  testIndex.flush();
-  field.startReading();
-
+void checkMaxScoreBulkScorerBs1OnlyForAllEssentialWindows(
+    IndexReader& reader, int32_t numTerms) {
   float partialThreshold = 0.0f;
   {
     MemPool pool;
-    Query::Context qContext(pool, *testIndex.reader);
+    Query::Context qContext(pool, reader);
     std::vector<std::string> terms;
     std::vector<TermQuery> queries;
     std::vector<Query*> optional;
@@ -8268,7 +8237,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
 
   {
     MemPool pool;
-    Query::Context qContext(pool, *testIndex.reader);
+    Query::Context qContext(pool, reader);
     std::vector<std::string> terms;
     std::vector<TermQuery> queries;
     std::vector<Query*> optional;
@@ -8286,12 +8255,33 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
   }
 }
 
-TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
-  const int32_t numTerms = 32;
-  const int32_t fullGroups = 1 + (int32_t)scaleTestWork(1);
-  const int32_t nDocs = fullGroups * DocsEnumMeta::L1_DOCS + 37;
+void checkMaxScoreBulkScorerSelectiveDomainDriveMatchesStream(
+    IndexReader& reader, int32_t numTerms) {
   const int32_t topK = 50;
   const int32_t filterStep = 512;
+
+  for (bool arrayDocSet : {false, true}) {
+    auto pull = runDenseFilteredPullTopK(
+        reader, numTerms, topK, filterStep, arrayDocSet);
+    DisjunctionTopKRun stream;
+    {
+      BulkDomainDriveGuard guard(true);
+      stream = runDenseFilteredBulkTopK(
+          reader, numTerms, topK, filterStep, arrayDocSet);
+    }
+    auto drive = runDenseFilteredBulkTopK(
+        reader, numTerms, topK, filterStep, arrayDocSet);
+
+    ASSERT_GT(drive.domainDriveWindows, 1) << "arrayDocSet=" << arrayDocSet;
+    assertSameTopKDocs(stream, drive, topK);
+    assertSameTopKDocs(pull, drive, topK);
+  }
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerDenseCorpusChecks) {
+  constexpr int32_t numTerms = 32;
+  const int32_t fullGroups = 1 + (int32_t)scaleTestWork(1);
+  const int32_t nDocs = fullGroups * DocsEnumMeta::L1_DOCS + 37;
   TestIndex testIndex;
   TestField field(testIndex, "body_w");
   field.startIndexing();
@@ -8299,21 +8289,25 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
   testIndex.flush();
   field.startReading();
 
-  for (bool arrayDocSet : {false, true}) {
-    auto pull = runDenseFilteredPullTopK(
-        *testIndex.reader, numTerms, topK, filterStep, arrayDocSet);
-    DisjunctionTopKRun stream;
-    {
-      BulkDomainDriveGuard guard(true);
-      stream = runDenseFilteredBulkTopK(
-          *testIndex.reader, numTerms, topK, filterStep, arrayDocSet);
-    }
-    auto drive = runDenseFilteredBulkTopK(
-        *testIndex.reader, numTerms, topK, filterStep, arrayDocSet);
-
-    ASSERT_GT(drive.domainDriveWindows, 1) << "arrayDocSet=" << arrayDocSet;
-    assertSameTopKDocs(stream, drive, topK);
-    assertSameTopKDocs(pull, drive, topK);
+  {
+    SCOPED_TRACE("bulkCountDomainDisjunctionDomainDriveMatchesPull");
+    checkBulkCountDomainDisjunctionDomainDriveMatchesPull(
+        *testIndex.reader, numTerms);
+  }
+  {
+    SCOPED_TRACE("Bs1BitsetFilterMatchesPull");
+    checkMaxScoreBulkScorerBs1BitsetFilterMatchesPull(
+        *testIndex.reader, numTerms);
+  }
+  {
+    SCOPED_TRACE("Bs1OnlyForAllEssentialWindows");
+    checkMaxScoreBulkScorerBs1OnlyForAllEssentialWindows(
+        *testIndex.reader, numTerms);
+  }
+  {
+    SCOPED_TRACE("SelectiveDomainDriveMatchesStream");
+    checkMaxScoreBulkScorerSelectiveDomainDriveMatchesStream(
+        *testIndex.reader, numTerms);
   }
 }
 
@@ -8427,14 +8421,12 @@ TEST_F(TermScorerTest, MaxScoreAccumulatorConcurrentMax) {
   EXPECT_FLOAT_EQ(concurrent.get(), 99.5f);
 }
 
-TEST_F(TermScorerTest, CrossSegmentAccumulatorRealOpMatchesExhaustive) {
-  CollectionHelper helper("main");
-  std::vector<std::vector<std::string>> idsBySeg;
-  addCrossSegmentAccumulatorDocs(helper, idsBySeg, 3);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+void checkCrossSegmentAccumulatorRealOpMatchesExhaustive(
+    IndexReader& reader,
+    const std::vector<std::vector<std::string>>& idsBySeg) {
   const int32_t k = 5;
 
-  auto expected = runCrossSegmentTermTopK(*reader, k, false);
+  auto expected = runCrossSegmentTermTopK(reader, k, false);
 
   auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("body_w", "needle").fields({"id"}).limit(k).getScores();
@@ -8456,23 +8448,19 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorRealOpMatchesExhaustive) {
   }
 }
 
-TEST_F(TermScorerTest, CrossSegmentAccumulatorPropagatesThresholdSequential) {
-  CollectionHelper helper("main");
-  std::vector<std::vector<std::string>> idsBySeg;
-  addCrossSegmentAccumulatorDocs(helper, idsBySeg, 2);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+void checkCrossSegmentAccumulatorPropagatesThresholdSequential(IndexReader& reader) {
   const int32_t k = 5;
 
   MaxScoreAccumulator accumulator;
   TopDocsCollector seg0Collector(k);
-  collectCrossSegmentTermSegment(*reader, 0, k, true, &accumulator, seg0Collector);
+  collectCrossSegmentTermSegment(reader, 0, k, true, &accumulator, seg0Collector);
   ASSERT_GT(accumulator.get(), std::numeric_limits<float>::lowest());
 
   TopDocsCollector seg1SharedCollector(k);
-  collectCrossSegmentTermSegment(*reader, 1, k, true, &accumulator, seg1SharedCollector);
+  collectCrossSegmentTermSegment(reader, 1, k, true, &accumulator, seg1SharedCollector);
 
   TopDocsCollector seg1LocalCollector(k);
-  collectCrossSegmentTermSegment(*reader, 1, k, true, nullptr, seg1LocalCollector);
+  collectCrossSegmentTermSegment(reader, 1, k, true, nullptr, seg1LocalCollector);
 
   EXPECT_LT(seg1SharedCollector.totalHits(), seg1LocalCollector.totalHits());
 
@@ -8483,8 +8471,24 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorPropagatesThresholdSequential) {
   DisjunctionTopKRun actual;
   actual.visited = seg0Collector.totalHits() + seg1SharedCollector.totalHits();
   actual.topDocs = sortedCollectorDocs(merged);
-  auto expected = runCrossSegmentTermTopK(*reader, k, false);
+  auto expected = runCrossSegmentTermTopK(reader, k, false, 2);
   assertSameTopKDocs(expected, actual, k);
+}
+
+TEST_F(TermScorerTest, CrossSegmentAccumulatorCorpusChecks) {
+  CollectionHelper helper("main");
+  std::vector<std::vector<std::string>> idsBySeg;
+  addCrossSegmentAccumulatorDocs(helper, idsBySeg, 3);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  {
+    SCOPED_TRACE("RealOpMatchesExhaustive");
+    checkCrossSegmentAccumulatorRealOpMatchesExhaustive(*reader, idsBySeg);
+  }
+  {
+    SCOPED_TRACE("PropagatesThresholdSequential");
+    checkCrossSegmentAccumulatorPropagatesThresholdSequential(*reader);
+  }
 }
 
 // Regression for the 1f bug: impact block skipping under-counts the total hit count
