@@ -47,12 +47,14 @@ class TermsEnum {
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> suffixStarts{};
 
   const char* docsEndRun = nullptr;
+  const char* packedBlocksRun = nullptr;
   const char* dfRun = nullptr;
   const char* ttfCodeRun = nullptr;
   const char* posOffRun = nullptr;
   const char* termImpactRun = nullptr;
   const char* pulsedRun = nullptr;
   uint32_t docsEndRunLen = 0;
+  uint32_t packedBlocksRunLen = 0;
   uint32_t dfRunLen = 0;
   uint32_t ttfCodeRunLen = 0;
   uint32_t posOffRunLen = 0;
@@ -60,6 +62,7 @@ class TermsEnum {
   uint32_t pulsedRunLen = 0;
 
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
+  std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> packedBlockCounts{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> docFreqs{};
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> ttfCodes{};
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> posOffsets{};
@@ -111,6 +114,7 @@ public:
     int64_t posStart = 0;
     int64_t totalTermFreq = 0;
     int32_t docFreq = 0;
+    int32_t packedBlockCount = 0;
     int64_t termOrdinal = -1;
     int32_t pulsedDoc = -1;
     int32_t pulsedPos = -1;
@@ -313,6 +317,13 @@ public:
     return (int64_t) ttf;
   }
 
+  int32_t packedBlockCount() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    assert(packedBlockCounts[(size_t) ordInBlock] <= (uint32_t) INT32_MAX);
+    return (int32_t) packedBlockCounts[(size_t) ordInBlock];
+  }
+
   // The whole-term (norm, maxTf) Pareto frontier stored in the term block
   // metadata (see PostingsWriter.flushTerms): the source for a scorer's
   // global max score - never derived by walking postings.  Returns the
@@ -370,6 +381,7 @@ public:
     state.hasPositions = FieldType::hasPositions(fieldInfo.flags);
     state.termOrdinal = ord();
     state.docFreq = docFreq();
+    state.packedBlockCount = packedBlockCount();
     state.totalTermFreq = totalTermFreq();
     state.termImpactFrontier = currentTermImpactFrontierSpan();
 
@@ -447,10 +459,11 @@ protected:
     // asks for them.  This keeps block entry and pure term scans on the
     // hashes/lengths/suffix path.  See PostingsWriter.flushTerms for the
     // byte-length code and run order.  A zero byte length marks an all-default
-    // run for docsEnd/df/ttfCode/posOff; pulsedRun still uses zero length only
-    // for the existing empty-payload case.
+    // run for docsEnd/packedBlocks/df/ttfCode/posOff; pulsedRun still uses
+    // zero length only for the existing empty-payload case.
     const char* p = metadataRuns;
     docsEndRunLen = readMetadataRunLen(p, blockEnd);
+    packedBlocksRunLen = readMetadataRunLen(p, blockEnd);
     dfRunLen = readMetadataRunLen(p, blockEnd);
     ttfCodeRunLen = FieldType::hasFreqs(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
     posOffRunLen = FieldType::hasPositions(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
@@ -459,6 +472,9 @@ protected:
 
     docsEndRun = p;
     p += docsEndRunLen;
+    assert(p <= blockEnd);
+    packedBlocksRun = p;
+    p += packedBlocksRunLen;
     assert(p <= blockEnd);
     dfRun = p;
     p += dfRunLen;
@@ -506,8 +522,9 @@ protected:
       return;
     }
     // Tier 1 metadata: term statistics only.  This decodes df and, for fields
-    // with freqs, ttfCode.  It deliberately does not touch docsEnd, posOff, or
-    // pulsed values, so stats-only callers do not pay to open postings.
+    // with freqs, ttfCode.  It deliberately does not touch docsEnd,
+    // packedBlocks, posOff, or pulsed values, so stats-only callers do not pay
+    // to open postings.
     parseMetadataRuns();
     uint32_t n = blockTermCount();
     if (dfRunLen == 0) {
@@ -535,8 +552,9 @@ protected:
       return;
     }
     // Tier 2 metadata: data needed to construct DocsEnum.  docsEnd supplies
-    // trailer-free docs slices, posOff supplies positions starts, and pulsedRun
-    // supplies inline doc/pos payloads for single-occurrence terms.
+    // trailer-free docs slices, packedBlocks describes their packed codec
+    // blocks, posOff supplies positions starts, and pulsedRun supplies inline
+    // doc/pos payloads for single-occurrence terms.
     parseMetadataRuns();
     uint32_t n = blockTermCount();
     if (docsEndRunLen == 0) {
@@ -553,6 +571,12 @@ protected:
         prevDocsEnd = docsEnd;
       }
       assert(p == end);
+    }
+
+    if (packedBlocksRunLen == 0) {
+      std::fill_n(packedBlockCounts.begin(), n, 0);
+    } else {
+      decodeSVBRun(packedBlocksRun, packedBlocksRunLen, packedBlockCounts.data(), n);
     }
 
     if (FieldType::hasPositions(fieldInfo.flags)) {

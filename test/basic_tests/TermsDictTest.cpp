@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstdint>
 #include <memory>
@@ -90,6 +91,54 @@ struct RawTermSpec {
   std::vector<RawDocSpec> docs;
 };
 
+struct BlockCensus {
+  int32_t contiguous = 0;
+  int32_t packed = 0;
+  int32_t bitset = 0;
+  std::vector<int32_t> packedPerGroup;
+};
+
+BlockCensus recomputeBlockCensus(const RawTermSpec& term) {
+  BlockCensus census;
+  int32_t blockCount =
+      ((int32_t) term.docs.size() + Postings::DOCS_BLOCK_SIZE - 1)
+      / Postings::DOCS_BLOCK_SIZE;
+  census.packedPerGroup.resize(
+      (size_t) ((blockCount + DocsEnumMeta::L1_PERIOD - 1)
+                / DocsEnumMeta::L1_PERIOD),
+      0);
+
+  uint32_t base = 0;
+  int32_t fullBlocks = (int32_t) term.docs.size() / Postings::DOCS_BLOCK_SIZE;
+  for (int32_t block = 0; block < fullBlocks; block++) {
+    int32_t start = block * Postings::DOCS_BLOCK_SIZE;
+    int32_t end = start + Postings::DOCS_BLOCK_SIZE;
+    uint32_t lastDoc = (uint32_t) term.docs[(size_t) end - 1].docid;
+    uint32_t docBase = base + (block == 0 ? 0 : 1);
+    uint32_t spanBits = lastDoc - docBase + 1;
+    uint32_t deltaOr = (uint32_t) term.docs[(size_t) start].docid - base;
+    for (int32_t i = start + 1; i < end; i++) {
+      deltaOr |= (uint32_t) (term.docs[(size_t) i].docid
+                             - term.docs[(size_t) i - 1].docid);
+    }
+    uint32_t bitsPerValue =
+        32 - (uint32_t) std::countl_zero(deltaOr | 1);
+    uint32_t numWords = (spanBits + 63) / 64;
+    if (spanBits == (uint32_t) Postings::DOCS_BLOCK_SIZE) {
+      census.contiguous++;
+    } else if (std::min(32u, bitsPerValue + 1)
+                   * (uint32_t) Postings::DOCS_BLOCK_SIZE
+               <= numWords * 64) {
+      census.packed++;
+      census.packedPerGroup[(size_t) block / DocsEnumMeta::L1_PERIOD]++;
+    } else {
+      census.bitset++;
+    }
+    base = lastDoc;
+  }
+  return census;
+}
+
 struct IteratedStats {
   int32_t df = 0;
   int64_t ttf = 0;
@@ -97,9 +146,11 @@ struct IteratedStats {
 
 struct MetadataRunCodes {
   uint32_t docsEnd = 0;
+  uint32_t packedBlocks = 0;
   uint32_t df = 0;
   uint32_t ttfCode = 0;
   uint32_t posOff = 0;
+  uint32_t termImpact = 0;
   uint32_t pulsed = 0;
 };
 
@@ -259,12 +310,17 @@ MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const Se
 
   MetadataRunCodes codes;
   codes.docsEnd = termsIS.readVint();
+  codes.packedBlocks = termsIS.readVint();
   codes.df = termsIS.readVint();
   if (FieldType::hasFreqs(fieldInfo.flags)) {
     codes.ttfCode = termsIS.readVint();
   }
   if (FieldType::hasPositions(fieldInfo.flags)) {
     codes.posOff = termsIS.readVint();
+  }
+  if (FieldType::hasFreqs(fieldInfo.flags)
+      && FieldType::hasPositions(fieldInfo.flags)) {
+    codes.termImpact = termsIS.readVint();
   }
   codes.pulsed = termsIS.readVint();
   return codes;
@@ -516,9 +572,11 @@ TEST_F(TermsDictTest, AllDefaultMetadataRunsPreservePulsedMultiBlockPostings) {
 
   MetadataRunCodes codes = readFirstBlockMetadataRunCodes(*reader, fieldInfo);
   EXPECT_EQ(codes.docsEnd, 0u);
+  EXPECT_EQ(codes.packedBlocks, 0u);
   EXPECT_EQ(codes.df, 0u);
   EXPECT_EQ(codes.ttfCode, 0u);
   EXPECT_EQ(codes.posOff, 0u);
+  EXPECT_NE(codes.termImpact, 0u);
   EXPECT_NE(codes.pulsed, 0u);
 
   TermsEnum tenum(pool, *reader, fieldInfo);
@@ -555,9 +613,11 @@ TEST_F(TermsDictTest, MixedMetadataRunsKeepNonUniformRowsExplicit) {
 
   MetadataRunCodes codes = readFirstBlockMetadataRunCodes(*reader, fieldInfo);
   EXPECT_NE(codes.docsEnd, 0u);
+  EXPECT_EQ(codes.packedBlocks, 0u);
   EXPECT_EQ(codes.df, 0u);
   EXPECT_NE(codes.ttfCode, 0u);
   EXPECT_NE(codes.posOff, 0u);
+  EXPECT_NE(codes.termImpact, 0u);
   EXPECT_NE(codes.pulsed, 0u);
 
   TermsEnum tenum(pool, *reader, fieldInfo);
@@ -573,6 +633,103 @@ TEST_F(TermsDictTest, MixedMetadataRunsKeepNonUniformRowsExplicit) {
     EXPECT_EQ(stats.ttf, expectedTtf(fieldInfo.flags, term)) << term.name;
   }
   EXPECT_FALSE(tenum.nextTerm());
+}
+
+TEST_F(TermsDictTest, PackedBlockCountsRoundTripAcrossIndexLevels) {
+  std::vector<RawTermSpec> terms;
+
+  RawTermSpec mixed{"mixed", {}};
+  for (int32_t doc = 0; doc < Postings::DOCS_BLOCK_SIZE; doc++) {
+    mixed.docs.push_back({doc, 1});
+  }
+  int32_t doc = 256;
+  for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+    mixed.docs.push_back({doc, 1});
+    doc += 16;
+  }
+  doc = mixed.docs.back().docid;
+  for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+    doc += i == 0 ? 1 : 2;
+    mixed.docs.push_back({doc, 1});
+  }
+  for (int32_t i = 0; i < 17; i++) {
+    doc += 11;
+    mixed.docs.push_back({doc, 1});
+  }
+  terms.push_back(std::move(mixed));
+
+  RawTermSpec multi{"multi", {}};
+  doc = 0;
+  int32_t multiDocs =
+      DocsEnumMeta::L1_DOCS + 2 * Postings::DOCS_BLOCK_SIZE + 17;
+  for (int32_t i = 0; i < multiDocs; i++) {
+    doc += 10;
+    multi.docs.push_back({doc, 1});
+  }
+  terms.push_back(std::move(multi));
+  terms.push_back({"pulse", {{7, 1}}});
+
+  BlockCensus mixedCensus = recomputeBlockCensus(terms[0]);
+  EXPECT_EQ(mixedCensus.contiguous, 1);
+  EXPECT_EQ(mixedCensus.packed, 1);
+  EXPECT_EQ(mixedCensus.bitset, 1);
+  BlockCensus multiCensus = recomputeBlockCensus(terms[1]);
+  EXPECT_GT(multiCensus.packed, DocsEnumMeta::L1_PERIOD);
+  EXPECT_GT((int32_t) terms[1].docs.size(), DocsEnumMeta::L1_DOCS);
+
+  for (FieldType::flag_type flags : {
+           FieldType::INDEX_DOCS,
+           FieldType::INDEX_DOCS_FREQS,
+           FieldType::INDEX_DOCS_FREQS_POSITIONS}) {
+    SCOPED_TRACE(::testing::Message() << "flags=" << flags);
+    RAMDir dir;
+    MemPool pool;
+    std::unique_ptr<PostingsReader> reader;
+    SegFieldInfo fieldInfo;
+    buildRawField(dir, pool, flags, terms, reader, fieldInfo);
+
+    TermsEnum tenum(pool, *reader, fieldInfo);
+    for (const RawTermSpec& term : terms) {
+      ASSERT_TRUE(tenum.nextTerm()) << term.name;
+      ASSERT_EQ((std::string_view) tenum.term(), term.name);
+      BlockCensus census = recomputeBlockCensus(term);
+      int32_t expectedPacked = term.name == "pulse" ? 0 : census.packed;
+      EXPECT_EQ(tenum.packedBlockCount(), expectedPacked) << term.name;
+
+      DocsOnlyEnum groupReader(tenum);
+      EXPECT_EQ(groupReader.packedBlockCount(), expectedPacked) << term.name;
+      DocsEnumMeta::GroupImpacts groups;
+      groupReader.readGroupImpacts(groups);
+      std::vector<int32_t> expectedGroups =
+          term.name == "pulse" ? std::vector<int32_t>{} : census.packedPerGroup;
+      EXPECT_EQ(groups.packedBlockCounts, expectedGroups) << term.name;
+
+      DocsOnlyEnum docs(tenum);
+      int32_t seen = 0;
+      int32_t groupSum = 0;
+      int32_t group = 0;
+      for (int32_t actual = docs.nextDoc(); actual != DocsEnumMeta::END;
+           actual = docs.nextDoc()) {
+        ASSERT_EQ(actual, term.docs[(size_t) seen].docid) << term.name;
+        if (term.name != "pulse" && (seen % DocsEnumMeta::L1_DOCS) == 0) {
+          ASSERT_LT(group, (int32_t) expectedGroups.size()) << term.name;
+          EXPECT_EQ(docs.l1PackedBlockCount(), expectedGroups[(size_t) group])
+              << term.name << " group " << group;
+          groupSum += docs.l1PackedBlockCount();
+          group++;
+        }
+        seen++;
+      }
+      EXPECT_EQ(seen, (int32_t) term.docs.size()) << term.name;
+      EXPECT_EQ(groupSum, expectedPacked) << term.name;
+      if (term.name == "pulse") {
+        EXPECT_EQ(docs.l1PackedBlockCount(), 0);
+      } else {
+        EXPECT_EQ(group, (int32_t) expectedGroups.size()) << term.name;
+      }
+    }
+    EXPECT_FALSE(tenum.nextTerm());
+  }
 }
 
 TEST_F(TermsDictTest, StatsAccessorsMatchDocsEnumAcrossIndexLevels) {

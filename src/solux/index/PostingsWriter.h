@@ -471,6 +471,7 @@ private:
   // bytes alive past the startTerm() call.  Slot i backs termList[i].
   std::array<char, Postings::TERMS_BLOCK_SIZE * PackedTerm::MAX_BYTES> termBytes;
   std::vector<uint64_t> termDocsEnd;  // cumulative trailer-free docs-region end offsets
+  std::vector<uint32_t> termPackedBlocks;
   std::vector<uint32_t> termDocFreqs;
   std::vector<uint64_t> termTtfCodes;
   std::vector<uint64_t> termPosOffsets;
@@ -502,12 +503,14 @@ private:
   int64_t pendingBlockPosByteOff = 0;
 
   int32_t docsFlushed;  /// number of documents flushed for the current term so far
+  uint32_t termPackedBlockCount = 0;
   int32_t curTf = 0;    /// occurrences (term freq) seen so far for the current doc
   int64_t ttfAcc = 0;   /// total term freq (sum of tf over docs) accumulated for the current term
   uint32_t prevDocBlockLast = 0;  /// last doc id of the previous flushed doc block (cross-block delta base); reset per term
   uint32_t prevL1GroupLast = 0;   /// last doc id of the previous flushed L1 group; reset per term
   uint32_t l1GroupLastDoc = 0;    /// last doc id in the buffered L1 group
   int32_t l1GroupBlockCount = 0;
+  uint32_t l1GroupPackedBlockCount = 0;
   int32_t l1GroupDocCount = 0;
   uint64_t l1GroupTfSum = 0;
   uint32_t l1GroupMaxTf = 0;
@@ -911,6 +914,8 @@ private:  // some internal utility methods... not for use by indexers
     assert(l1GroupLastDoc >= prevL1GroupLast);
     appendVint15(header_output, l1GroupLastDoc - prevL1GroupLast);
     appendVlong15(header_output, group_output.size());
+    assert(l1GroupPackedBlockCount <= (uint32_t) L1_PERIOD);
+    header_output.push_back((char) l1GroupPackedBlockCount);
     if (hasPositions) {
       assert(l1GroupTfSum >= (uint64_t) l1GroupDocCount);
       appendVint(header_output, (uint32_t) (l1GroupTfSum - (uint64_t) l1GroupDocCount));
@@ -932,6 +937,7 @@ private:  // some internal utility methods... not for use by indexers
     prevL1GroupLast = l1GroupLastDoc;
     group_output.resize(0);
     l1GroupBlockCount = 0;
+    l1GroupPackedBlockCount = 0;
     l1GroupDocCount = 0;
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
@@ -1074,6 +1080,8 @@ public:
       blockByteLen = 1;
     } else if (std::min(32u, bitsPerValue + 1) * (uint32_t) Postings::DOCS_BLOCK_SIZE <= numWords * 64) {
       compressed_output[0] = Postings::DOC_BLOCK_PACKED;
+      termPackedBlockCount++;
+      l1GroupPackedBlockCount++;
       uint32_t compressedSize = (uint32_t) compressed_output.size() - 1; // this gets changed to the actual size
       IndexCodec::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data() + 1,
                                     compressedSize, base);
@@ -1119,6 +1127,7 @@ public:
     unused(endingField);
     termList.resize(0);
     termDocsEnd.resize(0);
+    termPackedBlocks.resize(0);
     termDocFreqs.resize(0);
     termTtfCodes.resize(0);
     termPosOffsets.resize(0);
@@ -1175,14 +1184,19 @@ public:
   //     encoding.  The byte-length vints are written first for every run,
   //     followed by the non-default run bytes in the same order:
   //
-  //     [docsEnd lengths/code][df lengths/code][ttfCode lengths/code?]
-  //     [posOff lengths/code?][pulsed lengths/code]
+  //     [docsEnd lengths/code][packedBlocks lengths/code][df lengths/code]
+  //     [ttfCode lengths/code?]
+  //     [posOff lengths/code?][termImpact lengths/code?][pulsed lengths/code]
   //     [docsEnd: cumulative vlong run]
   //       Trailer-free slice ends within this block's docs region.  For term i,
   //       docsSize_i = docsEnd_i - docsEnd_(i-1), with docsEnd_(-1) = 0.
   //       Pulsed terms repeat the previous end, so their docsSize is 0.
   //       Default: every slice is zero-size, which is legal only when every
   //       term in the block is pulsed.
+  //     [packedBlocks: StreamVByte run]
+  //       Number of full doc blocks encoded with DOC_BLOCK_PACKED for every
+  //       term in the block.  Pulsed terms and StreamVByte tail blocks are 0.
+  //       Default: every value is 0.
   //     [df: StreamVByte run]
   //       docFreq for every term in the block.
   //       Default: every value is 1.
@@ -1207,10 +1221,10 @@ public:
   // The layout is column-stride on purpose.  Term scans, seekCeil, fuzzy
   // enumeration, and most miss paths need only hashes, lengths, and suffix
   // bytes.  Term stats decode as tier 1 (df/ttfCode), and postings-open
-  // metadata decodes as tier 2 (docsEnd/posOff/pulsed), both lazily in
-  // TermsEnum.  Per-doc tf values are not stored here: they are scoring data
-  // block-encoded alongside doc ids in the docs stream and remain part of the
-  // postings payload.
+  // metadata decodes as tier 2 (docsEnd/packedBlocks/posOff/pulsed), both
+  // lazily in TermsEnum.  Per-doc tf values are not stored here: they are
+  // scoring data block-encoded alongside doc ids in the docs stream and
+  // remain part of the postings payload.
   void flushTerms(bool endingField) {
     if (termList.empty()) {
       termBlockOffsets.pop_back();  // last block has no terms in it.
@@ -1224,6 +1238,7 @@ public:
 
     int nTerms = termList.size();
     assert((int)termDocsEnd.size() == nTerms);
+    assert((int)termPackedBlocks.size() == nTerms);
     assert((int)termDocFreqs.size() == nTerms);
     assert((int)termTtfCodes.size() == nTerms);
     assert(!hasPositions || (int)termPosOffsets.size() == nTerms);
@@ -1294,11 +1309,13 @@ public:
     termOutput.write(suffixBlob.data(), suffixBlob.size());
 
     std::vector<char> docsEndRun;
+    std::vector<char> packedBlocksRun;
     std::vector<char> dfRun;
     std::vector<char> ttfRun;
     std::vector<char> posOffRun;
     std::vector<char> pulsedRun;
     appendVlongRun(docsEndRun, termDocsEnd);
+    appendSVBRun(packedBlocksRun, termPackedBlocks);
     appendSVBRun(dfRun, termDocFreqs);
     if (hasFreqs) {
       appendVlongRun(ttfRun, termTtfCodes);
@@ -1313,11 +1330,13 @@ public:
     if (docsEndDefault) {
       assert(termPulsedMask == termMaskForCount(nTerms));
     }
+    bool packedBlocksDefault = allUInt32Equal(termPackedBlocks, 0);
     bool dfDefault = allUInt32Equal(termDocFreqs, 1);
     bool ttfDefault = allUInt64Equal(termTtfCodes, 0);
     bool posOffDefault = hasPositions && allUInt64Equal(termPosOffsets, 0);
 
     writeMetadataRunLen(docsEndDefault ? 0 : docsEndRun.size());
+    writeMetadataRunLen(packedBlocksDefault ? 0 : packedBlocksRun.size());
     writeMetadataRunLen(dfDefault ? 0 : dfRun.size());
     if (hasFreqs) {
       writeMetadataRunLen(ttfDefault ? 0 : ttfRun.size());
@@ -1332,6 +1351,9 @@ public:
 
     if (!docsEndDefault) {
       termOutput.write(docsEndRun.data(), docsEndRun.size());
+    }
+    if (!packedBlocksDefault) {
+      termOutput.write(packedBlocksRun.data(), packedBlocksRun.size());
     }
     if (!dfDefault) {
       termOutput.write(dfRun.data(), dfRun.size());
@@ -1362,11 +1384,13 @@ public:
   // returns 1-based ordinal of term in this field
   int64_t startTerm(TermRef term) {
     docsFlushed = 0;
+    termPackedBlockCount = 0;
     ttfAcc = 0;
     prevDocBlockLast = 0;  // each term's first doc block starts from base 0
     prevL1GroupLast = 0;
     l1GroupLastDoc = 0;
     l1GroupBlockCount = 0;
+    l1GroupPackedBlockCount = 0;
     l1GroupDocCount = 0;
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
@@ -1414,6 +1438,7 @@ public:
         termMaxTfPerNorm[norm] = 1;
         appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
       }
+      termPackedBlocks.push_back(0);
       termDocFreqs.push_back(1);
       termTtfCodes.push_back(0);
       termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
@@ -1510,6 +1535,7 @@ public:
       if (hasFreqs && hasNorms) {
         appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
       }
+      termPackedBlocks.push_back(termPackedBlockCount);
       termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
     }
 

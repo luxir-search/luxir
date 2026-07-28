@@ -8,7 +8,9 @@
 #include "test/SegmentTest.h"
 #include "test/TestIndex.h"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,7 @@ struct PostingSnapshot {
 struct TermSnapshot {
   std::string term;
   int32_t docFreq;
+  int32_t packedBlockCount;
   int64_t totalTermFreq;
   std::vector<int32_t> impactNorms;
   std::vector<int32_t> impactTfs;
@@ -55,6 +58,35 @@ std::string termName(int32_t ord) {
   return term;
 }
 
+int32_t recomputePackedBlockCount(const std::vector<PostingSnapshot>& postings) {
+  uint32_t base = 0;
+  int32_t packed = 0;
+  int32_t fullBlocks = (int32_t) postings.size() / Postings::DOCS_BLOCK_SIZE;
+  for (int32_t block = 0; block < fullBlocks; block++) {
+    int32_t start = block * Postings::DOCS_BLOCK_SIZE;
+    int32_t end = start + Postings::DOCS_BLOCK_SIZE;
+    uint32_t lastDoc = (uint32_t) postings[(size_t) end - 1].doc;
+    uint32_t docBase = base + (block == 0 ? 0 : 1);
+    uint32_t spanBits = lastDoc - docBase + 1;
+    uint32_t deltaOr = (uint32_t) postings[(size_t) start].doc - base;
+    for (int32_t i = start + 1; i < end; i++) {
+      deltaOr |= (uint32_t) (postings[(size_t) i].doc
+                             - postings[(size_t) i - 1].doc);
+    }
+    uint32_t bitsPerValue =
+        32 - (uint32_t) std::countl_zero(deltaOr | 1);
+    uint32_t numWords = (spanBits + 63) / 64;
+    if (spanBits != (uint32_t) Postings::DOCS_BLOCK_SIZE
+        && std::min(32u, bitsPerValue + 1)
+               * (uint32_t) Postings::DOCS_BLOCK_SIZE
+           <= numWords * 64) {
+      packed++;
+    }
+    base = lastDoc;
+  }
+  return packed;
+}
+
 void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
                   bool partitioned, int32_t termBase = 0,
                   IndexRamBudget* budget = nullptr) {
@@ -74,13 +106,13 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
   TestField body(index, "body");
   for (int32_t segment = 0; segment < 4; segment++) {
     body.startIndexing();
-    for (int32_t doc = 0; doc < 24; doc++) {
+    for (int32_t doc = 0; doc < 40; doc++) {
       std::string value = "common common";
       for (int32_t i = 0; i < 8; i++) {
         std::string term = termName(termBase + doc * 8 + i);
         value += " " + term + " " + term;
       }
-      body.add(doc, value);
+      body.add(doc * 16, value);
     }
     if ((segment & 1) == 0) index.deleteDoc(segment);
     index.flush();
@@ -109,6 +141,7 @@ FieldSnapshot snapshotField(MemPool& pool, Segment& segment) {
     TermSnapshot term;
     term.term = std::string((std::string_view) terms.term());
     term.docFreq = terms.docFreq();
+    term.packedBlockCount = terms.packedBlockCount();
     term.totalTermFreq = terms.totalTermFreq();
     terms.readTermImpactFrontier(term.impactNorms, term.impactTfs);
     DocsPosEnum docs(terms);
@@ -122,6 +155,8 @@ FieldSnapshot snapshotField(MemPool& pool, Segment& segment) {
       EXPECT_EQ(PosEnum::END, positions.nextPosition());
       term.postings.push_back(std::move(posting));
     }
+    EXPECT_EQ(term.packedBlockCount, recomputePackedBlockCount(term.postings))
+        << term.term;
     snapshot.terms.push_back(std::move(term));
   }
   return snapshot;
@@ -211,6 +246,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
     TermSnapshot term;
     term.term = std::string((std::string_view) terms.term());
     term.docFreq = terms.docFreq();
+    term.packedBlockCount = terms.packedBlockCount();
     term.totalTermFreq = terms.totalTermFreq();
     terms.readTermImpactFrontier(term.impactNorms, term.impactTfs);
     DocsPosEnum docs(terms);
@@ -221,6 +257,8 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
       for (int32_t i = 0; i < posting.tf; i++) posting.positions.push_back(positions.nextPosition());
       term.postings.push_back(std::move(posting));
     }
+    EXPECT_EQ(term.packedBlockCount, recomputePackedBlockCount(term.postings))
+        << term.term;
     snapshot.terms.push_back(std::move(term));
   }
   if (partitioned) verifySeeks(pool, outputReader, info, snapshot);
@@ -273,6 +311,11 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
   FieldSnapshot oracle = snapshotField(serial.pool, serialSegment);
   FieldSnapshot actual = snapshotField(partitioned.pool, partitionedSegment);
   EXPECT_EQ(oracle, actual);
+  ASSERT_FALSE(actual.terms.empty());
+  EXPECT_TRUE(std::any_of(actual.terms.begin(), actual.terms.end(),
+                          [](const TermSnapshot& term) {
+                            return term.packedBlockCount > 0;
+                          }));
   verifySeeks(partitioned.pool, partitionedSegment.postingsReader(), partitionedInfo, actual);
 
   TestIndex right;
