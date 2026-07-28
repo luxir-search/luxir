@@ -147,14 +147,15 @@ struct NumColumnFormat {
     return LinearFit::residual(plan.fit, rank, quotient, SLOPE_SHIFT);
   }
 
-  // Equivalent to (rank * scaledSlope) >> SLOPE_SHIFT, without overflowing
-  // int64 and without putting __int128 on the read path.
+  // rank * scaledSlope overflows int64 for a wide block (rank < 2^12 against a
+  // slope that can reach ~2^58), but the shifted result always fits. A 64x64
+  // multiply already produces 128 bits in a register pair, so taking the wide
+  // product costs the shift-combine and nothing else - cheaper than splitting
+  // the slope into whole and fractional parts, which needs two multiplies.
+  // This is also verbatim what LinearFit::predict computes on the write side,
+  // so the two cannot drift.
   static int64_t slopeTerm(uint64_t rank, int64_t scaledSlope) {
-    constexpr uint64_t mask = (1ULL << SLOPE_SHIFT) - 1;
-    int64_t whole = scaledSlope >> SLOPE_SHIFT;
-    uint64_t fraction = (uint64_t)scaledSlope & mask;
-    return (int64_t)rank * whole +
-        (int64_t)((rank * fraction) >> SLOPE_SHIFT);
+    return (int64_t)(((__int128)(int64_t)rank * scaledSlope) >> SLOPE_SHIFT);
   }
 };
 
