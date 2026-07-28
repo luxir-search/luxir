@@ -61,6 +61,11 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
       Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
       Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
       Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
+      // Mostly-single-valued multi-valued int: the only field here that makes
+      // a column carry an endValueRank mono sidecar, which every multi-valued
+      // read consults twice per doc.  1/64 of docs hold a second value, so the
+      // value ranks are a near-unit ramp.
+      Inverter::IndexHandler& i4 = inverter.getIndexHandler("u10_is");
 
       std::string s;
       for (int i = 0; i < segDocs; i++) {
@@ -102,6 +107,22 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
         i2.index(inverter, iVal);
 
         i3.index(inverter, r.rint(10000000));
+
+        // One call carrying every value: the multi-valued handler records the
+        // doc once per call, so calling it per value would add the doc to a
+        // term's stream twice.  The second value is drawn from the other 9 so
+        // a doc never lands in one facet bucket twice, and they go in
+        // ascending, the natural order for a multi-valued column.
+        int64_t isVals[2] = {r.rint(10), 0};
+        size_t nIsVals = 1;
+        if (r.rint(64) == 0) {
+          int64_t other = r.rint(9);
+          if (other >= isVals[0]) other++;
+          isVals[1] = other;
+          if (isVals[1] < isVals[0]) std::swap(isVals[0], isVals[1]);
+          nIsVals = 2;
+        }
+        i4.index(inverter, std::span<const int64_t>(isVals, nIsVals));
 
         inverter.finishDoc();
       }
