@@ -21,7 +21,7 @@
       "hidden": true,
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_CXX_FLAGS_DEBUG": "-g -ftrivial-auto-var-init=pattern"
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -Og -ftrivial-auto-var-init=pattern"
       }
     },
     {
@@ -67,7 +67,7 @@
       "name": "gcc-debug",
       "inherits": ["base", "base-gcc", "base-debug"],
       "displayName": "GCC Debug (recommended for iteration)",
-      "description": "Default for the edit-build-test loop. Non-ASan: ~31% faster per cycle than gcc-debug-asan (no ASan compile/link tax, tests run ~2.5x faster). PCH + ccache + mold auto-enabled.",
+      "description": "Default for the edit-build-test loop. Non-ASan: cold build ~137s vs ~204s for gcc-debug-asan, and the suite runs ~4x faster (6s vs 24s). PCH + ccache + mold auto-enabled. Built at -Og, not -O0: costs ~6% build time and a few scalar locals that gdb reports as <optimized out>, buys a 3x faster suite and GCC's dataflow warnings (-Wmaybe-uninitialized and friends), which -O0 cannot emit at all. For a session where you need every local materialized, reconfigure one build dir with -DCMAKE_CXX_FLAGS_DEBUG=\"-g -ftrivial-auto-var-init=pattern\".",
       "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"
     },
     {
@@ -81,7 +81,7 @@
       "name": "gcc-debug-asan",
       "inherits": ["base", "base-gcc", "base-debug", "features-asan"],
       "displayName": "GCC Debug ASAN (memory checks only)",
-      "description": "Use before committing or when chasing a crash/UB (use-after-free, leaks, OOB). NOT the default iteration build: ASan adds ~3.7s/build and makes tests ~2.5x slower.",
+      "description": "Use before committing or when chasing a crash/UB (use-after-free, leaks, OOB). NOT the default iteration build: ASan adds ~50% to a cold build and makes the suite ~4x slower (24s vs 6s).",
       "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
     },
     {

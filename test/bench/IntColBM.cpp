@@ -28,8 +28,8 @@ static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, 
   testField.nextSegment();
   IntColReader& intColReader = *testField.colReader;
 
-  int64_t ret;
-  int64_t count;
+  int64_t ret = 0;
+  int64_t count = 0;
   for (auto _ : state) {
     ret = 0;
     count = 0;

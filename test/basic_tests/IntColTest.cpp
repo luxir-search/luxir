@@ -665,7 +665,7 @@ TEST_F(IntColTest, testMonoBig) {
     auto nVals = rng.rint(1u,MonoReader::BLOCK_SIZE * 3 + 10);
     size_t bits;
     int64_t val = 0;
-    int64_t maxVal;
+    int64_t maxVal = 0;
 
     RAMDir dir;
     auto file = dir.createFile("mono");

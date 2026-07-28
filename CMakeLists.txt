@@ -153,17 +153,21 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 endif()
 
 # ---- Adaptive compile-parallelism CAP (memory-aware, Ninja job pool) ----
-# hpp-proto template instantiation makes each heavy TU cost ~1.5-2.5G RAM to compile, so
-# the build tool's default -j (logical cores: 32 on a hyperthreaded 16-core box) OOMs.
+# hpp-proto template instantiation makes each heavy TU expensive to compile, so the build
+# tool's default -j (logical cores: 32 on a hyperthreaded 16-core box) OOMs.
 # This caps CONCURRENT COMPILES via a Ninja pool sized from THIS machine's physical cores
 # and RAM, never above 16 (hyperthreads add no compile throughput past real cores). It is a
 # cap, not a forced -j: a smaller -j still wins, and it adapts DOWN automatically on a
 # smaller laptop. Override explicitly with -DSOLUX_COMPILE_JOBS=N. Tune _ram_jobs divisor
 # (GB/job) down once the serializer is moved out-of-line and per-TU memory drops.
+# Measured peak RSS of the heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at
+# -Og with ASan. The divisor covers the plain -Og case; an ASan build on a RAM-bound box
+# wants an explicit -DSOLUX_COMPILE_JOBS. Only the RAM arm moves - on a box with more
+# than ~3G per physical core the core count still binds.
 if(NOT DEFINED SOLUX_COMPILE_JOBS)
   cmake_host_system_information(RESULT _ncores QUERY NUMBER_OF_PHYSICAL_CORES)
   cmake_host_system_information(RESULT _rammb  QUERY TOTAL_PHYSICAL_MEMORY)
-  math(EXPR _ram_jobs "${_rammb} / 2000")   # ~2.0G per concurrent heavy compile (post serializer-isolation ceiling)
+  math(EXPR _ram_jobs "${_rammb} / 3000")   # ~3.0G per concurrent heavy compile (measured -Og peak)
   set(SOLUX_COMPILE_JOBS ${_ncores})
   if(_ram_jobs LESS SOLUX_COMPILE_JOBS)
     set(SOLUX_COMPILE_JOBS ${_ram_jobs})
