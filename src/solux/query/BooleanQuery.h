@@ -724,7 +724,8 @@ public:
         IndexReader::Segment& segment,
         std::span<Query::SegmentSource* const> mandatorySources,
         std::span<const uint8_t> mandatoryScores,
-        std::span<Query::ScorerSupplier* const> filterSuppliers) {
+        std::span<Query::ScorerSupplier* const> filterSuppliers,
+        bool allowsPruning) {
       assert(mandatorySources.size() == mandatoryScores.size());
       struct Entry {
         int64_t cost;
@@ -776,7 +777,8 @@ public:
       return {targetPool.make<BooleanQuery::ConjunctionScorer>(
                 targetPool, std::span<Query::Scorer*>(all, allCount),
                 std::span<int64_t>(costs, allCount),
-                std::span<Query::Scorer*>(scoring, scoringCount)),
+                std::span<Query::Scorer*>(scoring, scoringCount),
+                allowsPruning),
               false, leadCost, scoringCount};
     }
 
@@ -792,10 +794,11 @@ public:
         std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch,
         bool needsScores,
-        bool externallyDriven) {
+        bool externallyDriven,
+        bool allowsPruning) {
       Required req = assembleRequired(
           targetPool, segment, mandatorySources, mandatoryScores,
-          filterSuppliers);
+          filterSuppliers, allowsPruning);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
       bool hasScoringMandatory = req.scoringCount > 0;
@@ -872,7 +875,8 @@ public:
         } else if (optCount == minShouldMatch) {
           // Every surviving optional clause is required and scores.
           optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, optionalScorers, optionalCosts, optionalScorers);
+            targetPool, optionalScorers, optionalCosts, optionalScorers,
+            allowsPruning);
         } else if (optCount > minShouldMatch) {
           bool useWand = needsScores && reqScorer == nullptr && prohibitedSources.empty();
           if (useWand) {
@@ -918,7 +922,7 @@ public:
         scoringSpan[nscoring - 1] = optScorer;
         if (hasScoringMandatory) scoringSpan[0] = reqScorer;
         boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, allSpan, allCosts, scoringSpan);
+            targetPool, allSpan, allCosts, scoringSpan, allowsPruning);
       }
 
       auto prohibitedScorers = QueryPrep::createScorers(targetPool, segment, prohibitedSources);
@@ -1034,7 +1038,8 @@ public:
         return assembleScorer(targetPool, segment, mandatorySources,
                               mandatoryScores, optionalSources,
                               prohibitedSources, filterSuppliers, minShouldMatch, needsScores,
-                              leadCost != std::numeric_limits<int64_t>::max());
+                              leadCost != std::numeric_limits<int64_t>::max(),
+                              allowsPruning);
       }
 
       enum class ConjunctionMode : uint8_t {
@@ -3165,10 +3170,17 @@ public:
       }
     };
 
+    enum class ExactApproxKind : uint8_t {
+      DOCS_ENUM,
+      TERM_SCORER,
+      DOC_SET,
+    };
+
     std::span<Query::Scorer*> scorers; // subset of required clauses that contributes to score()
     std::span<Query::Scorer*> conjunctionClauses; // every direct required clause
     std::span<ApproxSlot> approximations; // every required clause, ascending cost (lead first)
     std::span<VerifierSlot> verifiers; // two-phase clauses sorted by matchCost
+    std::span<ExactApproxKind> exactApproxKinds;
 
     int32_t docid = -1;
     float minCompetitiveScore = 0.0f;
@@ -3188,6 +3200,7 @@ public:
     // fully intersected and verified, so results are exact regardless.
     int failStreak = 0;
     bool skipSeen = false;
+    bool competitivePruning;
     int64_t skippedRangeCount = 0;
 
     // Skip past doc-block ranges where the SUM of the scoring clauses' score
@@ -3310,6 +3323,81 @@ public:
       }
     }
 
+    int32_t exactNext(size_t index) {
+      const ApproxSlot& approximation = approximations[index];
+      switch (exactApproxKinds[index]) {
+        case ExactApproxKind::DOCS_ENUM:
+          return approximation.docsEnum->next();
+        case ExactApproxKind::TERM_SCORER:
+          return static_cast<TermQuery::Scorer*>(
+              approximation.scorer)->next();
+        case ExactApproxKind::DOC_SET:
+          return static_cast<QueryPrep::DocSetScorer*>(
+              approximation.scorer)->next();
+      }
+      std::unreachable();
+    }
+
+    int32_t exactAdvance(size_t index, int32_t target) {
+      const ApproxSlot& approximation = approximations[index];
+      switch (exactApproxKinds[index]) {
+        case ExactApproxKind::DOCS_ENUM:
+          return approximation.docsEnum->advance(target);
+        case ExactApproxKind::TERM_SCORER:
+          return static_cast<TermQuery::Scorer*>(
+              approximation.scorer)->advance(target);
+        case ExactApproxKind::DOC_SET:
+          return static_cast<QueryPrep::DocSetScorer*>(
+              approximation.scorer)->advance(target);
+      }
+      std::unreachable();
+    }
+
+    int32_t exactDocId(size_t index) {
+      const ApproxSlot& approximation = approximations[index];
+      switch (exactApproxKinds[index]) {
+        case ExactApproxKind::DOCS_ENUM:
+          return approximation.docsEnum->docId();
+        case ExactApproxKind::TERM_SCORER:
+          return static_cast<TermQuery::Scorer*>(
+              approximation.scorer)->docId();
+        case ExactApproxKind::DOC_SET:
+          return static_cast<QueryPrep::DocSetScorer*>(
+              approximation.scorer)->docId();
+      }
+      std::unreachable();
+    }
+
+    int32_t doNextExact(int32_t target) {
+      outer:
+      for (;;) {
+        if (target == solux::PostingsReader::END) {
+          docid = target;
+          return docid;
+        }
+        for (size_t j = 1; j < approximations.size(); j++) {
+          if (exactDocId(j) < target) {
+            int32_t id = exactAdvance(j, target);
+            assert(id >= target);
+            if (id > target) {
+              target = exactAdvance(0, id);
+              goto outer;
+            }
+          }
+        }
+        for (auto& verifier : verifiers) {
+          if (!verifier.matches(target)) {
+            int32_t id = exactNext(verifier.approxIndex);
+            target = verifier.approxIndex == 0
+                ? id : exactAdvance(0, id);
+            goto outer;
+          }
+        }
+        docid = target;
+        return docid;
+      }
+    }
+
     // internal utility method where first approximation has already been advanced to target.
     int32_t doNext(int32_t target) {
       ApproxSlot& first = approximations[0];
@@ -3352,6 +3440,7 @@ public:
     // k; revisit only with fresh profiles.)
     static inline bool disablePruningForTests = false;
     static inline bool disableApproxFlattenForTests = false;
+    static inline bool disableExactDirectApproximationsForTests = false;
 
     // allCosts contains each allScorers entry's supplier cost. scoringScorers is
     // the subset whose score() contributes to the conjunction score (filter
@@ -3361,8 +3450,10 @@ public:
     // scoring subset while staying in allScorers.
     ConjunctionScorer(solux::MemPool& pool, std::span<Query::Scorer*> allScorers,
                       std::span<int64_t> allCosts,
-                      std::span<Query::Scorer*> scoringScorers)
-            : scorers(scoringScorers), conjunctionClauses(allScorers) {
+                      std::span<Query::Scorer*> scoringScorers,
+                      bool competitivePruning)
+            : scorers(scoringScorers), conjunctionClauses(allScorers),
+              competitivePruning(competitivePruning) {
       assert(allScorers.size() == allCosts.size());
       auto flattened = pool.make_span<std::span<DocsPosEnum*>>(allScorers.size());
       size_t approximationCount = 0;
@@ -3388,14 +3479,16 @@ public:
         if (!flattened[i].empty()) {
           for (DocsPosEnum* docsEnum : flattened[i]) {
             approximations[approximationIndex++] = {
-              nullptr, docsEnum, docsEnum->numDocs(), ApproxSlot::Kind::DOCS_ENUM};
+              nullptr, docsEnum, docsEnum->numDocs(),
+              ApproxSlot::Kind::DOCS_ENUM};
           }
           verifiers[verifierIndex++] = {scorer, 0, scorer->matchCost(), true};
           continue;
         }
         approximations[approximationIndex++] = {
-          scorer, nullptr, allCosts[i], twoPhase ? ApproxSlot::Kind::TWO_PHASE
-                                                : ApproxSlot::Kind::SINGLE_PHASE};
+          scorer, nullptr, allCosts[i],
+          twoPhase ? ApproxSlot::Kind::TWO_PHASE
+                   : ApproxSlot::Kind::SINGLE_PHASE};
       }
       assert(approximationIndex == approximations.size());
       if (expanded) {
@@ -3415,14 +3508,47 @@ public:
                 [](const VerifierSlot& a, const VerifierSlot& b) {
                   return a.matchCost < b.matchCost;
                 });
+      if (!competitivePruning
+          && !disableExactDirectApproximationsForTests) {
+        auto kinds =
+            pool.make_span<ExactApproxKind>(approximations.size());
+        bool supported = true;
+        for (size_t i = 0; i < approximations.size(); i++) {
+          const ApproxSlot& approximation = approximations[i];
+          if (approximation.kind == ApproxSlot::Kind::DOCS_ENUM) {
+            kinds[i] = ExactApproxKind::DOCS_ENUM;
+          } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
+                     && dynamic_cast<TermQuery::Scorer*>(
+                            approximation.scorer) != nullptr) {
+            kinds[i] = ExactApproxKind::TERM_SCORER;
+          } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
+                     && dynamic_cast<QueryPrep::DocSetScorer*>(
+                            approximation.scorer) != nullptr) {
+            kinds[i] = ExactApproxKind::DOC_SET;
+          } else {
+            supported = false;
+            break;
+          }
+        }
+        if (supported) {
+          exactApproxKinds = kinds;
+          skipCount(SkipStats::conjExactDirectApproxEngagements);
+        }
+      }
     }
 
     int32_t next() override {
       assert(docid != solux::PostingsReader::END);
+      if (!exactApproxKinds.empty()) {
+        return doNextExact(exactNext(0));
+      }
       return doNext(leadTo(approximations[0].next()));
     }
 
     int32_t advance(int32_t docid) override {
+      if (!exactApproxKinds.empty()) {
+        return doNextExact(exactAdvance(0, docid));
+      }
       return doNext(leadTo(approximations[0].advance(docid)));
     }
 
@@ -3591,6 +3717,8 @@ public:
     static inline bool disableDenseScoredForTests = false;
     static inline bool disableScoredProbeForTests = false;
     static inline bool disableBatchBoundForTests = false;
+    static inline bool disableExactScoredBoundsBypassForTests = false;
+    static inline bool disableDirectDenseClausesForTests = false;
     static inline bool disableNegatedCountForTests = false;
 
   private:
@@ -3605,6 +3733,8 @@ public:
 
     struct DenseClause {
       std::span<Query::Scorer*> members;
+      TermQuery::Scorer* term = nullptr;
+      QueryPrep::DocSetScorer* docSet = nullptr;
     };
 
     struct BufferedTerm {
@@ -3652,6 +3782,7 @@ public:
     bool termTailScorers = false;
     bool denseScoredEligible = false;
     bool denseScoredCostRejected = false;
+    bool competitivePruning = true;
     const uint8_t* denseScoredNorms = nullptr;
 
     enum class DenseScoredAdmission : uint8_t {
@@ -3715,6 +3846,12 @@ public:
     }
 
     int32_t denseClauseDocId(const DenseClause& clause) {
+      if (clause.term != nullptr) {
+        return clause.term->docsEnum.docId();
+      }
+      if (clause.docSet != nullptr) {
+        return clause.docSet->docId();
+      }
       int32_t doc = PostingsReader::END;
       for (Query::Scorer* member : clause.members) {
         doc = std::min(doc, member->docId());
@@ -3724,6 +3861,12 @@ public:
 
     int32_t denseClauseCountAdvance(
         const DenseClause& clause, int32_t target) {
+      if (clause.term != nullptr) {
+        return clause.term->docsEnum.advanceDocOnly(target);
+      }
+      if (clause.docSet != nullptr) {
+        return clause.docSet->advance(target);
+      }
       int32_t doc = PostingsReader::END;
       for (Query::Scorer* member : clause.members) {
         DocsFreqEnum* probe = member->windowFilterProbeDocsEnum();
@@ -3741,6 +3884,14 @@ public:
     void fillDenseClauseWindowBits(const DenseClause& clause,
                                    std::span<uint64_t> bits,
                                    int32_t windowBase, int32_t windowEnd) {
+      if (clause.term != nullptr) {
+        clause.term->fillWindowBits(bits, windowBase, windowEnd);
+        return;
+      }
+      if (clause.docSet != nullptr) {
+        clause.docSet->fillWindowBits(bits, windowBase, windowEnd);
+        return;
+      }
       for (Query::Scorer* member : clause.members) {
         member->fillWindowBits(bits, windowBase, windowEnd);
       }
@@ -4161,6 +4312,8 @@ public:
       if (leadDoc < min) {
         leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(min);
       }
+      const bool exactDrive =
+          !competitivePruning && !disableExactScoredBoundsBypassForTests;
 
       for (;;) {
         if (leadDoc == solux::PostingsReader::END) {
@@ -4172,34 +4325,40 @@ public:
           return leadDoc;
         }
 
-        // Window = [leadDoc, upTo], bounded by every clause's shallow block.
         int32_t upTo = max - 1;
-        for (size_t c = 0; c < scorers.size(); c++) {
-          upTo = std::min(
-              upTo, scorerAdvanceShallow<TermFast, TermTailFast>(c, leadDoc));
-        }
-        if (upTo < leadDoc) {
-          upTo = leadDoc;
-        }
-        suffixMax[scorers.size()] = 0.0;
-        for (size_t c = scorers.size(); c-- > 0; ) {
-          windowMax[c] =
-              scorerGetMaxScore<TermFast, TermTailFast>(c, upTo);
-          suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
-        }
-        // Group-granular bounds only (see ConjunctionScorer::advanceCompetitive
-        // note): block-level refinement measured as a net loss here - the
-        // parse plus the 32x window shrink cost more than the added skips.
-        if (suffixMax[0] * scoreBoundFactor < (double) this->minCompetitiveScore) {
-          // Nothing in this window can compete: hop the lead without touching
-          // the other clauses or any scoring.
-          skippedWindowCount++;
-          if (upTo >= max - 1) {
-            out.max = max;
-            return upTo + 1;
+        if (exactDrive) {
+          // Exact collection pins theta at the lowest float, so score bounds
+          // cannot reject a window or candidate. Keep the same lead batches
+          // and scored resident probes without parsing impact headers merely
+          // to establish a useless bound horizon.
+        } else {
+          // Window = [leadDoc, upTo], bounded by every clause's shallow block.
+          for (size_t c = 0; c < scorers.size(); c++) {
+            upTo = std::min(
+                upTo, scorerAdvanceShallow<TermFast, TermTailFast>(c, leadDoc));
           }
-          leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(upTo + 1);
-          continue;
+          if (upTo < leadDoc) {
+            upTo = leadDoc;
+          }
+          suffixMax[scorers.size()] = 0.0;
+          for (size_t c = scorers.size(); c-- > 0; ) {
+            windowMax[c] =
+                scorerGetMaxScore<TermFast, TermTailFast>(c, upTo);
+            suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
+          }
+          // Group-granular bounds only (see
+          // ConjunctionScorer::advanceCompetitive note): block-level
+          // refinement measured as a net loss here.
+          if (suffixMax[0] * scoreBoundFactor
+              < (double) this->minCompetitiveScore) {
+            skippedWindowCount++;
+            if (upTo >= max - 1) {
+              out.max = max;
+              return upTo + 1;
+            }
+            leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(upTo + 1);
+            continue;
+          }
         }
 
         // Produce this window: chunks of lead docs, one pass per other clause.
@@ -4252,7 +4411,9 @@ public:
             n = w;
           }
           for (size_t c = 1; c < scorers.size() && n > 0; c++) {
-            const double remaining = suffixMax[c];  // clauses [c, end) add at most this
+            const double remaining = exactDrive
+                ? std::numeric_limits<double>::infinity()
+                : suffixMax[c];  // clauses [c, end) add at most this
             const bool batchBound = !disableBatchBoundForTests;
             if (batchBound && remainingBoundCanDrop(remaining)) {
               n = batchCompactByRemainingBound(n, remaining);
@@ -4925,6 +5086,7 @@ public:
       termTailScorers = scorers.size() > 1;
       allTermClauses = true;
       allDenseClauses = true;
+      bool hasDirectDenseClause = false;
       size_t scoreAddends = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
         std::span<Query::Scorer*> denseMembers;
@@ -4940,6 +5102,18 @@ public:
           }
         }
         denseClauses[i].members = denseMembers;
+        if (!scoredConstruction
+            && !disableDirectDenseClausesForTests
+            && denseMembers.size() == 1) {
+          denseClauses[i].term =
+              dynamic_cast<TermQuery::Scorer*>(denseMembers[0]);
+          if (denseClauses[i].term == nullptr) {
+            denseClauses[i].docSet =
+                dynamic_cast<QueryPrep::DocSetScorer*>(denseMembers[0]);
+          }
+          hasDirectDenseClause |= denseClauses[i].term != nullptr
+              || denseClauses[i].docSet != nullptr;
+        }
         allDenseClauses &= !denseMembers.empty();
         denseHasDisjGroup |= denseMembers.size() > 1;
 
@@ -4967,6 +5141,9 @@ public:
         allTermClauses &= !members.empty();
         hasDisjGroup |= !members.empty();
         scoreAddends += members.empty() ? 1 : members.size();
+      }
+      if (hasDirectDenseClause) {
+        skipCount(SkipStats::conjDirectDenseEngagements);
       }
       bool allDenseProhibited = true;
       for (size_t i = 0; i < prohibitedScorers.size(); i++) {
@@ -5034,6 +5211,10 @@ public:
     }
 
     void setTopKDepth(int32_t topK, bool allowPruning) override {
+      competitivePruning = allowPruning;
+      if (!allowPruning && !disableExactScoredBoundsBypassForTests) {
+        skipCount(SkipStats::conjExactScoredBoundsBypasses);
+      }
       // Unpruned collection (an exact total count pins the threshold at its
       // lowest) leaves score-first with no skipping at all, which is the
       // deep-k limit of the density bar. Price it at the deepest calibrated

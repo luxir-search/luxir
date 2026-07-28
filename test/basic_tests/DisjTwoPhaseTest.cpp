@@ -162,7 +162,7 @@ public:
     int64_t costs[] = {5, 4};
     Query::Scorer* scoring[] = {group, requiredScorer};
     auto* scorer = pool.make<BooleanQuery::ConjunctionScorer>(
-      pool, all, costs, scoring);
+      pool, all, costs, scoring, true);
 
     DirectRun run;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
@@ -224,7 +224,7 @@ public:
     int64_t costs[] = {5, 4};
     Query::Scorer* scoring[] = {group, requiredScorer};
     auto* scorer = pool.make<BooleanQuery::ConjunctionScorer>(
-      pool, all, costs, scoring);
+      pool, all, costs, scoring, true);
 
     RequestRun run;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {

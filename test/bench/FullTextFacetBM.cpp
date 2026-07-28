@@ -291,7 +291,8 @@ ScoreTopKResult runMsmWandTopK(IndexReader& reader, int32_t topK, MsmWandMode mo
     Query::Scorer* scorer = nullptr;
     if (count == minMatch) {
       auto costs = pool.make_span<int64_t>((size_t) count);
-      scorer = pool.make<BooleanQuery::ConjunctionScorer>(pool, span, costs, span);
+      scorer = pool.make<BooleanQuery::ConjunctionScorer>(
+        pool, span, costs, span, true);
     } else if (mode == MsmWandMode::Wand) {
       scorer = pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
     } else {

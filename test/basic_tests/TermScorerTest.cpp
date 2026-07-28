@@ -2076,7 +2076,7 @@ Query::Scorer* createMsmScorer(MemPool& pool, std::span<Query::Weight*> weights,
   std::span<Query::Scorer*> span(arr, (size_t) count);
   if (count == minMatch) {
     auto costs = pool.make_span<int64_t>((size_t) count);
-    return pool.make<BooleanQuery::ConjunctionScorer>(pool, span, costs, span);
+    return pool.make<BooleanQuery::ConjunctionScorer>(pool, span, costs, span, true);
   }
   if (wand) {
     return pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
@@ -5177,7 +5177,8 @@ TEST_F(TermScorerTest, blockMaxConjunctionTopKMatchesExhaustive) {
     BooleanQuery exhaustiveQ(mand, {}, {}, {});
     BooleanQuery prunedQ(mand, {}, {}, {});
     auto* exhaustiveWeight = exhaustiveQ.createWeight(qContext, Query::NEED_SCORES);
-    auto* prunedWeight = prunedQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* prunedWeight = prunedQ.createWeight(
+        qContext, Query::NEED_SCORES | Query::ALLOW_PRUNING);
 
     auto* exhaustiveScorer = exhaustiveWeight->createScorer(testIndex.pool, segment);
     ASSERT_NE(exhaustiveScorer, nullptr);
@@ -5226,7 +5227,8 @@ TEST_F(TermScorerTest, conjunctionFailedEvalBackoffEngages) {
   TermQuery b("body_w", "backb");
   std::vector<Query*> mand = {&a, &b};
   BooleanQuery backoffQ(mand, {}, {}, {});
-  auto* backoffWeight = backoffQ.createWeight(qContext, Query::NEED_SCORES);
+  auto* backoffWeight = backoffQ.createWeight(
+      qContext, Query::NEED_SCORES | Query::ALLOW_PRUNING);
   auto* backoffScorer = dynamic_cast<BooleanQuery::ConjunctionScorer*>(
       backoffWeight->createScorer(testIndex.pool, segment));
   ASSERT_NE(backoffScorer, nullptr);
