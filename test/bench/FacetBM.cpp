@@ -42,6 +42,7 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
   RSSWatcher watcher;
 
   int64_t fp = -1;
+  int64_t domainSize = -1;
   for (auto _ : state) {
     int64_t ret = 0;
 
@@ -52,6 +53,14 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
 
     if (qfield == "all") {
       topDocs.allQuery();
+    } else if (qfield == "1%") {
+      // No field has 100 distinct values, but sparse_u1k_s is populated on
+      // exactly 1% of docs, so exists over it is a ~1% domain for the cost of
+      // one docs-with-value bitset.  Intersecting two 10-valued fields reaches
+      // the same domain but walks 2M postings to do it, which then dominates
+      // the measurement.  This domain is sparse enough to stay an ARRAY (point
+      // decoding) and large enough to measure; tinyD is 6 docs.
+      topDocs.exprQuery("sparse_u1k_s:*");
     } else {
       topDocs.matchQuery(qfield, "0");
     }
@@ -89,12 +98,16 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
 
     benchmark::DoNotOptimize(ret);
 
+    domainSize = qDocs->found.value_or(-1);
     if (fp != -1) {
       ASSERT_EQ(fp, ret); // sanity check that we get the same result every time.
     }
     fp = ret;  // save the fingerprint for the next iteration
   }
 
+  // Matching docs, so each row says which domain size it actually measured
+  // rather than leaving it implied by the query field's cardinality.
+  state.counters["domain"] = (double)domainSize;
   state.counters["fp"] = fp;  // sanity check.
   state.counters["reused"] = reuseIndex;; // did we reuse the index?
   state.counters["rate"] = benchmark::Counter(state.iterations(),benchmark::Counter::kIsRate);
@@ -209,6 +222,11 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s",
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_is,     nDocs, shape, "short_u1m_s", "u10_is", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_is,      nDocs, shape, "short_u10_s", "u10_is", false);
+// ~1% domain: the sparse point-decode path at a size worth measuring.  tinyD
+// matches ~10 docs and bigD is dense enough to take the bulk path.
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10_i,       nDocs, shape, "1%", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10_is,      nDocs, shape, "1%", "u10_is", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_s,      nDocs, shape, "1%", "short_u10k_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", false);
