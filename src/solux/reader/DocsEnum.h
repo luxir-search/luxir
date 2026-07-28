@@ -37,7 +37,6 @@ protected:
   bool hasFreqs;
   bool hasPositions;
   bool hasNorms;
-  uint8_t currentL1PackedBlocks = 0;
   int32_t docfreq;
   int64_t ttf;
   int64_t docsSize;
@@ -170,18 +169,6 @@ protected:
     return (s & 0x7fffull) | (InputStream::readVlong(pos, end) << 15);
   }
 
-  void skipL1Header() {
-    uint32_t headerLen = docIS.readVint();
-    const char* p = docIS.ptr();
-    const char* headerEnd = p + headerLen;
-    unused(readVint15(p, headerEnd));
-    unused(readVlong15(p, headerEnd));
-    assert(p < headerEnd);
-    currentL1PackedBlocks = (uint8_t) *p++;
-    assert(currentL1PackedBlocks <= L1_PERIOD);
-    docIS.skip(headerLen);
-  }
-
   static uint32_t readU16LE(const char* p) {
     uint8_t b[2];
     memcpy(b, p, sizeof(b));
@@ -280,9 +267,6 @@ public:
   int32_t numDocs() { return docfreq; }
   int32_t totalTermFreq() { return ttf; }
   int32_t packedBlockCount() const { return termPackedBlocks; }
-  // Count from the L1 header most recently entered by this postings cursor.
-  // It is 0 before the cursor enters its first group and for pulsed postings.
-  int32_t l1PackedBlockCount() const { return (int32_t) currentL1PackedBlocks; }
   int64_t termOrd() const { return termOrdinal; }
   bool hasTermImpacts() const { return termImpactFrontierPtr != nullptr; }
 
@@ -754,7 +738,8 @@ private:
   void seekToBlockBody() {
     if (!bodyReady) {
       if (isL1Boundary(nextL0Block)) {
-        skipL1Header();
+        auto groupHeaderLen = docIS.readVint();
+        docIS.skip(groupHeaderLen);
       }
       auto headerLen = docIS.readVint();
       docIS.skip(headerLen);
@@ -773,7 +758,8 @@ private:
       return bodyBytes;
     }
     if (isL1Boundary(nextL0Block)) {
-      skipL1Header();
+      auto groupHeaderLen = docIS.readVint();
+      docIS.skip(groupHeaderLen);
     }
     auto headerLen = docIS.readVint();
     const char* p = docIS.ptr();
@@ -2374,8 +2360,7 @@ public:
       uint32_t groupLastDoc = prevLastDoc + groupLastDocDelta;
       uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
       assert(p < groupHeaderEnd);
-      currentL1PackedBlocks = (uint8_t) *p++;
-      assert(currentL1PackedBlocks <= L1_PERIOD);
+      p++;  // per-group packed-block count: no cursor consumer
       int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - block);
       int32_t groupDocCount = std::min(L1_DOCS, docfreq - group * L1_DOCS);
       int64_t groupTfSum = groupDocCount;
@@ -2645,7 +2630,8 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
   void seekToBlockBody() {
     if (!bodyReady) {
       if (isL1Boundary(nextL0Block)) {
-        skipL1Header();
+        auto groupHeaderLen = docIS.readVint();
+        docIS.skip(groupHeaderLen);
       }
       auto headerLen = docIS.readVint();
       docIS.skip(headerLen);
@@ -3204,8 +3190,7 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
       uint32_t groupLastDoc = prevLastDoc + readVint15(p, groupHeaderEnd);
       uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
       assert(p < groupHeaderEnd);
-      currentL1PackedBlocks = (uint8_t) *p++;
-      assert(currentL1PackedBlocks <= L1_PERIOD);
+      p++;  // per-group packed-block count: no cursor consumer
       int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - block);
       const char* groupBody = groupHeaderEnd;
       if (target <= (int32_t) groupLastDoc) {

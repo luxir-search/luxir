@@ -704,29 +704,23 @@ TEST_F(TermsDictTest, PackedBlockCountsRoundTripAcrossIndexLevels) {
           term.name == "pulse" ? std::vector<int32_t>{} : census.packedPerGroup;
       EXPECT_EQ(groups.packedBlockCounts, expectedGroups) << term.name;
 
+      // The group bytes are asserted via readGroupImpacts above; the
+      // sequential cursor skips L1 headers without parsing them. Iterate to
+      // prove the header byte does not disturb postings iteration, and that
+      // the per-group counts sum to the term total.
+      int64_t groupSum = 0;
+      for (int32_t count : groups.packedBlockCounts) {
+        groupSum += count;
+      }
+      EXPECT_EQ(groupSum, expectedPacked) << term.name;
       DocsOnlyEnum docs(tenum);
       int32_t seen = 0;
-      int32_t groupSum = 0;
-      int32_t group = 0;
       for (int32_t actual = docs.nextDoc(); actual != DocsEnumMeta::END;
            actual = docs.nextDoc()) {
         ASSERT_EQ(actual, term.docs[(size_t) seen].docid) << term.name;
-        if (term.name != "pulse" && (seen % DocsEnumMeta::L1_DOCS) == 0) {
-          ASSERT_LT(group, (int32_t) expectedGroups.size()) << term.name;
-          EXPECT_EQ(docs.l1PackedBlockCount(), expectedGroups[(size_t) group])
-              << term.name << " group " << group;
-          groupSum += docs.l1PackedBlockCount();
-          group++;
-        }
         seen++;
       }
       EXPECT_EQ(seen, (int32_t) term.docs.size()) << term.name;
-      EXPECT_EQ(groupSum, expectedPacked) << term.name;
-      if (term.name == "pulse") {
-        EXPECT_EQ(docs.l1PackedBlockCount(), 0);
-      } else {
-        EXPECT_EQ(group, (int32_t) expectedGroups.size()) << term.name;
-      }
     }
     EXPECT_FALSE(tenum.nextTerm());
   }
