@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "solux/store/OutputStream.h"
+#include "solux/util/solux_util.h"
 
 namespace solux {
 
@@ -118,8 +119,7 @@ public:
     assert(bits <= 32);
     if (bits == 0) return 0;
     uint64_t bitPos = (uint64_t)idx * bits;
-    uint64_t word;
-    memcpy(&word, base + (bitPos >> 3), sizeof(word));
+    uint64_t word = loadUnaligned<uint64_t>(base + (bitPos >> 3));
     return (uint32_t)(word >> (bitPos & 7)) & mask;
   }
 
@@ -128,8 +128,7 @@ public:
     assert(bits <= 57);
     if (bits == 0) return 0;
     uint64_t bitPos = idx * bits;
-    uint64_t word;
-    memcpy(&word, base + (bitPos >> 3), sizeof(word));
+    uint64_t word = loadUnaligned<uint64_t>(base + (bitPos >> 3));
     return (word >> (bitPos & 7)) & mask;
   }
 

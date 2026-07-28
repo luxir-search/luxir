@@ -85,9 +85,7 @@ public:
         blockInfo((int64_t)((uint64_t)rank / BLOCK_SIZE));
     const char* payload = blocks + info.payloadOffset();
     if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
-      int64_t value;
-      memcpy(&value, payload + rankInBlock * sizeof(value), sizeof(value));
-      return value;
+      return loadUnaligned<int64_t>(payload + rankInBlock * sizeof(int64_t));
     }
     uint64_t residual = LinearPack::select64(
         payload, rankInBlock, info.bits(), LinearPack::mask64(info.bits()));

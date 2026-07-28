@@ -79,6 +79,32 @@ template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
 #  define SOLUX_RESTRICT
 #endif
 
+// Load a scalar from bytes that may be unaligned - mapped file data at an
+// offset we do not control.
+//
+// The obvious `T v; memcpy(&v, p, sizeof v); return v;` compiles to the same
+// single load once optimized, but it needs a local, and the local is not free
+// in the builds we run tests in: at -O0 `-ftrivial-auto-var-init=pattern`
+// stores a fill pattern into it before the copy overwrites it, and ASan gives
+// it a shadow-checked fake stack slot (__asan_stack_malloc). Reading through a
+// 1-aligned type has no local at all, so every build gets the plain load.
+// always_inline, not just inline: at -O0 nothing is inlined by default, and a
+// call here would cost more than the local it removes.
+#if defined(__GNUC__)
+template <class T>
+[[gnu::always_inline]] inline T loadUnaligned(const void* p) {
+  typedef T __attribute__((__aligned__(1))) unaligned_t;
+  return *reinterpret_cast<const unaligned_t*>(p);
+}
+#else
+template <class T>
+SOLUX_INLINE inline T loadUnaligned(const void* p) {
+  T value;
+  memcpy(&value, p, sizeof(value));
+  return value;
+}
+#endif
+
 template<typename... Args>
 inline void unused(Args &&...) {}
 
