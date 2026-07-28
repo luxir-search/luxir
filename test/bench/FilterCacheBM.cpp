@@ -187,11 +187,11 @@ void BM_FilterCacheEffectiveDocSet(benchmark::State& state, bool deletes) {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key);
     auto probe = use->probe(0);
-    auto value = use->pinnedValue(0);
+    benchmark::DoNotOptimize(probe.docSet());
     DocSet* result;
     {
       BenchTimer timer(state);
-      result = use->effectiveDocSet(0, *reader, value);
+      result = use->effectiveDocSet(0, *reader);
       benchmark::DoNotOptimize(result);
     }
   }

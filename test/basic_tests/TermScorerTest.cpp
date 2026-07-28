@@ -7259,15 +7259,12 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   ASSERT_LT(2, 1024 / (int32_t) BooleanQuery::kMaskFilterDensityInverse + 1);
   std::vector<Query*> selectiveFilter = {&selective};
   BooleanQuery selectiveQuery(oneMandatory, {}, {}, selectiveFilter);
-  {
-    MemPool pool;
-    Query::Context context(pool, *reader);
-    auto* weight = selectiveQuery.createWeight(context, Query::NEED_SCORES);
-    auto* supplier = weight->scorerSupplier(
-        pool, context.topReader.segments()[0]);
-    ASSERT_NE(supplier, nullptr);
-    EXPECT_EQ(supplier->bulkScorer(pool), nullptr);
-  }
+  auto expectedSelective = runQueryTopK(
+      *reader, selectiveQuery, topK, false);
+  auto actualSelective = runBulk(
+      selectiveQuery, typeid(BooleanQuery::ConjunctionBulkScorer));
+  assertTopKEquivalent(
+      expectedSelective.topDocs, actualSelective.topDocs);
 
   std::vector<std::string_view> phraseTerms = {"quick", "fox"};
   std::vector<int32_t> phrasePositions = {0, 1};

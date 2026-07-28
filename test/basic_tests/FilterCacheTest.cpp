@@ -83,6 +83,58 @@ public:
   }
 };
 
+class FilterOwnGuard {
+  bool saved;
+
+public:
+  explicit FilterOwnGuard(bool disabled)
+    : saved(QueryPrep::disableFilterOwnForTests) {
+    QueryPrep::disableFilterOwnForTests = disabled;
+  }
+
+  ~FilterOwnGuard() {
+    QueryPrep::disableFilterOwnForTests = saved;
+  }
+};
+
+class OwnedFilterStatsGuard {
+  bool saved;
+
+public:
+  OwnedFilterStatsGuard() : saved(SkipStats::enabled) {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+
+  ~OwnedFilterStatsGuard() {
+    SkipStats::enabled = saved;
+    SkipStats::reset();
+  }
+};
+
+class UncacheableQuery final : public Query {
+  Query& child;
+
+public:
+  explicit UncacheableQuery(Query& child) : child(child) {}
+
+  ScoreProfile scoreProfile() const override {
+    return child.scoreProfile();
+  }
+
+  FilterKeyScope appendFilterKey(
+      FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
+    unused(out, ctx);
+    return FilterKeyScope::UNCACHEABLE;
+  }
+
+  Query::Weight* createWeight(
+      Query::Context& context, int32_t flags,
+      float multiplier = 1.0f) override {
+    return child.createWeight(context, flags, multiplier);
+  }
+};
+
 std::unique_ptr<DocSet> docs(int32_t maxDoc,
                              std::initializer_list<int32_t> values) {
   DocSetBuilder builder(maxDoc);
@@ -108,6 +160,18 @@ void addTermDoc(IndexWriter& writer, std::string_view text) {
   auto& inverter = writer.obtainInverter();
   auto& field = inverter.getIndexHandler("text_w");
   inverter.startDoc();
+  field.index(inverter, text);
+  inverter.finishDoc();
+  writer.releaseInverter(inverter);
+}
+
+void addIdTermDoc(IndexWriter& writer, std::string_view idValue,
+                  std::string_view text) {
+  auto& inverter = writer.obtainInverter();
+  auto& id = inverter.getIndexHandler("id");
+  auto& field = inverter.getIndexHandler("text_w");
+  inverter.startDoc();
+  id.index(inverter, idValue);
   field.index(inverter, text);
   inverter.finishDoc();
   writer.releaseInverter(inverter);
@@ -839,6 +903,250 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
   EXPECT_EQ(1u, counters.hits);
 }
 
+TEST(FilterCacheTest, disabledCacheStillOwnsOneRequestValue) {
+  FilterCacheConfig config = testConfig();
+  config.maxBytes = 0;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  for (int32_t doc = 0; doc < 1024; doc++) {
+    addTermDoc(writer, doc == 7 ? "selected body" : "body");
+  }
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  ASSERT_NE(nullptr, reader->filterCache());
+  ASSERT_FALSE(reader->filterCache()->enabled());
+
+  TermQuery selected("text_w", "selected");
+  MemPool contextPool;
+  Query::Context context(contextPool, *reader);
+  ASSERT_NE(nullptr, context.filterUses);
+  auto* use = context.getFilterUse(selected);
+  ASSERT_NE(nullptr, use);
+  auto* weight = selected.createWeight(context, 0);
+
+  OwnedFilterStatsGuard stats;
+  MemPool firstPool;
+  auto* first = QueryPrep::filterSupplier(
+      firstPool, *weight, nullptr, use, *reader, reader->segments()[0],
+      QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
+  ASSERT_NE(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(first));
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(1, SkipStats::ownedFilterServes);
+
+  auto before = reader->filterCache()->counters();
+  MemPool secondPool;
+  auto* second = QueryPrep::filterSupplier(
+      secondPool, *weight, nullptr, use, *reader, reader->segments()[0],
+      QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
+  ASSERT_NE(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(second));
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(2, SkipStats::ownedFilterServes);
+  EXPECT_EQ(before.misses, reader->filterCache()->counters().misses);
+
+  FilterOwnGuard disabled(true);
+  MemPool disabledContextPool;
+  Query::Context disabledContext(disabledContextPool, *reader);
+  auto* disabledWeight = selected.createWeight(disabledContext, 0);
+  auto* disabledUse = disabledContext.getFilterUse(selected);
+  MemPool disabledExecPool;
+  auto* disabledSupplier = QueryPrep::filterSupplier(
+      disabledExecPool, *disabledWeight, nullptr, disabledUse, *reader,
+      reader->segments()[0],
+      QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
+  ASSERT_NE(nullptr, disabledSupplier);
+  EXPECT_EQ(nullptr,
+            dynamic_cast<QueryPrep::DocSetSupplier*>(disabledSupplier));
+}
+
+TEST(FilterCacheTest, ownedAndBorrowedValuesComposeDeletesIdentically) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  for (int32_t doc = 0; doc < 8; doc++) {
+    addIdTermDoc(writer, std::to_string(doc), "selected");
+  }
+  writer.commit();
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("1", 1);
+  deletes.deleteId("3", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto reader = writer.getIndexReader(0);
+  ASSERT_EQ(1u, reader->segments().size());
+  ASSERT_NE(nullptr, reader->segments()[0].liveDocs());
+  auto identities = readerIdentitiesForTest(*reader);
+
+  FilterCacheConfig offConfig = testConfig();
+  offConfig.maxBytes = 0;
+  FilterCache off(offConfig);
+  FilterCache::UseRegistry ownedRequest(&off, *reader);
+  auto* ownedUse = ownedRequest.get(FilterKey("delete-parity"));
+  auto ownedProbe = ownedUse->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, ownedProbe.kind());
+  ownedUse->adoptOwnedRaw(
+      0, ownedProbe, docs(reader->segments()[0].maxDoc(), {0, 1, 2, 3}));
+  DocSet* owned = ownedUse->effectiveDocSet(0, *reader);
+
+  FilterCacheConfig onConfig = testConfig();
+  onConfig.admissionThreshold = 1;
+  FilterCache on(onConfig);
+  ASSERT_TRUE(on.onReaderPublished(reader->coreGen(), identities));
+  FilterCache::UseRegistry borrowedRequest(on, *reader);
+  auto* borrowedUse = borrowedRequest.get(FilterKey("delete-parity"));
+  auto borrowedProbe = borrowedUse->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, borrowedProbe.kind());
+  borrowedUse->publishRaw(
+      0, borrowedProbe,
+      docs(reader->segments()[0].maxDoc(), {0, 1, 2, 3}), 1);
+  DocSet* borrowed = borrowedUse->effectiveDocSet(0, *reader);
+
+  ASSERT_NE(nullptr, owned);
+  ASSERT_NE(nullptr, borrowed);
+  EXPECT_EQ(borrowed->card(), owned->card());
+  for (int32_t doc = 0; doc < reader->segments()[0].maxDoc(); doc++) {
+    EXPECT_EQ(borrowed->get(doc), owned->get(doc)) << doc;
+  }
+  EXPECT_TRUE(owned->get(0));
+  EXPECT_TRUE(owned->get(2));
+  EXPECT_FALSE(owned->get(1));
+  EXPECT_FALSE(owned->get(3));
+}
+
+TEST(FilterCacheTest, buildRaceLoserOwnsWithoutPublishingOrReprobing) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("build-race-owned");
+
+  FilterCache::UseRegistry builder(cache, 1, segments);
+  auto* builderUse = builder.get(key);
+  auto builderProbe = builderUse->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, builderProbe.kind());
+
+  OwnedFilterStatsGuard stats;
+  FilterCache::UseRegistry loser(cache, 1, segments);
+  auto* loserUse = loser.get(key);
+  auto loserProbe = loserUse->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, loserProbe.kind());
+  loserUse->adoptOwnedRaw(0, loserProbe, docs(1024, {5, 9}));
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(1, SkipStats::ownedFilterServes);
+  EXPECT_EQ(0u, cache.counters().builds);
+  EXPECT_EQ(0u, cache.bytesUsed());
+
+  uint64_t misses = cache.counters().misses;
+  auto localHit = loserUse->probe(0);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, localHit.kind());
+  EXPECT_TRUE(localHit.docSet()->get(5));
+  EXPECT_EQ(misses, cache.counters().misses);
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(2, SkipStats::ownedFilterServes);
+
+  builderUse->publishRaw(0, builderProbe, docs(1024, {5, 9}), 1);
+  EXPECT_EQ(1u, cache.counters().builds);
+  EXPECT_GT(cache.bytesUsed(), 0u);
+}
+
+TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
+  FilterCacheConfig config = testConfig();
+  config.maxBytes = 0;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addTermDoc(writer, "selected");
+  addTermDoc(writer, "other");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+
+  TermQuery term("text_w", "selected");
+  UncacheableQuery query(term);
+  MemPool contextPool;
+  Query::Context context(contextPool, *reader);
+  EXPECT_EQ(nullptr, context.getFilterUse(query));
+  auto* weight = query.createWeight(context, 0);
+  MemPool execPool;
+  auto* supplier = QueryPrep::filterSupplier(
+      execPool, *weight, nullptr, context.getFilterUse(query), *reader,
+      reader->segments()[0],
+      QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE);
+  ASSERT_NE(nullptr, supplier);
+  EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
+}
+
+TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
+  FilterCacheConfig config = testConfig();
+  config.maxBytes = 0;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  constexpr int32_t maxDoc = 1024;
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    std::string terms = "body";
+    if (doc < 4) terms += " sparse";
+    if (doc < 24) terms += " middle";
+    if (doc < 40) terms += " over";
+    addTermDoc(writer, terms);
+  }
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  constexpr int32_t sparseInverse = 64;
+  ASSERT_EQ(32, DocSetBuilder::arrayLimitFor(maxDoc));
+
+  auto isOwned = [&](std::string_view term,
+                     QueryPrep::FilterSupplierMode mode) {
+    TermQuery query("text_w", term);
+    MemPool contextPool;
+    Query::Context context(contextPool, *reader);
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(query);
+    MemPool execPool;
+    auto* supplier = QueryPrep::filterSupplier(
+        execPool, *weight, nullptr, use, *reader, reader->segments()[0],
+        mode, sparseInverse);
+    return dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr;
+  };
+
+  EXPECT_FALSE(isOwned(
+      "sparse", QueryPrep::FilterSupplierMode::DENSITY_ROUTED));
+  EXPECT_TRUE(isOwned(
+      "sparse", QueryPrep::FilterSupplierMode::SPARSE_BATCH));
+  EXPECT_FALSE(isOwned(
+      "middle", QueryPrep::FilterSupplierMode::SPARSE_BATCH));
+  EXPECT_FALSE(isOwned(
+      "middle", QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
+  EXPECT_FALSE(isOwned(
+      "over", QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
+}
+
+TEST(FilterCacheTest, requestOwnedArraysStayWithinMultiFilterBound) {
+  FilterCacheConfig config = testConfig();
+  config.maxBytes = 0;
+  FilterCache cache(config);
+  constexpr int32_t maxDoc = 1024;
+  constexpr int32_t filterCount = 4;
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  FilterCache::UseRegistry request(&cache, 1, segments);
+
+  for (int32_t filter = 0; filter < filterCount; filter++) {
+    auto* use = request.get(
+        FilterKey("owned-memory-" + std::to_string(filter)));
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, probe.kind());
+    DocSetBuilder builder(maxDoc);
+    for (int32_t doc = 0; doc < DocSetBuilder::arrayLimitFor(maxDoc); doc++) {
+      builder.add(doc);
+    }
+    use->adoptOwnedRaw(0, probe, builder.build());
+  }
+
+  size_t perFilterCap = sizeof(ArrDocSet)
+      + (size_t) DocSetBuilder::arrayLimitFor(maxDoc) * sizeof(int32_t);
+  EXPECT_GT(request.ownedBytesForTest(), 0u);
+  EXPECT_LE(request.ownedBytesForTest(), filterCount * perFilterCap);
+  auto* first = request.get(FilterKey("owned-memory-0"));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, first->probe(0).kind());
+  EXPECT_LE(request.ownedBytesForTest(), filterCount * perFilterCap);
+}
+
 TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
@@ -906,13 +1214,16 @@ TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {
   TermQuery query("text_w", "cache");
   MemPool contextPool;
   Query::Context context(contextPool, *reader);
-  auto* weight = query.createWeight(context, 0);
   auto* use = context.getFilterUse(query);
   auto heldClaim = use->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, heldClaim.kind());
+  MemPool racerPool;
+  Query::Context racerContext(racerPool, *reader);
+  auto* racerWeight = query.createWeight(racerContext, 0);
+  auto* racerUse = racerContext.getFilterUse(query);
 
   auto effective = QueryPrep::materializeEffectiveFilter(
-      *weight, nullptr, use, *reader, reader->segments()[0], nullptr);
+      *racerWeight, nullptr, racerUse, *reader, reader->segments()[0], nullptr);
   ASSERT_NE(nullptr, effective.get());
   EXPECT_EQ(1, effective.get()->card());
   EXPECT_EQ(1u, cache->counters().byproductInserts);
@@ -931,13 +1242,17 @@ TEST(FilterCacheTest, pruningBypassDoesNotOfferByproduct) {
   TermQuery query("text_w", "cache");
   MemPool contextPool;
   Query::Context context(contextPool, *reader);
-  auto* weight = query.createWeight(context, Query::ALLOW_PRUNING);
   auto* use = context.getFilterUse(query);
   auto heldClaim = use->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, heldClaim.kind());
+  MemPool racerPool;
+  Query::Context racerContext(racerPool, *reader);
+  auto* racerWeight =
+      query.createWeight(racerContext, Query::ALLOW_PRUNING);
+  auto* racerUse = racerContext.getFilterUse(query);
 
   auto effective = QueryPrep::materializeEffectiveFilter(
-      *weight, nullptr, use, *reader, reader->segments()[0], nullptr);
+      *racerWeight, nullptr, racerUse, *reader, reader->segments()[0], nullptr);
 
   ASSERT_NE(nullptr, effective.get());
   EXPECT_EQ(1, effective.get()->card());
@@ -959,15 +1274,23 @@ TEST(FilterCacheTest, requestCachesLiveAndDomainCompositionsSeparately) {
       reader->segments()[0].segInfo.seg_id, reader->segments()[0].maxDoc()}};
   FilterCache::UseRegistry request(*cache, reader->coreGen(), identities);
   auto* use = request.get(FilterKey("domain-composition"));
-  auto raw = use->offerRaw(0, docs(3, {0, 1}), 1);
+  use->offerRaw(0, docs(3, {0, 1}), 1);
   auto domain = docs(3, {1, 2});
+  auto otherDomain = docs(3, {0, 2});
 
   DocSet* domainEffective = use->effectiveDocSet(
-      0, *reader, raw, domain.get());
-  DocSet* liveEffective = use->effectiveDocSet(0, *reader, raw);
+      0, *reader, domain.get());
+  DocSet* otherEffective = use->effectiveDocSet(
+      0, *reader, otherDomain.get());
+  DocSet* domainAgain = use->effectiveDocSet(
+      0, *reader, domain.get());
+  DocSet* liveEffective = use->effectiveDocSet(0, *reader);
 
   EXPECT_EQ(1, domainEffective->card());
   EXPECT_TRUE(domainEffective->get(1));
+  EXPECT_EQ(1, otherEffective->card());
+  EXPECT_TRUE(otherEffective->get(0));
+  EXPECT_EQ(domainEffective, domainAgain);
   EXPECT_EQ(2, liveEffective->card());
 }
 
@@ -1335,6 +1658,17 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   auto offCache = off.getIndexWriter()->getFilterCache();
   ASSERT_TRUE(onCache->enabled());
   ASSERT_FALSE(offCache->enabled());
+
+  auto registryRequest = solux::test::localReq(offNode.getSearchEngine());
+  registryRequest->collection("filter_cache_it")
+      .topDocs("registry")
+      .matchQuery("body_w", "body")
+      .matchFilter("selection", "filter_w", "keep")
+      .getNumber()
+      .limit(0);
+  registryRequest->execute();
+  ASSERT_TRUE(registryRequest->ok()) << registryRequest->toString();
+  EXPECT_NE(nullptr, registryRequest->filterUses);
 
   auto firstOn = runCachedSearch(onNode, "filter_cache_it", "keep");
   auto firstOff = runCachedSearch(offNode, "filter_cache_it", "keep");

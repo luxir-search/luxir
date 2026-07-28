@@ -1991,7 +1991,7 @@ public:
         filterSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
             filterWeights.size());
         for (size_t i = 0; i < filterWeights.size(); i++) {
-          bool exactFilteredDisjunction = needsScores && !allowsPruning
+          bool exactFilteredDisjunction = !allowsPruning
               && !disableFilteredDisjunctionBatchForTests
               && mandatoryWeights.empty() && optionalWeights.size() >= 2
               && prohibitedWeights.empty() && minShouldMatch == 1;
@@ -2009,7 +2009,10 @@ public:
               targetPool, *filterWeights[i], nullptr, filterUses[i],
               context.topReader, segment, mode,
               exactFilteredDisjunction
-                  ? filteredDisjunctionBatchDensityInverseForTests : 0);
+                  ? needsScores
+                        ? filteredDisjunctionBatchDensityInverseForTests
+                        : QueryPrep::kSparseBatchCountOwnDensityInverse
+                  : 0);
         }
       }
       return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,

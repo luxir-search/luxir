@@ -151,6 +151,8 @@ struct SkipStats {
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
   static inline int64_t sparseFilteredTopKShapeRejects = 0;
+  static inline int64_t ownedFilterMaterializations = 0;
+  static inline int64_t ownedFilterServes = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t conjMatchFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
@@ -311,6 +313,8 @@ struct SkipStats {
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;
     sparseFilteredTopKShapeRejects = 0;
+    ownedFilterMaterializations = 0;
+    ownedFilterServes = 0;
     conjCountFallbacks = 0;
     conjMatchFallbacks = 0;
     bulkDomainWindowsFed = 0;

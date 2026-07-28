@@ -77,10 +77,10 @@ public:
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
-  // One Use per distinct filter key for the whole request: duplicate filters
-  // in separate operation trees share the same Use, so per-segment value pins
-  // and request-composed sets are produced once and reused (admission also
-  // counts once as a consequence). shared_ptr because a standalone
+  // One Use per distinct filter key for the whole request, even with the shared
+  // cache disabled: duplicate filters in separate operation trees share the
+  // same borrowed or owned raw value and request-composed sets (admission also
+  // counts once when a cache backend is active). shared_ptr because a standalone
   // Query::Context (tests, non-request embedders) creates and owns its own
   // registry, while request-backed Contexts all reference this one.
   std::shared_ptr<FilterCache::UseRegistry> filterUses;

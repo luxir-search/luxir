@@ -9,6 +9,7 @@
 #include <tuple>
 #include <utility>
 
+#include "solux/reader/SkipStats.h"
 #include "solux/search/IndexReader.h"
 
 namespace solux {
@@ -87,39 +88,59 @@ DocSet* FilterCache::ReaderValue::docSet(
 
 FilterCache::Probe::Probe(Kind kind, std::shared_ptr<SegmentSlot> slot,
                           std::shared_ptr<const SegmentValue> value,
-                          bool ownsClaim)
-  : slot(std::move(slot)), value(std::move(value)), kind_(kind),
-    ownsClaim(ownsClaim) {
+                          bool ownsClaim, DocSet* requestValue,
+                          Use* requestUse, size_t requestSegmentOrd,
+                          bool ownsRequestClaim)
+  : slot(std::move(slot)), value(std::move(value)),
+    requestValue(requestValue), requestUse(requestUse),
+    requestSegmentOrd(requestSegmentOrd), kind_(kind), ownsClaim(ownsClaim),
+    ownsRequestClaim(ownsRequestClaim) {
 }
 
-void FilterCache::Probe::releaseClaim() {
+void FilterCache::Probe::releaseClaims() {
   if (ownsClaim) {
     slot->building.store(false, std::memory_order_release);
     ownsClaim = false;
+  }
+  if (ownsRequestClaim) {
+    requestUse->releaseRequestClaim(requestSegmentOrd);
+    ownsRequestClaim = false;
   }
 }
 
 FilterCache::Probe::Probe(Probe&& other) noexcept
   : slot(std::move(other.slot)), value(std::move(other.value)),
-    kind_(other.kind_), ownsClaim(other.ownsClaim) {
+    requestValue(other.requestValue), requestUse(other.requestUse),
+    requestSegmentOrd(other.requestSegmentOrd), kind_(other.kind_),
+    ownsClaim(other.ownsClaim), ownsRequestClaim(other.ownsRequestClaim) {
   other.kind_ = Kind::BYPASS;
+  other.requestValue = nullptr;
+  other.requestUse = nullptr;
   other.ownsClaim = false;
+  other.ownsRequestClaim = false;
 }
 
 FilterCache::Probe& FilterCache::Probe::operator=(Probe&& other) noexcept {
   if (this == &other) return *this;
-  releaseClaim();
+  releaseClaims();
   slot = std::move(other.slot);
   value = std::move(other.value);
+  requestValue = other.requestValue;
+  requestUse = other.requestUse;
+  requestSegmentOrd = other.requestSegmentOrd;
   kind_ = other.kind_;
   ownsClaim = other.ownsClaim;
+  ownsRequestClaim = other.ownsRequestClaim;
   other.kind_ = Kind::BYPASS;
+  other.requestValue = nullptr;
+  other.requestUse = nullptr;
   other.ownsClaim = false;
+  other.ownsRequestClaim = false;
   return *this;
 }
 
 FilterCache::Probe::~Probe() {
-  releaseClaim();
+  releaseClaims();
 }
 
 FilterCache::ReaderProbe::ReaderProbe(
@@ -185,9 +206,24 @@ void FilterCache::Use::pinValue(
   if (value == nullptr || segmentOrd >= requestSlots.size()) return;
   auto& requestSlot = *requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
+  if (requestSlot.raw == nullptr) {
+    requestSlot.raw = value->docSet();
+    requestSlot.rawOwned = false;
+  }
   if (requestSlot.pins.empty() || requestSlot.pins.back() != value) {
     requestSlot.pins.push_back(value);
   }
+}
+
+void FilterCache::Use::releaseRequestClaim(size_t segmentOrd) {
+  if (segmentOrd >= requestSlots.size()) return;
+  auto& requestSlot = *requestSlots[segmentOrd];
+  {
+    std::lock_guard<std::mutex> lock(requestSlot.mutex);
+    assert(requestSlot.resolving);
+    requestSlot.resolving = false;
+  }
+  requestSlot.condition.notify_all();
 }
 
 void FilterCache::Use::pinReaderValue(
@@ -202,16 +238,41 @@ void FilterCache::Use::pinReaderValue(
 }
 
 FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
-  if (cache == nullptr || !cache->enabled()
-      || scope_ == FilterKeyScope::READER_STABLE
-      || segmentOrd >= readerSegments.size()) {
+  if (scope_ == FilterKeyScope::READER_STABLE
+      || segmentOrd >= readerSegments.size()
+      || segmentOrd >= requestSlots.size()) {
     return {};
+  }
+
+  auto& requestSlot = *requestSlots[segmentOrd];
+  {
+    std::unique_lock<std::mutex> lock(requestSlot.mutex);
+    requestSlot.condition.wait(lock, [&] {
+      return !requestSlot.resolving || requestSlot.raw != nullptr;
+    });
+    if (requestSlot.raw != nullptr) {
+      DocSet* raw = requestSlot.raw;
+      bool owned = requestSlot.rawOwned;
+      lock.unlock();
+      if (owned) skipCount(SkipStats::ownedFilterServes);
+      return Probe(Probe::Kind::HIT, nullptr, nullptr, false, raw);
+    }
+    requestSlot.resolving = true;
+  }
+
+  auto bypass = [&] {
+    return Probe(Probe::Kind::BYPASS, nullptr, nullptr, false, nullptr,
+                 this, segmentOrd, true);
+  };
+
+  if (cache == nullptr || !cache->enabled()) {
+    return bypass();
   }
 
   if (entry == nullptr || segmentOrd >= slotsByOrd.size()
       || slotsByOrd[segmentOrd] == nullptr) {
     cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
-    return {};
+    return bypass();
   }
 
   auto slot = slotsByOrd[segmentOrd];
@@ -219,7 +280,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
       || slot->segId != readerSegments[segmentOrd].segId
       || slot->maxDoc != readerSegments[segmentOrd].maxDoc) {
     cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
-    return {};
+    return bypass();
   }
 
   auto value = slot->value.load(std::memory_order_acquire);
@@ -228,25 +289,29 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
     value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
     entry->lastUsed.store(now, std::memory_order_relaxed);
     pinValue(segmentOrd, value);
+    releaseRequestClaim(segmentOrd);
     cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
-    return Probe(Probe::Kind::HIT, std::move(slot), std::move(value), false);
+    DocSet* raw = value->docSet();
+    return Probe(Probe::Kind::HIT, std::move(slot), std::move(value), false,
+                 raw);
   }
 
   cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
   if (!admitted || slot->maxDoc < cache->config.minSegmentDocs
       || readerCoreGen < cache->publishedCoreGen.load(std::memory_order_acquire)) {
-    return {};
+    return bypass();
   }
 
   bool expected = false;
   if (!slot->building.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel,
           std::memory_order_relaxed)) {
-    return {};
+    return bypass();
   }
   uint64_t now = cache->nextEpoch();
   entry->lastUsed.store(now, std::memory_order_relaxed);
-  return Probe(Probe::Kind::BUILD, std::move(slot), nullptr, true);
+  return Probe(Probe::Kind::BUILD, std::move(slot), nullptr, true, nullptr,
+               this, segmentOrd, true);
 }
 
 FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
@@ -360,6 +425,42 @@ FilterCache::Use::publishRaw(size_t segmentOrd, Probe& probe,
                         buildCostMicros);
 }
 
+DocSet* FilterCache::Use::adoptOwnedRaw(
+    size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw) {
+  if (raw == nullptr) {
+    throw std::invalid_argument("owned raw DocSet must not be null");
+  }
+  if (scope_ == FilterKeyScope::READER_STABLE) {
+    throw std::logic_error(
+        "reader-stable live-exact membership cannot use raw ownership");
+  }
+  if (segmentOrd >= requestSlots.size() || probe.requestUse != this
+      || probe.requestSegmentOrd != segmentOrd || !probe.ownsRequestClaim) {
+    throw std::logic_error("owned raw adoption requires the request claim");
+  }
+
+  raw->card();
+  auto& requestSlot = *requestSlots[segmentOrd];
+  bool inserted = false;
+  bool owned = false;
+  DocSet* result;
+  {
+    std::lock_guard<std::mutex> lock(requestSlot.mutex);
+    if (requestSlot.raw == nullptr) {
+      requestSlot.ownedRaw = std::move(raw);
+      requestSlot.raw = requestSlot.ownedRaw.get();
+      requestSlot.rawOwned = true;
+      inserted = true;
+    }
+    result = requestSlot.raw;
+    owned = requestSlot.rawOwned;
+  }
+  if (inserted) skipCount(SkipStats::ownedFilterMaterializations);
+  if (owned) skipCount(SkipStats::ownedFilterServes);
+  probe.releaseClaims();
+  return result;
+}
+
 std::shared_ptr<const FilterCache::SegmentValue>
 FilterCache::Use::publishRawByproduct(size_t segmentOrd, Probe& probe,
                                       std::unique_ptr<DocSet> raw,
@@ -386,12 +487,11 @@ FilterCache::Use::publishReaderStable(
 }
 
 DocSet* FilterCache::Use::effectiveDocSet(
-    size_t segmentOrd, IndexReader& reader,
-    const std::shared_ptr<const SegmentValue>& value, DocSet* domain) {
+    size_t segmentOrd, IndexReader& reader, DocSet* domain) {
   // PrepareContext domains already carry liveness, so that path is raw AND
   // domain. Without a domain this is raw AND liveDocs. Any composed set is
   // memoized only in this request's Use and is never published to the cache.
-  if (value == nullptr || segmentOrd >= readerSegments.size()
+  if (segmentOrd >= readerSegments.size()
       || segmentOrd >= reader.segments().size()) {
     return nullptr;
   }
@@ -400,15 +500,15 @@ DocSet* FilterCache::Use::effectiveDocSet(
       || segment.maxDoc() != readerSegments[segmentOrd].maxDoc) {
     return nullptr;
   }
-  pinValue(segmentOrd, value);
-
   auto& requestSlot = *requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
+  DocSet* raw = requestSlot.raw;
+  if (raw == nullptr) return nullptr;
   if (domain != nullptr) {
     for (auto& effective : requestSlot.domainEffective) {
       if (effective.domain == domain) return effective.docs.get();
     }
-    std::array<DocSet*, 2> sets{value->docSet(), domain};
+    std::array<DocSet*, 2> sets{raw, domain};
     auto docs = DocSet::intersect(sets);
     docs->card();
     DocSet* result = docs.get();
@@ -416,35 +516,39 @@ DocSet* FilterCache::Use::effectiveDocSet(
     return result;
   }
 
-  if (segment.liveDocs() == nullptr) return value->docSet();
+  if (segment.liveDocs() == nullptr) return raw;
   if (requestSlot.liveEffective != nullptr) {
     return requestSlot.liveEffective.get();
   }
   std::array<DocSet*, 2> sets{
-      value->docSet(), &segment.liveDocs()->docset()};
+      raw, &segment.liveDocs()->docset()};
   requestSlot.liveEffective = DocSet::intersect(sets);
   requestSlot.liveEffective->card();
   return requestSlot.liveEffective.get();
 }
 
-std::shared_ptr<const FilterCache::SegmentValue>
-FilterCache::Use::pinnedValue(size_t segmentOrd) const {
-  if (segmentOrd >= requestSlots.size()) return nullptr;
-  auto& requestSlot = *requestSlots[segmentOrd];
-  std::lock_guard<std::mutex> lock(requestSlot.mutex);
-  return requestSlot.pins.empty() ? nullptr : requestSlot.pins.back();
+size_t FilterCache::Use::ownedBytesForTest() {
+  size_t result = 0;
+  for (auto& requestSlotPtr : requestSlots) {
+    auto& requestSlot = *requestSlotPtr;
+    std::lock_guard<std::mutex> lock(requestSlot.mutex);
+    if (requestSlot.ownedRaw != nullptr) {
+      result += requestSlot.ownedRaw->ramBytesUsed();
+    }
+  }
+  return result;
 }
 
 FilterCache::UseRegistry::UseRegistry(
-    FilterCache& cache, uint64_t readerCoreGen,
+    FilterCache* cache, uint64_t readerCoreGen,
     std::span<const SegmentIdentity> segments)
   : UseRegistry(cache, readerCoreGen, readerCoreGen, segments) {
 }
 
 FilterCache::UseRegistry::UseRegistry(
-    FilterCache& cache, uint64_t readerCoreGen, uint64_t readerVersion,
+    FilterCache* cache, uint64_t readerCoreGen, uint64_t readerVersion,
     std::span<const SegmentIdentity> segments)
-  : cache(&cache), segments(segments.begin(), segments.end()),
+  : cache(cache), segments(segments.begin(), segments.end()),
     readerCoreGen(readerCoreGen), readerVersion(readerVersion)
     #ifndef NDEBUG
     , owningThread(std::this_thread::get_id())
@@ -452,8 +556,24 @@ FilterCache::UseRegistry::UseRegistry(
     {
 }
 
-FilterCache::UseRegistry::UseRegistry(FilterCache& cache, IndexReader& reader)
+FilterCache::UseRegistry::UseRegistry(FilterCache* cache, IndexReader& reader)
   : UseRegistry(cache, reader.coreGen(), reader.commitTime(),
+                readerIdentities(reader)) {
+}
+
+FilterCache::UseRegistry::UseRegistry(
+    FilterCache& cache, uint64_t readerCoreGen,
+    std::span<const SegmentIdentity> segments)
+  : UseRegistry(&cache, readerCoreGen, readerCoreGen, segments) {
+}
+
+FilterCache::UseRegistry::UseRegistry(
+    FilterCache& cache, uint64_t readerCoreGen, uint64_t readerVersion,
+    std::span<const SegmentIdentity> segments)
+  : UseRegistry(&cache, readerCoreGen, readerVersion, segments) {}
+
+FilterCache::UseRegistry::UseRegistry(FilterCache& cache, IndexReader& reader)
+  : UseRegistry(&cache, reader.coreGen(), reader.commitTime(),
                 readerIdentities(reader)) {
 }
 
@@ -464,10 +584,23 @@ FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
   #endif
   auto iter = uses.find(key);
   if (iter != uses.end()) return iter->second.get();
-  auto use = cache->beginUse(key, scope, readerCoreGen, readerVersion,
-                             segments);
+  auto use = cache != nullptr
+      ? cache->beginUse(key, scope, readerCoreGen, readerVersion, segments)
+      : std::unique_ptr<Use>(new Use(
+          nullptr, key, scope, nullptr,
+          std::vector<std::shared_ptr<SegmentSlot>>(segments.size()),
+          segments, readerCoreGen, readerVersion, false));
   Use* result = use.get();
   uses.emplace(key, std::move(use));
+  return result;
+}
+
+size_t FilterCache::UseRegistry::ownedBytesForTest() {
+  size_t result = 0;
+  for (auto& [key, use] : uses) {
+    unused(key);
+    result += use->ownedBytesForTest();
+  }
   return result;
 }
 
@@ -710,7 +843,6 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
       ? use.readerSegments[segmentOrd] : SegmentIdentity{};
   auto local = std::make_shared<SegmentValue>(
       std::move(raw), nextEpoch(), identity, buildCostMicros);
-  use.pinValue(segmentOrd, local);
 
   bool attempted = enabled() && use.entry != nullptr
       && segmentOrd < use.slotsByOrd.size()
@@ -767,10 +899,9 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     }
   }
 
-  if (probe != nullptr) probe->releaseClaim();
-  if (chosen != local) {
-    use.pinValue(segmentOrd, chosen);
-  } else if (!inserted && attempted) {
+  use.pinValue(segmentOrd, chosen);
+  if (probe != nullptr) probe->releaseClaims();
+  if (chosen == local && !inserted && attempted) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
   }
   if (inserted && byproduct) {

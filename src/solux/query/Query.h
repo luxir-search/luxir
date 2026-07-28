@@ -433,10 +433,9 @@ public:
       this->filterKeyContext.coreGen = topReader.coreGen();
       this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
       auto* filterCache = topReader.filterCache();
-      if (this->filterUses == nullptr && filterCache != nullptr
-          && filterCache->enabled()) {
+      if (this->filterUses == nullptr) {
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
-            *filterCache, topReader);
+            filterCache, topReader);
       }
     }
 
@@ -453,10 +452,9 @@ public:
       this->filterKeyContext.coreGen = topReader.coreGen();
       this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
       auto* filterCache = topReader.filterCache();
-      if (this->filterUses == nullptr && filterCache != nullptr
-          && filterCache->enabled()) {
+      if (this->filterUses == nullptr) {
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
-            *filterCache, topReader);
+            filterCache, topReader);
       }
       auto numSegs = topReader.segments().size();
       fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};

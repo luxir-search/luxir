@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -57,15 +58,18 @@ struct FilterCacheConfig {
 // budget. One benefit-density sweeper trims segment payloads individually and
 // ReaderValues as whole units from the high watermark to the low watermark.
 //
-// Query::Context and SearchRequest's request-destructed registry own all
-// shared_ptr pins. MemPool-allocated weights and scorers retain raw pointers
-// because their destructors never run.
+// Query::Context and SearchRequest's request-destructed registry own borrowed
+// shared_ptr pins and request-local raw values. MemPool-allocated weights and
+// scorers retain raw pointers because their destructors never run. The registry
+// exists even when this shared cache is absent or disabled.
 class FilterCache {
   struct ActiveSnapshot;
   struct FilterEntry;
   struct SegmentSlot;
 
 public:
+  class Use;
+
   struct SegmentIdentity {
     uint64_t segId;
     int32_t maxDoc;
@@ -183,12 +187,18 @@ public:
   private:
     std::shared_ptr<SegmentSlot> slot;
     std::shared_ptr<const SegmentValue> value;
+    DocSet* requestValue = nullptr;
+    Use* requestUse = nullptr;
+    size_t requestSegmentOrd = 0;
     Kind kind_ = Kind::BYPASS;
     bool ownsClaim = false;
+    bool ownsRequestClaim = false;
 
     Probe(Kind kind, std::shared_ptr<SegmentSlot> slot,
-          std::shared_ptr<const SegmentValue> value, bool ownsClaim);
-    void releaseClaim();
+          std::shared_ptr<const SegmentValue> value, bool ownsClaim,
+          DocSet* requestValue = nullptr, Use* requestUse = nullptr,
+          size_t requestSegmentOrd = 0, bool ownsRequestClaim = false);
+    void releaseClaims();
 
     friend class FilterCache;
     friend class Use;
@@ -202,8 +212,14 @@ public:
     ~Probe();
 
     Kind kind() const { return kind_; }
-    DocSet* docSet() const { return value == nullptr ? nullptr : value->docSet(); }
-    int32_t card() const { return value == nullptr ? 0 : value->card(); }
+    DocSet* docSet() const {
+      return requestValue != nullptr ? requestValue
+          : value == nullptr ? nullptr : value->docSet();
+    }
+    int32_t card() const {
+      DocSet* docs = docSet();
+      return docs == nullptr ? 0 : docs->card();
+    }
   };
 
   class ReaderProbe {
@@ -251,6 +267,11 @@ public:
       };
 
       std::mutex mutex;
+      std::condition_variable condition;
+      bool resolving = false;
+      DocSet* raw = nullptr;
+      bool rawOwned = false;
+      std::unique_ptr<DocSet> ownedRaw;
       std::vector<std::shared_ptr<const SegmentValue>> pins;
       std::unique_ptr<DocSet> liveEffective;
       std::vector<DomainEffective> domainEffective;
@@ -277,19 +298,22 @@ public:
         uint64_t readerVersion, bool admitted);
 
     friend class FilterCache;
+    friend class Probe;
     friend class UseRegistry;
 
     void pinValue(size_t segmentOrd,
                   const std::shared_ptr<const SegmentValue>& value);
     void pinReaderValue(const std::shared_ptr<const ReaderValue>& value);
+    void releaseRequestClaim(size_t segmentOrd);
 
   public:
     Probe probe(size_t segmentOrd);
     ReaderProbe probeReaderStable(
         IndexReader& reader, std::span<DocSet* const> domainPerSeg);
 
-    // The only insertion APIs accept raw filter membership. Domain and
-    // liveDocs composition happen after publication through effectiveDocSet.
+    // Shared-cache insertion and request-local adoption both accept raw filter
+    // membership. Domain and liveDocs composition happen afterward through the
+    // same effectiveDocSet seam.
     std::shared_ptr<const SegmentValue> publishRaw(
         size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
         uint32_t buildCostMicros);
@@ -303,17 +327,18 @@ public:
         ReaderProbe& probe, std::vector<std::unique_ptr<DocSet>> liveExact,
         uint32_t buildCostMicros);
 
+    DocSet* adoptOwnedRaw(size_t segmentOrd, Probe& probe,
+                          std::unique_ptr<DocSet> raw);
     DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader,
-                            const std::shared_ptr<const SegmentValue>& value,
                             DocSet* domain = nullptr);
-    std::shared_ptr<const SegmentValue> pinnedValue(size_t segmentOrd) const;
     bool wasAdmitted() const { return admitted; }
     FilterKeyScope scope() const { return scope_; }
     const void* entryIdentityForTest() const { return entry.get(); }
+    size_t ownedBytesForTest();
   };
 
-  // Request-local full-key dedup. It owns Use objects, while execution objects
-  // retain raw Use pointers only.
+  // Request-local full-key dedup and value ownership. It always exists; cache
+  // may be null or disabled. Execution objects retain raw Use pointers only.
   class UseRegistry {
     FilterCache* cache;
     std::vector<SegmentIdentity> segments;
@@ -325,6 +350,12 @@ public:
     #endif
 
   public:
+    UseRegistry(FilterCache* cache, uint64_t readerCoreGen,
+                std::span<const SegmentIdentity> segments);
+    UseRegistry(FilterCache* cache, uint64_t readerCoreGen,
+                uint64_t readerVersion,
+                std::span<const SegmentIdentity> segments);
+    UseRegistry(FilterCache* cache, IndexReader& reader);
     UseRegistry(FilterCache& cache, uint64_t readerCoreGen,
                 std::span<const SegmentIdentity> segments);
     UseRegistry(FilterCache& cache, uint64_t readerCoreGen,
@@ -338,6 +369,7 @@ public:
     Use* get(const FilterKey& key,
              FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE);
     size_t size() const { return uses.size(); }
+    size_t ownedBytesForTest();
   };
 
 private:

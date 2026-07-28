@@ -649,12 +649,39 @@ enum class FilterSupplierMode : uint8_t {
   // docs-only iteration. Let an admitted cached DocSet become the required
   // clause at every density; conjunction ordering then chooses the route.
   EXHAUSTIVE_CLAUSE,
-  // An exact filtered disjunction can batch sparse cached-DocSet candidates
-  // while preserving the ordinary dense cached-mask route. The caller supplies
-  // the separately measured sparse-density cutoff; only the middle band stays
-  // uncached.
+  // An exact filtered disjunction can batch sparse cached-DocSet candidates,
+  // scored or unscored, while preserving the ordinary dense cached-mask route.
+  // The caller supplies the separately measured sparse-density cutoff; only
+  // the middle band stays uncached.
   SPARSE_BATCH
 };
+
+inline bool disableFilterOwnForTests = false;
+// Request-local construction has to repay its postings gather in the same
+// request. The 5M cold-cache sweep found no profitable EXHAUSTIVE_CLAUSE
+// endpoint even at 0.11% density: direct postings conjunctions were already
+// cheaper. Unscored SPARSE_BATCH repaid it at 0.11% but not 1.02%, giving
+// COUNT a 1/256 cutoff. Scored SPARSE_BATCH uses its separately measured
+// density inverse supplied by the caller.
+inline constexpr int32_t kSparseBatchCountOwnDensityInverse = 256;
+
+inline bool shouldOwnFilterValue(FilterSupplierMode mode, int64_t cost,
+                                 int32_t maxDoc,
+                                 int32_t sparseBatchDensityInverse) {
+  if (disableFilterOwnForTests
+      || cost > DocSetBuilder::arrayLimitFor(maxDoc)) {
+    return false;
+  }
+  switch (mode) {
+    case FilterSupplierMode::DENSITY_ROUTED:
+    case FilterSupplierMode::EXHAUSTIVE_CLAUSE:
+      return false;
+    case FilterSupplierMode::SPARSE_BATCH:
+      return sparseBatchDensityInverse > 0
+          && cost <= maxDoc / sparseBatchDensityInverse;
+  }
+  std::unreachable();
+}
 
 inline Query::ScorerSupplier* filterSupplier(
     MemPool& targetPool, Query::Weight& weight,
@@ -665,8 +692,7 @@ inline Query::ScorerSupplier* filterSupplier(
   Query::SegmentSource& source = prepared != nullptr
     ? static_cast<Query::SegmentSource&>(*prepared)
     : static_cast<Query::SegmentSource&>(weight);
-  if (use == nullptr) return source.scorerSupplier(targetPool, segment);
-  if (use->scope() == FilterKeyScope::READER_STABLE) {
+  if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
     return source.scorerSupplier(targetPool, segment);
   }
 
@@ -676,38 +702,43 @@ inline Query::ScorerSupplier* filterSupplier(
   // side wants the DocSet candidate vector, while the dense side retains the
   // existing cached mask. Exhaustive mode bypasses the pruning-based density
   // policy so exact collection can use a cached DocSet in conjunction
-  // planning. Sparse entries also populate through facet/domain consumers,
-  // which serve them at any density.
+  // planning. On cache misses, only the measured very-sparse side of
+  // SPARSE_BATCH adopts a request value; the other modes retain postings.
+  // Sparse entries also populate through facet/domain consumers.
   auto* uncached = source.scorerSupplier(targetPool, segment);
-  if (uncached == nullptr
+  if (uncached == nullptr) return nullptr;
+  int64_t cost = uncached->cost();
+  if (use == nullptr
       || (mode == FilterSupplierMode::DENSITY_ROUTED
-          && uncached->cost()
-              < segment.maxDoc() / kMaskFilterDensityInverse)
+          && cost < segment.maxDoc() / kMaskFilterDensityInverse)
       || (mode == FilterSupplierMode::SPARSE_BATCH
           && (sparseBatchDensityInverse <= 0
-              || uncached->cost()
-                  > segment.maxDoc() / sparseBatchDensityInverse
-                  && uncached->cost()
-                      < segment.maxDoc() / kMaskFilterDensityInverse))) {
+              || cost > segment.maxDoc() / sparseBatchDensityInverse
+                  && cost < segment.maxDoc() / kMaskFilterDensityInverse))) {
     return uncached;
   }
 
   auto probe = use->probe((size_t) segment.ord);
-  std::shared_ptr<const FilterCache::SegmentValue> value;
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    value = use->pinnedValue((size_t) segment.ord);
+    DocSet* effective = use->effectiveDocSet(
+        (size_t) segment.ord, reader);
+    return targetPool.make<DocSetSupplier>(effective, segment);
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
     uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
-    value = use->publishRaw(
+    use->publishRaw(
         (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
   } else {
-    return uncached;
+    if (!shouldOwnFilterValue(
+            mode, cost, segment.maxDoc(), sparseBatchDensityInverse)) {
+      return uncached;
+    }
+    auto raw = materializeRawFilter(weight, prepared, segment);
+    use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
   }
 
-  DocSet* effective = use->effectiveDocSet(
-      (size_t) segment.ord, reader, value);
+  DocSet* effective = use->effectiveDocSet((size_t) segment.ord, reader);
   return targetPool.make<DocSetSupplier>(effective, segment);
 }
 
@@ -730,14 +761,14 @@ inline MaterializedFilter materializeEffectiveFilter(
   }
 
   auto probe = use->probe((size_t) segment.ord);
-  std::shared_ptr<const FilterCache::SegmentValue> value;
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    value = use->pinnedValue((size_t) segment.ord);
+    return MaterializedFilter(use->effectiveDocSet(
+        (size_t) segment.ord, reader, domain));
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
     uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
-    value = use->publishRawByproduct(
+    use->publishRawByproduct(
         (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
   } else {
     // A non-folded raw materialization is free by-product population. A
@@ -746,20 +777,26 @@ inline MaterializedFilter materializeEffectiveFilter(
         && use->wasAdmitted()
         && !weight.needsScores() && !weight.allowsPruning()) {
       auto buildStart = std::chrono::steady_clock::now();
-      auto effective = materialize(weight, prepared, segment, domain);
+      auto raw = materializeRawFilter(weight, prepared, segment);
       uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
-      value = use->offerRaw(
-          (size_t) segment.ord, std::move(effective), buildCostMicros);
-      DocSet* docs = use->effectiveDocSet(
-          (size_t) segment.ord, reader, value);
+      use->offerRaw(
+          (size_t) segment.ord, std::move(raw), buildCostMicros);
+      DocSet* docs = use->effectiveDocSet((size_t) segment.ord, reader);
       return MaterializedFilter(docs);
+    }
+    if (!disableFilterOwnForTests
+        && !weight.needsScores() && !weight.allowsPruning()) {
+      auto raw = materializeRawFilter(weight, prepared, segment);
+      use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
+      return MaterializedFilter(use->effectiveDocSet(
+          (size_t) segment.ord, reader, domain));
     }
     return MaterializedFilter(
         materialize(weight, prepared, segment, domain));
   }
 
   DocSet* effective = use->effectiveDocSet(
-      (size_t) segment.ord, reader, value, domain);
+      (size_t) segment.ord, reader, domain);
   return MaterializedFilter(effective);
 }
 

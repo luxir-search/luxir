@@ -92,14 +92,21 @@ public:
 
 class TopKCountCompositionGuard {
   bool saved;
+  int32_t savedDensityInverse;
 
 public:
-  explicit TopKCountCompositionGuard(bool disabled)
-    : saved(disableTopKCountComposition) {
+  TopKCountCompositionGuard(bool disabled, int32_t densityInverse)
+    : saved(disableTopKCountComposition),
+      savedDensityInverse(
+          TopDocsReq::exactCountTopKMinCandidateDensityInverseForTests) {
     disableTopKCountComposition = disabled;
+    TopDocsReq::exactCountTopKMinCandidateDensityInverseForTests =
+        densityInverse;
   }
   ~TopKCountCompositionGuard() {
     disableTopKCountComposition = saved;
+    TopDocsReq::exactCountTopKMinCandidateDensityInverseForTests =
+        savedDensityInverse;
   }
 };
 
@@ -251,6 +258,8 @@ struct FilteredCountResult {
   int64_t filteredDisjBatchCountWindows;
   int64_t filteredDisjBatchScoreWindows;
   int64_t filteredConjBatchCountWindows;
+  int64_t ownedFilterMaterializations;
+  int64_t ownedFilterServes;
 };
 
 enum class FilteredCountPath {
@@ -294,6 +303,8 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
     SkipStats::filteredConjBatchCountWindows,
+    SkipStats::ownedFilterMaterializations,
+    SkipStats::ownedFilterServes,
   };
 }
 
@@ -320,6 +331,8 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
     SkipStats::filteredConjBatchCountWindows,
+    SkipStats::ownedFilterMaterializations,
+    SkipStats::ownedFilterServes,
   };
 }
 
@@ -1637,9 +1650,12 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
 
   {
     FilteredDisjunctionBatchGuard enabled(false);
-    runFilteredCount(soluxNode->getSearchEngine(),
-                     FilteredCountShape::UNION, "selected",
-                     FilteredCountPath::FOLDED, collection);
+    auto cold = runFilteredCount(
+        soluxNode->getSearchEngine(), FilteredCountShape::UNION, "selected",
+        FilteredCountPath::FOLDED, collection);
+    EXPECT_EQ(1, cold.ownedFilterMaterializations);
+    EXPECT_GT(cold.ownedFilterServes, cold.ownedFilterMaterializations);
+    EXPECT_GT(cold.filteredDisjBatchEngagements, 0);
     runFilteredCount(soluxNode->getSearchEngine(),
                      FilteredCountShape::UNION, "selected",
                      FilteredCountPath::FOLDED, collection);
@@ -1748,6 +1764,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
     int64_t count;
     int64_t engagements;
     int64_t phraseVerifies;
+    int64_t ownedMaterializations;
   };
   auto run = [&](bool disabled) {
     FilteredDisjunctionBatchGuard guard(disabled);
@@ -1769,10 +1786,12 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
       req->getMatchCount("q"),
       SkipStats::filteredDisjBatchEngagements,
       SkipStats::phraseVerifies,
+      SkipStats::ownedFilterMaterializations,
     };
   };
 
-  run(false);
+  Result cold = run(false);
+  EXPECT_EQ(1, cold.ownedMaterializations);
   run(false);
   Result routed = run(false);
   Result bodyBulk = run(true);
@@ -1798,7 +1817,7 @@ TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
     docs.push_back(flatdoc(
         "id", "compose_" + std::to_string(doc),
         "body_w", body,
-        "filter_w", (doc % 100) == 0 ? "selected" : "other"));
+        "filter_w", (doc % 400) == 0 ? "selected" : "other"));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
@@ -1807,9 +1826,11 @@ TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
     std::map<std::string, float> scores;
     int64_t count;
     int64_t compositions;
+    int64_t ownedMaterializations;
+    int64_t ownedServes;
   };
   auto run = [&](bool disabled) {
-    TopKCountCompositionGuard compositionGuard(disabled);
+    TopKCountCompositionGuard compositionGuard(disabled, 512);
     auto req = localReq(soluxNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
@@ -1826,10 +1847,14 @@ TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
       resultScoreMap(*req, "q"),
       req->getMatchCount("q"),
       SkipStats::exactCountTopKCompositions,
+      SkipStats::ownedFilterMaterializations,
+      SkipStats::ownedFilterServes,
     };
   };
 
-  run(false);
+  Result cold = run(false);
+  EXPECT_EQ(1, cold.ownedMaterializations);
+  EXPECT_GT(cold.ownedServes, cold.ownedMaterializations);
   run(false);
   Result composed = run(false);
   Result exhaustive = run(true);
