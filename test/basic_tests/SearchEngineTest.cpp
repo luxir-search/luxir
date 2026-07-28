@@ -62,6 +62,19 @@ public:
   }
 };
 
+class FilteredConjunctionBatchGuard {
+  bool saved;
+
+public:
+  explicit FilteredConjunctionBatchGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredConjunctionBatchForTests) {
+    BooleanQuery::disableFilteredConjunctionBatchForTests = disabled;
+  }
+  ~FilteredConjunctionBatchGuard() {
+    BooleanQuery::disableFilteredConjunctionBatchForTests = saved;
+  }
+};
+
 class FilteredDisjunctionCountCompactionGuard {
   bool saved;
 
@@ -214,6 +227,7 @@ struct FilteredCountResult {
   int64_t filteredDisjBatchEngagements;
   int64_t filteredDisjBatchCountWindows;
   int64_t filteredDisjBatchScoreWindows;
+  int64_t filteredConjBatchCountWindows;
 };
 
 enum class FilteredCountPath {
@@ -256,6 +270,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::filteredDisjBatchEngagements,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
+    SkipStats::filteredConjBatchCountWindows,
   };
 }
 
@@ -281,6 +296,7 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
     SkipStats::filteredDisjBatchEngagements,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
+    SkipStats::filteredConjBatchCountWindows,
   };
 }
 
@@ -1416,7 +1432,8 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
   }
   EXPECT_EQ(filterCard, routed.count);
   EXPECT_EQ(0, routed.denseWindows);
-  EXPECT_GT(routed.sparseFallbacks, 0);
+  EXPECT_EQ(0, routed.sparseFallbacks);
+  EXPECT_GT(routed.filteredConjBatchCountWindows, 0);
   EXPECT_GT(routed.docsOnlyWordProbeAdvances, 0);
   EXPECT_EQ(0, routed.tfreqBlocksDecoded);
 
@@ -1429,6 +1446,73 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
   }
   EXPECT_EQ(routed.count, legacy.count);
   EXPECT_EQ(0, legacy.sparseFallbacks);
+  EXPECT_EQ(0, legacy.filteredConjBatchCountWindows);
+
+  FilteredCountResult unbatched;
+  {
+    FilterClauseCountGuard enabled(false);
+    FilteredConjunctionBatchGuard disabled(true);
+    unbatched = runFilteredCount(soluxNode->getSearchEngine(),
+                                 FilteredCountShape::INTERSECTION, "selected",
+                                 FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ(routed.count, unbatched.count);
+  EXPECT_GT(unbatched.sparseFallbacks, 0);
+  EXPECT_EQ(0, unbatched.filteredConjBatchCountWindows);
+}
+
+TEST_F(SearchEngineTest, cachedDocSetBatchesExactScoredTerm) {
+  constexpr std::string_view collection = "cached_docset_scored_term";
+  constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  int32_t filterCard = 0;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    bool selected = (doc % 100) == 0;
+    filterCard += (int32_t) selected;
+    docs.push_back(flatdoc(
+        "id", "scored_term_" + std::to_string(doc),
+        "body_w", "alpha beta",
+        "filter_w", selected ? "selected" : "other"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t count;
+    int64_t engagements;
+  };
+  auto run = [&](bool disabled) {
+    FilteredConjunctionBatchGuard guard(disabled);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().withStats()
+        .fields({"id"}).limit(100);
+    cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::TERM);
+    cur.matchFilter("filter", "filter_w", "selected");
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{
+      resultIds(*req, "q"),
+      resultScoreMap(*req, "q"),
+      req->getMatchCount("q"),
+      SkipStats::filteredConjBatchEngagements,
+    };
+  };
+
+  run(false);
+  run(false);
+  Result batch = run(false);
+  Result legacy = run(true);
+  EXPECT_EQ(filterCard, batch.count);
+  EXPECT_EQ(legacy.count, batch.count);
+  EXPECT_EQ(legacy.ids, batch.ids);
+  expectSameScoreMap(legacy.scores, batch.scores);
+  EXPECT_GT(batch.engagements, 0);
+  EXPECT_EQ(0, legacy.engagements);
 }
 
 TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
