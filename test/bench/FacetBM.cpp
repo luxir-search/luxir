@@ -226,6 +226,12 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_is,      nDocs, shape, "short_u10_s",
 // matches ~10 docs and bigD is dense enough to take the bulk path.
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10_i,       nDocs, shape, "1%", "u10_i", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10_is,      nDocs, shape, "1%", "u10_is", false);
+// u10_i needs 4 bits, which the old lane-packed select never straddles a word
+// for, so it had nothing to lose there.  u10k_i needs ~14, where roughly a
+// third of values cross a 32-bit lane boundary and the old select paid a
+// second load and a stitch branch - this is where the single-load point read
+// should show up on a real column.
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_i,      nDocs, shape, "1%", "u10k_i", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_s,      nDocs, shape, "1%", "short_u10k_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", true);
