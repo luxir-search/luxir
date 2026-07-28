@@ -149,7 +149,7 @@ public:
     }
 
     plan.relation = BlockRelation::CROSSES;
-    if (block.bits > 32 || block.scaledSlope != 0) {
+    if (block.bits() > 32 || block.scaledSlope != 0) {
       return plan;
     }
 
@@ -192,7 +192,7 @@ public:
     bool matches(int64_t valueRank, const BlockPlan& plan, int64_t lo, int64_t hi) {
       int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
       auto block = reader.blockInfo(blockNum);
-      if (block.bits <= 32 && block.scaledSlope == 0) {
+      if (block.bits() <= 32 && block.scaledSlope == 0) {
         if (valueRank < residualStart
             || valueRank >= residualStart + (int64_t)residualCount) {
           residualStart = reader.decodeResidualSubBlock(valueRank, residuals,

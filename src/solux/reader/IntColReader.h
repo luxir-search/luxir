@@ -33,11 +33,6 @@ private:
   const char* blockMeta = nullptr;
   int64_t nValues = 0;
 
-  const NumBlockInfo* blockMetaAt(int64_t blockNum) const {
-    assert(blockNum >= 0 && blockNum < numBlocks());
-    return (const NumBlockInfo*)blockMeta + blockNum;
-  }
-
   static int64_t reconstruct(const NumBlockInfo& info, uint64_t rankInBlock,
                              uint64_t residual) {
     // Constant blocks are the common case for unordered numeric data, and
@@ -70,11 +65,11 @@ public:
     return (nValues + BLOCK_SIZE - 1) / BLOCK_SIZE;
   }
 
-  NumBlockInfo blockInfo(int64_t blockNum) const {
+  // Read in place. NumBlockInfo is unaligned, so field access compiles to the
+  // same loads a copy would make, without materializing the struct.
+  const NumBlockInfo& blockInfo(int64_t blockNum) const {
     assert(blockNum >= 0 && blockNum < numBlocks());
-    NumBlockInfo info;
-    memcpy(&info, blockMeta + blockNum * sizeof(info), sizeof(info));
-    return info;
+    return ((const NumBlockInfo*)blockMeta)[blockNum];
   }
 
   int32_t valuesInBlock(int64_t blockNum) const {
@@ -87,15 +82,15 @@ public:
     assert(rank >= 0 && rank < nValues);
     uint64_t rankInBlock = (uint64_t)rank % BLOCK_SIZE;
     const NumBlockInfo& info =
-        *blockMetaAt((int64_t)((uint64_t)rank / BLOCK_SIZE));
-    const char* payload = blocks + info.payloadOffset;
-    if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
+        blockInfo((int64_t)((uint64_t)rank / BLOCK_SIZE));
+    const char* payload = blocks + info.payloadOffset();
+    if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
       int64_t value;
       memcpy(&value, payload + rankInBlock * sizeof(value), sizeof(value));
       return value;
     }
     uint64_t residual = LinearPack::select64(
-        payload, rankInBlock, info.bits, LinearPack::mask64(info.bits));
+        payload, rankInBlock, info.bits(), LinearPack::mask64(info.bits()));
     return reconstruct(info, rankInBlock, residual);
   }
 
@@ -114,16 +109,16 @@ public:
       return {rank > 0 ? valueAt(rank - 1) : 0, valueAt(rank)};
     }
     const NumBlockInfo& info =
-        *blockMetaAt((int64_t)((uint64_t)rank / BLOCK_SIZE));
-    const char* payload = blocks + info.payloadOffset;
-    if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
+        blockInfo((int64_t)((uint64_t)rank / BLOCK_SIZE));
+    const char* payload = blocks + info.payloadOffset();
+    if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
       int64_t pair[2];
       memcpy(pair, payload + (rankInBlock - 1) * sizeof(int64_t), sizeof(pair));
       return {pair[0], pair[1]};
     }
-    uint64_t mask = LinearPack::mask64(info.bits);
-    uint64_t prev = LinearPack::select64(payload, rankInBlock - 1, info.bits, mask);
-    uint64_t cur = LinearPack::select64(payload, rankInBlock, info.bits, mask);
+    uint64_t mask = LinearPack::mask64(info.bits());
+    uint64_t prev = LinearPack::select64(payload, rankInBlock - 1, info.bits(), mask);
+    uint64_t cur = LinearPack::select64(payload, rankInBlock, info.bits(), mask);
     return {reconstruct(info, rankInBlock - 1, prev),
             reconstruct(info, rankInBlock, cur)};
   }
@@ -143,20 +138,20 @@ public:
     int64_t start = rank / BULK_SIZE * BULK_SIZE;
     int64_t blockNum = start / BLOCK_SIZE;
     uint64_t rankInBlock = (uint64_t)start % BLOCK_SIZE;
-    NumBlockInfo info = blockInfo(blockNum);
+    const NumBlockInfo& info = blockInfo(blockNum);
     count = (uint32_t)std::min<int64_t>(BULK_SIZE, nValues - start);
-    const char* payload = blocks + info.payloadOffset;
+    const char* payload = blocks + info.payloadOffset();
 
-    if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
+    if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
       memcpy(out, payload + rankInBlock * sizeof(int64_t),
              count * sizeof(int64_t));
       return start;
     }
 
-    if (info.bits <= 32) {
+    if (info.bits() <= 32) {
       uint32_t residuals[BULK_SIZE];
-      LinearPack::unpack128(payload, rankInBlock, count, info.bits,
-                            LinearPack::mask32(info.bits), residuals);
+      LinearPack::unpack128(payload, rankInBlock, count, info.bits(),
+                            LinearPack::mask32(info.bits()), residuals);
       if (info.gcd == 1 && info.scaledSlope == 0) {
         for (uint32_t i = 0; i < count; i++) {
           out[i] = (int64_t)(info.baseBits + residuals[i]);
@@ -174,10 +169,10 @@ public:
       return start;
     }
 
-    uint64_t mask = LinearPack::mask64(info.bits);
+    uint64_t mask = LinearPack::mask64(info.bits());
     for (uint32_t i = 0; i < count; i++) {
       uint64_t residual = LinearPack::select64(
-          payload, rankInBlock + i, info.bits, mask);
+          payload, rankInBlock + i, info.bits(), mask);
       out[i] = reconstruct(info, rankInBlock + i, residual);
     }
     return start;
@@ -475,12 +470,12 @@ public:
     int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
     int64_t blockNum = start / BLOCK_SIZE;
     int64_t rankInBlock = start % BLOCK_SIZE;
-    NumericBlockInfo block = blockInfo(blockNum);
-    assert(block.bits <= 32 && block.scaledSlope == 0);
+    const NumericBlockInfo& block = blockInfo(blockNum);
+    assert(block.bits() <= 32 && block.scaledSlope == 0);
     count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
     LinearPack::unpack128(
-        columnIS.ptr() + block.payloadOffset, rankInBlock, count, block.bits,
-        LinearPack::mask32(block.bits), decoded);
+        columnIS.ptr() + block.payloadOffset(), rankInBlock, count,
+        block.bits(), LinearPack::mask32(block.bits()), decoded);
     return start;
   }
 

@@ -14,14 +14,36 @@ namespace solux {
 
 SOLUX_UNALIGNED_START
 struct NumBlockInfo {
-  uint64_t payloadOffset = 0;
+  // Payload offset in the low 56 bits, packed width in the top 8. One load
+  // yields both, and it lands the descriptor on 32 bytes: two per cache line,
+  // never straddling one, indexed by a shift. 2^56 bytes of payload per column
+  // is not a limit anything can reach.
+  //
+  // A general block can use gcd and scaledSlope together - a sorted
+  // day-granularity date column is a ramp over values sharing a divisor - so
+  // the two are separate fields. Monotonic columns pin gcd to 1 and
+  // NumColumnT<false> never reads it.
+  uint64_t offsetAndBits = 0;
   uint64_t baseBits = 0;
   uint64_t gcd = 1;
   int64_t scaledSlope = 0;
-  uint8_t bits = 0;
-  uint8_t padding[7] = {};
+
+  static constexpr uint64_t OFFSET_MASK = (1ULL << 56) - 1;
+
+  uint64_t payloadOffset() const {
+    return offsetAndBits & OFFSET_MASK;
+  }
+
+  uint8_t bits() const {
+    return (uint8_t)(offsetAndBits >> 56);
+  }
+
+  void setPayload(uint64_t payloadOffset, uint8_t bits) {
+    assert(payloadOffset <= OFFSET_MASK);
+    offsetAndBits = payloadOffset | ((uint64_t)bits << 56);
+  }
 } SOLUX_UNALIGNED_END;
-static_assert(sizeof(NumBlockInfo) == 40);
+static_assert(sizeof(NumBlockInfo) == 32);
 // Readers locate the zone array at metaOff + nBlocks * sizeof(NumBlockInfo),
 // while the writer aligns it to 8. Both agree only while the descriptor is a
 // multiple of 8; otherwise the writer inserts padding the reader never skips.
@@ -47,9 +69,12 @@ struct NumColumnFormat {
     NumBlockZone zone;
     LinearFit::Plan fit;
     uint64_t count = 0;
+    // Held outside info until the writer knows the payload offset; the two
+    // share a word on disk.
+    uint8_t bits = 0;
 
     bool raw() const {
-      return info.bits > MAX_PACKED_BITS;
+      return bits > MAX_PACKED_BITS;
     }
   };
 
@@ -83,7 +108,7 @@ struct NumColumnFormat {
 
     uint64_t range = ((uint64_t)max - (uint64_t)min) / gcd;
     if (std::bit_width(range) > MAX_PACKED_BITS) {
-      plan.info.bits = RAW_BITS;
+      plan.bits = RAW_BITS;
       return plan;
     }
 
@@ -104,7 +129,7 @@ struct NumColumnFormat {
     plan.info.baseBits = (uint64_t)min +
         gcd * (uint64_t)plan.fit.intercept;
     plan.info.scaledSlope = plan.fit.scaledSlope;
-    plan.info.bits = plan.fit.bits;
+    plan.bits = plan.fit.bits;
     // Constant blocks must reconstruct as min + gcd * residual: the residual is
     // then exactly (value - min) / gcd, which is what lets range queries
     // compare packed residuals against transformed bounds instead of decoding.

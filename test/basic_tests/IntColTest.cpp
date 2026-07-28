@@ -269,21 +269,21 @@ TEST_F(IntColTest, linearPackFormatCorners) {
   };
 
   auto bits0 = check(std::array<int64_t, 1>{42});
-  EXPECT_EQ(bits0.bits, 0);
+  EXPECT_EQ(bits0.bits(), 0);
   EXPECT_EQ(bits0.scaledSlope, 0);
 
   auto flatWidth = [&](uint8_t bits) {
     int64_t max = (int64_t)((1ULL << bits) - 1);
     return check(std::array<int64_t, 5>{0, max, 1, max, 0});
   };
-  EXPECT_EQ(flatWidth(1).bits, 1);
-  EXPECT_EQ(flatWidth(32).bits, 32);
-  EXPECT_EQ(flatWidth(33).bits, 33);
-  EXPECT_EQ(flatWidth(57).bits, 57);
+  EXPECT_EQ(flatWidth(1).bits(), 1);
+  EXPECT_EQ(flatWidth(32).bits(), 32);
+  EXPECT_EQ(flatWidth(33).bits(), 33);
+  EXPECT_EQ(flatWidth(57).bits(), 57);
 
   auto raw = check(std::array<int64_t, 5>{
       0, (int64_t)(1ULL << 58), 1, (int64_t)(1ULL << 58), 0});
-  EXPECT_EQ(raw.bits, NumColumnFormat::RAW_BITS);
+  EXPECT_EQ(raw.bits(), NumColumnFormat::RAW_BITS);
 
   auto gcd = check(std::array<int64_t, 5>{100, 190, 130, 160, 100});
   EXPECT_EQ(gcd.gcd, 30);
@@ -331,12 +331,11 @@ TEST_F(IntColTest, wrappingBaseBitPattern) {
   writer.finish(false);
 
   NumBlockInfo info;
-  info.payloadOffset = 0;
+  info.setPayload(0, 1);
   info.baseBits = (uint64_t)std::numeric_limits<int64_t>::min() +
       std::numeric_limits<uint64_t>::max();
   info.gcd = 1;
   info.scaledSlope = 1 << NumColumnFormat::SLOPE_SHIFT;
-  info.bits = 1;
 
   std::array<char, sizeof(NumBlockInfo) + 1> unalignedMeta{};
   memcpy(unalignedMeta.data() + 1, &info, sizeof(info));
@@ -649,7 +648,7 @@ TEST_F(IntColTest, monoFractionalSlope) {
          input.ptr(writer.blockLoc.offset() + writer.metaOff), sizeof(info));
   EXPECT_GT(info.scaledSlope, 7 * (int64_t)(1LL << NumColumnFormat::SLOPE_SHIFT));
   EXPECT_LT(info.scaledSlope, 8 * (int64_t)(1LL << NumColumnFormat::SLOPE_SHIFT));
-  EXPECT_LE(info.bits, 1);
+  EXPECT_LE(info.bits(), 1);
 
   MonoReader reader(
       input, writer.blockLoc.offset(), writer.metaOff, count);

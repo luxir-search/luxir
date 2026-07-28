@@ -50,15 +50,15 @@ private:
     overallMax = std::max(overallMax, plan.zone.max);
 
     if (plan.raw()) out.align(8);
-    plan.info.payloadOffset = out.size() - colStart;
+    plan.info.setPayload(out.size() - colStart, plan.bits);
     if (plan.raw()) {
       out.write(block.data(), block.size_bytes());
     } else {
-      LinearPack::Writer writer(out, plan.info.bits);
+      LinearPack::Writer writer(out, plan.bits);
       for (uint64_t i = 0; i < block.size(); i++) {
         uint64_t residual =
             NumColumnFormat::residual(plan, i, quotients[(size_t)i]);
-        assert(residual <= LinearPack::mask64(plan.info.bits));
+        assert(residual <= LinearPack::mask64(plan.bits));
         writer.append(residual);
       }
       writer.finish(false);
