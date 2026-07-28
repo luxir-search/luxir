@@ -2421,17 +2421,74 @@ protected:
 
   // Model to track documents and calculate facets dynamically
   class Model {
+    struct ValueRange {
+      size_t begin = 0;
+      size_t end = 0;
+    };
+
+    static constexpr size_t BUILTIN_FIELDS = 3;
+    static constexpr size_t MODEL_FIELDS = NUM_FIELDS + BUILTIN_FIELDS;
+    std::vector<std::array<ValueRange, MODEL_FIELDS>> valueRanges;
+    std::array<std::string, MODEL_FIELDS> fieldNames;
+    boost::unordered_flat_map<std::string_view, size_t> fieldOrdinals;
+
+    size_t fieldOrdinal(std::string_view name) const {
+      auto it = fieldOrdinals.find(name);
+      return it == fieldOrdinals.end() ? MODEL_FIELDS : it->second;
+    }
+
+    std::span<const NameVal> values(size_t docIdx, size_t ordinal) const {
+      if (ordinal >= MODEL_FIELDS) return {};
+      const auto& range = valueRanges[docIdx][ordinal];
+      const auto& doc = docs[docIdx];
+      return std::span<const NameVal>(doc).subspan(range.begin, range.end - range.begin);
+    }
+
+    const FieldVal* findOne(size_t docIdx, size_t ordinal) const {
+      auto vals = values(docIdx, ordinal);
+      return vals.empty() ? nullptr : &vals.front().val;
+    }
+
   public:
     std::vector<Doc> docs;
     std::vector<char> deleted;  // parallel to docs; deleted docs are not live
 
-    void addDoc(const Doc& doc) {
-      docs.push_back(doc);
+    explicit Model(const std::vector<FieldDef>& fields) {
+      fieldNames[0] = "id";
+      fieldNames[1] = "avgval_i";
+      fieldNames[2] = "avgval2_i";
+      for (size_t i = 0; i < fields.size(); i++) {
+        fieldNames[i + BUILTIN_FIELDS] = fields[i].name;
+      }
+      fieldOrdinals.reserve(MODEL_FIELDS);
+      for (size_t i = 0; i < fieldNames.size(); i++) {
+        fieldOrdinals.emplace(fieldNames[i], i);
+      }
+    }
+
+    void addDoc(Doc doc) {
+      docs.push_back(std::move(doc));
       deleted.push_back(0);
+      auto& ranges = valueRanges.emplace_back();
+      const auto& stored = docs.back();
+      for (size_t i = 0; i < stored.size(); i++) {
+        size_t ordinal = fieldOrdinal(stored[i].name);
+        ASSERT_LT(ordinal, ranges.size());
+        auto& range = ranges[ordinal];
+        if (range.begin == range.end) {
+          range.begin = i;
+        } else {
+          ASSERT_EQ(range.end, i) << "model field values must be contiguous";
+        }
+        range.end = i + 1;
+      }
     }
 
     void markDeleted(size_t i) { deleted[i] = 1; }
     bool isDeleted(size_t i) const { return i < deleted.size() && deleted[i]; }
+    const FieldVal* findOne(size_t docIdx, std::string_view name) const {
+      return findOne(docIdx, fieldOrdinal(name));
+    }
 
     std::vector<size_t> allDocIndexes() const {
       std::vector<size_t> out;
@@ -2445,9 +2502,35 @@ protected:
     std::vector<size_t> matchingDocIndexes(const solux::api::Query& query) const {
       std::vector<size_t> out;
       out.reserve(docs.size());
+      if (std::holds_alternative<bool>(query.kind) && std::get<bool>(query.kind)) {
+        return allDocIndexes();
+      }
+      if (!std::holds_alternative<solux::api::Match>(query.kind)) {
+        return allDocIndexes();
+      }
+
+      const auto& match = std::get<solux::api::Match>(query.kind);
+      const auto& matchVal = *match.val;
+      size_t ordinal = fieldOrdinal(match.field);
       for (size_t i = 0; i < docs.size(); i++) {
-        if (!isDeleted(i) && matchesQuery(docs[i], query)) {  // query domain is live-filtered
-          out.push_back(i);
+        if (isDeleted(i)) continue;
+        auto vals = values(i, ordinal);
+        if (std::holds_alternative<std::string_view>(matchVal.kind)) {
+          std::string_view expected = std::get<std::string_view>(matchVal.kind);
+          for (const auto& nv : vals) {
+            if (auto* strVal = std::get_if<std::string>(&nv.val); strVal && *strVal == expected) {
+              out.push_back(i);
+              break;
+            }
+          }
+        } else if (std::holds_alternative<int64_t>(matchVal.kind)) {
+          int64_t expected = std::get<int64_t>(matchVal.kind);
+          for (const auto& nv : vals) {
+            if (auto* intVal = std::get_if<int64_t>(&nv.val); intVal && *intVal == expected) {
+              out.push_back(i);
+              break;
+            }
+          }
         }
       }
       return out;
@@ -2670,6 +2753,7 @@ protected:
       ExpFacet out;
 
       std::string fieldName(facetOp.field);
+      size_t fieldOrd = fieldOrdinal(fieldName);
       int64_t limit = facetOp.limit.value_or(0);
       bool hasMin = facetOp.mincount.has_value();
       int64_t mincount = hasMin ? std::max<int64_t>(*facetOp.mincount, 1) : 1;
@@ -2681,18 +2765,32 @@ protected:
 
       // avg() sub-ops (string/id parent only; the parser rejects sub-ops on
       // int/range/text). There can be several; at most one is the sort key.
-      struct AvgOpDef { std::string name, field; };
+      struct AvgOpDef {
+        std::string name;
+        size_t fieldOrd;
+      };
       std::vector<AvgOpDef> avgOps;
       for (const auto& [opName, subPtr] : facetOp.ops) {
         const auto& sub = *subPtr;
         if (std::holds_alternative<solux::api::GenOp>(sub.kind)) {
           const auto& genOp = std::get<solux::api::GenOp>(sub.kind);
           if (genOp.name == "avg" || genOp.name == "average") {
-            avgOps.push_back({std::string(opName), std::string(std::get<std::string_view>(genOp.args[0].kind))});
+            avgOps.push_back({
+                std::string(opName),
+                fieldOrdinal(std::get<std::string_view>(genOp.args[0].kind))
+            });
           }
         }
       }
       bool hasAvg = !avgOps.empty();
+      bool hasSubFacet = false;
+      for (const auto& [opName, subPtr] : facetOp.ops) {
+        unused(opName);
+        if (std::holds_alternative<solux::api::FieldFacet>(subPtr->kind)) {
+          hasSubFacet = true;
+          break;
+        }
+      }
       int sortAvgIdx = -1;  // index into avgOps of the sort key, or -1
       if (!facetOp.sorts.empty()) {
         for (size_t k = 0; k < avgOps.size(); k++)
@@ -2704,14 +2802,13 @@ protected:
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
       boost::unordered_flat_map<std::string, int64_t> strCounts;
       boost::unordered_flat_map<std::string, std::vector<int64_t>> strAvgSums; // bucket -> sum per avgOp
+      boost::unordered_flat_map<std::string, std::vector<size_t>> strBucketDocs;
       int64_t missingCount = 0;
 
-      std::vector<const FieldVal*> vals;
       if (showZeros) {
-        for (const auto& doc : docs) {
-          findAll(doc, fieldName, vals);
-          for (auto* val : vals) {
-            if (auto* strVal = std::get_if<std::string>(val)) {
+        for (size_t docIdx = 0; docIdx < docs.size(); docIdx++) {
+          for (const auto& nv : values(docIdx, fieldOrd)) {
+            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
               strCounts.try_emplace(*strVal, 0);
             }
           }
@@ -2719,22 +2816,26 @@ protected:
       }
 
       for (auto docIdx : domainDocs) {
-        const auto& doc = docs[docIdx];
-        std::vector<int64_t> avs(avgOps.size(), 0);  // this doc's value per avgOp field
+        boost::container::small_vector<int64_t, 2> avs(avgOps.size(), 0);
         for (size_t k = 0; k < avgOps.size(); k++)
-          if (auto* p = find(doc, avgOps[k].field))
+          if (auto* p = findOne(docIdx, avgOps[k].fieldOrd))
             if (auto* iv = std::get_if<int64_t>(p)) avs[k] = *iv;
-        findAll(doc, fieldName, vals);
         bool hasField = false;
-        for (auto* val : vals) {
+        for (const auto& nv : values(docIdx, fieldOrd)) {
           if (isIntField) {
-            if (auto* intVal = std::get_if<int64_t>(val)) {
+            if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
               intCounts[*intVal]++;
               hasField = true;
             }
           } else {
-            if (auto* strVal = std::get_if<std::string>(val)) {
+            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
               strCounts[*strVal]++;
+              if (hasSubFacet) {
+                auto& bucketDocs = strBucketDocs[*strVal];
+                if (bucketDocs.empty() || bucketDocs.back() != docIdx) {
+                  bucketDocs.push_back(docIdx);
+                }
+              }
               if (hasAvg) {
                 auto& sums = strAvgSums[*strVal];
                 if (sums.empty()) sums.resize(avgOps.size(), 0);
@@ -2813,18 +2914,14 @@ protected:
           if (!std::holds_alternative<solux::api::FieldFacet>(sub.kind)) continue;
           auto& arr = out.subFacetOps[std::string(opName)];
           for (const auto& bval : parentVals) {
-            std::vector<size_t> bucketDocs;
-            std::vector<const FieldVal*> bvals;
-            for (auto docIdx : domainDocs) {
-              findAll(docs[docIdx], fieldName, bvals);
-              for (auto* p : bvals) {
-                if (auto* s = std::get_if<std::string>(p); s && *s == bval) {
-                  bucketDocs.push_back(docIdx);
-                  break;
-                }
-              }
+            auto bucketIt = strBucketDocs.find(bval);
+            if (bucketIt == strBucketDocs.end()) {
+              ADD_FAILURE() << "missing model documents for facet bucket " << bval;
+              arr.emplace_back();
+              continue;
             }
-            arr.push_back(calculateFieldFacet(std::get<solux::api::FieldFacet>(sub.kind), bucketDocs));
+            arr.push_back(calculateFieldFacet(
+                std::get<solux::api::FieldFacet>(sub.kind), bucketIt->second));
           }
         }
       }
@@ -2840,6 +2937,7 @@ protected:
       ExpFacet out;
       out.isRange = true;
       std::string fieldName(rf.field);
+      size_t fieldOrd = fieldOrdinal(fieldName);
       int64_t start = std::get<int64_t>((*rf.start).kind);
       int64_t end = std::get<int64_t>((*rf.end).kind);
       int64_t gap = std::get<int64_t>(
@@ -2849,12 +2947,10 @@ protected:
       int64_t bucketCount = (end - start) / gap + ((end - start) % gap != 0);
       std::vector<int64_t> bucketCounts((size_t)bucketCount, 0);
       int64_t missingCount = 0;
-      std::vector<const FieldVal*> vals;
       for (auto docIdx : domainDocs) {
-        findAll(docs[docIdx], fieldName, vals);
         bool hasField = false;
-        for (auto* p : vals) {
-          if (auto* iv = std::get_if<int64_t>(p)) {
+        for (const auto& nv : values(docIdx, fieldOrd)) {
+          if (auto* iv = std::get_if<int64_t>(&nv.val)) {
             hasField = true;
             int64_t v = *iv;
             if (v < start || v >= end) continue;  // out of range -> dropped
@@ -3017,7 +3113,7 @@ protected:
           }
           
           inverter.finishDoc();
-          segmentDocs[segNum].push_back(doc);
+          segmentDocs[segNum].push_back(std::move(doc));
         }
         
         iw->releaseInverter(inverter, true);  // Request immediate flush
@@ -3026,9 +3122,9 @@ protected:
     tg.wait();
     
     // Add all documents to the model
-    for (const auto& segDocs : segmentDocs) {
-      for (const auto& doc : segDocs) {
-        model.addDoc(doc);
+    for (auto& segDocs : segmentDocs) {
+      for (auto& doc : segDocs) {
+        model.addDoc(std::move(doc));
       }
     }
     
@@ -3175,7 +3271,6 @@ public:
     
     for (int iteration = 0; iteration < numIndexes; iteration++) {
       CollectionHelper helper;
-      Model model;
       
       // Generate random field definitions for this iteration
       std::vector<FieldDef> fields;
@@ -3220,6 +3315,8 @@ public:
         field.numUniqueValues = std::max(field.numUniqueValues, field.maxValuesPerDoc);
         fields.push_back(field);
       }
+
+      Model model(fields);
       
       // Build index with parallel segment construction
       buildRandomIndex(helper, model, rng, fields, maxSegments, maxDocsPerSegment);
@@ -3230,7 +3327,7 @@ public:
         std::vector<std::string> toDelete;
         for (size_t d = 0; d < model.docs.size(); d++) {
           if (rng.rint(100) < 15) {
-            if (auto* id = find(model.docs[d], "id"))
+            if (auto* id = model.findOne(d, "id"))
               if (auto* s = std::get_if<std::string>(id)) {
                 toDelete.push_back(*s);
                 model.markDeleted(d);
