@@ -12,11 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # Build acceleration
 # ccache: transparent compiler cache. No-op if ccache is not installed.
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
-# use a precompiled header (see target_precompile_headers below).
+# use a precompiled header (see target_precompile_headers below). Apply it in
+# the launcher rather than relying on each developer's global ccache config.
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
+  set(_SOLUX_CCACHE_LAUNCHER
+      "${CCACHE_PROGRAM};sloppiness=pch_defines,time_macros")
   set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
-  set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${_SOLUX_CCACHE_LAUNCHER}")
   message(STATUS "Solux: ccache enabled (${CCACHE_PROGRAM})")
 endif()
 
