@@ -59,7 +59,20 @@ static_assert(sizeof(NumBlockZone) == 16);
 struct NumColumnFormat {
   static constexpr uint32_t BLOCK_SIZE = 4096;
   static constexpr uint32_t BULK_SIZE = 128;
-  static constexpr uint8_t SLOPE_SHIFT = 14;
+
+  // Fixed-point slope: scaledSlope = round(slope * 2^SLOPE_SHIFT), so the
+  // rounding error is under 2^-(SLOPE_SHIFT+1) per rank and the drift across a
+  // whole block is under BLOCK_SIZE * 2^-(SLOPE_SHIFT+1). Residuals are
+  // integers, so drift below 1 widens their range by at most one and usually
+  // not at all - which puts the point of diminishing returns at
+  // log2(BLOCK_SIZE)+1. We take one bit past it (scale = 4 * BLOCK_SIZE, drift
+  // under 1/8) and no more: extra bits buy nothing measurable and cost
+  // headroom, because endpointSlope has to hold slope * 2^SLOPE_SHIFT in an
+  // int64 and falls back to the constant fit when it cannot. Derived from
+  // BLOCK_SIZE so retuning the block size cannot silently break the bound.
+  static constexpr uint8_t SLOPE_SHIFT =
+      (uint8_t)(std::bit_width(BLOCK_SIZE) + 1);
+  static_assert(BLOCK_SIZE <= (1u << SLOPE_SHIFT), "block drift must stay < 1");
   static constexpr uint8_t MAX_PACKED_BITS = 57;
   static constexpr uint8_t RAW_BITS = 64;
   static constexpr uint8_t MIN_LINEAR_BITS_SAVED = 1;
