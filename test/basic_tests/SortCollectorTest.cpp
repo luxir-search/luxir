@@ -174,7 +174,8 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
   }
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
-  auto run = [&](bool disableBulk, bool disableGather, bool disjConj,
+  enum Shape { DISJ, DISJ_CONJ, TERM, MAND_OPT };
+  auto run = [&](bool disableBulk, bool disableGather, Shape shape,
                  std::string_view sortField, qb::SortDir direction,
                  int32_t limit) {
     FieldSortBulkGuard guard(disableBulk);
@@ -184,17 +185,32 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
     auto& cursor = req->topDocs("q").getNumber().limit(limit)
         .fields({"id_s", "sort_i", "sort_s"});
     auto& mr = cursor.mr();
-    if (disjConj) {
-      auto betaGamma = qb::boolean(
-          mr, {qb::match(mr, "body_w", "beta"),
-               qb::match(mr, "body_w", "gamma")});
-      cursor.rawQuery() = qb::boolean(
-          mr, {}, {qb::match(mr, "body_w", "alpha"), betaGamma});
-    } else {
-      cursor.rawQuery() = qb::boolean(
-          mr, {}, {qb::match(mr, "body_w", "alpha"),
-                   qb::match(mr, "body_w", "beta"),
-                   qb::match(mr, "body_w", "gamma")});
+    switch (shape) {
+      case DISJ_CONJ: {
+        auto betaGamma = qb::boolean(
+            mr, {qb::match(mr, "body_w", "beta"),
+                 qb::match(mr, "body_w", "gamma")});
+        cursor.rawQuery() = qb::boolean(
+            mr, {}, {qb::match(mr, "body_w", "alpha"), betaGamma});
+        break;
+      }
+      case DISJ:
+        cursor.rawQuery() = qb::boolean(
+            mr, {}, {qb::match(mr, "body_w", "alpha"),
+                     qb::match(mr, "body_w", "beta"),
+                     qb::match(mr, "body_w", "gamma")});
+        break;
+      case TERM:
+        cursor.rawQuery() = qb::match(mr, "body_w", "alpha");
+        break;
+      case MAND_OPT:
+        // Unscored optional-drop reduces this to the bare alpha term, so the
+        // windowed route exercises the term match windows through the
+        // delegated supplier.
+        cursor.rawQuery() = qb::boolean(
+            mr, {qb::match(mr, "body_w", "alpha")},
+            {qb::match(mr, "body_w", "beta")});
+        break;
     }
     qb::sort(cursor, sortField, direction);
     req->execute(false);
@@ -218,12 +234,12 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
     return result;
   };
 
-  auto assertParity = [&](bool disjConj, std::string_view sortField,
+  auto assertParity = [&](Shape shape, std::string_view sortField,
                           qb::SortDir direction, int32_t limit) {
-    auto pull = run(true, true, disjConj, sortField, direction, limit);
+    auto pull = run(true, true, shape, sortField, direction, limit);
     auto windowFallback =
-        run(false, true, disjConj, sortField, direction, limit);
-    auto gathered = run(false, false, disjConj, sortField, direction, limit);
+        run(false, true, shape, sortField, direction, limit);
+    auto gathered = run(false, false, shape, sortField, direction, limit);
     EXPECT_EQ(pull.ids, windowFallback.ids);
     EXPECT_EQ(pull.ints, windowFallback.ints);
     EXPECT_EQ(pull.strings, windowFallback.strings);
@@ -234,10 +250,16 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
     EXPECT_EQ(windowFallback.hitCount, gathered.hitCount);
   };
 
-  assertParity(false, "sort_i", qb::ASC, 9);
-  assertParity(false, "sort_i", qb::DESC, 1000);
-  assertParity(false, "sort_s", qb::ASC, 17);
-  assertParity(true, "sort_s", qb::DESC, 1000);
+  assertParity(DISJ, "sort_i", qb::ASC, 9);
+  assertParity(DISJ, "sort_i", qb::DESC, 1000);
+  assertParity(DISJ, "sort_s", qb::ASC, 17);
+  assertParity(DISJ_CONJ, "sort_s", qb::DESC, 1000);
+  assertParity(TERM, "sort_i", qb::ASC, 9);
+  assertParity(TERM, "sort_i", qb::DESC, 1000);
+  assertParity(TERM, "sort_s", qb::ASC, 17);
+  assertParity(MAND_OPT, "sort_i", qb::DESC, 9);
+  assertParity(MAND_OPT, "sort_i", qb::ASC, 1000);
+  assertParity(MAND_OPT, "sort_s", qb::DESC, 17);
 }
 
 TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
@@ -488,12 +510,15 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
     FILTERED,
     FILTER_ONLY,
     ZERO,
+    TERM,
+    MAND_OPT,  // unscored optional-drop reduces to the bare term
   };
   enum class MatchPath {
     DENSE,
     SPARSE,
     FILTER_ONLY,
     PULL,  // two-phase clauses keep the pull conjunction; no bulk windows
+    TERM_FILL,  // TermBulkScorer window-bit fills
   };
 
   auto buildQuery = [](std::pmr::memory_resource& mr, Shape shape) {
@@ -531,6 +556,10 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
       }
       case Shape::ZERO:
         return qb::boolean(mr, {term("zero_a"), term("zero_b")});
+      case Shape::TERM:
+        return term("alpha");
+      case Shape::MAND_OPT:
+        return qb::boolean(mr, {term("alpha")}, {term("beta")});
     }
     std::unreachable();
   };
@@ -568,7 +597,8 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
       EXPECT_GT(bulk.denseMatchWindows, 0);
     } else if (expectedPath == MatchPath::SPARSE) {
       EXPECT_GT(bulk.sparseMatchWindows, 0);
-    } else if (expectedPath == MatchPath::FILTER_ONLY) {
+    } else if (expectedPath == MatchPath::FILTER_ONLY
+               || expectedPath == MatchPath::TERM_FILL) {
       EXPECT_GT(bulk.bulkFillCalls, 0);
     } else {
       EXPECT_EQ(bulk.denseMatchWindows, 0);
@@ -582,7 +612,7 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
     {"sort_s", qb::ASC},
     {"sort_s", qb::DESC},
   }};
-  constexpr std::array<std::pair<Shape, MatchPath>, 9> shapes = {{
+  constexpr std::array<std::pair<Shape, MatchPath>, 11> shapes = {{
     {Shape::DENSE_TWO, MatchPath::DENSE},
     {Shape::DENSE_THREE, MatchPath::DENSE},
     {Shape::SPARSE_TWO, MatchPath::SPARSE},
@@ -592,6 +622,8 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
     {Shape::FILTERED, MatchPath::DENSE},
     {Shape::FILTER_ONLY, MatchPath::FILTER_ONLY},
     {Shape::ZERO, MatchPath::DENSE},
+    {Shape::TERM, MatchPath::TERM_FILL},
+    {Shape::MAND_OPT, MatchPath::TERM_FILL},
   }};
   if (effort == 1) {
     // Exercise every scorer shape with one sort, then cover the remaining sort

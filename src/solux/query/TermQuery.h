@@ -1077,6 +1077,49 @@ public:
       out.scores = outScores;
     }
 
+    // Shared fill for the exhaustive window paths: term bits, then the
+    // incoming DocSet, then the attached WindowFilter. Returns false when the
+    // window filter proves the window empty before the term is consulted.
+    bool fillFilteredWindowBits(DocSet* filter) {
+      if (windowFilter != nullptr && !windowFilter->probes()
+          && windowFilter->prepare(windowStart, windowEnd) == 0) {
+        return false;
+      }
+      clearWindowBits();
+      scorer->fillWindowBits(windowBits, windowStart, windowEnd);
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
+        applyDomainBits(&((BitDocSet*) filter)->bits());
+      } else if (filter != nullptr) {
+        applyDocSetFilter(filter);
+      }
+      if (windowFilter != nullptr) {
+        if (windowFilter->probes()) {
+          applyWindowFilterProbe();
+        } else {
+          windowFilter->intersect(windowBits);
+        }
+      }
+      return true;
+    }
+
+    void emitWindowBits(ScoreWindow& out) const {
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          assert(out.size < kWindowSize);
+          out.docs[(size_t) out.size] = windowStart + index;
+          out.size++;
+          bits &= bits - 1;
+        }
+      }
+    }
+
   public:
     TermBulkScorer(MemPool& pool, TermQuery::Scorer* scorer, int32_t maxDoc)
         : scorer(scorer),
@@ -1103,23 +1146,8 @@ public:
       }
 
       setWindowBounds(min, max);
-      if (windowFilter != nullptr && !windowFilter->probes()
-          && windowFilter->prepare(windowStart, windowEnd) == 0) {
+      if (!fillFilteredWindowBits(filter)) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
-      }
-      clearWindowBits();
-      scorer->fillWindowBits(windowBits, windowStart, windowEnd);
-      if (filter != nullptr && filter->type == DocSet::BITSET) {
-        applyDomainBits(&((BitDocSet*) filter)->bits());
-      } else if (filter != nullptr) {
-        applyDocSetFilter(filter);
-      }
-      if (windowFilter != nullptr) {
-        if (windowFilter->probes()) {
-          applyWindowFilterProbe();
-        } else {
-          windowFilter->intersect(windowBits);
-        }
       }
       if (domainOut != nullptr) {
         skipCount(SkipStats::bulkDomainWindowsFed);
@@ -1131,6 +1159,35 @@ public:
         return PostingsReader::END;
       }
       return windowEnd;
+    }
+
+    bool supportsMatchWindows() const override {
+      return true;
+    }
+
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+
+      setWindowBounds(min, max);
+      out.min = windowStart;
+      out.max = windowEnd;
+      if (fillFilteredWindowBits(filter)) {
+        emitWindowBits(out);
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
