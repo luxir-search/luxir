@@ -41,10 +41,11 @@ private:
   std::vector<NumBlockZone> blockZones;
   std::vector<int64_t> values;
   std::vector<uint64_t> quotients;
+  bool useGcd = true;
 
   void addBlock(std::span<const int64_t> block) {
     NumColumnFormat::BlockPlan plan =
-        NumColumnFormat::planBlock(block, quotients);
+        NumColumnFormat::planBlock(block, quotients, useGcd);
     overallMin = std::min(overallMin, plan.zone.min);
     overallMax = std::max(overallMax, plan.zone.max);
 
@@ -67,8 +68,10 @@ private:
   }
 
 public:
-  explicit NumColumnWriter(OutputStream& out)
-      : out(out), colStart(out.size()) {
+  // useGcd == false is the monotonic contract: gcd stays 1 so readers can drop
+  // the field load and the multiply.  It also skips the write-side gcd scan.
+  explicit NumColumnWriter(OutputStream& out, bool useGcd = true)
+      : out(out), colStart(out.size()), useGcd(useGcd) {
     values.reserve(NumColumnFormat::BLOCK_SIZE);
     quotients.reserve(NumColumnFormat::BLOCK_SIZE);
   }
@@ -166,7 +169,7 @@ public:
   seg_location blockLoc;
   int64_t metaOff;
 
-  MonoWriter(MemPool& pool, OutputStream& out) : out(out), writer(out) {
+  MonoWriter(MemPool& pool, OutputStream& out) : out(out), writer(out, false) {
     unused(pool);
   }
 

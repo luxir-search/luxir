@@ -47,6 +47,24 @@ template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
 #define SOLUX_PACKED_END __pragma(pack(pop))
 #endif
 
+// For structs read straight out of a mapped file at an offset we do not
+// control.  aligned(1) tells the compiler the object may be unaligned, so it
+// emits loads that are safe for it; plain field access then compiles to the
+// same instructions a hand-written memcpy would, without materializing the
+// struct.  Layout is unchanged as long as members are already padded to their
+// natural offsets (assert the size), so aligning these on disk later is a
+// writer-side decision that needs no reader change.
+// use SOLUX_UNALIGNED_START struct X{} SOLUX_UNALIGNED_END;
+#ifdef __GNUC__
+#define SOLUX_UNALIGNED_START ;
+#define SOLUX_UNALIGNED_END __attribute__((__packed__, __aligned__(1)))
+#endif
+
+#ifdef _MSC_VER
+#define SOLUX_UNALIGNED_START __pragma(pack(push,1))
+#define SOLUX_UNALIGNED_END __pragma(pack(pop))
+#endif
+
 #if defined(__GNUC__)
 #  define SOLUX_INLINE __attribute__((always_inline))
 #  define SOLUX_NOINLINE __attribute__((noinline))

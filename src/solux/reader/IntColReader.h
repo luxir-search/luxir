@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 #include "DocsReader.h"
 #include "PostingsReader.h"
 #include "solux/codec/NumColumnFormat.h"
@@ -8,9 +10,19 @@
 
 namespace solux {
 
-// Shared numeric-column physical decode layer. Metadata is loaded with memcpy
-// because standalone columns may be relocated to an unaligned file offset.
-class NumColumn {
+// Shared numeric-column physical decode layer. Descriptors are read in place.
+//
+// NumBlockInfo is SOLUX_UNALIGNED because a column's bytes do not always land
+// where its writer put them: OrdMap writes firstSegs/globDeltas into standalone
+// files and then appends them into a payload file at an arbitrary
+// cumulativeSize (OrdMapImpl.h)
+//
+// WithGcd is a compile-time property of the column, not of a block: monotonic
+// columns are written with gcd pinned to 1 (the slope carries any regular
+// step), so their decode drops the field load and the multiply entirely rather
+// than branching around them.
+template <bool WithGcd>
+class NumColumnT {
 public:
   static constexpr uint32_t BLOCK_SIZE = NumColumnFormat::BLOCK_SIZE;
   static constexpr uint32_t BULK_SIZE = NumColumnFormat::BULK_SIZE;
@@ -21,24 +33,33 @@ private:
   const char* blockMeta = nullptr;
   int64_t nValues = 0;
 
-  int64_t reconstruct(const NumBlockInfo& info, uint64_t rankInBlock,
-                      uint64_t residual) const {
+  const NumBlockInfo* blockMetaAt(int64_t blockNum) const {
+    assert(blockNum >= 0 && blockNum < numBlocks());
+    return (const NumBlockInfo*)blockMeta + blockNum;
+  }
+
+  static int64_t reconstruct(const NumBlockInfo& info, uint64_t rankInBlock,
+                             uint64_t residual) {
     // Constant blocks are the common case for unordered numeric data, and
-    // slopeTerm costs two multiplies that produce zero for them. The branch is
-    // per-block-shaped, so it predicts; decodeFrame splits the same way.
-    if (info.scaledSlope == 0) {
-      return (int64_t)(info.baseBits + info.gcd * residual);
+    // slopeTerm costs two multiplies that produce zero for them. The test is
+    // per-block-shaped so it predicts; decodeFrame splits the same way.
+    uint64_t scaled = residual;
+    if (info.scaledSlope != 0) {
+      scaled += (uint64_t)NumColumnFormat::slopeTerm(rankInBlock,
+                                                     info.scaledSlope);
     }
-    uint64_t slopeTerm = (uint64_t)NumColumnFormat::slopeTerm(
-        rankInBlock, info.scaledSlope);
-    return (int64_t)(info.baseBits +
-        info.gcd * (slopeTerm + residual));
+    if constexpr (WithGcd) {
+      return (int64_t)(info.baseBits + info.gcd * scaled);
+    } else {
+      assert(info.gcd == 1);
+      return (int64_t)(info.baseBits + scaled);
+    }
   }
 
 public:
-  NumColumn() = default;
+  NumColumnT() = default;
 
-  NumColumn(const char* blocks, const char* blockMeta, int64_t nValues)
+  NumColumnT(const char* blocks, const char* blockMeta, int64_t nValues)
       : blocks(blocks), blockMeta(blockMeta), nValues(nValues) {}
 
   int64_t numValues() const {
@@ -64,9 +85,9 @@ public:
 
   int64_t valueAt(int64_t rank) const {
     assert(rank >= 0 && rank < nValues);
-    uint64_t blockNum = (uint64_t)rank / BLOCK_SIZE;
     uint64_t rankInBlock = (uint64_t)rank % BLOCK_SIZE;
-    NumBlockInfo info = blockInfo((int64_t)blockNum);
+    const NumBlockInfo& info =
+        *blockMetaAt((int64_t)((uint64_t)rank / BLOCK_SIZE));
     const char* payload = blocks + info.payloadOffset;
     if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
       int64_t value;
@@ -92,7 +113,8 @@ public:
     if (rankInBlock == 0) {
       return {rank > 0 ? valueAt(rank - 1) : 0, valueAt(rank)};
     }
-    NumBlockInfo info = blockInfo(rank / BLOCK_SIZE);
+    const NumBlockInfo& info =
+        *blockMetaAt((int64_t)((uint64_t)rank / BLOCK_SIZE));
     const char* payload = blocks + info.payloadOffset;
     if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
       int64_t pair[2];
@@ -162,7 +184,7 @@ public:
   }
 
   class Bulk {
-    const NumColumn& column;
+    const NumColumnT& column;
     int64_t index_ = -1;
     int64_t decodedStart = -1;
     int64_t decodedEnd = -1;
@@ -175,7 +197,7 @@ public:
     }
 
   public:
-    explicit Bulk(const NumColumn& column) : column(column) {}
+    explicit Bulk(const NumColumnT& column) : column(column) {}
 
     int64_t index() const {
       return index_;
@@ -214,28 +236,34 @@ public:
   };
 };
 
+// General numeric columns: values are arbitrary, so a per-block common divisor
+// is worth finding (coarse-granularity dates are the shape that pays for it).
+using NumColumn = NumColumnT<true>;
+// Monotonic columns: written with gcd pinned to 1, so the decode drops it.
+using MonoColumn = NumColumnT<false>;
+
 // Monotonic semantic facade over the shared numeric-column physical layer.
 class MonoReader {
 public:
-  static constexpr uint32_t BLOCK_SIZE = NumColumn::BLOCK_SIZE;
-  static constexpr int64_t ENDINDEX = NumColumn::ENDINDEX;
+  static constexpr uint32_t BLOCK_SIZE = MonoColumn::BLOCK_SIZE;
+  static constexpr int64_t ENDINDEX = MonoColumn::ENDINDEX;
   using BlockInfo = NumBlockInfo;
 
 private:
-  NumColumn values;
+  MonoColumn values;
 
 public:
   MonoReader(PostingsReader& postingsReader, seg_location loc, int64_t metaOff,
              int64_t nValues) {
     InputStream columnIS = postingsReader.getInputStreamSeek(loc);
     const char* blocks = columnIS.ptr();
-    values = NumColumn(blocks, blocks + metaOff, nValues);
+    values = MonoColumn(blocks, blocks + metaOff, nValues);
   }
 
   MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff,
              int64_t nValues) {
     const char* blocks = columnIS.ptr(loc);
-    values = NumColumn(blocks, blocks + metaOff, nValues);
+    values = MonoColumn(blocks, blocks + metaOff, nValues);
   }
 
   [[nodiscard]] int64_t numValues() const {
@@ -253,7 +281,7 @@ public:
   }
 
   class BulkValues {
-    NumColumn::Bulk values;
+    MonoColumn::Bulk values;
 
   public:
     explicit BulkValues(const MonoReader& column) : values(column.values) {}

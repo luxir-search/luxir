@@ -64,3 +64,6 @@ deps/FastPFOR/
 
 # Per-machine build additions (hooked via `include(LocalTargets.cmake OPTIONAL)`)
 LocalTargets.cmake
+
+# editor swap files
+.*.sw[a-p]

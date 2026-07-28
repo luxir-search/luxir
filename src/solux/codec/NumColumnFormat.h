@@ -12,6 +12,7 @@
 
 namespace solux {
 
+SOLUX_UNALIGNED_START
 struct NumBlockInfo {
   uint64_t payloadOffset = 0;
   uint64_t baseBits = 0;
@@ -19,17 +20,18 @@ struct NumBlockInfo {
   int64_t scaledSlope = 0;
   uint8_t bits = 0;
   uint8_t padding[7] = {};
-};
+} SOLUX_UNALIGNED_END;
 static_assert(sizeof(NumBlockInfo) == 40);
 // Readers locate the zone array at metaOff + nBlocks * sizeof(NumBlockInfo),
 // while the writer aligns it to 8. Both agree only while the descriptor is a
 // multiple of 8; otherwise the writer inserts padding the reader never skips.
 static_assert(sizeof(NumBlockInfo) % 8 == 0);
 
+SOLUX_UNALIGNED_START
 struct NumBlockZone {
   int64_t min = 0;
   int64_t max = 0;
-};
+} SOLUX_UNALIGNED_END;
 static_assert(sizeof(NumBlockZone) == 16);
 
 struct NumColumnFormat {
@@ -51,8 +53,14 @@ struct NumColumnFormat {
     }
   };
 
+  // useGcd == false skips the common-divisor scan and pins gcd to 1. Monotonic
+  // columns pass false: the slope already carries any regular step, so gcd only
+  // buys bits when the residuals themselves share a divisor - rare - and it
+  // costs a load and a multiply on every point read of the hottest columns in
+  // the engine (endValueRank and endOffset, read twice per doc).
   static BlockPlan planBlock(std::span<const int64_t> values,
-                             std::vector<uint64_t>& quotients) {
+                             std::vector<uint64_t>& quotients,
+                             bool useGcd = true) {
     assert(!values.empty() && values.size() <= BLOCK_SIZE);
 
     auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());
@@ -60,9 +68,11 @@ struct NumColumnFormat {
     int64_t max = *maxIt;
 
     uint64_t gcd = 0;
-    for (int64_t value : values) {
-      if (gcd == 1) break;
-      gcd = std::gcd(gcd, (uint64_t)value - (uint64_t)min);
+    if (useGcd) {
+      for (int64_t value : values) {
+        if (gcd == 1) break;
+        gcd = std::gcd(gcd, (uint64_t)value - (uint64_t)min);
+      }
     }
     if (gcd == 0) gcd = 1;
 
