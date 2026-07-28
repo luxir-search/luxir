@@ -50,6 +50,19 @@ public:
   }
 };
 
+class KeyGatherGuard {
+  bool saved;
+
+public:
+  explicit KeyGatherGuard(bool disabled)
+      : saved(FieldSortCollector::disableKeyGatherForTests) {
+    FieldSortCollector::disableKeyGatherForTests = disabled;
+  }
+  ~KeyGatherGuard() {
+    FieldSortCollector::disableKeyGatherForTests = saved;
+  }
+};
+
 class SortSkipStatsGuard {
   bool saved;
 
@@ -77,6 +90,12 @@ struct FieldSortBulkResult {
 
 class SortCollectorTest : public SoluxTest {
 protected:
+  struct WindowResult {
+    std::vector<segdoc> docs;
+    int64_t hitCount;
+    bool operator==(const WindowResult&) const = default;
+  };
+
   static std::vector<SortClause> columnPlan(const SortField& field) {
     return {SortClause(field)};
   }
@@ -90,6 +109,42 @@ protected:
     std::vector<std::string> ids;
     for (auto id : col.v) ids.emplace_back(id);
     return ids;
+  }
+
+  static WindowResult collectNumericWindows(
+      IndexReader& reader, std::string_view field, int64_t topCount,
+      SortField::SortOrder order, FieldComparator::MissingValue missing,
+      bool disableGather, std::span<const int32_t> segmentOrder = {}) {
+    IntFieldType fieldType(field);
+    SortField sortField(field, fieldType, order, missing);
+    FieldSortCollector collector(topCount, columnPlan(sortField));
+    KeyGatherGuard guard(disableGather);
+
+    auto collectSegment = [&](int32_t segment) {
+      auto& leaf = reader.segments()[(size_t)segment];
+      collector.setSegment(segment, &leaf.postingsReader());
+      std::vector<int32_t> docs;
+      for (int32_t doc = 0; doc < leaf.maxDoc(); doc++) {
+        if (leaf.liveDocs() == nullptr || leaf.liveDocs()->bitset().get(doc)) {
+          docs.push_back(doc);
+        }
+      }
+      collector.collectWindow(segment, docs);
+    };
+
+    if (segmentOrder.empty()) {
+      for (int32_t segment = 0;
+           segment < (int32_t)reader.segments().size(); segment++) {
+        collectSegment(segment);
+      }
+    } else {
+      for (int32_t segment : segmentOrder) collectSegment(segment);
+    }
+
+    WindowResult result;
+    result.hitCount = collector.totalHits();
+    for (const auto& doc : collector.sort()) result.docs.push_back(doc.doc);
+    return result;
   }
 };
 
@@ -119,9 +174,11 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
   }
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
-  auto run = [&](bool disableBulk, bool disjConj, std::string_view sortField,
-                 qb::SortDir direction, int32_t limit) {
+  auto run = [&](bool disableBulk, bool disableGather, bool disjConj,
+                 std::string_view sortField, qb::SortDir direction,
+                 int32_t limit) {
     FieldSortBulkGuard guard(disableBulk);
+    KeyGatherGuard gatherGuard(disableGather);
     auto req = localReq(soluxNode->getSearchEngine());
     req->collection("main");
     auto& cursor = req->topDocs("q").getNumber().limit(limit)
@@ -163,18 +220,234 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
 
   auto assertParity = [&](bool disjConj, std::string_view sortField,
                           qb::SortDir direction, int32_t limit) {
-    auto pull = run(true, disjConj, sortField, direction, limit);
-    auto bulk = run(false, disjConj, sortField, direction, limit);
-    EXPECT_EQ(pull.ids, bulk.ids);
-    EXPECT_EQ(pull.ints, bulk.ints);
-    EXPECT_EQ(pull.strings, bulk.strings);
-    EXPECT_EQ(pull.hitCount, bulk.hitCount);
+    auto pull = run(true, true, disjConj, sortField, direction, limit);
+    auto windowFallback =
+        run(false, true, disjConj, sortField, direction, limit);
+    auto gathered = run(false, false, disjConj, sortField, direction, limit);
+    EXPECT_EQ(pull.ids, windowFallback.ids);
+    EXPECT_EQ(pull.ints, windowFallback.ints);
+    EXPECT_EQ(pull.strings, windowFallback.strings);
+    EXPECT_EQ(pull.hitCount, windowFallback.hitCount);
+    EXPECT_EQ(windowFallback.ids, gathered.ids);
+    EXPECT_EQ(windowFallback.ints, gathered.ints);
+    EXPECT_EQ(windowFallback.strings, gathered.strings);
+    EXPECT_EQ(windowFallback.hitCount, gathered.hitCount);
   };
 
   assertParity(false, "sort_i", qb::ASC, 9);
   assertParity(false, "sort_i", qb::DESC, 1000);
   assertParity(false, "sort_s", qb::ASC, 17);
   assertParity(true, "sort_s", qb::DESC, 1000);
+}
+
+TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
+  CollectionHelper helper;
+  std::vector<std::string> deleted;
+  for (int32_t segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int32_t doc = 0; doc < 96; doc++) {
+      std::string id =
+          "s" + std::to_string(segment) + "d" + std::to_string(doc);
+      int64_t value = (doc * 37 + segment * 11) % 101;
+      Doc input = flatdoc(
+          "id", id, "id_s", id, "dense_i", value,
+          "dense_is", vec_i(value + 200, -value));
+      if (doc % 3 != 0) {
+        input.push_back({"sparse_i", value - 50});
+      }
+      if (doc % 4 == 1 || doc % 4 == 2) {
+        input.push_back({"sparse_is", vec_i(value + 300, value - 300)});
+      }
+      docs.push_back(std::move(input));
+      if (doc == 7 || doc == 53) deleted.push_back(id);
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), 2);
+  int64_t hits = reader->liveDocs();
+  for (std::string_view field :
+       {"dense_i", "sparse_i", "dense_is", "sparse_is"}) {
+    for (SortField::SortOrder order : {SortField::ASC, SortField::DESC}) {
+      for (FieldComparator::MissingValue missing :
+           {FieldComparator::MISSING_FIRST, FieldComparator::MISSING_LAST}) {
+        for (int64_t topCount : {int64_t(7), hits + 5}) {
+          auto fallback = collectNumericWindows(
+              *reader, field, topCount, order, missing, true);
+          auto gathered = collectNumericWindows(
+              *reader, field, topCount, order, missing, false);
+          EXPECT_EQ(gathered, fallback)
+              << field << " order=" << order << " missing=" << missing
+              << " topCount=" << topCount;
+          EXPECT_EQ(gathered.hitCount, hits);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(SortCollectorTest, keyGatherTieBreaksAcrossReversedSegments) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(
+      flatdoc("id", "early", "key_i", 10), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(
+      flatdoc("id", "late", "key_i", 10), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(reader->segments().size(), 2);
+  std::array<int32_t, 2> reversed = {1, 0};
+
+  for (std::string_view field : {"key_i", "absent_i"}) {
+    auto fallback = collectNumericWindows(
+        *reader, field, 1, SortField::ASC, FieldComparator::MISSING_LAST,
+        true, reversed);
+    auto gathered = collectNumericWindows(
+        *reader, field, 1, SortField::ASC, FieldComparator::MISSING_LAST,
+        false, reversed);
+    EXPECT_EQ(gathered, fallback);
+    ASSERT_EQ(gathered.docs.size(), 1);
+    EXPECT_EQ(gathered.docs[0], segdoc(0, 0));
+    EXPECT_EQ(gathered.hitCount, 2);
+  }
+}
+
+TEST_F(SortCollectorTest, keyGatherWarmupCrossesChunkPositions) {
+  constexpr int32_t numDocs = 1030;
+  const std::array<int32_t, 4> topCounts = {1, 512, 1024, 1025};
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  docs.reserve(numDocs);
+  for (int32_t doc = 0; doc < numDocs; doc++) {
+    Doc input = flatdoc("id", "d" + std::to_string(doc));
+    for (int32_t topCount : topCounts) {
+      std::string field = "warm" + std::to_string(topCount) + "_i";
+      int64_t value = doc == topCount ? -1 : 100000 + doc;
+      input.push_back({std::move(field), value});
+    }
+    docs.push_back(std::move(input));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  for (int32_t topCount : topCounts) {
+    std::string field = "warm" + std::to_string(topCount) + "_i";
+    auto fallback = collectNumericWindows(
+        *reader, field, topCount, SortField::ASC,
+        FieldComparator::MISSING_LAST, true);
+    auto gathered = collectNumericWindows(
+        *reader, field, topCount, SortField::ASC,
+        FieldComparator::MISSING_LAST, false);
+    EXPECT_EQ(gathered, fallback) << "topCount=" << topCount;
+    EXPECT_NE(std::find(
+                  gathered.docs.begin(), gathered.docs.end(),
+                  segdoc(0, topCount)),
+              gathered.docs.end())
+        << "the doc immediately after warmup was not admitted";
+    EXPECT_EQ(gathered.hitCount, numDocs);
+  }
+}
+
+TEST_F(SortCollectorTest, sparseLandingReusesPresentCandidate) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 8; doc++) {
+    Doc input = flatdoc("id", "d" + std::to_string(doc));
+    if (doc == 7) {
+      input.push_back({"sparse_i", int64_t(30)});
+      input.push_back({"sparse_is", vec_i(30, -100)});
+    }
+    docs.push_back(std::move(input));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  std::array<int32_t, 2> candidates = {5, 7};
+
+  auto run = [&](std::string_view field, bool disableGather) {
+    IntFieldType fieldType(field);
+    SortField sortField(
+        field, fieldType, SortField::ASC, FieldComparator::MISSING_LAST);
+    FieldSortCollector collector(2, columnPlan(sortField));
+    KeyGatherGuard guard(disableGather);
+    auto& segment = reader->segments()[0];
+    collector.setSegment(0, &segment.postingsReader());
+    collector.collectWindow(0, candidates);
+    WindowResult result;
+    result.hitCount = collector.totalHits();
+    for (const auto& doc : collector.sort()) result.docs.push_back(doc.doc);
+    return result;
+  };
+
+  for (std::string_view field : {"sparse_i", "sparse_is"}) {
+    auto fallback = run(field, true);
+    auto gathered = run(field, false);
+    EXPECT_EQ(gathered, fallback);
+    EXPECT_EQ(gathered.docs, (std::vector<segdoc>{segdoc(0, 7), segdoc(0, 5)}));
+    EXPECT_EQ(gathered.hitCount, 2);
+  }
+}
+
+TEST_F(SortCollectorTest, numericMissingPlacementIsDirectionIndependent) {
+  CollectionHelper helper;
+  std::vector<Doc> docs = {
+      flatdoc("id", "d0"),
+      flatdoc("id", "d1", "value_i", 10),
+      flatdoc("id", "d2"),
+      flatdoc("id", "d3", "value_i", 20),
+  };
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  struct Case {
+    SortField::SortOrder order;
+    FieldComparator::MissingValue missing;
+    std::vector<segdoc> expected;
+  };
+  std::vector<Case> cases = {
+      {SortField::ASC, FieldComparator::MISSING_FIRST,
+       {segdoc(0, 0), segdoc(0, 2), segdoc(0, 1), segdoc(0, 3)}},
+      {SortField::DESC, FieldComparator::MISSING_FIRST,
+       {segdoc(0, 0), segdoc(0, 2), segdoc(0, 3), segdoc(0, 1)}},
+      {SortField::ASC, FieldComparator::MISSING_LAST,
+       {segdoc(0, 1), segdoc(0, 3), segdoc(0, 0), segdoc(0, 2)}},
+      {SortField::DESC, FieldComparator::MISSING_LAST,
+       {segdoc(0, 3), segdoc(0, 1), segdoc(0, 0), segdoc(0, 2)}},
+  };
+
+  for (const auto& testCase : cases) {
+    auto fallback = collectNumericWindows(
+        *reader, "value_i", 4, testCase.order, testCase.missing, true);
+    auto gathered = collectNumericWindows(
+        *reader, "value_i", 4, testCase.order, testCase.missing, false);
+    EXPECT_EQ(gathered, fallback);
+    EXPECT_EQ(gathered.docs, testCase.expected);
+  }
+}
+
+TEST_F(SortCollectorTest, collectWindowFallbackCountsEachHitOnce) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 9; doc++) {
+    docs.push_back(flatdoc(
+        "id", "d" + std::to_string(doc),
+        "primary_i", doc % 3, "secondary_i", 9 - doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  IntFieldType primaryType("primary_i");
+  IntFieldType secondaryType("secondary_i");
+  std::vector<SortClause> clauses = {
+      SortClause(SortField("primary_i", primaryType, SortField::ASC)),
+      SortClause(SortField("secondary_i", secondaryType, SortField::ASC)),
+  };
+  FieldSortCollector collector(4, clauses);
+  auto& segment = reader->segments()[0];
+  collector.setSegment(0, &segment.postingsReader());
+  std::array<int32_t, 9> candidates = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  collector.collectWindow(0, candidates);
+
+  EXPECT_EQ(collector.totalHits(), (int64_t)candidates.size());
+  EXPECT_EQ(collector.size(), 4);
 }
 
 TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {

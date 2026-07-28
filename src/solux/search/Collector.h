@@ -608,12 +608,20 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
     int32_t next = bulk->matchNextWindow(window, filter, cursor, maxDoc);
-    for (int32_t i = 0; i < window.size; i++) {
-      int32_t doc = window.docs[(size_t) i];
-      if (builder != nullptr) {
-        builder->add(doc);
+    if (builder != nullptr) {
+      for (int32_t i = 0; i < window.size; i++) {
+        builder->add(window.docs[(size_t) i]);
       }
-      collector.collect(segnum, doc, 0.0f);
+    }
+    if constexpr (requires(Collector& c, std::span<const int32_t> docs) {
+        c.collectWindow(int32_t{}, docs);
+      }) {
+      collector.collectWindow(
+          segnum, window.docs.first((size_t)window.size));
+    } else {
+      for (int32_t i = 0; i < window.size; i++) {
+        collector.collect(segnum, window.docs[(size_t)i], 0.0f);
+      }
     }
     if (next == PostingsReader::END) {
       break;

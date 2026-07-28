@@ -14,7 +14,12 @@
 namespace solux {
 
 class FieldSortCollector {
+  static constexpr size_t KEY_BUFFER_SIZE = 1024;
+  int64_t keys[KEY_BUFFER_SIZE];
+
 public:
+  inline static bool disableKeyGatherForTests = false;
+
   struct SortDoc {
     segdoc doc;
     float score;
@@ -326,6 +331,52 @@ public:
     }
     if (cmp > 0) [[unlikely]] {
       admit(bottom, doc, score);
+    }
+  }
+
+  void collectWindow(int32_t segment, std::span<const int32_t> docs) {
+    FieldComparator::KeyBatch* batch = nullptr;
+    if (disableKeyGatherForTests || soleColumn == nullptr
+        || (batch = soleColumn->keyBatch()) == nullptr) {
+      for (int32_t doc : docs) {
+        collect(segment, doc, 0.0f);
+      }
+      return;
+    }
+
+    hitCount += (int64_t)docs.size();
+    if (topCount == 0) return;
+
+    size_t i = 0;
+    while (i < docs.size()) {
+      size_t chunkStart = i;
+      size_t chunkEnd = std::min(chunkStart + KEY_BUFFER_SIZE, docs.size());
+      batch->gatherKeys(
+          docs.subspan(chunkStart, chunkEnd - chunkStart),
+          std::span<int64_t>(keys, chunkEnd - chunkStart));
+
+      while (i < chunkEnd && pq->size() < (size_t)topCount) {
+        int32_t slot = (int32_t)pq->size();
+        batch->slotKeys[slot] = keys[i - chunkStart];
+        pq->insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
+        i++;
+      }
+      if (i == chunkEnd) continue;
+
+      int64_t bottomKey = batch->slotKeys[pq->top().slot];
+      for (; i < chunkEnd; i++) {
+        int64_t key = keys[i - chunkStart];
+        segdoc doc(segment, docs[i]);
+        if (key > bottomKey) continue;
+        if (key == bottomKey && doc >= pq->top().doc) continue;
+
+        SortDoc& bottom = pq->top();
+        int32_t slot = bottom.slot;
+        batch->slotKeys[slot] = key;
+        bottom = SortDoc(doc, 0.0f, slot);
+        pq->updateTop();
+        bottomKey = batch->slotKeys[pq->top().slot];
+      }
     }
   }
 

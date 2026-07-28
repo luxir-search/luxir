@@ -11,17 +11,34 @@
 #include "solux/util/MemPool.h"
 #include "solux/util/solux_util.h"
 #include <bit>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <vector>
 #include <limits>
 #include <cassert>
 #include <optional>
+#include <span>
 
 namespace solux {
 
 class FieldComparator {
 public:
+  // Optional batch sort-key capability for comparators whose complete sort
+  // order is an ascending transformed int64 key. Valid for the current segment
+  // only; setSegment resets its cursors. Implementations must not depend on
+  // setBottom notifications while this capability is in use.
+  // NOTE: no virtual destructor; never owned or deleted through this type.
+  class KeyBatch {
+  public:
+    // Live comparator slot storage, read and written directly by the collector.
+    std::span<int64_t> slotKeys;
+
+    // Gather transformed keys for ascending in-segment docs.
+    virtual void gatherKeys(std::span<const int32_t> docs,
+                            std::span<int64_t> keys) = 0;
+  };
+
   virtual ~FieldComparator() = default;
 
   // Set the current segment for this comparator
@@ -44,6 +61,8 @@ public:
   // Copy the value from a different comparator to this comparator
   virtual void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) = 0;
 
+  virtual KeyBatch* keyBatch() { return nullptr; }
+
   enum MissingValue {
     MISSING_FIRST,
     MISSING_LAST
@@ -54,22 +73,107 @@ public:
 
 // A comparator that can be used in a simplified collector that has values
 // that can be compared across different segments.
-class SimpleNumericFieldComparator : public FieldComparator {
+class SimpleNumericFieldComparator : public FieldComparator,
+                                     public FieldComparator::KeyBatch {
+  // IntColBM break-even: decodeFrame wins at eight gathered values per frame.
+  static constexpr size_t FRAME_DECODE_MIN = 8;
+
   std::string fieldName;
   std::optional<IntColReader> reader;
   std::optional<IntColReader::Iterator> iter;
+  std::optional<IntColReader::SparseValues> pointValues;
+  std::optional<screaming::BitSet::Iterator> docsIter;
   std::vector<int64_t> values; // Storage for bottom values
   int64_t sortMultiplier; // 1 for ascending, -1 for descending
   int64_t missingValueSubstitute;
   int64_t lastValue = 0;  // TODO: cache the last value lookup in compareBottom so we don't have to re-fetch if competitive
   segdoc lastDoc = {-1, -1};
+  int64_t decoded[NumColumn::BULK_SIZE];
+  int64_t decodedStart = -1;
+  int64_t decodedEnd = -1;
+  int32_t landedDoc = -1;
+  int32_t landedRank = -1;
   bool multiValued = false;
+
+  int64_t transformPresent(int64_t value) const {
+    return sortMultiplier < 0 ? ~value : value;
+  }
+
+  void gatherDenseSingle(std::span<const int32_t> docs,
+                         std::span<int64_t> keys) {
+    size_t i = 0;
+    while (i < docs.size()) {
+      int64_t frameStart =
+          (int64_t)docs[i] / NumColumn::BULK_SIZE * NumColumn::BULK_SIZE;
+      int64_t frameEnd = frameStart + NumColumn::BULK_SIZE;
+      size_t groupEnd = i + 1;
+      while (groupEnd < docs.size() && docs[groupEnd] < frameEnd) {
+        groupEnd++;
+      }
+
+      if (decodedStart == frameStart) {
+        for (; i < groupEnd; i++) {
+          keys[i] = transformPresent(decoded[docs[i] - decodedStart]);
+        }
+      } else if (groupEnd - i >= FRAME_DECODE_MIN) {
+        uint32_t count;
+        decodedStart = reader->decodeValueSubBlock(docs[i], decoded, count);
+        decodedEnd = decodedStart + count;
+        for (; i < groupEnd; i++) {
+          assert(docs[i] >= decodedStart && docs[i] < decodedEnd);
+          keys[i] = transformPresent(decoded[docs[i] - decodedStart]);
+        }
+      } else {
+        for (; i < groupEnd; i++) {
+          keys[i] = transformPresent(pointValues->valueAt(docs[i]));
+        }
+      }
+    }
+  }
+
+  bool land(int32_t doc) {
+    if (doc > landedDoc) {
+      landedDoc = docsIter->advance(doc);
+      landedRank = docsIter->rank();
+    }
+    return doc == landedDoc;
+  }
+
+  void gatherSparseSingle(std::span<const int32_t> docs,
+                          std::span<int64_t> keys) {
+    for (size_t i = 0; i < docs.size(); i++) {
+      if (!land(docs[i])) {
+        keys[i] = missingValueSubstitute;
+      } else {
+        keys[i] = transformPresent(pointValues->valueAt(landedRank));
+      }
+    }
+  }
+
+  void gatherMultiValued(std::span<const int32_t> docs,
+                         std::span<int64_t> keys) {
+    bool dense = !docsIter.has_value();
+    for (size_t i = 0; i < docs.size(); i++) {
+      int32_t rank;
+      if (dense) {
+        rank = docs[i];
+      } else if (land(docs[i])) {
+        rank = landedRank;
+      } else {
+        keys[i] = missingValueSubstitute;
+        continue;
+      }
+      int64_t valueRank = reader->getStartValueRank(rank);
+      keys[i] = transformPresent(pointValues->valueAt(valueRank));
+    }
+  }
 
 public:
   SimpleNumericFieldComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
     : fieldName(fieldName),
       values(numHits),
       sortMultiplier(reversed ? -1 : 1) {
+    slotKeys = values;
     
     // Missing placement is a fixed edge regardless of direction (the string
     // comparators and expression sort keys follow the same convention), so
@@ -83,9 +187,15 @@ public:
   
   void setSegment(int32_t segment, PostingsReader* postingsReader) override {
     // Reset reader and iterator
-    reader.reset();
     iter.reset();
+    pointValues.reset();
+    docsIter.reset();
+    reader.reset();
     multiValued = false;
+    decodedStart = -1;
+    decodedEnd = -1;
+    landedDoc = -1;
+    landedRank = -1;
 
     if (!postingsReader) return;
 
@@ -97,8 +207,30 @@ public:
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         iter.emplace(*reader);
+        pointValues.emplace(*reader);
         multiValued = reader->multiValued();
+        if (!reader->denseDocsWithValue()) {
+          docsIter.emplace(reader->docsWithValueBitSet());
+        }
       }
+    }
+  }
+
+  FieldComparator::KeyBatch* keyBatch() override {
+    return this;
+  }
+
+  void gatherKeys(std::span<const int32_t> docs,
+                  std::span<int64_t> keys) override {
+    assert(keys.size() == docs.size());
+    if (!reader.has_value()) {
+      std::fill(keys.begin(), keys.end(), missingValueSubstitute);
+    } else if (multiValued) {
+      gatherMultiValued(docs, keys);
+    } else if (docsIter.has_value()) {
+      gatherSparseSingle(docs, keys);
+    } else {
+      gatherDenseSingle(docs, keys);
     }
   }
 
