@@ -642,10 +642,10 @@ inline std::unique_ptr<DocSet> materializeRawFilter(
 }
 
 enum class FilterSupplierMode : uint8_t {
-  // Scored TOP_k keeps the calibrated density route: sparse filters remain
-  // pull/WAND iterators and do not even touch the cache.
+  // Pruned scored TOP_k keeps the calibrated density route: sparse filters
+  // remain pull/WAND iterators and do not even touch the cache.
   DENSITY_ROUTED,
-  // Exhaustive count/match/domain production values exact filter cost and
+  // Exhaustive collection, scored or unscored, values exact filter cost and
   // docs-only iteration. Let an admitted cached DocSet become the required
   // clause at every density; conjunction ordering then chooses the route.
   EXHAUSTIVE_CLAUSE,
@@ -670,14 +670,14 @@ inline Query::ScorerSupplier* filterSupplier(
     return source.scorerSupplier(targetPool, segment);
   }
 
-  // Gate before cache traffic. DENSITY_ROUTED leaves sparse scored filters on
+  // Gate before cache traffic. DENSITY_ROUTED leaves sparse filters on pruned
   // pull/WAND (a cached mask measures 7-16% slower on the 5M sweep).
   // SPARSE_BATCH extends that policy in both directions: its measured sparse
   // side wants the DocSet candidate vector, while the dense side retains the
-  // existing cached mask. Exhaustive mode deliberately bypasses both scored
-  // policies so exact cardinality participates in conjunction planning. Sparse
-  // entries also populate through facet/domain consumers, which serve them at
-  // any density.
+  // existing cached mask. Exhaustive mode bypasses the pruning-based density
+  // policy so exact collection can use a cached DocSet in conjunction
+  // planning. Sparse entries also populate through facet/domain consumers,
+  // which serve them at any density.
   auto* uncached = source.scorerSupplier(targetPool, segment);
   if (uncached == nullptr
       || (mode == FilterSupplierMode::DENSITY_ROUTED

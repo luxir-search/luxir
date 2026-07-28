@@ -69,6 +69,20 @@ FilterCacheConfig testConfig() {
       .maxMetadataBytes = 256 * 1024};
 }
 
+class ExactFilterCachePolicyGuard {
+  bool saved;
+
+public:
+  explicit ExactFilterCachePolicyGuard(bool disabled)
+    : saved(BooleanQuery::disableExactFilterCachePolicyForTests) {
+    BooleanQuery::disableExactFilterCachePolicyForTests = disabled;
+  }
+
+  ~ExactFilterCachePolicyGuard() {
+    BooleanQuery::disableExactFilterCachePolicyForTests = saved;
+  }
+};
+
 std::unique_ptr<DocSet> docs(int32_t maxDoc,
                              std::initializer_list<int32_t> values) {
   DocSetBuilder builder(maxDoc);
@@ -823,6 +837,59 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
   auto counters = cache->counters();
   EXPECT_EQ(1u, counters.builds);
   EXPECT_EQ(1u, counters.hits);
+}
+
+TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  constexpr int32_t maxDoc = 1024;
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    addTermDoc(writer, doc == 0 ? "alpha beta selected" : "alpha beta");
+  }
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto cache = writer.getFilterCache();
+
+  TermQuery alpha("text_w", "alpha");
+  TermQuery beta("text_w", "beta");
+  TermQuery selected("text_w", "selected");
+  std::array<Query*, 2> required{&alpha, &beta};
+  std::array<Query*, 1> filters{&selected};
+  BooleanQuery query(required, {}, {}, filters);
+
+  auto docSetLeads = [&](int32_t flags, bool disableExactPolicy) {
+    ExactFilterCachePolicyGuard guard(disableExactPolicy);
+    MemPool contextPool;
+    Query::Context context(contextPool, *reader);
+    auto* weight = query.createWeight(context, flags);
+    MemPool execPool;
+    auto* scorer = weight->createScorer(execPool, reader->segments()[0]);
+    EXPECT_NE(nullptr, scorer);
+    if (scorer == nullptr) return false;
+    auto clauses = scorer->flatConjunctionScorers();
+    EXPECT_EQ(3u, clauses.size());
+    return !clauses.empty()
+        && dynamic_cast<QueryPrep::DocSetScorer*>(clauses[0]) != nullptr;
+  };
+
+  auto initial = cache->counters();
+  EXPECT_FALSE(docSetLeads(Query::NEED_SCORES, true));
+  EXPECT_FALSE(docSetLeads(
+      Query::NEED_SCORES | Query::ALLOW_PRUNING, false));
+  auto bypassed = cache->counters();
+  EXPECT_EQ(initial.builds, bypassed.builds);
+  EXPECT_EQ(initial.hits, bypassed.hits);
+
+  EXPECT_TRUE(docSetLeads(Query::NEED_SCORES, false));
+  auto built = cache->counters();
+  EXPECT_EQ(initial.builds + 1, built.builds);
+  EXPECT_TRUE(docSetLeads(Query::NEED_SCORES, false));
+  EXPECT_EQ(built.hits + 1, cache->counters().hits);
+
+  EXPECT_TRUE(docSetLeads(0, false));
+  EXPECT_TRUE(docSetLeads(0, true));
 }
 
 TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {

@@ -408,6 +408,9 @@ public:
   // A/B toggle: retain the scored density policy for unscored filter suppliers
   // instead of letting cached DocSets become exhaustive conjunction clauses.
   static inline bool disableFilterClauseCountForTests = false;
+  // A/B toggle: retain the pruned scored density policy for exact scored
+  // filter suppliers instead of admitting cached DocSets as clauses.
+  static inline bool disableExactFilterCachePolicyForTests = false;
   // A/B toggle: keep exact filtered term disjunctions on their previous
   // conjunction/pull routes instead of batching cached-DocSet candidates.
   static inline bool disableFilteredDisjunctionBatchForTests = false;
@@ -1973,12 +1976,16 @@ public:
               && !disableFilteredDisjunctionBatchForTests
               && mandatoryWeights.empty() && optionalWeights.size() >= 2
               && prohibitedWeights.empty() && minShouldMatch == 1;
+          bool exhaustiveFilterClause = !allowsPruning
+              && (needsScores
+                    ? !disableExactFilterCachePolicyForTests
+                    : !disableFilterClauseCountForTests);
           QueryPrep::FilterSupplierMode mode =
-              (!needsScores && !disableFilterClauseCountForTests)
-                  ? QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE
-                  : exactFilteredDisjunction
-                      ? QueryPrep::FilterSupplierMode::SPARSE_BATCH
-                      : QueryPrep::FilterSupplierMode::DENSITY_ROUTED;
+              exactFilteredDisjunction
+                  ? QueryPrep::FilterSupplierMode::SPARSE_BATCH
+                  : exhaustiveFilterClause
+                        ? QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE
+                        : QueryPrep::FilterSupplierMode::DENSITY_ROUTED;
           filterSuppliers[i] = QueryPrep::filterSupplier(
               targetPool, *filterWeights[i], nullptr, filterUses[i],
               context.topReader, segment, mode,
