@@ -3329,8 +3329,11 @@ public:
         case ExactApproxKind::DOCS_ENUM:
           return approximation.docsEnum->next();
         case ExactApproxKind::TERM_SCORER:
-          return static_cast<TermQuery::Scorer*>(
-              approximation.scorer)->next();
+          return disableExactFreqOnSurvivalForTests
+              ? static_cast<TermQuery::Scorer*>(
+                    approximation.scorer)->next()
+              : static_cast<TermQuery::Scorer*>(
+                    approximation.scorer)->nextScoredProbe();
         case ExactApproxKind::DOC_SET:
           return static_cast<QueryPrep::DocSetScorer*>(
               approximation.scorer)->next();
@@ -3344,8 +3347,11 @@ public:
         case ExactApproxKind::DOCS_ENUM:
           return approximation.docsEnum->advance(target);
         case ExactApproxKind::TERM_SCORER:
-          return static_cast<TermQuery::Scorer*>(
-              approximation.scorer)->advance(target);
+          return disableExactFreqOnSurvivalForTests
+              ? static_cast<TermQuery::Scorer*>(
+                    approximation.scorer)->advance(target)
+              : static_cast<TermQuery::Scorer*>(
+                    approximation.scorer)->advanceScoredProbe(target);
         case ExactApproxKind::DOC_SET:
           return static_cast<QueryPrep::DocSetScorer*>(
               approximation.scorer)->advance(target);
@@ -3441,6 +3447,7 @@ public:
     static inline bool disablePruningForTests = false;
     static inline bool disableApproxFlattenForTests = false;
     static inline bool disableExactDirectApproximationsForTests = false;
+    static inline bool disableExactFreqOnSurvivalForTests = false;
 
     // allCosts contains each allScorers entry's supplier cost. scoringScorers is
     // the subset whose score() contributes to the conjunction score (filter

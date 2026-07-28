@@ -165,7 +165,8 @@ struct SkipStats {
   static inline int64_t scoredWordProbeAdvances = 0;
   // Scored resident-probe accounting. Advances count full blocks entered in
   // packed, contiguous, or word form. A survivor block is counted once, on its
-  // first exact candidate hit; its freq block may then be decoded once lazily.
+  // first termFreq() request after scoring survival; its freq block may then be
+  // decoded once lazily.
   static inline int64_t scoredProbeAdvances = 0;
   static inline int64_t scoredProbeSurvivorBlocks = 0;
   static inline int64_t scoredProbeFreqDecodes = 0;

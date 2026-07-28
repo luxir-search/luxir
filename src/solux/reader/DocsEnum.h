@@ -2162,15 +2162,7 @@ public:
       uint32_t docBytes = (uint32_t) (docIS.ptr() - bodyStart);
       assert(docBytes < bodyBytes);
       uint32_t freqBytes = bodyBytes - docBytes;
-      if (docid == target) {
-        uint32_t bytesRead = decodeScoredProbeFreqs(
-            docIS.ptr(), freqBytes);
-        assert(bytesRead == freqBytes);
-        const int32_t idx = docOrd - scoredProbeBlockStartOrd - 1;
-        tfreq = tfreqBuf[idx];
-      } else {
-        tfreqBufEnd = (int32_t) freqBytes;
-      }
+      tfreqBufEnd = (int32_t) freqBytes;
       docIS.skip(freqBytes);
     } else {
       assert((uint32_t) (docIS.ptr() - bodyStart) == bodyBytes);
@@ -2187,8 +2179,10 @@ public:
 
   // Probe-style scored advance for sorted membership tests. Full blocks remain
   // resident in their native doc representation, while the tfreq block is
-  // skipped by length and decoded only if termFreq() is requested on a hit.
-  // The resident state deliberately survives caller batch/window boundaries.
+  // skipped by length and decoded only if termFreq() is requested. A probe
+  // landing is not itself a survivor: callers may have more conjunction
+  // clauses to test. The resident state deliberately survives caller
+  // batch/window boundaries.
   int32_t advanceScoredProbe(int32_t target) SOLUX_INLINE {
     assert(target > docid);
     assert(!docsOnlyConsumed);

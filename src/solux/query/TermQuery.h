@@ -375,6 +375,10 @@ public:
       return docsEnum.advanceScoredProbe(target);
     }
 
+    int32_t nextScoredProbe() {
+      return docsEnum.advanceScoredProbe(docsEnum.docId() + 1);
+    }
+
     bool matchScoredProbe(int32_t target, float& score) SOLUX_INLINE {
       if (simScorer == nullptr) {
         int32_t doc = docsEnum.docId();

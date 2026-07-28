@@ -392,7 +392,8 @@ TEST_F(BooleanQueryDedupTest, weightDedupClonesAndWalksPostingsOnce) {
     SkipStats::enabled = true;
     SkipStats::reset();
     collectHits(*testIndex.reader, q);
-    int64_t decodes = SkipStats::docBlocksDecoded;
+    int64_t decodes =
+        SkipStats::docBlocksDecoded + SkipStats::scoredWordProbeAdvances;
     SkipStats::enabled = saved;
     return decodes;
   };

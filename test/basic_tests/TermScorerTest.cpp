@@ -195,6 +195,22 @@ struct ScoredProbeGuard {
   }
 };
 
+struct ExactFreqOnSurvivalGuard {
+  bool saved;
+
+  explicit ExactFreqOnSurvivalGuard(bool disabled)
+    : saved(BooleanQuery::ConjunctionScorer::
+                disableExactFreqOnSurvivalForTests) {
+    BooleanQuery::ConjunctionScorer::
+        disableExactFreqOnSurvivalForTests = disabled;
+  }
+
+  ~ExactFreqOnSurvivalGuard() {
+    BooleanQuery::ConjunctionScorer::
+        disableExactFreqOnSurvivalForTests = saved;
+  }
+};
+
 struct FilterMaskProbeGuard {
   bool saved;
 
@@ -6203,6 +6219,86 @@ TEST_F(TermScorerTest, conjunctionScoredProbeResumeOwnsPrepositionedTermFreq) {
   EXPECT_EQ(SkipStats::scoredProbeFreqDecodes, decodesBeforeFailure + 1);
   EXPECT_EQ(SkipStats::scoredProbeSurvivorBlocks,
             survivorsBeforeFailure + 1);
+}
+
+TEST_F(TermScorerTest, exactConjunctionDecodesTermFreqsOnlyOnSurvival) {
+  constexpr int32_t N = 40000;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "exact_filler";
+    if ((doc % 257) == 0) body += " exact_gate";
+    if ((doc % 2) == 0) {
+      appendRepeatedTerm(body, "exact_two", 2 + (doc % 5));
+    }
+    if ((doc % 3) == 0) {
+      appendRepeatedTerm(body, "exact_three", 3 + (doc % 7));
+    }
+    if ((doc % 5) == 0) {
+      appendRepeatedTerm(body, "exact_five", 4 + (doc % 11));
+    }
+    if ((doc % 7) == 0) {
+      appendRepeatedTerm(body, "exact_seven", 5 + (doc % 13));
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  struct Run {
+    std::vector<TopDocsCollector::ScoreDoc> topDocs;
+    int64_t exactEngagements;
+    int64_t probeAdvances;
+    int64_t survivorBlocks;
+    int64_t freqDecodes;
+    int64_t tfreqBlocksDecoded;
+  };
+  auto run = [&](bool disabled) {
+    auto poolFree = testIndex.pool.rewindScopeGuard();
+    ExactFreqOnSurvivalGuard freqGuard(disabled);
+    SkipStatsGuard stats;
+    Query::Context qContext(testIndex.pool, *testIndex.reader);
+    auto& segment = qContext.topReader.segments()[0];
+    std::array<std::string_view, 5> terms = {
+        "exact_gate", "exact_two", "exact_three", "exact_five",
+        "exact_seven"
+    };
+    auto queries = makeTermQueries(terms);
+    auto mandatory = queryPointers(queries);
+    BooleanQuery query(mandatory, {}, {}, {});
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    EXPECT_NE(scorer, nullptr);
+
+    TopDocsCollector collector(100);
+    if (scorer != nullptr) {
+      collectTopK(0, scorer, nullptr, nullptr, collector,
+                  /*allowPruning=*/false);
+    }
+    return Run{
+      sortedCollectorDocs(collector),
+      SkipStats::conjExactDirectApproxEngagements,
+      SkipStats::scoredProbeAdvances,
+      SkipStats::scoredProbeSurvivorBlocks,
+      SkipStats::scoredProbeFreqDecodes,
+      SkipStats::tfreqBlocksDecoded,
+    };
+  };
+
+  Run enabled = run(false);
+  Run disabled = run(true);
+  assertTopKEquivalent(disabled.topDocs, enabled.topDocs);
+  EXPECT_EQ(enabled.topDocs.size(), 1);
+  EXPECT_GT(enabled.exactEngagements, 0);
+  EXPECT_GT(disabled.exactEngagements, 0);
+  EXPECT_GT(enabled.probeAdvances, 0);
+  EXPECT_EQ(disabled.probeAdvances, 0);
+  EXPECT_GT(enabled.survivorBlocks, 0);
+  EXPECT_EQ(enabled.freqDecodes, enabled.survivorBlocks);
+  EXPECT_EQ(enabled.tfreqBlocksDecoded, enabled.freqDecodes);
+  EXPECT_GT(disabled.tfreqBlocksDecoded,
+            enabled.tfreqBlocksDecoded * 10);
 }
 
 TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
