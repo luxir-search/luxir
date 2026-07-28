@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -8,6 +9,7 @@
 #include "solux/query/Query.h"
 #include "solux/search/SearchOverrides.h"
 #include "solux/query/QueryPrep.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
@@ -40,6 +42,64 @@ public:
   static constexpr int32_t kExactCountTopKMaxDepth = 100;
   static inline int32_t exactCountTopKMinCandidateDensityInverseForTests =
       kExactCountTopKMinCandidateDensityInverse;
+
+  // Filtered MUST conjunctions can abandon competitive-score pruning when the
+  // filter caps the candidate set tightly enough. The depth-specific knees
+  // bracketed on the 5M Wikipedia corpus are:
+  //   TOP_10:   0.11% wins; 1.02% has an intersection loss
+  //   TOP_100:  2.16% wins; 3.95% has an uncached term loss
+  //   TOP_1000: 4.98% wins; 7.96% has an uncached term loss
+  // Use the conservative power-of-two boundary inside each bracket.
+  static constexpr std::array<int32_t, 3>
+      kSparseFilteredTopKDensityInverse{128, 32, 16};
+  static inline std::array<int32_t, 3>
+      sparseFilteredTopKDensityInverseForTests =
+          kSparseFilteredTopKDensityInverse;
+  static inline bool disableSparseFilteredTopKRerouteForTests = false;
+
+  static int32_t sparseFilteredTopKDensityInverse(int64_t topCount) {
+    if (topCount <= 0) return 0;
+    if (topCount <= 10) {
+      return sparseFilteredTopKDensityInverseForTests[0];
+    }
+    if (topCount <= 100) {
+      return sparseFilteredTopKDensityInverseForTests[1];
+    }
+    if (topCount <= 1000) {
+      return sparseFilteredTopKDensityInverseForTests[2];
+    }
+    return 0;
+  }
+
+  static bool admitSparseFilteredTopK(
+      Query::Weight& weight, IndexReader& reader, int64_t topCount) {
+    if (disableSparseFilteredTopKRerouteForTests) {
+      return false;
+    }
+    int32_t densityInverse = sparseFilteredTopKDensityInverse(topCount);
+    if (densityInverse <= 0) {
+      return false;
+    }
+    int64_t filterCost = 0;
+    MemPool pool;
+    for (auto& segment : reader.segments()) {
+      auto savepoint = pool.getSavePoint();
+      int64_t segmentCost =
+          weight.sparseFilteredTopKCost(pool, segment);
+      pool.rewind(savepoint);
+      if (segmentCost < 0) {
+        skipCount(SkipStats::sparseFilteredTopKShapeRejects);
+        return false;
+      }
+      filterCost += segmentCost;
+    }
+    bool admitted = filterCost <= std::max<int64_t>(
+        1, reader.maxDoc() / densityInverse);
+    if (!admitted) {
+      skipCount(SkipStats::sparseFilteredTopKDensityRejects);
+    }
+    return admitted;
+  }
 
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;

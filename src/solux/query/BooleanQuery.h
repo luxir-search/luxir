@@ -9,6 +9,7 @@
 #include "AllQuery.h"
 #include "BoostQuery.h"
 #include "ConstantScoreQuery.h"
+#include "PhraseQuery.h"
 #include "TermQuery.h"
 #include "ScoreCompact.h"
 #include "solux/reader/SkipStats.h"
@@ -637,6 +638,18 @@ public:
     int minShouldMatch = 0;
     bool needsScores = false;
     bool allowsPruning = false;
+    bool sparseFilteredTopKEligible = false;
+
+    static bool sparseFilteredTopKMandatory(Query* query) {
+      while (auto* boost = dynamic_cast<BoostQuery*>(query)) {
+        query = boost->getChild();
+      }
+      if (dynamic_cast<TermQuery*>(query) != nullptr) {
+        return true;
+      }
+      auto* phrase = dynamic_cast<PhraseQuery*>(query);
+      return phrase != nullptr && phrase->getSlop() == 0;
+    }
 
     static bool lessMaxScore(float a, float b) {
       bool finiteA = std::isfinite(a);
@@ -1924,6 +1937,12 @@ public:
       if (directTermUnion) {
         traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       }
+      sparseFilteredTopKEligible = !filterWeights.empty()
+          && !mandatoryClauses.empty() && optionalClauses.empty()
+          && prohibitedClauses.empty() && minShouldMatch == 0
+          && std::all_of(
+              mandatoryClauses.begin(), mandatoryClauses.end(),
+              sparseFilteredTopKMandatory);
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
@@ -1997,6 +2016,22 @@ public:
                           optionalSources,
                           prohibitedSources, filterSuppliers, minShouldMatch,
                           needsScores, allowsPruning);
+    }
+
+    int64_t sparseFilteredTopKCost(
+        MemPool& targetPool, IndexReader::Segment& segment) override {
+      if (!sparseFilteredTopKEligible) {
+        return -1;
+      }
+      int64_t cost = segment.maxDoc();
+      for (auto* weight : filterWeights) {
+        auto* supplier = weight->scorerSupplier(targetPool, segment);
+        if (supplier == nullptr) {
+          return 0;
+        }
+        cost = std::min(cost, supplier->cost());
+      }
+      return cost;
     }
 
     Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {

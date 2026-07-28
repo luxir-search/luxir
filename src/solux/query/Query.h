@@ -719,6 +719,16 @@ public:
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
+    /// A-priori cost of the folded filter clause for a scored conjunction that
+    /// may profitably abandon top-k pruning, or -1 when this weight's shape is
+    /// not eligible. Implementations must inspect suppliers only: this planner
+    /// hook runs before request execution and must not populate filter caches.
+    virtual int64_t sparseFilteredTopKCost(
+        MemPool& target, IndexReader::Segment& segment) {
+      unused(target, segment);
+      return -1;
+    }
+
     /// Optional execution-time preparation for weights that need the domain for
     /// all segments before they can create a scorer for any individual segment,
     /// such as shard-level kNN over a filtered domain.

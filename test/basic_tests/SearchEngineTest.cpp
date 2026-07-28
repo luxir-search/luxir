@@ -17,6 +17,7 @@
 #include "solux/reader/SkipStats.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/search/SearchOverrides.h"
+#include "solux/search/ops/TopDocsReq.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;
@@ -99,6 +100,28 @@ public:
   }
   ~TopKCountCompositionGuard() {
     disableTopKCountComposition = saved;
+  }
+};
+
+class SparseFilteredTopKRerouteGuard {
+  bool savedDisabled;
+  std::array<int32_t, 3> savedDensityInverse;
+
+public:
+  SparseFilteredTopKRerouteGuard(bool disabled, int32_t densityInverse)
+    : savedDisabled(TopDocsReq::disableSparseFilteredTopKRerouteForTests),
+      savedDensityInverse(
+          TopDocsReq::sparseFilteredTopKDensityInverseForTests) {
+    TopDocsReq::disableSparseFilteredTopKRerouteForTests = disabled;
+    TopDocsReq::sparseFilteredTopKDensityInverseForTests.fill(
+        densityInverse);
+  }
+
+  ~SparseFilteredTopKRerouteGuard() {
+    TopDocsReq::disableSparseFilteredTopKRerouteForTests =
+        savedDisabled;
+    TopDocsReq::sparseFilteredTopKDensityInverseForTests =
+        savedDensityInverse;
   }
 };
 
@@ -1513,6 +1536,79 @@ TEST_F(SearchEngineTest, cachedDocSetBatchesExactScoredTerm) {
   expectSameScoreMap(legacy.scores, batch.scores);
   EXPECT_GT(batch.engagements, 0);
   EXPECT_EQ(0, legacy.engagements);
+}
+
+TEST_F(SearchEngineTest, sparseFilteredTopKRerouteIsConjunctionOnly) {
+  constexpr std::string_view collection = "sparse_filtered_topk_reroute";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  constexpr int32_t nDocs = 1024;
+  docs.reserve(nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string filter = (doc % 512) == 0 ? "sparse " : "";
+    if ((doc & 1) == 0) filter += "dense";
+    docs.push_back(flatdoc(
+        "id", "reroute_" + std::to_string(doc),
+        "body_w", "alpha beta quick fox",
+        "filter_w", filter));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t reroutes;
+    int64_t densityRejects;
+    int64_t shapeRejects;
+  };
+  auto run = [&](FilteredCountShape shape, std::string_view filter,
+                 bool exact, bool disabled) {
+    SparseFilteredTopKRerouteGuard rerouteGuard(disabled, 64);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getScores().fields({"id"}).limit(10);
+    if (exact) cur.getNumber();
+    cur.rawQuery() = filteredCountBody(cur.mr(), shape);
+    if (!filter.empty()) {
+      cur.matchFilter("filter", "filter_w", filter);
+    }
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{
+      resultIds(*req, "q"),
+      resultScoreMap(*req, "q"),
+      SkipStats::sparseFilteredTopKReroutes,
+      SkipStats::sparseFilteredTopKDensityRejects,
+      SkipStats::sparseFilteredTopKShapeRejects,
+    };
+  };
+
+  for (FilteredCountShape shape :
+       {FilteredCountShape::TERM, FilteredCountShape::INTERSECTION,
+        FilteredCountShape::PHRASE}) {
+    Result pruned = run(shape, "sparse", false, true);
+    Result routed = run(shape, "sparse", false, false);
+    EXPECT_EQ(pruned.ids, routed.ids);
+    expectSameScoreMap(pruned.scores, routed.scores);
+    EXPECT_EQ(0, pruned.reroutes);
+    EXPECT_EQ(1, routed.reroutes);
+  }
+
+  Result dense = run(FilteredCountShape::TERM, "dense", false, false);
+  EXPECT_EQ(0, dense.reroutes);
+  EXPECT_EQ(1, dense.densityRejects);
+
+  Result unionResult =
+      run(FilteredCountShape::UNION, "sparse", false, false);
+  EXPECT_EQ(0, unionResult.reroutes);
+  EXPECT_EQ(1, unionResult.shapeRejects);
+
+  Result exact = run(FilteredCountShape::TERM, "sparse", true, false);
+  EXPECT_EQ(0, exact.reroutes);
+
+  Result unfiltered = run(FilteredCountShape::TERM, "", false, false);
+  EXPECT_EQ(0, unfiltered.reroutes);
 }
 
 TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {

@@ -696,6 +696,15 @@ public:
       requestFlags |= Query::ALLOW_PRUNING;
     }
     auto* weight = query->createWeight(*qcontext, requestFlags);
+    bool sparseFilteredTopKReroute = allowPruning && foldFilters
+        && topDocsReq.ops.empty() && !weight->needsPrepare()
+        && TopDocsReq::admitSparseFilteredTopK(
+            *weight, *req.reader, limit);
+    if (sparseFilteredTopKReroute) {
+      requestFlags &= ~Query::ALLOW_PRUNING;
+      weight = query->createWeight(*qcontext, requestFlags);
+      skipCount(SkipStats::sparseFilteredTopKReroutes);
+    }
     Query::Weight* countWeight = nullptr;
     Query::Weight* rankingWeight = nullptr;
     bool exactCountTopK = limit > 0 && topDocsReq.get_number
