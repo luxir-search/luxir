@@ -591,6 +591,41 @@ TEST_F(IntColTest, testMonoRepeatedValues) {
   ASSERT_EQ(3, r.valueAt(2)) << "Third value should be 3";
 }
 
+// valuesAt resolves one descriptor for the adjacent pair, so the pair that
+// straddles a block boundary takes a different path than the rest. Check every
+// rank across three blocks; nothing else calls valuesAt directly.
+TEST_F(IntColTest, monoValuesAtSpansBlockBoundaries) {
+  RAMDir dir;
+  auto file = dir.createFile("mono");
+  OutputStream out(file.get());
+  MemPool pool;
+  MonoWriter writer(pool, out);
+
+  const int64_t n = 2 * (int64_t)MonoReader::BLOCK_SIZE + 37;
+  std::vector<int64_t> expected((size_t)n);
+  int64_t acc = 0;
+  for (int64_t i = 0; i < n; i++) {
+    acc += 1 + i % 5;  // increasing with a non-constant step
+    expected[(size_t)i] = acc;
+    writer.addInt64(acc);
+  }
+  int64_t count = (int64_t)writer.finish();
+  out.close();
+  dir.finishFile(*file);
+
+  auto in = dir.openFile("mono");
+  InputStream input(in->getInputStream());
+  MonoReader reader(input, writer.blockLoc.offset(), writer.metaOff, count);
+
+  EXPECT_EQ(reader.valuesAt(0),
+            std::make_pair((int64_t)0, expected[0]));
+  for (int64_t i = 1; i < n; i++) {
+    EXPECT_EQ(reader.valuesAt(i),
+              std::make_pair(expected[(size_t)i - 1], expected[(size_t)i]))
+        << "rank " << i;
+  }
+}
+
 TEST_F(IntColTest, monoFractionalSlope) {
   RAMDir dir;
   auto file = dir.createFile("mono");

@@ -78,6 +78,34 @@ public:
     return reconstruct(info, rankInBlock, residual);
   }
 
+  // Values at rank-1 and rank, with rank-1 defined as 0 at rank 0. This is how
+  // monotonic columns are actually read - a doc's value range is the adjacent
+  // pair - and the two ranks share a block except at a boundary, so resolve the
+  // descriptor once instead of paying for it twice.
+  std::pair<int64_t, int64_t> valuesAt(int64_t rank) const {
+    assert(rank >= 0 && rank < nValues);
+    // Both cases where the pair does not share a descriptor: rank 0, which has
+    // no predecessor, and a block boundary, where rank - 1 is the previous
+    // block's last value. rank 0 has rankInBlock 0, so one test covers both.
+    // Only rank 0 yields 0; a boundary reads each side normally.
+    uint64_t rankInBlock = (uint64_t)rank % BLOCK_SIZE;
+    if (rankInBlock == 0) {
+      return {rank > 0 ? valueAt(rank - 1) : 0, valueAt(rank)};
+    }
+    NumBlockInfo info = blockInfo(rank / BLOCK_SIZE);
+    const char* payload = blocks + info.payloadOffset;
+    if (info.bits > NumColumnFormat::MAX_PACKED_BITS) {
+      int64_t pair[2];
+      memcpy(pair, payload + (rankInBlock - 1) * sizeof(int64_t), sizeof(pair));
+      return {pair[0], pair[1]};
+    }
+    uint64_t mask = LinearPack::mask64(info.bits);
+    uint64_t prev = LinearPack::select64(payload, rankInBlock - 1, info.bits, mask);
+    uint64_t cur = LinearPack::select64(payload, rankInBlock, info.bits, mask);
+    return {reconstruct(info, rankInBlock - 1, prev),
+            reconstruct(info, rankInBlock, cur)};
+  }
+
   // Decode the 128-aligned frame containing rank. Returns the global rank of
   // out[0] and stores the number of valid values in count.
   //
@@ -221,7 +249,7 @@ public:
   // Retrieve values[index-1], values[index]. If index is 0, the first value is
   // defined as zero.
   [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int64_t index) const {
-    return {index > 0 ? valueAt(index - 1) : 0, valueAt(index)};
+    return values.valuesAt(index);
   }
 
   class BulkValues {
