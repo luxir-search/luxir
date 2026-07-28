@@ -239,9 +239,18 @@ public:
     MemPool pool;
     RAMFile ramFile = {""};
     OutputStream os{&ramFile};
-    ScreamingBuilder builder{pool, os};
+    // Junk written before the builder exists misaligns the stream start; the
+    // builder must pad back to the format's 8-aligned set start.
+    int prefixBytes;
+    ScreamingBuilder builder;
 
-    explicit OutputStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
+    explicit OutputStreamBuilder(const Rng& rng = SoluxTest::rng, int prefix = 0)
+        : BldBase(rng),
+          prefixBytes([&] {
+            for (int i = 0; i < prefix; i++) os.write((char)0x5A);
+            return prefix;
+          }()),
+          builder(pool, os) {
     }
 
     void virtAdd(int val) override {
@@ -380,6 +389,41 @@ TEST_F(ScreamingTest, basic) {
     set.addSmallBucket();
     set.finishBuild();
     set.verifyIterator();
+  }
+}
+
+// Serialized sets must keep dense-bucket words 8-aligned (BLOCK_ALIGN): the
+// word scans compile with alignment assumptions, so a byte-misaligned words
+// pointer is a fault, not a slow path (this was the 5M-corpus norms-merge
+// segfault).  Interleave odd-cardinality sparse buckets (which force block
+// padding) with dense buckets, over stream starts at every misalignment
+// residue (which force the builder's leading stream pad), and verify both the
+// explicit alignment of every dense block and full iterate/rank/select parity.
+TEST_F(ScreamingTest, denseBucketAlignment) {
+  for (int prefix = 0; prefix < 8; prefix++) {
+    OutputStreamBuilder set(SoluxTest::rng, prefix);
+    set.addSmallBucket(3);
+    set.addMidBucket();
+    set.addSmallBucket(5);
+    set.addMidBucket();
+    set.addSmallBucket(1);
+    set.finishBuild();
+
+    const screaming::BitSet& bs = *set.bitset;
+    ASSERT_GT((int)bs.nBuckets, 0);
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(bs.start)
+                  & (screaming::BitSet::BLOCK_ALIGN - 1), 0u);
+    int denseSeen = 0;
+    for (int i = 0; i < bs.nBuckets; i++) {
+      const auto& desc = bs.descriptors[i];
+      if ((uint32_t)desc.size + 1 > screaming::BitSet::BUCKET_SPARSE_MAX) {
+        denseSeen++;
+        ASSERT_EQ(reinterpret_cast<uintptr_t>(bs.start + desc.offset)
+                      & (screaming::BitSet::BLOCK_ALIGN - 1), 0u);
+      }
+    }
+    ASSERT_GE(denseSeen, 2);
+    set.verifyIteratorSkips();
   }
 }
 

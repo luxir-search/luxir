@@ -14,14 +14,31 @@ class ScreamingBuilder : public screaming::Builder<ScreamingBuilder> {
 
   MemPool& pool;
   OutputStream& out;
+
+  // Serialized sets must start 8-aligned (screaming::BitSet::BLOCK_ALIGN):
+  // dense-bucket word scans are compiled with alignment assumptions, so a
+  // byte-misaligned set faults rather than merely slowing down.  Pad the
+  // stream up front; the stream offset equals the mmap-relative address.
+  void alignOut() {
+    static constexpr char zeros[screaming::BitSet::BLOCK_ALIGN] = {};
+    size_t pad = (screaming::BitSet::BLOCK_ALIGN
+                  - (out.size() & (screaming::BitSet::BLOCK_ALIGN - 1)))
+                 & (screaming::BitSet::BLOCK_ALIGN - 1);
+    if (pad > 0) {
+      out.write(zeros, pad);
+    }
+  }
+
 public:
   ScreamingBuilder(MemPool& pool, OutputStream& out)
   : Builder(pool.alloc(screaming::BitSet::SPARSE_CONTAINER_SIZE), pool.alloc(screaming::BitSet::DENSE_CONTAINER_SIZE),
             pool.alloc(SCRATCH_SIZE), SCRATCH_SIZE), pool(pool), out(out) {
+    alignOut();
   }
 
   ScreamingBuilder(MemPool& pool, OutputStream& out, void* sparseContainer, void* denseContainer, void* scratchBuf, uint32_t scratchSize)
   : Builder(sparseContainer, denseContainer, scratchBuf, scratchSize), pool(pool), out(out) {
+    alignOut();
   }
 
 protected:

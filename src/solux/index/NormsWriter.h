@@ -65,13 +65,23 @@ private:
 
     size_t bitsetLen = tempFile.size();
     assert(bitsetLen > 0);
-    char* bitsetBytes = pool.alloc(bitsetLen);
+    // The set's start must be 8-aligned wherever it is materialized (see
+    // screaming::BitSet::BLOCK_ALIGN): both in this request-lifetime copy and
+    // at the spliced stream offset the readers will later mmap.
+    char* bitsetBytes = pool.alloc(bitsetLen, screaming::BitSet::BLOCK_ALIGN);
     tempFile.copyTo(bitsetBytes);
     prepared.docsBitset.set(bitsetBytes + bitsetLen);
     prepared.hasBitset = true;
 
     auto outputPtr = postingsWriter.getOutputStream();
     OutputStream& out = *outputPtr;
+    static constexpr char zeros[screaming::BitSet::BLOCK_ALIGN] = {};
+    size_t pad = (screaming::BitSet::BLOCK_ALIGN
+                  - (out.size() & (screaming::BitSet::BLOCK_ALIGN - 1)))
+                 & (screaming::BitSet::BLOCK_ALIGN - 1);
+    if (pad > 0) {
+      out.write(zeros, pad);
+    }
     out.write(bitsetBytes, bitsetLen);
     fieldInfo.docsWithField = docsWithField;
     fieldInfo.docsWithFieldEndLoc = out.slocation();

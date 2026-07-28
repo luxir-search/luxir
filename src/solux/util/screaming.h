@@ -8,6 +8,7 @@
 #include <memory>
 #include <memory_resource>
 #include <sstream>
+#include <utility>
 #include <assert.h>
 
 #if defined(__BMI2__)
@@ -347,6 +348,19 @@ public:
   static constexpr uint32_t SPARSE_CONTAINER_SIZE = Bits::sizeInBytes;
   static constexpr uint32_t DENSE_CONTAINER_SIZE = Bits::sizeInBytes + RANK_INDEX_SIZE;
 
+  // Serialized-format alignment invariant: the set's first byte must sit at an
+  // 8-aligned address (writers pad their stream/buffer before the builder's
+  // first byte), and every bucket block occupies a multiple of 8 bytes (the
+  // builder pads sparse blocks; dense blocks are 8448 bytes).  Dense-bucket
+  // words are therefore always 8-aligned in memory, which the compiler is
+  // entitled to assume when it vectorizes word scans: GCC's AVX-512 nextSetBit
+  // loop derives its aligned vector loads from uint64_t alignment, and a
+  // byte-misaligned words pointer faults (#GP) - not just a slow path.  The
+  // descriptor array lands 8-aligned by the same block padding.
+  static constexpr uint32_t BLOCK_ALIGN = 8;
+  static_assert(DENSE_CONTAINER_SIZE % BLOCK_ALIGN == 0,
+                "dense blocks must preserve the block alignment invariant");
+
   // A dense bucket stores its bitset words immediately followed by a
   // cumulative-popcount rank index (RANK_INDEX_ENTRIES uint16s; see
   // Builder::flushBucket).  This is the single source of where that index lives:
@@ -390,10 +404,15 @@ public:
   void set(const void* pointerToEnd) {
     nBuckets = *((uint16_t*)pointerToEnd - 1);
     descriptors = (BucketDescriptor*)((char*)pointerToEnd - sizeof(uint16_t) - nBuckets * sizeof(BucketDescriptor));
+    if (nBuckets == 0) {
+      start = (const char*)descriptors;
+      return;
+    }
     // the size of all the buckets is the offset of the last bucket plus the size of that bucket
     auto lastDescriptor = descriptors[nBuckets - 1];
     auto sizeOfAllBuckets = lastDescriptor.offset + blockBytes(lastDescriptor);
     start = ((char*)descriptors) - sizeOfAllBuckets;
+    assert((reinterpret_cast<uintptr_t>(start) & (BLOCK_ALIGN - 1)) == 0);
   }
 
   bool empty() const {
@@ -458,6 +477,7 @@ public:
         case DENSE:
           return denseNextMaybe();
       }
+      std::unreachable();
     }
 
     int32_t advance(int32_t target) {
@@ -498,7 +518,7 @@ public:
           curr = target - 1;
           return denseNextMaybe();
       }
-      // unreachable
+      std::unreachable();
     }
 
 
@@ -568,7 +588,7 @@ public:
           rankBase += std::popcount(bitsToTheRight);
           return bucketRank + rankBase;
       }
-      // unreachable
+      std::unreachable();
     }
 
 
@@ -591,6 +611,8 @@ public:
         return sparseNext();
       } else {
         bucketType = DENSE;
+        assert((reinterpret_cast<uintptr_t>(set->start + desc.offset)
+                & (BLOCK_ALIGN - 1)) == 0);
         bucket.bits.obs = Bits((Bits::word_type*)(set->start + desc.offset));
         curr = bucketBase - 1;
         return denseNext();
@@ -622,6 +644,8 @@ public:
         bucket.sparse.values = (uint16_t*)(set->start + desc.offset);
       } else {
         bucketType = DENSE;
+        assert((reinterpret_cast<uintptr_t>(set->start + desc.offset)
+                & (BLOCK_ALIGN - 1)) == 0);
         bucket.bits.obs = Bits((Bits::word_type*)(set->start + desc.offset));
         curr = bucketBase - 1;
       }
@@ -683,6 +707,7 @@ protected:
     // before mini-block m, with the final mini-block intentionally uncounted).
     // Binary-search the index to the owning mini-block, scan its words to the
     // owning word, then select within that word.  Mirrors Iterator::rank().
+    assert((reinterpret_cast<uintptr_t>(start + desc.offset) & (BLOCK_ALIGN - 1)) == 0);
     const Bits::word_type* words = (const Bits::word_type*)(start + desc.offset);
     const uint16_t* rankIndexArr = denseRankIndex(words);
     // largest m with rankIndexArr[m] <= localRank == (first m with rankIndexArr[m] > localRank) - 1
@@ -711,12 +736,14 @@ protected:
 #endif
   }
 
-  // The number of bytes taken up by a block.
+  // The number of bytes taken up by a block, including its alignment padding
+  // (every block occupies a multiple of BLOCK_ALIGN bytes - see the invariant
+  // comment above; the builder's flushBucket writes matching padding).
   // NOTE: this requires knowing if a rank index is being used for dense blocks!
   static constexpr int blockBytes(const BucketDescriptor& desc) {
     int sz = (int)desc.size + 1;
     if (sz <= BUCKET_SPARSE_MAX) {
-      return sz * sizeof(uint16_t);
+      return (int)((sz * sizeof(uint16_t) + BLOCK_ALIGN - 1) & ~(size_t)(BLOCK_ALIGN - 1));
     } else {
       return DENSE_CONTAINER_SIZE;
     }
@@ -900,6 +927,15 @@ protected:
       // TODO: if (nVals <= 2) {}
       writeSize = bucketSize * sizeof(uint16_t);
       write((void *) values, writeSize);
+      // Pad every block to BLOCK_ALIGN so dense-bucket words (and the trailing
+      // descriptor array) stay 8-aligned; blockBytes() reports the padded size.
+      static constexpr char zeros[BitSet::BLOCK_ALIGN] = {};
+      uint32_t pad = (BitSet::BLOCK_ALIGN - (writeSize & (BitSet::BLOCK_ALIGN - 1)))
+                     & (BitSet::BLOCK_ALIGN - 1);
+      if (pad > 0) {
+        write((void *) zeros, pad);
+        writeSize += pad;
+      }
     } else {
       // fill in the rest of the bits from the buffered values
       for (uint32_t i=0; i < BitSet::BUCKET_SPARSE_MAX; i++) {
