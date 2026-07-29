@@ -23,7 +23,7 @@ target_precompile_headers(solux_test PRIVATE
 )
 
 # Compile the same exhaustive decoded-successor tests with AVX-512 forcibly
-# unavailable so the scalar portability path is exercised on AVX-512 hosts.
+# unavailable so AVX2 hosts exercise the AVX2 path.
 add_executable(decoded_successor_no_avx512_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_no_avx512_test PRIVATE .)
@@ -31,6 +31,17 @@ target_link_libraries(decoded_successor_no_avx512_test PRIVATE GTest::gtest_main
 target_compile_options(decoded_successor_no_avx512_test PRIVATE -mno-avx512f)
 target_compile_definitions(decoded_successor_no_avx512_test PRIVATE
   SOLUX_EXPECT_NO_AVX512=1)
+
+# Compile the same tests without AVX-512 or AVX2 so the scalar portability path
+# is exercised on SIMD hosts.
+add_executable(decoded_successor_scalar_test
+  basic_tests/DecodedSuccessorTest.cpp)
+target_include_directories(decoded_successor_scalar_test PRIVATE .)
+target_link_libraries(decoded_successor_scalar_test PRIVATE GTest::gtest_main)
+target_compile_options(decoded_successor_scalar_test PRIVATE
+  -mno-avx512f -mno-avx2)
+target_compile_definitions(decoded_successor_scalar_test PRIVATE
+  SOLUX_EXPECT_SCALAR=1)
 
 
 # (solux_smoke removed: it was migration scaffolding to run SmokeTest while solux_test was

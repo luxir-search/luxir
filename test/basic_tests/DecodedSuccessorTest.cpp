@@ -98,8 +98,12 @@ TEST(DecodedSuccessorTest, TailLoadDoesNotCrossGuardPage) {
 #endif
 }
 
-TEST(DecodedSuccessorTest, ForcedNoAvx512BuildUsesScalarPath) {
+TEST(DecodedSuccessorTest, ExpectedIsaIsCompiled) {
 #if defined(SOLUX_EXPECT_NO_AVX512)
   EXPECT_FALSE(DecodedSuccessor::hasAvx512ForTests());
+#endif
+#if defined(SOLUX_EXPECT_SCALAR)
+  EXPECT_FALSE(DecodedSuccessor::hasAvx512ForTests());
+  EXPECT_FALSE(DecodedSuccessor::hasAvx2ForTests());
 #endif
 }

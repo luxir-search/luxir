@@ -8,8 +8,14 @@
 #include <cassert>
 #include <cstdint>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
+#endif
+
+#if defined(__AVX512F__) || defined(__AVX2__)
+#define SOLUX_DECODED_SUCCESSOR_SIMD 1
+#else
+#define SOLUX_DECODED_SUCCESSOR_SIMD 0
 #endif
 
 #ifndef SOLUX_PROBE_CONSTANT_HOOKS
@@ -29,9 +35,67 @@ namespace solux {
 // Return the first index in [start, end) whose value is >= target, or end.
 // The input must be sorted. No storage beyond end is part of the contract.
 class DecodedSuccessor {
-  static constexpr int32_t LANES = 16;
   static constexpr int32_t SCALAR_LINEAR_PROBE = 8;
+
+#if defined(__AVX512F__)
+  using Vec = __m512i;
+  static constexpr int32_t LANES = 16;
+
+  static Vec broadcastTarget(int32_t target) SOLUX_INLINE {
+    return _mm512_set1_epi32(target);
+  }
+
+  static uint32_t geqMask(const int32_t* values, Vec target) SOLUX_INLINE {
+    const Vec block = _mm512_loadu_si512((const void*) values);
+    return (uint32_t) _mm512_cmp_epi32_mask(block, target, _MM_CMPINT_GE);
+  }
+
+  static uint32_t tailGeqMask(const int32_t* values, int32_t length,
+                              Vec target) SOLUX_INLINE {
+    assert(length > 0 && length < LANES);
+    const uint32_t valid = (1u << length) - 1u;
+    const Vec block =
+        _mm512_maskz_loadu_epi32((__mmask16) valid, (const void*) values);
+    return (uint32_t) _mm512_cmp_epi32_mask(
+        block, target, _MM_CMPINT_GE) & valid;
+  }
+#elif defined(__AVX2__)
+  using Vec = __m256i;
+  static constexpr int32_t LANES = 8;
+
+  static Vec broadcastTarget(int32_t target) SOLUX_INLINE {
+    // Signed block > target - 1 implements block >= target.
+    assert(target != INT32_MIN);
+    return _mm256_set1_epi32(target - 1);
+  }
+
+  static uint32_t geqMask(const int32_t* values, Vec target) SOLUX_INLINE {
+    const Vec block =
+        _mm256_loadu_si256((const __m256i*) values);
+    const Vec cmp = _mm256_cmpgt_epi32(block, target);
+    return (uint32_t) _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
+  }
+
+  static uint32_t tailGeqMask(const int32_t* values, int32_t length,
+                              Vec target) SOLUX_INLINE {
+    assert(length > 0 && length < LANES);
+    const uint32_t valid = (1u << length) - 1u;
+    const Vec laneMask = _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(length),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    // Maskload suppresses faults for lanes whose mask sign bit is clear.
+    const Vec block = _mm256_maskload_epi32(values, laneMask);
+    const Vec cmp = _mm256_cmpgt_epi32(block, target);
+    return (uint32_t) _mm256_movemask_ps(
+        _mm256_castsi256_ps(cmp)) & valid;
+  }
+#endif
+
+#if SOLUX_DECODED_SUCCESSOR_SIMD
+  static constexpr int32_t HISTOGRAM_BUCKETS = 128 / LANES + 2;
+#else
   static constexpr int32_t HISTOGRAM_BUCKETS = 10;
+#endif
 
   static void recordStrides(int32_t strides) SOLUX_INLINE {
 #if SOLUX_DECODED_SUCCESSOR_HISTOGRAM
@@ -57,24 +121,9 @@ class DecodedSuccessor {
         values + j, (size_t) (end - j), target) - values);
   }
 
-#if defined(__AVX512F__)
-  static uint32_t geqMask(const int32_t* values, __m512i target) SOLUX_INLINE {
-    const __m512i block = _mm512_loadu_si512((const void*) values);
-    return (uint32_t) _mm512_cmp_epi32_mask(block, target, _MM_CMPINT_GE);
-  }
-
-  static uint32_t tailGeqMask(const int32_t* values, int32_t length,
-                              __m512i target) SOLUX_INLINE {
-    assert(length > 0 && length < LANES);
-    const uint32_t valid = (1u << length) - 1u;
-    const __m512i block =
-        _mm512_maskz_loadu_epi32((__mmask16) valid, (const void*) values);
-    return (uint32_t) _mm512_cmp_epi32_mask(
-        block, target, _MM_CMPINT_GE) & valid;
-  }
-
+#if SOLUX_DECODED_SUCCESSOR_SIMD
   static int32_t SOLUX_NOINLINE continuationIndex(
-      const int32_t* values, int32_t start, int32_t end, __m512i target,
+      const int32_t* values, int32_t start, int32_t end, Vec target,
       int32_t strides) {
     int32_t j = start;
     while (end - j >= LANES) {
@@ -119,16 +168,24 @@ public:
 #endif
   }
 
+  static constexpr bool hasAvx2ForTests() {
+#if defined(__AVX2__) && !defined(__AVX512F__)
+    return true;
+#else
+    return false;
+#endif
+  }
+
   static int32_t index(const int32_t* values, int32_t start, int32_t end,
                        int32_t target) SOLUX_INLINE {
     assert(values != nullptr);
     assert(start >= 0 && start <= end);
-#if defined(__AVX512F__)
+#if SOLUX_DECODED_SUCCESSOR_SIMD
     if (disableSimdForTests) {
       return scalarIndex(values, start, end, target);
     }
 
-    const __m512i targetVector = _mm512_set1_epi32(target);
+    const Vec targetVector = broadcastTarget(target);
 #if SOLUX_FULL_INLINE_DECODED_SUCCESSOR
     int32_t j = start;
     int32_t strides = 0;
@@ -171,3 +228,5 @@ public:
 };
 
 } // namespace solux
+
+#undef SOLUX_DECODED_SUCCESSOR_SIMD
