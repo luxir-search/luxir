@@ -136,6 +136,12 @@ protected:
 
 public:
   ArrDocSet(std::vector<int32_t>&& docs) : DocSet(ARRAY), docs_(std::move(docs)) {
+    if (docs_.data() == nullptr) {
+      // Normalize empty storage so docs().data() is never null: consumers may
+      // use a null pointer to mean "no set at all" (e.g. DocSetProbe), which
+      // must stay distinct from an empty set that rejects every doc.
+      docs_.reserve(1);
+    }
     card_ = static_cast<int32_t>(docs_.size());
   }
 
@@ -168,15 +174,12 @@ public:
 /// scan, never share one across concurrent consumers.
 class DocSetProbe {
   const uint64_t* words = nullptr;
-  const int32_t* base = nullptr;
+  const int32_t* base = nullptr;  // null means no set: accept every doc.
   const int32_t* lo = nullptr;
   const int32_t* hi = nullptr;
-  // Distinct flag rather than a pointer sentinel: an EMPTY ArrDocSet also has
-  // no array storage, and it must reject every doc, not accept them.
-  bool matchAll = false;
 
 public:
-  DocSetProbe() : matchAll(true) {}  // accepts everything, like a null DocSet
+  DocSetProbe() = default;  // accepts everything, like a null DocSet
 
   explicit DocSetProbe(const DocSet* set) {
     reset(set);
@@ -185,16 +188,18 @@ public:
   void reset(const DocSet* set) {
     words = nullptr;
     base = lo = hi = nullptr;
-    matchAll = set == nullptr;
-    if (matchAll) {
+    if (set == nullptr) {
       return;
     }
     if (set->type == DocSet::BITSET) {
       words = ((const BitDocSet*) set)->bits().words;
     } else {
+      // An empty ArrDocSet still has non-null storage (normalized in its
+      // ctor), keeping it distinct from the null-set sentinel above.
       std::span<const int32_t> docs = ((const ArrDocSet*) set)->docs();
       base = lo = docs.data();
       hi = base + docs.size();
+      assert(base != nullptr);
     }
   }
 
@@ -202,7 +207,7 @@ public:
     if (words != nullptr) {
       return (words[(uint32_t) doc >> 6] >> (doc & 63)) & 1;
     }
-    if (matchAll) {
+    if (base == nullptr) {
       return true;
     }
     // lo[-1] < doc means lower_bound(doc) >= lo, so the cursor still applies
