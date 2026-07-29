@@ -125,6 +125,23 @@ public:
   }
 };
 
+class FilteredDisjunctionPostingsBlockGatherGuard {
+  bool saved;
+
+public:
+  explicit FilteredDisjunctionPostingsBlockGatherGuard(bool disabled)
+    : saved(BooleanQuery::
+                disableFilteredDisjunctionPostingsBlockGatherForTests) {
+    BooleanQuery::disableFilteredDisjunctionPostingsBlockGatherForTests =
+        disabled;
+  }
+
+  ~FilteredDisjunctionPostingsBlockGatherGuard() {
+    BooleanQuery::disableFilteredDisjunctionPostingsBlockGatherForTests =
+        saved;
+  }
+};
+
 class OwnedFilterStatsGuard {
   bool saved;
 
@@ -999,6 +1016,7 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
     std::string text = "filler";
     if ((doc & 1) == 0) text += " alpha";
     if ((doc % 3) == 0) text += " beta";
+    if ((doc % 3) != 1) text += " block_filter";
     if ((doc % 1000) == 0) text += " selected";
     if ((doc % 100) == 0) text += " middle";
     addTermDoc(writer, text);
@@ -1096,6 +1114,87 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
   EXPECT_GT(scorePostings.batchEngagements, 0);
   EXPECT_GT(scorePostings.postingsFeeds, 0);
   EXPECT_EQ(0, scoreArray.postingsFeeds);
+
+  struct GatherRun {
+    std::vector<int32_t> docs;
+    std::vector<int32_t> resumes;
+  };
+  auto gather = [&](int32_t min, int32_t max, bool disableBlockGather) {
+    FilteredDisjunctionPostingsBlockGatherGuard gatherGuard(
+        disableBlockGather);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    TermQuery blockFilter("text_w", "block_filter");
+    TermQuery alpha("text_w", "alpha");
+    auto scorer = [&](TermQuery& query) {
+      auto* weight = query.createWeight(context, 0);
+      return (TermQuery::Scorer*) weight->createScorer(pool, segment);
+    };
+    auto* filterScorer = scorer(blockFilter);
+    std::array<TermQuery::Scorer*, 2> termScorers{
+        scorer(blockFilter), scorer(alpha)};
+    if (filterScorer == nullptr || termScorers[0] == nullptr
+        || termScorers[1] == nullptr) {
+      ADD_FAILURE() << "expected all term scorers";
+      return GatherRun{};
+    }
+    auto* bulk = pool.make<BooleanQuery::DocSetDisjunctionBulkScorer>(
+        pool, filterScorer, std::span<const int32_t>{}, termScorers,
+        maxDoc, filterScorer);
+
+    GatherRun result;
+    int32_t cursor = min;
+    while (cursor != PostingsReader::END && cursor < max) {
+      ScoreWindow window;
+      int32_t next = bulk->matchNextWindow(
+          window, nullptr, cursor, max);
+      result.docs.insert(
+          result.docs.end(), window.docs.begin(),
+          window.docs.begin() + window.size);
+      result.resumes.push_back(next);
+      if (next == PostingsReader::END) {
+        break;
+      }
+      EXPECT_GT(next, cursor);
+      cursor = next;
+    }
+    return result;
+  };
+  auto expectedDocs = [](int32_t min, int32_t max) {
+    std::vector<int32_t> docs;
+    for (int32_t doc = min; doc < max; doc++) {
+      if ((doc % 3) != 1) {
+        docs.push_back(doc);
+      }
+    }
+    return docs;
+  };
+
+  std::vector<int32_t> expected = expectedDocs(0, maxDoc);
+  ASSERT_GT(expected.size(), (size_t) DocsEnumMeta::L1_DOCS);
+  int32_t blockBoundary =
+      expected[(size_t) Postings::DOCS_BLOCK_SIZE];
+  int32_t straddleMin = blockBoundary - 7;
+  int32_t straddleMax = blockBoundary + 11;
+  GatherRun straddledBlocks = gather(straddleMin, straddleMax, false);
+  GatherRun straddledVirtual = gather(straddleMin, straddleMax, true);
+  EXPECT_EQ(expectedDocs(straddleMin, straddleMax),
+            straddledBlocks.docs);
+  EXPECT_EQ(straddledVirtual.docs, straddledBlocks.docs);
+  EXPECT_EQ((std::vector<int32_t>{PostingsReader::END}),
+            straddledBlocks.resumes);
+  EXPECT_EQ(straddledVirtual.resumes, straddledBlocks.resumes);
+
+  GatherRun cappedBlocks = gather(0, maxDoc, false);
+  GatherRun cappedVirtual = gather(0, maxDoc, true);
+  EXPECT_EQ(expected, cappedBlocks.docs);
+  EXPECT_EQ(cappedVirtual.docs, cappedBlocks.docs);
+  EXPECT_EQ(
+      (std::vector<int32_t>{
+          expected[(size_t) DocsEnumMeta::L1_DOCS],
+          PostingsReader::END}),
+      cappedBlocks.resumes);
+  EXPECT_EQ(cappedVirtual.resumes, cappedBlocks.resumes);
 
   Run middleCount = run("middle", false, false, false);
   EXPECT_EQ(0, middleCount.batchEngagements);

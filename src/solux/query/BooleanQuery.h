@@ -418,6 +418,10 @@ public:
   // A/B toggle: retain virtual DocSet scorer iteration instead of consuming
   // an array-backed filter's sorted span directly.
   static inline bool disableFilteredDisjunctionArrayFeedForTests = false;
+  // A/B toggle: retain virtual term-scorer iteration instead of copying
+  // decoded postings blocks into the filtered-disjunction candidate batch.
+  static inline bool disableFilteredDisjunctionPostingsBlockGatherForTests =
+      false;
   // A/B toggle: keep exact scored filtered term conjunctions on their
   // body-led mask or pull routes instead of batching from a cached DocSet.
   static inline bool disableFilteredConjunctionBatchForTests = false;
@@ -1414,7 +1418,7 @@ public:
 
         Query::Scorer* filterScorer = nullptr;
         std::span<const int32_t> filterDocs;
-        bool postingsFeed = false;
+        TermQuery::Scorer* postingsScorer = nullptr;
         if (auto* docSetSupplier =
                 dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
           DocSet* docs = docSetSupplier->docSet();
@@ -1430,8 +1434,8 @@ public:
         } else if (!QueryPrep::
                        disableSparseBatchPostingsFeedForTests) {
           auto* scorer = filterSupplier->get(targetPool, filterCost);
-          filterScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
-          postingsFeed = filterScorer != nullptr;
+          postingsScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
+          filterScorer = postingsScorer;
         }
         if (filterScorer == nullptr && filterDocs.empty()) {
           skipCount(SkipStats::filteredDisjBatchNonDocSetFallbacks);
@@ -1479,7 +1483,7 @@ public:
         }
         return targetPool.make<BooleanQuery::DocSetDisjunctionBulkScorer>(
             targetPool, filterScorer, filterDocs, termScorers,
-            segment.maxDoc(), postingsFeed);
+            segment.maxDoc(), postingsScorer);
       }
 
       BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
@@ -6150,6 +6154,7 @@ public:
     static constexpr int32_t kMatchWords = (kBatchSize + 63) >> 6;
 
     Query::Scorer* filterScorer;
+    TermQuery::Scorer* postingsScorer;
     std::span<const int32_t> filterDocs;
     std::span<TermQuery::Scorer*> termScorers;
     std::span<uint64_t> matchedWords;
@@ -6159,6 +6164,57 @@ public:
     int32_t nextFilterDoc = -1;
     size_t nextFilterIndex = 0;
     int32_t candidateCount = 0;
+
+    int32_t gatherPostingsCandidates(int32_t min, int32_t max) {
+      auto& docsEnum = postingsScorer->docsEnum;
+      int32_t doc = nextFilterDoc;
+      if (doc < min) {
+        doc = docsEnum.docId();
+        if (doc < min) {
+          doc = docsEnum.advanceDocOnly(min);
+        }
+      }
+
+      candidateCount = 0;
+      int32_t upTo = std::min(max, maxDoc);
+      if (doc >= upTo) {
+        nextFilterDoc = doc;
+        return PostingsReader::END;
+      }
+
+      while (candidateCount < kBatchSize) {
+        std::span<const int32_t> blockDocs =
+            docsEnum.peekDocOnlyBlock();
+        if (blockDocs.empty()) {
+          break;
+        }
+        assert(blockDocs.front() >= min);
+        int32_t available = (int32_t) blockDocs.size();
+        const int32_t* rangeEnd = screaming::gallopLowerBound(
+            blockDocs.data(), blockDocs.data() + available, upTo);
+        int32_t count = std::min(
+            (int32_t) (rangeEnd - blockDocs.data()),
+            kBatchSize - candidateCount);
+        if (count == 0) {
+          break;
+        }
+        std::copy_n(
+            blockDocs.begin(), count,
+            outDocs.begin() + candidateCount);
+        candidateCount += count;
+        docsEnum.consumeDocOnlyBlock(count);
+        if (count < available) {
+          break;
+        }
+      }
+
+      std::span<const int32_t> remaining =
+          docsEnum.peekDocOnlyBlock();
+      nextFilterDoc = remaining.empty()
+          ? PostingsReader::END : remaining.front();
+      return nextFilterDoc >= upTo
+          ? PostingsReader::END : nextFilterDoc;
+    }
 
     int32_t gatherScorerCandidates(DocSet* externalFilter, int32_t min,
                                    int32_t max) {
@@ -6215,6 +6271,10 @@ public:
 
     int32_t gatherCandidates(DocSet* externalFilter, int32_t min,
                              int32_t max) {
+      if (externalFilter == nullptr && postingsScorer != nullptr
+          && !disableFilteredDisjunctionPostingsBlockGatherForTests) {
+        return gatherPostingsCandidates(min, max);
+      }
       return filterDocs.empty()
           ? gatherScorerCandidates(externalFilter, min, max)
           : gatherArrayCandidates(externalFilter, min, max);
@@ -6313,16 +6373,19 @@ public:
     DocSetDisjunctionBulkScorer(MemPool& pool, Query::Scorer* filterScorer,
                                 std::span<const int32_t> filterDocs,
                                 std::span<TermQuery::Scorer*> termScorers,
-                                int32_t maxDoc, bool postingsFeed)
-        : filterScorer(filterScorer), filterDocs(filterDocs),
+                                int32_t maxDoc,
+                                TermQuery::Scorer* postingsScorer)
+        : filterScorer(filterScorer), postingsScorer(postingsScorer),
+          filterDocs(filterDocs),
           termScorers(termScorers),
           matchedWords(pool.make_span<uint64_t>((size_t) kMatchWords)),
           outDocs(pool.make_span<int32_t>((size_t) kBatchSize)),
           outScores(pool.make_span<float>((size_t) kBatchSize)),
           maxDoc(maxDoc) {
       assert((filterScorer == nullptr) != filterDocs.empty());
+      assert(postingsScorer == nullptr || postingsScorer == filterScorer);
       skipCount(SkipStats::filteredDisjBatchEngagements);
-      if (postingsFeed) {
+      if (postingsScorer != nullptr) {
         skipCount(
             SkipStats::filteredDisjBatchPostingsFeedEngagements);
       }
