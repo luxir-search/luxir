@@ -76,6 +76,14 @@ public:
     return false;
   }
 
+  // Append this scorer's remaining exact docs directly to a builder when it
+  // has a docs-only block stream. Returns false without consuming anything
+  // when the scorer does not support that protocol.
+  virtual bool appendDocs(DocSetBuilder& builder) {
+    unused(builder);
+    return false;
+  }
+
   virtual void scoreCandidatesExact(std::span<int32_t> docs,
                                     std::span<float> scores) {
     unused(docs, scores);

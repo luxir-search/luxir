@@ -1135,6 +1135,17 @@ public:
       return true;
     }
 
+    bool appendDocs(DocSetBuilder& builder) override {
+      for (;;) {
+        std::span<const int32_t> docs = scorer->docsEnum.peekDocOnlyBlock();
+        if (docs.empty()) {
+          return true;
+        }
+        builder.addSorted(docs);
+        scorer->docsEnum.consumeDocOnlyBlock((int32_t) docs.size());
+      }
+    }
+
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
       max = std::min(max, maxDoc);

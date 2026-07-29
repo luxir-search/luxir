@@ -376,6 +376,40 @@ public:
     bitDocs->card_++;
   }
 
+  void addSorted(std::span<const int32_t> sortedDocs) {
+    if (sortedDocs.empty()) {
+      return;
+    }
+#ifndef NDEBUG
+    for (int32_t doc : sortedDocs) {
+      checkMonotonic(doc);
+    }
+#endif
+    if (bits) {
+      for (int32_t doc : sortedDocs) {
+        bits->set(doc);
+      }
+      bitDocs->card_ += (int32_t) sortedDocs.size();
+      return;
+    }
+
+    int32_t limit = arrayLimit();
+    int32_t appendBeforePromotion = std::min(
+        (int32_t) sortedDocs.size(),
+        std::max<int32_t>(0, limit - (int32_t) docs.size()));
+    docs.insert(docs.end(), sortedDocs.begin(),
+                sortedDocs.begin() + appendBeforePromotion);
+    if (appendBeforePromotion == (int32_t) sortedDocs.size()) {
+      return;
+    }
+
+    promoteToBits();
+    for (int32_t doc : sortedDocs.subspan((size_t) appendBeforePromotion)) {
+      bits->set(doc);
+    }
+    bitDocs->card_ += (int32_t) sortedDocs.size() - appendBeforePromotion;
+  }
+
   int32_t card() const {
     return bits ? bitDocs->cachedCard() : (int32_t) docs.size();
   }

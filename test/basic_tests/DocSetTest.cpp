@@ -169,4 +169,19 @@ TEST_F(DocSetTest, builderAddWindowWordsPromotesAtAddBoundary) {
   EXPECT_EQ(collect(*set, 96), (std::vector<int32_t>{1, 2, 10, 20}));
 }
 
+TEST_F(DocSetTest, builderAddSortedPromotesOnSpanOverflow) {
+  DocSetBuilder builder(96);
+  std::array<int32_t, 2> first{1, 2};
+  std::array<int32_t, 3> second{10, 20, 95};
+
+  builder.addSorted(first);
+  builder.addSorted(second);
+  auto set = builder.build();
+
+  ASSERT_EQ(set->type, DocSet::BITSET);
+  EXPECT_EQ(set->card(), 5);
+  EXPECT_EQ(collect(*set, 96),
+            (std::vector<int32_t>{1, 2, 10, 20, 95}));
+}
+
 }  // namespace solux::test

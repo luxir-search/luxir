@@ -6736,6 +6736,52 @@ TEST_F(TermScorerTest, queryPrepMaterializeBulkDomainMatchesPull) {
   expectDocSetEqual(actual.get(), expected.domain.get(), segment.maxDoc());
 }
 
+TEST_F(TermScorerTest, queryPrepDirectTermMaterializationMatchesWindows) {
+  const int32_t N = 2 * DocsEnumMeta::L1_DOCS + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "filler";
+    if (doc == 0 || doc == 127 || doc == 128
+        || doc == DocsEnumMeta::L1_DOCS - 1
+        || doc == DocsEnumMeta::L1_DOCS) {
+      body += " sparse";
+    }
+    if ((doc & 7) == 0) {
+      body += " promoted";
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  bool savedDirectDisable =
+      QueryPrep::disableDirectPostingsMaterializationForTests;
+  for (std::string_view term : {"sparse", "promoted", "missing"}) {
+    TermQuery query("body_w", term);
+    auto* directWeight = query.createWeight(qContext, 0);
+    QueryPrep::disableDirectPostingsMaterializationForTests = false;
+    auto direct = QueryPrep::materialize(
+        *directWeight, nullptr, segment, nullptr);
+
+    auto* windowWeight = query.createWeight(qContext, 0);
+    QueryPrep::disableDirectPostingsMaterializationForTests = true;
+    auto window = QueryPrep::materialize(
+        *windowWeight, nullptr, segment, nullptr);
+
+    expectDocSetEqual(direct.get(), window.get(), segment.maxDoc());
+    EXPECT_EQ(direct->type, window->type);
+    EXPECT_EQ(direct->type, term == "promoted"
+        ? DocSet::BITSET : DocSet::ARRAY);
+  }
+  QueryPrep::disableDirectPostingsMaterializationForTests =
+      savedDirectDisable;
+}
+
 // "+a b" without scores: the optional clause is a pure score add under a
 // mandatory clause, so a non-scoring weight drops it - membership is
 // unchanged and the single-clause count() shortcut engages (Lucene's

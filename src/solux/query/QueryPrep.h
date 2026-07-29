@@ -16,6 +16,8 @@
 
 namespace solux::QueryPrep {
 
+inline bool disableDirectPostingsMaterializationForTests = false;
+
 inline uint32_t elapsedBuildMicros(
     std::chrono::steady_clock::time_point start) {
   auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -487,6 +489,11 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
   if (supplier != nullptr) {
     auto* bulk = supplier->bulkScorer(scratch);
     if (bulk != nullptr) {
+      if (domain == nullptr
+          && !disableDirectPostingsMaterializationForTests
+          && bulk->appendDocs(builder)) {
+        return builder.build();
+      }
       int64_t count = 0;
       for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
         int32_t next = bulk->countNextWindow(count, &builder, domain, cursor, segment.maxDoc());
