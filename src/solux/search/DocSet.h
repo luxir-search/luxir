@@ -164,19 +164,61 @@ public:
 
 };
 
-/// Forward membership probe over a DocSet with the representation resolved
-/// once, replacing per-doc virtual DocSet::get() in scan loops. BITSET probes
-/// are stateless word tests. ARRAY probes gallop from the previous landing, so
-/// an ascending scan costs O(log gap) per probe on warm lines instead of a
-/// full binary search; a descending probe restarts from the array base -
-/// correct, just slower. A null set accepts every doc. The cursor is private
-/// probe state: DocSets stay shared and immutable, so create one probe per
-/// scan, never share one across concurrent consumers.
-class DocSetProbe {
-  const uint64_t* words = nullptr;
-  const int32_t* base = nullptr;  // null means no set: accept every doc.
+/// Galloping membership cursor over a sorted doc array. Probes gallop from
+/// the previous landing, so an ascending scan costs O(log gap) per probe on
+/// warm lines instead of a full binary search; a descending probe restarts
+/// from the array base - correct, just slower. An empty (or default) probe
+/// rejects every doc. The cursor is private to one scan: the underlying set
+/// stays shared and immutable, so never share a probe across concurrent
+/// consumers. Use directly when the set type is statically known; DocSetProbe
+/// wraps one for the dynamic case.
+class ArrDocSetProbe {
+  const int32_t* base = nullptr;
   const int32_t* lo = nullptr;
   const int32_t* hi = nullptr;
+
+public:
+  ArrDocSetProbe() = default;
+
+  explicit ArrDocSetProbe(const ArrDocSet& set) {
+    reset(set);
+  }
+
+  explicit ArrDocSetProbe(std::span<const int32_t> docs) {
+    reset(docs);
+  }
+
+  void reset(const ArrDocSet& set) {
+    reset(set.docs());
+  }
+
+  void reset(std::span<const int32_t> docs) {
+    base = lo = docs.data();
+    hi = base + docs.size();
+  }
+
+  /// Bound to an array? ArrDocSet storage is never null, so binding one
+  /// always answers true - including an empty set, which rejects every doc.
+  bool bound() const {
+    return base != nullptr;
+  }
+
+  bool get(int32_t doc) {
+    // lo[-1] < doc means lower_bound(doc) >= lo, so the cursor still applies
+    // even when this probe is below the previous one.
+    const int32_t* start = (lo == base || lo[-1] < doc) ? lo : base;
+    lo = screaming::gallopLowerBound(start, hi, doc);
+    return lo != hi && *lo == doc;
+  }
+};
+
+/// Forward membership probe over a DocSet with the representation resolved
+/// once, replacing per-doc virtual DocSet::get() in scan loops: BITSET
+/// probes become stateless word tests, ARRAY probes go through an
+/// ArrDocSetProbe cursor. A null set accepts every doc.
+class DocSetProbe {
+  const uint64_t* words = nullptr;
+  ArrDocSetProbe arr;
 
 public:
   DocSetProbe() = default;  // accepts everything, like a null DocSet
@@ -187,19 +229,15 @@ public:
 
   void reset(const DocSet* set) {
     words = nullptr;
-    base = lo = hi = nullptr;
+    arr = ArrDocSetProbe();
     if (set == nullptr) {
       return;
     }
     if (set->type == DocSet::BITSET) {
       words = ((const BitDocSet*) set)->bits().words;
     } else {
-      // An empty ArrDocSet still has non-null storage (normalized in its
-      // ctor), keeping it distinct from the null-set sentinel above.
-      std::span<const int32_t> docs = ((const ArrDocSet*) set)->docs();
-      base = lo = docs.data();
-      hi = base + docs.size();
-      assert(base != nullptr);
+      arr.reset(*(const ArrDocSet*) set);
+      assert(arr.bound());
     }
   }
 
@@ -207,14 +245,10 @@ public:
     if (words != nullptr) {
       return (words[(uint32_t) doc >> 6] >> (doc & 63)) & 1;
     }
-    if (base == nullptr) {
-      return true;
+    if (!arr.bound()) {
+      return true;  // no set
     }
-    // lo[-1] < doc means lower_bound(doc) >= lo, so the cursor still applies
-    // even when this probe is below the previous one.
-    const int32_t* start = (lo == base || lo[-1] < doc) ? lo : base;
-    lo = screaming::gallopLowerBound(start, hi, doc);
-    return lo != hi && *lo == doc;
+    return arr.get(doc);
   }
 };
 
