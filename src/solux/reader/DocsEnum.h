@@ -37,6 +37,12 @@ protected:
   bool hasFreqs;
   bool hasPositions;
   bool hasNorms;
+  // uint8_t currentL1PackedBlocks = 0;
+  // The per-group packed-block count is one byte in every L1 group header,
+  // right after the vint15 lastDoc delta and vlong15 group byte length. The
+  // skip paths length-skip headers without parsing, so nothing reads it on
+  // a plain cursor today; reinstate this field and parse it there if a
+  // cursor-level consumer appears. readGroupImpacts() already surfaces it.
   int32_t docfreq;
   int64_t ttf;
   int64_t docsSize;
