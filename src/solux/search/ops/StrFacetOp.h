@@ -1082,7 +1082,7 @@ public:
       std::vector<std::pair<std::string, char*>> valVec;
       auto& counts = mergedData->counts.map;
       for (auto& [key, val] : counts) {
-        int64_t count = *(int64_t*)val;
+        int64_t count = loadUnaligned<int64_t>(val);
         if (minCount == -1 || count >= minCount) {
           valVec.emplace_back(key, val);
         }
@@ -1090,8 +1090,10 @@ public:
       auto missing_count = mergedData->missing_num;
       if (thisOp().fieldFacet.sorts.empty()) {
         std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
-          if (*(int64_t*)a.second != *(int64_t*)b.second ) {
-            return *(int64_t*)a.second > *(int64_t*)b.second;
+          auto acount = loadUnaligned<int64_t>(a.second);
+          auto bcount = loadUnaligned<int64_t>(b.second);
+          if (acount != bcount) {
+            return acount > bcount;
           }
           return a.first < b.first;
         });
@@ -1127,7 +1129,7 @@ public:
       int64_t* countArr = build::allocArray(facetResultProto.counts, n, mr);
       for (size_t i = 0; i < n; i++) {
         ids[i] = build::arenaStr(mr, valVec[i].first);  // copy the (transient) string into the arena
-        countArr[i] = *(int64_t*)valVec[i].second;
+        countArr[i] = loadUnaligned<int64_t>(valVec[i].second);
       }
       if (missing) {
         facetResultProto.missing = missing_count;

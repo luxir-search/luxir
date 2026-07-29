@@ -10,7 +10,7 @@
 
 namespace solux {
 
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class segdoc {
   // docid must come first in little-endian for it to make up the low bytes of the int64_t
   int32_t docid;
@@ -40,7 +40,7 @@ public:
     return std::bit_cast<int64_t>(*this) - std::bit_cast<int64_t>(other);
   }
 
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 
 
@@ -49,11 +49,11 @@ class TopDocsCollector {
   public:
 
   // Having this packed helped both memory and CPU (presumably better cache hits?)
-  SOLUX_PACKED_START
+  SOLUX_UNALIGNED_START
   struct ScoreDoc {
     float score;
     segdoc doc;
-  } SOLUX_PACKED_END;
+  } SOLUX_UNALIGNED_END;
 
 
   int64_t hitCount = 0;

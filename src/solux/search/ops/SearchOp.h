@@ -208,6 +208,11 @@ public:
 
 };
 
+// Maps a bucket key to a byte-packed entry carved out of `pool`:
+//   [int64 doc count][one variable-size blob per inline calculator]
+// Entries start wherever the previous one ended, so nothing in an entry can be
+// assumed aligned - go through load/storeUnaligned here, and declare
+// calculator entry structs SOLUX_UNALIGNED (see StatsOp::InlineCalc::Entry).
 template <typename Key>
 class FacetMap {
 public:
@@ -225,7 +230,7 @@ public:
       auto ptr = pool.reserve(sizeof(int64_t));
       int space = (int)pool.spaceLeft();
       auto start = ptr;
-      *(int64_t*)ptr = 1;
+      storeUnaligned<int64_t>(ptr, 1);
       space -= sizeof(int64_t);
       ptr += sizeof(int64_t);
       for (auto* calc : calcs) {
@@ -249,7 +254,7 @@ public:
       unused(allocated);
     } else {
       auto ptr = iter->second;
-      (*(int64_t*)ptr)++;
+      storeUnaligned<int64_t>(ptr, loadUnaligned<int64_t>(ptr) + 1);
       ptr += sizeof(int64_t);
       for (auto* calc : calcs) {
         auto calcSpace = calc->update(ptr, docid);
@@ -266,7 +271,7 @@ public:
         auto ptr = pool.reserve(sizeof(int64_t));
         int space = (int)pool.spaceLeft();
         auto start = ptr;
-        *(int64_t*)ptr = *(int64_t*)otherPtr;
+        storeUnaligned<int64_t>(ptr, loadUnaligned<int64_t>(otherPtr));
         space -= sizeof(int64_t);
         ptr += sizeof(int64_t);
         otherPtr += sizeof(int64_t);
@@ -292,7 +297,7 @@ public:
         unused(allocated);
       } else {
         auto ptr = iter->second;
-        (*(int64_t*)ptr) += *(int64_t*)otherPtr;
+        storeUnaligned<int64_t>(ptr, loadUnaligned<int64_t>(ptr) + loadUnaligned<int64_t>(otherPtr));
         ptr += sizeof(int64_t);
         otherPtr += sizeof(int64_t);
         for (auto* calc : calcs) {
@@ -308,7 +313,7 @@ public:
   void finalize() {
     for (auto iter : map) {
       auto ptr = iter.second;
-      auto count = (*(int64_t*)ptr);
+      auto count = loadUnaligned<int64_t>(ptr);
       ptr += sizeof(int64_t);
       for (auto* calc : calcs) {
         auto calcSpace = calc->finalize(ptr, count);

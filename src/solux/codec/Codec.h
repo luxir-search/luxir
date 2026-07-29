@@ -68,7 +68,7 @@ public:
   ~SimpleCodec() override = default;
 
   void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override {
-    *reinterpret_cast<uint32_t*>(out) = inSz;
+    storeUnaligned<uint32_t>(out, inSz);
     memcpy(out+sizeof(uint32_t), in, inSz * sizeof(uint32_t));
     outSz = (inSz+1)*sizeof(uint32_t);
   }
@@ -76,7 +76,7 @@ public:
   // Hmmm, some codecs may be able to derive the size of the encoded data, and some may not!
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override {
     unused(inSz);
-    outSz = *reinterpret_cast<const uint32_t*>(in);
+    outSz = loadUnaligned<uint32_t>(in);
     assert((outSz+1)*sizeof(uint32_t) <= inSz);
     memcpy(out, in+sizeof(uint32_t), outSz*sizeof(uint32_t));
     return (outSz+1)*sizeof(uint32_t);

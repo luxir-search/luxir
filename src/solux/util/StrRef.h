@@ -454,7 +454,7 @@ public:
     // if (u.remote.size != other.u.remote.size) return false;
 
     // compare both size and hash code at once.
-    if (*(reinterpret_cast<const uint64_t *>(this)) != *(reinterpret_cast<const uint64_t *>(&other))) return false;
+    if (loadUnaligned<uint64_t>(this) != loadUnaligned<uint64_t>(&other)) return false;
 
     // at this point, either remote sizes match, or first 8 bytes of local sizes match.
     if (u.remote.ptr == other.u.remote.ptr)

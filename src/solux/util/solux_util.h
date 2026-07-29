@@ -33,28 +33,23 @@ template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
 
 
 
-// gcc and msvc have different ways of specifying packing of structs :-(
-// use SOLUX_PACKED_START class X{} SOLUX_PACKED_END;
-#ifdef __GNUC__
-#define SOLUX_PACKED(__Declaration__) __Declaration__ __attribute__((__packed__))
-#define SOLUX_PACKED_START ;
-#define SOLUX_PACKED_END __attribute__((__packed__))
-#endif
-
-#ifdef _MSC_VER
-#define SOLUX_PACKED( __Declaration__ ) __pragma( pack(push, 1) ) __Declaration__ __pragma( pack(pop))
-#define SOLUX_PACKED_START __pragma(pack(push,1))
-#define SOLUX_PACKED_END __pragma(pack(pop))
-#endif
-
-// For structs read straight out of a mapped file at an offset we do not
-// control.  aligned(1) tells the compiler the object may be unaligned, so it
-// emits loads that are safe for it; plain field access then compiles to the
-// same instructions a hand-written memcpy would, without materializing the
-// struct.  Layout is unchanged as long as members are already padded to their
-// natural offsets (assert the size), so aligning these on disk later is a
-// writer-side decision that needs no reader change.
+// Declares a struct with no internal padding whose objects may sit at any
+// address: mapped-file bytes at an offset we do not control, an entry carved
+// out of a MemPool, or an element of an array of the struct itself (packing
+// away the tail padding is exactly what puts the next element off-alignment).
+//
+// This tells the compiler alignof == 1, so it emits member accesses that are
+// safe for an unaligned object; plain field access then compiles to the same
+// instructions a hand-written memcpy would, without materializing the struct.
+// On gcc `packed` alone already implies alignof 1 and `aligned(1)` is
+// redundant; it is spelled out because the alignment, not the layout, is the
+// property callers depend on for correctness.  Layout is unchanged as long as
+// members are already padded to their natural offsets (assert the size), so
+// aligning these on disk later is a writer-side decision that needs no reader
+// change.
+//
 // use SOLUX_UNALIGNED_START struct X{} SOLUX_UNALIGNED_END;
+// gcc and msvc have different ways of spelling this :-(
 #ifdef __GNUC__
 #define SOLUX_UNALIGNED_START ;
 #define SOLUX_UNALIGNED_END __attribute__((__packed__, __aligned__(1)))
@@ -79,8 +74,11 @@ template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
 #  define SOLUX_RESTRICT
 #endif
 
-// Load a scalar from bytes that may be unaligned - mapped file data at an
-// offset we do not control.
+// Load/store a scalar through bytes that may be unaligned - mapped file data at
+// an offset we do not control, or a MemPool entry that starts wherever the
+// previous entry ended.  A plain `*(T*)p` on such bytes is UB even on x86:
+// nothing faults, but the compiler is entitled to assume alignof(T) and to
+// vectorize accordingly, and -fsanitize=alignment flags it.
 //
 // The obvious `T v; memcpy(&v, p, sizeof v); return v;` compiles to the same
 // single load once optimized, but it needs a local, and the local is not free
@@ -96,12 +94,21 @@ template <class T>
   typedef T __attribute__((__aligned__(1))) unaligned_t;
   return *reinterpret_cast<const unaligned_t*>(p);
 }
+template <class T>
+[[gnu::always_inline]] inline void storeUnaligned(void* p, T value) {
+  typedef T __attribute__((__aligned__(1))) unaligned_t;
+  *reinterpret_cast<unaligned_t*>(p) = value;
+}
 #else
 template <class T>
 SOLUX_INLINE inline T loadUnaligned(const void* p) {
   T value;
   memcpy(&value, p, sizeof(value));
   return value;
+}
+template <class T>
+SOLUX_INLINE inline void storeUnaligned(void* p, T value) {
+  memcpy(p, &value, sizeof(value));
 }
 #endif
 

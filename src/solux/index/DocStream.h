@@ -7,7 +7,7 @@
 namespace solux {
 
 /// List of documents (for docs-in-a-term, docs-with-value, etc)
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class DocStream {
 public:
   Stream stream;
@@ -100,9 +100,9 @@ public:
   // TODO: add a more specific PostingsConsumer that can communicate runs to a compressed bitset builder.
 
 
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class DocFreqStream {
 
 public:
@@ -143,7 +143,7 @@ public:
     }
   }
 }
-  SOLUX_PACKED_END;
+  SOLUX_UNALIGNED_END;
 
 // TODO: consider indexing payloads as separate type? (separate index options)
 // That would save 1 bit per position.
@@ -158,7 +158,7 @@ public:
 //   - How does hyperthreading (which can switch to a diff thread on a cache miss) play into this? My guess is we would
 //     want to avoid the contention.
 
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class alignas(1) DocFreqPosStream {
   Stream docs;
   Stream positions;
@@ -265,12 +265,12 @@ public:
                << ')';
   }
 }
-SOLUX_PACKED_END;
+SOLUX_UNALIGNED_END;
 
 
 
 // list of integers
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class IntStream {
 public:
   Stream storage;
@@ -333,10 +333,10 @@ public:
   }
 
 
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class IntDeltaStream {
 public:
   Stream storage;
@@ -372,10 +372,10 @@ public:
       sink(val);
     }
   }
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 // list of integers
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class LongStream {
 public:
   Stream storage;
@@ -421,7 +421,7 @@ public:
 
 
 
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 
 

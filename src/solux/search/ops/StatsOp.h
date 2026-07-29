@@ -192,6 +192,9 @@ public:
     // Named Entry (not entry): the InlineCalculator methods take a parameter
     // named "entry" that would shadow the type, silently turning
     // sizeof(Entry) into sizeof(void*).
+    // UNALIGNED: entries are byte-packed into the FacetMap pool at whatever
+    // offset the previous entry ended on, so `(Entry*)entry` is not 8-aligned.
+    SOLUX_UNALIGNED_START
     struct Entry {
       // AVG: val is the running decoded sum (finalize turns it into the average).
       // MIN/MAX: bits is the running extreme in raw sortable-encoded form; the
@@ -205,7 +208,7 @@ public:
       // bucket's doc count: docs can be missing the field or carry multiple
       // values); 0 marks an empty bucket, which emits NaN.
       int64_t count;
-    };
+    } SOLUX_UNALIGNED_END;
 
     std::optional<IntColReader> intColReader;
     std::optional<IntColReader::Iterator> intColIter;

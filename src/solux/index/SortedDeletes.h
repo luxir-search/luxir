@@ -14,7 +14,7 @@ namespace solux {
 /// Entry stored in the TermValHash for the id field.
 /// Each unique id maps to exactly one document and its version.
 /// For explicit delete-by-id entries, docId is -1.
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 struct IdEntry {
   int32_t docId;
   uint64_t version;
@@ -24,7 +24,7 @@ struct IdEntry {
   friend std::ostream& operator<<(std::ostream& out, const IdEntry& e) {
     return out << "(doc=" << e.docId << " ver=" << e.version << ")";
   }
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 
 /// A sorted list of (id, version) pairs for applying deletes to segments.

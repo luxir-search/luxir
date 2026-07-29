@@ -24,7 +24,7 @@ class END {
 
 // Hmmm, when there are 3 streams together, it would be better coded as
 // ptr,ptr,ptr,len,len,len to avoid extra padding!  termdoc, termpos
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 class Stream {
 public:
 
@@ -133,9 +133,11 @@ public:
       char *newPointer = pool.ptr(blockAddr);  // TODO: what about a version that returns pointer and the block address
       // move last 4 bytes to new area... we do this in one chunk using an integer.
       // this works for both both little endian and big endian since we're only moving.
-      uint32_t *lastWord = reinterpret_cast<uint32_t *>(ptr_ - 4);
-      *reinterpret_cast<uint32_t *>(newPointer) = *lastWord;
-      *lastWord = blockAddr;  // point to the new area with the last 4 bytes of the old area
+      // Slices start wherever the previous pool allocation ended, so none of
+      // these 4-byte accesses can assume alignment.
+      char *lastWord = ptr_ - 4;
+      storeUnaligned<uint32_t>(newPointer, loadUnaligned<uint32_t>(lastWord));
+      storeUnaligned<uint32_t>(lastWord, blockAddr);  // point to the new area with the last 4 bytes of the old area
       // TODO: this can alias bbStart_... is there anything we can do before reading bbStart_ to ensure this write is seen?
       // NOTE: we never read bbStart_ during the inversion phase of indexing, only when flushing.
 
@@ -195,7 +197,7 @@ public:
   }
 
 }
-  SOLUX_PACKED_END;
+  SOLUX_UNALIGNED_END;
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -247,7 +249,7 @@ public:
       } else {
         // follow the next link in the chain
         remaining_ -= (sliceSize_ - 4);
-        uint32_t bbptr = *reinterpret_cast<const uint32_t *>(ptr_);
+        uint32_t bbptr = loadUnaligned<uint32_t>(ptr_);
         initFromBBPointer(bbptr);
       }
     }

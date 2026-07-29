@@ -33,7 +33,7 @@ namespace solux {
 /// it back out.  Packed so the byte layout is the struct declaration, with no
 /// implicit padding.  Native endianness: aux entries are rebuilt from the
 /// segments they describe, never shipped between hosts.
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 struct VectorAuxMeta {
   int32_t dims = 0;
   int32_t metric = 0;       // raw solux::api::VectorMetric value
@@ -67,7 +67,7 @@ struct VectorAuxMeta {
     }
     return meta;
   }
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 /// Default IVF coarse-list count for n vectors: the sqrt(n) rule clamped to
 /// [1, 4096].  Single source of truth for both the builder's per-segment
@@ -101,7 +101,7 @@ static_assert(sizeof(VectorAuxMeta) == 8 * sizeof(int32_t),
 ///
 /// Native endianness, same contract as VectorAuxMeta: aux files are rebuilt
 /// from the segments they describe, never shipped between hosts.
-SOLUX_PACKED_START
+SOLUX_UNALIGNED_START
 struct VectorAuxListsFooter {
   int64_t faissHeaderBytes = 0;
   int64_t nlist = 0;
@@ -163,7 +163,7 @@ struct VectorAuxListsFooter {
     }
     return f;
   }
-} SOLUX_PACKED_END;
+} SOLUX_UNALIGNED_END;
 
 static_assert(sizeof(VectorAuxListsFooter) == 4 * sizeof(int64_t) + 2 * sizeof(int32_t),
               "VectorAuxListsFooter layout is an on-disk contract");

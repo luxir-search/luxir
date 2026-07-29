@@ -92,7 +92,7 @@ public:
   // read signed 4 byte little endian integer
   int32_t readInt() {
     assert(pos + sizeof(uint32_t) <= end);
-    uint32_t val = *(uint32_t*)pos; // potentially unaligned read
+    uint32_t val = loadUnaligned<uint32_t>(pos);
     pos += sizeof(uint32_t);
     return val;
   }
@@ -100,7 +100,7 @@ public:
   // read signed 8 byte little endian integer
   int64_t readLong() {
     assert(pos + sizeof(uint64_t) <= end);
-    int64_t val = *(int64_t*)pos; // potentially unaligned read
+    int64_t val = loadUnaligned<int64_t>(pos);
     pos += sizeof(int64_t);
     return val;
   }
