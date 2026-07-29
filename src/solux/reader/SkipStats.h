@@ -136,6 +136,7 @@ struct SkipStats {
   static inline int64_t disjCountIdentityProhibitedFallbacks = 0;
   static inline int64_t disjCountIdentityProfitabilityFallbacks = 0;
   static inline int64_t filteredDisjBatchEngagements = 0;
+  static inline int64_t filteredDisjBatchPostingsFeedEngagements = 0;
   static inline int64_t filteredDisjBatchCountWindows = 0;
   static inline int64_t filteredDisjBatchScoreWindows = 0;
   static inline int64_t filteredDisjBatchMatchWindows = 0;
@@ -147,6 +148,7 @@ struct SkipStats {
   static inline int64_t filteredConjBatchScoreWindows = 0;
   static inline int64_t exactCountTopKCompositions = 0;
   static inline int64_t exactCountTopKProfitabilityRejects = 0;
+  static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
   static inline int64_t exactCountTopKBulkFallbacks = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
@@ -298,6 +300,7 @@ struct SkipStats {
     disjCountIdentityProhibitedFallbacks = 0;
     disjCountIdentityProfitabilityFallbacks = 0;
     filteredDisjBatchEngagements = 0;
+    filteredDisjBatchPostingsFeedEngagements = 0;
     filteredDisjBatchCountWindows = 0;
     filteredDisjBatchScoreWindows = 0;
     filteredDisjBatchMatchWindows = 0;
@@ -309,6 +312,7 @@ struct SkipStats {
     filteredConjBatchScoreWindows = 0;
     exactCountTopKCompositions = 0;
     exactCountTopKProfitabilityRejects = 0;
+    exactCountTopKSparseFilterSinglePassRejects = 0;
     exactCountTopKBulkFallbacks = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;

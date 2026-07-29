@@ -366,10 +366,26 @@ public:
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class ScorerSupplier {
   public:
+    struct ExactCountTopKCosts {
+      int64_t filter = -1;
+      int64_t unionSide = -1;
+
+      bool available() const noexcept {
+        return filter >= 0 && unionSide >= 0;
+      }
+    };
+
     /// Estimated number of matching docs in this segment. This should be cheap
     /// to compute; an upper bound is safe. Compound suppliers use it to choose
     /// lead iterators before creating scorers.
     virtual int64_t cost() = 0;
+
+    /// Separately estimated filter and union costs for exact-count top-k
+    /// composition. The default means this supplier does not expose that
+    /// decomposition.
+    virtual ExactCountTopKCosts exactCountTopKCosts() {
+      return {};
+    }
 
     /// Create the scorer. leadCost is the estimated cost of the parent-selected
     /// lead iterator that will drive this scorer, or INT64_MAX when there is no

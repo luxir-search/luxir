@@ -110,6 +110,37 @@ public:
   }
 };
 
+class SparseExactCountSinglePassGuard {
+  bool savedDisabled;
+  int32_t savedDensityInverse;
+
+public:
+  SparseExactCountSinglePassGuard(
+      bool disabled, int32_t densityInverse =
+          TopDocsReq::
+              kExactCountTopKSparseFilterSinglePassDensityInverse)
+    : savedDisabled(
+          TopDocsReq::
+              disableExactCountTopKSparseFilterSinglePassForTests),
+      savedDensityInverse(
+          TopDocsReq::
+              exactCountTopKSparseFilterSinglePassDensityInverseForTests) {
+    TopDocsReq::disableExactCountTopKSparseFilterSinglePassForTests =
+        disabled;
+    TopDocsReq::
+        exactCountTopKSparseFilterSinglePassDensityInverseForTests =
+            densityInverse;
+  }
+
+  ~SparseExactCountSinglePassGuard() {
+    TopDocsReq::disableExactCountTopKSparseFilterSinglePassForTests =
+        savedDisabled;
+    TopDocsReq::
+        exactCountTopKSparseFilterSinglePassDensityInverseForTests =
+            savedDensityInverse;
+  }
+};
+
 class SparseFilteredTopKRerouteGuard {
   bool savedDisabled;
   std::array<int32_t, 3> savedDensityInverse;
@@ -255,6 +286,7 @@ struct FilteredCountResult {
   int64_t docsOnlyWordProbeAdvances;
   int64_t tfreqBlocksDecoded;
   int64_t filteredDisjBatchEngagements;
+  int64_t filteredDisjBatchPostingsFeedEngagements;
   int64_t filteredDisjBatchCountWindows;
   int64_t filteredDisjBatchScoreWindows;
   int64_t filteredConjBatchCountWindows;
@@ -300,6 +332,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::docsOnlyWordProbeAdvances,
     SkipStats::tfreqBlocksDecoded,
     SkipStats::filteredDisjBatchEngagements,
+    SkipStats::filteredDisjBatchPostingsFeedEngagements,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
     SkipStats::filteredConjBatchCountWindows,
@@ -328,6 +361,7 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
     SkipStats::docsOnlyWordProbeAdvances,
     SkipStats::tfreqBlocksDecoded,
     SkipStats::filteredDisjBatchEngagements,
+    SkipStats::filteredDisjBatchPostingsFeedEngagements,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
     SkipStats::filteredConjBatchCountWindows,
@@ -1653,9 +1687,11 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
     auto cold = runFilteredCount(
         soluxNode->getSearchEngine(), FilteredCountShape::UNION, "selected",
         FilteredCountPath::FOLDED, collection);
-    EXPECT_EQ(1, cold.ownedFilterMaterializations);
-    EXPECT_GT(cold.ownedFilterServes, cold.ownedFilterMaterializations);
+    EXPECT_EQ(0, cold.ownedFilterMaterializations);
+    EXPECT_EQ(0, cold.ownedFilterServes);
     EXPECT_GT(cold.filteredDisjBatchEngagements, 0);
+    EXPECT_GT(
+        cold.filteredDisjBatchPostingsFeedEngagements, 0);
     runFilteredCount(soluxNode->getSearchEngine(),
                      FilteredCountShape::UNION, "selected",
                      FilteredCountPath::FOLDED, collection);
@@ -1791,7 +1827,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
   };
 
   Result cold = run(false);
-  EXPECT_EQ(1, cold.ownedMaterializations);
+  EXPECT_EQ(0, cold.ownedMaterializations);
   run(false);
   Result routed = run(false);
   Result bodyBulk = run(true);
@@ -1803,34 +1839,43 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
   EXPECT_LE(routed.phraseVerifies, 9);
 }
 
-TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
+TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   constexpr std::string_view collection = "exact_count_topk_composition";
   constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
   CollectionHelper helper(collection);
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
-    std::string body;
-    if ((doc & 1) == 0) body += "alpha ";
-    if ((doc % 3) != 0) body += "beta ";
-    body += "filler";
+    std::string body = "filler";
+    if (doc < 30) body += " alpha";
+    if (doc >= 30 && doc < 60) body += " beta";
+    std::string filter;
+    if (doc < 40) filter += "sparse ";
+    if (doc < 60) filter += "equal";
     docs.push_back(flatdoc(
         "id", "compose_" + std::to_string(doc),
         "body_w", body,
-        "filter_w", (doc % 400) == 0 ? "selected" : "other"));
+        "filter_w", filter.empty() ? "other" : filter));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_GE(40, nDocs
+      / TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
+  ASSERT_LE(40, nDocs
+      / TopDocsReq::
+          kExactCountTopKSparseFilterSinglePassDensityInverse);
 
   struct Result {
     std::vector<std::string> ids;
     std::map<std::string, float> scores;
     int64_t count;
     int64_t compositions;
-    int64_t ownedMaterializations;
-    int64_t ownedServes;
+    int64_t sparseSinglePassRejects;
   };
-  auto run = [&](bool disabled) {
-    TopKCountCompositionGuard compositionGuard(disabled, 512);
+  auto run = [&](std::string_view filter, bool disableSparseDecision) {
+    TopKCountCompositionGuard compositionGuard(
+        false, TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
+    SparseExactCountSinglePassGuard sparseGuard(
+        disableSparseDecision);
     auto req = localReq(soluxNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
@@ -1838,7 +1883,7 @@ TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
     cur.rawQuery() = qb::boolean(cur.mr(), {},
         {qb::match(cur.mr(), "body_w", "alpha"),
          qb::match(cur.mr(), "body_w", "beta")});
-    cur.matchFilter("filter", "filter_w", "selected");
+    cur.matchFilter("filter", "filter_w", filter);
     SkipStatsGuard statsGuard;
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -1847,22 +1892,24 @@ TEST_F(SearchEngineTest, exactCountTopKComposesCountAndPrunedRanking) {
       resultScoreMap(*req, "q"),
       req->getMatchCount("q"),
       SkipStats::exactCountTopKCompositions,
-      SkipStats::ownedFilterMaterializations,
-      SkipStats::ownedFilterServes,
+      SkipStats::exactCountTopKSparseFilterSinglePassRejects,
     };
   };
 
-  Result cold = run(false);
-  EXPECT_EQ(1, cold.ownedMaterializations);
-  EXPECT_GT(cold.ownedServes, cold.ownedMaterializations);
-  run(false);
-  Result composed = run(false);
-  Result exhaustive = run(true);
-  EXPECT_EQ(exhaustive.count, composed.count);
-  EXPECT_EQ(exhaustive.ids, composed.ids);
-  EXPECT_EQ(exhaustive.scores, composed.scores);
-  EXPECT_GT(composed.compositions, 0);
-  EXPECT_EQ(0, exhaustive.compositions);
+  Result singlePass = run("sparse", false);
+  Result forcedComposition = run("sparse", true);
+  EXPECT_EQ(forcedComposition.count, singlePass.count);
+  EXPECT_EQ(forcedComposition.ids, singlePass.ids);
+  EXPECT_EQ(forcedComposition.scores, singlePass.scores);
+  EXPECT_EQ(0, singlePass.compositions);
+  EXPECT_GT(singlePass.sparseSinglePassRejects, 0);
+  EXPECT_GT(forcedComposition.compositions, 0);
+  EXPECT_EQ(0, forcedComposition.sparseSinglePassRejects);
+
+  Result equalCosts = run("equal", false);
+  EXPECT_EQ(60, equalCosts.count);
+  EXPECT_GT(equalCosts.compositions, 0);
+  EXPECT_EQ(0, equalCosts.sparseSinglePassRejects);
 }
 
 TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {

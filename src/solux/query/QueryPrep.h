@@ -17,6 +17,9 @@
 namespace solux::QueryPrep {
 
 inline bool disableDirectPostingsMaterializationForTests = false;
+// A/B toggle: restore request-local sparse batch materialization on cache
+// bypass instead of preserving the postings supplier as the gather feed.
+inline bool disableSparseBatchPostingsFeedForTests = false;
 
 inline uint32_t elapsedBuildMicros(
     std::chrono::steady_clock::time_point start) {
@@ -463,6 +466,8 @@ public:
 
   int64_t cost() override { return docs == nullptr ? 0 : (int64_t)docs->card(); }
 
+  DocSet* docSet() const { return docs; }
+
   Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
     unused(leadCost);
     return createDocSetScorer(targetPool, docs, segment);
@@ -739,9 +744,9 @@ inline Query::ScorerSupplier* filterSupplier(
   // side wants the DocSet candidate vector, while the dense side retains the
   // existing cached mask. Exhaustive mode bypasses the pruning-based density
   // policy so exact collection can use a cached DocSet in conjunction
-  // planning. On cache misses, only the measured very-sparse side of
-  // SPARSE_BATCH adopts a request value; the other modes retain postings.
-  // Sparse entries also populate through facet/domain consumers.
+  // planning. On cache bypass, SPARSE_BATCH retains postings for the batch
+  // gatherer; admitted cache builds still publish a DocSet, and cache hits
+  // borrow one. Sparse entries also populate through facet/domain consumers.
   auto* uncached = source.scorerSupplier(targetPool, segment);
   if (uncached == nullptr) return nullptr;
   int64_t cost = uncached->cost();
@@ -767,6 +772,10 @@ inline Query::ScorerSupplier* filterSupplier(
     use->publishRaw(
         (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
   } else {
+    if (mode == FilterSupplierMode::SPARSE_BATCH
+        && !disableSparseBatchPostingsFeedForTests) {
+      return uncached;
+    }
     if (!shouldOwnFilterValue(
             mode, cost, segment.maxDoc(), sparseBatchDensityInverse)) {
       return uncached;

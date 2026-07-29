@@ -415,6 +415,9 @@ public:
   // A/B toggle: keep exact filtered term disjunctions on their previous
   // conjunction/pull routes instead of batching cached-DocSet candidates.
   static inline bool disableFilteredDisjunctionBatchForTests = false;
+  // A/B toggle: retain virtual DocSet scorer iteration instead of consuming
+  // an array-backed filter's sorted span directly.
+  static inline bool disableFilteredDisjunctionArrayFeedForTests = false;
   // A/B toggle: keep exact scored filtered term conjunctions on their
   // body-led mask or pull routes instead of batching from a cached DocSet.
   static inline bool disableFilteredConjunctionBatchForTests = false;
@@ -1050,6 +1053,21 @@ public:
         return compositeCost(pool, segment, mandatorySources, optionalSources, filterSuppliers, minShouldMatch);
       }
 
+      Query::ScorerSupplier::ExactCountTopKCosts
+      exactCountTopKCosts() override {
+        if (!mandatorySources.empty() || optionalSources.size() < 2
+            || !prohibitedSources.empty() || filterSuppliers.size() != 1
+            || filterSuppliers[0] == nullptr || minShouldMatch != 1) {
+          return {};
+        }
+        return {
+          filterSuppliers[0]->cost(),
+          optionalCost(
+              pool, segment, optionalSources, minShouldMatch,
+              segment.maxDoc())
+        };
+      }
+
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         return assembleScorer(targetPool, segment, mandatorySources,
                               mandatoryScores, optionalSources,
@@ -1383,23 +1401,40 @@ public:
             || minShouldMatch != 1) {
           return nullptr;
         }
-        auto* filterSupplier =
-            dynamic_cast<QueryPrep::DocSetSupplier*>(filterSuppliers[0]);
-        if (filterSupplier == nullptr) {
-          skipCount(SkipStats::filteredDisjBatchNonDocSetFallbacks);
-          return nullptr;
-        }
+        auto* filterSupplier = filterSuppliers[0];
         int64_t filterCost = filterSupplier->cost();
-        int32_t densityInverse =
-            filteredDisjunctionBatchDensityInverseForTests;
+        int32_t densityInverse = needsScores
+            ? filteredDisjunctionBatchDensityInverseForTests
+            : QueryPrep::kSparseBatchCountOwnDensityInverse;
         if (densityInverse <= 0
             || filterCost > segment.maxDoc() / densityInverse) {
           skipCount(SkipStats::filteredDisjBatchDensityFallbacks);
           return nullptr;
         }
 
-        auto* filterScorer = filterSupplier->get(targetPool, filterCost);
-        if (filterScorer == nullptr) {
+        Query::Scorer* filterScorer = nullptr;
+        std::span<const int32_t> filterDocs;
+        bool postingsFeed = false;
+        if (auto* docSetSupplier =
+                dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
+          DocSet* docs = docSetSupplier->docSet();
+          if (docs == nullptr || docs->card() == 0) {
+            return nullptr;
+          }
+          if (!disableFilteredDisjunctionArrayFeedForTests
+              && docs->type == DocSet::ARRAY) {
+            filterDocs = ((ArrDocSet*) docs)->docs();
+          } else {
+            filterScorer = filterSupplier->get(targetPool, filterCost);
+          }
+        } else if (!QueryPrep::
+                       disableSparseBatchPostingsFeedForTests) {
+          auto* scorer = filterSupplier->get(targetPool, filterCost);
+          filterScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
+          postingsFeed = filterScorer != nullptr;
+        }
+        if (filterScorer == nullptr && filterDocs.empty()) {
+          skipCount(SkipStats::filteredDisjBatchNonDocSetFallbacks);
           return nullptr;
         }
         struct TermEntry {
@@ -1443,7 +1478,8 @@ public:
           termScorers[i] = entries[i].scorer;
         }
         return targetPool.make<BooleanQuery::DocSetDisjunctionBulkScorer>(
-            targetPool, filterScorer, termScorers, segment.maxDoc());
+            targetPool, filterScorer, filterDocs, termScorers,
+            segment.maxDoc(), postingsFeed);
       }
 
       BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
@@ -6114,16 +6150,18 @@ public:
     static constexpr int32_t kMatchWords = (kBatchSize + 63) >> 6;
 
     Query::Scorer* filterScorer;
+    std::span<const int32_t> filterDocs;
     std::span<TermQuery::Scorer*> termScorers;
     std::span<uint64_t> matchedWords;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
     int32_t maxDoc;
     int32_t nextFilterDoc = -1;
+    size_t nextFilterIndex = 0;
     int32_t candidateCount = 0;
 
-    int32_t gatherCandidates(DocSet* externalFilter, int32_t min,
-                             int32_t max) {
+    int32_t gatherScorerCandidates(DocSet* externalFilter, int32_t min,
+                                   int32_t max) {
       int32_t doc = nextFilterDoc;
       if (doc < min) {
         doc = filterScorer->docId();
@@ -6141,6 +6179,45 @@ public:
       nextFilterDoc = doc;
       return doc >= max || doc >= maxDoc
           ? PostingsReader::END : doc;
+    }
+
+    int32_t gatherArrayCandidates(DocSet* externalFilter, int32_t min,
+                                  int32_t max) {
+      const int32_t* begin = filterDocs.data() + nextFilterIndex;
+      const int32_t* end = filterDocs.data() + filterDocs.size();
+      if (begin != end && *begin < min) {
+        begin = screaming::gallopLowerBound(begin, end, min);
+      }
+      int32_t upTo = std::min(max, maxDoc);
+      const int32_t* rangeEnd =
+          screaming::gallopLowerBound(begin, end, upTo);
+      candidateCount = 0;
+      if (externalFilter == nullptr) {
+        int32_t count = std::min(
+            (int32_t) (rangeEnd - begin), kBatchSize);
+        std::copy_n(begin, count, outDocs.begin());
+        candidateCount = count;
+        begin += count;
+      } else {
+        while (begin != rangeEnd && candidateCount < kBatchSize) {
+          int32_t doc = *begin++;
+          if (externalFilter->get(doc)) {
+            outDocs[(size_t) candidateCount++] = doc;
+          }
+        }
+      }
+      nextFilterIndex = (size_t) (begin - filterDocs.data());
+      if (begin == end || (begin != end && *begin >= upTo)) {
+        return PostingsReader::END;
+      }
+      return *begin;
+    }
+
+    int32_t gatherCandidates(DocSet* externalFilter, int32_t min,
+                             int32_t max) {
+      return filterDocs.empty()
+          ? gatherScorerCandidates(externalFilter, min, max)
+          : gatherArrayCandidates(externalFilter, min, max);
     }
 
     void fillMatches(bool withScores) {
@@ -6234,14 +6311,21 @@ public:
 
   public:
     DocSetDisjunctionBulkScorer(MemPool& pool, Query::Scorer* filterScorer,
+                                std::span<const int32_t> filterDocs,
                                 std::span<TermQuery::Scorer*> termScorers,
-                                int32_t maxDoc)
-        : filterScorer(filterScorer), termScorers(termScorers),
+                                int32_t maxDoc, bool postingsFeed)
+        : filterScorer(filterScorer), filterDocs(filterDocs),
+          termScorers(termScorers),
           matchedWords(pool.make_span<uint64_t>((size_t) kMatchWords)),
           outDocs(pool.make_span<int32_t>((size_t) kBatchSize)),
           outScores(pool.make_span<float>((size_t) kBatchSize)),
           maxDoc(maxDoc) {
+      assert((filterScorer == nullptr) != filterDocs.empty());
       skipCount(SkipStats::filteredDisjBatchEngagements);
+      if (postingsFeed) {
+        skipCount(
+            SkipStats::filteredDisjBatchPostingsFeedEngagements);
+      }
     }
 
     bool supportsMatchWindows() const override {

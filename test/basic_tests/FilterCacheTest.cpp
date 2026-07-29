@@ -97,6 +97,34 @@ public:
   }
 };
 
+class SparseBatchPostingsFeedGuard {
+  bool saved;
+
+public:
+  explicit SparseBatchPostingsFeedGuard(bool disabled)
+    : saved(QueryPrep::disableSparseBatchPostingsFeedForTests) {
+    QueryPrep::disableSparseBatchPostingsFeedForTests = disabled;
+  }
+
+  ~SparseBatchPostingsFeedGuard() {
+    QueryPrep::disableSparseBatchPostingsFeedForTests = saved;
+  }
+};
+
+class FilteredDisjunctionArrayFeedGuard {
+  bool saved;
+
+public:
+  explicit FilteredDisjunctionArrayFeedGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredDisjunctionArrayFeedForTests) {
+    BooleanQuery::disableFilteredDisjunctionArrayFeedForTests = disabled;
+  }
+
+  ~FilteredDisjunctionArrayFeedGuard() {
+    BooleanQuery::disableFilteredDisjunctionArrayFeedForTests = saved;
+  }
+};
+
 class OwnedFilterStatsGuard {
   bool saved;
 
@@ -903,7 +931,7 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
   EXPECT_EQ(1u, counters.hits);
 }
 
-TEST(FilterCacheTest, disabledCacheStillOwnsOneRequestValue) {
+TEST(FilterCacheTest, disabledCacheSparseBatchRetainsPostingsFeed) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
@@ -929,21 +957,23 @@ TEST(FilterCacheTest, disabledCacheStillOwnsOneRequestValue) {
   auto* first = QueryPrep::filterSupplier(
       firstPool, *weight, nullptr, use, *reader, reader->segments()[0],
       QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
-  ASSERT_NE(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(first));
-  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
-  EXPECT_EQ(1, SkipStats::ownedFilterServes);
+  ASSERT_NE(nullptr, first);
+  EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(first));
+  EXPECT_EQ(0, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(0, SkipStats::ownedFilterServes);
 
   auto before = reader->filterCache()->counters();
   MemPool secondPool;
   auto* second = QueryPrep::filterSupplier(
       secondPool, *weight, nullptr, use, *reader, reader->segments()[0],
       QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
-  ASSERT_NE(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(second));
-  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
-  EXPECT_EQ(2, SkipStats::ownedFilterServes);
-  EXPECT_EQ(before.misses, reader->filterCache()->counters().misses);
+  ASSERT_NE(nullptr, second);
+  EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(second));
+  EXPECT_EQ(0, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(0, SkipStats::ownedFilterServes);
+  EXPECT_EQ(reader->filterCache()->counters().misses, before.misses);
 
-  FilterOwnGuard disabled(true);
+  SparseBatchPostingsFeedGuard disabledFeed(true);
   MemPool disabledContextPool;
   Query::Context disabledContext(disabledContextPool, *reader);
   auto* disabledWeight = selected.createWeight(disabledContext, 0);
@@ -953,9 +983,124 @@ TEST(FilterCacheTest, disabledCacheStillOwnsOneRequestValue) {
       disabledExecPool, *disabledWeight, nullptr, disabledUse, *reader,
       reader->segments()[0],
       QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
-  ASSERT_NE(nullptr, disabledSupplier);
-  EXPECT_EQ(nullptr,
+  ASSERT_NE(nullptr,
             dynamic_cast<QueryPrep::DocSetSupplier*>(disabledSupplier));
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(1, SkipStats::ownedFilterServes);
+}
+
+TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
+  FilterCacheConfig config = testConfig();
+  config.maxBytes = 0;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  constexpr int32_t maxDoc = 2 * DocsEnumMeta::L1_DOCS;
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    std::string text = "filler";
+    if ((doc & 1) == 0) text += " alpha";
+    if ((doc % 3) == 0) text += " beta";
+    if ((doc % 1000) == 0) text += " selected";
+    if ((doc % 100) == 0) text += " middle";
+    addTermDoc(writer, text);
+  }
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto& segment = reader->segments()[0];
+
+  struct Run {
+    int64_t count = 0;
+    std::vector<int32_t> docs;
+    std::vector<float> scores;
+    int64_t batchEngagements = 0;
+    int64_t postingsFeeds = 0;
+    int64_t denseWindows = 0;
+    int64_t wordBlocks = 0;
+  };
+  auto run = [&](std::string_view filterTerm, bool scored,
+                 bool disablePostingsFeed, bool disableArrayFeed) {
+    SparseBatchPostingsFeedGuard postingsGuard(disablePostingsFeed);
+    FilteredDisjunctionArrayFeedGuard arrayGuard(disableArrayFeed);
+    bool savedStats = SkipStats::enabled;
+    SkipStats::enabled = true;
+    SkipStats::reset();
+
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    TermQuery alpha("text_w", "alpha");
+    TermQuery beta("text_w", "beta");
+    TermQuery selected("text_w", filterTerm);
+    std::array<Query*, 2> optional{&alpha, &beta};
+    std::array<Query*, 1> filters{&selected};
+    BooleanQuery query({}, optional, {}, filters, 1);
+    auto* weight = query.createWeight(
+        context, scored ? Query::NEED_SCORES : 0);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+
+    Run result;
+    int32_t cursor = 0;
+    while (bulk != nullptr && cursor != PostingsReader::END
+           && cursor < maxDoc) {
+      int32_t next;
+      if (scored) {
+        ScoreWindow window;
+        next = bulk->scoreNextWindow(
+            window, nullptr, cursor, maxDoc,
+            std::numeric_limits<float>::lowest());
+        result.docs.insert(
+            result.docs.end(), window.docs.begin(),
+            window.docs.begin() + window.size);
+        result.scores.insert(
+            result.scores.end(), window.scores.begin(),
+            window.scores.begin() + window.size);
+      } else {
+        next = bulk->countNextWindow(
+            result.count, nullptr, nullptr, cursor, maxDoc);
+      }
+      if (next == PostingsReader::END) {
+        break;
+      }
+      EXPECT_GT(next, cursor);
+      cursor = next;
+    }
+    result.batchEngagements = SkipStats::filteredDisjBatchEngagements;
+    result.postingsFeeds =
+        SkipStats::filteredDisjBatchPostingsFeedEngagements;
+    result.denseWindows = SkipStats::conjDenseCountWindows;
+    result.wordBlocks = SkipStats::countBulkFillWordBlocks;
+    SkipStats::reset();
+    SkipStats::enabled = savedStats;
+    return result;
+  };
+
+  Run countPostings = run("selected", false, false, false);
+  Run countArray = run("selected", false, true, false);
+  Run countVirtual = run("selected", false, true, true);
+  EXPECT_EQ(9, countPostings.count);
+  EXPECT_EQ(countPostings.count, countArray.count);
+  EXPECT_EQ(countPostings.count, countVirtual.count);
+  EXPECT_GT(countPostings.batchEngagements, 0);
+  EXPECT_GT(countPostings.postingsFeeds, 0);
+  EXPECT_EQ(0, countArray.postingsFeeds);
+
+  Run scorePostings = run("selected", true, false, false);
+  Run scoreArray = run("selected", true, true, false);
+  Run scoreVirtual = run("selected", true, true, true);
+  EXPECT_EQ(9u, scorePostings.docs.size());
+  EXPECT_EQ(scorePostings.docs, scoreArray.docs);
+  EXPECT_EQ(scorePostings.docs, scoreVirtual.docs);
+  EXPECT_EQ(scorePostings.scores, scoreArray.scores);
+  EXPECT_EQ(scorePostings.scores, scoreVirtual.scores);
+  EXPECT_GT(scorePostings.batchEngagements, 0);
+  EXPECT_GT(scorePostings.postingsFeeds, 0);
+  EXPECT_EQ(0, scoreArray.postingsFeeds);
+
+  Run middleCount = run("middle", false, false, false);
+  EXPECT_EQ(0, middleCount.batchEngagements);
+  EXPECT_GT(middleCount.denseWindows, 0);
+  EXPECT_GT(middleCount.wordBlocks, 0);
 }
 
 TEST(FilterCacheTest, ownedAndBorrowedValuesComposeDeletesIdentically) {
@@ -1107,7 +1252,7 @@ TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
 
   EXPECT_FALSE(isOwned(
       "sparse", QueryPrep::FilterSupplierMode::DENSITY_ROUTED));
-  EXPECT_TRUE(isOwned(
+  EXPECT_FALSE(isOwned(
       "sparse", QueryPrep::FilterSupplierMode::SPARSE_BATCH));
   EXPECT_FALSE(isOwned(
       "middle", QueryPrep::FilterSupplierMode::SPARSE_BATCH));
@@ -1115,6 +1260,12 @@ TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
       "middle", QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
   EXPECT_FALSE(isOwned(
       "over", QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
+
+  {
+    SparseBatchPostingsFeedGuard disabledFeed(true);
+    EXPECT_TRUE(isOwned(
+        "sparse", QueryPrep::FilterSupplierMode::SPARSE_BATCH));
+  }
 }
 
 TEST(FilterCacheTest, requestOwnedArraysStayWithinMultiFilterBound) {

@@ -42,6 +42,16 @@ public:
   static constexpr int32_t kExactCountTopKMaxDepth = 100;
   static inline int32_t exactCountTopKMinCandidateDensityInverseForTests =
       kExactCountTopKMinCandidateDensityInverse;
+  // A sparse filter that is cheaper than its union body makes the exhaustive
+  // scored batch the natural single pass. Keep this knee separate from the
+  // batch admission constant even though both measured at /44.
+  static constexpr int32_t
+      kExactCountTopKSparseFilterSinglePassDensityInverse = 44;
+  static inline int32_t
+      exactCountTopKSparseFilterSinglePassDensityInverseForTests =
+          kExactCountTopKSparseFilterSinglePassDensityInverse;
+  static inline bool
+      disableExactCountTopKSparseFilterSinglePassForTests = false;
 
   // Filtered MUST conjunctions can abandon competitive-score pruning when the
   // filter caps the candidate set tightly enough. The depth-specific knees
@@ -242,8 +252,25 @@ public:
         candidateCost = std::min<int64_t>(
             candidateCost, collectorFilter->card());
       }
-      return candidateCost >= std::max<int64_t>(
-          1, (int64_t) maxDoc / densityInverse);
+      if (candidateCost < std::max<int64_t>(
+              1, (int64_t) maxDoc / densityInverse)) {
+        return false;
+      }
+
+      int32_t sparseInverse =
+          TopDocsReq::
+              exactCountTopKSparseFilterSinglePassDensityInverseForTests;
+      auto split = countSupplier.exactCountTopKCosts();
+      if (!TopDocsReq::
+              disableExactCountTopKSparseFilterSinglePassForTests
+          && sparseInverse > 0 && split.available()
+          && split.filter < split.unionSide
+          && split.filter <= (int64_t) maxDoc / sparseInverse) {
+        skipCount(
+            SkipStats::exactCountTopKSparseFilterSinglePassRejects);
+        return false;
+      }
+      return true;
     }
 
     void countThenCollectTopK(
