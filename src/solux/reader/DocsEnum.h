@@ -3189,6 +3189,99 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
     return consumed;
   }
 
+  static int32_t popcountRange(std::span<const uint64_t> bits,
+                               int32_t firstIndex, int32_t count) {
+    assert(firstIndex >= 0);
+    assert(count >= 0);
+    int32_t word = firstIndex >> 6;
+    int32_t bit = firstIndex & 63;
+    int32_t total = 0;
+    while (count > 0) {
+      int32_t take = std::min(count, 64 - bit);
+      uint64_t mask = take == 64 ? ~0ULL : ((1ULL << take) - 1ULL) << bit;
+      total += (int32_t) std::popcount(bits[(size_t) word] & mask);
+      count -= take;
+      word++;
+      bit = 0;
+    }
+    return total;
+  }
+
+  // popcount(stored block words AND bits), where stored bit i = doc docBase+i
+  // and `bits` bit j = doc j. A stored word's set bits never pass the block's
+  // last doc, so only in-range `bits` words are ever consulted.
+  static int32_t andPopcountShiftedWords(std::span<const uint64_t> bits,
+                                         const char* src, int32_t numWords,
+                                         uint32_t docBase) {
+    const int32_t nBitsWords = (int32_t) bits.size();
+    const int32_t baseWord = (int32_t) (docBase >> 6);
+    const int32_t off = (int32_t) (docBase & 63);
+    int32_t total = 0;
+    for (int32_t w = 0; w < numWords; w++) {
+      uint64_t word = loadWord64(src + (int64_t) w * 8);
+      if (word == 0) {
+        continue;
+      }
+      const int32_t wi = baseWord + w;
+      uint64_t chunk = bits[(size_t) wi] >> off;
+      if (off != 0 && wi + 1 < nBitsWords) {
+        chunk |= bits[(size_t) (wi + 1)] << (64 - off);
+      }
+      total += (int32_t) std::popcount(word & chunk);
+    }
+    return total;
+  }
+
+  // countInBitSet's whole-block walk: count word/contiguous full blocks by
+  // AND+popcount straight from the stream, consuming them wholesale. Stops
+  // with the stream ready for the regular decode on a packed block or the
+  // tail. Returns whether any block was consumed.
+  bool countWholeWordBlocks(std::span<const uint64_t> bits, int32_t& hits) {
+    bool consumed = false;
+    while (docfreq - docOrd >= Postings::DOCS_BLOCK_SIZE) {
+      seekToBlockBody();
+      bodyReady = true;
+      const int8_t token = (int8_t) *docIS.ptr();
+      if (token > 0) {
+        break;  // packed: the regular decode path takes it from here
+      }
+      const uint32_t base = docOrd == 0 ? 0 : (uint32_t) db[Postings::DOCS_BLOCK_SIZE - 1];
+      const uint32_t docBase = base + (docOrd == 0 ? 0 : 1);
+      const int32_t numWords = token == Postings::DOC_BLOCK_CONTIGUOUS ? 0 : -token;
+      uint32_t blockLast;
+      if (numWords == 0) {
+        blockLast = docBase + Postings::DOCS_BLOCK_SIZE - 1;
+        hits += popcountRange(bits, (int32_t) docBase, Postings::DOCS_BLOCK_SIZE);
+        skipCount(SkipStats::countBulkFillContiguousBlocks);
+      } else {
+        uint64_t lastWord = loadWord64(docIS.ptr() + 1 + (int64_t) (numWords - 1) * 8);
+        assert(lastWord != 0);
+        blockLast = docBase + (uint32_t) (numWords - 1) * 64
+                    + (63 - (uint32_t) std::countl_zero(lastWord));
+        hits += andPopcountShiftedWords(bits, docIS.ptr() + 1, numWords, docBase);
+      }
+      skipCount(SkipStats::countBulkFillWordBlocks);
+
+      docIS.skip(1 + (int64_t) numWords * 8);
+      if (hasFreqs) {
+        auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
+        docIS.skip(bytesSkipped);
+        skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
+      }
+      bodyReady = false;
+      const int32_t blockStartOrd = docOrd;
+      docOrd += Postings::DOCS_BLOCK_SIZE;
+      docid = (int32_t) blockLast;
+      blockMode = true;
+      db[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) blockLast;
+      docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;
+      nextL0Base = blockLast;
+      nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+      consumed = true;
+    }
+    return consumed;
+  }
+
   void skipToBlock(int32_t target) {
     assert(!docBlockResident);
     blockMode = false;
@@ -3450,6 +3543,37 @@ public:
       if (used < available) {
         return;
       }
+    }
+  }
+
+  // Count every remaining doc (including a currently-positioned one, like
+  // intoBitSet) whose bit is set in `bits` (bit index == doc id, sized to
+  // cover [0, maxDoc)), consuming the enum. intoBitSet's walk with counting
+  // in place of production: word and contiguous full blocks count by
+  // AND+popcount straight from the stream without expanding doc ids; packed
+  // blocks and the tail decode and probe.
+  int32_t countInBitSet(std::span<const uint64_t> bits) {
+    int32_t hits = 0;
+    materializeResidentBlock();
+    for (;;) {
+      if ((docid < 0 || blockMode) && docBufIdx >= docBufEnd
+          && countWholeWordBlocks(bits, hits)) {
+        continue;
+      }
+      auto blockDocs = peekDocBlock();
+      int32_t available = (int32_t) blockDocs.size();
+      if (available == 0) {
+        return hits;
+      }
+      skipCount(SkipStats::countBulkFillBlocks);
+      if (SkipStats::enabled) {
+        SkipStats::countBulkFillDocs += available;
+      }
+      for (int32_t i = 0; i < available; i++) {
+        int32_t doc = blockDocs[(size_t) i];
+        hits += (int32_t) ((bits[(size_t) (doc >> 6)] >> (doc & 63)) & 1);
+      }
+      consumeDocBlock(available);
     }
   }
 

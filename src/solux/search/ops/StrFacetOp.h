@@ -748,6 +748,9 @@ public:
                   domainView.card - docsWithValueInDomain;
             }
           } else {
+            if (domainView.compCard != 0) {
+              domainView.materializeBits(poolGuard.pool());
+            }
             terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
               DocsOnlyEnum postings(terms);
               localCounts[(size_t)localOrd] =

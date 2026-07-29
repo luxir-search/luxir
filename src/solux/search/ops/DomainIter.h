@@ -4,6 +4,7 @@
 #include "solux/reader/DocsReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/OrdColReader.h"
+#include "solux/util/MemPool.h"
 #include "solux/util/solux_util.h"
 
 namespace solux {
@@ -17,6 +18,7 @@ struct DomainView {
   int32_t maxDoc;
   int32_t card;
   int32_t compCard;
+  std::optional<FixedBitSet> ownedBits;
 
   DomainView(DocSet* domain, int32_t maxDoc)
       : domain(domain),
@@ -31,11 +33,39 @@ struct DomainView {
         compCard(maxDoc - card) {
     assert(card >= 0 && card <= maxDoc);
   }
+
+  // Expand an array domain into a pool-backed bitset so per-term counting can
+  // probe O(1) and AND whole word blocks. One expansion per (segment, facet)
+  // amortized over every counted term; `arr` stays set for the paths where the
+  // sorted array is the better representation.
+  void materializeBits(MemPool& pool) {
+    if (bits != nullptr || arr == nullptr) {
+      return;
+    }
+    size_t numWords = FixedBitSet::sizeInWords(maxDoc);
+    auto* words = (uint64_t*) pool.alloc(numWords * sizeof(uint64_t),
+                                         alignof(uint64_t));
+    memset(words, 0, numWords * sizeof(uint64_t));
+    for (int32_t doc : arr->docs()) {
+      words[(uint32_t) doc >> 6] |= 1ULL << (doc & 63);
+    }
+    ownedBits.emplace(words, maxDoc);
+    bits = &*ownedBits;
+  }
 };
 
-// Count one term's postings in the domain, driving from the smallest available
-// side. An array domain does not offer complement drive: its complement is
-// dense and cannot be enumerated without reconstructing a bitset.
+// Count one term's postings in the domain. Counting callers materialize an
+// array domain's bitset once per (segment, facet), so the common route for
+// every domain shape is one block-wise walk of the postings: word and
+// contiguous blocks count by AND+popcount straight from the stream, packed
+// blocks decode and probe O(1) bits.
+//
+// The exception is a very sparse domain against a much longer postings list,
+// where driving the domain and advancing the postings through the skip
+// structure leaps whole undecoded blocks. That needs the domain's doc spacing
+// to exceed a block's doc span, i.e. docFreq > card * DOCS_BLOCK_SIZE - only
+// reachable by array domains (a bitset domain's card is at least
+// maxDoc / 32, putting the crossover past maxDoc).
 inline int32_t countTermInDomain(const DomainView& view, DocsOnlyEnum& postings,
                                  int32_t docFreq) {
   // RootOp only uses a null domain when the segment has no deletions. Thus an
@@ -45,92 +75,46 @@ inline int32_t countTermInDomain(const DomainView& view, DocsOnlyEnum& postings,
     return docFreq;
   }
   assert(view.domain != nullptr);  // a null domain always has an empty complement
+  if (view.card == 0) {
+    return 0;
+  }
 
-  bool driveComplement =
-      view.bits != nullptr && view.compCard < view.card
-      && view.compCard < docFreq;
-  bool driveDomain = !driveComplement && view.card < docFreq;
-
-  if (!driveComplement && !driveDomain) {
-    // Postings drive: the membership test is the loop body, so resolve the
-    // domain representation out here.  A virtual DocSet::get() per posting is
-    // never devirtualized through this header and costs more than the test.
+  if (view.arr != nullptr
+      && (int64_t) docFreq > (int64_t) view.card * Postings::DOCS_BLOCK_SIZE) {
+    // Domain drive: advance postings to each array doc, galloping the array
+    // cursor to wherever the postings actually land.
     int32_t hits = 0;
-    auto walk = [&](auto&& member) SOLUX_INLINE {
-      for (int32_t doc = postings.nextDoc(); doc != DocsEnumMeta::END;
-           doc = postings.nextDoc()) {
-        if (member(doc)) {
-          hits++;
-        }
+    std::span<int32_t> docs = view.arr->docs();
+    const int32_t* p = docs.data();
+    const int32_t* end = p + docs.size();
+    while (p != end) {
+      int32_t target = *p;
+      if (postings.docId() < target
+          && postings.advance(target) == DocsEnumMeta::END) {
+        break;
       }
-    };
-    if (view.bits != nullptr) {
-      walk([&](int32_t doc) SOLUX_INLINE { return view.bits->get(doc); });
-    } else {
-      walk([&](int32_t doc) SOLUX_INLINE { return view.arr->get(doc); });
-    }
-    return hits;
-  }
-
-  auto match = [&](int32_t target) SOLUX_INLINE {
-    if (postings.docId() < target) {
-      postings.advance(target);
-    }
-    return postings.docId() == target;
-  };
-
-  int32_t hits = 0;
-  if (driveDomain) {
-    if (view.arr != nullptr) {
-      for (int32_t doc : view.arr->docs()) {
-        if (match(doc)) {
-          hits++;
-        }
-        if (postings.docId() == DocsEnumMeta::END) {
-          break;
-        }
-      }
-    } else {
-      int32_t doc = -1;
-      while (doc + 1 < view.maxDoc) {
-        doc = view.bits->nextSetBit(doc + 1);
-        if (doc >= view.maxDoc) {
-          break;
-        }
-        if (match(doc)) {
-          hits++;
-        }
-        if (postings.docId() == DocsEnumMeta::END) {
-          break;
-        }
+      int32_t landing = postings.docId();
+      if (landing == target) {
+        hits++;
+        p++;
+      } else {
+        assert(landing > target);
+        p = screaming::gallopLowerBound(p + 1, end, landing);
       }
     }
     return hits;
   }
 
-  // The complement includes deleted docs while the domain does not. This is
-  // intentional: docFreq also includes deleted postings, so df-complement is
-  // the live/filter-domain count with no separate liveDocs correction.
-  int32_t doc = -1;
-  while (doc + 1 < view.maxDoc) {
-    doc = view.bits->nextClearBit(doc + 1);
-    if (doc >= view.maxDoc) {
-      break;
-    }
-    if (match(doc)) {
-      hits++;
-    }
-    if (postings.docId() == DocsEnumMeta::END) {
-      break;
-    }
-  }
-  assert(hits <= docFreq);
-  return docFreq - hits;
+  assert(view.bits != nullptr);  // counting callers materialize array domains
+  return postings.countInBitSet(
+      {view.bits->words, FixedBitSet::sizeInWords(view.bits->size())});
 }
 
 // Number of in-domain docs without the field. DocsReader's bitset is the
 // segment-wide docs-with-field set, so this is shared by text facets and the
-// term-driven string strategy.
+// term-driven string strategy. Drives from the smaller side: either the domain
+// walks and the field set advances underneath it, or the field set walks and
+// the resolved domain representation answers O(1) probes.
 inline int32_t countMissingInDomain(const DomainView& view,
                                     const DocsReader& docsReader) {
   if (!docsReader.hasBitset()) {
@@ -141,10 +125,48 @@ inline int32_t countMissingInDomain(const DomainView& view,
   }
 
   int32_t haveField = 0;
-  screaming::BitSet::Iterator it(docsReader.bitset());
-  for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) {
-    if (view.domain->get(doc)) {
-      haveField++;
+  if (view.card <= docsReader.numDocs()) {
+    screaming::BitSet::Iterator it(docsReader.bitset());
+    if (view.arr != nullptr) {
+      for (int32_t doc : view.arr->docs()) {
+        if (it.val() < doc && it.advance(doc) == screaming::BitSet::END) {
+          break;
+        }
+        haveField += (int32_t) (it.val() == doc);
+      }
+    } else {
+      int32_t doc = 0;
+      while (doc < view.maxDoc) {
+        doc = view.bits->nextSetBit(doc);
+        if (doc >= view.maxDoc) {
+          break;
+        }
+        if (it.val() < doc && it.advance(doc) == screaming::BitSet::END) {
+          break;
+        }
+        haveField += (int32_t) (it.val() == doc);
+        doc = std::max(doc + 1, it.val());
+      }
+    }
+  } else {
+    screaming::BitSet::Iterator it(docsReader.bitset());
+    if (view.bits != nullptr) {
+      for (int32_t doc = it.next(); doc != screaming::BitSet::END;
+           doc = it.next()) {
+        haveField += (int32_t) view.bits->get(doc);
+      }
+    } else {
+      std::span<int32_t> docs = view.arr->docs();
+      const int32_t* lo = docs.data();
+      const int32_t* hi = lo + docs.size();
+      for (int32_t doc = it.next(); doc != screaming::BitSet::END;
+           doc = it.next()) {
+        lo = screaming::gallopLowerBound(lo, hi, doc);
+        if (lo == hi) {
+          break;
+        }
+        haveField += (int32_t) (*lo == doc);
+      }
     }
   }
   assert(haveField <= view.card);

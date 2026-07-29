@@ -391,6 +391,9 @@ public:
           return;
         }
         fieldReader.readFieldInfo(segFieldInfo);
+        if (domainView.compCard != 0) {
+          domainView.materializeBits(poolGuard.pool());
+        }
         TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
         while (tenum.nextTerm()) {
           int32_t docFreq = tenum.docFreq();
