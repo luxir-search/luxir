@@ -498,9 +498,15 @@ public:
       topTermsBuilder.add(globalOrd, globalDf);
     }
 
+    // Pad each column to a multiple of 8 so appending them back-to-back below
+    // keeps every column's 8-aligned start.  NumColumnWriter aligns its block
+    // meta within the column; that only survives the append if the column's
+    // own start does too, and NumBlockInfo is read in place.
     auto firstSegsInfo = firstSegs.finish();
+    firstSegsOut.align(8);
     firstSegsOut.flush(true);
     auto globDeltasInfo = globDeltas.finish();
+    globDeltasOut.align(8);
     globDeltasOut.flush(true);
 
     RAMFile metaOutFile("metaOut");
@@ -564,9 +570,12 @@ public:
       }
       if (tenum) tenum->releaseDeltas();
     }
+    // 8-align the payload end too: firstSegs is appended right here.
+    payloadOut.align(8);
     payloadOut.flush(true);
 
     uint64_t cumulativeSize = payloadFile.size();
+    assert((cumulativeSize & 7) == 0);
 
     if (needGlobalDeltas) {
       // redundant numValues for the global columns, but it makes reading simpler.

@@ -12,7 +12,12 @@
 
 namespace solux {
 
-SOLUX_UNALIGNED_START
+// Naturally aligned, and read in place off the mapping: every writer 8-aligns
+// the block-meta array (NumColumnWriter::finish), and every reader asserts it
+// on construction.  Anything that relocates a finished column has to preserve
+// that - OrdMap appends columns into one buffer and pads to 8 for exactly this
+// reason.  Do not make this SOLUX_UNALIGNED to paper over a new relocator;
+// pad the relocator instead, or the assert will point at it.
 struct NumBlockInfo {
   // Payload offset in the low 56 bits, packed width in the top 8. One load
   // yields both, and it lands the descriptor on 32 bytes: two per cache line,
@@ -42,18 +47,17 @@ struct NumBlockInfo {
     assert(payloadOffset <= OFFSET_MASK);
     offsetAndBits = payloadOffset | ((uint64_t)bits << 56);
   }
-} SOLUX_UNALIGNED_END;
+};
 static_assert(sizeof(NumBlockInfo) == 32);
 // Readers locate the zone array at metaOff + nBlocks * sizeof(NumBlockInfo),
 // while the writer aligns it to 8. Both agree only while the descriptor is a
 // multiple of 8; otherwise the writer inserts padding the reader never skips.
 static_assert(sizeof(NumBlockInfo) % 8 == 0);
 
-SOLUX_UNALIGNED_START
 struct NumBlockZone {
   int64_t min = 0;
   int64_t max = 0;
-} SOLUX_UNALIGNED_END;
+};
 static_assert(sizeof(NumBlockZone) == 16);
 
 struct NumColumnFormat {

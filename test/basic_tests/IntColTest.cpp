@@ -337,9 +337,7 @@ TEST_F(IntColTest, wrappingBaseBitPattern) {
   info.gcd = 1;
   info.scaledSlope = 1 << NumColumnFormat::SLOPE_SHIFT;
 
-  std::array<char, sizeof(NumBlockInfo) + 1> unalignedMeta{};
-  memcpy(unalignedMeta.data() + 1, &info, sizeof(info));
-  NumColumn column(payload.data(), unalignedMeta.data() + 1, 3);
+  NumColumn column(payload.data(), (const char*)&info, 3);
   EXPECT_EQ(column.valueAt(0), std::numeric_limits<int64_t>::min());
   EXPECT_EQ(column.valueAt(1), std::numeric_limits<int64_t>::min());
   EXPECT_EQ(column.valueAt(2), std::numeric_limits<int64_t>::min() + 2);

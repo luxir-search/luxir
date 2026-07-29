@@ -12,10 +12,12 @@ namespace solux {
 
 // Shared numeric-column physical decode layer. Descriptors are read in place.
 //
-// NumBlockInfo is SOLUX_UNALIGNED because a column's bytes do not always land
-// where its writer put them: OrdMap writes firstSegs/globDeltas into standalone
-// files and then appends them into a payload file at an arbitrary
-// cumulativeSize (OrdMapImpl.h)
+// The block-meta array must be 8-aligned - NumBlockInfo is a naturally aligned
+// struct read straight off the mapping. NumColumnWriter::finish aligns it in
+// the stream, so anything that RELOCATES a finished column has to preserve
+// that; OrdMap appends columns into one buffer and pads to 8 (OrdMapImpl.h).
+// The constructors assert it so a new relocator fails loudly rather than
+// silently reading misaligned descriptors.
 //
 // WithGcd is a compile-time property of the column, not of a block: monotonic
 // columns are written with gcd pinned to 1 (the slope carries any regular
@@ -55,7 +57,11 @@ public:
   NumColumnT() = default;
 
   NumColumnT(const char* blocks, const char* blockMeta, int64_t nValues)
-      : blocks(blocks), blockMeta(blockMeta), nValues(nValues) {}
+      : blocks(blocks), blockMeta(blockMeta), nValues(nValues) {
+    // Descriptors are read in place, so a relocated column that lost its
+    // 8-alignment lands here rather than in a misaligned load downstream.
+    assert(((uintptr_t)blockMeta & (alignof(NumBlockInfo) - 1)) == 0);
+  }
 
   int64_t numValues() const {
     return nValues;

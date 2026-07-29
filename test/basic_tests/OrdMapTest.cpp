@@ -470,13 +470,14 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
   }
 }
 
-TEST_F(OrdMapTest, relocatedGlobalColumnsLoadUnalignedMetadata) {
+TEST_F(OrdMapTest, relocatedGlobalColumnsKeepMetadataAligned) {
   RAMFile firstSegsFile("firstSegs");
   OutputStream firstSegsOut(&firstSegsFile);
   IntColWriter firstSegs(firstSegsOut);
   std::array<int64_t, 6> expectedFirstSegs = {0, 1, 2, 0, 1, 2};
   for (int64_t value : expectedFirstSegs) firstSegs.addInt64(value);
   auto firstSegsInfo = firstSegs.finish();
+  firstSegsOut.align(8);  // so the column appended after it stays aligned
   firstSegsOut.close();
 
   RAMFile globDeltasFile("globDeltas");
@@ -485,21 +486,24 @@ TEST_F(OrdMapTest, relocatedGlobalColumnsLoadUnalignedMetadata) {
   std::array<int64_t, 6> expectedGlobDeltas = {0, 0, 1, 1, 2, 2};
   for (int64_t value : expectedGlobDeltas) globDeltas.addInt64(value);
   auto globDeltasInfo = globDeltas.finish();
+  globDeltasOut.align(8);
   globDeltasOut.close();
 
   // OrdMap appends these standalone columns after its packed segment mappings.
-  // Use a deliberate three-byte mapping payload so both column-relative
-  // alignments are destroyed by relocation.
+  // NumBlockInfo is read in place, so relocation has to preserve each column's
+  // 8-aligned start: a deliberate three-byte mapping payload would destroy it,
+  // and the align(8) mirroring OrdMapImpl is what keeps it.
   RAMFile payloadFile("ordMapPayload");
   OutputStream payloadOut(&payloadFile);
   payloadOut.write("map", 3);
+  payloadOut.align(8);
   payloadOut.close();
 
   int64_t firstSegsLoc = payloadFile.size() + firstSegsInfo.columnLoc;
-  ASSERT_NE(firstSegsLoc % 8, 0);
+  ASSERT_EQ(firstSegsLoc % 8, 0);
   payloadFile.destructiveAppend(firstSegsFile);
   int64_t globDeltasLoc = payloadFile.size() + globDeltasInfo.columnLoc;
-  ASSERT_NE(globDeltasLoc % 8, 0);
+  ASSERT_EQ(globDeltasLoc % 8, 0);
   payloadFile.destructiveAppend(globDeltasFile);
 
   std::vector<char> relocated(payloadFile.size());
