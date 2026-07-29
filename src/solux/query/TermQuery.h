@@ -29,6 +29,7 @@ protected:
 public:
   class Scorer;
   class TermBulkScorer;
+  static inline bool disableCandidateLeapfrogForTests = false;
 
   TermQuery(std::string_view field, std::string_view term, float boost = 1.0f,
             bool useFrontierBound = true)
@@ -456,6 +457,19 @@ public:
       }
     }
 
+    static int32_t leapfrogCandidate(
+        const int32_t* docs, int32_t size, int32_t index, int32_t current) {
+      if (disableCandidateLeapfrogForTests || current <= docs[index]) {
+        return index;
+      }
+      if (current == PostingsReader::END) {
+        return size;
+      }
+      const int32_t* found = screaming::gallopLowerBound(
+          docs + index, docs + size, current);
+      return (int32_t) (found - docs);
+    }
+
     int32_t applyToCandidatesImpl(int32_t* docs, float* scores,
                                   int32_t size, bool required,
                                   std::span<uint64_t> matchedWords) {
@@ -469,6 +483,10 @@ public:
       int32_t current = docsEnum.docId();
       int32_t i = 0;
       while (i < size) {
+        i = leapfrogCandidate(docs, size, i, current);
+        if (i == size) {
+          break;
+        }
         int32_t target = docs[i];
         if (current < target) {
           current = docsEnum.advanceScoredProbe(target);
@@ -524,6 +542,10 @@ public:
       int32_t current = docsEnum.docId();
       int32_t i = 0;
       while (i < size) {
+        i = leapfrogCandidate(docs, size, i, current);
+        if (i == size) {
+          break;
+        }
         int32_t target = docs[i];
         if (current < target) {
           current = docsEnum.advanceDocOnly(target);

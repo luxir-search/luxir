@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <string>
 #include <string_view>
@@ -300,6 +301,19 @@ struct ForceEagerImpactsGuard {
 
   ~ForceEagerImpactsGuard() {
     ImpactsIndex::forceEagerForTests = saved;
+  }
+};
+
+struct CandidateLeapfrogGuard {
+  bool saved;
+
+  explicit CandidateLeapfrogGuard(bool disabled)
+    : saved(TermQuery::disableCandidateLeapfrogForTests) {
+    TermQuery::disableCandidateLeapfrogForTests = disabled;
+  }
+
+  ~CandidateLeapfrogGuard() {
+    TermQuery::disableCandidateLeapfrogForTests = saved;
   }
 };
 
@@ -8028,6 +8042,83 @@ TEST_F(TermScorerTest, ScoredWordProbeApplyToCandidatesMatchesPerDocAdvanceAcros
       EXPECT_GT(actual.scoredWordProbes, 0);
     }
   }
+}
+
+TEST_F(TermScorerTest, CandidateLeapfrogPreservesBatchedScoreAndMatchCompaction) {
+  CollectionHelper helper("main");
+  std::vector<int32_t> postings = {
+    DocsEnumMeta::L1_DOCS + 904,
+    DocsEnumMeta::L1_DOCS + 906
+  };
+  const int32_t batchSize = DocsEnumMeta::L1_DOCS;
+  indexProbeTermDocs(
+      helper, "leapfrog", postings, "leapfrog",
+      2 * batchSize - postings.back());
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  std::vector<int32_t> candidates((size_t) (2 * batchSize));
+  std::iota(candidates.begin(), candidates.end(), 0);
+
+  auto runScored = [&](bool disabled, bool required) {
+    CandidateLeapfrogGuard guard(disabled);
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    TermQuery query("body_w", "leapfrog");
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto& segment = qContext.topReader.segments()[0];
+    auto* scorer = weight->createScorer(pool, segment);
+    EXPECT_NE(scorer, nullptr);
+
+    CandidateSweepRun run;
+    run.docs = candidates;
+    run.scores = initialCandidateScores((int32_t) candidates.size());
+    int32_t firstSize = scorer->applyToCandidates(
+        run.docs.data(), run.scores.data(), batchSize, required);
+    int32_t secondSize = scorer->applyToCandidates(
+        run.docs.data() + batchSize, run.scores.data() + batchSize,
+        batchSize, required);
+    if (required) {
+      run.docs.erase(
+          run.docs.begin() + firstSize,
+          run.docs.begin() + batchSize);
+      run.scores.erase(
+          run.scores.begin() + firstSize,
+          run.scores.begin() + batchSize);
+      run.docs.resize((size_t) (firstSize + secondSize));
+      run.scores.resize((size_t) (firstSize + secondSize));
+    }
+    return run;
+  };
+
+  for (bool required : {false, true}) {
+    auto expected = runScored(true, required);
+    auto actual = runScored(false, required);
+    expectCandidateSweepEqual(expected, actual);
+    if (required) {
+      EXPECT_EQ(actual.docs, postings);
+    }
+  }
+
+  auto runMatches = [&](bool disabled) {
+    CandidateLeapfrogGuard guard(disabled);
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    TermQuery query("body_w", "leapfrog");
+    auto* weight = query.createWeight(qContext, 0);
+    auto& segment = qContext.topReader.segments()[0];
+    auto* scorer = (TermQuery::Scorer*) weight->createScorer(pool, segment);
+    EXPECT_NE(scorer, nullptr);
+    std::vector<uint64_t> matched((size_t) (2 * batchSize / 64));
+    scorer->addMatchesToCandidates(
+        candidates.data(), batchSize,
+        std::span<uint64_t>(matched.data(), (size_t) (batchSize / 64)));
+    scorer->addMatchesToCandidates(
+        candidates.data() + batchSize, batchSize,
+        std::span<uint64_t>(
+            matched.data() + batchSize / 64, (size_t) (batchSize / 64)));
+    return matched;
+  };
+
+  EXPECT_EQ(runMatches(false), runMatches(true));
 }
 
 // fillScoreBlock is count-driven: a call that stops on count (not upTo) must
