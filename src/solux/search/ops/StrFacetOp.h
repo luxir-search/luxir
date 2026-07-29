@@ -1158,6 +1158,11 @@ public:
       }
       int64_t slotNum = 0;
       for (auto [key, val] : valVec) {
+        // Prepared children retain each segment pointer until the last calc.
+        // A null task group runs that completion inline, so this bucket scope
+        // keeps every domain live through the last return.
+        std::vector<std::unique_ptr<DocSet>> bucketDomains;
+        bucketDomains.reserve(input.size());
         std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
         calculators.reserve(opers.size());
         for (auto& [name, subOp] : opers) {
@@ -1194,12 +1199,13 @@ public:
           // "all docs" to a sub-op (e.g. StatsOp), so when the field or value is
           // absent in this segment the bucket would wrongly absorb every doc in
           // the segment.  The bucket has no docs here, so the domain is empty.
-          std::unique_ptr<DocSet> bucketDomain = builder.build();
+          bucketDomains.push_back(builder.build());
+          DocSet* bucketDomain = bucketDomains.back().get();
           for (auto& subCalc : calculators) {
             //subCalc->calc(tg, segnum, &output);
             // no support for subcalcs launching tasks yet
 
-            subCalc->calc(nullptr, segnum, bucketDomain.get());
+            subCalc->calc(nullptr, segnum, bucketDomain);
           }
         }
         slotNum++;

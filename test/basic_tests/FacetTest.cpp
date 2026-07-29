@@ -2326,6 +2326,45 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   EXPECT_DOUBLE_EQ(15.0, std::get<solux::api::ArrDouble>(f->ops.at("av")->kind).v[0]) << req->toString();
 }
 
+TEST_F(FacetTest, bucketPreparedTopDocsRetainsSegmentDomains) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "cat_s", "x"),
+    flatdoc("id", "b"),
+    flatdoc("id", "c"),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+    flatdoc("id", "d"),
+    flatdoc("id", "e"),
+    flatdoc("id", "f", "cat_s", "x"),
+  }, UpdateMessage::COMMIT);
+  ASSERT_EQ(2u, helper.getIndexWriter()->getIndexReader()->segments().size());
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->testForcePrepare = true;
+  auto& topDocs = req->collection("main").topDocs("q").allQuery().limit(0);
+  auto& facet = topDocs.facet("f", "cat_s").limit(10);
+  facet.topDocs("bucket_docs").allQuery().fields({"id"}).getNumber().limit(-1);
+  req->execute();
+
+  ASSERT_OK(req);
+  const auto* outerDocs = req->docList("q");
+  ASSERT_NE(nullptr, outerDocs);
+  const auto* result = outerDocs->ops.at("f")->facetResult();
+  ASSERT_NE(nullptr, result);
+  ASSERT_EQ(1u, result->counts.size());
+  EXPECT_EQ(2, result->counts[0]);
+
+  const auto* bucketDocs = result->ops.at("bucket_docs")->docList();
+  ASSERT_NE(nullptr, bucketDocs);
+  EXPECT_EQ(2, bucketDocs->found.value_or(-1));
+  const auto& ids = std::get<api::ColStr>(
+      bucketDocs->columns.at("id").kind).v;
+  ASSERT_EQ(2u, ids.size());
+  EXPECT_EQ("a", ids[0]);
+  EXPECT_EQ("f", ids[1]);
+}
+
 // Nested facet: a string facet under a string facet, returning a per-parent-
 // bucket sub-facet (ops[name].arr.v[i].facet parallel to bucket_ids).
 TEST_F(FacetTest, nestedStringFacet) {
