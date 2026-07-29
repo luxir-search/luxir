@@ -502,11 +502,41 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
     if (scorer == nullptr) {
       return builder.build();
     }
-    for (;;) {
-      auto doc = scorer->next();
-      if (doc == PostingsReader::END) break;
-      if (domain && !domain->get(doc)) continue;
-      builder.add(doc);
+    if (domain == nullptr) {
+      for (;;) {
+        auto doc = scorer->next();
+        if (doc == PostingsReader::END) break;
+        builder.add(doc);
+      }
+    } else if (domain->type == DocSet::Type::BITSET) {
+      const FixedBitSet& bits = ((BitDocSet*) domain)->bits();
+      for (;;) {
+        auto doc = scorer->next();
+        if (doc == PostingsReader::END) break;
+        if (bits.get(doc)) {
+          builder.add(doc);
+        }
+      }
+    } else {
+      // Sparse array domain: drive from the array and advance the scorer,
+      // galloping the array cursor to wherever the scorer lands.
+      std::span<int32_t> docs = ((ArrDocSet*) domain)->docs();
+      const int32_t* p = docs.data();
+      const int32_t* end = p + docs.size();
+      while (p != end) {
+        int32_t target = *p;
+        if (scorer->docId() < target && scorer->advance(target) == PostingsReader::END) {
+          break;
+        }
+        int32_t landing = scorer->docId();
+        if (landing == target) {
+          builder.add(target);
+          p++;
+        } else {
+          assert(landing > target);
+          p = screaming::gallopLowerBound(p + 1, end, landing);
+        }
+      }
     }
   }
   return builder.build();

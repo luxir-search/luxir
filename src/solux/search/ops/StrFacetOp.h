@@ -1175,12 +1175,13 @@ public:
             TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
             if (tenum.seek(key)) {
               DocsOnlyEnum denum(tenum);
+              DocSetProbe domainProbe(input[segnum]);
               while (true) {
                 auto doc = denum.nextDoc();
                 if (doc == DocsEnumMeta::END) {
                   break; // no more docs for this term
                 }
-                if (input[segnum] && !input[segnum]->get(doc)) {
+                if (!domainProbe.get(doc)) {
                   continue; // this doc is not in the domain
                 }
                 builder.add(doc);

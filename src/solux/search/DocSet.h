@@ -143,6 +143,10 @@ public:
     return docs_;
   }
 
+  std::span<const int32_t> docs() const {
+    return docs_;
+  }
+
   bool get(int32_t docid) const override {
     // do a binary search for the docid
     return std::binary_search(docs_.begin(), docs_.end(), docid);
@@ -152,6 +156,61 @@ public:
     return sizeof(ArrDocSet) + docs_.capacity() * sizeof(int32_t);
   }
 
+};
+
+/// Forward membership probe over a DocSet with the representation resolved
+/// once, replacing per-doc virtual DocSet::get() in scan loops. BITSET probes
+/// are stateless word tests. ARRAY probes gallop from the previous landing, so
+/// an ascending scan costs O(log gap) per probe on warm lines instead of a
+/// full binary search; a descending probe restarts from the array base -
+/// correct, just slower. A null set accepts every doc. The cursor is private
+/// probe state: DocSets stay shared and immutable, so create one probe per
+/// scan, never share one across concurrent consumers.
+class DocSetProbe {
+  const uint64_t* words = nullptr;
+  const int32_t* base = nullptr;
+  const int32_t* lo = nullptr;
+  const int32_t* hi = nullptr;
+  // Distinct flag rather than a pointer sentinel: an EMPTY ArrDocSet also has
+  // no array storage, and it must reject every doc, not accept them.
+  bool matchAll = false;
+
+public:
+  DocSetProbe() : matchAll(true) {}  // accepts everything, like a null DocSet
+
+  explicit DocSetProbe(const DocSet* set) {
+    reset(set);
+  }
+
+  void reset(const DocSet* set) {
+    words = nullptr;
+    base = lo = hi = nullptr;
+    matchAll = set == nullptr;
+    if (matchAll) {
+      return;
+    }
+    if (set->type == DocSet::BITSET) {
+      words = ((const BitDocSet*) set)->bits().words;
+    } else {
+      std::span<const int32_t> docs = ((const ArrDocSet*) set)->docs();
+      base = lo = docs.data();
+      hi = base + docs.size();
+    }
+  }
+
+  bool get(int32_t doc) {
+    if (words != nullptr) {
+      return (words[(uint32_t) doc >> 6] >> (doc & 63)) & 1;
+    }
+    if (matchAll) {
+      return true;
+    }
+    // lo[-1] < doc means lower_bound(doc) >= lo, so the cursor still applies
+    // even when this probe is below the previous one.
+    const int32_t* start = (lo == base || lo[-1] < doc) ? lo : base;
+    lo = screaming::gallopLowerBound(start, hi, doc);
+    return lo != hi && *lo == doc;
+  }
 };
 
 class DocSetBuilder {
@@ -417,11 +476,13 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
 
   // Mixed representations use the true smallest-cardinality set as the lead.
   // Iterating it and probing the rest is total for either lead representation.
+  // Lead docs ascend, so each probe's array cursor only moves forward.
   std::vector<int32_t> outputDocs;
   outputDocs.reserve((size_t) sets[0]->card());
+  std::vector<DocSetProbe> probes(sets.begin() + 1, sets.end());
   auto matchesRest = [&](int32_t doc) {
-    for (size_t i = 1; i < sets.size(); i++) {
-      if (!sets[i]->get(doc)) {
+    for (auto& probe : probes) {
+      if (!probe.get(doc)) {
         return false;
       }
     }
