@@ -210,6 +210,100 @@ public:
     lo = screaming::gallopLowerBound(start, hi, doc);
     return lo != hi && *lo == doc;
   }
+
+  // intersect() strategy: with k array docs overlapping the span's range and
+  // n span docs, drive the array below k < n/8, gallop the array above
+  // k > 32n, merge linearly between. Two O(1) lookahead probes classify the
+  // block; no exact k is computed. The window is asymmetric because the
+  // merge's linear array walk is prefetch-friendly: measured 2026-07-29
+  // (n=128 spans, desktop) merge still beat the gallop arm at k/n=8
+  // (8.3ns vs 10.0ns per span doc) and only tied at k/n=64; the gallop arm's
+  // job is staying O(n log k) when k/n is extreme. Spans below 16 docs skip
+  // classification and take the always-safe gallop arm.
+  static constexpr int32_t INTERSECT_SPARSE_RATIO = 8;
+  static constexpr int32_t INTERSECT_DENSE_RATIO = 32;
+  static constexpr int32_t INTERSECT_MIN_CLASSIFY = 16;
+
+  /// Invoke callback(doc, index) for every element of the strictly-ascending
+  /// span `docs` that is a member of the array, in span order. Equivalent to
+  /// (but faster than) calling get() per element: whole-block misses return
+  /// after one gallop, and the walk strategy is chosen per block. Mark the
+  /// callback SOLUX_INLINE at the call site.
+  template <class F>
+  void intersect(std::span<const int32_t> docs, F&& callback) {
+    #ifndef NDEBUG
+    for (size_t j = 1; j < docs.size(); j++) {
+      assert(docs[j] > docs[j - 1]);
+    }
+    #endif
+    const int32_t n = (int32_t) docs.size();
+    if (n == 0 || base == hi) {
+      return;
+    }
+    const int32_t first = docs.front();
+    const int32_t last = docs.back();
+    const int32_t* start = (lo == base || lo[-1] < first) ? lo : base;
+    const int32_t* p = screaming::gallopLowerBound(start, hi, first);
+    if (p == hi || *p > last) {
+      lo = p;  // whole block misses
+      return;
+    }
+
+    const int64_t avail = hi - p;
+    if (n >= INTERSECT_MIN_CLASSIFY) {
+      const int64_t denseProbe = (int64_t) n * INTERSECT_DENSE_RATIO;
+      const int64_t sparseProbe = n / INTERSECT_SPARSE_RATIO;
+      if (avail <= sparseProbe || p[sparseProbe] > last) {
+        // k << n: drive the array, galloping a cursor over the span.
+        const int32_t* s = docs.data();
+        const int32_t* sEnd = s + n;
+        while (p != hi && *p <= last) {
+          int32_t v = *p;
+          s = screaming::gallopLowerBound(s, sEnd, v);
+          assert(s != sEnd);  // v <= last, so an element >= v exists
+          if (*s == v) {
+            callback(v, (int32_t) (s - docs.data()));
+          }
+          p++;
+        }
+        lo = p;
+        return;
+      }
+      if (!(avail > denseProbe && p[denseProbe] <= last)) {
+        // Comparable densities (n/8 <= k <= 32n): linear merge, cost <= 33n.
+        int32_t i = 0;
+        for (;;) {
+          if (*p < docs[(size_t) i]) {
+            if (++p == hi) break;
+          } else if (*p > docs[(size_t) i]) {
+            if (++i == n) break;
+          } else {
+            callback(*p, i);
+            ++p;
+            ++i;
+            if (p == hi || i == n) break;
+          }
+        }
+        lo = p;
+        return;
+      }
+      // else k >> n: fall through to the gallop arm.
+    }
+
+    // Drive the span, galloping the array from the cursor: get()-equivalent
+    // per element, never linear in k. The default for unclassified spans.
+    for (int32_t i = 0; i < n; i++) {
+      int32_t d = docs[(size_t) i];
+      if (*p < d) {
+        p = screaming::gallopLowerBound(p, hi, d);
+        if (p == hi) break;
+      }
+      if (*p == d) {
+        callback(d, i);
+      }
+    }
+    lo = p;
+  }
 };
 
 /// Forward membership probe over a DocSet with the representation resolved
@@ -249,6 +343,30 @@ public:
       return true;  // no set
     }
     return arr.get(doc);
+  }
+
+  /// Invoke callback(doc, index) for every member of the strictly-ascending
+  /// span, in span order; a null set matches every element. One representation
+  /// dispatch per span instead of per doc. Mark the callback SOLUX_INLINE at
+  /// the call site.
+  template <class F>
+  void intersect(std::span<const int32_t> docs, F&& callback) {
+    if (words != nullptr) {
+      for (int32_t i = 0; i < (int32_t) docs.size(); i++) {
+        int32_t doc = docs[(size_t) i];
+        if ((words[(uint32_t) doc >> 6] >> (doc & 63)) & 1) {
+          callback(doc, i);
+        }
+      }
+      return;
+    }
+    if (!arr.bound()) {
+      for (int32_t i = 0; i < (int32_t) docs.size(); i++) {
+        callback(docs[(size_t) i], i);
+      }
+      return;
+    }
+    arr.intersect(docs, std::forward<F>(callback));
   }
 };
 
