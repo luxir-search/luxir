@@ -30,9 +30,14 @@ class ScreamingBuilder : public screaming::Builder<ScreamingBuilder> {
   }
 
 public:
+  // 8-aligned, not bare alloc(): the dense container is addressed as uint64_t
+  // words (screaming.h's BLOCK_ALIGN invariant - the vectorized word scans
+  // derive aligned loads from that), and the scratch buffer holds
+  // BucketDescriptors plus a trailing void* link to the next scratch block.
   ScreamingBuilder(MemPool& pool, OutputStream& out)
-  : Builder(pool.alloc(screaming::BitSet::SPARSE_CONTAINER_SIZE), pool.alloc(screaming::BitSet::DENSE_CONTAINER_SIZE),
-            pool.alloc(SCRATCH_SIZE), SCRATCH_SIZE), pool(pool), out(out) {
+  : Builder(pool.alloc(screaming::BitSet::SPARSE_CONTAINER_SIZE, alignof(uint64_t)),
+            pool.alloc(screaming::BitSet::DENSE_CONTAINER_SIZE, alignof(uint64_t)),
+            pool.alloc(SCRATCH_SIZE, alignof(uint64_t)), SCRATCH_SIZE), pool(pool), out(out) {
     alignOut();
   }
 
@@ -48,7 +53,7 @@ protected:
   }
 
   void *allocateScratch() {
-    return pool.alloc(scratchSize);
+    return pool.alloc(scratchSize, alignof(uint64_t));
   }
 
   void deallocateScratch(void *ptr) {

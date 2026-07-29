@@ -36,7 +36,7 @@ void MemPool::nextBuffer(size_t sz) {
       delete[] buffer;
       buffers[bufferIdx] = nullptr;
       buffer = buffers[bufferIdx] = new char[nextSize];
-      *(uint32_t*)buffer = nextSize;
+      storeUnaligned<uint32_t>(buffer, nextSize);
     }
     allocSize += bufferSize(buffer);
   } else {

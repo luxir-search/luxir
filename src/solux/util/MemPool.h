@@ -174,14 +174,22 @@ public:
   char staticBuffer[STATIC_BUFFER_SIZE];  // static buffer for small pools
 
 
+  // These place a real T in the pool, so they allocate at alignof(T): the pool
+  // hands out bytes at whatever offset the previous allocation ended, and a T
+  // whose members want 8-byte alignment sitting on an odd offset is UB (it is
+  // what -fsanitize=alignment reports).  The _align variants are only for
+  // OVER-aligning past alignof(T), e.g. a SIMD buffer.  Raw byte buffers that
+  // are not a T still go through alloc(size) and stay unaligned by design -
+  // read those with load/storeUnaligned or a SOLUX_UNALIGNED struct.
   template <typename T, typename... Args>
   u_ptr<T> make_unique(Args&&... args) {
-    char* storage = alloc(sizeof(T));
+    char* storage = alloc(sizeof(T), alignof(T));
     return make_unique_at<T>(storage, std::forward<Args>(args)...);
   }
 
   template <typename T, typename... Args>
   u_ptr<T> make_unique_align(size_t alignment, Args&&... args) {
+    assert(alignment >= alignof(T));
     char* storage = alloc(sizeof(T), alignment);
     return make_unique_at<T>(storage, std::forward<Args>(args)...);
   }
@@ -189,12 +197,13 @@ public:
   template <typename T, typename... Args>
   T* make(Args&&... args) {
     static_assert(std::is_trivially_destructible<T>::value, "type for MemPool::make() must be trivially destructible");
-    char* storage = alloc(sizeof(T));
+    char* storage = alloc(sizeof(T), alignof(T));
     return new (storage) T(std::forward<Args>(args)...);
   }
   template <typename T, typename... Args>
   T* make_align(size_t alignment, Args&&... args) {
     static_assert(std::is_trivially_destructible<T>::value, "type for MemPool::make() must be trivially destructible");
+    assert(alignment >= alignof(T));
     char* storage = alloc(sizeof(T), alignment);
     return new (storage) T(std::forward<Args>(args)...);
   }
@@ -202,8 +211,9 @@ public:
   template <typename T, typename... Args>
   std::vector<T, MemPool::allocator<T>>* make_vec(Args&&... args) {
     static_assert(std::is_trivially_destructible<T>::value, "element type for MemPool::make_vec() must be trivially destructible");
-    char* storage = alloc(sizeof(std::vector<T, MemPool::allocator<T>>), 8);
-    return new (storage) std::vector<T, MemPool::allocator<T>>(std::forward<Args>(args)..., getAllocator());
+    using vec_type = std::vector<T, MemPool::allocator<T>>;
+    char* storage = alloc(sizeof(vec_type), alignof(vec_type));
+    return new (storage) vec_type(std::forward<Args>(args)..., getAllocator());
   }
 
   // make an array of default initialized elements
@@ -252,7 +262,7 @@ public:
     buffers.push_back(newBuffer);
     bufferIdx++;
     assert((size_t)bufferIdx == buffers.size() - 1);
-    *(int32_t*)newBuffer = size;
+    storeUnaligned<uint32_t>(newBuffer, size);
     buffer = newBuffer;
     pos = HEADER_SIZE;  // start after the header
     allocSize += size;
@@ -263,7 +273,7 @@ public:
   }
 
   uint32_t bufferSize(const char* buf) const {
-    return *(int32_t *)buf;
+    return loadUnaligned<uint32_t>(buf);
   }
 
   // TODO: avoid using ptr() directly since it won't work when switching to malloc
