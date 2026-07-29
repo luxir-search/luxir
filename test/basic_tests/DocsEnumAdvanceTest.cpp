@@ -622,6 +622,94 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   ASSERT_EQ(denum.advance(N), DocsEnumMeta::END);
 }
 
+TEST_F(DocsEnumAdvanceTest, trackedAndUntrackedSkipParityCrossesL1) {
+  const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    const int32_t tf = 1 + doc % 3;
+    field.add(doc, tf == 1 ? "hot" : tf == 2 ? "hot hot" : "hot hot hot");
+  }
+  testIndex.flush();
+  field.startReading();
+
+  const std::vector<int32_t> targets = {
+    DocsEnumMeta::L1_DOCS + 17,
+    DocsEnumMeta::L1_DOCS + 9 * Postings::DOCS_BLOCK_SIZE + 23,
+    2 * DocsEnumMeta::L1_DOCS + 11,
+    nDocs + 7
+  };
+  const bool saved = DocsEnumImpl::disableSlimL0WalkForTests;
+  const bool savedWrapperTrims =
+      DocsEnumImpl::disableProbeWrapperTrimsForTests;
+  auto restore = scope_guard([&] {
+    DocsEnumImpl::disableSlimL0WalkForTests = saved;
+    DocsEnumImpl::disableProbeWrapperTrimsForTests = savedWrapperTrims;
+  });
+
+  auto untracked = [&](bool disableSlim) {
+    DocsEnumImpl::disableSlimL0WalkForTests = disableSlim;
+    TermsEnum terms = field.createTermsEnum();
+    EXPECT_TRUE(terms.seek("hot"));
+    DocsFreqEnum docs(terms);
+    std::vector<int32_t> result;
+    for (int32_t target : targets) {
+      const int32_t doc = docs.advance(target);
+      result.push_back(doc);
+      if (doc != DocsEnumMeta::END) {
+        result.push_back(docs.termFreq());
+      }
+    }
+    return result;
+  };
+
+  auto tracked = [&](bool disableSlim) {
+    DocsEnumImpl::disableSlimL0WalkForTests = disableSlim;
+    TermsEnum terms = field.createTermsEnum();
+    EXPECT_TRUE(terms.seek("hot"));
+    DocsPosEnum docs(terms);
+    PosEnum positions(docs);
+    std::vector<int32_t> result;
+    for (int32_t target : targets) {
+      const int32_t doc = docs.advance(target);
+      result.push_back(doc);
+      if (doc == DocsEnumMeta::END) {
+        continue;
+      }
+      const int32_t tf = docs.termFreq();
+      result.push_back(tf);
+      positions.startPositions();
+      for (int32_t i = 0; i < tf; i++) {
+        result.push_back(positions.nextPosition());
+      }
+      result.push_back(positions.nextPosition());
+    }
+    return result;
+  };
+
+  EXPECT_EQ(untracked(false), untracked(true));
+  EXPECT_EQ(tracked(false), tracked(true));
+
+  auto scoredProbe = [&](bool disableTrims) {
+    DocsEnumImpl::disableProbeWrapperTrimsForTests = disableTrims;
+    TermsEnum terms = field.createTermsEnum();
+    EXPECT_TRUE(terms.seek("hot"));
+    DocsFreqEnum docs(terms);
+    std::vector<int32_t> result;
+    for (int32_t target : targets) {
+      const int32_t doc = docs.advanceScoredProbe(target);
+      result.push_back(doc);
+      if (doc != DocsEnumMeta::END) {
+        result.push_back(docs.termFreq());
+      }
+    }
+    return result;
+  };
+
+  EXPECT_EQ(scoredProbe(false), scoredProbe(true));
+}
+
 TEST_F(DocsEnumAdvanceTest, docsTierAdvanceProbesWordBlocksWithoutDecoding) {
   const std::vector<int32_t> docs = makeWordProbeDocs(3);
   RAMDir dir;

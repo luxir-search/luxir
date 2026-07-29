@@ -4,7 +4,7 @@
 #include "SkipStats.h"
 #include "solux/codec/Codec.h"
 #include "solux/codec/StreamVByte.h"
-#include "solux/util/BranchlessSearch.h"
+#include "solux/util/DecodedSuccessor.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -678,13 +678,20 @@ public:
     std::span<const int32_t> tfreqs;
   };
 
+#if SOLUX_PROBE_CONSTANT_HOOKS
+  static inline bool disableSlimL0WalkForTests = false;
+  static inline bool disableProbeWrapperTrimsForTests = false;
+#else
+  static constexpr bool disableSlimL0WalkForTests = false;
+  static constexpr bool disableProbeWrapperTrimsForTests = false;
+#endif
+
 private:
   int32_t nextL0Block = 0;     // block whose header is at docIS, unless bodyReady is true
   uint32_t nextL0Base = 0;     // last doc before nextL0Block
   int64_t nextL0CumTf = 0;     // cumulative tf before nextL0Block
   int32_t nextL1Group = 0;     // group whose header is next when nextL0Block is on a group boundary
   uint32_t nextL1Base = 0;     // last doc before nextL1Group
-  int64_t nextL1CumTf = 0;     // cumulative tf before nextL1Group
   uint32_t readyBlockBodyBytes = 0;  // body length retained by an L0 cursor landing
   bool bodyReady = false;      // docIS already points at the current block body after an L0 walk
 
@@ -708,7 +715,6 @@ private:
     return (block % L1_PERIOD) == 0;
   }
 
-  static constexpr int32_t DECODED_ADVANCE_LINEAR_PROBE = 8;
   static constexpr uint32_t SCORED_PROBE_REP_MASK = 0xffff;
   static constexpr uint32_t SCORED_PROBE_FREQS_DECODED = 1u << 30;
   static constexpr uint32_t SCORED_PROBE_SURVIVOR_COUNTED = 1u << 31;
@@ -1078,22 +1084,6 @@ private:
     materializeScoredProbeBlock();
   }
 
-  int32_t findDecodedRemainderGEQ(int32_t start, int32_t target) const {
-    int32_t j = start;
-    const int32_t linearEnd = std::min(docBufEnd, start + DECODED_ADVANCE_LINEAR_PROBE);
-    while (j < linearEnd && docBuf[j] < target) {
-      j++;
-    }
-    if (j < linearEnd) {
-      return j;
-    }
-    // The decoded block is L1-resident and probe targets are unpredictable:
-    // the branchless-search win case.
-    return (int32_t) (BranchlessIndex<int32_t>::lowerBound(docBuf + j,
-                                                           (size_t) (docBufEnd - j),
-                                                           target) - docBuf);
-  }
-
   int32_t advanceScoredNoPositionsFromReadyBlock(int32_t target) {
     assert(docid < target);
     assert(!positionTrackingEnabled);
@@ -1117,7 +1107,8 @@ private:
 
     blockMode = false;
     const int32_t start = docBufIdx;
-    const int32_t j = findDecodedRemainderGEQ(start, target);
+    const int32_t j =
+        DecodedSuccessor::index(docBuf, start, docBufEnd, target);
     assert(j < docBufEnd);
     const int32_t consumed = j + 1 - start;
     docOrd += consumed;
@@ -1230,7 +1221,6 @@ protected:
       nextL0CumTf = 0;
       nextL1Group = 0;
       nextL1Base = 0;
-      nextL1CumTf = 0;
       readyBlockBodyBytes = 0;
       bodyReady = false;
       // std::cout << "Normal posting" << std::endl;
@@ -1406,7 +1396,6 @@ private:
       if (isL1Boundary(nextL0Block)) {
         nextL1Group = nextL0Block / L1_PERIOD;
         nextL1Base = nextL0Base;
-        nextL1CumTf = nextL0CumTf;
       }
     }
 
@@ -1720,7 +1709,6 @@ private:
     if (isL1Boundary(nextL0Block)) {
       nextL1Group = nextL0Block / L1_PERIOD;
       nextL1Base = nextL0Base;
-      nextL1CumTf = nextL0CumTf;
     }
   }
 
@@ -1874,7 +1862,6 @@ private:
       if (isL1Boundary(nextL0Block)) {
         nextL1Group = nextL0Block / L1_PERIOD;
         nextL1Base = nextL0Base;
-        nextL1CumTf = nextL0CumTf;
       }
       consumed = true;
     }
@@ -2056,7 +2043,8 @@ public:
     clearScoredProbe();
   }
 
-  int32_t positionScoredProbeAtGEQ(int32_t target) SOLUX_INLINE {
+  template <bool TrimProbeWrapper>
+  SOLUX_INLINE int32_t positionScoredProbeAtGEQ(int32_t target) {
     assert(scoredProbeActive);
     assert(target > docid);
     assert(target <= (int32_t) scoredProbeBlockLast);
@@ -2065,7 +2053,8 @@ public:
     const int32_t numWords = scoredProbeNumWords();
     if (numWords < 0) {
       const int32_t start = docOrd - scoredProbeBlockStartOrd;
-      idx = findDecodedRemainderGEQ(start, target);
+      idx = DecodedSuccessor::index(
+          docBuf, start, Postings::DOCS_BLOCK_SIZE, target);
       assert(idx < Postings::DOCS_BLOCK_SIZE);
       landing = docBuf[idx];
     } else if (numWords == 0) {
@@ -2115,7 +2104,11 @@ public:
     docid = landing;
     docOrd = scoredProbeBlockStartOrd + idx + 1;
     docBufIdx = idx + 1;
-    docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    if constexpr (!TrimProbeWrapper) {
+      // The block entry publishes this once. Retain the old per-landing store
+      // only for the same-binary attribution path.
+      docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    }
     if (scoredProbeFreqsDecoded()) {
       tfreq = hasFreqs ? tfreqBuf[idx] : 1;
       tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
@@ -2124,6 +2117,7 @@ public:
     return docid;
   }
 
+  template <bool TrimProbeWrapper>
   void beginScoredProbeBlock(int32_t target) {
     assert(!scoredProbeActive);
     assert(docfreq - docOrd >= Postings::DOCS_BLOCK_SIZE);
@@ -2179,7 +2173,7 @@ public:
     tfreqOrd = blockStartOrd;
     tfreqBufIdx = 0;
     tfreqBufEnd = 0;
-    positionScoredProbeAtGEQ(target);
+    positionScoredProbeAtGEQ<TrimProbeWrapper>(target);
 
     if (hasFreqs) {
       uint32_t docBytes = (uint32_t) (docIS.ptr() - bodyStart);
@@ -2195,7 +2189,6 @@ public:
     if (isL1Boundary(nextL0Block)) {
       nextL1Group = nextL0Block / L1_PERIOD;
       nextL1Base = nextL0Base;
-      nextL1CumTf = nextL0CumTf;
     }
     skipCount(SkipStats::scoredProbeAdvances);
   }
@@ -2206,32 +2199,56 @@ public:
   // landing is not itself a survivor: callers may have more conjunction
   // clauses to test. The resident state deliberately survives caller
   // batch/window boundaries.
-  int32_t advanceScoredProbe(int32_t target) SOLUX_INLINE {
+  template <bool TrimProbeWrapper>
+  SOLUX_INLINE int32_t advanceScoredProbeImpl(int32_t target) {
     assert(target > docid);
     assert(!docsOnlyConsumed);
     assert(!docBlockResident);
     assert(!positionTrackingEnabled);
-    skipCount(SkipStats::advanceCalls);
+    if constexpr (!TrimProbeWrapper) {
+      skipCount(SkipStats::advanceCalls);
+    }
 
     if (scoredProbeActive) {
       if (target <= (int32_t) scoredProbeBlockLast) {
-        return positionScoredProbeAtGEQ(target);
+        return positionScoredProbeAtGEQ<TrimProbeWrapper>(target);
       }
       finishScoredProbeAtBlockEnd();
     }
     if (docBufEnd > 0 && target <= docBuf[docBufEnd - 1]) {
       return advanceScoredNoPositionsFromReadyBlock(target);
     }
-    if (nextL0Block < numDocBlocks
-        && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
-      skipToBlock(target);
+    if constexpr (TrimProbeWrapper) {
+      // Failure of the decoded-remainder check above already established that
+      // target is beyond docBufEnd.
+      if (nextL0Block < numDocBlocks) {
+        skipToBlock(target);
+      }
+    } else {
+      if (nextL0Block < numDocBlocks
+          && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
+        skipToBlock(target);
+      }
     }
     if (docOrd >= docfreq || docfreq - docOrd < Postings::DOCS_BLOCK_SIZE) {
       return advanceScoredNoPositionsFromReadyBlock(target);
     }
-    beginScoredProbeBlock(target);
+    beginScoredProbeBlock<TrimProbeWrapper>(target);
     assert(target <= (int32_t) scoredProbeBlockLast);
     return docid;
+  }
+
+  int32_t advanceScoredProbe(int32_t target) SOLUX_INLINE {
+#if SOLUX_PROBE_WRAPPER_TRIMS && SOLUX_PROBE_CONSTANT_HOOKS
+    if (disableProbeWrapperTrimsForTests) {
+      return advanceScoredProbeImpl<false>(target);
+    }
+#endif
+#if SOLUX_PROBE_WRAPPER_TRIMS
+    return advanceScoredProbeImpl<true>(target);
+#else
+    return advanceScoredProbeImpl<false>(target);
+#endif
   }
 
   // Fused membership/freq fetch for the conjunction clause pass. Once a
@@ -2269,20 +2286,32 @@ public:
   }
 
 
-  // Reset the doc decoder to the block that may contain target.  Position state is
-  // repaired by cumulativeTermFreq; the position stream itself stays lazy.
+  // Reset the doc decoder to the block that may contain target. Position state
+  // is repaired by cumulativeTermFreq; the position stream itself stays lazy.
+  // Untracked enums skip position metadata wholesale at both header levels.
+  template <bool TrackPositions>
   void skipToBlock(int32_t target) {
     assert(!docBlockResident);
     assert(!scoredProbeActive);
+    if constexpr (TrackPositions) {
+      assert(positionTrackingEnabled || disableSlimL0WalkForTests);
+    } else {
+      assert(!positionTrackingEnabled);
+    }
     blockMode = false;
-    clearPendingPositionRepair();
-    pendingPosSeekValid = false;
+    if constexpr (TrackPositions) {
+      clearPendingPositionRepair();
+      pendingPosSeekValid = false;
+    }
     const char* const streamStart = docIS.ptr(0);
     const char* const end = docIS.ptr(endOfDocs);
     const char* p = docIS.ptr();
     int32_t block = nextL0Block;
     uint32_t prevLastDoc = nextL0Base;
-    int64_t cumTf = nextL0CumTf;
+    int64_t cumTf = 0;
+    if constexpr (TrackPositions) {
+      cumTf = nextL0CumTf;
+    }
 
     auto walkL0To = [&](int32_t maxBlock) -> bool {
       while (block < maxBlock && block < numDocBlocks) {
@@ -2293,13 +2322,17 @@ public:
         uint32_t lastDocDelta = readVint15(p, headerEnd);
         uint32_t blockLastDoc = prevLastDoc + lastDocDelta;
         uint64_t blockByteLen = readVlong15(p, headerEnd);
-        int32_t blockDocCount = std::min(Postings::DOCS_BLOCK_SIZE,
-                                         docfreq - block * Postings::DOCS_BLOCK_SIZE);
-        int64_t blockTfSum = blockDocCount;
+        int64_t blockTfSum = 0;
         uint64_t blockPosByteOff = 0;
-        if (hasPositions) {
-          blockTfSum += InputStream::readVint(p, headerEnd);
-          blockPosByteOff = InputStream::readVlong(p, headerEnd);
+        if constexpr (TrackPositions) {
+          int32_t blockDocCount = std::min(
+              Postings::DOCS_BLOCK_SIZE,
+              docfreq - block * Postings::DOCS_BLOCK_SIZE);
+          blockTfSum = blockDocCount;
+          if (hasPositions) {
+            blockTfSum += InputStream::readVint(p, headerEnd);
+            blockPosByteOff = InputStream::readVlong(p, headerEnd);
+          }
         }
         p = headerEnd;
 
@@ -2308,28 +2341,34 @@ public:
           docIS.seek(body - streamStart);
           docOrd = block * Postings::DOCS_BLOCK_SIZE;
           tfreqOrd = docOrd;
-          cumulativeTermFreq = cumTf;  // restores position alignment; unused when !positionTrackingEnabled
-          if (positionTrackingEnabled) {
-            // Publish a forward seek anchor. PosEnum applies it lazily before
-            // serving positions, preserving the direct skip optimization
-            // without making the doc cursor mutate position decoder state.
-            pendingPosBlockOrd = cumTf - (cumTf % Postings::POSITIONS_BLOCK_SIZE);
-            pendingPosAbsoluteOffset = posStartLoc + (int64_t) blockPosByteOff;
-            pendingPosSeekValid = true;
+          if constexpr (TrackPositions) {
+            cumulativeTermFreq = cumTf;
+            if (positionTrackingEnabled) {
+              // Publish a forward seek anchor. PosEnum applies it lazily before
+              // serving positions, preserving the direct skip optimization
+              // without making the doc cursor mutate position decoder state.
+              pendingPosBlockOrd =
+                  cumTf - (cumTf % Postings::POSITIONS_BLOCK_SIZE);
+              pendingPosAbsoluteOffset =
+                  posStartLoc + (int64_t) blockPosByteOff;
+              pendingPosSeekValid = true;
+            }
           }
           docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) prevLastDoc;
-          docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;   // force a decode on the next nextDoc()
+          // Force a decode on the next nextDoc().
+          docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;
           tfreqBufIdx = tfreqBufEnd = 0;
           assert(blockByteLen
                  <= (uint64_t) std::numeric_limits<uint32_t>::max());
           readyBlockBodyBytes = (uint32_t) blockByteLen;
           nextL0Block = block;
           nextL0Base = prevLastDoc;
-          nextL0CumTf = cumTf;
+          if constexpr (TrackPositions) {
+            nextL0CumTf = cumTf;
+          }
           if (isL1Boundary(block)) {
             nextL1Group = block / L1_PERIOD;
             nextL1Base = prevLastDoc;
-            nextL1CumTf = cumTf;
           }
           bodyReady = true;
           return true;
@@ -2338,7 +2377,9 @@ public:
         p = body + (int64_t) blockByteLen;
         assert(p <= end);
         prevLastDoc = blockLastDoc;
-        cumTf += blockTfSum;
+        if constexpr (TrackPositions) {
+          cumTf += blockTfSum;
+        }
         block++;
       }
       return false;
@@ -2357,7 +2398,6 @@ public:
       int32_t group = block / L1_PERIOD;
       nextL1Group = group;
       nextL1Base = prevLastDoc;
-      nextL1CumTf = cumTf;
 
       uint32_t groupHeaderLen = InputStream::readVint(p, end);
       const char* groupHeaderEnd = p + groupHeaderLen;
@@ -2368,27 +2408,34 @@ public:
       assert(p < groupHeaderEnd);
       p++;  // per-group packed-block count: no cursor consumer
       int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - block);
-      int32_t groupDocCount = std::min(L1_DOCS, docfreq - group * L1_DOCS);
-      int64_t groupTfSum = groupDocCount;
-      if (hasPositions) {
-        groupTfSum += InputStream::readVint(p, groupHeaderEnd);
+      int64_t groupTfSum = 0;
+      if constexpr (TrackPositions) {
+        int32_t groupDocCount =
+            std::min(L1_DOCS, docfreq - group * L1_DOCS);
+        groupTfSum = groupDocCount;
+        if (hasPositions) {
+          groupTfSum += InputStream::readVint(p, groupHeaderEnd);
+        }
+        if (hasFreqs && hasNorms) {
+          uint32_t code = InputStream::readVint(p, groupHeaderEnd);
+          uint32_t frontierCount = code >> 1;
+          uint32_t tfWidth = (code & 1u) != 0 ? 4u : 2u;
+          assert(frontierCount > 0 && frontierCount <= 256);
+          size_t payloadBytes =
+              frontierCount + (size_t) frontierCount * tfWidth;
+          assert(p + payloadBytes <= groupHeaderEnd);
+          p += payloadBytes;
+        } else if (hasFreqs) {
+          auto spanImpact = InputStream::readVint(p, groupHeaderEnd);
+          unused(spanImpact);
+        } else if (hasNorms) {
+          auto spanMinNorm = InputStream::readVint(p, groupHeaderEnd);
+          unused(spanMinNorm);
+        }
+        assert(p == groupHeaderEnd);
+      } else {
+        p = groupHeaderEnd;
       }
-      if (hasFreqs && hasNorms) {
-        uint32_t code = InputStream::readVint(p, groupHeaderEnd);
-        uint32_t frontierCount = code >> 1;
-        uint32_t tfWidth = (code & 1u) != 0 ? 4u : 2u;
-        assert(frontierCount > 0 && frontierCount <= 256);
-        size_t payloadBytes = frontierCount + (size_t) frontierCount * tfWidth;
-        assert(p + payloadBytes <= groupHeaderEnd);
-        p += payloadBytes;
-      } else if (hasFreqs) {
-        auto spanImpact = InputStream::readVint(p, groupHeaderEnd);
-        unused(spanImpact);
-      } else if (hasNorms) {
-        auto spanMinNorm = InputStream::readVint(p, groupHeaderEnd);
-        unused(spanMinNorm);
-      }
-      assert(p == groupHeaderEnd);
 
       const char* groupBody = groupHeaderEnd;
       if (target <= (int32_t) groupLastDoc) {
@@ -2403,27 +2450,39 @@ public:
       p = groupBody + (int64_t) groupByteLen;
       assert(p <= end);
       prevLastDoc = groupLastDoc;
-      cumTf += groupTfSum;
+      if constexpr (TrackPositions) {
+        cumTf += groupTfSum;
+      }
       block += groupBlockCount;
       nextL1Group = block / L1_PERIOD;
       nextL1Base = prevLastDoc;
-      nextL1CumTf = cumTf;
     }
 
     docIS.seek(p - streamStart);
     docOrd = docfreq;
     tfreqOrd = docfreq;
-    cumulativeTermFreq = cumTf;
+    if constexpr (TrackPositions) {
+      cumulativeTermFreq = cumTf;
+    }
     docBufIdx = docBufEnd = 0;
     tfreqBufIdx = tfreqBufEnd = 0;
     nextL0Block = numDocBlocks;
     nextL0Base = prevLastDoc;
-    nextL0CumTf = cumTf;
+    if constexpr (TrackPositions) {
+      nextL0CumTf = cumTf;
+    }
     nextL1Group = docGroupCount();
     nextL1Base = prevLastDoc;
-    nextL1CumTf = cumTf;
     readyBlockBodyBytes = 0;
     bodyReady = false;
+  }
+
+  void skipToBlock(int32_t target) {
+    if (!positionTrackingEnabled && !disableSlimL0WalkForTests) {
+      skipToBlock<false>(target);
+    } else {
+      skipToBlock<true>(target);
+    }
   }
 
 private:
@@ -2477,7 +2536,8 @@ private:
     // they skip cumulative-tf repair entirely.
     blockMode = false;
     const int32_t start = docBufIdx;
-    const int32_t j = findDecodedRemainderGEQ(start, target);
+    const int32_t j =
+        DecodedSuccessor::index(docBuf, start, docBufEnd, target);
     assert(j < docBufEnd);
     const int32_t consumed = j + 1 - start;
     docOrd += consumed;
@@ -2613,8 +2673,6 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
   static bool isL1Boundary(int32_t block) {
     return (block % L1_PERIOD) == 0;
   }
-
-  static constexpr int32_t DECODED_ADVANCE_LINEAR_PROBE = 8;
 
   static uint64_t lowBitsMask(int32_t bits) {
     assert(bits >= 0 && bits <= 64);
@@ -2850,19 +2908,6 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
     clearDocBlockResident();
     docBufIdx = idx;
     docBufEnd = Postings::DOCS_BLOCK_SIZE;
-  }
-
-  int32_t findDecodedRemainderGEQ(int32_t start, int32_t target) const {
-    int32_t j = start;
-    const int32_t linearEnd = std::min(docBufEnd, start + DECODED_ADVANCE_LINEAR_PROBE);
-    while (j < linearEnd && db[j] < target) {
-      j++;
-    }
-    if (j < linearEnd) {
-      return j;
-    }
-    return (int32_t) (BranchlessIndex<int32_t>::lowerBound(
-        db + j, (size_t) (docBufEnd - j), target) - db);
   }
 
   void enterResidentBlock(int32_t blockStartOrd, uint32_t docBase,
@@ -3432,7 +3477,8 @@ public:
     }
     blockMode = false;
     const int32_t start = docBufIdx;
-    const int32_t j = findDecodedRemainderGEQ(start, target);
+    const int32_t j =
+        DecodedSuccessor::index(db, start, docBufEnd, target);
     assert(j < docBufEnd);
     docOrd += j + 1 - start;
     docBufIdx = j + 1;
@@ -3472,11 +3518,10 @@ public:
   BasicDocsEnum(const BasicDocsEnum&) = delete;
 };
 
-// The pre-decomposition implementation was 1376 bytes on this 64-bit target
-// (1384: readyBlockBodyBytes occupies an existing alignment hole).
-// Splitting out metadata must not add state or change the full layout.
+// The implementation is back to its pre-decomposition 1376-byte size after
+// deleting the unread next-L1 cumulative-tf cursor.
 static_assert(sizeof(DocsEnumMeta) == 96);
-static_assert(sizeof(DocsEnumImpl) == 1384);
+static_assert(sizeof(DocsEnumImpl) == 1376);
 static_assert(sizeof(DocsEnumMeta) < sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsOnlyEnum) == 696);
 static_assert(sizeof(DocsOnlyEnum) < sizeof(DocsEnumImpl));

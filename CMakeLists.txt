@@ -2,6 +2,15 @@ cmake_minimum_required(VERSION 3.16)
 project(Solux VERSION 0.1)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+option(SOLUX_PROBE_CONSTANT_HOOKS
+       "Compile probe-constant same-binary measurement hooks" ON)
+option(SOLUX_FULL_INLINE_DECODED_SUCCESSOR
+       "Inline the complete decoded-successor SIMD scan" OFF)
+option(SOLUX_DECODED_SUCCESSOR_HISTOGRAM
+       "Count decoded-successor vector strides" OFF)
+option(SOLUX_PROBE_WRAPPER_TRIMS
+       "Enable scored-probe wrapper bookkeeping trims" OFF)
 # C++26 "erroneous behavior" makes gcc zero-fill automatic storage by default,
 # which taxes hot stack scratch buffers (measured ~35-40% on phrase queries).
 # The presets override per-config flags: release/benchmarks builds use
@@ -198,6 +207,11 @@ file(GLOB_RECURSE Proj_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
 add_library(solux_lib STATIC ${Proj_SOURCES})
+target_compile_definitions(solux_lib PUBLIC
+  SOLUX_PROBE_CONSTANT_HOOKS=$<BOOL:${SOLUX_PROBE_CONSTANT_HOOKS}>
+  SOLUX_FULL_INLINE_DECODED_SUCCESSOR=$<BOOL:${SOLUX_FULL_INLINE_DECODED_SUCCESSOR}>
+  SOLUX_DECODED_SUCCESSOR_HISTOGRAM=$<BOOL:${SOLUX_DECODED_SUCCESSOR_HISTOGRAM}>
+  SOLUX_PROBE_WRAPPER_TRIMS=$<BOOL:${SOLUX_PROBE_WRAPPER_TRIMS}>)
 
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
