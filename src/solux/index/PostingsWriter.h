@@ -1589,6 +1589,9 @@ public:
       return;
     }
 
+    // The reader addresses the block-offset table as a uint64_t array straight
+    // out of the mapping, so it has to start 8-aligned.
+    termOutput.align(8);
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
     assert((int)result.termBlockOffsets.size()
            == ((result.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1);

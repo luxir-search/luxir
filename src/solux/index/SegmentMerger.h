@@ -1257,6 +1257,8 @@ private:
         outputFieldInfo->termsLoc = rows[0].termsBase;
         outputFieldInfo->docsLoc = rows[0].docsBase;
         outputFieldInfo->posLoc = rows[0].posBase;
+        // 8-aligned: the reader reads this table as a uint64_t array in place.
+        termsOut.align(8);
         outputFieldInfo->termBlockIndexLoc = termsOut.slocation();
         termsOut.write(blockOffsets.data(), blockOffsets.size() * sizeof(blockOffsets[0]));
 

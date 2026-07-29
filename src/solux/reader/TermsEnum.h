@@ -128,6 +128,9 @@ public:
     currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
     if (fieldInfo.nTerms == 0) return;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
+    // The writers pad the terms stream so this table starts 8-aligned (see
+    // PostingsWriter::finalizeField), which is what lets us read it in place.
+    assert((termsIS.offset() & 7) == 0);
     termBlockOffsets = reinterpret_cast<const uint64_t*>(termsIS.ptr());
     trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
     trieBase = trieIS.ptr();
