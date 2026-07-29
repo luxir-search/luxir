@@ -111,6 +111,23 @@ public:
   }
 };
 
+class FilteredConjunctionPostingsFeedGuard {
+  bool saved;
+
+public:
+  explicit FilteredConjunctionPostingsFeedGuard(bool disabled)
+    : saved(BooleanQuery::
+                disableFilteredConjunctionPostingsFeedForTests) {
+    BooleanQuery::disableFilteredConjunctionPostingsFeedForTests =
+        disabled;
+  }
+
+  ~FilteredConjunctionPostingsFeedGuard() {
+    BooleanQuery::disableFilteredConjunctionPostingsFeedForTests =
+        saved;
+  }
+};
+
 class FilteredDisjunctionArrayFeedGuard {
   bool saved;
 
@@ -1448,6 +1465,100 @@ TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
 
   EXPECT_TRUE(docSetLeads(0, false));
   EXPECT_TRUE(docSetLeads(0, true));
+}
+
+TEST(FilterCacheIntegrationTest,
+     exactScoredSparseFilterPostingsFeedMatchesCache) {
+  SoluxConfig cachedConfig;
+  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  SoluxConfig uncachedConfig;
+  uncachedConfig.filterCacheBytes = 0;
+  SoluxNode cachedNode(cachedConfig);
+  SoluxNode uncachedNode(uncachedConfig);
+  constexpr std::string_view collection =
+      "exact_scored_sparse_filter_postings";
+  solux::test::CollectionHelper cached(cachedNode, collection);
+  solux::test::CollectionHelper uncached(uncachedNode, collection);
+
+  constexpr int32_t maxDoc = 12 * DocsEnumMeta::L1_DOCS + 257;
+  std::vector<solux::test::Doc> docs;
+  docs.reserve((size_t) maxDoc);
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    std::string body = "alpha";
+    for (int32_t repeat = 0; repeat < doc % 5; repeat++) {
+      body += " alpha";
+    }
+    docs.push_back(solux::test::flatdoc(
+        "id", std::to_string(doc), "body_w", body,
+        "filter_w", doc % 40 == 0 ? "selected" : "other"));
+  }
+  ASSERT_TRUE(cached.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(uncached.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Result {
+    int64_t count = 0;
+    std::vector<std::string> ids;
+    std::vector<float> scores;
+    int64_t batchEngagements = 0;
+    int64_t postingsFeedEngagements = 0;
+  };
+  auto run = [&](SoluxNode& node, bool disablePostingsFeed) {
+    FilteredConjunctionPostingsFeedGuard feedGuard(
+        disablePostingsFeed);
+    OwnedFilterStatsGuard statsGuard;
+    auto request = solux::test::localReq(node.getSearchEngine());
+    request->collection(collection)
+        .topDocs("q")
+        .matchQuery("body_w", "alpha")
+        .matchFilter("selection", "filter_w", "selected")
+        .fields({"id"})
+        .withStats()
+        .limit(100);
+    request->execute(false);
+    EXPECT_TRUE(request->ok()) << request->errorMsg();
+
+    Result result;
+    result.count = request->getMatchCount("q");
+    const auto* list = request->docList("q");
+    if (list != nullptr) {
+      const auto* idColumn = list->columns.find("id");
+      const auto* scoreColumn = list->columns.find("_score_");
+      if (idColumn != nullptr && scoreColumn != nullptr) {
+        const auto* ids = std::get_if<api::ColStr>(&idColumn->kind);
+        const auto* scores =
+            std::get_if<api::ColFloat>(&scoreColumn->kind);
+        if (ids != nullptr && scores != nullptr) {
+          for (auto id : ids->v) {
+            result.ids.emplace_back(id);
+          }
+          result.scores.assign(scores->v.begin(), scores->v.end());
+        }
+      }
+    }
+    result.batchEngagements =
+        SkipStats::filteredConjBatchEngagements;
+    result.postingsFeedEngagements =
+        SkipStats::filteredConjBatchPostingsFeedEngagements;
+    return result;
+  };
+
+  run(cachedNode, false);
+  run(cachedNode, false);
+  Result cachedResult = run(cachedNode, false);
+  Result postingsResult = run(uncachedNode, false);
+  Result disabledResult = run(uncachedNode, true);
+
+  EXPECT_EQ((maxDoc + 39) / 40, cachedResult.count);
+  EXPECT_EQ(100u, cachedResult.ids.size());
+  EXPECT_EQ(cachedResult.ids.size(), cachedResult.scores.size());
+  EXPECT_GT(cachedResult.batchEngagements, 0);
+  EXPECT_EQ(0, cachedResult.postingsFeedEngagements);
+  EXPECT_GT(postingsResult.postingsFeedEngagements, 0);
+  EXPECT_EQ(cachedResult.count, postingsResult.count);
+  EXPECT_EQ(cachedResult.ids, postingsResult.ids);
+  EXPECT_EQ(cachedResult.scores, postingsResult.scores);
+  EXPECT_EQ(0, disabledResult.batchEngagements);
+  EXPECT_EQ(0, disabledResult.postingsFeedEngagements);
 }
 
 TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {

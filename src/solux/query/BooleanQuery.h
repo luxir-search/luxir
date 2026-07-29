@@ -425,6 +425,9 @@ public:
   // A/B toggle: keep exact scored filtered term conjunctions on their
   // body-led mask or pull routes instead of batching from a cached DocSet.
   static inline bool disableFilteredConjunctionBatchForTests = false;
+  // A/B toggle: require cached-DocSet provenance for the exact filtered
+  // conjunction batch instead of streaming an uncached term filter's postings.
+  static inline bool disableFilteredConjunctionPostingsFeedForTests = false;
   // A/B toggle for the count-only unmatched-candidate compaction inside the
   // DocSet batch route.
   static inline bool disableFilteredDisjunctionCountCompactionForTests = false;
@@ -1095,7 +1098,8 @@ public:
                                         ConjunctionMode mode,
                                         bool* docSetLeads = nullptr,
                                         bool* docSetSparseBulkEligible =
-                                            nullptr) {
+                                            nullptr,
+                                        bool* postingsFilterLeads = nullptr) {
         bool exhaustive = mode == ConjunctionMode::EXHAUSTIVE;
         bool includeFilters = mode != ConjunctionMode::SCORED_BODY;
         if (docSetLeads != nullptr) {
@@ -1104,10 +1108,14 @@ public:
         if (docSetSparseBulkEligible != nullptr) {
           *docSetSparseBulkEligible = false;
         }
+        if (postingsFilterLeads != nullptr) {
+          *postingsFilterLeads = false;
+        }
         struct Entry {
           int64_t cost;
           Query::ScorerSupplier* supplier;
           bool optionalGroup;
+          bool filter;
           bool docSetFilter;
         };
         boost::container::small_vector<Entry, 16> entries;
@@ -1116,7 +1124,8 @@ public:
           if (supplier == nullptr) {
             return nullptr;  // a required clause cannot match this segment
           }
-          entries.push_back({supplier->cost(), supplier, false, false});
+          entries.push_back({
+              supplier->cost(), supplier, false, false, false});
         }
         if (includeFilters) {
           for (auto* supplier : filterSuppliers) {
@@ -1124,7 +1133,7 @@ public:
               return nullptr;
             }
             entries.push_back({
-                supplier->cost(), supplier, false,
+                supplier->cost(), supplier, false, true,
                 dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr});
           }
         }
@@ -1148,7 +1157,7 @@ public:
           }
           entries.push_back({
               optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
-              nullptr, true, false});
+              nullptr, true, false, false});
         }
         if (entries.empty()
             || (entries.size() < 2
@@ -1205,6 +1214,21 @@ public:
             }
           }
         }
+        TermQuery::Scorer* postingsLead = nullptr;
+        if (mode == ConjunctionMode::EXACT_FILTERED
+            && !disableFilteredConjunctionPostingsFeedForTests
+            && entries[0].filter && !entries[0].docSetFilter) {
+          postingsLead = dynamic_cast<TermQuery::Scorer*>(arr[0]);
+          for (size_t i = 1; postingsLead != nullptr && i < entries.size();
+               i++) {
+            if (dynamic_cast<TermQuery::Scorer*>(arr[i]) == nullptr) {
+              postingsLead = nullptr;
+            }
+          }
+        }
+        if (postingsFilterLeads != nullptr) {
+          *postingsFilterLeads = postingsLead != nullptr;
+        }
 
         auto* prohibitedArr =
             targetPool.make_arr<Query::Scorer*>(prohibitedSources.size());
@@ -1225,7 +1249,7 @@ public:
             targetPool, std::span<Query::Scorer*>(arr, entries.size()),
             std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
             segment.maxDoc(), leadCost, nonLeadCost, !exhaustive,
-            entries[0].docSetFilter);
+            entries[0].docSetFilter, postingsLead);
       }
 
       BulkScorer* mandOptBulkScorer(MemPool& targetPool) {
@@ -1715,11 +1739,18 @@ public:
             && optionalSources.empty() && prohibitedSources.empty()) {
           bool docSetLeads = false;
           bool docSetTermTail = false;
+          bool postingsFilterLeads = false;
           auto* bulk = conjunctionBulkScorer(
               targetPool, ConjunctionMode::EXACT_FILTERED,
-              &docSetLeads, &docSetTermTail);
-          if (bulk != nullptr && docSetLeads && docSetTermTail) {
+              &docSetLeads, &docSetTermTail, &postingsFilterLeads);
+          if (bulk != nullptr
+              && ((docSetLeads && docSetTermTail)
+                  || postingsFilterLeads)) {
             skipCount(SkipStats::filteredConjBatchEngagements);
+            if (postingsFilterLeads) {
+              skipCount(
+                  SkipStats::filteredConjBatchPostingsFeedEngagements);
+            }
             return bulk;
           }
         }
@@ -3717,6 +3748,60 @@ public:
     }
   }; // ConjuctionScorer
 
+  struct PostingsCandidateBatch {
+    int32_t size;
+    int32_t nextDoc;
+  };
+
+  // Copy sorted docs from the one-way docs-only stream. nextDoc carries the
+  // first unconsumed posting because docsEnum rests on the last consumed one.
+  static PostingsCandidateBatch copyPostingsCandidates(
+      DocsFreqEnum& docsEnum, std::span<int32_t> outDocs,
+      int32_t nextDoc, int32_t min, int32_t upTo) {
+    int32_t doc = nextDoc;
+    if (doc < min) {
+      doc = docsEnum.docId();
+      if (doc < min) {
+        doc = docsEnum.advanceDocOnly(min);
+      }
+    }
+    if (doc >= upTo) {
+      return {0, doc};
+    }
+
+    int32_t size = 0;
+    while (size < (int32_t) outDocs.size()) {
+      std::span<const int32_t> blockDocs =
+          docsEnum.peekDocOnlyBlock();
+      if (blockDocs.empty()) {
+        break;
+      }
+      assert(blockDocs.front() >= min);
+      int32_t available = (int32_t) blockDocs.size();
+      const int32_t* rangeEnd = screaming::gallopLowerBound(
+          blockDocs.data(), blockDocs.data() + available, upTo);
+      int32_t count = std::min(
+          (int32_t) (rangeEnd - blockDocs.data()),
+          (int32_t) outDocs.size() - size);
+      if (count == 0) {
+        break;
+      }
+      std::copy_n(
+          blockDocs.begin(), count, outDocs.begin() + size);
+      size += count;
+      docsEnum.consumeDocOnlyBlock(count);
+      if (count < available) {
+        break;
+      }
+    }
+
+    std::span<const int32_t> remaining =
+        docsEnum.peekDocOnlyBlock();
+    return {
+        size,
+        remaining.empty() ? PostingsReader::END : remaining.front()};
+  }
+
   static void applyDomainBitsToWindow(std::span<uint64_t> windowBits,
                                       int32_t windowStart, int32_t windowEnd,
                                       const FixedBitSet* domainBits) {
@@ -3876,6 +3961,8 @@ public:
     bool denseScoredCostRejected = false;
     bool competitivePruning = true;
     const uint8_t* denseScoredNorms = nullptr;
+    TermQuery::Scorer* filteredPostingsLead = nullptr;
+    int32_t nextFilteredPostingsLeadDoc = -1;
 
     enum class DenseScoredAdmission : uint8_t {
       SCORE_FIRST,
@@ -4383,7 +4470,31 @@ public:
       return write;
     }
 
-    template <bool TermFast, bool TermTailFast = false>
+    int32_t advanceFilteredPostingsLead(int32_t target) {
+      int32_t doc = nextFilteredPostingsLeadDoc;
+      if (doc < target) {
+        auto& docsEnum = filteredPostingsLead->docsEnum;
+        doc = docsEnum.docId();
+        if (doc < target) {
+          doc = docsEnum.advanceDocOnly(target);
+        }
+        nextFilteredPostingsLeadDoc = doc;
+      }
+      return doc;
+    }
+
+    int32_t gatherFilteredPostingsLead(int32_t min, int32_t upTo) {
+      PostingsCandidateBatch batch = copyPostingsCandidates(
+          filteredPostingsLead->docsEnum, candDocs,
+          nextFilteredPostingsLeadDoc, min, upTo);
+      nextFilteredPostingsLeadDoc = batch.nextDoc;
+      std::fill(
+          candScores.begin(), candScores.begin() + batch.size, 0.0f);
+      return batch.size;
+    }
+
+    template <bool TermFast, bool TermTailFast = false,
+              bool FilteredPostingsFeed = false>
     int32_t scoreNextWindowImpl(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
                                 float minCompetitiveScore) {
       out.min = min;
@@ -4400,12 +4511,21 @@ public:
         this->minCompetitiveScore = minCompetitiveScore;
       }
 
-      int32_t leadDoc = scorerDocId<TermFast, TermTailFast>(0);
-      if (leadDoc < min) {
-        leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(min);
+      int32_t leadDoc;
+      if constexpr (FilteredPostingsFeed) {
+        assert(filteredPostingsLead != nullptr);
+        leadDoc = advanceFilteredPostingsLead(min);
+      } else {
+        leadDoc = scorerDocId<TermFast, TermTailFast>(0);
+        if (leadDoc < min) {
+          leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(min);
+        }
       }
       const bool exactDrive =
           !competitivePruning && !disableExactScoredBoundsBypassForTests;
+      if constexpr (FilteredPostingsFeed) {
+        assert(exactDrive);
+      }
 
       for (;;) {
         if (leadDoc == solux::PostingsReader::END) {
@@ -4448,7 +4568,11 @@ public:
               out.max = max;
               return upTo + 1;
             }
-            leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(upTo + 1);
+            if constexpr (FilteredPostingsFeed) {
+              leadDoc = advanceFilteredPostingsLead(upTo + 1);
+            } else {
+              leadDoc = scorerAdvanceLead<TermFast, TermTailFast>(upTo + 1);
+            }
             continue;
           }
         }
@@ -4477,13 +4601,18 @@ public:
             assert(lastDecided >= 0);
             return lastDecided + 1;
           }
-          const int64_t leadFreqDecodesBefore =
-              SkipStats::enabled ? SkipStats::tfreqBlocksDecoded : 0;
-          int32_t n = scorerFillScoreBlock<TermFast>(
-              0, candDocs.data(), candScores.data(), kChunk, upTo + 1);
-          if (SkipStats::enabled) {
-            SkipStats::conjScoredLeadFreqDecodes +=
-                SkipStats::tfreqBlocksDecoded - leadFreqDecodesBefore;
+          int32_t n;
+          if constexpr (FilteredPostingsFeed) {
+            n = gatherFilteredPostingsLead(leadDoc, upTo + 1);
+          } else {
+            const int64_t leadFreqDecodesBefore =
+                SkipStats::enabled ? SkipStats::tfreqBlocksDecoded : 0;
+            n = scorerFillScoreBlock<TermFast>(
+                0, candDocs.data(), candScores.data(), kChunk, upTo + 1);
+            if (SkipStats::enabled) {
+              SkipStats::conjScoredLeadFreqDecodes +=
+                  SkipStats::tfreqBlocksDecoded - leadFreqDecodesBefore;
+            }
           }
           if (n == 0) {
             break;
@@ -5130,7 +5259,8 @@ public:
                           std::span<Query::Scorer*> prohibitedScorers,
                           int32_t maxDoc, int64_t leadCost,
                           int64_t nonLeadCost, bool scoredConstruction,
-                          bool countLeadIsDocSet)
+                          bool countLeadIsDocSet,
+                          TermQuery::Scorer* filteredPostingsLead)
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
@@ -5145,19 +5275,19 @@ public:
           windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
           suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
           candDocs(pool.make_arr<int32_t>(
-              (size_t) (countLeadIsDocSet
+              (size_t) (countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk)),
-              (size_t) (countLeadIsDocSet
+              (size_t) (countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk)),
           candScores(pool.make_arr<float>(
-              (size_t) (countLeadIsDocSet
+              (size_t) (countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk)),
-              (size_t) (countLeadIsDocSet
+              (size_t) (countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk)),
           boundDrops(pool.make_arr<int32_t>(
-              (size_t) (countLeadIsDocSet
+              (size_t) (countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk)),
-              (size_t) (countLeadIsDocSet
+              (size_t) (countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk)),
           outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
           outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
@@ -5169,9 +5299,10 @@ public:
           groupScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
           maxDoc(maxDoc),
           candidateBatchSize(
-              countLeadIsDocSet
+              countLeadIsDocSet || filteredPostingsLead != nullptr
                   ? filteredConjunctionBatchSizeForTests : kChunk),
-          countLeadIsDocSet(countLeadIsDocSet) {
+          countLeadIsDocSet(countLeadIsDocSet),
+          filteredPostingsLead(filteredPostingsLead) {
       assert(!scorers.empty());
       std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
       allTermScorers = true;
@@ -5281,6 +5412,7 @@ public:
               1, (int64_t) maxDoc / denseThresholdInverse);
       denseScoredEligible = scoredConstruction && denseCountPath
           && !negatedCountPath && allTermScorers
+          && filteredPostingsLead == nullptr
           && !disableDenseScoredForTests;
       if (denseScoredEligible) {
         denseScoredNorms = termScorers[0]->flatNormsBase;
@@ -5378,8 +5510,13 @@ public:
         return scoreNextWindowTermClauses(
             out, filter, min, max, minCompetitiveScore);
       }
-      if (countLeadIsDocSet && termTailScorers) {
+      if ((countLeadIsDocSet || filteredPostingsLead != nullptr)
+          && termTailScorers) {
         skipCount(SkipStats::filteredConjBatchScoreWindows);
+      }
+      if (filteredPostingsLead != nullptr) {
+        return scoreNextWindowImpl<true, false, true>(
+            out, filter, min, max, minCompetitiveScore);
       }
       return allTermScorers
           ? scoreNextWindowImpl<true>(out, filter, min, max, minCompetitiveScore)
@@ -6166,52 +6303,11 @@ public:
     int32_t candidateCount = 0;
 
     int32_t gatherPostingsCandidates(int32_t min, int32_t max) {
-      auto& docsEnum = postingsScorer->docsEnum;
-      int32_t doc = nextFilterDoc;
-      if (doc < min) {
-        doc = docsEnum.docId();
-        if (doc < min) {
-          doc = docsEnum.advanceDocOnly(min);
-        }
-      }
-
-      candidateCount = 0;
       int32_t upTo = std::min(max, maxDoc);
-      if (doc >= upTo) {
-        nextFilterDoc = doc;
-        return PostingsReader::END;
-      }
-
-      while (candidateCount < kBatchSize) {
-        std::span<const int32_t> blockDocs =
-            docsEnum.peekDocOnlyBlock();
-        if (blockDocs.empty()) {
-          break;
-        }
-        assert(blockDocs.front() >= min);
-        int32_t available = (int32_t) blockDocs.size();
-        const int32_t* rangeEnd = screaming::gallopLowerBound(
-            blockDocs.data(), blockDocs.data() + available, upTo);
-        int32_t count = std::min(
-            (int32_t) (rangeEnd - blockDocs.data()),
-            kBatchSize - candidateCount);
-        if (count == 0) {
-          break;
-        }
-        std::copy_n(
-            blockDocs.begin(), count,
-            outDocs.begin() + candidateCount);
-        candidateCount += count;
-        docsEnum.consumeDocOnlyBlock(count);
-        if (count < available) {
-          break;
-        }
-      }
-
-      std::span<const int32_t> remaining =
-          docsEnum.peekDocOnlyBlock();
-      nextFilterDoc = remaining.empty()
-          ? PostingsReader::END : remaining.front();
+      PostingsCandidateBatch batch = copyPostingsCandidates(
+          postingsScorer->docsEnum, outDocs, nextFilterDoc, min, upTo);
+      candidateCount = batch.size;
+      nextFilterDoc = batch.nextDoc;
       return nextFilterDoc >= upTo
           ? PostingsReader::END : nextFilterDoc;
     }

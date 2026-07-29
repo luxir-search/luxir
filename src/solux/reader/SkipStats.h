@@ -144,6 +144,7 @@ struct SkipStats {
   static inline int64_t filteredDisjBatchNonDocSetFallbacks = 0;
   static inline int64_t filteredDisjBatchNonTermFallbacks = 0;
   static inline int64_t filteredConjBatchEngagements = 0;
+  static inline int64_t filteredConjBatchPostingsFeedEngagements = 0;
   static inline int64_t filteredConjBatchCountWindows = 0;
   static inline int64_t filteredConjBatchScoreWindows = 0;
   static inline int64_t exactCountTopKCompositions = 0;
@@ -308,6 +309,7 @@ struct SkipStats {
     filteredDisjBatchNonDocSetFallbacks = 0;
     filteredDisjBatchNonTermFallbacks = 0;
     filteredConjBatchEngagements = 0;
+    filteredConjBatchPostingsFeedEngagements = 0;
     filteredConjBatchCountWindows = 0;
     filteredConjBatchScoreWindows = 0;
     exactCountTopKCompositions = 0;
