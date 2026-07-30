@@ -4049,12 +4049,13 @@ public:
     // Keep filling through the first query clause, then apply the ordinary
     // intermediate-cardinality crossover.
     static constexpr int32_t kDocSetLeadLeapfrogThreshold = 1;
-    // Off: the Fenrir 5M sweep (2026-07-30, thresholds 8..128, journalist
-    // and unfiltered COUNT classes) lost at every setting - per-survivor
-    // probe advances cost more than streaming tail fills, and dense tails
-    // pay the linear L0 header walk per advance. Re-sweep via the
-    // SOLUX_TERM_LEAD_LEAPFROG_THRESHOLD override once within-group
-    // checkpoints make dense-enum advances cheap.
+    // Off: the Fenrir 5M sweeps (2026-07-30, thresholds 8..128, journalist
+    // and unfiltered COUNT classes) lost at every setting, both before AND
+    // after within-group checkpoints cut the dense-enum advance cost -
+    // per-survivor probing loses to streaming tail fills on per-probe fixed
+    // cost, not the header walk. The SOLUX_TERM_LEAD_LEAPFROG_THRESHOLD
+    // override remains only as an experiment knob; do not re-enable without
+    // a mechanism change that removes per-probe cost itself.
     static constexpr int32_t kTermLeadLeapfrogThreshold = 0;
     // Direct-term tails benefit from sparse filter-led iteration sooner than
     // disjunction groups. This bar applies only when a DocSet leads and every
