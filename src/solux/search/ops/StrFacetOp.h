@@ -715,16 +715,15 @@ public:
           } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
             int64_t compMissing = 0;
             OrdColReader ordColReader(postingsReader, segFieldInfo);
-            // Skinny-style local staging, for skinny's reason: memory. A u8
-            // per term (nTerms bytes, not 4x that) counts the walk; an ord
-            // that wraps aggregates its wrap count in a side map - one entry
-            // per wrapped ord, never one per wrap event, so staging stays
-            // O(nTerms) no matter how many doc-value pairs the complement
-            // holds. The map converts to an ord-sorted vector and merges
-            // back as +256*wraps in the ord-ordered emit stream, so unlike
-            // the shared skinny counter no per-term probe is ever needed.
-            std::vector<uint8_t> localCounts((size_t)nTerms);
-            boost::unordered_flat_map<int32_t, int32_t> wrapCounts;
+            // Local staging is a SkinnyCounter, for skinny's reason: a u8
+            // per term with per-ord overflow aggregated in its map, so
+            // staging stays O(nTerms) no matter how many doc-value pairs
+            // the complement holds. The narrowed instantiation keeps
+            // overflow entries at 8 bytes; complement counts fit int32 by
+            // maxDoc. Unlike the shared accumulator, the emit stream never
+            // probes the map: the (small) overflow set drains ord-sorted
+            // and merges by a sentinel compare as the stream passes.
+            SkinnyCounter<uint8_t, int32_t, int32_t> local((size_t)nTerms);
             forEachComplementOrdValue(
                 domainView, poolGuard.pool(), ordColReader, compMissing,
                 [&](int32_t docid, int32_t value) SOLUX_INLINE {
@@ -732,26 +731,21 @@ public:
                   // Column value 0 is missing; value v maps to term ord v-1.
                   // Multi-valued ord columns hold distinct ords per doc, so
                   // this counts the same doc-term pairs as docFreq.
-                  size_t ord = (size_t)value - 1;
-                  if (++localCounts[ord] == 0) {
-                    wrapCounts[(int32_t)ord]++;
-                  }
+                  local.increment(value - 1);
                 });
-            std::vector<std::pair<int32_t, int32_t>> wraps(
-                wrapCounts.begin(), wrapCounts.end());
-            std::sort(wraps.begin(), wraps.end());
-            // Sentinel keeps the emit stream's wrap check to one register
-            // compare per term.
-            size_t wrapIdx = 0;
-            int64_t nextWrap = wraps.empty()
-                ? std::numeric_limits<int64_t>::max() : wraps[0].first;
+            std::vector<std::pair<int32_t, int32_t>> overflow(
+                local.overflow.begin(), local.overflow.end());
+            std::sort(overflow.begin(), overflow.end());
+            size_t oi = 0;
+            int64_t nextOverflow = overflow.empty()
+                ? std::numeric_limits<int64_t>::max() : overflow[0].first;
             emitCounts([&](int64_t localOrd, int32_t docFreq) {
-              int32_t complementCount = localCounts[(size_t)localOrd];
-              if (localOrd == nextWrap) {
-                complementCount += wraps[wrapIdx].second << 8;
-                wrapIdx++;
-                nextWrap = wrapIdx < wraps.size()
-                    ? wraps[wrapIdx].first
+              int32_t complementCount = local.counts[(size_t)localOrd];
+              if (localOrd == nextOverflow) {
+                complementCount += overflow[oi].second;
+                oi++;
+                nextOverflow = oi < overflow.size()
+                    ? overflow[oi].first
                     : std::numeric_limits<int64_t>::max();
               }
               // Deleted postings are present in both docFreq and the
