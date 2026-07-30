@@ -674,6 +674,12 @@ public:
           } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
             profile->details.emplace_back(domainView.compCard == 0
                 ? "all-docs domain, docFreq-only dictionary walk"
+                : ((int64_t)domainView.compCard >> 4)
+                        >= (int64_t)segFieldInfo.nTerms
+                ? "inverted domain view, int32 staging"
+                : ((int64_t)segFieldInfo.nTerms >> 5)
+                        >= (int64_t)domainView.compCard
+                ? "inverted domain view, sorted-hit staging"
                 : "inverted domain view, u8 staging");
           } else {
             profile->details.emplace_back(
@@ -743,38 +749,106 @@ public:
             // the complement holds. The narrowed instantiation keeps
             // overflow entries at 8 bytes; complement counts fit int32 by
             // maxDoc. Unlike the shared accumulator, the emit stream never
-            // probes the map: the (small) overflow set drains ord-sorted
-            // and merges by a sentinel compare as the stream passes.
-            SkinnyCounter<uint8_t, int32_t, int32_t> local((size_t)nTerms);
-            forEachComplementOrdValue(
-                domainView, poolGuard.pool(), ordColReader, compMissing,
-                [&](int32_t docid, int32_t value) SOLUX_INLINE {
-                  unused(docid);
-                  // Column value 0 is missing; value v maps to term ord v-1.
-                  // Multi-valued ord columns hold distinct ords per doc, so
-                  // this counts the same doc-term pairs as docFreq.
-                  local.increment(value - 1);
-                });
-            std::vector<std::pair<int32_t, int32_t>> overflow(
-                local.overflow.begin(), local.overflow.end());
-            std::sort(overflow.begin(), overflow.end());
-            size_t oi = 0;
-            int64_t nextOverflow = overflow.empty()
-                ? std::numeric_limits<int64_t>::max() : overflow[0].first;
-            emitCounts([&](int64_t localOrd, int32_t docFreq) {
-              int32_t complementCount = local.counts[(size_t)localOrd];
-              if (localOrd == nextOverflow) {
-                complementCount += overflow[oi].second;
-                oi++;
-                nextOverflow = oi < overflow.size()
-                    ? overflow[oi].first
-                    : std::numeric_limits<int64_t>::max();
+            // probes a map: any side set drains ord-sorted and merges by a
+            // sentinel compare as the stream passes.
+            //
+            // The staging rep is picked by the same math as every other
+            // counter, using the walk that fills it: compCard per-doc
+            // increments over this segment's nTerms buckets. Wide (int32,
+            // branch-free) from R >= 16; u8 in the middle band, where
+            // 4*nTerms is worth saving and the walk hides the wrap check
+            // (u8's wrap branch measured ~3ns/doc, 10-15% of the
+            // walk-dominated low-cardinality cells - never pay it to shrink
+            // a few-KB array); hash-aggregated below R = 1/32, where even
+            // the u8 array's memset outweighs counting the few touched
+            // ords. The staging-specific int32-vs-u8 crossover has not been
+            // fit; 16 mirrors the shared vector crossover and may sit high.
+            bool stageWide = ((int64_t)domainView.compCard >> 4) >= nTerms;
+            bool stageSparse = (nTerms >> 5) >= (int64_t)domainView.compCard;
+            // The sorted-side sentinel merge is written out in each arm
+            // rather than shared through a helper: a lambda indirection in
+            // the emit callback measured 5-15% on the O(nTerms) emit loop.
+            if (stageWide) {
+              std::vector<int32_t> localCounts((size_t)nTerms);
+              forEachComplementOrdValue(
+                  domainView, poolGuard.pool(), ordColReader, compMissing,
+                  [&](int32_t docid, int32_t value) SOLUX_INLINE {
+                    unused(docid);
+                    // Column value 0 is missing; value v maps to term ord
+                    // v-1. Multi-valued ord columns hold distinct ords per
+                    // doc, so this counts the same doc-term pairs as docFreq.
+                    localCounts[(size_t)value - 1]++;
+                  });
+              emitCounts([&](int64_t localOrd, int32_t docFreq) SOLUX_INLINE {
+                int32_t complementCount = localCounts[(size_t)localOrd];
+                assert(complementCount <= docFreq);
+                return docFreq - complementCount;
+              });
+            } else if (stageSparse) {
+              // Collect raw ord hits and aggregate after the walk: the walk
+              // callback stays a bare push (a hash probe inlined there
+              // measured ~5ms/request at 99%/2Mu), and in this band the
+              // sort is small by construction.
+              std::vector<int32_t> hits;
+              hits.reserve((size_t)domainView.compCard);
+              forEachComplementOrdValue(
+                  domainView, poolGuard.pool(), ordColReader, compMissing,
+                  [&](int32_t docid, int32_t value) SOLUX_INLINE {
+                    unused(docid);
+                    hits.push_back(value - 1);
+                  });
+              std::sort(hits.begin(), hits.end());
+              std::vector<std::pair<int32_t, int32_t>> side;
+              for (size_t i = 0; i < hits.size();) {
+                size_t j = i + 1;
+                while (j < hits.size() && hits[j] == hits[i]) {
+                  j++;
+                }
+                side.emplace_back(hits[i], (int32_t)(j - i));
+                i = j;
               }
-              // Deleted postings are present in both docFreq and the
-              // complement column walk, so the subtraction remains exact.
-              assert(complementCount <= docFreq);
-              return docFreq - complementCount;
-            });
+              size_t si = 0;
+              int64_t next = side.empty()
+                  ? std::numeric_limits<int64_t>::max() : side[0].first;
+              emitCounts([&](int64_t localOrd, int32_t docFreq) SOLUX_INLINE {
+                int32_t complementCount = 0;
+                if (localOrd == next) {
+                  complementCount = side[si].second;
+                  si++;
+                  next = si < side.size()
+                      ? side[si].first : std::numeric_limits<int64_t>::max();
+                }
+                // Deleted postings are present in both docFreq and the
+                // complement column walk, so the subtraction remains exact.
+                assert(complementCount <= docFreq);
+                return docFreq - complementCount;
+              });
+            } else {
+              SkinnyCounter<uint8_t, int32_t, int32_t> local((size_t)nTerms);
+              forEachComplementOrdValue(
+                  domainView, poolGuard.pool(), ordColReader, compMissing,
+                  [&](int32_t docid, int32_t value) SOLUX_INLINE {
+                    unused(docid);
+                    local.increment(value - 1);
+                  });
+              std::vector<std::pair<int32_t, int32_t>> side(
+                  local.overflow.begin(), local.overflow.end());
+              std::sort(side.begin(), side.end());
+              size_t si = 0;
+              int64_t next = side.empty()
+                  ? std::numeric_limits<int64_t>::max() : side[0].first;
+              emitCounts([&](int64_t localOrd, int32_t docFreq) SOLUX_INLINE {
+                int32_t complementCount = local.counts[(size_t)localOrd];
+                if (localOrd == next) {
+                  complementCount += side[si].second;
+                  si++;
+                  next = si < side.size()
+                      ? side[si].first : std::numeric_limits<int64_t>::max();
+                }
+                assert(complementCount <= docFreq);
+                return docFreq - complementCount;
+              });
+            }
 
             if (thisOp().missing) {
               int64_t docsWithValueInComplement =

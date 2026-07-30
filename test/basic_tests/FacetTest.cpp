@@ -385,9 +385,10 @@ std::map<std::string, int64_t> filteredFacetBuckets(
 
 } // namespace
 
-// The complement walk stages per-term counts in a u8 with wrap counts
-// aggregated per ord in a side map; give terms exactly 255/256/511/512
-// complement hits so reconstruction crosses the wrap boundaries.
+// The complement walk's u8 staging band (compCard/nTerms between 1/32 and
+// 16) aggregates wrap counts per ord in a side map; give terms exactly
+// 255/256/511/512 complement hits so reconstruction crosses the wrap
+// boundaries. The filler terms hold the ratio below the int32 band.
 TEST_F(FacetTest, complementStagingWrapBoundaries) {
   CollectionHelper helper;
   helper.clear();
@@ -404,6 +405,11 @@ TEST_F(FacetTest, complementStagingWrapBoundaries) {
                              "sel_s", "yes"));
     }
   }
+  for (int32_t i = 0; i < 128; i++) {
+    docs.push_back(flatdoc("id", std::to_string(id++),
+                           "w_s", "fill" + std::to_string(i),
+                           "sel_s", "no"));
+  }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_EQ(1u, helper.durableSegmentCount());
 
@@ -413,6 +419,32 @@ TEST_F(FacetTest, complementStagingWrapBoundaries) {
   for (int32_t k : {255, 256, 511, 512}) {
     EXPECT_EQ(2, complement["t" + std::to_string(k)]) << "hits=" << k;
   }
+  EXPECT_EQ(filteredFacetBuckets(
+                helper, StrFacetStrategy::COLUMN_DOMAIN, "w_s"),
+            complement);
+}
+
+// A tiny complement over many terms (compCard <= nTerms/32) takes the
+// hash-staged arm: touched ords aggregate in a map and merge sorted into
+// the docFreq stream instead of allocating a dense stage.
+TEST_F(FacetTest, complementHashedStagingParity) {
+  CollectionHelper helper;
+  helper.clear();
+  std::vector<Doc> docs;
+  for (int i = 0; i < 96; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i),
+                           "w_s", "h" + std::to_string(i),
+                           "sel_s", i < 3 ? "no" : "yes"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(1u, helper.durableSegmentCount());
+
+  StrFacetStrategyGuard guard;
+  auto complement = filteredFacetBuckets(
+      helper, StrFacetStrategy::COLUMN_COMPLEMENT, "w_s");
+  EXPECT_EQ(93u, complement.size());
+  EXPECT_EQ(0u, complement.count("h0"));
+  EXPECT_EQ(1, complement["h3"]);
   EXPECT_EQ(filteredFacetBuckets(
                 helper, StrFacetStrategy::COLUMN_DOMAIN, "w_s"),
             complement);
