@@ -350,6 +350,111 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
   }
 }
 
+namespace {
+
+// Buckets of a facet computed under a forced strategy, over the domain
+// selected by sel_s=yes.
+std::map<std::string, int64_t> filteredFacetBuckets(
+    CollectionHelper& helper, StrFacetStrategy strategy,
+    std::string_view field) {
+  forcedStrFacetStrategy = strategy;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q");
+  top.getNumber(true).matchQuery("sel_s", "yes");
+  top.facet("f", field).limit(-1).mincount(1);
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  std::map<std::string, int64_t> buckets;
+  const auto* docs = req->docList("q");
+  EXPECT_NE(nullptr, docs);
+  if (docs == nullptr) {
+    return buckets;
+  }
+  const auto* result = docs->ops.at("f")->facetResult();
+  EXPECT_NE(nullptr, result);
+  if (result == nullptr) {
+    return buckets;
+  }
+  const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+  for (size_t i = 0; i < ids.size(); i++) {
+    buckets[std::string(ids[i])] = result->counts[i];
+  }
+  return buckets;
+}
+
+} // namespace
+
+// The complement walk stages per-term counts in a u8 with wrap counts
+// aggregated per ord in a side map; give terms exactly 255/256/511/512
+// complement hits so reconstruction crosses the wrap boundaries.
+TEST_F(FacetTest, complementStagingWrapBoundaries) {
+  CollectionHelper helper;
+  helper.clear();
+  std::vector<Doc> docs;
+  int id = 0;
+  for (int32_t k : {255, 256, 511, 512}) {
+    std::string term = "t" + std::to_string(k);
+    for (int32_t i = 0; i < k; i++) {
+      docs.push_back(flatdoc("id", std::to_string(id++), "w_s", term,
+                             "sel_s", "no"));
+    }
+    for (int32_t i = 0; i < 2; i++) {
+      docs.push_back(flatdoc("id", std::to_string(id++), "w_s", term,
+                             "sel_s", "yes"));
+    }
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(1u, helper.durableSegmentCount());
+
+  StrFacetStrategyGuard guard;
+  auto complement = filteredFacetBuckets(
+      helper, StrFacetStrategy::COLUMN_COMPLEMENT, "w_s");
+  for (int32_t k : {255, 256, 511, 512}) {
+    EXPECT_EQ(2, complement["t" + std::to_string(k)]) << "hits=" << k;
+  }
+  EXPECT_EQ(filteredFacetBuckets(
+                helper, StrFacetStrategy::COLUMN_DOMAIN, "w_s"),
+            complement);
+}
+
+// Remapped segments unpack the local->global ord mapping in 128-ord frames;
+// put counted terms on both sides of the 127/128 slot boundary and check
+// every strategy against the direct column walk.
+TEST_F(FacetTest, remappedOrdFrameBoundary) {
+  CollectionHelper helper;
+  helper.clear();
+  std::vector<Doc> docs;
+  for (int i = 0; i < 131; i++) {
+    char name[8];
+    std::snprintf(name, sizeof(name), "m%03d", i);
+    docs.push_back(flatdoc("id", "m" + std::to_string(i), "f_s", name,
+                           "sel_s", i % 2 ? "yes" : "no"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  // The second segment's terms sort first, shifting the first segment's
+  // local ords in the global dictionary so its frames are delta-mapped.
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "x0", "f_s", "a0", "sel_s", "yes"),
+      flatdoc("id", "x1", "f_s", "a1", "sel_s", "no"),
+      flatdoc("id", "x2", "f_s", "a2", "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(2u, helper.durableSegmentCount());
+
+  StrFacetStrategyGuard guard;
+  auto expected = filteredFacetBuckets(
+      helper, StrFacetStrategy::COLUMN_DOMAIN, "f_s");
+  EXPECT_EQ(expected, filteredFacetBuckets(
+                helper, StrFacetStrategy::COLUMN_COMPLEMENT, "f_s"));
+  EXPECT_EQ(expected, filteredFacetBuckets(
+                helper, StrFacetStrategy::TERM_DRIVEN, "f_s"));
+  // Frame slots on both sides of the 128 boundary: odd ords are in the
+  // domain, even ords only in the complement.
+  EXPECT_EQ(1, expected["m127"]);
+  EXPECT_EQ(0u, expected.count("m128"));
+  EXPECT_EQ(1, expected["m129"]);
+}
+
 TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   CollectionHelper helper;
   helper.clear();

@@ -499,19 +499,28 @@ public:
           mapping.numOrds = segFieldInfo.nTerms;
         }
 
-        auto forEachMappedOrd = [&](size_t size, auto&& accept) {
+        // Streams the local->global mapping for an ascending scan that visits
+        // every local ord, unpacking the OrdMap's 128-ord delta frames as the
+        // scan crosses them. globalOrd() must be called once per ord, in
+        // order, so frame starts are never skipped.
+        struct MappedOrdCursor {
+          const OrdMap::SegToGlobal& mapping;
+          int64_t size;
           uint64_t deltaFrame[128];
-          for (size_t base = 0; base < size; base += 128) {
-            uint32_t count = (uint32_t)std::min<size_t>(128, size - base);
-            if (mapping.bits != 0) {
-              mapping.unpackDeltas(base, count, deltaFrame);
+          int64_t globalOrd(int64_t localOrd) {
+            if (mapping.bits != 0 && (localOrd & 127) == 0) {
+              mapping.unpackDeltas((size_t)localOrd,
+                  (uint32_t)std::min<int64_t>(128, size - localOrd),
+                  deltaFrame);
             }
-            for (uint32_t i = 0; i < count; i++) {
-              int64_t localOrd = (int64_t)base + i;
-              int64_t globalOrd = mapping.bits == 0
-                  ? localOrd : localOrd + (int64_t)deltaFrame[i];
-              accept((size_t)localOrd, globalOrd);
-            }
+            return mapping.bits == 0
+                ? localOrd : localOrd + (int64_t)deltaFrame[localOrd & 127];
+          }
+        };
+        auto forEachMappedOrd = [&](size_t size, auto&& accept) {
+          MappedOrdCursor cursor{mapping, (int64_t)size};
+          for (size_t localOrd = 0; localOrd < size; localOrd++) {
+            accept(localOrd, cursor.globalOrd((int64_t)localOrd));
           }
         };
 
@@ -698,26 +707,20 @@ public:
 
           // One fused pass shared by every postings-side strategy: stream
           // docFreqs in local-ord order, apply the strategy's per-ord count,
-          // unpack the local->global mapping in the same 128-ord frames
-          // forEachMappedOrd uses, and add only finished positive counts.
-          // SegmentMergeDriver shares one accumulator across segments, so
-          // intermediate complement counts must never reach it - and with
-          // counts finished inside the stream, nothing here needs a
-          // separate drain pass over ord space.
-          uint64_t deltaFrame[128];
+          // advance the mapping cursor, and add only finished positive
+          // counts. SegmentMergeDriver shares one accumulator across
+          // segments, so intermediate complement counts must never reach it -
+          // and with counts finished inside the stream, nothing here needs a
+          // separate drain pass over ord space. The cursor advances for every
+          // ord, counted or not, so frame starts are never skipped.
+          MappedOrdCursor cursor{mapping, nTerms};
           auto emitCounts = [&](auto&& countOf) {
             terms.forEachDocFreq(
                 [&](int64_t localOrd, int32_t docFreq) SOLUX_INLINE {
-              if (mapping.bits != 0 && (localOrd & 127) == 0) {
-                mapping.unpackDeltas((size_t)localOrd,
-                    (uint32_t)std::min<int64_t>(128, nTerms - localOrd),
-                    deltaFrame);
-              }
+              int64_t globalOrd = cursor.globalOrd(localOrd);
               int32_t count = countOf(localOrd, docFreq);
               if (count > 0) {
-                addGlobalCount(mapping.bits == 0
-                    ? localOrd
-                    : localOrd + (int64_t)deltaFrame[localOrd & 127], count);
+                addGlobalCount(globalOrd, count);
               }
             });
           };
@@ -734,13 +737,14 @@ public:
             OrdColReader ordColReader(postingsReader, segFieldInfo);
             // Skinny-style local staging, for skinny's reason: memory. A u8
             // per term (nTerms bytes, not 4x that) counts the walk; an ord
-            // that wraps (one wrap per 256 hits, so at most compCard/256
-            // entries) is side-listed and the sorted wraps merge back as
-            // +256 runs in the ord-ordered emit stream. Unlike the shared
-            // skinny counter there is no overflow map to probe: the emit
-            // stream visits every ord in order, so the merge is free.
+            // that wraps aggregates its wrap count in a side map - one entry
+            // per wrapped ord, never one per wrap event, so staging stays
+            // O(nTerms) no matter how many doc-value pairs the complement
+            // holds. The map converts to an ord-sorted vector and merges
+            // back as +256*wraps in the ord-ordered emit stream, so unlike
+            // the shared skinny counter no per-term probe is ever needed.
             std::vector<uint8_t> localCounts((size_t)nTerms);
-            std::vector<int32_t> wraps;
+            boost::unordered_flat_map<int32_t, int32_t> wrapCounts;
             forEachComplementOrdValue(
                 domainView, poolGuard.pool(), ordColReader, compMissing,
                 [&](int32_t docid, int32_t value) SOLUX_INLINE {
@@ -750,24 +754,25 @@ public:
                   // this counts the same doc-term pairs as docFreq.
                   size_t ord = (size_t)value - 1;
                   if (++localCounts[ord] == 0) {
-                    wraps.push_back((int32_t)ord);
+                    wrapCounts[(int32_t)ord]++;
                   }
                 });
+            std::vector<std::pair<int32_t, int32_t>> wraps(
+                wrapCounts.begin(), wrapCounts.end());
             std::sort(wraps.begin(), wraps.end());
             // Sentinel keeps the emit stream's wrap check to one register
-            // compare per term; the rare match absorbs any repeats.
+            // compare per term.
             size_t wrapIdx = 0;
             int64_t nextWrap = wraps.empty()
-                ? std::numeric_limits<int64_t>::max() : wraps[0];
+                ? std::numeric_limits<int64_t>::max() : wraps[0].first;
             emitCounts([&](int64_t localOrd, int32_t docFreq) {
               int32_t complementCount = localCounts[(size_t)localOrd];
               if (localOrd == nextWrap) {
-                do {
-                  complementCount += 256;
-                  wrapIdx++;
-                  nextWrap = wrapIdx < wraps.size()
-                      ? wraps[wrapIdx] : std::numeric_limits<int64_t>::max();
-                } while (nextWrap == localOrd);
+                complementCount += wraps[wrapIdx].second << 8;
+                wrapIdx++;
+                nextWrap = wrapIdx < wraps.size()
+                    ? wraps[wrapIdx].first
+                    : std::numeric_limits<int64_t>::max();
               }
               // Deleted postings are present in both docFreq and the
               // complement column walk, so the subtraction remains exact.
