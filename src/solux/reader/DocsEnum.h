@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <type_traits>
@@ -39,10 +40,8 @@ protected:
   bool hasNorms;
   // uint8_t currentL1PackedBlocks = 0;
   // The per-group packed-block count is one byte in every L1 group header,
-  // right after the vint15 lastDoc delta and vlong15 group byte length. The
-  // skip paths length-skip headers without parsing, so nothing reads it on
-  // a plain cursor today; reinstate this field and parse it there if a
-  // cursor-level consumer appears. readGroupImpacts() already surfaces it.
+  // right after the vint15 lastDoc delta and vlong15 group byte length.
+  // The sampled L0 directory follows it.
   int32_t docfreq;
   int64_t ttf;
   int64_t docsSize;
@@ -58,21 +57,12 @@ public:
   /// sentinel value used for docs
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
-  // The skip structure is two levels: L0 per-block headers, and L1 group headers
-  // every L1_PERIOD blocks (see skipToBlock). There is deliberately NO level 2
-  // (a coarser index above L1). Measured 2026-07-05 with the skip-effectiveness
-  // harness (BM_SkipEffectiveness) at 1M docs: even in the aggressive-skip regime
-  // (common + rare high-idf disjunction, ~15% of blocks decoded) the L1 group
-  // walk stays tiny (~100 group-header reads for the whole query), so an L2 above
-  // it would save almost nothing. The header cost that actually dominates there is
-  // the WITHIN-group L0 walk (up to L1_PERIOD headers to reach the target block),
-  // which an L2 does not touch - the levers for that would be L1_PERIOD or a
-  // within-group L0 jump, not another level. And it is not gating regardless: the
-  // L0 walk is cheap vint reads, so skipping is a clear wall-clock win as-is.
-  // Revisit only if l0HeaderSteps/blocksDecoded blows up on much longer lists
-  // (8M+ docs); measure with the harness before adding structure.
+  // The skip structure has L0 per-block headers and L1 group headers every
+  // L1_PERIOD blocks. Each L1 header also samples L0 resume points within its
+  // group; there is deliberately no coarser level above L1.
   static constexpr int32_t L1_PERIOD = 32;
   static constexpr int32_t L1_DOCS = L1_PERIOD * Postings::DOCS_BLOCK_SIZE;
+  static inline bool disableL0CheckpointsForTests = false;
 
   struct ImpactFrontiers {
     std::vector<int32_t> offsets;
@@ -130,6 +120,58 @@ public:
   };
 
 protected:
+  struct L0Checkpoint {
+    uint32_t key = 0;
+    uint32_t bodyOffset = 0;
+    int32_t blockIdxInGroup = 0;
+  };
+
+  static inline bool disableL0Checkpoints =
+      std::getenv("SOLUX_DISABLE_L0_CHECKPOINTS") != nullptr;
+
+  // Consult pre-filter: a block holds exactly DOCS_BLOCK_SIZE docs, so the
+  // doc-id distance to the target bounds the block distance. Below one
+  // default writer stride (8 blocks) no jump is possible and the consult is
+  // skipped without touching the directory. Conservative only: a smaller
+  // written stride just forgoes marginal jumps, never selects a wrong one.
+  static constexpr int32_t L0_CHECKPOINT_MIN_SKIP_DOCS =
+      8 * Postings::DOCS_BLOCK_SIZE;
+
+  // A jump must skip at least this many headers to beat its own cost: a
+  // header parse is a couple of cheap vint reads, so short hops lose to the
+  // walk (measured on dense word-probed conjunctions).
+  static constexpr int32_t L0_CHECKPOINT_MIN_JUMP_BLOCKS = 4;
+
+  // Branchless over the (at most a few) entries: data-dependent early exits
+  // mispredict on probe workloads and cost more than the loop they save.
+  static bool consultL0Checkpoints(const char* entries, uint8_t entryCount,
+                                   uint32_t target, int32_t blockInGroup,
+                                   L0Checkpoint& selected) {
+    if (disableL0Checkpoints || disableL0CheckpointsForTests) {
+      return false;
+    }
+    int32_t minBlockIdx = blockInGroup + L0_CHECKPOINT_MIN_JUMP_BLOCKS;
+    uint64_t best = 0;
+    for (uint8_t i = 0; i < entryCount; i++) {
+      uint64_t entry;
+      static_assert(std::endian::native == std::endian::little);
+      memcpy(&entry, entries + (size_t) i * sizeof(entry), sizeof(entry));
+      int32_t blockIdx = (int32_t) ((entry >> 24) & 0xffu);
+      bool usable = (uint32_t) (entry >> 32) < target && blockIdx >= minBlockIdx;
+      best = usable ? entry : best;
+    }
+    if (best == 0) {
+      return false;
+    }
+    selected = L0Checkpoint{
+        .key = (uint32_t) (best >> 32),
+        .bodyOffset = (uint32_t) (best & 0xffffffu),
+        .blockIdxInGroup = (int32_t) ((best >> 24) & 0xffu)};
+    assert(selected.blockIdxInGroup > 0
+           && selected.blockIdxInGroup < L1_PERIOD);
+    return true;
+  }
+
   explicit DocsEnumMeta(const TermsEnum::PostingsState& state)
       : docIS(state.docIS), hasFreqs(state.hasFreqs),
         hasPositions(state.hasPositions), hasNorms(state.hasPositions),
@@ -248,6 +290,10 @@ private:
     assert(p < groupHeaderEnd);
     header.packedBlockCount = (int32_t) (uint8_t) *p++;
     assert(header.packedBlockCount <= L1_PERIOD);
+    assert(p < groupHeaderEnd);
+    uint8_t entryCount = (uint8_t) *p++;
+    assert(p + (size_t) entryCount * sizeof(uint64_t) <= groupHeaderEnd);
+    p += (size_t) entryCount * sizeof(uint64_t);
     if (hasPositions) {
       auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
       unused(groupCumTfDelta);
@@ -373,6 +419,10 @@ public:
       int32_t groupPackedBlockCount = (int32_t) (uint8_t) *p++;
       assert(groupPackedBlockCount <= groupBlockCount);
       unused(groupPackedBlockCount);
+      assert(p < groupHeaderEnd);
+      uint8_t entryCount = (uint8_t) *p++;
+      assert(p + (size_t) entryCount * sizeof(uint64_t) <= groupHeaderEnd);
+      p += (size_t) entryCount * sizeof(uint64_t);
       if (hasPositions) {
         auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
         unused(groupCumTfDelta);
@@ -694,6 +744,10 @@ private:
   uint32_t nextL1Base = 0;     // last doc before nextL1Group
   uint32_t readyBlockBodyBytes = 0;  // body length retained by an L0 cursor landing
   bool bodyReady = false;      // docIS already points at the current block body after an L0 walk
+  const char* l0CheckpointEntries = nullptr;
+  const char* l0CheckpointGroupBody = nullptr;
+  int32_t l0CheckpointGroupStartBlock = -1;
+  uint8_t l0CheckpointCount = 0;
 
   // Position metadata repair can be deferred while a positions-tracking enum is
   // only being advanced through decoded docs. The dirty range is always within
@@ -2386,6 +2440,22 @@ public:
     };
 
     if (!isL1Boundary(block)) {
+      if constexpr (!TrackPositions) {
+        int32_t groupStartBlock = (block / L1_PERIOD) * L1_PERIOD;
+        if ((int64_t) target - (int64_t) prevLastDoc
+                >= L0_CHECKPOINT_MIN_SKIP_DOCS
+            && l0CheckpointGroupStartBlock == groupStartBlock) {
+          L0Checkpoint checkpoint;
+          if (consultL0Checkpoints(
+                  l0CheckpointEntries, l0CheckpointCount, (uint32_t) target,
+                  block - groupStartBlock, checkpoint)) {
+            p = l0CheckpointGroupBody + checkpoint.bodyOffset;
+            block = groupStartBlock + checkpoint.blockIdxInGroup;
+            prevLastDoc = checkpoint.key;
+            skipCount(SkipStats::l0CheckpointJumps);
+          }
+        }
+      }
       int32_t nextGroupBlock = ((block / L1_PERIOD) + 1) * L1_PERIOD;
       if (walkL0To(nextGroupBlock)) {
         return;
@@ -2407,7 +2477,17 @@ public:
       uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
       assert(p < groupHeaderEnd);
       p++;  // per-group packed-block count: no cursor consumer
+      assert(p < groupHeaderEnd);
+      uint8_t entryCount = (uint8_t) *p++;
+      const char* checkpointEntries = p;
+      assert(p + (size_t) entryCount * sizeof(uint64_t) <= groupHeaderEnd);
+      p += (size_t) entryCount * sizeof(uint64_t);
       int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - block);
+      int32_t groupStartBlock = block;
+      l0CheckpointEntries = checkpointEntries;
+      l0CheckpointCount = entryCount;
+      l0CheckpointGroupBody = groupHeaderEnd;
+      l0CheckpointGroupStartBlock = groupStartBlock;
       int64_t groupTfSum = 0;
       if constexpr (TrackPositions) {
         int32_t groupDocCount =
@@ -2440,7 +2520,19 @@ public:
       const char* groupBody = groupHeaderEnd;
       if (target <= (int32_t) groupLastDoc) {
         p = groupBody;
-        if (walkL0To(block + groupBlockCount)) {
+        if constexpr (!TrackPositions) {
+          L0Checkpoint checkpoint;
+          if (consultL0Checkpoints(
+                  checkpointEntries, entryCount, (uint32_t) target, -1,
+                  checkpoint)) {
+            p = groupBody + checkpoint.bodyOffset;
+            assert(p < groupBody + (int64_t) groupByteLen);
+            block = groupStartBlock + checkpoint.blockIdxInGroup;
+            prevLastDoc = checkpoint.key;
+            skipCount(SkipStats::l0CheckpointJumps);
+          }
+        }
+        if (walkL0To(groupStartBlock + groupBlockCount)) {
           return;
         }
         assert(false);
@@ -2662,6 +2754,10 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
   bool blockMode = false;
   bool docBlockResident = false;
   bool bodyReady = false;
+  const char* l0CheckpointEntries = nullptr;
+  const char* l0CheckpointGroupBody = nullptr;
+  int32_t l0CheckpointGroupStartBlock = -1;
+  uint8_t l0CheckpointCount = 0;
 
   // +8: expandDocWords writes branchless 8-wide rows; if the last byte of the
   // last word has popcount 0 (common - it just means the block's final doc
@@ -3319,6 +3415,20 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
     };
 
     if (!isL1Boundary(block)) {
+      int32_t groupStartBlock = (block / L1_PERIOD) * L1_PERIOD;
+      if ((int64_t) target - (int64_t) prevLastDoc
+              >= L0_CHECKPOINT_MIN_SKIP_DOCS
+          && l0CheckpointGroupStartBlock == groupStartBlock) {
+        L0Checkpoint checkpoint;
+        if (consultL0Checkpoints(
+                l0CheckpointEntries, l0CheckpointCount, (uint32_t) target,
+                block - groupStartBlock, checkpoint)) {
+          p = l0CheckpointGroupBody + checkpoint.bodyOffset;
+          block = groupStartBlock + checkpoint.blockIdxInGroup;
+          prevLastDoc = checkpoint.key;
+          skipCount(SkipStats::l0CheckpointJumps);
+        }
+      }
       int32_t nextGroupBlock = ((block / L1_PERIOD) + 1) * L1_PERIOD;
       if (walkL0To(nextGroupBlock)) {
         return;
@@ -3335,11 +3445,31 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
       uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
       assert(p < groupHeaderEnd);
       p++;  // per-group packed-block count: no cursor consumer
+      assert(p < groupHeaderEnd);
+      uint8_t entryCount = (uint8_t) *p++;
+      const char* checkpointEntries = p;
+      assert(p + (size_t) entryCount * sizeof(uint64_t) <= groupHeaderEnd);
+      p += (size_t) entryCount * sizeof(uint64_t);
       int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - block);
+      int32_t groupStartBlock = block;
+      l0CheckpointEntries = checkpointEntries;
+      l0CheckpointCount = entryCount;
+      l0CheckpointGroupBody = groupHeaderEnd;
+      l0CheckpointGroupStartBlock = groupStartBlock;
       const char* groupBody = groupHeaderEnd;
       if (target <= (int32_t) groupLastDoc) {
         p = groupBody;
-        if (walkL0To(block + groupBlockCount)) {
+        L0Checkpoint checkpoint;
+        if (consultL0Checkpoints(
+                checkpointEntries, entryCount, (uint32_t) target, -1,
+                checkpoint)) {
+          p = groupBody + checkpoint.bodyOffset;
+          assert(p < groupBody + (int64_t) groupByteLen);
+          block = groupStartBlock + checkpoint.blockIdxInGroup;
+          prevLastDoc = checkpoint.key;
+          skipCount(SkipStats::l0CheckpointJumps);
+        }
+        if (walkL0To(groupStartBlock + groupBlockCount)) {
           return;
         }
         assert(false);
@@ -3642,12 +3772,12 @@ public:
   BasicDocsEnum(const BasicDocsEnum&) = delete;
 };
 
-// The implementation is back to its pre-decomposition 1376-byte size after
-// deleting the unread next-L1 cumulative-tf cursor.
+// Each dense cursor keeps the current group's two directory pointers and its
+// compact group identity, adding 24 bytes.
 static_assert(sizeof(DocsEnumMeta) == 96);
-static_assert(sizeof(DocsEnumImpl) == 1376);
+static_assert(sizeof(DocsEnumImpl) == 1400);
 static_assert(sizeof(DocsEnumMeta) < sizeof(DocsEnumImpl));
-static_assert(sizeof(DocsOnlyEnum) == 696);
+static_assert(sizeof(DocsOnlyEnum) == 720);
 static_assert(sizeof(DocsOnlyEnum) < sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsFreqEnum) == sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsPosEnum) == sizeof(DocsEnumImpl));

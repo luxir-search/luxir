@@ -284,6 +284,135 @@ protected:
     return it == docs.end() ? DocsEnumMeta::END : *it;
   }
 
+  struct CheckpointTermModel {
+    std::string term;
+    std::vector<Posting> postings;
+  };
+
+  class CheckpointToggleGuard {
+    bool savedCheckpoints;
+    bool savedStats;
+
+  public:
+    CheckpointToggleGuard()
+        : savedCheckpoints(DocsEnumMeta::disableL0CheckpointsForTests),
+          savedStats(SkipStats::enabled) {
+      DocsEnumMeta::disableL0CheckpointsForTests = false;
+      SkipStats::enabled = false;
+      SkipStats::reset();
+    }
+
+    ~CheckpointToggleGuard() {
+      DocsEnumMeta::disableL0CheckpointsForTests = savedCheckpoints;
+      SkipStats::enabled = savedStats;
+      SkipStats::reset();
+    }
+  };
+
+  static std::string checkpointTermName(int32_t blocks) {
+    std::string digits = std::to_string(blocks);
+    return "checkpoint" + std::string(3 - digits.size(), '0') + digits;
+  }
+
+  static void writeCheckpointTerms(
+      RAMDir& dir, MemPool& pool,
+      std::vector<CheckpointTermModel>& models) {
+    models.resize(0);
+    int32_t maxDoc = 0;
+    for (int32_t blocks : {5, 8, 9, 32, 40, 100}) {
+      CheckpointTermModel model;
+      model.term = checkpointTermName(blocks);
+      model.postings.reserve(
+          (size_t) blocks * Postings::DOCS_BLOCK_SIZE);
+      for (int32_t block = 0; block < blocks; block++) {
+        int32_t blockBase =
+            block * (Postings::DOCS_BLOCK_SIZE + 1000)
+            + (block / 11) * 50000;
+        for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+          int32_t ord = block * Postings::DOCS_BLOCK_SIZE + i;
+          int32_t doc = blockBase + i;
+          model.postings.push_back({doc, 1, 1 + (ord % 3)});
+        }
+      }
+      maxDoc = std::max(maxDoc, model.postings.back().docid + 1);
+      models.push_back(std::move(model));
+    }
+
+    std::vector<uint8_t> norms((size_t) maxDoc, 1);
+    PostingsWriter postingsWriter(dir, 0, maxDoc);
+    {
+      TextWriter writer(postingsWriter);
+      auto& finfo = postingsWriter.addField("f");
+      finfo.type = FieldType::TEXT;
+      finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+      writer.startField(&finfo);
+      writer.setNorms(TextNormsView(norms, nullptr));
+      for (const CheckpointTermModel& model : models) {
+        TermRef term(pool, model.term.data(), (uint32_t) model.term.size());
+        writer.startTerm(term);
+        for (const Posting& posting : model.postings) {
+          writer.startDoc(posting.docid);
+          for (int32_t pos = 0; pos < posting.tf; pos++) {
+            writer.addPositionDelta(pos == 0 ? 2 : 1);
+          }
+          writer.endDoc(posting.docid, posting.tf);
+        }
+        writer.endTerm(term);
+      }
+      writer.endField();
+    }
+    postingsWriter.finish();
+  }
+
+  static const Posting* checkpointPostingAtOrAfter(
+      const CheckpointTermModel& model, int32_t target) {
+    auto found = std::lower_bound(
+        model.postings.begin(), model.postings.end(), target,
+        [](const Posting& posting, int32_t value) {
+          return posting.docid < value;
+        });
+    return found == model.postings.end() ? nullptr : &*found;
+  }
+
+  static std::vector<int32_t> checkpointTargets(
+      const CheckpointTermModel& model) {
+    int32_t blocks =
+        (int32_t) model.postings.size() / Postings::DOCS_BLOCK_SIZE;
+    std::vector<int32_t> targets;
+    for (int32_t ord = 0;
+         ord < std::min(
+             (int32_t) model.postings.size(),
+             2 * Postings::DOCS_BLOCK_SIZE);
+         ord += 19) {
+      targets.push_back(model.postings[(size_t) ord].docid);
+    }
+    for (int32_t block = 2; block < blocks; block += 7) {
+      targets.push_back(
+          model.postings[
+              (size_t) block * Postings::DOCS_BLOCK_SIZE + 13].docid + 5);
+    }
+    for (int32_t block = TextWriter::kCheckpointStride;
+         block < blocks; block += TextWriter::kCheckpointStride) {
+      targets.push_back(
+          model.postings[
+              (size_t) block * Postings::DOCS_BLOCK_SIZE - 1].docid);
+      targets.push_back(
+          model.postings[
+              (size_t) block * Postings::DOCS_BLOCK_SIZE].docid);
+    }
+    for (int32_t groupEnd = DocsEnumMeta::L1_PERIOD;
+         groupEnd < blocks; groupEnd += DocsEnumMeta::L1_PERIOD) {
+      targets.push_back(
+          model.postings[
+              (size_t) groupEnd * Postings::DOCS_BLOCK_SIZE - 1].docid + 1);
+    }
+    targets.push_back(model.postings.back().docid + 1);
+    std::ranges::sort(targets);
+    auto duplicates = std::ranges::unique(targets);
+    targets.erase(duplicates.begin(), duplicates.end());
+    return targets;
+  }
+
   void writeRawSingleTerm(RAMDir& dir, MemPool& pool, std::string_view term,
                           const std::vector<int32_t>& docs) {
     ASSERT_FALSE(docs.empty());
@@ -1401,6 +1530,189 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
   ASSERT_GT(SkipStats::l1GroupSteps, 0);
   SkipStats::enabled = savedStats;
   SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, l0CheckpointParityAndPositionTracking) {
+  RAMDir dir;
+  MemPool pool;
+  std::vector<CheckpointTermModel> models;
+  writeCheckpointTerms(dir, pool, models);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  CheckpointToggleGuard guard;
+
+  auto runFreqs = [&](const CheckpointTermModel& model,
+                      const std::vector<int32_t>& targets,
+                      bool disableCheckpoints, bool docsOnly) {
+    DocsEnumMeta::disableL0CheckpointsForTests = disableCheckpoints;
+    TermsEnum terms(pool, reader, fieldInfo);
+    std::vector<int32_t> sequence;
+    if (!terms.seek(model.term)) {
+      ADD_FAILURE() << model.term;
+      return sequence;
+    }
+    DocsFreqEnum docs(terms);
+    int32_t current = -1;
+    for (int32_t target : targets) {
+      if (target <= current) {
+        continue;
+      }
+      current = docsOnly
+          ? docs.advanceDocOnly(target) : docs.advance(target);
+      const Posting* expected =
+          checkpointPostingAtOrAfter(model, target);
+      int32_t expectedDoc =
+          expected == nullptr ? DocsEnumMeta::END : expected->docid;
+      EXPECT_EQ(current, expectedDoc)
+          << model.term << " target=" << target
+          << " docsOnly=" << docsOnly
+          << " disabled=" << disableCheckpoints;
+      sequence.push_back(current);
+      if (current == DocsEnumMeta::END) {
+        break;
+      }
+      if (!docsOnly) {
+        EXPECT_EQ(docs.termFreq(), expected->tf)
+            << model.term << " doc=" << current;
+      }
+    }
+    return sequence;
+  };
+
+  auto runDocsTier = [&](const CheckpointTermModel& model,
+                         const std::vector<int32_t>& targets,
+                         bool disableCheckpoints) {
+    DocsEnumMeta::disableL0CheckpointsForTests = disableCheckpoints;
+    TermsEnum terms(pool, reader, fieldInfo);
+    std::vector<int32_t> sequence;
+    if (!terms.seek(model.term)) {
+      ADD_FAILURE() << model.term;
+      return sequence;
+    }
+    DocsOnlyEnum docs(terms);
+    int32_t current = -1;
+    for (int32_t target : targets) {
+      if (target <= current) {
+        continue;
+      }
+      current = docs.advance(target);
+      const Posting* expected =
+          checkpointPostingAtOrAfter(model, target);
+      EXPECT_EQ(current, expected == nullptr
+                             ? DocsEnumMeta::END : expected->docid)
+          << model.term << " target=" << target
+          << " disabled=" << disableCheckpoints;
+      sequence.push_back(current);
+      if (current == DocsEnumMeta::END) {
+        break;
+      }
+    }
+    return sequence;
+  };
+
+  for (const CheckpointTermModel& model : models) {
+    SCOPED_TRACE(model.term);
+    std::vector<int32_t> targets = checkpointTargets(model);
+    EXPECT_EQ(runFreqs(model, targets, false, false),
+              runFreqs(model, targets, true, false));
+    EXPECT_EQ(runFreqs(model, targets, false, true),
+              runFreqs(model, targets, true, true));
+    EXPECT_EQ(runDocsTier(model, targets, false),
+              runDocsTier(model, targets, true));
+  }
+
+  const CheckpointTermModel& positional = models.back();
+  std::vector<int32_t> positionalTargets = checkpointTargets(positional);
+  auto runPositions = [&](bool disableCheckpoints) {
+    DocsEnumMeta::disableL0CheckpointsForTests = disableCheckpoints;
+    TermsEnum terms(pool, reader, fieldInfo);
+    std::vector<int32_t> sequence;
+    if (!terms.seek(positional.term)) {
+      ADD_FAILURE() << positional.term;
+      return sequence;
+    }
+    DocsPosEnum docs(terms);
+    PosEnum positions(docs);
+    int32_t current = -1;
+    for (int32_t target : positionalTargets) {
+      if (target <= current) {
+        continue;
+      }
+      current = docs.advance(target);
+      const Posting* expected =
+          checkpointPostingAtOrAfter(positional, target);
+      EXPECT_EQ(current, expected == nullptr
+                             ? DocsEnumMeta::END : expected->docid)
+          << "target=" << target
+          << " disabled=" << disableCheckpoints;
+      sequence.push_back(current);
+      if (current == DocsEnumMeta::END) {
+        break;
+      }
+      if (expected == nullptr) {
+        ADD_FAILURE() << "missing model posting for doc=" << current;
+        break;
+      }
+      EXPECT_EQ(docs.termFreq(), expected->tf);
+      positions.startPositions();
+      for (int32_t i = 0; i < expected->tf; i++) {
+        EXPECT_EQ(positions.nextPosition(), expected->firstPos + i)
+            << "doc=" << current << " posOrd=" << i;
+      }
+      EXPECT_EQ(positions.nextPosition(), PosEnum::END)
+          << "doc=" << current;
+    }
+    return sequence;
+  };
+  EXPECT_EQ(runPositions(false), runPositions(true));
+}
+
+TEST_F(DocsEnumAdvanceTest, l0CheckpointEngagementAndKillSwitch) {
+  RAMDir dir;
+  MemPool pool;
+  std::vector<CheckpointTermModel> models;
+  writeCheckpointTerms(dir, pool, models);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  const CheckpointTermModel& dense = models.back();
+  CheckpointToggleGuard guard;
+  SkipStats::enabled = true;
+
+  auto run = [&](bool disableCheckpoints) {
+    DocsEnumMeta::disableL0CheckpointsForTests = disableCheckpoints;
+    SkipStats::reset();
+    TermsEnum terms(pool, reader, fieldInfo);
+    if (!terms.seek(dense.term)) {
+      ADD_FAILURE() << dense.term;
+      return std::pair<int64_t, int64_t>{-1, -1};
+    }
+    DocsFreqEnum docs(terms);
+    for (int32_t block : {20, 29, 55, 90}) {
+      const Posting& expected = dense.postings[
+          (size_t) block * Postings::DOCS_BLOCK_SIZE];
+      EXPECT_EQ(docs.advance(expected.docid), expected.docid)
+          << "block=" << block;
+      EXPECT_EQ(docs.termFreq(), expected.tf)
+          << "block=" << block;
+    }
+    return std::pair{
+        SkipStats::l0CheckpointJumps,
+        SkipStats::l0HeaderSteps};
+  };
+
+  auto enabled = run(false);
+  auto disabled = run(true);
+  EXPECT_GT(enabled.first, 0);
+  EXPECT_EQ(disabled.first, 0);
+  EXPECT_LT(enabled.second, disabled.second);
 }
 
 TEST_F(DocsEnumAdvanceTest, packedFrontierScoreMatchesScalarBitExact) {

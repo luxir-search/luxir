@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <assert.h>
@@ -421,6 +422,10 @@ public:
 // TODO: we need a specialization of this for when positions are not required (indexed string fields)
 class TextWriter {
 public:
+  static constexpr int32_t L1_PERIOD = 32;
+  static constexpr int32_t kCheckpointStride = 8;
+  static inline int32_t checkpointStrideForTests = kCheckpointStride;
+
   struct RangeResult {
     std::vector<uint64_t> termBlockOffsets;
     std::vector<std::string> separatorKeys;
@@ -483,8 +488,6 @@ private:
   std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
-  static constexpr int32_t L1_PERIOD = 32;
-
   // base (starting) values int the associated output streams to calculate offsets from
   int64_t termsLoc=0;
   int64_t docsLoc;
@@ -515,6 +518,8 @@ private:
   uint64_t l1GroupTfSum = 0;
   uint32_t l1GroupMaxTf = 0;
   uint32_t l1GroupMinNorm = 0;
+  std::array<uint32_t, L1_PERIOD> l1BlockLastDocs{};
+  std::array<uint64_t, L1_PERIOD> l1BlockBodyOffsets{};
   // Group-level (norm -> maxTf) surface for the buffered L1 group, merged from
   // each flushed block's frontier points.  The group header stores its Pareto
   // frontier (same staircase as L0 and the term dictionary) so group bounds
@@ -552,6 +557,8 @@ private:
   // max score must come from stored data, never a walk of the postings.
   std::array<uint32_t, 256> termMaxTfPerNorm;
   std::vector<char> termImpactRun;  // per-term encoded frontiers for the current term block
+  static inline bool disableL0CheckpointWrite =
+      std::getenv("SOLUX_DISABLE_L0_CHECKPOINT_WRITE") != nullptr;
 
 private:  // some internal utility methods... not for use by indexers
   void anchorPositionedDocBlock() {
@@ -871,6 +878,10 @@ private:  // some internal utility methods... not for use by indexers
 
   void appendL0Block(uint32_t lastDoc, uint32_t base, uint64_t blockByteLen,
                      uint32_t docCount, uint64_t tfSum, uint32_t maxTf, uint32_t minNorm) {
+    assert(l1GroupBlockCount >= 0 && l1GroupBlockCount < L1_PERIOD);
+    l1BlockLastDocs[(size_t) l1GroupBlockCount] = lastDoc;
+    l1BlockBodyOffsets[(size_t) l1GroupBlockCount] =
+        (uint64_t) group_output.size();
     // Position anchor for this doc block, captured at its first startDoc.
     assert(pendingBlockPosByteOff >= locOfPositionsForTerm);
     uint64_t posByteOff = hasPositions
@@ -916,6 +927,29 @@ private:  // some internal utility methods... not for use by indexers
     appendVlong15(header_output, group_output.size());
     assert(l1GroupPackedBlockCount <= (uint32_t) L1_PERIOD);
     header_output.push_back((char) l1GroupPackedBlockCount);
+    assert(checkpointStrideForTests > 0);
+    uint8_t entryCount = disableL0CheckpointWrite
+        ? 0
+        : (uint8_t) ((l1GroupBlockCount - 1) / checkpointStrideForTests);
+    header_output.push_back((char) entryCount);
+    if (!disableL0CheckpointWrite) {
+      uint32_t previousKey = 0;
+      for (int32_t b = checkpointStrideForTests; b < l1GroupBlockCount;
+           b += checkpointStrideForTests) {
+        uint32_t key = l1BlockLastDocs[(size_t) b - 1];
+        uint64_t bodyOffset = l1BlockBodyOffsets[(size_t) b];
+        assert(b == checkpointStrideForTests || key > previousKey);
+        assert(bodyOffset < (1u << 24));
+        assert(b > 0 && b < L1_PERIOD);
+        uint64_t entry = ((uint64_t) key << 32)
+            | ((uint64_t) (uint32_t) b << 24) | bodyOffset;
+        static_assert(std::endian::native == std::endian::little);
+        size_t offset = header_output.size();
+        header_output.resize(offset + sizeof(entry));
+        memcpy(header_output.data() + offset, &entry, sizeof(entry));
+        previousKey = key;
+      }
+    }
     if (hasPositions) {
       assert(l1GroupTfSum >= (uint64_t) l1GroupDocCount);
       appendVint(header_output, (uint32_t) (l1GroupTfSum - (uint64_t) l1GroupDocCount));
@@ -942,6 +976,8 @@ private:  // some internal utility methods... not for use by indexers
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
+    l1BlockLastDocs.fill(0);
+    l1BlockBodyOffsets.fill(0);
     l1GroupMaxTfPerNorm.fill(0);
   }
 
@@ -1395,6 +1431,8 @@ public:
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
+    l1BlockLastDocs.fill(0);
+    l1BlockBodyOffsets.fill(0);
     l1GroupMaxTfPerNorm.fill(0);
     group_output.resize(0);
     termMaxTfPerNorm.fill(0);

@@ -30,6 +30,8 @@ struct SkipStats {
   // Per-block L0 headers walked in skipToBlock (within an L1 group). Bounded by
   // ~L1_PERIOD per advance; the within-group skip cost.
   static inline int64_t l0HeaderSteps = 0;
+  // Direct jumps to sampled L0 headers within an L1 group.
+  static inline int64_t l0CheckpointJumps = 0;
   // L1 group headers walked in skipToBlock. The level2 decision metric: if this
   // dominates on long-list queries, a coarser third level pays off.
   static inline int64_t l1GroupSteps = 0;
@@ -221,6 +223,7 @@ struct SkipStats {
     docBlocksDecoded = 0;
     tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;
+    l0CheckpointJumps = 0;
     l1GroupSteps = 0;
     advanceCalls = 0;
     posSeeks = 0;

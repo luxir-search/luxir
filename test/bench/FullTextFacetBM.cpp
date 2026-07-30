@@ -1519,6 +1519,7 @@ static void BM_SkipEffectiveness(benchmark::State& state,
   ScoreTopKResult pruned = runMultiTermDisjunctionTopK(*reader, terms, topK, useFrontier, true);
   int64_t blocksDecoded = SkipStats::docBlocksDecoded;
   int64_t l0Steps = SkipStats::l0HeaderSteps;
+  int64_t l0CheckpointJumps = SkipStats::l0CheckpointJumps;
   int64_t l1Steps = SkipStats::l1GroupSteps;
   int64_t advanceCalls = SkipStats::advanceCalls;
   int64_t partitionLatchReuses = SkipStats::maxScorePartitionLatchReuses;
@@ -1545,6 +1546,7 @@ static void BM_SkipEffectiveness(benchmark::State& state,
   state.counters["pct_decoded"] =
     blocksTotal > 0 ? (double) blocksDecoded * 100.0 / (double) blocksTotal : 0.0;
   state.counters["l0_header_steps"] = (double) l0Steps;
+  state.counters["l0_checkpoint_jumps"] = (double) l0CheckpointJumps;
   state.counters["l1_group_steps"] = (double) l1Steps;
   state.counters["advance_calls"] = (double) advanceCalls;
   state.counters["partition_latch_reuses"] = (double) partitionLatchReuses;
