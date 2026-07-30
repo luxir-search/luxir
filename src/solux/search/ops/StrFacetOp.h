@@ -661,7 +661,7 @@ public:
           } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
             profile->details.emplace_back(domainView.compCard == 0
                 ? "all-docs domain, docFreq-only dictionary walk"
-                : "inverted domain view, adaptive point/bulk ord loads");
+                : "inverted domain view, u8 staging");
           } else {
             profile->details.emplace_back(
                 "per-term smallest-side postings intersection");
@@ -693,14 +693,38 @@ public:
         };
 
         if (strategy != StrFacetStrategy::COLUMN_DOMAIN) {
-          std::vector<int32_t> localCounts((size_t)segFieldInfo.nTerms);
           TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
+          int64_t nTerms = segFieldInfo.nTerms;
+
+          // One fused pass shared by every postings-side strategy: stream
+          // docFreqs in local-ord order, apply the strategy's per-ord count,
+          // unpack the local->global mapping in the same 128-ord frames
+          // forEachMappedOrd uses, and add only finished positive counts.
+          // SegmentMergeDriver shares one accumulator across segments, so
+          // intermediate complement counts must never reach it - and with
+          // counts finished inside the stream, nothing here needs a
+          // separate drain pass over ord space.
+          uint64_t deltaFrame[128];
+          auto emitCounts = [&](auto&& countOf) {
+            terms.forEachDocFreq(
+                [&](int64_t localOrd, int32_t docFreq) SOLUX_INLINE {
+              if (mapping.bits != 0 && (localOrd & 127) == 0) {
+                mapping.unpackDeltas((size_t)localOrd,
+                    (uint32_t)std::min<int64_t>(128, nTerms - localOrd),
+                    deltaFrame);
+              }
+              int32_t count = countOf(localOrd, docFreq);
+              if (count > 0) {
+                addGlobalCount(mapping.bits == 0
+                    ? localOrd
+                    : localOrd + (int64_t)deltaFrame[localOrd & 127], count);
+              }
+            });
+          };
 
           if (domainView.compCard == 0) {
             // Shared S2/S3 all-docs path: no ord column or postings enum.
-            terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
-              localCounts[(size_t)localOrd] = docFreq;
-            });
+            emitCounts([](int64_t, int32_t docFreq) { return docFreq; });
             if (thisOp().missing) {
               data.missing_num +=
                   (int64_t)maxDoc - segFieldInfo.docsWithField;
@@ -708,6 +732,15 @@ public:
           } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
             int64_t compMissing = 0;
             OrdColReader ordColReader(postingsReader, segFieldInfo);
+            // Skinny-style local staging, for skinny's reason: memory. A u8
+            // per term (nTerms bytes, not 4x that) counts the walk; an ord
+            // that wraps (one wrap per 256 hits, so at most compCard/256
+            // entries) is side-listed and the sorted wraps merge back as
+            // +256 runs in the ord-ordered emit stream. Unlike the shared
+            // skinny counter there is no overflow map to probe: the emit
+            // stream visits every ord in order, so the merge is free.
+            std::vector<uint8_t> localCounts((size_t)nTerms);
+            std::vector<int32_t> wraps;
             forEachComplementOrdValue(
                 domainView, poolGuard.pool(), ordColReader, compMissing,
                 [&](int32_t docid, int32_t value) SOLUX_INLINE {
@@ -715,15 +748,31 @@ public:
                   // Column value 0 is missing; value v maps to term ord v-1.
                   // Multi-valued ord columns hold distinct ords per doc, so
                   // this counts the same doc-term pairs as docFreq.
-                  localCounts[(size_t)value - 1]++;
+                  size_t ord = (size_t)value - 1;
+                  if (++localCounts[ord] == 0) {
+                    wraps.push_back((int32_t)ord);
+                  }
                 });
-
-            terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
+            std::sort(wraps.begin(), wraps.end());
+            // Sentinel keeps the emit stream's wrap check to one register
+            // compare per term; the rare match absorbs any repeats.
+            size_t wrapIdx = 0;
+            int64_t nextWrap = wraps.empty()
+                ? std::numeric_limits<int64_t>::max() : wraps[0];
+            emitCounts([&](int64_t localOrd, int32_t docFreq) {
               int32_t complementCount = localCounts[(size_t)localOrd];
+              if (localOrd == nextWrap) {
+                do {
+                  complementCount += 256;
+                  wrapIdx++;
+                  nextWrap = wrapIdx < wraps.size()
+                      ? wraps[wrapIdx] : std::numeric_limits<int64_t>::max();
+                } while (nextWrap == localOrd);
+              }
               // Deleted postings are present in both docFreq and the
               // complement column walk, so the subtraction remains exact.
               assert(complementCount <= docFreq);
-              localCounts[(size_t)localOrd] = docFreq - complementCount;
+              return docFreq - complementCount;
             });
 
             if (thisOp().missing) {
@@ -737,13 +786,10 @@ public:
                   domainView.card - docsWithValueInDomain;
             }
           } else {
-            if (domainView.compCard != 0) {
-              domainView.materializeBits(poolGuard.pool());
-            }
-            terms.forEachDocFreq([&](int64_t localOrd, int32_t docFreq) {
+            domainView.materializeBits(poolGuard.pool());
+            emitCounts([&](int64_t, int32_t docFreq) {
               DocsOnlyEnum postings(terms);
-              localCounts[(size_t)localOrd] =
-                  countTermInDomain(domainView, postings, docFreq);
+              return countTermInDomain(domainView, postings, docFreq);
             });
             if (thisOp().missing) {
               DocsReader docsReader(postingsReader, segFieldInfo);
@@ -751,17 +797,6 @@ public:
                   countMissingInDomain(domainView, docsReader);
             }
           }
-
-          // SegmentMergeDriver shares one accumulator across segments. S2/S3
-          // always stage in local-ord space and cross the 128-ord mapping frames
-          // only while draining completed direct domain counts.
-          forEachMappedOrd(localCounts.size(),
-                           [&](size_t localOrd, int64_t globalOrd) {
-            int32_t count = localCounts[localOrd];
-            if (count > 0) {
-              addGlobalCount(globalOrd, count);
-            }
-          });
           return;
         }
 
