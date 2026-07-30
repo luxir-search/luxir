@@ -428,6 +428,15 @@ public:
   // A/B toggle: require cached-DocSet provenance for the exact filtered
   // conjunction batch instead of streaming an uncached term filter's postings.
   static inline bool disableFilteredConjunctionPostingsFeedForTests = false;
+  // A/B toggle: keep multi-term exact filtered conjunctions on their previous
+  // body-led route.
+  static inline bool disableFilteredConjMultiTermForTests = false;
+  // Fenrir 5M 1-seg, 300-query intersection class, filters at 1% and 0.11%
+  // density, 2026-07-29: ratio>=4 wins on all four filter x cache-regime legs;
+  // 1-4 is regime-dependent (uncached wins from ~1, cached loses to the
+  // warm-DocSet mask until ~4); below 1 the filter cannot lead.
+  static inline int64_t multiTermBatchMinRatioDocSet = 4;
+  static inline int64_t multiTermBatchMinRatioPostings = 2;
   // A/B toggle for the count-only unmatched-candidate compaction inside the
   // DocSet batch route.
   static inline bool disableFilteredDisjunctionCountCompactionForTests = false;
@@ -1166,6 +1175,23 @@ public:
         }
         std::sort(entries.begin(), entries.end(),
                   [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+        if (mode == ConjunctionMode::EXACT_FILTERED) {
+          if (!entries[0].filter) {
+            return nullptr;
+          }
+          for (size_t i = 1; i < entries.size(); i++) {
+            if (dynamic_cast<TermQuery::Weight::Supplier*>(
+                    entries[i].supplier) == nullptr) {
+              return nullptr;
+            }
+          }
+          int64_t minRatio = entries[0].docSetFilter
+              ? multiTermBatchMinRatioDocSet
+              : multiTermBatchMinRatioPostings;
+          if (entries[1].cost < minRatio * entries[0].cost) {
+            return nullptr;
+          }
+        }
         if (docSetLeads != nullptr) {
           *docSetLeads = entries[0].docSetFilter;
         }
@@ -1735,7 +1761,10 @@ public:
         }
         if (needsScores && !allowsPruning
             && !disableFilteredConjunctionBatchForTests
-            && !filterSuppliers.empty() && mandatorySources.size() == 1
+            && !filterSuppliers.empty()
+            && mandatorySources.size() >= 1
+            && (!disableFilteredConjMultiTermForTests
+                || mandatorySources.size() == 1)
             && optionalSources.empty() && prohibitedSources.empty()) {
           bool docSetLeads = false;
           bool docSetTermTail = false;
@@ -1747,6 +1776,10 @@ public:
               && ((docSetLeads && docSetTermTail)
                   || postingsFilterLeads)) {
             skipCount(SkipStats::filteredConjBatchEngagements);
+            if (mandatorySources.size() > 1) {
+              skipCount(
+                  SkipStats::filteredConjBatchMultiTermEngagements);
+            }
             if (postingsFilterLeads) {
               skipCount(
                   SkipStats::filteredConjBatchPostingsFeedEngagements);

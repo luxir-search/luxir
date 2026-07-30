@@ -128,6 +128,52 @@ public:
   }
 };
 
+class FilteredConjMultiTermGuard {
+  bool saved;
+
+public:
+  explicit FilteredConjMultiTermGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredConjMultiTermForTests) {
+    BooleanQuery::disableFilteredConjMultiTermForTests = disabled;
+  }
+
+  ~FilteredConjMultiTermGuard() {
+    BooleanQuery::disableFilteredConjMultiTermForTests = saved;
+  }
+};
+
+class FilteredConjunctionBatchGuard {
+  bool saved;
+
+public:
+  explicit FilteredConjunctionBatchGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredConjunctionBatchForTests) {
+    BooleanQuery::disableFilteredConjunctionBatchForTests = disabled;
+  }
+
+  ~FilteredConjunctionBatchGuard() {
+    BooleanQuery::disableFilteredConjunctionBatchForTests = saved;
+  }
+};
+
+class FilteredConjRatioGuard {
+  int64_t savedDocSet;
+  int64_t savedPostings;
+
+public:
+  explicit FilteredConjRatioGuard(int64_t ratio)
+    : savedDocSet(BooleanQuery::multiTermBatchMinRatioDocSet),
+      savedPostings(BooleanQuery::multiTermBatchMinRatioPostings) {
+    BooleanQuery::multiTermBatchMinRatioDocSet = ratio;
+    BooleanQuery::multiTermBatchMinRatioPostings = ratio;
+  }
+
+  ~FilteredConjRatioGuard() {
+    BooleanQuery::multiTermBatchMinRatioDocSet = savedDocSet;
+    BooleanQuery::multiTermBatchMinRatioPostings = savedPostings;
+  }
+};
+
 class FilteredDisjunctionArrayFeedGuard {
   bool saved;
 
@@ -1559,6 +1605,250 @@ TEST(FilterCacheIntegrationTest,
   EXPECT_EQ(cachedResult.scores, postingsResult.scores);
   EXPECT_EQ(0, disabledResult.batchEngagements);
   EXPECT_EQ(0, disabledResult.postingsFeedEngagements);
+}
+
+enum class ExactFilteredConjShape {
+  THREE_TERMS,
+  RARE_TERM,
+  PHRASE,
+  TWO_FILTERS,
+};
+
+struct ExactFilteredConjResult {
+  int64_t count = 0;
+  std::vector<std::string> ids;
+  std::vector<float> scores;
+  int64_t batchEngagements = 0;
+  int64_t multiTermEngagements = 0;
+  int64_t postingsFeedEngagements = 0;
+};
+
+bool indexExactFilteredConjDocs(SoluxNode& node,
+                                std::string_view collection) {
+  constexpr int32_t maxDoc = 2000;
+  solux::test::CollectionHelper helper(node, collection);
+  std::vector<solux::test::Doc> docs;
+  docs.reserve((size_t) maxDoc);
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    // gamma is absent from 2/3 of docs so the batch's tail probes reject
+    // (and compact away) most filter-led candidates instead of all matching.
+    std::string body = "alpha beta quick fox";
+    for (int32_t repeat = 0; repeat < doc % 5; repeat++) {
+      body += " alpha";
+    }
+    for (int32_t repeat = 0; repeat < doc % 3; repeat++) {
+      body += " beta";
+    }
+    if (doc % 3 == 0) {
+      for (int32_t repeat = 0; repeat <= doc % 2; repeat++) {
+        body += " gamma";
+      }
+    }
+    if (doc % 100 == 0) {
+      body += " rare";
+    }
+    docs.push_back(solux::test::flatdoc(
+        "id", std::to_string(doc), "body_w", body,
+        "filter_w", doc % 40 == 0 ? "selected" : "other",
+        "second_filter_w", doc % 20 == 0 ? "wide" : "other"));
+  }
+  return helper.indexAll(docs, UpdateMessage::COMMIT).success;
+}
+
+ExactFilteredConjResult runExactFilteredConj(
+    SoluxNode& node, std::string_view collection,
+    ExactFilteredConjShape shape, bool disableMultiTerm,
+    bool disableBatch = false) {
+  FilteredConjMultiTermGuard multiTermGuard(disableMultiTerm);
+  FilteredConjunctionBatchGuard batchGuard(disableBatch);
+  OwnedFilterStatsGuard statsGuard;
+  auto request = solux::test::localReq(node.getSearchEngine());
+  request->collection(collection);
+  auto& cursor = request->topDocs("q");
+  cursor.getNumber().withStats().fields({"id"}).limit(100);
+  switch (shape) {
+    case ExactFilteredConjShape::THREE_TERMS:
+      cursor.rawQuery() = solux::test::qb::boolean(
+          cursor.mr(),
+          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           solux::test::qb::match(cursor.mr(), "body_w", "beta"),
+           solux::test::qb::match(cursor.mr(), "body_w", "gamma")});
+      cursor.matchFilter("selection", "filter_w", "selected");
+      break;
+    case ExactFilteredConjShape::RARE_TERM:
+      cursor.rawQuery() = solux::test::qb::boolean(
+          cursor.mr(),
+          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           solux::test::qb::match(cursor.mr(), "body_w", "rare")});
+      cursor.matchFilter("selection", "filter_w", "selected");
+      break;
+    case ExactFilteredConjShape::PHRASE:
+      cursor.rawQuery() = solux::test::qb::phraseWords(
+          cursor.mr(), "body_w", {"quick", "fox"});
+      cursor.matchFilter("selection", "filter_w", "selected");
+      break;
+    case ExactFilteredConjShape::TWO_FILTERS:
+      cursor.rawQuery() = solux::test::qb::boolean(
+          cursor.mr(),
+          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           solux::test::qb::match(cursor.mr(), "body_w", "beta")});
+      cursor.matchFilter("selection", "filter_w", "selected");
+      cursor.matchFilter("wide", "second_filter_w", "wide");
+      break;
+  }
+  request->execute(false);
+  EXPECT_TRUE(request->ok()) << request->errorMsg();
+
+  ExactFilteredConjResult result;
+  if (!request->ok()) {
+    return result;
+  }
+  result.count = request->getMatchCount("q");
+  const auto* list = request->docList("q");
+  if (list != nullptr) {
+    const auto* idColumn = list->columns.find("id");
+    const auto* scoreColumn = list->columns.find("_score_");
+    EXPECT_NE(nullptr, idColumn);
+    EXPECT_NE(nullptr, scoreColumn);
+    if (idColumn != nullptr && scoreColumn != nullptr) {
+      const auto* ids = std::get_if<api::ColStr>(&idColumn->kind);
+      const auto* scores = std::get_if<api::ColFloat>(&scoreColumn->kind);
+      EXPECT_NE(nullptr, ids);
+      EXPECT_NE(nullptr, scores);
+      if (ids != nullptr && scores != nullptr) {
+        for (auto id : ids->v) {
+          result.ids.emplace_back(id);
+        }
+        result.scores.assign(scores->v.begin(), scores->v.end());
+      }
+    }
+  }
+  result.batchEngagements = SkipStats::filteredConjBatchEngagements;
+  result.multiTermEngagements =
+      SkipStats::filteredConjBatchMultiTermEngagements;
+  result.postingsFeedEngagements =
+      SkipStats::filteredConjBatchPostingsFeedEngagements;
+  return result;
+}
+
+void expectSameExactFilteredConj(const ExactFilteredConjResult& expected,
+                                 const ExactFilteredConjResult& actual) {
+  EXPECT_EQ(expected.count, actual.count);
+  EXPECT_EQ(expected.ids, actual.ids);
+  EXPECT_EQ(expected.scores, actual.scores);
+}
+
+TEST(FilterCacheIntegrationTest,
+     filteredConjMultiTermMatchesCachedAndPostingsFilters) {
+  SoluxConfig cachedConfig;
+  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  SoluxConfig uncachedConfig;
+  uncachedConfig.filterCacheBytes = 0;
+  SoluxNode cachedNode(cachedConfig);
+  SoluxNode uncachedNode(uncachedConfig);
+  constexpr std::string_view collection =
+      "filtered_conj_multi_term_provenance";
+  ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
+  ASSERT_TRUE(indexExactFilteredConjDocs(uncachedNode, collection));
+
+  runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::THREE_TERMS, false);
+  runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::THREE_TERMS, false);
+  ExactFilteredConjResult cached = runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::THREE_TERMS, false);
+  ExactFilteredConjResult cachedBaseline = runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::THREE_TERMS, true);
+  ExactFilteredConjResult postings = runExactFilteredConj(
+      uncachedNode, collection, ExactFilteredConjShape::THREE_TERMS, false);
+  ExactFilteredConjResult postingsBaseline = runExactFilteredConj(
+      uncachedNode, collection, ExactFilteredConjShape::THREE_TERMS, true);
+
+  EXPECT_EQ(17, cached.count);
+  expectSameExactFilteredConj(cachedBaseline, cached);
+  expectSameExactFilteredConj(postingsBaseline, postings);
+  EXPECT_GT(cached.multiTermEngagements, 0);
+  EXPECT_EQ(0, cached.postingsFeedEngagements);
+  EXPECT_GT(postings.multiTermEngagements, 0);
+  EXPECT_GT(postings.postingsFeedEngagements, 0);
+  EXPECT_EQ(0, cachedBaseline.multiTermEngagements);
+  EXPECT_EQ(0, postingsBaseline.multiTermEngagements);
+}
+
+TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
+  SoluxConfig config;
+  config.filterCacheBytes = 0;
+  SoluxNode node(config);
+  constexpr std::string_view collection = "filtered_conj_ratio_gate";
+  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+
+  ExactFilteredConjResult engaged = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::THREE_TERMS, false);
+  ExactFilteredConjResult declined;
+  {
+    FilteredConjRatioGuard ratioGuard(1000000);
+    declined = runExactFilteredConj(
+        node, collection, ExactFilteredConjShape::THREE_TERMS, false);
+  }
+
+  expectSameExactFilteredConj(engaged, declined);
+  EXPECT_GT(engaged.multiTermEngagements, 0);
+  EXPECT_EQ(0, declined.batchEngagements);
+  EXPECT_EQ(0, declined.multiTermEngagements);
+}
+
+TEST(FilterCacheIntegrationTest, filteredConjMultiTermRequiresFilterLead) {
+  SoluxConfig config;
+  config.filterCacheBytes = 0;
+  SoluxNode node(config);
+  constexpr std::string_view collection = "filtered_conj_filter_lead";
+  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+
+  ExactFilteredConjResult enabled = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult baseline = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::RARE_TERM, true);
+
+  EXPECT_EQ(10, enabled.count);
+  expectSameExactFilteredConj(baseline, enabled);
+  EXPECT_EQ(0, enabled.batchEngagements);
+  EXPECT_EQ(0, enabled.multiTermEngagements);
+}
+
+TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
+  SoluxConfig config;
+  config.filterCacheBytes = 0;
+  SoluxNode node(config);
+  constexpr std::string_view collection = "filtered_conj_phrase_tail";
+  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+
+  ExactFilteredConjResult enabled = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::PHRASE, false);
+  ExactFilteredConjResult baseline = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::PHRASE, false, true);
+
+  EXPECT_EQ(50, enabled.count);
+  expectSameExactFilteredConj(baseline, enabled);
+  EXPECT_EQ(0, enabled.batchEngagements);
+}
+
+TEST(FilterCacheIntegrationTest, filteredConjTwoTermFiltersPreserveScores) {
+  SoluxConfig config;
+  config.filterCacheBytes = 0;
+  SoluxNode node(config);
+  constexpr std::string_view collection = "filtered_conj_two_filters";
+  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+
+  ExactFilteredConjResult enabled = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::TWO_FILTERS, false);
+  ExactFilteredConjResult baseline = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::TWO_FILTERS, true);
+
+  EXPECT_EQ(50, enabled.count);
+  expectSameExactFilteredConj(baseline, enabled);
+  EXPECT_GT(enabled.multiTermEngagements, 0);
+  EXPECT_GT(enabled.postingsFeedEngagements, 0);
+  EXPECT_EQ(0, baseline.multiTermEngagements);
 }
 
 TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {
