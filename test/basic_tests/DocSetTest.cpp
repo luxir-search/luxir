@@ -146,7 +146,7 @@ TEST_F(DocSetTest, builderAddWindowWordsMasksFinalPartialWord) {
   words[0] = (1ULL << 0) | (1ULL << 1) | (1ULL << 63);
   words[1] = (1ULL << 0) | (1ULL << 4) | (1ULL << 10);
 
-  builder.addWindowWords(words.data(), 3, 72);
+  builder.addWindowWords(words.data(), 3, 72, 5);
   auto set = builder.build();
 
   ASSERT_EQ(set->type, DocSet::ARRAY);
@@ -161,7 +161,7 @@ TEST_F(DocSetTest, builderAddWindowWordsPromotesAtAddBoundary) {
 
   std::array<uint64_t, 1> words{};
   words[0] = (1ULL << 0) | (1ULL << 10);
-  builder.addWindowWords(words.data(), 10, 21);
+  builder.addWindowWords(words.data(), 10, 21, 2);
   auto set = builder.build();
 
   ASSERT_EQ(set->type, DocSet::BITSET);

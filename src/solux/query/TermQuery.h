@@ -1182,11 +1182,13 @@ public:
       if (!fillFilteredWindowBits(filter)) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
-      if (domainOut != nullptr) {
+      int32_t wordCard = (int32_t) popCountWindowBits();
+      if (domainOut != nullptr && wordCard != 0) {
         skipCount(SkipStats::bulkDomainWindowsFed);
-        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+        domainOut->addWindowWords(
+            windowBits.data(), windowStart, windowEnd, wordCard);
       }
-      count += popCountWindowBits();
+      count += wordCard;
 
       if (windowEnd >= max) {
         return PostingsReader::END;

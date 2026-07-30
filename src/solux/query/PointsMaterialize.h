@@ -281,11 +281,13 @@ struct PointsMaterialize {
         return PostingsReader::END;
       }
       fillWindow(filter, min, max);
-      if (domainOut != nullptr) {
+      int32_t wordCard = cardinality();
+      if (domainOut != nullptr && wordCard != 0) {
         skipCount(SkipStats::bulkDomainWindowsFed);
-        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+        domainOut->addWindowWords(
+            windowBits.data(), windowStart, windowEnd, wordCard);
       }
-      count += cardinality();
+      count += wordCard;
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 

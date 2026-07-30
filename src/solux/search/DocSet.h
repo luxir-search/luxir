@@ -417,18 +417,6 @@ class DocSetBuilder {
     return word;
   }
 
-  int32_t popCountWindowWords(const uint64_t* words, int32_t windowStart,
-                              int32_t windowEnd) const {
-    unused(windowStart);
-    int32_t nbits = windowEnd - windowStart;
-    int32_t nwords = (nbits + 63) >> 6;
-    int32_t count = 0;
-    for (int32_t i = 0; i < nwords; i++) {
-      count += (int32_t) std::popcount(maskedWindowWord(words[i], i, nwords, nbits));
-    }
-    return count;
-  }
-
   void promoteToBits() {
     assert(!bits);
     bitDocs.emplace(max);
@@ -460,14 +448,13 @@ class DocSetBuilder {
   }
 
   void orWindowWordsToBits(const uint64_t* words, int32_t windowStart,
-                           int32_t windowEnd) {
+                           int32_t windowEnd, int32_t wordCard) {
     assert(bits != nullptr);
     int32_t nbits = windowEnd - windowStart;
     int32_t nwords = (nbits + 63) >> 6;
     int32_t destWord = windowStart >> 6;
     int32_t shift = windowStart & 63;
     int32_t bitWordCount = (int32_t) FixedBitSet::sizeInWords(max);
-    int32_t added = 0;
 
     for (int32_t i = 0; i < nwords; i++) {
       uint64_t source = maskedWindowWord(words[i], i, nwords, nbits);
@@ -478,10 +465,7 @@ class DocSetBuilder {
       int32_t lowWord = destWord + i;
       if (lowWord < bitWordCount) {
         uint64_t low = shift == 0 ? source : source << shift;
-        uint64_t before = bits->words[lowWord];
-        uint64_t after = before | low;
-        bits->words[lowWord] = after;
-        added += (int32_t) std::popcount(after) - (int32_t) std::popcount(before);
+        bits->words[lowWord] |= low;
       }
 
       if (shift != 0) {
@@ -489,15 +473,12 @@ class DocSetBuilder {
         if (highWord < bitWordCount) {
           uint64_t high = source >> (64 - shift);
           if (high != 0) {
-            uint64_t before = bits->words[highWord];
-            uint64_t after = before | high;
-            bits->words[highWord] = after;
-            added += (int32_t) std::popcount(after) - (int32_t) std::popcount(before);
+            bits->words[highWord] |= high;
           }
         }
       }
     }
-    bitDocs->card_ += added;
+    bitDocs->card_ += wordCard;
   }
 
 public:
@@ -571,16 +552,18 @@ public:
     return bits ? bitDocs->cachedCard() : (int32_t) docs.size();
   }
 
-  void addWindowWords(const uint64_t* words, int32_t windowStart, int32_t windowEnd) {
+  void addWindowWords(const uint64_t* words, int32_t windowStart,
+                      int32_t windowEnd, int32_t wordCard) {
     assert(words != nullptr);
     assert(windowStart >= 0);
     assert(windowEnd >= windowStart);
-    windowEnd = std::min(windowEnd, max);
+    assert(windowEnd <= max);
+    assert(wordCard >= 0);
     if (windowEnd <= windowStart) {
+      assert(wordCard == 0);
       return;
     }
 
-    int32_t wordCard = popCountWindowWords(words, windowStart, windowEnd);
     if (wordCard == 0) {
       return;
     }
@@ -590,7 +573,7 @@ public:
     #endif
 
     if (bits) {
-      orWindowWordsToBits(words, windowStart, windowEnd);
+      orWindowWordsToBits(words, windowStart, windowEnd, wordCard);
       return;
     }
 
@@ -603,7 +586,8 @@ public:
     int32_t appendBeforePromotion = std::max<int32_t>(0, limit - (int32_t) docs.size());
     appendWindowDocsToArray(words, windowStart, windowEnd, appendBeforePromotion);
     promoteToBits();
-    orWindowWordsToBits(words, windowStart, windowEnd);
+    orWindowWordsToBits(words, windowStart, windowEnd,
+                        wordCard - appendBeforePromotion);
   }
 
   std::unique_ptr<DocSet> build() {

@@ -519,11 +519,13 @@ public:
         return PostingsReader::END;
       }
       fillWindow(filter, min, max);
-      if (domainOut != nullptr) {
+      int32_t wordCard = windowCardinality();
+      if (domainOut != nullptr && wordCard != 0) {
         skipCount(SkipStats::bulkDomainWindowsFed);
-        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+        domainOut->addWindowWords(
+            windowBits.data(), windowStart, windowEnd, wordCard);
       }
-      count += windowCardinality();
+      count += wordCard;
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 

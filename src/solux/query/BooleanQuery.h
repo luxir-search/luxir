@@ -5165,10 +5165,12 @@ public:
       if (!windowReady) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
-      if (domainOut != nullptr) {
-        domainOut->addWindowWords(windowBits.data(), windowBase, windowEnd);
+      int32_t wordCard = (int32_t) popCountWindowBits();
+      if (domainOut != nullptr && wordCard != 0) {
+        domainOut->addWindowWords(
+            windowBits.data(), windowBase, windowEnd, wordCard);
       }
-      count += popCountWindowBits();
+      count += wordCard;
 
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
@@ -8042,12 +8044,15 @@ public:
       if (!fillExhaustiveWindowBits(filter, min, max)) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
-      if (domainOut != nullptr) {
-        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
-      }
+      int32_t wordCard = 0;
       for (size_t w = 0; w < windowBits.size(); w++) {
-        count += std::popcount(windowBits[w]);
+        wordCard += (int32_t) std::popcount(windowBits[w]);
       }
+      if (domainOut != nullptr && wordCard != 0) {
+        domainOut->addWindowWords(
+            windowBits.data(), windowStart, windowEnd, wordCard);
+      }
+      count += wordCard;
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 

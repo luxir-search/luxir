@@ -2285,6 +2285,132 @@ TEST(DocSetScorerTest, bulkScorerCountsAndEmitsBitsetAndArray) {
   check(array);
 }
 
+TEST(DocSetScorerTest, bulkScorerPreservesSparseWindowsAndDomains) {
+  constexpr int32_t windowSize = DocsEnumMeta::L1_DOCS;
+  constexpr int32_t maxDoc = 4 * windowSize + 37;
+  std::vector<int32_t> sourceDocs{
+      1, windowSize - 1, windowSize, windowSize + 7,
+      2 * windowSize - 1, 3 * windowSize + 3, maxDoc - 1};
+  ArrDocSet arraySource{std::vector<int32_t>(sourceDocs)};
+  RAMBitDocSet bitSource(maxDoc);
+  for (int32_t doc : sourceDocs) {
+    bitSource.mutableBits().set(doc);
+  }
+
+  RAMBitDocSet bitFilter(maxDoc);
+  for (int32_t doc : {windowSize - 1, windowSize,
+                      2 * windowSize - 1, maxDoc - 1}) {
+    bitFilter.mutableBits().set(doc);
+  }
+  ArrDocSet arrayFilter(
+      {1, windowSize + 7, 3 * windowSize + 3});
+
+  struct CountResult {
+    int64_t count;
+    std::unique_ptr<DocSet> domain;
+    bool sawEmptyWindow;
+  };
+  auto countWindows = [&](DocSet& source, DocSet* filter) {
+    MemPool pool;
+    QueryPrep::DocSetBulkScorer scorer(pool, &source, maxDoc);
+    DocSetBuilder builder(maxDoc);
+    int64_t count = 0;
+    bool sawEmptyWindow = false;
+    for (int32_t cursor = 0; cursor != PostingsReader::END; ) {
+      int64_t before = count;
+      int32_t next = scorer.countNextWindow(
+          count, &builder, filter, cursor, maxDoc);
+      sawEmptyWindow |= count == before;
+      if (next == PostingsReader::END) {
+        break;
+      }
+      EXPECT_GT(next, cursor);
+      cursor = next;
+    }
+    return CountResult{count, builder.build(), sawEmptyWindow};
+  };
+  auto expectedFor = [&](DocSet* filter) {
+    std::vector<int32_t> expected;
+    for (int32_t doc : sourceDocs) {
+      if (filter == nullptr || filter->get(doc)) {
+        expected.push_back(doc);
+      }
+    }
+    return expected;
+  };
+  auto expectCount = [&](DocSet& source, DocSet* filter,
+                         bool expectEmptyWindow) {
+    CountResult result = countWindows(source, filter);
+    std::vector<int32_t> expected = expectedFor(filter);
+    std::vector<int32_t> actual;
+    for (int32_t doc = 0; doc < maxDoc; doc++) {
+      if (result.domain->get(doc)) {
+        actual.push_back(doc);
+      }
+    }
+    EXPECT_EQ((int64_t) expected.size(), result.count);
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(expectEmptyWindow, result.sawEmptyWindow);
+  };
+
+  expectCount(arraySource, nullptr, true);
+  expectCount(arraySource, &bitFilter, true);
+  expectCount(arraySource, &arrayFilter, true);
+  expectCount(bitSource, nullptr, true);
+  expectCount(bitSource, &arrayFilter, true);
+
+  {
+    MemPool pool;
+    QueryPrep::DocSetBulkScorer scorer(pool, &arraySource, maxDoc);
+    DocSetBuilder builder(maxDoc);
+    int64_t count = 0;
+    constexpr int32_t rangeMin = windowSize - 2;
+    constexpr int32_t rangeMax = 2 * windowSize + 1;
+    for (int32_t cursor = rangeMin; cursor != PostingsReader::END; ) {
+      int32_t next = scorer.countNextWindow(
+          count, &builder, nullptr, cursor, rangeMax);
+      if (next == PostingsReader::END) {
+        break;
+      }
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    auto domain = builder.build();
+    EXPECT_EQ(4, count);
+    ASSERT_EQ(DocSet::ARRAY, domain->type);
+    std::span<const int32_t> domainDocs =
+        ((ArrDocSet*) domain.get())->docs();
+    EXPECT_EQ(
+        (std::vector<int32_t>{
+            windowSize - 1, windowSize, windowSize + 7,
+            2 * windowSize - 1}),
+        std::vector<int32_t>(domainDocs.begin(), domainDocs.end()));
+  }
+
+  auto expectScores = [&](DocSet* filter) {
+    MemPool pool;
+    QueryPrep::DocSetBulkScorer scorer(pool, &arraySource, maxDoc);
+    std::vector<int32_t> actual;
+    for (int32_t cursor = 0; cursor != PostingsReader::END; ) {
+      ScoreWindow window;
+      int32_t next = scorer.scoreNextWindow(
+          window, filter, cursor, maxDoc, 0.0f);
+      actual.insert(actual.end(), window.docs.begin(), window.docs.end());
+      for (float score : window.scores) {
+        EXPECT_EQ(0.0f, score);
+      }
+      if (next == PostingsReader::END) {
+        break;
+      }
+      EXPECT_GT(next, cursor);
+      cursor = next;
+    }
+    EXPECT_EQ(expectedFor(filter), actual);
+  };
+  expectScores(&bitFilter);
+  expectScores(&arrayFilter);
+}
+
 TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   SoluxConfig onConfig;
   onConfig.filterCacheBytes = 4 * 1024 * 1024;
