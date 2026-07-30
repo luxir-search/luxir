@@ -9,9 +9,12 @@
 #include <vector>
 
 #include "solux/api/padded_input.h"
+#include "solux/query/BooleanQuery.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/server/JsonResponse.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -256,6 +259,51 @@ TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
   EXPECT_EQ(3, *pieces[0].domain_size);
   EXPECT_TRUE(detailsMention(pieces[0], "maxOrd=1 ords=identity"));
   EXPECT_TRUE(detailsMention(pieces[0], "point ord loads"));
+}
+
+TEST_F(ExecutionProfileTest, termLeadFirstFillLeapfrogMatchesKillSwitch) {
+  constexpr int32_t docCount = 2 * DocsEnumMeta::L1_DOCS;
+  CollectionHelper helper("profile-term-lead-leapfrog");
+  std::vector<Doc> docs;
+  docs.reserve((size_t) docCount);
+  for (int32_t doc = 0; doc < docCount; doc++) {
+    std::string body = "tail";
+    if ((doc % 256) == 0) body += " lead";
+    docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto count = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("profile-term-lead-leapfrog");
+    auto& top = req->topDocs("q").getNumber().limit(0);
+    top.rawQuery() = qb::boolean(
+        top.mr(), {qb::match(top.mr(), "body_w", "lead"),
+                   qb::match(top.mr(), "body_w", "tail")});
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount("q");
+  };
+
+  bool savedStats = SkipStats::enabled;
+  int32_t savedThreshold =
+      BooleanQuery::ConjunctionBulkScorer::
+          termLeadLeapfrogThresholdForTests;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  BooleanQuery::ConjunctionBulkScorer::
+      termLeadLeapfrogThresholdForTests = 32;
+  int64_t leapfrogCount = count();
+  EXPECT_GT(SkipStats::conjTermLeadFirstFillLeapfrogs, 0);
+
+  BooleanQuery::ConjunctionBulkScorer::
+      termLeadLeapfrogThresholdForTests = 0;
+  int64_t fillCount = count();
+
+  BooleanQuery::ConjunctionBulkScorer::
+      termLeadLeapfrogThresholdForTests = savedThreshold;
+  SkipStats::enabled = savedStats;
+  EXPECT_EQ(leapfrogCount, fillCount);
 }
 
 TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {

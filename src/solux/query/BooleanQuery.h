@@ -4033,6 +4033,13 @@ public:
     // Keep filling through the first query clause, then apply the ordinary
     // intermediate-cardinality crossover.
     static constexpr int32_t kDocSetLeadLeapfrogThreshold = 1;
+    // Off: the Fenrir 5M sweep (2026-07-30, thresholds 8..128, journalist
+    // and unfiltered COUNT classes) lost at every setting - per-survivor
+    // probe advances cost more than streaming tail fills, and dense tails
+    // pay the linear L0 header walk per advance. Re-sweep via the
+    // SOLUX_TERM_LEAD_LEAPFROG_THRESHOLD override once within-group
+    // checkpoints make dense-enum advances cheap.
+    static constexpr int32_t kTermLeadLeapfrogThreshold = 0;
     // Direct-term tails benefit from sparse filter-led iteration sooner than
     // disjunction groups. This bar applies only when a DocSet leads and every
     // remaining clause is a direct term; other conjunctions retain /512.
@@ -4049,6 +4056,11 @@ public:
         kDenseLeapfrogThreshold;
     static inline int32_t docSetLeadLeapfrogThresholdForTests =
         kDocSetLeadLeapfrogThreshold;
+    static inline int32_t termLeadLeapfrogThresholdForTests = [] {
+      const char* value =
+          std::getenv("SOLUX_TERM_LEAD_LEAPFROG_THRESHOLD");
+      return value != nullptr ? std::atoi(value) : kTermLeadLeapfrogThreshold;
+    }();
     static inline int32_t docSetTermDenseThresholdInverseForTests =
         kDocSetTermDenseThresholdInverse;
     static inline int32_t filteredConjunctionBatchSizeForTests =
@@ -5159,9 +5171,14 @@ public:
         }
         return card < threshold;
       };
-      if (countLeadIsDocSet && denseClauses.size() >= 2
-          && belowLeapfrogThreshold(
-              docSetLeadLeapfrogThresholdForTests)) {
+      int32_t threshold = countLeadIsDocSet
+          ? docSetLeadLeapfrogThresholdForTests
+          : termLeadLeapfrogThresholdForTests;
+      if (threshold > 0 && denseClauses.size() >= 2
+          && belowLeapfrogThreshold(threshold)) {
+        if (!countLeadIsDocSet) {
+          skipCount(SkipStats::conjTermLeadFirstFillLeapfrogs);
+        }
         leapfrogRemainingDenseClauses(1, windowBase, windowEnd);
       } else {
         for (size_t c = 1; c < denseClauses.size(); c++) {
