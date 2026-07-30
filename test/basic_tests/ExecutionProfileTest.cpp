@@ -22,8 +22,8 @@ class ExecutionProfileTest : public SoluxTest {};
 namespace {
 
 std::string_view expectedStrategy(int64_t domainSize, int64_t cardinality) {
-  if ((domainSize >> 8) >= cardinality) return "vector";
-  if ((cardinality >> 6) >= domainSize) return "hash";
+  if ((domainSize >> 4) >= cardinality) return "vector";
+  if ((cardinality >> 5) >= domainSize) return "hash";
   return "skinny";
 }
 
@@ -83,11 +83,14 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
   std::vector<std::string> values;
   for (int i = 0; i < 64; i++) values.push_back("v" + std::to_string(i));
   helper.index(flatdoc("id", "1", "tags_ss", values), UpdateMessage::COMMIT);
+  // Three docs: enough that this segment's domain clears the hash threshold
+  // (cardinality >> 5 = 2 < 3) and wants skinny, driving the upgrade below.
   helper.indexAll(std::array{
       flatdoc("id", "2", "tags_ss", vecs("v0")),
       flatdoc("id", "3", "tags_ss", vecs("v1")),
+      flatdoc("id", "4", "tags_ss", vecs("v0")),
   }, UpdateMessage::COMMIT);
-  helper.index(flatdoc("id", "4", "tags_ss", vecs("v2")), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "5", "tags_ss", vecs("v2")), UpdateMessage::COMMIT);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
   auto req = localReq(helper.getSearchEngine());

@@ -329,16 +329,11 @@ public:
 
   class Calc : public Calculator {
     // Column-read-equivalents, fit to the forced-strategy facet grid
-    // (single-segment, sel {10,50,90,99} x realized cardinality 10..1.84M).
-    // DF_COST covers the per-term docFreq walk plus the local->global drain.
-    // COMPLEMENT_DOC_COST < 1 because the complement walk increments a dense
-    // local int32 array while the column walk pays shared-rep (skinny/vector)
-    // increments; the discount is what lets complement win at c == d for small
-    // term counts, which the measured grid shows. The fit reproduces the
-    // measured winner in every cell; nearest-boundary cells (50%/100K,
-    // 90%/~1.8M terms) are within 15% either way.
+    // (single-segment, sel {10,50,90,99} x realized cardinality 10..1.84M)
+    // with the measured counter-rep thresholds in place - the strategies must
+    // be compared under the reps each would actually run with. DF_COST covers
+    // the per-term docFreq walk plus the local->global drain.
     static constexpr double DF_COST = 2.25;
-    static constexpr double COMPLEMENT_DOC_COST = 0.9;
     static constexpr double POSTINGS_SETUP_COST = 30.0;
     static constexpr double POSTINGS_ADVANCE_COST = 4.0;
 
@@ -528,7 +523,7 @@ public:
         if (termsAvailable) {
           // Bitset domains walk the complement through an inverted word view;
           // only array domains pay a dense complement-bitset build.
-          complementCost = (double)domainView.compCard * COMPLEMENT_DOC_COST
+          complementCost = (double)domainView.compCard
               + (double)segFieldInfo.nTerms * DF_COST
               + (domainView.bits != nullptr
                      ? 0.0 : (double)FixedBitSet::sizeInWords(maxDoc));
@@ -610,11 +605,19 @@ public:
         if (spanRep) {
           rep = MergeableStrData::Rep::Span;
         } else {
-          // want a vector of global ords if the domain size is much larger than
-          // the number of unique values, so a skinny counter would overflow often.
-          bool wantVec = (domainSize >> 8) >= globVals;
-          // if unique values greatly outnumber domain docs, use a hashmap.
-          bool wantHash = (globVals >> 6) >= domainSize;
+          // Measured crossovers (counter-rep grid, single segment): vector wins
+          // CPU from R = increments/buckets ~= 16; below R ~= 1/20 the sparse
+          // reps reach CPU parity and the choice is memory, where skinny's
+          // 1 B/ord stays smallest until well past that point - so the hash
+          // threshold sits a step below the CPU crossover (1/32), which also
+          // hedges the per-value ord mapping sparse reps pay on multi-segment
+          // indexes. R uses this segment's domain card against the global
+          // bucket count, understating R on multi-segment indexes (errs toward
+          // skinny, the memory-safe side); re-tune with the multi-segment lane.
+          // The same R serves COLUMN_COMPLEMENT: its drain adds once per ord
+          // that appears in the domain, so d still bounds the buckets touched.
+          bool wantVec = (domainSize >> 4) >= globVals;
+          bool wantHash = (globVals >> 5) >= domainSize;
           rep =
               forcedFacetCounterMode == FacetCounterMode::FORCE_VECTOR
                   ? MergeableStrData::Rep::Vector
