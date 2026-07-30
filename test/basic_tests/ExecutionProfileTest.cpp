@@ -190,25 +190,47 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   CollectionHelper helper("profile-vector");
   std::vector<Doc> docs;
   for (int i = 0; i < 256; i++) {
-    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "only"));
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "only",
+                           "sel_s", i < 16 ? "yes" : "no"));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
 
+  // Unfiltered: the postings-side docFreq path emits one pre-aggregated
+  // count per ord, so vector is wanted from average magnitude 256 - the
+  // count that would spill skinny's u8 on every add. 256 docs of one term
+  // sits exactly on that boundary.
   auto req = localReq(helper.getSearchEngine());
   req->collection("profile-vector").profile().facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);
+  {
+    const auto& pieces = profileOp(*req).pieces;
+    ASSERT_EQ(1u, pieces.size());
+    EXPECT_EQ(256, *pieces[0].domain_size);
+    EXPECT_EQ(1, *pieces[0].cardinality);
+    EXPECT_EQ("vector", pieces[0].strategy);
+    EXPECT_TRUE(detailsMention(pieces[0], "maxOrd=1 ords=identity"));
+    EXPECT_TRUE(detailsMention(pieces[0], "docFreq-only"));
+    // no upgrade and no divergence note when this piece is the only contributor
+    EXPECT_FALSE(detailsMention(pieces[0], "upgraded"));
+    EXPECT_FALSE(detailsMention(pieces[0], "want="));
+  }
 
-  const auto& pieces = profileOp(*req).pieces;
-  ASSERT_EQ(1u, pieces.size());
-  EXPECT_EQ(256, *pieces[0].domain_size);
-  EXPECT_EQ(1, *pieces[0].cardinality);
-  EXPECT_EQ("vector", pieces[0].strategy);
-  EXPECT_TRUE(detailsMention(pieces[0], "maxOrd=1 ords=identity"));
-  EXPECT_TRUE(detailsMention(pieces[0], "docFreq-only"));
-  // no upgrade and no divergence note when this piece is the only contributor
-  EXPECT_FALSE(detailsMention(pieces[0], "upgraded"));
-  EXPECT_FALSE(detailsMention(pieces[0], "want="));
+  // Filtered to 16 of 256: the column walk adds once per in-domain doc, so
+  // R = 16 sits exactly at the measured vector boundary.
+  auto filtered = localReq(helper.getSearchEngine());
+  filtered->collection("profile-vector").profile();
+  auto& top = filtered->topDocs("q");
+  top.matchQuery("sel_s", "yes");
+  top.facet("cats", "cat_s").limit(-1);
+  filtered->execute(false);
+  ASSERT_OK(filtered);
+  {
+    const auto& pieces = profileOp(*filtered).pieces;
+    ASSERT_EQ(1u, pieces.size());
+    EXPECT_EQ(16, *pieces[0].domain_size);
+    EXPECT_EQ("vector", pieces[0].strategy);
+  }
 }
 
 TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {

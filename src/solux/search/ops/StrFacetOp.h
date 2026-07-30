@@ -336,6 +336,12 @@ public:
     static constexpr double DF_COST = 2.25;
     static constexpr double POSTINGS_SETUP_COST = 30.0;
     static constexpr double POSTINGS_ADVANCE_COST = 4.0;
+    // Complement must beat column by a margin, not a hair: near-tie picks
+    // (a 50.04% filter with a small term count) measured 5-24% slower than
+    // column under load, while every genuine complement win clears this by
+    // 10x. The margin only exists to keep coin-toss cells on the column
+    // side, where the docFreq walk and staging buy nothing.
+    static constexpr double COMPLEMENT_MARGIN = 0.9;
 
     ExecutionProfileRun* profileRun;
     std::vector<DocSet*> input;
@@ -567,7 +573,8 @@ public:
           // shared S2/S3 fast path rather than asking guessed constants whether
           // avoiding all column and postings reads is worthwhile.
           strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
-        } else if (complementCost < columnCost && complementCost <= termCost) {
+        } else if (complementCost < columnCost * COMPLEMENT_MARGIN
+                   && complementCost <= termCost) {
           strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
         } else if (termCost < columnCost) {
           strategy = StrFacetStrategy::TERM_DRIVEN;
@@ -602,13 +609,28 @@ public:
           // 1 B/ord stays smallest until well past that point - so the hash
           // threshold sits a step below the CPU crossover (1/32), which also
           // hedges the per-value ord mapping sparse reps pay on multi-segment
-          // indexes. R uses this segment's domain card against the global
-          // bucket count, understating R on multi-segment indexes (errs toward
+          // indexes. R understates on multi-segment indexes (errs toward
           // skinny, the memory-safe side); re-tune with the multi-segment lane.
-          // The same R serves COLUMN_COMPLEMENT: its drain adds once per ord
-          // that appears in the domain, so d still bounds the buckets touched.
-          bool wantVec = (domainSize >> 4) >= globVals;
-          bool wantHash = (globVals >> 5) >= domainSize;
+          //
+          // The adds depend on the strategy. The column walk adds 1 once per
+          // in-domain doc-value: the R >= 16 vector crossover above applies
+          // directly. The postings-side strategies emit pre-aggregated
+          // counts - at most one add per ord, magnitude ~= domainSize/G - so
+          // their add count caps at the bucket count and the vector-vs-skinny
+          // question is instead whether the magnitudes fit skinny's u8:
+          // vector from avg count >= 256 (small-G cells with big counts,
+          // where skinny's every add would spill to its overflow map), skinny
+          // below (big-G cells, where vector's O(G) int64 accumulator costs
+          // more than the whole complement walk - measured 2.2x at
+          // 99%/1M-terms when the per-doc R=16 rule picked vector here).
+          bool postingsSide = strategy != StrFacetStrategy::COLUMN_DOMAIN;
+          int64_t adds = postingsSide
+              ? std::min((int64_t)domainSize, globVals)
+              : (int64_t)domainSize;
+          bool wantVec = postingsSide
+              ? ((int64_t)domainSize >> 8) >= globVals
+              : ((int64_t)domainSize >> 4) >= globVals;
+          bool wantHash = (globVals >> 5) >= adds;
           rep =
               forcedFacetCounterMode == FacetCounterMode::FORCE_VECTOR
                   ? MergeableStrData::Rep::Vector
