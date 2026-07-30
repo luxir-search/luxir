@@ -399,6 +399,15 @@ public:
     /// lead constraint. Suppliers may use it to choose eager vs lazy setup.
     virtual Query::Scorer* get(MemPool& targetPool, int64_t leadCost) = 0;
 
+    /// Create an additional scorer with iterator state independent of get().
+    /// Suppliers that cannot cheaply reproduce their scorer leave this
+    /// unsupported.
+    virtual Query::Scorer* getIndependent(MemPool& targetPool,
+                                          int64_t leadCost) {
+      unused(targetPool, leadCost);
+      return nullptr;
+    }
+
     virtual BulkScorer* bulkScorer(MemPool& targetPool) {
       unused(targetPool);
       return nullptr;

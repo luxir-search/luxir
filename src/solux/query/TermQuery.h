@@ -197,6 +197,11 @@ public:
         return weight.createScorer(targetPool, segment);
       }
 
+      Query::Scorer* getIndependent(solux::MemPool& targetPool,
+                                    int64_t leadCost) override {
+        return get(targetPool, leadCost);
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override;
     };
 

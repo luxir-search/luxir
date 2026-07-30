@@ -142,6 +142,48 @@ public:
   }
 };
 
+class ExactCandidateTermFeedGuard {
+  bool saved;
+
+public:
+  explicit ExactCandidateTermFeedGuard(bool disabled)
+    : saved(BooleanQuery::disableExactCandidateTermFeedForTests) {
+    BooleanQuery::disableExactCandidateTermFeedForTests = disabled;
+  }
+
+  ~ExactCandidateTermFeedGuard() {
+    BooleanQuery::disableExactCandidateTermFeedForTests = saved;
+  }
+};
+
+class ExactCandidateTermFeedFractionGuard {
+  int64_t saved;
+
+public:
+  explicit ExactCandidateTermFeedFractionGuard(int64_t fraction)
+    : saved(BooleanQuery::kTermFeedMaxLeadFractionForTests) {
+    BooleanQuery::kTermFeedMaxLeadFractionForTests = fraction;
+  }
+
+  ~ExactCandidateTermFeedFractionGuard() {
+    BooleanQuery::kTermFeedMaxLeadFractionForTests = saved;
+  }
+};
+
+class ExactCandidateTermFeedDocSetRatioGuard {
+  int64_t saved;
+
+public:
+  explicit ExactCandidateTermFeedDocSetRatioGuard(int64_t ratio)
+    : saved(BooleanQuery::kTermFeedMinDocSetFilterRatio) {
+    BooleanQuery::kTermFeedMinDocSetFilterRatio = ratio;
+  }
+
+  ~ExactCandidateTermFeedDocSetRatioGuard() {
+    BooleanQuery::kTermFeedMinDocSetFilterRatio = saved;
+  }
+};
+
 class FilteredConjunctionBatchGuard {
   bool saved;
 
@@ -1612,6 +1654,7 @@ enum class ExactFilteredConjShape {
   RARE_TERM,
   PHRASE,
   TWO_FILTERS,
+  RARE_TERM_TWO_FILTERS,
 };
 
 struct ExactFilteredConjResult {
@@ -1621,6 +1664,9 @@ struct ExactFilteredConjResult {
   int64_t batchEngagements = 0;
   int64_t multiTermEngagements = 0;
   int64_t postingsFeedEngagements = 0;
+  int64_t termFeedEngagements = 0;
+  int64_t scoredProbeAdvances = 0;
+  int64_t scoreWindows = 0;
 };
 
 bool indexExactFilteredConjDocs(SoluxNode& node,
@@ -1650,7 +1696,8 @@ bool indexExactFilteredConjDocs(SoluxNode& node,
     docs.push_back(solux::test::flatdoc(
         "id", std::to_string(doc), "body_w", body,
         "filter_w", doc % 40 == 0 ? "selected" : "other",
-        "second_filter_w", doc % 20 == 0 ? "wide" : "other"));
+        "second_filter_w",
+        doc % 10 == 0 && doc % 400 != 200 ? "wide" : "other"));
   }
   return helper.indexAll(docs, UpdateMessage::COMMIT).success;
 }
@@ -1658,9 +1705,10 @@ bool indexExactFilteredConjDocs(SoluxNode& node,
 ExactFilteredConjResult runExactFilteredConj(
     SoluxNode& node, std::string_view collection,
     ExactFilteredConjShape shape, bool disableMultiTerm,
-    bool disableBatch = false) {
+    bool disableBatch = false, bool disableTermFeed = false) {
   FilteredConjMultiTermGuard multiTermGuard(disableMultiTerm);
   FilteredConjunctionBatchGuard batchGuard(disableBatch);
+  ExactCandidateTermFeedGuard termFeedGuard(disableTermFeed);
   OwnedFilterStatsGuard statsGuard;
   auto request = solux::test::localReq(node.getSearchEngine());
   request->collection(collection);
@@ -1679,8 +1727,11 @@ ExactFilteredConjResult runExactFilteredConj(
       cursor.rawQuery() = solux::test::qb::boolean(
           cursor.mr(),
           {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
-           solux::test::qb::match(cursor.mr(), "body_w", "rare")});
-      cursor.matchFilter("selection", "filter_w", "selected");
+           solux::test::qb::match(cursor.mr(), "body_w", "rare"),
+           solux::test::qb::match(cursor.mr(), "body_w", "gamma")});
+      // The wide filter keeps the feed (rare, df 20) under the DocSet
+      // provenance ratio gate; "selected" (df 50) sits inside it.
+      cursor.matchFilter("wide", "second_filter_w", "wide");
       break;
     case ExactFilteredConjShape::PHRASE:
       cursor.rawQuery() = solux::test::qb::phraseWords(
@@ -1692,6 +1743,15 @@ ExactFilteredConjResult runExactFilteredConj(
           cursor.mr(),
           {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
            solux::test::qb::match(cursor.mr(), "body_w", "beta")});
+      cursor.matchFilter("selection", "filter_w", "selected");
+      cursor.matchFilter("wide", "second_filter_w", "wide");
+      break;
+    case ExactFilteredConjShape::RARE_TERM_TWO_FILTERS:
+      cursor.rawQuery() = solux::test::qb::boolean(
+          cursor.mr(),
+          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           solux::test::qb::match(cursor.mr(), "body_w", "rare"),
+           solux::test::qb::match(cursor.mr(), "body_w", "gamma")});
       cursor.matchFilter("selection", "filter_w", "selected");
       cursor.matchFilter("wide", "second_filter_w", "wide");
       break;
@@ -1728,6 +1788,10 @@ ExactFilteredConjResult runExactFilteredConj(
       SkipStats::filteredConjBatchMultiTermEngagements;
   result.postingsFeedEngagements =
       SkipStats::filteredConjBatchPostingsFeedEngagements;
+  result.termFeedEngagements =
+      SkipStats::exactCandidateTermFeedEngagements;
+  result.scoredProbeAdvances = SkipStats::scoredProbeAdvances;
+  result.scoreWindows = SkipStats::filteredConjBatchScoreWindows;
   return result;
 }
 
@@ -1797,22 +1861,45 @@ TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
   EXPECT_EQ(0, declined.multiTermEngagements);
 }
 
-TEST(FilterCacheIntegrationTest, filteredConjMultiTermRequiresFilterLead) {
-  SoluxConfig config;
-  config.filterCacheBytes = 0;
-  SoluxNode node(config);
-  constexpr std::string_view collection = "filtered_conj_filter_lead";
-  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+TEST(FilterCacheIntegrationTest,
+     exactCandidateTermFeedMatchesKillSwitchForBothFilterProvenances) {
+  SoluxConfig cachedConfig;
+  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  SoluxConfig uncachedConfig;
+  uncachedConfig.filterCacheBytes = 0;
+  SoluxNode cachedNode(cachedConfig);
+  SoluxNode uncachedNode(uncachedConfig);
+  constexpr std::string_view collection = "exact_candidate_term_feed";
+  ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
+  ASSERT_TRUE(indexExactFilteredConjDocs(uncachedNode, collection));
 
-  ExactFilteredConjResult enabled = runExactFilteredConj(
-      node, collection, ExactFilteredConjShape::RARE_TERM, false);
-  ExactFilteredConjResult baseline = runExactFilteredConj(
-      node, collection, ExactFilteredConjShape::RARE_TERM, true);
+  runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult cached = runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult cachedKillSwitch = runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false,
+      false, true);
+  ExactFilteredConjResult postings = runExactFilteredConj(
+      uncachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult postingsKillSwitch = runExactFilteredConj(
+      uncachedNode, collection, ExactFilteredConjShape::RARE_TERM, false,
+      false, true);
 
-  EXPECT_EQ(10, enabled.count);
-  expectSameExactFilteredConj(baseline, enabled);
-  EXPECT_EQ(0, enabled.batchEngagements);
-  EXPECT_EQ(0, enabled.multiTermEngagements);
+  EXPECT_EQ(5, cached.count);
+  expectSameExactFilteredConj(cachedKillSwitch, cached);
+  expectSameExactFilteredConj(postingsKillSwitch, postings);
+  expectSameExactFilteredConj(cached, postings);
+  EXPECT_GT(cached.termFeedEngagements, 0);
+  EXPECT_GT(postings.termFeedEngagements, 0);
+  EXPECT_GT(cached.scoredProbeAdvances, 0);
+  EXPECT_GT(postings.scoredProbeAdvances, 0);
+  EXPECT_GT(cached.scoreWindows, 0);
+  EXPECT_GT(postings.scoreWindows, 0);
+  EXPECT_EQ(0, cachedKillSwitch.termFeedEngagements);
+  EXPECT_EQ(0, postingsKillSwitch.termFeedEngagements);
 }
 
 TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
@@ -1832,23 +1919,110 @@ TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
   EXPECT_EQ(0, enabled.batchEngagements);
 }
 
-TEST(FilterCacheIntegrationTest, filteredConjTwoTermFiltersPreserveScores) {
+TEST(FilterCacheIntegrationTest, exactCandidateTermFeedHandlesTwoFilters) {
   SoluxConfig config;
   config.filterCacheBytes = 0;
   SoluxNode node(config);
-  constexpr std::string_view collection = "filtered_conj_two_filters";
+  constexpr std::string_view collection = "exact_candidate_two_filters";
+  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+
+  ExactFilteredConjResult enabled = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::RARE_TERM_TWO_FILTERS,
+      false);
+  ExactFilteredConjResult baseline = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::RARE_TERM_TWO_FILTERS,
+      false, false, true);
+
+  EXPECT_EQ(2, enabled.count);
+  expectSameExactFilteredConj(baseline, enabled);
+  EXPECT_GT(enabled.termFeedEngagements, 0);
+  EXPECT_GT(enabled.scoredProbeAdvances, 0);
+  EXPECT_EQ(0, baseline.termFeedEngagements);
+}
+
+TEST(FilterCacheIntegrationTest,
+     exactCandidateFilterLeadKeepsExistingRouteAndCounters) {
+  SoluxConfig config;
+  config.filterCacheBytes = 0;
+  SoluxNode node(config);
+  constexpr std::string_view collection = "exact_candidate_filter_lead";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
 
   ExactFilteredConjResult enabled = runExactFilteredConj(
       node, collection, ExactFilteredConjShape::TWO_FILTERS, false);
-  ExactFilteredConjResult baseline = runExactFilteredConj(
-      node, collection, ExactFilteredConjShape::TWO_FILTERS, true);
+  ExactFilteredConjResult termFeedDisabled = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::TWO_FILTERS, false,
+      false, true);
 
-  EXPECT_EQ(50, enabled.count);
-  expectSameExactFilteredConj(baseline, enabled);
+  EXPECT_EQ(45, enabled.count);
+  expectSameExactFilteredConj(termFeedDisabled, enabled);
   EXPECT_GT(enabled.multiTermEngagements, 0);
   EXPECT_GT(enabled.postingsFeedEngagements, 0);
-  EXPECT_EQ(0, baseline.multiTermEngagements);
+  EXPECT_EQ(0, enabled.termFeedEngagements);
+  EXPECT_EQ(enabled.batchEngagements,
+            termFeedDisabled.batchEngagements);
+  EXPECT_EQ(enabled.multiTermEngagements,
+            termFeedDisabled.multiTermEngagements);
+  EXPECT_EQ(enabled.postingsFeedEngagements,
+            termFeedDisabled.postingsFeedEngagements);
+  EXPECT_EQ(enabled.scoreWindows, termFeedDisabled.scoreWindows);
+  EXPECT_EQ(0, termFeedDisabled.termFeedEngagements);
+}
+
+TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDensityCapDeclines) {
+  SoluxConfig config;
+  config.filterCacheBytes = 0;
+  SoluxNode node(config);
+  constexpr std::string_view collection = "exact_candidate_density_cap";
+  ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
+
+  ExactFilteredConjResult admitted = runExactFilteredConj(
+      node, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult declined;
+  {
+    ExactCandidateTermFeedFractionGuard guard(1000000);
+    declined = runExactFilteredConj(
+        node, collection, ExactFilteredConjShape::RARE_TERM, false);
+  }
+
+  expectSameExactFilteredConj(admitted, declined);
+  EXPECT_GT(admitted.termFeedEngagements, 0);
+  EXPECT_EQ(0, declined.termFeedEngagements);
+}
+
+// The DocSet-provenance ratio gate declines a term feed whose cost is too
+// close to the warm filter's; the raw-postings provenance carries no such
+// gate and must keep engaging under the same override.
+TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDocSetRatioDeclines) {
+  SoluxConfig cachedConfig;
+  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  SoluxConfig uncachedConfig;
+  uncachedConfig.filterCacheBytes = 0;
+  SoluxNode cachedNode(cachedConfig);
+  SoluxNode uncachedNode(uncachedConfig);
+  constexpr std::string_view collection = "exact_candidate_docset_ratio";
+  ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
+  ASSERT_TRUE(indexExactFilteredConjDocs(uncachedNode, collection));
+
+  runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult admitted = runExactFilteredConj(
+      cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  ExactFilteredConjResult declined;
+  ExactFilteredConjResult postings;
+  {
+    ExactCandidateTermFeedDocSetRatioGuard guard(1000000);
+    declined = runExactFilteredConj(
+        cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+    postings = runExactFilteredConj(
+        uncachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
+  }
+
+  expectSameExactFilteredConj(admitted, declined);
+  expectSameExactFilteredConj(admitted, postings);
+  EXPECT_GT(admitted.termFeedEngagements, 0);
+  EXPECT_EQ(0, declined.termFeedEngagements);
+  EXPECT_GT(postings.termFeedEngagements, 0);
 }
 
 TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {
