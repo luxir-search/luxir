@@ -124,6 +124,34 @@ public:
         assert(values[i] <= LinearPack::mask64(bits));
       }
     }
+
+    // Frame-cached mapping access for scans, shaped like
+    // OrdColReader::BulkOrds: any ord outside the decoded frame decodes the
+    // frame containing it, so callers may visit ords sparsely or skip them
+    // freely as long as access is not pathologically non-local.
+    class BulkGlobalOrds {
+      const SegToGlobal& mapping;
+      int64_t decodedStart = -1;
+      int64_t decodedEnd = -1;
+      uint64_t decoded[OrdColumnFormat::BULK_SIZE];
+
+    public:
+      explicit BulkGlobalOrds(const SegToGlobal& mapping) : mapping(mapping) {}
+
+      int64_t globalOrd(int64_t segmentOrd) {
+        if (mapping.bits == 0) {
+          return segmentOrd;
+        }
+        if (segmentOrd < decodedStart || segmentOrd >= decodedEnd) {
+          constexpr int64_t frame = (int64_t)OrdColumnFormat::BULK_SIZE;
+          decodedStart = (segmentOrd / frame) * frame;
+          decodedEnd = std::min(decodedStart + frame, mapping.numOrds);
+          mapping.unpackDeltas((uint64_t)decodedStart,
+                               (uint32_t)(decodedEnd - decodedStart), decoded);
+        }
+        return segmentOrd + (int64_t)decoded[segmentOrd - decodedStart];
+      }
+    };
   };
 
 private:

@@ -499,28 +499,10 @@ public:
           mapping.numOrds = segFieldInfo.nTerms;
         }
 
-        // Streams the local->global mapping for an ascending scan that visits
-        // every local ord, unpacking the OrdMap's 128-ord delta frames as the
-        // scan crosses them. globalOrd() must be called once per ord, in
-        // order, so frame starts are never skipped.
-        struct MappedOrdCursor {
-          const OrdMap::SegToGlobal& mapping;
-          int64_t size;
-          uint64_t deltaFrame[128];
-          int64_t globalOrd(int64_t localOrd) {
-            if (mapping.bits != 0 && (localOrd & 127) == 0) {
-              mapping.unpackDeltas((size_t)localOrd,
-                  (uint32_t)std::min<int64_t>(128, size - localOrd),
-                  deltaFrame);
-            }
-            return mapping.bits == 0
-                ? localOrd : localOrd + (int64_t)deltaFrame[localOrd & 127];
-          }
-        };
         auto forEachMappedOrd = [&](size_t size, auto&& accept) {
-          MappedOrdCursor cursor{mapping, (int64_t)size};
+          OrdMap::SegToGlobal::BulkGlobalOrds mapped(mapping);
           for (size_t localOrd = 0; localOrd < size; localOrd++) {
-            accept(localOrd, cursor.globalOrd((int64_t)localOrd));
+            accept(localOrd, mapped.globalOrd((int64_t)localOrd));
           }
         };
 
@@ -707,20 +689,18 @@ public:
 
           // One fused pass shared by every postings-side strategy: stream
           // docFreqs in local-ord order, apply the strategy's per-ord count,
-          // advance the mapping cursor, and add only finished positive
-          // counts. SegmentMergeDriver shares one accumulator across
-          // segments, so intermediate complement counts must never reach it -
-          // and with counts finished inside the stream, nothing here needs a
-          // separate drain pass over ord space. The cursor advances for every
-          // ord, counted or not, so frame starts are never skipped.
-          MappedOrdCursor cursor{mapping, nTerms};
+          // and add only finished positive counts, mapping just the ords
+          // actually emitted. SegmentMergeDriver shares one accumulator
+          // across segments, so intermediate complement counts must never
+          // reach it - and with counts finished inside the stream, nothing
+          // here needs a separate drain pass over ord space.
+          OrdMap::SegToGlobal::BulkGlobalOrds mapped(mapping);
           auto emitCounts = [&](auto&& countOf) {
             terms.forEachDocFreq(
                 [&](int64_t localOrd, int32_t docFreq) SOLUX_INLINE {
-              int64_t globalOrd = cursor.globalOrd(localOrd);
               int32_t count = countOf(localOrd, docFreq);
               if (count > 0) {
-                addGlobalCount(globalOrd, count);
+                addGlobalCount(mapped.globalOrd(localOrd), count);
               }
             });
           };
