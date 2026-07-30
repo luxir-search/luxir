@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
@@ -2086,6 +2087,270 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
       }
     }
   }
+}
+
+TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
+  constexpr std::string_view collection = "filter_docset_identity";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 16; doc++) {
+    std::string selected = doc % 3 == 0 ? "no" : "yes";
+    docs.push_back(flatdoc(
+        "id", "d" + std::to_string(doc),
+        "keep_zero_s", selected,
+        "keep_top_s", selected,
+        "body_w", doc % 2 == 0 ? "apple" : "pear",
+        "group_s", "g" + std::to_string(doc % 2),
+        "sub_s", "s" + std::to_string(doc % 4),
+        "value_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto cache = helper.getIndexWriter()->getFilterCache();
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, int64_t> facets;
+    std::map<std::string, double> avgs;
+    std::map<std::string, std::map<std::string, int64_t>> subFacets;
+    int64_t found = 0;
+    int64_t identities = 0;
+    int64_t domainWindows = 0;
+  };
+  auto run = [&](std::string_view filterField, int64_t limit,
+                 bool passive, bool nested) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").allQuery().getNumber()
+        .fields({"id"}).limit(limit)
+        .matchFilter("keep", filterField, "yes");
+    auto& facet = topDocs.facet("groups", "group_s").limit(-1);
+    if (nested) {
+      facet.avg("avg", "value_i");
+      facet.facet("subs", "sub_s").limit(-1);
+    }
+
+    Result result;
+    {
+      SkipStatsGuard stats;
+      TopDocsFilterFoldGuard fold(passive);
+      req->execute(false);
+      result.identities = SkipStats::filterDocSetIdentityCollections;
+      result.domainWindows = SkipStats::bulkDomainWindowsFed;
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    result.ids = resultIds(*req, "q");
+    result.facets = resultFacetMap(*req, "q", "groups");
+    result.found = req->getMatchCount("q");
+    if (nested) {
+      const auto* facetResult =
+          req->docList("q")->ops.at("groups")->facetResult();
+      const auto& groupIds =
+          std::get<api::ColStr>(facetResult->bucket_ids->kind);
+      const auto& avgs =
+          std::get<api::ArrDouble>(facetResult->ops.at("avg")->kind);
+      const auto& subResults =
+          std::get<api::ArrVal>(facetResult->ops.at("subs")->kind);
+      for (size_t i = 0; i < groupIds.v.size(); i++) {
+        std::string group(groupIds.v[i]);
+        result.avgs[group] = avgs.v[i];
+        const auto& subFacet =
+            std::get<api::FacetResult>(subResults.v[i].kind);
+        const auto& subIds =
+            std::get<api::ColStr>(subFacet.bucket_ids->kind);
+        for (size_t j = 0; j < subIds.v.size(); j++) {
+          result.subFacets[group][std::string(subIds.v[j])] =
+              subFacet.counts[j];
+        }
+      }
+    }
+    return result;
+  };
+
+  const std::map<std::string, int64_t> expectedFacets{
+      {"g0", 5}, {"g1", 5}};
+  auto missZero = run("keep_zero_s", 0, false, false);
+  EXPECT_EQ(0, missZero.identities);
+  EXPECT_GT(missZero.domainWindows, 0);
+  auto buildZero = run("keep_zero_s", 0, false, false);
+  EXPECT_GT(buildZero.identities, 0);
+  auto beforeZeroHit = cache->counters();
+  auto hitZero = run("keep_zero_s", 0, false, false);
+  EXPECT_GT(hitZero.identities, 0);
+  EXPECT_EQ(0, hitZero.domainWindows);
+  EXPECT_GT(cache->counters().hits, beforeZeroHit.hits);
+  EXPECT_EQ(10, hitZero.found);
+  EXPECT_TRUE(hitZero.ids.empty());
+  EXPECT_EQ(expectedFacets, hitZero.facets);
+  EXPECT_EQ(missZero.found, hitZero.found);
+  EXPECT_EQ(missZero.facets, hitZero.facets);
+
+  auto missTop = run("keep_top_s", 4, false, true);
+  EXPECT_EQ(0, missTop.identities);
+  EXPECT_GT(missTop.domainWindows, 0);
+  run("keep_top_s", 4, false, true);
+  auto beforeTopHit = cache->counters();
+  auto hitTop = run("keep_top_s", 4, false, true);
+  EXPECT_GT(hitTop.identities, 0);
+  EXPECT_EQ(0, hitTop.domainWindows);
+  EXPECT_GT(cache->counters().hits, beforeTopHit.hits);
+  EXPECT_EQ(10, hitTop.found);
+  EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d4", "d5"}),
+            hitTop.ids);
+  EXPECT_EQ(expectedFacets, hitTop.facets);
+  EXPECT_DOUBLE_EQ(7.6, hitTop.avgs.at("g0"));
+  EXPECT_DOUBLE_EQ(7.4, hitTop.avgs.at("g1"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"s0", 2}, {"s2", 3}}),
+            hitTop.subFacets.at("g0"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"s1", 3}, {"s3", 2}}),
+            hitTop.subFacets.at("g1"));
+  EXPECT_EQ(missTop.ids, hitTop.ids);
+  EXPECT_EQ(missTop.facets, hitTop.facets);
+  EXPECT_EQ(missTop.avgs, hitTop.avgs);
+  EXPECT_EQ(missTop.subFacets, hitTop.subFacets);
+
+  auto passive = run("keep_top_s", 4, true, true);
+  EXPECT_EQ(0, passive.identities);
+  EXPECT_EQ(hitTop.ids, passive.ids);
+  EXPECT_EQ(hitTop.found, passive.found);
+  EXPECT_EQ(hitTop.facets, passive.facets);
+  EXPECT_EQ(hitTop.avgs, passive.avgs);
+  EXPECT_EQ(hitTop.subFacets, passive.subFacets);
+
+  ASSERT_TRUE(helper.deleteById("d4", UpdateMessage::COMMIT).success);
+  auto deleted = run("keep_top_s", 4, false, true);
+  EXPECT_EQ(0, deleted.identities);
+  EXPECT_EQ(9, deleted.found);
+  EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d5", "d7"}),
+            deleted.ids);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"g0", 4}, {"g1", 5}}),
+            deleted.facets);
+}
+
+TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
+  constexpr std::string_view collection = "filter_docset_identity_guards";
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 12; doc++) {
+    docs.push_back(flatdoc(
+        "id", "g" + std::to_string(doc),
+        "keep_s", doc % 3 == 0 ? "no" : "yes",
+        "even_s", doc % 2 == 0 ? "yes" : "no",
+        "body_w", doc % 2 == 0 ? "apple" : "pear",
+        "group_s", "only",
+        "sort_i", 100 - doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto warm = [&](std::string_view field) {
+    for (int i = 0; i < 3; i++) {
+      auto req = localReq(soluxNode->getSearchEngine());
+      req->collection(collection);
+      req->topDocs("q").allQuery().getNumber().limit(0)
+          .matchFilter("filter", field, "yes");
+      req->execute(false);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+    }
+  };
+  warm("keep_s");
+  warm("even_s");
+  auto cache = helper.getIndexWriter()->getFilterCache();
+
+  auto run = [&](bool twoFilters, bool scoredQuery, bool fieldSort,
+                 bool passive, bool disableFilterClause) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").getNumber().fields({"id"})
+        .limit(fieldSort || scoredQuery ? 4 : 0);
+    if (scoredQuery) {
+      topDocs.matchQuery("body_w", "apple");
+    } else {
+      topDocs.allQuery();
+    }
+    topDocs.matchFilter("keep", "keep_s", "yes");
+    if (twoFilters) {
+      topDocs.matchFilter("even", "even_s", "yes");
+    }
+    if (fieldSort) {
+      qb::sort(topDocs, "sort_i", qb::ASC);
+    }
+    topDocs.facet("groups", "group_s").limit(-1);
+
+    int64_t identities;
+    int64_t domainWindows;
+    {
+      SkipStatsGuard stats;
+      TopDocsFilterFoldGuard fold(passive);
+      FilterClauseCountGuard filterClause(disableFilterClause);
+      req->execute(false);
+      identities = SkipStats::filterDocSetIdentityCollections;
+      domainWindows = SkipStats::bulkDomainWindowsFed;
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return std::tuple{
+        req->getMatchCount("q"), resultIds(*req, "q"),
+        identities, domainWindows};
+  };
+
+  auto beforeTwoFilter = cache->counters();
+  auto [twoFilterCount, twoFilterIds, twoFilterIdentities,
+        twoFilterWindows] = run(true, false, false, false, false);
+  EXPECT_EQ(4, twoFilterCount);
+  EXPECT_TRUE(twoFilterIds.empty());
+  EXPECT_EQ(0, twoFilterIdentities);
+  EXPECT_GT(twoFilterWindows, 0);
+  EXPECT_GE(cache->counters().hits - beforeTwoFilter.hits, 2);
+
+  auto [queryCount, queryIds, queryIdentities, queryWindows] =
+      run(false, true, false, false, false);
+  EXPECT_EQ(4, queryCount);
+  EXPECT_EQ((std::vector<std::string>{"g2", "g4", "g8", "g10"}),
+            queryIds);
+  EXPECT_EQ(0, queryIdentities);
+  EXPECT_GT(queryWindows, 0);
+
+  auto [sortedCount, sortedIds, sortedIdentities, sortedWindows] =
+      run(false, false, true, false, false);
+  EXPECT_EQ(8, sortedCount);
+  EXPECT_EQ((std::vector<std::string>{"g11", "g10", "g8", "g7"}),
+            sortedIds);
+  EXPECT_EQ(0, sortedIdentities);
+  unused(sortedWindows);
+
+  auto [disabledCount, disabledIds, disabledIdentities, disabledWindows] =
+      run(false, false, false, false, true);
+  EXPECT_EQ(8, disabledCount);
+  EXPECT_TRUE(disabledIds.empty());
+  EXPECT_EQ(0, disabledIdentities);
+  unused(disabledWindows);
+
+  auto [passiveCount, passiveIds, passiveIdentities, passiveWindows] =
+      run(false, false, false, true, false);
+  EXPECT_EQ(8, passiveCount);
+  EXPECT_TRUE(passiveIds.empty());
+  EXPECT_EQ(0, passiveIdentities);
+  unused(passiveWindows);
+
+  auto nested = localReq(soluxNode->getSearchEngine());
+  nested->collection(collection);
+  auto& outer = nested->facet("outer", "group_s").limit(-1);
+  outer.topDocs("filtered").allQuery().getNumber().fields({"id"}).limit(4)
+      .matchFilter("keep", "keep_s", "yes");
+  {
+    SkipStatsGuard stats;
+    nested->execute(false);
+    EXPECT_EQ(0, SkipStats::filterDocSetIdentityCollections);
+  }
+  ASSERT_OK(nested);
+  const auto* outerResult =
+      nested->responses[0]->proto.ops.at("outer")->facetResult();
+  ASSERT_NE(nullptr, outerResult);
+  const auto* filtered = outerResult->ops.at("filtered")->docList();
+  ASSERT_NE(nullptr, filtered);
+  EXPECT_EQ(8, filtered->found.value_or(-1));
+  const auto& nestedIds =
+      std::get<api::ColStr>(filtered->columns.at("id").kind).v;
+  EXPECT_EQ((std::vector<std::string_view>{"g1", "g2", "g4", "g5"}),
+            std::vector<std::string_view>(nestedIds.begin(), nestedIds.end()));
 }
 
 TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {

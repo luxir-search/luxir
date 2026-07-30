@@ -526,6 +526,8 @@ public:
 
   int64_t cost() override { return docs == nullptr ? 0 : (int64_t)docs->card(); }
 
+  DocSet* exactDocSet() override { return docs; }
+
   DocSet* docSet() const { return docs; }
 
   Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {

@@ -155,6 +155,7 @@ public:
 
       if (op.subOps.size() > 0) {
         output.resize(op.req.reader->segments().size());
+        borrowedDomains.resize(op.req.reader->segments().size());
         subCalcs.reserve(op.subOps.size());
         for (auto& [key, subOp] : op.subOps) {
           auto* subCalc = subOp->createCalculator(this, -1);
@@ -192,6 +193,8 @@ public:
     // Arena allocate?
     // We could have std::variant of DocSet.
     std::vector<std::unique_ptr<DocSet>> output;
+    // Request-pinned filter cache values handed directly to sub-ops.
+    std::vector<DocSet*> borrowedDomains;
     std::vector<std::unique_ptr<Calculator>> subCalcs;
 
     // Prepared path state. Used only when the main query or one of the
@@ -420,33 +423,62 @@ public:
         // Keep ownership until release so a scoring error cannot orphan it.
         data.reset(collectorMerger.obtain());
 
-        std::optional<DocSetBuilder> builder;
-        if (output.size() > 0 && !matchEverything) {
-          builder.emplace(seg.maxDoc());
-        }
-
         // Field-sorted ranking is the one thing a match-all still has to
         // iterate for: it orders by column values the domain says nothing
         // about.  A count-only field sort (limit 0) reads nothing back, so it
         // takes the domain answer like the score-ranked case.
         bool rankFromDocOrder = !data->useFieldSort;
-        if (matchEverything && (rankFromDocOrder || data->topCount() == 0)) {
-          int64_t total = domain == nullptr ? seg.maxDoc() : domain->card();
+        Query::ScorerSupplier* supplier = nullptr;
+        DocSet* borrowedDomain = nullptr;
+        // A root, non-prepared filter-only Boolean can expose its one cached
+        // required clause as the exact result. Outer domains remain explicit
+        // intersections and must use the collection ladder below.
+        if (!preparedMode && domain == nullptr && op.filterWeights.empty()
+            && op.weight->isConstantScoring()
+            && (rankFromDocOrder || data->topCount() == 0)) {
+          supplier = mainScorerSupplier(poolGuard.pool(), seg);
+          borrowedDomain =
+              supplier == nullptr ? nullptr : supplier->exactDocSet();
+          if (borrowedDomain != nullptr) {
+            skipCount(SkipStats::filterDocSetIdentityCollections);
+            if (!borrowedDomains.empty()) {
+              borrowedDomains[(size_t)segnum] = borrowedDomain;
+            }
+          }
+        }
+        bool identityResult = (matchEverything || borrowedDomain != nullptr)
+            && (rankFromDocOrder || data->topCount() == 0);
+
+        std::optional<DocSetBuilder> builder;
+        if (output.size() > 0 && !identityResult) {
+          builder.emplace(seg.maxDoc());
+        }
+
+        if (identityResult) {
+          DocSet* identityDomain =
+              borrowedDomain != nullptr ? borrowedDomain : domain;
+          int64_t total = borrowedDomain != nullptr
+              ? borrowedDomain->card()
+              : domain == nullptr ? seg.maxDoc() : domain->card();
           int64_t ranked = 0;
           if (rankFromDocOrder && data->topCount() > 0) {
             // Equal scores reduce ranking to doc order, so the domain's first
             // K docs are its top K.
-            auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
+            if (supplier == nullptr) {
+              supplier = mainScorerSupplier(poolGuard.pool(), seg);
+            }
             auto* scorer = supplier == nullptr ? nullptr
               : supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
             if (scorer != nullptr) {
-              ranked = collectFirstKConstant(segnum, scorer, domain,
+              ranked = collectFirstKConstant(segnum, scorer, identityDomain,
                                              *data->scoreCollector, data->topCount());
             }
           }
           assert(total >= ranked);
           data->addHits(total - ranked);
-        } else if (auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
+        } else if ((supplier = supplier != nullptr
+                                  ? supplier
+                                  : mainScorerSupplier(poolGuard.pool(), seg));
                    supplier != nullptr) {
           DocSet* filter = domain;
           std::unique_ptr<DocSet> newDomain;
@@ -644,7 +676,10 @@ public:
       // launch the sub-calculators in parallel after that.
       for (int i = subCalcs.size() - 1; i >= 0; i--) {
         // TODO: launch sub-calculators in parallel (except for the first one).
-        auto* newDomain = matchEverything ? domain : output[segnum].get();
+        auto* newDomain = matchEverything ? domain
+            : borrowedDomains[(size_t)segnum] != nullptr
+                ? borrowedDomains[(size_t)segnum]
+                : output[(size_t)segnum].get();
         subCalcs[i]->calc(tg, segnum, newDomain);
       }
 

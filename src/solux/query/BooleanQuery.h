@@ -1069,6 +1069,20 @@ public:
         return compositeCost(pool, segment, mandatorySources, optionalSources, filterSuppliers, minShouldMatch);
       }
 
+      DocSet* exactDocSet() override {
+        // Preserve the count-clause A/B baseline: disabling cached filter
+        // clause admission must also disable this degenerate form of it.
+        if (!needsScores && disableFilterClauseCountForTests) {
+          return nullptr;
+        }
+        if (!mandatorySources.empty() || !optionalSources.empty()
+            || !prohibitedSources.empty() || filterSuppliers.size() != 1
+            || filterSuppliers[0] == nullptr || minShouldMatch != 0) {
+          return nullptr;
+        }
+        return filterSuppliers[0]->exactDocSet();
+      }
+
       Query::ScorerSupplier::ExactCountTopKCosts
       exactCountTopKCosts() override {
         if (!mandatorySources.empty() || optionalSources.size() < 2

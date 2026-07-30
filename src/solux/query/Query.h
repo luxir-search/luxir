@@ -387,6 +387,13 @@ public:
       return {};
     }
 
+    /// Return a non-owning pointer to the exact matching DocSet when one is
+    /// already materialized. The supplier does not transfer ownership; the
+    /// default preserves the ordinary scorer/bulk-scorer collection contract.
+    virtual DocSet* exactDocSet() {
+      return nullptr;
+    }
+
     /// Create the scorer. leadCost is the estimated cost of the parent-selected
     /// lead iterator that will drive this scorer, or INT64_MAX when there is no
     /// lead constraint. Suppliers may use it to choose eager vs lazy setup.
