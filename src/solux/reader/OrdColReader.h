@@ -235,10 +235,13 @@ private:
     return (1ULL << bits) - 1;
   }
 
+  // invertMask (0 or ~0ULL) XORs each domain word before use, so the same walk
+  // serves a domain and its complement. The window mask is applied after the
+  // inversion, so inverted garbage past maxDoc is never visited.
   static uint64_t windowWord(const screaming::FixedBitSet& domainBits,
                              int32_t word,
-                             int32_t windowEnd) {
-    uint64_t bits = domainBits.words[word];
+                             int32_t windowEnd, uint64_t invertMask) {
+    uint64_t bits = domainBits.words[word] ^ invertMask;
     int32_t validBits = windowEnd - (word << 6);
     if (validBits < 64) bits &= lowBitsMask(validBits);
     return bits;
@@ -246,11 +249,11 @@ private:
 
   static void visitSetBits(const screaming::FixedBitSet& domainBits,
                            int32_t windowStart, int32_t windowEnd,
-                           auto&& visitor) {
+                           uint64_t invertMask, auto&& visitor) {
     int32_t wordStart = windowStart >> 6;
     int32_t wordEnd = (windowEnd + 63) >> 6;
     for (int32_t word = wordStart; word < wordEnd; word++) {
-      uint64_t bits = windowWord(domainBits, word, windowEnd);
+      uint64_t bits = windowWord(domainBits, word, windowEnd, invertMask);
       int32_t docBase = word << 6;
       while (bits != 0) {
         int32_t bit = (int32_t)std::countr_zero(bits);
@@ -344,10 +347,14 @@ public:
         missing_num, callback, stats);
   }
 
+  // invertMask ~0ULL walks the domain's complement without materializing a
+  // second bitset; the adaptive bulk/point decisions see complement
+  // cardinalities through the same inverted word reads.
   void SOLUX_NOINLINE forEachDocIdBitOrd(
       const screaming::FixedBitSet& domainBits, int32_t maxDoc,
       int32_t bulkMinHits, int64_t& missing_num,
-      auto&& callback, ForEachOrdStats* stats = nullptr) const {
+      auto&& callback, ForEachOrdStats* stats = nullptr,
+      uint64_t invertMask = 0) const {
     assert(maxDoc == maxdoc);
     assert(bulkMinHits >= 0 && bulkMinHits <= (int32_t)BULK_SIZE);
     assert(domainBits.size() >= maxDoc);
@@ -356,7 +363,7 @@ public:
     PointOrds pointValues(*this);
     BulkOrds bulkValues(*this);
     auto visitRange = [&](int32_t start, int32_t end, bool useBulk) {
-      visitSetBits(domainBits, start, end, [&](int32_t docid) {
+      visitSetBits(domainBits, start, end, invertMask, [&](int32_t docid) {
         int32_t ord = useBulk
             ? bulkValues.valueAt(docid) : pointValues.valueAt(docid);
         if (stats) {
@@ -378,7 +385,7 @@ public:
       int32_t wordEnd = (batchEnd + 63) >> 6;
       for (int32_t word = wordStart; word < wordEnd; word++) {
         cardinalities[(word - wordStart) >> 1] += (int32_t)std::popcount(
-            windowWord(domainBits, word, batchEnd));
+            windowWord(domainBits, word, batchEnd, invertMask));
       }
       int32_t nonemptyBlocks = 0;
       int32_t bulkBlocks = 0;

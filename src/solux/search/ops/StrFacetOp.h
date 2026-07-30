@@ -519,9 +519,12 @@ public:
         double complementCost = std::numeric_limits<double>::infinity();
         double termCost = std::numeric_limits<double>::infinity();
         if (termsAvailable) {
+          // Bitset domains walk the complement through an inverted word view;
+          // only array domains pay a dense complement-bitset build.
           complementCost = (double)domainView.compCard
               + (double)segFieldInfo.nTerms * DF_COST
-              + (double)FixedBitSet::sizeInWords(maxDoc);
+              + (domainView.bits != nullptr
+                     ? 0.0 : (double)FixedBitSet::sizeInWords(maxDoc));
           int32_t advanceSide = domainView.bits != nullptr
               ? std::min(domainView.card, domainView.compCard)
               : domainView.card;
@@ -648,7 +651,7 @@ public:
           } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
             profile->details.emplace_back(domainView.compCard == 0
                 ? "all-docs domain, docFreq-only dictionary walk"
-                : "inverted bitset, adaptive point/bulk ord loads");
+                : "inverted domain view, adaptive point/bulk ord loads");
           } else {
             profile->details.emplace_back(
                 "per-term smallest-side postings intersection");
@@ -693,34 +696,10 @@ public:
                   (int64_t)maxDoc - segFieldInfo.docsWithField;
             }
           } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
-            size_t numWords = FixedBitSet::sizeInWords(maxDoc);
-            auto* words = (uint64_t*)poolGuard.pool().alloc(
-                numWords * sizeof(uint64_t), alignof(uint64_t));
-            if (domainView.bits != nullptr) {
-              // Word-wise inversion reads the domain's whole word array, so it
-              // must cover the same doc space (liveDocs and every DocSetBuilder
-              // output are sized at maxDoc).
-              assert(domainView.bits->size() == maxDoc);
-              for (size_t i = 0; i < numWords; i++) {
-                words[i] = ~domainView.bits->words[i];
-              }
-            } else {
-              std::memset(words, 0xff, numWords * sizeof(uint64_t));
-              for (int32_t doc : domainView.arr->docs()) {
-                words[(uint32_t)doc >> 6] &=
-                    ~(1ULL << ((uint32_t)doc & 63));
-              }
-            }
-            int32_t trailing = maxDoc & 63;
-            if (trailing != 0) {
-              words[numWords - 1] &= (1ULL << trailing) - 1;
-            }
-            FixedBitSet complementBits(words, maxDoc);
-            BitDocSet complement(complementBits, domainView.compCard);
             int64_t compMissing = 0;
             OrdColReader ordColReader(postingsReader, segFieldInfo);
-            forEachOrdValue(
-                &complement, ordColReader, maxDoc, compMissing,
+            forEachComplementOrdValue(
+                domainView, poolGuard.pool(), ordColReader, compMissing,
                 [&](int32_t docid, int32_t value) SOLUX_INLINE {
                   unused(docid);
                   // Column value 0 is missing; value v maps to term ord v-1.

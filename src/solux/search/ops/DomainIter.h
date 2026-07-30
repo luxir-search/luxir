@@ -259,21 +259,27 @@ void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
   }
 }
 
-template <bool TrackStats, class F>
+template <bool TrackStats, bool Complement, class F>
 void forEachOrdValueImpl(DocSet* domain, OrdColReader& ordColReader,
                          int32_t maxDoc, int64_t& missing_num, F&& callback,
                          OrdColReader::ForEachOrdStats* stats) {
-  if (domain && domain->type == DocSet::Type::ARRAY) {
-    ordColReader.forEachOrd(
-        ((ArrDocSet*)domain)->docs(), missing_num, callback, stats);
-    return;
+  if constexpr (!Complement) {
+    if (domain && domain->type == DocSet::Type::ARRAY) {
+      ordColReader.forEachOrd(
+          ((ArrDocSet*)domain)->docs(), missing_num, callback, stats);
+      return;
+    }
   }
 
+  // Complement mode is only entered with a bitset domain: a null domain's
+  // complement is empty and array domains expand dense complement words first
+  // (forEachComplementOrdValue).
   const FixedBitSet* bits = domain ? &((BitDocSet*)domain)->bits() : nullptr;
+  assert(!Complement || bits != nullptr);
   if (bits != nullptr && ordColReader.docIdIndexed()) {
     ordColReader.forEachDocIdBitOrd(
         *bits, maxDoc, OrdColReader::configuredBulkMinHits(),
-        missing_num, callback, stats);
+        missing_num, callback, stats, Complement ? ~0ULL : 0);
     return;
   }
 
@@ -297,7 +303,11 @@ void forEachOrdValueImpl(DocSet* domain, OrdColReader& ordColReader,
   OrdColReader::Iterator iter(ordColReader);
   int32_t docid = -1;
   while (docid + 1 < maxDoc) {
-    docid = bits ? bits->nextSetBit(docid + 1) : docid + 1;
+    if constexpr (Complement) {
+      docid = (int32_t)bits->nextClearBit(docid + 1);
+    } else {
+      docid = bits ? bits->nextSetBit(docid + 1) : docid + 1;
+    }
     if (docid >= maxDoc) break;
     if (iter.docId() < docid) iter.advance(docid);
     if (iter.docId() != docid) {
@@ -320,7 +330,7 @@ void forEachOrdValueImpl(DocSet* domain, OrdColReader& ordColReader,
 template <class F>
 void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
                      int32_t maxDoc, int64_t& missing_num, F&& callback) {
-  forEachOrdValueImpl<false>(
+  forEachOrdValueImpl<false, false>(
       domain, ordColReader, maxDoc, missing_num,
       std::forward<F>(callback), nullptr);
 }
@@ -329,9 +339,46 @@ template <class F>
 void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
                      int32_t maxDoc, int64_t& missing_num, F&& callback,
                      OrdColReader::ForEachOrdStats* stats) {
-  forEachOrdValueImpl<true>(
+  forEachOrdValueImpl<true, false>(
       domain, ordColReader, maxDoc, missing_num,
       std::forward<F>(callback), stats);
+}
+
+// Walk the complement of a resolved facet domain over the ord column. Bitset
+// domains drive the shared adaptive machinery through inverted word reads, so
+// no second bitset is materialized. Array domains (reachable only when a
+// complement strategy is forced; the cost model never picks complement for a
+// sparse domain) expand dense complement words into the pool first.
+template <class F>
+void forEachComplementOrdValue(DomainView& view, MemPool& pool,
+                               OrdColReader& ordColReader,
+                               int64_t& missing_num, F&& callback) {
+  assert(view.domain != nullptr && view.compCard > 0);
+  if (view.bits == nullptr) {
+    size_t numWords = FixedBitSet::sizeInWords(view.maxDoc);
+    auto* words = (uint64_t*)pool.alloc(numWords * sizeof(uint64_t),
+                                        alignof(uint64_t));
+    std::memset(words, 0xff, numWords * sizeof(uint64_t));
+    for (int32_t doc : view.arr->docs()) {
+      words[(uint32_t)doc >> 6] &= ~(1ULL << ((uint32_t)doc & 63));
+    }
+    int32_t trailing = view.maxDoc & 63;
+    if (trailing != 0) {
+      words[numWords - 1] &= (1ULL << trailing) - 1;
+    }
+    FixedBitSet complementBits(words, view.maxDoc);
+    BitDocSet complement(complementBits, view.compCard);
+    forEachOrdValue(&complement, ordColReader, view.maxDoc, missing_num,
+                    std::forward<F>(callback));
+    return;
+  }
+  // Word-wise inversion reads the domain's whole word array, so it must cover
+  // the same doc space (liveDocs and every DocSetBuilder output are sized at
+  // maxDoc).
+  assert(view.bits->size() == view.maxDoc);
+  forEachOrdValueImpl<false, true>(
+      view.domain, ordColReader, view.maxDoc, missing_num,
+      std::forward<F>(callback), nullptr);
 }
 
 }
