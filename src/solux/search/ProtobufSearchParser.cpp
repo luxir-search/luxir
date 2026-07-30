@@ -296,7 +296,7 @@ public:
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(solux::overloaded{
       [&](const solux::api::TopDocs& topDocs) -> SearchOp* {
-        auto* qr = parseTopDocs(name, topDocs);
+        auto* qr = parseTopDocs(name, topDocs, true);
         addSubs(*qr, topDocs.ops);
         return qr;
       },
@@ -603,10 +603,12 @@ public:
     return weights;
   }
 
-  // Build a TopDocsReq from a TopDocs proto.  Caller decides whether to
-  // attach sub-ops (the kTopDocs path in parseOp does; parseFusion does
-  // not, since per-source ops are ignored by spec).
-  TopDocsReq* parseTopDocs(std::string_view name, const solux::api::TopDocs& topDocsReq) {
+  // Build a TopDocsReq from a TopDocs proto. The caller says whether its
+  // sub-ops are consumers: ordinary TopDocs attaches them, while Fusion
+  // ignores per-source ops by spec.
+  TopDocsReq* parseTopDocs(std::string_view name,
+                           const solux::api::TopDocs& topDocsReq,
+                           bool attachSubOps) {
     /*
     message TopDocs {
             Query query = 1;
@@ -631,6 +633,7 @@ public:
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
       : req.requestPool.make<AllQuery>();
+    Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
     unused(offset); // TODO
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
@@ -646,6 +649,11 @@ public:
     bool countClauseDisabled =
         BooleanQuery::disableFilterClauseCountForTests
         && limit == 0 && topDocsReq.get_number && !topDocsReq.get_scores;
+    CollectionRequirements requirements{
+      .needRankedDocs = limit > 0,
+      .needExactCount = topDocsReq.get_number,
+      .needExactDomain = attachSubOps && !topDocsReq.ops.empty()
+    };
     bool foldFilters = !filters.empty()
         && !disableTopDocsFilterFold
         && !countClauseDisabled;
@@ -663,6 +671,7 @@ public:
     // also leaves the Boolean tree visible to normalization before wrapping.
     if (req.testForcePrepare) {
       query = req.requestPool.make<ForcePrepareQuery>(query);
+      domainQuery = req.requestPool.make<ForcePrepareQuery>(domainQuery);
     }
 
     // Sort field schema lookup and Weight ctors that may throw are resolved
@@ -690,14 +699,15 @@ public:
     // pruning because a separate exhaustive windowed pass produces their
     // complete match domain and exact count before the ranking pass. Match-all
     // reuses the incoming domain and its cardinality instead.
-    bool allowPruning = limit > 0 && !parsedSorts.useFieldSort
-        && (topDocsReq.ops.empty() ? !topDocsReq.get_number : true);
+    bool allowPruning = requirements.needRankedDocs
+        && !parsedSorts.useFieldSort
+        && (!requirements.needExactCount || requirements.needExactDomain);
     if (allowPruning) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
     auto* weight = query->createWeight(*qcontext, requestFlags);
     bool sparseFilteredTopKReroute = allowPruning && foldFilters
-        && topDocsReq.ops.empty() && !weight->needsPrepare()
+        && !requirements.needExactDomain && !weight->needsPrepare()
         && TopDocsReq::admitSparseFilteredTopK(
             *weight, *req.reader, limit);
     if (sparseFilteredTopKReroute) {
@@ -712,8 +722,9 @@ public:
     }
     Query::Weight* countWeight = nullptr;
     Query::Weight* rankingWeight = nullptr;
-    bool exactCountTopK = limit > 0 && topDocsReq.get_number
-        && topDocsReq.ops.empty() && !parsedSorts.useFieldSort
+    bool exactCountTopK = requirements.needRankedDocs
+        && requirements.needExactCount && !requirements.needExactDomain
+        && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
     if (!disableTopKCountComposition && exactCountTopK
         && !weight->needsPrepare() && weight->canComposeExactCountTopK()) {
@@ -727,11 +738,27 @@ public:
     auto filterWeights = foldFilters
       ? std::span<Query::Weight*>{}
       : buildFilterWeights(filters, *qcontext, requestFlags);
+    Query::Weight* domainQueryWeight = nullptr;
+    std::span<Query::Weight*> domainFilterWeights;
+    if (!requirements.needRankedDocs && requirements.needExactDomain) {
+      if (foldFilters) {
+        int32_t domainFlags =
+            requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+        domainQueryWeight =
+            domainQuery->createWeight(*qcontext, domainFlags);
+        domainFilterWeights =
+            buildFilterWeights(filters, *qcontext, domainFlags);
+      } else {
+        domainQueryWeight = weight;
+        domainFilterWeights = filterWeights;
+      }
+    }
 
     auto* qr = solux::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *qcontext, query, weight,
       countWeight, rankingWeight, limit, std::move(parsedSorts),
-      filters, filterWeights);
+      requirements, filters, filterWeights, domainQuery, domainQueryWeight,
+      domainFilterWeights);
 
     if (firstQuery == nullptr) {
       firstQuery = qr;
@@ -783,7 +810,7 @@ public:
     sources.reserve(fusionProto.sources.size());
     for (auto& [srcName, srcProto] : lastWins(fusionProto.sources)) {  // dedup duplicate source names, last-wins
       size_t idx = sources.size();
-      auto* src = parseTopDocs(srcName, *srcProto);
+      auto* src = parseTopDocs(srcName, *srcProto, false);
       src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
         static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
       };

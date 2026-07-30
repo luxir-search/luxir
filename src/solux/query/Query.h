@@ -33,6 +33,18 @@ class DocSet;
 class DocSetBuilder;
 class WindowFilter;
 
+enum class PreparedDomainDependence : uint8_t {
+  // Prepared output is the canonical result of the query and may be
+  // published under the query's segment/core-stable filter key.
+  QUERY_CANONICAL = 0,
+  // Prepared output is exact only for the canonical live domain of one
+  // reader version. It belongs in the reader-stable cache lane.
+  CANONICAL_READER_DOMAIN = 1,
+  // Prepared output depends on the arbitrary PrepareContext domain and is
+  // request-local unless a separate key names that domain.
+  PREPARE_DOMAIN = 2
+};
+
 struct ScoreBounds {
   float lo = -std::numeric_limits<float>::infinity();
   float hi = std::numeric_limits<float>::infinity();
@@ -714,6 +726,13 @@ public:
       /// true only when every emitted doc is already within the PrepareContext
       /// domain used to build this PreparedWeight; false is always safe.
       bool outputIsSubsetOfDomain() const noexcept override { return false; }
+
+      /// Cache provenance for materialized output. The conservative default
+      /// prevents a prepared result from being published under a query-only
+      /// key unless the implementation affirmatively declares it canonical.
+      virtual PreparedDomainDependence domainDependence() const noexcept {
+        return PreparedDomainDependence::PREPARE_DOMAIN;
+      }
       virtual ~PreparedWeight() = default;
     };
 

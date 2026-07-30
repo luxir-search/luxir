@@ -1019,7 +1019,7 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
     auto* use = context.getFilterUse(query);
     MemPool execPool;
     auto* supplier = QueryPrep::filterSupplier(
-        execPool, *weight, nullptr, use, *reader, reader->segments()[0]);
+        execPool, *weight, use, *reader, reader->segments()[0]);
     ASSERT_NE(nullptr, supplier);
     EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
   }
@@ -1031,7 +1031,7 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
     auto* use = context.getFilterUse(query);
     MemPool execPool;
     auto* supplier = QueryPrep::filterSupplier(
-        execPool, *weight, nullptr, use, *reader, reader->segments()[0]);
+        execPool, *weight, use, *reader, reader->segments()[0]);
     ASSERT_NE(nullptr, supplier);
     EXPECT_NE(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
     EXPECT_EQ(1, supplier->cost());
@@ -1044,7 +1044,7 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
     auto* use = context.getFilterUse(query);
     MemPool execPool;
     auto* supplier = QueryPrep::filterSupplier(
-        execPool, *weight, nullptr, use, *reader, reader->segments()[0]);
+        execPool, *weight, use, *reader, reader->segments()[0]);
     ASSERT_NE(nullptr, supplier);
     EXPECT_NE(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
   }
@@ -1077,7 +1077,7 @@ TEST(FilterCacheTest, disabledCacheSparseBatchRetainsPostingsFeed) {
   OwnedFilterStatsGuard stats;
   MemPool firstPool;
   auto* first = QueryPrep::filterSupplier(
-      firstPool, *weight, nullptr, use, *reader, reader->segments()[0],
+      firstPool, *weight, use, *reader, reader->segments()[0],
       QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
   ASSERT_NE(nullptr, first);
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(first));
@@ -1087,7 +1087,7 @@ TEST(FilterCacheTest, disabledCacheSparseBatchRetainsPostingsFeed) {
   auto before = reader->filterCache()->counters();
   MemPool secondPool;
   auto* second = QueryPrep::filterSupplier(
-      secondPool, *weight, nullptr, use, *reader, reader->segments()[0],
+      secondPool, *weight, use, *reader, reader->segments()[0],
       QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
   ASSERT_NE(nullptr, second);
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(second));
@@ -1102,7 +1102,7 @@ TEST(FilterCacheTest, disabledCacheSparseBatchRetainsPostingsFeed) {
   auto* disabledUse = disabledContext.getFilterUse(selected);
   MemPool disabledExecPool;
   auto* disabledSupplier = QueryPrep::filterSupplier(
-      disabledExecPool, *disabledWeight, nullptr, disabledUse, *reader,
+      disabledExecPool, *disabledWeight, disabledUse, *reader,
       reader->segments()[0],
       QueryPrep::FilterSupplierMode::SPARSE_BATCH, 64);
   ASSERT_NE(nullptr,
@@ -1415,7 +1415,7 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   auto* weight = query.createWeight(context, 0);
   MemPool execPool;
   auto* supplier = QueryPrep::filterSupplier(
-      execPool, *weight, nullptr, context.getFilterUse(query), *reader,
+      execPool, *weight, context.getFilterUse(query), *reader,
       reader->segments()[0],
       QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE);
   ASSERT_NE(nullptr, supplier);
@@ -1449,7 +1449,7 @@ TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
     auto* use = context.getFilterUse(query);
     MemPool execPool;
     auto* supplier = QueryPrep::filterSupplier(
-        execPool, *weight, nullptr, use, *reader, reader->segments()[0],
+        execPool, *weight, use, *reader, reader->segments()[0],
         mode, sparseInverse);
     return dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr;
   };
@@ -2048,10 +2048,72 @@ TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {
   auto* racerUse = racerContext.getFilterUse(query);
 
   auto effective = QueryPrep::materializeEffectiveFilter(
-      *racerWeight, nullptr, racerUse, *reader, reader->segments()[0], nullptr);
+      *racerWeight, racerUse, *reader, reader->segments()[0], nullptr);
   ASSERT_NE(nullptr, effective.get());
   EXPECT_EQ(1, effective.get()->card());
   EXPECT_EQ(1u, cache->counters().byproductInserts);
+}
+
+TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
+  FilterCacheConfig config = testConfig();
+  config.minSegmentDocs = 0;
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addTermDoc(writer, "a keep");
+  addTermDoc(writer, "a");
+  addTermDoc(writer, "keep");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+
+  TermQuery term("text_w", "a");
+  ForcePrepareQuery forcedTerm(&term);
+  MemPool canonicalPool;
+  Query::Context canonicalContext(canonicalPool, *reader);
+  auto* canonicalWeight = forcedTerm.createWeight(canonicalContext, 0);
+  std::array<Query::Weight*, 1> canonicalWeights{canonicalWeight};
+  std::array<FilterCache::Use*, 1> canonicalUses{
+      canonicalContext.getFilterUse(forcedTerm)};
+  Query::Weight::PrepareContext canonicalPrepare{
+      *reader, std::span<DocSet* const>{}, false};
+  auto canonical = QueryPrep::prepareFilterSources(
+      canonicalWeights, canonicalUses, canonicalPrepare);
+  ASSERT_EQ(1u, canonical.size());
+  EXPECT_FALSE(canonical[0].prepared->outputIsSubsetOfDomain());
+  EXPECT_EQ(PreparedDomainDependence::QUERY_CANONICAL,
+            canonical[0].domainDependence);
+  auto canonicalDocs = QueryPrep::materializeEffectiveFilter(
+      canonical[0], *reader, reader->segments()[0], nullptr);
+  ASSERT_NE(nullptr, canonicalDocs.get());
+  EXPECT_EQ(2, canonicalDocs.get()->card());
+  auto canonicalProbe = canonical[0].cacheUse->probe(0);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, canonicalProbe.kind());
+
+  TermQuery keep("text_w", "keep");
+  ForcePrepareQuery preparedMandatory(&term);
+  std::array<Query*, 1> mandatory{&preparedMandatory};
+  std::array<Query*, 1> filters{&keep};
+  BooleanQuery domainDependent(mandatory, {}, {}, filters);
+  MemPool dependentPool;
+  Query::Context dependentContext(dependentPool, *reader);
+  auto* dependentWeight = domainDependent.createWeight(dependentContext, 0);
+  std::array<Query::Weight*, 1> dependentWeights{dependentWeight};
+  std::array<FilterCache::Use*, 1> dependentUses{
+      dependentContext.getFilterUse(domainDependent)};
+  Query::Weight::PrepareContext dependentPrepare{
+      *reader, std::span<DocSet* const>{}, false};
+  auto dependent = QueryPrep::prepareFilterSources(
+      dependentWeights, dependentUses, dependentPrepare);
+  ASSERT_EQ(1u, dependent.size());
+  EXPECT_TRUE(dependent[0].prepared->outputIsSubsetOfDomain());
+  EXPECT_EQ(PreparedDomainDependence::PREPARE_DOMAIN,
+            dependent[0].domainDependence);
+  auto dependentDocs = QueryPrep::materializeEffectiveFilter(
+      dependent[0], *reader, reader->segments()[0], nullptr);
+  ASSERT_NE(nullptr, dependentDocs.get());
+  EXPECT_EQ(1, dependentDocs.get()->card());
+  auto dependentProbe = dependent[0].cacheUse->probe(0);
+  EXPECT_NE(FilterCache::Probe::Kind::HIT, dependentProbe.kind());
 }
 
 TEST(FilterCacheTest, pruningBypassDoesNotOfferByproduct) {
@@ -2077,7 +2139,7 @@ TEST(FilterCacheTest, pruningBypassDoesNotOfferByproduct) {
   auto* racerUse = racerContext.getFilterUse(query);
 
   auto effective = QueryPrep::materializeEffectiveFilter(
-      *racerWeight, nullptr, racerUse, *reader, reader->segments()[0], nullptr);
+      *racerWeight, racerUse, *reader, reader->segments()[0], nullptr);
 
   ASSERT_NE(nullptr, effective.get());
   EXPECT_EQ(1, effective.get()->card());
@@ -3054,7 +3116,7 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
   EXPECT_GT(cache->counters().hits, before.hits);
 }
 
-TEST(FilterCacheIntegrationTest, multiSelectFacetMaterializationCapturesByproducts) {
+TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
   SoluxConfig config;
   config.filterCacheBytes = 4 * 1024 * 1024;
   SoluxNode node(config);
@@ -3086,9 +3148,15 @@ TEST(FilterCacheIntegrationTest, multiSelectFacetMaterializationCapturesByproduc
   };
 
   EXPECT_EQ(184, run());
+  auto beforeBuild = helper.getIndexWriter()->getFilterCache()->counters();
   EXPECT_EQ(184, run());
-  EXPECT_GE(helper.getIndexWriter()->getFilterCache()
-                ->counters().byproductInserts, 2u);
+  auto afterBuild = helper.getIndexWriter()->getFilterCache()->counters();
+  EXPECT_GE(afterBuild.builds - beforeBuild.builds, 2u);
+  auto beforeHit = afterBuild;
+  EXPECT_EQ(184, run());
+  EXPECT_GE(helper.getIndexWriter()->getFilterCache()->counters().hits
+                - beforeHit.hits,
+            2u);
 }
 
 TEST(DocSetRamBytesTest, usesOwnedCapacityForBothRepresentations) {

@@ -102,7 +102,7 @@ public:
     bool needsPrepare = false;
     std::atomic<int32_t> preparedDomainsSeen{0};
     std::vector<DocSet*> baseDomains;
-    std::vector<std::unique_ptr<Query::Weight::PreparedWeight>> preparedFilterWeights;
+    std::vector<QueryPrep::PreparedSource> preparedFilterSources;
 
     // Number of sources that have delivered their ranking.  When this hits
     // op.sources.size(), the last delivery launches doFusion.
@@ -125,7 +125,6 @@ public:
       }
       if (needsPrepare) {
         baseDomains.assign(numSegs, nullptr);
-        preparedFilterWeights.resize(op.filterWeights.size());
       }
     }
 
@@ -161,12 +160,14 @@ public:
       filterPtrs.reserve(op.filterWeights.size());
       auto& seg = op.req.reader->segments()[segnum];
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
-        auto* prepared = i < preparedFilterWeights.size()
-          ? preparedFilterWeights[i].get()
-          : nullptr;
-        filterDocSets.push_back(QueryPrep::materializeEffectiveFilter(
-            *op.filterWeights[i], prepared, op.filterUses[i],
-            *op.req.reader, seg, domain));
+        if (i < preparedFilterSources.size()) {
+          filterDocSets.push_back(QueryPrep::materializeEffectiveFilter(
+              preparedFilterSources[i], *op.req.reader, seg, domain));
+        } else {
+          filterDocSets.push_back(QueryPrep::materializeEffectiveFilter(
+              *op.filterWeights[i], op.filterUses[i],
+              *op.req.reader, seg, domain));
+        }
         filterPtrs.push_back(filterDocSets.back().get());
       }
       if (filterPtrs.empty()) return {};
@@ -190,11 +191,8 @@ public:
         std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
         tg != nullptr
       };
-      auto preparedFilters = QueryPrep::prepareFilterSources(
+      preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
-      for (size_t i = 0; i < preparedFilters.size(); i++) {
-        preparedFilterWeights[i] = std::move(preparedFilters[i].prepared);
-      }
 
       for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
         segFilters[(size_t)i] = buildSharedFilter(i, baseDomains[(size_t)i]);

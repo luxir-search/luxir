@@ -140,6 +140,8 @@ public:
   std::span<std::pair<std::string_view, Query*>> filters;
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
+  CollectionRequirements requirements;
+  QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
 
   // Optional sink for the merged top-K collector.  If set, the Calc invokes
@@ -174,7 +176,6 @@ public:
 
       if (op.subOps.size() > 0) {
         output.resize(op.req.reader->segments().size());
-        borrowedDomains.resize(op.req.reader->segments().size());
         subCalcs.reserve(op.subOps.size());
         for (auto& [key, subOp] : op.subOps) {
           auto* subCalc = subOp->createCalculator(this, -1);
@@ -193,7 +194,6 @@ public:
         baseDomains.assign(numSegs, nullptr);
         effectiveDomains.assign(numSegs, nullptr);
         effectiveDomainsOwned.resize(numSegs);
-        preparedFilterWeights.resize(op.filterWeights.size());
       }
     }
 
@@ -207,13 +207,9 @@ public:
     MaxScoreAccumulator scoreAccumulator;
 
 
-    // produced domains for subOps.
-    // TODO: how to avoid having 2 allocations per set, one for the DocSet and one for the memory in the DocSet?
-    // Arena allocate?
-    // We could have std::variant of DocSet.
-    std::vector<std::unique_ptr<DocSet>> output;
-    // Request-pinned filter cache values handed directly to sub-ops.
-    std::vector<DocSet*> borrowedDomains;
+    // Produced domains for sub-ops. A result either owns an intersection /
+    // collected set or borrows request-pinned cache state.
+    std::vector<QueryPrep::MaterializedFilter> output;
     std::vector<std::unique_ptr<Calculator>> subCalcs;
 
     // Prepared path state. Used only when the main query or one of the
@@ -227,7 +223,7 @@ public:
     std::vector<DocSet*> baseDomains;
     std::vector<DocSet*> effectiveDomains;
     std::vector<QueryPrep::MaterializedFilter> effectiveDomainsOwned;
-    std::vector<std::unique_ptr<Query::Weight::PreparedWeight>> preparedFilterWeights;
+    std::vector<QueryPrep::PreparedSource> preparedFilterSources;
     std::unique_ptr<Query::Weight::PreparedWeight> preparedWeight;
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {
@@ -339,8 +335,7 @@ public:
       filterPtrs.reserve(op.filterWeights.size());
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
         filters.push_back(QueryPrep::materializeEffectiveFilter(
-          *op.filterWeights[i], preparedFilterWeights[i].get(),
-          op.filterUses[i], *op.req.reader, seg, baseDomain));
+          preparedFilterSources[i], *op.req.reader, seg, baseDomain));
         filterPtrs.push_back(filters.back().get());
       }
       if (filterPtrs.empty()) return {};
@@ -370,11 +365,8 @@ public:
         std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
         tg != nullptr
       };
-      auto preparedFilters = QueryPrep::prepareFilterSources(
+      preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
-      for (size_t i = 0; i < preparedFilters.size(); i++) {
-        preparedFilterWeights[i] = std::move(preparedFilters[i].prepared);
-      }
 
       for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
         if (op.filterWeights.empty()) {
@@ -449,10 +441,27 @@ public:
         bool rankFromDocOrder = !data->useFieldSort;
         Query::ScorerSupplier* supplier = nullptr;
         DocSet* borrowedDomain = nullptr;
+        bool exactDomain = false;
+        DocSet* exactDomainDocs = nullptr;
+        if (!preparedMode && op.requirements.needExactDomain
+            && !op.requirements.needRankedDocs
+            && !op.exactDomainPlan.empty()) {
+          auto result = op.exactDomainPlan.produce(
+              poolGuard.pool(), *op.req.reader, seg, domain);
+          exactDomain = result.available;
+          if (exactDomain) {
+            output[(size_t)segnum] = std::move(result.docs);
+            exactDomainDocs = output[(size_t)segnum].get();
+            skipCount(SkipStats::exactDomainDocSetCollections);
+          } else {
+            skipCount(SkipStats::exactDomainStreamFallbacks);
+          }
+        }
         // A root, non-prepared filter-only Boolean can expose its one cached
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
-        if (!preparedMode && domain == nullptr && op.filterWeights.empty()
+        if (!exactDomain
+            && !preparedMode && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
             && (rankFromDocOrder || data->topCount() == 0)) {
           supplier = mainScorerSupplier(poolGuard.pool(), seg);
@@ -460,12 +469,14 @@ public:
               supplier == nullptr ? nullptr : supplier->exactDocSet();
           if (borrowedDomain != nullptr) {
             skipCount(SkipStats::filterDocSetIdentityCollections);
-            if (!borrowedDomains.empty()) {
-              borrowedDomains[(size_t)segnum] = borrowedDomain;
+            if (!output.empty()) {
+              output[(size_t)segnum] =
+                  QueryPrep::MaterializedFilter(borrowedDomain);
             }
           }
         }
-        bool identityResult = (matchEverything || borrowedDomain != nullptr)
+        bool identityResult =
+            (exactDomain || matchEverything || borrowedDomain != nullptr)
             && (rankFromDocOrder || data->topCount() == 0);
 
         std::optional<DocSetBuilder> builder;
@@ -474,11 +485,11 @@ public:
         }
 
         if (identityResult) {
-          DocSet* identityDomain =
-              borrowedDomain != nullptr ? borrowedDomain : domain;
-          int64_t total = borrowedDomain != nullptr
-              ? borrowedDomain->card()
-              : domain == nullptr ? seg.maxDoc() : domain->card();
+          DocSet* identityDomain = exactDomain
+              ? exactDomainDocs
+              : borrowedDomain != nullptr ? borrowedDomain : domain;
+          int64_t total = identityDomain == nullptr
+              ? seg.maxDoc() : identityDomain->card();
           int64_t ranked = 0;
           if (rankFromDocOrder && data->topCount() > 0) {
             // Equal scores reduce ranking to doc order, so the domain's first
@@ -508,8 +519,8 @@ public:
             std::vector<DocSet*> filterPtrs;
             for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
               filters.push_back(QueryPrep::materializeEffectiveFilter(
-                  *thisOp().filterWeights[i], nullptr,
-                  thisOp().filterUses[i], *op.req.reader, seg, nullptr));
+                  *thisOp().filterWeights[i], thisOp().filterUses[i],
+                  *op.req.reader, seg, nullptr));
               filterPtrs.push_back(filters.back().get());
             }
             if (domain) {
@@ -680,7 +691,8 @@ public:
           }
         }
         if (builder.has_value()) {
-          output[segnum] = std::move(builder->build());
+          output[(size_t)segnum] =
+              QueryPrep::MaterializedFilter(std::move(builder->build()));
         }
       }
       // For maximum parallelism, we want to launch sub-tasks that depend on matching documents
@@ -696,9 +708,7 @@ public:
       for (int i = subCalcs.size() - 1; i >= 0; i--) {
         // TODO: launch sub-calculators in parallel (except for the first one).
         auto* newDomain = matchEverything ? domain
-            : borrowedDomains[(size_t)segnum] != nullptr
-                ? borrowedDomains[(size_t)segnum]
-                : output[(size_t)segnum].get();
+            : output[(size_t)segnum].get();
         subCalcs[i]->calc(tg, segnum, newDomain);
       }
 
@@ -745,18 +755,33 @@ public:
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::Context& qcontext, Query* query, Query::Weight* weight,
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
-    SortPlan&& sortPlan,
+    SortPlan&& sortPlan, CollectionRequirements requirements,
     std::span<std::pair<std::string_view, Query*>> filters,
-    std::span<Query::Weight*> filterWeights)
+    std::span<Query::Weight*> filterWeights,
+    Query* domainQuery, Query::Weight* domainQueryWeight,
+    std::span<Query::Weight*> domainFilterWeights)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
       weight(weight), countWeight(countWeight), rankingWeight(rankingWeight),
       topCount(topCount), filters(filters), filterWeights(filterWeights),
+      requirements(requirements),
       sortPlan(std::move(sortPlan)) {
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());
       filterUses = qcontext.pool.make_span<FilterCache::Use*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
         filterUses[i] = qcontext.getFilterUse(*filters[i].second);
+      }
+    }
+    if (domainQueryWeight != nullptr) {
+      if (!domainQueryWeight->matchesAllDocs()) {
+        exactDomainPlan.add(
+            *domainQueryWeight, qcontext.getFilterUse(*domainQuery));
+      }
+      assert(domainFilterWeights.size() == filters.size());
+      for (size_t i = 0; i < domainFilterWeights.size(); i++) {
+        exactDomainPlan.add(
+            *domainFilterWeights[i],
+            qcontext.getFilterUse(*filters[i].second));
       }
     }
   }

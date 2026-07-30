@@ -45,10 +45,20 @@ inline Query::Scorer* createScorer(MemPool& targetPool,
 struct PreparedSource {
   Query::Weight* weight = nullptr;
   std::unique_ptr<Query::Weight::PreparedWeight> prepared;
+  FilterCache::Use* cacheUse = nullptr;
+  PreparedDomainDependence domainDependence =
+      PreparedDomainDependence::QUERY_CANONICAL;
 
   Query::SegmentSource& segmentSource() const {
     if (prepared) return *prepared;
     return *weight;
+  }
+
+  void setPrepared(std::unique_ptr<Query::Weight::PreparedWeight> value) {
+    prepared = std::move(value);
+    domainDependence = prepared == nullptr
+        ? PreparedDomainDependence::QUERY_CANONICAL
+        : prepared->domainDependence();
   }
 };
 
@@ -67,7 +77,7 @@ inline std::vector<PreparedSource> prepareSources(std::span<Query::Weight*> weig
     PreparedSource source;
     source.weight = weight;
     if (weight->needsPrepare()) {
-      source.prepared = weight->prepare(ctx);
+      source.setPrepared(weight->prepare(ctx));
     }
     out.emplace_back(std::move(source));
   }
@@ -654,6 +664,9 @@ public:
   }
 
   bool outputIsSubsetOfDomain() const noexcept override { return true; }
+  PreparedDomainDependence domainDependence() const noexcept override {
+    return PreparedDomainDependence::CANONICAL_READER_DOMAIN;
+  }
 };
 
 // Filter-only pre-prepare seam. Reader-stable hits replace prepare() with a
@@ -672,6 +685,7 @@ inline std::vector<PreparedSource> prepareFilterSources(
     auto* use = uses.empty() ? nullptr : uses[i];
     PreparedSource source;
     source.weight = weight;
+    source.cacheUse = use;
     if (!weight->needsPrepare()) {
       out.emplace_back(std::move(source));
       continue;
@@ -702,14 +716,14 @@ inline std::vector<PreparedSource> prepareFilterSources(
             probe, std::move(liveExact), buildCostMicros);
       }
       if (value != nullptr) {
-        source.prepared = std::make_unique<ReaderStablePreparedWeight>(
-            std::move(value));
+        source.setPrepared(std::make_unique<ReaderStablePreparedWeight>(
+            std::move(value)));
         out.emplace_back(std::move(source));
         continue;
       }
     }
 
-    source.prepared = weight->prepare(ctx);
+    source.setPrepared(weight->prepare(ctx));
     out.emplace_back(std::move(source));
   }
   return out;
@@ -788,16 +802,21 @@ inline bool shouldOwnFilterValue(FilterSupplierMode mode, int64_t cost,
 }
 
 inline Query::ScorerSupplier* filterSupplier(
-    MemPool& targetPool, Query::Weight& weight,
-    Query::Weight::PreparedWeight* prepared, FilterCache::Use* use,
+    MemPool& targetPool, const PreparedSource& source,
     IndexReader& reader, IndexReader::Segment& segment,
     FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
     int32_t sparseBatchDensityInverse = 0) {
-  Query::SegmentSource& source = prepared != nullptr
-    ? static_cast<Query::SegmentSource&>(*prepared)
-    : static_cast<Query::SegmentSource&>(weight);
+  auto& weight = *source.weight;
+  auto* prepared = source.prepared.get();
+  auto* use = source.cacheUse;
+  Query::SegmentSource& segmentSource = source.segmentSource();
+  if (source.domainDependence != PreparedDomainDependence::QUERY_CANONICAL
+      && use != nullptr
+      && use->scope() != FilterKeyScope::READER_STABLE) {
+    use = nullptr;
+  }
   if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
-    return source.scorerSupplier(targetPool, segment);
+    return segmentSource.scorerSupplier(targetPool, segment);
   }
 
   // Gate before cache traffic. DENSITY_ROUTED leaves sparse filters on pruned
@@ -809,7 +828,7 @@ inline Query::ScorerSupplier* filterSupplier(
   // planning. On cache bypass, SPARSE_BATCH retains postings for the batch
   // gatherer; admitted cache builds still publish a DocSet, and cache hits
   // borrow one. Sparse entries also populate through facet/domain consumers.
-  auto* uncached = source.scorerSupplier(targetPool, segment);
+  auto* uncached = segmentSource.scorerSupplier(targetPool, segment);
   if (uncached == nullptr) return nullptr;
   int64_t cost = uncached->cost();
   if (use == nullptr
@@ -850,10 +869,128 @@ inline Query::ScorerSupplier* filterSupplier(
   return targetPool.make<DocSetSupplier>(effective, segment);
 }
 
+inline Query::ScorerSupplier* filterSupplier(
+    MemPool& targetPool, Query::Weight& weight, FilterCache::Use* use,
+    IndexReader& reader, IndexReader::Segment& segment,
+    FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
+    int32_t sparseBatchDensityInverse = 0) {
+  PreparedSource source;
+  source.weight = &weight;
+  source.cacheUse = use;
+  return filterSupplier(
+      targetPool, source, reader, segment, mode,
+      sparseBatchDensityInverse);
+}
+
+struct ExactDomainSource {
+  Query::Weight* weight = nullptr;
+  FilterCache::Use* cacheUse = nullptr;
+};
+
+struct ExactDomainResult {
+  bool available = false;
+  MaterializedFilter docs;
+};
+
+// Try the separable exact-DocSet route for one segment. At the root, the
+// ordinary exhaustive filter policy may admit/build a source. Beneath an
+// explicit parent domain, only already-resident exact values are accepted:
+// a miss falls back to streaming the complete effective query through that
+// domain instead of materializing unrestricted source sets first.
+inline ExactDomainResult tryExactDomain(
+    MemPool& targetPool, std::span<const ExactDomainSource> sources,
+    IndexReader& reader, IndexReader::Segment& segment, DocSet* domain) {
+  if (domain != nullptr && domain->card() == 0) {
+    return {true, MaterializedFilter(domain)};
+  }
+
+  std::vector<DocSet*> sets;
+  sets.reserve(sources.size() + (domain == nullptr ? 0 : 1));
+  bool allAvailable = true;
+  for (const auto& source : sources) {
+    if (source.weight == nullptr || source.weight->needsPrepare()) {
+      allAvailable = false;
+      continue;
+    }
+
+    DocSet* exact = nullptr;
+    bool matchesNone = false;
+    if (domain != nullptr && source.cacheUse != nullptr) {
+      if (source.cacheUse->scope() == FilterKeyScope::READER_STABLE) {
+        allAvailable = false;
+        continue;
+      }
+      auto probe = source.cacheUse->probe((size_t) segment.ord);
+      if (probe.kind() != FilterCache::Probe::Kind::HIT) {
+        allAvailable = false;
+        continue;
+      }
+      exact = source.cacheUse->effectiveDocSet(
+          (size_t) segment.ord, reader);
+      if (exact == nullptr) {
+        allAvailable = false;
+        continue;
+      }
+    } else {
+      auto* supplier = filterSupplier(
+          targetPool, *source.weight, source.cacheUse,
+          reader, segment, FilterSupplierMode::EXHAUSTIVE_CLAUSE);
+      if (supplier == nullptr) {
+        matchesNone = true;
+      } else {
+        exact = supplier->exactDocSet();
+        if (exact == nullptr) {
+          allAvailable = false;
+          continue;
+        }
+      }
+    }
+
+    if (matchesNone) {
+      DocSetBuilder empty(segment.maxDoc());
+      return {true, MaterializedFilter(empty.build())};
+    }
+    sets.push_back(exact);
+  }
+  if (!allAvailable) return {};
+  if (domain != nullptr) sets.push_back(domain);
+
+  if (sets.empty()) return {true, MaterializedFilter()};
+  if (sets.size() == 1) {
+    return {true, MaterializedFilter(sets[0])};
+  }
+  return {true, MaterializedFilter(DocSet::intersect(sets))};
+}
+
+class ExactDomainPlan {
+  std::vector<ExactDomainSource> sources;
+
+public:
+  void add(Query::Weight& weight, FilterCache::Use* cacheUse) {
+    sources.push_back({&weight, cacheUse});
+  }
+
+  bool empty() const { return sources.empty(); }
+
+  ExactDomainResult produce(
+      MemPool& targetPool, IndexReader& reader,
+      IndexReader::Segment& segment, DocSet* domain) const {
+    return tryExactDomain(
+        targetPool, sources, reader, segment, domain);
+  }
+};
+
 inline MaterializedFilter materializeEffectiveFilter(
-    Query::Weight& weight, Query::Weight::PreparedWeight* prepared,
-    FilterCache::Use* use, IndexReader& reader,
+    const PreparedSource& source, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {
+  auto& weight = *source.weight;
+  auto* prepared = source.prepared.get();
+  auto* use = source.cacheUse;
+  if (source.domainDependence != PreparedDomainDependence::QUERY_CANONICAL
+      && use != nullptr
+      && use->scope() != FilterKeyScope::READER_STABLE) {
+    use = nullptr;
+  }
   if (use == nullptr) {
     return MaterializedFilter(materialize(weight, prepared, segment, domain));
   }
@@ -908,6 +1045,15 @@ inline MaterializedFilter materializeEffectiveFilter(
   return MaterializedFilter(effective);
 }
 
+inline MaterializedFilter materializeEffectiveFilter(
+    Query::Weight& weight, FilterCache::Use* use, IndexReader& reader,
+    IndexReader::Segment& segment, DocSet* domain) {
+  PreparedSource source;
+  source.weight = &weight;
+  source.cacheUse = use;
+  return materializeEffectiveFilter(source, reader, segment, domain);
+}
+
 inline std::unique_ptr<DocSet> intersectOwned(std::vector<std::unique_ptr<DocSet>>& sets) {
   if (sets.empty()) return nullptr;
   if (sets.size() == 1) return std::move(sets[0]);
@@ -932,19 +1078,15 @@ inline std::unique_ptr<DocSet> materializeIntersection(std::span<const PreparedS
 }
 
 inline MaterializedFilter materializeEffectiveIntersection(
-    std::span<const PreparedSource> sources,
-    std::span<FilterCache::Use* const> uses, IndexReader& reader,
+    std::span<const PreparedSource> sources, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {
-  assert(uses.empty() || uses.size() == sources.size());
   std::vector<MaterializedFilter> sets;
   std::vector<DocSet*> ptrs;
   sets.reserve(sources.size());
   ptrs.reserve(sources.size());
-  for (size_t i = 0; i < sources.size(); i++) {
-    auto& source = sources[i];
-    auto* use = uses.empty() ? nullptr : uses[i];
+  for (auto& source : sources) {
     sets.push_back(materializeEffectiveFilter(
-        *source.weight, source.prepared.get(), use, reader, segment, domain));
+        source, reader, segment, domain));
     ptrs.push_back(sets.back().get());
   }
   if (ptrs.empty()) return {};

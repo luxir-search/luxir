@@ -2059,6 +2059,22 @@ public:
         // of the domain this weight was prepared against.
         return hasFilters;
       }
+
+      PreparedDomainDependence domainDependence() const noexcept override {
+        if (hasFilters) return PreparedDomainDependence::PREPARE_DOMAIN;
+        auto strongest = PreparedDomainDependence::QUERY_CANONICAL;
+        auto include = [&](const std::vector<QueryPrep::PreparedSource>& sources) {
+          for (const auto& source : sources) {
+            if ((uint8_t) source.domainDependence > (uint8_t) strongest) {
+              strongest = source.domainDependence;
+            }
+          }
+        };
+        include(mandatorySources);
+        include(optionalSources);
+        include(prohibitedSources);
+        return strongest;
+      }
     };
 
 
@@ -2185,7 +2201,7 @@ public:
         for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
           auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
           filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
-            QueryPrep::preparedSpan(filterSources), filterUses, ctx.reader,
+            QueryPrep::preparedSpan(filterSources), ctx.reader,
             ctx.reader.segments()[segnum], outerDomain);
           childDomainPtrs[segnum] = filterDomains[segnum].get();
         }
@@ -2235,7 +2251,7 @@ public:
                         ? QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE
                         : QueryPrep::FilterSupplierMode::DENSITY_ROUTED;
           filterSuppliers[i] = QueryPrep::filterSupplier(
-              targetPool, *filterWeights[i], nullptr, filterUses[i],
+              targetPool, *filterWeights[i], filterUses[i],
               context.topReader, segment, mode,
               exactFilteredDisjunction
                   ? needsScores

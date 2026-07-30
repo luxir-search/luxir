@@ -48,6 +48,10 @@ public:
       bool outputIsSubsetOfDomain() const noexcept override {
         return child.prepared != nullptr && child.prepared->outputIsSubsetOfDomain();
       }
+
+      PreparedDomainDependence domainDependence() const noexcept override {
+        return child.domainDependence;
+      }
     };
 
   public:
@@ -62,7 +66,7 @@ public:
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
       if (childWeight->needsPrepare()) {
-        source.prepared = childWeight->prepare(ctx);
+        source.setPrepared(childWeight->prepare(ctx));
       }
       return std::make_unique<Prepared>(std::move(source));
     }

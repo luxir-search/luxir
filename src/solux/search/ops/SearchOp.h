@@ -20,6 +20,12 @@ using ReqFieldFacet = solux::api::FieldFacet;
 using ReqRangeFacet = solux::api::RangeFacet;
 using ReqSortList = std::span<const solux::api::SortSpec>;
 
+struct CollectionRequirements {
+  bool needRankedDocs = false;
+  bool needExactCount = false;
+  bool needExactDomain = false;
+};
+
 // --- Response-side (owning) oneof / optional mutators ---
 // hpp-proto translation of protobuf's mutable_<oneof_arm>() / mutable_<message>():
 // "return the active arm/value, creating a default one if not already present"
