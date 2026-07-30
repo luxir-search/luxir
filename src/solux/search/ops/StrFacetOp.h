@@ -328,12 +328,19 @@ public:
   }
 
   class Calc : public Calculator {
-    // Guesses in column-read-equivalents pending forced-strategy grid
-    // measurement. Keep these named so the measured crossover fit replaces
-    // constants rather than changing selector structure.
-    static constexpr double DF_COST = 2.0;
+    // Column-read-equivalents, fit to the forced-strategy facet grid
+    // (single-segment, sel {10,50,90,99} x realized cardinality 10..1.84M).
+    // DF_COST covers the per-term docFreq walk plus the local->global drain.
+    // COMPLEMENT_DOC_COST < 1 because the complement walk increments a dense
+    // local int32 array while the column walk pays shared-rep (skinny/vector)
+    // increments; the discount is what lets complement win at c == d for small
+    // term counts, which the measured grid shows. The fit reproduces the
+    // measured winner in every cell; nearest-boundary cells (50%/100K,
+    // 90%/~1.8M terms) are within 15% either way.
+    static constexpr double DF_COST = 2.25;
+    static constexpr double COMPLEMENT_DOC_COST = 0.9;
     static constexpr double POSTINGS_SETUP_COST = 30.0;
-    static constexpr double POSTINGS_ADVANCE_COST = 3.0;
+    static constexpr double POSTINGS_ADVANCE_COST = 4.0;
 
     ExecutionProfileRun* profileRun;
     std::vector<DocSet*> input;
@@ -521,7 +528,7 @@ public:
         if (termsAvailable) {
           // Bitset domains walk the complement through an inverted word view;
           // only array domains pay a dense complement-bitset build.
-          complementCost = (double)domainView.compCard
+          complementCost = (double)domainView.compCard * COMPLEMENT_DOC_COST
               + (double)segFieldInfo.nTerms * DF_COST
               + (domainView.bits != nullptr
                      ? 0.0 : (double)FixedBitSet::sizeInWords(maxDoc));
