@@ -658,6 +658,8 @@ public:
     bool needsScores = false;
     bool allowsPruning = false;
     bool sparseFilteredTopKEligible = false;
+    SparseFilteredTopKFamily sparseFilteredTopKFamilyKind =
+        SparseFilteredTopKFamily::CONJUNCTION;
 
     static bool sparseFilteredTopKMandatory(Query* query) {
       while (auto* boost = dynamic_cast<BoostQuery*>(query)) {
@@ -2055,12 +2057,17 @@ public:
       if (directTermUnion) {
         traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       }
-      sparseFilteredTopKEligible = !filterWeights.empty()
+      bool sparseFilteredTopKConjunction = !filterWeights.empty()
           && !mandatoryClauses.empty() && optionalClauses.empty()
           && prohibitedClauses.empty() && minShouldMatch == 0
           && std::all_of(
               mandatoryClauses.begin(), mandatoryClauses.end(),
               sparseFilteredTopKMandatory);
+      sparseFilteredTopKEligible = sparseFilteredTopKConjunction
+          || (directTermUnion && !filterWeights.empty());
+      if (directTermUnion && !filterWeights.empty()) {
+        sparseFilteredTopKFamilyKind = SparseFilteredTopKFamily::UNION;
+      }
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
@@ -2153,6 +2160,11 @@ public:
         cost = std::min(cost, supplier->cost());
       }
       return cost;
+    }
+
+    SparseFilteredTopKFamily sparseFilteredTopKFamily()
+        const noexcept override {
+      return sparseFilteredTopKFamilyKind;
     }
 
     Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {

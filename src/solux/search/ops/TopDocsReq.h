@@ -65,18 +65,31 @@ public:
   static inline std::array<int32_t, 3>
       sparseFilteredTopKDensityInverseForTests =
           kSparseFilteredTopKDensityInverse;
+  // Direct term unions retain useful competitive pruning at higher filter
+  // densities, especially at shallow top-k depths.
+  static constexpr std::array<int32_t, 3>
+      kSparseFilteredTopKUnionDensityInverse{128, 128, 64};
+  static inline std::array<int32_t, 3>
+      sparseFilteredTopKUnionDensityInverseForTests =
+          kSparseFilteredTopKUnionDensityInverse;
   static inline bool disableSparseFilteredTopKRerouteForTests = false;
+  static inline bool disableSparseFilteredTopKUnionForTests = false;
 
-  static int32_t sparseFilteredTopKDensityInverse(int64_t topCount) {
+  static int32_t sparseFilteredTopKDensityInverse(
+      Query::Weight::SparseFilteredTopKFamily family, int64_t topCount) {
     if (topCount <= 0) return 0;
+    const auto& densityInverses =
+        family == Query::Weight::SparseFilteredTopKFamily::UNION
+            ? sparseFilteredTopKUnionDensityInverseForTests
+            : sparseFilteredTopKDensityInverseForTests;
     if (topCount <= 10) {
-      return sparseFilteredTopKDensityInverseForTests[0];
+      return densityInverses[0];
     }
     if (topCount <= 100) {
-      return sparseFilteredTopKDensityInverseForTests[1];
+      return densityInverses[1];
     }
     if (topCount <= 1000) {
-      return sparseFilteredTopKDensityInverseForTests[2];
+      return densityInverses[2];
     }
     return 0;
   }
@@ -86,7 +99,13 @@ public:
     if (disableSparseFilteredTopKRerouteForTests) {
       return false;
     }
-    int32_t densityInverse = sparseFilteredTopKDensityInverse(topCount);
+    auto family = weight.sparseFilteredTopKFamily();
+    if (family == Query::Weight::SparseFilteredTopKFamily::UNION
+        && disableSparseFilteredTopKUnionForTests) {
+      return false;
+    }
+    int32_t densityInverse =
+        sparseFilteredTopKDensityInverse(family, topCount);
     if (densityInverse <= 0) {
       return false;
     }

@@ -701,9 +701,14 @@ public:
         && TopDocsReq::admitSparseFilteredTopK(
             *weight, *req.reader, limit);
     if (sparseFilteredTopKReroute) {
+      bool unionFamily = weight->sparseFilteredTopKFamily()
+          == Query::Weight::SparseFilteredTopKFamily::UNION;
       requestFlags &= ~Query::ALLOW_PRUNING;
       weight = query->createWeight(*qcontext, requestFlags);
       skipCount(SkipStats::sparseFilteredTopKReroutes);
+      if (unionFamily) {
+        skipCount(SkipStats::sparseFilteredTopKUnionReroutes);
+      }
     }
     Query::Weight* countWeight = nullptr;
     Query::Weight* rankingWeight = nullptr;

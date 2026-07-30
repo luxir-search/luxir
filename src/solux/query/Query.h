@@ -662,6 +662,11 @@ public:
     // no prepare pass and no constant-scoring fast path.
     int32_t traits = 0;
   public:
+    enum class SparseFilteredTopKFamily {
+      CONJUNCTION,
+      UNION,
+    };
+
     Weight(Query::Context& context, int32_t inputFlags) : context(context), inputFlags(inputFlags) {}
 
     /// Per-segment domains available during prepare(). An empty domain span
@@ -748,10 +753,16 @@ public:
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
-    /// A-priori cost of the folded filter clause for a scored conjunction that
-    /// may profitably abandon top-k pruning, or -1 when this weight's shape is
-    /// not eligible. Implementations must inspect suppliers only: this planner
-    /// hook runs before request execution and must not populate filter caches.
+    /// Policy family for choosing the sparse-filtered top-k density knee.
+    /// Existing and ineligible weights retain the conjunction-family default.
+    virtual SparseFilteredTopKFamily sparseFilteredTopKFamily() const noexcept {
+      return SparseFilteredTopKFamily::CONJUNCTION;
+    }
+
+    /// A-priori cost of the folded filter clause for a scored query that may
+    /// profitably abandon top-k pruning, or -1 when this weight's shape is not
+    /// eligible. Implementations must inspect suppliers only: this planner hook
+    /// runs before request execution and must not populate filter caches.
     virtual int64_t sparseFilteredTopKCost(
         MemPool& target, IndexReader::Segment& segment) {
       unused(target, segment);

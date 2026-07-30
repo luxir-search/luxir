@@ -153,6 +153,7 @@ struct SkipStats {
   static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
   static inline int64_t exactCountTopKBulkFallbacks = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
+  static inline int64_t sparseFilteredTopKUnionReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
   static inline int64_t sparseFilteredTopKShapeRejects = 0;
   static inline int64_t ownedFilterMaterializations = 0;
@@ -320,6 +321,7 @@ struct SkipStats {
     exactCountTopKSparseFilterSinglePassRejects = 0;
     exactCountTopKBulkFallbacks = 0;
     sparseFilteredTopKReroutes = 0;
+    sparseFilteredTopKUnionReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;
     sparseFilteredTopKShapeRejects = 0;
     ownedFilterMaterializations = 0;
