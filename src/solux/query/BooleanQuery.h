@@ -426,25 +426,25 @@ public:
   // decoded postings blocks into the filtered-disjunction candidate batch.
   static inline bool disableFilteredDisjunctionPostingsBlockGatherForTests =
       false;
-  // Test hook: use body-led mask or pull execution for exact scored filtered
-  // term conjunctions instead of exact candidate batching.
+  // Test hook: use body-led mask or pull execution for scored filtered term
+  // conjunctions instead of candidate batching.
   static inline bool disableFilteredConjunctionBatchForTests = false;
-  // Test hook: prevent a term filter from owning the exact candidate postings
+  // Test hook: prevent a term filter from owning the candidate postings
   // feed. A scored term may still own the feed.
   static inline bool disableFilteredConjunctionPostingsFeedForTests = false;
   // Test hook: use body-led execution for multi-term exact filtered
   // conjunctions.
   static inline bool disableFilteredConjMultiTermForTests = false;
-  // Test hook: keep the filter-owned exact route when a scored term could own
+  // Test hook: keep the filter-owned route when a scored term could own
   // the candidate feed.
-  static inline bool disableExactCandidateTermFeedForTests =
-      std::getenv("SOLUX_DISABLE_EXACT_CANDIDATE_TERM_FEED") != nullptr;
+  static inline bool disableCandidateTermFeedForTests =
+      std::getenv("SOLUX_DISABLE_CANDIDATE_TERM_FEED") != nullptr;
   // Candidate batching requires the cheapest body clause to be sufficiently
   // more expensive than the filter feed. A cached DocSet competes with a
   // cheap window mask and therefore requires the stricter ratio.
   static inline int64_t multiTermBatchMinRatioDocSet = 4;
   static inline int64_t multiTermBatchMinRatioPostings = 2;
-  // A term-owned exact candidate feed is limited to terms matching at most
+  // A term-owned candidate feed is limited to terms matching at most
   // maxDoc/32, which bounds candidate materialization to sparse scoring terms.
   static constexpr int64_t kTermFeedMaxLeadFraction = 32;
   static inline int64_t kTermFeedMaxLeadFractionForTests =
@@ -1137,14 +1137,16 @@ public:
       enum class ConjunctionMode : uint8_t {
         SCORED_BODY,
         EXHAUSTIVE,
-        EXACT_CANDIDATE,
+        CANDIDATE,
       };
 
       // Build a bulk conjunction from the required clause boundaries.
       // EXHAUSTIVE includes filters and count-only optional groups.
-      // EXACT_CANDIDATE includes direct filters but retains scored,
-      // single-phase construction. SCORED_BODY leaves filters to a window
-      // mask selected by filteredScoredBulkScorer.
+      // CANDIDATE includes direct filters but retains scored, single-phase
+      // construction. The cheapest required clause can then own a docs-only
+      // feed for exact or pruned collection; scoring clauses alone supply
+      // score bounds. SCORED_BODY leaves filters to a window mask selected by
+      // filteredScoredBulkScorer.
       BulkScorer* conjunctionBulkScorer(MemPool& targetPool,
                                         ConjunctionMode mode,
                                         bool* docSetLeads = nullptr,
@@ -1231,7 +1233,7 @@ public:
                                             : a.order < b.order;
                   });
         bool termFeed = false;
-        if (mode == ConjunctionMode::EXACT_CANDIDATE) {
+        if (mode == ConjunctionMode::CANDIDATE) {
           if (entries[0].filter) {
             for (size_t i = 1; i < entries.size(); i++) {
               if (dynamic_cast<TermQuery::Weight::Supplier*>(
@@ -1246,7 +1248,7 @@ public:
               return nullptr;
             }
           } else {
-            if (disableExactCandidateTermFeedForTests
+            if (disableCandidateTermFeedForTests
                 || !entries[0].scoring
                 || dynamic_cast<TermQuery::Weight::Supplier*>(
                        entries[0].supplier) == nullptr
@@ -1280,6 +1282,7 @@ public:
           nonLeadCost += entries[i].cost;
         }
         auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
+        auto clauseScores = targetPool.make_span<uint8_t>(entries.size());
         for (size_t i = 0; i < entries.size(); i++) {
           Query::Scorer* scorer;
           if (entries[i].optionalGroup) {
@@ -1309,34 +1312,35 @@ public:
             return nullptr;
           }
           arr[i] = scorer;
+          clauseScores[i] = entries[i].scoring;
         }
-        TermQuery::Scorer* termFeedScorer = nullptr;
-        std::span<uint8_t> exactCandidateFilters;
-        std::span<DocSet*> exactCandidateFilterDocSets;
+        TermQuery::Scorer* candidateLeadScoreScorer = nullptr;
+        std::span<uint8_t> candidateFilters;
+        std::span<DocSet*> candidateFilterDocSets;
         if (termFeed) {
-          termFeedScorer = dynamic_cast<TermQuery::Scorer*>(
+          candidateLeadScoreScorer = dynamic_cast<TermQuery::Scorer*>(
               entries[0].supplier->getIndependent(targetPool, leadCost));
-          assert(termFeedScorer != nullptr);
-          if (termFeedScorer == nullptr) {
+          assert(candidateLeadScoreScorer != nullptr);
+          if (candidateLeadScoreScorer == nullptr) {
             return nullptr;
           }
-          exactCandidateFilters =
+          candidateFilters =
               targetPool.make_span<uint8_t>(entries.size());
-          exactCandidateFilterDocSets =
+          candidateFilterDocSets =
               targetPool.make_span<DocSet*>(entries.size());
           std::fill(
-              exactCandidateFilters.begin(), exactCandidateFilters.end(), 0);
+              candidateFilters.begin(), candidateFilters.end(), 0);
           std::fill(
-              exactCandidateFilterDocSets.begin(),
-              exactCandidateFilterDocSets.end(), nullptr);
+              candidateFilterDocSets.begin(),
+              candidateFilterDocSets.end(), nullptr);
           for (size_t i = 0; i < entries.size(); i++) {
             if (!entries[i].filter) {
               continue;
             }
-            exactCandidateFilters[i] = 1;
+            candidateFilters[i] = 1;
             if (auto* supplier = dynamic_cast<QueryPrep::DocSetSupplier*>(
                     entries[i].supplier)) {
-              exactCandidateFilterDocSets[i] = supplier->docSet();
+              candidateFilterDocSets[i] = supplier->docSet();
             }
           }
         }
@@ -1350,7 +1354,7 @@ public:
           }
         }
         TermQuery::Scorer* candidatePostingsLead = nullptr;
-        if (mode == ConjunctionMode::EXACT_CANDIDATE) {
+        if (mode == ConjunctionMode::CANDIDATE) {
           if (termFeed) {
             candidatePostingsLead =
                 dynamic_cast<TermQuery::Scorer*>(arr[0]);
@@ -1394,9 +1398,10 @@ public:
         return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
             targetPool, std::span<Query::Scorer*>(arr, entries.size()),
             std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
-            segment.maxDoc(), leadCost, nonLeadCost, !exhaustive,
-            entries[0].docSetFilter, candidatePostingsLead, termFeedScorer,
-            exactCandidateFilters, exactCandidateFilterDocSets);
+            clauseScores, segment.maxDoc(), leadCost, nonLeadCost, !exhaustive,
+            entries[0].docSetFilter, candidatePostingsLead,
+            candidateLeadScoreScorer,
+            candidateFilters, candidateFilterDocSets);
       }
 
       BulkScorer* mandOptBulkScorer(
@@ -1688,6 +1693,41 @@ public:
           return nullptr;
         }
 
+        // Let a direct filter participate in the same cost ordering as the
+        // scored required terms. The cheapest required clause owns a docs-only
+        // candidate feed, while the scored clauses define the competitive
+        // window bound and score only survivors. If admission declines, retain
+        // the existing scored-body plus WindowFilter plan below.
+        if (allowsPruning && !disableFilteredConjunctionBatchForTests
+            && filterSuppliers.size() == 1
+            && !mandatorySources.empty() && optionalSources.empty()
+            && minShouldMatch == 0) {
+          bool docSetLeads = false;
+          bool docSetTermTail = false;
+          bool postingsFilterLeads = false;
+          bool termFeedLeads = false;
+          auto* candidate = conjunctionBulkScorer(
+              targetPool, ConjunctionMode::CANDIDATE,
+              &docSetLeads, &docSetTermTail, &postingsFilterLeads,
+              &termFeedLeads);
+          if (candidate != nullptr
+              && ((docSetLeads && docSetTermTail)
+                  || postingsFilterLeads || termFeedLeads)) {
+            skipCount(SkipStats::filteredConjBatchEngagements);
+            if (mandatorySources.size() > 1) {
+              skipCount(SkipStats::filteredConjBatchMultiTermEngagements);
+            }
+            if (postingsFilterLeads) {
+              skipCount(
+                  SkipStats::filteredConjBatchPostingsFeedEngagements);
+            }
+            if (termFeedLeads) {
+              skipCount(SkipStats::candidateTermFeedEngagements);
+            }
+            return candidate;
+          }
+        }
+
         // Ask the positive body to plan its own bulk route. This keeps route
         // identity and filter-sensitive admission in the supplier that will
         // construct the scorer, independent of whether normalization exposed
@@ -1853,7 +1893,7 @@ public:
           bool postingsFilterLeads = false;
           bool termFeedLeads = false;
           auto* bulk = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::EXACT_CANDIDATE,
+              targetPool, ConjunctionMode::CANDIDATE,
               &docSetLeads, &docSetTermTail, &postingsFilterLeads,
               &termFeedLeads);
           if (bulk != nullptr
@@ -1870,7 +1910,7 @@ public:
             }
             if (termFeedLeads) {
               skipCount(
-                  SkipStats::exactCandidateTermFeedEngagements);
+                  SkipStats::candidateTermFeedEngagements);
             }
             return bulk;
           }
@@ -4178,6 +4218,7 @@ public:
 
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
     std::span<Query::Scorer*> prohibitedScorers;
+    std::span<const uint8_t> scoringClauses;
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
     std::span<TermClause> termClauses;  // direct terms or decomposed flat unions
     std::span<DenseClause> denseClauses; // exact window-fill capable clauses
@@ -4217,14 +4258,14 @@ public:
     bool competitivePruning = true;
     const uint8_t* denseScoredNorms = nullptr;
     TermQuery::Scorer* candidatePostingsLead = nullptr;
-    TermQuery::Scorer* exactCandidateLeadScorer = nullptr;
-    std::span<uint8_t> exactCandidateFilters;
-    std::span<DocSet*> exactCandidateFilterDocSets;
+    TermQuery::Scorer* candidateLeadScoreScorer = nullptr;
+    std::span<uint8_t> candidateFilters;
+    std::span<DocSet*> candidateFilterDocSets;
     // Forward membership cursors over the DocSet filter clauses: candidates
     // ascend across batches and windows, so galloping probes replace the
     // per-candidate virtual get() (a from-scratch binary search on ARRAY
     // sets). One cursor per clause, private to this scorer's single scan.
-    std::span<DocSetProbe> exactCandidateFilterProbes;
+    std::span<DocSetProbe> candidateFilterProbes;
     int32_t nextCandidatePostingsLeadDoc = -1;
 
     enum class DenseScoredAdmission : uint8_t {
@@ -4756,7 +4797,7 @@ public:
       return batch.size;
     }
 
-    int32_t compactExactCandidateFilters(int32_t size, DocSet* filter) {
+    int32_t compactCandidateFilters(int32_t size, DocSet* filter) {
       int32_t write = 0;
       for (int32_t i = 0; i < size; i++) {
         int32_t doc = candDocs[(size_t) i];
@@ -4773,14 +4814,14 @@ public:
       }
       size = write;
 
-      assert(exactCandidateFilters.size() == scorers.size());
-      assert(exactCandidateFilterDocSets.size() == scorers.size());
+      assert(candidateFilters.size() == scorers.size());
+      assert(candidateFilterDocSets.size() == scorers.size());
       for (size_t clause = 0; clause < scorers.size() && size > 0;
            clause++) {
-        if (exactCandidateFilters[clause] == 0) {
+        if (candidateFilters[clause] == 0) {
           continue;
         }
-        DocSet* docSet = exactCandidateFilterDocSets[clause];
+        DocSet* docSet = candidateFilterDocSets[clause];
         TermQuery::Scorer* term = termScorers[clause];
         assert(docSet != nullptr || term != nullptr);
         write = 0;
@@ -4788,7 +4829,7 @@ public:
           int32_t doc = candDocs[(size_t) i];
           bool accepted;
           if (docSet != nullptr) {
-            accepted = exactCandidateFilterProbes[clause].get(doc);
+            accepted = candidateFilterProbes[clause].get(doc);
           } else {
             int32_t filterDoc = term->docsEnum.docId();
             if (filterDoc < doc) {
@@ -4807,7 +4848,7 @@ public:
 
     template <bool TermFast, bool TermTailFast = false,
               bool CandidatePostingsFeed = false,
-              bool ExactCandidateTermFeed = false>
+              bool CandidateTermFeed = false>
     int32_t scoreNextWindowImpl(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
                                 float minCompetitiveScore) {
       out.min = min;
@@ -4836,12 +4877,9 @@ public:
       }
       const bool exactDrive =
           !competitivePruning && !disableExactScoredBoundsBypassForTests;
-      if constexpr (CandidatePostingsFeed) {
-        assert(exactDrive);
-      }
-      if constexpr (ExactCandidateTermFeed) {
+      if constexpr (CandidateTermFeed) {
         assert(CandidatePostingsFeed);
-        assert(exactCandidateLeadScorer != nullptr);
+        assert(candidateLeadScoreScorer != nullptr);
       }
 
       for (;;) {
@@ -4861,18 +4899,25 @@ public:
           // and scored resident probes without parsing impact headers merely
           // to establish a useless bound horizon.
         } else {
-          // Window = [leadDoc, upTo], bounded by every clause's shallow block.
+          // Window = [leadDoc, upTo], bounded by the scoring clauses' shallow
+          // blocks. A filter is a zero-score required clause: it owns
+          // membership and may own the candidate feed, but contributes no
+          // score bound and must not parse frequency/impact data here.
           for (size_t c = 0; c < scorers.size(); c++) {
-            upTo = std::min(
-                upTo, scorerAdvanceShallow<TermFast, TermTailFast>(c, leadDoc));
+            if (scoringClauses[c] != 0) {
+              upTo = std::min(
+                  upTo,
+                  scorerAdvanceShallow<TermFast, TermTailFast>(c, leadDoc));
+            }
           }
           if (upTo < leadDoc) {
             upTo = leadDoc;
           }
           suffixMax[scorers.size()] = 0.0;
           for (size_t c = scorers.size(); c-- > 0; ) {
-            windowMax[c] =
-                scorerGetMaxScore<TermFast, TermTailFast>(c, upTo);
+            windowMax[c] = scoringClauses[c] != 0
+                ? scorerGetMaxScore<TermFast, TermTailFast>(c, upTo)
+                : 0.0f;
             suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
           }
           // Keep all-term bulk bounds group-granular so candidate windows do
@@ -4934,15 +4979,15 @@ public:
             break;
           }
           lastDecided = candDocs[(size_t) n - 1];
-          if constexpr (ExactCandidateTermFeed) {
-            n = compactExactCandidateFilters(n, filter);
+          if constexpr (CandidateTermFeed) {
+            n = compactCandidateFilters(n, filter);
             if (n > 0) {
               n = applyScoredProbeToCandidates<false>(
-                  exactCandidateLeadScorer, n,
+                  candidateLeadScoreScorer, n,
                   std::numeric_limits<double>::infinity());
             }
             for (size_t c = 1; c < scorers.size() && n > 0; c++) {
-              if (exactCandidateFilters[c] != 0) {
+              if (candidateFilters[c] != 0) {
                 continue;
               }
               assert(termScorers[c] != nullptr);
@@ -4994,7 +5039,7 @@ public:
           for (int32_t i = 0; i < n; i++) {
             if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
             int32_t doc = candDocs[(size_t) i];
-            if constexpr (!ExactCandidateTermFeed) {
+            if constexpr (!CandidateTermFeed) {
               if (windowFilter != nullptr && windowFilter->probes()
                   && !windowFilter->acceptsProbe(doc)) continue;
             }
@@ -5599,15 +5644,17 @@ public:
   public:
     ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
                           std::span<Query::Scorer*> prohibitedScorers,
+                          std::span<const uint8_t> scoringClauses,
                           int32_t maxDoc, int64_t leadCost,
                           int64_t nonLeadCost, bool scoredConstruction,
                           bool countLeadIsDocSet,
                           TermQuery::Scorer* candidatePostingsLead,
-                          TermQuery::Scorer* exactCandidateLeadScorer,
-                          std::span<uint8_t> exactCandidateFilters,
-                          std::span<DocSet*> exactCandidateFilterDocSets)
+                          TermQuery::Scorer* candidateLeadScoreScorer,
+                          std::span<uint8_t> candidateFilters,
+                          std::span<DocSet*> candidateFilterDocSets)
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
+          scoringClauses(scoringClauses),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
           denseClauses(pool.make_arr<DenseClause>(scorers.size()), scorers.size()),
@@ -5648,15 +5695,16 @@ public:
                   ? filteredConjunctionBatchSizeForTests : kChunk),
           countLeadIsDocSet(countLeadIsDocSet),
           candidatePostingsLead(candidatePostingsLead),
-          exactCandidateLeadScorer(exactCandidateLeadScorer),
-          exactCandidateFilters(exactCandidateFilters),
-          exactCandidateFilterDocSets(exactCandidateFilterDocSets) {
+          candidateLeadScoreScorer(candidateLeadScoreScorer),
+          candidateFilters(candidateFilters),
+          candidateFilterDocSets(candidateFilterDocSets) {
       assert(!scorers.empty());
-      if (!exactCandidateFilterDocSets.empty()) {
-        exactCandidateFilterProbes =
-            pool.make_span<DocSetProbe>(exactCandidateFilterDocSets.size());
-        for (size_t i = 0; i < exactCandidateFilterDocSets.size(); i++) {
-          exactCandidateFilterProbes[i].reset(exactCandidateFilterDocSets[i]);
+      assert(scoringClauses.size() == scorers.size());
+      if (!candidateFilterDocSets.empty()) {
+        candidateFilterProbes =
+            pool.make_span<DocSetProbe>(candidateFilterDocSets.size());
+        for (size_t i = 0; i < candidateFilterDocSets.size(); i++) {
+          candidateFilterProbes[i].reset(candidateFilterDocSets[i]);
         }
       }
       std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
@@ -5705,7 +5753,7 @@ public:
         }
         if (termScorers[i] != nullptr) {
           termClauses[i].members = scorers.subspan(i, 1);
-          scoreAddends++;
+          scoreAddends += (size_t) (scoringClauses[i] != 0);
           continue;
         }
         std::span<Query::Scorer*> members;
@@ -5721,7 +5769,9 @@ public:
         termClauses[i].members = members;
         allTermClauses &= !members.empty();
         hasDisjGroup |= !members.empty();
-        scoreAddends += members.empty() ? 1 : members.size();
+        if (scoringClauses[i] != 0) {
+          scoreAddends += members.empty() ? 1 : members.size();
+        }
       }
       if (hasDirectDenseClause) {
         skipCount(SkipStats::conjDirectDenseEngagements);
@@ -5859,7 +5909,7 @@ public:
           && termTailScorers) {
         skipCount(SkipStats::filteredConjBatchScoreWindows);
       }
-      if (exactCandidateLeadScorer != nullptr) {
+      if (candidateLeadScoreScorer != nullptr) {
         if (!termTailScorers) {
           skipCount(SkipStats::filteredConjBatchScoreWindows);
         }

@@ -226,6 +226,19 @@ struct FilterMaskProbeGuard {
   }
 };
 
+struct FilteredConjunctionBatchGuard {
+  bool saved;
+
+  explicit FilteredConjunctionBatchGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredConjunctionBatchForTests) {
+    BooleanQuery::disableFilteredConjunctionBatchForTests = disabled;
+  }
+
+  ~FilteredConjunctionBatchGuard() {
+    BooleanQuery::disableFilteredConjunctionBatchForTests = saved;
+  }
+};
+
 struct FilteredScoredBulkGuard {
   bool saved;
 
@@ -7051,6 +7064,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentScoredResults) {
     int64_t filterFillCalls;
   };
   auto run = [&](Query& query, bool forceFill, std::type_index expectedType) {
+    FilteredConjunctionBatchGuard candidateGuard(true);
     FilterMaskProbeGuard probeGuard(forceFill);
     SkipStatsGuard stats;
     MemPool pool;
@@ -7127,6 +7141,7 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
     int64_t fillCalls;
   };
   auto run = [&](Query& query, bool forceFill, std::type_index expectedType) {
+    FilteredConjunctionBatchGuard candidateGuard(true);
     FilterMaskProbeGuard probeGuard(forceFill);
     SkipStatsGuard stats;
     MemPool pool;

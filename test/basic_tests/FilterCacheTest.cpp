@@ -142,44 +142,44 @@ public:
   }
 };
 
-class ExactCandidateTermFeedGuard {
+class CandidateTermFeedGuard {
   bool saved;
 
 public:
-  explicit ExactCandidateTermFeedGuard(bool disabled)
-    : saved(BooleanQuery::disableExactCandidateTermFeedForTests) {
-    BooleanQuery::disableExactCandidateTermFeedForTests = disabled;
+  explicit CandidateTermFeedGuard(bool disabled)
+    : saved(BooleanQuery::disableCandidateTermFeedForTests) {
+    BooleanQuery::disableCandidateTermFeedForTests = disabled;
   }
 
-  ~ExactCandidateTermFeedGuard() {
-    BooleanQuery::disableExactCandidateTermFeedForTests = saved;
+  ~CandidateTermFeedGuard() {
+    BooleanQuery::disableCandidateTermFeedForTests = saved;
   }
 };
 
-class ExactCandidateTermFeedFractionGuard {
+class CandidateTermFeedFractionGuard {
   int64_t saved;
 
 public:
-  explicit ExactCandidateTermFeedFractionGuard(int64_t fraction)
+  explicit CandidateTermFeedFractionGuard(int64_t fraction)
     : saved(BooleanQuery::kTermFeedMaxLeadFractionForTests) {
     BooleanQuery::kTermFeedMaxLeadFractionForTests = fraction;
   }
 
-  ~ExactCandidateTermFeedFractionGuard() {
+  ~CandidateTermFeedFractionGuard() {
     BooleanQuery::kTermFeedMaxLeadFractionForTests = saved;
   }
 };
 
-class ExactCandidateTermFeedDocSetRatioGuard {
+class CandidateTermFeedDocSetRatioGuard {
   int64_t saved;
 
 public:
-  explicit ExactCandidateTermFeedDocSetRatioGuard(int64_t ratio)
+  explicit CandidateTermFeedDocSetRatioGuard(int64_t ratio)
     : saved(BooleanQuery::kTermFeedMinDocSetFilterRatio) {
     BooleanQuery::kTermFeedMinDocSetFilterRatio = ratio;
   }
 
-  ~ExactCandidateTermFeedDocSetRatioGuard() {
+  ~CandidateTermFeedDocSetRatioGuard() {
     BooleanQuery::kTermFeedMinDocSetFilterRatio = saved;
   }
 };
@@ -1556,7 +1556,7 @@ TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
 }
 
 TEST(FilterCacheIntegrationTest,
-     exactScoredSparseFilterPostingsFeedMatchesCache) {
+     scoredSparseFilterCandidateFeedsMatchOracles) {
   SoluxConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
   SoluxConfig uncachedConfig;
@@ -1572,13 +1572,25 @@ TEST(FilterCacheIntegrationTest,
   std::vector<solux::test::Doc> docs;
   docs.reserve((size_t) maxDoc);
   for (int32_t doc = 0; doc < maxDoc; doc++) {
-    std::string body = "alpha";
+    std::string body = "alpha beta";
     for (int32_t repeat = 0; repeat < doc % 5; repeat++) {
       body += " alpha";
     }
+    for (int32_t repeat = 0; repeat < doc % 3; repeat++) {
+      body += " beta";
+    }
+    if (doc % 3 == 0) {
+      body += " gamma";
+    }
+    if (doc % 64 == 0) {
+      body += " rare";
+    }
+    std::string filterValue = doc % 40 == 0
+        ? "selected semidense"
+        : doc % 20 == 0 ? "semidense" : "other";
     docs.push_back(solux::test::flatdoc(
         "id", std::to_string(doc), "body_w", body,
-        "filter_w", doc % 40 == 0 ? "selected" : "other"));
+        "filter_w", filterValue));
   }
   ASSERT_TRUE(cached.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(uncached.indexAll(docs, UpdateMessage::COMMIT).success);
@@ -1588,20 +1600,48 @@ TEST(FilterCacheIntegrationTest,
     std::vector<std::string> ids;
     std::vector<float> scores;
     int64_t batchEngagements = 0;
+    int64_t multiTermEngagements = 0;
     int64_t postingsFeedEngagements = 0;
+    int64_t termFeedEngagements = 0;
   };
-  auto run = [&](SoluxNode& node, bool disablePostingsFeed) {
+  enum class QueryShape {
+    ONE_TERM,
+    FILTER_LED,
+    TERM_LED_MULTI,
+    TERM_LED_ONE,
+  };
+  auto run = [&](SoluxNode& node, std::string_view filterTerm,
+                 bool pruning, bool disablePostingsFeed,
+                 bool disableBatch = false,
+                 QueryShape shape = QueryShape::ONE_TERM) {
     FilteredConjunctionPostingsFeedGuard feedGuard(
         disablePostingsFeed);
+    FilteredConjunctionBatchGuard batchGuard(disableBatch);
     OwnedFilterStatsGuard statsGuard;
     auto request = solux::test::localReq(node.getSearchEngine());
-    request->collection(collection)
+    auto& cursor = request->collection(collection)
         .topDocs("q")
-        .matchQuery("body_w", "alpha")
-        .matchFilter("selection", "filter_w", "selected")
+        .matchFilter("selection", "filter_w", filterTerm)
         .fields({"id"})
-        .withStats()
         .limit(100);
+    if (shape == QueryShape::TERM_LED_ONE) {
+      cursor.matchQuery("body_w", "rare");
+    } else if (shape != QueryShape::ONE_TERM) {
+      std::string_view third = shape == QueryShape::FILTER_LED
+          ? "gamma" : "rare";
+      cursor.rawQuery() = solux::test::qb::boolean(
+          cursor.mr(),
+          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           solux::test::qb::match(cursor.mr(), "body_w", "beta"),
+           solux::test::qb::match(cursor.mr(), "body_w", third)});
+    } else {
+      cursor.matchQuery("body_w", "alpha");
+    }
+    if (pruning) {
+      cursor.getScores();
+    } else {
+      cursor.withStats();
+    }
     request->execute(false);
     EXPECT_TRUE(request->ok()) << request->errorMsg();
 
@@ -1625,16 +1665,20 @@ TEST(FilterCacheIntegrationTest,
     }
     result.batchEngagements =
         SkipStats::filteredConjBatchEngagements;
+    result.multiTermEngagements =
+        SkipStats::filteredConjBatchMultiTermEngagements;
     result.postingsFeedEngagements =
         SkipStats::filteredConjBatchPostingsFeedEngagements;
+    result.termFeedEngagements =
+        SkipStats::candidateTermFeedEngagements;
     return result;
   };
 
-  run(cachedNode, false);
-  run(cachedNode, false);
-  Result cachedResult = run(cachedNode, false);
-  Result postingsResult = run(uncachedNode, false);
-  Result disabledResult = run(uncachedNode, true);
+  run(cachedNode, "selected", false, false);
+  run(cachedNode, "selected", false, false);
+  Result cachedResult = run(cachedNode, "selected", false, false);
+  Result postingsResult = run(uncachedNode, "selected", false, false);
+  Result disabledResult = run(uncachedNode, "selected", false, true);
 
   EXPECT_EQ((maxDoc + 39) / 40, cachedResult.count);
   EXPECT_EQ(100u, cachedResult.ids.size());
@@ -1647,6 +1691,73 @@ TEST(FilterCacheIntegrationTest,
   EXPECT_EQ(cachedResult.scores, postingsResult.scores);
   EXPECT_EQ(0, disabledResult.batchEngagements);
   EXPECT_EQ(0, disabledResult.postingsFeedEngagements);
+
+  // At density 1/20, TOP_100 keeps competitive pruning (the sparse reroute
+  // cuts over at 1/32). The same candidate primitive must therefore let the
+  // zero-score filter lead, probe and score the required term tails in cost
+  // order, and preserve the window-mask oracle's ranked output for both filter
+  // provenances.
+  run(cachedNode, "semidense", true, false, false,
+      QueryShape::FILTER_LED);
+  run(cachedNode, "semidense", true, false, false,
+      QueryShape::FILTER_LED);
+  Result cachedPruned = run(
+      cachedNode, "semidense", true, false, false,
+      QueryShape::FILTER_LED);
+  Result postingsPruned = run(
+      uncachedNode, "semidense", true, false, false,
+      QueryShape::FILTER_LED);
+  Result maskPruned = run(
+      uncachedNode, "semidense", true, false, true,
+      QueryShape::FILTER_LED);
+
+  EXPECT_EQ(100u, cachedPruned.ids.size());
+  EXPECT_GT(cachedPruned.batchEngagements, 0);
+  EXPECT_GT(cachedPruned.multiTermEngagements, 0);
+  EXPECT_EQ(0, cachedPruned.postingsFeedEngagements);
+  EXPECT_GT(postingsPruned.batchEngagements, 0);
+  EXPECT_GT(postingsPruned.multiTermEngagements, 0);
+  EXPECT_GT(postingsPruned.postingsFeedEngagements, 0);
+  EXPECT_EQ(0, maskPruned.batchEngagements);
+  EXPECT_EQ(0, maskPruned.multiTermEngagements);
+  EXPECT_EQ(0, maskPruned.postingsFeedEngagements);
+  EXPECT_EQ(cachedPruned.ids, postingsPruned.ids);
+  EXPECT_EQ(cachedPruned.scores, postingsPruned.scores);
+  EXPECT_EQ(maskPruned.ids, postingsPruned.ids);
+  EXPECT_EQ(maskPruned.scores, postingsPruned.scores);
+
+  // A rare scoring term reverses ownership: its docs-only postings feed is
+  // cheaper than the filter, while an independent cursor scores the lead
+  // survivors and the original scoring cursors retain whole-window bounds.
+  auto verifyTermLead = [&](QueryShape shape, bool multiTerm) {
+    run(cachedNode, "semidense", true, false, false, shape);
+    run(cachedNode, "semidense", true, false, false, shape);
+    Result cachedTermLead = run(
+        cachedNode, "semidense", true, false, false, shape);
+    Result postingsTermLead = run(
+        uncachedNode, "semidense", true, false, false, shape);
+    Result maskTermLead = run(
+        uncachedNode, "semidense", true, false, true, shape);
+
+    EXPECT_EQ(100u, cachedTermLead.ids.size());
+    EXPECT_GT(cachedTermLead.batchEngagements, 0);
+    EXPECT_EQ(multiTerm, cachedTermLead.multiTermEngagements > 0);
+    EXPECT_GT(cachedTermLead.termFeedEngagements, 0);
+    EXPECT_EQ(0, cachedTermLead.postingsFeedEngagements);
+    EXPECT_GT(postingsTermLead.batchEngagements, 0);
+    EXPECT_EQ(multiTerm, postingsTermLead.multiTermEngagements > 0);
+    EXPECT_GT(postingsTermLead.termFeedEngagements, 0);
+    EXPECT_EQ(0, postingsTermLead.postingsFeedEngagements);
+    EXPECT_EQ(0, maskTermLead.batchEngagements);
+    EXPECT_EQ(0, maskTermLead.multiTermEngagements);
+    EXPECT_EQ(0, maskTermLead.termFeedEngagements);
+    EXPECT_EQ(cachedTermLead.ids, postingsTermLead.ids);
+    EXPECT_EQ(cachedTermLead.scores, postingsTermLead.scores);
+    EXPECT_EQ(maskTermLead.ids, postingsTermLead.ids);
+    EXPECT_EQ(maskTermLead.scores, postingsTermLead.scores);
+  };
+  verifyTermLead(QueryShape::TERM_LED_MULTI, true);
+  verifyTermLead(QueryShape::TERM_LED_ONE, false);
 }
 
 enum class ExactFilteredConjShape {
@@ -1708,7 +1819,7 @@ ExactFilteredConjResult runExactFilteredConj(
     bool disableBatch = false, bool disableTermFeed = false) {
   FilteredConjMultiTermGuard multiTermGuard(disableMultiTerm);
   FilteredConjunctionBatchGuard batchGuard(disableBatch);
-  ExactCandidateTermFeedGuard termFeedGuard(disableTermFeed);
+  CandidateTermFeedGuard termFeedGuard(disableTermFeed);
   OwnedFilterStatsGuard statsGuard;
   auto request = solux::test::localReq(node.getSearchEngine());
   request->collection(collection);
@@ -1789,7 +1900,7 @@ ExactFilteredConjResult runExactFilteredConj(
   result.postingsFeedEngagements =
       SkipStats::filteredConjBatchPostingsFeedEngagements;
   result.termFeedEngagements =
-      SkipStats::exactCandidateTermFeedEngagements;
+      SkipStats::candidateTermFeedEngagements;
   result.scoredProbeAdvances = SkipStats::scoredProbeAdvances;
   result.scoreWindows = SkipStats::filteredConjBatchScoreWindows;
   return result;
@@ -1862,7 +1973,7 @@ TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
 }
 
 TEST(FilterCacheIntegrationTest,
-     exactCandidateTermFeedMatchesKillSwitchForBothFilterProvenances) {
+     candidateTermFeedMatchesKillSwitchForBothFilterProvenances) {
   SoluxConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
   SoluxConfig uncachedConfig;
@@ -1919,7 +2030,7 @@ TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
   EXPECT_EQ(0, enabled.batchEngagements);
 }
 
-TEST(FilterCacheIntegrationTest, exactCandidateTermFeedHandlesTwoFilters) {
+TEST(FilterCacheIntegrationTest, candidateTermFeedHandlesTwoFilters) {
   SoluxConfig config;
   config.filterCacheBytes = 0;
   SoluxNode node(config);
@@ -1969,7 +2080,7 @@ TEST(FilterCacheIntegrationTest,
   EXPECT_EQ(0, termFeedDisabled.termFeedEngagements);
 }
 
-TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDensityCapDeclines) {
+TEST(FilterCacheIntegrationTest, candidateTermFeedDensityCapDeclines) {
   SoluxConfig config;
   config.filterCacheBytes = 0;
   SoluxNode node(config);
@@ -1980,7 +2091,7 @@ TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDensityCapDeclines) {
       node, collection, ExactFilteredConjShape::RARE_TERM, false);
   ExactFilteredConjResult declined;
   {
-    ExactCandidateTermFeedFractionGuard guard(1000000);
+    CandidateTermFeedFractionGuard guard(1000000);
     declined = runExactFilteredConj(
         node, collection, ExactFilteredConjShape::RARE_TERM, false);
   }
@@ -1993,7 +2104,7 @@ TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDensityCapDeclines) {
 // The DocSet-provenance ratio gate declines a term feed whose cost is too
 // close to the warm filter's; the raw-postings provenance carries no such
 // gate and must keep engaging under the same override.
-TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDocSetRatioDeclines) {
+TEST(FilterCacheIntegrationTest, candidateTermFeedDocSetRatioDeclines) {
   SoluxConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
   SoluxConfig uncachedConfig;
@@ -2011,7 +2122,7 @@ TEST(FilterCacheIntegrationTest, exactCandidateTermFeedDocSetRatioDeclines) {
   ExactFilteredConjResult declined;
   ExactFilteredConjResult postings;
   {
-    ExactCandidateTermFeedDocSetRatioGuard guard(1000000);
+    CandidateTermFeedDocSetRatioGuard guard(1000000);
     declined = runExactFilteredConj(
         cachedNode, collection, ExactFilteredConjShape::RARE_TERM, false);
     postings = runExactFilteredConj(
