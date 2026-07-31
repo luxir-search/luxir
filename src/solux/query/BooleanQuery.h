@@ -450,8 +450,8 @@ public:
   // feed only when it is materially sparser than the filter. A postings filter
   // would otherwise need a per-query mask fill and does not use this gate.
   static inline int64_t kTermFeedMinDocSetFilterRatio = 3;
-  // Test hook: retain unmatched candidates between count-only DocSet batch
-  // clauses instead of compacting them.
+  // Test hook: retain unmatched candidates between term clauses in the
+  // count-only filtered-disjunction batch instead of compacting them.
   static inline bool disableFilteredDisjunctionCountCompactionForTests = false;
   // Scored exact filtered disjunction batching is limited to filters matching
   // at most maxDoc/44. Unscored count uses this batch only when its existing
@@ -1543,7 +1543,7 @@ public:
         return cost;
       }
 
-      BulkScorer* docSetDisjunctionBulkScorer(MemPool& targetPool) {
+      BulkScorer* filteredDisjunctionBulkScorer(MemPool& targetPool) {
         if (disableFilteredDisjunctionBatchForTests || allowsPruning
             || mandatorySources.size() != 0 || optionalSources.size() < 2
             || prohibitedSources.size() != 0 || filterSuppliers.size() != 1
@@ -1583,7 +1583,8 @@ public:
           filterScorer = postingsScorer;
         }
         if (filterScorer == nullptr && filterDocs.empty()) {
-          skipCount(SkipStats::filteredDisjBatchNonDocSetFallbacks);
+          skipCount(
+              SkipStats::filteredDisjBatchUnsupportedFilterFeedFallbacks);
           return nullptr;
         }
         struct TermEntry {
@@ -1626,7 +1627,7 @@ public:
         for (size_t i = 0; i < entries.size(); i++) {
           termScorers[i] = entries[i].scorer;
         }
-        return targetPool.make<BooleanQuery::DocSetDisjunctionBulkScorer>(
+        return targetPool.make<BooleanQuery::FilteredDisjunctionBulkScorer>(
             targetPool, filterScorer, filterDocs, termScorers,
             segment.maxDoc(), postingsScorer);
       }
@@ -1847,7 +1848,7 @@ public:
         if (!filterSuppliers.empty() && mandatorySources.empty()
             && prohibitedSources.empty() && optionalSources.size() >= 2
             && minShouldMatch == 1 && !allowsPruning && needsScores) {
-          if (auto* bulk = docSetDisjunctionBulkScorer(targetPool)) {
+          if (auto* bulk = filteredDisjunctionBulkScorer(targetPool)) {
             return bulk;
           }
           if (twoPhaseDisjunctionPull) {
@@ -1924,7 +1925,7 @@ public:
               && minShouldMatch == 1;
           if (pureFilteredDisjunction) {
             if (auto* disjunction =
-                    docSetDisjunctionBulkScorer(targetPool)) {
+                    filteredDisjunctionBulkScorer(targetPool)) {
               return disjunction;
             }
             skipCount(SkipStats::disjCountIdentityFilterFallbacks);
@@ -6629,7 +6630,7 @@ public:
   // sweep each term clause over those monotone candidates. Clause-at-a-time
   // execution preserves each term's resident-block probe state across adjacent
   // candidates, and scoring decodes frequencies only in blocks with survivors.
-  class DocSetDisjunctionBulkScorer final : public BulkScorer {
+  class FilteredDisjunctionBulkScorer final : public BulkScorer {
     // Bound candidate and score buffers while amortizing each clause sweep.
     static constexpr int32_t kBatchSize = DocsEnumMeta::L1_DOCS;
     static constexpr int32_t kMatchWords = (kBatchSize + 63) >> 6;
@@ -6810,11 +6811,11 @@ public:
     }
 
   public:
-    DocSetDisjunctionBulkScorer(MemPool& pool, Query::Scorer* filterScorer,
-                                std::span<const int32_t> filterDocs,
-                                std::span<TermQuery::Scorer*> termScorers,
-                                int32_t maxDoc,
-                                TermQuery::Scorer* postingsScorer)
+    FilteredDisjunctionBulkScorer(
+        MemPool& pool, Query::Scorer* filterScorer,
+        std::span<const int32_t> filterDocs,
+        std::span<TermQuery::Scorer*> termScorers, int32_t maxDoc,
+        TermQuery::Scorer* postingsScorer)
         : filterScorer(filterScorer), postingsScorer(postingsScorer),
           filterDocs(filterDocs),
           termScorers(termScorers),

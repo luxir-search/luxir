@@ -1243,7 +1243,7 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
       ADD_FAILURE() << "expected all term scorers";
       return GatherRun{};
     }
-    auto* bulk = pool.make<BooleanQuery::DocSetDisjunctionBulkScorer>(
+    auto* bulk = pool.make<BooleanQuery::FilteredDisjunctionBulkScorer>(
         pool, filterScorer, std::span<const int32_t>{}, termScorers,
         maxDoc, filterScorer);
 

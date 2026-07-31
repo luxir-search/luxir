@@ -767,10 +767,10 @@ enum class FilterSupplierMode : uint8_t {
   // docs-only iteration. Let an admitted cached DocSet become the required
   // clause at every density; conjunction ordering then chooses the route.
   EXHAUSTIVE_CLAUSE,
-  // An exact filtered disjunction can batch sparse cached-DocSet candidates,
-  // scored or unscored, while preserving the ordinary dense cached-mask route.
-  // The caller supplies the separately measured sparse-density cutoff; only
-  // the middle band stays uncached.
+  // An exact filtered disjunction can batch sparse filter candidates from a
+  // cached DocSet or uncached term postings while preserving the ordinary
+  // dense cached-mask route. The caller supplies the sparse-density cutoff;
+  // only the middle band stays uncached.
   SPARSE_BATCH
 };
 
