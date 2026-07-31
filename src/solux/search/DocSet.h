@@ -164,6 +164,40 @@ public:
 
 };
 
+/// AND a window-local bitset (bit 0 == windowStart) with a segment-wide
+/// FixedBitSet (bit 0 == doc 0). Words outside [windowStart, windowEnd) are
+/// cleared, including the unused tail of a fixed-size scratch window.
+inline void intersectBitSetWindow(std::span<uint64_t> windowWords,
+                                  int32_t windowStart, int32_t windowEnd,
+                                  const FixedBitSet& filter) {
+  assert(windowStart >= 0);
+  assert(windowEnd >= windowStart);
+  assert(windowEnd <= filter.size());
+  assert((int64_t) windowWords.size() * 64 >= windowEnd - windowStart);
+
+  const int32_t filterWords =
+      (int32_t) FixedBitSet::sizeInWords(filter.size());
+  for (int32_t w = 0; w < (int32_t) windowWords.size(); w++) {
+    int32_t firstDoc = windowStart + (w << 6);
+    int32_t remaining = windowEnd - firstDoc;
+    if (remaining <= 0) {
+      windowWords[(size_t) w] = 0;
+      continue;
+    }
+
+    int32_t sourceWord = firstDoc >> 6;
+    int32_t shift = firstDoc & 63;
+    uint64_t filterWord = filter.words[sourceWord] >> shift;
+    if (shift != 0 && sourceWord + 1 < filterWords) {
+      filterWord |= filter.words[sourceWord + 1] << (64 - shift);
+    }
+    if (remaining < 64) {
+      filterWord &= (1ULL << remaining) - 1ULL;
+    }
+    windowWords[(size_t) w] &= filterWord;
+  }
+}
+
 /// Galloping membership cursor over a sorted doc array. Probes gallop from
 /// the previous landing, so an ascending scan costs O(log gap) per probe on
 /// warm lines instead of a full binary search; a descending probe restarts

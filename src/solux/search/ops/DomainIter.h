@@ -1,6 +1,5 @@
 #pragma once
-#include "solux/search/DocSet.h"
-#include "solux/reader/DocsEnum.h"
+#include "solux/search/PostingsIntersection.h"
 #include "solux/reader/DocsReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/OrdColReader.h"
@@ -80,7 +79,7 @@ inline int32_t countTermInDomain(const DomainView& view, DocsOnlyEnum& postings,
   }
 
   if (view.arr != nullptr
-      && (int64_t) docFreq > (int64_t) view.card * Postings::DOCS_BLOCK_SIZE) {
+      && shouldDrivePostingsFromArray(docFreq, view.card)) {
     // Domain drive: advance postings to each array doc, galloping the array
     // cursor to wherever the postings actually land.
     int32_t hits = 0;

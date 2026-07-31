@@ -1023,34 +1023,10 @@ public:
       std::fill(windowBits.begin(), windowBits.end(), 0);
     }
 
-    static uint64_t validMask(int32_t remaining) {
-      if (remaining >= 64) return ~0ULL;
-      if (remaining <= 0) return 0;
-      return (1ULL << remaining) - 1ULL;
-    }
-
     void applyDomainBits(const FixedBitSet* domainBits) {
       assert(domainBits != nullptr);
-      int32_t domainWords = (int32_t) FixedBitSet::sizeInWords(domainBits->size());
-      for (size_t w = 0; w < windowBits.size(); w++) {
-        int32_t firstDoc = windowStart + (int32_t) (w << 6);
-        int32_t remaining = windowEnd - firstDoc;
-        if (remaining <= 0) {
-          windowBits[w] = 0;
-          continue;
-        }
-        uint64_t mask = validMask(remaining);
-        int32_t sourceWord = firstDoc >> 6;
-        int32_t shift = firstDoc & 63;
-        uint64_t domainWord = 0;
-        if (sourceWord < domainWords) {
-          domainWord = domainBits->words[sourceWord] >> shift;
-          if (shift != 0 && sourceWord + 1 < domainWords) {
-            domainWord |= domainBits->words[sourceWord + 1] << (64 - shift);
-          }
-        }
-        windowBits[w] &= domainWord & mask;
-      }
+      intersectBitSetWindow(
+          windowBits, windowStart, windowEnd, *domainBits);
     }
 
     void applyDocSetFilter(DocSet* filter) {

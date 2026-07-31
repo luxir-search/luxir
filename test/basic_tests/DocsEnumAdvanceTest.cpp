@@ -12,6 +12,7 @@
 #include "test/TestIndex.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/search/PostingsIntersection.h"
 #include "solux/search/Similarity.h"
 #include "solux/reader/PosEnum.h"
 
@@ -308,6 +309,31 @@ protected:
       SkipStats::reset();
     }
   };
+
+  class SkipStatsGuard {
+    bool saved;
+
+  public:
+    SkipStatsGuard() : saved(SkipStats::enabled) {
+      SkipStats::reset();
+      SkipStats::enabled = true;
+    }
+
+    ~SkipStatsGuard() {
+      SkipStats::enabled = saved;
+      SkipStats::reset();
+    }
+  };
+
+  static std::vector<int32_t> collectDocSet(DocSet& set, int32_t maxDoc) {
+    std::vector<int32_t> docs;
+    for (int32_t doc = 0; doc < maxDoc; doc++) {
+      if (set.get(doc)) {
+        docs.push_back(doc);
+      }
+    }
+    return docs;
+  }
 
   static std::string checkpointTermName(int32_t blocks) {
     std::string digits = std::to_string(blocks);
@@ -1301,6 +1327,115 @@ TEST_F(DocsEnumAdvanceTest, residentDocsBlockPeekAndConsumeMaterializeSpan) {
   auto span2 = denum.peekDocBlock();
   ASSERT_EQ((int32_t) span2.size(), (int32_t) expected.size() - 5);
   EXPECT_TRUE(std::equal(span2.begin(), span2.end(), expected.begin() + 5));
+}
+
+TEST_F(DocsEnumAdvanceTest,
+       materializePostingsIntersectionUsesBitWindowsAcrossBlockEncodings) {
+  std::vector<int32_t> docs;
+  appendWordBlock(docs);
+  appendContiguousBlock(docs);
+  appendPackedBlock(docs);
+  int32_t tailBase = nextBlockBase(docs);
+  for (int32_t i = 0; i < 37; i++) {
+    docs.push_back(tailBase + i * 5);
+  }
+  docs.push_back(3 * DocsEnumMeta::L1_DOCS + 17);
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "mixed", docs);
+  PostingsReader reader(dir, 0);
+  int32_t maxDoc = reader.maxDoc();
+
+  RAMBitDocSet domain(maxDoc);
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    if ((doc % 3) != 1) {
+      domain.mutableBits().set(doc);
+    }
+  }
+  std::vector<int32_t> expected;
+  for (int32_t doc : docs) {
+    if (domain.get(doc)) {
+      expected.push_back(doc);
+    }
+  }
+
+  FieldReader fieldReader(reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum terms(pool, reader, fieldInfo);
+  ASSERT_TRUE(terms.seek("mixed"));
+  int32_t docFreq = terms.docFreq();
+  EXPECT_EQ(domain.cachedCard(), -1);
+  DocsOnlyEnum postings(terms);
+
+  SkipStatsGuard stats;
+  auto result = materializePostingsIntersection(
+      postings, docFreq, &domain, maxDoc);
+
+  EXPECT_EQ(collectDocSet(*result, maxDoc), expected);
+  EXPECT_EQ(domain.cachedCard(), -1);
+  EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
+  EXPECT_GT(SkipStats::advanceCalls, 1);
+}
+
+TEST_F(DocsEnumAdvanceTest,
+       materializePostingsIntersectionRoutesArrayByRelativeSize) {
+  std::vector<int32_t> docs;
+  appendWordBlock(docs);
+  appendContiguousBlock(docs);
+  appendPackedBlock(docs);
+  int32_t tailBase = nextBlockBase(docs);
+  for (int32_t i = 0; i < 37; i++) {
+    docs.push_back(tailBase + i * 5);
+  }
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "mixed", docs);
+  PostingsReader reader(dir, 0);
+  int32_t maxDoc = reader.maxDoc();
+
+  auto materialize = [&](DocSet* domain) {
+    FieldReader fieldReader(reader);
+    EXPECT_TRUE(fieldReader.readNextField());
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+    TermsEnum terms(pool, reader, fieldInfo);
+    EXPECT_TRUE(terms.seek("mixed"));
+    int32_t docFreq = terms.docFreq();
+    DocsOnlyEnum postings(terms);
+    return materializePostingsIntersection(
+        postings, docFreq, domain, maxDoc);
+  };
+
+  std::vector<int32_t> mergeDocs;
+  for (int32_t doc = 0; doc < maxDoc; doc += 11) {
+    mergeDocs.push_back(doc);
+  }
+  ArrDocSet mergeDomain(std::move(mergeDocs));
+  std::vector<int32_t> mergeExpected;
+  for (int32_t doc : docs) {
+    if (mergeDomain.get(doc)) {
+      mergeExpected.push_back(doc);
+    }
+  }
+
+  SkipStatsGuard stats;
+  auto mergeResult = materialize(&mergeDomain);
+  EXPECT_EQ(collectDocSet(*mergeResult, maxDoc), mergeExpected);
+  EXPECT_EQ(SkipStats::advanceCalls, 0);
+
+  std::vector<int32_t> sparseDocs{docs[5], docs[300]};
+  ArrDocSet sparseDomain(std::move(sparseDocs));
+  ASSERT_TRUE(shouldDrivePostingsFromArray(
+      (int32_t) docs.size(), sparseDomain.card()));
+  SkipStats::reset();
+  auto sparseResult = materialize(&sparseDomain);
+  EXPECT_EQ(collectDocSet(*sparseResult, maxDoc),
+            (std::vector<int32_t>{docs[5], docs[300]}));
+  EXPECT_GT(SkipStats::advanceCalls, 0);
 }
 
 // The whole-term impact frontier stored in the term dictionary must equal the

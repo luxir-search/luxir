@@ -1275,36 +1275,32 @@ public:
           auto poolGuard = MemPool::threadLocalPoolGuard();
           FieldReader fieldReader(postingsReader);
           bool found = fieldReader.seek(thisOp().fieldName);
-          DocSetBuilder builder(maxDoc);
+          std::unique_ptr<DocSet> bucketDomain;
           if (found) {
             fieldReader.readFieldInfo(segFieldInfo);
             TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
             if (tenum.seek(key)) {
+              int32_t docFreq = tenum.docFreq();
               DocsOnlyEnum denum(tenum);
-              DocSetProbe domainProbe(input[segnum]);
-              while (true) {
-                auto doc = denum.nextDoc();
-                if (doc == DocsEnumMeta::END) {
-                  break; // no more docs for this term
-                }
-                if (!domainProbe.get(doc)) {
-                  continue; // this doc is not in the domain
-                }
-                builder.add(doc);
-              }
+              bucketDomain = materializePostingsIntersection(
+                  denum, docFreq, input[segnum], maxDoc);
             }
           }
           // Always pass a (possibly empty) bucket domain.  A null domain means
           // "all docs" to a sub-op (e.g. StatsOp), so when the field or value is
           // absent in this segment the bucket would wrongly absorb every doc in
           // the segment.  The bucket has no docs here, so the domain is empty.
-          bucketDomains.push_back(builder.build());
-          DocSet* bucketDomain = bucketDomains.back().get();
+          if (bucketDomain == nullptr) {
+            DocSetBuilder empty(maxDoc);
+            bucketDomain = empty.build();
+          }
+          bucketDomains.push_back(std::move(bucketDomain));
+          DocSet* bucketDomainPtr = bucketDomains.back().get();
           for (auto& subCalc : calculators) {
             //subCalc->calc(tg, segnum, &output);
             // no support for subcalcs launching tasks yet
 
-            subCalc->calc(nullptr, segnum, bucketDomain);
+            subCalc->calc(nullptr, segnum, bucketDomainPtr);
           }
         }
         slotNum++;

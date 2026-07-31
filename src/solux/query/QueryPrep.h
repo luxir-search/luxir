@@ -376,15 +376,8 @@ class DocSetBulkScorer final : public BulkScorer {
     int32_t wordCard = 0;
     if (filter->type == DocSet::BITSET) {
       const FixedBitSet& source = ((BitDocSet*) filter)->bits();
-      int32_t sourceWord = min >> 6;
-      int32_t shift = min & 63;
-      int32_t sourceWords = (int32_t) FixedBitSet::sizeInWords(source.size());
+      intersectBitSetWindow(windowBits, min, end, source);
       for (int32_t i = 0; i < words; i++) {
-        uint64_t bits = source.words[sourceWord + i] >> shift;
-        if (shift != 0 && sourceWord + i + 1 < sourceWords) {
-          bits |= source.words[sourceWord + i + 1] << (64 - shift);
-        }
-        windowBits[(size_t) i] &= bits;
         if (computeCard) {
           wordCard += (int32_t) std::popcount(windowBits[(size_t) i]);
         }
