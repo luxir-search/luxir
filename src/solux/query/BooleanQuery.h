@@ -132,8 +132,8 @@ private:
       if (inner != nullptr && (isPureNegative(*inner) || isComplementForm(*inner))) {
         // Required complements contribute no score: drop their match-all
         // carrier (if present), strip wrappers, and merge the exclusions.
-        // If an exclusion is itself a pure-negative Boolean it deliberately
-        // stays opaque here. Prohibited-list normalization is not part of R1.
+        // If an exclusion is itself a pure-negative Boolean it stays opaque;
+        // only the current required complement is inlined.
         plan.prohibited.insert(plan.prohibited.end(), inner->prohibited.begin(),
                                inner->prohibited.end());
         parents.erase(parents.begin() + (ptrdiff_t) i);
@@ -171,7 +171,7 @@ private:
     }
   }
 
-  // R5: a bare match-all in a required list is the conjunction's identity.
+  // A bare match-all in a required list is the conjunction's identity.
   // scoreProfile() treats AUTO_UNIFORM mandatory clauses as membership-only,
   // so removal never changes scores. The last required clause always stays:
   // a sole match-all IS the domain (browse-all, complement carrier), and
@@ -394,81 +394,73 @@ public:
   static inline bool disableWindowDispatchForTests = false;
   static inline bool disablePartitionLatchForTests = false;
   static inline bool disableMandOptBulkForTests = false;
-  // A/B toggle: send scored TOP_k with direct window-capable filters to the pull
-  // ConjunctionScorer instead of the window-filter bulk route.
+  // Test hook: route scored top-k queries with direct window filters through
+  // the pull ConjunctionScorer instead of the window-filter bulk scorer.
   static inline bool disableFilteredScoredBulkForTests = false;
-  // A/B toggle for exact probe-vs-fill equivalence tests.
+  // Test hook: fill filter masks instead of probing candidate docs.
   static inline bool disableFilterMaskProbeForTests = false;
-  // A/B toggle for the exact df(base) + non-member count path used by
-  // count-only skewed term disjunctions.
+  // Test hook: enumerate all terms instead of using the count identity for
+  // skewed term disjunctions.
   static inline bool disableDisjunctionCountIdentityForTests = false;
-  // A/B toggle: retain the plain pull DisjunctionScorer for sparse filtered
-  // term unions instead of using head/tail WAND candidate formation.
+  // Test hook: use the pull DisjunctionScorer for sparse filtered term unions
+  // instead of head/tail WAND candidate formation.
   static inline bool disableFilteredUnionWandForTests = false;
-  // A/B toggle: keep prohibited scored disjunctions on the pull MandNot path.
+  // Test hook: use pull MandNot for prohibited scored disjunctions.
   static inline bool disableBulkExclusionForTests = false;
-  // A/B toggle: retain the scored density policy for unscored filter suppliers
-  // instead of letting cached DocSets become exhaustive conjunction clauses.
+  // Test hook: route unscored filter suppliers by density instead of admitting
+  // exact filters as exhaustive conjunction clauses.
   static inline bool disableFilterClauseCountForTests = false;
-  // A/B toggle: retain the pruned scored density policy for exact scored
-  // filter suppliers instead of admitting cached DocSets as clauses.
+  // Test hook: route exact scored filter suppliers by density instead of
+  // admitting exact filters as exhaustive conjunction clauses.
   static inline bool disableExactFilterCachePolicyForTests = false;
-  // A/B toggle: keep exact filtered term disjunctions on their previous
-  // conjunction/pull routes instead of batching cached-DocSet candidates.
+  // Test hook: use conjunction/pull execution for exact filtered term
+  // disjunctions instead of batching candidates from the filter feed.
   static inline bool disableFilteredDisjunctionBatchForTests = false;
-  // A/B toggle: retain virtual DocSet scorer iteration instead of consuming
-  // an array-backed filter's sorted span directly.
+  // Test hook: iterate an array-backed filter through its virtual DocSet
+  // scorer instead of consuming its sorted span directly.
   static inline bool disableFilteredDisjunctionArrayFeedForTests = false;
-  // A/B toggle: retain virtual term-scorer iteration instead of copying
+  // Test hook: iterate a term through its virtual scorer instead of copying
   // decoded postings blocks into the filtered-disjunction candidate batch.
   static inline bool disableFilteredDisjunctionPostingsBlockGatherForTests =
       false;
-  // A/B toggle: keep exact scored filtered term conjunctions on their
-  // body-led mask or pull routes instead of batching from a cached DocSet.
+  // Test hook: use body-led mask or pull execution for exact scored filtered
+  // term conjunctions instead of exact candidate batching.
   static inline bool disableFilteredConjunctionBatchForTests = false;
-  // A/B toggle: require cached-DocSet provenance for the exact filtered
-  // conjunction batch instead of streaming an uncached term filter's postings.
+  // Test hook: prevent a term filter from owning the exact candidate postings
+  // feed. A scored term may still own the feed.
   static inline bool disableFilteredConjunctionPostingsFeedForTests = false;
-  // A/B toggle: keep multi-term exact filtered conjunctions on their previous
-  // body-led route.
+  // Test hook: use body-led execution for multi-term exact filtered
+  // conjunctions.
   static inline bool disableFilteredConjMultiTermForTests = false;
-  // A/B toggle: retain the previous exact filtered route when a scored term
-  // would otherwise own the exact candidate feed.
+  // Test hook: keep the filter-owned exact route when a scored term could own
+  // the candidate feed.
   static inline bool disableExactCandidateTermFeedForTests =
       std::getenv("SOLUX_DISABLE_EXACT_CANDIDATE_TERM_FEED") != nullptr;
-  // Fenrir 5M 1-seg, 300-query intersection class, filters at 1% and 0.11%
-  // density, 2026-07-29: ratio>=4 wins on all four filter x cache-regime legs;
-  // 1-4 is regime-dependent (uncached wins from ~1, cached loses to the
-  // warm-DocSet mask until ~4); below 1 the filter cannot lead.
+  // Candidate batching requires the cheapest body clause to be sufficiently
+  // more expensive than the filter feed. A cached DocSet competes with a
+  // cheap window mask and therefore requires the stricter ratio.
   static inline int64_t multiTermBatchMinRatioDocSet = 4;
   static inline int64_t multiTermBatchMinRatioPostings = 2;
-  // Provisional for the Fenrir 5M 1-seg, 300-query intersection domain;
-  // calibration on the benchmark host will replace this initial ~3% cap.
+  // A term-owned exact candidate feed is limited to terms matching at most
+  // maxDoc/32, which bounds candidate materialization to sparse scoring terms.
   static constexpr int64_t kTermFeedMaxLeadFraction = 32;
   static inline int64_t kTermFeedMaxLeadFractionForTests =
       kTermFeedMaxLeadFraction;
-  // Warm-DocSet filters displace a cheap baseline (window mask over an
-  // L2-resident set), so the term feed must be well under the filter to pay
-  // for its second feed cursor. Fenrir 5M 1-seg, journalist 1% cached
-  // T100C, feed-df/filter-card buckets (term-feed minus kill-switch):
-  // <=0.35 wins or parity (-10.2ms over 179q), 0.40-0.45 +62us/q avg and
-  // monotonically worse above (+156us/q at 0.8-1.0). Raw-postings filters
-  // displace a per-query mask fill and win at every measured ratio - no
-  // gate on that provenance.
+  // A cached DocSet has a cheap mask route, so a term may own the candidate
+  // feed only when it is materially sparser than the filter. A postings filter
+  // would otherwise need a per-query mask fill and does not use this gate.
   static inline int64_t kTermFeedMinDocSetFilterRatio = 3;
-  // A/B toggle for the count-only unmatched-candidate compaction inside the
-  // DocSet batch route.
+  // Test hook: retain unmatched candidates between count-only DocSet batch
+  // clauses instead of compacting them.
   static inline bool disableFilteredDisjunctionCountCompactionForTests = false;
-  // Exact TOP_100_COUNT over the 5M/301-union mimir cohort measured batch/pull
-  // at filter densities 2.16%=0.963, 2.33%=1.003, 2.49%=1.032,
-  // 3.04%=1.115, and 5.24%=1.744. /44 (2.27%) is the bracketed knee.
-  // Unscored COUNT uses the batch only when its existing dense route declines.
+  // Scored exact filtered disjunction batching is limited to filters matching
+  // at most maxDoc/44. Unscored count uses this batch only when its existing
+  // dense route declines.
   static constexpr int32_t kFilteredDisjunctionBatchDensityInverse = 44;
   static inline int32_t filteredDisjunctionBatchDensityInverseForTests =
       kFilteredDisjunctionBatchDensityInverse;
-  // A/B toggle: force the conjunction onto the eager single-phase path (each
-  // clause verifies inside its own advance) instead of two-phase (defer matches
-  // until the approximations agree). For benchmarking the two-phase win only.
+  // Test hook: use eager single-phase clauses instead of deferring exact
+  // matches until all approximations agree.
   static inline bool disableTwoPhaseForTests = false;
   // Pull-conjunction refinement band: refine bounds to block granularity when
   // theta reaches this fraction of the group-granular range bound.
@@ -532,27 +524,17 @@ public:
     }
     return sum;
   }
-  // Scored TOP_k filter routing: the window-mask bulk needs the collector
-  // floor to rise, and that tracks how densely the filter accepts docs, not
-  // filter-vs-body cost. Below maxDoc/kMaskFilterDensityInverse the mask
-  // route degenerates toward an unpruned scored scan and the pull conjunction
-  // (filter leads) wins. Measured crossover on the 5M sweep: 1% filter
-  // (journalist) wants pull, 10% (city) wants mask.
+  // Scored top-k pull-versus-bulk routing depends on filter density. Below
+  // maxDoc/kMaskFilterDensityInverse, the filter is selective enough to lead a
+  // pull conjunction. Denser filters admit filtered bulk execution, which
+  // chooses mask fill or per-candidate probing separately.
   static constexpr int64_t kMaskFilterDensityInverse = solux::kMaskFilterDensityInverse;
   // Relative cost of one monotonic filter advance vs streaming one filter
   // posting. Probe when leadCost * this weight is below filterCost.
   static constexpr int64_t kMaskProbeAdvanceWeight = 6;
-  // Probing checks candidates one at a time instead of filling the filter's
-  // bits for the window, so it only pays when FILLING is the expensive side -
-  // i.e. on a FAT filter. A thin filter is cheap to fill (few bits, sparse
-  // postings) while probing still costs a scalar advance per candidate, so
-  // the body/filter ratio alone routes wrongly once thin filters reach the
-  // mask. Measured on the 300-query intersection class at TOP_100 (forced
-  // fill / probe, so >1 means probing WINS):
-  //   0.50% 0.938 | 0.99% 0.942 | 1.99% 0.912 | 3.12% 0.959 | 4.98% 0.748
-  //   9.9% 0.989 (tie) | 19.2% 1.072 | 29.9% 1.148 | 42.6% 1.204
-  // so probing additionally requires the filter to cover at least maxDoc/8
-  // (12.5%), which puts every measured point on its winning side.
+  // Probing pays one scalar advance per candidate instead of filling the
+  // filter's bits for the window. Require the filter to match at least
+  // maxDoc/8; sparser filters are cheap enough to stream into a mask.
   static constexpr int64_t kMaskProbeMinFilterDensityInverse = 8;
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
@@ -769,12 +751,11 @@ public:
     };
 
     // Build the required-clause conjunction. Mandatory clauses score; filter
-    // clauses only constrain iteration. Required clauses are ordered by ascending
-    // supplier cost so the sparsest leads the conjunction (the highest-leverage
-    // win for a "+rare +common" or "+term filter:x" query), and the sparsest cost
-    // is passed as leadCost to every child get() per the supplier planning
-    // contract. Because a Solux Scorer exposes no cost(), this ordering has to
-    // happen here at the supplier layer, before any scorer is constructed.
+    // clauses only constrain iteration. Required clauses are ordered by
+    // ascending supplier cost so the sparsest leads the conjunction, and that
+    // cost is passed as leadCost to every child get() per the supplier planning
+    // contract. Because a Solux Scorer exposes no cost(), this ordering happens
+    // here at the supplier layer, before any scorer is constructed.
     static Required assembleRequired(
         MemPool& targetPool,
         IndexReader::Segment& segment,
@@ -1091,8 +1072,8 @@ public:
       }
 
       DocSet* exactDocSet() override {
-        // Preserve the count-clause A/B baseline: disabling cached filter
-        // clause admission must also disable this degenerate form of it.
+        // Apply the filter-clause test hook to the degenerate single-filter
+        // DocSet path as well.
         if (!needsScores && disableFilterClauseCountForTests) {
           return nullptr;
         }
@@ -1956,11 +1937,10 @@ public:
         }
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
-          // Two-phase clauses stay on the pull conjunction even unscored: it
+          // Two-phase clauses stay on the pull conjunction even unscored. It
           // flattens phrase approximations into the doc-level leapfrog and
-          // verifies positions only on full agreement, while an opaque
-          // phrase advance() verifies eagerly and loses badly (5x on a
-          // dense-phrase + term conjunction).
+          // verifies positions only after all approximations agree; treating a
+          // phrase as opaque would verify positions during every advance.
           return conjunctionBulkScorer(
               targetPool, ConjunctionMode::SCORED_BODY);
         }
@@ -3607,10 +3587,10 @@ public:
           }
           maxScore += (double) scorerMax;
         }
-        // The pull conjunction refines near-theta ranges to block granularity:
-        // its members can be two-phase (phrases), so a skipped range saves
-        // position verification, unlike the all-term bulk scorer where block
-        // refinement measured as a net loss and stays group-granular.
+        // The pull conjunction refines near-theta ranges to block granularity.
+        // Its members can be two-phase, so a skipped range can avoid position
+        // verification. The all-term bulk scorer stays group-granular to avoid
+        // refining every candidate window.
         bool competitive = maxScore >= (double) minCompetitiveScore;
         if (competitive && std::isfinite(maxScore)
             && (double) minCompetitiveScore >= kRefineBeta * maxScore) {
@@ -3814,10 +3794,8 @@ public:
     }
 
   public:
-    // A/B hook: turn off block-max range skipping entirely.  (A minimum
-    // evaluation stride like Lucene's window minimum was tried and measured
-    // neutral-to-worse at 5M - the natural per-block range prunes best at low
-    // k; revisit only with fresh profiles.)
+    // Test hook: disable block-max range skipping. The default evaluates each
+    // scorer's natural bound horizon without imposing a minimum stride.
     static inline bool disablePruningForTests = false;
     static inline bool disableApproxFlattenForTests = false;
     static inline bool disableExactDirectApproximationsForTests = false;
@@ -4117,10 +4095,8 @@ public:
   class ConjunctionBulkScorer final : public BulkScorer {
   public:
     // Dense count windows engage when the lead matches at least
-    // maxDoc / kDenseThresholdInverse docs.  Far below Lucene's 32: word-
-    // encoded blocks make clause window fills cheap, so windows beat the
-    // docs-only leapfrog until the lead gets quite sparse (measured minimum
-    // on the 5M benchmark corpus; 32 and 16384 are both ~20% slower).
+    // maxDoc/kDenseThresholdInverse docs. Word-encoded block fills remain
+    // useful at lower lead densities than scalar clause leapfrogging.
     static constexpr int32_t kDenseThresholdInverse = 512;
     static constexpr int32_t kDenseLeapfrogThreshold =
         DocsEnumMeta::L1_DOCS / 32;
@@ -4128,27 +4104,16 @@ public:
     // Keep filling through the first query clause, then apply the ordinary
     // intermediate-cardinality crossover.
     static constexpr int32_t kDocSetLeadLeapfrogThreshold = 1;
-    // Off: the Fenrir 5M sweeps (2026-07-30, thresholds 8..128, journalist
-    // and unfiltered COUNT classes) lost at every setting, both before AND
-    // after within-group checkpoints cut the dense-enum advance cost -
-    // per-survivor probing loses to streaming tail fills on per-probe fixed
-    // cost, not the header walk. The SOLUX_TERM_LEAD_LEAPFROG_THRESHOLD
-    // override remains only as an experiment knob; do not re-enable without
-    // a mechanism change that removes per-probe cost itself.
+    // Disabled because scalar per-survivor advances cost more than streaming
+    // term tail fills. The environment override is a test hook for changes
+    // that reduce the per-probe cost.
     static constexpr int32_t kTermLeadLeapfrogThreshold = 0;
-    // Direct-term or DocSet tails benefit from sparse lead iteration sooner
-    // regardless of lead type. On the 5M corpus, journalist-filtered, cached,
-    // and unfiltered COUNT sweeps (2026-07-30) put the knee between /128 and
-    // /64; /128 avoids the all-dense regressions seen at /64. Disjunction-
-    // group tails and scored construction retain /512. TOP_100_COUNT was flat
-    // (1.001) under /128, but other scored classes are unmeasured; revisit
-    // the scored bar only with broader data.
+    // Direct-term and DocSet tails switch to sparse lead iteration while the
+    // lead is still denser than the disjunction-group crossover because their
+    // sparse path avoids group construction.
     static constexpr int32_t kTermTailDenseThresholdInverse = 128;
-    // Cached-DocSet conjunction batches below the existing /128 dense-count
-    // knee. Measured on the 5M/300-intersection asteroid COUNT cohort:
-    // 128=40.77 ms, 512=40.41, 1024=39.66, 4096=40.48.
-    // Journalist exact-scored one-term TOP_100_COUNT was flat at 3.12-3.18 ms
-    // across the same sizes, so use the count knee for both routes.
+    // Bound the filtered-conjunction candidate buffer while amortizing clause
+    // cursor setup. Count and scored routes share the same batch shape.
     static constexpr int32_t kFilteredConjunctionBatchSize = 1024;
     static inline int32_t denseThresholdInverseForTests = [] {
       const char* value = std::getenv("SOLUX_DENSE_THRESHOLD_INVERSE");
@@ -4268,8 +4233,8 @@ public:
     int64_t denseSampleSurvivors = 0;
     int32_t denseScoredTopK = 0;
 
-    // Dense-scored admission thresholds were calibrated on the 5M benchmark
-    // corpus. Keep them together so the measured policy remains legible.
+    // Dense-scored admission considers requested depth, an initial survivor
+    // sample, and non-lead cost. Keep the parameters together.
     static constexpr int32_t kDenseScoredMinTopK = 100;
     static constexpr int32_t kDenseAdmissionSampleWindows = 8;
     static constexpr int32_t kDenseAdmissionMinLeadPerWindow = 32;
@@ -4904,9 +4869,8 @@ public:
                 scorerGetMaxScore<TermFast, TermTailFast>(c, upTo);
             suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
           }
-          // Group-granular bounds only (see
-          // ConjunctionScorer::advanceCompetitive note): block-level
-          // refinement measured as a net loss here.
+          // Keep all-term bulk bounds group-granular so candidate windows do
+          // not pay for block-level refinement.
           if (suffixMax[0] * scoreBoundFactor
               < (double) this->minCompetitiveScore) {
             skippedWindowCount++;
@@ -5418,11 +5382,9 @@ public:
       if (!densityAccepted) {
         skipCount(SkipStats::conjDenseScoredDensityRejects);
       }
-      // Construction bounds summed non-lead cost at 8x lead, so total fill is
-      // about 9x lead work; density bounds survivor scoring. An absolute cap
-      // priced neither side and blocked high-lead/deep-k wins: american south
-      // (82.6 survivors/window, density 0.184, ratio 0.489) and to be or not
-      // to be (401.9 survivors/window, density 0.473).
+      // Construction already bounds non-lead fill cost relative to the lead;
+      // this sample therefore gates on useful lead volume and survivor density
+      // instead of imposing an unrelated absolute survivor cap.
       bool admitted = leadAccepted && densityAccepted;
       denseScoredAdmission = admitted
           ? DenseScoredAdmission::ADMITTED
@@ -5829,14 +5791,9 @@ public:
       if (!allowPruning && !disableExactScoredBoundsBypassForTests) {
         skipCount(SkipStats::conjExactScoredBoundsBypasses);
       }
-      // Unpruned collection (an exact total count pins the threshold at its
-      // lowest) leaves score-first with no skipping at all, which is the
-      // deep-k limit of the density bar. Price it at the deepest calibrated
-      // depth: the curve was measured to k=1000, so that is the honest
-      // ceiling even though nothing prunes here. The shallow-k entry gate
-      // exists for the same reason - shallow requests prune hardest - so it
-      // reads the effective depth too: without pruning, requested depth only
-      // sizes the heap, it does not change the work either path must do.
+      // Unpruned collection has no score skips, so model it at the maximum
+      // depth used by the density policy. The requested depth only sizes the
+      // heap when pruning is disabled.
       int32_t effectiveTopK = allowPruning
           ? topK : kDenseAdmissionMaxDensityTopK;
       if (effectiveTopK < kDenseScoredMinTopK
@@ -5867,18 +5824,10 @@ public:
       }
       assert(windowFilter == nullptr);
       windowFilter = filter;
-      // The dense scored path fills EVERY clause across the window, so its
-      // cost does not shrink when a filter rejects most docs - only its output
-      // does. Its admission criteria were calibrated unfiltered, where a low
-      // survivor density means the intersection itself is selective and the
-      // fill is cheap per result; under a selective filter the same low
-      // density instead means the filter threw the fill away. Measured on the
-      // 300-query intersection class at TOP_100 (dense-scored off/on, so >1
-      // means the dense path is LOSING):
-      //   unfiltered 1.051 | 42.6% 1.017 | 9.9% 1.038   <- keep dense
-      //   4.98% 0.926 | 3.12% 0.959 | 1.99% 0.897 | 0.99% 0.872 | 0.50% 0.837
-      // so require the filter to be at least maxDoc/16 (6.25%) dense, which
-      // puts every measured point on its winning side.
+      // The dense scored path fills every clause before applying the filter,
+      // so a selective filter discards most of that work. Require the filter
+      // to match at least maxDoc/kDenseScoredMinFilterDensityInverse docs;
+      // sparser filters remain on score-first execution.
       if (filter->cost()
           < (int64_t) maxDoc
               / kDenseScoredMinFilterDensityInverse) {
@@ -6468,8 +6417,8 @@ public:
       // soon as the unprobed bounds cannot lift it over the threshold (the
       // bulk scorer's scoreCandidate shape).  An abandoned doc keeps its
       // partial sum, which is below the pushed threshold, so the collector
-      // discards it.  Summation order is NOT bit-stable across execution
-      // paths; only match sets are (accepted policy).
+      // discards it. Summation order varies across execution paths, so score
+      // bits are not guaranteed identical.
       float sum = 0.0f;
       for (size_t i = 0; i < scorers.size(); i++) {
         if (isEssential[i] && scorers[i]->docId() == docid) {
@@ -6676,14 +6625,12 @@ public:
   }; // MaxScoreDisjunctionScorer
 
 
-  // Exact filtered term disjunctions gather the cached DocSet once, then sweep
-  // each term clause over the monotone candidate batch. This is deliberately
-  // clause-at-a-time rather than the rejected per-filter-doc leapfrog: the
-  // term's resident-block probe state is reused across adjacent candidates,
-  // and scoring decodes frequencies only in blocks containing survivors.
+  // Exact filtered term disjunctions gather a batch from the filter feed, then
+  // sweep each term clause over those monotone candidates. Clause-at-a-time
+  // execution preserves each term's resident-block probe state across adjacent
+  // candidates, and scoring decodes frequencies only in blocks with survivors.
   class DocSetDisjunctionBulkScorer final : public BulkScorer {
-    // Exact TOP_100_COUNT over the 5M/301-union journalist cohort measured
-    // 4096/1024=0.991. One postings L1 group is the measured batch size.
+    // Bound candidate and score buffers while amortizing each clause sweep.
     static constexpr int32_t kBatchSize = DocsEnumMeta::L1_DOCS;
     static constexpr int32_t kMatchWords = (kBatchSize + 63) >> 6;
 
@@ -6973,25 +6920,17 @@ public:
     constexpr static int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
-    // The identity trades streaming the largest postings list for one scalar
-    // membership probe per doc of the smaller terms. A df RATIO gate misprices
-    // it: the largest clause in a skewed union is dense and word-encoded, so
-    // streaming it is nearly free per doc, and there is far less to save than a
-    // ratio implies. Measured on 5M (smaller-side df -> time vs enumeration):
-    // <100 0.15x, 100-1k 0.29x, 1k-10k 1.01x, 10k-100k 1.15x. So the gate is an
-    // ABSOLUTE probe budget, plus a ratio floor so we only pay it where there is
-    // something to save (tiny-OR-tiny unions are already fast and just fall
-    // back). A ratio-only gate at 32 admitted 95k probes on "the globe
-    // newspaper" and lost 4.6x.
+    // The identity avoids streaming the largest postings list by probing it
+    // once per doc from the smaller terms. A df ratio alone misprices that
+    // trade because dense word-encoded postings stream cheaply. Bound the
+    // absolute probe count as well, while retaining a ratio floor so small,
+    // balanced unions use ordinary enumeration.
     constexpr static int64_t kDisjunctionCountIdentityMaxProbes = 1024;
     constexpr static int64_t kDisjunctionCountIdentityMinDfRatio = 32;
-    // Domain-drive gate weights: drive only when card*nClauses*W < SUM(clause.cost()).
-    // W is the per-advance penalty (advance cost vs a vectorized block decode). HARDWARE
-    // SENSITIVE (vector throughput vs scalar skip cost; ISA): calibrated on an Intel hybrid
-    // 2P+8E laptop to a ~1% crossover; RE-VALIDATE on uniform desktop / cloud / ARM (NEON/
-    // SVE shifts the ratio). W_ARRAY < W_BITSET because array stream membership is an
-    // O(log card) ArrDocSet::get binary search vs bitset O(1) get (W_ARRAY reasoned from the
-    // ~15% delta, not swept).
+    // Drive from the domain when card*nClauses*W < sum(clause.cost()). W models
+    // a scalar advance relative to vectorized block decode and is sensitive to
+    // both implementations. W_ARRAY is lower because stream-side membership
+    // uses ArrDocSet::get instead of a bit lookup.
     constexpr static int64_t W_BITSET = 32;
     constexpr static int64_t W_ARRAY = 28;
     static_assert((kWindowSize % 64) == 0);
@@ -7018,8 +6957,8 @@ public:
     // Never cleared: a slot is valid only under a set window bit, and
     // addWindowScore overwrites on the first touch of a window.
     // Clauses add into it in fill order, so the sum's rounding depends on
-    // which clauses are essential in a window - accepted policy (execution
-    // paths are not required to be bit-identical).
+    // which clauses are essential in a window. Score bits are not guaranteed
+    // identical across execution paths.
     std::span<float> windowScores;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
@@ -7290,10 +7229,9 @@ public:
     }
 
     bool useBs1ForWindow() const {
-      // BS1 wins when every clause streams exhaustively into the shared score
-      // row. Once a clause is non-essential, the ordinary path can leave its
-      // postings untouched and probe only surviving candidates; BS1 instead
-      // decodes and scores that clause across the whole window.
+      // Dense shared-row fill is useful only when every clause is essential.
+      // Once a clause is non-essential, the ordinary path can leave its
+      // postings untouched and probe only surviving candidates.
       return scorers.size() >= kBs1MinClauses && splitIndex == 0;
     }
 
@@ -7719,8 +7657,8 @@ public:
       if (domainBits != nullptr) {
         return domainBits->get(doc);
       }
-      // Correctness fallback for ARRAY filters. Step 3 wiring keeps the hot path on
-      // null/BITSET filters until this is measured.
+      // ARRAY correctness fallback. Domain-driven execution consumes its
+      // sorted span directly; other routes may use this binary-search lookup.
       return filter->get(doc);
     }
 
@@ -7748,10 +7686,10 @@ public:
         return false;
       }
       int64_t scale = nClauses * weight;
-      // Drive cost is roughly card*nClauses advances. Stream cost is roughly
-      // sum(clause.cost()) vectorized decodes. W is the measured advance/decode
-      // ratio. ARRAY gets a lower W because stream-side membership is a binary
-      // search in ArrDocSet::get, while BITSET stream membership is bits.get().
+      // Drive cost is roughly card*nClauses scalar advances. Stream cost is
+      // roughly sum(clause.cost()) vectorized decodes. ARRAY gets a lower W
+      // because stream-side membership is an ArrDocSet::get binary search,
+      // while BITSET membership is a bit lookup.
       return card <= (aggregateClauseCost - 1) / scale;
     }
 
@@ -7866,8 +7804,8 @@ public:
     // Essential clauses drive via the block-fill API rather than per-doc
     // next()/score(): whole decoded blocks land at once and text terms score
     // through the vectorized flat-norms kernel. Scores may differ from the
-    // doc-at-a-time paths in the last bit (vectorized vs scalar rounding) -
-    // accepted policy, execution paths are not required to be bit-identical.
+    // doc-at-a-time paths in the last bit due to vectorized versus scalar
+    // rounding.
     // No clause-level threshold is ever pushed by this bulk scorer, so the
     // block fills below cannot skip docs.
     void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
@@ -8128,9 +8066,9 @@ public:
             break;
           }
           int32_t doc = windowStart + index;
-          // BS1 intentionally defers filter membership to one check per candidate.
-          // Selective filters may accumulate rejected docs, but dense windows are the
-          // path this mode is for.
+          // Shared-row fill defers filter membership to one check per candidate.
+          // Selective filters may accumulate rejected docs, but this mode is
+          // restricted to dense, all-essential windows.
           if (acceptsDoc(filter, domainBits, doc)) {
             float score = windowScores[(size_t) index];
             if (score >= minCompetitiveScore) {
