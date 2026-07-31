@@ -211,6 +211,13 @@ public:
           targetPool, materialize(targetPool), segment.maxDoc(),
           weight.constantScore);
     }
+
+    BulkScorer* filteredBulkScorer(
+        MemPool& targetPool,
+        const BulkScorerContext& bulkContext) override {
+      unused(bulkContext);
+      return bulkScorer(targetPool);
+    }
   };
 
   Query::ScorerSupplier* scorerSupplier(

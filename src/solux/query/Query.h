@@ -378,6 +378,20 @@ public:
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class ScorerSupplier {
   public:
+    enum class ScoreBlockFillKind : uint8_t {
+      DEFAULT_SCALAR,
+      BLOCK_ITERATION,
+    };
+
+    // Constraints imposed by the caller around a prospective bulk scorer.
+    // A supplier can use these to reject bulk execution when its algorithm is
+    // slower than pull under the enclosing domain.
+    struct BulkScorerContext {
+      int64_t filterCost = -1;
+
+      bool hasFilter() const noexcept { return filterCost >= 0; }
+    };
+
     struct ExactCountTopKCosts {
       int64_t filter = -1;
       int64_t unionSide = -1;
@@ -420,8 +434,27 @@ public:
       return nullptr;
     }
 
+    /// How get() implements fillScoreBlock(). This is an execution-cost
+    /// capability, not a correctness requirement. DEFAULT_SCALAR means the
+    /// scorer may use Scorer's next()+score() loop; BLOCK_ITERATION means it
+    /// amortizes postings iteration over blocks even if score calculation
+    /// within the block still needs per-doc values.
+    virtual ScoreBlockFillKind scoreBlockFillKind() const noexcept {
+      return ScoreBlockFillKind::DEFAULT_SCALAR;
+    }
+
     virtual BulkScorer* bulkScorer(MemPool& targetPool) {
       unused(targetPool);
+      return nullptr;
+    }
+
+    // Build a bulk scorer that will run beneath an enclosing filter. Unknown
+    // suppliers decline by default; implementations that understand their
+    // bulk route must explicitly accept or use the context.
+    virtual BulkScorer* filteredBulkScorer(
+        MemPool& targetPool, const BulkScorerContext& bulkContext) {
+      unused(targetPool);
+      unused(bulkContext);
       return nullptr;
     }
   };

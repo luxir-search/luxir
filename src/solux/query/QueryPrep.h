@@ -550,6 +550,13 @@ public:
     return targetPool.make<DocSetBulkScorer>(
         targetPool, docs, segment.maxDoc());
   }
+
+  BulkScorer* filteredBulkScorer(
+      MemPool& targetPool,
+      const BulkScorerContext& bulkContext) override {
+    unused(bulkContext);
+    return bulkScorer(targetPool);
+  }
 };
 
 inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,

@@ -397,6 +397,9 @@ public:
   // Test hook: route scored top-k queries with direct window filters through
   // the pull ConjunctionScorer instead of the window-filter bulk scorer.
   static inline bool disableFilteredScoredBulkForTests = false;
+  // Test hook: admit a filtered MandOpt bulk whose mandatory scorer only has
+  // the scalar fillScoreBlock fallback below its measured density crossover.
+  static inline bool disableFilteredMandOptFillGateForTests = false;
   // Test hook: fill filter masks instead of probing candidate docs.
   static inline bool disableFilterMaskProbeForTests = false;
   // Test hook: enumerate all terms instead of using the count identity for
@@ -536,6 +539,28 @@ public:
   // filter's bits for the window. Require the filter to match at least
   // maxDoc/8; sparser filters are cheap enough to stream into a mask.
   static constexpr int64_t kMaskProbeMinFilterDensityInverse = 8;
+  // MandOpt bulk drains its mandatory scorer through fillScoreBlock. A direct
+  // term has a block-native implementation and keeps the general /256 filter
+  // crossover. A compound mandatory scorer using the scalar default needs a
+  // substantially denser filter before streaming the body wins:
+  //   filter density    pull / bulk, +(climate policy)^3 report
+  //   1.02%             0.49-0.57
+  //   2.16%             0.79-0.85
+  //   3.95%             0.94-1.03
+  //   4.98%             0.84-0.92
+  //   7.96%             1.16-1.32
+  // Results hold across TOP_10/100/1000/TOP_100_COUNT and cached/uncached
+  // filters. /16 places every non-marginal point on its winning side.
+  static constexpr int64_t kMandOptScalarFillDensityInverse = 16;
+
+  static bool filterDensityBelow(int64_t cost, int32_t maxDoc,
+                                 int64_t densityInverse) noexcept {
+    assert(cost >= 0);
+    assert(maxDoc >= 0);
+    assert(densityInverse > 0);
+    return maxDoc > 0
+        && cost <= ((int64_t) maxDoc - 1) / densityInverse;
+  }
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
@@ -682,7 +707,8 @@ public:
 
     static bool filterDensityRoutesToPull(int64_t filterCost,
                                           int32_t maxDoc) {
-      return filterCost < maxDoc / kMaskFilterDensityInverse;
+      return filterDensityBelow(
+          filterCost, maxDoc, kMaskFilterDensityInverse);
     }
 
     // Match MaxScoreDisjunctionScorer's stable score order when an externally
@@ -1373,9 +1399,25 @@ public:
             exactCandidateFilters, exactCandidateFilterDocSets);
       }
 
-      BulkScorer* mandOptBulkScorer(MemPool& targetPool) {
-        auto* mandSupplier = mandatorySources[0]->scorerSupplier(targetPool, segment);
+      BulkScorer* mandOptBulkScorer(
+          MemPool& targetPool,
+          Query::ScorerSupplier* precomputedMandSupplier = nullptr,
+          const Query::ScorerSupplier::BulkScorerContext* bulkContext =
+              nullptr) {
+        auto* mandSupplier = precomputedMandSupplier != nullptr
+            ? precomputedMandSupplier
+            : mandatorySources[0]->scorerSupplier(targetPool, segment);
         if (mandSupplier == nullptr) {
+          return nullptr;
+        }
+        if (bulkContext != nullptr && bulkContext->hasFilter()
+            && !disableFilteredMandOptFillGateForTests
+            && filterDensityBelow(
+                bulkContext->filterCost, segment.maxDoc(),
+                kMandOptScalarFillDensityInverse)
+            && mandSupplier->scoreBlockFillKind()
+                == Query::ScorerSupplier::ScoreBlockFillKind::DEFAULT_SCALAR) {
+          skipCount(SkipStats::mandOptBulkScalarFillFallbacks);
           return nullptr;
         }
         int64_t mandCost = mandSupplier->cost();
@@ -1633,108 +1675,52 @@ public:
       }
 
       BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
-        enum class BodyShape : uint8_t {
-          NONE,
-          CHILD,
-          CONJUNCTION,
-          MAND_OPT,
-          MAX_SCORE,
-        };
-
         if (!needsScores || filterSuppliers.empty()
             || !prohibitedSources.empty() || minShouldMatch > 1) {
           return nullptr;
         }
-        int64_t filterCost = minFilterCost();
-        if (filterCost < 0) {
+        int64_t localFilterCost = minFilterCost();
+        if (localFilterCost < 0) {
+          return nullptr;
+        }
+        if (filterDensityRoutesToPull(
+                localFilterCost, segment.maxDoc())) {
           return nullptr;
         }
 
-        BodyShape shape = BodyShape::NONE;
-        Query::ScorerSupplier* childSupplier = nullptr;
-        int64_t bodyCost = 0;
-
-        // A folded filter prevents makeSupplier's single-mandatory unwrap, so
-        // recover the child's own bulk contract here (term and nested MandOpt
-        // are the common cases).
+        // Ask the positive body to plan its own bulk route. This keeps route
+        // identity and filter-sensitive admission in the supplier that will
+        // construct the scorer, independent of whether normalization exposed
+        // the body directly or wrapped it as a single child.
+        Query::ScorerSupplier* bodySupplier = nullptr;
         if (mandatorySources.size() == 1 && optionalSources.empty()
             && minShouldMatch < 1) {
-          childSupplier = mandatorySources[0]->scorerSupplier(
+          bodySupplier = mandatorySources[0]->scorerSupplier(
               targetPool, segment);
-          shape = BodyShape::CHILD;
         } else if (mandatorySources.empty() && optionalSources.size() == 1
                    && minShouldMatch == 1) {
           // Rank-only optionals (minShouldMatch == 0 beside filters) do not
           // own membership and therefore cannot use this route.
-          childSupplier = optionalSources[0]->scorerSupplier(
+          bodySupplier = optionalSources[0]->scorerSupplier(
               targetPool, segment);
-          shape = BodyShape::CHILD;
-        } else if (optionalSources.empty() && mandatorySources.size() >= 2) {
-          bodyCost = std::numeric_limits<int64_t>::max();
-          for (auto* source : mandatorySources) {
-            auto* supplier = source->scorerSupplier(targetPool, segment);
-            if (supplier == nullptr) {
-              return nullptr;
-            }
-            bodyCost = std::min(bodyCost, supplier->cost());
-          }
-          shape = BodyShape::CONJUNCTION;
-        } else if (!disableMandOptBulkForTests
-                   && mandatorySources.size() == 1
-                   && !optionalSources.empty() && minShouldMatch < 1) {
-          childSupplier = mandatorySources[0]->scorerSupplier(
-              targetPool, segment);
-          shape = BodyShape::MAND_OPT;
-        } else if (mandatorySources.empty() && optionalSources.size() >= 2
-                   && minShouldMatch == 1) {
-          for (auto* source : optionalSources) {
-            auto* supplier = source->scorerSupplier(targetPool, segment);
-            if (supplier == nullptr) {
-              continue;
-            }
-            int64_t cost = supplier->cost();
-            if (cost > 0
-                && bodyCost < std::numeric_limits<int64_t>::max()) {
-              int64_t room = std::numeric_limits<int64_t>::max() - bodyCost;
-              bodyCost = cost >= room
-                  ? std::numeric_limits<int64_t>::max()
-                  : bodyCost + cost;
-            }
-          }
-          shape = BodyShape::MAX_SCORE;
+        } else {
+          bodySupplier = targetPool.make<Supplier>(
+              targetPool, segment, mandatorySources, mandatoryScores,
+              optionalSources,
+              std::span<Query::SegmentSource* const>{},
+              std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
+              needsScores, allowsPruning);
         }
-
-        if (childSupplier == nullptr
-            && (shape == BodyShape::CHILD || shape == BodyShape::MAND_OPT)) {
+        if (bodySupplier == nullptr) {
           return nullptr;
         }
-        if (childSupplier != nullptr) {
-          bodyCost = childSupplier->cost();
-        }
-        if (shape == BodyShape::NONE
-            || filterDensityRoutesToPull(filterCost, segment.maxDoc())) {
-          return nullptr;
-        }
-
-        BulkScorer* bulk = nullptr;
-        switch (shape) {
-          case BodyShape::CHILD:
-            bulk = childSupplier->bulkScorer(targetPool);
-            break;
-          case BodyShape::CONJUNCTION:
-            bulk = conjunctionBulkScorer(
-                targetPool, ConjunctionMode::SCORED_BODY);
-            break;
-          case BodyShape::MAND_OPT:
-            bulk = mandOptBulkScorer(targetPool);
-            break;
-          case BodyShape::MAX_SCORE:
-            bulk = maxScoreBulkScorer(targetPool);
-            break;
-          case BodyShape::NONE:
-            std::unreachable();
-        }
-        return attachDirectFilters(targetPool, bulk, bodyCost, filterCost);
+        int64_t bodyCost = bodySupplier->cost();
+        Query::ScorerSupplier::BulkScorerContext bulkContext{
+            localFilterCost};
+        auto* bulk = bodySupplier->filteredBulkScorer(
+            targetPool, bulkContext);
+        return attachDirectFilters(
+            targetPool, bulk, bodyCost, localFilterCost);
       }
 
       BulkScorer* filterOnlyBulkScorer(MemPool& targetPool) {
@@ -1958,6 +1944,23 @@ public:
           return nullptr;
         }
         return maxScoreBulkScorer(targetPool);
+      }
+
+      BulkScorer* filteredBulkScorer(
+          MemPool& targetPool,
+          const Query::ScorerSupplier::BulkScorerContext& bulkContext)
+          override {
+        // BulkScorer currently owns one WindowFilter. Let the enclosing pull
+        // scorer compose nested filters instead of attempting two attachments.
+        if (!filterSuppliers.empty()) {
+          return nullptr;
+        }
+        if (!disableMandOptBulkForTests && mandatorySources.size() == 1
+            && !optionalSources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && minShouldMatch < 1) {
+          return mandOptBulkScorer(targetPool, nullptr, &bulkContext);
+        }
+        return bulkScorer(targetPool);
       }
     };
 

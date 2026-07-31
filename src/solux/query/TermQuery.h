@@ -202,7 +202,18 @@ public:
         return get(targetPool, leadCost);
       }
 
+      ScoreBlockFillKind scoreBlockFillKind() const noexcept override {
+        return ScoreBlockFillKind::BLOCK_ITERATION;
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override;
+
+      BulkScorer* filteredBulkScorer(
+          MemPool& targetPool,
+          const BulkScorerContext& bulkContext) override {
+        unused(bulkContext);
+        return bulkScorer(targetPool);
+      }
     };
 
     Query::ScorerSupplier* scorerSupplier(solux::MemPool& targetPool,
@@ -1312,7 +1323,8 @@ public:
 
 };
 
-inline BulkScorer* TermQuery::Weight::Supplier::bulkScorer(MemPool& targetPool) {
+inline BulkScorer* TermQuery::Weight::Supplier::bulkScorer(
+    MemPool& targetPool) {
   auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight.createScorer(targetPool, segment));
   if (scorer == nullptr) {
     return nullptr;

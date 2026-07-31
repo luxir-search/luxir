@@ -18,6 +18,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "solux/query/TermQuery.h"
+#include "solux/query/BoostQuery.h"
 #include "solux/query/NumericRangeQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/BooleanQuery.h"
@@ -235,6 +236,19 @@ struct FilteredScoredBulkGuard {
 
   ~FilteredScoredBulkGuard() {
     BooleanQuery::disableFilteredScoredBulkForTests = saved;
+  }
+};
+
+struct FilteredMandOptFillGateGuard {
+  bool saved;
+
+  explicit FilteredMandOptFillGateGuard(bool disabled)
+    : saved(BooleanQuery::disableFilteredMandOptFillGateForTests) {
+    BooleanQuery::disableFilteredMandOptFillGateForTests = disabled;
+  }
+
+  ~FilteredMandOptFillGateGuard() {
+    BooleanQuery::disableFilteredMandOptFillGateForTests = saved;
   }
 };
 
@@ -7287,6 +7301,7 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   for (int32_t doc = 0; doc < 1024; doc++) {
     std::string body = "quick fox pad";
     if ((doc % 2) == 0) body += " keep";
+    if ((doc % 32) == 2) body += " mid_filter";
     if ((doc % 512) == 0) body += " selective";  // below the mask-density gate
     if ((doc % 3) == 0) appendRepeatedTerm(body, "body_a", 1 + doc % 5);
     if ((doc % 5) == 0) body += " body_b";
@@ -7347,16 +7362,34 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   TermQuery unionA("body_w", "union_a");
   TermQuery unionB("body_w", "union_b");
   TermQuery keep("body_w", "keep");
+  TermQuery midFilter("body_w", "mid_filter");
 
   std::vector<Query*> oneMandatory = {&bodyA};
   std::vector<Query*> twoMandatory = {&bodyA, &bodyB};
   std::vector<Query*> oneOptional = {&bonus};
   std::vector<Query*> unionOptional = {&unionA, &unionB};
   std::vector<Query*> filters = {&keep};
+  std::vector<Query*> midFilters = {&midFilter};
   BooleanQuery termQuery(oneMandatory, {}, {}, filters);
   BooleanQuery conjunctionQuery(twoMandatory, {}, {}, filters);
   BooleanQuery mandOptQuery(oneMandatory, oneOptional, {}, filters);
   BooleanQuery unionQuery({}, unionOptional, {}, filters, 1);
+  BooleanQuery midMandOptQuery(oneMandatory, oneOptional, {}, midFilters);
+  BooleanQuery compoundMandatory({}, unionOptional, {}, {}, 1);
+  BoostQuery boostedCompoundMandatory(&compoundMandatory, 3.0f);
+  std::vector<Query*> compoundMandatoryClause = {&boostedCompoundMandatory};
+  BooleanQuery midCompoundMandOpt(
+      compoundMandatoryClause, oneOptional, {}, midFilters);
+  BooleanQuery denseCompoundMandOpt(
+      compoundMandatoryClause, oneOptional, {}, filters);
+  BooleanQuery compoundMandOptBody(
+      compoundMandatoryClause, oneOptional, {}, {});
+  std::vector<Query*> compoundBodyClause = {&compoundMandOptBody};
+  BooleanQuery wrappedMidCompoundMandOpt(
+      compoundBodyClause, {}, {}, midFilters);
+  std::vector<Query*> denseCompoundBodyClause = {&denseCompoundMandOpt};
+  BooleanQuery multiLevelCompoundMandOpt(
+      denseCompoundBodyClause, {}, {}, midFilters);
 
   auto expectedTerm = runQueryTopK(*reader, termQuery, topK, false);
   auto actualTerm = runBulk(termQuery, typeid(TermQuery::TermBulkScorer));
@@ -7372,6 +7405,97 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
   auto actualMandOpt = runBulk(
       mandOptQuery, typeid(BooleanQuery::MandOptBulkScorer));
   assertTopKEquivalent(expectedMandOpt.topDocs, actualMandOpt.topDocs);
+
+  // The 32-doc filter is above the general /256 mask knee but below the /16
+  // scalar-fill knee. A direct term mandatory retains bulk; a compound
+  // mandatory using Scorer's scalar fill falls back to pull. Dense filters
+  // still keep the compound bulk route.
+  EXPECT_FALSE(BooleanQuery::filterDensityBelow(1, 15, 16));
+  EXPECT_FALSE(BooleanQuery::filterDensityBelow(1, 16, 16));
+  EXPECT_TRUE(BooleanQuery::filterDensityBelow(1, 17, 16));
+  ASSERT_FALSE(BooleanQuery::filterDensityBelow(
+      32, 1024, BooleanQuery::kMaskFilterDensityInverse));
+  ASSERT_TRUE(BooleanQuery::filterDensityBelow(
+      32, 1024, BooleanQuery::kMandOptScalarFillDensityInverse));
+  auto expectedMidTerm = runQueryTopK(
+      *reader, midMandOptQuery, topK, false);
+  auto actualMidTerm = runBulk(
+      midMandOptQuery, typeid(BooleanQuery::MandOptBulkScorer));
+  assertTopKEquivalent(expectedMidTerm.topDocs, actualMidTerm.topDocs);
+
+  auto expectedMidCompound = runQueryTopK(
+      *reader, midCompoundMandOpt, topK, false);
+  {
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = context.topReader.segments()[0];
+    auto* weight = midCompoundMandOpt.createWeight(
+        context, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_EQ(nullptr, supplier->bulkScorer(pool));
+    EXPECT_EQ(1, SkipStats::mandOptBulkScalarFillFallbacks);
+  }
+  {
+    FilteredMandOptFillGateGuard gateGuard(true);
+    auto legacyMidCompound = runBulk(
+        midCompoundMandOpt, typeid(BooleanQuery::MandOptBulkScorer));
+    assertTopKEquivalent(
+        expectedMidCompound.topDocs, legacyMidCompound.topDocs);
+  }
+
+  // Prepared op-level filters wrap the complete MandOpt body as one child.
+  // The enclosing supplier must pass its filter context into that child's
+  // bulk admission instead of relying on its own syntactic body shape.
+  auto expectedWrappedMidCompound = runQueryTopK(
+      *reader, wrappedMidCompoundMandOpt, topK, false);
+  {
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = context.topReader.segments()[0];
+    auto* weight = wrappedMidCompoundMandOpt.createWeight(
+        context, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_EQ(nullptr, supplier->bulkScorer(pool));
+    EXPECT_EQ(1, SkipStats::mandOptBulkScalarFillFallbacks);
+  }
+  {
+    FilteredMandOptFillGateGuard gateGuard(true);
+    auto legacyWrappedMidCompound = runBulk(
+        wrappedMidCompoundMandOpt,
+        typeid(BooleanQuery::MandOptBulkScorer));
+    assertTopKEquivalent(
+        expectedWrappedMidCompound.topDocs,
+        legacyWrappedMidCompound.topDocs);
+  }
+
+  // Nested filter wrappers decline bulk composition because BulkScorer owns a
+  // single attached WindowFilter. The enclosing pull scorer composes them.
+  auto expectedMultiLevelCompound = runQueryTopK(
+      *reader, multiLevelCompoundMandOpt, topK, false);
+  EXPECT_FALSE(expectedMultiLevelCompound.topDocs.empty());
+  {
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = context.topReader.segments()[0];
+    auto* weight = multiLevelCompoundMandOpt.createWeight(
+        context, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_EQ(nullptr, supplier->bulkScorer(pool));
+    EXPECT_EQ(0, SkipStats::mandOptBulkScalarFillFallbacks);
+  }
+
+  auto expectedDenseCompound = runQueryTopK(
+      *reader, denseCompoundMandOpt, topK, false);
+  auto actualDenseCompound = runBulk(
+      denseCompoundMandOpt, typeid(BooleanQuery::MandOptBulkScorer));
+  assertTopKEquivalent(
+      expectedDenseCompound.topDocs, actualDenseCompound.topDocs);
 
   auto expectedUnion = runQueryTopK(*reader, unionQuery, topK, false);
   {

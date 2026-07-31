@@ -852,6 +852,13 @@ public:
         }
         return phaseOneBulkScorer(targetPool);
       }
+
+      BulkScorer* filteredBulkScorer(
+          MemPool& targetPool,
+          const BulkScorerContext& bulkContext) override {
+        unused(bulkContext);
+        return bulkScorer(targetPool);
+      }
     };
 
     Query::ScorerSupplier* scorerSupplier(MemPool& targetPool,
