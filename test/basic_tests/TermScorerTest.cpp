@@ -3784,6 +3784,75 @@ TEST_F(TermScorerTest, mandOptTwoPhaseMandatoryPhraseMatchesExhaustive) {
   EXPECT_GT(SkipStats::mandOptWindowEvals, 0);
 }
 
+TEST_F(TermScorerTest, mandOptExternalPhraseApproximationRetainsRequiredOptional) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(0, "alpha beta gamma delta");
+  f.add(1, "alpha beta gamma pad delta");
+  f.add(2, "alpha pad beta gamma delta");
+  f.add(3, "alpha beta gamma delta");
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+
+  PhraseQuery phraseForMax("body_w", terms, positions);
+  auto* phraseWeight = phraseForMax.createWeight(qContext, Query::NEED_SCORES);
+  auto* phraseScorer = phraseWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(phraseScorer, nullptr);
+  float theta = std::nextafter(
+      phraseScorer->getMaxScoreForSetup(PostingsReader::END),
+      std::numeric_limits<float>::infinity());
+
+  PhraseQuery phrase("body_w", terms, positions);
+  std::vector<std::string_view> optTerms = {"gamma", "delta"};
+  std::vector<int32_t> optPositions = {0, 1};
+  PhraseQuery bonus("body_w", optTerms, optPositions);
+  std::vector<Query*> mandatory = {&phrase};
+  std::vector<Query*> optional = {&bonus};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  scorer->setMinCompetitiveScore(theta);
+
+  auto enums = scorer->approximationEnums();
+  ASSERT_EQ(2, enums.size());
+  auto positionEnums = [&](int32_t doc) {
+    for (DocsPosEnum* docsEnum : enums) {
+      ASSERT_LT(docsEnum->docId(), doc);
+      EXPECT_EQ(doc, docsEnum->advance(doc));
+    }
+  };
+
+  SkipStatsGuard stats;
+  positionEnums(0);
+  EXPECT_TRUE(scorer->matchesAt(0));
+  EXPECT_GT(scorer->score(), 0.0f);
+  EXPECT_GT(scorer->score(), 0.0f);
+  EXPECT_EQ(1, SkipStats::mandOptOptionalVerifies);
+
+  positionEnums(1);
+  EXPECT_FALSE(scorer->matchesAt(1));
+  EXPECT_EQ(2, SkipStats::mandOptOptionalVerifies);
+
+  positionEnums(2);
+  EXPECT_FALSE(scorer->matchesAt(2));
+  EXPECT_EQ(2, SkipStats::mandOptOptionalVerifies);
+
+  positionEnums(3);
+  EXPECT_TRUE(scorer->matchesAt(3));
+  EXPECT_GT(scorer->score(), 0.0f);
+  EXPECT_GT(scorer->score(), 0.0f);
+  EXPECT_EQ(3, SkipStats::mandOptOptionalVerifies);
+}
+
 TEST_F(TermScorerTest, mandOptTwoPhaseOptionalScoresOnlyConfirmedMatches) {
   TestIndex testIndex;
   TestField f(testIndex, "body_w");

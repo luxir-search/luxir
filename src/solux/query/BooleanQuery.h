@@ -2381,6 +2381,12 @@ public:
     float windowReqMaxScore = std::numeric_limits<float>::infinity();
     float windowMaxScore = std::numeric_limits<float>::infinity();
     bool optIsRequired = false;
+    int32_t optCheckedDoc = -1;
+    bool optCheckedMatch = false;
+#ifndef NDEBUG
+    enum class IterationProtocol : uint8_t { NONE, INTERNAL, EXTERNAL };
+    IterationProtocol iterationProtocol = IterationProtocol::NONE;
+#endif
     // The window walk earns its keep through skips and conjunction windows.
     // When neither happens for a stretch (small corpora, low thresholds), it
     // disables itself and only re-arms once theta has grown past the theta it
@@ -2398,9 +2404,34 @@ public:
       return mand.twoPhase || opt.twoPhase;
     }
 
+#ifndef NDEBUG
+    void markInternalProtocol() {
+      assert(iterationProtocol != IterationProtocol::EXTERNAL);
+      iterationProtocol = IterationProtocol::INTERNAL;
+    }
+
+    void markExternalProtocol() {
+      assert(iterationProtocol != IterationProtocol::INTERNAL);
+      iterationProtocol = IterationProtocol::EXTERNAL;
+    }
+#endif
+
     bool optCanExist(int32_t upTo) const {
       int32_t optDoc = opt.docId();
       return optDoc != solux::PostingsReader::END && optDoc <= upTo;
+    }
+
+    bool optMatches() {
+      if (!opt.twoPhase) {
+        return true;
+      }
+      int32_t doc = opt.docId();
+      if (optCheckedDoc != doc) {
+        optCheckedDoc = doc;
+        skipCount(SkipStats::mandOptOptionalVerifies);
+        optCheckedMatch = opt.scorer->matches();
+      }
+      return optCheckedMatch;
     }
 
     float maxScoreAt(int32_t upTo, bool refined) {
@@ -2588,6 +2619,9 @@ public:
     }
 
     int32_t approximationNext() override {
+#ifndef NDEBUG
+      markInternalProtocol();
+#endif
       assert(id != solux::PostingsReader::END);
       // Without a threshold the window walk is inert and optIsRequired can
       // never be set; keep the mandatory clause on its sequential next()
@@ -2601,6 +2635,9 @@ public:
     }
 
     int32_t approximationAdvance(int32_t target) override {
+#ifndef NDEBUG
+      markInternalProtocol();
+#endif
       if (!(minCompetitiveScore > 0.0f)) {
         id = mand.advance(target);
         return id;
@@ -2612,7 +2649,49 @@ public:
       return id;
     }
 
+    std::span<DocsPosEnum*> approximationEnums() override {
+      if (!mand.twoPhase) {
+        return {};
+      }
+      // This deliberately projects only the mandatory side. The outer
+      // conjunction can globally order a selective filter with a phrase's
+      // postings, while matchesAt() retains the dynamic opt-is-required test.
+      // The scorer's private approximation remains opaque so its local
+      // block-max walk can still require the optional side.
+      return mand.scorer->approximationEnums();
+    }
+
+    bool matchesAt(int32_t doc) override {
+#ifndef NDEBUG
+      markExternalProtocol();
+#endif
+      id = doc;
+      if (!mand.scorer->matchesAt(doc)) {
+        return false;
+      }
+
+      if (optIsRequired) {
+        int32_t optDoc = opt.docId();
+        if (optDoc < doc) {
+          optDoc = opt.advance(doc);
+        }
+        if (optDoc != doc) {
+          return false;
+        }
+        if (!optMatches()) {
+          opt.next();
+          return false;
+        }
+      } else if (opt.docId() == doc && !optMatches()) {
+        opt.next();
+      }
+      return true;
+    }
+
     bool matches() override {
+#ifndef NDEBUG
+      markInternalProtocol();
+#endif
       int32_t reqDoc = mand.docId();
       if (mand.twoPhase && !mand.scorer->matches()) {
         return false;
@@ -2626,11 +2705,11 @@ public:
         if (optDoc != reqDoc) {
           return false;
         }
-        if (opt.twoPhase && !opt.scorer->matches()) {
+        if (!optMatches()) {
           opt.next();
           return false;
         }
-      } else if (opt.twoPhase && opt.docId() == reqDoc && !opt.scorer->matches()) {
+      } else if (opt.docId() == reqDoc && !optMatches()) {
         opt.next();
       }
       return true;
@@ -2655,7 +2734,7 @@ public:
       if (optDoc < id) {
         optDoc = opt.advance(id);
       }
-      if (opt.twoPhase && optDoc == id && !opt.scorer->matches()) {
+      if (optDoc == id && !optMatches()) {
         optDoc = opt.next();
       }
       if (optDoc == id) {

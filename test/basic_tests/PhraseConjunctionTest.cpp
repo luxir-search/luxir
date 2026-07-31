@@ -161,6 +161,31 @@ public:
     return readRun(*req, posSeeksBefore, phraseVerifiesBefore);
   }
 
+  Run runMandOpt(bool disableFlatten) {
+    ApproxFlattenGuard flattenGuard(disableFlatten);
+    SkipStatsGuard statsGuard;
+    int64_t posSeeksBefore = SkipStats::posSeeks;
+    int64_t phraseVerifiesBefore = SkipStats::phraseVerifies;
+
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q");
+    cur.getNumber().getScores().limit(2).batchSize(3).fields({"id"});
+
+    api::Query phrase = qb::boost(
+        cur.mr(), qb::phraseWords(cur.mr(), "body_w", {"a", "b"}), 4.0f);
+    api::Query optional = qb::boost(
+        cur.mr(), qb::match(cur.mr(), "body_w", "q"), 10.0f);
+    api::Query mandOpt = qb::boolean(
+        cur.mr(), {phrase}, {optional});
+    cur.rawQuery() = qb::boolean(
+        cur.mr(), {mandOpt}, {}, {},
+        {qb::match(cur.mr(), "body_w", "d")});
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return readRun(*req, posSeeksBefore, phraseVerifiesBefore);
+  }
+
   void SetUp() override {
     SoluxTest::SetUp();
     helper.indexAll({
@@ -215,6 +240,18 @@ TEST_F(PhraseConjunctionTest, flattenedEnumsPreserveResultsAndDeferVerification)
   EXPECT_EQ(nestedDisjoint.scores, flatDisjoint.scores);
   EXPECT_EQ(0, flatDisjoint.phraseVerifies);
   EXPECT_LE(flatDisjoint.posSeeks, nestedDisjoint.posSeeks);
+}
+
+TEST_F(PhraseConjunctionTest, mandOptProjectsMandatoryPhraseApproximation) {
+  Run opaque = runMandOpt(true);
+  Run projected = runMandOpt(false);
+
+  EXPECT_EQ(opaque.count, projected.count);
+  EXPECT_EQ(opaque.ids, projected.ids);
+  EXPECT_EQ(opaque.scores, projected.scores);
+  EXPECT_EQ(3, projected.count);
+  EXPECT_EQ((std::set<std::string>{"a1", "a4"}), projected.ids);
+  EXPECT_EQ(opaque.posSeeks, projected.posSeeks);
 }
 
 TEST_F(PhraseConjunctionTest, prohibitedPhraseVerifiesOnlyMandatoryCollisions) {

@@ -90,6 +90,7 @@ struct SkipStats {
   static inline int64_t mandOptWindowSkips = 0;
   static inline int64_t mandOptConjunctionWindows = 0;
   static inline int64_t mandOptWindowEvals = 0;
+  static inline int64_t mandOptOptionalVerifies = 0;
   static inline int64_t mandOptBulkWindows = 0;
   static inline int64_t mandOptBulkWindowSkips = 0;
   static inline int64_t mandOptBulkSweeps = 0;
@@ -266,6 +267,7 @@ struct SkipStats {
     mandOptWindowSkips = 0;
     mandOptConjunctionWindows = 0;
     mandOptWindowEvals = 0;
+    mandOptOptionalVerifies = 0;
     mandOptBulkWindows = 0;
     mandOptBulkWindowSkips = 0;
     mandOptBulkSweeps = 0;

@@ -850,15 +850,22 @@ public:
     }
     /// doc we are positioned on
     virtual int32_t docId() = 0;
-    /// Two-phase iteration contract: a consumer picks one protocol for a
-    /// scorer lifetime. If hasTwoPhase() is true, consumers that opt in drive
-    /// approximation*()+matches() only and never call next()/advance() on that
-    /// scorer. A non-empty approximationEnums() exposes the distinct iterators
-    /// whose conjunction is the approximation; a consumer may drive them and
-    /// call matchesAt() only after all are on that doc. Verification leaves
-    /// score state ready and must be idempotent for the current doc, or the
-    /// consumer must call it at most once per approximation doc. score() is only
-    /// valid after a successful match.
+    /// Iteration contract: a consumer picks exactly one protocol for a scorer
+    /// lifetime. Exact iteration uses next()/advance(). If hasTwoPhase() is
+    /// true, private two-phase iteration instead drives
+    /// approximation*()+matches(), while external two-phase iteration drives
+    /// every enum returned by approximationEnums() and calls matchesAt(). The
+    /// protocols must not be mixed. A non-empty approximationEnums() exposes
+    /// distinct iterators
+    /// whose conjunction is an externally drivable superset of the scorer's
+    /// exact matches. It need not be the same approximation used by
+    /// approximation*(): wrappers may expose a child's iterators and retain
+    /// dynamic restrictions for matchesAt(). A consumer may drive the enums
+    /// and call matchesAt() only after all are on that doc. A successful
+    /// matchesAt(doc) leaves docId()==doc and score state ready. Verification
+    /// must be idempotent for the current doc, or the consumer must call it at
+    /// most once per approximation doc. score() is only valid after a
+    /// successful match.
     virtual bool hasTwoPhase() const {
       return false;
     }
