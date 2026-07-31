@@ -18,7 +18,7 @@
 
 namespace solux {
 
-class SearchOp;
+class RootOp;
 class SearchRequest;
 
 class ProtobufSearchParser {
@@ -29,7 +29,7 @@ public:
   // queries to produce. Both the pool and any parsed protobuf objects must outlive the tree.
   explicit ProtobufSearchParser(SearchRequest& req);
 
-  SearchOp* parse();
+  RootOp* parse();
 };
 
 } // solux

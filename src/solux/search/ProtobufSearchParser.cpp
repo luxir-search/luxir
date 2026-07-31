@@ -245,7 +245,7 @@ public:
   explicit SearchParserImpl(SearchRequest& req) : req(req) {
   }
 
-  SearchOp* parse() {
+  RootOp* parse() {
     // Top level facets default to being nested under the first top-level query
     // for their input.
     // Their results go at the top-level however.
@@ -853,7 +853,7 @@ public:
 ProtobufSearchParser::ProtobufSearchParser(SearchRequest& req) : req(req) {
 }
 
-SearchOp* ProtobufSearchParser::parse() {
+RootOp* ProtobufSearchParser::parse() {
   return SearchParserImpl(req).parse();
 }
 

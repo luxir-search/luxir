@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -182,16 +183,16 @@ public:
           subCalcs.emplace_back(subCalc);
         }
       }
-      needsPrepare = op.weight->needsPrepare();
+      requiresPreparePhase = op.weight->needsPrepare();
       for (auto* weight : op.filterWeights) {
         if (weight->needsPrepare()) {
-          needsPrepare = true;
+          requiresPreparePhase = true;
           break;
         }
       }
-      if (needsPrepare) {
+      if (requiresPreparePhase) {
         auto numSegs = op.req.reader->segments().size();
-        baseDomains.assign(numSegs, nullptr);
+        inputDomains.assign(numSegs, nullptr);
         effectiveDomains.assign(numSegs, nullptr);
         effectiveDomainsOwned.resize(numSegs);
       }
@@ -212,33 +213,55 @@ public:
     std::vector<QueryPrep::MaterializedFilter> output;
     std::vector<std::unique_ptr<Calculator>> subCalcs;
 
-    // Prepared path state. Used only when the main query or one of the
-    // TopDocs filters needs all segment domains before scorer creation.
-    //
-    // Each segment task records its incoming base domain, then the last
-    // arriving segment prepares any global weights, materializes effective
-    // per-segment domains, and dispatches prepared collection tasks.
-    bool needsPrepare = false;
-    std::atomic<int32_t> preparedDomainsSeen{0};
-    std::vector<DocSet*> baseDomains;
+    // Prepared path state. Root delivery already supplies every segment
+    // domain at once. A nested streaming parent can still use the per-segment
+    // entry point, in which case the last arrival starts preparation.
+    // Calculator-level decision: the main weight or at least one filter
+    // requires the all-domain preparation phase. This is distinct from the
+    // main weight's Weight::needsPrepare() trait because a filter alone can
+    // require the phase.
+    bool requiresPreparePhase = false;
+    std::atomic<int32_t> gatheredDomainsSeen{0};
+    std::vector<DocSet*> inputDomains;
     std::vector<DocSet*> effectiveDomains;
     std::vector<QueryPrep::MaterializedFilter> effectiveDomainsOwned;
     std::vector<QueryPrep::PreparedSource> preparedFilterSources;
     std::unique_ptr<Query::Weight::PreparedWeight> preparedWeight;
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {
-      // TODO: there is a redundant task launch here since RootOp creates tasks for each segment already.
-      // We could think about rootOp calling us just once per index and we could launce a task per segment - but,
-      // if we are a sub-op of another operation, it's possible we might already be running in a per-segment mode?
-      if (needsPrepare) {
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          doPrepareDomain(tg, segnum, domain);
-        });
-      } else {
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          doCalc(tg, segnum, domain);
-        });
+      if (segnum < 0) {
+        assert(segnum == -1);
+        completeEmpty(tg);
+        return;
       }
+      if (!requiresPreparePhase) {
+        task_group_run(tg, [this, tg, segnum, domain]() {
+          doCollect(tg, segnum, domain);
+        });
+        return;
+      }
+
+      assert(segnum < (int32_t)inputDomains.size());
+      inputDomains[(size_t)segnum] = domain;
+      auto count =
+          gatheredDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
+      if (count != (int32_t)thisOp().req.reader->segments().size()) return;
+      startPrepare(tg);
+    }
+
+    void calcAll(oneapi::tbb::task_group* tg,
+                 std::span<DocSet* const> domains) override {
+      assert(domains.size() == thisOp().req.reader->segments().size());
+      if (domains.empty()) {
+        completeEmpty(tg);
+        return;
+      }
+      if (!requiresPreparePhase) {
+        dispatch(tg, domains);
+        return;
+      }
+      std::copy(domains.begin(), domains.end(), inputDomains.begin());
+      startPrepare(tg);
     }
 
     Query::ScorerSupplier* mainScorerSupplier(MemPool& pool, IndexReader::Segment& seg) {
@@ -323,9 +346,9 @@ public:
       collector.hitCount += count - ranked;
     }
 
-    QueryPrep::MaterializedFilter buildEffectiveDomain(int32_t segnum) {
+    QueryPrep::MaterializedFilter buildEffectiveDomain(
+        int32_t segnum, DocSet* baseDomain) {
       auto& op = thisOp();
-      auto* baseDomain = baseDomains[(size_t)segnum];
       if (op.filterWeights.empty()) return {};
       auto& seg = op.req.reader->segments()[segnum];
 
@@ -343,26 +366,27 @@ public:
       return QueryPrep::MaterializedFilter(DocSet::intersect(filterPtrs));
     }
 
-    void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) {
-      auto& op = thisOp();
-      if (segnum < 0) {
-        // Empty index: forward to sub-calculators so nested ops still emit a
-        // result, mirroring the empty-index path in doCollect.  Without this,
-        // a prepare-requiring query (force_prepare, KNN) silently drops nested
-        // facet/avg ops on an empty index.
-        for (auto& subCalc : subCalcs) {
-          subCalc->calc(tg, -1, nullptr);
-        }
-        doneCollecting();
-        return;
+    void completeEmpty(oneapi::tbb::task_group* tg) {
+      std::span<DocSet* const> noDomains;
+      for (auto& subCalc : subCalcs) {
+        subCalc->calcAll(tg, noDomains);
       }
-      baseDomains[(size_t)segnum] = domain;
-      auto count = preparedDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
-      if (count != (int32_t)op.req.reader->segments().size()) return;
+      doneCollecting();
+    }
 
+    void startPrepare(oneapi::tbb::task_group* tg) {
+      task_group_run(tg, [this, tg]() {
+        prepareAndDispatch(tg);
+      });
+    }
+
+    void prepareAndDispatch(oneapi::tbb::task_group* tg) {
+      auto& op = thisOp();
+      auto baseDomains = std::span<DocSet* const>(
+          inputDomains.data(), inputDomains.size());
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
-        std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
+        baseDomains,
         tg != nullptr
       };
       preparedFilterSources = QueryPrep::prepareFilterSources(
@@ -372,7 +396,8 @@ public:
         if (op.filterWeights.empty()) {
           effectiveDomains[i] = baseDomains[i];
         } else {
-          effectiveDomainsOwned[i] = buildEffectiveDomain((int32_t)i);
+          effectiveDomainsOwned[i] =
+              buildEffectiveDomain((int32_t)i, baseDomains[i]);
           effectiveDomains[i] = effectiveDomainsOwned[i].get();
         }
       }
@@ -386,33 +411,28 @@ public:
         preparedWeight = op.weight->prepare(queryCtx);
       }
 
-      for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
-        task_group_run(tg, [this, tg, i]() {
-          doPreparedCollect(tg, i);
+      dispatch(
+          tg,
+          std::span<DocSet* const>(
+              effectiveDomains.data(), effectiveDomains.size()));
+    }
+
+    void dispatch(
+        oneapi::tbb::task_group* tg, std::span<DocSet* const> domains) {
+      assert(domains.size() == thisOp().req.reader->segments().size());
+      // Keep the same task-stack ordering as Calculator::calcAll.
+      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
+        DocSet* domain = domains[(size_t)segnum];
+        task_group_run(tg, [this, tg, segnum, domain]() {
+          doCollect(tg, segnum, domain);
         });
       }
     }
 
-    void doPreparedCollect(oneapi::tbb::task_group* tg, int32_t segnum) {
-      doCollect(tg, segnum, effectiveDomains[(size_t)segnum], true);
-    }
-
-    void doCalc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) {
-      doCollect(tg, segnum, domain, false);
-    }
-
-    void doCollect(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain,
-                   bool preparedMode) {
+    void doCollect(
+        oneapi::tbb::task_group* tg, int32_t segnum,
+        solux::DocSet* domain) {
       auto& op = thisOp();
-
-      if (segnum < 0) {
-        // special case for empty index reader, we are done.
-        for (auto& subCalc : subCalcs) {
-          subCalc->calc(tg, -1, nullptr);
-        }
-        doneCollecting();
-        return;
-      }
 
       // A constant-scoring match-all is the identity on its domain: every doc
       // in the domain matches, all with the same score.  So the domain IS the
@@ -443,7 +463,7 @@ public:
         DocSet* borrowedDomain = nullptr;
         bool exactDomain = false;
         DocSet* exactDomainDocs = nullptr;
-        if (!preparedMode && op.requirements.needExactDomain
+        if (!requiresPreparePhase && op.requirements.needExactDomain
             && !op.requirements.needRankedDocs
             && !op.exactDomainPlan.empty()) {
           auto result = op.exactDomainPlan.produce(
@@ -461,7 +481,7 @@ public:
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
         if (!exactDomain
-            && !preparedMode && domain == nullptr && op.filterWeights.empty()
+            && !requiresPreparePhase && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
             && (rankFromDocOrder || data->topCount() == 0)) {
           supplier = mainScorerSupplier(poolGuard.pool(), seg);
@@ -515,7 +535,7 @@ public:
           // Keeps owned sets or request-pinned cache borrows alive; `filter`
           // may alias one directly, so the handles outlive collection below.
           std::vector<QueryPrep::MaterializedFilter> filters;
-          if (!preparedMode && !thisOp().filterWeights.empty()) {
+          if (!requiresPreparePhase && !thisOp().filterWeights.empty()) {
             std::vector<DocSet*> filterPtrs;
             for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
               filters.push_back(QueryPrep::materializeEffectiveFilter(
@@ -535,7 +555,7 @@ public:
           }
           DocSetBuilder* builderPtr = builder.has_value() ? &*builder : nullptr;
           bool sourcePreparedAgainstFilter =
-            preparedMode && preparedWeight != nullptr && filter == domain;
+            requiresPreparePhase && preparedWeight != nullptr && filter == domain;
           DocSet* collectorFilter =
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
@@ -545,7 +565,7 @@ public:
           // contract), no sub-op domain to build - can often read the count
           // straight from index stats (a term's docFreq) without iterating.
           bool counted = false;
-          if (!preparedMode && builderPtr == nullptr && filter == nullptr
+          if (!requiresPreparePhase && builderPtr == nullptr && filter == nullptr
               && !data->useFieldSort && data->scoreCollector->topCount == 0) {
             int64_t exact = op.weight->count(seg);
             if (exact >= 0) {

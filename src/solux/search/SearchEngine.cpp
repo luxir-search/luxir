@@ -1,8 +1,6 @@
 #include "SearchEngine.h"
 #include "ProtobufSearchParser.h"
-// The parser hands back a SearchOp tree that this TU drives (init / createCalculator), so it
-// needs SearchOp complete. That is the leaf op header, not the six the parser itself needs.
-#include "solux/search/ops/SearchOp.h"
+#include "solux/search/ops/RootOp.h"
 
 namespace solux {
 
@@ -21,13 +19,13 @@ void SearchEngine::submitBody(SearchRequest& req) {
     ProtobufSearchParser parser(req);
     auto* root = parser.parse();
     root->init();
-    std::unique_ptr<SearchOp::Calculator> calc(root->createCalculator(nullptr, -1));
+    std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
     // outlive this function, and its callbacks reach into collector output and
     // the getTarget chain.  Released in done().
     auto* rootCalc = calc.get();
     req.rootCalc = std::move(calc);
-    rootCalc->calc(req.tg, -1, nullptr);
+    rootCalc->start(req.tg);
 
     if (req.tg) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
