@@ -5985,17 +5985,20 @@ public:
     struct ApproxSlot {
       Scorer* scorer = nullptr;
       bool twoPhase = false;
+      int32_t doc = -1;
 
-      int32_t next() const {
-        return twoPhase ? scorer->approximationNext() : scorer->next();
+      int32_t next() {
+        doc = twoPhase ? scorer->approximationNext() : scorer->next();
+        return doc;
       }
 
-      int32_t advance(int32_t target) const {
-        return twoPhase ? scorer->approximationAdvance(target) : scorer->advance(target);
+      int32_t advance(int32_t target) {
+        doc = twoPhase ? scorer->approximationAdvance(target) : scorer->advance(target);
+        return doc;
       }
 
       int32_t docId() const {
-        return twoPhase ? scorer->approximationDocId() : scorer->docId();
+        return doc;
       }
 
       float matchCost() const {
@@ -6008,7 +6011,6 @@ public:
     std::span<ApproxSlot*> heap;
     std::span<ApproxSlot*> verificationOrder;
 
-    // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
     constexpr static auto idComparator = [](ApproxSlot& a, ApproxSlot& b) {
       return b.docId() < a.docId();
     };
@@ -6019,13 +6021,17 @@ public:
     // Scorers expose no approximation cost for a weighted estimate.
     float verificationCost = 0.0f;
     bool anyTwoPhase = false;
+    bool twoWay;
 
     static std::span<ApproxSlot> makeMembers(solux::MemPool& pool,
                                               std::span<Scorer*> scorers) {
       auto members = pool.make_span<ApproxSlot>(scorers.size());
       bool enableTwoPhase = !disableTwoPhaseForTests && !disableDisjTwoPhaseForTests;
       for (size_t i = 0; i < scorers.size(); i++) {
-        members[i] = {scorers[i], enableTwoPhase && scorers[i]->hasTwoPhase()};
+        bool twoPhase = enableTwoPhase && scorers[i]->hasTwoPhase();
+        int32_t doc = twoPhase ? scorers[i]->approximationDocId()
+                               : scorers[i]->docId();
+        members[i] = {scorers[i], twoPhase, doc};
       }
       return members;
     }
@@ -6046,11 +6052,13 @@ public:
 
   public:
     static inline bool disableDisjTwoPhaseForTests = false;
+    static inline bool disableTwoWayForTests = false;
 
     DisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers)
             : clauses(scorers), members(makeMembers(pool, scorers)),
               heap(makePointers(pool, members)),
-              verificationOrder(makePointers(pool, members)), pq(heap) {
+              verificationOrder(makePointers(pool, members)), pq(heap),
+              twoWay(scorers.size() == 2 && !disableTwoWayForTests) {
       for (auto& member : members) {
         if (member.twoPhase) {
           anyTwoPhase = true;
@@ -6077,6 +6085,17 @@ public:
 
     int32_t approximationNext() override {
       // Contract: callers must not re-poll after END (see Query::Scorer).
+      assert(docid != solux::PostingsReader::END);
+      if (twoWay) {
+        if (members[0].docId() == docid) {
+          members[0].next();
+        }
+        if (members[1].docId() == docid) {
+          members[1].next();
+        }
+        docid = std::min(members[0].docId(), members[1].docId());
+        return docid;
+      }
       assert(pq.size() > 0);
       int currid = docid;
       assert(pq.top().docId() == docid);
@@ -6106,11 +6125,21 @@ public:
       return docid;
     }
 
-    // Advance every member below target through its latched protocol. Members
-    // are touched at most once: each surfaces at the top while behind,
-    // advances to >= target, and sifts down.
+    // Advance every member below target through its latched protocol. On the
+    // heap path each member is touched at most once: it surfaces at the top
+    // while behind, advances to >= target, and sifts down.
     int32_t approximationAdvance(int32_t target) override {
       assert(docid < target);
+      if (twoWay) {
+        if (members[0].docId() < target) {
+          members[0].advance(target);
+        }
+        if (members[1].docId() < target) {
+          members[1].advance(target);
+        }
+        docid = std::min(members[0].docId(), members[1].docId());
+        return docid;
+      }
       while (pq.size() > 0 && pq.top().docId() < target) {
         if (pq.top().advance(target) == solux::PostingsReader::END) {
           pq.removeTop();
@@ -6148,7 +6177,8 @@ public:
     }
 
     float score() override {
-      assert(pq.size() > 0 && docid == pq.top().docId());
+      assert(docid != solux::PostingsReader::END);
+      assert(twoWay || (pq.size() > 0 && docid == pq.top().docId()));
       float score = 0.0f;
       for (auto& member : members) {
         if (member.docId() == docid
@@ -6157,6 +6187,10 @@ public:
         }
       }
       return score;
+    }
+
+    bool usesTwoWayMergeForTests() const {
+      return twoWay;
     }
 
     int32_t advanceShallow(int32_t target) override {

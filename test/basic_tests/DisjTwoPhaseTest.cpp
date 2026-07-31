@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <limits>
@@ -38,6 +39,18 @@ struct DisjTwoPhaseGuard {
   }
 };
 
+struct TwoWayDisjGuard {
+  bool saved = BooleanQuery::DisjunctionScorer::disableTwoWayForTests;
+
+  explicit TwoWayDisjGuard(bool disabled) {
+    BooleanQuery::DisjunctionScorer::disableTwoWayForTests = disabled;
+  }
+
+  ~TwoWayDisjGuard() {
+    BooleanQuery::DisjunctionScorer::disableTwoWayForTests = saved;
+  }
+};
+
 struct SkipStatsGuard {
   bool saved = SkipStats::enabled;
 
@@ -56,6 +69,12 @@ struct SkipStatsGuard {
 
 class DisjTwoPhaseTest : public SoluxTest {
 public:
+  enum class Iteration {
+    NEXT,
+    ADVANCE,
+    MIXED,
+  };
+
   struct DirectRun {
     std::map<int32_t, float> scores;
     int64_t phraseVerifies = 0;
@@ -105,7 +124,7 @@ public:
     return run;
   }
 
-  DirectRun runStandalone(bool disabled) {
+  DirectRun runStandalone(bool disabled, Iteration iteration = Iteration::NEXT) {
     DisjTwoPhaseGuard disjGuard(disabled);
     SkipStatsGuard statsGuard;
     auto reader = helper.getIndexWriter()->getIndexReader();
@@ -125,10 +144,32 @@ public:
     }
     auto* scorer = pool.make<BooleanQuery::DisjunctionScorer>(pool, members);
     EXPECT_EQ(!disabled, scorer->hasTwoPhase());
+    EXPECT_EQ(!BooleanQuery::DisjunctionScorer::disableTwoWayForTests,
+              scorer->usesTwoWayMergeForTests());
 
     DirectRun run;
-    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    if (iteration == Iteration::ADVANCE) {
+      constexpr std::array<int32_t, 5> targets = {0, 1, 2, 4, 15};
+      for (int32_t target : targets) {
+        int32_t doc = scorer->advance(target);
+        if (doc == PostingsReader::END) {
+          break;
+        }
+        run.scores.emplace(doc, scorer->score());
+      }
+    } else if (iteration == Iteration::MIXED) {
+      int32_t doc = scorer->next();
       run.scores.emplace(doc, scorer->score());
+      doc = scorer->advance(2);
+      run.scores.emplace(doc, scorer->score());
+      doc = scorer->next();
+      run.scores.emplace(doc, scorer->score());
+      EXPECT_EQ(PostingsReader::END, scorer->advance(15));
+    } else {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END;
+           doc = scorer->next()) {
+        run.scores.emplace(doc, scorer->score());
+      }
     }
     run.phraseVerifies = SkipStats::phraseVerifies;
     return run;
@@ -317,6 +358,38 @@ TEST_F(DisjTwoPhaseTest, standaloneSelfDrivesAndScoresEveryConfirmedMember) {
   EXPECT_EQ((std::set<int32_t>{0, 1, 3, 4}), docsOf(deferred));
   EXPECT_EQ(4, deferred.phraseVerifies);
   EXPECT_EQ(eager.phraseVerifies, deferred.phraseVerifies);
+}
+
+TEST_F(DisjTwoPhaseTest, twoWayMergeMatchesGenericHeapForNextAndAdvance) {
+  for (bool disableTwoPhase : {false, true}) {
+    DirectRun directNext;
+    DirectRun directAdvance;
+    DirectRun directMixed;
+    {
+      TwoWayDisjGuard guard(false);
+      directNext = runStandalone(disableTwoPhase);
+      directAdvance = runStandalone(disableTwoPhase, Iteration::ADVANCE);
+      directMixed = runStandalone(disableTwoPhase, Iteration::MIXED);
+    }
+
+    DirectRun genericNext;
+    DirectRun genericAdvance;
+    DirectRun genericMixed;
+    {
+      TwoWayDisjGuard guard(true);
+      genericNext = runStandalone(disableTwoPhase);
+      genericAdvance = runStandalone(disableTwoPhase, Iteration::ADVANCE);
+      genericMixed = runStandalone(disableTwoPhase, Iteration::MIXED);
+    }
+
+    EXPECT_EQ(genericNext.scores, directNext.scores);
+    EXPECT_EQ(genericAdvance.scores, directAdvance.scores);
+    EXPECT_EQ(genericMixed.scores, directMixed.scores);
+    EXPECT_EQ(directNext.scores, directAdvance.scores);
+    EXPECT_EQ(genericNext.phraseVerifies, directNext.phraseVerifies);
+    EXPECT_EQ(genericAdvance.phraseVerifies, directAdvance.phraseVerifies);
+    EXPECT_EQ(genericMixed.phraseVerifies, directMixed.phraseVerifies);
+  }
 }
 
 TEST_F(DisjTwoPhaseTest, conjunctionDefersPhraseVerificationUntilAlignment) {
