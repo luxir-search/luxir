@@ -4057,20 +4057,28 @@ public:
     // override remains only as an experiment knob; do not re-enable without
     // a mechanism change that removes per-probe cost itself.
     static constexpr int32_t kTermLeadLeapfrogThreshold = 0;
-    // Direct-term tails benefit from sparse filter-led iteration sooner than
-    // disjunction groups. This bar applies only when a DocSet leads and every
-    // remaining clause is a direct term; other conjunctions retain /512.
-    static constexpr int32_t kDocSetTermDenseThresholdInverse = 128;
+    // Direct-term or DocSet tails benefit from sparse lead iteration sooner
+    // regardless of lead type. On the 5M corpus, journalist-filtered, cached,
+    // and unfiltered COUNT sweeps (2026-07-30) put the knee between /128 and
+    // /64; /128 avoids the all-dense regressions seen at /64. Disjunction-
+    // group tails and scored construction retain /512. TOP_100_COUNT was flat
+    // (1.001) under /128, but other scored classes are unmeasured; revisit
+    // the scored bar only with broader data.
+    static constexpr int32_t kTermTailDenseThresholdInverse = 128;
     // Cached-DocSet conjunction batches below the existing /128 dense-count
     // knee. Measured on the 5M/300-intersection asteroid COUNT cohort:
     // 128=40.77 ms, 512=40.41, 1024=39.66, 4096=40.48.
     // Journalist exact-scored one-term TOP_100_COUNT was flat at 3.12-3.18 ms
     // across the same sizes, so use the count knee for both routes.
     static constexpr int32_t kFilteredConjunctionBatchSize = 1024;
-    static inline int32_t denseThresholdInverseForTests =
-        kDenseThresholdInverse;
-    static inline int32_t denseLeapfrogThresholdForTests =
-        kDenseLeapfrogThreshold;
+    static inline int32_t denseThresholdInverseForTests = [] {
+      const char* value = std::getenv("SOLUX_DENSE_THRESHOLD_INVERSE");
+      return value != nullptr ? std::atoi(value) : kDenseThresholdInverse;
+    }();
+    static inline int32_t denseLeapfrogThresholdForTests = [] {
+      const char* value = std::getenv("SOLUX_DENSE_LEAPFROG_THRESHOLD");
+      return value != nullptr ? std::atoi(value) : kDenseLeapfrogThreshold;
+    }();
     static inline int32_t docSetLeadLeapfrogThresholdForTests =
         kDocSetLeadLeapfrogThreshold;
     static inline int32_t termLeadLeapfrogThresholdForTests = [] {
@@ -4078,8 +4086,12 @@ public:
           std::getenv("SOLUX_TERM_LEAD_LEAPFROG_THRESHOLD");
       return value != nullptr ? std::atoi(value) : kTermLeadLeapfrogThreshold;
     }();
-    static inline int32_t docSetTermDenseThresholdInverseForTests =
-        kDocSetTermDenseThresholdInverse;
+    static inline int32_t termTailDenseThresholdInverseForTests = [] {
+      const char* value =
+          std::getenv("SOLUX_TERM_TAIL_DENSE_THRESHOLD_INVERSE");
+      return value != nullptr
+          ? std::atoi(value) : kTermTailDenseThresholdInverse;
+    }();
     static inline int32_t filteredConjunctionBatchSizeForTests =
         kFilteredConjunctionBatchSize;
     static inline bool disableDisjGroupBulkForTests = false;
@@ -4149,6 +4161,7 @@ public:
     bool denseCountPath = false;
     bool countLeadIsDocSet = false;
     bool termTailScorers = false;
+    bool sparseEligibleTails = false;
     bool denseScoredEligible = false;
     bool denseScoredCostRejected = false;
     bool competitivePruning = true;
@@ -5602,6 +5615,7 @@ public:
       std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
       allTermScorers = true;
       termTailScorers = scorers.size() > 1;
+      sparseEligibleTails = scorers.size() > 1;
       allTermClauses = true;
       allDenseClauses = true;
       bool hasDirectDenseClause = false;
@@ -5639,6 +5653,8 @@ public:
         allTermScorers &= termScorers[i] != nullptr;
         if (i > 0) {
           termTailScorers &= termScorers[i] != nullptr;
+          sparseEligibleTails &= termScorers[i] != nullptr
+              || denseClauses[i].docSet != nullptr;
         }
         if (termScorers[i] != nullptr) {
           termClauses[i].members = scorers.subspan(i, 1);
@@ -5698,8 +5714,8 @@ public:
       }
       negatedCountPath = !prohibitedScorers.empty();
       int32_t denseThresholdInverse =
-          countLeadIsDocSet && termTailScorers
-          ? docSetTermDenseThresholdInverseForTests
+          !scoredConstruction && sparseEligibleTails
+          ? termTailDenseThresholdInverseForTests
           : denseThresholdInverseForTests;
       denseCountPath = allDenseClauses && allDenseProhibited
           && maxDoc >= kWindowSize

@@ -1490,7 +1490,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
         "filter_w", selected ? "selected" : "other"));
   }
   ASSERT_GT(filterCard, nDocs / BooleanQuery::ConjunctionBulkScorer::
-      kDocSetTermDenseThresholdInverse);
+      kTermTailDenseThresholdInverse);
   ASSERT_LE(filterCard, DocSetBuilder::arrayLimitFor(nDocs));
   auto indexed = helper.indexAll(docs, UpdateMessage::COMMIT);
   ASSERT_TRUE(indexed.success) << indexed.error_message;
@@ -1555,7 +1555,7 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
         "filter_w", selected ? "selected" : "other"));
   }
   ASSERT_LT(filterCard, nDocs / BooleanQuery::ConjunctionBulkScorer::
-      kDocSetTermDenseThresholdInverse);
+      kTermTailDenseThresholdInverse);
   auto indexed = helper.indexAll(docs, UpdateMessage::COMMIT);
   ASSERT_TRUE(indexed.success) << indexed.error_message;
 
