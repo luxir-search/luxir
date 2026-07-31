@@ -4,6 +4,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "solux/search/DocSet.h"
 #include "solux/search/SearchRequest.h"
 #include "solux/util/thread.h"
 
@@ -183,32 +184,34 @@ public:
       return parent;
     }
 
-    // If domain==nullptr, then the domain consists of all documents in the segment.
+    // If domain.get()==nullptr, then the domain consists of all documents in
+    // the segment. Non-null domains crossing this boundary carry their
+    // lifetime with them.
     // if segnum == -1, then this is called not for a specific segment, but for the whole index.
     // segnum=-1 is also used for an empty index reader (no segments).
-    virtual void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) = 0;
+    virtual void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+                      DomainHandle domain) = 0;
 
     // Whole-index delivery. domains[i] is the domain for reader segment i;
     // an empty span represents an empty index. The default implementation
     // fans out the existing per-segment contract, while calculators that need
     // an index-wide view can plan directly from the complete input.
     //
-    // The span storage is borrowed only for this call, but until DomainHandle
-    // replaces this temporary raw-pointer contract, each domain must remain
-    // live until work submitted to tg completes. Async work captures the
-    // individual domain pointers, never the span.
+    // The span storage is borrowed only for this call. Async work copies the
+    // individual handles, never the span.
     virtual void calcAll(oneapi::tbb::task_group* tg,
-                         std::span<DocSet* const> domains) {
+                         std::span<const DomainHandle> domains) {
       assert(domains.size() == op.req.reader->segments().size());
       if (domains.empty()) {
-        calc(tg, -1, nullptr);
+        calc(tg, -1, {});
         return;
       }
       // task_group runs locally submitted tasks from a stack. Ascending
       // submission lets later segments, which are typically smaller, begin
       // on this thread first while earlier segments are available to steal.
       for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
-        DocSet* domain = domains[(size_t)segnum];
+        DomainHandle domain = domains[(size_t)segnum];
+        assert(domain.isDeliverable());
         task_group_run(tg, [this, tg, segnum, domain]() {
           calc(tg, segnum, domain);
         });
@@ -226,7 +229,8 @@ public:
     }
 
     solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override { return nullptr; }
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};
     virtual int insert(void* entry, int32_t docid, int space) = 0;

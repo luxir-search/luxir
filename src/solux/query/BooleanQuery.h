@@ -1995,7 +1995,7 @@ public:
       std::vector<uint8_t> mandatoryScores;
       std::vector<QueryPrep::PreparedSource> optionalSources;
       std::vector<QueryPrep::PreparedSource> prohibitedSources;
-      std::vector<QueryPrep::MaterializedFilter> filterDomains;
+      std::vector<DomainHandle> filterDomains;
       bool hasFilters = false;
       int minShouldMatch = 0;
       bool needsScores = false;
@@ -2006,7 +2006,7 @@ public:
                             std::span<const uint8_t> mandatoryScores,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
                             std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
-                            std::vector<QueryPrep::MaterializedFilter>&& filterDomains,
+                            std::vector<DomainHandle>&& filterDomains,
                             bool hasFilters, int minShouldMatch, bool needsScores,
                             bool allowsPruning)
         : mandatorySources(std::move(mandatorySources)),
@@ -2177,7 +2177,7 @@ public:
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       auto filterSources = QueryPrep::prepareFilterSources(
           filterWeights, filterUses, ctx);
-      std::vector<QueryPrep::MaterializedFilter> filterDomains(
+      std::vector<DomainHandle> filterDomains(
           ctx.reader.segments().size());
       std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
 
@@ -2187,6 +2187,8 @@ public:
           filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
             QueryPrep::preparedSpan(filterSources), ctx.reader,
             ctx.reader.segments()[segnum], outerDomain);
+          filterDomains[segnum] = std::move(filterDomains[segnum])
+              .pinnedWith(context.filterUses);
           childDomainPtrs[segnum] = filterDomains[segnum].get();
         }
       } else {

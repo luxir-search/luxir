@@ -259,7 +259,10 @@ public:
     solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       return nullptr;
     };
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domainHandle) override {
+      assert(domainHandle.isDeliverable());
+      DocSet* domain = domainHandle.get();
       if (segnum == -1) {
         driver.completeEmpty();  // empty index -> empty result
         return;
@@ -372,7 +375,10 @@ public:
     solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       return nullptr;
     };
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domainHandle) override {
+      assert(domainHandle.isDeliverable());
+      DocSet* domain = domainHandle.get();
       if (segnum == -1) {
         driver.completeEmpty();  // empty index -> empty result
         return;
@@ -501,7 +507,10 @@ public:
     solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       return nullptr;
     };
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domainHandle) override {
+      assert(domainHandle.isDeliverable());
+      DocSet* domain = domainHandle.get();
       if (segnum == -1) {
         driver.completeEmpty();
         return;

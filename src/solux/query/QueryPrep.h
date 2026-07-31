@@ -729,26 +729,6 @@ inline std::vector<PreparedSource> prepareFilterSources(
   return out;
 }
 
-// An effective filter may borrow request-pinned cache state or own a freshly
-// materialized/domain-composed set. Callers keep this handle, not a naked
-// pointer, whenever the result must survive the current stack frame.
-class MaterializedFilter {
-  std::unique_ptr<DocSet> owned;
-  DocSet* borrowed = nullptr;
-
-public:
-  MaterializedFilter() = default;
-  explicit MaterializedFilter(std::unique_ptr<DocSet> docs)
-    : owned(std::move(docs)) {}
-  explicit MaterializedFilter(DocSet* docs) : borrowed(docs) {}
-  MaterializedFilter(MaterializedFilter&&) noexcept = default;
-  MaterializedFilter& operator=(MaterializedFilter&&) noexcept = default;
-  MaterializedFilter(const MaterializedFilter&) = delete;
-  MaterializedFilter& operator=(const MaterializedFilter&) = delete;
-
-  DocSet* get() const { return owned != nullptr ? owned.get() : borrowed; }
-};
-
 inline std::unique_ptr<DocSet> materializeRawFilter(
     Query::Weight& weight, Query::Weight::PreparedWeight* prepared,
     IndexReader::Segment& segment) {
@@ -889,7 +869,7 @@ struct ExactDomainSource {
 
 struct ExactDomainResult {
   bool available = false;
-  MaterializedFilter docs;
+  DomainHandle docs;
 };
 
 // Try the separable exact-DocSet route for one segment. At the root, the
@@ -901,7 +881,7 @@ inline ExactDomainResult tryExactDomain(
     MemPool& targetPool, std::span<const ExactDomainSource> sources,
     IndexReader& reader, IndexReader::Segment& segment, DocSet* domain) {
   if (domain != nullptr && domain->card() == 0) {
-    return {true, MaterializedFilter(domain)};
+    return {true, DomainHandle::borrowed(domain)};
   }
 
   std::vector<DocSet*> sets;
@@ -948,18 +928,18 @@ inline ExactDomainResult tryExactDomain(
 
     if (matchesNone) {
       DocSetBuilder empty(segment.maxDoc());
-      return {true, MaterializedFilter(empty.build())};
+      return {true, DomainHandle(empty.build())};
     }
     sets.push_back(exact);
   }
   if (!allAvailable) return {};
   if (domain != nullptr) sets.push_back(domain);
 
-  if (sets.empty()) return {true, MaterializedFilter()};
+  if (sets.empty()) return {true, DomainHandle()};
   if (sets.size() == 1) {
-    return {true, MaterializedFilter(sets[0])};
+    return {true, DomainHandle::borrowed(sets[0])};
   }
-  return {true, MaterializedFilter(DocSet::intersect(sets))};
+  return {true, DomainHandle(DocSet::intersect(sets))};
 }
 
 class ExactDomainPlan {
@@ -980,7 +960,7 @@ public:
   }
 };
 
-inline MaterializedFilter materializeEffectiveFilter(
+inline DomainHandle materializeEffectiveFilter(
     const PreparedSource& source, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {
   auto& weight = *source.weight;
@@ -992,7 +972,7 @@ inline MaterializedFilter materializeEffectiveFilter(
     use = nullptr;
   }
   if (use == nullptr) {
-    return MaterializedFilter(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain));
   }
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
@@ -1000,14 +980,14 @@ inline MaterializedFilter materializeEffectiveFilter(
       DocSet* canonical = segment.liveDocs() == nullptr
           ? nullptr : &segment.liveDocs()->docset();
       assert(domain == nullptr || domain == canonical);
-      return MaterializedFilter(cached->docSet(segment));
+      return DomainHandle::borrowed(cached->docSet(segment));
     }
-    return MaterializedFilter(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain));
   }
 
   auto probe = use->probe((size_t) segment.ord);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    return MaterializedFilter(use->effectiveDocSet(
+    return DomainHandle::borrowed(use->effectiveDocSet(
         (size_t) segment.ord, reader, domain));
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
@@ -1027,25 +1007,25 @@ inline MaterializedFilter materializeEffectiveFilter(
       use->offerRaw(
           (size_t) segment.ord, std::move(raw), buildCostMicros);
       DocSet* docs = use->effectiveDocSet((size_t) segment.ord, reader);
-      return MaterializedFilter(docs);
+      return DomainHandle::borrowed(docs);
     }
     if (!disableFilterOwnForTests
         && !weight.needsScores() && !weight.allowsPruning()) {
       auto raw = materializeRawFilter(weight, prepared, segment);
       use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
-      return MaterializedFilter(use->effectiveDocSet(
+      return DomainHandle::borrowed(use->effectiveDocSet(
           (size_t) segment.ord, reader, domain));
     }
-    return MaterializedFilter(
+    return DomainHandle(
         materialize(weight, prepared, segment, domain));
   }
 
   DocSet* effective = use->effectiveDocSet(
       (size_t) segment.ord, reader, domain);
-  return MaterializedFilter(effective);
+  return DomainHandle::borrowed(effective);
 }
 
-inline MaterializedFilter materializeEffectiveFilter(
+inline DomainHandle materializeEffectiveFilter(
     Query::Weight& weight, FilterCache::Use* use, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {
   PreparedSource source;
@@ -1077,10 +1057,10 @@ inline std::unique_ptr<DocSet> materializeIntersection(std::span<const PreparedS
   return intersectOwned(sets);
 }
 
-inline MaterializedFilter materializeEffectiveIntersection(
+inline DomainHandle materializeEffectiveIntersection(
     std::span<const PreparedSource> sources, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {
-  std::vector<MaterializedFilter> sets;
+  std::vector<DomainHandle> sets;
   std::vector<DocSet*> ptrs;
   sets.reserve(sources.size());
   ptrs.reserve(sources.size());
@@ -1091,7 +1071,7 @@ inline MaterializedFilter materializeEffectiveIntersection(
   }
   if (ptrs.empty()) return {};
   if (ptrs.size() == 1) return std::move(sets[0]);
-  return MaterializedFilter(DocSet::intersect(ptrs));
+  return DomainHandle(DocSet::intersect(ptrs));
 }
 
 } // namespace solux::QueryPrep

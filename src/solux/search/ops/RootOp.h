@@ -22,7 +22,7 @@ public:
 
     void calc(
         oneapi::tbb::task_group* tg, int32_t segnum,
-        solux::DocSet* domain) override {
+        DomainHandle domain) override {
       unused(tg);
       unused(segnum);
       unused(domain);
@@ -32,7 +32,7 @@ public:
 
     void calcAll(
         oneapi::tbb::task_group* tg,
-        std::span<DocSet* const> domains) override {
+        std::span<const DomainHandle> domains) override {
       unused(tg);
       unused(domains);
       assert(false);
@@ -48,20 +48,19 @@ public:
       }
 
       const auto& segs = op.req.reader->segments();
-      std::vector<DocSet*> domains;
+      std::vector<DomainHandle> domains;
       domains.reserve(segs.size());
       for (auto& seg : segs) {
         // Start with live docs. This establishes the PrepareContext domain
         // contract (Query.h): a segment's domain, when present, is
         // live-filtered and is the complete eligibility predicate; null means
         // no deletes and no filters.
-        domains.push_back(
-            seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr);
+        auto* liveDocs = seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
+        domains.push_back(DomainHandle::pinned(liveDocs, op.req.reader));
       }
 
       for (auto& subCalc : subCalcs) {
-        subCalc->calcAll(
-            tg, std::span<DocSet* const>(domains.data(), domains.size()));
+        subCalc->calcAll(tg, domains);
       }
     }
   };

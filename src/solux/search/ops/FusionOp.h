@@ -97,11 +97,12 @@ public:
     std::vector<std::pair<segdoc, float>> fusedList;
 
     // Shared filter DocSet per segment, kept alive until fusion emits.
-    std::vector<QueryPrep::MaterializedFilter> segFilters;
+    std::vector<DomainHandle> segFilters;
 
     bool needsPrepare = false;
     std::atomic<int32_t> preparedDomainsSeen{0};
-    std::vector<DocSet*> baseDomains;
+    std::vector<DomainHandle> baseDomains;
+    std::vector<DocSet*> baseDomainViews;
     std::vector<QueryPrep::PreparedSource> preparedFilterSources;
 
     // Number of sources that have delivered their ranking.  When this hits
@@ -124,7 +125,8 @@ public:
         }
       }
       if (needsPrepare) {
-        baseDomains.assign(numSegs, nullptr);
+        baseDomains.resize(numSegs);
+        baseDomainViews.resize(numSegs);
       }
     }
 
@@ -140,7 +142,9 @@ public:
       return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domain) override {
+      assert(domain.isDeliverable());
       if (needsPrepare) {
         task_group_run(tg, [this, tg, segnum, domain]() {
           doPrepareDomain(tg, segnum, domain);
@@ -150,11 +154,11 @@ public:
       doCalc(tg, segnum, domain);
     }
 
-    QueryPrep::MaterializedFilter buildSharedFilter(int32_t segnum, DocSet* domain) {
+    DomainHandle buildSharedFilter(int32_t segnum, DocSet* domain) {
       auto& op = thisOp();
       if (op.filterWeights.empty()) return {};
 
-      std::vector<QueryPrep::MaterializedFilter> filterDocSets;
+      std::vector<DomainHandle> filterDocSets;
       std::vector<DocSet*> filterPtrs;
       filterDocSets.reserve(op.filterWeights.size());
       filterPtrs.reserve(op.filterWeights.size());
@@ -171,60 +175,70 @@ public:
         filterPtrs.push_back(filterDocSets.back().get());
       }
       if (filterPtrs.empty()) return {};
-      if (filterPtrs.size() == 1) return std::move(filterDocSets[0]);
-      return QueryPrep::MaterializedFilter(DocSet::intersect(filterPtrs));
+      if (filterPtrs.size() == 1) {
+        auto result = std::move(filterDocSets[0]);
+        assert(!op.sources.empty());
+        return std::move(result).pinnedWith(
+            op.sources.front()->qcontext.filterUses);
+      }
+      return DomainHandle(DocSet::intersect(filterPtrs));
     }
 
-    void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) {
+    void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum,
+                         DomainHandle domain) {
       auto& op = thisOp();
       if (segnum < 0) {
-        doCalc(tg, segnum, domain);
+        doCalc(tg, segnum, std::move(domain));
         return;
       }
 
-      baseDomains[(size_t)segnum] = domain;
+      baseDomains[(size_t)segnum] = std::move(domain);
+      baseDomainViews[(size_t)segnum] = baseDomains[(size_t)segnum].get();
       auto count = preparedDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
       if (count != (int32_t)op.req.reader->segments().size()) return;
 
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
-        std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
+        std::span<DocSet* const>(baseDomainViews.data(), baseDomainViews.size()),
         tg != nullptr
       };
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
 
       for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
-        segFilters[(size_t)i] = buildSharedFilter(i, baseDomains[(size_t)i]);
+        segFilters[(size_t)i] = buildSharedFilter(i, baseDomainViews[(size_t)i]);
       }
 
       for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
         task_group_run(tg, [this, tg, i]() {
-          dispatchSources(tg, i, segFilters[(size_t)i].get());
+          dispatchSources(tg, i, segFilters[(size_t)i]);
         });
       }
     }
 
-    void doCalc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) {
+    void doCalc(oneapi::tbb::task_group* tg, int32_t segnum,
+                DomainHandle domain) {
       auto& op = thisOp();
       if (segnum < 0) {
         // Empty-index case: hand each source a -1 dispatch so they fire
         // their rankingSink with a null collector.  Once all sources have
         // delivered, doFusion writes an empty DocList.
-        dispatchSources(tg, -1, nullptr);
+        dispatchSources(tg, -1, {});
         return;
       }
 
-      DocSet* sharedFilter = domain;
+      DomainHandle sharedFilter = std::move(domain);
       if (!op.filterWeights.empty()) {
-        segFilters[(size_t)segnum] = buildSharedFilter(segnum, domain);
-        sharedFilter = segFilters[segnum].get();
+        segFilters[(size_t)segnum] =
+            buildSharedFilter(segnum, sharedFilter.get());
+        sharedFilter = segFilters[segnum];
       }
 
-      dispatchSources(tg, segnum, sharedFilter);
+      dispatchSources(tg, segnum, std::move(sharedFilter));
     }
 
-    void dispatchSources(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* sharedFilter) {
+    void dispatchSources(oneapi::tbb::task_group* tg, int32_t segnum,
+                         DomainHandle sharedFilter) {
       // Dispatch each source's TopDocsReq::Calc::calc with the shared
       // filter as its domain.  The source will intersect with its own
       // filterWeights, collect top-K, and ultimately invoke rankingSink

@@ -16,6 +16,54 @@ public:
   }
 };
 
+class TrackingArrDocSet : public ArrDocSet {
+  bool& destroyed;
+
+public:
+  explicit TrackingArrDocSet(bool& destroyed)
+    : ArrDocSet(std::vector<int32_t>{2, 5}), destroyed(destroyed) {}
+
+  ~TrackingArrDocSet() override {
+    destroyed = true;
+  }
+};
+
+TEST_F(DocSetTest, domainHandleCopiesOwnTheirDocSet) {
+  bool destroyed = false;
+  DomainHandle copy;
+  {
+    DomainHandle original(
+        std::make_unique<TrackingArrDocSet>(destroyed));
+    ASSERT_TRUE(original.isDeliverable());
+    ASSERT_TRUE(original.get()->get(5));
+
+    copy = original;
+    original = {};
+    EXPECT_FALSE(destroyed);
+    EXPECT_TRUE(copy.get()->get(2));
+  }
+
+  EXPECT_FALSE(destroyed);
+  copy = {};
+  EXPECT_TRUE(destroyed);
+}
+
+TEST_F(DocSetTest, borrowedDomainRequiresPinBeforeDelivery) {
+  auto docs = std::make_shared<ArrDocSet>(std::vector<int32_t>{3});
+  std::weak_ptr<ArrDocSet> weak = docs;
+  auto borrowed = DomainHandle::borrowed(docs.get());
+  EXPECT_FALSE(borrowed.isDeliverable());
+
+  auto pinned = std::move(borrowed).pinnedWith(docs);
+  docs.reset();
+  EXPECT_TRUE(pinned.isDeliverable());
+  EXPECT_FALSE(weak.expired());
+  EXPECT_TRUE(pinned.get()->get(3));
+
+  pinned = {};
+  EXPECT_TRUE(weak.expired());
+}
+
 TEST_F(DocSetTest, unionTwoArrays) {
   ArrDocSet a({1, 3, 5, 7});
   ArrDocSet b({2, 3, 6, 7, 9});

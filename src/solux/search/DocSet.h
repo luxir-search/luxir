@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 #include <span>
@@ -60,6 +61,56 @@ public:
   static std::unique_ptr<DocSet> union_(std::span<DocSet*> sets);
 
   virtual ~DocSet() = default;
+};
+
+// Copyable domain delivery handle. The DocSet view may be null to represent
+// every document in a segment. A deliverable non-null view carries an erased
+// ownership pin that keeps its storage alive. borrowed() creates a temporary
+// non-deliverable result that must be promoted with pinnedWith().
+class DomainHandle {
+  DocSet* docs = nullptr;
+  std::shared_ptr<const void> lifetime;
+
+  DomainHandle(DocSet* docs, std::shared_ptr<const void> lifetime)
+    : docs(docs), lifetime(std::move(lifetime)) {}
+
+public:
+  DomainHandle() = default;
+
+  explicit DomainHandle(std::unique_ptr<DocSet> docs) {
+    std::shared_ptr<DocSet> owner(std::move(docs));
+    this->docs = owner.get();
+    lifetime = std::move(owner);
+  }
+
+  static DomainHandle borrowed(DocSet* docs) {
+    return DomainHandle(docs, nullptr);
+  }
+
+  template <typename T>
+  static DomainHandle pinned(DocSet* docs, std::shared_ptr<T> lifetime) {
+    if (docs == nullptr) return {};
+    if (lifetime == nullptr) {
+      throw std::invalid_argument("non-null domain requires a lifetime pin");
+    }
+    return DomainHandle(docs, std::move(lifetime));
+  }
+
+  // Attach an existing storage owner before a borrowed handle crosses an
+  // async delivery boundary. Owned handles already have the more precise pin
+  // and are left unchanged.
+  template <typename T>
+  DomainHandle pinnedWith(std::shared_ptr<T> owner) && {
+    if (docs == nullptr || lifetime != nullptr) return std::move(*this);
+    if (owner == nullptr) {
+      throw std::invalid_argument("borrowed domain requires a lifetime pin");
+    }
+    lifetime = std::move(owner);
+    return std::move(*this);
+  }
+
+  DocSet* get() const { return docs; }
+  bool isDeliverable() const { return docs == nullptr || lifetime != nullptr; }
 };
 
 /// non-owning BitDocSet

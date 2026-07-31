@@ -344,7 +344,7 @@ public:
     static constexpr double COMPLEMENT_MARGIN = 0.9;
 
     ExecutionProfileRun* profileRun;
-    std::vector<DocSet*> input;
+    std::vector<DomainHandle> input;
     std::vector<uint8_t> topTermsSegments;
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
@@ -390,7 +390,8 @@ public:
       return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
       //TODO: need to account for slot somehow,  or will subop do that?
     };
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domainHandle) override {
       // Sub-op task launching is not wired up yet (doSubops runs sub-calcs
       // inline with a null tg), so the per-segment work needs no task group.
       unused(tg);
@@ -399,6 +400,10 @@ public:
         driver.completeEmpty();
         return;
       }
+
+      assert(domainHandle.isDeliverable());
+      DocSet* domain = domainHandle.get();
+      input[(size_t)segnum] = std::move(domainHandle);
 
       if (profileRun != nullptr) {
         auto profile = profilePiece(profileRun, segnum);
@@ -425,7 +430,6 @@ public:
         for (auto* calc : data.inlineCalcs) {
           calc->startSeg(segnum);
         }
-        input[segnum] = domain;
         SegFieldInfo segFieldInfo;
         PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
@@ -473,7 +477,6 @@ public:
                       ExecutionProfilePieceState* profile,
                       bool allowTopTerms) {
         //write only to different slots, so no need to synchronize
-        input[segnum] = domain;
         SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
@@ -1257,11 +1260,6 @@ public:
       }
       int64_t slotNum = 0;
       for (auto [key, val] : valVec) {
-        // Prepared children retain each segment pointer until the last calc.
-        // A null task group runs that completion inline, so this bucket scope
-        // keeps every domain live through the last return.
-        std::vector<std::unique_ptr<DocSet>> bucketDomains;
-        bucketDomains.reserve(input.size());
         std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
         calculators.reserve(opers.size());
         for (auto& [name, subOp] : opers) {
@@ -1283,7 +1281,7 @@ public:
               int32_t docFreq = tenum.docFreq();
               DocsOnlyEnum denum(tenum);
               bucketDomain = materializePostingsIntersection(
-                  denum, docFreq, input[segnum], maxDoc);
+                  denum, docFreq, input[segnum].get(), maxDoc);
             }
           }
           // Always pass a (possibly empty) bucket domain.  A null domain means
@@ -1294,13 +1292,12 @@ public:
             DocSetBuilder empty(maxDoc);
             bucketDomain = empty.build();
           }
-          bucketDomains.push_back(std::move(bucketDomain));
-          DocSet* bucketDomainPtr = bucketDomains.back().get();
+          DomainHandle bucketDomainHandle(std::move(bucketDomain));
           for (auto& subCalc : calculators) {
             //subCalc->calc(tg, segnum, &output);
             // no support for subcalcs launching tasks yet
 
-            subCalc->calc(nullptr, segnum, bucketDomainPtr);
+            subCalc->calc(nullptr, segnum, bucketDomainHandle);
           }
         }
         slotNum++;
