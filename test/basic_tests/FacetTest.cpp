@@ -166,7 +166,69 @@ public:
   }
 };
 
+class FacetFeedStrategyGuard {
+  FacetFeedStrategy saved = forcedFacetFeedStrategy;
+public:
+  ~FacetFeedStrategyGuard() {
+    forcedFacetFeedStrategy = saved;
+  }
+};
+
 } // namespace
+
+TEST_F(FacetTest, stringFacetCountPlanSelectsAndForcesLegalOffers) {
+  StrFacetCountInputs in{
+      .maxDoc = 1000,
+      .domainCardinality = 1000,
+      .complementCardinality = 0,
+      .segmentTerms = 10,
+      .sumDocFreq = 1000,
+      .docsWithField = 1000,
+      .limit = 3,
+      .topTermsAvailable = 10,
+      .domainHasBitset = false,
+      .missingRequested = false,
+      .allowTopTerms = true,
+      .hasGlobalOrdMap = true,
+      .readerHasNoDeletes = true
+  };
+
+  EXPECT_EQ(StrFacetCountKind::TOP_TERMS,
+            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+  EXPECT_EQ(StrFacetCountKind::TOP_TERMS,
+            StrFacetCountPlan::select(
+                in, StrFacetStrategy::TOP_TERMS).strategy);
+  EXPECT_EQ(StrFacetCountKind::COLUMN_DOMAIN,
+            StrFacetCountPlan::select(
+                in, StrFacetStrategy::COLUMN_DOMAIN).strategy);
+
+  in.allowTopTerms = false;
+  auto topFallback =
+      StrFacetCountPlan::select(in, StrFacetStrategy::TOP_TERMS);
+  EXPECT_EQ(StrFacetCountKind::COLUMN_DOMAIN, topFallback.strategy);
+  EXPECT_FALSE(topFallback.forcedFallback.empty());
+  EXPECT_EQ(StrFacetCountKind::COLUMN_COMPLEMENT,
+            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+
+  in.domainCardinality = 990;
+  in.complementCardinality = 10;
+  in.domainHasBitset = true;
+  EXPECT_EQ(StrFacetCountKind::COLUMN_COMPLEMENT,
+            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+
+  in.domainCardinality = 500;
+  in.complementCardinality = 500;
+  in.segmentTerms = 1;
+  in.sumDocFreq = 1;
+  EXPECT_EQ(StrFacetCountKind::TERM_DRIVEN,
+            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+
+  in.segmentTerms = 0;
+  auto complementFallback =
+      StrFacetCountPlan::select(in, StrFacetStrategy::COLUMN_COMPLEMENT);
+  EXPECT_EQ(StrFacetCountKind::COLUMN_DOMAIN, complementFallback.strategy);
+  EXPECT_FALSE(complementFallback.forcedFallback.empty());
+}
 
 TEST_F(FacetTest, spanCounter) {
   constexpr size_t maxOrd = 200000;
@@ -2431,8 +2493,8 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
 }
 
 // A facet sub-op (avg) must not be polluted by a segment that lacks the facet
-// field: the bucket has no docs there. Regression for doSubops passing a null
-// (== all-docs) domain when the field/value is absent in a segment.
+// field: the bucket has no docs there. Regression for bucket-domain execution
+// passing a null (== all-docs) domain when the field/value is absent.
 TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   CollectionHelper helper;
   // seg1 has cat_s; seg2 has NO cat_s at all (only avgval).
@@ -2544,6 +2606,45 @@ TEST_F(FacetTest, nestedStringFacet) {
   ASSERT_EQ(1, (int)sfyIds.v.size()) << req->toString();
   EXPECT_EQ("p", sfyIds.v[0]);
   EXPECT_EQ(1, sfy.counts[0]);
+}
+
+TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "1", "cat_s", "a", "sub_s", "x", "metric_i", 10),
+      flatdoc("id", "2", "cat_s", "a", "sub_s", "y", "metric_i", 20),
+      flatdoc("id", "3", "cat_s", "b", "sub_s", "x", "metric_i", 30),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "4", "cat_s", "a", "sub_s", "x", "metric_i", 40),
+      flatdoc("id", "5", "cat_s", "b", "sub_s", "z", "metric_i", 50),
+      flatdoc("id", "6", "cat_s", "c", "sub_s", "x", "metric_i", 60),
+  }, UpdateMessage::COMMIT).success);
+
+  StrFacetStrategyGuard countGuard;
+  FacetFeedStrategyGuard feedGuard;
+  auto run = [&](StrFacetStrategy countStrategy,
+                 FacetFeedStrategy feedStrategy) {
+    forcedStrFacetStrategy = countStrategy;
+    forcedFacetFeedStrategy = feedStrategy;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& facet = req->facet("f", "cat_s").limit(2);
+    facet.avg("avg", "metric_i");
+    facet.facet("sub", "sub_s").limit(2);
+    facet.topDocs("docs").allQuery().fields({"id"}).getNumber().limit(-1);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return encodeFacetResult(*req, "f");
+  };
+
+  auto expected = run(
+      StrFacetStrategy::COLUMN_DOMAIN, FacetFeedStrategy::AUTO);
+  EXPECT_EQ(expected, run(
+      StrFacetStrategy::TOP_TERMS, FacetFeedStrategy::AUTO));
+  EXPECT_EQ(expected, run(
+      StrFacetStrategy::COLUMN_DOMAIN,
+      FacetFeedStrategy::BUCKET_DOMAINS));
 }
 
 //
@@ -3680,6 +3781,7 @@ TEST_F(RandomFacetTest, randomFaceting) {
   StrFacetStrategyGuard guard;
   for (StrFacetStrategy strategy : {
       StrFacetStrategy::AUTO,
+      StrFacetStrategy::TOP_TERMS,
       StrFacetStrategy::COLUMN_DOMAIN,
       StrFacetStrategy::COLUMN_COMPLEMENT,
       StrFacetStrategy::TERM_DRIVEN}) {

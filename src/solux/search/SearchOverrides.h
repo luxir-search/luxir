@@ -46,10 +46,17 @@ enum class StrFacetStrategy {
   AUTO, TOP_TERMS, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
 };
 
+enum class FacetFeedStrategy {
+  AUTO, BUCKET_DOMAINS
+};
+
 inline StrFacetStrategy parseStrFacetStrategyEnv() {
   const char* e = std::getenv("SOLUX_FACET_STRATEGY");
   if (e != nullptr) {
     std::string_view s(e);
+    if (s == "top_terms") {
+      return StrFacetStrategy::TOP_TERMS;
+    }
     if (s == "column") {
       return StrFacetStrategy::COLUMN_DOMAIN;
     }
@@ -61,6 +68,16 @@ inline StrFacetStrategy parseStrFacetStrategyEnv() {
     }
   }
   return StrFacetStrategy::AUTO;
+}
+
+inline FacetFeedStrategy parseFacetFeedStrategyEnv() {
+  // Facet feed overrides are planner A/B controls. Keep accepted values tied
+  // to executable feeds rather than advertising planned implementations.
+  const char* e = std::getenv("SOLUX_FACET_FEED");
+  if (e != nullptr && std::string_view(e) == "bucket_domains") {
+    return FacetFeedStrategy::BUCKET_DOMAINS;
+  }
+  return FacetFeedStrategy::AUTO;
 }
 
 // The SPAN_* modes drive the dedicated sparse fork; everything else runs the
@@ -108,5 +125,6 @@ inline FacetCounterMode parseFacetCounterModeEnv() {
 
 inline FacetCounterMode forcedFacetCounterMode = parseFacetCounterModeEnv();
 inline StrFacetStrategy forcedStrFacetStrategy = parseStrFacetStrategyEnv();
+inline FacetFeedStrategy forcedFacetFeedStrategy = parseFacetFeedStrategyEnv();
 
 } // namespace solux

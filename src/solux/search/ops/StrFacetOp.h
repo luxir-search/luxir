@@ -7,10 +7,12 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include "FacetEmit.h"
+#include "FacetExecution.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
 #include "solux/search/SearchOverrides.h"
 #include "SpanCounter.h"
+#include "StrFacetPlanning.h"
 #include "solux/util/SegmentMergeDriver.h"
 #include "solux/util/log.h"
 
@@ -328,21 +330,6 @@ public:
   }
 
   class Calc : public Calculator {
-    // Column-read-equivalents, fit to the forced-strategy facet grid
-    // (single-segment, sel {10,50,90,99} x realized cardinality 10..1.84M)
-    // with the measured counter-rep thresholds in place - the strategies must
-    // be compared under the reps each would actually run with. DF_COST covers
-    // the per-term docFreq walk plus the local->global drain.
-    static constexpr double DF_COST = 2.25;
-    static constexpr double POSTINGS_SETUP_COST = 30.0;
-    static constexpr double POSTINGS_ADVANCE_COST = 4.0;
-    // Complement must beat column by a margin, not a hair: near-tie picks
-    // (a 50.04% filter with a small term count) measured 5-24% slower than
-    // column under load, while every genuine complement win clears this by
-    // 10x. The margin only exists to keep coin-toss cells on the column
-    // side, where the docFreq walk and staging buy nothing.
-    static constexpr double COMPLEMENT_MARGIN = 0.9;
-
     ExecutionProfileRun* profileRun;
     std::vector<DomainHandle> input;
     std::vector<uint8_t> topTermsSegments;
@@ -382,7 +369,7 @@ public:
           || std::holds_alternative<std::monostate>(ourVal->kind)));
       auto& fr = oneofMut<solux::api::FacetResult>(*ourVal);
       // Cap = max distinct sub-op Vals written into this FacetResult's ops map.
-      // Both post sub-ops (doSubops, from subOps) and inline calculators
+      // Both post-selection sub-ops (from subOps) and inline calculators
       // (fillResult, from inlineSubOps) bubble through here, and the two sets are
       // disjoint (init() moves inline ops out of subOps), so the backing array
       // must be sized for their sum or opsSlot's pre-sized array overflows.
@@ -392,8 +379,8 @@ public:
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
-      // Sub-op task launching is not wired up yet (doSubops runs sub-calcs
-      // inline with a null tg), so the per-segment work needs no task group.
+      // Result-child execution is synchronous under the bucket-domain stage,
+      // so the per-segment parent count needs no task group.
       unused(tg);
       if (segnum == -1) {
         // Empty index - emit an empty (non-inline) result, matching prior behavior.
@@ -516,74 +503,28 @@ public:
         };
 
         DomainView domainView(domain, maxDoc);
-        bool termsAvailable = segFieldInfo.nTerms > 0;
-        double columnCost = (double)domainView.card;
-        double complementCost = std::numeric_limits<double>::infinity();
-        double termCost = std::numeric_limits<double>::infinity();
-        if (termsAvailable) {
-          // Bitset domains walk the complement through an inverted word view;
-          // only array domains pay a dense complement-bitset build.
-          complementCost = (double)domainView.compCard
-              + (double)segFieldInfo.nTerms * DF_COST
-              + (domainView.bits != nullptr
-                     ? 0.0 : (double)FixedBitSet::sizeInWords(maxDoc));
-          int32_t advanceSide = domainView.bits != nullptr
-              ? std::min(domainView.card, domainView.compCard)
-              : domainView.card;
-          termCost = (double)segFieldInfo.nTerms * POSTINGS_SETUP_COST
-              + std::min((double)segFieldInfo.sumDocFreq,
-                         (double)segFieldInfo.nTerms
-                             * POSTINGS_ADVANCE_COST * (double)advanceSide);
-          if (thisOp().missing && segFieldInfo.docsWithField != maxDoc) {
-            termCost += (double)segFieldInfo.docsWithField;
-          }
-        }
+        auto countPlan = StrFacetCountPlan::select(
+            StrFacetCountInputs{
+                .maxDoc = maxDoc,
+                .domainCardinality = domainView.card,
+                .complementCardinality = domainView.compCard,
+                .segmentTerms = segFieldInfo.nTerms,
+                .sumDocFreq = segFieldInfo.sumDocFreq,
+                .docsWithField = segFieldInfo.docsWithField,
+                .limit = thisOp().limit,
+                .topTermsAvailable = thisOp().ordMap == nullptr
+                    ? 0 : (int64_t)thisOp().ordMap->topTerms().entries.size(),
+                .domainHasBitset = domainView.bits != nullptr,
+                .missingRequested = thisOp().missing,
+                .allowTopTerms = allowTopTerms,
+                .hasGlobalOrdMap = thisOp().ordMap != nullptr,
+                .readerHasNoDeletes =
+                    thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
+            },
+            forcedStrFacetStrategy);
+        StrFacetCountKind strategy = countPlan.strategy;
 
-        // Not a counting strategy like the other three, so it is not a forcible
-        // mode: it answers from the OrdMap's docFreq list and counts nothing.
-        // Forcing any of the three disables it, which is what makes them a
-        // clean A/B baseline.
-        bool topTermsEligible =
-            allowTopTerms
-            && forcedStrFacetStrategy == StrFacetStrategy::AUTO
-            && thisOp().ordMap != nullptr
-            && domainView.compCard == 0
-            && thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
-            && thisOp().limit >= 0
-            && (int64_t)thisOp().ordMap->topTerms().entries.size()
-                >= thisOp().limit;
-
-        StrFacetStrategy strategy = StrFacetStrategy::COLUMN_DOMAIN;
-        std::string forcedFallback;
-        if (topTermsEligible) {
-          strategy = StrFacetStrategy::TOP_TERMS;
-        } else if (forcedStrFacetStrategy == StrFacetStrategy::COLUMN_DOMAIN) {
-          strategy = StrFacetStrategy::COLUMN_DOMAIN;
-        } else if (forcedStrFacetStrategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
-          if (termsAvailable) {
-            strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
-          } else {
-            forcedFallback = "forced complement unavailable: no terms dictionary";
-          }
-        } else if (forcedStrFacetStrategy == StrFacetStrategy::TERM_DRIVEN) {
-          if (termsAvailable) {
-            strategy = StrFacetStrategy::TERM_DRIVEN;
-          } else {
-            forcedFallback = "forced term unavailable: no terms dictionary";
-          }
-        } else if (termsAvailable && domainView.compCard == 0) {
-          // At 100% selectivity docFreq is the result. Make this an explicit
-          // shared S2/S3 fast path rather than asking guessed constants whether
-          // avoiding all column and postings reads is worthwhile.
-          strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
-        } else if (complementCost < columnCost * COMPLEMENT_MARGIN
-                   && complementCost <= termCost) {
-          strategy = StrFacetStrategy::COLUMN_COMPLEMENT;
-        } else if (termCost < columnCost) {
-          strategy = StrFacetStrategy::TERM_DRIVEN;
-        }
-
-        if (strategy == StrFacetStrategy::TOP_TERMS) {
+        if (strategy == StrFacetCountKind::TOP_TERMS) {
           if (thisOp().missing) {
             data.topTermsMissing +=
                 (int64_t)maxDoc - segFieldInfo.docsWithField;
@@ -593,6 +534,7 @@ public:
           if (profile != nullptr) {
             profile->wire.cardinality = globVals;
             profile->wire.strategy = "toplist";
+            profile->details.emplace_back("parent-count=top-terms");
             profile->details.emplace_back(
                 "global docFreq top terms, "
                 + std::to_string(thisOp().ordMap->topTerms().entries.size())
@@ -626,7 +568,7 @@ public:
           // below (big-G cells, where vector's O(G) int64 accumulator costs
           // more than the whole complement walk - measured 2.2x at
           // 99%/1M-terms when the per-doc R=16 rule picked vector here).
-          bool postingsSide = strategy != StrFacetStrategy::COLUMN_DOMAIN;
+          bool postingsSide = strategy != StrFacetCountKind::COLUMN_DOMAIN;
           int64_t adds = postingsSide
               ? std::min((int64_t)domainSize, globVals)
               : (int64_t)domainSize;
@@ -671,10 +613,12 @@ public:
           profile->details.emplace_back(
               "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
               + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
-          if (strategy == StrFacetStrategy::COLUMN_DOMAIN) {
+          if (strategy == StrFacetCountKind::COLUMN_DOMAIN) {
+            profile->details.emplace_back("parent-count=column-domain");
             profile->details.emplace_back(domainDesc(
                 domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
-          } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
+          } else if (strategy == StrFacetCountKind::COLUMN_COMPLEMENT) {
+            profile->details.emplace_back("parent-count=column-complement");
             profile->details.emplace_back(domainView.compCard == 0
                 ? "all-docs domain, docFreq-only dictionary walk"
                 : ((int64_t)domainView.compCard >> 4)
@@ -685,11 +629,12 @@ public:
                 ? "inverted domain view, sorted-hit staging"
                 : "inverted domain view, u8 staging");
           } else {
+            profile->details.emplace_back("parent-count=term-driven");
             profile->details.emplace_back(
                 "per-term smallest-side postings intersection");
           }
-          if (!forcedFallback.empty()) {
-            profile->details.emplace_back(forcedFallback);
+          if (!countPlan.forcedFallback.empty()) {
+            profile->details.emplace_back(countPlan.forcedFallback);
           }
           if (repUpgraded) {
             profile->details.emplace_back(
@@ -714,7 +659,7 @@ public:
           }
         };
 
-        if (strategy != StrFacetStrategy::COLUMN_DOMAIN) {
+        if (strategy != StrFacetCountKind::COLUMN_DOMAIN) {
           TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
           int64_t nTerms = segFieldInfo.nTerms;
 
@@ -743,7 +688,7 @@ public:
               data.missing_num +=
                   (int64_t)maxDoc - segFieldInfo.docsWithField;
             }
-          } else if (strategy == StrFacetStrategy::COLUMN_COMPLEMENT) {
+          } else if (strategy == StrFacetCountKind::COLUMN_COMPLEMENT) {
             int64_t compMissing = 0;
             OrdColReader ordColReader(postingsReader, segFieldInfo);
             // Local staging is a SkinnyCounter, for skinny's reason: a u8
@@ -1009,6 +954,7 @@ public:
 
       auto missing_count = mergedData->missing_num;
       std::vector<std::pair<std::string, int64_t>> countVec;
+      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
 
       int64_t numSegments = (int64_t)thisOp().reader.segments().size();
       bool allTopTerms =
@@ -1142,11 +1088,20 @@ public:
           }
         }
         countVec.reserve(ordCounts.size());
+        selectedBuckets.reserve(ordCounts.size());
         auto poolGuard = MemPool::threadLocalPoolGuard();
         OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);
         for (auto [ord, count] : ordCounts) {
           auto val = ordMapStr.ordToStr(ord);
           countVec.emplace_back(val, count);
+          int32_t output = (int32_t)selectedBuckets.size();
+          selectedBuckets.push_back({
+              .key = countVec.back().first,
+              .id = FacetBucketId{ord},
+              .count = count,
+              .owner = FacetOwnerSlot{output},
+              .output = FacetOutputSlot{output}
+          });
         }
       }
 
@@ -1158,7 +1113,7 @@ public:
         facetResultProto.missing = missing_count;
       }
 
-      doSubops(thisOp().subOps, countVec);
+      executeResultChildren(selectedBuckets);
     }
 
 
@@ -1247,61 +1202,81 @@ public:
         calc->fillResult(results);
       }
 
-      auto opers = thisOp().subOps;
-      for (auto& icalc : mergedData->inlineCalcs) {
-        opers.erase(icalc->getOp().name);
+      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
+      selectedBuckets.reserve(valVec.size());
+      for (size_t i = 0; i < valVec.size(); i++) {
+        selectedBuckets.push_back({
+            .key = valVec[i].first,
+            .id = std::nullopt,
+            .count = loadUnaligned<int64_t>(valVec[i].second),
+            .owner = FacetOwnerSlot{(int32_t)i},
+            .output = FacetOutputSlot{(int32_t)i}
+        });
       }
-      doSubops(opers, valVec);
+      executeResultChildren(selectedBuckets);
     }
 
-    void doSubops(boost::unordered_flat_map<std::string_view, SearchOp*> &opers, auto& valVec) {
-      if (opers.empty()) {
-        return; // no post sub ops, nothing to do.
-      }
-      int64_t slotNum = 0;
-      for (auto [key, val] : valVec) {
-        std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
-        calculators.reserve(opers.size());
-        for (auto& [name, subOp] : opers) {
-          auto* subCalc = subOp->createCalculator(this, slotNum, valVec.size());
-          calculators.emplace_back(subCalc);
+    DomainHandle materializeBucketDomain(
+        int32_t segnum,
+        const SelectedFacetBucket<std::string_view>& bucket) {
+      SegFieldInfo segFieldInfo;
+      auto& postingsReader =
+          thisOp().reader.segments()[(size_t)segnum].postingsReader();
+      int32_t maxDoc = postingsReader.maxDoc();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      FieldReader fieldReader(postingsReader);
+      std::unique_ptr<DocSet> domain;
+      if (fieldReader.seek(thisOp().fieldName)) {
+        fieldReader.readFieldInfo(segFieldInfo);
+        TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
+        if (terms.seek(bucket.key)) {
+          int32_t docFreq = terms.docFreq();
+          DocsOnlyEnum postings(terms);
+          domain = materializePostingsIntersection(
+              postings, docFreq, input[(size_t)segnum].get(), maxDoc);
         }
-        for (size_t segnum = 0; segnum < input.size(); segnum++) {
-          SegFieldInfo segFieldInfo;
-          auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-          int32_t maxDoc = postingsReader.maxDoc();
-          auto poolGuard = MemPool::threadLocalPoolGuard();
-          FieldReader fieldReader(postingsReader);
-          bool found = fieldReader.seek(thisOp().fieldName);
-          std::unique_ptr<DocSet> bucketDomain;
-          if (found) {
-            fieldReader.readFieldInfo(segFieldInfo);
-            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-            if (tenum.seek(key)) {
-              int32_t docFreq = tenum.docFreq();
-              DocsOnlyEnum denum(tenum);
-              bucketDomain = materializePostingsIntersection(
-                  denum, docFreq, input[segnum].get(), maxDoc);
-            }
-          }
-          // Always pass a (possibly empty) bucket domain.  A null domain means
-          // "all docs" to a sub-op (e.g. StatsOp), so when the field or value is
-          // absent in this segment the bucket would wrongly absorb every doc in
-          // the segment.  The bucket has no docs here, so the domain is empty.
-          if (bucketDomain == nullptr) {
-            DocSetBuilder empty(maxDoc);
-            bucketDomain = empty.build();
-          }
-          DomainHandle bucketDomainHandle(std::move(bucketDomain));
-          for (auto& subCalc : calculators) {
-            //subCalc->calc(tg, segnum, &output);
-            // no support for subcalcs launching tasks yet
+      }
 
-            subCalc->calc(nullptr, segnum, bucketDomainHandle);
-          }
-        }
-        slotNum++;
+      // A null domain means all documents, never an empty owner. Preserve an
+      // explicit empty set when the field or selected value is absent.
+      if (domain == nullptr) {
+        DocSetBuilder empty(maxDoc);
+        domain = empty.build();
       }
+      return DomainHandle(std::move(domain));
+    }
+
+    void executeResultChildren(
+        std::span<const SelectedFacetBucket<std::string_view>> buckets) {
+      if (thisOp().subOps.empty()) return;
+
+      switch (forcedFacetFeedStrategy) {
+        case FacetFeedStrategy::AUTO:
+        case FacetFeedStrategy::BUCKET_DOMAINS:
+          break;
+      }
+
+      if (profileRun != nullptr) {
+        for (auto& piece : profileRun->pieces) {
+          // The merge callback proves all piece detail writes are finished,
+          // but a final ExecutionProfileScope may not yet have set complete.
+          // Do not read that non-atomic lifecycle flag here.
+          piece.details.emplace_back("result-feed=bucket-domains");
+        }
+      }
+
+      std::vector<SearchOp*> children;
+      children.reserve(thisOp().subOps.size());
+      for (auto& [name, child] : thisOp().subOps) {
+        unused(name);
+        children.push_back(child);
+      }
+
+      FacetBucketDomainExecutor::execute(
+          *this, children, buckets, (int32_t)input.size(),
+          [this](int32_t segment, const auto& bucket) {
+            return materializeBucketDomain(segment, bucket);
+          });
     }
   };
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {

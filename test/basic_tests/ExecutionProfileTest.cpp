@@ -165,17 +165,18 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
 TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
   CollectionHelper helper("profile-top-terms");
   helper.indexAll(std::array{
-      flatdoc("id", "1", "cat_s", "a"),
-      flatdoc("id", "2", "cat_s", "b"),
+      flatdoc("id", "1", "cat_s", "a", "metric_i", 10),
+      flatdoc("id", "2", "cat_s", "b", "metric_i", 20),
   }, UpdateMessage::COMMIT);
   helper.indexAll(std::array{
-      flatdoc("id", "3", "cat_s", "a"),
-      flatdoc("id", "4", "cat_s", "c"),
+      flatdoc("id", "3", "cat_s", "a", "metric_i", 30),
+      flatdoc("id", "4", "cat_s", "c", "metric_i", 40),
   }, UpdateMessage::COMMIT);
 
   auto req = localReq(helper.getSearchEngine());
-  req->collection("profile-top-terms").profile()
+  auto& facet = req->collection("profile-top-terms").profile()
       .facet("cats", "cat_s").limit(2);
+  facet.avg("avg", "metric_i");
   req->execute(false);
   ASSERT_OK(req);
 
@@ -184,6 +185,8 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
   for (const auto& piece : pieces) {
     EXPECT_EQ("toplist", piece.strategy);
     EXPECT_EQ(3, *piece.cardinality);
+    EXPECT_TRUE(detailsMention(piece, "parent-count=top-terms"));
+    EXPECT_TRUE(detailsMention(piece, "result-feed=bucket-domains"));
     EXPECT_TRUE(detailsMention(piece, "global docFreq top terms"));
     EXPECT_TRUE(detailsMention(piece, "3 listed"));
   }
