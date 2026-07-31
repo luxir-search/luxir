@@ -2212,6 +2212,8 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
 TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
   constexpr std::string_view collection = "filter_docset_identity";
   CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 16; doc++) {
     std::string selected = doc % 3 == 0 ? "no" : "yes";
@@ -2354,6 +2356,8 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
 TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
   constexpr std::string_view collection = "filter_docset_identity_guards";
   CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 12; doc++) {
     docs.push_back(flatdoc(
@@ -2491,6 +2495,8 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
 TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
   constexpr std::string_view collection = "query_filter_docset_domain";
   CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 12; doc++) {
     docs.push_back(flatdoc(
