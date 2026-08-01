@@ -1712,8 +1712,12 @@ public:
       }
 
       BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
+        // This route makes its scored body the membership source. A filter-led
+        // query with no mandatory clause instead has rank-only optionals, so it
+        // must stay on the pull MandOptScorer path.
         if (!needsScores || filterSuppliers.empty()
-            || minShouldMatch > 1) {
+            || minShouldMatch > 1
+            || (mandatorySources.empty() && minShouldMatch < 1)) {
           return nullptr;
         }
         int64_t localFilterCost = minFilterCost();
@@ -1775,10 +1779,7 @@ public:
             && minShouldMatch < 1) {
           bodySupplier = mandatorySources[0]->scorerSupplier(
               targetPool, segment);
-        } else if (mandatorySources.empty() && optionalSources.size() == 1
-                   && minShouldMatch == 1) {
-          // Rank-only optionals (minShouldMatch == 0 beside filters) do not
-          // own membership and therefore cannot use this route.
+        } else if (mandatorySources.empty() && optionalSources.size() == 1) {
           bodySupplier = optionalSources[0]->scorerSupplier(
               targetPool, segment);
         } else {

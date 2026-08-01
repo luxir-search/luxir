@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <initializer_list>
 #include <map>
 #include <memory_resource>
 #include <set>
@@ -480,16 +481,23 @@ public:
 
 TEST_F(BooleanFuzzTest, optionalRanksUnlessMinMatchConstrains) {
   helper.index(flatdoc("id", "x1", "body_w", "f a"), UpdateMessage::NO_COMMIT);  // f + a
-  helper.index(flatdoc("id", "x2", "body_w", "f"), UpdateMessage::COMMIT);        // f, no a; z nowhere
+  helper.index(flatdoc("id", "x2", "body_w", "f"), UpdateMessage::NO_COMMIT);     // f, no optional
+  helper.index(flatdoc("id", "x3", "body_w", "z"), UpdateMessage::COMMIT);        // keeps z alive in segment
 
-  auto run = [&](const char* filterTerm, const char* optTerm, int minMatch) {
+  auto run = [&](const char* filterTerm,
+                 std::initializer_list<const char*> optTerms,
+                 int minMatch) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
     cur.limit(100).fields({"id"});
+    std::vector<api::Query> optionals;
+    for (const char* term : optTerms) {
+      optionals.push_back(qb::match(cur.mr(), "body_w", term));
+    }
     cur.rawQuery() = qb::boolean(cur.mr(),
         /*required=*/{},
-        /*optional=*/{qb::match(cur.mr(), "body_w", optTerm)},
+        /*optional=*/optionals,
         /*prohibited=*/{},
         /*filter=*/{qb::match(cur.mr(), "body_w", filterTerm)}, minMatch);
     req->execute();
@@ -499,12 +507,15 @@ TEST_F(BooleanFuzzTest, optionalRanksUnlessMinMatchConstrains) {
   };
 
   // min_match unset: the filter carries the match and the optional only ranks
-  // (Lucene bool semantics) - even when the optional term is absent everywhere.
-  EXPECT_EQ((std::set<std::string>{"x1", "x2"}), run("f", "a", 0));
-  EXPECT_EQ((std::set<std::string>{"x1", "x2"}), run("f", "z", 0));
+  // (Lucene bool semantics) - even when the optional is absent from every
+  // filtered document.
+  EXPECT_EQ((std::set<std::string>{"x1", "x2"}), run("f", {"a"}, 0));
+  EXPECT_EQ((std::set<std::string>{"x1", "x2"}), run("f", {"z"}, 0));
+  EXPECT_EQ((std::set<std::string>{"x1", "x2"}),
+            run("f", {"a", "z"}, 0));
   // min_match=1 makes the optional group a real constraint.
-  EXPECT_EQ((std::set<std::string>{"x1"}), run("f", "a", 1));
-  EXPECT_EQ((std::set<std::string>{}), run("f", "z", 1));
+  EXPECT_EQ((std::set<std::string>{"x1"}), run("f", {"a"}, 1));
+  EXPECT_EQ((std::set<std::string>{}), run("f", {"z"}, 1));
 }
 
 TEST_F(BooleanFuzzTest, minMatchComposesWithRequired) {
