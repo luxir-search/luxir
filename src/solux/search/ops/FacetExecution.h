@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "SearchOp.h"
+#include "solux/search/OrdMap.h"
 
 namespace solux {
 
@@ -32,6 +33,11 @@ enum class FacetBucketFlags : uint8_t {
   PINNED = 1 << 0
 };
 
+enum class FacetFeedKind : uint8_t {
+  BUCKET_DOMAINS,
+  STRING_COLUMN_REPLAY
+};
+
 template <typename Key>
 struct SelectedFacetBucket {
   // Borrowed keys are valid because post-selection execution is synchronous.
@@ -42,6 +48,33 @@ struct SelectedFacetBucket {
   FacetOwnerSlot owner;
   FacetOutputSlot output;
   FacetBucketFlags flags = FacetBucketFlags::NONE;
+};
+
+// One concrete parent source offered to result children. The selected bucket
+// ids are global ordinals for this OrdMap epoch; domains are the parent's
+// incoming domains and remain pinned for synchronous binding execution.
+struct StringFacetColumnSource {
+  std::string_view field;
+  const OrdMap& ordMap;
+  std::span<const DomainHandle> domains;
+  std::span<const SelectedFacetBucket<std::string_view>> buckets;
+};
+
+struct FacetChildContext {
+  SearchOp::Calculator& parent;
+  const StringFacetColumnSource* stringColumn = nullptr;
+};
+
+// Child-owned executable binding. The virtual call is at the whole binding
+// boundary; concrete implementations own every per-document loop.
+class FacetChildExecutor {
+public:
+  virtual FacetFeedKind feedKind() const = 0;
+  // A true result is a measured dominance rule, not merely capability. AUTO
+  // may select the binding without a cost race; false keeps the baseline.
+  virtual bool dominatesBucketDomains() const { return false; }
+  virtual void execute() = 0;
+  virtual ~FacetChildExecutor() = default;
 };
 
 // Baseline post-selection binding. The parent supplies the selected buckets

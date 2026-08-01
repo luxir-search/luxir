@@ -2,6 +2,9 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <format>
+#include <optional>
+#include <ranges>
 #include <string_view>
 #include <variant>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -13,6 +16,7 @@
 #include "solux/search/SearchOverrides.h"
 #include "SpanCounter.h"
 #include "StrFacetPlanning.h"
+#include "StrFacetReplay.h"
 #include "solux/util/SegmentMergeDriver.h"
 #include "solux/util/log.h"
 
@@ -327,6 +331,59 @@ public:
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
   ordMap(std::move(ordMap)) {
     enableExecutionProfile();
+  }
+
+  void normalizeOrdCounts(
+      std::vector<std::pair<int64_t, int64_t>>& ordCounts,
+      bool allowZeroPadding) const {
+    auto min = std::max<int64_t>(minCount, 1);
+    std::erase_if(ordCounts, [&](const auto& entry) {
+      return entry.second < min;
+    });
+
+    sortByCountDescAndLimit(ordCounts, limit);
+    if (!allowZeroPadding || minCount != 0) return;
+    int64_t numGlobalOrds = ordMap ? ordMap->numOrds() : 0;
+    int64_t target = (limit < 0) ? numGlobalOrds : limit;
+    if ((int64_t)ordCounts.size() >= target) return;
+
+    boost::unordered_flat_set<int64_t> present;
+    present.reserve(ordCounts.size());
+    for (auto [ord, count] : ordCounts) {
+      unused(count);
+      present.insert(ord);
+    }
+    for (int64_t ord = 0;
+         ord < numGlobalOrds && (int64_t)ordCounts.size() < target; ord++) {
+      if (!present.contains(ord)) ordCounts.emplace_back(ord, 0);
+    }
+  }
+
+  void resolveOrdCounts(
+      std::span<const std::pair<int64_t, int64_t>> ordCounts,
+      OrdMapStr& ordMapStr,
+      std::vector<std::pair<std::string, int64_t>>& countVec,
+      std::vector<SelectedFacetBucket<std::string_view>>* selectedBuckets)
+      const {
+    countVec.clear();
+    countVec.reserve(ordCounts.size());
+    if (selectedBuckets != nullptr) {
+      selectedBuckets->clear();
+      selectedBuckets->reserve(ordCounts.size());
+    }
+    for (auto [ord, count] : ordCounts) {
+      countVec.emplace_back(ordMapStr.ordToStr(ord), count);
+      if (selectedBuckets != nullptr) {
+        int32_t output = (int32_t)selectedBuckets->size();
+        selectedBuckets->push_back({
+            .key = countVec.back().first,
+            .id = FacetBucketId{ord},
+            .count = count,
+            .owner = FacetOwnerSlot{output},
+            .output = FacetOutputSlot{output}
+        });
+      }
+    }
   }
 
   class Calc : public Calculator {
@@ -931,30 +988,10 @@ public:
     }
 
     void facetResult(std::unique_ptr<MergeableStrData> mergedData) {
-      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
-        if (slot >= 0) {
-          // sub-facet: this Val is shared by all parent buckets, so index by
-          // slot into a per-bucket array (parallel to the parent bucket_ids),
-          // allocated once at numSlots under the mutex like StatsOp's arr_d.
-          auto& arr = oneofMut<solux::api::ArrVal>(val);
-          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
-        }
-      });
-      // For a sub-facet, our FacetResult goes into the slot-th element of the
-      // shared ArrVal (each slot is a distinct, stably-addressed Val).
-      solux::api::Val* targetVal = myVal;
-      if (slot >= 0) {
-        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
-        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
-      }
-      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*targetVal);
       auto limit = thisOp().limit;
-      auto missing = thisOp().missing;
 
       auto missing_count = mergedData->missing_num;
-      std::vector<std::pair<std::string, int64_t>> countVec;
-      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
+      std::vector<std::pair<int64_t, int64_t>> ordCounts;
 
       int64_t numSegments = (int64_t)thisOp().reader.segments().size();
       bool allTopTerms =
@@ -986,7 +1023,6 @@ public:
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
         auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
         auto* spanCounts = std::get_if<SpanCounter>(&mergedData->counts);
-        std::vector<std::pair<int64_t, int64_t>> ordCounts;
         // Collect nonzero counts first. Explicit mincount=0 pads zero-count
         // buckets after sorting/truncating the competitive nonzero buckets.
         auto min = std::max<int64_t>(thisOp().minCount, 1);
@@ -1068,51 +1104,41 @@ public:
                    thisOp().fieldName, repName, numOrds, ordCounts.size(), bytes);
         }
 
-        sortByCountDescAndLimit(ordCounts, limit);
-        bool showZeros = (thisOp().minCount == 0);
-        if (showZeros) {
-          int64_t numOrds = thisOp().ordMap ? thisOp().ordMap->numOrds() : 0;
-          int64_t target = (limit < 0) ? numOrds : limit;
-          if ((int64_t)ordCounts.size() < target) {
-            boost::unordered_flat_set<int64_t> present;
-            present.reserve(ordCounts.size());
-            for (auto& [ord, count] : ordCounts) {
-              unused(count);
-              present.insert(ord);
-            }
-            for (int64_t ord = 0; ord < numOrds && (int64_t)ordCounts.size() < target; ord++) {
-              if (!present.contains(ord)) {
-                ordCounts.emplace_back(ord, 0);
-              }
-            }
-          }
-        }
-        countVec.reserve(ordCounts.size());
-        selectedBuckets.reserve(ordCounts.size());
-        auto poolGuard = MemPool::threadLocalPoolGuard();
-        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);
-        for (auto [ord, count] : ordCounts) {
-          auto val = ordMapStr.ordToStr(ord);
-          countVec.emplace_back(val, count);
-          int32_t output = (int32_t)selectedBuckets.size();
-          selectedBuckets.push_back({
-              .key = countVec.back().first,
-              .id = FacetBucketId{ord},
-              .count = count,
-              .owner = FacetOwnerSlot{output},
-              .output = FacetOutputSlot{output}
-          });
-        }
       }
 
-      mergedData.reset();  // free up memory from the merged data, everything should be in countVec now.
+      mergedData.reset();
+      finishOrdCounts(std::move(ordCounts), missing_count, haveOrdCounts);
+    }
 
+    void finishOrdCounts(
+        std::vector<std::pair<int64_t, int64_t>> ordCounts,
+        int64_t missingCount, bool allowZeroPadding = true) {
+      thisOp().normalizeOrdCounts(ordCounts, allowZeroPadding);
 
+      std::vector<std::pair<std::string, int64_t>> countVec;
+      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
+                         *thisOp().req.reader, thisOp().fieldName);
+      thisOp().resolveOrdCounts(
+          ordCounts, ordMapStr, countVec, &selectedBuckets);
+
+      auto& mr = op.req.lastResponse->mr;
+      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
+        if (slot >= 0) {
+          auto& arr = oneofMut<solux::api::ArrVal>(val);
+          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
+        }
+      });
+      solux::api::Val* targetVal = myVal;
+      if (slot >= 0) {
+        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
+        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
+      }
+      auto& facetResultProto =
+          oneofMut<solux::api::FacetResult>(*targetVal);
       emitBuckets(facetResultProto, countVec, mr);
-      if (missing) {
-        facetResultProto.missing = missing_count;
-      }
-
+      if (thisOp().missing) facetResultProto.missing = missingCount;
       executeResultChildren(selectedBuckets);
     }
 
@@ -1250,10 +1276,49 @@ public:
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
       if (thisOp().subOps.empty()) return;
 
-      switch (forcedFacetFeedStrategy) {
-        case FacetFeedStrategy::AUTO:
-        case FacetFeedStrategy::BUCKET_DOMAINS:
-          break;
+      bool tryReplay = thisOp().ordMap != nullptr
+          && (forcedFacetFeedStrategy
+                  == FacetFeedStrategy::STRING_COLUMN_REPLAY
+              || (forcedFacetFeedStrategy == FacetFeedStrategy::AUTO
+                  && thisOp().subOps.size() == 1));
+      if (tryReplay) {
+        StringFacetColumnSource source{
+            .field = thisOp().fieldName,
+            .ordMap = *thisOp().ordMap,
+            .domains = input,
+            .buckets = buckets
+        };
+        FacetChildContext context{.parent = *this, .stringColumn = &source};
+        std::vector<std::unique_ptr<FacetChildExecutor>> bindings;
+        bindings.reserve(thisOp().subOps.size());
+        for (auto& [name, child] : thisOp().subOps) {
+          unused(name);
+          auto* binding = child->bindFacetChild(context);
+          if (binding == nullptr
+              || binding->feedKind()
+                     != FacetFeedKind::STRING_COLUMN_REPLAY) {
+            bindings.clear();
+            break;
+          }
+          bindings.emplace_back(binding);
+        }
+        bool forced = forcedFacetFeedStrategy
+            == FacetFeedStrategy::STRING_COLUMN_REPLAY;
+        bool dominant = bindings.size() == thisOp().subOps.size()
+            && std::ranges::all_of(bindings, [](const auto& binding) {
+              return binding->dominatesBucketDomains();
+            });
+        if (bindings.size() == thisOp().subOps.size()
+            && (forced || dominant)) {
+          if (profileRun != nullptr) {
+            for (auto& piece : profileRun->pieces) {
+              piece.details.emplace_back(
+                  "result-feed=string-column-replay");
+            }
+          }
+          for (auto& binding : bindings) binding->execute();
+          return;
+        }
       }
 
       if (profileRun != nullptr) {
@@ -1279,6 +1344,369 @@ public:
           });
     }
   };
+
+  class ReplayResultWriter : public Calculator {
+    StrFacetOp& child;
+
+  public:
+    ReplayResultWriter(StrFacetOp& child, Calculator& parent,
+                       int64_t numSlots)
+        : Calculator(child, &parent, -1, numSlots), child(child) {}
+
+    solux::api::Val* getTargetForSub(
+        SearchResponse* resp, Calculator* sub) override {
+      unused(resp);
+      unused(sub);
+      return nullptr;
+    }
+
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+              DomainHandle domain) override {
+      unused(tg);
+      unused(segnum);
+      unused(domain);
+      assert(false);
+    }
+
+    void finish(
+        StrFacetReplayBank::Rows rows,
+        std::span<const int64_t> missingCounts,
+        std::span<const SelectedFacetBucket<std::string_view>> buckets) {
+      assert(rows.size() == buckets.size());
+      assert(missingCounts.size() == buckets.size());
+      auto& mr = child.req.lastResponse->mr;
+      auto* target = getTarget(nullptr, [&](solux::api::Val& val) {
+        auto& arr = oneofMut<solux::api::ArrVal>(val);
+        if (arr.v.empty()) build::allocArray(arr.v, buckets.size(), mr);
+      });
+      auto& arr = oneofMut<solux::api::ArrVal>(*target);
+
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr ordMapStr(poolGuard.pool(), child.ordMap.get(),
+                         *child.req.reader, child.fieldName);
+      std::vector<std::pair<std::string, int64_t>> countVec;
+      for (const auto& bucket : buckets) {
+        int32_t owner = bucket.owner.value;
+        int32_t output = bucket.output.value;
+        assert(owner >= 0 && owner < (int32_t)rows.size());
+        assert(output >= 0 && output < (int32_t)arr.v.size());
+        auto& ordCounts = rows[(size_t)owner];
+        child.normalizeOrdCounts(ordCounts, true);
+        child.resolveOrdCounts(ordCounts, ordMapStr, countVec, nullptr);
+        auto& facetResultProto = oneofMut<solux::api::FacetResult>(
+            const_cast<solux::api::Val&>(arr.v[(size_t)output]));
+        emitBuckets(facetResultProto, countVec, mr);
+        if (child.missing) {
+          facetResultProto.missing = missingCounts[(size_t)owner];
+        }
+      }
+    }
+  };
+
+  class ColumnReplayExecutor : public FacetChildExecutor {
+    StrFacetOp& child;
+    SearchOp::Calculator& parent;
+    StringFacetColumnSource source;
+    StrFacetSelectedOrdMap::Selected selectedBuckets;
+    ExecutionProfileRun* profileRun;
+    int64_t domainDocs = 0;
+    int64_t maxDocs = 0;
+    int64_t expectedUpdates = 0;
+
+    template <bool ChildMulti, typename Visit>
+    static bool visitChildOrds(
+        int32_t docid, OrdColReader& childColumn,
+        OrdColReader::Iterator& childIterator,
+        OrdMap::SegToGlobal::BulkGlobalOrds& childGlobalOrds,
+        Visit&& visit) {
+      if (childIterator.docId() < docid) childIterator.advance(docid);
+      if (childIterator.docId() != docid) return false;
+      if constexpr (!ChildMulti) {
+        int32_t storedOrd = childIterator.value();
+        if (storedOrd == 0) return false;
+        visit(childGlobalOrds.globalOrd((int64_t)storedOrd - 1));
+        return true;
+      } else {
+        auto [start, end] = childColumn.getStartEndValueRank(
+            childIterator.rank());
+        for (int64_t rank = start; rank < end; rank++) {
+          int32_t storedOrd = childIterator.values().valueAt(rank);
+          visit(childGlobalOrds.globalOrd((int64_t)storedOrd - 1));
+        }
+        return start != end;
+      }
+    }
+
+    template <bool TrackProfile, bool ParentMulti,
+              bool ChildPresent, bool ChildMulti,
+              typename Bank, typename SelectedMap>
+    void replayValues(
+        Bank& bank, const SelectedMap& selectedMap,
+        OrdColReader& parentColumn, int32_t maxDoc, DocSet* domain,
+        OrdColReader* childColumn, OrdColReader::Iterator* childIterator,
+        OrdMap::SegToGlobal::BulkGlobalOrds* childGlobalOrds,
+        std::vector<int64_t>& missingCounts,
+        int64_t& routedDocs, int64_t& routedValues) {
+      int64_t parentMissing = 0;
+      int64_t numChildOrds = child.ordMap->numOrds();
+      if constexpr (!ParentMulti) {
+        forEachOrdValue(
+            domain, parentColumn, maxDoc, parentMissing,
+            [&](int32_t docid, int32_t storedOrd) SOLUX_INLINE {
+              int32_t owner = StrFacetSelectedOrdMap::owner(
+                  selectedMap, storedOrd);
+              if (owner < 0) return;
+              if constexpr (TrackProfile) routedDocs++;
+              bool haveChildValue = false;
+              if constexpr (ChildPresent) {
+                haveChildValue = visitChildOrds<ChildMulti>(
+                    docid, *childColumn, *childIterator, *childGlobalOrds,
+                    [&](int64_t ord) SOLUX_INLINE {
+                      StrFacetReplayBank::increment(
+                          bank, owner, ord, numChildOrds);
+                      if constexpr (TrackProfile) routedValues++;
+                    });
+              }
+              if (!haveChildValue && child.missing) {
+                missingCounts[(size_t)owner]++;
+              }
+            });
+      } else {
+        std::vector<int32_t> owners;
+        owners.reserve(4);
+        int32_t currentDoc = -1;
+        auto flush = [&]() SOLUX_INLINE {
+          if (owners.empty()) return;
+          if constexpr (TrackProfile) routedDocs++;
+          bool haveChildValue = false;
+          if constexpr (ChildPresent) {
+            haveChildValue = visitChildOrds<ChildMulti>(
+                currentDoc, *childColumn, *childIterator, *childGlobalOrds,
+                [&](int64_t ord) SOLUX_INLINE {
+                  for (int32_t owner : owners) {
+                    StrFacetReplayBank::increment(
+                        bank, owner, ord, numChildOrds);
+                  }
+                  if constexpr (TrackProfile) {
+                    routedValues += (int64_t)owners.size();
+                  }
+                });
+          }
+          if (!haveChildValue && child.missing) {
+            for (int32_t owner : owners) {
+              missingCounts[(size_t)owner]++;
+            }
+          }
+          owners.clear();
+        };
+        forEachOrdValue(
+            domain, parentColumn, maxDoc, parentMissing,
+            [&](int32_t docid, int32_t storedOrd) SOLUX_INLINE {
+              if (docid != currentDoc) {
+                flush();
+                currentDoc = docid;
+              }
+              int32_t owner = StrFacetSelectedOrdMap::owner(
+                  selectedMap, storedOrd);
+              if (owner >= 0) owners.push_back(owner);
+            });
+        flush();
+      }
+    }
+
+    template <bool TrackProfile, typename Bank>
+    void replaySegment(Bank& bank,
+                       std::vector<int64_t>& missingCounts,
+                       int32_t segnum) {
+      auto& postingsReader =
+          child.reader.segments()[(size_t)segnum].postingsReader();
+      int32_t maxDoc = postingsReader.maxDoc();
+      auto profile = parent.profilePiece(
+          TrackProfile ? profileRun : nullptr, segnum);
+      int64_t routedDocs = 0;
+      int64_t routedValues = 0;
+
+      FieldReader parentFieldReader(postingsReader);
+      if (!parentFieldReader.seek(source.field)) return;
+      SegFieldInfo parentFieldInfo;
+      parentFieldReader.readFieldInfo(parentFieldInfo);
+      OrdColReader parentColumn(postingsReader, parentFieldInfo);
+      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
+      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
+
+      FieldReader childFieldReader(postingsReader);
+      bool childFieldFound = childFieldReader.seek(child.fieldName);
+      std::optional<SegFieldInfo> childFieldInfo;
+      std::optional<OrdColReader> childColumn;
+      std::optional<OrdColReader::Iterator> childIterator;
+      auto childMapping = child.ordMap->getSegToGlobal(segnum);
+      std::optional<OrdMap::SegToGlobal::BulkGlobalOrds> childGlobalOrds;
+      if (childFieldFound) {
+        childFieldInfo.emplace();
+        childFieldReader.readFieldInfo(*childFieldInfo);
+        childColumn.emplace(postingsReader, *childFieldInfo);
+        childIterator.emplace(*childColumn);
+        childGlobalOrds.emplace(childMapping);
+      }
+
+      if (!childFieldFound && !child.missing) {
+        if constexpr (TrackProfile) {
+          if (auto* piece = profile.get()) {
+            piece->details.emplace_back(
+                "feed=string-column-replay, child=absent, skipped");
+          }
+        }
+        return;
+      }
+
+      selected.visit([&](const auto& selectedMap) {
+        DocSet* domain = source.domains[(size_t)segnum].get();
+        if (!childFieldFound) {
+          if (parentColumn.multiValued()) {
+            replayValues<TrackProfile, true, false, false>(
+                bank, selectedMap, parentColumn, maxDoc, domain,
+                nullptr, nullptr, nullptr, missingCounts,
+                routedDocs, routedValues);
+          } else {
+            replayValues<TrackProfile, false, false, false>(
+                bank, selectedMap, parentColumn, maxDoc, domain,
+                nullptr, nullptr, nullptr, missingCounts,
+                routedDocs, routedValues);
+          }
+        } else if (parentColumn.multiValued()) {
+          if (childColumn->multiValued()) {
+            replayValues<TrackProfile, true, true, true>(
+                bank, selectedMap, parentColumn, maxDoc, domain,
+                &*childColumn, &*childIterator, &*childGlobalOrds,
+                missingCounts, routedDocs, routedValues);
+          } else {
+            replayValues<TrackProfile, true, true, false>(
+                bank, selectedMap, parentColumn, maxDoc, domain,
+                &*childColumn, &*childIterator, &*childGlobalOrds,
+                missingCounts, routedDocs, routedValues);
+          }
+        } else if (childColumn->multiValued()) {
+          replayValues<TrackProfile, false, true, true>(
+              bank, selectedMap, parentColumn, maxDoc, domain,
+              &*childColumn, &*childIterator, &*childGlobalOrds,
+              missingCounts, routedDocs, routedValues);
+        } else {
+          replayValues<TrackProfile, false, true, false>(
+              bank, selectedMap, parentColumn, maxDoc, domain,
+              &*childColumn, &*childIterator, &*childGlobalOrds,
+              missingCounts, routedDocs, routedValues);
+        }
+      });
+
+      if constexpr (TrackProfile) {
+        if (auto* piece = profile.get()) {
+          piece->details.emplace_back(std::format(
+              "feed=string-column-replay, selector={}, parent={}, child={}, "
+              "routed-docs={}, routed-values={}",
+              selected.dense() ? "dense" : "sparse",
+              parentColumn.multiValued() ? "multi" : "single",
+              childFieldFound
+                  ? (childColumn->multiValued() ? "multi" : "single")
+                  : "absent",
+              routedDocs, routedValues));
+        }
+      }
+    }
+
+  public:
+    ColumnReplayExecutor(StrFacetOp& child,
+                         SearchOp::Calculator& parent,
+                         const StringFacetColumnSource& source)
+        : child(child), parent(parent), source(source),
+          selectedBuckets(
+              StrFacetSelectedOrdMap::selectedBuckets(source.buckets)),
+          profileRun(nullptr) {
+      __int128 selectedRoutes = 0;
+      for (const auto& bucket : source.buckets) {
+        selectedRoutes += bucket.count;
+      }
+      __int128 childValues = 0;
+      for (size_t segnum = 0; segnum < source.domains.size(); segnum++) {
+        auto& postingsReader =
+            child.reader.segments()[segnum].postingsReader();
+        int32_t segmentMax = postingsReader.maxDoc();
+        maxDocs += segmentMax;
+        DocSet* domain = source.domains[segnum].get();
+        domainDocs += domain != nullptr ? domain->card() : segmentMax;
+        FieldReader fieldReader(postingsReader);
+        if (!fieldReader.seek(child.fieldName)) continue;
+        SegFieldInfo fieldInfo;
+        fieldReader.readFieldInfo(fieldInfo);
+        childValues += fieldInfo.numValues;
+      }
+      __int128 estimate = maxDocs > 0
+          ? (selectedRoutes * childValues + maxDocs - 1) / maxDocs
+          : 0;
+      expectedUpdates = (int64_t)std::min<__int128>(
+          estimate, std::numeric_limits<int64_t>::max());
+    }
+
+    FacetFeedKind feedKind() const override {
+      return FacetFeedKind::STRING_COLUMN_REPLAY;
+    }
+
+    bool dominatesBucketDomains() const override {
+      return StrFacetColumnReplayPlan::dominatesBucketDomains(
+          source.ordMap.numOrds(), child.ordMap->numOrds(),
+          domainDocs, maxDocs, (int64_t)source.buckets.size(),
+          expectedUpdates);
+    }
+
+    void execute() override {
+      int32_t numOwners = (int32_t)source.buckets.size();
+      if (numOwners == 0) return;
+      profileRun = child.addExecutionProfileRun();
+
+      StrFacetReplayBank bank(
+          numOwners, child.ordMap->numOrds(), expectedUpdates);
+      if (profileRun != nullptr) {
+        for (auto& piece : profileRun->pieces) {
+          piece.details.emplace_back(std::format(
+              "bank={}, owners={}, child-ords={}, expected-updates={}",
+              StrFacetReplayBank::strategyName(bank.effectiveStrategy()),
+              numOwners, child.ordMap->numOrds(), expectedUpdates));
+        }
+      }
+      std::vector<int64_t> missingCounts((size_t)numOwners);
+      if (profileRun != nullptr) {
+        bank.visit([&](auto& concreteBank) {
+          for (int32_t segnum = 0;
+               segnum < (int32_t)source.domains.size(); segnum++) {
+            replaySegment<true>(concreteBank, missingCounts, segnum);
+          }
+        });
+      } else {
+        bank.visit([&](auto& concreteBank) {
+          for (int32_t segnum = 0;
+               segnum < (int32_t)source.domains.size(); segnum++) {
+            replaySegment<false>(concreteBank, missingCounts, segnum);
+          }
+        });
+      }
+
+      ReplayResultWriter writer(child, parent, numOwners);
+      writer.finish(bank.drain(), missingCounts, source.buckets);
+    }
+  };
+
+  FacetChildExecutor* bindFacetChild(
+      const FacetChildContext& context) override {
+    if (context.stringColumn == nullptr || ordMap == nullptr
+        || !subOps.empty() || !inlineSubOps.empty() || !sorts.empty()) {
+      return nullptr;
+    }
+    for (const auto& bucket : context.stringColumn->buckets) {
+      if (!bucket.id.has_value()) return nullptr;
+    }
+    return new ColumnReplayExecutor(*this, context.parent,
+                                    *context.stringColumn);
+  }
+
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
     return new Calc(*this, parent, slot, numSlots);
   }

@@ -47,7 +47,15 @@ enum class StrFacetStrategy {
 };
 
 enum class FacetFeedStrategy {
-  AUTO, BUCKET_DOMAINS
+  AUTO, BUCKET_DOMAINS, STRING_COLUMN_REPLAY
+};
+
+enum class StrFacetReplaySelector {
+  AUTO, DENSE, SPARSE
+};
+
+enum class StrFacetReplayBankStrategy {
+  AUTO, VECTOR, SKINNY, PACKED_HASH, WIDE_HASH
 };
 
 inline StrFacetStrategy parseStrFacetStrategyEnv() {
@@ -77,7 +85,33 @@ inline FacetFeedStrategy parseFacetFeedStrategyEnv() {
   if (e != nullptr && std::string_view(e) == "bucket_domains") {
     return FacetFeedStrategy::BUCKET_DOMAINS;
   }
+  if (e != nullptr && std::string_view(e) == "string_column") {
+    return FacetFeedStrategy::STRING_COLUMN_REPLAY;
+  }
   return FacetFeedStrategy::AUTO;
+}
+
+inline StrFacetReplaySelector parseStrFacetReplaySelectorEnv() {
+  const char* e = std::getenv("SOLUX_FACET_REPLAY_SELECTOR");
+  if (e != nullptr && std::string_view(e) == "dense") {
+    return StrFacetReplaySelector::DENSE;
+  }
+  if (e != nullptr && std::string_view(e) == "sparse") {
+    return StrFacetReplaySelector::SPARSE;
+  }
+  return StrFacetReplaySelector::AUTO;
+}
+
+inline StrFacetReplayBankStrategy parseStrFacetReplayBankEnv() {
+  const char* e = std::getenv("SOLUX_FACET_REPLAY_BANK");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "vector") return StrFacetReplayBankStrategy::VECTOR;
+    if (s == "skinny") return StrFacetReplayBankStrategy::SKINNY;
+    if (s == "packed_hash") return StrFacetReplayBankStrategy::PACKED_HASH;
+    if (s == "wide_hash") return StrFacetReplayBankStrategy::WIDE_HASH;
+  }
+  return StrFacetReplayBankStrategy::AUTO;
 }
 
 // The SPAN_* modes drive the dedicated sparse fork; everything else runs the
@@ -126,5 +160,9 @@ inline FacetCounterMode parseFacetCounterModeEnv() {
 inline FacetCounterMode forcedFacetCounterMode = parseFacetCounterModeEnv();
 inline StrFacetStrategy forcedStrFacetStrategy = parseStrFacetStrategyEnv();
 inline FacetFeedStrategy forcedFacetFeedStrategy = parseFacetFeedStrategyEnv();
+inline StrFacetReplaySelector forcedStrFacetReplaySelector =
+    parseStrFacetReplaySelectorEnv();
+inline StrFacetReplayBankStrategy forcedStrFacetReplayBank =
+    parseStrFacetReplayBankEnv();
 
 } // namespace solux

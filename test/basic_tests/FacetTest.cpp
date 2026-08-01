@@ -174,7 +174,72 @@ public:
   }
 };
 
+class StrFacetReplayGuard {
+  StrFacetReplaySelector savedSelector = forcedStrFacetReplaySelector;
+  StrFacetReplayBankStrategy savedBank = forcedStrFacetReplayBank;
+public:
+  ~StrFacetReplayGuard() {
+    forcedStrFacetReplaySelector = savedSelector;
+    forcedStrFacetReplayBank = savedBank;
+  }
+};
+
 } // namespace
+
+TEST_F(FacetTest, stringReplaySelectedOrdMapsRouteStoredOrds) {
+  std::vector<SelectedFacetBucket<std::string_view>> buckets{
+      {.key = "b", .id = FacetBucketId{1}, .count = 2,
+       .owner = FacetOwnerSlot{0}, .output = FacetOutputSlot{0}},
+      {.key = "d", .id = FacetBucketId{3}, .count = 1,
+       .owner = FacetOwnerSlot{1}, .output = FacetOutputSlot{1}}
+  };
+  OrdMap::SegToGlobal identity{.numOrds = 5};
+  for (auto strategy : {StrFacetReplaySelector::DENSE,
+                        StrFacetReplaySelector::SPARSE}) {
+    StrFacetSelectedOrdMap selected(identity, buckets, strategy);
+    selected.visit([&](const auto& map) {
+      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 1));
+      EXPECT_EQ(0, StrFacetSelectedOrdMap::owner(map, 2));
+      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 3));
+      EXPECT_EQ(1, StrFacetSelectedOrdMap::owner(map, 4));
+      EXPECT_EQ(-1, StrFacetSelectedOrdMap::owner(map, 5));
+    });
+  }
+}
+
+TEST_F(FacetTest, stringReplayAutoUsesMeasuredDominanceRegion) {
+  EXPECT_TRUE(StrFacetColumnReplayPlan::dominatesBucketDomains(
+      100'000, 100'000, 100'000, 5'000'000));
+  EXPECT_FALSE(StrFacetColumnReplayPlan::dominatesBucketDomains(
+      100'000, 100'000, 100'001, 5'000'000));
+  EXPECT_FALSE(StrFacetColumnReplayPlan::dominatesBucketDomains(
+      100'001, 1'000, 5'000, 5'000'000));
+  EXPECT_FALSE(StrFacetColumnReplayPlan::dominatesBucketDomains(
+      10, 100'001, 5'000, 5'000'000));
+}
+
+TEST_F(FacetTest, stringReplayCounterBanksMatchAcrossRepresentations) {
+  for (auto strategy : {StrFacetReplayBankStrategy::VECTOR,
+                        StrFacetReplayBankStrategy::SKINNY,
+                        StrFacetReplayBankStrategy::PACKED_HASH,
+                        StrFacetReplayBankStrategy::WIDE_HASH}) {
+    StrFacetReplayBank bank(2, 5, 302, strategy);
+    for (int i = 0; i < 300; i++) bank.increment(0, 1);
+    bank.increment(1, 4);
+    bank.increment(1, 4);
+    auto rows = bank.drain();
+    std::map<int64_t, int64_t> row0(rows[0].begin(), rows[0].end());
+    std::map<int64_t, int64_t> row1(rows[1].begin(), rows[1].end());
+    EXPECT_EQ((std::map<int64_t, int64_t>{{1, 300}}), row0);
+    EXPECT_EQ((std::map<int64_t, int64_t>{{4, 2}}), row1);
+  }
+
+  StrFacetReplayBank wideFallback(
+      3, std::numeric_limits<int64_t>::max(), 0,
+      StrFacetReplayBankStrategy::PACKED_HASH);
+  EXPECT_EQ(StrFacetReplayBankStrategy::WIDE_HASH,
+            wideFallback.effectiveStrategy());
+}
 
 TEST_F(FacetTest, stringFacetCountPlanSelectsAndForcesLegalOffers) {
   StrFacetCountInputs in{
@@ -2645,6 +2710,117 @@ TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {
   EXPECT_EQ(expected, run(
       StrFacetStrategy::COLUMN_DOMAIN,
       FacetFeedStrategy::BUCKET_DOMAINS));
+  EXPECT_EQ(expected, run(
+      StrFacetStrategy::COLUMN_DOMAIN,
+      FacetFeedStrategy::STRING_COLUMN_REPLAY));
+}
+
+TEST_F(FacetTest, stringColumnReplayMatchesBucketDomainsAcrossArities) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "1", "parent_s", "middle",
+              "parent_ss", vecs("middle", "zulu"),
+              "child_s", "blue", "child_ss", vecs("blue", "green"),
+              "sel_s", "yes"),
+      flatdoc("id", "2", "parent_s", "alpha",
+              "parent_ss", vecs("alpha", "middle"), "sel_s", "yes"),
+      flatdoc("id", "deleted", "parent_s", "deleted-value",
+              "parent_ss", vecs("deleted-value", "zulu"),
+              "child_s", "deleted-child",
+              "child_ss", vecs("deleted-child", "green"),
+              "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "3", "parent_s", "zulu",
+              "parent_ss", vecs("alpha", "zulu"),
+              "child_s", "amber", "child_ss", vecs("amber", "blue"),
+              "sel_s", "yes"),
+      flatdoc("id", "4", "parent_s", "middle",
+              "parent_ss", vecs("middle"),
+              "child_s", "blue", "child_ss", vecs("green"),
+              "sel_s", "no"),
+      flatdoc("id", "5", "child_s", "orphan",
+              "child_ss", vecs("orphan"), "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "6", "parent_s", "alpha",
+              "parent_ss", vecs("alpha", "middle"), "sel_s", "yes"),
+      flatdoc("id", "7", "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
+
+  FacetFeedStrategyGuard feedGuard;
+  StrFacetReplayGuard replayGuard;
+  auto run = [&](std::string_view parentField, std::string_view childField,
+                 bool filtered, FacetFeedStrategy feed,
+                 StrFacetReplaySelector selector,
+                 StrFacetReplayBankStrategy bank) {
+    forcedFacetFeedStrategy = feed;
+    forcedStrFacetReplaySelector = selector;
+    forcedStrFacetReplayBank = bank;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto addFacet = [&](auto& cursor) {
+      auto& parent = cursor.facet("f", parentField).limit(4).mincount(0);
+      auto& child = parent.facet("child", childField).limit(4).mincount(0);
+      std::get<api::FieldFacet>(child.rawOp().kind).missing = true;
+    };
+    if (filtered) {
+      auto& top = req->topDocs("q");
+      top.getNumber(true).matchQuery("sel_s", "yes");
+      addFacet(top);
+    } else {
+      addFacet(*req);
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const api::FacetResult* result = nullptr;
+    if (filtered) {
+      const auto* docs = req->docList("q");
+      EXPECT_NE(nullptr, docs);
+      if (docs != nullptr) result = docs->ops.at("f")->facetResult();
+    } else {
+      result = req->responses[0]->proto.ops.at("f")->facetResult();
+    }
+    EXPECT_NE(nullptr, result);
+    std::vector<std::byte> encoded;
+    if (result != nullptr) {
+      EXPECT_TRUE(api::encode(*result, encoded));
+    }
+    return encoded;
+  };
+
+  for (std::string_view parentField : {"parent_s", "parent_ss"}) {
+    for (std::string_view childField : {"child_s", "child_ss"}) {
+      for (bool filtered : {false, true}) {
+        auto expected = run(
+            parentField, childField, filtered,
+            FacetFeedStrategy::BUCKET_DOMAINS,
+            StrFacetReplaySelector::AUTO,
+            StrFacetReplayBankStrategy::AUTO);
+        EXPECT_EQ(expected, run(
+            parentField, childField, filtered,
+            FacetFeedStrategy::STRING_COLUMN_REPLAY,
+            StrFacetReplaySelector::AUTO,
+            StrFacetReplayBankStrategy::AUTO));
+        for (auto selector : {StrFacetReplaySelector::DENSE,
+                              StrFacetReplaySelector::SPARSE}) {
+          for (auto bank : {StrFacetReplayBankStrategy::VECTOR,
+                            StrFacetReplayBankStrategy::SKINNY,
+                            StrFacetReplayBankStrategy::PACKED_HASH,
+                            StrFacetReplayBankStrategy::WIDE_HASH}) {
+            EXPECT_EQ(expected, run(
+                parentField, childField, filtered,
+                FacetFeedStrategy::STRING_COLUMN_REPLAY, selector, bank))
+                << parentField << " -> " << childField
+                << " filtered=" << filtered
+                << " selector=" << (int)selector
+                << " bank=" << (int)bank;
+          }
+        }
+      }
+    }
+  }
 }
 
 //

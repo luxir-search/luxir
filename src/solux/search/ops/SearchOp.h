@@ -11,6 +11,8 @@
 
 namespace solux {
 class DocSet;
+struct FacetChildContext;
+class FacetChildExecutor;
 
 // --- Request-side (non-owning) proto message views ---
 // Sub-messages of the request proto (ReqProto = SearchRequest<non_owning_traits>),
@@ -77,6 +79,15 @@ public:
   }
   virtual bool canInline() {
     return false;
+  }
+
+  // Result-stage facet children may bind to parent-produced sources. The
+  // default operation has no specialized binding and uses BUCKET_DOMAINS.
+  // The returned executor is owned by the parent coordinator.
+  virtual FacetChildExecutor* bindFacetChild(
+      const FacetChildContext& context) {
+    unused(context);
+    return nullptr;
   }
 
   virtual ~SearchOp() = default;

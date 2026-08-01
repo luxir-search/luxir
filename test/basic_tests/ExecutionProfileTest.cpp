@@ -11,6 +11,7 @@
 #include "solux/api/padded_input.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/reader/SkipStats.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/server/JsonResponse.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -36,6 +37,25 @@ const api::ExecutionProfileOp& profileOp(const LocalReq& req) {
   EXPECT_EQ(1u, response.profile->ops.size());
   return response.profile->ops[0];
 }
+
+const api::ExecutionProfileOp& profileOp(
+    const LocalReq& req, std::string_view name) {
+  const auto& response = req.responses.back()->proto;
+  EXPECT_TRUE(response.profile.has_value());
+  if (response.profile) {
+    for (const auto& op : response.profile->ops) {
+      if (op.name == name) return op;
+    }
+  }
+  ADD_FAILURE() << "profile op not found: " << name;
+  return response.profile->ops.front();
+}
+
+class FacetFeedStrategyGuard {
+  FacetFeedStrategy saved = forcedFacetFeedStrategy;
+public:
+  ~FacetFeedStrategyGuard() { forcedFacetFeedStrategy = saved; }
+};
 
 // details is free-form prose for humans and NOT an API, but tests ship with the
 // code, so matching a marker in it is a fine way to confirm the intended path
@@ -189,6 +209,63 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
     EXPECT_TRUE(detailsMention(piece, "result-feed=bucket-domains"));
     EXPECT_TRUE(detailsMention(piece, "global docFreq top terms"));
     EXPECT_TRUE(detailsMention(piece, "3 listed"));
+  }
+}
+
+TEST_F(ExecutionProfileTest, nestedAutoSelectsReplayAndFallsBack) {
+  CollectionHelper helper("profile-nested-auto");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 200; i++) {
+    docs.push_back(flatdoc(
+        "id", std::to_string(i),
+        "parent_s", "parent-" + std::to_string(i % 4),
+        "child_s", "child-" + std::to_string(i % 7),
+        "sel_s", i == 0 ? "yes" : "no"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  FacetFeedStrategyGuard guard;
+  auto run = [&](FacetFeedStrategy feed, bool filtered) {
+    forcedFacetFeedStrategy = feed;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("profile-nested-auto").profile();
+    auto addFacet = [](auto& cursor) {
+      cursor.facet("parent", "parent_s").limit(10)
+          .facet("child", "child_s").limit(10);
+    };
+    if (filtered) {
+      auto& top = req->topDocs("q");
+      top.matchQuery("sel_s", "yes");
+      addFacet(top);
+    } else {
+      addFacet(*req);
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  auto encodeParent = [](const LocalReq& req, bool filtered) {
+    const api::FacetResult* result = filtered
+        ? req.docList("q")->ops.at("parent")->facetResult()
+        : req.responses[0]->proto.ops.at("parent")->facetResult();
+    std::vector<std::byte> encoded;
+    EXPECT_NE(nullptr, result);
+    if (result != nullptr) {
+      EXPECT_TRUE(api::encode(*result, encoded));
+    }
+    return encoded;
+  };
+
+  auto baseline = run(FacetFeedStrategy::BUCKET_DOMAINS, true);
+  auto automatic = run(FacetFeedStrategy::AUTO, true);
+  EXPECT_EQ(encodeParent(*baseline, true), encodeParent(*automatic, true));
+  for (const auto& piece : profileOp(*automatic, "parent").pieces) {
+    EXPECT_TRUE(detailsMention(piece, "result-feed=string-column-replay"));
+  }
+
+  auto fallback = run(FacetFeedStrategy::AUTO, false);
+  for (const auto& piece : profileOp(*fallback, "parent").pieces) {
+    EXPECT_TRUE(detailsMention(piece, "result-feed=bucket-domains"));
   }
 }
 

@@ -39,6 +39,39 @@ const T* gallopLowerBound(const T* lo, const T* hi, const T& key) noexcept {
   return std::lower_bound(lo + loIdx, lo + hiIdx, key);
 }
 
+// Index/projection form for monotonic encoded sources that do not expose a
+// contiguous value array. The caller can carry the returned index forward for
+// the next increasing key, preserving the same O(log distance) behavior.
+template <typename T, typename ValueAt>
+int64_t gallopLowerBound(int64_t lo, int64_t hi, const T& key,
+                         ValueAt&& valueAt) {
+  if (lo >= hi) return lo;
+  if (valueAt(lo) >= key) return lo;
+
+  int64_t lastLess = lo;
+  int64_t distance = hi - lo;
+  int64_t step = 1;
+  while (step < distance) {
+    int64_t probe = lo + step;
+    if (valueAt(probe) >= key) break;
+    lastLess = probe;
+    if (step > distance / 2) {
+      step = distance;
+    } else {
+      step <<= 1;
+    }
+  }
+
+  int64_t first = lastLess + 1;
+  int64_t end = step < distance ? lo + step + 1 : hi;
+  while (first < end) {
+    int64_t mid = first + ((end - first) >> 1);
+    if (valueAt(mid) < key) first = mid + 1;
+    else end = mid;
+  }
+  return first;
+}
+
 // Design:
 //   - Need ability to efficiently find the rank of a value (i.e. the number of values that come before it)
 //     Motivation: bitsets are often used with parallel arrays (i.e. doc values, where each entry has a document id
