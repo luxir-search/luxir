@@ -1380,10 +1380,12 @@ public:
               termFeed && candidatePostingsLead != nullptr;
         }
 
-        auto* prohibitedArr =
-            targetPool.make_arr<Query::Scorer*>(prohibitedSources.size());
+        Query::Scorer** prohibitedArr = nullptr;
         size_t prohibitedCount = 0;
+        std::span<TermQuery::Scorer*> candidateProhibitedTerms;
         if (exhaustive) {
+          prohibitedArr =
+              targetPool.make_arr<Query::Scorer*>(prohibitedSources.size());
           for (auto* source : prohibitedSources) {
             auto* supplier = source->scorerSupplier(targetPool, segment);
             if (supplier == nullptr) {
@@ -1394,10 +1396,40 @@ public:
               prohibitedArr[prohibitedCount++] = scorer;
             }
           }
+        } else if (mode == ConjunctionMode::CANDIDATE
+                   && !prohibitedSources.empty()) {
+          auto& terms = *targetPool.make_vec<TermQuery::Scorer*>();
+          for (auto* source : prohibitedSources) {
+            auto* supplier = source->scorerSupplier(targetPool, segment);
+            if (supplier == nullptr) {
+              continue;
+            }
+            auto* scorer = supplier->get(targetPool, leadCost);
+            if (scorer == nullptr) {
+              continue;
+            }
+            if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
+              terms.push_back(term);
+              continue;
+            }
+            auto members = scorer->flatDisjunctionScorers();
+            if (members.empty()) {
+              return nullptr;
+            }
+            for (auto* member : members) {
+              auto* term = dynamic_cast<TermQuery::Scorer*>(member);
+              if (term == nullptr) {
+                return nullptr;
+              }
+              terms.push_back(term);
+            }
+          }
+          candidateProhibitedTerms = {terms.data(), terms.size()};
         }
         return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
             targetPool, std::span<Query::Scorer*>(arr, entries.size()),
             std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
+            candidateProhibitedTerms,
             clauseScores, segment.maxDoc(), leadCost, nonLeadCost, !exhaustive,
             entries[0].docSetFilter, candidatePostingsLead,
             candidateLeadScoreScorer,
@@ -1681,7 +1713,7 @@ public:
 
       BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
         if (!needsScores || filterSuppliers.empty()
-            || !prohibitedSources.empty() || minShouldMatch > 1) {
+            || minShouldMatch > 1) {
           return nullptr;
         }
         int64_t localFilterCost = minFilterCost();
@@ -1726,6 +1758,12 @@ public:
             }
             return candidate;
           }
+        }
+
+        // Exclusions are admitted only by the candidate conjunction above.
+        // The scored-body plus WindowFilter fallback has no AND-NOT stage.
+        if (!prohibitedSources.empty()) {
+          return nullptr;
         }
 
         // Ask the positive body to plan its own bulk route. This keeps route
@@ -1855,6 +1893,12 @@ public:
           return filterOnlyBulkScorer(targetPool);
         }
         if (needsScores && !prohibitedSources.empty()) {
+          if (!filterSuppliers.empty()
+              && !disableFilteredScoredBulkForTests) {
+            if (auto* bulk = filteredScoredBulkScorer(targetPool)) {
+              return bulk;
+            }
+          }
           // Normalization hoists +(a b) -c to this exact shape. Required,
           // filtered, min-match, and single-positive forms retain their
           // existing pull/conjunction routing.
@@ -4182,6 +4226,7 @@ public:
       return value != nullptr
           ? std::atoi(value) : kTermTailDenseThresholdInverse;
     }();
+    // The generic lead fill consumes one postings block at a time.
     static inline int32_t filteredConjunctionBatchSizeForTests =
         kFilteredConjunctionBatchSize;
     static inline bool disableDisjGroupBulkForTests = false;
@@ -4218,6 +4263,7 @@ public:
 
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
     std::span<Query::Scorer*> prohibitedScorers;
+    std::span<TermQuery::Scorer*> candidateProhibitedTerms;
     std::span<const uint8_t> scoringClauses;
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
     std::span<TermClause> termClauses;  // direct terms or decomposed flat unions
@@ -4846,6 +4892,44 @@ public:
       return size;
     }
 
+    int32_t compactCandidateProhibitedTerms(int32_t size) {
+      if (candidateProhibitedTerms.empty() || size == 0) {
+        return size;
+      }
+      size_t words = ((size_t) size + 63) >> 6;
+      std::fill(clauseBits.begin(), clauseBits.begin() + (ptrdiff_t) words, 0);
+      auto matches = clauseBits.first(words);
+      for (auto* term : candidateProhibitedTerms) {
+        term->addMatchesToCandidates(candDocs.data(), size, matches);
+      }
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        if ((matches[(size_t) (i >> 6)] & (1ULL << (i & 63))) != 0) {
+          continue;
+        }
+        candDocs[(size_t) write] = candDocs[(size_t) i];
+        candScores[(size_t) write] = candScores[(size_t) i];
+        write++;
+      }
+      return write;
+    }
+
+    int32_t compactCompetitiveCandidates(int32_t size) {
+      if (minCompetitiveScore == std::numeric_limits<float>::lowest()) {
+        return size;
+      }
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        if (candScores[(size_t) i] < minCompetitiveScore) {
+          continue;
+        }
+        candDocs[(size_t) write] = candDocs[(size_t) i];
+        candScores[(size_t) write] = candScores[(size_t) i];
+        write++;
+      }
+      return write;
+    }
+
     template <bool TermFast, bool TermTailFast = false,
               bool CandidatePostingsFeed = false,
               bool CandidateTermFeed = false>
@@ -5035,6 +5119,10 @@ public:
                   : applyScorerToCandidates<
                       true, TermFast, TermTailFast>(c, n, remaining);
             }
+          }
+          if (!candidateProhibitedTerms.empty()) {
+            n = compactCompetitiveCandidates(n);
+            n = compactCandidateProhibitedTerms(n);
           }
           for (int32_t i = 0; i < n; i++) {
             if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
@@ -5644,6 +5732,8 @@ public:
   public:
     ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
                           std::span<Query::Scorer*> prohibitedScorers,
+                          std::span<TermQuery::Scorer*>
+                              candidateProhibitedTerms,
                           std::span<const uint8_t> scoringClauses,
                           int32_t maxDoc, int64_t leadCost,
                           int64_t nonLeadCost, bool scoredConstruction,
@@ -5654,6 +5744,7 @@ public:
                           std::span<DocSet*> candidateFilterDocSets)
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
+          candidateProhibitedTerms(candidateProhibitedTerms),
           scoringClauses(scoringClauses),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
@@ -5700,6 +5791,7 @@ public:
           candidateFilterDocSets(candidateFilterDocSets) {
       assert(!scorers.empty());
       assert(scoringClauses.size() == scorers.size());
+      assert(candidateBatchSize >= kChunk);
       if (!candidateFilterDocSets.empty()) {
         candidateFilterProbes =
             pool.make_span<DocSetProbe>(candidateFilterDocSets.size());

@@ -198,6 +198,23 @@ public:
   }
 };
 
+class FilteredConjunctionBatchSizeGuard {
+  int32_t saved;
+
+public:
+  explicit FilteredConjunctionBatchSizeGuard(int32_t size)
+    : saved(BooleanQuery::ConjunctionBulkScorer::
+                filteredConjunctionBatchSizeForTests) {
+    BooleanQuery::ConjunctionBulkScorer::
+        filteredConjunctionBatchSizeForTests = size;
+  }
+
+  ~FilteredConjunctionBatchSizeGuard() {
+    BooleanQuery::ConjunctionBulkScorer::
+        filteredConjunctionBatchSizeForTests = saved;
+  }
+};
+
 class FilteredConjRatioGuard {
   int64_t savedDocSet;
   int64_t savedPostings;
@@ -1557,6 +1574,8 @@ TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
 
 TEST(FilterCacheIntegrationTest,
      scoredSparseFilterCandidateFeedsMatchOracles) {
+  FilteredConjunctionBatchSizeGuard batchSizeGuard(
+      Postings::DOCS_BLOCK_SIZE);
   SoluxConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
   SoluxConfig uncachedConfig;
@@ -1582,6 +1601,12 @@ TEST(FilterCacheIntegrationTest,
     if (doc % 3 == 0) {
       body += " gamma";
     }
+    if (doc % 7 == 0) {
+      body += " delta";
+    }
+    if (doc >= maxDoc / 2 && doc % 11 == 0) {
+      body += " segment_only";
+    }
     if (doc % 64 == 0) {
       body += " rare";
     }
@@ -1592,8 +1617,19 @@ TEST(FilterCacheIntegrationTest,
         "id", std::to_string(doc), "body_w", body,
         "filter_w", filterValue));
   }
-  ASSERT_TRUE(cached.indexAll(docs, UpdateMessage::COMMIT).success);
-  ASSERT_TRUE(uncached.indexAll(docs, UpdateMessage::COMMIT).success);
+  size_t split = docs.size() / 2;
+  ASSERT_TRUE(cached.indexAll(
+      std::span<const solux::test::Doc>(docs).first(split),
+      UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(cached.indexAll(
+      std::span<const solux::test::Doc>(docs).subspan(split),
+      UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(uncached.indexAll(
+      std::span<const solux::test::Doc>(docs).first(split),
+      UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(uncached.indexAll(
+      std::span<const solux::test::Doc>(docs).subspan(split),
+      UpdateMessage::COMMIT).success);
 
   struct Result {
     int64_t count = 0;
@@ -1609,6 +1645,12 @@ TEST(FilterCacheIntegrationTest,
     FILTER_LED,
     TERM_LED_MULTI,
     TERM_LED_ONE,
+    FILTER_LED_NEGATED_ONE,
+    FILTER_LED_NEGATED_TWO,
+    FILTER_LED_NEGATED_GROUP,
+    TERM_LED_NEGATED,
+    SEGMENT_LOCAL_NEGATION,
+    PHRASE_NEGATION,
   };
   auto run = [&](SoluxNode& node, std::string_view filterTerm,
                  bool pruning, bool disablePostingsFeed,
@@ -1626,6 +1668,40 @@ TEST(FilterCacheIntegrationTest,
         .limit(100);
     if (shape == QueryShape::TERM_LED_ONE) {
       cursor.matchQuery("body_w", "rare");
+    } else if (shape == QueryShape::FILTER_LED_NEGATED_ONE
+               || shape == QueryShape::FILTER_LED_NEGATED_TWO
+               || shape == QueryShape::FILTER_LED_NEGATED_GROUP
+               || shape == QueryShape::TERM_LED_NEGATED
+               || shape == QueryShape::SEGMENT_LOCAL_NEGATION
+               || shape == QueryShape::PHRASE_NEGATION) {
+      auto& mr = cursor.mr();
+      std::vector<api::Query> required;
+      required.push_back(solux::test::qb::match(
+          mr, "body_w",
+          shape == QueryShape::TERM_LED_NEGATED ? "rare" : "alpha"));
+      std::vector<api::Query> prohibited;
+      if (shape == QueryShape::FILTER_LED_NEGATED_GROUP) {
+        std::array group = {
+            solux::test::qb::match(mr, "body_w", "gamma"),
+            solux::test::qb::match(mr, "body_w", "delta")};
+        prohibited.push_back(
+            solux::test::qb::boolean(mr, {}, group));
+      } else if (shape == QueryShape::SEGMENT_LOCAL_NEGATION) {
+        prohibited.push_back(solux::test::qb::match(
+            mr, "body_w", "segment_only"));
+      } else if (shape == QueryShape::PHRASE_NEGATION) {
+        prohibited.push_back(solux::test::qb::phraseWords(
+            mr, "body_w", {"beta", "gamma"}));
+      } else {
+        prohibited.push_back(solux::test::qb::match(
+            mr, "body_w", "gamma"));
+        if (shape == QueryShape::FILTER_LED_NEGATED_TWO) {
+          prohibited.push_back(solux::test::qb::match(
+              mr, "body_w", "delta"));
+        }
+      }
+      cursor.rawQuery() = solux::test::qb::boolean(
+          mr, required, {}, prohibited);
     } else if (shape != QueryShape::ONE_TERM) {
       std::string_view third = shape == QueryShape::FILTER_LED
           ? "gamma" : "rare";
@@ -1758,6 +1834,55 @@ TEST(FilterCacheIntegrationTest,
   };
   verifyTermLead(QueryShape::TERM_LED_MULTI, true);
   verifyTermLead(QueryShape::TERM_LED_ONE, false);
+
+  // Direct term exclusions consume the already-small candidate batch as an
+  // OR membership mask. They do not participate in candidate ownership,
+  // scoring, or score bounds. Exercise both filter provenances, both lead
+  // owners, separate and grouped exclusions, and a segment where the
+  // exclusion has no scorer.
+  auto verifyNegated = [&](QueryShape shape, bool termLead) {
+    run(cachedNode, "semidense", true, false, false, shape);
+    run(cachedNode, "semidense", true, false, false, shape);
+    Result cachedNegated = run(
+        cachedNode, "semidense", true, false, false, shape);
+    Result postingsNegated = run(
+        uncachedNode, "semidense", true, false, false, shape);
+    Result pullNegated = run(
+        uncachedNode, "semidense", true, false, true, shape);
+
+    EXPECT_FALSE(cachedNegated.ids.empty());
+    EXPECT_GT(cachedNegated.batchEngagements, 0);
+    EXPECT_EQ(termLead, cachedNegated.termFeedEngagements > 0);
+    EXPECT_EQ(0, cachedNegated.postingsFeedEngagements);
+    EXPECT_GT(postingsNegated.batchEngagements, 0);
+    EXPECT_EQ(termLead, postingsNegated.termFeedEngagements > 0);
+    EXPECT_EQ(!termLead,
+              postingsNegated.postingsFeedEngagements > 0);
+    EXPECT_EQ(0, pullNegated.batchEngagements);
+    EXPECT_EQ(cachedNegated.count, postingsNegated.count);
+    EXPECT_EQ(pullNegated.count, postingsNegated.count);
+    EXPECT_EQ(cachedNegated.ids, postingsNegated.ids);
+    EXPECT_EQ(cachedNegated.scores, postingsNegated.scores);
+    EXPECT_EQ(pullNegated.ids, postingsNegated.ids);
+    EXPECT_EQ(pullNegated.scores, postingsNegated.scores);
+  };
+  verifyNegated(QueryShape::FILTER_LED_NEGATED_ONE, false);
+  verifyNegated(QueryShape::FILTER_LED_NEGATED_TWO, false);
+  verifyNegated(QueryShape::FILTER_LED_NEGATED_GROUP, false);
+  verifyNegated(QueryShape::TERM_LED_NEGATED, true);
+  verifyNegated(QueryShape::SEGMENT_LOCAL_NEGATION, false);
+
+  // A two-phase exclusion cannot be represented by the term-membership
+  // primitive and must preserve the pull plan.
+  Result phrase = run(
+      uncachedNode, "semidense", true, false, false,
+      QueryShape::PHRASE_NEGATION);
+  Result phrasePull = run(
+      uncachedNode, "semidense", true, false, true,
+      QueryShape::PHRASE_NEGATION);
+  EXPECT_EQ(0, phrase.batchEngagements);
+  EXPECT_EQ(phrasePull.ids, phrase.ids);
+  EXPECT_EQ(phrasePull.scores, phrase.scores);
 }
 
 enum class ExactFilteredConjShape {
