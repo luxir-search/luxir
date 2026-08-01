@@ -409,7 +409,7 @@ public:
     if (!docsIter.has_value() || docid <= lastDoc) {
       docsIter.emplace(*docsBitset);
     }
-    int32_t found = docsIter->advance(docid);
+    [[maybe_unused]] int32_t found = docsIter->advance(docid);
     assert(found == docid);
     lastDoc = docid;
     int32_t ord = docsIter->rank();
@@ -933,7 +933,7 @@ private:  // some internal utility methods... not for use by indexers
         : (uint8_t) ((l1GroupBlockCount - 1) / checkpointStrideForTests);
     header_output.push_back((char) entryCount);
     if (!disableL0CheckpointWrite) {
-      uint32_t previousKey = 0;
+      [[maybe_unused]] uint32_t previousKey = 0;
       for (int32_t b = checkpointStrideForTests; b < l1GroupBlockCount;
            b += checkpointStrideForTests) {
         uint32_t key = l1BlockLastDocs[(size_t) b - 1];
@@ -1405,7 +1405,7 @@ public:
     }
     termOutput.write(pulsedRun.data(), pulsedRun.size());
 
-    uint32_t pulsedTerms = std::popcount(termPulsedMask);
+    [[maybe_unused]] uint32_t pulsedTerms = std::popcount(termPulsedMask);
     assert(pulsed.size() == (size_t)pulsedTerms * (hasPositions ? 2u : 1u));
     rememberLastTermOfCurrentBlock();
 

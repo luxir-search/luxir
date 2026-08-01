@@ -476,7 +476,7 @@ static void BM_TermSeekExact_hit(benchmark::State& state, TermSource source) {
     uint64_t fp = 1;
     for (int32_t ord : corpus->hitOrds) {
       std::string_view target = corpus->terms[ord];
-      bool found = tenum.seek(target);
+      [[maybe_unused]] bool found = tenum.seek(target);
       assert(found);
       assert(tenum.ord() == ord);
       fp = fp * 31 + (uint64_t)tenum.ord();
@@ -500,7 +500,7 @@ static void BM_TermSeekExact_miss(benchmark::State& state, TermSource source) {
   for (auto _ : state) {
     uint64_t fp = 1;
     for (const std::string& target : corpus->missTargets) {
-      bool found = tenum.seek(target);
+      [[maybe_unused]] bool found = tenum.seek(target);
       assert(!found);
       fp = fp * 31 + 7;
     }
@@ -523,7 +523,8 @@ static void BM_TermSeekCeil_jump(benchmark::State& state, TermSource source) {
   for (auto _ : state) {
     uint64_t fp = 1;
     for (int32_t i = 0; i < (int32_t)corpus->ceilTargets.size(); i++) {
-      bool found = tenum.seekCeil(corpus->ceilTargets[i]);
+      [[maybe_unused]] bool found =
+          tenum.seekCeil(corpus->ceilTargets[i]);
       assert(found);
       assert(tenum.ord() == corpus->ceilExpectedOrds[i]);
       fp = fp * 31 + (uint64_t)tenum.ord();
@@ -551,7 +552,8 @@ static void BM_TermStats_dict(benchmark::State& state, TermSource source) {
     uint64_t fp = 1;
     for (int32_t ord : corpus->hitOrds) {
       Similarity::TermStats stats;
-      bool found = context.lookupTermStats(*cachedFieldInfo, corpus->terms[(size_t)ord], stats);
+      [[maybe_unused]] bool found = context.lookupTermStats(
+          *cachedFieldInfo, corpus->terms[(size_t)ord], stats);
       assert(found);
       fp = addStatsFingerprint(fp, stats);
     }

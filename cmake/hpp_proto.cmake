@@ -37,7 +37,7 @@ target_compile_options(is_utf8 PRIVATE -Wno-error=pragmas)
 
 # --- runtime (header-only) interface for consumers of generated code ---
 add_library(hpp_proto_runtime INTERFACE)
-target_include_directories(hpp_proto_runtime INTERFACE "${HPP_PROTO_DIR}/include")
+target_include_directories(hpp_proto_runtime SYSTEM INTERFACE "${HPP_PROTO_DIR}/include")
 target_link_libraries(hpp_proto_runtime INTERFACE is_utf8)
 target_compile_features(hpp_proto_runtime INTERFACE cxx_std_23)
 add_library(hpp_proto::runtime ALIAS hpp_proto_runtime)

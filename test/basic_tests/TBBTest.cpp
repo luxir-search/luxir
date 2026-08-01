@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <stdatomic.h>
+#include <stdexcept>
 #include <oneapi/tbb/parallel_invoke.h>
 #include <oneapi/tbb/parallel_for.h>
 
@@ -84,13 +85,13 @@ protected:
       std::unique_lock<std::mutex> lock(indexLock);
       seenThreads.insert(std::this_thread::get_id());
       // if there are no *new* changes, we still want to wait for the previous commit to finish.
-      UpdateMessage* umsg = new UpdateMessage();  // this stack reference is what will keep the CommitInfo alive during the commit
+      auto umsg = std::make_unique<UpdateMessage>();
       umsg->commitNum = totalCommits;
+      if (!commitMain->try_put(umsg.get())) {
+        throw std::runtime_error("Commit admission failed");
+      }
+      umsg.release();
       totalCommits++;
-      lock.unlock();
-
-      auto success = commitMain->try_put(umsg);
-      assert(success);
     }
 
 

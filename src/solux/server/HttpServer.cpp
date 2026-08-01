@@ -2374,10 +2374,12 @@ void HttpServer::shutdown() {
   // Must be driven from a non-io thread: we join the io threads below, so a
   // self-call would deadlock.  Current callers (main / test thread, destructor)
   // satisfy this; assert to catch a future io-thread caller.
+#ifndef NDEBUG
   for (auto& t : threads) {
     assert(t.get_id() != std::this_thread::get_id()
            && "HttpServer::shutdown() must not be called from an io thread");
   }
+#endif
 
   // 1) Stop accepting.  Posted onto the acceptor's strand so it does not race the
   //    accept loop; the drain below keeps the io_context alive until it runs.

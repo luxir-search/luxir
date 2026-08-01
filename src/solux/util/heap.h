@@ -327,7 +327,9 @@ public:
     assert(heapSize < heap.size());
     heap[heapSize] = elem;
     heapSize++;
-    std::push_heap(heap.begin(), end(), comp);
+    if (heapSize > 1) {
+      std::push_heap(heap.begin(), end(), comp);
+    }
   }
 
   /// If capacity has been reached, the largest element is removed (i.e. heap keeps smallest)

@@ -1624,7 +1624,7 @@ private:
     int32_t minSize = std::numeric_limits<int32_t>::max();
     int32_t maxSize = std::numeric_limits<int32_t>::min();
     int64_t cumulativeBytes = 0;
-    bool isDense = true;
+    [[maybe_unused]] bool isDense = true;
 
     // Emits one value into the merged output: appends its bytes, updates size tracking,
     // and writes the corresponding endOffset entry (lazily starting the mono column if
@@ -1848,7 +1848,7 @@ private:
     }
 
     int64_t endValueRankBase = 0;  // used to calculate the endValueRank for each segment, if multivalued.
-    int32_t docsWithField = 0;
+    [[maybe_unused]] int32_t docsWithField = 0;
 
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];

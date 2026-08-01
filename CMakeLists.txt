@@ -64,13 +64,7 @@ include_directories(SYSTEM ./src)
 find_package(xxHash CONFIG REQUIRED)
 
 #from clion docs
-find_package(Boost)
-IF (Boost_FOUND)
-    include_directories(${Boost_INCLUDE_DIR})
-endif()
-set (Boost_USE_STATIC_LIBS OFF) # enable dynamic linking
-set (Boost_USE_MULTITHREAD ON)  # enable multithreading
-find_package (Boost COMPONENTS REQUIRED core thread sort)
+find_package(Boost CONFIG REQUIRED COMPONENTS core thread sort)
 
 find_package(TBB CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
@@ -268,7 +262,7 @@ target_include_directories(solux_lib PRIVATE ${GTL_INCLUDE_DIRS})
 
 target_link_libraries(solux_lib PRIVATE TBB::tbb)
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
-target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
+target_link_libraries(solux_lib PUBLIC Boost::core Boost::thread Boost::sort)
 target_link_libraries(solux_lib PRIVATE fastpfor)
 # Concrete solux::api wire model (post-cutover): hand-written concrete structs + out-of-line
 # pb_meta/glz::meta (solux_proto_concrete) carrying hpp_proto::runtime (is_utf8) + glaze.

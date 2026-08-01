@@ -478,7 +478,15 @@ public:
       SparseBucket sparse;
       DenseBucket bits;
 
-      Bucket() {};
+      Bucket() : sparse{nullptr, -1} {}
+
+      void setSparse(uint16_t* values) {
+        std::construct_at(&sparse, SparseBucket{values, -1});
+      }
+
+      void setDense(Bits::word_type* words) {
+        std::construct_at(&bits, DenseBucket{Bits(words)});
+      }
     } bucket;
 
     // enum that takes 16 bits
@@ -639,14 +647,13 @@ public:
       bucketSize = desc.size + 1;
       if (bucketSize <= BUCKET_SPARSE_MAX) {
         bucketType = SPARSE;
-        bucket.sparse.index = -1;
-        bucket.sparse.values = (uint16_t*)(set->start + desc.offset);
+        bucket.setSparse((uint16_t*)(set->start + desc.offset));
         return sparseNext();
       } else {
         bucketType = DENSE;
         assert((reinterpret_cast<uintptr_t>(set->start + desc.offset)
                 & (BLOCK_ALIGN - 1)) == 0);
-        bucket.bits.obs = Bits((Bits::word_type*)(set->start + desc.offset));
+        bucket.setDense((Bits::word_type*)(set->start + desc.offset));
         curr = bucketBase - 1;
         return denseNext();
       }
@@ -673,13 +680,12 @@ public:
       bucketSize = desc.size + 1;
       if (bucketSize <= BUCKET_SPARSE_MAX) {
         bucketType = SPARSE;
-        bucket.sparse.index = -1;
-        bucket.sparse.values = (uint16_t*)(set->start + desc.offset);
+        bucket.setSparse((uint16_t*)(set->start + desc.offset));
       } else {
         bucketType = DENSE;
         assert((reinterpret_cast<uintptr_t>(set->start + desc.offset)
                 & (BLOCK_ALIGN - 1)) == 0);
-        bucket.bits.obs = Bits((Bits::word_type*)(set->start + desc.offset));
+        bucket.setDense((Bits::word_type*)(set->start + desc.offset));
         curr = bucketBase - 1;
       }
     }

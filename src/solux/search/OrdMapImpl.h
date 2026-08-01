@@ -127,7 +127,7 @@ class OrdMapBuilder {
     template <class Acceptor>
     void forEachValue(Acceptor&& acceptor) const {
       assert(!writer);
-      uint64_t seen = 0;
+      [[maybe_unused]] uint64_t seen = 0;
       uint64_t values[128];
       for (size_t runIdx = 0; runIdx < runs.size(); runIdx++) {
         const auto& run = runs[runIdx];
@@ -187,7 +187,7 @@ class OrdMapBuilder {
       forEachValue([&](uint64_t, uint64_t value) {
         finalWriter.append(value);
       });
-      uint64_t written = finalWriter.finish();
+      [[maybe_unused]] uint64_t written = finalWriter.finish();
       assert(written == LinearPack::byteSize(count, finalBits));
     }
 
@@ -197,14 +197,14 @@ class OrdMapBuilder {
       assert(!writer);
       if (plan.bits == 0) return;
       LinearPack::Writer residualWriter(out, plan.bits);
-      uint64_t mask = LinearPack::mask64(plan.bits);
+      [[maybe_unused]] uint64_t mask = LinearPack::mask64(plan.bits);
       forEachValue([&](uint64_t index, uint64_t value) {
         uint64_t residual = OrdColumnFormat::residual(
             plan, index, value, OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT);
         assert(residual <= mask);
         residualWriter.append(residual);
       });
-      uint64_t written = residualWriter.finish();
+      [[maybe_unused]] uint64_t written = residualWriter.finish();
       assert(written == LinearPack::byteSize(count, plan.bits));
     }
 
@@ -235,7 +235,7 @@ class OrdMapBuilder {
       maxResidualBits = std::max(maxResidualBits, plan.info.bits);
       if (plan.info.bits != 0) {
         LinearPack::Writer writer(payload, plan.info.bits);
-        uint64_t mask = LinearPack::mask64(plan.info.bits);
+        [[maybe_unused]] uint64_t mask = LinearPack::mask64(plan.info.bits);
         for (uint32_t i = 0; i < blockCount; i++) {
           uint64_t residual = OrdColumnFormat::residual(
               plan.info, i, block[i]);

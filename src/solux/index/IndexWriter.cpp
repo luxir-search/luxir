@@ -539,16 +539,18 @@ void IndexWriter::commit(std::function<void()>&& callback, UpdateMessage::Commit
 
     void done(IndexWriter& iw) override {
       unused(iw);
+      std::unique_ptr<UpdateMessageWithCallback> self(this);
       callback();
-      delete this;
     }
   };
 
-  UpdateMessageWithCallback* updateMessage = new UpdateMessageWithCallback();
+  auto updateMessage = std::make_unique<UpdateMessageWithCallback>();
   updateMessage->commit = commitType;
   updateMessage->callback = std::move(callback);
-  auto success = submitUpdate(updateMessage);
-  assert(success);
+  if (!submitUpdate(updateMessage.get())) {
+    throw std::runtime_error("Commit admission failed");
+  }
+  updateMessage.release();
 }
 
 
@@ -572,8 +574,9 @@ void IndexWriter::commit(UpdateMessage::CommitType commitType) {
   updateMessage.commit = commitType;
 
   INDEX_DEBUG("SYNC_COMMIT_START: msg={}", (void*)&updateMessage);
-  bool success = submitUpdate(&updateMessage);
-  assert(success);
+  if (!submitUpdate(&updateMessage)) {
+    throw std::runtime_error("Commit admission failed");
+  }
 
   updateMessage.blocker.wait();
   INDEX_DEBUG("SYNC_COMMIT_END: msg={}", (void*)&updateMessage);
@@ -2275,8 +2278,9 @@ void IndexWriter::mergeSegments() {
   BlockingCommitMessage commitMessage;
   commitMessage.commit = UpdateMessage::COMMIT;
   commitMessage.maxSegments = 1;
-  bool accepted = submitUpdate(&commitMessage);
-  assert(accepted);
+  if (!submitUpdate(&commitMessage)) {
+    throw std::runtime_error("Force-merge commit admission failed");
+  }
   commitMessage.blocker.wait();
 }
 

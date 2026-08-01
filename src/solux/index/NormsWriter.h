@@ -59,7 +59,7 @@ private:
     MemPool scratchPool;
     DocsWriter docsWriter(scratchPool, tempOut);
     docsWithVal.pushDocs(pool, docsWriter);
-    int32_t added = docsWriter.finish();
+    [[maybe_unused]] int32_t added = docsWriter.finish();
     assert(added == docsWithField);
     tempOut.close();
 

@@ -263,9 +263,13 @@ void forEachOrdValueImpl(DocSet* domain, OrdColReader& ordColReader,
                          int32_t maxDoc, int64_t& missing_num, F&& callback,
                          OrdColReader::ForEachOrdStats* stats) {
   if constexpr (!Complement) {
-    if (domain && domain->type == DocSet::Type::ARRAY) {
+    if (domain != nullptr && domain->type == DocSet::Type::ARRAY) {
+      auto* arrayDomain = dynamic_cast<ArrDocSet*>(domain);
+      if (arrayDomain == nullptr) {
+        throw std::logic_error("ARRAY DocSet has a non-array dynamic type");
+      }
       ordColReader.forEachOrd(
-          ((ArrDocSet*)domain)->docs(), missing_num, callback, stats);
+          arrayDomain->docs(), missing_num, callback, stats);
       return;
     }
   }
