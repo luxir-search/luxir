@@ -143,7 +143,19 @@ private:
       }
       bool hasRequired = inner != nullptr
         && (!inner->mandatory.empty() || !inner->filter.empty());
-      bool optionalsAllowed = parentIsFilter || (inner != nullptr && inner->optional.empty());
+      // A sole required child may lift its rank-only optionals into an outer
+      // Boolean that has no optional constraint of its own. This is the same
+      // required body and the same optional score decoration, while exposing
+      // outer filters to cost-ordered required planning. Multiple required
+      // children stay opaque because lifting would reorder their score sums.
+      bool liftRankOnlyOptionals =
+          !parentIsFilter && inner != nullptr
+          && inner->minShouldMatch == 0 && parents.size() == 1
+          && !plan.filter.empty() && plan.optional.empty()
+          && plan.minShouldMatch == 0;
+      bool optionalsAllowed = parentIsFilter
+          || (inner != nullptr
+              && (inner->optional.empty() || liftRankOnlyOptionals));
       if (inner == nullptr || inner->minShouldMatch != 0 || !hasRequired
           || !optionalsAllowed) {
         i++;
@@ -157,6 +169,12 @@ private:
       } else {
         for (Query* query : inner->mandatory) {
           replacement.push_back(scoringClause(pool, query, child.boost));
+        }
+        if (liftRankOnlyOptionals) {
+          for (Query* query : inner->optional) {
+            plan.optional.push_back(
+                scoringClause(pool, query, child.boost));
+          }
         }
         plan.filter.insert(plan.filter.end(), inner->filter.begin(), inner->filter.end());
       }
@@ -400,6 +418,11 @@ public:
   // Test hook: admit a filtered MandOpt bulk whose mandatory scorer only has
   // the scalar fillScoreBlock fallback below its measured density crossover.
   static inline bool disableFilteredMandOptFillGateForTests = false;
+  // Test hook: retain the body-led exact MandOpt pass instead of composing
+  // the cost-ordered required/filter candidate feed with optional scoring.
+  static inline bool disableExactFilteredMandOptCompositionForTests =
+      std::getenv("SOLUX_DISABLE_EXACT_FILTERED_MANDOPT_COMPOSITION") !=
+      nullptr;
   // Test hook: fill filter masks instead of probing candidate docs.
   static inline bool disableFilterMaskProbeForTests = false;
   // Test hook: enumerate all terms instead of using the count identity for
@@ -1711,6 +1734,70 @@ public:
             segment.maxDoc(), postingsScorer);
       }
 
+      BulkScorer* exactFilteredMandOptBulkScorer(MemPool& targetPool) {
+        if (disableExactFilteredMandOptCompositionForTests || allowsPruning
+            || mandatorySources.size() != 1 || optionalSources.empty()
+            || !prohibitedSources.empty() || filterSuppliers.size() != 1
+            || minShouldMatch >= 1) {
+          return nullptr;
+        }
+
+        bool docSetLeads = false;
+        bool docSetTermTail = false;
+        bool postingsFilterLeads = false;
+        bool termFeedLeads = false;
+        auto* required = conjunctionBulkScorer(
+            targetPool, ConjunctionMode::CANDIDATE,
+            &docSetLeads, &docSetTermTail, &postingsFilterLeads,
+            &termFeedLeads);
+        if (required == nullptr
+            || !((docSetLeads && docSetTermTail)
+                 || postingsFilterLeads || termFeedLeads)) {
+          return nullptr;
+        }
+
+        auto* mandatorySupplier = mandatorySources[0]->scorerSupplier(
+            targetPool, segment);
+        if (mandatorySupplier == nullptr) {
+          return nullptr;
+        }
+        int64_t leadCost = std::min(
+            mandatorySupplier->cost(), filterSuppliers[0]->cost());
+        auto& optionalScorers = *targetPool.make_vec<Query::Scorer*>();
+        optionalScorers.reserve(optionalSources.size());
+        for (auto* source : optionalSources) {
+          auto* supplier = source->scorerSupplier(targetPool, segment);
+          if (supplier == nullptr) {
+            continue;
+          }
+          auto* scorer = supplier->get(targetPool, leadCost);
+          if (scorer == nullptr) {
+            continue;
+          }
+          if (scorer->hasTwoPhase()) {
+            return nullptr;
+          }
+          optionalScorers.push_back(scorer);
+        }
+
+        skipCount(SkipStats::filteredConjBatchEngagements);
+        if (postingsFilterLeads) {
+          skipCount(
+              SkipStats::filteredConjBatchPostingsFeedEngagements);
+        }
+        if (termFeedLeads) {
+          skipCount(SkipStats::candidateTermFeedEngagements);
+        }
+        skipCount(SkipStats::exactFilteredMandOptCompositions);
+        if (optionalScorers.empty()) {
+          return required;
+        }
+        return targetPool.make<BooleanQuery::OptionalScoreBulkScorer>(
+            required,
+            std::span<Query::Scorer*>(optionalScorers.data(),
+                                      optionalScorers.size()));
+      }
+
       BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
         // This route makes its scored body the membership source. A filter-led
         // query with no mandatory clause instead has rank-only optionals, so it
@@ -1727,6 +1814,11 @@ public:
         if (filterDensityRoutesToPull(
                 localFilterCost, segment.maxDoc())) {
           return nullptr;
+        }
+
+        if (auto* exactMandOpt =
+                exactFilteredMandOptBulkScorer(targetPool)) {
+          return exactMandOpt;
         }
 
         // Let a direct filter participate in the same cost ordering as the
@@ -3472,6 +3564,70 @@ public:
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
   }; // MandOptBulkScorer
+
+  // Add rank-only SHOULD scores to an exact required-body bulk stream.
+  // Membership and the mandatory score are owned by required; optionals can
+  // only add score, so sweeping them over the surviving batch preserves the
+  // Boolean match set and score-addition order. This decorator deliberately
+  // disables pruning: the required-body bounds do not include the optional
+  // contribution.
+  class OptionalScoreBulkScorer final : public BulkScorer {
+    BulkScorer* required;
+    std::span<Query::Scorer*> optional;
+
+  public:
+    OptionalScoreBulkScorer(BulkScorer* required,
+                            std::span<Query::Scorer*> optional)
+        : required(required), optional(optional) {
+      assert(required != nullptr);
+      assert(!optional.empty());
+    }
+
+    void setTopKDepth(int32_t topK, bool allowPruning) override {
+      assert(!allowPruning);
+      unused(allowPruning);
+      required->setTopKDepth(topK, false);
+    }
+
+    bool willCountDense() const override {
+      return required->willCountDense();
+    }
+
+    bool supportsMatchWindows() const override {
+      return required->supportsMatchWindows();
+    }
+
+    bool attachWindowFilter(WindowFilter* filter) override {
+      return required->attachWindowFilter(filter);
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      unused(minCompetitiveScore);
+      int32_t next = required->scoreNextWindow(
+          out, filter, min, max, std::numeric_limits<float>::lowest());
+      for (auto* scorer : optional) {
+        int32_t size = scorer->applyToCandidates(
+            out.docs.data(), out.scores.data(), out.size, false);
+        assert(size == out.size);
+        unused(size);
+      }
+      return next;
+    }
+
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
+      return required->matchNextWindow(out, filter, min, max);
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min,
+                            int32_t max) override {
+      return required->countNextWindow(
+          count, domainOut, filter, min, max);
+    }
+  };
 
   class MandNotScorer final : public Query::Scorer {
     Scorer* mandScorer;

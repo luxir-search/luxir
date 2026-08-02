@@ -374,6 +374,21 @@ TEST_F(BooleanNormalizeTest, requiredInlineGatesMandatoryOptionalsAndMinMatch) {
   EXPECT_EQ(0u, rankView.ruleMask & BooleanQuery::R1_REQUIRED_INLINE);
   EXPECT_EQ(std::type_index(typeid(BooleanQuery)), rankView.mandatoryTypes[1]);
 
+  Query* soleRankOuterClause[] = {&rankOnly};
+  Query* soleRankOuterFilter[] = {&root};
+  BooleanQuery soleRankOuter(
+      soleRankOuterClause, {}, {}, soleRankOuterFilter);
+  auto soleRankView = shape(soleRankOuter);
+  EXPECT_EQ(1, soleRankView.mandatoryCount);
+  EXPECT_EQ(1, soleRankView.optionalCount);
+  EXPECT_EQ(1, soleRankView.filterCount);
+  EXPECT_EQ(BooleanQuery::R1_REQUIRED_INLINE,
+            soleRankView.ruleMask & BooleanQuery::R1_REQUIRED_INLINE);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)),
+            soleRankView.mandatoryTypes[0]);
+  EXPECT_EQ(std::type_index(typeid(TermQuery)),
+            soleRankView.optionalTypes[0]);
+
   Query* constrainingOuterClauses[] = {&root, &constraining};
   BooleanQuery constrainingOuter(constrainingOuterClauses, {}, {}, {});
   auto constrainingView = shape(constrainingOuter);

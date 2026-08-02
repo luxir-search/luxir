@@ -154,6 +154,7 @@ struct SkipStats {
   static inline int64_t filteredConjBatchScoreWindows = 0;
   static inline int64_t candidateTermFeedEngagements = 0;
   static inline int64_t conjTermLeadFirstFillLeapfrogs = 0;
+  static inline int64_t exactFilteredMandOptCompositions = 0;
   static inline int64_t exactCountTopKCompositions = 0;
   static inline int64_t exactCountTopKProfitabilityRejects = 0;
   static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
@@ -329,6 +330,7 @@ struct SkipStats {
     filteredConjBatchScoreWindows = 0;
     candidateTermFeedEngagements = 0;
     conjTermLeadFirstFillLeapfrogs = 0;
+    exactFilteredMandOptCompositions = 0;
     exactCountTopKCompositions = 0;
     exactCountTopKProfitabilityRejects = 0;
     exactCountTopKSparseFilterSinglePassRejects = 0;
