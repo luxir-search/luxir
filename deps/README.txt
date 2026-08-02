@@ -4,18 +4,20 @@ Building
 0) System Build Tools
   # gcc/g++-16 (fortran is for building FAISS deps)
   sudo apt install gcc-16 g++-16 gfortran-16
-  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-16 50 
-  sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-16 50 
+  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-16 50 --slave /usr/bin/g++ g++ /usr/bin/g++-16
   sudo update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-16 50 
+
   # we currently use system tbb
   sudo apt install libtbb-dev
   # build tools
   sudo apt install pkg-config cmake ninja-build
-  # recommended
+  # recommended, but not required
   sudo apt install gdb ccache mold
-  
 
 1) One-shot setup (idempotent; safe to re-run):
+ 
+   TODO: this patches existing checkouts in vcpkg, so not sure
+   How to bootstrap w/o compiling first :-(
 
 $ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
 
