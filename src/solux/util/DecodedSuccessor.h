@@ -32,8 +32,9 @@
 
 namespace solux {
 
-// Return the first index in [start, end) whose value is >= target, or end.
-// The input must be sorted. No storage beyond end is part of the contract.
+// Return the first index in [start, end) whose value is >= target. The input
+// must be sorted, values before start must be below target, and a result must
+// exist. No storage beyond end is part of the contract.
 class DecodedSuccessor {
   static constexpr int32_t SCALAR_LINEAR_PROBE = 8;
 
@@ -50,8 +51,8 @@ class DecodedSuccessor {
     return (uint32_t) _mm512_cmp_epi32_mask(block, target, _MM_CMPINT_GE);
   }
 
-  static uint32_t tailGeqMask(const int32_t* values, int32_t length,
-                              Vec target) SOLUX_INLINE {
+  static uint32_t shortGeqMask(const int32_t* values, int32_t length,
+                               Vec target) SOLUX_INLINE {
     assert(length > 0 && length < LANES);
     const uint32_t valid = (1u << length) - 1u;
     const Vec block =
@@ -59,6 +60,7 @@ class DecodedSuccessor {
     return (uint32_t) _mm512_cmp_epi32_mask(
         block, target, _MM_CMPINT_GE) & valid;
   }
+
 #elif defined(__AVX2__)
   using Vec = __m256i;
   static constexpr int32_t LANES = 8;
@@ -76,19 +78,19 @@ class DecodedSuccessor {
     return (uint32_t) _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
   }
 
-  static uint32_t tailGeqMask(const int32_t* values, int32_t length,
-                              Vec target) SOLUX_INLINE {
+  static uint32_t shortGeqMask(const int32_t* values, int32_t length,
+                               Vec target) SOLUX_INLINE {
     assert(length > 0 && length < LANES);
     const uint32_t valid = (1u << length) - 1u;
     const Vec laneMask = _mm256_cmpgt_epi32(
         _mm256_set1_epi32(length),
         _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-    // Maskload suppresses faults for lanes whose mask sign bit is clear.
     const Vec block = _mm256_maskload_epi32(values, laneMask);
     const Vec cmp = _mm256_cmpgt_epi32(block, target);
     return (uint32_t) _mm256_movemask_ps(
         _mm256_castsi256_ps(cmp)) & valid;
   }
+
 #endif
 
 #if SOLUX_DECODED_SUCCESSOR_SIMD
@@ -122,6 +124,16 @@ class DecodedSuccessor {
   }
 
 #if SOLUX_DECODED_SUCCESSOR_SIMD
+  static int32_t SOLUX_NOINLINE shortArrayIndex(
+      const int32_t* values, int32_t start, int32_t end, Vec target,
+      int32_t strides) {
+    const uint32_t mask = shortGeqMask(values + start, end - start, target);
+    strides++;
+    assert(mask != 0);
+    recordStrides(strides);
+    return start + (int32_t) std::countr_zero(mask);
+  }
+
   static int32_t SOLUX_NOINLINE continuationIndex(
       const int32_t* values, int32_t start, int32_t end, Vec target,
       int32_t strides) {
@@ -136,12 +148,18 @@ class DecodedSuccessor {
       j += LANES;
     }
     if (j < end) {
-      const uint32_t mask = tailGeqMask(values + j, end - j, target);
-      strides++;
-      if (mask != 0) {
-        recordStrides(strides);
-        return j + (int32_t) std::countr_zero(mask);
+      if (end < LANES) {
+        return shortArrayIndex(values, j, end, target, strides);
       }
+      // The final vector ends at end and may overlap values before j. Those
+      // lanes are below target by contract, while a matching lane is known to
+      // exist in [j, end), so no lane mask or not-found branch is needed.
+      const int32_t base = end - LANES;
+      const uint32_t mask = geqMask(values + base, target);
+      strides++;
+      assert(mask != 0);
+      recordStrides(strides);
+      return base + (int32_t) std::countr_zero(mask);
     }
     recordStrides(strides);
     return end;
@@ -179,7 +197,9 @@ public:
   static int32_t index(const int32_t* values, int32_t start, int32_t end,
                        int32_t target) SOLUX_INLINE {
     assert(values != nullptr);
-    assert(start >= 0 && start <= end);
+    assert(start >= 0 && start < end);
+    assert(start == 0 || values[start - 1] < target);
+    assert(values[end - 1] >= target);
 #if SOLUX_DECODED_SUCCESSOR_SIMD
     if (disableSimdForTests) {
       return scalarIndex(values, start, end, target);
@@ -187,6 +207,9 @@ public:
 
     const Vec targetVector = broadcastTarget(target);
 #if SOLUX_FULL_INLINE_DECODED_SUCCESSOR
+    if (end < LANES) {
+      return scalarIndex(values, start, end, target);
+    }
     int32_t j = start;
     int32_t strides = 0;
     while (end - j >= LANES) {
@@ -199,13 +222,12 @@ public:
       j += LANES;
     }
     if (j < end) {
-      const uint32_t mask =
-          tailGeqMask(values + j, end - j, targetVector);
+      const int32_t base = end - LANES;
+      const uint32_t mask = geqMask(values + base, targetVector);
       strides++;
-      if (mask != 0) {
-        recordStrides(strides);
-        return j + (int32_t) std::countr_zero(mask);
-      }
+      assert(mask != 0);
+      recordStrides(strides);
+      return base + (int32_t) std::countr_zero(mask);
     }
     recordStrides(strides);
     return end;

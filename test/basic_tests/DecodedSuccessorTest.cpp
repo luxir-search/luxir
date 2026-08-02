@@ -15,21 +15,21 @@ using namespace solux;
 namespace {
 
 void checkAllTargets(const int32_t* values, int32_t length) {
-  for (int32_t start = 0; start <= length; start++) {
+  for (int32_t start = 0; start < length; start++) {
     std::vector<int32_t> targets = {-1, 0, 1, 2 * length, 2 * length + 1};
-    if (start < length) {
-      targets.push_back(values[start] - 1);
-      targets.push_back(values[start]);
-      targets.push_back(values[start] + 1);
-    }
-    if (length > 0) {
-      targets.push_back(values[length - 1] - 1);
-      targets.push_back(values[length - 1]);
-      targets.push_back(values[length - 1] + 1);
-    }
+    targets.push_back(values[start] - 1);
+    targets.push_back(values[start]);
+    targets.push_back(values[start] + 1);
+    targets.push_back(values[length - 1] - 1);
+    targets.push_back(values[length - 1]);
     for (int32_t target : targets) {
+      if ((start > 0 && values[start - 1] >= target)
+          || values[length - 1] < target) {
+        continue;
+      }
       const int32_t expected = (int32_t) (
           std::lower_bound(values + start, values + length, target) - values);
+      ASSERT_LT(expected, length);
       EXPECT_EQ(DecodedSuccessor::index(values, start, length, target),
                 expected)
           << "length=" << length << " start=" << start
@@ -79,10 +79,9 @@ TEST(DecodedSuccessorTest, TailLoadDoesNotCrossGuardPage) {
       values[i] = 3 * i + 1;
     }
     for (int32_t start = std::max(0, length - 20);
-         start <= length; start++) {
+         start < length; start++) {
       for (int32_t target : {values[std::min(start, length - 1)],
-                             values[length - 1],
-                             values[length - 1] + 1}) {
+                             values[length - 1]}) {
         const int32_t expected = (int32_t) (
             std::lower_bound(values + start, values + length, target)
             - values);
