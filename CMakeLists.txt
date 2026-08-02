@@ -202,6 +202,13 @@ list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
 add_library(solux_lib STATIC ${Proj_SOURCES})
 target_compile_definitions(solux_lib PUBLIC
+  # BlockBoundsBuilder owns an XXH3_state_t.  The macro exposes that layout,
+  # while the functions themselves remain in xxHash::xxhash.
+  XXH_STATIC_LINKING_ONLY
+  # GCC -Og cannot honor xxHash's always_inline AVX-512 accumulator through
+  # its function-pointer dispatch. Keep header inlining in optimized builds,
+  # but use the linked implementation in Debug.
+  SOLUX_XXHASH_INLINE=$<NOT:$<CONFIG:Debug>>
   SOLUX_PROBE_CONSTANT_HOOKS=$<BOOL:${SOLUX_PROBE_CONSTANT_HOOKS}>
   SOLUX_FULL_INLINE_DECODED_SUCCESSOR=$<BOOL:${SOLUX_FULL_INLINE_DECODED_SUCCESSOR}>
   SOLUX_DECODED_SUCCESSOR_HISTOGRAM=$<BOOL:${SOLUX_DECODED_SUCCESSOR_HISTOGRAM}>

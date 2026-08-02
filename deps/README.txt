@@ -1,7 +1,21 @@
 Building
 --------
 
-0) One-shot setup (idempotent; safe to re-run):
+0) System Build Tools
+  # gcc/g++-16 (fortran is for building FAISS deps)
+  sudo apt install gcc-16 g++-16 gfortran-16
+  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-16 50 
+  sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-16 50 
+  sudo update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-16 50 
+  # we currently use system tbb
+  sudo apt install libtbb-dev
+  # build tools
+  sudo apt install pkg-config cmake ninja-build
+  # recommended
+  sudo apt install gdb ccache mold
+  
+
+1) One-shot setup (idempotent; safe to re-run):
 
 $ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
 
@@ -24,21 +38,10 @@ $ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
    builds all dependencies with ASan; without that, newer gRPC/protobuf hit
    "use after poison" errors under the asan presets.
 
-1) Install dependencies via vcpkg (repeat in the asan root for asan presets):
+2) Install dependencies via vcpkg (repeat in the asan root for asan presets):
 
 $ cd /opt/vcpkg
-$ ./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 faiss glaze
-$ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
-
-Ubuntu:
-```
-sudo apt install libtbb-dev pkg-config "gfortran-$(gcc -dumpversion)"
-```
-
-The gfortran major version must match the gcc/g++ selected for the presets.
-CMake's Fortran/C interface detection can produce an empty mangling header
-when the compiler majors differ, which prevents the FAISS LAPACK dependency
-from configuring.
+$ ./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 glaze faiss
 
 FastPFOR
 --------
@@ -64,3 +67,4 @@ upstream tag if the directory is ever removed; apply_patches.sh then re-applies
 the local fix in patches/uni-algo-word-only-newline-leak.patch (the vendored
 copy in git already has it applied - see the apply_patches.sh header for what
 it fixes and why).
+

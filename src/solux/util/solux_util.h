@@ -6,11 +6,14 @@
 #include <vector>
 #include <memory.h>
 
-// NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
-// fvn1a when inlined.  25% slower if not inlined.
+// GCC -Og cannot compile xxHash's forced-inline AVX-512 dispatch path. Keep
+// the existing header-inlined implementation for optimized builds, but use the
+// linked implementation in Debug. The streaming-state layout is requested by
+// the target definition without pulling in the implementation there.
+#if SOLUX_XXHASH_INLINE
 #define XXH_INLINE_ALL
-#define XXH_PRIVATE_API
-#include <xxh3.h>
+#endif
+#include <xxhash.h>
 
 
 namespace solux {
