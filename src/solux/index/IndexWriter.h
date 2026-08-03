@@ -111,6 +111,51 @@ public:
     bool outputPublished = false;
   };
 
+  struct AuxStats {
+    std::string kind;
+    std::string field;
+    std::string name;
+    uint64_t gen = 0;
+    uint64_t commitTime = 0;
+    uint64_t builtCoreGen = 0;
+    std::vector<std::string> files;
+  };
+
+  struct SegmentStats {
+    uint64_t segId = 0;
+    uint64_t liveGen = 0;
+    uint64_t minUpdateVersion = 0;
+    uint64_t maxUpdateVersion = 0;
+    uint64_t firstCommitTime = 0;
+    uint64_t schemaGen = 0;
+    std::vector<AuxStats> overlays;
+    int32_t maxDoc = 0;
+    int32_t liveDocs = 0;
+    int32_t mergeLevel = 0;
+    bool committed = false;
+    bool merging = false;
+  };
+
+  struct Stats {
+    uint64_t commitTime = 0;
+    uint64_t indexGen = 0;
+    uint64_t coreGen = 0;
+    uint64_t updateVersion = 0;
+    uint64_t schemaGen = 0;
+    uint64_t segments = 0;
+    uint64_t committedSegments = 0;
+    uint64_t maxDocs = 0;
+    uint64_t liveDocs = 0;
+    uint64_t activeMerges = 0;
+    std::vector<AuxStats> auxIndexes;
+    std::vector<SegmentStats> segmentStats;
+    FilterCache::CounterValues filterCacheCounters;
+    uint64_t filterCacheMaxBytes = 0;
+    uint64_t filterCacheResidentBytes = 0;
+    uint64_t filterCacheMetadataBytes = 0;
+    bool filterCacheEnabled = false;
+  };
+
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
   // if we add a method to IndexWriter to get/set the merge factor or other configurable things.
   class MergePolicy {
@@ -299,8 +344,11 @@ public:
   std::deque<UpdateMessage*> pendingForceMerges;
   UpdateMessage* activeForceMerge = nullptr;
 
-  // The last updateNumber generated (the first update number generated will be 1)
-  uint64_t updateNumber = 0;
+  // The last updateNumber generated (the first update number generated will be 1).
+  // Only ever advanced from startUpdateBody, whose node has concurrency 1, so the
+  // increment needs no lock.  Relaxed atomic solely so stats() can read it while
+  // an update is in flight without a formal data race.
+  std::atomic<uint64_t> updateNumber{0};
 
   // Next session-local tag for updateSequencerNode.
   uint64_t updateOrdinal = 0;
@@ -309,21 +357,21 @@ public:
   // Not used for index_gen since not every commit will end up changing the index.
   uint64_t commitNumber = 0;
 
-  // last index generation number... incremented before each commit.
+  // Last durably published index generation. Protected by indexMutex.
   uint64_t indexGen = 0;
   
   // Segment composition generation. Incremented only when the set of segments changes (not for deletes).
   // This serves as an efficient cache key for structures that depend on segment composition but not deletes.
+  // Protected by indexMutex.
   uint64_t coreGen = 0;
   
-  // Track segment IDs from last commit to detect composition changes
+  // Track segment IDs from the last durable commit to detect composition changes.
+  // Protected by indexMutex.
   std::vector<uint64_t> lastCommittedSegIds;
 
-  // Schema generation read from IndexInfo on startup, written on each commit.
-  // Relaxed atomic: written from parallel flush tasks, the merge thread, and
-  // the commit body.  No ordering is needed - a segment stamped during a
-  // concurrent schema swap may legitimately get either gen - but the plain
-  // field was a formal data race (and TSan noise).
+  // Schema generation read from IndexInfo on startup and advanced only after
+  // a new commit is durable. Relaxed atomic because segment stamping can read
+  // it as a fallback outside indexMutex when no schema provider is installed.
   std::atomic<uint64_t> schemaGen_{0};
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
@@ -331,6 +379,7 @@ public:
   // pipeline (single-threaded via the commitFinishNode).  Used for carry-forward
   // (entries not rebuilt by this commit are preserved) and orphan-file cleanup
   // (files referenced by the previous list but not the new one are deleted).
+  // Publication and stats reads are protected by indexMutex.
   std::vector<AuxInfo> currentAuxIndexes_;
 
   // One entry per segment overlay referenced by the last published IndexInfo,
@@ -343,6 +392,8 @@ public:
     uint64_t segId;
     AuxInfo info;
   };
+  // Publication and stats-related ownership transitions are protected by
+  // indexMutex; commit/merge pipeline reads follow their existing ownership.
   std::vector<PublishedOverlay> currentSegmentOverlays_;
 
   std::optional<MergeFailureInfo> lastMergeFailure;
@@ -391,15 +442,11 @@ public:
     if (schemaProvider_) {
       auto schema = schemaProvider_();
       if (schema) {
-        schemaGen_.store(schema->gen_, std::memory_order_relaxed);
         return schema->gen_;
       }
     }
     return schemaGen_.load(std::memory_order_relaxed);
   }
-
-  // Returns the schema generation read from IndexInfo (or 0 if none).
-  uint64_t getSchemaGen() const { return schemaGen_.load(std::memory_order_relaxed); }
 
   // indexRamBudget is the (usually node-wide) pool that parallel merge tasks
   // reserve against; pass null for a private unlimited budget (tests, embedded).
@@ -511,7 +558,7 @@ private:
   void startUpdateBody(UpdateMessage& msg) {
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
-    msg.updateVersion = ++updateNumber;
+    msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
     msg.updateOrdinal = updateOrdinal++;
     msg.commitNum = 0;
     INDEX_DEBUG("startUpdateBody: msg={} updateVersion={} updateOrdinal={} commitNum={}",
@@ -578,8 +625,8 @@ private:
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
-  void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr,
-                          std::span<const AuxInfo> auxIndexes = {});
+  uint64_t writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& commitInfo,
+                              std::span<const AuxInfo> auxIndexes = {});
   std::vector<AuxInfo> buildAuxIndexes(const UpdateMessage& msg,
                                                    std::span<SegInfo*> segsToKeep,
                                                    std::vector<std::string>& outFilesToSync);
@@ -639,8 +686,8 @@ public:
   bool testMergeRunning();
   std::optional<MergeFailureInfo> testLastMergeFailure();
 
-  // dump some useful info for tests
-  void debugInfo();
+  // Coherent writer-visible and committed state for operational introspection.
+  Stats stats(bool includeSegments);
 };
 
 

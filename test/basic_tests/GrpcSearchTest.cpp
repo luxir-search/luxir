@@ -59,6 +59,17 @@ TEST_F(GrpcSearchTest, basic) {
   ASSERT_TRUE(status.ok());
 }
 
+TEST_F(GrpcSearchTest, statsUnary) {
+  solux::api::StatsRequest request;
+  request.segments = true;
+  grpc::ClientContext context;
+  Reply<solux::api::StatsResponse> response;
+  auto status = hppUnaryCall(channel.get(), rpc::Stats, &context, request, &response);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_GT(response.msg.totals.collections, 0);
+  EXPECT_FALSE(response.msg.collections.empty());
+}
+
 // A small batch_size forces emitDocsResponse to stream multiple responses over
 // one RPC, exercising the server's pending-write queue: response arenas are
 // freed at reply() time, so the queued ByteBuffers must own their bytes.

@@ -75,6 +75,9 @@ struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColIn
 struct ColFloat; struct ColDouble; struct ColMap; struct IndexInfo; struct AuxIndexInfo;
 struct SegmentInfo; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct SchemaRequest; struct SchemaResponse;
+struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
+struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
+struct FilterCacheStats; struct IndexRamStats;
 namespace UpdateResponse_ { struct Error; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
@@ -208,6 +211,88 @@ struct IndexInfo {
   uint64_t schema_gen = 0;
   std::span<const SegmentInfo> segments;
   std::span<const AuxIndexInfo> aux_indexes;
+};
+
+struct AuxStats {
+  std::string_view kind;
+  std::string_view field;
+  std::string_view name;
+  uint64_t gen = 0;
+  uint64_t commit_time = 0;
+  uint64_t built_core_gen = 0;
+  std::span<const std::string_view> files;
+};
+struct FilterCacheStats {
+  uint64_t max_bytes = 0;
+  uint64_t resident_bytes = 0;
+  uint64_t metadata_bytes = 0;
+  uint64_t hits = 0;
+  uint64_t misses = 0;
+  uint64_t admissions = 0;
+  uint64_t builds = 0;
+  uint64_t byproduct_inserts = 0;
+  uint64_t publish_rejects = 0;
+  uint64_t evictions = 0;
+  uint64_t purges = 0;
+  uint64_t oversized_key_bypasses = 0;
+  uint64_t reader_stable_hits = 0;
+  uint64_t reader_stable_refreshes = 0;
+  uint64_t reader_stable_retires = 0;
+  bool enabled = false;
+};
+struct IndexRamStats { uint64_t limit_bytes = 0; uint64_t reserved_bytes = 0; };
+struct StatsTotals {
+  uint64_t collections = 0;
+  uint64_t shards = 0;
+  uint64_t segments = 0;
+  uint64_t committed_segments = 0;
+  uint64_t max_docs = 0;
+  uint64_t live_docs = 0;
+  uint64_t deleted_docs = 0;
+};
+struct SegmentStats {
+  uint64_t seg_id = 0;
+  uint64_t live_gen = 0;
+  uint64_t min_update_version = 0;
+  uint64_t max_update_version = 0;
+  uint64_t first_commit_time = 0;
+  uint64_t schema_gen = 0;
+  std::span<const AuxStats> overlays;
+  int32_t max_doc = 0;
+  int32_t live_docs = 0;
+  int32_t deleted_docs = 0;
+  uint32_t merge_level = 0;
+  bool committed = false;
+  bool merging = false;
+};
+struct IndexStats {
+  StatsTotals totals;
+  uint64_t commit_time = 0;
+  uint64_t index_gen = 0;
+  uint64_t core_gen = 0;
+  uint64_t update_version = 0;
+  uint64_t schema_gen = 0;
+  uint64_t active_merges = 0;
+  std::span<const AuxStats> aux_indexes;
+  FilterCacheStats filter_cache;
+  std::span<const SegmentStats> segments;
+};
+struct ShardStats {
+  IndexStats index;
+  uint32_t shard_id = 0;
+};
+struct CollectionStats {
+  std::string_view name;
+  StatsTotals totals;
+  uint64_t schema_gen = 0;
+  std::span<const ShardStats> shards;
+  std::string_view error;
+};
+struct StatsRequest { std::optional<Target> collection; bool segments = false; };
+struct StatsResponse {
+  StatsTotals totals;
+  std::span<const CollectionStats> collections;
+  IndexRamStats index_ram;
 };
 
 struct Vector { std::optional<ArrFloat> f32; };                  // needs ArrFloat
@@ -483,6 +568,9 @@ SOLUX_TD(ColStr) SOLUX_TD(Column) SOLUX_TD(ColVector) SOLUX_TD(MultiVector) SOLU
 SOLUX_TD(ColFloat) SOLUX_TD(ColDouble) SOLUX_TD(ColMap) SOLUX_TD(IndexInfo) SOLUX_TD(AuxIndexInfo)
 SOLUX_TD(SegmentInfo) SOLUX_TD(AnalyzerDef) SOLUX_TD(FieldDef) SOLUX_TD(SchemaDef)
 SOLUX_TD(SchemaRequest) SOLUX_TD(SchemaResponse) SOLUX_TD(UpdateResponse_::Error)
+SOLUX_TD(StatsRequest) SOLUX_TD(StatsResponse) SOLUX_TD(StatsTotals) SOLUX_TD(CollectionStats)
+SOLUX_TD(ShardStats) SOLUX_TD(IndexStats) SOLUX_TD(SegmentStats) SOLUX_TD(AuxStats)
+SOLUX_TD(FilterCacheStats) SOLUX_TD(IndexRamStats)
 #undef SOLUX_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
@@ -513,6 +601,10 @@ SOLUX_ENTRY(ColVector) SOLUX_ENTRY(MultiVector) SOLUX_ENTRY(ColInt) SOLUX_ENTRY(
 SOLUX_ENTRY(ColDouble) SOLUX_ENTRY(ColMap) SOLUX_ENTRY(IndexInfo) SOLUX_ENTRY(AuxIndexInfo)
 SOLUX_ENTRY(SegmentInfo) SOLUX_ENTRY(AnalyzerDef) SOLUX_ENTRY(FieldDef)
 SOLUX_ENTRY(SchemaDef) SOLUX_ENTRY(SchemaRequest) SOLUX_ENTRY(SchemaResponse)
+SOLUX_ENTRY(StatsRequest) SOLUX_ENTRY(StatsResponse) SOLUX_ENTRY(StatsTotals)
+SOLUX_ENTRY(CollectionStats) SOLUX_ENTRY(ShardStats) SOLUX_ENTRY(IndexStats)
+SOLUX_ENTRY(SegmentStats) SOLUX_ENTRY(AuxStats) SOLUX_ENTRY(FilterCacheStats)
+SOLUX_ENTRY(IndexRamStats)
 #undef SOLUX_ENTRY
 
 } // namespace solux::api

@@ -29,6 +29,7 @@
 #include "solux/util/thread.h"
 #include "solux/util/proto.h"
 #include "ProtoUpdateMessage.h"
+#include "Stats.h"
 #include "solux/schema/Schema.h"
 #include "solux_descriptors.h"
 
@@ -157,6 +158,8 @@ using UpdateReqProto = solux::api::UpdateRequest;
 using UpdateRespProto = solux::api::UpdateResponse;
 using SchemaReqProto = solux::api::SchemaRequest;
 using SchemaRespProto = solux::api::SchemaResponse;
+using StatsReqProto = solux::api::StatsRequest;
+using StatsRespProto = solux::api::StatsResponse;
 using HelloReqProto = solux::api::HelloRequest;
 using HelloRespProto = solux::api::HelloReply;
 
@@ -732,6 +735,34 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   }
 }
 
+//   rpc Stats(StatsRequest) returns (StatsResponse)  [unary]
+static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<StatsReqProto>>();
+  if (!parseRequest(readBuf, *request, "Stats")) {
+    call.decrementOutstanding();
+    return;
+  }
+
+  // Per-segment output is unbounded. Keep both collection sampling and
+  // serialization off the completion-queue thread; responsesExpected keeps
+  // the call alive and requestActive preserves per-call request ordering.
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getSoluxNode().getTaskArena().enqueue([request, &call] {
+      try {
+        StatsRespProto response;
+        std::pmr::monotonic_buffer_resource respArena;
+        gatherStats(call.server.getSoluxNode(), request->proto, response, respArena);
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
 //   rpc SayHello(HelloRequest) returns (HelloReply)  [unary] - demo
 static void handleSayHello(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<HelloReqProto> request;
@@ -810,6 +841,7 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/solux.Indexer/UpdateStream",     {handleUpdateStream}},
     {"/solux.Admin/SetSchema",          {handleSetSchema}},
     {"/solux.Admin/GetSchema",          {handleGetSchema}},
+    {"/solux.Admin/Stats",              {handleStats}},
     {"/solux.Greeter/SayHello",         {handleSayHello}},
     {"/solux.Greeter/SayHello2",        {handleSayHello2}},
     {"/solux.Greeter/SayHelloStreaming",{handleSayHelloStreaming}},

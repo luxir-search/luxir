@@ -7,6 +7,7 @@
 #include "solux/api/solux_types.hpp"
 #include "solux/util/DateTime.h"
 
+#include <algorithm>
 #include <cctype>
 #include <memory_resource>
 #include <span>
@@ -278,6 +279,21 @@ std::shared_ptr<Collection> SoluxNode::resolveOrCreateCollection(const solux::ap
     collection = getOrCreateCollection(kDefaultCollectionName);
   }
   return collection;
+}
+
+std::vector<SoluxNode::CollectionEntry> SoluxNode::collectionEntries() {
+  std::vector<CollectionEntry> entries;
+  if (!root) return entries;
+
+  using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
+  root->collections.dataMap.cvisit_all([&](const auto& elem) {
+    if (auto* collection = std::get_if<Pointer>(&elem.second)) {
+      entries.push_back({elem.first, *collection, (*collection)->loadError});
+    }
+  });
+  std::sort(entries.begin(), entries.end(),
+            [](const CollectionEntry& a, const CollectionEntry& b) { return a.name < b.name; });
+  return entries;
 }
 
 std::shared_ptr<Collection> SoluxNode::createCollection(Library* library, std::string_view name) {

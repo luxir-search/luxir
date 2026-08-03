@@ -29,6 +29,9 @@ public:
   // Assigned alongside indexGen in finishCommitBody.  Equal to the previous
   // commit's core_gen if segment composition is unchanged, else previous + 1.
   uint64_t coreGen = 0;
+  // Schema generation captured for this commit and published only after the
+  // commit point is durable.
+  uint64_t schemaGen = 0;
   // Number of segments left to flush, protected by same mutex that protects the inverter lists.
   // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
   // inverter->updateMessage, among other things.

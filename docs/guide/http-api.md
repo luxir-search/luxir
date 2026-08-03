@@ -13,6 +13,8 @@ uses the same vocabulary as protobuf.
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
+| `GET /_stats` | Node totals and per-collection operational statistics. |
+| `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
 
 Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update
@@ -61,8 +63,9 @@ contract to rollback of the explicit atomic unit.
 
 Malformed JSON and HTTP-dialect validation failures detected before submission
 return `400` with a JSON error body. Oversized buffered bodies return `413`.
-The schema routes return `405` with an `Allow` header for a wrong method; other
-routes currently fall through to `404`, so method handling is not uniform.
+The schema and stats routes return `405` with an `Allow` header for a wrong
+method; other routes currently fall through to `404`, so method handling is
+not uniform.
 After a normal search has been submitted, query planning or execution errors
 appear as an `error` field in the HTTP-success NDJSON envelope. The server does
 not yet have a complete HTTP status taxonomy, so clients must inspect response

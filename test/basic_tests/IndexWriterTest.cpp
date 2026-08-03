@@ -279,6 +279,51 @@ TEST_F(IndexWriterTest, simple) {
   ASSERT_GT(r2.commitTime(), r1.commitTime());
 }
 
+// stats() is the one reader that runs concurrently with the commit/merge
+// threads, so hammer it while both are active.  It must always observe a
+// coherent snapshot: committed segments are a subset of writer-visible ones,
+// and live docs never exceed max docs.
+TEST_F(IndexWriterTest, statsConcurrentWithCommitsAndMerges) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  std::atomic_bool stop = false;
+  std::atomic_uint64_t samples = 0;
+
+  std::thread reader([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      auto s = iw.stats(true);
+      ASSERT_LE(s.committedSegments, s.segments);
+      ASSERT_EQ(s.segments, s.segmentStats.size());
+      ASSERT_LE(s.liveDocs, s.maxDocs);
+      uint64_t committed = 0, maxDocs = 0, liveDocs = 0;
+      for (const auto& seg : s.segmentStats) {
+        if (seg.committed) committed++;
+        ASSERT_LE(seg.liveDocs, seg.maxDoc);
+        maxDocs += (uint64_t)seg.maxDoc;
+        liveDocs += (uint64_t)seg.liveDocs;
+      }
+      // Per-segment records must add up to the rolled-up totals.
+      ASSERT_EQ(committed, s.committedSegments);
+      ASSERT_EQ(maxDocs, s.maxDocs);
+      ASSERT_EQ(liveDocs, s.liveDocs);
+      samples++;
+    }
+  });
+
+  for (int round = 0; round < 40; round++) {
+    for (int i = 0; i < 5; i++) addDoc(iw);
+    iw.commit();
+    if (round % 8 == 7) iw.mergeSegments();
+  }
+  stop.store(true, std::memory_order_relaxed);
+  reader.join();
+
+  EXPECT_GT(samples.load(), 0u);
+  auto final = iw.stats(true);
+  EXPECT_EQ(200u, final.maxDocs);
+  EXPECT_EQ(final.segments, final.committedSegments);
+}
+
 // Test retrieving IndexReader from the IndexWriter
 TEST_F(IndexWriterTest, getReader) {
   RAMDir dir;
@@ -808,7 +853,14 @@ TEST_F(IndexWriterTest, multiThreaded) {
           LOG_ERROR("Reader not seeing last advertised commit time! {} vs {}", iw.lastAdvertisedCommitTime.load(), reader->commitTime());
         }
 
-        iw.debugInfo();
+        auto stats = iw.stats(true);
+        LOG_INFO("IndexWriter: segments={} committed={} updates={} commitTime={} activeMerges={}",
+                 stats.segments, stats.committedSegments, stats.updateVersion,
+                 stats.commitTime, stats.activeMerges);
+        for (const auto& seg : stats.segmentStats) {
+          LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", seg.segId,
+                   seg.maxDoc, seg.mergeLevel, seg.firstCommitTime);
+        }
 
         // let's look at the last number of updates:
         if (!recordUpdates) {

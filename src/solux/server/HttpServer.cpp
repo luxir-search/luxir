@@ -42,6 +42,7 @@
 #include "JsonResponse.h"
 #include "NdjsonFramer.h"
 #include "ProtoUpdateMessage.h"
+#include "Stats.h"
 #include "solux/util/thread.h"
 
 namespace solux {
@@ -635,6 +636,10 @@ private:
     return parseCollectionPath(target, "/_schema", coll);
   }
 
+  static bool parseStatsPath(std::string_view target, std::string& coll) {
+    return parseCollectionPath(target, "/_stats", coll);
+  }
+
   static std::string_view trimHeaderValue(std::string_view v) {
     while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
     while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
@@ -764,6 +769,25 @@ private:
       }
     } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
       handleUpdate(req.body(), coll);
+    } else if (target == "/_stats" || parseStatsPath(target, coll)) {
+      if (req.method() != http::verb::get) {
+        respondMethodNotAllowed("GET", "method not allowed; stats are read with GET");
+        return;
+      }
+
+      bool includeSegments = false;
+      if (const std::string* value = findParam(params, "segments")) {
+        if (*value == "true") {
+          includeSegments = true;
+        } else if (*value != "false") {
+          respondSimple(http::status::bad_request, "application/json",
+                        renderErrorBody("invalid segments value '" + *value +
+                                        "' (valid: true, false)"));
+          return;
+        }
+      }
+      handleStats(target == "/_stats" ? std::nullopt : std::optional<std::string>(coll),
+                  includeSegments);
     } else if (parseSchemaPath(target, coll)) {
       // Writes are POST; the operation is the visible, typeable ?mode= param,
       // never an invisible HTTP verb.  mode=set (the default, and curl's
@@ -1023,6 +1047,42 @@ private:
       out = renderErrorBody(e.what());
     }
     respondSimple(status, "application/json", std::move(out));
+  }
+
+  void handleStats(std::optional<std::string> coll, bool includeSegments) {
+    auto ioPin = makeIoPin();
+    node_.getTaskArena().enqueue(
+        [self = shared_from_this(), coll = std::move(coll), includeSegments, ioPin] {
+          http::status status = http::status::ok;
+          std::string out;
+          try {
+            std::pmr::monotonic_buffer_resource resource;
+            solux::api::StatsRequest request;
+            request.segments = includeSegments;
+            if (coll) setCollectionTarget(request.collection, *coll, resource);
+
+            solux::api::StatsResponse response;
+            gatherStats(self->node_, request, response, resource);
+
+            std::string compact;
+            if (!solux::api::write_json(response, compact)) {
+              throw std::runtime_error("failed to serialize stats response");
+            }
+            glz::prettify_json(compact, out);
+            out += '\n';
+          } catch (const CollectionResolutionError& e) {
+            status = http::status::not_found;
+            out = renderErrorBody(e.what());
+          } catch (const std::exception& e) {
+            status = http::status::internal_server_error;
+            out = renderErrorBody(e.what());
+          }
+
+          net::post(self->stream_.get_executor(),
+                    [self, ioPin, status, body = std::move(out)]() mutable {
+                      self->respondSimple(status, "application/json", std::move(body));
+                    });
+        });
   }
 
   void handleSchemaSet(const std::string& body, const std::string& coll,

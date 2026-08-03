@@ -158,6 +158,76 @@ TEST_F(HttpApiTest, health) {
   EXPECT_NE(res.body().find(R"("status")"), std::string::npos);
 }
 
+TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
+  auto nodeStats = httpRequest(port(), http::verb::get, "/_stats");
+  ASSERT_EQ(200, nodeStats.result_int()) << nodeStats.body();
+  glz::generic_i64 nodeJson;
+  ASSERT_FALSE(glz::read_json(nodeJson, nodeStats.body())) << nodeStats.body();
+  EXPECT_TRUE(nodeJson.contains("totals"));
+  EXPECT_TRUE(nodeJson.contains("collections"));
+  EXPECT_TRUE(nodeJson.contains("index_ram"));
+
+  auto collectionStats =
+      httpRequest(port(), http::verb::get, "/collections/main/_stats");
+  ASSERT_EQ(200, collectionStats.result_int()) << collectionStats.body();
+  glz::generic_i64 collectionJson;
+  ASSERT_FALSE(glz::read_json(collectionJson, collectionStats.body()))
+      << collectionStats.body();
+  auto* collections =
+      collectionJson["collections"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, collections);
+  ASSERT_EQ(1, collections->size());
+  auto* name = (*collections)[0]["name"].get_if<std::string>();
+  ASSERT_NE(nullptr, name);
+  EXPECT_EQ("main", *name);
+
+  auto* shards = (*collections)[0]["shards"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, shards);
+  ASSERT_EQ(1, shards->size());
+  EXPECT_FALSE((*shards)[0]["index"].contains("segments"));
+}
+
+TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"stats-1","title_w":"segment stats"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto response =
+      httpRequest(port(), http::verb::get, "/collections/main/_stats?segments=true");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, response.body())) << response.body();
+
+  auto* segmentCount = root["totals"]["segments"].get_if<int64_t>();
+  auto* committedCount = root["totals"]["committed_segments"].get_if<int64_t>();
+  ASSERT_NE(nullptr, segmentCount);
+  ASSERT_NE(nullptr, committedCount);
+  EXPECT_GT(*segmentCount, 0);
+  EXPECT_EQ(*segmentCount, *committedCount);
+
+  auto* collections = root["collections"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, collections);
+  auto* shards = (*collections)[0]["shards"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, shards);
+  auto* segments =
+      (*shards)[0]["index"]["segments"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, segments);
+  EXPECT_EQ((size_t)*segmentCount, segments->size());
+  auto* committed = (*segments)[0]["committed"].get_if<bool>();
+  ASSERT_NE(nullptr, committed);
+  EXPECT_TRUE(*committed);
+}
+
+TEST_F(HttpApiTest, statsRoutingErrors) {
+  auto missing =
+      httpRequest(port(), http::verb::get, "/collections/http_missing_stats/_stats");
+  EXPECT_EQ(404, missing.result_int()) << missing.body();
+
+  auto wrongMethod = httpRequest(port(), http::verb::post, "/_stats");
+  EXPECT_EQ(405, wrongMethod.result_int()) << wrongMethod.body();
+  EXPECT_EQ("GET", wrongMethod[http::field::allow]);
+}
+
 TEST_F(HttpApiTest, unknownRouteIs404) {
   auto res = httpRequest(port(), http::verb::get, "/nope");
   EXPECT_EQ(404, res.result_int());

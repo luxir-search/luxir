@@ -119,7 +119,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
     schemaGen_ = indexInfo.schema_gen;
-    updateNumber = indexInfo.update_version;
+    updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
     segInfos.reserve(indexInfo.segments.size());
     lastCommittedSegIds.reserve(indexInfo.segments.size());
 
@@ -1064,28 +1064,31 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // piece (aux indexes, IndexInfo file) refers to the same values.  Stashed on
   // CommitInfo so they travel with the message.
   //
-  // segsToKeep is final at this point, so we can determine whether segment
-  // composition changed and mutate coreGen + lastCommittedSegIds now rather
-  // than deferring to writeIndexInfoFile.
-  if (msg.commitInfo) {
-    msg.commitInfo->indexGen = ++indexGen;
+  // segsToKeep is final at this point, so determine the generations this
+  // commit will carry. The writer's committed generations and segment IDs are
+  // published only after the commit point is durable.
+  // commitInfo is dereferenced unconditionally on entry, so it is never null
+  // here; do not reintroduce a presence check that implies otherwise.
+  assert(msg.commitInfo);
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    msg.commitInfo->indexGen = indexGen + 1;
 
     bool segsChanged = (segsToKeep.size() != lastCommittedSegIds.size());
     if (!segsChanged) {
       boost::unordered_flat_set<uint64_t> oldIds(lastCommittedSegIds.begin(),
-                                                  lastCommittedSegIds.end());
+                                                 lastCommittedSegIds.end());
       for (auto* s : segsToKeep) {
-        if (!oldIds.contains(s->segId)) { segsChanged = true; break; }
+        if (!oldIds.contains(s->segId)) {
+          segsChanged = true;
+          break;
+        }
       }
     }
+    msg.commitInfo->coreGen = coreGen + (segsChanged ? 1 : 0);
     if (segsChanged) {
-      coreGen++;
-      lastCommittedSegIds.clear();
-      lastCommittedSegIds.reserve(segsToKeep.size());
-      for (auto* s : segsToKeep) lastCommittedSegIds.push_back(s->segId);
-      INDEX_DEBUG("Segment composition changed, incremented coreGen to {}", coreGen);
+      INDEX_DEBUG("Segment composition changed, next coreGen={}", msg.commitInfo->coreGen);
     }
-    msg.commitInfo->coreGen = coreGen;
   }
 
   // Build aux indexes if requested.  Vector overlays are segment-local and are
@@ -1105,16 +1108,36 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     }
   }
 
-  // write the segments file with only the segments that have live documents
-  writeIndexInfoFile(segsToKeep, msg.commitInfo.get(), auxIndexInfos);
+  std::vector<uint64_t> committedSegIds;
+  committedSegIds.reserve(segsToKeep.size());
+  for (auto* seg : segsToKeep) committedSegIds.push_back(seg->segId);
+  msg.commitInfo->schemaGen = currentSchemaGen();
 
-  // Aux index housekeeping: now that the new IndexInfo is durable, files
-  // from the previous list that aren't in the new one are unreferenced.
-  // Then publish the new list for the next commit's carry-forward.
-  deleteOrphanedAuxFiles(currentAuxIndexes_, auxIndexInfos);
-  currentAuxIndexes_ = std::move(auxIndexInfos);
-  deleteOrphanedAuxFiles(currentSegmentOverlays_, segmentOverlayInfos);
-  currentSegmentOverlays_ = std::move(segmentOverlayInfos);
+  // write the segments file with only the segments that have live documents
+  uint64_t commitTime = writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
+
+  // Publish every committed field as one coherent state immediately after
+  // durability. Move the old aux lists out for best-effort cleanup below.
+  std::vector<AuxInfo> oldAuxIndexes;
+  std::vector<PublishedOverlay> oldSegmentOverlays;
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    indexGen = msg.commitInfo->indexGen;
+    coreGen = msg.commitInfo->coreGen;
+    schemaGen_.store(msg.commitInfo->schemaGen, std::memory_order_relaxed);
+    lastCommittedSegIds.swap(committedSegIds);
+    oldAuxIndexes = std::move(currentAuxIndexes_);
+    oldSegmentOverlays = std::move(currentSegmentOverlays_);
+    currentAuxIndexes_ = std::move(auxIndexInfos);
+    currentSegmentOverlays_ = std::move(segmentOverlayInfos);
+    lastCommitTime = commitTime;
+    lastAdvertisedCommitTime = commitTime;
+  }
+
+  // Files from the previous lists that aren't in the new commit are now
+  // unreferenced. The commit is already visible, so cleanup is best-effort.
+  deleteOrphanedAuxFiles(oldAuxIndexes, currentAuxIndexes_);
+  deleteOrphanedAuxFiles(oldSegmentOverlays, currentSegmentOverlays_);
 
   // Only move the segment to the delete list after the new IndexInfo file is written.
   // This way it should be safe for other threads to also try deletions.
@@ -1506,11 +1529,14 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     outFilesToSync.push_back(file);
   }
   activateVectorOverlayNames(stagedActiveOverlayNames);
-  for (auto& staged : stagedOverlays) {
-    for (const auto& file : staged.info.files) {
-      staged.seg->unsyncedFiles.push_back(file);
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    for (auto& staged : stagedOverlays) {
+      for (const auto& file : staged.info.files) {
+        staged.seg->unsyncedFiles.push_back(file);
+      }
+      staged.seg->auxOverlays.push_back(std::move(staged.info));
     }
-    staged.seg->auxOverlays.push_back(std::move(staged.info));
   }
 }
 
@@ -1586,8 +1612,8 @@ void IndexWriter::deleteOrphanedAuxFiles(const std::vector<AuxInfo>& oldList,
 // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
 // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
 // The passed span of segments may be reordered after this is finished.
-void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo,
-                                     std::span<const AuxInfo> auxIndexes) {
+uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& commitInfo,
+                                         std::span<const AuxInfo> auxIndexes) {
   // We should be able to write the segments file without holding the indexMutex,
   // as long as we access only fields that should not change on SegInfo.
   // liveDocs + liveGen won't change because we only apply deletes in finishCommitBody().
@@ -1608,44 +1634,19 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
   uint64_t numDocs = 0;
 
   // Caller (finishCommitBody) sorts by segId before us so aux-index building
-  // sees the same canonical order.  Defensive sort for the test-only no-commitInfo
-  // path where the caller hasn't sorted.
-  if (!commitInfo) {
-    std::sort(segs.begin(), segs.end(),
-              [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
-  }
+  // sees the same canonical order.
   assert(std::is_sorted(segs.begin(), segs.end(),
                         [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; }));
   
-  uint64_t updateVersion = 0;
-  uint64_t thisIndexGen;
-  if (commitInfo) {
-    // finishCommitBody assigned indexGen + coreGen up front (and updated
-    // lastCommittedSegIds at the same time) so aux-index building and this
-    // write share single values.
-    assert(commitInfo->indexGen > 0);
-    thisIndexGen = commitInfo->indexGen;
-    assert(commitInfo->highestUpdateVersion >= commitInfo->updateMessage->updateVersion);
-    updateVersion = commitInfo->highestUpdateVersion;
-  }
-  else {
-    // Test-only path (no commitInfo): assign on the fly, including the
-    // segsChanged check that finishCommitBody normally performs.
-    bool segsChanged = (segs.size() != lastCommittedSegIds.size());
-    if (!segsChanged) {
-      for (size_t i = 0; i < segs.size(); i++) {
-        if (segs[i]->segId != lastCommittedSegIds[i]) { segsChanged = true; break; }
-      }
-    }
-    if (segsChanged) {
-      coreGen++;
-      lastCommittedSegIds.clear();
-      lastCommittedSegIds.reserve(segs.size());
-      for (auto seg : segs) lastCommittedSegIds.push_back(seg->segId);
-    }
-    thisIndexGen = ++indexGen;
-    updateVersion = updateNumber;
-  }
+  // finishCommitBody assigned the candidate generations up front so aux-index
+  // building and this write share single values.  It publishes them to the
+  // writer only after this file is durable.
+  assert(commitInfo.indexGen > 0);
+  assert(commitInfo.highestUpdateVersion >= commitInfo.updateMessage->updateVersion);
+  uint64_t thisIndexGen = commitInfo.indexGen;
+  uint64_t updateVersion = commitInfo.highestUpdateVersion;
+  uint64_t thisCoreGen = commitInfo.coreGen;
+  uint64_t thisSchemaGen = commitInfo.schemaGen;
 
   // Build the IndexInfo message NON-OWNING into a scratch arena, then encode. Segment +
   // overlay + aux arrays are arena-allocated; AuxIndexInfo views point at the owning
@@ -1656,20 +1657,20 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
   indexInfo.version = 1;
   indexInfo.index_gen = thisIndexGen;
   indexInfo.update_version = updateVersion;
-  indexInfo.core_gen = coreGen;
-  indexInfo.schema_gen = currentSchemaGen();
+  indexInfo.core_gen = thisCoreGen;
+  indexInfo.schema_gen = thisSchemaGen;
+
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    for (auto* seg : segs) {
+      seg->lastCommitTime = now_us;
+      if (seg->firstCommitTime == 0) seg->firstCommitTime = now_us;
+    }
+  }
 
   solux::api::SegmentInfo* segArr = solux::api::build::allocArray(indexInfo.segments, segs.size(), iiArena);
   size_t segIdx = 0;
   for (auto seg : segs) {
-    // Update the commit time for the seg. Important to know if this seg is part of the last commit.
-    // This does mean that this may be visible before the commit is done and before lastCommitTime is updated.
-    // Any comparison with lastCommitTime should be done with this in mind.
-    seg->lastCommitTime = now_us;
-    if (seg->firstCommitTime == 0) {
-      seg->firstCommitTime = now_us;
-    }
-
     auto& segmentInfo = segArr[segIdx++];
     segmentInfo.seg_id = seg->segId;
     segmentInfo.max_doc = seg->maxDoc;
@@ -1722,9 +1723,7 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
 
   unused(numDocs);
 
-  // advertise this commit only after the file is closed.
-  lastCommitTime = now_us;
-  lastAdvertisedCommitTime = now_us;
+  return now_us;
 }
 
 
@@ -2286,46 +2285,7 @@ void IndexWriter::mergeSegments() {
 
 
 
-#ifdef REMOVED
-  // make sure we are getting the latest index reader (wasteful!)
-  indexReader.reset();
-  auto reader = getIndexReader();
-  std::vector<PostingsReader*> preaders; // TODO: make sure we're not trying to merge a segment that is being built!
-  std::vector<LiveDocs*> liveDocsPtrs;
-  preaders.reserve(reader->segments().size());
-  liveDocsPtrs.reserve(reader->segments().size());
-  for (auto& seg : reader->segments()) {
-    preaders.push_back(&seg.postingsReader());
-    liveDocsPtrs.push_back(seg.liveDocs());
-  }
-  // we could calc maxdoc at this point...
-  uint64_t segId = ++lastSegId;
-  PostingsWriter pwriter(dir, segId);
 
-  SegmentMerger merger(preaders, liveDocsPtrs, pwriter);
-  merger.merge();
-  pwriter.finish();
-
-  // update the list of segments... not safe currently
-  // TODO: add unused segments to the "to be deleted" list
-  segInfos.clear();
-  segInfos.emplace(segId, std::make_unique<SegInfo>(segId, pwriter.getMaxDoc()));
-
-
-  std::vector<SegInfo*> segs;
-  // need to lock the indexMutex to get a consistent view of the segments.
-  {
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    segs.reserve(segInfos.size());
-    for (auto& [segId, seg] : segInfos) {
-      segs.push_back(seg.get());
-    }
-  }
-
-  // Call the parameterized version w/o commit info
-  writeIndexInfoFile(segs);
-}
-#endif
 
 
 /// TEST CODE (called from tests)
@@ -2400,11 +2360,9 @@ void IndexWriter::testDeleteAllData() {
   // Don't touch commitNumber or updateOrdinal: the TBB graph relies on exact session-local ordinals.
 }
 
-// TEST HOOKS: safe only against a QUIESCED writer.  indexMutex here does not
-// exclude the commit body, which mutates seg->auxOverlays and
-// currentSegmentOverlays_ WITHOUT the lock (it is the single mutator by
-// design rule 1).  Do not "fix" a future race by adding locking on the
-// commit side; quiesce the writer in the test instead.
+// TEST HOOKS: safe only against a QUIESCED writer. indexMutex excludes overlay
+// publication, but the commit body also reads overlay state outside the lock;
+// quiesce the writer in the test rather than racing that read.
 bool IndexWriter::testDropSegmentOverlay(std::string_view name, size_t segmentOrd) {
   std::lock_guard<std::mutex> lock(indexMutex);
   if (segmentOrd >= segInfos.size()) return false;
@@ -2451,30 +2409,81 @@ std::optional<IndexWriter::MergeFailureInfo> IndexWriter::testLastMergeFailure()
   return lastMergeFailure;
 }
 
-// TEST CODE
-void IndexWriter::debugInfo() {
+IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
+  Stats out;
+  std::vector<uint64_t> committedIds;
+  std::vector<uint64_t> writerSegmentIds;
+  auto copyAux = [](const AuxInfo& src) {
+    AuxStats dst;
+    dst.kind = src.kind;
+    dst.field = src.field;
+    dst.name = src.name;
+    dst.gen = src.gen;
+    dst.commitTime = src.commit_time;
+    dst.builtCoreGen = src.built_core_gen;
+    dst.files = src.files;
+    return dst;
+  };
   {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    LOG_INFO("IndexWriter: segInfos.size={} idleInverters.size={} busyInverters.size={} flushingInverters.size={}",
-             segInfos.size(), idleInverters.size(), busyInverters.size(), flushingInverters.size());
-    LOG_INFO("\tupdateNumber={} updateOrdinal={} commitNumber={} lastCommitTime={} lastAdvertisedCommitTime={}",
-             updateNumber, updateOrdinal, commitNumber, lastCommitTime.load(), lastAdvertisedCommitTime.load());
-    LOG_INFO("\tmergePolicy->outstandingMerges={}", mergePolicy->outstandingMerges);
-    for (auto& [segId, seg] : segInfos) {
-      LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", segId, seg->maxDoc, seg->mergeLevel,
-               seg->lastCommitTime);
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    out.commitTime = lastAdvertisedCommitTime.load(std::memory_order_relaxed);
+    out.indexGen = indexGen;
+    out.coreGen = coreGen;
+    out.updateVersion = updateNumber.load(std::memory_order_relaxed);
+    out.schemaGen = schemaGen_.load(std::memory_order_relaxed);
+    out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
+    out.segments = segInfos.size();
+    out.auxIndexes.reserve(currentAuxIndexes_.size());
+    std::ranges::transform(currentAuxIndexes_, std::back_inserter(out.auxIndexes), copyAux);
+
+    committedIds = lastCommittedSegIds;
+    if (!includeSegments) writerSegmentIds.reserve(segInfos.size());
+    if (includeSegments) out.segmentStats.reserve(segInfos.size());
+    for (const auto& [segId, seg] : segInfos) {
+      unused(segId);
+      if (!includeSegments) writerSegmentIds.push_back(seg->segId);
+      out.maxDocs += (uint64_t)seg->maxDoc;
+      out.liveDocs += (uint64_t)seg->liveDocs;
+      if (!includeSegments) continue;
+
+      auto& dst = out.segmentStats.emplace_back();
+      dst.segId = seg->segId;
+      dst.liveGen = seg->liveGen;
+      dst.minUpdateVersion = seg->minVersion;
+      dst.maxUpdateVersion = seg->maxVersion;
+      dst.firstCommitTime = seg->firstCommitTime;
+      dst.schemaGen = seg->schemaGen;
+      dst.overlays.reserve(seg->auxOverlays.size());
+      std::ranges::transform(seg->auxOverlays, std::back_inserter(dst.overlays), copyAux);
+      dst.maxDoc = seg->maxDoc;
+      dst.liveDocs = seg->liveDocs;
+      dst.mergeLevel = std::max(0, seg->mergeLevel);
+      dst.merging = seg->merging;
     }
   }
 
-  {
-    std::lock_guard<std::mutex> lock(indexReaderMutex);
-    LOG_INFO("IndexWriter: indexReader={} ", (void*)indexReader.get());
-    if (indexReader.get()) {
-      LOG_INFO("\tindexReader->commitTime={}", indexReader->commitTime());
-    }
+  boost::unordered_flat_set<uint64_t> committedSet(committedIds.begin(), committedIds.end());
+  for (uint64_t segId : writerSegmentIds) {
+    if (committedSet.contains(segId)) out.committedSegments++;
+  }
+  for (auto& segment : out.segmentStats) {
+    segment.committed = committedSet.contains(segment.segId);
+    if (segment.committed) out.committedSegments++;
   }
 
-  // Debug info on TBB graph?
+  auto cache = getFilterCache();
+  if (cache) {
+    auto config = cache->configuration();
+    out.filterCacheEnabled = cache->enabled();
+    out.filterCacheMaxBytes = config.maxBytes;
+    out.filterCacheResidentBytes = cache->bytesUsed();
+    out.filterCacheMetadataBytes = cache->metadataBytesUsed();
+    out.filterCacheCounters = cache->counters();
+  }
+
+  std::sort(out.segmentStats.begin(), out.segmentStats.end(),
+            [](const SegmentStats& a, const SegmentStats& b) { return a.segId < b.segId; });
+  return out;
 }
 
 /// A cursor into a sorted EntrySpan for k-way merge.

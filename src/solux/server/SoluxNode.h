@@ -135,6 +135,12 @@ class SoluxNode {
 public:
   static constexpr std::string_view kDefaultCollectionName = "main";
 
+  struct CollectionEntry {
+    std::string name;
+    std::shared_ptr<Collection> collection;
+    std::string error;
+  };
+
   SoluxNode() : SoluxNode(SoluxConfig{}) {}
   explicit SoluxNode(SoluxConfig config);
   ~SoluxNode();
@@ -150,6 +156,10 @@ public:
 
   std::shared_ptr<Collection> resolveCollection(const solux::api::Target* target);
   std::shared_ptr<Collection> resolveOrCreateCollection(const solux::api::Target* target);
+
+  // Snapshot fully-created root collections without waiting for creations in
+  // flight. Load-failure tombstones retain their recorded error.
+  std::vector<CollectionEntry> collectionEntries();
 
   std::shared_ptr<Collection> getCollection(Library* library, std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(Library* library, std::string_view name);

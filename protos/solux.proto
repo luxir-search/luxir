@@ -53,4 +53,5 @@ service Searcher {
 service Admin {
   rpc SetSchema(solux.proto.SchemaRequest) returns (solux.proto.SchemaResponse) {}
   rpc GetSchema(solux.proto.SchemaRequest) returns (solux.proto.SchemaResponse) {}
+  rpc Stats(solux.proto.StatsRequest) returns (solux.proto.StatsResponse) {}
 }
