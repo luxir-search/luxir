@@ -202,6 +202,14 @@ public:
         return get(targetPool, leadCost);
       }
 
+      DocsOnlyEnum* getDocsOnly(MemPool& targetPool) override {
+        if (weight.cachedTermInfo == nullptr) {
+          return nullptr;
+        }
+        return weight.cachedTermInfo->useDocsEnum<DocsEnumTier::DOCS>(
+            targetPool, segment);
+      }
+
       ScoreBlockFillKind scoreBlockFillKind() const noexcept override {
         return ScoreBlockFillKind::BLOCK_ITERATION;
       }

@@ -239,6 +239,19 @@ struct FilteredConjunctionBatchGuard {
   }
 };
 
+struct ExactTermCountGuard {
+  bool saved;
+
+  explicit ExactTermCountGuard(bool disabled)
+    : saved(BooleanQuery::disableExactTermCountForTests) {
+    BooleanQuery::disableExactTermCountForTests = disabled;
+  }
+
+  ~ExactTermCountGuard() {
+    BooleanQuery::disableExactTermCountForTests = saved;
+  }
+};
+
 struct FilteredScoredBulkGuard {
   bool saved;
 
@@ -6093,7 +6106,7 @@ TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
 }
 
 TEST_F(TermScorerTest,
-       filteredCountCandidateHonorsDomainAndPartialMaxResume) {
+       exactFilteredTermCountHonorsDomainAndPartialMaxResume) {
   const int32_t N = 5 * DocsEnumMeta::L1_DOCS + 83;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -6128,6 +6141,7 @@ TEST_F(TermScorerTest,
   std::array<Query*, 2> mandatory{&lead, &dense};
   std::array<Query*, 1> filters{&filterTerm};
   BooleanQuery query(mandatory, {}, {}, filters);
+  SkipStatsGuard stats;
   auto* weight = query.createWeight(qContext, 0);
   auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
   ASSERT_NE(nullptr, supplier);
@@ -6136,7 +6150,6 @@ TEST_F(TermScorerTest,
 
   auto domain = makeEveryNthDocSet(N, 5, true);
   DocSetBuilder matchedDocs(N);
-  SkipStatsGuard stats;
   int64_t count = 0;
   int32_t cursor = 0;
   auto countTo = [&](int32_t max) {
@@ -6161,14 +6174,16 @@ TEST_F(TermScorerTest,
   for (int32_t doc : expected) {
     EXPECT_TRUE(actual->get(doc)) << doc;
   }
-  EXPECT_GT(SkipStats::filteredConjBatchCountWindows, 1);
-  EXPECT_EQ(1, SkipStats::filteredCountCandidateAdmits);
+  EXPECT_GT(SkipStats::exactTermCountBatches, 1);
+  EXPECT_EQ(1, SkipStats::exactTermCountEngagements);
+  EXPECT_EQ(0, SkipStats::filteredConjBatchCountWindows);
+  EXPECT_EQ(0, SkipStats::filteredCountCandidateAdmits);
   EXPECT_EQ(0, SkipStats::filteredCountCandidateDenseLatchBacks);
   EXPECT_EQ(0, SkipStats::conjDenseCountWindows);
   EXPECT_EQ(0, SkipStats::tfreqBlocksDecoded);
 
-  // An empty prefix is not an admission sample. The next nonempty range must
-  // still make the candidate-vs-dense decision from real evidence.
+  // An empty prefix must preserve the first unconsumed lead posting so the
+  // next nonempty range resumes without skipping it.
   SkipStats::reset();
   auto* prefixWeight = query.createWeight(qContext, 0);
   auto* prefixSupplier = prefixWeight->scorerSupplier(testIndex.pool, segment);
@@ -6192,7 +6207,26 @@ TEST_F(TermScorerTest,
     prefixNext = next;
   }
   EXPECT_EQ((N - 1) / 256, prefixCount);
-  EXPECT_EQ(1, SkipStats::filteredCountCandidateAdmits);
+  EXPECT_EQ(0, SkipStats::filteredCountCandidateAdmits);
+  EXPECT_EQ(1, SkipStats::exactTermCountEngagements);
+  EXPECT_GT(SkipStats::exactTermCountBatches, 1);
+
+  // A full lead batch reports only the interval it exhausted, not the caller's
+  // larger max. The next call must resume at that exact boundary.
+  auto* matchWeight = query.createWeight(qContext, 0);
+  auto* matchSupplier = matchWeight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(nullptr, matchSupplier);
+  auto* matchBulk = matchSupplier->bulkScorer(testIndex.pool);
+  ASSERT_NE(nullptr, matchBulk);
+  ScoreWindow matches;
+  int32_t matchNext = matchBulk->matchNextWindow(
+      matches, nullptr, 0, N);
+  EXPECT_EQ(1024 * 8, matchNext);
+  EXPECT_EQ(matchNext, matches.max);
+  EXPECT_EQ(0, matches.min);
+  for (int32_t i = 0; i < matches.size; i++) {
+    EXPECT_LT(matches.docs[(size_t) i], matches.max);
+  }
 
   // WindowFilter is a separate BulkScorer contract from the call-time
   // DocSet domain. Attaching one before iteration must select the dense arm,
@@ -6202,7 +6236,11 @@ TEST_F(TermScorerTest,
   auto* attachedSupplier = attachedWeight->scorerSupplier(
       testIndex.pool, segment);
   ASSERT_NE(nullptr, attachedSupplier);
-  auto* attachedBulk = attachedSupplier->bulkScorer(testIndex.pool);
+  BulkScorer* attachedBulk;
+  {
+    ExactTermCountGuard exactGuard(true);
+    attachedBulk = attachedSupplier->bulkScorer(testIndex.pool);
+  }
   ASSERT_NE(nullptr, attachedBulk);
   TermQuery attachedTerm("body_w", "attached_filter");
   auto* windowWeight = attachedTerm.createWeight(qContext, 0);

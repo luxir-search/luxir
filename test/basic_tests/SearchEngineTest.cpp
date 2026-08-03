@@ -90,6 +90,19 @@ public:
   }
 };
 
+class ExactTermCountGuard {
+  bool saved;
+
+public:
+  explicit ExactTermCountGuard(bool disabled)
+    : saved(BooleanQuery::disableExactTermCountForTests) {
+    BooleanQuery::disableExactTermCountForTests = disabled;
+  }
+  ~ExactTermCountGuard() {
+    BooleanQuery::disableExactTermCountForTests = saved;
+  }
+};
+
 class FilteredDisjunctionCountCompactionGuard {
   bool saved;
 
@@ -380,6 +393,7 @@ struct FilteredCountResult {
   int64_t filteredCountCandidateDenseLatchBacks;
   int64_t ownedFilterMaterializations;
   int64_t ownedFilterServes;
+  int64_t exactTermCountBatches;
 };
 
 enum class FilteredCountPath {
@@ -428,6 +442,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::filteredCountCandidateDenseLatchBacks,
     SkipStats::ownedFilterMaterializations,
     SkipStats::ownedFilterServes,
+    SkipStats::exactTermCountBatches,
   };
 }
 
@@ -459,6 +474,7 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
     SkipStats::filteredCountCandidateDenseLatchBacks,
     SkipStats::ownedFilterMaterializations,
     SkipStats::ownedFilterServes,
+    SkipStats::exactTermCountBatches,
   };
 }
 
@@ -541,6 +557,10 @@ void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
           EXPECT_EQ(folded.denseWindows, 0);
           EXPECT_EQ(folded.disjGroupWindows, 0);
           EXPECT_EQ(folded.sparseFallbacks, 0);
+        } else if (shape == FilteredCountShape::INTERSECTION) {
+          EXPECT_GT(folded.exactTermCountBatches, 0);
+          EXPECT_EQ(folded.denseWindows, 0);
+          EXPECT_EQ(folded.disjGroupWindows, 0);
         } else {
           EXPECT_TRUE(folded.denseWindows > 0
                       || folded.disjGroupWindows > 0);
@@ -553,6 +573,9 @@ void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
         EXPECT_EQ(folded.denseWindows, 0);
         EXPECT_EQ(folded.disjGroupWindows, 0);
         EXPECT_EQ(folded.sparseFallbacks, 0);
+        if (shape == FilteredCountShape::INTERSECTION) {
+          EXPECT_GT(folded.exactTermCountBatches, 0);
+        }
       }
     }
   }
@@ -1506,6 +1529,48 @@ TEST_F(SearchEngineTest,
             BooleanQuery::ConjunctionBulkScorer::
                 kFilteredConjunctionBatchSize);
 
+  struct ExactRun {
+    int64_t count = 0;
+    int64_t engagements = 0;
+    int64_t batches = 0;
+    int64_t candidateWindows = 0;
+    int64_t denseWindows = 0;
+    int64_t tfreqBlocksDecoded = 0;
+  };
+  auto runExact = [&](bool disabled) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().limit(0);
+    cur.rawQuery() = qb::boolean(
+        cur.mr(),
+        {qb::match(cur.mr(), "body_w", "required_lead"),
+         qb::match(cur.mr(), "body_w", "dense_a")});
+    cur.matchFilter("selection", "filter_w", "required_tail");
+    ExactTermCountGuard routeGuard(disabled);
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return ExactRun{
+      req->getMatchCount("q"),
+      SkipStats::exactTermCountEngagements,
+      SkipStats::exactTermCountBatches,
+      SkipStats::filteredConjBatchCountWindows,
+      SkipStats::conjDenseCountWindows,
+      SkipStats::tfreqBlocksDecoded,
+    };
+  };
+
+  ExactRun exact = runExact(false);
+  ExactRun exactDisabled = runExact(true);
+  EXPECT_EQ(overlapCount, exact.count);
+  EXPECT_EQ(exactDisabled.count, exact.count);
+  EXPECT_GT(exact.engagements, 0);
+  EXPECT_GT(exact.batches, 1);
+  EXPECT_EQ(0, exact.candidateWindows);
+  EXPECT_EQ(0, exact.denseWindows);
+  EXPECT_EQ(0, exact.tfreqBlocksDecoded);
+  EXPECT_EQ(0, exactDisabled.engagements);
+
   struct Run {
     int64_t count = 0;
     int64_t candidateWindows = 0;
@@ -1525,6 +1590,7 @@ TEST_F(SearchEngineTest,
          qb::match(cur.mr(), "body_w", second)});
     cur.matchFilter("selection", "filter_w", filter);
     IntegratedFilteredCountGuard routeGuard(disabled);
+    ExactTermCountGuard exactGuard(true);
     SkipStatsGuard statsGuard;
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();

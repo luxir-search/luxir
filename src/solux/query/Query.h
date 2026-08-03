@@ -446,6 +446,14 @@ public:
       return nullptr;
     }
 
+    // Create an independent docs-only postings cursor when this supplier is a
+    // direct term. Exact compound counts use this capability to avoid routing
+    // membership through a frequency-capable scorer.
+    virtual DocsOnlyEnum* getDocsOnly(MemPool& targetPool) {
+      unused(targetPool);
+      return nullptr;
+    }
+
     /// How get() implements fillScoreBlock(). This is an execution-cost
     /// capability, not a correctness requirement. DEFAULT_SCALAR means the
     /// scorer may use Scorer's next()+score() loop; BLOCK_ITERATION means it

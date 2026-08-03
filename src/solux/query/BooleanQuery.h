@@ -459,6 +459,10 @@ public:
   // instead of admitting its supplier into exact COUNT conjunction planning.
   static inline bool disableIntegratedFilteredCountForTests =
       std::getenv("SOLUX_DISABLE_INTEGRATED_FILTERED_COUNT") != nullptr;
+  // Test/bench hook: retain the prior dense/candidate/pull exact conjunction
+  // instead of the direct-term docs-only bulk scorer.
+  static inline bool disableExactTermCountForTests =
+      std::getenv("SOLUX_DISABLE_EXACT_TERM_COUNT") != nullptr;
   // Test hook: use body-led execution for multi-term exact filtered
   // conjunctions.
   static inline bool disableFilteredConjMultiTermForTests = false;
@@ -699,6 +703,9 @@ public:
     }
     return context.pool.make<BooleanQuery::Weight>(context, plan, flags, multiplier);
   }
+
+  class ConjunctionBulkScorer;
+  class ExactDocsOnlyTermConjunctionBulkScorer;
 
   class Weight final : public Query::Weight {
     std::span<Query::Weight*> mandatoryWeights;
@@ -1174,17 +1181,16 @@ public:
       // feed for exact or pruned collection; scoring clauses alone supply
       // score bounds. SCORED_BODY leaves filters to a window mask selected by
       // filteredScoredBulkScorer.
-      BulkScorer* conjunctionBulkScorer(MemPool& targetPool,
-                                        ConjunctionMode mode,
-                                        bool* docSetLeads = nullptr,
-                                        bool* docSetSparseBulkEligible =
-                                            nullptr,
-                                        bool* postingsFilterLeads = nullptr,
-                                        bool* termFeedLeads = nullptr,
-                                        std::span<Query::ScorerSupplier* const>
-                                            enclosingFilterSuppliers = {},
-                                        bool* candidatePostingsLeads =
-                                            nullptr) {
+      BulkScorer* conjunctionBulkScorer(
+          MemPool& targetPool, ConjunctionMode mode,
+          bool* docSetLeads = nullptr,
+          bool* docSetSparseBulkEligible = nullptr,
+          bool* postingsFilterLeads = nullptr,
+          bool* termFeedLeads = nullptr,
+          std::span<Query::ScorerSupplier* const>
+              enclosingFilterSuppliers = {},
+          bool* candidatePostingsLeads = nullptr,
+          bool* exactTermCount = nullptr) {
         bool exhaustive = mode == ConjunctionMode::EXHAUSTIVE;
         bool includeFilters = mode != ConjunctionMode::SCORED_BODY;
         if (docSetLeads != nullptr) {
@@ -1201,6 +1207,9 @@ public:
         }
         if (candidatePostingsLeads != nullptr) {
           *candidatePostingsLeads = false;
+        }
+        if (exactTermCount != nullptr) {
+          *exactTermCount = false;
         }
         struct Entry {
           int64_t cost;
@@ -1275,30 +1284,22 @@ public:
                     return a.cost != b.cost ? a.cost < b.cost
                                             : a.order < b.order;
                   });
-        // A consuming exact-count probe has no use for a fallback bulk. Check
-        // the candidate contract before constructing scorers so unsupported
-        // compound shapes do not build and discard the legacy route. Keep at
-        // least two tails: the two-clause dense intersection is cheaper even
-        // at survivor densities admitted by the multi-tail sample.
-        bool consumingExactCandidate = mode == ConjunctionMode::EXHAUSTIVE
-            && !needsScores && !enclosingFilterSuppliers.empty();
-        if (consumingExactCandidate) {
-          if (entries.size()
-                  < ConjunctionBulkScorer::kCandidateCountMinClauses
-              || !prohibitedSources.empty()
-              || hasOptionalGroup
-              || segment.maxDoc() < DocsEnumMeta::L1_DOCS
-              || entries[0].cost < std::max<int64_t>(
-                  1, (int64_t) segment.maxDoc()
-                      / ConjunctionBulkScorer::
-                          termTailDenseThresholdInverseForTests)) {
-            return nullptr;
-          }
-          for (const Entry& entry : entries) {
-            if (dynamic_cast<TermQuery::Weight::Supplier*>(
-                    entry.supplier) == nullptr) {
+        // An exact filtered conjunction of direct terms is a complete
+        // docs-only operation whether the filter belongs to this Boolean or
+        // is supplied by an enclosing request wrapper.
+        bool exactFilteredTermConjunction = mode == ConjunctionMode::EXHAUSTIVE
+            && !needsScores && !disableExactTermCountForTests
+            && (!filterSuppliers.empty()
+                || !enclosingFilterSuppliers.empty());
+        if (exactFilteredTermConjunction) {
+          bool supported = entries.size()
+                  >= ConjunctionBulkScorer::kIntegratedCountMinClauses
+              && prohibitedSources.empty() && !hasOptionalGroup;
+          if (!supported) {
+            if (!enclosingFilterSuppliers.empty()) {
               return nullptr;
             }
+            exactFilteredTermConjunction = false;
           }
         }
         bool termFeed = false;
@@ -1349,6 +1350,29 @@ public:
         int64_t nonLeadCost = 0;
         for (size_t i = 1; i < entries.size(); i++) {
           nonLeadCost += entries[i].cost;
+        }
+        if (exactFilteredTermConjunction) {
+          auto countTermEnums =
+              targetPool.make_span<DocsOnlyEnum*>(entries.size());
+          bool supported = true;
+          for (size_t i = 0; i < entries.size(); i++) {
+            countTermEnums[i] =
+                entries[i].supplier->getDocsOnly(targetPool);
+            if (countTermEnums[i] == nullptr) {
+              supported = false;
+              break;
+            }
+          }
+          if (supported) {
+            if (exactTermCount != nullptr) {
+              *exactTermCount = true;
+            }
+            return targetPool.make<ExactDocsOnlyTermConjunctionBulkScorer>(
+                targetPool, countTermEnums, segment.maxDoc());
+          }
+          if (!enclosingFilterSuppliers.empty()) {
+            return nullptr;
+          }
         }
         auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
         auto clauseScores = targetPool.make_span<uint8_t>(entries.size());
@@ -1444,7 +1468,7 @@ public:
                    && (!filterSuppliers.empty()
                        || !enclosingFilterSuppliers.empty())
                    && entries.size()
-                       >= ConjunctionBulkScorer::kCandidateCountMinClauses
+                       >= ConjunctionBulkScorer::kIntegratedCountMinClauses
                    && prohibitedSources.empty() && !hasOptionalGroup
                    && segment.maxDoc() >= DocsEnumMeta::L1_DOCS
                    && leadCost >= std::max<int64_t>(
@@ -2161,11 +2185,12 @@ public:
           bool docSetLeads = false;
           bool docSetSparseBulkEligible = false;
           bool candidatePostingsLead = false;
+          bool exactTermCount = false;
           auto* bulk =
               conjunctionBulkScorer(
                   targetPool, ConjunctionMode::EXHAUSTIVE, &docSetLeads,
                   &docSetSparseBulkEligible, nullptr, nullptr, {},
-                  &candidatePostingsLead);
+                  &candidatePostingsLead, &exactTermCount);
           if (bulk != nullptr) {
             // A cached DocSet lead owns the sparse route too: keep this bulk
             // scorer so countNextWindowSparse can drive from filter membership
@@ -2174,12 +2199,15 @@ public:
             bool keepDocSetLead = !disableFilterClauseCountForTests
                 && prohibitedSources.empty()
                 && docSetLeads && docSetSparseBulkEligible;
+            bool keepDirectTermSparse = prohibitedSources.empty()
+                && exactTermCount;
             if (candidatePostingsLead) {
               skipCount(SkipStats::filteredConjBatchEngagements);
               skipCount(
                   SkipStats::filteredConjBatchPostingsFeedEngagements);
             }
             if (bulk->willCountDense() || keepDocSetLead
+                || keepDirectTermSparse
                 || candidatePostingsLead) {
               return bulk;
             }
@@ -2258,10 +2286,12 @@ public:
               targetPool, ConjunctionMode::EXHAUSTIVE, nullptr, nullptr,
               nullptr, nullptr, bulkContext.filterSuppliers,
               &candidatePostingsLead);
-          if (bulk != nullptr && candidatePostingsLead) {
-            skipCount(SkipStats::filteredConjBatchEngagements);
-            skipCount(
-                SkipStats::filteredConjBatchPostingsFeedEngagements);
+          if (bulk != nullptr) {
+            if (candidatePostingsLead) {
+              skipCount(SkipStats::filteredConjBatchEngagements);
+              skipCount(
+                  SkipStats::filteredConjBatchPostingsFeedEngagements);
+            }
             return {bulk, true};
           }
         }
@@ -4421,6 +4451,49 @@ public:
         remaining.empty() ? PostingsReader::END : remaining.front()};
   }
 
+  static PostingsCandidateBatch copyPostingsCandidates(
+      DocsOnlyEnum& docsEnum, std::span<int32_t> outDocs,
+      int32_t nextDoc, int32_t min, int32_t upTo) {
+    int32_t doc = nextDoc;
+    if (doc < min) {
+      doc = docsEnum.docId();
+      if (doc < min) {
+        doc = docsEnum.advance(min);
+      }
+    }
+    if (doc >= upTo) {
+      return {0, doc};
+    }
+
+    int32_t size = 0;
+    while (size < (int32_t) outDocs.size()) {
+      std::span<const int32_t> blockDocs = docsEnum.peekDocBlock();
+      if (blockDocs.empty()) {
+        break;
+      }
+      assert(blockDocs.front() >= min);
+      const int32_t* rangeEnd = screaming::gallopLowerBound(
+          blockDocs.data(), blockDocs.data() + blockDocs.size(), upTo);
+      int32_t count = std::min(
+          (int32_t) (rangeEnd - blockDocs.data()),
+          (int32_t) outDocs.size() - size);
+      if (count == 0) {
+        break;
+      }
+      std::copy_n(blockDocs.begin(), count, outDocs.begin() + size);
+      size += count;
+      docsEnum.consumeDocBlock(count);
+      if (count < (int32_t) blockDocs.size()) {
+        break;
+      }
+    }
+
+    std::span<const int32_t> remaining = docsEnum.peekDocBlock();
+    return {
+        size,
+        remaining.empty() ? PostingsReader::END : remaining.front()};
+  }
+
   static void applyDomainBitsToWindow(std::span<uint64_t> windowBits,
                                       int32_t windowStart, int32_t windowEnd,
                                       const FixedBitSet* domainBits) {
@@ -4467,6 +4540,133 @@ public:
     }
   }
 
+  // Exact docs-only conjunction of direct terms. Keeping this separate from
+  // the scored conjunction avoids constructing frequency cursors and dense
+  // scoring scratch that exact membership never uses.
+  class ExactDocsOnlyTermConjunctionBulkScorer final : public BulkScorer {
+    static constexpr int32_t kBatchSize = 1024;
+    MemPool& pool;
+    std::span<DocsOnlyEnum*> terms;
+    std::span<int32_t> candidates;
+    std::span<float> scores;
+    int32_t maxDoc;
+    int32_t nextLeadDoc = -1;
+
+    static int32_t retainCandidates(
+        DocsOnlyEnum& docsEnum, int32_t* docs, int32_t size) {
+      int32_t current = docsEnum.docId();
+      int32_t read = 0;
+      int32_t write = 0;
+      while (read < size) {
+        if (current > docs[read]) {
+          read = (int32_t) (screaming::gallopLowerBound(
+              docs + read, docs + size, current) - docs);
+          if (read == size) {
+            break;
+          }
+        }
+        int32_t target = docs[read];
+        if (current < target) {
+          current = docsEnum.advance(target);
+        }
+        if (current == target) {
+          docs[write++] = target;
+        }
+        read++;
+      }
+      return write;
+    }
+
+    PostingsCandidateBatch nextBatch(DocSet* filter,
+                                     int32_t min, int32_t max) {
+      skipCount(SkipStats::exactTermCountBatches);
+      PostingsCandidateBatch batch = copyPostingsCandidates(
+          *terms[0], candidates, nextLeadDoc, min, max);
+      nextLeadDoc = batch.nextDoc;
+      int32_t size = batch.size;
+      if (filter != nullptr) {
+        int32_t write = 0;
+        for (int32_t i = 0; i < size; i++) {
+          int32_t doc = candidates[(size_t) i];
+          if (filter->get(doc)) {
+            candidates[(size_t) write++] = doc;
+          }
+        }
+        size = write;
+      }
+      for (size_t clause = 1; clause < terms.size() && size > 0; clause++) {
+        size = retainCandidates(*terms[clause], candidates.data(), size);
+      }
+      batch.size = size;
+      return batch;
+    }
+
+  public:
+    ExactDocsOnlyTermConjunctionBulkScorer(
+        MemPool& pool, std::span<DocsOnlyEnum*> terms,
+        int32_t maxDoc)
+        : pool(pool),
+          terms(terms),
+          candidates(pool.make_span<int32_t>(kBatchSize)),
+          maxDoc(maxDoc) {
+      assert(terms.size() >= 3);
+      skipCount(SkipStats::exactTermCountEngagements);
+    }
+
+    bool supportsMatchWindows() const override {
+      return true;
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      unused(minCompetitiveScore);
+      int32_t next = matchNextWindow(out, filter, min, max);
+      if (scores.empty()) {
+        scores = pool.make_span<float>(kBatchSize);
+      }
+      std::fill_n(scores.begin(), out.size, 0.0f);
+      out.scores = scores;
+      return next;
+    }
+
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      out.min = min;
+      out.max = max;
+      out.docs = candidates;
+      out.scores = scores;
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        out.size = 0;
+        return PostingsReader::END;
+      }
+      PostingsCandidateBatch batch = nextBatch(filter, min, max);
+      out.max = std::min(max, batch.nextDoc);
+      out.size = batch.size;
+      return batch.nextDoc;
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+      }
+      PostingsCandidateBatch batch = nextBatch(filter, min, max);
+      count += batch.size;
+      if (domainOut != nullptr) {
+        for (int32_t i = 0; i < batch.size; i++) {
+          domainOut->add(candidates[(size_t) i]);
+        }
+      }
+      return batch.nextDoc;
+    }
+  };
+
   // Bulk execution for pure conjunctions (every clause required, no two-phase
   // members; required-but-non-scoring clauses carry zero score and bounds):
   // windows anchor on the lead's current doc,
@@ -4499,7 +4699,7 @@ public:
     // cursor setup. Count and scored routes share the same production batch.
     static constexpr int32_t kFilteredConjunctionBatchSize = 1024;
     static constexpr int32_t kCandidateCountSampleSize = 256;
-    static constexpr int32_t kCandidateCountMinClauses = 3;
+    static constexpr int32_t kIntegratedCountMinClauses = 3;
     // Exact filtered COUNT samples 256 candidates before replacing the dense
     // route, then uses the full batch after admission. Candidate probing wins
     // when the call-time domain and first tail membership together remove
