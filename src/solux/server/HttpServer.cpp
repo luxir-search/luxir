@@ -1250,6 +1250,13 @@ private:
     state->urlCommit = urlCommit;
     state->ioPin = makeIoPin();
 
+    // http::async_read_some uses its dynamic buffer capacity to select a socket
+    // read size (capped at 64 KiB).  Header parsing otherwise leaves flat_buffer
+    // at Beast's 512-byte bootstrap allocation, so a firehose stream reaches us
+    // in ~512-byte turns even when the client writes multi-MiB chunks.  Reserve
+    // the composed read's cap without changing its important return-on-available-
+    // bytes behavior for checkpoint/control records.
+    buffer_.reserve(64 * 1024);
     streamUpdate_ = std::move(state);
     doStreamBodyRead();
   }
