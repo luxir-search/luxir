@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <optional>
 #include <typeindex>
 
 #include "Query.h"
@@ -1174,6 +1175,46 @@ public:
         CANDIDATE,
       };
 
+      // The route selected at construction/admission time. Runtime sampling
+      // may later latch a candidate route back to dense execution.
+      enum class ConjunctionRoute : uint8_t {
+        GENERIC,
+        CANDIDATE_DOC_SET_FILTER,
+        CANDIDATE_POSTINGS_FILTER,
+        CANDIDATE_SCORING_TERM,
+        COUNT_EXACT_DOCS_ONLY,
+        COUNT_POSTINGS_SAMPLE,
+        COUNT_DENSE,
+        COUNT_DOC_SET_SPARSE,
+      };
+
+      enum class EnclosingFilters : uint8_t {
+        NOT_SUPPLIED,
+        CONSUMED,
+      };
+
+      struct ConjunctionBulkResult {
+        BulkScorer* bulk;
+        ConjunctionRoute route;
+        EnclosingFilters enclosingFilters;
+
+        ConjunctionBulkResult(
+            BulkScorer* bulk, ConjunctionRoute route,
+            EnclosingFilters enclosingFilters)
+            : bulk(bulk), route(route),
+              enclosingFilters(enclosingFilters) {
+          assert(bulk != nullptr);
+        }
+
+        bool usesCandidateRoute() const {
+          return route == ConjunctionRoute::CANDIDATE_DOC_SET_FILTER
+              || route == ConjunctionRoute::CANDIDATE_POSTINGS_FILTER
+              || route == ConjunctionRoute::CANDIDATE_SCORING_TERM;
+        }
+      };
+
+      using MaybeConjunctionBulk = std::optional<ConjunctionBulkResult>;
+
       // Build a bulk conjunction from the required clause boundaries.
       // EXHAUSTIVE includes filters and count-only optional groups.
       // CANDIDATE includes direct filters but retains scored, single-phase
@@ -1181,35 +1222,15 @@ public:
       // feed for exact or pruned collection; scoring clauses alone supply
       // score bounds. SCORED_BODY leaves filters to a window mask selected by
       // filteredScoredBulkScorer.
-      BulkScorer* conjunctionBulkScorer(
+      MaybeConjunctionBulk conjunctionBulkScorer(
           MemPool& targetPool, ConjunctionMode mode,
-          bool* docSetLeads = nullptr,
-          bool* docSetSparseBulkEligible = nullptr,
-          bool* postingsFilterLeads = nullptr,
-          bool* termFeedLeads = nullptr,
           std::span<Query::ScorerSupplier* const>
-              enclosingFilterSuppliers = {},
-          bool* candidatePostingsLeads = nullptr,
-          bool* exactTermCount = nullptr) {
+              enclosingFilterSuppliers = {}) {
         bool exhaustive = mode == ConjunctionMode::EXHAUSTIVE;
         bool includeFilters = mode != ConjunctionMode::SCORED_BODY;
-        if (docSetLeads != nullptr) {
-          *docSetLeads = false;
-        }
-        if (docSetSparseBulkEligible != nullptr) {
-          *docSetSparseBulkEligible = false;
-        }
-        if (postingsFilterLeads != nullptr) {
-          *postingsFilterLeads = false;
-        }
-        if (termFeedLeads != nullptr) {
-          *termFeedLeads = false;
-        }
-        if (candidatePostingsLeads != nullptr) {
-          *candidatePostingsLeads = false;
-        }
-        if (exactTermCount != nullptr) {
-          *exactTermCount = false;
+        if (!includeFilters && !enclosingFilterSuppliers.empty()) {
+          assert(false);
+          return {};
         }
         struct Entry {
           int64_t cost;
@@ -1226,7 +1247,7 @@ public:
           auto* source = mandatorySources[i];
           auto* supplier = source->scorerSupplier(targetPool, segment);
           if (supplier == nullptr) {
-            return nullptr;  // a required clause cannot match this segment
+            return {};  // a required clause cannot match this segment
           }
           entries.push_back({
               supplier->cost(), supplier, false, false, false,
@@ -1235,7 +1256,7 @@ public:
         if (includeFilters) {
           for (auto* supplier : filterSuppliers) {
             if (supplier == nullptr) {
-              return nullptr;
+              return {};
             }
             entries.push_back({
                 supplier->cost(), supplier, false, true,
@@ -1244,7 +1265,7 @@ public:
           }
           for (auto* supplier : enclosingFilterSuppliers) {
             if (supplier == nullptr) {
-              return nullptr;
+              return {};
             }
             entries.push_back({
                 supplier->cost(), supplier, false, true,
@@ -1268,7 +1289,7 @@ public:
             optionalGroupCosts.push_back(supplier->cost());
           }
           if (optionalGroupSuppliers.empty()) {
-            return nullptr;
+            return {};
           }
           entries.push_back({
               optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
@@ -1277,7 +1298,7 @@ public:
         if (entries.empty()
             || (entries.size() < 2
                 && (!exhaustive || prohibitedSources.empty()))) {
-          return nullptr;
+          return {};
         }
         std::sort(entries.begin(), entries.end(),
                   [](const Entry& a, const Entry& b) {
@@ -1297,7 +1318,7 @@ public:
               && prohibitedSources.empty() && !hasOptionalGroup;
           if (!supported) {
             if (!enclosingFilterSuppliers.empty()) {
-              return nullptr;
+              return {};
             }
             exactFilteredTermConjunction = false;
           }
@@ -1308,14 +1329,14 @@ public:
             for (size_t i = 1; i < entries.size(); i++) {
               if (dynamic_cast<TermQuery::Weight::Supplier*>(
                       entries[i].supplier) == nullptr) {
-                return nullptr;
+                return {};
               }
             }
             int64_t minRatio = entries[0].docSetFilter
                 ? multiTermBatchMinRatioDocSet
                 : multiTermBatchMinRatioPostings;
             if (entries[1].cost < minRatio * entries[0].cost) {
-              return nullptr;
+              return {};
             }
           } else {
             if (disableCandidateTermFeedForTests
@@ -1324,7 +1345,7 @@ public:
                        entries[0].supplier) == nullptr
                 || entries[0].cost * kTermFeedMaxLeadFractionForTests
                        > segment.maxDoc()) {
-              return nullptr;
+              return {};
             }
             for (const Entry& entry : entries) {
               bool directTerm =
@@ -1332,19 +1353,16 @@ public:
                       entry.supplier) != nullptr;
               if (entry.filter ? !entry.docSetFilter && !directTerm
                                : !entry.scoring || !directTerm) {
-                return nullptr;
+                return {};
               }
               if (entry.docSetFilter
                   && entries[0].cost * kTermFeedMinDocSetFilterRatio
                          > entry.cost) {
-                return nullptr;
+                return {};
               }
             }
             termFeed = true;
           }
-        }
-        if (docSetLeads != nullptr) {
-          *docSetLeads = entries[0].docSetFilter;
         }
         int64_t leadCost = entries[0].cost;
         int64_t nonLeadCost = 0;
@@ -1364,14 +1382,17 @@ public:
             }
           }
           if (supported) {
-            if (exactTermCount != nullptr) {
-              *exactTermCount = true;
-            }
-            return targetPool.make<ExactDocsOnlyTermConjunctionBulkScorer>(
-                targetPool, countTermEnums, segment.maxDoc());
+            return ConjunctionBulkResult{
+              targetPool.make<ExactDocsOnlyTermConjunctionBulkScorer>(
+                  targetPool, countTermEnums, segment.maxDoc()),
+              ConjunctionRoute::COUNT_EXACT_DOCS_ONLY,
+              enclosingFilterSuppliers.empty()
+                  ? EnclosingFilters::NOT_SUPPLIED
+                  : EnclosingFilters::CONSUMED
+            };
           }
           if (!enclosingFilterSuppliers.empty()) {
-            return nullptr;
+            return {};
           }
         }
         auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
@@ -1389,7 +1410,7 @@ public:
               }
             }
             if (memberCount == 0) {
-              return nullptr;
+              return {};
             }
             scorer = memberCount == 1
               ? members[0]
@@ -1402,7 +1423,7 @@ public:
           if (scorer == nullptr
               || (mode != ConjunctionMode::EXHAUSTIVE
                   && scorer->hasTwoPhase())) {
-            return nullptr;
+            return {};
           }
           arr[i] = scorer;
           clauseScores[i] = entries[i].scoring;
@@ -1415,7 +1436,7 @@ public:
               entries[0].supplier->getIndependent(targetPool, leadCost));
           assert(candidateLeadScoreScorer != nullptr);
           if (candidateLeadScoreScorer == nullptr) {
-            return nullptr;
+            return {};
           }
           candidateFilters =
               targetPool.make_span<uint8_t>(entries.size());
@@ -1437,11 +1458,11 @@ public:
             }
           }
         }
-        if (docSetSparseBulkEligible != nullptr && entries[0].docSetFilter) {
-          *docSetSparseBulkEligible = true;
+        bool docSetSparseEligible = entries[0].docSetFilter;
+        if (docSetSparseEligible) {
           for (size_t i = 1; i < entries.size(); i++) {
             if (dynamic_cast<TermQuery::Scorer*>(arr[i]) == nullptr) {
-              *docSetSparseBulkEligible = false;
+              docSetSparseEligible = false;
               break;
             }
           }
@@ -1484,14 +1505,6 @@ public:
             }
           }
         }
-        if (postingsFilterLeads != nullptr) {
-          *postingsFilterLeads =
-              !termFeed && candidatePostingsLead != nullptr;
-        }
-        if (termFeedLeads != nullptr) {
-          *termFeedLeads =
-              termFeed && candidatePostingsLead != nullptr;
-        }
         Query::Scorer** prohibitedArr = nullptr;
         size_t prohibitedCount = 0;
         std::span<TermQuery::Scorer*> candidateProhibitedTerms;
@@ -1526,12 +1539,12 @@ public:
             }
             auto members = scorer->flatDisjunctionScorers();
             if (members.empty()) {
-              return nullptr;
+              return {};
             }
             for (auto* member : members) {
               auto* term = dynamic_cast<TermQuery::Scorer*>(member);
               if (term == nullptr) {
-                return nullptr;
+                return {};
               }
               terms.push_back(term);
             }
@@ -1546,10 +1559,46 @@ public:
             entries[0].docSetFilter, candidatePostingsLead,
             candidateLeadScoreScorer,
             candidateFilters, candidateFilterDocSets);
-        if (candidatePostingsLeads != nullptr) {
-          *candidatePostingsLeads = bulk->willSampleCandidateCount();
+        ConjunctionRoute route = ConjunctionRoute::GENERIC;
+        if (mode == ConjunctionMode::CANDIDATE) {
+          if (termFeed && candidatePostingsLead != nullptr) {
+            route = ConjunctionRoute::CANDIDATE_SCORING_TERM;
+          } else if (candidatePostingsLead != nullptr) {
+            route = ConjunctionRoute::CANDIDATE_POSTINGS_FILTER;
+          } else if (docSetSparseEligible) {
+            route = ConjunctionRoute::CANDIDATE_DOC_SET_FILTER;
+          }
+        } else if (mode == ConjunctionMode::EXHAUSTIVE) {
+          if (bulk->willSampleCandidateCount()) {
+            route = ConjunctionRoute::COUNT_POSTINGS_SAMPLE;
+          } else if (bulk->willCountDense()) {
+            route = ConjunctionRoute::COUNT_DENSE;
+          } else if (docSetSparseEligible && prohibitedSources.empty()) {
+            route = ConjunctionRoute::COUNT_DOC_SET_SPARSE;
+          }
         }
-        return bulk;
+        return ConjunctionBulkResult{
+          bulk, route,
+          enclosingFilterSuppliers.empty()
+              ? EnclosingFilters::NOT_SUPPLIED
+              : EnclosingFilters::CONSUMED
+        };
+      }
+
+      void recordCandidateConjunctionEngagement(
+          const ConjunctionBulkResult& result) const {
+        assert(result.usesCandidateRoute());
+        skipCount(SkipStats::filteredConjBatchEngagements);
+        if (mandatorySources.size() > 1) {
+          skipCount(SkipStats::filteredConjBatchMultiTermEngagements);
+        }
+        if (result.route
+            == ConjunctionRoute::CANDIDATE_POSTINGS_FILTER) {
+          skipCount(SkipStats::filteredConjBatchPostingsFeedEngagements);
+        }
+        if (result.route == ConjunctionRoute::CANDIDATE_SCORING_TERM) {
+          skipCount(SkipStats::candidateTermFeedEngagements);
+        }
       }
 
       BulkScorer* mandOptBulkScorer(
@@ -1835,17 +1884,9 @@ public:
           return nullptr;
         }
 
-        bool docSetLeads = false;
-        bool docSetTermTail = false;
-        bool postingsFilterLeads = false;
-        bool termFeedLeads = false;
-        auto* required = conjunctionBulkScorer(
-            targetPool, ConjunctionMode::CANDIDATE,
-            &docSetLeads, &docSetTermTail, &postingsFilterLeads,
-            &termFeedLeads);
-        if (required == nullptr
-            || !((docSetLeads && docSetTermTail)
-                 || postingsFilterLeads || termFeedLeads)) {
+        auto required = conjunctionBulkScorer(
+            targetPool, ConjunctionMode::CANDIDATE);
+        if (!required || !required->usesCandidateRoute()) {
           return nullptr;
         }
 
@@ -1873,20 +1914,13 @@ public:
           optionalScorers.push_back(scorer);
         }
 
-        skipCount(SkipStats::filteredConjBatchEngagements);
-        if (postingsFilterLeads) {
-          skipCount(
-              SkipStats::filteredConjBatchPostingsFeedEngagements);
-        }
-        if (termFeedLeads) {
-          skipCount(SkipStats::candidateTermFeedEngagements);
-        }
+        recordCandidateConjunctionEngagement(*required);
         skipCount(SkipStats::exactFilteredMandOptCompositions);
         if (optionalScorers.empty()) {
-          return required;
+          return required->bulk;
         }
         return targetPool.make<BooleanQuery::OptionalScoreBulkScorer>(
-            required,
+            required->bulk,
             std::span<Query::Scorer*>(optionalScorers.data(),
                                       optionalScorers.size()));
       }
@@ -1923,29 +1957,11 @@ public:
             && filterSuppliers.size() == 1
             && !mandatorySources.empty() && optionalSources.empty()
             && minShouldMatch == 0) {
-          bool docSetLeads = false;
-          bool docSetTermTail = false;
-          bool postingsFilterLeads = false;
-          bool termFeedLeads = false;
-          auto* candidate = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::CANDIDATE,
-              &docSetLeads, &docSetTermTail, &postingsFilterLeads,
-              &termFeedLeads);
-          if (candidate != nullptr
-              && ((docSetLeads && docSetTermTail)
-                  || postingsFilterLeads || termFeedLeads)) {
-            skipCount(SkipStats::filteredConjBatchEngagements);
-            if (mandatorySources.size() > 1) {
-              skipCount(SkipStats::filteredConjBatchMultiTermEngagements);
-            }
-            if (postingsFilterLeads) {
-              skipCount(
-                  SkipStats::filteredConjBatchPostingsFeedEngagements);
-            }
-            if (termFeedLeads) {
-              skipCount(SkipStats::candidateTermFeedEngagements);
-            }
-            return candidate;
+          auto candidate = conjunctionBulkScorer(
+              targetPool, ConjunctionMode::CANDIDATE);
+          if (candidate && candidate->usesCandidateRoute()) {
+            recordCandidateConjunctionEngagement(*candidate);
+            return candidate->bulk;
           }
         }
 
@@ -2121,31 +2137,11 @@ public:
             && (!disableFilteredConjMultiTermForTests
                 || mandatorySources.size() == 1)
             && optionalSources.empty() && prohibitedSources.empty()) {
-          bool docSetLeads = false;
-          bool docSetTermTail = false;
-          bool postingsFilterLeads = false;
-          bool termFeedLeads = false;
-          auto* bulk = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::CANDIDATE,
-              &docSetLeads, &docSetTermTail, &postingsFilterLeads,
-              &termFeedLeads);
-          if (bulk != nullptr
-              && ((docSetLeads && docSetTermTail)
-                  || postingsFilterLeads || termFeedLeads)) {
-            skipCount(SkipStats::filteredConjBatchEngagements);
-            if (mandatorySources.size() > 1) {
-              skipCount(
-                  SkipStats::filteredConjBatchMultiTermEngagements);
-            }
-            if (postingsFilterLeads) {
-              skipCount(
-                  SkipStats::filteredConjBatchPostingsFeedEngagements);
-            }
-            if (termFeedLeads) {
-              skipCount(
-                  SkipStats::candidateTermFeedEngagements);
-            }
-            return bulk;
+          auto result = conjunctionBulkScorer(
+              targetPool, ConjunctionMode::CANDIDATE);
+          if (result && result->usesCandidateRoute()) {
+            recordCandidateConjunctionEngagement(*result);
+            return result->bulk;
           }
         }
         // An exact count whose required body is a compound source must let
@@ -2182,34 +2178,27 @@ public:
               && ConjunctionBulkScorer::disableNegatedCountForTests) {
             return nullptr;
           }
-          bool docSetLeads = false;
-          bool docSetSparseBulkEligible = false;
-          bool candidatePostingsLead = false;
-          bool exactTermCount = false;
-          auto* bulk =
-              conjunctionBulkScorer(
-                  targetPool, ConjunctionMode::EXHAUSTIVE, &docSetLeads,
-                  &docSetSparseBulkEligible, nullptr, nullptr, {},
-                  &candidatePostingsLead, &exactTermCount);
-          if (bulk != nullptr) {
-            // A cached DocSet lead owns the sparse route too: keep this bulk
-            // scorer so countNextWindowSparse can drive from filter membership
-            // while term siblings retain docs-only probes. Prohibited clauses
-            // remain dense-only because sparse AND-NOT is not implemented here.
-            bool keepDocSetLead = !disableFilterClauseCountForTests
-                && prohibitedSources.empty()
-                && docSetLeads && docSetSparseBulkEligible;
-            bool keepDirectTermSparse = prohibitedSources.empty()
-                && exactTermCount;
-            if (candidatePostingsLead) {
-              skipCount(SkipStats::filteredConjBatchEngagements);
-              skipCount(
-                  SkipStats::filteredConjBatchPostingsFeedEngagements);
-            }
-            if (bulk->willCountDense() || keepDocSetLead
-                || keepDirectTermSparse
-                || candidatePostingsLead) {
-              return bulk;
+          auto result = conjunctionBulkScorer(
+              targetPool, ConjunctionMode::EXHAUSTIVE);
+          if (result) {
+            switch (result->route) {
+              case ConjunctionRoute::COUNT_POSTINGS_SAMPLE:
+                skipCount(SkipStats::filteredConjBatchEngagements);
+                skipCount(
+                    SkipStats::filteredConjBatchPostingsFeedEngagements);
+                return result->bulk;
+              case ConjunctionRoute::COUNT_DENSE:
+              case ConjunctionRoute::COUNT_EXACT_DOCS_ONLY:
+                return result->bulk;
+              case ConjunctionRoute::COUNT_DOC_SET_SPARSE:
+                // Sparse AND-NOT is not implemented, so construction assigns
+                // this route only when there are no prohibited clauses.
+                if (!disableFilterClauseCountForTests) {
+                  return result->bulk;
+                }
+                break;
+              default:
+                break;
             }
           }
           bool pureFilteredDisjunction = mandatorySources.empty()
@@ -2234,8 +2223,9 @@ public:
           // flattens phrase approximations into the doc-level leapfrog and
           // verifies positions only after all approximations agree; treating a
           // phrase as opaque would verify positions during every advance.
-          return conjunctionBulkScorer(
+          auto result = conjunctionBulkScorer(
               targetPool, ConjunctionMode::SCORED_BODY);
+          return result ? result->bulk : nullptr;
         }
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
             && !optionalSources.empty() && prohibitedSources.empty()
@@ -2281,18 +2271,21 @@ public:
             && optionalSources.empty() && prohibitedSources.empty()
             && minShouldMatch < 1
             && !bulkContext.filterSuppliers.empty()) {
-          bool candidatePostingsLead = false;
-          auto* bulk = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::EXHAUSTIVE, nullptr, nullptr,
-              nullptr, nullptr, bulkContext.filterSuppliers,
-              &candidatePostingsLead);
-          if (bulk != nullptr) {
-            if (candidatePostingsLead) {
+          auto result = conjunctionBulkScorer(
+              targetPool, ConjunctionMode::EXHAUSTIVE,
+              bulkContext.filterSuppliers);
+          if (result) {
+            assert(result->enclosingFilters == EnclosingFilters::CONSUMED);
+            if (result->enclosingFilters != EnclosingFilters::CONSUMED) {
+              return {};
+            }
+            if (result->route
+                == ConjunctionRoute::COUNT_POSTINGS_SAMPLE) {
               skipCount(SkipStats::filteredConjBatchEngagements);
               skipCount(
                   SkipStats::filteredConjBatchPostingsFeedEngagements);
             }
-            return {bulk, true};
+            return {result->bulk, true};
           }
         }
         if (bulkContext.requireFilterConsumption) {
