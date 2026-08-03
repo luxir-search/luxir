@@ -6092,6 +6092,145 @@ TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
   SkipStats::enabled = savedStats;
 }
 
+TEST_F(TermScorerTest,
+       filteredCountCandidateHonorsDomainAndPartialMaxResume) {
+  const int32_t N = 5 * DocsEnumMeta::L1_DOCS + 83;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  std::vector<int32_t> expected;
+  std::vector<int32_t> expectedAttached;
+  for (int32_t doc = 0; doc < N; doc++) {
+    bool requiredLead = (doc % 8) == 0;
+    bool overlap = (doc % 256) == 0;
+    bool independentTail = (doc % 8) != 0 && (doc % 6) == 0;
+    std::string body = "candidate_dense";
+    if (requiredLead) body += " candidate_lead";
+    if (independentTail || overlap) body += " candidate_filter";
+    if ((doc % 7) == 0) body += " attached_filter";
+    f.add(doc, body);
+    if (overlap && (doc % 5) == 0) {
+      expected.push_back(doc);
+    }
+    if (overlap && (doc % 7) == 0) {
+      expectedAttached.push_back(doc);
+    }
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery lead("body_w", "candidate_lead");
+  TermQuery dense("body_w", "candidate_dense");
+  TermQuery filterTerm("body_w", "candidate_filter");
+  std::array<Query*, 2> mandatory{&lead, &dense};
+  std::array<Query*, 1> filters{&filterTerm};
+  BooleanQuery query(mandatory, {}, {}, filters);
+  auto* weight = query.createWeight(qContext, 0);
+  auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(nullptr, supplier);
+  auto* bulk = supplier->bulkScorer(testIndex.pool);
+  ASSERT_NE(nullptr, bulk);
+
+  auto domain = makeEveryNthDocSet(N, 5, true);
+  DocSetBuilder matchedDocs(N);
+  SkipStatsGuard stats;
+  int64_t count = 0;
+  int32_t cursor = 0;
+  auto countTo = [&](int32_t max) {
+    while (cursor != PostingsReader::END && cursor < max) {
+      int32_t next = bulk->countNextWindow(
+          count, &matchedDocs, domain.get(), cursor, max);
+      if (next == PostingsReader::END) {
+        cursor = next;
+        break;
+      }
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+  };
+
+  countTo(2 * DocsEnumMeta::L1_DOCS + 181);
+  ASSERT_NE(PostingsReader::END, cursor);
+  countTo(N);
+  EXPECT_EQ((int64_t) expected.size(), count);
+  auto actual = matchedDocs.build();
+  ASSERT_EQ((int32_t) expected.size(), actual->card());
+  for (int32_t doc : expected) {
+    EXPECT_TRUE(actual->get(doc)) << doc;
+  }
+  EXPECT_GT(SkipStats::filteredConjBatchCountWindows, 1);
+  EXPECT_EQ(1, SkipStats::filteredCountCandidateAdmits);
+  EXPECT_EQ(0, SkipStats::filteredCountCandidateDenseLatchBacks);
+  EXPECT_EQ(0, SkipStats::conjDenseCountWindows);
+  EXPECT_EQ(0, SkipStats::tfreqBlocksDecoded);
+
+  // An empty prefix is not an admission sample. The next nonempty range must
+  // still make the candidate-vs-dense decision from real evidence.
+  SkipStats::reset();
+  auto* prefixWeight = query.createWeight(qContext, 0);
+  auto* prefixSupplier = prefixWeight->scorerSupplier(testIndex.pool, segment);
+  ASSERT_NE(nullptr, prefixSupplier);
+  auto* prefixBulk = prefixSupplier->bulkScorer(testIndex.pool);
+  ASSERT_NE(nullptr, prefixBulk);
+  int64_t prefixCount = 0;
+  int32_t prefixNext = prefixBulk->countNextWindow(
+      prefixCount, nullptr, nullptr, 1, 7);
+  EXPECT_EQ(8, prefixNext);
+  EXPECT_EQ(0, prefixCount);
+  EXPECT_EQ(0, SkipStats::filteredCountCandidateAdmits);
+  EXPECT_EQ(0, SkipStats::filteredCountCandidateDenseLatchBacks);
+  while (prefixNext != PostingsReader::END && prefixNext < N) {
+    int32_t next = prefixBulk->countNextWindow(
+        prefixCount, nullptr, nullptr, prefixNext, N);
+    if (next == PostingsReader::END) {
+      break;
+    }
+    ASSERT_GT(next, prefixNext);
+    prefixNext = next;
+  }
+  EXPECT_EQ((N - 1) / 256, prefixCount);
+  EXPECT_EQ(1, SkipStats::filteredCountCandidateAdmits);
+
+  // WindowFilter is a separate BulkScorer contract from the call-time
+  // DocSet domain. Attaching one before iteration must select the dense arm,
+  // which prepares and intersects the filter for every production window.
+  SkipStats::reset();
+  auto* attachedWeight = query.createWeight(qContext, 0);
+  auto* attachedSupplier = attachedWeight->scorerSupplier(
+      testIndex.pool, segment);
+  ASSERT_NE(nullptr, attachedSupplier);
+  auto* attachedBulk = attachedSupplier->bulkScorer(testIndex.pool);
+  ASSERT_NE(nullptr, attachedBulk);
+  TermQuery attachedTerm("body_w", "attached_filter");
+  auto* windowWeight = attachedTerm.createWeight(qContext, 0);
+  auto* windowScorer = windowWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(nullptr, windowScorer);
+  std::array<Query::Scorer*, 1> windowScorers{windowScorer};
+  WindowFilter windowFilter(
+      testIndex.pool, windowScorers, false, N / 7);
+  ASSERT_TRUE(attachedBulk->attachWindowFilter(&windowFilter));
+  EXPECT_TRUE(attachedBulk->willCountDense());
+
+  int64_t attachedCount = 0;
+  int32_t attachedCursor = 0;
+  while (attachedCursor != PostingsReader::END && attachedCursor < N) {
+    int32_t next = attachedBulk->countNextWindow(
+        attachedCount, nullptr, nullptr, attachedCursor, N);
+    if (next == PostingsReader::END) {
+      break;
+    }
+    ASSERT_GT(next, attachedCursor);
+    attachedCursor = next;
+  }
+  EXPECT_EQ((int64_t) expectedAttached.size(), attachedCount);
+  EXPECT_EQ(0, SkipStats::filteredConjBatchCountWindows);
+  EXPECT_GT(SkipStats::conjDenseCountWindows, 0);
+  EXPECT_EQ(0, SkipStats::tfreqBlocksDecoded);
+}
+
 TEST_F(TermScorerTest, conjunctionDenseScoredLatchBackResumesExactScoring) {
   DenseScoredGuard denseScoredGuard(false);
   SkipStatsGuard stats;
@@ -8449,6 +8588,44 @@ TEST_F(TermScorerTest, CandidateLeapfrogPreservesBatchedScoreAndMatchCompaction)
   };
 
   EXPECT_EQ(runMatches(false), runMatches(true));
+}
+
+TEST_F(TermScorerTest, RetainMatchesCompactsAcrossPostingsBlockShapesAndBatches) {
+  CollectionHelper helper("main");
+  auto postings = makeMixedProbePostings();
+  indexProbeTermDocs(helper, "retain_mix", postings, "retain_mix");
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  TermQuery query("body_w", "retain_mix");
+  auto* weight = query.createWeight(qContext, 0);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+      weight->createScorer(pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  const int32_t packedStart = postings[Postings::DOCS_BLOCK_SIZE];
+  const int32_t wordStart = postings[2 * Postings::DOCS_BLOCK_SIZE];
+  std::array<int32_t, 4> boundaries = {
+    0, packedStart + 73, wordStart + 100, postings.back() + 2
+  };
+  std::vector<int32_t> actual;
+  for (size_t batch = 1; batch < boundaries.size(); batch++) {
+    std::vector<int32_t> candidates(
+        (size_t) (boundaries[batch] - boundaries[batch - 1]));
+    std::iota(candidates.begin(), candidates.end(), boundaries[batch - 1]);
+    int32_t size = scorer->retainMatchesToCandidates(
+        candidates.data(), (int32_t) candidates.size());
+    actual.insert(actual.end(), candidates.begin(), candidates.begin() + size);
+  }
+  EXPECT_EQ(postings, actual);
+
+  std::array<int32_t, 2> afterEnd = {
+    postings.back() + 2, postings.back() + 3
+  };
+  EXPECT_EQ(0, scorer->retainMatchesToCandidates(
+      afterEnd.data(), (int32_t) afterEnd.size()));
 }
 
 // fillScoreBlock is count-driven: a call that stops on count (not upTo) must

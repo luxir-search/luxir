@@ -544,11 +544,13 @@ public:
         targetPool, docs, segment.maxDoc());
   }
 
-  BulkScorer* filteredBulkScorer(
+  FilteredBulkResult filteredBulkScorer(
       MemPool& targetPool,
       const BulkScorerContext& bulkContext) override {
-    unused(bulkContext);
-    return bulkScorer(targetPool);
+    if (bulkContext.requireFilterConsumption) {
+      return {};
+    }
+    return {bulkScorer(targetPool), false};
   }
 };
 

@@ -77,6 +77,19 @@ public:
   }
 };
 
+class IntegratedFilteredCountGuard {
+  bool saved;
+
+public:
+  explicit IntegratedFilteredCountGuard(bool disabled)
+    : saved(BooleanQuery::disableIntegratedFilteredCountForTests) {
+    BooleanQuery::disableIntegratedFilteredCountForTests = disabled;
+  }
+  ~IntegratedFilteredCountGuard() {
+    BooleanQuery::disableIntegratedFilteredCountForTests = saved;
+  }
+};
+
 class FilteredDisjunctionCountCompactionGuard {
   bool saved;
 
@@ -363,6 +376,8 @@ struct FilteredCountResult {
   int64_t filteredDisjBatchCountWindows;
   int64_t filteredDisjBatchScoreWindows;
   int64_t filteredConjBatchCountWindows;
+  int64_t filteredCountCandidateAdmits;
+  int64_t filteredCountCandidateDenseLatchBacks;
   int64_t ownedFilterMaterializations;
   int64_t ownedFilterServes;
 };
@@ -409,6 +424,8 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
     SkipStats::filteredConjBatchCountWindows,
+    SkipStats::filteredCountCandidateAdmits,
+    SkipStats::filteredCountCandidateDenseLatchBacks,
     SkipStats::ownedFilterMaterializations,
     SkipStats::ownedFilterServes,
   };
@@ -438,6 +455,8 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
     SkipStats::filteredDisjBatchCountWindows,
     SkipStats::filteredDisjBatchScoreWindows,
     SkipStats::filteredConjBatchCountWindows,
+    SkipStats::filteredCountCandidateAdmits,
+    SkipStats::filteredCountCandidateDenseLatchBacks,
     SkipStats::ownedFilterMaterializations,
     SkipStats::ownedFilterServes,
   };
@@ -1449,6 +1468,138 @@ TEST_F(SearchEngineTest, filteredCountBulkIntersectionSingleSegment) {
 
 TEST_F(SearchEngineTest, filteredCountBulkIntersectionMultiSegment) {
   expectFilteredCountEquivalence(soluxNode->getSearchEngine(), true);
+}
+
+TEST_F(SearchEngineTest,
+       uncachedFilteredCountSelectsAndSamplesEitherPostingsLead) {
+  constexpr std::string_view collection =
+      "uncached_filtered_count_candidate";
+  constexpr int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 123;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  int32_t selectedCount = 0;
+  int32_t overlapCount = 0;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    bool selected = (doc % 8) == 0;
+    bool overlap = (doc % 256) == 0;
+    bool independentTail = (doc % 8) != 0 && (doc % 6) == 0;
+    selectedCount += (int32_t) selected;
+    overlapCount += (int32_t) overlap;
+
+    std::string body = "dense_a dense_b";
+    if (independentTail || overlap) body += " filter_tail";
+    if (selected) body += " required_lead";
+
+    std::string filter;
+    if (selected) filter += "selected ";
+    if (independentTail || overlap) filter += "required_tail";
+    docs.push_back(flatdoc(
+        "id", "candidate_" + std::to_string(doc),
+        "body_w", body, "filter_w", filter));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_GT(selectedCount,
+            BooleanQuery::ConjunctionBulkScorer::
+                kFilteredConjunctionBatchSize);
+
+  struct Run {
+    int64_t count = 0;
+    int64_t candidateWindows = 0;
+    int64_t candidateAdmits = 0;
+    int64_t denseLatchBacks = 0;
+    int64_t denseWindows = 0;
+    int64_t tfreqBlocksDecoded = 0;
+  };
+  auto run = [&](std::string_view first, std::string_view second,
+                 std::string_view filter, bool disabled = false) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().limit(0);
+    cur.rawQuery() = qb::boolean(
+        cur.mr(),
+        {qb::match(cur.mr(), "body_w", first),
+         qb::match(cur.mr(), "body_w", second)});
+    cur.matchFilter("selection", "filter_w", filter);
+    IntegratedFilteredCountGuard routeGuard(disabled);
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::filteredConjBatchCountWindows,
+      SkipStats::filteredCountCandidateAdmits,
+      SkipStats::filteredCountCandidateDenseLatchBacks,
+      SkipStats::conjDenseCountWindows,
+      SkipStats::tfreqBlocksDecoded,
+    };
+  };
+
+  // The filter is cheapest in the first shape; the required term is cheapest
+  // in the second. Both feeds exceed one batch and retain only the 1/32
+  // overlap after the first tail probe.
+  Run filterLead = run("filter_tail", "dense_a", "selected");
+  Run requiredLead = run("required_lead", "dense_a", "required_tail");
+  int64_t expectedCandidateWindows = 1
+      + (selectedCount
+         - BooleanQuery::ConjunctionBulkScorer::kCandidateCountSampleSize
+         + BooleanQuery::ConjunctionBulkScorer::kFilteredConjunctionBatchSize
+         - 1)
+          / BooleanQuery::ConjunctionBulkScorer::
+              kFilteredConjunctionBatchSize;
+  for (const Run* result : {&filterLead, &requiredLead}) {
+    EXPECT_EQ(overlapCount, result->count);
+    EXPECT_EQ(expectedCandidateWindows, result->candidateWindows);
+    EXPECT_GT(result->candidateAdmits, 0);
+    EXPECT_EQ(0, result->denseLatchBacks);
+    EXPECT_EQ(0, result->denseWindows);
+    EXPECT_EQ(0, result->tfreqBlocksDecoded);
+  }
+
+  // A non-selective first tail rejects the candidate arm after one batch and
+  // resumes the dense route without losing the remaining filter postings.
+  Run latched = run("dense_a", "dense_b", "selected");
+  EXPECT_EQ(selectedCount, latched.count);
+  EXPECT_EQ(1, latched.candidateWindows);
+  EXPECT_EQ(0, latched.candidateAdmits);
+  EXPECT_GT(latched.denseLatchBacks, 0);
+  EXPECT_GT(latched.denseWindows, 0);
+  EXPECT_EQ(0, latched.tfreqBlocksDecoded);
+
+  auto runSingleTerm = [&] {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().limit(0);
+    cur.rawQuery() = qb::match(cur.mr(), "body_w", "dense_a");
+    cur.matchFilter("selection", "filter_w", "selected");
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::filteredConjBatchCountWindows,
+      SkipStats::filteredCountCandidateAdmits,
+      SkipStats::filteredCountCandidateDenseLatchBacks,
+      SkipStats::conjDenseCountWindows,
+      SkipStats::tfreqBlocksDecoded,
+    };
+  };
+  Run singleTerm = runSingleTerm();
+  EXPECT_EQ(selectedCount, singleTerm.count);
+  EXPECT_EQ(0, singleTerm.candidateWindows);
+  EXPECT_EQ(0, singleTerm.candidateAdmits);
+  EXPECT_EQ(0, singleTerm.denseLatchBacks);
+  EXPECT_GT(singleTerm.denseWindows, 0);
+
+  Run disabled = run("filter_tail", "dense_a", "selected", true);
+  EXPECT_EQ(filterLead.count, disabled.count);
+  EXPECT_EQ(0, disabled.candidateWindows);
+  EXPECT_EQ(0, disabled.candidateAdmits);
+  EXPECT_EQ(0, disabled.denseLatchBacks);
+  EXPECT_GT(disabled.denseWindows, 0);
 }
 
 TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {

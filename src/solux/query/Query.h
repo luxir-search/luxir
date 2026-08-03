@@ -388,8 +388,20 @@ public:
     // slower than pull under the enclosing domain.
     struct BulkScorerContext {
       int64_t filterCost = -1;
+      std::span<ScorerSupplier* const> filterSuppliers;
+      // Strong constraint: a supplier must return consumesFilters=true or
+      // decline with {}; it must not construct a non-consuming fallback.
+      bool requireFilterConsumption = false;
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
+    };
+
+    struct FilteredBulkResult {
+      BulkScorer* bulk = nullptr;
+      // All-or-none ownership: true requires a non-null bulk that enforces
+      // every supplier in BulkScorerContext::filterSuppliers. False leaves
+      // every enclosing supplier owned by the caller.
+      bool consumesFilters = false;
     };
 
     struct ExactCountTopKCosts {
@@ -451,11 +463,11 @@ public:
     // Build a bulk scorer that will run beneath an enclosing filter. Unknown
     // suppliers decline by default; implementations that understand their
     // bulk route must explicitly accept or use the context.
-    virtual BulkScorer* filteredBulkScorer(
+    virtual FilteredBulkResult filteredBulkScorer(
         MemPool& targetPool, const BulkScorerContext& bulkContext) {
       unused(targetPool);
       unused(bulkContext);
-      return nullptr;
+      return {};
     }
   };
 

@@ -208,11 +208,13 @@ public:
 
       BulkScorer* bulkScorer(MemPool& targetPool) override;
 
-      BulkScorer* filteredBulkScorer(
+      FilteredBulkResult filteredBulkScorer(
           MemPool& targetPool,
           const BulkScorerContext& bulkContext) override {
-        unused(bulkContext);
-        return bulkScorer(targetPool);
+        if (bulkContext.requireFilterConsumption) {
+          return {};
+        }
+        return {bulkScorer(targetPool), false};
       }
     };
 
@@ -571,6 +573,28 @@ public:
         }
         i++;
       }
+    }
+
+    int32_t retainMatchesToCandidates(int32_t* docs, int32_t size) {
+      assert(size >= 0);
+      int32_t current = docsEnum.docId();
+      int32_t read = 0;
+      int32_t write = 0;
+      while (read < size) {
+        read = leapfrogCandidate(docs, size, read, current);
+        if (read == size) {
+          break;
+        }
+        int32_t target = docs[read];
+        if (current < target) {
+          current = docsEnum.advanceDocOnly(target);
+        }
+        if (current == target) {
+          docs[write++] = target;
+        }
+        read++;
+      }
+      return write;
     }
 
     int32_t fillScoreBlockScalar(int32_t* docs, float* scores, int32_t count, int32_t upTo,
