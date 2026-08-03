@@ -39,6 +39,8 @@
 // - FieldDef reads accept a bare STRING as type-only sugar: {"year": "int"} ==
 //   {"year": {"type": "int"}} in a schema's fields/templates maps. Writes stay
 //   canonical (the object form).
+// - SortSpec reads `field` as an alias for `expr`, for the common bare-column sort.
+//   Writes stay canonical with `expr` because sort expressions are the underlying API.
 
 #pragma once
 
@@ -190,6 +192,35 @@ struct from<JSON, solux::api::ExprQuery> {
           } else if (key == "vars") {
             decltype(auto) vars = ::hpp_proto::detail::as_modifiable(ctx, value.vars);
             glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- SortSpec: `field` is a bare-column alias for `expr` -----
+template <>
+struct from<JSON, solux::api::SortSpec> {
+  template <auto Opts>
+  static void op(solux::api::SortSpec &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "expr" || key == "field") {
+            util::from_json<O>(value.expr, ctx, vit, vend);
+          } else if (key == "vars") {
+            decltype(auto) vars = ::hpp_proto::detail::as_modifiable(ctx, value.vars);
+            glz::util::parse_repeated<O>(true, vars, ctx, vit, vend);
+          } else if (key == "dir") {
+            util::from_json<O>(value.dir, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

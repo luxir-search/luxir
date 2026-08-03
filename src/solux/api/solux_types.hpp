@@ -78,7 +78,7 @@ struct SchemaRequest; struct SchemaResponse;
 namespace UpdateResponse_ { struct Error; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
-namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, ASCENDING = 1, DESC = 2, DESCENDING = 2 }; }
+namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };

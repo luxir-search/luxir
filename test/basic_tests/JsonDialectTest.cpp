@@ -278,6 +278,23 @@ TEST(JsonDialect, ExprQueryStringAndObjectForms) {
   EXPECT_EQ(out, R"({"expr":{"q":"status:active"}})");
 }
 
+TEST(JsonDialect, SortSpecFieldAlias) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SortSpec sort;
+  ASSERT_TRUE(P::read_json(sort, R"({"field":"price_i","dir":"asc"})", mr));
+  EXPECT_EQ("price_i", sort.expr);
+  EXPECT_EQ(P::SortSpec::SortDir::ASC, sort.dir);
+
+  // The public output remains the expression-based canonical form.
+  std::string out;
+  ASSERT_TRUE(P::write_json(sort, out));
+  EXPECT_EQ(R"({"expr":"price_i","dir":"asc"})", out);
+
+  P::SortSpec longAsc, longDesc;
+  EXPECT_FALSE(P::read_json(longAsc, R"({"expr":"price_i","dir":"ascending"})", mr));
+  EXPECT_FALSE(P::read_json(longDesc, R"({"expr":"price_i","dir":"descending"})", mr));
+}
+
 TEST(JsonDialect, DepthLimitErrorsCleanly) {
   std::pmr::monotonic_buffer_resource mr;
   std::string deep(300, '[');

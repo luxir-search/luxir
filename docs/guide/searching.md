@@ -133,6 +133,8 @@ Sort a column field explicitly:
 ```
 
 The `expr` member accepts either a bare field name or a numeric value expression.
+For a bare field sort, `field` is accepted as an input alias; responses and
+request echo use the canonical `expr` form.
 Numeric, date, string, and ID field names retain the direct column-sort path.
 Use `col("name")` when a field name is reserved or is not an identifier. Analyzed
 text has no sortable value unless it is indexed for string sorting or copied to

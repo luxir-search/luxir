@@ -167,12 +167,9 @@ message SortSpec {
   map<string, Val> vars = 2;
 
   enum SortDir {
-    option allow_alias = true;
     UNKNOWN = 0;
     ASC = 1;
-    ASCENDING = 1;
     DESC = 2;
-    DESCENDING = 2;
   }
   SortDir dir = 10;
 }
