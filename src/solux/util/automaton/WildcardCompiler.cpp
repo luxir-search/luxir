@@ -1,0 +1,63 @@
+#include "solux/util/automaton/WildcardCompiler.h"
+
+#include <format>
+#include <stdexcept>
+
+namespace solux::automaton {
+namespace {
+
+[[noreturn]] void error(std::string_view message, std::string_view pattern) {
+  throw std::runtime_error(std::format("{}: {}", message, pattern));
+}
+
+int32_t decode(std::string_view pattern, size_t& position) {
+  unsigned char first = pattern[position++];
+  if (first < 0x80) return first;
+  int32_t count = (first & 0xe0) == 0xc0 ? 2 : (first & 0xf0) == 0xe0 ? 3
+                : (first & 0xf8) == 0xf0 ? 4 : 0;
+  if (count == 0 || position + (size_t)count - 1 > pattern.size()) {
+    error("invalid UTF-8 in wildcard pattern", pattern);
+  }
+  int32_t codepoint = first & ((1 << (7 - count)) - 1);
+  for (int32_t i = 1; i < count; i++) {
+    unsigned char byte = pattern[position++];
+    if ((byte & 0xc0) != 0x80) error("invalid UTF-8 in wildcard pattern", pattern);
+    codepoint = (codepoint << 6) | (byte & 0x3f);
+  }
+  if ((count == 2 && codepoint < 0x80) || (count == 3 && codepoint < 0x800)
+      || (count == 4 && (codepoint < 0x10000 || codepoint > 0x10ffff))
+      || (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+    error("invalid UTF-8 in wildcard pattern", pattern);
+  }
+  return codepoint;
+}
+
+} // namespace
+
+ByteDfa compileWildcard(std::string_view pattern, Budget& budget) {
+  if (pattern.size() > 1000) error("pattern too complex", pattern);
+  try {
+    Automaton result = Automaton::epsilon(budget);
+    for (size_t position = 0; position < pattern.size();) {
+      int32_t codepoint = decode(pattern, position);
+      Automaton part;
+      if (codepoint == '*') {
+        part = Automaton::anyStringBytes(budget);
+      } else if (codepoint == '?') {
+        part = Automaton::anyChar(budget);
+      } else if (codepoint == '\\') {
+        if (position == pattern.size()) error("trailing escape in wildcard pattern", pattern);
+        part = Automaton::codepoint(decode(pattern, position), budget);
+      } else {
+        part = Automaton::codepoint(codepoint, budget);
+      }
+      result = Automaton::concatenate(result, part, budget);
+    }
+    return ByteDfa(utf32ToUtf8(result, budget), budget);
+  } catch (const std::runtime_error& e) {
+    if (std::string_view(e.what()) == "pattern too complex") error("pattern too complex", pattern);
+    throw;
+  }
+}
+
+} // namespace solux::automaton
