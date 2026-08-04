@@ -167,6 +167,18 @@ public:
   size_t size() const { return ranges.size(); }
   const std::vector<Range>& transitions(State state) const { return ranges[(size_t)state]; }
 
+  std::string commonPrefix() const {
+    std::string prefix;
+    State state = start();
+    while (state != DEAD && !isMatch(state)) {
+      const auto& stateRanges = ranges[(size_t)state];
+      if (stateRanges.size() != 1 || stateRanges[0].min != stateRanges[0].max) break;
+      prefix.push_back((char)stateRanges[0].min);
+      state = stateRanges[0].dest;
+    }
+    return prefix;
+  }
+
   Kind classify(std::string* value = nullptr) const {
     if (value != nullptr) value->clear();
     if (ranges.empty() || minAcceptedLength() > 255) return Kind::NONE;

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "solux/reader/LevenshteinAutomaton.h"
+#include "solux/reader/AutomatonSeekEnum.h"
 
 using namespace solux;
 
@@ -141,7 +142,7 @@ int trialNextLiveByte(const LevenshteinAutomaton& a, const LevenshteinAutomaton:
   for (int b = b0; b <= 255; b++) {
     if (a.canMatch(a.step(s, (uint8_t)b))) return b;
   }
-  return LevenshteinAutomaton::NONE;
+  return LevenshteinAutomaton::DEAD;
 }
 
 std::vector<LevenshteinAutomaton::State> liveStack(const LevenshteinAutomaton& a,
@@ -210,7 +211,11 @@ void expectSuccessor(std::string_view query, int k, bool prefixMode, std::string
   int liveDepth;
   auto states = liveStack(a, term, liveDepth);
   std::string actual;
-  bool actualFound = a.successor(term, states.data(), liveDepth, actual);
+  char buffer[PackedTerm::MAX_LEN + 1];
+  int actualLen;
+  bool actualFound = AutomatonSeekEnum<LevenshteinAutomaton>::successor(
+      a, term, states.data(), liveDepth, buffer, actualLen);
+  actual.assign(buffer, (size_t)actualLen);
   std::string expected;
   bool expectedFound = bruteSuccessor(a, term, maxLen, expected);
 
@@ -362,7 +367,11 @@ TEST(LevenshteinAutomatonTest, EdgeCases) {
     int liveDepth;
     auto states = liveStack(a, "a", liveDepth);
     std::string out;
-    ASSERT_TRUE(a.successor("a", states.data(), liveDepth, out));
+    char buffer[PackedTerm::MAX_LEN + 1];
+    int outLen;
+    ASSERT_TRUE(AutomatonSeekEnum<LevenshteinAutomaton>::successor(
+        a, "a", states.data(), liveDepth, buffer, outLen));
+    out.assign(buffer, (size_t)outLen);
     EXPECT_EQ(out, "b");
   }
 }

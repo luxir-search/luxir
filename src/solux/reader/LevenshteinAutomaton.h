@@ -13,7 +13,7 @@ namespace solux {
 // Byte-wise banded Levenshtein automaton for maxEdits <= 2.
 class LevenshteinAutomaton final {
 public:
-  static constexpr int NONE = -1;
+  static constexpr int DEAD = -1;
 
   struct State {
     uint16_t j;
@@ -134,78 +134,20 @@ public:
 
   int nextLiveByte(const State& s, int b0) const {
     if (b0 < 0) b0 = 0;
-    if (b0 > 255 || !canMatch(s)) return NONE;
+    if (b0 > 255 || !canMatch(s)) return DEAD;
     if (s.prefixMatched || minCell(s) < k) return b0;
 
-    int answer = NONE;
+    int answer = DEAD;
     int lo = std::max(0, (int)s.j - k);
     int hi = std::min(n, (int)s.j + k);
     for (int i = lo; i <= hi && i < n; i++) {
       if (cell(s, i) != k) continue;
       int b = (int)queryByte(i);
-      if (b >= b0 && (answer == NONE || b < answer)) answer = b;
+      if (b >= b0 && (answer == DEAD || b < answer)) answer = b;
     }
     return answer;
   }
 
-  bool successor(std::string_view term, const State* states, int liveDepth, std::string& out) const {
-    int m = (int)term.size();
-    assert(liveDepth >= 0 && liveDepth <= m);
-    out.clear();
-
-    if (liveDepth == m) {
-      int b = nextLiveByte(states[m], 0);
-      if (b != NONE) {
-        out.assign(term.data(), term.size());
-        out.push_back((char)(uint8_t)b);
-        return true;
-      }
-    }
-
-    int pos = liveDepth == m ? m - 1 : liveDepth;
-    for (; pos >= 0; pos--) {
-      uint8_t tb = (uint8_t)term[(size_t)pos];
-      if (tb == 0xff) continue;
-      int b = nextLiveByte(states[pos], (int)tb + 1);
-      if (b != NONE) {
-        out.assign(term.data(), (size_t)pos);
-        out.push_back((char)(uint8_t)b);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  bool successor(std::string_view term, const State* states, int liveDepth,
-                 char* out, int& outLen) const {
-    int m = (int)term.size();
-    assert(liveDepth >= 0 && liveDepth <= m);
-    outLen = 0;
-
-    if (liveDepth == m) {
-      int b = nextLiveByte(states[m], 0);
-      if (b != NONE) {
-        if (m > 0) memcpy(out, term.data(), (size_t)m);
-        out[m] = (char)(uint8_t)b;
-        outLen = m + 1;
-        return true;
-      }
-    }
-
-    int pos = liveDepth == m ? m - 1 : liveDepth;
-    for (; pos >= 0; pos--) {
-      uint8_t tb = (uint8_t)term[(size_t)pos];
-      if (tb == 0xff) continue;
-      int b = nextLiveByte(states[pos], (int)tb + 1);
-      if (b != NONE) {
-        if (pos > 0) memcpy(out, term.data(), (size_t)pos);
-        out[pos] = (char)(uint8_t)b;
-        outLen = pos + 1;
-        return true;
-      }
-    }
-    return false;
-  }
 };
 
 } // namespace solux
