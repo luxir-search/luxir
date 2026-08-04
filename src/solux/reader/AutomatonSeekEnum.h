@@ -18,8 +18,8 @@ class AutomatonSeekEnum : public FilteredTermsEnum {
 protected:
   static constexpr int DEAD = -1;
   std::string_view prefix;
-  bool consumePrefix;
   A automaton;
+  typename A::State initialState;
   typename A::State* stack;
   char previous[PackedTerm::MAX_LEN];
   char successorBuffer[PackedTerm::MAX_LEN + 1];
@@ -62,13 +62,7 @@ public:
 protected:
 
   void resetStack() {
-    stack[0] = automaton.start();
-    if (consumePrefix) {
-      for (unsigned char byte : prefix) {
-        stack[0] = automaton.step(stack[0], byte);
-        assert(automaton.canMatch(stack[0]));
-      }
-    }
+    stack[0] = initialState;
     previousLen = 0;
     previousLiveDepth = 0;
   }
@@ -134,9 +128,19 @@ protected:
   bool advance() override { return advanceAutomaton(); }
 
 public:
+  AutomatonSeekEnum(MemPool& pool, TermsEnum& te, std::string_view prefix, A automaton)
+      : FilteredTermsEnum(te), prefix(prefix), automaton(std::move(automaton)),
+        initialState(this->automaton.start()) {
+    stack = (typename A::State*)pool.alloc((PackedTerm::MAX_LEN + 1) * sizeof(typename A::State),
+                                            alignof(typename A::State));
+  }
+
+  // The caller supplies the state already reached by `prefix` when the
+  // automaton spans the whole term rather than just the suffix.
   AutomatonSeekEnum(MemPool& pool, TermsEnum& te, std::string_view prefix, A automaton,
-                    bool consumePrefix = false)
-      : FilteredTermsEnum(te), prefix(prefix), consumePrefix(consumePrefix), automaton(std::move(automaton)) {
+                    typename A::State initialState)
+      : FilteredTermsEnum(te), prefix(prefix), automaton(std::move(automaton)),
+        initialState(initialState) {
     stack = (typename A::State*)pool.alloc((PackedTerm::MAX_LEN + 1) * sizeof(typename A::State),
                                             alignof(typename A::State));
   }

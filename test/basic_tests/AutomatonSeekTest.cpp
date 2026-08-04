@@ -29,8 +29,8 @@ std::vector<std::string> collectSmart(TestField& field, const ByteDfa& dfa, int6
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
   TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
-  std::string prefix = dfa.commonPrefix();
-  AutomatonSeekEnum<ByteDfa> e(guard.pool(), terms, prefix, dfa, true);
+  auto [prefix, state] = dfa.commonPrefixAndState();
+  AutomatonSeekEnum<ByteDfa> e(guard.pool(), terms, prefix, dfa, state);
   std::vector<std::string> out;
   while (e.next()) out.emplace_back(e.termView());
   if (examined != nullptr) *examined = e.termsExamined();

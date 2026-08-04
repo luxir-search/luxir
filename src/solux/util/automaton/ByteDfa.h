@@ -167,7 +167,11 @@ public:
   size_t size() const { return ranges.size(); }
   const std::vector<Range>& transitions(State state) const { return ranges[(size_t)state]; }
 
-  std::string commonPrefix() const {
+  std::string commonPrefix() const { return commonPrefixAndState().first; }
+
+  // The longest unique byte path from the start, plus the state it reaches:
+  // the seek prefix and the enum's initial state in one walk.
+  std::pair<std::string, State> commonPrefixAndState() const {
     std::string prefix;
     State state = start();
     while (state != DEAD && !isMatch(state)) {
@@ -176,7 +180,7 @@ public:
       prefix.push_back((char)stateRanges[0].min);
       state = stateRanges[0].dest;
     }
-    return prefix;
+    return {std::move(prefix), state};
   }
 
   Kind classify(std::string* value = nullptr) const {
