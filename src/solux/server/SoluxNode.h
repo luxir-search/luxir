@@ -34,6 +34,26 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+class InvalidCollectionNameError : public CollectionResolutionError {
+public:
+  using CollectionResolutionError::CollectionResolutionError;
+};
+
+class CollectionNotFoundError : public CollectionResolutionError {
+public:
+  using CollectionResolutionError::CollectionResolutionError;
+};
+
+class CollectionUnavailableError : public CollectionResolutionError {
+public:
+  using CollectionResolutionError::CollectionResolutionError;
+};
+
+class CollectionExistsError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
 class Shard {
   Collection& collection; // hard reference to the collection that owns this shard
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)
@@ -72,7 +92,7 @@ namespace api::SchemaRequest_ { enum class Mode; }
 // consist of multiple shards.
 class Collection {
   std::string name;
-  std::string loadError;  // non-empty means the collection failed to load at startup; resolution rejects it
+  std::string unavailableReason;  // non-empty means resolution rejects the collection
   std::atomic<std::shared_ptr<Schema>> schema;  // atomic for lock-free reader access
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
@@ -158,7 +178,7 @@ public:
   std::shared_ptr<Collection> resolveOrCreateCollection(const solux::api::Target* target);
 
   // Snapshot fully-created root collections without waiting for creations in
-  // flight. Load-failure tombstones retain their recorded error.
+  // flight. Unavailable tombstones retain their recorded error.
   std::vector<CollectionEntry> collectionEntries();
 
   std::shared_ptr<Collection> getCollection(Library* library, std::string_view name);
@@ -182,7 +202,9 @@ public:
     return {};
   }
 
-  std::shared_ptr<Collection> createCollection(Library* library, std::string_view name);
+  std::shared_ptr<Collection> createCollection(
+      Library* library, std::string_view name, const api::SchemaDef* schema = nullptr);
+  void deleteCollection(std::string_view name);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;
@@ -201,7 +223,7 @@ private:
 
   void createSingletons();
   std::shared_ptr<Collection> initCollection(const std::string& name);
-  // Returns the collection unchanged, or throws CollectionResolutionError if it is a load-failure tombstone.
+  // Returns the collection unchanged, or throws if it is unavailable.
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
   static std::string normalizedCollectionName(std::string_view name);
   static void validateCollectionName(std::string_view name);

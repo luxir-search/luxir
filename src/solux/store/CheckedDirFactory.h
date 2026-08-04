@@ -147,6 +147,10 @@ public:
   std::vector<std::string> listCollections() override {
     return delegate_->listCollections();
   }
+
+  void remove(std::string_view collectionName) override {
+    delegate_->remove(collectionName);
+  }
 };
 
 } // namespace solux

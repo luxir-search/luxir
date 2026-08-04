@@ -75,6 +75,8 @@ struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColIn
 struct ColFloat; struct ColDouble; struct ColMap; struct IndexInfo; struct AuxIndexInfo;
 struct SegmentInfo; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct SchemaRequest; struct SchemaResponse;
+struct CreateCollectionRequest; struct CreateCollectionResponse;
+struct DeleteCollectionRequest; struct DeleteCollectionResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct FilterCacheStats; struct IndexRamStats;
@@ -323,6 +325,10 @@ struct SchemaRequest {                                           // needs Target
   std::optional<SchemaDef> schema;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };
+struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; };
+struct CreateCollectionResponse { std::string_view name; };
+struct DeleteCollectionRequest { std::string_view name; };
+struct DeleteCollectionResponse { std::string_view name; };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ColMap { std::span<const Map> v; };                       // span<incomplete Map> OK
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
@@ -568,6 +574,8 @@ SOLUX_TD(ColStr) SOLUX_TD(Column) SOLUX_TD(ColVector) SOLUX_TD(MultiVector) SOLU
 SOLUX_TD(ColFloat) SOLUX_TD(ColDouble) SOLUX_TD(ColMap) SOLUX_TD(IndexInfo) SOLUX_TD(AuxIndexInfo)
 SOLUX_TD(SegmentInfo) SOLUX_TD(AnalyzerDef) SOLUX_TD(FieldDef) SOLUX_TD(SchemaDef)
 SOLUX_TD(SchemaRequest) SOLUX_TD(SchemaResponse) SOLUX_TD(UpdateResponse_::Error)
+SOLUX_TD(CreateCollectionRequest) SOLUX_TD(CreateCollectionResponse)
+SOLUX_TD(DeleteCollectionRequest) SOLUX_TD(DeleteCollectionResponse)
 SOLUX_TD(StatsRequest) SOLUX_TD(StatsResponse) SOLUX_TD(StatsTotals) SOLUX_TD(CollectionStats)
 SOLUX_TD(ShardStats) SOLUX_TD(IndexStats) SOLUX_TD(SegmentStats) SOLUX_TD(AuxStats)
 SOLUX_TD(FilterCacheStats) SOLUX_TD(IndexRamStats)
@@ -601,6 +609,8 @@ SOLUX_ENTRY(ColVector) SOLUX_ENTRY(MultiVector) SOLUX_ENTRY(ColInt) SOLUX_ENTRY(
 SOLUX_ENTRY(ColDouble) SOLUX_ENTRY(ColMap) SOLUX_ENTRY(IndexInfo) SOLUX_ENTRY(AuxIndexInfo)
 SOLUX_ENTRY(SegmentInfo) SOLUX_ENTRY(AnalyzerDef) SOLUX_ENTRY(FieldDef)
 SOLUX_ENTRY(SchemaDef) SOLUX_ENTRY(SchemaRequest) SOLUX_ENTRY(SchemaResponse)
+SOLUX_ENTRY(CreateCollectionRequest) SOLUX_ENTRY(CreateCollectionResponse)
+SOLUX_ENTRY(DeleteCollectionRequest) SOLUX_ENTRY(DeleteCollectionResponse)
 SOLUX_ENTRY(StatsRequest) SOLUX_ENTRY(StatsResponse) SOLUX_ENTRY(StatsTotals)
 SOLUX_ENTRY(CollectionStats) SOLUX_ENTRY(ShardStats) SOLUX_ENTRY(IndexStats)
 SOLUX_ENTRY(SegmentStats) SOLUX_ENTRY(AuxStats) SOLUX_ENTRY(FilterCacheStats)

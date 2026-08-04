@@ -741,6 +741,18 @@ private:
     std::string coll;
     if (req.method() == http::verb::get && target == "/health") {
       respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
+    } else if (target == "/collections/_create") {
+      if (req.method() != http::verb::post && req.method() != http::verb::put) {
+        respondMethodNotAllowed("POST, PUT", "method not allowed; collections are created with POST or PUT");
+        return;
+      }
+      handleCollectionCreate(req.body());
+    } else if (target == "/collections/_delete") {
+      if (req.method() != http::verb::post) {
+        respondMethodNotAllowed("POST", "method not allowed; collections are deleted with POST");
+        return;
+      }
+      handleCollectionDelete(req.body());
     } else if (req.method() == http::verb::post && parseSearchPath(target, coll)) {
       auto format = HttpSearchFormat::ENVELOPE;
       if (const std::string* f = findParam(params, "format")) {
@@ -985,8 +997,7 @@ private:
 
         BlockingUpdateMessage msg(&state->proto);
         bool success = iw->submitUpdate(&msg);
-        assert(success);
-        unused(success);
+        if (!success) throw IndexWriterClosedError("index writer is closed");
         msg.blocker.wait();
         auto* resp = msg.finishResponse();
         if (!solux::api::write_json(*resp, out)) {
@@ -994,6 +1005,107 @@ private:
         }
       } catch (const CollectionResolutionError& e) {
         status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const IndexWriterClosedError& e) {
+        status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const std::exception& e) {
+        status = http::status::internal_server_error;
+        out = renderErrorBody(e.what());
+      }
+
+      net::post(self->stream_.get_executor(),
+          [self, ioPin, status, body = std::move(out)]() mutable {
+            self->respondSimple(status, "application/json", std::move(body));
+          });
+    });
+  }
+
+  void handleCollectionCreate(const std::string& body) {
+    struct State {
+      std::pmr::monotonic_buffer_resource resource;
+      solux::api::CreateCollectionRequest request;
+    };
+    auto state = std::make_shared<State>();
+    try {
+      std::string err;
+      if (!solux::api::read_json(state->request, body, state->resource, &err)) {
+        throw std::runtime_error(err.empty() ? "malformed create collection request" : err);
+      }
+    } catch (const std::exception& e) {
+      respondSimple(http::status::bad_request, "application/json", renderErrorBody(e.what()));
+      return;
+    }
+
+    auto ioPin = makeIoPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin] {
+      http::status status = http::status::ok;
+      std::string out;
+      try {
+        self->node_.createCollection(
+            nullptr, state->request.name,
+            state->request.schema ? &*state->request.schema : nullptr);
+        solux::api::CreateCollectionResponse response;
+        response.name = state->request.name;
+        if (!solux::api::write_json(response, out)) {
+          throw std::runtime_error("failed to serialize create collection response");
+        }
+      } catch (const InvalidCollectionNameError& e) {
+        status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const SchemaError& e) {
+        status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const CollectionExistsError& e) {
+        status = http::status::conflict;
+        out = renderErrorBody(e.what());
+      } catch (const std::exception& e) {
+        status = http::status::internal_server_error;
+        out = renderErrorBody(e.what());
+      }
+
+      net::post(self->stream_.get_executor(),
+          [self, ioPin, status, body = std::move(out)]() mutable {
+            self->respondSimple(status, "application/json", std::move(body));
+          });
+    });
+  }
+
+  void handleCollectionDelete(const std::string& body) {
+    struct State {
+      std::pmr::monotonic_buffer_resource resource;
+      solux::api::DeleteCollectionRequest request;
+    };
+    auto state = std::make_shared<State>();
+    try {
+      std::string err;
+      if (!solux::api::read_json(state->request, body, state->resource, &err)) {
+        throw std::runtime_error(err.empty() ? "malformed delete collection request" : err);
+      }
+    } catch (const std::exception& e) {
+      respondSimple(http::status::bad_request, "application/json", renderErrorBody(e.what()));
+      return;
+    }
+
+    auto ioPin = makeIoPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin] {
+      http::status status = http::status::ok;
+      std::string out;
+      try {
+        self->node_.deleteCollection(state->request.name);
+        solux::api::DeleteCollectionResponse response;
+        response.name = state->request.name;
+        if (!solux::api::write_json(response, out)) {
+          throw std::runtime_error("failed to serialize delete collection response");
+        }
+      } catch (const InvalidCollectionNameError& e) {
+        status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const CollectionNotFoundError& e) {
+        status = http::status::not_found;
+        out = renderErrorBody(e.what());
+      } catch (const CollectionUnavailableError& e) {
+        status = http::status::not_found;
         out = renderErrorBody(e.what());
       } catch (const std::exception& e) {
         status = http::status::internal_server_error;

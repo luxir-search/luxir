@@ -247,6 +247,8 @@ void roundTripType(const char* nm) {
   X(ArrArrBin) X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
   X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerDef)    \
   X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
+  X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
+  X(DeleteCollectionRequest) X(DeleteCollectionResponse)                                           \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
   X(SegmentStats) X(AuxStats) X(FilterCacheStats) X(IndexRamStats)                                 \
   X(HelloRequest) X(HelloReply)

@@ -52,6 +52,30 @@ public:
   }
 
   /**
+   * Replaces `expected` with `replacement` only if the key still maps to the
+   * exact expected pointer. Creation-in-flight entries never match.
+   */
+  bool replace(const Key& key, const Pointer& expected, Pointer replacement) {
+    bool replaced = false;
+    dataMap.visit(key, [&](auto& elem) {
+      auto* current = std::get_if<Pointer>(&elem.second);
+      if (current != nullptr && *current == expected) {
+        elem.second = std::move(replacement);
+        replaced = true;
+      }
+    });
+    return replaced;
+  }
+
+  /** Erases the key only if it still maps to the exact expected pointer. */
+  bool erase(const Key& key, const Pointer& expected) {
+    return dataMap.erase_if(key, [&](const auto& elem) {
+      auto* current = std::get_if<Pointer>(&elem.second);
+      return current != nullptr && *current == expected;
+    }) != 0;
+  }
+
+  /**
    * Retrieves the value associated with the given key, or creates it
    * if it doesn't already exist.  nullptr values are not stored in the map.
    */
@@ -118,10 +142,8 @@ public:
     auto visited = dataMap.cvisit(key, [&outVal](const auto& elem) {
       outVal = elem.second;
     });
-    /* ONLY true when we cache all values, and we don't cache nullptr
-    assert(visited == 1); // We don't do removals yet.  We should put things in a loop if we do in the future.
-    assert(std::holds_alternative<Pointer>(outVal));
-    */
+    // A concurrent erase after the creation wait leaves the key absent.
+    (void)visited;
     if (std::holds_alternative<Pointer>(outVal)) {
       return std::get<Pointer>(outVal);
     } else {

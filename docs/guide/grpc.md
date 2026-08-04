@@ -21,6 +21,8 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | `solux.Searcher/Search` | bidirectional stream | Several search requests per call, with one or more response batches per request. |
 | `solux.Admin/SetSchema` | unary | Set named definitions or replace a collection schema. |
 | `solux.Admin/GetSchema` | unary | Read a collection schema. |
+| `solux.Admin/CreateCollection` | unary | Create a collection, optionally with a schema. |
+| `solux.Admin/DeleteCollection` | unary | Delete a collection and its stored data. |
 | `solux.Admin/Stats` | unary | Read node-wide or collection index statistics. |
 
 The server also registers the standard gRPC health service and descriptor

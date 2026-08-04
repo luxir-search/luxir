@@ -158,6 +158,10 @@ using UpdateReqProto = solux::api::UpdateRequest;
 using UpdateRespProto = solux::api::UpdateResponse;
 using SchemaReqProto = solux::api::SchemaRequest;
 using SchemaRespProto = solux::api::SchemaResponse;
+using CreateCollectionReqProto = solux::api::CreateCollectionRequest;
+using CreateCollectionRespProto = solux::api::CreateCollectionResponse;
+using DeleteCollectionReqProto = solux::api::DeleteCollectionRequest;
+using DeleteCollectionRespProto = solux::api::DeleteCollectionResponse;
 using StatsReqProto = solux::api::StatsRequest;
 using StatsRespProto = solux::api::StatsResponse;
 using HelloReqProto = solux::api::HelloRequest;
@@ -515,10 +519,20 @@ static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server
 
 static void finishWithException(GenericCallData& call, const std::exception& e) {
   grpc::StatusCode code = grpc::StatusCode::INTERNAL;
-  if (dynamic_cast<const CollectionResolutionError*>(&e) != nullptr) {
+  if (dynamic_cast<const InvalidCollectionNameError*>(&e) != nullptr) {
+    auto method = call.genericCtx.method();
+    code = method == "/solux.Admin/CreateCollection" ||
+                   method == "/solux.Admin/DeleteCollection"
+        ? grpc::StatusCode::INVALID_ARGUMENT
+        : grpc::StatusCode::NOT_FOUND;
+  } else if (dynamic_cast<const CollectionExistsError*>(&e) != nullptr) {
+    code = grpc::StatusCode::ALREADY_EXISTS;
+  } else if (dynamic_cast<const CollectionResolutionError*>(&e) != nullptr) {
     code = grpc::StatusCode::NOT_FOUND;
   } else if (dynamic_cast<const SchemaError*>(&e) != nullptr) {
     code = grpc::StatusCode::INVALID_ARGUMENT;
+  } else if (dynamic_cast<const IndexWriterClosedError*>(&e) != nullptr) {
+    code = grpc::StatusCode::FAILED_PRECONDITION;
   }
   call.finishWithError(grpc::Status(code, e.what()));
 }
@@ -621,8 +635,7 @@ static grpc::ByteBuffer doBlockingUpdate(GRPCServer& server, const UpdateReqProt
   UpdateRespProto response;
   BlockingUpdateMessage updateMessage(&request, &response);
   bool success = iw->submitUpdate(&updateMessage);
-  assert(success);
-  unused(success);
+  if (!success) throw IndexWriterClosedError("index writer is closed");
   updateMessage.blocker.wait();
   updateMessage.finishResponse();
   return serializeToByteBuffer(response);
@@ -676,11 +689,65 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
 
     Update* updateMessage = new Update(std::move(request), &call);
     try {
-      iw->submitUpdate(updateMessage);
+      if (!iw->submitUpdate(updateMessage)) {
+        throw IndexWriterClosedError("index writer is closed");
+      }
     } catch (...) {
       delete updateMessage;
       throw;
     }
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
+//   rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse)  [unary]
+static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<CreateCollectionReqProto>>();
+  if (!parseRequest(readBuf, *request, "CreateCollection")) {
+    call.decrementOutstanding();
+    return;
+  }
+
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getSoluxNode().getTaskArena().enqueue([request, &call] {
+      try {
+        call.server.getSoluxNode().createCollection(
+            nullptr, request->proto.name,
+            request->proto.schema ? &*request->proto.schema : nullptr);
+        CreateCollectionRespProto response;
+        response.name = request->proto.name;
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
+//   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse)  [unary]
+static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<DeleteCollectionReqProto>>();
+  if (!parseRequest(readBuf, *request, "DeleteCollection")) {
+    call.decrementOutstanding();
+    return;
+  }
+
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getSoluxNode().getTaskArena().enqueue([request, &call] {
+      try {
+        call.server.getSoluxNode().deleteCollection(request->proto.name);
+        DeleteCollectionRespProto response;
+        response.name = request->proto.name;
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -841,6 +908,8 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/solux.Indexer/UpdateStream",     {handleUpdateStream}},
     {"/solux.Admin/SetSchema",          {handleSetSchema}},
     {"/solux.Admin/GetSchema",          {handleGetSchema}},
+    {"/solux.Admin/CreateCollection",   {handleCreateCollection}},
+    {"/solux.Admin/DeleteCollection",   {handleDeleteCollection}},
     {"/solux.Admin/Stats",              {handleStats}},
     {"/solux.Greeter/SayHello",         {handleSayHello}},
     {"/solux.Greeter/SayHello2",        {handleSayHello2}},

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <deque>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <mutex>
 #include <span>
@@ -22,6 +23,11 @@
 
 
 namespace solux {
+
+class IndexWriterClosedError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 #define INDEX_TRACE LOG_TRACE
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -97,6 +103,9 @@ inline std::string format_as(const SegInfo& seg) {
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
 class IndexWriter {
+  std::mutex closeMutex;
+  std::shared_mutex submissionMutex;
+  bool closed = false;
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
 
@@ -455,6 +464,7 @@ public:
                        FilterCacheConfig filterCacheConfig = {},
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR);
   ~IndexWriter();
+  void close();
 
   // Per-inverter auto-flush caps (Phase 1). When a non-atomic update indexes past
   // either cap, the current inverter is flushed to a segment mid-request and a fresh
@@ -484,6 +494,8 @@ public:
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.
   bool submitUpdate(UpdateMessage* msg) {
+    const std::shared_lock<std::shared_mutex> lock(submissionMutex);
+    if (closed) return false;
     // this is currently a simple submit to the startUpdateNode, but could be more complex in the future.
     // We could also eliminate the startUpdateNode completely and just submit to the processUpdateNode
     // after setting the sequence numbers.
@@ -492,6 +504,8 @@ public:
 
     // return a copy of the shared_ptr so that the instance it points to will never change while in use.
   std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0) {
+    const std::shared_lock<std::shared_mutex> submissionLock(submissionMutex);
+    if (closed) throw IndexWriterClosedError("index writer is closed");
     const std::lock_guard<std::mutex> lock(indexReaderMutex);
     bool needNewReader = false;
     if (!indexReader) {

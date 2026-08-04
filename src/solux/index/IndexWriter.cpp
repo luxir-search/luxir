@@ -266,6 +266,17 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
 }
 
 IndexWriter::~IndexWriter() {
+  close();
+}
+
+void IndexWriter::close() {
+  const std::lock_guard<std::mutex> closeLock(closeMutex);
+  {
+    const std::unique_lock<std::shared_mutex> lock(submissionMutex);
+    if (closed) return;
+    closed = true;
+  }
+
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?

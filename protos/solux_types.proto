@@ -969,6 +969,23 @@ message SegmentInfo {
   repeated AuxIndexInfo overlays = 9;
 }
 
+message CreateCollectionRequest {
+  string name = 1;
+  SchemaDef schema = 2;
+}
+
+message CreateCollectionResponse {
+  string name = 1;
+}
+
+message DeleteCollectionRequest {
+  string name = 1;
+}
+
+message DeleteCollectionResponse {
+  string name = 1;
+}
+
 // Operational statistics. An absent collection target requests every
 // collection on the node; per-segment records are opt-in because they are the
 // only unbounded part of the response.

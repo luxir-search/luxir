@@ -37,6 +37,8 @@ inline constexpr const char* SayHello2         = "/solux.Greeter/SayHello2";
 inline constexpr const char* SayHelloStreaming = "/solux.Greeter/SayHelloStreaming";
 inline constexpr const char* SetSchema         = "/solux.Admin/SetSchema";
 inline constexpr const char* GetSchema         = "/solux.Admin/GetSchema";
+inline constexpr const char* CreateCollection  = "/solux.Admin/CreateCollection";
+inline constexpr const char* DeleteCollection  = "/solux.Admin/DeleteCollection";
 inline constexpr const char* Stats             = "/solux.Admin/Stats";
 }  // namespace rpc
 
@@ -46,6 +48,8 @@ inline constexpr const char* Stats             = "/solux.Admin/Stats";
 std::string grpcSerialize(const solux::api::SearchRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const solux::api::UpdateRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const solux::api::StatsRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const solux::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const solux::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const solux::api::HelloRequest& msg, grpc::ByteBuffer& out);
 // `storage` retains the raw reply bytes the non-owning `msg` views; `arena` backs nested
 // message allocations. Both must outlive any read of `msg`.
@@ -54,6 +58,10 @@ std::string grpcParse(solux::api::SearchResponse& msg, const grpc::ByteBuffer& i
 std::string grpcParse(solux::api::UpdateResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 std::string grpcParse(solux::api::StatsResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
+std::string grpcParse(solux::api::CreateCollectionResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
+std::string grpcParse(solux::api::DeleteCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 std::string grpcParse(solux::api::HelloReply& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);

@@ -50,6 +50,12 @@ std::string grpcSerialize(const solux::api::UpdateRequest& msg, grpc::ByteBuffer
 std::string grpcSerialize(const solux::api::StatsRequest& msg, grpc::ByteBuffer& out) {
   return serialize(msg, out);
 }
+std::string grpcSerialize(const solux::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out) {
+  return serialize(msg, out);
+}
+std::string grpcSerialize(const solux::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out) {
+  return serialize(msg, out);
+}
 std::string grpcSerialize(const solux::api::HelloRequest& msg, grpc::ByteBuffer& out) {
   return serialize(msg, out);
 }
@@ -63,6 +69,14 @@ std::string grpcParse(solux::api::UpdateResponse& msg, const grpc::ByteBuffer& i
   return parse(msg, in, storage, arena);
 }
 std::string grpcParse(solux::api::StatsResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {
+  return parse(msg, in, storage, arena);
+}
+std::string grpcParse(solux::api::CreateCollectionResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {
+  return parse(msg, in, storage, arena);
+}
+std::string grpcParse(solux::api::DeleteCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {
   return parse(msg, in, storage, arena);
 }

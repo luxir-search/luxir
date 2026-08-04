@@ -110,6 +110,21 @@ TEST_F(UtilTest, lazyMap) {
   }
 }
 
+TEST_F(UtilTest, lazyMapConditionalReplaceAndErase) {
+  SharedLazyMap<int, int> map;
+  auto original = map.getOrCreate(7, [] { return std::make_shared<int>(1); });
+  auto wrong = std::make_shared<int>(1);
+  auto tombstone = std::make_shared<int>(2);
+
+  EXPECT_FALSE(map.replace(7, wrong, tombstone));
+  EXPECT_EQ(original, map.get(7));
+  EXPECT_TRUE(map.replace(7, original, tombstone));
+  EXPECT_EQ(tombstone, map.get(7));
+  EXPECT_FALSE(map.erase(7, original));
+  EXPECT_TRUE(map.erase(7, tombstone));
+  EXPECT_EQ(nullptr, map.get(7));
+}
+
 namespace {
 // Counters for arenaCreate exception-safety test.  File-scope so the tracked
 // types below don't need to reach into function locals.

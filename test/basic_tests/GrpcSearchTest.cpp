@@ -70,6 +70,28 @@ TEST_F(GrpcSearchTest, statsUnary) {
   EXPECT_FALSE(response.msg.collections.empty());
 }
 
+TEST_F(GrpcSearchTest, collectionCreateDeleteUnary) {
+  solux::api::CreateCollectionRequest create;
+  create.name = "grpc_admin_lifecycle";
+  grpc::ClientContext createContext;
+  Reply<solux::api::CreateCollectionResponse> createResponse;
+  auto createStatus = hppUnaryCall(
+      channel.get(), rpc::CreateCollection, &createContext, create, &createResponse);
+  ASSERT_TRUE(createStatus.ok()) << createStatus.error_message();
+  EXPECT_EQ("grpc_admin_lifecycle", createResponse.msg.name);
+  EXPECT_NO_THROW(soluxNode->getCollection("grpc_admin_lifecycle"));
+
+  solux::api::DeleteCollectionRequest remove;
+  remove.name = "grpc_admin_lifecycle";
+  grpc::ClientContext deleteContext;
+  Reply<solux::api::DeleteCollectionResponse> deleteResponse;
+  auto deleteStatus = hppUnaryCall(
+      channel.get(), rpc::DeleteCollection, &deleteContext, remove, &deleteResponse);
+  ASSERT_TRUE(deleteStatus.ok()) << deleteStatus.error_message();
+  EXPECT_EQ("grpc_admin_lifecycle", deleteResponse.msg.name);
+  EXPECT_THROW(soluxNode->getCollection("grpc_admin_lifecycle"), CollectionNotFoundError);
+}
+
 // A small batch_size forces emitDocsResponse to stream multiple responses over
 // one RPC, exercising the server's pending-write queue: response arenas are
 // freed at reply() time, so the queued ByteBuffers must own their bytes.

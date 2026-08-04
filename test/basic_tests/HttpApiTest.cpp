@@ -2327,4 +2327,57 @@ TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
   SUCCEED();
 }
 
+TEST_F(HttpApiTest, ndjsonCachedWriterFailsCleanlyAfterCollectionDelete) {
+  auto created = httpRequest(port(), http::verb::post, "/collections/_create",
+                             R"({"name":"admin_stream_delete"})");
+  ASSERT_EQ(200, created.result_int()) << created.body();
+
+  net::io_context cioc;
+  beast::tcp_stream stream(cioc);
+  tcp::resolver resolver(cioc);
+  stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
+  stream.expires_after(std::chrono::seconds(10));
+
+  std::string header =
+      "POST /collections/admin_stream_delete/_update HTTP/1.1\r\n"
+      "Host: 127.0.0.1\r\n"
+      "Content-Type: application/x-ndjson\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n";
+  net::write(stream, net::buffer(header));
+  writeRawHttpChunk(stream,
+      R"({"_update_":{"request_id":"before-delete","return_ids":true}})" "\n"
+      R"({"id":"before","title_w":"before delete"})" "\n"
+      "{}\n");
+
+  beast::flat_buffer buffer;
+  http::response_parser<http::buffer_body> parser;
+  beast::error_code ec;
+  http::read_header(stream, buffer, parser, ec);
+  ASSERT_FALSE(ec) << ec.message();
+  ASSERT_EQ(200, parser.get().result_int());
+
+  std::string pending;
+  std::string err;
+  std::string firstLine;
+  ASSERT_TRUE(readNextBodyLine(stream, buffer, parser, pending, firstLine, err)) << err;
+  EXPECT_NE(firstLine.find(R"("before")"), std::string::npos) << firstLine;
+
+  auto deleted = httpRequest(port(), http::verb::post, "/collections/_delete",
+                             R"({"name":"admin_stream_delete"})");
+  ASSERT_EQ(200, deleted.result_int()) << deleted.body();
+
+  writeRawHttpChunk(stream,
+      R"({"id":"after","title_w":"after delete"})" "\n"
+      "{}\n");
+
+  std::string errorLine;
+  ASSERT_TRUE(readNextBodyLine(stream, buffer, parser, pending, errorLine, err)) << err;
+  EXPECT_NE(errorLine.find(R"("status":"error")"), std::string::npos) << errorLine;
+  EXPECT_NE(errorLine.find("rejected"), std::string::npos) << errorLine;
+  EXPECT_NE(errorLine.find("docs_indexed_so_far"), std::string::npos) << errorLine;
+
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+}
+
 } // namespace solux::test

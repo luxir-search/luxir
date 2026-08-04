@@ -13,12 +13,21 @@ uses the same vocabulary as protobuf.
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
+| `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`. |
+| `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node totals and per-collection operational statistics. |
 | `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
 
 Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update
 does by default unless `--no-ingest.auto-create-collection` is set.
+
+`_create` is strict: creating a name that already exists is a `409` error, and
+the optional `schema` (same shape as a `_schema` set) is installed before the
+collection becomes visible, so no request can observe the collection with only
+the default schema. `_delete` names its target in the body, never falls back to
+a default collection, and returns `404` for a missing name. See the operations
+guide for deletion semantics under concurrent use.
 
 ## Content types and framing
 

@@ -51,6 +51,31 @@ stop writes, publish a commit, stop the process, and copy the data directory as
 a unit. Do not infer a supported live-backup protocol merely from immutable
 segment files: the metadata and files still need one consistent capture point.
 
+## Collection lifecycle
+
+Create and delete collections with `POST /collections/_create` and
+`POST /collections/_delete` (or unary `solux.Admin/CreateCollection` /
+`DeleteCollection`). Deleting a collection also deletes its stored data; there
+is no undo.
+
+Deletion is synchronous and wins over concurrent use. When the call returns,
+the name resolves to nothing, the on-disk data is gone, and the name can be
+recreated as a fresh empty collection. Requests racing the deletion fail
+cleanly per request: an update batch or NDJSON stream that arrives after
+deletion starts receives an error response, as does a search that resolves the
+collection after that point. A search already executing is unaffected - it
+holds its index view for the whole request and completes with correct results.
+Deletion waits for indexing work already accepted, including a running merge,
+so deleting a collection mid-merge can take as long as that merge.
+
+On the filesystem backend a deleted collection is first renamed into `trash/`
+under the data directory and then removed; `trash/` is purged again at startup,
+so a crash mid-deletion cannot resurrect a partially deleted collection. If
+deletion fails partway (for example an I/O error), the name stays unavailable
+with the recorded error and the delete can simply be retried. Deleting a
+collection that failed to load at startup is also the supported way to clear
+its broken on-disk state.
+
 ## Visibility policy
 
 Commits are the freshness boundary. An immediate `"commit": {}` waits until a

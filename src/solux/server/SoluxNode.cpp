@@ -9,12 +9,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <exception>
 #include <memory_resource>
 #include <span>
 
 namespace solux {
 
 static constexpr std::string_view SCHEMA_PREFIX = "_schema_";
+static constexpr std::string_view DELETING_REASON = "being deleted";
 
 static std::string schemaFileName(uint64_t gen) {
   return std::string(SCHEMA_PREFIX) + Postings::getSortableString(gen);
@@ -27,27 +29,27 @@ std::string SoluxNode::normalizedCollectionName(std::string_view name) {
 void SoluxNode::validateCollectionName(std::string_view name) {
   constexpr std::size_t kMaxCollectionNameBytes = 255;
   if (name.empty()) {
-    throw CollectionResolutionError("collection name is empty");
+    throw InvalidCollectionNameError("collection name is empty");
   }
   if (name.size() > kMaxCollectionNameBytes) {
-    throw CollectionResolutionError("collection '" + std::string(name) + "' exceeds maximum length");
+    throw InvalidCollectionNameError("collection '" + std::string(name) + "' exceeds maximum length");
   }
   if (name[0] == '_') {
-    throw CollectionResolutionError("collection '" + std::string(name) + "' is reserved");
+    throw InvalidCollectionNameError("collection '" + std::string(name) + "' is reserved");
   }
   if (name == "." || name == "..") {
-    throw CollectionResolutionError("collection '" + std::string(name) + "' is reserved");
+    throw InvalidCollectionNameError("collection '" + std::string(name) + "' is reserved");
   }
   if (std::isspace((unsigned char)name.front()) || std::isspace((unsigned char)name.back())) {
-    throw CollectionResolutionError("collection '" + std::string(name) + "' has leading or trailing whitespace");
+    throw InvalidCollectionNameError("collection '" + std::string(name) + "' has leading or trailing whitespace");
   }
   for (char c : name) {
     unsigned char ch = (unsigned char)c;
     if (ch < 0x20 || ch == 0x7f) {
-      throw CollectionResolutionError("collection '" + std::string(name) + "' contains a control character");
+      throw InvalidCollectionNameError("collection '" + std::string(name) + "' contains a control character");
     }
     if (c == '/' || c == '\\') {
-      throw CollectionResolutionError("collection '" + std::string(name) + "' must be a single path component");
+      throw InvalidCollectionNameError("collection '" + std::string(name) + "' must be a single path component");
     }
   }
 }
@@ -195,9 +197,10 @@ std::shared_ptr<Collection> SoluxNode::getCollection(std::string_view name) {
 }
 
 std::shared_ptr<Collection> SoluxNode::checkLoaded(std::shared_ptr<Collection> collection) {
-  if (collection && !collection->loadError.empty()) {
-    throw CollectionResolutionError(
-        "collection '" + collection->name + "' failed to load: " + collection->loadError);
+  if (collection && !collection->unavailableReason.empty()) {
+    throw CollectionUnavailableError(
+        "collection '" + collection->name + "' is unavailable: " +
+        collection->unavailableReason);
   }
   return collection;
 }
@@ -215,7 +218,7 @@ std::shared_ptr<Collection> SoluxNode::getCollection(Library* library, std::stri
     return checkLoaded(std::move(collection));
   }
 
-  throw CollectionResolutionError("collection '" + collectionName + "' does not exist");
+  throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
 }
 
 std::shared_ptr<Collection> SoluxNode::resolveCollection(const solux::api::Target* target) {
@@ -258,7 +261,7 @@ std::shared_ptr<Collection> SoluxNode::getOrCreateCollection(Library* library, s
     return created;
   });
   if (!collection) {
-    throw CollectionResolutionError("collection '" + collectionName + "' does not exist");
+    throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
   }
   return checkLoaded(std::move(collection));
 }
@@ -288,7 +291,7 @@ std::vector<SoluxNode::CollectionEntry> SoluxNode::collectionEntries() {
   using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
   root->collections.dataMap.cvisit_all([&](const auto& elem) {
     if (auto* collection = std::get_if<Pointer>(&elem.second)) {
-      entries.push_back({elem.first, *collection, (*collection)->loadError});
+      entries.push_back({elem.first, *collection, (*collection)->unavailableReason});
     }
   });
   std::sort(entries.begin(), entries.end(),
@@ -296,7 +299,8 @@ std::vector<SoluxNode::CollectionEntry> SoluxNode::collectionEntries() {
   return entries;
 }
 
-std::shared_ptr<Collection> SoluxNode::createCollection(Library* library, std::string_view name) {
+std::shared_ptr<Collection> SoluxNode::createCollection(
+    Library* library, std::string_view name, const api::SchemaDef* schema) {
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
     throw CollectionResolutionError("root library is not initialized");
@@ -305,12 +309,94 @@ std::shared_ptr<Collection> SoluxNode::createCollection(Library* library, std::s
   std::string collectionName = normalizedCollectionName(name);
   validateCollectionName(collectionName);
 
+  bool createdHere = false;
+  std::exception_ptr createFailure;
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() {
-    auto created = initCollection(collectionName);
-    LOG_INFO("Created collection: {}", collectionName);
-    return created;
+    createdHere = true;
+    std::shared_ptr<Collection> created;
+    try {
+      created = initCollection(collectionName);
+      if (schema != nullptr) {
+        created->updateSchema(*schema, api::SchemaRequest_::Mode::SET);
+      }
+      LOG_INFO("Created collection: {}", collectionName);
+      return created;
+    } catch (...) {
+      createFailure = std::current_exception();
+      try {
+        if (created && created->shard && created->shard->iw) {
+          created->shard->iw->close();
+        }
+        dirFactory->remove(collectionName);
+      } catch (const std::exception& e) {
+        auto tombstone = std::make_shared<Collection>();
+        tombstone->name = collectionName;
+        tombstone->unavailableReason =
+            "create failed and cleanup failed: " + std::string(e.what());
+        return tombstone;
+      } catch (...) {
+        auto tombstone = std::make_shared<Collection>();
+        tombstone->name = collectionName;
+        tombstone->unavailableReason =
+            "create failed and cleanup failed: unknown non-standard exception";
+        return tombstone;
+      }
+      std::rethrow_exception(createFailure);
+    }
   });
-  return checkLoaded(std::move(collection));
+  if (createFailure) std::rethrow_exception(createFailure);
+  if (!createdHere) {
+    throw CollectionExistsError("collection '" + collectionName + "' already exists");
+  }
+  return collection;
+}
+
+void SoluxNode::deleteCollection(std::string_view name) {
+  if (!root) throw CollectionResolutionError("root library is not initialized");
+
+  std::string collectionName = normalizedCollectionName(name);
+  validateCollectionName(collectionName);
+
+  auto collection = root->collections.get(collectionName);
+  if (!collection) {
+    throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
+  }
+  if (collection->unavailableReason == DELETING_REASON) {
+    throw CollectionUnavailableError(
+        "collection '" + collectionName + "' is unavailable: being deleted");
+  }
+
+  auto tombstone = std::make_shared<Collection>();
+  tombstone->name = collectionName;
+  tombstone->unavailableReason = DELETING_REASON;
+  if (!root->collections.replace(collectionName, collection, tombstone)) {
+    throw CollectionUnavailableError(
+        "collection '" + collectionName + "' changed while deletion started");
+  }
+
+  try {
+    if (collection->shard && collection->shard->iw) {
+      collection->shard->iw->close();
+    }
+    dirFactory->remove(collectionName);
+  } catch (const std::exception& e) {
+    auto failed = std::make_shared<Collection>();
+    failed->name = collectionName;
+    failed->unavailableReason = "delete failed: " + std::string(e.what());
+    root->collections.replace(collectionName, tombstone, std::move(failed));
+    throw;
+  } catch (...) {
+    auto failed = std::make_shared<Collection>();
+    failed->name = collectionName;
+    failed->unavailableReason = "delete failed: unknown non-standard exception";
+    root->collections.replace(collectionName, tombstone, std::move(failed));
+    throw;
+  }
+
+  if (!root->collections.erase(collectionName, tombstone)) {
+    throw std::runtime_error(
+        "collection '" + collectionName + "' tombstone disappeared during deletion");
+  }
 }
 
 std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
@@ -371,7 +457,7 @@ void SoluxNode::createSingletons() {
       LOG_ERROR("Failed to load collection '{}': {}", name, e.what());
       auto tombstone = std::make_shared<Collection>();
       tombstone->name = name;
-      tombstone->loadError = e.what();
+      tombstone->unavailableReason = "failed to load: " + std::string(e.what());
       root->collections.getOrCreate(name, [&]() { return tombstone; });
     }
   }

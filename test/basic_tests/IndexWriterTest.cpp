@@ -53,6 +53,25 @@ public:
   }
 };
 
+TEST_F(IndexWriterTest, closeIsIdempotentAndRejectsNewEntryPoints) {
+  class NoopUpdate final : public UpdateMessage {
+  public:
+    void handle(IndexWriter& iw) override { unused(iw); }
+    void done(IndexWriter& iw) override { unused(iw); }
+  };
+
+  RAMDir dir;
+  IndexWriter writer(dir);
+  auto heldReader = writer.getIndexReader();
+  writer.close();
+  EXPECT_NO_THROW(writer.close());
+
+  NoopUpdate update;
+  EXPECT_FALSE(writer.submitUpdate(&update));
+  EXPECT_THROW(writer.getIndexReader(), IndexWriterClosedError);
+  EXPECT_NE(nullptr, heldReader);
+}
+
 namespace {
 
 class TimedCommitMessage final : public UpdateMessage {

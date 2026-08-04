@@ -1,5 +1,7 @@
 #pragma once
 
+#include <map>
+#include <mutex>
 #include <optional>
 #include "Directory.h"
 #include "FileLock.h"
@@ -20,6 +22,9 @@ public:
 
   /// Return the names of collections that already exist on disk.
   virtual std::vector<std::string> listCollections() = 0;
+
+  /// Remove all storage for the named collection.
+  virtual void remove(std::string_view collectionName) = 0;
 };
 
 
@@ -34,6 +39,10 @@ public:
   std::vector<std::string> listCollections() override {
     return {};  // RAM has no persistence
   }
+
+  void remove(std::string_view collectionName) override {
+    (void)collectionName;
+  }
 };
 
 
@@ -42,11 +51,17 @@ public:
 class FSDirFactory : public DirectoryFactory {
   std::filesystem::path basePath_;
   std::filesystem::path collectionsPath_;  // basePath_/c
+  std::filesystem::path trashPath_;  // basePath_/trash
   std::optional<FileLock> lock_;
+  std::mutex removeMutex_;
+  std::map<std::string, std::filesystem::path> pendingTrash_;
+  uint64_t trashSequence_ = 0;
 
 public:
   explicit FSDirFactory(std::filesystem::path path)
-      : basePath_(std::move(path)), collectionsPath_(basePath_ / "c") {
+      : basePath_(std::move(path)),
+        collectionsPath_(basePath_ / "c"),
+        trashPath_(basePath_ / "trash") {
     bool created = std::filesystem::create_directories(collectionsPath_);
     if (created) {
       LOG_INFO("Created data directory: {}", basePath_.string());
@@ -54,6 +69,8 @@ public:
       LOG_INFO("Using existing data directory: {}", basePath_.string());
     }
     lock_.emplace(basePath_ / "write.lock");
+    std::filesystem::remove_all(trashPath_);
+    std::filesystem::create_directories(trashPath_);
   }
 
   std::shared_ptr<Directory> create(std::string_view collectionName) override {
@@ -69,6 +86,35 @@ public:
     }
     std::sort(result.begin(), result.end());
     return result;
+  }
+
+  void remove(std::string_view collectionName) override {
+    const std::lock_guard<std::mutex> lock(removeMutex_);
+    std::string name(collectionName);
+    if (auto pending = pendingTrash_.find(name); pending != pendingTrash_.end()) {
+      std::filesystem::remove_all(pending->second);
+      pendingTrash_.erase(pending);
+    }
+
+    auto source = collectionsPath_ / collectionName;
+    auto destination = trashPath_ / (name + "-" + std::to_string(trashSequence_++));
+    pendingTrash_.emplace(name, destination);
+
+    std::error_code ec;
+    std::filesystem::rename(source, destination, ec);
+    if (ec) {
+      std::error_code existsError;
+      bool sourceExists = std::filesystem::exists(source, existsError);
+      if (!existsError && !sourceExists) {
+        pendingTrash_.erase(name);
+        return;
+      }
+      pendingTrash_.erase(name);
+      throw std::filesystem::filesystem_error(
+          "failed to move collection to trash", source, destination, ec);
+    }
+    std::filesystem::remove_all(destination);
+    pendingTrash_.erase(name);
   }
 };
 
