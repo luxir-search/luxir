@@ -51,7 +51,8 @@ enum class FilterKeyTag : uint8_t {
   BOOLEAN_OPTIONAL = 18,
   BOOLEAN_PROHIBITED = 19,
   BOOLEAN_FILTER = 20,
-  WILDCARD = 21
+  WILDCARD = 21,
+  REGEX = 22
 };
 
 // Correctness envelope: schemaGen and timeZone always, plus coreGen for CORE_STABLE scope.

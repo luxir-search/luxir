@@ -21,7 +21,7 @@ public:
 
 class AutomatonQuery final : public MultiTermQuery {
 public:
-  enum class Kind { WILDCARD };
+  enum class Kind { WILDCARD, REGEX };
 
 private:
   Kind kind;
@@ -44,7 +44,7 @@ public:
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
-    out.appendTag(FilterKeyTag::WILDCARD);
+    out.appendTag(kind == Kind::WILDCARD ? FilterKeyTag::WILDCARD : FilterKeyTag::REGEX);
     out.appendString(field);
     out.appendTerm(pattern);
     return FilterKeyScope::SEGMENT_STABLE;

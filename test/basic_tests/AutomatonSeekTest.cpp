@@ -8,6 +8,7 @@
 #include "solux/reader/AutomatonSeekEnum.h"
 #include "solux/reader/BruteDfaTermsEnum.h"
 #include "solux/util/automaton/WildcardCompiler.h"
+#include "solux/util/automaton/RegExpParser.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 
@@ -114,4 +115,16 @@ TEST_F(AutomatonSeekTest, SparseWildcardJumps) {
   EXPECT_EQ(smart, collectBrute(field, dfa));
   EXPECT_EQ(smart.size(), 3);
   EXPECT_LT(examined, 30);
+}
+
+TEST_F(AutomatonSeekTest, RegexDifferential) {
+  std::mt19937 rng(0x4a9c31);
+  TestIndex index;
+  TestField field(index, "value_s");
+  addTerms(index, field, corpus(rng));
+  for (std::string_view pattern : {"[ab]pp.*", "a{2,3}bc*", "(cat|ban).*"}) {
+    Budget budget(10000000);
+    ByteDfa dfa = compileRegex(pattern, budget);
+    EXPECT_EQ(collectSmart(field, dfa), collectBrute(field, dfa)) << pattern;
+  }
 }

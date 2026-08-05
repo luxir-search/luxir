@@ -71,6 +71,15 @@ inline api::Query wildcard(std::pmr::memory_resource& mr, std::string_view field
   return q;
 }
 
+inline api::Query regex(std::pmr::memory_resource& mr, std::string_view field,
+                        std::string_view pattern) {
+  api::Query q;
+  auto& r = q.kind.emplace<api::RegexQuery>();
+  r.field = build::arenaStr(mr, field);
+  r.pattern = build::arenaStr(mr, pattern);
+  return q;
+}
+
 inline api::Query exists(std::pmr::memory_resource& mr, std::string_view field) {
   api::Query q;
   auto& e = q.kind.emplace<api::ExistsQuery>();

@@ -374,6 +374,8 @@ struct from<JSON, solux::api::Query> {
             arm(std::in_place_type<api::PrefixQuery>);
           } else if (key == "wildcard") {
             arm(std::in_place_type<api::WildcardQuery>);
+          } else if (key == "regex") {
+            arm(std::in_place_type<api::RegexQuery>);
           } else if (key == "fuzzy") {
             arm(std::in_place_type<api::FuzzyQuery>);
           } else if (key == "simple_query") {

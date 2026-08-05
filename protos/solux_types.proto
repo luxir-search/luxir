@@ -194,6 +194,7 @@ message Query {
     BoostQuery boost = 15;          // multiplies every hit score of a wrapped query
     RescoreQuery rescore = 16;      // preserves matches and replaces each hit's score
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
+    RegexQuery regex = 18;          // selects documents by regular-expression term match
     // TODO: function?
   }
 }
@@ -361,6 +362,14 @@ message PrefixQuery {
 // codepoint, and backslash escapes the next character. TEXT fields normalize
 // the whole pattern; STRING and ID fields use it verbatim.
 message WildcardQuery {
+  string field = 1;
+  string pattern = 2;
+}
+
+// Matches an anchored whole indexed term using `|`, concatenation, groups,
+// repetition, `.`, and character classes. `^` and `$` are literals. Patterns
+// are used verbatim for every field type; no multi-term normalization is applied.
+message RegexQuery {
   string field = 1;
   string pattern = 2;
 }

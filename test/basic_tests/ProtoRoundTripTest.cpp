@@ -238,7 +238,7 @@ void roundTripType(const char* nm) {
 #define SOLUX_MSGS(X)                                                                              \
   X(Target) X(SearchRequest) X(SearchOp) X(GenOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(NamedQuery)    \
-  X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
+  X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(Domain)                                                            \
   X(SearchResponse) X(DocList) X(FacetResult) X(Bucket) X(CommitParams) X(UpdateRequest)           \

@@ -26,6 +26,7 @@
 #include "solux/util/Clock.h"
 #include "solux/util/StrRef.h"
 #include "solux/util/automaton/WildcardCompiler.h"
+#include "solux/util/automaton/RegExpParser.h"
 
 namespace solux {
 
@@ -232,26 +233,57 @@ public:
 
   Query* createWildcardQuery(std::string_view field, std::string_view pattern) {
     std::string_view originalPattern = pattern;
+    FieldType& fieldType = *checkAutomatonField("Wildcard", field);
+    if (fieldType.type() == FieldType::Type::TEXT) {
+      pattern = normalizeMultiterm((TextFieldType&)fieldType, field, pattern);
+    }
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field,
+                              originalPattern, pattern, automaton::compileWildcard);
+  }
+
+  // Regex patterns are verbatim on every field type; normalizing inside the
+  // operator syntax is not well-defined.
+  Query* createRegexQuery(std::string_view field, std::string_view pattern) {
+    checkAutomatonField("Regex", field);
+    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field,
+                              pattern, pattern, automaton::compileRegex);
+  }
+
+private:
+  FieldType* checkAutomatonField(std::string_view label, std::string_view field) {
     FieldType& fieldType = *schema.getFieldTypeEx(field);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
-        pattern = normalizeMultiterm((TextFieldType&)fieldType, field, pattern);
-        break;
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
         break;
       default:
-        throw std::runtime_error(std::format("Wildcard query on unsupported field type: {}", field));
+        throw std::runtime_error(std::format("{} query on unsupported field type: {}", label, field));
     }
     if (!fieldType.indexed()) {
-      throw std::runtime_error(std::format("Wildcard query requires an indexed field: {}", field));
+      throw std::runtime_error(std::format("{} query requires an indexed field: {}", label, field));
     }
+    return &fieldType;
+  }
+
+  std::string_view poolCopy(std::string_view bytes) {
+    if (bytes.empty()) return {};
+    char* copy = pool.alloc(bytes.size());
+    memcpy(copy, bytes.data(), bytes.size());
+    return {copy, bytes.size()};
+  }
+
+  Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view label,
+                            std::string_view field, std::string_view originalPattern,
+                            std::string_view compiledPattern,
+                            automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&)) {
     automaton::ByteDfa compiled;
     try {
       automaton::Budget budget;
-      compiled = automaton::compileWildcard(pattern, budget);
+      compiled = compile(compiledPattern, budget);
     } catch (const std::runtime_error& e) {
-      throw std::runtime_error(std::format("Wildcard query for field '{}' pattern '{}': {}", field, originalPattern, e.what()));
+      throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
+                                           label, field, originalPattern, e.what()));
     }
     std::string enumBytes;
     automaton::ByteDfaKind kind = compiled.classify(&enumBytes);
@@ -262,15 +294,11 @@ public:
       enumBytes = std::move(commonPrefix);
       initialState = state;
     }
-    char* patternCopy = originalPattern.empty() ? nullptr : pool.alloc(originalPattern.size());
-    if (!originalPattern.empty()) memcpy(patternCopy, originalPattern.data(), originalPattern.size());
-    char* enumBytesCopy = enumBytes.empty() ? nullptr : pool.alloc(enumBytes.size());
-    if (!enumBytes.empty()) memcpy(enumBytesCopy, enumBytes.data(), enumBytes.size());
-    auto dfa = compiled.freeze(pool);
-    return pool.make<AutomatonQuery>(field, AutomatonQuery::Kind::WILDCARD,
-        std::string_view(patternCopy, originalPattern.size()), dfa, kind,
-        std::string_view(enumBytesCopy, enumBytes.size()), initialState);
+    return pool.make<AutomatonQuery>(field, queryKind, poolCopy(originalPattern),
+        compiled.freeze(pool), kind, poolCopy(enumBytes), initialState);
   }
+
+public:
 
   // OpenSearch-style AUTO fuzziness by byte length.
   static int autoMaxEdits(size_t termLen) {
