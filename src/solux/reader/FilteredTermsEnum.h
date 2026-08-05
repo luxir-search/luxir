@@ -32,7 +32,12 @@ public:
   TermsEnum& terms() { return te; }
 
   PackedTerm term() const { return te.term(); }
-  std::string_view termView() const { return (std::string_view)te.term(); }
+  // Built from TermsEnum::termLen() rather than the term's own length byte:
+  // the byte was just stored by the term reconstruction, so reading it back
+  // here costs a store-to-load round trip on every term a scan classifies.
+  std::string_view termView() const {
+    return std::string_view(te.term().data(), (size_t) te.termLen());
+  }
 
   // Per-term score of the currently accepted term.
   virtual float currentScore() const { return 1.0f; }

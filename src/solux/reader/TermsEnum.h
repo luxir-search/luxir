@@ -24,6 +24,9 @@ class TermsEnum {
   const SegFieldInfo& fieldInfo;
 
   PackedTerm currTerm;
+  // currTerm's byte length, kept beside the term instead of re-read from the
+  // length byte the reconstruction just stored.  See termLen().
+  int32_t currTermLen = 0;
   int32_t ordInBlock = -1; // the term number local to the current block
   // Bytes currTerm shares with the term immediately before it, in full-term
   // coordinates.  Only an in-block advance can report a nonzero value; see
@@ -45,10 +48,13 @@ class TermsEnum {
   const char* prefixLens = nullptr;
   const char* suffixLens = nullptr;
   const char* suffixBlob = nullptr;
+  // Start of the suffix bytes for the next in-block advance.  Suffixes are
+  // stored back to back in dictionary order and every in-block movement steps
+  // exactly one ord, so a running cursor replaces a prefix-summed start table.
+  const char* suffixCursor = nullptr;
   const char* metadataRuns = nullptr;
   const char* blockEnd = nullptr;
   uint32_t suffixBytesTotal = 0;
-  std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> suffixStarts{};
 
   const char* docsEndRun = nullptr;
   const char* packedBlocksRun = nullptr;
@@ -73,7 +79,6 @@ class TermsEnum {
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE * 2> pulsedValues{};
   bool statsDecoded = false;
   bool postingsDecoded = false;
-  bool suffixStartsDecoded = false;
   bool metadataRunsParsed = false;
 
   // term index level
@@ -194,8 +199,13 @@ public:
   }
 
   // Walk local term ordinals and docFreqs without reconstructing term bytes.
-  // Stats are bulk-decoded once per term block; suffix starts and suffix bytes
-  // remain untouched. The enum is left on the final term.
+  // Stats are bulk-decoded once per term block; the suffix blob is never read.
+  // ordInBlock is moved directly so the callback can open postings for the
+  // term it is handed (see StrFacetOp), but term()/termLen() stay on the
+  // block's first term and the suffix cursor stays at the start of its blob.
+  // The enum is therefore left in a state where only ord-indexed accessors are
+  // meaningful: callers must not read term() afterwards, and must re-enter
+  // through a seek (every one of which reloads a block) before advancing.
   template <class F>
   void forEachDocFreq(F&& callback) {
     for (termBlockIndex = 0; termBlockIndex < numTermBlocks; termBlockIndex++) {
@@ -304,7 +314,17 @@ public:
   /// term (i.e. the moment next() or seek() is called). Make a copy if you wish to keep it!
   /// If called before nextTerm() or seek() is done, returns a 0 length term.
   PackedTerm term() const {
+    assert(currTermLen == (int32_t) currTerm.size());
     return currTerm;
+  }
+
+  /// Byte length of term().  Same value as term().size(), but read from a
+  /// member rather than from the length byte the term reconstruction just
+  /// wrote, so per-term consumers do not pay a store-to-load round trip
+  /// through the term buffer.
+  int32_t termLen() const {
+    assert(currTermLen == (int32_t) currTerm.size());
+    return currTermLen;
   }
 
   /// Number of leading bytes term() shares with the term immediately preceding
@@ -458,19 +478,6 @@ protected:
   uint32_t validPulsedMask() const {
     uint32_t count = blockTermCount();
     return count == 32 ? UINT32_MAX : ((1u << count) - 1);
-  }
-
-  void decodeSuffixStarts() {
-    if (suffixStartsDecoded) {
-      return;
-    }
-    uint32_t suffixBytes = 0;
-    for (int32_t i = 0; i < maxOrdInBlock; i++) {
-      suffixStarts[(size_t) i] = suffixBytes;
-      suffixBytes += (uint8_t) suffixLens[i];
-    }
-    assert(suffixBytes == suffixBytesTotal);
-    suffixStartsDecoded = true;
   }
 
   void parseMetadataRuns() {
@@ -741,9 +748,8 @@ protected:
   // Seeks to termBlockIndex and reads the eager block-entry state from the
   // format written by PostingsWriter.flushTerms: header values, hash pointer,
   // prefix/suffix length run pointers, suffix blob pointer, and metadata start.
-  // It does not prefix-sum suffixLen, parse metadata run byte lengths, or decode
-  // any stats/postings metadata.  Those happen on demand in decodeSuffixStarts,
-  // decodeStats, and decodePostings.
+  // It does not parse metadata run byte lengths or decode any stats/postings
+  // metadata.  Those happen on demand in decodeStats and decodePostings.
   void readTermBlock() {
     // Common case (and always, for a single row): the block stays on the
     // current row; only re-resolve on a row boundary.  The whole dictionary
@@ -782,6 +788,7 @@ protected:
     suffixBytesTotal = termsIS.readVint();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
+    currTermLen = (int32_t) startingTerm.size();
     // The block's first term is not delta-coded against anything, so nothing is
     // known to be shared with whatever term preceded it.
     sharedLen = 0;
@@ -795,13 +802,23 @@ protected:
     suffixLens = termsIS.ptr();
     termsIS.skip(maxOrdInBlock);
     suffixBlob = termsIS.ptr();
+    suffixCursor = suffixBlob;
     termsIS.skip(suffixBytesTotal);
     metadataRuns = termsIS.ptr();
     assert(metadataRuns <= blockEnd);
 
+#ifndef NDEBUG
+    // The cursor walks the blob by suffixLens alone, so the writer's declared
+    // blob size has to be exactly what those lengths add up to.
+    uint32_t suffixBytes = 0;
+    for (int32_t i = 0; i < maxOrdInBlock; i++) {
+      suffixBytes += (uint8_t) suffixLens[i];
+    }
+    assert(suffixBytes == suffixBytesTotal);
+#endif
+
     statsDecoded = false;
     postingsDecoded = false;
-    suffixStartsDecoded = false;
     metadataRunsParsed = false;
   }
 
@@ -828,13 +845,16 @@ protected:
   // reads the next term in the block with no checking if one runs off the end of the block.
   void readNextTermInBlock() {
     assert(ordInBlock < maxOrdInBlock);
-    decodeSuffixStarts();
     ordInBlock++;
     uint32_t prefixLen = (uint8_t) prefixLens[ordInBlock - 1];
     uint32_t suffixLen = (uint8_t) suffixLens[ordInBlock - 1];
-    const char* suffix = suffixBlob + suffixStarts[(size_t) ordInBlock - 1];
+    const char* suffix = suffixCursor;
+    assert(suffix >= suffixBlob && suffix + suffixLen <= suffixBlob + suffixBytesTotal);
+    suffixCursor = suffix + suffixLen;
 
-    auto [data, len] = currTerm.unpack();
+    const char* data = currTerm.data();
+    uint32_t len = (uint32_t) currTermLen;
+    assert(len == currTerm.size());
     // TODO: things to try:
     // - an explicit loop vs memcpy
     // - an explict loop of 8 bytes at a time... requires making sure there are extra bytes at the end of termIS file.
@@ -850,7 +870,8 @@ protected:
     assert(prefixLen == factoredLen || data[blockPrefixLen + prefixLen] != *suffix);
 
     memcpy(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
-    currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
+    currTermLen = (int32_t) (blockPrefixLen + prefixLen + suffixLen);
+    currTerm.setSize((uint32_t) currTermLen);
     // Never an over-estimate whatever the build: these bytes were not written
     // just now, they are inherited from the previous term's reconstruction, so
     // the two terms share at least that many.  The assert above upgrades that
