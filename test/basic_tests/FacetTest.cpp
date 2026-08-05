@@ -1954,7 +1954,9 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
 
   auto all = run(FacetSubOpInlineMode::ALL);
   auto sortKeyOnly = run(FacetSubOpInlineMode::SORT_KEY_ONLY);
+  auto automatic = run(FacetSubOpInlineMode::AUTO);
   EXPECT_EQ(all, sortKeyOnly);
+  EXPECT_EQ(all, automatic);
   // ... and that it is the right answer: top 2 by avg(foo_i) desc is a(100), c(50).
   const auto& [buckets, counts, foo, bar] = all;
   ASSERT_EQ(2u, buckets.size());
@@ -1966,6 +1968,57 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
   EXPECT_EQ(50, foo[1]);
   EXPECT_EQ(5, bar[0]);   // (5 + 9 + 1) / 3
   EXPECT_EQ(5, bar[1]);   // (7 + 3) / 2
+}
+
+// AUTO inlines every sub-op exactly when the limit returns every bucket, and
+// only when a sort key already forced the inline pass. The profile is the
+// evidence: with the extras inlined nothing is left for the post-selection
+// feed, so no "result-feed=" detail is emitted at all.
+TEST_F(FacetTest, subOpInlineAutoFollowsBucketCoverage) {
+  CollectionHelper helper;
+  for (int i = 0; i < 40; i++) {
+    helper.index(flatdoc("cat_s", "c" + std::to_string(i % 4),   // 4 buckets
+                         "wide_s", "w" + std::to_string(i),      // 40 buckets
+                         "foo_i", (int64_t)i, "bar_i", (int64_t)(40 - i)),
+                 i == 39 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  auto feedDetails = [&](const char* field, bool sorted) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main").profile();
+    req->topDocs().getNumber(true).allQuery();
+    auto& facet = req->facet("f", field);
+    facet.limit(10);
+    facet.avg("avg_foo", "foo_i");
+    facet.avg("avg_bar", "bar_i");
+    if (sorted) {
+      qb::sort(facet, "avg_foo", qb::DESC);
+    }
+    req->execute(true);
+    std::string details;
+    const auto& profile = req->responses[0]->proto.profile;
+    EXPECT_TRUE(profile.has_value()) << req->toString();
+    if (profile) {
+      for (const auto& op : profile->ops) {
+        for (const auto& piece : op.pieces) {
+          for (const auto& detail : piece.details) {
+            details += std::string(detail) + ";";
+          }
+        }
+      }
+    }
+    return details;
+  };
+
+  // 4 buckets, limit 10 -> every bucket returned, and sorted, so the extras
+  // ride the inline pass and nothing reaches the bucket-domain feed.
+  EXPECT_EQ(feedDetails("cat_s", true).find("result-feed="), std::string::npos);
+  // 40 buckets, limit 10 -> ten of forty come back, so the extras stay on the
+  // feed where they only read the winners' documents.
+  EXPECT_NE(feedDetails("wide_s", true).find("result-feed="), std::string::npos);
+  // No sort key: the count pass is free to take a strategy the inline path
+  // cannot reach, so coverage alone does not move the extras.
+  EXPECT_NE(feedDetails("cat_s", false).find("result-feed="), std::string::npos);
 }
 
 // Facet sorted by an inline sub-op (avg) with a finite limit.  This exercises

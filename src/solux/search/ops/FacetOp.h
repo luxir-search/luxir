@@ -51,6 +51,14 @@ public:
 
   virtual ~FacetReq() = default;
 
+  // Upper bound on how many buckets this facet can return, or -1 when it is
+  // not knowable before execution.  init() uses it to ask "will every bucket
+  // come back", which is what decides whether inlining a sub-op beats
+  // computing it per returned bucket afterwards.
+  virtual int64_t maxBuckets() const {
+    return -1;
+  }
+
   void init() override {
     SearchOp::init();
     if (!sorts.empty()) {
@@ -70,13 +78,30 @@ public:
         }
       }
     }
-    // Whether the REMAINING sub-ops join the sort key in the count pass, or
-    // stay behind for the post-selection bucket-domain feed.  With no limit
-    // every bucket is returned, so the feed would re-read the whole domain
-    // anyway and inlining is strictly better; with a finite limit it depends on
-    // how much of the domain the returned buckets cover, which is what
-    // FacetSubOpInlineMode exists to measure.
-    bool inlineAll = limit == -1;
+    // Whether the REMAINING sub-ops join the count pass or stay behind for the
+    // post-selection bucket-domain feed.  The feed reads only the documents the
+    // RETURNED buckets hold, and pays a fixed cost per bucket on top; inlining
+    // reads the whole domain per sub-op and pays no per-bucket cost.  So the
+    // question is whether every bucket comes back: then the feed re-reads the
+    // whole domain anyway and only the fixed cost separates them.
+    //
+    // Measured on a 300k slice, three metrics sorted by one, at limit 10: at
+    // cardinality 10 - every bucket returned - inlining all of them wins 1.3x
+    // unfiltered and 3.6x at 1% selectivity, the gain growing as the domain
+    // shrinks and the per-bucket fixed cost dominates.  At cardinality 100 and
+    // 1,000 it LOSES 30-43%, because ten buckets of many hold little of the
+    // domain.  numOrds is an index-wide bound, so `limit >= maxBuckets()` is
+    // conservative for a filtered domain: it can only under-claim coverage.
+    //
+    // Restricted to requests that are already inlining something (a sort key,
+    // whose value decides which buckets are returned at all).  Without one, the
+    // count pass would otherwise be free to take a counting strategy the inline
+    // path cannot reach - the docFreq-only dictionary walk among them - and
+    // that trade has not been measured.  SOLUX_FACET_SUBOP_INLINE=all is how to
+    // measure it.
+    int64_t buckets = maxBuckets();
+    bool inlineAll = limit == -1
+        || (!inlineSubOps.empty() && buckets >= 0 && limit >= buckets);
     if (forcedFacetSubOpInline == FacetSubOpInlineMode::ALL) {
       inlineAll = true;
     } else if (forcedFacetSubOpInline == FacetSubOpInlineMode::SORT_KEY_ONLY) {

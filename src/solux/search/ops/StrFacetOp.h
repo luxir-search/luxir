@@ -340,6 +340,13 @@ public:
     enableExecutionProfile();
   }
 
+  // Distinct values across the index, which bounds the buckets a request can
+  // return.  A null OrdMap means the field has no values in any segment, so
+  // there are no buckets at all.
+  int64_t maxBuckets() const override {
+    return ordMap ? ordMap->numOrds() : 0;
+  }
+
   void normalizeOrdCounts(
       std::vector<std::pair<int64_t, int64_t>>& ordCounts,
       bool allowZeroPadding) const {
