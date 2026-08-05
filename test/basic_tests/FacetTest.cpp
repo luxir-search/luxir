@@ -174,6 +174,14 @@ public:
   }
 };
 
+class FacetSubOpInlineGuard {
+  FacetSubOpInlineMode saved = forcedFacetSubOpInline;
+public:
+  ~FacetSubOpInlineGuard() {
+    forcedFacetSubOpInline = saved;
+  }
+};
+
 class StrFacetReplayGuard {
   StrFacetReplaySelector savedSelector = forcedStrFacetReplaySelector;
   StrFacetReplayBankStrategy savedBank = forcedStrFacetReplayBank;
@@ -1895,6 +1903,69 @@ TEST_F(FacetTest, vectorOptimization) {
     EXPECT_EQ(i, bucketIds.v[i]);
     EXPECT_EQ(5, facetResult->counts[i]);
   }
+}
+
+// Both sides of FacetSubOpInlineMode answer the same request identically at a
+// finite limit: ALL accumulates every metric during the count pass, SORT_KEY_ONLY
+// leaves the non-sort metrics to the post-selection bucket-domain feed.  They
+// differ only in cost - which is what the override exists to measure - so this
+// pins the results equal so a crossover rule cannot be written on a path that
+// quietly answers something else.
+TEST_F(FacetTest, subOpInlineModesAgree) {
+  CollectionHelper helper;
+  // Two segments, and a category whose avg order differs from its count order.
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100, "bar_i", 5), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 1, "bar_i", 50), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 50, "bar_i", 7), UpdateMessage::COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100, "bar_i", 9), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100, "bar_i", 1), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 50, "bar_i", 3), UpdateMessage::COMMIT);
+
+  auto run = [&](FacetSubOpInlineMode mode) {
+    FacetSubOpInlineGuard guard;
+    forcedFacetSubOpInline = mode;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs().getNumber(true).allQuery();
+    auto& facet = req->facet("f", "cat_s");
+    facet.limit(2);              // finite, so the two modes really do differ
+    facet.avg("avg_foo", "foo_i");   // the sort key: inlined either way
+    facet.avg("avg_bar", "bar_i");   // the extra: inline vs bucket domains
+    qb::sort(facet, "avg_foo", qb::DESC);
+    req->execute(true);
+    // EXPECT, not ASSERT: an ASSERT returns void and this lambda has a value.
+    std::vector<std::string> buckets;
+    std::vector<int64_t> counts;
+    std::vector<double> foo, bar;
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    EXPECT_NE(result, nullptr) << req->toString();
+    if (result == nullptr) {
+      return std::tuple(buckets, counts, foo, bar);
+    }
+    for (auto& id : std::get<solux::api::ColStr>(result->bucket_ids->kind).v) {
+      buckets.emplace_back(id);
+    }
+    for (auto count : result->counts) counts.push_back(count);
+    for (auto v : std::get<solux::api::ArrDouble>(result->ops.at("avg_foo")->kind).v) foo.push_back(v);
+    for (auto v : std::get<solux::api::ArrDouble>(result->ops.at("avg_bar")->kind).v) bar.push_back(v);
+    return std::tuple(buckets, counts, foo, bar);
+  };
+
+  auto all = run(FacetSubOpInlineMode::ALL);
+  auto sortKeyOnly = run(FacetSubOpInlineMode::SORT_KEY_ONLY);
+  EXPECT_EQ(all, sortKeyOnly);
+  // ... and that it is the right answer: top 2 by avg(foo_i) desc is a(100), c(50).
+  const auto& [buckets, counts, foo, bar] = all;
+  ASSERT_EQ(2u, buckets.size());
+  EXPECT_EQ("a", buckets[0]);
+  EXPECT_EQ("c", buckets[1]);
+  EXPECT_EQ(3, counts[0]);
+  EXPECT_EQ(2, counts[1]);
+  EXPECT_EQ(100, foo[0]);
+  EXPECT_EQ(50, foo[1]);
+  EXPECT_EQ(5, bar[0]);   // (5 + 9 + 1) / 3
+  EXPECT_EQ(5, bar[1]);   // (7 + 3) / 2
 }
 
 // Facet sorted by an inline sub-op (avg) with a finite limit.  This exercises

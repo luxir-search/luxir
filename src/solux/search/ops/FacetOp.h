@@ -17,6 +17,7 @@
 #include "solux/reader/TermsEnum.h"
 #include "solux/schema/Schema.h"
 #include "solux/search/OrdMapStr.h"
+#include "solux/search/SearchOverrides.h"
 #include "solux/util/AtomicMerger.h"
 #include "solux/util/NumericUtils.h"
 #include "solux/util/SegmentMergeDriver.h"
@@ -69,15 +70,28 @@ public:
         }
       }
     }
-    //if there's no limit, more efficient to do inline
-    if (limit == -1) {
+    // Whether the REMAINING sub-ops join the sort key in the count pass, or
+    // stay behind for the post-selection bucket-domain feed.  With no limit
+    // every bucket is returned, so the feed would re-read the whole domain
+    // anyway and inlining is strictly better; with a finite limit it depends on
+    // how much of the domain the returned buckets cover, which is what
+    // FacetSubOpInlineMode exists to measure.
+    bool inlineAll = limit == -1;
+    if (forcedFacetSubOpInline == FacetSubOpInlineMode::ALL) {
+      inlineAll = true;
+    } else if (forcedFacetSubOpInline == FacetSubOpInlineMode::SORT_KEY_ONLY) {
+      inlineAll = false;
+    }
+    if (inlineAll) {
+      std::vector<std::string_view> moved;
       for (auto& subOp : subOps) {
         if (subOp.second->canInline()) {
           inlineSubOps.push_back(subOp);
+          moved.push_back(subOp.first);
         }
       }
-      for (auto& subOp : inlineSubOps) {
-        subOps.erase(subOp.first);
+      for (auto& name : moved) {
+        subOps.erase(name);
       }
     }
   }

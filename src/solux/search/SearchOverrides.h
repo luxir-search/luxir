@@ -50,6 +50,25 @@ enum class FacetFeedStrategy {
   AUTO, BUCKET_DOMAINS, STRING_COLUMN_REPLAY
 };
 
+// Which metric sub-ops a string/ID facet accumulates during the count pass
+// (SOLUX_FACET_SUBOP_INLINE).  Inlining pays the whole domain per metric and
+// covers every bucket; the post-selection bucket-domain feed pays only the
+// documents the RETURNED buckets hold, plus a fixed cost per bucket.  So
+// inlining wins when the returned buckets cover most of the domain, or when the
+// domain is small enough that the per-bucket fixed cost dominates, and loses
+// badly otherwise - on a 300k-document grid, moving two extra metrics onto the
+// bucket-domain feed was free from realized cardinality 1,000 upward and cost
+// 2.4x at cardinality 10.
+//
+// AUTO is the shipping rule: a sort key must be inlined (its value decides
+// which buckets are returned at all), and limit==-1 inlines everything because
+// every bucket is returned, which is the coverage-is-total case.  ALL and
+// SORT_KEY_ONLY pin the two sides so the crossover between them can be measured
+// at a finite limit before a rule is written for it.
+enum class FacetSubOpInlineMode {
+  AUTO, ALL, SORT_KEY_ONLY
+};
+
 enum class StrFacetReplaySelector {
   AUTO, DENSE, SPARSE
 };
@@ -89,6 +108,20 @@ inline FacetFeedStrategy parseFacetFeedStrategyEnv() {
     return FacetFeedStrategy::STRING_COLUMN_REPLAY;
   }
   return FacetFeedStrategy::AUTO;
+}
+
+inline FacetSubOpInlineMode parseFacetSubOpInlineEnv() {
+  const char* e = std::getenv("SOLUX_FACET_SUBOP_INLINE");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "all") {
+      return FacetSubOpInlineMode::ALL;
+    }
+    if (s == "sort_key") {
+      return FacetSubOpInlineMode::SORT_KEY_ONLY;
+    }
+  }
+  return FacetSubOpInlineMode::AUTO;
 }
 
 inline StrFacetReplaySelector parseStrFacetReplaySelectorEnv() {
@@ -160,6 +193,7 @@ inline FacetCounterMode parseFacetCounterModeEnv() {
 inline FacetCounterMode forcedFacetCounterMode = parseFacetCounterModeEnv();
 inline StrFacetStrategy forcedStrFacetStrategy = parseStrFacetStrategyEnv();
 inline FacetFeedStrategy forcedFacetFeedStrategy = parseFacetFeedStrategyEnv();
+inline FacetSubOpInlineMode forcedFacetSubOpInline = parseFacetSubOpInlineEnv();
 inline StrFacetReplaySelector forcedStrFacetReplaySelector =
     parseStrFacetReplaySelectorEnv();
 inline StrFacetReplayBankStrategy forcedStrFacetReplayBank =
