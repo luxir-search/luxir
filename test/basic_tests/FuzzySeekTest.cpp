@@ -296,6 +296,52 @@ TEST_F(FuzzySeekTest, EdgeAssertions) {
   }
 }
 
+// The seek enum classifies terms in a fused loop and scores only the accepted
+// ones through a separate hook, so scoring is the one part of the scan that no
+// differential-on-membership test would notice going missing: every score would
+// simply stay at its initial 1.0.  These are the exact values.
+TEST_F(FuzzySeekTest, ScoresAcceptedTerms) {
+  TestIndex ti;
+  TestField field(ti, "foo_s");
+  std::vector<std::string> terms = {"banana", "beadle", "eedle", "nedle",
+                                    "needl", "needle", "needles", "needlf"};
+  indexTerms(ti, field, terms);
+
+  // score = 1 - distance / (prefix + min(query suffix, term suffix)).
+  std::vector<Match> expected = {
+    {"beadle", 1.0f - 2.0f / 6.0f},
+    {"eedle", 1.0f - 1.0f / 5.0f},
+    {"nedle", 1.0f - 1.0f / 5.0f},
+    {"needl", 1.0f - 1.0f / 5.0f},
+    {"needle", 1.0f},
+    {"needles", 1.0f - 1.0f / 6.0f},
+    {"needlf", 1.0f - 1.0f / 6.0f},
+  };
+  auto seek = collectSeek(field, "", "needle", 2, false);
+  ASSERT_EQ(seek.size(), expected.size());
+  for (int i = 0; i < (int)expected.size(); i++) {
+    EXPECT_EQ(seek[(size_t)i].term, expected[(size_t)i].term) << "match " << i;
+    EXPECT_FLOAT_EQ(seek[(size_t)i].score, expected[(size_t)i].score) << "match " << i;
+  }
+
+  // Prefix mode scores the closest prefix of the term over a fixed denominator.
+  std::vector<Match> expectedPrefix = {
+    {"eedle", 1.0f - 1.0f / 4.0f},
+    {"nedle", 1.0f - 1.0f / 4.0f},
+    {"needl", 1.0f},
+    {"needle", 1.0f},
+    {"needles", 1.0f},
+    {"needlf", 1.0f},
+  };
+  auto seekPrefix = collectSeek(field, "", "need", 1, true);
+  ASSERT_EQ(seekPrefix.size(), expectedPrefix.size());
+  for (int i = 0; i < (int)expectedPrefix.size(); i++) {
+    EXPECT_EQ(seekPrefix[(size_t)i].term, expectedPrefix[(size_t)i].term) << "prefix " << i;
+    EXPECT_FLOAT_EQ(seekPrefix[(size_t)i].score, expectedPrefix[(size_t)i].score)
+        << "prefix " << i;
+  }
+}
+
 TEST_F(FuzzySeekTest, JumpEffectivenessSparseCorpus) {
   TestIndex ti;
   TestField field(ti, "foo_s");

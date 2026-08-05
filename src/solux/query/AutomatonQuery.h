@@ -8,7 +8,7 @@
 
 namespace solux {
 
-class ExactTermTermsEnum final : public FilteredTermsEnum {
+class ExactTermTermsEnum final : public ScanTermsEnum {
   std::string_view term;
 
 protected:
@@ -16,7 +16,7 @@ protected:
   Status accept() override { return termView() == term ? Status::ACCEPT : Status::END; }
 
 public:
-  ExactTermTermsEnum(TermsEnum& te, std::string_view term) : FilteredTermsEnum(te), term(term) {}
+  ExactTermTermsEnum(TermsEnum& te, std::string_view term) : ScanTermsEnum(te), term(term) {}
 };
 
 class AutomatonQuery final : public MultiTermQuery {

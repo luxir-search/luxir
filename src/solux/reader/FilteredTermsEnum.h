@@ -20,14 +20,10 @@ protected:
   bool started = false;
   bool exhausted = false;
 
-  // Position `te` on the first candidate term.
-  virtual bool seekStart() { return te.nextTerm(); }
-
-  // Classify the term `te` is currently positioned on.
-  virtual Status accept() = 0;
-
-  // Move the underlying enum to the next candidate term.
-  virtual bool advance() { return te.nextTerm(); }
+  bool finish() {
+    exhausted = true;
+    return false;
+  }
 
 public:
   explicit FilteredTermsEnum(TermsEnum& te) : te(te) {}
@@ -47,7 +43,29 @@ public:
   // classified, and the underlying enum may have moved past it by the time the
   // scan gave up, so advancing again would reason from a term that is no longer
   // there.
-  bool next() {
+  virtual bool next() = 0;
+};
+
+// Drives a scan that classifies every term the dictionary hands it, one
+// virtual call per term.  Enums that can prove whole runs of terms unacceptable
+// implement next() directly instead, so that they can skip and can fuse the
+// per-term work into one loop; they are not ScanTermsEnum and so cannot silently
+// inherit an accept() that nothing calls.
+class ScanTermsEnum : public FilteredTermsEnum {
+protected:
+  // Position `te` on the first candidate term.
+  virtual bool seekStart() { return te.nextTerm(); }
+
+  // Classify the term `te` is currently positioned on.
+  virtual Status accept() = 0;
+
+  // Move the underlying enum to the next candidate term.
+  virtual bool advance() { return te.nextTerm(); }
+
+public:
+  using FilteredTermsEnum::FilteredTermsEnum;
+
+  bool next() final {
     if (exhausted) return false;
     if (!started) {
       started = true;
@@ -64,16 +82,10 @@ public:
       if (!advance()) return finish();
     }
   }
-
-private:
-  bool finish() {
-    exhausted = true;
-    return false;
-  }
 };
 
 // Accepts every term that begins with `prefix`.
-class PrefixTermsEnum final : public FilteredTermsEnum {
+class PrefixTermsEnum final : public ScanTermsEnum {
   std::string_view prefix;
 
 protected:
@@ -85,13 +97,13 @@ protected:
 
 public:
   PrefixTermsEnum(TermsEnum& te, std::string_view prefix)
-    : FilteredTermsEnum(te), prefix(prefix) {}
+    : ScanTermsEnum(te), prefix(prefix) {}
 };
 
 // Accepts terms in [lower, upper] under byte order; either end may be open
 // (nullopt) or exclusive.  Terms are sorted, so the scan seeks to the lower
 // endpoint and stops at the first term past the upper one.
-class RangeTermsEnum final : public FilteredTermsEnum {
+class RangeTermsEnum final : public ScanTermsEnum {
   std::optional<std::string_view> lower;
   std::optional<std::string_view> upper;
   bool includeLower;
@@ -115,7 +127,7 @@ protected:
 public:
   RangeTermsEnum(TermsEnum& te, std::optional<std::string_view> lower, bool includeLower,
                  std::optional<std::string_view> upper, bool includeUpper)
-    : FilteredTermsEnum(te), lower(lower), upper(upper),
+    : ScanTermsEnum(te), lower(lower), upper(upper),
       includeLower(includeLower), includeUpper(includeUpper) {}
 };
 

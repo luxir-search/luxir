@@ -210,12 +210,21 @@ void expectSuccessor(std::string_view query, int k, bool prefixMode, std::string
   LevenshteinAutomaton a(query, k, prefixMode);
   int liveDepth;
   auto states = liveStack(a, term, liveDepth);
+  using Seek = AutomatonSeekEnum<LevenshteinAutomaton>;
   std::string actual;
   char buffer[PackedTerm::MAX_LEN + 1];
   int actualLen;
-  bool actualFound = AutomatonSeekEnum<LevenshteinAutomaton>::successor(
+  Seek::Successor kind = Seek::successor(
       a, term, states.data(), liveDepth, buffer, actualLen);
-  actual.assign(buffer, (size_t)actualLen);
+  bool actualFound = kind != Seek::Successor::NONE;
+  // A zero extension is reported rather than written out, so reconstruct it
+  // here: the brute oracle still gets the exact bytes to compare against.
+  if (kind == Seek::Successor::ZERO_EXTENSION) {
+    actual.assign(term);
+    actual.push_back('\0');
+  } else {
+    actual.assign(buffer, (size_t)actualLen);
+  }
   std::string expected;
   bool expectedFound = bruteSuccessor(a, term, maxLen, expected);
 
@@ -366,11 +375,12 @@ TEST(LevenshteinAutomatonTest, EdgeCases) {
     LevenshteinAutomaton a("b", 0, false);
     int liveDepth;
     auto states = liveStack(a, "a", liveDepth);
+    using Seek = AutomatonSeekEnum<LevenshteinAutomaton>;
     std::string out;
     char buffer[PackedTerm::MAX_LEN + 1];
     int outLen;
-    ASSERT_TRUE(AutomatonSeekEnum<LevenshteinAutomaton>::successor(
-        a, "a", states.data(), liveDepth, buffer, outLen));
+    ASSERT_EQ(Seek::successor(a, "a", states.data(), liveDepth, buffer, outLen),
+              Seek::Successor::JUMP);
     out.assign(buffer, (size_t)outLen);
     EXPECT_EQ(out, "b");
   }

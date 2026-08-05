@@ -11,7 +11,7 @@ namespace solux {
 
 // Brute-force fuzzy term scan over a required exact prefix plus a byte-wise
 // Levenshtein match on the remaining suffix.
-class FuzzyTermsEnum final : public FilteredTermsEnum {
+class FuzzyTermsEnum final : public ScanTermsEnum {
   std::string_view prefix;       // non-fuzzy leading bytes that must match exactly
   std::string_view suffix;       // query bytes after the prefix (the fuzzy part)
   int maxEdits;
@@ -73,7 +73,7 @@ public:
   // `prefix` is exact; `suffix` is fuzzy. Both views must outlive this enum.
   FuzzyTermsEnum(MemPool& pool, TermsEnum& te, std::string_view prefix,
                  std::string_view suffix, int maxEdits, bool prefixMode = false)
-    : FilteredTermsEnum(te), prefix(prefix), suffix(suffix), maxEdits(maxEdits),
+    : ScanTermsEnum(te), prefix(prefix), suffix(suffix), maxEdits(maxEdits),
       n((int)suffix.size()), prefixMode(prefixMode) {
     prev = (int*)pool.alloc((n + 1) * sizeof(int), alignof(int));
     cur = (int*)pool.alloc((n + 1) * sizeof(int), alignof(int));
