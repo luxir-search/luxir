@@ -25,6 +25,10 @@ class TermsEnum {
 
   PackedTerm currTerm;
   int32_t ordInBlock = -1; // the term number local to the current block
+  // Bytes currTerm shares with the term immediately before it, in full-term
+  // coordinates.  Only an in-block advance can report a nonzero value; see
+  // sharedPrefixLen().
+  int32_t sharedLen = 0;
 
   // block-level information
 
@@ -301,6 +305,21 @@ public:
   /// If called before nextTerm() or seek() is done, returns a 0 length term.
   PackedTerm term() const {
     return currTerm;
+  }
+
+  /// Number of leading bytes term() shares with the term immediately preceding
+  /// it in the dictionary, in full-term coordinates.  The block encoding stores
+  /// this, so scanners that compare consecutive terms never have to re-derive
+  /// it.  Valid after any successful positioning call.
+  ///
+  /// It is exact after an advance inside a term block and 0 everywhere else
+  /// (block entry, every seek): 0 claims no sharing, so it is always safe.
+  /// Callers must only read it as sharing with the term they last looked at
+  /// when they advanced one term to get here - after a seek the preceding
+  /// dictionary term is not the term they last saw, and its shared length
+  /// would be an over-estimate.
+  int32_t sharedPrefixLen() const {
+    return sharedLen;
   }
 
   int32_t docFreq() {
@@ -763,6 +782,9 @@ protected:
     suffixBytesTotal = termsIS.readVint();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
+    // The block's first term is not delta-coded against anything, so nothing is
+    // known to be shared with whatever term preceded it.
+    sharedLen = 0;
 
     // remember, then skip over the term hashes... one byte per hash.
     termHashes = termsIS.ptr();
@@ -829,6 +851,11 @@ protected:
 
     memcpy(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
     currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
+    // Never an over-estimate whatever the build: these bytes were not written
+    // just now, they are inherited from the previous term's reconstruction, so
+    // the two terms share at least that many.  The assert above upgrades that
+    // to exactly, by proving the next byte differs.
+    sharedLen = (int32_t) (blockPrefixLen + prefixLen);
   }
 
   // Find the block whose separator key is the greatest one that is <= target,
@@ -844,10 +871,16 @@ protected:
   }
 
 public:
+  // A seek can land arbitrarily far from where the enum was, so every seek ends
+  // by dropping the shared prefix back to 0 (see sharedPrefixLen).  The
+  // nTerms == 0 early returns need no such reset: sharedLen can only become
+  // nonzero by advancing within a block, which an empty field never does.
   bool seek(std::string_view target) {
     if (fieldInfo.nTerms == 0) return false;
     seekBlock(target, 0);
-    return seekInBlock(target);
+    bool found = seekInBlock(target);
+    sharedLen = 0;
+    return found;
   }
 
   /// Forward-only seek for sorted iteration. Target must be >= the current term.
@@ -879,13 +912,16 @@ public:
     // Linear forward scan within the current block.  Stops at the first term
     // >= target (the insertion point), so a subsequent seekForward starts from
     // the correct position.
+    bool found = false;
     for (;;) {
       auto cmp = term() <=> target;
-      if (cmp == 0) return true;
-      if (cmp > 0) return false;
-      if (ordInBlock >= maxOrdInBlock) return false;
+      if (cmp == 0) { found = true; break; }
+      if (cmp > 0) break;
+      if (ordInBlock >= maxOrdInBlock) break;
       readNextTermInBlock();
     }
+    sharedLen = 0;
+    return found;
   }
 
   /// Positions on the smallest term that is >= target.
@@ -899,11 +935,14 @@ public:
     seekBlock(target, 0);
     // nextTerm() can cross block boundaries, so this also handles a target
     // between the last term of one block and the first term of the next.
+    bool found;
     for (;;) {
       auto cmp = term() <=> target;
-      if (cmp >= 0) return true;        // first term >= target
-      if (!nextTerm()) return false;    // target is past the last term
+      if (cmp >= 0) { found = true; break; }        // first term >= target
+      if (!nextTerm()) { found = false; break; }    // target is past the last term
     }
+    sharedLen = 0;
+    return found;
   }
 
 protected:
@@ -955,28 +994,8 @@ public:
       // nextTerm();
       readNextTermInBlock();
     }
+    sharedLen = 0;
     assert(ord() == targetOrd);
-  }
-
-
-protected:
-  bool seekCeilInBlock(std::string_view target) {
-    auto cmp = term() <=> target;
-    // std::cout << " comparing with first " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
-    if (cmp == 0) return true;
-    if (cmp > 0) return false;  // this will normally only happen on the *first* block
-
-    // TODO: we could optimize this seeking by not actually building the term to compare.
-    // We know from prefix encoding how much of the previous term is shared.
-    // It could also possibly be faster to skip term metadata rather than reading it as well.
-    while (ordInBlock < maxOrdInBlock) {
-      nextTerm();
-      cmp = term() <=> target;
-      // std::cout << " comparing with next " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
-      if (cmp == 0) return true;
-      if (cmp > 0) return false;
-    }
-    return false;
   }
 
 

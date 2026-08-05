@@ -23,9 +23,12 @@ protected:
   Status accept() override {
     Status status = acceptAutomaton();
     if (status != Status::ACCEPT) return status;
-    int distance = automaton.matchDistance(stack[previousLen]);
+    // An accepted term was stepped to its end, so its final state is the top of
+    // the stack and the score denominator measures the whole term.
+    int suffixLen = (int)(termView().size() - prefix.size());
+    int distance = automaton.matchDistance(stack[suffixLen]);
     int denominator = prefixMode ? (int)prefix.size() + n
-        : (int)prefix.size() + std::min(n, previousLen);
+        : (int)prefix.size() + std::min(n, suffixLen);
     score = denominator != 0 ? 1.0f - (float)distance / (float)denominator : 1.0f;
     return Status::ACCEPT;
   }

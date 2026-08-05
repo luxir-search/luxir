@@ -21,11 +21,13 @@ protected:
   A automaton;
   typename A::State initialState;
   typename A::State* stack;
-  char previous[PackedTerm::MAX_LEN];
   char successorBuffer[PackedTerm::MAX_LEN + 1];
-  int previousLen = 0;
   int previousLiveDepth = 0;
   int successorLen = 0;
+  // A seek lands on a term the automaton never walked to, so the shared prefix
+  // the dictionary reports there is shared with a term this enum never saw.
+  // Set when that happens; the next accept re-anchors instead of trusting it.
+  bool chainBroken = false;
   int64_t termsExaminedCount = 0;
   int64_t dpStepCount = 0;
   int64_t jumpCount = 0;
@@ -63,29 +65,45 @@ protected:
 
   void resetStack() {
     stack[0] = initialState;
-    previousLen = 0;
     previousLiveDepth = 0;
+    chainBroken = true;
   }
 
-  int commonPrefixLen(std::string_view suffix) const {
-    int limit = std::min({previousLen, previousLiveDepth, (int)suffix.size()});
-    int i = 0;
-    while (i < limit && previous[i] == suffix[(size_t)i]) i++;
-    return i;
-  }
-
-  void savePrevious(std::string_view suffix) {
-    assert(suffix.size() <= PackedTerm::MAX_LEN);
-    if (!suffix.empty()) memcpy(previous, suffix.data(), suffix.size());
-    previousLen = (int)suffix.size();
-  }
-
+  // stack[0..previousLiveDepth] are the live states the previous term reached,
+  // so any term repeating that many of its bytes reuses them as they stand.
+  // The dictionary already encodes how many bytes each term repeats from the
+  // one before it, which is why nothing here compares term bytes.
   Status acceptAutomaton() {
-    std::string_view term = termView();
-    if (!term.starts_with(prefix)) return Status::END;
+    int shared;
+    if (chainBroken) {
+      // Re-anchor: walk this term from the start rather than reason about which
+      // term the dictionary measured its shared prefix against.  Doing it here
+      // rather than trusting the enum to report zero after a seek keeps the
+      // rule inside the one class that depends on it - a wrong reuse depth
+      // silently drops matches instead of failing.
+      chainBroken = false;
+      shared = 0;
+    } else {
+      shared = (int)te.sharedPrefixLen();
+    }
+    if (shared < (int)prefix.size()) {
+      // Either nothing below the query prefix is known to be reusable (block
+      // boundary, re-anchor), or the scan has walked off the end of the prefix
+      // range - which is how every anchored scan terminates.
+      if (!termView().starts_with(prefix)) return Status::END;
+      shared = (int)prefix.size();
+    }
+    // Otherwise the previous term began with prefix and this one repeats at
+    // least that much of it, so it does too and the check is skipped.
     termsExaminedCount++;
-    std::string_view suffix = term.substr(prefix.size());
-    int common = commonPrefixLen(suffix);
+    int common = shared - (int)prefix.size();
+    if (common > previousLiveDepth) {
+      // This term repeats the previous one through the byte that killed the
+      // automaton, so it dies in the same place.  Rejected without stepping and
+      // without reading a term byte; previousLiveDepth still describes it.
+      return Status::REJECT;
+    }
+    std::string_view suffix = termView().substr(prefix.size());
     int liveDepth = common;
     for (int i = common; i < (int)suffix.size(); i++) {
       typename A::State next = automaton.step(stack[i], (uint8_t)suffix[(size_t)i]);
@@ -95,15 +113,27 @@ protected:
       liveDepth = i + 1;
     }
     previousLiveDepth = liveDepth;
-    savePrevious(suffix);
     return liveDepth == (int)suffix.size() && automaton.isMatch(stack[suffix.size()])
         ? Status::ACCEPT : Status::REJECT;
   }
 
   bool advanceAutomaton() {
-    if (!successor(automaton, {previous, (size_t)previousLen}, stack, previousLiveDepth,
+    // accept() classifies without moving the enum, so it is still on the term
+    // whose successor is wanted: its suffix is what successor() needs.
+    std::string_view current = termView();
+    assert(current.size() >= prefix.size());
+    std::string_view suffix = current.substr(prefix.size());
+    if (!successor(automaton, suffix, stack, previousLiveDepth,
                    successorBuffer, successorLen)) return false;
-    std::string_view suffix(successorBuffer, (size_t)successorLen);
+    std::string_view target(successorBuffer, (size_t)successorLen);
+    // A zero extension has nothing that can sort before it, so automata that
+    // continue on any byte (a leading '.' or '*') skip the comparison too.
+    // Only successor()'s forward branch can return one byte more than the term
+    // it was given, and that branch copies the term itself into the buffer
+    // first, so the leading bytes match by construction rather than by test.
+    bool zeroExtension = successorLen == (int)suffix.size() + 1
+        && (uint8_t)successorBuffer[suffix.size()] == 0;
+    assert(!zeroExtension || memcmp(successorBuffer, suffix.data(), suffix.size()) == 0);
     // Step before seeking.  Most successors extend the current term by the
     // automaton's smallest live byte, and the only terms that can sort between
     // the two continue the current term with a SMALLER byte - usually none at
@@ -111,18 +141,13 @@ protected:
     // seek would only re-find what the step already reached.  Seek on a real
     // undershoot, which is where the skip earns its cost.
     if (!te.nextTerm()) return false;
-    // A zero extension has nothing that can sort before it, so automata that
-    // continue on any byte (a leading '.' or '*') skip the comparison too.
-    bool zeroExtension = successorLen == previousLen + 1
-        && (uint8_t)successorBuffer[previousLen] == 0
-        && memcmp(successorBuffer, previous, (size_t)previousLen) == 0;
     if (zeroExtension) return true;
-    char target[PackedTerm::MAX_LEN + 2];
-    size_t length = prefix.size() + suffix.size();
-    assert(length <= sizeof(target));
-    if (!prefix.empty()) memcpy(target, prefix.data(), prefix.size());
-    if (!suffix.empty()) memcpy(target + prefix.size(), suffix.data(), suffix.size());
-    std::string_view seekTarget(target, length);
+    char targetBuffer[PackedTerm::MAX_LEN + 2];
+    size_t length = prefix.size() + target.size();
+    assert(length <= sizeof(targetBuffer));
+    if (!prefix.empty()) memcpy(targetBuffer, prefix.data(), prefix.size());
+    if (!target.empty()) memcpy(targetBuffer + prefix.size(), target.data(), target.size());
+    std::string_view seekTarget(targetBuffer, length);
     if ((te.term() <=> seekTarget) >= 0) return true;
     jumpCount++;
     bool exact = te.seekForward(seekTarget);
@@ -130,6 +155,7 @@ protected:
       if (!te.nextTerm()) return false;
       assert((te.term() <=> seekTarget) >= 0);
     }
+    chainBroken = true;  // landed on a term the automaton never walked to
     return true;
   }
 

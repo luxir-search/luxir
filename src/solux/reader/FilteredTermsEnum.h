@@ -18,6 +18,7 @@ public:
 protected:
   TermsEnum& te;
   bool started = false;
+  bool exhausted = false;
 
   // Position `te` on the first candidate term.
   virtual bool seekStart() { return te.nextTerm(); }
@@ -42,21 +43,32 @@ public:
 
   // Advance to the next accepted term, returning false when the scan is
   // exhausted.  After a true return, term()/terms()/currentScore() are valid.
+  // A false return is final: subclasses track state about the term they last
+  // classified, and the underlying enum may have moved past it by the time the
+  // scan gave up, so advancing again would reason from a term that is no longer
+  // there.
   bool next() {
+    if (exhausted) return false;
     if (!started) {
       started = true;
-      if (!seekStart()) return false;
+      if (!seekStart()) return finish();
     } else {
-      if (!advance()) return false;
+      if (!advance()) return finish();
     }
     for (;;) {
       switch (accept()) {
         case Status::ACCEPT: return true;
-        case Status::END:    return false;
+        case Status::END:    return finish();
         case Status::REJECT: break;
       }
-      if (!advance()) return false;
+      if (!advance()) return finish();
     }
+  }
+
+private:
+  bool finish() {
+    exhausted = true;
+    return false;
   }
 };
 

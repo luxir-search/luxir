@@ -112,6 +112,13 @@ std::vector<std::string> makeTargets(std::mt19937_64& rng, const std::vector<std
   return targets;
 }
 
+int32_t lcp(std::string_view a, std::string_view b) {
+  uint32_t n = std::min((uint32_t)a.size(), (uint32_t)b.size());
+  uint32_t i = 0;
+  while (i < n && a[i] == b[i]) i++;
+  return (int32_t)i;
+}
+
 SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader, std::string_view fieldName) {
   FieldReader fieldReader(postingsReader);
   EXPECT_TRUE(fieldReader.seek(fieldName));
@@ -195,6 +202,66 @@ TEST_F(TermsEnumSeekFuzzTest, GapRoutingAcrossSeparatorBoundary) {
   TermsEnum ceilEnum(guard.pool(), seg->postingsReader(), field.fieldInfo);
   ASSERT_TRUE(ceilEnum.seekCeil("azm"));
   EXPECT_EQ((std::string_view)ceilEnum.term(), "azzz");
+}
+
+TEST_F(TermsEnumSeekFuzzTest, SharedPrefixLenMatchesAdjacentTerms) {
+  // Scanners skip work proportional to sharedPrefixLen, so a value larger than
+  // the real sharing silently drops matches.  It must be exact when the enum
+  // advanced one term inside a block, and 0 wherever the enum arrived by a
+  // block load or a seek instead.
+  std::mt19937_64 rng(0x5eedf00d);
+  TestIndex ti;
+  TestField field(ti, "shared_s");
+  std::vector<std::string> terms = makeTerms(rng);
+  ASSERT_GT(terms.size(), (size_t)Postings::TERMS_BLOCK_SIZE * 3);
+  indexTerms(ti, field, terms);
+
+  auto guard = field.testIndex.pool.rewindScopeGuard();
+  auto* seg = field.currentSegment();
+  {
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    for (size_t i = 0; i < terms.size(); i++) {
+      ASSERT_TRUE(te.nextTerm());
+      ASSERT_EQ((std::string_view)te.term(), terms[i]);
+      bool blockStart = (int32_t)(i % (size_t)Postings::TERMS_BLOCK_SIZE) == 0;
+      EXPECT_EQ(te.sharedPrefixLen(), blockStart ? 0 : lcp(terms[i - 1], terms[i])) << terms[i];
+    }
+    EXPECT_FALSE(te.nextTerm());
+  }
+
+  // Each seek gets a fresh enum: run on one that a previous seek already
+  // positioned, seekForward stops on its first comparison and never advances a
+  // term, so it would report 0 whether or not it resets.  From an unpositioned
+  // enum it scans the block term by term, which is the case that regresses if
+  // the reset is ever dropped.
+  for (const std::string& target : makeTargets(rng, terms)) {
+    {
+      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+      te.seek(target);
+      EXPECT_EQ(te.sharedPrefixLen(), 0) << "seek " << target;
+    }
+    {
+      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+      te.seekCeil(target);
+      EXPECT_EQ(te.sharedPrefixLen(), 0) << "seekCeil " << target;
+    }
+    {
+      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+      te.seekForward(target);
+      EXPECT_EQ(te.sharedPrefixLen(), 0) << "seekForward " << target;
+    }
+  }
+
+  // The scanning case made explicit: the last term of the first block is
+  // reached by advancing across the whole block, so sharedPrefixLen is nonzero
+  // right up until seekForward returns.
+  {
+    const std::string& lastOfBlock = terms[(size_t)Postings::TERMS_BLOCK_SIZE - 1];
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    EXPECT_TRUE(te.seekForward(lastOfBlock));
+    EXPECT_EQ((std::string_view)te.term(), lastOfBlock);
+    EXPECT_EQ(te.sharedPrefixLen(), 0);
+  }
 }
 
 TEST_F(TermsEnumSeekFuzzTest, RandomCollectionTermsMatchVectorReference) {
