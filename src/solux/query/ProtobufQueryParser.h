@@ -56,6 +56,7 @@ class ProtobufQueryParser {
 
   Query* parsePhrase(const solux::api::PhraseQuery& phraseQuery);
   Query* parsePrefix(const solux::api::PrefixQuery& prefixQuery);
+  Query* parseWildcard(const solux::api::WildcardQuery& wildcardQuery);
   Query* parseExists(const solux::api::ExistsQuery& existsQuery);
   Query* parseRange(const solux::api::RangeQuery& rangeQuery);
   Query* parseGeoBox(const solux::api::GeoBoxQuery& geoBoxQuery);

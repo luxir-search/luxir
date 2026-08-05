@@ -6,7 +6,7 @@
 namespace solux {
 
 class BruteDfaTermsEnum final : public FilteredTermsEnum {
-  const automaton::ByteDfa& dfa;
+  automaton::ByteDfaView dfa;
   std::string prefix;
 
 protected:
@@ -19,7 +19,7 @@ protected:
   }
 
 public:
-  BruteDfaTermsEnum(TermsEnum& te, const automaton::ByteDfa& dfa)
+  BruteDfaTermsEnum(TermsEnum& te, automaton::ByteDfaView dfa)
       : FilteredTermsEnum(te), dfa(dfa), prefix(dfa.commonPrefix()) {}
 };
 

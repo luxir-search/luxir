@@ -6,33 +6,41 @@
 #include <queue>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
+#include "solux/util/MemPool.h"
 #include "solux/util/automaton/Automaton.h"
 
 namespace solux::automaton {
 
-class ByteDfa {
+enum class ByteDfaKind { NONE, SINGLE, PREFIX, ALL, NORMAL };
+
+struct ByteDfaRange {
+  uint8_t min;
+  uint8_t max;
+  int32_t dest;
+};
+
+// Non-owning query-time representation. Its pointed-to storage is either the
+// compiler artifact's vectors or a request MemPool copy made by ByteDfa::freeze.
+class ByteDfaView {
 public:
   using State = int32_t;
+  using Range = ByteDfaRange;
+  using Kind = ByteDfaKind;
   static constexpr State DEAD = -1;
 
-  enum class Kind { NONE, SINGLE, PREFIX, ALL, NORMAL };
-
-  struct Range {
-    uint8_t min;
-    uint8_t max;
-    State dest;
-  };
-
 private:
-  std::vector<std::vector<Range>> ranges;
-  std::vector<uint8_t> accepts;
-  std::vector<int16_t> table;
+  const Range* ranges = nullptr;
+  const uint32_t* offsets = nullptr;
+  const uint8_t* accepts = nullptr;
+  const int16_t* table = nullptr;
+  uint32_t stateCount = 0;
 
   int32_t minAcceptedLength() const {
-    if (ranges.empty()) return -1;
-    std::vector<int32_t> distance(ranges.size(), -1);
+    if (stateCount == 0) return -1;
+    std::vector<int32_t> distance(stateCount, -1);
     std::queue<State> pending;
     distance[0] = 0;
     pending.push(0);
@@ -40,7 +48,7 @@ private:
       State state = pending.front();
       pending.pop();
       if (accepts[(size_t)state]) return distance[(size_t)state];
-      for (Range range : ranges[(size_t)state]) {
+      for (const Range& range : transitions(state)) {
         if (distance[(size_t)range.dest] == -1) {
           distance[(size_t)range.dest] = distance[(size_t)state] + 1;
           pending.push(range.dest);
@@ -51,97 +59,21 @@ private:
   }
 
 public:
-  ByteDfa() = default;
-  explicit ByteDfa(const Automaton& automaton, Budget& budget) { freeze(automaton, budget); }
+  constexpr ByteDfaView() = default;
+  constexpr ByteDfaView(const Range* ranges, const uint32_t* offsets,
+                        const uint8_t* accepts, const int16_t* table,
+                        uint32_t stateCount)
+      : ranges(ranges), offsets(offsets), accepts(accepts), table(table),
+        stateCount(stateCount) {}
 
-  // Input must be a determinized, dead-state-free byte automaton.  The debug
-  // assertions below make that query-time artifact contract explicit.
-  void freeze(const Automaton& automaton, Budget& budget) {
-    ranges.clear();
-    accepts.clear();
-    table.clear();
-    if (Automaton::isEmpty(automaton)) return;
-
-    ranges.resize((size_t)automaton.size());
-    accepts = automaton.acceptBits();
-    for (int32_t state = 0; state < automaton.size(); state++) {
-      for (Transition transition : automaton.transitionsFrom(state)) {
-        assert(transition.min >= 0 && transition.max <= 255);
-        assert(transition.dest >= 0 && transition.dest < automaton.size());
-        ranges[(size_t)state].push_back(
-            {(uint8_t)transition.min, (uint8_t)transition.max, transition.dest});
-        budget.consume();
-      }
-    }
-    for (auto& stateRanges : ranges) {
-      std::sort(stateRanges.begin(), stateRanges.end(),
-                [](Range a, Range b) { return a.min < b.min; });
-      for (size_t i = 1; i < stateRanges.size(); i++) assert(stateRanges[i - 1].max < stateRanges[i].min);
-      std::vector<Range> merged;
-      for (Range range : stateRanges) {
-        if (!merged.empty() && merged.back().dest == range.dest
-            && (int32_t)merged.back().max + 1 == range.min) {
-          merged.back().max = range.max;
-        } else {
-          merged.push_back(range);
-        }
-      }
-      stateRanges.swap(merged);
-    }
-
-    std::vector<uint8_t> reachable(ranges.size());
-    std::vector<State> pending{0};
-    reachable[0] = true;
-    for (size_t i = 0; i < pending.size(); i++) {
-      for (Range range : ranges[(size_t)pending[i]]) {
-        if (!reachable[(size_t)range.dest]) {
-          reachable[(size_t)range.dest] = true;
-          pending.push_back(range.dest);
-        }
-      }
-    }
-    for (uint8_t stateReachable : reachable) assert(stateReachable);
-
-    std::vector<std::vector<State>> reverse(ranges.size());
-    for (size_t state = 0; state < ranges.size(); state++) {
-      for (Range range : ranges[state]) reverse[(size_t)range.dest].push_back((State)state);
-    }
-    std::vector<uint8_t> coreachable(ranges.size());
-    pending.clear();
-    for (size_t state = 0; state < accepts.size(); state++) {
-      if (accepts[state]) { coreachable[state] = true; pending.push_back((State)state); }
-    }
-    for (size_t i = 0; i < pending.size(); i++) {
-      for (State previous : reverse[(size_t)pending[i]]) {
-        if (!coreachable[(size_t)previous]) {
-          coreachable[(size_t)previous] = true;
-          pending.push_back(previous);
-        }
-      }
-    }
-    for (uint8_t stateCoreachable : coreachable) assert(stateCoreachable);
-
-    if (ranges.size() * 256 * sizeof(int16_t) <= 128 * 1024) {
-      table.assign(ranges.size() * 256, DEAD);
-      for (size_t state = 0; state < ranges.size(); state++) {
-        for (Range range : ranges[state]) {
-          for (int32_t byte = range.min; byte <= range.max; byte++) {
-            table[state * 256 + (size_t)byte] = (int16_t)range.dest;
-          }
-        }
-      }
-      budget.consume((int64_t)ranges.size() * 256);
-    }
-  }
-
-  State start() const { return ranges.empty() ? DEAD : 0; }
+  State start() const { return stateCount == 0 ? DEAD : 0; }
   bool canMatch(State state) const { return state != DEAD; }
   bool isMatch(State state) const { return state != DEAD && accepts[(size_t)state]; }
 
   State step(State state, uint8_t byte) const {
     if (state == DEAD) return DEAD;
-    if (!table.empty()) return table[(size_t)state * 256 + byte];
-    for (Range range : ranges[(size_t)state]) {
+    if (table != nullptr) return table[(size_t)state * 256 + byte];
+    for (const Range& range : transitions(state)) {
       if (byte >= range.min && byte <= range.max) return range.dest;
     }
     return DEAD;
@@ -149,7 +81,7 @@ public:
 
   int32_t nextLiveByte(State state, int32_t byte) const {
     if (state == DEAD) return DEAD;
-    for (Range range : ranges[(size_t)state]) {
+    for (const Range& range : transitions(state)) {
       if (range.max >= byte) return std::max(byte, (int32_t)range.min);
     }
     return DEAD;
@@ -164,18 +96,17 @@ public:
     return isMatch(state);
   }
 
-  size_t size() const { return ranges.size(); }
-  const std::vector<Range>& transitions(State state) const { return ranges[(size_t)state]; }
+  size_t size() const { return stateCount; }
+  std::span<const Range> transitions(State state) const {
+    return {ranges + offsets[(size_t)state], offsets[(size_t)state + 1] - offsets[(size_t)state]};
+  }
 
   std::string commonPrefix() const { return commonPrefixAndState().first; }
-
-  // The longest unique byte path from the start, plus the state it reaches:
-  // the seek prefix and the enum's initial state in one walk.
   std::pair<std::string, State> commonPrefixAndState() const {
     std::string prefix;
     State state = start();
     while (state != DEAD && !isMatch(state)) {
-      const auto& stateRanges = ranges[(size_t)state];
+      auto stateRanges = transitions(state);
       if (stateRanges.size() != 1 || stateRanges[0].min != stateRanges[0].max) break;
       prefix.push_back((char)stateRanges[0].min);
       state = stateRanges[0].dest;
@@ -185,33 +116,26 @@ public:
 
   Kind classify(std::string* value = nullptr) const {
     if (value != nullptr) value->clear();
-    if (ranges.empty() || minAcceptedLength() > 255) return Kind::NONE;
-
+    if (stateCount == 0 || minAcceptedLength() > 255) return Kind::NONE;
     State state = 0;
     std::string prefix;
     while (!accepts[(size_t)state]) {
-      const auto& stateRanges = ranges[(size_t)state];
+      auto stateRanges = transitions(state);
       if (stateRanges.size() != 1 || stateRanges[0].min != stateRanges[0].max) return Kind::NORMAL;
       prefix.push_back((char)stateRanges[0].min);
-      // A unique path longer than the term cap cannot produce an indexed term,
-      // so its language is NONE even if it reaches an accept later.
       if (prefix.size() > 255) return Kind::NONE;
       state = stateRanges[0].dest;
     }
-
-    const auto& stateRanges = ranges[(size_t)state];
+    auto stateRanges = transitions(state);
     bool totalSelf = stateRanges.size() == 1 && stateRanges[0].min == 0
         && stateRanges[0].max == 255 && stateRanges[0].dest == state;
     bool totalHandoff = false;
     if (stateRanges.size() == 1 && stateRanges[0].min == 0 && stateRanges[0].max == 255
         && accepts[(size_t)stateRanges[0].dest]) {
-      const auto& nextRanges = ranges[(size_t)stateRanges[0].dest];
+      auto nextRanges = transitions(stateRanges[0].dest);
       totalHandoff = nextRanges.size() == 1 && nextRanges[0].min == 0
           && nextRanges[0].max == 255 && nextRanges[0].dest == stateRanges[0].dest;
     }
-    // We intentionally do not minimize.  Determinization can therefore leave
-    // this accepting handoff before the total-loop sink; it has the same byte
-    // language as a total self-loop.
     if (totalSelf || totalHandoff) {
       if (value != nullptr) *value = prefix;
       return prefix.empty() ? Kind::ALL : Kind::PREFIX;
@@ -222,6 +146,133 @@ public:
     }
     return Kind::NORMAL;
   }
+};
+static_assert(std::is_trivially_destructible_v<ByteDfaView>);
+
+class ByteDfa {
+public:
+  using State = ByteDfaView::State;
+  using Range = ByteDfaView::Range;
+  using Kind = ByteDfaView::Kind;
+  static constexpr State DEAD = ByteDfaView::DEAD;
+
+private:
+  std::vector<Range> ranges;
+  std::vector<uint32_t> offsets;
+  std::vector<uint8_t> accepts;
+  std::vector<int16_t> table;
+
+  ByteDfaView makeView() const {
+    return {ranges.data(), offsets.data(), accepts.data(), table.empty() ? nullptr : table.data(),
+            (uint32_t)accepts.size()};
+  }
+
+public:
+  ByteDfa() = default;
+  explicit ByteDfa(const Automaton& automaton, Budget& budget) { build(automaton, budget); }
+
+  ByteDfaView view() const { return makeView(); }
+
+  void build(const Automaton& automaton, Budget& budget) {
+    ranges.clear(); offsets.clear(); accepts.clear(); table.clear();
+    if (Automaton::isEmpty(automaton)) return;
+    std::vector<std::vector<Range>> stateRanges((size_t)automaton.size());
+    accepts = automaton.acceptBits();
+    for (int32_t state = 0; state < automaton.size(); state++) {
+      for (Transition transition : automaton.transitionsFrom(state)) {
+        assert(transition.min >= 0 && transition.max <= 255);
+        assert(transition.dest >= 0 && transition.dest < automaton.size());
+        stateRanges[(size_t)state].push_back({(uint8_t)transition.min, (uint8_t)transition.max, transition.dest});
+        budget.consume();
+      }
+    }
+    offsets.reserve(stateRanges.size() + 1);
+    offsets.push_back(0);
+    for (auto& state : stateRanges) {
+      std::sort(state.begin(), state.end(), [](Range a, Range b) { return a.min < b.min; });
+      for (size_t i = 1; i < state.size(); i++) assert(state[i - 1].max < state[i].min);
+      for (Range range : state) {
+        if (!ranges.empty() && offsets.back() != ranges.size()
+            && ranges.back().dest == range.dest && (int32_t)ranges.back().max + 1 == range.min) {
+          ranges.back().max = range.max;
+        } else ranges.push_back(range);
+      }
+      offsets.push_back((uint32_t)ranges.size());
+    }
+#ifndef NDEBUG
+    std::vector<uint8_t> reachable(accepts.size());
+    std::vector<State> pending{0};
+    reachable[0] = true;
+    for (size_t i = 0; i < pending.size(); i++) {
+      for (const Range& range : makeView().transitions(pending[i])) {
+        if (!reachable[(size_t)range.dest]) {
+          reachable[(size_t)range.dest] = true;
+          pending.push_back(range.dest);
+        }
+      }
+    }
+    for (uint8_t value : reachable) assert(value);
+
+    std::vector<std::vector<State>> reverse(accepts.size());
+    for (State state = 0; state < (State)accepts.size(); state++) {
+      for (const Range& range : makeView().transitions(state)) {
+        reverse[(size_t)range.dest].push_back(state);
+      }
+    }
+    std::vector<uint8_t> coreachable(accepts.size());
+    pending.clear();
+    for (State state = 0; state < (State)accepts.size(); state++) {
+      if (accepts[(size_t)state]) {
+        coreachable[(size_t)state] = true;
+        pending.push_back(state);
+      }
+    }
+    for (size_t i = 0; i < pending.size(); i++) {
+      for (State previous : reverse[(size_t)pending[i]]) {
+        if (!coreachable[(size_t)previous]) {
+          coreachable[(size_t)previous] = true;
+          pending.push_back(previous);
+        }
+      }
+    }
+    for (uint8_t value : coreachable) assert(value);
+#endif
+    if (accepts.size() * 256 * sizeof(int16_t) <= 128 * 1024) {
+      table.assign(accepts.size() * 256, DEAD);
+      for (size_t state = 0; state < accepts.size(); state++) {
+        for (const Range& range : makeView().transitions((State)state)) {
+          for (int32_t byte = range.min; byte <= range.max; byte++) table[state * 256 + (size_t)byte] = (int16_t)range.dest;
+        }
+      }
+      budget.consume((int64_t)accepts.size() * 256);
+    }
+  }
+
+  ByteDfaView freeze(MemPool& pool) const {
+    auto copy = [&]<typename T>(const std::vector<T>& source) -> T* {
+      if (source.empty()) return nullptr;
+      T* destination = pool.make_arr<T>(source.size());
+      std::copy(source.begin(), source.end(), destination);
+      return destination;
+    };
+    Range* copiedRanges = copy(ranges);
+    uint32_t* copiedOffsets = copy(offsets);
+    uint8_t* copiedAccepts = copy(accepts);
+    int16_t* copiedTable = copy(table);
+    return {copiedRanges, copiedOffsets, copiedAccepts, copiedTable, (uint32_t)accepts.size()};
+  }
+
+  State start() const { return makeView().start(); }
+  bool canMatch(State state) const { return makeView().canMatch(state); }
+  bool isMatch(State state) const { return makeView().isMatch(state); }
+  State step(State state, uint8_t byte) const { return makeView().step(state, byte); }
+  int32_t nextLiveByte(State state, int32_t byte) const { return makeView().nextLiveByte(state, byte); }
+  bool matches(std::string_view bytes) const { return makeView().matches(bytes); }
+  size_t size() const { return makeView().size(); }
+  std::span<const Range> transitions(State state) const { return makeView().transitions(state); }
+  std::string commonPrefix() const { return makeView().commonPrefix(); }
+  std::pair<std::string, State> commonPrefixAndState() const { return makeView().commonPrefixAndState(); }
+  Kind classify(std::string* value = nullptr) const { return makeView().classify(value); }
 };
 
 } // namespace solux::automaton

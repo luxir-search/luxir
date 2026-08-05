@@ -11,6 +11,7 @@
 
 #include "solux/analysis/Analyzer.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/AutomatonQuery.h"
 #include "solux/query/ExistsQuery.h"
 #include "solux/query/FuzzyQuery.h"
 #include "solux/query/MatchNoDocsQuery.h"
@@ -24,6 +25,7 @@
 #include "solux/schema/ValCoerce.h"
 #include "solux/util/Clock.h"
 #include "solux/util/StrRef.h"
+#include "solux/util/automaton/WildcardCompiler.h"
 
 namespace solux {
 
@@ -226,6 +228,48 @@ public:
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
+  }
+
+  Query* createWildcardQuery(std::string_view field, std::string_view pattern) {
+    std::string_view originalPattern = pattern;
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    switch (fieldType.type()) {
+      case FieldType::Type::TEXT:
+        pattern = normalizeMultiterm((TextFieldType&)fieldType, field, pattern);
+        break;
+      case FieldType::Type::ID:
+      case FieldType::Type::STRING:
+        break;
+      default:
+        throw std::runtime_error(std::format("Wildcard query on unsupported field type: {}", field));
+    }
+    if (!fieldType.indexed()) {
+      throw std::runtime_error(std::format("Wildcard query requires an indexed field: {}", field));
+    }
+    automaton::ByteDfa compiled;
+    try {
+      automaton::Budget budget;
+      compiled = automaton::compileWildcard(pattern, budget);
+    } catch (const std::runtime_error& e) {
+      throw std::runtime_error(std::format("Wildcard query for field '{}' pattern '{}': {}", field, originalPattern, e.what()));
+    }
+    std::string enumBytes;
+    automaton::ByteDfaKind kind = compiled.classify(&enumBytes);
+    if (kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
+    automaton::ByteDfaView::State initialState = compiled.start();
+    if (kind == automaton::ByteDfaKind::NORMAL) {
+      auto [commonPrefix, state] = compiled.commonPrefixAndState();
+      enumBytes = std::move(commonPrefix);
+      initialState = state;
+    }
+    char* patternCopy = originalPattern.empty() ? nullptr : pool.alloc(originalPattern.size());
+    if (!originalPattern.empty()) memcpy(patternCopy, originalPattern.data(), originalPattern.size());
+    char* enumBytesCopy = enumBytes.empty() ? nullptr : pool.alloc(enumBytes.size());
+    if (!enumBytes.empty()) memcpy(enumBytesCopy, enumBytes.data(), enumBytes.size());
+    auto dfa = compiled.freeze(pool);
+    return pool.make<AutomatonQuery>(field, AutomatonQuery::Kind::WILDCARD,
+        std::string_view(patternCopy, originalPattern.size()), dfa, kind,
+        std::string_view(enumBytesCopy, enumBytes.size()), initialState);
   }
 
   // OpenSearch-style AUTO fuzziness by byte length.

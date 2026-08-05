@@ -153,6 +153,12 @@ solux::Query* ProtobufQueryParser::parsePrefix(const solux::api::PrefixQuery& pr
   return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix);
 }
 
+solux::Query* ProtobufQueryParser::parseWildcard(const solux::api::WildcardQuery& wildcardQuery) {
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings);
+  return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern);
+}
+
 solux::Query* ProtobufQueryParser::parseExists(const solux::api::ExistsQuery& existsQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings);
@@ -431,6 +437,7 @@ solux::Query* ProtobufQueryParser::parse(const solux::api::Query& pquery) {
     [&](const solux::api::Match& m) -> solux::Query* { return parseMatch(m); },
     [&](const solux::api::PhraseQuery& p) -> solux::Query* { return parsePhrase(p); },
     [&](const solux::api::PrefixQuery& p) -> solux::Query* { return parsePrefix(p); },
+    [&](const solux::api::WildcardQuery& w) -> solux::Query* { return parseWildcard(w); },
     [&](const solux::api::ExistsQuery& e) -> solux::Query* { return parseExists(e); },
     [&](const solux::api::RangeQuery& r) -> solux::Query* { return parseRange(r); },
     [&](const solux::api::GeoBoxQuery& g) -> solux::Query* { return parseGeoBox(g); },

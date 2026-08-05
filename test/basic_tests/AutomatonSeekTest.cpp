@@ -29,8 +29,9 @@ std::vector<std::string> collectSmart(TestField& field, const ByteDfa& dfa, int6
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
   TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
-  auto [prefix, state] = dfa.commonPrefixAndState();
-  AutomatonSeekEnum<ByteDfa> e(guard.pool(), terms, prefix, dfa, state);
+  auto view = dfa.view();
+  auto [prefix, state] = view.commonPrefixAndState();
+  AutomatonSeekEnum<ByteDfaView> e(guard.pool(), terms, prefix, view, state);
   std::vector<std::string> out;
   while (e.next()) out.emplace_back(e.termView());
   if (examined != nullptr) *examined = e.termsExamined();
@@ -42,7 +43,7 @@ std::vector<std::string> collectBrute(TestField& field, const ByteDfa& dfa) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
   TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
-  BruteDfaTermsEnum e(terms, dfa);
+  BruteDfaTermsEnum e(terms, dfa.view());
   std::vector<std::string> out;
   while (e.next()) out.emplace_back(e.termView());
   return out;

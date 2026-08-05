@@ -2,6 +2,7 @@
 
 #include <format>
 #include <stdexcept>
+#include <vector>
 
 namespace solux::automaton {
 namespace {
@@ -32,12 +33,22 @@ int32_t decode(std::string_view pattern, size_t& position) {
   return codepoint;
 }
 
+Automaton concatenateBalanced(std::vector<Automaton>& parts, size_t begin, size_t end,
+                              Budget& budget) {
+  if (end - begin == 1) return std::move(parts[begin]);
+  size_t middle = begin + (end - begin) / 2;
+  Automaton left = concatenateBalanced(parts, begin, middle, budget);
+  Automaton right = concatenateBalanced(parts, middle, end, budget);
+  return Automaton::concatenate(left, right, budget);
+}
+
 } // namespace
 
 ByteDfa compileWildcard(std::string_view pattern, Budget& budget) {
   if (pattern.size() > 1000) error("pattern too complex", pattern);
   try {
-    Automaton result = Automaton::epsilon(budget);
+    std::vector<Automaton> parts;
+    parts.reserve(pattern.size());
     for (size_t position = 0; position < pattern.size();) {
       int32_t codepoint = decode(pattern, position);
       Automaton part;
@@ -51,8 +62,10 @@ ByteDfa compileWildcard(std::string_view pattern, Budget& budget) {
       } else {
         part = Automaton::codepoint(codepoint, budget);
       }
-      result = Automaton::concatenate(result, part, budget);
+      parts.push_back(std::move(part));
     }
+    Automaton result = parts.empty() ? Automaton::epsilon(budget)
+                                     : concatenateBalanced(parts, 0, parts.size(), budget);
     return ByteDfa(utf32ToUtf8(result, budget), budget);
   } catch (const std::runtime_error& e) {
     if (std::string_view(e.what()) == "pattern too complex") error("pattern too complex", pattern);
