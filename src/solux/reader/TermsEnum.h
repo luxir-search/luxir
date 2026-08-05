@@ -24,9 +24,6 @@ class TermsEnum {
   const SegFieldInfo& fieldInfo;
 
   PackedTerm currTerm;
-  // currTerm's byte length, kept beside the term instead of re-read from the
-  // length byte the reconstruction just stored.  See termLen().
-  int32_t currTermLen = 0;
   int32_t ordInBlock = -1; // the term number local to the current block
   // Bytes currTerm shares with the term immediately before it, in full-term
   // coordinates.  Only an in-block advance can report a nonzero value; see
@@ -201,7 +198,7 @@ public:
   // Walk local term ordinals and docFreqs without reconstructing term bytes.
   // Stats are bulk-decoded once per term block; the suffix blob is never read.
   // ordInBlock is moved directly so the callback can open postings for the
-  // term it is handed (see StrFacetOp), but term()/termLen() stay on the
+  // term it is handed (see StrFacetOp), but term() stays on the
   // block's first term and the suffix cursor stays at the start of its blob.
   // The enum is therefore left in a state where only ord-indexed accessors are
   // meaningful: callers must not read term() afterwards, and must re-enter
@@ -314,7 +311,6 @@ public:
   /// term (i.e. the moment next() or seek() is called). Make a copy if you wish to keep it!
   /// If called before nextTerm() or seek() is done, returns a 0 length term.
   PackedTerm term() const {
-    assert(currTermLen == (int32_t) currTerm.size());
     return currTerm;
   }
 
@@ -322,10 +318,6 @@ public:
   /// member rather than from the length byte the term reconstruction just
   /// wrote, so per-term consumers do not pay a store-to-load round trip
   /// through the term buffer.
-  int32_t termLen() const {
-    assert(currTermLen == (int32_t) currTerm.size());
-    return currTermLen;
-  }
 
   /// Number of leading bytes term() shares with the term immediately preceding
   /// it in the dictionary, in full-term coordinates.  The block encoding stores
@@ -788,7 +780,6 @@ protected:
     suffixBytesTotal = termsIS.readVint();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
-    currTermLen = (int32_t) startingTerm.size();
     // The block's first term is not delta-coded against anything, so nothing is
     // known to be shared with whatever term preceded it.
     sharedLen = 0;
@@ -853,7 +844,7 @@ protected:
     suffixCursor = suffix + suffixLen;
 
     const char* data = currTerm.data();
-    uint32_t len = (uint32_t) currTermLen;
+    uint32_t len = currTerm.size();
     assert(len == currTerm.size());
     // TODO: things to try:
     // - an explicit loop vs memcpy
@@ -870,8 +861,7 @@ protected:
     assert(prefixLen == factoredLen || data[blockPrefixLen + prefixLen] != *suffix);
 
     memcpy(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
-    currTermLen = (int32_t) (blockPrefixLen + prefixLen + suffixLen);
-    currTerm.setSize((uint32_t) currTermLen);
+    currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
     // Never an over-estimate whatever the build: these bytes were not written
     // just now, they are inherited from the previous term's reconstruction, so
     // the two terms share at least that many.  The assert above upgrades that
