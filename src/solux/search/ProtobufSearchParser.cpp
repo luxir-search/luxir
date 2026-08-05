@@ -366,6 +366,18 @@ public:
       }
       case FieldType::Type::ID:
       case FieldType::Type::STRING: {
+        // A string facet counts term ordinals, so it needs the term dictionary
+        // the ord column indexes into. A column-only field (IndexMode::NONE)
+        // stores values with nothing to take ordinals from; without this the
+        // request reached StrFacetOp and sized its counter from an OrdMap over
+        // a field with no terms - a length_error on debug builds and a
+        // segfault on release. Faceting raw column bytes is a separate feature,
+        // not a degraded form of this one.
+        if (!ftype->indexed()) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': field '"
+              + std::string(facetField) + "' is column-only (not indexed); string facets "
+              "require an indexed field");
+        }
         auto ordMap = req.reader->getOrdMap(facetField);
         facet = solux::arenaCreate<StrFacetOp>(req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, std::move(ordMap));
         break;

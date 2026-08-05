@@ -2152,8 +2152,10 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
 
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   CollectionHelper helper;
-  helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha"), UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("cat_s", "b", "foo_i", 2, "body_w", "beta"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha", "raw_sc", "x"),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 2, "body_w", "beta", "raw_sc", "y"),
+               UpdateMessage::COMMIT);
 
   struct Case {
     std::string name;
@@ -2191,7 +2193,15 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       auto& facet = req.facet("f", "cat_s");
       qb::sort(facet, "first", qb::ASC);
       qb::sort(facet, "second", qb::DESC);
-    }, "multiple sort fields"}
+    }, "multiple sort fields"},
+    // A _sc field is column-stored with no term dictionary, so there are no
+    // ordinals to count. This used to reach StrFacetOp and crash there.
+    {"string_column_only", [](LocalReq& req) {
+      req.facet("f", "raw_sc");
+    }, "column-only (not indexed)"},
+    {"string_column_only_with_subop", [](LocalReq& req) {
+      req.facet("f", "raw_sc").avg("avg", "foo_i");
+    }, "column-only (not indexed)"}
   };
 
   for (const auto& testCase : cases) {
