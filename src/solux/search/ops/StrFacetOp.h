@@ -300,7 +300,14 @@ private:
 
   class MergeableStrFacetInline : public MergeableData {
   public:
-    FacetMap<std::string> counts;
+    // Keyed by GLOBAL term ordinal, which is what makes this mergeable across
+    // segments.  It used to key by the term text, because when the inline path
+    // was written a segment ord was the only ord there was and text was the
+    // only cross-segment-stable key - which cost a dictionary seek and a string
+    // hash for every document counted.  Global ords (OrdMap) removed that
+    // constraint; term text is now resolved once per emitted bucket, in
+    // facetResult2, exactly as the non-inline path does it.
+    FacetMap<int64_t> counts;
     int64_t missing_num = 0; // number of missing values in this segment
     std::vector<SearchOp::InlineCalculator*> inlineCalcs;
     static MergeableStrFacetInline* merge(MergeableStrFacetInline* a, MergeableStrFacetInline* b) {
@@ -486,25 +493,44 @@ public:
         auto poolGuard = MemPool::threadLocalPoolGuard();
 
         FieldReader fieldReader(postingsReader);
-        std::optional<TermsEnum> tenum;
         bool found = fieldReader.seek(thisOp().fieldName);
         if (found) {
           fieldReader.readFieldInfo(segFieldInfo);
-          tenum.emplace(poolGuard.pool(), postingsReader, segFieldInfo);
         }
         if (profile != nullptr) {
           profile->wire.cardinality = found
               ? (thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms)
               : 0;
         }
+        // A null OrdMap means the field has no values in any segment, so the
+        // callback below never fires; the default identity mapping is right for
+        // that case and for a single segment.
+        OrdMap::SegToGlobal mapping;
+        if (thisOp().ordMap) {
+          mapping = thisOp().ordMap->getSegToGlobal(segnum);
+        }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int32_t val)SOLUX_INLINE {
-            tenum->seekOrd(val - 1);
-            std::string_view termView = (std::string_view) tenum->term();
-            data.counts.add((std::string) termView, docid);
-          });
+        if (mapping.bits == 0) {
+          // Identity segment (always so for one segment): local ords ARE global
+          // ords, so the column value is the key with nothing in between.
+          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            [&](int32_t docid, int32_t val)SOLUX_INLINE {
+              data.counts.add((int64_t)val - 1, docid);
+            });
+        } else {
+          // Remapped segment: globalOrd() decodes a delta frame, so it is only
+          // free while consecutive documents stay inside one.  The counting
+          // reps avoid that by tallying local ords and draining once (see
+          // countSegment); doing the same here means a local-keyed FacetMap
+          // drained through the calculators' own merge(), which is worth it if
+          // a multi-segment metric-sorted facet ever shows up hot.
+          OrdMap::SegToGlobal::BulkGlobalOrds mapped(mapping);
+          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            [&](int32_t docid, int32_t val)SOLUX_INLINE {
+              data.counts.add(mapped.globalOrd((int64_t)val - 1), docid);
+            });
+        }
 
         data.missing_num += missing_num;
       });
@@ -1162,7 +1188,10 @@ public:
       auto missing = thisOp().missing;
       mergedData->counts.finalize();
 
-      std::vector<std::pair<std::string, char*>> valVec;
+      // (global ord, entry).  Ties break on the ord rather than the term text,
+      // which is the same rule the non-inline path applies
+      // (sortByCountDescAndLimit over ordCounts) - one bucket order for both.
+      std::vector<std::pair<int64_t, char*>> valVec;
       auto& counts = mergedData->counts.map;
       for (auto& [key, val] : counts) {
         int64_t count = loadUnaligned<int64_t>(val);
@@ -1205,13 +1234,28 @@ public:
         valVec.resize(limit);
       }
 
+      // Term text for the buckets that survived selection, and only those -
+      // ordToStr seeks the dictionary once per bucket instead of once per
+      // counted document.  Its result is valid only until the next call, so
+      // each is copied out; the copies back the string_views handed to result
+      // children below, so they outlive the pool guard.
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
+                          *thisOp().req.reader, thisOp().fieldName);
+      std::vector<std::string> keys;
+      keys.reserve(valVec.size());
+      for (auto [ord, entry] : valVec) {
+        unused(entry);
+        keys.emplace_back(ordMapStr.ordToStr(ord));
+      }
+
       // fill in the facet result proto (non-owning: size known from valVec)
       auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ColStr>();
       size_t n = valVec.size();
       std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
       int64_t* countArr = build::allocArray(facetResultProto.counts, n, mr);
       for (size_t i = 0; i < n; i++) {
-        ids[i] = build::arenaStr(mr, valVec[i].first);  // copy the (transient) string into the arena
+        ids[i] = build::arenaStr(mr, keys[i]);  // copy the (transient) string into the arena
         countArr[i] = loadUnaligned<int64_t>(valVec[i].second);
       }
       if (missing) {
@@ -1232,8 +1276,10 @@ public:
       selectedBuckets.reserve(valVec.size());
       for (size_t i = 0; i < valVec.size(); i++) {
         selectedBuckets.push_back({
-            .key = valVec[i].first,
-            .id = std::nullopt,
+            .key = keys[i],
+            // Now known, and it is what StringFacetColumnSource documents its
+            // bucket ids to be: the global ordinal for this OrdMap epoch.
+            .id = FacetBucketId{valVec[i].first},
             .count = loadUnaligned<int64_t>(valVec[i].second),
             .owner = FacetOwnerSlot{(int32_t)i},
             .output = FacetOutputSlot{(int32_t)i}
