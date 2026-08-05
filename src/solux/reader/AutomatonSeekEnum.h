@@ -104,16 +104,26 @@ protected:
     if (!successor(automaton, {previous, (size_t)previousLen}, stack, previousLiveDepth,
                    successorBuffer, successorLen)) return false;
     std::string_view suffix(successorBuffer, (size_t)successorLen);
-    bool appendZero = successorLen == previousLen + 1
-        && memcmp(successorBuffer, previous, (size_t)previousLen) == 0
-        && (uint8_t)successorBuffer[previousLen] == 0;
-    if (appendZero) return te.nextTerm();
+    // Step before seeking.  Most successors extend the current term by the
+    // automaton's smallest live byte, and the only terms that can sort between
+    // the two continue the current term with a SMALLER byte - usually none at
+    // all - so a single step normally lands at or past the successor and a
+    // seek would only re-find what the step already reached.  Seek on a real
+    // undershoot, which is where the skip earns its cost.
+    if (!te.nextTerm()) return false;
+    // A zero extension has nothing that can sort before it, so automata that
+    // continue on any byte (a leading '.' or '*') skip the comparison too.
+    bool zeroExtension = successorLen == previousLen + 1
+        && (uint8_t)successorBuffer[previousLen] == 0
+        && memcmp(successorBuffer, previous, (size_t)previousLen) == 0;
+    if (zeroExtension) return true;
     char target[PackedTerm::MAX_LEN + 2];
     size_t length = prefix.size() + suffix.size();
     assert(length <= sizeof(target));
     if (!prefix.empty()) memcpy(target, prefix.data(), prefix.size());
     if (!suffix.empty()) memcpy(target + prefix.size(), suffix.data(), suffix.size());
     std::string_view seekTarget(target, length);
+    if ((te.term() <=> seekTarget) >= 0) return true;
     jumpCount++;
     bool exact = te.seekForward(seekTarget);
     if (!exact && (te.term() <=> seekTarget) < 0) {
