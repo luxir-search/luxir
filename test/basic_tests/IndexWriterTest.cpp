@@ -56,8 +56,10 @@ public:
 TEST_F(IndexWriterTest, closeIsIdempotentAndRejectsNewEntryPoints) {
   class NoopUpdate final : public UpdateMessage {
   public:
-    void handle(IndexWriter& iw) override { unused(iw); }
-    void done(IndexWriter& iw) override { unused(iw); }
+    Blocker blocker;
+    bool handled = false;
+    void handle(IndexWriter& iw) override { unused(iw); handled = true; }
+    void done(IndexWriter& iw) override { unused(iw); blocker.notify(); }
   };
 
   RAMDir dir;
@@ -66,8 +68,14 @@ TEST_F(IndexWriterTest, closeIsIdempotentAndRejectsNewEntryPoints) {
   writer.close();
   EXPECT_NO_THROW(writer.close());
 
+  // The graph admits the message and rejects it at the entry node, so it completes
+  // with an error without ever being handled.
   NoopUpdate update;
-  EXPECT_FALSE(writer.submitUpdate(&update));
+  EXPECT_TRUE(writer.submitUpdate(&update));
+  update.blocker.wait();
+  EXPECT_TRUE(update.result.errored());
+  EXPECT_FALSE(update.handled);
+
   EXPECT_THROW(writer.getIndexReader(), IndexWriterClosedError);
   EXPECT_NE(nullptr, heldReader);
 }

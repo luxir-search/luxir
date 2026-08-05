@@ -996,17 +996,14 @@ private:
         };
 
         BlockingUpdateMessage msg(&state->proto);
-        bool success = iw->submitUpdate(&msg);
-        if (!success) throw IndexWriterClosedError("index writer is closed");
+        // A closed writer still admits the message; it comes back errored below.
+        if (!iw->submitUpdate(&msg)) throw std::runtime_error("update was not admitted");
         msg.blocker.wait();
         auto* resp = msg.finishResponse();
         if (!solux::api::write_json(*resp, out)) {
           throw std::runtime_error("failed to serialize update response");
         }
       } catch (const CollectionResolutionError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
-      } catch (const IndexWriterClosedError& e) {
         status = http::status::bad_request;
         out = renderErrorBody(e.what());
       } catch (const std::exception& e) {
@@ -1691,6 +1688,14 @@ private:
     HttpStreamWriterTarget* target = streamWriterTarget(state->batch->collectionName, err);
     if (target == nullptr) {
       failStreamingUpdate("failed to resolve collection '" + state->batch->collectionName + "': " + err);
+      return false;
+    }
+    // The stream holds a cached writer, so a collection deleted mid-stream is only
+    // visible here.  A batch that races the close is instead rejected inside the
+    // graph and folded as a batch error; the batch after it ends the stream here.
+    if (target->indexWriter->isClosed()) {
+      failStreamingUpdate("NDJSON batch rejected: index writer for collection '" +
+                          state->batch->collectionName + "' is closed");
       return false;
     }
 

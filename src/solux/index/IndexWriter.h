@@ -3,7 +3,6 @@
 #include <atomic>
 #include <deque>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <mutex>
 #include <span>
@@ -103,9 +102,9 @@ inline std::string format_as(const SegInfo& seg) {
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
 class IndexWriter {
-  std::mutex closeMutex;
-  std::shared_mutex submissionMutex;
-  bool closed = false;
+  // Set once, never cleared. Read in the graph (startUpdateBody), so close()'s
+  // drain is what orders it - no mutual exclusion needed.  See close().
+  std::atomic<bool> closed = false;
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
 
@@ -357,7 +356,7 @@ public:
   // Only ever advanced from startUpdateBody, whose node has concurrency 1, so the
   // increment needs no lock.  Relaxed atomic solely so stats() can read it while
   // an update is in flight without a formal data race.
-  std::atomic<uint64_t> updateNumber{0};
+  std::atomic<uint64_t> updateNumber = 0;
 
   // Next session-local tag for updateSequencerNode.
   uint64_t updateOrdinal = 0;
@@ -381,7 +380,7 @@ public:
   // Schema generation read from IndexInfo on startup and advanced only after
   // a new commit is durable. Relaxed atomic because segment stamping can read
   // it as a fallback outside indexMutex when no schema provider is installed.
-  std::atomic<uint64_t> schemaGen_{0};
+  std::atomic<uint64_t> schemaGen_ = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // the IndexInfo file.  Read from s.olux at open, mutated only by the commit
@@ -431,7 +430,7 @@ public:
   // using a normal function node would cause buffering.
 
   tbb::flow::graph updateGraph;
-  std::unique_ptr<UpdateMessageFunc> startUpdateNode;
+  std::unique_ptr<UpdateMessageMultiFunc> startUpdateNode;
   std::unique_ptr<UpdateMessageFunc> processUpdateNode;
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > updateSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> updateFinishNode;
@@ -493,19 +492,25 @@ public:
 
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.
+  // A closed writer is not rejected here but in startUpdateNode, which is inside the
+  // graph and hence ordered against close()'s drain; the message completes with an error.
   bool submitUpdate(UpdateMessage* msg) {
-    const std::shared_lock<std::shared_mutex> lock(submissionMutex);
-    if (closed) return false;
     // this is currently a simple submit to the startUpdateNode, but could be more complex in the future.
     // We could also eliminate the startUpdateNode completely and just submit to the processUpdateNode
     // after setting the sequence numbers.
     return startUpdateNode->try_put(msg);
   }
 
+  // Advisory, for callers that would rather give up than submit (a streaming update
+  // holding a cached writer).  Closing is terminal, so false may be stale but true
+  // is final; the rejection that matters happens in the graph.
+  bool isClosed() const {
+    return closed.load(std::memory_order_relaxed);
+  }
+
     // return a copy of the shared_ptr so that the instance it points to will never change while in use.
   std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0) {
-    const std::shared_lock<std::shared_mutex> submissionLock(submissionMutex);
-    if (closed) throw IndexWriterClosedError("index writer is closed");
+    if (isClosed()) throw IndexWriterClosedError("index writer is closed");
     const std::lock_guard<std::mutex> lock(indexReaderMutex);
     bool needNewReader = false;
     if (!indexReader) {
@@ -570,7 +575,12 @@ private:
   };
 
   void startUpdateBody(UpdateMessage& msg) {
-    // if the start node can reject updates, then assigning sequence numbers should be done after that.
+    // Rejection must come before the sequence numbers are assigned: they must stay
+    // dense for the sequencer nodes.  Closing is terminal, so nothing follows a
+    // rejected message to leave stranded anyway.
+    if (closed.load(std::memory_order_relaxed)) {
+      throw IndexWriterClosedError("index writer is closed");
+    }
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
     msg.updateOrdinal = updateOrdinal++;

@@ -634,8 +634,8 @@ static grpc::ByteBuffer doBlockingUpdate(GRPCServer& server, const UpdateReqProt
 
   UpdateRespProto response;
   BlockingUpdateMessage updateMessage(&request, &response);
-  bool success = iw->submitUpdate(&updateMessage);
-  if (!success) throw IndexWriterClosedError("index writer is closed");
+  // A closed writer still admits the message; it comes back errored in the response.
+  if (!iw->submitUpdate(&updateMessage)) throw std::runtime_error("update was not admitted");
   updateMessage.blocker.wait();
   updateMessage.finishResponse();
   return serializeToByteBuffer(response);
@@ -690,7 +690,7 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
     Update* updateMessage = new Update(std::move(request), &call);
     try {
       if (!iw->submitUpdate(updateMessage)) {
-        throw IndexWriterClosedError("index writer is closed");
+        throw std::runtime_error("update was not admitted");
       }
     } catch (...) {
       delete updateMessage;

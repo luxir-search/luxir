@@ -166,11 +166,19 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
   // if necessary before submitting to the actual processing graph.
-  startUpdateNode = std::make_unique<UpdateMessageFunc>(updateGraph, 1,
-    [this](UpdateMessage* msg) -> UpdateMessage* {
-      // exceptions should be impossible here
-      this->startUpdateBody(*msg);
-      return msg;
+  startUpdateNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+    [this](UpdateMessage* msg,
+    UpdateMessageMultiFunc::output_ports_type& op) {
+      try {
+        this->startUpdateBody(*msg);
+      } catch (const std::exception& e) {
+        // Only a closed writer throws here.  The message took no sequence number, so
+        // it must complete here rather than flow on to the sequencer nodes.
+        msg->result.setException(e);
+        msg->done(*this);
+        return;
+      }
+      std::get<0>(op).try_put(msg);
     });
 
   // next, the node to actually process the update, indexing documents, etc.
@@ -200,7 +208,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     });
 
   // connect the update nodes
-  tbb::flow::make_edge(*startUpdateNode, *processUpdateNode);
+  tbb::flow::make_edge(tbb::flow::output_port<0>(*startUpdateNode), *processUpdateNode);
   tbb::flow::make_edge(*processUpdateNode, *updateSequencerNode);
   tbb::flow::make_edge(*updateSequencerNode, *updateFinishNode);
 
@@ -267,15 +275,17 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
 
 IndexWriter::~IndexWriter() {
   close();
+  // A submit racing close() is rejected by startUpdateNode, but that rejection is
+  // still a graph task; wait for it before the nodes are destroyed.
+  updateGraph.wait_for_all();
 }
 
 void IndexWriter::close() {
-  const std::lock_guard<std::mutex> closeLock(closeMutex);
-  {
-    const std::unique_lock<std::shared_mutex> lock(submissionMutex);
-    if (closed) return;
-    closed = true;
-  }
+  // The exchange is just a write barrier publishing `closed`, and picks the single
+  // caller that drains.  startUpdateNode reads the flag inside the graph, so a
+  // message either entered before this and is waited for below, or is rejected
+  // there: no update can reach storage once this returns.
+  if (closed.exchange(true, std::memory_order_release)) return;
 
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
