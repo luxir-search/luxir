@@ -191,6 +191,40 @@ TEST(WildcardTest, errorsAreClean) {
   EXPECT_THROW({ Budget budget(1); compileWildcard("abcdef", budget); }, std::runtime_error);
 }
 
+namespace {
+
+class TestCodepointFolder final : public CodepointFolder {
+public:
+  int32_t fold(int32_t codepoint, int32_t* out, int32_t maxOut) const override {
+    if (maxOut < 2) return -1;
+    if (codepoint == 'A') { out[0] = 'a'; return 1; }
+    if (codepoint == 0xdf) { out[0] = 's'; out[1] = 's'; return 2; }
+    if (codepoint == 0xff0a) { out[0] = '*'; return 1; }
+    if (codepoint == 'x') return 0;
+    out[0] = codepoint;
+    return 1;
+  }
+};
+
+} // namespace
+
+TEST(WildcardTest, literalAtomFolding) {
+  TestCodepointFolder folder;
+  auto compile = [&](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileWildcard(pattern, budget, &folder);
+  };
+  std::string fullwidthStar = utf8(0xff0a);
+  std::string value;
+  EXPECT_EQ(compile(fullwidthStar).classify(&value), ByteDfa::Kind::SINGLE);
+  EXPECT_EQ(value, "*");
+  EXPECT_EQ(compile("*").classify(), ByteDfa::Kind::ALL);
+  EXPECT_EQ(compile(utf8(0xdf) + "*").classify(&value), ByteDfa::Kind::PREFIX);
+  EXPECT_EQ(value, "ss");
+  EXPECT_TRUE(compile("x").matches(""));
+  EXPECT_TRUE(compile("\\" + fullwidthStar).matches("*"));
+}
+
 TEST(RegExpTest, compileSemanticsAndClassification) {
   auto compile = [](std::string_view pattern) { Budget budget(10000000); return compileRegex(pattern, budget); };
   EXPECT_TRUE(compile("(a|b)*c").matches("ababc"));
@@ -214,6 +248,17 @@ TEST(RegExpTest, compileSemanticsAndClassification) {
   EXPECT_EQ(compile("abc").classify(&value), ByteDfa::Kind::SINGLE);
   EXPECT_EQ(compile("abc.*").classify(&value), ByteDfa::Kind::NORMAL);
   EXPECT_EQ(compile("abc(d|e)").classify(&value), ByteDfa::Kind::NORMAL);
+}
+
+TEST(RegExpTest, literalAtomFolding) {
+  TestCodepointFolder folder;
+  Budget budget(10000000);
+  ByteDfa sharpS = compileRegex(utf8(0xdf) + "{2}", budget, &folder);
+  EXPECT_TRUE(sharpS.matches("ssss"));
+  EXPECT_FALSE(sharpS.matches("ss"));
+  EXPECT_FALSE(sharpS.matches("sssss"));
+  Budget escapedBudget(10000000);
+  EXPECT_TRUE(compileRegex("\\A", escapedBudget, &folder).matches("a"));
 }
 
 TEST(RegExpTest, errorsHavePositions) {

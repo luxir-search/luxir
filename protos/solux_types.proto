@@ -359,16 +359,18 @@ message PrefixQuery {
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
-// codepoint, and backslash escapes the next character. TEXT fields normalize
-// the whole pattern; STRING and ID fields use it verbatim.
+// codepoint, and backslash escapes the next character. On TEXT fields, literal
+// characters fold the way the field folds text; `*`, `?`, and escapes are
+// syntax and never fold. STRING and ID fields use bytes verbatim.
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
 }
 
 // Matches an anchored whole indexed term using `|`, concatenation, groups,
-// repetition, `.`, and character classes. `^` and `$` are literals. Patterns
-// are used verbatim for every field type; no multi-term normalization is applied.
+// repetition, `.`, and character classes. `^` and `$` are literals. On TEXT
+// fields, literal characters fold the way the field folds text; character
+// classes and ranges are codepoint-exact. STRING and ID fields use bytes verbatim.
 message RegexQuery {
   string field = 1;
   string pattern = 2;

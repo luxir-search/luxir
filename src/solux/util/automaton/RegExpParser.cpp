@@ -17,6 +17,7 @@ namespace {
 class Parser {
   std::string_view pattern;
   Budget& budget;
+  const CodepointFolder* folder;
   size_t position = 0;
 
   int32_t next() {
@@ -53,6 +54,10 @@ class Parser {
     Automaton left = fold(parts, begin, middle, unionParts);
     Automaton right = fold(parts, middle, end, unionParts);
     return unionParts ? Automaton::unite(left, right, budget) : Automaton::concatenate(left, right, budget);
+  }
+
+  Automaton literal(int32_t codepoint) {
+    return Automaton::literal(codepoint, folder, budget);
   }
 
   Automaton repetition(Automaton a) {
@@ -162,9 +167,9 @@ class Parser {
     if (cp == '.') return Automaton::anyChar(budget);
     if (cp == '\\') {
       if (position == pattern.size()) error("trailing escape", start, pattern);
-      return Automaton::codepoint(next(), budget);
+      return literal(next());
     }
-    return Automaton::codepoint(cp, budget);
+    return literal(cp);
   }
 
   Automaton concat() {
@@ -187,7 +192,8 @@ class Parser {
   }
 
 public:
-  Parser(std::string_view pattern, Budget& budget) : pattern(pattern), budget(budget) {}
+  Parser(std::string_view pattern, Budget& budget, const CodepointFolder* folder)
+      : pattern(pattern), budget(budget), folder(folder) {}
   Automaton parse() {
     Automaton result = unionExpr();
     if (position != pattern.size()) error("unbalanced ')'", position, pattern);
@@ -197,10 +203,10 @@ public:
 
 } // namespace
 
-ByteDfa compileRegex(std::string_view pattern, Budget& budget) {
+ByteDfa compileRegex(std::string_view pattern, Budget& budget, const CodepointFolder* folder) {
   if (pattern.size() > 1000) error("pattern too complex", 1000, pattern);
   try {
-    Parser parser(pattern, budget);
+    Parser parser(pattern, budget, folder);
     return ByteDfa(utf32ToUtf8(parser.parse(), budget), budget);
   } catch (const std::runtime_error& e) {
     if (std::string_view(e.what()) == "pattern too complex") error("pattern too complex", 0, pattern);

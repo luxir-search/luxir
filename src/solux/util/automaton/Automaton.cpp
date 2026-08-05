@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <iterator>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
+
+#include "solux/util/automaton/CodepointFolder.h"
 
 namespace solux::automaton {
 
@@ -96,6 +99,21 @@ Automaton Automaton::anyChar(Budget& budget) {
 
 Automaton Automaton::anyString(Budget& budget) {
   return star(anyChar(budget), budget);
+}
+
+Automaton Automaton::literal(int32_t cp, const CodepointFolder* folder, Budget& budget) {
+  if (folder == nullptr) return codepoint(cp, budget);
+  int32_t folded[32];
+  int32_t count = folder->fold(cp, folded, (int32_t)std::size(folded));
+  if (count < 0 || count > (int32_t)std::size(folded)) {
+    throw std::runtime_error("literal fold returned an invalid codepoint count");
+  }
+  if (count == 0) return epsilon(budget);
+  Automaton result = codepoint(folded[0], budget);
+  for (int32_t i = 1; i < count; i++) {
+    result = concatenate(result, codepoint(folded[i], budget), budget);
+  }
+  return result;
 }
 
 Automaton Automaton::anyStringBytes(Budget& budget) {

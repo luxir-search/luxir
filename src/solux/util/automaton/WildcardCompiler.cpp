@@ -44,7 +44,7 @@ Automaton concatenateBalanced(std::vector<Automaton>& parts, size_t begin, size_
 
 } // namespace
 
-ByteDfa compileWildcard(std::string_view pattern, Budget& budget) {
+ByteDfa compileWildcard(std::string_view pattern, Budget& budget, const CodepointFolder* folder) {
   if (pattern.size() > 1000) error("pattern too complex", pattern);
   try {
     std::vector<Automaton> parts;
@@ -58,9 +58,9 @@ ByteDfa compileWildcard(std::string_view pattern, Budget& budget) {
         part = Automaton::anyChar(budget);
       } else if (codepoint == '\\') {
         if (position == pattern.size()) error("trailing escape in wildcard pattern", pattern);
-        part = Automaton::codepoint(decode(pattern, position), budget);
+        part = Automaton::literal(decode(pattern, position), folder, budget);
       } else {
-        part = Automaton::codepoint(codepoint, budget);
+        part = Automaton::literal(codepoint, folder, budget);
       }
       parts.push_back(std::move(part));
     }

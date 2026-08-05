@@ -44,6 +44,62 @@ class QueryBuilder {
   std::string_view opName;
   std::vector<api::Warning>* warnings;
 
+  // Per-codepoint approximation of field folding for automaton literals.
+  // Combining-sequence patterns may not compose exactly like whole terms.
+  class TextCodepointFolder final : public automaton::CodepointFolder {
+    std::unique_ptr<TokenChain> chain;
+
+    static void appendUtf8(std::string& out, int32_t codepoint) {
+      if (codepoint < 0x80) out.push_back((char)codepoint);
+      else if (codepoint < 0x800) {
+        out.push_back((char)(0xc0 | (codepoint >> 6)));
+        out.push_back((char)(0x80 | (codepoint & 0x3f)));
+      } else if (codepoint < 0x10000) {
+        out.push_back((char)(0xe0 | (codepoint >> 12)));
+        out.push_back((char)(0x80 | ((codepoint >> 6) & 0x3f)));
+        out.push_back((char)(0x80 | (codepoint & 0x3f)));
+      } else {
+        out.push_back((char)(0xf0 | (codepoint >> 18)));
+        out.push_back((char)(0x80 | ((codepoint >> 12) & 0x3f)));
+        out.push_back((char)(0x80 | ((codepoint >> 6) & 0x3f)));
+        out.push_back((char)(0x80 | (codepoint & 0x3f)));
+      }
+    }
+
+  public:
+    TextCodepointFolder(TextFieldType& fieldType, std::string_view field)
+        : chain(fieldType.createAnalyzer(field)) {}
+
+    int32_t fold(int32_t codepoint, int32_t* out, int32_t maxOut) const override {
+      std::string bytes;
+      appendUtf8(bytes, codepoint);
+      chain->normalizeTerm(bytes);
+      int32_t count = 0;
+      for (size_t position = 0; position < bytes.size();) {
+        unsigned char first = bytes[position++];
+        int32_t width = first < 0x80 ? 1 : (first & 0xe0) == 0xc0 ? 2
+            : (first & 0xf0) == 0xe0 ? 3 : (first & 0xf8) == 0xf0 ? 4 : 0;
+        if (width == 0 || position + (size_t)width - 1 > bytes.size()) {
+          throw std::runtime_error("field normalizer returned invalid UTF-8");
+        }
+        int32_t folded = width == 1 ? first : first & ((1 << (7 - width)) - 1);
+        for (int32_t i = 1; i < width; i++) {
+          unsigned char byte = bytes[position++];
+          if ((byte & 0xc0) != 0x80) throw std::runtime_error("field normalizer returned invalid UTF-8");
+          folded = (folded << 6) | (byte & 0x3f);
+        }
+        if ((width == 2 && folded < 0x80) || (width == 3 && folded < 0x800)
+            || (width == 4 && (folded < 0x10000 || folded > 0x10ffff))
+            || (folded >= 0xd800 && folded <= 0xdfff)) {
+          throw std::runtime_error("field normalizer returned invalid UTF-8");
+        }
+        if (count == maxOut) throw std::runtime_error("field normalizer expanded a literal too far");
+        out[count++] = folded;
+      }
+      return count;
+    }
+  };
+
 public:
   static constexpr size_t MAX_PHRASE_SLOTS = 256;
 
@@ -232,21 +288,25 @@ public:
   }
 
   Query* createWildcardQuery(std::string_view field, std::string_view pattern) {
-    std::string_view originalPattern = pattern;
     FieldType& fieldType = *checkAutomatonField("Wildcard", field);
     if (fieldType.type() == FieldType::Type::TEXT) {
-      pattern = normalizeMultiterm((TextFieldType&)fieldType, field, pattern);
+      TextCodepointFolder folder((TextFieldType&)fieldType, field);
+      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field, pattern,
+                                &folder, automaton::compileWildcard);
     }
-    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field,
-                              originalPattern, pattern, automaton::compileWildcard);
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field, pattern,
+                              nullptr, automaton::compileWildcard);
   }
 
-  // Regex patterns are verbatim on every field type; normalizing inside the
-  // operator syntax is not well-defined.
   Query* createRegexQuery(std::string_view field, std::string_view pattern) {
-    checkAutomatonField("Regex", field);
-    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field,
-                              pattern, pattern, automaton::compileRegex);
+    FieldType& fieldType = *checkAutomatonField("Regex", field);
+    if (fieldType.type() == FieldType::Type::TEXT) {
+      TextCodepointFolder folder((TextFieldType&)fieldType, field);
+      return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field, pattern,
+                                &folder, automaton::compileRegex);
+    }
+    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field, pattern,
+                              nullptr, automaton::compileRegex);
   }
 
 private:
@@ -274,16 +334,17 @@ private:
   }
 
   Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view label,
-                            std::string_view field, std::string_view originalPattern,
-                            std::string_view compiledPattern,
-                            automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&)) {
+                            std::string_view field, std::string_view pattern,
+                            const automaton::CodepointFolder* folder,
+                            automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                                          const automaton::CodepointFolder*)) {
     automaton::ByteDfa compiled;
     try {
       automaton::Budget budget;
-      compiled = compile(compiledPattern, budget);
+      compiled = compile(pattern, budget, folder);
     } catch (const std::runtime_error& e) {
       throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
-                                           label, field, originalPattern, e.what()));
+                                           label, field, pattern, e.what()));
     }
     std::string enumBytes;
     automaton::ByteDfaKind kind = compiled.classify(&enumBytes);
@@ -294,7 +355,7 @@ private:
       enumBytes = std::move(commonPrefix);
       initialState = state;
     }
-    return pool.make<AutomatonQuery>(field, queryKind, poolCopy(originalPattern),
+    return pool.make<AutomatonQuery>(field, queryKind, poolCopy(pattern),
         compiled.freeze(pool), kind, poolCopy(enumBytes), initialState);
   }
 
