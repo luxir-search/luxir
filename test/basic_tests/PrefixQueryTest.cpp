@@ -338,6 +338,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     EXPECT_EQ(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
   }
 
+  // Conjunction-driven consumption (finite leadCost) keeps the lazy union.
   {
     ScorerModeGuard guard(ScorerMode::AUTO);
     MemPool pool;
@@ -347,8 +348,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto* supplier = weight->scorerSupplier(pool, segment);
     auto* scorer = supplier->get(pool, 1);
-    ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
-    EXPECT_EQ(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
+    ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
   }
 
   // Unscored contexts stay eager no matter which mode is forced.

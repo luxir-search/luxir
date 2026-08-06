@@ -75,8 +75,8 @@ public:
   public:
     // Test/bench force switch over the constant-score union scorers. AUTO is
     // the production policy; the forced modes bind only where the lazy
-    // preconditions hold (scored + pruning + self-driven), everything else
-    // stays eager.
+    // preconditions hold (scored + pruning, self-driven or conjunction
+    // driven), everything else stays eager.
     enum class ScorerMode : uint8_t { AUTO, FORCE_EAGER, FORCE_WINDOWED, FORCE_HEAP };
     static inline ScorerMode scorerModeForTests = ScorerMode::AUTO;
 
@@ -213,9 +213,12 @@ public:
       int64_t cost() override { return segment.maxDoc(); }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        bool selfDriven = leadCost == std::numeric_limits<int64_t>::max();
-        return weight.createScorerForMode(
-            targetPool, segment, weight.canUseLazy && selfDriven);
+        // Driven consumption keeps the lazy union: windows fill only at
+        // probed docids, and the returned next-union doc is a skip fence for
+        // the driver's probe loop, so a sparse or pruning lead never pays
+        // for the unvisited remainder the eager build materializes up front.
+        unused(leadCost);
+        return weight.createScorerForMode(targetPool, segment, weight.canUseLazy);
       }
     };
 

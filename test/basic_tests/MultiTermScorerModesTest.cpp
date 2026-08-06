@@ -213,6 +213,38 @@ TEST_F(MultiTermScorerModesTest, stateBudgetSpillsToEager) {
   MultiTermQuery::Weight::maxLazyStateBytes = saved;
 }
 
+// A conjunction-driven supplier (finite leadCost) keeps the lazy union;
+// unscored and non-pruning contexts stay eager.
+TEST_F(MultiTermScorerModesTest, drivenSupplierSelection) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+
+  struct Expect {
+    int32_t flags;
+    bool lazy;
+  };
+  for (auto [flags, lazy] :
+       {Expect{Query::NEED_SCORES | Query::ALLOW_PRUNING, true},
+        Expect{Query::NEED_SCORES, false},
+        Expect{0, false}}) {
+    ScorerModeGuard guard(ScorerMode::AUTO);
+    auto g = ti.pool.rewindScopeGuard();
+    PrefixQuery pq("body_w", "q");
+    Query::Context ctx(ti.pool, *ti.reader);
+    auto* weight = pq.createWeight(ctx, flags);
+    auto* supplier =
+        weight->scorerSupplier(ti.pool, ctx.topReader.segments()[0]);
+    ASSERT_NE(supplier, nullptr);
+    auto* scorer = supplier->get(ti.pool, 100);  // driven: finite leadCost
+    ASSERT_NE(scorer, nullptr);
+    EXPECT_EQ(lazy, dynamic_cast<UnionLazyScorer*>(scorer) != nullptr)
+        << "flags=" << flags;
+    EXPECT_EQ(!lazy, dynamic_cast<MultiTermQuery::Scorer*>(scorer) != nullptr)
+        << "flags=" << flags;
+  }
+}
+
 // firstDocLowerBound is a lower bound for every term and exact below the
 // full-block threshold, across pulsed, tail, and packed postings.
 TEST_F(MultiTermScorerModesTest, firstDocLowerBound) {
