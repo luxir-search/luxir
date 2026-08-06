@@ -43,17 +43,19 @@ protected:
   }
 };
 
-class LazyMultiTermGuard {
-  bool saved;
+using ScorerMode = MultiTermQuery::Weight::ScorerMode;
+
+class ScorerModeGuard {
+  ScorerMode saved;
 
 public:
-  explicit LazyMultiTermGuard(bool disabled)
-    : saved(MultiTermQuery::Weight::disableLazyMultiTermForTests) {
-    MultiTermQuery::Weight::disableLazyMultiTermForTests = disabled;
+  explicit ScorerModeGuard(ScorerMode mode)
+    : saved(MultiTermQuery::Weight::scorerModeForTests) {
+    MultiTermQuery::Weight::scorerModeForTests = mode;
   }
 
-  ~LazyMultiTermGuard() {
-    MultiTermQuery::Weight::disableLazyMultiTermForTests = saved;
+  ~ScorerModeGuard() {
+    MultiTermQuery::Weight::scorerModeForTests = saved;
   }
 };
 
@@ -89,9 +91,9 @@ static void buildSparsePrefixIndex(TestIndex& ti) {
 }
 
 static std::vector<TopDocsCollector::ScoreDoc> runPrefixTopK(
-    TestIndex& ti, int32_t k, bool disableLazy, bool conjunction = false,
+    TestIndex& ti, int32_t k, ScorerMode mode, bool conjunction = false,
     bool allowPruning = true) {
-  LazyMultiTermGuard guard(disableLazy);
+  ScorerModeGuard guard(mode);
   PrefixQuery prefix("foo_w", "pre");
   TermQuery common("foo_w", "common");
   Query* required[] = {&prefix, &common};
@@ -132,9 +134,9 @@ struct PrefixDecodeRun {
 };
 
 static PrefixDecodeRun runPrefixDecode(
-    TestIndex& ti, bool disableLazy, bool allowPruning,
+    TestIndex& ti, ScorerMode mode, bool allowPruning,
     bool conjunction = false, int64_t topCount = 10) {
-  LazyMultiTermGuard lazyGuard(disableLazy);
+  ScorerModeGuard modeGuard(mode);
   SkipStatsGuard statsGuard;
   PrefixQuery prefix("foo_w", "pre");
   TermQuery early("foo_w", "preearly");
@@ -256,25 +258,30 @@ TEST_F(PrefixQueryTest, lazyScoredPathMatchesMaterialized) {
   buildSparsePrefixIndex(ti);
 
   for (int32_t k : {5, 15, 30}) {
-    auto materialized = runPrefixTopK(ti, k, true);
-    auto lazy = runPrefixTopK(ti, k, false);
+    auto materialized = runPrefixTopK(ti, k, ScorerMode::FORCE_EAGER);
+    auto lazy = runPrefixTopK(ti, k, ScorerMode::AUTO);
+    auto heap = runPrefixTopK(ti, k, ScorerMode::FORCE_HEAP);
     expectSamePrefixTopK(materialized, lazy);
+    expectSamePrefixTopK(materialized, heap);
   }
 
-  auto materializedConjunction = runPrefixTopK(ti, 4, true, true);
-  auto lazyConjunction = runPrefixTopK(ti, 4, false, true);
+  auto materializedConjunction =
+      runPrefixTopK(ti, 4, ScorerMode::FORCE_EAGER, true);
+  auto lazyConjunction = runPrefixTopK(ti, 4, ScorerMode::AUTO, true);
   expectSamePrefixTopK(materializedConjunction, lazyConjunction);
-  expectSamePrefixTopK(runPrefixTopK(ti, 5, false, false, false),
-                       runPrefixTopK(ti, 5, false));
-  expectSamePrefixTopK(runPrefixTopK(ti, 4, false, true, false),
+  expectSamePrefixTopK(runPrefixTopK(ti, 4, ScorerMode::FORCE_HEAP, true),
+                       lazyConjunction);
+  expectSamePrefixTopK(runPrefixTopK(ti, 5, ScorerMode::AUTO, false, false),
+                       runPrefixTopK(ti, 5, ScorerMode::AUTO));
+  expectSamePrefixTopK(runPrefixTopK(ti, 4, ScorerMode::AUTO, true, false),
                        lazyConjunction);
 
-  auto first = runPrefixTopK(ti, 15, false);
-  auto second = runPrefixTopK(ti, 15, false);
+  auto first = runPrefixTopK(ti, 15, ScorerMode::AUTO);
+  auto second = runPrefixTopK(ti, 15, ScorerMode::AUTO);
   expectSamePrefixTopK(first, second);
 
-  auto top10 = runPrefixTopK(ti, 10, false);
-  auto top1000 = runPrefixTopK(ti, 1000, false);
+  auto top10 = runPrefixTopK(ti, 10, ScorerMode::AUTO);
+  auto top1000 = runPrefixTopK(ti, 1000, ScorerMode::AUTO);
   ASSERT_EQ(10u, top10.size());
   ASSERT_GE(top1000.size(), top10.size());
   expectSamePrefixTopK(top10, std::span(top1000).first(top10.size()));
@@ -286,7 +293,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
   auto& segment = ti.reader->segments()[0];
 
   {
-    LazyMultiTermGuard guard(false);
+    ScorerModeGuard guard(ScorerMode::AUTO);
     MemPool pool;
     Query::Context context(pool, *ti.reader);
     PrefixQuery prefix("foo_w", "pre");
@@ -303,7 +310,23 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
   }
 
   {
-    LazyMultiTermGuard guard(false);
+    ScorerModeGuard guard(ScorerMode::FORCE_HEAP);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    PrefixQuery prefix("foo_w", "pre");
+    auto* weight = prefix.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    ASSERT_NE(dynamic_cast<MultiTermQuery::HeapScorer*>(scorer), nullptr);
+    EXPECT_EQ(0, scorer->next());
+    scorer->setMinCompetitiveScore(
+        std::nextafter(1.0f, std::numeric_limits<float>::infinity()));
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+
+  {
+    ScorerModeGuard guard(ScorerMode::AUTO);
     MemPool pool;
     Query::Context context(pool, *ti.reader);
     PrefixQuery prefix("foo_w", "pre");
@@ -316,7 +339,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
   }
 
   {
-    LazyMultiTermGuard guard(false);
+    ScorerModeGuard guard(ScorerMode::AUTO);
     MemPool pool;
     Query::Context context(pool, *ti.reader);
     PrefixQuery prefix("foo_w", "pre");
@@ -328,8 +351,10 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
   }
 
-  for (bool disableLazy : {false, true}) {
-    LazyMultiTermGuard guard(disableLazy);
+  // Unscored contexts stay eager no matter which mode is forced.
+  for (ScorerMode mode : {ScorerMode::AUTO, ScorerMode::FORCE_EAGER,
+                          ScorerMode::FORCE_HEAP}) {
+    ScorerModeGuard guard(mode);
     MemPool pool;
     Query::Context context(pool, *ti.reader);
     PrefixQuery prefix("foo_w", "pre");
@@ -343,8 +368,9 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     EXPECT_EQ(15, count);
   }
 
-  for (bool disableLazy : {false, true}) {
-    LazyMultiTermGuard guard(disableLazy);
+  for (ScorerMode mode : {ScorerMode::AUTO, ScorerMode::FORCE_EAGER,
+                          ScorerMode::FORCE_HEAP}) {
+    ScorerModeGuard guard(mode);
     PrefixQuery prefix("foo_w", "pre");
     ConstantScoreQuery constant(&prefix, 2.5f);
     MemPool pool;
@@ -362,7 +388,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
   }
 }
 
-TEST_F(PrefixQueryTest, lazyCrossoverKeepsHugeExpansionMaterialized) {
+TEST_F(PrefixQueryTest, lazyCrossoverRoutesHugeExpansionToHeap) {
   TestIndex ti;
   TestField field(ti, "foo_w");
   field.startIndexing();
@@ -374,20 +400,29 @@ TEST_F(PrefixQueryTest, lazyCrossoverKeepsHugeExpansionMaterialized) {
   ti.flush();
   field.startReading();
 
-  LazyMultiTermGuard guard(false);
-  MemPool pool;
-  Query::Context context(pool, *ti.reader);
-  PrefixQuery prefix("foo_w", "pre");
-  auto* scorer = prefix.createWeight(
-      context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
-      ->createScorer(pool, context.topReader.segments()[0]);
-  ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
-  EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
-  int32_t count = 0;
-  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
-    count++;
+  // Past the term cap AUTO routes to the heap scorer; every term here is a
+  // pulsed single-doc term, so full iteration drives the pulsed-heavy path
+  // to exhaustion.
+  for (ScorerMode mode : {ScorerMode::AUTO, ScorerMode::FORCE_WINDOWED}) {
+    ScorerModeGuard guard(mode);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    PrefixQuery prefix("foo_w", "pre");
+    auto* scorer = prefix.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
+        ->createScorer(pool, context.topReader.segments()[0]);
+    if (mode == ScorerMode::AUTO) {
+      ASSERT_NE(dynamic_cast<MultiTermQuery::HeapScorer*>(scorer), nullptr);
+    } else {
+      // The forced windowed arm has no term cap.
+      ASSERT_NE(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    }
+    int32_t count = 0;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      count++;
+    }
+    EXPECT_EQ(termCount, count);
   }
-  EXPECT_EQ(termCount, count);
 }
 
 TEST_F(PrefixQueryTest, lazyRoutingPinsPruningLeadAndDecodeVolume) {
@@ -406,16 +441,22 @@ TEST_F(PrefixQueryTest, lazyRoutingPinsPruningLeadAndDecodeVolume) {
   ti.flush();
   field.startReading();
 
-  auto eager = runPrefixDecode(ti, true, true);
-  auto lazy = runPrefixDecode(ti, false, true);
-  auto exactCount = runPrefixDecode(ti, false, false);
-  auto exactCountKnob = runPrefixDecode(ti, true, false);
-  auto driven = runPrefixDecode(ti, false, true, true);
-  auto drivenKnob = runPrefixDecode(ti, true, true, true);
-  auto lazyUnfilled = runPrefixDecode(ti, false, true, false, docCount + 1);
-  auto eagerUnfilled = runPrefixDecode(ti, true, true, false, docCount + 1);
+  auto eager = runPrefixDecode(ti, ScorerMode::FORCE_EAGER, true);
+  auto lazy = runPrefixDecode(ti, ScorerMode::AUTO, true);
+  auto heap = runPrefixDecode(ti, ScorerMode::FORCE_HEAP, true);
+  auto exactCount = runPrefixDecode(ti, ScorerMode::AUTO, false);
+  auto exactCountKnob = runPrefixDecode(ti, ScorerMode::FORCE_EAGER, false);
+  auto driven = runPrefixDecode(ti, ScorerMode::AUTO, true, true);
+  auto drivenKnob = runPrefixDecode(ti, ScorerMode::FORCE_EAGER, true, true);
+  auto lazyUnfilled =
+      runPrefixDecode(ti, ScorerMode::AUTO, true, false, docCount + 1);
+  auto eagerUnfilled =
+      runPrefixDecode(ti, ScorerMode::FORCE_EAGER, true, false, docCount + 1);
 
   expectSamePrefixTopK(eager.docs, lazy.docs);
+  expectSamePrefixTopK(eager.docs, heap.docs);
+  EXPECT_EQ(10, heap.hits);
+  EXPECT_LE(heap.blocks, eager.blocks);
   expectSamePrefixTopK(eager.docs, exactCount.docs);
   expectSamePrefixTopK(exactCount.docs, exactCountKnob.docs);
   expectSamePrefixTopK(driven.docs, drivenKnob.docs);

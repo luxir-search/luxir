@@ -3509,6 +3509,37 @@ public:
 
   BasicDocsEnum(const BasicDocsEnum&) = delete;
 
+  // Cheap lower bound on the first doc of a term's postings: no enum
+  // construction, no block decode. Exact for pulsed terms and for terms
+  // whose docs fit one StreamVByte tail (docFreq < DOCS_BLOCK_SIZE); terms
+  // with full blocks return 0, since reaching their first doc would mean
+  // unpacking part of a coded block.
+  static int32_t firstDocLowerBound(const TermsEnum::PostingsState& state) {
+    if (state.docsEnd == state.docsStart) {
+      assert(state.pulsedDoc >= 0);
+      return state.pulsedDoc;
+    }
+    if (state.docFreq >= Postings::DOCS_BLOCK_SIZE) {
+      return 0;
+    }
+    // One StreamVByte tail: [group header][L0 header][keys][data], docs d1
+    // coded from base 0, so the first coded value is the first doc.
+    InputStream is = state.docIS;
+    auto groupHeaderLen = is.readVint();
+    is.skip(groupHeaderLen);
+    auto headerLen = is.readVint();
+    is.skip(headerLen);
+    const uint8_t* keys = (const uint8_t*) is.ptr();
+    const uint8_t* data = keys + svbKeyBytes((uint32_t) state.docFreq);
+    const int32_t len = (keys[0] & 3) + 1;
+    assert((const char*) (data + len) <= is.ptr() + is.left());
+    uint32_t doc = 0;
+    for (int32_t i = 0; i < len; i++) {
+      doc |= (uint32_t) data[i] << (8 * i);
+    }
+    return (int32_t) doc;
+  }
+
   int32_t docId() const { return docid; }
 
   int32_t next() { return nextDoc(); }
