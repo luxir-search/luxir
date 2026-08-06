@@ -70,9 +70,11 @@ enum class FacetFeedStrategy {
 // directly.  This one still ends at bucket domains; only their construction
 // changes, so every result child benefits without knowing about it.
 //
-// ORD_COLUMN skips the bucket-count ceiling AUTO applies for peak memory
-// (StrFacetBucketDomainPlan::MAX_BUCKETS): forcing it on a request that returns
-// enormously many buckets builds a domain for every one of them.
+// ORD_COLUMN skips the residency budget AUTO applies
+// (StrFacetBucketDomainPlan::MAX_BYTES): the ord column holds one DocSet per
+// bucket per segment where postings holds one in total, so forcing it on a
+// request that returns enormously many buckets, over many segments, or over a
+// large domain builds the whole table regardless of what it costs.
 enum class FacetBucketDomainSource {
   AUTO, POSTINGS, ORD_COLUMN
 };

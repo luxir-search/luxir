@@ -1460,7 +1460,7 @@ public:
                 == FacetBucketDomainSource::ORD_COLUMN
             || StrFacetBucketDomainPlan::ordColumnBeatsPostings(
                    cost.domainDocs, cost.selectedDocs, cost.maxDocs,
-                   (int64_t)buckets.size());
+                   (int64_t)buckets.size(), (int64_t)input.size());
       }
 
       if (profileRun != nullptr) {

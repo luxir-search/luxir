@@ -234,6 +234,32 @@ TEST_F(FacetTest, stringReplayAutoUsesMeasuredDominanceRegion) {
       10, 100'001, 5'000, 5'000'000));
 }
 
+// The ord-column construction holds one DocSet per bucket PER SEGMENT, where
+// postings holds one in total, so what has to be bounded is that table's size -
+// not the bucket count, which cannot see the segment or domain axes at all.
+TEST_F(FacetTest, bucketDomainResidencyIsBoundedOnEveryAxis) {
+  using Plan = StrFacetBucketDomainPlan;
+  // Coverage strongly favours the column: a 3,000-document domain whose ten
+  // returned buckets hold all of it, out of 300,000 documents.
+  auto favourable = [](int64_t numBuckets, int64_t numSegments,
+                       int64_t domainDocs) {
+    return Plan::ordColumnBeatsPostings(domainDocs, domainDocs, 300'000,
+                                        numBuckets, numSegments);
+  };
+  EXPECT_TRUE(favourable(10, 1, 3'000));
+  EXPECT_TRUE(favourable(1'024, 50, 3'000));  // 6.5MB of table is affordable
+
+  // Each axis alone can exhaust the budget, at the same favourable coverage.
+  EXPECT_FALSE(favourable(2'000'000, 1, 3'000));   // buckets
+  EXPECT_FALSE(favourable(1'024, 1'000, 3'000));   // segments
+  EXPECT_FALSE(favourable(10, 1, 20'000'000));     // domain doc ids
+
+  // And the estimate itself, which a request-wide budget would price against.
+  EXPECT_EQ((__int128)10 * 1 * Plan::BYTES_PER_DOMAIN
+                + (__int128)3'000 * Plan::BYTES_PER_DOC,
+            Plan::bucketDomainBytes(10, 1, 3'000));
+}
+
 TEST_F(FacetTest, stringReplayCounterBanksMatchAcrossRepresentations) {
   for (auto strategy : {StrFacetReplayBankStrategy::VECTOR,
                         StrFacetReplayBankStrategy::SKINNY,

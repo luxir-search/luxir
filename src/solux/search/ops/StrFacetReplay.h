@@ -90,18 +90,44 @@ struct StrFacetBucketDomainPlan {
   // that fixed costs are all that is left.  The one cell in [2,3) loses 1.28x
   // and the cells at [4,5.3] win 1.22-1.25x, so the crossover is just under 3.
   static constexpr int64_t MARGIN = 3;
-  // The column pass builds every bucket's domain at once, so it holds
-  // numBuckets x numSegments DocSets where postings holds one.  The seek term
-  // above grows without bound in the bucket count and would otherwise recommend
-  // the column for exactly the enormous bucket counts whose peak memory it
-  // cannot afford.  Same ceiling as the nested-facet replay's owner count, for
-  // the same reason.
-  static constexpr int64_t MAX_BUCKETS = 1'024;
+  // One DocSet per (bucket, segment), allocated whether or not it holds
+  // anything: an ArrDocSet, the separate shared_ptr control block DomainHandle
+  // makes for it, their allocator headers, and the handle slot itself.
+  static constexpr int64_t BYTES_PER_DOMAIN = 128;
+  // Doc ids, as an upper bound across BOTH representations.  A builder promotes
+  // to a bitset at maxDoc/32 documents, exactly where the array it replaces
+  // would have cost maxDoc/8 bytes, and the bitset stays flat as more documents
+  // land in it - so 4 bytes per domain document is never exceeded by the bitset
+  // arm.  Transient vector growth slack (up to 2x on the array arm, before
+  // build() shrinks to fit) is not modelled.
+  static constexpr int64_t BYTES_PER_DOC = 4;
+  // What one request may hold in bucket domains.  Same budget the replay bank
+  // uses for its flat counters.
+  static constexpr int64_t MAX_BYTES = 64 * 1024 * 1024;
+
+  // Peak bytes the ord-column construction holds, which is also what it costs
+  // OVER postings: postings materializes one bucket domain at a time and
+  // discards it, so its peak is a single DocSet whatever the bucket count.
+  // Split out from the rule below so a request-wide memory budget can price the
+  // construction without asking whether it is the faster one.
+  static __int128 bucketDomainBytes(int64_t numBuckets, int64_t numSegments,
+                                    int64_t domainDocs) {
+    return (__int128)numBuckets * numSegments * BYTES_PER_DOMAIN
+        + (__int128)domainDocs * BYTES_PER_DOC;
+  }
 
   static bool ordColumnBeatsPostings(int64_t domainDocs, int64_t selectedDocs,
-                                     int64_t maxDocs, int64_t numBuckets) {
+                                     int64_t maxDocs, int64_t numBuckets,
+                                     int64_t numSegments) {
     if (domainDocs <= 0 || maxDocs <= 0 || numBuckets <= 0) return false;
-    if (numBuckets > MAX_BUCKETS) return false;
+    // Refuse on memory before pricing speed.  The seek term below grows without
+    // bound in the bucket count and would otherwise recommend the column for
+    // exactly the bucket counts whose residency it cannot afford - and the
+    // bucket count alone does not see it, because the table grows with the
+    // segment count and the domain too.
+    if (bucketDomainBytes(numBuckets, numSegments, domainDocs) > MAX_BYTES) {
+      return false;
+    }
     __int128 postingsRead =
         (__int128)selectedDocs * maxDocs / domainDocs
         + (__int128)numBuckets * SEEK_DOC_EQUIVALENT;
