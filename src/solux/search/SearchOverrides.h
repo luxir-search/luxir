@@ -23,6 +23,12 @@ inline bool disableTopDocsFilterFold = false;
 // A/B baseline for unscored field-sort match-window collection.
 inline bool disableFieldSortBulk = false;
 
+// A/B baseline for field-sort competitive block pruning. Default false means
+// zone-based pruning runs wherever the primary sort clause offers block key
+// bounds and the request needs no exact count or domain.
+inline bool disableFieldSortPruning =
+    std::getenv("SOLUX_DISABLE_FIELD_SORT_PRUNING") != nullptr;
+
 // A/B baseline for exact-count score ranking. The default composes an
 // unscored exact-count pass with a competitively pruned top-k pass when the
 // query and per-segment density policy admit it.

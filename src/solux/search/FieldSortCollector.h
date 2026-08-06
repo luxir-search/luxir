@@ -334,6 +334,62 @@ public:
     }
   }
 
+  struct CompetitiveRange {
+    int32_t begin;
+    int32_t end;
+  };
+
+  // Competitive-range source for pruned collection. Returns the next doc range
+  // at or after `from` that the primary clause's block key bounds cannot prove
+  // noncompetitive. begin == PostingsReader::END means no remaining doc in this
+  // segment can enter the heap. The range end is only a re-consult hint (the
+  // next key-block boundary), never a claim about docs beyond it.
+  //
+  // Skip rules (smaller transformed key = better):
+  // - A block whose best key is worse than the heap bottom's primary key can
+  //   never contribute (secondary clauses cannot rescue a strictly worse
+  //   primary).
+  // - Equal-to-bottom blocks are skipped only for a sole-clause sort, and only
+  //   when the block's first unseen segdoc loses the tie-break against the
+  //   bottom's segdoc. The segdoc guard is required: collectors are reused
+  //   across segments and segments are not always visited in order, so a later
+  //   candidate does NOT always lose an equal-key tie.
+  // - Missing-value sentinels are treated as ordinary keys (the comparator
+  //   already ranks a real extreme and the sentinel as equal); a sentinel
+  //   bottom simply proves nothing strictly, which is automatically safe.
+  CompetitiveRange nextCompetitiveRange(int32_t segment, int32_t from) const {
+    FieldComparator::KeyBatch* batch = nullptr;
+    int32_t blockSize = 0;
+    if (topCount > 0 && !disableKeyGatherForTests
+        && clauses[0].comparator != nullptr
+        && (batch = clauses[0].comparator->keyBatch()) != nullptr) {
+      blockSize = batch->keyBlockSize();
+    }
+    if (blockSize == 0) return {from, PostingsReader::END};
+
+    int64_t block = (int64_t)from / blockSize;
+    int64_t blockCount = batch->keyBlockCount();
+    if (pq->size() < (size_t)topCount) {
+      // No bound yet; re-consult at the next block boundary.
+      return {from, blockEnd(block, blockSize)};
+    }
+    int64_t bottomKey = batch->slotKeys[pq->top().slot];
+    segdoc bottomDoc = pq->top().doc;
+    bool soleSort = clauses.size() == 1;
+    int32_t doc = from;
+    for (; block < blockCount; block++) {
+      int64_t best = batch->blockBestKey(block);
+      bool skip = best > bottomKey
+          || (best == bottomKey && soleSort
+              && segdoc(segment, doc) >= bottomDoc);
+      if (!skip) break;
+      skipCount(SkipStats::fieldSortBlocksSkipped);
+      doc = blockEnd(block, blockSize);
+    }
+    if (block >= blockCount) return {PostingsReader::END, PostingsReader::END};
+    return {doc, blockEnd(block, blockSize)};
+  }
+
   void collectWindow(int32_t segment, std::span<const int32_t> docs) {
     FieldComparator::KeyBatch* batch = nullptr;
     if (disableKeyGatherForTests || soleColumn == nullptr
@@ -381,6 +437,11 @@ public:
   }
 
 private:
+  static int32_t blockEnd(int64_t block, int32_t blockSize) {
+    return (int32_t)std::min<int64_t>((block + 1) * blockSize,
+                                      (int64_t)PostingsReader::END);
+  }
+
   SOLUX_NOINLINE void warmup(segdoc doc, float score) {
     int32_t slot = (int32_t)pq->size();
     copy(slot, doc, score);

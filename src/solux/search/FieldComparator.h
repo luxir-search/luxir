@@ -37,6 +37,18 @@ public:
     // Gather transformed keys for ascending in-segment docs.
     virtual void gatherKeys(std::span<const int32_t> docs,
                             std::span<int64_t> keys) = 0;
+
+    // Optional block-granular pruning bounds over the current segment. A
+    // nonzero size means doc d reads its key from block d / keyBlockSize()
+    // and blockBestKey(b) lower-bounds the transformed key of every doc in
+    // block b. Zero means no per-block bounds (collection stays exhaustive).
+    virtual int32_t keyBlockSize() const { return 0; }
+    virtual int64_t keyBlockCount() const { return 0; }
+    virtual int64_t blockBestKey(int64_t block) const {
+      unused(block);
+      assert(false);
+      return std::numeric_limits<int64_t>::min();
+    }
   };
 
   virtual ~FieldComparator() = default;
@@ -218,6 +230,23 @@ public:
 
   FieldComparator::KeyBatch* keyBatch() override {
     return this;
+  }
+
+  // Dense single-valued columns map doc == value rank, so the per-4096-value
+  // zone maps are exact per-doc-block key bounds. Sparse and multi-valued
+  // columns mix ranks and docs, so no bounds are offered there.
+  int32_t keyBlockSize() const override {
+    if (!reader.has_value() || multiValued || docsIter.has_value()) return 0;
+    return (int32_t)NumColumnFormat::BLOCK_SIZE;
+  }
+
+  int64_t keyBlockCount() const override {
+    return reader->numBlocks();
+  }
+
+  int64_t blockBestKey(int64_t block) const override {
+    NumBlockZone zone = reader->blockZone(block);
+    return sortMultiplier < 0 ? ~zone.max : zone.min;
   }
 
   void gatherKeys(std::span<const int32_t> docs,

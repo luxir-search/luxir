@@ -599,6 +599,12 @@ public:
           if (counted) {
             // fall through to the sub-calc/merge tail below
           } else if (data->useFieldSort) {
+            // Competitive block pruning skips (and cannot count) noncompetitive
+            // docs, so it is off whenever the request needs an exact hit count
+            // or a materialized domain.
+            bool allowSortPruning = !disableFieldSortPruning
+                && !op.requirements.needExactCount
+                && builderPtr == nullptr;
             bool usedBulk = false;
             if (!disableFieldSortBulk && !data->fieldCollector->needsScores) {
               auto* bulk = supplier->bulkScorer(poolGuard.pool());
@@ -611,7 +617,7 @@ public:
                 }
                 collectTopKMatchWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
-                    *data->fieldCollector, seg.maxDoc());
+                    *data->fieldCollector, seg.maxDoc(), allowSortPruning);
                 usedBulk = true;
               }
             }
@@ -625,7 +631,8 @@ public:
                   expressionBindings.emplace(
                       *data->fieldCollector, poolGuard.pool(), seg);
                 }
-                collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
+                collectTopK(segnum, scorer, collectorFilter, builderPtr,
+                            *data->fieldCollector, allowSortPruning);
               }
             }
           } else {

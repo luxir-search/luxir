@@ -63,6 +63,19 @@ public:
   }
 };
 
+class SortPruningGuard {
+  bool saved;
+
+public:
+  explicit SortPruningGuard(bool disabled)
+      : saved(disableFieldSortPruning) {
+    disableFieldSortPruning = disabled;
+  }
+  ~SortPruningGuard() {
+    disableFieldSortPruning = saved;
+  }
+};
+
 class SortSkipStatsGuard {
   bool saved;
 
@@ -2162,6 +2175,119 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     ASSERT_EQ("first duplicate", descCol.v[4]);
     ASSERT_EQ("doc5", idCol.v[4]);
   }
+}
+
+// Zone-based competitive pruning must return exactly what exhaustive
+// collection returns. The corpus spans multiple 4096-value zone blocks per
+// segment, includes deletes, ties, and a segment with missing values, and is
+// swept over match-all and term shapes, both drivers, both directions, and
+// limits around the block size.
+TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kDocsPerSeg = 5000;
+  std::vector<std::string> deleted;
+  int32_t docId = 0;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
+      std::string id = std::to_string(docId);
+      int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
+      std::string body = (docId & 1) == 0 ? "alpha" : "other";
+      if (seg == 1 && i % 13 == 0) {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "ties_i", (int64_t)(docId % 7),
+                             "mono_i", (int64_t)docId,
+                             "rev_i", (int64_t)(20000 - docId)),
+                     UpdateMessage::NO_COMMIT);
+      } else {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "rand_i", rand,
+                             "ties_i", (int64_t)(docId % 7),
+                             "mono_i", (int64_t)docId,
+                             "rev_i", (int64_t)(20000 - docId)),
+                     UpdateMessage::NO_COMMIT);
+      }
+      if (docId % 97 == 0) deleted.push_back(id);
+    }
+    helper.commit();
+  }
+  ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  struct Sorts {
+    std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
+  };
+  auto run = [&](bool disablePruning, bool forcePull, bool matchAll,
+                 const Sorts& sorts, int32_t limit, bool exactCount) {
+    SortPruningGuard pruningGuard(disablePruning);
+    FieldSortBulkGuard bulkGuard(forcePull);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    if (matchAll) {
+      cur.allQuery();
+    } else {
+      cur.rawQuery() = qb::match(cur.mr(), "body_w", "alpha");
+    }
+    if (exactCount) cur.getNumber();
+    for (const auto& [field, dir] : sorts.clauses) qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    struct Result {
+      std::vector<std::string> ids;
+      int64_t found = 0;
+      int64_t blocksSkipped = 0;
+    } result;
+    result.ids = resultIds(*req);
+    const auto* docs = req->docList("q");
+    if (docs != nullptr && docs->found) result.found = *docs->found;
+    result.blocksSkipped = SkipStats::fieldSortBlocksSkipped;
+    return result;
+  };
+
+  Sorts randAsc{{{"rand_i", qb::ASC}}};
+  Sorts randDesc{{{"rand_i", qb::DESC}}};
+  Sorts tiesAsc{{{"ties_i", qb::ASC}}};
+  Sorts tiesThenRand{{{"ties_i", qb::ASC}, {"rand_i", qb::ASC}}};
+  Sorts monoAsc{{{"mono_i", qb::ASC}}};
+  Sorts revDesc{{{"rev_i", qb::DESC}}};
+
+  for (bool matchAll : {true, false}) {
+    for (const Sorts& sorts :
+         {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc, revDesc}) {
+      for (int32_t limit : {1, 9, 987, 4500}) {
+        for (bool forcePull : {false, true}) {
+          auto exhaustive = run(true, forcePull, matchAll, sorts, limit, false);
+          auto pruned = run(false, forcePull, matchAll, sorts, limit, false);
+          EXPECT_EQ(exhaustive.ids, pruned.ids)
+              << "matchAll=" << matchAll << " limit=" << limit
+              << " forcePull=" << forcePull
+              << " sort=" << sorts.clauses[0].first;
+        }
+      }
+    }
+  }
+
+  // Shallow sole-clause sorts must actually skip blocks. The random column
+  // cannot skip strictly at this corpus size (the k-th-smallest bottom sits
+  // above a 4096-value block's expected min until tens of thousands of docs
+  // have been seen), so the deterministic assertions use doc-order-monotonic
+  // columns in each direction plus the segdoc-guarded equality rule on the
+  // tie column.
+  EXPECT_GT(run(false, true, true, monoAsc, 9, false).blocksSkipped, 0);
+  EXPECT_GT(run(false, true, true, revDesc, 9, false).blocksSkipped, 0);
+  EXPECT_GT(run(false, false, false, monoAsc, 9, false).blocksSkipped, 0);
+  EXPECT_GT(run(false, true, true, tiesAsc, 5, false).blocksSkipped, 0);
+  // A secondary clause forbids equality skipping; an all-ties primary then
+  // proves nothing, so no blocks may be skipped.
+  EXPECT_EQ(run(false, true, true, tiesThenRand, 5, false).blocksSkipped, 0);
+
+  // An exact hit count disables pruning and stays exact.
+  auto exactExhaustive = run(true, true, true, randAsc, 9, true);
+  auto exactPruned = run(false, true, true, randAsc, 9, true);
+  EXPECT_EQ(exactExhaustive.ids, exactPruned.ids);
+  EXPECT_EQ(exactExhaustive.found, exactPruned.found);
+  EXPECT_EQ(exactPruned.blocksSkipped, 0);
 }
 
 TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {

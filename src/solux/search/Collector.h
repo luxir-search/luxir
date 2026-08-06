@@ -449,6 +449,17 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
     needScores = needScores && collector.needsScores;
   }
 
+  // Field-sort competitive pruning: jump the scorer over doc blocks whose sort
+  // key bounds prove them noncompetitive. Skipped docs are uncounted, so the
+  // caller must not need an exact hit count or domain when pruning.
+  [[maybe_unused]] int32_t competitiveEnd = 0;
+  constexpr bool hasSortRanges =
+      requires { collector.nextCompetitiveRange(segnum, (int32_t)0); };
+  [[maybe_unused]] bool sortPrune = false;
+  if constexpr (hasSortRanges) {
+    sortPrune = allowPruning && builder == nullptr;
+  }
+
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*)filter;
     auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
@@ -456,6 +467,16 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       auto doc = scorer->next();
       if (doc == PostingsReader::END) {
         break;
+      }
+      if constexpr (hasSortRanges) {
+        while (sortPrune && doc >= competitiveEnd) {
+          auto range = collector.nextCompetitiveRange(segnum, doc);
+          competitiveEnd = range.end;
+          if (range.begin <= doc) break;
+          doc = scorer->advance(range.begin);
+          if (doc == PostingsReader::END) break;
+        }
+        if (doc == PostingsReader::END) break;
       }
       if (domainBits && !domainBits->get(doc)) {
         continue;
@@ -469,7 +490,22 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   } else {
     assert(filter->type == DocSet::ARRAY);
     ArrDocSet* arrDocs = (ArrDocSet*)filter;
-    for (auto doc : arrDocs->docs()) {
+    std::span<const int32_t> arr = arrDocs->docs();
+    const int32_t* cur = arr.data();
+    const int32_t* arrEnd = cur + arr.size();
+    while (cur != arrEnd) {
+      int32_t doc = *cur;
+      if constexpr (hasSortRanges) {
+        if (sortPrune && doc >= competitiveEnd) {
+          auto range = collector.nextCompetitiveRange(segnum, doc);
+          competitiveEnd = range.end;
+          if (range.begin > doc) {
+            cur = screaming::gallopLowerBound(cur, arrEnd, range.begin);
+            continue;
+          }
+        }
+      }
+      cur++;
       if (scorer->docId() < doc) {
         scorer->advance(doc);
       }
@@ -597,16 +633,38 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
 }
 
-// Collect exhaustive match-only windows in doc order. Scores are intentionally
-// absent from this path; collectors receive the unscored sentinel literal.
+// Collect match-only windows in doc order. Scores are intentionally absent
+// from this path; collectors receive the unscored sentinel literal.
+// allowPruning: when true and no domain builder is attached, a collector
+// exposing nextCompetitiveRange() has noncompetitive doc blocks jumped over
+// before window production (the window upper bound stays maxDoc, so window
+// overshoot past a competitive range is possible; overshot docs are rejected
+// by their gathered keys). Skipped docs are uncounted.
 template <typename Collector>
 void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                               DocSetBuilder* builder, Collector& collector,
-                              int32_t maxDoc) {
+                              int32_t maxDoc, bool allowPruning = false) {
   assert(bulk != nullptr);
   int32_t cursor = 0;
+  [[maybe_unused]] int32_t competitiveEnd = 0;
+  constexpr bool hasSortRanges =
+      requires { collector.nextCompetitiveRange(segnum, (int32_t)0); };
+  [[maybe_unused]] bool sortPrune = false;
+  if constexpr (hasSortRanges) {
+    sortPrune = allowPruning && builder == nullptr;
+  }
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    if constexpr (hasSortRanges) {
+      if (sortPrune && cursor >= competitiveEnd) {
+        auto range = collector.nextCompetitiveRange(segnum, cursor);
+        competitiveEnd = range.end;
+        if (range.begin > cursor) {
+          cursor = range.begin;
+          continue;
+        }
+      }
+    }
     int32_t next = bulk->matchNextWindow(window, filter, cursor, maxDoc);
     if (builder != nullptr) {
       for (int32_t i = 0; i < window.size; i++) {

@@ -173,6 +173,7 @@ struct SkipStats {
   static inline int64_t conjMatchFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t constantPullDomainCollections = 0;
+  static inline int64_t fieldSortBlocksSkipped = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -353,6 +354,7 @@ struct SkipStats {
     conjMatchFallbacks = 0;
     bulkDomainWindowsFed = 0;
     constantPullDomainCollections = 0;
+    fieldSortBlocksSkipped = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;
