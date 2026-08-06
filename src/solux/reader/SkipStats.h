@@ -174,6 +174,8 @@ struct SkipStats {
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t constantPullDomainCollections = 0;
   static inline int64_t fieldSortBlocksSkipped = 0;
+  static inline int64_t fieldSortCandidateActivations = 0;
+  static inline int64_t fieldSortCandidateTerminations = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -355,6 +357,8 @@ struct SkipStats {
     bulkDomainWindowsFed = 0;
     constantPullDomainCollections = 0;
     fieldSortBlocksSkipped = 0;
+    fieldSortCandidateActivations = 0;
+    fieldSortCandidateTerminations = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "solux/query/PostingsUnion.h"
 #include "solux/search/Collector.h"
 #include "solux/search/SortField.h"
 #include "solux/util/heap.h"
@@ -155,6 +156,27 @@ public:
   bool needsSort = true;
   std::unique_ptr<DirectPQ<SortDoc, FieldSortComparatorFunctor>> pq;
 
+  // String-sort candidate pruning state, all segment-local. The union is a
+  // conservative candidate superset built from the primary comparator's
+  // competitive ord interval; it and every allocation behind it live in
+  // segmentPool, which the dispatching op owns for the segment's lifetime.
+  static constexpr int32_t CANDIDATE_PROBE_INTERVAL = 4096;
+  static constexpr int64_t CANDIDATE_COST_RATIO = 8;
+  static constexpr int64_t CANDIDATE_STATE_BYTES = 8 << 20;
+  // Docs-equivalent charge per captured term: the activation walk pays a
+  // dictionary seek, a stats decode, and a postings-state capture per term,
+  // and the union pays heap traffic per term after that. Charging it keeps
+  // wide intervals from activating against small filtered domains.
+  static constexpr int64_t CANDIDATE_TERM_CAPTURE_COST = 16;
+  MemPool* segmentPool = nullptr;
+  UnionHeapScorer* candidates = nullptr;
+  int64_t candidateLo = 0;
+  int64_t candidateHi = -1;
+  int64_t segmentSourceCost = 0;
+  int32_t segmentMaxDoc = 0;
+  int32_t nextProbeDoc = 0;
+  bool candidatesDisabled = false;
+
   class ExpressionBindings {
   public:
     MemPool::ScopeGuard scope;
@@ -224,7 +246,20 @@ public:
   FieldSortCollector(FieldSortCollector&&) = delete;
   FieldSortCollector& operator=(FieldSortCollector&&) = delete;
 
-  void setSegment(int32_t segment, PostingsReader* reader) {
+  // sourceCost: estimated docs the collection source will still produce for
+  // this segment (query cost capped by any filter cardinality). It is the
+  // baseline candidate pruning must beat; negative means unknown, which
+  // conservatively disables candidate activation.
+  void setSegment(int32_t segment, PostingsReader* reader,
+                  MemPool* pool = nullptr, int64_t sourceCost = -1) {
+    segmentPool = pool;
+    candidates = nullptr;
+    candidateLo = 0;
+    candidateHi = -1;
+    nextProbeDoc = 0;
+    candidatesDisabled = false;
+    segmentSourceCost = sourceCost;
+    segmentMaxDoc = reader != nullptr ? reader->maxDoc() : 0;
     for (auto& clause : clauses) {
       clause.resetCache();
       if (clause.comparator != nullptr) {
@@ -357,7 +392,7 @@ public:
   // - Missing-value sentinels are treated as ordinary keys (the comparator
   //   already ranks a real extreme and the sentinel as equal); a sentinel
   //   bottom simply proves nothing strictly, which is automatically safe.
-  CompetitiveRange nextCompetitiveRange(int32_t segment, int32_t from) const {
+  CompetitiveRange nextCompetitiveRange(int32_t segment, int32_t from) {
     FieldComparator::KeyBatch* batch = nullptr;
     int32_t blockSize = 0;
     if (topCount > 0 && !disableKeyGatherForTests
@@ -365,7 +400,7 @@ public:
         && (batch = clauses[0].comparator->keyBatch()) != nullptr) {
       blockSize = batch->keyBlockSize();
     }
-    if (blockSize == 0) return {from, PostingsReader::END};
+    if (blockSize == 0) return candidateRange(segment, from);
 
     int64_t block = (int64_t)from / blockSize;
     int64_t blockCount = batch->keyBlockCount();
@@ -440,6 +475,120 @@ private:
   static int32_t blockEnd(int64_t block, int32_t blockSize) {
     return (int32_t)std::min<int64_t>((block + 1) * blockSize,
                                       (int64_t)PostingsReader::END);
+  }
+
+  int32_t probeDeferral(int32_t from) {
+    nextProbeDoc = (int32_t)std::min<int64_t>(
+        (int64_t)from + CANDIDATE_PROBE_INTERVAL,
+        (int64_t)PostingsReader::END);
+    return nextProbeDoc;
+  }
+
+  // Candidate-union competitive source for primary clauses without block key
+  // bounds (string ord comparators). Inactive consults return probe-interval
+  // ranges so driver overhead stays near zero; once the ord interval is
+  // narrow and cheap enough, the postings union activates and each consult
+  // surfaces the next candidate doc as a one-doc range.
+  CompetitiveRange candidateRange(int32_t segment, int32_t from) {
+    if (candidatesDisabled || segmentPool == nullptr || topCount == 0
+        || clauses[0].comparator == nullptr) {
+      candidatesDisabled = true;
+      return {from, PostingsReader::END};
+    }
+    if (pq->size() < (size_t)topCount) {
+      return {from, probeDeferral(from)};
+    }
+    if (candidates == nullptr && from < nextProbeDoc) {
+      return {from, nextProbeDoc};
+    }
+    FieldComparator::CompetitiveOrdState state;
+    auto status = clauses[0].comparator->competitiveOrdInterval(
+        state, pq->top().slot, pq->top().doc, segment, from,
+        clauses.size() == 1);
+    if (status == FieldComparator::OrdIntervalStatus::UNSUPPORTED) {
+      candidatesDisabled = true;
+      return {from, PostingsReader::END};
+    }
+    if (status == FieldComparator::OrdIntervalStatus::PENDING) {
+      return {from, probeDeferral(from)};
+    }
+    if (state.lo > state.hi) {
+      skipCount(SkipStats::fieldSortCandidateTerminations);
+      return {PostingsReader::END, PostingsReader::END};
+    }
+    if (candidates == nullptr) {
+      if (!tryActivateCandidates(state, from)) {
+        return {from, probeDeferral(from)};
+      }
+    }
+    if (state.lo != candidateLo || state.hi != candidateHi) {
+      // The interval only narrows within a segment (the bottom improves
+      // lexicographically and the segdoc-guard boundary drop is one-way).
+      // narrow() speaks 0-based term ordinals (PostingsState::termOrdinal).
+      bool narrowed = candidates->narrow(state.lo - 1, state.hi - 1);
+      assert(narrowed);
+      if (!narrowed) {
+        candidatesDisabled = true;
+        candidates = nullptr;
+        return {from, PostingsReader::END};
+      }
+      candidateLo = state.lo;
+      candidateHi = state.hi;
+    }
+    int32_t c = candidates->peekAdvance(from);
+    if (c == PostingsReader::END) {
+      skipCount(SkipStats::fieldSortCandidateTerminations);
+      return {PostingsReader::END, PostingsReader::END};
+    }
+    return {c, c + 1};
+  }
+
+  // The state-byte gate is free (interval width is known without touching
+  // the dictionary); the docFreq sum costs one stats decode per 128 terms
+  // and aborts at the profitability limit. The capture walk uses its own
+  // TermsEnum: the comparator's leaf enum backs setBottom/copy caching and
+  // must not be repositioned here.
+  SOLUX_NOINLINE bool tryActivateCandidates(
+      const FieldComparator::CompetitiveOrdState& state, int32_t from) {
+    int64_t termCount = state.hi - state.lo + 1;
+    if (segmentSourceCost < 0
+        || termCount * (int64_t)sizeof(DocsOnlyEnum) > CANDIDATE_STATE_BYTES) {
+      return false;
+    }
+    // Prorate the source estimate by the fraction of the segment left, then
+    // require the union (postings plus per-term capture) to undercut it by
+    // the cost ratio. The exhaustive baseline on a sparse filtered domain is
+    // its cardinality, not the doc space.
+    int64_t remaining = segmentMaxDoc <= 0 ? 0
+        : segmentSourceCost * ((int64_t)segmentMaxDoc - from) / segmentMaxDoc;
+    int64_t limit = remaining / CANDIDATE_COST_RATIO;
+    int64_t sum = termCount * CANDIDATE_TERM_CAPTURE_COST;
+    if (sum > limit) return false;
+    TermsEnum te(*segmentPool, *state.postingsReader, *state.fieldInfo);
+    for (int64_t ord = state.lo; ord <= state.hi; ord++) {
+      te.seekOrd(ord - 1);
+      sum += te.docFreq();
+      if (sum > limit) return false;
+    }
+    auto states =
+        segmentPool->make_span<TermsEnum::PostingsState>((size_t)termCount);
+    for (int64_t i = 0; i < termCount; i++) {
+      te.seekOrd(state.lo - 1 + i);
+      states[(size_t)i] = te.postingsState();
+    }
+    auto enums = segmentPool->make_span<DocsOnlyEnum*>((size_t)termCount);
+    std::fill(enums.begin(), enums.end(), nullptr);
+    auto heap = segmentPool->make_span<uint64_t>((size_t)termCount);
+    auto windowBits = segmentPool->make_span<uint64_t>(
+        (size_t)UnionHeapScorer::WINDOW_WORDS);
+    candidates = segmentPool->make<UnionHeapScorer>(
+        states, enums, heap, windowBits, *segmentPool, segmentMaxDoc, 0.0f);
+    candidateLo = state.lo;
+    candidateHi = state.hi;
+    // narrow() speaks 0-based term ordinals (PostingsState::termOrdinal).
+    candidates->narrow(candidateLo - 1, candidateHi - 1);
+    skipCount(SkipStats::fieldSortCandidateActivations);
+    return true;
   }
 
   SOLUX_NOINLINE void warmup(segdoc doc, float score) {

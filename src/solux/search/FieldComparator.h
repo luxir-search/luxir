@@ -75,6 +75,33 @@ public:
 
   virtual KeyBatch* keyBatch() { return nullptr; }
 
+  // Optional competitive segment-ord interval for string-sort pruning,
+  // derived from the heap bottom (so unlike KeyBatch it REQUIRES the
+  // setBottom lifecycle). READY yields the inclusive 1-based segment-ord
+  // interval [lo, hi] of terms whose docs could still enter the heap
+  // (lo > hi: none can - the segment is done). PENDING means no usable
+  // bound yet (e.g. the bottom is a missing value); UNSUPPORTED means this
+  // comparator or segment can never provide intervals.
+  //
+  // `from` is the collection cursor: every doc still to be collected has
+  // segdoc(segment, doc) >= segdoc(segment, from). The boundary (equal to
+  // bottom) term is excluded only for a sole-clause sort with an exact
+  // bottom whose segdoc tie-break every remaining doc loses.
+  enum class OrdIntervalStatus { UNSUPPORTED, PENDING, READY };
+  struct CompetitiveOrdState {
+    int64_t lo = 0;
+    int64_t hi = -1;
+    int64_t nTerms = 0;
+    PostingsReader* postingsReader = nullptr;
+    const SegFieldInfo* fieldInfo = nullptr;
+  };
+  virtual OrdIntervalStatus competitiveOrdInterval(
+      CompetitiveOrdState& out, int32_t bottomSlot, segdoc bottomDoc,
+      int32_t segment, int32_t from, bool soleSort) {
+    unused(out, bottomSlot, bottomDoc, segment, from, soleSort);
+    return OrdIntervalStatus::UNSUPPORTED;
+  }
+
   enum MissingValue {
     MISSING_FIRST,
     MISSING_LAST
@@ -377,6 +404,8 @@ class GlobalOrdComparator : public FieldComparator {
   std::optional<OrdColReader> reader;
   std::vector<int64_t> globalOrds; // Storage for global ordinals
   OrdMap::SegToGlobal segmentMapping;
+  PostingsReader* postingsReader = nullptr;
+  SegFieldInfo fieldInfo{};
   int64_t sortMultiplier; // 1 for ascending, -1 for descending
   int64_t missingOrd;
 
@@ -400,22 +429,23 @@ public:
     }
   }
   
-  void setSegment(int32_t segment, PostingsReader* postingsReader) override {
+  void setSegment(int32_t segment, PostingsReader* reader_) override {
     reader.reset();
     segmentMapping = {};
-    
+    postingsReader = reader_;
+    fieldInfo = {};
+
     if (!postingsReader) return;
-    
+
     // Get segment-to-global ordinal mapping from OrdMap
     if (ordMap) {
       segmentMapping = ordMap->getSegToGlobal(segment);
     }
-    
+
     // Load the ordinal column reader for this segment
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(*postingsReader);
     if (fieldReader.seek(fieldName)) {
-      SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);
       if (!ordMap) {
         segmentMapping.numOrds = fieldInfo.nTerms;
@@ -424,6 +454,41 @@ public:
         reader.emplace(*postingsReader, fieldInfo);
       }
     }
+  }
+
+  // Identity mapping only (ordMap == nullptr, the single-segment selection):
+  // slot values are then raw segment ords times the direction, so the bottom
+  // slot converts straight back to a segment-ord bound. The multi-segment
+  // global mode has no global-to-segment inverse and stays unsupported.
+  OrdIntervalStatus competitiveOrdInterval(
+      CompetitiveOrdState& out, int32_t bottomSlot, segdoc bottomDoc,
+      int32_t segment, int32_t from, bool soleSort) override {
+    if (!reader.has_value() || ordMap != nullptr || postingsReader == nullptr
+        || fieldInfo.nTerms == 0) {
+      return OrdIntervalStatus::UNSUPPORTED;
+    }
+    // Missing-first: docs without the field beat any real-valued bottom but
+    // have no postings, so a term interval can never represent them.
+    if (missingOrd == std::numeric_limits<int64_t>::min()) {
+      return OrdIntervalStatus::PENDING;
+    }
+    int64_t key = globalOrds[(size_t)bottomSlot];
+    if (key == missingOrd) return OrdIntervalStatus::PENDING;
+    int64_t ord = sortMultiplier < 0 ? -key : key;
+    assert(ord >= 1 && ord <= segmentMapping.numOrds);
+    // The bottom ord is always exact here (same-segment slot values).
+    bool closable = soleSort && segdoc(segment, from) >= bottomDoc;
+    if (sortMultiplier > 0) {
+      out.lo = 1;
+      out.hi = closable ? ord - 1 : ord;
+    } else {
+      out.lo = closable ? ord + 1 : ord;
+      out.hi = segmentMapping.numOrds;
+    }
+    out.nTerms = segmentMapping.numOrds;
+    out.postingsReader = postingsReader;
+    out.fieldInfo = &fieldInfo;
+    return OrdIntervalStatus::READY;
   }
 
   int64_t getGlobalOrd(int32_t docid) {
@@ -506,11 +571,13 @@ class SegmentOrdComparator : public FieldComparator {
   SegFieldInfo fieldInfo{};
   std::optional<OrdColReader> reader;
   std::optional<TermsEnum> termsEnum;
+  PostingsReader* postingsReader = nullptr;
   std::vector<Slot> slots;
   int32_t currentSegment = -1;
   int32_t bottomOrd = 0;
   int32_t sortMultiplier;
   int32_t missingSortCmp;
+  bool missingFirst;
   bool bottomMissing = true;
   bool bottomExact = false;
 
@@ -573,14 +640,16 @@ public:
       slots(numHits),
       sortMultiplier(reversed ? -1 : 1),
       // GlobalOrdComparator keeps its missing sentinel at the requested edge.
-      missingSortCmp((missingValue == MISSING_FIRST ? -1 : 1) * sortMultiplier) {}
+      missingSortCmp((missingValue == MISSING_FIRST ? -1 : 1) * sortMultiplier),
+      missingFirst(missingValue == MISSING_FIRST) {}
 
-  void setSegment(int32_t segment, PostingsReader* postingsReader) override {
+  void setSegment(int32_t segment, PostingsReader* reader_) override {
     termsEnum.reset();
     reader.reset();
     enumPool.rewind(enumPoolStart);
     fieldInfo = {};
     currentSegment = segment;
+    postingsReader = reader_;
 
     if (!postingsReader) return;
 
@@ -593,6 +662,39 @@ public:
     }
     reader.emplace(*postingsReader, fieldInfo);
     termsEnum.emplace(enumPool, *postingsReader, fieldInfo);
+  }
+
+  // Bottom state semantics (see setBottom): exact => bottomOrd is the
+  // bottom's own 1-based ord, so equal-ord docs tie with the bottom;
+  // inexact => the bottom term is absent here and sorts strictly between
+  // bottomOrd and bottomOrd + 1, so equal-ord docs strictly beat it and
+  // there is no boundary tie to reason about.
+  OrdIntervalStatus competitiveOrdInterval(
+      CompetitiveOrdState& out, int32_t bottomSlot, segdoc bottomDoc,
+      int32_t segment, int32_t from, bool soleSort) override {
+    unused(bottomSlot);
+    if (!termsEnum.has_value() || !reader.has_value()) {
+      return OrdIntervalStatus::UNSUPPORTED;
+    }
+    // Missing-first: docs without the field beat any real-valued bottom but
+    // have no postings, so a term interval can never represent them.
+    if (missingFirst || bottomMissing) return OrdIntervalStatus::PENDING;
+    int64_t nTerms = (int64_t)fieldInfo.nTerms;
+    bool closable = soleSort && bottomExact
+        && segdoc(segment, from) >= bottomDoc;
+    if (sortMultiplier > 0) {
+      out.lo = 1;
+      out.hi = closable ? (int64_t)bottomOrd - 1 : (int64_t)bottomOrd;
+    } else {
+      out.lo = bottomExact ? (closable ? (int64_t)bottomOrd + 1
+                                       : (int64_t)bottomOrd)
+                           : (int64_t)bottomOrd + 1;
+      out.hi = nTerms;
+    }
+    out.nTerms = nTerms;
+    out.postingsReader = postingsReader;
+    out.fieldInfo = &fieldInfo;
+    return OrdIntervalStatus::READY;
   }
 
   void setBottom(int32_t slot) override {

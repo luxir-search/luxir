@@ -124,6 +124,8 @@ protected:
     return ids;
   }
 
+  void runStringCandidatePruning(int32_t nSegs);
+
   static WindowResult collectNumericWindows(
       IndexReader& reader, std::string_view field, int64_t topCount,
       SortField::SortOrder order, FieldComparator::MissingValue missing,
@@ -2316,6 +2318,147 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   EXPECT_EQ(exactExhaustive.ids, exactPruned.ids);
   EXPECT_EQ(exactExhaustive.found, exactPruned.found);
   EXPECT_EQ(exactPruned.blocksSkipped, 0);
+}
+
+// String candidate pruning (postings-union over the competitive ord interval)
+// must match exhaustive collection. One segment exercises the identity
+// GlobalOrdComparator path, two segments the SegmentOrdComparator path with
+// collector reuse; the corpus carries a high-cardinality column (activation),
+// a 7-value tie column (empty-interval termination), missing values, and
+// deletes.
+void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
+  {
+    CollectionHelper helper;
+    helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+    constexpr int32_t kDocsPerSeg = 12000;
+    std::vector<std::string> deleted;
+    int32_t docId = 0;
+    for (int32_t seg = 0; seg < nSegs; seg++) {
+      for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
+        std::string id = std::to_string(docId);
+        uint32_t rand = (uint32_t)((uint32_t)docId * 2654435761u) % 200000;
+        std::string randValue = std::format("t{:06}", rand);
+        std::string body = (docId & 1) == 0 ? "alpha" : "other";
+        std::string tieValue = "v" + std::to_string(docId % 7);
+        if (docId % 13 == 0) {
+          helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                               "ties_s", tieValue),
+                       UpdateMessage::NO_COMMIT);
+        } else {
+          helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                               "rand_s", randValue, "ties_s", tieValue),
+                       UpdateMessage::NO_COMMIT);
+        }
+        if (docId % 97 == 0) deleted.push_back(id);
+      }
+      helper.commit();
+    }
+    ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+    struct Sorts {
+      std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
+    };
+    struct Result {
+      std::vector<std::string> ids;
+      int64_t activations = 0;
+      int64_t terminations = 0;
+    };
+    auto run = [&](bool disablePruning, bool forcePull, bool matchAll,
+                   const Sorts& sorts, int32_t limit) {
+      SortPruningGuard pruningGuard(disablePruning);
+      FieldSortBulkGuard bulkGuard(forcePull);
+      SortSkipStatsGuard statsGuard;
+      auto req = localReq(soluxNode->getSearchEngine());
+      req->collection("main");
+      auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+      if (matchAll) {
+        cur.allQuery();
+      } else {
+        cur.rawQuery() = qb::match(cur.mr(), "body_w", "alpha");
+      }
+      for (const auto& [field, dir] : sorts.clauses) qb::sort(cur, field, dir);
+      req->execute(false);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      Result result;
+      result.ids = resultIds(*req);
+      result.activations = SkipStats::fieldSortCandidateActivations;
+      result.terminations = SkipStats::fieldSortCandidateTerminations;
+      return result;
+    };
+
+    Sorts randAsc{{{"rand_s", qb::ASC}}};
+    Sorts randDesc{{{"rand_s", qb::DESC}}};
+    Sorts tiesAsc{{{"ties_s", qb::ASC}}};
+    Sorts tiesThenRand{{{"ties_s", qb::ASC}, {"rand_s", qb::ASC}}};
+
+    for (bool matchAll : {true, false}) {
+      for (const Sorts& sorts : {randAsc, randDesc, tiesAsc, tiesThenRand}) {
+        for (int32_t limit : {1, 9, 987}) {
+          for (bool forcePull : {false, true}) {
+            auto exhaustive = run(true, forcePull, matchAll, sorts, limit);
+            auto pruned = run(false, forcePull, matchAll, sorts, limit);
+            EXPECT_EQ(exhaustive.ids, pruned.ids)
+                << "nSegs=" << nSegs << " matchAll=" << matchAll
+                << " limit=" << limit << " forcePull=" << forcePull
+                << " sort=" << sorts.clauses[0].first;
+          }
+        }
+      }
+    }
+
+    // Shallow high-cardinality sorts must activate the candidate union in
+    // both directions and drivers; the sole-clause tie column empties its
+    // interval and terminates instead of activating.
+    EXPECT_GT(run(false, true, true, randAsc, 9).activations, 0);
+    EXPECT_GT(run(false, true, true, randDesc, 9).activations, 0);
+    // The windowed (term query) route only clears the cost gate once the
+    // interval is very tight relative to the filtered remainder: k=1.
+    EXPECT_GT(run(false, false, false, randAsc, 1).activations, 0);
+    auto ties = run(false, true, true, tiesAsc, 5);
+    EXPECT_EQ(ties.activations, 0);
+    EXPECT_GT(ties.terminations, 0);
+  }
+}
+
+// Missing-first docs beat any real-valued bottom but have no postings, so a
+// term interval can never represent them: both ord comparators must withhold
+// the interval (PENDING) whenever missing sorts first.
+TEST_F(SortCollectorTest, missingFirstBlocksCandidateIntervals) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "d0", "s_s", "b"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d1"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d2", "s_s", "a"), UpdateMessage::COMMIT);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto& leaf = reader->segments()[0];
+  using Status = FieldComparator::OrdIntervalStatus;
+  for (bool missingFirst : {false, true}) {
+    auto missing = missingFirst ? FieldComparator::MISSING_FIRST
+                                : FieldComparator::MISSING_LAST;
+    Status expected = missingFirst ? Status::PENDING : Status::READY;
+
+    SegmentOrdComparator seg("s_s", 1, false, missing);
+    seg.setSegment(0, &leaf.postingsReader());
+    seg.copy(0, segdoc(0, 0));
+    seg.setBottom(0);
+    FieldComparator::CompetitiveOrdState state;
+    EXPECT_EQ(seg.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
+              expected);
+
+    GlobalOrdComparator glob("s_s", nullptr, 1, false, missing);
+    glob.setSegment(0, &leaf.postingsReader());
+    glob.copy(0, segdoc(0, 0));
+    EXPECT_EQ(glob.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
+              expected);
+  }
+}
+
+TEST_F(SortCollectorTest, stringCandidatePruningSingleSegment) {
+  runStringCandidatePruning(1);
+}
+
+TEST_F(SortCollectorTest, stringCandidatePruningTwoSegments) {
+  runStringCandidatePruning(2);
 }
 
 TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {

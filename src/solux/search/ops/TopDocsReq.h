@@ -605,11 +605,20 @@ public:
             bool allowSortPruning = !disableFieldSortPruning
                 && !op.requirements.needExactCount
                 && builderPtr == nullptr;
+            // Candidate pruning must beat what the source would still cost:
+            // the query estimate, capped by an external filter's cardinality.
+            int64_t sortSourceCost = supplier->cost();
+            if (collectorFilter != nullptr) {
+              sortSourceCost = std::min(sortSourceCost,
+                                        (int64_t)collectorFilter->card());
+            }
             bool usedBulk = false;
             if (!disableFieldSortBulk && !data->fieldCollector->needsScores) {
               auto* bulk = supplier->bulkScorer(poolGuard.pool());
               if (bulk != nullptr && bulk->supportsMatchWindows()) {
-                data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+                data->fieldCollector->setSegment(
+                    segnum, &seg.postingsReader(), &poolGuard.pool(),
+                    sortSourceCost);
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
                   expressionBindings.emplace(
@@ -625,7 +634,9 @@ public:
               auto* scorer = supplier->get(
                   poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {
-                data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+                data->fieldCollector->setSegment(
+                    segnum, &seg.postingsReader(), &poolGuard.pool(),
+                    sortSourceCost);
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
                   expressionBindings.emplace(
