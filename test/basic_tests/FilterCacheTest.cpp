@@ -2726,7 +2726,7 @@ TEST(DocSetScorerTest, bulkScorerCountsAndEmitsBitsetAndArray) {
 
   auto check = [&](DocSet& source) {
     MemPool countPool;
-    QueryPrep::DocSetBulkScorer counter(countPool, &source, 192);
+    DocSetBulkScorer counter(countPool, &source, 192);
     DocSetBuilder builder(192);
     int64_t count = 0;
     EXPECT_EQ(PostingsReader::END, counter.countNextWindow(
@@ -2737,7 +2737,7 @@ TEST(DocSetScorerTest, bulkScorerCountsAndEmitsBitsetAndArray) {
     EXPECT_TRUE(counted->get(129));
 
     MemPool scorePool;
-    QueryPrep::DocSetBulkScorer scorer(scorePool, &source, 192);
+    DocSetBulkScorer scorer(scorePool, &source, 192);
     ScoreWindow window;
     EXPECT_EQ(PostingsReader::END, scorer.scoreNextWindow(
         window, &filter, 0, 192, std::numeric_limits<float>::lowest()));
@@ -2746,7 +2746,7 @@ TEST(DocSetScorerTest, bulkScorerCountsAndEmitsBitsetAndArray) {
     EXPECT_EQ(129, window.docs[1]);
 
     MemPool exactPool;
-    QueryPrep::DocSetBulkScorer exact(exactPool, &source, 192);
+    DocSetBulkScorer exact(exactPool, &source, 192);
     int64_t exactCount = 0;
     EXPECT_EQ(PostingsReader::END, exact.countNextWindow(
         exactCount, nullptr, nullptr, 0, 192));
@@ -2784,7 +2784,7 @@ TEST(DocSetScorerTest, bulkScorerPreservesSparseWindowsAndDomains) {
   };
   auto countWindows = [&](DocSet& source, DocSet* filter) {
     MemPool pool;
-    QueryPrep::DocSetBulkScorer scorer(pool, &source, maxDoc);
+    DocSetBulkScorer scorer(pool, &source, maxDoc);
     DocSetBuilder builder(maxDoc);
     int64_t count = 0;
     bool sawEmptyWindow = false;
@@ -2833,7 +2833,7 @@ TEST(DocSetScorerTest, bulkScorerPreservesSparseWindowsAndDomains) {
 
   {
     MemPool pool;
-    QueryPrep::DocSetBulkScorer scorer(pool, &arraySource, maxDoc);
+    DocSetBulkScorer scorer(pool, &arraySource, maxDoc);
     DocSetBuilder builder(maxDoc);
     int64_t count = 0;
     constexpr int32_t rangeMin = windowSize - 2;
@@ -2861,7 +2861,7 @@ TEST(DocSetScorerTest, bulkScorerPreservesSparseWindowsAndDomains) {
 
   auto expectScores = [&](DocSet* filter) {
     MemPool pool;
-    QueryPrep::DocSetBulkScorer scorer(pool, &arraySource, maxDoc);
+    DocSetBulkScorer scorer(pool, &arraySource, maxDoc);
     std::vector<int32_t> actual;
     for (int32_t cursor = 0; cursor != PostingsReader::END; ) {
       ScoreWindow window;
