@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "Query.h"
+#include "DocSetBulkScorer.h"
 
 namespace solux {
 
@@ -20,29 +21,6 @@ public:
     out.appendTag(FilterKeyTag::ALL);
     return FilterKeyScope::SEGMENT_STABLE;
   }
-
-  AllQuery::Weight* createWeight(Context& context, int32_t flags,
-                                 float multiplier = 1.0f) override {
-    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
-        context, *this, flags, constantWhenScored(flags, multiplier));
-    return weight;
-  }
-
-  class Weight final : public Query::Weight {
-  protected:
-    AllQuery& query;
-    float score;
-  public:
-    Weight(Context& context, AllQuery& query, int32_t flags, float score)
-      : Query::Weight(context, flags), query(query), score(score) {
-      traits |= IS_CONSTANT_SCORING | MATCHES_ALL_DOCS;
-    }
-
-    AllQuery::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
-      return targetPool.make<AllQuery::Scorer>(segment, score);
-    }
-
-  };
 
   class Scorer final : public Query::ConstantScorer {
   public:
@@ -104,6 +82,61 @@ public:
       docid = windowEnd <= lastDoc ? windowEnd : PostingsReader::END;
     }
   };
+
+  class Supplier final : public Query::ScorerSupplier {
+    solux::IndexReader::Segment& segment;
+    float score;
+  public:
+    Supplier(solux::IndexReader::Segment& segment, float score)
+      : segment(segment), score(score) {}
+
+    int64_t cost() override { return segment.maxDoc(); }
+
+    AllQuery::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+      unused(leadCost);
+      return targetPool.make<AllQuery::Scorer>(segment, score);
+    }
+
+    Query::Scorer* getIndependent(MemPool& targetPool,
+                                  int64_t leadCost) override {
+      return get(targetPool, leadCost);
+    }
+
+    // The null-source form of DocSetBulkScorer: all docs in [0, maxDoc), so
+    // the per-call filter becomes the window source directly.
+    BulkScorer* bulkScorer(MemPool& targetPool) override {
+      return targetPool.make<DocSetBulkScorer>(
+          targetPool, nullptr, segment.maxDoc(), score);
+    }
+  };
+
+  class Weight final : public Query::Weight {
+  protected:
+    AllQuery& query;
+    float score;
+  public:
+    Weight(Context& context, AllQuery& query, int32_t flags, float score)
+      : Query::Weight(context, flags), query(query), score(score) {
+      traits |= IS_CONSTANT_SCORING | MATCHES_ALL_DOCS;
+    }
+
+    Query::ScorerSupplier* scorerSupplier(
+        MemPool& targetPool, solux::IndexReader::Segment& segment) override {
+      return targetPool.make<AllQuery::Supplier>(segment, score);
+    }
+
+    AllQuery::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
+      return targetPool.make<AllQuery::Scorer>(segment, score);
+    }
+
+  };
+
+  AllQuery::Weight* createWeight(Context& context, int32_t flags,
+                                 float multiplier = 1.0f) override {
+    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
+        context, *this, flags, constantWhenScored(flags, multiplier));
+    return weight;
+  }
 
 };
 

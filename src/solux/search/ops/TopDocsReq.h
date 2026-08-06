@@ -624,6 +624,7 @@ public:
                   expressionBindings.emplace(
                       *data->fieldCollector, poolGuard.pool(), seg);
                 }
+                skipCount(SkipStats::fieldSortBulkCollections);
                 collectTopKMatchWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
                     *data->fieldCollector, seg.maxDoc(), allowSortPruning);

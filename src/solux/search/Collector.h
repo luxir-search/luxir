@@ -637,9 +637,11 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
 // from this path; collectors receive the unscored sentinel literal.
 // allowPruning: when true and no domain builder is attached, a collector
 // exposing nextCompetitiveRange() has noncompetitive doc blocks jumped over
-// before window production (the window upper bound stays maxDoc, so window
-// overshoot past a competitive range is possible; overshot docs are rejected
-// by their gathered keys). Skipped docs are uncounted.
+// before window production, and every window request is bounded by the
+// competitive range end - a one-doc candidate range costs one doc, not a
+// whole overshooting window of key-rejected neighbors. END from a bounded
+// request means the bound was reached; only an unbounded request's END is
+// query exhaustion. Skipped docs are uncounted.
 template <typename Collector>
 void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                               DocSetBuilder* builder, Collector& collector,
@@ -655,6 +657,7 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   }
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    int32_t windowMax = maxDoc;
     if constexpr (hasSortRanges) {
       if (sortPrune && cursor >= competitiveEnd) {
         auto range = collector.nextCompetitiveRange(segnum, cursor);
@@ -664,8 +667,11 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
           continue;
         }
       }
+      if (sortPrune) {
+        windowMax = std::min(windowMax, competitiveEnd);
+      }
     }
-    int32_t next = bulk->matchNextWindow(window, filter, cursor, maxDoc);
+    int32_t next = bulk->matchNextWindow(window, filter, cursor, windowMax);
     if (builder != nullptr) {
       for (int32_t i = 0; i < window.size; i++) {
         builder->add(window.docs[(size_t) i]);
@@ -682,7 +688,11 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
       }
     }
     if (next == PostingsReader::END) {
-      break;
+      if (windowMax >= maxDoc) {
+        break;
+      }
+      cursor = windowMax;
+      continue;
     }
     assert(next > cursor);
     cursor = next;

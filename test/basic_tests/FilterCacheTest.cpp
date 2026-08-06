@@ -2883,6 +2883,101 @@ TEST(DocSetScorerTest, bulkScorerPreservesSparseWindowsAndDomains) {
   expectScores(&arrayFilter);
 }
 
+// The null-source form: all docs in [0, maxDoc), with the per-call filter
+// consumed as the window source (match-all intersect filter = filter).
+TEST(DocSetScorerTest, nullSourceBulkScorerEmitsAllDocs) {
+  constexpr int32_t windowSize = DocsEnumMeta::L1_DOCS;
+  constexpr int32_t maxDoc = 2 * windowSize + 41;
+
+  {
+    MemPool pool;
+    DocSetBulkScorer scorer(pool, nullptr, maxDoc, 2.5f);
+    EXPECT_TRUE(scorer.supportsMatchWindows());
+    ScoreWindow window;
+    int32_t next = scorer.matchNextWindow(window, nullptr, 0, maxDoc);
+    EXPECT_EQ(windowSize, next);
+    ASSERT_EQ(windowSize, window.size);
+    EXPECT_EQ(0, window.docs[0]);
+    EXPECT_EQ(windowSize - 1, window.docs[(size_t) windowSize - 1]);
+    next = scorer.matchNextWindow(window, nullptr, 2 * windowSize, maxDoc);
+    EXPECT_EQ(PostingsReader::END, next);
+    ASSERT_EQ(41, window.size);
+    EXPECT_EQ(2 * windowSize, window.docs[0]);
+    EXPECT_EQ(maxDoc - 1, window.docs[40]);
+  }
+
+  // Scored windows carry the constant score; a higher competitive floor
+  // produces empty windows but still advances.
+  {
+    MemPool pool;
+    DocSetBulkScorer scorer(pool, nullptr, maxDoc, 2.5f);
+    ScoreWindow window;
+    scorer.scoreNextWindow(window, nullptr, 5, maxDoc, 2.5f);
+    ASSERT_EQ(windowSize, window.size);
+    EXPECT_EQ(5, window.docs[0]);
+    EXPECT_EQ(2.5f, window.scores[0]);
+    int32_t next = scorer.scoreNextWindow(
+        window, nullptr, windowSize + 5, maxDoc, 3.0f);
+    EXPECT_EQ(0, window.size);
+    EXPECT_EQ(2 * windowSize + 5, next);
+  }
+
+  // Bitset and array filters become the source.
+  {
+    RAMBitDocSet bits(maxDoc);
+    bits.mutableBits().set(3);
+    bits.mutableBits().set(windowSize);
+    bits.mutableBits().set(maxDoc - 1);
+    ArrDocSet arr({3, windowSize, maxDoc - 1});
+    for (DocSet* filter : {(DocSet*) &bits, (DocSet*) &arr}) {
+      MemPool pool;
+      DocSetBulkScorer scorer(pool, nullptr, maxDoc);
+      std::vector<int32_t> got;
+      for (int32_t cursor = 0; cursor != PostingsReader::END; ) {
+        ScoreWindow window;
+        int32_t next = scorer.matchNextWindow(window, filter, cursor, maxDoc);
+        got.insert(got.end(), window.docs.begin(), window.docs.end());
+        if (next == PostingsReader::END) break;
+        ASSERT_GT(next, cursor);
+        cursor = next;
+      }
+      EXPECT_EQ((std::vector<int32_t>{3, windowSize, maxDoc - 1}), got);
+    }
+  }
+
+  // Counting: arithmetic remaining-range shortcut, filter-card shortcut, and
+  // mid-range domain building.
+  {
+    MemPool pool;
+    DocSetBulkScorer scorer(pool, nullptr, maxDoc);
+    int64_t count = 0;
+    EXPECT_EQ(PostingsReader::END,
+              scorer.countNextWindow(count, nullptr, nullptr, 7, maxDoc));
+    EXPECT_EQ(maxDoc - 7, count);
+
+    ArrDocSet arr({3, windowSize, maxDoc - 1});
+    count = 0;
+    EXPECT_EQ(PostingsReader::END,
+              scorer.countNextWindow(count, nullptr, &arr, 0, maxDoc));
+    EXPECT_EQ(3, count);
+
+    DocSetBuilder builder(maxDoc);
+    count = 0;
+    for (int32_t cursor = windowSize - 2; cursor != PostingsReader::END; ) {
+      int32_t next = scorer.countNextWindow(
+          count, &builder, nullptr, cursor, windowSize + 2);
+      if (next == PostingsReader::END) break;
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    EXPECT_EQ(4, count);
+    auto domain = builder.build();
+    EXPECT_TRUE(domain->get(windowSize - 2));
+    EXPECT_TRUE(domain->get(windowSize + 1));
+    EXPECT_FALSE(domain->get(windowSize + 2));
+  }
+}
+
 TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   SoluxConfig onConfig;
   onConfig.filterCacheBytes = 4 * 1024 * 1024;

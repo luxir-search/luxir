@@ -2267,11 +2267,13 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
       std::vector<std::string> ids;
       int64_t found = 0;
       int64_t blocksSkipped = 0;
+      int64_t bulkCollections = 0;
     } result;
     result.ids = resultIds(*req);
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
     result.blocksSkipped = SkipStats::fieldSortBlocksSkipped;
+    result.bulkCollections = SkipStats::fieldSortBulkCollections;
     return result;
   };
 
@@ -2307,6 +2309,14 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   EXPECT_GT(run(false, true, true, monoAsc, 9, false).blocksSkipped, 0);
   EXPECT_GT(run(false, true, true, revDesc, 9, false).blocksSkipped, 0);
   EXPECT_GT(run(false, false, false, monoAsc, 9, false).blocksSkipped, 0);
+  // Match-all rides the null-source bulk scorer's match windows (with zone
+  // skips intact); forcing pull keeps the scorer loop.
+  {
+    auto matchAllBulk = run(false, false, true, monoAsc, 9, false);
+    EXPECT_GT(matchAllBulk.bulkCollections, 0);
+    EXPECT_GT(matchAllBulk.blocksSkipped, 0);
+    EXPECT_EQ(run(false, true, true, monoAsc, 9, false).bulkCollections, 0);
+  }
   EXPECT_GT(run(false, true, true, tiesAsc, 5, false).blocksSkipped, 0);
   // A secondary clause forbids equality skipping; an all-ties primary then
   // proves nothing, so no blocks may be skipped.
