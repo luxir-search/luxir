@@ -2055,6 +2055,61 @@ TEST_F(FacetTest, subOpInlineAutoFollowsBucketCoverage) {
   EXPECT_NE(feedDetails("cat_s", false).find("result-feed="), std::string::npos);
 }
 
+// A finite limit selects into a bounded heap instead of ordering every bucket,
+// so the two are pinned equal: every finite limit must return exactly the
+// prefix that ordering all of them and truncating would have. Metric ties are
+// deliberate - they are what makes the ord tie-break decide, and a selection
+// that disagreed with the comparator would show up here first.
+TEST_F(FacetTest, boundedSelectionMatchesOrderingEveryBucket) {
+  CollectionHelper helper;
+  helper.clear();
+  // Six categories, three distinct avg(foo_i) values, so two-way ties at every
+  // level. Two segments, so the merge runs before selection.
+  for (int i = 0; i < 24; i++) {
+    helper.index(flatdoc("cat_s", "c" + std::to_string(i % 6),
+                         "foo_i", (int64_t)((i % 6) / 2 * 10)),
+                 i == 11 || i == 23 ? UpdateMessage::COMMIT
+                                    : UpdateMessage::NO_COMMIT);
+  }
+
+  auto run = [&](int64_t limit) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs().getNumber(true).allQuery();
+    auto& facet = req->facet("f", "cat_s");
+    facet.limit(limit);
+    facet.avg("avg_foo", "foo_i");
+    qb::sort(facet, "avg_foo", qb::DESC);
+    req->execute(true);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    std::vector<std::pair<std::string, double>> buckets;
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    EXPECT_NE(result, nullptr) << req->toString();
+    if (result == nullptr) return buckets;
+    const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind).v;
+    const auto& avg = std::get<solux::api::ArrDouble>(
+        result->ops.at("avg_foo")->kind).v;
+    EXPECT_EQ(ids.size(), avg.size());
+    for (size_t i = 0; i < ids.size(); i++) {
+      buckets.emplace_back(ids[i], avg[i]);
+    }
+    return buckets;
+  };
+
+  auto all = run(-1);
+  ASSERT_EQ(6u, all.size());
+  EXPECT_EQ(20, all[0].second);  // ordered by avg desc, ties by ord asc
+  EXPECT_EQ(0, all[5].second);
+  for (int64_t limit = 0; limit <= 7; limit++) {
+    auto got = run(limit);
+    size_t want = std::min((size_t)limit, all.size());
+    ASSERT_EQ(want, got.size()) << "limit=" << limit;
+    for (size_t i = 0; i < want; i++) {
+      EXPECT_EQ(all[i], got[i]) << "limit=" << limit << " bucket " << i;
+    }
+  }
+}
+
 // The two bucket-domain constructions answer identically.  POSTINGS seeks each
 // returned bucket's term and intersects its postings; COLUMN_REPLAY makes one
 // pass over the ord column and appends each domain document to its bucket.

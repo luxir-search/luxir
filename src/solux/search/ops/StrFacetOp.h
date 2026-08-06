@@ -18,6 +18,7 @@
 #include "StrFacetPlanning.h"
 #include "StrFacetReplay.h"
 #include "solux/util/SegmentMergeDriver.h"
+#include "solux/util/heap.h"
 #include "solux/util/log.h"
 
 namespace solux {
@@ -1198,48 +1199,80 @@ public:
       // (global ord, entry).  Ties break on the ord rather than the term text,
       // which is the same rule the non-inline path applies
       // (sortByCountDescAndLimit over ordCounts) - one bucket order for both.
-      std::vector<std::pair<int64_t, char*>> valVec;
+      using Bucket = std::pair<int64_t, char*>;
+      std::vector<Bucket> valVec;
       auto& counts = mergedData->counts.map;
-      for (auto& [key, val] : counts) {
-        int64_t count = loadUnaligned<int64_t>(val);
-        if (minCount == -1 || count >= minCount) {
-          valVec.emplace_back(key, val);
-        }
-      }
       auto missing_count = mergedData->missing_num;
-      if (thisOp().fieldFacet.sorts.empty()) {
-        std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
+
+      // Count and bucket-value sorts are future work; sub-op sort is supported.
+      SearchOp::InlineCalculator* sortCalc = nullptr;
+      bool reversed = false;
+      if (!thisOp().fieldFacet.sorts.empty()) {
+        std::string_view field = thisOp().fieldFacet.sorts[0].expr;
+        for (auto* candidate : mergedData->inlineCalcs) {
+          if (candidate->getOp().name == field) {
+            sortCalc = candidate;
+            break;
+          }
+        }
+        assert(sortCalc != nullptr);
+        reversed =
+            thisOp().fieldFacet.sorts[0].dir == solux::api::SortSpec_::SortDir::DESC;
+      }
+
+      // "a comes before b" in the returned order.  One definition, used by both
+      // the bounded selection and the final ordering of what it kept.
+      auto better = [sortCalc, reversed](const Bucket& a, const Bucket& b) {
+        if (sortCalc == nullptr) {
           auto acount = loadUnaligned<int64_t>(a.second);
           auto bcount = loadUnaligned<int64_t>(b.second);
           if (acount != bcount) {
             return acount > bcount;
           }
           return a.first < b.first;
-        });
-      } else {
-        // Count and bucket-value sorts are future work; sub-op sort is supported.
-        std::string_view field = thisOp().fieldFacet.sorts[0].expr;
-        SearchOp::InlineCalculator* calc = nullptr;
-        for (auto* candidate : mergedData->inlineCalcs) {
-          if (candidate->getOp().name == field) {
-            calc = candidate;
-            break;
+        }
+        int asize, bsize;
+        int cmp = sortCalc->compare(a.second + sizeof(int64_t),
+                                    b.second + sizeof(int64_t), asize, bsize);
+        if (cmp == 0) {
+          return a.first < b.first; // tie-break by bucketid asc
+        }
+        return reversed ? cmp > 0 : cmp < 0;
+      };
+
+      if (limit > 0) {
+        // Bounded selection.  Sorting every bucket to return `limit` of them is
+        // what a high-cardinality metric-ordered facet spends most of its time
+        // on: at 278,741 buckets that is ~5M comparisons, each one a virtual
+        // call into the sort key's calculator and two dereferences into the
+        // scattered entry pool, plus one 16-byte vector slot per bucket.  A
+        // heap of `limit` costs one failed comparison per bucket and only
+        // ~limit*ln(n/limit) replacements, and allocates `limit` slots.
+        // DirectPQ evicts the GREATEST element under its comparator, so passing
+        // the returned order directly is what keeps the best: top() is then the
+        // worst of the best-so-far, which is the one to beat.
+        std::vector<Bucket> top((size_t)limit);
+        DirectPQ<Bucket, decltype(better)> pq(top, better, 0);
+        for (auto& [key, val] : counts) {
+          int64_t count = loadUnaligned<int64_t>(val);
+          if (minCount == -1 || count >= minCount) {
+            pq.insertWithOverflow({key, val});
           }
         }
-        assert(calc != nullptr);
-        bool reversed = thisOp().fieldFacet.sorts[0].dir == solux::api::SortSpec_::SortDir::DESC;
-        std::sort(valVec.begin(), valVec.end(), [&calc, reversed](auto& a, auto& b) {
-          int asize, bsize;
-          int  cmp = calc->compare(a.second + sizeof(int64_t), b.second + sizeof(int64_t), asize, bsize);
-          if (cmp == 0) {
-            return a.first < b.first; // tie-break by bucketid asc
+        top.resize(pq.size());
+        std::sort(top.begin(), top.end(), better);
+        valVec = std::move(top);
+      } else if (limit < 0) {
+        // Every bucket is returned, so there is nothing to select against.
+        for (auto& [key, val] : counts) {
+          int64_t count = loadUnaligned<int64_t>(val);
+          if (minCount == -1 || count >= minCount) {
+            valVec.emplace_back(key, val);
           }
-          return reversed ? cmp > 0 : cmp < 0;
-        });
+        }
+        std::sort(valVec.begin(), valVec.end(), better);
       }
-      if (limit >= 0 && limit < (int64_t)valVec.size()) {
-        valVec.resize(limit);
-      }
+      // limit == 0 returns no buckets, and never looks at one.
 
       // Term text for the buckets that survived selection, and only those -
       // ordToStr seeks the dictionary once per bucket instead of once per
