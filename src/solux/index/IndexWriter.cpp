@@ -1869,10 +1869,18 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // Segment-local ords are signed int32. Admit only sources whose summed
       // per-field term dictionaries remain below the flush-side limit. Text
       // dictionaries are exempt because they do not produce an ord column.
+      // Doc ids carry the same shape of limit: the merged segment's maxDoc
+      // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
+      int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
       for (SegInfo* seg : segs) {
+        if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
+                      seg->segId);
+          continue;
+        }
         auto postingsReader = getSegmentPostingsReader(*seg);
         MemPool metadataPool;
         FieldReader fields(*postingsReader);
@@ -1900,6 +1908,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
       }
       segs.swap(admitted);

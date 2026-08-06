@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "solux/reader/PostingsReader.h"
+
 namespace solux {
 
 // Admission prices for one field-merge batch: a conservative peak-RAM estimate
@@ -24,6 +26,15 @@ struct MergeCostModel {
   static bool ordTermsFit(int64_t currentTerms, int64_t sourceTerms) {
     return currentTerms >= 0 && sourceTerms >= 0 &&
            sourceTerms <= MAX_MERGED_ORD_TERMS - currentTerms;
+  }
+
+  // Doc ids must stay below PostingsReader::MAX_SEGMENT_DOCS (see the
+  // arithmetic-headroom contract there). Merges are the only path to large
+  // segments, so admission gates on the summed live docs of the sources.
+  static bool docsFit(int64_t currentDocs, int64_t sourceDocs) {
+    return currentDocs >= 0 && sourceDocs >= 0 &&
+           sourceDocs <= (int64_t) PostingsReader::MAX_SEGMENT_DOCS
+                             - currentDocs;
   }
 
   // Peak checked-out OutputStreams for each writer path.

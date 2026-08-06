@@ -25,6 +25,13 @@ public:
   // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
+  // Hard cap on a segment's maxDoc, enforced at merge admission (flush cannot
+  // approach it - RAM bounds an in-RAM segment orders of magnitude lower).
+  // Capping a full bit below END makes doc-id arithmetic structurally safe:
+  // doc + c cannot overflow int32 for any c <= 1 << 30, and can never collide
+  // with END, so window/block cursor math needs no per-site overflow audits.
+  static constexpr int32_t MAX_SEGMENT_DOCS = (1 << 30) - 1;
+
   // Static factory method to create PostingsReader with optional handling of missing files.
   // Returns nullptr if missingFileOK=true and any required files are missing.
   // If expectSynced=true, the opened files are expected to have been fsynced (committed state).

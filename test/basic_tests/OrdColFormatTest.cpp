@@ -494,6 +494,14 @@ TEST_F(OrdColFormatTest, mergeOrdTermSafetyMargin) {
   EXPECT_FALSE(MergeCostModel::ordTermsFit(0, -1));
 }
 
+TEST_F(OrdColFormatTest, mergeDocCountSafetyMargin) {
+  EXPECT_TRUE(MergeCostModel::docsFit(0, PostingsReader::MAX_SEGMENT_DOCS));
+  EXPECT_FALSE(MergeCostModel::docsFit(PostingsReader::MAX_SEGMENT_DOCS, 1));
+  EXPECT_FALSE(MergeCostModel::docsFit(0, -1));
+  EXPECT_TRUE(MergeCostModel::docsFit(
+      PostingsReader::MAX_SEGMENT_DOCS - 5, 5));
+}
+
 TEST_F(OrdColFormatTest, stringSortMissingLastAcrossSegmentsBothDirections) {
   OrdFormatGuard guard(OrdColWriter::FormatOverride::PREDICTED);
   CollectionHelper helper;

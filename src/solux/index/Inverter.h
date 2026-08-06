@@ -247,13 +247,18 @@ public:
   }
 
 
+  // Flush-side doc ids cannot approach MAX_SEGMENT_DOCS (RAM bounds an
+  // in-RAM segment orders of magnitude lower), so like ord overflow this is
+  // an assert-only tripwire; the enforced gate is merge admission.
   void setDoc(int32_t docid) {
     assert (docid >= currDoc);
+    assert (docid < PostingsReader::MAX_SEGMENT_DOCS);
     currDoc = docid;
   }
 
   void startDoc() {
     currDoc++;
+    assert (currDoc < PostingsReader::MAX_SEGMENT_DOCS);
   }
 
   void finishDoc() {
