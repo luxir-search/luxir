@@ -2,6 +2,7 @@
 #include "solux/schema/Schema.h"
 #include "solux/store/InputStream.h"
 #include "solux/store/CheckedDirFactory.h"
+#include "solux/store/ReadOnlyDirectory.h"
 #include "solux/reader/Postings.h"
 #include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
@@ -425,7 +426,7 @@ std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
 
 void SoluxNode::createSingletons() {
   if (config.store.backend == "fs") {
-    dirFactory = std::make_unique<FSDirFactory>(config.store.data_dir);
+    dirFactory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
   } else {
     dirFactory = std::make_unique<RAMDirFactory>();
   }
@@ -433,6 +434,11 @@ void SoluxNode::createSingletons() {
   if (config.store.checked_dir.sync != "off") {
     auto mode = config.store.checked_dir.sync == "throw" ? CheckedDirMode::THROW : CheckedDirMode::WARN;
     dirFactory = std::make_unique<CheckedDirFactory>(std::move(dirFactory), mode);
+  }
+
+  // Outermost, so a mutation is refused before any wrapper does bookkeeping for it.
+  if (config.read_only) {
+    dirFactory = std::make_unique<ReadOnlyDirFactory>(std::move(dirFactory));
   }
 
   root = std::make_shared<Library>();

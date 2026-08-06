@@ -104,6 +104,13 @@ struct IngestConfig {
 };
 
 struct SoluxConfig {
+  // Serve an existing data directory without owning it: the write lock is not taken,
+  // nothing is written, and every mutating request is rejected.  Lets a second process
+  // query a directory another instance is writing.  The view is the commit that was
+  // current when this node started; there is no reopen yet, so later commits by the
+  // writer are not picked up until restart.
+  bool read_only = false;
+
   std::string log_level = "info";
   size_t filterCacheBytes = 64ULL * 1024 * 1024;
   ServerConfig server;

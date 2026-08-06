@@ -149,6 +149,11 @@ class GenericCallData;
 // did before calling it (respondRaw's finishCount, or decrementOutstanding()).
 struct MethodEntry {
   void (*handle)(GenericCallData& call, grpc::ByteBuffer& readBuf);
+  // Whether the method can write.  A read-only node refuses these at dispatch,
+  // before any request bytes are read.  Storage refuses them too (see
+  // ReadOnlyDirectory), but that backstop is for paths holding a Directory
+  // directly - it is not a decent error for a caller.
+  bool mutating = false;
 };
 
 static const MethodEntry* lookupMethod(const std::string& method);
@@ -448,6 +453,16 @@ public:
           readsDone = true;
           finishSent = true;
           readerWriter.Finish(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unknown method"), make_tag(FINISH));
+          break;
+        }
+        if (methodEntry->mutating && server.getSoluxNode().readOnly()) {
+          readsDone = true;
+          finishSent = true;
+          readerWriter.Finish(
+              grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                           "node is read-only (--read-only): " + genericCtx.method() +
+                               " is not allowed"),
+              make_tag(FINISH));
           break;
         }
         readRequest();
@@ -904,12 +919,12 @@ static void handleSayHelloStreaming(GenericCallData& call, grpc::ByteBuffer& rea
 static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
     {"/solux.Searcher/Search",          {handleSearch}},
-    {"/solux.Indexer/Update",           {handleUpdate}},
-    {"/solux.Indexer/UpdateStream",     {handleUpdateStream}},
-    {"/solux.Admin/SetSchema",          {handleSetSchema}},
+    {"/solux.Indexer/Update",           {handleUpdate, true}},
+    {"/solux.Indexer/UpdateStream",     {handleUpdateStream, true}},
+    {"/solux.Admin/SetSchema",          {handleSetSchema, true}},
     {"/solux.Admin/GetSchema",          {handleGetSchema}},
-    {"/solux.Admin/CreateCollection",   {handleCreateCollection}},
-    {"/solux.Admin/DeleteCollection",   {handleDeleteCollection}},
+    {"/solux.Admin/CreateCollection",   {handleCreateCollection, true}},
+    {"/solux.Admin/DeleteCollection",   {handleDeleteCollection, true}},
     {"/solux.Admin/Stats",              {handleStats}},
     {"/solux.Greeter/SayHello",         {handleSayHello}},
     {"/solux.Greeter/SayHello2",        {handleSayHello2}},

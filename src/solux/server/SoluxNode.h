@@ -167,6 +167,11 @@ public:
 
   const SoluxConfig& getConfig() const { return config; }
 
+  // True when this node serves a data directory it does not own (no write lock).
+  // The transports use it to refuse mutating requests up front; the actual
+  // guarantee is enforced by ReadOnlyDirectory, not by this flag.
+  bool readOnly() const { return config.read_only; }
+
   // ALTERNATIVE: instead of nested maps, we could also have a single map directly to Collection or Shard objects
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
   // of collections.

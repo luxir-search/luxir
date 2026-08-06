@@ -566,6 +566,15 @@ private:
         }
         urlCommit = true;
       }
+      // Refuse before lifting the body limit: otherwise a read-only node reads an
+      // unbounded NDJSON stream only to reject it.  The body is unread, so like
+      // respondPayloadTooLarge() this ends the connection rather than reusing it.
+      if (node_.readOnly()) {
+        keepAlive_ = false;
+        respondSimple(http::status::forbidden, "application/json",
+                      renderErrorBody(readOnlyMessage(target)));
+        return;
+      }
       parser_->body_limit(boost::none);
       startStreamingUpdate(std::move(coll), urlCommit);
       return;
@@ -613,6 +622,20 @@ private:
     req.body() = std::move(bufferedBody_);
     parser_.reset();
     route(std::move(req));
+  }
+
+  // The write surface, named once.  A read-only node refuses these at dispatch;
+  // storage refuses them again (see ReadOnlyDirectory), but only this gate can
+  // produce a decent error, and only it stops the work before it starts.
+  static bool isMutatingRequest(http::verb method, std::string_view target) {
+    if (target == "/collections/_create" || target == "/collections/_delete") return true;
+    if (method != http::verb::post) return false;
+    std::string coll;
+    return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
+  }
+
+  static std::string readOnlyMessage(std::string_view target) {
+    return "node is read-only (--read-only): " + std::string(target) + " is not allowed";
   }
 
   static bool parseCollectionPath(std::string_view target, std::string_view suffix, std::string& coll) {
@@ -737,6 +760,12 @@ private:
       target = target.substr(0, q);
     }
     std::vector<UrlParam> params = parseParams(query);
+
+    if (node_.readOnly() && isMutatingRequest(req.method(), target)) {
+      respondSimple(http::status::forbidden, "application/json",
+                    renderErrorBody(readOnlyMessage(target)));
+      return;
+    }
 
     std::string coll;
     if (req.method() == http::verb::get && target == "/health") {

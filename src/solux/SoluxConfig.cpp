@@ -18,6 +18,8 @@ Rough hierarchy:
 
 
 void SoluxConfig::addOptions(CLI::App& app) {
+  app.add_flag("--read-only", read_only,
+               "Serve an existing data directory without the write lock; rejects all updates");
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);
   app.add_option("--filter-cache-bytes", filterCacheBytes,
@@ -99,6 +101,11 @@ void SoluxConfig::normalize() {
 
   if (store.backend == "ram" && store.data_dir != "solux_data") {
     spdlog::warn("store.data-dir is ignored when store.backend=ram");
+  }
+
+  if (read_only && store.backend != "fs") {
+    throw std::runtime_error("--read-only requires --store.backend=fs; there is no "
+                             "existing data directory to serve with backend=" + store.backend);
   }
 }
 

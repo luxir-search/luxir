@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <stdexcept>
 #include <vector>
 #include <string_view>
 #include <gtl/btree.hpp>
@@ -12,6 +13,15 @@
 // #define DIR_DEBUG LOG_DEBUG
 
 namespace solux {
+
+/// Thrown when a mutation is attempted against storage opened read-only.
+/// Read-only is a node-wide mode (--read-only), but it is enforced here so
+/// that no path - present or future - can put bytes in a data directory this
+/// process does not hold the write lock on.
+class ReadOnlyError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 // Implementations of Directory are thread safe.
 class Directory {

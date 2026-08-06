@@ -48,6 +48,12 @@ public:
 
 /// Factory that creates FSDirectory instances under basePath_/c/<name>.
 /// Shared resources (dictionaries, etc.) live directly under basePath_.
+///
+/// `unowned` opens an existing data directory without claiming it: no
+/// write.lock, no directory creation, no trash reset.  It suppresses only the
+/// open-time side effects, which a Directory wrapper cannot reach because they
+/// happen here in the constructor; rejecting mutations is ReadOnlyDirFactory's
+/// job, and the two are meant to be composed (see SoluxNode::createSingletons).
 class FSDirFactory : public DirectoryFactory {
   std::filesystem::path basePath_;
   std::filesystem::path collectionsPath_;  // basePath_/c
@@ -58,10 +64,19 @@ class FSDirFactory : public DirectoryFactory {
   uint64_t trashSequence_ = 0;
 
 public:
-  explicit FSDirFactory(std::filesystem::path path)
+  explicit FSDirFactory(std::filesystem::path path, bool unowned = false)
       : basePath_(std::move(path)),
         collectionsPath_(basePath_ / "c"),
         trashPath_(basePath_ / "trash") {
+    if (unowned) {
+      if (!std::filesystem::is_directory(collectionsPath_)) {
+        throw ReadOnlyError("data directory does not exist (or holds no collections): " +
+                            basePath_.string());
+      }
+      LOG_INFO("Using existing data directory unowned (no write lock): {}", basePath_.string());
+      return;
+    }
+
     bool created = std::filesystem::create_directories(collectionsPath_);
     if (created) {
       LOG_INFO("Created data directory: {}", basePath_.string());

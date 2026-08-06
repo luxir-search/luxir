@@ -27,8 +27,18 @@ int solux_main(int argc, char** argv) {
     return app.exit(e);
   }
 
-  config.normalize();
-  config.apply();
+  try {
+    config.normalize();
+    config.apply();
+  } catch (const std::exception &e) {
+    LOG_ERROR("Invalid configuration: {}", e.what());
+    return 1;
+  }
+
+  if (config.read_only) {
+    LOG_INFO("Read-only mode: serving {} without the write lock; updates are rejected",
+             config.store.data_dir);
+  }
 
   LOG_INFO("Logging: compile-time={}, runtime={}",
            spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),

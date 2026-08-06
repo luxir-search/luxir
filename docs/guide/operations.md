@@ -51,6 +51,42 @@ stop writes, publish a commit, stop the process, and copy the data directory as
 a unit. Do not infer a supported live-backup protocol merely from immutable
 segment files: the metadata and files still need one consistent capture point.
 
+## Read-only nodes
+
+A data directory has exactly one writer. The owning process takes `write.lock`
+under the data directory at startup and holds it until exit, so a second writer
+against the same directory fails to start rather than corrupting the index.
+
+`--read-only` opens an existing data directory without that lock:
+
+```bash
+solux --read-only --store.backend=fs --store.data-dir=/srv/solux/data
+```
+
+A read-only node writes nothing at all - no lock file, no trash directory, not
+even the data directory itself, which must already exist. It serves searches,
+schema reads, and `_stats`. Every mutation is refused: updates, NDJSON streams,
+schema writes, and collection create/delete return HTTP `403` (gRPC
+`FAILED_PRECONDITION`), and collections are never auto-created. The refusal is
+enforced twice - once at request dispatch for a clean error, and again at the
+storage layer, which rejects any write regardless of the path that reached it.
+
+Use it to query a directory another instance is writing, or to inspect one
+offline without risking a stray write. Three current limitations matter:
+
+- **The view does not advance.** A read-only node pins its index view the first
+  time it serves a query and never reopens, so commits the writer publishes
+  after that point are invisible until the read-only node restarts.
+- **`_stats` reports a different point in time** than searches do: it reflects
+  the directory as it was read at startup, while searches reflect the commit
+  pinned at the first query.
+- **Pinned files are not reclaimed.** Segment files are held open by `mmap`, so
+  files the writer deletes stay on disk until the read-only node exits. A
+  long-lived read-only node against a busy writer holds disk space that `du`
+  attributes to no visible file.
+
+Restart the read-only node to pick up newer commits and release pinned files.
+
 ## Collection lifecycle
 
 Create and delete collections with `POST /collections/_create` and
