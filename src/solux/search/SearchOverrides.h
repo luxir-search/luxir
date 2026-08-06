@@ -56,6 +56,27 @@ enum class FacetFeedStrategy {
   AUTO, BUCKET_DOMAINS, STRING_COLUMN_REPLAY
 };
 
+// How the bucket-domain feed builds the one domain per returned bucket that it
+// hands its result children (SOLUX_FACET_BUCKET_DOMAIN).  POSTINGS seeks each
+// bucket's term and intersects its postings with the incoming domain, so it
+// reads every posting of every returned term; ORD_COLUMN makes one pass over the
+// facet field's ord column and appends each domain document to its bucket's
+// builder, so it reads the domain once no matter how many buckets there are.
+// Coverage decides: postings reads what the RETURNED buckets hold index-wide,
+// the ord column reads the domain.
+//
+// Distinct from FacetFeedStrategy::STRING_COLUMN_REPLAY, which also walks a
+// column but produces no domains at all - it accumulates the child's answer
+// directly.  This one still ends at bucket domains; only their construction
+// changes, so every result child benefits without knowing about it.
+//
+// ORD_COLUMN skips the bucket-count ceiling AUTO applies for peak memory
+// (StrFacetBucketDomainPlan::MAX_BUCKETS): forcing it on a request that returns
+// enormously many buckets builds a domain for every one of them.
+enum class FacetBucketDomainSource {
+  AUTO, POSTINGS, ORD_COLUMN
+};
+
 // Which metric sub-ops a string/ID facet accumulates during the count pass
 // (SOLUX_FACET_SUBOP_INLINE).  Inlining pays the whole domain per metric and
 // covers every bucket; the post-selection bucket-domain feed pays only the
@@ -130,6 +151,20 @@ inline FacetSubOpInlineMode parseFacetSubOpInlineEnv() {
   return FacetSubOpInlineMode::AUTO;
 }
 
+inline FacetBucketDomainSource parseFacetBucketDomainSourceEnv() {
+  const char* e = std::getenv("SOLUX_FACET_BUCKET_DOMAIN");
+  if (e != nullptr) {
+    std::string_view s(e);
+    if (s == "postings") {
+      return FacetBucketDomainSource::POSTINGS;
+    }
+    if (s == "ord_column") {
+      return FacetBucketDomainSource::ORD_COLUMN;
+    }
+  }
+  return FacetBucketDomainSource::AUTO;
+}
+
 inline StrFacetReplaySelector parseStrFacetReplaySelectorEnv() {
   const char* e = std::getenv("SOLUX_FACET_REPLAY_SELECTOR");
   if (e != nullptr && std::string_view(e) == "dense") {
@@ -199,6 +234,8 @@ inline FacetCounterMode parseFacetCounterModeEnv() {
 inline FacetCounterMode forcedFacetCounterMode = parseFacetCounterModeEnv();
 inline StrFacetStrategy forcedStrFacetStrategy = parseStrFacetStrategyEnv();
 inline FacetFeedStrategy forcedFacetFeedStrategy = parseFacetFeedStrategyEnv();
+inline FacetBucketDomainSource forcedFacetBucketDomainSource =
+    parseFacetBucketDomainSourceEnv();
 inline FacetSubOpInlineMode forcedFacetSubOpInline = parseFacetSubOpInlineEnv();
 inline StrFacetReplaySelector forcedStrFacetReplaySelector =
     parseStrFacetReplaySelectorEnv();

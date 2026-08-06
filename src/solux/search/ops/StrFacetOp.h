@@ -1325,6 +1325,83 @@ public:
       return DomainHandle(std::move(domain));
     }
 
+    // Build every returned bucket's domain for every segment in one pass over
+    // the facet field's ord column, instead of one term seek plus postings
+    // intersection per bucket.  Indexed [segment * numBuckets + owner], which is
+    // what the bucket-domain executor asks for.
+    //
+    // A document reaches a builder at most once: ord columns carry each doc's
+    // distinct terms, and the segment-to-global mapping is injective, so no two
+    // stored ords of one document route to the same owner.  DocSetBuilder's
+    // debug monotonicity assert covers the claim.
+    std::vector<DomainHandle> ordColumnBucketDomains(
+        std::span<const SelectedFacetBucket<std::string_view>> buckets) {
+      size_t numBuckets = buckets.size();
+      size_t numSegments = input.size();
+      std::vector<DomainHandle> domains(numSegments * numBuckets);
+      auto selected = StrFacetSelectedOrdMap::selectedBuckets(buckets);
+
+      for (size_t segnum = 0; segnum < numSegments; segnum++) {
+        auto& postingsReader =
+            thisOp().reader.segments()[segnum].postingsReader();
+        int32_t maxDoc = postingsReader.maxDoc();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        // Reserved up front: DocSetBuilder holds a pointer into its own
+        // optional bitset, so it must never be reallocated once built into.
+        std::vector<DocSetBuilder> builders;
+        builders.reserve(numBuckets);
+        for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(maxDoc);
+
+        FieldReader fieldReader(postingsReader);
+        if (fieldReader.seek(thisOp().fieldName)) {
+          SegFieldInfo segFieldInfo;
+          fieldReader.readFieldInfo(segFieldInfo);
+          OrdColReader ordColReader(postingsReader, segFieldInfo);
+          auto mapping = thisOp().ordMap->getSegToGlobal((int32_t)segnum);
+          StrFacetSelectedOrdMap selectedMap(mapping, selected);
+          int64_t missing_num = 0;
+          DocSet* domain = input[segnum].get();
+          selectedMap.visit([&](const auto& ownerOfOrd) {
+            forEachOrdValue(
+                domain, ordColReader, maxDoc, missing_num,
+                [&](int32_t docid, int32_t storedOrd) SOLUX_INLINE {
+                  int32_t owner = StrFacetSelectedOrdMap::owner(
+                      ownerOfOrd, storedOrd);
+                  if (owner >= 0) builders[(size_t)owner].add(docid);
+                });
+          });
+        }
+
+        for (size_t i = 0; i < numBuckets; i++) {
+          domains[segnum * numBuckets + i] =
+              DomainHandle(builders[i].build());
+        }
+      }
+      return domains;
+    }
+
+    // Domain size, index size and returned coverage, for the bucket-domain
+    // construction choice.
+    struct BucketDomainCost {
+      int64_t domainDocs = 0;
+      int64_t maxDocs = 0;
+      int64_t selectedDocs = 0;
+    };
+
+    BucketDomainCost bucketDomainCost(
+        std::span<const SelectedFacetBucket<std::string_view>> buckets) {
+      BucketDomainCost cost;
+      for (size_t segnum = 0; segnum < input.size(); segnum++) {
+        int32_t segmentMax =
+            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+        cost.maxDocs += segmentMax;
+        DocSet* domain = input[segnum].get();
+        cost.domainDocs += domain != nullptr ? domain->card() : segmentMax;
+      }
+      for (const auto& bucket : buckets) cost.selectedDocs += bucket.count;
+      return cost;
+    }
+
     void executeResultChildren(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
       if (thisOp().subOps.empty()) return;
@@ -1374,12 +1451,27 @@ public:
         }
       }
 
+      bool ordColumnDomains = false;
+      if (thisOp().ordMap != nullptr && !buckets.empty()
+          && forcedFacetBucketDomainSource
+                 != FacetBucketDomainSource::POSTINGS) {
+        auto cost = bucketDomainCost(buckets);
+        ordColumnDomains = forcedFacetBucketDomainSource
+                == FacetBucketDomainSource::ORD_COLUMN
+            || StrFacetBucketDomainPlan::ordColumnBeatsPostings(
+                   cost.domainDocs, cost.selectedDocs, cost.maxDocs,
+                   (int64_t)buckets.size());
+      }
+
       if (profileRun != nullptr) {
         for (auto& piece : profileRun->pieces) {
           // The merge callback proves all piece detail writes are finished,
           // but a final ExecutionProfileScope may not yet have set complete.
           // Do not read that non-atomic lifecycle flag here.
           piece.details.emplace_back("result-feed=bucket-domains");
+          piece.details.emplace_back(
+              ordColumnDomains ? "bucket-domain-source=ord-column"
+                               : "bucket-domain-source=postings");
         }
       }
 
@@ -1390,9 +1482,16 @@ public:
         children.push_back(child);
       }
 
+      std::vector<DomainHandle> built;
+      if (ordColumnDomains) built = ordColumnBucketDomains(buckets);
+
       FacetBucketDomainExecutor::execute(
           *this, children, buckets, (int32_t)input.size(),
-          [this](int32_t segment, const auto& bucket) {
+          [&](int32_t segment, const auto& bucket) {
+            if (ordColumnDomains) {
+              return built[(size_t)segment * buckets.size()
+                           + (size_t)bucket.owner.value];
+            }
             return materializeBucketDomain(segment, bucket);
           });
     }

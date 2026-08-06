@@ -48,6 +48,67 @@ struct StrFacetColumnReplayPlan {
   }
 };
 
+// Which of the two constructions the bucket-domain feed uses to produce the one
+// domain per returned bucket.  Both end at the same DocSets; they differ in what
+// they read to get there.
+//
+//   postings: seek each returned bucket's term and intersect its postings with
+//     the incoming domain.  Reads what the returned buckets hold INDEX-WIDE,
+//     plus a dictionary seek per bucket, and re-walks the domain once per
+//     bucket.
+//   ord column: one pass over the facet field's ord column, appending each
+//     domain document to its bucket's builder.  Reads the DOMAIN, once, whatever
+//     the bucket count.
+//
+// So the discriminator is coverage against selectivity, not either alone.  A
+// bucket's index-wide docFreq is not known here without paying the seek the
+// choice is about, so it is estimated from the bucket's in-domain count under
+// the assumption that the filter and the facet field are uncorrelated:
+//   docFreq ~ count * maxDocs / domainDocs
+// A correlated filter makes that an over-estimate and can pick the column where
+// postings would have won; the loss is bounded, because the column pass costs
+// about what the count pass that just ran cost, while the postings side has no
+// such bound - at cardinality 10 and a 1% filter it reads every posting of all
+// ten returned terms, 100x the domain.
+struct StrFacetBucketDomainPlan {
+  // A dictionary seek decodes a term block; charged in units of the per-document
+  // work the column pass does.  An order-of-magnitude charge, not a fitted one:
+  // at a facet limit of 10 over 300k documents it is worth at most 0.2 of the
+  // ratio below and decides no cell of the measured grid, so that grid does not
+  // validate it.  It exists because the seeks are real and grow with the bucket
+  // count, and MAX_BUCKETS bounds what it can claim.
+  static constexpr int64_t SEEK_DOC_EQUIVALENT = 64;
+  // The column must beat the postings estimate by this factor to displace it: a
+  // postings block decode is streaming and vectorized, and gets cheaper still as
+  // the domain densifies into bit windows, while the column pass pays an advance
+  // per domain document.
+  //
+  // Fitted, on a 300k slice, one metric per bucket, facet limit 10, 42 cells.
+  // Measured column/postings qps against the ratio this rule computes: 0.68 at
+  // ratio 1.0, 0.78 at 2.0, 1.02 at 1.8, then 1.22-1.25 at 4.0-5.3, 2.8-8.9 at
+  // 18-99, decaying back to ~1.0 by ratio 2,000 where the domain is small enough
+  // that fixed costs are all that is left.  The one cell in [2,3) loses 1.28x
+  // and the cells at [4,5.3] win 1.22-1.25x, so the crossover is just under 3.
+  static constexpr int64_t MARGIN = 3;
+  // The column pass builds every bucket's domain at once, so it holds
+  // numBuckets x numSegments DocSets where postings holds one.  The seek term
+  // above grows without bound in the bucket count and would otherwise recommend
+  // the column for exactly the enormous bucket counts whose peak memory it
+  // cannot afford.  Same ceiling as the nested-facet replay's owner count, for
+  // the same reason.
+  static constexpr int64_t MAX_BUCKETS = 1'024;
+
+  static bool ordColumnBeatsPostings(int64_t domainDocs, int64_t selectedDocs,
+                                     int64_t maxDocs, int64_t numBuckets) {
+    if (domainDocs <= 0 || maxDocs <= 0 || numBuckets <= 0) return false;
+    if (numBuckets > MAX_BUCKETS) return false;
+    __int128 postingsRead =
+        (__int128)selectedDocs * maxDocs / domainDocs
+        + (__int128)numBuckets * SEEK_DOC_EQUIVALENT;
+    return (__int128)domainDocs * MARGIN <= postingsRead;
+  }
+};
+
 class StrFacetSelectedOrdMap {
 public:
   using Dense = std::vector<int32_t>;

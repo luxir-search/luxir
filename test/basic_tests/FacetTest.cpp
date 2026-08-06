@@ -182,6 +182,14 @@ public:
   }
 };
 
+class FacetBucketDomainSourceGuard {
+  FacetBucketDomainSource saved = forcedFacetBucketDomainSource;
+public:
+  ~FacetBucketDomainSourceGuard() {
+    forcedFacetBucketDomainSource = saved;
+  }
+};
+
 class StrFacetReplayGuard {
   StrFacetReplaySelector savedSelector = forcedStrFacetReplaySelector;
   StrFacetReplayBankStrategy savedBank = forcedStrFacetReplayBank;
@@ -2019,6 +2027,146 @@ TEST_F(FacetTest, subOpInlineAutoFollowsBucketCoverage) {
   // No sort key: the count pass is free to take a strategy the inline path
   // cannot reach, so coverage alone does not move the extras.
   EXPECT_NE(feedDetails("cat_s", false).find("result-feed="), std::string::npos);
+}
+
+// The two bucket-domain constructions answer identically.  POSTINGS seeks each
+// returned bucket's term and intersects its postings; COLUMN_REPLAY makes one
+// pass over the ord column and appends each domain document to its bucket.
+// They differ only in cost, so this pins them equal across segment seams,
+// multi-values, deleted documents, an absent-field segment and both domain
+// shapes - a cost rule cannot be written on a path that answers differently.
+TEST_F(FacetTest, bucketDomainSourcesAgree) {
+  CollectionHelper helper;
+  helper.clear();
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "cat_s", "middle", "tags_ss", vecs("x", "y"),
+              "foo_i", 10, "sel_s", "yes"),
+      flatdoc("id", "deleted", "cat_s", "deleted-value",
+              "tags_ss", vecs("x", "z"), "foo_i", 99, "sel_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      // Segment 1 shifts local ords in the global dictionary.
+      flatdoc("id", "b", "cat_s", "alpha", "tags_ss", vecs("y", "z"),
+              "foo_i", 20, "sel_s", "yes"),
+      // No foo_i: the metric must skip the document, not read it as zero.
+      flatdoc("id", "c", "cat_s", "zulu", "tags_ss", vecs("y"), "sel_s", "no"),
+  }, UpdateMessage::COMMIT).success);
+  // Segment 2 omits both faceted fields.
+  ASSERT_TRUE(helper.index(flatdoc("id", "absent", "foo_i", 7, "sel_s", "yes"),
+                           UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  FacetBucketDomainSourceGuard guard;
+  // A finite limit with no sort key keeps the metrics on the post-selection
+  // feed, which is the stage under test.
+  auto addFacets = [](auto& cursor) {
+    for (std::string_view field : {"cat_s", "tags_ss"}) {
+      auto& facet = cursor.facet(field, field).limit(10).mincount(1);
+      facet.avg("avg_foo", "foo_i");
+      facet.max("max_foo", "foo_i");
+    }
+  };
+  auto run = [&](FacetBucketDomainSource source, int domainKind) {
+    forcedFacetBucketDomainSource = source;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    if (domainKind == 0) {
+      addFacets(*req);
+    } else {
+      auto& top = req->topDocs("q");
+      top.getNumber(true).matchQuery(
+          "sel_s", domainKind == 1 ? "yes" : "does-not-exist");
+      addFacets(top);
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::vector<std::byte>> encoded;
+    for (std::string_view field : {"cat_s", "tags_ss"}) {
+      const api::FacetResult* result;
+      if (domainKind == 0) {
+        result = req->responses[0]->proto.ops.at(field)->facetResult();
+      } else {
+        const auto* docs = req->docList("q");
+        EXPECT_NE(nullptr, docs);
+        result = docs == nullptr ? nullptr : docs->ops.at(field)->facetResult();
+      }
+      EXPECT_NE(nullptr, result);
+      encoded.emplace_back();
+      if (result != nullptr) {
+        EXPECT_TRUE(api::encode(*result, encoded.back()));
+      }
+    }
+    return encoded;
+  };
+
+  for (int domainKind : {0, 1, 2}) {
+    auto expected = run(FacetBucketDomainSource::POSTINGS, domainKind);
+    EXPECT_EQ(expected, run(FacetBucketDomainSource::ORD_COLUMN, domainKind))
+        << "domainKind=" << domainKind;
+    EXPECT_EQ(expected, run(FacetBucketDomainSource::AUTO, domainKind))
+        << "domainKind=" << domainKind;
+  }
+}
+
+// AUTO chooses the construction on coverage against selectivity, not on either
+// alone.  A narrow facet over a filtered domain returns buckets holding the
+// whole domain, so postings would read every posting of every returned term -
+// far more than the domain - and replay wins.  A wide facet over the unfiltered
+// index returns a sliver, so postings reads only that sliver and replay would
+// have to walk the whole column.
+TEST_F(FacetTest, bucketDomainAutoFollowsCoverage) {
+  CollectionHelper helper;
+  helper.clear();
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i),
+                           "cat_s", "c" + std::to_string(i % 4),
+                           "wide_s", "w" + std::to_string(i),
+                           "foo_i", (int64_t)i,
+                           "sel_s", i % 20 == 0 ? "yes" : "no"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto sourceDetails = [&](std::string_view field, bool filtered) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").profile();
+    auto addFacet = [&](auto& cursor) {
+      cursor.facet("f", field).limit(5).avg("avg_foo", "foo_i");
+    };
+    if (filtered) {
+      auto& top = req->topDocs("q");
+      top.getNumber(true).matchQuery("sel_s", "yes");
+      addFacet(top);
+    } else {
+      addFacet(*req);
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::string details;
+    const auto& profile = req->responses[0]->proto.profile;
+    EXPECT_TRUE(profile.has_value()) << req->toString();
+    if (profile) {
+      for (const auto& op : profile->ops) {
+        for (const auto& piece : op.pieces) {
+          for (const auto& detail : piece.details) {
+            details += std::string(detail) + ";";
+          }
+        }
+      }
+    }
+    return details;
+  };
+
+  // 4 buckets over a 1/20 filter: the five returned buckets hold the whole
+  // domain, and their terms hold twenty times it.
+  EXPECT_NE(sourceDetails("cat_s", true).find(
+                "bucket-domain-source=ord-column"),
+            std::string::npos);
+  // 2000 buckets over every document: five of them hold five documents.
+  EXPECT_NE(sourceDetails("wide_s", false).find(
+                "bucket-domain-source=postings"),
+            std::string::npos);
 }
 
 // Facet sorted by an inline sub-op (avg) with a finite limit.  This exercises
