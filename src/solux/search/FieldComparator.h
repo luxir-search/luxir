@@ -349,6 +349,28 @@ public:
 };
 
 // A comparator for string fields that uses global ordinals for efficient cross-segment comparison
+// Selected segment ord for sorting: single-valued docs read their one ord;
+// multi-valued docs sort by their smallest ord ascending and largest ord
+// descending (min/max term semantics). Returns 0 for missing.
+inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
+                               bool descending) {
+  if (!reader.multiValued()) return reader.ordAt(docid);
+  if (!descending) return reader.firstOrdAt(docid);
+  const DocsReader& docs = reader.docsReader();
+  int32_t docRank;
+  if (!docs.hasBitset()) {
+    docRank = docid;
+  } else {
+    screaming::BitSet::Iterator iter(docs.bitset());
+    if (iter.advance(docid) != docid) return 0;
+    docRank = iter.rank();
+  }
+  auto [start, end] = reader.getStartEndValueRank(docRank);
+  assert(start < end);
+  OrdColReader::PointOrds ords(reader);
+  return ords.valueAt(end - 1);
+}
+
 class GlobalOrdComparator : public FieldComparator {
   std::string fieldName;
   std::shared_ptr<OrdMap> ordMap;
@@ -400,17 +422,16 @@ public:
       }
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
-        assert(!reader->multiValued());
       }
     }
   }
-  
+
   int64_t getGlobalOrd(int32_t docid) {
     if (!reader.has_value()) {
       return missingOrd;
     }
 
-    int64_t segmentOrd = reader->ordAt(docid);
+    int64_t segmentOrd = selectedSortOrd(*reader, docid, sortMultiplier < 0);
     if (segmentOrd == 0) {
       // Ordinal 0 means missing value
       return missingOrd;
@@ -539,26 +560,9 @@ class SegmentOrdComparator : public FieldComparator {
     slot.length = (uint32_t)value.size();
   }
 
-  int32_t maxOrdAt(int32_t docid) const {
-    const DocsReader& docs = reader->docsReader();
-    int32_t docRank;
-    if (!docs.hasBitset()) {
-      docRank = docid;
-    } else {
-      screaming::BitSet::Iterator iter(docs.bitset());
-      if (iter.advance(docid) != docid) return 0;
-      docRank = iter.rank();
-    }
-    auto [start, end] = reader->getStartEndValueRank(docRank);
-    assert(start < end);
-    OrdColReader::PointOrds ords(*reader);
-    return ords.valueAt(end - 1);
-  }
-
   int32_t selectedOrd(int32_t docid) const {
     if (!reader.has_value()) return 0;
-    if (!reader->multiValued()) return reader->ordAt(docid);
-    return sortMultiplier > 0 ? reader->firstOrdAt(docid) : maxOrdAt(docid);
+    return selectedSortOrd(*reader, docid, sortMultiplier < 0);
   }
 
 public:

@@ -1388,6 +1388,34 @@ TEST_F(SortCollectorTest, SegmentOrdMultiValuedSelectsMinAscAndMaxDesc) {
   EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d3", "d4"}), run(qb::DESC));
 }
 
+// A single segment routes to GlobalOrdComparator in both modes; it must apply
+// the same min-asc/max-desc multi-valued selection as SegmentOrdComparator.
+TEST_F(SortCollectorTest, SingleSegmentMultiValuedStringSort) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "d1", "tags_ss", vecs("m", "z")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d2", "tags_ss", vecs("a", "y")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d3", "tags_ss", vecs("b", "c")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "d4"), UpdateMessage::COMMIT);
+
+  for (StringSortMode mode : {StringSortMode::SEGMENT, StringSortMode::GLOBAL}) {
+    StringSortModeGuard guard(mode);
+    auto run = [&](qb::SortDir direction) {
+      auto req = localReq(soluxNode->getSearchEngine());
+      req->collection("main");
+      auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
+      qb::sort(cur, "tags_ss", direction);
+      req->execute(true);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      return resultIds(*req);
+    };
+    EXPECT_EQ((std::vector<std::string>{"d2", "d3", "d1", "d4"}), run(qb::ASC));
+    EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d3", "d4"}), run(qb::DESC));
+  }
+}
+
 TEST_F(SortCollectorTest, SortByPriceAscending) {
   CollectionHelper helper;
 
