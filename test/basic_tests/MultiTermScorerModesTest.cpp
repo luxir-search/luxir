@@ -154,8 +154,8 @@ void expectSelectionAndEarlyExit(TestIndex& ti) {
     ASSERT_NE(scorer, nullptr);
     EXPECT_EQ(eager, dynamic_cast<MultiTermQuery::Scorer*>(scorer) != nullptr);
     EXPECT_EQ(windowed,
-              dynamic_cast<MultiTermQuery::LazyScorer*>(scorer) != nullptr);
-    EXPECT_EQ(heap, dynamic_cast<MultiTermQuery::HeapScorer*>(scorer) != nullptr);
+              dynamic_cast<UnionLazyScorer*>(scorer) != nullptr);
+    EXPECT_EQ(heap, dynamic_cast<UnionHeapScorer*>(scorer) != nullptr);
     for (int i = 0; i < 3; i++) {
       ASSERT_NE(PostingsReader::END, scorer->next());
     }

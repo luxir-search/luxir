@@ -302,7 +302,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     EXPECT_TRUE(weight->allowsPruning());
     auto* supplier = weight->scorerSupplier(pool, segment);
     auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
-    ASSERT_NE(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
     EXPECT_EQ(0, scorer->next());
     scorer->setMinCompetitiveScore(
         std::nextafter(1.0f, std::numeric_limits<float>::infinity()));
@@ -318,7 +318,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto* supplier = weight->scorerSupplier(pool, segment);
     auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
-    ASSERT_NE(dynamic_cast<MultiTermQuery::HeapScorer*>(scorer), nullptr);
+    ASSERT_NE(dynamic_cast<UnionHeapScorer*>(scorer), nullptr);
     EXPECT_EQ(0, scorer->next());
     scorer->setMinCompetitiveScore(
         std::nextafter(1.0f, std::numeric_limits<float>::infinity()));
@@ -335,7 +335,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     auto* supplier = weight->scorerSupplier(pool, segment);
     auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
     ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
-    EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    EXPECT_EQ(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
   }
 
   {
@@ -348,7 +348,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     auto* supplier = weight->scorerSupplier(pool, segment);
     auto* scorer = supplier->get(pool, 1);
     ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
-    EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    EXPECT_EQ(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
   }
 
   // Unscored contexts stay eager no matter which mode is forced.
@@ -360,7 +360,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     PrefixQuery prefix("foo_w", "pre");
     auto* scorer = prefix.createWeight(context, 0)->createScorer(pool, segment);
     ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
-    EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    EXPECT_EQ(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
     int32_t count = 0;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
       count++;
@@ -412,10 +412,10 @@ TEST_F(PrefixQueryTest, lazyCrossoverRoutesHugeExpansionToHeap) {
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
         ->createScorer(pool, context.topReader.segments()[0]);
     if (mode == ScorerMode::AUTO) {
-      ASSERT_NE(dynamic_cast<MultiTermQuery::HeapScorer*>(scorer), nullptr);
+      ASSERT_NE(dynamic_cast<UnionHeapScorer*>(scorer), nullptr);
     } else {
       // The forced windowed arm has no term cap.
-      ASSERT_NE(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+      ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
     }
     int32_t count = 0;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
