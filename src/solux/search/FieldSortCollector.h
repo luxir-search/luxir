@@ -69,14 +69,12 @@ public:
     };
     std::unique_ptr<ExprState> expr;
 
-    RuntimeClause(const SortClause& descriptor, int32_t topCount,
-                  IndexReader* reader)
+    RuntimeClause(const SortClause& descriptor, IndexReader* reader)
       : descriptor(descriptor) {
       if (descriptor.getKind() == SortClause::COLUMN) {
-        comparator = descriptor.getSortField().createComparator(topCount, reader);
+        comparator = descriptor.getSortField().createComparator(reader);
       } else if (descriptor.getKind() == SortClause::EXPR) {
         expr = std::make_unique<ExprState>();
-        expr->slots.resize((size_t)topCount);
         expr->isDouble =
             descriptor.getValueProgram().root().type == ValueType::DOUBLE;
         expr->desc = descriptor.getOrder() == SortField::DESC;
@@ -144,7 +142,13 @@ public:
 
   int64_t hitCount = 0;
   int64_t topCount;
-  std::vector<SortDoc> topDocs;
+  // Slot storage (comparator values, EXPR slots) is grown on demand rather
+  // than allocated for topCount up front.  Slots are minted densely in
+  // increasing order, and only on cold paths (warmup, collectWindow's fill
+  // loop, an underfull merge), so those paths grow all clauses in lockstep
+  // before the first write to a new slot.  slotCapacity is what has been
+  // grown so far; it doubles up to topCount.
+  int64_t slotCapacity = 0;
   std::vector<RuntimeClause> clauses;
   // Single-column plans keep the pre-clause-walk cost on the per-doc admission
   // path: one direct virtual compareBottom instead of the generic clause walk
@@ -154,7 +158,9 @@ public:
   bool hasExpr = false;
   bool needsScores = true;
   bool needsSort = true;
-  std::unique_ptr<DirectPQ<SortDoc, FieldSortComparatorFunctor>> pq;
+  // Owns the SortDoc storage and expands it as hits arrive; topCount bounds
+  // the heap but is not allocated up front (limit=-1 maps to maxDoc).
+  ExpandingPQ<SortDoc, FieldSortComparatorFunctor> pq;
 
   // String-sort candidate pruning state, all segment-local. The union is a
   // conservative candidate superset built from the primary comparator's
@@ -219,13 +225,17 @@ public:
 public:
   FieldSortCollector(int64_t topCount, const std::vector<SortClause>& clauses,
                      IndexReader* reader = nullptr, bool needsScores = true)
-    : topCount(topCount), topDocs(topCount), needsScores(needsScores) {
+    : topCount(topCount), needsScores(needsScores),
+      pq((size_t)std::max(topCount, (int64_t)0), FieldSortComparatorFunctor(this)) {
     assert(topCount >= 0);
+    // Slot indexes are int32 (SortDoc::slot, FieldComparator::growSlots), so
+    // the capacity math in growSlotStorage never narrows out of range.
+    assert(topCount <= std::numeric_limits<int32_t>::max());
     assert(!clauses.empty());
 
     this->clauses.reserve(clauses.size());
     for (const auto& clause : clauses) {
-      this->clauses.emplace_back(clause, (int32_t)topCount, reader);
+      this->clauses.emplace_back(clause, reader);
     }
     if (this->clauses.size() == 1 && this->clauses[0].comparator != nullptr) {
       soleColumn = this->clauses[0].comparator.get();
@@ -236,9 +246,6 @@ public:
     for (const RuntimeClause& clause : this->clauses) {
       hasExpr |= clause.descriptor.getKind() == SortClause::EXPR;
     }
-
-    FieldSortComparatorFunctor comp(this);
-    pq = std::make_unique<DirectPQ<SortDoc, FieldSortComparatorFunctor>>(topDocs, comp);
   }
 
   // The pq's functor holds a back-pointer to this collector; moving would leave
@@ -266,7 +273,7 @@ public:
         clause.comparator->setSegment(segment, reader);
       }
     }
-    if (topCount > 0 && pq->size() == (size_t)topCount) setBottom();
+    if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
@@ -314,27 +321,6 @@ public:
     return (docA.doc > docB.doc) - (docA.doc < docB.doc);
   }
 
-  void copy(int32_t slot, segdoc doc, float score) {
-    for (auto& clause : clauses) {
-      if (clause.comparator != nullptr) clause.comparator->copy(slot, doc);
-      else if (clause.descriptor.getKind() == SortClause::EXPR) {
-        clause.copyCurrent(slot, doc, score);
-      }
-    }
-  }
-
-  void copy(int32_t slot, FieldSortCollector& other,
-            int32_t otherSlot, segdoc otherDoc) {
-    for (size_t i = 0; i < clauses.size(); i++) {
-      if (clauses[i].comparator != nullptr) {
-        clauses[i].comparator->copy(
-          slot, *other.clauses[i].comparator, otherSlot, otherDoc);
-      } else if (clauses[i].descriptor.getKind() == SortClause::EXPR) {
-        clauses[i].copyFrom(slot, other.clauses[i], otherSlot);
-      }
-    }
-  }
-
   // The rejected-doc path must stay small enough to inline into the collectTopK
   // loop (with the clause walk, copy loops, and heap sift inlined here, the
   // per-doc call overhead alone cost ~10% on single-field sort benchmarks), so
@@ -344,12 +330,12 @@ public:
     if (topCount == 0) return;
 
     segdoc doc(segment, docid);
-    if (pq->size() < (size_t)topCount) {
+    if (pq.size() < (size_t)topCount) {
       warmup(doc, score);
       return;
     }
 
-    SortDoc& bottom = pq->top();
+    SortDoc& bottom = pq.top();
     int cmp;
     if (soleColumn != nullptr) [[likely]] {
       cmp = soleColumn->compareBottom(bottom.slot, bottom.doc, doc);
@@ -404,12 +390,12 @@ public:
 
     int64_t block = (int64_t)from / blockSize;
     int64_t blockCount = batch->keyBlockCount();
-    if (pq->size() < (size_t)topCount) {
+    if (pq.size() < (size_t)topCount) {
       // No bound yet; re-consult at the next block boundary.
       return {from, blockEnd(block, blockSize)};
     }
-    int64_t bottomKey = batch->slotKeys[pq->top().slot];
-    segdoc bottomDoc = pq->top().doc;
+    int64_t bottomKey = batch->slotKeys[pq.top().slot];
+    segdoc bottomDoc = pq.top().doc;
     bool soleSort = clauses.size() == 1;
     int32_t doc = from;
     for (; block < blockCount; block++) {
@@ -446,27 +432,28 @@ public:
           docs.subspan(chunkStart, chunkEnd - chunkStart),
           std::span<int64_t>(keys, chunkEnd - chunkStart));
 
-      while (i < chunkEnd && pq->size() < (size_t)topCount) {
-        int32_t slot = (int32_t)pq->size();
+      while (i < chunkEnd && pq.size() < (size_t)topCount) {
+        int32_t slot = (int32_t)pq.size();
+        ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
         batch->slotKeys[slot] = keys[i - chunkStart];
-        pq->insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
+        pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
         i++;
       }
       if (i == chunkEnd) continue;
 
-      int64_t bottomKey = batch->slotKeys[pq->top().slot];
+      int64_t bottomKey = batch->slotKeys[pq.top().slot];
       for (; i < chunkEnd; i++) {
         int64_t key = keys[i - chunkStart];
         segdoc doc(segment, docs[i]);
         if (key > bottomKey) continue;
-        if (key == bottomKey && doc >= pq->top().doc) continue;
+        if (key == bottomKey && doc >= pq.top().doc) continue;
 
-        SortDoc& bottom = pq->top();
+        SortDoc& bottom = pq.top();
         int32_t slot = bottom.slot;
         batch->slotKeys[slot] = key;
         bottom = SortDoc(doc, 0.0f, slot);
-        pq->updateTop();
-        bottomKey = batch->slotKeys[pq->top().slot];
+        pq.updateTop();
+        bottomKey = batch->slotKeys[pq.top().slot];
       }
     }
   }
@@ -495,7 +482,7 @@ private:
       candidatesDisabled = true;
       return {from, PostingsReader::END};
     }
-    if (pq->size() < (size_t)topCount) {
+    if (pq.size() < (size_t)topCount) {
       return {from, probeDeferral(from)};
     }
     if (candidates == nullptr && from < nextProbeDoc) {
@@ -503,7 +490,7 @@ private:
     }
     FieldComparator::CompetitiveOrdState state;
     auto status = clauses[0].comparator->competitiveOrdInterval(
-        state, pq->top().slot, pq->top().doc, segment, from,
+        state, pq.top().slot, pq.top().doc, segment, from,
         clauses.size() == 1);
     if (status == FieldComparator::OrdIntervalStatus::UNSUPPORTED) {
       candidatesDisabled = true;
@@ -591,11 +578,58 @@ private:
     return true;
   }
 
+  // Grow every clause's slot storage in lockstep, doubling up to topCount.
+  // Must be called (via ensureSlotCapacity) before the first write to a new
+  // slot; that includes direct KeyBatch::slotKeys writes, which growSlots
+  // re-points at the resized storage.
+  SOLUX_NOINLINE void growSlotStorage(int64_t required) {
+    assert(required <= topCount);
+    int64_t capacity = std::min(topCount,
+        std::max({required, slotCapacity * 2, (int64_t)64}));
+    for (auto& clause : clauses) {
+      if (clause.comparator != nullptr) {
+        clause.comparator->growSlots((int32_t)capacity);
+      } else if (clause.expr != nullptr) {
+        resizeExact(clause.expr->slots, (size_t)capacity);
+      }
+    }
+    slotCapacity = capacity;
+  }
+
+  void ensureSlotCapacity(int64_t required) {
+    if (required > slotCapacity) growSlotStorage(required);
+  }
+
+  // Private because writing a slot is only safe after ensureSlotCapacity has
+  // covered it; every caller is on a path that just did so (or reuses a slot
+  // already in the heap).
+  void copy(int32_t slot, segdoc doc, float score) {
+    for (auto& clause : clauses) {
+      if (clause.comparator != nullptr) clause.comparator->copy(slot, doc);
+      else if (clause.descriptor.getKind() == SortClause::EXPR) {
+        clause.copyCurrent(slot, doc, score);
+      }
+    }
+  }
+
+  void copy(int32_t slot, FieldSortCollector& other,
+            int32_t otherSlot, segdoc otherDoc) {
+    for (size_t i = 0; i < clauses.size(); i++) {
+      if (clauses[i].comparator != nullptr) {
+        clauses[i].comparator->copy(
+          slot, *other.clauses[i].comparator, otherSlot, otherDoc);
+      } else if (clauses[i].descriptor.getKind() == SortClause::EXPR) {
+        clauses[i].copyFrom(slot, other.clauses[i], otherSlot);
+      }
+    }
+  }
+
   SOLUX_NOINLINE void warmup(segdoc doc, float score) {
-    int32_t slot = (int32_t)pq->size();
+    int32_t slot = (int32_t)pq.size();
+    ensureSlotCapacity(slot + 1);
     copy(slot, doc, score);
-    pq->insert(SortDoc(doc, score, slot));
-    if (pq->size() == (size_t)topCount) setBottom();
+    pq.insert(SortDoc(doc, score, slot));
+    if (pq.size() == (size_t)topCount) setBottom();
   }
 
   SOLUX_NOINLINE int compareCurrentDoc(const SortDoc& bottom, segdoc doc, float score) const {
@@ -606,12 +640,12 @@ private:
   SOLUX_NOINLINE void admit(SortDoc& bottom, segdoc doc, float score) {
     copy(bottom.slot, doc, score);
     bottom = SortDoc(doc, score, bottom.slot);
-    pq->updateTop();
+    pq.updateTop();
     setBottom();
   }
 
   void setBottom() {
-    int32_t slot = pq->top().slot;
+    int32_t slot = pq.top().slot;
     for (auto& clause : clauses) {
       if (clause.comparator != nullptr) clause.comparator->setBottom(slot);
     }
@@ -620,21 +654,23 @@ private:
 public:
 
   void merge(FieldSortCollector& other) {
+    // Self-merge would iterate a span that insert() can reallocate out from under us.
+    assert(this != &other);
     hitCount += other.hitCount;
     needsSort = true;
 
-    for (int64_t i = 0; i < (int64_t)other.pq->size(); i++) {
-      const auto& otherDoc = other.topDocs[(size_t)i];
-      if (pq->size() < (size_t)topCount) {
-        int32_t slot = (int32_t)pq->size();
+    for (const SortDoc& otherDoc : other.pq.span()) {
+      if (pq.size() < (size_t)topCount) {
+        int32_t slot = (int32_t)pq.size();
+        ensureSlotCapacity(slot + 1);
         copy(slot, other, otherDoc.slot, otherDoc.doc);
-        pq->insert(SortDoc(otherDoc.doc, otherDoc.score, slot));
+        pq.insert(SortDoc(otherDoc.doc, otherDoc.score, slot));
       } else {
-        SortDoc& bottom = pq->top();
+        SortDoc& bottom = pq.top();
         if (compare(bottom, otherDoc, CompareSource::OTHER, &other) > 0) {
           copy(bottom.slot, other, otherDoc.slot, otherDoc.doc);
           bottom = SortDoc(otherDoc.doc, otherDoc.score, bottom.slot);
-          pq->updateTop();
+          pq.updateTop();
         }
       }
     }
@@ -645,21 +681,21 @@ public:
   }
 
   uint64_t size() const {
-    return pq->size();
+    return pq.size();
   }
 
   std::span<SortDoc> sort() {
-    auto finalSize = size();
+    std::span<SortDoc> docs = pq.span();
     if (needsSort) {
       FieldSortComparatorFunctor comp(this);
-      std::sort_heap(topDocs.begin(), topDocs.begin() + finalSize, comp);
+      std::sort_heap(docs.begin(), docs.end(), comp);
       needsSort = false;
     }
-    return {topDocs.data(), finalSize};
+    return docs;
   }
 
   std::span<SortDoc> scoreDocs() {
-    return {topDocs.data(), size()};
+    return pq.span();
   }
 };
 

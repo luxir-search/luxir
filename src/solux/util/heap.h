@@ -318,11 +318,26 @@ public:
     return maxSize;
   }
 
+  /// Allocated backing storage in elements, distinct from capacity() (the
+  /// logical bound).  Never exceeds capacity(): growth doubles then clamps.
+  size_t storageCapacity() const {
+    return heap.capacity();
+  }
+
   /// The underlying storage; every element in the span is live heap contents.
   /// Reordering through this (e.g. std::sort_heap) breaks the heap invariant, after
   /// which only span()/size() remain valid.
   std::span<T> span() {
     return heap;
+  }
+
+  /// Move out the backing vector (exactly the live heap contents, in heap order),
+  /// invalidating any previously obtained span().  The queue is left empty and
+  /// may only be refilled or destroyed.
+  std::vector<T> release() {
+    std::vector<T> out = std::move(heap);
+    heap.clear();  // moved-from is only "valid but unspecified"; make empty real
+    return out;
   }
 
   /// Call this to re-heapify after top() was modified
@@ -333,6 +348,12 @@ public:
   /// Insert only if max size has not been reached.  Use insertWithOverflow otherwise.
   void insert(const T& elem) {
     assert(heap.size() < maxSize);
+    if (heap.size() == heap.capacity()) {
+      // Grow explicitly: push_back's own doubling would overshoot maxSize by
+      // up to 2x on the final step; reserve is exact and clamps at the bound.
+      heap.reserve(std::min(maxSize,
+                            std::max(heap.capacity() * 2, initialReserve)));
+    }
     heap.push_back(elem);
     if (heap.size() > 1) {
       std::push_heap(heap.begin(), heap.end(), comp);

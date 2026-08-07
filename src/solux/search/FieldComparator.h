@@ -73,6 +73,12 @@ public:
   // Copy the value from a different comparator to this comparator
   virtual void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) = 0;
 
+  // Grow per-slot storage to hold at least `capacity` slots.  The collector
+  // mints slots densely and calls this before the first write to a new slot,
+  // so storage need not be allocated for the worst-case bound up front.
+  // Implementations that publish KeyBatch::slotKeys must re-point it here.
+  virtual void growSlots(int32_t capacity) = 0;
+
   virtual KeyBatch* keyBatch() { return nullptr; }
 
   // Optional competitive segment-ord interval for string-sort pruning,
@@ -208,12 +214,10 @@ class SimpleNumericFieldComparator : public FieldComparator,
   }
 
 public:
-  SimpleNumericFieldComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
+  SimpleNumericFieldComparator(const std::string& fieldName, bool reversed, MissingValue missingValue)
     : fieldName(fieldName),
-      values(numHits),
       sortMultiplier(reversed ? -1 : 1) {
-    slotKeys = values;
-    
+
     // Missing placement is a fixed edge regardless of direction (the string
     // comparators and expression sort keys follow the same convention), so
     // the substitute is chosen in the TRANSFORMED key space: getDocValue
@@ -257,6 +261,12 @@ public:
 
   FieldComparator::KeyBatch* keyBatch() override {
     return this;
+  }
+
+  void growSlots(int32_t capacity) override {
+    if ((size_t)capacity <= values.size()) return;
+    resizeExact(values, (size_t)capacity);
+    slotKeys = values;
   }
 
   // Dense single-valued columns map doc == value rank, so the per-4096-value
@@ -410,11 +420,10 @@ class GlobalOrdComparator : public FieldComparator {
   int64_t missingOrd;
 
 public:
-  GlobalOrdComparator(const std::string& fieldName, std::shared_ptr<OrdMap> ordMap, 
-                      int numHits, bool reversed, MissingValue missingValue)
+  GlobalOrdComparator(const std::string& fieldName, std::shared_ptr<OrdMap> ordMap,
+                      bool reversed, MissingValue missingValue)
     : fieldName(fieldName),
       ordMap(ordMap),
-      globalOrds(numHits),
       sortMultiplier(reversed ? -1 : 1) {
     
     // For string fields, ordinal 0 means missing value
@@ -456,6 +465,12 @@ public:
     }
   }
 
+  void growSlots(int32_t capacity) override {
+    if ((size_t)capacity > globalOrds.size()) {
+      resizeExact(globalOrds, (size_t)capacity);
+    }
+  }
+
   // Identity mapping only (ordMap == nullptr, the single-segment selection):
   // slot values are then raw segment ords times the direction, so the bottom
   // slot converts straight back to a segment-ord bound. The multi-segment
@@ -472,6 +487,7 @@ public:
     if (missingOrd == std::numeric_limits<int64_t>::min()) {
       return OrdIntervalStatus::PENDING;
     }
+    assert(bottomSlot >= 0 && bottomSlot < (int32_t)globalOrds.size());
     int64_t key = globalOrds[(size_t)bottomSlot];
     if (key == missingOrd) return OrdIntervalStatus::PENDING;
     int64_t ord = sortMultiplier < 0 ? -key : key;
@@ -633,11 +649,10 @@ class SegmentOrdComparator : public FieldComparator {
   }
 
 public:
-  SegmentOrdComparator(const std::string& fieldName, int numHits,
+  SegmentOrdComparator(const std::string& fieldName,
                        bool reversed, MissingValue missingValue)
     : fieldName(fieldName),
       enumPoolStart(enumPool.getSavePoint()),
-      slots(numHits),
       sortMultiplier(reversed ? -1 : 1),
       // GlobalOrdComparator keeps its missing sentinel at the requested edge.
       missingSortCmp((missingValue == MISSING_FIRST ? -1 : 1) * sortMultiplier),
@@ -662,6 +677,10 @@ public:
     }
     reader.emplace(*postingsReader, fieldInfo);
     termsEnum.emplace(enumPool, *postingsReader, fieldInfo);
+  }
+
+  void growSlots(int32_t capacity) override {
+    if ((size_t)capacity > slots.size()) resizeExact(slots, (size_t)capacity);
   }
 
   // Bottom state semantics (see setBottom): exact => bottomOrd is the
@@ -808,9 +827,8 @@ class StrColComparator : public FieldComparator {
   std::string missingValueStr;
   
 public:
-  StrColComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
+  StrColComparator(const std::string& fieldName, bool reversed, MissingValue missingValue)
     : fieldName(fieldName),
-      values(numHits),
       sortMultiplier(reversed ? -1 : 1) {
     
     // For missing values, use empty string for MISSING_FIRST in ASC (sorts before all others)
@@ -840,7 +858,11 @@ public:
       }
     }
   }
-  
+
+  void growSlots(int32_t capacity) override {
+    if ((size_t)capacity > values.size()) resizeExact(values, (size_t)capacity);
+  }
+
   std::string_view getDocValue(int32_t docid) {
     if (!iter.has_value()) {
       return missingValueStr;

@@ -84,7 +84,7 @@ public:
         return stringSortModeOverride.exchange(value);
     }
     
-    std::unique_ptr<FieldComparator> createComparator(int numHits, IndexReader* reader = nullptr) const {
+    std::unique_ptr<FieldComparator> createComparator(IndexReader* reader = nullptr) const {
         // Handle regular field types based on FieldType
         switch (const_cast<FieldType*>(fieldType)->type()) {
             case FieldType::Type::INT:
@@ -96,7 +96,7 @@ public:
                 // matches the floating point order, so the int comparator
                 // works on the encoded values as-is for all four.
                 return std::make_unique<SimpleNumericFieldComparator>(
-                    fieldName, numHits, isReversed(), missingValue
+                    fieldName, isReversed(), missingValue
                 );
 
             case FieldType::Type::ID:
@@ -107,7 +107,7 @@ public:
                     if (stringSortMode == StringSortMode::SEGMENT &&
                         (!reader || reader->segments().size() > 1)) {
                         return std::make_unique<SegmentOrdComparator>(
-                            fieldName, numHits, isReversed(), missingValue
+                            fieldName, isReversed(), missingValue
                         );
                     }
                     // Use GlobalOrdComparator for indexed string fields
@@ -117,12 +117,12 @@ public:
                         ordMap = reader->getOrdMap(fieldName);
                     }
                     return std::make_unique<GlobalOrdComparator>(
-                        fieldName, ordMap, numHits, isReversed(), missingValue
+                        fieldName, ordMap, isReversed(), missingValue
                     );
                 } else {
                     // Use StrColComparator for non-indexed string columns
                     return std::make_unique<StrColComparator>(
-                        fieldName, numHits, isReversed(), missingValue
+                        fieldName, isReversed(), missingValue
                     );
                 }
             }

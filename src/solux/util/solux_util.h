@@ -118,6 +118,15 @@ SOLUX_INLINE inline void storeUnaligned(void* p, T value) {
 template<typename... Args>
 inline void unused(Args &&...) {}
 
+// Grow a vector to exactly n elements.  A growing resize() alone allocates
+// max(2*size, n) (libstdc++ _M_check_len), overshooting a deliberately capped
+// growth schedule on its final step; reserving first makes the cap real.
+template<typename T>
+inline void resizeExact(std::vector<T>& v, size_t n) {
+  v.reserve(n);
+  v.resize(n);
+}
+
 // generic vector ostream
 template<typename T>
 std::ostream &operator<<(std::ostream &out, const std::vector<T> &v) {

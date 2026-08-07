@@ -870,11 +870,11 @@ TEST_F(SortCollectorTest, smallEdge) {
 
     // collect 2nd segment first: should have [doc2,doc1]
     collect(collector, 0);
-    ASSERT_EQ(collector.pq->top().doc, segdoc(0,0));  // least competitive is doc1
+    ASSERT_EQ(collector.pq.top().doc, segdoc(0,0));  // least competitive is doc1
 
     // now collect 1st segment.  It should be [doc2, doc5] after
     collect(collector, 1);
-    ASSERT_EQ(collector.pq->top().doc, segdoc(1,1));  // least competitive is doc5
+    ASSERT_EQ(collector.pq.top().doc, segdoc(1,1));  // least competitive is doc5
 
     auto results = collector.sort();
     ASSERT_EQ(results.size(), 2);
@@ -888,11 +888,11 @@ TEST_F(SortCollectorTest, smallEdge) {
 
     // collect 2nd segment first: should have [doc5, doc4]
     collect(collector, 1);
-    ASSERT_EQ(collector.pq->top().doc, segdoc(1,0));  // least competitive is doc4
+    ASSERT_EQ(collector.pq.top().doc, segdoc(1,0));  // least competitive is doc4
 
     // now collect 1st segment.  It should be [doc2, doc5] after
     collect(collector, 0);
-    ASSERT_EQ(collector.pq->top().doc, segdoc(1,1));  // least competitive is doc5
+    ASSERT_EQ(collector.pq.top().doc, segdoc(1,1));  // least competitive is doc5
 
     auto results = collector.sort();
     ASSERT_EQ(results.size(), 2);
@@ -1048,6 +1048,63 @@ TEST_F(SortCollectorTest, randomSmall) {
 
 
 
+// Slot storage grows on demand: a deep limit over few hits allocates for the
+// hits, not the limit, and ranks identically to an exact-sized collector.
+// Exercises growth past several doublings on all three slot-minting paths:
+// collect() warmup, collectWindow's fill loop, and an underfull merge.
+TEST_F(SortCollectorTest, DeepLimitGrowsSlotStorageOnDemand) {
+  constexpr int32_t nDocs = 300;
+  constexpr int64_t deepLimit = 1'000'000;
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t i = 0; i < nDocs; i++) {
+    docs.push_back(flatdoc("id_s", "d" + std::to_string(i),
+                           "sort_i", (int64_t)((i * 37) % 251)));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  // collectWindow path (direct slotKeys writes across growth).
+  auto exact = collectNumericWindows(*reader, "sort_i", nDocs, SortField::ASC,
+                                     FieldComparator::MISSING_LAST, false);
+  auto deep = collectNumericWindows(*reader, "sort_i", deepLimit, SortField::ASC,
+                                    FieldComparator::MISSING_LAST, false);
+  EXPECT_EQ(exact, deep);
+
+  IntFieldType fieldType("sort_i");
+  SortField sortField("sort_i", fieldType, SortField::ASC);
+  auto& leaf = reader->segments()[0];
+  auto collect = [&](FieldSortCollector& collector, int32_t parity) {
+    collector.setSegment(0, &leaf.postingsReader());
+    for (int32_t doc = 0; doc < leaf.maxDoc(); doc++) {
+      if (parity < 0 || doc % 2 == parity) collector.collect(0, doc, 1.0f);
+    }
+  };
+
+  // collect() warmup path; capacity tracks the hits, not the limit.
+  FieldSortCollector whole(deepLimit, columnPlan(sortField));
+  collect(whole, -1);
+  EXPECT_EQ(whole.size(), (uint64_t)nDocs);
+  EXPECT_LE(whole.slotCapacity, (int64_t)nDocs * 2);
+
+  // Underfull merge mints the merged-in slots.
+  FieldSortCollector even(deepLimit, columnPlan(sortField));
+  FieldSortCollector odd(deepLimit, columnPlan(sortField));
+  collect(even, 0);
+  collect(odd, 1);
+  even.merge(odd);
+  EXPECT_EQ(even.size(), (uint64_t)nDocs);
+
+  auto wholeDocs = whole.sort();
+  auto mergedDocs = even.sort();
+  ASSERT_EQ(wholeDocs.size(), deep.docs.size());
+  ASSERT_EQ(mergedDocs.size(), deep.docs.size());
+  for (size_t i = 0; i < deep.docs.size(); i++) {
+    EXPECT_EQ(wholeDocs[i].doc, deep.docs[i]);
+    EXPECT_EQ(mergedDocs[i].doc, deep.docs[i]);
+  }
+}
+
 TEST_F(SortCollectorTest, SortByStringField) {
   CollectionHelper helper;
 
@@ -1200,7 +1257,7 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   SortField sortField("name_s", fieldType, SortField::ASC);
   {
     StringSortModeGuard globalGuard(StringSortMode::GLOBAL);
-    auto comparator = sortField.createComparator(2, reader.get());
+    auto comparator = sortField.createComparator(reader.get());
     EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(comparator.get()));
   }
 
@@ -1238,7 +1295,8 @@ TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
   auto compare = [&](int32_t pivotDoc, int32_t targetSegment, int32_t candidateDoc,
                      FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST,
                      bool reversed = false) {
-    SegmentOrdComparator comparator("name_s", 1, reversed, missing);
+    SegmentOrdComparator comparator("name_s", reversed, missing);
+    comparator.growSlots(1);
     comparator.setSegment(0, &reader->segments()[0].postingsReader());
     comparator.copy(0, segdoc(0, pivotDoc));
     comparator.setSegment(targetSegment,
@@ -2447,7 +2505,8 @@ TEST_F(SortCollectorTest, missingFirstBlocksCandidateIntervals) {
                                 : FieldComparator::MISSING_LAST;
     Status expected = missingFirst ? Status::PENDING : Status::READY;
 
-    SegmentOrdComparator seg("s_s", 1, false, missing);
+    SegmentOrdComparator seg("s_s", false, missing);
+    seg.growSlots(1);
     seg.setSegment(0, &leaf.postingsReader());
     seg.copy(0, segdoc(0, 0));
     seg.setBottom(0);
@@ -2455,7 +2514,8 @@ TEST_F(SortCollectorTest, missingFirstBlocksCandidateIntervals) {
     EXPECT_EQ(seg.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
               expected);
 
-    GlobalOrdComparator glob("s_s", nullptr, 1, false, missing);
+    GlobalOrdComparator glob("s_s", nullptr, false, missing);
+    glob.growSlots(1);
     glob.setSegment(0, &leaf.postingsReader());
     glob.copy(0, segdoc(0, 0));
     EXPECT_EQ(glob.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),

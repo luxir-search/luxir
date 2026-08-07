@@ -55,14 +55,31 @@ TEST(ExpandingPQTest, GrowthReallocationKeepsHeapAndTopK) {
   for (int v : vals) {
     pq.insertWithOverflow(v);
     ASSERT_TRUE(std::is_heap(pq.span().begin(), pq.span().end(), IntLess{}));
+    // Growth doubles then clamps: the backing allocation never runs past the
+    // bound the way push_back's own doubling would (64 -> 128 -> 130 here).
+    ASSERT_LE(pq.storageCapacity(), cap);
   }
   ASSERT_EQ(pq.size(), cap);
+  ASSERT_EQ(pq.storageCapacity(), cap);
 
   std::vector<int> kept(pq.span().begin(), pq.span().end());
   std::sort(kept.begin(), kept.end());
   std::sort(vals.begin(), vals.end());
   vals.resize(cap);
   ASSERT_EQ(kept, vals);
+}
+
+// release() hands back exactly the live heap contents so a caller can sort or
+// keep them without copying out of the queue.
+TEST(ExpandingPQTest, ReleaseMovesOutLiveContents) {
+  ExpandingPQ<int, IntLess> pq(3);
+  for (int v : {4, 1, 3, 2}) {
+    pq.insertWithOverflow(v);
+  }
+  std::vector<int> vals = pq.release();
+  ASSERT_EQ(pq.size(), 0u);
+  std::sort(vals.begin(), vals.end());
+  ASSERT_EQ(vals, (std::vector<int>{1, 2, 3}));
 }
 
 // End-to-end across the growth boundary: sliced collection + merge must equal unsliced

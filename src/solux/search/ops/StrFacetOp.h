@@ -1247,19 +1247,20 @@ public:
         // call into the sort key's calculator and two dereferences into the
         // scattered entry pool, plus one 16-byte vector slot per bucket.  A
         // heap of `limit` costs one failed comparison per bucket and only
-        // ~limit*ln(n/limit) replacements, and allocates `limit` slots.
-        // DirectPQ evicts the GREATEST element under its comparator, so passing
-        // the returned order directly is what keeps the best: top() is then the
-        // worst of the best-so-far, which is the one to beat.
-        std::vector<Bucket> top((size_t)limit);
-        DirectPQ<Bucket, decltype(better)> pq(top, better, 0);
+        // ~limit*ln(n/limit) replacements, and grows its storage on demand
+        // (a deep limit over few surviving buckets allocates for the
+        // survivors, not the limit).
+        // ExpandingPQ evicts the GREATEST element under its comparator, so
+        // passing the returned order directly is what keeps the best: top()
+        // is then the worst of the best-so-far, which is the one to beat.
+        ExpandingPQ<Bucket, decltype(better)> pq((size_t)limit, better);
         for (auto& [key, val] : counts) {
           int64_t count = loadUnaligned<int64_t>(val);
           if (minCount == -1 || count >= minCount) {
             pq.insertWithOverflow({key, val});
           }
         }
-        top.resize(pq.size());
+        std::vector<Bucket> top = pq.release();
         std::sort(top.begin(), top.end(), better);
         valVec = std::move(top);
       } else if (limit < 0) {
