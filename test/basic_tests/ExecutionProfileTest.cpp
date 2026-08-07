@@ -183,7 +183,7 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
 }
 
 TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
-  CollectionHelper helper("profile-top-terms");
+  CollectionHelper helper("profile_top_terms");
   helper.indexAll(std::array{
       flatdoc("id", "1", "cat_s", "a", "metric_i", 10),
       flatdoc("id", "2", "cat_s", "b", "metric_i", 20),
@@ -194,7 +194,7 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
   }, UpdateMessage::COMMIT);
 
   auto req = localReq(helper.getSearchEngine());
-  auto& facet = req->collection("profile-top-terms").profile()
+  auto& facet = req->collection("profile_top_terms").profile()
       .facet("cats", "cat_s").limit(2);
   facet.avg("avg", "metric_i");
   req->execute(false);
@@ -213,7 +213,7 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
 }
 
 TEST_F(ExecutionProfileTest, nestedAutoSelectsReplayAndFallsBack) {
-  CollectionHelper helper("profile-nested-auto");
+  CollectionHelper helper("profile_nested_auto");
   std::vector<Doc> docs;
   for (int i = 0; i < 200; i++) {
     docs.push_back(flatdoc(
@@ -228,7 +228,7 @@ TEST_F(ExecutionProfileTest, nestedAutoSelectsReplayAndFallsBack) {
   auto run = [&](FacetFeedStrategy feed, bool filtered) {
     forcedFacetFeedStrategy = feed;
     auto req = localReq(helper.getSearchEngine());
-    req->collection("profile-nested-auto").profile();
+    req->collection("profile_nested_auto").profile();
     auto addFacet = [](auto& cursor) {
       cursor.facet("parent", "parent_s").limit(10)
           .facet("child", "child_s").limit(10);
@@ -270,7 +270,7 @@ TEST_F(ExecutionProfileTest, nestedAutoSelectsReplayAndFallsBack) {
 }
 
 TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
-  CollectionHelper helper("profile-vector");
+  CollectionHelper helper("profile_vector");
   std::vector<Doc> docs;
   for (int i = 0; i < 256; i++) {
     docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "only",
@@ -283,7 +283,7 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   // count that would spill skinny's u8 on every add. 256 docs of one term
   // sits exactly on that boundary.
   auto req = localReq(helper.getSearchEngine());
-  req->collection("profile-vector").profile().facet("cats", "cat_s").limit(-1);
+  req->collection("profile_vector").profile().facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);
   {
@@ -302,7 +302,7 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
   // Filtered to 16 of 256: the column walk adds once per in-domain doc, so
   // R = 16 sits exactly at the measured vector boundary.
   auto filtered = localReq(helper.getSearchEngine());
-  filtered->collection("profile-vector").profile();
+  filtered->collection("profile_vector").profile();
   auto& top = filtered->topDocs("q");
   top.matchQuery("sel_s", "yes");
   top.facet("cats", "cat_s").limit(-1);
@@ -317,7 +317,7 @@ TEST_F(ExecutionProfileTest, reportsVectorAtStrategyBoundary) {
 }
 
 TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
-  CollectionHelper helper("profile-sparse");
+  CollectionHelper helper("profile_sparse");
   std::vector<Doc> docs;
   for (int i = 0; i < 256; i++) {
     docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "only",
@@ -326,7 +326,7 @@ TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
   helper.indexAll(docs, UpdateMessage::COMMIT);
 
   auto req = localReq(helper.getSearchEngine());
-  req->collection("profile-sparse").profile();
+  req->collection("profile_sparse").profile();
   auto& q = req->topDocs("q").allQuery().limit(0).matchFilter("f", "sel_s", "t");
   q.facet("cats", "cat_s").limit(-1);
   req->execute(false);
@@ -343,7 +343,7 @@ TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
 
 TEST_F(ExecutionProfileTest, termLeadFirstFillLeapfrogMatchesKillSwitch) {
   constexpr int32_t docCount = 2 * DocsEnumMeta::L1_DOCS;
-  CollectionHelper helper("profile-term-lead-leapfrog");
+  CollectionHelper helper("profile_term_lead_leapfrog");
   std::vector<Doc> docs;
   docs.reserve((size_t) docCount);
   for (int32_t doc = 0; doc < docCount; doc++) {
@@ -355,7 +355,7 @@ TEST_F(ExecutionProfileTest, termLeadFirstFillLeapfrogMatchesKillSwitch) {
 
   auto count = [&] {
     auto req = localReq(helper.getSearchEngine());
-    req->collection("profile-term-lead-leapfrog");
+    req->collection("profile_term_lead_leapfrog");
     auto& top = req->topDocs("q").getNumber().limit(0);
     top.rawQuery() = qb::boolean(
         top.mr(), {qb::match(top.mr(), "body_w", "lead"),
@@ -387,7 +387,7 @@ TEST_F(ExecutionProfileTest, termLeadFirstFillLeapfrogMatchesKillSwitch) {
 }
 
 TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
-  CollectionHelper helper("profile-serial");
+  CollectionHelper helper("profile_serial");
   std::vector<Doc> docs;
   for (int i = 0; i < 64; i++) {
     docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 8)));
@@ -395,7 +395,7 @@ TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
   }
 
   auto req = localReq(helper.getSearchEngine());
-  req->collection("profile-serial").profile().facet("cats", "cat_s").limit(-1);
+  req->collection("profile_serial").profile().facet("cats", "cat_s").limit(-1);
   req->execute((int32_t)1);
   ASSERT_OK(req);
 
@@ -407,12 +407,12 @@ TEST_F(ExecutionProfileTest, maxParallelOneRunsSingleThreaded) {
 }
 
 TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
-  CollectionHelper helper("profile-reject");
+  CollectionHelper helper("profile_reject");
   helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
 
   for (int32_t maxParallel : {2, -2}) {
     auto req = localReq(helper.getSearchEngine());
-    req->collection("profile-reject").facet("cats", "cat_s").limit(-1);
+    req->collection("profile_reject").facet("cats", "cat_s").limit(-1);
     req->execute(maxParallel);
     ASSERT_FALSE(req->responses.empty());
     EXPECT_NE(std::string_view::npos,
@@ -421,7 +421,7 @@ TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
 }
 
 TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsInlineOnCallingThread) {
-  CollectionHelper helper("profile-inline");
+  CollectionHelper helper("profile_inline");
   std::vector<Doc> docs;
   for (int i = 0; i < 32; i++) {
     docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 4)));
@@ -429,7 +429,7 @@ TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsInlineOnCallingThread) {
   }
 
   auto req = localReq(helper.getSearchEngine());
-  req->collection("profile-inline").profile().facet("cats", "cat_s").limit(-1);
+  req->collection("profile_inline").profile().facet("cats", "cat_s").limit(-1);
   helper.getSearchEngine().dispatch(*req.get(), -1);
   // -1 = the calling thread: the whole request completed inside dispatch(), so
   // the response is readable with no wait/synchronization at all.
@@ -460,14 +460,14 @@ public:
 } // namespace
 
 TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
-  CollectionHelper helper("profile-pool");
+  CollectionHelper helper("profile_pool");
   helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
 
   auto* arena = createArena();
   auto req = LocalReqHandle(
       solux::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
-  req->collection("profile-pool").facet("cats", "cat_s").limit(-1);
+  req->collection("profile_pool").facet("cats", "cat_s").limit(-1);
   helper.getSearchEngine().dispatch(*req.get(), 1);
   ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
   EXPECT_NE(std::this_thread::get_id(), repliedOn.get());

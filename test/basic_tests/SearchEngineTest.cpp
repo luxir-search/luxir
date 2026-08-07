@@ -2859,13 +2859,16 @@ TEST_F(SearchEngineTest, missingCollectionErrors) {
 }
 
 TEST_F(SearchEngineTest, unsafeCollectionNameErrors) {
+  // Search-time resolution is lookup-only: an invalid name reads as
+  // not-found, with no validation on the request path.
   auto req = localReq(soluxNode->getSearchEngine());
   req->collection("../bad");
   req->topDocs("q").allQuery();
   ExpectLog quiet("Search request failed:");
   req->execute();
   ASSERT_FALSE(req->responses.empty());
-  EXPECT_NE(req->errorMsg().find("single path component"), std::string::npos) << req->errorMsg();
+  EXPECT_NE(req->errorMsg().find("collection '../bad' does not exist"), std::string::npos)
+      << req->errorMsg();
 }
 
 TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {

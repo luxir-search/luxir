@@ -9,7 +9,6 @@
 #include "solux/util/DateTime.h"
 
 #include <algorithm>
-#include <cctype>
 #include <exception>
 #include <memory_resource>
 #include <span>
@@ -23,10 +22,6 @@ static std::string schemaFileName(uint64_t gen) {
   return std::string(SCHEMA_PREFIX) + Postings::getSortableString(gen);
 }
 
-std::string SoluxNode::normalizedCollectionName(std::string_view name) {
-  return std::string(name);
-}
-
 void SoluxNode::validateCollectionName(std::string_view name) {
   constexpr std::size_t kMaxCollectionNameBytes = 255;
   if (name.empty()) {
@@ -38,19 +33,16 @@ void SoluxNode::validateCollectionName(std::string_view name) {
   if (name[0] == '_') {
     throw InvalidCollectionNameError("collection '" + std::string(name) + "' is reserved");
   }
-  if (name == "." || name == "..") {
-    throw InvalidCollectionNameError("collection '" + std::string(name) + "' is reserved");
-  }
-  if (std::isspace((unsigned char)name.front()) || std::isspace((unsigned char)name.back())) {
-    throw InvalidCollectionNameError("collection '" + std::string(name) + "' has leading or trailing whitespace");
+  // Lowercase id names ([a-z][a-z0-9_]*): the name is the on-disk directory,
+  // and lowercase keeps a data dir portable to case-insensitive filesystems.
+  if (name[0] < 'a' || name[0] > 'z') {
+    throw InvalidCollectionNameError("collection '" + std::string(name) +
+                                     "' must start with a lowercase letter");
   }
   for (char c : name) {
-    unsigned char ch = (unsigned char)c;
-    if (ch < 0x20 || ch == 0x7f) {
-      throw InvalidCollectionNameError("collection '" + std::string(name) + "' contains a control character");
-    }
-    if (c == '/' || c == '\\') {
-      throw InvalidCollectionNameError("collection '" + std::string(name) + "' must be a single path component");
+    if ((c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_') {
+      throw InvalidCollectionNameError("collection '" + std::string(name) +
+          "' may only contain lowercase letters, digits, and underscores");
     }
   }
 }
@@ -212,9 +204,9 @@ std::shared_ptr<Collection> SoluxNode::getCollection(Library* library, std::stri
     throw CollectionResolutionError("root library is not initialized");
   }
 
-  std::string collectionName = normalizedCollectionName(name);
-  validateCollectionName(collectionName);
-
+  // Resolution is lookup-only: an invalid name can never be in the map, so it
+  // reads as not-found rather than paying a validation scan per request.
+  std::string collectionName(name);
   if (auto collection = targetLibrary->collections.get(collectionName)) {
     return checkLoaded(std::move(collection));
   }
@@ -250,7 +242,7 @@ std::shared_ptr<Collection> SoluxNode::getOrCreateCollection(Library* library, s
     throw CollectionResolutionError("root library is not initialized");
   }
 
-  std::string collectionName = normalizedCollectionName(name);
+  std::string collectionName(name);
   validateCollectionName(collectionName);
 
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() -> std::shared_ptr<Collection> {
@@ -307,7 +299,7 @@ std::shared_ptr<Collection> SoluxNode::createCollection(
     throw CollectionResolutionError("root library is not initialized");
   }
 
-  std::string collectionName = normalizedCollectionName(name);
+  std::string collectionName(name);
   validateCollectionName(collectionName);
 
   bool createdHere = false;
@@ -355,9 +347,16 @@ std::shared_ptr<Collection> SoluxNode::createCollection(
 void SoluxNode::deleteCollection(std::string_view name) {
   if (!root) throw CollectionResolutionError("root library is not initialized");
 
-  std::string collectionName = normalizedCollectionName(name);
-  validateCollectionName(collectionName);
+  // Empty means the request never named a collection - a malformed request,
+  // not a missing collection.
+  if (name.empty()) {
+    throw InvalidCollectionNameError("collection name is empty");
+  }
 
+  // Otherwise lookup-only, no name validation: every map key is
+  // filesystem-safe (from a validated create or a startup directory listing),
+  // and a tombstoned legacy-named collection must stay deletable.
+  std::string collectionName(name);
   auto collection = root->collections.get(collectionName);
   if (!collection) {
     throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");

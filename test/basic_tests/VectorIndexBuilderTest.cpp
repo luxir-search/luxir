@@ -267,6 +267,20 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
 
 // One segment, one field, build all aux indexes via "*".  Verify a FAISS index file
 // is written with the expected ntotal / dims and that the IndexInfo references it.
+TEST_F(VectorIndexBuilderTest, overlayFileNamesAreCaseSafe) {
+  // Capitals append their positions, so names differing only by case stay
+  // distinct even after a case-insensitive filesystem folds them.
+  EXPECT_EQ("FooBar-0-3", Postings::caseSafeName("FooBar"));
+  EXPECT_EQ("foobar", Postings::caseSafeName("foobar"));
+
+  std::string a = Postings::getSegmentOverlayFileName(1, "vec.Emb_v", 0, 0);
+  std::string b = Postings::getSegmentOverlayFileName(1, "vec.emb_v", 0, 0);
+  for (char& c : a) {
+    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+  }
+  EXPECT_NE(a, b);
+}
+
 TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
   CollectionHelper h("main");
@@ -544,7 +558,8 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   ASSERT_EQ(overlays1.size(), 1u);
   std::string firstFile{overlays1[0]->files[0]};
   // Overlay filename convention: segment-prefixed like liveDocs -
-  // s<segId>__<name>_<gen>_<fnum> - so ls groups overlays with their segment.
+  // s<segId>__<name>_<gen>_<fnum> - so ls groups overlays with their segment
+  // (all-lowercase names render verbatim in filenames).
   EXPECT_TRUE(firstFile.starts_with(
       Postings::getIndexFileNamePrefix(info1->segments[0].seg_id) + "__vec.embedding_v_"))
       << "unexpected overlay filename: " << firstFile;

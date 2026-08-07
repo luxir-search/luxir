@@ -846,7 +846,7 @@ TEST_F(GrpcIndexTest, unsafeCollectionNameReturnsNotFound) {
   grpc::Status status = hppUnaryCall(channel.get(), rpc::Update, &context, b.finish(), &response);
 
   EXPECT_EQ(grpc::StatusCode::NOT_FOUND, status.error_code());
-  EXPECT_NE(status.error_message().find("single path component"), std::string::npos)
+  EXPECT_NE(status.error_message().find("must start with a lowercase letter"), std::string::npos)
       << status.error_message();
 }
 

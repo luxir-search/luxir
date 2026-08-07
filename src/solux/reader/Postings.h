@@ -83,40 +83,41 @@ public:
     return s;
   }
 
-  /// Filename for an aux-index file (see AuxIndexInfo in solux_types.proto).
-  /// Format: "s_<name>_<sortable_gen>_<sortable_fnum>".  The leading "s_" prefix
-  /// disambiguates from segment files (which are "s<base36>" without an underscore
-  /// after the prefix).  <name> is opaque to the file layer; callers conventionally
-  /// use "<kind_short>.<field>" (e.g. "vec.title_v") so files group naturally on ls.
-  static std::string getAuxIndexFileName(std::string_view name, uint64_t gen, uint32_t fnum) {
-    std::string s(PREFIX_FNAME);
-    s += '_';
-    s.append(name);
-    s += '_';
-    s.append(getSortableString(gen));
-    s += '_';
-    s.append(getSortableString(fnum));
+  /// Case-safe rendering of a name for filenames: the name verbatim, then
+  /// '-'-separated positions of its uppercase letters ("FooBar" ->
+  /// "FooBar-0-3").  Names that differ only by case get different position
+  /// lists, so their filenames stay distinct even on a case-insensitive
+  /// filesystem, while all-lowercase names render unchanged.  '-' is not an
+  /// id character, so a suffixed name can never collide with a plain one.
+  static std::string caseSafeName(std::string_view name) {
+    std::string s(name);
+    for (size_t i = 0; i < name.size(); i++) {
+      if (name[i] >= 'A' && name[i] <= 'Z') {
+        s += '-';
+        s.append(std::to_string(i));
+      }
+    }
     return s;
   }
 
   /// Filename for a segment-local overlay file (see SegmentInfo.overlays).
-  /// Format: "s<segId>__<name>_<gen>_<fnum>" - the segment prefix groups a
-  /// segment's overlays with its data files and liveDocs in ls, and lets the
-  /// existing dead-segment deletePrefix sweep reclaim them automatically.
-  /// <name> conventionally contains a dot ("vec.title_v"), so it cannot
-  /// collide with the liveDocs "__L" marker.  Parsing, if ever needed, is
-  /// END-anchored (the last two underscore-separated fields are gen and
-  /// fnum) because field names may themselves contain underscores and
-  /// digits.  Filenames are opaque to the file layer; the IndexInfo manifest
-  /// binds file <-> entry.  gen is an overlay-defined generation.  Vector
-  /// overlays use a per-(segment, field) rebuild ordinal, so rebuilds write a
-  /// new file while old readers still hold the previous file.
+  /// Format: "s<segId>__<caseSafeName>_<gen>_<fnum>" - the segment prefix
+  /// groups a segment's overlays with its data files and liveDocs in ls, and
+  /// lets the existing dead-segment deletePrefix sweep reclaim them
+  /// automatically.  <name> conventionally contains a dot ("vec.title_v"), so
+  /// it cannot collide with the liveDocs "__L" marker.  Parsing, if ever
+  /// needed, is END-anchored (the last two underscore-separated fields are
+  /// gen and fnum) because names contain underscores.  Filenames are opaque
+  /// to the file layer; the IndexInfo manifest binds file <-> entry.  gen is
+  /// an overlay-defined generation.  Vector overlays use a per-(segment,
+  /// field) rebuild ordinal, so rebuilds write a new file while old readers
+  /// still hold the previous file.
   static std::string getSegmentOverlayFileName(uint64_t segId, std::string_view name,
                                                uint64_t gen, uint32_t fnum) {
     std::string s(PREFIX_FNAME);
     s.append(getSortableString(segId));
     s += "__";
-    s.append(name);
+    s.append(caseSafeName(name));
     s += '_';
     s.append(getSortableString(gen));
     s += '_';

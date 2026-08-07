@@ -320,15 +320,56 @@ TEST_F(SchemaTest, fieldAndTemplateNameCollision) {
 
 
 TEST_F(SchemaTest, suffixMatchingIsTemplateOnly) {
-  // A CONCRETE field that happens to be named like a suffix is exact-match
-  // only; it never captures other fields via suffix resolution.
+  // A CONCRETE field cannot even be named like a suffix: the leading
+  // underscore namespace is reserved, so nothing concrete can shadow
+  // template resolution.
   SchemaBuilder b;
   b.field("_w").type = FieldClass::STRING;
-  auto schema = b.build();
+  EXPECT_THROW(b.build(), SchemaError);
+}
 
-  EXPECT_NE(nullptr, schema->getFieldTypePtr("_w"));
-  EXPECT_EQ(nullptr, schema->getFieldTypePtr("body_w"))
-    << "concrete '_w' must not act as a suffix template";
+
+TEST_F(SchemaTest, nameRules) {
+  {
+    SchemaBuilder b;
+    b.field("9lives").type = FieldClass::STRING;
+    EXPECT_THROW(b.build(), SchemaError);
+  }
+  {
+    SchemaBuilder b;
+    b.field("bad-name").type = FieldClass::STRING;
+    EXPECT_THROW(b.build(), SchemaError);
+  }
+  {
+    SchemaBuilder b;
+    b.templ("noUnderscore").type = FieldClass::STRING;
+    EXPECT_THROW(b.build(), SchemaError);
+  }
+  {
+    // Field names land in filenames, so length is bounded.
+    SchemaBuilder b;
+    b.field(std::string(128, 'a')).type = FieldClass::STRING;
+    EXPECT_THROW(b.build(), SchemaError);
+  }
+  {
+    // Mixed case is fine for fields; _version_ passes as the one reserved
+    // name; 127 bytes is the length bound.
+    SchemaBuilder b;
+    b.field("camelCase").type = FieldClass::STRING;
+    b.field(std::string(127, 'a')).type = FieldClass::STRING;
+    auto s = b.build();
+    EXPECT_NE(nullptr, s->getFieldTypePtr("camelCase"));
+    EXPECT_NE(nullptr, s->getFieldTypePtr("_version_"));
+  }
+}
+
+
+TEST_F(SchemaTest, caseFoldedDuplicateRejected) {
+  // Two names differing only by case are a typo, not two fields.
+  SchemaBuilder b;
+  b.field("Title").type = FieldClass::STRING;
+  b.field("title").type = FieldClass::STRING;
+  EXPECT_THROW(b.build(), SchemaError);
 }
 
 

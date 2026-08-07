@@ -100,6 +100,17 @@ public:
   // fromProto input that reproduces this schema exactly.
   void toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& arena) const;
 
+  // Name rules.  A concrete field name is id-like: an ASCII letter followed by
+  // ASCII letters, digits, or underscores, at most 127 bytes (field names
+  // land in filenames).  The leading-underscore namespace is reserved for the
+  // engine; "_version_" is the one reserved name accepted here.  A template
+  // name is '_' followed by ASCII letters, digits, or underscores: a suffix
+  // pattern ("_s") or an abstract parent type ("_body_"; anything with a
+  // second underscore can never suffix-match, since matching anchors on the
+  // LAST underscore of a field name).
+  static bool validFieldName(std::string_view name);
+  static bool validTemplateName(std::string_view name);
+
   // Create the default schema with built-in fields.
   static std::shared_ptr<Schema> createDefaultSchema();
 

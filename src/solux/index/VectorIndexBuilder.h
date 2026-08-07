@@ -22,8 +22,8 @@ namespace solux {
 /// enough to be worth indexing.
 ///
 /// One index per (eligible) vector field per segment, written under a single
-/// filename produced by Postings::getAuxIndexFileName.  The "name" recorded in
-/// the segment overlay is "vec.<fieldName>" (e.g. "vec.title_v").
+/// filename produced by Postings::getSegmentOverlayFileName.  The "name"
+/// recorded in the segment overlay is "vec.<fieldName>" (e.g. "vec.title_v").
 ///
 /// Eligibility: a field is eligible if the schema's resolved FieldType is a
 /// VectorFieldType with metric != METRIC_NONE.  Per-segment dims must agree

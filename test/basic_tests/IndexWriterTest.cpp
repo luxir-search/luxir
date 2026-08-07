@@ -2030,11 +2030,26 @@ TEST_F(IndexWriterTest, concurrentFlushAndCommit) {
   EXPECT_EQ(nDocs + 1, totalDocs);
 }
 
+TEST_F(IndexWriterTest, dynamicFieldNameRules) {
+  using namespace solux::test;
+  // Doc-supplied names hit the id-like check on first use; a template suffix
+  // match must not admit an invalid name.
+  CollectionHelper helper("dyn_field_names");
+  auto result = helper.indexAll({
+    flatdoc("id", "g1", "camelCase_s", "ok"),
+    flatdoc("id", "b1", "bad-name_s", "rejected"),
+  }, UpdateMessage::COMMIT);
+  ASSERT_EQ(solux::api::UpdateResponse_::Status::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ("b1", result.errors[0].id);
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("bad-name_s"));
+}
+
 // Test coreGen tracking and segment commit_time
 TEST_F(IndexWriterTest, testCoreGen) {
   using namespace solux::test;
 
-  CollectionHelper helper("coreGenTest");
+  CollectionHelper helper("core_gen_test");
   helper.clear();
 
   auto iw = helper.getIndexWriter();

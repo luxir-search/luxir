@@ -52,6 +52,11 @@ void Inverter::clearUndoLog() {
 
 
 Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name) {
+  // First sight of a doc-supplied field name: without this check a template
+  // suffix match would admit any string into segment metadata.
+  if (!Schema::validFieldName(name)) {
+    throw std::runtime_error("Invalid field name: " + std::string(name));
+  }
   // perhaps this part should be moved to Schema?
   auto currSchema = schema.get();
   bool justAcquiredSchema = false;

@@ -423,9 +423,12 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
   };
 
   expectRejected("/collections/_reserved/_update", "reserved");
-  expectRejected("/collections/unsafe/slash/_update", "single path component");
-  expectRejected("/collections/../_update", "reserved");
-  expectRejected("/collections/" + absolute.string() + "/_update", "single path component");
+  expectRejected("/collections/MyCollection/_update", "must start with a lowercase letter");
+  expectRejected("/collections/my-collection/_update", "may only contain lowercase letters");
+  expectRejected("/collections/9lives/_update", "must start with a lowercase letter");
+  expectRejected("/collections/unsafe/slash/_update", "may only contain lowercase letters");
+  expectRejected("/collections/../_update", "must start with a lowercase letter");
+  expectRejected("/collections/" + absolute.string() + "/_update", "must start with a lowercase letter");
   expectRejected("/collections//_update", "empty");
 
   localServer.shutdown();

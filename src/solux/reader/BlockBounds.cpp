@@ -103,12 +103,8 @@ BlockBounds::TermView BlockBounds::find(int32_t termOrd) const {
 }
 
 std::string BlockBounds::fileName(uint64_t segId, std::string_view field) {
-  uint64_t hash = 1469598103934665603ULL;
-  for (uint8_t c : field) {
-    hash ^= c;
-    hash *= 1099511628211ULL;
-  }
-  return std::format("{}__bb_{:016x}.bbi", Postings::getIndexFileNamePrefix(segId), hash);
+  return std::format("{}__bb_{}.bbi", Postings::getIndexFileNamePrefix(segId),
+                     Postings::caseSafeName(field));
 }
 
 uint64_t BlockBounds::checksum(std::span<const char> bytes) {

@@ -5,6 +5,7 @@
 #include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <cstddef>
 #include <span>
@@ -64,6 +65,32 @@ using sv_entry_map =
   boost::unordered_flat_map<std::string_view, const SourceEntry*, PackedTermHash, PackedTermEqual>;
 using sv_resolved_map = boost::unordered_flat_map<std::string_view, ResolvedField, PackedTermHash, PackedTermEqual>;
 using sv_flat_set = boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual>;
+
+static bool isIdChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool Schema::validFieldName(std::string_view name) {
+  // Field names land in filenames (block-bounds, vector overlays), so bound
+  // them well under the 255-byte filesystem component limit.
+  constexpr size_t kMaxFieldNameBytes = 127;
+  if (name == "_version_") return true;
+  if (name.empty() || name.size() > kMaxFieldNameBytes) return false;
+  char c0 = name.front();
+  if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z'))) return false;
+  for (char c : name) {
+    if (!isIdChar(c)) return false;
+  }
+  return true;
+}
+
+bool Schema::validTemplateName(std::string_view name) {
+  if (name.size() < 2 || name.front() != '_') return false;
+  for (char c : name.substr(1)) {
+    if (!isIdChar(c)) return false;
+  }
+  return true;
+}
 
 static std::string serializeSchemaDef(const solux::api::SchemaDef& def) {
   std::vector<std::byte> serialized;
@@ -371,9 +398,31 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
   // ---- resolve the whole merged graph ----
   sv_entry_map defMap;
   defMap.reserve(entries.size());
+  // folded(name) -> authored name: two names differing only by ASCII case are
+  // almost certainly a typo, so reject at authoring time.
+  boost::unordered_flat_map<std::string, std::string_view> folded;
+  folded.reserve(entries.size());
   for (const auto& e : entries) {
+    if (e.isTemplate) {
+      if (!validTemplateName(e.name)) {
+        throw SchemaError("invalid template name '" + std::string(e.name) +
+                          "': must be '_' followed by ASCII letters, digits, or underscores");
+      }
+    } else if (!validFieldName(e.name)) {
+      throw SchemaError("invalid field name '" + std::string(e.name) +
+                        "': ASCII letters, digits, and underscores, starting with a letter");
+    }
     if (!defMap.emplace(e.name, &e).second) {
       throw SchemaError("duplicate definition of '" + std::string(e.name) + "'");
+    }
+    std::string f(e.name);
+    for (char& c : f) {
+      if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    }
+    auto [it, inserted] = folded.emplace(std::move(f), e.name);
+    if (!inserted) {
+      throw SchemaError("'" + std::string(e.name) + "' differs only by case from '" +
+                        std::string(it->second) + "'");
     }
   }
 

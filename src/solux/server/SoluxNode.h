@@ -230,7 +230,6 @@ private:
   std::shared_ptr<Collection> initCollection(const std::string& name);
   // Returns the collection unchanged, or throws if it is unavailable.
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
-  static std::string normalizedCollectionName(std::string_view name);
   static void validateCollectionName(std::string_view name);
 
   SoluxConfig config;
