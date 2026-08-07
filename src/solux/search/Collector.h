@@ -69,13 +69,16 @@ class TopDocsCollector {
   };
 
   int64_t topCount;
-  std::vector<ScoreDoc> topDocs;  // TODO: create an expanding PQ backed by a vector so we don't have to allocate a vector of size topCount
   // Heap orders by (score, then doc) so ties at the k-th score are broken by (seg, docid):
   // the kept top-K is a deterministic total order, independent of collection/merge order
   // (and, once it exists, slicing).  Required for sliced==unsliced to hold at exact ties.
-  DirectPQ<ScoreDoc, decltype(scoreAndDocComp)> pq;
+  // The storage expands on demand: topCount bounds the heap but is not allocated up
+  // front, which matters for deep or unbounded limits (limit=-1 maps to maxDoc) and for
+  // the per-slice collectors that never see topCount hits.
+  ExpandingPQ<ScoreDoc, decltype(scoreAndDocComp)> pq;
 
-  TopDocsCollector(int64_t topCount) : topCount(topCount), topDocs(topCount), pq(topDocs) {
+  TopDocsCollector(int64_t topCount)
+      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0)) {
     // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
     // empty and collect() only counts.  Negative counts are a bug in the caller.
     assert(topCount >= 0);
@@ -134,14 +137,17 @@ class TopDocsCollector {
 
   // merge other into this.
   void merge(TopDocsCollector& other) {
+    // Self-merge would iterate a span that collect() can reallocate out from under us.
+    assert(this != &other);
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
     auto newHitCount = hitCount + other.hitCount;
+    std::span<ScoreDoc> otherDocs = other.pq.span();
     // Since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
     // Future possible optimization: if we do a whole level of a min-tree without any insertions, we could stop early.
-    for (int i = other.size() - 1; i >= 0; i--) {
-      collect(other.topDocs[i].doc.segment(), other.topDocs[i].doc.docId(), other.topDocs[i].score);
+    for (int64_t i = (int64_t)otherDocs.size() - 1; i >= 0; i--) {
+      collect(otherDocs[i].doc.segment(), otherDocs[i].doc.docId(), otherDocs[i].score);
     }
     hitCount = newHitCount;
   }
@@ -151,12 +157,13 @@ class TopDocsCollector {
   std::span<ScoreDoc> sort() {
     // sort_heap must use the same comparator the heap was built with (scoreAndDocComp),
     // which also gives the stable response order: score desc, then (seg, docid) asc at ties.
-    std::sort_heap(topDocs.begin(), topDocs.begin() + pq.size(), scoreAndDocComp);
-    return {topDocs.data(), pq.size()};
+    std::span<ScoreDoc> docs = pq.span();
+    std::sort_heap(docs.begin(), docs.end(), scoreAndDocComp);
+    return docs;
   }
 
   std::span<ScoreDoc> scoreDocs() {
-    return {topDocs.data(), pq.size()};
+    return pq.span();
   }
 };
 
@@ -238,7 +245,7 @@ public:
     // The generic way...  Could probably be optimized.
     // 1) if other.minCompetitiveVal is greater than our minCompetitiveVal, we can just append all of other's docs.
     // 2) we could skip the comparisons anyway if there is space?
-    for (auto& sd: other.topDocs) {
+    for (auto& sd: other.scoreDocs()) {
       collect(sd.doc.segment(), sd.doc.docId(), sd.score);
     }
     hitCount = newHitCount;

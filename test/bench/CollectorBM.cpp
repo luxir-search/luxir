@@ -21,7 +21,11 @@ static void BM_Collector(benchmark::State& state, int32_t nDocs, bool sorted) {
       collector.collect(0, i, score);
     }
     collector.sort();
-    ret = collector.topDocs[0].score;
+    if constexpr (requires { collector.scoreDocs(); }) {
+      ret = collector.scoreDocs()[0].score;
+    } else {
+      ret = collector.topDocs[0].score;
+    }
     benchmark::DoNotOptimize(ret);
   }
   state.counters["topscore"] = ret;  // sanity check that different implementations are agreeing.

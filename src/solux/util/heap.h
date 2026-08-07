@@ -4,6 +4,7 @@
 #include <span>
 #include <numeric>
 #include <algorithm>
+#include <vector>
 
 namespace solux {
 
@@ -273,6 +274,91 @@ public:
 
 };
 
+
+
+/// A DirectPQ variant that owns its storage: the heap is backed by a std::vector that
+/// grows on demand (construction makes at most one small bounded reservation), so a
+/// large capacity bound (e.g. a deep or unbounded top-k) does not allocate or zero its
+/// worst case up front.  Once size() reaches maxSize, insertWithOverflow evicts instead
+/// of growing, so the steady-state hot path never touches the vector's capacity logic.
+/// \tparam T
+/// \tparam Comp
+template <class T, class Comp>
+class ExpandingPQ {
+  std::vector<T> heap;  // heap.size() is the current heap size; grows up to maxSize
+  size_t maxSize;
+  [[no_unique_address]] Comp comp{};  // Use [[no_unique_address]] to optimize away storage for empty comparators
+
+  // One allocation covers typical small top-k requests; deeper heaps double from here.
+  static constexpr size_t initialReserve = 64;
+
+public:
+  explicit ExpandingPQ(size_t maxSize) : maxSize(maxSize) {
+    heap.reserve(std::min(maxSize, initialReserve));
+  }
+
+  ExpandingPQ(size_t maxSize, Comp comp) : maxSize(maxSize), comp(comp) {
+    heap.reserve(std::min(maxSize, initialReserve));
+  }
+
+  // Reference to the top element.
+  T& top() {
+    return heap.front();
+  }
+
+  const T& top() const {
+    return heap.front();
+  }
+
+  size_t size() const {
+    return heap.size();
+  }
+
+  size_t capacity() const {
+    return maxSize;
+  }
+
+  /// The underlying storage; every element in the span is live heap contents.
+  /// Reordering through this (e.g. std::sort_heap) breaks the heap invariant, after
+  /// which only span()/size() remain valid.
+  std::span<T> span() {
+    return heap;
+  }
+
+  /// Call this to re-heapify after top() was modified
+  void updateTop() {
+    update_heap_top(heap.begin(), heap.end(), comp);
+  }
+
+  /// Insert only if max size has not been reached.  Use insertWithOverflow otherwise.
+  void insert(const T& elem) {
+    assert(heap.size() < maxSize);
+    heap.push_back(elem);
+    if (heap.size() > 1) {
+      std::push_heap(heap.begin(), heap.end(), comp);
+    }
+  }
+
+  /// If capacity has been reached, the largest element is removed (i.e. heap keeps smallest)
+  /// If this is a min-heap (common in solux), then we are keeping everything larger than the offered value.
+  /// @returns true if the new element caused the previous top() to be ejected.
+  bool insertWithOverflow(const T& elem) {
+    if (heap.size() < maxSize) {
+      insert(elem);
+      return false;
+    }
+
+    // if the priority queue is full, then we only want to insert the new value if it is
+    // less than the current root.
+    if (comp(elem, top())) {
+      top() = elem; // overwrite the previous top
+      updateTop();
+      return true;
+    } else {
+      return false;
+    }
+  }
+};
 
 
 /// We don't use std::priority_queue since it doesn't allow direct access to the underlying storage.
