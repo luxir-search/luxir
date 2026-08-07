@@ -2903,3 +2903,156 @@ TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {
   }
   EXPECT_EQ(collections[0], soluxNode->getCollection(name));
 }
+
+namespace {
+
+// Forces the old two-arrangement constant top-k shape (independent capture
+// scorer + count-only bulk pass) for parity runs.
+class OldConstantShapeGuard {
+  bool saved;
+
+public:
+  explicit OldConstantShapeGuard(bool old)
+    : saved(TopDocsReq::disableConstantWindowCaptureForTests) {
+    TopDocsReq::disableConstantWindowCaptureForTests = old;
+  }
+  ~OldConstantShapeGuard() {
+    TopDocsReq::disableConstantWindowCaptureForTests = saved;
+  }
+};
+
+// qax* matches i % 2 == 0, qbx* matches i % 3 == 0; the conjunction is
+// i % 6 == 0. keep_s excludes every 30th doc from the filtered variants.
+void indexConstantConjDocs(CollectionHelper& helper, int32_t segments) {
+  constexpr int32_t kDocs = 240;
+  int32_t perSegment = kDocs / segments;
+  for (int32_t seg = 0; seg < segments; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t i = seg * perSegment; i < (seg + 1) * perSegment; i++) {
+      std::string body;
+      if (i % 2 == 0) body += "qax" + std::to_string(i);
+      if (i % 3 == 0) {
+        body += (body.empty() ? "" : " ") + std::string("qbx") + std::to_string(i);
+      }
+      if (body.empty()) body = "filler";
+      docs.push_back(flatdoc(
+          "id", "d" + std::to_string(1000 + i),  // fixed width: id order == doc order
+          "body_w", body,
+          "keep_s", i % 30 == 0 ? "no" : "yes",
+          "group_s", "g" + std::to_string(i % 3)));
+    }
+    auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
+    ASSERT_TRUE(result.success) << result.error_message;
+  }
+}
+
+struct ConstantTopKRun {
+  std::vector<std::string> ids;
+  std::map<std::string, float> scores;
+  std::map<std::string, int64_t> facets;
+  int64_t found = 0;
+  int64_t captures = 0;
+};
+
+ConstantTopKRun runConstantConjTopK(SearchEngine& engine, int64_t limit,
+                                    bool oldShape, bool withScores,
+                                    bool withFilter, bool withFacet) {
+  auto req = localReq(engine);
+  req->collection("main");
+  auto& topDocs = req->topDocs("q")
+      .exprQuery("body_w:qax* AND body_w:qbx*")
+      .getNumber().fields({"id"}).limit(limit);
+  if (withScores) topDocs.getScores();
+  if (withFilter) topDocs.matchFilter("keep", "keep_s", "yes");
+  if (withFacet) topDocs.facet("groups", "group_s").limit(-1);
+
+  ConstantTopKRun run;
+  {
+    SkipStatsGuard stats;
+    OldConstantShapeGuard shape(oldShape);
+    req->execute(false);
+    run.captures = SkipStats::constantWindowCaptures;
+  }
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  run.ids = resultIds(*req, "q");
+  if (withScores) run.scores = resultScoreMap(*req, "q");
+  if (withFacet) run.facets = resultFacetMap(*req, "q", "groups");
+  run.found = req->getMatchCount("q");
+  return run;
+}
+
+// Doc-order expectations computed from the corpus definition.
+std::vector<std::string> expectedConstantFirstK(int64_t k, bool withFilter) {
+  std::vector<std::string> ids;
+  for (int32_t i = 0; i < 240 && (int64_t) ids.size() < k; i += 6) {
+    if (withFilter && i % 30 == 0) continue;
+    ids.push_back("d" + std::to_string(1000 + i));
+  }
+  return ids;
+}
+
+int64_t expectedConstantMatches(bool withFilter) {
+  int64_t count = 0;
+  for (int32_t i = 0; i < 240; i += 6) {
+    if (withFilter && i % 30 == 0) continue;
+    count++;
+  }
+  return count;
+}
+
+void expectConstantTopKShapes(SearchEngine& engine) {
+  struct Shape {
+    int64_t limit;
+    bool withScores, withFilter, withFacet;
+  };
+  // limit 4: the capture window overshoots K. limit 1000: matches run out
+  // before K, so the count phase is a no-op.
+  for (auto [limit, withScores, withFilter, withFacet] :
+       {Shape{4, false, false, false}, Shape{4, true, false, false},
+        Shape{4, false, true, false}, Shape{4, true, false, true},
+        Shape{4, false, true, true}, Shape{1000, false, false, false},
+        Shape{1000, true, true, true}}) {
+    SCOPED_TRACE("limit=" + std::to_string(limit)
+                 + " scores=" + std::to_string(withScores)
+                 + " filter=" + std::to_string(withFilter)
+                 + " facet=" + std::to_string(withFacet));
+    auto fresh = runConstantConjTopK(engine, limit, false,
+                                     withScores, withFilter, withFacet);
+    auto old = runConstantConjTopK(engine, limit, true,
+                                   withScores, withFilter, withFacet);
+    // Filtered requests route through the filter-specific collection paths,
+    // not the constant window-capture branch (before this change too).
+    if (!withFilter) {
+      EXPECT_GT(fresh.captures, 0);
+    }
+    EXPECT_EQ(0, old.captures);
+    EXPECT_EQ(old.ids, fresh.ids);
+    EXPECT_EQ(old.facets, fresh.facets);
+    EXPECT_EQ(old.found, fresh.found);
+    expectSameScoreMap(old.scores, fresh.scores);
+
+    EXPECT_EQ(expectedConstantMatches(withFilter), fresh.found);
+    EXPECT_EQ(expectedConstantFirstK(limit, withFilter), fresh.ids);
+    if (withScores) {
+      ASSERT_FALSE(fresh.scores.empty());
+      float constant = fresh.scores.begin()->second;
+      for (auto& [id, score] : fresh.scores) {
+        EXPECT_EQ(constant, score) << id;
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST_F(SearchEngineTest, constantTopKWindowCaptureSingleSegment) {
+  CollectionHelper helper;
+  indexConstantConjDocs(helper, 1);
+  expectConstantTopKShapes(helper.getSearchEngine());
+}
+
+TEST_F(SearchEngineTest, constantTopKWindowCaptureMultiSegment) {
+  CollectionHelper helper;
+  indexConstantConjDocs(helper, 3);
+  expectConstantTopKShapes(helper.getSearchEngine());
+}

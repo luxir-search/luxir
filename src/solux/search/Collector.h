@@ -640,6 +640,67 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
 }
 
+// Constant scores rank by doc order, so a segment's top K docs are its first
+// K matches: capture them straight off the counting bulk's emitted windows,
+// then count the remainder without materializing docs. One bulk arrangement
+// serves ranking, count, and domain; an independent capture scorer would
+// rebuild every clause (a multiterm clause re-runs its dictionary scan per
+// build). Score windows carry the weight's constant, so reported scores
+// match what a pull scorer from the same weight returns.
+inline void collectFirstKConstantWindowed(
+    int32_t segnum, BulkScorer* bulk, DocSet* filter, DocSetBuilder* builder,
+    TopDocsCollector& collector, int32_t maxDoc) {
+  assert(bulk != nullptr);
+  assert(collector.topCount > 0);
+  skipCount(SkipStats::constantWindowCaptures);
+  bulk->setTopKDepth((int32_t) collector.topCount, false);
+  int64_t collected = 0;
+  int64_t overshoot = 0;
+  int32_t cursor = 0;
+  ScoreWindow window;
+  while (cursor != PostingsReader::END && cursor < maxDoc
+         && collected < collector.topCount) {
+    int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc,
+                                         std::numeric_limits<float>::lowest());
+    if (builder != nullptr) {
+      skipCount(SkipStats::bulkDomainWindowsFed);
+    }
+    for (int32_t i = 0; i < window.size; i++) {
+      int32_t doc = window.docs[(size_t) i];
+      if (builder != nullptr) {
+        builder->add(doc);
+      }
+      if (collected < collector.topCount) {
+        collector.collect(segnum, doc, window.scores[(size_t) i]);
+        collected++;
+      } else {
+        // The capture window ran past K; these are count-only.
+        collector.hitCount++;
+        overshoot++;
+      }
+    }
+    if (next == PostingsReader::END) {
+      cursor = next;
+      break;
+    }
+    assert(next > cursor);
+    cursor = next;
+  }
+  int64_t count = 0;
+  while (cursor != PostingsReader::END && cursor < maxDoc) {
+    int32_t next = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);
+    if (next == PostingsReader::END) {
+      break;
+    }
+    assert(next > cursor);
+    cursor = next;
+  }
+  collector.hitCount += count;
+  assert(builder == nullptr
+         || builder->card() == collected + overshoot + count);
+  unused(overshoot);
+}
+
 // Collect match-only windows in doc order. Scores are intentionally absent
 // from this path; collectors receive the unscored sentinel literal.
 // allowPruning: when true and no domain builder is attached, a collector

@@ -75,6 +75,9 @@ public:
           kSparseFilteredTopKUnionDensityInverse;
   static inline bool disableSparseFilteredTopKRerouteForTests = false;
   static inline bool disableSparseFilteredTopKUnionForTests = false;
+  // Forces the constant-scoring top-k path back to its old two-arrangement
+  // shape (independent first-K capture scorer + count-only bulk pass).
+  static inline bool disableConstantWindowCaptureForTests = false;
 
   static int32_t sparseFilteredTopKDensityInverse(
       Query::Weight::SparseFilteredTopKFamily family, int64_t topCount) {
@@ -712,10 +715,21 @@ public:
                 // windows without materializing docs or scores.
                 collectCountWindowed(bulk, collectorFilter, builderPtr, *data->scoreCollector,
                                      seg.maxDoc());
+              } else if (op.weight->isConstantScoring()
+                         && !disableConstantWindowCaptureForTests) {
+                // Equal scores reduce ranking to doc order: the segment's top
+                // K docs are the first K matches, captured straight off this
+                // bulk's emitted windows before consumption degrades to
+                // count-only. An independent capture scorer would rebuild
+                // every clause (a multiterm clause re-runs its dictionary
+                // scan per build).
+                collectFirstKConstantWindowed(
+                    segnum, bulk, collectorFilter, builderPtr,
+                    *data->scoreCollector, seg.maxDoc());
               } else if (op.weight->isConstantScoring()) {
-                // Equal scores reduce ranking to doc order. The bulk scorer
-                // drives the exhaustive count/domain while an independent
-                // scorer visits only this segment's first K matches.
+                // Test-forced old shape: the bulk scorer drives the
+                // exhaustive count/domain while an independent scorer visits
+                // only this segment's first K matches.
                 auto* captureSupplier = mainScorerSupplier(poolGuard.pool(), seg);
                 int64_t captured = 0;
                 if (captureSupplier != nullptr) {
