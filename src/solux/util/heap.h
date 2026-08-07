@@ -17,7 +17,7 @@ template <class RandomIt, class LessCompare>
 bool update_heap_top(RandomIt begin, RandomIt end, LessCompare comp) {
   auto arr = begin - 1;  // 1 based array since that is how heap offsets work.
   size_t sz = end - begin + 1;  // size of our 1 based array
-  assert(sz >= 1);
+  assert(sz >= 2);  // do not call on an empty heap (sz counts the unused 1-based slot)
   size_t empty = 1;  // the index of the slot that changed (i.e. begin)
   auto newVal = std::move(arr[empty]);  // first slot was changed, so copy and empty the slot
 
@@ -43,7 +43,7 @@ bool update_heap_top(RandomIt begin, RandomIt end, LessCompare comp) {
   // found the spot for the new value
   arr[empty] = std::move(newVal);
   return empty != 1;
-};
+}
 
 /// Directly using std::make_heap is error-prone when dealing with indirection, esp if you have an array of
 /// pointers you want to merge and you don't want to change the ordering, and you do want to know what slot
