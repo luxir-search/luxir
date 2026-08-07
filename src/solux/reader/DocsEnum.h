@@ -49,7 +49,6 @@ protected:
   int64_t endOfDocs;
   const char* termImpactFrontierPtr = nullptr;
   uint32_t termImpactFrontierLen = 0;
-  int64_t termOrdinal = -1;
   int32_t numDocBlocks = 0;
   int32_t termPackedBlocks = 0;
 
@@ -180,7 +179,6 @@ protected:
         endOfDocs(state.docsEnd),
         termImpactFrontierPtr(state.termImpactFrontier.ptr),
         termImpactFrontierLen(state.termImpactFrontier.len),
-        termOrdinal(state.termOrdinal),
         termPackedBlocks(state.packedBlockCount) {
     assert(endOfDocs >= startOfDocs);
     if (docsSize != 0) {
@@ -319,7 +317,6 @@ public:
   int32_t numDocs() { return docfreq; }
   int32_t totalTermFreq() { return ttf; }
   int32_t packedBlockCount() const { return termPackedBlocks; }
-  int64_t termOrd() const { return termOrdinal; }
   bool hasTermImpacts() const { return termImpactFrontierPtr != nullptr; }
 
   std::span<const char> encodedTermImpactFrontier() const {
@@ -3805,10 +3802,10 @@ public:
 
 // Each dense cursor keeps the current group's two directory pointers and its
 // compact group identity, adding 24 bytes.
-static_assert(sizeof(DocsEnumMeta) == 96);
-static_assert(sizeof(DocsEnumImpl) == 1400);
+static_assert(sizeof(DocsEnumMeta) == 88);
+static_assert(sizeof(DocsEnumImpl) == 1392);
 static_assert(sizeof(DocsEnumMeta) < sizeof(DocsEnumImpl));
-static_assert(sizeof(DocsOnlyEnum) == 720);
+static_assert(sizeof(DocsOnlyEnum) == 712);
 static_assert(sizeof(DocsOnlyEnum) < sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsFreqEnum) == sizeof(DocsEnumImpl));
 static_assert(sizeof(DocsPosEnum) == sizeof(DocsEnumImpl));

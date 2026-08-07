@@ -2,14 +2,12 @@
 #include "solux/reader/Postings.h"
 #include "solux/reader/TestOverlayAuxReader.h"
 #include "solux/reader/VectorAuxReader.h"
-#include "solux/reader/FieldReader.h"
 
 #include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
 #include <span>
-#include <unordered_map>
 
 #include "OrdMapImpl.h"
 
@@ -305,55 +303,6 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
     }
   }
   while (retry);
-
-  // Sidecars are read-only derivative artifacts. Aggregate exactly the same
-  // stored field totals as Query::Context, then attach per segment only after
-  // the top-reader avgdl epoch is known. Any failure leaves that field on the
-  // existing impacts path for this reader's lifetime.
-  std::unordered_map<std::string, Similarity::FieldStats> fieldStats;
-  for (auto& segment : segs) {
-    MemPool pool;
-    FieldReader fields(segment.postingsReader());
-    while (fields.readNextField()) {
-      SegFieldInfo info{};
-      fields.readFieldInfo(info);
-      if (!(info.flags & FieldType::INDEX_DOCS)) continue;
-      auto& stats = fieldStats[std::string((std::string_view) info.fieldname)];
-      stats.docsWithField += info.docsWithField;
-      stats.sumDocFreq += info.sumDocFreq;
-      stats.sumTotalTermFreq += info.sumTotalTermFreq;
-    }
-  }
-  Similarity similarity;
-  for (auto& segment : segs) {
-    MemPool pool;
-    FieldReader fields(segment.postingsReader());
-    while (fields.readNextField()) {
-      SegFieldInfo info{};
-      fields.readFieldInfo(info);
-      if (!FieldType::hasFreqs(info.flags) || !FieldType::hasPositions(info.flags)
-          || info.type != FieldType::TEXT) continue;
-      std::string field((std::string_view) info.fieldname);
-      auto statsIt = fieldStats.find(field);
-      if (statsIt == fieldStats.end() || statsIt->second.docsWithField <= 0) continue;
-      float avgdl = similarity.avgFieldLength(statsIt->second);
-      try {
-        std::string failure;
-        auto bounds = BlockBounds::open(dir, segment.segInfo.seg_id, info,
-                                        segment.maxDoc(), avgdl, &failure, true);
-        if (bounds) {
-          segment.attachBlockBounds(std::move(field), std::move(bounds));
-        } else if (!failure.empty()) {
-          IREADER_DEBUG("Ignoring block-bounds sidecar for seg={} field='{}': {}",
-                        segment.segInfo.seg_id, field, failure);
-        }
-      } catch (const std::exception& e) {
-        BlockBounds::validationFailures.fetch_add(1, std::memory_order_relaxed);
-        IREADER_DEBUG("Ignoring block-bounds sidecar for seg={} field='{}': {}",
-                      segment.segInfo.seg_id, field, e.what());
-      }
-    }
-  }
 
   // Check if we can share ordMaps from the previous reader
   if (previousReader && previousReader->coreGen() == this->coreGeneration) {

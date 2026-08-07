@@ -228,7 +228,6 @@ public:
       if (simScorer != nullptr && normsReader != nullptr) {
         auto built = targetPool.make_span<ImpactsIndex>(conjunctionEnums.size());
         auto multiplicities = targetPool.make_span<int32_t>(conjunctionEnums.size());
-        const BlockBounds* sidecarField = segment.blockBounds(query.getField());
         bool allBuilt = true;
         for (size_t i = 0; i < conjunctionEnums.size(); i++) {
           DocsPosEnum* docsEnum = conjunctionEnums[i];
@@ -237,9 +236,7 @@ public:
             if (slotEnum == docsEnum) multiplicity++;
           }
           multiplicities[i] = multiplicity;
-          BlockBounds::TermView sidecarTerm = sidecarField
-              ? sidecarField->find(docsEnum->termOrd()) : BlockBounds::TermView{};
-          built[i].build(targetPool, *docsEnum, *simScorer, 1.0f, true, sidecarTerm);
+          built[i].build(targetPool, *docsEnum, *simScorer, 1.0f, true);
           allBuilt &= !built[i].empty();
         }
         impactMultiplicities = multiplicities;

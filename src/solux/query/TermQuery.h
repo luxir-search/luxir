@@ -150,18 +150,14 @@ public:
       } else if (segFieldInfo->columnLoc.offset() > 0) {
         valueReader = targetPool.make<solux::IntColReader>(segment.postingsReader(), *segFieldInfo);
       }
-      BlockBounds::TermView sidecarTerm;
-      if (const BlockBounds* bounds = segment.blockBounds(query.getField())) {
-        sidecarTerm = bounds->find(docsEnum->termOrd());
-      }
       if (ordReader != nullptr) {
         return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, ordReader,
                                                   simScorer, boost,
-                                                  query.shouldUseFrontierBound(), sidecarTerm);
+                                                  query.shouldUseFrontierBound());
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
                                                 valueReader, simScorer, boost,
-                                                query.shouldUseFrontierBound(), sidecarTerm);
+                                                query.shouldUseFrontierBound());
     }
 
     // A term's exact match count is its docFreq - free from the term stats -
@@ -306,26 +302,24 @@ public:
 
     Scorer(solux::MemPool& pool, solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
-           bool useFrontierBound = true, BlockBounds::TermView sidecar = {})
+           bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, simScorer, boost, useFrontierBound) {
-      buildImpacts(pool, normsReader != nullptr, useFrontierBound, sidecar);
+      buildImpacts(pool, normsReader != nullptr, useFrontierBound);
     }
 
     Scorer(solux::MemPool& pool, solux::DocsFreqEnum& docsEnum, solux::NormsReader* normsReader,
            solux::IntColReader* valueReader, solux::Similarity::BM25Scorer* simScorer,
-           float boost = 1.0f, bool useFrontierBound = true,
-           BlockBounds::TermView sidecar = {})
+           float boost = 1.0f, bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, valueReader, simScorer, boost, useFrontierBound) {
       buildImpacts(pool, normsReader != nullptr || valueReader != nullptr,
-                   useFrontierBound, sidecar);
+                   useFrontierBound);
     }
 
     Scorer(solux::MemPool& pool, solux::DocsFreqEnum& docsEnum,
            solux::OrdColReader* ordReader, solux::Similarity::BM25Scorer* simScorer,
-           float boost = 1.0f, bool useFrontierBound = true,
-           BlockBounds::TermView sidecar = {})
+           float boost = 1.0f, bool useFrontierBound = true)
             : Scorer(docsEnum, ordReader, simScorer, boost, useFrontierBound) {
-      buildImpacts(pool, ordReader != nullptr, useFrontierBound, sidecar);
+      buildImpacts(pool, ordReader != nullptr, useFrontierBound);
     }
 
     bool hasImpacts() const {
@@ -333,14 +327,13 @@ public:
     }
 
     void buildImpacts(solux::MemPool& pool, bool hasNormLookup,
-                      bool useFrontierBound = true,
-                      BlockBounds::TermView sidecar = {}) {
+                      bool useFrontierBound = true) {
       if (simScorer == nullptr || !hasNormLookup) {
         competitiveUpTo = PostingsReader::END;
         competitiveBound = std::numeric_limits<float>::infinity();
         return;
       }
-      impacts.build(pool, docsEnum, *simScorer, boost, useFrontierBound, sidecar);
+      impacts.build(pool, docsEnum, *simScorer, boost, useFrontierBound);
       competitiveUpTo = PostingsReader::END;
       competitiveBound = hasImpacts() ? 0.0f : std::numeric_limits<float>::infinity();
     }

@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "solux/reader/DocsEnum.h"
-#include "solux/reader/BlockBounds.h"
 #include "solux/search/Similarity.h"
 #include "solux/util/MemPool.h"
 
@@ -59,7 +58,6 @@ private:
   bool useFrontierBound = true;
   bool lazyGroupHeaders = false;
   float globalMax = 0.0f;
-  BlockBounds::TermView sidecar;
 
   int32_t count = 0;       // total blocks
   int32_t groupCount = 0;
@@ -193,8 +191,7 @@ public:
   static inline bool forceEagerForTests = false;
 
   void build(MemPool& pool_, DocsEnumMeta& docsEnum_, Similarity::BM25Scorer& simScorer_,
-             float boost_, bool useFrontierBound_ = true,
-             BlockBounds::TermView sidecar_ = {}) {
+             float boost_, bool useFrontierBound_ = true) {
     pool = &pool_;
     docsEnum = &docsEnum_;
     simScorer = &simScorer_;
@@ -202,13 +199,6 @@ public:
     useFrontierBound = useFrontierBound_;
     lazyGroupHeaders = false;
     globalMax = 0.0f;
-    sidecar = {};
-    if (sidecar_ && (boost_ == 0.0f
-        || (std::isfinite(boost_) && boost_ > 0.0f
-            && std::isfinite(simScorer_.internalWeight())
-            && simScorer_.internalWeight() > 0.0f))) {
-      sidecar = sidecar_;
-    }
     count = docsEnum_.numImpactBlocks();
     groupCount = docsEnum_.numImpactGroups();
     groupHeadersParsed = 0;
@@ -298,43 +288,6 @@ public:
 
   float globalMaxImpact() const {
     return globalMax;
-  }
-
-  // Stage-1 parse-free surface. Existing consumers intentionally continue to
-  // use the format-backed methods below; these reads never touch the format
-  // cursor, groupHeadersParsed, chunks, or body offsets.
-  bool hasSidecarGeometry() const { return (bool) sidecar; }
-
-  int32_t sidecarGroupContaining(int32_t target) const {
-    assert(sidecar);
-    return sidecar.groupContaining(target);
-  }
-
-  int32_t sidecarBlockContaining(int32_t target) const {
-    assert(sidecar);
-    return sidecar.blockContaining(target);
-  }
-
-  int32_t sidecarGroupLastDoc(int32_t group) const {
-    assert(sidecar);
-    return sidecar.groupLastDoc(group);
-  }
-
-  int32_t sidecarBlockLastDoc(int32_t block) const {
-    assert(sidecar);
-    return sidecar.blockLastDoc(block);
-  }
-
-  float sidecarGroupBoundUpper(int32_t group) const {
-    assert(sidecar);
-    if (boost == 0.0f) return 0.0f;
-    return simScorer->scoreFromUpperDenominator(sidecar.groupDenominator(group), boost);
-  }
-
-  float sidecarBlockBoundUpper(int32_t block) const {
-    assert(sidecar);
-    if (boost == 0.0f) return 0.0f;
-    return simScorer->scoreFromUpperDenominator(sidecar.blockDenominator(block), boost);
   }
 
   int32_t groupContainingFrom(int32_t fromGroup, int32_t target) const {

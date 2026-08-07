@@ -94,8 +94,6 @@ public:
 //
 class Similarity {
 public:
-  static constexpr uint32_t SCORING_NORM_REVISION = 1;
-
   static float bm25InvNorm(float k1, float b, float fieldLength, float avgdl) {
     return 1.0f / (k1 * ((1 - b) + b * fieldLength / avgdl));
   }
@@ -106,16 +104,6 @@ public:
 
   static float bm25ScoreFromDenominator(float weight, float denominator, float boost) {
     return boost * (weight - weight / denominator);
-  }
-
-  // Build a float denominator that is strictly no smaller than the production
-  // denominator at the same inputs. nextafter calls materialize every rounded
-  // intermediate and prevent contraction across the directed-rounding steps.
-  static float bm25DenominatorUpper(uint32_t termFreq, float invNorm) {
-    const float inf = std::numeric_limits<float>::infinity();
-    float invHi = std::nextafter(invNorm, inf);
-    float productHi = std::nextafter((float) termFreq * invHi, inf);
-    return std::nextafter(1.0f + productHi, inf);
   }
 
   const float k1;
@@ -254,10 +242,6 @@ public:
         maxScore = std::max(maxScore, scores[i]);
       }
       return maxScore;
-    }
-
-    float scoreFromUpperDenominator(float denominator, float externalBoost) const {
-      return bm25ScoreFromDenominator(weight, denominator, externalBoost);
     }
 
     float internalWeight() const { return weight; }
