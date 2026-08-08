@@ -246,17 +246,9 @@ public:
   }
 
   RootOp* parse() {
-    // Top level facets default to being nested under the first top-level query
-    // for their input.
-    // Their results go at the top-level however.
-
     RootOp& rootOp = *solux::arenaCreate<RootOp>(req.arena, req);
     rootOp.parent = nullptr;
     addSubs(rootOp, req.proto.ops);
-
-    // figure out if any facets are using the first query as their input.
-    // If so, add those facets under the first query with a signal that they should add their
-    // results at the top-level of the response.
     return &rootOp;
   }
 
@@ -313,6 +305,8 @@ public:
         StatsOp::Kind kind;
         if (genOp.name == "avg" || genOp.name == "average") {
           kind = StatsOp::AVG;
+        } else if (genOp.name == "sum") {
+          kind = StatsOp::SUM;
         } else if (genOp.name == "min") {
           kind = StatsOp::MIN;
         } else if (genOp.name == "max") {
@@ -325,7 +319,19 @@ public:
         }
         std::string_view statsField = ProtobufQueryParser::getString(genOp.args[0]);
         auto& statsFtype = req.schema->getFieldTypeEx(statsField);
-        return solux::arenaCreate<StatsOp>(req.arena, req, name, statsField, statsFtype->type(), kind);
+        auto statsType = statsFtype->type();
+        if (statsType != FieldType::Type::INT
+            && statsType != FieldType::Type::FLOAT
+            && statsType != FieldType::Type::DOUBLE
+            && statsType != FieldType::Type::DATE) {
+          throw std::runtime_error("Generic operation '" + std::string(genOp.name)
+              + "' requires a numeric or DATE field");
+        }
+        if (kind == StatsOp::SUM && statsType == FieldType::Type::DATE) {
+          throw std::runtime_error("Generic operation 'sum' cannot sum DATE field '"
+              + std::string(statsField) + "'");
+        }
+        return solux::arenaCreate<StatsOp>(req.arena, req, name, statsField, statsType, kind);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);

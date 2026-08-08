@@ -46,6 +46,7 @@ public:
   OpCursor& facet(std::string_view name, std::string_view field);       // FieldFacet
   OpCursor& rangeFacet(std::string_view name, std::string_view field);  // RangeFacet
   OpCursor& avg(std::string_view name, std::string_view field);         // GenOp "avg"
+  OpCursor& sum(std::string_view name, std::string_view field);         // GenOp "sum"
   OpCursor& min(std::string_view name, std::string_view field);         // GenOp "min"
   OpCursor& max(std::string_view name, std::string_view field);         // GenOp "max"
   OpCursor& stats(std::string_view name, std::string_view field);       // GenOp "stats"
@@ -168,6 +169,7 @@ public:
   OpCursor& facet(std::string_view name, std::string_view field) { return rootCursor_.facet(name, field); }
   OpCursor& rangeFacet(std::string_view name, std::string_view field) { return rootCursor_.rangeFacet(name, field); }
   OpCursor& avg(std::string_view name, std::string_view field) { return rootCursor_.avg(name, field); }
+  OpCursor& sum(std::string_view name, std::string_view field) { return rootCursor_.sum(name, field); }
   OpCursor& min(std::string_view name, std::string_view field) { return rootCursor_.min(name, field); }
   OpCursor& max(std::string_view name, std::string_view field) { return rootCursor_.max(name, field); }
   OpCursor& stats(std::string_view name, std::string_view field) { return rootCursor_.stats(name, field); }
@@ -446,6 +448,9 @@ inline OpCursor& OpCursor::rangeFacet(std::string_view name, std::string_view fi
 }
 inline OpCursor& OpCursor::avg(std::string_view name, std::string_view field) {
   return genOpHelper(name, "avg", field);
+}
+inline OpCursor& OpCursor::sum(std::string_view name, std::string_view field) {
+  return genOpHelper(name, "sum", field);
 }
 inline OpCursor& OpCursor::min(std::string_view name, std::string_view field) {
   return genOpHelper(name, "min", field);

@@ -209,11 +209,12 @@ TEST_F(JsonResponseTest, facetStatsRenderPerBucketAndEmptyAsNull) {
   auto& facet = req->facet("cats", "cat_s");
   facet.limit(-1);
   facet.min("minimum", "price_i");
+  facet.sum("total", "price_i");
   req->execute(false);
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"cats":{"buckets":[{"val":"a","count":2,"minimum":10},{"val":"b","count":2,"minimum":null},{"val":"c","count":1,"minimum":5}]}}})" "\n",
+      R"({"ops":{"cats":{"buckets":[{"val":"a","count":2,"total":40,"minimum":10},{"val":"b","count":2,"total":null,"minimum":null},{"val":"c","count":1,"total":5,"minimum":5}]}}})" "\n",
       renderSearchResponseLine(req->responses[0]->proto));
 }
 
@@ -249,10 +250,12 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
   req->collection("main");
   req->avg("average", "price_i");
   req->min("empty", "other_i");
+  req->sum("empty_sum", "other_i");
+  req->sum("total", "price_i");
   req->execute(false);
   ASSERT_OK(req);
 
-  EXPECT_EQ(R"({"ops":{"average":20,"empty":null}})" "\n",
+  EXPECT_EQ(R"({"ops":{"average":20,"empty":null,"empty_sum":null,"total":40}})" "\n",
             renderSearchResponseLine(req->responses[0]->proto));
 }
 

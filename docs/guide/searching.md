@@ -234,8 +234,8 @@ POST /collections/books/_search
 ```
 
 The document list is promoted to `found` and `docs` in the HTTP envelope;
-nested and sibling operation results appear under `ops`. `avg`, `min`, and
-`max` generic operations work on numeric columns and ignore missing values.
+nested and sibling operation results appear under `ops`. `avg`, `sum`, `min`,
+and `max` generic operations work on numeric columns and ignore missing values.
 An empty metric domain renders as `null` in JSON.
 
 See [Faceting](faceting.md) for terms, range, date, nested, and per-bucket

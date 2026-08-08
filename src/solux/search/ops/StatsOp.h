@@ -10,12 +10,12 @@
 #include "solux/search/ops/DomainIter.h"
 
 namespace solux {
-// Single-field numeric stats over a domain: avg, min, or max.  One op instance
+// Single-field numeric stats over a domain: avg, sum, min, or max.  One op instance
 // computes one stat; the result is a double (NaN for an empty domain/bucket,
 // which the JSON layer renders as null).
 class StatsOp : public SearchOp {
 public:
-  enum Kind { AVG, MIN, MAX };
+  enum Kind { AVG, SUM, MIN, MAX };
 
   const std::string_view fieldName; // the name of the field to compute the stat for
   // INT, FLOAT, or DOUBLE - FLOAT/DOUBLE columns hold sortable bits that
@@ -68,11 +68,16 @@ public:
       case AVG:
         // one of sum/dsum is always 0 (a field is either int or floating)
         return ((double)m.sum + m.dsum) / (double)m.count;
+      case SUM:
+        return m.count ? (isFloating() ? m.dsum : (double)m.sum)
+                       : std::numeric_limits<double>::quiet_NaN();
       case MIN:
         return m.count ? decodeDouble(m.rawMin) : std::numeric_limits<double>::quiet_NaN();
-      default: // MAX
+      case MAX:
         return m.count ? decodeDouble(m.rawMax) : std::numeric_limits<double>::quiet_NaN();
     }
+    assert(false);
+    return std::numeric_limits<double>::quiet_NaN();
   }
 
   class Calc : public Calculator {
@@ -133,7 +138,8 @@ public:
         // by domain type.  The kind switch stays outside the loop so each case
         // keeps a tight per-value body.
         switch (thisOp().kind) {
-          case AVG: {
+          case AVG:
+          case SUM: {
             __int128 sum = 0;  // 128-bit: exact and overflow-free over full-range int64 values
             double dsum = 0;
             bool floating = thisOp().isFloating();
@@ -213,16 +219,64 @@ public:
       int64_t count;
     } SOLUX_UNALIGNED_END;
 
+    // SUM needs an exact 128-bit accumulator for integer fields, but only a
+    // presence bit rather than AVG's value count. Keep it separate so adding
+    // SUM does not enlarge every existing metric entry in high-cardinality
+    // inline facets.
+    SOLUX_UNALIGNED_START
+    struct SumEntry {
+      union {
+        __int128 integral;
+        double floating;
+      };
+      bool seen;
+    } SOLUX_UNALIGNED_END;
+
     std::optional<IntColReader> intColReader;
     std::optional<IntColReader::Iterator> intColIter;
 
-    void accum(Entry& e, int64_t raw) {
-      switch (thisOp().kind) {
-        case AVG: e.val += thisOp().decodeDouble(raw); break;
-        case MIN: e.bits = std::min(e.bits, raw); break;
-        case MAX: e.bits = std::max(e.bits, raw); break;
+    int entrySize() {
+      return thisOp().kind == SUM ? (int)sizeof(SumEntry) : (int)sizeof(Entry);
+    }
+
+    void initialize(void* entry) {
+      if (thisOp().kind == SUM) {
+        auto* e = (SumEntry*)entry;
+        if (thisOp().isFloating()) {
+          e->floating = 0.0;
+        } else {
+          e->integral = 0;
+        }
+        e->seen = false;
+        return;
       }
-      e.count++;
+      auto* e = (Entry*)entry;
+      switch (thisOp().kind) {
+        case AVG: e->val = 0.0; break;
+        case MIN: e->bits = INT64_MAX; break;
+        case MAX: e->bits = INT64_MIN; break;
+        case SUM: break;
+      }
+      e->count = 0;
+    }
+
+    void accum(void* entry, int64_t raw) {
+      switch (thisOp().kind) {
+        case AVG: ((Entry*)entry)->val += thisOp().decodeDouble(raw); break;
+        case SUM: {
+          auto* e = (SumEntry*)entry;
+          if (thisOp().isFloating()) {
+            e->floating += thisOp().decodeDouble(raw);
+          } else {
+            e->integral += raw;
+          }
+          e->seen = true;
+          return;
+        }
+        case MIN: ((Entry*)entry)->bits = std::min(((Entry*)entry)->bits, raw); break;
+        case MAX: ((Entry*)entry)->bits = std::max(((Entry*)entry)->bits, raw); break;
+      }
+      ((Entry*)entry)->count++;
     }
 
   public:
@@ -240,75 +294,76 @@ public:
     }
 
     int insert(void* entry, int32_t docid, int space) override {
-      if (space < (int)sizeof(Entry)) {
-        return -(int)sizeof(Entry); // not enough space to insert
+      int size = entrySize();
+      if (space < size) {
+        return -size; // not enough space to insert
       }
-      auto* e = (Entry*)entry;
-      switch (thisOp().kind) {
-        case AVG: e->val = 0.0; break;
-        case MIN: e->bits = INT64_MAX; break;
-        case MAX: e->bits = INT64_MIN; break;
-      }
-      e->count = 0;
+      initialize(entry);
       return update(entry, docid);
     }
 
     int update(void* entry, int32_t docid) override {
-      auto* e = (Entry*)entry;
       if (intColIter) {
         if (intColIter->docId() < docid) {
           intColIter->advance(docid);
         }
         if (intColIter->docId() == docid) {
           if (!intColReader->multiValued()) {
-            accum(*e, intColIter->value());
+            accum(entry, intColIter->value());
           } else {
             auto [start, end] = intColReader->getStartEndValueRank(intColIter->rank());
             for (int64_t vrank = start; vrank < end; vrank++) {
-              accum(*e, intColIter->values().valueAt(vrank));
+              accum(entry, intColIter->values().valueAt(vrank));
             }
           }
         }
       }
-      return sizeof(Entry);
+      return entrySize();
     }
 
     std::pair<int, int> merge(void* target, void* from) override {
+      if (thisOp().kind == SUM) {
+        auto* e = (SumEntry*)target;
+        auto* o = (SumEntry*)from;
+        if (thisOp().isFloating()) {
+          e->floating += o->floating;
+        } else {
+          e->integral += o->integral;
+        }
+        e->seen |= o->seen;
+        return {(int)sizeof(SumEntry), (int)sizeof(SumEntry)};
+      }
       auto* e = (Entry*)target;
       auto* o = (Entry*)from;
       switch (thisOp().kind) {
         case AVG: e->val += o->val; break;
         case MIN: e->bits = std::min(e->bits, o->bits); break;
         case MAX: e->bits = std::max(e->bits, o->bits); break;
+        case SUM: break;
       }
       e->count += o->count;
       return {sizeof(Entry), sizeof(Entry)};
     }
 
     std::pair<int, int> mergeNew(void* target, void* from, int space) override {
-      if (space < (int)sizeof(Entry)) {
-        return {-(int)sizeof(Entry), (int)sizeof(Entry)}; // not enough space to insert
+      int size = entrySize();
+      if (space < size) {
+        return {-size, size}; // not enough space to insert
       }
-      auto* e = (Entry*)target;
-      switch (thisOp().kind) {
-        case AVG: e->val = 0.0; break;
-        case MIN: e->bits = INT64_MAX; break;
-        case MAX: e->bits = INT64_MIN; break;
-      }
-      e->count = 0;
+      initialize(target);
       return merge(target, from);
     }
 
-    // count is the bucket's doc count and is unused: stats work off the number
-    // of field values seen (e->count).  AVG resolves its running sum into the
-    // average here; an empty bucket becomes NaN (matching the non-inline path's
-    // 0/0).  MIN/MAX stay in raw form: compare() runs after finalize and needs
-    // the int64 ordering - NaN reaching the sort would break its strict weak
-    // ordering - so their decode waits until fillResult.  Always return the
-    // entry size - the FacetMap entry walk packs calc entries back to back, so
-    // a 0 return would desync any calcs that follow.
+    // count is the bucket's doc count and is unused. AVG works off the number
+    // of field values in Entry::count and resolves its running sum here; an
+    // empty bucket becomes NaN. SUM keeps its presence bit and accumulator in
+    // SumEntry and needs no finalization. MIN/MAX stay in raw form: compare()
+    // runs after finalize and needs the int64 ordering, so their decode waits
+    // until fillResult. Always return the entry size: the FacetMap entry walk
+    // packs calc entries back to back, so 0 would desync calcs that follow.
     int finalize(void* entry, int64_t count) override {
       unused(count);
+      if (thisOp().kind == SUM) return sizeof(SumEntry);
       auto* e = (Entry*)entry;
       if (thisOp().kind == AVG) {
         e->val = e->count > 0 ? e->val / e->count
@@ -318,6 +373,21 @@ public:
     }
 
     int compare(void* a, void* b, int& asize, int& bsize) override {
+      if (thisOp().kind == SUM) {
+        auto* aentry = (SumEntry*)a;
+        auto* bentry = (SumEntry*)b;
+        asize = sizeof(SumEntry);
+        bsize = sizeof(SumEntry);
+        if (!aentry->seen || !bentry->seen) {
+          return (!bentry->seen) - (!aentry->seen);
+        }
+        if (thisOp().isFloating()) {
+          return aentry->floating < bentry->floating ? -1
+              : (aentry->floating > bentry->floating ? 1 : 0);
+        }
+        return aentry->integral < bentry->integral ? -1
+            : (aentry->integral > bentry->integral ? 1 : 0);
+      }
       auto* aentry = (Entry*)a;
       auto* bentry = (Entry*)b;
       asize = sizeof(Entry);
@@ -367,6 +437,14 @@ public:
       auto* data = const_cast<double*>(arr.v.data());
       Kind kind = thisOp().kind;
       for (auto i = 0u; i < entries.size(); i++) {
+        if (kind == SUM) {
+          auto* e = (SumEntry*)entries[i];
+          data[i] = e->seen
+              ? (thisOp().isFloating() ? e->floating : (double)e->integral)
+              : std::numeric_limits<double>::quiet_NaN();
+          entries[i] += sizeof(SumEntry);
+          continue;
+        }
         auto e = *(Entry*)entries[i];
         if (kind == AVG) {
           data[i] = e.val;

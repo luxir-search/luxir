@@ -2503,6 +2503,45 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   }
 }
 
+TEST_F(FacetTest, sumInlineSortsAndAccumulatesIntegersExactly) {
+  CollectionHelper helper;
+  helper.clear();
+  constexpr int64_t twoTo53 = int64_t{1} << 53;
+  helper.index(flatdoc("cat_s", "a", "amount_is", vec_i(twoTo53, 1),
+                       "id", "a1"),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(2), "id", "b1"),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "id", "c1"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("cat_s", "a", "amount_is", vec_i(-twoTo53),
+                       "id", "a2"),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(3), "id", "b2"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& facet = req->facet("categories", "cat_s").limit(-1);
+  facet.sum("total", "amount_is");
+  qb::sort(facet, "total", qb::DESC);
+
+  req->execute();
+
+  ASSERT_OK(req);
+  const auto* result = req->responses[0]->proto.ops.at("categories")->facetResult();
+  ASSERT_NE(result, nullptr);
+  const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind).v;
+  const auto& totals = std::get<solux::api::ArrDouble>(result->ops.at("total")->kind).v;
+  ASSERT_EQ(3u, ids.size());
+  ASSERT_EQ(ids.size(), totals.size());
+  EXPECT_EQ("b", ids[0]);
+  EXPECT_EQ(5.0, totals[0]);
+  EXPECT_EQ("a", ids[1]);
+  EXPECT_EQ(1.0, totals[1]);
+  EXPECT_EQ("c", ids[2]);
+  EXPECT_TRUE(std::isnan(totals[2]));
+}
+
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   CollectionHelper helper;
   helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha", "raw_sc", "x"),

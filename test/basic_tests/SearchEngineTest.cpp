@@ -752,8 +752,10 @@ TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
 
   auto& topDocs = req->topDocs("q").allQuery().getNumber();
   topDocs.avg("nested_avg", "foo_i");
+  topDocs.sum("nested_sum", "foo_i");
 
   req->avg("root_avg", "foo_i");
+  req->sum("root_sum", "foo_i");
   req->min("root_min", "foo_i");
   req->max("root_max", "foo_i");
 
@@ -764,6 +766,7 @@ TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   ASSERT_FALSE(hasError(response)) << req->toString();
   ASSERT_TRUE(response.ops.contains("root_avg")) << req->toString();
   EXPECT_TRUE(std::isnan(req->scalar<double>("root_avg")));
+  EXPECT_TRUE(std::isnan(req->scalar<double>("root_sum")));
   EXPECT_TRUE(std::isnan(req->scalar<double>("root_min")));
   EXPECT_TRUE(std::isnan(req->scalar<double>("root_max")));
 
@@ -772,6 +775,7 @@ TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   ASSERT_EQ(0, docs->found.value_or(0));
   ASSERT_TRUE(docs->ops.contains("nested_avg")) << req->toString();
   EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_avg")->kind)));
+  EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_sum")->kind)));
 }
 
 // Root-level min/max across 2 segments over int, float, double, and
@@ -810,6 +814,50 @@ TEST_F(SearchEngineTest, minMaxOps) {
   EXPECT_EQ(3.5, req->scalar<double>("max_d"));
   EXPECT_EQ(3.0, req->scalar<double>("min_is"));
   EXPECT_EQ(45.0, req->scalar<double>("max_is"));
+}
+
+TEST_F(SearchEngineTest, sumOps) {
+  CollectionHelper helper;
+  helper.clear();
+  constexpr int64_t twoTo53 = int64_t{1} << 53;
+  helper.index(flatdoc("foo_i", twoTo53, "foo_f", 1.5,
+                       "foo_d", 3.5, "prices_is", vec_i(20, 35, 45)),
+               UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_i", 1, "foo_f", -2.25,
+                       "foo_d", -1.25, "prices_is", 3),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_i", -twoTo53, "foo_f", 0.75),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs("q").allQuery().getNumber();
+  topDocs.sum("nested_i", "foo_i");
+  req->sum("sum_i", "foo_i");
+  req->sum("sum_f", "foo_f");
+  req->sum("sum_d", "foo_d");
+  req->sum("sum_is", "prices_is");
+
+  req->execute();
+
+  ASSERT_OK(req);
+  EXPECT_EQ(1.0, req->scalar<double>("sum_i"));
+  EXPECT_EQ(0.0, req->scalar<double>("sum_f"));
+  EXPECT_EQ(2.25, req->scalar<double>("sum_d"));
+  EXPECT_EQ(103.0, req->scalar<double>("sum_is"));
+  EXPECT_EQ(1.0, std::get<double>(req->docList("q")->ops.at("nested_i")->kind));
+}
+
+TEST_F(SearchEngineTest, sumRejectsDateFields) {
+  CollectionHelper helper;
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->sum("bad", "when_dt");
+
+  req->execute();
+
+  ASSERT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("cannot sum DATE field 'when_dt'"));
 }
 
 // limit 0 ("count/aggregate only, no docs") must return an accurate count and any

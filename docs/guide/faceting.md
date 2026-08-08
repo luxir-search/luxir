@@ -87,7 +87,7 @@ enumerated.
 
 ## Numeric metrics
 
-`avg`, `min`, and `max` are generic operations over a numeric column. They
+`avg`, `sum`, `min`, and `max` are generic operations over a numeric column. They
 ignore missing values and return `null` when no value exists in the domain:
 
 ```json
@@ -95,6 +95,10 @@ ignore missing values and return `null` when no value exists in the domain:
   "gen_op": {"name":"avg","args":["price_f"]}
 }
 ```
+
+`sum` adds every value occurrence, including every element of a multi-valued
+field. Integer sums are accumulated exactly and then returned as a `double`, so
+values beyond 2^53 may be rounded in the response.
 
 At the root of `top_docs.ops`, the result is one scalar over the entire match
 domain. Nested under a string or ID facet, it is evaluated independently for

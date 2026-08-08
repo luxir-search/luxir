@@ -172,7 +172,7 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
   isolating scheduler effects.
 - Count-only and aggregate-only requests: `limit: 0` with `get_number: true`
   returns the exact count and any facets/metrics without fetching documents.
-- Numeric `avg`, `min`, and `max` operations at query level or per string-facet
+- Numeric `avg`, `sum`, `min`, and `max` operations at query level or per string-facet
   bucket.
 - Hybrid fusion op: reciprocal rank fusion (RRF) over named sources (e.g.
   a lexical and a vector query), with shared and per-source filters.
