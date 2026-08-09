@@ -267,3 +267,51 @@ TEST_F(DisjunctionCountIdentityTest, prohibitedClauseFallsBack) {
   EXPECT_EQ(0, normal.engagements);
   EXPECT_GT(normal.prohibitedFallbacks, 0);
 }
+
+TEST_F(DisjunctionCountIdentityTest, multiWindowIdentityStaysDocsOnly) {
+  // The identity loop interleaves docs-only window fills with cursor
+  // advances on the same term scorers. A corpus wider than one count window
+  // forces an advance AFTER a fill, which must stay on the docs-only
+  // protocol; the single-window corpora above never reach that interleave.
+  CollectionHelper wide;
+  const int32_t total = 12800;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) total);
+  for (int32_t doc = 0; doc < total; doc++) {
+    std::string body = "filler ";
+    if ((doc & 1) == 0) body += "wcommon ";
+    if (doc == 1 || doc == 5000 || doc == 9000 || doc == 12799) {
+      body += "wrare ";
+    }
+    docs.push_back(flatdoc(
+        "id", "w" + std::to_string(doc),
+        "body_w", body));
+  }
+  wide.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto countUnion = [&](bool disableIdentity) {
+    IdentityGuard identityGuard(disableIdentity);
+    SkipStatsGuard statsGuard;
+    auto req = localReq(wide.getSearchEngine());
+    req->collection("main");
+    auto& cursor = req->topDocs("q").getNumber().limit(0);
+    auto& mr = cursor.mr();
+    cursor.rawQuery() = qb::boolean(mr, {},
+        {qb::match(mr, "body_w", "wcommon"),
+         qb::match(mr, "body_w", "wrare")});
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return std::pair<int64_t, int64_t>(
+        req->getMatchCount(), SkipStats::disjCountIdentityEngagements);
+  };
+
+  auto [enumeratedCount, enumeratedEngagements] = countUnion(true);
+  auto [identityCount, identityEngagements] = countUnion(false);
+
+  // wcommon on 6400 evens; wrare adds odd docs 1 and 12799 (5000 and 9000
+  // already match wcommon).
+  EXPECT_EQ(6402, identityCount);
+  EXPECT_EQ(enumeratedCount, identityCount);
+  EXPECT_EQ(0, enumeratedEngagements);
+  EXPECT_GT(identityEngagements, 0);
+}

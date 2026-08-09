@@ -391,6 +391,13 @@ public:
       return docsEnum.advance(target);
     }
 
+    // Docs-only strict advance for count-only consumers that also window-fill
+    // this scorer: fills switch the enum to docs-only consumption, and the
+    // scored advance() may not follow it.
+    int32_t advanceDocOnly(int32_t target) {
+      return docsEnum.advanceDocOnly(target);
+    }
+
     int32_t advanceScoredProbe(int32_t target) {
       return docsEnum.advanceScoredProbe(target);
     }

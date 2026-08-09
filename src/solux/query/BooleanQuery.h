@@ -7785,7 +7785,7 @@ public:
     std::span<Query::Scorer*> countTerms;
     std::span<uint64_t> countClauseBits;
     std::span<uint64_t> countTermBits;
-    std::span<Query::Scorer*> disjCountIdentityOthers;
+    std::span<TermQuery::Scorer*> disjCountIdentityOthers;
     TermQuery::Scorer* disjCountIdentityLargest = nullptr;
     int64_t disjCountIdentityLargestDf = 0;
     std::span<Query::Scorer*> exclusionScorers;  // flattened OR
@@ -7857,11 +7857,12 @@ public:
       }
 
       disjCountIdentityOthers =
-          pool.make_span<Query::Scorer*>(scorers.size() - 1);
+          pool.make_span<TermQuery::Scorer*>(scorers.size() - 1);
       size_t other = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
         if (i != largestIndex) {
-          disjCountIdentityOthers[other++] = scorers[i];
+          disjCountIdentityOthers[other++] =
+              static_cast<TermQuery::Scorer*>(scorers[i]);
         }
       }
       assert(other == disjCountIdentityOthers.size());
@@ -8273,7 +8274,10 @@ public:
       for (auto* scorer : disjCountIdentityOthers) {
         int32_t doc = scorer->docId();
         if (doc < target) {
-          doc = scorer->advance(target);
+          // Docs-only: the window loop also fills these scorers' bits, which
+          // switches their enums to docs-only consumption; a scored advance
+          // may not follow that.
+          doc = scorer->advanceDocOnly(target);
         }
         next = std::min(next, doc);
       }
