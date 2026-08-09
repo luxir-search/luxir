@@ -632,6 +632,9 @@ public:
                     segnum, bulk, collectorFilter, builderPtr,
                     *data->fieldCollector, seg.maxDoc(), allowSortPruning);
                 usedBulk = true;
+              } else if (bulk != nullptr) {
+                skipCount(SkipStats::bulkBuiltThenRejected);
+                skipCount(SkipStats::bulkBuiltThenRejectedSortMatchWindow);
               }
             }
             if (!usedBulk) {
@@ -682,6 +685,9 @@ public:
                     composedExactCountTopK = true;
                   } else {
                     skipCount(SkipStats::exactCountTopKBulkFallbacks);
+                    skipCount(SkipStats::bulkBuiltThenRejected);
+                    skipCount(
+                        SkipStats::bulkBuiltThenRejectedExactComposition);
                   }
                 } else {
                   skipCount(SkipStats::exactCountTopKBulkFallbacks);

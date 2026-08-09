@@ -1625,6 +1625,10 @@ public:
         int64_t mandCost = mandSupplier->cost();
         auto* mandScorer = mandSupplier->get(targetPool, mandCost);
         if (mandScorer == nullptr || mandScorer->hasTwoPhase()) {
+          if (mandScorer != nullptr) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedMandOptTwoPhase);
+          }
           return nullptr;
         }
 
@@ -1643,6 +1647,8 @@ public:
             continue;
           }
           if (scorer->hasTwoPhase()) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedMandOptTwoPhase);
             return nullptr;
           }
           optScorers.push_back(scorer);
@@ -1737,6 +1743,8 @@ public:
                       return member->supportsWindowFilter();
                     })) {
               skipCount(SkipStats::bulkExclusionUnsupportedFallbacks);
+              skipCount(SkipStats::bulkBuiltThenRejected);
+              skipCount(SkipStats::bulkBuiltThenRejectedMaxScoreProhibited);
               return nullptr;
             }
             exclusions.insert(exclusions.end(), members.begin(), members.end());
@@ -1763,6 +1771,8 @@ public:
         for (size_t i = 0; i < filterSuppliers.size(); i++) {
           auto* scorer = filterSuppliers[i]->get(targetPool, bodyCost);
           if (scorer == nullptr || !scorer->supportsWindowFilter()) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedFilterAttach);
             return nullptr;
           }
           filterScorers[i] = scorer;
@@ -1773,7 +1783,12 @@ public:
             && bodyCost <= (filterCost - 1) / kMaskProbeAdvanceWeight;
         auto* windowFilter = targetPool.make<WindowFilter>(
             targetPool, filterScorers, probe, filterCost);
-        return bulk->attachWindowFilter(windowFilter) ? bulk : nullptr;
+        if (!bulk->attachWindowFilter(windowFilter)) {
+          skipCount(SkipStats::bulkBuiltThenRejected);
+          skipCount(SkipStats::bulkBuiltThenRejectedFilterAttach);
+          return nullptr;
+        }
+        return bulk;
       }
 
       int64_t minFilterCost() const {
@@ -1808,6 +1823,7 @@ public:
         Query::Scorer* filterScorer = nullptr;
         std::span<const int32_t> filterDocs;
         TermQuery::Scorer* postingsScorer = nullptr;
+        bool builtFilterScorer = false;
         if (auto* docSetSupplier =
                 dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
           DocSet* docs = docSetSupplier->docSet();
@@ -1819,16 +1835,22 @@ public:
             filterDocs = ((ArrDocSet*) docs)->docs();
           } else {
             filterScorer = filterSupplier->get(targetPool, filterCost);
+            builtFilterScorer = filterScorer != nullptr;
           }
         } else if (!QueryPrep::
                        disableSparseBatchPostingsFeedForTests) {
           auto* scorer = filterSupplier->get(targetPool, filterCost);
+          builtFilterScorer = scorer != nullptr;
           postingsScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
           filterScorer = postingsScorer;
         }
         if (filterScorer == nullptr && filterDocs.empty()) {
           skipCount(
               SkipStats::filteredDisjBatchUnsupportedFilterFeedFallbacks);
+          if (builtFilterScorer) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedFilteredDisj);
+          }
           return nullptr;
         }
         struct TermEntry {
@@ -1848,6 +1870,8 @@ public:
           }
           auto* termScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
           if (termScorer == nullptr) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedFilteredDisj);
             if (scorer->hasTwoPhase()) {
               twoPhaseDisjunctionPull = true;
               return nullptr;
@@ -1858,6 +1882,10 @@ public:
           entries.push_back({supplier->cost(), termScorer});
         }
         if (entries.empty()) {
+          if (builtFilterScorer) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedFilteredDisj);
+          }
           return nullptr;
         }
         if (!needsScores) {
@@ -1887,12 +1915,18 @@ public:
         auto required = conjunctionBulkScorer(
             targetPool, ConjunctionMode::CANDIDATE);
         if (!required || !required->usesCandidateRoute()) {
+          if (required) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedExactMandOpt);
+          }
           return nullptr;
         }
 
         auto* mandatorySupplier = mandatorySources[0]->scorerSupplier(
             targetPool, segment);
         if (mandatorySupplier == nullptr) {
+          skipCount(SkipStats::bulkBuiltThenRejected);
+          skipCount(SkipStats::bulkBuiltThenRejectedExactMandOpt);
           return nullptr;
         }
         int64_t leadCost = std::min(
@@ -1909,6 +1943,8 @@ public:
             continue;
           }
           if (scorer->hasTwoPhase()) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedExactMandOpt);
             return nullptr;
           }
           optionalScorers.push_back(scorer);
@@ -1963,6 +1999,10 @@ public:
             recordCandidateConjunctionEngagement(*candidate);
             return candidate->bulk;
           }
+          if (candidate) {
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedFilteredScored);
+          }
         }
 
         // Exclusions are admitted only by the candidate conjunction above.
@@ -2015,10 +2055,18 @@ public:
         entries.reserve(filterSuppliers.size());
         for (auto* supplier : filterSuppliers) {
           if (supplier == nullptr) {
+            if (!entries.empty()) {
+              skipCount(SkipStats::bulkBuiltThenRejected);
+              skipCount(SkipStats::bulkBuiltThenRejectedFilterOnly);
+            }
             return nullptr;
           }
           auto* bulk = supplier->bulkScorer(targetPool);
           if (bulk == nullptr) {
+            if (!entries.empty()) {
+              skipCount(SkipStats::bulkBuiltThenRejected);
+              skipCount(SkipStats::bulkBuiltThenRejectedFilterOnly);
+            }
             return nullptr;
           }
           entries.push_back({supplier->cost(), bulk});
@@ -2200,6 +2248,8 @@ public:
               default:
                 break;
             }
+            skipCount(SkipStats::bulkBuiltThenRejected);
+            skipCount(SkipStats::bulkBuiltThenRejectedWrapperRoute);
           }
           bool pureFilteredDisjunction = mandatorySources.empty()
               && prohibitedSources.empty() && optionalSources.size() >= 2

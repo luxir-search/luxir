@@ -3074,3 +3074,41 @@ TEST_F(SearchEngineTest, constantTopKWindowCaptureMultiSegment) {
   indexConstantConjDocs(helper, 3);
   expectConstantTopKShapes(helper.getSearchEngine());
 }
+
+TEST_F(SearchEngineTest, bulkBuiltThenRejectedWrapperRoute) {
+  CollectionHelper helper;
+  indexConstantConjDocs(helper, 1);
+
+  struct Run {
+    int64_t found;
+    int64_t rejected;
+    int64_t wrapperRoute;
+  };
+  auto run = [&](bool filtered) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q").exprQuery("body_w:qax*")
+        .getNumber().limit(0);
+    if (filtered) {
+      topDocs.matchFilter("keep", "keep_s", "yes");
+    }
+    SkipStatsGuard stats;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::bulkBuiltThenRejected,
+      SkipStats::bulkBuiltThenRejectedWrapperRoute,
+    };
+  };
+
+  Run filtered = run(true);
+  EXPECT_EQ(112, filtered.found);
+  EXPECT_GT(filtered.wrapperRoute, 0);
+  EXPECT_GE(filtered.rejected, filtered.wrapperRoute);
+
+  Run unfiltered = run(false);
+  EXPECT_EQ(120, unfiltered.found);
+  EXPECT_EQ(0, unfiltered.rejected);
+  EXPECT_EQ(0, unfiltered.wrapperRoute);
+}
