@@ -342,7 +342,7 @@ public:
             bulkContext);
         auto* rankingBulk =
             plan.available == Query::ScorerSupplier::BulkAnswer::NO
-            ? nullptr : rankingSupplier->bulkScorer(pool);
+            ? nullptr : rankingSupplier->buildBulk(pool, plan);
         if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
           rankingSupplier->recordBulkPlanCommitment(
               Query::ScorerSupplier::BulkUse::SCORED_WINDOWS,
@@ -637,7 +637,7 @@ public:
                   || plan.supportsMatchWindows
                       == Query::ScorerSupplier::BulkAnswer::NO;
               auto* bulk = plannedNo
-                  ? nullptr : supplier->bulkScorer(poolGuard.pool());
+                  ? nullptr : supplier->buildBulk(poolGuard.pool(), plan);
               if (plannedNo) {
                 supplier->recordBulkPlanCommitment(
                     Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
@@ -727,7 +727,7 @@ public:
                         op.rankingWeight->scorerSupplier(
                             poolGuard.pool(), seg);
                     auto* exactScorer =
-                        supplier->bulkScorer(poolGuard.pool());
+                        supplier->buildBulk(poolGuard.pool(), plan);
                     if (exactScorer != nullptr
                         && exactScorer->supportsExactCandidateScoring()) {
                       countThenCollectTopK(

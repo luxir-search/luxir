@@ -345,6 +345,14 @@ public:
     UNKNOWN,
   };
 
+  enum class UnresolvedSupplierCause : uint8_t {
+    NONE,
+    MULTITERM,
+    PHRASE,
+    NUMERIC_GEO,
+    OTHER,
+  };
+
   enum class DirectScorerKind : uint8_t {
     TERM,
     DOC_SET,
@@ -414,6 +422,17 @@ public:
     IndependentTermAccess independentTerm = IndependentTermAccess::UNKNOWN;
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
+
+    bool hasUnknown() const noexcept {
+      return matchState == MatchState::UNKNOWN
+          || directKind == DirectScorerKind::UNKNOWN
+          || reportedTwoPhase == ReportedTwoPhase::UNKNOWN
+          || windowFillClause == ClauseShape::UNKNOWN
+          || termDisjunctionClause == ClauseShape::UNKNOWN
+          || independentTerm == IndependentTermAccess::UNKNOWN
+          || docsOnly == DocsOnlyAccess::UNKNOWN
+          || directDocSet == DirectDocSetAccess::UNKNOWN;
+    }
   };
 
   // Unknown and custom queries are conservatively variable-scoring.
@@ -486,11 +505,18 @@ public:
       bool hasFilter() const noexcept { return filterCost >= 0; }
     };
 
+    // Supplier-owned, pool-allocated state carried from a definite plan into
+    // construction. Only the supplier that created the state may interpret it.
+    struct BulkBuildState {
+      const ScorerSupplier* owner = nullptr;
+    };
+
     struct BulkPlan {
       BulkAnswer available = BulkAnswer::UNKNOWN;
       BulkAnswer supportsMatchWindows = BulkAnswer::UNKNOWN;
       BulkAnswer supportsExactCandidateScoring = BulkAnswer::UNKNOWN;
       BulkAnswer consumesFilters = BulkAnswer::UNKNOWN;
+      const BulkBuildState* buildState = nullptr;
     };
 
     struct FilteredBulkResult {
@@ -522,6 +548,15 @@ public:
         const ScorerBuildContext& buildContext) const {
       unused(buildContext);
       return {};
+    }
+
+    /// Attribute a shape uncertainty to the supplier family that must resolve
+    /// it. Compound and transparent wrapper suppliers should delegate to the
+    /// unresolved child.
+    virtual UnresolvedSupplierCause unresolvedScorerCause(
+        const ScorerBuildContext& buildContext) const {
+      unused(buildContext);
+      return UnresolvedSupplierCause::OTHER;
     }
 
     /// Resolve any dictionary-expansion-dependent shape answers for this
@@ -599,6 +634,14 @@ public:
     virtual BulkScorer* bulkScorer(MemPool& targetPool) {
       unused(targetPool);
       return nullptr;
+    }
+
+    /// Consume supplier-owned state from a definite plan when available. The
+    /// default preserves the historical bulk construction path.
+    virtual BulkScorer* buildBulk(
+        MemPool& targetPool, const BulkPlan& plan) {
+      unused(plan);
+      return bulkScorer(targetPool);
     }
 
     // Build a bulk scorer that will run beneath an enclosing filter. Unknown

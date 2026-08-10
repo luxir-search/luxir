@@ -85,6 +85,11 @@ class ConstantScoreQuery final : public solux::Query {
       };
     }
 
+    Query::UnresolvedSupplierCause unresolvedScorerCause(
+        const Query::ScorerBuildContext& buildContext) const override {
+      return childSupplier->unresolvedScorerCause(buildContext);
+    }
+
     bool fillExpansionMemo(
         const Query::ScorerBuildContext& buildContext) override {
       return childSupplier->fillExpansionMemo(buildContext);

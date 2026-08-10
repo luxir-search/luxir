@@ -277,13 +277,19 @@ public:
       }
 
       // Deliberately all-UNKNOWN: window-fill eligibility depends on a
-    // positive cost injected after construction, and two-phase state on
-    // the flattening outcome; a falsely definite answer would poison
-    // route planning.
-    Query::ScorerShape describeScorer(
+      // positive cost injected after construction, and two-phase state on
+      // the flattening outcome; a falsely definite answer would poison
+      // route planning.
+      Query::ScorerShape describeScorer(
           const Query::ScorerBuildContext& buildContext) const override {
         unused(buildContext);
         return {};
+      }
+
+      Query::UnresolvedSupplierCause unresolvedScorerCause(
+          const Query::ScorerBuildContext& buildContext) const override {
+        unused(buildContext);
+        return Query::UnresolvedSupplierCause::PHRASE;
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {

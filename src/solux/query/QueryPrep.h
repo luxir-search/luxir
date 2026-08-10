@@ -298,21 +298,7 @@ public:
     }
 
     const auto& source = static_cast<BitDocSet*>(docs)->bits();
-    int32_t bitCount = windowEnd - windowStart;
-    int32_t words = (bitCount + 63) >> 6;
-    int32_t sourceWord = windowStart >> 6;
-    int32_t shift = windowStart & 63;
-    int32_t sourceWords = (int32_t) FixedBitSet::sizeInWords(maxDoc);
-    for (int32_t i = 0; i < words; i++) {
-      uint64_t bits = source.words[sourceWord + i] >> shift;
-      if (shift != 0 && sourceWord + i + 1 < sourceWords) {
-        bits |= source.words[sourceWord + i + 1] << (64 - shift);
-      }
-      if (i + 1 == words && (bitCount & 63) != 0) {
-        bits &= (1ULL << (bitCount & 63)) - 1ULL;
-      }
-      windowBits[(size_t) i] |= bits;
-    }
+    source.orRange(windowBits, windowStart, windowEnd);
   }
 };
 

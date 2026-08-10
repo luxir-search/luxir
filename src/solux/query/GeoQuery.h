@@ -195,6 +195,12 @@ public:
       return {};
     }
 
+    Query::UnresolvedSupplierCause unresolvedScorerCause(
+        const Query::ScorerBuildContext& buildContext) const override {
+      unused(buildContext);
+      return Query::UnresolvedSupplierCause::NUMERIC_GEO;
+    }
+
     Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
       if (leadCost < cost()) {
         skipCount(SkipStats::geoSparseVerifyArms);

@@ -802,12 +802,18 @@ public:
       int64_t cost() override { return estimatedCost; }
 
       // Deliberately all-UNKNOWN: the produced scorer arm (sparse verify,
-    // materialized points, zone map, scan) depends on leadCost; a
-    // falsely definite answer would poison route planning.
-    Query::ScorerShape describeScorer(
+      // materialized points, zone map, scan) depends on leadCost; a
+      // falsely definite answer would poison route planning.
+      Query::ScorerShape describeScorer(
           const Query::ScorerBuildContext& buildContext) const override {
         unused(buildContext);
         return {};
+      }
+
+      Query::UnresolvedSupplierCause unresolvedScorerCause(
+          const Query::ScorerBuildContext& buildContext) const override {
+        unused(buildContext);
+        return Query::UnresolvedSupplierCause::NUMERIC_GEO;
       }
 
       Query::Scorer* createPointsScorerForTests(MemPool& targetPool) {

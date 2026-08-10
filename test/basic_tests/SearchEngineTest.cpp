@@ -3407,3 +3407,30 @@ TEST_F(SearchEngineTest, conjunctionPlanFillsOptionalMultiTermMemo) {
   EXPECT_EQ(1, planned.expansions);
   EXPECT_EQ(1, disabledIdentity.expansions);
 }
+
+TEST_F(SearchEngineTest, conjunctionUnknownIslandAttributesPhraseCause) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(
+      {flatdoc("id", "1", "body_w", "quick fox", "keep_s", "yes"),
+       flatdoc("id", "2", "body_w", "quick brown fox", "keep_s", "yes"),
+       flatdoc("id", "3", "body_w", "quick fox", "keep_s", "no")},
+      UpdateMessage::COMMIT).success);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs("q").getNumber().limit(0);
+  topDocs.rawQuery() =
+      qb::phraseWords(topDocs.mr(), "body_w", {"quick", "fox"});
+  topDocs.matchFilter("keep", "keep_s", "yes");
+
+  SkipStatsGuard stats;
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount("q"));
+  EXPECT_GT(SkipStats::conjPlanUnknownIsland, 0);
+  EXPECT_EQ(SkipStats::conjPlanUnknownIsland,
+            SkipStats::conjPlanUnknownIslandPhrase);
+  EXPECT_EQ(0, SkipStats::conjPlanUnknownIslandMultiTerm);
+  EXPECT_EQ(0, SkipStats::conjPlanUnknownIslandNumericGeo);
+  EXPECT_EQ(0, SkipStats::conjPlanUnknownIslandOther);
+}

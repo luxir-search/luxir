@@ -175,6 +175,10 @@ struct SkipStats {
   static inline int64_t bulkBuiltThenRejectedSortMatchWindow = 0;
   static inline int64_t bulkBuiltThenRejectedExactComposition = 0;
   static inline int64_t conjPlanUnknownIsland = 0;
+  static inline int64_t conjPlanUnknownIslandMultiTerm = 0;
+  static inline int64_t conjPlanUnknownIslandPhrase = 0;
+  static inline int64_t conjPlanUnknownIslandNumericGeo = 0;
+  static inline int64_t conjPlanUnknownIslandOther = 0;
   static inline int64_t multitermExpansions = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKUnionReroutes = 0;
@@ -373,6 +377,10 @@ struct SkipStats {
     bulkBuiltThenRejectedSortMatchWindow = 0;
     bulkBuiltThenRejectedExactComposition = 0;
     conjPlanUnknownIsland = 0;
+    conjPlanUnknownIslandMultiTerm = 0;
+    conjPlanUnknownIslandPhrase = 0;
+    conjPlanUnknownIslandNumericGeo = 0;
+    conjPlanUnknownIslandOther = 0;
     multitermExpansions = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKUnionReroutes = 0;

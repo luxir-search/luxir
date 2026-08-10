@@ -276,6 +276,31 @@ public:
     return count;
   }
 
+  // OR [from, to) into destination with bit 0 corresponding to from.
+  // The final partial word is masked; destination words beyond the range are
+  // untouched.
+  void orRange(std::span<uint64_t> destination, int32_t from,
+               int32_t to) const {
+    assert(from >= 0 && to >= from && to <= nbits);
+    int32_t bitCount = to - from;
+    assert((int64_t) destination.size() * 64 >= bitCount);
+    if (bitCount == 0) return;
+
+    int32_t destinationWords = (bitCount + 63) >> 6;
+    int32_t sourceWord = from >> 6;
+    int32_t shift = from & 63;
+    for (int32_t i = 0; i < destinationWords; i++) {
+      uint64_t sourceBits = words[sourceWord + i] >> shift;
+      if (shift != 0 && sourceWord + i + 1 < (int32_t) nwords) {
+        sourceBits |= words[sourceWord + i + 1] << (64 - shift);
+      }
+      if (i + 1 == destinationWords && (bitCount & 63) != 0) {
+        sourceBits &= (1ULL << (bitCount & 63)) - 1ULL;
+      }
+      destination[(size_t) i] |= sourceBits;
+    }
+  }
+
   void set(int32_t index) {
     assert(index < nbits);
     OBS::set(index);

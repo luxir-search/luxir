@@ -1664,6 +1664,26 @@ public:
         return maskSupplierAccess(positive);
       }
 
+      Query::UnresolvedSupplierCause unresolvedScorerCause(
+          const Query::ScorerBuildContext& buildContext) const override {
+        auto findCause = [&](std::span<Query::ScorerSupplier* const> suppliers) {
+          for (auto* supplier : suppliers) {
+            if (supplier != nullptr
+                && supplier->describeScorer(buildContext).hasUnknown()) {
+              return supplier->unresolvedScorerCause(buildContext);
+            }
+          }
+          return Query::UnresolvedSupplierCause::NONE;
+        };
+        for (auto suppliers : {
+                 mandatoryShapeSuppliers, filterSuppliers,
+                 optionalShapeSuppliers, prohibitedShapeSuppliers}) {
+          Query::UnresolvedSupplierCause cause = findCause(suppliers);
+          if (cause != Query::UnresolvedSupplierCause::NONE) return cause;
+        }
+        return Query::UnresolvedSupplierCause::OTHER;
+      }
+
       bool fillExpansionMemo(
           const Query::ScorerBuildContext& buildContext) override {
         bool filled = fillExpansionMemos(
@@ -1785,7 +1805,7 @@ public:
         Query::ScorerShape shape;
       };
 
-      struct ConjunctionPlan {
+      struct ConjunctionPlan : BulkBuildState {
         ConjunctionMode mode = ConjunctionMode::SCORED_BODY;
         ConjunctionRoute route = ConjunctionRoute::GENERIC;
         EnclosingFilters enclosingFilters = EnclosingFilters::NOT_SUPPLIED;
@@ -1799,6 +1819,8 @@ public:
         bool docSetSparseEligible = false;
         bool recordConjunctionConstruction = false;
         bool hasDirectDenseClause = false;
+        Query::UnresolvedSupplierCause unresolvedCause =
+            Query::UnresolvedSupplierCause::NONE;
       };
 
       struct ConjunctionPlanningResult {
@@ -1863,6 +1885,18 @@ public:
             return std::nullopt;
         }
         std::unreachable();
+      }
+
+      static Query::UnresolvedSupplierCause firstUnresolvedCause(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        for (auto* supplier : suppliers) {
+          if (supplier != nullptr
+              && supplier->describeScorer(buildContext).hasUnknown()) {
+            return supplier->unresolvedScorerCause(buildContext);
+          }
+        }
+        return Query::UnresolvedSupplierCause::OTHER;
       }
 
       static Query::ScorerShape plannedOptionalGroupShape(
@@ -1978,6 +2012,8 @@ public:
         for (PlannedEntry& entry : entries) {
           if (entry.optionalGroup) {
             if (hasUnknownElision(optionalSuppliers, buildContext)) {
+              plan.unresolvedCause = firstUnresolvedCause(
+                  optionalSuppliers, buildContext);
               return {ConjunctionPlanStatus::LEGACY, plan};
             }
             entry.shape = plannedOptionalGroupShape(
@@ -1987,6 +2023,12 @@ public:
             }
           } else {
             entry.shape = entry.supplier->describeScorer(buildContext);
+            if (plan.unresolvedCause
+                    == Query::UnresolvedSupplierCause::NONE
+                && entry.shape.hasUnknown()) {
+              plan.unresolvedCause =
+                  entry.supplier->unresolvedScorerCause(buildContext);
+            }
             if (entry.shape.matchState == Query::MatchState::EMPTY) {
               return {ConjunctionPlanStatus::NO_MATCH, plan};
             }
@@ -2001,6 +2043,8 @@ public:
           }
         }
         if (hasUnknownElision(prohibitedSuppliers, buildContext)) {
+          plan.unresolvedCause = firstUnresolvedCause(
+              prohibitedSuppliers, buildContext);
           return {ConjunctionPlanStatus::LEGACY, plan};
         }
 
@@ -2012,6 +2056,12 @@ public:
           plan.optionalGroup[i] = {
               optionalSuppliers[i],
               optionalSuppliers[i]->describeScorer(buildContext)};
+          if (plan.unresolvedCause
+                  == Query::UnresolvedSupplierCause::NONE
+              && plan.optionalGroup[i].shape.hasUnknown()) {
+            plan.unresolvedCause =
+                optionalSuppliers[i]->unresolvedScorerCause(buildContext);
+          }
         }
         plan.prohibited = targetPool.make_span<PlannedSupplier>(
             prohibitedSuppliers.size());
@@ -2019,6 +2069,12 @@ public:
           plan.prohibited[i] = {
               prohibitedSuppliers[i],
               prohibitedSuppliers[i]->describeScorer(buildContext)};
+          if (plan.unresolvedCause
+                  == Query::UnresolvedSupplierCause::NONE
+              && plan.prohibited[i].shape.hasUnknown()) {
+            plan.unresolvedCause =
+                prohibitedSuppliers[i]->unresolvedScorerCause(buildContext);
+          }
         }
 
         auto finishRoute = [&](ConjunctionRoute route,
@@ -2431,8 +2487,13 @@ public:
         ConjunctionPlanningResult planning = planConjunction(
             pool, mode, acceptedRoutes);
         switch (planning.status) {
-          case ConjunctionPlanStatus::READY:
-            return matchWindowBulkPlan();
+          case ConjunctionPlanStatus::READY: {
+            BulkPlan bulkPlan = matchWindowBulkPlan();
+            auto* buildPlan = pool.make<ConjunctionPlan>(planning.plan);
+            buildPlan->owner = this;
+            bulkPlan.buildState = buildPlan;
+            return bulkPlan;
+          }
           case ConjunctionPlanStatus::DECLINED:
           case ConjunctionPlanStatus::NO_MATCH:
             return noBulkPlan();
@@ -2957,8 +3018,6 @@ public:
         auto clauseLayouts =
             targetPool.make_span<ConjunctionClauseLayout>(
                 plan.entries.size());
-        Query::ScorerBuildContext buildContext =
-            scorerBuildContext(plan.leadCost);
         for (size_t i = 0; i < plan.entries.size(); i++) {
           const PlannedEntry& entry = plan.entries[i];
           Query::Scorer* scorer;
@@ -2971,8 +3030,6 @@ public:
                   targetPool, plan.leadCost);
 #ifndef NDEBUG
               assertScorerLayout(memberPlan.shape, member);
-              assertScorerShape(
-                  memberPlan.supplier, member, buildContext);
 #endif
               if (member != nullptr) {
                 members[memberCount++] = member;
@@ -2988,9 +3045,6 @@ public:
                     std::span<Query::Scorer*>(members, memberCount));
           } else {
             scorer = entry.supplier->get(targetPool, plan.leadCost);
-#ifndef NDEBUG
-            assertScorerShape(entry.supplier, scorer, buildContext);
-#endif
           }
 #ifndef NDEBUG
           assertScorerLayout(entry.shape, scorer);
@@ -3080,8 +3134,6 @@ public:
                 targetPool, plan.leadCost);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
-            assertScorerShape(
-                prohibited.supplier, scorer, buildContext);
 #endif
             if (scorer != nullptr) {
               prohibitedArr[prohibitedCount] = scorer;
@@ -3100,8 +3152,6 @@ public:
                 targetPool, plan.leadCost);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
-            assertScorerShape(
-                prohibited.supplier, scorer, buildContext);
 #endif
             if (scorer == nullptr) continue;
             if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
@@ -3172,6 +3222,26 @@ public:
         }
       }
 
+      static void recordUnknownIsland(
+          Query::UnresolvedSupplierCause cause) {
+        skipCount(SkipStats::conjPlanUnknownIsland);
+        switch (cause) {
+          case Query::UnresolvedSupplierCause::MULTITERM:
+            skipCount(SkipStats::conjPlanUnknownIslandMultiTerm);
+            break;
+          case Query::UnresolvedSupplierCause::PHRASE:
+            skipCount(SkipStats::conjPlanUnknownIslandPhrase);
+            break;
+          case Query::UnresolvedSupplierCause::NUMERIC_GEO:
+            skipCount(SkipStats::conjPlanUnknownIslandNumericGeo);
+            break;
+          case Query::UnresolvedSupplierCause::NONE:
+          case Query::UnresolvedSupplierCause::OTHER:
+            skipCount(SkipStats::conjPlanUnknownIslandOther);
+            break;
+        }
+      }
+
       MaybeConjunctionBulk conjunctionBulkScorer(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
@@ -3180,7 +3250,7 @@ public:
         ConjunctionPlanningResult planning = planConjunction(
             targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
         if (planning.status == ConjunctionPlanStatus::LEGACY) {
-          skipCount(SkipStats::conjPlanUnknownIsland);
+          recordUnknownIsland(planning.plan.unresolvedCause);
           return legacyConjunctionBulkScorer(
               targetPool, mode, enclosingFilterSuppliers);
         }
@@ -3206,6 +3276,16 @@ public:
           skipCount(SkipStats::candidateTermFeedEngagements);
         }
       }
+
+      // Deferred scored-path helpers migrate to plan-before-build in measured
+      // tripwire priority:
+      // mandOpt: bulkBuiltThenRejectedMandOptTwoPhase.
+      // maxScore: bulkBuiltThenRejectedMaxScoreProhibited.
+      // attachDirectFilters: bulkBuiltThenRejectedFilterAttach.
+      // filteredDisjunction: bulkBuiltThenRejectedFilteredDisj.
+      // exactFilteredMandOpt: bulkBuiltThenRejectedExactMandOpt.
+      // filteredScored: bulkBuiltThenRejectedFilteredScored.
+      // filterOnly: bulkBuiltThenRejectedFilterOnly.
 
       BulkScorer* mandOptBulkScorer(
           MemPool& targetPool,
@@ -3768,7 +3848,7 @@ public:
         bool legacy = planning.status == ConjunctionPlanStatus::LEGACY;
         MaybeConjunctionBulk result;
         if (legacy) {
-          skipCount(SkipStats::conjPlanUnknownIsland);
+          recordUnknownIsland(planning.plan.unresolvedCause);
           result = legacyConjunctionBulkScorer(
               targetPool, ConjunctionMode::EXHAUSTIVE);
         } else {
@@ -3889,6 +3969,9 @@ public:
                   use, integratedContext);
               if (integrated.available == BulkAnswer::YES
                   && integrated.consumesFilters == BulkAnswer::YES) {
+                // The child owns any build state. This wrapper still performs
+                // the filter-consumption handshake during construction.
+                integrated.buildState = nullptr;
                 return integrated;
               }
               integratedUnknown =
@@ -4033,6 +4116,22 @@ public:
         if (disjunction.available == BulkAnswer::NO) {
           skipCount(SkipStats::disjCountIdentityFilterFallbacks);
         }
+      }
+
+      BulkScorer* buildBulk(
+          MemPool& targetPool, const BulkPlan& plan) override {
+        if (plan.buildState == nullptr) {
+          return bulkScorer(targetPool);
+        }
+        if (plan.buildState->owner != this) {
+          return bulkScorer(targetPool);
+        }
+        const auto& conjunction =
+            *static_cast<const ConjunctionPlan*>(plan.buildState);
+        recordConjunctionPlanCommitment(conjunction);
+        MaybeConjunctionBulk result =
+            buildConjunction(targetPool, conjunction);
+        return result ? result->bulk : nullptr;
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
