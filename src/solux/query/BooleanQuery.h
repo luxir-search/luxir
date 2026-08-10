@@ -706,6 +706,14 @@ public:
     return context.pool.make<BooleanQuery::Weight>(context, plan, flags, multiplier);
   }
 
+  struct ConjunctionClauseLayout {
+    Query::ClauseShape windowFillKind = Query::ClauseShape::NONE;
+    std::span<Query::Scorer*> denseMembers;
+    TermQuery::Scorer* directTerm = nullptr;
+    QueryPrep::DocSetScorer* directDocSet = nullptr;
+    std::span<Query::Scorer*> termMembers;
+  };
+
   class ConjunctionBulkScorer;
   class ExactDocsOnlyTermConjunctionBulkScorer;
 
@@ -825,11 +833,8 @@ public:
     }
 
 #ifndef NDEBUG
-    static void assertScorerShape(
-        Query::ScorerSupplier* supplier, Query::Scorer* scorer,
-        const Query::ScorerBuildContext& buildContext) {
-      assert(supplier != nullptr);
-      Query::ScorerShape shape = supplier->describeScorer(buildContext);
+    static void assertScorerLayout(
+        const Query::ScorerShape& shape, Query::Scorer* scorer) {
       if (scorer == nullptr) {
         assert(shape.matchState != Query::MatchState::NONEMPTY);
         return;
@@ -904,6 +909,17 @@ public:
           break;
         case Query::ClauseShape::UNKNOWN:
           break;
+      }
+    }
+
+    static void assertScorerShape(
+        Query::ScorerSupplier* supplier, Query::Scorer* scorer,
+        const Query::ScorerBuildContext& buildContext) {
+      assert(supplier != nullptr);
+      Query::ScorerShape shape = supplier->describeScorer(buildContext);
+      assertScorerLayout(shape, scorer);
+      if (scorer == nullptr) {
+        return;
       }
 
       bool termSupplier =
@@ -1251,7 +1267,6 @@ public:
       return optionalCost(targetPool, segment, optionalSources, minShouldMatch, maxDoc);
     }
 
-    // TODO: OPT share child suppliers between cost() and get().
     class Supplier final : public Query::ScorerSupplier {
       MemPool& pool;
       IndexReader::Segment& segment;
@@ -1547,7 +1562,33 @@ public:
           needsScores(needsScores), allowsPruning(allowsPruning) {}
 
       int64_t cost() override {
-        return compositeCost(pool, segment, mandatorySources, optionalSources, filterSuppliers, minShouldMatch);
+        int64_t maxDoc = segment.maxDoc();
+        if (!mandatoryShapeSuppliers.empty() || !filterSuppliers.empty()) {
+          int64_t requiredCost = maxDoc;
+          for (auto* supplier : mandatoryShapeSuppliers) {
+            if (supplier == nullptr) return 0;
+            requiredCost = std::min(requiredCost, supplier->cost());
+          }
+          for (auto* supplier : filterSuppliers) {
+            if (supplier == nullptr) return 0;
+            requiredCost = std::min(requiredCost, supplier->cost());
+          }
+          if (minShouldMatch >= 1 && !optionalShapeSuppliers.empty()) {
+            boost::container::small_vector<int64_t, 16> costs;
+            for (auto* supplier : optionalShapeSuppliers) {
+              costs.push_back(supplier == nullptr ? 0 : supplier->cost());
+            }
+            requiredCost = std::min(
+                requiredCost,
+                optionalCost(costs, minShouldMatch, maxDoc));
+          }
+          return requiredCost;
+        }
+        boost::container::small_vector<int64_t, 16> costs;
+        for (auto* supplier : optionalShapeSuppliers) {
+          costs.push_back(supplier == nullptr ? 0 : supplier->cost());
+        }
+        return optionalCost(costs, minShouldMatch, maxDoc);
       }
 
       Query::ScorerShape describeScorer(
@@ -1678,6 +1719,562 @@ public:
 
       using MaybeConjunctionBulk = std::optional<ConjunctionBulkResult>;
 
+      using AcceptedConjunctionRoutes = uint32_t;
+
+      enum class ConjunctionPlanStatus : uint8_t {
+        READY,
+        DECLINED,
+        NO_MATCH,
+        LEGACY,
+      };
+
+      struct PlannedEntry {
+        int64_t cost;
+        Query::ScorerSupplier* supplier;
+        Query::ScorerShape shape;
+        bool optionalGroup;
+        bool filter;
+        bool docSetFilter;
+        bool scoring;
+        size_t order;
+      };
+
+      struct PlannedSupplier {
+        Query::ScorerSupplier* supplier;
+        Query::ScorerShape shape;
+      };
+
+      struct ConjunctionPlan {
+        ConjunctionMode mode = ConjunctionMode::SCORED_BODY;
+        ConjunctionRoute route = ConjunctionRoute::GENERIC;
+        EnclosingFilters enclosingFilters = EnclosingFilters::NOT_SUPPLIED;
+        std::span<PlannedEntry> entries;
+        std::span<PlannedSupplier> optionalGroup;
+        std::span<PlannedSupplier> prohibited;
+        int64_t leadCost = 0;
+        int64_t nonLeadCost = 0;
+        bool hasOptionalGroup = false;
+        bool termFeed = false;
+        bool docSetSparseEligible = false;
+        bool recordConjunctionConstruction = false;
+        bool hasDirectDenseClause = false;
+      };
+
+      struct ConjunctionPlanningResult {
+        ConjunctionPlanStatus status;
+        ConjunctionPlan plan;
+      };
+
+      static constexpr AcceptedConjunctionRoutes routeBit(
+          ConjunctionRoute route) {
+        return 1u << (uint32_t) route;
+      }
+
+      static constexpr AcceptedConjunctionRoutes candidateRouteMask() {
+        return routeBit(ConjunctionRoute::CANDIDATE_DOC_SET_FILTER)
+            | routeBit(ConjunctionRoute::CANDIDATE_POSTINGS_FILTER)
+            | routeBit(ConjunctionRoute::CANDIDATE_SCORING_TERM);
+      }
+
+      static constexpr AcceptedConjunctionRoutes countRouteMask(
+          bool includeDocSetSparse) {
+        AcceptedConjunctionRoutes routes =
+            routeBit(ConjunctionRoute::COUNT_EXACT_DOCS_ONLY)
+            | routeBit(ConjunctionRoute::COUNT_POSTINGS_SAMPLE)
+            | routeBit(ConjunctionRoute::COUNT_DENSE);
+        if (includeDocSetSparse) {
+          routes |= routeBit(ConjunctionRoute::COUNT_DOC_SET_SPARSE);
+        }
+        return routes;
+      }
+
+      static constexpr AcceptedConjunctionRoutes allRouteMask() {
+        return (1u << ((uint32_t) ConjunctionRoute::COUNT_DOC_SET_SPARSE + 1))
+            - 1;
+      }
+
+      static std::optional<bool> directTerm(
+          const Query::ScorerShape& shape) {
+        if (shape.directKind == Query::DirectScorerKind::UNKNOWN) {
+          return std::nullopt;
+        }
+        return shape.directKind == Query::DirectScorerKind::TERM;
+      }
+
+      static std::optional<bool> directDocSet(
+          const Query::ScorerShape& shape) {
+        if (shape.directDocSet == Query::DirectDocSetAccess::UNKNOWN) {
+          return std::nullopt;
+        }
+        return shape.directDocSet == Query::DirectDocSetAccess::SUPPORTED;
+      }
+
+      static std::optional<bool> windowFillClause(
+          const Query::ScorerShape& shape) {
+        switch (shape.windowFillClause) {
+          case Query::ClauseShape::DIRECT:
+            return true;
+          case Query::ClauseShape::FLAT_DISJUNCTION:
+            return !ConjunctionBulkScorer::disableDisjGroupBulkForTests;
+          case Query::ClauseShape::NONE:
+            return false;
+          case Query::ClauseShape::UNKNOWN:
+            return std::nullopt;
+        }
+        std::unreachable();
+      }
+
+      static Query::ScorerShape plannedOptionalGroupShape(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        size_t nonempty = nonemptyCount(suppliers, buildContext);
+        if (nonempty == 0) {
+          return emptyShape();
+        }
+        if (nonempty == 1) {
+          for (auto* supplier : suppliers) {
+            if (supplier == nullptr) continue;
+            Query::ScorerShape shape =
+                supplier->describeScorer(buildContext);
+            if (shape.matchState == Query::MatchState::NONEMPTY) {
+              return shape;
+            }
+          }
+          std::unreachable();
+        }
+        Query::ScorerShape shape = opaqueShape(
+            Query::MatchState::NONEMPTY,
+            disjunctionTwoPhase(suppliers, buildContext));
+        shape.windowFillClause = flatClauseShape(
+            suppliers, buildContext, true);
+        shape.termDisjunctionClause = flatClauseShape(
+            suppliers, buildContext, false);
+        return shape;
+      }
+
+      ConjunctionPlanningResult planConjunction(
+          MemPool& targetPool, ConjunctionMode mode,
+          AcceptedConjunctionRoutes acceptedRoutes,
+          std::span<Query::ScorerSupplier* const>
+              enclosingFilterSuppliers = {}) {
+        ConjunctionPlan plan;
+        plan.mode = mode;
+        plan.enclosingFilters = enclosingFilterSuppliers.empty()
+            ? EnclosingFilters::NOT_SUPPLIED
+            : EnclosingFilters::CONSUMED;
+        bool exhaustive = mode == ConjunctionMode::EXHAUSTIVE;
+        bool includeFilters = mode != ConjunctionMode::SCORED_BODY;
+        if (!includeFilters && !enclosingFilterSuppliers.empty()) {
+          assert(false);
+          return {ConjunctionPlanStatus::DECLINED, plan};
+        }
+
+        boost::container::small_vector<PlannedEntry, 16> entries;
+        size_t entryOrder = 0;
+        for (size_t i = 0; i < mandatoryShapeSuppliers.size(); i++) {
+          auto* supplier = mandatoryShapeSuppliers[i];
+          if (supplier == nullptr) {
+            return {ConjunctionPlanStatus::NO_MATCH, plan};
+          }
+          entries.push_back({
+              supplier->cost(), supplier, {}, false, false, false,
+              mandatoryScores[i] != 0, entryOrder++});
+        }
+        if (includeFilters) {
+          for (auto* supplier : filterSuppliers) {
+            if (supplier == nullptr) {
+              return {ConjunctionPlanStatus::NO_MATCH, plan};
+            }
+            entries.push_back({
+                supplier->cost(), supplier, {}, false, true, false,
+                false, entryOrder++});
+          }
+          for (auto* supplier : enclosingFilterSuppliers) {
+            if (supplier == nullptr) {
+              return {ConjunctionPlanStatus::NO_MATCH, plan};
+            }
+            entries.push_back({
+                supplier->cost(), supplier, {}, false, true, false,
+                false, entryOrder++});
+          }
+        }
+
+        boost::container::small_vector<Query::ScorerSupplier*, 16>
+            optionalSuppliers;
+        boost::container::small_vector<int64_t, 16> optionalCosts;
+        plan.hasOptionalGroup = exhaustive && minShouldMatch >= 1
+            && !optionalSources.empty();
+        if (plan.hasOptionalGroup) {
+          for (auto* supplier : optionalShapeSuppliers) {
+            if (supplier == nullptr) continue;
+            optionalSuppliers.push_back(supplier);
+            optionalCosts.push_back(supplier->cost());
+          }
+          if (optionalSuppliers.empty()) {
+            return {ConjunctionPlanStatus::NO_MATCH, plan};
+          }
+          entries.push_back({
+              optionalCost(optionalCosts, 1, segment.maxDoc()), nullptr, {},
+              true, false, false, false, entryOrder++});
+        }
+        if (entries.empty()
+            || (entries.size() < 2
+                && (!exhaustive || prohibitedSources.empty()))) {
+          return {ConjunctionPlanStatus::DECLINED, plan};
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const PlannedEntry& a, const PlannedEntry& b) {
+                    return a.cost != b.cost ? a.cost < b.cost
+                                            : a.order < b.order;
+                  });
+        plan.leadCost = entries[0].cost;
+        for (size_t i = 1; i < entries.size(); i++) {
+          plan.nonLeadCost += entries[i].cost;
+        }
+        Query::ScorerBuildContext buildContext =
+            scorerBuildContext(plan.leadCost);
+
+        for (PlannedEntry& entry : entries) {
+          if (entry.optionalGroup) {
+            if (hasUnknownElision(optionalSuppliers, buildContext)) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            entry.shape = plannedOptionalGroupShape(
+                optionalSuppliers, buildContext);
+            if (entry.shape.matchState == Query::MatchState::EMPTY) {
+              return {ConjunctionPlanStatus::NO_MATCH, plan};
+            }
+          } else {
+            entry.shape = entry.supplier->describeScorer(buildContext);
+            if (entry.shape.matchState == Query::MatchState::EMPTY) {
+              return {ConjunctionPlanStatus::NO_MATCH, plan};
+            }
+          }
+        }
+
+        boost::container::small_vector<Query::ScorerSupplier*, 16>
+            prohibitedSuppliers;
+        for (auto* supplier : prohibitedShapeSuppliers) {
+          if (supplier != nullptr) {
+            prohibitedSuppliers.push_back(supplier);
+          }
+        }
+        if (hasUnknownElision(prohibitedSuppliers, buildContext)) {
+          return {ConjunctionPlanStatus::LEGACY, plan};
+        }
+
+        plan.entries = targetPool.make_span<PlannedEntry>(entries.size());
+        std::copy(entries.begin(), entries.end(), plan.entries.begin());
+        plan.optionalGroup =
+            targetPool.make_span<PlannedSupplier>(optionalSuppliers.size());
+        for (size_t i = 0; i < optionalSuppliers.size(); i++) {
+          plan.optionalGroup[i] = {
+              optionalSuppliers[i],
+              optionalSuppliers[i]->describeScorer(buildContext)};
+        }
+        plan.prohibited = targetPool.make_span<PlannedSupplier>(
+            prohibitedSuppliers.size());
+        for (size_t i = 0; i < prohibitedSuppliers.size(); i++) {
+          plan.prohibited[i] = {
+              prohibitedSuppliers[i],
+              prohibitedSuppliers[i]->describeScorer(buildContext)};
+        }
+
+        auto finishRoute = [&](ConjunctionRoute route,
+                               bool constructsConjunction) {
+          plan.route = route;
+          plan.recordConjunctionConstruction = constructsConjunction;
+          ConjunctionPlanStatus status =
+              (acceptedRoutes & routeBit(route)) != 0
+              ? ConjunctionPlanStatus::READY
+              : ConjunctionPlanStatus::DECLINED;
+          return ConjunctionPlanningResult{status, plan};
+        };
+
+        bool exactFilteredTermConjunction =
+            mode == ConjunctionMode::EXHAUSTIVE
+            && !needsScores && !disableExactTermCountForTests
+            && (!filterSuppliers.empty()
+                || !enclosingFilterSuppliers.empty());
+        if (exactFilteredTermConjunction) {
+          bool structurallySupported = plan.entries.size()
+                  >= ConjunctionBulkScorer::kIntegratedCountMinClauses
+              && prohibitedSources.empty() && !plan.hasOptionalGroup;
+          if (!structurallySupported) {
+            if (!enclosingFilterSuppliers.empty()) {
+              return {ConjunctionPlanStatus::DECLINED, plan};
+            }
+            exactFilteredTermConjunction = false;
+          }
+        }
+        if (exactFilteredTermConjunction) {
+          bool supported = true;
+          for (const PlannedEntry& entry : plan.entries) {
+            if (entry.shape.docsOnly == Query::DocsOnlyAccess::UNKNOWN) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            supported &= entry.shape.docsOnly
+                == Query::DocsOnlyAccess::SUPPORTED;
+          }
+          if (supported) {
+            return finishRoute(
+                ConjunctionRoute::COUNT_EXACT_DOCS_ONLY, false);
+          }
+          if (!enclosingFilterSuppliers.empty()) {
+            return {ConjunctionPlanStatus::DECLINED, plan};
+          }
+        }
+
+        for (const PlannedEntry& entry : plan.entries) {
+          if (entry.shape.directKind == Query::DirectScorerKind::UNKNOWN
+              || entry.shape.windowFillClause
+                  == Query::ClauseShape::UNKNOWN
+              || entry.shape.termDisjunctionClause
+                  == Query::ClauseShape::UNKNOWN) {
+            return {ConjunctionPlanStatus::LEGACY, plan};
+          }
+        }
+
+        if (mode != ConjunctionMode::EXHAUSTIVE) {
+          for (const PlannedEntry& entry : plan.entries) {
+            if (entry.shape.reportedTwoPhase
+                == Query::ReportedTwoPhase::UNKNOWN) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            if (entry.shape.reportedTwoPhase
+                == Query::ReportedTwoPhase::YES) {
+              return {ConjunctionPlanStatus::DECLINED, plan};
+            }
+          }
+        }
+
+        if (mode == ConjunctionMode::CANDIDATE) {
+          if (plan.entries[0].filter) {
+            for (size_t i = 1; i < plan.entries.size(); i++) {
+              std::optional<bool> term = directTerm(plan.entries[i].shape);
+              if (!term.has_value()) {
+                return {ConjunctionPlanStatus::LEGACY, plan};
+              }
+              if (!*term) {
+                return {ConjunctionPlanStatus::DECLINED, plan};
+              }
+            }
+            std::optional<bool> leadDocSet =
+                directDocSet(plan.entries[0].shape);
+            if (!leadDocSet.has_value()) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            plan.entries[0].docSetFilter = *leadDocSet;
+            int64_t minRatio = *leadDocSet
+                ? multiTermBatchMinRatioDocSet
+                : multiTermBatchMinRatioPostings;
+            if (plan.entries[1].cost
+                < minRatio * plan.entries[0].cost) {
+              return {ConjunctionPlanStatus::DECLINED, plan};
+            }
+          } else {
+            std::optional<bool> leadTerm =
+                directTerm(plan.entries[0].shape);
+            if (!leadTerm.has_value()
+                || plan.entries[0].shape.independentTerm
+                    == Query::IndependentTermAccess::UNKNOWN) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            if (disableCandidateTermFeedForTests
+                || !plan.entries[0].scoring || !*leadTerm
+                || plan.entries[0].shape.independentTerm
+                    != Query::IndependentTermAccess::SUPPORTED
+                || plan.entries[0].cost
+                       * kTermFeedMaxLeadFractionForTests
+                    > segment.maxDoc()) {
+              return {ConjunctionPlanStatus::DECLINED, plan};
+            }
+            for (PlannedEntry& entry : plan.entries) {
+              std::optional<bool> term = directTerm(entry.shape);
+              if (!term.has_value()) {
+                return {ConjunctionPlanStatus::LEGACY, plan};
+              }
+              if (entry.filter) {
+                std::optional<bool> docSet = directDocSet(entry.shape);
+                if (!docSet.has_value()) {
+                  return {ConjunctionPlanStatus::LEGACY, plan};
+                }
+                entry.docSetFilter = *docSet;
+                if (!*docSet && !*term) {
+                  return {ConjunctionPlanStatus::DECLINED, plan};
+                }
+              } else if (!entry.scoring || !*term) {
+                return {ConjunctionPlanStatus::DECLINED, plan};
+              }
+              if (entry.docSetFilter
+                  && plan.entries[0].cost
+                         * kTermFeedMinDocSetFilterRatio
+                      > entry.cost) {
+                return {ConjunctionPlanStatus::DECLINED, plan};
+              }
+            }
+            plan.termFeed = true;
+          }
+
+          for (const PlannedSupplier& prohibited : plan.prohibited) {
+            if (prohibited.shape.matchState == Query::MatchState::EMPTY) {
+              continue;
+            }
+            if (prohibited.shape.termDisjunctionClause
+                == Query::ClauseShape::UNKNOWN) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            if (prohibited.shape.termDisjunctionClause
+                    != Query::ClauseShape::DIRECT
+                && prohibited.shape.termDisjunctionClause
+                    != Query::ClauseShape::FLAT_DISJUNCTION) {
+              return {ConjunctionPlanStatus::DECLINED, plan};
+            }
+          }
+
+          if (plan.termFeed) {
+            return finishRoute(
+                ConjunctionRoute::CANDIDATE_SCORING_TERM, true);
+          }
+          if (plan.entries[0].docSetFilter) {
+            plan.docSetSparseEligible = true;
+            return finishRoute(
+                ConjunctionRoute::CANDIDATE_DOC_SET_FILTER, true);
+          }
+          if (!disableFilteredConjunctionPostingsFeedForTests) {
+            std::optional<bool> leadTerm =
+                directTerm(plan.entries[0].shape);
+            if (!leadTerm.has_value()) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            if (*leadTerm) {
+              return finishRoute(
+                  ConjunctionRoute::CANDIDATE_POSTINGS_FILTER, true);
+            }
+          }
+          return finishRoute(ConjunctionRoute::GENERIC, true);
+        }
+
+        if (mode == ConjunctionMode::SCORED_BODY) {
+          return finishRoute(ConjunctionRoute::GENERIC, true);
+        }
+
+        bool postingsSampleCandidate = !needsScores
+            && !disableIntegratedFilteredCountForTests
+            && (!filterSuppliers.empty()
+                || !enclosingFilterSuppliers.empty())
+            && plan.entries.size()
+                >= ConjunctionBulkScorer::kIntegratedCountMinClauses
+            && prohibitedSources.empty() && !plan.hasOptionalGroup
+            && segment.maxDoc() >= DocsEnumMeta::L1_DOCS
+            && plan.leadCost >= std::max<int64_t>(
+                1, (int64_t) segment.maxDoc()
+                    / ConjunctionBulkScorer::
+                        termTailDenseThresholdInverseForTests);
+        if (postingsSampleCandidate) {
+          bool allTerms = true;
+          for (const PlannedEntry& entry : plan.entries) {
+            std::optional<bool> term = directTerm(entry.shape);
+            if (!term.has_value()) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            allTerms &= *term;
+          }
+          if (allTerms) {
+            plan.hasDirectDenseClause =
+                !ConjunctionBulkScorer::disableDirectDenseClausesForTests;
+            return finishRoute(
+                ConjunctionRoute::COUNT_POSTINGS_SAMPLE, true);
+          }
+        }
+
+        bool allDense = true;
+        for (const PlannedEntry& entry : plan.entries) {
+          std::optional<bool> dense = windowFillClause(entry.shape);
+          if (!dense.has_value()) {
+            return {ConjunctionPlanStatus::LEGACY, plan};
+          }
+          allDense &= *dense;
+        }
+        bool allDenseProhibited = true;
+        for (const PlannedSupplier& prohibited : plan.prohibited) {
+          if (prohibited.shape.matchState == Query::MatchState::EMPTY) {
+            continue;
+          }
+          std::optional<bool> dense = windowFillClause(prohibited.shape);
+          if (!dense.has_value()) {
+            return {ConjunctionPlanStatus::LEGACY, plan};
+          }
+          allDenseProhibited &= *dense;
+        }
+
+        if (!ConjunctionBulkScorer::disableDirectDenseClausesForTests) {
+          for (const PlannedEntry& entry : plan.entries) {
+            if (entry.shape.windowFillClause
+                != Query::ClauseShape::DIRECT) {
+              continue;
+            }
+            if (entry.shape.directKind
+                == Query::DirectScorerKind::UNKNOWN) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            plan.hasDirectDenseClause |=
+                entry.shape.directKind == Query::DirectScorerKind::TERM
+                || entry.shape.directKind
+                    == Query::DirectScorerKind::DOC_SET;
+          }
+        }
+
+        bool sparseEligibleTails = plan.entries.size() > 1;
+        if (allDense) {
+          for (size_t i = 1; i < plan.entries.size(); i++) {
+            std::optional<bool> term = directTerm(plan.entries[i].shape);
+            if (!term.has_value()) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            bool directDenseDocSet =
+                !ConjunctionBulkScorer::disableDirectDenseClausesForTests
+                && plan.entries[i].shape.windowFillClause
+                    == Query::ClauseShape::DIRECT
+                && plan.entries[i].shape.directKind
+                    == Query::DirectScorerKind::DOC_SET;
+            sparseEligibleTails &= *term || directDenseDocSet;
+          }
+        }
+        int32_t denseThresholdInverse = sparseEligibleTails
+            ? ConjunctionBulkScorer::termTailDenseThresholdInverseForTests
+            : ConjunctionBulkScorer::denseThresholdInverseForTests;
+        bool denseCount = allDense && allDenseProhibited
+            && segment.maxDoc() >= DocsEnumMeta::L1_DOCS
+            && plan.leadCost >= std::max<int64_t>(
+                1, (int64_t) segment.maxDoc() / denseThresholdInverse);
+        if (denseCount) {
+          return finishRoute(ConjunctionRoute::COUNT_DENSE, true);
+        }
+
+        std::optional<bool> leadDocSet =
+            directDocSet(plan.entries[0].shape);
+        if (!leadDocSet.has_value()) {
+          return {ConjunctionPlanStatus::LEGACY, plan};
+        }
+        plan.entries[0].docSetFilter = *leadDocSet;
+        plan.docSetSparseEligible = *leadDocSet;
+        if (plan.docSetSparseEligible) {
+          for (size_t i = 1; i < plan.entries.size(); i++) {
+            std::optional<bool> term = directTerm(plan.entries[i].shape);
+            if (!term.has_value()) {
+              return {ConjunctionPlanStatus::LEGACY, plan};
+            }
+            plan.docSetSparseEligible &= *term;
+          }
+        }
+        if (plan.docSetSparseEligible && prohibitedSources.empty()) {
+          return finishRoute(
+              ConjunctionRoute::COUNT_DOC_SET_SPARSE, true);
+        }
+        return finishRoute(ConjunctionRoute::GENERIC, true);
+      }
+
       // Build a bulk conjunction from the required clause boundaries.
       // EXHAUSTIVE includes filters and count-only optional groups.
       // CANDIDATE includes direct filters but retains scored, single-phase
@@ -1685,7 +2282,7 @@ public:
       // feed for exact or pruned collection; scoring clauses alone supply
       // score bounds. SCORED_BODY leaves filters to a window mask selected by
       // filteredScoredBulkScorer.
-      MaybeConjunctionBulk conjunctionBulkScorer(
+      MaybeConjunctionBulk legacyConjunctionBulkScorer(
           MemPool& targetPool, ConjunctionMode mode,
           std::span<Query::ScorerSupplier* const>
               enclosingFilterSuppliers = {}) {
@@ -2076,6 +2673,324 @@ public:
         };
       }
 
+      MaybeConjunctionBulk buildConjunction(
+          MemPool& targetPool, const ConjunctionPlan& plan) {
+        if (plan.route == ConjunctionRoute::COUNT_EXACT_DOCS_ONLY) {
+          auto countTermEnums =
+              targetPool.make_span<DocsOnlyEnum*>(plan.entries.size());
+          for (size_t i = 0; i < plan.entries.size(); i++) {
+            assert(plan.entries[i].shape.docsOnly
+                   == Query::DocsOnlyAccess::SUPPORTED);
+            countTermEnums[i] =
+                plan.entries[i].supplier->getDocsOnly(targetPool);
+            if (countTermEnums[i] == nullptr) {
+              return {};
+            }
+          }
+          return ConjunctionBulkResult{
+            targetPool.make<ExactDocsOnlyTermConjunctionBulkScorer>(
+                targetPool, countTermEnums, segment.maxDoc()),
+            plan.route, plan.enclosingFilters
+          };
+        }
+
+        auto* arr =
+            targetPool.make_arr<Query::Scorer*>(plan.entries.size());
+        auto clauseScores =
+            targetPool.make_span<uint8_t>(plan.entries.size());
+        auto materializeClause = [&](Query::Scorer** scorerSlot,
+                                     const Query::ScorerShape& shape) {
+          Query::Scorer* scorer = *scorerSlot;
+          ConjunctionClauseLayout layout;
+          layout.windowFillKind = shape.windowFillClause;
+          switch (shape.directKind) {
+            case Query::DirectScorerKind::TERM:
+              layout.directTerm =
+                  dynamic_cast<TermQuery::Scorer*>(scorer);
+              assert(layout.directTerm != nullptr);
+              break;
+            case Query::DirectScorerKind::DOC_SET:
+              layout.directDocSet =
+                  dynamic_cast<QueryPrep::DocSetScorer*>(scorer);
+              assert(layout.directDocSet != nullptr);
+              break;
+            case Query::DirectScorerKind::OTHER:
+            case Query::DirectScorerKind::UNKNOWN:
+              break;
+          }
+          switch (shape.windowFillClause) {
+            case Query::ClauseShape::DIRECT:
+              layout.denseMembers = {scorerSlot, 1};
+              break;
+            case Query::ClauseShape::FLAT_DISJUNCTION:
+              if (!ConjunctionBulkScorer::disableDisjGroupBulkForTests) {
+                layout.denseMembers = scorer->flatDisjunctionScorers();
+                assert(!layout.denseMembers.empty());
+              }
+              break;
+            case Query::ClauseShape::NONE:
+            case Query::ClauseShape::UNKNOWN:
+              break;
+          }
+          switch (shape.termDisjunctionClause) {
+            case Query::ClauseShape::DIRECT:
+              assert(layout.directTerm != nullptr);
+              layout.termMembers = {scorerSlot, 1};
+              break;
+            case Query::ClauseShape::FLAT_DISJUNCTION:
+              if (!ConjunctionBulkScorer::disableDisjGroupBulkForTests) {
+                layout.termMembers = scorer->flatDisjunctionScorers();
+                assert(!layout.termMembers.empty());
+#ifndef NDEBUG
+                for (Query::Scorer* member : layout.termMembers) {
+                  assert(dynamic_cast<TermQuery::Scorer*>(member) != nullptr);
+                }
+#endif
+              }
+              break;
+            case Query::ClauseShape::NONE:
+            case Query::ClauseShape::UNKNOWN:
+              break;
+          }
+          return layout;
+        };
+        auto clauseLayouts =
+            targetPool.make_span<ConjunctionClauseLayout>(
+                plan.entries.size());
+        Query::ScorerBuildContext buildContext =
+            scorerBuildContext(plan.leadCost);
+        for (size_t i = 0; i < plan.entries.size(); i++) {
+          const PlannedEntry& entry = plan.entries[i];
+          Query::Scorer* scorer;
+          if (entry.optionalGroup) {
+            auto* members = targetPool.make_arr<Query::Scorer*>(
+                plan.optionalGroup.size());
+            size_t memberCount = 0;
+            for (const PlannedSupplier& memberPlan : plan.optionalGroup) {
+              auto* member = memberPlan.supplier->get(
+                  targetPool, plan.leadCost);
+#ifndef NDEBUG
+              assertScorerLayout(memberPlan.shape, member);
+              assertScorerShape(
+                  memberPlan.supplier, member, buildContext);
+#endif
+              if (member != nullptr) {
+                members[memberCount++] = member;
+              }
+            }
+            if (memberCount == 0) {
+              return {};
+            }
+            scorer = memberCount == 1
+                ? members[0]
+                : targetPool.make<BooleanQuery::DisjunctionScorer>(
+                    targetPool,
+                    std::span<Query::Scorer*>(members, memberCount));
+          } else {
+            scorer = entry.supplier->get(targetPool, plan.leadCost);
+#ifndef NDEBUG
+            assertScorerShape(entry.supplier, scorer, buildContext);
+#endif
+          }
+#ifndef NDEBUG
+          assertScorerLayout(entry.shape, scorer);
+#endif
+          if (scorer == nullptr) {
+            return {};
+          }
+          if (plan.mode != ConjunctionMode::EXHAUSTIVE) {
+            assert(!scorer->hasTwoPhase());
+            if (scorer->hasTwoPhase()) {
+              return {};
+            }
+          }
+          arr[i] = scorer;
+          clauseScores[i] = entry.scoring;
+          clauseLayouts[i] = materializeClause(arr + i, entry.shape);
+        }
+
+        TermQuery::Scorer* candidateLeadScoreScorer = nullptr;
+        std::span<uint8_t> candidateFilters;
+        std::span<DocSet*> candidateFilterDocSets;
+        if (plan.termFeed) {
+          candidateLeadScoreScorer = dynamic_cast<TermQuery::Scorer*>(
+              plan.entries[0].supplier->getIndependent(
+                  targetPool, plan.leadCost));
+          assert(candidateLeadScoreScorer != nullptr);
+          if (candidateLeadScoreScorer == nullptr) {
+            return {};
+          }
+          candidateFilters =
+              targetPool.make_span<uint8_t>(plan.entries.size());
+          candidateFilterDocSets =
+              targetPool.make_span<DocSet*>(plan.entries.size());
+          std::fill(candidateFilters.begin(), candidateFilters.end(), 0);
+          std::fill(
+              candidateFilterDocSets.begin(),
+              candidateFilterDocSets.end(), nullptr);
+          for (size_t i = 0; i < plan.entries.size(); i++) {
+            if (!plan.entries[i].filter) continue;
+            candidateFilters[i] = 1;
+            if (auto* supplier =
+                    dynamic_cast<QueryPrep::DocSetSupplier*>(
+                        plan.entries[i].supplier)) {
+              candidateFilterDocSets[i] = supplier->docSet();
+            }
+          }
+        }
+
+        bool runtimeDocSetSparseEligible =
+            plan.entries[0].docSetFilter;
+        if (runtimeDocSetSparseEligible) {
+          for (size_t i = 1; i < plan.entries.size(); i++) {
+            if (clauseLayouts[i].directTerm == nullptr) {
+              runtimeDocSetSparseEligible = false;
+              break;
+            }
+          }
+        }
+#ifndef NDEBUG
+        assert(runtimeDocSetSparseEligible == plan.docSetSparseEligible);
+#endif
+
+        TermQuery::Scorer* candidatePostingsLead = nullptr;
+        if (plan.route == ConjunctionRoute::CANDIDATE_SCORING_TERM
+            || plan.route
+                == ConjunctionRoute::CANDIDATE_POSTINGS_FILTER
+            || plan.route == ConjunctionRoute::COUNT_POSTINGS_SAMPLE) {
+          candidatePostingsLead = clauseLayouts[0].directTerm;
+          assert(candidatePostingsLead != nullptr);
+          if (candidatePostingsLead == nullptr) {
+            return {};
+          }
+        }
+
+        Query::Scorer** prohibitedArr = nullptr;
+        size_t prohibitedCount = 0;
+        std::span<ConjunctionClauseLayout> prohibitedLayouts;
+        std::span<TermQuery::Scorer*> candidateProhibitedTerms;
+        if (plan.mode == ConjunctionMode::EXHAUSTIVE) {
+          prohibitedArr = targetPool.make_arr<Query::Scorer*>(
+              plan.prohibited.size());
+          prohibitedLayouts =
+              targetPool.make_span<ConjunctionClauseLayout>(
+              plan.prohibited.size());
+          for (const PlannedSupplier& prohibited : plan.prohibited) {
+            auto* scorer = prohibited.supplier->get(
+                targetPool, plan.leadCost);
+#ifndef NDEBUG
+            assertScorerLayout(prohibited.shape, scorer);
+            assertScorerShape(
+                prohibited.supplier, scorer, buildContext);
+#endif
+            if (scorer != nullptr) {
+              prohibitedArr[prohibitedCount] = scorer;
+              prohibitedLayouts[prohibitedCount] =
+                  materializeClause(
+                      prohibitedArr + prohibitedCount,
+                      prohibited.shape);
+              prohibitedCount++;
+            }
+          }
+        } else if (plan.mode == ConjunctionMode::CANDIDATE
+                   && !plan.prohibited.empty()) {
+          auto& terms = *targetPool.make_vec<TermQuery::Scorer*>();
+          for (const PlannedSupplier& prohibited : plan.prohibited) {
+            auto* scorer = prohibited.supplier->get(
+                targetPool, plan.leadCost);
+#ifndef NDEBUG
+            assertScorerLayout(prohibited.shape, scorer);
+            assertScorerShape(
+                prohibited.supplier, scorer, buildContext);
+#endif
+            if (scorer == nullptr) continue;
+            if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
+              terms.push_back(term);
+              continue;
+            }
+            auto members = scorer->flatDisjunctionScorers();
+            assert(!members.empty());
+            if (members.empty()) {
+              return {};
+            }
+            for (auto* member : members) {
+              auto* term = dynamic_cast<TermQuery::Scorer*>(member);
+              assert(term != nullptr);
+              if (term == nullptr) {
+                return {};
+              }
+              terms.push_back(term);
+            }
+          }
+          candidateProhibitedTerms = {terms.data(), terms.size()};
+        }
+
+        auto* bulk = targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
+            targetPool,
+            std::span<Query::Scorer*>(arr, plan.entries.size()),
+            std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
+            candidateProhibitedTerms, clauseScores, segment.maxDoc(),
+            plan.leadCost, plan.nonLeadCost,
+            plan.mode != ConjunctionMode::EXHAUSTIVE,
+            plan.entries[0].docSetFilter, candidatePostingsLead,
+            candidateLeadScoreScorer, candidateFilters,
+            candidateFilterDocSets, false, clauseLayouts,
+            prohibitedLayouts.first(prohibitedCount));
+
+#ifndef NDEBUG
+        ConjunctionRoute builtRoute = ConjunctionRoute::GENERIC;
+        if (plan.mode == ConjunctionMode::CANDIDATE) {
+          if (plan.termFeed && candidatePostingsLead != nullptr) {
+            builtRoute = ConjunctionRoute::CANDIDATE_SCORING_TERM;
+          } else if (candidatePostingsLead != nullptr) {
+            builtRoute = ConjunctionRoute::CANDIDATE_POSTINGS_FILTER;
+          } else if (runtimeDocSetSparseEligible) {
+            builtRoute = ConjunctionRoute::CANDIDATE_DOC_SET_FILTER;
+          }
+        } else if (plan.mode == ConjunctionMode::EXHAUSTIVE) {
+          if (bulk->willSampleCandidateCount()) {
+            builtRoute = ConjunctionRoute::COUNT_POSTINGS_SAMPLE;
+          } else if (bulk->willCountDense()) {
+            builtRoute = ConjunctionRoute::COUNT_DENSE;
+          } else if (runtimeDocSetSparseEligible
+                     && prohibitedSources.empty()) {
+            builtRoute = ConjunctionRoute::COUNT_DOC_SET_SPARSE;
+          }
+        }
+        assert(builtRoute == plan.route);
+#endif
+        return ConjunctionBulkResult{
+          bulk, plan.route, plan.enclosingFilters
+        };
+      }
+
+      void recordConjunctionPlanCommitment(
+          const ConjunctionPlan& plan) const {
+        if (plan.recordConjunctionConstruction
+            && plan.hasDirectDenseClause) {
+          skipCount(SkipStats::conjDirectDenseEngagements);
+        }
+      }
+
+      MaybeConjunctionBulk conjunctionBulkScorer(
+          MemPool& targetPool, ConjunctionMode mode,
+          AcceptedConjunctionRoutes acceptedRoutes,
+          std::span<Query::ScorerSupplier* const>
+              enclosingFilterSuppliers = {}) {
+        ConjunctionPlanningResult planning = planConjunction(
+            targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
+        if (planning.status == ConjunctionPlanStatus::LEGACY) {
+          skipCount(SkipStats::conjPlanUnknownIsland);
+          return legacyConjunctionBulkScorer(
+              targetPool, mode, enclosingFilterSuppliers);
+        }
+        recordConjunctionPlanCommitment(planning.plan);
+        if (planning.status != ConjunctionPlanStatus::READY) {
+          return {};
+        }
+        return buildConjunction(targetPool, planning.plan);
+      }
+
       void recordCandidateConjunctionEngagement(
           const ConjunctionBulkResult& result) const {
         assert(result.usesCandidateRoute());
@@ -2408,7 +3323,8 @@ public:
         }
 
         auto required = conjunctionBulkScorer(
-            targetPool, ConjunctionMode::CANDIDATE);
+            targetPool, ConjunctionMode::CANDIDATE,
+            candidateRouteMask());
         if (!required || !required->usesCandidateRoute()) {
           if (required) {
             skipCount(SkipStats::bulkBuiltThenRejected);
@@ -2489,7 +3405,8 @@ public:
             && !mandatorySources.empty() && optionalSources.empty()
             && minShouldMatch == 0) {
           auto candidate = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::CANDIDATE);
+              targetPool, ConjunctionMode::CANDIDATE,
+              candidateRouteMask());
           if (candidate && candidate->usesCandidateRoute()) {
             recordCandidateConjunctionEngagement(*candidate);
             return candidate->bulk;
@@ -2624,6 +3541,79 @@ public:
             entries[0].bulk, filterWords, clauseWords, filterCard, maxDoc);
       }
 
+      BulkScorer* filteredCountBulkScorer(
+          MemPool& targetPool, bool allowAlternateBulk) {
+        if (!disableIntegratedFilteredCountForTests
+            && mandatorySources.size() == 1
+            && optionalSources.empty() && prohibitedSources.empty()
+            && !filterSuppliers.empty() && minShouldMatch < 1) {
+          auto* bodySupplier = mandatorySources[0]->scorerSupplier(
+              targetPool, segment);
+          int64_t filterCost = minFilterCost();
+          if (bodySupplier != nullptr && filterCost >= 0) {
+            Query::ScorerSupplier::BulkScorerContext bulkContext{
+                filterCost, filterSuppliers, true};
+            auto filtered = bodySupplier->filteredBulkScorer(
+                targetPool, bulkContext);
+            if (filtered.consumesFilters) {
+              return filtered.bulk;
+            }
+          }
+        }
+
+        AcceptedConjunctionRoutes accepted =
+            countRouteMask(!disableFilterClauseCountForTests);
+        ConjunctionPlanningResult planning = planConjunction(
+            targetPool, ConjunctionMode::EXHAUSTIVE, accepted);
+        bool legacy = planning.status == ConjunctionPlanStatus::LEGACY;
+        MaybeConjunctionBulk result;
+        if (legacy) {
+          skipCount(SkipStats::conjPlanUnknownIsland);
+          result = legacyConjunctionBulkScorer(
+              targetPool, ConjunctionMode::EXHAUSTIVE);
+        } else {
+          recordConjunctionPlanCommitment(planning.plan);
+          if (planning.status == ConjunctionPlanStatus::READY) {
+            result = buildConjunction(targetPool, planning.plan);
+          }
+        }
+        if (result) {
+          switch (result->route) {
+            case ConjunctionRoute::COUNT_POSTINGS_SAMPLE:
+              skipCount(SkipStats::filteredConjBatchEngagements);
+              skipCount(
+                  SkipStats::filteredConjBatchPostingsFeedEngagements);
+              return result->bulk;
+            case ConjunctionRoute::COUNT_DENSE:
+            case ConjunctionRoute::COUNT_EXACT_DOCS_ONLY:
+              return result->bulk;
+            case ConjunctionRoute::COUNT_DOC_SET_SPARSE:
+              if (!disableFilterClauseCountForTests) {
+                return result->bulk;
+              }
+              break;
+            default:
+              break;
+          }
+          skipCount(SkipStats::bulkBuiltThenRejected);
+          skipCount(SkipStats::bulkBuiltThenRejectedWrapperRoute);
+        }
+        bool pureFilteredDisjunction = mandatorySources.empty()
+            && prohibitedSources.empty() && optionalSources.size() >= 2
+            && minShouldMatch == 1;
+        if (!allowAlternateBulk && !legacy) {
+          return nullptr;
+        }
+        if (pureFilteredDisjunction) {
+          if (auto* disjunction =
+                  filteredDisjunctionBulkScorer(targetPool)) {
+            return disjunction;
+          }
+          skipCount(SkipStats::disjCountIdentityFilterFallbacks);
+        }
+        return nullptr;
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override {
         if (!needsScores && optionalSources.size() >= 2) {
           if (!mandatorySources.empty()) {
@@ -2681,31 +3671,11 @@ public:
                 || mandatorySources.size() == 1)
             && optionalSources.empty() && prohibitedSources.empty()) {
           auto result = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::CANDIDATE);
+              targetPool, ConjunctionMode::CANDIDATE,
+              candidateRouteMask());
           if (result && result->usesCandidateRoute()) {
             recordCandidateConjunctionEngagement(*result);
             return result->bulk;
-          }
-        }
-        // An exact count whose required body is a compound source must let
-        // that source plan with the enclosing filters. Treating the body as
-        // one opaque clause loses its direct-term boundaries and forces the
-        // filter back into a post-body window mask.
-        if (!disableIntegratedFilteredCountForTests
-            && !needsScores && mandatorySources.size() == 1
-            && optionalSources.empty() && prohibitedSources.empty()
-            && !filterSuppliers.empty() && minShouldMatch < 1) {
-          auto* bodySupplier = mandatorySources[0]->scorerSupplier(
-              targetPool, segment);
-          int64_t filterCost = minFilterCost();
-          if (bodySupplier != nullptr && filterCost >= 0) {
-            Query::ScorerSupplier::BulkScorerContext bulkContext{
-                filterCost, filterSuppliers, true};
-            auto filtered = bodySupplier->filteredBulkScorer(
-                targetPool, bulkContext);
-            if (filtered.consumesFilters) {
-              return filtered.bulk;
-            }
           }
         }
         // Filtered and negated counts use the windowed intersection when the
@@ -2721,42 +3691,7 @@ public:
               && ConjunctionBulkScorer::disableNegatedCountForTests) {
             return nullptr;
           }
-          auto result = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::EXHAUSTIVE);
-          if (result) {
-            switch (result->route) {
-              case ConjunctionRoute::COUNT_POSTINGS_SAMPLE:
-                skipCount(SkipStats::filteredConjBatchEngagements);
-                skipCount(
-                    SkipStats::filteredConjBatchPostingsFeedEngagements);
-                return result->bulk;
-              case ConjunctionRoute::COUNT_DENSE:
-              case ConjunctionRoute::COUNT_EXACT_DOCS_ONLY:
-                return result->bulk;
-              case ConjunctionRoute::COUNT_DOC_SET_SPARSE:
-                // Sparse AND-NOT is not implemented, so construction assigns
-                // this route only when there are no prohibited clauses.
-                if (!disableFilterClauseCountForTests) {
-                  return result->bulk;
-                }
-                break;
-              default:
-                break;
-            }
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedWrapperRoute);
-          }
-          bool pureFilteredDisjunction = mandatorySources.empty()
-              && prohibitedSources.empty() && optionalSources.size() >= 2
-              && minShouldMatch == 1;
-          if (pureFilteredDisjunction) {
-            if (auto* disjunction =
-                    filteredDisjunctionBulkScorer(targetPool)) {
-              return disjunction;
-            }
-            skipCount(SkipStats::disjCountIdentityFilterFallbacks);
-          }
-          return nullptr;
+          return filteredCountBulkScorer(targetPool, true);
         }
         if (needsScores && !filterSuppliers.empty()) {
           return disableFilteredScoredBulkForTests
@@ -2769,7 +3704,8 @@ public:
           // verifies positions only after all approximations agree; treating a
           // phrase as opaque would verify positions during every advance.
           auto result = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::SCORED_BODY);
+              targetPool, ConjunctionMode::SCORED_BODY,
+              routeBit(ConjunctionRoute::GENERIC));
           return result ? result->bulk : nullptr;
         }
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
@@ -2818,6 +3754,7 @@ public:
             && !bulkContext.filterSuppliers.empty()) {
           auto result = conjunctionBulkScorer(
               targetPool, ConjunctionMode::EXHAUSTIVE,
+              allRouteMask(),
               bulkContext.filterSuppliers);
           if (result) {
             assert(result->enclosingFilters == EnclosingFilters::CONSUMED);
@@ -3194,7 +4131,17 @@ public:
         if (supplier == nullptr) {
           return 0;
         }
-        auto* bulk = supplier->bulkScorer(guard.pool());
+        auto* booleanSupplier = dynamic_cast<Supplier*>(supplier);
+        assert(booleanSupplier != nullptr);
+        if (booleanSupplier == nullptr) {
+          return -1;
+        }
+        bool pureFilteredDisjunction = mandatoryWeights.empty()
+            && optionalWeights.size() >= 2 && minShouldMatch == 1;
+        auto* bulk = pureFilteredDisjunction
+            ? booleanSupplier->bulkScorer(guard.pool())
+            : booleanSupplier->filteredCountBulkScorer(
+                guard.pool(), false);
         if (bulk == nullptr) {
           return -1;
         }
@@ -6871,7 +7818,12 @@ public:
                           TermQuery::Scorer* candidatePostingsLead,
                           TermQuery::Scorer* candidateLeadScoreScorer,
                           std::span<uint8_t> candidateFilters,
-                          std::span<DocSet*> candidateFilterDocSets)
+                          std::span<DocSet*> candidateFilterDocSets,
+                          bool recordRouteCommitment = true,
+                          std::span<const ConjunctionClauseLayout>
+                              plannedClauses = {},
+                          std::span<const ConjunctionClauseLayout>
+                              plannedProhibitedClauses = {})
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
           candidateProhibitedTerms(candidateProhibitedTerms),
@@ -6921,7 +7873,13 @@ public:
           candidateFilterDocSets(candidateFilterDocSets) {
       assert(!scorers.empty());
       assert(scoringClauses.size() == scorers.size());
+      assert(plannedClauses.empty()
+             || plannedClauses.size() == scorers.size());
+      assert(plannedProhibitedClauses.empty()
+             || plannedProhibitedClauses.size()
+                 == prohibitedScorers.size());
       assert(candidateBatchSize >= kChunk);
+      bool plannedLayout = !plannedClauses.empty();
       if (!candidateFilterDocSets.empty()) {
         candidateFilterProbes =
             pool.make_span<DocSetProbe>(candidateFilterDocSets.size());
@@ -6939,14 +7897,18 @@ public:
       size_t scoreAddends = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
         std::span<Query::Scorer*> denseMembers;
-        if (scorers[i]->supportsWindowFilter()) {
-          denseMembers = scorers.subspan(i, 1);
-        } else if (!disableDisjGroupBulkForTests) {
-          denseMembers = scorers[i]->flatDisjunctionScorers();
-          for (Query::Scorer* member : denseMembers) {
-            if (!member->supportsWindowFilter()) {
-              denseMembers = {};
-              break;
+        if (plannedLayout) {
+          denseMembers = plannedClauses[i].denseMembers;
+        } else {
+          if (scorers[i]->supportsWindowFilter()) {
+            denseMembers = scorers.subspan(i, 1);
+          } else if (!disableDisjGroupBulkForTests) {
+            denseMembers = scorers[i]->flatDisjunctionScorers();
+            for (Query::Scorer* member : denseMembers) {
+              if (!member->supportsWindowFilter()) {
+                denseMembers = {};
+                break;
+              }
             }
           }
         }
@@ -6954,11 +7916,16 @@ public:
         if (!scoredConstruction
             && !disableDirectDenseClausesForTests
             && denseMembers.size() == 1) {
-          denseClauses[i].term =
-              dynamic_cast<TermQuery::Scorer*>(denseMembers[0]);
-          if (denseClauses[i].term == nullptr) {
-            denseClauses[i].docSet =
-                dynamic_cast<QueryPrep::DocSetScorer*>(denseMembers[0]);
+          if (plannedLayout) {
+            denseClauses[i].term = plannedClauses[i].directTerm;
+            denseClauses[i].docSet = plannedClauses[i].directDocSet;
+          } else {
+            denseClauses[i].term =
+                dynamic_cast<TermQuery::Scorer*>(denseMembers[0]);
+            if (denseClauses[i].term == nullptr) {
+              denseClauses[i].docSet =
+                  dynamic_cast<QueryPrep::DocSetScorer*>(denseMembers[0]);
+            }
           }
           hasDirectDenseClause |= denseClauses[i].term != nullptr
               || denseClauses[i].docSet != nullptr;
@@ -6966,7 +7933,12 @@ public:
         allDenseClauses &= !denseMembers.empty();
         denseHasDisjGroup |= denseMembers.size() > 1;
 
-        termScorers[i] = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
+        if (plannedLayout) {
+          termScorers[i] = plannedClauses[i].directTerm;
+        } else {
+          termScorers[i] =
+              dynamic_cast<TermQuery::Scorer*>(scorers[i]);
+        }
         allTermScorers &= termScorers[i] != nullptr;
         if (i > 0) {
           termTailScorers &= termScorers[i] != nullptr;
@@ -6979,13 +7951,17 @@ public:
           continue;
         }
         std::span<Query::Scorer*> members;
-        if (!disableDisjGroupBulkForTests) {
-          members = scorers[i]->flatDisjunctionScorers();
-        }
-        for (auto* member : members) {
-          if (dynamic_cast<TermQuery::Scorer*>(member) == nullptr) {
-            members = {};
-            break;
+        if (plannedLayout) {
+          members = plannedClauses[i].termMembers;
+        } else {
+          if (!disableDisjGroupBulkForTests) {
+            members = scorers[i]->flatDisjunctionScorers();
+          }
+          for (auto* member : members) {
+            if (dynamic_cast<TermQuery::Scorer*>(member) == nullptr) {
+              members = {};
+              break;
+            }
           }
         }
         termClauses[i].members = members;
@@ -6995,26 +7971,49 @@ public:
           scoreAddends += members.empty() ? 1 : members.size();
         }
       }
-      if (hasDirectDenseClause) {
+      if (hasDirectDenseClause && recordRouteCommitment) {
         skipCount(SkipStats::conjDirectDenseEngagements);
       }
       bool allDenseProhibited = true;
       for (size_t i = 0; i < prohibitedScorers.size(); i++) {
         std::span<Query::Scorer*> denseMembers;
-        bool supportsWindowFilter =
-            prohibitedScorers[i]->supportsWindowFilter();
-        prohibitedScorers[i]->recordWindowFilterCommit(
-            supportsWindowFilter);
-        if (supportsWindowFilter) {
-          denseMembers = prohibitedScorers.subspan(i, 1);
-        } else if (!disableDisjGroupBulkForTests) {
-          denseMembers = prohibitedScorers[i]->flatDisjunctionScorers();
-          for (Query::Scorer* member : denseMembers) {
-            bool memberSupports = member->supportsWindowFilter();
-            member->recordWindowFilterCommit(memberSupports);
-            if (!memberSupports) {
-              denseMembers = {};
+        if (plannedLayout) {
+          denseMembers = plannedProhibitedClauses[i].denseMembers;
+          switch (plannedProhibitedClauses[i].windowFillKind) {
+            case Query::ClauseShape::DIRECT:
+              prohibitedScorers[i]->recordWindowFilterCommit(true);
               break;
+            case Query::ClauseShape::FLAT_DISJUNCTION:
+              prohibitedScorers[i]->recordWindowFilterCommit(false);
+              if (!denseMembers.empty()) {
+                for (Query::Scorer* member : denseMembers) {
+                  member->recordWindowFilterCommit(true);
+                }
+              }
+              break;
+            case Query::ClauseShape::NONE:
+              prohibitedScorers[i]->recordWindowFilterCommit(false);
+              break;
+            case Query::ClauseShape::UNKNOWN:
+              assert(false);
+              break;
+          }
+        } else {
+          bool supportsWindowFilter =
+              prohibitedScorers[i]->supportsWindowFilter();
+          prohibitedScorers[i]->recordWindowFilterCommit(
+              supportsWindowFilter);
+          if (supportsWindowFilter) {
+            denseMembers = prohibitedScorers.subspan(i, 1);
+          } else if (!disableDisjGroupBulkForTests) {
+            denseMembers = prohibitedScorers[i]->flatDisjunctionScorers();
+            for (Query::Scorer* member : denseMembers) {
+              bool memberSupports = member->supportsWindowFilter();
+              member->recordWindowFilterCommit(memberSupports);
+              if (!memberSupports) {
+                denseMembers = {};
+                break;
+              }
             }
           }
         }

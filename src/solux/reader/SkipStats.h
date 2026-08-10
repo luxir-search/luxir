@@ -174,6 +174,7 @@ struct SkipStats {
   static inline int64_t bulkBuiltThenRejectedFilterOnly = 0;
   static inline int64_t bulkBuiltThenRejectedSortMatchWindow = 0;
   static inline int64_t bulkBuiltThenRejectedExactComposition = 0;
+  static inline int64_t conjPlanUnknownIsland = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKUnionReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
@@ -370,6 +371,7 @@ struct SkipStats {
     bulkBuiltThenRejectedFilterOnly = 0;
     bulkBuiltThenRejectedSortMatchWindow = 0;
     bulkBuiltThenRejectedExactComposition = 0;
+    conjPlanUnknownIsland = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKUnionReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;

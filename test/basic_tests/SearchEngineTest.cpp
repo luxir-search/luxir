@@ -1739,6 +1739,59 @@ TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {
   EXPECT_GT(cache->counters().hits, beforeHit.hits);
 }
 
+TEST_F(SearchEngineTest,
+       conjunctionPlanReadyRoutesMatchBuiltClassification) {
+  constexpr std::string_view collection = "conjunction_plan_ready_routes";
+  constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string filter;
+    if ((doc % 4) == 0) filter += "exact ";
+    if ((doc & 1) == 0) filter += "dense ";
+    if ((doc % 2048) == 0) filter += "sparse";
+    docs.push_back(flatdoc(
+        "id", "plan_" + std::to_string(doc),
+        "body_w", "alpha beta", "filter_w", filter));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  FilteredCountResult exact = runFilteredCount(
+      soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+      "exact", FilteredCountPath::FOLDED, collection);
+  EXPECT_EQ((nDocs + 3) / 4, exact.count);
+  EXPECT_GT(exact.exactTermCountBatches, 0);
+
+  FilteredCountResult dense;
+  {
+    ExactTermCountGuard exactGuard(true);
+    IntegratedFilteredCountGuard sampleGuard(true);
+    dense = runFilteredCount(
+        soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+        "dense", FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ((nDocs + 1) / 2, dense.count);
+  EXPECT_GT(dense.denseWindows, 0);
+
+  runFilteredCount(
+      soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+      "sparse", FilteredCountPath::FOLDED, collection);
+  runFilteredCount(
+      soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+      "sparse", FilteredCountPath::FOLDED, collection);
+  FilteredCountResult sparse;
+  {
+    ExactTermCountGuard exactGuard(true);
+    sparse = runFilteredCount(
+        soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+        "sparse", FilteredCountPath::FOLDED, collection);
+  }
+  EXPECT_EQ((nDocs + 2047) / 2048, sparse.count);
+  EXPECT_EQ(0, sparse.denseWindows);
+  EXPECT_GT(sparse.filteredConjBatchCountWindows, 0);
+}
+
 TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
   constexpr std::string_view collection = "cached_sparse_count_clause";
   constexpr int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
@@ -3075,7 +3128,7 @@ TEST_F(SearchEngineTest, constantTopKWindowCaptureMultiSegment) {
   expectConstantTopKShapes(helper.getSearchEngine());
 }
 
-TEST_F(SearchEngineTest, bulkBuiltThenRejectedWrapperRoute) {
+TEST_F(SearchEngineTest, filteredMultiTermCountPlansBeforeBuild) {
   CollectionHelper helper;
   indexConstantConjDocs(helper, 1);
 
@@ -3083,6 +3136,7 @@ TEST_F(SearchEngineTest, bulkBuiltThenRejectedWrapperRoute) {
     int64_t found;
     int64_t rejected;
     int64_t wrapperRoute;
+    int64_t unknownIsland;
   };
   auto run = [&](bool filtered) {
     auto req = localReq(helper.getSearchEngine());
@@ -3099,16 +3153,57 @@ TEST_F(SearchEngineTest, bulkBuiltThenRejectedWrapperRoute) {
       req->getMatchCount("q"),
       SkipStats::bulkBuiltThenRejected,
       SkipStats::bulkBuiltThenRejectedWrapperRoute,
+      SkipStats::conjPlanUnknownIsland,
     };
   };
 
   Run filtered = run(true);
   EXPECT_EQ(112, filtered.found);
-  EXPECT_GT(filtered.wrapperRoute, 0);
-  EXPECT_GE(filtered.rejected, filtered.wrapperRoute);
+  EXPECT_EQ(0, filtered.rejected);
+  EXPECT_EQ(0, filtered.wrapperRoute);
+  EXPECT_EQ(0, filtered.unknownIsland);
 
   Run unfiltered = run(false);
   EXPECT_EQ(120, unfiltered.found);
   EXPECT_EQ(0, unfiltered.rejected);
   EXPECT_EQ(0, unfiltered.wrapperRoute);
+  EXPECT_EQ(0, unfiltered.unknownIsland);
+}
+
+TEST_F(SearchEngineTest,
+       conjunctionPlanUnknownOptionalMatchesDisabledIdentity) {
+  CollectionHelper helper;
+  indexConstantConjDocs(helper, 1);
+
+  struct Run {
+    int64_t found;
+    int64_t unknownIsland;
+  };
+  auto run = [&](bool disableFilterFold) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {},
+        {qb::match(topDocs.mr(), "body_w", "filler"),
+         qb::prefix(topDocs.mr(), "body_w", "qax")},
+        {}, {}, 1);
+    topDocs.matchFilter("keep", "keep_s", "yes");
+    SkipStatsGuard stats;
+    {
+      TopDocsFilterFoldGuard foldGuard(disableFilterFold);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::conjPlanUnknownIsland,
+    };
+  };
+
+  Run planned = run(false);
+  Run disabledIdentity = run(true);
+  EXPECT_EQ(disabledIdentity.found, planned.found);
+  EXPECT_GT(planned.unknownIsland, 0);
+  EXPECT_EQ(0, disabledIdentity.unknownIsland);
 }
