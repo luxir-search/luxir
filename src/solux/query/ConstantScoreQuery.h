@@ -85,6 +85,11 @@ class ConstantScoreQuery final : public solux::Query {
       };
     }
 
+    bool fillExpansionMemo(
+        const Query::ScorerBuildContext& buildContext) override {
+      return childSupplier->fillExpansionMemo(buildContext);
+    }
+
     Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
       auto* childScorer = childSupplier->get(targetPool, leadCost);
       if (childScorer == nullptr) return nullptr;

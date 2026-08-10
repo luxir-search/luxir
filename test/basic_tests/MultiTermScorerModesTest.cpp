@@ -48,6 +48,35 @@ public:
   }
 };
 
+class StateBudgetGuard {
+  size_t saved;
+
+public:
+  explicit StateBudgetGuard(size_t bytes)
+    : saved(MultiTermQuery::Weight::maxLazyStateBytes) {
+    MultiTermQuery::Weight::maxLazyStateBytes = bytes;
+  }
+
+  ~StateBudgetGuard() {
+    MultiTermQuery::Weight::maxLazyStateBytes = saved;
+  }
+};
+
+class SkipStatsGuard {
+  bool saved;
+
+public:
+  SkipStatsGuard() : saved(SkipStats::enabled) {
+    SkipStats::reset();
+    SkipStats::enabled = true;
+  }
+
+  ~SkipStatsGuard() {
+    SkipStats::enabled = saved;
+    SkipStats::reset();
+  }
+};
+
 // Every term starts with "q" so one prefix query unions the whole corpus.
 void buildCorpus(TestField& field, const std::map<int32_t, std::string>& docs) {
   field.startIndexing();
@@ -251,21 +280,41 @@ TEST_F(MultiTermScorerModesTest, stateBudgetSpillsToEager) {
   buildCorpus(field, mixedShapeDocs());
 
   auto eager = collectDocs(ti, ScorerMode::FORCE_EAGER, {0, 0});
-  size_t saved = MultiTermQuery::Weight::maxLazyStateBytes;
-  MultiTermQuery::Weight::maxLazyStateBytes =
-      8 * sizeof(TermsEnum::PostingsState);
+  StateBudgetGuard stateBudget(
+      8 * sizeof(TermsEnum::PostingsState));
   {
     ScorerModeGuard guard(ScorerMode::AUTO);
     auto g = ti.pool.rewindScopeGuard();
     PrefixQuery pq("body_w", "q");
     Query::Context ctx(ti.pool, *ti.reader);
-    auto* weight =
-        pq.createWeight(ctx, Query::NEED_SCORES | Query::ALLOW_PRUNING);
-    auto* scorer = weight->createScorer(ti.pool, ctx.topReader.segments()[0]);
-    ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
+    auto* weight = dynamic_cast<MultiTermQuery::Weight*>(
+        pq.createWeight(ctx, Query::NEED_SCORES | Query::ALLOW_PRUNING));
+    ASSERT_NE(weight, nullptr);
+    auto* supplier =
+        weight->scorerSupplier(ti.pool, ctx.topReader.segments()[0]);
+    Query::ScorerBuildContext buildContext =
+        MultiTermQuery::Weight::scorerBuildContext(1);
+    expectMultiTermShape(
+        supplier->describeScorer(buildContext),
+        Query::MatchState::UNKNOWN, Query::ClauseShape::UNKNOWN);
+    SkipStatsGuard statsGuard;
+    auto* scorer = dynamic_cast<MultiTermQuery::Scorer*>(
+        weight->createScorer(ti.pool, ctx.topReader.segments()[0]));
+    ASSERT_NE(scorer, nullptr);
+    EXPECT_TRUE(weight->expansionMemoUsesBitsetForTests(
+        ctx.topReader.segments()[0]));
+    EXPECT_EQ(0u, weight->expansionMemoRetainedStatesForTests(
+        ctx.topReader.segments()[0]));
+    auto* second = dynamic_cast<MultiTermQuery::Scorer*>(
+        supplier->get(ti.pool, 1));
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(scorer->bitWordsForTests(), second->bitWordsForTests());
+    EXPECT_EQ(1, SkipStats::multitermExpansions);
+    expectMultiTermShape(
+        supplier->describeScorer(buildContext),
+        Query::MatchState::NONEMPTY, Query::ClauseShape::DIRECT);
   }
   EXPECT_EQ(eager, collectDocs(ti, ScorerMode::AUTO, {0, 0}));
-  MultiTermQuery::Weight::maxLazyStateBytes = saved;
 }
 
 // A conjunction-driven supplier (finite leadCost) keeps the lazy union;
@@ -362,6 +411,18 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
         prefixSupplier->describeScorer(
             MultiTermQuery::Weight::scorerBuildContext(1)),
         Query::MatchState::UNKNOWN, windowFillClause);
+
+    Query::ScorerBuildContext modeContext =
+        MultiTermQuery::Weight::scorerBuildContext(1);
+    EXPECT_TRUE(prefixSupplier->fillExpansionMemo(modeContext));
+    Query::ClauseShape resolvedWindowFill =
+        mode == ScorerMode::FORCE_EAGER
+        ? Query::ClauseShape::DIRECT
+        : Query::ClauseShape::NONE;
+    expectMultiTermShape(
+        prefixSupplier->describeScorer(modeContext),
+        Query::MatchState::NONEMPTY, resolvedWindowFill);
+    EXPECT_FALSE(prefixSupplier->fillExpansionMemo(modeContext));
   }
 
   {
@@ -385,6 +446,10 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
   expectMultiTermShape(emptyPrefixSupplier->describeScorer(buildContext),
                        Query::MatchState::UNKNOWN,
                        Query::ClauseShape::DIRECT);
+  EXPECT_TRUE(emptyPrefixSupplier->fillExpansionMemo(buildContext));
+  expectMultiTermShape(emptyPrefixSupplier->describeScorer(buildContext),
+                       Query::MatchState::EMPTY,
+                       Query::ClauseShape::DIRECT);
 
   PrefixQuery absentField("missing_w", "q");
   auto* absentWeight = absentField.createWeight(context, 0);
@@ -393,6 +458,66 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
   expectMultiTermShape(absentSupplier->describeScorer(buildContext),
                        Query::MatchState::EMPTY,
                        Query::ClauseShape::DIRECT);
+}
+
+TEST_F(MultiTermScorerModesTest,
+       expansionMemoReusedAcrossSuppliersAndScorerBuilds) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, {{0, "qalpha"}, {1, "qbeta"}, {2, "other"}});
+
+  auto run = [&](size_t maxStates, bool expectBitset) {
+    StateBudgetGuard stateBudget(
+        maxStates * sizeof(TermsEnum::PostingsState));
+    auto guard = ti.pool.rewindScopeGuard();
+    auto& segment = ti.reader->segments()[0];
+    Query::Context context(ti.pool, *ti.reader);
+    PrefixQuery prefix("body_w", "q");
+    auto* weight = dynamic_cast<MultiTermQuery::Weight*>(
+        prefix.createWeight(context, 0));
+    ASSERT_NE(weight, nullptr);
+    Query::ScorerBuildContext buildContext =
+        MultiTermQuery::Weight::scorerBuildContext(1);
+
+    SkipStatsGuard statsGuard;
+    auto* firstSupplier = weight->scorerSupplier(ti.pool, segment);
+    ASSERT_NE(firstSupplier, nullptr);
+    firstSupplier->describeScorer(buildContext);
+    firstSupplier->describeScorer(buildContext);
+    EXPECT_EQ(0, SkipStats::multitermExpansions);
+    EXPECT_TRUE(firstSupplier->fillExpansionMemo(buildContext));
+    EXPECT_EQ(expectBitset,
+              weight->expansionMemoUsesBitsetForTests(segment));
+    EXPECT_EQ(expectBitset ? 0u : 2u,
+              weight->expansionMemoRetainedStatesForTests(segment));
+    auto* first = dynamic_cast<MultiTermQuery::Scorer*>(
+        firstSupplier->get(ti.pool, 1));
+    ASSERT_NE(first, nullptr);
+
+    auto* secondSupplier = weight->scorerSupplier(ti.pool, segment);
+    ASSERT_NE(secondSupplier, nullptr);
+    EXPECT_FALSE(secondSupplier->fillExpansionMemo(buildContext));
+    auto* second = dynamic_cast<MultiTermQuery::Scorer*>(
+        secondSupplier->get(ti.pool, 1));
+    ASSERT_NE(second, nullptr);
+    auto* third = dynamic_cast<MultiTermQuery::Scorer*>(
+        weight->createScorer(ti.pool, segment));
+    ASSERT_NE(third, nullptr);
+
+    if (expectBitset) {
+      EXPECT_EQ(first->bitWordsForTests(), second->bitWordsForTests());
+      EXPECT_EQ(first->bitWordsForTests(), third->bitWordsForTests());
+    }
+    for (auto* scorer : {first, second, third}) {
+      EXPECT_EQ(0, scorer->next());
+      EXPECT_EQ(1, scorer->next());
+      EXPECT_EQ(PostingsReader::END, scorer->next());
+    }
+    EXPECT_EQ(1, SkipStats::multitermExpansions);
+  };
+
+  run(2, false);  // exactly at the cap retains both states
+  run(1, true);   // the next state crosses the cap into the bitset form
 }
 
 TEST_F(MultiTermScorerModesTest, eagerWindowFillCopiesUnalignedMaskedRange) {

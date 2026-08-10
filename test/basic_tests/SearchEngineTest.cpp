@@ -3232,15 +3232,17 @@ TEST_F(SearchEngineTest, constantTopKWindowCaptureMultiSegment) {
   expectConstantTopKShapes(helper.getSearchEngine());
 }
 
-TEST_F(SearchEngineTest, filteredMultiTermCountPlansBeforeBuild) {
+TEST_F(SearchEngineTest, filteredMultiTermCountExpandsOncePerSegment) {
   CollectionHelper helper;
-  indexConstantConjDocs(helper, 1);
+  constexpr int32_t kSegments = 3;
+  indexConstantConjDocs(helper, kSegments);
 
   struct Run {
     int64_t found;
     int64_t rejected;
     int64_t wrapperRoute;
     int64_t unknownIsland;
+    int64_t expansions;
   };
   auto run = [&](bool filtered) {
     auto req = localReq(helper.getSearchEngine());
@@ -3258,6 +3260,7 @@ TEST_F(SearchEngineTest, filteredMultiTermCountPlansBeforeBuild) {
       SkipStats::bulkBuiltThenRejected,
       SkipStats::bulkBuiltThenRejectedWrapperRoute,
       SkipStats::conjPlanUnknownIsland,
+      SkipStats::multitermExpansions,
     };
   };
 
@@ -3266,12 +3269,14 @@ TEST_F(SearchEngineTest, filteredMultiTermCountPlansBeforeBuild) {
   EXPECT_EQ(0, filtered.rejected);
   EXPECT_EQ(0, filtered.wrapperRoute);
   EXPECT_EQ(0, filtered.unknownIsland);
+  EXPECT_EQ(kSegments, filtered.expansions);
 
   Run unfiltered = run(false);
   EXPECT_EQ(120, unfiltered.found);
   EXPECT_EQ(0, unfiltered.rejected);
   EXPECT_EQ(0, unfiltered.wrapperRoute);
   EXPECT_EQ(0, unfiltered.unknownIsland);
+  EXPECT_EQ(kSegments, unfiltered.expansions);
 }
 
 TEST_F(SearchEngineTest, filteredMultiTermDenseCountUsesWindowFill) {
@@ -3362,14 +3367,14 @@ TEST_F(SearchEngineTest, filteredMultiTermFieldSortUsesWindowBulk) {
   EXPECT_EQ(0, sortedOracle.sortMatchWindowRejects);
 }
 
-TEST_F(SearchEngineTest,
-       conjunctionPlanUnknownOptionalMatchesDisabledIdentity) {
+TEST_F(SearchEngineTest, conjunctionPlanFillsOptionalMultiTermMemo) {
   CollectionHelper helper;
   indexConstantConjDocs(helper, 1);
 
   struct Run {
     int64_t found;
     int64_t unknownIsland;
+    int64_t expansions;
   };
   auto run = [&](bool disableFilterFold) {
     auto req = localReq(helper.getSearchEngine());
@@ -3390,12 +3395,15 @@ TEST_F(SearchEngineTest,
     return Run{
       req->getMatchCount("q"),
       SkipStats::conjPlanUnknownIsland,
+      SkipStats::multitermExpansions,
     };
   };
 
   Run planned = run(false);
   Run disabledIdentity = run(true);
   EXPECT_EQ(disabledIdentity.found, planned.found);
-  EXPECT_GT(planned.unknownIsland, 0);
+  EXPECT_EQ(0, planned.unknownIsland);
   EXPECT_EQ(0, disabledIdentity.unknownIsland);
+  EXPECT_EQ(1, planned.expansions);
+  EXPECT_EQ(1, disabledIdentity.expansions);
 }

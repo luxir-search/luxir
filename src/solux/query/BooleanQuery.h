@@ -1346,6 +1346,34 @@ public:
         return false;
       }
 
+      static bool fillExpansionMemos(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        bool filled = false;
+        for (auto* supplier : suppliers) {
+          if (supplier != nullptr
+              && supplier->fillExpansionMemo(buildContext)) {
+            filled = true;
+          }
+        }
+        return filled;
+      }
+
+      static Query::ScorerShape describeResolved(
+          Query::ScorerSupplier* supplier,
+          const Query::ScorerBuildContext& buildContext) {
+        Query::ScorerShape shape = supplier->describeScorer(buildContext);
+        bool unknown = shape.matchState == Query::MatchState::UNKNOWN
+            || shape.directKind == Query::DirectScorerKind::UNKNOWN
+            || shape.reportedTwoPhase == Query::ReportedTwoPhase::UNKNOWN
+            || shape.windowFillClause == Query::ClauseShape::UNKNOWN
+            || shape.termDisjunctionClause == Query::ClauseShape::UNKNOWN;
+        if (unknown && supplier->fillExpansionMemo(buildContext)) {
+          shape = supplier->describeScorer(buildContext);
+        }
+        return shape;
+      }
+
       static size_t nonemptyCount(
           std::span<Query::ScorerSupplier* const> suppliers,
           const Query::ScorerBuildContext& buildContext) {
@@ -1636,6 +1664,19 @@ public:
         return maskSupplierAccess(positive);
       }
 
+      bool fillExpansionMemo(
+          const Query::ScorerBuildContext& buildContext) override {
+        bool filled = fillExpansionMemos(
+            mandatoryShapeSuppliers, buildContext);
+        filled = fillExpansionMemos(filterSuppliers, buildContext)
+            || filled;
+        filled = fillExpansionMemos(optionalShapeSuppliers, buildContext)
+            || filled;
+        filled = fillExpansionMemos(prohibitedShapeSuppliers, buildContext)
+            || filled;
+        return filled;
+      }
+
       DocSet* exactDocSet() override {
         // Apply the filter-clause test hook to the degenerate single-filter
         // DocSet path as well.
@@ -1852,11 +1893,11 @@ public:
         return shape;
       }
 
-      ConjunctionPlanningResult planConjunction(
+      ConjunctionPlanningResult planConjunctionOnce(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
           std::span<Query::ScorerSupplier* const>
-              enclosingFilterSuppliers = {}) {
+              enclosingFilterSuppliers) {
         ConjunctionPlan plan;
         plan.mode = mode;
         plan.enclosingFilters = enclosingFilterSuppliers.empty()
@@ -2275,6 +2316,34 @@ public:
         return finishRoute(ConjunctionRoute::GENERIC, true);
       }
 
+      ConjunctionPlanningResult planConjunction(
+          MemPool& targetPool, ConjunctionMode mode,
+          AcceptedConjunctionRoutes acceptedRoutes,
+          std::span<Query::ScorerSupplier* const>
+              enclosingFilterSuppliers = {}) {
+        ConjunctionPlanningResult planning = planConjunctionOnce(
+            targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
+        if (planning.status != ConjunctionPlanStatus::LEGACY) {
+          return planning;
+        }
+
+        Query::ScorerBuildContext buildContext =
+            scorerBuildContext(planning.plan.leadCost);
+        bool filled = fillExpansionMemos(
+            mandatoryShapeSuppliers, buildContext);
+        filled = fillExpansionMemos(filterSuppliers, buildContext)
+            || filled;
+        filled = fillExpansionMemos(optionalShapeSuppliers, buildContext)
+            || filled;
+        filled = fillExpansionMemos(prohibitedShapeSuppliers, buildContext)
+            || filled;
+        filled = fillExpansionMemos(enclosingFilterSuppliers, buildContext)
+            || filled;
+        if (!filled) return planning;
+        return planConjunctionOnce(
+            targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
+      }
+
       static BulkPlan knownBulkPlan(
           BulkAnswer available, BulkAnswer matchWindows,
           BulkAnswer exactCandidateScoring,
@@ -2326,8 +2395,8 @@ public:
           }
           filterFeed = true;
         } else if (!QueryPrep::disableSparseBatchPostingsFeedForTests) {
-          Query::ScorerShape shape = filterSupplier->describeScorer(
-              scorerBuildContext(filterCost));
+          Query::ScorerShape shape = describeResolved(
+              filterSupplier, scorerBuildContext(filterCost));
           if (shape.matchState == Query::MatchState::UNKNOWN
               || shape.directKind == Query::DirectScorerKind::UNKNOWN) {
             return {};
@@ -2348,7 +2417,7 @@ public:
         for (auto* supplier : optionalShapeSuppliers) {
           if (supplier == nullptr) continue;
           Query::ScorerShape shape =
-              supplier->describeScorer(buildContext);
+              describeResolved(supplier, buildContext);
           if (shape.matchState == Query::MatchState::UNKNOWN
               || shape.directKind == Query::DirectScorerKind::UNKNOWN) {
             return {};
@@ -2389,7 +2458,7 @@ public:
         for (auto* supplier : optionalShapeSuppliers) {
           if (supplier == nullptr) continue;
           Query::ScorerShape shape =
-              supplier->describeScorer(buildContext);
+              describeResolved(supplier, buildContext);
           if (shape.matchState == Query::MatchState::UNKNOWN) {
             return {};
           }
@@ -3879,7 +3948,7 @@ public:
           Query::ScorerBuildContext buildContext =
               scorerBuildContext(leadCost);
           Query::ScorerShape mandatoryShape =
-              mandatory->describeScorer(buildContext);
+              describeResolved(mandatory, buildContext);
           if (mandatoryShape.matchState == Query::MatchState::UNKNOWN
               || mandatoryShape.reportedTwoPhase
                   == Query::ReportedTwoPhase::UNKNOWN) {
@@ -3896,7 +3965,7 @@ public:
           for (auto* optional : optionalShapeSuppliers) {
             if (optional == nullptr) continue;
             Query::ScorerShape optionalShape =
-                optional->describeScorer(buildContext);
+                describeResolved(optional, buildContext);
             if (optionalShape.matchState == Query::MatchState::UNKNOWN
                 || optionalShape.reportedTwoPhase
                     == Query::ReportedTwoPhase::UNKNOWN) {

@@ -524,6 +524,16 @@ public:
       return {};
     }
 
+    /// Resolve any dictionary-expansion-dependent shape answers for this
+    /// segment. The default has nothing to resolve. Implementations may recurse
+    /// into wrapped or compound suppliers, but must leave describeScorer()
+    /// itself pure.
+    virtual bool fillExpansionMemo(
+        const ScorerBuildContext& buildContext) {
+      unused(buildContext);
+      return false;
+    }
+
     /// Separately estimated filter and union costs for exact-count top-k
     /// composition. The default means this supplier does not expose that
     /// decomposition.
@@ -622,6 +632,9 @@ public:
   /// Gives context to a Query (i.e. what index it's being used on amongst other things) when creating weights
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
   class Context {
+    std::unique_ptr<google::protobuf::Arena> standaloneArena;
+    google::protobuf::Arena* allocationArena;
+
   public:
     using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
 
@@ -648,12 +661,13 @@ public:
     // allocation) and passes the results in, so this only binds/moves members.
     // (solux::arenaCreate would make a throwing arena ctor safe now; the factory
     // split is kept as structure, not a safety requirement.)
-    Context(MemPool& pool, IndexReader& topReader,
+    Context(google::protobuf::Arena& arena, MemPool& pool,
+            IndexReader& topReader,
             std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
             Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
             FilterKeyContext filterKeyContext = {},
             std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : pool(pool), topReader(topReader),
+      : allocationArena(&arena), pool(pool), topReader(topReader),
         filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext),
         fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)),
@@ -673,7 +687,9 @@ public:
             std::vector<api::Warning>* warnings = nullptr,
             FilterKeyContext filterKeyContext = {},
             std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
+      : standaloneArena(std::make_unique<google::protobuf::Arena>()),
+        allocationArena(standaloneArena.get()),
+        pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext),
         fieldInfoMap(4, pool.getAllocator()),
         limits(limits), warnings(warnings) {
@@ -702,8 +718,13 @@ public:
       }
       FieldInfoMap map(4, pool.getAllocator());
       return solux::arenaCreate<Context>(
-        *arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map),
+        *arena, *arena, pool, topReader,
+        std::span<FieldReader>(readers, numSegs), std::move(map),
         limits, warnings, filterKeyContext, std::move(filterUses));
+    }
+
+    google::protobuf::Arena& arena() const noexcept {
+      return *allocationArena;
     }
 
     FilterCache::Use* getFilterUse(const Query& query) {

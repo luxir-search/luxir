@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "PostingsUnion.h"
@@ -54,6 +55,8 @@ public:
     Scorer(FixedBitSet bits, int32_t maxDoc, float constantScore)
       : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc) {}
 
+    const uint64_t* bitWordsForTests() const { return bits.words; }
+
     int32_t next() override {
       if (docid == PostingsReader::END) return docid = PostingsReader::END;
       return advanceTo(docid + 1);
@@ -97,16 +100,71 @@ public:
   };
 
   class Weight final : public Query::Weight {
+    enum class ExpansionMode : uint8_t {
+      EAGER,
+      WINDOWED,
+      HEAP,
+    };
+
+    struct BitsetPayload {
+      uint64_t* words;
+    };
+
+    struct ExpansionMemo {
+      using States = std::vector<TermsEnum::PostingsState>;
+      std::variant<States, BitsetPayload> payload;
+      int64_t sumDocFreq;
+      size_t termCount;
+      ExpansionMode autoMode;
+      Query::MatchState matchState;
+
+      ExpansionMemo(States&& states,
+                    int64_t sumDocFreq, ExpansionMode autoMode)
+        : payload(std::in_place_type<States>, std::move(states)),
+          sumDocFreq(sumDocFreq),
+          termCount(std::get<States>(payload).size()), autoMode(autoMode),
+          matchState(termCount == 0 ? Query::MatchState::EMPTY
+                                   : Query::MatchState::NONEMPTY) {}
+
+      ExpansionMemo(BitsetPayload bitset, int64_t sumDocFreq,
+                    size_t termCount)
+        : payload(bitset), sumDocFreq(sumDocFreq), termCount(termCount),
+          autoMode(ExpansionMode::EAGER),
+          matchState(termCount == 0 ? Query::MatchState::EMPTY
+                                   : Query::MatchState::NONEMPTY) {
+        assert(termCount != 0);
+        assert(bitset.words != nullptr);
+      }
+
+      bool hasBitset() const {
+        return std::holds_alternative<BitsetPayload>(payload);
+      }
+
+      const States& states() const {
+        return std::get<States>(payload);
+      }
+
+      uint64_t* bitWords() const {
+        return std::get<BitsetPayload>(payload).words;
+      }
+    };
+
+    struct ExpansionSlot {
+      ExpansionMemo* memo = nullptr;
+    };
+
     MultiTermQuery& query;
     CachedFieldInfo* cachedFieldInfo = nullptr;
     float boost;
     bool canUseLazy;
+    google::protobuf::Arena& memoArena;
+    std::span<ExpansionSlot> expansionSlots;
 
   public:
     // Test/bench force switch over the constant-score union scorers. AUTO is
-    // the production policy; the forced modes bind only where the lazy
-    // preconditions hold (scored + pruning, self-driven or conjunction
-    // driven), everything else stays eager.
+    // the production policy; the forced lazy modes bind only where the lazy
+    // preconditions hold and the retained-state budget is not exceeded.
+    // Everything else stays eager.
     using ScorerMode = Query::ScorerBuildContext::MultiTermScorerMode;
     static inline ScorerMode scorerModeForTests = ScorerMode::AUTO;
 
@@ -134,119 +192,202 @@ public:
         boost(constantWhenScored(flags, multiplier)),
         canUseLazy((flags & (NEED_SCORES | ALLOW_PRUNING))
                      == (NEED_SCORES | ALLOW_PRUNING)
-                   && scorerModeForTests != ScorerMode::FORCE_EAGER) {
+                   && scorerModeForTests != ScorerMode::FORCE_EAGER),
+        memoArena(context.arena()),
+        expansionSlots(
+            context.pool.make_span<ExpansionSlot>(context.numSegments())) {
       traits |= IS_CONSTANT_SCORING;  // every match scores the same
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
     }
 
   private:
-    // Retained-state budget exceeded: union the collected states plus the
-    // rest of the term stream into a full bitset.
-    Query::Scorer* eagerRemainder(
-        MemPool& targetPool, FilteredTermsEnum& fenum,
-        const std::vector<TermsEnum::PostingsState>& states, int32_t maxDoc) {
+    static ExpansionMode chooseAutoMode(
+        size_t termCount, size_t maxStateBytes) {
+      size_t maxStates =
+          maxStateBytes / sizeof(TermsEnum::PostingsState);
+      if (termCount > maxStates) return ExpansionMode::EAGER;
+      if (termCount > MAX_LAZY_TERMS) return ExpansionMode::HEAP;
+      return ExpansionMode::WINDOWED;
+    }
+
+    static ExpansionMode chooseMode(
+        bool canUseLazy, const Query::ScorerBuildContext& buildContext,
+        const ExpansionMemo& memo) {
+      if (memo.hasBitset()) {
+        assert(memo.autoMode == ExpansionMode::EAGER);
+        return ExpansionMode::EAGER;
+      }
+      if (!canUseLazy) return ExpansionMode::EAGER;
+      switch (buildContext.multiTermScorerModeForTests) {
+        case ScorerMode::AUTO:
+          return memo.autoMode;
+        case ScorerMode::FORCE_EAGER:
+          return ExpansionMode::EAGER;
+        case ScorerMode::FORCE_WINDOWED:
+          return ExpansionMode::WINDOWED;
+        case ScorerMode::FORCE_HEAP:
+          return ExpansionMode::HEAP;
+      }
+      std::unreachable();
+    }
+
+    static void addPostingsToBitset(
+        FixedBitSet& bits, const TermsEnum::PostingsState& state) {
+      DocsOnlyEnum docsEnum(state);
+      for (int32_t doc = docsEnum.nextDoc();
+           doc != PostingsReader::END; doc = docsEnum.nextDoc()) {
+        bits.set(doc);
+      }
+    }
+
+    bool fillExpansionMemo(
+        MemPool& scratchPool, IndexReader::Segment& segment,
+        const Query::ScorerBuildContext& buildContext) {
+      assert(segment.ord >= 0
+             && (size_t) segment.ord < expansionSlots.size());
+      ExpansionSlot& slot = expansionSlots[(size_t) segment.ord];
+      if (slot.memo != nullptr) return false;
+
+      ExpansionMemo::States states;
+      size_t maxStates = buildContext.multiTermMaxLazyStateBytes
+          / sizeof(TermsEnum::PostingsState);
+      uint64_t* bitWords = nullptr;
+      size_t termCount = 0;
+      int64_t sumDocFreq = 0;
+      if (cachedFieldInfo != nullptr) {
+        auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
+        if (segFieldInfo != nullptr) {
+          auto scratchGuard = scratchPool.rewindScopeGuard();
+          auto* termsEnum = scratchPool.make<TermsEnum>(
+              scratchPool, segment.postingsReader(), *segFieldInfo);
+          FilteredTermsEnum* fenum =
+              query.createFilteredEnum(scratchPool, *termsEnum);
+          skipCount(SkipStats::multitermExpansions);
+          while (fenum->next()) {
+            TermsEnum::PostingsState state =
+                fenum->terms().postingsState();
+            termCount++;
+            sumDocFreq += state.docFreq;
+            if (bitWords != nullptr) {
+              FixedBitSet bits(bitWords, segment.maxDoc());
+              addPostingsToBitset(bits, state);
+              continue;
+            }
+            if (states.size() < maxStates) {
+              if (states.size() == states.capacity()) {
+                size_t nextCapacity = states.empty()
+                    ? std::min<size_t>(8, maxStates)
+                    : states.capacity() > maxStates / 2
+                        ? maxStates
+                        : states.capacity() * 2;
+                states.reserve(nextCapacity);
+              }
+              states.push_back(state);
+              continue;
+            }
+
+            size_t nWords = FixedBitSet::sizeInWords(segment.maxDoc());
+            bitWords = google::protobuf::Arena::CreateArray<uint64_t>(
+                &memoArena, nWords);
+            memset(bitWords, 0, nWords * sizeof(uint64_t));
+            FixedBitSet bits(bitWords, segment.maxDoc());
+            for (const auto& retained : states) {
+              addPostingsToBitset(bits, retained);
+            }
+            addPostingsToBitset(bits, state);
+            ExpansionMemo::States().swap(states);
+          }
+        }
+      }
+
+      // The request arena survives every segment-local pool rewind. Each
+      // segment task publishes only its preallocated ordinal slot.
+      ExpansionMemo* memo;
+      if (bitWords != nullptr) {
+        memo = solux::arenaCreate<ExpansionMemo>(
+            memoArena, BitsetPayload{bitWords}, sumDocFreq, termCount);
+      } else {
+        ExpansionMode autoMode = chooseAutoMode(
+            termCount, buildContext.multiTermMaxLazyStateBytes);
+        memo = solux::arenaCreate<ExpansionMemo>(
+            memoArena, std::move(states), sumDocFreq, autoMode);
+      }
+      slot.memo = memo;
+      return true;
+    }
+
+    const ExpansionMemo& expansionMemo(
+        MemPool& scratchPool, IndexReader::Segment& segment,
+        const Query::ScorerBuildContext& buildContext) {
+      fillExpansionMemo(scratchPool, segment, buildContext);
+      return *expansionSlots[(size_t) segment.ord].memo;
+    }
+
+    Query::Scorer* createEagerScorer(
+        MemPool& targetPool,
+        std::span<const TermsEnum::PostingsState> states,
+        int32_t maxDoc) {
       size_t nWords = FixedBitSet::sizeInWords(maxDoc);
       auto* words = (uint64_t*)targetPool.alloc(
           nWords * sizeof(uint64_t), alignof(uint64_t));
       memset(words, 0, nWords * sizeof(uint64_t));
       FixedBitSet bits(words, maxDoc);
-      std::span<uint64_t> bitWords(words, nWords);
-
       for (const auto& state : states) {
-        DocsOnlyEnum docsEnum(state);
-        docsEnum.intoBitSet(bitWords, 0, maxDoc);
-      }
-      while (fenum.next()) {
-        DocsOnlyEnum docsEnum(fenum.terms());
-        docsEnum.intoBitSet(bitWords, 0, maxDoc);
+        addPostingsToBitset(bits, state);
       }
       return targetPool.make<MultiTermQuery::Scorer>(bits, maxDoc, boost);
     }
 
     Query::Scorer* createScorerForMode(
-        MemPool& targetPool, IndexReader::Segment& segment, bool useLazy) {
-      if (cachedFieldInfo == nullptr) return nullptr;       // field absent everywhere
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
-      if (segFieldInfo == nullptr) return nullptr;          // field absent in this segment
-
-      // Fresh per-segment cursor because scorers can be built in parallel.
-      auto* termsEnum = targetPool.make<TermsEnum>(targetPool, segment.postingsReader(), *segFieldInfo);
-      FilteredTermsEnum* fenum = query.createFilteredEnum(targetPool, *termsEnum);
-
+        MemPool& targetPool, IndexReader::Segment& segment,
+        const Query::ScorerBuildContext& buildContext) {
+      const ExpansionMemo& memo = expansionMemo(
+          targetPool, segment, buildContext);
+      unused(memo.sumDocFreq);
+      if (memo.matchState == Query::MatchState::EMPTY) return nullptr;
       int32_t maxDoc = segment.postingsReader().maxDoc();
-      if (useLazy) {
-        const ScorerMode mode = scorerModeForTests;
-        // AUTO bounds retained states by bytes; the forced modes are test
-        // hooks and unbounded so the A/B matrix can probe past the budget.
-        const size_t maxStates = mode == ScorerMode::AUTO
-            ? maxLazyStateBytes / sizeof(TermsEnum::PostingsState)
-            : std::numeric_limits<size_t>::max();
-        std::vector<TermsEnum::PostingsState> states;
-        while (fenum->next()) {
-          states.push_back(fenum->terms().postingsState());
-          if (states.size() > maxStates) {
-            return eagerRemainder(targetPool, *fenum, states, maxDoc);
-          }
-        }
-        if (states.empty()) return nullptr;
-
-        if (mode == ScorerMode::FORCE_HEAP
-            || (mode == ScorerMode::AUTO && states.size() > MAX_LAZY_TERMS)) {
-          auto statesArr = targetPool.make_span<TermsEnum::PostingsState>(states.size());
-          std::copy(states.begin(), states.end(), statesArr.begin());
-          auto enums = targetPool.make_span<DocsOnlyEnum*>(states.size());
-          std::fill(enums.begin(), enums.end(), nullptr);
-          auto heap = targetPool.make_span<uint64_t>(states.size());
-          auto windowBits =
-              targetPool.make_span<uint64_t>((size_t) UnionHeapScorer::WINDOW_WORDS);
-          return targetPool.make<UnionHeapScorer>(
-              std::span<const TermsEnum::PostingsState>(statesArr), enums, heap,
-              windowBits, targetPool, maxDoc, boost);
-        }
-
+      ExpansionMode mode = chooseMode(canUseLazy, buildContext, memo);
+      if (memo.hasBitset()) {
+        assert(mode == ExpansionMode::EAGER);
+        return targetPool.make<MultiTermQuery::Scorer>(
+            FixedBitSet(memo.bitWords(), maxDoc), maxDoc, boost);
+      }
+      const ExpansionMemo::States& states = memo.states();
+      assert(memo.termCount == states.size());
+      if (mode == ExpansionMode::HEAP) {
+        auto enums = targetPool.make_span<DocsOnlyEnum*>(memo.termCount);
+        std::fill(enums.begin(), enums.end(), nullptr);
+        auto heap = targetPool.make_span<uint64_t>(memo.termCount);
+        auto windowBits = targetPool.make_span<uint64_t>(
+            (size_t) UnionHeapScorer::WINDOW_WORDS);
+        return targetPool.make<UnionHeapScorer>(
+            std::span<const TermsEnum::PostingsState>(states),
+            enums, heap, windowBits, targetPool, maxDoc, boost);
+      }
+      if (mode == ExpansionMode::WINDOWED) {
         static_assert(std::is_trivially_destructible_v<DocsOnlyEnum>);
         auto* docsEnums = (DocsOnlyEnum*) targetPool.alloc(
-            states.size() * sizeof(DocsOnlyEnum), alignof(DocsOnlyEnum));
-        for (size_t i = 0; i < states.size(); i++) {
+            memo.termCount * sizeof(DocsOnlyEnum), alignof(DocsOnlyEnum));
+        for (size_t i = 0; i < memo.termCount; i++) {
           new (&docsEnums[i]) DocsOnlyEnum(states[i]);
         }
         auto windowBits =
             targetPool.make_span<uint64_t>((size_t) UnionLazyScorer::WINDOW_WORDS);
         return targetPool.make<UnionLazyScorer>(
-            std::span(docsEnums, states.size()), windowBits, maxDoc, boost);
+            std::span(docsEnums, memo.termCount), windowBits, maxDoc, boost);
       }
-
-      // Bitset words live in targetPool so the scorer stays trivially destructible.
-      size_t nWords = FixedBitSet::sizeInWords(maxDoc);
-      auto* words = (uint64_t*)targetPool.alloc(nWords * sizeof(uint64_t), alignof(uint64_t));
-      memset(words, 0, nWords * sizeof(uint64_t));
-      FixedBitSet bits(words, maxDoc);
-
-      bool anyTerm = false;
-      // Reclaim each term's postings-enum allocations before scanning the next term.
-      auto savepoint = targetPool.getSavePoint();
-      while (fenum->next()) {
-        anyTerm = true;
-        {
-          DocsOnlyEnum docsEnum(fenum->terms());
-          for (int32_t doc = docsEnum.nextDoc(); doc != PostingsReader::END; doc = docsEnum.nextDoc()) {
-            bits.set(doc);
-          }
-        }
-        targetPool.rewind(savepoint);
-      }
-
-      if (!anyTerm) return nullptr;  // the field exists but no term matched
-      return targetPool.make<MultiTermQuery::Scorer>(bits, maxDoc, boost);
+      return createEagerScorer(targetPool, states, maxDoc);
     }
 
     class Supplier final : public Query::ScorerSupplier {
       Weight& weight;
       IndexReader::Segment& segment;
+      MemPool& scratchPool;
 
     public:
-      Supplier(Weight& weight, IndexReader::Segment& segment)
-        : weight(weight), segment(segment) {}
+      Supplier(Weight& weight, IndexReader::Segment& segment,
+               MemPool& scratchPool)
+        : weight(weight), segment(segment), scratchPool(scratchPool) {}
 
       int64_t cost() override { return segment.maxDoc(); }
 
@@ -256,6 +397,10 @@ public:
         if (weight.cachedFieldInfo == nullptr
             || weight.cachedFieldInfo->segInfos[segment.ord] == nullptr) {
           matchState = Query::MatchState::EMPTY;
+        } else {
+          ExpansionMemo* memo =
+              weight.expansionSlots[(size_t) segment.ord].memo;
+          if (memo != nullptr) matchState = memo->matchState;
         }
         Query::ScorerShape shape{
           .matchState = matchState,
@@ -267,6 +412,17 @@ public:
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
         };
+        ExpansionMemo* memo =
+            weight.expansionSlots[(size_t) segment.ord].memo;
+        if (memo != nullptr) {
+          ExpansionMode mode = chooseMode(
+              weight.canUseLazy, buildContext, *memo);
+          if (mode == ExpansionMode::EAGER
+              && !disableDenseFillForTests) {
+            shape.windowFillClause = Query::ClauseShape::DIRECT;
+          }
+          return shape;
+        }
         bool eagerGuaranteed = !weight.canUseLazy
             || buildContext.multiTermScorerModeForTests
                 == ScorerMode::FORCE_EAGER;
@@ -281,8 +437,8 @@ public:
             return shape;
           case ScorerMode::AUTO:
             // Retained-state overflow may switch AUTO to the eager scorer,
-            // which fills windows; the lazy scorers do not. NONE would be a
-            // falsely definite claim, so the fill answer stays open.
+            // which fills windows; keep the answer open until the expansion
+            // memo records the actual branch.
             unused(buildContext.multiTermMaxLazyStateBytes);
             if (!disableDenseFillForTests) {
               shape.windowFillClause = Query::ClauseShape::UNKNOWN;
@@ -292,25 +448,46 @@ public:
         std::unreachable();
       }
 
+      bool fillExpansionMemo(
+          const Query::ScorerBuildContext& buildContext) override {
+        return weight.fillExpansionMemo(
+            scratchPool, segment, buildContext);
+      }
+
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         // Driven consumption keeps the lazy union: windows fill only at
         // probed docids, and the returned next-union doc is a skip fence for
         // the driver's probe loop, so a sparse or pruning lead never pays
         // for the unvisited remainder the eager build materializes up front.
-        unused(leadCost);
-        return weight.createScorerForMode(targetPool, segment, weight.canUseLazy);
+        return weight.createScorerForMode(
+            targetPool, segment, Weight::scorerBuildContext(leadCost));
       }
     };
 
   public:
     Query::ScorerSupplier* scorerSupplier(
         MemPool& targetPool, IndexReader::Segment& segment) override {
-      return targetPool.make<Supplier>(*this, segment);
+      return targetPool.make<Supplier>(*this, segment, targetPool);
     }
 
     Query::Scorer* createScorer(
         MemPool& targetPool, IndexReader::Segment& segment) override {
-      return createScorerForMode(targetPool, segment, canUseLazy);
+      return createScorerForMode(
+          targetPool, segment,
+          scorerBuildContext(std::numeric_limits<int64_t>::max()));
+    }
+
+    bool expansionMemoUsesBitsetForTests(
+        const IndexReader::Segment& segment) const {
+      ExpansionMemo* memo = expansionSlots[(size_t) segment.ord].memo;
+      return memo != nullptr && memo->hasBitset();
+    }
+
+    size_t expansionMemoRetainedStatesForTests(
+        const IndexReader::Segment& segment) const {
+      ExpansionMemo* memo = expansionSlots[(size_t) segment.ord].memo;
+      assert(memo != nullptr);
+      return memo->hasBitset() ? 0 : memo->states().size();
     }
   };
 };
