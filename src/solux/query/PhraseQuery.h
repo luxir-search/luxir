@@ -276,6 +276,16 @@ public:
         return minCost < 0 ? 0 : minCost;
       }
 
+      // Deliberately all-UNKNOWN: window-fill eligibility depends on a
+    // positive cost injected after construction, and two-phase state on
+    // the flattening outcome; a falsely definite answer would poison
+    // route planning.
+    Query::ScorerShape describeScorer(
+          const Query::ScorerBuildContext& buildContext) const override {
+        unused(buildContext);
+        return {};
+      }
+
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         Query::Scorer* scorer = weight.createScorer(targetPool, segment);
         if (scorer == nullptr) return nullptr;
@@ -972,10 +982,14 @@ public:
       double fillWork = (double) approximationCost
           * (double) std::max(matchCostEstimate, 1.0f)
           * kExclusionWindowFillPositionWeight;
-      bool admitted = fillWork <= (double) windowFillPositiveCost;
-      skipCount(admitted ? SkipStats::phraseExclusionWindowAdmits
-                         : SkipStats::phraseExclusionWindowRejects);
-      return admitted;
+      return fillWork <= (double) windowFillPositiveCost;
+    }
+
+    void recordWindowFilterCommit(bool supported) const override {
+      if (exclusionWindowFill) {
+        skipCount(supported ? SkipStats::phraseExclusionWindowAdmits
+                            : SkipStats::phraseExclusionWindowRejects);
+      }
     }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,

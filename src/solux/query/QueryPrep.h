@@ -94,6 +94,9 @@ struct CostedScorers {
   std::span<int64_t> costs;
 };
 
+using ScorerBuildObserver =
+    void (*)(Query::ScorerSupplier*, Query::Scorer*, int64_t);
+
 inline std::span<Query::SegmentSource*> liveSources(MemPool& targetPool,
                                                     std::span<Query::Weight*> weights) {
   if (weights.empty()) return {};
@@ -116,12 +119,17 @@ inline std::span<Query::SegmentSource*> segmentSources(MemPool& targetPool,
 
 inline std::span<Query::Scorer*> createScorers(MemPool& targetPool,
                                                IndexReader::Segment& segment,
-                                               std::span<Query::SegmentSource* const> sources) {
+                                               std::span<Query::SegmentSource* const> sources,
+                                               ScorerBuildObserver observer = nullptr) {
   if (sources.empty()) return {};
   auto& scorers = *targetPool.make_vec<Query::Scorer*>();
   scorers.reserve(sources.size());
   for (auto* source : sources) {
-    auto* scorer = createScorer(targetPool, segment, *source);
+    auto* supplier = source->scorerSupplier(targetPool, segment);
+    if (supplier == nullptr) continue;
+    constexpr int64_t leadCost = std::numeric_limits<int64_t>::max();
+    auto* scorer = supplier->get(targetPool, leadCost);
+    if (observer != nullptr) observer(supplier, scorer, leadCost);
     if (scorer != nullptr) scorers.push_back(scorer);
   }
   return scorers;
@@ -129,7 +137,8 @@ inline std::span<Query::Scorer*> createScorers(MemPool& targetPool,
 
 inline CostedScorers createScorersWithCosts(
     MemPool& targetPool, IndexReader::Segment& segment,
-    std::span<Query::SegmentSource* const> sources) {
+    std::span<Query::SegmentSource* const> sources,
+    ScorerBuildObserver observer = nullptr) {
   if (sources.empty()) return {};
   auto scorers = targetPool.make_span<Query::Scorer*>(sources.size());
   auto costs = targetPool.make_span<int64_t>(sources.size());
@@ -138,7 +147,9 @@ inline CostedScorers createScorersWithCosts(
     auto* supplier = source->scorerSupplier(targetPool, segment);
     if (supplier == nullptr) continue;
     int64_t cost = supplier->cost();
-    auto* scorer = supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    constexpr int64_t leadCost = std::numeric_limits<int64_t>::max();
+    auto* scorer = supplier->get(targetPool, leadCost);
+    if (observer != nullptr) observer(supplier, scorer, leadCost);
     if (scorer == nullptr) continue;
     scorers[count] = scorer;
     costs[count++] = cost;
@@ -151,7 +162,8 @@ inline CostedScorers createScorersWithCosts(
 // by ascending cost.
 inline CostedScorers createScorersByCost(MemPool& targetPool,
                                          IndexReader::Segment& segment,
-                                         std::span<Query::SegmentSource* const> sources) {
+                                         std::span<Query::SegmentSource* const> sources,
+                                         ScorerBuildObserver observer = nullptr) {
   if (sources.empty()) return {};
 
   struct CostedSupplier {
@@ -174,7 +186,9 @@ inline CostedScorers createScorersByCost(MemPool& targetPool,
   auto* costs = targetPool.make_arr<int64_t>(sources.size());
   size_t count = 0;
   for (auto& c : costed) {
-    auto* scorer = c.supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    constexpr int64_t leadCost = std::numeric_limits<int64_t>::max();
+    auto* scorer = c.supplier->get(targetPool, leadCost);
+    if (observer != nullptr) observer(c.supplier, scorer, leadCost);
     if (scorer != nullptr) {
       scorers[count] = scorer;
       costs[count++] = c.cost;
@@ -320,6 +334,23 @@ public:
   DocSetSupplier(DocSet* docs, IndexReader::Segment& segment) : docs(docs), segment(segment) {}
 
   int64_t cost() override { return docs == nullptr ? 0 : (int64_t)docs->card(); }
+
+  Query::ScorerShape describeScorer(
+      const Query::ScorerBuildContext& buildContext) const override {
+    unused(buildContext);
+    return {
+      .matchState = docs == nullptr || docs->card() == 0
+          ? Query::MatchState::EMPTY
+          : Query::MatchState::NONEMPTY,
+      .directKind = Query::DirectScorerKind::DOC_SET,
+      .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+      .windowFillClause = Query::ClauseShape::DIRECT,
+      .termDisjunctionClause = Query::ClauseShape::NONE,
+      .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+      .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+      .directDocSet = Query::DirectDocSetAccess::SUPPORTED,
+    };
+  }
 
   DocSet* exactDocSet() override { return docs; }
 

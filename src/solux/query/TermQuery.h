@@ -188,6 +188,24 @@ public:
         return weight.cachedTermInfo->docFreq(segment.ord);
       }
 
+      Query::ScorerShape describeScorer(
+          const Query::ScorerBuildContext& buildContext) const override {
+        unused(buildContext);
+        return {
+          .matchState = weight.cachedTermInfo == nullptr
+                  || weight.cachedTermInfo->docFreq(segment.ord) == 0
+              ? Query::MatchState::EMPTY
+              : Query::MatchState::NONEMPTY,
+          .directKind = Query::DirectScorerKind::TERM,
+          .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+          .windowFillClause = Query::ClauseShape::DIRECT,
+          .termDisjunctionClause = Query::ClauseShape::DIRECT,
+          .independentTerm = Query::IndependentTermAccess::SUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::SUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
+      }
+
       Query::Scorer* get(solux::MemPool& targetPool, int64_t leadCost) override {
         unused(leadCost);
         return weight.createScorer(targetPool, segment);

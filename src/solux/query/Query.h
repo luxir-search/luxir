@@ -339,6 +339,83 @@ public:
     }
   };
 
+  enum class MatchState : uint8_t {
+    EMPTY,
+    NONEMPTY,
+    UNKNOWN,
+  };
+
+  enum class DirectScorerKind : uint8_t {
+    TERM,
+    DOC_SET,
+    OTHER,
+    UNKNOWN,
+  };
+
+  enum class ReportedTwoPhase : uint8_t {
+    YES,
+    NO,
+    UNKNOWN,
+  };
+
+  enum class ClauseShape : uint8_t {
+    DIRECT,
+    FLAT_DISJUNCTION,
+    NONE,
+    UNKNOWN,
+  };
+
+  enum class IndependentTermAccess : uint8_t {
+    SUPPORTED,
+    UNSUPPORTED,
+    UNKNOWN,
+  };
+
+  enum class DocsOnlyAccess : uint8_t {
+    SUPPORTED,
+    UNSUPPORTED,
+    UNKNOWN,
+  };
+
+  enum class DirectDocSetAccess : uint8_t {
+    SUPPORTED,
+    UNSUPPORTED,
+    UNKNOWN,
+  };
+
+  // Exact inputs that may affect which scorer a supplier constructs. Test
+  // controls are values captured by the caller, never read by describeScorer.
+  struct ScorerBuildContext {
+    enum class MultiTermScorerMode : uint8_t {
+      AUTO,
+      FORCE_EAGER,
+      FORCE_WINDOWED,
+      FORCE_HEAP,
+    };
+
+    int64_t leadCost = std::numeric_limits<int64_t>::max();
+    MultiTermScorerMode multiTermScorerModeForTests =
+        MultiTermScorerMode::AUTO;
+    size_t multiTermMaxLazyStateBytes = 32u << 20;
+    bool disableBooleanTwoPhaseForTests = false;
+    bool disableDisjunctionTwoPhaseForTests = false;
+    bool disableFilteredUnionWandForTests = false;
+  };
+
+  // Description of every non-null scorer produced for one build context.
+  // UNKNOWN is conservative and always legal; definite answers must describe
+  // the declared scorer protocols rather than an equivalent representation.
+  struct ScorerShape {
+    MatchState matchState = MatchState::UNKNOWN;
+    DirectScorerKind directKind = DirectScorerKind::UNKNOWN;
+    ReportedTwoPhase reportedTwoPhase = ReportedTwoPhase::UNKNOWN;
+    ClauseShape windowFillClause = ClauseShape::UNKNOWN;
+    ClauseShape termDisjunctionClause = ClauseShape::UNKNOWN;
+    IndependentTermAccess independentTerm = IndependentTermAccess::UNKNOWN;
+    DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
+    DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
+  };
+
   // Unknown and custom queries are conservatively variable-scoring.
   virtual ScoreProfile scoreProfile() const { return ScoreProfile::variable(); }
 
@@ -417,6 +494,15 @@ public:
     /// to compute; an upper bound is safe. Compound suppliers use it to choose
     /// lead iterators before creating scorers.
     virtual int64_t cost() = 0;
+
+    /// Pure description of the scorer returned by get() for this exact build
+    /// context. Implementations must not construct scorers, increment counters,
+    /// or allocate from the target pool while answering.
+    virtual ScorerShape describeScorer(
+        const ScorerBuildContext& buildContext) const {
+      unused(buildContext);
+      return {};
+    }
 
     /// Separately estimated filter and union costs for exact-count top-k
     /// composition. The default means this supplier does not expose that
@@ -959,6 +1045,11 @@ public:
     /// output and monotonic exact advance().
     virtual bool supportsWindowFilter() const {
       return false;
+    }
+    /// Record that an exclusion builder committed to this scorer's window
+    /// filter answer. Most scorers have no per-decision instrumentation.
+    virtual void recordWindowFilterCommit(bool supported) const {
+      unused(supported);
     }
     /// Optional docs-only probe specialization. WindowFilter falls back to
     /// exact advance() when an opted-in scorer does not expose one.

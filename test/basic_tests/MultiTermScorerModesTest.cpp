@@ -9,6 +9,8 @@
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "solux/query/PrefixQuery.h"
+#include "solux/query/QueryPrep.h"
+#include "solux/query/TermQuery.h"
 #include "solux/reader/DocsEnum.h"
 
 using namespace solux;
@@ -165,6 +167,44 @@ void expectSelectionAndEarlyExit(TestIndex& ti) {
   }
 }
 
+void expectTermShape(const Query::ScorerShape& shape,
+                     Query::MatchState matchState) {
+  EXPECT_EQ(matchState, shape.matchState);
+  EXPECT_EQ(Query::DirectScorerKind::TERM, shape.directKind);
+  EXPECT_EQ(Query::ReportedTwoPhase::NO, shape.reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::DIRECT, shape.windowFillClause);
+  EXPECT_EQ(Query::ClauseShape::DIRECT, shape.termDisjunctionClause);
+  EXPECT_EQ(Query::IndependentTermAccess::SUPPORTED, shape.independentTerm);
+  EXPECT_EQ(Query::DocsOnlyAccess::SUPPORTED, shape.docsOnly);
+  EXPECT_EQ(Query::DirectDocSetAccess::UNSUPPORTED, shape.directDocSet);
+}
+
+void expectDocSetShape(const Query::ScorerShape& shape,
+                       Query::MatchState matchState) {
+  EXPECT_EQ(matchState, shape.matchState);
+  EXPECT_EQ(Query::DirectScorerKind::DOC_SET, shape.directKind);
+  EXPECT_EQ(Query::ReportedTwoPhase::NO, shape.reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::DIRECT, shape.windowFillClause);
+  EXPECT_EQ(Query::ClauseShape::NONE, shape.termDisjunctionClause);
+  EXPECT_EQ(Query::IndependentTermAccess::UNSUPPORTED,
+            shape.independentTerm);
+  EXPECT_EQ(Query::DocsOnlyAccess::UNSUPPORTED, shape.docsOnly);
+  EXPECT_EQ(Query::DirectDocSetAccess::SUPPORTED, shape.directDocSet);
+}
+
+void expectMultiTermShape(const Query::ScorerShape& shape,
+                          Query::MatchState matchState) {
+  EXPECT_EQ(matchState, shape.matchState);
+  EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
+  EXPECT_EQ(Query::ReportedTwoPhase::NO, shape.reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::NONE, shape.windowFillClause);
+  EXPECT_EQ(Query::ClauseShape::NONE, shape.termDisjunctionClause);
+  EXPECT_EQ(Query::IndependentTermAccess::UNSUPPORTED,
+            shape.independentTerm);
+  EXPECT_EQ(Query::DocsOnlyAccess::UNSUPPORTED, shape.docsOnly);
+  EXPECT_EQ(Query::DirectDocSetAccess::UNSUPPORTED, shape.directDocSet);
+}
+
 }  // namespace
 
 class MultiTermScorerModesTest : public SoluxTest {};
@@ -243,6 +283,80 @@ TEST_F(MultiTermScorerModesTest, drivenSupplierSelection) {
     EXPECT_EQ(!lazy, dynamic_cast<MultiTermQuery::Scorer*>(scorer) != nullptr)
         << "flags=" << flags;
   }
+}
+
+TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, {{0, "qalpha"}, {1, "qbeta"}, {2, "other"}});
+
+  auto guard = ti.pool.rewindScopeGuard();
+  auto& segment = ti.reader->segments()[0];
+  Query::Context context(ti.pool, *ti.reader);
+  Query::ScorerBuildContext buildContext{
+      .leadCost = 1,
+  };
+
+  TermQuery presentTerm("body_w", "qalpha");
+  auto* presentWeight = presentTerm.createWeight(context, 0);
+  auto* presentSupplier = presentWeight->scorerSupplier(ti.pool, segment);
+  ASSERT_NE(nullptr, presentSupplier);
+  expectTermShape(presentSupplier->describeScorer(buildContext),
+                  Query::MatchState::NONEMPTY);
+
+  TermQuery missingTerm("body_w", "missing");
+  auto* missingWeight = missingTerm.createWeight(context, 0);
+  auto* missingSupplier = missingWeight->scorerSupplier(ti.pool, segment);
+  ASSERT_NE(nullptr, missingSupplier);
+  expectTermShape(missingSupplier->describeScorer(buildContext),
+                  Query::MatchState::EMPTY);
+
+  DocSetBuilder docsBuilder(segment.maxDoc());
+  docsBuilder.add(1);
+  auto docs = docsBuilder.build();
+  QueryPrep::DocSetSupplier docsSupplier(docs.get(), segment);
+  expectDocSetShape(docsSupplier.describeScorer(buildContext),
+                    Query::MatchState::NONEMPTY);
+  QueryPrep::DocSetSupplier nullDocsSupplier(nullptr, segment);
+  expectDocSetShape(nullDocsSupplier.describeScorer(buildContext),
+                    Query::MatchState::EMPTY);
+  DocSetBuilder emptyBuilder(segment.maxDoc());
+  auto emptyDocs = emptyBuilder.build();
+  QueryPrep::DocSetSupplier emptyDocsSupplier(emptyDocs.get(), segment);
+  expectDocSetShape(emptyDocsSupplier.describeScorer(buildContext),
+                    Query::MatchState::EMPTY);
+
+  for (ScorerMode mode : {
+           ScorerMode::AUTO,
+           ScorerMode::FORCE_EAGER,
+           ScorerMode::FORCE_WINDOWED,
+           ScorerMode::FORCE_HEAP}) {
+    ScorerModeGuard modeGuard(mode);
+    PrefixQuery prefix("body_w", "q");
+    auto* prefixWeight = prefix.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* prefixSupplier = prefixWeight->scorerSupplier(ti.pool, segment);
+    ASSERT_NE(nullptr, prefixSupplier);
+    expectMultiTermShape(
+        prefixSupplier->describeScorer(
+            MultiTermQuery::Weight::scorerBuildContext(1)),
+        Query::MatchState::UNKNOWN);
+  }
+
+  PrefixQuery emptyPrefix("body_w", "z");
+  auto* emptyPrefixWeight = emptyPrefix.createWeight(context, 0);
+  auto* emptyPrefixSupplier =
+      emptyPrefixWeight->scorerSupplier(ti.pool, segment);
+  ASSERT_NE(nullptr, emptyPrefixSupplier);
+  expectMultiTermShape(emptyPrefixSupplier->describeScorer(buildContext),
+                       Query::MatchState::UNKNOWN);
+
+  PrefixQuery absentField("missing_w", "q");
+  auto* absentWeight = absentField.createWeight(context, 0);
+  auto* absentSupplier = absentWeight->scorerSupplier(ti.pool, segment);
+  ASSERT_NE(nullptr, absentSupplier);
+  expectMultiTermShape(absentSupplier->describeScorer(buildContext),
+                       Query::MatchState::EMPTY);
 }
 
 // firstDocLowerBound is a lower bound for every term and exact below the

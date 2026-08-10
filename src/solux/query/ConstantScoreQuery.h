@@ -70,6 +70,21 @@ class ConstantScoreQuery final : public solux::Query {
 
     int64_t cost() override { return childSupplier->cost(); }
 
+    Query::ScorerShape describeScorer(
+        const Query::ScorerBuildContext& buildContext) const override {
+      Query::ScorerShape child = childSupplier->describeScorer(buildContext);
+      return {
+        .matchState = child.matchState,
+        .directKind = Query::DirectScorerKind::OTHER,
+        .reportedTwoPhase = child.reportedTwoPhase,
+        .windowFillClause = Query::ClauseShape::NONE,
+        .termDisjunctionClause = Query::ClauseShape::NONE,
+        .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+        .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+      };
+    }
+
     Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
       auto* childScorer = childSupplier->get(targetPool, leadCost);
       if (childScorer == nullptr) return nullptr;

@@ -77,7 +77,7 @@ public:
     // the production policy; the forced modes bind only where the lazy
     // preconditions hold (scored + pruning, self-driven or conjunction
     // driven), everything else stays eager.
-    enum class ScorerMode : uint8_t { AUTO, FORCE_EAGER, FORCE_WINDOWED, FORCE_HEAP };
+    using ScorerMode = Query::ScorerBuildContext::MultiTermScorerMode;
     static inline ScorerMode scorerModeForTests = ScorerMode::AUTO;
 
     // Past this many terms AUTO abandons the all-live-cursors windowed scorer
@@ -90,6 +90,14 @@ public:
     // Non-const so tests can pin the spill path without a quarter-million
     // term index.
     static inline size_t maxLazyStateBytes = 32u << 20;
+
+    static Query::ScorerBuildContext scorerBuildContext(int64_t leadCost) {
+      return {
+        .leadCost = leadCost,
+        .multiTermScorerModeForTests = scorerModeForTests,
+        .multiTermMaxLazyStateBytes = maxLazyStateBytes,
+      };
+    }
 
     Weight(Context& context, MultiTermQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags), query(query),
@@ -211,6 +219,40 @@ public:
         : weight(weight), segment(segment) {}
 
       int64_t cost() override { return segment.maxDoc(); }
+
+      Query::ScorerShape describeScorer(
+          const Query::ScorerBuildContext& buildContext) const override {
+        Query::MatchState matchState = Query::MatchState::UNKNOWN;
+        if (weight.cachedFieldInfo == nullptr
+            || weight.cachedFieldInfo->segInfos[segment.ord] == nullptr) {
+          matchState = Query::MatchState::EMPTY;
+        }
+        Query::ScorerShape shape{
+          .matchState = matchState,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+          .windowFillClause = Query::ClauseShape::NONE,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
+        if (!weight.canUseLazy) {
+          return shape;
+        }
+        switch (buildContext.multiTermScorerModeForTests) {
+          case ScorerMode::FORCE_WINDOWED:
+          case ScorerMode::FORCE_HEAP:
+          case ScorerMode::FORCE_EAGER:
+            return shape;
+          case ScorerMode::AUTO:
+            // Retained-state overflow may switch AUTO to the eager scorer,
+            // but all current alternatives expose the same declared shape.
+            unused(buildContext.multiTermMaxLazyStateBytes);
+            return shape;
+        }
+        std::unreachable();
+      }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         // Driven consumption keeps the lazy union: windows fill only at

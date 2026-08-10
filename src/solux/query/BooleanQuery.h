@@ -11,6 +11,7 @@
 #include "AllQuery.h"
 #include "BoostQuery.h"
 #include "ConstantScoreQuery.h"
+#include "MultiTermQuery.h"
 #include "PhraseQuery.h"
 #include "TermQuery.h"
 #include "ScoreCompact.h"
@@ -811,6 +812,137 @@ public:
       size_t scoringCount;
     };
 
+    static Query::ScorerBuildContext scorerBuildContext(int64_t leadCost) {
+      Query::ScorerBuildContext buildContext =
+          MultiTermQuery::Weight::scorerBuildContext(leadCost);
+      buildContext.disableBooleanTwoPhaseForTests =
+          disableTwoPhaseForTests;
+      buildContext.disableDisjunctionTwoPhaseForTests =
+          DisjunctionScorer::disableDisjTwoPhaseForTests;
+      buildContext.disableFilteredUnionWandForTests =
+          disableFilteredUnionWandForTests;
+      return buildContext;
+    }
+
+#ifndef NDEBUG
+    static void assertScorerShape(
+        Query::ScorerSupplier* supplier, Query::Scorer* scorer,
+        const Query::ScorerBuildContext& buildContext) {
+      assert(supplier != nullptr);
+      Query::ScorerShape shape = supplier->describeScorer(buildContext);
+      if (scorer == nullptr) {
+        assert(shape.matchState != Query::MatchState::NONEMPTY);
+        return;
+      }
+
+      assert(shape.matchState != Query::MatchState::EMPTY);
+      bool directTerm = dynamic_cast<TermQuery::Scorer*>(scorer) != nullptr;
+      bool directDocSet =
+          dynamic_cast<QueryPrep::DocSetScorer*>(scorer) != nullptr;
+      switch (shape.directKind) {
+        case Query::DirectScorerKind::TERM:
+          assert(directTerm);
+          break;
+        case Query::DirectScorerKind::DOC_SET:
+          assert(directDocSet);
+          break;
+        case Query::DirectScorerKind::OTHER:
+          assert(!directTerm && !directDocSet);
+          break;
+        case Query::DirectScorerKind::UNKNOWN:
+          break;
+      }
+
+      switch (shape.reportedTwoPhase) {
+        case Query::ReportedTwoPhase::YES:
+          assert(scorer->hasTwoPhase());
+          break;
+        case Query::ReportedTwoPhase::NO:
+          assert(!scorer->hasTwoPhase());
+          break;
+        case Query::ReportedTwoPhase::UNKNOWN:
+          break;
+      }
+
+      bool directWindowFill = scorer->supportsWindowFilter();
+      auto disjunctionMembers = scorer->flatDisjunctionScorers();
+      bool flatWindowFill = !disjunctionMembers.empty()
+          && std::all_of(
+              disjunctionMembers.begin(), disjunctionMembers.end(),
+              [](Query::Scorer* member) {
+                return member->supportsWindowFilter();
+              });
+      switch (shape.windowFillClause) {
+        case Query::ClauseShape::DIRECT:
+          assert(directWindowFill);
+          break;
+        case Query::ClauseShape::FLAT_DISJUNCTION:
+          assert(!directWindowFill && flatWindowFill);
+          break;
+        case Query::ClauseShape::NONE:
+          assert(!directWindowFill && !flatWindowFill);
+          break;
+        case Query::ClauseShape::UNKNOWN:
+          break;
+      }
+
+      bool flatTermDisjunction = !disjunctionMembers.empty()
+          && std::all_of(
+              disjunctionMembers.begin(), disjunctionMembers.end(),
+              [](Query::Scorer* member) {
+                return dynamic_cast<TermQuery::Scorer*>(member) != nullptr;
+              });
+      switch (shape.termDisjunctionClause) {
+        case Query::ClauseShape::DIRECT:
+          assert(directTerm);
+          break;
+        case Query::ClauseShape::FLAT_DISJUNCTION:
+          assert(!directTerm && flatTermDisjunction);
+          break;
+        case Query::ClauseShape::NONE:
+          assert(!directTerm && !flatTermDisjunction);
+          break;
+        case Query::ClauseShape::UNKNOWN:
+          break;
+      }
+
+      bool termSupplier =
+          dynamic_cast<TermQuery::Weight::Supplier*>(supplier) != nullptr;
+      bool docSetSupplier =
+          dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr;
+      switch (shape.independentTerm) {
+        case Query::IndependentTermAccess::SUPPORTED:
+          assert(termSupplier);
+          break;
+        case Query::IndependentTermAccess::UNSUPPORTED:
+          assert(!termSupplier);
+          break;
+        case Query::IndependentTermAccess::UNKNOWN:
+          break;
+      }
+      switch (shape.docsOnly) {
+        case Query::DocsOnlyAccess::SUPPORTED:
+          assert(termSupplier);
+          break;
+        case Query::DocsOnlyAccess::UNSUPPORTED:
+          assert(!termSupplier);
+          break;
+        case Query::DocsOnlyAccess::UNKNOWN:
+          break;
+      }
+      switch (shape.directDocSet) {
+        case Query::DirectDocSetAccess::SUPPORTED:
+          assert(docSetSupplier);
+          break;
+        case Query::DirectDocSetAccess::UNSUPPORTED:
+          assert(!docSetSupplier);
+          break;
+        case Query::DirectDocSetAccess::UNKNOWN:
+          break;
+      }
+    }
+#endif
+
     // Build the required-clause conjunction. Mandatory clauses score; filter
     // clauses only constrain iteration. Required clauses are ordered by
     // ascending supplier cost so the sparsest leads the conjunction, and that
@@ -863,7 +995,14 @@ public:
       size_t allCount = 0;
       size_t scoringCount = 0;
       for (auto& e : entries) {
+#ifndef NDEBUG
+        Query::ScorerBuildContext buildContext =
+            scorerBuildContext(leadCost);
+#endif
         auto* scorer = e.supplier->get(targetPool, leadCost);
+#ifndef NDEBUG
+        assertScorerShape(e.supplier, scorer, buildContext);
+#endif
         if (scorer == nullptr) return {nullptr, true, 0, 0};
         all[allCount] = scorer;
         costs[allCount++] = e.cost;
@@ -894,6 +1033,15 @@ public:
         bool needsScores,
         bool externallyDriven,
         bool allowsPruning) {
+      QueryPrep::ScorerBuildObserver buildObserver = nullptr;
+#ifndef NDEBUG
+      buildObserver = [](Query::ScorerSupplier* supplier,
+                         Query::Scorer* scorer, int64_t leadCost) {
+        Query::ScorerBuildContext buildContext =
+            scorerBuildContext(leadCost);
+        assertScorerShape(supplier, scorer, buildContext);
+      };
+#endif
       Required req = assembleRequired(
           targetPool, segment, mandatorySources, mandatoryScores,
           filterSuppliers, allowsPruning);
@@ -912,11 +1060,14 @@ public:
       // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
       QueryPrep::CostedScorers optional;
       if (minShouldMatch > 1) {
-        optional = QueryPrep::createScorersByCost(targetPool, segment, optionalSources);
+        optional = QueryPrep::createScorersByCost(
+            targetPool, segment, optionalSources, buildObserver);
       } else if (minShouldMatch == 1) {
-        optional = QueryPrep::createScorersWithCosts(targetPool, segment, optionalSources);
+        optional = QueryPrep::createScorersWithCosts(
+            targetPool, segment, optionalSources, buildObserver);
       } else {
-        optional.scorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
+        optional.scorers = QueryPrep::createScorers(
+            targetPool, segment, optionalSources, buildObserver);
       }
       auto optionalScorers = optional.scorers;
       auto optionalCosts = optional.costs;
@@ -1023,7 +1174,8 @@ public:
             targetPool, allSpan, allCosts, scoringSpan, allowsPruning);
       }
 
-      auto prohibitedScorers = QueryPrep::createScorers(targetPool, segment, prohibitedSources);
+      auto prohibitedScorers = QueryPrep::createScorers(
+          targetPool, segment, prohibitedSources, buildObserver);
       if (!prohibitedScorers.empty()) {
         Query::Scorer* prohibitedScorer = prohibitedScorers.size() == 1
           ? prohibitedScorers[0]
@@ -1108,10 +1260,264 @@ public:
       std::span<Query::SegmentSource* const> optionalSources;
       std::span<Query::SegmentSource* const> prohibitedSources;
       std::span<Query::ScorerSupplier* const> filterSuppliers;
+      std::span<Query::ScorerSupplier* const> mandatoryShapeSuppliers;
+      std::span<Query::ScorerSupplier* const> optionalShapeSuppliers;
+      std::span<Query::ScorerSupplier* const> prohibitedShapeSuppliers;
+      int64_t shapeRequiredCost;
       int minShouldMatch;
       bool needsScores;
       bool allowsPruning;
       bool twoPhaseDisjunctionPull = false;
+
+      static Query::ScorerShape emptyShape() {
+        Query::ScorerShape shape;
+        shape.matchState = Query::MatchState::EMPTY;
+        return shape;
+      }
+
+      static Query::ScorerShape opaqueShape(
+          Query::MatchState matchState,
+          Query::ReportedTwoPhase reportedTwoPhase =
+              Query::ReportedTwoPhase::NO) {
+        return {
+          .matchState = matchState,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = reportedTwoPhase,
+          .windowFillClause = Query::ClauseShape::NONE,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
+      }
+
+      static Query::ScorerShape maskSupplierAccess(
+          Query::ScorerShape shape) {
+        shape.independentTerm =
+            Query::IndependentTermAccess::UNSUPPORTED;
+        shape.docsOnly = Query::DocsOnlyAccess::UNSUPPORTED;
+        shape.directDocSet = Query::DirectDocSetAccess::UNSUPPORTED;
+        return shape;
+      }
+
+      static Query::MatchState requiredMatchState(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        Query::MatchState state = Query::MatchState::NONEMPTY;
+        for (auto* supplier : suppliers) {
+          if (supplier == nullptr) return Query::MatchState::EMPTY;
+          Query::MatchState member =
+              supplier->describeScorer(buildContext).matchState;
+          if (member == Query::MatchState::EMPTY) {
+            return Query::MatchState::EMPTY;
+          }
+          if (member == Query::MatchState::UNKNOWN) {
+            state = Query::MatchState::UNKNOWN;
+          }
+        }
+        return state;
+      }
+
+      static bool hasUnknownElision(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        for (auto* supplier : suppliers) {
+          if (supplier != nullptr
+              && supplier->describeScorer(buildContext).matchState
+                  == Query::MatchState::UNKNOWN) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      static size_t nonemptyCount(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        size_t count = 0;
+        for (auto* supplier : suppliers) {
+          if (supplier != nullptr
+              && supplier->describeScorer(buildContext).matchState
+                  == Query::MatchState::NONEMPTY) {
+            count++;
+          }
+        }
+        return count;
+      }
+
+      static Query::ReportedTwoPhase disjunctionTwoPhase(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext) {
+        if (buildContext.disableBooleanTwoPhaseForTests
+            || buildContext.disableDisjunctionTwoPhaseForTests) {
+          return Query::ReportedTwoPhase::NO;
+        }
+        bool unknown = false;
+        for (auto* supplier : suppliers) {
+          if (supplier == nullptr) continue;
+          Query::ScorerShape member =
+              supplier->describeScorer(buildContext);
+          if (member.matchState != Query::MatchState::NONEMPTY) continue;
+          if (member.reportedTwoPhase == Query::ReportedTwoPhase::YES) {
+            return Query::ReportedTwoPhase::YES;
+          }
+          unknown |= member.reportedTwoPhase
+              == Query::ReportedTwoPhase::UNKNOWN;
+        }
+        return unknown ? Query::ReportedTwoPhase::UNKNOWN
+                       : Query::ReportedTwoPhase::NO;
+      }
+
+      static Query::ClauseShape flatClauseShape(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::ScorerBuildContext& buildContext,
+          bool windowFill) {
+        bool unknown = false;
+        for (auto* supplier : suppliers) {
+          if (supplier == nullptr) continue;
+          Query::ScorerShape member =
+              supplier->describeScorer(buildContext);
+          if (member.matchState != Query::MatchState::NONEMPTY) continue;
+          bool direct = windowFill
+              ? member.windowFillClause == Query::ClauseShape::DIRECT
+              : member.directKind == Query::DirectScorerKind::TERM;
+          if (direct) continue;
+          bool memberUnknown = windowFill
+              ? member.windowFillClause == Query::ClauseShape::UNKNOWN
+              : member.directKind == Query::DirectScorerKind::UNKNOWN;
+          if (!memberUnknown) return Query::ClauseShape::NONE;
+          unknown = true;
+        }
+        return unknown ? Query::ClauseShape::UNKNOWN
+                       : Query::ClauseShape::FLAT_DISJUNCTION;
+      }
+
+      Query::ScorerShape requiredShape(
+          const Query::ScorerBuildContext& buildContext) const {
+        size_t requiredCount =
+            mandatoryShapeSuppliers.size() + filterSuppliers.size();
+        if (requiredCount == 0) return emptyShape();
+
+        Query::MatchState state =
+            requiredMatchState(mandatoryShapeSuppliers, buildContext);
+        if (state != Query::MatchState::EMPTY) {
+          Query::MatchState filters =
+              requiredMatchState(filterSuppliers, buildContext);
+          if (filters == Query::MatchState::EMPTY) {
+            state = Query::MatchState::EMPTY;
+          } else if (filters == Query::MatchState::UNKNOWN) {
+            state = Query::MatchState::UNKNOWN;
+          }
+        }
+        if (state == Query::MatchState::EMPTY) return emptyShape();
+
+        if (requiredCount == 1 && mandatoryShapeSuppliers.size() == 1
+            && mandatoryScores[0] != 0) {
+          return mandatoryShapeSuppliers[0]->describeScorer(buildContext);
+        }
+        return opaqueShape(state);
+      }
+
+      std::optional<bool> directWindowFilters(
+          const Query::ScorerBuildContext& buildContext) const {
+        if (!mandatorySources.empty() || filterSuppliers.empty()) return false;
+        for (auto* supplier : filterSuppliers) {
+          if (supplier == nullptr) return false;
+          Query::ScorerShape shape = supplier->describeScorer(buildContext);
+          if (shape.windowFillClause == Query::ClauseShape::UNKNOWN) {
+            return std::nullopt;
+          }
+          if (shape.windowFillClause != Query::ClauseShape::DIRECT) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      Query::ScorerShape optionalShape(
+          const Query::ScorerBuildContext& buildContext,
+          bool hasRequired) const {
+        size_t count = nonemptyCount(optionalShapeSuppliers, buildContext);
+        if (count == 0 || (minShouldMatch > 1
+                           && count < (size_t) minShouldMatch)) {
+          return emptyShape();
+        }
+        if (count == 1 && minShouldMatch <= 1) {
+          for (auto* supplier : optionalShapeSuppliers) {
+            if (supplier != nullptr) {
+              Query::ScorerShape shape =
+                  supplier->describeScorer(buildContext);
+              if (shape.matchState == Query::MatchState::NONEMPTY) {
+                return shape;
+              }
+            }
+          }
+          std::unreachable();
+        }
+
+        if (minShouldMatch > 1) {
+          return opaqueShape(Query::MatchState::NONEMPTY);
+        }
+
+        Query::ClauseShape termShape = flatClauseShape(
+            optionalShapeSuppliers, buildContext, false);
+        std::optional<bool> directFilters =
+            directWindowFilters(buildContext);
+        bool filteredUnionWandCandidate =
+            !buildContext.disableFilteredUnionWandForTests
+            && needsScores && minShouldMatch == 1
+            && mandatorySources.empty() && prohibitedSources.empty()
+            && filterDensityRoutesToPull(
+                shapeRequiredCost, segment.maxDoc());
+        if (filteredUnionWandCandidate
+            && (!directFilters.has_value()
+                || termShape == Query::ClauseShape::UNKNOWN)) {
+          Query::ScorerShape shape;
+          shape.matchState = Query::MatchState::NONEMPTY;
+          shape.directKind = Query::DirectScorerKind::OTHER;
+          return shape;
+        }
+        bool useFilteredUnionWand = filteredUnionWandCandidate
+            && *directFilters
+            && termShape == Query::ClauseShape::FLAT_DISJUNCTION;
+        bool plainExternalDisjunction =
+            buildContext.leadCost != std::numeric_limits<int64_t>::max()
+            && needsScores && !hasRequired && prohibitedSources.empty()
+            && minShouldMatch <= 1;
+        bool useMaxScoreDisjunction = needsScores && !hasRequired
+            && prohibitedSources.empty() && minShouldMatch <= 1
+            && !plainExternalDisjunction;
+        if (useFilteredUnionWand || useMaxScoreDisjunction) {
+          return opaqueShape(Query::MatchState::NONEMPTY);
+        }
+
+        Query::ScorerShape shape = opaqueShape(
+            Query::MatchState::NONEMPTY,
+            disjunctionTwoPhase(optionalShapeSuppliers, buildContext));
+        shape.windowFillClause = flatClauseShape(
+            optionalShapeSuppliers, buildContext, true);
+        shape.termDisjunctionClause = flatClauseShape(
+            optionalShapeSuppliers, buildContext, false);
+        return shape;
+      }
+
+      static Query::ReportedTwoPhase mandOptTwoPhase(
+          Query::ScorerShape required, Query::ScorerShape optional,
+          const Query::ScorerBuildContext& buildContext) {
+        if (buildContext.disableBooleanTwoPhaseForTests) {
+          return Query::ReportedTwoPhase::NO;
+        }
+        if (required.reportedTwoPhase == Query::ReportedTwoPhase::YES
+            || optional.reportedTwoPhase == Query::ReportedTwoPhase::YES) {
+          return Query::ReportedTwoPhase::YES;
+        }
+        if (required.reportedTwoPhase == Query::ReportedTwoPhase::NO
+            && optional.reportedTwoPhase == Query::ReportedTwoPhase::NO) {
+          return Query::ReportedTwoPhase::NO;
+        }
+        return Query::ReportedTwoPhase::UNKNOWN;
+      }
+
     public:
       Supplier(MemPool& pool, IndexReader::Segment& segment,
                std::span<Query::SegmentSource* const> mandatorySources,
@@ -1119,17 +1525,74 @@ public:
                std::span<Query::SegmentSource* const> optionalSources,
                std::span<Query::SegmentSource* const> prohibitedSources,
                std::span<Query::ScorerSupplier* const> filterSuppliers,
+               std::span<Query::ScorerSupplier* const>
+                   mandatoryShapeSuppliers,
+               std::span<Query::ScorerSupplier* const>
+                   optionalShapeSuppliers,
+               std::span<Query::ScorerSupplier* const>
+                   prohibitedShapeSuppliers,
+               int64_t shapeRequiredCost,
                int minShouldMatch,
                bool needsScores,
                bool allowsPruning)
         : pool(pool), segment(segment), mandatorySources(mandatorySources),
           mandatoryScores(mandatoryScores),
           optionalSources(optionalSources), prohibitedSources(prohibitedSources),
-          filterSuppliers(filterSuppliers), minShouldMatch(minShouldMatch),
+          filterSuppliers(filterSuppliers),
+          mandatoryShapeSuppliers(mandatoryShapeSuppliers),
+          optionalShapeSuppliers(optionalShapeSuppliers),
+          prohibitedShapeSuppliers(prohibitedShapeSuppliers),
+          shapeRequiredCost(shapeRequiredCost),
+          minShouldMatch(minShouldMatch),
           needsScores(needsScores), allowsPruning(allowsPruning) {}
 
       int64_t cost() override {
         return compositeCost(pool, segment, mandatorySources, optionalSources, filterSuppliers, minShouldMatch);
+      }
+
+      Query::ScorerShape describeScorer(
+          const Query::ScorerBuildContext& buildContext) const override {
+        bool hasRequired = !mandatorySources.empty()
+            || !filterSuppliers.empty();
+        Query::ScorerShape required = requiredShape(buildContext);
+        if (hasRequired
+            && required.matchState == Query::MatchState::EMPTY) {
+          return maskSupplierAccess(required);
+        }
+        if (hasUnknownElision(optionalShapeSuppliers, buildContext)) {
+          return maskSupplierAccess({});
+        }
+
+        Query::ScorerShape optional =
+            optionalShape(buildContext, hasRequired);
+        bool optionalsConstrain = minShouldMatch >= 1 || !hasRequired;
+        Query::ScorerShape positive;
+        if (!hasRequired) {
+          positive = optional;
+        } else if (optional.matchState == Query::MatchState::EMPTY) {
+          if (optionalsConstrain && !optionalSources.empty()) {
+            positive = emptyShape();
+          } else {
+            positive = required;
+          }
+        } else if (!optionalsConstrain) {
+          Query::MatchState state = required.matchState;
+          positive = opaqueShape(
+              state, mandOptTwoPhase(required, optional, buildContext));
+        } else {
+          positive = opaqueShape(required.matchState);
+        }
+        if (positive.matchState == Query::MatchState::EMPTY) {
+          return maskSupplierAccess(positive);
+        }
+
+        if (hasUnknownElision(prohibitedShapeSuppliers, buildContext)) {
+          return maskSupplierAccess({});
+        }
+        if (nonemptyCount(prohibitedShapeSuppliers, buildContext) != 0) {
+          positive = opaqueShape(positive.matchState);
+        }
+        return maskSupplierAccess(positive);
       }
 
       DocSet* exactDocSet() override {
@@ -1404,7 +1867,14 @@ public:
                 optionalGroupSuppliers.size());
             size_t memberCount = 0;
             for (auto* supplier : optionalGroupSuppliers) {
+#ifndef NDEBUG
+              Query::ScorerBuildContext buildContext =
+                  scorerBuildContext(leadCost);
+#endif
               auto* member = supplier->get(targetPool, leadCost);
+#ifndef NDEBUG
+              assertScorerShape(supplier, member, buildContext);
+#endif
               if (member != nullptr) {
                 members[memberCount++] = member;
               }
@@ -1418,7 +1888,14 @@ public:
                   targetPool,
                   std::span<Query::Scorer*>(members, memberCount));
           } else {
+#ifndef NDEBUG
+            Query::ScorerBuildContext buildContext =
+                scorerBuildContext(leadCost);
+#endif
             scorer = entries[i].supplier->get(targetPool, leadCost);
+#ifndef NDEBUG
+            assertScorerShape(entries[i].supplier, scorer, buildContext);
+#endif
           }
           if (scorer == nullptr
               || (mode != ConjunctionMode::EXHAUSTIVE
@@ -1516,7 +1993,14 @@ public:
             if (supplier == nullptr) {
               continue;
             }
+#ifndef NDEBUG
+            Query::ScorerBuildContext buildContext =
+                scorerBuildContext(leadCost);
+#endif
             auto* scorer = supplier->get(targetPool, leadCost);
+#ifndef NDEBUG
+            assertScorerShape(supplier, scorer, buildContext);
+#endif
             if (scorer != nullptr) {
               prohibitedArr[prohibitedCount++] = scorer;
             }
@@ -1529,7 +2013,14 @@ public:
             if (supplier == nullptr) {
               continue;
             }
+#ifndef NDEBUG
+            Query::ScorerBuildContext buildContext =
+                scorerBuildContext(leadCost);
+#endif
             auto* scorer = supplier->get(targetPool, leadCost);
+#ifndef NDEBUG
+            assertScorerShape(supplier, scorer, buildContext);
+#endif
             if (scorer == nullptr) {
               continue;
             }
@@ -1730,7 +2221,9 @@ public:
             if (scorer == nullptr) {
               continue;
             }
-            if (scorer->supportsWindowFilter()) {
+            bool supportsWindowFilter = scorer->supportsWindowFilter();
+            scorer->recordWindowFilterCommit(supportsWindowFilter);
+            if (supportsWindowFilter) {
               exclusions.push_back(scorer);
               continue;
             }
@@ -1740,7 +2233,9 @@ public:
             if (members.empty()
                 || !std::all_of(
                     members.begin(), members.end(), [](Query::Scorer* member) {
-                      return member->supportsWindowFilter();
+                      bool supported = member->supportsWindowFilter();
+                      member->recordWindowFilterCommit(supported);
+                      return supported;
                     })) {
               skipCount(SkipStats::bulkExclusionUnsupportedFallbacks);
               skipCount(SkipStats::bulkBuiltThenRejected);
@@ -2024,7 +2519,7 @@ public:
           bodySupplier = optionalSources[0]->scorerSupplier(
               targetPool, segment);
         } else {
-          bodySupplier = targetPool.make<Supplier>(
+          bodySupplier = makeSupplier(
               targetPool, segment, mandatorySources, mandatoryScores,
               optionalSources,
               std::span<Query::SegmentSource* const>{},
@@ -2370,10 +2865,28 @@ public:
         auto* child = mandatorySources[0]->scorerSupplier(targetPool, segment);
         if (child != nullptr) return child;
       }
+      auto mandatoryShapeSuppliers = QueryPrep::collectSuppliers(
+          targetPool, segment, mandatorySources);
+      auto optionalShapeSuppliers = QueryPrep::collectSuppliers(
+          targetPool, segment, optionalSources);
+      auto prohibitedShapeSuppliers = QueryPrep::collectSuppliers(
+          targetPool, segment, prohibitedSources);
+      int64_t shapeRequiredCost = segment.maxDoc();
+      for (auto* supplier : mandatoryShapeSuppliers) {
+        if (supplier != nullptr) {
+          shapeRequiredCost = std::min(shapeRequiredCost, supplier->cost());
+        }
+      }
+      for (auto* supplier : filterSuppliers) {
+        if (supplier != nullptr) {
+          shapeRequiredCost = std::min(shapeRequiredCost, supplier->cost());
+        }
+      }
       return targetPool.make<Supplier>(
         targetPool, segment, mandatorySources, mandatoryScores, optionalSources,
-        prohibitedSources, filterSuppliers, minShouldMatch, needsScores,
-        allowsPruning);
+        prohibitedSources, filterSuppliers, mandatoryShapeSuppliers,
+        optionalShapeSuppliers, prohibitedShapeSuppliers, shapeRequiredCost,
+        minShouldMatch, needsScores, allowsPruning);
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
@@ -6488,12 +7001,18 @@ public:
       bool allDenseProhibited = true;
       for (size_t i = 0; i < prohibitedScorers.size(); i++) {
         std::span<Query::Scorer*> denseMembers;
-        if (prohibitedScorers[i]->supportsWindowFilter()) {
+        bool supportsWindowFilter =
+            prohibitedScorers[i]->supportsWindowFilter();
+        prohibitedScorers[i]->recordWindowFilterCommit(
+            supportsWindowFilter);
+        if (supportsWindowFilter) {
           denseMembers = prohibitedScorers.subspan(i, 1);
         } else if (!disableDisjGroupBulkForTests) {
           denseMembers = prohibitedScorers[i]->flatDisjunctionScorers();
           for (Query::Scorer* member : denseMembers) {
-            if (!member->supportsWindowFilter()) {
+            bool memberSupports = member->supportsWindowFilter();
+            member->recordWindowFilterCommit(memberSupports);
+            if (!memberSupports) {
               denseMembers = {};
               break;
             }

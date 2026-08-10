@@ -186,6 +186,15 @@ public:
 
     int64_t cost() override { return estimatedCost; }
 
+    // Deliberately all-UNKNOWN: the produced scorer arm (sparse verify vs
+    // materialized points) depends on leadCost and BKD availability, and a
+    // falsely definite answer would poison route planning.
+    Query::ScorerShape describeScorer(
+        const Query::ScorerBuildContext& buildContext) const override {
+      unused(buildContext);
+      return {};
+    }
+
     Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
       if (leadCost < cost()) {
         skipCount(SkipStats::geoSparseVerifyArms);
