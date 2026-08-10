@@ -34,6 +34,20 @@ public:
   }
 };
 
+class DenseFillGuard {
+  bool saved;
+
+public:
+  explicit DenseFillGuard(bool disabled)
+    : saved(MultiTermQuery::disableDenseFillForTests) {
+    MultiTermQuery::disableDenseFillForTests = disabled;
+  }
+
+  ~DenseFillGuard() {
+    MultiTermQuery::disableDenseFillForTests = saved;
+  }
+};
+
 // Every term starts with "q" so one prefix query unions the whole corpus.
 void buildCorpus(TestField& field, const std::map<int32_t, std::string>& docs) {
   field.startIndexing();
@@ -193,11 +207,12 @@ void expectDocSetShape(const Query::ScorerShape& shape,
 }
 
 void expectMultiTermShape(const Query::ScorerShape& shape,
-                          Query::MatchState matchState) {
+                          Query::MatchState matchState,
+                          Query::ClauseShape windowFillClause) {
   EXPECT_EQ(matchState, shape.matchState);
   EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
   EXPECT_EQ(Query::ReportedTwoPhase::NO, shape.reportedTwoPhase);
-  EXPECT_EQ(Query::ClauseShape::NONE, shape.windowFillClause);
+  EXPECT_EQ(windowFillClause, shape.windowFillClause);
   EXPECT_EQ(Query::ClauseShape::NONE, shape.termDisjunctionClause);
   EXPECT_EQ(Query::IndependentTermAccess::UNSUPPORTED,
             shape.independentTerm);
@@ -326,11 +341,17 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
   expectDocSetShape(emptyDocsSupplier.describeScorer(buildContext),
                     Query::MatchState::EMPTY);
 
-  for (ScorerMode mode : {
-           ScorerMode::AUTO,
-           ScorerMode::FORCE_EAGER,
-           ScorerMode::FORCE_WINDOWED,
-           ScorerMode::FORCE_HEAP}) {
+  struct ModeShape {
+    ScorerMode mode;
+    Query::ClauseShape windowFillClause;
+  };
+  for (auto [mode, windowFillClause] : {
+           // AUTO may overflow retained state into the eager fill-capable
+           // scorer, so its fill answer is open rather than a definite NONE.
+           ModeShape{ScorerMode::AUTO, Query::ClauseShape::UNKNOWN},
+           ModeShape{ScorerMode::FORCE_EAGER, Query::ClauseShape::DIRECT},
+           ModeShape{ScorerMode::FORCE_WINDOWED, Query::ClauseShape::NONE},
+           ModeShape{ScorerMode::FORCE_HEAP, Query::ClauseShape::NONE}}) {
     ScorerModeGuard modeGuard(mode);
     PrefixQuery prefix("body_w", "q");
     auto* prefixWeight = prefix.createWeight(
@@ -340,7 +361,20 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
     expectMultiTermShape(
         prefixSupplier->describeScorer(
             MultiTermQuery::Weight::scorerBuildContext(1)),
-        Query::MatchState::UNKNOWN);
+        Query::MatchState::UNKNOWN, windowFillClause);
+  }
+
+  {
+    DenseFillGuard denseFillGuard(true);
+    ScorerModeGuard modeGuard(ScorerMode::FORCE_EAGER);
+    PrefixQuery prefix("body_w", "q");
+    auto* prefixWeight = prefix.createWeight(context, 0);
+    auto* prefixSupplier = prefixWeight->scorerSupplier(ti.pool, segment);
+    ASSERT_NE(nullptr, prefixSupplier);
+    expectMultiTermShape(
+        prefixSupplier->describeScorer(
+            MultiTermQuery::Weight::scorerBuildContext(1)),
+        Query::MatchState::UNKNOWN, Query::ClauseShape::NONE);
   }
 
   PrefixQuery emptyPrefix("body_w", "z");
@@ -349,14 +383,48 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
       emptyPrefixWeight->scorerSupplier(ti.pool, segment);
   ASSERT_NE(nullptr, emptyPrefixSupplier);
   expectMultiTermShape(emptyPrefixSupplier->describeScorer(buildContext),
-                       Query::MatchState::UNKNOWN);
+                       Query::MatchState::UNKNOWN,
+                       Query::ClauseShape::DIRECT);
 
   PrefixQuery absentField("missing_w", "q");
   auto* absentWeight = absentField.createWeight(context, 0);
   auto* absentSupplier = absentWeight->scorerSupplier(ti.pool, segment);
   ASSERT_NE(nullptr, absentSupplier);
   expectMultiTermShape(absentSupplier->describeScorer(buildContext),
-                       Query::MatchState::EMPTY);
+                       Query::MatchState::EMPTY,
+                       Query::ClauseShape::DIRECT);
+}
+
+TEST_F(MultiTermScorerModesTest, eagerWindowFillCopiesUnalignedMaskedRange) {
+  constexpr int32_t maxDoc = 192;
+  uint64_t words[FixedBitSet::sizeInWords(maxDoc)] = {};
+  FixedBitSet bits(words, maxDoc);
+  for (int32_t doc : {0, 60, 61, 63, 64, 65, 92, 124, 125, 126,
+                      127, 128, 137, 138, 139, 190}) {
+    bits.set(doc);
+  }
+
+  DenseFillGuard denseFillGuard(false);
+  MultiTermQuery::Scorer scorer(bits, maxDoc, 1.0f);
+  ASSERT_TRUE(scorer.supportsWindowFilter());
+  EXPECT_EQ(nullptr, scorer.windowFilterProbeDocsEnum());
+
+  constexpr int32_t windowStart = 61;
+  constexpr int32_t windowEnd = 139;
+  uint64_t windowWords[2] = {1ULL << 5, 0};
+  scorer.fillWindowBits(windowWords, windowStart, windowEnd);
+
+  for (int32_t relative = 0; relative < 128; relative++) {
+    bool expected = relative == 5
+        || (relative < windowEnd - windowStart
+            && bits.get(windowStart + relative));
+    EXPECT_EQ(expected,
+              (windowWords[relative >> 6] & (1ULL << (relative & 63))) != 0)
+        << "relative=" << relative;
+  }
+
+  DenseFillGuard disabledGuard(true);
+  EXPECT_FALSE(scorer.supportsWindowFilter());
 }
 
 // firstDocLowerBound is a lower bound for every term and exact below the

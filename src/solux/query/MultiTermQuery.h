@@ -21,6 +21,8 @@ protected:
   std::string_view field;
 
 public:
+  static inline bool disableDenseFillForTests = false;
+
   explicit MultiTermQuery(std::string_view field) : field(field) {}
 
   std::string_view getField() const { return field; }
@@ -61,6 +63,34 @@ public:
       return advanceTo(target);
     }
     int32_t docId() override { return docid; }
+
+    bool supportsWindowFilter() const override {
+      return !disableDenseFillForTests;
+    }
+
+    void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
+                        int32_t windowEnd) override {
+      assert(windowStart >= 0 && windowEnd >= windowStart && windowEnd <= maxDoc);
+      if (windowEnd <= windowStart) return;
+
+      int32_t bitCount = windowEnd - windowStart;
+      int32_t words = (bitCount + 63) >> 6;
+      int32_t sourceWord = windowStart >> 6;
+      int32_t shift = windowStart & 63;
+      int32_t sourceWords = (int32_t) FixedBitSet::sizeInWords(maxDoc);
+      for (int32_t i = 0; i < words; i++) {
+        uint64_t sourceBits = bits.words[sourceWord + i] >> shift;
+        if (shift != 0 && sourceWord + i + 1 < sourceWords) {
+          sourceBits |= bits.words[sourceWord + i + 1] << (64 - shift);
+        }
+        if (i + 1 == words && (bitCount & 63) != 0) {
+          sourceBits &= (1ULL << (bitCount & 63)) - 1ULL;
+        }
+        windowBits[(size_t) i] |= sourceBits;
+      }
+    }
+
+    DocsFreqEnum* windowFilterProbeDocsEnum() override { return nullptr; }
 
   protected:
     void exhaust() override { maxDoc = 0; }
@@ -237,9 +267,13 @@ public:
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
         };
-        if (!weight.canUseLazy) {
-          return shape;
+        bool eagerGuaranteed = !weight.canUseLazy
+            || buildContext.multiTermScorerModeForTests
+                == ScorerMode::FORCE_EAGER;
+        if (eagerGuaranteed && !disableDenseFillForTests) {
+          shape.windowFillClause = Query::ClauseShape::DIRECT;
         }
+        if (!weight.canUseLazy) return shape;
         switch (buildContext.multiTermScorerModeForTests) {
           case ScorerMode::FORCE_WINDOWED:
           case ScorerMode::FORCE_HEAP:
@@ -247,8 +281,12 @@ public:
             return shape;
           case ScorerMode::AUTO:
             // Retained-state overflow may switch AUTO to the eager scorer,
-            // but all current alternatives expose the same declared shape.
+            // which fills windows; the lazy scorers do not. NONE would be a
+            // falsely definite claim, so the fill answer stays open.
             unused(buildContext.multiTermMaxLazyStateBytes);
+            if (!disableDenseFillForTests) {
+              shape.windowFillClause = Query::ClauseShape::UNKNOWN;
+            }
             return shape;
         }
         std::unreachable();

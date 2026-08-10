@@ -38,6 +38,19 @@ public:
   }
 };
 
+class MultiTermDenseFillGuard {
+  bool saved;
+
+public:
+  explicit MultiTermDenseFillGuard(bool disabled)
+    : saved(MultiTermQuery::disableDenseFillForTests) {
+    MultiTermQuery::disableDenseFillForTests = disabled;
+  }
+  ~MultiTermDenseFillGuard() {
+    MultiTermQuery::disableDenseFillForTests = saved;
+  }
+};
+
 class FilterClauseCountGuard {
   bool saved;
 
@@ -3017,6 +3030,21 @@ void indexConstantConjDocs(CollectionHelper& helper, int32_t segments) {
   }
 }
 
+void indexMultiTermDenseRouteDocs(CollectionHelper& helper) {
+  std::vector<Doc> docs;
+  docs.reserve(DocsEnumMeta::L1_DOCS);
+  for (int32_t i = 0; i < DocsEnumMeta::L1_DOCS; i++) {
+    docs.push_back(flatdoc(
+        "id", "d" + std::to_string(10000 + i),
+        "body_w", (i & 1) == 0 ? "qax qcommon" : "other qcommon",
+        "dense_s", i % 17 == 0 ? "no" : "yes",
+        "sparse_s", i % 1024 == 0 ? "yes" : "no",
+        "sort_i", (int64_t) ((i * 7919) % DocsEnumMeta::L1_DOCS)));
+  }
+  auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(result.success) << result.error_message;
+}
+
 struct ConstantTopKRun {
   std::vector<std::string> ids;
   std::map<std::string, float> scores;
@@ -3168,6 +3196,85 @@ TEST_F(SearchEngineTest, filteredMultiTermCountPlansBeforeBuild) {
   EXPECT_EQ(0, unfiltered.rejected);
   EXPECT_EQ(0, unfiltered.wrapperRoute);
   EXPECT_EQ(0, unfiltered.unknownIsland);
+}
+
+TEST_F(SearchEngineTest, filteredMultiTermDenseCountUsesWindowFill) {
+  CollectionHelper helper;
+  indexMultiTermDenseRouteDocs(helper);
+
+  struct CountRun {
+    int64_t found;
+    int64_t rejected;
+    int64_t denseWindows;
+    int64_t countFallbacks;
+  };
+  auto runCount = [&](std::string_view filterField, bool disableDenseFill) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q").exprQuery("body_w:qax*")
+        .getNumber().limit(0);
+    topDocs.matchFilter("filter", filterField, "yes");
+    SkipStatsGuard stats;
+    {
+      MultiTermDenseFillGuard denseFillGuard(disableDenseFill);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return CountRun{
+      req->getMatchCount("q"),
+      SkipStats::bulkBuiltThenRejected,
+      SkipStats::conjDenseCountWindows,
+      SkipStats::conjCountFallbacks,
+    };
+  };
+
+  CountRun dense = runCount("dense_s", false);
+  CountRun denseOracle = runCount("dense_s", true);
+  EXPECT_EQ(denseOracle.found, dense.found);
+  EXPECT_EQ(0, dense.rejected);
+  EXPECT_GT(dense.denseWindows, 0);
+  EXPECT_EQ(0, dense.countFallbacks);
+  EXPECT_EQ(0, denseOracle.denseWindows);
+
+  CountRun sparse = runCount("sparse_s", false);
+  CountRun sparseOracle = runCount("sparse_s", true);
+  EXPECT_EQ(sparseOracle.found, sparse.found);
+  EXPECT_EQ(0, sparse.rejected);
+  EXPECT_EQ(0, sparse.denseWindows);
+}
+
+TEST_F(SearchEngineTest, filteredMultiTermFieldSortUsesWindowBulk) {
+  CollectionHelper helper;
+  indexMultiTermDenseRouteDocs(helper);
+
+  struct SortRun {
+    std::vector<std::string> ids;
+    int64_t bulkCollections;
+  };
+  auto runSort = [&](bool disableDenseFill) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q").exprQuery("body_w:qax*")
+        .fields({"id"}).limit(25);
+    topDocs.matchFilter("filter", "dense_s", "yes");
+    qb::sort(topDocs, "sort_i", qb::ASC);
+    SkipStatsGuard stats;
+    {
+      MultiTermDenseFillGuard denseFillGuard(disableDenseFill);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return SortRun{
+      resultIds(*req, "q"),
+      SkipStats::fieldSortBulkCollections,
+    };
+  };
+
+  SortRun sorted = runSort(false);
+  SortRun sortedOracle = runSort(true);
+  EXPECT_EQ(sortedOracle.ids, sorted.ids);
+  EXPECT_EQ(1, sorted.bulkCollections);
+  EXPECT_EQ(0, sortedOracle.bulkCollections);
 }
 
 TEST_F(SearchEngineTest,
