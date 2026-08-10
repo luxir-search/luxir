@@ -228,6 +228,19 @@ public:
         return ScoreBlockFillKind::BLOCK_ITERATION;
       }
 
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        unused(use);
+        bool available = cost() != 0
+            && !bulkContext.requireFilterConsumption;
+        return {
+          available ? BulkAnswer::YES : BulkAnswer::NO,
+          available ? BulkAnswer::YES : BulkAnswer::NO,
+          BulkAnswer::NO,
+          BulkAnswer::NO,
+        };
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override;
 
       FilteredBulkResult filteredBulkScorer(

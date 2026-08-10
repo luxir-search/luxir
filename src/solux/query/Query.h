@@ -455,6 +455,19 @@ public:
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class ScorerSupplier {
   public:
+    enum class BulkUse : uint8_t {
+      COUNT_WINDOWS,
+      MATCH_WINDOWS,
+      EXACT_CANDIDATE_SCORING,
+      SCORED_WINDOWS,
+    };
+
+    enum class BulkAnswer : uint8_t {
+      YES,
+      NO,
+      UNKNOWN,
+    };
+
     enum class ScoreBlockFillKind : uint8_t {
       DEFAULT_SCALAR,
       BLOCK_ITERATION,
@@ -471,6 +484,13 @@ public:
       bool requireFilterConsumption = false;
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
+    };
+
+    struct BulkPlan {
+      BulkAnswer available = BulkAnswer::UNKNOWN;
+      BulkAnswer supportsMatchWindows = BulkAnswer::UNKNOWN;
+      BulkAnswer supportsExactCandidateScoring = BulkAnswer::UNKNOWN;
+      BulkAnswer consumesFilters = BulkAnswer::UNKNOWN;
     };
 
     struct FilteredBulkResult {
@@ -547,6 +567,23 @@ public:
     /// within the block still needs per-doc values.
     virtual ScoreBlockFillKind scoreBlockFillKind() const noexcept {
       return ScoreBlockFillKind::DEFAULT_SCALAR;
+    }
+
+    /// Describe bulk construction for one consumer intent without building.
+    /// UNKNOWN preserves the historical speculative-build path. Definite
+    /// answers must match bulkScorer()/filteredBulkScorer() for this context.
+    virtual BulkPlan planBulk(
+        BulkUse use, const BulkScorerContext& bulkContext) {
+      unused(use, bulkContext);
+      return {};
+    }
+
+    /// Record route decisions from a definite pre-build decline. Planning is
+    /// pure; consumers call this only when they commit to skipping the build.
+    virtual void recordBulkPlanCommitment(
+        BulkUse use, const BulkScorerContext& bulkContext,
+        const BulkPlan& plan) {
+      unused(use, bulkContext, plan);
     }
 
     virtual BulkScorer* bulkScorer(MemPool& targetPool) {

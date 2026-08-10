@@ -336,7 +336,18 @@ public:
           countBulk, collectorFilter, builder, maxDoc);
       int64_t before = collector.totalHits();
       if (rankingSupplier != nullptr) {
-        auto* rankingBulk = rankingSupplier->bulkScorer(pool);
+        Query::ScorerSupplier::BulkScorerContext bulkContext;
+        auto plan = rankingSupplier->planBulk(
+            Query::ScorerSupplier::BulkUse::SCORED_WINDOWS,
+            bulkContext);
+        auto* rankingBulk =
+            plan.available == Query::ScorerSupplier::BulkAnswer::NO
+            ? nullptr : rankingSupplier->bulkScorer(pool);
+        if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
+          rankingSupplier->recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::SCORED_WINDOWS,
+              bulkContext, plan);
+        }
         if (rankingBulk != nullptr) {
           collectTopKWindowed(
               segnum, rankingBulk, collectorFilter, collector,
@@ -617,7 +628,21 @@ public:
             }
             bool usedBulk = false;
             if (!disableFieldSortBulk && !data->fieldCollector->needsScores) {
-              auto* bulk = supplier->bulkScorer(poolGuard.pool());
+              Query::ScorerSupplier::BulkScorerContext bulkContext;
+              auto plan = supplier->planBulk(
+                  Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                  bulkContext);
+              bool plannedNo =
+                  plan.available == Query::ScorerSupplier::BulkAnswer::NO
+                  || plan.supportsMatchWindows
+                      == Query::ScorerSupplier::BulkAnswer::NO;
+              auto* bulk = plannedNo
+                  ? nullptr : supplier->bulkScorer(poolGuard.pool());
+              if (plannedNo) {
+                supplier->recordBulkPlanCommitment(
+                    Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                    bulkContext, plan);
+              }
               if (bulk != nullptr && bulk->supportsMatchWindows()) {
                 data->fieldCollector->setSegment(
                     segnum, &seg.postingsReader(), &poolGuard.pool(),
@@ -669,28 +694,59 @@ public:
               if (countSupplier != nullptr
                   && admitExactCountTopK(
                       *countSupplier, collectorFilter, seg.maxDoc())) {
-                auto* countBulk =
-                    countSupplier->bulkScorer(poolGuard.pool());
-                if (countBulk != nullptr) {
-                  auto* rankingSupplier = op.rankingWeight->scorerSupplier(
-                      poolGuard.pool(), seg);
-                  auto* exactScorer = supplier->bulkScorer(poolGuard.pool());
-                  if (exactScorer != nullptr
-                      && exactScorer->supportsExactCandidateScoring()) {
-                    countThenCollectTopK(
-                        poolGuard.pool(), segnum, countBulk, rankingSupplier,
-                        collectorFilter, nullptr, *data->scoreCollector,
-                        seg.maxDoc(), true, exactScorer);
-                    skipCount(SkipStats::exactCountTopKCompositions);
-                    composedExactCountTopK = true;
+                Query::ScorerSupplier::BulkScorerContext bulkContext;
+                auto plan = supplier->planBulk(
+                    Query::ScorerSupplier::BulkUse::
+                        EXACT_CANDIDATE_SCORING,
+                    bulkContext);
+                bool plannedNo =
+                    plan.available
+                        == Query::ScorerSupplier::BulkAnswer::NO
+                    || plan.supportsExactCandidateScoring
+                        == Query::ScorerSupplier::BulkAnswer::NO;
+                if (plannedNo) {
+                  auto countPlan = countSupplier->planBulk(
+                      Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+                      bulkContext);
+                  countSupplier->recordBulkPlanCommitment(
+                      Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+                      bulkContext, countPlan);
+                  if (countPlan.available
+                      != Query::ScorerSupplier::BulkAnswer::NO) {
+                    supplier->recordBulkPlanCommitment(
+                        Query::ScorerSupplier::BulkUse::
+                            EXACT_CANDIDATE_SCORING,
+                        bulkContext, plan);
+                  }
+                  skipCount(SkipStats::exactCountTopKBulkFallbacks);
+                } else {
+                  auto* countBulk =
+                      countSupplier->bulkScorer(poolGuard.pool());
+                  if (countBulk != nullptr) {
+                    auto* rankingSupplier =
+                        op.rankingWeight->scorerSupplier(
+                            poolGuard.pool(), seg);
+                    auto* exactScorer =
+                        supplier->bulkScorer(poolGuard.pool());
+                    if (exactScorer != nullptr
+                        && exactScorer->supportsExactCandidateScoring()) {
+                      countThenCollectTopK(
+                          poolGuard.pool(), segnum, countBulk,
+                          rankingSupplier, collectorFilter, nullptr,
+                          *data->scoreCollector, seg.maxDoc(), true,
+                          exactScorer);
+                      skipCount(SkipStats::exactCountTopKCompositions);
+                      composedExactCountTopK = true;
+                    } else {
+                      skipCount(SkipStats::exactCountTopKBulkFallbacks);
+                      skipCount(SkipStats::bulkBuiltThenRejected);
+                      skipCount(
+                          SkipStats::
+                              bulkBuiltThenRejectedExactComposition);
+                    }
                   } else {
                     skipCount(SkipStats::exactCountTopKBulkFallbacks);
-                    skipCount(SkipStats::bulkBuiltThenRejected);
-                    skipCount(
-                        SkipStats::bulkBuiltThenRejectedExactComposition);
                   }
-                } else {
-                  skipCount(SkipStats::exactCountTopKBulkFallbacks);
                 }
               } else if (countSupplier != nullptr) {
                 skipCount(SkipStats::exactCountTopKProfitabilityRejects);

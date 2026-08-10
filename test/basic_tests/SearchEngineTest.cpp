@@ -2364,6 +2364,82 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   EXPECT_EQ(0, equalCosts.sparseSinglePassRejects);
 }
 
+TEST_F(SearchEngineTest,
+       exactCompositionIneligibleConstantRankingDeclinesBeforeBuild) {
+  constexpr std::string_view collection =
+      "exact_composition_constant_ranking";
+  constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "filler";
+    if (doc < 30) body += " alpha";
+    if (doc >= 30 && doc < 60) body += " beta";
+    docs.push_back(flatdoc(
+        "id", "constant_rank_" + std::to_string(doc),
+        "body_w", body,
+        "filter_w", doc < 60 ? "keep" : "other"));
+  }
+  auto indexed = helper.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(indexed.success) << indexed.error_message;
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t count;
+    int64_t fallbacks;
+    int64_t exactCompositionRejects;
+    int64_t profitabilityRejects;
+    int64_t sparseRejects;
+    int64_t compositions;
+  };
+  auto run = [&](bool disableComposition) {
+    TopKCountCompositionGuard compositionGuard(
+        disableComposition,
+        TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
+    SparseFilteredTopKRerouteGuard rerouteGuard(true);
+    FilteredDisjunctionBatchGuard batchGuard(true);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection(collection);
+    auto& cur = req->topDocs("q").getNumber().withStats()
+        .fields({"id"}).limit(100);
+    cur.rawQuery() = qb::boolean(cur.mr(), {},
+        {qb::match(cur.mr(), "body_w", "alpha"),
+         qb::match(cur.mr(), "body_w", "beta")});
+    cur.matchFilter("filter", "filter_w", "keep");
+    SkipStatsGuard statsGuard;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{
+      resultIds(*req, "q"),
+      resultScoreMap(*req, "q"),
+      req->getMatchCount("q"),
+      SkipStats::exactCountTopKBulkFallbacks,
+      SkipStats::bulkBuiltThenRejectedExactComposition,
+      SkipStats::exactCountTopKProfitabilityRejects,
+      SkipStats::exactCountTopKSparseFilterSinglePassRejects,
+      SkipStats::exactCountTopKCompositions,
+    };
+  };
+
+  Result planned = run(false);
+  Result oldShape = run(true);
+  EXPECT_EQ(oldShape.count, planned.count);
+  EXPECT_EQ(oldShape.ids, planned.ids);
+  EXPECT_EQ(oldShape.scores, planned.scores);
+  ASSERT_FALSE(planned.scores.empty());
+  float score = planned.scores.begin()->second;
+  for (const auto& [id, candidateScore] : planned.scores) {
+    unused(id);
+    EXPECT_EQ(score, candidateScore);
+  }
+  EXPECT_GT(planned.fallbacks, 0)
+      << planned.profitabilityRejects << " " << planned.sparseRejects
+      << " " << planned.compositions;
+  EXPECT_EQ(0, planned.exactCompositionRejects);
+}
+
 TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {
   constexpr std::string_view collection = "unfiltered_count_clause_guard";
   CollectionHelper helper(collection);
@@ -3250,6 +3326,8 @@ TEST_F(SearchEngineTest, filteredMultiTermFieldSortUsesWindowBulk) {
   struct SortRun {
     std::vector<std::string> ids;
     int64_t bulkCollections;
+    int64_t builtThenRejected;
+    int64_t sortMatchWindowRejects;
   };
   auto runSort = [&](bool disableDenseFill) {
     auto req = localReq(helper.getSearchEngine());
@@ -3267,6 +3345,8 @@ TEST_F(SearchEngineTest, filteredMultiTermFieldSortUsesWindowBulk) {
     return SortRun{
       resultIds(*req, "q"),
       SkipStats::fieldSortBulkCollections,
+      SkipStats::bulkBuiltThenRejected,
+      SkipStats::bulkBuiltThenRejectedSortMatchWindow,
     };
   };
 
@@ -3274,7 +3354,12 @@ TEST_F(SearchEngineTest, filteredMultiTermFieldSortUsesWindowBulk) {
   SortRun sortedOracle = runSort(true);
   EXPECT_EQ(sortedOracle.ids, sorted.ids);
   EXPECT_EQ(1, sorted.bulkCollections);
+  EXPECT_EQ(0, sorted.builtThenRejected);
+  EXPECT_EQ(0, sorted.sortMatchWindowRejects);
+  EXPECT_EQ(1, sorted.bulkCollections + sorted.sortMatchWindowRejects);
   EXPECT_EQ(0, sortedOracle.bulkCollections);
+  EXPECT_EQ(0, sortedOracle.builtThenRejected);
+  EXPECT_EQ(0, sortedOracle.sortMatchWindowRejects);
 }
 
 TEST_F(SearchEngineTest,

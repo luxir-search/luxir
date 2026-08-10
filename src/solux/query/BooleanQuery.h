@@ -2275,6 +2275,146 @@ public:
         return finishRoute(ConjunctionRoute::GENERIC, true);
       }
 
+      static BulkPlan knownBulkPlan(
+          BulkAnswer available, BulkAnswer matchWindows,
+          BulkAnswer exactCandidateScoring,
+          BulkAnswer consumesFilters = BulkAnswer::NO) {
+        return {
+          available,
+          matchWindows,
+          exactCandidateScoring,
+          consumesFilters,
+        };
+      }
+
+      static BulkPlan noBulkPlan() {
+        return knownBulkPlan(
+            BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO);
+      }
+
+      static BulkPlan matchWindowBulkPlan() {
+        return knownBulkPlan(
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO);
+      }
+
+      BulkPlan planFilteredDisjunctionBulk() {
+        if (disableFilteredDisjunctionBatchForTests || allowsPruning
+            || !mandatorySources.empty() || optionalSources.size() < 2
+            || !prohibitedSources.empty() || filterSuppliers.size() != 1
+            || minShouldMatch != 1) {
+          return noBulkPlan();
+        }
+        auto* filterSupplier = filterSuppliers[0];
+        if (filterSupplier == nullptr) {
+          return noBulkPlan();
+        }
+        int64_t filterCost = filterSupplier->cost();
+        int32_t densityInverse = needsScores
+            ? filteredDisjunctionBatchDensityInverseForTests
+            : QueryPrep::kSparseBatchCountOwnDensityInverse;
+        if (densityInverse <= 0
+            || filterCost > segment.maxDoc() / densityInverse) {
+          return noBulkPlan();
+        }
+
+        bool filterFeed = false;
+        if (auto* docSetSupplier =
+                dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
+          DocSet* docs = docSetSupplier->docSet();
+          if (docs == nullptr || docs->card() == 0) {
+            return noBulkPlan();
+          }
+          filterFeed = true;
+        } else if (!QueryPrep::disableSparseBatchPostingsFeedForTests) {
+          Query::ScorerShape shape = filterSupplier->describeScorer(
+              scorerBuildContext(filterCost));
+          if (shape.matchState == Query::MatchState::UNKNOWN
+              || shape.directKind == Query::DirectScorerKind::UNKNOWN) {
+            return {};
+          }
+          if (shape.matchState == Query::MatchState::EMPTY) {
+            return noBulkPlan();
+          }
+          filterFeed =
+              shape.directKind == Query::DirectScorerKind::TERM;
+        }
+        if (!filterFeed) {
+          return noBulkPlan();
+        }
+
+        Query::ScorerBuildContext buildContext = scorerBuildContext(
+            std::numeric_limits<int64_t>::max());
+        bool hasOptional = false;
+        for (auto* supplier : optionalShapeSuppliers) {
+          if (supplier == nullptr) continue;
+          Query::ScorerShape shape =
+              supplier->describeScorer(buildContext);
+          if (shape.matchState == Query::MatchState::UNKNOWN
+              || shape.directKind == Query::DirectScorerKind::UNKNOWN) {
+            return {};
+          }
+          if (shape.matchState == Query::MatchState::EMPTY) continue;
+          if (shape.directKind != Query::DirectScorerKind::TERM) {
+            return noBulkPlan();
+          }
+          hasOptional = true;
+        }
+        if (!hasOptional) {
+          return noBulkPlan();
+        }
+        return knownBulkPlan(
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
+      }
+
+      BulkPlan planConjunctionBulk(
+          ConjunctionMode mode, AcceptedConjunctionRoutes acceptedRoutes) {
+        ConjunctionPlanningResult planning = planConjunction(
+            pool, mode, acceptedRoutes);
+        switch (planning.status) {
+          case ConjunctionPlanStatus::READY:
+            return matchWindowBulkPlan();
+          case ConjunctionPlanStatus::DECLINED:
+          case ConjunctionPlanStatus::NO_MATCH:
+            return noBulkPlan();
+          case ConjunctionPlanStatus::LEGACY:
+            return {};
+        }
+        std::unreachable();
+      }
+
+      BulkPlan planMaxScoreBulk() const {
+        Query::ScorerBuildContext buildContext = scorerBuildContext(
+            std::numeric_limits<int64_t>::max());
+        bool hasOptional = false;
+        for (auto* supplier : optionalShapeSuppliers) {
+          if (supplier == nullptr) continue;
+          Query::ScorerShape shape =
+              supplier->describeScorer(buildContext);
+          if (shape.matchState == Query::MatchState::UNKNOWN) {
+            return {};
+          }
+          if (shape.matchState == Query::MatchState::NONEMPTY) {
+            hasOptional = true;
+          }
+        }
+        return hasOptional ? matchWindowBulkPlan() : noBulkPlan();
+      }
+
+      bool filteredDisjunctionDensityDecline() const {
+        if (disableFilteredDisjunctionBatchForTests || allowsPruning
+            || !mandatorySources.empty() || optionalSources.size() < 2
+            || !prohibitedSources.empty() || filterSuppliers.size() != 1
+            || minShouldMatch != 1 || filterSuppliers[0] == nullptr) {
+          return false;
+        }
+        int32_t densityInverse = needsScores
+            ? filteredDisjunctionBatchDensityInverseForTests
+            : QueryPrep::kSparseBatchCountOwnDensityInverse;
+        return densityInverse <= 0
+            || filterSuppliers[0]->cost()
+                > segment.maxDoc() / densityInverse;
+      }
+
       // Build a bulk conjunction from the required clause boundaries.
       // EXHAUSTIVE includes filters and count-only optional groups.
       // CANDIDATE includes direct filters but retains scored, single-phase
@@ -3612,6 +3752,227 @@ public:
           skipCount(SkipStats::disjCountIdentityFilterFallbacks);
         }
         return nullptr;
+      }
+
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        if (bulkContext.hasFilter()
+            || !bulkContext.filterSuppliers.empty()
+            || bulkContext.requireFilterConsumption) {
+          return {};
+        }
+
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING) {
+          bool exactDisjunctionShape = needsScores && !allowsPruning
+              && mandatorySources.empty() && optionalSources.size() >= 2
+              && prohibitedSources.empty() && filterSuppliers.size() == 1
+              && minShouldMatch == 1;
+          if (exactDisjunctionShape) {
+            BulkPlan disjunction = planFilteredDisjunctionBulk();
+            if (disjunction.supportsExactCandidateScoring
+                == BulkAnswer::YES) {
+              return disjunction;
+            }
+            if (disjunction.supportsExactCandidateScoring
+                == BulkAnswer::NO) {
+              return knownBulkPlan(
+                  BulkAnswer::UNKNOWN, BulkAnswer::UNKNOWN,
+                  BulkAnswer::NO);
+            }
+            return {};
+          }
+          bool unscoredFilteredDisjunction = !needsScores
+              && mandatorySources.empty() && optionalSources.size() >= 2
+              && prohibitedSources.empty() && filterSuppliers.size() == 1
+              && minShouldMatch == 1;
+          if (unscoredFilteredDisjunction) {
+            BulkPlan conjunction = planConjunctionBulk(
+                ConjunctionMode::EXHAUSTIVE,
+                countRouteMask(!disableFilterClauseCountForTests));
+            if (conjunction.available == BulkAnswer::YES
+                || conjunction.available == BulkAnswer::UNKNOWN) {
+              return conjunction;
+            }
+            return planFilteredDisjunctionBulk();
+          }
+          return knownBulkPlan(
+              BulkAnswer::UNKNOWN, BulkAnswer::UNKNOWN, BulkAnswer::NO);
+        }
+
+        if (mandatorySources.empty() && optionalSources.empty()
+            && prohibitedSources.empty() && !filterSuppliers.empty()) {
+          return {};
+        }
+
+        bool hasFilteredCountBody = !mandatorySources.empty()
+            || (minShouldMatch >= 1 && !optionalSources.empty());
+        if (!needsScores && hasFilteredCountBody
+            && optionalSources.empty() == (minShouldMatch < 1)
+            && (!prohibitedSources.empty() || !filterSuppliers.empty())
+            && minShouldMatch <= 1) {
+          if (!prohibitedSources.empty()
+              && ConjunctionBulkScorer::disableNegatedCountForTests) {
+            return noBulkPlan();
+          }
+          bool integratedUnknown = false;
+          if (!disableIntegratedFilteredCountForTests
+              && mandatorySources.size() == 1
+              && optionalSources.empty() && prohibitedSources.empty()
+              && !filterSuppliers.empty() && minShouldMatch < 1) {
+            auto* bodySupplier = mandatorySources[0]->scorerSupplier(
+                pool, segment);
+            int64_t filterCost = minFilterCost();
+            if (bodySupplier != nullptr && filterCost >= 0) {
+              BulkScorerContext integratedContext{
+                  filterCost, filterSuppliers, true};
+              BulkPlan integrated = bodySupplier->planBulk(
+                  use, integratedContext);
+              if (integrated.available == BulkAnswer::YES
+                  && integrated.consumesFilters == BulkAnswer::YES) {
+                return integrated;
+              }
+              integratedUnknown =
+                  integrated.available == BulkAnswer::UNKNOWN
+                  || integrated.consumesFilters == BulkAnswer::UNKNOWN;
+            }
+          }
+          BulkPlan conjunction = planConjunctionBulk(
+              ConjunctionMode::EXHAUSTIVE,
+              countRouteMask(!disableFilterClauseCountForTests));
+          if (conjunction.available == BulkAnswer::YES) {
+            return conjunction;
+          }
+          bool pureFilteredDisjunction = mandatorySources.empty()
+              && prohibitedSources.empty() && optionalSources.size() >= 2
+              && minShouldMatch == 1;
+          if (pureFilteredDisjunction) {
+            BulkPlan disjunction = planFilteredDisjunctionBulk();
+            if (disjunction.available != BulkAnswer::NO) {
+              return disjunction;
+            }
+          }
+          if (integratedUnknown
+              && conjunction.available == BulkAnswer::NO) {
+            return {};
+          }
+          return conjunction;
+        }
+
+        if (needsScores && (!filterSuppliers.empty()
+                            || !prohibitedSources.empty())) {
+          return {};
+        }
+        if (optionalSources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && mandatorySources.size() >= 2) {
+          return planConjunctionBulk(
+              ConjunctionMode::SCORED_BODY,
+              routeBit(ConjunctionRoute::GENERIC));
+        }
+        if (!disableMandOptBulkForTests && mandatorySources.size() == 1
+            && !optionalSources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && minShouldMatch < 1) {
+          auto* mandatory = mandatoryShapeSuppliers[0];
+          if (mandatory == nullptr) {
+            return noBulkPlan();
+          }
+          int64_t leadCost = mandatory->cost();
+          Query::ScorerBuildContext buildContext =
+              scorerBuildContext(leadCost);
+          Query::ScorerShape mandatoryShape =
+              mandatory->describeScorer(buildContext);
+          if (mandatoryShape.matchState == Query::MatchState::UNKNOWN
+              || mandatoryShape.reportedTwoPhase
+                  == Query::ReportedTwoPhase::UNKNOWN) {
+            return {};
+          }
+          if (mandatoryShape.matchState == Query::MatchState::EMPTY) {
+            return noBulkPlan();
+          }
+          if (mandatoryShape.reportedTwoPhase
+              == Query::ReportedTwoPhase::YES) {
+            return {};
+          }
+          bool hasOptional = false;
+          for (auto* optional : optionalShapeSuppliers) {
+            if (optional == nullptr) continue;
+            Query::ScorerShape optionalShape =
+                optional->describeScorer(buildContext);
+            if (optionalShape.matchState == Query::MatchState::UNKNOWN
+                || optionalShape.reportedTwoPhase
+                    == Query::ReportedTwoPhase::UNKNOWN) {
+              return {};
+            }
+            if (optionalShape.matchState == Query::MatchState::EMPTY) {
+              continue;
+            }
+            if (optionalShape.reportedTwoPhase
+                == Query::ReportedTwoPhase::YES) {
+              return {};
+            }
+            hasOptional = true;
+          }
+          if (!hasOptional) {
+            return noBulkPlan();
+          }
+          return knownBulkPlan(
+              BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO);
+        }
+        if (!mandatorySources.empty() || !prohibitedSources.empty()
+            || !filterSuppliers.empty() || minShouldMatch > 1
+            || optionalSources.size() < 2) {
+          return noBulkPlan();
+        }
+        return planMaxScoreBulk();
+      }
+
+      void recordBulkPlanCommitment(
+          BulkUse use, const BulkScorerContext& bulkContext,
+          const BulkPlan& plan) override {
+        unused(plan);
+        if (bulkContext.hasFilter()
+            || !bulkContext.filterSuppliers.empty()
+            || bulkContext.requireFilterConsumption) {
+          return;
+        }
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING) {
+          if (filteredDisjunctionDensityDecline()) {
+            skipCount(SkipStats::filteredDisjBatchDensityFallbacks);
+          }
+          return;
+        }
+
+        bool hasFilteredCountBody = !mandatorySources.empty()
+            || (minShouldMatch >= 1 && !optionalSources.empty());
+        if (needsScores || !hasFilteredCountBody
+            || optionalSources.empty() != (minShouldMatch < 1)
+            || (prohibitedSources.empty() && filterSuppliers.empty())
+            || minShouldMatch > 1) {
+          return;
+        }
+        AcceptedConjunctionRoutes accepted =
+            countRouteMask(!disableFilterClauseCountForTests);
+        ConjunctionPlanningResult planning = planConjunction(
+            pool, ConjunctionMode::EXHAUSTIVE, accepted);
+        if (planning.status == ConjunctionPlanStatus::LEGACY) {
+          return;
+        }
+        recordConjunctionPlanCommitment(planning.plan);
+        if (planning.status == ConjunctionPlanStatus::READY) {
+          return;
+        }
+        bool pureFilteredDisjunction = mandatorySources.empty()
+            && prohibitedSources.empty() && optionalSources.size() >= 2
+            && minShouldMatch == 1;
+        if (!pureFilteredDisjunction) {
+          return;
+        }
+        if (filteredDisjunctionDensityDecline()) {
+          skipCount(SkipStats::filteredDisjBatchDensityFallbacks);
+        }
+        BulkPlan disjunction = planFilteredDisjunctionBulk();
+        if (disjunction.available == BulkAnswer::NO) {
+          skipCount(SkipStats::disjCountIdentityFilterFallbacks);
+        }
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
