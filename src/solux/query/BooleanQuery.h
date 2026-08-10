@@ -2321,25 +2321,16 @@ public:
           AcceptedConjunctionRoutes acceptedRoutes,
           std::span<Query::ScorerSupplier* const>
               enclosingFilterSuppliers = {}) {
-        ConjunctionPlanningResult planning = planConjunctionOnce(
-            targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
-        if (planning.status != ConjunctionPlanStatus::LEGACY) {
-          return planning;
-        }
-
+        // Expansion capture does not depend on leadCost. Resolve it before
+        // planConjunctionOnce reads supplier costs and sorts the entries, so
+        // memo-backed costs determine both entry order and the build context.
         Query::ScorerBuildContext buildContext =
-            scorerBuildContext(planning.plan.leadCost);
-        bool filled = fillExpansionMemos(
-            mandatoryShapeSuppliers, buildContext);
-        filled = fillExpansionMemos(filterSuppliers, buildContext)
-            || filled;
-        filled = fillExpansionMemos(optionalShapeSuppliers, buildContext)
-            || filled;
-        filled = fillExpansionMemos(prohibitedShapeSuppliers, buildContext)
-            || filled;
-        filled = fillExpansionMemos(enclosingFilterSuppliers, buildContext)
-            || filled;
-        if (!filled) return planning;
+            scorerBuildContext(segment.maxDoc());
+        fillExpansionMemos(mandatoryShapeSuppliers, buildContext);
+        fillExpansionMemos(filterSuppliers, buildContext);
+        fillExpansionMemos(optionalShapeSuppliers, buildContext);
+        fillExpansionMemos(prohibitedShapeSuppliers, buildContext);
+        fillExpansionMemos(enclosingFilterSuppliers, buildContext);
         return planConjunctionOnce(
             targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
       }

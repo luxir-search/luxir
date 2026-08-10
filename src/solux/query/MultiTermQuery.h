@@ -23,6 +23,7 @@ protected:
 
 public:
   static inline bool disableDenseFillForTests = false;
+  static inline bool disableTruthfulCostForTests = false;
 
   explicit MultiTermQuery(std::string_view field) : field(field) {}
 
@@ -389,7 +390,14 @@ public:
                MemPool& scratchPool)
         : weight(weight), segment(segment), scratchPool(scratchPool) {}
 
-      int64_t cost() override { return segment.maxDoc(); }
+      int64_t cost() override {
+        ExpansionMemo* memo =
+            weight.expansionSlots[(size_t) segment.ord].memo;
+        if (disableTruthfulCostForTests || memo == nullptr) {
+          return segment.maxDoc();
+        }
+        return std::min<int64_t>(memo->sumDocFreq, segment.maxDoc());
+      }
 
       Query::ScorerShape describeScorer(
           const Query::ScorerBuildContext& buildContext) const override {

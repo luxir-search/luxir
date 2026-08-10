@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -8,6 +9,7 @@
 
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
+#include "solux/query/BooleanQuery.h"
 #include "solux/query/PrefixQuery.h"
 #include "solux/query/QueryPrep.h"
 #include "solux/query/TermQuery.h"
@@ -45,6 +47,20 @@ public:
 
   ~DenseFillGuard() {
     MultiTermQuery::disableDenseFillForTests = saved;
+  }
+};
+
+class TruthfulCostGuard {
+  bool saved;
+
+public:
+  explicit TruthfulCostGuard(bool disabled)
+    : saved(MultiTermQuery::disableTruthfulCostForTests) {
+    MultiTermQuery::disableTruthfulCostForTests = disabled;
+  }
+
+  ~TruthfulCostGuard() {
+    MultiTermQuery::disableTruthfulCostForTests = saved;
   }
 };
 
@@ -518,6 +534,103 @@ TEST_F(MultiTermScorerModesTest,
 
   run(2, false);  // exactly at the cap retains both states
   run(1, true);   // the next state crosses the cap into the bitset form
+}
+
+TEST_F(MultiTermScorerModesTest,
+       supplierCostStaysMaxDocUntilExpansionMemoIsFilled) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, {{0, "rare_a"}, {1, "other"}, {2, "rare_b"}});
+
+  auto guard = ti.pool.rewindScopeGuard();
+  auto& segment = ti.reader->segments()[0];
+  Query::Context context(ti.pool, *ti.reader);
+  PrefixQuery prefix("body_w", "rare_");
+  auto* weight = prefix.createWeight(context, 0);
+  auto* supplier = weight->scorerSupplier(ti.pool, segment);
+  ASSERT_NE(supplier, nullptr);
+
+  SkipStatsGuard statsGuard;
+  EXPECT_EQ(segment.maxDoc(), supplier->cost());
+  EXPECT_EQ(0, SkipStats::multitermExpansions);
+  EXPECT_TRUE(supplier->fillExpansionMemo(
+      MultiTermQuery::Weight::scorerBuildContext(segment.maxDoc())));
+  EXPECT_EQ(2, supplier->cost());
+  EXPECT_EQ(1, SkipStats::multitermExpansions);
+}
+
+TEST_F(MultiTermScorerModesTest,
+       truthfulCostMakesRareMultiTermLeadCommonTermConjunction) {
+  constexpr int32_t maxDoc = 1000;
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    std::string body = "common";
+    if (doc == 100) body += " rare_a";
+    if (doc == 700) body += " rare_b";
+    field.add(doc, body);
+  }
+  ti.flush();
+  field.startReading();
+
+  struct Run {
+    int64_t count;
+    int64_t advanceCalls;
+    int64_t sparseFallbacks;
+    int64_t denseWindows;
+    std::unique_ptr<DocSet> docs;
+  };
+  auto run = [&](bool disableTruthfulCost) {
+    TruthfulCostGuard costGuard(disableTruthfulCost);
+    auto poolGuard = ti.pool.rewindScopeGuard();
+    Query::Context context(ti.pool, *ti.reader);
+    TermQuery common("body_w", "common");
+    PrefixQuery rare("body_w", "rare_");
+    std::array<Query*, 2> mandatory = {&common, &rare};
+    BooleanQuery query(mandatory, {}, {}, {});
+    auto* weight = query.createWeight(context, 0);
+    auto& segment = context.topReader.segments()[0];
+
+    SkipStatsGuard statsGuard;
+    auto* supplier = weight->scorerSupplier(ti.pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = supplier == nullptr
+        ? nullptr : supplier->bulkScorer(ti.pool);
+    EXPECT_NE(bulk, nullptr);
+    int64_t count = 0;
+    DocSetBuilder docsBuilder(segment.maxDoc());
+    int32_t next = bulk == nullptr
+        ? PostingsReader::END
+        : bulk->countNextWindow(
+            count, &docsBuilder, nullptr, 0, segment.maxDoc());
+    EXPECT_EQ(PostingsReader::END, next);
+    auto docs = docsBuilder.build();
+    EXPECT_EQ(count, docs->card());
+    return Run{
+      count,
+      SkipStats::advanceCalls,
+      SkipStats::conjCountFallbacks,
+      SkipStats::conjDenseCountWindows,
+      std::move(docs),
+    };
+  };
+
+  Run maxDocCostOracle = run(true);
+  Run truthfulCost = run(false);
+  EXPECT_EQ(2, maxDocCostOracle.count);
+  EXPECT_EQ(maxDocCostOracle.count, truthfulCost.count);
+  EXPECT_EQ(1, maxDocCostOracle.sparseFallbacks);
+  EXPECT_EQ(maxDocCostOracle.sparseFallbacks,
+            truthfulCost.sparseFallbacks);
+  EXPECT_EQ(0, maxDocCostOracle.denseWindows);
+  EXPECT_EQ(maxDocCostOracle.denseWindows, truthfulCost.denseWindows);
+  EXPECT_LT(truthfulCost.advanceCalls, maxDocCostOracle.advanceCalls);
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    EXPECT_EQ(maxDocCostOracle.docs->get(doc), truthfulCost.docs->get(doc));
+  }
+  EXPECT_TRUE(truthfulCost.docs->get(100));
+  EXPECT_TRUE(truthfulCost.docs->get(700));
 }
 
 TEST_F(MultiTermScorerModesTest, eagerWindowFillCopiesUnalignedMaskedRange) {
