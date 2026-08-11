@@ -45,6 +45,7 @@ struct SearchParserImpl {
   int opDepth = 0;
   const int maxOpDepth;
   static constexpr size_t MAX_RANGE_BUCKETS = 100000;
+  static constexpr size_t MAX_SUBOP_RANGE_BUCKETS = 1024;
 
   struct ParsedFences {
     std::span<const int64_t> values;
@@ -316,7 +317,9 @@ public:
         return facet;
       },
       [&](const solux::api::RangeFacet& facetReq) -> SearchOp* {
-        return createRangeFacetReq(name, facetReq);
+        auto* facet = createRangeFacetReq(name, facetReq);
+        addSubs(*facet, facetReq.ops);
+        return facet;
       },
       [&](const solux::api::GenOp& genOp) -> SearchOp* {
         StatsOp::Kind kind;
@@ -430,9 +433,9 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range gap or calendar_gap is required");
     }
-    if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
+    if (!facetReq.sorts.empty()) {
       throw std::runtime_error("facet '" + std::string(facetName)
-          + "': sub-ops/sorts are not yet supported for range facets");
+          + "': sorts are not yet supported for range facets");
     }
 
     auto& fieldType = req.schema->getFieldTypeEx(facetField);
@@ -456,6 +459,18 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': mincount must be >= 0");
     }
+
+    // With sub-ops, every bucket carries a domain builder per segment plus
+    // per-bucket response slots, so the cap sits far below the plain-counting
+    // bucket limit.
+    auto checkSubOpBucketCap = [&](const ParsedFences& parsed) {
+      if (!facetReq.ops.empty()
+          && parsed.values.size() - 1 > MAX_SUBOP_RANGE_BUCKETS) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': range facets with sub-ops are limited to "
+            + std::to_string(MAX_SUBOP_RANGE_BUCKETS) + " buckets");
+      }
+    };
 
     TimeZone zone = TimeZone::utc();
     if (fieldType->type() == FieldType::Type::DATE) {
@@ -519,6 +534,7 @@ public:
       }
       ParsedFences parsed = makeFloatingFences(
           facetName, fieldType->type(), start, end, gap);
+      checkSubOpBucketCap(parsed);
       return solux::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetReq, facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, fieldType->type(), minCount,
@@ -558,6 +574,7 @@ public:
       parsed = makeCalendarFences(facetName, start, end,
           std::get<api::CalendarGap>(facetReq.gap_kind), zone);
     }
+    checkSubOpBucketCap(parsed);
 
     return solux::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetReq, facetField, facetName, parsed.values,

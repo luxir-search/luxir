@@ -1544,6 +1544,9 @@ TEST_F(FacetTest, rangeFacetValidationAndDegenerateRanges) {
     req.rangeFacet("f", "number_i").range(0, 100001, 1);
   }, "100000 bucket limit");
   expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_i").range(0, 2000, 1).avg("a", "number_i");
+  }, "limited to 1024 buckets");
+  expectError([](LocalReq& req) {
     req.rangeFacet("f", "number_i").range(0, 10, 0);
   }, "gap must be > 0");
   expectError([](LocalReq& req) {
@@ -2540,6 +2543,118 @@ TEST_F(FacetTest, sumInlineSortsAndAccumulatesIntegersExactly) {
   EXPECT_EQ(1.0, totals[1]);
   EXPECT_EQ("c", ids[2]);
   EXPECT_TRUE(std::isnan(totals[2]));
+}
+
+// Range facet sub-ops: each returned bucket's domain feeds the child ops
+// post-selection (ranges have no inline counting pass).
+TEST_F(FacetTest, rangeFacetSubOps) {
+  CollectionHelper helper;
+  // Two segments; keep_s carves the domain. val_i buckets: [0,10) [10,20) [20,30).
+  helper.index(flatdoc("keep_s", "y", "val_i", 5, "score_i", 10), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("keep_s", "y", "val_i", 15, "score_i", 30), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("keep_s", "n", "val_i", 16, "score_i", 999), UpdateMessage::COMMIT);
+  helper.index(flatdoc("keep_s", "y", "val_i", 7, "score_i", 20), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("keep_s", "y", "val_i", 25, "score_i", 50), UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs("q").getNumber(true).matchQuery("keep_s", "y");
+  topDocs.rangeFacet("f", "val_i").range(0, 30, 10)
+      .avg("avg_score", "score_i").sum("sum_score", "score_i");
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+  ASSERT_NE(nullptr, docs);
+  const auto* result = docs->ops.at("f")->facetResult();
+  ASSERT_NE(nullptr, result);
+  const std::array bounds = {
+    std::pair<int64_t, int64_t>{0, 10},
+    std::pair<int64_t, int64_t>{10, 20},
+    std::pair<int64_t, int64_t>{20, 30}
+  };
+  const std::array<int64_t, 3> counts = {2, 1, 1};
+  expectRangeResult(*result, bounds, counts, -1);
+  const auto& avg = std::get<api::ArrDouble>(result->ops.at("avg_score")->kind).v;
+  ASSERT_EQ(3u, avg.size());
+  EXPECT_EQ(15, avg[0]);  // (10+20)/2; the keep=n doc is outside the domain
+  EXPECT_EQ(30, avg[1]);
+  EXPECT_EQ(50, avg[2]);
+  const auto& sum = std::get<api::ArrDouble>(result->ops.at("sum_score")->kind).v;
+  ASSERT_EQ(3u, sum.size());
+  EXPECT_EQ(30, sum[0]);
+  EXPECT_EQ(30, sum[1]);
+  EXPECT_EQ(50, sum[2]);
+}
+
+// Multi-valued bucket field: a doc with several values in one bucket joins
+// that bucket's domain once, and a doc can join several buckets. mincount
+// drops a bucket; sub-op arrays align with the buckets actually returned.
+TEST_F(FacetTest, rangeFacetSubOpsMultiValueAndMincount) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {RangeSchemaField{"vals_is", false, true}};
+  setRangeFacetSchema(helper, fields);
+  helper.indexAll(std::array{
+    flatdoc("vals_is", vec_i(1, 2), "score_i", 10),
+    flatdoc("vals_is", vec_i(25), "score_i", 50),
+    flatdoc("vals_is", vec_i(3, 25), "score_i", 7),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->topDocs().getNumber(true).allQuery();
+  req->rangeFacet("f", "vals_is").range(0, 30, 10).mincount(1)
+      .sum("sum_score", "score_i");
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto& result = rootFacetResult(*req, "f");
+  // Counts are value occurrences; [10,20) is empty and mincount(1) drops it.
+  const std::array bounds = {
+    std::pair<int64_t, int64_t>{0, 10},
+    std::pair<int64_t, int64_t>{20, 30}
+  };
+  const std::array<int64_t, 2> counts = {3, 2};
+  expectRangeResult(result, bounds, counts, -1);
+  // Sums are per-document: doc1 contributes 10 once to [0,10) despite two
+  // in-bucket values, and doc3 contributes 7 to both returned buckets.
+  const auto& sum = std::get<api::ArrDouble>(result.ops.at("sum_score")->kind).v;
+  ASSERT_EQ(2u, sum.size());
+  EXPECT_EQ(17, sum[0]);  // 10 + 7
+  EXPECT_EQ(57, sum[1]);  // 50 + 7
+}
+
+// A range facet as a bucket child of a string facet: its FacetResult lands in
+// the slot of the parent-allocated ArrVal, one per parent bucket.
+TEST_F(FacetTest, rangeFacetNestedUnderStringFacet) {
+  CollectionHelper helper;
+  helper.index(flatdoc("cat_s", "a", "val_i", 5), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "a", "val_i", 15), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "val_i", 5), UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->topDocs().getNumber(true).allQuery();
+  req->facet("f", "cat_s").rangeFacet("r", "val_i").range(0, 20, 10);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto& result = rootFacetResult(*req, "f");
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  ASSERT_EQ(2u, ids.size());
+  EXPECT_EQ("a", ids[0]);
+  EXPECT_EQ("b", ids[1]);
+  const auto& arr = std::get<api::ArrVal>(result.ops.at("r")->kind).v;
+  ASSERT_EQ(2u, arr.size());
+  const std::array bounds = {
+    std::pair<int64_t, int64_t>{0, 10},
+    std::pair<int64_t, int64_t>{10, 20}
+  };
+  ASSERT_NE(nullptr, arr[0].facetResult());
+  expectRangeResult(*arr[0].facetResult(), bounds, std::array<int64_t, 2>{1, 1}, -1);
+  ASSERT_NE(nullptr, arr[1].facetResult());
+  expectRangeResult(*arr[1].facetResult(), bounds, std::array<int64_t, 2>{1, 0}, -1);
 }
 
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {

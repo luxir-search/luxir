@@ -468,7 +468,8 @@ inline OpCursor& OpCursor::genOpHelper(std::string_view name, std::string_view f
   g.name = build::arenaStr(req_->mr, fn);
   solux::api::Val* args = build::allocArray(g.args, 1, req_->mr);
   args[0].kind = build::arenaStr(req_->mr, field);
-  return req_->pushCursor(this, sub, nullptr);  // GenOp has no sub-ops
+  // GenOp is a leaf: stay on the cursor it was added to, so stat ops chain.
+  return *this;
 }
 
 inline OpCursor& OpCursor::allQuery() { getOrCreateQuery().kind = true; return *this; }  // the `all` arm
