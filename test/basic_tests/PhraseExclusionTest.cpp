@@ -143,7 +143,7 @@ TEST_F(PhraseExclusionTest, admittedCountMatchesDisabledOracleAcrossSegments) {
   EXPECT_GT(SkipStats::negatedCountExclFills, 0);
 }
 
-TEST_F(PhraseExclusionTest, rejectedGateKeepsPullPathCorrect) {
+TEST_F(PhraseExclusionTest, rejectedShapeDeclinesBulkProbeBeforeConstruction) {
   addRejectedSegment(helper, "r_");
   int64_t expected = runCount(
       helper, true, PhraseShape::ORDINARY, false, true);
@@ -153,7 +153,8 @@ TEST_F(PhraseExclusionTest, rejectedGateKeepsPullPathCorrect) {
       helper, false, PhraseShape::ORDINARY, false, true);
   EXPECT_EQ(actual, expected);
   EXPECT_EQ(SkipStats::phraseExclusionWindowAdmits, 0);
-  EXPECT_GT(SkipStats::phraseExclusionWindowRejects, 0);
+  EXPECT_EQ(SkipStats::phraseExclusionWindowRejects, 0);
+  EXPECT_EQ(SkipStats::conjPlanUnknownIslandPhrase, 0);
   EXPECT_EQ(SkipStats::negatedCountWindows, 0);
   EXPECT_EQ(SkipStats::negatedCountExclFills, 0);
 }

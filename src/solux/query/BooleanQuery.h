@@ -822,7 +822,8 @@ public:
 
     static Query::ScorerBuildContext scorerBuildContext(int64_t leadCost) {
       Query::ScorerBuildContext buildContext =
-          MultiTermQuery::Weight::scorerBuildContext(leadCost);
+          MultiTermQuery::Weight::scorerBuildContext(
+              leadCost, PhraseQuery::ScorerControls::disableSortForTests);
       buildContext.disableBooleanTwoPhaseForTests =
           disableTwoPhaseForTests;
       buildContext.disableDisjunctionTwoPhaseForTests =
@@ -2471,6 +2472,13 @@ public:
           }
           if (shape.matchState == Query::MatchState::EMPTY) continue;
           if (shape.directKind != Query::DirectScorerKind::TERM) {
+            // Two-phase rejection remains owned by the deferred helper below.
+            // Keep its BulkPlan unknown so an exact child shape does not
+            // silently migrate the helper or erase its build-discard tripwire.
+            if (shape.reportedTwoPhase
+                != Query::ReportedTwoPhase::NO) {
+              return {};
+            }
             return noBulkPlan();
           }
           hasOptional = true;

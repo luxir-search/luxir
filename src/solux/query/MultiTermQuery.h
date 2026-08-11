@@ -164,11 +164,13 @@ public:
     // term index.
     static inline size_t maxLazyStateBytes = 32u << 20;
 
-    static Query::ScorerBuildContext scorerBuildContext(int64_t leadCost) {
+    static Query::ScorerBuildContext scorerBuildContext(
+        int64_t leadCost, bool phraseDisableSortForTests = false) {
       return {
         .leadCost = leadCost,
         .multiTermScorerModeForTests = scorerModeForTests,
         .multiTermMaxLazyStateBytes = maxLazyStateBytes,
+        .phraseDisableSortForTests = phraseDisableSortForTests,
       };
     }
 

@@ -51,6 +51,19 @@ public:
   }
 };
 
+class PhraseShapeGuard {
+  bool saved;
+
+public:
+  explicit PhraseShapeGuard(bool disabled)
+    : saved(PhraseQuery::disableShapesForTests) {
+    PhraseQuery::disableShapesForTests = disabled;
+  }
+  ~PhraseShapeGuard() {
+    PhraseQuery::disableShapesForTests = saved;
+  }
+};
+
 class FilterClauseCountGuard {
   bool saved;
 
@@ -3408,7 +3421,7 @@ TEST_F(SearchEngineTest, conjunctionPlanFillsOptionalMultiTermMemo) {
   EXPECT_EQ(1, disabledIdentity.expansions);
 }
 
-TEST_F(SearchEngineTest, conjunctionUnknownIslandAttributesPhraseCause) {
+TEST_F(SearchEngineTest, filteredPhraseCountRetiresPhraseIsland) {
   CollectionHelper helper;
   ASSERT_TRUE(helper.indexAll(
       {flatdoc("id", "1", "body_w", "quick fox", "keep_s", "yes"),
@@ -3416,21 +3429,46 @@ TEST_F(SearchEngineTest, conjunctionUnknownIslandAttributesPhraseCause) {
        flatdoc("id", "3", "body_w", "quick fox", "keep_s", "no")},
       UpdateMessage::COMMIT).success);
 
-  auto req = localReq(helper.getSearchEngine());
-  req->collection("main");
-  auto& topDocs = req->topDocs("q").getNumber().limit(0);
-  topDocs.rawQuery() =
-      qb::phraseWords(topDocs.mr(), "body_w", {"quick", "fox"});
-  topDocs.matchFilter("keep", "keep_s", "yes");
+  struct Run {
+    int64_t found;
+    int64_t island;
+    int64_t phraseIsland;
+    int64_t multiTermIsland;
+    int64_t numericGeoIsland;
+    int64_t otherIsland;
+  };
+  auto run = [&](bool disableShapes) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    topDocs.rawQuery() =
+        qb::phraseWords(topDocs.mr(), "body_w", {"quick", "fox"});
+    topDocs.matchFilter("keep", "keep_s", "yes");
+    SkipStatsGuard stats;
+    {
+      PhraseShapeGuard shapeGuard(disableShapes);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::conjPlanUnknownIsland,
+      SkipStats::conjPlanUnknownIslandPhrase,
+      SkipStats::conjPlanUnknownIslandMultiTerm,
+      SkipStats::conjPlanUnknownIslandNumericGeo,
+      SkipStats::conjPlanUnknownIslandOther,
+    };
+  };
 
-  SkipStatsGuard stats;
-  req->execute(false);
-  ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_EQ(1, req->getMatchCount("q"));
-  EXPECT_GT(SkipStats::conjPlanUnknownIsland, 0);
-  EXPECT_EQ(SkipStats::conjPlanUnknownIsland,
-            SkipStats::conjPlanUnknownIslandPhrase);
-  EXPECT_EQ(0, SkipStats::conjPlanUnknownIslandMultiTerm);
-  EXPECT_EQ(0, SkipStats::conjPlanUnknownIslandNumericGeo);
-  EXPECT_EQ(0, SkipStats::conjPlanUnknownIslandOther);
+  Run oracle = run(true);
+  Run planned = run(false);
+  EXPECT_EQ(oracle.found, planned.found);
+  EXPECT_EQ(1, planned.found);
+  EXPECT_GT(oracle.island, 0);
+  EXPECT_EQ(oracle.island, oracle.phraseIsland);
+  EXPECT_EQ(0, planned.island);
+  EXPECT_EQ(0, planned.phraseIsland);
+  EXPECT_EQ(0, planned.multiTermIsland);
+  EXPECT_EQ(0, planned.numericGeoIsland);
+  EXPECT_EQ(0, planned.otherIsland);
 }

@@ -22,6 +22,8 @@ class PhraseQuery final : public Query {
   int32_t slop;
 
 public:
+  static inline bool disableShapesForTests = false;
+
   struct ScorerControls {
     static inline bool countMatchesForTests = false;
     static inline int64_t matchCallsForTests = 0;
@@ -46,6 +48,165 @@ public:
   template<class MatcherPolicy> class PhraseScorer;
   using Scorer = PhraseScorer<ExactMatcher>;
   using SloppyScorer = PhraseScorer<SloppyMatcher>;
+
+private:
+  struct Estimate {
+    bool nonempty = false;
+    std::vector<int32_t> querySlotSources;
+    std::vector<int32_t> conjunctionOrder;
+    std::vector<int32_t> slotOrder;
+    std::vector<int32_t> slotGroup;
+    std::vector<std::vector<int32_t>> groupSlots;
+    int64_t approximationCost = 0;
+    float matchCost = 0.0f;
+  };
+
+  static int32_t narrowedTotalTermFreq(
+      const TermsEnum::PostingsState& state) {
+    // Match DocsEnumMeta::totalTermFreq(), including its current int32_t
+    // narrowing of the int64_t postings-state value.
+    return (int32_t) state.totalTermFreq;
+  }
+
+  static Estimate estimate(
+      std::span<const TermsEnum::PostingsState* const> states,
+      std::span<const std::string_view> queryTerms,
+      std::span<const int32_t> queryPositions, int32_t slop,
+      bool disableSort, bool disableRepeatDedup) {
+    assert(states.size() == queryTerms.size());
+    assert(states.size() == queryPositions.size());
+    Estimate result;
+    for (const auto* state : states) {
+      if (state == nullptr) return result;
+    }
+    result.nonempty = true;
+
+    result.querySlotSources.resize(states.size());
+    bool dedupRepeats = !disableRepeatDedup || slop > 0;
+    for (int32_t i = 0; i < (int32_t) states.size(); i++) {
+      int32_t first = i;
+      if (dedupRepeats) {
+        for (int32_t j = 0; j < i; j++) {
+          if (queryTerms[(size_t) j] == queryTerms[(size_t) i]) {
+            first = j;
+            break;
+          }
+        }
+      }
+      result.querySlotSources[(size_t) i] = first;
+      if (first == i) result.conjunctionOrder.push_back(i);
+    }
+
+    auto byCost = [&](int32_t a, int32_t b) {
+      const auto& sa = *states[(size_t) result.querySlotSources[(size_t) a]];
+      const auto& sb = *states[(size_t) result.querySlotSources[(size_t) b]];
+      if (sa.docFreq != sb.docFreq) return sa.docFreq < sb.docFreq;
+      int32_t ta = narrowedTotalTermFreq(sa);
+      int32_t tb = narrowedTotalTermFreq(sb);
+      if (ta != tb) return ta < tb;
+      return false;
+    };
+    if (!disableSort) {
+      std::stable_sort(
+          result.conjunctionOrder.begin(), result.conjunctionOrder.end(),
+          byCost);
+    }
+
+    result.slotOrder.resize(states.size());
+    for (size_t i = 0; i < result.slotOrder.size(); i++) {
+      result.slotOrder[i] = (int32_t) i;
+    }
+    if (!disableSort) {
+      std::stable_sort(
+          result.slotOrder.begin(), result.slotOrder.end(),
+          [&](int32_t a, int32_t b) {
+            if (byCost(a, b)) return true;
+            if (byCost(b, a)) return false;
+            return a < b;
+          });
+    }
+
+    result.slotGroup.assign(states.size(), -1);
+    for (size_t i = 0; i < result.slotOrder.size(); i++) {
+      if (result.slotGroup[i] >= 0) continue;
+      int32_t source = result.querySlotSources[
+          (size_t) result.slotOrder[i]];
+      std::vector<int32_t> members;
+      for (size_t j = i; j < result.slotOrder.size(); j++) {
+        int32_t candidateSource = result.querySlotSources[
+            (size_t) result.slotOrder[j]];
+        if (candidateSource == source) members.push_back((int32_t) j);
+      }
+      if (members.size() < 2) continue;
+      std::sort(members.begin(), members.end(), [&](int32_t a, int32_t b) {
+        int32_t aOrdinal = result.slotOrder[(size_t) a];
+        int32_t bOrdinal = result.slotOrder[(size_t) b];
+        if (queryPositions[(size_t) aOrdinal]
+            != queryPositions[(size_t) bOrdinal]) {
+          return queryPositions[(size_t) aOrdinal]
+              < queryPositions[(size_t) bOrdinal];
+        }
+        return aOrdinal < bOrdinal;
+      });
+      int32_t group = (int32_t) result.groupSlots.size();
+      for (int32_t slot : members) {
+        result.slotGroup[(size_t) slot] = group;
+      }
+      result.groupSlots.push_back(std::move(members));
+    }
+
+    assert(!result.conjunctionOrder.empty());
+    const auto* approximationState = states[(size_t)
+        result.querySlotSources[(size_t) result.conjunctionOrder[0]]];
+    result.approximationCost = approximationState->docFreq;
+    if (slop > 0) {
+      double averageTf = 0.0;
+      for (int32_t ordinal : result.slotOrder) {
+        const auto& state = *states[(size_t)
+            result.querySlotSources[(size_t) ordinal]];
+        averageTf += state.docFreq > 0
+            ? (double) narrowedTotalTermFreq(state) / (double) state.docFreq
+            : 1.0;
+      }
+      double slotCount = (double) result.slotOrder.size();
+      double estimate = slotCount * averageTf
+          + (double) result.groupSlots.size() * slotCount;
+      result.matchCost = (float) std::min(
+          estimate, (double) std::numeric_limits<float>::max());
+    } else {
+      for (int32_t ordinal : result.slotOrder) {
+        const auto& state = *states[(size_t)
+            result.querySlotSources[(size_t) ordinal]];
+        if (state.docFreq > 0) {
+          result.matchCost += (float) narrowedTotalTermFreq(state)
+              / (float) state.docFreq;
+        } else {
+          result.matchCost += 1.0f;
+        }
+      }
+    }
+    return result;
+  }
+
+  // Position-verification price for a windowed exclusion fill, relative to
+  // the positive side's cost. A windowed fill verifies positions for every
+  // approximation hit in the window; the pull path verifies only the docs
+  // that survive the positive leapfrog, so admitting too eagerly loses.
+  // MEASURED on the 70-query neg_phrase population (5M corpus): weight 4.0
+  // admits 8 and gives class 0.90; 1.0 admits 22 and gives 0.77 with one
+  // query at 1.12; 0.25 admits 41 and gives 0.68 but grows a loss tail of
+  // seven queries up to 1.53. 1.0 takes most of the win without the tail.
+  static constexpr double kExclusionWindowFillPositionWeight = 1.0;
+
+  static bool estimateSupportsWindowFill(
+      int64_t approximationCost, float matchCost, int64_t positiveCost) {
+    double fillWork = (double) approximationCost
+        * (double) std::max(matchCost, 1.0f)
+        * kExclusionWindowFillPositionWeight;
+    return fillWork <= (double) positiveCost;
+  }
+
+public:
 
   PhraseQuery(std::string_view field, std::span<std::string_view> terms,
               std::span<const int32_t> positions, int32_t slop = 0)
@@ -84,6 +245,73 @@ public:
     std::span<CachedTermInfo*> cachedTermInfos;
     Similarity::BM25Scorer* simScorer = nullptr;
 
+    Estimate estimateScorer(IndexReader::Segment& segment,
+                            bool disableSort,
+                            bool disableRepeatDedup) const {
+      if (cachedFieldInfo == nullptr
+          || cachedFieldInfo->segInfos[segment.ord] == nullptr) {
+        return {};
+      }
+      std::vector<const TermsEnum::PostingsState*> states;
+      states.reserve(cachedTermInfos.size());
+      for (const auto* termInfo : cachedTermInfos) {
+        states.push_back(termInfo->postingsStates[segment.ord]);
+      }
+      return PhraseQuery::estimate(
+          states, query.getTerms(), query.getPositions(), query.getSlop(),
+          disableSort, disableRepeatDedup);
+    }
+
+#ifndef NDEBUG
+    void assertConstructionMatchesEstimate(
+        IndexReader::Segment& segment, const Estimate& estimate,
+        std::span<DocsPosEnum*> querySlotEnums,
+        std::span<DocsPosEnum*> slotEnums,
+        std::span<const int32_t> positions,
+        std::span<const int32_t> ordinals,
+        std::span<DocsPosEnum*> conjunctionEnums,
+        std::span<const int32_t> slotGroup,
+        std::span<RepeatGroup> groups) const {
+      assert(estimate.nonempty);
+      assert(querySlotEnums.size() == estimate.querySlotSources.size());
+      for (size_t i = 0; i < querySlotEnums.size(); i++) {
+        int32_t source = estimate.querySlotSources[i];
+        assert(querySlotEnums[i] == querySlotEnums[(size_t) source]);
+      }
+      assert(conjunctionEnums.size() == estimate.conjunctionOrder.size());
+      for (size_t i = 0; i < conjunctionEnums.size(); i++) {
+        int32_t ordinal = estimate.conjunctionOrder[i];
+        assert(conjunctionEnums[i] == querySlotEnums[(size_t) ordinal]);
+      }
+      assert(conjunctionEnums[0]->numDocs() == estimate.approximationCost);
+      assert(slotEnums.size() == estimate.slotOrder.size());
+      for (size_t i = 0; i < slotEnums.size(); i++) {
+        int32_t ordinal = estimate.slotOrder[i];
+        int32_t source = estimate.querySlotSources[(size_t) ordinal];
+        const auto* state = cachedTermInfos[(size_t) source]
+            ->postingsStates[segment.ord];
+        assert(state != nullptr);
+        assert(slotEnums[i] == querySlotEnums[(size_t) ordinal]);
+        assert(slotEnums[i]->numDocs() == state->docFreq);
+        assert(slotEnums[i]->totalTermFreq()
+               == narrowedTotalTermFreq(*state));
+        assert(positions[i] == query.getPositions()[(size_t) ordinal]);
+        assert(ordinals[i] == ordinal);
+      }
+      assert(std::equal(slotGroup.begin(), slotGroup.end(),
+                        estimate.slotGroup.begin(),
+                        estimate.slotGroup.end()));
+      assert(groups.size() == estimate.groupSlots.size());
+      for (size_t i = 0; i < groups.size(); i++) {
+        const auto& expected = estimate.groupSlots[i];
+        assert(groups[i].docsEnum == slotEnums[(size_t) expected[0]]);
+        assert(groups[i].slots.size() == expected.size());
+        assert(std::equal(groups[i].slots.begin(), groups[i].slots.end(),
+                          expected.begin(), expected.end()));
+      }
+    }
+#endif
+
   public:
     Weight(Query::Context& context, PhraseQuery& query, int32_t flags, float multiplier)
         : Query::Weight(context, flags), query(query) {
@@ -110,114 +338,75 @@ public:
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-      if (cachedFieldInfo == nullptr) return nullptr;
+      Estimate estimate = estimateScorer(
+          segment, ScorerControls::disableSortForTests,
+          ScorerControls::disableRepeatDedupForTests);
+      if (!estimate.nonempty) return nullptr;
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
-      if (segFieldInfo == nullptr) return nullptr;
+      assert(segFieldInfo != nullptr);
 
       auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());
       auto querySlotPosEnums = targetPool.make_span<PosEnum*>(cachedTermInfos.size());
-      auto queryTerms = query.getTerms();
-      struct TermEnums {
-        DocsPosEnum* docs;
-        PosEnum* positions;
-      };
-      std::vector<TermEnums> distinct;
-      distinct.reserve(cachedTermInfos.size());
-      bool dedupRepeats = !ScorerControls::disableRepeatDedupForTests || query.getSlop() > 0;
       for (int32_t i = 0; i < (int32_t) cachedTermInfos.size(); i++) {
-        int32_t first = i;
-        if (dedupRepeats) {
-          for (int32_t j = 0; j < i; j++) {
-            if (queryTerms[(size_t) j] == queryTerms[(size_t) i]) {
-              first = j;
-              break;
-            }
-          }
-        }
-        if (first != i) {
-          querySlotEnums[(size_t) i] = querySlotEnums[(size_t) first];
-          querySlotPosEnums[(size_t) i] = querySlotPosEnums[(size_t) first];
+        int32_t source = estimate.querySlotSources[(size_t) i];
+        if (source != i) {
+          querySlotEnums[(size_t) i] = querySlotEnums[(size_t) source];
+          querySlotPosEnums[(size_t) i] =
+              querySlotPosEnums[(size_t) source];
           continue;
         }
         DocsPosEnum* docsEnum = cachedTermInfos[(size_t) i]
             ->useDocsEnum<DocsEnumTier::POSITIONS>(targetPool, segment);
+        assert(docsEnum != nullptr);
         if (docsEnum == nullptr) return nullptr;
         PosEnum* posEnum = targetPool.make<PosEnum>(*docsEnum);
         querySlotEnums[(size_t) i] = docsEnum;
         querySlotPosEnums[(size_t) i] = posEnum;
-        distinct.push_back({docsEnum, posEnum});
       }
 
-      auto byCost = [](DocsPosEnum* a, DocsPosEnum* b) {
-        if (a->numDocs() != b->numDocs()) return a->numDocs() < b->numDocs();
-        if (a->totalTermFreq() != b->totalTermFreq()) {
-          return a->totalTermFreq() < b->totalTermFreq();
-        }
-        return false;
-      };
-      if (!ScorerControls::disableSortForTests) {
-        std::stable_sort(distinct.begin(), distinct.end(), [&](const TermEnums& a,
-                                                               const TermEnums& b) {
-          return byCost(a.docs, b.docs);
-        });
-      }
-      auto conjunctionEnums = targetPool.make_span<DocsPosEnum*>(distinct.size());
-      auto conjunctionPosEnums = targetPool.make_span<PosEnum*>(distinct.size());
-      for (size_t i = 0; i < distinct.size(); i++) {
-        conjunctionEnums[i] = distinct[i].docs;
-        conjunctionPosEnums[i] = distinct[i].positions;
+      auto conjunctionEnums = targetPool.make_span<DocsPosEnum*>(
+          estimate.conjunctionOrder.size());
+      auto conjunctionPosEnums = targetPool.make_span<PosEnum*>(
+          estimate.conjunctionOrder.size());
+      for (size_t i = 0; i < estimate.conjunctionOrder.size(); i++) {
+        int32_t ordinal = estimate.conjunctionOrder[i];
+        conjunctionEnums[i] = querySlotEnums[(size_t) ordinal];
+        conjunctionPosEnums[i] = querySlotPosEnums[(size_t) ordinal];
       }
 
-      std::vector<int32_t> order(querySlotEnums.size());
-      for (size_t i = 0; i < order.size(); i++) order[i] = (int32_t) i;
-      if (!ScorerControls::disableSortForTests) {
-        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
-          DocsPosEnum* ea = querySlotEnums[(size_t) a];
-          DocsPosEnum* eb = querySlotEnums[(size_t) b];
-          if (byCost(ea, eb)) return true;
-          if (byCost(eb, ea)) return false;
-          return a < b;
-        });
-      }
-      auto slotEnums = targetPool.make_span<DocsPosEnum*>(order.size());
-      auto slotPosEnums = targetPool.make_span<PosEnum*>(order.size());
-      auto positions = targetPool.make_span<int32_t>(order.size());
-      auto ordinals = targetPool.make_span<int32_t>(order.size());
-      for (size_t k = 0; k < order.size(); k++) {
-        int32_t ord = order[k];
+      auto slotEnums = targetPool.make_span<DocsPosEnum*>(
+          estimate.slotOrder.size());
+      auto slotPosEnums = targetPool.make_span<PosEnum*>(
+          estimate.slotOrder.size());
+      auto positions = targetPool.make_span<int32_t>(
+          estimate.slotOrder.size());
+      auto ordinals = targetPool.make_span<int32_t>(
+          estimate.slotOrder.size());
+      for (size_t k = 0; k < estimate.slotOrder.size(); k++) {
+        int32_t ord = estimate.slotOrder[k];
         slotEnums[k] = querySlotEnums[(size_t) ord];
         slotPosEnums[k] = querySlotPosEnums[(size_t) ord];
         positions[k] = query.getPositions()[(size_t) ord];
         ordinals[k] = ord;
       }
 
-      auto slotGroup = targetPool.make_span<int32_t>(slotEnums.size());
-      std::fill(slotGroup.begin(), slotGroup.end(), -1);
-      std::vector<std::vector<int32_t>> groupSlots;
-      for (size_t i = 0; i < slotEnums.size(); i++) {
-        if (slotGroup[i] >= 0) continue;
-        std::vector<int32_t> members;
-        for (size_t j = i; j < slotEnums.size(); j++) {
-          if (slotEnums[j] == slotEnums[i]) members.push_back((int32_t) j);
-        }
-        if (members.size() < 2) continue;
-        std::sort(members.begin(), members.end(), [&](int32_t a, int32_t b) {
-          if (positions[(size_t) a] != positions[(size_t) b]) {
-            return positions[(size_t) a] < positions[(size_t) b];
-          }
-          return ordinals[(size_t) a] < ordinals[(size_t) b];
-        });
-        int32_t gid = (int32_t) groupSlots.size();
-        for (int32_t slot : members) slotGroup[(size_t) slot] = gid;
-        groupSlots.push_back(std::move(members));
-      }
-      auto groups = targetPool.make_span<RepeatGroup>(groupSlots.size());
-      for (size_t g = 0; g < groupSlots.size(); g++) {
-        groups[g].docsEnum = slotEnums[(size_t) groupSlots[g][0]];
-        groups[g].posEnum = slotPosEnums[(size_t) groupSlots[g][0]];
+      auto slotGroup = targetPool.copy_span(
+          std::span<int32_t>(estimate.slotGroup));
+      auto groups = targetPool.make_span<RepeatGroup>(
+          estimate.groupSlots.size());
+      for (size_t g = 0; g < estimate.groupSlots.size(); g++) {
+        auto& groupSlots = estimate.groupSlots[g];
+        groups[g].docsEnum = slotEnums[(size_t) groupSlots[0]];
+        groups[g].posEnum = slotPosEnums[(size_t) groupSlots[0]];
         groups[g].slots = targetPool.copy_span(
-            std::span<int32_t>(groupSlots[g].data(), groupSlots[g].size()));
+            std::span<int32_t>(groupSlots));
       }
+
+#ifndef NDEBUG
+      assertConstructionMatchesEstimate(
+          segment, estimate, querySlotEnums, slotEnums, positions, ordinals,
+          conjunctionEnums, slotGroup, groups);
+#endif
 
       NormsReader* normsReader = (inputFlags & NEED_SCORES) != 0
           ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
@@ -248,12 +437,14 @@ public:
             targetPool, slotEnums, slotPosEnums, positions, ordinals,
             conjunctionEnums, conjunctionPosEnums, normsReader,
             simScorer, impacts, impactMultiplicities, slotGroup, groups,
-            query.getSlop(), (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
+            estimate.approximationCost, estimate.matchCost, query.getSlop(),
+            (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
       }
       return targetPool.make<Scorer>(
           targetPool, slotEnums, slotPosEnums, positions, ordinals,
           conjunctionEnums, conjunctionPosEnums, normsReader,
-          simScorer, impacts, impactMultiplicities, slotGroup, groups, 0,
+          simScorer, impacts, impactMultiplicities, slotGroup, groups,
+          estimate.approximationCost, estimate.matchCost, 0,
           (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
     }
 
@@ -276,14 +467,31 @@ public:
         return minCost < 0 ? 0 : minCost;
       }
 
-      // Deliberately all-UNKNOWN: window-fill eligibility depends on a
-      // positive cost injected after construction, and two-phase state on
-      // the flattening outcome; a falsely definite answer would poison
-      // route planning.
       Query::ScorerShape describeScorer(
           const Query::ScorerBuildContext& buildContext) const override {
-        unused(buildContext);
-        return {};
+        if (PhraseQuery::disableShapesForTests) return {};
+        Estimate estimate = weight.estimateScorer(
+            segment, buildContext.phraseDisableSortForTests, false);
+        Query::ClauseShape windowFill = Query::ClauseShape::NONE;
+        if (estimate.nonempty
+            && (weight.inputFlags & EXCLUSION_WINDOW_FILL) != 0
+            && estimateSupportsWindowFill(
+                estimate.approximationCost, estimate.matchCost,
+                buildContext.leadCost)) {
+          windowFill = Query::ClauseShape::DIRECT;
+        }
+        return {
+          .matchState = estimate.nonempty
+              ? Query::MatchState::NONEMPTY
+              : Query::MatchState::EMPTY,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = Query::ReportedTwoPhase::YES,
+          .windowFillClause = windowFill,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -709,16 +917,6 @@ public:
   class PhraseScorer final : public Query::Scorer {
     friend MatcherPolicy;
 
-    // Position-verification price for a windowed exclusion fill, relative to
-    // the positive side's cost. A windowed fill verifies positions for every
-    // approximation hit in the window; the pull path verifies only the docs
-    // that survive the positive leapfrog, so admitting too eagerly loses.
-    // MEASURED on the 70-query neg_phrase population (5M corpus): weight 4.0
-    // admits 8 and gives class 0.90; 1.0 admits 22 and gives 0.77 with one
-    // query at 1.12; 0.25 admits 41 and gives 0.68 but grows a loss tail of
-    // seven queries up to 1.53. 1.0 takes most of the win without the tail.
-    static constexpr double kExclusionWindowFillPositionWeight = 1.0;
-
     std::span<DocsPosEnum*> slotEnums;
     std::span<PosEnum*> slotPosEnums;
     std::span<const int32_t> positions;
@@ -890,40 +1088,22 @@ public:
                  Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
                  std::span<const int32_t> impactMultiplicities,
                  std::span<const int32_t> slotGroup, std::span<RepeatGroup> groups,
+                 int64_t approximationCost, float matchCostEstimate,
                  int32_t slop, bool exclusionWindowFill = false)
         : slotEnums(slotEnums), slotPosEnums(slotPosEnums), positions(positions),
           ordinals(ordinals), conjunctionEnums(conjunctionEnums),
           conjunctionPosEnums(conjunctionPosEnums), pool(&targetPool), slotGroup(slotGroup),
           groups(groups), simScorer(simScorer), impacts(impacts),
           impactMultiplicities(impactMultiplicities), matcher(slop),
-          approximationCost(conjunctionEnums[0]->numDocs()),
+          matchCostEstimate(matchCostEstimate),
+          approximationCost(approximationCost),
           exclusionWindowFill(exclusionWindowFill) {
       if (!groups.empty()) slotCursor = targetPool.make_span<int32_t>(slotEnums.size());
+      assert(approximationCost == conjunctionEnums[0]->numDocs());
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
-      }
-      if constexpr (MatcherPolicy::IS_SLOPPY) {
-        double averageTf = 0.0;
-        for (DocsPosEnum* docsEnum : slotEnums) {
-          int32_t numDocs = docsEnum->numDocs();
-          averageTf += numDocs > 0
-              ? (double) docsEnum->totalTermFreq() / (double) numDocs : 1.0;
-        }
-        double estimate = (double) slotEnums.size() * averageTf
-            + (double) groups.size() * (double) slotEnums.size();
-        matchCostEstimate = (float) std::min(
-            estimate, (double) std::numeric_limits<float>::max());
-      } else {
-        for (auto* docsEnum : slotEnums) {
-          int32_t numDocs = docsEnum->numDocs();
-          if (numDocs > 0) {
-            matchCostEstimate += (float) docsEnum->totalTermFreq() / (float) numDocs;
-          } else {
-            matchCostEstimate += 1.0f;
-          }
-        }
       }
       matcher.init(*this);
     }
@@ -985,10 +1165,8 @@ public:
       if (!exclusionWindowFill) {
         return false;
       }
-      double fillWork = (double) approximationCost
-          * (double) std::max(matchCostEstimate, 1.0f)
-          * kExclusionWindowFillPositionWeight;
-      return fillWork <= (double) windowFillPositiveCost;
+      return estimateSupportsWindowFill(
+          approximationCost, matchCostEstimate, windowFillPositiveCost);
     }
 
     void recordWindowFilterCommit(bool supported) const override {
