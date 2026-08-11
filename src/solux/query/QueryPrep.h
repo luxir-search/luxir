@@ -375,7 +375,17 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
   DocSetBuilder builder(segment.maxDoc());
   auto* supplier = source.scorerSupplier(scratch, segment);
   if (supplier != nullptr) {
-    auto* bulk = supplier->bulkScorer(scratch);
+    Query::ScorerSupplier::BulkScorerContext bulkContext;
+    auto plan = supplier->planBulk(
+        Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+    bool plannedNo =
+        plan.available == Query::ScorerSupplier::BulkAnswer::NO;
+    if (plannedNo) {
+      supplier->recordBulkPlanCommitment(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+          bulkContext, plan);
+    }
+    auto* bulk = plannedNo ? nullptr : supplier->buildBulk(scratch, plan);
     if (bulk != nullptr) {
       if (domain == nullptr
           && !disableDirectPostingsMaterializationForTests

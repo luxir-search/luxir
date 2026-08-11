@@ -78,6 +78,42 @@ public:
   }
 };
 
+class WindowFillExposureFactorGuard {
+  int64_t saved;
+
+public:
+  explicit WindowFillExposureFactorGuard(int64_t factor)
+    : saved(BooleanQuery::windowFillExposureFactorForTests) {
+    BooleanQuery::windowFillExposureFactorForTests = factor;
+  }
+  ~WindowFillExposureFactorGuard() {
+    BooleanQuery::windowFillExposureFactorForTests = saved;
+  }
+};
+
+class CountDenseThresholdGuard {
+  int32_t savedDense;
+  int32_t savedTermTail;
+
+public:
+  explicit CountDenseThresholdGuard(int32_t inverse)
+    : savedDense(BooleanQuery::ConjunctionBulkScorer::
+                     denseThresholdInverseForTests),
+      savedTermTail(BooleanQuery::ConjunctionBulkScorer::
+                        termTailDenseThresholdInverseForTests) {
+    BooleanQuery::ConjunctionBulkScorer::denseThresholdInverseForTests =
+        inverse;
+    BooleanQuery::ConjunctionBulkScorer::termTailDenseThresholdInverseForTests =
+        inverse;
+  }
+  ~CountDenseThresholdGuard() {
+    BooleanQuery::ConjunctionBulkScorer::denseThresholdInverseForTests =
+        savedDense;
+    BooleanQuery::ConjunctionBulkScorer::termTailDenseThresholdInverseForTests =
+        savedTermTail;
+  }
+};
+
 class FilterClauseCountGuard {
   bool saved;
 
@@ -3661,4 +3697,309 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
     EXPECT_LE(planned.bulkRejects[i], oracle.bulkRejects[i])
         << "counter=" << i;
   }
+}
+
+TEST_F(SearchEngineTest,
+       exhaustiveNumericCountBuildsPointsWhileFieldSortKeepsSparseVerify) {
+  constexpr std::string_view collection = "numeric_count_consumption";
+  constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
+  constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  SchemaBuilder schema;
+  auto& range = schema.field("range_i");
+  range.type = api::FieldDef::FieldClass::INT;
+  range.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  int64_t expected = 0;
+  for (int32_t doc = 0; doc < N; doc++) {
+    bool alpha = (doc & 1) == 0;
+    expected += alpha && doc <= hi;
+    docs.push_back(flatdoc(
+        "id", "numeric_use_" + std::to_string(doc),
+        "body_w", alpha ? "alpha" : "other", "range_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Run {
+    int64_t found;
+    std::vector<std::string> ids;
+    int64_t island;
+    int64_t pointsArms;
+    int64_t complementArms;
+    int64_t sparseVerifyArms;
+    int64_t fieldSortBulkCollections;
+  };
+  auto run = [&](bool fieldSort, bool disableShapes) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").matchQuery("body_w", "alpha")
+        .getNumber();
+    if (fieldSort) {
+      topDocs.fields({"id"}).limit(25);
+      qb::sort(topDocs, "range_i", qb::ASC);
+    } else {
+      topDocs.limit(0);
+    }
+    appendRawFilter(topDocs, "range", qb::range(
+        topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
+        qb::valI64(topDocs.mr(), hi), nullptr));
+    SkipStatsGuard stats;
+    {
+      NumericRangeShapeGuard shapeGuard(disableShapes);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"), resultIds(*req, "q"),
+      SkipStats::conjPlanUnknownIslandNumericGeo,
+      SkipStats::numericRangePointsArms,
+      SkipStats::numericRangeComplementArms,
+      SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::fieldSortBulkCollections,
+    };
+  };
+
+  Run count = run(false, false);
+  Run countShapesDisabled = run(false, true);
+  EXPECT_EQ(expected, count.found);
+  EXPECT_EQ(count.found, countShapesDisabled.found);
+  EXPECT_GT(count.pointsArms + count.complementArms, 0);
+  EXPECT_EQ(0, count.sparseVerifyArms);
+  EXPECT_EQ(0, count.island);
+  EXPECT_EQ(0, countShapesDisabled.pointsArms
+                   + countShapesDisabled.complementArms);
+  EXPECT_GT(countShapesDisabled.sparseVerifyArms, 0);
+  EXPECT_GT(countShapesDisabled.island, 0);
+
+  Run sorted = run(true, false);
+  Run sortedShapesDisabled = run(true, true);
+  EXPECT_EQ(expected, sorted.found);
+  EXPECT_EQ(sorted.found, sortedShapesDisabled.found);
+  EXPECT_EQ(sorted.ids, sortedShapesDisabled.ids);
+  EXPECT_EQ(25u, sorted.ids.size());
+  EXPECT_EQ(0, sorted.pointsArms + sorted.complementArms);
+  EXPECT_GT(sorted.sparseVerifyArms, 0);
+  EXPECT_GT(sorted.fieldSortBulkCollections, 0);
+}
+
+TEST_F(SearchEngineTest,
+       exhaustiveNumericCountScalesShapeRefreshToLeadExposure) {
+  constexpr std::string_view collection = "numeric_count_lead_exposure";
+  constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
+  constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  SchemaBuilder schema;
+  auto& range = schema.field("range_i");
+  range.type = api::FieldDef::FieldClass::INT;
+  range.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  int64_t expected = 0;
+  for (int32_t doc = 0; doc < N; doc++) {
+    // One survivor per required term keeps minOther * 4096 below the fat
+    // range fence. The scoped dense-threshold override below only keeps this
+    // provably-tiny fixture on the refresh path so both build choices remain
+    // observable.
+    bool first = doc % 10000 == 0;
+    bool second = doc % 10001 == 0;
+    expected += first && second && doc <= hi;
+    std::string body;
+    if (first) body += "moderate_a ";
+    if (second) body += "moderate_b";
+    if (body.empty()) body = "other";
+    docs.push_back(flatdoc(
+        "id", "numeric_exposure_" + std::to_string(doc),
+        "body_w", body, "range_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Run {
+    int64_t found;
+    int64_t denseWindows;
+    int64_t pointsArms;
+    int64_t complementArms;
+    int64_t sparseVerifyArms;
+  };
+  auto run = [&](int64_t factor) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(),
+        {qb::match(topDocs.mr(), "body_w", "moderate_a"),
+         qb::match(topDocs.mr(), "body_w", "moderate_b")});
+    appendRawFilter(topDocs, "range", qb::range(
+        topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
+        qb::valI64(topDocs.mr(), hi), nullptr));
+    WindowFillExposureFactorGuard factorGuard(factor);
+    CountDenseThresholdGuard denseThresholdGuard(N);
+    SkipStatsGuard stats;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::conjDenseCountWindows,
+      SkipStats::numericRangePointsArms,
+      SkipStats::numericRangeComplementArms,
+      SkipStats::numericRangeSparseVerifyArms,
+    };
+  };
+
+  Run scaled = run(BooleanQuery::WINDOW_FILL_EXPOSURE_FACTOR);
+  Run maxDocLike = run(N);
+  EXPECT_EQ(expected, scaled.found);
+  EXPECT_EQ(scaled.found, maxDocLike.found);
+  EXPECT_GT(scaled.denseWindows, 0);
+  EXPECT_EQ(0, scaled.pointsArms + scaled.complementArms);
+  EXPECT_GT(scaled.sparseVerifyArms, 0);
+  EXPECT_GT(maxDocLike.pointsArms + maxDocLike.complementArms, 0);
+  EXPECT_EQ(0, maxDocLike.sparseVerifyArms);
+}
+
+TEST_F(SearchEngineTest,
+       exhaustiveNumericUnionCountUsesGroupExposure) {
+  constexpr std::string_view collection = "numeric_count_group_exposure";
+  constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
+  constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  SchemaBuilder schema;
+  auto& range = schema.field("range_i");
+  range.type = api::FieldDef::FieldClass::INT;
+  range.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  int64_t expected = 0;
+  for (int32_t doc = 0; doc < N; doc++) {
+    bool left = doc % 4 == 0;
+    bool right = doc % 4 == 1;
+    expected += (left || right) && doc <= hi;
+    std::string body = left ? "union_a" : right ? "union_b" : "other";
+    docs.push_back(flatdoc(
+        "id", "numeric_group_" + std::to_string(doc),
+        "body_w", body, "range_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Run {
+    int64_t found;
+    int64_t pointsArms;
+    int64_t complementArms;
+    int64_t sparseVerifyArms;
+  };
+  auto run = [&](bool disableShapes) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {},
+        {qb::match(topDocs.mr(), "body_w", "union_a"),
+         qb::match(topDocs.mr(), "body_w", "union_b")},
+        {},
+        {qb::range(
+            topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0),
+            nullptr, qb::valI64(topDocs.mr(), hi), nullptr)},
+        1);
+    SkipStatsGuard stats;
+    {
+      NumericRangeShapeGuard shapeGuard(disableShapes);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::numericRangePointsArms,
+      SkipStats::numericRangeComplementArms,
+      SkipStats::numericRangeSparseVerifyArms,
+    };
+  };
+
+  Run planned = run(false);
+  Run shapesDisabled = run(true);
+  EXPECT_EQ(expected, planned.found);
+  EXPECT_EQ(planned.found, shapesDisabled.found);
+  EXPECT_GT(planned.pointsArms + planned.complementArms, 0);
+  EXPECT_EQ(0, planned.sparseVerifyArms);
+  EXPECT_EQ(0, shapesDisabled.pointsArms
+                   + shapesDisabled.complementArms);
+  EXPECT_GT(shapesDisabled.sparseVerifyArms, 0);
+}
+
+TEST_F(SearchEngineTest,
+       exhaustiveNumericNegatedCountUsesPositiveExposure) {
+  constexpr std::string_view collection = "numeric_count_negated_exposure";
+  constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
+  constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  SchemaBuilder schema;
+  auto& range = schema.field("range_i");
+  range.type = api::FieldDef::FieldClass::INT;
+  range.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  int64_t expected = 0;
+  for (int32_t doc = 0; doc < N; doc++) {
+    bool dense = (doc & 1) == 0;
+    expected += dense && doc > hi;
+    docs.push_back(flatdoc(
+        "id", "numeric_negated_" + std::to_string(doc),
+        "body_w", dense ? "dense" : "other", "range_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Run {
+    int64_t found;
+    int64_t pointsArms;
+    int64_t complementArms;
+    int64_t sparseVerifyArms;
+  };
+  auto run = [&](bool disableShapes) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(),
+        {qb::match(topDocs.mr(), "body_w", "dense")}, {},
+        {qb::range(
+            topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0),
+            nullptr, qb::valI64(topDocs.mr(), hi), nullptr)});
+    SkipStatsGuard stats;
+    {
+      NumericRangeShapeGuard shapeGuard(disableShapes);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::numericRangePointsArms,
+      SkipStats::numericRangeComplementArms,
+      SkipStats::numericRangeSparseVerifyArms,
+    };
+  };
+
+  Run planned = run(false);
+  Run shapesDisabled = run(true);
+  EXPECT_EQ(expected, planned.found);
+  EXPECT_EQ(planned.found, shapesDisabled.found);
+  EXPECT_GT(planned.pointsArms + planned.complementArms, 0);
+  EXPECT_EQ(0, planned.sparseVerifyArms);
+  EXPECT_EQ(0, shapesDisabled.pointsArms
+                   + shapesDisabled.complementArms);
+  EXPECT_GT(shapesDisabled.sparseVerifyArms, 0);
 }

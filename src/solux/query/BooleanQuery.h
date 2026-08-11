@@ -483,6 +483,22 @@ public:
   static constexpr int64_t kTermFeedMaxLeadFraction = 32;
   static inline int64_t kTermFeedMaxLeadFractionForTests =
       kTermFeedMaxLeadFraction;
+  // Window-fill consumption converts per-candidate verification into
+  // per-span decoding. buildLeadCost_i = min(maxDoc,
+  // minOtherRequiredCost_i * 4096) bounds the worst-case fill span: every
+  // surviving other-side doc may populate one full window, saturated at the
+  // segment size. Materialization is therefore admitted whenever that span
+  // could exceed the fence, leaving sparse verification only for provably
+  // tiny other sides below fence/4096. Known accepted cost: conjunctions whose
+  // true intermediate is far below the cheapest single clause (for example,
+  // +sarah +fisher has an intermediate of 195 but minOther of 10458) re-pay
+  // the bounded one-time materialization, about 3.4ms at r50, because this
+  // bound cannot observe the intermediate. A selectivity-product exposure
+  // estimate is the enumerated future refinement. Measured with gcc-release
+  // on Fenrir, 2026-08-11, with the quick-board A/B as the confirming oracle.
+  static constexpr int64_t WINDOW_FILL_EXPOSURE_FACTOR = 4096;
+  static inline int64_t windowFillExposureFactorForTests =
+      WINDOW_FILL_EXPOSURE_FACTOR;
   // A cached DocSet has a cheap mask route, so a term may own the candidate
   // feed only when it is materially sparser than the filter. A postings filter
   // would otherwise need a per-query mask fill and does not use this gate.
@@ -1220,8 +1236,12 @@ public:
       boost::container::small_vector<int64_t, 16> sorted(costs.begin(), costs.end());
       if (take < n) std::sort(sorted.begin(), sorted.end());
       int64_t sum = 0;
-      for (int i = 0; i < take; i++) sum += sorted[(size_t) i];
-      return std::min(sum, maxDoc);
+      for (int i = 0; i < take; i++) {
+        int64_t cost = sorted[(size_t) i];
+        if (cost >= maxDoc - sum) return maxDoc;
+        sum += cost;
+      }
+      return sum;
     }
 
     static int64_t optionalCost(
@@ -1802,16 +1822,19 @@ public:
         bool docSetFilter;
         bool scoring;
         size_t order;
+        int64_t buildLeadCost = 0;
       };
 
       struct PlannedSupplier {
         Query::ScorerSupplier* supplier;
         Query::ScorerShape shape;
+        int64_t buildLeadCost = 0;
       };
 
       struct ConjunctionPlan : BulkBuildState {
         ConjunctionMode mode = ConjunctionMode::SCORED_BODY;
         ConjunctionRoute route = ConjunctionRoute::GENERIC;
+        BulkUse use = BulkUse::MATCH_WINDOWS;
         EnclosingFilters enclosingFilters = EnclosingFilters::NOT_SUPPLIED;
         std::span<PlannedEntry> entries;
         std::span<PlannedSupplier> optionalGroup;
@@ -1931,13 +1954,26 @@ public:
         return shape;
       }
 
+      int64_t scaledWindowFillExposure(int64_t exposure) const {
+        assert(exposure >= 0);
+        assert(windowFillExposureFactorForTests > 0);
+        return exposure
+                > segment.maxDoc() / windowFillExposureFactorForTests
+            ? segment.maxDoc()
+            : exposure * windowFillExposureFactorForTests;
+      }
+
       ConjunctionPlanningResult planConjunctionOnce(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
+          BulkUse use,
           std::span<Query::ScorerSupplier* const>
-              enclosingFilterSuppliers) {
+              enclosingFilterSuppliers,
+          bool perEntryExposure = false) {
         ConjunctionPlan plan;
         plan.mode = mode;
+        plan.use = use;
+        assert(!perEntryExposure || use == BulkUse::COUNT_WINDOWS);
         plan.enclosingFilters = enclosingFilterSuppliers.empty()
             ? EnclosingFilters::NOT_SUPPLIED
             : EnclosingFilters::CONSUMED;
@@ -2010,11 +2046,21 @@ public:
         for (size_t i = 1; i < entries.size(); i++) {
           plan.nonLeadCost += entries[i].cost;
         }
-        Query::ScorerBuildContext buildContext =
-            scorerBuildContext(plan.leadCost);
 
-        for (PlannedEntry& entry : entries) {
+        int64_t optionalGroupBuildLeadCost = plan.leadCost;
+        for (size_t i = 0; i < entries.size(); i++) {
+          PlannedEntry& entry = entries[i];
+          entry.buildLeadCost = plan.leadCost;
+          if (perEntryExposure) {
+            entry.buildLeadCost = entries.size() == 1
+                ? segment.maxDoc()
+                : scaledWindowFillExposure(
+                    entries[i == 0 ? 1 : 0].cost);
+          }
+          Query::ScorerBuildContext buildContext =
+              scorerBuildContext(entry.buildLeadCost);
           if (entry.optionalGroup) {
+            optionalGroupBuildLeadCost = entry.buildLeadCost;
             if (hasUnknownElision(optionalSuppliers, buildContext)) {
               plan.unresolvedCause = firstUnresolvedCause(
                   optionalSuppliers, buildContext);
@@ -2046,9 +2092,15 @@ public:
             prohibitedSuppliers.push_back(supplier);
           }
         }
-        if (hasUnknownElision(prohibitedSuppliers, buildContext)) {
+        int64_t prohibitedBuildLeadCost = perEntryExposure
+            ? scaledWindowFillExposure(entries[0].cost)
+            : plan.leadCost;
+        Query::ScorerBuildContext prohibitedBuildContext =
+            scorerBuildContext(prohibitedBuildLeadCost);
+        if (hasUnknownElision(
+                prohibitedSuppliers, prohibitedBuildContext)) {
           plan.unresolvedCause = firstUnresolvedCause(
-              prohibitedSuppliers, buildContext);
+              prohibitedSuppliers, prohibitedBuildContext);
           return {ConjunctionPlanStatus::LEGACY, plan};
         }
 
@@ -2057,9 +2109,12 @@ public:
         plan.optionalGroup =
             targetPool.make_span<PlannedSupplier>(optionalSuppliers.size());
         for (size_t i = 0; i < optionalSuppliers.size(); i++) {
+          Query::ScorerBuildContext buildContext =
+              scorerBuildContext(optionalGroupBuildLeadCost);
           plan.optionalGroup[i] = {
               optionalSuppliers[i],
-              optionalSuppliers[i]->describeScorer(buildContext)};
+              optionalSuppliers[i]->describeScorer(buildContext),
+              optionalGroupBuildLeadCost};
           if (plan.unresolvedCause
                   == Query::UnresolvedSupplierCause::NONE
               && plan.optionalGroup[i].shape.hasUnknown()) {
@@ -2072,12 +2127,15 @@ public:
         for (size_t i = 0; i < prohibitedSuppliers.size(); i++) {
           plan.prohibited[i] = {
               prohibitedSuppliers[i],
-              prohibitedSuppliers[i]->describeScorer(buildContext)};
+              prohibitedSuppliers[i]->describeScorer(
+                  prohibitedBuildContext),
+              prohibitedBuildLeadCost};
           if (plan.unresolvedCause
                   == Query::UnresolvedSupplierCause::NONE
               && plan.prohibited[i].shape.hasUnknown()) {
             plan.unresolvedCause =
-                prohibitedSuppliers[i]->unresolvedScorerCause(buildContext);
+                prohibitedSuppliers[i]->unresolvedScorerCause(
+                    prohibitedBuildContext);
           }
         }
 
@@ -2376,9 +2434,28 @@ public:
         return finishRoute(ConjunctionRoute::GENERIC, true);
       }
 
+      ConjunctionPlanningResult refreshConjunctionShapes(
+          MemPool& targetPool, ConjunctionMode mode,
+          AcceptedConjunctionRoutes acceptedRoutes,
+          std::span<Query::ScorerSupplier* const> enclosingFilterSuppliers,
+          const ConjunctionPlanningResult& original) {
+        assert(original.plan.use == BulkUse::COUNT_WINDOWS);
+        ConjunctionPlanningResult refreshed = planConjunctionOnce(
+            targetPool, mode, acceptedRoutes, original.plan.use,
+            enclosingFilterSuppliers, true);
+        if (refreshed.status == ConjunctionPlanStatus::READY
+            && refreshed.plan.route == original.plan.route) {
+          assert(refreshed.plan.leadCost == original.plan.leadCost);
+          assert(refreshed.plan.nonLeadCost == original.plan.nonLeadCost);
+          return refreshed;
+        }
+        return original;
+      }
+
       ConjunctionPlanningResult planConjunction(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
+          BulkUse use,
           std::span<Query::ScorerSupplier* const>
               enclosingFilterSuppliers = {}) {
         // Expansion capture does not depend on leadCost. Resolve it before
@@ -2391,8 +2468,17 @@ public:
         fillExpansionMemos(optionalShapeSuppliers, buildContext);
         fillExpansionMemos(prohibitedShapeSuppliers, buildContext);
         fillExpansionMemos(enclosingFilterSuppliers, buildContext);
-        return planConjunctionOnce(
-            targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
+        ConjunctionPlanningResult planning = planConjunctionOnce(
+            targetPool, mode, acceptedRoutes, use,
+            enclosingFilterSuppliers);
+        if (use == BulkUse::COUNT_WINDOWS
+            && planning.status == ConjunctionPlanStatus::READY
+            && planning.plan.leadCost != segment.maxDoc()) {
+          return refreshConjunctionShapes(
+              targetPool, mode, acceptedRoutes, enclosingFilterSuppliers,
+              planning);
+        }
+        return planning;
       }
 
       static BulkPlan knownBulkPlan(
@@ -2494,9 +2580,10 @@ public:
       }
 
       BulkPlan planConjunctionBulk(
-          ConjunctionMode mode, AcceptedConjunctionRoutes acceptedRoutes) {
+          BulkUse use, ConjunctionMode mode,
+          AcceptedConjunctionRoutes acceptedRoutes) {
         ConjunctionPlanningResult planning = planConjunction(
-            pool, mode, acceptedRoutes);
+            pool, mode, acceptedRoutes, use);
         switch (planning.status) {
           case ConjunctionPlanStatus::READY: {
             BulkPlan bulkPlan = matchWindowBulkPlan();
@@ -2947,6 +3034,23 @@ public:
 
       MaybeConjunctionBulk buildConjunction(
           MemPool& targetPool, const ConjunctionPlan& plan) {
+        auto assertBuildLeadCost = [&](int64_t buildLeadCost) {
+          if (plan.use == BulkUse::COUNT_WINDOWS) {
+            assert(buildLeadCost >= plan.leadCost);
+            assert(buildLeadCost <= segment.maxDoc());
+          } else {
+            assert(buildLeadCost == plan.leadCost);
+          }
+        };
+        for (const PlannedEntry& entry : plan.entries) {
+          assertBuildLeadCost(entry.buildLeadCost);
+        }
+        for (const PlannedSupplier& member : plan.optionalGroup) {
+          assertBuildLeadCost(member.buildLeadCost);
+        }
+        for (const PlannedSupplier& prohibited : plan.prohibited) {
+          assertBuildLeadCost(prohibited.buildLeadCost);
+        }
         if (plan.route == ConjunctionRoute::COUNT_EXACT_DOCS_ONLY) {
           auto countTermEnums =
               targetPool.make_span<DocsOnlyEnum*>(plan.entries.size());
@@ -3038,7 +3142,7 @@ public:
             size_t memberCount = 0;
             for (const PlannedSupplier& memberPlan : plan.optionalGroup) {
               auto* member = memberPlan.supplier->get(
-                  targetPool, plan.leadCost);
+                  targetPool, memberPlan.buildLeadCost);
 #ifndef NDEBUG
               assertScorerLayout(memberPlan.shape, member);
 #endif
@@ -3055,7 +3159,8 @@ public:
                     targetPool,
                     std::span<Query::Scorer*>(members, memberCount));
           } else {
-            scorer = entry.supplier->get(targetPool, plan.leadCost);
+            scorer = entry.supplier->get(
+                targetPool, entry.buildLeadCost);
           }
 #ifndef NDEBUG
           assertScorerLayout(entry.shape, scorer);
@@ -3142,7 +3247,7 @@ public:
               plan.prohibited.size());
           for (const PlannedSupplier& prohibited : plan.prohibited) {
             auto* scorer = prohibited.supplier->get(
-                targetPool, plan.leadCost);
+                targetPool, prohibited.buildLeadCost);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
 #endif
@@ -3256,10 +3361,12 @@ public:
       MaybeConjunctionBulk conjunctionBulkScorer(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
+          BulkUse use,
           std::span<Query::ScorerSupplier* const>
               enclosingFilterSuppliers = {}) {
         ConjunctionPlanningResult planning = planConjunction(
-            targetPool, mode, acceptedRoutes, enclosingFilterSuppliers);
+            targetPool, mode, acceptedRoutes, use,
+            enclosingFilterSuppliers);
         if (planning.status == ConjunctionPlanStatus::LEGACY) {
           recordUnknownIsland(planning.plan.unresolvedCause);
           return legacyConjunctionBulkScorer(
@@ -3615,7 +3722,7 @@ public:
 
         auto required = conjunctionBulkScorer(
             targetPool, ConjunctionMode::CANDIDATE,
-            candidateRouteMask());
+            candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
         if (!required || !required->usesCandidateRoute()) {
           if (required) {
             skipCount(SkipStats::bulkBuiltThenRejected);
@@ -3697,7 +3804,7 @@ public:
             && minShouldMatch == 0) {
           auto candidate = conjunctionBulkScorer(
               targetPool, ConjunctionMode::CANDIDATE,
-              candidateRouteMask());
+              candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
           if (candidate && candidate->usesCandidateRoute()) {
             recordCandidateConjunctionEngagement(*candidate);
             return candidate->bulk;
@@ -3833,7 +3940,7 @@ public:
       }
 
       BulkScorer* filteredCountBulkScorer(
-          MemPool& targetPool, bool allowAlternateBulk) {
+          MemPool& targetPool, bool allowAlternateBulk, BulkUse use) {
         if (!disableIntegratedFilteredCountForTests
             && mandatorySources.size() == 1
             && optionalSources.empty() && prohibitedSources.empty()
@@ -3855,7 +3962,7 @@ public:
         AcceptedConjunctionRoutes accepted =
             countRouteMask(!disableFilterClauseCountForTests);
         ConjunctionPlanningResult planning = planConjunction(
-            targetPool, ConjunctionMode::EXHAUSTIVE, accepted);
+            targetPool, ConjunctionMode::EXHAUSTIVE, accepted, use);
         bool legacy = planning.status == ConjunctionPlanStatus::LEGACY;
         MaybeConjunctionBulk result;
         if (legacy) {
@@ -3938,7 +4045,7 @@ public:
               && minShouldMatch == 1;
           if (unscoredFilteredDisjunction) {
             BulkPlan conjunction = planConjunctionBulk(
-                ConjunctionMode::EXHAUSTIVE,
+                use, ConjunctionMode::EXHAUSTIVE,
                 countRouteMask(!disableFilterClauseCountForTests));
             if (conjunction.available == BulkAnswer::YES
                 || conjunction.available == BulkAnswer::UNKNOWN) {
@@ -3991,7 +4098,7 @@ public:
             }
           }
           BulkPlan conjunction = planConjunctionBulk(
-              ConjunctionMode::EXHAUSTIVE,
+              use, ConjunctionMode::EXHAUSTIVE,
               countRouteMask(!disableFilterClauseCountForTests));
           if (conjunction.available == BulkAnswer::YES) {
             return conjunction;
@@ -4019,7 +4126,7 @@ public:
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
           return planConjunctionBulk(
-              ConjunctionMode::SCORED_BODY,
+              use, ConjunctionMode::SCORED_BODY,
               routeBit(ConjunctionRoute::GENERIC));
         }
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
@@ -4082,7 +4189,10 @@ public:
       void recordBulkPlanCommitment(
           BulkUse use, const BulkScorerContext& bulkContext,
           const BulkPlan& plan) override {
-        unused(plan);
+        if (use == BulkUse::COUNT_WINDOWS
+            && plan.available == BulkAnswer::NO) {
+          recordDisjunctionCountIdentityShapeFallbacks();
+        }
         if (bulkContext.hasFilter()
             || !bulkContext.filterSuppliers.empty()
             || bulkContext.requireFilterConsumption) {
@@ -4106,7 +4216,7 @@ public:
         AcceptedConjunctionRoutes accepted =
             countRouteMask(!disableFilterClauseCountForTests);
         ConjunctionPlanningResult planning = planConjunction(
-            pool, ConjunctionMode::EXHAUSTIVE, accepted);
+            pool, ConjunctionMode::EXHAUSTIVE, accepted, use);
         if (planning.status == ConjunctionPlanStatus::LEGACY) {
           return;
         }
@@ -4129,6 +4239,19 @@ public:
         }
       }
 
+      void recordDisjunctionCountIdentityShapeFallbacks() const {
+        if (needsScores || optionalSources.size() < 2) return;
+        if (!mandatorySources.empty()) {
+          skipCount(SkipStats::disjCountIdentityRequiredFallbacks);
+        }
+        if (!prohibitedSources.empty()) {
+          skipCount(SkipStats::disjCountIdentityProhibitedFallbacks);
+        }
+        if (minShouldMatch > 1) {
+          skipCount(SkipStats::disjCountIdentityMinMatchFallbacks);
+        }
+      }
+
       BulkScorer* buildBulk(
           MemPool& targetPool, const BulkPlan& plan) override {
         if (plan.buildState == nullptr) {
@@ -4139,6 +4262,9 @@ public:
         }
         const auto& conjunction =
             *static_cast<const ConjunctionPlan*>(plan.buildState);
+        if (conjunction.use == BulkUse::COUNT_WINDOWS) {
+          recordDisjunctionCountIdentityShapeFallbacks();
+        }
         recordConjunctionPlanCommitment(conjunction);
         MaybeConjunctionBulk result =
             buildConjunction(targetPool, conjunction);
@@ -4146,17 +4272,7 @@ public:
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
-        if (!needsScores && optionalSources.size() >= 2) {
-          if (!mandatorySources.empty()) {
-            skipCount(SkipStats::disjCountIdentityRequiredFallbacks);
-          }
-          if (!prohibitedSources.empty()) {
-            skipCount(SkipStats::disjCountIdentityProhibitedFallbacks);
-          }
-          if (minShouldMatch > 1) {
-            skipCount(SkipStats::disjCountIdentityMinMatchFallbacks);
-          }
-        }
+        recordDisjunctionCountIdentityShapeFallbacks();
         if (mandatorySources.empty() && optionalSources.empty()
             && prohibitedSources.empty() && !filterSuppliers.empty()) {
           return filterOnlyBulkScorer(targetPool);
@@ -4203,7 +4319,7 @@ public:
             && optionalSources.empty() && prohibitedSources.empty()) {
           auto result = conjunctionBulkScorer(
               targetPool, ConjunctionMode::CANDIDATE,
-              candidateRouteMask());
+              candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
           if (result && result->usesCandidateRoute()) {
             recordCandidateConjunctionEngagement(*result);
             return result->bulk;
@@ -4222,7 +4338,8 @@ public:
               && ConjunctionBulkScorer::disableNegatedCountForTests) {
             return nullptr;
           }
-          return filteredCountBulkScorer(targetPool, true);
+          return filteredCountBulkScorer(
+              targetPool, true, BulkUse::MATCH_WINDOWS);
         }
         if (needsScores && !filterSuppliers.empty()) {
           return disableFilteredScoredBulkForTests
@@ -4236,7 +4353,8 @@ public:
           // phrase as opaque would verify positions during every advance.
           auto result = conjunctionBulkScorer(
               targetPool, ConjunctionMode::SCORED_BODY,
-              routeBit(ConjunctionRoute::GENERIC));
+              routeBit(ConjunctionRoute::GENERIC),
+              BulkUse::SCORED_WINDOWS);
           return result ? result->bulk : nullptr;
         }
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
@@ -4286,6 +4404,7 @@ public:
           auto result = conjunctionBulkScorer(
               targetPool, ConjunctionMode::EXHAUSTIVE,
               allRouteMask(),
+              BulkUse::MATCH_WINDOWS,
               bulkContext.filterSuppliers);
           if (result) {
             assert(result->enclosingFilters == EnclosingFilters::CONSUMED);
@@ -4667,12 +4786,16 @@ public:
         if (booleanSupplier == nullptr) {
           return -1;
         }
-        bool pureFilteredDisjunction = mandatoryWeights.empty()
-            && optionalWeights.size() >= 2 && minShouldMatch == 1;
-        auto* bulk = pureFilteredDisjunction
-            ? booleanSupplier->bulkScorer(guard.pool())
-            : booleanSupplier->filteredCountBulkScorer(
-                guard.pool(), false);
+        Query::ScorerSupplier::BulkScorerContext bulkContext;
+        auto plan = booleanSupplier->planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+        if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
+          booleanSupplier->recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+              bulkContext, plan);
+          return -1;
+        }
+        auto* bulk = booleanSupplier->buildBulk(guard.pool(), plan);
         if (bulk == nullptr) {
           return -1;
         }

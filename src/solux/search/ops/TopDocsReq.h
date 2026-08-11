@@ -720,8 +720,20 @@ public:
                   }
                   skipCount(SkipStats::exactCountTopKBulkFallbacks);
                 } else {
-                  auto* countBulk =
-                      countSupplier->bulkScorer(poolGuard.pool());
+                  auto countPlan = countSupplier->planBulk(
+                      Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+                      bulkContext);
+                  bool countPlannedNo = countPlan.available
+                      == Query::ScorerSupplier::BulkAnswer::NO;
+                  if (countPlannedNo) {
+                    countSupplier->recordBulkPlanCommitment(
+                        Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+                        bulkContext, countPlan);
+                  }
+                  auto* countBulk = countPlannedNo
+                      ? nullptr
+                      : countSupplier->buildBulk(
+                          poolGuard.pool(), countPlan);
                   if (countBulk != nullptr) {
                     auto* rankingSupplier =
                         op.rankingWeight->scorerSupplier(
@@ -760,6 +772,22 @@ public:
                 && op.weight->isConstantScoring()
                 && op.weight->prefersPullForSparseArrayDomain()
                 && supplier->cost() <= DocSetBuilder::arrayLimitFor(seg.maxDoc());
+            auto buildDeclaredBulk = [&]() -> BulkScorer* {
+              Query::ScorerSupplier::BulkUse use =
+                  data->scoreCollector->topCount == 0
+                      || op.weight->isConstantScoring()
+                      || builderPtr != nullptr
+                  ? Query::ScorerSupplier::BulkUse::COUNT_WINDOWS
+                  : Query::ScorerSupplier::BulkUse::SCORED_WINDOWS;
+              Query::ScorerSupplier::BulkScorerContext bulkContext;
+              auto plan = supplier->planBulk(use, bulkContext);
+              if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
+                supplier->recordBulkPlanCommitment(
+                    use, bulkContext, plan);
+                return nullptr;
+              }
+              return supplier->buildBulk(poolGuard.pool(), plan);
+            };
             if (composedExactCountTopK) {
               // countThenCollectTopK supplied both the exact hit count and
               // competitively pruned ranking.
@@ -771,7 +799,7 @@ public:
                     segnum, scorer, collectorFilter, *builder,
                     *data->scoreCollector);
               }
-            } else if ((bulk = supplier->bulkScorer(poolGuard.pool())) != nullptr) {
+            } else if ((bulk = buildDeclaredBulk()) != nullptr) {
               if (data->scoreCollector->topCount == 0) {
                 // limit 0: the collector keeps nothing but the total, so count
                 // windows without materializing docs or scores.
