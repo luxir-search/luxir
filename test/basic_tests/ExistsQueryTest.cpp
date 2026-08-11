@@ -353,6 +353,35 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   EXPECT_EQ(expectedIds({"d1"}), resultIds(*deletedReq));
 }
 
+TEST_F(ExistsQueryTest,
+       FullFieldSupplierStaysConservativeWhileScorerFillsWindows) {
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  ExistsQuery query("dense_w");
+  auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
+  ASSERT_NE(nullptr, supplier);
+
+  Query::ScorerShape shape = supplier->describeScorer({});
+  EXPECT_EQ(Query::MatchState::UNKNOWN, shape.matchState);
+  EXPECT_EQ(Query::DirectScorerKind::UNKNOWN, shape.directKind);
+  EXPECT_EQ(Query::ReportedTwoPhase::UNKNOWN, shape.reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::UNKNOWN, shape.windowFillClause);
+  EXPECT_EQ(Query::ClauseShape::UNKNOWN, shape.termDisjunctionClause);
+  EXPECT_EQ(Query::IndependentTermAccess::UNKNOWN, shape.independentTerm);
+  EXPECT_EQ(Query::DocsOnlyAccess::UNKNOWN, shape.docsOnly);
+  EXPECT_EQ(Query::DirectDocSetAccess::UNKNOWN, shape.directDocSet);
+
+  bool saved = AllQuery::disableDenseClauseForTests;
+  AllQuery::disableDenseClauseForTests = false;
+  Query::Scorer* scorer = supplier->get(pool, segment.maxDoc());
+  AllQuery::disableDenseClauseForTests = saved;
+  ASSERT_NE(nullptr, dynamic_cast<AllQuery::Scorer*>(scorer));
+  EXPECT_TRUE(scorer->supportsWindowFilter());
+}
+
 TEST_F(ExistsQueryTest, QueryabilityErrorsAndSimpleDegradation) {
   for (std::string_view field : {"unknown_field", "stored_only", "_stored_"}) {
     EXPECT_FALSE(exprError(std::string("exists(") + std::string(field) + ")").empty());

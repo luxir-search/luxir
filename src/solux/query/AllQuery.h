@@ -9,6 +9,8 @@ namespace solux {
 
 class AllQuery final : public solux::Query {
 public:
+  static inline bool disableDenseClauseForTests = false;
+
   AllQuery() {}
 
   ScoreProfile scoreProfile() const override {
@@ -55,6 +57,10 @@ public:
 
     void exhaust() override { lastDoc = -1; }
 
+    bool supportsWindowFilter() const override {
+      return !disableDenseClauseForTests;
+    }
+
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       skipCount(SkipStats::countBulkFillCalls);
@@ -91,6 +97,23 @@ public:
       : segment(segment), score(score) {}
 
     int64_t cost() override { return segment.maxDoc(); }
+
+    Query::ScorerShape describeScorer(
+        const Query::ScorerBuildContext& buildContext) const override {
+      unused(buildContext);
+      return {
+        .matchState = Query::MatchState::NONEMPTY,
+        .directKind = Query::DirectScorerKind::OTHER,
+        .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+        .windowFillClause = disableDenseClauseForTests
+            ? Query::ClauseShape::NONE
+            : Query::ClauseShape::DIRECT,
+        .termDisjunctionClause = Query::ClauseShape::NONE,
+        .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+        .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+      };
+    }
 
     AllQuery::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
       unused(leadCost);
