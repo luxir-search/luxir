@@ -4,6 +4,8 @@
 
 namespace solux {
 
+const SoluxConfig& SearchEngine::config() const { return node.getConfig(); }
+
 void SearchEngine::submitBody(SearchRequest& req) {
   try {
     if (!req.timeZone) throw std::runtime_error(req.timeZoneError);

@@ -103,6 +103,13 @@ struct IngestConfig {
   bool auto_create_collection = true;
 };
 
+struct SearchConfig {
+  // Max nesting depth of search operations in one request (ops within ops).
+  // A request-shape limit like the query parsers' nesting budget, but much
+  // lower: every level is a full search operation, not just a query node.
+  int max_op_depth = 10;
+};
+
 struct SoluxConfig {
   // Serve an existing data directory without owning it: the write lock is not taken,
   // nothing is written, and every mutating request is rejected.  Lets a second process
@@ -117,6 +124,7 @@ struct SoluxConfig {
   StoreConfig store;
   IndexConfig index;
   IngestConfig ingest;
+  SearchConfig search;
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);

@@ -93,6 +93,11 @@ void SoluxConfig::addOptions(CLI::App& app) {
   app.add_flag("--ingest.auto-create-collection,!--no-ingest.auto-create-collection",
                ingest.auto_create_collection, "Create missing collections on first use")
       ->default_val(ingest.auto_create_collection);
+
+  app.add_option("--search.max-op-depth", search.max_op_depth,
+                 "Max nesting depth of search operations in one request")
+      ->default_val(search.max_op_depth)
+      ->check(CLI::PositiveNumber);
 }
 
 void SoluxConfig::normalize() {

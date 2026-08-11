@@ -6,6 +6,7 @@
 namespace solux {
 
 class SoluxNode;
+struct SoluxConfig;
 
 /// The SearchEngine is a singleton owned by the SoluxNode object and is responsible for
 /// executing search requests.  It is the main entry point for the search subsystem.
@@ -21,6 +22,11 @@ class SearchEngine {
 public:
   SearchEngine(SoluxNode& node): node(node) {
   }
+
+  // Node-level configuration (request-shape limits, etc).  Out-of-line: the
+  // SoluxNode/SearchEngine headers include each other, so SoluxNode may be
+  // incomplete here.
+  const SoluxConfig& config() const;
 
   // Transport entry point: route the request by max_parallel, then submit().
   // -1 executes inline on the calling thread (no cross-thread hop at all -

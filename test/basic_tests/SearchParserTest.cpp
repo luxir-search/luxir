@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "solux/SoluxConfig.h"
 #include "solux/query/AllQuery.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/BoostQuery.h"
@@ -22,6 +23,7 @@
 #include "solux/search/ProtobufSearchParser.h"
 #include "solux/search/ops/RootOp.h"
 #include "solux/search/ops/TopDocsReq.h"
+#include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -476,4 +478,38 @@ TEST_F(SearchParserTest, getNumberControlsPruningWeightFlag) {
 
   EXPECT_EQ(std::optional<bool>(true), parseAllowsPruning(false));
   EXPECT_EQ(std::optional<bool>(false), parseAllowsPruning(true));
+}
+
+TEST_F(SearchParserTest, opNestingDepthCapped) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{flatdoc("id", "d1", "body_w", "a")}, UpdateMessage::COMMIT);
+
+  // Builds a chain of `depth` nested TopDocs ops and parses it.
+  auto parseNested = [&](SearchEngine& engine, int depth) {
+    auto request = localReq(engine);
+    OpCursor* cursor = &request->collection("main").topDocs("op0");
+    for (int i = 1; i < depth; i++) {
+      cursor = &cursor->topDocs("op" + std::to_string(i));
+    }
+    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->schema = helper.collection().getSchema();
+    ProtobufSearchParser parser(*request);
+    parser.parse();
+  };
+
+  int cap = helper.getSearchEngine().config().search.max_op_depth;
+  parseNested(helper.getSearchEngine(), cap);  // at the cap: accepted
+  try {
+    parseNested(helper.getSearchEngine(), cap + 1);
+    FAIL() << "expected an op nesting error";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("nesting exceeds"), std::string::npos) << e.what();
+  }
+
+  // The cap is node configuration (--search.max-op-depth), not a constant.
+  SoluxConfig config;
+  config.search.max_op_depth = 2;
+  SoluxNode node{config};
+  parseNested(node.getSearchEngine(), 2);
+  EXPECT_THROW(parseNested(node.getSearchEngine(), 3), std::runtime_error);
 }
