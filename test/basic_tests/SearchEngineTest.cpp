@@ -13,6 +13,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/reader/Postings.h"
 #include "solux/reader/SkipStats.h"
@@ -61,6 +62,19 @@ public:
   }
   ~PhraseShapeGuard() {
     PhraseQuery::disableShapesForTests = saved;
+  }
+};
+
+class NumericRangeShapeGuard {
+  bool saved;
+
+public:
+  explicit NumericRangeShapeGuard(bool disabled)
+    : saved(NumericRangeQuery::disableShapesForTests) {
+    NumericRangeQuery::disableShapesForTests = disabled;
+  }
+  ~NumericRangeShapeGuard() {
+    NumericRangeQuery::disableShapesForTests = saved;
   }
 };
 
@@ -243,6 +257,20 @@ std::vector<std::string> resultIds(const LocalReq& req, std::string_view opName)
   if (ids == nullptr) return out;
   for (auto id : ids->v) out.emplace_back(id);
   return out;
+}
+
+void appendRawFilter(OpCursor& cursor, std::string_view name,
+                     const api::Query& query) {
+  auto& topDocs = std::get<api::TopDocs>(cursor.rawOp().kind);
+  auto old = topDocs.filter;
+  api::NamedQuery* filters =
+      api::build::allocArray(topDocs.filter, old.size() + 1, cursor.mr());
+  std::copy(old.begin(), old.end(), filters);
+  filters[old.size()].name = api::build::arenaStr(cursor.mr(), name);
+  auto* stored = (api::Query*)cursor.mr().allocate(
+      sizeof(api::Query), alignof(api::Query));
+  new (stored) api::Query(query);
+  filters[old.size()].query = stored;
 }
 
 std::map<std::string, float> resultScoreMap(const LocalReq& req,
@@ -1763,6 +1791,74 @@ TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {
   EXPECT_EQ(first.count, hit.count);
   EXPECT_GT(hit.denseWindows, 0);
   EXPECT_GT(cache->counters().hits, beforeHit.hits);
+}
+
+TEST_F(SearchEngineTest, cachedNumericFilterHitIgnoresShapeToggle) {
+  constexpr std::string_view collection = "cached_numeric_dense_count";
+  constexpr int32_t N = DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  SchemaBuilder schema;
+  auto& range = schema.field("range_i");
+  range.type = api::FieldDef::FieldClass::INT;
+  range.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  for (int32_t doc = 0; doc < N; doc++) {
+    docs.push_back(flatdoc(
+        "id", "cached_numeric_" + std::to_string(doc),
+        "body_w", "alpha", "range_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto cache = helper.getIndexWriter()->getFilterCache();
+
+  struct Run {
+    int64_t found;
+    int64_t island;
+    int64_t numericGeoIsland;
+    int64_t denseWindows;
+    int64_t numericArms;
+  };
+  auto run = [&](bool disableShapes) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").matchQuery("body_w", "alpha")
+        .getNumber().limit(0);
+    appendRawFilter(topDocs, "range", qb::range(
+        topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
+        qb::valI64(topDocs.mr(), N / 2 - 1), nullptr));
+    SkipStatsGuard stats;
+    {
+      NumericRangeShapeGuard shapeGuard(disableShapes);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::conjPlanUnknownIsland,
+      SkipStats::conjPlanUnknownIslandNumericGeo,
+      SkipStats::conjDenseCountWindows,
+      SkipStats::numericRangePointsArms
+          + SkipStats::numericRangeComplementArms
+          + SkipStats::numericRangeZoneArms
+          + SkipStats::numericRangeSparseVerifyArms,
+    };
+  };
+
+  Run first = run(false);
+  Run second = run(false);
+  auto beforeHit = cache->counters();
+  Run hitWithShapesDisabled = run(true);
+  EXPECT_EQ(first.found, second.found);
+  EXPECT_EQ(first.found, hitWithShapesDisabled.found);
+  EXPECT_EQ(N / 2, hitWithShapesDisabled.found);
+  EXPECT_GT(cache->counters().hits, beforeHit.hits);
+  EXPECT_EQ(0, hitWithShapesDisabled.island);
+  EXPECT_EQ(0, hitWithShapesDisabled.numericGeoIsland);
+  EXPECT_GT(hitWithShapesDisabled.denseWindows, 0);
+  EXPECT_EQ(0, hitWithShapesDisabled.numericArms);
 }
 
 TEST_F(SearchEngineTest,
@@ -3471,4 +3567,98 @@ TEST_F(SearchEngineTest, filteredPhraseCountRetiresPhraseIsland) {
   EXPECT_EQ(0, planned.multiTermIsland);
   EXPECT_EQ(0, planned.numericGeoIsland);
   EXPECT_EQ(0, planned.otherIsland);
+}
+
+TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
+  constexpr std::string_view collection = "numeric_shape_island";
+  constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  SchemaBuilder schema;
+  auto& range = schema.field("range_i");
+  range.type = api::FieldDef::FieldClass::INT;
+  range.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  for (int32_t doc = 0; doc < N; doc++) {
+    docs.push_back(flatdoc(
+        "id", "numeric_shape_" + std::to_string(doc),
+        "body_w", "alpha", "range_i", doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  struct Run {
+    int64_t found;
+    int64_t island;
+    int64_t numericGeoIsland;
+    int64_t denseWindows;
+    int64_t pointsArms;
+    int64_t complementArms;
+    int64_t zoneArms;
+    int64_t sparseVerifyArms;
+    std::array<int64_t, 11> bulkRejects;
+  };
+  auto run = [&](bool disableShapes) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    auto& topDocs = req->topDocs("q").matchQuery("body_w", "alpha")
+        .getNumber().limit(0);
+    appendRawFilter(topDocs, "range", qb::range(
+        topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
+        qb::valI64(topDocs.mr(), N / 2 - 1), nullptr));
+    SkipStatsGuard stats;
+    {
+      NumericRangeShapeGuard shapeGuard(disableShapes);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Run{
+      req->getMatchCount("q"),
+      SkipStats::conjPlanUnknownIsland,
+      SkipStats::conjPlanUnknownIslandNumericGeo,
+      SkipStats::conjDenseCountWindows,
+      SkipStats::numericRangePointsArms,
+      SkipStats::numericRangeComplementArms,
+      SkipStats::numericRangeZoneArms,
+      SkipStats::numericRangeSparseVerifyArms,
+      {
+        SkipStats::bulkBuiltThenRejected,
+        SkipStats::bulkBuiltThenRejectedWrapperRoute,
+        SkipStats::bulkBuiltThenRejectedMandOptTwoPhase,
+        SkipStats::bulkBuiltThenRejectedMaxScoreProhibited,
+        SkipStats::bulkBuiltThenRejectedFilterAttach,
+        SkipStats::bulkBuiltThenRejectedFilteredDisj,
+        SkipStats::bulkBuiltThenRejectedExactMandOpt,
+        SkipStats::bulkBuiltThenRejectedFilteredScored,
+        SkipStats::bulkBuiltThenRejectedFilterOnly,
+        SkipStats::bulkBuiltThenRejectedSortMatchWindow,
+        SkipStats::bulkBuiltThenRejectedExactComposition,
+      },
+    };
+  };
+
+  Run oracle = run(true);
+  Run planned = run(false);
+  EXPECT_EQ(oracle.found, planned.found);
+  EXPECT_EQ(N / 2, planned.found);
+  EXPECT_GT(oracle.island, 0);
+  EXPECT_EQ(oracle.island, oracle.numericGeoIsland);
+  EXPECT_EQ(0, planned.island);
+  EXPECT_EQ(0, planned.numericGeoIsland);
+  EXPECT_GT(planned.denseWindows, 0);
+  EXPECT_GT(planned.pointsArms, 0);
+  EXPECT_EQ(0, planned.complementArms);
+  EXPECT_EQ(0, planned.zoneArms);
+  EXPECT_EQ(0, planned.sparseVerifyArms);
+  EXPECT_EQ(oracle.pointsArms, planned.pointsArms);
+  EXPECT_EQ(oracle.complementArms, planned.complementArms);
+  EXPECT_EQ(oracle.zoneArms, planned.zoneArms);
+  EXPECT_EQ(oracle.sparseVerifyArms, planned.sparseVerifyArms);
+  for (size_t i = 0; i < planned.bulkRejects.size(); i++) {
+    EXPECT_LE(planned.bulkRejects[i], oracle.bulkRejects[i])
+        << "counter=" << i;
+  }
 }

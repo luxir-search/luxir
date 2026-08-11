@@ -14,6 +14,7 @@
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
@@ -265,6 +266,52 @@ TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
   auto selective = runRange(*index.reader, "dense_i", -120'000, -119'800);
   EXPECT_GT(selective.cost, 0);
   EXPECT_LT(selective.cost, N);
+}
+
+TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
+  constexpr int32_t N = 2 * IntColReader::BLOCK_SIZE;
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  docs.reserve(N);
+  for (int32_t doc = 0; doc < N; doc++) {
+    int64_t value = doc == 0 ? 10
+        : doc < (int32_t)IntColReader::BLOCK_SIZE ? 20 : 30;
+    docs.push_back(flatdoc(
+        "id", "deleted_range_" + std::to_string(doc),
+        "deleted_only_i", value));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById(
+      "deleted_range_0", UpdateMessage::COMMIT).success);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  NumericRangeQuery query("deleted_only_i", 10, 10);
+  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+      query.createWeight(context, 0));
+  auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  Query::ScorerBuildContext buildContext;
+  buildContext.leadCost = std::numeric_limits<int64_t>::max();
+  EXPECT_EQ(Query::MatchState::NONEMPTY,
+            supplier->describeScorer(buildContext).matchState);
+  Query::Scorer* scorer = supplier->get(pool, buildContext.leadCost);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_NE(nullptr,
+            dynamic_cast<NumericRangeQuery::ZoneMapScorer*>(scorer));
+  EXPECT_EQ((std::vector<int32_t>{0}), collect(scorer));
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs("q").getNumber().limit(0);
+  topDocs.rawQuery() = qb::range(
+      topDocs.mr(), "deleted_only_i", qb::valI64(topDocs.mr(), 10),
+      nullptr, qb::valI64(topDocs.mr(), 10), nullptr);
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(0, req->getMatchCount("q"));
 }
 
 TEST_F(NumericRangeZoneMapTest, countDeclinesDeletedSegment) {

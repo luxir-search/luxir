@@ -141,6 +141,65 @@ std::vector<PointsReader::Point> readPoints(IndexReader::Segment& segment,
   return points.readAll();
 }
 
+enum class ExpectedScorerKind {
+  SPARSE_VERIFY,
+  POINTS_ARRAY,
+  POINTS_BIT,
+  ZONE_MAP,
+  SCAN,
+};
+
+void expectShapeAndScorer(IndexReader& reader, std::string_view field,
+                          int64_t lo, int64_t hi, int64_t leadCost,
+                          ExpectedScorerKind expectedKind) {
+  MemPool pool;
+  QueryState state(pool, reader, field, lo, hi);
+  auto* supplier = state.weight->scorerSupplier(
+      pool, reader.segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+
+  Query::ScorerBuildContext buildContext;
+  buildContext.leadCost = leadCost;
+  Query::ScorerShape shape = supplier->describeScorer(buildContext);
+  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY
+      || expectedKind == ExpectedScorerKind::SCAN;
+  EXPECT_EQ(Query::MatchState::NONEMPTY, shape.matchState);
+  EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
+  EXPECT_EQ(expectedTwoPhase ? Query::ReportedTwoPhase::YES
+                             : Query::ReportedTwoPhase::NO,
+            shape.reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::DIRECT, shape.windowFillClause);
+  EXPECT_EQ(Query::ClauseShape::NONE, shape.termDisjunctionClause);
+  EXPECT_EQ(Query::IndependentTermAccess::UNSUPPORTED,
+            shape.independentTerm);
+  EXPECT_EQ(Query::DocsOnlyAccess::UNSUPPORTED, shape.docsOnly);
+  EXPECT_EQ(Query::DirectDocSetAccess::UNSUPPORTED, shape.directDocSet);
+  EXPECT_FALSE(shape.hasUnknown());
+  EXPECT_EQ(Query::UnresolvedSupplierCause::NONE,
+            supplier->unresolvedScorerCause(buildContext));
+
+  Query::Scorer* scorer = supplier->get(pool, leadCost);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_EQ(expectedKind == ExpectedScorerKind::SPARSE_VERIFY,
+            dynamic_cast<NumericRangeQuery::RangeScorer<
+                IntColReader::SparseIterator>*>(scorer) != nullptr);
+  EXPECT_EQ(expectedKind == ExpectedScorerKind::POINTS_ARRAY,
+            dynamic_cast<NumericRangeQuery::PointsArrayScorer*>(scorer)
+                != nullptr);
+  EXPECT_EQ(expectedKind == ExpectedScorerKind::POINTS_BIT,
+            dynamic_cast<NumericRangeQuery::PointsBitScorer*>(scorer)
+                != nullptr);
+  EXPECT_EQ(expectedKind == ExpectedScorerKind::ZONE_MAP,
+            dynamic_cast<NumericRangeQuery::ZoneMapScorer*>(scorer)
+                != nullptr);
+  EXPECT_EQ(expectedKind == ExpectedScorerKind::SCAN,
+            dynamic_cast<NumericRangeQuery::RangeScorer<
+                IntColReader::Iterator>*>(scorer) != nullptr);
+  EXPECT_EQ(expectedTwoPhase, scorer->hasTwoPhase());
+  EXPECT_TRUE(scorer->supportsWindowFilter());
+  EXPECT_EQ(fullScan(reader, field, lo, hi), collect(scorer));
+}
+
 } // namespace
 
 class NumericRangePointsTest : public SoluxTest {};
@@ -250,19 +309,23 @@ TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {
 TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   constexpr int32_t N = 33'000;
   CollectionHelper helper;
-  const RangeField fields[] = {{"arm_sorted"}, {"arm_shuffled"}};
+  const RangeField fields[] = {
+    {"arm_sorted"}, {"arm_shuffled"}, {"arm_multi", true}};
   setRangeSchema(helper, fields);
 
   auto writer = helper.getIndexWriter();
   Inverter& inverter = writer->obtainInverter();
   auto& sorted = inverter.getIndexHandler("arm_sorted");
   auto& shuffled = inverter.getIndexHandler("arm_shuffled");
+  auto& multi = inverter.getIndexHandler("arm_multi");
   auto& scanSorted = inverter.getIndexHandler("arm_scan_sorted_i");
   auto& scanShuffled = inverter.getIndexHandler("arm_scan_shuffled_i");
   for (int32_t doc = 0; doc < N; doc++) {
     inverter.startDoc();
     sorted.index(inverter, doc);
     shuffled.index(inverter, (int64_t)((doc * 7919) % 33001));
+    const int64_t duplicateValues[] = {doc, doc};
+    multi.index(inverter, duplicateValues);
     scanSorted.index(inverter, doc);
     scanShuffled.index(inverter, (int64_t)((doc * 7919) % 33001));
     inverter.finishDoc();
@@ -271,6 +334,37 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   writer->commit();
   auto reader = writer->getIndexReader();
   auto& segment = reader->segments()[0];
+
+  auto sweepShape = [&](std::string_view field, int64_t lo, int64_t hi,
+                        ExpectedScorerKind denseKind) {
+    MemPool pool;
+    QueryState state(pool, *reader, field, lo, hi);
+    auto* supplier = state.weight->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    int64_t supplierCost = supplier->cost();
+    ASSERT_GT(supplierCost, 0);
+    expectShapeAndScorer(*reader, field, lo, hi, supplierCost - 1,
+                         ExpectedScorerKind::SPARSE_VERIFY);
+    expectShapeAndScorer(*reader, field, lo, hi, supplierCost, denseKind);
+    expectShapeAndScorer(*reader, field, lo, hi, supplierCost + 1, denseKind);
+    expectShapeAndScorer(*reader, field, lo, hi,
+                         std::numeric_limits<int64_t>::max(), denseKind);
+  };
+
+  sweepShape("arm_sorted", 100, 100,
+             ExpectedScorerKind::POINTS_ARRAY);
+  sweepShape("arm_sorted", 0, IntColReader::BLOCK_SIZE - 1,
+             ExpectedScorerKind::POINTS_BIT);
+  sweepShape("arm_sorted", 0, 26'000,
+             ExpectedScorerKind::POINTS_BIT);  // complement
+  sweepShape("arm_sorted", 0, N - 1,
+             ExpectedScorerKind::POINTS_BIT);  // all-match complement
+  sweepShape("arm_multi", 100, 200,
+             ExpectedScorerKind::POINTS_ARRAY);  // dedup
+  sweepShape("arm_scan_sorted_i", 0, IntColReader::BLOCK_SIZE - 1,
+             ExpectedScorerKind::ZONE_MAP);
+  sweepShape("arm_scan_shuffled_i", 0, 9'999,
+             ExpectedScorerKind::SCAN);
 
   auto select = [&](std::string_view field, int64_t lo, int64_t hi,
                     int64_t leadCost) {
@@ -591,6 +685,36 @@ TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
     EXPECT_EQ(exactCount(*reader, "wide_point", lo, hi),
               (int64_t)expected.size()) << "wide [" << lo << "," << hi << "]";
   }
+}
+
+TEST_F(NumericRangePointsTest, nonemptyFenceCanRefineToEmptyScorer) {
+  CollectionHelper helper;
+  const RangeField fields[] = {{"fence_gap"}};
+  setRangeSchema(helper, fields);
+  ASSERT_TRUE(helper.indexAll(
+      {flatdoc("id", "zero", "fence_gap", 0),
+       flatdoc("id", "ten", "fence_gap", 10)},
+      UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  QueryState state(pool, *reader, "fence_gap", 5, 5);
+  auto* supplier = state.weight->scorerSupplier(
+      pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+
+  Query::ScorerBuildContext buildContext;
+  buildContext.leadCost = std::numeric_limits<int64_t>::max();
+  Query::ScorerShape shape = supplier->describeScorer(buildContext);
+  EXPECT_EQ(Query::MatchState::NONEMPTY, shape.matchState);
+  Query::Scorer* scorer = supplier->get(pool, buildContext.leadCost);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_TRUE(collect(scorer).empty());
+
+  buildContext.numericRangeDisableShapesForTests = true;
+  EXPECT_TRUE(supplier->describeScorer(buildContext).hasUnknown());
+  EXPECT_EQ(Query::UnresolvedSupplierCause::NUMERIC_GEO,
+            supplier->unresolvedScorerCause(buildContext));
 }
 
 TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {

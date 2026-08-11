@@ -17,6 +17,7 @@
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/BoostQuery.h"
 #include "solux/query/NumericRangeQuery.h"
@@ -322,6 +323,19 @@ struct PhraseMatchCountGuard {
 
   int64_t calls() const {
     return PhraseQuery::Scorer::matchCallsForTests;
+  }
+};
+
+struct NumericRangeShapeGuard {
+  bool saved;
+
+  explicit NumericRangeShapeGuard(bool disabled)
+    : saved(NumericRangeQuery::disableShapesForTests) {
+    NumericRangeQuery::disableShapesForTests = disabled;
+  }
+
+  ~NumericRangeShapeGuard() {
+    NumericRangeQuery::disableShapesForTests = saved;
   }
 };
 
@@ -7385,6 +7399,11 @@ TEST_F(TermScorerTest, FilterMaskProbeAndFillProduceEquivalentSparseCounts) {
 
 TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
   CollectionHelper helper("range_filter_shapes");
+  SchemaBuilder schema;
+  auto& rangeField = schema.field("range_i");
+  rangeField.type = api::FieldDef::FieldClass::INT;
+  rangeField.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
   const int32_t nDocs = 2 * DocsEnumMeta::L1_DOCS + 257;
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
@@ -7463,9 +7482,11 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     std::type_index bulkType;
     int64_t fillCalls;
   };
-  auto run = [&](Query& query, bool pull, bool forceFill) {
+  auto run = [&](Query& query, bool pull, bool forceFill,
+                 bool disableShapes) {
     FilteredScoredBulkGuard bulkGuard(pull);
     FilterMaskProbeGuard probeGuard(forceFill);
+    NumericRangeShapeGuard shapeGuard(disableShapes);
     SkipStatsGuard stats;
     MemPool pool;
     Query::Context context(pool, *reader);
@@ -7499,12 +7520,15 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
 
   for (const auto& shape : cases) {
     SCOPED_TRACE(shape.name);
-    Run pull = run(*shape.query, true, false);
-    Run attached = run(*shape.query, false, false);
+    Run pull = run(*shape.query, true, false, true);
+    Run attached = run(*shape.query, false, false, false);
+    Run disabled = run(*shape.query, false, false, true);
     EXPECT_EQ(attached.bulkType, shape.bulkType);
     EXPECT_EQ(attached.docs, pull.docs);
+    EXPECT_EQ(disabled.bulkType, shape.bulkType);
+    EXPECT_EQ(disabled.docs, pull.docs);
     if (shape.probeReachable) {
-      Run fill = run(*shape.query, false, true);
+      Run fill = run(*shape.query, false, true, false);
       EXPECT_EQ(fill.bulkType, shape.bulkType);
       EXPECT_EQ(fill.docs, pull.docs);
       EXPECT_GT(fill.fillCalls, attached.fillCalls);

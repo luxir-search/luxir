@@ -27,6 +27,8 @@ class NumericRangeQuery final : public Query {
   int64_t hi;
 
 public:
+  static inline bool disableShapesForTests = false;
+
   NumericRangeQuery(std::string_view field, int64_t lo, int64_t hi)
     : field(field), lo(lo), hi(hi) {}
 
@@ -632,6 +634,13 @@ public:
 
       using Materialized = PointsMaterialize::Materialized;
 
+      enum class ScorerArm : uint8_t {
+        SPARSE_VERIFY,
+        POINTS,
+        ZONE_MAP,
+        SCAN,
+      };
+
       NumericRangeQuery::Weight& weight;
       IndexReader::Segment& segment;
       IntColReader& reader;
@@ -745,18 +754,6 @@ public:
             pool, result, segment.maxDoc(), weight.constantScore);
       }
 
-      Query::Scorer* phaseOneScorer(MemPool& pool) {
-        if (!useZoneMap) {
-          return pool.make<RangeScorer<IntColReader::Iterator>>(
-              reader, weight.query.getLo(), weight.query.getHi(), allMatch,
-              weight.constantScore);
-        }
-        skipCount(SkipStats::numericRangeZoneArms);
-        return pool.make<ZoneMapScorer>(
-            pool, reader, plans, weight.query.getLo(), weight.query.getHi(),
-            segment.maxDoc(), weight.constantScore);
-      }
-
       BulkScorer* phaseOneBulkScorer(MemPool& pool) {
         if (!useZoneMap) return nullptr;
         skipCount(SkipStats::numericRangeZoneArms);
@@ -777,6 +774,12 @@ public:
       bool useComplement(uint64_t exactCount) const {
         return points != nullptr && !reader.multiValued()
             && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
+      }
+
+      ScorerArm selectScorerArm(int64_t leadCost) const {
+        if (leadCost < estimatedCost) return ScorerArm::SPARSE_VERIFY;
+        if (points != nullptr) return ScorerArm::POINTS;
+        return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
       }
 
     public:
@@ -801,19 +804,31 @@ public:
 
       int64_t cost() override { return estimatedCost; }
 
-      // Deliberately all-UNKNOWN: the produced scorer arm (sparse verify,
-      // materialized points, zone map, scan) depends on leadCost; a
-      // falsely definite answer would poison route planning.
       Query::ScorerShape describeScorer(
           const Query::ScorerBuildContext& buildContext) const override {
-        unused(buildContext);
-        return {};
+        if (buildContext.numericRangeDisableShapesForTests) return {};
+        ScorerArm arm = selectScorerArm(buildContext.leadCost);
+        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
+            || arm == ScorerArm::SCAN;
+        return {
+          .matchState = Query::MatchState::NONEMPTY,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = twoPhase
+              ? Query::ReportedTwoPhase::YES
+              : Query::ReportedTwoPhase::NO,
+          .windowFillClause = Query::ClauseShape::DIRECT,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
           const Query::ScorerBuildContext& buildContext) const override {
-        unused(buildContext);
-        return Query::UnresolvedSupplierCause::NUMERIC_GEO;
+        return buildContext.numericRangeDisableShapesForTests
+            ? Query::UnresolvedSupplierCause::NUMERIC_GEO
+            : Query::UnresolvedSupplierCause::NONE;
       }
 
       Query::Scorer* createPointsScorerForTests(MemPool& targetPool) {
@@ -831,25 +846,36 @@ public:
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        if (leadCost < cost()) {
-          skipCount(SkipStats::numericRangeSparseVerifyArms);
-          return targetPool.make<RangeScorer<IntColReader::SparseIterator>>(
-              reader, weight.query.getLo(), weight.query.getHi(), allMatch,
-              weight.constantScore);
-        }
-        if (points != nullptr) {
-          auto [begin, end] = exactPositions(targetPool);
-          uint64_t exactCount = end - begin;
-          if (useComplement(exactCount)) {
-            skipCount(SkipStats::numericRangeComplementArms);
+        switch (selectScorerArm(leadCost)) {
+          case ScorerArm::SPARSE_VERIFY:
+            skipCount(SkipStats::numericRangeSparseVerifyArms);
+            return targetPool.make<
+                RangeScorer<IntColReader::SparseIterator>>(
+                    reader, weight.query.getLo(), weight.query.getHi(),
+                    allMatch, weight.constantScore);
+          case ScorerArm::POINTS: {
+            auto [begin, end] = exactPositions(targetPool);
+            uint64_t exactCount = end - begin;
+            if (useComplement(exactCount)) {
+              skipCount(SkipStats::numericRangeComplementArms);
+              return scorerFor(targetPool,
+                  materializeComplement(targetPool, begin, end));
+            }
+            skipCount(SkipStats::numericRangePointsArms);
             return scorerFor(targetPool,
-                materializeComplement(targetPool, begin, end));
+                materializePoints(targetPool, begin, end));
           }
-          skipCount(SkipStats::numericRangePointsArms);
-          return scorerFor(targetPool,
-              materializePoints(targetPool, begin, end));
+          case ScorerArm::ZONE_MAP:
+            skipCount(SkipStats::numericRangeZoneArms);
+            return targetPool.make<ZoneMapScorer>(
+                targetPool, reader, plans, weight.query.getLo(),
+                weight.query.getHi(), segment.maxDoc(), weight.constantScore);
+          case ScorerArm::SCAN:
+            return targetPool.make<RangeScorer<IntColReader::Iterator>>(
+                reader, weight.query.getLo(), weight.query.getHi(), allMatch,
+                weight.constantScore);
         }
-        return phaseOneScorer(targetPool);
+        std::unreachable();
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {

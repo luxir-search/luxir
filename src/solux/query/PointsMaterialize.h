@@ -82,10 +82,17 @@ struct PointsMaterialize {
 
     int32_t advance(int32_t target) override {
       assert(docid < target);
-      auto begin = docs.begin() + std::min<int64_t>(index + 1, docs.size());
-      auto found = std::lower_bound(begin, docs.end(), target);
-      index = found - docs.begin();
-      return docid = found == docs.end() ? PostingsReader::END : *found;
+      int64_t nextIndex = std::min<int64_t>(index + 1, docs.size());
+      if (nextIndex == (int64_t)docs.size()) {
+        index = nextIndex;
+        return docid = PostingsReader::END;
+      }
+      const int32_t* base = docs.data();
+      const int32_t* end = base + docs.size();
+      const int32_t* found = screaming::gallopLowerBound(
+          base + nextIndex, end, target);
+      index = found - base;
+      return docid = found == end ? PostingsReader::END : *found;
     }
 
     int32_t docId() override { return docid; }
@@ -121,6 +128,13 @@ struct PointsMaterialize {
     }
     int32_t docId() override { return docid; }
     bool supportsWindowFilter() const override { return true; }
+
+    void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
+                        int32_t windowEnd) override {
+      assert(windowStart >= 0 && windowEnd >= windowStart
+          && windowEnd <= limit);
+      bits.orRange(windowBits, windowStart, windowEnd);
+    }
   };
 
   class PointsArrayBulkScorer final : public BulkScorer {
@@ -128,6 +142,7 @@ struct PointsMaterialize {
     std::span<int32_t> outDocs;
     std::span<float> outScores;
     float constantScore;
+    int64_t windowIndex = 0;
 
     bool accepted(DocSet* filter, int32_t doc) const {
       return filter == nullptr || filter->get(doc);
@@ -142,12 +157,17 @@ struct PointsMaterialize {
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
-      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+      if (docs.empty() || min >= max
+          || (filter != nullptr && filter->card() == 0)) {
         return PostingsReader::END;
       }
-      auto begin = std::lower_bound(docs.begin(), docs.end(), min);
-      auto end = std::lower_bound(begin, docs.end(), max);
-      for (auto it = begin; it != end; ++it) {
+      const int32_t* base = docs.data();
+      const int32_t* docsEnd = base + docs.size();
+      const int32_t* begin = screaming::gallopLowerBound(
+          base + windowIndex, docsEnd, min);
+      const int32_t* end = screaming::gallopLowerBound(begin, docsEnd, max);
+      windowIndex = end - base;
+      for (const int32_t* it = begin; it != end; ++it) {
         if (!accepted(filter, *it)) continue;
         if (domainOut != nullptr) domainOut->add(*it);
         count++;
@@ -163,13 +183,17 @@ struct PointsMaterialize {
       out.size = 0;
       out.docs = outDocs;
       out.scores = outScores;
-      if (min >= max || minCompetitiveScore > constantScore
+      if (docs.empty() || min >= max || minCompetitiveScore > constantScore
           || (filter != nullptr && filter->card() == 0)) {
         return PostingsReader::END;
       }
-      auto begin = std::lower_bound(docs.begin(), docs.end(), min);
-      auto end = std::lower_bound(begin, docs.end(), max);
-      for (auto it = begin; it != end; ++it) {
+      const int32_t* base = docs.data();
+      const int32_t* docsEnd = base + docs.size();
+      const int32_t* begin = screaming::gallopLowerBound(
+          base + windowIndex, docsEnd, min);
+      const int32_t* end = screaming::gallopLowerBound(begin, docsEnd, max);
+      windowIndex = end - base;
+      for (const int32_t* it = begin; it != end; ++it) {
         if (!accepted(filter, *it)) continue;
         outDocs[(size_t)out.size] = *it;
         outScores[(size_t)out.size] = constantScore;

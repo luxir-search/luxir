@@ -12,6 +12,7 @@
 #include "BoostQuery.h"
 #include "ConstantScoreQuery.h"
 #include "MultiTermQuery.h"
+#include "NumericRangeQuery.h"
 #include "PhraseQuery.h"
 #include "TermQuery.h"
 #include "ScoreCompact.h"
@@ -824,6 +825,8 @@ public:
       Query::ScorerBuildContext buildContext =
           MultiTermQuery::Weight::scorerBuildContext(
               leadCost, PhraseQuery::ScorerControls::disableSortForTests);
+      buildContext.numericRangeDisableShapesForTests =
+          NumericRangeQuery::disableShapesForTests;
       buildContext.disableBooleanTwoPhaseForTests =
           disableTwoPhaseForTests;
       buildContext.disableDisjunctionTwoPhaseForTests =
