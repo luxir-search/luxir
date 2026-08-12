@@ -151,52 +151,45 @@ public:
 
 // Overview
 // ========
-// Execution follows Lucene's shape: Query -> Weight -> Scorer, plus one
-// addition, prepare(), for queries that need a whole-index pass before
-// per-segment scoring.
+// Query construction and segment execution are separated by an explicit plan:
 //
-//   Query   : the user's query, independent of any index.
-//   Weight  : created by a Query for one IndexReader (carried by Query::Context)
-//             via createWeight(); holds index-level state (term stats, cached
-//             enums, and child Weights for compound queries like BooleanQuery).
-//   SegmentSource
-//           : execution-facing source implemented by Weight and PreparedWeight.
-//   ScorerSupplier
-//           : temporary segment-local planning state that creates a Scorer.
-//   Scorer  : created by a ScorerSupplier for a single segment; iterates that
-//             segment's matching docs.
+//   Query
+//     -> createWeight(): per-query, cross-segment state for one IndexReader;
+//        Boolean normalization and flattening happen here.
+//     -> optional Weight::prepare(): domain-aware whole-index work returning an
+//        immutable PreparedWeight. Weight and PreparedWeight are SegmentSources.
+//     -> SegmentSource::scorerSupplier(): temporary per-segment planning state.
+//     -> ScorerSupplier::resolve(PlanContext{Demand{candidates, span, horizon},
+//                                            controls}): select one scorer arm.
+//     -> ScorerPlan: segment-pool-owned affine token recording the arm's shape,
+//        cost, demand, and construction state. A parent may retain child plans;
+//        one of build(), buildIndependent(), or buildDocsOnly() consumes it and
+//        produces the recorded cursor scorer or docs-only enum.
 //
-// Two phases, with different threading and allocation rules. Getting these
-// wrong can be a data race, so they are part of the contract:
+// Window and count consumers use planBulk(horizon, BulkScorerContext) ->
+// BulkPlan. A definite BulkPlan records its capabilities and supplier-owned
+// build state; buildBulk() produces the planned window producer, while
+// constantCount carries an exact scalar result without constructing an
+// executor. Composite plans retain the child ScorerPlans their build consumes.
 //
-// 1. Build: single-threaded, before search tasks are dispatched.
-//    createWeight() walks the Query tree and builds the Weight tree.  Weight
-//    ctors may read/populate the shared Query::Context (field/term caches) and
-//    allocate from Context::pool (the per-request MemPool).  Safe ONLY because
-//    it runs before any task is dispatched.
+// Scorer contains execution protocols only: exact cursor iteration, the private
+// or externally driven two-phase pair, fillWindowBits(), and scoring. Capability
+// selection and product construction belong to plans, not built scorers.
 //
-// 2. Execute: parallel, on the TBB task pool.
-//    a. prepare(): optional.  A Weight with the NEEDS_PREPARE trait is prepared
-//       before its segment scorers are created.  This is for any weight that
-//       must resolve state across the whole index before per-segment scorers
-//       exist: a leaf computing an index-level result (e.g. KnnQuery), or a
-//       compound query (e.g. BooleanQuery) that must prepare children after
-//       deriving their per-segment domains.
-//       prepare() returns an immutable PreparedWeight holding the whole-index
-//       result; scorerSupplier() then reads from it per segment.  Compound
-//       weights set NEEDS_PREPARE from child traits and recursively prepare
-//       children, threading per-segment domains down.
-//    b. scorerSupplier(targetPool, segment): called as needed for a segment,
-//       often from parallel tasks.  The supplier resolves a plan token, whose
-//       build() creates the Scorer.
+// Planning doctrine:
+//   - A route describes capability.
+//   - ExecutionUse declares the consumption horizon.
+//   - Exposure is priced in the consumer's unit: candidates for candidate
+//     probes, span for window fills.
+//   - UNKNOWN is always legal; a falsely definite answer never is.
+//   - Decisions are recorded in plans, not predicted beside construction.
 //
-//    Because (a) and (b) can run on worker threads, they MUST NOT allocate from
-//    Context::pool or populate/mutate the Context caches (both are
-//    single-thread-only, populated in phase 1).  They may read immutable state
-//    built in phase 1.  scorerSupplier() and Scorer creation allocate from the
-//    per-call targetPool; prepare() uses stack/std containers, local or
-//    thread-local MemPools, or heap allocations for scratch, and returns state
-//    owned by the PreparedWeight.
+// createWeight() runs single-threaded before search tasks are dispatched. It may
+// populate Query::Context caches and allocate from Context::pool. prepare(),
+// scorerSupplier(), resolve(), and plan construction may run on worker threads;
+// they may read that immutable state but MUST NOT mutate Context or allocate
+// from Context::pool. Their scratch and products belong to local, thread-local,
+// prepared-result, or per-segment storage as appropriate.
 //
 // Domain: the per-segment DocSet a query is restricted to (liveDocs from RootOp,
 // intersected with any filter clauses).  PrepareContext carries the per-segment
@@ -223,7 +216,6 @@ public:
 template <typename KeyType, typename ValType>
 class PoolMapVec {
 public:
-  // This is mostly a helper class since it was hard to get the types right the first time.
   // Example:
   // using SegFieldInfoMap = PoolMapVec<std::string_view, SegFieldInfo>;
   // SegFieldInfoMap segFieldInfoMap;
@@ -395,10 +387,9 @@ public:
     UNKNOWN,
   };
 
-  // The consumer that will execute a resolved scorer. PULL preserves the
-  // ordinary cursor path; the remaining values are the former BulkUse cases.
-  // Keeping one vocabulary here lets a supplier price an arm against the
-  // actual consumption horizon without a second API change in R2.
+  // The consumer protocol whose exposure the supplier must price. PULL uses
+  // cursor iteration; the window and candidate values declare their exact
+  // bulk consumption horizon.
   enum class ExecutionUse : uint8_t {
     PULL,
     COUNT_WINDOWS,
@@ -418,7 +409,8 @@ public:
       return {candidates, span, horizon};
     }
 
-    // R1 adapter: both demand units intentionally carry the old scalar.
+    // Convenience form for callers whose candidate and span estimates are the
+    // same scalar.
     static Demand fromLeadCost(
         int64_t leadCost,
         ExecutionUse horizon = ExecutionUse::PULL) noexcept {
@@ -693,8 +685,8 @@ public:
           ? buildBulk(targetPool, plan) : nullptr;
     }
 
-    /// Consume supplier-owned state from a definite plan when available. The
-    /// default preserves the historical bulk construction path.
+    /// Consume supplier-owned state from a definite plan. The default has no
+    /// bulk product.
     virtual BulkScorer* buildBulk(
         MemPool& targetPool, const BulkPlan& plan) {
       unused(targetPool, plan);
@@ -730,13 +722,13 @@ public:
     virtual Query::ScorerSupplier* scorerSupplier(
         MemPool& targetPool, IndexReader::Segment& segment) = 0;
 
-    /// Compatibility hook for existing scorer implementations. New call sites
-    /// should go through scorerSupplier(); the default supplier delegates here.
+    /// Direct scorer construction implemented by SegmentSources whose supplier
+    /// delegates its build to the source.
     virtual Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) = 0;
 
     /// Advisory flag for callers that can optimize domain filtering. Return
-    /// true only when every emitted doc is already within the PrepareContext
-    /// domain used to build this SegmentSource; false is always safe.
+    /// true only when every emitted doc is already within this SegmentSource's
+    /// PrepareContext construction domain; false is always safe.
     virtual bool outputIsSubsetOfDomain() const noexcept { return false; }
   };
 
@@ -770,8 +762,6 @@ public:
     // Ctor used by Context::create for arena allocation: the factory does the
     // work that can throw (pool allocation, FieldReader init, map bucket
     // allocation) and passes the results in, so this only binds/moves members.
-    // (solux::arenaCreate would make a throwing arena ctor safe now; the factory
-    // split is kept as structure, not a safety requirement.)
     Context(google::protobuf::Arena& arena, MemPool& pool,
             IndexReader& topReader,
             std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
@@ -1022,7 +1012,7 @@ public:
         : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel) {}
     };
 
-    /// Immutable result of prepare(), used to create segment scorers after
+    /// Immutable result of prepare() for segment-scorer creation after
     /// whole-index work has completed.
     class PreparedWeight : public Query::SegmentSource {
     public:
@@ -1031,8 +1021,9 @@ public:
       virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
       /// Advisory flag for callers that can optimize domain filtering. Return
-      /// true only when every emitted doc is already within the PrepareContext
-      /// domain used to build this PreparedWeight; false is always safe.
+      /// true only when every emitted doc is already within this
+      /// PreparedWeight's PrepareContext construction domain; false is always
+      /// safe.
       bool outputIsSubsetOfDomain() const noexcept override { return false; }
 
       /// Cache provenance for materialized output. The conservative default
@@ -1132,8 +1123,8 @@ public:
     /// or populate/mutate Query::Context caches.
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
-    /// Compatibility facade over the count planner. New consumers call
-    /// planBulk(COUNT_WINDOWS) directly.
+    /// Return a constant-count plan result, or -1 when this segment requires
+    /// execution to count.
     virtual int64_t count(IndexReader::Segment& segment) {
       auto guard = MemPool::threadLocalPoolGuard();
       ScorerSupplier* supplier = scorerSupplier(guard.pool(), segment);

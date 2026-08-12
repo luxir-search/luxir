@@ -3313,9 +3313,8 @@ TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
-  // One structural group plus scalable repeated groups. Effort 1 retains
-  // within-group and cross-group ranges; effort 2 restores the old 3-group
-  // corpus.
+  // One structural group plus scalable repeated groups. Effort 1 covers
+  // within-group and cross-group ranges; effort 2 uses a 3-group corpus.
   const int32_t fullGroups = 1 + (int32_t)scaleTestWork(1);
   const int32_t postingCount = fullGroups * DocsEnumMeta::L1_DOCS + 37;
   TestIndex testIndex;
@@ -4108,8 +4107,7 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
   std::array<Query*, 1> filterOnly = {&filterTerm};
   std::array<Query*, 1> prohibitedOnly = {&prohibited};
   {
-    // A direct-term filter no longer forces the pull fallback: the dense
-    // filter routes MandOpt to the window-mask bulk.
+    // A dense direct-term filter routes MandOpt to the window-mask bulk.
     BooleanQuery query(std::span<Query*>(mandOnly), optOnly, empty, filterOnly, 0);
     auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
     auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
@@ -5180,10 +5178,9 @@ TEST_F(TermScorerTest, phraseScoreUsesFullOverlappingFrequency) {
   EXPECT_TRUE(sawDoc3);
 }
 
-// Safety net for PhraseScorer matcher-policy extraction: these are the exact
-// production float bits before the refactor. Default/absent slop and explicit
-// slop=0 must retain them without changing IDF, frequency, norm, or score
-// operation order.
+// PhraseScorer's exact score contract includes these production float bits.
+// Default/absent slop and explicit slop=0 must preserve IDF, frequency, norm,
+// and score operation order.
 TEST_F(TermScorerTest, phraseExactScoreBitGoldens) {
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -9343,9 +9340,8 @@ TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
   EXPECT_EQ(exactCollector.totalHits(), (int64_t) N);
 }
 
-// Regression: CachedTermInfo used to cache a mutable postings-enum prototype. A scorer could
-// consume that prototype before another weight cloned it. The cache now holds immutable
-// positioned-term state, so every scorer starts independently without another seek.
+// CachedTermInfo holds immutable positioned-term state. Every scorer must start
+// independently without another dictionary seek.
 TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {
   const int32_t N = 3 * Postings::DOCS_BLOCK_SIZE + 7;  // multi-block, "needle" in every doc
   TestIndex testIndex;

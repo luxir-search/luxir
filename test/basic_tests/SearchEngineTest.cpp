@@ -951,8 +951,7 @@ TEST_F(SearchEngineTest, sumRejectsDateFields) {
 }
 
 // limit 0 ("count/aggregate only, no docs") must return an accurate count and any
-// sub-op results without collecting or ranking documents - and must never crash the
-// top-K collector (which used to assert topCount > 0 / build a zero-capacity heap).
+// sub-op results without collecting, ranking, or constructing a top-K heap.
 TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
   CollectionHelper helper;
   helper.index(flatdoc("foo_w", "brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::NO_COMMIT);
@@ -3211,8 +3210,8 @@ TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {
 
 namespace {
 
-// Forces the old two-arrangement constant top-k shape (independent capture
-// scorer + count-only bulk pass) for parity runs.
+// Forces independent capture-scorer and count-only-bulk arrangements for
+// parity runs.
 class OldConstantShapeGuard {
   bool saved;
 
@@ -3341,7 +3340,7 @@ void expectConstantTopKShapes(SearchEngine& engine) {
     auto old = runConstantConjTopK(engine, limit, true,
                                    withScores, withFilter, withFacet);
     // Filtered requests route through the filter-specific collection paths,
-    // not the constant window-capture branch (before this change too).
+    // not the constant window-capture branch.
     if (!withFilter) {
       EXPECT_GT(fresh.captures, 0);
     }

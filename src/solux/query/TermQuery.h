@@ -520,7 +520,7 @@ public:
       int32_t tf = docsEnum.termFreq();
       // Keep the flat-norms load inline (it is one indexed byte read); the
       // NOINLINE advanceNorm wrapper stays for the sparse iterator walk only,
-      // which is the code the inliner used to over-pull into score().
+      // which is the inliner-sensitive code pulled into score().
       int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[docid]
                                                      : advanceNorm(docid);
       return boost * simScorer->score((float) tf, encodedNorm);

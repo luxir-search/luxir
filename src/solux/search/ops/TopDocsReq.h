@@ -75,8 +75,8 @@ public:
           kSparseFilteredTopKUnionDensityInverse;
   static inline bool disableSparseFilteredTopKRerouteForTests = false;
   static inline bool disableSparseFilteredTopKUnionForTests = false;
-  // Forces the constant-scoring top-k path back to its old two-arrangement
-  // shape (independent first-K capture scorer + count-only bulk pass).
+  // Forces independent first-K capture and count-only bulk arrangements for
+  // constant-scoring top-k requests.
   static inline bool disableConstantWindowCaptureForTests = false;
 
   static int32_t sparseFilteredTopKDensityInverse(
@@ -605,8 +605,8 @@ public:
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
               : filter;
-          // Exact-count shortcut: ask the same planner for a scalar product
-          // instead of entering a separate Weight::count route.
+          // A constant-count plan satisfies this segment without constructing
+          // an executor.
           bool counted = false;
           if (!requiresPreparePhase && builderPtr == nullptr && filter == nullptr
               && !data->useFieldSort && data->scoreCollector->topCount == 0) {
@@ -886,9 +886,9 @@ public:
                     segnum, bulk, collectorFilter, builderPtr,
                     *data->scoreCollector, seg.maxDoc());
               } else if (op.weight->isConstantScoring()) {
-                // Test-forced old shape: the bulk scorer drives the
-                // exhaustive count/domain while an independent scorer visits
-                // only this segment's first K matches.
+                // In the test-forced arrangement, the bulk scorer drives the
+                // exhaustive count/domain and an independent scorer visits only
+                // this segment's first K matches.
                 auto* captureSupplier = mainScorerSupplier(poolGuard.pool(), seg);
                 int64_t captured = 0;
                 if (captureSupplier != nullptr) {
@@ -985,9 +985,7 @@ public:
 
   // ProtobufSearchParser resolves everything that can fail (sort field schema
   // lookup, Weight construction, filter weights) and passes the results in, so
-  // this ctor just binds members.  (arenaCreate registers ~TopDocsReq only
-  // after construction succeeds, so a throwing arena ctor is safe now - the
-  // parser split is parse-phase structure, not a nothrow requirement.)
+  // this ctor just binds members.
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::Context& qcontext, Query* query, Query::Weight* weight,
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,

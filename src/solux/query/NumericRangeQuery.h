@@ -55,9 +55,8 @@ public:
     return context.pool.make<Weight>(context, *this, flags, score);
   }
 
-  // This is deliberately the pre-zone-map scorer. It remains the sparse
-  // two-phase verifier and is also exposed to the benchmark as the old full
-  // column-scan baseline when instantiated with IntColReader::Iterator.
+  // RangeScorer is the sparse two-phase verifier and, when instantiated with
+  // IntColReader::Iterator, the benchmark's full column-scan baseline.
   template <class ColIter>
   class RangeScorer final : public Query::ConstantScorer {
     IntColReader& reader;
@@ -620,7 +619,7 @@ public:
     }
 
     class Supplier final : public Query::ScorerSupplier {
-      // Crossing values cost about 2x the old dense scan. Require at least
+      // Crossing values cost about 2x a dense scan. Require at least
       // half the values to be structurally prunable before using zone maps.
       // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
       // least representative hardware described by the tuning caveat.

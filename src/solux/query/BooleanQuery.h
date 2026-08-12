@@ -462,7 +462,7 @@ public:
   // instead of admitting its supplier into exact COUNT conjunction planning.
   static inline bool disableIntegratedFilteredCountForTests =
       std::getenv("SOLUX_DISABLE_INTEGRATED_FILTERED_COUNT") != nullptr;
-  // Test/bench hook: retain the prior dense/candidate/pull exact conjunction
+  // Test/bench hook: force dense/candidate/pull exact conjunction execution
   // instead of the direct-term docs-only bulk scorer.
   static inline bool disableExactTermCountForTests =
       std::getenv("SOLUX_DISABLE_EXACT_TERM_COUNT") != nullptr;
@@ -1011,9 +1011,9 @@ public:
             && std::all_of(
                 optionalDirectTerm.begin(), optionalDirectTerm.end(),
                 [](uint8_t value) { return value != 0; });
-        // The filtered scored-bulk density gate has already selected pull for
-        // this exact shape. The filter remains the conjunction lead; WAND only
-        // replaces the sole scoring disjunction member.
+        // The filtered scored-bulk density gate has selected pull for this
+        // exact shape. The filter remains the conjunction lead, and WAND is the
+        // sole scoring disjunction member.
         bool useFilteredUnionWand = !disableFilteredUnionWandForTests
             && needsScores && minShouldMatch == 1
             && mandatoryCount == 0 && prohibitedSourceCount == 0
@@ -4466,10 +4466,9 @@ public:
       // min_match > 1 and lets duplicates satisfy multiple match slots):
       // - min_match above half the clauses ("10 words, mm=9") is a MISS
       //   BUDGET: the user allows N - mm absences. Each removed duplicate
-      //   decrements min_match (floored at 1), keeping the budget constant -
-      //   a doc containing the duplicated term matches exactly as before,
-      //   and a doc missing it is no longer charged for one absent term
-      //   more than once.
+      //   decrements min_match (floored at 1), keeping the budget constant: a
+      //   doc containing the duplicated term satisfies that slot, and a doc
+      //   missing it is charged for the absence only once.
       // - min_match at or below half ("10 words, mm=2") is an ABSOLUTE
       //   COUNT: match at least mm distinct words. It stays as-is, capped
       //   at the deduped clause count so an all-duplicates query remains

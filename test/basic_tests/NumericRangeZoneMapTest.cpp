@@ -264,7 +264,7 @@ TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
               oracle(extremeGcd, endpoint, endpoint));
   }
 
-  // A selective correlated range should no longer advertise docsWithField.
+  // A selective correlated range must advertise its selective estimate.
   auto selective = runRange(*index.reader, "dense_i", -120'000, -119'800);
   EXPECT_GT(selective.cost, 0);
   EXPECT_LT(selective.cost, N);

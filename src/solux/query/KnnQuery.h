@@ -757,9 +757,8 @@ public:
           cleared[seg] = 1;
         }
         // Hand engines a span only where it can exclude something: a
-        // liveness seed or at least one pooled rank.  An all-ones span
-        // would only demote a previously selector-less scan to a per-vector
-        // always-true probe.
+        // liveness seed or at least one pooled rank. An all-ones span would
+        // demote a selector-free scan to a per-vector always-true probe.
         for (size_t i = 0; i < numSegs; i++) {
           if (!eligibleStore[i].empty()
               && (rankLivePerSeg[i] != nullptr || cleared[i])) {
@@ -1756,8 +1755,8 @@ public:
         //   BREADTH - allocateToBudget appended new lists: only the freshly
         //            allocated tail needs scanning, since prior lists' hits
         //            are already unioned into the host pool.
-        // Scanning only the new tail on a breadth round turns the old O(rounds x
-        // lists) IVF re-scan into O(lists) total.  A breadth round is only entered
+        // Scanning only the new tail on breadth rounds keeps total IVF list
+        // scanning O(lists). A breadth round is only entered
         // after a poolExhausted=true round (host loop), so every prior list is
         // already drained at this depth - omitting them from this round's
         // exhaustion accounting is correct.  Flat (below-threshold) engines are
@@ -1773,8 +1772,8 @@ public:
         // SUPERSET of what one global pass over all selected lists would
         // return - PROVIDED every list was scanned at the final candidate
         // count, which is exactly what the depth-round full re-scan maintains.
-        // What must NOT happen on the depth axis is skipping previously
-        // scanned lists - that silently loses recall.  EXCLUDING the host's
+        // What must NOT happen on the depth axis is skipping already-scanned
+        // lists - that silently loses recall. EXCLUDING the host's
         // already-POOLED ranks (request.eligible) is safe, and is also what
         // makes the smaller fresh-budget heaps sound: if x is in
         // top-(pooled+k)(P) and x is not pooled, fewer than k members of

@@ -615,7 +615,7 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
 
 // Multi-term version of the anti-correlated frontier corpus: numTerms terms,
 // each round-robin over docids so each gets its own anti-correlated block
-// structure (loose corner, tight frontier).  Used to measure whether the T2
+// structure (loose corner, tight frontier). Measures whether the T2
 // frontier bound tightens the MULTI-term windowed-MaxScore window bound, not
 // just the single-term block skip.
 std::vector<std::string> makeMtTerms(int32_t numTerms) {

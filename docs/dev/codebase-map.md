@@ -30,9 +30,14 @@ locations, browse `src/solux/<area>/`.
      `GEO_POINT` field. Absence of either = `SegFieldInfo.pointsMetaOff == 0`.
 
 4. **Query System** (`src/solux/query/`)
-   - `Query`: Abstract query representation
-   - `Weight`: Query adapted to specific index
-   - `Scorer`: Executes query on specific segment
+
+   Query execution flows from an index-independent `Query` through a
+   cross-segment `Weight`, then through a per-segment `ScorerSupplier` that
+   resolves retained construction plans for the cursor, docs-only, bulk, or
+   constant-count product the consumer will execute. The Overview in
+   [`Query.h`](../../src/solux/query/Query.h) is the authoritative hierarchy and
+   planning-contract description.
+
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
@@ -78,7 +83,7 @@ locations, browse `src/solux/<area>/`.
 
 ## Request Flow
 
-**Search**: gRPC/HTTP Request -> SearchEngine -> Query Parsing -> Parallel Segment Search -> Result Collection -> Response
+**Search**: gRPC/HTTP Request -> SearchEngine -> Query Parsing -> Weight Creation -> Per-Segment Plan Resolution and Execution -> Result Collection -> Response
 
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 
