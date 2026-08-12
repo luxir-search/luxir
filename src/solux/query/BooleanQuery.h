@@ -922,6 +922,9 @@ public:
         case Query::ClauseShape::FLAT_DISJUNCTION:
           assert(!directWindowFill && flatWindowFill);
           break;
+        case Query::ClauseShape::FLAT_CONJUNCTION:
+          assert(false);
+          break;
         case Query::ClauseShape::NONE:
           assert(!directWindowFill && !flatWindowFill);
           break;
@@ -942,8 +945,35 @@ public:
         case Query::ClauseShape::FLAT_DISJUNCTION:
           assert(!directTerm && flatTermDisjunction);
           break;
+        case Query::ClauseShape::FLAT_CONJUNCTION:
+          assert(false);
+          break;
         case Query::ClauseShape::NONE:
           assert(!directTerm && !flatTermDisjunction);
+          break;
+        case Query::ClauseShape::UNKNOWN:
+          break;
+      }
+
+      auto conjunctionMembers = scorer->flatConjunctionScorers();
+      bool flatTermConjunction = !conjunctionMembers.empty()
+          && std::all_of(
+              conjunctionMembers.begin(), conjunctionMembers.end(),
+              [](Query::Scorer* member) {
+                return dynamic_cast<TermQuery::Scorer*>(member) != nullptr;
+              });
+      switch (shape.termConjunctionClause) {
+        case Query::ClauseShape::DIRECT:
+          assert(directTerm);
+          break;
+        case Query::ClauseShape::FLAT_CONJUNCTION:
+          assert(!directTerm && flatTermConjunction);
+          break;
+        case Query::ClauseShape::NONE:
+          assert(!directTerm && !flatTermConjunction);
+          break;
+        case Query::ClauseShape::FLAT_DISJUNCTION:
+          assert(false);
           break;
         case Query::ClauseShape::UNKNOWN:
           break;
@@ -1323,6 +1353,7 @@ public:
           .reportedTwoPhase = reportedTwoPhase,
           .windowFillClause = Query::ClauseShape::NONE,
           .termDisjunctionClause = Query::ClauseShape::NONE,
+          .termConjunctionClause = Query::ClauseShape::NONE,
           .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -1484,7 +1515,26 @@ public:
             && mandatoryScores[0] != 0) {
           return mandatoryShapeSuppliers[0]->describeScorer(memberContext);
         }
-        return opaqueShape(state);
+        Query::ScorerShape shape = opaqueShape(state);
+        if (requiredCount >= 1) {
+          bool allTerms = true;
+          for (auto suppliers : {
+                   mandatoryShapeSuppliers, filterSuppliers}) {
+            for (auto* supplier : suppliers) {
+              if (supplier == nullptr) {
+                allTerms = false;
+                continue;
+              }
+              allTerms &= supplier->describeScorer(memberContext).directKind
+                  == Query::DirectScorerKind::TERM;
+            }
+          }
+          if (allTerms) {
+            shape.termConjunctionClause =
+                Query::ClauseShape::FLAT_CONJUNCTION;
+          }
+        }
+        return shape;
       }
 
       std::optional<bool> directWindowFilters(
@@ -1980,7 +2030,23 @@ public:
         READY,
         DECLINED,
         NO_MATCH,
-        LEGACY,
+      };
+
+      struct BooleanBulkBuildState : BulkBuildState {
+        enum class Kind : uint8_t {
+          CONJUNCTION,
+          MAND_OPT,
+          MAX_SCORE,
+          FILTERED_DISJUNCTION,
+          EXACT_FILTERED_MAND_OPT,
+          FILTERED_BODY,
+          FILTER_ONLY,
+          DELEGATE_FILTERED_CHILD,
+        };
+
+        Kind kind;
+
+        explicit BooleanBulkBuildState(Kind kind) : kind(kind) {}
       };
 
       struct PlannedEntry {
@@ -2003,7 +2069,7 @@ public:
         Query::ScorerPlan* plan = nullptr;
       };
 
-      struct ConjunctionPlan : BulkBuildState {
+      struct ConjunctionPlan : BooleanBulkBuildState {
         ConjunctionMode mode = ConjunctionMode::SCORED_BODY;
         ConjunctionRoute route = ConjunctionRoute::GENERIC;
         BulkUse use = BulkUse::MATCH_WINDOWS;
@@ -2018,9 +2084,102 @@ public:
         bool docSetSparseEligible = false;
         bool recordConjunctionConstruction = false;
         bool hasDirectDenseClause = false;
+        bool negatedCount = false;
         Query::ScorerPlan* independentLeadPlan = nullptr;
         Query::UnresolvedSupplierCause unresolvedCause =
             Query::UnresolvedSupplierCause::NONE;
+
+        ConjunctionPlan()
+          : BooleanBulkBuildState(
+                BooleanBulkBuildState::Kind::CONJUNCTION) {}
+      };
+
+      struct MandOptPlan : BooleanBulkBuildState {
+        PlannedSupplier mandatory;
+        std::span<PlannedSupplier> optional;
+        std::span<int64_t> optionalCosts;
+        int64_t mandatoryCost = 0;
+
+        MandOptPlan()
+          : BooleanBulkBuildState(Kind::MAND_OPT) {}
+      };
+
+      enum class MaxScoreCountRoute : uint8_t {
+        ORDINARY,
+        DISJUNCTION_IDENTITY,
+        DISJUNCTION_OF_CONJUNCTIONS,
+      };
+
+      enum class DisjunctionIdentityFallback : uint8_t {
+        NONE,
+        DELETES,
+        NON_TERM,
+        PROFITABILITY,
+      };
+
+      struct MaxScorePlan : BooleanBulkBuildState {
+        std::span<PlannedSupplier> optional;
+        std::span<int64_t> optionalCosts;
+        std::span<PlannedSupplier> prohibited;
+        int64_t aggregateClauseCost = 0;
+        MaxScoreCountRoute countRoute = MaxScoreCountRoute::ORDINARY;
+        DisjunctionIdentityFallback identityFallback =
+            DisjunctionIdentityFallback::NONE;
+        size_t identityLargestIndex = 0;
+
+        MaxScorePlan()
+          : BooleanBulkBuildState(Kind::MAX_SCORE) {}
+      };
+
+      struct FilteredDisjunctionPlan : BooleanBulkBuildState {
+        PlannedSupplier filter{};
+        DocSet* filterDocs = nullptr;
+        bool arrayFilterFeed = false;
+        bool postingsFilterFeed = false;
+        std::span<PlannedSupplier> optional;
+
+        FilteredDisjunctionPlan()
+          : BooleanBulkBuildState(Kind::FILTERED_DISJUNCTION) {}
+      };
+
+      struct ExactFilteredMandOptPlan : BooleanBulkBuildState {
+        ConjunctionPlan* required = nullptr;
+        std::span<PlannedSupplier> optional;
+
+        ExactFilteredMandOptPlan()
+          : BooleanBulkBuildState(Kind::EXACT_FILTERED_MAND_OPT) {}
+      };
+
+      struct FilteredBodyPlan : BooleanBulkBuildState {
+        Query::ScorerSupplier* bodySupplier = nullptr;
+        BulkPlan bodyPlan;
+        std::span<PlannedSupplier> filters;
+        int64_t bodyCost = 0;
+        int64_t filterCost = 0;
+
+        FilteredBodyPlan()
+          : BooleanBulkBuildState(Kind::FILTERED_BODY) {}
+      };
+
+      struct PlannedBulkSupplier {
+        Query::ScorerSupplier* supplier = nullptr;
+        int64_t cost = 0;
+        BulkPlan plan;
+      };
+
+      struct FilterOnlyPlan : BooleanBulkBuildState {
+        std::span<PlannedBulkSupplier> filters;
+
+        FilterOnlyPlan()
+          : BooleanBulkBuildState(Kind::FILTER_ONLY) {}
+      };
+
+      struct DelegateFilteredChildPlan : BooleanBulkBuildState {
+        Query::ScorerSupplier* child = nullptr;
+        BulkPlan childPlan;
+
+        DelegateFilteredChildPlan()
+          : BooleanBulkBuildState(Kind::DELEGATE_FILTERED_CHILD) {}
       };
 
       struct ConjunctionPlanningResult {
@@ -2079,6 +2238,8 @@ public:
             return true;
           case Query::ClauseShape::FLAT_DISJUNCTION:
             return !ConjunctionBulkScorer::disableDisjGroupBulkForTests;
+          case Query::ClauseShape::FLAT_CONJUNCTION:
+            return false;
           case Query::ClauseShape::NONE:
             return false;
           case Query::ClauseShape::UNKNOWN:
@@ -2243,7 +2404,7 @@ public:
             if (hasUnknownElision(optionalSuppliers, buildContext)) {
               plan.unresolvedCause = firstUnresolvedCause(
                   optionalSuppliers, buildContext);
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             entry.shape = plannedOptionalGroupShape(
                 optionalSuppliers, buildContext);
@@ -2280,7 +2441,7 @@ public:
                 prohibitedSuppliers, prohibitedBuildContext)) {
           plan.unresolvedCause = firstUnresolvedCause(
               prohibitedSuppliers, prohibitedBuildContext);
-          return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
         }
 
         plan.entries = targetPool.make_span<PlannedEntry>(entries.size());
@@ -2317,6 +2478,12 @@ public:
                     prohibitedBuildContext);
           }
         }
+        plan.negatedCount = std::any_of(
+            plan.prohibited.begin(), plan.prohibited.end(),
+            [](const PlannedSupplier& prohibited) {
+              return prohibited.shape.matchState
+                  == Query::MatchState::NONEMPTY;
+            });
 
         auto finishRoute = [&](ConjunctionRoute route,
                                bool constructsConjunction) {
@@ -2349,7 +2516,7 @@ public:
           bool supported = true;
           for (const PlannedEntry& entry : plan.entries) {
             if (entry.shape.docsOnly == Query::DocsOnlyAccess::UNKNOWN) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             supported &= entry.shape.docsOnly
                 == Query::DocsOnlyAccess::SUPPORTED;
@@ -2369,7 +2536,7 @@ public:
                   == Query::ClauseShape::UNKNOWN
               || entry.shape.termDisjunctionClause
                   == Query::ClauseShape::UNKNOWN) {
-            return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
           }
         }
 
@@ -2377,7 +2544,7 @@ public:
           for (const PlannedEntry& entry : plan.entries) {
             if (entry.shape.reportedTwoPhase
                 == Query::ReportedTwoPhase::UNKNOWN) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             if (entry.shape.reportedTwoPhase
                 == Query::ReportedTwoPhase::YES) {
@@ -2391,7 +2558,7 @@ public:
             for (size_t i = 1; i < plan.entries.size(); i++) {
               std::optional<bool> term = directTerm(plan.entries[i].shape);
               if (!term.has_value()) {
-                return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
               }
               if (!*term) {
                 return {ConjunctionPlanStatus::DECLINED, plan};
@@ -2400,7 +2567,7 @@ public:
             std::optional<bool> leadDocSet =
                 directDocSet(plan.entries[0].shape);
             if (!leadDocSet.has_value()) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             plan.entries[0].docSetFilter = *leadDocSet;
             int64_t minRatio = *leadDocSet
@@ -2416,7 +2583,7 @@ public:
             if (!leadTerm.has_value()
                 || plan.entries[0].shape.independentTerm
                     == Query::IndependentTermAccess::UNKNOWN) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             if (disableCandidateTermFeedForTests
                 || !plan.entries[0].scoring || !*leadTerm
@@ -2430,12 +2597,12 @@ public:
             for (PlannedEntry& entry : plan.entries) {
               std::optional<bool> term = directTerm(entry.shape);
               if (!term.has_value()) {
-                return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
               }
               if (entry.filter) {
                 std::optional<bool> docSet = directDocSet(entry.shape);
                 if (!docSet.has_value()) {
-                  return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
                 }
                 entry.docSetFilter = *docSet;
                 if (!*docSet && !*term) {
@@ -2460,7 +2627,7 @@ public:
             }
             if (prohibited.shape.termDisjunctionClause
                 == Query::ClauseShape::UNKNOWN) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             if (prohibited.shape.termDisjunctionClause
                     != Query::ClauseShape::DIRECT
@@ -2483,7 +2650,7 @@ public:
             std::optional<bool> leadTerm =
                 directTerm(plan.entries[0].shape);
             if (!leadTerm.has_value()) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             if (*leadTerm) {
               return finishRoute(
@@ -2514,7 +2681,7 @@ public:
           for (const PlannedEntry& entry : plan.entries) {
             std::optional<bool> term = directTerm(entry.shape);
             if (!term.has_value()) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             allTerms &= *term;
           }
@@ -2530,7 +2697,7 @@ public:
         for (const PlannedEntry& entry : plan.entries) {
           std::optional<bool> dense = windowFillClause(entry.shape);
           if (!dense.has_value()) {
-            return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
           }
           allDense &= *dense;
         }
@@ -2541,7 +2708,7 @@ public:
           }
           std::optional<bool> dense = windowFillClause(prohibited.shape);
           if (!dense.has_value()) {
-            return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
           }
           allDenseProhibited &= *dense;
         }
@@ -2554,7 +2721,7 @@ public:
             }
             if (entry.shape.directKind
                 == Query::DirectScorerKind::UNKNOWN) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             plan.hasDirectDenseClause |=
                 entry.shape.directKind == Query::DirectScorerKind::TERM
@@ -2568,7 +2735,7 @@ public:
           for (size_t i = 1; i < plan.entries.size(); i++) {
             std::optional<bool> term = directTerm(plan.entries[i].shape);
             if (!term.has_value()) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             bool directDenseDocSet =
                 !ConjunctionBulkScorer::disableDirectDenseClausesForTests
@@ -2593,7 +2760,7 @@ public:
         std::optional<bool> leadDocSet =
             directDocSet(plan.entries[0].shape);
         if (!leadDocSet.has_value()) {
-          return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
         }
         plan.entries[0].docSetFilter = *leadDocSet;
         plan.docSetSparseEligible = *leadDocSet;
@@ -2601,7 +2768,7 @@ public:
           for (size_t i = 1; i < plan.entries.size(); i++) {
             std::optional<bool> term = directTerm(plan.entries[i].shape);
             if (!term.has_value()) {
-              return {ConjunctionPlanStatus::LEGACY, plan};
+              return {ConjunctionPlanStatus::DECLINED, plan};
             }
             plan.docSetSparseEligible &= *term;
           }
@@ -2669,6 +2836,7 @@ public:
             && left.reportedTwoPhase == right.reportedTwoPhase
             && left.windowFillClause == right.windowFillClause
             && left.termDisjunctionClause == right.termDisjunctionClause
+            && left.termConjunctionClause == right.termConjunctionClause
             && left.independentTerm == right.independentTerm
             && left.docsOnly == right.docsOnly
             && left.directDocSet == right.directDocSet;
@@ -2722,13 +2890,16 @@ public:
       static BulkPlan knownBulkPlan(
           BulkAnswer available, BulkAnswer matchWindows,
           BulkAnswer exactCandidateScoring,
-          BulkAnswer consumesFilters = BulkAnswer::NO) {
-        return {
+          BulkAnswer consumesFilters = BulkAnswer::NO,
+          BulkAnswer acceptsWindowFilter = BulkAnswer::NO) {
+        BulkPlan plan{
           available,
           matchWindows,
           exactCandidateScoring,
           consumesFilters,
         };
+        plan.acceptsWindowFilter = acceptsWindowFilter;
+        return plan;
       }
 
       static BulkPlan noBulkPlan() {
@@ -2738,93 +2909,38 @@ public:
 
       static BulkPlan matchWindowBulkPlan() {
         return knownBulkPlan(
-            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO);
-      }
-
-      BulkPlan planFilteredDisjunctionBulk() {
-        if (disableFilteredDisjunctionBatchForTests || allowsPruning
-            || !mandatorySources.empty() || optionalSources.size() < 2
-            || !prohibitedSources.empty() || filterSuppliers.size() != 1
-            || minShouldMatch != 1) {
-          return noBulkPlan();
-        }
-        auto* filterSupplier = filterSuppliers[0];
-        if (filterSupplier == nullptr) {
-          return noBulkPlan();
-        }
-        int64_t filterCost = filterSupplier->cost();
-        int32_t densityInverse = needsScores
-            ? filteredDisjunctionBatchDensityInverseForTests
-            : QueryPrep::kSparseBatchCountOwnDensityInverse;
-        if (densityInverse <= 0
-            || filterCost > segment.maxDoc() / densityInverse) {
-          return noBulkPlan();
-        }
-
-        bool filterFeed = false;
-        if (auto* docSetSupplier =
-                dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
-          DocSet* docs = docSetSupplier->docSet();
-          if (docs == nullptr || docs->card() == 0) {
-            return noBulkPlan();
-          }
-          filterFeed = true;
-        } else if (!QueryPrep::disableSparseBatchPostingsFeedForTests) {
-          Query::ScorerShape shape = describeResolved(
-              filterSupplier, scorerBuildContext(filterCost));
-          if (shape.matchState == Query::MatchState::UNKNOWN
-              || shape.directKind == Query::DirectScorerKind::UNKNOWN) {
-            return {};
-          }
-          if (shape.matchState == Query::MatchState::EMPTY) {
-            return noBulkPlan();
-          }
-          filterFeed =
-              shape.directKind == Query::DirectScorerKind::TERM;
-        }
-        if (!filterFeed) {
-          return noBulkPlan();
-        }
-
-        Query::PlanContext buildContext = scorerBuildContext(
-            std::numeric_limits<int64_t>::max());
-        bool hasOptional = false;
-        for (auto* supplier : optionalShapeSuppliers) {
-          if (supplier == nullptr) continue;
-          Query::ScorerShape shape =
-              describeResolved(supplier, buildContext);
-          if (shape.matchState == Query::MatchState::UNKNOWN
-              || shape.directKind == Query::DirectScorerKind::UNKNOWN) {
-            return {};
-          }
-          if (shape.matchState == Query::MatchState::EMPTY) continue;
-          if (shape.directKind != Query::DirectScorerKind::TERM) {
-            // Two-phase rejection remains owned by the deferred helper below.
-            // Keep its BulkPlan unknown so an exact child shape does not
-            // silently migrate the helper or erase its build-discard tripwire.
-            if (shape.reportedTwoPhase
-                != Query::ReportedTwoPhase::NO) {
-              return {};
-            }
-            return noBulkPlan();
-          }
-          hasOptional = true;
-        }
-        if (!hasOptional) {
-          return noBulkPlan();
-        }
-        return knownBulkPlan(
-            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
+            BulkAnswer::NO, BulkAnswer::YES);
       }
 
       BulkPlan planConjunctionBulk(
           BulkUse use, ConjunctionMode mode,
-          AcceptedConjunctionRoutes acceptedRoutes) {
+          AcceptedConjunctionRoutes acceptedRoutes,
+          std::span<Query::ScorerSupplier* const>
+              enclosingFilterSuppliers = {}) {
         ConjunctionPlanningResult planning = planConjunction(
-            pool, mode, acceptedRoutes, use);
+            pool, mode, acceptedRoutes, use,
+            enclosingFilterSuppliers);
         switch (planning.status) {
           case ConjunctionPlanStatus::READY: {
-            BulkPlan bulkPlan = matchWindowBulkPlan();
+            bool acceptsWindowFilter = true;
+            for (const PlannedEntry& entry : planning.plan.entries) {
+              acceptsWindowFilter &=
+                  entry.shape.termDisjunctionClause
+                      == Query::ClauseShape::DIRECT
+                  || (!ConjunctionBulkScorer::
+                           disableDisjGroupBulkForTests
+                      && entry.shape.termDisjunctionClause
+                          == Query::ClauseShape::FLAT_DISJUNCTION);
+            }
+            BulkPlan bulkPlan = knownBulkPlan(
+                BulkAnswer::YES, BulkAnswer::YES,
+                mode == ConjunctionMode::CANDIDATE
+                    ? BulkAnswer::YES : BulkAnswer::NO,
+                enclosingFilterSuppliers.empty()
+                    ? BulkAnswer::NO : BulkAnswer::YES,
+                acceptsWindowFilter
+                    ? BulkAnswer::YES : BulkAnswer::NO);
             resolveConjunctionChildren(pool, planning.plan);
             auto* buildPlan = pool.make<ConjunctionPlan>(planning.plan);
             buildPlan->owner = this;
@@ -2834,28 +2950,8 @@ public:
           case ConjunctionPlanStatus::DECLINED:
           case ConjunctionPlanStatus::NO_MATCH:
             return noBulkPlan();
-          case ConjunctionPlanStatus::LEGACY:
-            return {};
         }
         std::unreachable();
-      }
-
-      BulkPlan planMaxScoreBulk() const {
-        Query::PlanContext buildContext = scorerBuildContext(
-            std::numeric_limits<int64_t>::max());
-        bool hasOptional = false;
-        for (auto* supplier : optionalShapeSuppliers) {
-          if (supplier == nullptr) continue;
-          Query::ScorerShape shape =
-              describeResolved(supplier, buildContext);
-          if (shape.matchState == Query::MatchState::UNKNOWN) {
-            return {};
-          }
-          if (shape.matchState == Query::MatchState::NONEMPTY) {
-            hasOptional = true;
-          }
-        }
-        return hasOptional ? matchWindowBulkPlan() : noBulkPlan();
       }
 
       bool filteredDisjunctionDensityDecline() const {
@@ -2879,398 +2975,7 @@ public:
       // construction. The cheapest required clause can then own a docs-only
       // feed for exact or pruned collection; scoring clauses alone supply
       // score bounds. SCORED_BODY leaves filters to a window mask selected by
-      // filteredScoredBulkScorer.
-      MaybeConjunctionBulk legacyConjunctionBulkScorer(
-          MemPool& targetPool, ConjunctionMode mode,
-          std::span<Query::ScorerSupplier* const>
-              enclosingFilterSuppliers = {}) {
-        bool exhaustive = mode == ConjunctionMode::EXHAUSTIVE;
-        bool includeFilters = mode != ConjunctionMode::SCORED_BODY;
-        if (!includeFilters && !enclosingFilterSuppliers.empty()) {
-          assert(false);
-          return {};
-        }
-        struct Entry {
-          int64_t cost;
-          Query::ScorerSupplier* supplier;
-          bool optionalGroup;
-          bool filter;
-          bool docSetFilter;
-          bool scoring;
-          size_t order;
-        };
-        boost::container::small_vector<Entry, 16> entries;
-        size_t entryOrder = 0;
-        for (size_t i = 0; i < mandatorySources.size(); i++) {
-          auto* source = mandatorySources[i];
-          auto* supplier = source->scorerSupplier(targetPool, segment);
-          if (supplier == nullptr) {
-            return {};  // a required clause cannot match this segment
-          }
-          entries.push_back({
-              supplier->cost(), supplier, false, false, false,
-              mandatoryScores[i] != 0, entryOrder++});
-        }
-        if (includeFilters) {
-          for (auto* supplier : filterSuppliers) {
-            if (supplier == nullptr) {
-              return {};
-            }
-            entries.push_back({
-                supplier->cost(), supplier, false, true,
-                dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr,
-                false, entryOrder++});
-          }
-          for (auto* supplier : enclosingFilterSuppliers) {
-            if (supplier == nullptr) {
-              return {};
-            }
-            entries.push_back({
-                supplier->cost(), supplier, false, true,
-                dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr,
-                false, entryOrder++});
-          }
-        }
-
-        boost::container::small_vector<Query::ScorerSupplier*, 16>
-            optionalGroupSuppliers;
-        boost::container::small_vector<int64_t, 16> optionalGroupCosts;
-        bool hasOptionalGroup = exhaustive && minShouldMatch >= 1
-            && !optionalSources.empty();
-        if (hasOptionalGroup) {
-          for (auto* source : optionalSources) {
-            auto* supplier = source->scorerSupplier(targetPool, segment);
-            if (supplier == nullptr) {
-              continue;
-            }
-            optionalGroupSuppliers.push_back(supplier);
-            optionalGroupCosts.push_back(supplier->cost());
-          }
-          if (optionalGroupSuppliers.empty()) {
-            return {};
-          }
-          entries.push_back({
-              optionalCost(optionalGroupCosts, 1, segment.maxDoc()),
-              nullptr, true, false, false, false, entryOrder++});
-        }
-        if (entries.empty()
-            || (entries.size() < 2
-                && (!exhaustive || prohibitedSources.empty()))) {
-          return {};
-        }
-        std::sort(entries.begin(), entries.end(),
-                  [](const Entry& a, const Entry& b) {
-                    return a.cost != b.cost ? a.cost < b.cost
-                                            : a.order < b.order;
-                  });
-        // An exact filtered conjunction of direct terms is a complete
-        // docs-only operation whether the filter belongs to this Boolean or
-        // is supplied by an enclosing request wrapper.
-        bool exactFilteredTermConjunction = mode == ConjunctionMode::EXHAUSTIVE
-            && !needsScores && !disableExactTermCountForTests
-            && (!filterSuppliers.empty()
-                || !enclosingFilterSuppliers.empty());
-        if (exactFilteredTermConjunction) {
-          bool supported = entries.size()
-                  >= ConjunctionBulkScorer::kIntegratedCountMinClauses
-              && prohibitedSources.empty() && !hasOptionalGroup;
-          if (!supported) {
-            if (!enclosingFilterSuppliers.empty()) {
-              return {};
-            }
-            exactFilteredTermConjunction = false;
-          }
-        }
-        bool termFeed = false;
-        if (mode == ConjunctionMode::CANDIDATE) {
-          if (entries[0].filter) {
-            for (size_t i = 1; i < entries.size(); i++) {
-              if (dynamic_cast<TermQuery::Weight::Supplier*>(
-                      entries[i].supplier) == nullptr) {
-                return {};
-              }
-            }
-            int64_t minRatio = entries[0].docSetFilter
-                ? multiTermBatchMinRatioDocSet
-                : multiTermBatchMinRatioPostings;
-            if (entries[1].cost < minRatio * entries[0].cost) {
-              return {};
-            }
-          } else {
-            if (disableCandidateTermFeedForTests
-                || !entries[0].scoring
-                || dynamic_cast<TermQuery::Weight::Supplier*>(
-                       entries[0].supplier) == nullptr
-                || entries[0].cost * kTermFeedMaxLeadFractionForTests
-                       > segment.maxDoc()) {
-              return {};
-            }
-            for (const Entry& entry : entries) {
-              bool directTerm =
-                  dynamic_cast<TermQuery::Weight::Supplier*>(
-                      entry.supplier) != nullptr;
-              if (entry.filter ? !entry.docSetFilter && !directTerm
-                               : !entry.scoring || !directTerm) {
-                return {};
-              }
-              if (entry.docSetFilter
-                  && entries[0].cost * kTermFeedMinDocSetFilterRatio
-                         > entry.cost) {
-                return {};
-              }
-            }
-            termFeed = true;
-          }
-        }
-        int64_t leadCost = entries[0].cost;
-        int64_t nonLeadCost = 0;
-        for (size_t i = 1; i < entries.size(); i++) {
-          nonLeadCost += entries[i].cost;
-        }
-        if (exactFilteredTermConjunction) {
-          auto countTermEnums =
-              targetPool.make_span<DocsOnlyEnum*>(entries.size());
-          bool supported = true;
-          for (size_t i = 0; i < entries.size(); i++) {
-            countTermEnums[i] =
-                entries[i].supplier->getDocsOnly(targetPool);
-            if (countTermEnums[i] == nullptr) {
-              supported = false;
-              break;
-            }
-          }
-          if (supported) {
-            return ConjunctionBulkResult{
-              targetPool.make<ExactDocsOnlyTermConjunctionBulkScorer>(
-                  targetPool, countTermEnums, segment.maxDoc()),
-              ConjunctionRoute::COUNT_EXACT_DOCS_ONLY,
-              enclosingFilterSuppliers.empty()
-                  ? EnclosingFilters::NOT_SUPPLIED
-                  : EnclosingFilters::CONSUMED
-            };
-          }
-          if (!enclosingFilterSuppliers.empty()) {
-            return {};
-          }
-        }
-        auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
-        auto clauseScores = targetPool.make_span<uint8_t>(entries.size());
-        for (size_t i = 0; i < entries.size(); i++) {
-          Query::Scorer* scorer;
-          if (entries[i].optionalGroup) {
-            auto* members = targetPool.make_arr<Query::Scorer*>(
-                optionalGroupSuppliers.size());
-            size_t memberCount = 0;
-            for (auto* supplier : optionalGroupSuppliers) {
-#ifndef NDEBUG
-              Query::PlanContext buildContext =
-                  scorerBuildContext(leadCost);
-#endif
-              auto* member = supplier->get(targetPool, leadCost);
-#ifndef NDEBUG
-              assertScorerShape(supplier, member, buildContext);
-#endif
-              if (member != nullptr) {
-                members[memberCount++] = member;
-              }
-            }
-            if (memberCount == 0) {
-              return {};
-            }
-            scorer = memberCount == 1
-              ? members[0]
-              : targetPool.make<BooleanQuery::DisjunctionScorer>(
-                  targetPool,
-                  std::span<Query::Scorer*>(members, memberCount));
-          } else {
-#ifndef NDEBUG
-            Query::PlanContext buildContext =
-                scorerBuildContext(leadCost);
-#endif
-            scorer = entries[i].supplier->get(targetPool, leadCost);
-#ifndef NDEBUG
-            assertScorerShape(entries[i].supplier, scorer, buildContext);
-#endif
-          }
-          if (scorer == nullptr
-              || (mode != ConjunctionMode::EXHAUSTIVE
-                  && scorer->hasTwoPhase())) {
-            return {};
-          }
-          arr[i] = scorer;
-          clauseScores[i] = entries[i].scoring;
-        }
-        TermQuery::Scorer* candidateLeadScoreScorer = nullptr;
-        std::span<uint8_t> candidateFilters;
-        std::span<DocSet*> candidateFilterDocSets;
-        if (termFeed) {
-          candidateLeadScoreScorer = dynamic_cast<TermQuery::Scorer*>(
-              entries[0].supplier->getIndependent(targetPool, leadCost));
-          assert(candidateLeadScoreScorer != nullptr);
-          if (candidateLeadScoreScorer == nullptr) {
-            return {};
-          }
-          candidateFilters =
-              targetPool.make_span<uint8_t>(entries.size());
-          candidateFilterDocSets =
-              targetPool.make_span<DocSet*>(entries.size());
-          std::fill(
-              candidateFilters.begin(), candidateFilters.end(), 0);
-          std::fill(
-              candidateFilterDocSets.begin(),
-              candidateFilterDocSets.end(), nullptr);
-          for (size_t i = 0; i < entries.size(); i++) {
-            if (!entries[i].filter) {
-              continue;
-            }
-            candidateFilters[i] = 1;
-            if (auto* supplier = dynamic_cast<QueryPrep::DocSetSupplier*>(
-                    entries[i].supplier)) {
-              candidateFilterDocSets[i] = supplier->docSet();
-            }
-          }
-        }
-        bool docSetSparseEligible = entries[0].docSetFilter;
-        if (docSetSparseEligible) {
-          for (size_t i = 1; i < entries.size(); i++) {
-            if (dynamic_cast<TermQuery::Scorer*>(arr[i]) == nullptr) {
-              docSetSparseEligible = false;
-              break;
-            }
-          }
-        }
-        TermQuery::Scorer* candidatePostingsLead = nullptr;
-        if (mode == ConjunctionMode::CANDIDATE) {
-          if (termFeed) {
-            candidatePostingsLead =
-                dynamic_cast<TermQuery::Scorer*>(arr[0]);
-          } else if (!disableFilteredConjunctionPostingsFeedForTests
-                     && entries[0].filter && !entries[0].docSetFilter) {
-            candidatePostingsLead =
-                dynamic_cast<TermQuery::Scorer*>(arr[0]);
-            for (size_t i = 1;
-                 candidatePostingsLead != nullptr && i < entries.size();
-                 i++) {
-              if (dynamic_cast<TermQuery::Scorer*>(arr[i]) == nullptr) {
-                candidatePostingsLead = nullptr;
-              }
-            }
-          }
-        } else if (mode == ConjunctionMode::EXHAUSTIVE && !needsScores
-                   && !disableIntegratedFilteredCountForTests
-                   && (!filterSuppliers.empty()
-                       || !enclosingFilterSuppliers.empty())
-                   && entries.size()
-                       >= ConjunctionBulkScorer::kIntegratedCountMinClauses
-                   && prohibitedSources.empty() && !hasOptionalGroup
-                   && segment.maxDoc() >= DocsEnumMeta::L1_DOCS
-                   && leadCost >= std::max<int64_t>(
-                       1, (int64_t) segment.maxDoc()
-                           / ConjunctionBulkScorer::
-                               termTailDenseThresholdInverseForTests)) {
-          candidatePostingsLead =
-              dynamic_cast<TermQuery::Scorer*>(arr[0]);
-          for (size_t i = 1;
-               candidatePostingsLead != nullptr && i < entries.size(); i++) {
-            if (dynamic_cast<TermQuery::Scorer*>(arr[i]) == nullptr) {
-              candidatePostingsLead = nullptr;
-            }
-          }
-        }
-        Query::Scorer** prohibitedArr = nullptr;
-        size_t prohibitedCount = 0;
-        std::span<TermQuery::Scorer*> candidateProhibitedTerms;
-        if (exhaustive) {
-          prohibitedArr =
-              targetPool.make_arr<Query::Scorer*>(prohibitedSources.size());
-          for (auto* source : prohibitedSources) {
-            auto* supplier = source->scorerSupplier(targetPool, segment);
-            if (supplier == nullptr) {
-              continue;
-            }
-#ifndef NDEBUG
-            Query::PlanContext buildContext =
-                scorerBuildContext(leadCost);
-#endif
-            auto* scorer = supplier->get(targetPool, leadCost);
-#ifndef NDEBUG
-            assertScorerShape(supplier, scorer, buildContext);
-#endif
-            if (scorer != nullptr) {
-              prohibitedArr[prohibitedCount++] = scorer;
-            }
-          }
-        } else if (mode == ConjunctionMode::CANDIDATE
-                   && !prohibitedSources.empty()) {
-          auto& terms = *targetPool.make_vec<TermQuery::Scorer*>();
-          for (auto* source : prohibitedSources) {
-            auto* supplier = source->scorerSupplier(targetPool, segment);
-            if (supplier == nullptr) {
-              continue;
-            }
-#ifndef NDEBUG
-            Query::PlanContext buildContext =
-                scorerBuildContext(leadCost);
-#endif
-            auto* scorer = supplier->get(targetPool, leadCost);
-#ifndef NDEBUG
-            assertScorerShape(supplier, scorer, buildContext);
-#endif
-            if (scorer == nullptr) {
-              continue;
-            }
-            if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
-              terms.push_back(term);
-              continue;
-            }
-            auto members = scorer->flatDisjunctionScorers();
-            if (members.empty()) {
-              return {};
-            }
-            for (auto* member : members) {
-              auto* term = dynamic_cast<TermQuery::Scorer*>(member);
-              if (term == nullptr) {
-                return {};
-              }
-              terms.push_back(term);
-            }
-          }
-          candidateProhibitedTerms = {terms.data(), terms.size()};
-        }
-        auto* bulk = targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
-            targetPool, std::span<Query::Scorer*>(arr, entries.size()),
-            std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
-            candidateProhibitedTerms,
-            clauseScores, segment.maxDoc(), leadCost, nonLeadCost, !exhaustive,
-            entries[0].docSetFilter, candidatePostingsLead,
-            candidateLeadScoreScorer,
-            candidateFilters, candidateFilterDocSets);
-        ConjunctionRoute route = ConjunctionRoute::GENERIC;
-        if (mode == ConjunctionMode::CANDIDATE) {
-          if (termFeed && candidatePostingsLead != nullptr) {
-            route = ConjunctionRoute::CANDIDATE_SCORING_TERM;
-          } else if (candidatePostingsLead != nullptr) {
-            route = ConjunctionRoute::CANDIDATE_POSTINGS_FILTER;
-          } else if (docSetSparseEligible) {
-            route = ConjunctionRoute::CANDIDATE_DOC_SET_FILTER;
-          }
-        } else if (mode == ConjunctionMode::EXHAUSTIVE) {
-          if (bulk->willSampleCandidateCount()) {
-            route = ConjunctionRoute::COUNT_POSTINGS_SAMPLE;
-          } else if (bulk->willCountDense()) {
-            route = ConjunctionRoute::COUNT_DENSE;
-          } else if (docSetSparseEligible && prohibitedSources.empty()) {
-            route = ConjunctionRoute::COUNT_DOC_SET_SPARSE;
-          }
-        }
-        return ConjunctionBulkResult{
-          bulk, route,
-          enclosingFilterSuppliers.empty()
-              ? EnclosingFilters::NOT_SUPPLIED
-              : EnclosingFilters::CONSUMED
-        };
-      }
-
+      // the filtered scored-body route.
       MaybeConjunctionBulk buildConjunction(
           MemPool& targetPool, const ConjunctionPlan& plan) {
         auto assertBuildDemand = [&](const Query::Demand& demand) {
@@ -3348,6 +3053,9 @@ public:
                 assert(!layout.denseMembers.empty());
               }
               break;
+            case Query::ClauseShape::FLAT_CONJUNCTION:
+              assert(false);
+              break;
             case Query::ClauseShape::NONE:
             case Query::ClauseShape::UNKNOWN:
               break;
@@ -3367,6 +3075,9 @@ public:
                 }
 #endif
               }
+              break;
+            case Query::ClauseShape::FLAT_CONJUNCTION:
+              assert(false);
               break;
             case Query::ClauseShape::NONE:
             case Query::ClauseShape::UNKNOWN:
@@ -3544,7 +3255,8 @@ public:
             plan.mode != ConjunctionMode::EXHAUSTIVE,
             plan.entries[0].docSetFilter, candidatePostingsLead,
             candidateLeadScoreScorer, candidateFilters,
-            candidateFilterDocSets, false, clauseLayouts,
+            candidateFilterDocSets, plan.negatedCount, false,
+            clauseLayouts,
             prohibitedLayouts.first(prohibitedCount));
 
 #ifndef NDEBUG
@@ -3582,48 +3294,6 @@ public:
         }
       }
 
-      static void recordUnknownIsland(
-          Query::UnresolvedSupplierCause cause) {
-        skipCount(SkipStats::conjPlanUnknownIsland);
-        switch (cause) {
-          case Query::UnresolvedSupplierCause::MULTITERM:
-            skipCount(SkipStats::conjPlanUnknownIslandMultiTerm);
-            break;
-          case Query::UnresolvedSupplierCause::PHRASE:
-            skipCount(SkipStats::conjPlanUnknownIslandPhrase);
-            break;
-          case Query::UnresolvedSupplierCause::NUMERIC_GEO:
-            skipCount(SkipStats::conjPlanUnknownIslandNumericGeo);
-            break;
-          case Query::UnresolvedSupplierCause::NONE:
-          case Query::UnresolvedSupplierCause::OTHER:
-            skipCount(SkipStats::conjPlanUnknownIslandOther);
-            break;
-        }
-      }
-
-      MaybeConjunctionBulk conjunctionBulkScorer(
-          MemPool& targetPool, ConjunctionMode mode,
-          AcceptedConjunctionRoutes acceptedRoutes,
-          BulkUse use,
-          std::span<Query::ScorerSupplier* const>
-              enclosingFilterSuppliers = {}) {
-        ConjunctionPlanningResult planning = planConjunction(
-            targetPool, mode, acceptedRoutes, use,
-            enclosingFilterSuppliers);
-        if (planning.status == ConjunctionPlanStatus::LEGACY) {
-          recordUnknownIsland(planning.plan.unresolvedCause);
-          return legacyConjunctionBulkScorer(
-              targetPool, mode, enclosingFilterSuppliers);
-        }
-        recordConjunctionPlanCommitment(planning.plan);
-        if (planning.status != ConjunctionPlanStatus::READY) {
-          return {};
-        }
-        resolveConjunctionChildren(targetPool, planning.plan);
-        return buildConjunction(targetPool, planning.plan);
-      }
-
       void recordCandidateConjunctionEngagement(
           const ConjunctionBulkResult& result) const {
         assert(result.usesCandidateRoute());
@@ -3640,109 +3310,118 @@ public:
         }
       }
 
-      // Deferred scored-path helpers migrate to plan-before-build in measured
-      // tripwire priority:
-      // mandOpt: bulkBuiltThenRejectedMandOptTwoPhase.
-      // maxScore: bulkBuiltThenRejectedMaxScoreProhibited.
-      // attachDirectFilters: bulkBuiltThenRejectedFilterAttach.
-      // filteredDisjunction: bulkBuiltThenRejectedFilteredDisj.
-      // exactFilteredMandOpt: bulkBuiltThenRejectedExactMandOpt.
-      // filteredScored: bulkBuiltThenRejectedFilteredScored.
-      // filterOnly: bulkBuiltThenRejectedFilterOnly.
-
-      BulkScorer* mandOptBulkScorer(
-          MemPool& targetPool,
-          Query::ScorerSupplier* precomputedMandSupplier = nullptr,
-          const Query::ScorerSupplier::BulkScorerContext* bulkContext =
-              nullptr) {
-        auto* mandSupplier = precomputedMandSupplier != nullptr
-            ? precomputedMandSupplier
-            : mandatorySources[0]->scorerSupplier(targetPool, segment);
+      BulkPlan planMandOptBulk(
+          BulkUse use,
+          const Query::ScorerSupplier::BulkScorerContext& bulkContext) {
+        auto* mandSupplier = mandatoryShapeSuppliers[0];
         if (mandSupplier == nullptr) {
-          return nullptr;
+          return noBulkPlan();
         }
-        if (bulkContext != nullptr && bulkContext->hasFilter()
+        if (bulkContext.hasFilter()
             && !disableFilteredMandOptFillGateForTests
             && filterDensityBelow(
-                bulkContext->filterCost, segment.maxDoc(),
+                bulkContext.filterCost, segment.maxDoc(),
                 kMandOptScalarFillDensityInverse)
             && mandSupplier->scoreBlockFillKind()
                 == Query::ScorerSupplier::ScoreBlockFillKind::DEFAULT_SCALAR) {
-          skipCount(SkipStats::mandOptBulkScalarFillFallbacks);
-          return nullptr;
+          return noBulkPlan();
         }
         int64_t mandCost = mandSupplier->cost();
-        auto* mandScorer = mandSupplier->get(targetPool, mandCost);
-        if (mandScorer == nullptr || mandScorer->hasTwoPhase()) {
-          if (mandScorer != nullptr) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedMandOptTwoPhase);
-          }
-          return nullptr;
+        Query::Demand demand = Query::Demand::fromLeadCost(mandCost, use);
+        Query::PlanContext buildContext = scorerBuildContext(demand);
+        Query::ScorerShape mandShape =
+            describeResolved(mandSupplier, buildContext);
+        if (mandShape.matchState != Query::MatchState::NONEMPTY
+            || mandShape.reportedTwoPhase != Query::ReportedTwoPhase::NO) {
+          return noBulkPlan();
         }
 
-        auto& optScorers = *targetPool.make_vec<Query::Scorer*>();
-        auto& optCosts = *targetPool.make_vec<int64_t>();
-        optScorers.reserve(optionalSources.size());
-        optCosts.reserve(optionalSources.size());
-        for (auto* source : optionalSources) {
-          auto* supplier = source->scorerSupplier(targetPool, segment);
+        boost::container::small_vector<PlannedSupplier, 16> optional;
+        boost::container::small_vector<int64_t, 16> optionalCosts;
+        for (auto* supplier : optionalShapeSuppliers) {
           if (supplier == nullptr) {
             continue;
           }
           int64_t cost = supplier->cost();
-          auto* scorer = supplier->get(targetPool, mandCost);
-          if (scorer == nullptr) {
+          Query::ScorerShape shape =
+              describeResolved(supplier, buildContext);
+          if (shape.matchState == Query::MatchState::EMPTY) {
             continue;
           }
-          if (scorer->hasTwoPhase()) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedMandOptTwoPhase);
-            return nullptr;
+          if (shape.matchState != Query::MatchState::NONEMPTY
+              || shape.reportedTwoPhase != Query::ReportedTwoPhase::NO) {
+            return noBulkPlan();
           }
-          optScorers.push_back(scorer);
-          optCosts.push_back(cost);
+          optional.push_back({supplier, shape, demand});
+          optionalCosts.push_back(cost);
         }
-        if (optScorers.empty()) {
-          return nullptr;
+        if (optional.empty()) {
+          return noBulkPlan();
         }
 
-        return targetPool.make<BooleanQuery::MandOptBulkScorer>(
-            targetPool, mandScorer,
-            std::span<Query::Scorer*>(optScorers.data(), optScorers.size()),
-            std::span<int64_t>(optCosts.data(), optCosts.size()),
-            segment.maxDoc(), mandCost);
+        auto* state = pool.make<MandOptPlan>();
+        state->owner = this;
+        state->mandatory = {mandSupplier, mandShape, demand};
+        state->mandatory.plan = mandSupplier->resolve(pool, buildContext);
+        state->mandatoryCost = mandCost;
+        state->optional = pool.make_span<PlannedSupplier>(optional.size());
+        state->optionalCosts = pool.make_span<int64_t>(optionalCosts.size());
+        for (size_t i = 0; i < optional.size(); i++) {
+          optional[i].plan = optional[i].supplier->resolve(
+              pool, buildContext);
+          state->optional[i] = optional[i];
+          state->optionalCosts[i] = optionalCosts[i];
+        }
+        BulkPlan plan = matchWindowBulkPlan();
+        plan.buildState = state;
+        plan.acceptsWindowFilter = BulkAnswer::YES;
+        return plan;
       }
 
-      BulkScorer* maxScoreBulkScorer(MemPool& targetPool,
-                                     bool withBulkExclusion = false) {
-        auto& optionalScorersVec = *targetPool.make_vec<Query::Scorer*>();
-        optionalScorersVec.reserve(optionalSources.size());
+      BulkScorer* buildMandOptBulk(
+          MemPool& targetPool, const MandOptPlan& plan) {
+        Query::Scorer* mandatory = plan.mandatory.plan->build(targetPool);
+        assert(mandatory != nullptr && !mandatory->hasTwoPhase());
+        auto optional = targetPool.make_span<Query::Scorer*>(
+            plan.optional.size());
+        for (size_t i = 0; i < plan.optional.size(); i++) {
+          optional[i] = plan.optional[i].plan->build(targetPool);
+          assert(optional[i] != nullptr && !optional[i]->hasTwoPhase());
+        }
+        return targetPool.make<BooleanQuery::MandOptBulkScorer>(
+            targetPool, mandatory, optional, plan.optionalCosts,
+            segment.maxDoc(), plan.mandatoryCost);
+      }
+
+      BulkPlan planMaxScoreBulk(BulkUse use,
+                                bool withBulkExclusion = false) {
+        Query::Demand optionalDemand = Query::Demand::fromLeadCost(
+            std::numeric_limits<int64_t>::max(), use);
+        Query::PlanContext optionalContext =
+            scorerBuildContext(optionalDemand);
+        boost::container::small_vector<PlannedSupplier, 16> optional;
+        boost::container::small_vector<int64_t, 16> optionalCosts;
         // Count-only identity routing needs every per-segment term df even for
         // the common two-clause case. Scored execution keeps its existing
         // four-clause threshold for retaining costs.
-        auto* optionalCostsVec =
-          (!needsScores || optionalSources.size() >= kCostAwareOrderMinClauses)
-            ? targetPool.make_vec<int64_t>() : nullptr;
-        if (optionalCostsVec != nullptr) {
-          optionalCostsVec->reserve(optionalSources.size());
-        }
+        bool retainCosts = !needsScores
+            || optionalSources.size() >= kCostAwareOrderMinClauses;
         int64_t aggregateClauseCost = 0;
-        for (auto* source : optionalSources) {
-          auto* supplier = source->scorerSupplier(targetPool, segment);
+        for (auto* supplier : optionalShapeSuppliers) {
           if (supplier == nullptr) {
             continue;
           }
           int64_t cost = supplier->cost();
-          auto* scorer = supplier->get(
-              targetPool, std::numeric_limits<int64_t>::max());
-          if (scorer == nullptr) {
+          Query::ScorerShape shape =
+              describeResolved(supplier, optionalContext);
+          if (shape.matchState == Query::MatchState::EMPTY) {
             continue;
           }
-          optionalScorersVec.push_back(scorer);
-          if (optionalCostsVec != nullptr) {
-            optionalCostsVec->push_back(cost);
+          if (shape.matchState != Query::MatchState::NONEMPTY) {
+            return noBulkPlan();
           }
+          optional.push_back({supplier, shape, optionalDemand});
+          optionalCosts.push_back(cost);
           if (cost > 0
               && aggregateClauseCost < std::numeric_limits<int64_t>::max()) {
             int64_t room = std::numeric_limits<int64_t>::max()
@@ -3754,94 +3433,174 @@ public:
             }
           }
         }
-        std::span<Query::Scorer*> optionalScorers(
-            optionalScorersVec.data(), optionalScorersVec.size());
-        std::span<int64_t> optionalCosts;
-        if (optionalCostsVec != nullptr) {
-          optionalCosts = {optionalCostsVec->data(), optionalCostsVec->size()};
-        }
-        if (optionalScorers.size() < 2) {
-          if (withBulkExclusion) {
-            skipCount(SkipStats::bulkExclusionPositiveSegmentFallbacks);
-          }
-          return nullptr;
+        if (optional.size() < 2) {
+          return noBulkPlan();
         }
 
-        std::span<Query::Scorer*> exclusionScorers;
+        Query::Demand exclusionDemand = Query::Demand::fromLeadCost(
+            aggregateClauseCost, use);
+        Query::PlanContext exclusionContext =
+            scorerBuildContext(exclusionDemand);
+        boost::container::small_vector<PlannedSupplier, 16> prohibited;
         if (withBulkExclusion) {
-          auto& exclusions = *targetPool.make_vec<Query::Scorer*>();
-          for (auto* source : prohibitedSources) {
-            auto* supplier = source->scorerSupplier(targetPool, segment);
+          for (auto* supplier : prohibitedShapeSuppliers) {
             if (supplier == nullptr) {
               continue;
             }
-            auto* scorer = supplier->get(targetPool, aggregateClauseCost);
-            if (scorer == nullptr) {
+            Query::ScorerShape shape =
+                describeResolved(supplier, exclusionContext);
+            if (shape.matchState == Query::MatchState::EMPTY) {
               continue;
             }
-            bool supportsWindowFilter = scorer->supportsWindowFilter();
-            scorer->recordWindowFilterCommit(supportsWindowFilter);
-            if (supportsWindowFilter) {
-              exclusions.push_back(scorer);
-              continue;
+            if (shape.matchState != Query::MatchState::NONEMPTY
+                || (shape.windowFillClause != Query::ClauseShape::DIRECT
+                    && shape.windowFillClause
+                        != Query::ClauseShape::FLAT_DISJUNCTION)) {
+              return noBulkPlan();
             }
-            // A prohibited Boolean is decomposable only as a flat OR whose
-            // members each satisfy the same exact window-fill contract.
-            auto members = scorer->flatDisjunctionScorers();
-            if (members.empty()
-                || !std::all_of(
-                    members.begin(), members.end(), [](Query::Scorer* member) {
-                      bool supported = member->supportsWindowFilter();
-                      member->recordWindowFilterCommit(supported);
-                      return supported;
-                    })) {
-              skipCount(SkipStats::bulkExclusionUnsupportedFallbacks);
-              skipCount(SkipStats::bulkBuiltThenRejected);
-              skipCount(SkipStats::bulkBuiltThenRejectedMaxScoreProhibited);
-              return nullptr;
-            }
-            exclusions.insert(exclusions.end(), members.begin(), members.end());
+            prohibited.push_back({supplier, shape, exclusionDemand});
           }
-          exclusionScorers = {exclusions.data(), exclusions.size()};
+        }
+
+        auto* state = pool.make<MaxScorePlan>();
+        state->owner = this;
+        state->aggregateClauseCost = aggregateClauseCost;
+        state->optional = pool.make_span<PlannedSupplier>(optional.size());
+        state->optionalCosts = retainCosts
+            ? pool.make_span<int64_t>(optional.size())
+            : std::span<int64_t>{};
+        for (size_t i = 0; i < optional.size(); i++) {
+          optional[i].plan = optional[i].supplier->resolve(
+              pool, optionalContext);
+          state->optional[i] = optional[i];
+          if (retainCosts) state->optionalCosts[i] = optionalCosts[i];
+        }
+        state->prohibited =
+            pool.make_span<PlannedSupplier>(prohibited.size());
+        for (size_t i = 0; i < prohibited.size(); i++) {
+          prohibited[i].plan = prohibited[i].supplier->resolve(
+              pool, exclusionContext);
+          state->prohibited[i] = prohibited[i];
+        }
+
+        if (!needsScores && !disableDisjunctionCountIdentityForTests) {
+          if (segment.liveDocs() != nullptr) {
+            state->identityFallback =
+                DisjunctionIdentityFallback::DELETES;
+          } else {
+          bool allTerms = true;
+          size_t largestIndex = 0;
+          int64_t largestDf = -1;
+          int64_t totalDf = 0;
+          for (size_t i = 0; i < optional.size(); i++) {
+            allTerms &= optional[i].shape.directKind
+                == Query::DirectScorerKind::TERM;
+            int64_t df = optionalCosts[i];
+            if (df > largestDf) {
+              largestDf = df;
+              largestIndex = i;
+            }
+            totalDf = df >= std::numeric_limits<int64_t>::max() - totalDf
+                ? std::numeric_limits<int64_t>::max()
+                : totalDf + df;
+          }
+          int64_t otherDf = totalDf == std::numeric_limits<int64_t>::max()
+              ? totalDf : totalDf - largestDf;
+          if (!allTerms) {
+            state->identityFallback =
+                DisjunctionIdentityFallback::NON_TERM;
+          } else if (otherDf > 0
+              && otherDf
+                  <= MaxScoreBulkScorer::kDisjunctionCountIdentityMaxProbes
+              && otherDf
+                  <= largestDf
+                      / MaxScoreBulkScorer::
+                          kDisjunctionCountIdentityMinDfRatio) {
+            state->countRoute =
+                MaxScoreCountRoute::DISJUNCTION_IDENTITY;
+            state->identityLargestIndex = largestIndex;
+          } else {
+            state->identityFallback =
+                DisjunctionIdentityFallback::PROFITABILITY;
+          }
+          }
+        }
+
+        if (!needsScores
+            && state->countRoute == MaxScoreCountRoute::ORDINARY
+            && !MaxScoreBulkScorer::disableDisjConjBulkForTests) {
+          bool hasConjunction = false;
+          bool supported = true;
+          for (const PlannedSupplier& child : optional) {
+            supported &= child.shape.termConjunctionClause
+                    == Query::ClauseShape::DIRECT
+                || child.shape.termConjunctionClause
+                    == Query::ClauseShape::FLAT_CONJUNCTION;
+            hasConjunction |= child.shape.termConjunctionClause
+                == Query::ClauseShape::FLAT_CONJUNCTION;
+          }
+          if (supported && hasConjunction) {
+            state->countRoute =
+                MaxScoreCountRoute::DISJUNCTION_OF_CONJUNCTIONS;
+          }
+        }
+
+        BulkPlan plan = matchWindowBulkPlan();
+        plan.buildState = state;
+        plan.acceptsWindowFilter = BulkAnswer::YES;
+        return plan;
+      }
+
+      BulkScorer* buildMaxScoreBulk(
+          MemPool& targetPool, const MaxScorePlan& plan) {
+        switch (plan.identityFallback) {
+          case DisjunctionIdentityFallback::NONE:
+            break;
+          case DisjunctionIdentityFallback::DELETES:
+            skipCount(SkipStats::disjCountIdentityDeleteFallbacks);
+            break;
+          case DisjunctionIdentityFallback::NON_TERM:
+            skipCount(SkipStats::disjCountIdentityNonTermFallbacks);
+            break;
+          case DisjunctionIdentityFallback::PROFITABILITY:
+            skipCount(
+                SkipStats::disjCountIdentityProfitabilityFallbacks);
+            break;
+        }
+        auto optional = targetPool.make_span<Query::Scorer*>(
+            plan.optional.size());
+        for (size_t i = 0; i < plan.optional.size(); i++) {
+          optional[i] = plan.optional[i].plan->build(targetPool);
+          assert(optional[i] != nullptr);
+        }
+        auto& exclusion = *targetPool.make_vec<Query::Scorer*>();
+        for (const PlannedSupplier& child : plan.prohibited) {
+          Query::Scorer* scorer = child.plan->build(targetPool);
+          assert(scorer != nullptr);
+          scorer->recordWindowFilterCommit(true);
+          if (child.shape.windowFillClause == Query::ClauseShape::DIRECT) {
+            exclusion.push_back(scorer);
+          } else {
+            auto members = scorer->flatDisjunctionScorers();
+            assert(!members.empty());
+            for (Query::Scorer* member : members) {
+              member->recordWindowFilterCommit(true);
+              exclusion.push_back(member);
+            }
+          }
+        }
+        if (!plan.prohibited.empty()) {
           skipCount(SkipStats::bulkExclusionEngagements);
         }
         return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
-            targetPool, optionalScorers, optionalCosts, exclusionScorers,
-            segment.maxDoc(), aggregateClauseCost, !needsScores,
-            segment.liveDocs() != nullptr);
-      }
-
-      BulkScorer* attachDirectFilters(MemPool& targetPool,
-                                      BulkScorer* bulk,
-                                      int64_t bodyCost,
-                                      int64_t filterCost) {
-        if (bulk == nullptr || filterSuppliers.empty()) {
-          return nullptr;
-        }
-
-        auto filterScorers = targetPool.make_span<Query::Scorer*>(
-            filterSuppliers.size());
-        for (size_t i = 0; i < filterSuppliers.size(); i++) {
-          auto* scorer = filterSuppliers[i]->get(targetPool, bodyCost);
-          if (scorer == nullptr || !scorer->supportsWindowFilter()) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedFilterAttach);
-            return nullptr;
-          }
-          filterScorers[i] = scorer;
-        }
-        bool probe = !disableFilterMaskProbeForTests && filterCost > 0
-            && filterCost >= (int64_t) segment.maxDoc()
-                                 / kMaskProbeMinFilterDensityInverse
-            && bodyCost <= (filterCost - 1) / kMaskProbeAdvanceWeight;
-        auto* windowFilter = targetPool.make<WindowFilter>(
-            targetPool, filterScorers, probe, filterCost);
-        if (!bulk->attachWindowFilter(windowFilter)) {
-          skipCount(SkipStats::bulkBuiltThenRejected);
-          skipCount(SkipStats::bulkBuiltThenRejectedFilterAttach);
-          return nullptr;
-        }
-        return bulk;
+            targetPool, optional, plan.optionalCosts,
+            std::span<Query::Scorer*>(exclusion.data(), exclusion.size()),
+            segment.maxDoc(), plan.aggregateClauseCost,
+            plan.countRoute
+                == MaxScoreCountRoute::DISJUNCTION_OF_CONJUNCTIONS,
+            plan.countRoute
+                == MaxScoreCountRoute::DISJUNCTION_IDENTITY,
+            plan.identityLargestIndex);
       }
 
       int64_t minFilterCost() const {
@@ -3855,186 +3614,243 @@ public:
         return cost;
       }
 
-      BulkScorer* filteredDisjunctionBulkScorer(MemPool& targetPool) {
+      BulkPlan planFilteredDisjunctionBulk(BulkUse use) {
         if (disableFilteredDisjunctionBatchForTests || allowsPruning
             || mandatorySources.size() != 0 || optionalSources.size() < 2
             || prohibitedSources.size() != 0 || filterSuppliers.size() != 1
             || minShouldMatch != 1) {
-          return nullptr;
+          return noBulkPlan();
         }
         auto* filterSupplier = filterSuppliers[0];
+        if (filterSupplier == nullptr) return noBulkPlan();
         int64_t filterCost = filterSupplier->cost();
         int32_t densityInverse = needsScores
             ? filteredDisjunctionBatchDensityInverseForTests
             : QueryPrep::kSparseBatchCountOwnDensityInverse;
         if (densityInverse <= 0
             || filterCost > segment.maxDoc() / densityInverse) {
-          skipCount(SkipStats::filteredDisjBatchDensityFallbacks);
-          return nullptr;
+          return noBulkPlan();
         }
 
-        Query::Scorer* filterScorer = nullptr;
-        std::span<const int32_t> filterDocs;
-        TermQuery::Scorer* postingsScorer = nullptr;
-        bool builtFilterScorer = false;
+        Query::Demand filterDemand = Query::Demand::fromLeadCost(
+            filterCost, use);
+        Query::PlanContext filterContext =
+            scorerBuildContext(filterDemand);
+        PlannedSupplier filter{};
+        DocSet* filterDocs = nullptr;
+        bool arrayFilterFeed = false;
+        bool postingsFilterFeed = false;
         if (auto* docSetSupplier =
                 dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
           DocSet* docs = docSetSupplier->docSet();
           if (docs == nullptr || docs->card() == 0) {
-            return nullptr;
+            return noBulkPlan();
           }
           if (!disableFilteredDisjunctionArrayFeedForTests
               && docs->type == DocSet::ARRAY) {
-            filterDocs = ((ArrDocSet*) docs)->docs();
+            filterDocs = docs;
+            arrayFilterFeed = true;
           } else {
-            filterScorer = filterSupplier->get(targetPool, filterCost);
-            builtFilterScorer = filterScorer != nullptr;
+            Query::ScorerShape shape =
+                filterSupplier->describeScorer(filterContext);
+            filter = {filterSupplier, shape, filterDemand};
           }
         } else if (!QueryPrep::
                        disableSparseBatchPostingsFeedForTests) {
-          auto* scorer = filterSupplier->get(targetPool, filterCost);
-          builtFilterScorer = scorer != nullptr;
-          postingsScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
-          filterScorer = postingsScorer;
-        }
-        if (filterScorer == nullptr && filterDocs.empty()) {
-          skipCount(
-              SkipStats::filteredDisjBatchUnsupportedFilterFeedFallbacks);
-          if (builtFilterScorer) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedFilteredDisj);
+          Query::ScorerShape shape =
+              describeResolved(filterSupplier, filterContext);
+          if (shape.matchState == Query::MatchState::NONEMPTY
+              && shape.directKind == Query::DirectScorerKind::TERM) {
+            filter = {filterSupplier, shape, filterDemand};
+            postingsFilterFeed = true;
           }
-          return nullptr;
         }
-        struct TermEntry {
-          int64_t cost;
-          TermQuery::Scorer* scorer;
-        };
-        boost::container::small_vector<TermEntry, 16> entries;
-        for (auto* source : optionalSources) {
-          auto* supplier = source->scorerSupplier(targetPool, segment);
+        if (!arrayFilterFeed && filter.supplier == nullptr) {
+          return noBulkPlan();
+        }
+
+        Query::Demand optionalDemand = Query::Demand::fromLeadCost(
+            std::numeric_limits<int64_t>::max(), use);
+        Query::PlanContext optionalContext =
+            scorerBuildContext(optionalDemand);
+        boost::container::small_vector<PlannedSupplier, 16> entries;
+        for (auto* supplier : optionalShapeSuppliers) {
           if (supplier == nullptr) {
             continue;
           }
-          auto* scorer = supplier->get(
-              targetPool, std::numeric_limits<int64_t>::max());
-          if (scorer == nullptr) {
+          Query::ScorerShape shape =
+              describeResolved(supplier, optionalContext);
+          if (shape.matchState == Query::MatchState::EMPTY) {
             continue;
           }
-          auto* termScorer = dynamic_cast<TermQuery::Scorer*>(scorer);
-          if (termScorer == nullptr) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedFilteredDisj);
-            if (scorer->hasTwoPhase()) {
-              twoPhaseDisjunctionPull = true;
-              return nullptr;
-            }
-            skipCount(SkipStats::filteredDisjBatchNonTermFallbacks);
-            return nullptr;
+          if (shape.matchState != Query::MatchState::NONEMPTY
+              || shape.directKind != Query::DirectScorerKind::TERM) {
+            return noBulkPlan();
           }
-          entries.push_back({supplier->cost(), termScorer});
+          entries.push_back({supplier, shape, optionalDemand});
         }
         if (entries.empty()) {
-          if (builtFilterScorer) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedFilteredDisj);
-          }
-          return nullptr;
+          return noBulkPlan();
         }
         if (!needsScores) {
           std::sort(entries.begin(), entries.end(),
-                    [](const TermEntry& a, const TermEntry& b) {
-                      return a.cost > b.cost;
+                    [](const PlannedSupplier& a,
+                       const PlannedSupplier& b) {
+                      return a.supplier->cost() > b.supplier->cost();
                     });
         }
-        auto termScorers =
-            targetPool.make_span<TermQuery::Scorer*>(entries.size());
+
+        auto* state = pool.make<FilteredDisjunctionPlan>();
+        state->owner = this;
+        state->filter = filter;
+        state->filterDocs = filterDocs;
+        state->arrayFilterFeed = arrayFilterFeed;
+        state->postingsFilterFeed = postingsFilterFeed;
+        if (filter.supplier != nullptr) {
+          state->filter.plan = filter.supplier->resolve(
+              pool, filterContext);
+        }
+        state->optional = pool.make_span<PlannedSupplier>(entries.size());
         for (size_t i = 0; i < entries.size(); i++) {
-          termScorers[i] = entries[i].scorer;
+          entries[i].plan = entries[i].supplier->resolve(
+              pool, optionalContext);
+          state->optional[i] = entries[i];
+        }
+        BulkPlan plan = knownBulkPlan(
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
+        plan.buildState = state;
+        return plan;
+      }
+
+      BulkScorer* buildFilteredDisjunctionBulk(
+          MemPool& targetPool, const FilteredDisjunctionPlan& plan) {
+        Query::Scorer* filterScorer = nullptr;
+        std::span<const int32_t> filterDocs;
+        TermQuery::Scorer* postingsScorer = nullptr;
+        if (plan.arrayFilterFeed) {
+          assert(plan.filterDocs != nullptr
+                 && plan.filterDocs->type == DocSet::ARRAY);
+          filterDocs = ((ArrDocSet*) plan.filterDocs)->docs();
+        } else {
+          filterScorer = plan.filter.plan->build(targetPool);
+          assert(filterScorer != nullptr);
+          if (plan.postingsFilterFeed) {
+            postingsScorer = dynamic_cast<TermQuery::Scorer*>(filterScorer);
+            assert(postingsScorer != nullptr);
+          }
+        }
+        auto terms = targetPool.make_span<TermQuery::Scorer*>(
+            plan.optional.size());
+        for (size_t i = 0; i < plan.optional.size(); i++) {
+          Query::Scorer* scorer = plan.optional[i].plan->build(targetPool);
+          terms[i] = dynamic_cast<TermQuery::Scorer*>(scorer);
+          assert(terms[i] != nullptr);
         }
         return targetPool.make<BooleanQuery::FilteredDisjunctionBulkScorer>(
-            targetPool, filterScorer, filterDocs, termScorers,
+            targetPool, filterScorer, filterDocs, terms,
             segment.maxDoc(), postingsScorer);
       }
 
-      BulkScorer* exactFilteredMandOptBulkScorer(MemPool& targetPool) {
+      BulkPlan planExactFilteredMandOptBulk(BulkUse use) {
         if (disableExactFilteredMandOptCompositionForTests || allowsPruning
             || mandatorySources.size() != 1 || optionalSources.empty()
             || !prohibitedSources.empty() || filterSuppliers.size() != 1
             || minShouldMatch >= 1) {
-          return nullptr;
+          return noBulkPlan();
         }
 
-        auto required = conjunctionBulkScorer(
-            targetPool, ConjunctionMode::CANDIDATE,
+        ConjunctionPlanningResult required = planConjunction(
+            pool, ConjunctionMode::CANDIDATE,
             candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
-        if (!required || !required->usesCandidateRoute()) {
-          if (required) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedExactMandOpt);
-          }
-          return nullptr;
+        if (required.status != ConjunctionPlanStatus::READY
+            || (required.plan.route
+                    != ConjunctionRoute::CANDIDATE_DOC_SET_FILTER
+                && required.plan.route
+                    != ConjunctionRoute::CANDIDATE_POSTINGS_FILTER
+                && required.plan.route
+                    != ConjunctionRoute::CANDIDATE_SCORING_TERM)) {
+          return noBulkPlan();
         }
 
-        auto* mandatorySupplier = mandatorySources[0]->scorerSupplier(
-            targetPool, segment);
+        auto* mandatorySupplier = mandatoryShapeSuppliers[0];
         if (mandatorySupplier == nullptr) {
-          skipCount(SkipStats::bulkBuiltThenRejected);
-          skipCount(SkipStats::bulkBuiltThenRejectedExactMandOpt);
-          return nullptr;
+          return noBulkPlan();
         }
         int64_t leadCost = std::min(
             mandatorySupplier->cost(), filterSuppliers[0]->cost());
-        auto& optionalScorers = *targetPool.make_vec<Query::Scorer*>();
-        optionalScorers.reserve(optionalSources.size());
-        for (auto* source : optionalSources) {
-          auto* supplier = source->scorerSupplier(targetPool, segment);
+        Query::Demand demand = Query::Demand::fromLeadCost(leadCost, use);
+        Query::PlanContext context = scorerBuildContext(demand);
+        boost::container::small_vector<PlannedSupplier, 16> optional;
+        for (auto* supplier : optionalShapeSuppliers) {
           if (supplier == nullptr) {
             continue;
           }
-          auto* scorer = supplier->get(targetPool, leadCost);
-          if (scorer == nullptr) {
+          Query::ScorerShape shape = describeResolved(supplier, context);
+          if (shape.matchState == Query::MatchState::EMPTY) {
             continue;
           }
-          if (scorer->hasTwoPhase()) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedExactMandOpt);
-            return nullptr;
+          if (shape.matchState != Query::MatchState::NONEMPTY
+              || shape.reportedTwoPhase
+                  != Query::ReportedTwoPhase::NO) {
+            return noBulkPlan();
           }
-          optionalScorers.push_back(scorer);
+          optional.push_back({supplier, shape, demand});
         }
 
-        recordCandidateConjunctionEngagement(*required);
-        skipCount(SkipStats::exactFilteredMandOptCompositions);
-        if (optionalScorers.empty()) {
-          return required->bulk;
+        auto* state = pool.make<ExactFilteredMandOptPlan>();
+        state->owner = this;
+        state->required = pool.make<ConjunctionPlan>(required.plan);
+        resolveConjunctionChildren(pool, *state->required);
+        state->optional = pool.make_span<PlannedSupplier>(optional.size());
+        for (size_t i = 0; i < optional.size(); i++) {
+          optional[i].plan = optional[i].supplier->resolve(pool, context);
+          state->optional[i] = optional[i];
         }
-        return targetPool.make<BooleanQuery::OptionalScoreBulkScorer>(
-            required->bulk,
-            std::span<Query::Scorer*>(optionalScorers.data(),
-                                      optionalScorers.size()));
+        BulkPlan plan = knownBulkPlan(
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
+        plan.buildState = state;
+        return plan;
       }
 
-      BulkScorer* filteredScoredBulkScorer(MemPool& targetPool) {
+      BulkScorer* buildExactFilteredMandOptBulk(
+          MemPool& targetPool, const ExactFilteredMandOptPlan& plan) {
+        MaybeConjunctionBulk required =
+            buildConjunction(targetPool, *plan.required);
+        assert(required && required->usesCandidateRoute());
+        if (!required) return nullptr;
+        recordCandidateConjunctionEngagement(*required);
+        skipCount(SkipStats::exactFilteredMandOptCompositions);
+        if (plan.optional.empty()) return required->bulk;
+        auto optional = targetPool.make_span<Query::Scorer*>(
+            plan.optional.size());
+        for (size_t i = 0; i < plan.optional.size(); i++) {
+          optional[i] = plan.optional[i].plan->build(targetPool);
+          assert(optional[i] != nullptr && !optional[i]->hasTwoPhase());
+        }
+        return targetPool.make<BooleanQuery::OptionalScoreBulkScorer>(
+            required->bulk, optional);
+      }
+
+      BulkPlan planFilteredScoredBulk(BulkUse use) {
         // This route makes its scored body the membership source. A filter-led
         // query with no mandatory clause instead has rank-only optionals, so it
         // must stay on the pull MandOptScorer path.
         if (!needsScores || filterSuppliers.empty()
             || minShouldMatch > 1
             || (mandatorySources.empty() && minShouldMatch < 1)) {
-          return nullptr;
+          return noBulkPlan();
         }
         int64_t localFilterCost = minFilterCost();
         if (localFilterCost < 0) {
-          return nullptr;
+          return noBulkPlan();
         }
         if (filterDensityRoutesToPull(
                 localFilterCost, segment.maxDoc())) {
-          return nullptr;
+          return noBulkPlan();
         }
 
-        if (auto* exactMandOpt =
-                exactFilteredMandOptBulkScorer(targetPool)) {
+        BulkPlan exactMandOpt = planExactFilteredMandOptBulk(use);
+        if (exactMandOpt.available == BulkAnswer::YES) {
           return exactMandOpt;
         }
 
@@ -4047,23 +3863,24 @@ public:
             && filterSuppliers.size() == 1
             && !mandatorySources.empty() && optionalSources.empty()
             && minShouldMatch == 0) {
-          auto candidate = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::CANDIDATE,
+          ConjunctionPlanningResult candidate = planConjunction(
+              pool, ConjunctionMode::CANDIDATE,
               candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
-          if (candidate && candidate->usesCandidateRoute()) {
-            recordCandidateConjunctionEngagement(*candidate);
-            return candidate->bulk;
-          }
-          if (candidate) {
-            skipCount(SkipStats::bulkBuiltThenRejected);
-            skipCount(SkipStats::bulkBuiltThenRejectedFilteredScored);
+          if (candidate.status == ConjunctionPlanStatus::READY) {
+            resolveConjunctionChildren(pool, candidate.plan);
+            auto* state = pool.make<ConjunctionPlan>(candidate.plan);
+            state->owner = this;
+            BulkPlan plan = knownBulkPlan(
+                BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
+            plan.buildState = state;
+            return plan;
           }
         }
 
         // Exclusions are admitted only by the candidate conjunction above.
         // The scored-body plus WindowFilter fallback has no AND-NOT stage.
         if (!prohibitedSources.empty()) {
-          return nullptr;
+          return noBulkPlan();
         }
 
         // Ask the positive body to plan its own bulk route. This keeps route
@@ -4074,66 +3891,139 @@ public:
         if (mandatorySources.size() == 1 && optionalSources.empty()
             && minShouldMatch < 1) {
           bodySupplier = mandatorySources[0]->scorerSupplier(
-              targetPool, segment);
+              pool, segment);
         } else if (mandatorySources.empty() && optionalSources.size() == 1) {
           bodySupplier = optionalSources[0]->scorerSupplier(
-              targetPool, segment);
+              pool, segment);
         } else {
           bodySupplier = makeSupplier(
-              targetPool, segment, mandatorySources, mandatoryScores,
+              pool, segment, mandatorySources, mandatoryScores,
               optionalSources,
               std::span<Query::SegmentSource* const>{},
               std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
               needsScores, allowsPruning);
         }
         if (bodySupplier == nullptr) {
-          return nullptr;
+          return noBulkPlan();
         }
         int64_t bodyCost = bodySupplier->cost();
-        Query::ScorerSupplier::BulkScorerContext bulkContext{
+        BulkScorerContext childContext{
             localFilterCost, filterSuppliers};
-        auto filtered = bodySupplier->filteredBulkScorer(
-            targetPool, bulkContext);
-        if (filtered.consumesFilters) {
-          return filtered.bulk;
+        BulkPlan bodyPlan = bodySupplier->planBulk(use, childContext);
+        if (bodyPlan.available != BulkAnswer::YES) {
+          return noBulkPlan();
         }
-        return attachDirectFilters(
-            targetPool, filtered.bulk, bodyCost, localFilterCost);
+        if (bodyPlan.consumesFilters == BulkAnswer::YES) {
+          auto* state = pool.make<DelegateFilteredChildPlan>();
+          state->owner = this;
+          state->child = bodySupplier;
+          state->childPlan = bodyPlan;
+          BulkPlan plan = bodyPlan;
+          plan.buildState = state;
+          return plan;
+        }
+        if (bodyPlan.consumesFilters != BulkAnswer::NO
+            || bodyPlan.acceptsWindowFilter != BulkAnswer::YES) {
+          return noBulkPlan();
+        }
+
+        Query::Demand filterDemand = Query::Demand::fromLeadCost(
+            bodyCost, use);
+        Query::PlanContext filterContext =
+            scorerBuildContext(filterDemand);
+        boost::container::small_vector<PlannedSupplier, 16> filters;
+        for (Query::ScorerSupplier* supplier : filterSuppliers) {
+          if (supplier == nullptr) return noBulkPlan();
+          Query::ScorerShape shape =
+              describeResolved(supplier, filterContext);
+          if (shape.matchState != Query::MatchState::NONEMPTY
+              || shape.windowFillClause != Query::ClauseShape::DIRECT) {
+            return noBulkPlan();
+          }
+          filters.push_back({supplier, shape, filterDemand});
+        }
+        auto* state = pool.make<FilteredBodyPlan>();
+        state->owner = this;
+        state->bodySupplier = bodySupplier;
+        state->bodyPlan = bodyPlan;
+        state->bodyCost = bodyCost;
+        state->filterCost = localFilterCost;
+        state->filters = pool.make_span<PlannedSupplier>(filters.size());
+        for (size_t i = 0; i < filters.size(); i++) {
+          filters[i].plan = filters[i].supplier->resolve(
+              pool, filterContext);
+          state->filters[i] = filters[i];
+        }
+        BulkPlan plan = bodyPlan;
+        plan.buildState = state;
+        return plan;
       }
 
-      BulkScorer* filterOnlyBulkScorer(MemPool& targetPool) {
-        struct Entry {
-          int64_t cost;
-          BulkScorer* bulk;
-        };
-        boost::container::small_vector<Entry, 16> entries;
+      BulkScorer* buildFilteredBodyBulk(
+          MemPool& targetPool, const FilteredBodyPlan& plan) {
+        BulkScorer* bulk = plan.bodySupplier->buildBulk(
+            targetPool, plan.bodyPlan);
+        assert(bulk != nullptr);
+        auto scorers = targetPool.make_span<Query::Scorer*>(
+            plan.filters.size());
+        for (size_t i = 0; i < plan.filters.size(); i++) {
+          scorers[i] = plan.filters[i].plan->build(targetPool);
+          assert(scorers[i] != nullptr
+                 && scorers[i]->supportsWindowFilter());
+        }
+        bool probe = !disableFilterMaskProbeForTests
+            && plan.filterCost > 0
+            && plan.filterCost >= (int64_t) segment.maxDoc()
+                                     / kMaskProbeMinFilterDensityInverse
+            && plan.bodyCost
+                <= (plan.filterCost - 1) / kMaskProbeAdvanceWeight;
+        auto* filter = targetPool.make<WindowFilter>(
+            targetPool, scorers, probe, plan.filterCost);
+        bool attached = bulk->attachWindowFilter(filter);
+        assert(attached);
+        return attached ? bulk : nullptr;
+      }
+
+      BulkPlan planFilterOnlyBulk(BulkUse use) {
+        boost::container::small_vector<PlannedBulkSupplier, 16> entries;
         entries.reserve(filterSuppliers.size());
         for (auto* supplier : filterSuppliers) {
-          if (supplier == nullptr) {
-            if (!entries.empty()) {
-              skipCount(SkipStats::bulkBuiltThenRejected);
-              skipCount(SkipStats::bulkBuiltThenRejectedFilterOnly);
-            }
-            return nullptr;
-          }
-          auto* bulk = supplier->bulkScorer(targetPool);
-          if (bulk == nullptr) {
-            if (!entries.empty()) {
-              skipCount(SkipStats::bulkBuiltThenRejected);
-              skipCount(SkipStats::bulkBuiltThenRejectedFilterOnly);
-            }
-            return nullptr;
-          }
-          entries.push_back({supplier->cost(), bulk});
+          if (supplier == nullptr) return noBulkPlan();
+          BulkPlan child = supplier->planBulk(use, {});
+          if (child.available != BulkAnswer::YES
+              || child.hasConstantCount()) return noBulkPlan();
+          entries.push_back({supplier, supplier->cost(), child});
         }
         std::sort(entries.begin(), entries.end(),
-                  [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
-        if (entries.size() == 1) {
+                  [](const PlannedBulkSupplier& a,
+                     const PlannedBulkSupplier& b) {
+                    return a.cost < b.cost;
+                  });
+        auto* state = pool.make<FilterOnlyPlan>();
+        state->owner = this;
+        state->filters = pool.make_span<PlannedBulkSupplier>(entries.size());
+        std::copy(entries.begin(), entries.end(), state->filters.begin());
+        BulkPlan plan = knownBulkPlan(
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO);
+        plan.buildState = state;
+        return plan;
+      }
+
+      BulkScorer* buildFilterOnlyBulk(
+          MemPool& targetPool, const FilterOnlyPlan& plan) {
+        auto bulks = targetPool.make_span<BulkScorer*>(
+            plan.filters.size());
+        for (size_t i = 0; i < plan.filters.size(); i++) {
+          bulks[i] = plan.filters[i].supplier->buildBulk(
+              targetPool, plan.filters[i].plan);
+          assert(bulks[i] != nullptr);
+        }
+        if (bulks.size() == 1) {
           // Wrap even the single-clause case: the wrapper owns the
           // non-scoring contract (constant-0 score windows, no impact
           // pruning by the lead).
           return targetPool.make<BooleanQuery::FilterOnlyBulkScorer>(
-              entries[0].bulk, std::span<uint64_t>{}, std::span<uint64_t>{},
+              bulks[0], std::span<uint64_t>{}, std::span<uint64_t>{},
               0, segment.maxDoc());
         }
 
@@ -4142,12 +4032,12 @@ public:
         auto filterWords = targetPool.make_span<uint64_t>(wordCount);
         auto clauseWords = targetPool.make_span<uint64_t>(wordCount);
         bool first = true;
-        for (size_t i = 1; i < entries.size(); i++) {
+        for (size_t i = 1; i < bulks.size(); i++) {
           DocSetBuilder builder(maxDoc);
           int64_t count = 0;
           for (int32_t cursor = 0;
                cursor != PostingsReader::END && cursor < maxDoc; ) {
-            int32_t next = entries[i].bulk->countNextWindow(
+            int32_t next = bulks[i]->countNextWindow(
                 count, &builder, nullptr, cursor, maxDoc);
             if (next == PostingsReader::END) {
               break;
@@ -4181,131 +4071,95 @@ public:
           filterCard += (int32_t) std::popcount(word);
         }
         return targetPool.make<BooleanQuery::FilterOnlyBulkScorer>(
-            entries[0].bulk, filterWords, clauseWords, filterCard, maxDoc);
-      }
-
-      BulkScorer* filteredCountBulkScorer(
-          MemPool& targetPool, bool allowAlternateBulk, BulkUse use) {
-        if (!disableIntegratedFilteredCountForTests
-            && mandatorySources.size() == 1
-            && optionalSources.empty() && prohibitedSources.empty()
-            && !filterSuppliers.empty() && minShouldMatch < 1) {
-          auto* bodySupplier = mandatorySources[0]->scorerSupplier(
-              targetPool, segment);
-          int64_t filterCost = minFilterCost();
-          if (bodySupplier != nullptr && filterCost >= 0) {
-            Query::ScorerSupplier::BulkScorerContext bulkContext{
-                filterCost, filterSuppliers, true};
-            auto filtered = bodySupplier->filteredBulkScorer(
-                targetPool, bulkContext);
-            if (filtered.consumesFilters) {
-              return filtered.bulk;
-            }
-          }
-        }
-
-        AcceptedConjunctionRoutes accepted =
-            countRouteMask(!disableFilterClauseCountForTests);
-        ConjunctionPlanningResult planning = planConjunction(
-            targetPool, ConjunctionMode::EXHAUSTIVE, accepted, use);
-        bool legacy = planning.status == ConjunctionPlanStatus::LEGACY;
-        MaybeConjunctionBulk result;
-        if (legacy) {
-          recordUnknownIsland(planning.plan.unresolvedCause);
-          result = legacyConjunctionBulkScorer(
-              targetPool, ConjunctionMode::EXHAUSTIVE);
-        } else {
-          recordConjunctionPlanCommitment(planning.plan);
-          if (planning.status == ConjunctionPlanStatus::READY) {
-            resolveConjunctionChildren(targetPool, planning.plan);
-            result = buildConjunction(targetPool, planning.plan);
-          }
-        }
-        if (result) {
-          switch (result->route) {
-            case ConjunctionRoute::COUNT_POSTINGS_SAMPLE:
-              skipCount(SkipStats::filteredConjBatchEngagements);
-              skipCount(
-                  SkipStats::filteredConjBatchPostingsFeedEngagements);
-              return result->bulk;
-            case ConjunctionRoute::COUNT_DENSE:
-            case ConjunctionRoute::COUNT_EXACT_DOCS_ONLY:
-              return result->bulk;
-            case ConjunctionRoute::COUNT_DOC_SET_SPARSE:
-              if (!disableFilterClauseCountForTests) {
-                return result->bulk;
-              }
-              break;
-            default:
-              break;
-          }
-          skipCount(SkipStats::bulkBuiltThenRejected);
-          skipCount(SkipStats::bulkBuiltThenRejectedWrapperRoute);
-        }
-        bool pureFilteredDisjunction = mandatorySources.empty()
-            && prohibitedSources.empty() && optionalSources.size() >= 2
-            && minShouldMatch == 1;
-        if (!allowAlternateBulk && !legacy) {
-          return nullptr;
-        }
-        if (pureFilteredDisjunction) {
-          if (auto* disjunction =
-                  filteredDisjunctionBulkScorer(targetPool)) {
-            return disjunction;
-          }
-          skipCount(SkipStats::disjCountIdentityFilterFallbacks);
-        }
-        return nullptr;
+            bulks[0], filterWords, clauseWords, filterCard, maxDoc);
       }
 
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
-        if (bulkContext.hasFilter()
-            || !bulkContext.filterSuppliers.empty()
-            || bulkContext.requireFilterConsumption) {
-          return {};
+        if (bulkContext.requireConstantCount
+            && mandatorySources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && minShouldMatch <= 1
+            && optionalShapeSuppliers.size() == 1
+            && optionalShapeSuppliers[0] != nullptr) {
+          return optionalShapeSuppliers[0]->planBulk(use, bulkContext);
+        }
+        bool hasEnclosingFilters = bulkContext.hasFilter()
+            || !bulkContext.filterSuppliers.empty();
+        if (hasEnclosingFilters && !filterSuppliers.empty()) {
+          return noBulkPlan();
         }
 
-        if (use == BulkUse::EXACT_CANDIDATE_SCORING) {
-          bool exactDisjunctionShape = needsScores && !allowsPruning
-              && mandatorySources.empty() && optionalSources.size() >= 2
-              && prohibitedSources.empty() && filterSuppliers.size() == 1
-              && minShouldMatch == 1;
-          if (exactDisjunctionShape) {
-            BulkPlan disjunction = planFilteredDisjunctionBulk();
-            if (disjunction.supportsExactCandidateScoring
-                == BulkAnswer::YES) {
-              return disjunction;
+        if (hasEnclosingFilters && !disableIntegratedFilteredCountForTests
+            && !needsScores && optionalSources.empty()
+            && prohibitedSources.empty() && minShouldMatch < 1) {
+          if (mandatorySources.size() == 1) {
+            Query::ScorerSupplier* child = mandatoryShapeSuppliers[0];
+            if (child != nullptr) {
+              BulkPlan childPlan = child->planBulk(use, bulkContext);
+              if (childPlan.available == BulkAnswer::YES
+                  && childPlan.consumesFilters == BulkAnswer::YES) {
+                auto* state = pool.make<DelegateFilteredChildPlan>();
+                state->owner = this;
+                state->child = child;
+                state->childPlan = childPlan;
+                BulkPlan plan = childPlan;
+                plan.buildState = state;
+                return plan;
+              }
             }
-            if (disjunction.supportsExactCandidateScoring
-                == BulkAnswer::NO) {
-              return knownBulkPlan(
-                  BulkAnswer::UNKNOWN, BulkAnswer::UNKNOWN,
-                  BulkAnswer::NO);
-            }
-            return {};
+          } else if (mandatorySources.size() >= 2
+                     && !bulkContext.filterSuppliers.empty()) {
+            BulkPlan plan = planConjunctionBulk(
+                use, ConjunctionMode::EXHAUSTIVE, allRouteMask(),
+                bulkContext.filterSuppliers);
+            if (plan.available == BulkAnswer::YES) return plan;
           }
-          bool unscoredFilteredDisjunction = !needsScores
-              && mandatorySources.empty() && optionalSources.size() >= 2
-              && prohibitedSources.empty() && filterSuppliers.size() == 1
-              && minShouldMatch == 1;
-          if (unscoredFilteredDisjunction) {
-            BulkPlan conjunction = planConjunctionBulk(
-                use, ConjunctionMode::EXHAUSTIVE,
-                countRouteMask(!disableFilterClauseCountForTests));
-            if (conjunction.available == BulkAnswer::YES
-                || conjunction.available == BulkAnswer::UNKNOWN) {
-              return conjunction;
-            }
-            return planFilteredDisjunctionBulk();
-          }
-          return knownBulkPlan(
-              BulkAnswer::UNKNOWN, BulkAnswer::UNKNOWN, BulkAnswer::NO);
+        }
+        if (bulkContext.requireFilterConsumption) {
+          return noBulkPlan();
         }
 
         if (mandatorySources.empty() && optionalSources.empty()
             && prohibitedSources.empty() && !filterSuppliers.empty()) {
-          return {};
+          return planFilterOnlyBulk(use);
+        }
+
+        if (needsScores && !prohibitedSources.empty()) {
+          if (!filterSuppliers.empty()
+              && !disableFilteredScoredBulkForTests) {
+            BulkPlan filtered = planFilteredScoredBulk(use);
+            if (filtered.available == BulkAnswer::YES) return filtered;
+          }
+          bool maxScoreShape = mandatorySources.empty()
+              && filterSuppliers.empty() && minShouldMatch <= 1
+              && optionalSources.size() >= 2;
+          if (!maxScoreShape || disableBulkExclusionForTests) {
+            return noBulkPlan();
+          }
+          return planMaxScoreBulk(use, true);
+        }
+
+        if (!filterSuppliers.empty() && mandatorySources.empty()
+            && prohibitedSources.empty() && optionalSources.size() >= 2
+            && minShouldMatch == 1 && !allowsPruning) {
+          BulkPlan disjunction = planFilteredDisjunctionBulk(use);
+          if (disjunction.available == BulkAnswer::YES) {
+            return disjunction;
+          }
+          if (twoPhaseDisjunctionPull) return noBulkPlan();
+        }
+
+        if (needsScores && !allowsPruning
+            && !disableFilteredConjunctionBatchForTests
+            && !filterSuppliers.empty()
+            && mandatorySources.size() >= 1
+            && (!disableFilteredConjMultiTermForTests
+                || mandatorySources.size() == 1)
+            && optionalSources.empty() && prohibitedSources.empty()) {
+          BulkPlan candidate = planConjunctionBulk(
+              BulkUse::EXACT_CANDIDATE_SCORING,
+              ConjunctionMode::CANDIDATE, candidateRouteMask());
+          if (candidate.available == BulkAnswer::YES) return candidate;
         }
 
         bool hasFilteredCountBody = !mandatorySources.empty()
@@ -4318,29 +4172,26 @@ public:
               && ConjunctionBulkScorer::disableNegatedCountForTests) {
             return noBulkPlan();
           }
-          bool integratedUnknown = false;
           if (!disableIntegratedFilteredCountForTests
               && mandatorySources.size() == 1
               && optionalSources.empty() && prohibitedSources.empty()
               && !filterSuppliers.empty() && minShouldMatch < 1) {
-            auto* bodySupplier = mandatorySources[0]->scorerSupplier(
-                pool, segment);
+            Query::ScorerSupplier* child = mandatoryShapeSuppliers[0];
             int64_t filterCost = minFilterCost();
-            if (bodySupplier != nullptr && filterCost >= 0) {
-              BulkScorerContext integratedContext{
+            if (child != nullptr && filterCost >= 0) {
+              BulkScorerContext context{
                   filterCost, filterSuppliers, true};
-              BulkPlan integrated = bodySupplier->planBulk(
-                  use, integratedContext);
-              if (integrated.available == BulkAnswer::YES
-                  && integrated.consumesFilters == BulkAnswer::YES) {
-                // The child owns any build state. This wrapper still performs
-                // the filter-consumption handshake during construction.
-                integrated.buildState = nullptr;
-                return integrated;
+              BulkPlan childPlan = child->planBulk(use, context);
+              if (childPlan.available == BulkAnswer::YES
+                  && childPlan.consumesFilters == BulkAnswer::YES) {
+                auto* state = pool.make<DelegateFilteredChildPlan>();
+                state->owner = this;
+                state->child = child;
+                state->childPlan = childPlan;
+                BulkPlan plan = childPlan;
+                plan.buildState = state;
+                return plan;
               }
-              integratedUnknown =
-                  integrated.available == BulkAnswer::UNKNOWN
-                  || integrated.consumesFilters == BulkAnswer::UNKNOWN;
             }
           }
           BulkPlan conjunction = planConjunctionBulk(
@@ -4352,22 +4203,13 @@ public:
           bool pureFilteredDisjunction = mandatorySources.empty()
               && prohibitedSources.empty() && optionalSources.size() >= 2
               && minShouldMatch == 1;
-          if (pureFilteredDisjunction) {
-            BulkPlan disjunction = planFilteredDisjunctionBulk();
-            if (disjunction.available != BulkAnswer::NO) {
-              return disjunction;
-            }
-          }
-          if (integratedUnknown
-              && conjunction.available == BulkAnswer::NO) {
-            return {};
-          }
-          return conjunction;
+          return pureFilteredDisjunction
+              ? planFilteredDisjunctionBulk(use) : noBulkPlan();
         }
 
-        if (needsScores && (!filterSuppliers.empty()
-                            || !prohibitedSources.empty())) {
-          return {};
+        if (needsScores && !filterSuppliers.empty()) {
+          return disableFilteredScoredBulkForTests
+              ? noBulkPlan() : planFilteredScoredBulk(use);
         }
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
@@ -4378,63 +4220,95 @@ public:
         if (!disableMandOptBulkForTests && mandatorySources.size() == 1
             && !optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && minShouldMatch < 1) {
-          auto* mandatory = mandatoryShapeSuppliers[0];
-          if (mandatory == nullptr) {
-            return noBulkPlan();
-          }
-          int64_t leadCost = mandatory->cost();
-          Query::PlanContext buildContext =
-              scorerBuildContext(leadCost);
-          Query::ScorerShape mandatoryShape =
-              describeResolved(mandatory, buildContext);
-          if (mandatoryShape.matchState == Query::MatchState::UNKNOWN
-              || mandatoryShape.reportedTwoPhase
-                  == Query::ReportedTwoPhase::UNKNOWN) {
-            return {};
-          }
-          if (mandatoryShape.matchState == Query::MatchState::EMPTY) {
-            return noBulkPlan();
-          }
-          if (mandatoryShape.reportedTwoPhase
-              == Query::ReportedTwoPhase::YES) {
-            return {};
-          }
-          bool hasOptional = false;
-          for (auto* optional : optionalShapeSuppliers) {
-            if (optional == nullptr) continue;
-            Query::ScorerShape optionalShape =
-                describeResolved(optional, buildContext);
-            if (optionalShape.matchState == Query::MatchState::UNKNOWN
-                || optionalShape.reportedTwoPhase
-                    == Query::ReportedTwoPhase::UNKNOWN) {
-              return {};
-            }
-            if (optionalShape.matchState == Query::MatchState::EMPTY) {
-              continue;
-            }
-            if (optionalShape.reportedTwoPhase
-                == Query::ReportedTwoPhase::YES) {
-              return {};
-            }
-            hasOptional = true;
-          }
-          if (!hasOptional) {
-            return noBulkPlan();
-          }
-          return knownBulkPlan(
-              BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO);
+          return planMandOptBulk(use, bulkContext);
         }
         if (!mandatorySources.empty() || !prohibitedSources.empty()
             || !filterSuppliers.empty() || minShouldMatch > 1
             || optionalSources.size() < 2) {
           return noBulkPlan();
         }
-        return planMaxScoreBulk();
+        return planMaxScoreBulk(use, false);
       }
 
       void recordBulkPlanCommitment(
           BulkUse use, const BulkScorerContext& bulkContext,
           const BulkPlan& plan) override {
+        if (plan.available == BulkAnswer::NO && needsScores
+            && !prohibitedSources.empty()) {
+          bool maxScoreShape = mandatorySources.empty()
+              && filterSuppliers.empty() && minShouldMatch <= 1
+              && optionalSources.size() >= 2;
+          if (!maxScoreShape) {
+            skipCount(SkipStats::bulkExclusionShapeFallbacks);
+          } else if (disableBulkExclusionForTests) {
+            skipCount(SkipStats::bulkExclusionDisabledFallbacks);
+          } else {
+            size_t positiveCount = 0;
+            Query::PlanContext context = scorerBuildContext(
+                Query::Demand::fromLeadCost(
+                    std::numeric_limits<int64_t>::max(), use));
+            for (Query::ScorerSupplier* supplier
+                 : optionalShapeSuppliers) {
+              if (supplier != nullptr
+                  && describeResolved(supplier, context).matchState
+                      == Query::MatchState::NONEMPTY) {
+                positiveCount++;
+              }
+            }
+            if (positiveCount < 2) {
+              skipCount(
+                  SkipStats::bulkExclusionPositiveSegmentFallbacks);
+            } else {
+              skipCount(SkipStats::bulkExclusionUnsupportedFallbacks);
+            }
+          }
+        }
+        if (plan.available == BulkAnswer::NO
+            && bulkContext.hasFilter()
+            && !disableMandOptBulkForTests
+            && mandatorySources.size() == 1
+            && !optionalSources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && minShouldMatch < 1
+            && !disableFilteredMandOptFillGateForTests
+            && filterDensityBelow(
+                bulkContext.filterCost, segment.maxDoc(),
+                kMandOptScalarFillDensityInverse)
+            && mandatoryShapeSuppliers[0] != nullptr
+            && mandatoryShapeSuppliers[0]->scoreBlockFillKind()
+                == Query::ScorerSupplier::ScoreBlockFillKind::
+                    DEFAULT_SCALAR) {
+          skipCount(SkipStats::mandOptBulkScalarFillFallbacks);
+        }
+        int64_t localFilterCost = minFilterCost();
+        if (plan.available == BulkAnswer::NO && needsScores
+            && !filterSuppliers.empty() && localFilterCost >= 0
+            && !filterDensityRoutesToPull(
+                localFilterCost, segment.maxDoc())) {
+          Query::ScorerSupplier* body = nullptr;
+          if (mandatorySources.size() == 1 && optionalSources.empty()
+              && minShouldMatch < 1) {
+            body = mandatoryShapeSuppliers[0];
+          } else if (mandatorySources.empty()
+                     && optionalSources.size() == 1) {
+            body = optionalShapeSuppliers[0];
+          } else {
+            body = makeSupplier(
+                pool, segment, mandatorySources, mandatoryScores,
+                optionalSources,
+                std::span<Query::SegmentSource* const>{},
+                std::span<Query::ScorerSupplier* const>{},
+                minShouldMatch, needsScores, allowsPruning);
+          }
+          if (body != nullptr) {
+            BulkScorerContext childContext{
+                localFilterCost, filterSuppliers};
+            BulkPlan childPlan = body->planBulk(use, childContext);
+            if (childPlan.available == BulkAnswer::NO) {
+              body->recordBulkPlanCommitment(
+                  use, childContext, childPlan);
+            }
+          }
+        }
         if (use == BulkUse::COUNT_WINDOWS
             && plan.available == BulkAnswer::NO) {
           recordDisjunctionCountIdentityShapeFallbacks();
@@ -4459,17 +4333,6 @@ public:
             || minShouldMatch > 1) {
           return;
         }
-        AcceptedConjunctionRoutes accepted =
-            countRouteMask(!disableFilterClauseCountForTests);
-        ConjunctionPlanningResult planning = planConjunction(
-            pool, ConjunctionMode::EXHAUSTIVE, accepted, use);
-        if (planning.status == ConjunctionPlanStatus::LEGACY) {
-          return;
-        }
-        recordConjunctionPlanCommitment(planning.plan);
-        if (planning.status == ConjunctionPlanStatus::READY) {
-          return;
-        }
         bool pureFilteredDisjunction = mandatorySources.empty()
             && prohibitedSources.empty() && optionalSources.size() >= 2
             && minShouldMatch == 1;
@@ -4479,7 +4342,7 @@ public:
         if (filteredDisjunctionDensityDecline()) {
           skipCount(SkipStats::filteredDisjBatchDensityFallbacks);
         }
-        BulkPlan disjunction = planFilteredDisjunctionBulk();
+        BulkPlan disjunction = planFilteredDisjunctionBulk(use);
         if (disjunction.available == BulkAnswer::NO) {
           skipCount(SkipStats::disjCountIdentityFilterFallbacks);
         }
@@ -4500,181 +4363,61 @@ public:
 
       BulkScorer* buildBulk(
           MemPool& targetPool, const BulkPlan& plan) override {
-        if (plan.buildState == nullptr) {
-          return bulkScorer(targetPool);
-        }
-        if (plan.buildState->owner != this) {
-          return bulkScorer(targetPool);
-        }
-        const auto& conjunction =
-            *static_cast<const ConjunctionPlan*>(plan.buildState);
-        if (conjunction.use == BulkUse::COUNT_WINDOWS) {
-          recordDisjunctionCountIdentityShapeFallbacks();
-        }
-        recordConjunctionPlanCommitment(conjunction);
-        MaybeConjunctionBulk result =
-            buildConjunction(targetPool, conjunction);
-        return result ? result->bulk : nullptr;
-      }
-
-      BulkScorer* bulkScorer(MemPool& targetPool) override {
-        recordDisjunctionCountIdentityShapeFallbacks();
-        if (mandatorySources.empty() && optionalSources.empty()
-            && prohibitedSources.empty() && !filterSuppliers.empty()) {
-          return filterOnlyBulkScorer(targetPool);
-        }
-        if (needsScores && !prohibitedSources.empty()) {
-          if (!filterSuppliers.empty()
-              && !disableFilteredScoredBulkForTests) {
-            if (auto* bulk = filteredScoredBulkScorer(targetPool)) {
-              return bulk;
+        assert(plan.buildState != nullptr
+               && plan.buildState->owner == this);
+        auto* state = static_cast<const BooleanBulkBuildState*>(
+            plan.buildState);
+        switch (state->kind) {
+          case BooleanBulkBuildState::Kind::CONJUNCTION: {
+            const auto& conjunction =
+                *static_cast<const ConjunctionPlan*>(state);
+            if (conjunction.use == BulkUse::COUNT_WINDOWS) {
+              recordDisjunctionCountIdentityShapeFallbacks();
             }
-          }
-          // Normalization hoists +(a b) -c to this exact shape. Required,
-          // filtered, min-match, and single-positive forms retain their
-          // existing pull/conjunction routing.
-          bool maxScoreShape = mandatorySources.empty()
-              && filterSuppliers.empty() && minShouldMatch <= 1
-              && optionalSources.size() >= 2;
-          if (!maxScoreShape) {
-            skipCount(SkipStats::bulkExclusionShapeFallbacks);
-            return nullptr;
-          }
-          if (disableBulkExclusionForTests) {
-            skipCount(SkipStats::bulkExclusionDisabledFallbacks);
-            return nullptr;
-          }
-          return maxScoreBulkScorer(targetPool, true);
-        }
-        if (!filterSuppliers.empty() && mandatorySources.empty()
-            && prohibitedSources.empty() && optionalSources.size() >= 2
-            && minShouldMatch == 1 && !allowsPruning && needsScores) {
-          if (auto* bulk = filteredDisjunctionBulkScorer(targetPool)) {
-            return bulk;
-          }
-          if (twoPhaseDisjunctionPull) {
-            return nullptr;
-          }
-        }
-        if (needsScores && !allowsPruning
-            && !disableFilteredConjunctionBatchForTests
-            && !filterSuppliers.empty()
-            && mandatorySources.size() >= 1
-            && (!disableFilteredConjMultiTermForTests
-                || mandatorySources.size() == 1)
-            && optionalSources.empty() && prohibitedSources.empty()) {
-          auto result = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::CANDIDATE,
-              candidateRouteMask(), BulkUse::EXACT_CANDIDATE_SCORING);
-          if (result && result->usesCandidateRoute()) {
-            recordCandidateConjunctionEngagement(*result);
-            return result->bulk;
-          }
-        }
-        // Filtered and negated counts use the windowed intersection when the
-        // positive body and every exclusion support exact dense fills. A
-        // cached DocSet lead can also drive its sparse conjunction route.
-        bool hasFilteredCountBody = !mandatorySources.empty()
-            || (minShouldMatch >= 1 && !optionalSources.empty());
-        if (!needsScores && hasFilteredCountBody
-            && optionalSources.empty() == (minShouldMatch < 1)
-            && (!prohibitedSources.empty() || !filterSuppliers.empty())
-            && minShouldMatch <= 1) {
-          if (!prohibitedSources.empty()
-              && ConjunctionBulkScorer::disableNegatedCountForTests) {
-            return nullptr;
-          }
-          return filteredCountBulkScorer(
-              targetPool, true, BulkUse::MATCH_WINDOWS);
-        }
-        if (needsScores && !filterSuppliers.empty()) {
-          return disableFilteredScoredBulkForTests
-              ? nullptr : filteredScoredBulkScorer(targetPool);
-        }
-        if (optionalSources.empty() && prohibitedSources.empty()
-            && filterSuppliers.empty() && mandatorySources.size() >= 2) {
-          // Two-phase clauses stay on the pull conjunction even unscored. It
-          // flattens phrase approximations into the doc-level leapfrog and
-          // verifies positions only after all approximations agree; treating a
-          // phrase as opaque would verify positions during every advance.
-          auto result = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::SCORED_BODY,
-              routeBit(ConjunctionRoute::GENERIC),
-              BulkUse::SCORED_WINDOWS);
-          return result ? result->bulk : nullptr;
-        }
-        if (!disableMandOptBulkForTests && mandatorySources.size() == 1
-            && !optionalSources.empty() && prohibitedSources.empty()
-            && filterSuppliers.empty() && minShouldMatch < 1) {
-          return mandOptBulkScorer(targetPool);
-        }
-        // Shape gate only - scoring is not required. In count-only mode the
-        // window loop exhaustively ORs each clause into the window bitset,
-        // which is far cheaper than a doc-at-a-time heap disjunction.
-        if (!mandatorySources.empty() || !prohibitedSources.empty()
-            || !filterSuppliers.empty() || minShouldMatch > 1 || optionalSources.size() < 2) {
-          return nullptr;
-        }
-        return maxScoreBulkScorer(targetPool);
-      }
-
-      FilteredBulkResult filteredBulkScorer(
-          MemPool& targetPool,
-          const Query::ScorerSupplier::BulkScorerContext& bulkContext)
-          override {
-        // BulkScorer currently owns one WindowFilter. Let the enclosing pull
-        // scorer compose nested filters instead of attempting two attachments.
-        if (!filterSuppliers.empty()) {
-          return {};
-        }
-        if (!disableIntegratedFilteredCountForTests
-            && !needsScores && mandatorySources.size() == 1
-            && optionalSources.empty() && prohibitedSources.empty()
-            && minShouldMatch < 1
-            && !bulkContext.filterSuppliers.empty()) {
-          auto* child = mandatorySources[0]->scorerSupplier(
-              targetPool, segment);
-          if (child != nullptr) {
-            auto filtered = child->filteredBulkScorer(
-                targetPool, bulkContext);
-            if (filtered.consumesFilters) {
-              return filtered;
-            }
-          }
-        }
-        if (!disableIntegratedFilteredCountForTests && !needsScores
-            && mandatorySources.size() >= 2
-            && optionalSources.empty() && prohibitedSources.empty()
-            && minShouldMatch < 1
-            && !bulkContext.filterSuppliers.empty()) {
-          auto result = conjunctionBulkScorer(
-              targetPool, ConjunctionMode::EXHAUSTIVE,
-              allRouteMask(),
-              BulkUse::MATCH_WINDOWS,
-              bulkContext.filterSuppliers);
-          if (result) {
-            assert(result->enclosingFilters == EnclosingFilters::CONSUMED);
-            if (result->enclosingFilters != EnclosingFilters::CONSUMED) {
-              return {};
-            }
-            if (result->route
-                == ConjunctionRoute::COUNT_POSTINGS_SAMPLE) {
+            recordConjunctionPlanCommitment(conjunction);
+            MaybeConjunctionBulk result =
+                buildConjunction(targetPool, conjunction);
+            if (!result) return nullptr;
+            if (result->usesCandidateRoute()) {
+              recordCandidateConjunctionEngagement(*result);
+            } else if (conjunction.mode == ConjunctionMode::EXHAUSTIVE
+                       && result->route
+                           == ConjunctionRoute::COUNT_POSTINGS_SAMPLE) {
               skipCount(SkipStats::filteredConjBatchEngagements);
               skipCount(
                   SkipStats::filteredConjBatchPostingsFeedEngagements);
             }
-            return {result->bulk, true};
+            return result->bulk;
+          }
+          case BooleanBulkBuildState::Kind::MAND_OPT:
+            return buildMandOptBulk(
+                targetPool, *static_cast<const MandOptPlan*>(state));
+          case BooleanBulkBuildState::Kind::MAX_SCORE:
+            return buildMaxScoreBulk(
+                targetPool, *static_cast<const MaxScorePlan*>(state));
+          case BooleanBulkBuildState::Kind::FILTERED_DISJUNCTION:
+            return buildFilteredDisjunctionBulk(
+                targetPool,
+                *static_cast<const FilteredDisjunctionPlan*>(state));
+          case BooleanBulkBuildState::Kind::EXACT_FILTERED_MAND_OPT:
+            return buildExactFilteredMandOptBulk(
+                targetPool,
+                *static_cast<const ExactFilteredMandOptPlan*>(state));
+          case BooleanBulkBuildState::Kind::FILTERED_BODY:
+            return buildFilteredBodyBulk(
+                targetPool,
+                *static_cast<const FilteredBodyPlan*>(state));
+          case BooleanBulkBuildState::Kind::FILTER_ONLY:
+            return buildFilterOnlyBulk(
+                targetPool, *static_cast<const FilterOnlyPlan*>(state));
+          case BooleanBulkBuildState::Kind::DELEGATE_FILTERED_CHILD: {
+            const auto& delegated =
+                *static_cast<const DelegateFilteredChildPlan*>(state);
+            return delegated.child->buildBulk(
+                targetPool, delegated.childPlan);
           }
         }
-        if (bulkContext.requireFilterConsumption) {
-          return {};
-        }
-        if (!disableMandOptBulkForTests && mandatorySources.size() == 1
-            && !optionalSources.empty() && prohibitedSources.empty()
-            && filterSuppliers.empty() && minShouldMatch < 1) {
-          return {mandOptBulkScorer(targetPool, nullptr, &bulkContext), false};
-        }
-        return {bulkScorer(targetPool), false};
+        std::unreachable();
       }
     };
 
@@ -5012,60 +4755,6 @@ public:
     // Single-clause boolean shapes delegate to the wrapped clause. Filtered
     // count-only conjunctions exhaust the same per-window bulk intersection
     // used by collection, with filter clauses kept as lazy zero-score members.
-    int64_t count(solux::IndexReader::Segment& segment) override {
-      if (!prohibitedWeights.empty() || minShouldMatch > 1) {
-        return -1;
-      }
-      bool hasFilteredCountBody = !mandatoryWeights.empty()
-          || (minShouldMatch >= 1 && !optionalWeights.empty());
-      if (!filterWeights.empty()) {
-        if (!hasFilteredCountBody || needsScores || segment.liveDocs() != nullptr) {
-          return -1;
-        }
-        auto guard = MemPool::threadLocalPoolGuard();
-        auto* supplier = scorerSupplier(guard.pool(), segment);
-        if (supplier == nullptr) {
-          return 0;
-        }
-        auto* booleanSupplier = dynamic_cast<Supplier*>(supplier);
-        assert(booleanSupplier != nullptr);
-        if (booleanSupplier == nullptr) {
-          return -1;
-        }
-        Query::ScorerSupplier::BulkScorerContext bulkContext;
-        auto plan = booleanSupplier->planBulk(
-            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
-        if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
-          booleanSupplier->recordBulkPlanCommitment(
-              Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-              bulkContext, plan);
-          return -1;
-        }
-        auto* bulk = booleanSupplier->buildBulk(guard.pool(), plan);
-        if (bulk == nullptr) {
-          return -1;
-        }
-        int64_t count = 0;
-        for (int32_t cursor = 0;
-             cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
-          int32_t next = bulk->countNextWindow(
-              count, nullptr, nullptr, cursor, segment.maxDoc());
-          if (next == PostingsReader::END) {
-            break;
-          }
-          assert(next > cursor);
-          cursor = next;
-        }
-        return count;
-      }
-      if (mandatoryWeights.size() == 1 && optionalWeights.empty()) {
-        return mandatoryWeights[0]->count(segment);
-      }
-      if (mandatoryWeights.empty() && optionalWeights.size() == 1) {
-        return optionalWeights[0]->count(segment);
-      }
-      return -1;
-    }
   };  // BooleanQuery::Weight
 
   class Scorer final : public Query::Scorer {
@@ -8719,6 +8408,7 @@ public:
                           TermQuery::Scorer* candidateLeadScoreScorer,
                           std::span<uint8_t> candidateFilters,
                           std::span<DocSet*> candidateFilterDocSets,
+                          bool plannedNegatedCount,
                           bool recordRouteCommitment = true,
                           std::span<const ConjunctionClauseLayout>
                               plannedClauses = {},
@@ -8891,6 +8581,9 @@ public:
                 }
               }
               break;
+            case Query::ClauseShape::FLAT_CONJUNCTION:
+              assert(false);
+              break;
             case Query::ClauseShape::NONE:
               prohibitedScorers[i]->recordWindowFilterCommit(false);
               break;
@@ -8936,7 +8629,10 @@ public:
                                                          (size_t) kChunk);
         }
       }
-      negatedCountPath = !prohibitedScorers.empty();
+      assert(plannedNegatedCount
+             == (!prohibitedScorers.empty()
+                 || !candidateProhibitedTerms.empty()));
+      negatedCountPath = plannedNegatedCount;
       int32_t denseThresholdInverse =
           !scoredConstruction && sparseEligibleTails
           ? termTailDenseThresholdInverseForTests
@@ -10153,7 +9849,6 @@ public:
   public:
     static inline bool disableDisjConjBulkForTests = false;
 
-  private:
     constexpr static int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
@@ -10164,6 +9859,8 @@ public:
     // balanced unions use ordinary enumeration.
     constexpr static int64_t kDisjunctionCountIdentityMaxProbes = 1024;
     constexpr static int64_t kDisjunctionCountIdentityMinDfRatio = 32;
+
+  private:
     // Drive from the domain when card*nClauses*W < sum(clause.cost()). W models
     // a scalar advance relative to vectorized block decode and is sensitive to
     // both implementations. W_ARRAY is lower because stream-side membership
@@ -10233,60 +9930,28 @@ public:
     bool disjConjCountPath = false;
 
     void configureDisjunctionCountIdentity(solux::MemPool& pool,
-                                           bool countOnly,
-                                           bool hasDeletes) {
-      if (!countOnly || disableDisjunctionCountIdentityForTests) {
-        return;
-      }
-      if (hasDeletes) {
-        skipCount(SkipStats::disjCountIdentityDeleteFallbacks);
-        return;
-      }
+                                           bool enabled,
+                                           size_t largestIndex) {
+      if (!enabled) return;
       assert(clauseCosts.size() == scorers.size());
-
-      size_t largestIndex = 0;
-      int64_t largestDf = -1;
-      int64_t totalDf = 0;
-      for (size_t i = 0; i < scorers.size(); i++) {
-        if (dynamic_cast<TermQuery::Scorer*>(scorers[i]) == nullptr) {
-          skipCount(SkipStats::disjCountIdentityNonTermFallbacks);
-          return;
-        }
-        int64_t df = clauseCosts[i];
-        assert(df >= 0);
-        if (df > largestDf) {
-          largestDf = df;
-          largestIndex = i;
-        }
-        if (df >= std::numeric_limits<int64_t>::max() - totalDf) {
-          totalDf = std::numeric_limits<int64_t>::max();
-        } else {
-          totalDf += df;
-        }
-      }
-
-      int64_t otherDf = totalDf == std::numeric_limits<int64_t>::max()
-          ? totalDf : totalDf - largestDf;
-      if (otherDf <= 0
-          || otherDf > kDisjunctionCountIdentityMaxProbes
-          || otherDf > largestDf / kDisjunctionCountIdentityMinDfRatio) {
-        skipCount(SkipStats::disjCountIdentityProfitabilityFallbacks);
-        return;
-      }
+      assert(largestIndex < scorers.size());
+      assert(dynamic_cast<TermQuery::Scorer*>(
+          scorers[largestIndex]) != nullptr);
 
       disjCountIdentityOthers =
           pool.make_span<TermQuery::Scorer*>(scorers.size() - 1);
       size_t other = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
         if (i != largestIndex) {
-          disjCountIdentityOthers[other++] =
-              static_cast<TermQuery::Scorer*>(scorers[i]);
+          auto* term = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
+          assert(term != nullptr);
+          disjCountIdentityOthers[other++] = term;
         }
       }
       assert(other == disjCountIdentityOthers.size());
       disjCountIdentityLargest =
           static_cast<TermQuery::Scorer*>(scorers[largestIndex]);
-      disjCountIdentityLargestDf = largestDf;
+      disjCountIdentityLargestDf = clauseCosts[largestIndex];
     }
 
     // Exact unscored count decomposition is all-or-nothing. Any opaque or
@@ -11329,7 +10994,9 @@ public:
                        std::span<int64_t> clauseCosts,
                        std::span<Query::Scorer*> exclusionScorers,
                        int32_t maxDoc, int64_t aggregateClauseCost,
-                       bool enableDisjConjCount, bool hasDeletes)
+                       bool enableDisjConjCount,
+                       bool enableDisjunctionCountIdentity,
+                       size_t identityLargestIndex)
             : scorers(scorers),
               clauseCosts(clauseCosts),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -11363,7 +11030,7 @@ public:
       }
       configureDisjConjCount(pool, enableDisjConjCount);
       configureDisjunctionCountIdentity(
-          pool, enableDisjConjCount, hasDeletes);
+          pool, enableDisjunctionCountIdentity, identityLargestIndex);
     }
 
     bool supportsMatchWindows() const override {

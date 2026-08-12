@@ -526,6 +526,7 @@ public:
               ? Query::ClauseShape::DIRECT
               : Query::ClauseShape::NONE,
           .termDisjunctionClause = Query::ClauseShape::NONE,
+          .termConjunctionClause = Query::ClauseShape::NONE,
           .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,

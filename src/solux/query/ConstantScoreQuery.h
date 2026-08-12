@@ -73,6 +73,7 @@ class ConstantScoreQuery final : public solux::Query {
         .reportedTwoPhase = child.reportedTwoPhase,
         .windowFillClause = Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
+        .termConjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -129,6 +130,17 @@ class ConstantScoreQuery final : public solux::Query {
       return planPool.make<Plan>(
           *this, planContext, wrappedShape(childPlan->shape()),
           childPlan->cost(), childPlan, constantScore);
+    }
+
+    BulkPlan planBulk(
+        BulkUse use, const BulkScorerContext& bulkContext) override {
+      if (!bulkContext.requireConstantCount) {
+        return {
+          BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+          BulkAnswer::NO,
+        };
+      }
+      return childSupplier->planBulk(use, bulkContext);
     }
   };
 

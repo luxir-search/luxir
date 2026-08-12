@@ -642,6 +642,7 @@ public:
       };
 
       NumericRangeQuery::Weight& weight;
+      MemPool& planPool;
       IndexReader::Segment& segment;
       IntColReader& reader;
       PointsReader* points;
@@ -800,6 +801,7 @@ public:
               : Query::ReportedTwoPhase::NO,
           .windowFillClause = Query::ClauseShape::DIRECT,
           .termDisjunctionClause = Query::ClauseShape::NONE,
+          .termConjunctionClause = Query::ClauseShape::NONE,
           .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -860,12 +862,88 @@ public:
             complement(complement) {}
       };
 
+      struct BulkState final : Query::ScorerSupplier::BulkBuildState {
+        enum class Arm : uint8_t {
+          POINTS,
+          ZONE_MAP,
+        };
+
+        Arm arm;
+        uint64_t begin = 0;
+        uint64_t end = 0;
+        bool complement = false;
+
+        BulkState(const Supplier* owner, Arm arm)
+          : arm(arm) {
+          this->owner = owner;
+        }
+      };
+
+      int64_t exactCount() {
+        if (points != nullptr && !reader.multiValued()) {
+          auto [begin, end] = exactPositions(planPool);
+          return (int64_t)(end - begin);
+        }
+        CrossingValues crossing(reader);
+        if (!reader.multiValued()) {
+          int64_t count = 0;
+          for (int64_t blockNum = 0;
+               blockNum < reader.numBlocks(); blockNum++) {
+            const BlockPlan& plan = plans[(size_t)blockNum];
+            int64_t start =
+                blockNum * (int64_t)IntColReader::BLOCK_SIZE;
+            int64_t end = start + reader.valuesInBlock(blockNum);
+            if (plan.relation == BlockRelation::INSIDE) {
+              count += end - start;
+            } else if (plan.relation == BlockRelation::CROSSES) {
+              for (int64_t rank = start; rank < end; rank++) {
+                count += crossing.matches(
+                    rank, plan, weight.query.getLo(),
+                    weight.query.getHi());
+              }
+            }
+          }
+          return count;
+        }
+
+        int64_t count = 0;
+        for (int32_t docRank = 0;
+             docRank < reader.docsWithValue(); docRank++) {
+          auto [start, end] = reader.getStartEndValueRank(docRank);
+          int64_t rank = start;
+          bool matched = false;
+          while (rank < end && !matched) {
+            int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
+            int64_t blockEnd = std::min<int64_t>(
+                end, (blockNum + 1)
+                    * (int64_t)IntColReader::BLOCK_SIZE);
+            const BlockPlan& plan = plans[(size_t)blockNum];
+            if (plan.relation == BlockRelation::INSIDE) {
+              matched = true;
+            } else if (plan.relation == BlockRelation::CROSSES) {
+              while (rank < blockEnd && !matched) {
+                matched = crossing.matches(
+                    rank, plan, weight.query.getLo(),
+                    weight.query.getHi());
+                rank++;
+              }
+            } else {
+              rank = blockEnd;
+            }
+          }
+          count += matched;
+        }
+        return count;
+      }
+
     public:
-      Supplier(NumericRangeQuery::Weight& weight, IndexReader::Segment& segment,
+      Supplier(NumericRangeQuery::Weight& weight, MemPool& planPool,
+               IndexReader::Segment& segment,
                IntColReader& reader, std::span<const BlockPlan> plans,
                int64_t estimatedCost, bool allMatch, PointsReader* points,
                PointsReader::FenceRange fence)
-          : weight(weight), segment(segment), reader(reader), points(points),
+          : weight(weight), planPool(planPool), segment(segment),
+            reader(reader), points(points),
             plans(plans), fence(fence), estimatedCost(estimatedCost),
             allMatch(allMatch) {
         int64_t prunableValues = 0;
@@ -933,30 +1011,75 @@ public:
         return resolve(targetPool, planContext)->build(targetPool);
       }
 
-      BulkScorer* bulkScorer(MemPool& targetPool) override {
-        if (points != nullptr) {
-          auto [begin, end] = exactPositions(targetPool);
-          uint64_t exactCount = end - begin;
-          if (useComplement(exactCount)) {
-            skipCount(SkipStats::numericRangeComplementArms);
-            return bulkFor(targetPool,
-                materializeComplement(targetPool, begin, end));
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        unused(use);
+        if (bulkContext.requireConstantCount) {
+          if (segment.liveDocs() != nullptr) {
+            return {
+              BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+              BulkAnswer::NO,
+            };
           }
-          skipCount(SkipStats::numericRangePointsArms);
-          return bulkFor(targetPool,
-              materializePoints(targetPool, begin, end));
+          return {
+            BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+            BulkAnswer::NO, nullptr, exactCount(),
+          };
         }
-        return phaseOneBulkScorer(targetPool);
+        if (bulkContext.requireFilterConsumption) {
+          return {
+            BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+            BulkAnswer::NO,
+          };
+        }
+        if (points != nullptr) {
+          auto [begin, end] = exactPositions(planPool);
+          auto* state = planPool.make<BulkState>(
+              this, BulkState::Arm::POINTS);
+          state->begin = begin;
+          state->end = end;
+          state->complement = useComplement(end - begin);
+          return {
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
+            BulkAnswer::NO, state,
+          };
+        }
+        if (useZoneMap) {
+          auto* state = planPool.make<BulkState>(
+              this, BulkState::Arm::ZONE_MAP);
+          return {
+            BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
+            BulkAnswer::NO, state,
+          };
+        }
+        return {
+          BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+          BulkAnswer::NO,
+        };
       }
 
-      FilteredBulkResult filteredBulkScorer(
-          MemPool& targetPool,
-          const BulkScorerContext& bulkContext) override {
-        if (bulkContext.requireFilterConsumption) {
-          return {};
+      BulkScorer* buildBulk(
+          MemPool& targetPool, const BulkPlan& plan) override {
+        assert(plan.available == BulkAnswer::YES);
+        assert(!plan.hasConstantCount());
+        assert(plan.buildState != nullptr);
+        assert(plan.buildState->owner == this);
+        const auto& state =
+            *static_cast<const BulkState*>(plan.buildState);
+        if (state.arm == BulkState::Arm::ZONE_MAP) {
+          return phaseOneBulkScorer(targetPool);
         }
-        return {bulkScorer(targetPool), false};
+        assert(points != nullptr);
+        if (state.complement) {
+          skipCount(SkipStats::numericRangeComplementArms);
+          return bulkFor(targetPool,
+              materializeComplement(targetPool, state.begin, state.end));
+        }
+        skipCount(SkipStats::numericRangePointsArms);
+        return bulkFor(targetPool,
+            materializePoints(targetPool, state.begin, state.end));
       }
+
     };
 
     Query::ScorerSupplier* scorerSupplier(MemPool& targetPool,
@@ -994,7 +1117,8 @@ public:
         }
         cost = (int64_t)fenceCount;
       }
-      return targetPool.make<Supplier>(*this, segment, *reader, plans, cost,
+      return targetPool.make<Supplier>(*this, targetPool, segment, *reader,
+                                       plans, cost,
                                        allMatch, points, fence);
     }
 
@@ -1054,79 +1178,6 @@ public:
           segment.maxDoc(), constantScore);
     }
 
-    int64_t count(IndexReader::Segment& segment) override {
-      if (segment.liveDocs() != nullptr) return -1;
-      SegFieldInfo* segInfo = nullptr;
-      if (!segmentInfo(segment, segInfo)) return 0;
-      IntColReader reader(segment.postingsReader(), *segInfo);
-      if (reader.numValues() == 0) return 0;
-      if (reader.getMax() < query.getLo() || query.getHi() < reader.getMin()) {
-        return 0;
-      }
-      if (segInfo->pointsMetaOff != 0 && !reader.multiValued()) {
-        PointsReader points(segment.postingsReader(), *segInfo);
-        if (points.pointCount() != (uint64_t)reader.numValues()) {
-          throw std::runtime_error("NumericRangeQuery: points/column value count mismatch");
-        }
-        auto fence = points.fenceRange(query.getLo(), query.getHi());
-        if (fence.empty) return 0;
-        auto guard = MemPool::threadLocalPoolGuard();
-        auto residuals = guard.pool().make_span<uint32_t>(points.maxPointsPerLeaf());
-        auto raw = guard.pool().make_span<int64_t>(points.maxPointsPerLeaf());
-        auto [begin, end] = exactPointPositions(
-            points, fence, query.getLo(), query.getHi(), residuals, raw);
-        return (int64_t)(end - begin);
-      }
-
-      std::vector<BlockPlan> plans((size_t)reader.numBlocks());
-      for (int64_t i = 0; i < reader.numBlocks(); i++) {
-        plans[(size_t)i] = classifyBlock(
-            reader.blockInfo(i), reader.blockZone(i), query.getLo(),
-            query.getHi());
-      }
-      CrossingValues crossing(reader);
-      if (!reader.multiValued()) {
-        int64_t count = 0;
-        for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
-          const BlockPlan& plan = plans[(size_t)blockNum];
-          int64_t start = blockNum * (int64_t)IntColReader::BLOCK_SIZE;
-          int64_t end = start + reader.valuesInBlock(blockNum);
-          if (plan.relation == BlockRelation::INSIDE) {
-            count += end - start;
-          } else if (plan.relation == BlockRelation::CROSSES) {
-            for (int64_t rank = start; rank < end; rank++) {
-              count += crossing.matches(rank, plan, query.getLo(), query.getHi());
-            }
-          }
-        }
-        return count;
-      }
-
-      int64_t count = 0;
-      for (int32_t docRank = 0; docRank < reader.docsWithValue(); docRank++) {
-        auto [start, end] = reader.getStartEndValueRank(docRank);
-        int64_t rank = start;
-        bool matched = false;
-        while (rank < end && !matched) {
-          int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
-          int64_t blockEnd = std::min<int64_t>(end,
-              (blockNum + 1) * (int64_t)IntColReader::BLOCK_SIZE);
-          const BlockPlan& plan = plans[(size_t)blockNum];
-          if (plan.relation == BlockRelation::INSIDE) {
-            matched = true;
-          } else if (plan.relation == BlockRelation::CROSSES) {
-            while (rank < blockEnd && !matched) {
-              matched = crossing.matches(rank, plan, query.getLo(), query.getHi());
-              rank++;
-            }
-          } else {
-            rank = blockEnd;
-          }
-        }
-        count += matched;
-      }
-      return count;
-    }
   };
 };
 

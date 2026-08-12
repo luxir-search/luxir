@@ -33,9 +33,6 @@ namespace solux {
 class DocSet;
 class DocSetBuilder;
 class WindowFilter;
-namespace query_detail {
-class LegacyScorerPlan;
-}
 
 enum class PreparedDomainDependence : uint8_t {
   // Prepared output is the canonical result of the query and may be
@@ -374,6 +371,7 @@ public:
   enum class ClauseShape : uint8_t {
     DIRECT,
     FLAT_DISJUNCTION,
+    FLAT_CONJUNCTION,
     NONE,
     UNKNOWN,
   };
@@ -469,6 +467,7 @@ public:
     ReportedTwoPhase reportedTwoPhase = ReportedTwoPhase::UNKNOWN;
     ClauseShape windowFillClause = ClauseShape::UNKNOWN;
     ClauseShape termDisjunctionClause = ClauseShape::UNKNOWN;
+    ClauseShape termConjunctionClause = ClauseShape::UNKNOWN;
     IndependentTermAccess independentTerm = IndependentTermAccess::UNKNOWN;
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
@@ -479,6 +478,7 @@ public:
           || reportedTwoPhase == ReportedTwoPhase::UNKNOWN
           || windowFillClause == ClauseShape::UNKNOWN
           || termDisjunctionClause == ClauseShape::UNKNOWN
+          || termConjunctionClause == ClauseShape::UNKNOWN
           || independentTerm == IndependentTermAccess::UNKNOWN
           || docsOnly == DocsOnlyAccess::UNKNOWN
           || directDocSet == DirectDocSetAccess::UNKNOWN;
@@ -524,35 +524,11 @@ public:
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class ScorerSupplier {
   public:
-    // Transition tripwire: an unresolved legacy plan must be consumed before
-    // the same supplier is resolved again. A nonzero count means a planner
-    // retained a token but later re-entered through a bridge.
-    static inline std::atomic<int64_t> legacyResolveTwiceForTests{0};
-
-  private:
-    friend class query_detail::LegacyScorerPlan;
-    bool legacyPlanOutstanding = false;
-
-    void markLegacyPlanResolved() {
-      if (legacyPlanOutstanding) {
-        legacyResolveTwiceForTests.fetch_add(1, std::memory_order_relaxed);
-        assert(false);
-      }
-      legacyPlanOutstanding = true;
-    }
-
-    void consumeLegacyPlan() {
-      assert(legacyPlanOutstanding);
-      legacyPlanOutstanding = false;
-    }
-
-  public:
     using BulkUse = ExecutionUse;
 
     enum class BulkAnswer : uint8_t {
       YES,
       NO,
-      UNKNOWN,
     };
 
     enum class ScoreBlockFillKind : uint8_t {
@@ -569,6 +545,9 @@ public:
       // Strong constraint: a supplier must return consumesFilters=true or
       // decline with {}; it must not construct a non-consuming fallback.
       bool requireFilterConsumption = false;
+      // Ask this same planner only for an exact scalar count arm. This never
+      // authorizes a bulk build whose output would then be discarded.
+      bool requireConstantCount = false;
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
     };
@@ -580,11 +559,17 @@ public:
     };
 
     struct BulkPlan {
-      BulkAnswer available = BulkAnswer::UNKNOWN;
-      BulkAnswer supportsMatchWindows = BulkAnswer::UNKNOWN;
-      BulkAnswer supportsExactCandidateScoring = BulkAnswer::UNKNOWN;
-      BulkAnswer consumesFilters = BulkAnswer::UNKNOWN;
+      BulkAnswer available = BulkAnswer::NO;
+      BulkAnswer supportsMatchWindows = BulkAnswer::NO;
+      BulkAnswer supportsExactCandidateScoring = BulkAnswer::NO;
+      BulkAnswer consumesFilters = BulkAnswer::NO;
       const BulkBuildState* buildState = nullptr;
+      int64_t constantCount = -1;
+      BulkAnswer acceptsWindowFilter = BulkAnswer::NO;
+
+      bool hasConstantCount() const noexcept {
+        return constantCount >= 0;
+      }
     };
 
     struct FilteredBulkResult {
@@ -619,11 +604,8 @@ public:
     }
 
     /// Resolve one exact construction arm into a pool-owned affine token.
-    /// The default token records describeScorer() and delegates its one build
-    /// to the legacy get() override, allowing unmigrated suppliers to remain
-    /// operational through R1b/R1c.
     virtual ScorerPlan* resolve(
-        MemPool& planPool, const PlanContext& planContext);
+        MemPool& planPool, const PlanContext& planContext) = 0;
 
     /// Attribute a shape uncertainty to the supplier family that must resolve
     /// it. Compound and transparent wrapper suppliers should delegate to the
@@ -702,12 +684,17 @@ public:
     }
 
     /// Describe bulk construction for one consumer intent without building.
-    /// UNKNOWN preserves the historical speculative-build path. Definite
-    /// answers must match bulkScorer()/filteredBulkScorer() for this context.
+    /// The answer is definite and must match the product built for this
+    /// context.
     virtual BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) {
       unused(use, bulkContext);
-      return {};
+      return {
+        BulkAnswer::NO,
+        BulkAnswer::NO,
+        BulkAnswer::NO,
+        BulkAnswer::NO,
+      };
     }
 
     /// Record route decisions from a definite pre-build decline. Planning is
@@ -719,16 +706,22 @@ public:
     }
 
     virtual BulkScorer* bulkScorer(MemPool& targetPool) {
-      unused(targetPool);
-      return nullptr;
+      BulkScorerContext bulkContext;
+      BulkPlan plan = planBulk(BulkUse::MATCH_WINDOWS, bulkContext);
+      if (plan.available == BulkAnswer::NO) {
+        recordBulkPlanCommitment(
+            BulkUse::MATCH_WINDOWS, bulkContext, plan);
+      }
+      return plan.available == BulkAnswer::YES && !plan.hasConstantCount()
+          ? buildBulk(targetPool, plan) : nullptr;
     }
 
     /// Consume supplier-owned state from a definite plan when available. The
     /// default preserves the historical bulk construction path.
     virtual BulkScorer* buildBulk(
         MemPool& targetPool, const BulkPlan& plan) {
-      unused(plan);
-      return bulkScorer(targetPool);
+      unused(targetPool, plan);
+      return nullptr;
     }
 
     // Build a bulk scorer that will run beneath an enclosing filter. Unknown
@@ -736,9 +729,19 @@ public:
     // bulk route must explicitly accept or use the context.
     virtual FilteredBulkResult filteredBulkScorer(
         MemPool& targetPool, const BulkScorerContext& bulkContext) {
-      unused(targetPool);
-      unused(bulkContext);
-      return {};
+      BulkPlan plan = planBulk(BulkUse::MATCH_WINDOWS, bulkContext);
+      if (plan.available != BulkAnswer::YES || plan.hasConstantCount()) {
+        if (plan.available == BulkAnswer::NO) {
+          recordBulkPlanCommitment(
+              BulkUse::MATCH_WINDOWS, bulkContext, plan);
+        }
+        return {};
+      }
+      BulkScorer* bulk = buildBulk(targetPool, plan);
+      return {
+        bulk,
+        bulk != nullptr && plan.consumesFilters == BulkAnswer::YES,
+      };
     }
   };
 
@@ -747,7 +750,8 @@ public:
   public:
     /// Return temporary per-segment planning state allocated from targetPool.
     /// A null supplier means this source cannot match the segment.
-    virtual Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment);
+    virtual Query::ScorerSupplier* scorerSupplier(
+        MemPool& targetPool, IndexReader::Segment& segment) = 0;
 
     /// Compatibility hook for existing scorer implementations. New call sites
     /// should go through scorerSupplier(); the default supplier delegates here.
@@ -1151,13 +1155,19 @@ public:
     /// or populate/mutate Query::Context caches.
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
-    /// Exact number of matching docs in this segment, or -1 when that is not
-    /// known cheaply. A non-negative return must equal what iterating the
-    /// scorer would count. Implementations must return -1 when the segment
-    /// has deleted docs they do not account for; callers must not use this
-    /// when an external filter or domain further restricts eligibility.
+    /// Compatibility facade over the count planner. New consumers call
+    /// planBulk(COUNT_WINDOWS) directly.
     virtual int64_t count(IndexReader::Segment& segment) {
-      unused(segment);
+      auto guard = MemPool::threadLocalPoolGuard();
+      ScorerSupplier* supplier = scorerSupplier(guard.pool(), segment);
+      if (supplier == nullptr) return 0;
+      ScorerSupplier::BulkScorerContext constantContext;
+      constantContext.requireConstantCount = true;
+      auto constantPlan = supplier->planBulk(
+          ExecutionUse::COUNT_WINDOWS, constantContext);
+      if (constantPlan.hasConstantCount()) {
+        return constantPlan.constantCount;
+      }
       return -1;
     }
 
@@ -1389,6 +1399,7 @@ public:
           && left.reportedTwoPhase == right.reportedTwoPhase
           && left.windowFillClause == right.windowFillClause
           && left.termDisjunctionClause == right.termDisjunctionClause
+          && left.termConjunctionClause == right.termConjunctionClause
           && left.independentTerm == right.independentTerm
           && left.docsOnly == right.docsOnly
           && left.directDocSet == right.directDocSet;
@@ -1430,6 +1441,9 @@ public:
           break;
         case ClauseShape::FLAT_DISJUNCTION:
           assert(!directWindowFill && flatWindowFill);
+          break;
+        case ClauseShape::FLAT_CONJUNCTION:
+          assert(false);
           break;
         case ClauseShape::NONE:
           assert(!directWindowFill && !flatWindowFill);
@@ -1660,69 +1674,6 @@ public:
   }
 };
 
-namespace query_detail {
-
-// One generic escape for suppliers not yet migrated to recorded construction.
-// The plan snapshots the legacy scalar and shape, then invokes the supplier's
-// existing get() override exactly once.
-class LegacyScorerPlan final : public Query::ScorerPlan {
-public:
-  LegacyScorerPlan(Query::ScorerSupplier& supplier,
-                   const Query::PlanContext& planContext,
-                   const Query::ScorerShape& shape, int64_t cost)
-    : Query::ScorerPlan(supplier, planContext, shape, cost) {}
-
-protected:
-  Query::Scorer* buildScorer(MemPool& targetPool) override {
-    owner().consumeLegacyPlan();
-    return owner().get(targetPool, context().demand.candidates);
-  }
-
-  Query::Scorer* buildIndependentScorer(
-      MemPool& targetPool) override {
-    owner().consumeLegacyPlan();
-    return owner().getIndependent(
-        targetPool, context().demand.candidates);
-  }
-
-  DocsOnlyEnum* buildDocsOnlyEnum(MemPool& targetPool) override {
-    owner().consumeLegacyPlan();
-    return owner().getDocsOnly(targetPool);
-  }
-};
-
-// Transitional supplier for SegmentSource implementations that still only
-// implement createScorer(). Specialized suppliers should override cost() with a
-// better estimate and may use leadCost in get().
-class DefaultScorerSupplier final : public Query::ScorerSupplier {
-  Query::SegmentSource& source;
-  IndexReader::Segment& segment;
-
-public:
-  DefaultScorerSupplier(Query::SegmentSource& source, IndexReader::Segment& segment)
-    : source(source), segment(segment) {}
-
-  // Conservative upper bound when the wrapped source has no cheaper estimate.
-  int64_t cost() override {
-    return segment.maxDoc();
-  }
-
-  Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-    unused(leadCost);
-    return source.createScorer(targetPool, segment);
-  }
-};
-
-} // namespace query_detail
-
-inline Query::ScorerPlan* Query::ScorerSupplier::resolve(
-    MemPool& planPool, const PlanContext& planContext) {
-  ScorerPlan* plan = planPool.make<query_detail::LegacyScorerPlan>(
-      *this, planContext, describeScorer(planContext), cost());
-  markLegacyPlanResolved();
-  return plan;
-}
-
 inline Query::Scorer* Query::ScorerSupplier::get(
     MemPool& targetPool, int64_t leadCost) {
   PlanContext planContext = PlanContext::fromLeadCost(leadCost);
@@ -1749,11 +1700,6 @@ inline DocsOnlyEnum* Query::ScorerSupplier::getDocsOnly(
   ScorerPlan* plan = resolve(targetPool, planContext);
   assert(plan != nullptr);
   return plan == nullptr ? nullptr : plan->buildDocsOnly(targetPool);
-}
-
-inline Query::ScorerSupplier* Query::SegmentSource::scorerSupplier(MemPool& targetPool,
-                                                                   IndexReader::Segment& segment) {
-  return targetPool.make<query_detail::DefaultScorerSupplier>(*this, segment);
 }
 
 

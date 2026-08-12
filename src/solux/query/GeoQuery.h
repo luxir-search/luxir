@@ -121,6 +121,7 @@ public:
     };
 
     GeoQueryWeight& weight;
+    MemPool& planPool;
     IndexReader::Segment& segment;
     IntColReader& reader;
     BKDReader* bkd;
@@ -199,6 +200,7 @@ public:
             ? Query::ClauseShape::DIRECT
             : Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
+        .termConjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -244,10 +246,12 @@ public:
     };
 
   public:
-    Supplier(GeoQueryWeight& weight, IndexReader::Segment& segment,
+    Supplier(GeoQueryWeight& weight, MemPool& planPool,
+             IndexReader::Segment& segment,
              IntColReader& reader, BKDReader* bkd,
              BKDReader::EstimateResult estimate)
-        : weight(weight), segment(segment), reader(reader), bkd(bkd),
+        : weight(weight), planPool(planPool), segment(segment),
+          reader(reader), bkd(bkd),
           relation(weight.query.makeRelation()),
           estimatedCost((int64_t)std::min<uint64_t>(
               estimate.estimatedCount, (uint64_t)reader.docsWithValue())),
@@ -280,21 +284,49 @@ public:
       return resolve(targetPool, planContext)->build(targetPool);
     }
 
-    BulkScorer* bulkScorer(MemPool& targetPool) override {
+    BulkPlan planBulk(
+        BulkUse use, const BulkScorerContext& bulkContext) override {
+      unused(use);
+      if (bulkContext.requireConstantCount) {
+        if (segment.liveDocs() != nullptr || bkd == nullptr
+            || reader.multiValued()) {
+          return {
+            BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+            BulkAnswer::NO,
+          };
+        }
+        size_t size = bkd->maxPointsPerLeaf();
+        BKDReader::Scratch countScratch{
+          {}, planPool.make_span<uint32_t>(size),
+          planPool.make_span<uint32_t>(size),
+        };
+        int64_t exact =
+            (int64_t)bkd->countIntersect(relation, countScratch).exactCount;
+        return {
+          BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+          BulkAnswer::NO, nullptr, exact,
+        };
+      }
+      bool available = bkd != nullptr
+          && !bulkContext.requireFilterConsumption;
+      return {
+        available ? BulkAnswer::YES : BulkAnswer::NO,
+        available ? BulkAnswer::YES : BulkAnswer::NO,
+        BulkAnswer::NO,
+        BulkAnswer::NO,
+      };
+    }
+
+    BulkScorer* buildBulk(
+        MemPool& targetPool, const BulkPlan& plan) override {
+      assert(plan.available == BulkAnswer::YES);
+      assert(!plan.hasConstantCount());
+      assert(bkd != nullptr);
       if (bkd == nullptr) return nullptr;
       skipCount(SkipStats::geoBKDArms);
       return PointsMaterialize::bulkFor(
           targetPool, materialize(targetPool), segment.maxDoc(),
           weight.constantScore);
-    }
-
-    FilteredBulkResult filteredBulkScorer(
-        MemPool& targetPool,
-        const BulkScorerContext& bulkContext) override {
-      if (bulkContext.requireFilterConsumption) {
-        return {};
-      }
-      return {bulkScorer(targetPool), false};
     }
   };
 
@@ -316,7 +348,8 @@ public:
       estimate = bkd->estimateIntersect(relation);
       if (estimate.upperBound == 0) return nullptr;
     }
-    return targetPool.make<Supplier>(*this, segment, *reader, bkd, estimate);
+    return targetPool.make<Supplier>(
+        *this, targetPool, segment, *reader, bkd, estimate);
   }
 
   Query::Scorer* createScorer(MemPool& targetPool,
@@ -341,24 +374,6 @@ public:
         *reader, relation, constantScore);
   }
 
-  int64_t count(IndexReader::Segment& segment) override {
-    if (query.isEmpty()) return 0;
-    if (segment.liveDocs() != nullptr) return -1;
-    SegFieldInfo* info = nullptr;
-    if (!segmentInfo(segment, info)) return 0;
-    if (info->type != FieldType::GEO_POINT) wrongFieldType();
-    IntColReader reader(segment.postingsReader(), *info);
-    if (reader.numValues() == 0) return 0;
-    if (reader.multiValued() || info->pointsMetaOff == 0) return -1;
-    BKDReader bkd(segment.postingsReader(), *info);
-    if (bkd.pointCount() != (uint64_t)reader.numValues()) countMismatch();
-    auto guard = MemPool::threadLocalPoolGuard();
-    size_t size = bkd.maxPointsPerLeaf();
-    BKDReader::Scratch scratch{{}, guard.pool().make_span<uint32_t>(size),
-                               guard.pool().make_span<uint32_t>(size)};
-    Relation relation = query.makeRelation();
-    return (int64_t)bkd.countIntersect(relation, scratch).exactCount;
-  }
 };
 
 } // namespace solux

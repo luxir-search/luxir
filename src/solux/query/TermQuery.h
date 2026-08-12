@@ -162,15 +162,6 @@ public:
 
     // A term's exact match count is its docFreq - free from the term stats -
     // unless deletions could have removed some of its docs.
-    int64_t count(solux::IndexReader::Segment& segment) override {
-      if (segment.liveDocs() != nullptr) {
-        return -1;
-      }
-      if (cachedTermInfo == nullptr) {
-        return 0;
-      }
-      return cachedTermInfo->docFreq(segment.ord);
-    }
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
     // in this segment) so compound scorers can order leaders by cost. The
@@ -230,6 +221,7 @@ public:
           .reportedTwoPhase = Query::ReportedTwoPhase::NO,
           .windowFillClause = Query::ClauseShape::DIRECT,
           .termDisjunctionClause = Query::ClauseShape::DIRECT,
+          .termConjunctionClause = Query::ClauseShape::DIRECT,
           .independentTerm = Query::IndependentTermAccess::SUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::SUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -263,26 +255,33 @@ public:
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
+        if (bulkContext.requireConstantCount) {
+          if (segment.liveDocs() != nullptr) {
+            return {
+              BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+              BulkAnswer::NO,
+            };
+          }
+          return {
+            BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+            BulkAnswer::NO, nullptr, cost(),
+          };
+        }
         bool available = cost() != 0
             && !bulkContext.requireFilterConsumption;
-        return {
+        BulkPlan plan{
           available ? BulkAnswer::YES : BulkAnswer::NO,
           available ? BulkAnswer::YES : BulkAnswer::NO,
           BulkAnswer::NO,
           BulkAnswer::NO,
         };
+        plan.acceptsWindowFilter = available
+            ? BulkAnswer::YES : BulkAnswer::NO;
+        return plan;
       }
 
-      BulkScorer* bulkScorer(MemPool& targetPool) override;
-
-      FilteredBulkResult filteredBulkScorer(
-          MemPool& targetPool,
-          const BulkScorerContext& bulkContext) override {
-        if (bulkContext.requireFilterConsumption) {
-          return {};
-        }
-        return {bulkScorer(targetPool), false};
-      }
+      BulkScorer* buildBulk(
+          MemPool& targetPool, const BulkPlan& plan) override;
     };
 
     Query::ScorerSupplier* scorerSupplier(solux::MemPool& targetPool,
@@ -1394,8 +1393,10 @@ public:
 
 };
 
-inline BulkScorer* TermQuery::Weight::Supplier::bulkScorer(
-    MemPool& targetPool) {
+inline BulkScorer* TermQuery::Weight::Supplier::buildBulk(
+    MemPool& targetPool, const BulkPlan& plan) {
+  assert(plan.available == BulkAnswer::YES);
+  assert(!plan.hasConstantCount());
   auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight.createScorer(targetPool, segment));
   if (scorer == nullptr) {
     return nullptr;

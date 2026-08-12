@@ -7150,7 +7150,7 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
   }
   EXPECT_EQ(iterated, dfA);
 
-  // Scoring: optional kept -> no compound-count shortcut, same match set.
+  // Scoring: optional kept -> no scalar count arm, same match set.
   Query::Context qContext2(testIndex.pool, *testIndex.reader);
   BooleanQuery q2(mand, opt, {}, {});
   auto* scoredWeight = q2.createWeight(qContext2, Query::NEED_SCORES);
@@ -7495,7 +7495,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     auto* supplier = weight->scorerSupplier(pool, segment);
     EXPECT_NE(supplier, nullptr);
     auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(pool);
-    EXPECT_EQ(bulk == nullptr, pull);
+    EXPECT_EQ(bulk == nullptr, pull || disableShapes);
     TopDocsCollector collector(50);
     if (bulk != nullptr) {
       collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
@@ -7525,7 +7525,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
     Run disabled = run(*shape.query, false, false, true);
     EXPECT_EQ(attached.bulkType, shape.bulkType);
     EXPECT_EQ(attached.docs, pull.docs);
-    EXPECT_EQ(disabled.bulkType, shape.bulkType);
+    EXPECT_EQ(disabled.bulkType, std::type_index(typeid(void)));
     EXPECT_EQ(disabled.docs, pull.docs);
     if (shape.probeReachable) {
       Run fill = run(*shape.query, false, true, false);

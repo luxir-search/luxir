@@ -86,6 +86,30 @@ public:
       SegFieldInfo& fieldInfo;
       float constantScore;
 
+      class Plan final : public Query::ScorerPlan {
+        Supplier& supplier;
+
+      protected:
+        Query::Scorer* buildScorer(MemPool& targetPool) override {
+          if (supplier.fieldInfo.docsWithField
+              == supplier.segment.maxDoc()) {
+            return targetPool.make<AllQuery::Scorer>(
+                supplier.segment, supplier.constantScore);
+          }
+          return targetPool.make<ExistsQuery::Scorer>(
+              supplier.segment.postingsReader(), supplier.fieldInfo,
+              supplier.constantScore);
+        }
+
+      public:
+        Plan(Supplier& supplier,
+             const Query::PlanContext& planContext,
+             const Query::ScorerShape& shape, int64_t cost)
+          : Query::ScorerPlan(
+                supplier, planContext, shape, cost),
+            supplier(supplier) {}
+      };
+
     public:
       Supplier(IndexReader::Segment& segment, SegFieldInfo& fieldInfo,
                float constantScore)
@@ -94,13 +118,46 @@ public:
 
       int64_t cost() override { return fieldInfo.docsWithField; }
 
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        unused(leadCost);
-        if (fieldInfo.docsWithField == segment.maxDoc()) {
-          return targetPool.make<AllQuery::Scorer>(segment, constantScore);
+      Query::ScorerShape describeScorer(
+          const Query::PlanContext& buildContext) const override {
+        unused(buildContext);
+        return {
+          .matchState = Query::MatchState::NONEMPTY,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+          .windowFillClause = fieldInfo.docsWithField == segment.maxDoc()
+              ? Query::ClauseShape::DIRECT
+              : Query::ClauseShape::NONE,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .termConjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm =
+              Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
+      }
+
+      Query::ScorerPlan* resolve(
+          MemPool& planPool,
+          const Query::PlanContext& planContext) override {
+        return planPool.make<Plan>(
+            *this, planContext, describeScorer(planContext), cost());
+      }
+
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        unused(use);
+        if (bulkContext.requireConstantCount
+            && segment.liveDocs() == nullptr) {
+          return {
+            BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+            BulkAnswer::NO, nullptr, cost(),
+          };
         }
-        return targetPool.make<ExistsQuery::Scorer>(
-            segment.postingsReader(), fieldInfo, constantScore);
+        return {
+          BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+          BulkAnswer::NO,
+        };
       }
     };
 
@@ -118,11 +175,6 @@ public:
           : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
     }
 
-    int64_t count(IndexReader::Segment& segment) override {
-      if (segment.liveDocs() != nullptr) return -1;
-      SegFieldInfo* info = segmentInfo(segment);
-      return info == nullptr ? 0 : info->docsWithField;
-    }
   };
 };
 

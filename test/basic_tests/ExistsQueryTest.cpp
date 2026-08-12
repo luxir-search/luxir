@@ -354,7 +354,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
 }
 
 TEST_F(ExistsQueryTest,
-       FullFieldSupplierStaysConservativeWhileScorerFillsWindows) {
+       FullFieldSupplierDescribesTheResolvedAllDocsArm) {
   auto reader = helper.getIndexWriter()->getIndexReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
@@ -365,14 +365,15 @@ TEST_F(ExistsQueryTest,
   ASSERT_NE(nullptr, supplier);
 
   Query::ScorerShape shape = supplier->describeScorer({});
-  EXPECT_EQ(Query::MatchState::UNKNOWN, shape.matchState);
-  EXPECT_EQ(Query::DirectScorerKind::UNKNOWN, shape.directKind);
-  EXPECT_EQ(Query::ReportedTwoPhase::UNKNOWN, shape.reportedTwoPhase);
-  EXPECT_EQ(Query::ClauseShape::UNKNOWN, shape.windowFillClause);
-  EXPECT_EQ(Query::ClauseShape::UNKNOWN, shape.termDisjunctionClause);
-  EXPECT_EQ(Query::IndependentTermAccess::UNKNOWN, shape.independentTerm);
-  EXPECT_EQ(Query::DocsOnlyAccess::UNKNOWN, shape.docsOnly);
-  EXPECT_EQ(Query::DirectDocSetAccess::UNKNOWN, shape.directDocSet);
+  EXPECT_EQ(Query::MatchState::NONEMPTY, shape.matchState);
+  EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
+  EXPECT_EQ(Query::ReportedTwoPhase::NO, shape.reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::DIRECT, shape.windowFillClause);
+  EXPECT_EQ(Query::ClauseShape::NONE, shape.termDisjunctionClause);
+  EXPECT_EQ(Query::ClauseShape::NONE, shape.termConjunctionClause);
+  EXPECT_EQ(Query::IndependentTermAccess::UNSUPPORTED, shape.independentTerm);
+  EXPECT_EQ(Query::DocsOnlyAccess::UNSUPPORTED, shape.docsOnly);
+  EXPECT_EQ(Query::DirectDocSetAccess::UNSUPPORTED, shape.directDocSet);
 
   bool saved = AllQuery::disableDenseClauseForTests;
   AllQuery::disableDenseClauseForTests = false;

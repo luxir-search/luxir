@@ -375,6 +375,7 @@ public:
             .reportedTwoPhase = Query::ReportedTwoPhase::NO,
             .windowFillClause = Query::ClauseShape::NONE,
             .termDisjunctionClause = Query::ClauseShape::NONE,
+            .termConjunctionClause = Query::ClauseShape::NONE,
             .independentTerm =
                 Query::IndependentTermAccess::UNSUPPORTED,
             .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
@@ -927,6 +928,12 @@ public:
     }
 
     Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
+      unused(target, segment);
+      return nullptr;
+    }
+
+    Query::ScorerSupplier* scorerSupplier(
+        MemPool& target, IndexReader::Segment& segment) override {
       unused(target, segment);
       return nullptr;
     }

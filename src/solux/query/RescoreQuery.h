@@ -273,6 +273,46 @@ class RescoreQuery final : public Query {
     bool needsChildScore;
     bool pruning;
 
+    class Plan final : public Query::ScorerPlan {
+      Query::ScorerPlan* childPlan;
+      ValueProgram* program;
+      IndexReader::Segment* segment;
+      float multiplier;
+      bool needsChildScore;
+      bool pruning;
+
+    protected:
+      Query::Scorer* buildScorer(MemPool& targetPool) override {
+        Query::Scorer* childScorer = childPlan->build(targetPool);
+        if (childScorer == nullptr) return nullptr;
+        BoundValueProgram* expression =
+            program->bind(targetPool, *segment);
+        const ValueBounds& root =
+            expression->bounds(program->rootNode);
+        if (root.alwaysMissing) {
+          throw std::runtime_error(
+              "rescore expression is always missing for a matchable "
+              "segment; use def() in the expression or exists() in the "
+              "child query");
+        }
+        return targetPool.make<Scorer>(
+            childScorer, expression, multiplier, needsChildScore, pruning);
+      }
+
+    public:
+      Plan(Supplier& supplier,
+           const Query::PlanContext& planContext,
+           const Query::ScorerShape& shape, int64_t cost,
+           Query::ScorerPlan* childPlan, ValueProgram* program,
+           IndexReader::Segment* segment, float multiplier,
+           bool needsChildScore, bool pruning)
+        : Query::ScorerPlan(
+              supplier, planContext, shape, cost),
+          childPlan(childPlan), program(program), segment(segment),
+          multiplier(multiplier), needsChildScore(needsChildScore),
+          pruning(pruning) {}
+    };
+
   public:
     Supplier(Query::ScorerSupplier* childSupplier,
              ValueProgram* program, IndexReader::Segment* segment,
@@ -293,6 +333,7 @@ class RescoreQuery final : public Query {
         .reportedTwoPhase = child.reportedTwoPhase,
         .windowFillClause = Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
+        .termConjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -309,18 +350,27 @@ class RescoreQuery final : public Query {
       return childSupplier->fillExpansionMemo(buildContext);
     }
 
-    Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-      Query::Scorer* childScorer = childSupplier->get(targetPool, leadCost);
-      if (childScorer == nullptr) return nullptr;
-      BoundValueProgram* expression = program->bind(targetPool, *segment);
-      const ValueBounds& root = expression->bounds(program->rootNode);
-      if (root.alwaysMissing) {
-        throw std::runtime_error(
-            "rescore expression is always missing for a matchable segment; use "
-            "def() in the expression or exists() in the child query");
+    Query::ScorerPlan* resolve(
+        MemPool& planPool,
+        const Query::PlanContext& planContext) override {
+      Query::ScorerPlan* childPlan =
+          childSupplier->resolve(planPool, planContext);
+      assert(childPlan != nullptr);
+      return planPool.make<Plan>(
+          *this, planContext, describeScorer(planContext),
+          childPlan->cost(), childPlan, program, segment, multiplier,
+          needsChildScore, pruning);
+    }
+
+    BulkPlan planBulk(
+        BulkUse use, const BulkScorerContext& bulkContext) override {
+      if (!bulkContext.requireConstantCount) {
+        return {
+          BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+          BulkAnswer::NO,
+        };
       }
-      return targetPool.make<Scorer>(
-          childScorer, expression, multiplier, needsChildScore, pruning);
+      return childSupplier->planBulk(use, bulkContext);
     }
   };
 
@@ -446,9 +496,6 @@ public:
                           multiplier, needsChildScore, allowsPruning());
     }
 
-    int64_t count(IndexReader::Segment& segment) override {
-      return childWeight->count(segment);
-    }
 
     bool childNeedsScoresForTest() const { return childWeight->needsScores(); }
   };

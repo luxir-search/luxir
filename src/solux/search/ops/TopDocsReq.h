@@ -341,7 +341,7 @@ public:
             Query::ScorerSupplier::BulkUse::SCORED_WINDOWS,
             bulkContext);
         auto* rankingBulk =
-            plan.available == Query::ScorerSupplier::BulkAnswer::NO
+            plan.available != Query::ScorerSupplier::BulkAnswer::YES
             ? nullptr : rankingSupplier->buildBulk(pool, plan);
         if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
           rankingSupplier->recordBulkPlanCommitment(
@@ -597,16 +597,18 @@ public:
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
               : filter;
-          // Exact-count shortcut: a count-only collection (limit 0) over the
-          // raw query - no filters, no deletes (null filter per the domain
-          // contract), no sub-op domain to build - can often read the count
-          // straight from index stats (a term's docFreq) without iterating.
+          // Exact-count shortcut: ask the same planner for a scalar product
+          // instead of entering a separate Weight::count route.
           bool counted = false;
           if (!requiresPreparePhase && builderPtr == nullptr && filter == nullptr
               && !data->useFieldSort && data->scoreCollector->topCount == 0) {
-            int64_t exact = op.weight->count(seg);
-            if (exact >= 0) {
-              data->scoreCollector->hitCount += exact;
+            Query::ScorerSupplier::BulkScorerContext countContext;
+            countContext.requireConstantCount = true;
+            auto countPlan = supplier->planBulk(
+                Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+                countContext);
+            if (countPlan.hasConstantCount()) {
+              data->scoreCollector->hitCount += countPlan.constantCount;
               counted = true;
             }
           }
@@ -697,9 +699,9 @@ public:
                   Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
                   bulkContext);
               bool plannedNo =
-                  plan.available == Query::ScorerSupplier::BulkAnswer::NO
+                  plan.available != Query::ScorerSupplier::BulkAnswer::YES
                   || plan.supportsMatchWindows
-                      == Query::ScorerSupplier::BulkAnswer::NO;
+                      != Query::ScorerSupplier::BulkAnswer::YES;
               auto* bulk = plannedNo
                   ? nullptr : supplier->buildBulk(poolGuard.pool(), plan);
               if (plannedNo) {
@@ -707,7 +709,8 @@ public:
                     Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
                     bulkContext, plan);
               }
-              if (bulk != nullptr && bulk->supportsMatchWindows()) {
+              if (bulk != nullptr) {
+                assert(bulk->supportsMatchWindows());
                 data->fieldCollector->setSegment(
                     segnum, &seg.postingsReader(), &poolGuard.pool(),
                     sortSourceCost);
@@ -722,9 +725,6 @@ public:
                     *data->fieldCollector, seg.maxDoc(), allowSortPruning);
                 data->fieldCollector->recordSegmentSkipStats(segnum);
                 usedBulk = true;
-              } else if (bulk != nullptr) {
-                skipCount(SkipStats::bulkBuiltThenRejected);
-                skipCount(SkipStats::bulkBuiltThenRejectedSortMatchWindow);
               }
             }
             if (!usedBulk) {
@@ -767,9 +767,9 @@ public:
                     bulkContext);
                 bool plannedNo =
                     plan.available
-                        == Query::ScorerSupplier::BulkAnswer::NO
+                        != Query::ScorerSupplier::BulkAnswer::YES
                     || plan.supportsExactCandidateScoring
-                        == Query::ScorerSupplier::BulkAnswer::NO;
+                        != Query::ScorerSupplier::BulkAnswer::YES;
                 if (plannedNo) {
                   auto countPlan = countSupplier->planBulk(
                       Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
@@ -790,7 +790,7 @@ public:
                       Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
                       bulkContext);
                   bool countPlannedNo = countPlan.available
-                      == Query::ScorerSupplier::BulkAnswer::NO;
+                      != Query::ScorerSupplier::BulkAnswer::YES;
                   if (countPlannedNo) {
                     countSupplier->recordBulkPlanCommitment(
                         Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
@@ -806,8 +806,9 @@ public:
                             poolGuard.pool(), seg);
                     auto* exactScorer =
                         supplier->buildBulk(poolGuard.pool(), plan);
-                    if (exactScorer != nullptr
-                        && exactScorer->supportsExactCandidateScoring()) {
+                    if (exactScorer != nullptr) {
+                      assert(
+                          exactScorer->supportsExactCandidateScoring());
                       countThenCollectTopK(
                           poolGuard.pool(), segnum, countBulk,
                           rankingSupplier, collectorFilter, nullptr,
@@ -817,10 +818,6 @@ public:
                       composedExactCountTopK = true;
                     } else {
                       skipCount(SkipStats::exactCountTopKBulkFallbacks);
-                      skipCount(SkipStats::bulkBuiltThenRejected);
-                      skipCount(
-                          SkipStats::
-                              bulkBuiltThenRejectedExactComposition);
                     }
                   } else {
                     skipCount(SkipStats::exactCountTopKBulkFallbacks);
@@ -847,7 +844,7 @@ public:
                   : Query::ScorerSupplier::BulkUse::SCORED_WINDOWS;
               Query::ScorerSupplier::BulkScorerContext bulkContext;
               auto plan = supplier->planBulk(use, bulkContext);
-              if (plan.available == Query::ScorerSupplier::BulkAnswer::NO) {
+              if (plan.available != Query::ScorerSupplier::BulkAnswer::YES) {
                 supplier->recordBulkPlanCommitment(
                     use, bulkContext, plan);
                 return nullptr;

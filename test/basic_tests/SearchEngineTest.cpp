@@ -3596,8 +3596,8 @@ TEST_F(SearchEngineTest, filteredPhraseCountRetiresPhraseIsland) {
   Run planned = run(false);
   EXPECT_EQ(oracle.found, planned.found);
   EXPECT_EQ(1, planned.found);
-  EXPECT_GT(oracle.island, 0);
-  EXPECT_EQ(oracle.island, oracle.phraseIsland);
+  EXPECT_EQ(0, oracle.island);
+  EXPECT_EQ(0, oracle.phraseIsland);
   EXPECT_EQ(0, planned.island);
   EXPECT_EQ(0, planned.phraseIsland);
   EXPECT_EQ(0, planned.multiTermIsland);
@@ -3680,8 +3680,8 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
   Run planned = run(false);
   EXPECT_EQ(oracle.found, planned.found);
   EXPECT_EQ(N / 2, planned.found);
-  EXPECT_GT(oracle.island, 0);
-  EXPECT_EQ(oracle.island, oracle.numericGeoIsland);
+  EXPECT_EQ(0, oracle.island);
+  EXPECT_EQ(0, oracle.numericGeoIsland);
   EXPECT_EQ(0, planned.island);
   EXPECT_EQ(0, planned.numericGeoIsland);
   EXPECT_GT(planned.denseWindows, 0);
@@ -3774,7 +3774,7 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(0, countShapesDisabled.pointsArms
                    + countShapesDisabled.complementArms);
   EXPECT_GT(countShapesDisabled.sparseVerifyArms, 0);
-  EXPECT_GT(countShapesDisabled.island, 0);
+  EXPECT_EQ(0, countShapesDisabled.island);
 
   Run sorted = run(true, false);
   Run sortedShapesDisabled = run(true, true);
@@ -3932,9 +3932,9 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(planned.found, shapesDisabled.found);
   EXPECT_GT(planned.pointsArms + planned.complementArms, 0);
   EXPECT_EQ(0, planned.sparseVerifyArms);
-  EXPECT_EQ(0, shapesDisabled.pointsArms
-                   + shapesDisabled.complementArms);
-  EXPECT_GT(shapesDisabled.sparseVerifyArms, 0);
+  EXPECT_GT(shapesDisabled.pointsArms
+                + shapesDisabled.complementArms, 0);
+  EXPECT_EQ(0, shapesDisabled.sparseVerifyArms);
 }
 
 TEST_F(SearchEngineTest,
@@ -3999,7 +3999,7 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(planned.found, shapesDisabled.found);
   EXPECT_GT(planned.pointsArms + planned.complementArms, 0);
   EXPECT_EQ(0, planned.sparseVerifyArms);
-  EXPECT_EQ(0, shapesDisabled.pointsArms
-                   + shapesDisabled.complementArms);
-  EXPECT_GT(shapesDisabled.sparseVerifyArms, 0);
+  EXPECT_GT(shapesDisabled.pointsArms
+                + shapesDisabled.complementArms, 0);
+  EXPECT_EQ(0, shapesDisabled.sparseVerifyArms);
 }

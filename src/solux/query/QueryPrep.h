@@ -259,6 +259,7 @@ public:
       .reportedTwoPhase = Query::ReportedTwoPhase::NO,
       .windowFillClause = Query::ClauseShape::DIRECT,
       .termDisjunctionClause = Query::ClauseShape::NONE,
+      .termConjunctionClause = Query::ClauseShape::NONE,
       .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
       .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
       .directDocSet = Query::DirectDocSetAccess::SUPPORTED,
@@ -276,19 +277,32 @@ public:
         *this, planContext, describeScorer(planContext), cost());
   }
 
-  BulkScorer* bulkScorer(MemPool& targetPool) override {
+  BulkPlan planBulk(
+      BulkUse use, const BulkScorerContext& bulkContext) override {
+    unused(use);
+    if (bulkContext.requireConstantCount) {
+      return {
+        BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+        BulkAnswer::NO, nullptr, cost(),
+      };
+    }
+    bool available = cost() != 0
+        && !bulkContext.requireFilterConsumption;
+    return {
+      available ? BulkAnswer::YES : BulkAnswer::NO,
+      available ? BulkAnswer::YES : BulkAnswer::NO,
+      BulkAnswer::NO,
+      BulkAnswer::NO,
+    };
+  }
+
+  BulkScorer* buildBulk(
+      MemPool& targetPool, const BulkPlan& plan) override {
+    assert(plan.available == BulkAnswer::YES);
+    assert(!plan.hasConstantCount());
     if (docs == nullptr || docs->card() == 0) return nullptr;
     return targetPool.make<DocSetBulkScorer>(
         targetPool, docs, segment.maxDoc());
-  }
-
-  FilteredBulkResult filteredBulkScorer(
-      MemPool& targetPool,
-      const BulkScorerContext& bulkContext) override {
-    if (bulkContext.requireFilterConsumption) {
-      return {};
-    }
-    return {bulkScorer(targetPool), false};
   }
 };
 

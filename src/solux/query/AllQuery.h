@@ -139,6 +139,7 @@ public:
             ? Query::ClauseShape::DIRECT
             : Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
+        .termConjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
@@ -159,9 +160,36 @@ public:
       return resolve(targetPool, planContext)->buildIndependent(targetPool);
     }
 
+    BulkPlan planBulk(
+        BulkUse use, const BulkScorerContext& bulkContext) override {
+      unused(use);
+      if (bulkContext.requireConstantCount) {
+        if (segment.liveDocs() != nullptr) {
+          return {
+            BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
+            BulkAnswer::NO,
+          };
+        }
+        return {
+          BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+          BulkAnswer::NO, nullptr, segment.maxDoc(),
+        };
+      }
+      bool available = !bulkContext.requireFilterConsumption;
+      return {
+        available ? BulkAnswer::YES : BulkAnswer::NO,
+        available ? BulkAnswer::YES : BulkAnswer::NO,
+        BulkAnswer::NO,
+        BulkAnswer::NO,
+      };
+    }
+
     // The null-source form of DocSetBulkScorer: all docs in [0, maxDoc), so
     // the per-call filter becomes the window source directly.
-    BulkScorer* bulkScorer(MemPool& targetPool) override {
+    BulkScorer* buildBulk(
+        MemPool& targetPool, const BulkPlan& plan) override {
+      assert(plan.available == BulkAnswer::YES);
+      assert(!plan.hasConstantCount());
       return targetPool.make<DocSetBulkScorer>(
           targetPool, nullptr, segment.maxDoc(), score);
     }
