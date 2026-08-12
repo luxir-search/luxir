@@ -842,7 +842,9 @@ public:
         Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
       Query::PlanContext buildContext =
           MultiTermQuery::Weight::scorerBuildContext(
-              leadCost, PhraseQuery::ScorerControls::disableSortForTests);
+              leadCost, PhraseQuery::ScorerControls::disableSortForTests,
+              PhraseQuery::ScorerControls::disableRepeatDedupForTests,
+              PhraseQuery::disableShapesForTests);
       buildContext.demand.horizon = horizon;
       buildContext.numericRangeDisableShapesForTests =
           NumericRangeQuery::disableShapesForTests;

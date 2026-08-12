@@ -114,6 +114,12 @@ public:
   }
 
   class Supplier final : public Query::ScorerSupplier {
+    enum class ScorerArm : uint8_t {
+      SPARSE_VERIFY,
+      BKD,
+      SCAN,
+    };
+
     GeoQueryWeight& weight;
     IndexReader::Segment& segment;
     IntColReader& reader;
@@ -174,6 +180,69 @@ public:
       return {docs.first(size), nullptr};
     }
 
+    ScorerArm selectScorerArm(int64_t candidateCost) const {
+      if (candidateCost < estimatedCost) {
+        return ScorerArm::SPARSE_VERIFY;
+      }
+      return bkd != nullptr ? ScorerArm::BKD : ScorerArm::SCAN;
+    }
+
+    static Query::ScorerShape shapeFor(ScorerArm arm) {
+      bool bkdArm = arm == ScorerArm::BKD;
+      return {
+        .matchState = Query::MatchState::NONEMPTY,
+        .directKind = Query::DirectScorerKind::OTHER,
+        .reportedTwoPhase = bkdArm
+            ? Query::ReportedTwoPhase::NO
+            : Query::ReportedTwoPhase::YES,
+        .windowFillClause = bkdArm
+            ? Query::ClauseShape::DIRECT
+            : Query::ClauseShape::NONE,
+        .termDisjunctionClause = Query::ClauseShape::NONE,
+        .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+        .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+      };
+    }
+
+    Query::Scorer* buildScorer(
+        MemPool& targetPool, ScorerArm arm) const {
+      switch (arm) {
+        case ScorerArm::SPARSE_VERIFY:
+          skipCount(SkipStats::geoSparseVerifyArms);
+          return targetPool.make<
+              GeoQueryScorer<Relation, IntColReader::SparseIterator>>(
+                  reader, relation, weight.constantScore);
+        case ScorerArm::BKD:
+          skipCount(SkipStats::geoBKDArms);
+          return PointsMaterialize::scorerFor(
+              targetPool, materialize(targetPool), segment.maxDoc(),
+              weight.constantScore);
+        case ScorerArm::SCAN:
+          skipCount(SkipStats::geoScanArms);
+          return targetPool.make<
+              GeoQueryScorer<Relation, IntColReader::Iterator>>(
+                  reader, relation, weight.constantScore);
+      }
+      std::unreachable();
+    }
+
+    class Plan final : public Query::ScorerPlan {
+      Supplier& supplier;
+      ScorerArm arm;
+
+    protected:
+      Query::Scorer* buildScorer(MemPool& targetPool) override {
+        return supplier.buildScorer(targetPool, arm);
+      }
+
+    public:
+      Plan(Supplier& supplier, const Query::PlanContext& planContext,
+           const Query::ScorerShape& shape, int64_t cost, ScorerArm arm)
+        : Query::ScorerPlan(supplier, planContext, shape, cost),
+          supplier(supplier), arm(arm) {}
+    };
+
   public:
     Supplier(GeoQueryWeight& weight, IndexReader::Segment& segment,
              IntColReader& reader, BKDReader* bkd,
@@ -186,37 +255,29 @@ public:
 
     int64_t cost() override { return estimatedCost; }
 
-    // Deliberately all-UNKNOWN: the produced scorer arm (sparse verify vs
-    // materialized points) depends on leadCost and BKD availability, and a
-    // falsely definite answer would poison route planning.
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      unused(buildContext);
-      return {};
+      return shapeFor(selectScorerArm(buildContext.demand.candidates));
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
         const Query::PlanContext& buildContext) const override {
       unused(buildContext);
-      return Query::UnresolvedSupplierCause::NUMERIC_GEO;
+      return Query::UnresolvedSupplierCause::NONE;
+    }
+
+    Query::ScorerPlan* resolve(
+        MemPool& planPool,
+        const Query::PlanContext& planContext) override {
+      ScorerArm arm = selectScorerArm(planContext.demand.candidates);
+      return planPool.make<Plan>(
+          *this, planContext, shapeFor(arm), cost(), arm);
     }
 
     Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-      if (leadCost < cost()) {
-        skipCount(SkipStats::geoSparseVerifyArms);
-        return targetPool.make<
-            GeoQueryScorer<Relation, IntColReader::SparseIterator>>(
-                reader, relation, weight.constantScore);
-      }
-      if (bkd != nullptr) {
-        skipCount(SkipStats::geoBKDArms);
-        return PointsMaterialize::scorerFor(
-            targetPool, materialize(targetPool), segment.maxDoc(),
-            weight.constantScore);
-      }
-      skipCount(SkipStats::geoScanArms);
-      return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
-          reader, relation, weight.constantScore);
+      Query::PlanContext planContext =
+          Query::PlanContext::fromLeadCost(leadCost);
+      return resolve(targetPool, planContext)->build(targetPool);
     }
 
     BulkScorer* bulkScorer(MemPool& targetPool) override {

@@ -436,7 +436,10 @@ public:
     MultiTermScorerMode multiTermScorerModeForTests =
         MultiTermScorerMode::AUTO;
     size_t multiTermMaxLazyStateBytes = 32u << 20;
+    bool multiTermDisableDenseFillForTests = false;
     bool phraseDisableSortForTests = false;
+    bool phraseDisableRepeatDedupForTests = false;
+    bool phraseDisableShapesForTests = false;
     bool numericRangeDisableShapesForTests = false;
     bool disableBooleanTwoPhaseForTests = false;
     bool disableDisjunctionTwoPhaseForTests = false;

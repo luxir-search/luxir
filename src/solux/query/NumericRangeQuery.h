@@ -657,6 +657,7 @@ public:
       std::pair<uint64_t, uint64_t> exactPositions(MemPool& pool) {
         assert(points != nullptr);
         if (!exactReady) {
+          auto scratchGuard = pool.rewindScopeGuard();
           auto residuals = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
           auto raw = pool.make_span<int64_t>(points->maxPointsPerLeaf());
           std::tie(loPos, hiPos) = Weight::exactPointPositions(
@@ -782,6 +783,79 @@ public:
         return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
       }
 
+      static Query::ScorerShape shapeFor(
+          ScorerArm arm, const Query::PlanContext& planContext) {
+        if (planContext.numericRangeDisableShapesForTests) return {};
+        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
+            || arm == ScorerArm::SCAN;
+        return {
+          .matchState = Query::MatchState::NONEMPTY,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = twoPhase
+              ? Query::ReportedTwoPhase::YES
+              : Query::ReportedTwoPhase::NO,
+          .windowFillClause = Query::ClauseShape::DIRECT,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
+      }
+
+      Query::Scorer* buildScorer(
+          MemPool& targetPool, ScorerArm arm, uint64_t begin,
+          uint64_t end, bool complement) {
+        switch (arm) {
+          case ScorerArm::SPARSE_VERIFY:
+            skipCount(SkipStats::numericRangeSparseVerifyArms);
+            return targetPool.make<
+                RangeScorer<IntColReader::SparseIterator>>(
+                    reader, weight.query.getLo(), weight.query.getHi(),
+                    allMatch, weight.constantScore);
+          case ScorerArm::POINTS:
+            if (complement) {
+              skipCount(SkipStats::numericRangeComplementArms);
+              return scorerFor(targetPool,
+                  materializeComplement(targetPool, begin, end));
+            }
+            skipCount(SkipStats::numericRangePointsArms);
+            return scorerFor(targetPool,
+                materializePoints(targetPool, begin, end));
+          case ScorerArm::ZONE_MAP:
+            skipCount(SkipStats::numericRangeZoneArms);
+            return targetPool.make<ZoneMapScorer>(
+                targetPool, reader, plans, weight.query.getLo(),
+                weight.query.getHi(), segment.maxDoc(), weight.constantScore);
+          case ScorerArm::SCAN:
+            return targetPool.make<RangeScorer<IntColReader::Iterator>>(
+                reader, weight.query.getLo(), weight.query.getHi(), allMatch,
+                weight.constantScore);
+        }
+        std::unreachable();
+      }
+
+      class Plan final : public Query::ScorerPlan {
+        Supplier& supplier;
+        ScorerArm arm;
+        uint64_t loPos;
+        uint64_t hiPos;
+        bool complement;
+
+      protected:
+        Query::Scorer* buildScorer(MemPool& targetPool) override {
+          return supplier.buildScorer(
+              targetPool, arm, loPos, hiPos, complement);
+        }
+
+      public:
+        Plan(Supplier& supplier, const Query::PlanContext& planContext,
+             const Query::ScorerShape& shape, int64_t cost, ScorerArm arm,
+             uint64_t loPos, uint64_t hiPos, bool complement)
+          : Query::ScorerPlan(supplier, planContext, shape, cost),
+            supplier(supplier), arm(arm), loPos(loPos), hiPos(hiPos),
+            complement(complement) {}
+      };
+
     public:
       Supplier(NumericRangeQuery::Weight& weight, IndexReader::Segment& segment,
                IntColReader& reader, std::span<const BlockPlan> plans,
@@ -806,22 +880,8 @@ public:
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
-        if (buildContext.numericRangeDisableShapesForTests) return {};
         ScorerArm arm = selectScorerArm(buildContext.demand.candidates);
-        bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
-            || arm == ScorerArm::SCAN;
-        return {
-          .matchState = Query::MatchState::NONEMPTY,
-          .directKind = Query::DirectScorerKind::OTHER,
-          .reportedTwoPhase = twoPhase
-              ? Query::ReportedTwoPhase::YES
-              : Query::ReportedTwoPhase::NO,
-          .windowFillClause = Query::ClauseShape::DIRECT,
-          .termDisjunctionClause = Query::ClauseShape::NONE,
-          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
-          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
-          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
-        };
+        return shapeFor(arm, buildContext);
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -845,37 +905,28 @@ public:
             materializeComplement(targetPool, begin, end));
       }
 
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        switch (selectScorerArm(leadCost)) {
-          case ScorerArm::SPARSE_VERIFY:
-            skipCount(SkipStats::numericRangeSparseVerifyArms);
-            return targetPool.make<
-                RangeScorer<IntColReader::SparseIterator>>(
-                    reader, weight.query.getLo(), weight.query.getHi(),
-                    allMatch, weight.constantScore);
-          case ScorerArm::POINTS: {
-            auto [begin, end] = exactPositions(targetPool);
-            uint64_t exactCount = end - begin;
-            if (useComplement(exactCount)) {
-              skipCount(SkipStats::numericRangeComplementArms);
-              return scorerFor(targetPool,
-                  materializeComplement(targetPool, begin, end));
-            }
-            skipCount(SkipStats::numericRangePointsArms);
-            return scorerFor(targetPool,
-                materializePoints(targetPool, begin, end));
-          }
-          case ScorerArm::ZONE_MAP:
-            skipCount(SkipStats::numericRangeZoneArms);
-            return targetPool.make<ZoneMapScorer>(
-                targetPool, reader, plans, weight.query.getLo(),
-                weight.query.getHi(), segment.maxDoc(), weight.constantScore);
-          case ScorerArm::SCAN:
-            return targetPool.make<RangeScorer<IntColReader::Iterator>>(
-                reader, weight.query.getLo(), weight.query.getHi(), allMatch,
-                weight.constantScore);
+      Query::ScorerPlan* resolve(
+          MemPool& planPool,
+          const Query::PlanContext& planContext) override {
+        ScorerArm arm = selectScorerArm(planContext.demand.candidates);
+        uint64_t begin = 0;
+        uint64_t end = 0;
+        bool complement = false;
+        if (arm == ScorerArm::POINTS) {
+          std::tie(begin, end) = exactPositions(planPool);
+          complement = useComplement(end - begin);
         }
-        std::unreachable();
+        return planPool.make<Plan>(
+            *this, planContext, shapeFor(arm, planContext), cost(), arm,
+            begin, end, complement);
+      }
+
+      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+        Query::PlanContext planContext =
+            Query::PlanContext::fromLeadCost(leadCost);
+        planContext.numericRangeDisableShapesForTests =
+            NumericRangeQuery::disableShapesForTests;
+        return resolve(targetPool, planContext)->build(targetPool);
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {

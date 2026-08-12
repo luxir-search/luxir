@@ -662,7 +662,8 @@ TEST_F(MultiTermScorerModesTest, eagerWindowFillCopiesUnalignedMaskedRange) {
   }
 
   DenseFillGuard disabledGuard(true);
-  EXPECT_FALSE(scorer.supportsWindowFilter());
+  MultiTermQuery::Scorer disabledScorer(bits, maxDoc, 1.0f);
+  EXPECT_FALSE(disabledScorer.supportsWindowFilter());
 }
 
 // firstDocLowerBound is a lower bound for every term and exact below the

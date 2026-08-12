@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -50,13 +51,31 @@ public:
   using SloppyScorer = PhraseScorer<SloppyMatcher>;
 
 private:
-  struct Estimate {
+  struct EstimateCalculation {
     bool nonempty = false;
     std::vector<int32_t> querySlotSources;
     std::vector<int32_t> conjunctionOrder;
     std::vector<int32_t> slotOrder;
     std::vector<int32_t> slotGroup;
     std::vector<std::vector<int32_t>> groupSlots;
+    int64_t approximationCost = 0;
+    float matchCost = 0.0f;
+  };
+
+  struct EstimateGroup {
+    std::span<const int32_t> slots;
+  };
+
+  // Demand-independent estimator facts. The memo is segment-pool-owned and
+  // intentionally contains only POD spans; the demand-specific window-fill
+  // arm belongs to the affine ScorerPlan.
+  struct EstimateMemo {
+    bool nonempty = false;
+    std::span<const int32_t> querySlotSources;
+    std::span<const int32_t> conjunctionOrder;
+    std::span<const int32_t> slotOrder;
+    std::span<const int32_t> slotGroup;
+    std::span<const EstimateGroup> groupSlots;
     int64_t approximationCost = 0;
     float matchCost = 0.0f;
   };
@@ -68,14 +87,14 @@ private:
     return (int32_t) state.totalTermFreq;
   }
 
-  static Estimate estimate(
+  static EstimateCalculation estimate(
       std::span<const TermsEnum::PostingsState* const> states,
       std::span<const std::string_view> queryTerms,
       std::span<const int32_t> queryPositions, int32_t slop,
       bool disableSort, bool disableRepeatDedup) {
     assert(states.size() == queryTerms.size());
     assert(states.size() == queryPositions.size());
-    Estimate result;
+    EstimateCalculation result;
     for (const auto* state : states) {
       if (state == nullptr) return result;
     }
@@ -188,6 +207,29 @@ private:
     return result;
   }
 
+  static EstimateMemo* memoizeEstimate(
+      MemPool& pool, EstimateCalculation& estimate) {
+    auto* memo = pool.make<EstimateMemo>();
+    memo->nonempty = estimate.nonempty;
+    memo->querySlotSources = pool.copy_span(
+        std::span<int32_t>(estimate.querySlotSources));
+    memo->conjunctionOrder = pool.copy_span(
+        std::span<int32_t>(estimate.conjunctionOrder));
+    memo->slotOrder = pool.copy_span(
+        std::span<int32_t>(estimate.slotOrder));
+    memo->slotGroup = pool.copy_span(
+        std::span<int32_t>(estimate.slotGroup));
+    auto groups = pool.make_span<EstimateGroup>(estimate.groupSlots.size());
+    for (size_t i = 0; i < groups.size(); i++) {
+      groups[i].slots = pool.copy_span(
+          std::span<int32_t>(estimate.groupSlots[i]));
+    }
+    memo->groupSlots = groups;
+    memo->approximationCost = estimate.approximationCost;
+    memo->matchCost = estimate.matchCost;
+    return memo;
+  }
+
   // Position-verification price for a windowed exclusion fill, relative to
   // the positive side's cost. A windowed fill verifies positions for every
   // approximation hit in the window; the pull path verifies only the docs
@@ -245,9 +287,9 @@ public:
     std::span<CachedTermInfo*> cachedTermInfos;
     Similarity::BM25Scorer* simScorer = nullptr;
 
-    Estimate estimateScorer(IndexReader::Segment& segment,
-                            bool disableSort,
-                            bool disableRepeatDedup) const {
+    EstimateCalculation estimateScorer(
+        IndexReader::Segment& segment, bool disableSort,
+        bool disableRepeatDedup) const {
       if (cachedFieldInfo == nullptr
           || cachedFieldInfo->segInfos[segment.ord] == nullptr) {
         return {};
@@ -264,7 +306,7 @@ public:
 
 #ifndef NDEBUG
     void assertConstructionMatchesEstimate(
-        IndexReader::Segment& segment, const Estimate& estimate,
+        IndexReader::Segment& segment, const EstimateMemo& estimate,
         std::span<DocsPosEnum*> querySlotEnums,
         std::span<DocsPosEnum*> slotEnums,
         std::span<const int32_t> positions,
@@ -303,7 +345,7 @@ public:
                         estimate.slotGroup.end()));
       assert(groups.size() == estimate.groupSlots.size());
       for (size_t i = 0; i < groups.size(); i++) {
-        const auto& expected = estimate.groupSlots[i];
+        std::span<const int32_t> expected = estimate.groupSlots[i].slots;
         assert(groups[i].docsEnum == slotEnums[(size_t) expected[0]]);
         assert(groups[i].slots.size() == expected.size());
         assert(std::equal(groups[i].slots.begin(), groups[i].slots.end(),
@@ -337,10 +379,9 @@ public:
       }
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-      Estimate estimate = estimateScorer(
-          segment, ScorerControls::disableSortForTests,
-          ScorerControls::disableRepeatDedupForTests);
+    Query::Scorer* buildScorer(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        const EstimateMemo& estimate) {
       if (!estimate.nonempty) return nullptr;
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
       assert(segFieldInfo != nullptr);
@@ -390,16 +431,15 @@ public:
         ordinals[k] = ord;
       }
 
-      auto slotGroup = targetPool.copy_span(
-          std::span<int32_t>(estimate.slotGroup));
+      std::span<const int32_t> slotGroup = estimate.slotGroup;
       auto groups = targetPool.make_span<RepeatGroup>(
           estimate.groupSlots.size());
       for (size_t g = 0; g < estimate.groupSlots.size(); g++) {
-        auto& groupSlots = estimate.groupSlots[g];
+        std::span<const int32_t> groupSlots =
+            estimate.groupSlots[g].slots;
         groups[g].docsEnum = slotEnums[(size_t) groupSlots[0]];
         groups[g].posEnum = slotPosEnums[(size_t) groupSlots[0]];
-        groups[g].slots = targetPool.copy_span(
-            std::span<int32_t>(groupSlots));
+        groups[g].slots = groupSlots;
       }
 
 #ifndef NDEBUG
@@ -449,8 +489,96 @@ public:
     }
 
     class Supplier final : public Query::ScorerSupplier {
+      enum class ScorerArm : uint8_t {
+        EMPTY,
+        PULL,
+        WINDOW_FILL,
+      };
+
       PhraseQuery::Weight& weight;
       IndexReader::Segment& segment;
+      std::array<EstimateMemo*, 4> estimateMemos{};
+
+      template<class EstimateType>
+      ScorerArm selectArm(
+          const EstimateType& estimate,
+          const Query::PlanContext& planContext) const {
+        if (!estimate.nonempty) return ScorerArm::EMPTY;
+        if ((weight.inputFlags & EXCLUSION_WINDOW_FILL) != 0
+            && estimateSupportsWindowFill(
+                estimate.approximationCost, estimate.matchCost,
+                planContext.demand.candidates)) {
+          return ScorerArm::WINDOW_FILL;
+        }
+        return ScorerArm::PULL;
+      }
+
+      static Query::ScorerShape shapeFor(
+          ScorerArm arm, const Query::PlanContext& planContext) {
+        if (planContext.phraseDisableShapesForTests) return {};
+        return {
+          .matchState = arm == ScorerArm::EMPTY
+              ? Query::MatchState::EMPTY
+              : Query::MatchState::NONEMPTY,
+          .directKind = Query::DirectScorerKind::OTHER,
+          .reportedTwoPhase = Query::ReportedTwoPhase::YES,
+          .windowFillClause = arm == ScorerArm::WINDOW_FILL
+              ? Query::ClauseShape::DIRECT
+              : Query::ClauseShape::NONE,
+          .termDisjunctionClause = Query::ClauseShape::NONE,
+          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
+          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        };
+      }
+
+      const EstimateMemo& estimateMemo(
+          MemPool& planPool, const Query::PlanContext& planContext) {
+        size_t key = (planContext.phraseDisableSortForTests ? 2u : 0u)
+            | (planContext.phraseDisableRepeatDedupForTests ? 1u : 0u);
+        EstimateMemo*& memo = estimateMemos[key];
+        if (memo == nullptr) {
+          EstimateCalculation estimate = weight.estimateScorer(
+              segment, planContext.phraseDisableSortForTests,
+              planContext.phraseDisableRepeatDedupForTests);
+          memo = memoizeEstimate(planPool, estimate);
+        }
+        return *memo;
+      }
+
+      class Plan final : public Query::ScorerPlan {
+        Supplier& supplier;
+        const EstimateMemo& estimate;
+        ScorerArm arm;
+
+      protected:
+        Query::Scorer* buildScorer(MemPool& targetPool) override {
+          if (arm == ScorerArm::EMPTY) return nullptr;
+          Query::Scorer* scorer = supplier.weight.buildScorer(
+              targetPool, supplier.segment, estimate);
+          assert(scorer != nullptr);
+          if (supplier.weight.query.getSlop() > 0) {
+            static_cast<PhraseQuery::SloppyScorer*>(scorer)
+                ->setWindowFillPositiveCost(context().demand.candidates);
+          } else {
+            static_cast<PhraseQuery::Scorer*>(scorer)
+                ->setWindowFillPositiveCost(context().demand.candidates);
+          }
+#ifndef NDEBUG
+          assert(scorer->supportsWindowFilter()
+                 == (arm == ScorerArm::WINDOW_FILL));
+#endif
+          return scorer;
+        }
+
+      public:
+        Plan(Supplier& supplier, const Query::PlanContext& planContext,
+             const Query::ScorerShape& shape, int64_t cost,
+             const EstimateMemo& estimate, ScorerArm arm)
+          : Query::ScorerPlan(
+                supplier, planContext, shape, cost),
+            supplier(supplier), estimate(estimate), arm(arm) {}
+      };
 
     public:
       Supplier(PhraseQuery::Weight& weight, IndexReader::Segment& segment)
@@ -469,54 +597,58 @@ public:
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
-        if (PhraseQuery::disableShapesForTests) return {};
-        Estimate estimate = weight.estimateScorer(
-            segment, buildContext.phraseDisableSortForTests, false);
-        Query::ClauseShape windowFill = Query::ClauseShape::NONE;
-        if (estimate.nonempty
-            && (weight.inputFlags & EXCLUSION_WINDOW_FILL) != 0
-            && estimateSupportsWindowFill(
-                estimate.approximationCost, estimate.matchCost,
-                buildContext.demand.candidates)) {
-          windowFill = Query::ClauseShape::DIRECT;
-        }
-        return {
-          .matchState = estimate.nonempty
-              ? Query::MatchState::NONEMPTY
-              : Query::MatchState::EMPTY,
-          .directKind = Query::DirectScorerKind::OTHER,
-          .reportedTwoPhase = Query::ReportedTwoPhase::YES,
-          .windowFillClause = windowFill,
-          .termDisjunctionClause = Query::ClauseShape::NONE,
-          .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
-          .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
-          .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
-        };
+        EstimateCalculation estimate = weight.estimateScorer(
+            segment, buildContext.phraseDisableSortForTests,
+            buildContext.phraseDisableRepeatDedupForTests);
+        return shapeFor(selectArm(estimate, buildContext), buildContext);
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
           const Query::PlanContext& buildContext) const override {
-        unused(buildContext);
-        return Query::UnresolvedSupplierCause::PHRASE;
+        return buildContext.phraseDisableShapesForTests
+            ? Query::UnresolvedSupplierCause::PHRASE
+            : Query::UnresolvedSupplierCause::NONE;
+      }
+
+      Query::ScorerPlan* resolve(
+          MemPool& planPool,
+          const Query::PlanContext& planContext) override {
+        const EstimateMemo& estimate = estimateMemo(planPool, planContext);
+        ScorerArm arm = selectArm(estimate, planContext);
+        return planPool.make<Plan>(
+            *this, planContext, shapeFor(arm, planContext), cost(),
+            estimate, arm);
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        Query::Scorer* scorer = weight.createScorer(targetPool, segment);
-        if (scorer == nullptr) return nullptr;
-        if (weight.query.getSlop() > 0) {
-          static_cast<PhraseQuery::SloppyScorer*>(scorer)
-              ->setWindowFillPositiveCost(leadCost);
-        } else {
-          static_cast<PhraseQuery::Scorer*>(scorer)
-              ->setWindowFillPositiveCost(leadCost);
-        }
-        return scorer;
+        Query::PlanContext planContext = scorerBuildContext(leadCost);
+        return resolve(targetPool, planContext)->build(targetPool);
       }
     };
 
     Query::ScorerSupplier* scorerSupplier(MemPool& targetPool,
                                            IndexReader::Segment& segment) override {
       return targetPool.make<Supplier>(*this, segment);
+    }
+
+    Query::Scorer* createScorer(
+        MemPool& targetPool, IndexReader::Segment& segment) override {
+      auto* supplier = scorerSupplier(targetPool, segment);
+      Query::PlanContext planContext = scorerBuildContext(
+          std::numeric_limits<int64_t>::max());
+      return supplier->resolve(targetPool, planContext)->build(targetPool);
+    }
+
+    static Query::PlanContext scorerBuildContext(int64_t leadCost) {
+      Query::PlanContext planContext =
+          Query::PlanContext::fromLeadCost(leadCost);
+      planContext.phraseDisableSortForTests =
+          ScorerControls::disableSortForTests;
+      planContext.phraseDisableRepeatDedupForTests =
+          ScorerControls::disableRepeatDedupForTests;
+      planContext.phraseDisableShapesForTests =
+          PhraseQuery::disableShapesForTests;
+      return planContext;
     }
   };
 
