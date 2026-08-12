@@ -4,7 +4,9 @@
 
 namespace solux {
 
-const SoluxConfig& SearchEngine::config() const { return node.getConfig(); }
+const SearchConfig& SearchEngine::searchConfig() const {
+  return node.getConfig().search;
+}
 
 void SearchEngine::submitBody(SearchRequest& req) {
   try {

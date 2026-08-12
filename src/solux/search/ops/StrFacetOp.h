@@ -94,6 +94,9 @@ inline void collectSparseCounts(
 //
 
 class StrFacetOp : public FieldFacetReq {
+  std::shared_ptr<OrdMap> ordMap;
+  std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
+
 public:
   class MergeableStrData : public solux::MergeableData {
   public:
@@ -296,9 +299,6 @@ public:
     }
   };
 
-private:
-  std::shared_ptr<OrdMap> ordMap;
-
   class MergeableStrFacetInline : public MergeableData {
   public:
     // Keyed by GLOBAL term ordinal, which is what makes this mergeable across
@@ -341,11 +341,72 @@ public:
     enableExecutionProfile();
   }
 
-  // Distinct values across the index, which bounds the buckets a request can
-  // return.  A null OrdMap means the field has no values in any segment, so
-  // there are no buckets at all.
-  int64_t maxBuckets() const override {
-    return ordMap ? ordMap->numOrds() : 0;
+  bool canEmitAsBucketChild() const override {
+    return true;
+  }
+
+  void init() override {
+    FacetReq::init();
+    if (!sorts.empty()) {
+      if (sorts.size() > 1) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': multiple sort fields are not yet supported");
+      }
+      for (auto& sort : sorts) {
+        auto iter = subOps.find(sort.expr);
+        if (iter == subOps.end()) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': unknown sort field '" + std::string(sort.expr) + "'");
+        }
+        if (!iter->second->canInline()) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': cannot sort by a subop without inline support: "
+              + std::string(iter->second->name));
+        }
+        inlineSubOps.push_back(*iter);
+        subOps.erase(iter);
+      }
+    }
+
+    // Whether the REMAINING sub-ops join the count pass or stay behind for the
+    // post-selection bucket-domain feed. The feed reads only the documents the
+    // RETURNED buckets hold, and pays a fixed cost per bucket on top; inlining
+    // reads the whole domain per sub-op and pays no per-bucket cost. So the
+    // question is whether every bucket comes back: then the feed re-reads the
+    // whole domain anyway and only the fixed cost separates them.
+    //
+    // Measured on a 300k slice, three metrics sorted by one, at limit 10: at
+    // cardinality 10 - every bucket returned - inlining all of them wins 1.3x
+    // unfiltered and 3.6x at 1% selectivity, the gain growing as the domain
+    // shrinks and the per-bucket fixed cost dominates. At cardinality 100 and
+    // 1,000 it LOSES 30-43%, because ten buckets of many hold little of the
+    // domain. numOrds is an index-wide bound, so `limit >= buckets` is
+    // conservative for a filtered domain: it can only under-claim coverage.
+    //
+    // Restricted to requests that are already inlining something (a sort key,
+    // whose value decides which buckets are returned at all). Without one, the
+    // count pass would otherwise be free to take a counting strategy the inline
+    // path cannot reach - the docFreq-only dictionary walk among them - and
+    // that trade has not been measured. SOLUX_FACET_SUBOP_INLINE=all is how to
+    // measure it.
+    int64_t buckets = ordMap ? ordMap->numOrds() : 0;
+    bool inlineAll = limit == -1
+        || (!inlineSubOps.empty() && limit >= buckets);
+    if (forcedFacetSubOpInline == FacetSubOpInlineMode::ALL) {
+      inlineAll = true;
+    } else if (forcedFacetSubOpInline == FacetSubOpInlineMode::SORT_KEY_ONLY) {
+      inlineAll = false;
+    }
+    if (inlineAll) {
+      std::vector<std::string_view> moved;
+      for (auto& subOp : subOps) {
+        if (subOp.second->canInline()) {
+          inlineSubOps.push_back(subOp);
+          moved.push_back(subOp.first);
+        }
+      }
+      for (auto& name : moved) subOps.erase(name);
+    }
   }
 
   void normalizeOrdCounts(
@@ -435,6 +496,10 @@ public:
 
     solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       auto* ourVal = parent->getTargetForSub(resp, this);
+      solux::api::Val* target = nullptr;
+      routeTarget<solux::api::ArrVal>(*ourVal, resp->mr,
+          [&](solux::api::Val& val) { target = &val; });
+      ourVal = target;
       // the Val should either be unset, or have a FacetResult
       assert(
         ourVal != nullptr && (std::holds_alternative<solux::api::FacetResult>(ourVal->kind)
@@ -447,7 +512,6 @@ public:
       // must be sized for their sum or opsSlot's pre-sized array overflows.
       std::size_t cap = thisOp().subOps.size() + thisOp().inlineSubOps.size();
       return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
-      //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
@@ -1158,19 +1222,13 @@ public:
           ordCounts, ordMapStr, countVec, &selectedBuckets);
 
       auto& mr = op.req.lastResponse->mr;
-      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
-        if (slot >= 0) {
-          auto& arr = oneofMut<solux::api::ArrVal>(val);
-          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
-        }
+      solux::api::FacetResult* result = nullptr;
+      getTarget(nullptr, [&](solux::api::Val& val) {
+        routeTarget<solux::api::ArrVal>(val, mr, [&](solux::api::Val& target) {
+          result = &oneofMut<solux::api::FacetResult>(target);
+        });
       });
-      solux::api::Val* targetVal = myVal;
-      if (slot >= 0) {
-        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
-        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
-      }
-      auto& facetResultProto =
-          oneofMut<solux::api::FacetResult>(*targetVal);
+      auto& facetResultProto = *result;
       emitBuckets(facetResultProto, countVec, mr);
       if (thisOp().missing) facetResultProto.missing = missingCount;
       executeResultChildren(selectedBuckets);
@@ -1179,18 +1237,13 @@ public:
 
     void facetResult2(std::unique_ptr<MergeableStrFacetInline> mergedData) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
-        if (slot >= 0) {
-          auto& arr = oneofMut<solux::api::ArrVal>(val);
-          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
-        }
+      solux::api::FacetResult* result = nullptr;
+      getTarget(nullptr, [&](solux::api::Val& val) {
+        routeTarget<solux::api::ArrVal>(val, mr, [&](solux::api::Val& target) {
+          result = &oneofMut<solux::api::FacetResult>(target);
+        });
       });
-      solux::api::Val* targetVal = myVal;
-      if (slot >= 0) {
-        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
-        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
-      }
-      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*targetVal);
+      auto& facetResultProto = *result;
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;

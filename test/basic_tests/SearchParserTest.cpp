@@ -497,7 +497,8 @@ TEST_F(SearchParserTest, opNestingDepthCapped) {
     parser.parse();
   };
 
-  int cap = helper.getSearchEngine().config().search.max_op_depth;
+  auto defaultRequest = localReq(helper.getSearchEngine());
+  int cap = defaultRequest->searchConfig.max_op_depth;
   parseNested(helper.getSearchEngine(), cap);  // at the cap: accepted
   try {
     parseNested(helper.getSearchEngine(), cap + 1);

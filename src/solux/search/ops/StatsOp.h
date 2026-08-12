@@ -30,6 +30,10 @@ public:
     : SearchOp(req, name), fieldName(fieldName), valType(valType), kind(kind) {
   }
 
+  bool canEmitAsBucketChild() const override {
+    return true;
+  }
+
   bool isFloating() const {
     return valType == FieldType::FLOAT || valType == FieldType::DOUBLE;
   }
@@ -84,21 +88,17 @@ public:
     SegmentMergeDriver<MergeableStats> driver;
 
     void emitResult(double result) {
-      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
-        if (slot >= 0) {
-          // do array creation with mutex held since different buckets could be calculated in parallel
-          auto& arr = oneofMut<solux::api::ArrDouble>(val);
-          if (arr.v.empty()) {
-            build::allocArray(arr.v, numSlots, op.req.lastResponse->mr);
+      auto& mr = op.req.lastResponse->mr;
+      getTarget(nullptr, [&](solux::api::Val& val) {
+        routeTarget<solux::api::ArrDouble>(val, mr, [&](auto& target) {
+          using Target = std::remove_cvref_t<decltype(target)>;
+          if constexpr (std::is_same_v<Target, solux::api::Val>) {
+            target.kind.template emplace<double>(result);
+          } else {
+            target = result;
           }
-        }
+        });
       });
-      if (slot == -1) {
-        myVal->kind.emplace<double>(result);
-      } else {
-        auto& arr = oneofMut<solux::api::ArrDouble>(*myVal);
-        const_cast<double*>(arr.v.data())[slot] = result;
-      }
     }
 
   public:

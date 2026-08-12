@@ -3364,7 +3364,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   ASSERT_NO_THROW(cache->validateForTest());
 }
 
-TEST(FilterCacheIntegrationTest, nestedKnnDomainDoesNotRecordAdmission) {
+TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
   SoluxConfig config;
   config.filterCacheBytes = 0;
   SoluxNode node(config);
@@ -3391,7 +3391,9 @@ TEST(FilterCacheIntegrationTest, nestedKnnDomainDoesNotRecordAdmission) {
     addFilter(nested, solux::test::qb::knn(
         nested.mr(), "embedding_v", queryVector, 3, 0, true));
     request->execute();
-    EXPECT_TRUE(request->ok()) << request->toString();
+    EXPECT_FALSE(request->ok()) << request->toString();
+    EXPECT_NE(request->errorMsg().find("cannot emit per bucket"),
+              std::string::npos);
   };
 
   runNested();
@@ -3403,7 +3405,7 @@ TEST(FilterCacheIntegrationTest, nestedKnnDomainDoesNotRecordAdmission) {
 
   runKnnFilter(node, "filter_cache_knn_gate", queryVector, 3);
   EXPECT_EQ(0u, cache->counters().admissions)
-      << "nested domains must not count as the first admission sighting";
+      << "rejected nested requests must not count as an admission sighting";
   runKnnFilter(node, "filter_cache_knn_gate", queryVector, 3);
   auto built = cache->counters();
   EXPECT_EQ(1u, built.admissions);

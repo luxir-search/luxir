@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
@@ -22,6 +23,11 @@ inline bool disableTopDocsFilterFold = false;
 
 // A/B baseline for unscored field-sort match-window collection.
 inline bool disableFieldSortBulk = false;
+
+// Test override for one segment's range-facet bucket-domain builder budget.
+// Zero selects the production constant; tests set a tiny nonzero value to
+// force bucket chunking.
+inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key

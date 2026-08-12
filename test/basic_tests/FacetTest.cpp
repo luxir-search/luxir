@@ -190,6 +190,14 @@ public:
   }
 };
 
+class RangeFacetBucketDomainBudgetGuard {
+  std::size_t saved = forcedRangeFacetBucketDomainByteBudget;
+public:
+  ~RangeFacetBucketDomainBudgetGuard() {
+    forcedRangeFacetBucketDomainByteBudget = saved;
+  }
+};
+
 class StrFacetReplayGuard {
   StrFacetReplaySelector savedSelector = forcedStrFacetReplaySelector;
   StrFacetReplayBankStrategy savedBank = forcedStrFacetReplayBank;
@@ -2657,6 +2665,114 @@ TEST_F(FacetTest, rangeFacetNestedUnderStringFacet) {
   expectRangeResult(*arr[1].facetResult(), bounds, std::array<int64_t, 2>{1, 0}, -1);
 }
 
+TEST_F(FacetTest, intFacetNestedUnderStringFacetUsesDistinctSlots) {
+  CollectionHelper helper;
+  helper.index(flatdoc("cat_s", "a", "val_i", 1), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "a", "val_i", 2), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "val_i", 9), UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->facet("outer", "cat_s").limit(-1)
+      .facet("inner", "val_i").limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+
+  const auto& outer = rootFacetResult(*req, "outer");
+  const auto& outerIds = std::get<api::ColStr>(outer.bucket_ids->kind).v;
+  ASSERT_EQ(2u, outerIds.size());
+  EXPECT_EQ("a", outerIds[0]);
+  EXPECT_EQ("b", outerIds[1]);
+  const auto& inner = std::get<api::ArrVal>(outer.ops.at("inner")->kind).v;
+  ASSERT_EQ(2u, inner.size());
+  ASSERT_NE(nullptr, inner[0].facetResult());
+  ASSERT_NE(nullptr, inner[1].facetResult());
+  const auto& aIds =
+      std::get<api::ColInt>(inner[0].facetResult()->bucket_ids->kind).v;
+  const auto& bIds =
+      std::get<api::ColInt>(inner[1].facetResult()->bucket_ids->kind).v;
+  ASSERT_EQ(2u, aIds.size());
+  EXPECT_EQ(1, aIds[0]);
+  EXPECT_EQ(2, aIds[1]);
+  ASSERT_EQ(1u, bIds.size());
+  EXPECT_EQ(9, bIds[0]);
+}
+
+TEST_F(FacetTest, stringFacetWithStatNestedUnderRangeFacet) {
+  CollectionHelper helper;
+  helper.index(flatdoc("range_i", 5, "group_s", "x", "score_i", 10),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("range_i", 5, "group_s", "y", "score_i", 20),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("range_i", 15, "group_s", "x", "score_i", 30),
+               UpdateMessage::COMMIT);
+  helper.index(flatdoc("range_i", 5, "group_s", "x", "score_i", 40),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("range_i", 15, "group_s", "z", "score_i", 50),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("outer", "range_i").range(0, 20, 10)
+      .facet("groups", "group_s").limit(-1)
+      .sum("score", "score_i");
+  req->execute();
+  ASSERT_OK(req);
+
+  const auto& outer = rootFacetResult(*req, "outer");
+  const auto& groups = std::get<api::ArrVal>(outer.ops.at("groups")->kind).v;
+  ASSERT_EQ(2u, groups.size());
+  for (size_t i = 0; i < groups.size(); i++) {
+    ASSERT_NE(nullptr, groups[i].facetResult());
+  }
+  const auto& first = *groups[0].facetResult();
+  const auto& firstIds = std::get<api::ColStr>(first.bucket_ids->kind).v;
+  const auto& firstSums = std::get<api::ArrDouble>(first.ops.at("score")->kind).v;
+  ASSERT_EQ(2u, firstIds.size());
+  EXPECT_EQ("x", firstIds[0]);
+  EXPECT_EQ("y", firstIds[1]);
+  EXPECT_EQ(50, firstSums[0]);
+  EXPECT_EQ(20, firstSums[1]);
+
+  const auto& second = *groups[1].facetResult();
+  const auto& secondIds = std::get<api::ColStr>(second.bucket_ids->kind).v;
+  const auto& secondSums = std::get<api::ArrDouble>(second.ops.at("score")->kind).v;
+  ASSERT_EQ(2u, secondIds.size());
+  EXPECT_EQ("x", secondIds[0]);
+  EXPECT_EQ("z", secondIds[1]);
+  EXPECT_EQ(30, secondSums[0]);
+  EXPECT_EQ(50, secondSums[1]);
+}
+
+TEST_F(FacetTest, rangeFacetSubOpsChunkedBudgetMatchesDefault) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("range_i", 1, "score_i", 10),
+      flatdoc("range_i", 11, "score_i", 20),
+      flatdoc("range_i", 21, "score_i", 30),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("range_i", 2, "score_i", 40),
+      flatdoc("range_i", 12, "score_i", 50),
+      flatdoc("range_i", 31, "score_i", 60),
+  }, UpdateMessage::COMMIT).success);
+
+  RangeFacetBucketDomainBudgetGuard guard;
+  auto run = [&](std::size_t budget) {
+    forcedRangeFacetBucketDomainByteBudget = budget;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("f", "range_i").range(0, 40, 10)
+        .sum("score", "score_i");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return encodeFacetResult(*req, "f");
+  };
+
+  auto expected = run(0);
+  EXPECT_EQ(expected, run(1));
+}
+
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   CollectionHelper helper;
   helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha", "raw_sc", "x"),
@@ -3107,43 +3223,20 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   EXPECT_DOUBLE_EQ(15.0, std::get<solux::api::ArrDouble>(f->ops.at("av")->kind).v[0]) << req->toString();
 }
 
-TEST_F(FacetTest, bucketPreparedTopDocsRetainsSegmentDomains) {
+TEST_F(FacetTest, topDocsUnderFacetRejected) {
   CollectionHelper helper;
-  helper.indexAll(std::array{
-    flatdoc("id", "a", "cat_s", "x"),
-    flatdoc("id", "b"),
-    flatdoc("id", "c"),
-  }, UpdateMessage::COMMIT);
-  helper.indexAll(std::array{
-    flatdoc("id", "d"),
-    flatdoc("id", "e"),
-    flatdoc("id", "f", "cat_s", "x"),
-  }, UpdateMessage::COMMIT);
-  ASSERT_EQ(2u, helper.getIndexWriter()->getIndexReader()->segments().size());
+  helper.index(flatdoc("id", "a", "cat_s", "x"), UpdateMessage::COMMIT);
 
   auto req = localReq(soluxNode->getSearchEngine());
-  req->testForcePrepare = true;
-  auto& topDocs = req->collection("main").topDocs("q").allQuery().limit(0);
-  auto& facet = topDocs.facet("f", "cat_s").limit(10);
+  req->collection("main");
+  auto& facet = req->facet("f", "cat_s");
   facet.topDocs("bucket_docs").allQuery().fields({"id"}).getNumber().limit(-1);
   req->execute();
 
-  ASSERT_OK(req);
-  const auto* outerDocs = req->docList("q");
-  ASSERT_NE(nullptr, outerDocs);
-  const auto* result = outerDocs->ops.at("f")->facetResult();
-  ASSERT_NE(nullptr, result);
-  ASSERT_EQ(1u, result->counts.size());
-  EXPECT_EQ(2, result->counts[0]);
-
-  const auto* bucketDocs = result->ops.at("bucket_docs")->docList();
-  ASSERT_NE(nullptr, bucketDocs);
-  EXPECT_EQ(2, bucketDocs->found.value_or(-1));
-  const auto& ids = std::get<api::ColStr>(
-      bucketDocs->columns.at("id").kind).v;
-  ASSERT_EQ(2u, ids.size());
-  EXPECT_EQ("a", ids[0]);
-  EXPECT_EQ("f", ids[1]);
+  ASSERT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find("facet 'f'"), std::string::npos);
+  EXPECT_NE(req->errorMsg().find("child op 'bucket_docs' cannot emit per bucket"),
+            std::string::npos);
 }
 
 // Nested facet: a string facet under a string facet, returning a per-parent-
@@ -3214,7 +3307,6 @@ TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {
     auto& facet = req->facet("f", "cat_s").limit(2);
     facet.avg("avg", "metric_i");
     facet.facet("sub", "sub_s").limit(2);
-    facet.topDocs("docs").allQuery().fields({"id"}).getNumber().limit(-1);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     return encodeFacetResult(*req, "f");

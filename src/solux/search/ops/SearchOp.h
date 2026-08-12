@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <type_traits>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -81,6 +82,10 @@ public:
     return false;
   }
 
+  virtual bool canEmitAsBucketChild() const {
+    return false;
+  }
+
   // Result-stage facet children may bind to parent-produced sources. The
   // default operation has no specialized binding and uses BUCKET_DOMAINS.
   // The returned executor is owned by the parent coordinator.
@@ -140,6 +145,26 @@ public:
     };
 
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
+
+    // Route an emitter to its ordinary Val or to its bucket slot. Array
+    // creation and the visitor both run under the response lock when this is
+    // called from getTarget's visitor.
+    template <typename ArrayArm, typename Visitor>
+    void routeTarget(solux::api::Val& val, std::pmr::memory_resource& mr,
+                     Visitor&& visitor) {
+      if (slot == -1) {
+        visitor(val);
+        return;
+      }
+      assert(slot >= 0);
+      assert(slot < numSlots);
+      auto& arr = oneofMut<ArrayArm>(val);
+      if (arr.v.empty()) {
+        build::allocArray(arr.v, (size_t)numSlots, mr);
+      }
+      using Element = std::remove_const_t<typename decltype(arr.v)::element_type>;
+      visitor(const_cast<Element&>(arr.v[(size_t)slot]));
+    }
 
     ExecutionProfileScope profilePiece(ExecutionProfileRun* run, int32_t segnum) {
       ExecutionProfilePieceState* state =

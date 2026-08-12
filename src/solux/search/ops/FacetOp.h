@@ -41,7 +41,6 @@ public:
   // lifetime).  Held by value.
   ReqSortList sorts;
   std::string_view facetName;
-  std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
     int64_t limit, int64_t minCount, bool missing,
@@ -52,74 +51,15 @@ public:
 
   virtual ~FacetReq() = default;
 
-  // Upper bound on how many buckets this facet can return, or -1 when it is
-  // not knowable before execution.  init() uses it to ask "will every bucket
-  // come back", which is what decides whether inlining a sub-op beats
-  // computing it per returned bucket afterwards.
-  virtual int64_t maxBuckets() const {
-    return -1;
-  }
-
   void init() override {
+    for (const auto& [childName, child] : subOps) {
+      if (!child->canEmitAsBucketChild()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': child op '" + std::string(childName)
+            + "' cannot emit per bucket");
+      }
+    }
     SearchOp::init();
-    if (!sorts.empty()) {
-      if (sorts.size() > 1) {
-        throw std::runtime_error("facet '" + std::string(facetName) + "': multiple sort fields are not yet supported");
-      }
-      for (auto& sort : sorts) {
-        auto iter = subOps.find(sort.expr);
-        if (iter == subOps.end()) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': unknown sort field '" + std::string(sort.expr) + "'");
-        }
-        if (iter->second->canInline()) {
-          inlineSubOps.push_back(*iter);
-          subOps.erase(iter);
-        } else {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': cannot sort by a subop without inline support: " + std::string(iter->second->name));
-        }
-      }
-    }
-    // Whether the REMAINING sub-ops join the count pass or stay behind for the
-    // post-selection bucket-domain feed.  The feed reads only the documents the
-    // RETURNED buckets hold, and pays a fixed cost per bucket on top; inlining
-    // reads the whole domain per sub-op and pays no per-bucket cost.  So the
-    // question is whether every bucket comes back: then the feed re-reads the
-    // whole domain anyway and only the fixed cost separates them.
-    //
-    // Measured on a 300k slice, three metrics sorted by one, at limit 10: at
-    // cardinality 10 - every bucket returned - inlining all of them wins 1.3x
-    // unfiltered and 3.6x at 1% selectivity, the gain growing as the domain
-    // shrinks and the per-bucket fixed cost dominates.  At cardinality 100 and
-    // 1,000 it LOSES 30-43%, because ten buckets of many hold little of the
-    // domain.  numOrds is an index-wide bound, so `limit >= maxBuckets()` is
-    // conservative for a filtered domain: it can only under-claim coverage.
-    //
-    // Restricted to requests that are already inlining something (a sort key,
-    // whose value decides which buckets are returned at all).  Without one, the
-    // count pass would otherwise be free to take a counting strategy the inline
-    // path cannot reach - the docFreq-only dictionary walk among them - and
-    // that trade has not been measured.  SOLUX_FACET_SUBOP_INLINE=all is how to
-    // measure it.
-    int64_t buckets = maxBuckets();
-    bool inlineAll = limit == -1
-        || (!inlineSubOps.empty() && buckets >= 0 && limit >= buckets);
-    if (forcedFacetSubOpInline == FacetSubOpInlineMode::ALL) {
-      inlineAll = true;
-    } else if (forcedFacetSubOpInline == FacetSubOpInlineMode::SORT_KEY_ONLY) {
-      inlineAll = false;
-    }
-    if (inlineAll) {
-      std::vector<std::string_view> moved;
-      for (auto& subOp : subOps) {
-        if (subOp.second->canInline()) {
-          inlineSubOps.push_back(subOp);
-          moved.push_back(subOp.first);
-        }
-      }
-      for (auto& name : moved) {
-        subOps.erase(name);
-      }
-    }
   }
 
   // utility template method that calls callback with (int32 docid, int64_t value) for each doc in the domain that has
@@ -247,6 +187,10 @@ public:
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
   globalMin(globalMin), globalMax(globalMax), useVector(useVector) {}
 
+  bool canEmitAsBucketChild() const override {
+    return true;
+  }
+
   // Scan every segment for the column's min/max and decide vector vs map
   // storage based on the resulting range.  Runs during parsing so the result
   // can be passed to the IntFacetReq ctor.
@@ -340,8 +284,13 @@ public:
 
     void facetResult(MergeableIntFacet& merged) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      auto* myVal = getTarget(nullptr);
-      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*myVal);
+      solux::api::FacetResult* result = nullptr;
+      getTarget(nullptr, [&](solux::api::Val& val) {
+        routeTarget<solux::api::ArrVal>(val, mr, [&](solux::api::Val& target) {
+          result = &oneofMut<solux::api::FacetResult>(target);
+        });
+      });
+      auto& facetResultProto = *result;
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -400,6 +349,10 @@ class FullTextFacetReq : public FieldFacetReq {
 public:
   FullTextFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
+
+  bool canEmitAsBucketChild() const override {
+    return true;
+  }
 
   class Calc : public Calculator {
     SegmentMergeDriver<MergeableStrFacet> driver;
@@ -465,8 +418,13 @@ public:
 
     void facetResult(MergeableStrFacet& merged) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      auto* myVal = getTarget(nullptr);
-      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*myVal);
+      solux::api::FacetResult* result = nullptr;
+      getTarget(nullptr, [&](solux::api::Val& val) {
+        routeTarget<solux::api::ArrVal>(val, mr, [&](solux::api::Val& target) {
+          result = &oneofMut<solux::api::FacetResult>(target);
+        });
+      });
+      auto& facetResultProto = *result;
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -492,6 +450,8 @@ public:
 };
 
 class IntFacetRangeReq : public FacetReq {
+  static constexpr size_t BUCKET_BUILDER_FIXED_BYTES = 128;
+  static constexpr size_t BUCKET_DOMAIN_BYTE_BUDGET = 64 * 1024 * 1024;
   std::span<const int64_t> fences;
   int64_t affineGap;
   FieldType::Type valueType;
@@ -523,12 +483,8 @@ public:
 
   virtual ~IntFacetRangeReq() = default;
 
-  // FacetReq::init()'s inline-move keys off limit == -1 (every bucket
-  // returned), but this op has no inline counting pass: a moved sub-op would
-  // never run.  Sub-ops always execute post-selection over bucket domains.
-  // The parser rejects sorts, so the sort handling is not lost either.
-  void init() override {
-    SearchOp::init();
+  bool canEmitAsBucketChild() const override {
+    return true;
   }
 
   class MergeableRangeFacet : public MergeableData {
@@ -570,14 +526,10 @@ public:
     solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       auto* ourVal = parent->getTargetForSub(resp, this);
       assert(ourVal != nullptr);
-      if (slot >= 0) {
-        // This range facet is itself a bucket child: its FacetResult lives at
-        // its slot of the parent-allocated ArrVal (see facetResult), and its
-        // sub-ops' entries belong inside THAT FacetResult's ops map.
-        auto& arr = oneofMut<solux::api::ArrVal>(*ourVal);
-        assert(!arr.v.empty());
-        ourVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
-      }
+      solux::api::Val* target = nullptr;
+      routeTarget<solux::api::ArrVal>(*ourVal, resp->mr,
+          [&](solux::api::Val& val) { target = &val; });
+      ourVal = target;
       auto& fr = oneofMut<solux::api::FacetResult>(*ourVal);
       return build::opsSlot(fr.ops, thisOp().subOps.size(), sub->getOp().name,
                             resp->mr);
@@ -600,9 +552,7 @@ public:
         auto end = thisOp().fences.back();
         auto& facetReq = (FacetReq&)getOp();
         auto& segment = facetReq.reader.segments()[segnum];
-        bool noSubOps = thisOp().subOps.empty()
-                     && thisOp().inlineSubOps.empty()
-                     && thisOp().sorts.empty();
+        bool noSubOps = thisOp().subOps.empty() && thisOp().sorts.empty();
         if (!IntFacetRangeReq::disablePointsRangeFacetForTests
             && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
             && start < end) {
@@ -652,19 +602,13 @@ public:
 
     void facetResult(MergeableRangeFacet& merged) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
-        if (slot >= 0) {
-          // do array creation with mutex held since different buckets could be calculated in parallel
-          auto& arr = oneofMut<solux::api::ArrVal>(val);
-          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
-        }
+      solux::api::FacetResult* result = nullptr;
+      getTarget(nullptr, [&](solux::api::Val& val) {
+        routeTarget<solux::api::ArrVal>(val, mr, [&](solux::api::Val& target) {
+          result = &oneofMut<solux::api::FacetResult>(target);
+        });
       });
-      solux::api::Val* targetVal = myVal;
-      if (slot >= 0) {
-        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
-        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
-      }
-      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*targetVal);
+      auto& facetResultProto = *result;
       auto minCount = thisOp().minCount;
       auto missing = thisOp().missing;
 
@@ -710,9 +654,9 @@ public:
       executeResultChildren(merged, emitted);
     }
 
-    // Post-selection sub-op execution: one Calculator binding per (returned
-    // bucket, sub-op), fed that bucket's domain segment by segment - the same
-    // baseline feed string facets use (FacetBucketDomainExecutor).
+    // Post-selection sub-op execution keeps every bucket/child binding alive
+    // while feeding one segment at a time. Within a segment, bucket chunks cap
+    // the simultaneous worst-case bitset footprint.
     void executeResultChildren(const MergeableRangeFacet& merged,
                                std::span<const size_t> emitted) {
       if (thisOp().subOps.empty() || emitted.empty()) return;
@@ -736,59 +680,88 @@ public:
         children.push_back(child);
       }
 
-      std::span<const SelectedFacetBucket<int64_t>> bucketSpan(buckets);
-      std::vector<DomainHandle> built = bucketDomains(bucketSpan);
-      FacetBucketDomainExecutor::execute(
-          *this, children, bucketSpan, (int32_t)input.size(),
-          [&](int32_t segment, const auto& bucket) {
-            return built[(size_t)segment * buckets.size()
-                         + (size_t)bucket.owner.value];
-          });
+      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings;
+      bindings.reserve(buckets.size() * children.size());
+      for (const auto& bucket : buckets) {
+        assert(bucket.output.value >= 0);
+        assert(bucket.output.value < (int32_t)buckets.size());
+        for (SearchOp* child : children) {
+          bindings.emplace_back(child->createCalculator(
+              this, bucket.output.value, (int64_t)buckets.size()));
+        }
+      }
+
+      if (input.empty()) {
+        std::span<const DomainHandle> noDomains;
+        for (auto& binding : bindings) binding->calcAll(nullptr, noDomains);
+        return;
+      }
+
+      for (size_t segnum = 0; segnum < input.size(); segnum++) {
+        int32_t maxDoc =
+            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+        size_t builderBytes = (size_t)(((uint64_t)maxDoc + 63) / 64) * 8
+                            + BUCKET_BUILDER_FIXED_BYTES;
+        size_t byteBudget = forcedRangeFacetBucketDomainByteBudget != 0
+            ? forcedRangeFacetBucketDomainByteBudget
+            : BUCKET_DOMAIN_BYTE_BUDGET;
+        size_t bucketsPerChunk = std::max<size_t>(
+            1, byteBudget / builderBytes);
+        for (size_t begin = 0; begin < buckets.size();
+             begin += bucketsPerChunk) {
+          size_t chunkSize = std::min(bucketsPerChunk, buckets.size() - begin);
+          auto chunk = std::span<const SelectedFacetBucket<int64_t>>(buckets)
+                           .subspan(begin, chunkSize);
+          std::vector<DomainHandle> domains = bucketDomains(segnum, chunk);
+          for (size_t bucket = 0; bucket < chunkSize; bucket++) {
+            for (size_t child = 0; child < children.size(); child++) {
+              bindings[(begin + bucket) * children.size() + child]->calc(
+                  nullptr, (int32_t)segnum, domains[bucket]);
+            }
+          }
+        }
+      }
     }
 
-    // Build every returned bucket's domain for every segment in one pass over
-    // the value column (the range analog of StrFacetOp::ordColumnBucketDomains;
-    // ranges have no per-bucket postings alternative).  Indexed
-    // [segment * numBuckets + owner].  A multi-valued document can put two
-    // values in one bucket and DocSetBuilder requires strictly increasing
-    // docids, so each builder skips a repeat of the docid it just added.
+    // Build one chunk of one segment's bucket domains in a value-column pass.
+    // A multi-valued document can put two values in one bucket and
+    // DocSetBuilder requires strictly increasing docids, so each builder skips
+    // a repeat of the docid it just added.
     std::vector<DomainHandle> bucketDomains(
+        size_t segnum,
         std::span<const SelectedFacetBucket<int64_t>> buckets) {
       size_t numBuckets = buckets.size();
-      size_t numSegments = input.size();
-      std::vector<DomainHandle> domains(numSegments * numBuckets);
-      // bucket index -> owner slot; -1 when mincount filtered the bucket out.
-      std::vector<int32_t> ownerOfBucket(thisOp().bucketCount(), -1);
-      for (const auto& bucket : buckets) {
-        ownerOfBucket[(size_t)bucket.key] = bucket.owner.value;
+      std::vector<DomainHandle> domains(numBuckets);
+      // Range bucket index -> builder in this chunk.
+      std::vector<int32_t> builderOfBucket(thisOp().bucketCount(), -1);
+      for (size_t i = 0; i < buckets.size(); i++) {
+        builderOfBucket[(size_t)buckets[i].key] = (int32_t)i;
       }
       int64_t start = thisOp().fences.front();
       int64_t end = thisOp().fences.back();
-      for (size_t segnum = 0; segnum < numSegments; segnum++) {
-        int32_t maxDoc =
-            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
-        // Reserved up front: DocSetBuilder holds a pointer into its own
-        // optional bitset, so it must never be reallocated once built into.
-        std::vector<DocSetBuilder> builders;
-        builders.reserve(numBuckets);
-        for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(maxDoc);
-        std::vector<int32_t> lastAdded(numBuckets, -1);
+      int32_t maxDoc =
+          thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+      // DocSetBuilder holds a pointer into its own optional bitset, so reserve
+      // before construction and never reallocate the vector.
+      std::vector<DocSetBuilder> builders;
+      builders.reserve(numBuckets);
+      for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(maxDoc);
+      std::vector<int32_t> lastAdded(numBuckets, -1);
 
-        SegFieldInfo segFieldInfo;
-        int64_t missing_num = 0;
-        thisOp().facetSegIntCol(
-            input[segnum].get(), (int32_t)segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int64_t val) SOLUX_INLINE {
-              if (val < start || val >= end) return;
-              int32_t owner = ownerOfBucket[thisOp().bucketOf(val)];
-              if (owner < 0 || lastAdded[(size_t)owner] == docid) return;
-              lastAdded[(size_t)owner] = docid;
-              builders[(size_t)owner].add(docid);
-            });
+      SegFieldInfo segFieldInfo;
+      int64_t missing_num = 0;
+      thisOp().facetSegIntCol(
+          input[segnum].get(), (int32_t)segnum, missing_num, segFieldInfo,
+          [&](int32_t docid, int64_t val) SOLUX_INLINE {
+            if (val < start || val >= end) return;
+            int32_t builder = builderOfBucket[thisOp().bucketOf(val)];
+            if (builder < 0 || lastAdded[(size_t)builder] == docid) return;
+            lastAdded[(size_t)builder] = docid;
+            builders[(size_t)builder].add(docid);
+          });
 
-        for (size_t i = 0; i < numBuckets; i++) {
-          domains[segnum * numBuckets + i] = DomainHandle(builders[i].build());
-        }
+      for (size_t i = 0; i < numBuckets; i++) {
+        domains[i] = DomainHandle(builders[i].build());
       }
       return domains;
     }

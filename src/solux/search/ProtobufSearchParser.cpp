@@ -8,7 +8,6 @@
 #include <variant>
 #include <vector>
 
-#include "solux/search/SearchEngine.h"
 #include "solux/search/SearchRequest.h"
 #include "solux/query/ParseContext.h"
 #include "solux/search/ops/RootOp.h"
@@ -38,11 +37,8 @@ namespace {
 struct SearchParserImpl {
   SearchRequest& req;
   TopDocsReq* firstQuery = nullptr;
-  // Current depth of the op tree being built (root-level ops are depth 1) and
-  // the configured cap (--search.max-op-depth).  Ops nested past the cap are
-  // rejected: a request-shape limit like the query parsers' nesting budget,
-  // checked in addSubs, the single funnel for op recursion.
-  int opDepth = 0;
+  // Root-level ops are depth 1. Ops nested past the configured cap are rejected
+  // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
   static constexpr size_t MAX_RANGE_BUCKETS = 100000;
   static constexpr size_t MAX_SUBOP_RANGE_BUCKETS = 1024;
@@ -251,13 +247,13 @@ public:
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
   explicit SearchParserImpl(SearchRequest& req)
-    : req(req), maxOpDepth(req.engine.config().search.max_op_depth) {
+    : req(req), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
   RootOp* parse() {
     RootOp& rootOp = *solux::arenaCreate<RootOp>(req.arena, req);
     rootOp.parent = nullptr;
-    addSubs(rootOp, req.proto.ops);
+    addSubs(rootOp, req.proto.ops, 0);
     return &rootOp;
   }
 
@@ -279,46 +275,43 @@ public:
     }
   }
 
-  void addSubs(SearchOp& currOp, OpsMap ops) {
+  void addSubs(SearchOp& currOp, OpsMap ops, int depth) {
     if (ops.empty()) return;
-    if (opDepth >= maxOpDepth) {
+    if (depth >= maxOpDepth) {
       throw std::runtime_error("search operation nesting exceeds the maximum depth of "
                                + std::to_string(maxOpDepth));
     }
-    // No unwind protection on the decrement: an op parse error aborts the
-    // whole (single-use) parse, so the counter never needs to rebalance.
-    ++opDepth;
     for (auto& [name, searchOp] : lastWins(ops)) {
       // map values are indirect views over the request bytes; deref to the SearchOp.
       // lastWins() collapses duplicate op names (protobuf map dedup semantics).
       validateName(name, "op");
-      auto* sub = parseOp(name, **searchOp);
+      auto* sub = parseOp(name, **searchOp, depth + 1);
       if (sub == nullptr) {
         continue; // skip this op
       }
       currOp.subOps[name] = sub;
       sub->parent = &currOp;
     }
-    --opDepth;
   }
 
-  SearchOp* parseOp(std::string_view name, const solux::api::SearchOp& searchOp) {
+  SearchOp* parseOp(std::string_view name, const solux::api::SearchOp& searchOp,
+                    int depth) {
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(solux::overloaded{
       [&](const solux::api::TopDocs& topDocs) -> SearchOp* {
         auto* qr = parseTopDocs(name, topDocs, true);
-        addSubs(*qr, topDocs.ops);
+        addSubs(*qr, topDocs.ops, depth);
         return qr;
       },
       [&](const solux::api::Fusion& fusion) -> SearchOp* { return parseFusion(name, fusion); },
       [&](const solux::api::FieldFacet& facetReq) -> SearchOp* {
         auto* facet = createFieldFacetReq(name, facetReq);
-        addSubs(*facet, facetReq.ops);
+        addSubs(*facet, facetReq.ops, depth);
         return facet;
       },
       [&](const solux::api::RangeFacet& facetReq) -> SearchOp* {
         auto* facet = createRangeFacetReq(name, facetReq);
-        addSubs(*facet, facetReq.ops);
+        addSubs(*facet, facetReq.ops, depth);
         return facet;
       },
       [&](const solux::api::GenOp& genOp) -> SearchOp* {

@@ -9,6 +9,7 @@
 
 #include "solux/api/solux_types.hpp"
 #include "solux/api/build.h"
+#include "solux/SoluxConfig.h"
 #include "IndexReader.h"
 #include "FilterCache.h"
 #include "solux/schema/Schema.h"
@@ -74,6 +75,7 @@ class SearchRequest {
 
 public:
   SearchEngine& engine;
+  const SearchConfig searchConfig;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
@@ -120,12 +122,8 @@ public:
   // machinery does not belong on the public API); nothing wire-facing sets it.
   bool testForcePrepare = false;
 
-  SearchRequest(SearchEngine& engine, const ReqProto& proto, google::protobuf::Arena& arena)
-    : engine(engine), proto(proto), arena(arena),
-      dateMathNowEpochMillis(currentEpochMillis()),
-      timeZone(resolveTimeZone(proto.time_zone)) {
-    if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
-  }
+  SearchRequest(SearchEngine& engine, const ReqProto& proto,
+                google::protobuf::Arena& arena);
 
   virtual ~SearchRequest() = default;
 

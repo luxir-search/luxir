@@ -25,7 +25,8 @@ class LocalReq;
 
 // Fluent cursor over one op (or the request root). Cursors are owned by LocalReq in a
 // std::deque, so a reference stays valid as later chain calls add more cursors. The configure
-// methods assert the op kind. Descend with topDocs()/facet()/avg()/...; climb back with end().
+// methods assert the op kind. Descend with topDocs()/facet(); stat helpers add
+// a GenOp leaf and return the calling cursor. Climb back with end().
 //
 // The concrete solux::api classes are the public API: reads go through their named accessors
 // (val.docList()/asDouble(), map_view.find). This cursor only hides the ARENA/build-by-backing

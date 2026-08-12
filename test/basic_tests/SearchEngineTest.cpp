@@ -2734,27 +2734,6 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
   EXPECT_GT(passiveDomains, 0);
   EXPECT_EQ(0, passiveWindows);
 
-  auto nested = localReq(soluxNode->getSearchEngine());
-  nested->collection(collection);
-  auto& outer = nested->facet("outer", "group_s").limit(-1);
-  outer.topDocs("filtered").allQuery().getNumber().fields({"id"}).limit(4)
-      .matchFilter("keep", "keep_s", "yes");
-  {
-    SkipStatsGuard stats;
-    nested->execute(false);
-    EXPECT_EQ(0, SkipStats::filterDocSetIdentityCollections);
-  }
-  ASSERT_OK(nested);
-  const auto* outerResult =
-      nested->responses[0]->proto.ops.at("outer")->facetResult();
-  ASSERT_NE(nullptr, outerResult);
-  const auto* filtered = outerResult->ops.at("filtered")->docList();
-  ASSERT_NE(nullptr, filtered);
-  EXPECT_EQ(8, filtered->found.value_or(-1));
-  const auto& nestedIds =
-      std::get<api::ColStr>(filtered->columns.at("id").kind).v;
-  EXPECT_EQ((std::vector<std::string_view>{"g1", "g2", "g4", "g5"}),
-            std::vector<std::string_view>(nestedIds.begin(), nestedIds.end()));
 }
 
 TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
@@ -2832,18 +2811,6 @@ TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
   runPrepared("yes");
   EXPECT_EQ(1, runPrepared("no"));
 
-  auto nested = localReq(soluxNode->getSearchEngine());
-  nested->collection(collection);
-  auto& outer = nested->facet("outer", "group_s").limit(-1);
-  auto& inner = outer.topDocs("filtered").matchQuery("body_w", "pear")
-      .getNumber().limit(0);
-  inner.facet("low", "low_s").limit(-1);
-  {
-    SkipStatsGuard stats;
-    nested->execute(false);
-    EXPECT_GT(SkipStats::exactDomainStreamFallbacks, 0);
-  }
-  EXPECT_TRUE(nested->ok()) << nested->errorMsg();
 }
 
 TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
