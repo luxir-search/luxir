@@ -124,6 +124,15 @@ static void BM_IntSortFiltered(benchmark::State& state, int64_t nDocs,
         (double)SkipStats::fieldSortIrreducibleBlocks;
     state.counters["bulkCollections"] =
         (double)SkipStats::fieldSortBulkCollections;
+    state.counters["requiredBlocks"] =
+        (double)SkipStats::fieldSortRequiredBlocks;
+    state.counters["bfActivations"] =
+        (double)SkipStats::fieldSortBestFirstActivations;
+    state.counters["bfBlocks"] = (double)SkipStats::fieldSortBestFirstBlocks;
+    state.counters["bfTerminations"] =
+        (double)SkipStats::fieldSortBestFirstTerminations;
+    state.counters["bfFallbacks"] =
+        (double)SkipStats::fieldSortBestFirstFallbacks;
   }
 
   for (auto _ : state) {

@@ -204,10 +204,23 @@ struct SkipStats {
   // of the last heap change - "how late did the top-k stop moving".
   static inline int64_t fieldSortDocsGathered = 0;
   static inline int64_t fieldSortGatherAtLastAdmission = 0;
-  // Blocks whose best key strictly undercuts the final bottom: the visit
-  // floor no traversal order can avoid (bounds cover all docs, so a block
-  // holding a better-bounded key must be inspected to refute it).
+  // Blocks whose best key strictly undercuts the bottom: the visit floor no
+  // traversal order can avoid (bounds cover all docs, so a block holding a
+  // better-bounded key must be inspected to refute it). SEGMENT-LOCAL:
+  // recorded at each segment's completion against the then-current bottom,
+  // so multi-segment sums overstate the final-bottom floor - single-segment
+  // runs give the honest reading.
   static inline int64_t fieldSortIrreducibleBlocks = 0;
+  // Equality-aware operational floor: blocks a fresh traversal would still
+  // collect under the full tie/segdoc rules. Segment-local, as above.
+  static inline int64_t fieldSortRequiredBlocks = 0;
+  // Best-first exact-domain driver: route activations, blocks gathered,
+  // proof terminations (heap head strictly noncompetitive), and work-cap
+  // fallbacks to the forward sweep.
+  static inline int64_t fieldSortBestFirstActivations = 0;
+  static inline int64_t fieldSortBestFirstBlocks = 0;
+  static inline int64_t fieldSortBestFirstTerminations = 0;
+  static inline int64_t fieldSortBestFirstFallbacks = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -415,6 +428,11 @@ struct SkipStats {
     fieldSortDocsGathered = 0;
     fieldSortGatherAtLastAdmission = 0;
     fieldSortIrreducibleBlocks = 0;
+    fieldSortRequiredBlocks = 0;
+    fieldSortBestFirstActivations = 0;
+    fieldSortBestFirstBlocks = 0;
+    fieldSortBestFirstTerminations = 0;
+    fieldSortBestFirstFallbacks = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;

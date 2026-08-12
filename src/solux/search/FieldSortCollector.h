@@ -360,6 +360,57 @@ public:
     int32_t end;
   };
 
+  enum class BlockClass { COLLECT, SKIP_STRICT, SKIP_TIE };
+
+  // The block-granular skip rules shared by every pruning driver (full
+  // contract on nextCompetitiveRange): a strict bound loss always skips;
+  // a bound tie skips only for a sole-clause sort whose segdoc tie-break
+  // the block's first unseen doc loses.
+  static BlockClass classifyKeyBlock(int32_t segment, int32_t firstUnseenDoc,
+                                     int64_t best, int64_t bottomKey,
+                                     segdoc bottomDoc, bool soleSort) {
+    if (best > bottomKey) return BlockClass::SKIP_STRICT;
+    if (best == bottomKey && soleSort
+        && segdoc(segment, firstUnseenDoc) >= bottomDoc) {
+      return BlockClass::SKIP_TIE;
+    }
+    return BlockClass::COLLECT;
+  }
+
+  // Driver-facing form: classify against the current heap bottom.
+  BlockClass classifyBlock(int32_t segment, int32_t firstUnseenDoc,
+                           int64_t best,
+                           FieldComparator::KeyBatch* batch) const {
+    assert(heapFull());
+    return classifyKeyBlock(segment, firstUnseenDoc, best,
+                            batch->slotKeys[pq.top().slot], pq.top().doc,
+                            soleColumn != nullptr);
+  }
+
+  bool heapFull() const {
+    return topCount > 0 && pq.size() == (size_t)topCount;
+  }
+
+  struct KeyBlockPlan {
+    FieldComparator::KeyBatch* batch = nullptr;
+    int32_t blockSize = 0;
+    int64_t blockCount = 0;
+  };
+
+  // Non-null batch only when ranking is active and the sole primary clause
+  // offers order-independent masked block gathers (dense single-valued
+  // numeric column) with block bounds.
+  KeyBlockPlan maskedKeyBlockPlan() {
+    KeyBlockPlan plan;
+    FieldComparator::KeyBatch* batch;
+    if (topCount > 0 && !disableKeyGatherForTests && soleColumn != nullptr
+        && (batch = soleColumn->keyBatch()) != nullptr
+        && batch->supportsMaskedBlockGather() && batch->keyBlockSize() != 0) {
+      plan = {batch, batch->keyBlockSize(), batch->keyBlockCount()};
+    }
+    return plan;
+  }
+
   // Competitive-range source for pruned collection. Returns the next doc range
   // at or after `from` that the primary clause's block key bounds cannot prove
   // noncompetitive. begin == PostingsReader::END means no remaining doc in this
@@ -400,11 +451,11 @@ public:
     bool soleSort = clauses.size() == 1;
     int32_t doc = from;
     for (; block < blockCount; block++) {
-      int64_t best = batch->blockBestKey(block);
-      bool skip = best > bottomKey
-          || (best == bottomKey && soleSort
-              && segdoc(segment, doc) >= bottomDoc);
-      if (!skip) break;
+      if (classifyKeyBlock(segment, doc, batch->blockBestKey(block),
+                           bottomKey, bottomDoc, soleSort)
+          == BlockClass::COLLECT) {
+        break;
+      }
       skipCount(SkipStats::fieldSortBlocksSkipped);
       doc = blockEnd(block, blockSize);
     }
@@ -414,11 +465,14 @@ public:
   }
 
   // Attribution only (no-op unless SkipStats::enabled): count blocks whose
-  // best key strictly undercuts the final bottom. Any correct bound-driven
-  // traversal must inspect these blocks, in every visit order - the gap
-  // between this and fieldSortCompetitiveRanges is what reordering could
-  // save. Call after a segment's collection completes.
-  void recordSegmentSkipStats() {
+  // best key strictly undercuts the final bottom (fieldSortIrreducibleBlocks)
+  // and blocks a fresh traversal at the final bottom would still have to
+  // collect under the full tie rules (fieldSortRequiredBlocks, the
+  // equality-aware operational floor). Any correct bound-driven traversal
+  // must inspect these blocks, in every visit order - the gap between the
+  // visited-block counters and these is what reordering can save. Call after
+  // a segment's collection completes.
+  void recordSegmentSkipStats(int32_t segment) {
     if (!SkipStats::enabled || topCount == 0
         || pq.size() < (size_t)topCount || disableKeyGatherForTests) {
       return;
@@ -429,10 +483,19 @@ public:
         || batch->keyBlockSize() == 0) {
       return;
     }
+    int32_t blockSize = batch->keyBlockSize();
     int64_t bottomKey = batch->slotKeys[pq.top().slot];
+    segdoc bottomDoc = pq.top().doc;
+    bool soleSort = clauses.size() == 1;
     for (int64_t block = 0, n = batch->keyBlockCount(); block < n; block++) {
-      if (batch->blockBestKey(block) < bottomKey) {
+      int64_t best = batch->blockBestKey(block);
+      if (best < bottomKey) {
         SkipStats::fieldSortIrreducibleBlocks++;
+      }
+      if (classifyKeyBlock(segment, (int32_t)(block * (int64_t)blockSize),
+                           best, bottomKey, bottomDoc, soleSort)
+          == BlockClass::COLLECT) {
+        SkipStats::fieldSortRequiredBlocks++;
       }
     }
   }
@@ -449,9 +512,6 @@ public:
 
     hitCount += (int64_t)docs.size();
     if (topCount == 0) return;
-    if (SkipStats::enabled) {
-      SkipStats::fieldSortDocsGathered += (int64_t)docs.size();
-    }
 
     size_t i = 0;
     while (i < docs.size()) {
@@ -460,36 +520,66 @@ public:
       batch->gatherKeys(
           docs.subspan(chunkStart, chunkEnd - chunkStart),
           std::span<int64_t>(keys, chunkEnd - chunkStart));
-
-      while (i < chunkEnd && pq.size() < (size_t)topCount) {
-        int32_t slot = (int32_t)pq.size();
-        ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
-        batch->slotKeys[slot] = keys[i - chunkStart];
-        pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
-        recordAdmission(docs.size(), i);
-        i++;
+      // Gathered-doc accounting advances per chunk so recordAdmission's
+      // chunk-relative arithmetic stays doc-precise.
+      if (SkipStats::enabled) {
+        SkipStats::fieldSortDocsGathered += (int64_t)(chunkEnd - chunkStart);
       }
-      if (i == chunkEnd) continue;
-
-      int64_t bottomKey = batch->slotKeys[pq.top().slot];
-      for (; i < chunkEnd; i++) {
-        int64_t key = keys[i - chunkStart];
-        segdoc doc(segment, docs[i]);
-        if (key > bottomKey) continue;
-        if (key == bottomKey && doc >= pq.top().doc) continue;
-
-        SortDoc& bottom = pq.top();
-        int32_t slot = bottom.slot;
-        batch->slotKeys[slot] = key;
-        bottom = SortDoc(doc, 0.0f, slot);
-        pq.updateTop();
-        bottomKey = batch->slotKeys[pq.top().slot];
-        recordAdmission(docs.size(), i);
-      }
+      admitChunk(segment, docs.subspan(chunkStart, chunkEnd - chunkStart),
+                 std::span<const int64_t>(keys, chunkEnd - chunkStart), batch);
+      i = chunkEnd;
     }
   }
 
+  // Admit an already-gathered (docs, keys) batch. Docs ascend within a batch;
+  // batches may arrive in any block order (segdoc is the tie key, and the
+  // admission rules are order-independent).
+  void admitGathered(int32_t segment, std::span<const int32_t> docs,
+                     std::span<const int64_t> keys,
+                     FieldComparator::KeyBatch* batch) {
+    hitCount += (int64_t)docs.size();
+    if (topCount == 0) return;
+    if (SkipStats::enabled) {
+      SkipStats::fieldSortDocsGathered += (int64_t)docs.size();
+    }
+    admitChunk(segment, docs, keys, batch);
+  }
+
 private:
+  // Warmup fill then bottom-gated replacement over one gathered chunk.
+  // Shared by the in-order window path (which gathers keys per chunk) and
+  // the masked block driver (which gathers fused with the domain bits).
+  void admitChunk(int32_t segment, std::span<const int32_t> docs,
+                  std::span<const int64_t> keys,
+                  FieldComparator::KeyBatch* batch) {
+    size_t i = 0;
+    while (i < docs.size() && pq.size() < (size_t)topCount) {
+      int32_t slot = (int32_t)pq.size();
+      ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
+      batch->slotKeys[slot] = keys[i];
+      pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
+      recordAdmission(docs.size(), i);
+      i++;
+    }
+    if (i == docs.size()) return;
+
+    int64_t bottomKey = batch->slotKeys[pq.top().slot];
+    for (; i < docs.size(); i++) {
+      int64_t key = keys[i];
+      segdoc doc(segment, docs[i]);
+      if (key > bottomKey) continue;
+      if (key == bottomKey && doc >= pq.top().doc) continue;
+
+      SortDoc& bottom = pq.top();
+      int32_t slot = bottom.slot;
+      batch->slotKeys[slot] = key;
+      bottom = SortDoc(doc, 0.0f, slot);
+      pq.updateTop();
+      bottomKey = batch->slotKeys[pq.top().slot];
+      recordAdmission(docs.size(), i);
+    }
+  }
+
   // Attribution only: the gathered-doc index of this heap change, doc-precise
   // (fieldSortDocsGathered was bumped for the whole window on entry).
   static void recordAdmission(size_t windowSize, size_t i) {

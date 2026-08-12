@@ -767,6 +767,108 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   }
 }
 
+// Best-first exact-domain field-sort driver. The whole domain is known up
+// front - a bitset (cached filter or liveDocs), or every doc when
+// domainWords is empty (match-all, no deletes) - so no scorer runs: key
+// blocks are visited in ascending bound order, each block's in-domain docs
+// admitted through the comparator's fused masked gather. Bound order makes
+// termination a proof - once the heap head classifies SKIP_STRICT against
+// the current bottom, no remaining block can contribute. Equal-bound heads
+// are popped individually through the tie/segdoc rules. workCap bounds
+// pathological tie plateaus; on cap, unvisited blocks are swept forward in
+// doc order under the same classification. Every in-domain doc is gathered
+// at most once, so hitCount keeps the pruned-path semantics (counts
+// gathered docs; pruning is off when exact counts are required).
+template <typename Collector>
+void collectTopKBitSetBestFirst(int32_t segnum,
+                                std::span<const uint64_t> domainWords,
+                                Collector& collector, MemPool& pool,
+                                int64_t workCap) {
+  auto plan = collector.maskedKeyBlockPlan();
+  assert(plan.batch != nullptr);
+  using BC = typename Collector::BlockClass;
+  skipCount(SkipStats::fieldSortBestFirstActivations);
+
+  struct BoundBlock {
+    int64_t bound;
+    int64_t block;
+    bool operator>(const BoundBlock& o) const {
+      return bound != o.bound ? bound > o.bound : block > o.block;
+    }
+  };
+  std::span<BoundBlock> heap = pool.make_span<BoundBlock>(
+      (size_t)plan.blockCount);
+  for (int64_t b = 0; b < plan.blockCount; b++) {
+    heap[(size_t)b] = {plan.batch->blockBestKey(b), b};
+  }
+  auto cmp = std::greater<BoundBlock>();  // min-heap by (bound, block)
+  std::make_heap(heap.begin(), heap.end(), cmp);
+
+  std::span<uint64_t> visited =
+      pool.make_span<uint64_t>((size_t)((plan.blockCount + 63) >> 6));
+  std::fill(visited.begin(), visited.end(), 0);
+  std::span<int32_t> outDocs = pool.make_span<int32_t>((size_t)plan.blockSize);
+  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.blockSize);
+
+  auto gatherBlock = [&](int64_t block) {
+    visited[(size_t)(block >> 6)] |= 1ULL << (block & 63);
+    int32_t n = plan.batch->gatherBlockMasked(block, domainWords, outDocs,
+                                              outKeys);
+    skipCount(SkipStats::fieldSortBestFirstBlocks);
+    if (n > 0) {
+      collector.admitGathered(segnum, outDocs.first((size_t)n),
+                              outKeys.first((size_t)n), plan.batch);
+    }
+  };
+
+  int64_t visitedCount = 0;
+  size_t heapSize = heap.size();
+  while (heapSize > 0) {
+    BoundBlock top = heap[0];
+    std::pop_heap(heap.begin(), heap.begin() + heapSize, cmp);
+    heapSize--;
+    if (collector.heapFull()) {
+      auto cls = collector.classifyBlock(
+          segnum, (int32_t)(top.block * (int64_t)plan.blockSize), top.bound,
+          plan.batch);
+      if (cls == BC::SKIP_STRICT) {
+        // Heap order proves every remaining block is at least as bad; credit
+        // the head and the whole remaining heap as skipped so cross-arm
+        // skip accounting stays comparable.
+        skipCount(SkipStats::fieldSortBestFirstTerminations);
+        if (SkipStats::enabled) {
+          SkipStats::fieldSortBlocksSkipped += (int64_t)heapSize + 1;
+        }
+        return;
+      }
+      if (cls == BC::SKIP_TIE) {
+        skipCount(SkipStats::fieldSortBlocksSkipped);
+        continue;
+      }
+    }
+    gatherBlock(top.block);
+    if (++visitedCount >= workCap) break;
+  }
+  if (heapSize == 0) return;
+
+  // Work cap hit (tie plateau or adversarial bound layout): finish with one
+  // forward doc-order sweep over unvisited blocks, classifying each.
+  skipCount(SkipStats::fieldSortBestFirstFallbacks);
+  for (int64_t block = 0; block < plan.blockCount; block++) {
+    if ((visited[(size_t)(block >> 6)] >> (block & 63)) & 1) continue;
+    if (collector.heapFull()) {
+      auto cls = collector.classifyBlock(
+          segnum, (int32_t)(block * (int64_t)plan.blockSize),
+          plan.batch->blockBestKey(block), plan.batch);
+      if (cls != BC::COLLECT) {
+        skipCount(SkipStats::fieldSortBlocksSkipped);
+        continue;
+      }
+    }
+    gatherBlock(block);
+  }
+}
+
 // Rank score windows into a top-k collector. This is intentionally only a
 // ranking primitive; callers that need an exact count or materialized domain
 // compose it with countMatchesWindowed using an independent scorer supplier.

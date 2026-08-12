@@ -49,6 +49,24 @@ public:
       assert(false);
       return std::numeric_limits<int64_t>::min();
     }
+
+    // Order-independent fused block gather: extract one key block's in-domain
+    // docs and transformed keys straight from the domain bitset, without a
+    // doc-array round trip. `words` is the whole-segment bitset (word w
+    // covers docs [64w, 64w+64)); an EMPTY span means no mask - every doc in
+    // the block (match-all with no deletes). Blocks may be requested in ANY
+    // order - only comparators with no forward-only cursor (dense
+    // single-valued) offer this. outDocs/outKeys must hold keyBlockSize()
+    // entries. Returns the number gathered.
+    virtual bool supportsMaskedBlockGather() const { return false; }
+    virtual int32_t gatherBlockMasked(int64_t block,
+                                      std::span<const uint64_t> words,
+                                      std::span<int32_t> outDocs,
+                                      std::span<int64_t> outKeys) {
+      unused(block, words, outDocs, outKeys);
+      assert(false);
+      return 0;
+    }
   };
 
   virtual ~FieldComparator() = default;
@@ -298,6 +316,76 @@ public:
     } else {
       gatherDenseSingle(docs, keys);
     }
+  }
+
+  // Dense single-valued only: doc == value rank and no forward-only landing
+  // cursor, so blocks can be gathered in any order.
+  bool supportsMaskedBlockGather() const override {
+    return keyBlockSize() != 0;
+  }
+
+  int32_t gatherBlockMasked(int64_t block, std::span<const uint64_t> words,
+                            std::span<int32_t> outDocs,
+                            std::span<int64_t> outKeys) override {
+    assert(keyBlockSize() != 0);
+    int64_t blockStart = block * (int64_t)NumColumnFormat::BLOCK_SIZE;
+    if (words.empty()) {
+      // No mask: every doc in the block (dense single-valued, doc == rank).
+      int64_t blockLimit = std::min(blockStart + NumColumnFormat::BLOCK_SIZE,
+                                    reader->numValues());
+      int32_t out = 0;
+      for (int64_t frameStart = blockStart; frameStart < blockLimit;
+           frameStart += NumColumn::BULK_SIZE) {
+        if (decodedStart != frameStart) {
+          uint32_t count;
+          decodedStart =
+              reader->decodeValueSubBlock((int32_t)frameStart, decoded, count);
+          decodedEnd = decodedStart + count;
+        }
+        int64_t frameEnd = std::min(frameStart + NumColumn::BULK_SIZE,
+                                    blockLimit);
+        for (int64_t doc = frameStart; doc < frameEnd; doc++) {
+          outDocs[(size_t)out] = (int32_t)doc;
+          outKeys[(size_t)out] = transformPresent(decoded[doc - decodedStart]);
+          out++;
+        }
+      }
+      return out;
+    }
+    int64_t blockLimit = std::min(blockStart + NumColumnFormat::BLOCK_SIZE,
+                                  (int64_t)words.size() * 64);
+    int32_t out = 0;
+    for (int64_t frameStart = blockStart; frameStart < blockLimit;
+         frameStart += NumColumn::BULK_SIZE) {
+      size_t w0 = (size_t)(frameStart >> 6);
+      size_t wEnd = std::min(w0 + NumColumn::BULK_SIZE / 64, words.size());
+      int32_t frameCard = 0;
+      for (size_t w = w0; w < wEnd; w++) {
+        frameCard += (int32_t)std::popcount(words[w]);
+      }
+      if (frameCard == 0) continue;
+      bool useDecoded = frameCard >= (int32_t)FRAME_DECODE_MIN;
+      if (useDecoded && decodedStart != frameStart) {
+        uint32_t count;
+        decodedStart =
+            reader->decodeValueSubBlock((int32_t)frameStart, decoded, count);
+        decodedEnd = decodedStart + count;
+      }
+      for (size_t w = w0; w < wEnd; w++) {
+        uint64_t bits = words[w];
+        int32_t base = (int32_t)(w << 6);
+        while (bits != 0) {
+          int32_t doc = base + std::countr_zero(bits);
+          bits &= bits - 1;
+          outDocs[(size_t)out] = doc;
+          outKeys[(size_t)out] = transformPresent(
+              useDecoded ? decoded[doc - decodedStart]
+                         : pointValues->valueAt(doc));
+          out++;
+        }
+      }
+    }
+    return out;
   }
 
   virtual int64_t getDocValue(int32_t docid) {

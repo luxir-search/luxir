@@ -627,7 +627,71 @@ public:
                                         (int64_t)collectorFilter->card());
             }
             bool usedBulk = false;
-            if (!disableFieldSortBulk && !data->fieldCollector->needsScores) {
+            // Best-first exact-domain route: when the whole result set is
+            // already a materialized BITSET, no scorer needs to run - the
+            // driver visits key blocks in bound order and terminates on
+            // proof. Two domain sources qualify: the supplier's exact cached
+            // set (a folded filter-only Boolean over match-all, no other
+            // filter or sub-op domain restriction), or an explicit
+            // collectorFilter under a true match-all weight. Activation also
+            // requires the expected visit floor (ceil(k/d) blocks) to be
+            // sub-saturating; at ceil(k/d) >= blockCount the bound floor
+            // covers every block and bound order cannot beat doc order.
+            if (allowSortPruning && !disableFieldSortBestFirst
+                && !requiresPreparePhase
+                && !data->fieldCollector->needsScores
+                && !data->fieldCollector->hasExpr
+                && data->fieldCollector->topCount > 0) {
+              DocSet* domainSet = nullptr;
+              bool allDocs = false;
+              if (collectorFilter == nullptr) {
+                domainSet = supplier->exactDocSet();
+                // Match-all with no deletes and no filters: the domain is
+                // every doc (deletes would have arrived as a liveDocs
+                // domain in collectorFilter per the root domain contract).
+                allDocs =
+                    domainSet == nullptr && op.weight->matchesAllDocs();
+              } else if (op.weight->matchesAllDocs()) {
+                domainSet = collectorFilter;
+              }
+              if (allDocs
+                  || (domainSet != nullptr
+                      && domainSet->type == DocSet::BITSET)) {
+                data->fieldCollector->setSegment(
+                    segnum, &seg.postingsReader(), &poolGuard.pool(),
+                    sortSourceCost);
+                auto plan = data->fieldCollector->maskedKeyBlockPlan();
+                int64_t card =
+                    allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
+                if (plan.batch != nullptr && card > 0) {
+                  int64_t expectedFloor =
+                      (data->fieldCollector->topCount * (int64_t)seg.maxDoc()
+                       + card - 1) / card;
+                  if (expectedFloor < plan.blockCount
+                      || forceFieldSortBestFirst) {
+                    // Cap generously above the expected floor so uniform
+                    // data reaches proof termination; the forward-sweep
+                    // fallback keeps adversarial tie plateaus linear.
+                    int64_t workCap = std::min(plan.blockCount,
+                                               4 * expectedFloor + 64);
+                    std::span<const uint64_t> words;  // empty = every doc
+                    if (!allDocs) {
+                      const FixedBitSet& bits =
+                          ((BitDocSet*)domainSet)->bits();
+                      words = std::span<const uint64_t>(
+                          bits.words, FixedBitSet::sizeInWords(bits.size()));
+                    }
+                    collectTopKBitSetBestFirst(
+                        segnum, words,
+                        *data->fieldCollector, poolGuard.pool(), workCap);
+                    data->fieldCollector->recordSegmentSkipStats(segnum);
+                    usedBulk = true;
+                  }
+                }
+              }
+            }
+            if (!usedBulk && !disableFieldSortBulk
+                && !data->fieldCollector->needsScores) {
               Query::ScorerSupplier::BulkScorerContext bulkContext;
               auto plan = supplier->planBulk(
                   Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
@@ -656,7 +720,7 @@ public:
                 collectTopKMatchWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
                     *data->fieldCollector, seg.maxDoc(), allowSortPruning);
-                data->fieldCollector->recordSegmentSkipStats();
+                data->fieldCollector->recordSegmentSkipStats(segnum);
                 usedBulk = true;
               } else if (bulk != nullptr) {
                 skipCount(SkipStats::bulkBuiltThenRejected);
@@ -677,7 +741,7 @@ public:
                 }
                 collectTopK(segnum, scorer, collectorFilter, builderPtr,
                             *data->fieldCollector, allowSortPruning);
-                data->fieldCollector->recordSegmentSkipStats();
+                data->fieldCollector->recordSegmentSkipStats(segnum);
               }
             }
           } else {

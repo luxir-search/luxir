@@ -35,6 +35,15 @@ inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 inline bool disableFieldSortPruning =
     std::getenv("SOLUX_DISABLE_FIELD_SORT_PRUNING") != nullptr;
 
+// A/B baseline for the best-first exact-bitset field-sort driver. Default
+// false means eligible match-all + cached-bitset field sorts visit key
+// blocks in bound order with proof termination instead of doc order.
+inline bool disableFieldSortBestFirst =
+    std::getenv("SOLUX_DISABLE_FIELD_SORT_BEST_FIRST") != nullptr;
+// Test-only: bypass the expected-floor activation gate so small corpora
+// (too few key blocks to ever pass it) still drive the best-first arm.
+inline bool forceFieldSortBestFirst = false;
+
 // A/B baseline for exact-count score ranking. The default composes an
 // unscored exact-count pass with a competitively pruned top-k pass when the
 // query and per-segment density policy admit it.

@@ -78,6 +78,34 @@ public:
 
 using SortSkipStatsGuard = SkipStatsScope;
 
+class TopDocsFilterFoldGuard {
+  bool saved;
+
+public:
+  explicit TopDocsFilterFoldGuard(bool disabled)
+      : saved(disableTopDocsFilterFold) {
+    disableTopDocsFilterFold = disabled;
+  }
+  ~TopDocsFilterFoldGuard() { disableTopDocsFilterFold = saved; }
+};
+
+class BestFirstGuard {
+  bool savedDisable;
+  bool savedForce;
+
+public:
+  BestFirstGuard(bool disabled, bool force)
+      : savedDisable(disableFieldSortBestFirst),
+        savedForce(forceFieldSortBestFirst) {
+    disableFieldSortBestFirst = disabled;
+    forceFieldSortBestFirst = force;
+  }
+  ~BestFirstGuard() {
+    disableFieldSortBestFirst = savedDisable;
+    forceFieldSortBestFirst = savedForce;
+  }
+};
+
 struct FieldSortBulkResult {
   std::vector<std::string> ids;
   std::vector<int64_t> ints;
@@ -2375,6 +2403,146 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   EXPECT_EQ(exactExhaustive.ids, exactPruned.ids);
   EXPECT_EQ(exactExhaustive.found, exactPruned.found);
   EXPECT_EQ(exactPruned.blocksSkipped, 0);
+
+}
+
+// The best-first exact-domain driver must return exactly what the doc-order
+// windowed path and exhaustive collection return. Its bitset domain arrives
+// two ways: the folded filter-only Boolean's cached set (delete-free
+// segments only - a raw cache borrow must be live-exact), or an explicit
+// effective filter with folding disabled (which handles deletes). The corpus
+// spans multiple key blocks, a missing-value segment (sparse column declines
+// the masked plan, so segments mix arms), ties, and both directions; the
+// small block count means the expected-floor gate always declines, so the
+// force override drives the route and the gate itself is asserted once.
+TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
+  CollectionHelper helper("best_first_sort");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kDocsPerSeg = 5000;
+  int32_t docId = 0;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
+      std::string id = std::to_string(docId);
+      int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
+      std::string body = (docId & 1) == 0 ? "alpha" : "other";
+      if (seg == 1 && i % 13 == 0) {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "ties_i", (int64_t)(docId % 7),
+                             "mono_i", (int64_t)docId),
+                     UpdateMessage::NO_COMMIT);
+      } else {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "rand_i", rand,
+                             "ties_i", (int64_t)(docId % 7),
+                             "mono_i", (int64_t)docId),
+                     UpdateMessage::NO_COMMIT);
+      }
+    }
+    helper.commit();
+  }
+
+  struct Sorts {
+    std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
+  };
+  auto run = [&](bool bestFirst, bool disablePruning, bool foldFilters,
+                 const Sorts& sorts, int32_t limit, bool exactCount,
+                 std::string_view field = "body_w",
+                 std::string_view value = "alpha") {
+    BestFirstGuard bfGuard(!bestFirst, bestFirst);
+    SortPruningGuard pruningGuard(disablePruning);
+    TopDocsFilterFoldGuard foldGuard(!foldFilters);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("best_first_sort");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    cur.allQuery();
+    if (!field.empty()) cur.matchFilter("f", field, value);
+    if (exactCount) cur.getNumber();
+    for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    struct Result {
+      std::vector<std::string> ids;
+      int64_t found = 0;
+      int64_t activations = 0;
+    } result;
+    result.ids = resultIds(*req);
+    const auto* docs = req->docList("q");
+    if (docs != nullptr && docs->found) result.found = *docs->found;
+    result.activations = SkipStats::fieldSortBestFirstActivations;
+    return result;
+  };
+
+  Sorts randAsc{{{"rand_i", qb::ASC}}};
+  Sorts randDesc{{{"rand_i", qb::DESC}}};
+  Sorts tiesAsc{{{"ties_i", qb::ASC}}};
+  Sorts tiesThenRand{{{"ties_i", qb::ASC}, {"rand_i", qb::ASC}}};
+  Sorts monoAsc{{{"mono_i", qb::ASC}}};
+
+  // Two sightings admit and materialize the filter; the route serves hits.
+  run(false, true, true, randAsc, 9, false);
+  run(false, true, true, randAsc, 9, false);
+
+  for (const Sorts& sorts :
+       {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc}) {
+    for (int32_t limit : {1, 9, 987, 4500}) {
+      auto exhaustive = run(false, true, true, sorts, limit, false);
+      auto docOrder = run(false, false, true, sorts, limit, false);
+      auto bestFirst = run(true, false, true, sorts, limit, false);
+      EXPECT_EQ(exhaustive.ids, docOrder.ids)
+          << "limit=" << limit << " sort=" << sorts.clauses[0].first;
+      EXPECT_EQ(exhaustive.ids, bestFirst.ids)
+          << "limit=" << limit << " sort=" << sorts.clauses[0].first;
+      // Pure match-all: no filter at all, the empty-mask domain form.
+      auto allExhaustive = run(false, true, true, sorts, limit, false, "");
+      auto allBestFirst = run(true, false, true, sorts, limit, false, "");
+      EXPECT_EQ(allExhaustive.ids, allBestFirst.ids)
+          << "match-all limit=" << limit
+          << " sort=" << sorts.clauses[0].first;
+    }
+  }
+
+  // Route engagement and gates, proven by the activation counter.
+  EXPECT_GT(run(true, false, true, randAsc, 9, false).activations, 0);
+  // Pure match-all with no deletes rides the empty-mask domain form.
+  EXPECT_GT(run(true, false, true, randAsc, 9, false, "").activations, 0);
+  // Without the force override the expected floor saturates this corpus's
+  // two key blocks per segment, so the gate declines.
+  EXPECT_EQ(run(false, false, true, randAsc, 9, false).activations, 0);
+  // Secondary clause: no sole column, no masked plan.
+  EXPECT_EQ(run(true, false, true, tiesThenRand, 9, false).activations, 0);
+  // Exact count keeps every pruning route off and stays exact.
+  {
+    auto exact = run(true, false, true, randAsc, 9, true);
+    auto exactExh = run(false, true, true, randAsc, 9, true);
+    EXPECT_EQ(exact.activations, 0);
+    EXPECT_EQ(exact.ids, exactExh.ids);
+    EXPECT_EQ(exact.found, exactExh.found);
+  }
+  // A single-doc filter materializes as an array DocSet: representation gate.
+  run(true, false, true, randAsc, 9, false, "id_s", "42");
+  run(true, false, true, randAsc, 9, false, "id_s", "42");
+  EXPECT_EQ(run(true, false, true, randAsc, 9, false, "id_s", "42")
+                .activations, 0);
+
+  // Deletes: the folded route's raw cache borrow must decline (live-exact
+  // only), while the unfolded effective-filter route folds liveness and
+  // stays usable - and both remain correct.
+  ASSERT_TRUE(helper.deleteByIds({"42", "1000", "7003"},
+                                 UpdateMessage::COMMIT).success);
+  auto deletedExhaustive = run(false, true, true, randAsc, 987, false);
+  auto deletedFolded = run(true, false, true, randAsc, 987, false);
+  EXPECT_EQ(deletedFolded.activations, 0);
+  EXPECT_EQ(deletedExhaustive.ids, deletedFolded.ids);
+  auto deletedUnfolded = run(true, false, false, randAsc, 987, false);
+  EXPECT_GT(deletedUnfolded.activations, 0);
+  EXPECT_EQ(deletedExhaustive.ids, deletedUnfolded.ids);
+  // Pure match-all with deletes: liveDocs becomes the domain bitset per the
+  // root domain contract, so the route still activates and stays correct.
+  auto deletedAllExhaustive = run(false, true, true, randAsc, 987, false, "");
+  auto deletedAllBestFirst = run(true, false, true, randAsc, 987, false, "");
+  EXPECT_GT(deletedAllBestFirst.activations, 0);
+  EXPECT_EQ(deletedAllExhaustive.ids, deletedAllBestFirst.ids);
 }
 
 // String candidate pruning (postings-union over the competitive ord interval)
