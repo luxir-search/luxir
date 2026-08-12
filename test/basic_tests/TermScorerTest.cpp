@@ -15,6 +15,7 @@
 #include "test/SoluxTest.h"
 #include "test/TopKAssert.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
@@ -711,7 +712,8 @@ DisjunctionTopKRun runExhaustiveDisjunctionTopK(IndexReader& reader, int32_t top
     Query::Scorer* scorer = count == 1
       ? arr[0]
       : pool.make<BooleanQuery::DisjunctionScorer>(
-          pool, std::span<Query::Scorer*>(arr, (size_t) count));
+          pool, std::span<Query::Scorer*>(arr, (size_t) count),
+          singlePhaseScorersForTests(pool, (size_t)count), true);
     collectTopK(segnum, scorer, nullptr, nullptr, collector, false);
   }
 
@@ -869,7 +871,8 @@ DisjunctionTopKRun runExhaustiveTermDisjunctionTopK(IndexReader& reader,
     Query::Scorer* scorer = count == 1
       ? arr[0]
       : pool.make<BooleanQuery::DisjunctionScorer>(
-          pool, std::span<Query::Scorer*>(arr, (size_t) count));
+          pool, std::span<Query::Scorer*>(arr, (size_t) count),
+          singlePhaseScorersForTests(pool, (size_t)count), true);
     collectTopK(segnum, scorer, nullptr, nullptr, collector, false);
   }
 
@@ -1586,7 +1589,8 @@ DisjunctionTopKRun runFilteredExhaustiveTermDisjunctionTopK(
     Query::Scorer* scorer = count == 1
       ? arr[0]
       : pool.make<BooleanQuery::DisjunctionScorer>(
-          pool, std::span<Query::Scorer*>(arr, (size_t) count));
+          pool, std::span<Query::Scorer*>(arr, (size_t) count),
+          singlePhaseScorersForTests(pool, (size_t)count), true);
     auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
                                             arrayDocSet, liveOnly);
     collectTopK(segnum, scorer, filter.get(), nullptr, collector, false);
@@ -1705,7 +1709,8 @@ DisjunctionTopKRun runMandOptSupplierTopK(IndexReader& reader,
                           segments[segnum].maxDoc(), allowPruning);
       continue;
     }
-    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    auto* scorer = buildScorerForTests(
+        pool, *supplier, std::numeric_limits<int64_t>::max());
     if (scorer != nullptr) {
       collectTopK(segnum, scorer, filter.get(), nullptr, collector, allowPruning,
                   allowPruning ? &accumulator : nullptr);
@@ -1766,7 +1771,8 @@ std::vector<WindowScore> exhaustiveWindowScores(IndexReader& reader,
   Query::Scorer* scorer = count == 1
     ? arr[0]
     : pool.make<BooleanQuery::DisjunctionScorer>(
-        pool, std::span<Query::Scorer*>(arr, (size_t) count));
+        pool, std::span<Query::Scorer*>(arr, (size_t) count),
+        singlePhaseScorersForTests(pool, (size_t)count), true);
   int32_t doc = scorer->docId() < minDoc ? scorer->advance(minDoc) : scorer->docId();
   while (doc < maxDoc) {
     scores.push_back({doc, scorer->score()});
@@ -2173,7 +2179,9 @@ Query::Scorer* createMsmScorer(MemPool& pool, std::span<Query::Weight*> weights,
   std::span<Query::Scorer*> span(arr, (size_t) count);
   if (count == minMatch) {
     auto costs = pool.make_span<int64_t>((size_t) count);
-    return pool.make<BooleanQuery::ConjunctionScorer>(pool, span, costs, span, true);
+    return pool.make<BooleanQuery::ConjunctionScorer>(
+        pool, span, costs,
+        singlePhaseScorersForTests(pool, (size_t)count), span, true, true);
   }
   if (wand) {
     return pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
@@ -4051,7 +4059,8 @@ TEST_F(TermScorerTest, mandOptBulkZeroAndOneSurvivingOptionalScorers) {
   auto* seg0Supplier = weight->scorerSupplier(pool, segments[0]);
   ASSERT_NE(seg0Supplier, nullptr);
   EXPECT_EQ(seg0Supplier->bulkScorer(pool), nullptr);
-  auto* seg0Scorer = seg0Supplier->get(pool, std::numeric_limits<int64_t>::max());
+  auto* seg0Scorer = buildScorerForTests(
+      pool, *seg0Supplier, std::numeric_limits<int64_t>::max());
   ASSERT_NE(seg0Scorer, nullptr);
   EXPECT_EQ(collectDocIds(seg0Scorer), std::vector<int32_t>({0}));
 
@@ -4303,7 +4312,8 @@ TEST_F(TermScorerTest, mandOptKeepsThetaOutOfMandatoryTermScorer) {
       EXPECT_GT(SkipStats::mandOptBulkWindowSkips, 0);
     } else {
       auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
-          supplier->get(pool, std::numeric_limits<int64_t>::max()));
+          buildScorerForTests(
+              pool, *supplier, std::numeric_limits<int64_t>::max()));
       ASSERT_NE(scorer, nullptr);
       scorer->setMinCompetitiveScore(100.0f);
       EXPECT_EQ(scorer->next(), PostingsReader::END);
@@ -4468,7 +4478,8 @@ TEST_F(TermScorerTest, disjunctionBoundsAreFiniteConservativeAndRefinable) {
     ASSERT_NE(scorers[t], nullptr);
   }
   auto* disj = testIndex.pool.make<BooleanQuery::DisjunctionScorer>(
-      testIndex.pool, std::span<Query::Scorer*>(scorers, termNames.size()));
+      testIndex.pool, std::span<Query::Scorer*>(scorers, termNames.size()),
+      singlePhaseScorersForTests(testIndex.pool, termNames.size()), true);
 
   int32_t target = Postings::DOCS_BLOCK_SIZE + 5;
   int32_t upTo = disj->advanceShallow(target);
@@ -7200,10 +7211,10 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
   auto* supplierA = filterA.createWeight(context, 0)->scorerSupplier(pool, segment);
   auto* supplierB = filterB.createWeight(context, 0)->scorerSupplier(pool, segment);
   auto scorers = pool.make_span<Query::Scorer*>(2);
-  scorers[0] = supplierA->get(pool, std::numeric_limits<int64_t>::max());
-  scorers[1] = supplierB->get(pool, std::numeric_limits<int64_t>::max());
-  ASSERT_TRUE(scorers[0]->supportsWindowFilter());
-  ASSERT_TRUE(scorers[1]->supportsWindowFilter());
+  scorers[0] = buildScorerForTests(
+      pool, *supplierA, std::numeric_limits<int64_t>::max());
+  scorers[1] = buildScorerForTests(
+      pool, *supplierB, std::numeric_limits<int64_t>::max());
   WindowFilter filter(pool, scorers);
 
   EXPECT_EQ(filter.prepare(1, 6), 0);
@@ -7501,8 +7512,8 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
       collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
                           segment.maxDoc(), true);
     } else if (supplier != nullptr) {
-      auto* scorer = supplier->get(
-          pool, std::numeric_limits<int64_t>::max());
+      auto* scorer = buildScorerForTests(
+          pool, *supplier, std::numeric_limits<int64_t>::max());
       if (scorer != nullptr) {
         collectTopK(0, scorer, nullptr, nullptr, collector, true);
       }
@@ -7932,7 +7943,8 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
               nullptr);
     auto* scorer = supplier == nullptr
         ? nullptr
-        : supplier->get(pool, std::numeric_limits<int64_t>::max());
+        : buildScorerForTests(
+              pool, *supplier, std::numeric_limits<int64_t>::max());
     EXPECT_NE(dynamic_cast<BooleanQuery::ConjunctionScorer*>(scorer), nullptr);
     TopDocsCollector collector(20);
     if (scorer != nullptr) {

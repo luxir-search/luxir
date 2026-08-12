@@ -224,11 +224,13 @@ public:
     auto* standaloneSupplier = groupWeight->scorerSupplier(pool, segment);
     ASSERT_NE(standaloneSupplier, nullptr);
     EXPECT_NE(dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(
-                  standaloneSupplier->get(pool, std::numeric_limits<int64_t>::max())),
+                  buildScorerForTests(
+                      pool, *standaloneSupplier,
+                      std::numeric_limits<int64_t>::max())),
               nullptr);
     auto* drivenSupplier = groupWeight->scorerSupplier(pool, segment);
     ASSERT_NE(drivenSupplier, nullptr);
-    auto* driven = drivenSupplier->get(pool, 1);
+    auto* driven = buildScorerForTests(pool, *drivenSupplier, 1);
     auto* plain = dynamic_cast<BooleanQuery::DisjunctionScorer*>(driven);
     ASSERT_NE(plain, nullptr);
     EXPECT_EQ(2, plain->flatDisjunctionScorers().size());

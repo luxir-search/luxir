@@ -9,6 +9,7 @@
 
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/PrefixQuery.h"
 #include "solux/query/QueryPrep.h"
@@ -322,7 +323,7 @@ TEST_F(MultiTermScorerModesTest, stateBudgetSpillsToEager) {
     EXPECT_EQ(0u, weight->expansionMemoRetainedStatesForTests(
         ctx.topReader.segments()[0]));
     auto* second = dynamic_cast<MultiTermQuery::Scorer*>(
-        supplier->get(ti.pool, 1));
+        buildScorerForTests(ti.pool, *supplier, 1));
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(scorer->bitWordsForTests(), second->bitWordsForTests());
     EXPECT_EQ(1, SkipStats::multitermExpansions);
@@ -356,7 +357,8 @@ TEST_F(MultiTermScorerModesTest, drivenSupplierSelection) {
     auto* supplier =
         weight->scorerSupplier(ti.pool, ctx.topReader.segments()[0]);
     ASSERT_NE(supplier, nullptr);
-    auto* scorer = supplier->get(ti.pool, 100);  // driven: finite leadCost
+    auto* scorer = buildScorerForTests(
+        ti.pool, *supplier, 100);  // driven: finite candidates
     ASSERT_NE(scorer, nullptr);
     EXPECT_EQ(lazy, dynamic_cast<UnionLazyScorer*>(scorer) != nullptr)
         << "flags=" << flags;
@@ -507,14 +509,14 @@ TEST_F(MultiTermScorerModesTest,
     EXPECT_EQ(expectBitset ? 0u : 2u,
               weight->expansionMemoRetainedStatesForTests(segment));
     auto* first = dynamic_cast<MultiTermQuery::Scorer*>(
-        firstSupplier->get(ti.pool, 1));
+        buildScorerForTests(ti.pool, *firstSupplier, 1));
     ASSERT_NE(first, nullptr);
 
     auto* secondSupplier = weight->scorerSupplier(ti.pool, segment);
     ASSERT_NE(secondSupplier, nullptr);
     EXPECT_FALSE(secondSupplier->fillExpansionMemo(buildContext));
     auto* second = dynamic_cast<MultiTermQuery::Scorer*>(
-        secondSupplier->get(ti.pool, 1));
+        buildScorerForTests(ti.pool, *secondSupplier, 1));
     ASSERT_NE(second, nullptr);
     auto* third = dynamic_cast<MultiTermQuery::Scorer*>(
         weight->createScorer(ti.pool, segment));
@@ -644,7 +646,6 @@ TEST_F(MultiTermScorerModesTest, eagerWindowFillCopiesUnalignedMaskedRange) {
 
   DenseFillGuard denseFillGuard(false);
   MultiTermQuery::Scorer scorer(bits, maxDoc, 1.0f);
-  ASSERT_TRUE(scorer.supportsWindowFilter());
   EXPECT_EQ(nullptr, scorer.windowFilterProbeDocsEnum());
 
   constexpr int32_t windowStart = 61;
@@ -661,9 +662,6 @@ TEST_F(MultiTermScorerModesTest, eagerWindowFillCopiesUnalignedMaskedRange) {
         << "relative=" << relative;
   }
 
-  DenseFillGuard disabledGuard(true);
-  MultiTermQuery::Scorer disabledScorer(bits, maxDoc, 1.0f);
-  EXPECT_FALSE(disabledScorer.supportsWindowFilter());
 }
 
 // firstDocLowerBound is a lower bound for every term and exact below the

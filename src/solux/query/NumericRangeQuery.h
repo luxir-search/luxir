@@ -90,7 +90,6 @@ public:
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
         lo(lo), hi(hi), allMatch(allMatch), multi(reader.multiValued()) {}
 
-    bool hasTwoPhase() const override { return true; }
     int32_t approximationNext() override {
       docid = iter.next();
       return docid;
@@ -123,7 +122,6 @@ public:
       return docid;
     }
     int32_t docId() override { return docid; }
-    bool supportsWindowFilter() const override { return true; }
   };
 
   enum class BlockRelation : uint8_t {
@@ -412,7 +410,6 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    bool supportsWindowFilter() const override { return true; }
 
   protected:
     // The current iteration window is behind docid, so emptying the doc
@@ -788,9 +785,7 @@ public:
         return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
       }
 
-      static Query::ScorerShape shapeFor(
-          ScorerArm arm, const Query::PlanContext& planContext) {
-        if (planContext.numericRangeDisableShapesForTests) return {};
+      static Query::ScorerShape shapeFor(ScorerArm arm) {
         bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
             || arm == ScorerArm::SCAN;
         return {
@@ -857,7 +852,7 @@ public:
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost, ScorerArm arm,
              uint64_t loPos, uint64_t hiPos, bool complement)
-          : Query::ScorerPlan(supplier, planContext, shape, cost),
+          : Query::ScorerPlan(planContext, shape, cost),
             supplier(supplier), arm(arm), loPos(loPos), hiPos(hiPos),
             complement(complement) {}
       };
@@ -962,8 +957,9 @@ public:
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
+        if (buildContext.numericRangeDisableShapesForTests) return {};
         ScorerArm arm = selectScorerArm(buildContext.demand);
-        return shapeFor(arm, buildContext);
+        return shapeFor(arm);
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -999,16 +995,17 @@ public:
           complement = useComplement(end - begin);
         }
         return planPool.make<Plan>(
-            *this, planContext, shapeFor(arm, planContext), cost(), arm,
+            *this, planContext, shapeFor(arm), cost(), arm,
             begin, end, complement);
       }
 
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        Query::PlanContext planContext =
-            Query::PlanContext::fromLeadCost(leadCost);
-        planContext.numericRangeDisableShapesForTests =
+      Query::PlanContext makePlanContext(
+          const Query::Demand& demand) const override {
+        Query::PlanContext context;
+        context.demand = demand;
+        context.numericRangeDisableShapesForTests =
             NumericRangeQuery::disableShapesForTests;
-        return resolve(targetPool, planContext)->build(targetPool);
+        return context;
       }
 
       BulkPlan planBulk(
@@ -1125,8 +1122,11 @@ public:
     Query::Scorer* createScorer(MemPool& targetPool,
                                 IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
-      return supplier == nullptr ? nullptr
-          : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+      if (supplier == nullptr) return nullptr;
+      Query::Demand demand = Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max());
+      return supplier->resolve(
+          targetPool, supplier->makePlanContext(demand))->build(targetPool);
     }
 
     Query::Scorer* createPointsScorerForTests(MemPool& targetPool,

@@ -96,7 +96,6 @@ TEST_F(ExecutionHierarchyTest, allPlanSnapshotsDenseControlAtSupplierCreation) {
   AllQuery::disableDenseClauseForTests = true;
   auto* scorer = plan->build(pool);
   ASSERT_NE(nullptr, scorer);
-  EXPECT_TRUE(scorer->supportsWindowFilter());
   EXPECT_EQ(Query::ClauseShape::DIRECT,
             plan->shape().windowFillClause);
 }

@@ -36,7 +36,11 @@ inline Query::Scorer* createScorer(MemPool& targetPool,
                                    Query::SegmentSource& source) {
   auto* supplier = source.scorerSupplier(targetPool, segment);
   if (supplier == nullptr) return nullptr;
-  return supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+  Query::Demand demand = Query::Demand::fromLeadCost(
+      std::numeric_limits<int64_t>::max());
+  Query::ScorerPlan* plan = supplier->resolve(
+      targetPool, supplier->makePlanContext(demand));
+  return plan->build(targetPool);
 }
 
 // Owning prepare result for a child query. If prepared is null, the original
@@ -183,8 +187,6 @@ public:
 
   int32_t docId() override { return doc; }
 
-  bool supportsWindowFilter() const override { return true; }
-
   // Window fills OR membership into caller-owned scratch; the caller clears
   // separate clause scratch and ANDs across conjunctive scorers. The array
   // resume cursor requires windows to arrive in nondecreasing order.
@@ -239,7 +241,7 @@ class DocSetSupplier final : public Query::ScorerSupplier {
     Plan(DocSetSupplier& supplier,
          const Query::PlanContext& planContext,
          const Query::ScorerShape& shape, int64_t cost)
-      : Query::ScorerPlan(supplier, planContext, shape, cost),
+      : Query::ScorerPlan(planContext, shape, cost),
         supplier(supplier) {}
   };
 
@@ -346,7 +348,11 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
       return builder.build();
     }
 
-    auto* scorer = supplier->get(scratch, std::numeric_limits<int64_t>::max());
+    Query::Demand demand = Query::Demand::fromLeadCost(
+        std::numeric_limits<int64_t>::max());
+    Query::ScorerPlan* scorerPlan = supplier->resolve(
+        scratch, supplier->makePlanContext(demand));
+    auto* scorer = scorerPlan->build(scratch);
     if (scorer == nullptr) {
       return builder.build();
     }

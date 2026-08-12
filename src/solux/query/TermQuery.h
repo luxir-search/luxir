@@ -196,7 +196,7 @@ public:
       public:
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost)
-          : Query::ScorerPlan(supplier, planContext, shape, cost),
+          : Query::ScorerPlan(planContext, shape, cost),
             supplier(supplier) {}
       };
 
@@ -233,19 +233,6 @@ public:
           const Query::PlanContext& planContext) override {
         return planPool.make<Plan>(
             *this, planContext, describeScorer(planContext), cost());
-      }
-
-      Query::Scorer* getIndependent(solux::MemPool& targetPool,
-                                    int64_t leadCost) override {
-        Query::PlanContext planContext =
-            Query::PlanContext::fromLeadCost(leadCost);
-        return resolve(targetPool, planContext)->buildIndependent(targetPool);
-      }
-
-      DocsOnlyEnum* getDocsOnly(MemPool& targetPool) override {
-        Query::PlanContext planContext = Query::PlanContext::fromLeadCost(
-            std::numeric_limits<int64_t>::max());
-        return resolve(targetPool, planContext)->buildDocsOnly(targetPool);
       }
 
       ScoreBlockFillKind scoreBlockFillKind() const noexcept override {
@@ -824,10 +811,6 @@ public:
         return;
       }
       docsEnum.intoBitSet(windowBits, windowStart, windowEnd);
-    }
-
-    bool supportsWindowFilter() const override {
-      return true;
     }
 
     DocsFreqEnum* windowFilterProbeDocsEnum() override {

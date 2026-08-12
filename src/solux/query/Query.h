@@ -187,7 +187,8 @@ public:
 //       weights set NEEDS_PREPARE from child traits and recursively prepare
 //       children, threading per-segment domains down.
 //    b. scorerSupplier(targetPool, segment): called as needed for a segment,
-//       often from parallel tasks.  The supplier's get() creates the Scorer.
+//       often from parallel tasks.  The supplier resolves a plan token, whose
+//       build() creates the Scorer.
 //
 //    Because (a) and (b) can run on worker threads, they MUST NOT allocate from
 //    Context::pool or populate/mutate the Context caches (both are
@@ -447,6 +448,7 @@ public:
     bool numericRangeDisableShapesForTests = false;
     bool disableBooleanTwoPhaseForTests = false;
     bool disableDisjunctionTwoPhaseForTests = false;
+    bool disableMandNotTwoPhaseForTests = false;
     bool disableFilteredUnionWandForTests = false;
 
     static PlanContext fromLeadCost(
@@ -594,7 +596,7 @@ public:
     /// lead iterators before creating scorers.
     virtual int64_t cost() = 0;
 
-    /// Pure description of the scorer returned by get() for this exact build
+    /// Pure description of the scorer returned by resolve() for this exact build
     /// context. Implementations must not construct scorers, increment counters,
     /// or allocate from the target pool while answering.
     virtual ScorerShape describeScorer(
@@ -606,6 +608,15 @@ public:
     /// Resolve one exact construction arm into a pool-owned affine token.
     virtual ScorerPlan* resolve(
         MemPool& planPool, const PlanContext& planContext) = 0;
+
+    /// Snapshot supplier-family controls for a top-level pull resolve. Parents
+    /// that compute child Demand construct and pass the full PlanContext
+    /// directly; standalone consumers use this factory before resolve().
+    virtual PlanContext makePlanContext(const Demand& demand) const {
+      PlanContext context;
+      context.demand = demand;
+      return context;
+    }
 
     /// Attribute a shape uncertainty to the supplier family that must resolve
     /// it. Compound and transparent wrapper suppliers should delegate to the
@@ -640,41 +651,7 @@ public:
       return nullptr;
     }
 
-    /// Create the scorer. leadCost is the estimated cost of the parent-selected
-    /// lead iterator that will drive this scorer, or INT64_MAX when there is no
-    /// lead constraint. Suppliers may use it to choose eager vs lazy setup.
-    virtual Query::Scorer* get(MemPool& targetPool, int64_t leadCost);
-
-    /// Context-carrying transition bridge for callers that already know a
-    /// bulk horizon. Unlike the scalar compatibility overload, this always
-    /// resolves and consumes the recorded plan.
-    Query::Scorer* get(
-        MemPool& targetPool, const PlanContext& planContext);
-
-    /// Create an additional scorer with iterator state independent of get().
-    /// Suppliers that cannot cheaply reproduce their scorer leave this
-    /// unsupported.
-    virtual Query::Scorer* getIndependent(MemPool& targetPool,
-                                          int64_t leadCost) {
-      unused(targetPool, leadCost);
-      return nullptr;
-    }
-
-    Query::Scorer* getIndependent(
-        MemPool& targetPool, const PlanContext& planContext);
-
-    // Create an independent docs-only postings cursor when this supplier is a
-    // direct term. Exact compound counts use this capability to avoid routing
-    // membership through a frequency-capable scorer.
-    virtual DocsOnlyEnum* getDocsOnly(MemPool& targetPool) {
-      unused(targetPool);
-      return nullptr;
-    }
-
-    DocsOnlyEnum* getDocsOnly(
-        MemPool& targetPool, const PlanContext& planContext);
-
-    /// How get() implements fillScoreBlock(). This is an execution-cost
+    /// How the resolved scorer implements fillScoreBlock(). This is an execution-cost
     /// capability, not a correctness requirement. DEFAULT_SCALAR means the
     /// scorer may use Scorer's next()+score() loop; BLOCK_ITERATION means it
     /// amortizes postings iteration over blocks even if score calculation
@@ -1188,8 +1165,8 @@ public:
     /// doc we are positioned on
     virtual int32_t docId() = 0;
     /// Iteration contract: a consumer picks exactly one protocol for a scorer
-    /// lifetime. Exact iteration uses next()/advance(). If hasTwoPhase() is
-    /// true, private two-phase iteration instead drives
+    /// lifetime. Exact iteration uses next()/advance(). A plan that selects
+    /// private two-phase iteration instead drives
     /// approximation*()+matches(), while external two-phase iteration drives
     /// every enum returned by approximationEnums() and calls matchesAt(). The
     /// protocols must not be mixed. A non-empty approximationEnums() exposes
@@ -1203,9 +1180,6 @@ public:
     /// must be idempotent for the current doc, or the consumer must call it at
     /// most once per approximation doc. score() is only valid after a
     /// successful match.
-    virtual bool hasTwoPhase() const {
-      return false;
-    }
     virtual int32_t approximationNext() {
       return next();
     }
@@ -1238,14 +1212,8 @@ public:
     virtual std::span<Scorer*> flatConjunctionScorers() {
       return {};
     }
-    /// Whether this scorer's exact iteration protocol can back a WindowFilter.
-    /// Implementations that opt in must provide correct fillWindowBits()
-    /// output and monotonic exact advance().
-    virtual bool supportsWindowFilter() const {
-      return false;
-    }
     /// Record that an exclusion builder committed to this scorer's window
-    /// filter answer. Most scorers have no per-decision instrumentation.
+    /// fill protocol. Most scorers have no per-decision instrumentation.
     virtual void recordWindowFilterCommit(bool supported) const {
       unused(supported);
     }
@@ -1380,7 +1348,6 @@ public:
   // NOTE: no virtual destructor; plans are pool-owned and never deleted
   // through this type.
   class ScorerPlan {
-    ScorerSupplier* supplier;
     PlanContext planContext;
     ScorerShape recordedShape;
     int64_t resolvedCost;
@@ -1391,74 +1358,11 @@ public:
       consumed = true;
     }
 
-#ifndef NDEBUG
-    static bool sameShape(
-        const ScorerShape& left, const ScorerShape& right) noexcept {
-      return left.matchState == right.matchState
-          && left.directKind == right.directKind
-          && left.reportedTwoPhase == right.reportedTwoPhase
-          && left.windowFillClause == right.windowFillClause
-          && left.termDisjunctionClause == right.termDisjunctionClause
-          && left.termConjunctionClause == right.termConjunctionClause
-          && left.independentTerm == right.independentTerm
-          && left.docsOnly == right.docsOnly
-          && left.directDocSet == right.directDocSet;
-    }
-
-    void assertRecordedShape() const {
-      assert(sameShape(
-          recordedShape, supplier->describeScorer(planContext)));
-    }
-
-    void assertBuiltShape(Scorer* scorer) const {
-      if (scorer == nullptr) {
-        assert(recordedShape.matchState != MatchState::NONEMPTY);
-        return;
-      }
-      assert(recordedShape.matchState != MatchState::EMPTY);
-      switch (recordedShape.reportedTwoPhase) {
-        case ReportedTwoPhase::YES:
-          assert(scorer->hasTwoPhase());
-          break;
-        case ReportedTwoPhase::NO:
-          assert(!scorer->hasTwoPhase());
-          break;
-        case ReportedTwoPhase::UNKNOWN:
-          break;
-      }
-
-      bool directWindowFill = scorer->supportsWindowFilter();
-      auto flatMembers = scorer->flatDisjunctionScorers();
-      bool flatWindowFill = !flatMembers.empty()
-          && std::all_of(
-              flatMembers.begin(), flatMembers.end(),
-              [](Scorer* member) {
-                return member->supportsWindowFilter();
-              });
-      switch (recordedShape.windowFillClause) {
-        case ClauseShape::DIRECT:
-          assert(directWindowFill);
-          break;
-        case ClauseShape::FLAT_DISJUNCTION:
-          assert(!directWindowFill && flatWindowFill);
-          break;
-        case ClauseShape::FLAT_CONJUNCTION:
-          assert(false);
-          break;
-        case ClauseShape::NONE:
-          assert(!directWindowFill && !flatWindowFill);
-          break;
-        case ClauseShape::UNKNOWN:
-          break;
-      }
-    }
-#endif
-
   protected:
-    ScorerPlan(ScorerSupplier& supplier, const PlanContext& planContext,
+    ScorerPlan(const PlanContext& planContext,
                const ScorerShape& recordedShape, int64_t resolvedCost)
-      : supplier(&supplier), planContext(planContext),
-        recordedShape(recordedShape), resolvedCost(resolvedCost) {}
+      : planContext(planContext), recordedShape(recordedShape),
+        resolvedCost(resolvedCost) {}
 
     virtual Scorer* buildScorer(MemPool& targetPool) = 0;
     virtual Scorer* buildIndependentScorer(MemPool& targetPool) {
@@ -1470,7 +1374,6 @@ public:
       return nullptr;
     }
 
-    ScorerSupplier& owner() const noexcept { return *supplier; }
     const PlanContext& context() const noexcept { return planContext; }
 
   public:
@@ -1485,44 +1388,17 @@ public:
 
     Scorer* build(MemPool& targetPool) {
       consume();
-#ifndef NDEBUG
-      assertRecordedShape();
-#endif
-      Scorer* scorer = buildScorer(targetPool);
-#ifndef NDEBUG
-      assertBuiltShape(scorer);
-#endif
-      return scorer;
+      return buildScorer(targetPool);
     }
 
     Scorer* buildIndependent(MemPool& targetPool) {
       consume();
-#ifndef NDEBUG
-      assertRecordedShape();
-#endif
-      Scorer* scorer = buildIndependentScorer(targetPool);
-#ifndef NDEBUG
-      assertBuiltShape(scorer);
-#endif
-      return scorer;
+      return buildIndependentScorer(targetPool);
     }
 
     DocsOnlyEnum* buildDocsOnly(MemPool& targetPool) {
       consume();
-#ifndef NDEBUG
-      assertRecordedShape();
-#endif
-      DocsOnlyEnum* docs = buildDocsOnlyEnum(targetPool);
-#ifndef NDEBUG
-      if (recordedShape.docsOnly == DocsOnlyAccess::SUPPORTED
-          && recordedShape.matchState == MatchState::NONEMPTY) {
-        assert(docs != nullptr);
-      }
-      if (recordedShape.docsOnly == DocsOnlyAccess::UNSUPPORTED) {
-        assert(docs == nullptr);
-      }
-#endif
-      return docs;
+      return buildDocsOnlyEnum(targetPool);
     }
   };
 
@@ -1600,7 +1476,6 @@ public:
         probeMode(probeMode), filterCost(filterCost) {
     assert(!scorers.empty());
     for (size_t i = 0; i < scorers.size(); i++) {
-      assert(scorers[i]->supportsWindowFilter());
       probeEnums[i] = scorers[i]->windowFilterProbeDocsEnum();
     }
   }
@@ -1673,34 +1548,5 @@ public:
     }
   }
 };
-
-inline Query::Scorer* Query::ScorerSupplier::get(
-    MemPool& targetPool, int64_t leadCost) {
-  PlanContext planContext = PlanContext::fromLeadCost(leadCost);
-  return get(targetPool, planContext);
-}
-
-inline Query::Scorer* Query::ScorerSupplier::get(
-    MemPool& targetPool, const PlanContext& planContext) {
-  ScorerPlan* plan = resolve(targetPool, planContext);
-  assert(plan != nullptr);
-  return plan == nullptr ? nullptr : plan->build(targetPool);
-}
-
-inline Query::Scorer* Query::ScorerSupplier::getIndependent(
-    MemPool& targetPool, const PlanContext& planContext) {
-  ScorerPlan* plan = resolve(targetPool, planContext);
-  assert(plan != nullptr);
-  return plan == nullptr
-      ? nullptr : plan->buildIndependent(targetPool);
-}
-
-inline DocsOnlyEnum* Query::ScorerSupplier::getDocsOnly(
-    MemPool& targetPool, const PlanContext& planContext) {
-  ScorerPlan* plan = resolve(targetPool, planContext);
-  assert(plan != nullptr);
-  return plan == nullptr ? nullptr : plan->buildDocsOnly(targetPool);
-}
-
 
 } // end namespace

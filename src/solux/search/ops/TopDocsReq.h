@@ -284,10 +284,19 @@ public:
       return source.scorerSupplier(pool, seg);
     }
 
+    static Query::Scorer* buildPullScorer(
+        MemPool& pool, Query::ScorerSupplier& supplier) {
+      Query::Demand demand = Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max());
+      Query::ScorerPlan* plan = supplier.resolve(
+          pool, supplier.makePlanContext(demand));
+      return plan->build(pool);
+    }
+
     Query::Scorer* createMainScorer(MemPool& pool, IndexReader::Segment& seg) {
       auto* supplier = mainScorerSupplier(pool, seg);
       if (supplier == nullptr) return nullptr;
-      return supplier->get(pool, std::numeric_limits<int64_t>::max());
+      return buildPullScorer(pool, *supplier);
     }
 
     bool admitExactCountTopK(Query::ScorerSupplier& countSupplier,
@@ -354,8 +363,7 @@ public:
               allowPruning ? &scoreAccumulator : nullptr,
               maxDoc, allowPruning, exactScorer);
         } else {
-          auto* rankingScorer = rankingSupplier->get(
-              pool, std::numeric_limits<int64_t>::max());
+          auto* rankingScorer = buildPullScorer(pool, *rankingSupplier);
           if (rankingScorer != nullptr) {
             collectTopK(
                 segnum, rankingScorer, collectorFilter, nullptr,
@@ -555,7 +563,7 @@ public:
               supplier = mainScorerSupplier(poolGuard.pool(), seg);
             }
             auto* scorer = supplier == nullptr ? nullptr
-              : supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              : buildPullScorer(poolGuard.pool(), *supplier);
             if (scorer != nullptr) {
               ranked = collectFirstKConstant(segnum, scorer, identityDomain,
                                              *data->scoreCollector, data->topCount());
@@ -728,8 +736,7 @@ public:
               }
             }
             if (!usedBulk) {
-              auto* scorer = supplier->get(
-                  poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
                 data->fieldCollector->setSegment(
                     segnum, &seg.postingsReader(), &poolGuard.pool(),
@@ -855,8 +862,7 @@ public:
               // countThenCollectTopK supplied both the exact hit count and
               // competitively pruned ranking.
             } else if (useSparseConstantPull) {
-              auto* scorer = supplier->get(
-                  poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
                 collectConstantTopKAndDomain(
                     segnum, scorer, collectorFilter, *builder,
@@ -886,8 +892,8 @@ public:
                 auto* captureSupplier = mainScorerSupplier(poolGuard.pool(), seg);
                 int64_t captured = 0;
                 if (captureSupplier != nullptr) {
-                  auto* captureScorer = captureSupplier->get(
-                      poolGuard.pool(), std::numeric_limits<int64_t>::max());
+                  auto* captureScorer = buildPullScorer(
+                      poolGuard.pool(), *captureSupplier);
                   if (captureScorer != nullptr) {
                     captured = collectFirstKConstant(
                         segnum, captureScorer, collectorFilter,
@@ -911,7 +917,7 @@ public:
                     seg.maxDoc(), allowPruning);
               }
             } else {
-              auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
                 collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->scoreCollector,
                             allowPruning, &scoreAccumulator);

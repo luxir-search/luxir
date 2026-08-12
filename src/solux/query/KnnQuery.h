@@ -355,7 +355,7 @@ public:
                const Query::ScorerShape& shape, int64_t cost,
                std::span<const Hit> hits)
             : Query::ScorerPlan(
-                  supplier, planContext, shape, cost),
+                  planContext, shape, cost),
               hits(hits) {}
         };
 

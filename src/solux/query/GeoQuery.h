@@ -48,7 +48,6 @@ public:
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
         relation(relation), multi(reader.multiValued()) {}
 
-  bool hasTwoPhase() const override { return true; }
   int32_t approximationNext() override {
     docid = iter.next();
     return docid;
@@ -241,7 +240,7 @@ public:
     public:
       Plan(Supplier& supplier, const Query::PlanContext& planContext,
            const Query::ScorerShape& shape, int64_t cost, ScorerArm arm)
-        : Query::ScorerPlan(supplier, planContext, shape, cost),
+        : Query::ScorerPlan(planContext, shape, cost),
           supplier(supplier), arm(arm) {}
     };
 
@@ -276,12 +275,6 @@ public:
       ScorerArm arm = selectScorerArm(planContext.demand.candidates);
       return planPool.make<Plan>(
           *this, planContext, shapeFor(arm), cost(), arm);
-    }
-
-    Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-      Query::PlanContext planContext =
-          Query::PlanContext::fromLeadCost(leadCost);
-      return resolve(targetPool, planContext)->build(targetPool);
     }
 
     BulkPlan planBulk(
@@ -355,8 +348,11 @@ public:
   Query::Scorer* createScorer(MemPool& targetPool,
                               IndexReader::Segment& segment) override {
     auto* supplier = scorerSupplier(targetPool, segment);
-    return supplier == nullptr ? nullptr
-        : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    if (supplier == nullptr) return nullptr;
+    Query::Demand demand = Query::Demand::fromLeadCost(
+        std::numeric_limits<int64_t>::max());
+    return supplier->resolve(
+        targetPool, supplier->makePlanContext(demand))->build(targetPool);
   }
 
   // Test and benchmark baseline that bypasses the BKD.

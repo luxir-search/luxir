@@ -321,10 +321,15 @@ TEST_F(RescoreQueryTest, forwardsTwoPhaseVerification) {
   RescoreQuery rescore(&phrase, parseValue(arena, *schema, "neg(1)"));
   MemPool pool;
   Query::Context context(pool, *reader);
-  Query::Scorer* scorer = rescore.createWeight(context, Query::NEED_SCORES)
-      ->createScorer(pool, segment);
+  auto* supplier = rescore.createWeight(context, Query::NEED_SCORES)
+      ->scorerSupplier(pool, segment);
+  ASSERT_NE(nullptr, supplier);
+  auto* plan = resolveScorerPlanForTests(
+      pool, *supplier, std::numeric_limits<int64_t>::max());
+  Query::Scorer* scorer = plan->build(pool);
   ASSERT_NE(nullptr, scorer);
-  ASSERT_TRUE(scorer->hasTwoPhase());
+  ASSERT_EQ(Query::ReportedTwoPhase::YES,
+            plan->shape().reportedTwoPhase);
   EXPECT_FALSE(scorer->approximationEnums().empty());
   EXPECT_TRUE(scorer->flatDisjunctionScorers().empty());
   EXPECT_TRUE(scorer->flatConjunctionScorers().empty());

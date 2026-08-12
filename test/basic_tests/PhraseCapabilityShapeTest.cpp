@@ -7,6 +7,7 @@
 #include "solux/query/PhraseQuery.h"
 #include "test/CollectionHelper.h"
 #include "test/SoluxTest.h"
+#include "test/TestUtils.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -113,5 +114,5 @@ TEST_F(PhraseCapabilityShapeTest,
       context, Query::EXCLUSION_WINDOW_FILL);
   auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
 
-  ASSERT_NE(nullptr, supplier->get(pool, 18));
+  ASSERT_NE(nullptr, buildScorerForTests(pool, *supplier, 18));
 }

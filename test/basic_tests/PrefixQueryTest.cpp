@@ -7,6 +7,7 @@
 
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -151,8 +152,8 @@ static PrefixDecodeRun runPrefixDecode(
   TopDocsCollector collector(topCount);
   for (auto& segment : context.topReader.segments()) {
     auto* supplier = weight->scorerSupplier(pool, segment);
-    auto* scorer = supplier == nullptr ? nullptr : supplier->get(
-        pool, std::numeric_limits<int64_t>::max());
+    auto* scorer = supplier == nullptr ? nullptr : buildScorerForTests(
+        pool, *supplier, std::numeric_limits<int64_t>::max());
     if (scorer == nullptr) {
       ADD_FAILURE() << "prefix scorer missing";
       return {};
@@ -301,7 +302,8 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     EXPECT_TRUE(weight->allowsPruning());
     auto* supplier = weight->scorerSupplier(pool, segment);
-    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    auto* scorer = buildScorerForTests(
+        pool, *supplier, std::numeric_limits<int64_t>::max());
     ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
     EXPECT_EQ(0, scorer->next());
     scorer->setMinCompetitiveScore(
@@ -317,7 +319,8 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     auto* weight = prefix.createWeight(
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto* supplier = weight->scorerSupplier(pool, segment);
-    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    auto* scorer = buildScorerForTests(
+        pool, *supplier, std::numeric_limits<int64_t>::max());
     ASSERT_NE(dynamic_cast<UnionHeapScorer*>(scorer), nullptr);
     EXPECT_EQ(0, scorer->next());
     scorer->setMinCompetitiveScore(
@@ -333,7 +336,8 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     auto* weight = prefix.createWeight(context, Query::NEED_SCORES);
     EXPECT_FALSE(weight->allowsPruning());
     auto* supplier = weight->scorerSupplier(pool, segment);
-    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    auto* scorer = buildScorerForTests(
+        pool, *supplier, std::numeric_limits<int64_t>::max());
     ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
     EXPECT_EQ(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
   }
@@ -347,7 +351,7 @@ TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
     auto* weight = prefix.createWeight(
         context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto* supplier = weight->scorerSupplier(pool, segment);
-    auto* scorer = supplier->get(pool, 1);
+    auto* scorer = buildScorerForTests(pool, *supplier, 1);
     ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
   }
 

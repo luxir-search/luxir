@@ -44,7 +44,6 @@ public:
   class Scorer final : public Query::ConstantScorer {
     FixedBitSet bits;
     int32_t maxDoc;
-    bool denseFillDisabled;
     int32_t docid = -1;
 
     // First set bit at or after `from`, or END when none remain.
@@ -55,13 +54,7 @@ public:
 
   public:
     Scorer(FixedBitSet bits, int32_t maxDoc, float constantScore)
-      : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc),
-        denseFillDisabled(disableDenseFillForTests) {}
-
-    Scorer(FixedBitSet bits, int32_t maxDoc, float constantScore,
-           bool denseFillDisabled)
-      : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc),
-        denseFillDisabled(denseFillDisabled) {}
+      : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc) {}
 
     const uint64_t* bitWordsForTests() const { return bits.words; }
 
@@ -74,10 +67,6 @@ public:
       return advanceTo(target);
     }
     int32_t docId() override { return docid; }
-
-    bool supportsWindowFilter() const override {
-      return !denseFillDisabled;
-    }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
@@ -363,7 +352,7 @@ public:
     Query::Scorer* createEagerScorer(
         MemPool& targetPool,
         std::span<const TermsEnum::PostingsState> states,
-        int32_t maxDoc, bool denseFillDisabled) {
+        int32_t maxDoc) {
       size_t nWords = FixedBitSet::sizeInWords(maxDoc);
       auto* words = (uint64_t*)targetPool.alloc(
           nWords * sizeof(uint64_t), alignof(uint64_t));
@@ -373,21 +362,19 @@ public:
         addPostingsToBitset(bits, state);
       }
       return targetPool.make<MultiTermQuery::Scorer>(
-          bits, maxDoc, boost, denseFillDisabled);
+          bits, maxDoc, boost);
     }
 
     Query::Scorer* createScorerFromPlan(
         MemPool& targetPool, IndexReader::Segment& segment,
-        const ExpansionFacts& facts, ExpansionMode mode,
-        bool denseFillDisabled) {
+        const ExpansionFacts& facts, ExpansionMode mode) {
       unused(facts.sumDocFreq);
       if (facts.matchState == Query::MatchState::EMPTY) return nullptr;
       int32_t maxDoc = segment.postingsReader().maxDoc();
       if (facts.hasBitset()) {
         assert(mode == ExpansionMode::EAGER);
         return targetPool.make<MultiTermQuery::Scorer>(
-            FixedBitSet(facts.bitWords(), maxDoc), maxDoc, boost,
-            denseFillDisabled);
+            FixedBitSet(facts.bitWords(), maxDoc), maxDoc, boost);
       }
       const ExpansionFacts::States& states = facts.states();
       assert(facts.termCount == states.size());
@@ -414,7 +401,7 @@ public:
             std::span(docsEnums, facts.termCount), windowBits, maxDoc, boost);
       }
       return createEagerScorer(
-          targetPool, states, maxDoc, denseFillDisabled);
+          targetPool, states, maxDoc);
     }
 
     class Supplier final : public Query::ScorerSupplier {
@@ -445,23 +432,19 @@ public:
         Supplier& supplier;
         const ExpansionFacts& facts;
         ExpansionMode mode;
-        bool denseFillDisabled;
 
       protected:
         Query::Scorer* buildScorer(MemPool& targetPool) override {
           return supplier.weight.createScorerFromPlan(
-              targetPool, supplier.segment, facts, mode,
-              denseFillDisabled);
+              targetPool, supplier.segment, facts, mode);
         }
 
       public:
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost,
              const ExpansionFacts& facts, ExpansionMode mode)
-          : Query::ScorerPlan(supplier, planContext, shape, cost),
-            supplier(supplier), facts(facts), mode(mode),
-            denseFillDisabled(
-                planContext.multiTermDisableDenseFillForTests) {}
+          : Query::ScorerPlan(planContext, shape, cost),
+            supplier(supplier), facts(facts), mode(mode) {}
       };
 
     public:
@@ -562,15 +545,11 @@ public:
             facts, mode);
       }
 
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        // Driven consumption keeps the lazy union: windows fill only at
-        // probed docids, and the returned next-union doc is a skip fence for
-        // the driver's probe loop, so a sparse or pruning lead never pays
-        // for the unvisited remainder the eager build materializes up front.
-        Query::PlanContext planContext =
-            Weight::scorerBuildContext(leadCost);
-        return resolve(targetPool, planContext)->build(targetPool);
+      Query::PlanContext makePlanContext(
+          const Query::Demand& demand) const override {
+        return Weight::scorerBuildContext(demand);
       }
+
     };
 
   public:

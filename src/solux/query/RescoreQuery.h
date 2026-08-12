@@ -181,7 +181,6 @@ class RescoreQuery final : public Query {
 
     int32_t docId() override { return doc; }
 
-    bool hasTwoPhase() const override { return child->hasTwoPhase(); }
 
     int32_t approximationNext() override {
       return skipUncompetitive(true, child->approximationNext());
@@ -307,7 +306,7 @@ class RescoreQuery final : public Query {
            IndexReader::Segment* segment, float multiplier,
            bool needsChildScore, bool pruning)
         : Query::ScorerPlan(
-              supplier, planContext, shape, cost),
+              planContext, shape, cost),
           childPlan(childPlan), program(program), segment(segment),
           multiplier(multiplier), needsChildScore(needsChildScore),
           pruning(pruning) {}
@@ -360,6 +359,11 @@ class RescoreQuery final : public Query {
           *this, planContext, describeScorer(planContext),
           childPlan->cost(), childPlan, program, segment, multiplier,
           needsChildScore, pruning);
+    }
+
+    Query::PlanContext makePlanContext(
+        const Query::Demand& demand) const override {
+      return childSupplier->makePlanContext(demand);
     }
 
     BulkPlan planBulk(
@@ -432,8 +436,11 @@ public:
       Query::Scorer* createScorer(
           MemPool& targetPool, IndexReader::Segment& segment) override {
         Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
-        return supplier == nullptr
-            ? nullptr : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+        if (supplier == nullptr) return nullptr;
+        Query::Demand demand = Query::Demand::fromLeadCost(
+            std::numeric_limits<int64_t>::max());
+        return supplier->resolve(
+            targetPool, supplier->makePlanContext(demand))->build(targetPool);
       }
 
       Query::ScorerSupplier* scorerSupplier(
@@ -483,8 +490,11 @@ public:
     Query::Scorer* createScorer(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
-      return supplier == nullptr
-          ? nullptr : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+      if (supplier == nullptr) return nullptr;
+      Query::Demand demand = Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max());
+      return supplier->resolve(
+          targetPool, supplier->makePlanContext(demand))->build(targetPool);
     }
 
     Query::ScorerSupplier* scorerSupplier(

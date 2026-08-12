@@ -46,7 +46,6 @@ class ConstantScoreQuery final : public solux::Query {
     // Matching is exactly the child's, so forward two-phase iteration: a
     // constant_score(range) / constant_score(phrase) clause keeps verifying
     // cheaply in a conjunction instead of forcing its child to iterate fully.
-    bool hasTwoPhase() const override { return child->hasTwoPhase(); }
     int32_t approximationNext() override {
       return exhausted ? PostingsReader::END : child->approximationNext();
     }
@@ -96,7 +95,7 @@ class ConstantScoreQuery final : public solux::Query {
       Plan(Supplier& supplier, const Query::PlanContext& planContext,
            const Query::ScorerShape& shape, int64_t cost,
            Query::ScorerPlan* childPlan, float constantScore)
-        : Query::ScorerPlan(supplier, planContext, shape, cost),
+        : Query::ScorerPlan(planContext, shape, cost),
           childPlan(childPlan), constantScore(constantScore) {}
     };
 
@@ -130,6 +129,11 @@ class ConstantScoreQuery final : public solux::Query {
       return planPool.make<Plan>(
           *this, planContext, wrappedShape(childPlan->shape()),
           childPlan->cost(), childPlan, constantScore);
+    }
+
+    Query::PlanContext makePlanContext(
+        const Query::Demand& demand) const override {
+      return childSupplier->makePlanContext(demand);
     }
 
     BulkPlan planBulk(

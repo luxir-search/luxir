@@ -61,8 +61,10 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
   if (sparseSupplier != nullptr) {
     run.cost = sparseSupplier->cost();
     run.zoneBulkAvailable = sparseSupplier->bulkScorer(pool) != nullptr;
-    auto* sparse = sparseSupplier->get(pool, 0);
-    EXPECT_TRUE(sparse->hasTwoPhase());
+    auto* sparsePlan = resolveScorerPlanForTests(pool, *sparseSupplier, 0);
+    auto* sparse = sparsePlan->build(pool);
+    EXPECT_EQ(Query::ReportedTwoPhase::YES,
+              sparsePlan->shape().reportedTwoPhase);
     run.sparseVerify = collect(sparse);
   }
 
@@ -298,8 +300,7 @@ TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
       std::numeric_limits<int64_t>::max());
   EXPECT_EQ(Query::MatchState::NONEMPTY,
             supplier->describeScorer(buildContext).matchState);
-  Query::Scorer* scorer = supplier->get(
-      pool, buildContext.demand.candidates);
+  Query::Scorer* scorer = supplier->resolve(pool, buildContext)->build(pool);
   ASSERT_NE(nullptr, scorer);
   EXPECT_NE(nullptr,
             dynamic_cast<NumericRangeQuery::ZoneMapScorer*>(scorer));
@@ -354,7 +355,6 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
         query.createWeight(context, 0));
     auto* scorer = weight->createZoneMapScorerForTests(
         pool, context.topReader.segments()[0]);
-    EXPECT_TRUE(scorer->supportsWindowFilter());
     auto scorers = pool.make_span<Query::Scorer*>(1);
     scorers[0] = scorer;
     return scorers;

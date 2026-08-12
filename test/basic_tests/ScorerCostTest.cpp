@@ -154,13 +154,15 @@ TEST_F(ScorerCostTest, needScoresFlagControlsScoring) {
   EXPECT_EQ(scoredSup->cost(), unscoredSup->cost());
 
   // With NEED_SCORES the term scorer produces a real BM25 score.
-  auto* scored = scoredSup->get(pool, std::numeric_limits<int64_t>::max());
+  auto* scored = buildScorerForTests(
+      pool, *scoredSup, std::numeric_limits<int64_t>::max());
   ASSERT_NE(scored, nullptr);
   scored->next();
   EXPECT_GT(scored->score(), 0.0f);
 
   // Without it (a filter-style clause) scoring setup is skipped; score() is 0.
-  auto* unscored = unscoredSup->get(pool, std::numeric_limits<int64_t>::max());
+  auto* unscored = buildScorerForTests(
+      pool, *unscoredSup, std::numeric_limits<int64_t>::max());
   ASSERT_NE(unscored, nullptr);
   unscored->next();
   EXPECT_EQ(0.0f, unscored->score());

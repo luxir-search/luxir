@@ -836,6 +836,7 @@ public:
       bool unsatisfiable;
       int64_t cost;
       size_t scoringCount;
+      bool twoPhase;
     };
 
     struct PullChildPlan {
@@ -858,6 +859,8 @@ public:
           disableTwoPhaseForTests;
       buildContext.disableDisjunctionTwoPhaseForTests =
           DisjunctionScorer::disableDisjTwoPhaseForTests;
+      buildContext.disableMandNotTwoPhaseForTests =
+          MandNotScorer::disableNotTwoPhaseForTests;
       buildContext.disableFilteredUnionWandForTests =
           disableFilteredUnionWandForTests;
       return buildContext;
@@ -870,163 +873,6 @@ public:
           Query::Demand::fromLeadCost(leadCost, horizon));
     }
 
-#ifndef NDEBUG
-    static void assertScorerLayout(
-        const Query::ScorerShape& shape, Query::Scorer* scorer) {
-      if (scorer == nullptr) {
-        assert(shape.matchState != Query::MatchState::NONEMPTY);
-        return;
-      }
-
-      assert(shape.matchState != Query::MatchState::EMPTY);
-      bool directTerm = dynamic_cast<TermQuery::Scorer*>(scorer) != nullptr;
-      bool directDocSet =
-          dynamic_cast<QueryPrep::DocSetScorer*>(scorer) != nullptr;
-      switch (shape.directKind) {
-        case Query::DirectScorerKind::TERM:
-          assert(directTerm);
-          break;
-        case Query::DirectScorerKind::DOC_SET:
-          assert(directDocSet);
-          break;
-        case Query::DirectScorerKind::OTHER:
-          assert(!directTerm && !directDocSet);
-          break;
-        case Query::DirectScorerKind::UNKNOWN:
-          break;
-      }
-
-      switch (shape.reportedTwoPhase) {
-        case Query::ReportedTwoPhase::YES:
-          assert(scorer->hasTwoPhase());
-          break;
-        case Query::ReportedTwoPhase::NO:
-          assert(!scorer->hasTwoPhase());
-          break;
-        case Query::ReportedTwoPhase::UNKNOWN:
-          break;
-      }
-
-      bool directWindowFill = scorer->supportsWindowFilter();
-      auto disjunctionMembers = scorer->flatDisjunctionScorers();
-      bool flatWindowFill = !disjunctionMembers.empty()
-          && std::all_of(
-              disjunctionMembers.begin(), disjunctionMembers.end(),
-              [](Query::Scorer* member) {
-                return member->supportsWindowFilter();
-              });
-      switch (shape.windowFillClause) {
-        case Query::ClauseShape::DIRECT:
-          assert(directWindowFill);
-          break;
-        case Query::ClauseShape::FLAT_DISJUNCTION:
-          assert(!directWindowFill && flatWindowFill);
-          break;
-        case Query::ClauseShape::FLAT_CONJUNCTION:
-          assert(false);
-          break;
-        case Query::ClauseShape::NONE:
-          assert(!directWindowFill && !flatWindowFill);
-          break;
-        case Query::ClauseShape::UNKNOWN:
-          break;
-      }
-
-      bool flatTermDisjunction = !disjunctionMembers.empty()
-          && std::all_of(
-              disjunctionMembers.begin(), disjunctionMembers.end(),
-              [](Query::Scorer* member) {
-                return dynamic_cast<TermQuery::Scorer*>(member) != nullptr;
-              });
-      switch (shape.termDisjunctionClause) {
-        case Query::ClauseShape::DIRECT:
-          assert(directTerm);
-          break;
-        case Query::ClauseShape::FLAT_DISJUNCTION:
-          assert(!directTerm && flatTermDisjunction);
-          break;
-        case Query::ClauseShape::FLAT_CONJUNCTION:
-          assert(false);
-          break;
-        case Query::ClauseShape::NONE:
-          assert(!directTerm && !flatTermDisjunction);
-          break;
-        case Query::ClauseShape::UNKNOWN:
-          break;
-      }
-
-      auto conjunctionMembers = scorer->flatConjunctionScorers();
-      bool flatTermConjunction = !conjunctionMembers.empty()
-          && std::all_of(
-              conjunctionMembers.begin(), conjunctionMembers.end(),
-              [](Query::Scorer* member) {
-                return dynamic_cast<TermQuery::Scorer*>(member) != nullptr;
-              });
-      switch (shape.termConjunctionClause) {
-        case Query::ClauseShape::DIRECT:
-          assert(directTerm);
-          break;
-        case Query::ClauseShape::FLAT_CONJUNCTION:
-          assert(!directTerm && flatTermConjunction);
-          break;
-        case Query::ClauseShape::NONE:
-          assert(!directTerm && !flatTermConjunction);
-          break;
-        case Query::ClauseShape::FLAT_DISJUNCTION:
-          assert(false);
-          break;
-        case Query::ClauseShape::UNKNOWN:
-          break;
-      }
-    }
-
-    static void assertScorerShape(
-        Query::ScorerSupplier* supplier, Query::Scorer* scorer,
-        const Query::PlanContext& buildContext) {
-      assert(supplier != nullptr);
-      Query::ScorerShape shape = supplier->describeScorer(buildContext);
-      assertScorerLayout(shape, scorer);
-      if (scorer == nullptr) {
-        return;
-      }
-
-      bool termSupplier =
-          dynamic_cast<TermQuery::Weight::Supplier*>(supplier) != nullptr;
-      bool docSetSupplier =
-          dynamic_cast<QueryPrep::DocSetSupplier*>(supplier) != nullptr;
-      switch (shape.independentTerm) {
-        case Query::IndependentTermAccess::SUPPORTED:
-          assert(termSupplier);
-          break;
-        case Query::IndependentTermAccess::UNSUPPORTED:
-          assert(!termSupplier);
-          break;
-        case Query::IndependentTermAccess::UNKNOWN:
-          break;
-      }
-      switch (shape.docsOnly) {
-        case Query::DocsOnlyAccess::SUPPORTED:
-          assert(termSupplier);
-          break;
-        case Query::DocsOnlyAccess::UNSUPPORTED:
-          assert(!termSupplier);
-          break;
-        case Query::DocsOnlyAccess::UNKNOWN:
-          break;
-      }
-      switch (shape.directDocSet) {
-        case Query::DirectDocSetAccess::SUPPORTED:
-          assert(docSetSupplier);
-          break;
-        case Query::DirectDocSetAccess::UNSUPPORTED:
-          assert(!docSetSupplier);
-          break;
-        case Query::DirectDocSetAccess::UNKNOWN:
-          break;
-      }
-    }
-#endif
-
     // Build the required-clause conjunction from the child plans retained by
     // the Boolean plan. Mandatory clauses score; filters only constrain
     // iteration. Resolve has already frozen the pre-expansion supplier order
@@ -1035,15 +881,17 @@ public:
         MemPool& targetPool,
         std::span<PullChildPlan> entries,
         int64_t leadCost,
-        bool allowsPruning) {
+        bool allowsPruning,
+        bool enableTwoPhase) {
       size_t scoringCapacity = 0;
       for (const PullChildPlan& entry : entries) {
         scoringCapacity += entry.scoring ? 1 : 0;
       }
-      if (entries.empty()) return {nullptr, false, 0, 0};
+      if (entries.empty()) return {nullptr, false, 0, 0, false};
 
       auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
       auto* costs = targetPool.make_arr<int64_t>(entries.size());
+      auto twoPhase = targetPool.make_span<uint8_t>(entries.size());
       Query::Scorer** scoring = scoringCapacity == 0
         ? nullptr
         : targetPool.make_arr<Query::Scorer*>(scoringCapacity);
@@ -1051,23 +899,28 @@ public:
       size_t scoringCount = 0;
       for (auto& e : entries) {
         auto* scorer = e.plan->build(targetPool);
-#ifndef NDEBUG
-        assertScorerLayout(e.plan->shape(), scorer);
-#endif
-        if (scorer == nullptr) return {nullptr, true, 0, 0};
+        if (scorer == nullptr) return {nullptr, true, 0, 0, false};
         all[allCount] = scorer;
+        assert(e.plan->shape().reportedTwoPhase
+               != Query::ReportedTwoPhase::UNKNOWN);
+        twoPhase[allCount] = e.plan->shape().reportedTwoPhase
+            == Query::ReportedTwoPhase::YES;
         costs[allCount++] = e.cost;
         if (e.scoring) scoring[scoringCount++] = scorer;
       }
 
       // A lone scoring clause (one mandatory, no filters) needs no wrapper.
-      if (allCount == 1 && scoringCount == 1) return {all[0], false, leadCost, 1};
+      if (allCount == 1 && scoringCount == 1) {
+        return {all[0], false, leadCost, 1,
+                twoPhase[0] != 0};
+      }
       return {targetPool.make<BooleanQuery::ConjunctionScorer>(
                 targetPool, std::span<Query::Scorer*>(all, allCount),
                 std::span<int64_t>(costs, allCount),
+                twoPhase.first(allCount),
                 std::span<Query::Scorer*>(scoring, scoringCount),
-                allowsPruning),
-              false, leadCost, scoringCount};
+                allowsPruning, enableTwoPhase),
+              false, leadCost, scoringCount, false};
     }
 
     // Keep clause wiring in one place so prepared and non-prepared execution
@@ -1086,9 +939,11 @@ public:
         int minShouldMatch,
         bool needsScores,
         bool externallyDriven,
-        bool allowsPruning) {
+        bool allowsPruning,
+        const Query::PlanContext& planContext) {
       Required req = assembleRequired(
-          targetPool, requiredPlans, requiredLeadCost, allowsPruning);
+          targetPool, requiredPlans, requiredLeadCost, allowsPruning,
+          !planContext.disableBooleanTwoPhaseForTests);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
       bool hasScoringMandatory = req.scoringCount > 0;
@@ -1104,45 +959,58 @@ public:
       // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
       auto optionalScorersStorage =
           targetPool.make_span<Query::Scorer*>(optionalPlans.size());
+      auto optionalTwoPhaseStorage =
+          targetPool.make_span<uint8_t>(optionalPlans.size());
+      auto optionalDirectTermStorage =
+          targetPool.make_span<uint8_t>(optionalPlans.size());
       auto optionalCostsStorage = minShouldMatch >= 1
           ? targetPool.make_span<int64_t>(optionalPlans.size())
           : std::span<int64_t>{};
       size_t optionalCount = 0;
       for (PullChildPlan& child : optionalPlans) {
         Query::Scorer* scorer = child.plan->build(targetPool);
-#ifndef NDEBUG
-        assertScorerLayout(child.plan->shape(), scorer);
-#endif
         if (scorer == nullptr) continue;
         optionalScorersStorage[optionalCount] = scorer;
+        assert(child.plan->shape().reportedTwoPhase
+               != Query::ReportedTwoPhase::UNKNOWN);
+        optionalTwoPhaseStorage[optionalCount] =
+            child.plan->shape().reportedTwoPhase
+                == Query::ReportedTwoPhase::YES;
+        optionalDirectTermStorage[optionalCount] =
+            child.plan->shape().directKind
+                == Query::DirectScorerKind::TERM;
         if (minShouldMatch >= 1) {
           optionalCostsStorage[optionalCount] = child.cost;
         }
         optionalCount++;
       }
       auto optionalScorers = optionalScorersStorage.first(optionalCount);
+      auto optionalTwoPhase =
+          optionalTwoPhaseStorage.first(optionalCount);
+      auto optionalDirectTerm =
+          optionalDirectTermStorage.first(optionalCount);
       auto optionalCosts = minShouldMatch >= 1
           ? optionalCostsStorage.first(optionalCount)
           : std::span<int64_t>{};
       Query::Scorer* optScorer = nullptr;
+      bool optTwoPhase = false;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
         bool directWindowFilters = false;
         if (mandatoryCount == 0 && filterCount != 0
             && reqScorer != nullptr) {
-          auto filterScorers = reqScorer->flatConjunctionScorers();
-          directWindowFilters = filterScorers.size() == filterCount
-              && std::all_of(filterScorers.begin(), filterScorers.end(),
-                             [](Query::Scorer* scorer) {
-                               return scorer->supportsWindowFilter();
-                             });
+          directWindowFilters = requiredPlans.size() == filterCount
+              && std::all_of(
+                  requiredPlans.begin(), requiredPlans.end(),
+                  [](const PullChildPlan& child) {
+                    return child.plan->shape().windowFillClause
+                        == Query::ClauseShape::DIRECT;
+                  });
         }
         bool flatTermDisjunction = optCount >= 2
-            && std::all_of(optionalScorers.begin(), optionalScorers.end(),
-                           [](Query::Scorer* scorer) {
-                             return dynamic_cast<TermQuery::Scorer*>(scorer)
-                                 != nullptr;
-                           });
+            && std::all_of(
+                optionalDirectTerm.begin(), optionalDirectTerm.end(),
+                [](uint8_t value) { return value != 0; });
         // The filtered scored-bulk density gate has already selected pull for
         // this exact shape. The filter remains the conjunction lead; WAND only
         // replaces the sole scoring disjunction member.
@@ -1165,6 +1033,7 @@ public:
         if (minShouldMatch <= 1) {
           if (optCount == 1) {
             optScorer = optionalScorers[0];
+            optTwoPhase = optionalTwoPhase[0] != 0;
           } else if (useFilteredUnionWand) {
             optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
               targetPool, optionalScorers, 1);
@@ -1172,13 +1041,23 @@ public:
             optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
               targetPool, optionalScorers, segment.maxDoc());
           } else {
-            optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
+            optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(
+                targetPool, optionalScorers, optionalTwoPhase,
+                !planContext.disableBooleanTwoPhaseForTests
+                    && !planContext.disableDisjunctionTwoPhaseForTests);
+            optTwoPhase = !planContext.disableBooleanTwoPhaseForTests
+                && !planContext.disableDisjunctionTwoPhaseForTests
+                && std::any_of(
+                    optionalTwoPhase.begin(), optionalTwoPhase.end(),
+                    [](uint8_t value) { return value != 0; });
           }
         } else if (optCount == minShouldMatch) {
           // Every surviving optional clause is required and scores.
           optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, optionalScorers, optionalCosts, optionalScorers,
-            allowsPruning);
+            targetPool, optionalScorers, optionalCosts, optionalTwoPhase,
+            optionalScorers,
+            allowsPruning,
+            !planContext.disableBooleanTwoPhaseForTests);
         } else if (optCount > minShouldMatch) {
           bool useWand = needsScores && reqScorer == nullptr
               && prohibitedSourceCount == 0;
@@ -1208,7 +1087,9 @@ public:
       } else if (!optionalsConstrain) {
         // min_match unset with required/filter clauses: optionals rank
         // coincident matches but never decide them.
-        boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, reqScorer, optScorer);
+        boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(
+            targetPool, reqScorer, req.twoPhase, optScorer, optTwoPhase,
+            !planContext.disableBooleanTwoPhaseForTests);
       } else {
         // min_match >= 1 alongside required/filter clauses: the optional
         // group is a constraint, conjoined with the required side.  Scoring
@@ -1224,28 +1105,53 @@ public:
         std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(nscoring), nscoring);
         scoringSpan[nscoring - 1] = optScorer;
         if (hasScoringMandatory) scoringSpan[0] = reqScorer;
+        std::array<uint8_t, 2> allTwoPhase{
+            (uint8_t)req.twoPhase, (uint8_t)optTwoPhase};
         boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, allSpan, allCosts, scoringSpan, allowsPruning);
+            targetPool, allSpan, allCosts,
+            allTwoPhase, scoringSpan, allowsPruning,
+            !planContext.disableBooleanTwoPhaseForTests);
       }
 
       auto prohibitedStorage =
           targetPool.make_span<Query::Scorer*>(prohibitedPlans.size());
+      auto prohibitedTwoPhaseStorage =
+          targetPool.make_span<uint8_t>(prohibitedPlans.size());
       size_t prohibitedCount = 0;
       for (PullChildPlan& child : prohibitedPlans) {
         Query::Scorer* scorer = child.plan->build(targetPool);
-#ifndef NDEBUG
-        assertScorerLayout(child.plan->shape(), scorer);
-#endif
         if (scorer != nullptr) {
-          prohibitedStorage[prohibitedCount++] = scorer;
+          prohibitedStorage[prohibitedCount] = scorer;
+          assert(child.plan->shape().reportedTwoPhase
+                 != Query::ReportedTwoPhase::UNKNOWN);
+          prohibitedTwoPhaseStorage[prohibitedCount] =
+              child.plan->shape().reportedTwoPhase
+                  == Query::ReportedTwoPhase::YES;
+          prohibitedCount++;
         }
       }
       auto prohibitedScorers = prohibitedStorage.first(prohibitedCount);
+      auto prohibitedTwoPhase =
+          prohibitedTwoPhaseStorage.first(prohibitedCount);
       if (!prohibitedScorers.empty()) {
         Query::Scorer* prohibitedScorer = prohibitedScorers.size() == 1
           ? prohibitedScorers[0]
-          : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, prohibitedScorers);
-        boolScorer = targetPool.make<BooleanQuery::MandNotScorer>(targetPool, boolScorer, prohibitedScorer);
+          : targetPool.make<BooleanQuery::DisjunctionScorer>(
+              targetPool, prohibitedScorers, prohibitedTwoPhase,
+              !planContext.disableBooleanTwoPhaseForTests
+                  && !planContext.disableDisjunctionTwoPhaseForTests);
+        bool prohibitedHasTwoPhase = prohibitedScorers.size() == 1
+            ? prohibitedTwoPhase[0] != 0
+            : !planContext.disableBooleanTwoPhaseForTests
+                && !planContext.disableDisjunctionTwoPhaseForTests
+                && std::any_of(
+                    prohibitedTwoPhase.begin(), prohibitedTwoPhase.end(),
+                    [](uint8_t value) { return value != 0; });
+        boolScorer = targetPool.make<BooleanQuery::MandNotScorer>(
+            targetPool, boolScorer, prohibitedScorer,
+            prohibitedHasTwoPhase,
+            !planContext.disableBooleanTwoPhaseForTests
+                && !planContext.disableMandNotTwoPhaseForTests);
       }
       return boolScorer;
     }
@@ -1679,7 +1585,7 @@ public:
               supplier.needsScores,
               demand().candidates
                   != std::numeric_limits<int64_t>::max(),
-              supplier.allowsPruning);
+              supplier.allowsPruning, context());
         }
 
       public:
@@ -1693,7 +1599,7 @@ public:
             std::span<PullChildPlan> prohibited,
             int64_t requiredLeadCost,
             bool requiredUnsatisfiable)
-          : Query::ScorerPlan(supplier, planContext, shape, cost),
+          : Query::ScorerPlan(planContext, shape, cost),
             supplier(supplier), required(required), optional(optional),
             prohibited(prohibited), requiredLeadCost(requiredLeadCost),
             requiredUnsatisfiable(requiredUnsatisfiable) {}
@@ -1944,6 +1850,11 @@ public:
             requiredLeadCost, requiredUnsatisfiable);
       }
 
+      Query::PlanContext makePlanContext(
+          const Query::Demand& demand) const override {
+        return scorerBuildContext(demand);
+      }
+
       DocSet* exactDocSet() override {
         // Apply the filter-clause test hook to the degenerate single-filter
         // DocSet path as well.
@@ -1971,11 +1882,6 @@ public:
               pool, segment, optionalSources, minShouldMatch,
               segment.maxDoc())
         };
-      }
-
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        Query::PlanContext planContext = scorerBuildContext(leadCost);
-        return resolve(targetPool, planContext)->build(targetPool);
       }
 
       enum class ConjunctionMode : uint8_t {
@@ -2827,22 +2733,6 @@ public:
         return planning;
       }
 
-#ifndef NDEBUG
-      static bool sameScorerShape(
-          const Query::ScorerShape& left,
-          const Query::ScorerShape& right) {
-        return left.matchState == right.matchState
-            && left.directKind == right.directKind
-            && left.reportedTwoPhase == right.reportedTwoPhase
-            && left.windowFillClause == right.windowFillClause
-            && left.termDisjunctionClause == right.termDisjunctionClause
-            && left.termConjunctionClause == right.termConjunctionClause
-            && left.independentTerm == right.independentTerm
-            && left.docsOnly == right.docsOnly
-            && left.directDocSet == right.directDocSet;
-      }
-#endif
-
       void resolveConjunctionChildren(
           MemPool& planPool, ConjunctionPlan& plan) {
         auto resolveChild = [&](PlannedSupplier& child) {
@@ -2850,9 +2740,6 @@ public:
               scorerBuildContext(child.buildDemand);
           child.plan = child.supplier->resolve(planPool, planContext);
           assert(child.plan != nullptr);
-#ifndef NDEBUG
-          assert(sameScorerShape(child.shape, child.plan->shape()));
-#endif
         };
 
         for (PlannedEntry& entry : plan.entries) {
@@ -2866,9 +2753,6 @@ public:
               scorerBuildContext(entry.buildDemand);
           entry.plan = entry.supplier->resolve(planPool, planContext);
           assert(entry.plan != nullptr);
-#ifndef NDEBUG
-          assert(sameScorerShape(entry.shape, entry.plan->shape()));
-#endif
         }
         if (plan.termFeed) {
           Query::PlanContext planContext = scorerBuildContext(
@@ -2876,11 +2760,6 @@ public:
           plan.independentLeadPlan =
               plan.entries[0].supplier->resolve(planPool, planContext);
           assert(plan.independentLeadPlan != nullptr);
-#ifndef NDEBUG
-          assert(sameScorerShape(
-              plan.entries[0].shape,
-              plan.independentLeadPlan->shape()));
-#endif
         }
         for (PlannedSupplier& child : plan.prohibited) {
           resolveChild(child);
@@ -3094,15 +2973,20 @@ public:
           if (entry.optionalGroup) {
             auto* members = targetPool.make_arr<Query::Scorer*>(
                 plan.optionalGroup.size());
+            auto memberTwoPhase = targetPool.make_span<uint8_t>(
+                plan.optionalGroup.size());
             size_t memberCount = 0;
             for (const PlannedSupplier& memberPlan : plan.optionalGroup) {
               assert(memberPlan.plan != nullptr);
               auto* member = memberPlan.plan->build(targetPool);
-#ifndef NDEBUG
-              assertScorerLayout(memberPlan.shape, member);
-#endif
               if (member != nullptr) {
-                members[memberCount++] = member;
+                members[memberCount] = member;
+                assert(memberPlan.plan->shape().reportedTwoPhase
+                       != Query::ReportedTwoPhase::UNKNOWN);
+                memberTwoPhase[memberCount] =
+                    memberPlan.plan->shape().reportedTwoPhase
+                        == Query::ReportedTwoPhase::YES;
+                memberCount++;
               }
             }
             if (memberCount == 0) {
@@ -3112,20 +2996,21 @@ public:
                 ? members[0]
                 : targetPool.make<BooleanQuery::DisjunctionScorer>(
                     targetPool,
-                    std::span<Query::Scorer*>(members, memberCount));
+                    std::span<Query::Scorer*>(members, memberCount),
+                    memberTwoPhase.first(memberCount),
+                    false);
           } else {
             assert(entry.plan != nullptr);
             scorer = entry.plan->build(targetPool);
           }
-#ifndef NDEBUG
-          assertScorerLayout(entry.shape, scorer);
-#endif
           if (scorer == nullptr) {
             return {};
           }
           if (plan.mode != ConjunctionMode::EXHAUSTIVE) {
-            assert(!scorer->hasTwoPhase());
-            if (scorer->hasTwoPhase()) {
+            assert(entry.plan->shape().reportedTwoPhase
+                   == Query::ReportedTwoPhase::NO);
+            if (entry.plan->shape().reportedTwoPhase
+                != Query::ReportedTwoPhase::NO) {
               return {};
             }
           }
@@ -3203,9 +3088,6 @@ public:
           for (const PlannedSupplier& prohibited : plan.prohibited) {
             assert(prohibited.plan != nullptr);
             auto* scorer = prohibited.plan->build(targetPool);
-#ifndef NDEBUG
-            assertScorerLayout(prohibited.shape, scorer);
-#endif
             if (scorer != nullptr) {
               prohibitedArr[prohibitedCount] = scorer;
               prohibitedLayouts[prohibitedCount] =
@@ -3221,9 +3103,6 @@ public:
           for (const PlannedSupplier& prohibited : plan.prohibited) {
             assert(prohibited.plan != nullptr);
             auto* scorer = prohibited.plan->build(targetPool);
-#ifndef NDEBUG
-            assertScorerLayout(prohibited.shape, scorer);
-#endif
             if (scorer == nullptr) continue;
             if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
               terms.push_back(term);
@@ -3381,12 +3260,12 @@ public:
       BulkScorer* buildMandOptBulk(
           MemPool& targetPool, const MandOptPlan& plan) {
         Query::Scorer* mandatory = plan.mandatory.plan->build(targetPool);
-        assert(mandatory != nullptr && !mandatory->hasTwoPhase());
+        assert(mandatory != nullptr);
         auto optional = targetPool.make_span<Query::Scorer*>(
             plan.optional.size());
         for (size_t i = 0; i < plan.optional.size(); i++) {
           optional[i] = plan.optional[i].plan->build(targetPool);
-          assert(optional[i] != nullptr && !optional[i]->hasTwoPhase());
+          assert(optional[i] != nullptr);
         }
         return targetPool.make<BooleanQuery::MandOptBulkScorer>(
             targetPool, mandatory, optional, plan.optionalCosts,
@@ -3825,7 +3704,7 @@ public:
             plan.optional.size());
         for (size_t i = 0; i < plan.optional.size(); i++) {
           optional[i] = plan.optional[i].plan->build(targetPool);
-          assert(optional[i] != nullptr && !optional[i]->hasTwoPhase());
+          assert(optional[i] != nullptr);
         }
         return targetPool.make<BooleanQuery::OptionalScoreBulkScorer>(
             required->bulk, optional);
@@ -3968,8 +3847,7 @@ public:
             plan.filters.size());
         for (size_t i = 0; i < plan.filters.size(); i++) {
           scorers[i] = plan.filters[i].plan->build(targetPool);
-          assert(scorers[i] != nullptr
-                 && scorers[i]->supportsWindowFilter());
+          assert(scorers[i] != nullptr);
         }
         bool probe = !disableFilterMaskProbeForTests
             && plan.filterCost > 0
@@ -4509,7 +4387,11 @@ public:
       }
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-        return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
+        Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
+        Query::Demand demand = Query::Demand::fromLeadCost(
+            std::numeric_limits<int64_t>::max());
+        return supplier->resolve(
+            targetPool, supplier->makePlanContext(demand))->build(targetPool);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -4749,7 +4631,11 @@ public:
     }
 
     Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
-      return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
+      Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
+      Query::Demand demand = Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max());
+      return static_cast<Scorer*>(supplier->resolve(
+          targetPool, supplier->makePlanContext(demand))->build(targetPool));
     }
 
     // Single-clause boolean shapes delegate to the wrapped clause. Filtered
@@ -5013,9 +4899,12 @@ public:
     }
 
   public:
-    MandOptScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* optScorer)
-      : mand{mandScorer, !disableTwoPhaseForTests && mandScorer->hasTwoPhase()},
-        opt{optScorer, !disableTwoPhaseForTests && optScorer->hasTwoPhase()} {
+    MandOptScorer(solux::MemPool& targetPool,
+                  Scorer* mandScorer, bool mandTwoPhase,
+                  Scorer* optScorer, bool optTwoPhase,
+                  bool enableTwoPhase)
+      : mand{mandScorer, enableTwoPhase && mandTwoPhase},
+        opt{optScorer, enableTwoPhase && optTwoPhase} {
       unused(targetPool);
       reqMaxScore = mand.scorer->getMaxScoreForSetup(solux::PostingsReader::END);
     }
@@ -5033,10 +4922,6 @@ public:
     int32_t advance(int32_t docid) override {
       int32_t doc = approximationAdvance(docid);
       return anyTwoPhase() ? nextMatched(doc) : doc;
-    }
-
-    bool hasTwoPhase() const override {
-      return anyTwoPhase();
     }
 
     int32_t approximationNext() override {
@@ -5706,12 +5591,10 @@ public:
           maxDoc(maxDoc),
           mandCost(mandCost) {
       assert(mand != nullptr);
-      assert(!mand->hasTwoPhase());
       assert(!opts.empty());
       scoreBoundFactor = 1.0 + (double) (opts.size() + 1) * 0x1p-24;
       for (auto* opt : opts) {
         assert(opt != nullptr);
-        assert(!opt->hasTwoPhase());
       }
     }
 
@@ -5896,10 +5779,11 @@ public:
   public:
     static inline bool disableNotTwoPhaseForTests = false;
 
-    MandNotScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* notScorer)
+    MandNotScorer(solux::MemPool& targetPool,
+                  Scorer* mandScorer, Scorer* notScorer,
+                  bool prohibitedTwoPhase, bool enableTwoPhase)
       : mandScorer(mandScorer), notScorer(notScorer),
-        notTwoPhase(!disableTwoPhaseForTests && !disableNotTwoPhaseForTests
-                    && notScorer->hasTwoPhase()) {
+        notTwoPhase(enableTwoPhase && prohibitedTwoPhase) {
       unused(targetPool);
     }
 
@@ -6314,17 +6198,20 @@ public:
     // scoring subset while staying in allScorers.
     ConjunctionScorer(solux::MemPool& pool, std::span<Query::Scorer*> allScorers,
                       std::span<int64_t> allCosts,
+                      std::span<const uint8_t> twoPhaseScorers,
                       std::span<Query::Scorer*> scoringScorers,
-                      bool competitivePruning)
+                      bool competitivePruning,
+                      bool enableTwoPhase)
             : scorers(scoringScorers), conjunctionClauses(allScorers),
               competitivePruning(competitivePruning) {
       assert(allScorers.size() == allCosts.size());
+      assert(allScorers.size() == twoPhaseScorers.size());
       auto flattened = pool.make_span<std::span<DocsPosEnum*>>(allScorers.size());
       size_t approximationCount = 0;
       size_t verifierCount = 0;
       bool expanded = false;
       for (size_t i = 0; i < allScorers.size(); i++) {
-        bool twoPhase = !disableTwoPhaseForTests && allScorers[i]->hasTwoPhase();
+        bool twoPhase = enableTwoPhase && twoPhaseScorers[i] != 0;
         if (twoPhase && !disableApproxFlattenForTests) {
           flattened[i] = allScorers[i]->approximationEnums();
           expanded |= !flattened[i].empty();
@@ -6339,7 +6226,7 @@ public:
       size_t verifierIndex = 0;
       for (size_t i = 0; i < allScorers.size(); i++) {
         Query::Scorer* scorer = allScorers[i];
-        bool twoPhase = !disableTwoPhaseForTests && scorer->hasTwoPhase();
+        bool twoPhase = enableTwoPhase && twoPhaseScorers[i] != 0;
         if (!flattened[i].empty()) {
           for (DocsPosEnum* docsEnum : flattened[i]) {
             approximations[approximationIndex++] = {
@@ -8409,11 +8296,11 @@ public:
                           std::span<uint8_t> candidateFilters,
                           std::span<DocSet*> candidateFilterDocSets,
                           bool plannedNegatedCount,
-                          bool recordRouteCommitment = true,
+                          bool recordRouteCommitment,
                           std::span<const ConjunctionClauseLayout>
-                              plannedClauses = {},
+                              plannedClauses,
                           std::span<const ConjunctionClauseLayout>
-                              plannedProhibitedClauses = {})
+                              plannedProhibitedClauses)
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
           candidateProhibitedTerms(candidateProhibitedTerms),
@@ -8463,13 +8350,10 @@ public:
           candidateFilterDocSets(candidateFilterDocSets) {
       assert(!scorers.empty());
       assert(scoringClauses.size() == scorers.size());
-      assert(plannedClauses.empty()
-             || plannedClauses.size() == scorers.size());
-      assert(plannedProhibitedClauses.empty()
-             || plannedProhibitedClauses.size()
-                 == prohibitedScorers.size());
+      assert(plannedClauses.size() == scorers.size());
+      assert(plannedProhibitedClauses.size()
+             == prohibitedScorers.size());
       assert(candidateBatchSize >= kChunk);
-      bool plannedLayout = !plannedClauses.empty();
       if (!candidateFilterDocSets.empty()) {
         candidateFilterProbes =
             pool.make_span<DocSetProbe>(candidateFilterDocSets.size());
@@ -8486,49 +8370,21 @@ public:
       bool hasDirectDenseClause = false;
       size_t scoreAddends = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
-        std::span<Query::Scorer*> denseMembers;
-        if (plannedLayout) {
-          denseMembers = plannedClauses[i].denseMembers;
-        } else {
-          if (scorers[i]->supportsWindowFilter()) {
-            denseMembers = scorers.subspan(i, 1);
-          } else if (!disableDisjGroupBulkForTests) {
-            denseMembers = scorers[i]->flatDisjunctionScorers();
-            for (Query::Scorer* member : denseMembers) {
-              if (!member->supportsWindowFilter()) {
-                denseMembers = {};
-                break;
-              }
-            }
-          }
-        }
+        std::span<Query::Scorer*> denseMembers =
+            plannedClauses[i].denseMembers;
         denseClauses[i].members = denseMembers;
         if (!scoredConstruction
             && !disableDirectDenseClausesForTests
             && denseMembers.size() == 1) {
-          if (plannedLayout) {
-            denseClauses[i].term = plannedClauses[i].directTerm;
-            denseClauses[i].docSet = plannedClauses[i].directDocSet;
-          } else {
-            denseClauses[i].term =
-                dynamic_cast<TermQuery::Scorer*>(denseMembers[0]);
-            if (denseClauses[i].term == nullptr) {
-              denseClauses[i].docSet =
-                  dynamic_cast<QueryPrep::DocSetScorer*>(denseMembers[0]);
-            }
-          }
+          denseClauses[i].term = plannedClauses[i].directTerm;
+          denseClauses[i].docSet = plannedClauses[i].directDocSet;
           hasDirectDenseClause |= denseClauses[i].term != nullptr
               || denseClauses[i].docSet != nullptr;
         }
         allDenseClauses &= !denseMembers.empty();
         denseHasDisjGroup |= denseMembers.size() > 1;
 
-        if (plannedLayout) {
-          termScorers[i] = plannedClauses[i].directTerm;
-        } else {
-          termScorers[i] =
-              dynamic_cast<TermQuery::Scorer*>(scorers[i]);
-        }
+        termScorers[i] = plannedClauses[i].directTerm;
         allTermScorers &= termScorers[i] != nullptr;
         if (i > 0) {
           termTailScorers &= termScorers[i] != nullptr;
@@ -8540,20 +8396,8 @@ public:
           scoreAddends += (size_t) (scoringClauses[i] != 0);
           continue;
         }
-        std::span<Query::Scorer*> members;
-        if (plannedLayout) {
-          members = plannedClauses[i].termMembers;
-        } else {
-          if (!disableDisjGroupBulkForTests) {
-            members = scorers[i]->flatDisjunctionScorers();
-          }
-          for (auto* member : members) {
-            if (dynamic_cast<TermQuery::Scorer*>(member) == nullptr) {
-              members = {};
-              break;
-            }
-          }
-        }
+        std::span<Query::Scorer*> members =
+            plannedClauses[i].termMembers;
         termClauses[i].members = members;
         allTermClauses &= !members.empty();
         hasDisjGroup |= !members.empty();
@@ -8566,49 +8410,29 @@ public:
       }
       bool allDenseProhibited = true;
       for (size_t i = 0; i < prohibitedScorers.size(); i++) {
-        std::span<Query::Scorer*> denseMembers;
-        if (plannedLayout) {
-          denseMembers = plannedProhibitedClauses[i].denseMembers;
-          switch (plannedProhibitedClauses[i].windowFillKind) {
-            case Query::ClauseShape::DIRECT:
-              prohibitedScorers[i]->recordWindowFilterCommit(true);
-              break;
-            case Query::ClauseShape::FLAT_DISJUNCTION:
-              prohibitedScorers[i]->recordWindowFilterCommit(false);
-              if (!denseMembers.empty()) {
-                for (Query::Scorer* member : denseMembers) {
-                  member->recordWindowFilterCommit(true);
-                }
-              }
-              break;
-            case Query::ClauseShape::FLAT_CONJUNCTION:
-              assert(false);
-              break;
-            case Query::ClauseShape::NONE:
-              prohibitedScorers[i]->recordWindowFilterCommit(false);
-              break;
-            case Query::ClauseShape::UNKNOWN:
-              assert(false);
-              break;
-          }
-        } else {
-          bool supportsWindowFilter =
-              prohibitedScorers[i]->supportsWindowFilter();
-          prohibitedScorers[i]->recordWindowFilterCommit(
-              supportsWindowFilter);
-          if (supportsWindowFilter) {
-            denseMembers = prohibitedScorers.subspan(i, 1);
-          } else if (!disableDisjGroupBulkForTests) {
-            denseMembers = prohibitedScorers[i]->flatDisjunctionScorers();
-            for (Query::Scorer* member : denseMembers) {
-              bool memberSupports = member->supportsWindowFilter();
-              member->recordWindowFilterCommit(memberSupports);
-              if (!memberSupports) {
-                denseMembers = {};
-                break;
+        std::span<Query::Scorer*> denseMembers =
+            plannedProhibitedClauses[i].denseMembers;
+        switch (plannedProhibitedClauses[i].windowFillKind) {
+          case Query::ClauseShape::DIRECT:
+            prohibitedScorers[i]->recordWindowFilterCommit(true);
+            break;
+          case Query::ClauseShape::FLAT_DISJUNCTION:
+            prohibitedScorers[i]->recordWindowFilterCommit(false);
+            if (!denseMembers.empty()) {
+              for (Query::Scorer* member : denseMembers) {
+                member->recordWindowFilterCommit(true);
               }
             }
-          }
+            break;
+          case Query::ClauseShape::FLAT_CONJUNCTION:
+            assert(false);
+            break;
+          case Query::ClauseShape::NONE:
+            prohibitedScorers[i]->recordWindowFilterCommit(false);
+            break;
+          case Query::ClauseShape::UNKNOWN:
+            assert(false);
+            break;
         }
         prohibitedDenseClauses[i].members = denseMembers;
         allDenseProhibited &= !denseMembers.empty();
@@ -8918,12 +8742,14 @@ public:
     bool anyTwoPhase = false;
     bool twoWay;
 
-    static std::span<ApproxSlot> makeMembers(solux::MemPool& pool,
-                                              std::span<Scorer*> scorers) {
+    static std::span<ApproxSlot> makeMembers(
+        solux::MemPool& pool, std::span<Scorer*> scorers,
+        std::span<const uint8_t> twoPhaseScorers,
+        bool enableTwoPhase) {
+      assert(scorers.size() == twoPhaseScorers.size());
       auto members = pool.make_span<ApproxSlot>(scorers.size());
-      bool enableTwoPhase = !disableTwoPhaseForTests && !disableDisjTwoPhaseForTests;
       for (size_t i = 0; i < scorers.size(); i++) {
-        bool twoPhase = enableTwoPhase && scorers[i]->hasTwoPhase();
+        bool twoPhase = enableTwoPhase && twoPhaseScorers[i] != 0;
         int32_t doc = twoPhase ? scorers[i]->approximationDocId()
                                : scorers[i]->docId();
         members[i] = {scorers[i], twoPhase, doc};
@@ -8949,8 +8775,12 @@ public:
     static inline bool disableDisjTwoPhaseForTests = false;
     static inline bool disableTwoWayForTests = false;
 
-    DisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers)
-            : clauses(scorers), members(makeMembers(pool, scorers)),
+    DisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers,
+                      std::span<const uint8_t> twoPhaseScorers,
+                      bool enableTwoPhase)
+            : clauses(scorers),
+              members(makeMembers(
+                  pool, scorers, twoPhaseScorers, enableTwoPhase)),
               heap(makePointers(pool, members)),
               verificationOrder(makePointers(pool, members)), pq(heap),
               twoWay(scorers.size() == 2 && !disableTwoWayForTests) {
@@ -8972,10 +8802,6 @@ public:
 
     int32_t advance(int32_t target) override {
       return nextMatched(approximationAdvance(target));
-    }
-
-    bool hasTwoPhase() const override {
-      return anyTwoPhase;
     }
 
     int32_t approximationNext() override {

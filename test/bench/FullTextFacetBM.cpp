@@ -15,6 +15,7 @@
 #include "test/CollectionHelper.h"
 #include "test/TopKAssert.h"
 #include "test/LocalReq.h"
+#include "test/TestUtils.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/TermQuery.h"
@@ -292,7 +293,8 @@ ScoreTopKResult runMsmWandTopK(IndexReader& reader, int32_t topK, MsmWandMode mo
     if (count == minMatch) {
       auto costs = pool.make_span<int64_t>((size_t) count);
       scorer = pool.make<BooleanQuery::ConjunctionScorer>(
-        pool, span, costs, span, true);
+        pool, span, costs,
+        singlePhaseScorersForTests(pool, (size_t)count), span, true, true);
     } else if (mode == MsmWandMode::Wand) {
       scorer = pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
     } else {
@@ -343,7 +345,8 @@ ScoreTopKResult runClusteredDisjunctionTopK(IndexReader& reader, int32_t topK,
       scorer = arr[0];
     } else if (mode == DisjunctionMaxScoreMode::Exhaustive) {
       scorer = pool.make<BooleanQuery::DisjunctionScorer>(
-        pool, std::span<Query::Scorer*>(arr, (size_t) count));
+        pool, std::span<Query::Scorer*>(arr, (size_t) count),
+        singlePhaseScorersForTests(pool, (size_t)count), true);
     } else {
       int32_t windowSize = mode == DisjunctionMaxScoreMode::Global
         ? std::numeric_limits<int32_t>::max()
@@ -787,7 +790,8 @@ ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
       }
       result.bulkFallbackSegments++;
       LOG_ERROR("MaxScore bulk scorer unexpectedly null for segment {}", segnum);
-      auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+      auto* scorer = buildScorerForTests(
+          pool, *supplier, std::numeric_limits<int64_t>::max());
       if (scorer == nullptr) {
         continue;
       }

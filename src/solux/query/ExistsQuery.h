@@ -106,7 +106,7 @@ public:
              const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost)
           : Query::ScorerPlan(
-                supplier, planContext, shape, cost),
+                planContext, shape, cost),
             supplier(supplier) {}
       };
 
@@ -171,8 +171,11 @@ public:
     Query::Scorer* createScorer(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
-      return supplier == nullptr ? nullptr
-          : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+      if (supplier == nullptr) return nullptr;
+      Query::Demand demand = Query::Demand::fromLeadCost(
+          std::numeric_limits<int64_t>::max());
+      return supplier->resolve(
+          targetPool, supplier->makePlanContext(demand))->build(targetPool);
     }
 
   };

@@ -17,6 +17,7 @@
 #include "test/CollectionHelper.h"
 #include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
+#include "test/TestUtils.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -96,7 +97,7 @@ std::vector<int32_t> selectedScorer(IndexReader& reader, std::string_view field,
   QueryState state(pool, reader, field, lo, hi);
   auto* supplier = state.weight->scorerSupplier(pool, reader.segments()[0]);
   return supplier == nullptr ? std::vector<int32_t>{}
-      : collect(supplier->get(pool, leadCost));
+      : collect(buildScorerForTests(pool, *supplier, leadCost));
 }
 
 std::vector<int32_t> materialized(IndexReader& reader, std::string_view field,
@@ -197,8 +198,6 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
   EXPECT_EQ(expectedKind == ExpectedScorerKind::SCAN,
             dynamic_cast<NumericRangeQuery::RangeScorer<
                 IntColReader::Iterator>*>(scorer) != nullptr);
-  EXPECT_EQ(expectedTwoPhase, scorer->hasTwoPhase());
-  EXPECT_TRUE(scorer->supportsWindowFilter());
   EXPECT_EQ(fullScan(reader, field, lo, hi), collect(scorer));
 }
 
@@ -389,7 +388,7 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
     EXPECT_NE(supplier, nullptr);
     SkipStats::reset();
     SkipStats::enabled = true;
-    Query::Scorer* scorer = supplier->get(pool, leadCost);
+    Query::Scorer* scorer = buildScorerForTests(pool, *supplier, leadCost);
     SkipStats::enabled = false;
     return std::tuple{collect(scorer),
                       SkipStats::numericRangeSparseVerifyArms,
@@ -449,7 +448,7 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
         query.createWeight(context, Query::NEED_SCORES, 3.0f));
     auto* supplier = weight->scorerSupplier(pool, segment);
     ASSERT_NE(nullptr, supplier);
-    auto* scorer = supplier->get(pool, leadCost);
+    auto* scorer = buildScorerForTests(pool, *supplier, leadCost);
     ASSERT_NE(nullptr, scorer);
     EXPECT_FLOAT_EQ(3.0f, scorer->getMaxScore(PostingsReader::END));
     EXPECT_FLOAT_EQ(3.0f,
@@ -556,7 +555,8 @@ TEST_F(NumericRangePointsTest, fanoutCostAndArrayBitsetBoundary) {
   auto* supplier = state.weight->scorerSupplier(pool, segment);
   ASSERT_NE(supplier, nullptr);
   EXPECT_EQ(supplier->cost(), N);
-  auto* dense = supplier->get(pool, std::numeric_limits<int64_t>::max());
+  auto* dense = buildScorerForTests(
+      pool, *supplier, std::numeric_limits<int64_t>::max());
   EXPECT_NE(dynamic_cast<NumericRangeQuery::PointsBitScorer*>(dense), nullptr);
   EXPECT_EQ(collect(dense), (std::vector<int32_t>{0, 1}));
 
@@ -564,8 +564,8 @@ TEST_F(NumericRangePointsTest, fanoutCostAndArrayBitsetBoundary) {
   QueryState sparseState(sparsePool, *reader, "fanout", 1, 1);
   auto* sparseSupplier = sparseState.weight->scorerSupplier(sparsePool, segment);
   ASSERT_NE(sparseSupplier, nullptr);
-  auto* sparse = sparseSupplier->get(
-      sparsePool, std::numeric_limits<int64_t>::max());
+  auto* sparse = buildScorerForTests(
+      sparsePool, *sparseSupplier, std::numeric_limits<int64_t>::max());
   EXPECT_NE(dynamic_cast<NumericRangeQuery::PointsArrayScorer*>(sparse), nullptr);
   EXPECT_EQ(collect(sparse), (std::vector<int32_t>{0}));
 }
@@ -644,7 +644,8 @@ TEST_F(NumericRangePointsTest, arrayPathDedupsMultiValuedDuplicates) {
   QueryState state(pool, *reader, "dup_multi", 500'000, 500'001);
   auto* supplier = state.weight->scorerSupplier(pool, reader->segments()[0]);
   ASSERT_NE(supplier, nullptr);
-  auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+  auto* scorer = buildScorerForTests(
+      pool, *supplier, std::numeric_limits<int64_t>::max());
   ASSERT_NE(dynamic_cast<NumericRangeQuery::PointsArrayScorer*>(scorer), nullptr);
   EXPECT_EQ(collect(scorer), expected);
   EXPECT_EQ(materialized(*reader, "dup_multi", 500'000, 500'001), expected);
@@ -723,8 +724,7 @@ TEST_F(NumericRangePointsTest, nonemptyFenceCanRefineToEmptyScorer) {
       std::numeric_limits<int64_t>::max());
   Query::ScorerShape shape = supplier->describeScorer(buildContext);
   EXPECT_EQ(Query::MatchState::NONEMPTY, shape.matchState);
-  Query::Scorer* scorer = supplier->get(
-      pool, buildContext.demand.candidates);
+  Query::Scorer* scorer = supplier->resolve(pool, buildContext)->build(pool);
   ASSERT_NE(nullptr, scorer);
   EXPECT_TRUE(collect(scorer).empty());
 

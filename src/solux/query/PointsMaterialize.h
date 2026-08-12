@@ -96,8 +96,6 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
-    bool supportsWindowFilter() const override { return true; }
-
   protected:
     void exhaust() override { index = (int64_t)docs.size(); }
   };
@@ -127,8 +125,6 @@ struct PointsMaterialize {
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    bool supportsWindowFilter() const override { return true; }
-
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       assert(windowStart >= 0 && windowEnd >= windowStart

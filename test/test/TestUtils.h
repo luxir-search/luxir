@@ -1,13 +1,36 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <string>
 #include "SoluxTest.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/query/Query.h"
 #include "solux/util/Overloaded.h"
 
 namespace solux::test {
+
+inline Query::ScorerPlan* resolveScorerPlanForTests(
+    MemPool& pool, Query::ScorerSupplier& supplier, int64_t candidates,
+    Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
+  Query::Demand demand = Query::Demand::fromLeadCost(candidates, horizon);
+  return supplier.resolve(pool, supplier.makePlanContext(demand));
+}
+
+inline Query::Scorer* buildScorerForTests(
+    MemPool& pool, Query::ScorerSupplier& supplier, int64_t candidates,
+    Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
+  return resolveScorerPlanForTests(
+      pool, supplier, candidates, horizon)->build(pool);
+}
+
+inline std::span<const uint8_t> singlePhaseScorersForTests(
+    MemPool& pool, size_t count) {
+  auto protocols = pool.make_span<uint8_t>(count);
+  std::fill(protocols.begin(), protocols.end(), 0);
+  return protocols;
+}
 
 // Idea: think of making a reference-version (i.e. std::string_view, std::span) of this class for use in main code.
 

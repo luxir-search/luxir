@@ -19,6 +19,7 @@
 #include "test/CollectionHelper.h"
 #include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
+#include "test/TestUtils.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -354,8 +355,9 @@ TEST_F(GeoDistanceQueryTest, uniformScoreAndBoundsAcrossExecutionArms) {
                       Query::NEED_SCORES, 4.0f);
   auto* supplier = state.weight->scorerSupplier(pool, segment);
   ASSERT_NE(nullptr, supplier);
-  check(supplier->get(pool, 0));  // sparse verifier
-  check(supplier->get(pool, std::numeric_limits<int64_t>::max()));  // BKD
+  check(buildScorerForTests(pool, *supplier, 0));  // sparse verifier
+  check(buildScorerForTests(
+      pool, *supplier, std::numeric_limits<int64_t>::max()));  // BKD
   check(state.weight->createScanScorerForTests(pool, segment));
 
   BulkScorer* bulk = supplier->bulkScorer(pool);
@@ -441,7 +443,8 @@ TEST_F(GeoDistanceQueryTest, bkdScanAndColumnOraclesAcrossCorpora) {
           ASSERT_NE(nullptr, supplier);
           EXPECT_LE(supplier->cost(), 350);
           // leadCost 0 forces the sparse-verify arm through the same oracle.
-          EXPECT_EQ(expected, collect(supplier->get(pool, 0)));
+          EXPECT_EQ(expected, collect(buildScorerForTests(
+                                  pool, *supplier, 0)));
         }
       }
     }

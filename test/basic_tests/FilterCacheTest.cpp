@@ -3305,8 +3305,8 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
       MemPool pool;
       auto* supplier = prepared->scorerSupplier(pool, segment);
       if (supplier == nullptr) continue;
-      auto* scorer = supplier->get(
-          pool, std::numeric_limits<int64_t>::max());
+      auto* scorer = test::buildScorerForTests(
+          pool, *supplier, std::numeric_limits<int64_t>::max());
       if (scorer == nullptr) continue;
       while (scorer->next() != PostingsReader::END) total++;
     }

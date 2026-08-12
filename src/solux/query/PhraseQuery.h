@@ -513,9 +513,7 @@ public:
         return ScorerArm::PULL;
       }
 
-      static Query::ScorerShape shapeFor(
-          ScorerArm arm, const Query::PlanContext& planContext) {
-        if (planContext.phraseDisableShapesForTests) return {};
+      static Query::ScorerShape shapeFor(ScorerArm arm) {
         return {
           .matchState = arm == ScorerArm::EMPTY
               ? Query::MatchState::EMPTY
@@ -558,17 +556,6 @@ public:
           Query::Scorer* scorer = supplier.weight.buildScorer(
               targetPool, supplier.segment, estimate);
           assert(scorer != nullptr);
-          if (supplier.weight.query.getSlop() > 0) {
-            static_cast<PhraseQuery::SloppyScorer*>(scorer)
-                ->setWindowFillPositiveCost(context().demand.candidates);
-          } else {
-            static_cast<PhraseQuery::Scorer*>(scorer)
-                ->setWindowFillPositiveCost(context().demand.candidates);
-          }
-#ifndef NDEBUG
-          assert(scorer->supportsWindowFilter()
-                 == (arm == ScorerArm::WINDOW_FILL));
-#endif
           return scorer;
         }
 
@@ -577,7 +564,7 @@ public:
              const Query::ScorerShape& shape, int64_t cost,
              const EstimateMemo& estimate, ScorerArm arm)
           : Query::ScorerPlan(
-                supplier, planContext, shape, cost),
+                planContext, shape, cost),
             supplier(supplier), estimate(estimate), arm(arm) {}
       };
 
@@ -598,10 +585,11 @@ public:
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
+        if (buildContext.phraseDisableShapesForTests) return {};
         EstimateCalculation estimate = weight.estimateScorer(
             segment, buildContext.phraseDisableSortForTests,
             buildContext.phraseDisableRepeatDedupForTests);
-        return shapeFor(selectArm(estimate, buildContext), buildContext);
+        return shapeFor(selectArm(estimate, buildContext));
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -617,14 +605,17 @@ public:
         const EstimateMemo& estimate = estimateMemo(planPool, planContext);
         ScorerArm arm = selectArm(estimate, planContext);
         return planPool.make<Plan>(
-            *this, planContext, shapeFor(arm, planContext), cost(),
+            *this, planContext, shapeFor(arm), cost(),
             estimate, arm);
       }
 
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        Query::PlanContext planContext = scorerBuildContext(leadCost);
-        return resolve(targetPool, planContext)->build(targetPool);
+      Query::PlanContext makePlanContext(
+          const Query::Demand& demand) const override {
+        Query::PlanContext context = scorerBuildContext(demand.candidates);
+        context.demand = demand;
+        return context;
       }
+
     };
 
     Query::ScorerSupplier* scorerSupplier(MemPool& targetPool,
@@ -1071,7 +1062,6 @@ public:
     int32_t checkedDocid = -1;
     bool checkedMatch = false;
     float matchCostEstimate = 0.0f;
-    int64_t windowFillPositiveCost = 0;
     int64_t approximationCost;
     bool exclusionWindowFill;
     const uint8_t* flatNormsBase = nullptr;
@@ -1259,7 +1249,6 @@ public:
 #endif
       return doMatches();
     }
-    bool hasTwoPhase() const override { return true; }
     int32_t approximationNext() override {
 #ifndef NDEBUG
       markTwoPhase();
@@ -1289,18 +1278,6 @@ public:
       return doMatches();
     }
     float matchCost() override { return matchCostEstimate; }
-
-    void setWindowFillPositiveCost(int64_t cost) {
-      windowFillPositiveCost = cost;
-    }
-
-    bool supportsWindowFilter() const override {
-      if (!exclusionWindowFill) {
-        return false;
-      }
-      return estimateSupportsWindowFill(
-          approximationCost, matchCostEstimate, windowFillPositiveCost);
-    }
 
     void recordWindowFilterCommit(bool supported) const override {
       if (exclusionWindowFill) {

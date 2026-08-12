@@ -13,6 +13,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SoluxTest.h"
+#include "test/TestUtils.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -94,8 +95,8 @@ TEST_F(AllQueryCapabilityShapeTest,
   EXPECT_EQ(0, supplier.cost());
   expectExactAllShape(
       supplier.describeScorer({}), Query::ClauseShape::DIRECT);
-  EXPECT_NE(nullptr, supplier.get(
-      pool, std::numeric_limits<int64_t>::max()));
+  EXPECT_NE(nullptr, buildScorerForTests(
+      pool, supplier, std::numeric_limits<int64_t>::max()));
 }
 
 TEST_F(AllQueryCapabilityShapeTest, disableSwitchGatesDenseClauseProtocol) {
@@ -111,14 +112,18 @@ TEST_F(AllQueryCapabilityShapeTest, disableSwitchGatesDenseClauseProtocol) {
     AllQuery::Supplier supplier(segment, 0.0f);
     expectExactAllShape(
         supplier.describeScorer({}), Query::ClauseShape::DIRECT);
-    EXPECT_TRUE(supplier.get(pool, segment.maxDoc())->supportsWindowFilter());
+    EXPECT_EQ(Query::ClauseShape::DIRECT,
+              resolveScorerPlanForTests(pool, supplier, segment.maxDoc())
+                  ->shape().windowFillClause);
   }
   {
     DenseClauseGuard disabled(true);
     AllQuery::Supplier supplier(segment, 0.0f);
     expectExactAllShape(
         supplier.describeScorer({}), Query::ClauseShape::NONE);
-    EXPECT_FALSE(supplier.get(pool, segment.maxDoc())->supportsWindowFilter());
+    EXPECT_EQ(Query::ClauseShape::NONE,
+              resolveScorerPlanForTests(pool, supplier, segment.maxDoc())
+                  ->shape().windowFillClause);
   }
 }
 

@@ -292,7 +292,8 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   ASSERT_NE(nullptr, sparseSupplier);
   EXPECT_EQ(2, sparseSupplier->cost());
   EXPECT_EQ(2, sparseWeight->count(segment));
-  auto* sparseScorer = sparseSupplier->get(pool, segment.maxDoc());
+  auto* sparseScorer = buildScorerForTests(
+      pool, *sparseSupplier, segment.maxDoc());
   ASSERT_NE(nullptr, sparseScorer);
   EXPECT_EQ(0, sparseScorer->next());
   EXPECT_EQ(1, sparseScorer->advance(1));
@@ -304,7 +305,8 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   ASSERT_NE(nullptr, denseSupplier);
   EXPECT_EQ(5, denseSupplier->cost());
   EXPECT_NE(nullptr, dynamic_cast<AllQuery::Scorer*>(
-                         denseSupplier->get(pool, segment.maxDoc())));
+                         buildScorerForTests(
+                             pool, *denseSupplier, segment.maxDoc())));
 
   MemPool scorePool;
   Query::Context scoreContext(scorePool, *reader);
@@ -377,10 +379,10 @@ TEST_F(ExistsQueryTest,
 
   bool saved = AllQuery::disableDenseClauseForTests;
   AllQuery::disableDenseClauseForTests = false;
-  Query::Scorer* scorer = supplier->get(pool, segment.maxDoc());
+  Query::Scorer* scorer = buildScorerForTests(
+      pool, *supplier, segment.maxDoc());
   AllQuery::disableDenseClauseForTests = saved;
   ASSERT_NE(nullptr, dynamic_cast<AllQuery::Scorer*>(scorer));
-  EXPECT_TRUE(scorer->supportsWindowFilter());
 }
 
 TEST_F(ExistsQueryTest, QueryabilityErrorsAndSimpleDegradation) {

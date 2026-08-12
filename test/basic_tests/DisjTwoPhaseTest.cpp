@@ -142,8 +142,9 @@ public:
       ADD_FAILURE() << "missing standalone member scorer";
       return {};
     }
-    auto* scorer = pool.make<BooleanQuery::DisjunctionScorer>(pool, members);
-    EXPECT_EQ(!disabled, scorer->hasTwoPhase());
+    uint8_t memberTwoPhase[] = {1, 0};
+    auto* scorer = pool.make<BooleanQuery::DisjunctionScorer>(
+        pool, members, memberTwoPhase, !disabled);
     EXPECT_EQ(!BooleanQuery::DisjunctionScorer::disableTwoWayForTests,
               scorer->usesTwoWayMergeForTests());
 
@@ -198,12 +199,15 @@ public:
       ADD_FAILURE() << "missing conjunction member scorer";
       return {};
     }
-    auto* group = pool.make<BooleanQuery::DisjunctionScorer>(pool, groupMembers);
+    uint8_t groupMemberTwoPhase[] = {1, 1};
+    auto* group = pool.make<BooleanQuery::DisjunctionScorer>(
+        pool, groupMembers, groupMemberTwoPhase, !disabled);
     Query::Scorer* all[] = {group, requiredScorer};
     int64_t costs[] = {5, 4};
+    uint8_t allTwoPhase[] = {(uint8_t)!disabled, 0};
     Query::Scorer* scoring[] = {group, requiredScorer};
     auto* scorer = pool.make<BooleanQuery::ConjunctionScorer>(
-      pool, all, costs, scoring, true);
+      pool, all, costs, allTwoPhase, scoring, true, true);
 
     DirectRun run;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
@@ -263,9 +267,10 @@ public:
       pool, groupMembers, segment.maxDoc());
     Query::Scorer* all[] = {group, requiredScorer};
     int64_t costs[] = {5, 4};
+    uint8_t allTwoPhase[] = {0, 0};
     Query::Scorer* scoring[] = {group, requiredScorer};
     auto* scorer = pool.make<BooleanQuery::ConjunctionScorer>(
-      pool, all, costs, scoring, true);
+      pool, all, costs, allTwoPhase, scoring, true, true);
 
     RequestRun run;
     for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
@@ -297,18 +302,22 @@ public:
     auto* standaloneWeight = group.createWeight(context, Query::NEED_SCORES);
     auto* standaloneSupplier = standaloneWeight->scorerSupplier(pool, segment);
     ASSERT_NE(standaloneSupplier, nullptr);
-    auto* standalone = standaloneSupplier->get(
-      pool, std::numeric_limits<int64_t>::max());
+    auto* standalone = buildScorerForTests(
+      pool, *standaloneSupplier, std::numeric_limits<int64_t>::max());
     EXPECT_NE(dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(standalone),
               nullptr);
 
     auto* drivenWeight = group.createWeight(context, Query::NEED_SCORES);
     auto* drivenSupplier = drivenWeight->scorerSupplier(pool, segment);
     ASSERT_NE(drivenSupplier, nullptr);
+    auto* drivenPlan = resolveScorerPlanForTests(
+        pool, *drivenSupplier, 1);
     auto* driven = dynamic_cast<BooleanQuery::DisjunctionScorer*>(
-      drivenSupplier->get(pool, 1));
+        drivenPlan->build(pool));
     ASSERT_NE(driven, nullptr);
-    EXPECT_EQ(!disabled, driven->hasTwoPhase());
+    EXPECT_EQ(disabled ? Query::ReportedTwoPhase::NO
+                       : Query::ReportedTwoPhase::YES,
+              drivenPlan->shape().reportedTwoPhase);
   }
 
   RequestRun runProhibited(bool disabled) {

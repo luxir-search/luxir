@@ -23,6 +23,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
+#include "test/TestUtils.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -86,7 +87,7 @@ struct QueryState {
 std::vector<int32_t> collect(Query::Scorer* scorer, bool twoPhase) {
   std::vector<int32_t> docs;
   if (scorer == nullptr) return docs;
-  if (!twoPhase || !scorer->hasTwoPhase()) {
+  if (!twoPhase) {
     for (int32_t doc = scorer->next(); doc != PostingsReader::END;
          doc = scorer->next()) {
       docs.push_back(doc);
@@ -495,10 +496,12 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
             state.weight->count(segment));
   int64_t sparseBefore = SkipStats::geoSparseVerifyArms;
   SkipStats::enabled = true;
-  auto* sparse = supplier->get(pool, 0);
+  auto* sparsePlan = resolveScorerPlanForTests(pool, *supplier, 0);
+  auto* sparse = sparsePlan->build(pool);
   SkipStats::enabled = false;
   ASSERT_NE(nullptr, sparse);
-  EXPECT_TRUE(sparse->hasTwoPhase());
+  EXPECT_EQ(Query::ReportedTwoPhase::YES,
+            sparsePlan->shape().reportedTwoPhase);
   EXPECT_EQ(sparseBefore + 1, SkipStats::geoSparseVerifyArms);
 
   QueryState multiState(pool, *reader, "geo_multi", boxes[2]);

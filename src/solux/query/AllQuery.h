@@ -29,13 +29,11 @@ public:
     solux::IndexReader::Segment& segment;
     int32_t docid = -1;
     int32_t lastDoc;
-    bool denseClause;
 
-    Scorer(solux::IndexReader::Segment& segment, float constantScore = 0.0f,
-           bool denseClause = !disableDenseClauseForTests)
+    Scorer(solux::IndexReader::Segment& segment,
+           float constantScore = 0.0f)
       : Query::ConstantScorer(constantScore), segment(segment),
-        lastDoc(segment.postingsReader().maxDoc() - 1),
-        denseClause(denseClause) {
+        lastDoc(segment.postingsReader().maxDoc() - 1) {
     }
 
     int32_t next() override {
@@ -59,10 +57,6 @@ public:
     }
 
     void exhaust() override { lastDoc = -1; }
-
-    bool supportsWindowFilter() const override {
-      return denseClause;
-    }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
@@ -105,19 +99,19 @@ public:
     protected:
       Query::Scorer* buildScorer(MemPool& targetPool) override {
         return targetPool.make<AllQuery::Scorer>(
-            supplier.segment, supplier.score, supplier.denseClause);
+            supplier.segment, supplier.score);
       }
 
       Query::Scorer* buildIndependentScorer(
           MemPool& targetPool) override {
         return targetPool.make<AllQuery::Scorer>(
-            supplier.segment, supplier.score, supplier.denseClause);
+            supplier.segment, supplier.score);
       }
 
     public:
       Plan(Supplier& supplier, const Query::PlanContext& planContext,
            const Query::ScorerShape& shape, int64_t cost)
-        : Query::ScorerPlan(supplier, planContext, shape, cost),
+        : Query::ScorerPlan(planContext, shape, cost),
           supplier(supplier) {}
     };
 
@@ -151,13 +145,6 @@ public:
         const Query::PlanContext& planContext) override {
       return planPool.make<Plan>(
           *this, planContext, describeScorer(planContext), cost());
-    }
-
-    Query::Scorer* getIndependent(MemPool& targetPool,
-                                  int64_t leadCost) override {
-      Query::PlanContext planContext =
-          Query::PlanContext::fromLeadCost(leadCost);
-      return resolve(targetPool, planContext)->buildIndependent(targetPool);
     }
 
     BulkPlan planBulk(
