@@ -777,8 +777,12 @@ public:
             && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
       }
 
-      ScorerArm selectScorerArm(int64_t leadCost) const {
-        if (leadCost < estimatedCost) return ScorerArm::SPARSE_VERIFY;
+      ScorerArm selectScorerArm(const Query::Demand& demand) const {
+        // Sparse verification pays for the consumer's possible fill span;
+        // materialize once that span can cross the range's estimate fence.
+        if (demand.span < estimatedCost) {
+          return ScorerArm::SPARSE_VERIFY;
+        }
         if (points != nullptr) return ScorerArm::POINTS;
         return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
       }
@@ -880,7 +884,7 @@ public:
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
-        ScorerArm arm = selectScorerArm(buildContext.demand.candidates);
+        ScorerArm arm = selectScorerArm(buildContext.demand);
         return shapeFor(arm, buildContext);
       }
 
@@ -908,7 +912,7 @@ public:
       Query::ScorerPlan* resolve(
           MemPool& planPool,
           const Query::PlanContext& planContext) override {
-        ScorerArm arm = selectScorerArm(planContext.demand.candidates);
+        ScorerArm arm = selectScorerArm(planContext.demand);
         uint64_t begin = 0;
         uint64_t end = 0;
         bool complement = false;

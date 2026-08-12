@@ -179,11 +179,12 @@ public:
     static inline size_t maxLazyStateBytes = 32u << 20;
 
     static Query::PlanContext scorerBuildContext(
-        int64_t leadCost, bool phraseDisableSortForTests = false,
+        const Query::Demand& demand,
+        bool phraseDisableSortForTests = false,
         bool phraseDisableRepeatDedupForTests = false,
         bool phraseDisableShapesForTests = false) {
       return {
-        .demand = Query::Demand::fromLeadCost(leadCost),
+        .demand = demand,
         .multiTermScorerModeForTests = scorerModeForTests,
         .multiTermMaxLazyStateBytes = maxLazyStateBytes,
         .multiTermDisableDenseFillForTests = disableDenseFillForTests,
@@ -192,6 +193,17 @@ public:
             phraseDisableRepeatDedupForTests,
         .phraseDisableShapesForTests = phraseDisableShapesForTests,
       };
+    }
+
+    static Query::PlanContext scorerBuildContext(
+        int64_t leadCost, bool phraseDisableSortForTests = false,
+        bool phraseDisableRepeatDedupForTests = false,
+        bool phraseDisableShapesForTests = false) {
+      return scorerBuildContext(
+          Query::Demand::fromLeadCost(leadCost),
+          phraseDisableSortForTests,
+          phraseDisableRepeatDedupForTests,
+          phraseDisableShapesForTests);
     }
 
     Weight(Context& context, MultiTermQuery& query, int32_t flags, float multiplier)

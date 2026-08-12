@@ -150,7 +150,8 @@ enum class ExpectedScorerKind {
 };
 
 void expectShapeAndScorer(IndexReader& reader, std::string_view field,
-                          int64_t lo, int64_t hi, int64_t leadCost,
+                          int64_t lo, int64_t hi,
+                          const Query::Demand& demand,
                           ExpectedScorerKind expectedKind) {
   MemPool pool;
   QueryState state(pool, reader, field, lo, hi);
@@ -159,7 +160,7 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
   ASSERT_NE(nullptr, supplier);
 
   Query::PlanContext buildContext;
-  buildContext.demand = Query::Demand::fromLeadCost(leadCost);
+  buildContext.demand = demand;
   Query::ScorerShape shape = supplier->describeScorer(buildContext);
   bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY
       || expectedKind == ExpectedScorerKind::SCAN;
@@ -178,7 +179,8 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
   EXPECT_EQ(Query::UnresolvedSupplierCause::NONE,
             supplier->unresolvedScorerCause(buildContext));
 
-  Query::Scorer* scorer = supplier->get(pool, leadCost);
+  Query::Scorer* scorer =
+      supplier->resolve(pool, buildContext)->build(pool);
   ASSERT_NE(nullptr, scorer);
   EXPECT_EQ(expectedKind == ExpectedScorerKind::SPARSE_VERIFY,
             dynamic_cast<NumericRangeQuery::RangeScorer<
@@ -198,6 +200,14 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
   EXPECT_EQ(expectedTwoPhase, scorer->hasTwoPhase());
   EXPECT_TRUE(scorer->supportsWindowFilter());
   EXPECT_EQ(fullScan(reader, field, lo, hi), collect(scorer));
+}
+
+void expectShapeAndScorer(IndexReader& reader, std::string_view field,
+                          int64_t lo, int64_t hi, int64_t leadCost,
+                          ExpectedScorerKind expectedKind) {
+  expectShapeAndScorer(
+      reader, field, lo, hi, Query::Demand::fromLeadCost(leadCost),
+      expectedKind);
 }
 
 } // namespace
@@ -345,6 +355,11 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
     ASSERT_GT(supplierCost, 0);
     expectShapeAndScorer(*reader, field, lo, hi, supplierCost - 1,
                          ExpectedScorerKind::SPARSE_VERIFY);
+    expectShapeAndScorer(
+        *reader, field, lo, hi,
+        Query::Demand::fromCandidatesAndSpan(
+            supplierCost - 1, supplierCost),
+        denseKind);
     expectShapeAndScorer(*reader, field, lo, hi, supplierCost, denseKind);
     expectShapeAndScorer(*reader, field, lo, hi, supplierCost + 1, denseKind);
     expectShapeAndScorer(*reader, field, lo, hi,

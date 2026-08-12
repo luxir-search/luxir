@@ -78,16 +78,16 @@ public:
   }
 };
 
-class WindowFillExposureFactorGuard {
+class WindowFillSpanScaleGuard {
   int64_t saved;
 
 public:
-  explicit WindowFillExposureFactorGuard(int64_t factor)
-    : saved(BooleanQuery::windowFillExposureFactorForTests) {
-    BooleanQuery::windowFillExposureFactorForTests = factor;
+  explicit WindowFillSpanScaleGuard(int64_t scale)
+    : saved(BooleanQuery::windowFillSpanScaleForTests) {
+    BooleanQuery::windowFillSpanScaleForTests = scale;
   }
-  ~WindowFillExposureFactorGuard() {
-    BooleanQuery::windowFillExposureFactorForTests = saved;
+  ~WindowFillSpanScaleGuard() {
+    BooleanQuery::windowFillSpanScaleForTests = saved;
   }
 };
 
@@ -3788,7 +3788,7 @@ TEST_F(SearchEngineTest,
 }
 
 TEST_F(SearchEngineTest,
-       exhaustiveNumericCountScalesShapeRefreshToLeadExposure) {
+       exhaustiveNumericCountPricesMaterializationFromDemandSpan) {
   constexpr std::string_view collection = "numeric_count_lead_exposure";
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
@@ -3805,10 +3805,10 @@ TEST_F(SearchEngineTest,
   docs.reserve(N);
   int64_t expected = 0;
   for (int32_t doc = 0; doc < N; doc++) {
-    // One survivor per required term keeps minOther * 4096 below the fat
-    // range fence. The scoped dense-threshold override below only keeps this
-    // provably-tiny fixture on the refresh path so both build choices remain
-    // observable.
+    // One survivor per required term keeps the default
+    // minOther * WINDOW_SIZE span below the fat range fence. The scoped
+    // dense-threshold override only keeps this provably-tiny fixture on the
+    // refresh path so both build choices remain observable.
     bool first = doc % 10000 == 0;
     bool second = doc % 10001 == 0;
     expected += first && second && doc <= hi;
@@ -3829,7 +3829,7 @@ TEST_F(SearchEngineTest,
     int64_t complementArms;
     int64_t sparseVerifyArms;
   };
-  auto run = [&](int64_t factor) {
+  auto run = [&](int64_t spanScale) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").getNumber().limit(0);
@@ -3840,7 +3840,7 @@ TEST_F(SearchEngineTest,
     appendRawFilter(topDocs, "range", qb::range(
         topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
         qb::valI64(topDocs.mr(), hi), nullptr));
-    WindowFillExposureFactorGuard factorGuard(factor);
+    WindowFillSpanScaleGuard spanScaleGuard(spanScale);
     CountDenseThresholdGuard denseThresholdGuard(N);
     SkipStatsGuard stats;
     req->execute(false);
@@ -3854,7 +3854,7 @@ TEST_F(SearchEngineTest,
     };
   };
 
-  Run scaled = run(BooleanQuery::WINDOW_FILL_EXPOSURE_FACTOR);
+  Run scaled = run(BooleanQuery::WINDOW_FILL_SPAN_SCALE);
   Run maxDocLike = run(N);
   EXPECT_EQ(expected, scaled.found);
   EXPECT_EQ(scaled.found, maxDocLike.found);

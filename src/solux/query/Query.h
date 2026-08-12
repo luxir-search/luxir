@@ -413,6 +413,12 @@ public:
     int64_t span = std::numeric_limits<int64_t>::max();
     ExecutionUse horizon = ExecutionUse::PULL;
 
+    static Demand fromCandidatesAndSpan(
+        int64_t candidates, int64_t span,
+        ExecutionUse horizon = ExecutionUse::PULL) noexcept {
+      return {candidates, span, horizon};
+    }
+
     // R1 adapter: both demand units intentionally carry the old scalar.
     static Demand fromLeadCost(
         int64_t leadCost,

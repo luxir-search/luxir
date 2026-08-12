@@ -484,8 +484,8 @@ public:
   static inline int64_t kTermFeedMaxLeadFractionForTests =
       kTermFeedMaxLeadFraction;
   // Window-fill consumption converts per-candidate verification into
-  // per-span decoding. buildLeadCost_i = min(maxDoc,
-  // minOtherRequiredCost_i * 4096) bounds the worst-case fill span: every
+  // per-span decoding. Demand.span = min(maxDoc,
+  // Demand.candidates * WINDOW_SIZE) bounds the worst-case fill span: every
   // surviving other-side doc may populate one full window, saturated at the
   // segment size. Materialization is therefore admitted whenever that span
   // could exceed the fence, leaving sparse verification only for provably
@@ -496,9 +496,10 @@ public:
   // bound cannot observe the intermediate. A selectivity-product exposure
   // estimate is the enumerated future refinement. Measured with gcc-release
   // on Fenrir, 2026-08-11, with the quick-board A/B as the confirming oracle.
-  static constexpr int64_t WINDOW_FILL_EXPOSURE_FACTOR = 4096;
-  static inline int64_t windowFillExposureFactorForTests =
-      WINDOW_FILL_EXPOSURE_FACTOR;
+  static constexpr int64_t WINDOW_FILL_SPAN_SCALE =
+      DocsEnumMeta::L1_DOCS;
+  static inline int64_t windowFillSpanScaleForTests =
+      WINDOW_FILL_SPAN_SCALE;
   // A cached DocSet has a cheap mask route, so a term may own the candidate
   // feed only when it is materially sparser than the filter. A postings filter
   // would otherwise need a per-query mask fill and does not use this gate.
@@ -845,14 +846,12 @@ public:
     };
 
     static Query::PlanContext scorerBuildContext(
-        int64_t leadCost,
-        Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
+        const Query::Demand& demand) {
       Query::PlanContext buildContext =
           MultiTermQuery::Weight::scorerBuildContext(
-              leadCost, PhraseQuery::ScorerControls::disableSortForTests,
+              demand, PhraseQuery::ScorerControls::disableSortForTests,
               PhraseQuery::ScorerControls::disableRepeatDedupForTests,
               PhraseQuery::disableShapesForTests);
-      buildContext.demand.horizon = horizon;
       buildContext.numericRangeDisableShapesForTests =
           NumericRangeQuery::disableShapesForTests;
       buildContext.disableBooleanTwoPhaseForTests =
@@ -862,6 +861,13 @@ public:
       buildContext.disableFilteredUnionWandForTests =
           disableFilteredUnionWandForTests;
       return buildContext;
+    }
+
+    static Query::PlanContext scorerBuildContext(
+        int64_t leadCost,
+        Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
+      return scorerBuildContext(
+          Query::Demand::fromLeadCost(leadCost, horizon));
     }
 
 #ifndef NDEBUG
@@ -1589,11 +1595,18 @@ public:
 
       static Query::PlanContext childPlanContext(
           const Query::PlanContext& parentContext,
-          int64_t leadCost) {
+          const Query::Demand& demand) {
         Query::PlanContext childContext = parentContext;
-        childContext.demand = Query::Demand::fromLeadCost(
-            leadCost, parentContext.demand.horizon);
+        childContext.demand = demand;
         return childContext;
+      }
+
+      static Query::PlanContext childPlanContext(
+          const Query::PlanContext& parentContext,
+          int64_t leadCost) {
+        return childPlanContext(
+            parentContext, Query::Demand::fromLeadCost(
+                leadCost, parentContext.demand.horizon));
       }
 
       class PullScorerPlan final : public Query::ScorerPlan {
@@ -1979,14 +1992,14 @@ public:
         bool docSetFilter;
         bool scoring;
         size_t order;
-        int64_t buildLeadCost = 0;
+        Query::Demand buildDemand;
         Query::ScorerPlan* plan = nullptr;
       };
 
       struct PlannedSupplier {
         Query::ScorerSupplier* supplier;
         Query::ScorerShape shape;
-        int64_t buildLeadCost = 0;
+        Query::Demand buildDemand;
         Query::ScorerPlan* plan = nullptr;
       };
 
@@ -2114,13 +2127,16 @@ public:
         return shape;
       }
 
-      int64_t scaledWindowFillExposure(int64_t exposure) const {
-        assert(exposure >= 0);
-        assert(windowFillExposureFactorForTests > 0);
-        return exposure
-                > segment.maxDoc() / windowFillExposureFactorForTests
+      Query::Demand windowFillDemand(
+          int64_t candidates, BulkUse use) const {
+        assert(candidates >= 0);
+        assert(windowFillSpanScaleForTests > 0);
+        int64_t span = candidates
+                > segment.maxDoc() / windowFillSpanScaleForTests
             ? segment.maxDoc()
-            : exposure * windowFillExposureFactorForTests;
+            : candidates * windowFillSpanScaleForTests;
+        return Query::Demand::fromCandidatesAndSpan(
+            candidates, span, use);
       }
 
       ConjunctionPlanningResult planConjunctionOnce(
@@ -2129,11 +2145,11 @@ public:
           BulkUse use,
           std::span<Query::ScorerSupplier* const>
               enclosingFilterSuppliers,
-          bool perEntryExposure = false) {
+          bool perEntryDemand = false) {
         ConjunctionPlan plan;
         plan.mode = mode;
         plan.use = use;
-        assert(!perEntryExposure || use == BulkUse::COUNT_WINDOWS);
+        assert(!perEntryDemand || use == BulkUse::COUNT_WINDOWS);
         plan.enclosingFilters = enclosingFilterSuppliers.empty()
             ? EnclosingFilters::NOT_SUPPLIED
             : EnclosingFilters::CONSUMED;
@@ -2207,20 +2223,23 @@ public:
           plan.nonLeadCost += entries[i].cost;
         }
 
-        int64_t optionalGroupBuildLeadCost = plan.leadCost;
+        Query::Demand optionalGroupBuildDemand =
+            Query::Demand::fromLeadCost(plan.leadCost, use);
         for (size_t i = 0; i < entries.size(); i++) {
           PlannedEntry& entry = entries[i];
-          entry.buildLeadCost = plan.leadCost;
-          if (perEntryExposure) {
-            entry.buildLeadCost = entries.size() == 1
-                ? segment.maxDoc()
-                : scaledWindowFillExposure(
-                    entries[i == 0 ? 1 : 0].cost);
+          entry.buildDemand = Query::Demand::fromLeadCost(
+              plan.leadCost, use);
+          if (perEntryDemand) {
+            entry.buildDemand = entries.size() == 1
+                ? Query::Demand::fromCandidatesAndSpan(
+                    segment.maxDoc(), segment.maxDoc(), use)
+                : windowFillDemand(
+                    entries[i == 0 ? 1 : 0].cost, use);
           }
           Query::PlanContext buildContext =
-              scorerBuildContext(entry.buildLeadCost, use);
+              scorerBuildContext(entry.buildDemand);
           if (entry.optionalGroup) {
-            optionalGroupBuildLeadCost = entry.buildLeadCost;
+            optionalGroupBuildDemand = entry.buildDemand;
             if (hasUnknownElision(optionalSuppliers, buildContext)) {
               plan.unresolvedCause = firstUnresolvedCause(
                   optionalSuppliers, buildContext);
@@ -2252,11 +2271,11 @@ public:
             prohibitedSuppliers.push_back(supplier);
           }
         }
-        int64_t prohibitedBuildLeadCost = perEntryExposure
-            ? scaledWindowFillExposure(entries[0].cost)
-            : plan.leadCost;
+        Query::Demand prohibitedBuildDemand = perEntryDemand
+            ? windowFillDemand(entries[0].cost, use)
+            : Query::Demand::fromLeadCost(plan.leadCost, use);
         Query::PlanContext prohibitedBuildContext =
-            scorerBuildContext(prohibitedBuildLeadCost, use);
+            scorerBuildContext(prohibitedBuildDemand);
         if (hasUnknownElision(
                 prohibitedSuppliers, prohibitedBuildContext)) {
           plan.unresolvedCause = firstUnresolvedCause(
@@ -2270,11 +2289,11 @@ public:
             targetPool.make_span<PlannedSupplier>(optionalSuppliers.size());
         for (size_t i = 0; i < optionalSuppliers.size(); i++) {
           Query::PlanContext buildContext =
-              scorerBuildContext(optionalGroupBuildLeadCost, use);
+              scorerBuildContext(optionalGroupBuildDemand);
           plan.optionalGroup[i] = {
               optionalSuppliers[i],
               optionalSuppliers[i]->describeScorer(buildContext),
-              optionalGroupBuildLeadCost};
+              optionalGroupBuildDemand};
           if (plan.unresolvedCause
                   == Query::UnresolvedSupplierCause::NONE
               && plan.optionalGroup[i].shape.hasUnknown()) {
@@ -2289,7 +2308,7 @@ public:
               prohibitedSuppliers[i],
               prohibitedSuppliers[i]->describeScorer(
                   prohibitedBuildContext),
-              prohibitedBuildLeadCost};
+              prohibitedBuildDemand};
           if (plan.unresolvedCause
                   == Query::UnresolvedSupplierCause::NONE
               && plan.prohibited[i].shape.hasUnknown()) {
@@ -2659,8 +2678,8 @@ public:
       void resolveConjunctionChildren(
           MemPool& planPool, ConjunctionPlan& plan) {
         auto resolveChild = [&](PlannedSupplier& child) {
-          Query::PlanContext planContext = scorerBuildContext(
-              child.buildLeadCost, plan.use);
+          Query::PlanContext planContext =
+              scorerBuildContext(child.buildDemand);
           child.plan = child.supplier->resolve(planPool, planContext);
           assert(child.plan != nullptr);
 #ifndef NDEBUG
@@ -2675,8 +2694,8 @@ public:
             }
             continue;
           }
-          Query::PlanContext planContext = scorerBuildContext(
-              entry.buildLeadCost, plan.use);
+          Query::PlanContext planContext =
+              scorerBuildContext(entry.buildDemand);
           entry.plan = entry.supplier->resolve(planPool, planContext);
           assert(entry.plan != nullptr);
 #ifndef NDEBUG
@@ -3254,22 +3273,26 @@ public:
 
       MaybeConjunctionBulk buildConjunction(
           MemPool& targetPool, const ConjunctionPlan& plan) {
-        auto assertBuildLeadCost = [&](int64_t buildLeadCost) {
+        auto assertBuildDemand = [&](const Query::Demand& demand) {
+          assert(demand.horizon == plan.use);
           if (plan.use == BulkUse::COUNT_WINDOWS) {
-            assert(buildLeadCost >= plan.leadCost);
-            assert(buildLeadCost <= segment.maxDoc());
+            assert(demand.candidates >= plan.leadCost);
+            assert(demand.candidates <= segment.maxDoc());
+            assert(demand.span >= demand.candidates);
+            assert(demand.span <= segment.maxDoc());
           } else {
-            assert(buildLeadCost == plan.leadCost);
+            assert(demand.candidates == plan.leadCost);
+            assert(demand.span == plan.leadCost);
           }
         };
         for (const PlannedEntry& entry : plan.entries) {
-          assertBuildLeadCost(entry.buildLeadCost);
+          assertBuildDemand(entry.buildDemand);
         }
         for (const PlannedSupplier& member : plan.optionalGroup) {
-          assertBuildLeadCost(member.buildLeadCost);
+          assertBuildDemand(member.buildDemand);
         }
         for (const PlannedSupplier& prohibited : plan.prohibited) {
-          assertBuildLeadCost(prohibited.buildLeadCost);
+          assertBuildDemand(prohibited.buildDemand);
         }
         if (plan.route == ConjunctionRoute::COUNT_EXACT_DOCS_ONLY) {
           auto countTermEnums =
