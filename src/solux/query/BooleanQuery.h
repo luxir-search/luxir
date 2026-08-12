@@ -837,6 +837,13 @@ public:
       size_t scoringCount;
     };
 
+    struct PullChildPlan {
+      int64_t cost = 0;
+      Query::ScorerSupplier* supplier = nullptr;
+      Query::ScorerPlan* plan = nullptr;
+      bool scoring = false;
+    };
+
     static Query::PlanContext scorerBuildContext(
         int64_t leadCost,
         Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
@@ -984,49 +991,20 @@ public:
     }
 #endif
 
-    // Build the required-clause conjunction. Mandatory clauses score; filter
-    // clauses only constrain iteration. Required clauses are ordered by
-    // ascending supplier cost so the sparsest leads the conjunction, and that
-    // cost is passed as leadCost to every child get() per the supplier planning
-    // contract. Because a Solux Scorer exposes no cost(), this ordering happens
-    // here at the supplier layer, before any scorer is constructed.
+    // Build the required-clause conjunction from the child plans retained by
+    // the Boolean plan. Mandatory clauses score; filters only constrain
+    // iteration. Resolve has already frozen the pre-expansion supplier order
+    // and passed the sparsest required cost to every child plan.
     static Required assembleRequired(
         MemPool& targetPool,
-        IndexReader::Segment& segment,
-        std::span<Query::SegmentSource* const> mandatorySources,
-        std::span<const uint8_t> mandatoryScores,
-        std::span<Query::ScorerSupplier* const> filterSuppliers,
+        std::span<PullChildPlan> entries,
+        int64_t leadCost,
         bool allowsPruning) {
-      assert(mandatorySources.size() == mandatoryScores.size());
-      struct Entry {
-        int64_t cost;
-        Query::ScorerSupplier* supplier;
-        bool scoring;
-      };
-      boost::container::small_vector<Entry, 16> entries;
       size_t scoringCapacity = 0;
-      for (size_t i = 0; i < mandatorySources.size(); i++) {
-        auto* source = mandatorySources[i];
-        auto* supplier = source->scorerSupplier(targetPool, segment);
-        if (supplier == nullptr) return {nullptr, true, 0, 0};
-        bool scores = mandatoryScores[i] != 0;
-        scoringCapacity += scores ? 1 : 0;
-        entries.push_back({supplier->cost(), supplier, scores});
-      }
-      for (auto* supplier : filterSuppliers) {
-        if (supplier == nullptr) return {nullptr, true, 0, 0};
-        entries.push_back({supplier->cost(), supplier, false});
+      for (const PullChildPlan& entry : entries) {
+        scoringCapacity += entry.scoring ? 1 : 0;
       }
       if (entries.empty()) return {nullptr, false, 0, 0};
-
-      // leadCost is the cost of the sparsest required clause: it bounds how often
-      // the others get driven, so each may plan eager vs lazy setup off it.
-      int64_t leadCost = std::numeric_limits<int64_t>::max();
-      for (auto& e : entries) leadCost = std::min(leadCost, e.cost);
-
-      // Sparsest first so allScorers[0] leads the conjunction.
-      std::sort(entries.begin(), entries.end(),
-                [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
 
       auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
       auto* costs = targetPool.make_arr<int64_t>(entries.size());
@@ -1036,13 +1014,9 @@ public:
       size_t allCount = 0;
       size_t scoringCount = 0;
       for (auto& e : entries) {
+        auto* scorer = e.plan->build(targetPool);
 #ifndef NDEBUG
-        Query::PlanContext buildContext =
-            scorerBuildContext(leadCost);
-#endif
-        auto* scorer = e.supplier->get(targetPool, leadCost);
-#ifndef NDEBUG
-        assertScorerShape(e.supplier, scorer, buildContext);
+        assertScorerLayout(e.plan->shape(), scorer);
 #endif
         if (scorer == nullptr) return {nullptr, true, 0, 0};
         all[allCount] = scorer;
@@ -1065,27 +1039,20 @@ public:
     static Query::Scorer* assembleScorer(
         MemPool& targetPool,
         IndexReader::Segment& segment,
-        std::span<Query::SegmentSource* const> mandatorySources,
-        std::span<const uint8_t> mandatoryScores,
-        std::span<Query::SegmentSource* const> optionalSources,
-        std::span<Query::SegmentSource* const> prohibitedSources,
-        std::span<Query::ScorerSupplier* const> filterSuppliers,
+        std::span<PullChildPlan> requiredPlans,
+        std::span<PullChildPlan> optionalPlans,
+        std::span<PullChildPlan> prohibitedPlans,
+        int64_t requiredLeadCost,
+        size_t mandatoryCount,
+        size_t filterCount,
+        size_t optionalSourceCount,
+        size_t prohibitedSourceCount,
         int minShouldMatch,
         bool needsScores,
         bool externallyDriven,
         bool allowsPruning) {
-      QueryPrep::ScorerBuildObserver buildObserver = nullptr;
-#ifndef NDEBUG
-      buildObserver = [](Query::ScorerSupplier* supplier,
-                         Query::Scorer* scorer, int64_t leadCost) {
-        Query::PlanContext buildContext =
-            scorerBuildContext(leadCost);
-        assertScorerShape(supplier, scorer, buildContext);
-      };
-#endif
       Required req = assembleRequired(
-          targetPool, segment, mandatorySources, mandatoryScores,
-          filterSuppliers, allowsPruning);
+          targetPool, requiredPlans, requiredLeadCost, allowsPruning);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
       bool hasScoringMandatory = req.scoringCount > 0;
@@ -1099,27 +1066,36 @@ public:
 
       // For min-should-match (> 1) order the optional scorers by cost so the
       // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
-      QueryPrep::CostedScorers optional;
-      if (minShouldMatch > 1) {
-        optional = QueryPrep::createScorersByCost(
-            targetPool, segment, optionalSources, buildObserver);
-      } else if (minShouldMatch == 1) {
-        optional = QueryPrep::createScorersWithCosts(
-            targetPool, segment, optionalSources, buildObserver);
-      } else {
-        optional.scorers = QueryPrep::createScorers(
-            targetPool, segment, optionalSources, buildObserver);
+      auto optionalScorersStorage =
+          targetPool.make_span<Query::Scorer*>(optionalPlans.size());
+      auto optionalCostsStorage = minShouldMatch >= 1
+          ? targetPool.make_span<int64_t>(optionalPlans.size())
+          : std::span<int64_t>{};
+      size_t optionalCount = 0;
+      for (PullChildPlan& child : optionalPlans) {
+        Query::Scorer* scorer = child.plan->build(targetPool);
+#ifndef NDEBUG
+        assertScorerLayout(child.plan->shape(), scorer);
+#endif
+        if (scorer == nullptr) continue;
+        optionalScorersStorage[optionalCount] = scorer;
+        if (minShouldMatch >= 1) {
+          optionalCostsStorage[optionalCount] = child.cost;
+        }
+        optionalCount++;
       }
-      auto optionalScorers = optional.scorers;
-      auto optionalCosts = optional.costs;
+      auto optionalScorers = optionalScorersStorage.first(optionalCount);
+      auto optionalCosts = minShouldMatch >= 1
+          ? optionalCostsStorage.first(optionalCount)
+          : std::span<int64_t>{};
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
         bool directWindowFilters = false;
-        if (mandatorySources.empty() && !filterSuppliers.empty()
+        if (mandatoryCount == 0 && filterCount != 0
             && reqScorer != nullptr) {
           auto filterScorers = reqScorer->flatConjunctionScorers();
-          directWindowFilters = filterScorers.size() == filterSuppliers.size()
+          directWindowFilters = filterScorers.size() == filterCount
               && std::all_of(filterScorers.begin(), filterScorers.end(),
                              [](Query::Scorer* scorer) {
                                return scorer->supportsWindowFilter();
@@ -1136,18 +1112,18 @@ public:
         // replaces the sole scoring disjunction member.
         bool useFilteredUnionWand = !disableFilteredUnionWandForTests
             && needsScores && minShouldMatch == 1
-            && mandatorySources.empty() && prohibitedSources.empty()
+            && mandatoryCount == 0 && prohibitedSourceCount == 0
             && directWindowFilters && flatTermDisjunction
             && req.scoringCount == 0
             && filterDensityRoutesToPull(req.cost, segment.maxDoc());
         bool plainExternalDisjunction = externallyDriven && needsScores
-          && reqScorer == nullptr && prohibitedSources.empty()
+          && reqScorer == nullptr && prohibitedSourceCount == 0
           && minShouldMatch <= 1 && optCount >= 2;
         if (plainExternalDisjunction) {
           sortByMaxScore(targetPool, optionalScorers);
         }
         bool useMaxScoreDisjunction = needsScores && reqScorer == nullptr
-          && prohibitedSources.empty() && minShouldMatch <= 1 && optCount >= 2
+          && prohibitedSourceCount == 0 && minShouldMatch <= 1 && optCount >= 2
           && !plainExternalDisjunction;
         // minShouldMatch applies to optional scorers that exist in this segment.
         if (minShouldMatch <= 1) {
@@ -1168,7 +1144,8 @@ public:
             targetPool, optionalScorers, optionalCosts, optionalScorers,
             allowsPruning);
         } else if (optCount > minShouldMatch) {
-          bool useWand = needsScores && reqScorer == nullptr && prohibitedSources.empty();
+          bool useWand = needsScores && reqScorer == nullptr
+              && prohibitedSourceCount == 0;
           if (useWand) {
             optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
               targetPool, optionalScorers, minShouldMatch);
@@ -1190,7 +1167,7 @@ public:
         // constraining optional group means no match here - returning
         // reqScorer would wrongly emit filter/required-only docs.  A rank-only
         // group is simply absent.
-        if (optionalsConstrain && !optionalSources.empty()) return nullptr;
+        if (optionalsConstrain && optionalSourceCount != 0) return nullptr;
         boolScorer = reqScorer;
       } else if (!optionalsConstrain) {
         // min_match unset with required/filter clauses: optionals rank
@@ -1215,8 +1192,19 @@ public:
             targetPool, allSpan, allCosts, scoringSpan, allowsPruning);
       }
 
-      auto prohibitedScorers = QueryPrep::createScorers(
-          targetPool, segment, prohibitedSources, buildObserver);
+      auto prohibitedStorage =
+          targetPool.make_span<Query::Scorer*>(prohibitedPlans.size());
+      size_t prohibitedCount = 0;
+      for (PullChildPlan& child : prohibitedPlans) {
+        Query::Scorer* scorer = child.plan->build(targetPool);
+#ifndef NDEBUG
+        assertScorerLayout(child.plan->shape(), scorer);
+#endif
+        if (scorer != nullptr) {
+          prohibitedStorage[prohibitedCount++] = scorer;
+        }
+      }
+      auto prohibitedScorers = prohibitedStorage.first(prohibitedCount);
       if (!prohibitedScorers.empty()) {
         Query::Scorer* prohibitedScorer = prohibitedScorers.size() == 1
           ? prohibitedScorers[0]
@@ -1470,11 +1458,14 @@ public:
             mandatoryShapeSuppliers.size() + filterSuppliers.size();
         if (requiredCount == 0) return emptyShape();
 
+        Query::PlanContext memberContext = childPlanContext(
+            buildContext, shapeRequiredCost);
+
         Query::MatchState state =
-            requiredMatchState(mandatoryShapeSuppliers, buildContext);
+            requiredMatchState(mandatoryShapeSuppliers, memberContext);
         if (state != Query::MatchState::EMPTY) {
           Query::MatchState filters =
-              requiredMatchState(filterSuppliers, buildContext);
+              requiredMatchState(filterSuppliers, memberContext);
           if (filters == Query::MatchState::EMPTY) {
             state = Query::MatchState::EMPTY;
           } else if (filters == Query::MatchState::UNKNOWN) {
@@ -1485,7 +1476,7 @@ public:
 
         if (requiredCount == 1 && mandatoryShapeSuppliers.size() == 1
             && mandatoryScores[0] != 0) {
-          return mandatoryShapeSuppliers[0]->describeScorer(buildContext);
+          return mandatoryShapeSuppliers[0]->describeScorer(memberContext);
         }
         return opaqueShape(state);
       }
@@ -1493,9 +1484,11 @@ public:
       std::optional<bool> directWindowFilters(
           const Query::PlanContext& buildContext) const {
         if (!mandatorySources.empty() || filterSuppliers.empty()) return false;
+        Query::PlanContext memberContext = childPlanContext(
+            buildContext, shapeRequiredCost);
         for (auto* supplier : filterSuppliers) {
           if (supplier == nullptr) return false;
-          Query::ScorerShape shape = supplier->describeScorer(buildContext);
+          Query::ScorerShape shape = supplier->describeScorer(memberContext);
           if (shape.windowFillClause == Query::ClauseShape::UNKNOWN) {
             return std::nullopt;
           }
@@ -1509,7 +1502,10 @@ public:
       Query::ScorerShape optionalShape(
           const Query::PlanContext& buildContext,
           bool hasRequired) const {
-        size_t count = nonemptyCount(optionalShapeSuppliers, buildContext);
+        Query::PlanContext memberContext = childPlanContext(
+            buildContext, std::numeric_limits<int64_t>::max());
+        size_t count = nonemptyCount(
+            optionalShapeSuppliers, memberContext);
         if (count == 0 || (minShouldMatch > 1
                            && count < (size_t) minShouldMatch)) {
           return emptyShape();
@@ -1518,7 +1514,7 @@ public:
           for (auto* supplier : optionalShapeSuppliers) {
             if (supplier != nullptr) {
               Query::ScorerShape shape =
-                  supplier->describeScorer(buildContext);
+                  supplier->describeScorer(memberContext);
               if (shape.matchState == Query::MatchState::NONEMPTY) {
                 return shape;
               }
@@ -1532,7 +1528,7 @@ public:
         }
 
         Query::ClauseShape termShape = flatClauseShape(
-            optionalShapeSuppliers, buildContext, false);
+            optionalShapeSuppliers, memberContext, false);
         std::optional<bool> directFilters =
             directWindowFilters(buildContext);
         bool filteredUnionWandCandidate =
@@ -1566,11 +1562,11 @@ public:
 
         Query::ScorerShape shape = opaqueShape(
             Query::MatchState::NONEMPTY,
-            disjunctionTwoPhase(optionalShapeSuppliers, buildContext));
+            disjunctionTwoPhase(optionalShapeSuppliers, memberContext));
         shape.windowFillClause = flatClauseShape(
-            optionalShapeSuppliers, buildContext, true);
+            optionalShapeSuppliers, memberContext, true);
         shape.termDisjunctionClause = flatClauseShape(
-            optionalShapeSuppliers, buildContext, false);
+            optionalShapeSuppliers, memberContext, false);
         return shape;
       }
 
@@ -1590,6 +1586,55 @@ public:
         }
         return Query::ReportedTwoPhase::UNKNOWN;
       }
+
+      static Query::PlanContext childPlanContext(
+          const Query::PlanContext& parentContext,
+          int64_t leadCost) {
+        Query::PlanContext childContext = parentContext;
+        childContext.demand = Query::Demand::fromLeadCost(
+            leadCost, parentContext.demand.horizon);
+        return childContext;
+      }
+
+      class PullScorerPlan final : public Query::ScorerPlan {
+        Supplier& supplier;
+        std::span<PullChildPlan> required;
+        std::span<PullChildPlan> optional;
+        std::span<PullChildPlan> prohibited;
+        int64_t requiredLeadCost;
+        bool requiredUnsatisfiable;
+
+      protected:
+        Query::Scorer* buildScorer(MemPool& targetPool) override {
+          if (requiredUnsatisfiable) return nullptr;
+          return assembleScorer(
+              targetPool, supplier.segment, required, optional, prohibited,
+              requiredLeadCost, supplier.mandatorySources.size(),
+              supplier.filterSuppliers.size(),
+              supplier.optionalSources.size(),
+              supplier.prohibitedSources.size(), supplier.minShouldMatch,
+              supplier.needsScores,
+              demand().candidates
+                  != std::numeric_limits<int64_t>::max(),
+              supplier.allowsPruning);
+        }
+
+      public:
+        PullScorerPlan(
+            Supplier& supplier,
+            const Query::PlanContext& planContext,
+            const Query::ScorerShape& shape,
+            int64_t cost,
+            std::span<PullChildPlan> required,
+            std::span<PullChildPlan> optional,
+            std::span<PullChildPlan> prohibited,
+            int64_t requiredLeadCost,
+            bool requiredUnsatisfiable)
+          : Query::ScorerPlan(supplier, planContext, shape, cost),
+            supplier(supplier), required(required), optional(optional),
+            prohibited(prohibited), requiredLeadCost(requiredLeadCost),
+            requiredUnsatisfiable(requiredUnsatisfiable) {}
+      };
 
     public:
       Supplier(MemPool& pool, IndexReader::Segment& segment,
@@ -1653,12 +1698,14 @@ public:
           const Query::PlanContext& buildContext) const override {
         bool hasRequired = !mandatorySources.empty()
             || !filterSuppliers.empty();
+        Query::PlanContext unboundedContext = childPlanContext(
+            buildContext, std::numeric_limits<int64_t>::max());
         Query::ScorerShape required = requiredShape(buildContext);
         if (hasRequired
             && required.matchState == Query::MatchState::EMPTY) {
           return maskSupplierAccess(required);
         }
-        if (hasUnknownElision(optionalShapeSuppliers, buildContext)) {
+        if (hasUnknownElision(optionalShapeSuppliers, unboundedContext)) {
           return maskSupplierAccess({});
         }
 
@@ -1685,10 +1732,10 @@ public:
           return maskSupplierAccess(positive);
         }
 
-        if (hasUnknownElision(prohibitedShapeSuppliers, buildContext)) {
+        if (hasUnknownElision(prohibitedShapeSuppliers, unboundedContext)) {
           return maskSupplierAccess({});
         }
-        if (nonemptyCount(prohibitedShapeSuppliers, buildContext) != 0) {
+        if (nonemptyCount(prohibitedShapeSuppliers, unboundedContext) != 0) {
           positive = opaqueShape(positive.matchState);
         }
         return maskSupplierAccess(positive);
@@ -1696,20 +1743,31 @@ public:
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
           const Query::PlanContext& buildContext) const override {
-        auto findCause = [&](std::span<Query::ScorerSupplier* const> suppliers) {
+        Query::PlanContext requiredContext = childPlanContext(
+            buildContext, shapeRequiredCost);
+        for (auto suppliers : {
+                 mandatoryShapeSuppliers, filterSuppliers}) {
+          Query::UnresolvedSupplierCause cause = [&]() {
+            for (auto* supplier : suppliers) {
+              if (supplier != nullptr
+                  && supplier->describeScorer(requiredContext).hasUnknown()) {
+                return supplier->unresolvedScorerCause(requiredContext);
+              }
+            }
+            return Query::UnresolvedSupplierCause::NONE;
+          }();
+          if (cause != Query::UnresolvedSupplierCause::NONE) return cause;
+        }
+        Query::PlanContext unboundedContext = childPlanContext(
+            buildContext, std::numeric_limits<int64_t>::max());
+        for (auto suppliers : {
+                 optionalShapeSuppliers, prohibitedShapeSuppliers}) {
           for (auto* supplier : suppliers) {
             if (supplier != nullptr
-                && supplier->describeScorer(buildContext).hasUnknown()) {
-              return supplier->unresolvedScorerCause(buildContext);
+                && supplier->describeScorer(unboundedContext).hasUnknown()) {
+              return supplier->unresolvedScorerCause(unboundedContext);
             }
           }
-          return Query::UnresolvedSupplierCause::NONE;
-        };
-        for (auto suppliers : {
-                 mandatoryShapeSuppliers, filterSuppliers,
-                 optionalShapeSuppliers, prohibitedShapeSuppliers}) {
-          Query::UnresolvedSupplierCause cause = findCause(suppliers);
-          if (cause != Query::UnresolvedSupplierCause::NONE) return cause;
         }
         return Query::UnresolvedSupplierCause::OTHER;
       }
@@ -1725,6 +1783,102 @@ public:
         filled = fillExpansionMemos(prohibitedShapeSuppliers, buildContext)
             || filled;
         return filled;
+      }
+
+      Query::ScorerPlan* resolve(
+          MemPool& planPool,
+          const Query::PlanContext& planContext) override {
+        int64_t resolvedCost = cost();
+        boost::container::small_vector<PullChildPlan, 16> required;
+        boost::container::small_vector<PullChildPlan, 16> optional;
+        boost::container::small_vector<PullChildPlan, 16> prohibited;
+        bool requiredUnsatisfiable = false;
+
+        for (size_t i = 0; i < mandatoryShapeSuppliers.size(); i++) {
+          Query::ScorerSupplier* child = mandatoryShapeSuppliers[i];
+          if (child == nullptr) {
+            requiredUnsatisfiable = true;
+            continue;
+          }
+          required.push_back({
+              child->cost(), child, nullptr, mandatoryScores[i] != 0});
+        }
+        for (size_t i = 0; i < filterSuppliers.size(); i++) {
+          Query::ScorerSupplier* child = filterSuppliers[i];
+          if (child == nullptr) {
+            requiredUnsatisfiable = true;
+            continue;
+          }
+          required.push_back({child->cost(), child, nullptr, false});
+        }
+
+        int64_t requiredLeadCost =
+            std::numeric_limits<int64_t>::max();
+        for (const PullChildPlan& child : required) {
+          requiredLeadCost = std::min(requiredLeadCost, child.cost);
+        }
+        std::sort(
+            required.begin(), required.end(),
+            [](const PullChildPlan& left, const PullChildPlan& right) {
+              return left.cost < right.cost;
+            });
+
+        for (size_t i = 0; i < optionalShapeSuppliers.size(); i++) {
+          Query::ScorerSupplier* child = optionalShapeSuppliers[i];
+          if (child == nullptr) continue;
+          int64_t childCost = minShouldMatch >= 1 ? child->cost() : 0;
+          optional.push_back({childCost, child, nullptr, false});
+        }
+        if (minShouldMatch > 1) {
+          std::sort(
+              optional.begin(), optional.end(),
+              [](const PullChildPlan& left, const PullChildPlan& right) {
+                return left.cost < right.cost;
+              });
+        }
+        for (Query::ScorerSupplier* child : prohibitedShapeSuppliers) {
+          if (child != nullptr) {
+            prohibited.push_back({0, child, nullptr, false});
+          }
+        }
+
+        auto requiredPlans =
+            planPool.make_span<PullChildPlan>(required.size());
+        auto optionalPlans =
+            planPool.make_span<PullChildPlan>(optional.size());
+        auto prohibitedPlans =
+            planPool.make_span<PullChildPlan>(prohibited.size());
+        std::copy(required.begin(), required.end(), requiredPlans.begin());
+        std::copy(optional.begin(), optional.end(), optionalPlans.begin());
+        std::copy(prohibited.begin(), prohibited.end(), prohibitedPlans.begin());
+
+        if (!requiredUnsatisfiable) {
+          Query::PlanContext requiredContext = childPlanContext(
+              planContext, requiredLeadCost);
+          for (PullChildPlan& child : requiredPlans) {
+            child.plan = child.supplier->resolve(
+                planPool, requiredContext);
+            assert(child.plan != nullptr);
+          }
+          Query::PlanContext unboundedContext = childPlanContext(
+              planContext, std::numeric_limits<int64_t>::max());
+          for (PullChildPlan& child : optionalPlans) {
+            child.plan = child.supplier->resolve(
+                planPool, unboundedContext);
+            assert(child.plan != nullptr);
+          }
+          for (PullChildPlan& child : prohibitedPlans) {
+            child.plan = child.supplier->resolve(
+                planPool, unboundedContext);
+            assert(child.plan != nullptr);
+          }
+        }
+
+        Query::ScorerShape shape = describeScorer(planContext);
+        return planPool.make<PullScorerPlan>(
+            *this, planContext, shape, resolvedCost,
+            requiredPlans, optionalPlans, prohibitedPlans,
+            requiredLeadCost, requiredUnsatisfiable);
       }
 
       DocSet* exactDocSet() override {
@@ -1757,11 +1911,8 @@ public:
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        return assembleScorer(targetPool, segment, mandatorySources,
-                              mandatoryScores, optionalSources,
-                              prohibitedSources, filterSuppliers, minShouldMatch, needsScores,
-                              leadCost != std::numeric_limits<int64_t>::max(),
-                              allowsPruning);
+        Query::PlanContext planContext = scorerBuildContext(leadCost);
+        return resolve(targetPool, planContext)->build(targetPool);
       }
 
       enum class ConjunctionMode : uint8_t {
@@ -1829,12 +1980,14 @@ public:
         bool scoring;
         size_t order;
         int64_t buildLeadCost = 0;
+        Query::ScorerPlan* plan = nullptr;
       };
 
       struct PlannedSupplier {
         Query::ScorerSupplier* supplier;
         Query::ScorerShape shape;
         int64_t buildLeadCost = 0;
+        Query::ScorerPlan* plan = nullptr;
       };
 
       struct ConjunctionPlan : BulkBuildState {
@@ -1852,6 +2005,7 @@ public:
         bool docSetSparseEligible = false;
         bool recordConjunctionConstruction = false;
         bool hasDirectDenseClause = false;
+        Query::ScorerPlan* independentLeadPlan = nullptr;
         Query::UnresolvedSupplierCause unresolvedCause =
             Query::UnresolvedSupplierCause::NONE;
       };
@@ -2487,6 +2641,65 @@ public:
         return planning;
       }
 
+#ifndef NDEBUG
+      static bool sameScorerShape(
+          const Query::ScorerShape& left,
+          const Query::ScorerShape& right) {
+        return left.matchState == right.matchState
+            && left.directKind == right.directKind
+            && left.reportedTwoPhase == right.reportedTwoPhase
+            && left.windowFillClause == right.windowFillClause
+            && left.termDisjunctionClause == right.termDisjunctionClause
+            && left.independentTerm == right.independentTerm
+            && left.docsOnly == right.docsOnly
+            && left.directDocSet == right.directDocSet;
+      }
+#endif
+
+      void resolveConjunctionChildren(
+          MemPool& planPool, ConjunctionPlan& plan) {
+        auto resolveChild = [&](PlannedSupplier& child) {
+          Query::PlanContext planContext = scorerBuildContext(
+              child.buildLeadCost, plan.use);
+          child.plan = child.supplier->resolve(planPool, planContext);
+          assert(child.plan != nullptr);
+#ifndef NDEBUG
+          assert(sameScorerShape(child.shape, child.plan->shape()));
+#endif
+        };
+
+        for (PlannedEntry& entry : plan.entries) {
+          if (entry.optionalGroup) {
+            for (PlannedSupplier& child : plan.optionalGroup) {
+              resolveChild(child);
+            }
+            continue;
+          }
+          Query::PlanContext planContext = scorerBuildContext(
+              entry.buildLeadCost, plan.use);
+          entry.plan = entry.supplier->resolve(planPool, planContext);
+          assert(entry.plan != nullptr);
+#ifndef NDEBUG
+          assert(sameScorerShape(entry.shape, entry.plan->shape()));
+#endif
+        }
+        if (plan.termFeed) {
+          Query::PlanContext planContext = scorerBuildContext(
+              plan.leadCost, plan.use);
+          plan.independentLeadPlan =
+              plan.entries[0].supplier->resolve(planPool, planContext);
+          assert(plan.independentLeadPlan != nullptr);
+#ifndef NDEBUG
+          assert(sameScorerShape(
+              plan.entries[0].shape,
+              plan.independentLeadPlan->shape()));
+#endif
+        }
+        for (PlannedSupplier& child : plan.prohibited) {
+          resolveChild(child);
+        }
+      }
+
       static BulkPlan knownBulkPlan(
           BulkAnswer available, BulkAnswer matchWindows,
           BulkAnswer exactCandidateScoring,
@@ -2593,6 +2806,7 @@ public:
         switch (planning.status) {
           case ConjunctionPlanStatus::READY: {
             BulkPlan bulkPlan = matchWindowBulkPlan();
+            resolveConjunctionChildren(pool, planning.plan);
             auto* buildPlan = pool.make<ConjunctionPlan>(planning.plan);
             buildPlan->owner = this;
             bulkPlan.buildState = buildPlan;
@@ -3063,11 +3277,9 @@ public:
           for (size_t i = 0; i < plan.entries.size(); i++) {
             assert(plan.entries[i].shape.docsOnly
                    == Query::DocsOnlyAccess::SUPPORTED);
-            Query::PlanContext planContext = scorerBuildContext(
-                plan.entries[i].buildLeadCost, plan.use);
+            assert(plan.entries[i].plan != nullptr);
             countTermEnums[i] =
-                plan.entries[i].supplier->getDocsOnly(
-                    targetPool, planContext);
+                plan.entries[i].plan->buildDocsOnly(targetPool);
             if (countTermEnums[i] == nullptr) {
               return {};
             }
@@ -3150,10 +3362,8 @@ public:
                 plan.optionalGroup.size());
             size_t memberCount = 0;
             for (const PlannedSupplier& memberPlan : plan.optionalGroup) {
-              Query::PlanContext planContext = scorerBuildContext(
-                  memberPlan.buildLeadCost, plan.use);
-              auto* member = memberPlan.supplier->get(
-                  targetPool, planContext);
+              assert(memberPlan.plan != nullptr);
+              auto* member = memberPlan.plan->build(targetPool);
 #ifndef NDEBUG
               assertScorerLayout(memberPlan.shape, member);
 #endif
@@ -3170,10 +3380,8 @@ public:
                     targetPool,
                     std::span<Query::Scorer*>(members, memberCount));
           } else {
-            Query::PlanContext planContext = scorerBuildContext(
-                entry.buildLeadCost, plan.use);
-            scorer = entry.supplier->get(
-                targetPool, planContext);
+            assert(entry.plan != nullptr);
+            scorer = entry.plan->build(targetPool);
           }
 #ifndef NDEBUG
           assertScorerLayout(entry.shape, scorer);
@@ -3196,11 +3404,9 @@ public:
         std::span<uint8_t> candidateFilters;
         std::span<DocSet*> candidateFilterDocSets;
         if (plan.termFeed) {
-          Query::PlanContext planContext = scorerBuildContext(
-              plan.leadCost, plan.use);
+          assert(plan.independentLeadPlan != nullptr);
           candidateLeadScoreScorer = dynamic_cast<TermQuery::Scorer*>(
-              plan.entries[0].supplier->getIndependent(
-                  targetPool, planContext));
+              plan.independentLeadPlan->buildIndependent(targetPool));
           assert(candidateLeadScoreScorer != nullptr);
           if (candidateLeadScoreScorer == nullptr) {
             return {};
@@ -3261,10 +3467,8 @@ public:
               targetPool.make_span<ConjunctionClauseLayout>(
               plan.prohibited.size());
           for (const PlannedSupplier& prohibited : plan.prohibited) {
-            Query::PlanContext planContext = scorerBuildContext(
-                prohibited.buildLeadCost, plan.use);
-            auto* scorer = prohibited.supplier->get(
-                targetPool, planContext);
+            assert(prohibited.plan != nullptr);
+            auto* scorer = prohibited.plan->build(targetPool);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
 #endif
@@ -3281,10 +3485,8 @@ public:
                    && !plan.prohibited.empty()) {
           auto& terms = *targetPool.make_vec<TermQuery::Scorer*>();
           for (const PlannedSupplier& prohibited : plan.prohibited) {
-            Query::PlanContext planContext = scorerBuildContext(
-                plan.leadCost, plan.use);
-            auto* scorer = prohibited.supplier->get(
-                targetPool, planContext);
+            assert(prohibited.plan != nullptr);
+            auto* scorer = prohibited.plan->build(targetPool);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
 #endif
@@ -3395,6 +3597,7 @@ public:
         if (planning.status != ConjunctionPlanStatus::READY) {
           return {};
         }
+        resolveConjunctionChildren(targetPool, planning.plan);
         return buildConjunction(targetPool, planning.plan);
       }
 
@@ -3991,6 +4194,7 @@ public:
         } else {
           recordConjunctionPlanCommitment(planning.plan);
           if (planning.status == ConjunctionPlanStatus::READY) {
+            resolveConjunctionChildren(targetPool, planning.plan);
             result = buildConjunction(targetPool, planning.plan);
           }
         }

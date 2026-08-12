@@ -9,8 +9,6 @@
 #include <span>
 #include <stdexcept>
 #include <vector>
-#include <boost/container/small_vector.hpp>
-
 #include "Query.h"
 #include "DocSetBulkScorer.h"
 #include "solux/search/DocSet.h"
@@ -89,14 +87,6 @@ inline std::span<const PreparedSource> preparedSpan(const std::vector<PreparedSo
   return {sources.data(), sources.size()};
 }
 
-struct CostedScorers {
-  std::span<Query::Scorer*> scorers;
-  std::span<int64_t> costs;
-};
-
-using ScorerBuildObserver =
-    void (*)(Query::ScorerSupplier*, Query::Scorer*, int64_t);
-
 inline std::span<Query::SegmentSource*> liveSources(MemPool& targetPool,
                                                     std::span<Query::Weight*> weights) {
   if (weights.empty()) return {};
@@ -115,86 +105,6 @@ inline std::span<Query::SegmentSource*> segmentSources(MemPool& targetPool,
     sources[i] = &preparedSources[i].segmentSource();
   }
   return sources;
-}
-
-inline std::span<Query::Scorer*> createScorers(MemPool& targetPool,
-                                               IndexReader::Segment& segment,
-                                               std::span<Query::SegmentSource* const> sources,
-                                               ScorerBuildObserver observer = nullptr) {
-  if (sources.empty()) return {};
-  auto& scorers = *targetPool.make_vec<Query::Scorer*>();
-  scorers.reserve(sources.size());
-  for (auto* source : sources) {
-    auto* supplier = source->scorerSupplier(targetPool, segment);
-    if (supplier == nullptr) continue;
-    constexpr int64_t leadCost = std::numeric_limits<int64_t>::max();
-    auto* scorer = supplier->get(targetPool, leadCost);
-    if (observer != nullptr) observer(supplier, scorer, leadCost);
-    if (scorer != nullptr) scorers.push_back(scorer);
-  }
-  return scorers;
-}
-
-inline CostedScorers createScorersWithCosts(
-    MemPool& targetPool, IndexReader::Segment& segment,
-    std::span<Query::SegmentSource* const> sources,
-    ScorerBuildObserver observer = nullptr) {
-  if (sources.empty()) return {};
-  auto scorers = targetPool.make_span<Query::Scorer*>(sources.size());
-  auto costs = targetPool.make_span<int64_t>(sources.size());
-  size_t count = 0;
-  for (auto* source : sources) {
-    auto* supplier = source->scorerSupplier(targetPool, segment);
-    if (supplier == nullptr) continue;
-    int64_t cost = supplier->cost();
-    constexpr int64_t leadCost = std::numeric_limits<int64_t>::max();
-    auto* scorer = supplier->get(targetPool, leadCost);
-    if (observer != nullptr) observer(supplier, scorer, leadCost);
-    if (scorer == nullptr) continue;
-    scorers[count] = scorer;
-    costs[count++] = cost;
-  }
-  return {scorers.first(count), costs.first(count)};
-}
-
-
-// Like createScorers, but retains supplier costs and orders both parallel spans
-// by ascending cost.
-inline CostedScorers createScorersByCost(MemPool& targetPool,
-                                         IndexReader::Segment& segment,
-                                         std::span<Query::SegmentSource* const> sources,
-                                         ScorerBuildObserver observer = nullptr) {
-  if (sources.empty()) return {};
-
-  struct CostedSupplier {
-    int64_t cost;
-    Query::ScorerSupplier* supplier;
-  };
-
-  // The (cost, supplier) scratch is only needed to sort before building scorers;
-  // it does not outlive this call. A small_vector keeps it on the stack for the
-  // usual handful of clauses.
-  boost::container::small_vector<CostedSupplier, 16> costed;
-  for (auto* source : sources) {
-    auto* supplier = source->scorerSupplier(targetPool, segment);
-    if (supplier != nullptr) costed.push_back({supplier->cost(), supplier});
-  }
-  std::sort(costed.begin(), costed.end(),
-            [](const CostedSupplier& a, const CostedSupplier& b) { return a.cost < b.cost; });
-
-  auto* scorers = targetPool.make_arr<Query::Scorer*>(sources.size());
-  auto* costs = targetPool.make_arr<int64_t>(sources.size());
-  size_t count = 0;
-  for (auto& c : costed) {
-    constexpr int64_t leadCost = std::numeric_limits<int64_t>::max();
-    auto* scorer = c.supplier->get(targetPool, leadCost);
-    if (observer != nullptr) observer(c.supplier, scorer, leadCost);
-    if (scorer != nullptr) {
-      scorers[count] = scorer;
-      costs[count++] = c.cost;
-    }
-  }
-  return {{scorers, count}, {costs, count}};
 }
 
 // Collect a ScorerSupplier for each source, keeping a 1:1 mapping with the input
