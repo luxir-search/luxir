@@ -76,18 +76,7 @@ public:
   }
 };
 
-class SortSkipStatsGuard {
-  bool saved;
-
-public:
-  SortSkipStatsGuard() : saved(SkipStats::enabled) {
-    SkipStats::enabled = true;
-    SkipStats::reset();
-  }
-  ~SortSkipStatsGuard() {
-    SkipStats::enabled = saved;
-  }
-};
+using SortSkipStatsGuard = SkipStatsScope;
 
 struct FieldSortBulkResult {
   std::vector<std::string> ids;

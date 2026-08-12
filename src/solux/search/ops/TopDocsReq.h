@@ -656,6 +656,7 @@ public:
                 collectTopKMatchWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
                     *data->fieldCollector, seg.maxDoc(), allowSortPruning);
+                data->fieldCollector->recordSegmentSkipStats();
                 usedBulk = true;
               } else if (bulk != nullptr) {
                 skipCount(SkipStats::bulkBuiltThenRejected);
@@ -676,6 +677,7 @@ public:
                 }
                 collectTopK(segnum, scorer, collectorFilter, builderPtr,
                             *data->fieldCollector, allowSortPruning);
+                data->fieldCollector->recordSegmentSkipStats();
               }
             }
           } else {

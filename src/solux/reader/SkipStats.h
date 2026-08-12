@@ -195,6 +195,19 @@ struct SkipStats {
   static inline int64_t fieldSortCandidateActivations = 0;
   static inline int64_t fieldSortCandidateTerminations = 0;
   static inline int64_t fieldSortBulkCollections = 0;
+  // Field-sort pruning attribution: ranges issued before the heap filled
+  // (the warmup transient, in key blocks) and competitive ranges issued after
+  // (the visited-block count the bound rules could not skip).
+  static inline int64_t fieldSortWarmupRanges = 0;
+  static inline int64_t fieldSortCompetitiveRanges = 0;
+  // Docs pushed through the bulk key-gather path, and the gathered-doc index
+  // of the last heap change - "how late did the top-k stop moving".
+  static inline int64_t fieldSortDocsGathered = 0;
+  static inline int64_t fieldSortGatherAtLastAdmission = 0;
+  // Blocks whose best key strictly undercuts the final bottom: the visit
+  // floor no traversal order can avoid (bounds cover all docs, so a block
+  // holding a better-bounded key must be inspected to refute it).
+  static inline int64_t fieldSortIrreducibleBlocks = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -397,6 +410,11 @@ struct SkipStats {
     fieldSortCandidateActivations = 0;
     fieldSortCandidateTerminations = 0;
     fieldSortBulkCollections = 0;
+    fieldSortWarmupRanges = 0;
+    fieldSortCompetitiveRanges = 0;
+    fieldSortDocsGathered = 0;
+    fieldSortGatherAtLastAdmission = 0;
+    fieldSortIrreducibleBlocks = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;
@@ -446,5 +464,18 @@ inline void skipCount(int64_t& counter) {
     counter++;
   }
 }
+
+// RAII enable+reset for a measurement scope; restores the previous enabled
+// state (single-threaded harness use only, like the counters themselves).
+class SkipStatsScope {
+  bool saved;
+
+public:
+  SkipStatsScope() : saved(SkipStats::enabled) {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+  ~SkipStatsScope() { SkipStats::enabled = saved; }
+};
 
 } // namespace solux

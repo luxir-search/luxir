@@ -392,6 +392,7 @@ public:
     int64_t blockCount = batch->keyBlockCount();
     if (pq.size() < (size_t)topCount) {
       // No bound yet; re-consult at the next block boundary.
+      skipCount(SkipStats::fieldSortWarmupRanges);
       return {from, blockEnd(block, blockSize)};
     }
     int64_t bottomKey = batch->slotKeys[pq.top().slot];
@@ -408,7 +409,32 @@ public:
       doc = blockEnd(block, blockSize);
     }
     if (block >= blockCount) return {PostingsReader::END, PostingsReader::END};
+    skipCount(SkipStats::fieldSortCompetitiveRanges);
     return {doc, blockEnd(block, blockSize)};
+  }
+
+  // Attribution only (no-op unless SkipStats::enabled): count blocks whose
+  // best key strictly undercuts the final bottom. Any correct bound-driven
+  // traversal must inspect these blocks, in every visit order - the gap
+  // between this and fieldSortCompetitiveRanges is what reordering could
+  // save. Call after a segment's collection completes.
+  void recordSegmentSkipStats() {
+    if (!SkipStats::enabled || topCount == 0
+        || pq.size() < (size_t)topCount || disableKeyGatherForTests) {
+      return;
+    }
+    FieldComparator::KeyBatch* batch;
+    if (clauses[0].comparator == nullptr
+        || (batch = clauses[0].comparator->keyBatch()) == nullptr
+        || batch->keyBlockSize() == 0) {
+      return;
+    }
+    int64_t bottomKey = batch->slotKeys[pq.top().slot];
+    for (int64_t block = 0, n = batch->keyBlockCount(); block < n; block++) {
+      if (batch->blockBestKey(block) < bottomKey) {
+        SkipStats::fieldSortIrreducibleBlocks++;
+      }
+    }
   }
 
   void collectWindow(int32_t segment, std::span<const int32_t> docs) {
@@ -423,6 +449,9 @@ public:
 
     hitCount += (int64_t)docs.size();
     if (topCount == 0) return;
+    if (SkipStats::enabled) {
+      SkipStats::fieldSortDocsGathered += (int64_t)docs.size();
+    }
 
     size_t i = 0;
     while (i < docs.size()) {
@@ -437,6 +466,7 @@ public:
         ensureSlotCapacity(slot + 1);  // re-points batch->slotKeys on growth
         batch->slotKeys[slot] = keys[i - chunkStart];
         pq.insert(SortDoc(segdoc(segment, docs[i]), 0.0f, slot));
+        recordAdmission(docs.size(), i);
         i++;
       }
       if (i == chunkEnd) continue;
@@ -454,11 +484,21 @@ public:
         bottom = SortDoc(doc, 0.0f, slot);
         pq.updateTop();
         bottomKey = batch->slotKeys[pq.top().slot];
+        recordAdmission(docs.size(), i);
       }
     }
   }
 
 private:
+  // Attribution only: the gathered-doc index of this heap change, doc-precise
+  // (fieldSortDocsGathered was bumped for the whole window on entry).
+  static void recordAdmission(size_t windowSize, size_t i) {
+    if (SkipStats::enabled) {
+      SkipStats::fieldSortGatherAtLastAdmission =
+          SkipStats::fieldSortDocsGathered - (int64_t)(windowSize - i) + 1;
+    }
+  }
+
   static int32_t blockEnd(int64_t block, int32_t blockSize) {
     return (int32_t)std::min<int64_t>((block + 1) * blockSize,
                                       (int64_t)PostingsReader::END);
