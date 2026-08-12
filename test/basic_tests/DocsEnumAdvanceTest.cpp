@@ -1125,6 +1125,57 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   SkipStats::reset();
 }
 
+// The packed-block twin of the word-block straddle test above: a no-emit
+// window over a bit-packed landing block must also leave the cursor off live
+// docs (the block-boundary peek decodes without publishing), and a jumped
+// window base must reach later blocks through skip data without losing the
+// landing block's first doc.
+TEST_F(DocsEnumAdvanceTest, intoBitSetPackedStraddleWithNoEmitDoesNotConsume) {
+  // Stride keeps the block far from contiguous/word-encodable: packed codec.
+  std::vector<int32_t> docs;
+  docs.reserve((size_t) (2 * Postings::DOCS_BLOCK_SIZE));
+  for (int32_t i = 0; i < 2 * Postings::DOCS_BLOCK_SIZE; i++) {
+    docs.push_back(65 + i * 997);
+  }
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "packedgap", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("packedgap"));
+
+  DocsOnlyEnum denum(tenum);
+
+  std::vector<uint64_t> bits(1, 0);
+  denum.intoBitSet(bits, 0, 64);
+  EXPECT_TRUE(docsFromBits(bits, 0, 64).empty());
+  // The landing block was decoded but nothing was published or consumed.
+  EXPECT_LT(denum.docId(), 0);
+
+  // A jumped window base past the whole first block leaps via skip data and
+  // must present the second block's docs exactly.
+  int32_t secondBlockFirst = docs[(size_t) Postings::DOCS_BLOCK_SIZE];
+  std::vector<int32_t> got;
+  appendIntoBitSetWindow(denum, docs, secondBlockFirst - 1,
+                         secondBlockFirst + 4000, got);
+  EXPECT_EQ(got, modelWindow(docs, secondBlockFirst - 1,
+                             secondBlockFirst + 4000));
+
+  // The straddle-and-abandon in between must not have lost the first
+  // block's docs for successor consumers on a fresh enum.
+  DocsOnlyEnum denum2(tenum);
+  std::vector<uint64_t> bits2(1, 0);
+  denum2.intoBitSet(bits2, 0, 64);
+  EXPECT_LT(denum2.docId(), 0);
+  EXPECT_EQ(denum2.nextDoc(), 65);
+}
+
 TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundary) {
   const std::vector<int32_t> docs = makeContiguousDocs(Postings::DOCS_BLOCK_SIZE);
   RAMDir dir;

@@ -232,6 +232,9 @@ struct SkipStats {
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
   static inline int64_t geoSparseVerifyArms = 0;
+  // Codec skipBlock calls on landing-block traversal only: header-level
+  // leaps (skipToBlock over whole blocks) bypass freq planes by byte length
+  // without charging this counter, so it undercounts under jumped windows.
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
   static inline int64_t docsOnlyWordProbeAdvances = 0;
   static inline int64_t scoredWordProbeAdvances = 0;
