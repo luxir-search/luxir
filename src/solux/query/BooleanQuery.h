@@ -1241,7 +1241,6 @@ public:
       int minShouldMatch;
       bool needsScores;
       bool allowsPruning;
-      bool twoPhaseDisjunctionPull = false;
 
       static Query::ScorerShape emptyShape() {
         Query::ScorerShape shape;
@@ -2046,6 +2045,17 @@ public:
 
         FilteredDisjunctionPlan()
           : BooleanBulkBuildState(Kind::FILTERED_DISJUNCTION) {}
+      };
+
+      enum class FilteredDisjunctionDisposition : uint8_t {
+        DECLINED,
+        BULK,
+        TWO_PHASE_PULL,
+      };
+
+      struct FilteredDisjunctionPlanningResult {
+        BulkPlan plan;
+        FilteredDisjunctionDisposition disposition;
       };
 
       struct ExactFilteredMandOptPlan : BooleanBulkBuildState {
@@ -3493,22 +3503,27 @@ public:
         return cost;
       }
 
-      BulkPlan planFilteredDisjunctionBulk(BulkUse use) {
+      FilteredDisjunctionPlanningResult planFilteredDisjunctionBulk(
+          BulkUse use) {
+        auto declined = [&]() {
+          return FilteredDisjunctionPlanningResult{
+            noBulkPlan(), FilteredDisjunctionDisposition::DECLINED};
+        };
         if (disableFilteredDisjunctionBatchForTests || allowsPruning
             || mandatorySources.size() != 0 || optionalSources.size() < 2
             || prohibitedSources.size() != 0 || filterSuppliers.size() != 1
             || minShouldMatch != 1) {
-          return noBulkPlan();
+          return declined();
         }
         auto* filterSupplier = filterSuppliers[0];
-        if (filterSupplier == nullptr) return noBulkPlan();
+        if (filterSupplier == nullptr) return declined();
         int64_t filterCost = filterSupplier->cost();
         int32_t densityInverse = needsScores
             ? filteredDisjunctionBatchDensityInverseForTests
             : QueryPrep::kSparseBatchCountOwnDensityInverse;
         if (densityInverse <= 0
             || filterCost > segment.maxDoc() / densityInverse) {
-          return noBulkPlan();
+          return declined();
         }
 
         Query::Demand filterDemand = Query::Demand::fromLeadCost(
@@ -3523,7 +3538,7 @@ public:
                 dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
           DocSet* docs = docSetSupplier->docSet();
           if (docs == nullptr || docs->card() == 0) {
-            return noBulkPlan();
+            return declined();
           }
           if (!disableFilteredDisjunctionArrayFeedForTests
               && docs->type == DocSet::ARRAY) {
@@ -3545,7 +3560,7 @@ public:
           }
         }
         if (!arrayFilterFeed && filter.supplier == nullptr) {
-          return noBulkPlan();
+          return declined();
         }
 
         Query::Demand optionalDemand = Query::Demand::fromLeadCost(
@@ -3562,14 +3577,20 @@ public:
           if (shape.matchState == Query::MatchState::EMPTY) {
             continue;
           }
+          if (shape.reportedTwoPhase == Query::ReportedTwoPhase::YES) {
+            return {
+              noBulkPlan(),
+              FilteredDisjunctionDisposition::TWO_PHASE_PULL,
+            };
+          }
           if (shape.matchState != Query::MatchState::NONEMPTY
               || shape.directKind != Query::DirectScorerKind::TERM) {
-            return noBulkPlan();
+            return declined();
           }
           entries.push_back({supplier, shape, optionalDemand});
         }
         if (entries.empty()) {
-          return noBulkPlan();
+          return declined();
         }
         if (!needsScores) {
           std::sort(entries.begin(), entries.end(),
@@ -3598,7 +3619,7 @@ public:
         BulkPlan plan = knownBulkPlan(
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
         plan.buildState = state;
-        return plan;
+        return {plan, FilteredDisjunctionDisposition::BULK};
       }
 
       BulkScorer* buildFilteredDisjunctionBulk(
@@ -4020,11 +4041,15 @@ public:
         if (!filterSuppliers.empty() && mandatorySources.empty()
             && prohibitedSources.empty() && optionalSources.size() >= 2
             && minShouldMatch == 1 && !allowsPruning) {
-          BulkPlan disjunction = planFilteredDisjunctionBulk(use);
-          if (disjunction.available == BulkAnswer::YES) {
-            return disjunction;
+          auto disjunction = planFilteredDisjunctionBulk(use);
+          if (disjunction.disposition
+              == FilteredDisjunctionDisposition::BULK) {
+            return disjunction.plan;
           }
-          if (twoPhaseDisjunctionPull) return noBulkPlan();
+          if (disjunction.disposition
+              == FilteredDisjunctionDisposition::TWO_PHASE_PULL) {
+            return noBulkPlan();
+          }
         }
 
         if (needsScores && !allowsPruning
@@ -4081,8 +4106,8 @@ public:
           bool pureFilteredDisjunction = mandatorySources.empty()
               && prohibitedSources.empty() && optionalSources.size() >= 2
               && minShouldMatch == 1;
-          return pureFilteredDisjunction
-              ? planFilteredDisjunctionBulk(use) : noBulkPlan();
+          if (!pureFilteredDisjunction) return noBulkPlan();
+          return planFilteredDisjunctionBulk(use).plan;
         }
 
         if (needsScores && !filterSuppliers.empty()) {
@@ -4220,8 +4245,8 @@ public:
         if (filteredDisjunctionDensityDecline()) {
           skipCount(SkipStats::filteredDisjBatchDensityFallbacks);
         }
-        BulkPlan disjunction = planFilteredDisjunctionBulk(use);
-        if (disjunction.available == BulkAnswer::NO) {
+        auto disjunction = planFilteredDisjunctionBulk(use);
+        if (disjunction.plan.available == BulkAnswer::NO) {
           skipCount(SkipStats::disjCountIdentityFilterFallbacks);
         }
       }

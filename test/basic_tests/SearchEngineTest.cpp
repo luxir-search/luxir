@@ -2386,7 +2386,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
     docs.push_back(flatdoc(
         "id", "phrase_pull_" + std::to_string(doc),
         "body_w", body,
-        "filter_w", (doc % 1000) == 0 ? "selected" : "other"));
+        "filter_w", (doc % 100) == 0 ? "selected" : "other"));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
@@ -2397,6 +2397,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
     int64_t engagements;
     int64_t phraseVerifies;
     int64_t ownedMaterializations;
+    int64_t directApproxEngagements;
   };
   auto run = [&](bool disabled) {
     FilteredDisjunctionBatchGuard guard(disabled);
@@ -2419,11 +2420,13 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
       SkipStats::filteredDisjBatchEngagements,
       SkipStats::phraseVerifies,
       SkipStats::ownedFilterMaterializations,
+      SkipStats::conjExactDirectApproxEngagements,
     };
   };
 
   Result cold = run(false);
   EXPECT_EQ(0, cold.ownedMaterializations);
+  EXPECT_GT(cold.directApproxEngagements, 0);
   run(false);
   Result routed = run(false);
   Result bodyBulk = run(true);
@@ -2432,7 +2435,9 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
   expectSameScoreMap(bodyBulk.scores, routed.scores);
   EXPECT_EQ(0, routed.engagements);
   EXPECT_EQ(0, bodyBulk.engagements);
-  EXPECT_LE(routed.phraseVerifies, 9);
+  EXPECT_GT(routed.directApproxEngagements, 0);
+  EXPECT_EQ(0, bodyBulk.directApproxEngagements);
+  EXPECT_LT(routed.phraseVerifies, bodyBulk.phraseVerifies);
 }
 
 TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
