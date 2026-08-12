@@ -30,6 +30,13 @@ public:
       traits |= IS_CONSTANT_SCORING;  // vacuously constant
     }
 
+    Query::ScorerSupplier* scorerSupplier(
+        MemPool& targetPool,
+        solux::IndexReader::Segment& segment) override {
+      unused(targetPool, segment);
+      return nullptr;
+    }
+
     Query::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
       unused(targetPool);
       unused(segment);

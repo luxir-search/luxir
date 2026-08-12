@@ -285,7 +285,7 @@ class RescoreQuery final : public Query {
     int64_t cost() override { return childSupplier->cost(); }
 
     Query::ScorerShape describeScorer(
-        const Query::ScorerBuildContext& buildContext) const override {
+        const Query::PlanContext& buildContext) const override {
       Query::ScorerShape child = childSupplier->describeScorer(buildContext);
       return {
         .matchState = child.matchState,
@@ -300,12 +300,12 @@ class RescoreQuery final : public Query {
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
-        const Query::ScorerBuildContext& buildContext) const override {
+        const Query::PlanContext& buildContext) const override {
       return childSupplier->unresolvedScorerCause(buildContext);
     }
 
     bool fillExpansionMemo(
-        const Query::ScorerBuildContext& buildContext) override {
+        const Query::PlanContext& buildContext) override {
       return childSupplier->fillExpansionMemo(buildContext);
     }
 

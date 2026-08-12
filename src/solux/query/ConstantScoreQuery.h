@@ -64,15 +64,9 @@ class ConstantScoreQuery final : public solux::Query {
   class Supplier final : public Query::ScorerSupplier {
     Query::ScorerSupplier* childSupplier;
     float constantScore;
-  public:
-    Supplier(Query::ScorerSupplier* childSupplier, float constantScore)
-      : childSupplier(childSupplier), constantScore(constantScore) {}
 
-    int64_t cost() override { return childSupplier->cost(); }
-
-    Query::ScorerShape describeScorer(
-        const Query::ScorerBuildContext& buildContext) const override {
-      Query::ScorerShape child = childSupplier->describeScorer(buildContext);
+    static Query::ScorerShape wrappedShape(
+        const Query::ScorerShape& child) {
       return {
         .matchState = child.matchState,
         .directKind = Query::DirectScorerKind::OTHER,
@@ -85,20 +79,56 @@ class ConstantScoreQuery final : public solux::Query {
       };
     }
 
+    class Plan final : public Query::ScorerPlan {
+      Query::ScorerPlan* childPlan;
+      float constantScore;
+
+    protected:
+      Query::Scorer* buildScorer(MemPool& targetPool) override {
+        Query::Scorer* childScorer = childPlan->build(targetPool);
+        if (childScorer == nullptr) return nullptr;
+        return targetPool.make<ConstantScoreQuery::Scorer>(
+            childScorer, constantScore);
+      }
+
+    public:
+      Plan(Supplier& supplier, const Query::PlanContext& planContext,
+           const Query::ScorerShape& shape, int64_t cost,
+           Query::ScorerPlan* childPlan, float constantScore)
+        : Query::ScorerPlan(supplier, planContext, shape, cost),
+          childPlan(childPlan), constantScore(constantScore) {}
+    };
+
+  public:
+    Supplier(Query::ScorerSupplier* childSupplier, float constantScore)
+      : childSupplier(childSupplier), constantScore(constantScore) {}
+
+    int64_t cost() override { return childSupplier->cost(); }
+
+    Query::ScorerShape describeScorer(
+        const Query::PlanContext& buildContext) const override {
+      return wrappedShape(childSupplier->describeScorer(buildContext));
+    }
+
     Query::UnresolvedSupplierCause unresolvedScorerCause(
-        const Query::ScorerBuildContext& buildContext) const override {
+        const Query::PlanContext& buildContext) const override {
       return childSupplier->unresolvedScorerCause(buildContext);
     }
 
     bool fillExpansionMemo(
-        const Query::ScorerBuildContext& buildContext) override {
+        const Query::PlanContext& buildContext) override {
       return childSupplier->fillExpansionMemo(buildContext);
     }
 
-    Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-      auto* childScorer = childSupplier->get(targetPool, leadCost);
-      if (childScorer == nullptr) return nullptr;
-      return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
+    Query::ScorerPlan* resolve(
+        MemPool& planPool,
+        const Query::PlanContext& planContext) override {
+      Query::ScorerPlan* childPlan =
+          childSupplier->resolve(planPool, planContext);
+      assert(childPlan != nullptr);
+      return planPool.make<Plan>(
+          *this, planContext, wrappedShape(childPlan->shape()),
+          childPlan->cost(), childPlan, constantScore);
     }
   };
 

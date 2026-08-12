@@ -837,10 +837,13 @@ public:
       size_t scoringCount;
     };
 
-    static Query::ScorerBuildContext scorerBuildContext(int64_t leadCost) {
-      Query::ScorerBuildContext buildContext =
+    static Query::PlanContext scorerBuildContext(
+        int64_t leadCost,
+        Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
+      Query::PlanContext buildContext =
           MultiTermQuery::Weight::scorerBuildContext(
               leadCost, PhraseQuery::ScorerControls::disableSortForTests);
+      buildContext.demand.horizon = horizon;
       buildContext.numericRangeDisableShapesForTests =
           NumericRangeQuery::disableShapesForTests;
       buildContext.disableBooleanTwoPhaseForTests =
@@ -934,7 +937,7 @@ public:
 
     static void assertScorerShape(
         Query::ScorerSupplier* supplier, Query::Scorer* scorer,
-        const Query::ScorerBuildContext& buildContext) {
+        const Query::PlanContext& buildContext) {
       assert(supplier != nullptr);
       Query::ScorerShape shape = supplier->describeScorer(buildContext);
       assertScorerLayout(shape, scorer);
@@ -1032,7 +1035,7 @@ public:
       size_t scoringCount = 0;
       for (auto& e : entries) {
 #ifndef NDEBUG
-        Query::ScorerBuildContext buildContext =
+        Query::PlanContext buildContext =
             scorerBuildContext(leadCost);
 #endif
         auto* scorer = e.supplier->get(targetPool, leadCost);
@@ -1073,7 +1076,7 @@ public:
 #ifndef NDEBUG
       buildObserver = [](Query::ScorerSupplier* supplier,
                          Query::Scorer* scorer, int64_t leadCost) {
-        Query::ScorerBuildContext buildContext =
+        Query::PlanContext buildContext =
             scorerBuildContext(leadCost);
         assertScorerShape(supplier, scorer, buildContext);
       };
@@ -1341,7 +1344,7 @@ public:
 
       static Query::MatchState requiredMatchState(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         Query::MatchState state = Query::MatchState::NONEMPTY;
         for (auto* supplier : suppliers) {
           if (supplier == nullptr) return Query::MatchState::EMPTY;
@@ -1359,7 +1362,7 @@ public:
 
       static bool hasUnknownElision(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         for (auto* supplier : suppliers) {
           if (supplier != nullptr
               && supplier->describeScorer(buildContext).matchState
@@ -1372,7 +1375,7 @@ public:
 
       static bool fillExpansionMemos(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         bool filled = false;
         for (auto* supplier : suppliers) {
           if (supplier != nullptr
@@ -1385,7 +1388,7 @@ public:
 
       static Query::ScorerShape describeResolved(
           Query::ScorerSupplier* supplier,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         Query::ScorerShape shape = supplier->describeScorer(buildContext);
         bool unknown = shape.matchState == Query::MatchState::UNKNOWN
             || shape.directKind == Query::DirectScorerKind::UNKNOWN
@@ -1400,7 +1403,7 @@ public:
 
       static size_t nonemptyCount(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         size_t count = 0;
         for (auto* supplier : suppliers) {
           if (supplier != nullptr
@@ -1414,7 +1417,7 @@ public:
 
       static Query::ReportedTwoPhase disjunctionTwoPhase(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         if (buildContext.disableBooleanTwoPhaseForTests
             || buildContext.disableDisjunctionTwoPhaseForTests) {
           return Query::ReportedTwoPhase::NO;
@@ -1437,7 +1440,7 @@ public:
 
       static Query::ClauseShape flatClauseShape(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext,
+          const Query::PlanContext& buildContext,
           bool windowFill) {
         bool unknown = false;
         for (auto* supplier : suppliers) {
@@ -1460,7 +1463,7 @@ public:
       }
 
       Query::ScorerShape requiredShape(
-          const Query::ScorerBuildContext& buildContext) const {
+          const Query::PlanContext& buildContext) const {
         size_t requiredCount =
             mandatoryShapeSuppliers.size() + filterSuppliers.size();
         if (requiredCount == 0) return emptyShape();
@@ -1486,7 +1489,7 @@ public:
       }
 
       std::optional<bool> directWindowFilters(
-          const Query::ScorerBuildContext& buildContext) const {
+          const Query::PlanContext& buildContext) const {
         if (!mandatorySources.empty() || filterSuppliers.empty()) return false;
         for (auto* supplier : filterSuppliers) {
           if (supplier == nullptr) return false;
@@ -1502,7 +1505,7 @@ public:
       }
 
       Query::ScorerShape optionalShape(
-          const Query::ScorerBuildContext& buildContext,
+          const Query::PlanContext& buildContext,
           bool hasRequired) const {
         size_t count = nonemptyCount(optionalShapeSuppliers, buildContext);
         if (count == 0 || (minShouldMatch > 1
@@ -1548,7 +1551,8 @@ public:
             && *directFilters
             && termShape == Query::ClauseShape::FLAT_DISJUNCTION;
         bool plainExternalDisjunction =
-            buildContext.leadCost != std::numeric_limits<int64_t>::max()
+            buildContext.demand.candidates
+                != std::numeric_limits<int64_t>::max()
             && needsScores && !hasRequired && prohibitedSources.empty()
             && minShouldMatch <= 1;
         bool useMaxScoreDisjunction = needsScores && !hasRequired
@@ -1570,7 +1574,7 @@ public:
 
       static Query::ReportedTwoPhase mandOptTwoPhase(
           Query::ScorerShape required, Query::ScorerShape optional,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         if (buildContext.disableBooleanTwoPhaseForTests) {
           return Query::ReportedTwoPhase::NO;
         }
@@ -1644,7 +1648,7 @@ public:
       }
 
       Query::ScorerShape describeScorer(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         bool hasRequired = !mandatorySources.empty()
             || !filterSuppliers.empty();
         Query::ScorerShape required = requiredShape(buildContext);
@@ -1689,7 +1693,7 @@ public:
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         auto findCause = [&](std::span<Query::ScorerSupplier* const> suppliers) {
           for (auto* supplier : suppliers) {
             if (supplier != nullptr
@@ -1709,7 +1713,7 @@ public:
       }
 
       bool fillExpansionMemo(
-          const Query::ScorerBuildContext& buildContext) override {
+          const Query::PlanContext& buildContext) override {
         bool filled = fillExpansionMemos(
             mandatoryShapeSuppliers, buildContext);
         filled = fillExpansionMemos(filterSuppliers, buildContext)
@@ -1916,7 +1920,7 @@ public:
 
       static Query::UnresolvedSupplierCause firstUnresolvedCause(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         for (auto* supplier : suppliers) {
           if (supplier != nullptr
               && supplier->describeScorer(buildContext).hasUnknown()) {
@@ -1928,7 +1932,7 @@ public:
 
       static Query::ScorerShape plannedOptionalGroupShape(
           std::span<Query::ScorerSupplier* const> suppliers,
-          const Query::ScorerBuildContext& buildContext) {
+          const Query::PlanContext& buildContext) {
         size_t nonempty = nonemptyCount(suppliers, buildContext);
         if (nonempty == 0) {
           return emptyShape();
@@ -2057,8 +2061,8 @@ public:
                 : scaledWindowFillExposure(
                     entries[i == 0 ? 1 : 0].cost);
           }
-          Query::ScorerBuildContext buildContext =
-              scorerBuildContext(entry.buildLeadCost);
+          Query::PlanContext buildContext =
+              scorerBuildContext(entry.buildLeadCost, use);
           if (entry.optionalGroup) {
             optionalGroupBuildLeadCost = entry.buildLeadCost;
             if (hasUnknownElision(optionalSuppliers, buildContext)) {
@@ -2095,8 +2099,8 @@ public:
         int64_t prohibitedBuildLeadCost = perEntryExposure
             ? scaledWindowFillExposure(entries[0].cost)
             : plan.leadCost;
-        Query::ScorerBuildContext prohibitedBuildContext =
-            scorerBuildContext(prohibitedBuildLeadCost);
+        Query::PlanContext prohibitedBuildContext =
+            scorerBuildContext(prohibitedBuildLeadCost, use);
         if (hasUnknownElision(
                 prohibitedSuppliers, prohibitedBuildContext)) {
           plan.unresolvedCause = firstUnresolvedCause(
@@ -2109,8 +2113,8 @@ public:
         plan.optionalGroup =
             targetPool.make_span<PlannedSupplier>(optionalSuppliers.size());
         for (size_t i = 0; i < optionalSuppliers.size(); i++) {
-          Query::ScorerBuildContext buildContext =
-              scorerBuildContext(optionalGroupBuildLeadCost);
+          Query::PlanContext buildContext =
+              scorerBuildContext(optionalGroupBuildLeadCost, use);
           plan.optionalGroup[i] = {
               optionalSuppliers[i],
               optionalSuppliers[i]->describeScorer(buildContext),
@@ -2461,8 +2465,8 @@ public:
         // Expansion capture does not depend on leadCost. Resolve it before
         // planConjunctionOnce reads supplier costs and sorts the entries, so
         // memo-backed costs determine both entry order and the build context.
-        Query::ScorerBuildContext buildContext =
-            scorerBuildContext(segment.maxDoc());
+        Query::PlanContext buildContext =
+            scorerBuildContext(segment.maxDoc(), use);
         fillExpansionMemos(mandatoryShapeSuppliers, buildContext);
         fillExpansionMemos(filterSuppliers, buildContext);
         fillExpansionMemos(optionalShapeSuppliers, buildContext);
@@ -2548,7 +2552,7 @@ public:
           return noBulkPlan();
         }
 
-        Query::ScorerBuildContext buildContext = scorerBuildContext(
+        Query::PlanContext buildContext = scorerBuildContext(
             std::numeric_limits<int64_t>::max());
         bool hasOptional = false;
         for (auto* supplier : optionalShapeSuppliers) {
@@ -2602,7 +2606,7 @@ public:
       }
 
       BulkPlan planMaxScoreBulk() const {
-        Query::ScorerBuildContext buildContext = scorerBuildContext(
+        Query::PlanContext buildContext = scorerBuildContext(
             std::numeric_limits<int64_t>::max());
         bool hasOptional = false;
         for (auto* supplier : optionalShapeSuppliers) {
@@ -2824,7 +2828,7 @@ public:
             size_t memberCount = 0;
             for (auto* supplier : optionalGroupSuppliers) {
 #ifndef NDEBUG
-              Query::ScorerBuildContext buildContext =
+              Query::PlanContext buildContext =
                   scorerBuildContext(leadCost);
 #endif
               auto* member = supplier->get(targetPool, leadCost);
@@ -2845,7 +2849,7 @@ public:
                   std::span<Query::Scorer*>(members, memberCount));
           } else {
 #ifndef NDEBUG
-            Query::ScorerBuildContext buildContext =
+            Query::PlanContext buildContext =
                 scorerBuildContext(leadCost);
 #endif
             scorer = entries[i].supplier->get(targetPool, leadCost);
@@ -2950,7 +2954,7 @@ public:
               continue;
             }
 #ifndef NDEBUG
-            Query::ScorerBuildContext buildContext =
+            Query::PlanContext buildContext =
                 scorerBuildContext(leadCost);
 #endif
             auto* scorer = supplier->get(targetPool, leadCost);
@@ -2970,7 +2974,7 @@ public:
               continue;
             }
 #ifndef NDEBUG
-            Query::ScorerBuildContext buildContext =
+            Query::PlanContext buildContext =
                 scorerBuildContext(leadCost);
 #endif
             auto* scorer = supplier->get(targetPool, leadCost);
@@ -3057,8 +3061,11 @@ public:
           for (size_t i = 0; i < plan.entries.size(); i++) {
             assert(plan.entries[i].shape.docsOnly
                    == Query::DocsOnlyAccess::SUPPORTED);
+            Query::PlanContext planContext = scorerBuildContext(
+                plan.entries[i].buildLeadCost, plan.use);
             countTermEnums[i] =
-                plan.entries[i].supplier->getDocsOnly(targetPool);
+                plan.entries[i].supplier->getDocsOnly(
+                    targetPool, planContext);
             if (countTermEnums[i] == nullptr) {
               return {};
             }
@@ -3141,8 +3148,10 @@ public:
                 plan.optionalGroup.size());
             size_t memberCount = 0;
             for (const PlannedSupplier& memberPlan : plan.optionalGroup) {
+              Query::PlanContext planContext = scorerBuildContext(
+                  memberPlan.buildLeadCost, plan.use);
               auto* member = memberPlan.supplier->get(
-                  targetPool, memberPlan.buildLeadCost);
+                  targetPool, planContext);
 #ifndef NDEBUG
               assertScorerLayout(memberPlan.shape, member);
 #endif
@@ -3159,8 +3168,10 @@ public:
                     targetPool,
                     std::span<Query::Scorer*>(members, memberCount));
           } else {
+            Query::PlanContext planContext = scorerBuildContext(
+                entry.buildLeadCost, plan.use);
             scorer = entry.supplier->get(
-                targetPool, entry.buildLeadCost);
+                targetPool, planContext);
           }
 #ifndef NDEBUG
           assertScorerLayout(entry.shape, scorer);
@@ -3183,9 +3194,11 @@ public:
         std::span<uint8_t> candidateFilters;
         std::span<DocSet*> candidateFilterDocSets;
         if (plan.termFeed) {
+          Query::PlanContext planContext = scorerBuildContext(
+              plan.leadCost, plan.use);
           candidateLeadScoreScorer = dynamic_cast<TermQuery::Scorer*>(
               plan.entries[0].supplier->getIndependent(
-                  targetPool, plan.leadCost));
+                  targetPool, planContext));
           assert(candidateLeadScoreScorer != nullptr);
           if (candidateLeadScoreScorer == nullptr) {
             return {};
@@ -3246,8 +3259,10 @@ public:
               targetPool.make_span<ConjunctionClauseLayout>(
               plan.prohibited.size());
           for (const PlannedSupplier& prohibited : plan.prohibited) {
+            Query::PlanContext planContext = scorerBuildContext(
+                prohibited.buildLeadCost, plan.use);
             auto* scorer = prohibited.supplier->get(
-                targetPool, prohibited.buildLeadCost);
+                targetPool, planContext);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
 #endif
@@ -3264,8 +3279,10 @@ public:
                    && !plan.prohibited.empty()) {
           auto& terms = *targetPool.make_vec<TermQuery::Scorer*>();
           for (const PlannedSupplier& prohibited : plan.prohibited) {
+            Query::PlanContext planContext = scorerBuildContext(
+                plan.leadCost, plan.use);
             auto* scorer = prohibited.supplier->get(
-                targetPool, plan.leadCost);
+                targetPool, planContext);
 #ifndef NDEBUG
             assertScorerLayout(prohibited.shape, scorer);
 #endif
@@ -4137,7 +4154,7 @@ public:
             return noBulkPlan();
           }
           int64_t leadCost = mandatory->cost();
-          Query::ScorerBuildContext buildContext =
+          Query::PlanContext buildContext =
               scorerBuildContext(leadCost);
           Query::ScorerShape mandatoryShape =
               describeResolved(mandatory, buildContext);

@@ -29,10 +29,13 @@ public:
     solux::IndexReader::Segment& segment;
     int32_t docid = -1;
     int32_t lastDoc;
+    bool denseClause;
 
-    Scorer(solux::IndexReader::Segment& segment, float constantScore = 0.0f)
+    Scorer(solux::IndexReader::Segment& segment, float constantScore = 0.0f,
+           bool denseClause = !disableDenseClauseForTests)
       : Query::ConstantScorer(constantScore), segment(segment),
-        lastDoc(segment.postingsReader().maxDoc() - 1) {
+        lastDoc(segment.postingsReader().maxDoc() - 1),
+        denseClause(denseClause) {
     }
 
     int32_t next() override {
@@ -58,7 +61,7 @@ public:
     void exhaust() override { lastDoc = -1; }
 
     bool supportsWindowFilter() const override {
-      return !disableDenseClauseForTests;
+      return denseClause;
     }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
@@ -92,22 +95,49 @@ public:
   class Supplier final : public Query::ScorerSupplier {
     solux::IndexReader::Segment& segment;
     float score;
+    // The test control is supplier-fixed so resolve and its later build cannot
+    // observe different global values.
+    bool denseClause;
+
+    class Plan final : public Query::ScorerPlan {
+      Supplier& supplier;
+
+    protected:
+      Query::Scorer* buildScorer(MemPool& targetPool) override {
+        return targetPool.make<AllQuery::Scorer>(
+            supplier.segment, supplier.score, supplier.denseClause);
+      }
+
+      Query::Scorer* buildIndependentScorer(
+          MemPool& targetPool) override {
+        return targetPool.make<AllQuery::Scorer>(
+            supplier.segment, supplier.score, supplier.denseClause);
+      }
+
+    public:
+      Plan(Supplier& supplier, const Query::PlanContext& planContext,
+           const Query::ScorerShape& shape, int64_t cost)
+        : Query::ScorerPlan(supplier, planContext, shape, cost),
+          supplier(supplier) {}
+    };
+
   public:
     Supplier(solux::IndexReader::Segment& segment, float score)
-      : segment(segment), score(score) {}
+      : segment(segment), score(score),
+        denseClause(!disableDenseClauseForTests) {}
 
     int64_t cost() override { return segment.maxDoc(); }
 
     Query::ScorerShape describeScorer(
-        const Query::ScorerBuildContext& buildContext) const override {
+        const Query::PlanContext& buildContext) const override {
       unused(buildContext);
       return {
         .matchState = Query::MatchState::NONEMPTY,
         .directKind = Query::DirectScorerKind::OTHER,
         .reportedTwoPhase = Query::ReportedTwoPhase::NO,
-        .windowFillClause = disableDenseClauseForTests
-            ? Query::ClauseShape::NONE
-            : Query::ClauseShape::DIRECT,
+        .windowFillClause = denseClause
+            ? Query::ClauseShape::DIRECT
+            : Query::ClauseShape::NONE,
         .termDisjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
@@ -115,14 +145,18 @@ public:
       };
     }
 
-    AllQuery::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-      unused(leadCost);
-      return targetPool.make<AllQuery::Scorer>(segment, score);
+    Query::ScorerPlan* resolve(
+        MemPool& planPool,
+        const Query::PlanContext& planContext) override {
+      return planPool.make<Plan>(
+          *this, planContext, describeScorer(planContext), cost());
     }
 
     Query::Scorer* getIndependent(MemPool& targetPool,
                                   int64_t leadCost) override {
-      return get(targetPool, leadCost);
+      Query::PlanContext planContext =
+          Query::PlanContext::fromLeadCost(leadCost);
+      return resolve(targetPool, planContext)->buildIndependent(targetPool);
     }
 
     // The null-source form of DocSetBulkScorer: all docs in [0, maxDoc), so

@@ -179,6 +179,36 @@ public:
     class Supplier final : public Query::ScorerSupplier {
       TermQuery::Weight& weight;
       solux::IndexReader::Segment& segment;
+
+      class Plan final : public Query::ScorerPlan {
+        Supplier& supplier;
+
+      protected:
+        Query::Scorer* buildScorer(MemPool& targetPool) override {
+          return supplier.weight.createScorer(targetPool, supplier.segment);
+        }
+
+        Query::Scorer* buildIndependentScorer(
+            MemPool& targetPool) override {
+          return supplier.weight.createScorer(targetPool, supplier.segment);
+        }
+
+        DocsOnlyEnum* buildDocsOnlyEnum(MemPool& targetPool) override {
+          if (supplier.weight.cachedTermInfo == nullptr) {
+            return nullptr;
+          }
+          return supplier.weight.cachedTermInfo
+              ->useDocsEnum<DocsEnumTier::DOCS>(
+                  targetPool, supplier.segment);
+        }
+
+      public:
+        Plan(Supplier& supplier, const Query::PlanContext& planContext,
+             const Query::ScorerShape& shape, int64_t cost)
+          : Query::ScorerPlan(supplier, planContext, shape, cost),
+            supplier(supplier) {}
+      };
+
     public:
       Supplier(TermQuery::Weight& weight, solux::IndexReader::Segment& segment)
         : weight(weight), segment(segment) {}
@@ -189,7 +219,7 @@ public:
       }
 
       Query::ScorerShape describeScorer(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         unused(buildContext);
         return {
           .matchState = weight.cachedTermInfo == nullptr
@@ -206,22 +236,24 @@ public:
         };
       }
 
-      Query::Scorer* get(solux::MemPool& targetPool, int64_t leadCost) override {
-        unused(leadCost);
-        return weight.createScorer(targetPool, segment);
+      Query::ScorerPlan* resolve(
+          MemPool& planPool,
+          const Query::PlanContext& planContext) override {
+        return planPool.make<Plan>(
+            *this, planContext, describeScorer(planContext), cost());
       }
 
       Query::Scorer* getIndependent(solux::MemPool& targetPool,
                                     int64_t leadCost) override {
-        return get(targetPool, leadCost);
+        Query::PlanContext planContext =
+            Query::PlanContext::fromLeadCost(leadCost);
+        return resolve(targetPool, planContext)->buildIndependent(targetPool);
       }
 
       DocsOnlyEnum* getDocsOnly(MemPool& targetPool) override {
-        if (weight.cachedTermInfo == nullptr) {
-          return nullptr;
-        }
-        return weight.cachedTermInfo->useDocsEnum<DocsEnumTier::DOCS>(
-            targetPool, segment);
+        Query::PlanContext planContext = Query::PlanContext::fromLeadCost(
+            std::numeric_limits<int64_t>::max());
+        return resolve(targetPool, planContext)->buildDocsOnly(targetPool);
       }
 
       ScoreBlockFillKind scoreBlockFillKind() const noexcept override {

@@ -150,7 +150,7 @@ public:
     // the production policy. FORCE_EAGER always selects the eager scorer;
     // forced lazy modes require the lazy preconditions and retained-state
     // budget. Everything else stays eager.
-    using ScorerMode = Query::ScorerBuildContext::MultiTermScorerMode;
+    using ScorerMode = Query::PlanContext::MultiTermScorerMode;
     static inline ScorerMode scorerModeForTests = ScorerMode::AUTO;
 
     // Past this many terms AUTO abandons the all-live-cursors windowed scorer
@@ -164,10 +164,10 @@ public:
     // term index.
     static inline size_t maxLazyStateBytes = 32u << 20;
 
-    static Query::ScorerBuildContext scorerBuildContext(
+    static Query::PlanContext scorerBuildContext(
         int64_t leadCost, bool phraseDisableSortForTests = false) {
       return {
-        .leadCost = leadCost,
+        .demand = Query::Demand::fromLeadCost(leadCost),
         .multiTermScorerModeForTests = scorerModeForTests,
         .multiTermMaxLazyStateBytes = maxLazyStateBytes,
         .phraseDisableSortForTests = phraseDisableSortForTests,
@@ -198,7 +198,7 @@ public:
     }
 
     static ExpansionMode chooseMode(
-        bool canUseLazy, const Query::ScorerBuildContext& buildContext,
+        bool canUseLazy, const Query::PlanContext& buildContext,
         const ExpansionMemo& memo) {
       if (memo.hasBitset()) {
         assert(memo.autoMode == ExpansionMode::EAGER);
@@ -229,7 +229,7 @@ public:
 
     bool fillExpansionMemo(
         MemPool& scratchPool, IndexReader::Segment& segment,
-        const Query::ScorerBuildContext& buildContext) {
+        const Query::PlanContext& buildContext) {
       assert(segment.ord >= 0
              && (size_t) segment.ord < expansionSlots.size());
       ExpansionSlot& slot = expansionSlots[(size_t) segment.ord];
@@ -305,7 +305,7 @@ public:
 
     const ExpansionMemo& expansionMemo(
         MemPool& scratchPool, IndexReader::Segment& segment,
-        const Query::ScorerBuildContext& buildContext) {
+        const Query::PlanContext& buildContext) {
       fillExpansionMemo(scratchPool, segment, buildContext);
       return *expansionSlots[(size_t) segment.ord].memo;
     }
@@ -327,7 +327,7 @@ public:
 
     Query::Scorer* createScorerForMode(
         MemPool& targetPool, IndexReader::Segment& segment,
-        const Query::ScorerBuildContext& buildContext) {
+        const Query::PlanContext& buildContext) {
       const ExpansionMemo& memo = expansionMemo(
           targetPool, segment, buildContext);
       unused(memo.sumDocFreq);
@@ -386,7 +386,7 @@ public:
       }
 
       Query::ScorerShape describeScorer(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         Query::MatchState matchState = Query::MatchState::UNKNOWN;
         if (weight.cachedFieldInfo == nullptr
             || weight.cachedFieldInfo->segInfos[segment.ord] == nullptr) {
@@ -443,13 +443,13 @@ public:
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         unused(buildContext);
         return Query::UnresolvedSupplierCause::MULTITERM;
       }
 
       bool fillExpansionMemo(
-          const Query::ScorerBuildContext& buildContext) override {
+          const Query::PlanContext& buildContext) override {
         return weight.fillExpansionMemo(
             scratchPool, segment, buildContext);
       }

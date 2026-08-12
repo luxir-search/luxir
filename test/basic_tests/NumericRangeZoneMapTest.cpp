@@ -293,11 +293,13 @@ TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
       query.createWeight(context, 0));
   auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, supplier);
-  Query::ScorerBuildContext buildContext;
-  buildContext.leadCost = std::numeric_limits<int64_t>::max();
+  Query::PlanContext buildContext;
+  buildContext.demand = Query::Demand::fromLeadCost(
+      std::numeric_limits<int64_t>::max());
   EXPECT_EQ(Query::MatchState::NONEMPTY,
             supplier->describeScorer(buildContext).matchState);
-  Query::Scorer* scorer = supplier->get(pool, buildContext.leadCost);
+  Query::Scorer* scorer = supplier->get(
+      pool, buildContext.demand.candidates);
   ASSERT_NE(nullptr, scorer);
   EXPECT_NE(nullptr,
             dynamic_cast<NumericRangeQuery::ZoneMapScorer*>(scorer));

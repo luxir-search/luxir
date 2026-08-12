@@ -190,13 +190,13 @@ public:
     // materialized points) depends on leadCost and BKD availability, and a
     // falsely definite answer would poison route planning.
     Query::ScorerShape describeScorer(
-        const Query::ScorerBuildContext& buildContext) const override {
+        const Query::PlanContext& buildContext) const override {
       unused(buildContext);
       return {};
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
-        const Query::ScorerBuildContext& buildContext) const override {
+        const Query::PlanContext& buildContext) const override {
       unused(buildContext);
       return Query::UnresolvedSupplierCause::NUMERIC_GEO;
     }

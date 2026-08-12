@@ -316,13 +316,30 @@ class DocSetSupplier final : public Query::ScorerSupplier {
   DocSet* docs;
   IndexReader::Segment& segment;
 
+  class Plan final : public Query::ScorerPlan {
+    DocSetSupplier& supplier;
+
+  protected:
+    Query::Scorer* buildScorer(MemPool& targetPool) override {
+      return createDocSetScorer(
+          targetPool, supplier.docs, supplier.segment);
+    }
+
+  public:
+    Plan(DocSetSupplier& supplier,
+         const Query::PlanContext& planContext,
+         const Query::ScorerShape& shape, int64_t cost)
+      : Query::ScorerPlan(supplier, planContext, shape, cost),
+        supplier(supplier) {}
+  };
+
 public:
   DocSetSupplier(DocSet* docs, IndexReader::Segment& segment) : docs(docs), segment(segment) {}
 
   int64_t cost() override { return docs == nullptr ? 0 : (int64_t)docs->card(); }
 
   Query::ScorerShape describeScorer(
-      const Query::ScorerBuildContext& buildContext) const override {
+      const Query::PlanContext& buildContext) const override {
     unused(buildContext);
     return {
       .matchState = docs == nullptr || docs->card() == 0
@@ -342,9 +359,11 @@ public:
 
   DocSet* docSet() const { return docs; }
 
-  Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-    unused(leadCost);
-    return createDocSetScorer(targetPool, docs, segment);
+  Query::ScorerPlan* resolve(
+      MemPool& planPool,
+      const Query::PlanContext& planContext) override {
+    return planPool.make<Plan>(
+        *this, planContext, describeScorer(planContext), cost());
   }
 
   BulkScorer* bulkScorer(MemPool& targetPool) override {

@@ -468,7 +468,7 @@ public:
       }
 
       Query::ScorerShape describeScorer(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         if (PhraseQuery::disableShapesForTests) return {};
         Estimate estimate = weight.estimateScorer(
             segment, buildContext.phraseDisableSortForTests, false);
@@ -477,7 +477,7 @@ public:
             && (weight.inputFlags & EXCLUSION_WINDOW_FILL) != 0
             && estimateSupportsWindowFill(
                 estimate.approximationCost, estimate.matchCost,
-                buildContext.leadCost)) {
+                buildContext.demand.candidates)) {
           windowFill = Query::ClauseShape::DIRECT;
         }
         return {
@@ -495,7 +495,7 @@ public:
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         unused(buildContext);
         return Query::UnresolvedSupplierCause::PHRASE;
       }

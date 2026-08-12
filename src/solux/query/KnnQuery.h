@@ -338,6 +338,58 @@ public:
     class KnnPreparedWeight final : public Query::Weight::PreparedWeight {
       std::vector<std::vector<Hit>> perSegHits;
 
+      class Supplier final : public Query::ScorerSupplier {
+        std::span<const Hit> hits;
+
+        class Plan final : public Query::ScorerPlan {
+          std::span<const Hit> hits;
+
+        protected:
+          Query::Scorer* buildScorer(MemPool& targetPool) override {
+            return targetPool.make<KnnQuery::Scorer>(hits);
+          }
+
+        public:
+          Plan(Supplier& supplier,
+               const Query::PlanContext& planContext,
+               const Query::ScorerShape& shape, int64_t cost,
+               std::span<const Hit> hits)
+            : Query::ScorerPlan(
+                  supplier, planContext, shape, cost),
+              hits(hits) {}
+        };
+
+      public:
+        explicit Supplier(std::span<const Hit> hits) : hits(hits) {
+          assert(!hits.empty());
+        }
+
+        int64_t cost() override { return (int64_t)hits.size(); }
+
+        Query::ScorerShape describeScorer(
+            const Query::PlanContext& buildContext) const override {
+          unused(buildContext);
+          return {
+            .matchState = Query::MatchState::NONEMPTY,
+            .directKind = Query::DirectScorerKind::OTHER,
+            .reportedTwoPhase = Query::ReportedTwoPhase::NO,
+            .windowFillClause = Query::ClauseShape::NONE,
+            .termDisjunctionClause = Query::ClauseShape::NONE,
+            .independentTerm =
+                Query::IndependentTermAccess::UNSUPPORTED,
+            .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+            .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+          };
+        }
+
+        Query::ScorerPlan* resolve(
+            MemPool& planPool,
+            const Query::PlanContext& planContext) override {
+          return planPool.make<Plan>(
+              *this, planContext, describeScorer(planContext), cost(), hits);
+        }
+      };
+
     public:
       explicit KnnPreparedWeight(std::vector<std::vector<Hit>>&& perSegHits)
         : perSegHits(std::move(perSegHits)) {}
@@ -348,6 +400,15 @@ public:
         if (hits.empty()) return nullptr;
         return target.make<KnnQuery::Scorer>(
           std::span<const Hit>(hits.data(), hits.size()));
+      }
+
+      Query::ScorerSupplier* scorerSupplier(
+          MemPool& target, IndexReader::Segment& segment) override {
+        if ((size_t)segment.ord >= perSegHits.size()) return nullptr;
+        auto& hits = perSegHits[(size_t)segment.ord];
+        if (hits.empty()) return nullptr;
+        return target.make<Supplier>(
+            std::span<const Hit>(hits.data(), hits.size()));
       }
 
       bool outputIsSubsetOfDomain() const noexcept override { return true; }

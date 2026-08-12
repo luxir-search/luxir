@@ -158,8 +158,8 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
       pool, reader.segments()[0]);
   ASSERT_NE(nullptr, supplier);
 
-  Query::ScorerBuildContext buildContext;
-  buildContext.leadCost = leadCost;
+  Query::PlanContext buildContext;
+  buildContext.demand = Query::Demand::fromLeadCost(leadCost);
   Query::ScorerShape shape = supplier->describeScorer(buildContext);
   bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY
       || expectedKind == ExpectedScorerKind::SCAN;
@@ -703,11 +703,13 @@ TEST_F(NumericRangePointsTest, nonemptyFenceCanRefineToEmptyScorer) {
       pool, reader->segments()[0]);
   ASSERT_NE(nullptr, supplier);
 
-  Query::ScorerBuildContext buildContext;
-  buildContext.leadCost = std::numeric_limits<int64_t>::max();
+  Query::PlanContext buildContext;
+  buildContext.demand = Query::Demand::fromLeadCost(
+      std::numeric_limits<int64_t>::max());
   Query::ScorerShape shape = supplier->describeScorer(buildContext);
   EXPECT_EQ(Query::MatchState::NONEMPTY, shape.matchState);
-  Query::Scorer* scorer = supplier->get(pool, buildContext.leadCost);
+  Query::Scorer* scorer = supplier->get(
+      pool, buildContext.demand.candidates);
   ASSERT_NE(nullptr, scorer);
   EXPECT_TRUE(collect(scorer).empty());
 

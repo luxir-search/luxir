@@ -308,7 +308,7 @@ TEST_F(MultiTermScorerModesTest, stateBudgetSpillsToEager) {
     ASSERT_NE(weight, nullptr);
     auto* supplier =
         weight->scorerSupplier(ti.pool, ctx.topReader.segments()[0]);
-    Query::ScorerBuildContext buildContext =
+    Query::PlanContext buildContext =
         MultiTermQuery::Weight::scorerBuildContext(1);
     expectMultiTermShape(
         supplier->describeScorer(buildContext),
@@ -373,8 +373,8 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
   auto guard = ti.pool.rewindScopeGuard();
   auto& segment = ti.reader->segments()[0];
   Query::Context context(ti.pool, *ti.reader);
-  Query::ScorerBuildContext buildContext{
-      .leadCost = 1,
+  Query::PlanContext buildContext{
+      .demand = Query::Demand::fromLeadCost(1),
   };
 
   TermQuery presentTerm("body_w", "qalpha");
@@ -428,7 +428,7 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
             MultiTermQuery::Weight::scorerBuildContext(1)),
         Query::MatchState::UNKNOWN, windowFillClause);
 
-    Query::ScorerBuildContext modeContext =
+    Query::PlanContext modeContext =
         MultiTermQuery::Weight::scorerBuildContext(1);
     EXPECT_TRUE(prefixSupplier->fillExpansionMemo(modeContext));
     Query::ClauseShape resolvedWindowFill =
@@ -492,7 +492,7 @@ TEST_F(MultiTermScorerModesTest,
     auto* weight = dynamic_cast<MultiTermQuery::Weight*>(
         prefix.createWeight(context, 0));
     ASSERT_NE(weight, nullptr);
-    Query::ScorerBuildContext buildContext =
+    Query::PlanContext buildContext =
         MultiTermQuery::Weight::scorerBuildContext(1);
 
     SkipStatsGuard statsGuard;

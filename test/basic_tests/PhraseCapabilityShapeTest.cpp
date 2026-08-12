@@ -37,8 +37,8 @@ public:
     Query::Context context(pool, *reader);
     auto* weight = query.createWeight(context, flags);
     auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
-    Query::ScorerBuildContext buildContext{
-      .leadCost = leadCost,
+    Query::PlanContext buildContext{
+      .demand = Query::Demand::fromLeadCost(leadCost),
       .phraseDisableSortForTests = disableSort,
     };
     return supplier->describeScorer(buildContext);

@@ -805,9 +805,9 @@ public:
       int64_t cost() override { return estimatedCost; }
 
       Query::ScorerShape describeScorer(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         if (buildContext.numericRangeDisableShapesForTests) return {};
-        ScorerArm arm = selectScorerArm(buildContext.leadCost);
+        ScorerArm arm = selectScorerArm(buildContext.demand.candidates);
         bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
             || arm == ScorerArm::SCAN;
         return {
@@ -825,7 +825,7 @@ public:
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
-          const Query::ScorerBuildContext& buildContext) const override {
+          const Query::PlanContext& buildContext) const override {
         return buildContext.numericRangeDisableShapesForTests
             ? Query::UnresolvedSupplierCause::NUMERIC_GEO
             : Query::UnresolvedSupplierCause::NONE;
