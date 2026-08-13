@@ -776,7 +776,17 @@ public:
               sortSourceCost = std::min(sortSourceCost,
                                         (int64_t)collectorFilter->card());
             }
+            // One segment bind for every execution arm below: repeated
+            // setSegment calls are correct (slot state survives) but re-seek
+            // comparator readers, a real fixed cost on string sorts.
+            data->fieldCollector->setSegment(
+                segnum, &seg.postingsReader(), &poolGuard.pool(),
+                sortSourceCost);
             bool usedBulk = false;
+            // A MATCH_WINDOWS plan taken by a declined arm is retained here
+            // so the ordinary bulk arm never re-plans the same context.
+            std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
+            Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
             // Best-first exact-domain route: when the whole result set is
             // already a materialized BITSET, no scorer needs to run - the
             // driver visits key blocks in bound order and terminates on
@@ -807,9 +817,6 @@ public:
               if (allDocs
                   || (domainSet != nullptr
                       && domainSet->type == DocSet::BITSET)) {
-                data->fieldCollector->setSegment(
-                    segnum, &seg.postingsReader(), &poolGuard.pool(),
-                    sortSourceCost);
                 auto plan = data->fieldCollector->maskedKeyBlockPlan();
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
@@ -840,12 +847,92 @@ public:
                 }
               }
             }
+            // Seeded two-pass query-driven route: no materialized domain
+            // exists (else best-first took it), but the sole dense numeric
+            // primary still publishes block bounds, so the driver fills the
+            // heap from the best-bounded blocks via one bulk scorer and
+            // sweeps the complement with a second, independent one. Needs a
+            // supplier whose bulk plans declare independentReplan (both
+            // products are built before pass 1), a sub-saturating expected
+            // floor with material headroom (4*floor+64 < blockCount), and
+            // at least one expected match per key block. forceFieldSortSeeding
+            // bypasses only the two economic gates, never correctness or
+            // capability.
+            if (!usedBulk && allowSortPruning && !disableFieldSortSeeding
+                && !disableFieldSortBulk && !requiresPreparePhase
+                && !data->fieldCollector->needsScores
+                && !data->fieldCollector->hasExpr
+                && data->fieldCollector->topCount > 0) {
+              auto plan = data->fieldCollector->maskedKeyBlockPlan();
+              if (plan.batch != nullptr && plan.blockCount > 0
+                  && sortSourceCost > 0) {
+                int64_t expectedFloor = std::min<int64_t>(
+                    plan.blockCount,
+                    (data->fieldCollector->topCount * (int64_t)seg.maxDoc()
+                     + sortSourceCost - 1) / sortSourceCost);
+                bool material =
+                    4 * expectedFloor + 64 < plan.blockCount
+                    && sortSourceCost >= plan.blockCount;
+                if (material || forceFieldSortSeeding) {
+                  matchWindowsPlan = supplier->planBulk(
+                      Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                      matchWindowsContext);
+                  auto& bulkPlan = *matchWindowsPlan;
+                  if (bulkPlan.available
+                          == Query::ScorerSupplier::BulkAnswer::YES
+                      && bulkPlan.supportsMatchWindows
+                          == Query::ScorerSupplier::BulkAnswer::YES
+                      && bulkPlan.independentReplan
+                          == Query::ScorerSupplier::BulkAnswer::YES
+                      && !bulkPlan.hasConstantCount()) {
+                    auto sweepPlan = supplier->planBulk(
+                        Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                        matchWindowsContext);
+                    auto* seedBulk =
+                        supplier->buildBulk(poolGuard.pool(), bulkPlan);
+                    matchWindowsPlan.reset();  // consumed by the build
+                    auto* sweepBulk = seedBulk == nullptr ? nullptr
+                        : supplier->buildBulk(poolGuard.pool(), sweepPlan);
+                    if (seedBulk != nullptr && sweepBulk != nullptr) {
+                      int64_t seedBudget = expectedFloor;
+                      if (fieldSortSeedBudgetPerMilleForTests > 0) {
+                        seedBudget = std::max<int64_t>(
+                            1, expectedFloor
+                                * fieldSortSeedBudgetPerMilleForTests / 1000);
+                      }
+                      int64_t lambda = std::max<int64_t>(
+                          1, sortSourceCost / plan.blockCount);
+                      int64_t fillAbortBudget = std::max<int64_t>(
+                          8, 4 * ((data->fieldCollector->topCount + lambda - 1)
+                                  / lambda));
+                      collectTopKMatchWindowedSeeded(
+                          segnum, seedBulk, sweepBulk, collectorFilter,
+                          *data->fieldCollector, poolGuard.pool(),
+                          seg.maxDoc(), seedBudget, fillAbortBudget);
+                      data->fieldCollector->recordSegmentSkipStats(segnum);
+                      usedBulk = true;
+                    } else if (seedBulk != nullptr) {
+                      // The pass-2 product failed to build; the untouched
+                      // pass-1 product runs today's single-pass walk.
+                      skipCount(SkipStats::fieldSortBulkCollections);
+                      collectTopKMatchWindowed(
+                          segnum, seedBulk, collectorFilter, builderPtr,
+                          *data->fieldCollector, seg.maxDoc(),
+                          allowSortPruning);
+                      data->fieldCollector->recordSegmentSkipStats(segnum);
+                      usedBulk = true;
+                    }
+                  }
+                }
+              }
+            }
             if (!usedBulk && !disableFieldSortBulk
                 && !data->fieldCollector->needsScores) {
-              Query::ScorerSupplier::BulkScorerContext bulkContext;
-              auto plan = supplier->planBulk(
-                  Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                  bulkContext);
+              auto plan = matchWindowsPlan.has_value()
+                  ? *matchWindowsPlan
+                  : supplier->planBulk(
+                        Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
+                        matchWindowsContext);
               bool plannedNo =
                   plan.available != Query::ScorerSupplier::BulkAnswer::YES
                   || plan.supportsMatchWindows
@@ -855,13 +942,10 @@ public:
               if (plannedNo) {
                 supplier->recordBulkPlanCommitment(
                     Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
-                    bulkContext, plan);
+                    matchWindowsContext, plan);
               }
               if (bulk != nullptr) {
                 assert(bulk->supportsMatchWindows());
-                data->fieldCollector->setSegment(
-                    segnum, &seg.postingsReader(), &poolGuard.pool(),
-                    sortSourceCost);
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
                   expressionBindings.emplace(
@@ -878,9 +962,6 @@ public:
             if (!usedBulk) {
               auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
-                data->fieldCollector->setSegment(
-                    segnum, &seg.postingsReader(), &poolGuard.pool(),
-                    sortSourceCost);
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
                   expressionBindings.emplace(

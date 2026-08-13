@@ -264,6 +264,10 @@ public:
         };
         plan.acceptsWindowFilter = available
             ? BulkAnswer::YES : BulkAnswer::NO;
+        // Every build constructs a fresh scorer and enum from immutable
+        // cached term state, so coexisting plans are trivially disjoint.
+        plan.independentReplan = available
+            ? BulkAnswer::YES : BulkAnswer::NO;
         return plan;
       }
 

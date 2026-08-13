@@ -44,6 +44,23 @@ inline bool disableFieldSortBestFirst =
 // (too few key blocks to ever pass it) still drive the best-first arm.
 inline bool forceFieldSortBestFirst = false;
 
+// A/B baseline for the seeded two-pass query-driven field-sort driver.
+// Default false means eligible query-driven field sorts fill the heap from
+// the best-bounded key blocks first, then sweep the complement.
+inline bool disableFieldSortSeeding =
+    std::getenv("SOLUX_DISABLE_FIELD_SORT_SEEDING") != nullptr;
+// Test-only: bypass the economic gates (materiality and matches-per-block)
+// so small corpora still drive the seeded arm. Correctness and capability
+// gates are never bypassed.
+inline bool forceFieldSortSeeding = false;
+// Test/bench-only: scales the seed-set size relative to the expected floor
+// R_hat (per-mille so the override stays integral). 0 selects the production
+// policy (1000 = exactly R_hat).
+inline int32_t fieldSortSeedBudgetPerMilleForTests = []() {
+  const char* v = std::getenv("SOLUX_FIELD_SORT_SEED_BUDGET_PERMILLE");
+  return v != nullptr ? std::atoi(v) : 0;
+}();
+
 // A/B baseline for exact-count score ranking. The default composes an
 // unscored exact-count pass with a competitively pruned top-k pass when the
 // query and per-segment density policy admit it.

@@ -121,7 +121,12 @@ public:
   // Emit the matching docs of the next window in [min, max), intersected
   // with filter, without scores (out.scores contents are unspecified).
   // Exhaustive like countNextWindow: there is no competitive threshold.
-  // Returns the resume docid under the same contract as scoreNextWindow.
+  // Returns the resume docid under the same contract as scoreNextWindow,
+  // with one addition all window entry points share: END from a request
+  // whose max is below maxDoc only means the bound was reached - it is NOT
+  // an exhaustion latch, and the caller may keep issuing later bounded
+  // requests (which must return empty windows once the underlying stream is
+  // truly exhausted). Only an unbounded request's END means exhaustion.
   virtual int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
                                   int32_t min, int32_t max) {
     return scoreNextWindow(out, filter, min, max,
@@ -560,6 +565,14 @@ public:
       const BulkBuildState* buildState = nullptr;
       int64_t constantCount = -1;
       BulkAnswer acceptsWindowFilter = BulkAnswer::NO;
+      // YES declares that another planBulk() call on this supplier with an
+      // identical context may coexist with this plan: neither call
+      // invalidates the other, their build states are disjoint, each plan is
+      // built at most once, and both products enumerate the same exact
+      // matches under the same filter contract. Consumers that need two
+      // independent forward executions (the seeded field-sort driver) require
+      // YES and build both products before either runs.
+      BulkAnswer independentReplan = BulkAnswer::NO;
 
       bool hasConstantCount() const noexcept {
         return constantCount >= 0;

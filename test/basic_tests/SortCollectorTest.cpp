@@ -106,6 +106,27 @@ public:
   }
 };
 
+class SeededGuard {
+  bool savedDisable;
+  bool savedForce;
+  int32_t savedBudget;
+
+public:
+  SeededGuard(bool disabled, bool force, int32_t budgetPerMille = 0)
+      : savedDisable(disableFieldSortSeeding),
+        savedForce(forceFieldSortSeeding),
+        savedBudget(fieldSortSeedBudgetPerMilleForTests) {
+    disableFieldSortSeeding = disabled;
+    forceFieldSortSeeding = force;
+    fieldSortSeedBudgetPerMilleForTests = budgetPerMille;
+  }
+  ~SeededGuard() {
+    disableFieldSortSeeding = savedDisable;
+    forceFieldSortSeeding = savedForce;
+    fieldSortSeedBudgetPerMilleForTests = savedBudget;
+  }
+};
+
 struct FieldSortBulkResult {
   std::vector<std::string> ids;
   std::vector<int64_t> ints;
@@ -2543,6 +2564,224 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   auto deletedAllBestFirst = run(true, false, true, randAsc, 987, false, "");
   EXPECT_GT(deletedAllBestFirst.activations, 0);
   EXPECT_EQ(deletedAllExhaustive.ids, deletedAllBestFirst.ids);
+}
+
+// Seeded two-pass query-driven collection must match doc-order pruning and
+// exhaustive collection. The corpus gives every query shape the driver must
+// survive: "alpha" is a mid-density term uncorrelated with the sort keys,
+// "head" lives only inside segment 0's first key block (the term exhausts in
+// an early seed and later seed windows must come back empty), and "tail"
+// lives only in the last docs (anti-correlated with mono_i asc: the
+// best-bounded seeds hold no matches, exercising the underfilled-heap
+// path). A 500-per-mille seed budget forces undershoot so pass 2 has real
+// work; ties exercise the segdoc guard when the pass-2 cursor runs behind
+// pass-1 admissions.
+TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
+  CollectionHelper helper("seeded_sort");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kDocsPerSeg = 5000;
+  int32_t docId = 0;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
+      std::string id = std::to_string(docId);
+      int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
+      std::string body = (docId & 1) == 0 ? "alpha" : "other";
+      if (docId < 500) body = "head";
+      if (docId >= 9000) body = "tail";
+      if (seg == 1 && i % 13 == 0) {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "ties_i", (int64_t)(docId % 7),
+                             "mono_i", (int64_t)docId),
+                     UpdateMessage::NO_COMMIT);
+      } else {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "rand_i", rand,
+                             "ties_i", (int64_t)(docId % 7),
+                             "mono_i", (int64_t)docId),
+                     UpdateMessage::NO_COMMIT);
+      }
+    }
+    helper.commit();
+  }
+
+  struct Sorts {
+    std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
+  };
+  enum class Main { TERM, BOOLEAN };
+  auto run = [&](bool seeded, bool disablePruning, const Sorts& sorts,
+                 int32_t limit, bool exactCount,
+                 std::string_view value = "alpha",
+                 int32_t budgetPerMille = 0, Main main = Main::TERM) {
+    SeededGuard seededGuard(!seeded, seeded, budgetPerMille);
+    SortPruningGuard pruningGuard(disablePruning);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("seeded_sort");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    if (main == Main::TERM) {
+      cur.matchQuery("body_w", value);
+    } else {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {qb::match(cur.mr(), "body_w", value)}, {},
+          {qb::match(cur.mr(), "body_w", "tail")});
+    }
+    if (exactCount) cur.getNumber();
+    for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    struct Result {
+      std::vector<std::string> ids;
+      int64_t found = 0;
+      int64_t activations = 0;
+      int64_t seedBlocks = 0;
+      int64_t fillAborts = 0;
+      int64_t pass2Skips = 0;
+    } result;
+    result.ids = resultIds(*req);
+    const auto* docs = req->docList("q");
+    if (docs != nullptr && docs->found) result.found = *docs->found;
+    result.activations = SkipStats::fieldSortSeededActivations;
+    result.seedBlocks = SkipStats::fieldSortSeedBlocks;
+    result.fillAborts = SkipStats::fieldSortSeedFillAborts;
+    result.pass2Skips = SkipStats::fieldSortSeedPass2Skips;
+    return result;
+  };
+
+  Sorts randAsc{{{"rand_i", qb::ASC}}};
+  Sorts randDesc{{{"rand_i", qb::DESC}}};
+  Sorts tiesAsc{{{"ties_i", qb::ASC}}};
+  Sorts tiesThenRand{{{"ties_i", qb::ASC}, {"rand_i", qb::ASC}}};
+  Sorts monoAsc{{{"mono_i", qb::ASC}}};
+
+  for (const Sorts& sorts :
+       {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc}) {
+    for (int32_t limit : {1, 9, 987, 4500}) {
+      for (std::string_view term : {"alpha", "head", "tail"}) {
+        auto exhaustive = run(false, true, sorts, limit, false, term);
+        auto docOrder = run(false, false, sorts, limit, false, term);
+        auto seeded = run(true, false, sorts, limit, false, term);
+        // Undershot seed budget: pass 2 must complete the floor.
+        auto underseeded = run(true, false, sorts, limit, false, term, 500);
+        EXPECT_EQ(exhaustive.ids, docOrder.ids)
+            << "limit=" << limit << " term=" << term
+            << " sort=" << sorts.clauses[0].first;
+        EXPECT_EQ(exhaustive.ids, seeded.ids)
+            << "limit=" << limit << " term=" << term
+            << " sort=" << sorts.clauses[0].first;
+        EXPECT_EQ(exhaustive.ids, underseeded.ids)
+            << "underseeded limit=" << limit << " term=" << term
+            << " sort=" << sorts.clauses[0].first;
+      }
+    }
+  }
+
+  // Route engagement, proven by the activation counter; multi-clause sorts
+  // have no sole column and must decline.
+  EXPECT_GT(run(true, false, randAsc, 9, false).activations, 0);
+  EXPECT_EQ(run(true, false, tiesThenRand, 9, false).activations, 0);
+  // Without the force override the two-block corpus can never clear the
+  // materiality gate.
+  EXPECT_EQ(run(false, false, randAsc, 9, false).activations, 0);
+  // A compound main query offers no independentReplan capability.
+  EXPECT_EQ(run(true, false, randAsc, 9, false, "alpha", 0,
+                Main::BOOLEAN).activations, 0);
+  // Exact count keeps every pruning route off and stays exact.
+  {
+    auto exact = run(true, false, randAsc, 9, true);
+    auto exactExh = run(false, true, randAsc, 9, true);
+    EXPECT_EQ(exact.activations, 0);
+    EXPECT_EQ(exact.ids, exactExh.ids);
+    EXPECT_EQ(exact.found, exactExh.found);
+  }
+  // "head" matches exactly segment 0's first key block and limit 987 keeps
+  // the heap underfull: every match must be collected exactly once, so any
+  // double-collect across the passes inflates found.
+  {
+    auto seededHead = run(true, false, randAsc, 987, false, "head");
+    auto exhHead = run(false, true, randAsc, 987, false, "head");
+    EXPECT_GT(seededHead.activations, 0);
+    EXPECT_EQ(exhHead.found, seededHead.found);
+    EXPECT_EQ(exhHead.ids, seededHead.ids);
+  }
+  // Anti-correlated "tail" under mono asc with an undershot budget: the one
+  // seed block holds no matches, the heap stays underfull, and the sweep
+  // completes correctness.
+  {
+    auto seededTail = run(true, false, monoAsc, 987, false, "tail", 500);
+    auto exhTail = run(false, true, monoAsc, 987, false, "tail");
+    EXPECT_GT(seededTail.activations, 0);
+    EXPECT_EQ(exhTail.ids, seededTail.ids);
+    EXPECT_EQ(exhTail.found, seededTail.found);
+  }
+
+  // Deletes arrive as the liveDocs domain bitset and intersect both passes.
+  ASSERT_TRUE(helper.deleteByIds({"600", "1042", "7003"},
+                                 UpdateMessage::COMMIT).success);
+  for (const Sorts& sorts : {randAsc, tiesAsc}) {
+    auto exhaustive = run(false, true, sorts, 987, false);
+    auto seeded = run(true, false, sorts, 987, false);
+    EXPECT_GT(seeded.activations, 0);
+    EXPECT_EQ(exhaustive.ids, seeded.ids)
+        << "deletes sort=" << sorts.clauses[0].first;
+  }
+}
+
+// The seed-schedule abort must fire against an anti-correlated query on a
+// segment with more key blocks than the minimum abort budget (8): the term
+// lives only in the last of 13 blocks while the sort prefers the first
+// blocks, so seed probes come back empty. Depending on task scheduling the
+// segment collects cold (underfilled-heap abort) or against a heap warmed
+// by the small all-matching segment whose keys are all worse (consecutive
+// matchless-seed abort); both must abandon the schedule and let the sweep
+// complete correctness.
+TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
+  constexpr int32_t kBigSegDocs = 13 * 4096;
+  constexpr int32_t kProbeStart = 12 * 4096;
+  CollectionHelper helper("seeded_abort");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  for (int32_t i = 0; i < 5000; i++) {
+    helper.index(flatdoc("id", std::to_string(i), "id_s", std::to_string(i),
+                         "body_w", "probe", "mono_i", (int64_t)(100000 + i)),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+  for (int32_t i = 0; i < kBigSegDocs; i++) {
+    int32_t docId = 5000 + i;
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId),
+                         "body_w", i >= kProbeStart ? "probe" : "filler",
+                         "mono_i", (int64_t)i),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  auto run = [&](bool seeded, bool disablePruning) {
+    SeededGuard seededGuard(!seeded, seeded);
+    SortPruningGuard pruningGuard(disablePruning);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("seeded_abort");
+    auto& cur = req->topDocs("q").limit(9).fields({"id_s"})
+        .matchQuery("body_w", "probe");
+    qb::sort(cur, "mono_i", qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    struct Result {
+      std::vector<std::string> ids;
+      int64_t activations = 0;
+      int64_t fillAborts = 0;
+    } result;
+    result.ids = resultIds(*req);
+    result.activations = SkipStats::fieldSortSeededActivations;
+    result.fillAborts = SkipStats::fieldSortSeedFillAborts;
+    return result;
+  };
+
+  auto exhaustive = run(false, true);
+  auto seeded = run(true, false);
+  EXPECT_GT(seeded.activations, 0);
+  EXPECT_GT(seeded.fillAborts, 0);
+  EXPECT_EQ(exhaustive.ids, seeded.ids);
 }
 
 // String candidate pruning (postings-union over the competitive ord interval)

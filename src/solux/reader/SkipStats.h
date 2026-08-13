@@ -221,6 +221,15 @@ struct SkipStats {
   static inline int64_t fieldSortBestFirstBlocks = 0;
   static inline int64_t fieldSortBestFirstTerminations = 0;
   static inline int64_t fieldSortBestFirstFallbacks = 0;
+  // Seeded two-pass query-driven driver: route activations, seed blocks the
+  // scorer actually enumerated, seeds the maturing bottom classified away
+  // before any postings work, underfilled-heap aborts of the seed schedule,
+  // and pass-2 jumps over already-enumerated seed blocks.
+  static inline int64_t fieldSortSeededActivations = 0;
+  static inline int64_t fieldSortSeedBlocks = 0;
+  static inline int64_t fieldSortSeedClassifiedOut = 0;
+  static inline int64_t fieldSortSeedFillAborts = 0;
+  static inline int64_t fieldSortSeedPass2Skips = 0;
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
@@ -436,6 +445,11 @@ struct SkipStats {
     fieldSortBestFirstBlocks = 0;
     fieldSortBestFirstTerminations = 0;
     fieldSortBestFirstFallbacks = 0;
+    fieldSortSeededActivations = 0;
+    fieldSortSeedBlocks = 0;
+    fieldSortSeedClassifiedOut = 0;
+    fieldSortSeedFillAborts = 0;
+    fieldSortSeedPass2Skips = 0;
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;

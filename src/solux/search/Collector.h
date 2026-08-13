@@ -713,45 +713,21 @@ inline void collectFirstKConstantWindowed(
   unused(overshoot);
 }
 
-// Collect match-only windows in doc order. Scores are intentionally absent
-// from this path; collectors receive the unscored sentinel literal.
-// allowPruning: when true and no domain builder is attached, a collector
-// exposing nextCompetitiveRange() has noncompetitive doc blocks jumped over
-// before window production, and every window request is bounded by the
-// competitive range end - a one-doc candidate range costs one doc, not a
-// whole overshooting window of key-rejected neighbors. END from a bounded
-// request means the bound was reached; only an unbounded request's END is
-// query exhaustion. Skipped docs are uncounted.
+// Consume every match window of [begin, end): produce, feed the domain
+// builder and the collector, stop at the bound. END from a bounded request
+// only means the bound was reached (BulkScorer::matchNextWindow contract),
+// so callers may keep issuing later ranges afterwards. Returns the number
+// of docs emitted to the collector.
 template <typename Collector>
-void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
-                              DocSetBuilder* builder, Collector& collector,
-                              int32_t maxDoc, bool allowPruning = false) {
-  assert(bulk != nullptr);
-  int32_t cursor = 0;
-  [[maybe_unused]] int32_t competitiveEnd = 0;
-  constexpr bool hasSortRanges =
-      requires { collector.nextCompetitiveRange(segnum, (int32_t)0); };
-  [[maybe_unused]] bool sortPrune = false;
-  if constexpr (hasSortRanges) {
-    sortPrune = allowPruning && builder == nullptr;
-  }
+int64_t feedMatchWindows(int32_t segnum, BulkScorer* bulk, DocSet* filter,
+                         DocSetBuilder* builder, Collector& collector,
+                         int32_t begin, int32_t end) {
   ScoreWindow window;
-  while (cursor != PostingsReader::END && cursor < maxDoc) {
-    int32_t windowMax = maxDoc;
-    if constexpr (hasSortRanges) {
-      if (sortPrune && cursor >= competitiveEnd) {
-        auto range = collector.nextCompetitiveRange(segnum, cursor);
-        competitiveEnd = range.end;
-        if (range.begin > cursor) {
-          cursor = range.begin;
-          continue;
-        }
-      }
-      if (sortPrune) {
-        windowMax = std::min(windowMax, competitiveEnd);
-      }
-    }
-    int32_t next = bulk->matchNextWindow(window, filter, cursor, windowMax);
+  int32_t cursor = begin;
+  int64_t emitted = 0;
+  while (cursor < end) {
+    int32_t next = bulk->matchNextWindow(window, filter, cursor, end);
+    emitted += window.size;
     if (builder != nullptr) {
       for (int32_t i = 0; i < window.size; i++) {
         builder->add(window.docs[(size_t) i]);
@@ -768,14 +744,65 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
       }
     }
     if (next == PostingsReader::END) {
-      if (windowMax >= maxDoc) {
-        break;
-      }
-      cursor = windowMax;
-      continue;
+      break;
     }
     assert(next > cursor);
     cursor = next;
+  }
+  return emitted;
+}
+
+// Collect match-only windows in doc order. Scores are intentionally absent
+// from this path; collectors receive the unscored sentinel literal.
+// allowPruning: when true and no domain builder is attached, a collector
+// exposing nextCompetitiveRange() has noncompetitive doc blocks jumped over
+// before window production, and every window request is bounded by the
+// competitive range end - a one-doc candidate range costs one doc, not a
+// whole overshooting window of key-rejected neighbors. Skipped docs are
+// uncounted. visitedBlocks (with its block geometry) marks key blocks an
+// earlier seeded pass already enumerated: the walk jumps them, and window
+// production never crosses a block boundary without re-consulting the mask.
+template <typename Collector>
+void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
+                              DocSetBuilder* builder, Collector& collector,
+                              int32_t maxDoc, bool allowPruning = false,
+                              std::span<const uint64_t> visitedBlocks = {},
+                              int32_t visitedBlockSize = 0) {
+  assert(bulk != nullptr);
+  assert(visitedBlocks.empty() || visitedBlockSize > 0);
+  int32_t cursor = 0;
+  constexpr bool hasSortRanges =
+      requires { collector.nextCompetitiveRange(segnum, (int32_t)0); };
+  [[maybe_unused]] bool sortPrune = false;
+  if constexpr (hasSortRanges) {
+    sortPrune = allowPruning && builder == nullptr;
+  }
+  while (cursor < maxDoc) {
+    int32_t rangeEnd = maxDoc;
+    if constexpr (hasSortRanges) {
+      if (sortPrune) {
+        auto range = collector.nextCompetitiveRange(segnum, cursor);
+        if (range.begin == PostingsReader::END) {
+          break;
+        }
+        cursor = std::max(cursor, range.begin);
+        rangeEnd = std::min(rangeEnd, range.end);
+      }
+    }
+    if (!visitedBlocks.empty()) {
+      int64_t block = (int64_t)cursor / visitedBlockSize;
+      int32_t blockLimit = (int32_t)std::min<int64_t>(
+          (block + 1) * (int64_t)visitedBlockSize, (int64_t)maxDoc);
+      if ((visitedBlocks[(size_t)(block >> 6)] >> (block & 63)) & 1) {
+        skipCount(SkipStats::fieldSortSeedPass2Skips);
+        cursor = blockLimit;
+        continue;
+      }
+      rangeEnd = std::min(rangeEnd, blockLimit);
+    }
+    feedMatchWindows(segnum, bulk, filter, builder, collector, cursor,
+                     rangeEnd);
+    cursor = rangeEnd;
   }
 }
 
@@ -879,6 +906,92 @@ void collectTopKBitSetBestFirst(int32_t segnum,
     }
     gatherBlock(block);
   }
+}
+
+// Seeded two-pass query-driven field-sort driver. The domain is reachable
+// only through forward scorers (streaming postings, no rewind), so
+// bound-ordered visiting is reformulated as two monotone passes: select the
+// seedCount best-bounded key blocks, walk them in doc order with one bulk
+// scorer so the heap bottom matures to near-final, then sweep from doc 0
+// with a second, independent bulk scorer whose competitive-range walk now
+// skips essentially everything. Both products must exist before pass 1 runs:
+// a pass-2 scorer cannot be recovered after pass 1 advanced a shared one.
+// Blocks pass 1 actually enumerated are recorded in a visited mask the sweep
+// jumps over, so every match reaches the collector at most once and hitCount
+// keeps pruned-path semantics. Once the heap fills, each remaining seed is
+// classified against the maturing bottom before any postings work. Two abort
+// rules bound an anti-correlated query (its matches only in high-key blocks,
+// so seed probes come back empty): a heap still underfull after
+// fillAbortBudget enumerated seeds abandons the schedule, and so does a
+// consecutive run of fillAbortBudget matchless enumerated seeds - the
+// latter also fires when a warm heap (filled by earlier segments) lets
+// low-bound blocks classify competitive without the underfull test ever
+// engaging. Either way the sweep completes correctness, inheriting whatever
+// bottom the seeds bought.
+template <typename Collector>
+void collectTopKMatchWindowedSeeded(
+    int32_t segnum, BulkScorer* seedBulk, BulkScorer* sweepBulk,
+    DocSet* filter, Collector& collector, MemPool& pool, int32_t maxDoc,
+    int64_t seedCount, int64_t fillAbortBudget) {
+  auto plan = collector.maskedKeyBlockPlan();
+  assert(plan.batch != nullptr);
+  assert(seedBulk != nullptr && sweepBulk != nullptr);
+  using BC = typename Collector::BlockClass;
+  skipCount(SkipStats::fieldSortSeededActivations);
+
+  // Select the seedCount smallest (bound, blockId) blocks, then visit them
+  // in ascending doc order so the seed scorer only moves forward.
+  std::span<int64_t> blocks = pool.make_span<int64_t>((size_t)plan.blockCount);
+  for (int64_t b = 0; b < plan.blockCount; b++) {
+    blocks[(size_t)b] = b;
+  }
+  seedCount = std::min<int64_t>(seedCount, plan.blockCount);
+  auto boundLess = [&](int64_t a, int64_t b) {
+    int64_t boundA = plan.batch->blockBestKey(a);
+    int64_t boundB = plan.batch->blockBestKey(b);
+    return boundA != boundB ? boundA < boundB : a < b;
+  };
+  std::nth_element(blocks.begin(), blocks.begin() + seedCount, blocks.end(),
+                   boundLess);
+  std::span<int64_t> seeds = blocks.first((size_t)seedCount);
+  std::sort(seeds.begin(), seeds.end());
+
+  std::span<uint64_t> visited =
+      pool.make_span<uint64_t>((size_t)((plan.blockCount + 63) >> 6));
+  std::fill(visited.begin(), visited.end(), 0);
+
+  int64_t enumerated = 0;
+  int64_t consecutiveEmpty = 0;
+  for (int64_t block : seeds) {
+    if (collector.heapFull()) {
+      if (collector.classifyBlock(
+              segnum, (int32_t)(block * (int64_t)plan.blockSize),
+              plan.batch->blockBestKey(block), plan.batch) != BC::COLLECT) {
+        skipCount(SkipStats::fieldSortSeedClassifiedOut);
+        continue;
+      }
+    } else if (enumerated >= fillAbortBudget) {
+      skipCount(SkipStats::fieldSortSeedFillAborts);
+      break;
+    }
+    int32_t begin = (int32_t)(block * (int64_t)plan.blockSize);
+    int32_t end = (int32_t)std::min<int64_t>(
+        (block + 1) * (int64_t)plan.blockSize, (int64_t)maxDoc);
+    int64_t emitted = feedMatchWindows(segnum, seedBulk, filter, nullptr,
+                                       collector, begin, end);
+    visited[(size_t)(block >> 6)] |= 1ULL << (block & 63);
+    enumerated++;
+    skipCount(SkipStats::fieldSortSeedBlocks);
+    if (emitted != 0) {
+      consecutiveEmpty = 0;
+    } else if (++consecutiveEmpty >= fillAbortBudget) {
+      skipCount(SkipStats::fieldSortSeedFillAborts);
+      break;
+    }
+  }
+
+  collectTopKMatchWindowed(segnum, sweepBulk, filter, nullptr, collector,
+                           maxDoc, true, visited, plan.blockSize);
 }
 
 // Rank score windows into a top-k collector. This is intentionally only a
