@@ -291,7 +291,7 @@ ScoreTopKResult runMsmWandTopK(IndexReader& reader, int32_t topK, MsmWandMode mo
     std::span<Query::Scorer*> span(arr, (size_t) count);
     Query::Scorer* scorer = nullptr;
     if (count == minMatch) {
-      auto costs = pool.make_span<int64_t>((size_t) count);
+      auto costs = pool.make_span_zeroed<int64_t>((size_t) count);  // ConjunctionScorer copies costs unconditionally
       scorer = pool.make<BooleanQuery::ConjunctionScorer>(
         pool, span, costs,
         singlePhaseScorersForTests(pool, (size_t)count), span, true, true);

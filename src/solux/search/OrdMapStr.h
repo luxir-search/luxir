@@ -16,7 +16,8 @@ public:
   IntColReader::SparseValues* firstSegs = nullptr;
 
   OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
-    enums = pool.make_span<TermsEnum*>(index.segments().size());
+    // Lazy per-segment cache: null means not yet opened.
+    enums = pool.make_span_zeroed<TermsEnum*>(index.segments().size());
     if (ordMap && ordMap->getGlobDeltas()) {
       deltas = pool.make<IntColReader::SparseValues>(*ordMap->getGlobDeltas());
       firstSegs = pool.make<IntColReader::SparseValues>(*ordMap->getFirstSegs());

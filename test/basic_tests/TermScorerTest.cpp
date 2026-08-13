@@ -2178,7 +2178,7 @@ Query::Scorer* createMsmScorer(MemPool& pool, std::span<Query::Weight*> weights,
   if (count < minMatch) return nullptr;
   std::span<Query::Scorer*> span(arr, (size_t) count);
   if (count == minMatch) {
-    auto costs = pool.make_span<int64_t>((size_t) count);
+    auto costs = pool.make_span_zeroed<int64_t>((size_t) count);  // ConjunctionScorer copies costs unconditionally
     return pool.make<BooleanQuery::ConjunctionScorer>(
         pool, span, costs,
         singlePhaseScorersForTests(pool, (size_t)count), span, true, true);

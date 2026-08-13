@@ -3,6 +3,7 @@
 #include <memory>
 #include <algorithm>
 #include <assert.h>
+#include <cstring>
 #include <memory_resource>
 #include <span>
 #include <boost/container/small_vector.hpp>
@@ -216,24 +217,30 @@ public:
     return new (storage) vec_type(std::forward<Args>(args)..., getAllocator());
   }
 
-  // make an array of default initialized elements
+  // make an array of DEFAULT-initialized elements: types with default
+  // member initializers (or user default constructors) are constructed, but
+  // trivial element types are left UNINITIALIZED - pool memory is recycled,
+  // so their contents are garbage and every element must be written before
+  // it is read. Callers that want cleared storage say so with
+  // make_arr_zeroed/make_span_zeroed. Debug builds poison the storage first
+  // so reliance on the pre-2026-08 zeroing behavior fails loudly instead of
+  // reading recycled bytes.
   template <typename T>
   T* make_arr(size_t size) {
     static_assert(std::is_trivially_destructible<T>::value, "element type for MemPool::make_arr() must be trivially destructible");
     char* storage = alloc(sizeof(T)*size, alignof(T));
-    return new (storage) T[size]();  // default initialize or uninitialized?
+#ifndef NDEBUG
+    memset(storage, 0xA5, sizeof(T) * size);
+#endif
+    return new (storage) T[size];
   }
 
-  // make an array of UNINITIALIZED trivial elements: a large capacity
-  // reservation touches no memory until the caller writes it, unlike
-  // make_arr's value-initialization (which zeroes the whole span).
+  // make an array of value-initialized (zeroed, for trivial types) elements.
   template <typename T>
-  T* make_arr_uninit(size_t size) {
-    static_assert(std::is_trivially_default_constructible<T>::value
-                      && std::is_trivially_destructible<T>::value,
-                  "element type for MemPool::make_arr_uninit() must be trivial");
+  T* make_arr_zeroed(size_t size) {
+    static_assert(std::is_trivially_destructible<T>::value, "element type for MemPool::make_arr_zeroed() must be trivially destructible");
     char* storage = alloc(sizeof(T)*size, alignof(T));
-    return new (storage) T[size];
+    return new (storage) T[size]();
   }
 
   template <typename T>
@@ -243,8 +250,8 @@ public:
   }
 
   template <typename T>
-  std::span<T> make_span_uninit(size_t size) {
-    T* arr = make_arr_uninit<T>(size);
+  std::span<T> make_span_zeroed(size_t size) {
+    T* arr = make_arr_zeroed<T>(size);
     return {arr, size};
   }
 

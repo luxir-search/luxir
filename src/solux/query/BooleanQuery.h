@@ -9588,7 +9588,9 @@ public:
         }
         if (write != i) {
           outDocs[(size_t) write] = outDocs[(size_t) i];
-          outScores[(size_t) write] = outScores[(size_t) i];
+          if (withScores) {
+            outScores[(size_t) write] = outScores[(size_t) i];
+          }
         }
         write++;
       }

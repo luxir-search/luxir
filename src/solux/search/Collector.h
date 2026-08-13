@@ -849,7 +849,7 @@ public:
 
   LeafBoundFrontier(const KeyBlockPlan& plan, MemPool& pool)
       : plan(plan), leavesPerBlock(plan.blockSize / plan.leafSize),
-        heap(pool.make_span_uninit<Node>((size_t)plan.leafCount)) {
+        heap(pool.make_span<Node>((size_t)plan.leafCount)) {
     for (int64_t b = 0; b < plan.blockCount; b++) {
       heap[(size_t)b] = {plan.batch->blockBestKey(b),
                          (int32_t)(b * (int64_t)plan.blockSize), false, b};
