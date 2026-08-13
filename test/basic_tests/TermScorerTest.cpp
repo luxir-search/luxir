@@ -9009,6 +9009,99 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
   }
 }
 
+// Domain-driven match/count windows must apply prohibited-clause exclusions:
+// the sparse-filter drive path bypasses the window-bits fill (and its
+// exclusion subtraction), so it has to prepare the exclusion window itself
+// and reject excluded docs per candidate.
+TEST_F(TermScorerTest, MaxScoreBulkScorerDomainDriveAppliesExclusions) {
+  TestIndex testIndex;
+  TestField field(testIndex, "body_w");
+  field.startIndexing();
+  const int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 211;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    appendRepeatedTerm(body, (doc & 1) != 0 ? "excl_a" : "excl_b", 2);
+    if (doc % 7 == 0) {
+      appendRepeatedTerm(body, "excl_a", 1);
+    }
+    if (doc % 3 == 0) {
+      appendRepeatedTerm(body, "excl_block", 1);
+    }
+    field.add(doc, body);
+  }
+  testIndex.flush();
+  field.startReading();
+  auto reader = testIndex.reader;
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery a("body_w", "excl_a");
+  TermQuery b("body_w", "excl_b");
+  TermQuery blocked("body_w", "excl_block");
+  std::array<Query*, 2> optional = {&a, &b};
+  std::array<Query*, 1> prohibited = {&blocked};
+  std::span<Query*> empty;
+
+  struct Run {
+    std::vector<int32_t> matched;
+    int64_t counted = 0;
+    int64_t driveWindows = 0;
+  };
+  auto makeBulk = [&](BooleanQuery& query) {
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    auto* bulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(
+        supplier->bulkScorer(pool));
+    EXPECT_NE(bulk, nullptr);
+    return bulk;
+  };
+  auto run = [&](bool disableDrive) {
+    BulkDomainDriveGuard guard(disableDrive);
+    BooleanQuery query(empty, std::span<Query*>(optional.data(), 2),
+                       std::span<Query*>(prohibited.data(), 1), empty);
+    auto filter = makeEveryNthSegmentDocSet(segment, 512, false, false);
+    Run result;
+    auto* matchBulk = makeBulk(query);
+    ScoreWindow window;
+    int32_t cursor = 0;
+    while (cursor != PostingsReader::END && cursor < segment.maxDoc()) {
+      int32_t next = matchBulk->matchNextWindow(window, filter.get(), cursor,
+                                                segment.maxDoc());
+      for (int32_t i = 0; i < window.size; i++) {
+        result.matched.push_back(window.docs[(size_t) i]);
+      }
+      if (next == PostingsReader::END) break;
+      cursor = next;
+    }
+    auto* countBulk = makeBulk(query);
+    cursor = 0;
+    while (cursor != PostingsReader::END && cursor < segment.maxDoc()) {
+      int32_t next = countBulk->countNextWindow(result.counted, nullptr,
+                                                filter.get(), cursor,
+                                                segment.maxDoc());
+      if (next == PostingsReader::END) break;
+      cursor = next;
+    }
+    result.driveWindows = matchBulk->domainDriveWindowCount()
+        + countBulk->domainDriveWindowCount();
+    return result;
+  };
+
+  auto exhaustive = run(true);
+  auto driven = run(false);
+  ASSERT_GT(driven.driveWindows, 0);
+  ASSERT_EQ(exhaustive.driveWindows, 0);
+  EXPECT_FALSE(driven.matched.empty());
+  EXPECT_EQ(exhaustive.matched, driven.matched);
+  EXPECT_EQ(exhaustive.counted, driven.counted);
+  EXPECT_EQ((int64_t) driven.matched.size(), driven.counted);
+  for (int32_t doc : driven.matched) {
+    EXPECT_NE(doc % 3, 0) << "prohibited doc emitted: " << doc;
+  }
+}
+
 void checkMaxScoreBulkScorerBs1BitsetFilterMatchesPull(
     IndexReader& reader, int32_t numTerms) {
   const int32_t topK = 100;

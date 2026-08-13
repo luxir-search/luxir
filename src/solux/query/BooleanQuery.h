@@ -11038,8 +11038,9 @@ public:
             && windowFilter->prepare(windowStart, windowEnd) == 0) {
           return windowEnd >= max ? PostingsReader::END : windowEnd;
         }
+        prepareExclusionWindow();
         forEachDomainDoc(filter, [&](int32_t doc) {
-          if (matchesAnyClause(doc)) {
+          if (!isExcluded(doc) && matchesAnyClause(doc)) {
             assert(out.size < kWindowSize);
             out.docs[(size_t) out.size] = doc;
             out.size++;
@@ -11096,8 +11097,9 @@ public:
             && windowFilter->prepare(windowStart, windowEnd) == 0) {
           return windowEnd >= max ? PostingsReader::END : windowEnd;
         }
+        prepareExclusionWindow();
         forEachDomainDoc(filter, [&](int32_t doc) {
-          if (matchesAnyClause(doc)) {
+          if (!isExcluded(doc) && matchesAnyClause(doc)) {
             count++;
             if (domainOut != nullptr) {
               domainOut->add(doc);
