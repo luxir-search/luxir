@@ -807,23 +807,23 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 }
 
 // Best-first exact-domain field-sort driver. The whole domain is known up
-// front - a bitset (cached filter or liveDocs), or every doc when
-// domainWords is empty (match-all, no deletes) - so no scorer runs: key
-// blocks are visited in ascending bound order, each block's in-domain docs
-// admitted through the comparator's fused masked gather. Bound order makes
-// termination a proof - once the heap head classifies SKIP_STRICT against
-// the current bottom, no remaining block can contribute. Equal-bound heads
-// are popped individually through the tie/segdoc rules. workCap bounds
-// pathological tie plateaus; on cap, unvisited blocks are swept forward in
-// doc order under the same classification. Every in-domain doc is gathered
-// at most once, so hitCount keeps the pruned-path semantics (counts
-// gathered docs; pruning is off when exact counts are required).
-template <typename Collector>
-void collectTopKBitSetBestFirst(int32_t segnum,
-                                std::span<const uint64_t> domainWords,
-                                Collector& collector, MemPool& pool,
-                                int64_t workCap) {
-  auto plan = collector.maskedKeyBlockPlan();
+// front - materialized docs, or every doc for match-all with no deletes -
+// so no scorer runs: key blocks are visited in ascending bound order, each
+// block's in-domain docs admitted through an order-independent gather.
+// Bound order makes termination a proof - once the heap head classifies
+// SKIP_STRICT against the current bottom, no remaining block can
+// contribute. Equal-bound heads are popped individually through the
+// tie/segdoc rules. workCap bounds pathological tie plateaus; on cap,
+// unvisited blocks are swept forward in doc order under the same
+// classification. Every in-domain doc is gathered at most once, so
+// hitCount keeps the pruned-path semantics (counts gathered docs; pruning
+// is off when exact counts are required). The domain representation lives
+// in `gather`, which feeds one block's in-domain (docs, keys) to
+// admitGathered; the bitset and array entry points below supply it.
+template <typename Collector, typename GatherBlock>
+void collectTopKBestFirst(int32_t segnum, Collector& collector, MemPool& pool,
+                          const typename Collector::KeyBlockPlan& plan,
+                          int64_t workCap, GatherBlock&& gather) {
   assert(plan.batch != nullptr);
   using BC = typename Collector::BlockClass;
   skipCount(SkipStats::fieldSortBestFirstActivations);
@@ -846,18 +846,11 @@ void collectTopKBitSetBestFirst(int32_t segnum,
   std::span<uint64_t> visited =
       pool.make_span<uint64_t>((size_t)((plan.blockCount + 63) >> 6));
   std::fill(visited.begin(), visited.end(), 0);
-  std::span<int32_t> outDocs = pool.make_span<int32_t>((size_t)plan.blockSize);
-  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.blockSize);
 
   auto gatherBlock = [&](int64_t block) {
     visited[(size_t)(block >> 6)] |= 1ULL << (block & 63);
-    int32_t n = plan.batch->gatherBlockMasked(block, domainWords, outDocs,
-                                              outKeys);
     skipCount(SkipStats::fieldSortBestFirstBlocks);
-    if (n > 0) {
-      collector.admitGathered(segnum, outDocs.first((size_t)n),
-                              outKeys.first((size_t)n), plan.batch);
-    }
+    gather(block);
   };
 
   int64_t visitedCount = 0;
@@ -906,6 +899,61 @@ void collectTopKBitSetBestFirst(int32_t segnum,
     }
     gatherBlock(block);
   }
+}
+
+// Bitset-domain entry: domainWords is a whole-segment word span (cached
+// filter or liveDocs), or empty meaning every doc (match-all, no deletes).
+// Blocks gather through the comparator's fused masked gather.
+template <typename Collector>
+void collectTopKBitSetBestFirst(int32_t segnum,
+                                std::span<const uint64_t> domainWords,
+                                Collector& collector, MemPool& pool,
+                                int64_t workCap) {
+  auto plan = collector.maskedKeyBlockPlan();
+  assert(plan.batch != nullptr);
+  std::span<int32_t> outDocs = pool.make_span<int32_t>((size_t)plan.blockSize);
+  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.blockSize);
+  collectTopKBestFirst(
+      segnum, collector, pool, plan, workCap, [&](int64_t block) {
+        int32_t n = plan.batch->gatherBlockMasked(block, domainWords, outDocs,
+                                                  outKeys);
+        if (n > 0) {
+          collector.admitGathered(segnum, outDocs.first((size_t)n),
+                                  outKeys.first((size_t)n), plan.batch);
+        }
+      });
+}
+
+// Array-domain entry: domainDocs is the whole sorted materialized set (an
+// ARRAY DocSet, below the bitset promotion threshold). Each visited block
+// gallops to its doc sub-span and gathers keys through the comparator's
+// order-independent key gather - the docs themselves need no copy.
+template <typename Collector>
+void collectTopKArrayBestFirst(int32_t segnum,
+                               std::span<const int32_t> domainDocs,
+                               Collector& collector, MemPool& pool,
+                               int64_t workCap) {
+  auto plan = collector.maskedKeyBlockPlan();
+  assert(plan.batch != nullptr);
+  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.blockSize);
+  const int32_t* domainEnd = domainDocs.data() + domainDocs.size();
+  collectTopKBestFirst(
+      segnum, collector, pool, plan, workCap, [&](int64_t block) {
+        int32_t begin = (int32_t)std::min<int64_t>(
+            block * (int64_t)plan.blockSize,
+            (int64_t)std::numeric_limits<int32_t>::max());
+        int32_t end = (int32_t)std::min<int64_t>(
+            (block + 1) * (int64_t)plan.blockSize,
+            (int64_t)std::numeric_limits<int32_t>::max());
+        const int32_t* lo =
+            screaming::gallopLowerBound(domainDocs.data(), domainEnd, begin);
+        const int32_t* hi = screaming::gallopLowerBound(lo, domainEnd, end);
+        if (lo == hi) return;
+        std::span<const int32_t> docs(lo, hi);
+        plan.batch->gatherKeys(docs, outKeys.first(docs.size()));
+        collector.admitGathered(segnum, docs, outKeys.first(docs.size()),
+                                plan.batch);
+      });
 }
 
 // Seeded two-pass query-driven field-sort driver. The domain is reachable

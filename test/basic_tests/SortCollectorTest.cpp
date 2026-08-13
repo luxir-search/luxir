@@ -2446,18 +2446,23 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
       std::string id = std::to_string(docId);
       int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
       std::string body = (docId & 1) == 0 ? "alpha" : "other";
+      Doc doc;
       if (seg == 1 && i % 13 == 0) {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "ties_i", (int64_t)(docId % 7),
-                             "mono_i", (int64_t)docId),
-                     UpdateMessage::NO_COMMIT);
+        doc = flatdoc("id", id, "id_s", id, "body_w", body,
+                      "ties_i", (int64_t)(docId % 7),
+                      "mono_i", (int64_t)docId);
       } else {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "rand_i", rand,
-                             "ties_i", (int64_t)(docId % 7),
-                             "mono_i", (int64_t)docId),
-                     UpdateMessage::NO_COMMIT);
+        doc = flatdoc("id", id, "id_s", id, "body_w", body,
+                      "rand_i", rand,
+                      "ties_i", (int64_t)(docId % 7),
+                      "mono_i", (int64_t)docId);
       }
+      // ~2% of docs: materializes under the bitset promotion threshold, so
+      // this filter is the array-domain route's shape.
+      if (docId % 50 == 0) {
+        doc.push_back(NameVal{"arr_s", "y"});
+      }
+      helper.index(doc, UpdateMessage::NO_COMMIT);
     }
     helper.commit();
   }
@@ -2540,11 +2545,27 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     EXPECT_EQ(exact.ids, exactExh.ids);
     EXPECT_EQ(exact.found, exactExh.found);
   }
-  // A single-doc filter materializes as an array DocSet: representation gate.
-  run(true, false, true, randAsc, 9, false, "id_s", "42");
-  run(true, false, true, randAsc, 9, false, "id_s", "42");
-  EXPECT_EQ(run(true, false, true, randAsc, 9, false, "id_s", "42")
-                .activations, 0);
+  // Array DocSet domains (below the bitset promotion threshold) ride the
+  // gallop-and-gather entry: a ~2% filter and the degenerate single-doc
+  // filter both activate (force bypasses the floor gate) and match
+  // exhaustive collection.
+  for (auto [field, value] : {std::pair<std::string_view, std::string_view>
+                                  {"arr_s", "y"}, {"id_s", "42"}}) {
+    run(true, false, true, randAsc, 9, false, field, value);
+    run(true, false, true, randAsc, 9, false, field, value);
+    for (int32_t limit : {1, 9, 987}) {
+      auto arrBestFirst =
+          run(true, false, true, randAsc, limit, false, field, value);
+      auto arrExhaustive =
+          run(false, true, true, randAsc, limit, false, field, value);
+      EXPECT_GT(arrBestFirst.activations, 0)
+          << field << " limit=" << limit;
+      EXPECT_EQ(arrExhaustive.ids, arrBestFirst.ids)
+          << field << " limit=" << limit;
+      EXPECT_EQ(arrExhaustive.found, arrBestFirst.found)
+          << field << " limit=" << limit;
+    }
+  }
 
   // Deletes: the folded route's raw cache borrow must decline (live-exact
   // only), while the unfolded effective-filter route folds liveness and
@@ -2564,6 +2585,14 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   auto deletedAllBestFirst = run(true, false, true, randAsc, 987, false, "");
   EXPECT_GT(deletedAllBestFirst.activations, 0);
   EXPECT_EQ(deletedAllExhaustive.ids, deletedAllBestFirst.ids);
+  // Array domain with deletes (doc 1000 is an arr_s member): the folded raw
+  // borrow declines, the unfolded effective set stays an array and correct.
+  auto deletedArrExhaustive =
+      run(false, true, true, randAsc, 987, false, "arr_s", "y");
+  auto deletedArrUnfolded =
+      run(true, false, false, randAsc, 987, false, "arr_s", "y");
+  EXPECT_GT(deletedArrUnfolded.activations, 0);
+  EXPECT_EQ(deletedArrExhaustive.ids, deletedArrUnfolded.ids);
 }
 
 // Seeded two-pass query-driven collection must match doc-order pruning and

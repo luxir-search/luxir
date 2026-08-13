@@ -788,11 +788,11 @@ public:
             std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
             Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
             // Best-first exact-domain route: when the whole result set is
-            // already a materialized BITSET, no scorer needs to run - the
-            // driver visits key blocks in bound order and terminates on
-            // proof. Two domain sources qualify: the supplier's exact cached
-            // set (a folded filter-only Boolean over match-all, no other
-            // filter or sub-op domain restriction), or an explicit
+            // already materialized (BITSET or ARRAY), no scorer needs to run
+            // - the driver visits key blocks in bound order and terminates
+            // on proof. Two domain sources qualify: the supplier's exact
+            // cached set (a folded filter-only Boolean over match-all, no
+            // other filter or sub-op domain restriction), or an explicit
             // collectorFilter under a true match-all weight. Activation also
             // requires the expected visit floor (ceil(k/d) blocks) to be
             // sub-saturating; at ceil(k/d) >= blockCount the bound floor
@@ -816,7 +816,8 @@ public:
               }
               if (allDocs
                   || (domainSet != nullptr
-                      && domainSet->type == DocSet::BITSET)) {
+                      && (domainSet->type == DocSet::BITSET
+                          || domainSet->type == DocSet::ARRAY))) {
                 auto plan = data->fieldCollector->maskedKeyBlockPlan();
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
@@ -831,16 +832,23 @@ public:
                     // fallback keeps adversarial tie plateaus linear.
                     int64_t workCap = std::min(plan.blockCount,
                                                4 * expectedFloor + 64);
-                    std::span<const uint64_t> words;  // empty = every doc
-                    if (!allDocs) {
-                      const FixedBitSet& bits =
-                          ((BitDocSet*)domainSet)->bits();
-                      words = std::span<const uint64_t>(
-                          bits.words, FixedBitSet::sizeInWords(bits.size()));
+                    if (!allDocs && domainSet->type == DocSet::ARRAY) {
+                      collectTopKArrayBestFirst(
+                          segnum, ((ArrDocSet*)domainSet)->docs(),
+                          *data->fieldCollector, poolGuard.pool(), workCap);
+                    } else {
+                      std::span<const uint64_t> words;  // empty = every doc
+                      if (!allDocs) {
+                        const FixedBitSet& bits =
+                            ((BitDocSet*)domainSet)->bits();
+                        words = std::span<const uint64_t>(
+                            bits.words,
+                            FixedBitSet::sizeInWords(bits.size()));
+                      }
+                      collectTopKBitSetBestFirst(
+                          segnum, words,
+                          *data->fieldCollector, poolGuard.pool(), workCap);
                     }
-                    collectTopKBitSetBestFirst(
-                        segnum, words,
-                        *data->fieldCollector, poolGuard.pool(), workCap);
                     data->fieldCollector->recordSegmentSkipStats(segnum);
                     usedBulk = true;
                   }
