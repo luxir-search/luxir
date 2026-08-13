@@ -76,8 +76,20 @@ public:
   static inline bool disableSparseFilteredTopKRerouteForTests = false;
   static inline bool disableSparseFilteredTopKUnionForTests = false;
   // Forces independent first-K capture and count-only bulk arrangements for
-  // constant-scoring top-k requests.
+  // complete constant-scoring top-k requests, and disables the limit-only
+  // bounded drain for parity tests.
   static inline bool disableConstantWindowCaptureForTests = false;
+
+  enum class ConstantScoreDisposition : uint8_t {
+    NOT_CONSTANT_TOP_K,
+    LIMIT_ONLY,
+    COMPLETE,
+  };
+
+  enum class ExactCountTopKRoute : uint8_t {
+    EXACT_CANDIDATE_SCORING,
+    CONSTANT_FIRST_K,
+  };
 
   static int32_t sparseFilteredTopKDensityInverse(
       Query::Weight::SparseFilteredTopKFamily family, int64_t topCount) {
@@ -285,12 +297,37 @@ public:
     }
 
     static Query::Scorer* buildPullScorer(
-        MemPool& pool, Query::ScorerSupplier& supplier) {
+        MemPool& pool, Query::ScorerSupplier& supplier,
+        int64_t candidates = std::numeric_limits<int64_t>::max()) {
       Query::Demand demand = Query::Demand::fromLeadCost(
-          std::numeric_limits<int64_t>::max());
+          candidates);
       Query::ScorerPlan* plan = supplier.resolve(
           pool, supplier.makePlanContext(demand));
       return plan->build(pool);
+    }
+
+    ConstantScoreDisposition constantScoreDisposition(
+        const TopDocsCollector& collector,
+        DocSetBuilder* builder) noexcept {
+      const auto& op = thisOp();
+      if (collector.topCount <= 0 || !op.weight->isConstantScoring()) {
+        return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
+      }
+      if (!TopDocsReq::disableConstantWindowCaptureForTests
+          && !op.requirements.needExactCount && builder == nullptr
+          && op.filters.empty()) {
+        return ConstantScoreDisposition::LIMIT_ONLY;
+      }
+      return ConstantScoreDisposition::COMPLETE;
+    }
+
+    static Query::Scorer* buildBoundedConstantScorer(
+        MemPool& pool, Query::ScorerSupplier& supplier,
+        DocSet* filter, int64_t topCount) {
+      int64_t candidates = filter == nullptr
+          ? std::min<int64_t>(supplier.cost(), topCount)
+          : supplier.cost();
+      return buildPullScorer(pool, supplier, candidates);
     }
 
     Query::Scorer* createMainScorer(MemPool& pool, IndexReader::Segment& seg) {
@@ -375,6 +412,107 @@ public:
       int64_t ranked = collector.totalHits() - before;
       assert(count >= ranked);
       collector.hitCount += count - ranked;
+    }
+
+    bool composeVariableScoreExactCountTopK(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier& scoringSupplier,
+        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
+        TopDocsCollector& collector, int32_t maxDoc) {
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto scoringPlan = scoringSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
+          bulkContext);
+      bool scoringDeclined =
+          scoringPlan.available
+              != Query::ScorerSupplier::BulkAnswer::YES
+          || scoringPlan.supportsExactCandidateScoring
+              != Query::ScorerSupplier::BulkAnswer::YES;
+      if (scoringDeclined) {
+        auto countPlan = countSupplier.planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext);
+        countSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, countPlan);
+        if (countPlan.available
+            != Query::ScorerSupplier::BulkAnswer::NO) {
+          scoringSupplier.recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
+              bulkContext, scoringPlan);
+        }
+        return false;
+      }
+
+      auto countPlan = countSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+          bulkContext);
+      if (countPlan.available
+          != Query::ScorerSupplier::BulkAnswer::YES) {
+        countSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, countPlan);
+        return false;
+      }
+      auto* countBulk = countSupplier.buildBulk(pool, countPlan);
+      if (countBulk == nullptr) return false;
+      auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
+          pool, thisOp().qcontext.topReader.segments()[segnum]);
+      auto* exactScorer = scoringSupplier.buildBulk(pool, scoringPlan);
+      if (exactScorer == nullptr) return false;
+      assert(exactScorer->supportsExactCandidateScoring());
+      countThenCollectTopK(
+          pool, segnum, countBulk, rankingSupplier, collectorFilter,
+          nullptr, collector, maxDoc, true, exactScorer);
+      return true;
+    }
+
+    bool countThenCollectConstantTopK(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
+        TopDocsCollector& collector, int32_t maxDoc) {
+      Query::ScorerSupplier::BulkScorerContext constantContext;
+      constantContext.requireConstantCount = true;
+      auto constantPlan = countSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+          constantContext);
+      int64_t count = collectorFilter == nullptr
+              && constantPlan.hasConstantCount()
+          ? constantPlan.constantCount : -1;
+
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      if (count < 0) {
+        auto countPlan = countSupplier.planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext);
+        if (countPlan.available
+            != Query::ScorerSupplier::BulkAnswer::YES) {
+          countSupplier.recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+              bulkContext, countPlan);
+          return false;
+        }
+        auto* countBulk = countSupplier.buildBulk(pool, countPlan);
+        if (countBulk == nullptr) return false;
+        count = countMatchesWindowed(
+            countBulk, collectorFilter, nullptr, maxDoc);
+      }
+
+      int64_t captured = 0;
+      if (count > 0) {
+        auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
+            pool, thisOp().qcontext.topReader.segments()[segnum]);
+        if (rankingSupplier == nullptr) return false;
+        auto* rankingScorer = buildBoundedConstantScorer(
+            pool, *rankingSupplier, collectorFilter, collector.topCount);
+        if (rankingScorer == nullptr) return false;
+        captured = collectFirstKConstant(
+            segnum, rankingScorer, collectorFilter, collector,
+            collector.topCount);
+      }
+      assert(count >= captured);
+      collector.hitCount += count - captured;
+      return true;
     }
 
     DomainHandle buildEffectiveDomain(
@@ -563,7 +701,9 @@ public:
               supplier = mainScorerSupplier(poolGuard.pool(), seg);
             }
             auto* scorer = supplier == nullptr ? nullptr
-              : buildPullScorer(poolGuard.pool(), *supplier);
+              : buildBoundedConstantScorer(
+                    poolGuard.pool(), *supplier, identityDomain,
+                    data->topCount());
             if (scorer != nullptr) {
               ranked = collectFirstKConstant(segnum, scorer, identityDomain,
                                              *data->scoreCollector, data->topCount());
@@ -759,6 +899,14 @@ public:
             bool allowPruning = op.weight->allowsPruning();
             BulkScorer* bulk = nullptr;
             bool composedExactCountTopK = false;
+            ConstantScoreDisposition constantRoute =
+                constantScoreDisposition(
+                    *data->scoreCollector, builderPtr);
+            ExactCountTopKRoute exactCountTopKRoute =
+                constantRoute
+                        == ConstantScoreDisposition::NOT_CONSTANT_TOP_K
+                    ? ExactCountTopKRoute::EXACT_CANDIDATE_SCORING
+                    : ExactCountTopKRoute::CONSTANT_FIRST_K;
             if (builderPtr == nullptr
                 && data->scoreCollector->topCount > 0
                 && op.countWeight != nullptr && op.rankingWeight != nullptr) {
@@ -767,69 +915,24 @@ public:
               if (countSupplier != nullptr
                   && admitExactCountTopK(
                       *countSupplier, collectorFilter, seg.maxDoc())) {
-                Query::ScorerSupplier::BulkScorerContext bulkContext;
-                auto plan = supplier->planBulk(
-                    Query::ScorerSupplier::BulkUse::
-                        EXACT_CANDIDATE_SCORING,
-                    bulkContext);
-                bool plannedNo =
-                    plan.available
-                        != Query::ScorerSupplier::BulkAnswer::YES
-                    || plan.supportsExactCandidateScoring
-                        != Query::ScorerSupplier::BulkAnswer::YES;
-                if (plannedNo) {
-                  auto countPlan = countSupplier->planBulk(
-                      Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-                      bulkContext);
-                  countSupplier->recordBulkPlanCommitment(
-                      Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-                      bulkContext, countPlan);
-                  if (countPlan.available
-                      != Query::ScorerSupplier::BulkAnswer::NO) {
-                    supplier->recordBulkPlanCommitment(
-                        Query::ScorerSupplier::BulkUse::
-                            EXACT_CANDIDATE_SCORING,
-                        bulkContext, plan);
-                  }
-                  skipCount(SkipStats::exactCountTopKBulkFallbacks);
-                } else {
-                  auto countPlan = countSupplier->planBulk(
-                      Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-                      bulkContext);
-                  bool countPlannedNo = countPlan.available
-                      != Query::ScorerSupplier::BulkAnswer::YES;
-                  if (countPlannedNo) {
-                    countSupplier->recordBulkPlanCommitment(
-                        Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-                        bulkContext, countPlan);
-                  }
-                  auto* countBulk = countPlannedNo
-                      ? nullptr
-                      : countSupplier->buildBulk(
-                          poolGuard.pool(), countPlan);
-                  if (countBulk != nullptr) {
-                    auto* rankingSupplier =
-                        op.rankingWeight->scorerSupplier(
-                            poolGuard.pool(), seg);
-                    auto* exactScorer =
-                        supplier->buildBulk(poolGuard.pool(), plan);
-                    if (exactScorer != nullptr) {
-                      assert(
-                          exactScorer->supportsExactCandidateScoring());
-                      countThenCollectTopK(
-                          poolGuard.pool(), segnum, countBulk,
-                          rankingSupplier, collectorFilter, nullptr,
-                          *data->scoreCollector, seg.maxDoc(), true,
-                          exactScorer);
-                      skipCount(SkipStats::exactCountTopKCompositions);
-                      composedExactCountTopK = true;
-                    } else {
-                      skipCount(SkipStats::exactCountTopKBulkFallbacks);
-                    }
-                  } else {
-                    skipCount(SkipStats::exactCountTopKBulkFallbacks);
-                  }
+                switch (exactCountTopKRoute) {
+                  case ExactCountTopKRoute::EXACT_CANDIDATE_SCORING:
+                    composedExactCountTopK =
+                        composeVariableScoreExactCountTopK(
+                            poolGuard.pool(), segnum, *supplier,
+                            *countSupplier, collectorFilter,
+                            *data->scoreCollector, seg.maxDoc());
+                    break;
+                  case ExactCountTopKRoute::CONSTANT_FIRST_K:
+                    composedExactCountTopK = countThenCollectConstantTopK(
+                        poolGuard.pool(), segnum, *countSupplier,
+                        collectorFilter, *data->scoreCollector,
+                        seg.maxDoc());
+                    break;
                 }
+                skipCount(composedExactCountTopK
+                    ? SkipStats::exactCountTopKCompositions
+                    : SkipStats::exactCountTopKBulkFallbacks);
               } else if (countSupplier != nullptr) {
                 skipCount(SkipStats::exactCountTopKProfitabilityRejects);
               } else {
@@ -844,11 +947,14 @@ public:
                 && supplier->cost() <= DocSetBuilder::arrayLimitFor(seg.maxDoc());
             auto buildDeclaredBulk = [&]() -> BulkScorer* {
               Query::ScorerSupplier::BulkUse use =
-                  data->scoreCollector->topCount == 0
-                      || op.weight->isConstantScoring()
-                      || builderPtr != nullptr
-                  ? Query::ScorerSupplier::BulkUse::COUNT_WINDOWS
-                  : Query::ScorerSupplier::BulkUse::SCORED_WINDOWS;
+                  constantRoute
+                          == ConstantScoreDisposition::LIMIT_ONLY
+                      ? Query::ScorerSupplier::BulkUse::SCORED_WINDOWS
+                      : data->scoreCollector->topCount == 0
+                              || op.weight->isConstantScoring()
+                              || builderPtr != nullptr
+                          ? Query::ScorerSupplier::BulkUse::COUNT_WINDOWS
+                          : Query::ScorerSupplier::BulkUse::SCORED_WINDOWS;
               Query::ScorerSupplier::BulkScorerContext bulkContext;
               auto plan = supplier->planBulk(use, bulkContext);
               if (plan.available != Query::ScorerSupplier::BulkAnswer::YES) {
@@ -884,7 +990,11 @@ public:
                 // scan per build).
                 collectFirstKConstantWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
-                    *data->scoreCollector, seg.maxDoc());
+                    *data->scoreCollector, seg.maxDoc(),
+                    constantRoute
+                            == ConstantScoreDisposition::LIMIT_ONLY
+                        ? ConstantScoreDrain::LIMIT_ONLY
+                        : ConstantScoreDrain::COMPLETE);
               } else if (op.weight->isConstantScoring()) {
                 // In the test-forced arrangement, the bulk scorer drives the
                 // exhaustive count/domain and an independent scorer visits only
@@ -917,10 +1027,25 @@ public:
                     seg.maxDoc(), allowPruning);
               }
             } else {
-              auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
+              auto* scorer = constantRoute
+                      == ConstantScoreDisposition::LIMIT_ONLY
+                  ? buildBoundedConstantScorer(
+                        poolGuard.pool(), *supplier, collectorFilter,
+                        data->scoreCollector->topCount)
+                  : buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
-                collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->scoreCollector,
-                            allowPruning, &scoreAccumulator);
+                if (constantRoute
+                    == ConstantScoreDisposition::LIMIT_ONLY) {
+                  collectFirstKConstant(
+                      segnum, scorer, collectorFilter,
+                      *data->scoreCollector,
+                      data->scoreCollector->topCount);
+                } else {
+                  collectTopK(
+                      segnum, scorer, collectorFilter, builderPtr,
+                      *data->scoreCollector, allowPruning,
+                      &scoreAccumulator);
+                }
               }
             }
           }

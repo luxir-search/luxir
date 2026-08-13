@@ -1042,10 +1042,10 @@ public:
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
-    // The query shape can supply exact unscored count and competitively
-    // pruned score-ranking passes. Profitability remains a per-segment
-    // decision because a sparse filter can make pruning more expensive than
-    // one exhaustive scored pass.
+    // The query shape can supply an exact unscored count plus either a
+    // competitively pruned scoring pass or a bounded constant-score first-K
+    // pass. Profitability and exact-count product availability remain
+    // per-segment planner decisions.
     static constexpr int32_t CAN_COMPOSE_EXACT_COUNT_TOPK = 1 << 4;
 
     /// Raw execution trait bitmask.

@@ -9,6 +9,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/SkipStats.h"
+#include "solux/search/Collector.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -169,4 +170,82 @@ TEST_F(AllQueryCapabilityShapeTest,
   EXPECT_GT(SkipStats::negatedCountWindows, 0);
   EXPECT_GT(SkipStats::negatedCountExclFills, 0);
   EXPECT_EQ(SkipStats::conjDirectDenseEngagements, 0);
+}
+
+TEST_F(AllQueryCapabilityShapeTest,
+       limitOnlyConstantWindowDrainStopsAfterTopK) {
+  constexpr int64_t topCount = 10;
+  const int32_t numDocs = DocsEnumMeta::L1_DOCS + 257;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) numDocs);
+  for (int32_t doc = 0; doc < numDocs; doc++) {
+    docs.push_back(flatdoc(
+        "id", std::to_string(doc), "body_w", "keep"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+
+  auto collect = [&](ConstantScoreDrain drain) -> int64_t {
+    MemPool pool;
+    AllQuery::Supplier supplier(segment, 1.0f);
+    Query::ScorerSupplier::BulkScorerContext context;
+    auto plan = supplier.planBulk(
+        Query::ExecutionUse::SCORED_WINDOWS, context);
+    EXPECT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+    if (plan.available != Query::ScorerSupplier::BulkAnswer::YES) return -1;
+    auto* bulk = supplier.buildBulk(pool, plan);
+    EXPECT_NE(nullptr, bulk);
+    if (bulk == nullptr) return -1;
+    TopDocsCollector collector(topCount);
+    collectFirstKConstantWindowed(
+        0, bulk, nullptr, nullptr, collector, segment.maxDoc(), drain);
+    return collector.totalHits();
+  };
+
+  EXPECT_EQ(topCount, collect(ConstantScoreDrain::LIMIT_ONLY));
+  EXPECT_EQ(numDocs, collect(ConstantScoreDrain::COMPLETE));
+}
+
+TEST_F(AllQueryCapabilityShapeTest,
+       pureNegativeExactCountTopKComposesNegatedCountAndFirstK) {
+  const int32_t numDocs = DocsEnumMeta::L1_DOCS + 257;
+  std::vector<Doc> docs;
+  std::vector<std::string> expectedTop;
+  docs.reserve((size_t) numDocs);
+  for (int32_t doc = 0; doc < numDocs; doc++) {
+    bool excluded = (doc % 7) == 0;
+    docs.push_back(flatdoc(
+        "id", std::to_string(doc), "body_w",
+        excluded ? "excluded" : "keep"));
+    if (!excluded && expectedTop.size() < 100) {
+      expectedTop.push_back(std::to_string(doc));
+    }
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& top = req->collection("main").topDocs("q")
+      .getNumber().fields({"id"}).limit(100);
+  top.rawQuery() = qb::boolean(
+      top.mr(), {}, {},
+      {qb::match(top.mr(), "body_w", "excluded")});
+
+  SkipStatsGuard stats;
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  std::vector<std::string> actualTop;
+  for (const Doc& doc : req->getDocs()) {
+    const FieldVal* id = solux::test::find(doc, "id");
+    ASSERT_NE(nullptr, id);
+    actualTop.push_back(std::get<std::string>(*id));
+  }
+  EXPECT_EQ(numDocs - (numDocs + 6) / 7, req->getMatchCount());
+  EXPECT_EQ(expectedTop, actualTop);
+  EXPECT_GT(SkipStats::exactCountTopKCompositions, 0);
+  EXPECT_GT(SkipStats::negatedCountWindows, 0);
+  EXPECT_GT(SkipStats::negatedCountExclFills, 0);
+  EXPECT_EQ(SkipStats::bulkExclusionShapeFallbacks, 0);
 }

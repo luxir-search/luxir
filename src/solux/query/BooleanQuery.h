@@ -3975,12 +3975,14 @@ public:
 
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
-        if (bulkContext.requireConstantCount
-            && mandatorySources.empty() && prohibitedSources.empty()
-            && filterSuppliers.empty() && minShouldMatch <= 1
-            && optionalShapeSuppliers.size() == 1
-            && optionalShapeSuppliers[0] != nullptr) {
-          return optionalShapeSuppliers[0]->planBulk(use, bulkContext);
+        if (bulkContext.requireConstantCount) {
+          if (mandatorySources.empty() && prohibitedSources.empty()
+              && filterSuppliers.empty() && minShouldMatch <= 1
+              && optionalShapeSuppliers.size() == 1
+              && optionalShapeSuppliers[0] != nullptr) {
+            return optionalShapeSuppliers[0]->planBulk(use, bulkContext);
+          }
+          return noBulkPlan();
         }
         bool hasEnclosingFilters = bulkContext.hasFilter()
             || !bulkContext.filterSuppliers.empty();
@@ -4539,7 +4541,12 @@ public:
               [](Query* clause) {
                 return dynamic_cast<TermQuery*>(clause) != nullptr;
               });
-      if (directTermUnion) {
+      bool unfilteredConstantComplement = constant
+          && filterWeights.empty() && optionalWeights.empty()
+          && mandatoryWeights.size() == 1
+          && mandatoryWeights[0]->matchesAllDocs()
+          && !prohibitedWeights.empty();
+      if (directTermUnion || unfilteredConstantComplement) {
         traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       }
       bool sparseFilteredTopKConjunction = !filterWeights.empty()

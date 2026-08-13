@@ -772,7 +772,11 @@ public:
         && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
     if (!disableTopKCountComposition && exactCountTopK
-        && !weight->needsPrepare() && weight->canComposeExactCountTopK()) {
+        && !weight->needsPrepare() && weight->canComposeExactCountTopK()
+        // A constant-score ranking pass is bounded only when no collector
+        // filter can reject its first K matches. Variable-score composition
+        // retains its existing filtered candidate route.
+        && (filters.empty() || !weight->isConstantScoring())) {
       int32_t countFlags =
           requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
       int32_t rankingFlags =

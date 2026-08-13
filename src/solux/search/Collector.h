@@ -640,18 +640,25 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
 }
 
+enum class ConstantScoreDrain : uint8_t {
+  LIMIT_ONLY,
+  COMPLETE,
+};
+
 // Constant scores rank by doc order, so a segment's top K docs are its first
-// K matches: capture them straight off the counting bulk's emitted windows,
-// then count the remainder without materializing docs. One bulk arrangement
-// serves ranking, count, and domain; an independent capture scorer would
-// rebuild every clause (a multiterm clause re-runs its dictionary scan per
-// build). Score windows carry the weight's constant, so reported scores
-// match what a pull scorer from the same weight returns.
+// K matches. LIMIT_ONLY stops as soon as K are captured. COMPLETE continues
+// with count windows to satisfy an exact-count or domain consumer. One bulk
+// arrangement then serves ranking, count, and domain; an independent capture
+// scorer would rebuild every clause (a multiterm clause re-runs its dictionary
+// scan per build). Score windows carry the weight's constant, so reported
+// scores match what a pull scorer from the same weight returns.
 inline void collectFirstKConstantWindowed(
     int32_t segnum, BulkScorer* bulk, DocSet* filter, DocSetBuilder* builder,
-    TopDocsCollector& collector, int32_t maxDoc) {
+    TopDocsCollector& collector, int32_t maxDoc,
+    ConstantScoreDrain drain) {
   assert(bulk != nullptr);
   assert(collector.topCount > 0);
+  assert(drain == ConstantScoreDrain::COMPLETE || builder == nullptr);
   skipCount(SkipStats::constantWindowCaptures);
   bulk->setTopKDepth((int32_t) collector.topCount, false);
   int64_t collected = 0;
@@ -673,10 +680,12 @@ inline void collectFirstKConstantWindowed(
       if (collected < collector.topCount) {
         collector.collect(segnum, doc, window.scores[(size_t) i]);
         collected++;
-      } else {
+      } else if (drain == ConstantScoreDrain::COMPLETE) {
         // The capture window ran past K; these are count-only.
         collector.hitCount++;
         overshoot++;
+      } else {
+        break;
       }
     }
     if (next == PostingsReader::END) {
@@ -685,6 +694,9 @@ inline void collectFirstKConstantWindowed(
     }
     assert(next > cursor);
     cursor = next;
+  }
+  if (drain == ConstantScoreDrain::LIMIT_ONLY) {
+    return;
   }
   int64_t count = 0;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
