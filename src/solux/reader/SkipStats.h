@@ -214,19 +214,25 @@ struct SkipStats {
   // Equality-aware operational floor: blocks a fresh traversal would still
   // collect under the full tie/segdoc rules. Segment-local, as above.
   static inline int64_t fieldSortRequiredBlocks = 0;
-  // Best-first exact-domain driver: route activations, blocks gathered,
-  // proof terminations (heap head strictly noncompetitive), and work-cap
-  // fallbacks to the forward sweep.
+  // Leaf-level twins of the three floor/skip counters above (512-value
+  // units; never compare against the 4096-unit coarse counters directly).
+  static inline int64_t fieldSortLeavesSkipped = 0;
+  static inline int64_t fieldSortIrreducibleLeaves = 0;
+  static inline int64_t fieldSortRequiredLeaves = 0;
+  // Best-first exact-domain driver: route activations, coarse nodes
+  // expanded into leaves, leaves gathered, proof terminations (heap head
+  // strictly noncompetitive), and work-cap fallbacks to the forward sweep.
   static inline int64_t fieldSortBestFirstActivations = 0;
-  static inline int64_t fieldSortBestFirstBlocks = 0;
+  static inline int64_t fieldSortBestFirstExpansions = 0;
+  static inline int64_t fieldSortBestFirstLeaves = 0;
   static inline int64_t fieldSortBestFirstTerminations = 0;
   static inline int64_t fieldSortBestFirstFallbacks = 0;
-  // Seeded two-pass query-driven driver: route activations, seed blocks the
+  // Seeded two-pass query-driven driver: route activations, seed leaves the
   // scorer actually enumerated, seeds the maturing bottom classified away
-  // before any postings work, underfilled-heap aborts of the seed schedule,
-  // and pass-2 jumps over already-enumerated seed blocks.
+  // before any postings work, seed-schedule aborts (underfilled heap or a
+  // matchless run), and pass-2 jumps over already-enumerated seed leaves.
   static inline int64_t fieldSortSeededActivations = 0;
-  static inline int64_t fieldSortSeedBlocks = 0;
+  static inline int64_t fieldSortSeedLeaves = 0;
   static inline int64_t fieldSortSeedClassifiedOut = 0;
   static inline int64_t fieldSortSeedFillAborts = 0;
   static inline int64_t fieldSortSeedPass2Skips = 0;
@@ -441,12 +447,16 @@ struct SkipStats {
     fieldSortGatherAtLastAdmission = 0;
     fieldSortIrreducibleBlocks = 0;
     fieldSortRequiredBlocks = 0;
+    fieldSortLeavesSkipped = 0;
+    fieldSortIrreducibleLeaves = 0;
+    fieldSortRequiredLeaves = 0;
     fieldSortBestFirstActivations = 0;
-    fieldSortBestFirstBlocks = 0;
+    fieldSortBestFirstExpansions = 0;
+    fieldSortBestFirstLeaves = 0;
     fieldSortBestFirstTerminations = 0;
     fieldSortBestFirstFallbacks = 0;
     fieldSortSeededActivations = 0;
-    fieldSortSeedBlocks = 0;
+    fieldSortSeedLeaves = 0;
     fieldSortSeedClassifiedOut = 0;
     fieldSortSeedFillAborts = 0;
     fieldSortSeedPass2Skips = 0;

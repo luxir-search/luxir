@@ -61,6 +61,8 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
       // 100 uniform values, so one term selects ~1% of docs: the query-driven
       // 1%-selectivity posture (a per-term density no other field here has).
       Inverter::IndexHandler& s9 = inverter.getIndexHandler("short_u100_s");
+      // 1000 uniform values: ~0.1%/term, the sparse query-driven tier.
+      Inverter::IndexHandler& s10 = inverter.getIndexHandler("short_u1000_s");
       Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
       Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
       Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
@@ -108,6 +110,7 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
         // every other field's per-doc values (and bench fingerprints) intact.
         SplitMix64 r2(localIdNum ^ 0x9E3779B97F4A7C15ULL);
         s9.index(inverter, std::to_string(r2.rint(100)));
+        s10.index(inverter, std::to_string(r2.rint(1000)));
 
         i1.index(inverter, r.rint(10));
 

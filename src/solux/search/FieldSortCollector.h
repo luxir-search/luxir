@@ -180,6 +180,7 @@ public:
   int64_t candidateHi = -1;
   int64_t segmentSourceCost = 0;
   int32_t segmentMaxDoc = 0;
+  bool leafDescentEnabled = false;
   int32_t nextProbeDoc = 0;
   bool candidatesDisabled = false;
 
@@ -272,6 +273,24 @@ public:
       if (clause.comparator != nullptr) {
         clause.comparator->setSegment(segment, reader);
       }
+    }
+    // Leaf descent in nextCompetitiveRange only pays when the expected leaf
+    // visit floor (ceil(k * maxDoc / sourceCost) leaves) is MATERIALLY
+    // sub-saturating. At saturation every leaf classifies COLLECT under the
+    // final bottom, so descending would only split producer calls eight ways
+    // and classify eight bounds per block for nothing - and near saturation
+    // (measured at floor/leafCount ~0.99: a reproducible ~30% regression)
+    // the few skippable leaves fragment producer ranges without paying for
+    // the classifications. The 2x margin keeps the whole win at 1% and off
+    // through the boundary band.
+    leafDescentEnabled = false;
+    FieldComparator::KeyBatch* batch;
+    if (topCount > 0 && sourceCost > 0 && clauses[0].comparator != nullptr
+        && (batch = clauses[0].comparator->keyBatch()) != nullptr
+        && batch->leafBlockSize() != 0) {
+      int64_t depth = (topCount * (int64_t)segmentMaxDoc + sourceCost - 1)
+          / sourceCost;
+      leafDescentEnabled = 2 * depth < batch->leafBlockCount();
     }
     if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
   }
@@ -395,18 +414,21 @@ public:
     FieldComparator::KeyBatch* batch = nullptr;
     int32_t blockSize = 0;
     int64_t blockCount = 0;
+    int32_t leafSize = 0;
+    int64_t leafCount = 0;
   };
 
   // Non-null batch only when ranking is active and the sole primary clause
-  // offers order-independent masked block gathers (dense single-valued
-  // numeric column) with block bounds.
+  // offers order-independent masked leaf gathers (dense single-valued
+  // numeric column) with two-level bounds.
   KeyBlockPlan maskedKeyBlockPlan() {
     KeyBlockPlan plan;
     FieldComparator::KeyBatch* batch;
     if (topCount > 0 && !disableKeyGatherForTests && soleColumn != nullptr
         && (batch = soleColumn->keyBatch()) != nullptr
-        && batch->supportsMaskedBlockGather() && batch->keyBlockSize() != 0) {
-      plan = {batch, batch->keyBlockSize(), batch->keyBlockCount()};
+        && batch->supportsMaskedLeafGather() && batch->leafBlockSize() != 0) {
+      plan = {batch, batch->keyBlockSize(), batch->keyBlockCount(),
+              batch->leafBlockSize(), batch->leafBlockCount()};
     }
     return plan;
   }
@@ -442,19 +464,55 @@ public:
     int64_t block = (int64_t)from / blockSize;
     int64_t blockCount = batch->keyBlockCount();
     if (pq.size() < (size_t)topCount) {
-      // No bound yet; re-consult at the next block boundary.
+      // No bound yet; re-consult at the next block boundary. Coarse-width
+      // warm-up on purpose: nothing can prune, so leaf-width ranges would
+      // only split producer calls.
       skipCount(SkipStats::fieldSortWarmupRanges);
       return {from, blockEnd(block, blockSize)};
     }
     int64_t bottomKey = batch->slotKeys[pq.top().slot];
     segdoc bottomDoc = pq.top().doc;
     bool soleSort = clauses.size() == 1;
+    int32_t leafSize = leafDescentEnabled ? batch->leafBlockSize() : 0;
     int32_t doc = from;
     for (; block < blockCount; block++) {
       if (classifyKeyBlock(segment, doc, batch->blockBestKey(block),
                            bottomKey, bottomDoc, soleSort)
           == BlockClass::COLLECT) {
-        break;
+        // Descend: the coarse bound cannot prune this block, but individual
+        // leaves still can (the coarse min lives in one leaf). All leaves
+        // can refute a coarse COLLECT - equality skips consult the leaf's
+        // own first unseen doc - so a refuted block falls through to the
+        // next coarse block. A returned range extends across CONSECUTIVE
+        // competitive leaves (maximal within the block), so runs where no
+        // leaf can prune anything cost one producer call, not eight.
+        if (leafSize == 0) break;
+        int64_t leaf = (int64_t)doc / leafSize;
+        int64_t leafLimit = std::min(
+            ((block + 1) * (int64_t)blockSize + leafSize - 1) / leafSize,
+            batch->leafBlockCount());
+        for (; leaf < leafLimit; leaf++) {
+          if (classifyKeyBlock(segment, doc, batch->leafBestKey(leaf),
+                               bottomKey, bottomDoc, soleSort)
+              == BlockClass::COLLECT) {
+            int64_t endLeaf = leaf + 1;
+            for (; endLeaf < leafLimit; endLeaf++) {
+              if (classifyKeyBlock(
+                      segment, (int32_t)(endLeaf * (int64_t)leafSize),
+                      batch->leafBestKey(endLeaf), bottomKey, bottomDoc,
+                      soleSort)
+                  != BlockClass::COLLECT) {
+                break;
+              }
+            }
+            skipCount(SkipStats::fieldSortCompetitiveRanges);
+            return {doc, blockEnd(endLeaf - 1, leafSize)};
+          }
+          skipCount(SkipStats::fieldSortLeavesSkipped);
+          doc = blockEnd(leaf, leafSize);
+        }
+        skipCount(SkipStats::fieldSortBlocksSkipped);
+        continue;
       }
       skipCount(SkipStats::fieldSortBlocksSkipped);
       doc = blockEnd(block, blockSize);
@@ -496,6 +554,19 @@ public:
                            best, bottomKey, bottomDoc, soleSort)
           == BlockClass::COLLECT) {
         SkipStats::fieldSortRequiredBlocks++;
+      }
+    }
+    int32_t leafSize = batch->leafBlockSize();
+    if (leafSize == 0) return;
+    for (int64_t leaf = 0, n = batch->leafBlockCount(); leaf < n; leaf++) {
+      int64_t best = batch->leafBestKey(leaf);
+      if (best < bottomKey) {
+        SkipStats::fieldSortIrreducibleLeaves++;
+      }
+      if (classifyKeyBlock(segment, (int32_t)(leaf * (int64_t)leafSize),
+                           best, bottomKey, bottomDoc, soleSort)
+          == BlockClass::COLLECT) {
+        SkipStats::fieldSortRequiredLeaves++;
       }
     }
   }

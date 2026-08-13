@@ -106,6 +106,16 @@ public:
   }
 };
 
+class WorkCapGuard {
+  int64_t saved;
+
+public:
+  explicit WorkCapGuard(int64_t cap) : saved(forceFieldSortWorkCapForTests) {
+    forceFieldSortWorkCapForTests = cap;
+  }
+  ~WorkCapGuard() { forceFieldSortWorkCapForTests = saved; }
+};
+
 class SeededGuard {
   bool savedDisable;
   bool savedForce;
@@ -2528,6 +2538,27 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     }
   }
 
+  // A tiny forced work cap crosses to the forward-sweep fallback on every
+  // shape; parity must hold and the fallback counter must fire.
+  {
+    WorkCapGuard capGuard(2);
+    SortSkipStatsGuard statsGuard;
+    for (const Sorts& sorts : {randAsc, randDesc, tiesAsc, monoAsc}) {
+      for (int32_t limit : {9, 987}) {
+        auto exhaustive = run(false, true, true, sorts, limit, false);
+        auto capped = run(true, false, true, sorts, limit, false);
+        EXPECT_EQ(exhaustive.ids, capped.ids)
+            << "capped limit=" << limit << " sort=" << sorts.clauses[0].first;
+        auto allExhaustive = run(false, true, true, sorts, limit, false, "");
+        auto allCapped = run(true, false, true, sorts, limit, false, "");
+        EXPECT_EQ(allExhaustive.ids, allCapped.ids)
+            << "capped match-all limit=" << limit
+            << " sort=" << sorts.clauses[0].first;
+      }
+    }
+    EXPECT_GT(SkipStats::fieldSortBestFirstFallbacks, 0);
+  }
+
   // Route engagement and gates, proven by the activation counter.
   EXPECT_GT(run(true, false, true, randAsc, 9, false).activations, 0);
   // Pure match-all with no deletes rides the empty-mask domain form.
@@ -2670,7 +2701,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
     result.activations = SkipStats::fieldSortSeededActivations;
-    result.seedBlocks = SkipStats::fieldSortSeedBlocks;
+    result.seedBlocks = SkipStats::fieldSortSeedLeaves;
     result.fillAborts = SkipStats::fieldSortSeedFillAborts;
     result.pass2Skips = SkipStats::fieldSortSeedPass2Skips;
     return result;

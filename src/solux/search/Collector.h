@@ -808,102 +808,172 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 
 // Best-first exact-domain field-sort driver. The whole domain is known up
 // front - materialized docs, or every doc for match-all with no deletes -
-// so no scorer runs: key blocks are visited in ascending bound order, each
-// block's in-domain docs admitted through an order-independent gather.
-// Bound order makes termination a proof - once the heap head classifies
-// SKIP_STRICT against the current bottom, no remaining block can
-// contribute. Equal-bound heads are popped individually through the
-// tie/segdoc rules. workCap bounds pathological tie plateaus; on cap,
-// unvisited blocks are swept forward in doc order under the same
-// classification. Every in-domain doc is gathered at most once, so
-// hitCount keeps the pruned-path semantics (counts gathered docs; pruning
-// is off when exact counts are required). The domain representation lives
-// in `gather`, which feeds one block's in-domain (docs, keys) to
-// admitGathered; the bitset and array entry points below supply it.
-template <typename Collector, typename GatherBlock>
-void collectTopKBestFirst(int32_t segnum, Collector& collector, MemPool& pool,
-                          const typename Collector::KeyBlockPlan& plan,
-                          int64_t workCap, GatherBlock&& gather) {
-  assert(plan.batch != nullptr);
-  using BC = typename Collector::BlockClass;
-  skipCount(SkipStats::fieldSortBestFirstActivations);
-
-  struct BoundBlock {
+// so no scorer runs: bounds are visited in ascending order through a mixed
+// lazy frontier. Only the coarse blocks are heapified up front (setup cost
+// stays independent of leaf count); popping a competitive coarse node
+// replaces it with its leaves in the same (bound, firstDoc, level) heap,
+// and only popped-competitive LEAVES gather. Coarse bounds lower-bound
+// their leaves, so a SKIP_STRICT head still proves global termination, and
+// a tie-skipped coarse node discards its whole subtree soundly (every
+// child's bound and first unseen doc are at least as bad against the same
+// bottom). workCap bounds leaf gather attempts on pathological tie
+// plateaus; on cap, unvisited leaves are swept forward in doc order under
+// the same classification. Every in-domain doc is gathered at most once,
+// so hitCount keeps the pruned-path semantics (counts gathered docs;
+// pruning is off when exact counts are required). The domain
+// representation lives in `gather`, which feeds one leaf's in-domain
+// (docs, keys) to admitGathered; the bitset and array entry points below
+// supply it.
+// Mixed coarse/leaf bound frontier shared by the bound-ordered drivers: a
+// (bound, firstDoc, coarse-before-leaf) min-heap seeded with only the
+// coarse nodes; a popped-competitive coarse node is replaced by its leaves
+// via expand(). Peak occupancy never exceeds leafCount (each unexpanded
+// coarse node stands in for at least one of its own leaves), and the
+// backing span is UNINITIALIZED - the reservation touches only what the
+// frontier actually holds, so a near-ceiling segment costs pages
+// proportional to the visited frontier, not the leaf directory.
+template <typename KeyBlockPlan>
+class LeafBoundFrontier {
+public:
+  struct Node {
     int64_t bound;
-    int64_t block;
-    bool operator>(const BoundBlock& o) const {
-      return bound != o.bound ? bound > o.bound : block > o.block;
+    int32_t firstDoc;
+    bool isLeaf;  // a coarse node orders before its equal-bound first leaf
+    int64_t id;   // coarse block id or global leaf id
+    bool operator>(const Node& o) const {
+      if (bound != o.bound) return bound > o.bound;
+      if (firstDoc != o.firstDoc) return firstDoc > o.firstDoc;
+      return isLeaf && !o.isLeaf;
     }
   };
-  std::span<BoundBlock> heap = pool.make_span<BoundBlock>(
-      (size_t)plan.blockCount);
-  for (int64_t b = 0; b < plan.blockCount; b++) {
-    heap[(size_t)b] = {plan.batch->blockBestKey(b), b};
-  }
-  auto cmp = std::greater<BoundBlock>();  // min-heap by (bound, block)
-  std::make_heap(heap.begin(), heap.end(), cmp);
 
+  LeafBoundFrontier(const KeyBlockPlan& plan, MemPool& pool)
+      : plan(plan), leavesPerBlock(plan.blockSize / plan.leafSize),
+        heap(pool.make_span_uninit<Node>((size_t)plan.leafCount)) {
+    for (int64_t b = 0; b < plan.blockCount; b++) {
+      heap[(size_t)b] = {plan.batch->blockBestKey(b),
+                         (int32_t)(b * (int64_t)plan.blockSize), false, b};
+    }
+    size = (size_t)plan.blockCount;
+    std::make_heap(heap.begin(), heap.begin() + size, cmp);
+  }
+
+  bool empty() const { return size == 0; }
+
+  // Pop the best node. pop_heap parks it at heap[size], so
+  // remainingWithHead() covers the head plus the still-live frontier until
+  // the next expand() overwrites the parked slot.
+  Node pop() {
+    Node top = heap[0];
+    std::pop_heap(heap.begin(), heap.begin() + size, cmp);
+    size--;
+    return top;
+  }
+
+  void expand(const Node& coarse) {
+    assert(!coarse.isLeaf);
+    int64_t firstLeaf = coarse.id * leavesPerBlock;
+    int64_t leafLimit = std::min(firstLeaf + leavesPerBlock, plan.leafCount);
+    for (int64_t leaf = firstLeaf; leaf < leafLimit; leaf++) {
+      heap[size] = {plan.batch->leafBestKey(leaf),
+                    (int32_t)(leaf * (int64_t)plan.leafSize), true, leaf};
+      size++;
+      std::push_heap(heap.begin(), heap.begin() + size, cmp);
+    }
+  }
+
+  std::span<const Node> remainingWithHead() const {
+    return heap.first(size + 1);
+  }
+
+private:
+  KeyBlockPlan plan;
+  int64_t leavesPerBlock;
+  std::greater<Node> cmp;  // min-heap
+  std::span<Node> heap;
+  size_t size = 0;
+};
+
+template <typename Collector, typename GatherLeaf>
+void collectTopKBestFirst(int32_t segnum, Collector& collector, MemPool& pool,
+                          const typename Collector::KeyBlockPlan& plan,
+                          int64_t workCap, GatherLeaf&& gather) {
+  assert(plan.batch != nullptr && plan.leafSize != 0);
+  using BC = typename Collector::BlockClass;
+  using Frontier = LeafBoundFrontier<typename Collector::KeyBlockPlan>;
+  skipCount(SkipStats::fieldSortBestFirstActivations);
+
+  Frontier frontier(plan, pool);
   std::span<uint64_t> visited =
-      pool.make_span<uint64_t>((size_t)((plan.blockCount + 63) >> 6));
+      pool.make_span<uint64_t>((size_t)((plan.leafCount + 63) >> 6));
   std::fill(visited.begin(), visited.end(), 0);
 
-  auto gatherBlock = [&](int64_t block) {
-    visited[(size_t)(block >> 6)] |= 1ULL << (block & 63);
-    skipCount(SkipStats::fieldSortBestFirstBlocks);
-    gather(block);
+  auto gatherLeaf = [&](int64_t leaf) {
+    visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
+    skipCount(SkipStats::fieldSortBestFirstLeaves);
+    gather(leaf);
   };
 
-  int64_t visitedCount = 0;
-  size_t heapSize = heap.size();
-  while (heapSize > 0) {
-    BoundBlock top = heap[0];
-    std::pop_heap(heap.begin(), heap.begin() + heapSize, cmp);
-    heapSize--;
+  int64_t leafGathers = 0;
+  bool capped = false;
+  while (!frontier.empty()) {
+    auto top = frontier.pop();
     if (collector.heapFull()) {
-      auto cls = collector.classifyBlock(
-          segnum, (int32_t)(top.block * (int64_t)plan.blockSize), top.bound,
-          plan.batch);
+      auto cls = collector.classifyBlock(segnum, top.firstDoc, top.bound,
+                                         plan.batch);
       if (cls == BC::SKIP_STRICT) {
-        // Heap order proves every remaining block is at least as bad; credit
-        // the head and the whole remaining heap as skipped so cross-arm
-        // skip accounting stays comparable.
+        // Heap order proves every remaining node is at least as bad; credit
+        // the head and the whole remaining frontier as skipped, per level,
+        // so cross-arm skip accounting stays comparable.
         skipCount(SkipStats::fieldSortBestFirstTerminations);
         if (SkipStats::enabled) {
-          SkipStats::fieldSortBlocksSkipped += (int64_t)heapSize + 1;
+          for (const auto& node : frontier.remainingWithHead()) {
+            (node.isLeaf ? SkipStats::fieldSortLeavesSkipped
+                         : SkipStats::fieldSortBlocksSkipped)++;
+          }
         }
         return;
       }
       if (cls == BC::SKIP_TIE) {
-        skipCount(SkipStats::fieldSortBlocksSkipped);
+        skipCount(top.isLeaf ? SkipStats::fieldSortLeavesSkipped
+                             : SkipStats::fieldSortBlocksSkipped);
         continue;
       }
     }
-    gatherBlock(top.block);
-    if (++visitedCount >= workCap) break;
+    if (!top.isLeaf) {
+      skipCount(SkipStats::fieldSortBestFirstExpansions);
+      frontier.expand(top);
+      continue;
+    }
+    gatherLeaf(top.id);
+    if (++leafGathers >= workCap) {
+      capped = true;
+      break;
+    }
   }
-  if (heapSize == 0) return;
+  if (!capped || frontier.empty()) return;
 
   // Work cap hit (tie plateau or adversarial bound layout): finish with one
-  // forward doc-order sweep over unvisited blocks, classifying each.
+  // forward doc-order sweep over unvisited leaves, classifying each.
   skipCount(SkipStats::fieldSortBestFirstFallbacks);
-  for (int64_t block = 0; block < plan.blockCount; block++) {
-    if ((visited[(size_t)(block >> 6)] >> (block & 63)) & 1) continue;
+  for (int64_t leaf = 0; leaf < plan.leafCount; leaf++) {
+    if ((visited[(size_t)(leaf >> 6)] >> (leaf & 63)) & 1) continue;
     if (collector.heapFull()) {
       auto cls = collector.classifyBlock(
-          segnum, (int32_t)(block * (int64_t)plan.blockSize),
-          plan.batch->blockBestKey(block), plan.batch);
+          segnum, (int32_t)(leaf * (int64_t)plan.leafSize),
+          plan.batch->leafBestKey(leaf), plan.batch);
       if (cls != BC::COLLECT) {
-        skipCount(SkipStats::fieldSortBlocksSkipped);
+        skipCount(SkipStats::fieldSortLeavesSkipped);
         continue;
       }
     }
-    gatherBlock(block);
+    gatherLeaf(leaf);
   }
 }
 
 // Bitset-domain entry: domainWords is a whole-segment word span (cached
 // filter or liveDocs), or empty meaning every doc (match-all, no deletes).
-// Blocks gather through the comparator's fused masked gather.
+// Leaves gather through the comparator's fused masked gather.
 template <typename Collector>
 void collectTopKBitSetBestFirst(int32_t segnum,
                                 std::span<const uint64_t> domainWords,
@@ -911,12 +981,12 @@ void collectTopKBitSetBestFirst(int32_t segnum,
                                 int64_t workCap) {
   auto plan = collector.maskedKeyBlockPlan();
   assert(plan.batch != nullptr);
-  std::span<int32_t> outDocs = pool.make_span<int32_t>((size_t)plan.blockSize);
-  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.blockSize);
+  std::span<int32_t> outDocs = pool.make_span<int32_t>((size_t)plan.leafSize);
+  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.leafSize);
   collectTopKBestFirst(
-      segnum, collector, pool, plan, workCap, [&](int64_t block) {
-        int32_t n = plan.batch->gatherBlockMasked(block, domainWords, outDocs,
-                                                  outKeys);
+      segnum, collector, pool, plan, workCap, [&](int64_t leaf) {
+        int32_t n = plan.batch->gatherLeafMasked(leaf, domainWords, outDocs,
+                                                 outKeys);
         if (n > 0) {
           collector.admitGathered(segnum, outDocs.first((size_t)n),
                                   outKeys.first((size_t)n), plan.batch);
@@ -925,7 +995,7 @@ void collectTopKBitSetBestFirst(int32_t segnum,
 }
 
 // Array-domain entry: domainDocs is the whole sorted materialized set (an
-// ARRAY DocSet, below the bitset promotion threshold). Each visited block
+// ARRAY DocSet, below the bitset promotion threshold). Each visited leaf
 // gallops to its doc sub-span and gathers keys through the comparator's
 // order-independent key gather - the docs themselves need no copy.
 template <typename Collector>
@@ -935,15 +1005,15 @@ void collectTopKArrayBestFirst(int32_t segnum,
                                int64_t workCap) {
   auto plan = collector.maskedKeyBlockPlan();
   assert(plan.batch != nullptr);
-  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.blockSize);
+  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.leafSize);
   const int32_t* domainEnd = domainDocs.data() + domainDocs.size();
   collectTopKBestFirst(
-      segnum, collector, pool, plan, workCap, [&](int64_t block) {
+      segnum, collector, pool, plan, workCap, [&](int64_t leaf) {
         int32_t begin = (int32_t)std::min<int64_t>(
-            block * (int64_t)plan.blockSize,
+            leaf * (int64_t)plan.leafSize,
             (int64_t)std::numeric_limits<int32_t>::max());
         int32_t end = (int32_t)std::min<int64_t>(
-            (block + 1) * (int64_t)plan.blockSize,
+            (leaf + 1) * (int64_t)plan.leafSize,
             (int64_t)std::numeric_limits<int32_t>::max());
         const int32_t* lo =
             screaming::gallopLowerBound(domainDocs.data(), domainEnd, begin);
@@ -959,21 +1029,21 @@ void collectTopKArrayBestFirst(int32_t segnum,
 // Seeded two-pass query-driven field-sort driver. The domain is reachable
 // only through forward scorers (streaming postings, no rewind), so
 // bound-ordered visiting is reformulated as two monotone passes: select the
-// seedCount best-bounded key blocks, walk them in doc order with one bulk
+// seedCount best-bounded LEAVES, walk them in doc order with one bulk
 // scorer so the heap bottom matures to near-final, then sweep from doc 0
 // with a second, independent bulk scorer whose competitive-range walk now
 // skips essentially everything. Both products must exist before pass 1 runs:
 // a pass-2 scorer cannot be recovered after pass 1 advanced a shared one.
-// Blocks pass 1 actually enumerated are recorded in a visited mask the sweep
+// Leaves pass 1 actually enumerated are recorded in a visited mask the sweep
 // jumps over, so every match reaches the collector at most once and hitCount
 // keeps pruned-path semantics. Once the heap fills, each remaining seed is
 // classified against the maturing bottom before any postings work. Two abort
-// rules bound an anti-correlated query (its matches only in high-key blocks,
+// rules bound an anti-correlated query (its matches only in high-key leaves,
 // so seed probes come back empty): a heap still underfull after
 // fillAbortBudget enumerated seeds abandons the schedule, and so does a
 // consecutive run of fillAbortBudget matchless enumerated seeds - the
 // latter also fires when a warm heap (filled by earlier segments) lets
-// low-bound blocks classify competitive without the underfull test ever
+// low-bound leaves classify competitive without the underfull test ever
 // engaging. Either way the sweep completes correctness, inheriting whatever
 // bottom the seeds bought.
 template <typename Collector>
@@ -982,39 +1052,44 @@ void collectTopKMatchWindowedSeeded(
     DocSet* filter, Collector& collector, MemPool& pool, int32_t maxDoc,
     int64_t seedCount, int64_t fillAbortBudget) {
   auto plan = collector.maskedKeyBlockPlan();
-  assert(plan.batch != nullptr);
+  assert(plan.batch != nullptr && plan.leafSize != 0);
   assert(seedBulk != nullptr && sweepBulk != nullptr);
   using BC = typename Collector::BlockClass;
   skipCount(SkipStats::fieldSortSeededActivations);
 
-  // Select the seedCount smallest (bound, blockId) blocks, then visit them
-  // in ascending doc order so the seed scorer only moves forward.
-  std::span<int64_t> blocks = pool.make_span<int64_t>((size_t)plan.blockCount);
-  for (int64_t b = 0; b < plan.blockCount; b++) {
-    blocks[(size_t)b] = b;
+  // Select the seedCount globally best-bounded leaves through the same lazy
+  // frontier the best-first driver uses - only the coarse level is
+  // heapified, and a popped coarse node is replaced by its leaves - then
+  // visit the selection in ascending doc order so the seed scorer only
+  // moves forward. Selection is metadata-only: no classification, no
+  // postings work (an undiscovered leaf cannot beat its parent's bound, so
+  // the first seedCount leaf pops ARE the global best).
+  LeafBoundFrontier<typename Collector::KeyBlockPlan> frontier(plan, pool);
+  seedCount = std::min<int64_t>(seedCount, plan.leafCount);
+  std::span<int64_t> seeds = pool.make_span<int64_t>((size_t)seedCount);
+  int64_t selected = 0;
+  while (!frontier.empty() && selected < seedCount) {
+    auto top = frontier.pop();
+    if (top.isLeaf) {
+      seeds[(size_t)selected++] = top.id;
+    } else {
+      frontier.expand(top);
+    }
   }
-  seedCount = std::min<int64_t>(seedCount, plan.blockCount);
-  auto boundLess = [&](int64_t a, int64_t b) {
-    int64_t boundA = plan.batch->blockBestKey(a);
-    int64_t boundB = plan.batch->blockBestKey(b);
-    return boundA != boundB ? boundA < boundB : a < b;
-  };
-  std::nth_element(blocks.begin(), blocks.begin() + seedCount, blocks.end(),
-                   boundLess);
-  std::span<int64_t> seeds = blocks.first((size_t)seedCount);
-  std::sort(seeds.begin(), seeds.end());
+  std::span<int64_t> selectedSeeds = seeds.first((size_t)selected);
+  std::sort(selectedSeeds.begin(), selectedSeeds.end());
 
   std::span<uint64_t> visited =
-      pool.make_span<uint64_t>((size_t)((plan.blockCount + 63) >> 6));
+      pool.make_span<uint64_t>((size_t)((plan.leafCount + 63) >> 6));
   std::fill(visited.begin(), visited.end(), 0);
 
   int64_t enumerated = 0;
   int64_t consecutiveEmpty = 0;
-  for (int64_t block : seeds) {
+  for (int64_t leaf : selectedSeeds) {
     if (collector.heapFull()) {
       if (collector.classifyBlock(
-              segnum, (int32_t)(block * (int64_t)plan.blockSize),
-              plan.batch->blockBestKey(block), plan.batch) != BC::COLLECT) {
+              segnum, (int32_t)(leaf * (int64_t)plan.leafSize),
+              plan.batch->leafBestKey(leaf), plan.batch) != BC::COLLECT) {
         skipCount(SkipStats::fieldSortSeedClassifiedOut);
         continue;
       }
@@ -1022,14 +1097,14 @@ void collectTopKMatchWindowedSeeded(
       skipCount(SkipStats::fieldSortSeedFillAborts);
       break;
     }
-    int32_t begin = (int32_t)(block * (int64_t)plan.blockSize);
+    int32_t begin = (int32_t)(leaf * (int64_t)plan.leafSize);
     int32_t end = (int32_t)std::min<int64_t>(
-        (block + 1) * (int64_t)plan.blockSize, (int64_t)maxDoc);
+        (leaf + 1) * (int64_t)plan.leafSize, (int64_t)maxDoc);
     int64_t emitted = feedMatchWindows(segnum, seedBulk, filter, nullptr,
                                        collector, begin, end);
-    visited[(size_t)(block >> 6)] |= 1ULL << (block & 63);
+    visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
     enumerated++;
-    skipCount(SkipStats::fieldSortSeedBlocks);
+    skipCount(SkipStats::fieldSortSeedLeaves);
     if (emitted != 0) {
       consecutiveEmpty = 0;
     } else if (++consecutiveEmpty >= fillAbortBudget) {
@@ -1039,7 +1114,7 @@ void collectTopKMatchWindowedSeeded(
   }
 
   collectTopKMatchWindowed(segnum, sweepBulk, filter, nullptr, collector,
-                           maxDoc, true, visited, plan.blockSize);
+                           maxDoc, true, visited, plan.leafSize);
 }
 
 // Rank score windows into a top-k collector. This is intentionally only a

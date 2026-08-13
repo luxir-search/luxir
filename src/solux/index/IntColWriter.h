@@ -39,13 +39,15 @@ private:
   bool finished = false;
   std::vector<NumBlockInfo> blockInfo;
   std::vector<NumBlockZone> blockZones;
+  std::vector<NumBlockZone> leafZones;
   std::vector<int64_t> values;
   std::vector<uint64_t> quotients;
   bool useGcd = true;
+  bool zonesEnabled = true;
 
   void addBlock(std::span<const int64_t> block) {
     NumColumnFormat::BlockPlan plan =
-        NumColumnFormat::planBlock(block, quotients, useGcd);
+        NumColumnFormat::planBlock(block, quotients, useGcd, zonesEnabled);
     overallMin = std::min(overallMin, plan.zone.min);
     overallMax = std::max(overallMax, plan.zone.max);
 
@@ -65,13 +67,20 @@ private:
     }
     blockInfo.push_back(plan.info);
     blockZones.push_back(plan.zone);
+    leafZones.insert(leafZones.end(), plan.leafZones,
+                     plan.leafZones + plan.leafCount);
   }
 
 public:
   // useGcd == false is the monotonic contract: gcd stays 1 so readers can drop
   // the field load and the multiply.  It also skips the write-side gcd scan.
-  explicit NumColumnWriter(OutputStream& out, bool useGcd = true)
-      : out(out), colStart(out.size()), useGcd(useGcd) {
+  // writeZones == false declares at construction that finish() will not
+  // persist zones, so planning skips the per-leaf extrema pass and nothing
+  // accumulates (monotonic sidecars are the large writers on this path).
+  explicit NumColumnWriter(OutputStream& out, bool useGcd = true,
+                           bool writeZones = true)
+      : out(out), colStart(out.size()), useGcd(useGcd),
+        zonesEnabled(writeZones) {
     values.reserve(NumColumnFormat::BLOCK_SIZE);
     quotients.reserve(NumColumnFormat::BLOCK_SIZE);
   }
@@ -97,6 +106,7 @@ public:
   FinishData finish(bool writeZones, bool writeBounds) {
     assert(!finished);
     assert(!writeBounds || writeZones);
+    assert(!writeZones || zonesEnabled);
     if (!values.empty()) {
       addBlock(values);
       values.clear();
@@ -111,6 +121,15 @@ public:
       out.align(8);
       if (!blockZones.empty()) {
         out.write(blockZones.data(), blockZones.size() * sizeof(NumBlockZone));
+      }
+      // Leaf zones directly follow the block zones (both 16-byte entries, so
+      // alignment is preserved); readers locate them from the block count and
+      // the bounds trailer from ceil(numValues / LEAF_ZONE_SIZE).
+      if (!leafZones.empty()) {
+        assert((int64_t)leafZones.size()
+               == (nAdded + NumColumnFormat::LEAF_ZONE_SIZE - 1)
+                   / NumColumnFormat::LEAF_ZONE_SIZE);
+        out.write(leafZones.data(), leafZones.size() * sizeof(NumBlockZone));
       }
     }
     if (writeBounds) {
@@ -169,7 +188,8 @@ public:
   seg_location blockLoc;
   int64_t metaOff;
 
-  MonoWriter(MemPool& pool, OutputStream& out) : out(out), writer(out, false) {
+  MonoWriter(MemPool& pool, OutputStream& out)
+      : out(out), writer(out, false, false) {
     unused(pool);
   }
 

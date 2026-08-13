@@ -43,6 +43,9 @@ inline bool disableFieldSortBestFirst =
 // Test-only: bypass the expected-floor activation gate so small corpora
 // (too few key blocks to ever pass it) still drive the best-first arm.
 inline bool forceFieldSortBestFirst = false;
+// Test-only: override the best-first leaf work cap (0 = production formula)
+// so the cap-crossing forward-sweep fallback is reachable on small corpora.
+inline int64_t forceFieldSortWorkCapForTests = 0;
 
 // A/B baseline for the seeded two-pass query-driven field-sort driver.
 // Default false means eligible query-driven field sorts fill the heap from

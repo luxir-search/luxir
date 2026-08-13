@@ -70,6 +70,7 @@ static void recordFieldSortCounters(benchmark::State& state) {
   state.counters["competitiveRanges"] =
       (double)SkipStats::fieldSortCompetitiveRanges;
   state.counters["blocksSkipped"] = (double)SkipStats::fieldSortBlocksSkipped;
+  state.counters["leavesSkipped"] = (double)SkipStats::fieldSortLeavesSkipped;
   state.counters["docsGathered"] = (double)SkipStats::fieldSortDocsGathered;
   state.counters["lastAdmission"] =
       (double)SkipStats::fieldSortGatherAtLastAdmission;
@@ -79,16 +80,22 @@ static void recordFieldSortCounters(benchmark::State& state) {
       (double)SkipStats::fieldSortBulkCollections;
   state.counters["requiredBlocks"] =
       (double)SkipStats::fieldSortRequiredBlocks;
+  state.counters["irreducibleLeaves"] =
+      (double)SkipStats::fieldSortIrreducibleLeaves;
+  state.counters["requiredLeaves"] =
+      (double)SkipStats::fieldSortRequiredLeaves;
   state.counters["bfActivations"] =
       (double)SkipStats::fieldSortBestFirstActivations;
-  state.counters["bfBlocks"] = (double)SkipStats::fieldSortBestFirstBlocks;
+  state.counters["bfExpansions"] =
+      (double)SkipStats::fieldSortBestFirstExpansions;
+  state.counters["bfLeaves"] = (double)SkipStats::fieldSortBestFirstLeaves;
   state.counters["bfTerminations"] =
       (double)SkipStats::fieldSortBestFirstTerminations;
   state.counters["bfFallbacks"] =
       (double)SkipStats::fieldSortBestFirstFallbacks;
   state.counters["seedActivations"] =
       (double)SkipStats::fieldSortSeededActivations;
-  state.counters["seedBlocks"] = (double)SkipStats::fieldSortSeedBlocks;
+  state.counters["seedLeaves"] = (double)SkipStats::fieldSortSeedLeaves;
   state.counters["seedClassifiedOut"] =
       (double)SkipStats::fieldSortSeedClassifiedOut;
   state.counters["seedFillAborts"] =
@@ -243,5 +250,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q10pct, INT_SORT_SS_DOCS,
                         "short_u10_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q1pct, INT_SORT_SS_DOCS,
                         "short_u100_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p1pct, INT_SORT_SS_DOCS,
+                        "short_u1000_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p01pct, INT_SORT_SS_DOCS,
                         "short_u10k_s", true);

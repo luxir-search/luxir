@@ -38,10 +38,15 @@ public:
     virtual void gatherKeys(std::span<const int32_t> docs,
                             std::span<int64_t> keys) = 0;
 
-    // Optional block-granular pruning bounds over the current segment. A
-    // nonzero size means doc d reads its key from block d / keyBlockSize()
-    // and blockBestKey(b) lower-bounds the transformed key of every doc in
-    // block b. Zero means no per-block bounds (collection stays exhaustive).
+    // Optional two-level pruning-bounds directory over the current segment.
+    // A nonzero coarse size means doc d reads its key from block
+    // d / keyBlockSize() and blockBestKey(b) lower-bounds the transformed
+    // key of every doc in block b. Zero means no bounds (collection stays
+    // exhaustive). A nonzero leaf size (only ever offered together with the
+    // coarse level; leaves nest exactly in coarse blocks) refines the same
+    // contract at leaf granularity: leafBestKey(l) lower-bounds every doc in
+    // leaf l. Coarse bounds are the min over their leaves, so a coarse skip
+    // proves every child skips.
     virtual int32_t keyBlockSize() const { return 0; }
     virtual int64_t keyBlockCount() const { return 0; }
     virtual int64_t blockBestKey(int64_t block) const {
@@ -49,21 +54,28 @@ public:
       assert(false);
       return std::numeric_limits<int64_t>::min();
     }
+    virtual int32_t leafBlockSize() const { return 0; }
+    virtual int64_t leafBlockCount() const { return 0; }
+    virtual int64_t leafBestKey(int64_t leaf) const {
+      unused(leaf);
+      assert(false);
+      return std::numeric_limits<int64_t>::min();
+    }
 
-    // Order-independent fused block gather: extract one key block's in-domain
-    // docs and transformed keys straight from the domain bitset, without a
+    // Order-independent fused leaf gather: extract one leaf's in-domain docs
+    // and transformed keys straight from the domain bitset, without a
     // doc-array round trip. `words` is the whole-segment bitset (word w
     // covers docs [64w, 64w+64)); an EMPTY span means no mask - every doc in
-    // the block (match-all with no deletes). Blocks may be requested in ANY
+    // the leaf (match-all with no deletes). Leaves may be requested in ANY
     // order - only comparators with no forward-only cursor (dense
-    // single-valued) offer this. outDocs/outKeys must hold keyBlockSize()
+    // single-valued) offer this. outDocs/outKeys must hold leafBlockSize()
     // entries. Returns the number gathered.
-    virtual bool supportsMaskedBlockGather() const { return false; }
-    virtual int32_t gatherBlockMasked(int64_t block,
-                                      std::span<const uint64_t> words,
-                                      std::span<int32_t> outDocs,
-                                      std::span<int64_t> outKeys) {
-      unused(block, words, outDocs, outKeys);
+    virtual bool supportsMaskedLeafGather() const { return false; }
+    virtual int32_t gatherLeafMasked(int64_t leaf,
+                                     std::span<const uint64_t> words,
+                                     std::span<int32_t> outDocs,
+                                     std::span<int64_t> outKeys) {
+      unused(leaf, words, outDocs, outKeys);
       assert(false);
       return 0;
     }
@@ -318,23 +330,36 @@ public:
     }
   }
 
+  int32_t leafBlockSize() const override {
+    return keyBlockSize() != 0 ? (int32_t)NumColumnFormat::LEAF_ZONE_SIZE : 0;
+  }
+
+  int64_t leafBlockCount() const override {
+    return reader->numLeafZones();
+  }
+
+  int64_t leafBestKey(int64_t leaf) const override {
+    NumBlockZone zone = reader->leafZone(leaf);
+    return sortMultiplier < 0 ? ~zone.max : zone.min;
+  }
+
   // Dense single-valued only: doc == value rank and no forward-only landing
-  // cursor, so blocks can be gathered in any order.
-  bool supportsMaskedBlockGather() const override {
+  // cursor, so leaves can be gathered in any order.
+  bool supportsMaskedLeafGather() const override {
     return keyBlockSize() != 0;
   }
 
-  int32_t gatherBlockMasked(int64_t block, std::span<const uint64_t> words,
-                            std::span<int32_t> outDocs,
-                            std::span<int64_t> outKeys) override {
+  int32_t gatherLeafMasked(int64_t leaf, std::span<const uint64_t> words,
+                           std::span<int32_t> outDocs,
+                           std::span<int64_t> outKeys) override {
     assert(keyBlockSize() != 0);
-    int64_t blockStart = block * (int64_t)NumColumnFormat::BLOCK_SIZE;
+    int64_t leafStart = leaf * (int64_t)NumColumnFormat::LEAF_ZONE_SIZE;
     if (words.empty()) {
-      // No mask: every doc in the block (dense single-valued, doc == rank).
-      int64_t blockLimit = std::min(blockStart + NumColumnFormat::BLOCK_SIZE,
-                                    reader->numValues());
+      // No mask: every doc in the leaf (dense single-valued, doc == rank).
+      int64_t leafLimit = std::min<int64_t>(
+          leafStart + NumColumnFormat::LEAF_ZONE_SIZE, reader->numValues());
       int32_t out = 0;
-      for (int64_t frameStart = blockStart; frameStart < blockLimit;
+      for (int64_t frameStart = leafStart; frameStart < leafLimit;
            frameStart += NumColumn::BULK_SIZE) {
         if (decodedStart != frameStart) {
           uint32_t count;
@@ -343,7 +368,7 @@ public:
           decodedEnd = decodedStart + count;
         }
         int64_t frameEnd = std::min(frameStart + NumColumn::BULK_SIZE,
-                                    blockLimit);
+                                    leafLimit);
         for (int64_t doc = frameStart; doc < frameEnd; doc++) {
           outDocs[(size_t)out] = (int32_t)doc;
           outKeys[(size_t)out] = transformPresent(decoded[doc - decodedStart]);
@@ -352,10 +377,11 @@ public:
       }
       return out;
     }
-    int64_t blockLimit = std::min(blockStart + NumColumnFormat::BLOCK_SIZE,
-                                  (int64_t)words.size() * 64);
+    int64_t leafLimit = std::min<int64_t>(
+        leafStart + NumColumnFormat::LEAF_ZONE_SIZE,
+        (int64_t)words.size() * 64);
     int32_t out = 0;
-    for (int64_t frameStart = blockStart; frameStart < blockLimit;
+    for (int64_t frameStart = leafStart; frameStart < leafLimit;
          frameStart += NumColumn::BULK_SIZE) {
       size_t w0 = (size_t)(frameStart >> 6);
       size_t wEnd = std::min(w0 + NumColumn::BULK_SIZE / 64, words.size());

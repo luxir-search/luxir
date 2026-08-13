@@ -265,6 +265,18 @@ TEST_F(IntColTest, linearPackFormatCorners) {
       EXPECT_EQ(zone.min, *minIt);
       EXPECT_EQ(zone.max, *maxIt);
     }
+    constexpr int64_t kLeaf = NumColumnFormat::LEAF_ZONE_SIZE;
+    EXPECT_EQ(reader.numLeafZones(),
+              ((int64_t)expected.size() + kLeaf - 1) / kLeaf);
+    for (int64_t leaf = 0; leaf < reader.numLeafZones(); leaf++) {
+      int64_t start = leaf * kLeaf;
+      int64_t end = std::min<int64_t>(start + kLeaf, expected.size());
+      auto [minIt, maxIt] = std::minmax_element(
+          expected.begin() + start, expected.begin() + end);
+      NumBlockZone zone = reader.leafZone(leaf);
+      EXPECT_EQ(zone.min, *minIt) << "leaf=" << leaf;
+      EXPECT_EQ(zone.max, *maxIt) << "leaf=" << leaf;
+    }
     return reader.blockInfo(0);
   };
 
@@ -318,6 +330,19 @@ TEST_F(IntColTest, linearPackFormatCorners) {
   EXPECT_EQ(wrapping.gcd, 1);
   EXPECT_EQ(wrapping.baseBits,
             (uint64_t)std::numeric_limits<int64_t>::max());
+
+  // Counts hugging every leaf/frame/block boundary: the leaf-zone oracle in
+  // check() proves the partial-leaf and partial-block geometry.
+  std::vector<int64_t> ramp;
+  for (int64_t count : {1, 127, 128, 511, 512, 513, 4095, 4096, 4097,
+                        3 * 4096 + 700}) {
+    ramp.resize((size_t)count);
+    for (int64_t i = 0; i < count; i++) {
+      ramp[(size_t)i] =
+          (int64_t)(((uint64_t)i * 2654435761u) % 100000) - 50000;
+    }
+    check(ramp);
+  }
 }
 
 TEST_F(IntColTest, wrappingBaseBitPattern) {

@@ -224,9 +224,27 @@ public:
     return new (storage) T[size]();  // default initialize or uninitialized?
   }
 
+  // make an array of UNINITIALIZED trivial elements: a large capacity
+  // reservation touches no memory until the caller writes it, unlike
+  // make_arr's value-initialization (which zeroes the whole span).
+  template <typename T>
+  T* make_arr_uninit(size_t size) {
+    static_assert(std::is_trivially_default_constructible<T>::value
+                      && std::is_trivially_destructible<T>::value,
+                  "element type for MemPool::make_arr_uninit() must be trivial");
+    char* storage = alloc(sizeof(T)*size, alignof(T));
+    return new (storage) T[size];
+  }
+
   template <typename T>
   std::span<T> make_span(size_t size) {
     T* arr = make_arr<T>(size);
+    return {arr, size};
+  }
+
+  template <typename T>
+  std::span<T> make_span_uninit(size_t size) {
+    T* arr = make_arr_uninit<T>(size);
     return {arr, size};
   }
 

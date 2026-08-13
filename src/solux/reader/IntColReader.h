@@ -340,6 +340,7 @@ private:
   InputStream columnIS;
   NumColumn values;
   const char* zoneMeta = nullptr;
+  const char* leafZoneMeta = nullptr;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
@@ -358,15 +359,17 @@ public:
     const char* blockMeta = blocks + fieldInfo.columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
     zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    
-    // Read min/max values that come after the block metadata
+    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+
+    // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+      const char* minMaxPtr =
+          leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
     }
-    
+
     if (fieldInfo.monoLoc.offset() > 0) {
       endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     }
@@ -390,10 +393,12 @@ public:
     const char* blockMeta = blocks + columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
     zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    
-    // Read min/max values that come after the block metadata
+    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+
+    // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+      const char* minMaxPtr =
+          leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -446,6 +451,21 @@ public:
     assert(blockNum >= 0 && blockNum < numBlocks());
     NumBlockZone zone;
     memcpy(&zone, zoneMeta + blockNum * sizeof(zone), sizeof(zone));
+    return zone;
+  }
+
+  // Exact per-LEAF_ZONE_SIZE-value bounds, one level under blockZone().
+  // Leaf `l` covers value ranks [l * LEAF_ZONE_SIZE,
+  // min((l + 1) * LEAF_ZONE_SIZE, numValues)).
+  int64_t numLeafZones() const {
+    return (nvals + NumColumnFormat::LEAF_ZONE_SIZE - 1)
+        / NumColumnFormat::LEAF_ZONE_SIZE;
+  }
+
+  NumBlockZone leafZone(int64_t leaf) const {
+    assert(leaf >= 0 && leaf < numLeafZones());
+    NumBlockZone zone;
+    memcpy(&zone, leafZoneMeta + leaf * sizeof(zone), sizeof(zone));
     return zone;
   }
 

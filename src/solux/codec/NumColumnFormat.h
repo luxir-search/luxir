@@ -63,6 +63,16 @@ static_assert(sizeof(NumBlockZone) == 16);
 struct NumColumnFormat {
   static constexpr uint32_t BLOCK_SIZE = 4096;
   static constexpr uint32_t BULK_SIZE = 128;
+  // Leaf zone granularity: exact min/max bounds are also kept per 512
+  // values, one level under the whole-block zones, so bound consumers can
+  // prune at ~1/8 block spans (the irreducible gather under block bounds is
+  // ~k * granularity docs). Leaves nest in blocks and decode frames, and
+  // stay word-aligned for masked gathers.
+  static constexpr uint32_t LEAF_ZONE_SIZE = 512;
+  static constexpr uint32_t LEAVES_PER_BLOCK = BLOCK_SIZE / LEAF_ZONE_SIZE;
+  static_assert(BLOCK_SIZE % LEAF_ZONE_SIZE == 0);
+  static_assert(LEAF_ZONE_SIZE % BULK_SIZE == 0);
+  static_assert(LEAF_ZONE_SIZE % 64 == 0);
 
   // Fixed-point slope: scaledSlope = round(slope * 2^SLOPE_SHIFT), so the
   // rounding error is under 2^-(SLOPE_SHIFT+1) per rank and the drift across a
@@ -84,6 +94,10 @@ struct NumColumnFormat {
   struct BlockPlan {
     NumBlockInfo info;
     NumBlockZone zone;
+    // Exact per-512-value bounds, computed in the same extrema pass before
+    // the RAW/packed choice - RAW blocks carry ordinary leaf zones.
+    NumBlockZone leafZones[LEAVES_PER_BLOCK];
+    uint32_t leafCount = 0;
     LinearFit::Plan fit;
     uint64_t count = 0;
     // Held outside info until the writer knows the payload offset; the two
@@ -100,9 +114,11 @@ struct NumColumnFormat {
   // buys bits when the residuals themselves share a divisor - rare - and it
   // costs a load and a multiply on every point read of the hottest columns in
   // the engine (endValueRank and endOffset, read twice per doc).
+  // leafZones == false skips the per-leaf extrema pass for writers that never
+  // persist zones (monotonic sidecars), whose finish() drops them anyway.
   static BlockPlan planBlock(std::span<const int64_t> values,
                              std::vector<uint64_t>& quotients,
-                             bool useGcd = true) {
+                             bool useGcd = true, bool leafZones = true) {
     assert(!values.empty() && values.size() <= BLOCK_SIZE);
 
     auto [minIt, maxIt] = std::minmax_element(values.begin(), values.end());
@@ -122,6 +138,16 @@ struct NumColumnFormat {
     plan.info.gcd = gcd;
     plan.zone = {min, max};
     plan.count = values.size();
+    if (leafZones) {
+      for (size_t leafStart = 0; leafStart < values.size();
+           leafStart += LEAF_ZONE_SIZE) {
+        size_t leafEnd = std::min(leafStart + LEAF_ZONE_SIZE, values.size());
+        auto [leafMinIt, leafMaxIt] = std::minmax_element(
+            values.begin() + (ptrdiff_t)leafStart,
+            values.begin() + (ptrdiff_t)leafEnd);
+        plan.leafZones[plan.leafCount++] = {*leafMinIt, *leafMaxIt};
+      }
+    }
 
     uint64_t range = ((uint64_t)max - (uint64_t)min) / gcd;
     if (std::bit_width(range) > MAX_PACKED_BITS) {

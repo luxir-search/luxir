@@ -822,16 +822,23 @@ public:
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
                 if (plan.batch != nullptr && card > 0) {
-                  int64_t expectedFloor =
+                  // Expected leaf visit floor: the driver gathers leaves, so
+                  // both the activation test and the work cap are in leaf
+                  // units. The 2x margin matches the walk's leaf-descent
+                  // gate: at floor ~= leafCount, bound-ordering everything
+                  // through a heap is strictly worse than the forward walk.
+                  int64_t expectedFloor = std::min<int64_t>(
+                      plan.leafCount,
                       (data->fieldCollector->topCount * (int64_t)seg.maxDoc()
-                       + card - 1) / card;
-                  if (expectedFloor < plan.blockCount
+                       + card - 1) / card);
+                  if (2 * expectedFloor < plan.leafCount
                       || forceFieldSortBestFirst) {
                     // Cap generously above the expected floor so uniform
                     // data reaches proof termination; the forward-sweep
                     // fallback keeps adversarial tie plateaus linear.
-                    int64_t workCap = std::min(plan.blockCount,
-                                               4 * expectedFloor + 64);
+                    int64_t workCap = forceFieldSortWorkCapForTests > 0
+                        ? forceFieldSortWorkCapForTests
+                        : std::min(plan.leafCount, 4 * expectedFloor + 64);
                     if (!allDocs && domainSet->type == DocSet::ARRAY) {
                       collectTopKArrayBestFirst(
                           segnum, ((ArrDocSet*)domainSet)->docs(),
@@ -874,13 +881,20 @@ public:
               auto plan = data->fieldCollector->maskedKeyBlockPlan();
               if (plan.batch != nullptr && plan.blockCount > 0
                   && sortSourceCost > 0) {
-                int64_t expectedFloor = std::min<int64_t>(
-                    plan.blockCount,
+                int64_t expectedDepth =
                     (data->fieldCollector->topCount * (int64_t)seg.maxDoc()
-                     + sortSourceCost - 1) / sortSourceCost);
+                     + sortSourceCost - 1) / sortSourceCost;
+                // Budget and materiality are both in leaf units (pass 1
+                // enumerates leaves). Leaf-normalized materiality measured
+                // BETTER than preserving the coarse-era activation envelope:
+                // it admits the 1% band, where seeding takes the walk from
+                // 1.66x the leaf floor to floor+O(1) and the second scorer
+                // costs far less than the excess it removes.
+                int64_t leafFloor =
+                    std::min<int64_t>(plan.leafCount, expectedDepth);
                 bool material =
-                    4 * expectedFloor + 64 < plan.blockCount
-                    && sortSourceCost >= plan.blockCount;
+                    4 * leafFloor + 64 < plan.leafCount
+                    && sortSourceCost >= plan.leafCount;
                 if (material || forceFieldSortSeeding) {
                   matchWindowsPlan = supplier->planBulk(
                       Query::ScorerSupplier::BulkUse::MATCH_WINDOWS,
@@ -902,14 +916,14 @@ public:
                     auto* sweepBulk = seedBulk == nullptr ? nullptr
                         : supplier->buildBulk(poolGuard.pool(), sweepPlan);
                     if (seedBulk != nullptr && sweepBulk != nullptr) {
-                      int64_t seedBudget = expectedFloor;
+                      int64_t seedBudget = leafFloor;
                       if (fieldSortSeedBudgetPerMilleForTests > 0) {
                         seedBudget = std::max<int64_t>(
-                            1, expectedFloor
+                            1, leafFloor
                                 * fieldSortSeedBudgetPerMilleForTests / 1000);
                       }
                       int64_t lambda = std::max<int64_t>(
-                          1, sortSourceCost / plan.blockCount);
+                          1, sortSourceCost / plan.leafCount);
                       int64_t fillAbortBudget = std::max<int64_t>(
                           8, 4 * ((data->fieldCollector->topCount + lambda - 1)
                                   / lambda));
