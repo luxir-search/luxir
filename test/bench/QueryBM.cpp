@@ -58,6 +58,9 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
       // here lacks.  Doc-driven counting costs O(domain) no matter how few docs
       // hold a value, so this is where term-driven counting can pay off.
       Inverter::IndexHandler& s8 = inverter.getIndexHandler("sparse_u1k_s");
+      // 100 uniform values, so one term selects ~1% of docs: the query-driven
+      // 1%-selectivity posture (a per-term density no other field here has).
+      Inverter::IndexHandler& s9 = inverter.getIndexHandler("short_u100_s");
       Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
       Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
       Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
@@ -100,6 +103,11 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
         if (r.rint(100) == 0) {
           s8.index(inverter, std::to_string(r.rint(1000)));
         }
+
+        // Drawn from an independent stream so inserting this field leaves
+        // every other field's per-doc values (and bench fingerprints) intact.
+        SplitMix64 r2(localIdNum ^ 0x9E3779B97F4A7C15ULL);
+        s9.index(inverter, std::to_string(r2.rint(100)));
 
         i1.index(inverter, r.rint(10));
 

@@ -172,7 +172,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_StringSort, segment_desc, STRING_SORT_DOCS,
 // term postings are the domain - no materialized set exists, so the exact-
 // domain best-first route cannot fire and collection rides the pruned
 // doc-order window walk. queryField "short_u10_s" ~= 10% density per term,
-// "short_u10k_s" ~= 0.01% (sparse control).
+// "short_u100_s" ~= 1%, "short_u10k_s" ~= 0.01% (sparse control).
 static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
                             const char* queryField, bool singleSeg = false) {
   if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
@@ -241,5 +241,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f0p1pct, INT_SORT_SS_DOCS, 10, tr
 SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, q10pct, STRING_SORT_DOCS, "short_u10_s");
 SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q10pct, INT_SORT_SS_DOCS,
                         "short_u10_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q1pct, INT_SORT_SS_DOCS,
+                        "short_u100_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p01pct, INT_SORT_SS_DOCS,
                         "short_u10k_s", true);
