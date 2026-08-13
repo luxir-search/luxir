@@ -96,11 +96,11 @@ public:
   CollectionHelper helper;
 
   TermRangeE2ETest() {
-    helper.index(flatdoc("id", "d1", "tag_s", "action", "title_wl", "Alpha"),
+    helper.index(flatdoc("id", "d1", "tag_s", "action", "title_un", "Alpha"),
                  UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d2", "tag_s", "drama", "title_wl", "Mike"),
+    helper.index(flatdoc("id", "d2", "tag_s", "drama", "title_un", "Mike"),
                  UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d3", "tag_s", "scifi", "title_wl", "Zulu"),
+    helper.index(flatdoc("id", "d3", "tag_s", "scifi", "title_un", "Zulu"),
                  UpdateMessage::COMMIT);
   }
 
@@ -147,8 +147,8 @@ TEST_F(TermRangeE2ETest, textEndpointsAreNormalized) {
   using S = std::vector<std::string>;
   // TEXT endpoints fold like the field folds: [Alpha TO Mike] finds the
   // lowercased indexed terms
-  EXPECT_EQ((S{"d1", "d2"}), rangeIds("title_wl", "Alpha", "Mike"));
-  EXPECT_EQ((S{"d2", "d3"}), rangeIds("title_wl", "M", nullptr));
+  EXPECT_EQ((S{"d1", "d2"}), rangeIds("title_un", "Alpha", "Mike"));
+  EXPECT_EQ((S{"d2", "d3"}), rangeIds("title_un", "M", nullptr));
 }
 
 TEST_F(TermRangeE2ETest, constantScoring) {

@@ -140,6 +140,17 @@ TEST_F(AnalysisTest, lowercaseFolds) {
   EXPECT_EQ((std::vector<std::string>{"the", "quick", "brown"}), out.terms);
 }
 
+// Unicode lowercase, and only lowercase: accents and sharp-s survive (no
+// casefold, no accent fold), compatibility forms are not normalized (fullwidth
+// stays fullwidth) - the whitespace family touches nothing but case.
+TEST_F(AnalysisTest, lowercaseUnicode) {
+  auto src = std::make_unique<WhitespaceTokenizer>();
+  WhitespaceTokenizer& head = *src;
+  LowercaseFilter filter(std::move(src));
+  auto out = analyze(head, filter, "CAFÉ Straße ＡＢＣ");
+  EXPECT_EQ((std::vector<std::string>{"café", "straße", "ａｂｃ"}), out.terms);
+}
+
 // The borrow contract: a rewriting filter must not write the source bytes.
 TEST_F(AnalysisTest, lowercaseDoesNotMutateSource) {
   std::string source = "Mixed CASE Words";
@@ -186,7 +197,10 @@ TEST_F(AnalysisTest, reuseAcrossValues) {
   EXPECT_EQ((std::vector<std::string>{"four", "five"}), analyze(tok, tok, "four five").terms);
 }
 
-// End-to-end through the schema-configured chain factory.
+// End-to-end through the schema-configured chain factory: the _wl chain,
+// whitespace + Unicode lowercase. Stateless (no segmentation cursor),
+// punctuation kept (whitespace family), accents and compatibility forms
+// preserved - it touches nothing but case.
 TEST_F(AnalysisTest, chainWhitespaceLowercase) {
   TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace", {"lowercase"});
   auto chain = ft.createAnalyzer("body");
@@ -194,6 +208,8 @@ TEST_F(AnalysisTest, chainWhitespaceLowercase) {
   EXPECT_FALSE(chain->stateful);
   auto out = analyze(*chain, "Hello World FOO");
   EXPECT_EQ((std::vector<std::string>{"hello", "world", "foo"}), out.terms);
+  out = analyze(*chain, "The QUICK Straße CAFÉ!");
+  EXPECT_EQ((std::vector<std::string>{"the", "quick", "straße", "café!"}), out.terms);
 }
 
 TEST_F(AnalysisTest, chainKeyword) {
@@ -410,12 +426,12 @@ TEST_F(AnalysisTest, chainUnicodeWordFold) {
   EXPECT_EQ((std::vector<std::string>{"cafe", "naive", "senor", "strasse", "中", "文"}), out.terms);
 }
 
-// fold (_t) vs no-fold (_wl): the accent is dropped with fold, preserved without.
+// fold (_t) vs no-fold (_un): the accent is dropped with fold, preserved without.
 TEST_F(AnalysisTest, foldVsPreserveAccents) {
   TextFieldType folding("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf", "fold"});
-  TextFieldType preserving("wl", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  TextFieldType preserving("un", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
   EXPECT_EQ((std::vector<std::string>{"cafe"}), analyze(*folding.createAnalyzer("t"), "Café").terms);
-  EXPECT_EQ((std::vector<std::string>{"café"}), analyze(*preserving.createAnalyzer("wl"), "Café").terms);
+  EXPECT_EQ((std::vector<std::string>{"café"}), analyze(*preserving.createAnalyzer("un"), "Café").terms);
 }
 
 // NFKC_CF must reach the fold/normalize fixpoint: NFKC of U+03D3 (ϓ) is U+038E,

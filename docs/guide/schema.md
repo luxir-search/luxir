@@ -60,7 +60,9 @@ The complete suffix set is:
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
 | `_w` | Stored text split on whitespace, case- and accent-sensitive. |
-| `_wl` | Stored Unicode-word text with NFKC case folding; accents preserved. |
+| `_wl` | Stored text split on whitespace, Unicode-lowercased; no normalization or accent folding. |
+| `_u` | Stored Unicode-word text, case- and accent-sensitive. |
+| `_un` | Stored Unicode-word text with NFKC case folding; accents preserved. |
 | `_t` | Stored Unicode-word text with NFKC case and accent folding. |
 | `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
 

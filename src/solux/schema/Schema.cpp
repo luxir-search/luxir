@@ -648,14 +648,24 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_ds", FieldClass::DOUBLE).multi = true;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = true;
-  // Text suffixes, from raw to fully folded:
-  //   _w  raw whitespace tokens (case- and accent-sensitive)
-  //   _wl Unicode word segmentation + NFKC case folding, accents PRESERVED
-  //       (the opt-out for accent-sensitive languages: Swedish a-ring, Spanish n-tilde, ...)
-  //   _t  the general default: also folds accents, so cafe matches cafe-with-accent
-  //       (US/adoption-centric; lossy for some languages - use _wl there)
+  // Text suffixes, two families from raw to fully folded. In the whitespace
+  // family a trailing `l` means "plus lowercase"; the unicode family uses `n`
+  // for NFKC_CF ("normalize": casefold + compatibility forms + canonical
+  // equivalence), because bare lowercase on unicode-segmented text leaves
+  // equal-looking strings unequal (NFC vs NFD, final sigma) and is a trap.
+  //   _w   raw whitespace tokens (case- and accent-sensitive)
+  //   _wl  whitespace + Unicode lowercase: touch nothing but case (for
+  //        identifier-ish or pre-normalized content)
+  //   _u   Unicode word segmentation, raw (case- and accent-sensitive)
+  //   _un  Unicode word segmentation + NFKC_CF, accents PRESERVED (the opt-out
+  //        for accent-sensitive languages: Swedish a-ring, Spanish n-tilde, ...)
+  //   _t   the general default: _un + accent fold, so cafe matches
+  //        cafe-with-accent (US/adoption-centric; lossy for some languages -
+  //        use _un there)
   setAnalyzer(add(templates, "_w", FieldClass::TEXT), "whitespace");
-  setAnalyzer(add(templates, "_wl", FieldClass::TEXT), "unicode_word", {"nfkc_cf"});
+  setAnalyzer(add(templates, "_wl", FieldClass::TEXT), "whitespace", {"lowercase"});
+  setAnalyzer(add(templates, "_u", FieldClass::TEXT), "unicode_word");
+  setAnalyzer(add(templates, "_un", FieldClass::TEXT), "unicode_word", {"nfkc_cf"});
   setAnalyzer(add(templates, "_t", FieldClass::TEXT), "unicode_word", {"nfkc_cf", "fold"});
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the template; concrete fields may pin it.

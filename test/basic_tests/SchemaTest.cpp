@@ -44,13 +44,13 @@ TEST_F(SchemaTest, defaultSchema) {
   // Templates should NOT be found by exact name
   ASSERT_EQ(nullptr, schema->getFieldTypePtr("_s"));
   ASSERT_EQ(nullptr, schema->getFieldTypePtr("_w"));
-  ASSERT_EQ(nullptr, schema->getFieldTypePtr("_wl"));
+  ASSERT_EQ(nullptr, schema->getFieldTypePtr("_un"));
   ASSERT_EQ(nullptr, schema->getFieldTypePtr("_i"));
 
   // But suffix matching should work
   ASSERT_NE(nullptr, schema->getFieldTypePtr("title_s"));
   ASSERT_NE(nullptr, schema->getFieldTypePtr("body_w"));
-  ASSERT_NE(nullptr, schema->getFieldTypePtr("body_wl"));
+  ASSERT_NE(nullptr, schema->getFieldTypePtr("body_un"));
   ASSERT_NE(nullptr, schema->getFieldTypePtr("count_i"));
   EXPECT_EQ(FieldType::STRING, schema->getFieldTypePtr("title_s")->type());
   EXPECT_EQ(FieldType::TEXT, schema->getFieldTypePtr("body_w")->type());
@@ -115,37 +115,37 @@ TEST_F(SchemaTest, fromProtoBasic) {
 
 TEST_F(SchemaTest, inheritance) {
   SchemaBuilder b;
-  auto& parent = b.templ("_wl");
+  auto& parent = b.templ("_un");
   parent.type = FieldClass::TEXT;
   parent.index = IndexMode::MATCH;
   b.analyzer(parent, "whitespace", {"lowercase"});
-  b.field("title").parent = "_wl";
+  b.field("title").parent = "_un";
 
   auto schema = b.build();
 
-  // title should inherit TEXT type and analyzer from _wl
+  // title should inherit TEXT type and analyzer from _un
   auto* title = schema->getFieldTypePtr("title");
   ASSERT_NE(nullptr, title);
   EXPECT_EQ(FieldType::TEXT, title->type());
   EXPECT_TRUE(title->indexed());
   EXPECT_FALSE(title->isAbstract());
 
-  // _wl is a template, should not be found by exact name
-  EXPECT_EQ(nullptr, schema->getFieldTypePtr("_wl"));
+  // _un is a template, should not be found by exact name
+  EXPECT_EQ(nullptr, schema->getFieldTypePtr("_un"));
   // But suffix matching should work
-  EXPECT_NE(nullptr, schema->getFieldTypePtr("body_wl"));
+  EXPECT_NE(nullptr, schema->getFieldTypePtr("body_un"));
 }
 
 
 TEST_F(SchemaTest, inheritanceOverride) {
   SchemaBuilder b;
-  auto& parent = b.templ("_wl");
+  auto& parent = b.templ("_un");
   parent.type = FieldClass::TEXT;
   parent.index = IndexMode::MATCH;
   b.analyzer(parent, "whitespace", {"lowercase"});
   // Child overrides the analyzer
   auto& child = b.field("title");
-  child.parent = "_wl";
+  child.parent = "_un";
   b.analyzer(child, "keyword");
 
   auto schema = b.build();
@@ -200,12 +200,12 @@ TEST_F(SchemaTest, setMode) {
 TEST_F(SchemaTest, setWithParentFromBase) {
   auto baseSchema = Schema::createDefaultSchema();
 
-  // Merge: add "title" that inherits from "_wl" in the base schema
+  // Merge: add "title" that inherits from "_un" in the base schema
   SchemaBuilder b;
-  b.field("title").parent = "_wl";
+  b.field("title").parent = "_un";
   auto merged = b.build(baseSchema.get());
 
-  // "title" should inherit TEXT type and analyzer from base's _wl
+  // "title" should inherit TEXT type and analyzer from base's _un
   auto* title = merged->getFieldTypePtr("title");
   ASSERT_NE(nullptr, title);
   EXPECT_EQ(FieldType::TEXT, title->type());
@@ -213,7 +213,7 @@ TEST_F(SchemaTest, setWithParentFromBase) {
   EXPECT_FALSE(title->isAbstract());
 
   auto* textFt = (TextFieldType*)(title);
-  EXPECT_EQ("unicode_word", textFt->tokenizer_);  // inherited from _wl
+  EXPECT_EQ("unicode_word", textFt->tokenizer_);  // inherited from _un
   ASSERT_EQ(1, textFt->filters_.size());
   EXPECT_EQ("nfkc_cf", textFt->filters_[0]);
 
@@ -630,7 +630,7 @@ TEST_F(SchemaTest, toProtoEmitsAuthoredSourceDeterministically) {
   SchemaBuilder b;
   auto& z = b.field("zebra");
   z.type = FieldClass::INT;
-  b.field("apple").parent = "_wl";
+  b.field("apple").parent = "_un";
   auto schema = b.build(Schema::createDefaultSchema().get());
 
   std::pmr::monotonic_buffer_resource arena;
@@ -653,14 +653,14 @@ TEST_F(SchemaTest, toProtoEmitsAuthoredSourceDeterministically) {
   // Parent reference preserved (not resolved away).
   const api::FieldDef* apple = out.fields.find("apple");
   ASSERT_NE(nullptr, apple);
-  EXPECT_EQ("_wl", apple->parent);
+  EXPECT_EQ("_un", apple->parent);
 
   // Templates carried in their own map, alpha-ordered.
   ASSERT_GT(out.templates.size(), 0u);
   for (std::size_t i = 1; i < out.templates.size(); i++) {
     EXPECT_LT(out.templates[i - 1].first, out.templates[i].first);
   }
-  EXPECT_NE(nullptr, out.templates.find("_wl"));
+  EXPECT_NE(nullptr, out.templates.find("_un"));
 }
 
 
@@ -1007,11 +1007,11 @@ TEST_F(SchemaTest, sourceDef) {
   // Verify that sourceDef_ preserves the original SchemaDef (including parent
   // references and the fields/templates split).
   SchemaBuilder b;
-  auto& parent = b.templ("_wl");
+  auto& parent = b.templ("_un");
   parent.type = FieldClass::TEXT;
   parent.index = IndexMode::MATCH;
   b.analyzer(parent, "whitespace", {"lowercase"});
-  b.field("title").parent = "_wl";
+  b.field("title").parent = "_un";
 
   auto schema = b.build();
   ASSERT_FALSE(schema->sourceDef_.empty());
@@ -1025,8 +1025,8 @@ TEST_F(SchemaTest, sourceDef) {
 
   const api::FieldDef* title = roundtripped.fields.find("title");
   ASSERT_NE(nullptr, title);
-  EXPECT_EQ("_wl", title->parent) << "sourceDef should preserve parent references";
-  EXPECT_NE(nullptr, roundtripped.templates.find("_wl"))
+  EXPECT_EQ("_un", title->parent) << "sourceDef should preserve parent references";
+  EXPECT_NE(nullptr, roundtripped.templates.find("_un"))
     << "templates persist in their own map";
 }
 

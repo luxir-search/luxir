@@ -21,7 +21,7 @@ using namespace solux::test;
 // Exercises query-time analysis for phrase queries (QueryBuilder), reached
 // through the protobuf parser. The index side and the query side must run the
 // same analyzer for an analyzed field, so an uppercase query has to match a
-// case-folded index. body_wl is unicode_word + nfkc_cf (case folding); body_w
+// case-folded index. body_un is unicode_word + nfkc_cf (case folding); body_w
 // is whitespace, case- and accent-sensitive (no analysis changes the bytes).
 class QueryAnalysisTest : public SoluxTest {
 public:
@@ -33,9 +33,9 @@ public:
   }
 
   QueryAnalysisTest() {
-    helper.index(flatdoc("id", "d1", "body_wl", "Welcome Thomas Anderson here",
+    helper.index(flatdoc("id", "d1", "body_un", "Welcome Thomas Anderson here",
                          "body_w", "Welcome Thomas Anderson here"), UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d2", "body_wl", "Anderson met Thomas",
+    helper.index(flatdoc("id", "d2", "body_un", "Anderson met Thomas",
                          "body_w", "Anderson met Thomas"), UpdateMessage::COMMIT);
   }
 
@@ -68,29 +68,29 @@ public:
 
 TEST_F(QueryAnalysisTest, textPhraseAnalyzedAndCaseFolded) {
   // Uppercase query text against a case-folded field still matches.
-  EXPECT_EQ(1, phraseTextCount("body_wl", "Thomas Anderson"));
-  EXPECT_EQ(1, phraseTextCount("body_wl", "THOMAS ANDERSON"));
+  EXPECT_EQ(1, phraseTextCount("body_un", "Thomas Anderson"));
+  EXPECT_EQ(1, phraseTextCount("body_un", "THOMAS ANDERSON"));
 }
 
 TEST_F(QueryAnalysisTest, textPhraseOrderMatters) {
   // Reversed order is not an adjacent phrase in either doc.
-  EXPECT_EQ(0, phraseTextCount("body_wl", "Anderson Thomas"));
+  EXPECT_EQ(0, phraseTextCount("body_un", "Anderson Thomas"));
 }
 
 TEST_F(QueryAnalysisTest, singleTokenTextCollapsesToTermQuery) {
   // One analyzed token => TermQuery (PhraseQuery needs >= 2). Matches both docs.
-  EXPECT_EQ(2, phraseTextCount("body_wl", "ANDERSON"));
+  EXPECT_EQ(2, phraseTextCount("body_un", "ANDERSON"));
 }
 
 TEST_F(QueryAnalysisTest, emptyAnalysisMatchesNothing) {
   // Non-empty input that analyzes to zero tokens => MatchNoDocsQuery, no crash.
-  EXPECT_EQ(0, phraseTextCount("body_wl", "   "));
-  EXPECT_EQ(0, phraseTextCount("body_wl", " ... "));
+  EXPECT_EQ(0, phraseTextCount("body_un", "   "));
+  EXPECT_EQ(0, phraseTextCount("body_un", " ... "));
 }
 
 TEST_F(QueryAnalysisTest, wordListAnalyzed) {
   auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").phraseQuery("body_wl", {"THOMAS", "ANDERSON"}).withStats();
+  req->collection("main").topDocs("q").phraseQuery("body_un", {"THOMAS", "ANDERSON"}).withStats();
   req->execute();
   EXPECT_EQ(1, req->getMatchCount());
 }
@@ -100,7 +100,7 @@ TEST_F(QueryAnalysisTest, wordListEntryFlattensToMultiplePositions) {
   // to several phrase positions (flatten, like text). "Thomas Anderson" as one
   // entry -> [thomas, anderson].
   auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").phraseQuery("body_wl", {"Thomas Anderson"}).withStats();
+  req->collection("main").topDocs("q").phraseQuery("body_un", {"Thomas Anderson"}).withStats();
   req->execute();
   EXPECT_EQ(1, req->getMatchCount());
 }
@@ -114,7 +114,7 @@ TEST_F(QueryAnalysisTest, wordListWithPositionsAdjustsForExpansion) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
-  ph.field = "body_wl";
+  ph.field = "body_un";
   auto& mr = cur.mr();
   std::string_view* w = build::allocArray(ph.words, 2, mr);
   w[0] = build::arenaStr(mr, "Thomas Anderson");
@@ -131,13 +131,13 @@ TEST_F(QueryAnalysisTest, preAnalyzedTermsUsedVerbatim) {
   // terms[] are already analyzed: they must match the index bytes exactly.
   {
     auto req = localReq(helper.getSearchEngine());
-    req->collection("main").topDocs("q").phraseTerms("body_wl", {"thomas", "anderson"}).withStats();
+    req->collection("main").topDocs("q").phraseTerms("body_un", {"thomas", "anderson"}).withStats();
     req->execute();
     EXPECT_EQ(1, req->getMatchCount());  // already folded -> matches
   }
   {
     auto req = localReq(helper.getSearchEngine());
-    req->collection("main").topDocs("q").phraseTerms("body_wl", {"Thomas", "Anderson"}).withStats();
+    req->collection("main").topDocs("q").phraseTerms("body_un", {"Thomas", "Anderson"}).withStats();
     req->execute();
     EXPECT_EQ(0, req->getMatchCount());  // NOT analyzed; uppercase misses folded index
   }
@@ -148,7 +148,7 @@ TEST_F(QueryAnalysisTest, preAnalyzedTermsBinUsedVerbatim) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
-  ph.field = "body_wl";
+  ph.field = "body_un";
   auto& mr = cur.mr();
   auto* tb = build::allocArray(ph.terms_bin, 2, mr);
   tb[0] = build::arenaBytes(mr, bytes("thomas"));
@@ -163,7 +163,7 @@ TEST_F(QueryAnalysisTest, multiplePhraseInputsRejected) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
-  ph.field = "body_wl";
+  ph.field = "body_un";
   ph.text = "Thomas Anderson";
   auto& mr = cur.mr();
   std::string_view* w = build::allocArray(ph.words, 1, mr);
@@ -179,7 +179,7 @@ TEST_F(QueryAnalysisTest, positionsWithoutTermsRejected) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
-  ph.field = "body_wl";
+  ph.field = "body_un";
   auto& mr = cur.mr();
   std::int32_t* pos = build::allocArray(ph.positions, 2, mr);
   pos[0] = 0;
@@ -197,11 +197,11 @@ TEST_F(QueryAnalysisTest, caseSensitiveFieldRespectsCase) {
 }
 
 TEST_F(QueryAnalysisTest, structuredSlopPassesThrough) {
-  helper.index(flatdoc("id", "d3", "body_wl", "Anderson Thomas"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "d3", "body_un", "Anderson Thomas"), UpdateMessage::COMMIT);
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
-  phrase.field = "body_wl";
+  phrase.field = "body_un";
   phrase.text = "Thomas Anderson";
   phrase.slop = 2;
   cur.withStats();
@@ -214,7 +214,7 @@ TEST_F(QueryAnalysisTest, structuredNegativeSlopRejected) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
-  phrase.field = "body_wl";
+  phrase.field = "body_un";
   phrase.text = "Thomas Anderson";
   phrase.slop = -1;
   cur.withStats();
@@ -227,7 +227,7 @@ TEST_F(QueryAnalysisTest, structuredRawSlotCapRejectedBeforeCopy) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
-  phrase.field = "body_wl";
+  phrase.field = "body_un";
   auto* terms = api::build::allocArray(
       phrase.terms, QueryBuilder::MAX_PHRASE_SLOTS + 1, cur.mr());
   for (size_t i = 0; i < QueryBuilder::MAX_PHRASE_SLOTS + 1; i++) terms[i] = "x";
@@ -312,14 +312,14 @@ TEST(QueryBuilderPhraseCanonicalization, capsAnalysisAndRejectsNormalizedOverflo
   std::vector<std::string_view> dropped = {"...", "Thomas", "Anderson"};
   std::vector<int32_t> droppedPositions = {0, 1, 2};
   auto* query = dynamic_cast<PhraseQuery*>(
-      builder.createPhraseQuery("body_wl", dropped, droppedPositions, 3));
+      builder.createPhraseQuery("body_un", dropped, droppedPositions, 3));
   ASSERT_NE(query, nullptr);
   EXPECT_EQ((std::vector<int32_t>{0, 1}),
             std::vector<int32_t>(query->getPositions().begin(), query->getPositions().end()));
 
   std::string_view single = "Thomas";
   EXPECT_NE(nullptr, dynamic_cast<TermQuery*>(builder.createPhraseQuery(
-      "body_wl", std::span<const std::string_view>(&single, 1), {}, 50)));
+      "body_un", std::span<const std::string_view>(&single, 1), {}, 50)));
 }
 
 // --- max term length (indexed terms truncate to PackedTerm::MAX_LEN) ----------
@@ -363,19 +363,19 @@ TEST_F(QueryAnalysisTest, oversizedIdTruncatesConsistently) {
 TEST_F(QueryAnalysisTest, matchSingleTermCaseFolded) {
   // Uppercase match query against a case-folded field matches (the parity fix);
   // one analyzed term collapses to a TermQuery. d1 and d2 both contain anderson.
-  EXPECT_EQ(2, matchCount("body_wl", "ANDERSON"));
+  EXPECT_EQ(2, matchCount("body_un", "ANDERSON"));
 }
 
 TEST_F(QueryAnalysisTest, matchMultiTermDefaultsToOr) {
   // "Thomas here" -> [thomas, here]; default operator OR. d1 has both, d2 has
   // thomas only -> both match.
-  EXPECT_EQ(2, matchCount("body_wl", "Thomas here"));
+  EXPECT_EQ(2, matchCount("body_un", "Thomas here"));
 }
 
 TEST_F(QueryAnalysisTest, matchAndRequiresAllTerms) {
   // Same terms with operator AND: only d1 contains both thomas and here.
   auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").matchQuery("body_wl", "Thomas here",
+  req->collection("main").topDocs("q").matchQuery("body_un", "Thomas here",
                                      solux::api::Match_::Operator::AND).withStats();
   req->execute();
   EXPECT_EQ(1, req->getMatchCount());
@@ -383,7 +383,7 @@ TEST_F(QueryAnalysisTest, matchAndRequiresAllTerms) {
 
 TEST_F(QueryAnalysisTest, matchEmptyAnalyzesToNothing) {
   // Non-empty input that analyzes to zero tokens -> MatchNoDocsQuery.
-  EXPECT_EQ(0, matchCount("body_wl", " ... "));
+  EXPECT_EQ(0, matchCount("body_un", " ... "));
 }
 
 TEST_F(QueryAnalysisTest, matchOnNonTextFieldIsVerbatim) {
@@ -395,16 +395,16 @@ TEST_F(QueryAnalysisTest, matchOnNonTextFieldIsVerbatim) {
 TEST_F(QueryAnalysisTest, matchMinShouldMatch) {
   // d1: "welcome thomas anderson here"; d2: "anderson met thomas".
   // "welcome here met" -> d1 has {welcome,here}=2, d2 has {met}=1.
-  EXPECT_EQ(2, matchCount("body_wl", "welcome here met"));             // OR baseline
-  EXPECT_EQ(1, matchMinMatchCount("body_wl", "welcome here met", 2));  // >=2 -> only d1
-  EXPECT_EQ(0, matchMinMatchCount("body_wl", "welcome here met", 3));  // all three -> none
-  EXPECT_EQ(0, matchMinMatchCount("body_wl", "welcome here met", 10)); // clamped to 3 -> none
+  EXPECT_EQ(2, matchCount("body_un", "welcome here met"));             // OR baseline
+  EXPECT_EQ(1, matchMinMatchCount("body_un", "welcome here met", 2));  // >=2 -> only d1
+  EXPECT_EQ(0, matchMinMatchCount("body_un", "welcome here met", 3));  // all three -> none
+  EXPECT_EQ(0, matchMinMatchCount("body_un", "welcome here met", 10)); // clamped to 3 -> none
 }
 
 TEST_F(QueryAnalysisTest, matchMinShouldMatchMissingTermLowersCeiling) {
   // "zzz" exists nowhere, so only 2 of the 3 terms can ever match.
-  EXPECT_EQ(2, matchMinMatchCount("body_wl", "thomas anderson zzz", 2));  // both real terms present
-  EXPECT_EQ(0, matchMinMatchCount("body_wl", "thomas anderson zzz", 3));  // can't reach 3 -> none
+  EXPECT_EQ(2, matchMinMatchCount("body_un", "thomas anderson zzz", 2));  // both real terms present
+  EXPECT_EQ(0, matchMinMatchCount("body_un", "thomas anderson zzz", 3));  // can't reach 3 -> none
 }
 
 TEST_F(QueryAnalysisTest, booleanMinMatchOptionalClauses) {
@@ -413,9 +413,9 @@ TEST_F(QueryAnalysisTest, booleanMinMatchOptionalClauses) {
   auto& cur = req->collection("main").topDocs("q");
   auto& mr = cur.mr();
   cur.rawQuery() = qb::boolean(mr, /*required=*/{},
-      /*optional=*/{qb::match(mr, "body_wl", "welcome"),
-                    qb::match(mr, "body_wl", "here"),
-                    qb::match(mr, "body_wl", "met")},
+      /*optional=*/{qb::match(mr, "body_un", "welcome"),
+                    qb::match(mr, "body_un", "here"),
+                    qb::match(mr, "body_un", "met")},
       /*prohibited=*/{}, /*filter=*/{}, /*minMatch=*/2);
   cur.withStats();
   req->execute();
@@ -429,8 +429,8 @@ TEST_F(QueryAnalysisTest, booleanMinMatchComposesWithRequired) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     auto& mr = cur.mr();
-    cur.rawQuery() = qb::boolean(mr, /*required=*/{qb::match(mr, "body_wl", "anderson")},
-        /*optional=*/{qb::match(mr, "body_wl", "thomas"), qb::match(mr, "body_wl", "welcome")},
+    cur.rawQuery() = qb::boolean(mr, /*required=*/{qb::match(mr, "body_un", "anderson")},
+        /*optional=*/{qb::match(mr, "body_un", "thomas"), qb::match(mr, "body_un", "welcome")},
         /*prohibited=*/{}, /*filter=*/{}, minMatch);
     cur.withStats();
     req->execute();
@@ -446,15 +446,15 @@ TEST_F(QueryAnalysisTest, matchMinShouldMatchManyTerms) {
   // Terms with distinct doc frequencies (a:4, b:3, c:2, d:1) exercise the
   // cost-ordered lead/tail split across several thresholds.
   helper.clear();
-  helper.index(flatdoc("id", "d1", "body_wl", "a b c d"), UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("id", "d2", "body_wl", "a b c"), UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("id", "d3", "body_wl", "a b"), UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("id", "d4", "body_wl", "a"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "d1", "body_un", "a b c d"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d2", "body_un", "a b c"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d3", "body_un", "a b"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d4", "body_un", "a"), UpdateMessage::COMMIT);
 
-  EXPECT_EQ(4, matchMinMatchCount("body_wl", "a b c d", 1));  // OR -> all have 'a'
-  EXPECT_EQ(3, matchMinMatchCount("body_wl", "a b c d", 2));  // d1,d2,d3
-  EXPECT_EQ(2, matchMinMatchCount("body_wl", "a b c d", 3));  // d1,d2
-  EXPECT_EQ(1, matchMinMatchCount("body_wl", "a b c d", 4));  // d1 (conjunction)
+  EXPECT_EQ(4, matchMinMatchCount("body_un", "a b c d", 1));  // OR -> all have 'a'
+  EXPECT_EQ(3, matchMinMatchCount("body_un", "a b c d", 2));  // d1,d2,d3
+  EXPECT_EQ(2, matchMinMatchCount("body_un", "a b c d", 3));  // d1,d2
+  EXPECT_EQ(1, matchMinMatchCount("body_un", "a b c d", 4));  // d1 (conjunction)
 }
 
 TEST_F(QueryAnalysisTest, matchMinShouldMatchScoreIncludesAllMatches) {
@@ -462,11 +462,11 @@ TEST_F(QueryAnalysisTest, matchMinShouldMatchScoreIncludesAllMatches) {
   // under min_match=2: the scorer stops iterating at minMatch but score() has
   // to complete the tail so the BM25 sum covers every matching term.
   helper.clear();
-  helper.index(flatdoc("id", "x", "body_wl", "alpha beta gamma"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "x", "body_un", "alpha beta gamma"), UpdateMessage::COMMIT);
 
   auto score = [&](int minMatch) {
     auto req = localReq(helper.getSearchEngine());
-    auto& cur = req->collection("main").topDocs("q").matchQuery("body_wl", "alpha beta gamma");
+    auto& cur = req->collection("main").topDocs("q").matchQuery("body_un", "alpha beta gamma");
     if (minMatch > 0) std::get<solux::api::Match>(cur.rawQuery().kind).min_match = minMatch;
     cur.withStats();
     req->execute();

@@ -37,13 +37,13 @@ public:
   CollectionHelper helper{"main"};
 
   void SetUp() override {
-    helper.index(flatdoc("id", "d1", "title_wl", "Blade Runner", "body_wl", "a replicant story",
+    helper.index(flatdoc("id", "d1", "title_un", "Blade Runner", "body_un", "a replicant story",
                          "tag_s", "scifi", "year_i", "1982"),
                  UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d2", "title_wl", "The Running Man", "body_wl", "arnold runs fast",
+    helper.index(flatdoc("id", "d2", "title_un", "The Running Man", "body_un", "arnold runs fast",
                          "tag_s", "action", "year_i", "1987"),
                  UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d3", "title_wl", "Bladed Weapons", "body_wl", "swords and knives",
+    helper.index(flatdoc("id", "d3", "title_un", "Bladed Weapons", "body_un", "swords and knives",
                          "tag_s", "scifi", "year_i", "1990"),
                  UpdateMessage::COMMIT);
   }
@@ -365,11 +365,11 @@ TEST_F(BoostQueryTest, wireValidationRejectsInvalidValuesAndOverflow) {
 }
 
 TEST_F(ExprQueryTest, fieldedTermAndPhrase) {
-  auto docs = search("title_wl:blade");
+  auto docs = search("title_un:blade");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 
-  docs = search("title_wl:\"blade runner\"");
+  docs = search("title_un:\"blade runner\"");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 
@@ -378,14 +378,14 @@ TEST_F(ExprQueryTest, fieldedTermAndPhrase) {
 }
 
 TEST_F(ExprQueryTest, booleanComposition) {
-  auto docs = search("tag_s:scifi AND NOT title_wl:blade");
+  auto docs = search("tag_s:scifi AND NOT title_un:blade");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d3"));
 
-  docs = search("title_wl:blade OR body_wl:arnold");
+  docs = search("title_un:blade OR body_un:arnold");
   EXPECT_EQ(2u, docs.size());
 
-  docs = search("+tag_s:scifi -title_wl:bladed");
+  docs = search("+tag_s:scifi -title_un:bladed");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 }
@@ -410,10 +410,10 @@ TEST_F(ExprQueryTest, rangesAndComparisons) {
 }
 
 TEST_F(ExprQueryTest, decorations) {
-  auto docs = search("title_wl:runn*");
+  auto docs = search("title_un:runn*");
   EXPECT_EQ(2u, docs.size());  // runner, running
 
-  docs = search("title_wl:blabe~1");
+  docs = search("title_un:blabe~1");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 
@@ -423,10 +423,10 @@ TEST_F(ExprQueryTest, decorations) {
 
 TEST_F(ExprQueryTest, multitermDecorationsAreNormalized) {
   // prefix/fuzzy text folds the way the field folds - Runn* finds "runner"
-  auto docs = search("title_wl:Runn*");
+  auto docs = search("title_un:Runn*");
   EXPECT_EQ(2u, docs.size());  // runner, running
 
-  docs = search("title_wl:Blabe~1");
+  docs = search("title_un:Blabe~1");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 
@@ -443,15 +443,15 @@ TEST_F(ExprQueryTest, termRanges) {
   EXPECT_TRUE(hasId(docs, "d2"));
   docs = search("tag_s:>=s");
   EXPECT_EQ(2u, docs.size());
-  docs = search("title_wl:[Blade TO Bladed]");  // TEXT endpoints fold
+  docs = search("title_un:[Blade TO Bladed]");  // TEXT endpoints fold
   EXPECT_EQ(2u, docs.size());  // blade(d1), bladed(d3)
-  docs = search("title_wl:{blade TO bladed]");  // exclusive lower
+  docs = search("title_un:{blade TO bladed]");  // exclusive lower
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d3"));
 }
 
 TEST_F(ExprQueryTest, fieldGroupDistribution) {
-  auto docs = search("title_wl:(blade OR running)");
+  auto docs = search("title_un:(blade OR running)");
   EXPECT_EQ(2u, docs.size());
 
   docs = search("year_i:(>=1982 AND <1990)");
@@ -459,23 +459,23 @@ TEST_F(ExprQueryTest, fieldGroupDistribution) {
 }
 
 TEST_F(ExprQueryTest, functionForm) {
-  auto docs = search("match(blade runner, field=title_wl, operator=AND)");
+  auto docs = search("match(blade runner, field=title_un, operator=AND)");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 
-  docs = search("boolean(required=[tag_s:scifi], prohibited=[title_wl:blade])");
+  docs = search("boolean(required=[tag_s:scifi], prohibited=[title_un:blade])");
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d3"));
 
   docs = search("constant_score(tag_s:scifi, score=2.5)");
   EXPECT_EQ(2u, docs.size());
 
-  docs = search("simple_query(running blade, fields=[title_wl])");
+  docs = search("simple_query(running blade, fields=[title_un])");
   EXPECT_EQ(2u, docs.size());  // d1 (blade), d2 (running)
 }
 
 TEST_F(ExprQueryTest, varsBindAsValues) {
-  auto docs = search("title_wl:$t", [&](solux::api::Query& q) {
+  auto docs = search("title_un:$t", [&](solux::api::Query& q) {
     auto& e = std::get<solux::api::ExprQuery>(q.kind);
     using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>;
     static solux::api::Val val;  // outlives the request in this test
@@ -503,12 +503,12 @@ TEST_F(ExprQueryTest, expansionSplicesIntoRequestTree) {
 TEST_F(ExprQueryTest, rigorousErrors) {
   EXPECT_NE(searchErr("bareword").find("unfielded term"), std::string::npos);
   EXPECT_NE(searchErr("bogus_field:x").find("unknown field"), std::string::npos);
-  EXPECT_NE(searchErr("title_wl:a AND").find("expected a clause"), std::string::npos);
+  EXPECT_NE(searchErr("title_un:a AND").find("expected a clause"), std::string::npos);
   EXPECT_NE(searchErr("").find("non-empty"), std::string::npos);
 
   std::string deep;
   for (int i = 0; i < 200; i++) deep += "(";
-  deep += "title_wl:a";
+  deep += "title_un:a";
   for (int i = 0; i < 200; i++) deep += ")";
   EXPECT_NE(searchErr(deep).find("nesting exceeds"), std::string::npos);
 }

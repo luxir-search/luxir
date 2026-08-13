@@ -425,9 +425,9 @@ TEST_F(FuzzyQueryE2ETest, textTermIsNormalized) {
   using S = std::vector<std::string>;
   // multiterm input folds the way the field folds; AUTO edits come from the
   // normalized bytes
-  helper.index(flatdoc("id", "d5", "title_wl", "Blade Runner"), UpdateMessage::COMMIT);
-  EXPECT_EQ(fuzzyIds("title_wl", "Blabe", 1), (S{"d5"}));
-  EXPECT_EQ(fuzzyIds("title_wl", "RUNNER", 0), (S{"d5"}));  // fold, then exact
+  helper.index(flatdoc("id", "d5", "title_un", "Blade Runner"), UpdateMessage::COMMIT);
+  EXPECT_EQ(fuzzyIds("title_un", "Blabe", 1), (S{"d5"}));
+  EXPECT_EQ(fuzzyIds("title_un", "RUNNER", 0), (S{"d5"}));  // fold, then exact
   // STRING fields are unanalyzed: the term stays verbatim
   EXPECT_TRUE(fuzzyIds("color_s", "RED", 1).empty());
 }

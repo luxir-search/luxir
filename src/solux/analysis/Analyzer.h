@@ -235,42 +235,36 @@ public:
 };
 
 
-// ASCII lowercase. Rewriting filters obey the read-only contract: rather than
-// writing the source bytes in place, it copies the token into its own reusable
-// buffer and repoints. Pure-lowercase tokens pass through with zero copy.
+// Lowercase `in`, using `buf` as scratch only when a rewrite is needed. Returns
+// a view of the result - `in` itself when already lowercase (zero copy). Pure
+// ASCII is handled bytewise; any non-ASCII byte routes through uni-algo's full
+// Unicode lowercase (defined in Analyzer.cpp to keep uni-algo's heavy headers
+// out of this widely-included header).
+std::string_view applyLowercase(std::string_view in, std::string& buf);
+
+// Unicode lowercase, and nothing else: unlike nfkc_cf it does no normalization,
+// so compatibility forms and canonical equivalence are left alone - the
+// whitespace family's "touch nothing but case" filter. Rewriting filters obey
+// the read-only contract: rather than writing the source bytes in place, it
+// copies the token into its own reusable buffer and repoints. Pure-lowercase
+// tokens pass through with zero copy.
 class LowercaseFilter : public TokenFilter {
-  std::vector<char> buf; // reusable output buffer; the borrowed bytes live here after a rewrite
+  std::string buf; // reusable output buffer; the borrowed bytes live here after a rewrite
 public:
   LowercaseFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
 
   bool incrementToken() override {
     if (!source().incrementToken()) return false;
-
-    std::string_view in = token.text;
-    // Find the first uppercase byte. If there is none, leave the token pointing
-    // at the source bytes (no copy, no repoint).
-    size_t i = 0;
-    for (; i < in.size(); i++) {
-      char c = in[i];
-      if (c >= 'A' && c <= 'Z') break; // TODO: handle unicode!
-    }
-    if (i == in.size()) return true;
-
-    // Copy into our own buffer and fold the rest. We never write `in`.
-    buf.assign(in.begin(), in.end());
-    for (; i < buf.size(); i++) {
-      char c = buf[i];
-      if (c >= 'A' && c <= 'Z') buf[i] = (char) (c + ('a' - 'A'));
-    }
-    token.text = std::string_view(buf.data(), buf.size());
+    std::string_view folded = applyLowercase(token.text, buf);
+    if (folded.data() != token.text.data()) token.text = folded;
     return true;
   }
 
   void normalizeTerm(std::string& term) override {
     TokenFilter::normalizeTerm(term);
-    for (char& c : term) {
-      if (c >= 'A' && c <= 'Z') c = (char) (c + ('a' - 'A'));
-    }
+    std::string scratch;
+    std::string_view folded = applyLowercase(term, scratch);
+    if (folded.data() != term.data()) term.assign(folded);
   }
 };
 

@@ -364,9 +364,9 @@ TEST(JsonDialect, FieldDefStrictReads) {
   }
   {  // parent + inherited type reads fine with no type at all
     P::SchemaDef def;
-    ASSERT_TRUE(P::read_json(def, R"({"fields":{"t":{"parent":"_wl"}}})", mr));
+    ASSERT_TRUE(P::read_json(def, R"({"fields":{"t":{"parent":"_un"}}})", mr));
     EXPECT_FALSE(def.fields.find("t")->type.has_value());
-    EXPECT_EQ("_wl", def.fields.find("t")->parent);
+    EXPECT_EQ("_un", def.fields.find("t")->parent);
   }
 }
 

@@ -253,7 +253,7 @@ The same positional rule applies to match-all, numeric and geo ranges, prefix,
 and term-range queries: their default constant is `1` and a required clause
 contributes `0`. Filter and prohibited clauses never score.
 
-Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
+Prefix and fuzzy text is folded the way the field folds - `title_t:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
 string fields the text is used exactly as written.
 

@@ -137,7 +137,7 @@ inline bool isAsciiWs(unsigned char c) {
 // applied in the same stage. Equivalent to unicode_word + nfkc_cf (asserted in
 // AnalysisTest) but without the extra filter hop / redundant ASCII scan. Accent
 // folding is intentionally NOT fused in - it stays the separate, optional `fold`
-// filter (lossy, language-dependent; it is what distinguishes _t from _wl).
+// filter (lossy, language-dependent; it is what distinguishes _t from _un).
 //
 // Hot-path structure: reset() copies the value into `lowered`, ASCII-lowercasing
 // in one bulk pass (vectorizable; ASCII byte ops cannot corrupt multibyte UTF-8
@@ -343,6 +343,27 @@ public:
 };
 
 }  // namespace
+
+std::string_view applyLowercase(std::string_view in, std::string& buf) {
+  size_t firstUpper = in.size();
+  for (size_t i = 0; i < in.size(); i++) {
+    unsigned char c = (unsigned char) in[i];
+    if (c & 0x80) {
+      // Full Unicode lowercase (default un-tailored casing); also lowercases
+      // any ASCII uppercase preceding this byte.
+      buf = una::cases::to_lowercase_utf8(in);
+      return buf;
+    }
+    if (c >= 'A' && c <= 'Z' && firstUpper == in.size()) firstUpper = i;
+  }
+  if (firstUpper == in.size()) return in;  // pure lowercase ASCII: zero copy
+  buf.assign(in);
+  for (size_t i = firstUpper; i < buf.size(); i++) {
+    char c = buf[i];
+    if (c >= 'A' && c <= 'Z') buf[i] = (char) (c + ('a' - 'A'));
+  }
+  return buf;
+}
 
 std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer() {
   return std::make_unique<UnicodeWordTokenizer>();

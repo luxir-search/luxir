@@ -13,9 +13,9 @@ public:
   CollectionHelper helper;
 
   WildcardQueryE2ETest() {
-    helper.index(flatdoc("id", "d1", "body_w", "Foobar apple", "title_wl", "Foobar", "color_s", "foo*bar"), UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d2", "body_w", "Food apple", "title_wl", "Food", "color_s", "foobar"), UpdateMessage::NO_COMMIT);
-    helper.index(flatdoc("id", "d3", "body_w", "fool", "title_wl", "fool", "color_s", "FOOBAR"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "d1", "body_w", "Foobar apple", "title_un", "Foobar", "color_s", "foo*bar"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "d2", "body_w", "Food apple", "title_un", "Food", "color_s", "foobar"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "d3", "body_w", "fool", "title_un", "fool", "color_s", "FOOBAR"), UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d4", "body_w", "banana", "color_s", "other"), UpdateMessage::COMMIT);
   }
 
@@ -42,7 +42,7 @@ TEST_F(WildcardQueryE2ETest, protoExprAndFilter) {
   EXPECT_EQ(wildcardCount("body_w", "*"), 4);
   EXPECT_EQ(wildcardCount("color_s", "foo*bar"), 2);  // NORMAL includes exact "foobar"
   EXPECT_EQ(wildcardCount("body_w", std::string(301, 'a') + "*"), 0);
-  EXPECT_EQ(wildcardCount("title_wl", "FOO*"), 3);      // whole-pattern TEXT folding
+  EXPECT_EQ(wildcardCount("title_un", "FOO*"), 3);      // whole-pattern TEXT folding
   EXPECT_EQ(wildcardCount("color_s", "FOO*"), 1);      // STRING stays verbatim
 
   // Empty wildcard matches only an empty term; this schema does not index one.

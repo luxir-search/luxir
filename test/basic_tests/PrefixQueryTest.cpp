@@ -560,10 +560,10 @@ TEST_F(PrefixQueryE2ETest, asBooleanFilter) {
 TEST_F(PrefixQueryE2ETest, textPrefixIsNormalized) {
   // multiterm input folds the way the field folds (never tokenized), so a
   // capitalized prefix finds lowercased indexed terms
-  helper.index(flatdoc("id", "d5", "title_wl", "Blade Runner"), UpdateMessage::COMMIT);
-  EXPECT_EQ(prefixCount("title_wl", "Runn"), 1);
-  EXPECT_EQ(prefixCount("title_wl", "runn"), 1);
-  EXPECT_EQ(prefixCount("title_wl", "BLADE"), 1);
+  helper.index(flatdoc("id", "d5", "title_un", "Blade Runner"), UpdateMessage::COMMIT);
+  EXPECT_EQ(prefixCount("title_un", "Runn"), 1);
+  EXPECT_EQ(prefixCount("title_un", "runn"), 1);
+  EXPECT_EQ(prefixCount("title_un", "BLADE"), 1);
   // STRING fields are unanalyzed: the prefix stays verbatim
   EXPECT_EQ(prefixCount("color_s", "RED"), 0);
 }
