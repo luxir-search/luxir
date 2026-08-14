@@ -5,16 +5,16 @@
 #include <string>
 #include <vector>
 
-#include "solux/reader/AutomatonSeekEnum.h"
-#include "solux/reader/BruteDfaTermsEnum.h"
-#include "solux/util/automaton/WildcardCompiler.h"
-#include "solux/util/automaton/RegExpParser.h"
-#include "test/SoluxTest.h"
+#include "luxir/reader/AutomatonSeekEnum.h"
+#include "luxir/reader/BruteDfaTermsEnum.h"
+#include "luxir/util/automaton/WildcardCompiler.h"
+#include "luxir/util/automaton/RegExpParser.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::automaton;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::automaton;
+using namespace luxir::test;
 
 namespace {
 
@@ -81,7 +81,7 @@ std::string pattern(std::mt19937& rng) {
 
 } // namespace
 
-class AutomatonSeekTest : public SoluxTest {};
+class AutomatonSeekTest : public LuxirTest {};
 
 TEST_F(AutomatonSeekTest, WildcardDifferentialAndLowerBound) {
   std::mt19937 rng(0x4a9c31);

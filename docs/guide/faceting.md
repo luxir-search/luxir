@@ -268,7 +268,7 @@ daylight-saving change can be 23 or 25 physical hours. Week buckets begin on
 Monday.
 
 Nonexistent civil fences shift forward through the zone transition. If a zone
-change removes a whole nominal bucket, Solux removes the zero-width bucket and
+change removes a whole nominal bucket, Luxir removes the zero-width bucket and
 returns a `calendar_bucket_skipped` warning rather than silently changing the
 calendar. See [Dates and Time Zones](dates.md) for the date-math and civil-time
 contract.

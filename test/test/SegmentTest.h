@@ -1,12 +1,12 @@
 #pragma once
 #include <tuple>
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/PosEnum.h"
-#include "solux/util/random.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/PosEnum.h"
+#include "luxir/util/random.h"
 #include "gtest/gtest.h"
 
-namespace solux {
+namespace luxir {
 
 // Create and test a random segment
 // This is old code that was used to test low level reading and writing before there was higher level

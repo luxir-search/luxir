@@ -5,21 +5,21 @@
 
 #include <gtest/gtest.h>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
 using namespace std;
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-using ResponseStatus = solux::api::UpdateResponse_::Status;
+using ResponseStatus = luxir::api::UpdateResponse_::Status;
 
 // No schema entry and no default suffix match, so getIndexHandler throws.
 static constexpr const char* BAD_FIELD = "no_such_field";
 
-class UpdateErrorTest : public SoluxTest {
+class UpdateErrorTest : public LuxirTest {
 public:
   struct SubmitOpts {
     bool allOrNone = false;

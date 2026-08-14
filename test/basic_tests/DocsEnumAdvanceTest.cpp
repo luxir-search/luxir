@@ -8,21 +8,21 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
-#include "solux/query/TermQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/search/PostingsIntersection.h"
-#include "solux/search/Similarity.h"
-#include "solux/reader/PosEnum.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/search/PostingsIntersection.h"
+#include "luxir/search/Similarity.h"
+#include "luxir/reader/PosEnum.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Fuzz for postings-enum advance() and friends.
 // Builds randomized indexes and replays random nextDoc()/advance()/position-read sequences against an
 // independent model, checking doc id, term freq, and positions every step.
-class DocsEnumAdvanceTest : public SoluxTest {
+class DocsEnumAdvanceTest : public LuxirTest {
 protected:
   struct Posting { int32_t docid; int32_t firstPos; int32_t tf; };
 
@@ -1949,8 +1949,8 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
   auto input = dir.openFile(segName);
   ASSERT_NE(input, nullptr);
   std::string bytes(input->read());
-  ASSERT_GE(bytes.size(), Postings::SOLUX_HEADER.size());
-  memcpy(bytes.data(), "SOLUX000", Postings::SOLUX_HEADER.size());
+  ASSERT_GE(bytes.size(), Postings::LUXIR_HEADER.size());
+  memcpy(bytes.data(), "LUXIR000", Postings::LUXIR_HEADER.size());
 
   ASSERT_TRUE(dir.deleteFile(segName));
   auto outFile = dir.createFile(segName);

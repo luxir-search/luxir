@@ -1,9 +1,9 @@
 #include <charconv>
 #include <test/SegmentTest.h>
-#include "bench/solux_bench.h"
-#include "solux/index/Inverter.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/Inverter.h"
 
-using namespace solux;
+using namespace luxir;
 
 static void BM_Invert(benchmark::State& state, std::string field, bool writePostings) {
 
@@ -21,7 +21,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
   }
 
 
-  int iter = unit_tests ? (int)SoluxTest::scaleTestWork(10) : 1000;
+  int iter = unit_tests ? (int)LuxirTest::scaleTestWork(10) : 1000;
   int64_t inverterSz = 0;
   RAMDir dir;
   for (auto _ : state) {

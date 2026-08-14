@@ -1,8 +1,8 @@
 #include <charconv>
-#include "bench/solux_bench.h"
-#include "solux/index/Inverter.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/Inverter.h"
 
-using namespace solux;
+using namespace luxir;
 
 static void BM_BitSet(benchmark::State& state, int32_t blocks, bool getRank) {
   Rng rng;

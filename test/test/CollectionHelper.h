@@ -2,26 +2,26 @@
 
 #include "DurableIndexInfo.h"
 #include "TestUtils.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/schema/Schema.h"
-#include "solux/server/ProtoUpdateMessage.h"
-#include "solux/search/SearchEngine.h"
-#include "solux/api/build.h"
-#include "solux/api/padded_input.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/server/ProtoUpdateMessage.h"
+#include "luxir/search/SearchEngine.h"
+#include "luxir/api/build.h"
+#include "luxir/api/padded_input.h"
 #include "LocalReq.h"
 #include <memory_resource>
 
-#include "solux/util/thread.h"
+#include "luxir/util/thread.h"
 
-namespace solux::test {
+namespace luxir::test {
 
-namespace build = solux::api::build;
+namespace build = luxir::api::build;
 
 // Owning result of a blocking update. The wire response is NON-OWNING (backed by the
 // message's arena, which dies with the message), so the blocking done() EXTRACTS owning
 // copies of everything a test might read after the call returns.
 struct IndexResult {
-  using Status = solux::api::UpdateResponse_::Status;
+  using Status = luxir::api::UpdateResponse_::Status;
   struct Error {
     std::string id;
     std::string error_message;
@@ -39,7 +39,7 @@ struct IndexResult {
 class CollectionHelper {
 private:
   std::shared_ptr<Collection> collection_;
-  SoluxNode* node_;
+  LuxirNode* node_;
 
   // Extract owning copies of the (non-owning) response into the result; called from done(),
   // where the message (and its response arena) are still alive.
@@ -61,7 +61,7 @@ private:
 
   // Run a fully-built (arena-backed) concrete UpdateRequest synchronously. `request` and its
   // backing arena must outlive this call (they do: the caller holds them on the stack).
-  IndexResult runSync(const solux::api::UpdateRequest& request) {
+  IndexResult runSync(const luxir::api::UpdateRequest& request) {
     auto writer = collection().getShard()->getIndexWriter();
 
     class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
@@ -89,8 +89,8 @@ private:
 public:
   // Convert a Doc to a concrete (non-owning) Map, building all nested data into `mr` (which
   // must outlive any use of the resulting Map). The FieldVal arms map to Val variant arms.
-  static void convertDocToProto(const Doc& doc, solux::api::Map& map, std::pmr::memory_resource& mr) {
-    using namespace solux::api;
+  static void convertDocToProto(const Doc& doc, luxir::api::Map& map, std::pmr::memory_resource& mr) {
+    using namespace luxir::api;
     using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<Val>>;
     Pair* fields = build::allocArray(map.fields, doc.size(), mr);
     std::size_t fi = 0;
@@ -149,9 +149,9 @@ public:
   // submit(). All nested doc/id data is copied into the builder's arena.
   class UpdateBuilder {
     std::pmr::monotonic_buffer_resource mr_;
-    build::SpanBuilder<solux::api::Map> docs_{mr_};
+    build::SpanBuilder<luxir::api::Map> docs_{mr_};
     build::SpanBuilder<std::string_view> deleteIds_{mr_};
-    solux::api::UpdateRequest request_;
+    luxir::api::UpdateRequest request_;
 
   public:
     UpdateBuilder& add(const Doc& doc) {
@@ -197,7 +197,7 @@ public:
 
     // Seal the accumulated docs/ids into the request spans and return it (stable until this
     // builder is destroyed).
-    const solux::api::UpdateRequest& finish() {
+    const luxir::api::UpdateRequest& finish() {
       request_.docs = docs_.finish();
       request_.delete_ids = deleteIds_.finish();
       return request_;
@@ -205,9 +205,9 @@ public:
   };
 
   CollectionHelper(std::string_view name = "main")
-    : CollectionHelper(*SoluxTest::soluxNode, name) {}
+    : CollectionHelper(*LuxirTest::luxirNode, name) {}
 
-  CollectionHelper(SoluxNode& node, std::string_view name = "main")
+  CollectionHelper(LuxirNode& node, std::string_view name = "main")
     : node_(&node) {
     collection_ = node.getOrCreateCollection(name);
     getIndexWriter()->mergePolicy->setMergeFactor(node.getConfig().index.merge_factor);
@@ -307,7 +307,7 @@ public:
   void clear() {
     auto writer = collection().getShard()->getIndexWriter();
     writer->testDeleteAllData();
-    if (!SoluxTest::isDefaultSchema(collection().getSchema())) {
+    if (!LuxirTest::isDefaultSchema(collection().getSchema())) {
       collection().setSchema(Schema::createDefaultSchema());
     }
   }
@@ -384,4 +384,4 @@ inline std::vector<std::string> allIds(CollectionHelper& helper) {
   return ids;
 }
 
-} // namespace solux::test
+} // namespace luxir::test

@@ -5,17 +5,17 @@
 
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-namespace solux::test {
+namespace luxir::test {
 
 // DocList's flat columns+docs pair.  document_format=ROWS places every
 // returned field in per-document maps (DocList.docs; missing = key absent);
 // COLUMNS (the engine default) keeps dense columns.  Document i is always
 // the merge of the two, so both formats must decode to identical Docs
 // (convertResultsToDocs is the reference decode loop).
-class DocFormatTest : public SoluxTest {};
+class DocFormatTest : public LuxirTest {};
 
 namespace {
 
@@ -175,4 +175,4 @@ TEST_F(DocFormatTest, columnsFormatSetsRowCount) {
   EXPECT_EQ(2u, dl->columns.size());
 }
 
-} // namespace solux::test
+} // namespace luxir::test

@@ -3,16 +3,16 @@
 #include <atomic>
 #include <optional>
 #include <thread>
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/query/NumericRangeQuery.h"
-#include "solux/query/QueryBuilder.h"
-#include "solux/util/DateTime.h"
+#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/util/DateTime.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -43,7 +43,7 @@ void expectZoneRange(std::string_view text, const TimeZone& zone,
 
 } // namespace
 
-class DateFieldTest : public SoluxTest {
+class DateFieldTest : public LuxirTest {
 };
 
 // ---- parse: strict_date_optional_time || epoch_millis (Solr/OpenSearch) ----
@@ -251,7 +251,7 @@ TEST_F(DateFieldTest, mergeAcrossSegments) {
   helper.getIndexWriter()->mergeSegments();
   helper.commit();
 
-  auto lreq = localReq(soluxNode->getSearchEngine());
+  auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main").topDocs("q").allQuery().fields({"id_s", "when_dt"}).limit(10);
   lreq->execute();
   auto docs = lreq->getDocs();
@@ -260,7 +260,7 @@ TEST_F(DateFieldTest, mergeAcrossSegments) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "b", "when_dt", b)));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "c", "when_dt", c)));
 
-  auto s = localReq(soluxNode->getSearchEngine());
+  auto s = localReq(luxirNode->getSearchEngine());
   auto& scur = s->collection("main").topDocs("q").allQuery().fields({"id_s"}).limit(10);
   qb::sort(scur, "when_dt", qb::ASC);
   s->execute();
@@ -305,7 +305,7 @@ TEST_F(DateFieldTest, roundTrip) {
                        "stamps_dts", vec_i(a, b)),
                UpdateMessage::COMMIT);
 
-  auto lreq = localReq(soluxNode->getSearchEngine());
+  auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main").topDocs("q")
       .allQuery()
       .fields({"id_s", "when_dt", "stamps_dts"})
@@ -330,9 +330,9 @@ TEST_F(DateFieldTest, indexDateMathAndStableNowPerUpdate) {
     flatdoc("id", "now2", "when_dt", "now"),
   };
   auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
-  ASSERT_EQ(solux::api::UpdateResponse_::Status::OK, result.status);
+  ASSERT_EQ(luxir::api::UpdateResponse_::Status::OK, result.status);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q").allQuery().fields({"id", "when_dt"}).limit(10);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
@@ -366,7 +366,7 @@ TEST_F(DateFieldTest, sort) {
   helper.index(flatdoc("id_s", "c", "when_dt", "1969-06-01T00:00:00Z"), UpdateMessage::NO_COMMIT);  // pre-epoch
   helper.index(flatdoc("id_s", "d"), UpdateMessage::COMMIT);  // missing, sorts last asc
 
-  auto lreq = localReq(soluxNode->getSearchEngine());
+  auto lreq = localReq(luxirNode->getSearchEngine());
   auto& cur = lreq->collection("main").topDocs("q").allQuery().fields({"id_s"}).limit(10);
   qb::sort(cur, "when_dt", qb::ASC);
   lreq->execute();
@@ -396,11 +396,11 @@ TEST_F(DateFieldTest, multiStringPartialFailureNoCorruption) {
     flatdoc("id", "g2", "stamps_dts", std::vector<std::string>{"2003-03-03", "2004-04-04"}),
   };
   auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
-  ASSERT_EQ(solux::api::UpdateResponse_::Status::PARTIAL, result.status);
+  ASSERT_EQ(luxir::api::UpdateResponse_::Status::PARTIAL, result.status);
   ASSERT_EQ(1, result.errors.size());
   EXPECT_EQ("b1", result.errors[0].id);
 
-  auto lreq = localReq(soluxNode->getSearchEngine());
+  auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main").topDocs("q").allQuery().fields({"id", "stamps_dts"}).limit(10);
   lreq->execute();
   auto retrieved = lreq->getDocs();
@@ -559,7 +559,7 @@ TEST_F(DateFieldTest, denverSpringGapGranuleWarnings) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "gap", "when_dt", "2024-03-10T09:30:00Z"),
                UpdateMessage::COMMIT);
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").timeZone("America/Denver").topDocs("q")
       .matchQuery("when_dt", "2024-03-10T02:30").withStats();
   req->execute();
@@ -681,7 +681,7 @@ TEST_F(DateFieldTest, requestZoneThreadsAllQueryDialectsAndBounds) {
   helper.index(flatdoc("id", "c", "when_dt", "2024-03-10T09:31:00Z"),
                UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").timeZone("America/Denver");
   auto& structured = req->topDocs("structured");
   structured.rawQuery() = qb::range(
@@ -703,13 +703,13 @@ TEST_F(DateFieldTest, ingestRemainsUtcUnderZonedQueries) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "utc", "when_dt", "2024-01-15"), UpdateMessage::COMMIT);
 
-  auto utc = localReq(soluxNode->getSearchEngine());
+  auto utc = localReq(luxirNode->getSearchEngine());
   utc->collection("main").topDocs("q").matchQuery("when_dt", "2024-01-15").withStats();
   utc->execute();
   ASSERT_TRUE(utc->ok()) << utc->errorMsg();
   EXPECT_EQ(1, utc->getMatchCount());
 
-  auto denver = localReq(soluxNode->getSearchEngine());
+  auto denver = localReq(luxirNode->getSearchEngine());
   denver->collection("main").timeZone("America/Denver").topDocs("q")
       .matchQuery("when_dt", "2024-01-15").withStats();
   denver->execute();
@@ -722,7 +722,7 @@ TEST_F(DateFieldTest, skippedQueryGranuleWarnsAndInvalidZoneIsEager) {
   helper.index(flatdoc("id", "apia", "when_dt", "2011-12-30T10:00:00Z"),
                UpdateMessage::COMMIT);  // 2011-12-31 local after the dateline jump
 
-  auto skipped = localReq(soluxNode->getSearchEngine());
+  auto skipped = localReq(luxirNode->getSearchEngine());
   skipped->collection("main").timeZone("Pacific/Apia").topDocs("q")
       .matchQuery("when_dt", "2011-12-30").withStats();
   skipped->execute();
@@ -735,7 +735,7 @@ TEST_F(DateFieldTest, skippedQueryGranuleWarnsAndInvalidZoneIsEager) {
   EXPECT_NE(skipped->respWarnings()[0].message.find("2011-12-30"), std::string_view::npos);
   EXPECT_NE(skipped->respWarnings()[0].message.find("Pacific/Apia"), std::string_view::npos);
 
-  auto invalid = localReq(soluxNode->getSearchEngine());
+  auto invalid = localReq(luxirNode->getSearchEngine());
   invalid->collection("main").timeZone("No/Such_Zone").topDocs("q").allQuery();
   invalid->execute();
   EXPECT_FALSE(invalid->ok());
@@ -751,7 +751,7 @@ TEST_F(DateFieldTest, queryGranularity) {
   helper.index(flatdoc("id", "d3", "when_dt", "2024-06-26T00:00:00Z"), UpdateMessage::COMMIT);
 
   auto count = [&](std::function<void(OpCursor&)> setQuery) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     setQuery(cur);
     cur.withStats();
@@ -774,14 +774,14 @@ TEST_F(DateFieldTest, queryGranularity) {
   // range endpoints include the granule they name; exclusive excludes it whole
   auto range = [&](const char* gteV, const char* ltV, bool loIncl, bool hiIncl) {
     return count([&](OpCursor& c) {
-      auto& r = c.rawQuery().kind.emplace<solux::api::RangeQuery>();
+      auto& r = c.rawQuery().kind.emplace<luxir::api::RangeQuery>();
       auto& mr = c.mr();
       r.field = build::arenaStr(mr, "when_dt");
-      auto* loVal = (solux::api::Val*)mr.allocate(sizeof(solux::api::Val), alignof(solux::api::Val));
-      new (loVal) solux::api::Val();
+      auto* loVal = (luxir::api::Val*)mr.allocate(sizeof(luxir::api::Val), alignof(luxir::api::Val));
+      new (loVal) luxir::api::Val();
       loVal->kind = build::arenaStr(mr, gteV);
-      auto* hiVal = (solux::api::Val*)mr.allocate(sizeof(solux::api::Val), alignof(solux::api::Val));
-      new (hiVal) solux::api::Val();
+      auto* hiVal = (luxir::api::Val*)mr.allocate(sizeof(luxir::api::Val), alignof(luxir::api::Val));
+      new (hiVal) luxir::api::Val();
       hiVal->kind = build::arenaStr(mr, ltV);
       if (loIncl) r.gte = loVal; else r.gt = loVal;
       if (hiIncl) r.lte = hiVal; else r.lt = hiVal;
@@ -804,12 +804,12 @@ TEST_F(DateFieldTest, badDateMarksDocFailed) {
   };
   auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
 
-  ASSERT_EQ(solux::api::UpdateResponse_::Status::PARTIAL, result.status);
+  ASSERT_EQ(luxir::api::UpdateResponse_::Status::PARTIAL, result.status);
   ASSERT_EQ(1, result.errors.size());
   EXPECT_EQ("b1", result.errors[0].id);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("when_dt"));
 
-  auto lreq = localReq(soluxNode->getSearchEngine());
+  auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main").topDocs("q").allQuery().fields({"id"}).limit(10);
   lreq->execute();
   std::vector<std::string> ids;

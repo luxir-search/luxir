@@ -14,7 +14,7 @@
 
 #include "TestUtils.h"
 
-namespace solux::test {
+namespace luxir::test {
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -63,7 +63,7 @@ public:
   HttpReq& fields(std::initializer_list<std::string> fs) { fields_.assign(fs); return *this; }
   HttpReq& withStats() { count_ = true; scores_ = true; return *this; }
 
-  // The Solux JSON dialect for SearchRequest: one op "q" holding a top_docs with a
+  // The Luxir JSON dialect for SearchRequest: one op "q" holding a top_docs with a
   // match query in sugar form ({"<field>": <value>}).
   std::string buildJson() const {
     std::string j = R"({"ops":{"q":{"top_docs":{"query":{"match":{)";
@@ -208,4 +208,4 @@ private:
   }
 };
 
-} // namespace solux::test
+} // namespace luxir::test

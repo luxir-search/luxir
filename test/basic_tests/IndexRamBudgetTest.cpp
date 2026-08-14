@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "solux/index/IndexRamBudget.h"
+#include "luxir/index/IndexRamBudget.h"
 
-using namespace solux;
+using namespace luxir;
 
 TEST(IndexRamBudgetTest, UnlimitedBudgetAlwaysAcquires) {
   IndexRamBudget budget;

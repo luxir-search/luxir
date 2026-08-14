@@ -4,12 +4,12 @@
 #include <array>
 #include <map>
 #include <string>
-#include "SoluxTest.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/query/Query.h"
-#include "solux/util/Overloaded.h"
+#include "LuxirTest.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/query/Query.h"
+#include "luxir/util/Overloaded.h"
 
-namespace solux::test {
+namespace luxir::test {
 
 inline Query::ScorerPlan* resolveScorerPlanForTests(
     MemPool& pool, Query::ScorerSupplier& supplier, int64_t candidates,
@@ -105,7 +105,7 @@ Doc flatdoc(T1 arg1, T2 arg2, Args... args) {
 };
 
 
-using solux::overloaded;  // the shared std::visit visitor (solux/util/Overloaded.h)
+using luxir::overloaded;  // the shared std::visit visitor (luxir/util/Overloaded.h)
 
 // Utility function to compare Doc objects for testing
 inline bool docEquals(const Doc& doc1, const Doc& doc2) {
@@ -241,11 +241,11 @@ inline std::string docsToString(const std::vector<Doc>& docs) {
   return result;
 }
 
-} // solux::test
+} // luxir::test
 
 // Expect that `docs` contains a doc matching `doc`; on failure prints the expected doc and
 // the full actual doc list via docToString().
 #define EXPECT_CONTAINS_DOC(docs, doc)                                                      \
-  EXPECT_TRUE(::solux::test::containsDoc((docs), (doc)))                                    \
-      << "expected doc: " << ::solux::test::docToString(doc) << "\nactual docs:\n"          \
-      << ::solux::test::docsToString(docs)
+  EXPECT_TRUE(::luxir::test::containsDoc((docs), (doc)))                                    \
+      << "expected doc: " << ::luxir::test::docToString(doc) << "\nactual docs:\n"          \
+      << ::luxir::test::docsToString(docs)

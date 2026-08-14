@@ -1,16 +1,16 @@
 #include <set>
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/PosEnum.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/PosEnum.h"
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include<boost/container/static_vector.hpp>
 
-#include "solux/index/IntColWriter.h"
+#include "luxir/index/IntColWriter.h"
 
-namespace solux {
+namespace luxir {
 
-class PostingsTest : public SoluxTest {
+class PostingsTest : public LuxirTest {
 protected:
   RAMDir dir;
   MemPool pool;
@@ -470,7 +470,7 @@ TEST_F(PostingsTest, levelLadder) {
 // SIMDCompressionAndIntersection codec. The StreamVByte AVX tail must stay within
 // SVB_OVERREAD_PAD.
 TEST_F(PostingsTest, codecFileOverreadBounds) {
-  // SoluxSIMDFor numeric column codec: claim exact (decode from a 0-slack buffer).
+  // LuxirSIMDFor numeric column codec: claim exact (decode from a 0-slack buffer).
   for (uint8_t bits : {(uint8_t)1, (uint8_t)7, (uint8_t)17, (uint8_t)31, (uint8_t)32}) {
     uint32_t mask = bits == 32 ? ~0u : ((1u << bits) - 1);
     for (uint32_t n : {1u, 5u, 31u, 100u, 128u, 200u, 333u}) {
@@ -488,12 +488,12 @@ TEST_F(PostingsTest, codecFileOverreadBounds) {
     }
   }
 
-  // SoluxPFORd docs + SoluxPFOR positions codecs: full-block decodeBlock, claim exact.
+  // LuxirPFORd docs + LuxirPFOR positions codecs: full-block decodeBlock, claim exact.
   auto checkBlockCodec = [&](U32Codec& codec, uint32_t blockSize, const char* name) {
     std::vector<uint32_t> vals(blockSize);
     uint32_t d = 0;
     for (auto& v : vals) { d += rng.rint(1, 1000); v = d; }  // monotonic (delta-coded)
-    std::vector<uint32_t> expected = vals;  // SoluxPFORd delta-codes its input in place
+    std::vector<uint32_t> expected = vals;  // LuxirPFORd delta-codes its input in place
     std::vector<char> work(blockSize * sizeof(uint32_t) + 1024);
     uint32_t encSz = work.size();
     codec.encodeBlock(vals.data(), blockSize, work.data(), encSz);

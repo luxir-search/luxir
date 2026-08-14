@@ -5,19 +5,19 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -140,7 +140,7 @@ int64_t runPullCount(CollectionHelper& helper, const Shape& shape,
   return collector.totalHits();
 }
 
-class DenseScoredAdmissionTest : public SoluxTest {
+class DenseScoredAdmissionTest : public LuxirTest {
 public:
   static constexpr Shape shallowInside{
       "shallowinsidelead", "shallowinsideother", 100, 10};
@@ -158,7 +158,7 @@ public:
   CollectionHelper helper;
 
   void SetUp() override {
-    SoluxTest::SetUp();
+    LuxirTest::SetUp();
     constexpr std::array shapes = {
         shallowInside, shallowOutside, deepInside,
         deepOutside, highSurvivors, belowLeadFloor};

@@ -5,21 +5,21 @@
 #include <string>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
-#include "solux/query/TermRangeQuery.h"
-#include "solux/query/QueryBuilder.h"
-#include "solux/schema/Schema.h"
+#include "luxir/query/TermRangeQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/schema/Schema.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Drive TermRangeQuery::Weight::createScorer directly to assert per-segment
 // doc ids (the PrefixQueryTest shape; the two queries share the multi-term
 // machinery and differ only in endpoint specification).
-class TermRangeQueryTest : public SoluxTest {
+class TermRangeQueryTest : public LuxirTest {
 protected:
   std::vector<int32_t> rangeDocs(TestIndex& ti, std::string_view field,
                                  std::optional<std::string_view> lower, bool includeLower,
@@ -91,7 +91,7 @@ TEST_F(TermRangeQueryTest, multiSegment) {
 
 // End-to-end through the range arm: the builder picks term ranges for
 // term-backed fields and numeric ranges for columns from the same wire shape.
-class TermRangeE2ETest : public SoluxTest {
+class TermRangeE2ETest : public LuxirTest {
 public:
   CollectionHelper helper;
 
@@ -109,11 +109,11 @@ public:
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     auto& mr = cur.mr();
-    auto& r = cur.rawQuery().kind.emplace<solux::api::RangeQuery>();
+    auto& r = cur.rawQuery().kind.emplace<luxir::api::RangeQuery>();
     r.field = build::arenaStr(mr, field);
     auto mkVal = [&](const char* text) {
-      auto* v = (solux::api::Val*)mr.allocate(sizeof(solux::api::Val), alignof(solux::api::Val));
-      new (v) solux::api::Val();
+      auto* v = (luxir::api::Val*)mr.allocate(sizeof(luxir::api::Val), alignof(luxir::api::Val));
+      new (v) luxir::api::Val();
       v->kind = build::arenaStr(mr, text);
       return v;
     };
@@ -155,13 +155,13 @@ TEST_F(TermRangeE2ETest, constantScoring) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   auto& mr = cur.mr();
-  auto& r = cur.rawQuery().kind.emplace<solux::api::RangeQuery>();
+  auto& r = cur.rawQuery().kind.emplace<luxir::api::RangeQuery>();
   r.field = build::arenaStr(mr, "tag_s");
   cur.withStats().fields({"id"}).limit(100);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   const auto& docs = *req->docList("q");
-  const auto& scores = std::get<solux::api::ColFloat>(docs.columns.at("_score_").kind).v;
+  const auto& scores = std::get<luxir::api::ColFloat>(docs.columns.at("_score_").kind).v;
   ASSERT_EQ(3u, scores.size());
   for (float s : scores) {
     EXPECT_FLOAT_EQ(scores[0], s);  // every match scores the same

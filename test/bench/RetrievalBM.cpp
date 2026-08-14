@@ -2,14 +2,14 @@
 #include <string>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/server/JsonResponse.h"
-#include "solux/util/random.h"
+#include "bench/luxir_bench.h"
+#include "luxir/server/JsonResponse.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Field-retrieval micro-benchmarks over the shared bench index:
 //
@@ -32,7 +32,7 @@ static const std::vector<std::string> FIELDS_MIXED = {"id", "u10k_i", "short_u10
 
 // Build or reuse the standard bench index; returns whether it was reused.
 static bool setupIndex(CollectionHelper& helper, int64_t& nDocs) {
-  nDocs = solux::unit_tests ? SoluxTest::scaleTestWork(200) : benchDocs;
+  nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(200) : benchDocs;
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
   bool reuse = helper.indexMatchesShape(docsPerSeg);
@@ -44,19 +44,19 @@ static bool setupIndex(CollectionHelper& helper, int64_t& nDocs) {
 // (~1k), so collection stays cheap relative to loading; the tiny unit-test
 // corpus needs the lower-cardinality field to match anything at all.
 static const char* pageQueryField() {
-  return solux::unit_tests ? "short_u10_s" : "short_u10k_s";
+  return luxir::unit_tests ? "short_u10_s" : "short_u10k_s";
 }
 
 // Order-sensitive value hash over both carriers of a DocList (columns and
 // docs), for the per-iteration determinism assert.
-static int64_t fingerprintDocList(const solux::api::DocList& dl) {
+static int64_t fingerprintDocList(const luxir::api::DocList& dl) {
   int64_t h = dl.row_count;
   for (const auto& [name, col] : dl.columns) {
     h = h * 31 + java_string_hashcode(name);
-    if (const auto* c = std::get_if<solux::api::ColStr>(&col.kind)) {
+    if (const auto* c = std::get_if<luxir::api::ColStr>(&col.kind)) {
       for (size_t i = 0; i < c->v.size(); i++)
         if (c->v[i] != c->missing_val) h = h * 31 + java_string_hashcode(c->v[i]);
-    } else if (const auto* c = std::get_if<solux::api::ColInt>(&col.kind)) {
+    } else if (const auto* c = std::get_if<luxir::api::ColInt>(&col.kind)) {
       for (size_t i = 0; i < c->v.size(); i++)
         if (c->v[i] != c->missing_val) h = h * 31 + c->v[i];
     }
@@ -75,14 +75,14 @@ static int64_t fingerprintDocList(const solux::api::DocList& dl) {
 }
 
 static void BM_FieldLoad(benchmark::State& state, const std::vector<std::string>& fields,
-                         solux::api::DocFormat format) {
+                         luxir::api::DocFormat format) {
   CollectionHelper helper;
   int64_t nDocs = 0;
   bool reuseIndex = setupIndex(helper, nDocs);
 
   int64_t fp = -1;
   for (auto _ : state) {
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("q")
         .matchQuery(pageQueryField(), "0")
@@ -120,7 +120,7 @@ static const std::vector<std::string> FIELDS_ID = {"id"};
 // Render an already-built response repeatedly; the request handle stays in
 // the caller's scope so the response arena outlives the loop.
 // bytes_per_second reports render throughput.
-static void renderLoop(benchmark::State& state, const solux::api::SearchResponse& proto) {
+static void renderLoop(benchmark::State& state, const luxir::api::SearchResponse& proto) {
   int64_t fp = -1;
   for (auto _ : state) {
     std::string line = renderSearchResponseLine(proto);
@@ -137,7 +137,7 @@ static void renderLoop(benchmark::State& state, const solux::api::SearchResponse
 }
 
 static void BM_JsonRender(benchmark::State& state, const std::vector<std::string>& fields,
-                          solux::api::DocFormat format) {
+                          luxir::api::DocFormat format) {
   CollectionHelper helper("jsonbm");
   helper.clear();  // idempotent across variants and repeated --bench runs
   std::vector<Doc> corpus;
@@ -153,7 +153,7 @@ static void BM_JsonRender(benchmark::State& state, const std::vector<std::string
   }
   helper.indexAll(corpus, UpdateMessage::COMMIT);
 
-  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+  auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
   req->collection("jsonbm");
   req->topDocs("q")
       .allQuery()
@@ -190,8 +190,8 @@ static std::string makeBody(SplitMix64& r, size_t targetBytes) {
   return s;
 }
 
-static void BM_JsonRenderBody(benchmark::State& state, solux::api::DocFormat format) {
-  size_t bodyBytes = solux::unit_tests ? 32 * 1024 : 1024 * 1024;
+static void BM_JsonRenderBody(benchmark::State& state, luxir::api::DocFormat format) {
+  size_t bodyBytes = luxir::unit_tests ? 32 * 1024 : 1024 * 1024;
   CollectionHelper helper("jsonbm_body");
   helper.clear();
   std::vector<Doc> corpus;
@@ -202,7 +202,7 @@ static void BM_JsonRenderBody(benchmark::State& state, solux::api::DocFormat for
   }
   helper.indexAll(corpus, UpdateMessage::COMMIT);
 
-  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+  auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
   req->collection("jsonbm_body");
   req->topDocs("q")
       .allQuery()
@@ -215,20 +215,20 @@ static void BM_JsonRenderBody(benchmark::State& state, solux::api::DocFormat for
   renderLoop(state, req->responses[0]->proto);
 }
 
-static constexpr auto ROWS = solux::api::DocFormat::ROWS;
-static constexpr auto COLS = solux::api::DocFormat::COLUMNS;
+static constexpr auto ROWS = luxir::api::DocFormat::ROWS;
+static constexpr auto COLS = luxir::api::DocFormat::COLUMNS;
 
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, none, FIELDS_NONE, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, int_cols, FIELDS_INT, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, int_rows, FIELDS_INT, ROWS);
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, str_cols, FIELDS_STR, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, str_rows, FIELDS_STR, ROWS);
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_cols, FIELDS_MIXED, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_rows, FIELDS_MIXED, ROWS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, none, FIELDS_NONE, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, int_cols, FIELDS_INT, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, int_rows, FIELDS_INT, ROWS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, str_cols, FIELDS_STR, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, str_rows, FIELDS_STR, ROWS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_cols, FIELDS_MIXED, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_rows, FIELDS_MIXED, ROWS);
 
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_cols, FIELDS_MIXED7, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_rows, FIELDS_MIXED7, ROWS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, ids_cols, FIELDS_ID, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, ids_rows, FIELDS_ID, ROWS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRenderBody, body_cols, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRenderBody, body_rows, ROWS);
+LUXIR_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_cols, FIELDS_MIXED7, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_rows, FIELDS_MIXED7, ROWS);
+LUXIR_BENCHMARK_CAPTURE(BM_JsonRender, ids_cols, FIELDS_ID, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_JsonRender, ids_rows, FIELDS_ID, ROWS);
+LUXIR_BENCHMARK_CAPTURE(BM_JsonRenderBody, body_cols, COLS);
+LUXIR_BENCHMARK_CAPTURE(BM_JsonRenderBody, body_rows, ROWS);

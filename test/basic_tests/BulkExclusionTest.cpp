@@ -6,16 +6,16 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/SkipStats.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -186,7 +186,7 @@ void addSegment(CollectionHelper& helper, std::string_view prefix,
 
 }  // namespace
 
-class BulkExclusionTest : public SoluxTest {
+class BulkExclusionTest : public LuxirTest {
 public:
   CollectionHelper helper;
 };

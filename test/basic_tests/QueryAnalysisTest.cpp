@@ -6,24 +6,24 @@
 #include <string>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/QueryBuilder.h"
-#include "solux/query/TermQuery.h"
-#include "solux/util/StrRef.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/util/StrRef.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Exercises query-time analysis for phrase queries (QueryBuilder), reached
 // through the protobuf parser. The index side and the query side must run the
 // same analyzer for an analyzed field, so an uppercase query has to match a
 // case-folded index. body_un is unicode_word + nfkc_cf (case folding); body_w
 // is whitespace, case- and accent-sensitive (no analysis changes the bytes).
-class QueryAnalysisTest : public SoluxTest {
+class QueryAnalysisTest : public LuxirTest {
 public:
   CollectionHelper helper;
 
@@ -59,7 +59,7 @@ public:
   int64_t matchMinMatchCount(std::string_view field, std::string_view value, int minMatch) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q").matchQuery(field, value);
-    std::get<solux::api::Match>(cur.rawQuery().kind).min_match = minMatch;
+    std::get<luxir::api::Match>(cur.rawQuery().kind).min_match = minMatch;
     cur.withStats();
     req->execute();
     return req->getMatchCount();
@@ -113,7 +113,7 @@ TEST_F(QueryAnalysisTest, wordListWithPositionsAdjustsForExpansion) {
   // the shift, "here" would collide with "anderson" and never match.
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  auto& ph = cur.rawQuery().kind.emplace<luxir::api::PhraseQuery>();
   ph.field = "body_un";
   auto& mr = cur.mr();
   std::string_view* w = build::allocArray(ph.words, 2, mr);
@@ -147,7 +147,7 @@ TEST_F(QueryAnalysisTest, preAnalyzedTermsBinUsedVerbatim) {
   // terms_bin is the binary equivalent of terms: already analyzed, verbatim.
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  auto& ph = cur.rawQuery().kind.emplace<luxir::api::PhraseQuery>();
   ph.field = "body_un";
   auto& mr = cur.mr();
   auto* tb = build::allocArray(ph.terms_bin, 2, mr);
@@ -162,7 +162,7 @@ TEST_F(QueryAnalysisTest, multiplePhraseInputsRejected) {
   // Only one of text / words / terms / terms_bin may be set.
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  auto& ph = cur.rawQuery().kind.emplace<luxir::api::PhraseQuery>();
   ph.field = "body_un";
   ph.text = "Thomas Anderson";
   auto& mr = cur.mr();
@@ -178,7 +178,7 @@ TEST_F(QueryAnalysisTest, positionsWithoutTermsRejected) {
   // positions with no phrase input is a malformed request.
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  auto& ph = cur.rawQuery().kind.emplace<luxir::api::PhraseQuery>();
   ph.field = "body_un";
   auto& mr = cur.mr();
   std::int32_t* pos = build::allocArray(ph.positions, 2, mr);
@@ -376,7 +376,7 @@ TEST_F(QueryAnalysisTest, matchAndRequiresAllTerms) {
   // Same terms with operator AND: only d1 contains both thomas and here.
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("body_un", "Thomas here",
-                                     solux::api::Match_::Operator::AND).withStats();
+                                     luxir::api::Match_::Operator::AND).withStats();
   req->execute();
   EXPECT_EQ(1, req->getMatchCount());
 }
@@ -467,12 +467,12 @@ TEST_F(QueryAnalysisTest, matchMinShouldMatchScoreIncludesAllMatches) {
   auto score = [&](int minMatch) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q").matchQuery("body_un", "alpha beta gamma");
-    if (minMatch > 0) std::get<solux::api::Match>(cur.rawQuery().kind).min_match = minMatch;
+    if (minMatch > 0) std::get<luxir::api::Match>(cur.rawQuery().kind).min_match = minMatch;
     cur.withStats();
     req->execute();
     EXPECT_EQ(1, req->getMatchCount());
     const auto* dl = req->docList("q");
-    const auto& scores = std::get<solux::api::ColFloat>(dl->columns.at("_score_").kind).v;
+    const auto& scores = std::get<luxir::api::ColFloat>(dl->columns.at("_score_").kind).v;
     float s = scores[0];
     return s;
   };

@@ -1,15 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
-project(Solux VERSION 0.1)
+project(Luxir VERSION 0.1)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-option(SOLUX_PROBE_CONSTANT_HOOKS
+option(LUXIR_PROBE_CONSTANT_HOOKS
        "Compile probe-constant same-binary measurement hooks" ON)
-option(SOLUX_FULL_INLINE_DECODED_SUCCESSOR
+option(LUXIR_FULL_INLINE_DECODED_SUCCESSOR
        "Inline the complete decoded-successor SIMD scan" OFF)
-option(SOLUX_DECODED_SUCCESSOR_HISTOGRAM
+option(LUXIR_DECODED_SUCCESSOR_HISTOGRAM
        "Count decoded-successor vector strides" OFF)
-option(SOLUX_PROBE_WRAPPER_TRIMS
+option(LUXIR_PROBE_WRAPPER_TRIMS
        "Enable scored-probe wrapper bookkeeping trims" OFF)
 # C++26 "erroneous behavior" makes gcc zero-fill automatic storage by default,
 # which taxes hot stack scratch buffers (measured ~35-40% on phrase queries).
@@ -25,11 +25,11 @@ option(SOLUX_PROBE_WRAPPER_TRIMS
 # the launcher rather than relying on each developer's global ccache config.
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
-  set(_SOLUX_CCACHE_LAUNCHER
+  set(_LUXIR_CCACHE_LAUNCHER
       "${CCACHE_PROGRAM};sloppiness=pch_defines,time_macros")
   set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
-  set(CMAKE_CXX_COMPILER_LAUNCHER "${_SOLUX_CCACHE_LAUNCHER}")
-  message(STATUS "Solux: ccache enabled (${CCACHE_PROGRAM})")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${_LUXIR_CCACHE_LAUNCHER}")
+  message(STATUS "Luxir: ccache enabled (${CCACHE_PROGRAM})")
 endif()
 
 # Fast linker: prefer mold, then lld, then gold. Each candidate is verified with
@@ -37,21 +37,21 @@ endif()
 # 2.40 chokes on GCC 16's libatomic_asneeded.so AS_NEEDED script) is rejected
 # automatically and we fall back to the next option, ending at the system
 # default. NOTE: results are cached; after installing a new linker, reconfigure
-# from a clean cache (or unset the SOLUX_LD_WORKS_* cache vars) to re-detect.
+# from a clean cache (or unset the LUXIR_LD_WORKS_* cache vars) to re-detect.
 include(CheckLinkerFlag)
-set(SOLUX_LINKER "")
+set(LUXIR_LINKER "")
 foreach(_cand mold lld gold)
-  check_linker_flag(CXX "-fuse-ld=${_cand}" SOLUX_LD_WORKS_${_cand})
-  if(SOLUX_LD_WORKS_${_cand})
+  check_linker_flag(CXX "-fuse-ld=${_cand}" LUXIR_LD_WORKS_${_cand})
+  if(LUXIR_LD_WORKS_${_cand})
     add_link_options("-fuse-ld=${_cand}")
-    set(SOLUX_LINKER "${_cand}")
+    set(LUXIR_LINKER "${_cand}")
     break()
   endif()
 endforeach()
-if(SOLUX_LINKER)
-  message(STATUS "Solux: using '${SOLUX_LINKER}' linker")
+if(LUXIR_LINKER)
+  message(STATUS "Luxir: using '${LUXIR_LINKER}' linker")
 else()
-  message(STATUS "Solux: using default system linker (no faster linker usable)")
+  message(STATUS "Luxir: using default system linker (no faster linker usable)")
 endif()
 
 # This keeps dlls and executables together, which makes windows happy.
@@ -71,7 +71,7 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(lz4 CONFIG REQUIRED)
 # JSON (both the proto-JSON dialect and the HTTP envelope) is glaze, which comes in
-# via solux_proto_concrete. Boost.Beast/Asio (the HTTP transport) are header-only and
+# via luxir_proto_concrete. Boost.Beast/Asio (the HTTP transport) are header-only and
 # come with the Boost include dir found above.
 # FAISS for vector ANN aux indexes (gcc vcpkg presets only).
 # FAISS exports OpenMP::OpenMP_CXX in its imported-target interface, so we must
@@ -79,7 +79,7 @@ find_package(lz4 CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(faiss CONFIG REQUIRED)
 # protobuf (DescriptorPool + google::protobuf::Arena) and gRPC are linked directly into
-# solux_lib now that myproto is gone; they used to arrive transitively via myproto.
+# luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 
@@ -99,7 +99,7 @@ set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # FastPFOR (vendored under deps/FastPFOR, v0.5.0): SIMD bit-packing kernels with
 # native ARM NEON support (headers/fastpfor_neon.h). We compile the bit-packing
 # sources the codecs use, plus streamvbyte.c for the experimental postings-tail
-# SIMD varint path. We skip varintdecode.c and codecfactory.cpp because Solux
+# SIMD varint path. We skip varintdecode.c and codecfactory.cpp because Luxir
 # does not reference them.
 add_library(fastpfor STATIC
   deps/FastPFOR/src/bitpacking.cpp
@@ -164,140 +164,140 @@ endif()
 # This caps CONCURRENT COMPILES via a Ninja pool sized from THIS machine's physical cores
 # and RAM, never above 16 (hyperthreads add no compile throughput past real cores). It is a
 # cap, not a forced -j: a smaller -j still wins, and it adapts DOWN automatically on a
-# smaller laptop. Override explicitly with -DSOLUX_COMPILE_JOBS=N. Tune _ram_jobs divisor
+# smaller laptop. Override explicitly with -DLUXIR_COMPILE_JOBS=N. Tune _ram_jobs divisor
 # (GB/job) down once the serializer is moved out-of-line and per-TU memory drops.
 # Measured peak RSS of the heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at
 # -Og with ASan. The divisor covers the plain -Og case; an ASan build on a RAM-bound box
-# wants an explicit -DSOLUX_COMPILE_JOBS. Only the RAM arm moves - on a box with more
+# wants an explicit -DLUXIR_COMPILE_JOBS. Only the RAM arm moves - on a box with more
 # than ~3G per physical core the core count still binds.
-if(NOT DEFINED SOLUX_COMPILE_JOBS)
+if(NOT DEFINED LUXIR_COMPILE_JOBS)
   cmake_host_system_information(RESULT _ncores QUERY NUMBER_OF_PHYSICAL_CORES)
   cmake_host_system_information(RESULT _rammb  QUERY TOTAL_PHYSICAL_MEMORY)
   math(EXPR _ram_jobs "${_rammb} / 3000")   # ~3.0G per concurrent heavy compile (measured -Og peak)
-  set(SOLUX_COMPILE_JOBS ${_ncores})
-  if(_ram_jobs LESS SOLUX_COMPILE_JOBS)
-    set(SOLUX_COMPILE_JOBS ${_ram_jobs})
+  set(LUXIR_COMPILE_JOBS ${_ncores})
+  if(_ram_jobs LESS LUXIR_COMPILE_JOBS)
+    set(LUXIR_COMPILE_JOBS ${_ram_jobs})
   endif()
-  if(SOLUX_COMPILE_JOBS GREATER 16)
-    set(SOLUX_COMPILE_JOBS 16)
+  if(LUXIR_COMPILE_JOBS GREATER 16)
+    set(LUXIR_COMPILE_JOBS 16)
   endif()
-  if(SOLUX_COMPILE_JOBS LESS 1)
-    set(SOLUX_COMPILE_JOBS 1)
+  if(LUXIR_COMPILE_JOBS LESS 1)
+    set(LUXIR_COMPILE_JOBS 1)
   endif()
 endif()
-message(STATUS "Solux compile-job cap: ${SOLUX_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
-set_property(GLOBAL PROPERTY JOB_POOLS solux_compile=${SOLUX_COMPILE_JOBS})
-set(CMAKE_JOB_POOL_COMPILE solux_compile)
+message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
+set_property(GLOBAL PROPERTY JOB_POOLS luxir_compile=${LUXIR_COMPILE_JOBS})
+set(CMAKE_JOB_POOL_COMPILE luxir_compile)
 
 # Include protobuf/grpc generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
 # CONFIGURE_DEPENDS: re-glob on build so a newly added src .cpp is picked up without a manual
-# reconfigure. Without it a new file is silently missing from solux_lib in every build dir that
+# reconfigure. Without it a new file is silently missing from luxir_lib in every build dir that
 # has not been reconfigured, and only surfaces as an undefined symbol at link time - which is
 # easy to miss when the preset you are iterating in happens to have been reconfigured already.
 # (test/CMakeLists.txt has had this for the same reason.)
 file(GLOB_RECURSE Proj_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
-add_library(solux_lib STATIC ${Proj_SOURCES})
-target_compile_definitions(solux_lib PUBLIC
+add_library(luxir_lib STATIC ${Proj_SOURCES})
+target_compile_definitions(luxir_lib PUBLIC
   # GCC -Og cannot honor xxHash's always_inline AVX-512 accumulator through
   # its function-pointer dispatch. Keep header inlining in optimized builds,
   # but use the linked implementation in Debug.
-  SOLUX_XXHASH_INLINE=$<NOT:$<CONFIG:Debug>>
-  SOLUX_PROBE_CONSTANT_HOOKS=$<BOOL:${SOLUX_PROBE_CONSTANT_HOOKS}>
-  SOLUX_FULL_INLINE_DECODED_SUCCESSOR=$<BOOL:${SOLUX_FULL_INLINE_DECODED_SUCCESSOR}>
-  SOLUX_DECODED_SUCCESSOR_HISTOGRAM=$<BOOL:${SOLUX_DECODED_SUCCESSOR_HISTOGRAM}>
-  SOLUX_PROBE_WRAPPER_TRIMS=$<BOOL:${SOLUX_PROBE_WRAPPER_TRIMS}>)
+  LUXIR_XXHASH_INLINE=$<NOT:$<CONFIG:Debug>>
+  LUXIR_PROBE_CONSTANT_HOOKS=$<BOOL:${LUXIR_PROBE_CONSTANT_HOOKS}>
+  LUXIR_FULL_INLINE_DECODED_SUCCESSOR=$<BOOL:${LUXIR_FULL_INLINE_DECODED_SUCCESSOR}>
+  LUXIR_DECODED_SUCCESSOR_HISTOGRAM=$<BOOL:${LUXIR_DECODED_SUCCESSOR_HISTOGRAM}>
+  LUXIR_PROBE_WRAPPER_TRIMS=$<BOOL:${LUXIR_PROBE_WRAPPER_TRIMS}>)
 
-add_executable(solux src/solux/main.cpp)
-target_link_libraries(solux solux_lib)
+add_executable(luxir src/luxir/main.cpp)
+target_link_libraries(luxir luxir_lib)
 
 # Precompiled headers
 # Heavy, rarely-changing external/generated headers shared across translation
 # units. Project headers are intentionally excluded so editing them does not
 # invalidate the PCH; the one exception is util/log.h, which is stable and is
 # the only correct way to pull in spdlog (it sets SPDLOG_ACTIVE_LEVEL first).
-# SOLUX_PCH_COMMON is consumed by the test target too, so it is set before
+# LUXIR_PCH_COMMON is consumed by the test target too, so it is set before
 # add_subdirectory(test) and limited to headers on every target's include path.
-set(SOLUX_PCH_COMMON
+set(LUXIR_PCH_COMMON
   <vector> <string> <string_view> <memory> <algorithm> <span>
   <optional> <unordered_map> <cstdint> <charconv>
   <boost/unordered/unordered_flat_map.hpp>
   # NOTE: the proto message header is intentionally NOT in the PCH during the
-  # solux::api cutover. A TU that includes the concrete header must not also pull
+  # luxir::api cutover. A TU that includes the concrete header must not also pull
   # the trait-templated header (unqualified-count ADL clash), and converted TUs
   # use this PCH, so the proto header is included per-TU instead.
 )
-target_precompile_headers(solux_lib PRIVATE
-  ${SOLUX_PCH_COMMON}
+target_precompile_headers(luxir_lib PRIVATE
+  ${LUXIR_PCH_COMMON}
   <oneapi/tbb/flow_graph.h>
   <oneapi/tbb/task_group.h>
   # Angle brackets: src/ is on the include path; quotes would resolve to the
   # wrong (src-less) source-relative path.
-  <solux/util/log.h>
+  <luxir/util/log.h>
 )
 
 # hpp-proto codegen toolchain (is_utf8, protoc-gen-hpp, hpp_proto::runtime,
 # hpp_proto_generate()). Included unconditionally now that the engine migration to
-# hpp solux::proto is underway (big-bang). protos/ uses hpp_proto_generate().
+# hpp luxir::proto is underway (big-bang). protos/ uses hpp_proto_generate().
 include(cmake/hpp_proto.cmake)
 
 add_subdirectory(protos)
 add_subdirectory(test)
 
-# solux_descriptors.cpp #include "solux_fds_data.h" (generated descriptor set); order its
+# luxir_descriptors.cpp #include "luxir_fds_data.h" (generated descriptor set); order its
 # compile after generation. The PCH no longer force-includes any generated proto header.
-add_dependencies(solux_lib solux_fds_gen)
-# build/protos holds the generated solux_fds_data.h (was provided via solux_proto_hpp).
-target_include_directories(solux_lib PRIVATE "${CMAKE_BINARY_DIR}/protos")
-# solux_descriptors.cpp pulls protobuf descriptor headers; keep the hpp serializer
+add_dependencies(luxir_lib luxir_fds_gen)
+# build/protos holds the generated luxir_fds_data.h (was provided via luxir_proto_hpp).
+target_include_directories(luxir_lib PRIVATE "${CMAKE_BINARY_DIR}/protos")
+# luxir_descriptors.cpp pulls protobuf descriptor headers; keep the hpp serializer
 # PCH out of its TU (avoids the unqualified-count ADL clash, per the sweep split).
-set_source_files_properties(src/solux/server/solux_descriptors.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+set_source_files_properties(src/luxir/server/luxir_descriptors.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 if(ROBIN_HOOD_HASHING)
   find_path(ROBIN_HOOD_HASHING_INCLUDE_DIRS "robin_hood.h")
-  target_include_directories(solux_lib PRIVATE ${ROBIN_HOOD_HASHING_INCLUDE_DIRS})
+  target_include_directories(luxir_lib PRIVATE ${ROBIN_HOOD_HASHING_INCLUDE_DIRS})
 endif()
 
 find_path(GTL_INCLUDE_DIRS "gtl/bit_vector.hpp")
-target_include_directories(solux_lib PRIVATE ${GTL_INCLUDE_DIRS})
+target_include_directories(luxir_lib PRIVATE ${GTL_INCLUDE_DIRS})
 
-target_link_libraries(solux_lib PRIVATE TBB::tbb)
-target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
-target_link_libraries(solux_lib PUBLIC Boost::core Boost::thread Boost::sort)
-target_link_libraries(solux_lib PRIVATE fastpfor)
-# Concrete solux::api wire model (post-cutover): hand-written concrete structs + out-of-line
-# pb_meta/glz::meta (solux_proto_concrete) carrying hpp_proto::runtime (is_utf8) + glaze.
+target_link_libraries(luxir_lib PRIVATE TBB::tbb)
+target_link_libraries(luxir_lib PRIVATE xxHash::xxhash)
+target_link_libraries(luxir_lib PUBLIC Boost::core Boost::thread Boost::sort)
+target_link_libraries(luxir_lib PRIVATE fastpfor)
+# Concrete luxir::api wire model (post-cutover): hand-written concrete structs + out-of-line
+# pb_meta/glz::meta (luxir_proto_concrete) carrying hpp_proto::runtime (is_utf8) + glaze.
 # libprotobuf for google::protobuf::Arena (kept as the allocator) and the DescriptorPool used
-# by descriptor-only reflection; grpc++ for the server. The trait-templated solux_proto_hpp
-# was dropped - no TU includes "protos/solux*.pb.hpp" anymore. myproto (the protobuf message
+# by descriptor-only reflection; grpc++ for the server. The trait-templated luxir_proto_hpp
+# was dropped - no TU includes "protos/luxir*.pb.hpp" anymore. myproto (the protobuf message
 # classes + typed stubs) is also intentionally gone.
-target_link_libraries(solux_lib PUBLIC solux_proto_concrete)
-target_link_libraries(solux_lib PUBLIC protobuf::libprotobuf)
-target_link_libraries(solux_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
+target_link_libraries(luxir_lib PUBLIC luxir_proto_concrete)
+target_link_libraries(luxir_lib PUBLIC protobuf::libprotobuf)
+target_link_libraries(luxir_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
 # log.h is included by tests and other dependents; propagate spdlog's compiled
 # mode so every TU shares the same default-logger registry.
-target_link_libraries(solux_lib PUBLIC spdlog::spdlog)
-target_link_libraries(solux_lib PRIVATE CLI11::CLI11)
-target_link_libraries(solux_lib PRIVATE lz4::lz4)
-target_link_libraries(solux_lib PRIVATE faiss)
+target_link_libraries(luxir_lib PUBLIC spdlog::spdlog)
+target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
+target_link_libraries(luxir_lib PRIVATE lz4::lz4)
+target_link_libraries(luxir_lib PRIVATE faiss)
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
-# the analysis chain (src/solux/analysis/Analyzer.cpp).
-target_link_libraries(solux_lib PRIVATE uni_algo)
+# the analysis chain (src/luxir/analysis/Analyzer.cpp).
+target_link_libraries(luxir_lib PRIVATE uni_algo)
 
 # Optional, untracked developer-machine additions (extra tools/targets that
 # should not live in the shared build). Opt-in: merely having the file present
 # used to put its targets in `all`, so a box set up for bench runs paid for them
-# on every ordinary build. Configure with -DSOLUX_LOCAL_TARGETS=ON to enable
+# on every ordinary build. Configure with -DLUXIR_LOCAL_TARGETS=ON to enable
 # (cached per build dir, so a bench build dir sets it once).
-option(SOLUX_LOCAL_TARGETS "Include the untracked LocalTargets.cmake" OFF)
-if(SOLUX_LOCAL_TARGETS)
+option(LUXIR_LOCAL_TARGETS "Include the untracked LocalTargets.cmake" OFF)
+if(LUXIR_LOCAL_TARGETS)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LocalTargets.cmake")
-    message(STATUS "Solux: including LocalTargets.cmake")
+    message(STATUS "Luxir: including LocalTargets.cmake")
     include(LocalTargets.cmake)
   else()
-    message(WARNING "SOLUX_LOCAL_TARGETS=ON but LocalTargets.cmake does not exist")
+    message(WARNING "LUXIR_LOCAL_TARGETS=ON but LocalTargets.cmake does not exist")
   endif()
 endif()

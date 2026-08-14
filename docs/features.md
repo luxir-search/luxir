@@ -1,6 +1,6 @@
-# Solux Features
+# Luxir Features
 
-Solux is a high-performance hybrid search engine: full-text relevance,
+Luxir is a high-performance hybrid search engine: full-text relevance,
 vector similarity, and faceted analytics in one native-code core. Requests
 share one composable request tree - queries, filters, facets, statistics, and
 fusion - served over gRPC and a JSON/HTTP API designed for humans.
@@ -236,7 +236,7 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
 
 ## Status
 
-Solux is pre-1.0 and moving fast; interfaces can change without
+Luxir is pre-1.0 and moving fast; interfaces can change without
 back-compat. It is currently a single-node engine with no replication,
 distributed query execution, authentication, or TLS. This page lists shipped
 capabilities; the [operations guide](guide/operations.md) states the deployment

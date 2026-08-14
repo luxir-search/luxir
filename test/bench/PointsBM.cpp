@@ -15,14 +15,14 @@
 #include <utility>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/index/PointsWriter.h"
-#include "solux/reader/PointsReader.h"
-#include "solux/store/Directory.h"
-#include "solux/util/random.h"
-#include "solux/util/screaming.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/PointsWriter.h"
+#include "luxir/reader/PointsReader.h"
+#include "luxir/store/Directory.h"
+#include "luxir/util/random.h"
+#include "luxir/util/screaming.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -73,8 +73,8 @@ constexpr std::array<uint16_t, 4> LEAF_SIZES{{128, 256, 512, 1024}};
 constexpr std::array<int32_t, 4> WINDOW_PERMILLE{{10, 100, 500, 900}};
 
 uint64_t pointCount() {
-  return solux::unit_tests
-      ? (uint64_t)SoluxTest::scaleTestWork(8 * 1024)
+  return luxir::unit_tests
+      ? (uint64_t)LuxirTest::scaleTestWork(8 * 1024)
       : 1'000'000ULL;
 }
 
@@ -232,7 +232,7 @@ PointsFixture &fixture(PointShape shape, PointsWriter::Options options) {
 
 bool skipReducedUnitCase(benchmark::State &state, uint16_t leafSize,
                          int32_t windowPermille = -1) {
-  if (!solux::unit_tests)
+  if (!luxir::unit_tests)
     return false;
   if (leafSize != 256 && leafSize != 512) {
     state.SkipWithMessage("reduced unit-test leaf-size sweep");

@@ -1,27 +1,27 @@
 #include <gtest/gtest.h>
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // missing_val on single-valued response columns is chosen per column per
 // batch so that it never equals a real value: the v[i] != missing_val check
 // is exact.  These tests force each step of the selection ladder and the
 // collision cases that a fixed sentinel would get wrong.
-class MissingValuesTest : public SoluxTest {
+class MissingValuesTest : public LuxirTest {
 protected:
   // Run an all-docs query returning `fields` and hand back the LocalReq for
   // both Doc-level and column-level assertions.  Caller must call done().
   LocalReq* query(std::initializer_list<std::string> fields) {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
     lreq->collection("main").topDocs("q").allQuery().fields(fields).limit(10);
     lreq->execute();
     return lreq;
   }
 
-  const solux::api::Column& column(LocalReq* lreq, std::string_view field) {
+  const luxir::api::Column& column(LocalReq* lreq, std::string_view field) {
     const auto* docs = lreq->docList("q");
     return docs->columns.at(field);
   }
@@ -35,7 +35,7 @@ TEST_F(MissingValuesTest, intLadder) {
   helper.index(flatdoc("id_s", "b"), UpdateMessage::COMMIT);
   {
     auto* lreq = query({"id_s", "num_i"});
-    ASSERT_EQ(0, std::get<solux::api::ColInt>(column(lreq, "num_i").kind).missing_val);
+    ASSERT_EQ(0, std::get<luxir::api::ColInt>(column(lreq, "num_i").kind).missing_val);
     auto docs = lreq->getDocs();
     ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "a", "num_i", (int64_t)5)));
     ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "b")));
@@ -46,7 +46,7 @@ TEST_F(MissingValuesTest, intLadder) {
   helper.index(flatdoc("id_s", "c", "num_i", 0), UpdateMessage::COMMIT);
   {
     auto* lreq = query({"id_s", "num_i"});
-    ASSERT_EQ(std::numeric_limits<int64_t>::min(), std::get<solux::api::ColInt>(column(lreq, "num_i").kind).missing_val);
+    ASSERT_EQ(std::numeric_limits<int64_t>::min(), std::get<luxir::api::ColInt>(column(lreq, "num_i").kind).missing_val);
     ASSERT_TRUE(containsDoc(lreq->getDocs(), flatdoc("id_s", "c", "num_i", (int64_t)0)));
     lreq->done();
   }
@@ -57,7 +57,7 @@ TEST_F(MissingValuesTest, intLadder) {
   helper.index(flatdoc("id_s", "d", "num_i", std::numeric_limits<int64_t>::min()), UpdateMessage::COMMIT);
   {
     auto* lreq = query({"id_s", "num_i"});
-    ASSERT_EQ(std::numeric_limits<int64_t>::max(), std::get<solux::api::ColInt>(column(lreq, "num_i").kind).missing_val);
+    ASSERT_EQ(std::numeric_limits<int64_t>::max(), std::get<luxir::api::ColInt>(column(lreq, "num_i").kind).missing_val);
     auto docs = lreq->getDocs();
     ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "d", "num_i", std::numeric_limits<int64_t>::min())));
     ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "b")));
@@ -68,7 +68,7 @@ TEST_F(MissingValuesTest, intLadder) {
   helper.index(flatdoc("id_s", "e", "num_i", std::numeric_limits<int64_t>::max()), UpdateMessage::COMMIT);
   {
     auto* lreq = query({"id_s", "num_i"});
-    auto& col = std::get<solux::api::ColInt>(column(lreq, "num_i").kind);
+    auto& col = std::get<luxir::api::ColInt>(column(lreq, "num_i").kind);
     auto filler = col.missing_val;
     for (auto v : col.v) {
       if (v == filler) {
@@ -94,7 +94,7 @@ TEST_F(MissingValuesTest, doubleCollisions) {
   helper.index(flatdoc("id_s", "c"), UpdateMessage::COMMIT);
 
   auto* lreq = query({"id_s", "w_d"});
-  auto& col = std::get<solux::api::ColDouble>(column(lreq, "w_d").kind);
+  auto& col = std::get<luxir::api::ColDouble>(column(lreq, "w_d").kind);
   double filler = col.missing_val;
   ASSERT_NE(std::numeric_limits<double>::lowest(), filler);
   ASSERT_NE(0.0, filler);  // also excludes -0.0 (they compare equal)
@@ -113,7 +113,7 @@ TEST_F(MissingValuesTest, floatZeroPreferred) {
   helper.index(flatdoc("id_s", "b"), UpdateMessage::COMMIT);
 
   auto* lreq = query({"id_s", "p_f"});
-  ASSERT_EQ(0.0f, std::get<solux::api::ColFloat>(column(lreq, "p_f").kind).missing_val);
+  ASSERT_EQ(0.0f, std::get<luxir::api::ColFloat>(column(lreq, "p_f").kind).missing_val);
   auto docs = lreq->getDocs();
   ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "a", "p_f", 1.5f)));
   ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "b")));
@@ -130,7 +130,7 @@ TEST_F(MissingValuesTest, stringEmptyCollision) {
   helper.index(flatdoc("id_s", "c"), UpdateMessage::COMMIT);
 
   auto* lreq = query({"id_s", "tag_sc"});
-  auto& col = std::get<solux::api::ColStr>(column(lreq, "tag_sc").kind);
+  auto& col = std::get<luxir::api::ColStr>(column(lreq, "tag_sc").kind);
   ASSERT_GT(col.missing_val, std::string("zebra"));
 
   auto docs = lreq->getDocs();
@@ -148,7 +148,7 @@ TEST_F(MissingValuesTest, stringDenseDefault) {
   helper.index(flatdoc("id_s", "b"), UpdateMessage::COMMIT);
 
   auto* lreq = query({"id_s", "tag_sc"});
-  ASSERT_EQ("", std::get<solux::api::ColStr>(column(lreq, "tag_sc").kind).missing_val);
+  ASSERT_EQ("", std::get<luxir::api::ColStr>(column(lreq, "tag_sc").kind).missing_val);
   auto docs = lreq->getDocs();
   ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "a", "tag_sc", std::string("x"))));
   ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "b")));

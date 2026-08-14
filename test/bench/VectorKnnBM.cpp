@@ -9,20 +9,20 @@
 #include <string_view>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/index/VectorIndexBuilder.h"
-#include "solux/query/KnnQuery.h"
-#include "solux/reader/VectorAuxReader.h"
-#include "solux/util/random.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/query/KnnQuery.h"
+#include "luxir/reader/VectorAuxReader.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
+namespace api = luxir::api;
 
 namespace {
 
@@ -69,7 +69,7 @@ struct IvfPqBenchGuard {
       savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
     VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
     VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-    if (solux::unit_tests) {
+    if (luxir::unit_tests) {
       // Tiny corpus in unit-test mode: shrink so IVF+PQ actually trains and
       // the ANN path gets coverage. Real runs keep production IVF+PQ params
       // but force eligibility so the benchmark measures the aux path.
@@ -181,7 +181,7 @@ void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims
   helper.clear();
   installVectorBenchSchema(helper.collection(), dims);
 
-  int64_t nSegs = solux::unit_tests ? 2 : 4;
+  int64_t nSegs = luxir::unit_tests ? 2 : 4;
   int64_t baseSegDocs = nDocs / nSegs;
   int64_t remainder = nDocs % nSegs;
   int64_t docId = 0;
@@ -244,10 +244,10 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
 
 void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
                   bool skew = false) {
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(240)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(240)
       : state.range(0);
-  int32_t dims = solux::unit_tests ? 16 : 64;
+  int32_t dims = luxir::unit_tests ? 16 : 64;
   int32_t valuesPerDoc = multiValued ? 4 : 1;
   int32_t k = 10;
 
@@ -344,7 +344,7 @@ std::vector<float> makeClusteredQuery(int32_t queryOrd, int32_t dims, int32_t nC
 }
 
 std::vector<int32_t> clusteredDocsPerSeg(int64_t nDocs) {
-  int64_t nSegs = solux::unit_tests ? 2 : 4;
+  int64_t nSegs = luxir::unit_tests ? 2 : 4;
   std::vector<int32_t> docsPerSeg((size_t)nSegs);
   for (int64_t seg = 0; seg < nSegs; seg++) {
     docsPerSeg[(size_t)seg] = (int32_t)(nDocs / nSegs + (seg < nDocs % nSegs ? 1 : 0));
@@ -434,17 +434,17 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
 }
 
 void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
-  if (solux::unit_tests && state.threads() > 4) {
+  if (luxir::unit_tests && state.threads() > 4) {
     state.SkipWithMessage("reduced vector unit-test thread sweep");
     return;
   }
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestDimension(240, 2)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestDimension(240, 2)
       : 50'000;
-  int32_t dims = solux::unit_tests ? 16 : 64;
-  int32_t nClusters = solux::unit_tests ? 8 : 100;
-  int32_t nQueries = solux::unit_tests
-      ? (int32_t)SoluxTest::scaleTestDimension(4, 2)
+  int32_t dims = luxir::unit_tests ? 16 : 64;
+  int32_t nClusters = luxir::unit_tests ? 8 : 100;
+  int32_t nQueries = luxir::unit_tests
+      ? (int32_t)LuxirTest::scaleTestDimension(4, 2)
       : 16;
   int32_t nprobe = (int32_t)state.range(0);
   int32_t cand = (int32_t)state.range(1);  // candidate pool size; 0 = adaptive default
@@ -588,11 +588,11 @@ void BM_VectorKnnRecallThreadsParallel(benchmark::State& state) {
 // counter for context.  Fixed iteration count: each iteration is a full
 // rebuild, so let it be expensive but bounded.
 void BM_VectorIvfPqBuild(benchmark::State& state) {
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(240)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(240)
       : 50'000;
-  int32_t dims = solux::unit_tests ? 16 : 64;
-  int32_t nClusters = solux::unit_tests ? 8 : 100;
+  int32_t dims = luxir::unit_tests ? 16 : 64;
+  int32_t nClusters = luxir::unit_tests ? 8 : 100;
 
   IvfPqBenchGuard guard;
   CollectionHelper helper("main");
@@ -643,19 +643,19 @@ void BM_VectorIvfPqBuild(benchmark::State& state) {
 
 void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
   bool aboveThresholdFlush = state.range(0) != 0;
-  int32_t dims = solux::unit_tests ? 16 : 64;
-  int32_t nClusters = solux::unit_tests ? 8 : 100;
+  int32_t dims = luxir::unit_tests ? 16 : 64;
+  int32_t nClusters = luxir::unit_tests ? 8 : 100;
   int64_t flushDocs = aboveThresholdFlush
-    ? (solux::unit_tests ? 120 : 25'000)
-    : (solux::unit_tests ? 4 : 128);
-  int64_t threshold = solux::unit_tests
+    ? (luxir::unit_tests ? 120 : 25'000)
+    : (luxir::unit_tests ? 4 : 128);
+  int64_t threshold = luxir::unit_tests
     ? (int64_t)dims * 64
     : 1'000'000;
 
   IvfPqBenchGuard guard;
   VectorIndexBuilder::ivfPqBuildThresholdScanCost = threshold;
   CollectionHelper helper("main");
-  std::vector<int32_t> docsPerSeg = solux::unit_tests
+  std::vector<int32_t> docsPerSeg = luxir::unit_tests
     ? std::vector<int32_t>{120, 120}
     : std::vector<int32_t>{25'000, 25'000};
 
@@ -719,20 +719,20 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
 }  // namespace
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
-// SOLUX_BENCHMARK appends.
+// LUXIR_BENCHMARK appends.
 BENCHMARK(BM_VectorIvfPqBuild)->UseManualTime()->Iterations(3);
 BENCHMARK(BM_VectorIvfPqIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivfpq, false, true)->Arg(50'000);
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_column, true, false)->Arg(50'000);
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq, true, true)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivfpq, false, true)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_column, true, false)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq, true, true)->Arg(50'000);
 // Deepen-latency point: the skew corpus (see makeVectorDoc) makes round-1
 // collapse underfill the doc target, forcing depth rounds (folds counter
 // == 1).  IVF-only: the flat column engine doc-collapses during its scan
 // and so never deepens on multiplicity.
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq_skew, true, true, true)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq_skew, true, true, true)->Arg(50'000);
 
 // Two sweeps over (nprobe, refine); 0 = production default for either knob.
 // nprobe sweep at default refine: breadth axis, up to exhaustive-over-lists.
@@ -740,7 +740,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq_skew, true, true, true)->Arg(5
 // measurements showed the recall ceiling is refine-bound, not probe-bound).
 // The (exhaustive, 16) point checks how close the ceiling gets to 1.0 when
 // both knobs are generous.
-SOLUX_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k"})
+LUXIR_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->Args({1, 0, 10})->Args({4, 0, 10})->Args({16, 0, 10})
     ->Args({64, 0, 10})->Args({1 << 20, 0, 10})
     ->Args({0, 10, 10})->Args({0, 80, 10})->Args({0, 100, 10})->Args({0, 120, 10})
@@ -753,11 +753,11 @@ SOLUX_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k"})
 // Parallel-execution latency points: default knobs, a wide-breadth probe
 // (more selected lists = more scan tasks), and a deep-k pool (bigger
 // rescore buckets).
-SOLUX_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k"})
+LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->Args({16, 0, 10})->Args({1 << 20, 0, 10})
     ->Args({0, 0, 1000});
 
-SOLUX_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k"})
+LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->ThreadRange(1, 32);
-SOLUX_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k"})
+LUXIR_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->ThreadRange(1, 32);

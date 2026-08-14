@@ -1,11 +1,11 @@
-# Solux Documentation
+# Luxir Documentation
 
 New here? The [Quickstart](guide/quickstart.md) goes from an empty server to
 indexed documents, full-text queries, exact counts, and streaming import/export
 with `curl`. The [features page](features.md) is the compact answer to "what
-does Solux do today?"
+does Luxir do today?"
 
-## Use Solux
+## Use Luxir
 
 1. [Quickstart](guide/quickstart.md) - the shortest path to a useful search.
 2. [Documents and values](guide/documents.md) - field naming, missing values,
@@ -32,7 +32,7 @@ does Solux do today?"
     JSON, partial results, and error behavior.
 13. [gRPC API](guide/grpc.md) - services, streaming model, and transport
     differences from HTTP.
-14. [Operating Solux](guide/operations.md) - persistence, ports, memory and
+14. [Operating Luxir](guide/operations.md) - persistence, ports, memory and
     ingest controls, commits, and the current security/availability boundary.
 
 ## Understand or contribute

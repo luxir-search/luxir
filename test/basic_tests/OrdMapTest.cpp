@@ -6,13 +6,13 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/index/IntColWriter.h"
-#include "solux/search/OrdMap.h"
-#include "solux/search/IndexReader.h"
-#include "solux/reader/IntColReader.h"
+#include "luxir/index/IntColWriter.h"
+#include "luxir/search/OrdMap.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/reader/IntColReader.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -848,11 +848,11 @@ TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
     Results results;
     const auto* docs = req->docList("q");
     if (docs == nullptr) return results;
-    const auto& ids = std::get<solux::api::ColStr>(
+    const auto& ids = std::get<luxir::api::ColStr>(
         docs->columns.at("id").kind).v;
     for (std::string_view id : ids) results.sortedIds.emplace_back(id);
     const auto* facet = docs->ops.at("f")->facetResult();
-    const auto& buckets = std::get<solux::api::ColStr>(
+    const auto& buckets = std::get<luxir::api::ColStr>(
         facet->bucket_ids->kind).v;
     for (std::string_view bucket : buckets) results.bucketIds.emplace_back(bucket);
     results.counts.assign(facet->counts.begin(), facet->counts.end());

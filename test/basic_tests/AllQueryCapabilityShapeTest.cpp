@@ -5,19 +5,19 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/AllQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/Collector.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -62,7 +62,7 @@ void expectExactAllShape(const Query::ScorerShape& shape,
 
 } // namespace
 
-class AllQueryCapabilityShapeTest : public SoluxTest {
+class AllQueryCapabilityShapeTest : public LuxirTest {
 public:
   CollectionHelper helper;
 };
@@ -238,7 +238,7 @@ TEST_F(AllQueryCapabilityShapeTest,
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   std::vector<std::string> actualTop;
   for (const Doc& doc : req->getDocs()) {
-    const FieldVal* id = solux::test::find(doc, "id");
+    const FieldVal* id = luxir::test::find(doc, "id");
     ASSERT_NE(nullptr, id);
     actualTop.push_back(std::get<std::string>(*id));
   }

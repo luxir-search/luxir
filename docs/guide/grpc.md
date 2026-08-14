@@ -1,12 +1,12 @@
 # gRPC API
 
-HTTP is the fastest way to explore Solux; gRPC is the typed, binary surface for
+HTTP is the fastest way to explore Luxir; gRPC is the typed, binary surface for
 applications that want long-lived bidirectional streams and columnar search
 results. Both reach the same request and execution model. The protobuf files
 are the source of truth:
 
-- [`protos/solux.proto`](../../protos/solux.proto) defines services.
-- [`protos/solux_types.proto`](../../protos/solux_types.proto) defines search,
+- [`protos/luxir.proto`](../../protos/luxir.proto) defines services.
+- [`protos/luxir_types.proto`](../../protos/luxir_types.proto) defines search,
   update, schema, document, facet, and response messages.
 
 The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
@@ -16,17 +16,17 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 
 | Service and method | Shape | Purpose |
 |---|---|---|
-| `solux.Indexer/Update` | unary | One bounded update request and response. |
-| `solux.Indexer/UpdateStream` | bidirectional stream | A stream of independently acknowledged update requests. |
-| `solux.Searcher/Search` | bidirectional stream | Several search requests per call, with one or more response batches per request. |
-| `solux.Admin/SetSchema` | unary | Set named definitions or replace a collection schema. |
-| `solux.Admin/GetSchema` | unary | Read a collection schema. |
-| `solux.Admin/CreateCollection` | unary | Create a collection, optionally with a schema. |
-| `solux.Admin/DeleteCollection` | unary | Delete a collection and its stored data. |
-| `solux.Admin/Stats` | unary | Read node-wide or collection index statistics. |
+| `luxir.Indexer/Update` | unary | One bounded update request and response. |
+| `luxir.Indexer/UpdateStream` | bidirectional stream | A stream of independently acknowledged update requests. |
+| `luxir.Searcher/Search` | bidirectional stream | Several search requests per call, with one or more response batches per request. |
+| `luxir.Admin/SetSchema` | unary | Set named definitions or replace a collection schema. |
+| `luxir.Admin/GetSchema` | unary | Read a collection schema. |
+| `luxir.Admin/CreateCollection` | unary | Create a collection, optionally with a schema. |
+| `luxir.Admin/DeleteCollection` | unary | Delete a collection and its stored data. |
+| `luxir.Admin/Stats` | unary | Read node-wide or collection index statistics. |
 
 The server also registers the standard gRPC health service and descriptor
-reflection. Solux implements the application services through gRPC's generic
+reflection. Luxir implements the application services through gRPC's generic
 byte transport, so the stock reflection plugin can resolve known symbols but
 does not currently enumerate those services in `ListServices`. Ask for a known
 symbol directly when using a reflection client.
@@ -42,16 +42,16 @@ protoc -I protos \
   --cpp_out=generated \
   --grpc_out=generated \
   --plugin=protoc-gen-grpc="$(command -v grpc_cpp_plugin)" \
-  protos/solux_types.proto protos/solux.proto
+  protos/luxir_types.proto protos/luxir.proto
 ```
 
 Use the equivalent `grpc_tools.protoc`, Gradle, Go, Rust, or other language
-plugin for your client. Solux does not yet publish packaged generated clients.
+plugin for your client. Luxir does not yet publish packaged generated clients.
 
 Reflection can inspect a known service without local proto files:
 
 ```bash
-grpcurl -plaintext localhost:9401 describe solux.Searcher
+grpcurl -plaintext localhost:9401 describe luxir.Searcher
 ```
 
 ## Search streams
@@ -120,4 +120,4 @@ The configured gRPC port listens on all interfaces with insecure server
 credentials. There is no built-in TLS, authentication, authorization, or
 request tenancy layer. Put it behind the same private network, proxy, or
 service-mesh security boundary as the HTTP port; see
-[Operating Solux](operations.md).
+[Operating Luxir](operations.md).

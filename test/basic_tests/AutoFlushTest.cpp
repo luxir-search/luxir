@@ -11,14 +11,14 @@
 #include <string>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class AutoFlushTest : public SoluxTest {};
+class AutoFlushTest : public LuxirTest {};
 
 namespace {
 // Restores an IndexWriter's auto-flush caps on scope exit. Tests share the "main"

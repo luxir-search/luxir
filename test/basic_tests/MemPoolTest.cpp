@@ -1,14 +1,14 @@
 #include <boost/sort/spreadsort/string_sort.hpp>
 
-#include "test/SoluxTest.h"
-#include "solux/util/MemPool.h"
-#include "solux/util/StrRef.h"
+#include "test/LuxirTest.h"
+#include "luxir/util/MemPool.h"
+#include "luxir/util/StrRef.h"
 #include <boost/unordered/unordered_node_map.hpp>
 
 using namespace std;
-using namespace solux;
+using namespace luxir;
 
-class MemPoolTest : public solux::SoluxTest {
+class MemPoolTest : public luxir::LuxirTest {
 protected:
 };
 
@@ -16,7 +16,7 @@ class X {
 public:
   int& cons_calls;
   int& des_calls;
-  solux::u_ptr<X> nested;
+  luxir::u_ptr<X> nested;
 
   X(int& cons_calls, int& des_calls) : cons_calls(cons_calls), des_calls(des_calls) {
     // std::cout << "X::X() this=" << (void*)this << std::endl;
@@ -305,7 +305,7 @@ TEST_F(MemPoolTest, rewind) {
     ASSERT_EQ(outer.pool().size(), sz);
   }
 
-  // MemPool::threadLocal().alloc(77);  // this should cause test runner (SoluxTestListener::OnTestEnd) to fail the test
+  // MemPool::threadLocal().alloc(77);  // this should cause test runner (LuxirTestListener::OnTestEnd) to fail the test
 }
 
 TEST_F(MemPoolTest, randRewind) {

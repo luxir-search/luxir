@@ -1,29 +1,29 @@
 # Quickstart
 
-Solux speaks plain JSON over HTTP. Start the server, `curl` a document in,
+Luxir speaks plain JSON over HTTP. Start the server, `curl` a document in,
 `curl` a search out. There is no schema to define up front, no client library
 to install, and no cluster to stand up first. Once the source build is ready,
 this page gets you to a working search in a few commands.
 
-## Get Solux
+## Get Luxir
 
-Solux is currently a source preview, not a packaged binary or container. Its
+Luxir is currently a source preview, not a packaged binary or container. Its
 presets assume a prepared Linux/GCC/vcpkg development environment; the current
 setup and its limitations are in [Build Setup](../dev/build-setup.md). The
-release result is `build/gcc-release/bin/solux`. The commands below assume that
+release result is `build/gcc-release/bin/luxir`. The commands below assume that
 binary is on your `PATH`.
 
 ## Start the server
 
 ```bash
-solux
+luxir
 ```
 
 That's it. The HTTP/JSON API is listening on port `9400`, storing data in
 memory. To keep data across restarts, point it at a directory:
 
 ```bash
-solux --store.backend=fs --store.data-dir=./data
+luxir --store.backend=fs --store.data-dir=./data
 ```
 
 Check it's alive:
@@ -117,7 +117,7 @@ POST /collections/main/_search
 ### The query language
 
 When you're the one writing the query, a bare string anywhere a query object
-goes is an expression in the [Solux query language](query-language.md):
+goes is an expression in the [Luxir query language](query-language.md):
 fielded terms, AND/OR/NOT, ranges, and function forms for most structured query
 types. Unlike `simple_query`, malformed input is a parse error, not a guess:
 
@@ -136,7 +136,7 @@ range clause excluded it.
 ## Bulk ingest: stream a whole file
 
 Set the content type to `application/x-ndjson` and send one document per line.
-The stream is unbounded - pipe in a file of any size and Solux indexes it as it
+The stream is unbounded - pipe in a file of any size and Luxir indexes it as it
 arrives, without buffering the whole thing:
 
 ```
@@ -223,7 +223,7 @@ POST /collections/books/_search
 ```
 
 The same server holds multiple collections as independent index namespaces.
-They share the process scheduler and memory, and Solux does not currently
+They share the process scheduler and memory, and Luxir does not currently
 provide per-collection tenant quotas or authorization boundaries. Auto-create
 is on by default; set `--no-ingest.auto-create-collection` if a write to an
 unknown collection should be rejected.
@@ -238,7 +238,7 @@ Changes become visible on commit. You have three ways, use whichever fits:
 
 ## See what the server understood
 
-Add `?explain=request` to a query and Solux echoes back the canonical request it
+Add `?explain=request` to a query and Luxir echoes back the canonical request it
 parsed - the shorthand you sent, expanded to the full form:
 
 ```
@@ -263,4 +263,4 @@ you expect.
 - [Vector search](vector-search.md) - dense-vector and hybrid retrieval.
 - [Geo search](geo-search.md) - bounding boxes and distance queries.
 - [HTTP conventions](http-api.md) - framing, validation, and error behavior.
-- [Operating Solux](operations.md) - persistence, resource controls, and security.
+- [Operating Luxir](operations.md) - persistence, resource controls, and security.

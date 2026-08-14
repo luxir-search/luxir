@@ -1,6 +1,6 @@
-#include "solux/codec/Codec.h"  // SoluxPFOR, SoluxPFORd, SoluxSIMDFor
+#include "luxir/codec/Codec.h"  // LuxirPFOR, LuxirPFORd, LuxirSIMDFor
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "FastPFOR/headers/bitpackinghelpers.h"
 #include "FastPFOR/headers/simdbitpacking.h"
 #include "FastPFOR/headers/usimdbitpacking.h"
@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -135,7 +135,7 @@ std::vector<uint32_t> roundtrip(U32Codec& codec, std::vector<uint32_t> in) {
 
 }  // namespace
 
-class PForTest : public SoluxTest {
+class PForTest : public LuxirTest {
 protected:
   void assertScalarEncoding(const std::array<uint32_t, BLK>& block,
                             std::string_view shape) {
@@ -147,7 +147,7 @@ protected:
     uint32_t actualSize = (uint32_t) actual.size();
     uint32_t scalarSize = (uint32_t) scalar.size();
 
-    SoluxPFOR codec;
+    LuxirPFOR codec;
     codec.encodeBlock(actualInput.data(), BLK, actual.data(), actualSize);
     encodeBlockPForScalar(scalarInput.data(), scalar.data(), scalarSize);
 
@@ -183,7 +183,7 @@ protected:
 // Non-delta PForDelta: round-trips across value distributions that exercise the
 // exception path, all-zero (bestb==0), and full 32-bit values.
 TEST_F(PForTest, pforRoundTrip) {
-  SoluxPFOR fp;
+  LuxirPFOR fp;
 
   for (int trial = 0; trial < 300; ++trial) {
     std::vector<uint32_t> data(BLK);
@@ -318,7 +318,7 @@ TEST_F(PForTest, vectorizedEncoderMatchesScalarBytes) {
 
 // Delta-coded PForDelta (docs codec): monotonic inputs, like document ids.
 TEST_F(PForTest, pfordRoundTrip) {
-  SoluxPFORd fp;
+  LuxirPFORd fp;
 
   for (int trial = 0; trial < 300; ++trial) {
     std::vector<uint32_t> data(BLK);
@@ -338,7 +338,7 @@ TEST_F(PForTest, pfordRoundTrip) {
 // delta from the previous block's last id must round-trip when decoded with the
 // same base. Mirrors how the postings writer and reader carry it across blocks.
 TEST_F(PForTest, pfordBaseCarry) {
-  SoluxPFORd fp;
+  LuxirPFORd fp;
 
   for (int trial = 0; trial < 200; ++trial) {
     uint32_t base = rng() % 1000000;            // previous block's last id

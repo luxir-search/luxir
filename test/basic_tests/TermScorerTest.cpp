@@ -1,4 +1,4 @@
-#include <solux/query/AllQuery.h>
+#include <luxir/query/AllQuery.h>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -12,25 +12,25 @@
 #include <thread>
 #include <vector>
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TopKAssert.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
-#include "solux/query/TermQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/NumericRangeQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/ForcePrepareQuery.h"
-#include "solux/search/Collector.h"
-#include "solux/reader/PosEnum.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/search/Collector.h"
+#include "luxir/reader/PosEnum.h"
 
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 template<typename T>
 concept HasTermFreq = requires(T& docs) { docs.termFreq(); };
@@ -59,7 +59,7 @@ static_assert(HasIntoBitSet<DocsFreqEnum>);
 
 constexpr int32_t kMaxScoreDisjunctionSegDocs = 3 * Postings::DOCS_BLOCK_SIZE + 40;
 
-class TermScorerTest : public SoluxTest {
+class TermScorerTest : public LuxirTest {
 protected:
 
   std::vector<const char*> text = {
@@ -2101,7 +2101,7 @@ std::vector<std::string> localResultIds(LocalReq& req, std::string_view opName =
   if (docs == nullptr) return ids;
   const auto* idColumn = docs->columns.find("id");
   if (idColumn == nullptr) return ids;
-  const auto* idCol = std::get_if<solux::api::ColStr>(&idColumn->kind);
+  const auto* idCol = std::get_if<luxir::api::ColStr>(&idColumn->kind);
   if (idCol == nullptr) return ids;
   for (const auto& id : idCol->v) ids.emplace_back(id);
   return ids;
@@ -2113,7 +2113,7 @@ std::vector<float> localResultScores(LocalReq& req, std::string_view opName = "q
   if (docs == nullptr) return scores;
   const auto* scoreColumn = docs->columns.find("_score_");
   if (scoreColumn == nullptr) return scores;
-  const auto* scoreCol = std::get_if<solux::api::ColFloat>(&scoreColumn->kind);
+  const auto* scoreCol = std::get_if<luxir::api::ColFloat>(&scoreColumn->kind);
   if (scoreCol == nullptr) return scores;
   for (float score : scoreCol->v) scores.push_back(score);
   return scores;
@@ -9331,7 +9331,7 @@ void checkCrossSegmentAccumulatorRealOpMatchesExhaustive(
 
   auto expected = runCrossSegmentTermTopK(reader, k, false);
 
-  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+  auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("body_w", "needle").fields({"id"}).limit(k).getScores();
   req->execute(true);
   ASSERT_EQ(req->responses.size(), 1u) << req->toString();

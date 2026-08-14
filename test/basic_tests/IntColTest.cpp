@@ -1,18 +1,18 @@
-#include "solux/index/Inverter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 #include <vector>
 
-#include "solux/index/IntColWriter.h"
+#include "luxir/index/IntColWriter.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class IntColTest : public SoluxTest {
+class IntColTest : public LuxirTest {
 protected:
 
 

@@ -2,7 +2,7 @@
 
 Detailed build and environment notes for a source checkout.
 
-Solux does not yet have a packaged binary, container image, or turnkey
+Luxir does not yet have a packaged binary, container image, or turnkey
 clean-machine installer. The checked-in presets describe the current developer
 environment rather than a portable distribution: Linux/x86-64, GCC, and vcpkg
 roots at `/opt/vcpkg` (plus `/opt/vcpkg_asan` for ASan). The commands below are
@@ -21,7 +21,7 @@ snapshot are not pinned by this repository yet.
   supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
 
 The build uses `-march=native`; a release binary is intended for the machine
-class on which its dependencies and Solux itself were built.
+class on which its dependencies and Luxir itself were built.
 
 ## Prepare a checkout
 
@@ -40,7 +40,7 @@ sudo chown -R "$(id -un):$(id -gn)" /opt/vcpkg
 /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 ```
 
-Run Solux's dependency setup before installing packages. It fetches pinned
+Run Luxir's dependency setup before installing packages. It fetches pinned
 FastPFOR and applies the required triplet and FAISS patches to the vcpkg root:
 
 ```bash
@@ -94,7 +94,7 @@ Use the non-ASan debug build for normal iteration:
 ```bash
 cmake --preset gcc-debug
 cmake --build --preset gcc-debug
-./build/gcc-debug/bin/solux_test
+./build/gcc-debug/bin/luxir_test
 ```
 
 Build the optimized server with:
@@ -102,7 +102,7 @@ Build the optimized server with:
 ```bash
 cmake --preset gcc-release
 cmake --build --preset gcc-release
-./build/gcc-release/bin/solux
+./build/gcc-release/bin/luxir
 ```
 
 Before committing memory-sensitive work, run the ASan build:
@@ -116,14 +116,14 @@ instrumented triplet.
 ```bash
 cmake --preset gcc-debug-asan
 cmake --build --preset gcc-debug-asan
-ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/solux_test
+ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/luxir_test
 ```
 
 The binaries for every preset are under `build/<preset>/bin/`.
 
 ## Measure on your workload
 
-Solux does not yet publish a portable performance envelope. Hardware, corpus,
+Luxir does not yet publish a portable performance envelope. Hardware, corpus,
 query mix, vector model, and requested exactness all materially change the
 result, so evaluate the release build on representative inputs.
 
@@ -132,23 +132,23 @@ substantial setup time and memory:
 
 ```bash
 ulimit -v 32000000
-./build/gcc-release/bin/solux_test --bench --benchmark_filter='-BM_Vector'
+./build/gcc-release/bin/luxir_test --bench --benchmark_filter='-BM_Vector'
 ```
 
 The negative filter excludes the slow vector families. For a quick path/code
 coverage pass over the small unit-test corpus, use:
 
 ```bash
-./build/gcc-debug/bin/solux_test --gtest_filter='Benchmarks.all'
+./build/gcc-debug/bin/luxir_test --gtest_filter='Benchmarks.all'
 ```
 
 Test runs default to `--effort=1`. Scalable fuzz loops and benchmark unit
-corpora can derive linear work with `SoluxTest::scaleTestWork()` or scale each
-side of a multidimensional space with `SoluxTest::scaleTestDimension()`. Raise
+corpora can derive linear work with `LuxirTest::scaleTestWork()` or scale each
+side of a multidimensional space with `LuxirTest::scaleTestDimension()`. Raise
 the budget for a broader pass, for example:
 
 ```bash
-./build/gcc-debug-asan/bin/solux_test --effort=4
+./build/gcc-debug-asan/bin/luxir_test --effort=4
 ```
 
 Effort 4 aims for roughly four times the total scalable work, including when
@@ -166,5 +166,5 @@ data and the C++ runtime consistent across a fleet: identical tzdb version
 strings do not guarantee identical transition decoding across different
 parser implementations.
 
-See [Operating Solux](../guide/operations.md) for persistence, ports, security,
+See [Operating Luxir](../guide/operations.md) for persistence, ports, security,
 and resource controls after the binary is built.

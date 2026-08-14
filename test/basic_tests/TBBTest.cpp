@@ -4,14 +4,14 @@
 #include <oneapi/tbb/parallel_invoke.h>
 #include <oneapi/tbb/parallel_for.h>
 
-#include "solux/util/thread.h"
+#include "luxir/util/thread.h"
 
-#include "solux/store/Directory.h"
+#include "luxir/store/Directory.h"
 #include "oneapi/tbb/task_group.h"
 #include "oneapi/tbb/flow_graph.h"
 #include "oneapi/tbb/concurrent_queue.h"
 
-using namespace solux;
+using namespace luxir;
 
 // This is to test the TBB strategy for enforcing that commits are finished in order.
 class TBBTest : public testing::Test {

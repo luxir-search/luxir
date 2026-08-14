@@ -2,13 +2,13 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <vector>
-#include "test/SoluxTest.h"
-#include "solux/util/screaming.h"
-#include "solux/index/ScreamingBuilder.h"
+#include "test/LuxirTest.h"
+#include "luxir/util/screaming.h"
+#include "luxir/index/ScreamingBuilder.h"
 
-using namespace solux;
+using namespace luxir;
 
-class ScreamingTest : public solux::SoluxTest {
+class ScreamingTest : public luxir::LuxirTest {
 public:
 
   // Utility class to make it easier to test screaming bitset
@@ -27,7 +27,7 @@ public:
     int curr = -1;  // the current value added
     int nAdds = 0;
 
-    explicit BldBase(const Rng& rng = SoluxTest::rng) : rng(rng) {
+    explicit BldBase(const Rng& rng = LuxirTest::rng) : rng(rng) {
       buf.resize(screaming::BitSet::Bits::fixedNumWords);
       obs = screaming::BitSet::Bits(&buf[0]);
     }
@@ -244,7 +244,7 @@ public:
     int prefixBytes;
     ScreamingBuilder builder;
 
-    explicit OutputStreamBuilder(const Rng& rng = SoluxTest::rng, int prefix = 0)
+    explicit OutputStreamBuilder(const Rng& rng = LuxirTest::rng, int prefix = 0)
         : BldBase(rng),
           prefixBytes([&] {
             for (int i = 0; i < prefix; i++) os.write((char)0x5A);
@@ -279,7 +279,7 @@ public:
     screaming::StringStreamBuilder builder{out};
     std::string resultStr;
 
-    explicit SStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
+    explicit SStreamBuilder(const Rng& rng = LuxirTest::rng) : BldBase(rng) {
     }
 
     void virtAdd(int val) override {
@@ -401,7 +401,7 @@ TEST_F(ScreamingTest, basic) {
 // explicit alignment of every dense block and full iterate/rank/select parity.
 TEST_F(ScreamingTest, denseBucketAlignment) {
   for (int prefix = 0; prefix < 8; prefix++) {
-    OutputStreamBuilder set(SoluxTest::rng, prefix);
+    OutputStreamBuilder set(LuxirTest::rng, prefix);
     set.addSmallBucket(3);
     set.addMidBucket();
     set.addSmallBucket(5);

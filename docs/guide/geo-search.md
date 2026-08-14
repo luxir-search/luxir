@@ -1,6 +1,6 @@
 # Geo search
 
-Solux represents a location as a typed `geo_point` and answers bounding-box
+Luxir represents a location as a typed `geo_point` and answers bounding-box
 and radius queries inside the normal query tree. A geo query can be the main
 query, a non-scoring filter on text or vector retrieval, or a boolean clause.
 There is no post-filter stage with a different idea of the result set.
@@ -45,7 +45,7 @@ POST /collections/places/_update
 }
 ```
 
-Longitude must be within `[-180,180]` and latitude within `[-90,90]`. Solux
+Longitude must be within `[-180,180]` and latitude within `[-90,90]`. Luxir
 quantizes each coordinate into a 32-bit grid, roughly centimeter resolution.
 Invalid shapes, non-finite numbers, and out-of-range coordinates are
 per-document update errors.

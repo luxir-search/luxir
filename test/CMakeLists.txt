@@ -5,19 +5,19 @@ find_package(benchmark REQUIRED)
 # without a manual reconfigure (otherwise new files link as undefined symbols).
 file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 
-add_executable(solux_test ${Test_SOURCES})
-target_include_directories(solux_test PRIVATE .)
-target_link_libraries(solux_test PRIVATE solux_lib benchmark::benchmark GTest::gtest)
-# HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via solux_lib) and
+add_executable(luxir_test ${Test_SOURCES})
+target_include_directories(luxir_test PRIVATE .)
+target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest)
+# HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via luxir_lib) and
 # drives the HTTP server with a header-only Boost.Beast client.
 # uni-algo (vendored): AnalysisTest exercises Unicode case folding / NFKC / UAX#29
 # segmentation directly to gate conformance before the real filters are built.
-target_link_libraries(solux_test PRIVATE uni_algo)
+target_link_libraries(luxir_test PRIVATE uni_algo)
 
 # gtest/benchmark are the dominant parse cost across the ~40 test TUs; add them
-# to the shared heavy-header set (SOLUX_PCH_COMMON comes from the root CMake).
-target_precompile_headers(solux_test PRIVATE
-  ${SOLUX_PCH_COMMON}
+# to the shared heavy-header set (LUXIR_PCH_COMMON comes from the root CMake).
+target_precompile_headers(luxir_test PRIVATE
+  ${LUXIR_PCH_COMMON}
   <gtest/gtest.h>
   <benchmark/benchmark.h>
 )
@@ -30,7 +30,7 @@ target_include_directories(decoded_successor_no_avx512_test PRIVATE .)
 target_link_libraries(decoded_successor_no_avx512_test PRIVATE GTest::gtest_main)
 target_compile_options(decoded_successor_no_avx512_test PRIVATE -mno-avx512f)
 target_compile_definitions(decoded_successor_no_avx512_test PRIVATE
-  SOLUX_EXPECT_NO_AVX512=1)
+  LUXIR_EXPECT_NO_AVX512=1)
 
 # Compile the same tests without AVX-512 or AVX2 so the scalar portability path
 # is exercised on SIMD hosts.
@@ -41,11 +41,11 @@ target_link_libraries(decoded_successor_scalar_test PRIVATE GTest::gtest_main)
 target_compile_options(decoded_successor_scalar_test PRIVATE
   -mno-avx512f -mno-avx2)
 target_compile_definitions(decoded_successor_scalar_test PRIVATE
-  SOLUX_EXPECT_SCALAR=1)
+  LUXIR_EXPECT_SCALAR=1)
 
 
-# (solux_smoke removed: it was migration scaffolding to run SmokeTest while solux_test was
-# still on the protobuf API. solux_test now compiles SmokeTest.cpp on the concrete solux::api,
+# (luxir_smoke removed: it was migration scaffolding to run SmokeTest while luxir_test was
+# still on the protobuf API. luxir_test now compiles SmokeTest.cpp on the concrete luxir::api,
 # so the standalone target is redundant.)
 
 
@@ -59,12 +59,12 @@ if(NOT DEFINED $ENV{TMP})
   set(ENV{TMP} /tmp)
 endif()
 
-set(SOLUX_TMP "$ENV{TMP}/solux")
-file(MAKE_DIRECTORY ${SOLUX_TMP})
-download("${SOLUX_TMP}/book.txt" http://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
+set(LUXIR_TMP "$ENV{TMP}/luxir")
+file(MAKE_DIRECTORY ${LUXIR_TMP})
+download("${LUXIR_TMP}/book.txt" http://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
 
 # Unicode 15.1.0 conformance files for AnalysisTest (must match uni-algo's
 # pinned Unicode version: deps/uni-algo/include/uni_algo/impl/impl_unicode_version.h).
 # If a download fails (offline), the conformance tests GTEST_SKIP rather than fail.
-download("${SOLUX_TMP}/WordBreakTest-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/auxiliary/WordBreakTest.txt 69506b2253b8defb1f15b1476397376285cfda3bafd9304ee50d48bbfa0a2ab4)
-download("${SOLUX_TMP}/CaseFolding-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/CaseFolding.txt 4e55acfdc32825a22e87670e9056a3bf94ad7c5400065778e9e10f8314372bcf)
+download("${LUXIR_TMP}/WordBreakTest-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/auxiliary/WordBreakTest.txt 69506b2253b8defb1f15b1476397376285cfda3bafd9304ee50d48bbfa0a2ab4)
+download("${LUXIR_TMP}/CaseFolding-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/CaseFolding.txt 4e55acfdc32825a22e87670e9056a3bf94ad7c5400065778e9e10f8314372bcf)

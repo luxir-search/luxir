@@ -12,28 +12,28 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/SoluxConfig.h"
-#include "solux/query/AllQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/ParseContext.h"
-#include "solux/query/ProtobufQueryParser.h"
-#include "solux/query/TermQuery.h"
-#include "solux/search/FieldSortCollector.h"
-#include "solux/search/ProtobufSearchParser.h"
-#include "solux/search/ops/RootOp.h"
-#include "solux/search/ops/TopDocsReq.h"
-#include "solux/server/SoluxNode.h"
+#include "luxir/LuxirConfig.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ParseContext.h"
+#include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/FieldSortCollector.h"
+#include "luxir/search/ProtobufSearchParser.h"
+#include "luxir/search/ops/RootOp.h"
+#include "luxir/search/ops/TopDocsReq.h"
+#include "luxir/server/LuxirNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class SearchParserTest : public SoluxTest {
+class SearchParserTest : public LuxirTest {
   using ScoreMap = std::map<std::pair<int32_t, int32_t>, float>;
 
   MemPool parsePool;
@@ -264,7 +264,7 @@ TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
     flatdoc("id", "d4", "body_w", "a", "keep_s", "yes"),
   }, UpdateMessage::COMMIT);
 
-  auto shapeReq = localReq(soluxNode->getSearchEngine());
+  auto shapeReq = localReq(luxirNode->getSearchEngine());
   shapeReq->collection("main");
   shapeReq->topDocs("q").exprQuery("body_w:a AND (body_w:b OR body_w:c)")
       .withStats().fields({"id"}).limit(-1).matchFilter("keep", "keep_s", "yes");
@@ -280,7 +280,7 @@ TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
   EXPECT_EQ(1, plan.filterCount);
   EXPECT_EQ(0, plan.minShouldMatch);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs("folded").exprQuery("body_w:a AND (body_w:b OR body_w:c)")
       .withStats().fields({"id"}).limit(-1).matchFilter("keep", "keep_s", "yes");
@@ -307,7 +307,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
 
   // Filter-only search: no query at all. The fold's match-all placeholder
   // must be eliminated, leaving the filter as the sole (required) clause.
-  auto shapeReq = localReq(soluxNode->getSearchEngine());
+  auto shapeReq = localReq(luxirNode->getSearchEngine());
   shapeReq->collection("main");
   shapeReq->topDocs("q").withStats().fields({"id"}).limit(-1)
       .matchFilter("keep", "keep_s", "yes");
@@ -323,7 +323,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   EXPECT_EQ(BooleanQuery::R5_MATCH_ALL_ELIMINATE,
             plan.ruleMask & BooleanQuery::R5_MATCH_ALL_ELIMINATE);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs("q").withStats().fields({"id"}).limit(-1)
       .matchFilter("keep", "keep_s", "yes");
@@ -333,7 +333,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   EXPECT_EQ(2, req->getDocs("q").size());
 
   // No query and no filters selects everything.
-  auto browse = localReq(soluxNode->getSearchEngine());
+  auto browse = localReq(luxirNode->getSearchEngine());
   browse->collection("main");
   browse->topDocs("q").withStats().fields({"id"}).limit(-1);
   browse->execute();
@@ -341,7 +341,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   EXPECT_EQ(3, browse->getMatchCount("q"));
 
   // An explicitly empty Query (unset oneof) behaves like `all`.
-  auto empty = localReq(soluxNode->getSearchEngine());
+  auto empty = localReq(luxirNode->getSearchEngine());
   empty->collection("main");
   auto& td = empty->topDocs("q").withStats().fields({"id"}).limit(-1);
   td.rawQuery();
@@ -379,7 +379,7 @@ TEST_F(SearchParserTest, normalizationScoreModesAndStringComparator) {
 
   auto inspect = [&](std::string_view expression, qb::SortDir direction,
                      bool getScores, auto&& verify) {
-    auto request = localReq(soluxNode->getSearchEngine());
+    auto request = localReq(luxirNode->getSearchEngine());
     request->collection("main");
     auto& top = request->topDocs("q").matchQuery("body_w", "term").limit(10);
     top.getScores(getScores);
@@ -436,7 +436,7 @@ TEST_F(SearchParserTest, normalizationScoreModesAndStringComparator) {
     EXPECT_FALSE(parsed.sortPlan.useFieldSort);
   });
 
-  auto canonical = localReq(soluxNode->getSearchEngine());
+  auto canonical = localReq(luxirNode->getSearchEngine());
   canonical->collection("main");
   auto& top = canonical->topDocs("q").matchQuery("body_w", "term").limit(10);
   qb::sort(top, "score", qb::DESC);
@@ -508,9 +508,9 @@ TEST_F(SearchParserTest, opNestingDepthCapped) {
   }
 
   // The cap is node configuration (--search.max-op-depth), not a constant.
-  SoluxConfig config;
+  LuxirConfig config;
   config.search.max_op_depth = 2;
-  SoluxNode node{config};
+  LuxirNode node{config};
   parseNested(node.getSearchEngine(), 2);
   EXPECT_THROW(parseNested(node.getSearchEngine(), 3), std::runtime_error);
 }

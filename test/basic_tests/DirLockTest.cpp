@@ -5,10 +5,10 @@
 #include <string>
 #include <unistd.h>
 
-#include "solux/store/DirectoryFactory.h"
-#include "solux/store/ReadOnlyDirectory.h"
+#include "luxir/store/DirectoryFactory.h"
+#include "luxir/store/ReadOnlyDirectory.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -18,7 +18,7 @@ class TempDir {
 public:
   TempDir() {
     std::string pathTemplate =
-        (std::filesystem::temp_directory_path() / "solux_dir_lock_XXXXXX").string();
+        (std::filesystem::temp_directory_path() / "luxir_dir_lock_XXXXXX").string();
     if (::mkdtemp(pathTemplate.data()) == nullptr) {
       throw std::runtime_error("Failed to create temp directory");
     }

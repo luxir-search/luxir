@@ -13,26 +13,26 @@
 
 #include <gtest/gtest.h>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/FuzzyQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/PrefixQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/FuzzyQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/PrefixQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/Collector.h"
 
 using namespace std;
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class ExprQueryTest : public SoluxTest {
+class ExprQueryTest : public LuxirTest {
 public:
   CollectionHelper helper{"main"};
 
@@ -50,7 +50,7 @@ public:
 
 
   std::vector<Doc> search(std::string_view q,
-                          std::function<void(solux::api::Query&)> tweak = {}) {
+                          std::function<void(luxir::api::Query&)> tweak = {}) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     cur.exprQuery(q).fields({"id"}).limit(-1);
@@ -75,7 +75,7 @@ public:
   }
 };
 
-class BoostQueryTest : public SoluxTest {
+class BoostQueryTest : public LuxirTest {
 protected:
   static void assertPrunedTopKMatchesExhaustive(IndexReader& reader, Query& query,
                                                  std::string_view label,
@@ -475,13 +475,13 @@ TEST_F(ExprQueryTest, functionForm) {
 }
 
 TEST_F(ExprQueryTest, varsBindAsValues) {
-  auto docs = search("title_un:$t", [&](solux::api::Query& q) {
-    auto& e = std::get<solux::api::ExprQuery>(q.kind);
-    using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>;
-    static solux::api::Val val;  // outlives the request in this test
+  auto docs = search("title_un:$t", [&](luxir::api::Query& q) {
+    auto& e = std::get<luxir::api::ExprQuery>(q.kind);
+    using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>;
+    static luxir::api::Val val;  // outlives the request in this test
     val.kind = std::string_view("blade");
-    static Pair pair{"t", ::hpp_proto::indirect_view<solux::api::Val>{&val}};
-    e.vars = solux::api::map_view<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>(
+    static Pair pair{"t", ::hpp_proto::indirect_view<luxir::api::Val>{&val}};
+    e.vars = luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>(
         std::span<const Pair>(&pair, 1));
   });
   ASSERT_EQ(1u, docs.size());
@@ -497,7 +497,7 @@ TEST_F(ExprQueryTest, expansionSplicesIntoRequestTree) {
   cur.exprQuery("tag_s:scifi").fields({"id"}).limit(-1);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_TRUE(std::holds_alternative<solux::api::Match>(cur.rawQuery().kind));
+  EXPECT_TRUE(std::holds_alternative<luxir::api::Match>(cur.rawQuery().kind));
 }
 
 TEST_F(ExprQueryTest, rigorousErrors) {

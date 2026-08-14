@@ -3,12 +3,12 @@
 #include <array>
 #include <string>
 
-#include "solux/schema/Schema.h"
-#include "solux/util/proto.h"
-#include "solux/value/ValueExprParser.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/util/proto.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/SchemaBuilder.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 

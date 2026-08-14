@@ -1,6 +1,6 @@
 # Indexing
 
-Solux has one update model with two HTTP encodings. Use a JSON request when a
+Luxir has one update model with two HTTP encodings. Use a JSON request when a
 group of documents is naturally bounded or must be atomic. Use NDJSON for a
 feed or file of any size. The latter is a real stream: documents enter the
 indexing pipeline while later bytes are still arriving, so a client does not
@@ -145,7 +145,7 @@ Content-Type: application/x-ndjson
 {"_end_":{"commit":{}}}
 ```
 
-There is no stream-size limit. Solux frames records as bytes arrive and cuts
+There is no stream-size limit. Luxir frames records as bytes arrive and cuts
 ordinary non-atomic input into internal mini-batches. The limits are on one
 record and on explicitly atomic material, not on the stream.
 

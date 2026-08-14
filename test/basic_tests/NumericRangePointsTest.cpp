@@ -8,19 +8,19 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/index/PointsWriter.h"
-#include "solux/query/NumericRangeQuery.h"
-#include "solux/query/QueryPrep.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/PointsReader.h"
-#include "solux/util/random.h"
+#include "luxir/index/PointsWriter.h"
+#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/QueryPrep.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PointsReader.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -211,7 +211,7 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
 
 } // namespace
 
-class NumericRangePointsTest : public SoluxTest {};
+class NumericRangePointsTest : public LuxirTest {};
 
 TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
   constexpr int32_t N = 2600;

@@ -8,52 +8,52 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
-#include "solux/index/handler/VectorHandler.h"
-#include "solux/reader/VectorReader.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/schema/FieldType.h"
-#include "solux/schema/Schema.h"
-#include "solux/store/FSDirectory.h"
-#include "solux/util/log.h"
-#include "solux/api/build.h"
+#include "luxir/index/handler/VectorHandler.h"
+#include "luxir/reader/VectorReader.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/schema/FieldType.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/store/FSDirectory.h"
+#include "luxir/util/log.h"
+#include "luxir/api/build.h"
 
 #include <memory_resource>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class VectorColTest : public SoluxTest {
+class VectorColTest : public LuxirTest {
 protected:
   void SetUp() override {
-    SoluxTest::SetUp();
-    auto col = soluxNode->getCollection("main");
+    LuxirTest::SetUp();
+    auto col = luxirNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
   }
 };
 
 // Build a Val containing a single Vector{f32}, backed by `mr` (must outlive the Val).
-static solux::api::Val makeVec(std::pmr::memory_resource& mr, std::initializer_list<float> floats) {
-  solux::api::Val v;
-  auto& f32 = v.kind.emplace<solux::api::Vector>().f32.emplace();
-  float* a = solux::api::build::allocArray(f32.v, floats.size(), mr);
+static luxir::api::Val makeVec(std::pmr::memory_resource& mr, std::initializer_list<float> floats) {
+  luxir::api::Val v;
+  auto& f32 = v.kind.emplace<luxir::api::Vector>().f32.emplace();
+  float* a = luxir::api::build::allocArray(f32.v, floats.size(), mr);
   std::size_t i = 0;
   for (float f : floats) a[i++] = f;
   return v;
 }
 
-static void indexVal(Inverter& inverter, Inverter::IndexHandler& handler, const solux::api::Val& val) {
+static void indexVal(Inverter& inverter, Inverter::IndexHandler& handler, const luxir::api::Val& val) {
   handler.index(inverter, val);
 }
 
 static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite = true) {
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   f.normalize_on_write = normalizeOnWrite;
   b.set(col);
 }
@@ -63,12 +63,12 @@ static void indexMultiVec(Inverter& inverter, Inverter::IndexHandler& handler,
                           int32_t docid, std::vector<std::vector<float>> vecs) {
   std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(docid);
-  solux::api::Val v;
-  auto& arr = v.kind.emplace<solux::api::ArrVector>();
-  auto* a = solux::api::build::allocArray(arr.v, vecs.size(), mr);
+  luxir::api::Val v;
+  auto& arr = v.kind.emplace<luxir::api::ArrVector>();
+  auto* a = luxir::api::build::allocArray(arr.v, vecs.size(), mr);
   for (std::size_t i = 0; i < vecs.size(); i++) {
     auto& f32 = a[i].f32.emplace();
-    float* fa = solux::api::build::allocArray(f32.v, vecs[i].size(), mr);
+    float* fa = luxir::api::build::allocArray(f32.v, vecs[i].size(), mr);
     for (std::size_t j = 0; j < vecs[i].size(); j++) fa[j] = vecs[i][j];
   }
   indexVal(inverter, handler, v);
@@ -127,10 +127,10 @@ TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
   auto& handler = inverter.getIndexHandler("vec_v");
 
   std::pmr::monotonic_buffer_resource mr;
-  solux::api::Val val;
-  auto& f32 = val.kind.emplace<solux::api::Vector>().f32.emplace();
+  luxir::api::Val val;
+  auto& f32 = val.kind.emplace<luxir::api::Vector>().f32.emplace();
   constexpr size_t DIMS = 256 * 1024;
-  float* values = solux::api::build::allocArray(f32.v, DIMS, mr);
+  float* values = luxir::api::build::allocArray(f32.v, DIMS, mr);
   for (size_t i = 0; i < DIMS; i++) values[i] = (float)i;
 
   size_t extraBefore = inverter.extraRamBytes;
@@ -156,7 +156,7 @@ TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
 // for the next request.
 TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
   std::string pathTemplate =
-      (std::filesystem::temp_directory_path() / "solux_vector_io_XXXXXX").string();
+      (std::filesystem::temp_directory_path() / "luxir_vector_io_XXXXXX").string();
   ASSERT_NE(nullptr, ::mkdtemp(pathTemplate.data()));
   std::filesystem::path path(pathTemplate);
 
@@ -166,8 +166,8 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
 
     auto submit = [&](bool commit) {
       std::pmr::monotonic_buffer_resource mr;
-      solux::api::UpdateRequest request;
-      auto* docs = solux::api::build::allocArray(request.docs, 1, mr);
+      luxir::api::UpdateRequest request;
+      auto* docs = luxir::api::build::allocArray(request.docs, 1, mr);
       CollectionHelper::convertDocToProto(
           flatdoc("vec_v", std::vector<float>(512, 1.0f)), docs[0], mr);
       if (commit) request.commit.emplace();
@@ -506,9 +506,9 @@ TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
 
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   b.set(h.collection());
 
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
@@ -558,9 +558,9 @@ TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
 
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   f.normalized = true;
 
   auto schema = b.set(h.collection());
@@ -595,9 +595,9 @@ TEST_F(VectorColTest, cosineSkipsZeroVector) {
 
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   b.set(h.collection());
 
   // Doc "a" has a zero vector (skipped); doc "b" has a usable one (kept).
@@ -650,10 +650,10 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
 TEST_F(VectorColTest, schemaProtoRoundTrip) {
   SchemaBuilder b;
   auto& f = b.field("embedding");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
   f.dims = 384;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
 
   auto schema = b.build();
   auto it = schema->getFieldType("embedding");
@@ -666,17 +666,17 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   EXPECT_TRUE(vft->hasColumn());
   EXPECT_TRUE(vft->isSet(FieldType::FIXED_SIZE));
 
-  solux::api::SchemaDef outDef;
+  luxir::api::SchemaDef outDef;
   std::pmr::monotonic_buffer_resource outMr;
   schema->toProto(&outDef, outMr);
   const auto* fd = outDef.fields.find("embedding");
   ASSERT_NE(nullptr, fd);
   ASSERT_TRUE(fd->type.has_value());
-  EXPECT_EQ(solux::api::FieldDef_::FieldClass::VECTOR, *fd->type);
+  EXPECT_EQ(luxir::api::FieldDef_::FieldClass::VECTOR, *fd->type);
   ASSERT_TRUE(fd->dims.has_value());
   EXPECT_EQ(384, *fd->dims);
   ASSERT_TRUE(fd->metric.has_value());
-  EXPECT_EQ(solux::api::VectorMetric::COSINE, *fd->metric);
+  EXPECT_EQ(luxir::api::VectorMetric::COSINE, *fd->metric);
   // toProto emits the authored sparse def: normalize_on_write was never set
   // (the on-write default is derived from COSINE), so it round-trips as absent.
   EXPECT_FALSE(fd->normalize_on_write.has_value());

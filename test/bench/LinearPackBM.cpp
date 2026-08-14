@@ -1,14 +1,14 @@
 #include <cstdint>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/codec/Codec.h"
-#include "solux/codec/LinearPack.h"
-#include "solux/util/random.h"
+#include "bench/luxir_bench.h"
+#include "luxir/codec/Codec.h"
+#include "luxir/codec/LinearPack.h"
+#include "luxir/util/random.h"
 #include <gtest/gtest.h>
 
 // Head-to-head for the two integer bit-packing layouts, across bit widths:
-//   - SoluxSIMDFor: FastPFOR 4-interleaved-lane layout (the numeric/postings
+//   - LuxirSIMDFor: FastPFOR 4-interleaved-lane layout (the numeric/postings
 //     codec). Bulk decode is one shared shift+mask per output vector; single
 //     select pays lane arithmetic plus a 1-2 word stitch.
 //   - LinearPack: flat contiguous exact-bpv layout (the ord/column codec).
@@ -18,7 +18,7 @@
 // is at parity except the 11-16 and 26-31 bit bands (load-window boundaries).
 // Both access the same 128 values, packed each way from one random source.
 
-namespace solux {
+namespace luxir {
 
 static constexpr uint32_t N = 128;
 
@@ -36,8 +36,8 @@ struct PackedBlock {
     uint32_t vmask = bits >= 32 ? ~0u : ((1u << bits) - 1u);
     for (uint32_t i = 0; i < N; i++) vals[i] = (uint32_t)rng.rint(vmask) & vmask;
 
-    SoluxSIMDFor codec;
-    pfor.assign(SoluxSIMDFor::byteSize(N, bits) + 64, 0);
+    LuxirSIMDFor codec;
+    pfor.assign(LuxirSIMDFor::byteSize(N, bits) + 64, 0);
     uint32_t outSz = pfor.size();
     std::vector<uint32_t> in(vals);
     codec.encodeWithMeta(in.data(), N, pfor.data(), outSz, 0, bits);
@@ -50,7 +50,7 @@ struct PackedBlock {
 
 static void BM_pfor_block(benchmark::State& state, uint8_t bits) {
   PackedBlock blk(bits);
-  SoluxSIMDFor codec;
+  LuxirSIMDFor codec;
   uint32_t out[N];
   for (auto _ : state) {
     codec.decodeSingleBlock(blk.pfor.data(), out, N, bits);
@@ -82,7 +82,7 @@ static void probeOrder(uint32_t* idx) {
 
 static void BM_pfor_select(benchmark::State& state, uint8_t bits) {
   PackedBlock blk(bits);
-  SoluxSIMDFor codec;
+  LuxirSIMDFor codec;
   uint32_t idx[N];
   probeOrder(idx);
   uint32_t sink = 0;
@@ -110,11 +110,11 @@ static void BM_flat_select(benchmark::State& state, uint8_t bits) {
 // Widths span every code path: the fast loadu band (17-24), the narrow-load
 // band (11-16), the loadl band (<=10), and the two-part high band (26-31).
 #define REG(b)                                                          \
-  SOLUX_BENCHMARK_CAPTURE(BM_pfor_block, b/blk, (uint8_t)b);            \
-  SOLUX_BENCHMARK_CAPTURE(BM_flat_block, b/blk, (uint8_t)b);           \
-  SOLUX_BENCHMARK_CAPTURE(BM_pfor_select, b/sel, (uint8_t)b);          \
-  SOLUX_BENCHMARK_CAPTURE(BM_flat_select, b/sel, (uint8_t)b);
+  LUXIR_BENCHMARK_CAPTURE(BM_pfor_block, b/blk, (uint8_t)b);            \
+  LUXIR_BENCHMARK_CAPTURE(BM_flat_block, b/blk, (uint8_t)b);           \
+  LUXIR_BENCHMARK_CAPTURE(BM_pfor_select, b/sel, (uint8_t)b);          \
+  LUXIR_BENCHMARK_CAPTURE(BM_flat_select, b/sel, (uint8_t)b);
 
 REG(4) REG(8) REG(12) REG(16) REG(20) REG(24) REG(31)
 
-}  // namespace solux
+}  // namespace luxir

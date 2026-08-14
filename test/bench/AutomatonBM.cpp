@@ -3,16 +3,16 @@
 #include <string>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/reader/AutomatonSeekEnum.h"
-#include "solux/reader/BruteDfaTermsEnum.h"
-#include "solux/util/automaton/RegExpParser.h"
-#include "solux/util/automaton/WildcardCompiler.h"
+#include "bench/luxir_bench.h"
+#include "luxir/reader/AutomatonSeekEnum.h"
+#include "luxir/reader/BruteDfaTermsEnum.h"
+#include "luxir/util/automaton/RegExpParser.h"
+#include "luxir/util/automaton/WildcardCompiler.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::automaton;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::automaton;
+using namespace luxir::test;
 
 namespace {
 
@@ -76,13 +76,13 @@ void BM_AutomatonEnum(benchmark::State& state, std::string_view pattern, bool re
 
 } // namespace
 
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_trailing_smart, "match_*", false, false);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_trailing_brute, "match_*", false, true);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_mid_smart, "match_*_end", false, false);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_mid_brute, "match_*_end", false, true);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_leading_smart, "*_end", false, false);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_leading_brute, "*_end", false, true);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_alternation_smart, "(match|noise)_[a-m].*", true, false);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_alternation_brute, "(match|noise)_[a-m].*", true, true);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_repeat_smart, "match_[a-z][0-9]{1,4}_end", true, false);
-SOLUX_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_repeat_brute, "match_[a-z][0-9]{1,4}_end", true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_trailing_smart, "match_*", false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_trailing_brute, "match_*", false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_mid_smart, "match_*_end", false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_mid_brute, "match_*_end", false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_leading_smart, "*_end", false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, wildcard_leading_brute, "*_end", false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_alternation_smart, "(match|noise)_[a-m].*", true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_alternation_brute, "(match|noise)_[a-m].*", true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_repeat_smart, "match_[a-z][0-9]{1,4}_end", true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_AutomatonEnum, regex_repeat_brute, "match_[a-z][0-9]{1,4}_end", true, true);

@@ -4,18 +4,18 @@
 
 #include <gtest/gtest.h>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
 using namespace std;
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-using Operator = solux::api::Match_::Operator;
+using Operator = luxir::api::Match_::Operator;
 
-class SimpleQueryTest : public SoluxTest {
+class SimpleQueryTest : public LuxirTest {
 public:
   CollectionHelper helper{"main"};
 
@@ -34,12 +34,12 @@ public:
 
   // run q over the given fields; returns doc ids (empty on error)
   std::vector<Doc> search(std::string_view q, std::initializer_list<std::string> fields,
-                          std::function<void(solux::api::SimpleQuery&)> tweak = {}) {
+                          std::function<void(luxir::api::SimpleQuery&)> tweak = {}) {
     auto req = localReq(helper.getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     cur.simpleQuery(q, fields).fields({"id"}).limit(-1);
     if (tweak) {
-      tweak(std::get<solux::api::SimpleQuery>(cur.rawQuery().kind));
+      tweak(std::get<luxir::api::SimpleQuery>(cur.rawQuery().kind));
     }
     req->execute();
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -149,13 +149,13 @@ TEST_F(SimpleQueryTest, fuzzyTerm) {
 TEST_F(SimpleQueryTest, operatorAndMinMatch) {
   // default operator AND: every clause must match
   auto docs = search("blade replicant", {"title_un", "body_un"},
-                     [](solux::api::SimpleQuery& sq) { sq.operator_ = Operator::AND; });
+                     [](luxir::api::SimpleQuery& sq) { sq.operator_ = Operator::AND; });
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 
   // min_match: at least 2 of 3 optional clauses
   docs = search("blade replicant swords", {"title_un", "body_un"},
-                [](solux::api::SimpleQuery& sq) { sq.min_match = 2; });
+                [](luxir::api::SimpleQuery& sq) { sq.min_match = 2; });
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));
 }
@@ -178,7 +178,7 @@ TEST_F(SimpleQueryTest, minMatchNeverBindsToFieldExpansion) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.simpleQuery("blade", {"title_un", "body_un"}).fields({"id"}).limit(-1);
-  std::get<solux::api::SimpleQuery>(cur.rawQuery().kind).min_match = 2;
+  std::get<luxir::api::SimpleQuery>(cur.rawQuery().kind).min_match = 2;
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(1u, req->getDocs().size());  // d1 matches via title alone
@@ -188,7 +188,7 @@ TEST_F(SimpleQueryTest, minMatchNeverBindsToFieldExpansion) {
 TEST_F(SimpleQueryTest, minMatchCountsMixedFieldTypeClauses) {
   // 2 of 3 clauses: an exact STRING match counts alongside analyzed TEXT ones
   auto docs = search("tag_s:scifi blade swords", {"title_un", "body_un"},
-                     [](solux::api::SimpleQuery& sq) { sq.min_match = 2; });
+                     [](luxir::api::SimpleQuery& sq) { sq.min_match = 2; });
   EXPECT_EQ(2u, docs.size());
   EXPECT_TRUE(hasId(docs, "d1"));  // scifi + blade
   EXPECT_TRUE(hasId(docs, "d3"));  // scifi + swords
@@ -211,7 +211,7 @@ TEST_F(SimpleQueryTest, minMatchOnRequiredTopLevelIsSilentlyInapplicable) {
   // min_match cannot apply - that is user-input-contingent, so it costs no
   // warning
   cur.simpleQuery("blade +runner", {"title_un"}).fields({"id"}).limit(-1);
-  std::get<solux::api::SimpleQuery>(cur.rawQuery().kind).min_match = 2;
+  std::get<luxir::api::SimpleQuery>(cur.rawQuery().kind).min_match = 2;
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(1u, req->getDocs().size());  // both required terms: d1
@@ -222,7 +222,7 @@ TEST_F(SimpleQueryTest, allowedFieldsNarrows) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.simpleQuery("tag_s:scifi", {"title_un"}).fields({"id"}).limit(-1);
-  auto& sq = std::get<solux::api::SimpleQuery>(cur.rawQuery().kind);
+  auto& sq = std::get<luxir::api::SimpleQuery>(cur.rawQuery().kind);
   auto* allowed = build::allocArray(sq.allowed_fields, 1, cur.mr());
   allowed[0] = build::arenaStr(cur.mr(), "title_un");
   req->execute();
@@ -264,7 +264,7 @@ TEST_F(SimpleQueryTest, expansionSplicesIntoRequestTree) {
   cur.simpleQuery("tag_s:scifi", {"title_un"}).fields({"id"}).limit(-1);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_TRUE(std::holds_alternative<solux::api::Match>(cur.rawQuery().kind));
+  EXPECT_TRUE(std::holds_alternative<luxir::api::Match>(cur.rawQuery().kind));
 
   // a q that parses to nothing has no structured equivalent to splice; the
   // string arm stays put and the query matches no documents
@@ -273,6 +273,6 @@ TEST_F(SimpleQueryTest, expansionSplicesIntoRequestTree) {
   cur2.simpleQuery("+ | -", {"title_un"}).fields({"id"}).limit(-1);
   req2->execute();
   ASSERT_TRUE(req2->ok()) << req2->errorMsg();
-  EXPECT_TRUE(std::holds_alternative<solux::api::SimpleQuery>(cur2.rawQuery().kind));
+  EXPECT_TRUE(std::holds_alternative<luxir::api::SimpleQuery>(cur2.rawQuery().kind));
   EXPECT_EQ(0u, req2->getDocs().size());
 }

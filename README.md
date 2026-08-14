@@ -1,6 +1,6 @@
-# Solux
+# Luxir
 
-Solux is a high-performance hybrid search engine: full-text relevance, vector
+Luxir is a high-performance hybrid search engine: full-text relevance, vector
 similarity, faceting, and analytics in one native-code core. Queries, filters,
 facets, metrics, and rank fusion are one composable request tree, served over
 an HTTP/JSON API for humans and a typed streaming gRPC API for applications.
@@ -21,7 +21,7 @@ No collection creation, schema ceremony, or client library is required to get
 there. Field-name suffixes provide useful defaults, a write to a new collection
 creates it, and a terse request can always be echoed back in its canonical form.
 
-## Why Solux
+## Why Luxir
 
 - **Hybrid is a property of the query tree, not a pipeline.** kNN composes with
   boolean logic and filters, and reciprocal-rank fusion combines lexical and
@@ -35,10 +35,10 @@ creates it, and a terse request can always be echoed back in its canonical form.
   to the update endpoint and export every match as document-per-line NDJSON over
   one connection.
 - **Efficiency is the product.** Cloud makes inefficiency a recurring bill.
-  Solux is built to use one large modern machine well: native code, memory-mapped
+  Luxir is built to use one large modern machine well: native code, memory-mapped
   immutable segments, work-stealing parallelism, and SIMD-aware data paths.
 
-The complete shipped capability list is in [Solux Features](docs/features.md).
+The complete shipped capability list is in [Luxir Features](docs/features.md).
 For the design rationale, see [Architecture](docs/design/architecture.md).
 
 ## Try it
@@ -46,7 +46,7 @@ For the design rationale, see [Architecture](docs/design/architecture.md).
 Start a built server and check the HTTP endpoint:
 
 ```bash
-./build/gcc-release/bin/solux
+./build/gcc-release/bin/luxir
 curl http://localhost:9400/health
 ```
 
@@ -71,21 +71,21 @@ Continue with the [Quickstart](docs/guide/quickstart.md), then use the
 
 ## Build from source
 
-Solux is pre-1.0 and currently distributed as source. It requires a
+Luxir is pre-1.0 and currently distributed as source. It requires a
 C++26-capable compiler, CMake, Ninja, vcpkg, and the native dependencies listed
 in [Build Setup](docs/dev/build-setup.md). With those dependencies installed:
 
 ```bash
 cmake --preset gcc-release
 cmake --build --preset gcc-release
-./build/gcc-release/bin/solux
+./build/gcc-release/bin/luxir
 ```
 
 The project is licensed under the [Apache License 2.0](LICENSE).
 
 ## Current scope
 
-Solux is moving quickly and interfaces can change. It is currently a
+Luxir is moving quickly and interfaces can change. It is currently a
 single-node engine with no built-in authentication or TLS; deploy it behind
 your own network and security boundary. Replication, distributed query
 execution, packaged clients, and a collection-management API are not shipped

@@ -2,9 +2,9 @@
 #include <memory>
 #include <string>
 
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/TestIndex.h"
-#include "solux/query/PrefixQuery.h"
+#include "luxir/query/PrefixQuery.h"
 
 // A/B matrix for the constant-score multiterm union scorers (eager bitset vs
 // all-cursors windowed vs heap-gated windows), across term count, per-term
@@ -16,8 +16,8 @@
 // probing it needs a corpus too large for a routine bench; measure it on the
 // bench box against a real index.
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 

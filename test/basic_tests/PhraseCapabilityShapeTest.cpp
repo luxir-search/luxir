@@ -4,15 +4,15 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/PhraseQuery.h"
+#include "luxir/query/PhraseQuery.h"
 #include "test/CollectionHelper.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class PhraseCapabilityShapeTest : public SoluxTest {
+class PhraseCapabilityShapeTest : public LuxirTest {
 public:
   CollectionHelper helper;
   std::shared_ptr<IndexReader> reader;

@@ -1,6 +1,6 @@
-# Solux Architecture
+# Luxir Architecture
 
-Solux is a hybrid search engine: full-text relevance, vector similarity, and
+Luxir is a hybrid search engine: full-text relevance, vector similarity, and
 faceted analytics in one native-code core, queried through one composable
 request tree.
 For a class-by-class map of the source tree, see
@@ -8,7 +8,7 @@ For a class-by-class map of the source tree, see
 
 ## Design goals
 
-Solux started from a premise about cloud economics: compute is no longer a
+Luxir started from a premise about cloud economics: compute is no longer a
 sunk cost. You pay for inefficiency every month, forever - and instance
 pricing is linear up to very large machines, so one big node is now the
 economical unit of capacity that clusters of small machines once were. Both

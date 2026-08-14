@@ -1,4 +1,4 @@
-// Wire-model regression net for the concrete solux::api classes. Instead of hand-writing an
+// Wire-model regression net for the concrete luxir::api classes. Instead of hand-writing an
 // instance + a verifier per message (which silently fails to cover any field someone forgets
 // to add), this drives EVERY message type through one generic round-trip:
 //
@@ -8,7 +8,7 @@
 //
 // A canonical-JSON fixpoint catches any field the codec drops or mis-tags, with zero per-field
 // code: a newly added proto field is covered the moment it exists in the struct + meta. The one
-// hand-maintained thing is the message-type list (SOLUX_MSGS) - adding a message is one line,
+// hand-maintained thing is the message-type list (LUXIR_MSGS) - adding a message is one line,
 // and a missing message is then the single possible coverage gap (vs per-field gaps before).
 //
 // Scope/limits: this is self-round-trip (fixpoint), so it catches dropped/mis-tagged fields and
@@ -36,15 +36,15 @@
 
 #include <glaze/glaze.hpp>
 
-#include "solux/api/padded_input.h"
-#include "solux/api/solux_types.hpp"
-#include "solux/api/solux.hpp"
-#include "solux/api/build.h"
+#include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_types.hpp"
+#include "luxir/api/luxir.hpp"
+#include "luxir/api/build.h"
 
 namespace {
 using namespace std::string_view_literals;
-namespace P = solux::api;
-namespace B = solux::api::build;
+namespace P = luxir::api;
+namespace B = luxir::api::build;
 
 // Cap on message-nesting depth (breaks self-referential cycles). Coverage only; the fixpoint
 // holds at any depth.
@@ -62,7 +62,7 @@ template <class... A> struct vt_variant<std::variant<A...>> : std::true_type {};
 template <class> struct vt_span : std::false_type {};
 template <class U, std::size_t E> struct vt_span<std::span<U, E>> : std::true_type { using type = std::remove_cv_t<U>; };
 template <class> struct vt_map : std::false_type {};
-template <class K, class V> struct vt_map<solux::api::map_view<K, V>> : std::true_type { using val = V; };
+template <class K, class V> struct vt_map<luxir::api::map_view<K, V>> : std::true_type { using val = V; };
 
 // ----- small helpers -----
 template <class U>
@@ -74,13 +74,13 @@ U* arenaNew(std::pmr::memory_resource& mr) {
 
 // One-entry by-value map slot (for map_view<sv, Column> / map_view<sv, TopDocs>).
 template <class V>
-V& mapValueSlot(solux::api::map_view<std::string_view, V>& m, std::string_view key,
+V& mapValueSlot(luxir::api::map_view<std::string_view, V>& m, std::string_view key,
                 std::pmr::memory_resource& mr) {
   using Pair = std::pair<std::string_view, V>;
   Pair* arr = (Pair*)mr.allocate(sizeof(Pair), alignof(Pair));
   ::new (arr) Pair();
   arr->first = key;
-  m = solux::api::map_view<std::string_view, V>(std::span<const Pair>(arr, 1));
+  m = luxir::api::map_view<std::string_view, V>(std::span<const Pair>(arr, 1));
   return arr->second;
 }
 
@@ -235,7 +235,7 @@ void roundTripType(const char* nm) {
 }
 
 // The one hand-maintained list: every message type. Add a message -> add a line.
-#define SOLUX_MSGS(X)                                                                              \
+#define LUXIR_MSGS(X)                                                                              \
   X(Target) X(SearchRequest) X(SearchOp) X(GenOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(NamedQuery)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
@@ -255,7 +255,7 @@ void roundTripType(const char* nm) {
 
 TEST(ProtoRoundTrip, AllMessages) {
 #define RT(T) roundTripType<P::T>(#T);
-  SOLUX_MSGS(RT)
+  LUXIR_MSGS(RT)
 #undef RT
 }
 

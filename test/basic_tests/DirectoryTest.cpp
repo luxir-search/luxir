@@ -4,14 +4,14 @@
 #include <limits>
 #include <oneapi/tbb/task_group.h>
 
-#include "solux/store/Directory.h"
-#include "solux/store/FSDirectory.h"
-#include "solux/store/CheckedDirFactory.h"
-#include "test/SoluxTest.h"
+#include "luxir/store/Directory.h"
+#include "luxir/store/FSDirectory.h"
+#include "luxir/store/CheckedDirFactory.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
+using namespace luxir;
 
-class DirectoryTest : public solux::SoluxTest {
+class DirectoryTest : public luxir::LuxirTest {
 protected:
   void addFile(Directory& dir, const std::string& name, const std::string& data) {
     std::unique_ptr<File> f = dir.createFile(name);
@@ -215,7 +215,7 @@ protected:
   }
 
   std::filesystem::path getTempDir() {
-    std::string tmpl = (std::filesystem::temp_directory_path() / "solux_test_XXXXXX").string();
+    std::string tmpl = (std::filesystem::temp_directory_path() / "luxir_test_XXXXXX").string();
     if (mkdtemp(tmpl.data()) == nullptr) {
       throw std::runtime_error("Failed to create temp directory");
     }

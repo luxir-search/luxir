@@ -13,14 +13,14 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/PhraseQuery.h"
-#include "solux/search/Collector.h"
-#include "solux/search/Similarity.h"
-#include "test/SoluxTest.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/search/Collector.h"
+#include "luxir/search/Similarity.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -101,7 +101,7 @@ bool bruteExists(const std::vector<std::string>& doc,
 
 } // namespace
 
-class PhraseSlopTest : public SoluxTest {};
+class PhraseSlopTest : public LuxirTest {};
 
 TEST_F(PhraseSlopTest, handTracedFrequencyAndCapturedThreshold) {
   TestIndex index;

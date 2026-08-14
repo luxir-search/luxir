@@ -3,15 +3,15 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#include "test/SoluxTest.h"
-#include "solux/util/SharedLazyMap.h"
-#include "solux/util/StrRef.h"
-#include "solux/util/log.h"
-#include "solux/util/proto.h"
+#include "test/LuxirTest.h"
+#include "luxir/util/SharedLazyMap.h"
+#include "luxir/util/StrRef.h"
+#include "luxir/util/log.h"
+#include "luxir/util/proto.h"
 
-using namespace solux;
+using namespace luxir;
 
-class UtilTest : public SoluxTest {
+class UtilTest : public LuxirTest {
 protected:
 };
 

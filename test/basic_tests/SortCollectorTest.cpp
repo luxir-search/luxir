@@ -1,14 +1,14 @@
 #include <gtest/gtest.h>
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/search/FieldSortCollector.h"
-#include "solux/search/SortField.h"
-#include "solux/search/SearchOverrides.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/schema/FieldType.h"
-#include "solux/util/random.h"
+#include "luxir/search/FieldSortCollector.h"
+#include "luxir/search/SortField.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/schema/FieldType.h"
+#include "luxir/util/random.h"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -17,8 +17,8 @@
 #include <optional>
 #include <utility>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -149,7 +149,7 @@ struct FieldSortBulkResult {
 
 } // namespace
 
-class SortCollectorTest : public SoluxTest {
+class SortCollectorTest : public LuxirTest {
 protected:
   struct WindowResult {
     std::vector<segdoc> docs;
@@ -166,7 +166,7 @@ protected:
     if (docs == nullptr) return {};
     const auto* column = docs->columns.find("id_s");
     if (column == nullptr) return {};
-    const auto& col = std::get<solux::api::ColStr>(column->kind);
+    const auto& col = std::get<luxir::api::ColStr>(column->kind);
     std::vector<std::string> ids;
     for (auto id : col.v) ids.emplace_back(id);
     return ids;
@@ -243,7 +243,7 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
                  int32_t limit) {
     FieldSortBulkGuard guard(disableBulk);
     KeyGatherGuard gatherGuard(disableGather);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cursor = req->topDocs("q").getNumber().limit(limit)
         .fields({"id_s", "sort_i", "sort_s"});
@@ -285,11 +285,11 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
     if (docs == nullptr) return result;
     result.hitCount = docs->found.value_or(0);
     const auto& ids =
-        std::get<solux::api::ColStr>(docs->columns.at("id_s").kind).v;
+        std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind).v;
     const auto& ints =
-        std::get<solux::api::ColInt>(docs->columns.at("sort_i").kind).v;
+        std::get<luxir::api::ColInt>(docs->columns.at("sort_i").kind).v;
     const auto& strings =
-        std::get<solux::api::ColStr>(docs->columns.at("sort_s").kind).v;
+        std::get<luxir::api::ColStr>(docs->columns.at("sort_s").kind).v;
     result.ids.assign(ids.begin(), ids.end());
     result.ints.assign(ints.begin(), ints.end());
     result.strings.reserve(strings.size());
@@ -631,7 +631,7 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
                  qb::SortDir direction) {
     FieldSortBulkGuard bulkGuard(disableBulk);
     SortSkipStatsGuard statsGuard;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cursor = req->topDocs("q").getNumber().limit(97)
         .fields({"id_s"});
@@ -1166,7 +1166,7 @@ TEST_F(SortCollectorTest, SortByStringField) {
   helper.index(flatdoc("id_s", "doc5", "name_s", "alice"), UpdateMessage::COMMIT); // duplicate value
   
   // Create a search request that sorts by name ascending
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
   qb::sort(cur, "name_s", qb::ASC);
@@ -1177,8 +1177,8 @@ TEST_F(SortCollectorTest, SortByStringField) {
   ASSERT_EQ(5, docs->found.value_or(0));
 
   // Verify sort order: alice (doc2), alice (doc5), bob, charlie, david
-  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-  auto& nameCol = std::get<solux::api::ColStr>(docs->columns.at("name_s").kind);
+  auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& nameCol = std::get<luxir::api::ColStr>(docs->columns.at("name_s").kind);
 
   ASSERT_EQ(5, (int)idCol.v.size());
   ASSERT_EQ(5, (int)nameCol.v.size());
@@ -1200,7 +1200,7 @@ TEST_F(SortCollectorTest, SortByStringField) {
   ASSERT_EQ("doc4", idCol.v[4]);
 
   // Test descending sort as well
-  auto req3 = localReq(soluxNode->getSearchEngine());
+  auto req3 = localReq(luxirNode->getSearchEngine());
   req3->collection("main");
   auto& cur3 = req3->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
   qb::sort(cur3, "name_s", qb::DESC);
@@ -1211,8 +1211,8 @@ TEST_F(SortCollectorTest, SortByStringField) {
   ASSERT_EQ(5, docs3->found.value_or(0));
 
   // Verify descending sort order: david, charlie, bob, alice (doc2), alice (doc5)
-  auto& idCol3 = std::get<solux::api::ColStr>(docs3->columns.at("id_s").kind);
-  auto& nameCol3 = std::get<solux::api::ColStr>(docs3->columns.at("name_s").kind);
+  auto& idCol3 = std::get<luxir::api::ColStr>(docs3->columns.at("id_s").kind);
+  auto& nameCol3 = std::get<luxir::api::ColStr>(docs3->columns.at("name_s").kind);
 
   ASSERT_EQ("david", nameCol3.v[0]);
   ASSERT_EQ("doc4", idCol3.v[0]);
@@ -1248,7 +1248,7 @@ TEST_F(SortCollectorTest, SegmentOrdMatchesGlobalAcrossDictionaryShapes) {
   CollectionHelper helper;
   auto run = [&](StringSortMode mode, qb::SortDir direction, int32_t limit) {
     StringSortModeGuard guard(mode);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(limit).getScores().allQuery().fields({"id_s"});
     qb::sort(cur, "name_s", direction);
@@ -1256,7 +1256,7 @@ TEST_F(SortCollectorTest, SegmentOrdMatchesGlobalAcrossDictionaryShapes) {
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     const auto* docs = req->docList("q");
     const auto& scoreCol =
-        std::get<solux::api::ColFloat>(docs->columns.at("_score_").kind).v;
+        std::get<luxir::api::ColFloat>(docs->columns.at("_score_").kind).v;
     return StringSortResult{
         resultIds(*req), std::vector<float>(scoreCol.begin(), scoreCol.end())};
   };
@@ -1309,7 +1309,7 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
     EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(comparator.get()));
   }
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").limit(2).allQuery().fields({"id_s"});
   qb::sort(cur, "name_s", qb::ASC);
@@ -1483,7 +1483,7 @@ TEST_F(SortCollectorTest, SegmentOrdMultiValuedSelectsMinAscAndMaxDesc) {
 
   auto run = [&](qb::SortDir direction) {
     StringSortModeGuard guard(StringSortMode::SEGMENT);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
     qb::sort(cur, "tags_ss", direction);
@@ -1511,7 +1511,7 @@ TEST_F(SortCollectorTest, SingleSegmentMultiValuedStringSort) {
   for (StringSortMode mode : {StringSortMode::SEGMENT, StringSortMode::GLOBAL}) {
     StringSortModeGuard guard(mode);
     auto run = [&](qb::SortDir direction) {
-      auto req = localReq(soluxNode->getSearchEngine());
+      auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
       qb::sort(cur, "tags_ss", direction);
@@ -1535,7 +1535,7 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 100, "price_s", "00100", "rating_i", 4), UpdateMessage::COMMIT);
 
   // Create a search request that sorts by price ascending
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
   qb::sort(cur, "price_i", qb::ASC);
@@ -1549,8 +1549,8 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   ASSERT_GT((int)docs->columns.size(), 0) << "No columns returned";
 
   // Check if values were actually loaded
-  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+  auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
 
   ASSERT_GT((int)idCol.v.size(), 0) << "No id values loaded";
   ASSERT_GT((int)priceCol.v.size(), 0) << "No price values loaded";
@@ -1570,7 +1570,7 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   ASSERT_EQ(150, priceCol.v[4]);
 
   // Now test string sorting with the same data - should give identical results
-  auto req2 = localReq(soluxNode->getSearchEngine());
+  auto req2 = localReq(luxirNode->getSearchEngine());
   req2->collection("main");
   auto& cur2 = req2->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_s"});
   qb::sort(cur2, "price_s", qb::ASC);
@@ -1581,8 +1581,8 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   ASSERT_EQ(5, docs2->found.value_or(0));
 
   // Verify same sort order as integer sort
-  auto& idCol2 = std::get<solux::api::ColStr>(docs2->columns.at("id_s").kind);
-  auto& priceStrCol = std::get<solux::api::ColStr>(docs2->columns.at("price_s").kind);
+  auto& idCol2 = std::get<luxir::api::ColStr>(docs2->columns.at("id_s").kind);
+  auto& priceStrCol = std::get<luxir::api::ColStr>(docs2->columns.at("price_s").kind);
 
   ASSERT_EQ("doc2", idCol2.v[0]);
   ASSERT_EQ("00050", priceStrCol.v[0]);
@@ -1609,7 +1609,7 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 100, "rating_i", 4), UpdateMessage::COMMIT);
 
   // Create a search request that sorts by rating desc, then price asc
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").getNumber().limit(10).allQuery()
       .fields({"id_s", "price_i", "rating_i"});
@@ -1629,9 +1629,9 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
   // rating 4: doc2(50), doc5(100)
   // rating 3: doc3(150)
 
-  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
-  auto& ratingCol = std::get<solux::api::ColInt>(docs->columns.at("rating_i").kind);
+  auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
+  auto& ratingCol = std::get<luxir::api::ColInt>(docs->columns.at("rating_i").kind);
   std::vector<std::string_view> expectedIds = {"doc4", "doc1", "doc2", "doc5", "doc3"};
   std::vector<int64_t> expectedPrices = {75, 100, 50, 100, 150};
   std::vector<int64_t> expectedRatings = {5, 5, 4, 4, 3};
@@ -1655,7 +1655,7 @@ TEST_F(SortCollectorTest, MixedColumnSortsSingleAndMultiSegment) {
     helper.index(flatdoc("id_s", "doc5", "price_i", 100, "rating_i", 4, "cat_s", "b"), mode(true));
   };
   auto run = [&](std::string_view secondary) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
     qb::sort(cur, "rating_i", qb::DESC);
@@ -1739,7 +1739,7 @@ TEST_F(SortCollectorTest, ScoreAndDocClausesInEveryPosition) {
     std::sort(expected.begin(), expected.end(),
               [&](const auto& a, const auto& b) { return compare(a, b, specs); });
 
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(10).fields({"id_s"});
     cur.rawQuery() = qb::boolean(cur.mr(), {}, {
@@ -1765,7 +1765,7 @@ TEST_F(SortCollectorTest, SecondaryClauseControlsHeapEviction) {
                  i == 99 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").limit(5).allQuery().fields({"id_s"});
   qb::sort(cur, "tier_i", qb::ASC);
@@ -1783,7 +1783,7 @@ TEST_F(SortCollectorTest, EqualScoreCandidateCanDisplaceHeapBottom) {
                  i == 19 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").limit(3).allQuery().fields({"id_s"});
   qb::sort(cur, "_score_", qb::DESC);
@@ -1805,7 +1805,7 @@ TEST_F(SortCollectorTest, CanonicalScoreSortsMatchDefault) {
     std::vector<float> scores;
   };
   auto run = [&](int mode) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(4).getScores().fields({"id_s"});
     cur.rawQuery() = qb::boolean(cur.mr(), {}, {
@@ -1821,7 +1821,7 @@ TEST_F(SortCollectorTest, CanonicalScoreSortsMatchDefault) {
     req->execute(true);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     const auto* docs = req->docList("q");
-    const auto& scores = std::get<solux::api::ColFloat>(docs->columns.at("_score_").kind).v;
+    const auto& scores = std::get<luxir::api::ColFloat>(docs->columns.at("_score_").kind).v;
     return Result{resultIds(*req), std::vector<float>(scores.begin(), scores.end())};
   };
 
@@ -1842,7 +1842,7 @@ TEST_F(SortCollectorTest, DocSortAcrossSegmentsAndMissingSecondary) {
   helper.index(flatdoc("id_s", "e", "tier_i", 0, "secondary_i", 3), UpdateMessage::COMMIT);
 
   auto run = [&](std::vector<std::pair<std::string_view, qb::SortDir>> specs) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s"});
     for (auto [field, direction] : specs) qb::sort(cur, field, direction);
@@ -1874,7 +1874,7 @@ TEST_F(SortCollectorTest, FieldSortReturnsScoresAndColumnDefaultsAscending) {
     });
   };
   auto runColumn = [&](qb::SortDir direction, bool omitted) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(10).fields({"id_s"});
     makeQuery(cur);
@@ -1886,7 +1886,7 @@ TEST_F(SortCollectorTest, FieldSortReturnsScoresAndColumnDefaultsAscending) {
   };
   EXPECT_EQ(runColumn(qb::ASC, false), runColumn(qb::ASC, true));
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").limit(10).getScores().fields({"id_s"});
   makeQuery(cur);
@@ -1896,7 +1896,7 @@ TEST_F(SortCollectorTest, FieldSortReturnsScoresAndColumnDefaultsAscending) {
   ASSERT_OK(req);
   EXPECT_EQ((std::vector<std::string>{"b", "a", "d", "c"}), resultIds(*req));
   const auto* docs = req->docList("q");
-  const auto& scores = std::get<solux::api::ColFloat>(docs->columns.at("_score_").kind).v;
+  const auto& scores = std::get<luxir::api::ColFloat>(docs->columns.at("_score_").kind).v;
   EXPECT_EQ((std::vector<float>{3.0f, 1.0f, 3.0f, 2.0f}),
             std::vector<float>(scores.begin(), scores.end()));
 }
@@ -1910,7 +1910,7 @@ TEST_F(SortCollectorTest, SortByPriceDescending) {
   helper.index(flatdoc("id_s", "doc3", "price_i", 150), UpdateMessage::COMMIT);
 
   // Create a search request that sorts by price descending
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s", "price_i"});
   qb::sort(cur, "price_i", qb::DESC);
@@ -1918,8 +1918,8 @@ TEST_F(SortCollectorTest, SortByPriceDescending) {
   ASSERT_OK(req);
 
   const auto* docs = req->docList("q");
-  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+  auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
 
   // Verify sort order by price descending: doc3(150), doc1(100), doc2(50)
   ASSERT_EQ("doc3", idCol.v[0]);
@@ -1942,7 +1942,7 @@ TEST_F(SortCollectorTest, SortWithBatchedResponses) {
   }
 
   // Create a search request with small batch size to trigger multiple responses
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").limit(10)
       .batchSize(3)  // Small batch size to get multiple responses
@@ -1976,7 +1976,7 @@ TEST_F(SortCollectorTest, SortWithBatchedResponses) {
     }
 
     // Collect all prices to verify complete sort order
-    auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+    auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
     for (int j = 0; j < (int)priceCol.v.size(); j++) {
       allPrices.push_back(priceCol.v[j]);
     }
@@ -2006,7 +2006,7 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 75), UpdateMessage::COMMIT);
   
   // Create a search request that sorts by price ascending
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   // Sort by price ascending (missing values should be last by default)
   auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
@@ -2018,8 +2018,8 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
   ASSERT_EQ(5, docs->found.value_or(0));
 
   // Check order: documents with values first (50, 75, 100), then missing values
-  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+  auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
 
   ASSERT_EQ(5, (int)idCol.v.size());
   ASSERT_EQ(5, (int)priceCol.v.size());
@@ -2049,7 +2049,7 @@ TEST_F(SortCollectorTest, EmptyResults) {
   helper.index(flatdoc("id_s", "doc2", "price_i", 50), UpdateMessage::COMMIT);
   
   // Create a search request that matches no documents
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   // Search for a field value that doesn't exist
   auto& cur = req->topDocs("q").getNumber().limit(10).matchQuery("id_s", "nonexistent");
@@ -2072,7 +2072,7 @@ TEST_F(SortCollectorTest, SingleDocument) {
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::COMMIT);
   
   // Create a search request
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
   // Sort by price
@@ -2083,8 +2083,8 @@ TEST_F(SortCollectorTest, SingleDocument) {
   const auto* docs = req->docList("q");
 
   ASSERT_EQ(1, docs->found.value_or(0));
-  ASSERT_EQ("doc1", std::get<solux::api::ColStr>(docs->columns.at("id_s").kind).v[0]);
-  ASSERT_EQ(100, std::get<solux::api::ColInt>(docs->columns.at("price_i").kind).v[0]);
+  ASSERT_EQ("doc1", std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind).v[0]);
+  ASSERT_EQ(100, std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind).v[0]);
 }
 
 TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
@@ -2097,7 +2097,7 @@ TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
   }
   
   // Create a search request with limit of 5
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").getNumber().limit(5).allQuery().fields({"id_s", "price_i"});  // Only get top 5
   // Sort by price ascending
@@ -2110,7 +2110,7 @@ TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
   // Should report total of 20 matches but only return 5
   ASSERT_EQ(20, docs->found.value_or(0));
 
-  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+  auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
   ASSERT_EQ(5, (int)priceCol.v.size()) << "Should only return top 5 documents";
 
   // Verify we got the 5 lowest prices: 10, 20, 30, 40, 50
@@ -2128,7 +2128,7 @@ TEST_F(SortCollectorTest, LimitOne) {
   helper.index(flatdoc("id_s", "doc3", "price_i", 150), UpdateMessage::COMMIT);
   
   // Create a search request with limit=1
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").getNumber().limit(1).allQuery().fields({"id_s", "price_i"});  // Only get the top 1
   // Sort by price ascending
@@ -2141,8 +2141,8 @@ TEST_F(SortCollectorTest, LimitOne) {
   // Should report 3 matches but only return 1
   ASSERT_EQ(3, docs->found.value_or(0));
 
-  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+  auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<luxir::api::ColInt>(docs->columns.at("price_i").kind);
 
   ASSERT_EQ(1, (int)idCol.v.size());
   ASSERT_EQ(1, (int)priceCol.v.size());
@@ -2179,7 +2179,7 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
   std::vector<int64_t> fingerprints;
   
   for (int run = 0; run < 2; run++) {  // Just 2 runs for debugging
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").getNumber().limit(50).allQuery().fields({"id_s", "price_i"});
     // Sort by price ascending
@@ -2193,7 +2193,7 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
 
     // Calculate fingerprint of results
     int64_t fp = docs->found.value_or(0);
-    const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+    const auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
 
     for (int i = 0; i < (int)idCol.v.size(); i++) {
       int64_t id = 0;
@@ -2225,7 +2225,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
   
   // Test sorting by indexed string field (name_s)
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     // Sort by indexed string field
     auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
@@ -2236,7 +2236,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     const auto* docs = req->docList("q");
     ASSERT_EQ(5, docs->found.value_or(0));
 
-    auto& nameCol = std::get<solux::api::ColStr>(docs->columns.at("name_s").kind);
+    auto& nameCol = std::get<luxir::api::ColStr>(docs->columns.at("name_s").kind);
 
     // Verify sort order: alice, alice, bob, charlie, david
     ASSERT_EQ("alice", nameCol.v[0]);
@@ -2248,7 +2248,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
   
   // Test sorting by non-indexed string column (description_sc)
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     // Sort by non-indexed string column
     auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "description_sc"});
@@ -2259,8 +2259,8 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     const auto* docs = req->docList("q");
     ASSERT_EQ(5, docs->found.value_or(0));
 
-    auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-    auto& descCol = std::get<solux::api::ColStr>(docs->columns.at("description_sc").kind);
+    auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+    auto& descCol = std::get<luxir::api::ColStr>(docs->columns.at("description_sc").kind);
 
     // Verify sort order by description: "first duplicate", "first person", "fourth person", "second person", "third person"
     ASSERT_EQ("first duplicate", descCol.v[0]);
@@ -2281,7 +2281,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
   
   // Test descending sort on non-indexed string column
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     // Sort by non-indexed string column descending
     auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "description_sc"});
@@ -2292,8 +2292,8 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     const auto* docs = req->docList("q");
     ASSERT_EQ(5, docs->found.value_or(0));
 
-    auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-    auto& descCol = std::get<solux::api::ColStr>(docs->columns.at("description_sc").kind);
+    auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+    auto& descCol = std::get<luxir::api::ColStr>(docs->columns.at("description_sc").kind);
 
     // Verify descending sort order
     ASSERT_EQ("third person", descCol.v[0]);
@@ -2357,7 +2357,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
     SortPruningGuard pruningGuard(disablePruning);
     FieldSortBulkGuard bulkGuard(forcePull);
     SortSkipStatsGuard statsGuard;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     if (matchAll) {
@@ -2488,7 +2488,7 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     SortPruningGuard pruningGuard(disablePruning);
     TopDocsFilterFoldGuard foldGuard(!foldFilters);
     SortSkipStatsGuard statsGuard;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("best_first_sort");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     cur.allQuery();
@@ -2675,7 +2675,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
     SeededGuard seededGuard(!seeded, seeded, budgetPerMille);
     SortPruningGuard pruningGuard(disablePruning);
     SortSkipStatsGuard statsGuard;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("seeded_sort");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     if (main == Main::TERM) {
@@ -2819,7 +2819,7 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
     SeededGuard seededGuard(!seeded, seeded);
     SortPruningGuard pruningGuard(disablePruning);
     SortSkipStatsGuard statsGuard;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("seeded_abort");
     auto& cur = req->topDocs("q").limit(9).fields({"id_s"})
         .matchQuery("body_w", "probe");
@@ -2892,7 +2892,7 @@ void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
       SortPruningGuard pruningGuard(disablePruning);
       FieldSortBulkGuard bulkGuard(forcePull);
       SortSkipStatsGuard statsGuard;
-      auto req = localReq(soluxNode->getSearchEngine());
+      auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
       if (matchAll) {
@@ -3058,7 +3058,7 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
         });
 
       // Search with sorting
-      auto req = localReq(soluxNode->getSearchEngine());
+      auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
 
       int limit = rng.rint(1, docsPerSeg*3/2);  // Get all results
@@ -3078,8 +3078,8 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
       auto reader = helper.getIndexWriter()->getIndexReader();
 
       // Verify results are in expected order
-      const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
-      const auto& valueCol = std::get<solux::api::ColInt>(docs->columns.at("value_i").kind);
+      const auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
+      const auto& valueCol = std::get<luxir::api::ColInt>(docs->columns.at("value_i").kind);
 
       // verify that the number of results match either the limit or the number of docs indexed (whichever is smaller)
       ASSERT_EQ(idCol.v.size(), std::min(limit, totalDocs));

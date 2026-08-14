@@ -16,12 +16,12 @@
 #include <utility>
 #include <vector>
 
-#include "solux/api/build.h"
-#include "solux/api/solux_types.hpp"
-#include "solux/schema/Schema.h"
-#include "solux/server/SoluxNode.h"
+#include "luxir/api/build.h"
+#include "luxir/api/luxir_types.hpp"
+#include "luxir/schema/Schema.h"
+#include "luxir/server/LuxirNode.h"
 
-namespace solux {
+namespace luxir {
 
 class SchemaBuilder {
   using Pair = std::pair<std::string_view, api::FieldDef>;
@@ -79,4 +79,4 @@ public:
   }
 };
 
-} // namespace solux
+} // namespace luxir

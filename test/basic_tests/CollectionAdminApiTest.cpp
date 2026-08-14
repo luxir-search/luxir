@@ -9,17 +9,17 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/AllQuery.h"
-#include "solux/reader/Postings.h"
-#include "solux/server/HttpServer.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/server/HttpServer.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-namespace solux::test {
+namespace luxir::test {
 
-class CollectionAdminApiTest : public SoluxTest {};
+class CollectionAdminApiTest : public LuxirTest {};
 
 class CollectionAdminDataDir {
   std::filesystem::path path_;
@@ -39,17 +39,17 @@ public:
   const std::filesystem::path& path() const { return path_; }
 };
 
-static SoluxConfig fsConfig(const CollectionAdminDataDir& data) {
-  SoluxConfig config;
+static LuxirConfig fsConfig(const CollectionAdminDataDir& data) {
+  LuxirConfig config;
   config.store.backend = "fs";
   config.store.data_dir = data.path().string();
   return config;
 }
 
 TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
-  CollectionAdminDataDir data("solux_collection_admin_lifecycle");
+  CollectionAdminDataDir data("luxir_collection_admin_lifecycle");
   auto config = fsConfig(data);
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer server(node, 2, 0);
   server.start();
   int port = server.getPort();
@@ -106,7 +106,7 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
 }
 
 TEST_F(CollectionAdminApiTest, createWithSchemaPublishesConfiguredCollection) {
-  SoluxNode node;
+  LuxirNode node;
   HttpServer server(node, 2, 0);
   server.start();
 
@@ -132,10 +132,10 @@ TEST_F(CollectionAdminApiTest, createWithSchemaPublishesConfiguredCollection) {
 }
 
 TEST_F(CollectionAdminApiTest, deleteWhileIndexingRejectsRacingBatchesCleanly) {
-  CollectionAdminDataDir data("solux_collection_admin_index_race");
+  CollectionAdminDataDir data("luxir_collection_admin_index_race");
   auto config = fsConfig(data);
   config.ingest.auto_create_collection = false;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer server(node, 2, 0);
   server.start();
   int port = server.getPort();
@@ -179,10 +179,10 @@ TEST_F(CollectionAdminApiTest, deleteWhileIndexingRejectsRacingBatchesCleanly) {
 }
 
 TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
-  CollectionAdminDataDir data("solux_collection_admin_held_reader");
+  CollectionAdminDataDir data("luxir_collection_admin_held_reader");
   auto config = fsConfig(data);
   config.ingest.auto_create_collection = false;
-  SoluxNode node(config);
+  LuxirNode node(config);
   node.createCollection(nullptr, "admin_held_reader");
   CollectionHelper helper(node, "admin_held_reader");
   auto indexed = helper.index(flatdoc("id", "held"), UpdateMessage::COMMIT);
@@ -210,12 +210,12 @@ TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
 }
 
 TEST_F(CollectionAdminApiTest, restartKeepsDeletedCollectionAbsentAndPurgesTrash) {
-  CollectionAdminDataDir data("solux_collection_admin_restart");
+  CollectionAdminDataDir data("luxir_collection_admin_restart");
   auto config = fsConfig(data);
   config.ingest.auto_create_collection = false;
 
   {
-    SoluxNode node(config);
+    LuxirNode node(config);
     node.createCollection(nullptr, "admin_restart");
     CollectionHelper helper(node, "admin_restart");
     ASSERT_TRUE(helper.index(flatdoc("id", "restart"), UpdateMessage::COMMIT).success);
@@ -227,19 +227,19 @@ TEST_F(CollectionAdminApiTest, restartKeepsDeletedCollectionAbsentAndPurgesTrash
   std::ofstream(data.path() / "trash" / "interrupted" / "file") << "stale";
 
   {
-    SoluxNode restarted(config);
+    LuxirNode restarted(config);
     EXPECT_THROW(restarted.getCollection("admin_restart"), CollectionNotFoundError);
     EXPECT_TRUE(std::filesystem::is_empty(data.path() / "trash"));
   }
 }
 
 TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
-  CollectionAdminDataDir data("solux_collection_admin_corrupt");
+  CollectionAdminDataDir data("luxir_collection_admin_corrupt");
   auto config = fsConfig(data);
   config.ingest.auto_create_collection = false;
 
   {
-    SoluxNode node(config);
+    LuxirNode node(config);
     node.createCollection(nullptr, "admin_corrupt");
     CollectionHelper helper(node, "admin_corrupt");
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
@@ -249,10 +249,10 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
                 std::ios::binary | std::ios::trunc)
       << "\xff\xff\xff\xff\xff\xff\xff\xff";
 
-  SoluxNode node(config);
+  LuxirNode node(config);
   EXPECT_THROW(node.getCollection("admin_corrupt"), CollectionUnavailableError);
   EXPECT_NO_THROW(node.deleteCollection("admin_corrupt"));
   EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_corrupt"));
 }
 
-} // namespace solux::test
+} // namespace luxir::test

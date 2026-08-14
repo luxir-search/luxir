@@ -14,7 +14,7 @@
 #include <gtest/gtest.h>
 #include "test/GrpcClient.h"
 #include "oneapi/tbb/task_group.h"
-#include "test/GrpcSoluxTest.h"
+#include "test/GrpcLuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
@@ -23,8 +23,8 @@
 #define GRPC_DEBUG LOG_TRACE
 // #define GRPC_DEBUG LOG_DEBUG
 
-using namespace solux;
-using namespace solux::test;  // HppClientReaderWriter, hppUnaryCall, Reply, rpc::
+using namespace luxir;
+using namespace luxir::test;  // HppClientReaderWriter, hppUnaryCall, Reply, rpc::
 
 namespace {
 
@@ -34,7 +34,7 @@ static std::string idString(std::string_view id) {  // request_id, now a proto s
 
 } // namespace
 
-class GrpcIndexTest : public GrpcSoluxTest {
+class GrpcIndexTest : public GrpcLuxirTest {
 public:
   std::shared_ptr<grpc::Channel> channel;
 
@@ -84,21 +84,21 @@ public:
     size_t row = (size_t)col;
     // if docnum wasn't passed in, get it from the column.
     if (docnum == -1) {
-      const auto& id_i = std::get<solux::api::ColInt>(fields.at("id_i").kind);
+      const auto& id_i = std::get<luxir::api::ColInt>(fields.at("id_i").kind);
       docnum = id_i.v[row];
     }  else {
-      const auto& id_i = std::get<solux::api::ColInt>(fields.at("id_i").kind);
+      const auto& id_i = std::get<luxir::api::ColInt>(fields.at("id_i").kind);
       ASSERT_EQ(docnum, id_i.v[row]);
     }
 
     Rng r(rng_seed + docnum);
     auto sid = std::to_string(docnum);
-    const auto& id = std::get<solux::api::ColStr>(fields.at("id").kind);
+    const auto& id = std::get<luxir::api::ColStr>(fields.at("id").kind);
     ASSERT_EQ(sid, id.v[row]);
 
     auto has_i256_50_i = r.rbool();
     if (fields.contains("i256_50_i")) {
-      const auto& i256_50_i = std::get<solux::api::ColInt>(fields.at("i256_50_i").kind);
+      const auto& i256_50_i = std::get<luxir::api::ColInt>(fields.at("i256_50_i").kind);
       if (has_i256_50_i) {
         ASSERT_EQ((int64_t)(r() & 0xff), i256_50_i.v[row]);
       } else {
@@ -113,7 +113,7 @@ public:
     if (fields.contains("s3_256_50_ss")) {
       size_t n = has_s3_256_50ss ? (size_t)r.rint(1,4) : 0; // expected number of values
 
-      const auto& s3_256_50ss = std::get<solux::api::ArrArrStr>(fields.at("s3_256_50_ss").kind);
+      const auto& s3_256_50ss = std::get<luxir::api::ArrArrStr>(fields.at("s3_256_50_ss").kind);
       const auto& arr = s3_256_50ss.v[row].v;
       ASSERT_EQ(n, arr.size());
       int curr = 0;
@@ -130,19 +130,19 @@ public:
 
     // t_w and t2_w are TEXT fields, stored by default, returned as col_s.
     if (fields.contains("t_w")) {
-      const auto& t_w = std::get<solux::api::ColStr>(fields.at("t_w").kind);
+      const auto& t_w = std::get<luxir::api::ColStr>(fields.at("t_w").kind);
       ASSERT_EQ(std::format("{} {}", sid, "common"), t_w.v[row]);
     }
     if (fields.contains("t2_w")) {
       auto expected = std::format("{} {} {}", r.rint(0,10), r.rint(0,100), r.rint(0,1000));
-      const auto& t2_w = std::get<solux::api::ColStr>(fields.at("t2_w").kind);
+      const auto& t2_w = std::get<luxir::api::ColStr>(fields.at("t2_w").kind);
       ASSERT_EQ(expected, t2_w.v[row]);
     }
   }
 
 
   void doSingleUpdate(bool commit, int64_t docnum=0, bool waitForMerges=false) {
-    Reply<solux::api::UpdateResponse> response;
+    Reply<luxir::api::UpdateResponse> response;
     grpc::ClientContext context;
 
     CollectionHelper::UpdateBuilder b;
@@ -157,7 +157,7 @@ public:
     ASSERT_TRUE(status.ok());
     // The unary path fills a caller-supplied response: it must get the same
     // initialization (status, request_id) as an arena-created one.
-    ASSERT_EQ(solux::api::UpdateResponse_::Status::OK, response.msg.status);
+    ASSERT_EQ(luxir::api::UpdateResponse_::Status::OK, response.msg.status);
     ASSERT_EQ(std::to_string(docnum), idString(response.msg.request_id));
     ASSERT_GT(response.msg.update_version, 0u);
   }
@@ -165,21 +165,21 @@ public:
   int64_t getDocCount() {
     // Read Stream
     grpc::ClientContext rcontext;  // need a new one for each RPC
-    HppClientReaderWriter<solux::api::SearchRequest, solux::api::SearchResponse> rstream(
+    HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> rstream(
       channel.get(), rpc::Search, &rcontext);
 
     // Build the SearchRequest with the LocalReq builder (used only as a builder; we serialize
     // its `proto`, we do not execute locally).
-    auto lreq = localReq(soluxNode->getSearchEngine());
+    auto lreq = localReq(luxirNode->getSearchEngine());
     lreq->collection("main").topDocs("q").allQuery().getNumber();
 
     bool wrote = rstream.Write(lreq->proto);  // lreq stays alive through Write
     EXPECT_TRUE(wrote);
 
-    Reply<solux::api::SearchResponse> sresponse;
+    Reply<luxir::api::SearchResponse> sresponse;
     bool read = rstream.Read(&sresponse);
     EXPECT_TRUE(read);
-    const auto& docs = std::get<solux::api::DocList>(sresponse.msg.ops.at("q")->kind);
+    const auto& docs = std::get<luxir::api::DocList>(sresponse.msg.ops.at("q")->kind);
     return docs.found ? *docs.found : 0;
   }
 
@@ -187,10 +187,10 @@ public:
   // lead to deadlock if we are insisting on writing more messages and the server is waiting for us to read more.
   // Ideally, a separate thread is used for reading the responses.  This should also increase efficiency/throughput.
   void doStreamingUpdates(Rng& r, int64_t nMessages, int commitPercent, int64_t docnum=-1, int waitForMergesPercent=0) {
-    Reply<solux::api::UpdateResponse> response;
+    Reply<luxir::api::UpdateResponse> response;
     grpc::ClientContext context;  // need a new one for each RPC
 
-    HppClientReaderWriter<solux::api::UpdateRequest, solux::api::UpdateResponse> stream(
+    HppClientReaderWriter<luxir::api::UpdateRequest, luxir::api::UpdateResponse> stream(
       channel.get(), rpc::UpdateStream, &context);
 
     int nWrites=0;
@@ -268,10 +268,10 @@ public:
   // This version of streaming updates uses a separate reader thread to avoid deadlock that can happen above if we insist on
   // writing more messages and the server is waiting for us to read more.
   void doStreamingUpdates2(Rng& r, int nMessages) {
-    Reply<solux::api::UpdateResponse> response;
+    Reply<luxir::api::UpdateResponse> response;
     grpc::ClientContext context;  // need a new one for each RPC
 
-    HppClientReaderWriter<solux::api::UpdateRequest, solux::api::UpdateResponse> stream(
+    HppClientReaderWriter<luxir::api::UpdateRequest, luxir::api::UpdateResponse> stream(
       channel.get(), rpc::UpdateStream, &context);
 
     int nWrites=0;
@@ -368,18 +368,18 @@ public:
     }
 
     // do a final commit
-    solux::test::CollectionHelper ch("main");
+    luxir::test::CollectionHelper ch("main");
     ch.commit();
   }
 
-  using RequestCreator = std::function<void(int64_t docid, solux::test::LocalReq& req)>;
-  using ResponseChecker = std::function<void(int64_t docid, const solux::api::SearchResponse& response)>;
+  using RequestCreator = std::function<void(int64_t docid, luxir::test::LocalReq& req)>;
+  using ResponseChecker = std::function<void(int64_t docid, const luxir::api::SearchResponse& response)>;
 
   void doStreamingSearches(Rng& r, int64_t startDoc, int64_t nMessages, int64_t nDocs, RequestCreator& reqCreator, ResponseChecker& respChecker) {
-    Reply<solux::api::SearchResponse> response;
+    Reply<luxir::api::SearchResponse> response;
     grpc::ClientContext context;  // need a new one for each RPC
 
-    HppClientReaderWriter<solux::api::SearchRequest, solux::api::SearchResponse> stream(
+    HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
       channel.get(), rpc::Search, &context);
 
     int nWrites=0;
@@ -414,7 +414,7 @@ public:
 
       if (doWrite) {
         // Build the request with a fresh LocalReq builder; it must live through the Write.
-        auto lreq = localReq(soluxNode->getSearchEngine());
+        auto lreq = localReq(luxirNode->getSearchEngine());
         auto docId = (startDoc + nWrites) % nDocs;
         reqCreator(docId, *lreq);
         nWrites++;
@@ -499,25 +499,25 @@ TEST_F(GrpcIndexTest, maxSegmentsCommitDurablyPublishesMergedLayout) {
 
   CollectionHelper::UpdateBuilder request;
   request.collection("main").commit(false, 1);
-  Reply<solux::api::UpdateResponse> response;
+  Reply<luxir::api::UpdateResponse> response;
   grpc::ClientContext context;
   grpc::Status status = hppUnaryCall(channel.get(), rpc::Update, &context,
                                      request.finish(), &response);
 
   ASSERT_TRUE(status.ok()) << status.error_message();
-  EXPECT_EQ(solux::api::UpdateResponse_::Status::OK, response.msg.status);
+  EXPECT_EQ(luxir::api::UpdateResponse_::Status::OK, response.msg.status);
   EXPECT_EQ(1u, helper.durableSegmentCount());
 }
 
 
 TEST_F(GrpcIndexTest, streamingHello) {
-  solux::api::HelloRequest req;
-  Reply<solux::api::HelloReply> result;
+  luxir::api::HelloRequest req;
+  Reply<luxir::api::HelloReply> result;
   grpc::ClientContext context;  // need a new one for each RPC
 
   // The grpc write and read interfaces are specified to be thread-safe with respect to each other, which should mean
   // that we can have a separate thread reading responses while the main thread is writing requests.
-  HppClientReaderWriter<solux::api::HelloRequest, solux::api::HelloReply> stream(
+  HppClientReaderWriter<luxir::api::HelloRequest, luxir::api::HelloReply> stream(
     channel.get(), rpc::SayHelloStreaming, &context);
 
   req.async = false;
@@ -562,13 +562,13 @@ TEST_F(GrpcIndexTest, streamingHello) {
 // Single streaming request with many requests + multiple responses per request over that stream.
 // Commenting out the lock guard in BiStreamingRequest::respond() should cause this test to fail sometimes.
 TEST_F(GrpcIndexTest, streamingHello2) {
-  Rng r = SoluxTest::rng;
+  Rng r = LuxirTest::rng;
 
-  solux::api::HelloRequest req;
-  Reply<solux::api::HelloReply> result;
+  luxir::api::HelloRequest req;
+  Reply<luxir::api::HelloReply> result;
   grpc::ClientContext context;  // need a new one for each RPC
 
-  HppClientReaderWriter<solux::api::HelloRequest, solux::api::HelloReply> stream(
+  HppClientReaderWriter<luxir::api::HelloRequest, luxir::api::HelloReply> stream(
     channel.get(), rpc::SayHelloStreaming, &context);
 
   oneapi::tbb::task_group tasks;
@@ -645,8 +645,8 @@ TEST_F(GrpcIndexTest, threadsafe) {
               auto namelen = name.size();
 
               for (int j=0; j<callsPerTask; j++) {
-                solux::api::HelloRequest req;
-                Reply<solux::api::HelloReply> result;
+                luxir::api::HelloRequest req;
+                Reply<luxir::api::HelloReply> result;
                 grpc::ClientContext context;  // need a new one for each RPC
 
 
@@ -686,11 +686,11 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   uint32_t percentFacet = 50; // percent of the requests that use facets
 
   // clear the index
-  solux::test::CollectionHelper ch("main");
+  luxir::test::CollectionHelper ch("main");
 
   doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent, waitForMergesPercent);
 
-  RequestCreator requestCreator = [&](int64_t docid, solux::test::LocalReq& req) {
+  RequestCreator requestCreator = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));  // set request id to the id so we know what doc we are looking for
     // try to retrieve the document we just indexed
     auto& q = req.topDocs("q").getNumber().matchQuery("id", std::to_string(docid));
@@ -702,8 +702,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     }
   };
 
-  ResponseChecker responseChecker = [&](int64_t docid, const solux::api::SearchResponse& response) {
-    const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
+  ResponseChecker responseChecker = [&](int64_t docid, const luxir::api::SearchResponse& response) {
+    const auto& docList = std::get<luxir::api::DocList>(response.ops.at("q")->kind);
     ASSERT_TRUE(docList.found.has_value());
     ASSERT_EQ(1, *docList.found);  // FIXME!  this comes up as "2" now sometimes with nDocs=100????
     ASSERT_EQ(docList.columns.size(), retrieveFields.size()); // this might change in the future.
@@ -712,9 +712,9 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     // do same calculation to see if facet was requested
     if (SplitMix64(docid)() % 100 < percentFacet) {
       // verify the facet response.  It should be a single bucket with id_i=docid and count=1
-      const auto& facetResult = std::get<solux::api::FacetResult>(docList.ops.at("f")->kind);
+      const auto& facetResult = std::get<luxir::api::FacetResult>(docList.ops.at("f")->kind);
       ASSERT_TRUE(facetResult.bucket_ids.has_value());
-      const auto& bucketIds = std::get<solux::api::ColInt>(facetResult.bucket_ids->kind);
+      const auto& bucketIds = std::get<luxir::api::ColInt>(facetResult.bucket_ids->kind);
       ASSERT_EQ(1u, bucketIds.v.size());
       ASSERT_EQ(docid, bucketIds.v[0]);
       ASSERT_EQ(1u, facetResult.counts.size());
@@ -727,7 +727,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   // Now let's do a test designed to uncover codec thread-safety bugs -
   // unpacking blocks of docids, frequencies, or positions concurrently should do it.
 
-  RequestCreator reqc2 = [&](int64_t docid, solux::test::LocalReq& req) {
+  RequestCreator reqc2 = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));
     // the field t2_w contains integers from 1-10, 1-100, and 1-1000.  So if we search for
     // something like "0" it should match > 11% of the docs and use block compression in the codec
@@ -738,8 +738,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   // record the number of hits per query in a boost flat unordered map
   boost::unordered::unordered_flat_map<int64_t, int64_t> hits;
 
-  ResponseChecker respc2 = [&](int64_t docid, const solux::api::SearchResponse& response) {
-    const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
+  ResponseChecker respc2 = [&](int64_t docid, const luxir::api::SearchResponse& response) {
+    const auto& docList = std::get<luxir::api::DocList>(response.ops.at("q")->kind);
     // not too much to check here... just record the hits we got
     ASSERT_TRUE(docList.found.has_value());
     hits[docid % 10] = *docList.found;
@@ -749,8 +749,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   doThreadSafeSearch(1, 10, nDocs, reqc2, respc2);
 
   // now we can check the hits to see if we got the expected number of hits for each t2_w:[0 - 10]
-  ResponseChecker respc2verify = [&](int64_t docid, const solux::api::SearchResponse& response) {
-    const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
+  ResponseChecker respc2verify = [&](int64_t docid, const luxir::api::SearchResponse& response) {
+    const auto& docList = std::get<luxir::api::DocList>(response.ops.at("q")->kind);
     ASSERT_TRUE(docList.found.has_value());
     ASSERT_EQ(hits[docid % 10], *docList.found);
   };
@@ -765,16 +765,16 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   //
   int64_t limit=50;
   int32_t batchSize = 5;
-  RequestCreator reqc3 = [&](int64_t docid, solux::test::LocalReq& req) {
+  RequestCreator reqc3 = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));
     auto& q = req.topDocs("q").getNumber().limit(limit).batchSize(batchSize)
                  .matchQuery("t2_w", std::to_string(docid % 10));
     for (auto& field : retrieveFields) q.fields({std::string(field)});
   };
 
-  ResponseChecker respc3 = [&](int64_t docid, const solux::api::SearchResponse& response) {
+  ResponseChecker respc3 = [&](int64_t docid, const luxir::api::SearchResponse& response) {
     unused(docid);
-    const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
+    const auto& docList = std::get<luxir::api::DocList>(response.ops.at("q")->kind);
     // because responses are streaming and not necessarily in order across different logical requests,
     // we need to get the number used to generate the query from the request id
     std::string requestId = idString(response.request_id);
@@ -793,7 +793,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     size_t expectedSize = (size_t)expectedColSize;
 
     // check the id field
-    const auto& idColumn = std::get<solux::api::ColStr>(docList.columns.at("id").kind);
+    const auto& idColumn = std::get<luxir::api::ColStr>(docList.columns.at("id").kind);
     if (idColumn.v.size() != expectedSize) {
       LOG_ERROR("CLIENT RESULT: request_id={} more={} found={}", requestId, response.more, *docList.found);
     }
@@ -812,7 +812,7 @@ TEST_F(GrpcIndexTest, addDocs) {
 
   // Setup request
   CollectionHelper::UpdateBuilder b;
-  Reply<solux::api::UpdateResponse> response;
+  Reply<luxir::api::UpdateResponse> response;
 
   b.collection("main");
 
@@ -838,7 +838,7 @@ TEST_F(GrpcIndexTest, addDocs) {
 
 TEST_F(GrpcIndexTest, unsafeCollectionNameReturnsNotFound) {
   CollectionHelper::UpdateBuilder b;
-  Reply<solux::api::UpdateResponse> response;
+  Reply<luxir::api::UpdateResponse> response;
   b.collection("../bad");
   b.add(flatdoc("id", "grpc-bad-name", "title_w", "badname token"));
 
@@ -852,7 +852,7 @@ TEST_F(GrpcIndexTest, unsafeCollectionNameReturnsNotFound) {
 
 TEST_F(GrpcIndexTest, addDocsStream) {
   // Setup request
-  Reply<solux::api::UpdateResponse> response;
+  Reply<luxir::api::UpdateResponse> response;
   grpc::ClientContext context;  // need a new one for each RPC
 
   CollectionHelper::UpdateBuilder req;
@@ -862,7 +862,7 @@ TEST_F(GrpcIndexTest, addDocsStream) {
 
   GRPC_DEBUG("CLIENT REQ: docs={}", 1);
 
-  HppClientReaderWriter<solux::api::UpdateRequest, solux::api::UpdateResponse> stream(
+  HppClientReaderWriter<luxir::api::UpdateRequest, luxir::api::UpdateResponse> stream(
     channel.get(), rpc::UpdateStream, &context);
   bool wrote = stream.Write(req.finish());
   ASSERT_TRUE(wrote);
@@ -897,12 +897,12 @@ TEST_F(GrpcIndexTest, visibility) {
 
   // Write Stream
   grpc::ClientContext wcontext;  // need a new one for each RPC
-  HppClientReaderWriter<solux::api::UpdateRequest, solux::api::UpdateResponse> wstream(
+  HppClientReaderWriter<luxir::api::UpdateRequest, luxir::api::UpdateResponse> wstream(
     channel.get(), rpc::UpdateStream, &wcontext);
 
   {
     CollectionHelper::UpdateBuilder req;
-    Reply<solux::api::UpdateResponse> response;
+    Reply<luxir::api::UpdateResponse> response;
 
     req.collection("main");
 
@@ -922,7 +922,7 @@ TEST_F(GrpcIndexTest, visibility) {
 
   {
     CollectionHelper::UpdateBuilder req;
-    Reply<solux::api::UpdateResponse> response;
+    Reply<luxir::api::UpdateResponse> response;
 
     req.collection("main");
     req.commit();
@@ -944,7 +944,7 @@ TEST_F(GrpcIndexTest, visibility) {
   bool ok = wstream.WritesDone();
   ASSERT_TRUE(ok);
 
-  Reply<solux::api::UpdateResponse> response;
+  Reply<luxir::api::UpdateResponse> response;
   while (wstream.Read(&response)) {
     GRPC_DEBUG("CLIENT RESULT: status={}", (int)response.msg.status);
   }

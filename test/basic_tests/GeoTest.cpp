@@ -12,21 +12,21 @@
 #include <tuple>
 #include <vector>
 
-#include "solux/api/build.h"
-#include "solux/query/GeoBoxQuery.h"
-#include "solux/reader/BKDReader.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/IntColReader.h"
-#include "solux/util/geo.h"
-#include "solux/util/random.h"
+#include "luxir/api/build.h"
+#include "luxir/query/GeoBoxQuery.h"
+#include "luxir/reader/BKDReader.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/IntColReader.h"
+#include "luxir/util/geo.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -173,7 +173,7 @@ void setValues(api::Val& val, std::pmr::memory_resource& mr, size_t size,
 
 } // namespace
 
-class GeoEncodingTest : public SoluxTest {};
+class GeoEncodingTest : public LuxirTest {};
 
 TEST_F(GeoEncodingTest, endpointsZerosValidationAndPacking) {
   EXPECT_EQ(INT32_MIN, geo::encodeLatitude(-90.0));
@@ -243,7 +243,7 @@ TEST_F(GeoEncodingTest, quantizationBoundariesAndRandomRoundTrips) {
   }
 }
 
-class GeoBoxQueryTest : public SoluxTest {};
+class GeoBoxQueryTest : public LuxirTest {};
 
 TEST_F(GeoBoxQueryTest, publicWireIngestAndProtoQueryRoundTrip) {
   CollectionHelper helper;
@@ -290,7 +290,7 @@ TEST_F(GeoBoxQueryTest, publicWireIngestAndProtoQueryRoundTrip) {
   multi[3].push_back(quantize((double)-33.8688f, 151.2093));
 
   auto queryIds = [&](std::string_view field, const Box& box) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     cur.rawQuery() = qb::geoBox(cur.mr(), field, box.minLat, box.maxLat,
                                 box.minLon, box.maxLon);
@@ -359,7 +359,7 @@ TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
               error.error_message.find("[x, y] = [lon, lat]"));
   }
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.rawQuery() = qb::geoBox(cur.mr(), "geo_single", 49.0, 51.0, 9.0, 11.0);
   cur.fields({"id"}).limit(10);

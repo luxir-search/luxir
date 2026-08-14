@@ -22,38 +22,38 @@
 #include <thread>
 #include <vector>
 
-#include "solux/index/IndexWriter.h"
-#include "solux/index/Inverter.h"
-#include "solux/query/AllQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/ExistsQuery.h"
-#include "solux/query/ForcePrepareQuery.h"
-#include "solux/query/FuzzyQuery.h"
-#include "solux/query/GeoBoxQuery.h"
-#include "solux/query/GeoDistanceQuery.h"
-#include "solux/query/KnnQuery.h"
-#include "solux/query/MatchNoDocsQuery.h"
-#include "solux/query/NumericRangeQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/PrefixQuery.h"
-#include "solux/query/QueryPrep.h"
-#include "solux/query/TermQuery.h"
-#include "solux/query/TermRangeQuery.h"
-#include "solux/search/FilterCache.h"
-#include "solux/search/SearchOverrides.h"
-#include "solux/server/SoluxNode.h"
-#include "solux/store/Directory.h"
-#include "solux/util/DateTime.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ExistsQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/FuzzyQuery.h"
+#include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/KnnQuery.h"
+#include "luxir/query/MatchNoDocsQuery.h"
+#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/PrefixQuery.h"
+#include "luxir/query/QueryPrep.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/TermRangeQuery.h"
+#include "luxir/search/FilterCache.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/server/LuxirNode.h"
+#include "luxir/store/Directory.h"
+#include "luxir/util/DateTime.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -352,9 +352,9 @@ struct CachedSearchResult {
                          const CachedSearchResult&) = default;
 };
 
-CachedSearchResult runCachedSearch(SoluxNode& node, std::string_view collection,
+CachedSearchResult runCachedSearch(LuxirNode& node, std::string_view collection,
                                    std::string_view filter) {
-  auto request = solux::test::localReq(node.getSearchEngine());
+  auto request = luxir::test::localReq(node.getSearchEngine());
   request->collection(collection)
       .topDocs("q")
       .matchQuery("body_w", "body")
@@ -367,7 +367,7 @@ CachedSearchResult runCachedSearch(SoluxNode& node, std::string_view collection,
   CachedSearchResult result{
       .count = request->getMatchCount("q"), .ids = {}};
   for (const auto& doc : request->getDocs("q")) {
-    auto* id = solux::test::find(doc, "id");
+    auto* id = luxir::test::find(doc, "id");
     if (id != nullptr) result.ids.push_back(std::get<std::string>(*id));
   }
   std::sort(result.ids.begin(), result.ids.end());
@@ -383,21 +383,21 @@ void installVectorSchema(Collection& collection) {
   schema.set(collection);
 }
 
-void addFilter(solux::test::OpCursor& cursor, const api::Query& query);
+void addFilter(luxir::test::OpCursor& cursor, const api::Query& query);
 
 CachedSearchResult runKnnFilter(
-    SoluxNode& node, std::string_view collection,
+    LuxirNode& node, std::string_view collection,
     std::span<const float> queryVector, int32_t k, bool exact = true,
     int32_t nprobe = 0, int32_t refineCandidates = 0,
     float minScanFraction = 0.0f) {
-  auto request = solux::test::localReq(node.getSearchEngine());
+  auto request = luxir::test::localReq(node.getSearchEngine());
   auto& cursor = request->collection(collection)
                      .topDocs("q")
                      .allQuery()
                      .fields({"id"})
                      .getNumber()
                      .limit(-1);
-  addFilter(cursor, solux::test::qb::knn(
+  addFilter(cursor, luxir::test::qb::knn(
       cursor.mr(), "embedding_v", queryVector, k, nprobe, exact,
       refineCandidates, minScanFraction));
   request->execute();
@@ -405,7 +405,7 @@ CachedSearchResult runKnnFilter(
   CachedSearchResult result{
       .count = request->getMatchCount("q"), .ids = {}};
   for (const auto& doc : request->getDocs("q")) {
-    auto* id = solux::test::find(doc, "id");
+    auto* id = luxir::test::find(doc, "id");
     if (id != nullptr) result.ids.push_back(std::get<std::string>(*id));
   }
   std::sort(result.ids.begin(), result.ids.end());
@@ -464,7 +464,7 @@ std::vector<std::unique_ptr<DocSet>> oneDocPerSegment(IndexReader& reader) {
   return result;
 }
 
-void addFilter(solux::test::OpCursor& cursor, const api::Query& query) {
+void addFilter(luxir::test::OpCursor& cursor, const api::Query& query) {
   auto& top = std::get<api::TopDocs>(cursor.rawOp().kind);
   auto* filter = api::build::allocArray(top.filter, 1, cursor.mr());
   filter[0].name = "selection";
@@ -1576,19 +1576,19 @@ TEST(FilterCacheIntegrationTest,
      scoredSparseFilterCandidateFeedsMatchOracles) {
   FilteredConjunctionBatchSizeGuard batchSizeGuard(
       Postings::DOCS_BLOCK_SIZE);
-  SoluxConfig cachedConfig;
+  LuxirConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxConfig uncachedConfig;
+  LuxirConfig uncachedConfig;
   uncachedConfig.filterCacheBytes = 0;
-  SoluxNode cachedNode(cachedConfig);
-  SoluxNode uncachedNode(uncachedConfig);
+  LuxirNode cachedNode(cachedConfig);
+  LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection =
       "exact_scored_sparse_filter_postings";
-  solux::test::CollectionHelper cached(cachedNode, collection);
-  solux::test::CollectionHelper uncached(uncachedNode, collection);
+  luxir::test::CollectionHelper cached(cachedNode, collection);
+  luxir::test::CollectionHelper uncached(uncachedNode, collection);
 
   constexpr int32_t maxDoc = 12 * DocsEnumMeta::L1_DOCS + 257;
-  std::vector<solux::test::Doc> docs;
+  std::vector<luxir::test::Doc> docs;
   docs.reserve((size_t) maxDoc);
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     std::string body = "alpha beta";
@@ -1613,22 +1613,22 @@ TEST(FilterCacheIntegrationTest,
     std::string filterValue = doc % 40 == 0
         ? "selected semidense"
         : doc % 20 == 0 ? "semidense" : "other";
-    docs.push_back(solux::test::flatdoc(
+    docs.push_back(luxir::test::flatdoc(
         "id", std::to_string(doc), "body_w", body,
         "filter_w", filterValue));
   }
   size_t split = docs.size() / 2;
   ASSERT_TRUE(cached.indexAll(
-      std::span<const solux::test::Doc>(docs).first(split),
+      std::span<const luxir::test::Doc>(docs).first(split),
       UpdateMessage::COMMIT).success);
   ASSERT_TRUE(cached.indexAll(
-      std::span<const solux::test::Doc>(docs).subspan(split),
+      std::span<const luxir::test::Doc>(docs).subspan(split),
       UpdateMessage::COMMIT).success);
   ASSERT_TRUE(uncached.indexAll(
-      std::span<const solux::test::Doc>(docs).first(split),
+      std::span<const luxir::test::Doc>(docs).first(split),
       UpdateMessage::COMMIT).success);
   ASSERT_TRUE(uncached.indexAll(
-      std::span<const solux::test::Doc>(docs).subspan(split),
+      std::span<const luxir::test::Doc>(docs).subspan(split),
       UpdateMessage::COMMIT).success);
 
   struct Result {
@@ -1652,7 +1652,7 @@ TEST(FilterCacheIntegrationTest,
     SEGMENT_LOCAL_NEGATION,
     PHRASE_NEGATION,
   };
-  auto run = [&](SoluxNode& node, std::string_view filterTerm,
+  auto run = [&](LuxirNode& node, std::string_view filterTerm,
                  bool pruning, bool disablePostingsFeed,
                  bool disableBatch = false,
                  QueryShape shape = QueryShape::ONE_TERM) {
@@ -1660,7 +1660,7 @@ TEST(FilterCacheIntegrationTest,
         disablePostingsFeed);
     FilteredConjunctionBatchGuard batchGuard(disableBatch);
     OwnedFilterStatsGuard statsGuard;
-    auto request = solux::test::localReq(node.getSearchEngine());
+    auto request = luxir::test::localReq(node.getSearchEngine());
     auto& cursor = request->collection(collection)
         .topDocs("q")
         .matchFilter("selection", "filter_w", filterTerm)
@@ -1676,40 +1676,40 @@ TEST(FilterCacheIntegrationTest,
                || shape == QueryShape::PHRASE_NEGATION) {
       auto& mr = cursor.mr();
       std::vector<api::Query> required;
-      required.push_back(solux::test::qb::match(
+      required.push_back(luxir::test::qb::match(
           mr, "body_w",
           shape == QueryShape::TERM_LED_NEGATED ? "rare" : "alpha"));
       std::vector<api::Query> prohibited;
       if (shape == QueryShape::FILTER_LED_NEGATED_GROUP) {
         std::array group = {
-            solux::test::qb::match(mr, "body_w", "gamma"),
-            solux::test::qb::match(mr, "body_w", "delta")};
+            luxir::test::qb::match(mr, "body_w", "gamma"),
+            luxir::test::qb::match(mr, "body_w", "delta")};
         prohibited.push_back(
-            solux::test::qb::boolean(mr, {}, group));
+            luxir::test::qb::boolean(mr, {}, group));
       } else if (shape == QueryShape::SEGMENT_LOCAL_NEGATION) {
-        prohibited.push_back(solux::test::qb::match(
+        prohibited.push_back(luxir::test::qb::match(
             mr, "body_w", "segment_only"));
       } else if (shape == QueryShape::PHRASE_NEGATION) {
-        prohibited.push_back(solux::test::qb::phraseWords(
+        prohibited.push_back(luxir::test::qb::phraseWords(
             mr, "body_w", {"beta", "gamma"}));
       } else {
-        prohibited.push_back(solux::test::qb::match(
+        prohibited.push_back(luxir::test::qb::match(
             mr, "body_w", "gamma"));
         if (shape == QueryShape::FILTER_LED_NEGATED_TWO) {
-          prohibited.push_back(solux::test::qb::match(
+          prohibited.push_back(luxir::test::qb::match(
               mr, "body_w", "delta"));
         }
       }
-      cursor.rawQuery() = solux::test::qb::boolean(
+      cursor.rawQuery() = luxir::test::qb::boolean(
           mr, required, {}, prohibited);
     } else if (shape != QueryShape::ONE_TERM) {
       std::string_view third = shape == QueryShape::FILTER_LED
           ? "gamma" : "rare";
-      cursor.rawQuery() = solux::test::qb::boolean(
+      cursor.rawQuery() = luxir::test::qb::boolean(
           cursor.mr(),
-          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
-           solux::test::qb::match(cursor.mr(), "body_w", "beta"),
-           solux::test::qb::match(cursor.mr(), "body_w", third)});
+          {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "beta"),
+           luxir::test::qb::match(cursor.mr(), "body_w", third)});
     } else {
       cursor.matchQuery("body_w", "alpha");
     }
@@ -1905,11 +1905,11 @@ struct ExactFilteredConjResult {
   int64_t scoreWindows = 0;
 };
 
-bool indexExactFilteredConjDocs(SoluxNode& node,
+bool indexExactFilteredConjDocs(LuxirNode& node,
                                 std::string_view collection) {
   constexpr int32_t maxDoc = 2000;
-  solux::test::CollectionHelper helper(node, collection);
-  std::vector<solux::test::Doc> docs;
+  luxir::test::CollectionHelper helper(node, collection);
+  std::vector<luxir::test::Doc> docs;
   docs.reserve((size_t) maxDoc);
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     // gamma is absent from 2/3 of docs so the batch's tail probes reject
@@ -1929,7 +1929,7 @@ bool indexExactFilteredConjDocs(SoluxNode& node,
     if (doc % 100 == 0) {
       body += " rare";
     }
-    docs.push_back(solux::test::flatdoc(
+    docs.push_back(luxir::test::flatdoc(
         "id", std::to_string(doc), "body_w", body,
         "filter_w", doc % 40 == 0 ? "selected" : "other",
         "second_filter_w",
@@ -1939,55 +1939,55 @@ bool indexExactFilteredConjDocs(SoluxNode& node,
 }
 
 ExactFilteredConjResult runExactFilteredConj(
-    SoluxNode& node, std::string_view collection,
+    LuxirNode& node, std::string_view collection,
     ExactFilteredConjShape shape, bool disableMultiTerm,
     bool disableBatch = false, bool disableTermFeed = false) {
   FilteredConjMultiTermGuard multiTermGuard(disableMultiTerm);
   FilteredConjunctionBatchGuard batchGuard(disableBatch);
   CandidateTermFeedGuard termFeedGuard(disableTermFeed);
   OwnedFilterStatsGuard statsGuard;
-  auto request = solux::test::localReq(node.getSearchEngine());
+  auto request = luxir::test::localReq(node.getSearchEngine());
   request->collection(collection);
   auto& cursor = request->topDocs("q");
   cursor.getNumber().withStats().fields({"id"}).limit(100);
   switch (shape) {
     case ExactFilteredConjShape::THREE_TERMS:
-      cursor.rawQuery() = solux::test::qb::boolean(
+      cursor.rawQuery() = luxir::test::qb::boolean(
           cursor.mr(),
-          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
-           solux::test::qb::match(cursor.mr(), "body_w", "beta"),
-           solux::test::qb::match(cursor.mr(), "body_w", "gamma")});
+          {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "beta"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "gamma")});
       cursor.matchFilter("selection", "filter_w", "selected");
       break;
     case ExactFilteredConjShape::RARE_TERM:
-      cursor.rawQuery() = solux::test::qb::boolean(
+      cursor.rawQuery() = luxir::test::qb::boolean(
           cursor.mr(),
-          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
-           solux::test::qb::match(cursor.mr(), "body_w", "rare"),
-           solux::test::qb::match(cursor.mr(), "body_w", "gamma")});
+          {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "rare"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "gamma")});
       // The wide filter keeps the feed (rare, df 20) under the DocSet
       // provenance ratio gate; "selected" (df 50) sits inside it.
       cursor.matchFilter("wide", "second_filter_w", "wide");
       break;
     case ExactFilteredConjShape::PHRASE:
-      cursor.rawQuery() = solux::test::qb::phraseWords(
+      cursor.rawQuery() = luxir::test::qb::phraseWords(
           cursor.mr(), "body_w", {"quick", "fox"});
       cursor.matchFilter("selection", "filter_w", "selected");
       break;
     case ExactFilteredConjShape::TWO_FILTERS:
-      cursor.rawQuery() = solux::test::qb::boolean(
+      cursor.rawQuery() = luxir::test::qb::boolean(
           cursor.mr(),
-          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
-           solux::test::qb::match(cursor.mr(), "body_w", "beta")});
+          {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "beta")});
       cursor.matchFilter("selection", "filter_w", "selected");
       cursor.matchFilter("wide", "second_filter_w", "wide");
       break;
     case ExactFilteredConjShape::RARE_TERM_TWO_FILTERS:
-      cursor.rawQuery() = solux::test::qb::boolean(
+      cursor.rawQuery() = luxir::test::qb::boolean(
           cursor.mr(),
-          {solux::test::qb::match(cursor.mr(), "body_w", "alpha"),
-           solux::test::qb::match(cursor.mr(), "body_w", "rare"),
-           solux::test::qb::match(cursor.mr(), "body_w", "gamma")});
+          {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "rare"),
+           luxir::test::qb::match(cursor.mr(), "body_w", "gamma")});
       cursor.matchFilter("selection", "filter_w", "selected");
       cursor.matchFilter("wide", "second_filter_w", "wide");
       break;
@@ -2040,12 +2040,12 @@ void expectSameExactFilteredConj(const ExactFilteredConjResult& expected,
 
 TEST(FilterCacheIntegrationTest,
      filteredConjMultiTermMatchesCachedAndPostingsFilters) {
-  SoluxConfig cachedConfig;
+  LuxirConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxConfig uncachedConfig;
+  LuxirConfig uncachedConfig;
   uncachedConfig.filterCacheBytes = 0;
-  SoluxNode cachedNode(cachedConfig);
-  SoluxNode uncachedNode(uncachedConfig);
+  LuxirNode cachedNode(cachedConfig);
+  LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection =
       "filtered_conj_multi_term_provenance";
   ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
@@ -2076,9 +2076,9 @@ TEST(FilterCacheIntegrationTest,
 }
 
 TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "filtered_conj_ratio_gate";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
 
@@ -2099,12 +2099,12 @@ TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
 
 TEST(FilterCacheIntegrationTest,
      candidateTermFeedMatchesKillSwitchForBothFilterProvenances) {
-  SoluxConfig cachedConfig;
+  LuxirConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxConfig uncachedConfig;
+  LuxirConfig uncachedConfig;
   uncachedConfig.filterCacheBytes = 0;
-  SoluxNode cachedNode(cachedConfig);
-  SoluxNode uncachedNode(uncachedConfig);
+  LuxirNode cachedNode(cachedConfig);
+  LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection = "exact_candidate_term_feed";
   ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
   ASSERT_TRUE(indexExactFilteredConjDocs(uncachedNode, collection));
@@ -2139,9 +2139,9 @@ TEST(FilterCacheIntegrationTest,
 }
 
 TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "filtered_conj_phrase_tail";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
 
@@ -2156,9 +2156,9 @@ TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
 }
 
 TEST(FilterCacheIntegrationTest, candidateTermFeedHandlesTwoFilters) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "exact_candidate_two_filters";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
 
@@ -2178,9 +2178,9 @@ TEST(FilterCacheIntegrationTest, candidateTermFeedHandlesTwoFilters) {
 
 TEST(FilterCacheIntegrationTest,
      exactCandidateFilterLeadKeepsExistingRouteAndCounters) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "exact_candidate_filter_lead";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
 
@@ -2206,9 +2206,9 @@ TEST(FilterCacheIntegrationTest,
 }
 
 TEST(FilterCacheIntegrationTest, candidateTermFeedDensityCapDeclines) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "exact_candidate_density_cap";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
 
@@ -2230,12 +2230,12 @@ TEST(FilterCacheIntegrationTest, candidateTermFeedDensityCapDeclines) {
 // close to the warm filter's; the raw-postings provenance carries no such
 // gate and must keep engaging under the same override.
 TEST(FilterCacheIntegrationTest, candidateTermFeedDocSetRatioDeclines) {
-  SoluxConfig cachedConfig;
+  LuxirConfig cachedConfig;
   cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxConfig uncachedConfig;
+  LuxirConfig uncachedConfig;
   uncachedConfig.filterCacheBytes = 0;
-  SoluxNode cachedNode(cachedConfig);
-  SoluxNode uncachedNode(uncachedConfig);
+  LuxirNode cachedNode(cachedConfig);
+  LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection = "exact_candidate_docset_ratio";
   ASSERT_TRUE(indexExactFilteredConjDocs(cachedNode, collection));
   ASSERT_TRUE(indexExactFilteredConjDocs(uncachedNode, collection));
@@ -2451,18 +2451,18 @@ TEST(FilterCacheTest, readerStableUseRejectsRawByproductPublication) {
 }
 
 TEST(FilterCacheTest, readerProbeCountsDeferredBypassesAndMisses) {
-  SoluxConfig nodeConfig;
+  LuxirConfig nodeConfig;
   nodeConfig.filterCacheBytes = 0;
-  SoluxNode node(nodeConfig);
-  solux::test::CollectionHelper helper(node, "filter_cache_reader_counters");
+  LuxirNode node(nodeConfig);
+  luxir::test::CollectionHelper helper(node, "filter_cache_reader_counters");
   FilterCacheConfig config = testConfig();
   config.maxEntryBytes = 16;
   config.admissionThreshold = 2;
   auto cache = std::make_shared<FilterCache>(config);
   helper.getIndexWriter()->filterCache = cache;
   ASSERT_TRUE(helper.indexAll(std::array{
-      solux::test::flatdoc("id", "1", "body_w", "body"),
-      solux::test::flatdoc("id", "2", "body_w", "body")},
+      luxir::test::flatdoc("id", "1", "body_w", "body"),
+      luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto domains = canonicalDomains(*reader);
@@ -2557,17 +2557,17 @@ TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
 }
 
 TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
-  SoluxConfig nodeConfig;
+  LuxirConfig nodeConfig;
   nodeConfig.filterCacheBytes = 0;
-  SoluxNode node(nodeConfig);
-  solux::test::CollectionHelper helper(node, "filter_cache_reader_retire");
+  LuxirNode node(nodeConfig);
+  luxir::test::CollectionHelper helper(node, "filter_cache_reader_retire");
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(config);
   helper.getIndexWriter()->filterCache = cache;
   ASSERT_TRUE(helper.indexAll(std::array{
-      solux::test::flatdoc("id", "1", "body_w", "body"),
-      solux::test::flatdoc("id", "2", "body_w", "body")},
+      luxir::test::flatdoc("id", "1", "body_w", "body"),
+      luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto domains = canonicalDomains(*reader);
@@ -2612,10 +2612,10 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
 
 TEST(FilterCacheTest, readerPublishRaceCannotResurrectStaleValue) {
   constexpr int ENTRY_COUNT = 128;
-  SoluxConfig nodeConfig;
+  LuxirConfig nodeConfig;
   nodeConfig.filterCacheBytes = 0;
-  SoluxNode node(nodeConfig);
-  solux::test::CollectionHelper helper(node, "filter_cache_reader_race");
+  LuxirNode node(nodeConfig);
+  luxir::test::CollectionHelper helper(node, "filter_cache_reader_race");
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   config.maxMetadataEntries = ENTRY_COUNT * 2;
@@ -2623,8 +2623,8 @@ TEST(FilterCacheTest, readerPublishRaceCannotResurrectStaleValue) {
   auto cache = std::make_shared<FilterCache>(config);
   helper.getIndexWriter()->filterCache = cache;
   ASSERT_TRUE(helper.indexAll(std::array{
-      solux::test::flatdoc("id", "1", "body_w", "body"),
-      solux::test::flatdoc("id", "2", "body_w", "body")},
+      luxir::test::flatdoc("id", "1", "body_w", "body"),
+      luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto domains = canonicalDomains(*reader);
@@ -2979,19 +2979,19 @@ TEST(DocSetScorerTest, nullSourceBulkScorerEmitsAllDocs) {
 }
 
 TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
-  SoluxConfig onConfig;
+  LuxirConfig onConfig;
   onConfig.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxConfig offConfig;
+  LuxirConfig offConfig;
   offConfig.filterCacheBytes = 0;
-  SoluxNode onNode(onConfig);
-  SoluxNode offNode(offConfig);
-  solux::test::CollectionHelper on(onNode, "filter_cache_it");
-  solux::test::CollectionHelper off(offNode, "filter_cache_it");
+  LuxirNode onNode(onConfig);
+  LuxirNode offNode(offConfig);
+  luxir::test::CollectionHelper on(onNode, "filter_cache_it");
+  luxir::test::CollectionHelper off(offNode, "filter_cache_it");
 
-  std::vector<solux::test::Doc> docs;
+  std::vector<luxir::test::Doc> docs;
   docs.reserve(1100);
   for (int32_t i = 0; i < 1100; i++) {
-    docs.push_back(solux::test::flatdoc(
+    docs.push_back(luxir::test::flatdoc(
         "id", std::to_string(i), "body_w", "body",
         "filter_w", (i & 1) == 0 ? "keep" : "drop",
         "group_s", (i % 3) == 0 ? "a" : "b"));
@@ -3003,7 +3003,7 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   ASSERT_TRUE(onCache->enabled());
   ASSERT_FALSE(offCache->enabled());
 
-  auto registryRequest = solux::test::localReq(offNode.getSearchEngine());
+  auto registryRequest = luxir::test::localReq(offNode.getSearchEngine());
   registryRequest->collection("filter_cache_it")
       .topDocs("registry")
       .matchQuery("body_w", "body")
@@ -3023,13 +3023,13 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   EXPECT_GT(beforeMutation.builds, 0u);
   EXPECT_GT(beforeMutation.hits, 0u);
 
-  solux::test::Doc replacement = solux::test::flatdoc(
+  luxir::test::Doc replacement = luxir::test::flatdoc(
       "id", "replacement", "body_w", "body", "filter_w", "keep",
       "group_s", "a");
-  solux::test::CollectionHelper::UpdateBuilder onUpdate;
+  luxir::test::CollectionHelper::UpdateBuilder onUpdate;
   onUpdate.remove("0").add(replacement).commit();
   ASSERT_TRUE(on.submit(onUpdate).success);
-  solux::test::CollectionHelper::UpdateBuilder offUpdate;
+  luxir::test::CollectionHelper::UpdateBuilder offUpdate;
   offUpdate.remove("0").add(replacement).commit();
   ASSERT_TRUE(off.submit(offUpdate).success);
 
@@ -3047,11 +3047,11 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
 }
 
 TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_reset";
-  solux::test::CollectionHelper helper(node, collection);
+  luxir::test::CollectionHelper helper(node, collection);
   auto writer = helper.getIndexWriter();
   FilterCacheConfig cacheConfig = testConfig();
   cacheConfig.minSegmentDocs = 1000;
@@ -3059,10 +3059,10 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   auto firstCache = std::make_shared<FilterCache>(cacheConfig);
   writer->filterCache = firstCache;
 
-  std::vector<solux::test::Doc> firstPhase;
+  std::vector<luxir::test::Doc> firstPhase;
   firstPhase.reserve(1000);
   for (int32_t i = 0; i < 1000; i++) {
-    firstPhase.push_back(solux::test::flatdoc(
+    firstPhase.push_back(luxir::test::flatdoc(
         "id", "old-" + std::to_string(i), "body_w", "body",
         "filter_w", i < 50 ? "keep" : "drop"));
   }
@@ -3085,13 +3085,13 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   writer->filterCache = secondCache;
   EXPECT_EQ(0u, secondCache->entryCountForTest());
 
-  std::vector<solux::test::Doc> secondPhase;
+  std::vector<luxir::test::Doc> secondPhase;
   std::vector<std::string> expectedIds;
   secondPhase.reserve(1000);
   for (int32_t i = 0; i < 1000; i++) {
     bool keep = i >= 950;
     std::string id = "new-" + std::to_string(i);
-    secondPhase.push_back(solux::test::flatdoc(
+    secondPhase.push_back(luxir::test::flatdoc(
         "id", id, "body_w", "body",
         "filter_w", keep ? "keep" : "drop"));
     if (keep) expectedIds.push_back(id);
@@ -3111,7 +3111,7 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   // reader built WITH a previousReader must not resurrect the old one.
   auto postResetReader = writer->getIndexReader();
   EXPECT_EQ(secondCache.get(), postResetReader->filterCache());
-  solux::test::CollectionHelper::UpdateBuilder touch;
+  luxir::test::CollectionHelper::UpdateBuilder touch;
   touch.remove("new-0").commit();
   ASSERT_TRUE(helper.submit(touch).success);
   auto successorReader = writer->getIndexReader();
@@ -3120,10 +3120,10 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
 }
 
 TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershipKnn) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
-  solux::test::CollectionHelper helper(node, "filter_cache_membership");
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_membership");
   auto writer = helper.getIndexWriter();
   auto cache = std::make_shared<FilterCache>(testConfig());
   writer->filterCache = cache;
@@ -3135,35 +3135,35 @@ TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershi
   schema.set(helper.collection());
 
   ASSERT_TRUE(helper.indexAll(std::array{
-      solux::test::flatdoc("id", "1", "body_w", "body", "filter_w", "keep",
+      luxir::test::flatdoc("id", "1", "body_w", "body", "filter_w", "keep",
                            "embedding_v", std::vector<float>{0.0f, 0.0f}),
-      solux::test::flatdoc("id", "2", "body_w", "body", "filter_w", "keep",
+      luxir::test::flatdoc("id", "2", "body_w", "body", "filter_w", "keep",
                            "embedding_v", std::vector<float>{10.0f, 0.0f}),
-      solux::test::flatdoc("id", "3", "body_w", "body", "filter_w", "drop",
+      luxir::test::flatdoc("id", "3", "body_w", "body", "filter_w", "drop",
                            "embedding_v", std::vector<float>{0.0f, 1.0f})},
       UpdateMessage::COMMIT).success);
 
   auto run = [&](bool requiredTerm) {
-    auto request = solux::test::localReq(node.getSearchEngine());
+    auto request = luxir::test::localReq(node.getSearchEngine());
     auto& cursor = request->collection("filter_cache_membership")
                        .topDocs("q")
                        .allQuery()
                        .fields({"id"})
                        .getNumber()
                        .limit(-1);
-    auto term = solux::test::qb::match(cursor.mr(), "filter_w", "keep");
-    auto knn = solux::test::qb::knn(cursor.mr(), "embedding_v",
+    auto term = luxir::test::qb::match(cursor.mr(), "filter_w", "keep");
+    auto knn = luxir::test::qb::knn(cursor.mr(), "embedding_v",
                                     {0.0f, 1.0f}, 1, 0, true);
     auto filter = requiredTerm
-        ? solux::test::qb::boolean(cursor.mr(), {term}, {knn})
-        : solux::test::qb::boolean(cursor.mr(), {}, {term, knn});
+        ? luxir::test::qb::boolean(cursor.mr(), {term}, {knn})
+        : luxir::test::qb::boolean(cursor.mr(), {}, {term, knn});
     addFilter(cursor, filter);
     request->execute();
     EXPECT_TRUE(request->ok()) << request->toString();
     CachedSearchResult result{
         .count = request->getMatchCount("q"), .ids = {}};
     for (const auto& doc : request->getDocs("q")) {
-      auto* id = solux::test::find(doc, "id");
+      auto* id = luxir::test::find(doc, "id");
       if (id != nullptr) result.ids.push_back(std::get<std::string>(*id));
     }
     std::sort(result.ids.begin(), result.ids.end());
@@ -3189,17 +3189,17 @@ TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershi
 }
 
 TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
-  solux::test::CollectionHelper helper(node, "filter_cache_knn_refresh");
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_knn_refresh");
   installVectorSchema(helper.collection());
   auto cache = std::make_shared<FilterCache>(testConfig());
   helper.getIndexWriter()->filterCache = cache;
 
-  std::vector<solux::test::Doc> input;
+  std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 24; i++) {
-    input.push_back(solux::test::flatdoc(
+    input.push_back(luxir::test::flatdoc(
         "id", std::to_string(i), "group_s", i < 12 ? "a" : "b",
         "embedding_v", std::vector<float>{(float)i, 0.0f}));
   }
@@ -3219,7 +3219,7 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
   const void* entryIdentity = cache->entryIdentityForTest(key);
   ASSERT_NE(nullptr, entryIdentity);
 
-  solux::test::CollectionHelper::UpdateBuilder update;
+  luxir::test::CollectionHelper::UpdateBuilder update;
   update.remove("0").commit();
   ASSERT_TRUE(helper.submit(update).success);
   auto secondReader = helper.getIndexWriter()->getIndexReader();
@@ -3245,11 +3245,11 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
 }
 
 TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
+  LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_knn_pin";
-  solux::test::CollectionHelper helper(node, collection);
+  luxir::test::CollectionHelper helper(node, collection);
   installVectorSchema(helper.collection());
   FilterCacheConfig cacheConfig = testConfig();
   cacheConfig.admissionThreshold = 1;
@@ -3257,10 +3257,10 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   auto writer = helper.getIndexWriter();
   writer->filterCache = cache;
 
-  std::vector<solux::test::Doc> input;
+  std::vector<luxir::test::Doc> input;
   input.reserve(4096);
   for (int32_t i = 0; i < 4096; i++) {
-    input.push_back(solux::test::flatdoc(
+    input.push_back(luxir::test::flatdoc(
         "id", std::to_string(i),
         "embedding_v", std::vector<float>{(float)i, 0.0f}));
   }
@@ -3341,7 +3341,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   });
 
   collecting.wait();
-  solux::test::CollectionHelper::UpdateBuilder update;
+  luxir::test::CollectionHelper::UpdateBuilder update;
   update.remove("0").commit();
   auto updateResult = helper.submit(update);
   std::shared_ptr<IndexReader> nextReader;
@@ -3365,17 +3365,17 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
 }
 
 TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 0;
-  SoluxNode node(config);
-  solux::test::CollectionHelper helper(node, "filter_cache_knn_gate");
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_knn_gate");
   installVectorSchema(helper.collection());
   auto cache = std::make_shared<FilterCache>(testConfig());
   helper.getIndexWriter()->filterCache = cache;
 
-  std::vector<solux::test::Doc> input;
+  std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 20; i++) {
-    input.push_back(solux::test::flatdoc(
+    input.push_back(luxir::test::flatdoc(
         "id", std::to_string(i), "group_s", (i & 1) == 0 ? "a" : "b",
         "embedding_v", std::vector<float>{(float)i, 0.0f}));
   }
@@ -3383,12 +3383,12 @@ TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
   std::array<float, 2> queryVector{0.0f, 0.0f};
 
   auto runNested = [&]() {
-    auto request = solux::test::localReq(node.getSearchEngine());
+    auto request = luxir::test::localReq(node.getSearchEngine());
     auto& top = request->collection("filter_cache_knn_gate")
                     .topDocs("q").allQuery().limit(0);
     auto& nested = top.facet("groups", "group_s").limit(-1)
                        .topDocs("near").allQuery().limit(-1);
-    addFilter(nested, solux::test::qb::knn(
+    addFilter(nested, luxir::test::qb::knn(
         nested.mr(), "embedding_v", queryVector, 3, 0, true));
     request->execute();
     EXPECT_FALSE(request->ok()) << request->toString();
@@ -3423,14 +3423,14 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
     FoldGuard() { disableTopDocsFilterFold = true; }
     ~FoldGuard() { disableTopDocsFilterFold = saved; }
   } foldGuard;
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxNode node(config);
-  solux::test::CollectionHelper helper(node, "filter_cache_mixed");
-  std::vector<solux::test::Doc> input;
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_mixed");
+  std::vector<luxir::test::Doc> input;
   input.reserve(1100);
   for (int32_t i = 0; i < 1100; i++) {
-    input.push_back(solux::test::flatdoc(
+    input.push_back(luxir::test::flatdoc(
         "id", std::to_string(i), "body_w", "body",
         "filter_w", i < 30 ? "sparse" : "other"));
   }
@@ -3439,7 +3439,7 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
   EXPECT_EQ(30, runCachedSearch(node, "filter_cache_mixed", "sparse").count);
   EXPECT_EQ(30, runCachedSearch(node, "filter_cache_mixed", "sparse").count);
 
-  solux::test::CollectionHelper::UpdateBuilder update;
+  luxir::test::CollectionHelper::UpdateBuilder update;
   for (int32_t i = 0; i < 20; i++) update.remove(std::to_string(i));
   update.commit();
   ASSERT_TRUE(helper.submit(update).success);
@@ -3450,14 +3450,14 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
 }
 
 TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.filterCacheBytes = 4 * 1024 * 1024;
-  SoluxNode node(config);
-  solux::test::CollectionHelper helper(node, "filter_cache_facet");
-  std::vector<solux::test::Doc> docs;
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_facet");
+  std::vector<luxir::test::Doc> docs;
   docs.reserve(1100);
   for (int32_t i = 0; i < 1100; i++) {
-    docs.push_back(solux::test::flatdoc(
+    docs.push_back(luxir::test::flatdoc(
         "id", std::to_string(i), "body_w", "body",
         "filter_w", (i & 1) == 0 ? "keep" : "drop",
         "group_s", (i % 3) == 0 ? "a" : "b"));
@@ -3465,7 +3465,7 @@ TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
   auto run = [&]() {
-    auto request = solux::test::localReq(node.getSearchEngine());
+    auto request = luxir::test::localReq(node.getSearchEngine());
     auto& top = request->collection("filter_cache_facet")
                     .topDocs("q")
                     .matchQuery("body_w", "body")
@@ -3806,7 +3806,7 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
 }
 
 TEST(FilterKeyTest, fuzzyIsCoreStableAndIncludesEffectiveLimit) {
-  FuzzyQuery fuzzy("title", "solux", 2, 1, 0);
+  FuzzyQuery fuzzy("title", "luxir", 2, 1, 0);
   FilterKeyContext first{.schemaGen = 5, .coreGen = 10,
                          .fuzzyMaxExpansions = 40, .timeZone = "UTC"};
   FilterKeyContext otherCore = first;
@@ -3865,7 +3865,7 @@ TEST(FilterKeyTest, fullBytesDefeatForcedHashCollision) {
   EXPECT_EQ(first.hash(), second.hash());
   EXPECT_NE(first, second);
 }
-using namespace solux::test;
+using namespace luxir::test;
 
 namespace {
 
@@ -4166,7 +4166,7 @@ void validateStalePublicationRejection() {
 }
 
 void validateConcurrentSweepPurgeAccounting() {
-#ifdef SOLUX_ASAN
+#ifdef LUXIR_ASAN
   constexpr int entries = 8192;
 #else
   constexpr int entries = 32768;
@@ -4213,7 +4213,7 @@ void validateConcurrentSweepPurgeAccounting() {
 
 } // namespace
 
-class FilterCacheConcurrencyTest : public SoluxTest {};
+class FilterCacheConcurrencyTest : public LuxirTest {};
 
 TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
   ASSERT_NO_THROW(validateConcurrentByproductPublication());
@@ -4226,15 +4226,15 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
   const int phases = 3;
   const int percentDeletes = 35;
   const int percentCommits = 70;
-#ifdef SOLUX_ASAN
+#ifdef LUXIR_ASAN
   const int batchesPerWriter = 18;
 #else
   const int batchesPerWriter = 40;
 #endif
 
-  SoluxConfig nodeConfig;
+  LuxirConfig nodeConfig;
   nodeConfig.filterCacheBytes = 0;
-  SoluxNode node(nodeConfig);
+  LuxirNode node(nodeConfig);
   CollectionHelper helper(node, collection);
   auto writer = helper.getIndexWriter();
   writer->mergePolicy->setMergeFactor(3);

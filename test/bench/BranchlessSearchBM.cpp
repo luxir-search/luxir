@@ -4,24 +4,24 @@
 #include <vector>
 #include <map>
 #include <algorithm>
-#include "solux/util/BranchlessSearch.h"
-#include "solux/util/screaming.h"
-#include "solux/util/random.h"
-#include "test/SoluxTest.h"
+#include "luxir/util/BranchlessSearch.h"
+#include "luxir/util/screaming.h"
+#include "luxir/util/random.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
+using namespace luxir;
 using screaming::gallopLowerBound;
 
-namespace solux { extern bool unit_tests; }
+namespace luxir { extern bool unit_tests; }
 
 // Low-level micro-benchmarks for the screaming-bitset / prefix-array search
 // internals (branchless vs std vs gallop).  These are NOT regression benchmarks
-// and are disabled by default -- otherwise they would run on every solux_test
+// and are disabled by default -- otherwise they would run on every luxir_test
 // invocation via Benchmarks.all and slow the (ASan/valgrind) suite.  They are
 // only worth running when working on the bitset / search code itself.
 //
 // To run them: uncomment the `#define RUN_DISABLED_BENCHMARKS` below, rebuild, then
-//   solux_test --bench --benchmark_filter='UpperBound|ColdSparse|SparseSkip|DenseRank'
+//   luxir_test --bench --benchmark_filter='UpperBound|ColdSparse|SparseSkip|DenseRank'
 // The findings are recorded in the project memory; the production choices they
 // justify (gallop in the SPARSE advance, branchless in select / findSeg / the
 // dense rank index) are covered by the normal Screaming/Knn tests plus the
@@ -30,7 +30,7 @@ namespace solux { extern bool unit_tests; }
 // Always-on: cheap fuzz check that the production gallop and branchless searches
 // match std::lower_bound across edge-case lengths and every key position.
 TEST(BranchlessSearchBM, gallopAndBranchlessMatchStd) {
-  auto& rng = SoluxTest::rng;  // gtest-seeded (per-test) fast RNG
+  auto& rng = LuxirTest::rng;  // gtest-seeded (per-test) fast RNG
   for (size_t len : std::initializer_list<size_t>{0, 1, 2, 3, 7, 16, 100, 4096}) {
     std::uniform_int_distribution<int> v(0, (int)len + 5);
     std::vector<uint16_t> arr(len);
@@ -168,7 +168,7 @@ struct SparseArena {
 // prefetch runs (and across benchmark's repeated convergence calls).
 [[maybe_unused]] const SparseArena& coldArena(size_t bucketSize) {
   static std::map<size_t, SparseArena> cache;
-  size_t target = solux::unit_tests ? (4ull << 20) : COLD_TARGET_BYTES;
+  size_t target = luxir::unit_tests ? (4ull << 20) : COLD_TARGET_BYTES;
   auto it = cache.find(bucketSize);
   if (it == cache.end()) it = cache.emplace(bucketSize, buildArena(bucketSize, target)).first;
   return it->second;

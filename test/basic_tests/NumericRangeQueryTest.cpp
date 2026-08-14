@@ -6,31 +6,31 @@
 #include <string>
 #include <vector>
 
-#include "solux/query/QueryBuilder.h"
-#include "solux/schema/Schema.h"
-#include "solux/util/MemPool.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/util/MemPool.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
-namespace api = solux::api;
+namespace api = luxir::api;
 
 // Numeric range (and numeric match, which is a degenerate range) executed by
 // scanning the field's numeric column.  Tests assert the exact set of matching
 // id_s values so bound handling, missing values, multi-valued "any", encoded
 // sortable order, and two-phase conjunctions are all observable from results.
-class NumericRangeQueryTest : public SoluxTest {
+class NumericRangeQueryTest : public LuxirTest {
 protected:
   // Run a top-level query built from `build` (given the request arena) and
   // return the sorted id_s of the matching docs.
   std::vector<std::string> idsFor(auto&& build) {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = lreq->collection("main").topDocs("q");
     cur.rawQuery() = build(cur.mr());
     cur.fields({"id_s"}).limit(1000);
@@ -38,7 +38,7 @@ protected:
     std::vector<std::string> ids;
     const auto* docs = lreq->docList("q");
     if (docs && docs->columns.contains("id_s")) {
-      const auto& col = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+      const auto& col = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);
       for (auto sv : col.v) ids.push_back(std::string(sv));
     }
     std::sort(ids.begin(), ids.end());

@@ -1,0 +1,480 @@
+#pragma once
+
+#include "luxir/index/DocStream.h"
+#include "luxir/index/BKDWriter.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/index/IntColWriter.h"
+#include "luxir/index/PointsWriter.h"
+#include "luxir/schema/ValCoerce.h"
+#include "luxir/util/geo.h"
+
+#include <fmt/format.h>
+
+#include <ranges>
+
+using namespace luxir;
+namespace luxir::handler {
+
+// RANGE flush adds this 16-byte-per-value peak outside inverter.pool, so the
+// inverter autoflush cap must leave headroom for the transient sort array.
+struct FlushPoint {
+  int64_t value;
+  int32_t docid;
+};
+
+static_assert(sizeof(FlushPoint) == 16);
+
+inline void writePoints(PostingsWriter& postingsWriter,
+                        PostingsWriter::IndexFieldInfo& fieldInfo,
+                        std::vector<FlushPoint>& points) {
+  sortPointsByValueDocid(std::span<FlushPoint>(points));
+  auto output = postingsWriter.getOutputStream();
+  PointsWriter writer(*output, PointsWriter::Options{});
+  for (const auto& point : points) writer.addPoint(point.value, point.docid);
+  auto data = writer.finish();
+  fieldInfo.pointsLoc = data.pointsLoc;
+  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+}
+
+inline void writeGeoPoints(PostingsWriter& postingsWriter,
+                           PostingsWriter::IndexFieldInfo& fieldInfo,
+                           std::vector<BKDWriter::Point>& points) {
+  auto output = postingsWriter.getOutputStream();
+  BKDWriter writer(*output);
+  auto data = writer.write(points);
+  fieldInfo.pointsLoc = data.pointsLoc;
+  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+}
+
+[[noreturn]] inline void throwGeoPointWire(std::string_view fieldName,
+                                           std::string_view detail) {
+  throw std::runtime_error(fmt::format(
+      "field '{}': cannot coerce value to GEO_POINT [x, y] = [lon, lat]: {}",
+      fieldName, detail));
+}
+
+inline GeoPoint parseGeoPointWire(const IndexVal& val,
+                                  std::string_view fieldName) {
+  auto checkArity = [&](size_t size) {
+    if (size != 2) {
+      throwGeoPointWire(fieldName,
+                        fmt::format("expected exactly 2 elements, got {}", size));
+    }
+  };
+  if (const auto* a = std::get_if<luxir::api::ArrDouble>(&val.kind)) {
+    checkArity(a->v.size());
+    return {a->v[1], a->v[0]};
+  }
+  if (const auto* a = std::get_if<luxir::api::ArrInt>(&val.kind)) {
+    checkArity(a->v.size());
+    return {(double)a->v[1], (double)a->v[0]};
+  }
+  if (const auto* a = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+    checkArity(a->v.size());
+    auto numeric = [&](size_t index) {
+      const IndexVal& element = a->v[index];
+      if (!std::holds_alternative<int64_t>(element.kind) &&
+          !std::holds_alternative<double>(element.kind) &&
+          !std::holds_alternative<float>(element.kind)) {
+        throwGeoPointWire(fieldName,
+                          fmt::format("element {} ({}) is not numeric", index,
+                                      coerce::describe(element)));
+      }
+      return coerce::toDouble(element, fieldName);
+    };
+    double longitude = numeric(0);
+    double latitude = numeric(1);
+    return {latitude, longitude};
+  }
+  throwGeoPointWire(fieldName,
+                    "expected a two-element numeric array");
+}
+
+//
+// Info for one single valued column.
+//
+// IntColHandler and MultiIntColHandler serve the whole int-column family
+// (INT, FLOAT, DOUBLE, DATE, GEO_POINT): the value a column stores is whatever
+// FieldType::coerceColInt64 returns (raw ints, sortable bits, epoch millis),
+// so the handlers themselves are encoding-blind.  Coercion failures throw,
+// which the per-doc update path recovers by marking the doc failed.
+//
+class IntColHandler : public Inverter::IndexHandler {
+  friend class Inverter;
+  LongStream longStream;
+  DocStream docsWithVal;
+  int32_t numVals = 0;
+
+public:
+  IntColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+      docsWithVal(inverter.pool) {
+  }
+
+  IntColHandler(Inverter& inverter, PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType,
+                IndexHandler& parent)
+    : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
+    unused(parent);
+  }
+
+  ~IntColHandler() override = default;
+
+  void index(Inverter& inverter, const IndexVal& val) override {
+    // explicit null means "no value", same as an absent field
+    if (coerce::isNull(val)) return;
+    indexSingle(inverter, fieldType->coerceColInt64(
+        val, std::string_view(fieldName), inverter.coerceContext));
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexSingle(inverter, fieldType->coerceColInt64(
+        coerce::scalarVal(int64), std::string_view(fieldName),
+        inverter.coerceContext));
+  }
+
+  void indexSingle(Inverter& inverter, int64_t val) {
+    longStream.addVal(inverter.pool, val);
+    docsWithVal.addDoc(inverter.pool, inverter.getDoc());
+    numVals++;
+  }
+
+  void flush(Inverter& inverter) override {
+    flushIntCol(inverter);
+  }
+
+  // TODO: make static and pass everything needed so it's composable
+  void flushIntCol(Inverter& inverter) {
+    if (numVals == 0) {
+      return;  // drop the field.
+    }
+    PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+
+    // TODO: move this to postingsWriter method
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    fieldInfo.type = fieldType->type();
+    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+    flushIntCol(inverter, fieldInfo);
+  }
+
+  // This is the version called directly from text field for norms
+  void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
+    auto& tmpPool = MemPool::threadLocal();
+    PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+    auto full = numVals >= postingsWriter.getMaxDoc();
+
+    // push values
+    {
+      auto outputPtr = postingsWriter.getOutputStream();
+      IntColWriter writer(*outputPtr);
+      // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
+      // not really possible if we're writing the column directly and incrementally since we don't know
+      // min, max, numbits, gcd, etc.  But we *could* know that stuff when merging segments!
+      // For direct incremental columns, and for merging, we could have a IntColWriter method that accepts (docid,val)
+      // For that, we could have versions of push that take a number of values to push so we can have the best
+      // of both worlds.
+      // We could also be told it's a required field, in which case we would always chose a dense encoding unless
+      // all bits are somehow needed.  In that case, we would decode blocks of docs so we could feed doc/val
+      // pairs to the inverter.  A co-routine generator might be perfect for this (one that fills blocks, not
+      // individual values)
+      longStream.pushValues(inverter.pool, writer);
+      writer.finish(fieldInfo);
+    }
+
+    if (fieldType->rangeIndexed()) {
+      if (fieldType->type() == FieldType::GEO_POINT) {
+        std::vector<BKDWriter::Point> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({geo::unpackLatitude(value),
+                            geo::unpackLongitude(value), 0});
+        });
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(pointIndex < points.size());
+          points[pointIndex++].docid = docid;
+        });
+        assert(pointIndex == points.size());
+        writeGeoPoints(postingsWriter, fieldInfo, points);
+      } else {
+        std::vector<FlushPoint> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({value, 0});
+        });
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(pointIndex < points.size());
+          points[pointIndex++].docid = docid;
+        });
+        assert(pointIndex == points.size());
+        writePoints(postingsWriter, fieldInfo, points);
+      }
+    }
+
+    // push docs
+    {
+      auto guard = tmpPool.rewindScopeGuard();
+      // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
+      DocsWithValWriter docsWriter(tmpPool, postingsWriter, fieldInfo);
+      if (!full) {
+        docsWithVal.pushDocs(inverter.pool, docsWriter);
+        docsWriter.finish();
+      }
+      else {
+        docsWriter.finishDense(numVals);
+      }
+    }
+
+  }
+};
+
+
+class MultiIntColHandler : public Inverter::IndexHandler {
+  friend class Inverter;
+  LongStream longStream;
+  IntStream lengthStream;
+  DocStream docsWithVal;
+  int64_t numVals = 0;
+  int32_t numDocs = 0;
+
+public:
+  MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
+                     const std::shared_ptr<FieldType>& fieldType)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+      lengthStream(inverter.pool), docsWithVal(inverter.pool) {
+  }
+
+  ~MultiIntColHandler() override = default;
+
+  void index(Inverter& inverter, const IndexVal& val) override {
+    // expected kinds first: array form, then a single value
+    if (std::holds_alternative<luxir::api::ArrInt>(val.kind)) {
+      auto& arr = std::get<luxir::api::ArrInt>(val.kind).v;
+      index(inverter, std::span<const int64_t>(arr.data(), arr.size()));
+      return;
+    }
+    if (std::holds_alternative<int64_t>(val.kind)) {
+      index(inverter, std::get<int64_t>(val.kind));
+      return;
+    }
+    if (coerce::isNull(val)) return;
+    // Coercions last, element-wise through the field type.  Materialize the
+    // full array before indexMulti: a throw partway through a lazy transform
+    // would leave already-appended values without their doc/length entries
+    // (the column reconstructs positionally, corrupting later docs); a throw
+    // before any stream mutation just fails the doc.
+    std::vector<int64_t> encoded;
+    bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
+      encoded.push_back(fieldType->coerceColInt64(
+          elem, std::string_view(fieldName), inverter.coerceContext));
+    });
+    if (!wasArray) {
+      encoded.push_back(fieldType->coerceColInt64(
+          val, std::string_view(fieldName), inverter.coerceContext));
+    }
+    indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexMulti(inverter, std::views::single(
+        fieldType->coerceColInt64(coerce::scalarVal(int64), std::string_view(fieldName),
+                                  inverter.coerceContext)));
+  }
+
+  void index(Inverter& inverter, std::span<const int64_t> vals) override {
+    // int64 -> any int-column type never throws, so the lazy transform is safe
+    // under the validate-before-mutate contract.
+    indexMulti(inverter, vals | std::views::transform([this, &inverter](int64_t v) {
+      return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName),
+                                       inverter.coerceContext);
+    }));
+  }
+
+  void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
+    int64_t n = 0;
+    for (auto val : values) {
+      longStream.addVal(inverter.pool, val);
+      n++;
+    }
+    if (n == 0) return;
+    numVals += n;
+    docsWithVal.addDoc(inverter.pool, inverter.getDoc());
+    lengthStream.addVal(inverter.pool, n);
+    numDocs++;
+  }
+
+  void flush(Inverter& inverter) override {
+    flushIntCol(inverter);
+  }
+
+  // TODO: make static and pass everything needed so it's composable
+  void flushIntCol(Inverter& inverter) {
+    if (numVals == 0) {
+      return;  // drop the field.
+    }
+    PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+
+    // TODO: move this to postingsWriter method
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    fieldInfo.type = fieldType->type();
+    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+    flushIntCol(inverter, fieldInfo);
+  }
+
+  // This is the version called directly from text field for norms
+  void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
+    auto& pool = MemPool::threadLocal();
+    PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+    auto full = numDocs >= postingsWriter.getMaxDoc();
+
+    // push values
+    {
+      auto outputPtr = postingsWriter.getOutputStream();
+      IntColWriter writer(*outputPtr);
+      longStream.pushValues(inverter.pool, writer);
+      writer.finish(fieldInfo);
+    }
+
+    if (fieldType->rangeIndexed()) {
+      if (fieldType->type() == FieldType::GEO_POINT) {
+        std::vector<BKDWriter::Point> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({geo::unpackLatitude(value),
+                            geo::unpackLongitude(value), 0});
+        });
+        IntStream::Reader lengths(lengthStream, inverter.pool);
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(!lengths.eof());
+          int32_t length = lengths.next();
+          assert(length >= 0);
+          for (int32_t i = 0; i < length; i++) {
+            assert(pointIndex < points.size());
+            points[pointIndex++].docid = docid;
+          }
+        });
+        assert(lengths.eof());
+        assert(pointIndex == points.size());
+        writeGeoPoints(postingsWriter, fieldInfo, points);
+      } else {
+        std::vector<FlushPoint> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({value, 0});
+        });
+
+        IntStream::Reader lengths(lengthStream, inverter.pool);
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(!lengths.eof());
+          int32_t length = lengths.next();
+          assert(length >= 0);
+          for (int32_t i = 0; i < length; i++) {
+            assert(pointIndex < points.size());
+            points[pointIndex++].docid = docid;
+          }
+        });
+        assert(lengths.eof());
+        assert(pointIndex == points.size());
+        writePoints(postingsWriter, fieldInfo, points);
+      }
+    }
+
+    // push docs
+    {
+      auto guard = pool.rewindScopeGuard();
+      // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
+      DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
+      if (!full) {
+        docsWithVal.pushDocs(inverter.pool, docsWriter);
+        docsWriter.finish();
+      }
+      else {
+        docsWriter.finishDense(numDocs);
+      }
+    }
+
+    // push lengths
+    {
+      auto guard = pool.rewindScopeGuard();
+      OutputStreamPtr out = postingsWriter.getOutputStream();
+      MonoWriter endValueRankWriter(pool, *out);
+      int64_t endValueRank = 0;
+
+      lengthStream.visitValues(inverter.pool, [&endValueRank, &endValueRankWriter](auto val) {
+        endValueRank += val;
+        endValueRankWriter.addInt64(endValueRank);
+      });
+
+      endValueRankWriter.finish();
+      fieldInfo.monoLoc = endValueRankWriter.blockLoc;
+      fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
+    }
+
+  }
+};
+
+class GeoPointHandler final : public IntColHandler {
+public:
+  GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
+                  const std::shared_ptr<FieldType>& fieldType)
+    : IntColHandler(inverter, fieldName, fieldType) {}
+
+  void index(Inverter& inverter, double latitude, double longitude) override {
+    indexSingle(inverter, geo::encodePoint(latitude, longitude));
+  }
+
+  void index(Inverter& inverter, std::span<const GeoPoint> points) override {
+    if (points.empty()) return;
+    if (points.size() != 1) {
+      throw std::invalid_argument("single-valued GEO_POINT field received multiple points");
+    }
+    index(inverter, points[0].latitude, points[0].longitude);
+  }
+
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (coerce::isNull(val)) return;
+    GeoPoint point = parseGeoPointWire(val, std::string_view(fieldName));
+    index(inverter, point.latitude, point.longitude);
+  }
+};
+
+class MultiGeoPointHandler final : public MultiIntColHandler {
+public:
+  MultiGeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
+                       const std::shared_ptr<FieldType>& fieldType)
+    : MultiIntColHandler(inverter, fieldName, fieldType) {}
+
+  void index(Inverter& inverter, double latitude, double longitude) override {
+    int64_t packed = geo::encodePoint(latitude, longitude);
+    indexMulti(inverter, std::views::single(packed));
+  }
+
+  void index(Inverter& inverter, std::span<const GeoPoint> points) override {
+    std::vector<int64_t> packed;
+    packed.reserve(points.size());
+    for (const auto& point : points) {
+      packed.push_back(geo::encodePoint(point.latitude, point.longitude));
+    }
+    indexMulti(inverter, packed);
+  }
+
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (coerce::isNull(val)) return;
+    const auto* arr = std::get_if<luxir::api::ArrVal>(&val.kind);
+    if (arr == nullptr) {
+      throwGeoPointWire(std::string_view(fieldName),
+                        "multi-valued fields require an array of point arrays");
+    }
+    std::vector<GeoPoint> points;
+    points.reserve(arr->v.size());
+    for (const auto& point : arr->v) {
+      points.push_back(parseGeoPointWire(point, std::string_view(fieldName)));
+    }
+    index(inverter, std::span<const GeoPoint>(points));
+  }
+};
+
+
+} // namespace luxir::handler

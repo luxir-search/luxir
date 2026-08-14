@@ -5,15 +5,15 @@
 #include <string>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/Inverter.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/search/FilterCache.h"
-#include "solux/store/Directory.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/FilterCache.h"
+#include "luxir/store/Directory.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -219,15 +219,15 @@ void BM_FilterCachePublishDense(benchmark::State& state) {
 
 } // namespace
 
-SOLUX_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, term, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, boolean_100, 100);
-SOLUX_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, boolean_10k, 10'000);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, term, 1);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, boolean_100, 100);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, boolean_10k, 10'000);
 
-SOLUX_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, term, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_100, 100);
-SOLUX_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_10k, 10'000);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, term, 1);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_100, 100);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_10k, 10'000);
 
-SOLUX_BENCHMARK(BM_FilterCacheProbePin);
+LUXIR_BENCHMARK(BM_FilterCacheProbePin);
 
 BENCHMARK_CAPTURE(BM_FilterCacheEffectiveDocSet, raw_serve, false)
     ->UseManualTime()->Iterations(100);

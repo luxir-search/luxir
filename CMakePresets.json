@@ -93,7 +93,7 @@
   ],
 
   "buildPresets": [
-    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Recommended iteration build. Concurrent compiles are capped adaptively (physical cores + RAM, <=16) via the solux_compile Ninja pool in CMakeLists, so a plain -j is safe here and on smaller laptops." },
+    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Recommended iteration build. Concurrent compiles are capped adaptively (physical cores + RAM, <=16) via the luxir_compile Ninja pool in CMakeLists, so a plain -j is safe here and on smaller laptops." },
     { "name": "gcc-debug-asan",   "configurePreset": "gcc-debug-asan",   "description": "Memory-check build (pre-commit)." },
     { "name": "gcc-release",      "configurePreset": "gcc-release" },
     { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" }

@@ -1,11 +1,11 @@
 #include "gtest/gtest.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/reader/PosEnum.h"
-#include "solux/schema/Schema.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/PosEnum.h"
+#include "luxir/schema/Schema.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
 #include <array>
@@ -16,10 +16,10 @@
 #include <string_view>
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class TextMergeFuzzTest : public SoluxTest {
+class TextMergeFuzzTest : public LuxirTest {
 protected:
   struct Posting {
     int32_t doc;

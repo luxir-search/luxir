@@ -3,9 +3,9 @@
 #include <memory>
 #include <string>
 
-#include "solux/codec/Codec.h"
+#include "luxir/codec/Codec.h"
 
-namespace solux {
+namespace luxir {
 
 class U32CodecFactory {
 public:

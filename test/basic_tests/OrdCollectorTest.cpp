@@ -1,11 +1,11 @@
-#include "test/SoluxTest.h"
-#include "solux/util/MemPool.h"
-#include "solux/index/OrdCollector.h"
+#include "test/LuxirTest.h"
+#include "luxir/util/MemPool.h"
+#include "luxir/index/OrdCollector.h"
 
 using namespace std;
-using namespace solux;
+using namespace luxir;
 
-class OrdCollectorTest : public solux::SoluxTest {
+class OrdCollectorTest : public luxir::LuxirTest {
 protected:
 };
 

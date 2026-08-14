@@ -15,18 +15,18 @@
 #include <latch>
 
 #include <oneapi/tbb/flow_graph.h>
-#include <solux/index/Inverter.h>
-#include <solux/server/ProtoUpdateMessage.h>
+#include <luxir/index/Inverter.h>
+#include <luxir/server/ProtoUpdateMessage.h>
 
-#include "solux/index/IndexWriter.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/search/IndexReader.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/util/MemPool.h"
-#include "solux/util/Signal.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/util/MemPool.h"
+#include "luxir/util/Signal.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
@@ -36,9 +36,9 @@
 // #define TEST_DEBUG LOG_DEBUG
 
 using namespace std;
-using namespace solux;
+using namespace luxir;
 
-class IndexWriterTest : public SoluxTest {
+class IndexWriterTest : public LuxirTest {
 public:
   std::string field = "text_w";
 
@@ -160,22 +160,22 @@ bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
 
 
 TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
-  EXPECT_EQ(SoluxConfig{}.index.merge_factor,
+  EXPECT_EQ(LuxirConfig{}.index.merge_factor,
             IndexWriter::MergePolicy::DEFAULT_MERGE_FACTOR);
 
-  SoluxConfig config;
+  LuxirConfig config;
   CLI::App app;
   config.addOptions(app);
   app.parse("--index.merge-factor 1000");
   ASSERT_EQ(config.index.merge_factor, 1000);
 
-  SoluxNode node(config);
-  solux::test::CollectionHelper main(node);
+  LuxirNode node(config);
+  luxir::test::CollectionHelper main(node);
   EXPECT_EQ(main.getIndexWriter()->mergePolicy->mergeFactor, 1000);
   EXPECT_EQ(node.getOrCreateCollection("other")->getShard()->getIndexWriter()->mergePolicy->mergeFactor,
             1000);
 
-  SoluxConfig invalidConfig;
+  LuxirConfig invalidConfig;
   CLI::App invalidApp;
   invalidConfig.addOptions(invalidApp);
   EXPECT_THROW(invalidApp.parse("--index.merge-factor 1"), CLI::ValidationError);
@@ -203,7 +203,7 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
     flushAtVersion(9, "first higher version segment");
     flushAtVersion(10, "second higher version segment");
     writer.commit();
-    auto info = solux::test::readDurableIndexInfo(*dir);
+    auto info = luxir::test::readDurableIndexInfo(*dir);
     EXPECT_EQ(info->segments.size(), 1u);
     EXPECT_EQ(info->update_version, 10u);
   }
@@ -221,7 +221,7 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   writer->updateGraph.wait_for_all();
   EXPECT_FALSE(msg->result.errored());
   EXPECT_EQ(msg->updateVersion, 11u);
-  EXPECT_EQ(solux::test::readDurableIndexInfo(*dir)->update_version, 11u);
+  EXPECT_EQ(luxir::test::readDurableIndexInfo(*dir)->update_version, 11u);
 }
 
 
@@ -457,8 +457,8 @@ TEST_F(IndexWriterTest, booleanAcquiresUsesAfterFilterNormalization) {
 
 // Test automatic merging kick-off
 TEST_F(IndexWriterTest, autoMerge) {
-  // This scope guard no longer needed since SoluxTest clears all listeners.
-  // auto cleaner = solux::scope_guard([](){ solux::Signal::unlisten("mergeStart");});
+  // This scope guard no longer needed since LuxirTest clears all listeners.
+  // auto cleaner = luxir::scope_guard([](){ luxir::Signal::unlisten("mergeStart");});
 
   auto iterations = 1;  // increase for more thorough testing
   for (auto iter=0; iter<iterations; iter++) {
@@ -491,7 +491,7 @@ TEST_F(IndexWriterTest, autoMerge) {
       return nullptr;
     };
 
-    solux::Signal::listen("mergeStart", std::move(callback));
+    luxir::Signal::listen("mergeStart", std::move(callback));
 
     // this should cause a segment flush and a merge to kick off, but we've blocked the merge from completing until
     // later.
@@ -542,7 +542,7 @@ TEST_F(IndexWriterTest, autoMerge) {
 }
 
 TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper helper("main");
   auto iw = helper.getIndexWriter();
@@ -564,14 +564,14 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
 
   std::latch mergeStarted(1);
   std::latch releaseMerge(1);
-  solux::Signal::listen("mergeStart", [&](void* a, void* b, void* c) -> void* {
+  luxir::Signal::listen("mergeStart", [&](void* a, void* b, void* c) -> void* {
     unused(a, b, c);
     mergeStarted.count_down();
     releaseMerge.wait();
     return nullptr;
   });
 
-  solux::Signal::listen("segmentMergeBody", [](void*, void*, void*) -> void* {
+  luxir::Signal::listen("segmentMergeBody", [](void*, void*, void*) -> void* {
     throw std::runtime_error("injected segment merge failure");
   });
   std::atomic_bool waitCommitDone = false;
@@ -596,8 +596,8 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
     mergeThread.join();
     waitCommitThread.join();
   }
-  solux::Signal::unlisten("mergeStart");
-  solux::Signal::unlisten("segmentMergeBody");
+  luxir::Signal::unlisten("mergeStart");
+  luxir::Signal::unlisten("segmentMergeBody");
 
   EXPECT_FALSE(iw->testMergeRunning());
   EXPECT_TRUE(waitCommitDone.load(std::memory_order_relaxed));
@@ -627,7 +627,7 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
 
 // Multithreaded test of IndexWriter updates, commits, merges, and IndexReader reopen during those.
 TEST_F(IndexWriterTest, multiThreaded) {
-  using namespace solux::test;
+  using namespace luxir::test;
   int requestThreads = 4;
   int docsToAdd = 100;
   int percentReads = 20;
@@ -669,11 +669,11 @@ TEST_F(IndexWriterTest, multiThreaded) {
   // request.commit), so the request is fully built in time (base-from-member idiom).
   struct TestReq {
     std::pmr::monotonic_buffer_resource mr;
-    solux::api::UpdateRequest request;
+    luxir::api::UpdateRequest request;
     TestReq(std::string_view fieldName, int numAdds, bool doCommit, bool waitForMerges,
             uint32_t maxSegments) {
       if (numAdds > 0) {
-        solux::api::Map* docs = solux::api::build::allocArray(request.docs, numAdds, mr);
+        luxir::api::Map* docs = luxir::api::build::allocArray(request.docs, numAdds, mr);
         for (int i = 0; i < numAdds; i++) {
           CollectionHelper::convertDocToProto(
               flatdoc(std::string(fieldName), std::string("now is the time for all")), docs[i], mr);
@@ -689,7 +689,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
   class TestProtoUpdateMessage : private TestReq, public ProtoUpdateMessage {
   public:
-    solux::api::UpdateRequest& updateRequest;
+    luxir::api::UpdateRequest& updateRequest;
     std::function<void(TestProtoUpdateMessage&)> callback = nullptr;
 
     TestProtoUpdateMessage(std::string_view fieldName, int numAdds, bool doCommit,
@@ -930,7 +930,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
 // Test that _version_ field is present when overwrite=true and absent otherwise
 TEST_F(IndexWriterTest, versionFieldOverwrite) {
-  using namespace solux::test;
+  using namespace luxir::test;
   
   CollectionHelper helper("main");
 
@@ -994,7 +994,7 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
 // docid - it used to index the dense decoder by docid, reading the wrong doc's
 // version past a gap (and asserting past the end of the column).
 TEST_F(IndexWriterTest, sparseVersionColumnDeletes) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper helper("main");
 
@@ -1027,7 +1027,7 @@ TEST_F(IndexWriterTest, sparseVersionColumnDeletes) {
 
 // Test deletion functionality - verify delete infrastructure works
 TEST_F(IndexWriterTest, deletionInfrastructure) {
-  using namespace solux::test;
+  using namespace luxir::test;
   
   CollectionHelper helper("main");
 
@@ -1250,7 +1250,7 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 // batch.  All injected failures are invisible to queries, so the version
 // oracle below must hold exactly as if they were never submitted.
 static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int updateFailPercent = 0) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper helper("main");
 
@@ -1279,7 +1279,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
     if (result.success) return;
     EXPECT_GT(maxSegments, 0u);
     EXPECT_GT(mergeFailPercent, 0);
-    EXPECT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
+    EXPECT_EQ(luxir::api::UpdateResponse_::Status::ERROR, result.status);
   };
 
   auto numThreads = 16;
@@ -1294,7 +1294,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
   Rng mergeRng(seed ^ 0x9e3779b97f4a7c15ULL);
   std::mutex mergeRngMutex;
   if (mergeFailPercent > 0) {
-    solux::Signal::listen("segmentMergeBody",
+    luxir::Signal::listen("segmentMergeBody",
         [&mergeRng, &mergeRngMutex, mergeFailPercent](void*, void*, void*) -> void* {
           bool shouldFail = false;
           {
@@ -1371,7 +1371,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
             Doc doc = flatdoc("id", docId);
             auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
             checkCommittedResponse(maxSegments, result);
-            // TODO: expose and get SoluxError for actual error message / stack trace.
+            // TODO: expose and get LuxirError for actual error message / stack trace.
             docVersions[localDoc] = result.updateVersion;
 
           } else if (operation == 1) { // Delete
@@ -1442,7 +1442,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
               auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
               recordForceMergeResponse(maxSegments, result);
               ASSERT_FALSE(result.success);
-              ASSERT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
+              ASSERT_EQ(luxir::api::UpdateResponse_::Status::ERROR, result.status);
               ASSERT_EQ(1, (int)result.errors.size());
               EXPECT_EQ(docId, result.errors[0].id);
             } else {
@@ -1459,7 +1459,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
               auto result = helper.submit(b);
               recordForceMergeResponse(maxSegments, result);
               ASSERT_FALSE(result.success);
-              ASSERT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
+              ASSERT_EQ(luxir::api::UpdateResponse_::Status::ERROR, result.status);
               ASSERT_EQ(1, (int)result.errors.size());
               EXPECT_EQ(docId, result.errors[0].id);
               EXPECT_EQ(1, result.errors[0].index);
@@ -1470,7 +1470,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
           Doc doc = flatdoc("id", docId);
           auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
           checkCommittedResponse(maxSegments, result);
-          // TODO: expose and get SoluxError for actual error message / stack trace.
+          // TODO: expose and get LuxirError for actual error message / stack trace.
           docVersions[localDoc] = result.updateVersion;
 
         } else if (operation == 1) { // Delete
@@ -1528,7 +1528,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
     // The run is meaningless if no merge actually failed; the version oracle
     // above would still pass.  Assert at least one injected failure landed.
     EXPECT_GT(quietFailures.suppressed(), 0u);
-    solux::Signal::unlisten("segmentMergeBody");
+    luxir::Signal::unlisten("segmentMergeBody");
   }
 
   if (updateFailPercent > 0) {
@@ -1565,7 +1565,7 @@ TEST_F(IndexWriterTest, testMultithreadedUpdatesWithDocAndMergeFailures) {
 
 // Test segment merging with deleted documents
 TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
-  using namespace solux::test;
+  using namespace luxir::test;
   
   CollectionHelper helper("main");
   
@@ -1662,7 +1662,7 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
 // and the merge merges a segment before deletes have been applied and "personalDeletes" come into play.
 //
 TEST_F(IndexWriterTest, segmentMergerPositions) {
-  using namespace solux::test;
+  using namespace luxir::test;
   int docsPerSeg = 10;
   int numSegs = 10;
 
@@ -1863,7 +1863,7 @@ TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
 
   std::set<int64_t> applied;  // segIds the delete was applied to this commit
   std::mutex appliedMu;       // applyDeletes fires the hook from parallel per-segment tasks
-  solux::Signal::listen("deleteAppliedToSegment", [&](void* a, void*, void*) -> void* {
+  luxir::Signal::listen("deleteAppliedToSegment", [&](void* a, void*, void*) -> void* {
     std::lock_guard<std::mutex> lk(appliedMu);
     applied.insert((int64_t)a);
     return nullptr;
@@ -1919,7 +1919,7 @@ TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
 
 // Test that fields are removed from the index after document deletion and merging
 TEST_F(IndexWriterTest, removeFields) {
-  using namespace solux::test;
+  using namespace luxir::test;
   
   CollectionHelper helper("main");
   
@@ -2031,7 +2031,7 @@ TEST_F(IndexWriterTest, concurrentFlushAndCommit) {
 }
 
 TEST_F(IndexWriterTest, dynamicFieldNameRules) {
-  using namespace solux::test;
+  using namespace luxir::test;
   // Doc-supplied names hit the id-like check on first use; a template suffix
   // match must not admit an invalid name.
   CollectionHelper helper("dyn_field_names");
@@ -2039,7 +2039,7 @@ TEST_F(IndexWriterTest, dynamicFieldNameRules) {
     flatdoc("id", "g1", "camelCase_s", "ok"),
     flatdoc("id", "b1", "bad-name_s", "rejected"),
   }, UpdateMessage::COMMIT);
-  ASSERT_EQ(solux::api::UpdateResponse_::Status::PARTIAL, result.status);
+  ASSERT_EQ(luxir::api::UpdateResponse_::Status::PARTIAL, result.status);
   ASSERT_EQ(1u, result.errors.size());
   EXPECT_EQ("b1", result.errors[0].id);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("bad-name_s"));
@@ -2047,7 +2047,7 @@ TEST_F(IndexWriterTest, dynamicFieldNameRules) {
 
 // Test coreGen tracking and segment commit_time
 TEST_F(IndexWriterTest, testCoreGen) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper helper("core_gen_test");
   helper.clear();

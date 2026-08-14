@@ -4,16 +4,16 @@
 
 #include <tbb/task_group.h>
 
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 
-namespace solux {
+namespace luxir {
 void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
   unused(nDocs);
   helper.clear();
@@ -144,7 +144,7 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
 
   helper.commit();
 
-  if (!solux::unit_tests) {
+  if (!luxir::unit_tests) {
     malloc_trim(0);
     std::println(std::cerr,"Post buildBenchIndex - Peak RSS: {} KB, current RSS: KB {}", peakRSSKB(), currentRSSKB());
   }
@@ -154,8 +154,8 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
 static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::string_view shape) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   test::CollectionHelper helper;
@@ -240,8 +240,8 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     start = end + 1;
   }
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   //
@@ -284,7 +284,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
       continue;
     }
 
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("main");
     // match all docs query
     auto& topDocs = req->topDocs("q");
@@ -305,7 +305,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     // Now lets fingerprint the results to make sure we get the same every time.
     const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
     // convert the ids back to integers and add them up.
-    const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id").kind);
+    const auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id").kind);
     // start with the number of matches
     ret += docs->found.value_or(0);
     for (int i = 0; i < (int)idCol.v.size(); i++) {
@@ -345,8 +345,8 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
                          std::string_view field1, std::string_view field2, bool para) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -360,7 +360,7 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
 
   int64_t fp = -1;
   for (auto _ : state) {
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs("q");
 
@@ -396,31 +396,31 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
 constexpr int32_t nDocs = 10'000'000; // nocommit
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
 
-SOLUX_BENCHMARK_CAPTURE(BM_QueryBuildIndex, build,              nDocs, shape);
+LUXIR_BENCHMARK_CAPTURE(BM_QueryBuildIndex, build,              nDocs, shape);
 
 // use this one for profiling...
-// SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i,            nDocs, shape, "all", "u10_i", false)->MinTime(30);
+// LUXIR_BENCHMARK_CAPTURE(BM_Query, u10_i,            nDocs, shape, "all", "u10_i", false)->MinTime(30);
 // #ifdef REMOVED
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_scan,        nDocs, shape, "scan","u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i,             nDocs, shape, "all", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_score,       nDocs, shape, "all", "u10_i,_score_", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_para,        nDocs, shape, "all", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10m_i,            nDocs, shape, "all", "u10m_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10_s,      nDocs, shape, "all", "short_u10_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10_s_para, nDocs, shape, "all", "short_u10_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u100k_s,      nDocs, shape, "all", "short_u100k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u100k_s_para, nDocs, shape, "all", "short_u100k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s,      nDocs, shape, "all", "short_u1m_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s_para, nDocs, shape, "all", "short_u1m_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10_i_scan,        nDocs, shape, "scan","u10_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10_i,             nDocs, shape, "all", "u10_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10_i_score,       nDocs, shape, "all", "u10_i,_score_", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10_i_para,        nDocs, shape, "all", "u10_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10m_i,            nDocs, shape, "all", "u10m_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u10_s,      nDocs, shape, "all", "short_u10_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u10_s_para, nDocs, shape, "all", "short_u10_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u100k_s,      nDocs, shape, "all", "short_u100k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u100k_s_para, nDocs, shape, "all", "short_u100k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u1m_s,      nDocs, shape, "all", "short_u1m_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u1m_s_para, nDocs, shape, "all", "short_u1m_s", true);
 
 // Conjunction shapes (rare term leads, advance()s the common one across blocks).
-SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse,      nDocs, shape, "short_u10_s",  "short_u100k_s", false);  // ~1M AND ~100
-SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse_para, nDocs, shape, "short_u10_s",  "short_u100k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_mid,         nDocs, shape, "short_u10_s",  "short_u10k_s",  false);  // ~1M AND ~1k
-SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_mid_sparse,        nDocs, shape, "short_u10k_s", "short_u100k_s", false);  // ~1k AND ~100
+LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse,      nDocs, shape, "short_u10_s",  "short_u100k_s", false);  // ~1M AND ~100
+LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse_para, nDocs, shape, "short_u10_s",  "short_u100k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_mid,         nDocs, shape, "short_u10_s",  "short_u10k_s",  false);  // ~1M AND ~1k
+LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_mid_sparse,        nDocs, shape, "short_u10k_s", "short_u100k_s", false);  // ~1k AND ~100
 // #endif

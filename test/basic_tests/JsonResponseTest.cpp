@@ -3,15 +3,15 @@
 #include <array>
 #include <string>
 
-#include "solux/server/JsonResponse.h"
+#include "luxir/server/JsonResponse.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-namespace solux::test {
+namespace luxir::test {
 
-class JsonResponseTest : public SoluxTest {};
+class JsonResponseTest : public LuxirTest {};
 
 namespace {
 
@@ -77,23 +77,23 @@ TEST_F(JsonResponseTest, stringEscapingSimdPathMatchesScalar) {
   vals.push_back("caf\xC3\xA9 \xE2\x98\x95 utf8 passthrough padded past the block size");
 
   std::vector<std::string_view> views(vals.begin(), vals.end());
-  solux::api::Column col;
-  auto& strCol = col.kind.emplace<solux::api::ColStr>();
+  luxir::api::Column col;
+  auto& strCol = col.kind.emplace<luxir::api::ColStr>();
   strCol.v = std::span<const std::string_view>(views);
-  std::pair<std::string_view, solux::api::Column> colPair{"s", col};
+  std::pair<std::string_view, luxir::api::Column> colPair{"s", col};
 
-  solux::api::DocList dl;
-  dl.columns = solux::api::map_view<std::string_view, solux::api::Column>(
-      std::span<const std::pair<std::string_view, solux::api::Column>>(&colPair, 1));
+  luxir::api::DocList dl;
+  dl.columns = luxir::api::map_view<std::string_view, luxir::api::Column>(
+      std::span<const std::pair<std::string_view, luxir::api::Column>>(&colPair, 1));
   dl.row_count = (int32_t)views.size();
 
-  solux::api::Val val;
+  luxir::api::Val val;
   val.kind = dl;
-  std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>> opPair{
-      "q", ::hpp_proto::indirect_view<solux::api::Val>{&val}};
-  solux::api::SearchResponse resp;
-  resp.ops = solux::api::map_view<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>(
-      std::span<const std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>>(&opPair, 1));
+  std::pair<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>> opPair{
+      "q", ::hpp_proto::indirect_view<luxir::api::Val>{&val}};
+  luxir::api::SearchResponse resp;
+  resp.ops = luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>(
+      std::span<const std::pair<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>>(&opPair, 1));
 
   std::string expected = R"({"docs":[)";
   for (size_t i = 0; i < vals.size(); i++) {
@@ -132,7 +132,7 @@ TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
 }
 
 TEST_F(JsonResponseTest, executionProfileShape) {
-  solux::api::ExecutionProfilePiece piece;
+  luxir::api::ExecutionProfilePiece piece;
   piece.kind = "segment";
   piece.segment = 2;
   piece.max_doc = 11;
@@ -144,10 +144,10 @@ TEST_F(JsonResponseTest, executionProfileShape) {
   piece.domain_size = 1;
   piece.thread_id = 123;
   piece.elapsed_us = 7;
-  solux::api::ExecutionProfileOp op;
+  luxir::api::ExecutionProfileOp op;
   op.name = "cats";
   op.pieces = {&piece, 1};
-  solux::api::SearchResponse resp;
+  luxir::api::SearchResponse resp;
   resp.profile.emplace().ops = {&op, 1};
 
   EXPECT_EQ(
@@ -361,4 +361,4 @@ TEST_F(JsonResponseTest, secondDocListRendersUnderOps) {
       renderSearchResponseLine(req->responses[0]->proto));
 }
 
-} // namespace solux::test
+} // namespace luxir::test

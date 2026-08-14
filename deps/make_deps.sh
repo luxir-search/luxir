@@ -2,7 +2,7 @@
 # Bootstrap deps/ for a fresh checkout:
 #   1. fetch pinned third-party sources that are not checked into the repo
 #      (FastPFOR; also restores the normally-vendored uni-algo if absent)
-#   2. apply Solux's local patches (delegates to apply_patches.sh, which
+#   2. apply Luxir's local patches (delegates to apply_patches.sh, which
 #      also patches the vcpkg roots - see its header for what and why)
 # Safe to re-run: every step skips work that is already done.
 #

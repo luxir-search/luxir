@@ -1,15 +1,15 @@
 #include <gtest/gtest.h>
 #include <cmath>
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/util/NumericUtils.h"
+#include "luxir/util/NumericUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class FloatFieldTest : public SoluxTest {
+class FloatFieldTest : public LuxirTest {
 };
 
 // The sortable encodings must order exactly like the floating point values
@@ -87,7 +87,7 @@ TEST_F(FloatFieldTest, roundTrip) {
   helper.index(flatdoc("id_s", "d3", "weight_d", std::numeric_limits<double>::infinity()),
                UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
       .allQuery()
       .fields({"id_s", "price_f", "weight_d", "vals_fs", "vals_ds"})
@@ -115,7 +115,7 @@ TEST_F(FloatFieldTest, sortFloat) {
   helper.index(flatdoc("id_s", "e"), UpdateMessage::COMMIT);  // missing value, sorts last
 
   auto sortBy = [&](qb::SortDir dir) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").allQuery().fields({"id_s"}).limit(10);
     qb::sort(cur, "price_f", dir);
@@ -143,7 +143,7 @@ TEST_F(FloatFieldTest, sortDouble) {
   helper.index(flatdoc("id_s", "b", "weight_d", 1e-300), UpdateMessage::COMMIT);
   helper.index(flatdoc("id_s", "c", "weight_d", -2.5), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q").allQuery().fields({"id_s"}).limit(10);
   qb::sort(cur, "weight_d", qb::ASC);
@@ -169,7 +169,7 @@ TEST_F(FloatFieldTest, avgFacetInline) {
   helper.index(flatdoc("id_s", "c", "color_s", "blue", "vals_ds", vec(6.0)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "d", "color_s", "blue"), UpdateMessage::COMMIT);  // no values
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q").allQuery().limit(10);
   auto& facet = req->facet("f", "color_s");
   facet.limit(-1);
@@ -181,21 +181,21 @@ TEST_F(FloatFieldTest, avgFacetInline) {
 
   const auto* fr = req->responses[0]->proto.ops.at("f")->facetResult();
   ASSERT_NE(fr, nullptr);
-  auto& bids = std::get<solux::api::ColStr>(fr->bucket_ids->kind);
+  auto& bids = std::get<luxir::api::ColStr>(fr->bucket_ids->kind);
   ASSERT_EQ(2u, bids.v.size());
   ASSERT_EQ("red", bids.v[0]);
   ASSERT_EQ("blue", bids.v[1]);
 
   // red: (1+3+5)/3 values = 3.0 (dividing by its 2 docs would give 4.5)
   // blue: 6/1 value = 6.0 (dividing by its 2 docs would give 3.0)
-  ASSERT_DOUBLE_EQ(3.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgd")->kind).v[0]);
-  ASSERT_DOUBLE_EQ(6.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgd")->kind).v[1]);
+  ASSERT_DOUBLE_EQ(3.0, std::get<luxir::api::ArrDouble>(fr->ops.at("avgd")->kind).v[0]);
+  ASSERT_DOUBLE_EQ(6.0, std::get<luxir::api::ArrDouble>(fr->ops.at("avgd")->kind).v[1]);
 
   // multi-valued int through the same inline path
   // red: (10+20+30)/3 = 20.0 ; blue has no values -> NaN, matching the
   // non-inline path (rendered as null by the JSON layer)
-  ASSERT_DOUBLE_EQ(20.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[0]);
-  ASSERT_TRUE(std::isnan(std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[1]));
+  ASSERT_DOUBLE_EQ(20.0, std::get<luxir::api::ArrDouble>(fr->ops.at("avgi")->kind).v[0]);
+  ASSERT_TRUE(std::isnan(std::get<luxir::api::ArrDouble>(fr->ops.at("avgi")->kind).v[1]));
 }
 
 // avg must decode the sortable bits before summing - the sum of raw encoded
@@ -207,7 +207,7 @@ TEST_F(FloatFieldTest, avg) {
   helper.index(flatdoc("id_s", "b", "price_f", 2.0f, "weight_d", 2.5), UpdateMessage::COMMIT);
   helper.index(flatdoc("id_s", "c", "price_f", 6.0f, "weight_d", 5.0), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q").allQuery().limit(10);
   req->avg("avgf", "price_f");
   req->avg("avgd", "weight_d");

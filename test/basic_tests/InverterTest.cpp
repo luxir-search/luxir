@@ -1,14 +1,14 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
-#include <solux/index/Inverter.h>
+#include <luxir/index/Inverter.h>
 
-#include "solux/index/DocStream.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/DocStream.h"
+#include "test/LuxirTest.h"
 
 using namespace std;
 
-using namespace solux;
+using namespace luxir;
 
 
 class TestConsumer {
@@ -46,7 +46,7 @@ public:
 };
 
 
-class InverterTest : public SoluxTest {
+class InverterTest : public LuxirTest {
 public:
   // add a doc and some random positions to both docstream and consumer
   // return false if we can't add any more.

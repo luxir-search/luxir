@@ -1,11 +1,11 @@
 #include <latch>
 #include <thread>
 
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/CollectionHelper.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 
 // Benchmark overwrite efficiency: N real threads concurrently indexing random documents
@@ -15,9 +15,9 @@ using namespace solux::test;
 static void BM_Overwrite(benchmark::State& state, int nThreads, int64_t maxDoc, int batchSize, bool overwrite, bool extraInt = false) {
   int64_t totalDocs = maxDoc * 2;  // 2x overwrite ratio
 
-  if (solux::unit_tests) {
-    totalDocs = std::min(totalDocs, SoluxTest::scaleTestWork(200));
-    maxDoc = std::min(maxDoc, SoluxTest::scaleTestWork(100));
+  if (luxir::unit_tests) {
+    totalDocs = std::min(totalDocs, LuxirTest::scaleTestWork(200));
+    maxDoc = std::min(maxDoc, LuxirTest::scaleTestWork(100));
   }
 
   int64_t docsPerThread = totalDocs / nThreads;
@@ -90,23 +90,23 @@ static void BM_Overwrite(benchmark::State& state, int nThreads, int64_t maxDoc, 
 // noOW_int adds an extra int field to approximate the cost of indexing _version_ without the delete
 // buffering, so the difference between overwrite and noOW_int isolates
 // the delete buffering + application cost.
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k,           1, 100'000, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k_noOW,      1, 100'000, 100, false);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k_noOW_int,  1, 100'000, 100, false, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t2_100k,           2, 100'000, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t2_100k_noOW,      2, 100'000, 100, false);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t2_100k_noOW_int,  2, 100'000, 100, false, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_100k,           4, 100'000, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_100k_noOW,      4, 100'000, 100, false);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_100k_noOW_int,  4, 100'000, 100, false, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t8_100k,           8, 100'000, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t8_100k_noOW,      8, 100'000, 100, false);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t8_100k_noOW_int,  8, 100'000, 100, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k,           1, 100'000, 100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k_noOW,      1, 100'000, 100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_100k_noOW_int,  1, 100'000, 100, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t2_100k,           2, 100'000, 100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t2_100k_noOW,      2, 100'000, 100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t2_100k_noOW_int,  2, 100'000, 100, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_100k,           4, 100'000, 100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_100k_noOW,      4, 100'000, 100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_100k_noOW_int,  4, 100'000, 100, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t8_100k,           8, 100'000, 100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t8_100k_noOW,      8, 100'000, 100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t8_100k_noOW_int,  8, 100'000, 100, false, true);
 
 // Vary maxDoc to change scale (collision rate stays ~constant since totalDocs = maxDoc * 2)
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_1k,          4, 1'000,     100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_1k_noOW,     4, 1'000,     100, false);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k,         4, 10'000,    100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_noOW,    4, 10'000,    100, false);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m,          4, 1'000'000, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m_noOW,     4, 1'000'000, 100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1k,          4, 1'000,     100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1k_noOW,     4, 1'000,     100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k,         4, 10'000,    100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_noOW,    4, 10'000,    100, false);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m,          4, 1'000'000, 100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_1m_noOW,     4, 1'000'000, 100, false);

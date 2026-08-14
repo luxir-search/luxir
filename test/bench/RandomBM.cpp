@@ -1,7 +1,7 @@
 #include <benchmark/benchmark.h>
 #include <random>
-#include "solux/util/random.h"
-#include "solux/util/solux_util.h"
+#include "luxir/util/random.h"
+#include "luxir/util/luxir_util.h"
 #include "gtest/gtest.h"
 
 
@@ -54,21 +54,21 @@ static void BM_mersenne_twister(benchmark::State& state) {
 }
 
 static void BM_RomuTrio(benchmark::State& state) {
-  using rng_type = solux::SoluxRand<solux::RomuTrio>;
+  using rng_type = luxir::LuxirRand<luxir::RomuTrio>;
   rng_type rng(1234);
   benchRng(state, rng);
 }
 
 
 static void BM_SplitMix64(benchmark::State& state) {
-  using rng_type = solux::SoluxRand<solux::SplitMix64>;
+  using rng_type = luxir::LuxirRand<luxir::SplitMix64>;
   rng_type rng(1234);
   benchRng(state, rng);
 }
 
 inline uint64_t mymix(uint64_t v) {
   // change to different implementations here to test mixing
-  return solux::Hash::hash(&v, sizeof(uint64_t));
+  return luxir::Hash::hash(&v, sizeof(uint64_t));
 }
 
 static void BM_mix(benchmark::State& state) {
@@ -93,10 +93,10 @@ BENCHMARK(BM_SplitMix64);
 BENCHMARK(BM_mix);
 #else
 inline void hackety_hack() {
-  solux::unused(hackety_hack);
-  solux::unused(BM_mersenne_twister);  // get rid of "unused" warnings
-  solux::unused(BM_RomuTrio);
-  solux::unused(BM_SplitMix64);
-  solux::unused(BM_mix);
+  luxir::unused(hackety_hack);
+  luxir::unused(BM_mersenne_twister);  // get rid of "unused" warnings
+  luxir::unused(BM_RomuTrio);
+  luxir::unused(BM_SplitMix64);
+  luxir::unused(BM_mix);
 }
 #endif

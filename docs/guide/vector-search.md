@@ -1,6 +1,6 @@
 # Vector Search
 
-Solux stores vector fields in the normal column store and can also build
+Luxir stores vector fields in the normal column store and can also build
 per-segment ANN (FAISS IVF+PQ) aux indexes for searchable vector fields. The
 column is always the source of truth. Vector search supports exact flat KNN,
 doc collapse for multi-valued vector fields, liveDocs filtering, and
@@ -209,11 +209,11 @@ Each segment is searched with its ANN index when it has one, or by exact scan
 of the vector column when it does not.
 
 `nprobe` is a merge-stable IVF effort knob. The wire name stays familiar, but
-the value is interpreted as the number of lists Solux would probe if the field
+the value is interpreted as the number of lists Luxir would probe if the field
 were a single IVF index built with `nlist = sqrt(live_vector_count)`, capped
 the same way as the builder's `nlist`. That total effort is spread across the
 current per-segment indexes, so pure merges do not change the requested
-effort. When `nprobe` is `0`, Solux chooses an adaptive default and may
+effort. When `nprobe` is `0`, Luxir chooses an adaptive default and may
 auto-deepen breadth when filters or doc collapse leave too few live documents.
 An explicit `nprobe` pins the total effort cap.
 

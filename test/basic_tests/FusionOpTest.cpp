@@ -8,31 +8,31 @@
 #include <utility>
 #include <vector>
 
-#include "solux/schema/Schema.h"
-#include "solux/server/SoluxNode.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/server/LuxirNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class FusionOpTest : public SoluxTest {
+class FusionOpTest : public LuxirTest {
 protected:
   void SetUp() override {
-    auto col = soluxNode->getCollection("main");
+    auto col = luxirNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
   }
 
   // Override _v with a vector field so the same docs can carry both an
   // analyzed text field (_w) and a dense vector for fusion across both.
-  static void installVecSchema(Collection& col, solux::api::VectorMetric metric) {
+  static void installVecSchema(Collection& col, luxir::api::VectorMetric metric) {
     SchemaBuilder b;
     auto& f = b.templ("_v");
-    f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
     f.column = true;
     f.metric = metric;
     b.set(col);
@@ -42,19 +42,19 @@ protected:
 
   // Copy a by-value Query into the build arena and return a stable pointer for an
   // optional_indirect_view<Query> member to point at.
-  static solux::api::Query* arenaQuery(std::pmr::memory_resource& mr, const solux::api::Query& q) {
-    auto* p = (solux::api::Query*)mr.allocate(sizeof(solux::api::Query), alignof(solux::api::Query));
-    return new (p) solux::api::Query(q);
+  static luxir::api::Query* arenaQuery(std::pmr::memory_resource& mr, const luxir::api::Query& q) {
+    auto* p = (luxir::api::Query*)mr.allocate(sizeof(luxir::api::Query), alignof(luxir::api::Query));
+    return new (p) luxir::api::Query(q);
   }
 
   // Grow Fusion.sources (map_view<string_view, TopDocs>, TopDocs by value) by one entry and
   // return the fresh slot to fill. Realloc-grow (mirrors LocalReq::appendOp): the prior
   // entries are trivially copyable with their nested data in the arena. The returned
   // reference stays valid until the next addSource() call reallocates the backing array.
-  static solux::api::TopDocs& addSource(solux::api::Fusion& fusion, std::string_view name,
+  static luxir::api::TopDocs& addSource(luxir::api::Fusion& fusion, std::string_view name,
                                         std::pmr::memory_resource& mr) {
-    using Map = solux::api::map_view<std::string_view, solux::api::TopDocs>;
-    using Pair = std::pair<std::string_view, solux::api::TopDocs>;
+    using Map = luxir::api::map_view<std::string_view, luxir::api::TopDocs>;
+    using Pair = std::pair<std::string_view, luxir::api::TopDocs>;
     auto old = fusion.sources;
     Pair* a = (Pair*)mr.allocate(sizeof(Pair) * (old.size() + 1), alignof(Pair));
     std::uninitialized_value_construct_n(a, old.size() + 1);
@@ -65,7 +65,7 @@ protected:
   }
 
   // Append one field name to a Fusion.fields span (realloc-grow preserves prior entries).
-  static void addField(solux::api::Fusion& fusion, std::string_view field,
+  static void addField(luxir::api::Fusion& fusion, std::string_view field,
                        std::pmr::memory_resource& mr) {
     auto old = fusion.fields;
     std::string_view* a = build::allocArray(fusion.fields, old.size() + 1, mr);
@@ -75,33 +75,33 @@ protected:
 
   // Append a named filter (a NamedQuery) to a span<const NamedQuery> (Fusion.filter or
   // TopDocs.filter), pointing the entry at an arena copy of the pre-built query.
-  static void addNamedFilter(std::span<const solux::api::NamedQuery>& filter,
-                             std::string_view name, const solux::api::Query& q,
+  static void addNamedFilter(std::span<const luxir::api::NamedQuery>& filter,
+                             std::string_view name, const luxir::api::Query& q,
                              std::pmr::memory_resource& mr) {
     auto old = filter;
-    solux::api::NamedQuery* a = build::allocArray(filter, old.size() + 1, mr);
+    luxir::api::NamedQuery* a = build::allocArray(filter, old.size() + 1, mr);
     for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
     a[old.size()].name = build::arenaStr(mr, name);
     a[old.size()].query = arenaQuery(mr, q);
   }
 
   // Append a sort spec to a TopDocs source (realloc-grow preserves prior entries).
-  static void addSort(solux::api::TopDocs& src, std::string_view expr,
-                      solux::api::SortSpec::SortDir dir, std::pmr::memory_resource& mr) {
+  static void addSort(luxir::api::TopDocs& src, std::string_view expr,
+                      luxir::api::SortSpec::SortDir dir, std::pmr::memory_resource& mr) {
     auto old = src.sorts;
-    solux::api::SortSpec* a = build::allocArray(src.sorts, old.size() + 1, mr);
+    luxir::api::SortSpec* a = build::allocArray(src.sorts, old.size() + 1, mr);
     for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
     a[old.size()].expr = build::arenaStr(mr, expr);
     a[old.size()].dir = dir;
   }
 
-  static void setTextSource(solux::api::TopDocs& src, std::pmr::memory_resource& mr,
+  static void setTextSource(luxir::api::TopDocs& src, std::pmr::memory_resource& mr,
                             std::string_view field, std::string_view term, int64_t limit) {
     src.limit = limit;
     src.query = arenaQuery(mr, qb::match(mr, field, term));
   }
 
-  static void setKnnSource(solux::api::TopDocs& src, std::pmr::memory_resource& mr,
+  static void setKnnSource(luxir::api::TopDocs& src, std::pmr::memory_resource& mr,
                            std::string_view field, std::vector<float> query, int32_t k) {
     src.limit = k;
     src.query = arenaQuery(mr, qb::knn(mr, field, query, k));
@@ -110,15 +110,15 @@ protected:
   // Set a source's query to a BooleanQuery of several optional kNN clauses, so
   // a single source's Context hosts multiple kNN weights (prepared serially),
   // while many such sources prepare concurrently against the shared request pool.
-  static void setBoolKnnSource(solux::api::TopDocs& src, std::pmr::memory_resource& mr,
+  static void setBoolKnnSource(luxir::api::TopDocs& src, std::pmr::memory_resource& mr,
                                std::string_view field,
                                const std::vector<std::vector<float>>& queryVecs,
                                int32_t k, int64_t limit) {
     src.limit = limit;
-    std::vector<solux::api::Query> optional;
+    std::vector<luxir::api::Query> optional;
     for (const auto& qv : queryVecs) optional.push_back(qb::knn(mr, field, qv, k));
-    src.query = arenaQuery(mr, qb::boolean(mr, std::span<const solux::api::Query>{},
-                                           std::span<const solux::api::Query>(optional)));
+    src.query = arenaQuery(mr, qb::boolean(mr, std::span<const luxir::api::Query>{},
+                                           std::span<const luxir::api::Query>(optional)));
   }
 
   // Pull "id" out of a Fusion response in fused-rank order.
@@ -128,7 +128,7 @@ protected:
     if (dl == nullptr) return ids;
     const auto* colp = dl->columns.find("id");
     if (colp == nullptr) return ids;
-    const auto* col = std::get_if<solux::api::ColStr>(&colp->kind);
+    const auto* col = std::get_if<luxir::api::ColStr>(&colp->kind);
     if (col == nullptr) return ids;
     for (const auto& s : col->v) ids.emplace_back(s);
     return ids;
@@ -140,7 +140,7 @@ protected:
     if (dl == nullptr) return scores;
     const auto* colp = dl->columns.find("_score_");
     if (colp == nullptr) return scores;
-    const auto* col = std::get_if<solux::api::ColFloat>(&colp->kind);
+    const auto* col = std::get_if<luxir::api::ColFloat>(&colp->kind);
     if (col == nullptr) return scores;
     for (float v : col->v) scores.push_back(v);
     return scores;
@@ -155,7 +155,7 @@ protected:
 //     d (2.0) falls outside the k=3 cutoff.
 TEST_F(FusionOpTest, rrfTextAndKnn) {
   CollectionHelper h("main");
-  installVecSchema(h.collection(), solux::api::VectorMetric::L2);
+  installVecSchema(h.collection(), luxir::api::VectorMetric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",  "embedding_v", std::vector<float>{1.0f, 0,    0   }));
   h.index(flatdoc("id", std::string("b"), "foo_w", "orange", "embedding_v", std::vector<float>{0.9f, 0.1f, 0   }));
@@ -163,9 +163,9 @@ TEST_F(FusionOpTest, rrfTextAndKnn) {
   h.index(flatdoc("id", std::string("d"), "foo_w", "orange", "embedding_v", std::vector<float>{0,    1.0f, 0   }));
   h.commit({"*"});
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
   lreq->collection("main");
-  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
   fusion.get_number = true;
@@ -216,9 +216,9 @@ TEST_F(FusionOpTest, sharedFilter) {
   h.index(flatdoc("id", std::string("c"), "foo_w", "apple x y",   "color_s", "red"));
   h.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
   lreq->collection("main");
-  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
   fusion.get_number = true;
@@ -249,7 +249,7 @@ TEST_F(FusionOpTest, sharedFilter) {
 
 TEST_F(FusionOpTest, sharedKnnFilter) {
   CollectionHelper h("main");
-  installVecSchema(h.collection(), solux::api::VectorMetric::L2);
+  installVecSchema(h.collection(), luxir::api::VectorMetric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
                   "embedding_v", std::vector<float>{1.0f, 0.0f}));
@@ -259,9 +259,9 @@ TEST_F(FusionOpTest, sharedKnnFilter) {
                   "embedding_v", std::vector<float>{0.0f, 0.9f}));
   h.commit({"*"});
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
   lreq->collection("main");
-  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
   fusion.get_number = true;
@@ -310,9 +310,9 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
   h.index(flatdoc("id", std::string("e"), "foo_w", "apple banana e1 e2", "prio_i", (int64_t)20));
   h.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
   lreq->collection("main");
-  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
   fusion.get_number = true;
@@ -322,7 +322,7 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
   setTextSource(addSource(fusion, "apple", mr), mr, "foo_w", "apple", 10);
   auto& bananaSrc = addSource(fusion, "banana", mr);
   setTextSource(bananaSrc, mr, "foo_w", "banana", 10);
-  addSort(bananaSrc, "prio_i", solux::api::SortSpec::SortDir::DESC, mr);
+  addSort(bananaSrc, "prio_i", luxir::api::SortSpec::SortDir::DESC, mr);
 
   lreq->execute();
   ASSERT_OK(lreq);
@@ -375,9 +375,9 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
   h.index(flatdoc("id", std::string("d"), "foo_w", "apple", "color_s", "blue", "owner_s", "bob"));
   h.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
   lreq->collection("main");
-  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
   fusion.get_number = true;
@@ -414,7 +414,7 @@ TEST_F(FusionOpTest, validation) {
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
 
   auto buildBase = [&]() {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
     lreq->collection("main");
     return lreq;
   };
@@ -422,7 +422,7 @@ TEST_F(FusionOpTest, validation) {
   // No sources.
   {
     auto* lreq = buildBase();
-    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     fusion.rrf.emplace().k = 60;
     ExpectLog quiet("Search request failed:");
     lreq->execute();
@@ -434,7 +434,7 @@ TEST_F(FusionOpTest, validation) {
   // No method.
   {
     auto* lreq = buildBase();
-    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
     ExpectLog quiet("Search request failed:");
@@ -447,7 +447,7 @@ TEST_F(FusionOpTest, validation) {
   // Negative k.
   {
     auto* lreq = buildBase();
-    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
     fusion.rrf.emplace().k = -1;
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
@@ -461,12 +461,12 @@ TEST_F(FusionOpTest, validation) {
   // Sub-ops not supported.
   {
     auto* lreq = buildBase();
-    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
     fusion.rrf.emplace().k = 60;
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
-    auto* sub = build::mapSlot<solux::api::SearchOp>(fusion.ops, 1, "facet", mr);
-    sub->kind.emplace<solux::api::FieldFacet>().field = build::arenaStr(mr, "color_s");
+    auto* sub = build::mapSlot<luxir::api::SearchOp>(fusion.ops, 1, "facet", mr);
+    sub->kind.emplace<luxir::api::FieldFacet>().field = build::arenaStr(mr, "color_s");
     ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
@@ -481,9 +481,9 @@ TEST_F(FusionOpTest, validation) {
 TEST_F(FusionOpTest, emptyIndex) {
   CollectionHelper h("main");
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
   lreq->collection("main");
-  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 5;
   fusion.get_number = true;
@@ -510,7 +510,7 @@ TEST_F(FusionOpTest, emptyIndex) {
 //
 TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   CollectionHelper h("main");
-  installVecSchema(h.collection(), solux::api::VectorMetric::L2);
+  installVecSchema(h.collection(), luxir::api::VectorMetric::L2);
 
   // ~40 docs across 5 segments; ~1/3 lack the vector field so the sparse
   // single-valued valueRank->docId selector path runs.  Distinct vectors keep
@@ -535,9 +535,9 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   }
 
   auto buildReq = [&]() {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    auto* lreq = LocalReq::create(luxirNode->getSearchEngine());
     lreq->collection("main");
-    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
     fusion.limit = -1;
     fusion.get_number = true;

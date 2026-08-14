@@ -30,7 +30,7 @@ writer. That activation is process-local unless it produced a durable overlay
 entry. A commit that fails mid-build has no side effects: staged overlay files
 are deleted, no overlay entries are published, and no names are activated -
 the caller sees the error and decides whether to retry. Startup seeds active
-names only from overlays already present in `s.olux`, so Solux never treats
+names only from overlays already present in `s.olux`, so Luxir never treats
 intent-only state as a boot-time "must build" queue.
 
 Explicit commit-time vector builds stage overlay files and entries across the
@@ -60,7 +60,7 @@ FAISS when the field uses cosine and the stored column is raw.
 
 Index data stays memory-mapped at query time. The aux file holds a small FAISS
 header (index parameters, IVF centroids, PQ codebooks) followed by the
-inverted-list payloads (PQ codes and vector ids) in Solux's own layout; the
+inverted-list payloads (PQ codes and vector ids) in Luxir's own layout; the
 reader decodes only the header into memory and serves list scans directly from
 the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
@@ -72,7 +72,7 @@ Merges drop overlays for merged-away segments. The merged segment is treated
 as a new segment and gets fresh overlays inside the merge-private phase for
 active vector fields that pass the same thresholds. Whichever later commit
 publishes the merged segment publishes its overlay entries atomically with the
-segment. If a merge-time vector overlay build fails, Solux deletes the staged
+segment. If a merge-time vector overlay build fails, Luxir deletes the staged
 overlay files, publishes the merged segment without vector overlays, and
 serves that field through the exact flat column fallback until a later
 explicit build succeeds.
@@ -94,7 +94,7 @@ Internally, an `nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment
 indexes; that is what makes the knob merge-stable.
 
-For per-segment IVF, Solux ranks all segments' IVF lists by query-to-centroid
+For per-segment IVF, Luxir ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan
 fraction is reached. List cost is based on that list's live vector count
 divided by the field's live vector count. This handles uneven list sizes and

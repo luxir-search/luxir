@@ -1,21 +1,21 @@
 #pragma once
 #include <gtest/gtest.h>
-#include "solux/util/random.h"
-#include "solux/index/Inverter.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/reader/TermsEnum.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/PosEnum.h"
-#include "solux/reader/IntColReader.h"
-#include "solux/reader/NormsReader.h"
-#include "solux/reader/OrdColReader.h"
-#include "test/SoluxTest.h"
+#include "luxir/util/random.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/TermsEnum.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/PosEnum.h"
+#include "luxir/reader/IntColReader.h"
+#include "luxir/reader/NormsReader.h"
+#include "luxir/reader/OrdColReader.h"
+#include "test/LuxirTest.h"
 #include <vector>
 
 
-namespace solux::test {
+namespace luxir::test {
 
   class ValGen {
   public:
@@ -143,7 +143,7 @@ namespace solux::test {
 
 // The TestIndex class is for testing low-level indexing functionality.  It was first introduced before there were
 // any higher-level features.  It also acts as a compatibility layer between low level tests
-// and actual solux APIs as they change over time.
+// and actual luxir APIs as they change over time.
   class TestIndex {
   public:
     RAMDir dir;

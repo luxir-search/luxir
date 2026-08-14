@@ -7,16 +7,16 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/index/IndexWriter.h"
-#include "solux/schema/Schema.h"
-#include "solux/util/Signal.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-namespace solux::test {
+namespace luxir::test {
 namespace {
 
 using namespace std::chrono_literals;
@@ -41,9 +41,9 @@ bool addSegment(CollectionHelper& helper, std::string_view prefix, int count) {
 void enableL2VectorSuffix(Collection& collection) {
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::L2;
+  f.metric = luxir::api::VectorMetric::L2;
   b.set(collection);
 }
 
@@ -114,7 +114,7 @@ public:
 
 } // namespace
 
-class ForceMergeTest : public SoluxTest {};
+class ForceMergeTest : public LuxirTest {};
 
 TEST_F(ForceMergeTest, concurrentUncommittedIngestionDoesNotBlockPublish) {
   CollectionHelper helper("main");
@@ -274,4 +274,4 @@ TEST_F(ForceMergeTest, emptyCommitIsResumeForm) {
   EXPECT_EQ(1u, helper.durableSegmentCount());
 }
 
-} // namespace solux::test
+} // namespace luxir::test

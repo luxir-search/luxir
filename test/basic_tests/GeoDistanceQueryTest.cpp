@@ -10,19 +10,19 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/query/GeoDistanceQuery.h"
-#include "solux/reader/BKDReader.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/IntColReader.h"
-#include "solux/util/geo.h"
-#include "solux/util/random.h"
+#include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/reader/BKDReader.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/IntColReader.h"
+#include "luxir/util/geo.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -169,7 +169,7 @@ GeoPoint shapeCenter(Shape shape) {
 
 } // namespace
 
-class GeoMathTest : public SoluxTest {};
+class GeoMathTest : public LuxirTest {};
 
 TEST_F(GeoMathTest, haversinAndDistanceSortKey) {
   EXPECT_EQ(0.0, geo::haversinSortKey(12.0, -34.0, 12.0, -34.0));
@@ -252,7 +252,7 @@ TEST_F(GeoMathTest, axisLatitudeAndCircleBoundingBox) {
   }
 }
 
-class BKDDistanceRelationTest : public SoluxTest {};
+class BKDDistanceRelationTest : public LuxirTest {};
 
 TEST_F(BKDDistanceRelationTest, randomizedCellAndPointOracle) {
   SplitMix64 rng(0x70d18a4c);
@@ -322,7 +322,7 @@ TEST_F(BKDDistanceRelationTest, validatesInputs) {
       std::invalid_argument);
 }
 
-class GeoDistanceQueryTest : public SoluxTest {};
+class GeoDistanceQueryTest : public LuxirTest {};
 
 TEST_F(GeoDistanceQueryTest, uniformScoreAndBoundsAcrossExecutionArms) {
   CollectionHelper helper;

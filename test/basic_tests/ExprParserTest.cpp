@@ -12,17 +12,17 @@
 #include <string>
 #include <vector>
 
-#include "solux/query/ExprParser.h"
-#include "solux/schema/Schema.h"
+#include "luxir/query/ExprParser.h"
+#include "luxir/schema/Schema.h"
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
 using namespace std;
-using namespace solux;
+using namespace luxir;
 
-using Operator = solux::api::Match_::Operator;
+using Operator = luxir::api::Match_::Operator;
 
-class ExprParserTest : public SoluxTest {
+class ExprParserTest : public LuxirTest {
 public:
   std::pmr::monotonic_buffer_resource arena;
   std::shared_ptr<Schema> schema = Schema::createDefaultSchema();
@@ -491,14 +491,14 @@ TEST_F(ExprParserTest, boostFunctionForm) {
 TEST_F(ExprParserTest, rescoreFunctionHasQueryAndValuePositions) {
   bindVar("factor", api::Val{.kind = 2.0});
   const auto& rescore =
-      asRescore(*parse("rescore(title:solux, mul(score,$factor))"));
+      asRescore(*parse("rescore(title:luxir, mul(score,$factor))"));
   ASSERT_TRUE(rescore.query.has_value());
-  EXPECT_EQ("solux", matchVal(*rescore.query));
+  EXPECT_EQ("luxir", matchVal(*rescore.query));
   EXPECT_EQ("mul(score,$factor)", rescore.expr);
   EXPECT_NE(nullptr, rescore.vars.find("factor"));
 
   const auto& named =
-      asRescore(*parse("rescore(query=title:solux, expr=add(score,count))"));
+      asRescore(*parse("rescore(query=title:luxir, expr=add(score,count))"));
   EXPECT_EQ("add(score,count)", named.expr);
 }
 

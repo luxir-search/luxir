@@ -8,18 +8,18 @@
 #include <utility>
 #include <vector>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/SkipStats.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
+namespace api = luxir::api;
 
 namespace {
 
@@ -63,7 +63,7 @@ struct SkipStatsGuard {
 
 } // namespace
 
-class PhraseConjunctionTest : public SoluxTest {
+class PhraseConjunctionTest : public LuxirTest {
 public:
   enum class Shape {
     PHRASE_AND_TERMS,
@@ -187,7 +187,7 @@ public:
   }
 
   void SetUp() override {
-    SoluxTest::SetUp();
+    LuxirTest::SetUp();
     helper.indexAll({
       flatdoc("id", "a0", "body_w", "a q b c q d"),
       flatdoc("id", "a1", "body_w", "a b c q d"),

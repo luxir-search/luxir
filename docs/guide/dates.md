@@ -1,6 +1,6 @@
 # Dates and time zones
 
-Solux stores dates as int64 milliseconds since the Unix epoch. Name a field
+Luxir stores dates as int64 milliseconds since the Unix epoch. Name a field
 with the `_dt` suffix (or `_dts` for multi-valued) and it is a DATE field you
 can query, range, sort, and facet on. This page covers the accepted date
 forms, date math, and how time zones change what a request means. The full
@@ -39,7 +39,7 @@ NOW-1MONTH/MONTH        all of last month
 2024-06-25T00:00:00Z+6MONTHS   Solr style: math appended directly
 ```
 
-Both Solr word units (`DAYS`, `MONTHS`, case-insensitive; `WEEKS` is a Solux
+Both Solr word units (`DAYS`, `MONTHS`, case-insensitive; `WEEKS` is a Luxir
 extension) and OpenSearch one-letter units (`d`, `M`, case-sensitive: `M` is
 month, `m` is minute) work. `NOW` is one clock snapshot for the whole
 request, so every clause in a request sees the same instant.

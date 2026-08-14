@@ -7,16 +7,16 @@
 #include <string>
 #include <vector>
 
-#include "solux/api/solux_types.hpp"
-#include "solux/search/FieldSortCollector.h"
-#include "solux/value/ValueExprParser.h"
+#include "luxir/api/luxir_types.hpp"
+#include "luxir/search/FieldSortCollector.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -29,7 +29,7 @@ std::vector<std::string> ids(const LocalReq& req) {
 
 } // namespace
 
-class ValueExprSortTest : public SoluxTest {};
+class ValueExprSortTest : public LuxirTest {};
 
 TEST_F(ValueExprSortTest, directionsMissingLastDefAndVariable) {
   CollectionHelper helper;
@@ -39,7 +39,7 @@ TEST_F(ValueExprSortTest, directionsMissingLastDefAndVariable) {
 
   auto run = [&](std::string_view expression, qb::SortDir direction,
                  std::optional<int64_t> fallback = std::nullopt) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
     if (fallback) {
@@ -72,7 +72,7 @@ TEST_F(ValueExprSortTest, bareMultiValuedIntSortsByFirstValue) {
   helper.index(flatdoc("id_s", "d"), UpdateMessage::COMMIT);
 
   auto run = [&](std::string_view expression, qb::SortDir direction) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
     qb::sort(top, expression, direction);
@@ -100,7 +100,7 @@ TEST_F(ValueExprSortTest, multiSortFallsThroughToSegmentDocOrder) {
   helper.index(flatdoc("id_s", "lower", "x_i", 0, "y_i", 9),
                UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
   qb::sort(top, "add(x_i,0)", qb::ASC);
@@ -117,7 +117,7 @@ TEST_F(ValueExprSortTest, nestedDocidUsesReaderGlobalOrder) {
   helper.index(flatdoc("id_s", "b"), UpdateMessage::COMMIT);
   helper.index(flatdoc("id_s", "c"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
   qb::sort(top, "add(_docid_,0)", qb::DESC);
@@ -134,7 +134,7 @@ TEST_F(ValueExprSortTest, scoreColumnExpressionAndGetScoresOutput) {
                        "body_w", "term term term term"), UpdateMessage::COMMIT);
 
   auto run = [&](bool getScores) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").matchQuery("body_w", "term")
         .limit(10).fields({"id_s"}).getScores(getScores);
@@ -157,7 +157,7 @@ TEST_F(ValueExprSortTest, reducersAndRootDiagnostics) {
   helper.index(flatdoc("id_s", "low", "values_is", vec_i(-3, 10)),
                UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
   qb::sort(top, "min(values_is)", qb::ASC);
@@ -166,7 +166,7 @@ TEST_F(ValueExprSortTest, reducersAndRootDiagnostics) {
   EXPECT_EQ((std::vector<std::string>{"low", "wide"}), ids(*req));
 
   auto expectError = [&](std::string_view expression, std::string_view expected) {
-    auto bad = localReq(soluxNode->getSearchEngine());
+    auto bad = localReq(luxirNode->getSearchEngine());
     bad->collection("main");
     auto& badTop = bad->topDocs("q").allQuery().limit(10);
     qb::sort(badTop, expression, qb::ASC);
@@ -273,7 +273,7 @@ TEST_F(ValueExprSortTest, randomizedDifferentialOracle) {
   }
 
   auto actual = [&](std::string_view expression, qb::SortDir direction) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").allQuery().limit(-1).batchSize(DOC_COUNT)
         .fields({"id_s"});

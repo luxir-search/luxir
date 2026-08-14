@@ -1,13 +1,13 @@
 
-#include "bench/solux_bench.h"
-#include "solux/search/Collector.h"
+#include "bench/luxir_bench.h"
+#include "luxir/search/Collector.h"
 
-using namespace solux;
+using namespace luxir;
 
 template<typename T>
 static void BM_Collector(benchmark::State& state, int32_t nDocs, bool sorted) {
-  // Rng rng(SoluxTest::rng_seed);
-  if (solux::unit_tests) {
+  // Rng rng(LuxirTest::rng_seed);
+  if (luxir::unit_tests) {
     nDocs = 100; // for unit tests, use a smaller number of docs
   }
   Rng rng(1);
@@ -54,11 +54,11 @@ BENCHMARK_CAPTURE(BM_CollectorPQ, sorted, ndocs, true)->Range(1, 1<<10);
 BENCHMARK_CAPTURE(BM_CollectorMed, sorted, ndocs, true)->Range(1, 1<<10);
 #else
 inline void hackety_hack() {
-  solux::unused(hackety_hack);
-  solux::unused(BM_CollectorPQ);
-  solux::unused(BM_CollectorMed);
-  solux::unused(BM_CollectorMedI);
-  solux::unused(BM_CollectorPQ);
-  solux::unused(BM_CollectorMed);
+  luxir::unused(hackety_hack);
+  luxir::unused(BM_CollectorPQ);
+  luxir::unused(BM_CollectorMed);
+  luxir::unused(BM_CollectorMedI);
+  luxir::unused(BM_CollectorPQ);
+  luxir::unused(BM_CollectorMed);
 }
 #endif

@@ -1,10 +1,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/codec/Codec.h"
-#include "solux/reader/Postings.h"
-#include "solux/util/random.h"
+#include "bench/luxir_bench.h"
+#include "luxir/codec/Codec.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/util/random.h"
 #include <gtest/gtest.h>
 
 // Where does postings doc-decode spend its time? Each block is unpacked (the
@@ -13,22 +13,22 @@
 // carries a serial running-count vector-to-vector, so wider registers cannot
 // speed it up. This bench measures the split end-to-end over a multi-block list
 // so the two phases overlap across blocks (out-of-order), the realistic cost:
-//   end2end - SoluxPFORd::decodeBlock (unpack + inverse-delta), the real path
-//   unpack  - SoluxSIMDFor unpack of the same-width delta residuals, no delta
+//   end2end - LuxirPFORd::decodeBlock (unpack + inverse-delta), the real path
+//   unpack  - LuxirSIMDFor unpack of the same-width delta residuals, no delta
 // The gap end2end - unpack is the in-situ prefix-sum cost (the width-immune part
 // a wider unpack cannot move). Deps/FastPFOR headers are confined to Codec.cpp,
 // so we reach the codecs through their public APIs only; the pure-FOR unpack is
 // a proxy for the PFor unpack (equal when gaps are uniform, no exceptions).
 
-namespace solux {
+namespace luxir {
 
 static constexpr uint32_t B = Postings::DOCS_BLOCK_SIZE;  // 128
 static constexpr uint32_t N_BLOCKS = 256;                 // 32K docs, encoded fits L2
 
 struct PostingsList {
-  std::vector<char> encoded;                // SoluxPFORd blocks, contiguous
+  std::vector<char> encoded;                // LuxirPFORd blocks, contiguous
   std::vector<uint32_t> blockOffset;
-  std::vector<char> forEncoded;             // SoluxSIMDFor of the gap residuals
+  std::vector<char> forEncoded;             // LuxirSIMDFor of the gap residuals
   std::vector<uint32_t> forOffset;
   std::vector<uint8_t> forBits;
 
@@ -42,8 +42,8 @@ struct PostingsList {
       d = cur;
     }
 
-    SoluxPFORd pfor;
-    SoluxSIMDFor forCodec;
+    LuxirPFORd pfor;
+    LuxirSIMDFor forCodec;
     encoded.assign((size_t)N_BLOCKS * B * 5 + 1024, 0);
     forEncoded.assign((size_t)N_BLOCKS * B * 5 + 1024, 0);
     blockOffset.resize(N_BLOCKS);
@@ -79,7 +79,7 @@ struct PostingsList {
 
 static void BM_postings_end2end(benchmark::State& state, uint8_t gapBits) {
   PostingsList list(gapBits);
-  SoluxPFORd pfor;
+  LuxirPFORd pfor;
   uint32_t out[B];
   for (auto _ : state) {
     uint32_t base = 0;
@@ -95,7 +95,7 @@ static void BM_postings_end2end(benchmark::State& state, uint8_t gapBits) {
 
 static void BM_postings_unpack(benchmark::State& state, uint8_t gapBits) {
   PostingsList list(gapBits);
-  SoluxSIMDFor forCodec;
+  LuxirSIMDFor forCodec;
   uint32_t out[B];
   for (auto _ : state) {
     for (uint32_t b = 0; b < N_BLOCKS; b++) {
@@ -114,4 +114,4 @@ static void BM_postings_unpack(benchmark::State& state, uint8_t gapBits) {
 
 REG(9) REG(13) REG(17)
 
-}  // namespace solux
+}  // namespace luxir

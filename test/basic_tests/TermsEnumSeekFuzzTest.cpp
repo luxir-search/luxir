@@ -6,15 +6,15 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/Postings.h"
-#include "solux/reader/TermsEnum.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/reader/TermsEnum.h"
 #include "test/CollectionHelper.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -174,7 +174,7 @@ void expectSeekForward(PostingsReader& postingsReader, const SegFieldInfo& field
 
 } // namespace
 
-class TermsEnumSeekFuzzTest : public SoluxTest {
+class TermsEnumSeekFuzzTest : public LuxirTest {
 };
 
 TEST_F(TermsEnumSeekFuzzTest, GapRoutingAcrossSeparatorBoundary) {

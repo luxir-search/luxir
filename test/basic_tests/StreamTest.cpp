@@ -3,15 +3,15 @@
 #include <iostream>
 #include <limits>
 
-#include "solux/index/Stream.h"
-#include "solux/index/DocStream.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/Stream.h"
+#include "luxir/index/DocStream.h"
+#include "test/LuxirTest.h"
 
 using namespace std;
 
-namespace solux {
+namespace luxir {
 
-class StreamTest : public SoluxTest {
+class StreamTest : public LuxirTest {
 public:
 
 // Write a bunch of random bytes and then ensure we can read them back verbatim.

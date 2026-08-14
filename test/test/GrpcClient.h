@@ -3,13 +3,13 @@
 // Shared gRPC test client over the server's generic ByteBuffer transport.
 //
 // The server is an AsyncGenericService routed by method name (no protobuf-generated stubs),
-// so tests build a CONCRETE solux::api request, serialize it to a grpc::ByteBuffer (via
-// solux::api::encode), call by method name, and parse the ByteBuffer reply back into a
-// CONCRETE solux::api response. Responses are NON-OWNING: the Reply holder keeps the raw
+// so tests build a CONCRETE luxir::api request, serialize it to a grpc::ByteBuffer (via
+// luxir::api::encode), call by method name, and parse the ByteBuffer reply back into a
+// CONCRETE luxir::api response. Responses are NON-OWNING: the Reply holder keeps the raw
 // reply bytes + a pmr arena alive so the parsed view stays valid while the test inspects it.
 //
 // Method names are string constants here (mirroring the server's lookupMethod table) so the
-// test side no longer depends on the templated solux.service.hpp / *.pb.hpp.
+// test side no longer depends on the templated luxir.service.hpp / *.pb.hpp.
 
 #include <memory>
 #include <memory_resource>
@@ -22,48 +22,48 @@
 #include <grpcpp/support/byte_buffer.h>
 #include <grpcpp/support/sync_stream.h>
 
-#include "solux/api/solux_types.hpp"  // solux::api::SearchRequest / SearchResponse, UpdateRequest/Response
-#include "solux/api/solux.hpp"        // solux::api::HelloRequest / HelloReply
+#include "luxir/api/luxir_types.hpp"  // luxir::api::SearchRequest / SearchResponse, UpdateRequest/Response
+#include "luxir/api/luxir.hpp"        // luxir::api::HelloRequest / HelloReply
 
-namespace solux::test {
+namespace luxir::test {
 
 // RPC method paths (match GRPCServer.cpp lookupMethod()).
 namespace rpc {
-inline constexpr const char* Search            = "/solux.Searcher/Search";
-inline constexpr const char* Update            = "/solux.Indexer/Update";
-inline constexpr const char* UpdateStream      = "/solux.Indexer/UpdateStream";
-inline constexpr const char* SayHello          = "/solux.Greeter/SayHello";
-inline constexpr const char* SayHello2         = "/solux.Greeter/SayHello2";
-inline constexpr const char* SayHelloStreaming = "/solux.Greeter/SayHelloStreaming";
-inline constexpr const char* SetSchema         = "/solux.Admin/SetSchema";
-inline constexpr const char* GetSchema         = "/solux.Admin/GetSchema";
-inline constexpr const char* CreateCollection  = "/solux.Admin/CreateCollection";
-inline constexpr const char* DeleteCollection  = "/solux.Admin/DeleteCollection";
-inline constexpr const char* Stats             = "/solux.Admin/Stats";
+inline constexpr const char* Search            = "/luxir.Searcher/Search";
+inline constexpr const char* Update            = "/luxir.Indexer/Update";
+inline constexpr const char* UpdateStream      = "/luxir.Indexer/UpdateStream";
+inline constexpr const char* SayHello          = "/luxir.Greeter/SayHello";
+inline constexpr const char* SayHello2         = "/luxir.Greeter/SayHello2";
+inline constexpr const char* SayHelloStreaming = "/luxir.Greeter/SayHelloStreaming";
+inline constexpr const char* SetSchema         = "/luxir.Admin/SetSchema";
+inline constexpr const char* GetSchema         = "/luxir.Admin/GetSchema";
+inline constexpr const char* CreateCollection  = "/luxir.Admin/CreateCollection";
+inline constexpr const char* DeleteCollection  = "/luxir.Admin/DeleteCollection";
+inline constexpr const char* Stats             = "/luxir.Admin/Stats";
 }  // namespace rpc
 
 // Out-of-line (de)serialization for the RPC message types (defined in GrpcClient.cpp). The
-// heavy (en/de)code lives in the solux_proto_concrete lib (solux::api::encode/decode); these
+// heavy (en/de)code lives in the luxir_proto_concrete lib (luxir::api::encode/decode); these
 // are thin ByteBuffer<->bytes adapters. Return "" on success, else the error message.
-std::string grpcSerialize(const solux::api::SearchRequest& msg, grpc::ByteBuffer& out);
-std::string grpcSerialize(const solux::api::UpdateRequest& msg, grpc::ByteBuffer& out);
-std::string grpcSerialize(const solux::api::StatsRequest& msg, grpc::ByteBuffer& out);
-std::string grpcSerialize(const solux::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
-std::string grpcSerialize(const solux::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out);
-std::string grpcSerialize(const solux::api::HelloRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::SearchRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::UpdateRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::StatsRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::HelloRequest& msg, grpc::ByteBuffer& out);
 // `storage` retains the raw reply bytes the non-owning `msg` views; `arena` backs nested
 // message allocations. Both must outlive any read of `msg`.
-std::string grpcParse(solux::api::SearchResponse& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::SearchResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
-std::string grpcParse(solux::api::UpdateResponse& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::UpdateResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
-std::string grpcParse(solux::api::StatsResponse& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::StatsResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
-std::string grpcParse(solux::api::CreateCollectionResponse& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::CreateCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
-std::string grpcParse(solux::api::DeleteCollectionResponse& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::DeleteCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
-std::string grpcParse(solux::api::HelloReply& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::HelloReply& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 
 // Holds a parsed non-owning concrete reply + the storage/arena it views. Reuse across reads:
@@ -138,4 +138,4 @@ grpc::Status hppUnaryCall(grpc::ChannelInterface* channel, const char* methodNam
   return grpc::Status::OK;
 }
 
-}  // namespace solux::test
+}  // namespace luxir::test

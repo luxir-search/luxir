@@ -1,16 +1,16 @@
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include <memory_resource>
 #include <latch>
 #include <google/protobuf/arena.h>
 #include "tbb/task_group.h"
 
-#include "solux/util/MemPool.h"
-#include "solux/util/random.h"
-#include "solux/util/solux_util.h"
+#include "luxir/util/MemPool.h"
+#include "luxir/util/random.h"
+#include "luxir/util/luxir_util.h"
 
-using namespace solux;
+using namespace luxir;
 
-/* solux::MemPool vs std::pmr::monotonic_buffer_resource vs protobuf3 Arena
+/* luxir::MemPool vs std::pmr::monotonic_buffer_resource vs protobuf3 Arena
    By default (linux/g++12), std::pmr::monotonic_buffer_resource starts with an initial allocation size of 1024+64.
    Subsequent allocation sizes multiply the large part (1024) by 1.5 and then add 64.
    For a fair comparison with MemPool, we start with the same allocation size.
@@ -102,7 +102,7 @@ static char* alloc(Allocator& allocator, size_t bytes) {
 }
 
 template <class Allocator>
-static uint64_t smallAlloc(solux::Rng& rng) {
+static uint64_t smallAlloc(luxir::Rng& rng) {
   auto info = rng();
   Allocator allocator;
   for (int i=0; i<50; i++) {
@@ -126,7 +126,7 @@ template <class Allocator>
 inline void benchAlloc(benchmark::State& state) {
   uint64_t result = 0;
   for (auto _ : state) {
-    result += smallAlloc<Allocator>(SoluxTest::rng);
+    result += smallAlloc<Allocator>(LuxirTest::rng);
     benchmark::DoNotOptimize(result);
     // benchmark::ClobberMemory();
   }
@@ -158,7 +158,7 @@ template <class Allocator>
 static uint64_t allocFree(int iterations, int taskno, Allocator& allocator) {
   // std::cout << "TASK " << taskno << " START iterations=" << iterations << std::endl;
 
-  solux::Rng rng(taskno+1);
+  luxir::Rng rng(taskno+1);
   auto info = rng();
   int max = 1024;
   char** buffers = (char**) alloc<Allocator>(allocator, sizeof(char *) * max);
@@ -259,6 +259,6 @@ BENCHMARK(BM_AllocFree_std_pool)->Range(1,16)->RangeMultiplier(2)->UseRealTime()
 
 #else
 inline void hackety_hack() {
-  solux::unused(hackety_hack);
+  luxir::unused(hackety_hack);
 }
 #endif

@@ -1,7 +1,7 @@
 // Parse tests for SimpleQueryParser: (string, schema, options) -> api::Query
 // subtree, no engine.  Structural assertions on the emitted tree.  Behaviors
 // adapted from Lucene's TestSimpleQueryParser where the dialects overlap
-// (operators, negation, precedence, never-fails edge cases), plus the Solux
+// (operators, negation, precedence, never-fails edge cases), plus the Luxir
 // fielded-term extension and FieldType-directed arm selection.
 
 #include <gtest/gtest.h>
@@ -10,17 +10,17 @@
 #include <memory_resource>
 #include <string>
 
-#include "solux/query/SimpleQueryParser.h"
-#include "solux/schema/Schema.h"
+#include "luxir/query/SimpleQueryParser.h"
+#include "luxir/schema/Schema.h"
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
 using namespace std;
-using namespace solux;
+using namespace luxir;
 
-using Operator = solux::api::Match_::Operator;
+using Operator = luxir::api::Match_::Operator;
 
-class SimpleQueryParserTest : public SoluxTest {
+class SimpleQueryParserTest : public LuxirTest {
 public:
   std::pmr::monotonic_buffer_resource arena;
   std::shared_ptr<Schema> schema = Schema::createDefaultSchema();

@@ -7,13 +7,13 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/reader/FuzzySeekEnum.h"
-#include "solux/reader/FuzzyTermsEnum.h"
-#include "test/SoluxTest.h"
+#include "luxir/reader/FuzzySeekEnum.h"
+#include "luxir/reader/FuzzyTermsEnum.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -191,7 +191,7 @@ bool containsTerm(const std::vector<Match>& matches, std::string_view term) {
 
 } // namespace
 
-class FuzzySeekTest : public SoluxTest {
+class FuzzySeekTest : public LuxirTest {
 };
 
 TEST_F(FuzzySeekTest, DifferentialSingleTermAndOneBlock) {

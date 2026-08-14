@@ -1,6 +1,6 @@
 ## Project Overview
 
-Solux is a high-performance hybrid search engine written in C++. It features a gRPC API, full-text indexing and searching, faceted search, and vector search.
+Luxir is a high-performance hybrid search engine written in C++. It features a gRPC API, full-text indexing and searching, faceted search, and vector search.
 
 See [docs/dev/codebase-map.md](docs/dev/codebase-map.md) for the component/class layout, data organization, and request flow, and [docs/design/architecture.md](docs/design/architecture.md) for the design overview and rationale. [docs/README.md](docs/README.md) maps the documentation tree (guide/ = user, design/ = architecture+decisions, dev/ = contributor).
 
@@ -45,23 +45,23 @@ per-test/per-suite lines otherwise burn context on every green run.
 
 ```bash
 # Run all tests (iteration build)
-./build/gcc-debug/bin/solux_test --gtest_brief=1 --gtest_print_time=0
+./build/gcc-debug/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 
 # Run specific test suite
-./build/gcc-debug/bin/solux_test --gtest_filter="IndexWriterTest.*" --gtest_brief=1 --gtest_print_time=0
+./build/gcc-debug/bin/luxir_test --gtest_filter="IndexWriterTest.*" --gtest_brief=1 --gtest_print_time=0
 
 # Run benchmarks (NOTE: builds production-scale corpora - slow setup, use
 # gcc-release and memory caps (ulimit -v 32000000) for real measurements.
 # For quick iteration/coverage use the small-corpus unit-test mode instead:
-#   ./build/gcc-debug/bin/solux_test --gtest_filter="Benchmarks.all"
-./build/gcc-debug/bin/solux_test --bench
+#   ./build/gcc-debug/bin/luxir_test --gtest_filter="Benchmarks.all"
+./build/gcc-debug/bin/luxir_test --bench
 
 # Run all benchmarks except the slow vector ones (HNSW/IVFPQ builds dominate
 # wall-clock). Negative google-benchmark filter excludes the BM_Vector* family:
-./build/gcc-release/bin/solux_test --bench --benchmark_filter='-BM_Vector'
+./build/gcc-release/bin/luxir_test --bench --benchmark_filter='-BM_Vector'
 
 # Run the same suite under ASan before committing
-./build/gcc-debug-asan/bin/solux_test --gtest_brief=1 --gtest_print_time=0
+./build/gcc-debug-asan/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
 
 ## Code Conventions
@@ -71,7 +71,7 @@ per-test/per-suite lines otherwise burn context on every green run.
 - do not use em dashes or other non-ascii (in source or prose)
 - This is unreleased code, so NEVER worry about back compat.
 - Allocate engine objects that need a destructor (search ops, Query::Context,
-  request/response wrappers) with solux::arenaCreate<T> (src/solux/util/proto.h),
+  request/response wrappers) with luxir::arenaCreate<T> (src/luxir/util/proto.h),
   not protobuf's Arena::Create<T>. arenaCreate constructs first and registers the
   destructor only on success, so a throwing ctor is safe. Raw Arena::Create<T>
   registers the cleanup node before placement-new and runs ~T() on

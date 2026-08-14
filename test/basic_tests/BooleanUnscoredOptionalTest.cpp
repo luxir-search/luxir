@@ -10,16 +10,16 @@
 #include <utility>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/SkipStats.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/SkipStats.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -62,7 +62,7 @@ struct DisjConjBulkGuard {
 
 } // namespace
 
-class BooleanUnscoredOptionalTest : public SoluxTest {
+class BooleanUnscoredOptionalTest : public LuxirTest {
 public:
   enum class Shape {
     REQUIRED_DISJUNCTION,

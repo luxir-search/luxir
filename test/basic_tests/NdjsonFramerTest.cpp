@@ -1,4 +1,4 @@
-#include "solux/server/NdjsonFramer.h"
+#include "luxir/server/NdjsonFramer.h"
 
 #include <string>
 #include <string_view>
@@ -6,7 +6,7 @@
 
 #include <gtest/gtest.h>
 
-namespace solux {
+namespace luxir {
 
 static std::vector<std::string> drain(NdjsonFramer& framer) {
   std::vector<std::string> out;
@@ -79,4 +79,4 @@ TEST(NdjsonFramerTest, overCapCompleteRecordIsError) {
   EXPECT_TRUE(drain(framer).empty());
 }
 
-}  // namespace solux
+}  // namespace luxir

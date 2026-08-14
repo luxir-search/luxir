@@ -4,17 +4,17 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/AllQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/MatchNoDocsQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/TermQuery.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/MatchNoDocsQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/TermQuery.h"
 #include "test/CollectionHelper.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 static_assert(!std::is_copy_constructible_v<Query::ScorerPlan>);
 static_assert(!std::is_move_constructible_v<Query::ScorerPlan>);
@@ -30,7 +30,7 @@ public:
   }
 };
 
-class ExecutionHierarchyTest : public SoluxTest {
+class ExecutionHierarchyTest : public LuxirTest {
 public:
   CollectionHelper helper;
   std::shared_ptr<IndexReader> reader;

@@ -8,10 +8,10 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/reader/LevenshteinAutomaton.h"
-#include "solux/reader/AutomatonSeekEnum.h"
+#include "luxir/reader/LevenshteinAutomaton.h"
+#include "luxir/reader/AutomatonSeekEnum.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 

@@ -9,21 +9,21 @@
 #include <utility>
 #include <vector>
 
-#include "solux/index/PostingsWriter.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/query/Query.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/PosEnum.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/search/IndexReader.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/schema/Schema.h"
-#include "solux/schema/FieldType.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/query/Query.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/PosEnum.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/schema/FieldType.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -398,7 +398,7 @@ IteratedStats readQueryPostingsStats(MemPool& pool, IndexReader& reader,
 
 } // namespace
 
-class TermsDictTest : public SoluxTest {
+class TermsDictTest : public LuxirTest {
 };
 
 TEST_F(TermsDictTest, RangeTableSeeksAcross64BitTermOrdinals) {

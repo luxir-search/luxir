@@ -1,8 +1,8 @@
-#include "solux_bench.h"
-#include "solux/util/random.h"
-#include "solux/util/solux_util.h"
-#include "solux/util/StrRef.h"
-#include "solux/util/TermValHash.h"
+#include "luxir_bench.h"
+#include "luxir/util/random.h"
+#include "luxir/util/luxir_util.h"
+#include "luxir/util/StrRef.h"
+#include "luxir/util/TermValHash.h"
 #include "gtl/phmap.hpp"
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "boost/unordered/unordered_flat_set.hpp"
@@ -11,7 +11,7 @@
 #include <robin_hood.h>
 #endif
 
-using namespace solux;
+using namespace luxir;
 
 
 
@@ -396,7 +396,7 @@ static void BM_invertTemplate(benchmark::State& state) {
   MemPool::save_point savePoint = pool.getSavePoint();
 
   int nTerms = 1000000;  // number of lookups to do
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     nTerms = 1000;
   }
   int unique = 0;        // number of terms that turned out to be unique
@@ -422,7 +422,7 @@ static void BM_invertTemplate(benchmark::State& state) {
       for(;;) {
         term = data + randOffset;
 
-        // comparing solux impl of TermValHash with phmap::unordered_flat_set
+        // comparing luxir impl of TermValHash with phmap::unordered_flat_set
         // Note: most of these numbers were with murmurhash, but now we switched to XXH3!
         // tlen = (r()&0x3f) + 4;   // 655K unique keys (long): phmap 6.5% better (prob because skipping long key comps)
         tlen = (r()&0x0f) + 4;   // 256k unique keys (shortish): TVHash better by 1.5%
@@ -519,13 +519,13 @@ TUNING_BENCHMARK(BM_invertSVRobinFlatMap);
 
 /*
 Due to robin_hood's incomplete heterogeneous lookup support (as of 1/20201) as well as generally slower speed than phmap,
-the latter is being selected as the general hash table impl for solux.  To avoid another dependency, the robin_hood code
+the latter is being selected as the general hash table impl for luxir.  To avoid another dependency, the robin_hood code
 is ifdefed out.
 
 Representative run:
- [main] /mnt/e/opt/code/solux/cmake-build-release-wsl/bin$ ./solux_test --bench --benchmark_filter=BM_invert --benchmark_repetitions=60 | grep _mean
+ [main] /mnt/e/opt/code/luxir/cmake-build-release-wsl/bin$ ./luxir_test --bench --benchmark_filter=BM_invert --benchmark_repetitions=60 | grep _mean
 2021-01-26T14:47:13-05:00
-Running ./solux_test
+Running ./luxir_test
         Run on (12 X 3593.26 MHz CPU s)
 CPU Caches:
 L1 Data 32 KiB (x6)

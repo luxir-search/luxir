@@ -1,6 +1,6 @@
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/SegmentTest.h"
-#include "solux/reader/PostingsReader.h"
+#include "luxir/reader/PostingsReader.h"
 
 /* Results of postings reading before position blocks are supported (just reading vints directly,
  * without decoding into intermediate array:
@@ -61,9 +61,9 @@ static void BM_Postings(benchmark::State& state, int nTerms, int nDocs, int nPos
 
   // std::cout << "BM_Postings START" << std::endl;
 
-  auto seg = std::make_unique<solux::SegmentTest>();
+  auto seg = std::make_unique<luxir::SegmentTest>();
 
-  if (!solux::unit_tests) {
+  if (!luxir::unit_tests) {
     seg->r.init(1);  // keep seed the same for performance benchmark
   }
 
@@ -77,14 +77,14 @@ static void BM_Postings(benchmark::State& state, int nTerms, int nDocs, int nPos
   uint64_t iter = 0;
   for (auto _ : state) {
     iter++;
-    if (solux::unit_tests) {
+    if (luxir::unit_tests) {
       // Under clang debug, if we pause timing, it causes things to get very slow.
 
       // std::cout << "\tBM_Postings PauseTiming" << std::endl;
       // state.PauseTiming();  // PauseTiming and ResumeTiming are very slow (~200ns)! Don't use in conjunction with anything fast!
       // add a new different index each time if we are running unit tests
-      // seg = std::make_unique<solux::SegmentTest>();
-      // seg->r.init(solux::SoluxTest::rng());
+      // seg = std::make_unique<luxir::SegmentTest>();
+      // seg->r.init(luxir::LuxirTest::rng());
       seg->initWriter();
       seg->addFields(false, 1, nTerms, nDocs, nPosPerDoc);
       seg->initReader();
@@ -110,15 +110,15 @@ static void BM_Postings(benchmark::State& state, int nTerms, int nDocs, int nPos
   state.counters["pos"] = tpos;
 
   // std::cout << "\tBM_Postings END iter=" << iter << std::endl;
-  solux::unused(iter);
+  luxir::unused(iter);
 }
 
 
 
-BENCHMARK_CAPTURE(BM_Postings, readTailPos, 1, 8, solux::Postings::POSITIONS_BLOCK_SIZE/8-1);      // read non-block encoded positions (tail)
-BENCHMARK_CAPTURE(BM_Postings, readBlockPos, 1, 8, solux::Postings::POSITIONS_BLOCK_SIZE/8);      // read positions when they are block encoded
-BENCHMARK_CAPTURE(BM_Postings, readDocsTail, 1, solux::Postings::DOCS_BLOCK_SIZE-1, 2, 0);        // read non-block encoded documents (tail)
-BENCHMARK_CAPTURE(BM_Postings, readDocsBlock, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 0);
-BENCHMARK_CAPTURE(BM_Postings, readDocsBlockPos, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 100);
-BENCHMARK_CAPTURE(BM_Postings, readPulsedDoc, solux::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 0);
-BENCHMARK_CAPTURE(BM_Postings, readPulsedPos, solux::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 100);
+BENCHMARK_CAPTURE(BM_Postings, readTailPos, 1, 8, luxir::Postings::POSITIONS_BLOCK_SIZE/8-1);      // read non-block encoded positions (tail)
+BENCHMARK_CAPTURE(BM_Postings, readBlockPos, 1, 8, luxir::Postings::POSITIONS_BLOCK_SIZE/8);      // read positions when they are block encoded
+BENCHMARK_CAPTURE(BM_Postings, readDocsTail, 1, luxir::Postings::DOCS_BLOCK_SIZE-1, 2, 0);        // read non-block encoded documents (tail)
+BENCHMARK_CAPTURE(BM_Postings, readDocsBlock, 1, luxir::Postings::DOCS_BLOCK_SIZE, 2, 0);
+BENCHMARK_CAPTURE(BM_Postings, readDocsBlockPos, 1, luxir::Postings::DOCS_BLOCK_SIZE, 2, 100);
+BENCHMARK_CAPTURE(BM_Postings, readPulsedDoc, luxir::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 0);
+BENCHMARK_CAPTURE(BM_Postings, readPulsedPos, luxir::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 100);

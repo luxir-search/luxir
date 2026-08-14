@@ -7,12 +7,12 @@
 #include <string>
 #include <vector>
 
-#include "solux/util/automaton/ByteDfa.h"
-#include "solux/util/automaton/Utf32ToUtf8.h"
-#include "solux/util/automaton/WildcardCompiler.h"
-#include "solux/util/automaton/RegExpParser.h"
+#include "luxir/util/automaton/ByteDfa.h"
+#include "luxir/util/automaton/Utf32ToUtf8.h"
+#include "luxir/util/automaton/WildcardCompiler.h"
+#include "luxir/util/automaton/RegExpParser.h"
 
-using namespace solux::automaton;
+using namespace luxir::automaton;
 
 static bool accepts(const Automaton& automaton, std::string_view bytes) {
   std::vector<int32_t> current{0};

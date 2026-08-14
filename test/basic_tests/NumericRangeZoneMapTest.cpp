@@ -7,20 +7,20 @@
 #include <span>
 #include <vector>
 
-#include "solux/query/NumericRangeQuery.h"
-#include "solux/query/QueryPrep.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/util/NumericUtils.h"
-#include "solux/util/random.h"
+#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/QueryPrep.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/util/NumericUtils.h"
+#include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -116,7 +116,7 @@ void expectRun(const RangeRun& run, const std::vector<int32_t>& expected) {
 
 } // namespace
 
-class NumericRangeZoneMapTest : public SoluxTest {};
+class NumericRangeZoneMapTest : public LuxirTest {};
 
 TEST_F(NumericRangeZoneMapTest, randomizedMultiBlockOracleAndCount) {
   constexpr int32_t N = 33'000;

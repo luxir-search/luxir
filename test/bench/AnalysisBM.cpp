@@ -1,9 +1,9 @@
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/TestData.h"
-#include "solux/analysis/Analyzer.h"
-#include "solux/schema/FieldType.h"
+#include "luxir/analysis/Analyzer.h"
+#include "luxir/schema/FieldType.h"
 
-using namespace solux;
+using namespace luxir;
 
 // Tokenization-only throughput over the book corpus. This isolates the analyzer
 // from inversion/postings (unlike IndexBookBM), so the per-token cost of offset

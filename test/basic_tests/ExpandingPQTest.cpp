@@ -2,11 +2,11 @@
 #include <limits>
 #include <vector>
 
-#include "solux/search/Collector.h"
-#include "solux/util/heap.h"
-#include "test/SoluxTest.h"
+#include "luxir/search/Collector.h"
+#include "luxir/util/heap.h"
+#include "test/LuxirTest.h"
 
-namespace solux::test {
+namespace luxir::test {
 
 namespace {
 struct IntLess {
@@ -121,4 +121,4 @@ TEST(ExpandingPQTest, TopDocsCollectorSliceMergeEquivalence) {
   ASSERT_EQ(merged[0].doc, segdoc(0, 6));
 }
 
-}  // namespace solux::test
+}  // namespace luxir::test

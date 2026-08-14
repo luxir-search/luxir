@@ -2,12 +2,12 @@
 #include <gtest/gtest.h>
 #include <iostream>
 
-#include "solux/store/Directory.h"
-#include "test/SoluxTest.h"
+#include "luxir/store/Directory.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
+using namespace luxir;
 
-class OutputStreamTest : public solux::SoluxTest {
+class OutputStreamTest : public luxir::LuxirTest {
 public:
   // if you run into an issue in this test, try changing to true to catch the bug earlier.
   constexpr static bool catch_early = false;

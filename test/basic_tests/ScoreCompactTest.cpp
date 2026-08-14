@@ -1,4 +1,4 @@
-#include "solux/query/ScoreCompact.h"
+#include "luxir/query/ScoreCompact.h"
 
 #include <algorithm>
 #include <bit>
@@ -9,7 +9,7 @@
 
 #include "gtest/gtest.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 

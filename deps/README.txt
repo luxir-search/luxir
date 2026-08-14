@@ -22,7 +22,7 @@ Building
 $ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
 
    This fetches pinned FastPFOR sources if absent (and restores the
-   normally-vendored uni-algo if it is ever missing) and applies Solux's local
+   normally-vendored uni-algo if it is ever missing) and applies Luxir's local
    patches to the vcpkg roots (and FastPFOR, if any patches exist). FastPFOR
    itself is compiled by the main CMakeLists.txt, so there is no static-lib
    build step. Run it BEFORE installing vcpkg packages, or reinstall any

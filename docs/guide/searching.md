@@ -1,6 +1,6 @@
 # Searching
 
-A Solux search request describes the result, not a sequence of calls. The
+A Luxir search request describes the result, not a sequence of calls. The
 small form asks for one ranked document list. The full form names several
 operations and nests facets or metrics under the query whose match set they
 should consume. Both are the same model: the small form becomes a `top_docs`
@@ -94,13 +94,13 @@ query that already has `required` or `filter` clauses unless `min_match` is set.
 
 The [structured query reference](query-reference.md) documents every field and
 default. Use [`simple_query`](query-reference.md#simple-query) for text a person
-typed and the strict [Solux query language](query-language.md) for text your
+typed and the strict [Luxir query language](query-language.md) for text your
 application authored. That separation is intentional: one degrades rather than
 fail; the other would rather report the exact byte offset of a bug than guess.
 
 ## Counts and top-k work
 
-`found` is opt-in. Without `get_number`, Solux can use block score bounds and
+`found` is opt-in. Without `get_number`, Luxir can use block score bounds and
 MaxScore-style skipping to avoid scoring documents that cannot enter the top
 k. With `get_number`, it exhaustively counts the domain and returns the exact
 total. The request says which contract it consumes; there is no hidden

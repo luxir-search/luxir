@@ -5,16 +5,16 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/server/GRPCServer.h"
-#include "solux/server/HttpServer.h"
-#include "solux/store/Directory.h"
+#include "luxir/server/GRPCServer.h"
+#include "luxir/server/HttpServer.h"
+#include "luxir/store/Directory.h"
 #include "test/GrpcClient.h"
 #include "test/HttpReq.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
-namespace solux::test {
+namespace luxir::test {
 
-class ReadOnlyNodeTest : public SoluxTest {};
+class ReadOnlyNodeTest : public LuxirTest {};
 
 namespace {
 
@@ -34,8 +34,8 @@ public:
   const std::filesystem::path& path() const { return path_; }
 };
 
-SoluxConfig fsConfig(const DataDir& data, bool readOnly = false) {
-  SoluxConfig config;
+LuxirConfig fsConfig(const DataDir& data, bool readOnly = false) {
+  LuxirConfig config;
   config.store.backend = "fs";
   config.store.data_dir = data.path().string();
   config.read_only = readOnly;
@@ -45,7 +45,7 @@ SoluxConfig fsConfig(const DataDir& data, bool readOnly = false) {
 
 // Seeds a data directory with one committed doc and leaves the writer running.
 struct RunningWriter {
-  SoluxNode node;
+  LuxirNode node;
   HttpServer server;
 
   explicit RunningWriter(const DataDir& data) : node(fsConfig(data)), server(node, 2, 0) {
@@ -63,11 +63,11 @@ struct RunningWriter {
 // A read-only node shares a data directory with the instance that owns it: it opens
 // without contending for write.lock, serves searches, and refuses every mutation.
 TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
-  DataDir data("solux_read_only_http");
+  DataDir data("luxir_read_only_http");
   RunningWriter writer(data);
 
   // The writer is still up and still holds write.lock.
-  SoluxNode reader(fsConfig(data, /*readOnly=*/true));
+  LuxirNode reader(fsConfig(data, /*readOnly=*/true));
   HttpServer readerServer(reader, 2, 0);
   readerServer.start();
   int port = readerServer.getPort();
@@ -105,7 +105,7 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
 
   // The writer never lost its lock: a second writer is still refused, and the
   // writer itself can still index and commit while the reader serves.
-  EXPECT_THROW({ SoluxNode second(fsConfig(data)); }, std::runtime_error);
+  EXPECT_THROW({ LuxirNode second(fsConfig(data)); }, std::runtime_error);
   auto stillWriting = httpRequest(writer.server.getPort(), http::verb::post,
       "/collections/main/_update",
       R"({"docs":[{"id":"r5","title_w":"lockless token"}],"commit":{}})");
@@ -115,38 +115,38 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
 }
 
 TEST_F(ReadOnlyNodeTest, grpcRefusesMutatingMethods) {
-  DataDir data("solux_read_only_grpc");
+  DataDir data("luxir_read_only_grpc");
   RunningWriter writer(data);
 
-  SoluxNode reader(fsConfig(data, /*readOnly=*/true));
+  LuxirNode reader(fsConfig(data, /*readOnly=*/true));
   GRPCServer readerServer(reader, 2, 0);
   std::thread serverThread([&] { readerServer.run(); });
   ASSERT_TRUE(readerServer.waitForStart());
   auto channel = grpc::CreateChannel("localhost:" + std::to_string(readerServer.getPort()),
                                      grpc::InsecureChannelCredentials());
 
-  solux::api::UpdateRequest update;
+  luxir::api::UpdateRequest update;
   grpc::ClientContext updateContext;
-  Reply<solux::api::UpdateResponse> updateReply;
+  Reply<luxir::api::UpdateResponse> updateReply;
   auto updateStatus = hppUnaryCall(channel.get(), rpc::Update, &updateContext, update, &updateReply);
   EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, updateStatus.error_code())
       << updateStatus.error_message();
   EXPECT_NE(updateStatus.error_message().find("read-only"), std::string::npos)
       << updateStatus.error_message();
 
-  solux::api::CreateCollectionRequest create;
+  luxir::api::CreateCollectionRequest create;
   create.name = "read_only_grpc_new";
   grpc::ClientContext createContext;
-  Reply<solux::api::CreateCollectionResponse> createReply;
+  Reply<luxir::api::CreateCollectionResponse> createReply;
   auto createStatus =
       hppUnaryCall(channel.get(), rpc::CreateCollection, &createContext, create, &createReply);
   EXPECT_EQ(grpc::StatusCode::FAILED_PRECONDITION, createStatus.error_code())
       << createStatus.error_message();
 
   // Read methods are unaffected.
-  solux::api::StatsRequest stats;
+  luxir::api::StatsRequest stats;
   grpc::ClientContext statsContext;
-  Reply<solux::api::StatsResponse> statsReply;
+  Reply<luxir::api::StatsResponse> statsReply;
   auto statsStatus = hppUnaryCall(channel.get(), rpc::Stats, &statsContext, stats, &statsReply);
   EXPECT_TRUE(statsStatus.ok()) << statsStatus.error_message();
 
@@ -156,27 +156,27 @@ TEST_F(ReadOnlyNodeTest, grpcRefusesMutatingMethods) {
 
 // A read-only node writes nothing at startup: no data dir, no lock file, no trash.
 TEST_F(ReadOnlyNodeTest, startupTouchesNothing) {
-  DataDir data("solux_read_only_startup");
+  DataDir data("luxir_read_only_startup");
 
-  EXPECT_THROW({ SoluxNode reader(fsConfig(data, /*readOnly=*/true)); }, ReadOnlyError);
+  EXPECT_THROW({ LuxirNode reader(fsConfig(data, /*readOnly=*/true)); }, ReadOnlyError);
   EXPECT_FALSE(std::filesystem::exists(data.path()));
 
-  { SoluxNode writer(fsConfig(data)); }
+  { LuxirNode writer(fsConfig(data)); }
   ASSERT_TRUE(std::filesystem::exists(data.path() / "write.lock"));
   std::filesystem::remove(data.path() / "write.lock");
   std::filesystem::remove_all(data.path() / "trash");
 
-  { SoluxNode reader(fsConfig(data, /*readOnly=*/true)); }
+  { LuxirNode reader(fsConfig(data, /*readOnly=*/true)); }
   EXPECT_FALSE(std::filesystem::exists(data.path() / "write.lock"));
   EXPECT_FALSE(std::filesystem::exists(data.path() / "trash"));
 }
 
 // There is no existing data directory to serve without the fs backend.
 TEST_F(ReadOnlyNodeTest, readOnlyRequiresTheFsBackend) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.read_only = true;
   config.store.backend = "ram";
   EXPECT_THROW(config.normalize(), std::runtime_error);
 }
 
-} // namespace solux::test
+} // namespace luxir::test

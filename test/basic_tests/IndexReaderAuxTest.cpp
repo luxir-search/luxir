@@ -11,34 +11,34 @@
 #include <thread>
 #include <vector>
 
-#include "solux/api/build.h"
-#include "solux/api/padded_input.h"
-#include "solux/api/solux_types.hpp"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/VectorIndexBuilder.h"
-#include "solux/reader/AuxReader.h"
-#include "solux/reader/Postings.h"
-#include "solux/reader/TestOverlayAuxReader.h"
-#include "solux/reader/VectorAuxReader.h"
-#include "solux/schema/Schema.h"
-#include "solux/search/IndexReader.h"
-#include "solux/server/SoluxNode.h"
+#include "luxir/api/build.h"
+#include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_types.hpp"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/reader/AuxReader.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/reader/TestOverlayAuxReader.h"
+#include "luxir/reader/VectorAuxReader.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/server/LuxirNode.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class IndexReaderAuxTest : public SoluxTest {
+class IndexReaderAuxTest : public LuxirTest {
 public:
   IndexReaderAuxTest() { TestOverlayAuxReader::enabledForTests = true; }
 
 protected:
   void SetUp() override {
-    auto col = soluxNode->getCollection("main");
+    auto col = luxirNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
   }
 
@@ -84,18 +84,18 @@ protected:
   static void enableL2OnVecSuffix(Collection& col) {
     SchemaBuilder b;
     auto& f = b.templ("_v");
-    f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
     f.column = true;
-    f.metric = solux::api::VectorMetric::L2;
+    f.metric = luxir::api::VectorMetric::L2;
     b.set(col);
   }
 
   static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite) {
     SchemaBuilder b;
     auto& f = b.templ("_v");
-    f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
     f.column = true;
-    f.metric = solux::api::VectorMetric::COSINE;
+    f.metric = luxir::api::VectorMetric::COSINE;
     f.normalize_on_write = normalizeOnWrite;
     b.set(col);
   }
@@ -103,8 +103,8 @@ protected:
 
 namespace {
 
-std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::IndexInfo& info) {
-  std::vector<const solux::api::AuxIndexInfo*> out;
+std::vector<const luxir::api::AuxIndexInfo*> vectorOverlays(const luxir::api::IndexInfo& info) {
+  std::vector<const luxir::api::AuxIndexInfo*> out;
   for (const auto& seg : info.segments) {
     for (const auto& overlay : seg.overlays) {
       if (overlay.kind == VectorIndexBuilder::KIND) out.push_back(&overlay);
@@ -123,7 +123,7 @@ std::shared_ptr<AuxReader> firstSegmentAux(IndexReader& reader, std::string_view
   return nullptr;
 }
 
-const solux::api::AuxIndexInfo& onlyVectorOverlay(const solux::api::IndexInfo& info) {
+const luxir::api::AuxIndexInfo& onlyVectorOverlay(const luxir::api::IndexInfo& info) {
   auto overlays = vectorOverlays(info);
   EXPECT_EQ(overlays.size(), 1u);
   return *overlays[0];
@@ -164,7 +164,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   ASSERT_NE(vaux, nullptr);
   EXPECT_EQ(vaux->getField(), "embedding_v");
   EXPECT_EQ(vaux->getDims(), 4);
-  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorMetric::L2);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)luxir::api::VectorMetric::L2);
   EXPECT_FALSE(vaux->shouldNormalizeColumnOnCosineRescore());
 
   auto* idx = vaux->getFaissIndex();
@@ -178,7 +178,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
 // deserialized into RAM; the list payloads are served zero-copy from the aux
 // file's memory view through MmapInvertedLists.  Guards against silently
 // falling back to a RAM-resident ArrayInvertedLists, and verifies the list
-// payloads written in Solux's own layout round-trip (every segment-local
+// payloads written in Luxir's own layout round-trip (every segment-local
 // valueRank appears exactly once across the lists).
 TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
   IvfPqGuard guard;
@@ -293,7 +293,7 @@ TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
   ASSERT_NE(aux, nullptr);
   auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
   ASSERT_NE(vaux, nullptr);
-  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorMetric::COSINE);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)luxir::api::VectorMetric::COSINE);
   EXPECT_TRUE(vaux->shouldNormalizeColumnOnCosineRescore());
 }
 
@@ -566,19 +566,19 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   // loaded arena instead of emplace_back, then re-encode while the loaded view is alive.
   auto loaded = readDurableIndexInfo(dir);
   auto oldAux = loaded.info.aux_indexes;
-  solux::api::AuxIndexInfo* aux =
-      solux::api::build::allocArray(loaded.info.aux_indexes, oldAux.size() + 1, *loaded.arena);
+  luxir::api::AuxIndexInfo* aux =
+      luxir::api::build::allocArray(loaded.info.aux_indexes, oldAux.size() + 1, *loaded.arena);
   for (size_t i = 0; i < oldAux.size(); i++) aux[i] = oldAux[i];
   auto& extra = aux[oldAux.size()];
   extra.kind = "future_kind_abc";
   extra.name = "future.foo";
   extra.gen = 1;
-  solux::api::build::allocArray(extra.files, 1, *loaded.arena)[0] =
+  luxir::api::build::allocArray(extra.files, 1, *loaded.arena)[0] =
       "nonexistent_file_should_not_be_opened";
 
   {
     std::vector<std::byte> serialized;
-    ASSERT_TRUE(solux::api::encode(loaded.info, serialized));
+    ASSERT_TRUE(luxir::api::encode(loaded.info, serialized));
     auto out = dir.createFile(Postings::INDEX_INFO_FILE);
     OutputStream os;
     os.setFile(&*out);

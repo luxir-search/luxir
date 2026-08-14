@@ -1,5 +1,5 @@
 #include "gtest/gtest.h"
-#include "solux/util/DecodedSuccessor.h"
+#include "luxir/util/DecodedSuccessor.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <unistd.h>
 #endif
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -51,7 +51,7 @@ TEST(DecodedSuccessorTest, ExhaustiveLengthsStartsAndPartialVectors) {
 }
 
 TEST(DecodedSuccessorTest, DisableHookKeepsScalarSemantics) {
-#if SOLUX_PROBE_CONSTANT_HOOKS
+#if LUXIR_PROBE_CONSTANT_HOOKS
   const bool saved = DecodedSuccessor::disableSimdForTests;
   DecodedSuccessor::disableSimdForTests = true;
   const int32_t values[] = {2, 5, 9, 14, 20, 27, 35, 44, 54, 65,
@@ -98,10 +98,10 @@ TEST(DecodedSuccessorTest, TailLoadDoesNotCrossGuardPage) {
 }
 
 TEST(DecodedSuccessorTest, ExpectedIsaIsCompiled) {
-#if defined(SOLUX_EXPECT_NO_AVX512)
+#if defined(LUXIR_EXPECT_NO_AVX512)
   EXPECT_FALSE(DecodedSuccessor::hasAvx512ForTests());
 #endif
-#if defined(SOLUX_EXPECT_SCALAR)
+#if defined(LUXIR_EXPECT_SCALAR)
   EXPECT_FALSE(DecodedSuccessor::hasAvx512ForTests());
   EXPECT_FALSE(DecodedSuccessor::hasAvx2ForTests());
 #endif

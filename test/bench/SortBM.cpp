@@ -1,12 +1,12 @@
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/SortField.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/SortField.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 static void BM_StringSort(benchmark::State& state, int64_t nDocs,
                           std::string_view shape, qb::SortDir direction,
@@ -19,7 +19,7 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
     ~ModeGuard() { SortField::setStringSortModeForTests(saved); }
   } guard(mode);
 
-  if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
 
@@ -29,7 +29,7 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
 
   int64_t fingerprint = -1;
   for (auto _ : state) {
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("string_sort_bm");
     auto& top = req->topDocs("q").getNumber(true).allQuery().limit(100)
         .fields({"id", "short_u10k_s"});
@@ -109,7 +109,7 @@ static void recordFieldSortCounters(benchmark::State& state) {
 // 1000 ~= 10% density, 100 ~= 1%, 10 ~= 0.1%).
 static void BM_IntSortFiltered(benchmark::State& state, int64_t nDocs,
                                int64_t filterBelow, bool singleSeg = false) {
-  if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   if (singleSeg) {
     // The serverbench sort-grid posture: one segment, so the irreducible
@@ -126,7 +126,7 @@ static void BM_IntSortFiltered(benchmark::State& state, int64_t nDocs,
   if (!reused) buildBenchIndex(helper, nDocs, docsPerSeg);
 
   auto execute = [&]() -> int64_t {
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection(collection);
     auto& top = req->topDocs("q").allQuery().limit(10).fields({"id"});
     qb::sort(top, "u10m_i", qb::ASC);
@@ -166,13 +166,13 @@ static void BM_IntSortFiltered(benchmark::State& state, int64_t nDocs,
       state.iterations(), benchmark::Counter::kIsRate);
 }
 
-SOLUX_BENCHMARK_CAPTURE(BM_StringSort, global_asc, STRING_SORT_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_StringSort, global_asc, STRING_SORT_DOCS,
                         STRING_SORT_SHAPE, qb::ASC, StringSortMode::GLOBAL);
-SOLUX_BENCHMARK_CAPTURE(BM_StringSort, global_desc, STRING_SORT_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_StringSort, global_desc, STRING_SORT_DOCS,
                         STRING_SORT_SHAPE, qb::DESC, StringSortMode::GLOBAL);
-SOLUX_BENCHMARK_CAPTURE(BM_StringSort, segment_asc, STRING_SORT_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_StringSort, segment_asc, STRING_SORT_DOCS,
                         STRING_SORT_SHAPE, qb::ASC, StringSortMode::SEGMENT);
-SOLUX_BENCHMARK_CAPTURE(BM_StringSort, segment_desc, STRING_SORT_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_StringSort, segment_desc, STRING_SORT_DOCS,
                         STRING_SORT_SHAPE, qb::DESC, StringSortMode::SEGMENT);
 // Near-unique int sort where the selectivity predicate IS the main query
 // (a term match, uncached): the GRID_FILTER_MODE=query sort10 posture. The
@@ -182,7 +182,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_StringSort, segment_desc, STRING_SORT_DOCS,
 // "short_u100_s" ~= 1%, "short_u10k_s" ~= 0.01% (sparse control).
 static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
                             const char* queryField, bool singleSeg = false) {
-  if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   if (singleSeg) {
     docsPerSeg.push_back((int32_t)nDocs);
@@ -196,7 +196,7 @@ static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
   if (!reused) buildBenchIndex(helper, nDocs, docsPerSeg);
 
   auto execute = [&]() -> int64_t {
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection(collection);
     auto& top = req->topDocs("q").limit(10).fields({"id"})
         .matchQuery(queryField, "3");
@@ -236,21 +236,21 @@ static void BM_IntSortQuery(benchmark::State& state, int64_t nDocs,
       state.iterations(), benchmark::Counter::kIsRate);
 }
 
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, all, STRING_SORT_DOCS, 0);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, f10pct, STRING_SORT_DOCS, 1000);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, f1pct, STRING_SORT_DOCS, 100);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, f0p1pct, STRING_SORT_DOCS, 10);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, all, STRING_SORT_DOCS, 0);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, f10pct, STRING_SORT_DOCS, 1000);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, f1pct, STRING_SORT_DOCS, 100);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, f0p1pct, STRING_SORT_DOCS, 10);
 static constexpr int64_t INT_SORT_SS_DOCS = 5'000'000;
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_all, INT_SORT_SS_DOCS, 0, true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f10pct, INT_SORT_SS_DOCS, 1000, true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f1pct, INT_SORT_SS_DOCS, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f0p1pct, INT_SORT_SS_DOCS, 10, true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, q10pct, STRING_SORT_DOCS, "short_u10_s");
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q10pct, INT_SORT_SS_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_all, INT_SORT_SS_DOCS, 0, true);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f10pct, INT_SORT_SS_DOCS, 1000, true);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f1pct, INT_SORT_SS_DOCS, 100, true);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortFiltered, ss_f0p1pct, INT_SORT_SS_DOCS, 10, true);
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, q10pct, STRING_SORT_DOCS, "short_u10_s");
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q10pct, INT_SORT_SS_DOCS,
                         "short_u10_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q1pct, INT_SORT_SS_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q1pct, INT_SORT_SS_DOCS,
                         "short_u100_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p1pct, INT_SORT_SS_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p1pct, INT_SORT_SS_DOCS,
                         "short_u1000_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p01pct, INT_SORT_SS_DOCS,
+LUXIR_BENCHMARK_CAPTURE(BM_IntSortQuery, ss_q0p01pct, INT_SORT_SS_DOCS,
                         "short_u10k_s", true);

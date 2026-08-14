@@ -15,11 +15,11 @@
 #include <uni_algo/norm.h>
 #include <uni_algo/ranges_word.h>
 
-#include "solux/analysis/Analyzer.h"
-#include "solux/schema/FieldType.h"
-#include "test/SoluxTest.h"
+#include "luxir/analysis/Analyzer.h"
+#include "luxir/schema/FieldType.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -58,7 +58,7 @@ Analysis analyze(TokenChain& tc, std::string_view val) {
 
 }  // namespace
 
-class AnalysisTest : public SoluxTest {};
+class AnalysisTest : public LuxirTest {};
 
 TEST_F(AnalysisTest, whitespaceBasic) {
   WhitespaceTokenizer tok;
@@ -235,7 +235,7 @@ TEST_F(AnalysisTest, nocopyWhitespaceAlias) {
 // are built on top of uni-algo: validates that the pinned library actually
 // passes UAX#29 word segmentation and Unicode full case folding, plus a few
 // shipped-behavior sanity checks. The two file-driven tests consume the official
-// Unicode data files that cmake downloads into $TMP/solux; they GTEST_SKIP when
+// Unicode data files that cmake downloads into $TMP/luxir; they GTEST_SKIP when
 // the files are absent (offline) rather than fail.
 // ---------------------------------------------------------------------------
 namespace {
@@ -243,7 +243,7 @@ namespace fs = std::filesystem;
 
 // Path to a Unicode conformance file (cmake downloads these next to book.txt).
 fs::path unicodeDataPath(const char* name) {
-  return fs::temp_directory_path() / "solux" / name;
+  return fs::temp_directory_path() / "luxir" / name;
 }
 
 // toNFKC_Casefold approximation for the spike: case-fold, then NFKC. The

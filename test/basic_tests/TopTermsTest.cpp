@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "solux/search/TopTerms.h"
+#include "luxir/search/TopTerms.h"
 
-namespace solux {
+namespace luxir {
 
 // Retention is clamp(above threshold, nTerms/64, maxEntries), so a test that
 // wants the floor to do anything has to add enough terms to earn it.

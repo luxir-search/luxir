@@ -2,11 +2,11 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <new>
-#include <solux/util/random.h>
+#include <luxir/util/random.h>
 #include <boost/unordered/unordered_flat_map.hpp>
-#include "solux/util/solux_util.h"
-#include "solux/util/heap.h"
-#include "solux/util/TaggedPtr.h"
+#include "luxir/util/luxir_util.h"
+#include "luxir/util/heap.h"
+#include "luxir/util/TaggedPtr.h"
 
 using namespace std;
 
@@ -26,13 +26,13 @@ TEST(BasicTest, testCompiler) {
     EXPECT_TRUE(std::hardware_destructive_interference_size > 0 && std::hardware_destructive_interference_size <= 256);
 #endif
 
-    SOLUX_UNALIGNED_START
+    LUXIR_UNALIGNED_START
     struct alignas(1) s2 {
       int64_t x;
       char c;
       int32_t z;
       char d;
-    } SOLUX_UNALIGNED_END;
+    } LUXIR_UNALIGNED_END;
 
     EXPECT_EQ(sizeof(int64_t)+sizeof(char)*2+sizeof(int32_t), sizeof(s2));  // make sure there is no padding
 
@@ -55,7 +55,7 @@ TEST(BasicTest, testPQ) {
 
   /* alternate form... need to use decltype for lambda
   auto constexpr mycmp = [](double a, double b){return b < a;}; // reversed comparator for a min heap
-  solux::IndirectPQ<float, decltype(mycmp)> pq(vals, valPtrs);
+  luxir::IndirectPQ<float, decltype(mycmp)> pq(vals, valPtrs);
   */
 
   {
@@ -63,7 +63,7 @@ TEST(BasicTest, testPQ) {
     std::vector<float*> valPtrs;
     valPtrs.resize(vals.size());
 
-    solux::IndirectPQ<float, std::greater<>> pq(vals, valPtrs);
+    luxir::IndirectPQ<float, std::greater<>> pq(vals, valPtrs);
     ASSERT_EQ(vals.size(), pq.size());
     ASSERT_EQ(pq.top(), 25.0);
     ASSERT_EQ(pq.indexOfTop(), 2);
@@ -84,7 +84,7 @@ TEST(BasicTest, testPQ) {
   {
     std::vector<float> vals = {50.0, 75.0, 25.0, 80.0, 40.0};
     std::vector<float*> valPtrs(3);
-    solux::IndirectPQ<float, std::greater<>> pq(valPtrs, 0);
+    luxir::IndirectPQ<float, std::greater<>> pq(valPtrs, 0);
     ASSERT_EQ(pq.size(), 0);
     ASSERT_EQ(nullptr, pq.insertWithOverflow(&vals[4]));  // 40
     ASSERT_EQ(nullptr, pq.insertWithOverflow(&vals[0]));  // 50
@@ -100,7 +100,7 @@ TEST(BasicTest, testPQ) {
 
     valPtrs[0] = &vals[4];  // 40
     valPtrs[1] = &vals[2];  // 25
-    solux::IndirectPQ<float, std::greater<>> pq2(vals, valPtrs, size_t(2));
+    luxir::IndirectPQ<float, std::greater<>> pq2(vals, valPtrs, size_t(2));
     ASSERT_EQ(pq2.size(), 2);
     ASSERT_EQ(pq2.top(), 25.0f);
     ASSERT_EQ(pq2.indexOfTop(), 2);
@@ -109,7 +109,7 @@ TEST(BasicTest, testPQ) {
   {
     std::vector<float> vals = {50.0, 75.0, 25.0, 80.0, 40.0};
     std::vector<int> valPtrs(3);
-    solux::IndexedPQ<float, std::greater<>> pq(vals, valPtrs, 0);
+    luxir::IndexedPQ<float, std::greater<>> pq(vals, valPtrs, 0);
     ASSERT_EQ(pq.size(), 0);
     ASSERT_EQ(false, pq.insertWithOverflow(40.0f));  // 40
     ASSERT_EQ(false, pq.insertWithOverflow(50.0f));  // 50
@@ -127,7 +127,7 @@ TEST(BasicTest, testPQ) {
 
   {
     int n = 100;
-    solux::Rng rng;
+    luxir::Rng rng;
     std::vector<int> vals(n);
     for (auto& val : vals) {
       val = rng.rint(1000000);
@@ -136,10 +136,10 @@ TEST(BasicTest, testPQ) {
     std::ranges::sort(sorted);
 
     std::vector<int*> ptrs(vals.size());
-    solux::IndirectPQ<int, std::greater<>> pq(vals, ptrs);
+    luxir::IndirectPQ<int, std::greater<>> pq(vals, ptrs);
 
     std::vector<int> indexes(vals.size());
-    solux::IndexedPQ<int, std::greater<>> indexedPQ(vals, indexes);
+    luxir::IndexedPQ<int, std::greater<>> indexedPQ(vals, indexes);
 
     ASSERT_EQ(pq.top(), sorted[0]);
 

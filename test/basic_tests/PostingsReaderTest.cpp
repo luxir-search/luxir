@@ -1,13 +1,13 @@
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/SegmentTest.h"
 #include<boost/container/static_vector.hpp>
 
-namespace solux {
+namespace luxir {
 
-class PostingsReaderTest : public SoluxTest {
+class PostingsReaderTest : public LuxirTest {
 protected:
   SegmentTest st;
 public:

@@ -6,17 +6,17 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/SearchOverrides.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/SearchOverrides.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -60,7 +60,7 @@ struct SkipStatsGuard {
 
 } // namespace
 
-class DisjunctionCountIdentityTest : public SoluxTest {
+class DisjunctionCountIdentityTest : public LuxirTest {
 public:
   using QueryFactory = std::function<api::Query(OpCursor&)>;
 

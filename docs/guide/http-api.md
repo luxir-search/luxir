@@ -98,4 +98,4 @@ HTTP/1.1 keep-alive and request streaming are supported. A configured nonzero
 HTTP port currently binds all interfaces, and the server has no TLS,
 authentication, authorization, CORS policy, or tenant permission layer. Do not
 expose it directly to an untrusted network. See
-[Operating Solux](operations.md#network-ports-and-security).
+[Operating Luxir](operations.md#network-ports-and-security).

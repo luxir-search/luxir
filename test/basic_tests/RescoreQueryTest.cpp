@@ -6,24 +6,24 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/ForcePrepareQuery.h"
-#include "solux/query/ParseContext.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/ProtobufQueryParser.h"
-#include "solux/query/RescoreQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/search/Collector.h"
-#include "solux/value/ValueExprParser.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/ParseContext.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/RescoreQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/Collector.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -87,7 +87,7 @@ void expectSameTopK(IndexReader& reader, Query& query,
 
 } // namespace
 
-class RescoreQueryTest : public SoluxTest {};
+class RescoreQueryTest : public LuxirTest {};
 
 TEST_F(RescoreQueryTest, grammarExecutionPreservesMembershipAndAllowsNegativeScores) {
   CollectionHelper helper;

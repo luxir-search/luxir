@@ -9,24 +9,24 @@
 #include <string>
 #include <vector>
 
-#include "solux/index/VectorIndexBuilder.h"
-#include "solux/query/KnnQuery.h"
-#include "solux/query/VectorEngine.h"
-#include "solux/schema/Schema.h"
-#include "solux/search/SearchOverrides.h"
-#include "solux/server/SoluxNode.h"
+#include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/query/KnnQuery.h"
+#include "luxir/query/VectorEngine.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/server/LuxirNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
-namespace build = solux::api::build;
+namespace api = luxir::api;
+namespace build = luxir::api::build;
 
 // Test engines wrapping the production flat engine via
 // KnnQuery::engineWrapperForTests.  Real VectorEngine implementations (scores
@@ -132,7 +132,7 @@ public:
   }
 };
 
-class KnnQueryTest : public SoluxTest {
+class KnnQueryTest : public LuxirTest {
 protected:
   struct TopDocsFilterFoldGuard {
     bool saved;
@@ -237,7 +237,7 @@ protected:
   };
 
   void SetUp() override {
-    auto col = soluxNode->getCollection("main");
+    auto col = luxirNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
   }
 
@@ -289,7 +289,7 @@ protected:
 
   // Build a TopDocs request with a KNN query for the given field + query
   // vector + k.  Always pulls back "id" so tests can assert ordering.
-  static LocalReq* makeKnnReq(SoluxNode& node, std::string_view field,
+  static LocalReq* makeKnnReq(LuxirNode& node, std::string_view field,
                               std::vector<float> queryVec, int32_t k,
                               int32_t nprobe = 0, int32_t refineCandidates = 0,
                               bool exact = false, float minScanFraction = 0.0f) {
@@ -300,7 +300,7 @@ protected:
   }
 
   static LocalReq* makeKnnFilterReq(
-      SoluxNode& node, std::string_view field, std::vector<float> queryVec,
+      LuxirNode& node, std::string_view field, std::vector<float> queryVec,
       int32_t k, int32_t nprobe = 0, int32_t refineCandidates = 0,
       bool exact = false, float minScanFraction = 0.0f) {
     auto* lreq = LocalReq::create(node.getSearchEngine());
@@ -383,7 +383,7 @@ TEST_F(KnnQueryTest, basicOrdering) {
   h.index(flatdoc("id", std::string("d"), "embedding_v", std::vector<float>{0, 0, 0, 1}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0, 0}, 3);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 3);
@@ -409,12 +409,12 @@ TEST_F(KnnQueryTest, zeroBoostKeepsKnnMatchSetAndZeroesScores) {
   h.index(flatdoc("id", std::string("d"), "embedding_v", std::vector<float>{3, 0}));
   h.commit({"*"});
 
-  auto* baseline = makeKnnReq(*soluxNode, "embedding_v", {0, 0}, 3);
+  auto* baseline = makeKnnReq(*luxirNode, "embedding_v", {0, 0}, 3);
   baseline->execute();
   ASSERT_TRUE(baseline->ok()) << baseline->errorMsg();
   auto expectedIds = resultIds(*baseline);
 
-  auto* zero = LocalReq::create(soluxNode->getSearchEngine());
+  auto* zero = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = zero->collection("main").topDocs("q");
   cur.getScores().getNumber().fields({"id"});
   auto knn = qb::knn(cur.mr(), "embedding_v", {0, 0}, 3);
@@ -455,7 +455,7 @@ TEST_F(KnnQueryTest, multiSegment) {
   h.index(flatdoc("id", std::string("s2_a"), "embedding_v", std::vector<float>{0, 0, 1.0f}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 3);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 3);
@@ -497,7 +497,7 @@ TEST_F(KnnQueryTest, multiValuedGrouping) {
 
   // Only two live docs have vectors, so k=3 returns both distinct docs after
   // collapsing "a"'s two top chunks into one hit.
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 2u) << "a's two top vectors must collapse to one hit";
@@ -512,7 +512,7 @@ TEST_F(KnnQueryTest, multiValuedGrouping) {
   std::vector<std::string> del{"a"};
   h.deleteByIds(del, UpdateMessage::COMMIT);
 
-  auto* req2 = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req2 = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req2->execute();
   auto ids2 = resultIds(*req2);
   ASSERT_EQ(ids2.size(), 1u);
@@ -536,7 +536,7 @@ TEST_F(KnnQueryTest, multiValuedGuaranteesKDocs) {
                   std::vector<std::vector<float>>{{0.3f, 0, 0}}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 3);
@@ -563,7 +563,7 @@ TEST_F(KnnQueryTest, multiValuedKExceedsDistinctDocs) {
                   std::vector<std::vector<float>>{{0.3f, 0, 0}}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 10);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 10);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 4);
@@ -594,7 +594,7 @@ TEST_F(KnnQueryTest, multiValuedFillsAfterDeletingTopDoc) {
   std::vector<std::string> del{"a"};
   h.deleteByIds(del, UpdateMessage::COMMIT);
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 3);
@@ -622,7 +622,7 @@ TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
                   std::vector<std::vector<float>>{{0.3f, 0, 0}}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 4);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 4);
   {
     ExpectLog quiet("at candidate cap");
     req->execute();
@@ -664,7 +664,7 @@ TEST_F(KnnQueryTest, multiValuedMultiSegment) {
                   std::vector<std::vector<float>>{{0, 0, 1}, {0, 0, 0.9f}}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 3u);
@@ -705,7 +705,7 @@ TEST_F(KnnQueryTest, multiValuedSurvivesMerge) {
   h.getIndexWriter()->mergeSegments();
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 3u);
@@ -747,7 +747,7 @@ TEST_F(KnnQueryTest, filtersDeletedDocs) {
   std::vector<std::string> ids{"b"};
   h.deleteByIds(ids, UpdateMessage::COMMIT);
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 2);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 2);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 2);
@@ -778,7 +778,7 @@ TEST_F(KnnQueryTest, topDocsFilterConstrainsKnnSearch) {
                   "embedding_v", std::vector<float>{0.7f, 0.0f}));
   h.commit({"*"});
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   configKnn(cur, "embedding_v", {1.0f, 0.0f}, 2);
   addMatchFilter(cur, "red", "color_s", "red");
@@ -809,7 +809,7 @@ TEST_F(KnnQueryTest, booleanOptionalKnnsCanFacet) {
                   "body_v", std::vector<float>{0.3f, 0.3f}));
   h.commit({"*"});
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.limit(10).getNumber().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(), /*required=*/{},
@@ -859,7 +859,7 @@ TEST_F(KnnQueryTest, booleanKnnFilterConstrainsRequiredKnn) {
                   "body_v", std::vector<float>{0.5f, 0.5f}));
   h.commit({"*"});
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.limit(10).getNumber().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -889,7 +889,7 @@ TEST_F(KnnQueryTest, booleanTermRequiredUsesKnnFilter) {
                   "body_v", std::vector<float>{0.0f, 0.9f}));
   h.commit({"*"});
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.limit(10).getNumber().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -917,7 +917,7 @@ TEST_F(KnnQueryTest, booleanDisjointRequiredAndKnnFilterReturnsEmpty) {
                   "body_v", std::vector<float>{0.0f, 1.0f}));
   h.commit({"*"});
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.limit(10).getNumber().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -941,7 +941,7 @@ TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
   h.index(flatdoc("id", std::string("c"), "foo_w", "orange", "state_s", "ok"));
   h.commit();
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.limit(10).withStats().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -966,7 +966,7 @@ TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.getNumber();
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -1002,7 +1002,7 @@ TEST_F(KnnQueryTest, manyDeletes) {
   std::vector<std::string> dels{"d0", "d1", "d2", "d3"};
   h.deleteByIds(dels, UpdateMessage::COMMIT);
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1.0f, 0.0f}, 2);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1.0f, 0.0f}, 2);
   req->execute();
   EXPECT_EQ(req->getMatchCount(), 2);
   auto ids = resultIds(*req);
@@ -1023,7 +1023,7 @@ TEST_F(KnnQueryTest, missingAuxIndexFallsBackToColumnScan) {
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}),
           UpdateMessage::COMMIT);
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 5);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 5);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 1);
@@ -1047,7 +1047,7 @@ TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
   }
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5,
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {0, 0, 0, 0}, 5,
                          /*nprobe=*/4, /*refineCandidates=*/320);
   req->execute();
 
@@ -1083,7 +1083,7 @@ TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
   }
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {2000, 0, 0, 0}, 5,
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {2000, 0, 0, 0}, 5,
                          /*nprobe=*/1, /*refineCandidates=*/40);
   req->execute();
 
@@ -1126,7 +1126,7 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
 
   // Approximate at nprobe=1: probes blob A's list only; the outlier (true #1,
   // distance 200 vs blob A's best ~399) cannot appear.
-  auto* approx = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* approx = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                             /*nprobe=*/1, /*refineCandidates=*/40);
   approx->execute();
   auto approxIds = resultIds(*approx);
@@ -1138,7 +1138,7 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
 
   // exact: identical request plus the contract flag; hostile nprobe/refine
   // are ignored and the true top-5 comes back in order.
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                          /*nprobe=*/1, /*refineCandidates=*/40, /*exact=*/true);
   req->execute();
 
@@ -1175,7 +1175,7 @@ TEST_F(KnnQueryTest, minScanFractionFloorsExplicitNProbe) {
                   "embedding_v", std::vector<float>{600.0f, 0.0f, 0.0f, 0.0f}));
   h.commit({"*"});
 
-  auto* narrow = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* narrow = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                             /*nprobe=*/1, /*refineCandidates=*/40);
   narrow->execute();
   auto narrowIds = resultIds(*narrow);
@@ -1185,14 +1185,14 @@ TEST_F(KnnQueryTest, minScanFractionFloorsExplicitNProbe) {
     EXPECT_NE(id, "outlier");
   }
 
-  auto* floor = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* floor = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                            /*nprobe=*/1, /*refineCandidates=*/200,
                            /*exact=*/false, /*minScanFraction=*/1.0f);
   floor->execute();
   auto floorIds = resultIds(*floor);
   floor->done();
 
-  auto* exact = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* exact = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                            /*nprobe=*/1, /*refineCandidates=*/200, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
@@ -1231,7 +1231,7 @@ TEST_F(KnnQueryTest, defaultNProbeStaysLeanNotFullScan) {
                   "embedding_v", std::vector<float>{600.0f, 0.0f, 0.0f, 0.0f}));
   h.commit({"*"});
 
-  auto* dflt = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* dflt = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                           /*nprobe=*/0, /*refineCandidates=*/40);
   dflt->execute();
   auto dfltIds = resultIds(*dflt);
@@ -1242,7 +1242,7 @@ TEST_F(KnnQueryTest, defaultNProbeStaysLeanNotFullScan) {
         << "nprobe=0 must stay at the lean index default, not probe every list";
   }
 
-  auto* full = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* full = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                           /*nprobe=*/0, /*refineCandidates=*/200,
                           /*exact=*/false, /*minScanFraction=*/1.0f);
   full->execute();
@@ -1272,13 +1272,13 @@ TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {
                   "embedding_v", std::vector<float>{101.0f, 0.0f, 0.0f, 0.0f}));
   h.commit();
 
-  auto* approx = makeKnnReq(*soluxNode, "embedding_v", {101, 0, 0, 0}, 5,
+  auto* approx = makeKnnReq(*luxirNode, "embedding_v", {101, 0, 0, 0}, 5,
                             /*nprobe=*/2, /*refineCandidates=*/200);
   approx->execute();
   auto approxIds = resultIds(*approx);
   approx->done();
 
-  auto* exact = makeKnnReq(*soluxNode, "embedding_v", {101, 0, 0, 0}, 5,
+  auto* exact = makeKnnReq(*luxirNode, "embedding_v", {101, 0, 0, 0}, 5,
                            /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
@@ -1313,7 +1313,7 @@ TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
   }
   h.commit();
 
-  auto* approx = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* approx = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                             /*nprobe=*/1, /*refineCandidates=*/40);
   approx->execute();
   auto approxIds = resultIds(*approx);
@@ -1323,7 +1323,7 @@ TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
     EXPECT_NE(id, "outlier") << "segment-local nprobe=1 should miss the outlier list";
   }
 
-  auto* exact = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+  auto* exact = makeKnnReq(*luxirNode, "embedding_v", {400, 0, 0, 0}, 5,
                            /*nprobe=*/1, /*refineCandidates=*/40, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
@@ -1386,7 +1386,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   std::vector<float> queryVec{40.3f, 0.0f, 0.0f, 0.0f};
   // refine_candidates covers every live vector, so the terminal rescore is
   // exhaustive and exact parity is guaranteed, not k-means-placement luck.
-  auto* par = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
+  auto* par = makeKnnReq(*luxirNode, "embedding_v", queryVec, 10,
                          /*nprobe=*/0, /*refineCandidates=*/400,
                          /*exact=*/false, /*minScanFraction=*/1.0f);
   par->execute(/*parallel=*/true);
@@ -1394,7 +1394,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   auto parScores = resultScores(*par);
   par->done();
 
-  auto* ser = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
+  auto* ser = makeKnnReq(*luxirNode, "embedding_v", queryVec, 10,
                          /*nprobe=*/0, /*refineCandidates=*/400,
                          /*exact=*/false, /*minScanFraction=*/1.0f);
   ser->execute(/*parallel=*/false);
@@ -1402,7 +1402,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   auto serScores = resultScores(*ser);
   ser->done();
 
-  auto* exact = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
+  auto* exact = makeKnnReq(*luxirNode, "embedding_v", queryVec, 10,
                            /*nprobe=*/0, /*refineCandidates=*/400, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
@@ -1458,14 +1458,14 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
   }
 
   std::vector<float> queryVec{20.2f, 0.0f, 0.0f, 0.0f};
-  auto* par = makeKnnReq(*soluxNode, "emb_vs", queryVec, 10,
+  auto* par = makeKnnReq(*luxirNode, "emb_vs", queryVec, 10,
                          /*nprobe=*/4, /*refineCandidates=*/20);
   par->execute(/*parallel=*/true);
   auto parIds = resultIds(*par);
   auto parScores = resultScores(*par);
   par->done();
 
-  auto* ser = makeKnnReq(*soluxNode, "emb_vs", queryVec, 10,
+  auto* ser = makeKnnReq(*luxirNode, "emb_vs", queryVec, 10,
                          /*nprobe=*/4, /*refineCandidates=*/20);
   ser->execute(/*parallel=*/false);
   auto serIds = resultIds(*ser);
@@ -1505,7 +1505,7 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
         << "segment 0 fell back to flat (below IVF training floor)";
   }
 
-  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.limit(10).getNumber().fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -1557,13 +1557,13 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   }
 
   auto runAndCheck = [&](const std::string& deletedId) {
-    auto* req = makeKnnReq(*soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
                            /*nprobe=*/0, /*refineCandidates=*/200,
                            /*exact=*/false, /*minScanFraction=*/1.0f);
     req->execute();
     auto ids = resultIds(*req);
     req->done();
-    auto* exact = makeKnnReq(*soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+    auto* exact = makeKnnReq(*luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
                              /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
     exact->execute();
     auto exactIds = resultIds(*exact);
@@ -1616,7 +1616,7 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
   h.deleteByIds(dels, UpdateMessage::COMMIT);
 
   auto makeFiltered = [&](bool exact) {
-    auto* req = LocalReq::create(soluxNode->getSearchEngine());
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     configKnn(cur, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
               /*nprobe=*/0, /*refineCandidates=*/200,
@@ -1669,7 +1669,7 @@ TEST_F(KnnQueryTest, filterCacheMatchesUncachedExactAndIvfWithDeletes) {
 
   auto run = [&](bool exact) {
     auto* req = makeKnnFilterReq(
-        *soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+        *luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
         /*nprobe=*/0, /*refineCandidates=*/200, exact,
         exact ? 0.0f : 1.0f);
     req->execute();
@@ -1715,7 +1715,7 @@ TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
   std::vector<std::string> expected;
   for (int repeat = 0; repeat < 5; repeat++) {
     auto* req = makeKnnFilterReq(
-        *soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 8,
+        *luxirNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 8,
         /*nprobe=*/1, /*refineCandidates=*/40, /*exact=*/false);
     req->execute();
     EXPECT_TRUE(req->ok()) << req->toString();
@@ -1744,7 +1744,7 @@ TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
   h.commit({"*"});
 
   auto makeReq = [&](bool wrapInBoolean) {
-    auto* req = LocalReq::create(soluxNode->getSearchEngine());
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     cur.getScores().getNumber().fields({"id"});
     auto knn = [&] {
@@ -1802,7 +1802,7 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v",
+  auto* req = makeKnnReq(*luxirNode, "embedding_v",
                          {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}, 1);
   {
     ExpectLog quiet("Search request failed:");
@@ -1829,7 +1829,7 @@ TEST_F(KnnQueryTest, nanStoredVectorRanksLast) {
   h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 3u);
@@ -1853,7 +1853,7 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   }
   h.commit({"*"});
 
-  auto* capped = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5);
+  auto* capped = makeKnnReq(*luxirNode, "embedding_v", {0, 0, 0, 0}, 5);
   {
     ExpectLog quiet("at candidate cap");  // non-exact falls short of k at the cap
     capped->execute();
@@ -1861,7 +1861,7 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   EXPECT_EQ(capped->getMatchCount(), 2) << "non-exact respects the host cap";
   capped->done();
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5,
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {0, 0, 0, 0}, 5,
                          /*nprobe=*/0, /*refineCandidates=*/0, /*exact=*/true);
   req->execute();
   EXPECT_EQ(req->getMatchCount(), 5) << "exact fulfills k despite the host cap";
@@ -1896,7 +1896,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
   }
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3,
                          /*nprobe=*/4, /*refineCandidates=*/192);
   req->execute();
 
@@ -1951,13 +1951,13 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
   h.deleteByIds(dels, UpdateMessage::COMMIT);
 
   int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3,
                          /*nprobe=*/0, /*refineCandidates=*/200,
                          /*exact=*/false, /*minScanFraction=*/1.0f);
   req->execute();
   auto ids = resultIds(*req);
   req->done();
-  auto* exact = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
+  auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3,
                            /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
@@ -2016,7 +2016,7 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
 
   int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
   int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 4,
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
                          /*nprobe=*/0, /*refineCandidates=*/8,
                          /*exact=*/false, /*minScanFraction=*/1.0f);
   req->execute();
@@ -2031,7 +2031,7 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   int64_t stale1 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(stale1, stale0) << "an engine returned an already-pooled rank post-fold";
 
-  auto* exact = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 4,
+  auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
                            /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
@@ -2064,7 +2064,7 @@ TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   }
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0, 0}, 3,
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {7, 0, 0, 0}, 3,
                          /*nprobe=*/4, /*refineCandidates=*/192);
   req->execute();
 
@@ -2101,7 +2101,7 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
   h.commit({"*"});
 
   auto buildBlue = [&](int32_t nprobe) {
-    auto* req = LocalReq::create(soluxNode->getSearchEngine());
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     configKnn(cur, "embedding_v", {0, 0, 0, 0}, 3, nprobe, /*refineCandidates=*/96);
     addMatchFilter(cur, "blue", "color_s", "blue");
@@ -2134,8 +2134,8 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
 // Note: this used to crash the arena.  TopDocsReq's ctor called createWeight,
 // and protobuf's Arena::Create registered ~T() before the ctor body ran, so a
 // throwing ctor left a half-constructed object scheduled for cleanup.  The fix
-// moved createWeight to TopDocsReq::init() (runs after construction).  Solux now
-// also allocates ops via solux::arenaCreate, which registers the destructor only
+// moved createWeight to TopDocsReq::init() (runs after construction).  Luxir now
+// also allocates ops via luxir::arenaCreate, which registers the destructor only
 // after the ctor succeeds, so a throwing arena ctor is safe regardless.
 TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   CollectionHelper h("main");
@@ -2145,7 +2145,7 @@ TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   h.commit({"*"});
 
   // Query is 3-d but index is 4-d.
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 1);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 1);
   {
     ExpectLog quiet("Search request failed:");
     req->execute();
@@ -2167,7 +2167,7 @@ TEST_F(KnnQueryTest, emptyQueryVectorReturnsErrorResponse) {
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
   h.commit();
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {}, 1);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {}, 1);
   {
     ExpectLog quiet("Search request failed:");
     req->execute();
@@ -2202,7 +2202,7 @@ TEST_F(KnnQueryTest, cosineMetric) {
   h.commit({"*"});
 
   // Non-unit query in +x direction - gets normalized inside KnnQuery::Weight.
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0}, 4);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {7, 0, 0}, 4);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 4);
@@ -2242,7 +2242,7 @@ TEST_F(KnnQueryTest, zeroOnlyCosineSegmentDoesNotPoisonColumnScan) {
   h.index(flatdoc("id", std::string("north"), "embedding_v", std::vector<float>{0, 3, 0}));
   h.commit();
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0}, 2);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {7, 0, 0}, 2);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 2);
@@ -2269,7 +2269,7 @@ TEST_F(KnnQueryTest, l2Scores) {
   h.index(flatdoc("id", std::string("two"), "embedding_v", std::vector<float>{2, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {0, 0}, 3);
   req->execute();
 
   auto ids = resultIds(*req);
@@ -2323,7 +2323,7 @@ TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
   }
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0}, 4);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0}, 4);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 4);
@@ -2364,7 +2364,7 @@ TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
                   std::vector<std::vector<float>>{{0.3f, 0, 0}}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 3);
@@ -2405,7 +2405,7 @@ TEST_F(KnnQueryTest, mixedExactSegmentsSkipColumnRescore) {
   h.index(flatdoc("id", std::string("b2"), "embedding_v", std::vector<float>{0.5f, 0, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 4);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 4);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 4);
@@ -2447,7 +2447,7 @@ TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
   h.index(flatdoc("id", std::string("c"), "embedding_v", std::vector<float>{4, 3, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {7, 0, 0}, 3);
   req->execute();
 
   auto ids = resultIds(*req);

@@ -250,12 +250,12 @@ uaix_static bool segment_word_utf8(struct impl_segment_word_state* const state, 
     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3a
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3b
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (p_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(raw_prop)) // WB3c
         result = false; // NOLINT
@@ -476,12 +476,12 @@ uaix_static bool segment_word_rev_utf8(struct impl_segment_word_state* const sta
     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3a
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3b
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (c_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(state->prev_cp_prop)) // WB3c
         result = false; // NOLINT
@@ -649,12 +649,12 @@ uaix_static bool segment_word_utf16(struct impl_segment_word_state* const state,
     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3a
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3b
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (p_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(raw_prop)) // WB3c
         result = false; // NOLINT
@@ -871,12 +871,12 @@ uaix_static bool segment_word_rev_utf16(struct impl_segment_word_state* const st
     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3a
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3b
     {
         result = true;
-        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
+        *word_prop = 0; // Luxir fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
     }
     else if (c_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(state->prev_cp_prop)) // WB3c
         result = false; // NOLINT

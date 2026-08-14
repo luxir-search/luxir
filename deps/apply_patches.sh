@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply Solux's local patches to the vcpkg roots and the FastPFOR checkout.
+# Apply Luxir's local patches to the vcpkg roots and the FastPFOR checkout.
 # Safe to re-run: patches that are already applied are detected and skipped.
 #
 # Usage: ./apply_patches.sh [VCPKG_ROOT [VCPKG_ASAN_ROOT]]

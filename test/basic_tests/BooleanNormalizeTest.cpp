@@ -9,20 +9,20 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
-#include "solux/query/AllQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/ExistsQuery.h"
-#include "solux/query/ForcePrepareQuery.h"
-#include "solux/query/TermQuery.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ExistsQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/TermQuery.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class BooleanNormalizeTest : public SoluxTest {
+class BooleanNormalizeTest : public LuxirTest {
 protected:
   using ScoreMap = std::map<std::pair<int32_t, int32_t>, float>;
 

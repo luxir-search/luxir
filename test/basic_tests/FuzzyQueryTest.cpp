@@ -5,22 +5,22 @@
 #include <string>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/FuzzyQuery.h"
-#include "solux/query/QueryBuilder.h"
-#include "solux/reader/Postings.h"
-#include "solux/schema/Schema.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/FuzzyQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/search/Collector.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Direct per-segment fuzzy scorer checks.
-class FuzzyQueryTest : public SoluxTest {
+class FuzzyQueryTest : public LuxirTest {
 protected:
   std::vector<int32_t> fuzzyDocs(TestIndex& ti, std::string_view field, std::string_view term,
                                  int maxEdits, int prefixLength, int segOrd, int32_t flags = 0) {
@@ -377,7 +377,7 @@ TEST_F(FuzzyQueryTest, defaultPrefixExcludesLeadingEdit) {
 }
 
 // End-to-end protobuf coverage.
-class FuzzyQueryE2ETest : public SoluxTest {
+class FuzzyQueryE2ETest : public LuxirTest {
 public:
   CollectionHelper helper;
 

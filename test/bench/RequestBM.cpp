@@ -1,11 +1,11 @@
 #include "oneapi/tbb/task_group.h"
-#include "bench/solux_bench.h"
-#include "test/GrpcSoluxTest.h"
+#include "bench/luxir_bench.h"
+#include "test/GrpcLuxirTest.h"
 #include "test/GrpcClient.h"
 
 
-using namespace solux;
-using namespace solux::test;  // HppClientReaderWriter, Reply, rpc::*
+using namespace luxir;
+using namespace luxir::test;  // HppClientReaderWriter, Reply, rpc::*
 
 // about 1.2% slower when not ommitting frame pointer
 // adding term hashes (without using them) resulted in a slowdown of ~1%
@@ -15,16 +15,16 @@ using namespace solux::test;  // HppClientReaderWriter, Reply, rpc::*
 static void BM_Req(benchmark::State& state, int writers, int readers, bool async) {
   unused(writers,readers);
   
-  auto channel = GrpcSoluxTest::getChannel();
-  if (GrpcSoluxTest::startFailed()) {
+  auto channel = GrpcLuxirTest::getChannel();
+  if (GrpcLuxirTest::startFailed()) {
     state.SkipWithError("gRPC test server failed to start in this environment");
     return;
   }
 
-  solux::api::HelloRequest req;
-  Reply<solux::api::HelloReply> result;
+  luxir::api::HelloRequest req;
+  Reply<luxir::api::HelloReply> result;
   grpc::ClientContext context;  // need a new one for each RPC
-  HppClientReaderWriter<solux::api::HelloRequest, solux::api::HelloReply> stream(
+  HppClientReaderWriter<luxir::api::HelloRequest, luxir::api::HelloReply> stream(
     channel.get(), rpc::SayHelloStreaming, &context);
 
   oneapi::tbb::task_group tasks;

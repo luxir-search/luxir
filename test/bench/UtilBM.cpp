@@ -1,17 +1,17 @@
 #include <benchmark/benchmark.h>
 #include <random>
-#include "solux/util/random.h"
-#include "solux/util/heap.h"
-#include "solux/util/solux_util.h"
+#include "luxir/util/random.h"
+#include "luxir/util/heap.h"
+#include "luxir/util/luxir_util.h"
 #include "gtest/gtest.h"
 
-using namespace solux;
+using namespace luxir;
 
 
 /*
  We get a good benefit to updating top, even when comparisons are extremely cheap!
- (and small heaps will be common when merging segments in solux)
-NOTE: the UpdateTopOnly variant that uses solux::update_heap_top to pop as well is slower than
+ (and small heaps will be common when merging segments in luxir)
+NOTE: the UpdateTopOnly variant that uses luxir::update_heap_top to pop as well is slower than
  using std::heap_pop (the UpdateTop variant).  This menas our update_heap_top could still be improved
  even though it's still a win over a pop_heap/push_heap pair.
 
@@ -336,12 +336,12 @@ BENCHMARK(BM_heap<UpdateTopIdx>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<UpdateTopOnly>)->RangeMultiplier(2)->Range(1, 1<<10);
 #else
 inline void hackety_hack() {
-  solux::unused(hackety_hack);
-  solux::unused(BM_heap<HeapStd>);
-  solux::unused(BM_heap<UpdateTop>);
-  solux::unused(BM_heap<indirectPQ>);
-  solux::unused(BM_heap<indexedPQ>);
-  solux::unused(BM_heap<UpdateTopIdx>);
-  solux::unused(BM_heap<UpdateTopOnly>);
+  luxir::unused(hackety_hack);
+  luxir::unused(BM_heap<HeapStd>);
+  luxir::unused(BM_heap<UpdateTop>);
+  luxir::unused(BM_heap<indirectPQ>);
+  luxir::unused(BM_heap<indexedPQ>);
+  luxir::unused(BM_heap<UpdateTopIdx>);
+  luxir::unused(BM_heap<UpdateTopOnly>);
 }
 #endif

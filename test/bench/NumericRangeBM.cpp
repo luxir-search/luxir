@@ -8,15 +8,15 @@
 #include <string_view>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/query/NumericRangeQuery.h"
-#include "solux/schema/Schema.h"
-#include "solux/util/random.h"
+#include "bench/luxir_bench.h"
+#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/util/random.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -77,8 +77,8 @@ class NumericRangeBenchIndex {
 
 public:
   NumericRangeBenchIndex()
-      : numDocs(solux::unit_tests
-            ? (int32_t)SoluxTest::scaleTestWork(5'120)
+      : numDocs(luxir::unit_tests
+            ? (int32_t)LuxirTest::scaleTestWork(5'120)
             : 512'000) {
     SchemaBuilder b;
     for (const FieldSpec& spec : FIELDS) {
@@ -188,7 +188,7 @@ int32_t fullScanCount(NumericRangeBenchIndex& fixture, const FieldSpec& field,
 void BM_NumericRangePoints(benchmark::State& state, FieldShape shape,
                            BenchArm arm) {
   int32_t perMille = (int32_t)state.range(0);
-  if (solux::unit_tests && !unitTestSelectivity(perMille)) {
+  if (luxir::unit_tests && !unitTestSelectivity(perMille)) {
     state.SkipWithMessage("reduced unit-test selectivity sweep");
     return;
   }

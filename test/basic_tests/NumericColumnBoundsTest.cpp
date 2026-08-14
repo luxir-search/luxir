@@ -3,16 +3,16 @@
 #include <limits>
 #include <optional>
 
-#include "solux/index/IntColWriter.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/util/NumericUtils.h"
-#include "solux/value/ValueExprParser.h"
+#include "luxir/index/IntColWriter.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/util/NumericUtils.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -29,7 +29,7 @@ std::optional<IntColReader::EncodedBounds> readBounds(
 
 } // namespace
 
-class NumericColumnBoundsTest : public SoluxTest {};
+class NumericColumnBoundsTest : public LuxirTest {};
 
 TEST_F(NumericColumnBoundsTest, emptyWriterHasNoBounds) {
   RAMDir directory;

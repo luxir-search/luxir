@@ -7,17 +7,17 @@
 #include <string>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/PrefixQuery.h"
-#include "solux/query/QueryPrep.h"
-#include "solux/query/TermQuery.h"
-#include "solux/reader/DocsEnum.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/PrefixQuery.h"
+#include "luxir/query/QueryPrep.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/reader/DocsEnum.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 using ScorerMode = MultiTermQuery::Weight::ScorerMode;
 
@@ -268,7 +268,7 @@ void expectMultiTermShape(const Query::ScorerShape& shape,
 
 }  // namespace
 
-class MultiTermScorerModesTest : public SoluxTest {};
+class MultiTermScorerModesTest : public LuxirTest {};
 
 TEST_F(MultiTermScorerModesTest, pulsedSparseParity) {
   TestIndex ti;

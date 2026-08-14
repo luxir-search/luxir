@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "solux/reader/Postings.h"
+#include "luxir/reader/Postings.h"
 #include "test/TestIndex.h"
 
 #include <algorithm>
@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   auto schema = std::make_shared<Schema>();
@@ -37,7 +37,7 @@ TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   index.initReader();
   ASSERT_EQ(1u, index.reader->segments().size());
 
-  const char* dumpPath = std::getenv("SOLUX_BYTE_DUMP");
+  const char* dumpPath = std::getenv("LUXIR_BYTE_DUMP");
   if (dumpPath == nullptr) return;
   uint64_t segId = index.reader->segments()[0].segInfo.seg_id;
   std::string prefix = Postings::getIndexFileNamePrefix(segId);

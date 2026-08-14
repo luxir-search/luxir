@@ -11,21 +11,21 @@
 #include <unordered_set>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/index/TrieBuilder.h"
-#include "solux/query/FuzzyQuery.h"
-#include "solux/query/Query.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/FuzzySeekEnum.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/reader/TermsEnum.h"
-#include "solux/search/Collector.h"
-#include "solux/store/Directory.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/index/TrieBuilder.h"
+#include "luxir/query/FuzzyQuery.h"
+#include "luxir/query/Query.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/FuzzySeekEnum.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/TermsEnum.h"
+#include "luxir/search/Collector.h"
+#include "luxir/store/Directory.h"
 #include "test/SegmentTest.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -42,20 +42,20 @@ constexpr int32_t kDenseVariantTerms = 2;
 constexpr int32_t kStatsMaxDocs = 300000;
 
 int32_t denseTargetTerms() {
-  return solux::unit_tests
-      ? (int32_t)SoluxTest::scaleTestDimension(8, 2)
+  return luxir::unit_tests
+      ? (int32_t)LuxirTest::scaleTestDimension(8, 2)
       : kDenseTargetTerms;
 }
 
 int32_t denseExactDocsPerTerm() {
-  return solux::unit_tests
-      ? (int32_t)SoluxTest::scaleTestDimension(24, 2)
+  return luxir::unit_tests
+      ? (int32_t)LuxirTest::scaleTestDimension(24, 2)
       : kDenseExactDocsPerTerm;
 }
 
 int32_t denseVariantDocsPerTerm() {
-  return solux::unit_tests
-      ? (int32_t)SoluxTest::scaleTestDimension(32, 2)
+  return luxir::unit_tests
+      ? (int32_t)LuxirTest::scaleTestDimension(32, 2)
       : kDenseVariantDocsPerTerm;
 }
 
@@ -204,7 +204,7 @@ public:
   int64_t trieBytes = 0;
 
   TermSeekCorpus(TermSource sourceIn, int32_t termCount, uint64_t seedIn)
-      : nTerms(termCount), buildEffort(SoluxTest::effort),
+      : nTerms(termCount), buildEffort(LuxirTest::effort),
         seed(seedIn), source(sourceIn) {
     build();
   }
@@ -397,14 +397,14 @@ std::shared_ptr<TermSeekCorpus> getTermSeekCorpus(TermSource source) {
   if (source != TermSource::DECIMAL && dictWords().empty()) {
     return nullptr;  // no system word list on this machine; caller skips
   }
-  int32_t nTerms = solux::unit_tests ? kUnitTerms : kBenchTerms;
-  uint64_t seed = solux::unit_tests ? SoluxTest::rng_seed : 0x51f15eeda5c0ffeeull;
+  int32_t nTerms = luxir::unit_tests ? kUnitTerms : kBenchTerms;
+  uint64_t seed = luxir::unit_tests ? LuxirTest::rng_seed : 0x51f15eeda5c0ffeeull;
 
   static std::array<std::shared_ptr<TermSeekCorpus>,
                     (size_t)TermSource::COUNT> corpora;
   auto& corpus = corpora[(size_t)source];
   if (corpus == nullptr || corpus->source != source
-      || corpus->buildEffort != SoluxTest::effort || corpus->seed != seed
+      || corpus->buildEffort != LuxirTest::effort || corpus->seed != seed
       || (source == TermSource::DECIMAL && corpus->nTerms != nTerms)) {
     corpus = std::make_shared<TermSeekCorpus>(source, nTerms, seed);
   }
@@ -583,7 +583,7 @@ static void BM_TermStats_postings(benchmark::State& state, TermSource source) {
       Similarity::TermStats stats;
       bool found = lookupTermStatsPostings(pool, reader, *cachedFieldInfo, term, stats);
       assert(found);
-      if (solux::unit_tests) {
+      if (luxir::unit_tests) {
         Similarity::TermStats dictStats;
         bool dictFound = context.lookupTermStats(*cachedFieldInfo, term, dictStats);
         ASSERT_EQ(dictFound, found);
@@ -649,8 +649,8 @@ static void BM_FuzzyTopK(benchmark::State& state) {
   IndexReader& reader = corpus->statsReader();
 
   std::vector<std::string> queries;
-  int32_t queryTarget = solux::unit_tests
-      ? (int32_t)SoluxTest::scaleTestWork(4)
+  int32_t queryTarget = luxir::unit_tests
+      ? (int32_t)LuxirTest::scaleTestWork(4)
       : 64;
   int32_t stride = std::max(1, (int32_t)corpus->denseOrds.size() / queryTarget);
   for (int32_t i = 0; i < (int32_t)corpus->denseOrds.size()
@@ -714,25 +714,25 @@ static void BM_FuzzyTopK(benchmark::State& state) {
 
 // Grouped by source to keep related result rows together. The per-source corpus
 // cache also avoids rebuilding WORDS after the COMPOUND fuzzy cases.
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, decimal, TermSource::DECIMAL);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, decimal, TermSource::DECIMAL);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, decimal, TermSource::DECIMAL);
-SOLUX_BENCHMARK_CAPTURE(BM_TermStats_dict, decimal, TermSource::DECIMAL);
-SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, decimal, TermSource::DECIMAL);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, words, TermSource::WORDS);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, words, TermSource::WORDS);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, words, TermSource::WORDS);
-SOLUX_BENCHMARK_CAPTURE(BM_TermStats_dict, words, TermSource::WORDS);
-SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, words, TermSource::WORDS);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, compound, TermSource::COMPOUND);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, compound, TermSource::COMPOUND);
-SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, compound, TermSource::COMPOUND);
-SOLUX_BENCHMARK_CAPTURE(BM_TermStats_dict, compound, TermSource::COMPOUND);
-SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, compound, TermSource::COMPOUND);
-SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, compound_e2, TermSource::COMPOUND, 2);
-SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e1, TermSource::WORDS, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e2, TermSource::WORDS, 2);
-SOLUX_BENCHMARK(BM_FuzzyTopK);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, decimal, TermSource::DECIMAL);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, decimal, TermSource::DECIMAL);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, decimal, TermSource::DECIMAL);
+LUXIR_BENCHMARK_CAPTURE(BM_TermStats_dict, decimal, TermSource::DECIMAL);
+LUXIR_BENCHMARK_CAPTURE(BM_TermStats_postings, decimal, TermSource::DECIMAL);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, words, TermSource::WORDS);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, words, TermSource::WORDS);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, words, TermSource::WORDS);
+LUXIR_BENCHMARK_CAPTURE(BM_TermStats_dict, words, TermSource::WORDS);
+LUXIR_BENCHMARK_CAPTURE(BM_TermStats_postings, words, TermSource::WORDS);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, compound, TermSource::COMPOUND);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, compound, TermSource::COMPOUND);
+LUXIR_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, compound, TermSource::COMPOUND);
+LUXIR_BENCHMARK_CAPTURE(BM_TermStats_dict, compound, TermSource::COMPOUND);
+LUXIR_BENCHMARK_CAPTURE(BM_TermStats_postings, compound, TermSource::COMPOUND);
+LUXIR_BENCHMARK_CAPTURE(BM_FuzzyEnum, compound_e2, TermSource::COMPOUND, 2);
+LUXIR_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e1, TermSource::WORDS, 1);
+LUXIR_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e2, TermSource::WORDS, 2);
+LUXIR_BENCHMARK(BM_FuzzyTopK);
 // about 1.2% slower when not ommitting frame pointer
 // adding term hashes (without using them) resulted in a slowdown of ~1%
 // med is about 5% slower than small (before any optimizations like using hashes or pulling out prefixes from block starts)
@@ -743,10 +743,10 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
   // int nTerms=1000000;
   int nTerms=1000000;
   uint64_t seed = 1;
-  if (solux::unit_tests) {
-    nTerms = SoluxTest::rng.rint(
-        1, (int32_t)SoluxTest::scaleTestWork(Postings::TERMS_BLOCK_SIZE * 10));
-    seed = SoluxTest::rng_seed;
+  if (luxir::unit_tests) {
+    nTerms = LuxirTest::rng.rint(
+        1, (int32_t)LuxirTest::scaleTestWork(Postings::TERMS_BLOCK_SIZE * 10));
+    seed = LuxirTest::rng_seed;
   }
   auto fname = "myfield";
 

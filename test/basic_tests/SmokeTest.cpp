@@ -1,19 +1,19 @@
 // Standalone validation of the concrete-API test infra: exercises CollectionHelper
-// (Doc -> concrete solux::api::Map build-by-backing, blocking + async update) and LocalReq
+// (Doc -> concrete luxir::api::Map build-by-backing, blocking + async update) and LocalReq
 // (fluent OpCursor builder -> non-owning response via Val accessors) end to end.
 
 #include <memory_resource>
 
 #include <gtest/gtest.h>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class SmokeTest : public SoluxTest {};
+class SmokeTest : public LuxirTest {};
 
 // convertDocToProto covers every FieldVal arm; this builds a doc with all of them into an
 // arena and checks each Val variant arm (including the vector arms the engine round-trip
@@ -33,13 +33,13 @@ TEST_F(SmokeTest, ConvertDocAllArmsRoundTrip) {
   );
 
   std::pmr::monotonic_buffer_resource arena;
-  solux::api::Map map;
+  luxir::api::Map map;
   CollectionHelper::convertDocToProto(doc, map, arena);
 
   // map.fields is a flat span of {key, indirect_view<Val>} pairs (build order, no hashing),
   // so look fields up by linear scan.
-  static const solux::api::Val kMissing;
-  auto arm = [&](const char* name) -> const solux::api::Val& {
+  static const luxir::api::Val kMissing;
+  auto arm = [&](const char* name) -> const luxir::api::Val& {
     for (const auto& kv : map.fields) {
       if (kv.first == name) return *kv.second;
     }
@@ -53,24 +53,24 @@ TEST_F(SmokeTest, ConvertDocAllArmsRoundTrip) {
   EXPECT_DOUBLE_EQ(std::get<double>(arm("d").kind), 2.5);
   EXPECT_EQ(std::get<std::string_view>(arm("s").kind), "hello");
 
-  const auto& ai = std::get<solux::api::ArrInt>(arm("ai").kind).v;
+  const auto& ai = std::get<luxir::api::ArrInt>(arm("ai").kind).v;
   ASSERT_EQ(ai.size(), 3u);
   EXPECT_EQ(ai[0], 1); EXPECT_EQ(ai[2], 3);
 
-  const auto& af = std::get<solux::api::Vector>(arm("af").kind).f32;
+  const auto& af = std::get<luxir::api::Vector>(arm("af").kind).f32;
   ASSERT_TRUE(af.has_value());
   ASSERT_EQ(af->v.size(), 4u);
   EXPECT_FLOAT_EQ(af->v[3], 4);
 
-  const auto& ad = std::get<solux::api::ArrDouble>(arm("ad").kind).v;
+  const auto& ad = std::get<luxir::api::ArrDouble>(arm("ad").kind).v;
   ASSERT_EQ(ad.size(), 2u);
   EXPECT_DOUBLE_EQ(ad[1], 2.2);
 
-  const auto& as = std::get<solux::api::ArrStr>(arm("as").kind).v;
+  const auto& as = std::get<luxir::api::ArrStr>(arm("as").kind).v;
   ASSERT_EQ(as.size(), 2u);
   EXPECT_EQ(as[0], "x"); EXPECT_EQ(as[1], "y");
 
-  const auto& av = std::get<solux::api::ArrVector>(arm("av").kind).v;
+  const auto& av = std::get<luxir::api::ArrVector>(arm("av").kind).v;
   ASSERT_EQ(av.size(), 2u);
   ASSERT_TRUE(av[0].f32.has_value());
   EXPECT_EQ(av[0].f32->v.size(), 2u);

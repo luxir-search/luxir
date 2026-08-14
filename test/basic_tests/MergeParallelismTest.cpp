@@ -1,15 +1,15 @@
 #include <algorithm>
 #include <gtest/gtest.h>
 
-#include "solux/index/MergeCostModel.h"
-#include "solux/reader/Postings.h"
-#include "solux/server/SoluxNode.h"
+#include "luxir/index/MergeCostModel.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/server/LuxirNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -122,7 +122,7 @@ int mergedSegmentFileCount(CollectionHelper& helper) {
 } // namespace
 
 TEST(MergeParallelismTest, SerialAndParallelMergedContentEquivalent) {
-  auto& budget = SoluxTest::soluxNode->getIndexRamBudget();
+  auto& budget = LuxirTest::luxirNode->getIndexRamBudget();
   BudgetTotalGuard guard(budget);
   CollectionHelper helper("main");
 
@@ -144,7 +144,7 @@ TEST(MergeParallelismTest, SerialAndParallelMergedContentEquivalent) {
 }
 
 TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
-  auto& budget = SoluxTest::soluxNode->getIndexRamBudget();
+  auto& budget = LuxirTest::luxirNode->getIndexRamBudget();
   BudgetTotalGuard guard(budget);
   budget.setTotalBytes(0);
 

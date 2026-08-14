@@ -5,24 +5,24 @@
 #include <string>
 #include <vector>
 
-#include "solux/index/IndexRamBudget.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/MergeCostModel.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/reader/StoredFieldsReader.h"
-#include "solux/schema/Schema.h"
-#include "solux/search/IndexReader.h"
-#include "solux/server/SoluxNode.h"
-#include "solux/store/Directory.h"
-#include "solux/util/Signal.h"
-#include "solux/util/solux_util.h"
+#include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/MergeCostModel.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/StoredFieldsReader.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/server/LuxirNode.h"
+#include "luxir/store/Directory.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
-using IndexMode = solux::api::FieldDef::IndexMode;
+using namespace luxir;
+using IndexMode = luxir::api::FieldDef::IndexMode;
 
 class StoredFieldsTest : public ::testing::Test {
 protected:
@@ -334,7 +334,7 @@ TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
       iw.commit();
     }
 
-    solux::Signal::listen("segmentMergeBody",
+    luxir::Signal::listen("segmentMergeBody",
         [&budget, &maxReserved](void*, void*, void*) -> void* {
           int64_t reserved = budget.reservedBytes();
           int64_t prev = maxReserved.load(std::memory_order_relaxed);
@@ -344,8 +344,8 @@ TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
           }
           return nullptr;
         });
-    auto cleanup = solux::scope_guard([]() {
-      solux::Signal::unlisten("segmentMergeBody");
+    auto cleanup = luxir::scope_guard([]() {
+      luxir::Signal::unlisten("segmentMergeBody");
     });
 
     iw.mergeSegments();
@@ -609,10 +609,10 @@ TEST_F(StoredFieldsTest, emptySegment) {
 
 // End-to-end: a STORED TEXT field should come back in search results when
 // requested via TopDocs.fields.
-class StoredFieldsSearchTest : public solux::SoluxTest {};
+class StoredFieldsSearchTest : public luxir::LuxirTest {};
 
 TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -669,7 +669,7 @@ TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
 // STORED, so values come back in search results out of the box with no
 // schema customization.
 TEST_F(StoredFieldsSearchTest, defaultTSuffixIsStored) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
   // Ensure we're on the default schema.
@@ -722,7 +722,7 @@ TEST_F(StoredFieldsSearchTest, defaultTSuffixIsStored) {
 // through the stored-fields resource.  Verify single-valued and multi-valued
 // work end-to-end.
 TEST_F(StoredFieldsSearchTest, storedStringField) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -732,12 +732,12 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
   {
     SchemaBuilder b;
     auto& f = b.field("label");
-    f.type = solux::api::FieldDef::FieldClass::STRING;
+    f.type = luxir::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
     f.column = false;
     f.stored = true;
     auto& f2 = b.field("aliases");
-    f2.type = solux::api::FieldDef::FieldClass::STRING;
+    f2.type = luxir::api::FieldDef::FieldClass::STRING;
     f2.index = IndexMode::MATCH;
     f2.column = false;
     f2.multi = true;
@@ -777,7 +777,7 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
 // column (faster; no LZ4 decompression).  The stored-fields copy is written
 // but unused for retrieval - it's only consulted when there is no column.
 TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -785,7 +785,7 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
   // Column-only (not indexed) STRING that is also STORED.
   SchemaBuilder b;
   auto& f = b.field("tag");
-  f.type = solux::api::FieldDef::FieldClass::STRING;
+  f.type = luxir::api::FieldDef::FieldClass::STRING;
   f.index = IndexMode::NONE;
   f.column = true;
   f.stored = true;
@@ -818,7 +818,7 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
 // different chunks, different decompression - and the right values land
 // in the response.
 TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -830,11 +830,11 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
       std::make_shared<StoredFieldType>("_stored_embeddings_");
   SchemaBuilder b;
   auto& body = b.field("body");
-  body.type = solux::api::FieldDef::FieldClass::TEXT;
+  body.type = luxir::api::FieldDef::FieldClass::TEXT;
   body.index = IndexMode::MATCH;
   body.stored = true;
   auto& para = b.field("paragraphs");
-  para.type = solux::api::FieldDef::FieldClass::TEXT;
+  para.type = luxir::api::FieldDef::FieldClass::TEXT;
   para.index = IndexMode::MATCH;
   para.stored = true;
   para.stored_resource = "_stored_embeddings_";
@@ -869,7 +869,7 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
 // with other stored fields in the same chunk (one decompression per doc) may
 // opt in; others can leave STORED off and rely on column retrieval.
 TEST_F(StoredFieldsSearchTest, storedIdField) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -902,7 +902,7 @@ TEST_F(StoredFieldsSearchTest, storedIdField) {
 // that field.  Retrieval should pull from stored fields for new segments
 // and fall back to the column for old ones - no empty slots.
 TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -911,7 +911,7 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
     auto schema = Schema::createDefaultSchema();
     SchemaBuilder b;
     auto& f = b.field("name");
-    f.type = solux::api::FieldDef::FieldClass::STRING;
+    f.type = luxir::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
     f.column = true;
     f.stored = false;
@@ -928,7 +928,7 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
     auto schema = Schema::createDefaultSchema();
     SchemaBuilder b;
     auto& f = b.field("name");
-    f.type = solux::api::FieldDef::FieldClass::STRING;
+    f.type = luxir::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
     f.column = false;
     f.stored = true;
@@ -967,7 +967,7 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
 // values come back, including for a value that only exists in the stored
 // resource (no column) AND for one that exists in both.
 TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
 
@@ -977,7 +977,7 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
   {
     SchemaBuilder b;
     auto& f = b.field("author");
-    f.type = solux::api::FieldDef::FieldClass::STRING;
+    f.type = luxir::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::NONE;
     f.column = true;
     f.stored = true;
@@ -1019,7 +1019,7 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
 // covers the grouping path - correctness only; we can't easily observe the
 // decompression count from test code.
 TEST_F(StoredFieldsSearchTest, multipleFieldsShareResource) {
-  using namespace solux::test;
+  using namespace luxir::test;
 
   CollectionHelper ch;
   ch.collection().setSchema(Schema::createDefaultSchema());

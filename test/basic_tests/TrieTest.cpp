@@ -9,11 +9,11 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/index/TrieBuilder.h"
-#include "solux/reader/TrieReader.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/TrieBuilder.h"
+#include "luxir/reader/TrieReader.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -310,7 +310,7 @@ TEST(TrieTest, FuzzMatchesReference) {
   bool sawArray = false;
   bool sawReverse = false;
 
-  uint32_t rounds = (uint32_t)SoluxTest::scaleTestWork(40);
+  uint32_t rounds = (uint32_t)LuxirTest::scaleTestWork(40);
   for (uint32_t round = 0; round < rounds; round++) {
     std::vector<std::string> keys = makeFuzzKeys(rng, round);
     ASSERT_FALSE(keys.empty());

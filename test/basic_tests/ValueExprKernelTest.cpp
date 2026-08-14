@@ -6,13 +6,13 @@
 #include <string>
 #include <vector>
 
-#include "solux/value/ValueExprParser.h"
+#include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -29,7 +29,7 @@ ValueProgram* parseValue(ArenaOwner& memory, Schema& schema, std::string_view ex
 
 } // namespace
 
-class ValueExprKernelTest : public SoluxTest {};
+class ValueExprKernelTest : public LuxirTest {};
 
 TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   CollectionHelper helper;

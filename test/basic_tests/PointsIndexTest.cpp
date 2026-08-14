@@ -8,20 +8,20 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/index/PointsWriter.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/IntColReader.h"
-#include "solux/reader/PointsReader.h"
-#include "solux/store/Directory.h"
-#include "solux/util/NumericUtils.h"
+#include "luxir/index/PointsWriter.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/IntColReader.h"
+#include "luxir/reader/PointsReader.h"
+#include "luxir/store/Directory.h"
+#include "luxir/util/NumericUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -121,7 +121,7 @@ SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader,
 
 } // namespace
 
-class PointsIndexTest : public SoluxTest {};
+class PointsIndexTest : public LuxirTest {};
 
 TEST_F(PointsIndexTest, leafBoundariesAndDirectory) {
   std::vector<Point> points = {

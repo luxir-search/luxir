@@ -11,20 +11,20 @@
 #include <utility>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/search/DocSet.h"
-#include "solux/search/FilterCache.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/search/DocSet.h"
+#include "luxir/search/FilterCache.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
-namespace build = solux::api::build;
+namespace api = luxir::api;
+namespace build = luxir::api::build;
 
 namespace {
 
@@ -130,7 +130,7 @@ struct UnscoredOptionalDropGuard {
 
 // Randomized differential test for boolean matching. body_w uses identity
 // analysis for this vocabulary, so the oracle can evaluate raw tokens.
-class BooleanFuzzTest : public SoluxTest {
+class BooleanFuzzTest : public LuxirTest {
 public:
   CollectionHelper helper;
   // A wide vocabulary over short docs keeps terms sparse, so a clause is often
@@ -918,7 +918,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
   auto savedCache = helper.getIndexWriter()->filterCache;
   helper.getIndexWriter()->filterCache = cache;
   struct CacheRestore {
-    solux::test::CollectionHelper& helper;
+    luxir::test::CollectionHelper& helper;
     std::shared_ptr<FilterCache> saved;
     ~CacheRestore() { helper.getIndexWriter()->filterCache = saved; }
   } cacheRestore{helper, std::move(savedCache)};

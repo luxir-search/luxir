@@ -1,6 +1,6 @@
-# Operating Solux
+# Operating Luxir
 
-Solux currently has a deliberately narrow deployment model: one process uses
+Luxir currently has a deliberately narrow deployment model: one process uses
 one machine well and can host many isolated collections. Scale the machine for
 capacity. Replication, sharding across nodes, failover orchestration, snapshots,
 and a collection-management API are not built into the server yet.
@@ -15,13 +15,13 @@ The default backend is in-memory and loses every collection when the process
 exits:
 
 ```bash
-solux
+luxir
 ```
 
 Use the filesystem backend for durable data:
 
 ```bash
-solux --store.backend=fs --store.data-dir=/srv/solux/data
+luxir --store.backend=fs --store.data-dir=/srv/luxir/data
 ```
 
 Each collection is an independent index below the data directory. Collections
@@ -38,7 +38,7 @@ Use local storage with reliable `fsync` and atomic-rename behavior. The optional
 checked-directory mode diagnoses filesystems that violate the sync assumptions:
 
 ```bash
-solux --store.backend=fs --store.data-dir=/srv/solux/data \
+luxir --store.backend=fs --store.data-dir=/srv/luxir/data \
       --store.checked-dir.sync=warn
 ```
 
@@ -60,7 +60,7 @@ against the same directory fails to start rather than corrupting the index.
 `--read-only` opens an existing data directory without that lock:
 
 ```bash
-solux --read-only --store.backend=fs --store.data-dir=/srv/solux/data
+luxir --read-only --store.backend=fs --store.data-dir=/srv/luxir/data
 ```
 
 A read-only node writes nothing at all - no lock file, no trash directory, not
@@ -90,7 +90,7 @@ Restart the read-only node to pick up newer commits and release pinned files.
 ## Collection lifecycle
 
 Create and delete collections with `POST /collections/_create` and
-`POST /collections/_delete` (or unary `solux.Admin/CreateCollection` /
+`POST /collections/_delete` (or unary `luxir.Admin/CreateCollection` /
 `DeleteCollection`). Deleting a collection also deletes its stored data; there
 is no undo.
 
@@ -143,7 +143,7 @@ Defaults:
 A configured nonzero port binds `0.0.0.0`; there is no listen-address option
 yet. Disable HTTP with `--no-http`. The gRPC server always starts.
 
-Solux does **not** provide TLS, authentication, authorization, per-tenant
+Luxir does **not** provide TLS, authentication, authorization, per-tenant
 quotas, or a permission model. Do not expose either port directly to an
 untrusted network. Bindings currently make network policy mandatory: place the
 process in a private network namespace, firewall both ports, or front them with
@@ -178,7 +178,7 @@ node-wide indexing RAM budget. Per-segment records are omitted by default; add
 load-failure tombstones with their `error` and excludes them from totals. Each
 collection index is sampled coherently, but a node-wide response is not one
 transaction across collections. The same payload is available through unary
-`solux.Admin/Stats`; omit its collection target for the node-wide view.
+`luxir.Admin/Stats`; omit its collection target for the node-wide view.
 
 Counts follow the JSON dialect: a zero-valued field is omitted rather than
 emitted, so a scraper must read an absent field as zero. Totals appear at the
@@ -189,7 +189,7 @@ node and collection totals.
 Set log verbosity with:
 
 ```bash
-solux --log-level=info
+luxir --log-level=info
 ```
 
 Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
@@ -201,7 +201,7 @@ HTTP and gRPC each default to half the detected hardware threads, with a
 minimum of one:
 
 ```bash
-solux --server.http.threads=8 --server.grpc.threads=8
+luxir --server.http.threads=8 --server.grpc.threads=8
 ```
 
 These are network event-loop/completion-queue threads, not the search worker
@@ -226,7 +226,7 @@ of simultaneously slow streams.
 ## Indexing memory and ingest limits
 
 ```bash
-solux \
+luxir \
   --index.max-inverter-ram-mb=64 \
   --index.max-inverter-docs=8388608 \
   --max-index-ram=8192
@@ -240,7 +240,7 @@ solux \
 The HTTP ingest limits distinguish bounded material from streams:
 
 ```bash
-solux \
+luxir \
   --ingest.max-request-body=32MB \
   --ingest.max-record=32MB \
   --ingest.stream-batch-size=1MB \
@@ -267,7 +267,7 @@ across machines if requests must produce identical civil-time boundaries.
 ## Shutdown and recovery
 
 Engine/server components have drainable shutdown paths, but the current
-`solux` executable does not install an application signal handler to invoke
+`luxir` executable does not install an application signal handler to invoke
 them. A normal `SIGTERM`/`SIGINT` therefore terminates the process rather than
 waiting for in-flight requests. Before a planned stop, quiesce producers and
 publish an immediate commit. After an unplanned stop, the filesystem backend
@@ -281,7 +281,7 @@ detected when the affected reader is opened.
 
 ## Current production boundary
 
-Before treating Solux as a production service, account explicitly for the
+Before treating Luxir as a production service, account explicitly for the
 features it does not yet supply:
 
 - single node, with no replication or distributed query execution;

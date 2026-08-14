@@ -4,19 +4,19 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/codec/LinearPack.h"
-#include "solux/index/MergeCostModel.h"
-#include "solux/index/OrdColWriter.h"
-#include "solux/reader/OrdColReader.h"
-#include "solux/search/ops/DomainIter.h"
+#include "luxir/codec/LinearPack.h"
+#include "luxir/index/MergeCostModel.h"
+#include "luxir/index/OrdColWriter.h"
+#include "luxir/reader/OrdColReader.h"
+#include "luxir/search/ops/DomainIter.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -90,7 +90,7 @@ std::vector<char> encodeDocOrds(int32_t count, uint8_t bits) {
 
 } // namespace
 
-class OrdColFormatTest : public SoluxTest {};
+class OrdColFormatTest : public LuxirTest {};
 
 TEST_F(OrdColFormatTest, directDocIdAndRankShapes) {
   OrdFormatGuard guard(OrdColWriter::FormatOverride::DIRECT);
@@ -380,15 +380,15 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatch) {
     OrdFormatGuard guard(format);
     helper.clear();
     helper.indexAll(docs, UpdateMessage::COMMIT);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").getNumber(true).allQuery();
     auto& facet = top.facet("f", field).limit(-1);
-    std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+    std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->toString();
     const auto* result = req->docList("q")->ops.at("f")->facetResult();
-    const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind).v;
+    const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
     FacetOutput out;
     for (size_t i = 0; i < ids.size(); i++) {
       out.buckets.emplace_back(ids[i], result->counts[i]);
@@ -442,17 +442,17 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatchAcrossBlocksAndSparseDomai
     OrdFormatGuard guard(format);
     helper.clear();
     EXPECT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").getNumber(true).limit(10);
     top.rawQuery() = qb::match(top.mr(), "gate_s", "yes");
     auto& facet = top.facet("f", "cat_s").limit(-1);
-    std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+    std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
     EXPECT_OK(req);
     EXPECT_EQ(93, req->getMatchCount());
     const auto* result = req->docList("q")->ops.at("f")->facetResult();
-    const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind).v;
+    const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
     FacetOutput out;
     for (size_t i = 0; i < ids.size(); i++) {
       out.buckets.emplace_back(ids[i], result->counts[i]);
@@ -513,14 +513,14 @@ TEST_F(OrdColFormatTest, stringSortMissingLastAcrossSegmentsBothDirections) {
   helper.index(flatdoc("id_s", "doc6", "name_s", "d"), UpdateMessage::COMMIT);
 
   auto sortedIds = [&](qb::SortDir direction) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").getNumber(true).allQuery().limit(10)
         .fields({"id_s", "name_s"});
     qb::sort(top, "name_s", direction);
     req->execute(false);
     EXPECT_OK(req);
-    const auto& ids = std::get<solux::api::ColStr>(
+    const auto& ids = std::get<luxir::api::ColStr>(
         req->docList("q")->columns.at("id_s").kind).v;
     return std::vector<std::string>(ids.begin(), ids.end());
   };
@@ -551,25 +551,25 @@ TEST_F(OrdColFormatTest, predictedInputSegmentsMergeWithFacetAndSortParity) {
     bool operator==(const Snapshot&) const = default;
   };
   auto snapshot = [&]() {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q").getNumber(true).allQuery().limit(100)
         .fields({"id_s", "sort_s"});
     qb::sort(top, "sort_s", qb::ASC);
     auto& facet = top.facet("f", "cat_s").limit(-1);
-    std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+    std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
     EXPECT_OK(req);
 
     Snapshot out;
     const auto* facetResult = req->docList("q")->ops.at("f")->facetResult();
     const auto& bucketIds =
-        std::get<solux::api::ColStr>(facetResult->bucket_ids->kind).v;
+        std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind).v;
     for (size_t i = 0; i < bucketIds.size(); i++) {
       out.facet.buckets.emplace_back(bucketIds[i], facetResult->counts[i]);
     }
     out.facet.missing = facetResult->missing.value_or(0);
-    const auto& ids = std::get<solux::api::ColStr>(
+    const auto& ids = std::get<luxir::api::ColStr>(
         req->docList("q")->columns.at("id_s").kind).v;
     out.sortedIds.assign(ids.begin(), ids.end());
     return out;

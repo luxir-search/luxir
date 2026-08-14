@@ -1,4 +1,4 @@
-// Golden-wire tests for the Solux JSON dialect (src/solux/api/json_dialect.h): literal
+// Golden-wire tests for the Luxir JSON dialect (src/luxir/api/json_dialect.h): literal
 // JSON text in/out, pinning the surface as a contract rather than a self-round-trip.
 // Val is untagged (a raw JSON value): reads dispatch on the token, writes render the arm
 // bare. Map is a plain object; Vector is a bare number array.
@@ -9,13 +9,13 @@
 #include <string>
 #include <variant>
 
-#include "solux/api/solux_types.hpp"
-#include "solux/api/build.h"
+#include "luxir/api/luxir_types.hpp"
+#include "luxir/api/build.h"
 
 namespace {
 using namespace std::string_view_literals;
-namespace P = solux::api;
-namespace B = solux::api::build;
+namespace P = luxir::api;
+namespace B = luxir::api::build;
 
 P::Val readVal(std::string_view json, std::pmr::memory_resource& mr) {
   P::Val v;

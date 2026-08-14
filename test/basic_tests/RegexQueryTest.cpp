@@ -3,12 +3,12 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class RegexQueryE2ETest : public SoluxTest {
+class RegexQueryE2ETest : public LuxirTest {
 public:
   CollectionHelper helper;
   RegexQueryE2ETest() {

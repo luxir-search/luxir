@@ -1,11 +1,11 @@
-#include "solux/codec/LinearPack.h"
+#include "luxir/codec/LinearPack.h"
 
 #include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 

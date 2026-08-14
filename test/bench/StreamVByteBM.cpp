@@ -1,9 +1,9 @@
 #include <vector>
 #include <cstdint>
-#include "solux/util/random.h"
-#include "solux/util/solux_util.h"
-#include "solux/store/InputStream.h"
-#include "bench/solux_bench.h"
+#include "luxir/util/random.h"
+#include "luxir/util/luxir_util.h"
+#include "luxir/store/InputStream.h"
+#include "bench/luxir_bench.h"
 #include <gtest/gtest.h>
 
 // StreamVByte (FastPFOR deps/FastPFOR/src/streamvbyte.c), C linkage. The _d1 variants
@@ -20,7 +20,7 @@ extern "C" {
                                   uint64_t count, uint32_t prev);
 }
 
-namespace solux {
+namespace luxir {
 
 // n sorted docids; gaps uniform in [1, 2*avgGap] so byte-lengths vary (vint mispredicts).
 static std::vector<uint32_t> genDocs(Rng& rng, uint32_t n, uint32_t avgGap) {
@@ -86,4 +86,4 @@ BENCHMARK_CAPTURE(BM_Tail_vint, n120_sparse, 120, 100000);
 BENCHMARK_CAPTURE(BM_Tail_svb,  n120_sparse_scalar, 120, 100000, false);
 BENCHMARK_CAPTURE(BM_Tail_svb,  n120_sparse, 120, 100000, true);
 
-}  // namespace solux
+}  // namespace luxir

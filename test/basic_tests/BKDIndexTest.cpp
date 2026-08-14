@@ -14,14 +14,14 @@
 #include <oneapi/tbb/global_control.h>
 #include <oneapi/tbb/task_arena.h>
 
-#include "solux/index/BKDWriter.h"
-#include "solux/reader/BKDReader.h"
-#include "solux/store/Directory.h"
-#include "solux/util/geo.h"
-#include "solux/util/random.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/BKDWriter.h"
+#include "luxir/reader/BKDReader.h"
+#include "luxir/store/Directory.h"
+#include "luxir/util/geo.h"
+#include "luxir/util/random.h"
+#include "test/LuxirTest.h"
 
-using namespace solux;
+using namespace luxir;
 
 namespace {
 
@@ -149,7 +149,7 @@ void referenceShape(uint32_t node, uint32_t leaves,
 
 } // namespace
 
-class BKDIndexTest : public SoluxTest {};
+class BKDIndexTest : public LuxirTest {};
 
 TEST_F(BKDIndexTest, roundTripDistributionsExtremesAndLeafBoundaries) {
   SplitMix64 rng(0x42c7e35a);

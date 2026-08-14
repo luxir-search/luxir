@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
 #include <iostream>
 
-#include "solux/index/DocStream.h"
-#include "solux/index/Inverter.h"
-#include "solux/util/TermValHash.h"
+#include "luxir/index/DocStream.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/util/TermValHash.h"
 
 using namespace std;
-using namespace solux;
+using namespace luxir;
 
 TEST(TermValHash, testTypes) {
   // PackedTerm isn't trivial, but it should be trivially copyable

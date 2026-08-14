@@ -1,9 +1,9 @@
 #include <charconv>
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/TestIndex.h"
-#include "solux/index/Inverter.h"
+#include "luxir/index/Inverter.h"
 
-using namespace solux;
+using namespace luxir;
 
 template <class IterType>
 static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, int64_t maxVal, int skip) {

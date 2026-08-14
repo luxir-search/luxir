@@ -5,26 +5,26 @@
 #include <cmath>
 #include <limits>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/PrefixQuery.h"
-#include "solux/query/QueryBuilder.h"
-#include "solux/query/TermQuery.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/schema/Schema.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/PrefixQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/search/Collector.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Drive PrefixQuery::Weight::createScorer directly to assert per-segment doc ids.
-class PrefixQueryTest : public SoluxTest {
+class PrefixQueryTest : public LuxirTest {
 protected:
   // Collect the docs a prefix query matches in one segment, in iteration order.
   std::vector<int32_t> prefixDocs(TestIndex& ti, std::string_view field,
@@ -494,7 +494,7 @@ TEST_F(PrefixQueryTest, fieldTypeValidation) {
 }
 
 // End-to-end coverage for protobuf parsing, query building, and execution.
-class PrefixQueryE2ETest : public SoluxTest {
+class PrefixQueryE2ETest : public LuxirTest {
 public:
   CollectionHelper helper;
 

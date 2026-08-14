@@ -1,14 +1,14 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/schema/Schema.h"
-#include "solux/schema/FieldType.h"
-#include "solux/store/InputStream.h"
-#include "solux/reader/Postings.h"
-#include "solux/api/padded_input.h"
-#include "solux/api/solux_types.hpp"
+#include "luxir/schema/Schema.h"
+#include "luxir/schema/FieldType.h"
+#include "luxir/store/InputStream.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_types.hpp"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
@@ -16,18 +16,18 @@
 #include <memory_resource>
 #include <span>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
-using FieldClass = solux::api::FieldDef::FieldClass;
-using IndexMode = solux::api::FieldDef::IndexMode;
+namespace api = luxir::api;
+using FieldClass = luxir::api::FieldDef::FieldClass;
+using IndexMode = luxir::api::FieldDef::IndexMode;
 
 static std::string schemaFileName(uint64_t gen) {
   return "_schema_" + Postings::getSortableString(gen);
 }
 
-class SchemaTest : public SoluxTest {};
+class SchemaTest : public LuxirTest {};
 
 
 TEST_F(SchemaTest, defaultSchema) {

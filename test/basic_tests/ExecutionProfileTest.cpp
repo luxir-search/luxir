@@ -8,20 +8,20 @@
 #include <thread>
 #include <vector>
 
-#include "solux/api/padded_input.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/SearchOverrides.h"
-#include "solux/server/JsonResponse.h"
+#include "luxir/api/padded_input.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/server/JsonResponse.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-namespace solux::test {
+namespace luxir::test {
 
-class ExecutionProfileTest : public SoluxTest {};
+class ExecutionProfileTest : public LuxirTest {};
 
 namespace {
 
@@ -465,7 +465,7 @@ TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
 
   auto* arena = createArena();
   auto req = LocalReqHandle(
-      solux::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
+      luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
   req->collection("profile_pool").facet("cats", "cat_s").limit(-1);
   helper.getSearchEngine().dispatch(*req.get(), 1);
@@ -474,4 +474,4 @@ TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
   ASSERT_OK(req);
 }
 
-} // namespace solux::test
+} // namespace luxir::test

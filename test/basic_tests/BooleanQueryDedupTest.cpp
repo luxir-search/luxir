@@ -8,19 +8,19 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
-#include "solux/query/AllQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/Collector.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class BooleanQueryDedupTest : public SoluxTest {
+class BooleanQueryDedupTest : public LuxirTest {
 protected:
   struct Hit {
     segdoc doc;
@@ -178,7 +178,7 @@ TEST_F(BooleanQueryDedupTest, wrappedDuplicateTermsPreserveMinMatch) {
                         collectHits(*testIndex.reader, duplicate));
 }
 
-// Solux-defined semantics, split by intent: min_match above half the
+// Luxir-defined semantics, split by intent: min_match above half the
 // clauses is a miss budget (each removed duplicate decrements it, floor 1);
 // min_match at or below half is an absolute distinct-word count (kept,
 // capped at the deduped clause count).

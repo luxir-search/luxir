@@ -6,18 +6,18 @@
 #include <string>
 #include <vector>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/SkipStats.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
+namespace api = luxir::api;
 
 namespace {
 
@@ -49,7 +49,7 @@ struct SkipStatsGuard {
 
 } // namespace
 
-class DisjGroupConjunctionTest : public SoluxTest {
+class DisjGroupConjunctionTest : public LuxirTest {
 public:
   enum class Shape {
     TWO_GROUPS,
@@ -183,7 +183,7 @@ public:
   }
 
   void SetUp() override {
-    SoluxTest::SetUp();
+    LuxirTest::SetUp();
     std::vector<Doc> docs;
     docs.reserve((size_t) numDocs);
     for (int32_t doc = 0; doc < numDocs; doc++) {

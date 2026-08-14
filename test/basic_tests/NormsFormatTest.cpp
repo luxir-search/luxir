@@ -5,13 +5,13 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "solux/query/TermQuery.h"
-#include "test/SoluxTest.h"
+#include "luxir/query/TermQuery.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -94,7 +94,7 @@ void assertTermScores(TestIndex& testIndex, std::string_view field, std::string_
 
 } // namespace
 
-class NormsFormatTest : public SoluxTest {
+class NormsFormatTest : public LuxirTest {
 };
 
 TEST_F(NormsFormatTest, denseFieldUsesFlatNoBitset) {

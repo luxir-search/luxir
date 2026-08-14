@@ -1,15 +1,15 @@
-#include "solux/index/Inverter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class TextMergeTest : public SoluxTest {
+class TextMergeTest : public LuxirTest {
 protected:
 
 };

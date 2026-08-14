@@ -2,14 +2,14 @@
 #include <gtest/gtest.h>
 #include <iostream>
 
-#include "test/SoluxTest.h"
-#include "solux/util/AtomicMerger.h"
+#include "test/LuxirTest.h"
+#include "luxir/util/AtomicMerger.h"
 
 using namespace std;
 
-namespace solux::test {
+namespace luxir::test {
 
-class AtomicMergerTest : public SoluxTest {
+class AtomicMergerTest : public LuxirTest {
 public:
   class Data : public MergeableData {
   public:

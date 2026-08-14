@@ -1,19 +1,19 @@
 #include <gtest/gtest.h>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
-#include "solux/query/TermQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/ForcePrepareQuery.h"
-#include "solux/query/AllQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/AllQuery.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Single-segment corpus: df(a)=6, df(b)=3, df(c)=1, maxDoc=6.
-class ScorerCostTest : public SoluxTest {
+class ScorerCostTest : public LuxirTest {
 public:
   CollectionHelper helper;
   std::shared_ptr<IndexReader> reader;

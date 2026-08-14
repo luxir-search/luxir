@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "solux/index/SegmentMerger.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/reader/PosEnum.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/TermsEnum.h"
+#include "luxir/index/SegmentMerger.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/PosEnum.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/TermsEnum.h"
 #include "test/SegmentTest.h"
 #include "test/TestIndex.h"
 
@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 

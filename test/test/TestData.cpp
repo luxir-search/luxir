@@ -2,7 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include "TestData.h"
-#include "solux/util/log.h"
+#include "luxir/util/log.h"
 
 namespace fs=std::filesystem;
 
@@ -14,7 +14,7 @@ Book::Book() {
 }
 
 void Book::readFile() {
-  auto fname = fs::temp_directory_path() / "solux" / "book.txt";
+  auto fname = fs::temp_directory_path() / "luxir" / "book.txt";
   std::ifstream file(fname, std::ios::binary);
   if (!file) {
     LOG_ERROR("Couldn't read file '{}', try reloading cmake project to download it.", (std::string)fname);

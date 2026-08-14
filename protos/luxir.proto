@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+import "luxir_types.proto";
+
+option java_package = "org.apache.luxir";
+option java_outer_classname = "LuxirProto";
+option objc_class_prefix = "Luxir";
+
+package luxir;
+
+// The greeting service definition.  Just here temporarily as a sanity check around running multiple services
+// as well as having a service that just works.
+service Greeter {
+  // Sends a greeting
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+  rpc SayHello2 (HelloRequest) returns (HelloReply) {}
+  rpc SayHelloStreaming (stream HelloRequest) returns (stream HelloReply) {}
+}
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+  int32 response_count = 2;  // how many responses to send back
+  // the minimum and maximum amount of time to wait before responding (in microseconds)
+  int32 min_sleep_us = 3;
+  int32 max_sleep_us = 4;
+  int32 n_threads = 5;
+  // if async==true, the receiving thread will not take part in request processing (will just hand off to other threads)
+  // if false, the receiving thread will participate (possibly along with other threads) in request processing until
+  // all requests are processed.
+  bool async = 6;
+  bool debug = 7;
+}
+
+// The response message containing the greetings
+message HelloReply {
+  string message = 1;
+  int32 response_number = 2;
+}
+
+
+service Indexer {
+  rpc Update(luxir.proto.UpdateRequest) returns (luxir.proto.UpdateResponse) {}
+  rpc UpdateStream(stream luxir.proto.UpdateRequest) returns (stream luxir.proto.UpdateResponse) {}
+}
+
+service Searcher {
+  // TODO: should we have a non-streaming version for the request? Perhaps if it makes some
+  // clients easier (is this the case?)
+  rpc Search(stream luxir.proto.SearchRequest) returns (stream luxir.proto.SearchResponse) {}
+}
+
+service Admin {
+  rpc SetSchema(luxir.proto.SchemaRequest) returns (luxir.proto.SchemaResponse) {}
+  rpc GetSchema(luxir.proto.SchemaRequest) returns (luxir.proto.SchemaResponse) {}
+  rpc CreateCollection(luxir.proto.CreateCollectionRequest) returns (luxir.proto.CreateCollectionResponse) {}
+  rpc DeleteCollection(luxir.proto.DeleteCollectionRequest) returns (luxir.proto.DeleteCollectionResponse) {}
+  rpc Stats(luxir.proto.StatsRequest) returns (luxir.proto.StatsResponse) {}
+}

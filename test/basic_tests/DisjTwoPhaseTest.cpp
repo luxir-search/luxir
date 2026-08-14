@@ -10,20 +10,20 @@
 #include <string>
 #include <string_view>
 
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/reader/SkipStats.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-namespace api = solux::api;
+namespace api = luxir::api;
 
 namespace {
 
@@ -67,7 +67,7 @@ struct SkipStatsGuard {
 
 } // namespace
 
-class DisjTwoPhaseTest : public SoluxTest {
+class DisjTwoPhaseTest : public LuxirTest {
 public:
   enum class Iteration {
     NEXT,
@@ -337,7 +337,7 @@ public:
   }
 
   void SetUp() override {
-    SoluxTest::SetUp();
+    LuxirTest::SetUp();
     helper.indexAll({
       flatdoc("id", "s0", "body_w", "sa sb"),
       flatdoc("id", "s1", "body_w", "st"),

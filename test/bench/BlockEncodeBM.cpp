@@ -1,15 +1,15 @@
 #include <vector>
-#include "solux/util/random.h"
-#include "solux/util/solux_util.h"
-#include "solux/codec/NumColumnFormat.h"
+#include "luxir/util/random.h"
+#include "luxir/util/luxir_util.h"
+#include "luxir/codec/NumColumnFormat.h"
 #include "test/CodecTest.h"
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include <gtest/gtest.h>
 
 
-namespace solux {
+namespace luxir {
 
-//constexpr uint32_t INT_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
+//constexpr uint32_t INT_BLOCK_SIZE = LuxirPFOR::BLOCK_SIZE;
 constexpr uint32_t INT_BLOCK_SIZE = NumColumnFormat::BLOCK_SIZE;
 
 // TODO: how to chose distribution?  bias toward small values?
@@ -37,7 +37,7 @@ inline void fillBlock(Rng& rng, uint32_t* out, uint32_t outSz, bool sorted) {
 
 static void BM_blockDecode(benchmark::State& state, std::string codecName, uint32_t blockSize, bool sorted, bool testSelect=false) {
   // std::cout << "state.range[0]=" << state.range(0) << std::endl;
-  Rng rng(SoluxTest::global_random_seed);  // make same data for different test variants
+  Rng rng(LuxirTest::global_random_seed);  // make same data for different test variants
 
   auto codec = U32CodecFactory::getCodec(codecName);
 
@@ -82,7 +82,7 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
         codec->decodeBlock(&encoded[i][0], encoded[i].size(), &decoded[i][0], decodedSz);
         ASSERT_EQ(nvalues, decodedSz);
 
-        if (solux::unit_tests) {
+        if (luxir::unit_tests) {
           // state.PauseTiming();
           ASSERT_EQ(nvalues, decodedSz);
           ASSERT_EQ(values[i], decoded[i]);
@@ -106,10 +106,10 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
 
 // TODO: is there a way to get test name and avoid the duplication with codec here?
 BENCHMARK_CAPTURE(BM_blockDecode, SimpleCodec, "SimpleCodec", INT_BLOCK_SIZE, false);
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR128, "SoluxPFOR", 128, false);  // these two codecs only do 128
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFORd128, "SoluxPFORd", 128, true);
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxSIMDFor, "SoluxSIMDFor", INT_BLOCK_SIZE, false);
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxSIMDFor_select, "SoluxSIMDFor", INT_BLOCK_SIZE, false, true);
+BENCHMARK_CAPTURE(BM_blockDecode, LuxirPFOR128, "LuxirPFOR", 128, false);  // these two codecs only do 128
+BENCHMARK_CAPTURE(BM_blockDecode, LuxirPFORd128, "LuxirPFORd", 128, true);
+BENCHMARK_CAPTURE(BM_blockDecode, LuxirSIMDFor, "LuxirSIMDFor", INT_BLOCK_SIZE, false);
+BENCHMARK_CAPTURE(BM_blockDecode, LuxirSIMDFor_select, "LuxirSIMDFor", INT_BLOCK_SIZE, false, true);
 
 
-} // end solux
+} // end luxir

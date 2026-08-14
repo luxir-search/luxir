@@ -4,24 +4,24 @@
 
 #include <gtest/gtest.h>
 
-#include "solux/schema/FieldType.h"
-#include "solux/schema/ValCoerce.h"
-#include "solux/util/DateTime.h"
-#include "solux/util/NumericUtils.h"
+#include "luxir/schema/FieldType.h"
+#include "luxir/schema/ValCoerce.h"
+#include "luxir/util/DateTime.h"
+#include "luxir/util/NumericUtils.h"
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
 
 using namespace std;
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-using ResponseStatus = solux::api::UpdateResponse_::Status;
+using ResponseStatus = luxir::api::UpdateResponse_::Status;
 
-class ValCoerceTest : public SoluxTest {
+class ValCoerceTest : public LuxirTest {
 public:
   static api::Val sval(std::string_view s) { return coerce::scalarVal(s); }
 

@@ -11,19 +11,19 @@
 
 #include <tbb/task_group.h>
 
-#include "bench/solux_bench.h"
+#include "bench/luxir_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/TopKAssert.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/query/PhraseQuery.h"
-#include "solux/query/TermQuery.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/Collector.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/PhraseQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/Collector.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 //
 // Full-text field faceting benchmark.
@@ -382,7 +382,7 @@ ScoreTopKResult runClusteredDisjunctionTopK(IndexReader& reader, int32_t topK,
 // Execution paths are not required to produce bit-identical sums (accepted
 // policy): compare tie-group-aware, per TopKAssert.h.
 void assertSameTopK(const ScoreTopKResult& expected, const ScoreTopKResult& actual) {
-  solux::test::assertTopKEquivalent(expected.topDocs, actual.topDocs);
+  luxir::test::assertTopKEquivalent(expected.topDocs, actual.topDocs);
 }
 
 void buildClusteredScoreTopKIndex(IndexWriter& iw, int64_t nDocs) {
@@ -521,7 +521,7 @@ void buildMsmWandBenchIndex(CollectionHelper& helper, int64_t nDocs) {
   Inverter& inverter = iw->obtainInverter();
   Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
   Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
-  int32_t hotLimit = solux::unit_tests ? 128 : 512;
+  int32_t hotLimit = luxir::unit_tests ? 128 : 512;
 
   std::string body;
   for (int64_t doc = 0; doc < nDocs; doc++) {
@@ -897,7 +897,7 @@ ScoreTopKResult runPhraseFilterConjunctionTopKCounted(IndexReader& reader, int32
 
 }  // namespace
 
-namespace solux {
+namespace luxir {
 
 void buildFullTextBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
   unused(nDocs);
@@ -960,13 +960,13 @@ void buildFullTextBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<
 
   helper.commit();
 
-  if (!solux::unit_tests) {
+  if (!luxir::unit_tests) {
     malloc_trim(0);
     std::println(std::cerr, "Post buildFullTextBenchIndex - Peak RSS: {} KB, current RSS: {} KB", peakRSSKB(), currentRSSKB());
   }
 }
 
-}  // namespace solux
+}  // namespace luxir
 
 //
 // Faceting ON the full-text field body_w (FullTextFacetReq, term-driven counting).
@@ -977,8 +977,8 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
                              std::string_view qterm, bool para) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -1002,7 +1002,7 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
   for (auto _ : state) {
     int64_t ret = 0;
 
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs("q");
 
@@ -1024,8 +1024,8 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
     const auto* facetResult = qDocs->ops.at("f")->facetResult();
     const auto& counts = facetResult->counts;
     // Text faceting buckets are terms (col_s).
-    if (std::holds_alternative<solux::api::ColStr>(facetResult->bucket_ids->kind)) {
-      const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+    if (std::holds_alternative<luxir::api::ColStr>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
       for (int i = 0; i < (int)counts.size(); i++) {
         ret = ret * 31 + java_string_hashcode(bucketIds.v[i]) + counts[i];
       }
@@ -1061,8 +1061,8 @@ static void BM_FullTextScoreTopK(benchmark::State& state, int64_t nDocs, std::st
   int mergeFactor = 10;  // TODO: actually get from IW?
   constexpr int32_t topK = 100;
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -1120,8 +1120,8 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
   int mergeFactor = 10;  // TODO: actually get from IW?
   constexpr int32_t topK = 100;
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   std::vector<int32_t> docsPerSeg;
@@ -1177,8 +1177,8 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
 //
 static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
                                                      DisjunctionMaxScoreMode mode) {
-  int64_t clusteredDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(2'000)
+  int64_t clusteredDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(2'000)
       : 1'000'000;
   constexpr int32_t topK = 100;
   std::vector<int32_t> docsPerSeg = {(int32_t) clusteredDocs};
@@ -1242,8 +1242,8 @@ static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
                                                         CrossSegmentAccumulatorMode mode) {
   constexpr int32_t topK = 100;
   std::vector<int32_t> docsPerSeg;
-  if (solux::unit_tests) {
-    docsPerSeg.assign(4, (int32_t)SoluxTest::scaleTestWork(512));
+  if (luxir::unit_tests) {
+    docsPerSeg.assign(4, (int32_t)LuxirTest::scaleTestWork(512));
   } else {
     docsPerSeg.assign(8, 125000);
   }
@@ -1305,8 +1305,8 @@ static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
 // driving once the top-k threshold rises.
 //
 static void BM_FullTextScoreTopKMsmWand(benchmark::State& state, MsmWandMode mode) {
-  int64_t msmDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(2'000)
+  int64_t msmDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(2'000)
       : 1'000'003;
   constexpr int32_t topK = 100;
   std::vector<int32_t> docsPerSeg = {(int32_t) msmDocs};
@@ -1360,8 +1360,8 @@ static void BM_FullTextScoreTopKMsmWand(benchmark::State& state, MsmWandMode mod
 // have similar norms, so per-block minNorm should be a useful pruning bound.
 //
 static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
-  int64_t clusteredDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(1'000)
+  int64_t clusteredDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(1'000)
       : 1'000'000;
   constexpr int32_t topK = 100;
 
@@ -1409,8 +1409,8 @@ static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
 static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
                                                   FrontierBoundMode mode, bool zipf) {
   constexpr int32_t topK = 100;
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(2'000)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(2'000)
       : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
   // anti-correlated mt0..mt3 (loose corner), vs realistic Zipfian mid-freq terms.
@@ -1436,7 +1436,7 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
   ScoreTopKResult t2 = runMultiTermDisjunctionTopK(*reader, terms, topK, true);
   ScoreTopKResult t1 = runMultiTermDisjunctionTopK(*reader, terms, topK, false);
   assertSameTopK(t2, t1);
-  if (solux::unit_tests && zipf) {
+  if (luxir::unit_tests && zipf) {
     ASSERT_LT(t2.visited, t1.visited);
   }
 
@@ -1493,8 +1493,8 @@ enum class SkipQueryClass {
 static void BM_SkipEffectiveness(benchmark::State& state,
                                  SkipQueryClass queryClass,
                                  int32_t topK, bool useFrontier) {
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(2'000)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(2'000)
       : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
   // Zipfian body_w: rank 0 densest. t2 ~ head (many blocks), t50 mid, t500 tail,
@@ -1567,8 +1567,8 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
                                                 int32_t domainStep,
                                                 bool domainArray) {
   constexpr int32_t topK = 100;
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(1'000)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(1'000)
       : 1'000'000;
   int32_t numTerms = corpus == BulkDisjunctionCorpus::Dense ? 32 : 5;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
@@ -1648,7 +1648,7 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
 // this toolchain can misread the NRVO'd struct member when nothing else touches
 // it between the return and the read; an out-of-line read returns the real
 // value. The engine is correct -- this only hardens the bench's determinism guard.
-SOLUX_NOINLINE static int64_t observeResultFp(const ScoreTopKResult& r) {
+LUXIR_NOINLINE static int64_t observeResultFp(const ScoreTopKResult& r) {
   return r.fp;
 }
 
@@ -1656,8 +1656,8 @@ static void BM_FullTextScoreTopKPhraseFilterConjunction(benchmark::State& state,
   constexpr int32_t topK = 100;
   constexpr int32_t filterStep = 64;
   constexpr int32_t adjacencyStep = 8;
-  int64_t nDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(1'000)
+  int64_t nDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(1'000)
       : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
 
@@ -1734,8 +1734,8 @@ static void BM_FullTextScoreTopKPhraseFilterConjunction(benchmark::State& state,
 static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
                                                FrontierCorpus corpus,
                                                FrontierBoundMode mode) {
-  int64_t corpusDocs = solux::unit_tests
-      ? SoluxTest::scaleTestWork(1'000)
+  int64_t corpusDocs = luxir::unit_tests
+      ? LuxirTest::scaleTestWork(1'000)
       : 1'000'000;
   constexpr int32_t topK = 100;
   std::string_view qterm = "frontier";
@@ -1744,7 +1744,7 @@ static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
   // share the identical index. Production benchmark mode retains the original
   // single-collection lifecycle to avoid holding several million-doc corpora.
   std::string_view collectionName = "main";
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     collectionName = corpus == FrontierCorpus::AntiCorrelated
         ? "frontier_bounds_anti_bm"
         : corpus == FrontierCorpus::Clustered
@@ -1755,13 +1755,13 @@ static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
   bool reuseIndex = false;
   if (corpus == FrontierCorpus::AntiCorrelated) {
     std::array<int32_t, 1> docsPerSeg = {(int32_t)corpusDocs};
-    reuseIndex = solux::unit_tests && helper.indexMatchesShape(docsPerSeg);
+    reuseIndex = luxir::unit_tests && helper.indexMatchesShape(docsPerSeg);
     if (!reuseIndex) {
       buildAntiCorrelatedFrontierBenchIndex(helper, corpusDocs);
     }
   } else if (corpus == FrontierCorpus::Clustered) {
     std::array<int32_t, 1> docsPerSeg = {(int32_t)corpusDocs};
-    reuseIndex = solux::unit_tests && helper.indexMatchesShape(docsPerSeg);
+    reuseIndex = luxir::unit_tests && helper.indexMatchesShape(docsPerSeg);
     if (!reuseIndex) {
       helper.clear();
       buildClusteredScoreTopKIndex(*helper.getIndexWriter(), corpusDocs);
@@ -1785,7 +1785,7 @@ static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
   ScoreTopKResult frontier = runFullTextScoreTopK(*reader, qterm, topK, true, true);
   assertSameTopK(exhaustive, corner);
   assertSameTopK(exhaustive, frontier);
-  if (solux::unit_tests && corpus == FrontierCorpus::AntiCorrelated) {
+  if (luxir::unit_tests && corpus == FrontierCorpus::AntiCorrelated) {
     ASSERT_LT(frontier.visited, corner.visited);
     ASSERT_GT(frontier.skippedBlocks, corner.skippedBlocks);
   }
@@ -1836,125 +1836,125 @@ constexpr const char* shape = "5555";  // ~5 segs of ~181K docs down to tiny spa
 // Faceting ON the full-text field (body_w) via FullTextFacetReq term-driven
 // counting, sweeping the domain density through the queried term's docFreq:
 // match-all -> head (dense) -> mid -> tail (sparse), serial and parallel.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, all_body,       nDocs, shape, "all",    false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, all_body_para,  nDocs, shape, "all",    true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, head_body,      nDocs, shape, "t0",     false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, head_body_para, nDocs, shape, "t0",     true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, mid_body,       nDocs, shape, "t100",   false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, mid_body_para,  nDocs, shape, "t100",   true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, tail_body,      nDocs, shape, "t10000", false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, tail_body_para, nDocs, shape, "t10000", true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, all_body,       nDocs, shape, "all",    false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, all_body_para,  nDocs, shape, "all",    true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, head_body,      nDocs, shape, "t0",     false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, head_body_para, nDocs, shape, "t0",     true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, mid_body,       nDocs, shape, "t100",   false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, mid_body_para,  nDocs, shape, "t100",   true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, tail_body,      nDocs, shape, "t10000", false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextFacet, tail_body_para, nDocs, shape, "t10000", true);
 
 // Single-term relevance top-k A/B over the same full-text corpus, measuring the
 // Step 1 impact-skipping win on dense and mid-frequency terms.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",   true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",   true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
 
 // Disjunction MaxScore A/B. t0 is the frequent low-idf clause; t1000 is rare
 // enough to lift the top-k threshold but common enough to supply k winners.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_skip,   nDocs, shape, "t0", "t1000", true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_noskip, nDocs, shape, "t0", "t1000", false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_skip,   nDocs, shape, "t0", "t1000", true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_noskip, nDocs, shape, "t0", "t1000", false);
 
 // Clustered-disjunction A/B/C for block-max windowed MaxScore.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_windowed,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_windowed,
                         DisjunctionMaxScoreMode::Windowed);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_global,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_global,
                         DisjunctionMaxScoreMode::Global);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_exhaustive,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_exhaustive,
                         DisjunctionMaxScoreMode::Exhaustive);
 
 // Cross-segment competitive threshold A/B.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, shared,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, shared,
                         CrossSegmentAccumulatorMode::Shared);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, local,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, local,
                         CrossSegmentAccumulatorMode::Local);
 
 // Min-should-match WAND A/B.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, wand, MsmWandMode::Wand);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, exhaustive, MsmWandMode::Exhaustive);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, wand, MsmWandMode::Wand);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, exhaustive, MsmWandMode::Exhaustive);
 
 // Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_noskip, false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_noskip, false);
 
 // T2 frontier impact bound A/B. Corpus 0 is anti-correlated by construction;
 // corpora 1 and 2 reuse the existing clustered and Zipfian workloads.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, anti_t2,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, anti_t2,
                         FrontierCorpus::AntiCorrelated, FrontierBoundMode::Frontier);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, anti_t1,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, anti_t1,
                         FrontierCorpus::AntiCorrelated, FrontierBoundMode::Corner);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, clustered_t2,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, clustered_t2,
                         FrontierCorpus::Clustered, FrontierBoundMode::Frontier);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, clustered_t1,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, clustered_t1,
                         FrontierCorpus::Clustered, FrontierBoundMode::Corner);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, zipf_t2,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, zipf_t2,
                         FrontierCorpus::Zipf, FrontierBoundMode::Frontier);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, zipf_t1,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, zipf_t1,
                         FrontierCorpus::Zipf, FrontierBoundMode::Corner);
 
 // Multi-term windowed-MaxScore disjunction, T2 frontier vs T1 corner sub-clauses,
 // on the anti-correlated corpus (where the corner is loose) and a realistic Zipfian one.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_anti_t2,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_anti_t2,
                         FrontierBoundMode::Frontier, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_anti_t1,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_anti_t1,
                         FrontierBoundMode::Corner, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t2,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t2,
                         FrontierBoundMode::Frontier, true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t1,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t1,
                         FrontierBoundMode::Corner, true);
 
 // Skip-effectiveness validation harness. Frontier (T2) sweep over k for both
 // query classes, plus a corner (T1) pair at k=10 to read bound tightness off
 // pct_decoded. Report per class x k: pct_decoded (headline), l1_group_steps
 // (level2 decision), l0_header_steps, advance_calls.
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10,
                         SkipQueryClass::TwoTerm, 10, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k100,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k100,
                         SkipQueryClass::TwoTerm, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k1000,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k1000,
                         SkipQueryClass::TwoTerm, 1000, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10,
                         SkipQueryClass::ThreeTerm, 10, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k100,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k100,
                         SkipQueryClass::ThreeTerm, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k1000,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k1000,
                         SkipQueryClass::ThreeTerm, 1000, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10_corner,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10_corner,
                         SkipQueryClass::TwoTerm, 10, false);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10_corner,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10_corner,
                         SkipQueryClass::ThreeTerm, 10, false);
 // Common + rare high-idf: the aggressive-skip case that stresses the L1 header
 // walk. Watch l1_group_steps relative to blocks_decoded here for the level2 call.
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k10,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k10,
                         SkipQueryClass::TwoTermRare, 10, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k100,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k100,
                         SkipQueryClass::TwoTermRare, 100, true);
-SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k1000,
+LUXIR_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k1000,
                         SkipQueryClass::TwoTermRare, 1000, true);
 
 // Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
 // many-clause corpus is the pre-BS1 case where most clauses stay essential.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_few,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_few,
                         BulkDisjunctionCorpus::Few, true, 0, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_few,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_few,
                         BulkDisjunctionCorpus::Few, false, 0, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense,
                         BulkDisjunctionCorpus::Dense, true, 0, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense,
                         BulkDisjunctionCorpus::Dense, false, 0, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain,
                         BulkDisjunctionCorpus::Dense, true, 16, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense_domain,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense_domain,
                         BulkDisjunctionCorpus::Dense, false, 16, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_sel,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_sel,
                         BulkDisjunctionCorpus::Dense, true, 256, false);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_arr,
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_arr,
                         BulkDisjunctionCorpus::Dense, true, 256, true);
 
 // Phrase approximation conjoined with a selective filter term. The filter leads
 // the required conjunction, so two-phase phrase verification should only run on
 // docs that survive approximation agreement.
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPhraseFilterConjunction, twophase, true);
-SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPhraseFilterConjunction, eager,    false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPhraseFilterConjunction, twophase, true);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPhraseFilterConjunction, eager,    false);

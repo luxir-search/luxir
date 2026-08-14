@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
-#include "test/SoluxTest.h"
-#include "solux/search/DocSet.h"
+#include "test/LuxirTest.h"
+#include "luxir/search/DocSet.h"
 
-namespace solux::test {
+namespace luxir::test {
 
-class DocSetTest : public SoluxTest {
+class DocSetTest : public LuxirTest {
 public:
   static std::vector<int32_t> collect(DocSet& d, int32_t maxDoc) {
     std::vector<int32_t> out;
@@ -232,4 +232,4 @@ TEST_F(DocSetTest, builderAddSortedPromotesOnSpanOverflow) {
             (std::vector<int32_t>{1, 2, 10, 20, 95}));
 }
 
-}  // namespace solux::test
+}  // namespace luxir::test

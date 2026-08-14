@@ -2,18 +2,18 @@
 
 #include <string>
 
-#include "solux/index/Inverter.h"
-#include "test/SoluxTest.h"
+#include "luxir/index/Inverter.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Inverter::memSize() must account for RAM held OUTSIDE the inverter's pool -
 // the heap term-hash tables, IdHandler's private idPool, and string-column
 // RAMFiles - via the extraRamBytes counter handlers bump at their allocation
 // sites. Without this, memSize()==pool.size() badly under-counts a real load.
-class InverterMemSizeTest : public SoluxTest {};
+class InverterMemSizeTest : public LuxirTest {};
 
 // A text field's term-hash table lives on the heap (outside inverter.pool);
 // indexing many distinct terms must grow extraRamBytes and lift memSize above

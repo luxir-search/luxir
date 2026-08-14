@@ -11,28 +11,28 @@
 #include <string_view>
 #include <vector>
 
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
-#include "solux/api/build.h"
-#include "solux/reader/Postings.h"
-#include "solux/schema/Schema.h"
-#include "solux/server/HttpServer.h"
+#include "luxir/api/build.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/server/HttpServer.h"
 
-namespace solux::test {
+namespace luxir::test {
 
 // End-to-end coverage of the Phase 0 HTTP/JSON API (POST /collections/{c}/query
 // + GET /health), exercising the async Beast plumbing against the same in-process
 // node the rest of the suite uses.  No mocks; RAMDir.
-class HttpApiTest : public SoluxTest {
+class HttpApiTest : public LuxirTest {
 protected:
   std::optional<HttpServer> server;
   CollectionHelper helper{"main"};
 
   void SetUp() override {
-    server.emplace(*SoluxTest::soluxNode, 2 /*threads*/, 0 /*OS-assigned port*/);
+    server.emplace(*LuxirTest::luxirNode, 2 /*threads*/, 0 /*OS-assigned port*/);
     server->start();
   }
 
@@ -303,8 +303,8 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
 }
 
 TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
-  SoluxTest::clearCollection("http_route_a");
-  SoluxTest::clearCollection("http_route_b");
+  LuxirTest::clearCollection("http_route_a");
+  LuxirTest::clearCollection("http_route_b");
 
   auto updateA = httpRequest(port(), http::verb::post, "/collections/http_route_a/_update",
       R"({"docs":[{"id":"route-a","title_w":"routeshared token"}],"commit":{}})");
@@ -325,8 +325,8 @@ TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
   ASSERT_EQ(200, reqB.status()) << reqB.rawResponse();
   EXPECT_EQ(std::set<std::string>({"route-b"}), idsOf(reqB.getDocs())) << reqB.rawResponse();
 
-  SoluxTest::clearCollection("http_route_a");
-  SoluxTest::clearCollection("http_route_b");
+  LuxirTest::clearCollection("http_route_a");
+  LuxirTest::clearCollection("http_route_b");
 }
 
 TEST_F(HttpApiTest, autoCreateCollectionDefaultOn) {
@@ -334,7 +334,7 @@ TEST_F(HttpApiTest, autoCreateCollectionDefaultOn) {
       R"({"docs":[{"id":"auto-on","title_w":"autocreateon token"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
   std::shared_ptr<Collection> created;
-  EXPECT_NO_THROW(created = SoluxTest::soluxNode->getCollection("http_auto_create_on"));
+  EXPECT_NO_THROW(created = LuxirTest::luxirNode->getCollection("http_auto_create_on"));
   ASSERT_NE(nullptr, created);
 
   HttpReq hreq(port());
@@ -343,13 +343,13 @@ TEST_F(HttpApiTest, autoCreateCollectionDefaultOn) {
   ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
   EXPECT_EQ(std::set<std::string>({"auto-on"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
 
-  SoluxTest::clearCollection("http_auto_create_on");
+  LuxirTest::clearCollection("http_auto_create_on");
 }
 
 TEST_F(HttpApiTest, autoCreateCollectionCanBeDisabled) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.auto_create_collection = false;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -372,11 +372,11 @@ TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
   EXPECT_EQ(200, autoOnReq.status()) << autoOnReq.rawResponse();
   EXPECT_NE(autoOnReq.rawResponse().find("collection '" + autoOnName + "' does not exist"),
             std::string::npos) << autoOnReq.rawResponse();
-  EXPECT_THROW(SoluxTest::soluxNode->getCollection(autoOnName), CollectionResolutionError);
+  EXPECT_THROW(LuxirTest::luxirNode->getCollection(autoOnName), CollectionResolutionError);
 
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.auto_create_collection = false;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -398,20 +398,20 @@ TEST_F(HttpApiTest, leadingUnderscoreCollectionNameIsRejected) {
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("collection '_reserved' is reserved"), std::string::npos)
       << update.body();
-  EXPECT_THROW(SoluxTest::soluxNode->getCollection("_reserved"), CollectionResolutionError);
+  EXPECT_THROW(LuxirTest::luxirNode->getCollection("_reserved"), CollectionResolutionError);
 }
 
 TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
   auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-  std::filesystem::path base = std::filesystem::temp_directory_path() / ("solux_unsafe_names_" + stamp);
-  std::filesystem::path absolute = std::filesystem::temp_directory_path() / ("solux_abs_collection_" + stamp);
+  std::filesystem::path base = std::filesystem::temp_directory_path() / ("luxir_unsafe_names_" + stamp);
+  std::filesystem::path absolute = std::filesystem::temp_directory_path() / ("luxir_abs_collection_" + stamp);
   std::filesystem::remove_all(base);
   std::filesystem::remove_all(absolute);
 
-  SoluxConfig config;
+  LuxirConfig config;
   config.store.backend = "fs";
   config.store.data_dir = base.string();
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -440,15 +440,15 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
 TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
   auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-  std::filesystem::path base = std::filesystem::temp_directory_path() / ("solux_corrupt_col_" + stamp);
+  std::filesystem::path base = std::filesystem::temp_directory_path() / ("luxir_corrupt_col_" + stamp);
   std::filesystem::remove_all(base);
 
-  SoluxConfig config;
+  LuxirConfig config;
   config.store.backend = "fs";
   config.store.data_dir = base.string();
 
   {
-    SoluxNode node(config);
+    LuxirNode node(config);
     HttpServer localServer(node, 2, 0);
     localServer.start();
     auto good = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/_update",
@@ -467,7 +467,7 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
   }
 
   // Node startup must survive the corrupt collection and serve the good one.
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -713,10 +713,10 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
   };
 
   auto run = [&](int64_t maxInFlight, RunResult& result) {
-    SoluxConfig config;
+    LuxirConfig config;
     config.ingest.stream_batch_docs = 3;
     config.ingest.max_inflight_batches = maxInFlight;
-    SoluxNode node(config);
+    LuxirNode node(config);
     HttpServer localServer(node, 2, 0);
     localServer.start();
 
@@ -786,10 +786,10 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 }
 
 TEST_F(HttpApiTest, ndjsonPipelinedInputFailureDrainsSubmittedPrefix) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.stream_batch_docs = 1;
   config.ingest.max_inflight_batches = 8;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -831,10 +831,10 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   };
 
   auto run = [&](int64_t maxInFlight, RunResult& result) {
-    SoluxConfig config;
+    LuxirConfig config;
     config.ingest.stream_batch_docs = 16;
     config.ingest.max_inflight_batches = maxInFlight;
-    SoluxNode node(config);
+    LuxirNode node(config);
     HttpServer localServer(node, 2, 0);
     localServer.start();
 
@@ -876,10 +876,10 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
 }
 
 TEST_F(HttpApiTest, ndjsonPipelinedBarriersPreserveIntervalsAndCommit) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.stream_batch_docs = 2;
   config.ingest.max_inflight_batches = 8;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -922,10 +922,10 @@ TEST_F(HttpApiTest, ndjsonPipelinedBarriersPreserveIntervalsAndCommit) {
 }
 
 TEST_F(HttpApiTest, ndjsonDisconnectDrainsPipelinedBatches) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.stream_batch_docs = 1;
   config.ingest.max_inflight_batches = 8;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -1285,10 +1285,10 @@ TEST_F(HttpApiTest, ndjsonInlineUpdateReturnIdsDefaultFalse) {
 }
 
 TEST_F(HttpApiTest, ndjsonDeferredInlineUpdateEnforcesRequestBodyCap) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.max_request_body = 1024;
   config.ingest.max_record = 4096;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -1369,7 +1369,7 @@ TEST_F(HttpApiTest, ndjsonUrlCommitCommitsAtEof) {
 }
 
 TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
-  SoluxNode node;
+  LuxirNode node;
   auto writer = node.getCollection("main")->getShard()->getIndexWriter();
   std::uint64_t before = writer->getIndexReader()->commitTime();
   HttpServer localServer(node, 2, 0);
@@ -1424,10 +1424,10 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamFailureRollsBack) {
 }
 
 TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
-  SoluxConfig config;
+  LuxirConfig config;
   config.ingest.max_request_body = 1024;
   config.ingest.max_record = 2048;
-  SoluxNode node(config);
+  LuxirNode node(config);
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -1896,7 +1896,7 @@ TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
 // ?format=docs: every line is a bare document - no envelope, no batching
 // visible on the wire regardless of batch_size.
 TEST_F(HttpApiTest, docsFormatIsPureDocLines) {
-  SoluxTest::clearCollection("http_docs");
+  LuxirTest::clearCollection("http_docs");
   CollectionHelper ch("http_docs");
   for (int i = 0; i < 5; i++) {
     auto commit = i == 4 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
@@ -1923,7 +1923,7 @@ TEST_F(HttpApiTest, docsFormatIsPureDocLines) {
 // The docs format is also selectable in the request body (full form,
 // request-level response_format) for clients that cannot set URL params.
 TEST_F(HttpApiTest, docsFormatSelectableInBody) {
-  SoluxTest::clearCollection("http_docs_body");
+  LuxirTest::clearCollection("http_docs_body");
   CollectionHelper ch("http_docs_body");
   ch.index(flatdoc("id", std::string("b1")), UpdateMessage::COMMIT);
 
@@ -1936,7 +1936,7 @@ TEST_F(HttpApiTest, docsFormatSelectableInBody) {
 // get_number puts the count in a _header_ meta record on the first line;
 // without it the body is pure documents.
 TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
-  SoluxTest::clearCollection("http_docs_hdr");
+  LuxirTest::clearCollection("http_docs_hdr");
   CollectionHelper ch("http_docs_hdr");
   ch.index(flatdoc("id", std::string("h1")), UpdateMessage::NO_COMMIT);
   ch.index(flatdoc("id", std::string("h2")), UpdateMessage::COMMIT);
@@ -2009,7 +2009,7 @@ TEST_F(HttpApiTest, ndjsonUnknownUnderscoreRecordIs400) {
 // headers-only prefix (empty batch -> wholesale replacement) and headers
 // behind a pending doc (shared accounting -> threshold submit).
 TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
-  SoluxTest::clearCollection("http_hdrs");
+  LuxirTest::clearCollection("http_hdrs");
   std::string headerLine = R"({"_header_":{"pad":")" + std::string(4096, 'h') + R"("}})" "\n";
   std::string megOfHeaders;
   for (int i = 0; i < 300; i++) megOfHeaders += headerLine;  // ~1.2MiB
@@ -2065,7 +2065,7 @@ TEST_F(HttpApiTest, docsFormatRejectsFusionSourceOps) {
 // carries its found.  Every doc is attributable by tracking the current
 // section.
 TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
-  SoluxTest::clearCollection("http_docs_multi");
+  LuxirTest::clearCollection("http_docs_multi");
   CollectionHelper ch("http_docs_multi");
   std::vector<Doc> docs;
   for (int i = 0; i < 6; i++) docs.push_back(flatdoc("id", "a" + std::to_string(i), "kind_s", std::string("a")));
@@ -2104,7 +2104,7 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
 // Warnings force a _header_ even without get_number: degraded execution is
 // never silent, docs format included.
 TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
-  SoluxTest::clearCollection("http_docs_warn");
+  LuxirTest::clearCollection("http_docs_warn");
   CollectionHelper ch("http_docs_warn");
   ch.index(flatdoc("id", std::string("w1"), "tag_s", std::string("v")), UpdateMessage::COMMIT);
 
@@ -2122,7 +2122,7 @@ TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
 // Zero matches: pure mode returns an empty 200 body; with get_number the body
 // is the single header line.
 TEST_F(HttpApiTest, docsFormatZeroResults) {
-  SoluxTest::clearCollection("http_docs_zero");
+  LuxirTest::clearCollection("http_docs_zero");
   CollectionHelper ch("http_docs_zero");
   ch.index(flatdoc("id", std::string("z1")), UpdateMessage::COMMIT);
 
@@ -2139,7 +2139,7 @@ TEST_F(HttpApiTest, docsFormatZeroResults) {
 
 // Keep-alive: two docs-format responses on one connection.
 TEST_F(HttpApiTest, docsFormatKeepAliveReuse) {
-  SoluxTest::clearCollection("http_docs_ka");
+  LuxirTest::clearCollection("http_docs_ka");
   CollectionHelper ch("http_docs_ka");
   ch.index(flatdoc("id", std::string("k1")), UpdateMessage::COMMIT);
 
@@ -2171,8 +2171,8 @@ TEST_F(HttpApiTest, docsFormatKeepAliveReuse) {
 // The flagship property: format=docs output (header included) pipes straight
 // back into streaming /update - the _header_ record is a recognized no-op.
 TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
-  SoluxTest::clearCollection("http_rt_src");
-  SoluxTest::clearCollection("http_rt_dst");
+  LuxirTest::clearCollection("http_rt_src");
+  LuxirTest::clearCollection("http_rt_dst");
   CollectionHelper src("http_rt_src");
   for (int i = 0; i < 7; i++) {
     auto commit = i == 6 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
@@ -2202,7 +2202,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 // the emitter to pause (observable via streamPauseCount) while the client
 // withholds reads; draining the response resumes it and every doc arrives.
 TEST_F(HttpApiTest, backpressurePausesEmitter) {
-  SoluxTest::clearCollection("http_bp");
+  LuxirTest::clearCollection("http_bp");
   CollectionHelper ch("http_bp");
   std::string pad(400, 'x');
   std::vector<Doc> docs;
@@ -2211,7 +2211,7 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   }
   ch.indexAll(docs, UpdateMessage::COMMIT);
 
-  HttpServer bpServer(*SoluxTest::soluxNode, 2, 0, /*streamBufferBytes=*/4096);
+  HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
 
   net::io_context cioc;
@@ -2283,7 +2283,7 @@ TEST_F(HttpApiTest, emitterExceptionCompletesWithError) {
 // observes CANCEL and completes the request.  A stranded request would hang
 // shutdown() here (it drains in-flight work).
 TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
-  SoluxTest::clearCollection("http_bp2");
+  LuxirTest::clearCollection("http_bp2");
   CollectionHelper ch("http_bp2");
   std::string pad(400, 'x');
   std::vector<Doc> docs;
@@ -2293,7 +2293,7 @@ TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
   ch.indexAll(docs, UpdateMessage::COMMIT);
 
   std::optional<HttpServer> bpServer;
-  bpServer.emplace(*SoluxTest::soluxNode, 2, 0, /*streamBufferBytes=*/4096);
+  bpServer.emplace(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer->start();
 
   net::io_context cioc;
@@ -2383,4 +2383,4 @@ TEST_F(HttpApiTest, ndjsonCachedWriterFailsCleanlyAfterCollectionDelete) {
   stream.socket().shutdown(tcp::socket::shutdown_both, ec);
 }
 
-} // namespace solux::test
+} // namespace luxir::test

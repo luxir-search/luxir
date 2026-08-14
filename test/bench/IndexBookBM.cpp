@@ -1,10 +1,10 @@
 #include <charconv>
 #include "test/SegmentTest.h"
 #include "test/TestData.h"
-#include "bench/solux_bench.h"
-#include "solux/index/Inverter.h"
+#include "bench/luxir_bench.h"
+#include "luxir/index/Inverter.h"
 
-using namespace solux;
+using namespace luxir;
 
 // Indexes the book and reports the invert and flush phases separately. A single
 // invert+flush run yields both phase numbers, so there is no need for distinct

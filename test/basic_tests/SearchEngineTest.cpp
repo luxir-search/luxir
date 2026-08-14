@@ -9,21 +9,21 @@
 #include <thread>
 #include <tuple>
 #include <vector>
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "solux/query/BooleanQuery.h"
-#include "solux/reader/Postings.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/reader/DocsEnum.h"
-#include "solux/search/SearchOverrides.h"
-#include "solux/search/ops/TopDocsReq.h"
-#include "solux/server/GRPCServer.h"
+#include "luxir/query/BooleanQuery.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/TopDocsReq.h"
+#include "luxir/server/GRPCServer.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 class TopDocsFilterFoldGuard {
@@ -357,7 +357,7 @@ void expectSameScoreMap(const std::map<std::string, float>& expected,
 
 // FieldFacet.missing has no fluent OpCursor setter; reach through the raw op.
 OpCursor& facetMissing(OpCursor& cur) {
-  std::get<solux::api::FieldFacet>(cur.rawOp().kind).missing = true;
+  std::get<luxir::api::FieldFacet>(cur.rawOp().kind).missing = true;
   return cur;
 }
 
@@ -819,7 +819,7 @@ SparseConstantDispatchResult runSparseConstantDispatch(
 }
 }  // namespace
 
-class SearchEngineTest : public SoluxTest {
+class SearchEngineTest : public LuxirTest {
 public:
 };
 
@@ -836,7 +836,7 @@ TEST_F(SearchEngineTest, prunedTopDocsFacetTwoPassMatchesExhaustiveMultiSegment)
 TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   CollectionHelper helper;
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->requestId("test_stats_ops_empty_index_emit_nan");
 
@@ -880,7 +880,7 @@ TEST_F(SearchEngineTest, minMaxOps) {
                        "prices_is", 3), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_i", 5), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs("q").allQuery().getNumber();
   req->min("min_i", "foo_i");
@@ -919,7 +919,7 @@ TEST_F(SearchEngineTest, sumOps) {
   helper.index(flatdoc("foo_i", -twoTo53, "foo_f", 0.75),
                UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& topDocs = req->topDocs("q").allQuery().getNumber();
   topDocs.sum("nested_i", "foo_i");
@@ -940,7 +940,7 @@ TEST_F(SearchEngineTest, sumOps) {
 
 TEST_F(SearchEngineTest, sumRejectsDateFields) {
   CollectionHelper helper;
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->sum("bad", "when_dt");
 
@@ -960,7 +960,7 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
 
   // Score path: match query, limit 0 + get_number.  Accurate count, zero docs.
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
     req->execute();
@@ -972,7 +972,7 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
 
   // A facet sub-op under a limit-0 topDocs still sees the full matching domain.
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& q = req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
     q.facet("colors", "color_s").limit(-1);
@@ -983,7 +983,7 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
     EXPECT_TRUE(req->getDocs("q").empty());
 
     const auto& docs = *req->docList("q");
-    const auto& facet = std::get<solux::api::FacetResult>(docs.ops.at("colors")->kind);
+    const auto& facet = std::get<luxir::api::FacetResult>(docs.ops.at("colors")->kind);
     int64_t facetTotal = 0;
     for (auto c : facet.counts) facetTotal += c;
     EXPECT_EQ(3, facetTotal);
@@ -991,7 +991,7 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
 
   // Field-sort path: sort by a column, limit 0 + get_number.  Accurate count, zero docs.
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& q = req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
     qb::sort(q, "foo_i", qb::ASC);
@@ -1019,7 +1019,7 @@ TEST_F(SearchEngineTest, singleTermLimitZeroFacetFallsBackOnCacheMiss) {
   SkipStats::enabled = true;
   SkipStats::reset();
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& q = req->topDocs("q").matchQuery("foo_w", "needle").getNumber().limit(0);
   q.facet("colors", "color_s").limit(-1);
@@ -1028,7 +1028,7 @@ TEST_F(SearchEngineTest, singleTermLimitZeroFacetFallsBackOnCacheMiss) {
   ASSERT_OK(req);
   EXPECT_EQ(86, req->getMatchCount("q"));
   const auto& docsOut = *req->docList("q");
-  const auto& facet = std::get<solux::api::FacetResult>(docsOut.ops.at("colors")->kind);
+  const auto& facet = std::get<luxir::api::FacetResult>(docsOut.ops.at("colors")->kind);
   int64_t facetTotal = 0;
   for (auto c : facet.counts) facetTotal += c;
   EXPECT_EQ(86, facetTotal);
@@ -1049,7 +1049,7 @@ TEST_F(SearchEngineTest, basic) {
   // should be 2 segments now.
 
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->requestId("myrequestid");
 
@@ -1080,29 +1080,29 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(ncols, docs.columns.size());
 
     // Accessors: column arms (columns is a plain map) and facet arms (ops is indirect).
-    auto colI = [&](const char* n) -> const solux::api::ColInt& {
-      return std::get<solux::api::ColInt>(docs.columns.at(n).kind);
+    auto colI = [&](const char* n) -> const luxir::api::ColInt& {
+      return std::get<luxir::api::ColInt>(docs.columns.at(n).kind);
     };
-    auto colS = [&](const char* n) -> const solux::api::ColStr& {
-      return std::get<solux::api::ColStr>(docs.columns.at(n).kind);
+    auto colS = [&](const char* n) -> const luxir::api::ColStr& {
+      return std::get<luxir::api::ColStr>(docs.columns.at(n).kind);
     };
-    auto multiS = [&](const char* n) -> const solux::api::ArrArrStr& {
-      return std::get<solux::api::ArrArrStr>(docs.columns.at(n).kind);
+    auto multiS = [&](const char* n) -> const luxir::api::ArrArrStr& {
+      return std::get<luxir::api::ArrArrStr>(docs.columns.at(n).kind);
     };
-    auto multiI = [&](const char* n) -> const solux::api::ArrArrInt& {
-      return std::get<solux::api::ArrArrInt>(docs.columns.at(n).kind);
+    auto multiI = [&](const char* n) -> const luxir::api::ArrArrInt& {
+      return std::get<luxir::api::ArrArrInt>(docs.columns.at(n).kind);
     };
-    auto facetOf = [&](const char* n) -> const solux::api::FacetResult& {
-      return std::get<solux::api::FacetResult>(resp.ops.at(n)->kind);
+    auto facetOf = [&](const char* n) -> const luxir::api::FacetResult& {
+      return std::get<luxir::api::FacetResult>(resp.ops.at(n)->kind);
     };
-    auto fBidsI = [&](const char* n) -> const solux::api::ColInt& {
-      return std::get<solux::api::ColInt>(facetOf(n).bucket_ids->kind);
+    auto fBidsI = [&](const char* n) -> const luxir::api::ColInt& {
+      return std::get<luxir::api::ColInt>(facetOf(n).bucket_ids->kind);
     };
-    auto fBidsS = [&](const char* n) -> const solux::api::ColStr& {
-      return std::get<solux::api::ColStr>(facetOf(n).bucket_ids->kind);
+    auto fBidsS = [&](const char* n) -> const luxir::api::ColStr& {
+      return std::get<luxir::api::ColStr>(facetOf(n).bucket_ids->kind);
     };
-    auto fBidsMultiI = [&](const char* n) -> const solux::api::ArrArrInt& {
-      return std::get<solux::api::ArrArrInt>(facetOf(n).bucket_ids->kind);
+    auto fBidsMultiI = [&](const char* n) -> const luxir::api::ArrArrInt& {
+      return std::get<luxir::api::ArrArrInt>(facetOf(n).bucket_ids->kind);
     };
 
     // docs will be ordered by shortest field first since term freq is same for all.
@@ -1166,10 +1166,10 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, facetOf("f4").counts.at(1));
     ASSERT_EQ(1, facetOf("f4").counts.at(2));
     // check the sub-op avg
-    ASSERT_EQ(3, std::get<solux::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v.size());
-    ASSERT_EQ(5, std::get<solux::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[0]);
-    ASSERT_EQ(17, std::get<solux::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[1]);
-    ASSERT_EQ(23, std::get<solux::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[2]);
+    ASSERT_EQ(3, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v.size());
+    ASSERT_EQ(5, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[0]);
+    ASSERT_EQ(17, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[1]);
+    ASSERT_EQ(23, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[2]);
 
     // check the fifth facet
     ASSERT_EQ(2, fBidsS("f5").v.size());
@@ -1223,7 +1223,7 @@ TEST_F(SearchEngineTest, basic) {
 #ifdef REMOVED
   // FIXME
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->requestId("myrequestid");
 
@@ -1237,11 +1237,11 @@ TEST_F(SearchEngineTest, basic) {
     // LOG_DEBUG("ENGINE REQ: {}", req->toString());
 
     const auto& resp = req->responses[0]->proto;
-    auto fBidsI = [&](const char* n) -> const solux::api::ColInt& {
-      return std::get<solux::api::ColInt>(std::get<solux::api::FacetResult>(resp.ops.at(n)->kind).bucket_ids->kind);
+    auto fBidsI = [&](const char* n) -> const luxir::api::ColInt& {
+      return std::get<luxir::api::ColInt>(std::get<luxir::api::FacetResult>(resp.ops.at(n)->kind).bucket_ids->kind);
     };
     auto fCounts = [&](const char* n) -> const auto& {
-      return std::get<solux::api::FacetResult>(resp.ops.at(n)->kind).counts;
+      return std::get<luxir::api::FacetResult>(resp.ops.at(n)->kind).counts;
     };
 
     // check the facet
@@ -1263,7 +1263,7 @@ TEST_F(SearchEngineTest, basic) {
 
   // now lets do the same request, but try to get multiple responses.
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->requestId("myrequestid");
     req->topDocs("q").matchQuery("foo_w", "brown").withStats()
@@ -1274,11 +1274,11 @@ TEST_F(SearchEngineTest, basic) {
 
     ASSERT_EQ(req->proto.request_id, req->responses[0]->proto.request_id);
     const auto& docs = *req->docList("q");
-    auto colI = [&](const char* n) -> const solux::api::ColInt& {
-      return std::get<solux::api::ColInt>(docs.columns.at(n).kind);
+    auto colI = [&](const char* n) -> const luxir::api::ColInt& {
+      return std::get<luxir::api::ColInt>(docs.columns.at(n).kind);
     };
-    auto colS = [&](const char* n) -> const solux::api::ColStr& {
-      return std::get<solux::api::ColStr>(docs.columns.at(n).kind);
+    auto colS = [&](const char* n) -> const luxir::api::ColStr& {
+      return std::get<luxir::api::ColStr>(docs.columns.at(n).kind);
     };
     ASSERT_EQ(3, docs.found.value_or(0));
     ASSERT_EQ(3, docs.columns.size());
@@ -1296,12 +1296,12 @@ TEST_F(SearchEngineTest, basic) {
 
 
     ASSERT_EQ(req->proto.request_id, req->responses[1]->proto.request_id);
-    const auto& docs2 = std::get<solux::api::DocList>(req->responses[1]->proto.ops.at("q")->kind);
-    auto colI2 = [&](const char* n) -> const solux::api::ColInt& {
-      return std::get<solux::api::ColInt>(docs2.columns.at(n).kind);
+    const auto& docs2 = std::get<luxir::api::DocList>(req->responses[1]->proto.ops.at("q")->kind);
+    auto colI2 = [&](const char* n) -> const luxir::api::ColInt& {
+      return std::get<luxir::api::ColInt>(docs2.columns.at(n).kind);
     };
-    auto colS2 = [&](const char* n) -> const solux::api::ColStr& {
-      return std::get<solux::api::ColStr>(docs2.columns.at(n).kind);
+    auto colS2 = [&](const char* n) -> const luxir::api::ColStr& {
+      return std::get<luxir::api::ColStr>(docs2.columns.at(n).kind);
     };
     ASSERT_EQ(3, docs2.found.value_or(0));
     ASSERT_EQ(2, docs2.offset);
@@ -1320,7 +1320,7 @@ TEST_F(SearchEngineTest, basic) {
   {
     // new let's try for 3 responses
 
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->requestId("myrequestid");
     req->topDocs("q").matchQuery("foo_w", "brown").withStats()
@@ -1329,9 +1329,9 @@ TEST_F(SearchEngineTest, basic) {
     req->execute(para);
     ASSERT_EQ(3, req->responses.size());
     // check offsets are correct
-    ASSERT_EQ(0, std::get<solux::api::DocList>(req->responses[0]->proto.ops.at("q")->kind).offset);
-    ASSERT_EQ(1, std::get<solux::api::DocList>(req->responses[1]->proto.ops.at("q")->kind).offset);
-    ASSERT_EQ(2, std::get<solux::api::DocList>(req->responses[2]->proto.ops.at("q")->kind).offset);
+    ASSERT_EQ(0, std::get<luxir::api::DocList>(req->responses[0]->proto.ops.at("q")->kind).offset);
+    ASSERT_EQ(1, std::get<luxir::api::DocList>(req->responses[1]->proto.ops.at("q")->kind).offset);
+    ASSERT_EQ(2, std::get<luxir::api::DocList>(req->responses[2]->proto.ops.at("q")->kind).offset);
   }
 }
 
@@ -1345,7 +1345,7 @@ TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
     cur.withStats().fields({"foo_i", "color_s"}).matchQuery("foo_w", "brown");
   };
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   addBrownTopDocs(req->topDocs("normal"));
   req->execute();
@@ -1354,7 +1354,7 @@ TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
 
   // Same query through the prepared path: the engine test seam wraps each
   // top-docs root in ForcePrepareQuery (the wrapper is not on the wire).
-  auto forcedReq = localReq(soluxNode->getSearchEngine());
+  auto forcedReq = localReq(luxirNode->getSearchEngine());
   forcedReq->testForcePrepare = true;
   forcedReq->collection("main");
   auto& forced = forcedReq->topDocs("forced");
@@ -1368,29 +1368,29 @@ TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
   const auto& forcedDocs = *forcedReq->docList("forced");
   ASSERT_EQ(normalDocs.found.value_or(0), forcedDocs.found.value_or(0));
 
-  const auto& normalFoo = std::get<solux::api::ColInt>(normalDocs.columns.at("foo_i").kind).v;
-  const auto& forcedFoo = std::get<solux::api::ColInt>(forcedDocs.columns.at("foo_i").kind).v;
+  const auto& normalFoo = std::get<luxir::api::ColInt>(normalDocs.columns.at("foo_i").kind).v;
+  const auto& forcedFoo = std::get<luxir::api::ColInt>(forcedDocs.columns.at("foo_i").kind).v;
   ASSERT_EQ(normalFoo.size(), forcedFoo.size());
   for (size_t i = 0; i < normalFoo.size(); i++) {
     EXPECT_EQ(normalFoo[i], forcedFoo[i]);
   }
 
-  const auto& normalColor = std::get<solux::api::ColStr>(normalDocs.columns.at("color_s").kind).v;
-  const auto& forcedColor = std::get<solux::api::ColStr>(forcedDocs.columns.at("color_s").kind).v;
+  const auto& normalColor = std::get<luxir::api::ColStr>(normalDocs.columns.at("color_s").kind).v;
+  const auto& forcedColor = std::get<luxir::api::ColStr>(forcedDocs.columns.at("color_s").kind).v;
   ASSERT_EQ(normalColor.size(), forcedColor.size());
   for (size_t i = 0; i < normalColor.size(); i++) {
     EXPECT_EQ(normalColor[i], forcedColor[i]);
   }
 
-  const auto& normalScore = std::get<solux::api::ColFloat>(normalDocs.columns.at("_score_").kind).v;
-  const auto& forcedScore = std::get<solux::api::ColFloat>(forcedDocs.columns.at("_score_").kind).v;
+  const auto& normalScore = std::get<luxir::api::ColFloat>(normalDocs.columns.at("_score_").kind).v;
+  const auto& forcedScore = std::get<luxir::api::ColFloat>(forcedDocs.columns.at("_score_").kind).v;
   ASSERT_EQ(normalScore.size(), forcedScore.size());
   for (size_t i = 0; i < normalScore.size(); i++) {
     EXPECT_FLOAT_EQ(normalScore[i], forcedScore[i]);
   }
 
-  const auto& facet = std::get<solux::api::FacetResult>(forcedDocs.ops.at("colors")->kind);
-  const auto& facetBids = std::get<solux::api::ColStr>(facet.bucket_ids->kind);
+  const auto& facet = std::get<luxir::api::FacetResult>(forcedDocs.ops.at("colors")->kind);
+  const auto& facetBids = std::get<luxir::api::ColStr>(facet.bucket_ids->kind);
   ASSERT_EQ(3, facetBids.v.size());
   std::map<std::string, int64_t> facetCounts;
   for (size_t i = 0; i < facetBids.v.size(); i++) {
@@ -1407,7 +1407,7 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   // The prepared path must not disturb the constant score: the test seam
   // wraps the root, so this runs ForcePrepare(ConstantScore(match)).  (The
   // reverse composition, ConstantScore over a preparing child, is covered at
@@ -1426,7 +1426,7 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   const auto& docs = *req->docList("constant");
   ASSERT_EQ(3, docs.found.value_or(0));
 
-  const auto& foo = std::get<solux::api::ColInt>(docs.columns.at("foo_i").kind).v;
+  const auto& foo = std::get<luxir::api::ColInt>(docs.columns.at("foo_i").kind).v;
   ASSERT_EQ(3, foo.size());
   std::map<int64_t, bool> seenFoo;
   for (size_t i = 0; i < foo.size(); i++) {
@@ -1436,14 +1436,14 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   EXPECT_TRUE(seenFoo[17]);
   EXPECT_TRUE(seenFoo[23]);
 
-  const auto& scores = std::get<solux::api::ColFloat>(docs.columns.at("_score_").kind).v;
+  const auto& scores = std::get<luxir::api::ColFloat>(docs.columns.at("_score_").kind).v;
   ASSERT_EQ(3, scores.size());
   for (size_t i = 0; i < scores.size(); i++) {
     EXPECT_FLOAT_EQ(7.5f, scores[i]);
   }
 
-  const auto& facetResult = std::get<solux::api::FacetResult>(docs.ops.at("colors")->kind);
-  const auto& facetBids = std::get<solux::api::ColStr>(facetResult.bucket_ids->kind);
+  const auto& facetResult = std::get<luxir::api::FacetResult>(docs.ops.at("colors")->kind);
+  const auto& facetBids = std::get<luxir::api::ColStr>(facetResult.bucket_ids->kind);
   ASSERT_EQ(3, facetBids.v.size());
   std::map<std::string, int64_t> facetCounts;
   for (size_t i = 0; i < facetBids.v.size(); i++) {
@@ -1461,7 +1461,7 @@ TEST_F(SearchEngineTest, opAndFilterNameCharset) {
   helper.index(flatdoc("foo_w", "hello"), UpdateMessage::COMMIT);
 
   {  // unusual but legal name
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("My-Op_2").matchQuery("foo_w", "hello");
     req->execute();
@@ -1469,7 +1469,7 @@ TEST_F(SearchEngineTest, opAndFilterNameCharset) {
     ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
   }
   {  // path-unsafe op name is rejected with the teaching message
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("bad.name!").matchQuery("foo_w", "hello");
     ExpectLog quiet("Search request failed:");
@@ -1478,15 +1478,15 @@ TEST_F(SearchEngineTest, opAndFilterNameCharset) {
     EXPECT_NE(req->errorMsg().find("restricted to"), std::string::npos) << req->errorMsg();
   }
   {  // filter names use the same rule
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").matchQuery("foo_w", "hello");
-    auto& td = std::get<solux::api::TopDocs>(cur.rawOp().kind);
-    auto* f = solux::api::build::allocArray(td.filter, 1, cur.mr());
+    auto& td = std::get<luxir::api::TopDocs>(cur.rawOp().kind);
+    auto* f = luxir::api::build::allocArray(td.filter, 1, cur.mr());
     f[0].name = "bad name";
-    auto* q = (solux::api::Query*)cur.mr().allocate(sizeof(solux::api::Query),
-                                                    alignof(solux::api::Query));
-    new (q) solux::api::Query(qb::match(cur.mr(), "foo_w", "hello"));
+    auto* q = (luxir::api::Query*)cur.mr().allocate(sizeof(luxir::api::Query),
+                                                    alignof(luxir::api::Query));
+    new (q) luxir::api::Query(qb::match(cur.mr(), "foo_w", "hello"));
     f[0].query = q;
     ExpectLog quiet("Search request failed:");
     req->execute();
@@ -1505,7 +1505,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
   }, UpdateMessage::COMMIT);
 
   {  // single filter narrows the query domain
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("q").matchQuery("foo_w", "hello").getNumber().fields({"id"})
         .matchFilter("f", "cat_s", "a");
@@ -1515,7 +1515,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     EXPECT_EQ(2, docs.found);
   }
   {  // two filters intersect
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("q").matchQuery("foo_w", "hello").getNumber().fields({"id"})
         .matchFilter("f1", "cat_s", "a").matchFilter("f2", "size_s", "big");
@@ -1525,7 +1525,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     EXPECT_EQ(1, docs.found);
   }
   {  // a nested facet counts over the filtered domain
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& td = req->topDocs("q");
     td.matchQuery("foo_w", "hello").getNumber().fields({"id"})
@@ -1551,14 +1551,14 @@ TEST_F(SearchEngineTest, topDocsFilterFoldMatchesExplicitBoolean) {
     flatdoc("id", "d4", "body_w", "banana", "keep_s", "yes"),
   }, UpdateMessage::COMMIT);
 
-  auto folded = localReq(soluxNode->getSearchEngine());
+  auto folded = localReq(luxirNode->getSearchEngine());
   folded->collection("main");
   folded->topDocs("q").matchQuery("body_w", "apple").withStats().fields({"id"})
       .limit(-1).matchFilter("keep", "keep_s", "yes");
   folded->execute();
   ASSERT_OK(folded);
 
-  auto explicitFilter = localReq(soluxNode->getSearchEngine());
+  auto explicitFilter = localReq(luxirNode->getSearchEngine());
   explicitFilter->collection("main");
   auto& cur = explicitFilter->topDocs("q").withStats().fields({"id"}).limit(-1);
   cur.rawQuery() = qb::boolean(cur.mr(),
@@ -1591,7 +1591,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldMatchesPassivePath) {
   };
 
   auto run = [&](bool passive) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("ranked").matchQuery("body_w", "apple").withStats().fields({"id"})
         .limit(2).matchFilter("keep", "keep_s", "yes");
@@ -1623,11 +1623,11 @@ TEST_F(SearchEngineTest, topDocsFilterFoldMatchesPassivePath) {
 }
 
 TEST_F(SearchEngineTest, filteredCountBulkIntersectionSingleSegment) {
-  expectFilteredCountEquivalence(soluxNode->getSearchEngine(), false);
+  expectFilteredCountEquivalence(luxirNode->getSearchEngine(), false);
 }
 
 TEST_F(SearchEngineTest, filteredCountBulkIntersectionMultiSegment) {
-  expectFilteredCountEquivalence(soluxNode->getSearchEngine(), true);
+  expectFilteredCountEquivalence(luxirNode->getSearchEngine(), true);
 }
 
 TEST_F(SearchEngineTest,
@@ -1675,7 +1675,7 @@ TEST_F(SearchEngineTest,
     int64_t tfreqBlocksDecoded = 0;
   };
   auto runExact = [&](bool disabled) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().limit(0);
     cur.rawQuery() = qb::boolean(
@@ -1718,7 +1718,7 @@ TEST_F(SearchEngineTest,
   };
   auto run = [&](std::string_view first, std::string_view second,
                  std::string_view filter, bool disabled = false) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().limit(0);
     cur.rawQuery() = qb::boolean(
@@ -1773,7 +1773,7 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(0, latched.tfreqBlocksDecoded);
 
   auto runSingleTerm = [&] {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().limit(0);
     cur.rawQuery() = qb::match(cur.mr(), "body_w", "dense_a");
@@ -1812,14 +1812,14 @@ TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {
   auto cache = helper.getIndexWriter()->getFilterCache();
 
   auto first = runFilteredCount(
-      soluxNode->getSearchEngine(), FilteredCountShape::TERM,
+      luxirNode->getSearchEngine(), FilteredCountShape::TERM,
       "fat_term_single", FilteredCountPath::FOLDED, collection);
   auto second = runFilteredCount(
-      soluxNode->getSearchEngine(), FilteredCountShape::TERM,
+      luxirNode->getSearchEngine(), FilteredCountShape::TERM,
       "fat_term_single", FilteredCountPath::FOLDED, collection);
   auto beforeHit = cache->counters();
   auto hit = runFilteredCount(
-      soluxNode->getSearchEngine(), FilteredCountShape::TERM,
+      luxirNode->getSearchEngine(), FilteredCountShape::TERM,
       "fat_term_single", FilteredCountPath::FOLDED, collection);
 
   EXPECT_EQ(first.count, second.count);
@@ -1915,7 +1915,7 @@ TEST_F(SearchEngineTest,
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
   FilteredCountResult exact = runFilteredCount(
-      soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+      luxirNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
       "exact", FilteredCountPath::FOLDED, collection);
   EXPECT_EQ((nDocs + 3) / 4, exact.count);
   EXPECT_GT(exact.exactTermCountBatches, 0);
@@ -1925,23 +1925,23 @@ TEST_F(SearchEngineTest,
     ExactTermCountGuard exactGuard(true);
     IntegratedFilteredCountGuard sampleGuard(true);
     dense = runFilteredCount(
-        soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+        luxirNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
         "dense", FilteredCountPath::FOLDED, collection);
   }
   EXPECT_EQ((nDocs + 1) / 2, dense.count);
   EXPECT_GT(dense.denseWindows, 0);
 
   runFilteredCount(
-      soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+      luxirNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
       "sparse", FilteredCountPath::FOLDED, collection);
   runFilteredCount(
-      soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+      luxirNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
       "sparse", FilteredCountPath::FOLDED, collection);
   FilteredCountResult sparse;
   {
     ExactTermCountGuard exactGuard(true);
     sparse = runFilteredCount(
-        soluxNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
+        luxirNode->getSearchEngine(), FilteredCountShape::INTERSECTION,
         "sparse", FilteredCountPath::FOLDED, collection);
   }
   EXPECT_EQ((nDocs + 2047) / 2048, sparse.count);
@@ -1975,10 +1975,10 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
   // measure a true hit whose DocSet is a costed conjunction clause.
   {
     FilterClauseCountGuard enabled(false);
-    runFilteredCount(soluxNode->getSearchEngine(),
+    runFilteredCount(luxirNode->getSearchEngine(),
                      FilteredCountShape::INTERSECTION, "selected",
                      FilteredCountPath::FOLDED, collection);
-    runFilteredCount(soluxNode->getSearchEngine(),
+    runFilteredCount(luxirNode->getSearchEngine(),
                      FilteredCountShape::INTERSECTION, "selected",
                      FilteredCountPath::FOLDED, collection);
   }
@@ -1986,7 +1986,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
   FilteredCountResult routed;
   {
     FilterClauseCountGuard enabled(false);
-    routed = runFilteredCount(soluxNode->getSearchEngine(),
+    routed = runFilteredCount(luxirNode->getSearchEngine(),
                               FilteredCountShape::INTERSECTION, "selected",
                               FilteredCountPath::FOLDED, collection);
   }
@@ -2002,7 +2002,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
   FilteredCountResult legacy;
   {
     FilterClauseCountGuard disabled(true);
-    legacy = runFilteredCount(soluxNode->getSearchEngine(),
+    legacy = runFilteredCount(luxirNode->getSearchEngine(),
                               FilteredCountShape::INTERSECTION, "selected",
                               FilteredCountPath::FOLDED, collection);
   }
@@ -2036,17 +2036,17 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
 
   {
     FilterClauseCountGuard enabled(false);
-    runFilteredCount(soluxNode->getSearchEngine(),
+    runFilteredCount(luxirNode->getSearchEngine(),
                      FilteredCountShape::INTERSECTION, "selected",
                      FilteredCountPath::FOLDED, collection);
-    runFilteredCount(soluxNode->getSearchEngine(),
+    runFilteredCount(luxirNode->getSearchEngine(),
                      FilteredCountShape::INTERSECTION, "selected",
                      FilteredCountPath::FOLDED, collection);
   }
   FilteredCountResult routed;
   {
     FilterClauseCountGuard enabled(false);
-    routed = runFilteredCount(soluxNode->getSearchEngine(),
+    routed = runFilteredCount(luxirNode->getSearchEngine(),
                               FilteredCountShape::INTERSECTION, "selected",
                               FilteredCountPath::FOLDED, collection);
   }
@@ -2060,7 +2060,7 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
   FilteredCountResult legacy;
   {
     FilterClauseCountGuard disabled(true);
-    legacy = runFilteredCount(soluxNode->getSearchEngine(),
+    legacy = runFilteredCount(luxirNode->getSearchEngine(),
                               FilteredCountShape::INTERSECTION, "selected",
                               FilteredCountPath::FOLDED, collection);
   }
@@ -2072,7 +2072,7 @@ TEST_F(SearchEngineTest, cachedDocSetSparseLeadKeepsTermWordProbes) {
   {
     FilterClauseCountGuard enabled(false);
     FilteredConjunctionBatchGuard disabled(true);
-    unbatched = runFilteredCount(soluxNode->getSearchEngine(),
+    unbatched = runFilteredCount(luxirNode->getSearchEngine(),
                                  FilteredCountShape::INTERSECTION, "selected",
                                  FilteredCountPath::FOLDED, collection);
   }
@@ -2106,7 +2106,7 @@ TEST_F(SearchEngineTest, cachedDocSetBatchesExactScoredTerm) {
   };
   auto run = [&](bool disabled) {
     FilteredConjunctionBatchGuard guard(disabled);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
         .fields({"id"}).limit(100);
@@ -2139,7 +2139,7 @@ TEST_F(SearchEngineTest, sparseFilteredTopKRerouteAdmitsConjunctionShapes) {
   constexpr std::string_view collection = "sparse_filtered_topk_reroute";
   CollectionHelper helper(collection);
   indexSparseFilteredTopKDocs(helper);
-  auto& engine = soluxNode->getSearchEngine();
+  auto& engine = luxirNode->getSearchEngine();
 
   for (FilteredCountShape shape :
        {FilteredCountShape::TERM, FilteredCountShape::INTERSECTION,
@@ -2182,7 +2182,7 @@ TEST_F(SearchEngineTest,
   constexpr std::string_view collection = "sparse_filtered_union_topk";
   CollectionHelper helper(collection);
   indexSparseFilteredTopKDocs(helper);
-  auto& engine = soluxNode->getSearchEngine();
+  auto& engine = luxirNode->getSearchEngine();
 
   SparseFilteredTopKResult routed;
   {
@@ -2211,7 +2211,7 @@ TEST_F(SearchEngineTest, sparseFilteredTopKRerouteUsesFamilyDensityKnees) {
   indexSparseFilteredTopKDocs(helper);
   SparseFilteredTopKRerouteGuard guard(
       false, false, {32, 32, 32}, {64, 64, 64});
-  auto& engine = soluxNode->getSearchEngine();
+  auto& engine = luxirNode->getSearchEngine();
 
   auto conjunction = runSparseFilteredTopK(
       engine, collection, FilteredCountShape::INTERSECTION, "between", 100);
@@ -2229,7 +2229,7 @@ TEST_F(SearchEngineTest, sparseFilteredTermUnionDisableRestoresPrunedPath) {
       "sparse_filtered_union_topk_disable";
   CollectionHelper helper(collection);
   indexSparseFilteredTopKDocs(helper);
-  auto& engine = soluxNode->getSearchEngine();
+  auto& engine = luxirNode->getSearchEngine();
 
   SparseFilteredTopKResult routed;
   {
@@ -2279,14 +2279,14 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
   {
     FilteredDisjunctionBatchGuard enabled(false);
     auto cold = runFilteredCount(
-        soluxNode->getSearchEngine(), FilteredCountShape::UNION, "selected",
+        luxirNode->getSearchEngine(), FilteredCountShape::UNION, "selected",
         FilteredCountPath::FOLDED, collection);
     EXPECT_EQ(0, cold.ownedFilterMaterializations);
     EXPECT_EQ(0, cold.ownedFilterServes);
     EXPECT_GT(cold.filteredDisjBatchEngagements, 0);
     EXPECT_GT(
         cold.filteredDisjBatchPostingsFeedEngagements, 0);
-    runFilteredCount(soluxNode->getSearchEngine(),
+    runFilteredCount(luxirNode->getSearchEngine(),
                      FilteredCountShape::UNION, "selected",
                      FilteredCountPath::FOLDED, collection);
   }
@@ -2294,14 +2294,14 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
   {
     FilteredDisjunctionBatchGuard enabled(false);
     batchCount = runFilteredCount(
-        soluxNode->getSearchEngine(), FilteredCountShape::UNION,
+        luxirNode->getSearchEngine(), FilteredCountShape::UNION,
         "selected", FilteredCountPath::FOLDED, collection);
   }
   FilteredCountResult pullCount;
   {
     FilteredDisjunctionBatchGuard disabled(true);
     pullCount = runFilteredCount(
-        soluxNode->getSearchEngine(), FilteredCountShape::UNION,
+        luxirNode->getSearchEngine(), FilteredCountShape::UNION,
         "selected", FilteredCountPath::FOLDED, collection);
   }
   EXPECT_EQ(filterCard, batchCount.count);
@@ -2315,14 +2315,14 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
   {
     FilteredDisjunctionCountCompactionGuard disabled(true);
     uncompactedCount = runFilteredCount(
-        soluxNode->getSearchEngine(), FilteredCountShape::UNION,
+        luxirNode->getSearchEngine(), FilteredCountShape::UNION,
         "selected", FilteredCountPath::FOLDED, collection);
   }
   EXPECT_EQ(batchCount.count, uncompactedCount.count);
   EXPECT_GT(uncompactedCount.filteredDisjBatchCountWindows, 0);
 
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().limit(0);
     cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::UNION);
@@ -2347,7 +2347,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
   };
   auto runTopCount = [&](bool disabled) {
     FilteredDisjunctionBatchGuard guard(disabled);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
         .fields({"id"}).limit(100);
@@ -2401,7 +2401,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
   };
   auto run = [&](bool disabled) {
     FilteredDisjunctionBatchGuard guard(disabled);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
         .fields({"id"}).limit(100);
@@ -2477,7 +2477,7 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
         false, TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
     SparseExactCountSinglePassGuard sparseGuard(
         disableSparseDecision);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
         .fields({"id"}).limit(100);
@@ -2549,7 +2549,7 @@ TEST_F(SearchEngineTest,
         TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
     SparseFilteredTopKRerouteGuard rerouteGuard(true);
     FilteredDisjunctionBatchGuard batchGuard(true);
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
         .fields({"id"}).limit(100);
@@ -2597,13 +2597,13 @@ TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {
   FilteredCountResult enabled;
   {
     FilterClauseCountGuard guard(false);
-    enabled = runUnfilteredCount(soluxNode->getSearchEngine(),
+    enabled = runUnfilteredCount(luxirNode->getSearchEngine(),
                                  FilteredCountShape::INTERSECTION, collection);
   }
   FilteredCountResult disabled;
   {
     FilterClauseCountGuard guard(true);
-    disabled = runUnfilteredCount(soluxNode->getSearchEngine(),
+    disabled = runUnfilteredCount(luxirNode->getSearchEngine(),
                                   FilteredCountShape::INTERSECTION, collection);
   }
   EXPECT_EQ(enabled.count, disabled.count);
@@ -2625,9 +2625,9 @@ TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) 
   ASSERT_EQ(DocSetBuilder::arrayLimitFor(1024), 32);
 
   auto atLimitBaseline = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), "limit_s", true);
+      luxirNode->getSearchEngine(), "limit_s", true);
   auto atLimit = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), "limit_s", false);
+      luxirNode->getSearchEngine(), "limit_s", false);
   EXPECT_EQ(atLimit.pullCollections, 1);
   EXPECT_EQ(atLimit.domainWindows, 0);
   EXPECT_EQ(atLimit.bulkFillCalls, 0);
@@ -2637,9 +2637,9 @@ TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) 
   EXPECT_EQ(atLimit.facets, atLimitBaseline.facets);
 
   auto overLimitBaseline = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), "over_s", true);
+      luxirNode->getSearchEngine(), "over_s", true);
   auto overLimit = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), "over_s", false);
+      luxirNode->getSearchEngine(), "over_s", false);
   EXPECT_EQ(overLimit.pullCollections, 0);
   EXPECT_GT(overLimit.domainWindows, 0);
   EXPECT_EQ(overLimit.found, 33);
@@ -2656,9 +2656,9 @@ TEST_F(SearchEngineTest, sparseConstantPullDispatchExcludesMultiFilterPlans) {
   ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
 
   auto baseline = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), "limit_s", true, true);
+      luxirNode->getSearchEngine(), "limit_s", true, true);
   auto actual = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), "limit_s", false, true);
+      luxirNode->getSearchEngine(), "limit_s", false, true);
   EXPECT_EQ(actual.pullCollections, 0);
   EXPECT_GT(actual.domainWindows, 0);
   EXPECT_EQ(actual.ids, baseline.ids);
@@ -2674,7 +2674,7 @@ TEST_F(SearchEngineTest, sparseConstantPullDispatchLeavesMatchAllShortcutUntouch
   ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
 
   auto actual = runSparseConstantDispatch(
-      soluxNode->getSearchEngine(), {}, false);
+      luxirNode->getSearchEngine(), {}, false);
   EXPECT_EQ(actual.pullCollections, 0);
   EXPECT_EQ(actual.found, 1024);
   int64_t facetTotal = 0;
@@ -2711,7 +2711,7 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
 
   auto run = [&](bool passive, bool twoFilters, int64_t limit,
                  bool getNumber, bool withFacet) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs("q").allQuery().fields({"id"}).limit(limit);
     if (getNumber) topDocs.getNumber();
@@ -2797,7 +2797,7 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
   };
   auto run = [&](std::string_view filterField, int64_t limit,
                  bool passive, bool nested) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").allQuery().getNumber()
         .fields({"id"}).limit(limit)
@@ -2928,7 +2928,7 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
 
   auto warm = [&](std::string_view field) {
     for (int i = 0; i < 3; i++) {
-      auto req = localReq(soluxNode->getSearchEngine());
+      auto req = localReq(luxirNode->getSearchEngine());
       req->collection(collection);
       req->topDocs("q").allQuery().getNumber().limit(0)
           .matchFilter("filter", field, "yes");
@@ -2942,7 +2942,7 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
 
   auto run = [&](bool twoFilters, bool scoredQuery, bool fieldSort,
                  bool passive, bool disableFilterClause) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").getNumber().fields({"id"})
         .limit(fieldSort || scoredQuery ? 4 : 0);
@@ -3044,7 +3044,7 @@ TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
   auto run = [&]() {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").matchQuery("body_w", "apple")
         .getNumber().limit(0)
@@ -3083,7 +3083,7 @@ TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
   EXPECT_EQ(std::get<1>(second), facets);
 
   auto runPrepared = [&](std::string_view lowValue) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->testForcePrepare = true;
     req->collection(collection);
     auto& topDocs = req->topDocs("q").getNumber().limit(0);
@@ -3114,7 +3114,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
   }, UpdateMessage::COMMIT);
 
   auto runAll = [&](bool filtered) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q").allQuery().getNumber().fields({"id"}).limit(-1);
     if (filtered) cur.matchFilter("keep", "keep_s", "yes");
@@ -3131,7 +3131,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
   EXPECT_EQ(4, unfilteredAll.first);
   EXPECT_EQ((std::map<std::string, int64_t>{{"x", 2}, {"y", 2}}), unfilteredAll.second);
 
-  auto prepared = localReq(soluxNode->getSearchEngine());
+  auto prepared = localReq(luxirNode->getSearchEngine());
   prepared->testForcePrepare = true;
   prepared->collection("main");
   auto& preparedCur = prepared->topDocs("q").matchQuery("body_w", "apple")
@@ -3153,7 +3153,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
 // Missing collection targets error cleanly and do not auto-create on reads.
 TEST_F(SearchEngineTest, missingCollectionErrors) {
   std::string name = "search_engine_missing_collection";
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection(name);
   req->topDocs("q").allQuery();
   ExpectLog quiet("Search request failed:");
@@ -3161,13 +3161,13 @@ TEST_F(SearchEngineTest, missingCollectionErrors) {
   ASSERT_FALSE(req->responses.empty());
   EXPECT_NE(req->errorMsg().find("collection '" + name + "' does not exist"),
             std::string::npos) << req->errorMsg();
-  EXPECT_THROW(soluxNode->getCollection(name), CollectionResolutionError);
+  EXPECT_THROW(luxirNode->getCollection(name), CollectionResolutionError);
 }
 
 TEST_F(SearchEngineTest, unsafeCollectionNameErrors) {
   // Search-time resolution is lookup-only: an invalid name reads as
   // not-found, with no validation on the request path.
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("../bad");
   req->topDocs("q").allQuery();
   ExpectLog quiet("Search request failed:");
@@ -3178,7 +3178,7 @@ TEST_F(SearchEngineTest, unsafeCollectionNameErrors) {
 }
 
 TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {
-  const std::string name = "concurrent_create_once_" + std::to_string(SoluxTest::rng_seed);
+  const std::string name = "concurrent_create_once_" + std::to_string(LuxirTest::rng_seed);
   constexpr int numThreads = 32;
 
   std::vector<std::shared_ptr<Collection>> collections(numThreads);
@@ -3193,7 +3193,7 @@ TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {
       while (!start.load()) {
         std::this_thread::yield();
       }
-      collections[i] = soluxNode->getOrCreateCollection(name);
+      collections[i] = luxirNode->getOrCreateCollection(name);
     });
   }
 
@@ -3210,7 +3210,7 @@ TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {
   for (const auto& collection : collections) {
     EXPECT_EQ(collections[0], collection);
   }
-  EXPECT_EQ(collections[0], soluxNode->getCollection(name));
+  EXPECT_EQ(collections[0], luxirNode->getCollection(name));
 }
 
 namespace {

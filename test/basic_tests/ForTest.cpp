@@ -1,19 +1,19 @@
-#include "solux/index/Inverter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
-#include "solux/codec/Codec.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/PostingsReader.h"
+#include "luxir/codec/Codec.h"
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 // Runs the FOR-codec battery (round-trip + random access) across every length
 // and value-range boundary. Parameterized by codec type for easy extension.
 template <typename Codec>
-class ForTest : public SoluxTest {
+class ForTest : public LuxirTest {
 protected:
   Codec codec;
 
@@ -74,7 +74,7 @@ protected:
   }
 };
 
-using ForCodecs = ::testing::Types<SoluxSIMDFor>;
+using ForCodecs = ::testing::Types<LuxirSIMDFor>;
 TYPED_TEST_SUITE(ForTest, ForCodecs);
 
 TYPED_TEST(ForTest, basic) {

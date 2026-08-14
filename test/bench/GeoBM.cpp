@@ -12,20 +12,20 @@
 #include <string_view>
 #include <vector>
 
-#include "bench/solux_bench.h"
-#include "solux/query/GeoBoxQuery.h"
-#include "solux/query/GeoDistanceQuery.h"
-#include "solux/reader/BKDReader.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/schema/Schema.h"
-#include "solux/util/geo.h"
-#include "solux/util/random.h"
+#include "bench/luxir_bench.h"
+#include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/reader/BKDReader.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/util/geo.h"
+#include "luxir/util/random.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -129,8 +129,8 @@ constexpr std::array<RawPoint, 20> CITY_CENTERS{{
 }};
 
 int32_t documentCount() {
-  return solux::unit_tests
-      ? (int32_t)SoluxTest::scaleTestWork(UNIT_TEST_DOCS)
+  return luxir::unit_tests
+      ? (int32_t)LuxirTest::scaleTestWork(UNIT_TEST_DOCS)
       : PRODUCTION_DOCS;
 }
 
@@ -443,14 +443,14 @@ int32_t countMatches(Query::Scorer* scorer) {
 }
 
 bool unitTimingCase(CorpusShape shape, BoxCase box) {
-  if (!solux::unit_tests) return true;
+  if (!luxir::unit_tests) return true;
   bool corpusSelected = shape == UNIFORM || shape == CLUSTERED;
   bool boxSelected = box == CITY || box == REGION || box == DATELINE;
   return corpusSelected && boxSelected;
 }
 
 bool unitTimingCase(CorpusShape shape, DistanceCase circle) {
-  if (!solux::unit_tests) return true;
+  if (!luxir::unit_tests) return true;
   bool corpusSelected = shape == UNIFORM || shape == CLUSTERED;
   bool circleSelected = circle == DISTANCE_CITY || circle == DISTANCE_REGION
                      || circle == DISTANCE_GLOBAL_MINUS_SLIVER;
@@ -548,7 +548,7 @@ void BM_GeoCount(benchmark::State& state, CorpusShape shape) {
 }
 
 void BM_GeoEstimate(benchmark::State& state, CorpusShape shape) {
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     skipReduced(state);
     return;
   }
@@ -661,7 +661,7 @@ void BM_GeoDistanceCount(benchmark::State& state, CorpusShape shape) {
 }
 
 void BM_GeoDistanceEstimate(benchmark::State& state, CorpusShape shape) {
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     skipReduced(state);
     return;
   }
@@ -685,7 +685,7 @@ void BM_GeoDistanceEstimate(benchmark::State& state, CorpusShape shape) {
 }
 
 void BM_GeoSize(benchmark::State& state, CorpusShape shape) {
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     skipReduced(state);
     return;
   }
@@ -702,7 +702,7 @@ void BM_GeoSize(benchmark::State& state, CorpusShape shape) {
 }
 
 void BM_GeoBuild(benchmark::State& state, CorpusShape shape) {
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     state.SkipWithMessage("geo build benchmark is production-only");
     return;
   }
@@ -736,7 +736,7 @@ void BM_GeoBuild(benchmark::State& state, CorpusShape shape) {
 }
 
 void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
-  if (solux::unit_tests) {
+  if (luxir::unit_tests) {
     state.SkipWithMessage("geo merge benchmark is production-only");
     return;
   }

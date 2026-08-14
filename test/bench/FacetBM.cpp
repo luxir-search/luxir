@@ -4,16 +4,16 @@
 
 #include <tbb/task_group.h>
 
-#include "bench/solux_bench.h"
-#include "solux/search/ops/FacetOp.h"
+#include "bench/luxir_bench.h"
+#include "luxir/search/ops/FacetOp.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-// buildBenchIndex is declared in solux_bench.h
+// buildBenchIndex is declared in luxir_bench.h
 
 
 //
@@ -22,8 +22,8 @@ using namespace solux::test;
 static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view shape, std::string_view qfield, std::string_view ffield, bool para, int64_t topLimit = 10) {
   int mergeFactor = 10;  // TODO: actually get from IW?
 
-  if (solux::unit_tests) {
-    nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
   }
 
   //
@@ -46,7 +46,7 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
   for (auto _ : state) {
     int64_t ret = 0;
 
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("main");
     // match all docs query
     auto& topDocs = req->topDocs("q");
@@ -76,18 +76,18 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     const auto* qDocs = req->responses[0]->proto.ops.at("q")->docList();
     const auto* facetResult = qDocs->ops.at("f")->facetResult();
     const auto& counts = facetResult->counts;
-    if (std::holds_alternative<solux::api::ColInt>(facetResult->bucket_ids->kind)) {
-      const auto& bucketIds = std::get<solux::api::ColInt>(facetResult->bucket_ids->kind);
+    if (std::holds_alternative<luxir::api::ColInt>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<luxir::api::ColInt>(facetResult->bucket_ids->kind);
       for (int i = 0; i < (int)counts.size(); i++) {
         ret = ret * 31 + bucketIds.v[i] + counts[i];
       }
-    } else if (std::holds_alternative<solux::api::ColStr>(facetResult->bucket_ids->kind)) {
-      const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+    } else if (std::holds_alternative<luxir::api::ColStr>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
       for (int i = 0; i < (int)counts.size(); i++) {
         ret = ret * 31 + java_string_hashcode(bucketIds.v[i]) + counts[i];
       }
-    } else if (std::holds_alternative<solux::api::ArrArrInt>(facetResult->bucket_ids->kind)) {
-      const auto& bucketIds = std::get<solux::api::ArrArrInt>(facetResult->bucket_ids->kind);
+    } else if (std::holds_alternative<luxir::api::ArrArrInt>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<luxir::api::ArrArrInt>(facetResult->bucket_ids->kind);
       for (int i = 0; i < (int)counts.size(); i++) {
         ret = ret * 31 + bucketIds.v[i].v[0] + counts[i];
       }
@@ -156,7 +156,7 @@ static void buildRangeFacetBenchIndex(CollectionHelper& helper,
 
 static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
                           std::string_view shape, bool forceWalk) {
-  if (solux::unit_tests) nDocs = SoluxTest::scaleTestWork(200);
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
   CollectionHelper helper("facet_range_bm");
@@ -170,7 +170,7 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
   IntFacetRangeReq::disablePointsRangeFacetForTests = forceWalk;
   int64_t fingerprint = -1;
   for (auto _ : state) {
-    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("facet_range_bm");
     req->rangeFacet("f", "range_bm_i").range(-500, 10'000'500, 100'003);
     req->execute(false);
@@ -196,66 +196,66 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
 constexpr int32_t nDocs = 10'000'000;
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
 
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_i,          nDocs, shape, "all", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_i_para,     nDocs, shape, "all", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_i,         nDocs, shape, "all", "u10k_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_i_para,    nDocs, shape, "all", "u10k_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10m_i,         nDocs, shape, "all", "u10m_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10m_i_para,    nDocs, shape, "all", "u10m_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10_i,          nDocs, shape, "all", "u10_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10_i_para,     nDocs, shape, "all", "u10_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10k_i,         nDocs, shape, "all", "u10k_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10k_i_para,    nDocs, shape, "all", "u10k_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10m_i,         nDocs, shape, "all", "u10m_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10m_i_para,    nDocs, shape, "all", "u10m_i", true);
 // Multi-valued (1 value per doc, 2 on 1/64 of them).  Pairs with u10_i: same
 // cardinality and domain, so the difference between the two rows is the cost
 // of the multi-valued path - the endValueRank mono column read twice per doc.
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_is,         nDocs, shape, "all", "u10_is", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_is_para,    nDocs, shape, "all", "u10_is", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_s,         nDocs, shape, "all", "short_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_s_para,    nDocs, shape, "all", "short_u10k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u100k_s,        nDocs, shape, "all", "short_u100k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u100k_s_para,   nDocs, shape, "all", "short_u100k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u1m_s,          nDocs, shape, "all", "short_u1m_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u1m_s_para,     nDocs, shape, "all", "short_u1m_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10_is,         nDocs, shape, "all", "u10_is", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10_is_para,    nDocs, shape, "all", "u10_is", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10k_s,         nDocs, shape, "all", "short_u10k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u10k_s_para,    nDocs, shape, "all", "short_u10k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u100k_s,        nDocs, shape, "all", "short_u100k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u100k_s_para,   nDocs, shape, "all", "short_u100k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s,          nDocs, shape, "all", "short_u1m_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, u1m_s_para,     nDocs, shape, "all", "short_u1m_s", true);
 
 
 // test different domain sizes
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,      nDocs, shape, "short_u1m_s", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,      nDocs, shape, "short_u1m_s", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_is,     nDocs, shape, "short_u1m_s", "u10_is", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_is,      nDocs, shape, "short_u10_s", "u10_is", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,      nDocs, shape, "short_u1m_s", "u10_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,      nDocs, shape, "short_u1m_s", "u10_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_is,     nDocs, shape, "short_u1m_s", "u10_is", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_is,      nDocs, shape, "short_u10_s", "u10_is", false);
 // ~1% domain: the sparse point-decode path at a size worth measuring.  tinyD
 // matches ~10 docs and bigD is dense enough to take the bulk path.
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10_i,       nDocs, shape, "1%", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10_is,      nDocs, shape, "1%", "u10_is", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u10_i,       nDocs, shape, "1%", "u10_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u10_is,      nDocs, shape, "1%", "u10_is", false);
 // u10_i needs 4 bits, which the old lane-packed select never straddles a word
 // for, so it had nothing to lose there.  u10k_i needs ~14, where roughly a
 // third of values cross a 32-bit lane boundary and the old select paid a
 // second load and a stitch branch - this is where the single-load point read
 // should show up on a real column.
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_i,      nDocs, shape, "1%", "u10k_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_s,      nDocs, shape, "1%", "short_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_i,      nDocs, shape, "1%", "u10k_i", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, midD_u10k_s,      nDocs, shape, "1%", "short_u10k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", true);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", true);
 
 // Sparse field (~1% of docs have a value).  Doc-driven counting walks the whole
 // domain regardless, so total postings stay far below the domain size - the one
 // shape where per-term postings intersection should beat the column walk.
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_sparse_s,    nDocs, shape, "short_u10_s", "sparse_u1k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_sparse_s,   nDocs, shape, "short_u1m_s", "sparse_u1k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, sparse_s,         nDocs, shape, "all", "sparse_u1k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, bigD_sparse_s,    nDocs, shape, "short_u10_s", "sparse_u1k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, tinyD_sparse_s,   nDocs, shape, "short_u1m_s", "sparse_u1k_s", false);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, sparse_s,         nDocs, shape, "all", "sparse_u1k_s", false);
 
 // limit=0: facet-only requests that return no documents, the shape a facet
 // benchmark actually issues.  Worth its own cells because limit>0 and limit=0
 // take different collection paths: with no top-K to fill, everything the
 // request costs is domain and facet work.
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, lim0_u10_i,       nDocs, shape, "all", "u10_i", false, 0);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, lim0_u1m_s,       nDocs, shape, "all", "short_u1m_s", false, 0);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s", "u10_i", false, 0);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_u10_i,       nDocs, shape, "all", "u10_i", false, 0);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_u1m_s,       nDocs, shape, "all", "short_u1m_s", false, 0);
+LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s", "u10_i", false, 0);
 
-SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
-SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);

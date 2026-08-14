@@ -1,24 +1,24 @@
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/index/UpdateMessage.h"
-#include "solux/index/VectorIndexBuilder.h"
-#include "solux/reader/VectorAuxReader.h"
-#include "solux/schema/Schema.h"
-#include "solux/server/ProtoUpdateMessage.h"
-#include "solux/server/SoluxNode.h"
-#include "solux/store/Directory.h"
-#include "solux/store/FSDirectory.h"
-#include "solux/reader/Postings.h"
-#include "solux/util/Signal.h"
-#include "solux/util/log.h"
-#include "solux/api/padded_input.h"
-#include "solux/api/solux_types.hpp"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/index/UpdateMessage.h"
+#include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/reader/VectorAuxReader.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/server/ProtoUpdateMessage.h"
+#include "luxir/server/LuxirNode.h"
+#include "luxir/store/Directory.h"
+#include "luxir/store/FSDirectory.h"
+#include "luxir/reader/Postings.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/log.h"
+#include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_types.hpp"
 #include "test/QueryBuild.h"
 
 #include <faiss/IndexFlat.h>
@@ -38,16 +38,16 @@
 #include <thread>
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class VectorIndexBuilderTest : public SoluxTest {
+class VectorIndexBuilderTest : public LuxirTest {
 protected:
   void SetUp() override {
     // Reset to default schema; tests selectively install metric-bearing schemas
     // via enableL2OnVecSuffix.  Persisted schemas from prior tests would otherwise
     // leak in.
-    auto col = soluxNode->getCollection("main");
+    auto col = luxirNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
   }
 
@@ -102,7 +102,7 @@ struct VectorBuildFailureGuard {
 
   explicit VectorBuildFailureGuard(std::string fieldName)
       : quiet("injected failure for " + fieldName) {
-    solux::Signal::listen("vectorBuildField",
+    luxir::Signal::listen("vectorBuildField",
         [field = std::move(fieldName)](void* fnPtr, void*, void*) -> void* {
           if (*(const std::string_view*)fnPtr == field) {
             throw std::runtime_error("VectorBuildFailureGuard: injected failure for " + field);
@@ -112,7 +112,7 @@ struct VectorBuildFailureGuard {
   }
 
   ~VectorBuildFailureGuard() {
-    solux::Signal::unlisten("vectorBuildField");
+    luxir::Signal::unlisten("vectorBuildField");
   }
 };
 
@@ -132,13 +132,13 @@ std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fn
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
 }
 
-VectorAuxMeta readVectorAuxMeta(const solux::api::AuxIndexInfo& aux) {
+VectorAuxMeta readVectorAuxMeta(const luxir::api::AuxIndexInfo& aux) {
   return VectorAuxMeta::fromBytes(
       std::string_view((const char*)aux.opaque_meta.data(), aux.opaque_meta.size()), aux.name);
 }
 
-std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::IndexInfo* info) {
-  std::vector<const solux::api::AuxIndexInfo*> out;
+std::vector<const luxir::api::AuxIndexInfo*> vectorOverlays(const luxir::api::IndexInfo* info) {
+  std::vector<const luxir::api::AuxIndexInfo*> out;
   for (const auto& seg : info->segments) {
     for (const auto& overlay : seg.overlays) {
       if (overlay.kind == VectorIndexBuilder::KIND) out.push_back(&overlay);
@@ -147,7 +147,7 @@ std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::In
   return out;
 }
 
-std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const IndexInfoHolder& info) {
+std::vector<const luxir::api::AuxIndexInfo*> vectorOverlays(const IndexInfoHolder& info) {
   return vectorOverlays(&info.info);
 }
 
@@ -191,11 +191,11 @@ bool commitForTest(CollectionHelper& h,
   // Build the non-owning commit request directly into a local arena (lives across the
   // blocking submit + wait below).
   std::pmr::monotonic_buffer_resource mr;
-  solux::api::UpdateRequest request;
+  luxir::api::UpdateRequest request;
   auto& params = request.commit.emplace();
   if (!buildAuxIndexes.empty()) {
-    std::string_view* a = solux::api::build::allocArray(params.build_aux_indexes, buildAuxIndexes.size(), mr);
-    for (size_t i = 0; i < buildAuxIndexes.size(); i++) a[i] = solux::api::build::arenaStr(mr, buildAuxIndexes[i]);
+    std::string_view* a = luxir::api::build::allocArray(params.build_aux_indexes, buildAuxIndexes.size(), mr);
+    for (size_t i = 0; i < buildAuxIndexes.size(); i++) a[i] = luxir::api::build::arenaStr(mr, buildAuxIndexes[i]);
   }
   params.wait_for_merges = waitForMerges;
 
@@ -220,13 +220,13 @@ int64_t vectorMergeBuildCount() {
   return VectorIndexBuilder::ivfPqMergeBuildCountForTests.load(std::memory_order_relaxed);
 }
 
-const solux::api::AuxIndexInfo& onlyVectorOverlay(const solux::api::IndexInfo* info) {
+const luxir::api::AuxIndexInfo& onlyVectorOverlay(const luxir::api::IndexInfo* info) {
   auto overlays = vectorOverlays(info);
   EXPECT_EQ(overlays.size(), 1u);
   return *overlays[0];
 }
 
-const solux::api::AuxIndexInfo& onlyVectorOverlay(const IndexInfoHolder& info) {
+const luxir::api::AuxIndexInfo& onlyVectorOverlay(const IndexInfoHolder& info) {
   return onlyVectorOverlay(&info.info);
 }
 
@@ -234,9 +234,9 @@ const solux::api::AuxIndexInfo& onlyVectorOverlay(const IndexInfoHolder& info) {
 void enableL2OnVecSuffix(Collection& col) {
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::L2;
+  f.metric = luxir::api::VectorMetric::L2;
   // Merge preserves all built-in fields and overrides _v with the
   // metric-bearing definition.
   b.set(col);
@@ -255,7 +255,7 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
   std::vector<std::string> ids;
   if (const auto* dl = req->docList("q")) {
     if (const auto* p = dl->columns.find("id")) {
-      if (const auto* col = std::get_if<solux::api::ColStr>(&p->kind)) {
+      if (const auto* col = std::get_if<luxir::api::ColStr>(&p->kind)) {
         for (auto id : col->v) ids.emplace_back(id);
       }
     }
@@ -345,7 +345,7 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
   faiss::Index* ramIdx = ramAux->getFaissIndex();
   ASSERT_NE(ramIdx, nullptr);
 
-  std::string tmpl = (std::filesystem::temp_directory_path() / "solux_vec_aux_XXXXXX").string();
+  std::string tmpl = (std::filesystem::temp_directory_path() / "luxir_vec_aux_XXXXXX").string();
   ASSERT_NE(mkdtemp(tmpl.data()), nullptr);
   std::filesystem::path tmp(tmpl);
   {
@@ -425,7 +425,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
 
     auto meta = readVectorAuxMeta(*aux);
     EXPECT_EQ(meta.dims, 3);
-    EXPECT_EQ(meta.metric, (int32_t)solux::api::VectorMetric::L2);
+    EXPECT_EQ(meta.metric, (int32_t)luxir::api::VectorMetric::L2);
     EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
   }
 }
@@ -1067,14 +1067,14 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
     h.commit();
   }
 
-  solux::Signal::listen("mergedPostingsReader", [](void*, void*, void*) -> void* {
+  luxir::Signal::listen("mergedPostingsReader", [](void*, void*, void*) -> void* {
     throw std::runtime_error("injected merged postings reader failure");
   });
   {
     ExpectLog quiet("injected merged postings reader failure");
     iw->mergeSegments();
   }
-  solux::Signal::unlisten("mergedPostingsReader");
+  luxir::Signal::unlisten("mergedPostingsReader");
 
   EXPECT_FALSE(iw->testMergeRunning());
   auto failure = iw->testLastMergeFailure();
@@ -1115,7 +1115,7 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
 
   std::latch mergeStarted(1);
   std::latch releaseMerge(1);
-  solux::Signal::listen("mergeStart", [&](void* a, void* b, void* c) -> void* {
+  luxir::Signal::listen("mergeStart", [&](void* a, void* b, void* c) -> void* {
     unused(a, b, c);
     mergeStarted.count_down();
     releaseMerge.wait();
@@ -1196,9 +1196,9 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   // Schema: _v with metric=COSINE.
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   b.set(h.collection());
 
   for (int i = 0; i < 80; i++) {
@@ -1224,9 +1224,9 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
 
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   f.normalized = true;
   b.set(h.collection());
 
@@ -1288,9 +1288,9 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
 
   SchemaBuilder b;
   auto& f = b.templ("_v");
-  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
   f.column = true;
-  f.metric = solux::api::VectorMetric::COSINE;
+  f.metric = luxir::api::VectorMetric::COSINE;
   f.normalize_on_write = false;
   b.set(h.collection());
 

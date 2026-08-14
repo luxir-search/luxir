@@ -1,6 +1,6 @@
 # Documents and values
 
-A Solux document is a flat map from field name to typed value. The schema says
+A Luxir document is a flat map from field name to typed value. The schema says
 how each value is indexed and retained; the document itself carries no type
 tags. This page defines the boundary that indexing, querying, and retrieval
 share.
@@ -33,7 +33,7 @@ ignored property. Define a concrete field or template through the
 [schema API](schema.md) when suffixes are not the desired public names.
 
 Request objects follow a separate but related rule: unknown request keys are
-errors. Solux does not silently accept a misspelled query option.
+errors. Luxir does not silently accept a misspelled query option.
 
 ## Missing, null, and empty
 
@@ -68,7 +68,7 @@ prefix collide for overwrite and delete purposes. Keep IDs within that bound.
 
 With the normal `allow_dups: false`, another document with the same ID replaces
 the old document. Replacement is whole-document replacement: fields omitted by
-the new version disappear. Solux does not currently implement field patches.
+the new version disappear. Luxir does not currently implement field patches.
 Set `allow_dups: true` only when duplicate IDs are intentionally append-only.
 
 `_version_` is reserved for internal overwrite ordering and is not an

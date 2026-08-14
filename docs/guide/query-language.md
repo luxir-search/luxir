@@ -1,4 +1,4 @@
-# The Solux query language (`expr`)
+# The Luxir query language (`expr`)
 
 `expr` is the query string aimed at developers: the thing you type into a
 curl body, a dashboard, or a filter. It has a strict grammar and reports
@@ -178,7 +178,7 @@ accepted forms include `NOW-1DAY/DAY`, `2024-01-01T00:00:00Z+2MONTHS`, and
 `2024-01-01T00:00:00Z||+2M`. Solr word units are
 case-insensitive (`YEARS`, `MONTHS`, `WEEKS`, `DAYS`/`DATE`, `HOURS`,
 `MINUTES`, `SECONDS`, and the millisecond aliases). `WEEK`/`WEEKS` is a
-Solux extension beyond Solr's own grammar, coherent with the `w` abbreviation
+Luxir extension beyond Solr's own grammar, coherent with the `w` abbreviation
 and civil week rounding. OpenSearch abbreviations are
 case-sensitive: `y`, `M`, `w`, `d`, `h`/`H`, `m`, and `s`, so `M` means month
 while `m` means minute. Week rounding starts Monday.

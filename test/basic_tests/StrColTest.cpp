@@ -1,19 +1,19 @@
 
 #include "gtest/gtest.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
-#include "solux/index/handler/StrColHandler.h"
-#include "solux/reader/StrColReader.h"
-#include "solux/reader/FieldReader.h"
+#include "luxir/index/handler/StrColHandler.h"
+#include "luxir/reader/StrColReader.h"
+#include "luxir/reader/FieldReader.h"
 #include <vector>
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class StrColTest : public SoluxTest {
+class StrColTest : public LuxirTest {
 protected:
 
 };
@@ -729,7 +729,7 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
   }
   
   // Search and retrieve the _ssc field
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
       .getNumber()
       .limit(10)
@@ -748,13 +748,13 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
   ASSERT_TRUE(columns.contains("tags_ssc"));
 
   const auto& tagsCol = columns.at("tags_ssc");
-  ASSERT_TRUE(std::holds_alternative<solux::api::ArrArrStr>(tagsCol.kind));
-  const auto& multiTags = std::get<solux::api::ArrArrStr>(tagsCol.kind);
+  ASSERT_TRUE(std::holds_alternative<luxir::api::ArrArrStr>(tagsCol.kind));
+  const auto& multiTags = std::get<luxir::api::ArrArrStr>(tagsCol.kind);
 
   ASSERT_EQ(3, multiTags.v.size());
 
   // Find doc1 and verify its tags
-  const auto& idCol = std::get<solux::api::ColStr>(columns.at("id_s").kind);
+  const auto& idCol = std::get<luxir::api::ColStr>(columns.at("id_s").kind);
   for (int i = 0; i < 3; i++) {
     if (idCol.v[i] == "doc1") {
       auto& tags = multiTags.v[i].v;
@@ -801,7 +801,7 @@ TEST_F(StrColTest, EmptyAndMissingValues) {
   }
   
   // Search and retrieve
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
       .getNumber()
       .limit(10)
@@ -816,12 +816,12 @@ TEST_F(StrColTest, EmptyAndMissingValues) {
 
   // Verify handling of empty and missing values
   const auto& columns = docs->columns;
-  const auto& idCol = std::get<solux::api::ColStr>(columns.at("id_s").kind);
+  const auto& idCol = std::get<luxir::api::ColStr>(columns.at("id_s").kind);
 
   if (columns.contains("tags_ssc")) {
     const auto& tagsCol = columns.at("tags_ssc");
-    if (std::holds_alternative<solux::api::ArrArrStr>(tagsCol.kind)) {
-      const auto& multiTags = std::get<solux::api::ArrArrStr>(tagsCol.kind);
+    if (std::holds_alternative<luxir::api::ArrArrStr>(tagsCol.kind)) {
+      const auto& multiTags = std::get<luxir::api::ArrArrStr>(tagsCol.kind);
 
       for (int i = 0; i < 3; i++) {
         if (idCol.v[i] == "doc1") {
@@ -887,7 +887,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   ASSERT_NE(0, segFieldInfo.monoLoc.offset());  // endValueRankReader present for multi-valued
   
   // Verify we can still read the values correctly
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
       .getNumber()
       .limit(10)
@@ -904,8 +904,8 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   const auto& columns = docs->columns;
   ASSERT_TRUE(columns.contains("uniform_ssc"));
   const auto& uniformCol = columns.at("uniform_ssc");
-  ASSERT_TRUE(std::holds_alternative<solux::api::ArrArrStr>(uniformCol.kind));
-  const auto& multiUniform = std::get<solux::api::ArrArrStr>(uniformCol.kind);
+  ASSERT_TRUE(std::holds_alternative<luxir::api::ArrArrStr>(uniformCol.kind));
+  const auto& multiUniform = std::get<luxir::api::ArrArrStr>(uniformCol.kind);
 
   ASSERT_EQ(3, multiUniform.v.size());
 

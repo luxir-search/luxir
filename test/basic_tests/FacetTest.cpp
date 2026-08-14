@@ -13,24 +13,24 @@
 #include <tbb/task_group.h>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
-#include "solux/util/random.h"
-#include "solux/util/proto.h"
-#include "solux/index/Inverter.h"
-#include "solux/index/IndexWriter.h"
-#include "solux/reader/SkipStats.h"
-#include "solux/search/ops/FacetOp.h"
-#include "solux/search/ops/StrFacetOp.h"
-#include "solux/util/NumericUtils.h"
+#include "luxir/util/random.h"
+#include "luxir/util/proto.h"
+#include "luxir/index/Inverter.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/reader/SkipStats.h"
+#include "luxir/search/ops/FacetOp.h"
+#include "luxir/search/ops/StrFacetOp.h"
+#include "luxir/util/NumericUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
-class FacetTest : public SoluxTest {
+class FacetTest : public LuxirTest {
 protected:
 };
 
@@ -422,7 +422,7 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
   FacetCounterModeGuard guard;
   auto run = [&](FacetCounterMode mode, int64_t mincount) {
     forcedFacetCounterMode = mode;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs();
     topDocs.getNumber(true).matchQuery("selected_s", "yes");
@@ -754,14 +754,14 @@ TEST_F(FacetTest, spanCounterTopKOverflowShortCircuit) {
   FacetCounterModeGuard guard;
   auto topBucket = [&](FacetCounterMode mode, int64_t limit) {
     forcedFacetCounterMode = mode;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->facet("f", "category_s").limit(limit);
     req->execute(true);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
     EXPECT_NE(result, nullptr);
-    const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind);
+    const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind);
     return std::pair<std::string, int64_t>(std::string(ids.v[0]), result->counts[0]);
   };
 
@@ -949,7 +949,7 @@ TEST_F(FacetTest, emptyIndex) {
   
   for (const auto& fieldType : fieldTypes) {
     // Create a search request with faceting on the field type
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
     req->topDocs().getNumber(true).allQuery();
@@ -962,7 +962,7 @@ TEST_F(FacetTest, emptyIndex) {
       // Regular field facet
       auto& facet = req->facet("f", fieldType.fieldName);
       facet.limit(10);
-      std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true; // Also test missing value handling
+      std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true; // Also test missing value handling
     }
 
     // Execute search on empty index
@@ -978,7 +978,7 @@ TEST_F(FacetTest, emptyIndex) {
       const auto* facetResult = ops.at("f_range")->facetResult();
       ASSERT_NE(facetResult, nullptr) << "Failed for " << fieldType.description;
 
-      const auto& ids = std::get<solux::api::ArrArrInt>(facetResult->bucket_ids->kind);
+      const auto& ids = std::get<luxir::api::ArrArrInt>(facetResult->bucket_ids->kind);
       ASSERT_EQ(10, (int)ids.v.size()) << "Failed for " << fieldType.description;
       ASSERT_EQ(10, (int)facetResult->counts.size()) << "Failed for " << fieldType.description;
       for (int64_t count : facetResult->counts) EXPECT_EQ(0, count);
@@ -990,10 +990,10 @@ TEST_F(FacetTest, emptyIndex) {
       // Check appropriate bucket type based on field type
       if (fieldType.fieldName.contains("_i")) {
         // Integer field
-        ASSERT_EQ(0, (int)std::get<solux::api::ColInt>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
+        ASSERT_EQ(0, (int)std::get<luxir::api::ColInt>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
       } else if (fieldType.fieldName.contains("_s") || fieldType.fieldName.contains("_w")) {
         // String or text field
-        ASSERT_EQ(0, (int)std::get<solux::api::ColStr>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
+        ASSERT_EQ(0, (int)std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
       }
       ASSERT_EQ(0, (int)facetResult->counts.size()) << "Failed for " << fieldType.description;
 
@@ -1029,7 +1029,7 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
   auto run = [&](bool disablePoints) {
     IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
     SkipStats::reset();
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& all = req->rangeFacet("all", "range_is").range(-1500, 9100, 2700);
     std::get<api::RangeFacet>(all.rawOp().kind).missing = true;
@@ -1131,7 +1131,7 @@ TEST_F(FacetTest, floatingRangeFacetMatchesScanAndColumnWalk) {
   auto run = [&](bool disablePoints) {
     IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
     SkipStats::reset();
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->rangeFacet("floats", "value_f").rangeFp(-0.0, 1.0, 0.2);
     req->rangeFacet("doubles", "value_d").rangeFp(-0.0, 1.0, 0.25);
@@ -1203,7 +1203,7 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     indexDocs(helper);
     ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
     SkipStats::reset();
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& facet = req->rangeFacet("f", "range_i").range(0, 3000, 1000);
     std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
@@ -1218,7 +1218,7 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     helper.clear();
     indexDocs(helper);
     SkipStats::reset();
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& top = req->topDocs("q");
     top.matchQuery("tag_s", "keep");
@@ -1237,7 +1237,7 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     helper.clear();
     indexDocs(helper);
     SkipStats::reset();
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& facet = req->rangeFacet("f", "walk_i").range(0, 3000, 1000);
     std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
@@ -1284,7 +1284,7 @@ TEST_F(FacetTest, calendarDateRangeDenverDstAndPointsParity) {
   PointsRangeFacetTestGuard guard;
   auto run = [&](bool disablePoints) {
     IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->rangeFacet("days", "when_dt").calendarRange(
         "2024-03-09", "2024-03-14", 1,
@@ -1320,7 +1320,7 @@ TEST_F(FacetTest, calendarDateRangeTransitionFenceEdges) {
   ASSERT_TRUE(helper.index(flatdoc("id", "c", "when_dt", transition + 1),
                            UpdateMessage::COMMIT).success);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->rangeFacet("days", "when_dt").calendarRange(
       "2024-03-09T02", "2024-03-11T02", 1,
@@ -1343,7 +1343,7 @@ TEST_F(FacetTest, dateRangeFacetZoneInheritanceAndOverrides) {
   };
   setRangeFacetSchema(helper, fields);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").timeZone("America/Denver");
   req->rangeFacet("inherited", "when_dt").calendarRange(
       "2024-03-10", "2024-03-11", 1, api::CalendarGap_::Unit::DAY);
@@ -1372,7 +1372,7 @@ TEST_F(FacetTest, dateRangeFacetDateMathBounds) {
   };
   setRangeFacetSchema(helper, fields);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   int64_t now = req->dateMathNowEpochMillis;
   req->rangeFacet("days", "when_dt").range(
@@ -1394,7 +1394,7 @@ TEST_F(FacetTest, dateRangeFacetSkippedBoundWarns) {
   };
   setRangeFacetSchema(helper, fields);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& cursor = req->rangeFacet("minutes", "when_dt")
                      .range("2024-03-10T02:30", "2024-03-10T04", 60000);
@@ -1420,7 +1420,7 @@ TEST_F(FacetTest, calendarDateRangeFromStartAndFoldProvenance) {
   };
   setRangeFacetSchema(helper, fields);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->rangeFacet("month_ends", "when_dt").calendarRange(
       "2024-01-31", "2024-04-01", 1,
@@ -1475,7 +1475,7 @@ TEST_F(FacetTest, calendarDateRangeApiaSkippedDayParityAndWarning) {
   PointsRangeFacetTestGuard guard;
   auto run = [&](bool disablePoints) {
     IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->rangeFacet("by_day", "when_dt").calendarRange(
         "2011-12-29", "2012-01-02", 1,
@@ -1513,7 +1513,7 @@ TEST_F(FacetTest, rangeFacetValidationAndDegenerateRanges) {
   setRangeFacetSchema(helper, fields);
 
   auto expectError = [&](auto configure, std::string_view text) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     configure(*req);
     req->execute(false);
@@ -1606,7 +1606,7 @@ TEST_F(FacetTest, rangeFacetEmptyDomainAndPartialLastBucket) {
   ASSERT_TRUE(helper.index(flatdoc("id", "a", "number_i", 9, "pick_s", "no"),
                            UpdateMessage::COMMIT).success);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q");
   top.matchQuery("pick_s", "yes");
@@ -1627,7 +1627,7 @@ TEST_F(FacetTest, rangeFacetEmptyDomainAndPartialLastBucket) {
 TEST_F(FacetTest, emptyIndexNestedFacet) {
   CollectionHelper helper;
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -1635,7 +1635,7 @@ TEST_F(FacetTest, emptyIndexNestedFacet) {
 
   auto& facet = topDocs.facet("f", "category_s");
   facet.limit(10);
-  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+  std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
   req->execute(true);
 
@@ -1646,7 +1646,7 @@ TEST_F(FacetTest, emptyIndexNestedFacet) {
   ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  EXPECT_EQ(0, (int)std::get<solux::api::ColStr>(facetResult->bucket_ids->kind).v.size());
+  EXPECT_EQ(0, (int)std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind).v.size());
   EXPECT_EQ(0, (int)facetResult->counts.size());
   EXPECT_EQ(0, facetResult->missing.value_or(0));
 }
@@ -1665,7 +1665,7 @@ TEST_F(FacetTest, singleSegment) {
   
   // Test integer faceting
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
     req->topDocs().getNumber(true).allQuery();
@@ -1676,7 +1676,7 @@ TEST_F(FacetTest, singleSegment) {
     ASSERT_EQ(1u, req->responses.size());
     const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facetResult, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColInt>(facetResult->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColInt>(facetResult->bucket_ids->kind);
 
     // Should have 5 buckets (0, 10, 20, 30, 40)
     ASSERT_EQ(5, (int)bucketIds.v.size());
@@ -1691,7 +1691,7 @@ TEST_F(FacetTest, singleSegment) {
 
   // Test string faceting
   {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
     req->topDocs().getNumber(true).allQuery();
@@ -1702,7 +1702,7 @@ TEST_F(FacetTest, singleSegment) {
     ASSERT_EQ(1u, req->responses.size());
     const auto* facetResult = req->responses[0]->proto.ops.at("f_str")->facetResult();
     ASSERT_NE(facetResult, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
 
     // Should have 3 unique colors
     ASSERT_EQ(3, (int)bucketIds.v.size());
@@ -1737,7 +1737,7 @@ TEST_F(FacetTest, multipleSegments) {
   }
   
   // Create search request with faceting
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   req->topDocs().getNumber(true).allQuery();
@@ -1750,7 +1750,7 @@ TEST_F(FacetTest, multipleSegments) {
   ASSERT_NE(facetResult, nullptr);
 
   // Should have 9 unique values: 0,1,2,10,11,12,20,21,22
-  ASSERT_EQ(9, (int)std::get<solux::api::ColInt>(facetResult->bucket_ids->kind).v.size());
+  ASSERT_EQ(9, (int)std::get<luxir::api::ColInt>(facetResult->bucket_ids->kind).v.size());
   ASSERT_EQ(9, (int)facetResult->counts.size());
 
   // Each value should have count of 1
@@ -1784,7 +1784,7 @@ TEST_F(FacetTest, matchAllCountsFromDomain) {
 
   for (int64_t limit : {0, 2, 100}) {
     for (bool para : {false, true}) {
-      auto req = localReq(soluxNode->getSearchEngine());
+      auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
       req->topDocs().allQuery().getNumber(true).limit(limit);
       req->facet("f", "color_s").limit(10);
@@ -1796,7 +1796,7 @@ TEST_F(FacetTest, matchAllCountsFromDomain) {
       ASSERT_EQ(std::min(limit, (int64_t)9), (int64_t)docs->row_count) << why;
 
       const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
-      const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+      const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
       ASSERT_EQ(3u, bucketIds.v.size()) << why;
       for (size_t i = 0; i < bucketIds.v.size(); i++) {
         EXPECT_EQ(expected[std::string(bucketIds.v[i])], facetResult->counts[i])
@@ -1819,7 +1819,7 @@ TEST_F(FacetTest, flatOrdMapDeltaFrames) {
     helper.commit();
   }
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs().getNumber(true).allQuery();
   req->facet("f", "cat_s").limit(-1);
@@ -1844,14 +1844,14 @@ TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
   helper.index(flatdoc("id", "c", "other_s", "x"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "d", "other_s", "y"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   req->topDocs().getNumber(true).allQuery();
 
   auto& facet = req->facet("f", "body_w");
   facet.limit(-1);
-  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+  std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
   req->execute(true);
 
@@ -1859,7 +1859,7 @@ TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
   ASSERT_TRUE(req->responses[0]->proto.ops.contains("f")) << req->toString();
   const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(2, (int)bucketIds.v.size());
   ASSERT_EQ(2, (int)facetResult->counts.size());
   EXPECT_EQ("alpha", bucketIds.v[0]);
@@ -1886,7 +1886,7 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   }
   helper.commit();
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -1903,7 +1903,7 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(4, (int)bucketIds.v.size());
   ASSERT_EQ(4, (int)facetResult->counts.size());
   EXPECT_EQ("apple", bucketIds.v[0]);
@@ -1926,7 +1926,7 @@ TEST_F(FacetTest, vectorOptimization) {
   helper.commit();
   
   // Create search request with faceting
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   req->topDocs().getNumber(true).allQuery();
@@ -1937,7 +1937,7 @@ TEST_F(FacetTest, vectorOptimization) {
   ASSERT_EQ(1u, req->responses.size());
   const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr);
-  const auto& bucketIds = std::get<solux::api::ColInt>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColInt>(facetResult->bucket_ids->kind);
 
   // Should have 20 unique values (0-19)
   ASSERT_EQ(20, (int)bucketIds.v.size());
@@ -1969,7 +1969,7 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
   auto run = [&](FacetSubOpInlineMode mode) {
     FacetSubOpInlineGuard guard;
     forcedFacetSubOpInline = mode;
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs().getNumber(true).allQuery();
     auto& facet = req->facet("f", "cat_s");
@@ -1988,12 +1988,12 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
     if (result == nullptr) {
       return std::tuple(buckets, counts, foo, bar);
     }
-    for (auto& id : std::get<solux::api::ColStr>(result->bucket_ids->kind).v) {
+    for (auto& id : std::get<luxir::api::ColStr>(result->bucket_ids->kind).v) {
       buckets.emplace_back(id);
     }
     for (auto count : result->counts) counts.push_back(count);
-    for (auto v : std::get<solux::api::ArrDouble>(result->ops.at("avg_foo")->kind).v) foo.push_back(v);
-    for (auto v : std::get<solux::api::ArrDouble>(result->ops.at("avg_bar")->kind).v) bar.push_back(v);
+    for (auto v : std::get<luxir::api::ArrDouble>(result->ops.at("avg_foo")->kind).v) foo.push_back(v);
+    for (auto v : std::get<luxir::api::ArrDouble>(result->ops.at("avg_bar")->kind).v) bar.push_back(v);
     return std::tuple(buckets, counts, foo, bar);
   };
 
@@ -2029,7 +2029,7 @@ TEST_F(FacetTest, subOpInlineAutoFollowsBucketCoverage) {
   }
 
   auto feedDetails = [&](const char* field, bool sorted) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main").profile();
     req->topDocs().getNumber(true).allQuery();
     auto& facet = req->facet("f", field);
@@ -2084,7 +2084,7 @@ TEST_F(FacetTest, boundedSelectionMatchesOrderingEveryBucket) {
   }
 
   auto run = [&](int64_t limit) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs().getNumber(true).allQuery();
     auto& facet = req->facet("f", "cat_s");
@@ -2097,8 +2097,8 @@ TEST_F(FacetTest, boundedSelectionMatchesOrderingEveryBucket) {
     const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
     EXPECT_NE(result, nullptr) << req->toString();
     if (result == nullptr) return buckets;
-    const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind).v;
-    const auto& avg = std::get<solux::api::ArrDouble>(
+    const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
+    const auto& avg = std::get<luxir::api::ArrDouble>(
         result->ops.at("avg_foo")->kind).v;
     EXPECT_EQ(ids.size(), avg.size());
     for (size_t i = 0; i < ids.size(); i++) {
@@ -2282,7 +2282,7 @@ TEST_F(FacetTest, sortBySubOp) {
   // Builds a facet on cat_s with an inline avg(foo_i) sub-op, sorted by that
   // sub-op, and returns the request handle (kept alive by the caller).
   auto runFacet = [&](int64_t limit, qb::SortDir dir) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
     req->topDocs().getNumber(true).allQuery();
@@ -2302,7 +2302,7 @@ TEST_F(FacetTest, sortBySubOp) {
     auto req = runFacet(10, qb::ASC);
     const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facet, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(facet->bucket_ids->kind);
     ASSERT_EQ(3, (int)bucketIds.v.size());
     EXPECT_EQ("b", bucketIds.v[0]);
     EXPECT_EQ("c", bucketIds.v[1]);
@@ -2310,7 +2310,7 @@ TEST_F(FacetTest, sortBySubOp) {
     EXPECT_EQ(1, facet->counts[0]);
     EXPECT_EQ(2, facet->counts[1]);
     EXPECT_EQ(3, facet->counts[2]);
-    const auto& avg = std::get<solux::api::ArrDouble>(facet->ops.at("avgsub")->kind);
+    const auto& avg = std::get<luxir::api::ArrDouble>(facet->ops.at("avgsub")->kind);
     ASSERT_EQ(3, (int)avg.v.size());
     EXPECT_EQ(1, avg.v[0]);
     EXPECT_EQ(50, avg.v[1]);
@@ -2323,11 +2323,11 @@ TEST_F(FacetTest, sortBySubOp) {
     auto req = runFacet(2, qb::DESC);
     const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facet, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(facet->bucket_ids->kind);
     ASSERT_EQ(2, (int)bucketIds.v.size());
     EXPECT_EQ("a", bucketIds.v[0]);
     EXPECT_EQ("c", bucketIds.v[1]);
-    const auto& avg = std::get<solux::api::ArrDouble>(facet->ops.at("avgsub")->kind);
+    const auto& avg = std::get<luxir::api::ArrDouble>(facet->ops.at("avgsub")->kind);
     ASSERT_EQ(2, (int)avg.v.size());
     EXPECT_EQ(100, avg.v[0]);
     EXPECT_EQ(50, avg.v[1]);
@@ -2357,7 +2357,7 @@ TEST_F(FacetTest, minMaxSubOps) {
 
   // Default count-desc sort with bucket-id tiebreak: a(3), b(2), d(2), c(1).
   for (int64_t limit : {10, -1}) {  // 10 = deferred sub-op path, -1 = inline path
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs().getNumber(true).allQuery();
     auto& facet = req->facet("f", "cat_s");
@@ -2369,14 +2369,14 @@ TEST_F(FacetTest, minMaxSubOps) {
     ASSERT_EQ(1u, req->responses.size()) << req->toString();
     const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facetResult, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
     ASSERT_EQ(4, (int)bucketIds.v.size()) << "limit=" << limit;
     EXPECT_EQ("a", bucketIds.v[0]);
     EXPECT_EQ("b", bucketIds.v[1]);
     EXPECT_EQ("d", bucketIds.v[2]);
     EXPECT_EQ("c", bucketIds.v[3]);
-    const auto& mn = std::get<solux::api::ArrDouble>(facetResult->ops.at("mn")->kind);
-    const auto& mx = std::get<solux::api::ArrDouble>(facetResult->ops.at("mx")->kind);
+    const auto& mn = std::get<luxir::api::ArrDouble>(facetResult->ops.at("mn")->kind);
+    const auto& mx = std::get<luxir::api::ArrDouble>(facetResult->ops.at("mx")->kind);
     ASSERT_EQ(4, (int)mn.v.size()) << "limit=" << limit;
     ASSERT_EQ(4, (int)mx.v.size()) << "limit=" << limit;
     EXPECT_EQ(-5, mn.v[0]);
@@ -2409,7 +2409,7 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
   helper.index(flatdoc("cat_s", "d", "other_i", 1), UpdateMessage::COMMIT);
 
   auto runFacet = [&](int64_t limit, qb::SortDir dir) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs().getNumber(true).allQuery();
     auto& facet = req->facet("f", "cat_s");
@@ -2425,13 +2425,13 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
     auto req = runFacet(10, qb::ASC);
     const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facet, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(facet->bucket_ids->kind);
     ASSERT_EQ(4, (int)bucketIds.v.size());
     EXPECT_EQ("d", bucketIds.v[0]);
     EXPECT_EQ("b", bucketIds.v[1]);
     EXPECT_EQ("c", bucketIds.v[2]);
     EXPECT_EQ("a", bucketIds.v[3]);
-    const auto& mn = std::get<solux::api::ArrDouble>(facet->ops.at("mn")->kind);
+    const auto& mn = std::get<luxir::api::ArrDouble>(facet->ops.at("mn")->kind);
     ASSERT_EQ(4, (int)mn.v.size());
     EXPECT_TRUE(std::isnan(mn.v[0]));
     EXPECT_EQ(1, mn.v[1]);
@@ -2444,12 +2444,12 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
     auto req = runFacet(3, qb::DESC);
     const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facet, nullptr);
-    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(facet->bucket_ids->kind);
     ASSERT_EQ(3, (int)bucketIds.v.size());
     EXPECT_EQ("a", bucketIds.v[0]);
     EXPECT_EQ("c", bucketIds.v[1]);
     EXPECT_EQ("b", bucketIds.v[2]);
-    const auto& mn = std::get<solux::api::ArrDouble>(facet->ops.at("mn")->kind);
+    const auto& mn = std::get<luxir::api::ArrDouble>(facet->ops.at("mn")->kind);
     ASSERT_EQ(3, (int)mn.v.size());
     EXPECT_EQ(100, mn.v[0]);
     EXPECT_EQ(50, mn.v[1]);
@@ -2482,7 +2482,7 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   helper.indexAll(firstSegment, UpdateMessage::COMMIT);
   helper.indexAll(secondSegment, UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   req->topDocs().getNumber(true).allQuery();
@@ -2497,11 +2497,11 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   ASSERT_OK(req);
   const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(totalDocs, (int)bucketIds.v.size());
   ASSERT_EQ(totalDocs, (int)facetResult->counts.size());
-  const auto& avgScoreResult = std::get<solux::api::ArrDouble>(facetResult->ops.at("avg_score")->kind);
-  const auto& avgBonusResult = std::get<solux::api::ArrDouble>(facetResult->ops.at("avg_bonus")->kind);
+  const auto& avgScoreResult = std::get<luxir::api::ArrDouble>(facetResult->ops.at("avg_score")->kind);
+  const auto& avgBonusResult = std::get<luxir::api::ArrDouble>(facetResult->ops.at("avg_bonus")->kind);
   ASSERT_EQ(totalDocs, (int)avgScoreResult.v.size());
   ASSERT_EQ(totalDocs, (int)avgBonusResult.v.size());
 
@@ -2530,7 +2530,7 @@ TEST_F(FacetTest, sumInlineSortsAndAccumulatesIntegersExactly) {
   helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(3), "id", "b2"),
                UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& facet = req->facet("categories", "cat_s").limit(-1);
   facet.sum("total", "amount_is");
@@ -2541,8 +2541,8 @@ TEST_F(FacetTest, sumInlineSortsAndAccumulatesIntegersExactly) {
   ASSERT_OK(req);
   const auto* result = req->responses[0]->proto.ops.at("categories")->facetResult();
   ASSERT_NE(result, nullptr);
-  const auto& ids = std::get<solux::api::ColStr>(result->bucket_ids->kind).v;
-  const auto& totals = std::get<solux::api::ArrDouble>(result->ops.at("total")->kind).v;
+  const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
+  const auto& totals = std::get<luxir::api::ArrDouble>(result->ops.at("total")->kind).v;
   ASSERT_EQ(3u, ids.size());
   ASSERT_EQ(ids.size(), totals.size());
   EXPECT_EQ("b", ids[0]);
@@ -2564,7 +2564,7 @@ TEST_F(FacetTest, rangeFacetSubOps) {
   helper.index(flatdoc("keep_s", "y", "val_i", 7, "score_i", 20), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("keep_s", "y", "val_i", 25, "score_i", 50), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& topDocs = req->topDocs("q").getNumber(true).matchQuery("keep_s", "y");
   topDocs.rangeFacet("f", "val_i").range(0, 30, 10)
@@ -2609,7 +2609,7 @@ TEST_F(FacetTest, rangeFacetSubOpsMultiValueAndMincount) {
     flatdoc("vals_is", vec_i(3, 25), "score_i", 7),
   }, UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs().getNumber(true).allQuery();
   req->rangeFacet("f", "vals_is").range(0, 30, 10).mincount(1)
@@ -2641,7 +2641,7 @@ TEST_F(FacetTest, rangeFacetNestedUnderStringFacet) {
   helper.index(flatdoc("cat_s", "a", "val_i", 15), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("cat_s", "b", "val_i", 5), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs().getNumber(true).allQuery();
   req->facet("f", "cat_s").rangeFacet("r", "val_i").range(0, 20, 10);
@@ -2828,7 +2828,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   };
 
   for (const auto& testCase : cases) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     testCase.configure(*req);
 
@@ -2850,7 +2850,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
 TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   CollectionHelper helper;
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->testForcePrepare = true;  // wraps the root: force_prepare(all)
   req->collection("main");
 
@@ -2872,7 +2872,7 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
   const auto* fFacet = docs->ops.at("f")->facetResult();
   ASSERT_NE(fFacet, nullptr) << req->toString();
-  EXPECT_EQ(0, (int)std::get<solux::api::ColStr>(fFacet->bucket_ids->kind).v.size());
+  EXPECT_EQ(0, (int)std::get<luxir::api::ColStr>(fFacet->bucket_ids->kind).v.size());
   ASSERT_TRUE(docs->ops.contains("a")) << req->toString();
   EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("a")->kind)));
 }
@@ -2889,7 +2889,7 @@ TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -2904,7 +2904,7 @@ TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
   ASSERT_NE(qDocs, nullptr) << req->toString();
   const auto* facetResult = qDocs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(2, (int)bucketIds.v.size()) << req->toString();
   ASSERT_EQ(2, (int)facetResult->counts.size());
   EXPECT_EQ("a", bucketIds.v[0]);
@@ -2920,7 +2920,7 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
   helper.index(flatdoc("id", "3", "cat_s", "y", "sel_s", "no"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "4", "cat_s", "z", "sel_s", "no"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -2935,7 +2935,7 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
   ASSERT_NE(docs, nullptr) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(3, (int)bucketIds.v.size()) << req->toString();
   ASSERT_EQ(3, (int)facetResult->counts.size());
   EXPECT_EQ("x", bucketIds.v[0]);
@@ -2955,7 +2955,7 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
   helper.index(flatdoc("id", "5", "cat_s", "d", "sel_s", "no"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "6", "cat_s", "e", "sel_s", "no"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -2970,7 +2970,7 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
   ASSERT_NE(docs, nullptr) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(4, (int)bucketIds.v.size()) << req->toString();
   ASSERT_EQ(4, (int)facetResult->counts.size());
   EXPECT_EQ("a", bucketIds.v[0]);
@@ -2990,7 +2990,7 @@ TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
   helper.index(flatdoc("id", "3", "sel_s", "no", "body_w", "gamma"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "4", "sel_s", "no", "body_w", "delta"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -3005,7 +3005,7 @@ TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
   ASSERT_NE(docs, nullptr) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(4, (int)bucketIds.v.size()) << req->toString();
   ASSERT_EQ(4, (int)facetResult->counts.size());
   EXPECT_EQ("alpha", bucketIds.v[0]);
@@ -3036,7 +3036,7 @@ TEST_F(FacetTest, avgNestedSparseArrayDomain) {
   }
   helper.commit();
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -3065,7 +3065,7 @@ TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
   helper.index(flatdoc("id", "3", "other_s", "x"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "4", "other_s", "y"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -3073,7 +3073,7 @@ TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
 
   auto& facet = topDocs.facet("f", "body_w");
   facet.limit(-1);
-  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+  std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
   req->execute(true);
 
@@ -3082,7 +3082,7 @@ TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
   ASSERT_NE(docs, nullptr) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(2, (int)bucketIds.v.size());
   EXPECT_EQ("alpha", bucketIds.v[0]);
   EXPECT_EQ(2, facetResult->counts[0]);
@@ -3114,7 +3114,7 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   }
   helper.commit();
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
   auto& topDocs = req->topDocs();
@@ -3122,7 +3122,7 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
 
   auto& facet = topDocs.facet("f", "body_w");
   facet.limit(-1);
-  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
+  std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
   req->execute(true);
 
@@ -3132,7 +3132,7 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   ASSERT_EQ(3, docs->found.value_or(0));
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   // Only in-domain docs contribute: alpha (doc 5) and beta (doc 50). The gamma
   // docs have body_w but are out of domain, so they appear in neither the
   // buckets nor the have-field count.
@@ -3164,7 +3164,7 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
 
   // domain = {A,C,D,F,G}; x={A,D} avg 20; y={C,F} avg 30; z={G} avg 100 (count 1).
   for (int64_t limit : {(int64_t)10, (int64_t)-1}) {
-    auto req = localReq(soluxNode->getSearchEngine());
+    auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs();
     topDocs.getNumber(true).matchQuery("sel_s", "yes");
@@ -3178,8 +3178,8 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
     ASSERT_NE(docs, nullptr) << req->toString();
     const auto* f = docs->ops.at("f")->facetResult();
     ASSERT_NE(f, nullptr) << req->toString();
-    const auto& bucketIds = std::get<solux::api::ColStr>(f->bucket_ids->kind);
-    const auto& avgArr = std::get<solux::api::ArrDouble>(f->ops.at("av")->kind);
+    const auto& bucketIds = std::get<luxir::api::ColStr>(f->bucket_ids->kind);
+    const auto& avgArr = std::get<luxir::api::ArrDouble>(f->ops.at("av")->kind);
     ASSERT_EQ(3, (int)bucketIds.v.size()) << "limit=" << limit << "\n" << req->toString();
     std::map<std::string, double> got;
     for (int i = 0; i < (int)bucketIds.v.size(); i++)
@@ -3201,7 +3201,7 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   helper.index(flatdoc("id", "C", "sel_s", "yes", "avgval_i", 1000), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "D", "sel_s", "yes", "avgval_i", 2000), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& topDocs = req->topDocs();
   topDocs.getNumber(true).matchQuery("sel_s", "yes");
@@ -3215,19 +3215,19 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   ASSERT_NE(docs, nullptr) << req->toString();
   const auto* f = docs->ops.at("f")->facetResult();
   ASSERT_NE(f, nullptr) << req->toString();
-  const auto& bucketIds = std::get<solux::api::ColStr>(f->bucket_ids->kind);
+  const auto& bucketIds = std::get<luxir::api::ColStr>(f->bucket_ids->kind);
   ASSERT_EQ(1, (int)bucketIds.v.size()) << req->toString();
   EXPECT_EQ("x", bucketIds.v[0]);
   EXPECT_EQ(2, f->counts[0]);
   // bucket x = {A,B}; avg = (10+20)/2 = 15. C,D lack cat_s and must NOT leak in.
-  EXPECT_DOUBLE_EQ(15.0, std::get<solux::api::ArrDouble>(f->ops.at("av")->kind).v[0]) << req->toString();
+  EXPECT_DOUBLE_EQ(15.0, std::get<luxir::api::ArrDouble>(f->ops.at("av")->kind).v[0]) << req->toString();
 }
 
 TEST_F(FacetTest, topDocsUnderFacetRejected) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "a", "cat_s", "x"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& facet = req->facet("f", "cat_s");
   facet.topDocs("bucket_docs").allQuery().fields({"id"}).getNumber().limit(-1);
@@ -3247,7 +3247,7 @@ TEST_F(FacetTest, nestedStringFacet) {
   helper.index(flatdoc("id", "2", "cat_s", "x", "sub_s", "q"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "3", "cat_s", "y", "sub_s", "p"), UpdateMessage::COMMIT);
 
-  auto req = localReq(soluxNode->getSearchEngine());
+  auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& topDocs = req->topDocs();
   topDocs.allQuery();
@@ -3261,23 +3261,23 @@ TEST_F(FacetTest, nestedStringFacet) {
   ASSERT_NE(docs, nullptr) << req->toString();
   const auto* f = docs->ops.at("f")->facetResult();
   ASSERT_NE(f, nullptr) << req->toString();
-  const auto& fIds = std::get<solux::api::ColStr>(f->bucket_ids->kind);
+  const auto& fIds = std::get<luxir::api::ColStr>(f->bucket_ids->kind);
   ASSERT_EQ(2, (int)fIds.v.size()) << req->toString();
   EXPECT_EQ("x", fIds.v[0]);  // x(2), y(1): count desc
   EXPECT_EQ("y", fIds.v[1]);
-  const auto& sfArr = std::get<solux::api::ArrVal>(f->ops.at("sf")->kind);
+  const auto& sfArr = std::get<luxir::api::ArrVal>(f->ops.at("sf")->kind);
   ASSERT_EQ(2, (int)sfArr.v.size()) << req->toString();  // one sub-facet per parent bucket
   // bucket x = docs {1,2} -> sub_s {p:1, q:1}
-  const auto& sfx = std::get<solux::api::FacetResult>(sfArr.v[0].kind);
-  const auto& sfxIds = std::get<solux::api::ColStr>(sfx.bucket_ids->kind);
+  const auto& sfx = std::get<luxir::api::FacetResult>(sfArr.v[0].kind);
+  const auto& sfxIds = std::get<luxir::api::ColStr>(sfx.bucket_ids->kind);
   ASSERT_EQ(2, (int)sfxIds.v.size()) << req->toString();
   EXPECT_EQ("p", sfxIds.v[0]);
   EXPECT_EQ("q", sfxIds.v[1]);
   EXPECT_EQ(1, sfx.counts[0]);
   EXPECT_EQ(1, sfx.counts[1]);
   // bucket y = doc {3} -> sub_s {p:1}
-  const auto& sfy = std::get<solux::api::FacetResult>(sfArr.v[1].kind);
-  const auto& sfyIds = std::get<solux::api::ColStr>(sfy.bucket_ids->kind);
+  const auto& sfy = std::get<luxir::api::FacetResult>(sfArr.v[1].kind);
+  const auto& sfyIds = std::get<luxir::api::ColStr>(sfy.bucket_ids->kind);
   ASSERT_EQ(1, (int)sfyIds.v.size()) << req->toString();
   EXPECT_EQ("p", sfyIds.v[0]);
   EXPECT_EQ(1, sfy.counts[0]);
@@ -3435,7 +3435,7 @@ TEST_F(FacetTest, stringColumnReplayMatchesBucketDomainsAcrossArities) {
 //
 // Comprehensive random faceting test class
 //
-class RandomFacetTest : public SoluxTest {
+class RandomFacetTest : public LuxirTest {
 protected:
   static constexpr int MERGE_FACTOR = 10;
   static constexpr int NUM_FIELDS = 8;  // we do a linear search on field names in the document, so keep this small.
@@ -3455,11 +3455,11 @@ protected:
   // No need for FacetRequest struct anymore - we read the built request directly.
 
   // The request is built via the OpCursor fluent API; the model reads it back through the
-  // non-owning concrete request view (LocalReq::proto, a solux::api::SearchRequest).
-  using ReqOps = solux::test::OpsMap;  // map_view<string_view, indirect_view<SearchOp>>
-  using RespOps = solux::api::map_view<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>;
+  // non-owning concrete request view (LocalReq::proto, a luxir::api::SearchRequest).
+  using ReqOps = luxir::test::OpsMap;  // map_view<string_view, indirect_view<SearchOp>>
+  using RespOps = luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>;
 
-  // Plain expected-result mirror of the engine's solux::api facet/doclist output. The model
+  // Plain expected-result mirror of the engine's luxir::api facet/doclist output. The model
   // computes these from the built request; verify compares the (non-owning, arena-backed)
   // engine output against them. (The api result types are spans into an arena, so a plain
   // owning mirror is simpler than rebuilding owning api structs.)
@@ -3561,17 +3561,17 @@ protected:
       return out;
     }
 
-    std::vector<size_t> matchingDocIndexes(const solux::api::Query& query) const {
+    std::vector<size_t> matchingDocIndexes(const luxir::api::Query& query) const {
       std::vector<size_t> out;
       out.reserve(docs.size());
       if (std::holds_alternative<bool>(query.kind) && std::get<bool>(query.kind)) {
         return allDocIndexes();
       }
-      if (!std::holds_alternative<solux::api::Match>(query.kind)) {
+      if (!std::holds_alternative<luxir::api::Match>(query.kind)) {
         return allDocIndexes();
       }
 
-      const auto& match = std::get<solux::api::Match>(query.kind);
+      const auto& match = std::get<luxir::api::Match>(query.kind);
       const auto& matchVal = *match.val;
       size_t ordinal = fieldOrdinal(match.field);
       for (size_t i = 0; i < docs.size(); i++) {
@@ -3608,7 +3608,7 @@ protected:
     }
 
     // Dump model state for debugging
-    void dumpModel(const std::string& field, const solux::api::Query& query) const {
+    void dumpModel(const std::string& field, const luxir::api::Query& query) const {
       LOG_ERROR("=== Model Dump for field '{}' ===", field);
       LOG_ERROR("Total docs: {}", docs.size());
       
@@ -3640,8 +3640,8 @@ protected:
       }
       
       std::string queryStr;
-      if (std::holds_alternative<solux::api::Match>(query.kind)) {
-        const auto& qm = std::get<solux::api::Match>(query.kind);
+      if (std::holds_alternative<luxir::api::Match>(query.kind)) {
+        const auto& qm = std::get<luxir::api::Match>(query.kind);
         const auto& qv = *qm.val;
         queryStr = "match(" + std::string(qm.field) + "=" +
           (std::holds_alternative<std::string_view>(qv.kind) ? std::string(std::get<std::string_view>(qv.kind)) :
@@ -3676,13 +3676,13 @@ protected:
     }
     
     // Check if a document matches a query
-    bool matchesQuery(const Doc& doc, const solux::api::Query& query) const {
+    bool matchesQuery(const Doc& doc, const luxir::api::Query& query) const {
       if (std::holds_alternative<bool>(query.kind) && std::get<bool>(query.kind)) {
         return true;
       }
 
-      if (std::holds_alternative<solux::api::Match>(query.kind)) {
-        const auto& match = std::get<solux::api::Match>(query.kind);
+      if (std::holds_alternative<luxir::api::Match>(query.kind)) {
+        const auto& match = std::get<luxir::api::Match>(query.kind);
         const auto& matchVal = *match.val;
         std::vector<const FieldVal*> vals;
         findAll(doc, match.field, vals);
@@ -3739,19 +3739,19 @@ protected:
       auto allDocs = allDocIndexes();
       for (const auto& [opName, searchOpPtr] : requestOps) {
         const auto& searchOp = *searchOpPtr;
-        if (std::holds_alternative<solux::api::FieldFacet>(searchOp.kind)) {
+        if (std::holds_alternative<luxir::api::FieldFacet>(searchOp.kind)) {
           // Process field facet - facets at root level operate on all documents
-          ExpVal v; v.facet = calculateFieldFacet(std::get<solux::api::FieldFacet>(searchOp.kind), allDocs);
+          ExpVal v; v.facet = calculateFieldFacet(std::get<luxir::api::FieldFacet>(searchOp.kind), allDocs);
           responseOps[std::string(opName)] = std::move(v);
-        } else if (std::holds_alternative<solux::api::RangeFacet>(searchOp.kind)) {
-          ExpVal v; v.facet = calculateRangeFacet(std::get<solux::api::RangeFacet>(searchOp.kind), allDocs);
+        } else if (std::holds_alternative<luxir::api::RangeFacet>(searchOp.kind)) {
+          ExpVal v; v.facet = calculateRangeFacet(std::get<luxir::api::RangeFacet>(searchOp.kind), allDocs);
           responseOps[std::string(opName)] = std::move(v);
-        } else if (std::holds_alternative<solux::api::TopDocs>(searchOp.kind)) {
+        } else if (std::holds_alternative<luxir::api::TopDocs>(searchOp.kind)) {
           // Process top docs query (which may have nested ops)
-          const auto& topDocs = std::get<solux::api::TopDocs>(searchOp.kind);
+          const auto& topDocs = std::get<luxir::api::TopDocs>(searchOp.kind);
 
           // The query in top_docs defines the domain for nested ops
-          solux::api::Query effectiveQuery;
+          luxir::api::Query effectiveQuery;
           if (topDocs.query.has_value()) effectiveQuery = *topDocs.query;
           if (effectiveQuery.kind.index() == 0) {
             effectiveQuery.kind = true;  // Default to all if no query specified
@@ -3777,18 +3777,18 @@ protected:
 
       for (const auto& [opName, searchOpPtr] : requestOps) {
         const auto& searchOp = *searchOpPtr;
-        if (std::holds_alternative<solux::api::FieldFacet>(searchOp.kind)) {
+        if (std::holds_alternative<luxir::api::FieldFacet>(searchOp.kind)) {
           // Nested facet uses the domain query from its parent
-          ExpVal v; v.facet = calculateFieldFacet(std::get<solux::api::FieldFacet>(searchOp.kind), domainDocs);
+          ExpVal v; v.facet = calculateFieldFacet(std::get<luxir::api::FieldFacet>(searchOp.kind), domainDocs);
           responseOps[std::string(opName)] = std::move(v);
-        } else if (std::holds_alternative<solux::api::RangeFacet>(searchOp.kind)) {
-          ExpVal v; v.facet = calculateRangeFacet(std::get<solux::api::RangeFacet>(searchOp.kind), domainDocs);
+        } else if (std::holds_alternative<luxir::api::RangeFacet>(searchOp.kind)) {
+          ExpVal v; v.facet = calculateRangeFacet(std::get<luxir::api::RangeFacet>(searchOp.kind), domainDocs);
           responseOps[std::string(opName)] = std::move(v);
-        } else if (std::holds_alternative<solux::api::TopDocs>(searchOp.kind)) {
+        } else if (std::holds_alternative<luxir::api::TopDocs>(searchOp.kind)) {
           // Nested top_docs would combine its query with the domain query
           // This is more complex and would need proper query combination logic
           // For now, just using the nested query
-          const auto& topDocs = std::get<solux::api::TopDocs>(searchOp.kind);
+          const auto& topDocs = std::get<luxir::api::TopDocs>(searchOp.kind);
           ExpVal v; v.isDocList = true;
 
           if (topDocs.query.has_value()) {
@@ -3810,7 +3810,7 @@ protected:
     }
           
     // Calculate expected facet results for a single field facet
-    ExpFacet calculateFieldFacet(const solux::api::FieldFacet& facetOp,
+    ExpFacet calculateFieldFacet(const luxir::api::FieldFacet& facetOp,
                                  const std::vector<size_t>& domainDocs) const {
       ExpFacet out;
 
@@ -3834,8 +3834,8 @@ protected:
       std::vector<AvgOpDef> avgOps;
       for (const auto& [opName, subPtr] : facetOp.ops) {
         const auto& sub = *subPtr;
-        if (std::holds_alternative<solux::api::GenOp>(sub.kind)) {
-          const auto& genOp = std::get<solux::api::GenOp>(sub.kind);
+        if (std::holds_alternative<luxir::api::GenOp>(sub.kind)) {
+          const auto& genOp = std::get<luxir::api::GenOp>(sub.kind);
           if (genOp.name == "avg" || genOp.name == "average") {
             avgOps.push_back({
                 std::string(opName),
@@ -3848,7 +3848,7 @@ protected:
       bool hasSubFacet = false;
       for (const auto& [opName, subPtr] : facetOp.ops) {
         unused(opName);
-        if (std::holds_alternative<solux::api::FieldFacet>(subPtr->kind)) {
+        if (std::holds_alternative<luxir::api::FieldFacet>(subPtr->kind)) {
           hasSubFacet = true;
           break;
         }
@@ -3858,7 +3858,7 @@ protected:
         for (size_t k = 0; k < avgOps.size(); k++)
           if (avgOps[k].name == facetOp.sorts[0].expr) { sortAvgIdx = (int)k; break; }
       }
-      bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts[0].dir == solux::api::SortSpec_::SortDir::DESC;
+      bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts[0].dir == luxir::api::SortSpec_::SortDir::DESC;
 
       // Count values for documents matching the domain query
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
@@ -3973,7 +3973,7 @@ protected:
         if (parentVals.empty()) return out;  // engine emits no sub-op for an empty parent
         for (const auto& [opName, subPtr] : facetOp.ops) {
           const auto& sub = *subPtr;
-          if (!std::holds_alternative<solux::api::FieldFacet>(sub.kind)) continue;
+          if (!std::holds_alternative<luxir::api::FieldFacet>(sub.kind)) continue;
           auto& arr = out.subFacetOps[std::string(opName)];
           for (const auto& bval : parentVals) {
             auto bucketIt = strBucketDocs.find(bval);
@@ -3983,7 +3983,7 @@ protected:
               continue;
             }
             arr.push_back(calculateFieldFacet(
-                std::get<solux::api::FieldFacet>(sub.kind), bucketIt->second));
+                std::get<luxir::api::FieldFacet>(sub.kind), bucketIt->second));
           }
         }
       }
@@ -3994,7 +3994,7 @@ protected:
     // Expected result for an int range facet. Buckets are dense and in
     // bucket order; out-of-range values are dropped (not missing);
     // missing = domain docs with no int value for the field.
-    ExpFacet calculateRangeFacet(const solux::api::RangeFacet& rf,
+    ExpFacet calculateRangeFacet(const luxir::api::RangeFacet& rf,
                                  const std::vector<size_t>& domainDocs) const {
       ExpFacet out;
       out.isRange = true;
@@ -4003,7 +4003,7 @@ protected:
       int64_t start = std::get<int64_t>((*rf.start).kind);
       int64_t end = std::get<int64_t>((*rf.end).kind);
       int64_t gap = std::get<int64_t>(
-          std::get<solux::api::Val>(rf.gap_kind).kind);
+          std::get<luxir::api::Val>(rf.gap_kind).kind);
       int64_t minCount = rf.mincount.value_or(0);
 
       int64_t bucketCount = (end - start) / gap + ((end - start) % gap != 0);
@@ -4244,7 +4244,7 @@ protected:
     cur.range(start, end, gap);
     int mc = rng.rint(3);
     if (mc != 0) cur.mincount(mc - 1);
-    std::get<solux::api::RangeFacet>(cur.rawOp().kind).missing = rng.rbool();
+    std::get<luxir::api::RangeFacet>(cur.rawOp().kind).missing = rng.rbool();
   }
 
   // Add a facet op for `field` under `parent` as `name`: an int field becomes a
@@ -4279,7 +4279,7 @@ protected:
     } else {
       cur.limit(rng.rint(1, 50));  // Random limit
     }
-    auto& ff = std::get<solux::api::FieldFacet>(cur.rawOp().kind);
+    auto& ff = std::get<luxir::api::FieldFacet>(cur.rawOp().kind);
     // Random mincount. Leaving it unset is distinct from explicit 0.
     int mincountChoice = rng.rint(field.isInt ? 4 : 5);
     if (mincountChoice == 0) {
@@ -4412,7 +4412,7 @@ public:
             // Advance RNG to ensure different seed for each test
             localRng(); 
             
-            auto req = localReq(soluxNode->getSearchEngine());
+            auto req = localReq(luxirNode->getSearchEngine());
             req->collection("main");
 
             // Issue several top_docs queries (each its own domain) per request and
@@ -4455,18 +4455,18 @@ public:
             model.processOps(req->proto.ops, expected);
 
             // Compare one facet result (buckets + counts + missing) against the model.
-            std::function<void(const std::string&, const solux::api::FieldFacet&,
-                               const solux::api::FacetResult&, const ExpFacet&)> verifyOneFacet =
-              [&](const std::string& ctx, const solux::api::FieldFacet& ff,
-                  const solux::api::FacetResult& actual, const ExpFacet& expected) {
+            std::function<void(const std::string&, const luxir::api::FieldFacet&,
+                               const luxir::api::FacetResult&, const ExpFacet&)> verifyOneFacet =
+              [&](const std::string& ctx, const luxir::api::FieldFacet& ff,
+                  const luxir::api::FacetResult& actual, const ExpFacet& expected) {
               if (expected.intBuckets) {
-                ASSERT_TRUE(actual.bucket_ids && std::holds_alternative<solux::api::ColInt>(actual.bucket_ids->kind)) << "expected int buckets: " << ctx << "\n" << req->toString();
-                const auto& a = std::get<solux::api::ColInt>(actual.bucket_ids->kind);
+                ASSERT_TRUE(actual.bucket_ids && std::holds_alternative<luxir::api::ColInt>(actual.bucket_ids->kind)) << "expected int buckets: " << ctx << "\n" << req->toString();
+                const auto& a = std::get<luxir::api::ColInt>(actual.bucket_ids->kind);
                 ASSERT_EQ(a.v.size(), expected.intIds.size()) << "bucket count: " << ctx << "\n" << req->toString();
                 for (int i = 0; i < (int)a.v.size(); i++) EXPECT_EQ(a.v[i], expected.intIds[i]) << "bucket " << i << " value: " << ctx;
               } else {
-                ASSERT_TRUE(actual.bucket_ids && std::holds_alternative<solux::api::ColStr>(actual.bucket_ids->kind)) << "expected string buckets: " << ctx << "\n" << req->toString();
-                const auto& a = std::get<solux::api::ColStr>(actual.bucket_ids->kind);
+                ASSERT_TRUE(actual.bucket_ids && std::holds_alternative<luxir::api::ColStr>(actual.bucket_ids->kind)) << "expected string buckets: " << ctx << "\n" << req->toString();
+                const auto& a = std::get<luxir::api::ColStr>(actual.bucket_ids->kind);
                 ASSERT_EQ(a.v.size(), expected.strIds.size()) << "bucket count: " << ctx << "\n" << req->toString();
                 for (int i = 0; i < (int)a.v.size(); i++) EXPECT_EQ(a.v[i], expected.strIds[i]) << "bucket " << i << " value: " << ctx;
               }
@@ -4477,13 +4477,13 @@ public:
               // avg() sub-op result: arr_d with one entry per returned bucket.
               for (const auto& [opName, subPtr] : ff.ops) {
                 const auto& sub = *subPtr;
-                if (std::holds_alternative<solux::api::GenOp>(sub.kind)) {
-                  const auto& genOp = std::get<solux::api::GenOp>(sub.kind);
+                if (std::holds_alternative<luxir::api::GenOp>(sub.kind)) {
+                  const auto& genOp = std::get<luxir::api::GenOp>(sub.kind);
                   if (genOp.name != "avg" && genOp.name != "average") continue;
                   // Empty facets emit no sub-op result (model omits it too).
                   if (!expected.avgOps.contains(std::string(opName))) continue;
                   ASSERT_TRUE(actual.ops.contains(opName)) << "actual avg missing: " << ctx << "\n" << req->toString();
-                  const auto& aArr = std::get<solux::api::ArrDouble>(actual.ops.at(opName)->kind);
+                  const auto& aArr = std::get<luxir::api::ArrDouble>(actual.ops.at(opName)->kind);
                   const auto& eArr = expected.avgOps.at(std::string(opName));
                   ASSERT_EQ(aArr.v.size(), eArr.size()) << "avg arr size: " << ctx << "\n" << req->toString();
                   for (int i = 0; i < (int)eArr.size(); i++)
@@ -4493,16 +4493,16 @@ public:
               // Nested sub-facet results: ops[name].arr.v[i].facet, one per bucket.
               for (const auto& [opName, subPtr] : ff.ops) {
                 const auto& sub = *subPtr;
-                if (!std::holds_alternative<solux::api::FieldFacet>(sub.kind)) continue;
+                if (!std::holds_alternative<luxir::api::FieldFacet>(sub.kind)) continue;
                 if (!expected.subFacetOps.contains(std::string(opName))) continue;  // empty parent -> no sub-op
                 ASSERT_TRUE(actual.ops.contains(opName)) << "actual sub-facet missing: " << ctx << "\n" << req->toString();
-                const auto& aArr = std::get<solux::api::ArrVal>(actual.ops.at(opName)->kind);
+                const auto& aArr = std::get<luxir::api::ArrVal>(actual.ops.at(opName)->kind);
                 const auto& eArr = expected.subFacetOps.at(std::string(opName));
                 ASSERT_EQ(aArr.v.size(), eArr.size()) << "sub-facet arr size: " << ctx << "\n" << req->toString();
                 for (int i = 0; i < (int)eArr.size(); i++)
                   verifyOneFacet(ctx + "/" + std::string(opName) + "[" + std::to_string(i) + "]",
-                                 std::get<solux::api::FieldFacet>(sub.kind),
-                                 std::get<solux::api::FacetResult>(aArr.v[i].kind),
+                                 std::get<luxir::api::FieldFacet>(sub.kind),
+                                 std::get<luxir::api::FacetResult>(aArr.v[i].kind),
                                  eArr[i]);
               }
             };
@@ -4514,22 +4514,22 @@ public:
                 for (const auto& [name, opPtr] : reqOps) {
                   const auto& op = *opPtr;
                   std::string nameStr(name);
-                  if (std::holds_alternative<solux::api::FieldFacet>(op.kind)) {
-                    std::string ctx = path + nameStr + " (field " + std::string(std::get<solux::api::FieldFacet>(op.kind).field) + ")";
+                  if (std::holds_alternative<luxir::api::FieldFacet>(op.kind)) {
+                    std::string ctx = path + nameStr + " (field " + std::string(std::get<luxir::api::FieldFacet>(op.kind).field) + ")";
                     ASSERT_TRUE(expectedOps.contains(nameStr) && !expectedOps.at(nameStr).isDocList) << "expected facet missing: " << ctx;
                     ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name)->facetResult())
                       << "actual facet missing: " << ctx << "\n" << req->toString();
-                    verifyOneFacet(ctx, std::get<solux::api::FieldFacet>(op.kind),
+                    verifyOneFacet(ctx, std::get<luxir::api::FieldFacet>(op.kind),
                                    *actualOps.at(name)->facetResult(),
                                    expectedOps.at(nameStr).facet);
-                  } else if (std::holds_alternative<solux::api::RangeFacet>(op.kind)) {
-                    std::string ctx = path + nameStr + " (range " + std::string(std::get<solux::api::RangeFacet>(op.kind).field) + ")";
+                  } else if (std::holds_alternative<luxir::api::RangeFacet>(op.kind)) {
+                    std::string ctx = path + nameStr + " (range " + std::string(std::get<luxir::api::RangeFacet>(op.kind).field) + ")";
                     ASSERT_TRUE(expectedOps.contains(nameStr) && !expectedOps.at(nameStr).isDocList) << "expected range missing: " << ctx;
                     ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name)->facetResult())
                       << "actual range missing: " << ctx << "\n" << req->toString();
                     const auto& af = *actualOps.at(name)->facetResult();
                     const auto& ef = expectedOps.at(nameStr).facet;
-                    const auto& ab = std::get<solux::api::ArrArrInt>(af.bucket_ids->kind);
+                    const auto& ab = std::get<luxir::api::ArrArrInt>(af.bucket_ids->kind);
                     ASSERT_EQ(ab.v.size(), ef.rangePairs.size()) << "range bucket count: " << ctx << "\n" << req->toString();
                     for (int i = 0; i < (int)ef.rangePairs.size(); i++) {
                       ASSERT_EQ(2, (int)ab.v[i].v.size()) << ctx;
@@ -4539,11 +4539,11 @@ public:
                     ASSERT_EQ(af.counts.size(), ef.counts.size()) << "range counts size: " << ctx;
                     for (int i = 0; i < (int)ef.counts.size(); i++)
                       EXPECT_EQ(af.counts[i], ef.counts[i]) << "range count " << i << ": " << ctx;
-                    if (std::get<solux::api::RangeFacet>(op.kind).missing) { EXPECT_EQ(af.missing.value_or(0), ef.missing.value_or(0)) << "range missing: " << ctx; }
-                  } else if (std::holds_alternative<solux::api::TopDocs>(op.kind) && !std::get<solux::api::TopDocs>(op.kind).ops.empty()) {
+                    if (std::get<luxir::api::RangeFacet>(op.kind).missing) { EXPECT_EQ(af.missing.value_or(0), ef.missing.value_or(0)) << "range missing: " << ctx; }
+                  } else if (std::holds_alternative<luxir::api::TopDocs>(op.kind) && !std::get<luxir::api::TopDocs>(op.kind).ops.empty()) {
                     ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name)->docList()) << "actual docs missing: " << path + nameStr << "\n" << req->toString();
                     ASSERT_TRUE(expectedOps.contains(nameStr) && expectedOps.at(nameStr).isDocList) << "expected docs missing: " << path + nameStr;
-                    verifyOps(std::get<solux::api::TopDocs>(op.kind).ops,
+                    verifyOps(std::get<luxir::api::TopDocs>(op.kind).ops,
                               actualOps.at(name)->docList()->ops,
                               expectedOps.at(nameStr).ops, path + nameStr + "/");
                   }

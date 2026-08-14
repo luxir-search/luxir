@@ -6,22 +6,22 @@
 #include <string_view>
 #include <vector>
 
-#include "solux/api/build.h"
-#include "solux/query/AllQuery.h"
-#include "solux/query/BoostQuery.h"
-#include "solux/query/ExistsQuery.h"
-#include "solux/reader/FieldReader.h"
-#include "solux/reader/TermsEnum.h"
-#include "solux/schema/Schema.h"
+#include "luxir/api/build.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ExistsQuery.h"
+#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/TermsEnum.h"
+#include "luxir/schema/Schema.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "test/SoluxTest.h"
+#include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-using namespace solux;
-using namespace solux::test;
+using namespace luxir;
+using namespace luxir::test;
 
 namespace {
 
@@ -59,7 +59,7 @@ void installExistsSchema(CollectionHelper& helper, SchemaBuilder& b) {
 std::vector<std::string> resultIds(const LocalReq& req) {
   std::vector<std::string> ids;
   for (const Doc& doc : req.getDocs()) {
-    const FieldVal* id = solux::test::find(doc, "id");
+    const FieldVal* id = luxir::test::find(doc, "id");
     if (id != nullptr) ids.push_back(std::get<std::string>(*id));
   }
   std::sort(ids.begin(), ids.end());
@@ -86,7 +86,7 @@ SegFieldInfo readFieldInfo(IndexReader::Segment& segment,
 
 } // namespace
 
-class ExistsQueryTest : public SoluxTest {
+class ExistsQueryTest : public LuxirTest {
 public:
   CollectionHelper helper;
   SchemaBuilder schemaBuilder;  // the installed SchemaDef views its storage

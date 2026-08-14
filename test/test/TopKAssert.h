@@ -6,9 +6,9 @@
 #include <span>
 
 #include "gtest/gtest.h"
-#include "solux/search/Collector.h"
+#include "luxir/search/Collector.h"
 
-namespace solux::test {
+namespace luxir::test {
 
 // Cross-execution-path top-k equivalence under the accepted score policy:
 // clause sums may differ in low bits between execution paths (FP summation
@@ -56,4 +56,4 @@ inline void assertTopKEquivalent(std::span<const TopDocsCollector::ScoreDoc> exp
   }
 }
 
-} // namespace solux::test
+} // namespace luxir::test

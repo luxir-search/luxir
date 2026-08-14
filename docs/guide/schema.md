@@ -1,6 +1,6 @@
 # Schema
 
-Solux works without a schema: field types come from name suffixes (`title_w`,
+Luxir works without a schema: field types come from name suffixes (`title_w`,
 `year_i`, `tags_ss` - see the [Quickstart](quickstart.md)). When you want real
 field names without suffixes, a custom analyzer, or typed vector fields, you
 define a schema. The schema API speaks the same JSON in both directions: what

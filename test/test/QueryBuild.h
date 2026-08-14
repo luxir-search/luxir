@@ -1,8 +1,8 @@
 #pragma once
-// Arena-backed builders for the concrete solux::api query/op constructs the OpCursor fluent
+// Arena-backed builders for the concrete luxir::api query/op constructs the OpCursor fluent
 // helpers don't cover (boolean trees, knn, fusion sources, sorts). Every builder allocates
 // nested spans into a caller-provided std::pmr::memory_resource (use OpCursor::mr() / the
-// LocalReq's `mr`), which must outlive the request. All solux::api types are trivially
+// LocalReq's `mr`), which must outlive the request. All luxir::api types are trivially
 // copyable with their nested data in the arena, so Query/SortSpec values can be passed and
 // copied by value freely.
 //
@@ -18,13 +18,13 @@
 #include <vector>
 
 #include "LocalReq.h"
-#include "solux/api/build.h"
-#include "solux/api/solux_types.hpp"
+#include "luxir/api/build.h"
+#include "luxir/api/luxir_types.hpp"
 
-namespace solux::test::qb {
+namespace luxir::test::qb {
 
-namespace api = solux::api;
-namespace build = solux::api::build;
+namespace api = luxir::api;
+namespace build = luxir::api::build;
 
 using SortDir = api::SortSpec_::SortDir;
 inline constexpr SortDir UNKNOWN = SortDir::UNKNOWN;
@@ -313,4 +313,4 @@ inline OpCursor& sortVar(OpCursor& cur, std::string_view expr,
   return cur;
 }
 
-}  // namespace solux::test::qb
+}  // namespace luxir::test::qb
