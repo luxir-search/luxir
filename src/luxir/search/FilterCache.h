@@ -34,6 +34,9 @@ struct FilterCacheConfig {
   int32_t minSegmentDocs = 3;
   #endif
   size_t admissionHistorySize = 4096;
+  // Zero inherits admissionHistorySize so both lanes have equal defaults
+  // while remaining independently configurable.
+  size_t wholeAdmissionHistorySize = 0;
   uint32_t admissionThreshold = 2;
   size_t maxMetadataEntries = 8192;
   size_t maxMetadataBytes = 0;
@@ -52,11 +55,12 @@ struct FilterCacheConfig {
 // Use performs the one outer-map lookup for a query/filter pair, snapshots the
 // entry's COW slot vector, and aligns it to reader ordinals. Segment tasks then
 // index that request-local vector without hashing. No map entry is allocated
-// for a key until a bounded frequency ring has admitted it (second sighting by
-// default); a massive one-off key costs one 8-byte ring cell. Oversized keys
-// bypass before ring recording, and key metadata has its own maxMetadataBytes
-// budget. One benefit-density sweeper trims segment payloads individually and
-// ReaderValues as whole units from the high watermark to the low watermark.
+// for a key until either bounded observation lane has admitted it (second
+// sighting by default); clause and whole-query traffic use separate equal-
+// policy histories. Oversized keys bypass before ring recording, and key
+// metadata has its own maxMetadataBytes budget. One benefit-density sweeper
+// trims segment payloads individually and ReaderValues as whole units from the
+// high watermark to the low watermark.
 //
 // Query::Context and SearchRequest's request-destructed registry own borrowed
 // shared_ptr pins and request-local raw values. MemPool-allocated weights and
@@ -70,6 +74,11 @@ class FilterCache {
 public:
   class Use;
 
+  enum class AdmissionLane : uint8_t {
+    CLAUSE,
+    WHOLE
+  };
+
   struct SegmentIdentity {
     uint64_t segId;
     int32_t maxDoc;
@@ -81,10 +90,13 @@ public:
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t admissions = 0;
+    uint64_t buildAttempts = 0;
     uint64_t builds = 0;
     uint64_t byproductInserts = 0;
     uint64_t publishRejects = 0;
     uint64_t evictions = 0;
+    uint64_t capacityDeadBuilds = 0;
+    uint64_t thrashBuildSkips = 0;
     uint64_t purges = 0;
     uint64_t oversizedKeyBypasses = 0;
     uint64_t readerStableHits = 0;
@@ -102,6 +114,8 @@ public:
     // (entry-lifetime metadataBytes budget, not value lifetime).
     uint32_t charge;
     uint32_t buildCostMicros;
+    const bool claimedBuild;
+    mutable std::atomic<uint64_t> cacheHits{0};
     double density = 0;
     mutable std::atomic<uint64_t> lastUsed;
     mutable std::atomic<double> priority;
@@ -111,7 +125,8 @@ public:
 
   public:
     SegmentValue(std::unique_ptr<DocSet> docs, uint64_t epoch,
-                 SegmentIdentity identityForTest, uint32_t buildCostMicros);
+                 SegmentIdentity identityForTest, uint32_t buildCostMicros,
+                 bool claimedBuild);
 
     DocSet* docSet() const { return docs.get(); }
     int32_t card() const {
@@ -288,14 +303,16 @@ public:
     uint64_t readerVersion;
     bool admitted;
     std::mutex readerStateMutex;
-    bool readerAdmissionConsidered = false;
     std::shared_ptr<const ReaderValue> readerPin;
+    uint8_t observedAdmissionLanes = 0;
+    uint8_t readerAdmissionRecordedLanes = 0;
 
     Use(FilterCache* cache, FilterKey key, FilterKeyScope scope,
         std::shared_ptr<FilterEntry> entry,
         std::vector<std::shared_ptr<SegmentSlot>> slotsByOrd,
         std::vector<SegmentIdentity> readerSegments, uint64_t readerCoreGen,
-        uint64_t readerVersion, bool admitted);
+        uint64_t readerVersion, bool admitted,
+        uint8_t observedAdmissionLanes);
 
     friend class FilterCache;
     friend class Probe;
@@ -368,7 +385,8 @@ public:
     // before segment execution can fork. The registry is intentionally
     // unsynchronized.
     Use* get(const FilterKey& key,
-             FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE);
+             FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE,
+             AdmissionLane lane = AdmissionLane::CLAUSE);
     size_t size() const { return uses.size(); }
     size_t ownedBytesForTest();
   };
@@ -386,9 +404,23 @@ private:
     std::atomic<bool> active{true};
     std::atomic<bool> building{false};
     std::atomic<std::shared_ptr<const SegmentValue>> value;
+    // Serializes absent-value backoff decisions with publication and capacity
+    // eviction. Shared hits stay lock-free unless they lose an eviction race.
+    std::atomic_flag feedbackTransition = ATOMIC_FLAG_INIT;
+    std::atomic<uint32_t> deadBuildStreak{0};
+    std::atomic<uint32_t> buildBypassesRemaining{0};
 
     SegmentSlot(uint64_t segId, int32_t maxDoc)
       : segId(segId), maxDoc(maxDoc) {}
+
+    void lock() {
+      while (feedbackTransition.test_and_set(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+    void unlock() {
+      feedbackTransition.clear(std::memory_order_release);
+    }
   };
 
   // resident means the outer map still owns this key's metadata; false is
@@ -422,10 +454,13 @@ private:
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> misses{0};
     std::atomic<uint64_t> admissions{0};
+    std::atomic<uint64_t> buildAttempts{0};
     std::atomic<uint64_t> builds{0};
     std::atomic<uint64_t> byproductInserts{0};
     std::atomic<uint64_t> publishRejects{0};
     std::atomic<uint64_t> evictions{0};
+    std::atomic<uint64_t> capacityDeadBuilds{0};
+    std::atomic<uint64_t> thrashBuildSkips{0};
     std::atomic<uint64_t> purges{0};
     std::atomic<uint64_t> oversizedKeyBypasses{0};
     std::atomic<uint64_t> readerStableHits{0};
@@ -451,7 +486,8 @@ private:
   FilterCacheConfig config;
   boost::unordered::concurrent_flat_map<
       FilterKey, std::shared_ptr<FilterEntry>, FilterKeyHash> entries;
-  AdmissionRing admission;
+  AdmissionRing clauseAdmission;
+  AdmissionRing wholeAdmission;
   std::atomic<std::shared_ptr<const ActiveSnapshot>> activeSegments;
   std::atomic<size_t> residentBytes{0};
   std::atomic<size_t> metadataBytes{0};
@@ -486,7 +522,13 @@ private:
       std::span<const SegmentIdentity> readerSegments);
   std::unique_ptr<Use> beginUse(const FilterKey& key, FilterKeyScope scope,
                                 uint64_t readerCoreGen, uint64_t readerVersion,
-                                std::span<const SegmentIdentity> readerSegments);
+                                std::span<const SegmentIdentity> readerSegments,
+                                AdmissionLane lane);
+  void observeAdmissionLane(Use& use, AdmissionLane lane);
+  AdmissionRing& admissionFor(AdmissionLane lane);
+  void recordCapacityEviction(
+      const std::shared_ptr<SegmentSlot>& slot,
+      const std::shared_ptr<const SegmentValue>& value);
   std::shared_ptr<const SegmentValue> publish(
       Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
       bool byproduct, uint32_t buildCostMicros);

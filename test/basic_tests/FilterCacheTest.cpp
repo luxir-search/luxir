@@ -541,6 +541,36 @@ struct FilterFoldGuard {
   }
 };
 
+FilterCache::Probe::Kind servePolicyValue(
+    FilterCache& cache,
+    std::span<const FilterCache::SegmentIdentity> segments,
+    const FilterKey& key, int32_t expectedDoc, uint32_t buildCostMicros,
+    int* claimedBuilds = nullptr, bool* sharedHit = nullptr,
+    uint64_t readerCoreGen = 1) {
+  FilterCache::UseRegistry request(cache, readerCoreGen, segments);
+  auto* use = request.get(key);
+  auto probe = use->probe(0);
+  auto kind = probe.kind();
+  DocSet* served = nullptr;
+  std::unique_ptr<DocSet> fallback;
+  if (kind == FilterCache::Probe::Kind::HIT) {
+    served = probe.docSet();
+    if (sharedHit != nullptr) *sharedHit = true;
+  } else if (kind == FilterCache::Probe::Kind::BUILD) {
+    if (claimedBuilds != nullptr) (*claimedBuilds)++;
+    auto value = use->publishRaw(
+        0, probe, bitDocs(4096, expectedDoc), buildCostMicros);
+    served = value->docSet();
+  } else {
+    fallback = bitDocs(4096, expectedDoc);
+    served = fallback.get();
+  }
+  EXPECT_EQ(1, served->card());
+  EXPECT_TRUE(served->get(expectedDoc));
+  EXPECT_FALSE(served->get((expectedDoc + 1) % 4096));
+  return kind;
+}
+
 } // namespace
 
 TEST(FilterCacheTest, admissionIsOncePerDistinctKeyPerRequest) {
@@ -563,6 +593,86 @@ TEST(FilterCacheTest, admissionIsOncePerDistinctKeyPerRequest) {
   EXPECT_EQ(1u, cache.counters().admissions);
   EXPECT_EQ(0u, cache.counters().builds)
       << "a claim is not a completed cache build";
+}
+
+TEST(FilterCacheTest, admissionLanesIsolateScanTraffic) {
+  auto verify = [](FilterCache::AdmissionLane seededLane,
+                   FilterCache::AdmissionLane floodLane) {
+    FilterCacheConfig config = testConfig();
+    config.admissionHistorySize = 4;
+    config.wholeAdmissionHistorySize = 4;
+    config.admissionThreshold = 2;
+    FilterCache cache(config);
+    std::array segments{FilterCache::SegmentIdentity{1, 100}};
+    ASSERT_TRUE(cache.onReaderPublished(1, segments));
+    FilterKey recurring = FilterKey::withHashForTest("recurring", 7);
+
+    {
+      FilterCache::UseRegistry seed(cache, 1, segments);
+      EXPECT_FALSE(seed.get(recurring, FilterKeyScope::SEGMENT_STABLE,
+                            seededLane)->wasAdmitted());
+    }
+    for (uint64_t i = 0; i < 32; i++) {
+      FilterCache::UseRegistry flood(cache, 1, segments);
+      auto key = FilterKey::withHashForTest(
+          "flood-" + std::to_string(i), 100 + i);
+      flood.get(key, FilterKeyScope::SEGMENT_STABLE, floodLane);
+    }
+
+    FilterCache::UseRegistry second(cache, 1, segments);
+    auto* use = second.get(recurring, FilterKeyScope::SEGMENT_STABLE,
+                           seededLane);
+    EXPECT_TRUE(use->wasAdmitted());
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD, use->probe(0).kind());
+  };
+
+  verify(FilterCache::AdmissionLane::CLAUSE,
+         FilterCache::AdmissionLane::WHOLE);
+  verify(FilterCache::AdmissionLane::WHOLE,
+         FilterCache::AdmissionLane::CLAUSE);
+}
+
+TEST(FilterCacheTest, admissionLanePromotionDeduplicatesEachRequest) {
+  FilterCacheConfig config = testConfig();
+  config.admissionHistorySize = 8;
+  config.wholeAdmissionHistorySize = 8;
+  config.admissionThreshold = 2;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey clauseFirst("clause-first");
+  FilterKey wholeFirst("whole-first");
+
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(clauseFirst);
+    EXPECT_EQ(use, request.get(clauseFirst));
+    EXPECT_EQ(use, request.get(clauseFirst, FilterKeyScope::SEGMENT_STABLE,
+                               FilterCache::AdmissionLane::WHOLE));
+    EXPECT_FALSE(use->wasAdmitted());
+
+    auto* reverse = request.get(
+        wholeFirst, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    EXPECT_EQ(reverse, request.get(
+        wholeFirst, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::CLAUSE));
+    EXPECT_FALSE(reverse->wasAdmitted());
+    EXPECT_EQ(0u, cache.entryCountForTest());
+  }
+
+  FilterCache::UseRegistry second(cache, 1, segments);
+  auto* fromWhole = second.get(
+      clauseFirst, FilterKeyScope::SEGMENT_STABLE,
+      FilterCache::AdmissionLane::WHOLE);
+  EXPECT_TRUE(fromWhole->wasAdmitted());
+  auto* fromClause = second.get(
+      wholeFirst, FilterKeyScope::SEGMENT_STABLE,
+      FilterCache::AdmissionLane::CLAUSE);
+  EXPECT_TRUE(fromClause->wasAdmitted());
+  EXPECT_NE(fromWhole->entryIdentityForTest(),
+            fromClause->entryIdentityForTest());
+  EXPECT_EQ(2u, cache.entryCountForTest());
 }
 
 TEST(FilterCacheTest, publishHitsEmptyAndForcesCardinality) {
@@ -626,6 +736,7 @@ TEST(FilterCacheTest, builderClaimIsNonblockingAndExceptionSafe) {
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
             retry.get(key)->probe(0).kind());
   EXPECT_EQ(0u, cache.counters().builds);
+  EXPECT_EQ(2u, cache.counters().buildAttempts);
 }
 
 TEST(FilterCacheTest, publicationRevalidatesPurgeCoreAndIdentity) {
@@ -787,6 +898,178 @@ TEST(FilterCacheTest, evictsLowerBenefitDensityAndPinsRetiredValue) {
   FilterCache::UseRegistry verify(cache, 1, segments);
   EXPECT_NE(FilterCache::Probe::Kind::HIT, verify.get(first)->probe(0).kind());
   EXPECT_EQ(FilterCache::Probe::Kind::HIT, verify.get(second)->probe(0).kind());
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, zeroHitEvictionBackoffBoundsOrderedReplay) {
+  auto sample = bitDocs(4096, 1);
+  size_t charge = sample->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 3 - 1;
+  config.lowWatermarkBytes = charge * 2;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  std::array hotKeys{FilterKey("hot-value-0"), FilterKey("hot-value-1")};
+  constexpr int deadCount = 8;
+  std::array<FilterKey, deadCount> deadKeys;
+  std::array<int, deadCount> claimedBuilds{};
+  std::array<bool, deadCount> sharedHits{};
+  for (int i = 0; i < deadCount; i++) {
+    deadKeys[i] = FilterKey("dead-value-" + std::to_string(i));
+  }
+
+  for (int i = 0; i < (int)hotKeys.size(); i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+              servePolicyValue(cache, segments, hotKeys[i], i + 1, 100'000));
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+              servePolicyValue(cache, segments, hotKeys[i], i + 1, 100'000));
+  }
+
+  constexpr int rounds = 64;
+  for (int round = 0; round < rounds; round++) {
+    for (int i = 0; i < (int)hotKeys.size(); i++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+                servePolicyValue(
+                    cache, segments, hotKeys[i], i + 1, 100'000));
+    }
+    for (int i = 0; i < deadCount; i++) {
+      servePolicyValue(cache, segments, deadKeys[i], 10 + i, 1,
+                       &claimedBuilds[i], &sharedHits[i]);
+    }
+    for (int i = 0; i < (int)hotKeys.size(); i++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+                servePolicyValue(
+                    cache, segments, hotKeys[i], i + 1, 100'000));
+    }
+  }
+
+  constexpr int logarithmicBuildBound = 1 + (int)std::bit_width(63U);
+  int totalDeadBuilds = 0;
+  for (int i = 0; i < deadCount; i++) {
+    EXPECT_LE(claimedBuilds[i],
+              logarithmicBuildBound + (sharedHits[i] ? 1 : 0));
+    totalDeadBuilds += claimedBuilds[i];
+  }
+  auto counters = cache.counters();
+  EXPECT_GT(counters.thrashBuildSkips, 0u);
+  EXPECT_EQ(2u + (uint64_t)totalDeadBuilds, counters.buildAttempts);
+  EXPECT_EQ((uint64_t)totalDeadBuilds, counters.capacityDeadBuilds);
+  EXPECT_LT(cache.bytesUsed(), charge * deadCount / 2);
+  for (int i = 0; i < (int)hotKeys.size(); i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+              servePolicyValue(cache, segments, hotKeys[i], i + 1, 100'000));
+  }
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, evictionBackoffRecoversAndHitResetsDebt) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey winner("phase-winner");
+  FilterKey recovering("phase-recovering");
+
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, winner, 1, 10));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            servePolicyValue(cache, segments, winner, 1, 10));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, recovering, 2, 1));
+  EXPECT_EQ(1u, cache.counters().capacityDeadBuilds);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+            servePolicyValue(cache, segments, recovering, 2, 1));
+
+  bool recovered = false;
+  for (int i = 0; i < 4096 && !recovered; i++) {
+    auto kind = servePolicyValue(cache, segments, recovering, 2, 1);
+    recovered = kind == FilterCache::Probe::Kind::HIT;
+  }
+  ASSERT_TRUE(recovered);
+
+  uint64_t deadBuildsBeforeHitEviction = cache.counters().capacityDeadBuilds;
+  FilterKey replacement("phase-replacement");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, replacement, 3, 100'000));
+  EXPECT_EQ(deadBuildsBeforeHitEviction,
+            cache.counters().capacityDeadBuilds);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, recovering, 2, 1));
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, byproductEvictionDoesNotAccrueDeadBuildDebt) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey byproduct("byproduct-victim");
+
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    request.get(byproduct)->offerRaw(0, bitDocs(4096, 1), 1);
+  }
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(
+                cache, segments, FilterKey("byproduct-winner"), 2, 100'000));
+  EXPECT_EQ(0u, cache.counters().capacityDeadBuilds);
+  EXPECT_EQ(0u, cache.counters().thrashBuildSkips);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, byproduct, 1, 1));
+  ASSERT_NO_THROW(cache.validateForTest());
+}
+
+TEST(FilterCacheTest, purgeAndMetadataSweepDiscardBackoffGhosts) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  config.maxMetadataEntries = 2;
+  FilterCache cache(config);
+  std::array oldSegments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, oldSegments));
+  FilterKey winner("ghost-winner");
+  FilterKey victim("ghost-victim");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, oldSegments, winner, 1, 100'000));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, oldSegments, victim, 2, 1));
+  ASSERT_EQ(1u, cache.counters().capacityDeadBuilds);
+  const void* oldEntry = cache.entryIdentityForTest(victim);
+  ASSERT_NE(nullptr, oldEntry);
+
+  std::array newSegments{FilterCache::SegmentIdentity{2, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(2, newSegments));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, newSegments, winner, 1, 100'000,
+                             nullptr, nullptr, 2));
+  {
+    FilterCache::UseRegistry metadata(cache, 2, newSegments);
+    metadata.get(FilterKey("ghost-metadata-sweep"));
+  }
+  EXPECT_EQ(nullptr, cache.entryIdentityForTest(victim));
+
+  uint64_t skipsBefore = cache.counters().thrashBuildSkips;
+  FilterCache::UseRegistry retry(cache, 2, newSegments);
+  auto* retryUse = retry.get(victim);
+  EXPECT_NE(nullptr, retryUse->entryIdentityForTest());
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, retryUse->probe(0).kind());
+  EXPECT_EQ(skipsBefore, cache.counters().thrashBuildSkips);
   ASSERT_NO_THROW(cache.validateForTest());
 }
 
@@ -994,11 +1277,25 @@ TEST(FilterCacheTest, largeKeyBelowCapAdmitsAndHits) {
 TEST(FilterCacheTest, concurrentHitEvictAndPublish) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
-  config.lowWatermarkBytes = 0;
+  config.lowWatermarkBytes = 1;
   FilterCache cache(config);
   std::array segments{FilterCache::SegmentIdentity{1, 4096}};
   cache.onReaderPublished(1, segments);
   FilterKey key("concurrent");
+  {
+    FilterCache::UseRegistry seed(cache, 1, segments);
+    auto* use = seed.get(key);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, bitDocs(4096, 1), 1);
+  }
+  cache.sweep();
+  ASSERT_EQ(1u, cache.counters().capacityDeadBuilds);
+  {
+    FilterCache::UseRegistry backedOff(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+              backedOff.get(key)->probe(0).kind());
+  }
   std::atomic<bool> start{false};
 
   auto publisher = [&](int32_t doc) {
@@ -1038,6 +1335,10 @@ TEST(FilterCacheTest, concurrentHitEvictAndPublish) {
   second.join();
   third.join();
   fourth.join();
+  ASSERT_NO_THROW(cache.validateForTest());
+  EXPECT_GT(cache.counters().buildAttempts, 0u);
+  EXPECT_GT(cache.counters().capacityDeadBuilds, 0u);
+  EXPECT_GT(cache.counters().thrashBuildSkips, 0u);
   cache.clear();
   EXPECT_EQ(0u, cache.bytesUsed());
   EXPECT_GT(cache.counters().builds + cache.counters().byproductInserts, 0u);

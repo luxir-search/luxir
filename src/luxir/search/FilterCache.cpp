@@ -35,10 +35,12 @@ std::vector<FilterCache::SegmentIdentity> readerIdentities(IndexReader& reader) 
 FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
                                         uint64_t epoch,
                                         SegmentIdentity identityForTest,
-                                        uint32_t buildCostMicros)
+                                        uint32_t buildCostMicros,
+                                        bool claimedBuild)
   : docs(std::move(docs)),
     charge((uint32_t) this->docs->ramBytesUsed()),
-    buildCostMicros(buildCostMicros), lastUsed(epoch),
+    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
+    lastUsed(epoch),
     priority(0)
     #ifndef NDEBUG
     , identityForTest(identityForTest)
@@ -190,11 +192,12 @@ FilterCache::Use::Use(FilterCache* cache, FilterKey key,
                       std::vector<std::shared_ptr<SegmentSlot>> slotsByOrd,
                       std::vector<SegmentIdentity> readerSegments,
                       uint64_t readerCoreGen, uint64_t readerVersion,
-                      bool admitted)
+                      bool admitted, uint8_t observedAdmissionLanes)
   : cache(cache), key(std::move(key)), scope_(scope), entry(std::move(entry)),
     slotsByOrd(std::move(slotsByOrd)),
     readerSegments(std::move(readerSegments)), readerCoreGen(readerCoreGen),
-    readerVersion(readerVersion), admitted(admitted) {
+    readerVersion(readerVersion), admitted(admitted),
+    observedAdmissionLanes(observedAdmissionLanes) {
   requestSlots.reserve(this->readerSegments.size());
   for (size_t i = 0; i < this->readerSegments.size(); i++) {
     requestSlots.push_back(std::make_unique<RequestSlot>());
@@ -264,6 +267,29 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
     return Probe(Probe::Kind::BYPASS, nullptr, nullptr, false, nullptr,
                  this, segmentOrd, true);
   };
+  auto sharedHit = [&](std::shared_ptr<SegmentSlot> slot,
+                       std::shared_ptr<const SegmentValue> value) {
+    value->cacheHits.fetch_add(1, std::memory_order_relaxed);
+    if (slot->value.load(std::memory_order_acquire) != value) {
+      // A hit that borrowed the old value before capacity eviction must reset
+      // feedback after the eviction transition finishes.
+      std::lock_guard<SegmentSlot> lock(*slot);
+      slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+      slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
+    } else {
+      slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+      slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
+    }
+    uint64_t now = cache->nextEpoch();
+    value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
+    entry->lastUsed.store(now, std::memory_order_relaxed);
+    pinValue(segmentOrd, value);
+    releaseRequestClaim(segmentOrd);
+    cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
+    DocSet* raw = value->docSet();
+    return Probe(Probe::Kind::HIT, std::move(slot), std::move(value), false,
+                 raw);
+  };
 
   if (cache == nullptr || !cache->enabled()) {
     return bypass();
@@ -285,20 +311,39 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
 
   auto value = slot->value.load(std::memory_order_acquire);
   if (value != nullptr) {
-    uint64_t now = cache->nextEpoch();
-    value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
-    entry->lastUsed.store(now, std::memory_order_relaxed);
-    pinValue(segmentOrd, value);
-    releaseRequestClaim(segmentOrd);
-    cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
-    DocSet* raw = value->docSet();
-    return Probe(Probe::Kind::HIT, std::move(slot), std::move(value), false,
-                 raw);
+    return sharedHit(std::move(slot), std::move(value));
+  }
+
+  if (!admitted || slot->maxDoc < cache->config.minSegmentDocs
+      || readerCoreGen < cache->publishedCoreGen.load(std::memory_order_acquire)) {
+    cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
+    return bypass();
+  }
+
+  std::unique_lock<SegmentSlot> feedbackLock(*slot);
+  if (!slot->active.load(std::memory_order_acquire)
+      || slot->segId != readerSegments[segmentOrd].segId
+      || slot->maxDoc != readerSegments[segmentOrd].maxDoc
+      || readerCoreGen
+          < cache->publishedCoreGen.load(std::memory_order_acquire)) {
+    cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
+    return bypass();
+  }
+  value = slot->value.load(std::memory_order_acquire);
+  if (value != nullptr) {
+    feedbackLock.unlock();
+    return sharedHit(std::move(slot), std::move(value));
   }
 
   cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
-  if (!admitted || slot->maxDoc < cache->config.minSegmentDocs
-      || readerCoreGen < cache->publishedCoreGen.load(std::memory_order_acquire)) {
+  if (slot->building.load(std::memory_order_acquire)) return bypass();
+  uint32_t bypasses = slot->buildBypassesRemaining.load(
+      std::memory_order_relaxed);
+  if (bypasses != 0) {
+    slot->buildBypassesRemaining.store(bypasses - 1,
+                                       std::memory_order_relaxed);
+    cache->counter.thrashBuildSkips.fetch_add(1,
+                                              std::memory_order_relaxed);
     return bypass();
   }
 
@@ -308,6 +353,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
           std::memory_order_relaxed)) {
     return bypass();
   }
+  cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
   uint64_t now = cache->nextEpoch();
   entry->lastUsed.store(now, std::memory_order_relaxed);
   return Probe(Probe::Kind::BUILD, std::move(slot), nullptr, true, nullptr,
@@ -348,27 +394,32 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
   bool staleAfterCreate = false;
   {
     std::lock_guard<std::mutex> lock(readerStateMutex);
+    uint8_t pendingLanes = observedAdmissionLanes
+        & (uint8_t)~readerAdmissionRecordedLanes;
+    for (AdmissionLane lane : {AdmissionLane::CLAUSE,
+                               AdmissionLane::WHOLE}) {
+      uint8_t laneBit = (uint8_t)(1U << (uint8_t)lane);
+      if ((pendingLanes & laneBit) != 0) {
+        admitted = cache->admissionFor(lane).record(key.hash()) || admitted;
+      }
+    }
+    readerAdmissionRecordedLanes |= pendingLanes;
     if (entry == nullptr) {
       entry = cache->findEntry(key);
       if (entry == nullptr) {
-        if (readerAdmissionConsidered) {
+        if (!admitted) {
           cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
           return {};
         }
-        readerAdmissionConsidered = true;
-        admitted = cache->admission.record(key.hash());
-        if (admitted) {
-          entry = cache->findOrCreateEntry(key, scope_);
-          // A publication can advance after its entry snapshot but before this
-          // reader-lane insertion. Do not let that new entry claim old-reader
-          // work; publish-time validation remains the final backstop.
-          staleAfterCreate = readerVersion
-              != cache->publishedReaderVersion.load(
-                  std::memory_order_acquire);
-        }
+        entry = cache->findOrCreateEntry(key, scope_);
+        // A publication can advance after its entry snapshot but before this
+        // reader-lane insertion. Do not let that new entry claim old-reader
+        // work; publish-time validation remains the final backstop.
+        staleAfterCreate = readerVersion
+            != cache->publishedReaderVersion.load(
+                std::memory_order_acquire);
       } else {
-        // Entry existence is proof of prior admission. Refreshes deliberately
-        // do not consult the ring again.
+        // Entry existence is proof of prior admission.
         admitted = true;
       }
     }
@@ -409,6 +460,9 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
           std::memory_order_relaxed)) {
     return {};
   }
+  // ReaderValue eviction feedback is deferred until the READER_STABLE whole-
+  // membership stage; segment backoff cannot represent an atomic reader unit.
+  cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
   uint64_t now = cache->nextEpoch();
   localEntry->lastUsed.store(now, std::memory_order_relaxed);
   bool refresh = localEntry->readerValueEverPublished.load(
@@ -585,18 +639,29 @@ FilterCache::UseRegistry::UseRegistry(FilterCache& cache, IndexReader& reader)
 }
 
 FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
-                                                FilterKeyScope scope) {
+                                                FilterKeyScope scope,
+                                                AdmissionLane lane) {
   #ifndef NDEBUG
   assert(owningThread == std::this_thread::get_id());
   #endif
   auto iter = uses.find(key);
-  if (iter != uses.end()) return iter->second.get();
+  if (iter != uses.end()) {
+    auto* use = iter->second.get();
+    if (use->scope_ != scope) {
+      throw std::logic_error(
+          "FilterCache request key reused with different scope");
+    }
+    if (cache != nullptr) cache->observeAdmissionLane(*use, lane);
+    return use;
+  }
   auto use = cache != nullptr
-      ? cache->beginUse(key, scope, readerCoreGen, readerVersion, segments)
+      ? cache->beginUse(
+          key, scope, readerCoreGen, readerVersion, segments, lane)
       : std::unique_ptr<Use>(new Use(
           nullptr, key, scope, nullptr,
           std::vector<std::shared_ptr<SegmentSlot>>(segments.size()),
-          segments, readerCoreGen, readerVersion, false));
+          segments, readerCoreGen, readerVersion, false,
+          (uint8_t)(1U << (uint8_t)lane)));
   Use* result = use.get();
   uses.emplace(key, std::move(use));
   return result;
@@ -637,9 +702,20 @@ bool FilterCache::AdmissionRing::record(uint64_t fingerprint) {
   return before + 1 >= threshold;
 }
 
+FilterCache::AdmissionRing& FilterCache::admissionFor(AdmissionLane lane) {
+  return lane == AdmissionLane::CLAUSE
+      ? clauseAdmission : wholeAdmission;
+}
+
 FilterCache::FilterCache(FilterCacheConfig config)
-  : config(config), admission(config.admissionHistorySize,
-                              config.admissionThreshold) {
+  : config(config),
+    clauseAdmission(config.admissionHistorySize, config.admissionThreshold),
+    wholeAdmission(config.wholeAdmissionHistorySize == 0
+        ? config.admissionHistorySize : config.wholeAdmissionHistorySize,
+        config.admissionThreshold) {
+  if (this->config.wholeAdmissionHistorySize == 0) {
+    this->config.wholeAdmissionHistorySize = this->config.admissionHistorySize;
+  }
   if (this->config.lowWatermarkBytes == 0) {
     this->config.lowWatermarkBytes = this->config.maxBytes * 9 / 10;
   }
@@ -686,6 +762,22 @@ double FilterCache::effectiveValueBytes(
 void FilterCache::advanceEvictionClock(double priority) {
   double clock = evictionClock.load(std::memory_order_relaxed);
   evictionClock.store(std::max(clock, priority), std::memory_order_relaxed);
+}
+
+void FilterCache::recordCapacityEviction(
+    const std::shared_ptr<SegmentSlot>& slot,
+    const std::shared_ptr<const SegmentValue>& value) {
+  if (!value->claimedBuild
+      || value->cacheHits.load(std::memory_order_relaxed) != 0) {
+    return;
+  }
+  uint32_t streak = slot->deadBuildStreak.load(std::memory_order_relaxed);
+  if (streak != std::numeric_limits<uint32_t>::max()) streak++;
+  slot->deadBuildStreak.store(streak, std::memory_order_relaxed);
+  uint32_t bypasses = streak >= 10 ? 1024U : 1U << streak;
+  slot->buildBypassesRemaining.store(bypasses,
+                                     std::memory_order_relaxed);
+  counter.capacityDeadBuilds.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
@@ -806,35 +898,45 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
 std::unique_ptr<FilterCache::Use> FilterCache::beginUse(
     const FilterKey& key, FilterKeyScope scope, uint64_t readerCoreGen,
     uint64_t readerVersion,
-    std::span<const SegmentIdentity> readerSegments) {
-  // Keep oversized rejection and the admission ring ahead of allocation: a
-  // key gets FilterEntry metadata only after admission, never on first sight
-  // under the default threshold.
-  if (enabled() && scope != FilterKeyScope::READER_STABLE
-      && key.bytes().size() > config.maxEntryBytes) {
-    counter.oversizedKeyBypasses.fetch_add(1, std::memory_order_relaxed);
-    return std::unique_ptr<Use>(new Use(
-        this, key, scope, nullptr,
-        std::vector<std::shared_ptr<SegmentSlot>>(readerSegments.size()),
-        std::vector<SegmentIdentity>(readerSegments.begin(),
-                                     readerSegments.end()),
-        readerCoreGen, readerVersion, false));
-  }
-  // Reader-stable admission is delayed until the canonical-domain prepare
-  // seam. Nested domains must neither serve values nor record ring sightings.
-  bool readerStable = scope == FilterKeyScope::READER_STABLE;
-  bool admitted = !readerStable && enabled() && admission.record(key.hash());
-  auto entry = !readerStable && enabled() ? findEntry(key) : nullptr;
-  if (entry == nullptr && admitted) entry = findOrCreateEntry(key, scope);
-  auto slots = readerStable || entry == nullptr
-      ? std::vector<std::shared_ptr<SegmentSlot>>(readerSegments.size())
-      : alignSlots(entry, readerSegments);
+    std::span<const SegmentIdentity> readerSegments, AdmissionLane lane) {
   auto use = std::unique_ptr<Use>(new Use(
-      this, key, scope, std::move(entry), std::move(slots),
+      this, key, scope, nullptr,
+      std::vector<std::shared_ptr<SegmentSlot>>(readerSegments.size()),
       std::vector<SegmentIdentity>(readerSegments.begin(), readerSegments.end()),
-      readerCoreGen, readerVersion, admitted));
+      readerCoreGen, readerVersion, false, 0));
+  observeAdmissionLane(*use, lane);
   maybeSweep();
   return use;
+}
+
+void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
+  uint8_t laneBit = (uint8_t)(1U << (uint8_t)lane);
+  if ((use.observedAdmissionLanes & laneBit) != 0) return;
+  use.observedAdmissionLanes |= laneBit;
+  if (!enabled()) return;
+
+  // Reader-stable admission stays behind its canonical-domain gate. The lane
+  // observations are retained here and recorded by probeReaderStable only
+  // after that gate accepts the request.
+  if (use.scope_ == FilterKeyScope::READER_STABLE) return;
+  if (use.key.bytes().size() > config.maxEntryBytes) {
+    counter.oversizedKeyBypasses.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  use.admitted = admissionFor(lane).record(use.key.hash()) || use.admitted;
+  auto entry = use.entry != nullptr ? use.entry : findEntry(use.key);
+  if (entry == nullptr && use.admitted) {
+    entry = findOrCreateEntry(use.key, use.scope_);
+  }
+  if (entry == nullptr) return;
+  if (entry->scope != use.scope_) {
+    throw std::logic_error("FilterCache key reused with different scope");
+  }
+  if (use.entry == nullptr) {
+    use.entry = entry;
+    use.slotsByOrd = alignSlots(entry, use.readerSegments);
+  }
 }
 
 std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
@@ -848,19 +950,21 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
   if (raw == nullptr) throw std::invalid_argument("raw DocSet must not be null");
   SegmentIdentity identity = segmentOrd < use.readerSegments.size()
       ? use.readerSegments[segmentOrd] : SegmentIdentity{};
+  bool claimed = probe != nullptr && probe->ownsClaim;
   auto local = std::make_shared<SegmentValue>(
-      std::move(raw), nextEpoch(), identity, buildCostMicros);
+      std::move(raw), nextEpoch(), identity, buildCostMicros,
+      claimed && !byproduct);
 
   bool attempted = enabled() && use.entry != nullptr
       && segmentOrd < use.slotsByOrd.size()
       && use.slotsByOrd[segmentOrd] != nullptr;
   bool inserted = false;
-  bool claimed = probe != nullptr && probe->ownsClaim;
   std::shared_ptr<const SegmentValue> chosen = local;
 
   if (attempted) {
     auto slot = use.slotsByOrd[segmentOrd];
     std::lock_guard<std::mutex> lock(use.entry->mutex);
+    std::lock_guard<SegmentSlot> feedbackLock(*slot);
     auto current = slot->value.load(std::memory_order_acquire);
     if (current != nullptr) {
       chosen = current;
@@ -1067,10 +1171,14 @@ bool FilterCache::onReaderPublished(
     }
     auto slots = entry->slots.load(std::memory_order_acquire);
     for (const auto& slot : *slots) {
+      std::lock_guard<SegmentSlot> feedbackLock(*slot);
       SegmentIdentity identity{slot->segId, slot->maxDoc};
       bool active = isActive(*next, identity);
       slot->active.store(active, std::memory_order_release);
       if (!active) {
+        slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+        slot->buildBypassesRemaining.store(0,
+                                           std::memory_order_relaxed);
         auto value = slot->value.exchange(nullptr, std::memory_order_acq_rel);
         if (value != nullptr) {
           residentBytes.fetch_sub(value->ramBytesUsed(),
@@ -1165,10 +1273,13 @@ void FilterCache::sweep() {
               detached = true;
             }
           } else {
+            std::lock_guard<SegmentSlot> feedbackLock(*candidate.slot);
             auto expected = candidate.segmentValue;
             if (candidate.slot->value.compare_exchange_strong(
                     expected, nullptr, std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
+              recordCapacityEviction(candidate.slot,
+                                     candidate.segmentValue);
               residentBytes.fetch_sub(
                   candidate.segmentValue->ramBytesUsed(),
                   std::memory_order_relaxed);
@@ -1249,17 +1360,24 @@ void FilterCache::sweepMetadata() {
           }
         }
         for (const auto& slot : *slots) {
+          std::lock_guard<SegmentSlot> feedbackLock(*slot);
           slot->active.store(false, std::memory_order_release);
           if (overBytes) {
             auto value = slot->value.exchange(nullptr,
                                                std::memory_order_acq_rel);
             if (value != nullptr) {
+              recordCapacityEviction(slot, value);
               residentBytes.fetch_sub(value->ramBytesUsed(),
                                       std::memory_order_relaxed);
               advanceEvictionClock(value->evictionPriority());
               counter.evictions.fetch_add(1, std::memory_order_relaxed);
             }
           }
+          // Metadata eviction removes the stable slot itself, so its feedback
+          // is observable in counters but cannot survive into a future entry.
+          slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+          slot->buildBypassesRemaining.store(0,
+                                             std::memory_order_relaxed);
         }
       }
     }
@@ -1289,7 +1407,10 @@ void FilterCache::clear() {
       }
       auto slots = candidate.entry->slots.load(std::memory_order_acquire);
       for (const auto& slot : *slots) {
+        std::lock_guard<SegmentSlot> feedbackLock(*slot);
         slot->active.store(false, std::memory_order_release);
+        slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+        slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
         auto value = slot->value.exchange(nullptr, std::memory_order_acq_rel);
         if (value != nullptr) {
           residentBytes.fetch_sub(value->ramBytesUsed(),
@@ -1306,10 +1427,15 @@ FilterCache::CounterValues FilterCache::counters() const {
       .hits = counter.hits.load(std::memory_order_relaxed),
       .misses = counter.misses.load(std::memory_order_relaxed),
       .admissions = counter.admissions.load(std::memory_order_relaxed),
+      .buildAttempts = counter.buildAttempts.load(std::memory_order_relaxed),
       .builds = counter.builds.load(std::memory_order_relaxed),
       .byproductInserts = counter.byproductInserts.load(std::memory_order_relaxed),
       .publishRejects = counter.publishRejects.load(std::memory_order_relaxed),
       .evictions = counter.evictions.load(std::memory_order_relaxed),
+      .capacityDeadBuilds = counter.capacityDeadBuilds.load(
+          std::memory_order_relaxed),
+      .thrashBuildSkips = counter.thrashBuildSkips.load(
+          std::memory_order_relaxed),
       .purges = counter.purges.load(std::memory_order_relaxed),
       .oversizedKeyBypasses = counter.oversizedKeyBypasses.load(
           std::memory_order_relaxed),
@@ -1425,6 +1551,19 @@ void FilterCache::validateForTest() {
       }
       first = false;
       previousSegId = slot->segId;
+      uint32_t streak = slot->deadBuildStreak.load(
+          std::memory_order_relaxed);
+      uint32_t bypasses = slot->buildBypassesRemaining.load(
+          std::memory_order_relaxed);
+      if (bypasses > 1024 || (bypasses != 0 && streak == 0)) {
+        throw std::logic_error(
+            "FilterCache validation: invalid segment build backoff");
+      }
+      if (!slot->active.load(std::memory_order_acquire)
+          && (streak != 0 || bypasses != 0)) {
+        throw std::logic_error(
+            "FilterCache validation: inactive slot retains build backoff");
+      }
       auto value = slot->value.load(std::memory_order_acquire);
       if (value == nullptr) continue;
       double priority = value->evictionPriority();
