@@ -84,6 +84,11 @@ public:
       return childWeight->scorerSupplier(
           targetPool, segment, executionMode);
     }
+
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      return childWeight->constantCount(segment, domain);
+    }
   };
 };
 

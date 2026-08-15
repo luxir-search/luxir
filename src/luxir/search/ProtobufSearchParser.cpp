@@ -693,7 +693,7 @@ public:
     // path as the benchmark baseline.
     bool countClauseDisabled =
         BooleanQuery::disableFilterClauseCountForTests
-        && limit == 0 && topDocsReq.get_number && !topDocsReq.get_scores;
+        && limit == 0 && topDocsReq.get_number;
     CollectionRequirements requirements{
       .needRankedDocs = limit > 0,
       .needExactCount = topDocsReq.get_number,
@@ -732,12 +732,13 @@ public:
     //
     // NEED_SCORES is purely computational (fuzzy match semantics no longer
     // hang off it - the expansion cap is a property of the query).  A
-    // count-/domain-only request (limit 0, no get_scores) reads no score, so
+    // count-/domain-only request (limit 0) reads no score, so
     // it skips norms/impacts/BM25 and lets boolean prep pick non-scoring
     // iterators. Ranked requests need scores only when their normalized sort
     // plan consumes score (default ranking, SCORE, or a score-dependent EXPR).
     int32_t requestFlags = 0;
-    if (topDocsReq.get_scores || (limit > 0 && parsedSorts.rankNeedsScores)) {
+    if (limit > 0
+        && (topDocsReq.get_scores || parsedSorts.rankNeedsScores)) {
       requestFlags |= Query::NEED_SCORES;
     }
     // Competitive-score pruning requires a score-ranked heap. Sub-ops permit
@@ -803,10 +804,38 @@ public:
       }
     }
 
+    Query::Weight* wholeMembershipWeight = nullptr;
+    FilterCache::Use* wholeMembershipUse = nullptr;
+    bool pureCount = !QueryPrep::disableWholeMembershipPlanForTests
+        && limit == 0 && topDocsReq.get_number
+        && !requirements.needExactDomain && !parsedSorts.useFieldSort
+        && !weight->needsPrepare() && filterWeights.empty();
+    if (pureCount) {
+      wholeMembershipWeight = weight;
+      bool everySegmentConstant = weight->matchesAllDocs();
+      if (!everySegmentConstant) {
+        everySegmentConstant = true;
+        for (auto& segment : req.reader->segments()) {
+          DocSet* rootDomain = segment.liveDocs() == nullptr
+              ? nullptr : &segment.liveDocs()->docset();
+          if (!weight->constantCount(segment, rootDomain).has_value()) {
+            everySegmentConstant = false;
+            break;
+          }
+        }
+      }
+      auto* cache = req.reader->filterCache();
+      if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
+        wholeMembershipUse = qcontext->getFilterUse(
+            *query, FilterCache::AdmissionLane::WHOLE);
+      }
+    }
+
     auto* qr = luxir::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *qcontext, query, weight,
       countWeight, rankingWeight, limit, std::move(parsedSorts),
-      requirements, filters, filterWeights, domainQuery, domainQueryWeight,
+      requirements, wholeMembershipWeight, wholeMembershipUse,
+      filters, filterWeights, domainQuery, domainQueryWeight,
       domainFilterWeights);
 
     if (firstQuery == nullptr) {

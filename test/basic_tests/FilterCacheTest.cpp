@@ -1795,6 +1795,162 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
 }
 
+TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addTermDoc(writer, "alpha beta");
+  addTermDoc(writer, "alpha");
+  addTermDoc(writer, "beta");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto& segment = reader->segments()[0];
+  MemPool pool;
+  Query::Context context(pool, *reader);
+
+  AllQuery all;
+  MatchNoDocsQuery none;
+  TermQuery alpha("text_w", "alpha");
+  ConstantScoreQuery constant(&alpha, 3.0f);
+  BoostQuery boost(&alpha, 2.0f);
+  ForcePrepareQuery prepared(&alpha);
+  auto* allWeight = all.createWeight(context, 0);
+  auto* noneWeight = none.createWeight(context, 0);
+  auto* alphaWeight = alpha.createWeight(context, 0);
+  auto* constantWeight = constant.createWeight(context, 0);
+  auto* boostWeight = boost.createWeight(context, 0);
+  auto* preparedWeight = prepared.createWeight(context, 0);
+
+  EXPECT_EQ(3, *allWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(0, *noneWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(2, *alphaWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(2, *constantWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(2, *boostWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(2, *preparedWeight->constantCount(segment, nullptr));
+
+  auto restricted = docs(3, {0, 2});
+  EXPECT_FALSE(allWeight->constantCount(
+      segment, restricted.get()).has_value());
+  EXPECT_EQ(0, *noneWeight->constantCount(segment, restricted.get()));
+  EXPECT_FALSE(alphaWeight->constantCount(
+      segment, restricted.get()).has_value());
+}
+
+TEST(FilterCacheTest,
+     wholeMembershipComposesIncomingDomainAndGuardsPublication) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addTermDoc(writer, "alpha beta");
+  addTermDoc(writer, "alpha");
+  addTermDoc(writer, "alpha beta");
+  addTermDoc(writer, "beta");
+  addTermDoc(writer, "alpha beta gamma");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto& segment = reader->segments()[0];
+  TermQuery alpha("text_w", "alpha");
+  TermQuery beta("text_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  auto incoming = docs(5, {0, 1, 3});
+
+  OwnedFilterStatsGuard stats;
+  MemPool firstPool;
+  Query::Context firstContext(firstPool, *reader);
+  auto* firstWeight = query.createWeight(firstContext, 0);
+  auto* firstUse = firstContext.getFilterUse(
+      query, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan firstPlan(
+      *firstWeight, firstUse, firstContext.filterUses);
+  auto built = firstPlan.resolve(*reader, segment, incoming.get());
+  ASSERT_TRUE(built.available);
+  EXPECT_EQ(1, built.count);
+  ASSERT_NE(nullptr, built.docs.get());
+  EXPECT_EQ(1, built.docs.get()->card());
+  ASSERT_NE(nullptr, firstUse->rawDocSet(0));
+  EXPECT_EQ(3, firstUse->rawDocSet(0)->card());
+  EXPECT_EQ(1, SkipStats::wholeCountBuilds);
+
+  SkipStats::reset();
+  MemPool hitPool;
+  Query::Context hitContext(hitPool, *reader);
+  auto* hitWeight = query.createWeight(hitContext, 0);
+  auto* hitUse = hitContext.getFilterUse(
+      query, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan hitPlan(
+      *hitWeight, hitUse, hitContext.filterUses);
+  auto hit = hitPlan.resolve(*reader, segment, incoming.get());
+  ASSERT_TRUE(hit.available);
+  EXPECT_EQ(1, hit.count);
+  EXPECT_EQ(1, SkipStats::wholeCountHits);
+  EXPECT_EQ(hit.docs.get(), hitUse->effectiveDocSet(
+      0, *reader, incoming.get()));
+
+  auto emptyDomain = docs(5, {});
+  auto allDeleted = hitPlan.resolve(
+      *reader, segment, emptyDomain.get());
+  ASSERT_TRUE(allDeleted.available);
+  EXPECT_EQ(0, allDeleted.count);
+
+  TermQuery gamma("text_w", "gamma");
+  std::array<Query*, 2> dependentRequired{&alpha, &gamma};
+  BooleanQuery dependentQuery(dependentRequired, {}, {}, {});
+  MemPool dependentPool;
+  Query::Context dependentContext(dependentPool, *reader);
+  auto* dependentWeight = dependentQuery.createWeight(dependentContext, 0);
+  auto* dependentUse = dependentContext.getFilterUse(
+      dependentQuery, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan dependentPlan(
+      *dependentWeight, dependentUse, dependentContext.filterUses,
+      PreparedDomainDependence::PREPARE_DOMAIN);
+  EXPECT_THROW(
+      dependentPlan.resolve(*reader, segment, nullptr), std::logic_error);
+
+  MemPool retryPool;
+  Query::Context retryContext(retryPool, *reader);
+  auto* retryWeight = dependentQuery.createWeight(retryContext, 0);
+  auto* retryUse = retryContext.getFilterUse(
+      dependentQuery, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan retryPlan(
+      *retryWeight, retryUse, retryContext.filterUses);
+  auto retry = retryPlan.resolve(*reader, segment, nullptr);
+  ASSERT_TRUE(retry.available);
+  EXPECT_EQ(1, retry.count);
+}
+
+TEST(FilterCacheTest, wholeAdmissionDiscriminatesSchemaGeneration) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addTermDoc(writer, "alpha beta");
+  addTermDoc(writer, "alpha");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  TermQuery alpha("text_w", "alpha");
+  TermQuery beta("text_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+
+  MemPool firstPool;
+  Query::Context first(
+      firstPool, *reader, {}, nullptr,
+      FilterKeyContext{.schemaGen = 3, .timeZone = {}});
+  auto* firstUse = first.getFilterUse(
+      query, FilterCache::AdmissionLane::WHOLE);
+  MemPool secondPool;
+  Query::Context second(
+      secondPool, *reader, {}, nullptr,
+      FilterKeyContext{.schemaGen = 4, .timeZone = {}});
+  auto* secondUse = second.getFilterUse(
+      query, FilterCache::AdmissionLane::WHOLE);
+
+  EXPECT_NE(firstUse->entryIdentityForTest(),
+            secondUse->entryIdentityForTest());
+  EXPECT_EQ(2u, reader->filterCache()->entryCountForTest());
+}
+
 TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;

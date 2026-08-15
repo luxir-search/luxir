@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "luxir/query/BooleanQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/SearchOverrides.h"
 #include "test/CollectionHelper.h"
@@ -41,6 +42,18 @@ struct FilterFoldGuard {
 
   ~FilterFoldGuard() {
     disableTopDocsFilterFold = saved;
+  }
+};
+
+struct WholeMembershipPlanGuard {
+  bool saved = QueryPrep::disableWholeMembershipPlanForTests;
+
+  WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = true;
+  }
+
+  ~WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = saved;
   }
 };
 
@@ -95,6 +108,7 @@ public:
           bool materializeDomain = false, bool externalFilter = false) {
     IdentityGuard identityGuard(disableIdentity);
     FilterFoldGuard filterGuard(externalFilter);
+    WholeMembershipPlanGuard wholeGuard;
     SkipStatsGuard statsGuard;
 
     auto req = localReq(helper.getSearchEngine());
@@ -291,6 +305,7 @@ TEST_F(DisjunctionCountIdentityTest, multiWindowIdentityStaysDocsOnly) {
 
   auto countUnion = [&](bool disableIdentity) {
     IdentityGuard identityGuard(disableIdentity);
+    WholeMembershipPlanGuard wholeGuard;
     SkipStatsGuard statsGuard;
     auto req = localReq(wide.getSearchEngine());
     req->collection("main");

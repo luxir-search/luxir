@@ -43,6 +43,12 @@ public:
       unused(segment);
       return nullptr;  // never matches any doc
     }
+
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      unused(segment, domain);
+      return 0;
+    }
   };
 };
 

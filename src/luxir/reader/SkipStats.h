@@ -243,6 +243,11 @@ struct SkipStats {
   static inline int64_t filterDocSetIdentityCollections = 0;
   static inline int64_t exactDomainDocSetCollections = 0;
   static inline int64_t exactDomainStreamFallbacks = 0;
+  static inline int64_t wholeCountHits = 0;
+  static inline int64_t wholeCountBuilds = 0;
+  static inline int64_t wholeCountBypasses = 0;
+  static inline int64_t wholeCountConstant = 0;
+  static inline int64_t wholeCountFallbackSuppliers = 0;
   static inline int64_t numericRangeSparseVerifyArms = 0;
   static inline int64_t numericRangeComplementArms = 0;
   static inline int64_t numericRangePointsArms = 0;
@@ -469,6 +474,11 @@ struct SkipStats {
     filterDocSetIdentityCollections = 0;
     exactDomainDocSetCollections = 0;
     exactDomainStreamFallbacks = 0;
+    wholeCountHits = 0;
+    wholeCountBuilds = 0;
+    wholeCountBypasses = 0;
+    wholeCountConstant = 0;
+    wholeCountFallbackSuppliers = 0;
     numericRangeSparseVerifyArms = 0;
     numericRangeComplementArms = 0;
     numericRangePointsArms = 0;

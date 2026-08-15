@@ -157,6 +157,7 @@ public:
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
   CollectionRequirements requirements;
+  QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
 
@@ -659,14 +660,33 @@ public:
             skipCount(SkipStats::exactDomainStreamFallbacks);
           }
         }
+        QueryPrep::WholeMembershipResult wholeCountResult;
+        if (!exactDomain && !matchEverything
+            && !op.wholeMembershipPlan.empty()) {
+          wholeCountResult = op.wholeMembershipPlan.resolve(
+              *op.req.reader, seg, domain);
+        }
+        bool wholeCountAvailable = wholeCountResult.available;
+        bool wholeFallbackSupplierPending =
+            !wholeCountAvailable && op.wholeMembershipPlan.hasCacheUse();
+        auto obtainMainSupplier = [&]() {
+          if (supplier == nullptr) {
+            if (wholeFallbackSupplierPending) {
+              skipCount(SkipStats::wholeCountFallbackSuppliers);
+              wholeFallbackSupplierPending = false;
+            }
+            supplier = mainScorerSupplier(poolGuard.pool(), seg);
+          }
+          return supplier;
+        };
         // A root, non-prepared filter-only Boolean can expose its one cached
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
-        if (!exactDomain
+        if (!exactDomain && !wholeCountAvailable
             && !requiresPreparePhase && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
             && (rankFromDocOrder || data->topCount() == 0)) {
-          supplier = mainScorerSupplier(poolGuard.pool(), seg);
+          supplier = obtainMainSupplier();
           borrowedDomain =
               supplier == nullptr ? nullptr : supplier->exactDocSet();
           if (borrowedDomain != nullptr) {
@@ -679,7 +699,8 @@ public:
           }
         }
         bool identityResult =
-            (exactDomain || matchEverything || borrowedDomain != nullptr)
+            (wholeCountAvailable || exactDomain || matchEverything
+             || borrowedDomain != nullptr)
             && (rankFromDocOrder || data->topCount() == 0);
 
         std::optional<DocSetBuilder> builder;
@@ -688,17 +709,21 @@ public:
         }
 
         if (identityResult) {
-          DocSet* identityDomain = exactDomain
-              ? exactDomainDocs
-              : borrowedDomain != nullptr ? borrowedDomain : domain;
-          int64_t total = identityDomain == nullptr
-              ? seg.maxDoc() : identityDomain->card();
+          DocSet* identityDomain = wholeCountAvailable
+              ? wholeCountResult.docs.get()
+              : exactDomain
+                    ? exactDomainDocs
+                    : borrowedDomain != nullptr ? borrowedDomain : domain;
+          int64_t total = wholeCountAvailable
+              ? wholeCountResult.count
+              : identityDomain == nullptr
+                    ? seg.maxDoc() : identityDomain->card();
           int64_t ranked = 0;
           if (rankFromDocOrder && data->topCount() > 0) {
             // Equal scores reduce ranking to doc order, so the domain's first
             // K docs are its top K.
             if (supplier == nullptr) {
-              supplier = mainScorerSupplier(poolGuard.pool(), seg);
+              supplier = obtainMainSupplier();
             }
             auto* scorer = supplier == nullptr ? nullptr
               : buildBoundedConstantScorer(
@@ -711,9 +736,7 @@ public:
           }
           assert(total >= ranked);
           data->addHits(total - ranked);
-        } else if ((supplier = supplier != nullptr
-                                  ? supplier
-                                  : mainScorerSupplier(poolGuard.pool(), seg));
+        } else if ((supplier = obtainMainSupplier());
                    supplier != nullptr) {
           DocSet* filter = domain;
           std::unique_ptr<DocSet> newDomain;
@@ -1218,6 +1241,8 @@ public:
     Query::Context& qcontext, Query* query, Query::Weight* weight,
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
     SortPlan&& sortPlan, CollectionRequirements requirements,
+    Query::Weight* wholeMembershipWeight,
+    FilterCache::Use* wholeMembershipUse,
     std::span<std::pair<std::string_view, Query*>> filters,
     std::span<Query::Weight*> filterWeights,
     Query* domainQuery, Query::Weight* domainQueryWeight,
@@ -1227,6 +1252,11 @@ public:
       topCount(topCount), filters(filters), filterWeights(filterWeights),
       requirements(requirements),
       sortPlan(std::move(sortPlan)) {
+    if (wholeMembershipWeight != nullptr) {
+      wholeMembershipPlan = QueryPrep::WholeMembershipPlan(
+          *wholeMembershipWeight, wholeMembershipUse,
+          qcontext.filterUses);
+    }
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());
       filterUses = qcontext.pool.make_span<FilterCache::Use*>(filters.size());

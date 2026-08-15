@@ -203,6 +203,13 @@ public:
       return targetPool.make<AllQuery::Scorer>(segment, score);
     }
 
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      return domain == nullptr
+          ? std::optional<int64_t>((int64_t) segment.maxDoc())
+          : std::nullopt;
+    }
+
   };
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,

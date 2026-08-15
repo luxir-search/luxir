@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -26,6 +27,19 @@ using namespace luxir;
 using namespace luxir::test;
 
 namespace {
+class WholeMembershipPlanGuard {
+  bool saved;
+
+public:
+  explicit WholeMembershipPlanGuard(bool disabled)
+    : saved(QueryPrep::disableWholeMembershipPlanForTests) {
+    QueryPrep::disableWholeMembershipPlanForTests = disabled;
+  }
+  ~WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = saved;
+  }
+};
+
 class TopDocsFilterFoldGuard {
   bool saved;
 
@@ -411,6 +425,55 @@ public:
   }
 };
 
+struct WholeCountRun {
+  int64_t found = 0;
+  int64_t hits = 0;
+  int64_t builds = 0;
+  int64_t bypasses = 0;
+  int64_t constants = 0;
+  int64_t fallbackSuppliers = 0;
+  bool docsEmpty = false;
+  bool hasScoreValues = false;
+};
+
+using WholeCountQueryBuilder =
+    std::function<api::Query(std::pmr::memory_resource&)>;
+
+WholeCountRun runWholeCount(
+    SearchEngine& engine, std::string_view collection,
+    const WholeCountQueryBuilder& buildQuery, bool getScores = false,
+    bool forcePrepare = false) {
+  auto req = localReq(engine);
+  req->testForcePrepare = forcePrepare;
+  req->collection(collection);
+  auto& topDocs = req->topDocs("q").getNumber().limit(0);
+  if (getScores) topDocs.getScores();
+  topDocs.rawQuery() = buildQuery(topDocs.mr());
+
+  SkipStatsGuard stats;
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  const auto* docs = req->docList("q");
+  bool hasScoreValues = false;
+  if (docs != nullptr) {
+    const auto* scoreColumn = docs->columns.find("_score_");
+    if (scoreColumn != nullptr) {
+      const auto* scores = std::get_if<api::ColFloat>(&scoreColumn->kind);
+      hasScoreValues = scores != nullptr && !scores->v.empty();
+    }
+  }
+  return {
+    req->getMatchCount("q"),
+    SkipStats::wholeCountHits,
+    SkipStats::wholeCountBuilds,
+    SkipStats::wholeCountBypasses,
+    SkipStats::wholeCountConstant,
+    SkipStats::wholeCountFallbackSuppliers,
+    req->getDocs("q").empty(),
+    hasScoreValues,
+  };
+}
+
 struct SparseFilteredTopKResult {
   std::vector<std::string> ids;
   std::map<std::string, float> scores;
@@ -511,6 +574,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
 
   SkipStatsGuard statsGuard;
   {
+    WholeMembershipPlanGuard wholeGuard(true);
     TopDocsFilterFoldGuard foldGuard(path == FilteredCountPath::MATERIALIZED);
     req->execute(false);
   }
@@ -545,7 +609,10 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
   cur.rawQuery() = filteredCountBody(cur.mr(), shape);
 
   SkipStatsGuard statsGuard;
-  req->execute(false);
+  {
+    WholeMembershipPlanGuard wholeGuard(true);
+    req->execute(false);
+  }
   EXPECT_TRUE(req->ok()) << req->errorMsg();
   return {
     req->getMatchCount("q"),
@@ -1001,6 +1068,471 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
     EXPECT_EQ(3, req->getMatchCount("q"));
     EXPECT_TRUE(req->getDocs("q").empty());
   }
+}
+
+TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
+  constexpr std::string_view collection = "whole_count_families";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 96; doc++) {
+    std::string body;
+    if ((doc % 2) == 0) body += "alpha ";
+    if ((doc % 3) == 0) body += "beta ";
+    if ((doc % 5) == 0) body += "gamma ";
+    if ((doc % 7) == 0) body += "delta ";
+    if ((doc % 11) == 0) body += "epsilon ";
+    if ((doc % 3) == 0) {
+      body += "quick fox ";
+    } else if ((doc % 3) == 1) {
+      body += "quick brown fox ";
+    } else {
+      body += "slow turtle ";
+    }
+    if ((doc % 4) != 3) {
+      body += (doc % 4) == 0 ? "color "
+          : (doc % 4) == 1 ? "colon " : "colors ";
+    }
+    if ((doc % 4) == 0) body += "presto ";
+    if ((doc % 6) == 0) body += "prefix ";
+    docs.push_back(flatdoc(
+        "id", "whole_" + std::to_string(doc), "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("whole_0", UpdateMessage::COMMIT).success);
+
+  auto conjunction = [](std::pmr::memory_resource& mr,
+                        std::string_view first,
+                        std::string_view second) {
+    return qb::boolean(
+        mr, {qb::match(mr, "body_w", first),
+             qb::match(mr, "body_w", second)});
+  };
+  std::vector<std::pair<std::string, WholeCountQueryBuilder>> families;
+  families.emplace_back("term", [](auto& mr) {
+    return qb::match(mr, "body_w", "alpha");
+  });
+  families.emplace_back("intersection", [=](auto& mr) {
+    return conjunction(mr, "alpha", "beta");
+  });
+  families.emplace_back("union", [](auto& mr) {
+    return qb::boolean(
+        mr, {}, {qb::match(mr, "body_w", "beta"),
+                 qb::match(mr, "body_w", "gamma")}, {}, {}, 1);
+  });
+  families.emplace_back("phrase", [](auto& mr) {
+    return qb::phraseWords(mr, "body_w", {"quick", "fox"});
+  });
+  families.emplace_back("sloppy phrase", [](auto& mr) {
+    auto query = qb::phraseWords(mr, "body_w", {"quick", "fox"});
+    std::get<api::PhraseQuery>(query.kind).slop = 2;
+    return query;
+  });
+  families.emplace_back("negated boolean", [](auto& mr) {
+    return qb::boolean(
+        mr, {qb::all()}, {}, {qb::match(mr, "body_w", "gamma")});
+  });
+  families.emplace_back("boosted", [=](auto& mr) {
+    return qb::boost(mr, conjunction(mr, "alpha", "delta"), 3.0f);
+  });
+  families.emplace_back("constant score", [=](auto& mr) {
+    return qb::constantScore(
+        mr, conjunction(mr, "beta", "epsilon"), 4.0f);
+  });
+  families.emplace_back("prefix", [](auto& mr) {
+    return qb::prefix(mr, "body_w", "pre");
+  });
+  families.emplace_back("wildcard", [](auto& mr) {
+    return qb::wildcard(mr, "body_w", "col*");
+  });
+  families.emplace_back("fuzzy", [](auto& mr) {
+    return qb::fuzzy(mr, "body_w", "color", 1, 0, 20);
+  });
+
+  for (const auto& [name, buildQuery] : families) {
+    SCOPED_TRACE(name);
+    WholeCountRun bypass = runWholeCount(
+        helper.getSearchEngine(), collection, buildQuery);
+    WholeCountRun build = runWholeCount(
+        helper.getSearchEngine(), collection, buildQuery);
+    WholeCountRun hit = runWholeCount(
+        helper.getSearchEngine(), collection, buildQuery);
+    EXPECT_EQ(bypass.found, build.found);
+    EXPECT_EQ(build.found, hit.found);
+    EXPECT_TRUE(bypass.docsEmpty);
+    EXPECT_EQ(1, bypass.bypasses);
+    EXPECT_EQ(1, bypass.fallbackSuppliers);
+    EXPECT_EQ(1, build.builds);
+    EXPECT_EQ(0, build.fallbackSuppliers);
+    EXPECT_EQ(1, hit.hits);
+    EXPECT_EQ(0, hit.fallbackSuppliers);
+  }
+
+  WholeCountRun unboostedHit = runWholeCount(
+      helper.getSearchEngine(), collection, [=](auto& mr) {
+        return conjunction(mr, "alpha", "delta");
+      });
+  EXPECT_EQ(1, unboostedHit.hits);
+  WholeCountRun unwrappedConstantHit = runWholeCount(
+      helper.getSearchEngine(), collection, [=](auto& mr) {
+        return conjunction(mr, "beta", "epsilon");
+      });
+  EXPECT_EQ(1, unwrappedConstantHit.hits);
+}
+
+TEST_F(SearchEngineTest, limitZeroGetScoresUsesUnscoredWholeMembership) {
+  constexpr std::string_view collection = "whole_count_get_scores";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  for (int32_t doc = 0; doc < 32; doc++) {
+    ASSERT_TRUE(helper.index(
+        flatdoc("id", "score_" + std::to_string(doc), "body_w",
+                doc % 2 == 0 ? "alpha beta" : "alpha"),
+        doc == 31 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("score_0", UpdateMessage::COMMIT).success);
+
+  WholeCountQueryBuilder query = [](auto& mr) {
+    return qb::boolean(
+        mr, {qb::match(mr, "body_w", "alpha"),
+             qb::match(mr, "body_w", "beta")});
+  };
+  WholeCountRun bypass = runWholeCount(
+      helper.getSearchEngine(), collection, query, true);
+  WholeCountRun build = runWholeCount(
+      helper.getSearchEngine(), collection, query, true);
+  WholeCountRun hit = runWholeCount(
+      helper.getSearchEngine(), collection, query, true);
+  EXPECT_EQ(15, bypass.found);
+  EXPECT_EQ(bypass.found, build.found);
+  EXPECT_EQ(build.found, hit.found);
+  EXPECT_EQ(1, bypass.bypasses);
+  EXPECT_EQ(1, build.builds);
+  EXPECT_EQ(1, hit.hits);
+  EXPECT_FALSE(bypass.hasScoreValues);
+  EXPECT_FALSE(build.hasScoreValues);
+  EXPECT_FALSE(hit.hasScoreValues);
+}
+
+TEST_F(SearchEngineTest, wholeCountConstantGateAvoidsWholeAdmission) {
+  constexpr std::string_view collection = "whole_count_constants";
+  CollectionHelper helper(collection);
+  auto cache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 32; doc++) {
+    docs.push_back(flatdoc(
+        "id", "constant_" + std::to_string(doc), "body_w",
+        doc % 2 == 0 ? "alpha" : "beta"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  WholeCountQueryBuilder all = [](auto& mr) {
+    unused(mr);
+    return qb::all();
+  };
+  WholeCountQueryBuilder term = [](auto& mr) {
+    return qb::match(mr, "body_w", "alpha");
+  };
+  WholeCountQueryBuilder none = [](auto& mr) {
+    return qb::phraseWords(mr, "body_w", {});
+  };
+  for (int round = 0; round < 3; round++) {
+    WholeCountRun allRun = runWholeCount(
+        helper.getSearchEngine(), collection, all);
+    WholeCountRun noneRun = runWholeCount(
+        helper.getSearchEngine(), collection, none);
+    WholeCountRun termRun = runWholeCount(
+        helper.getSearchEngine(), collection, term);
+    EXPECT_EQ(32, allRun.found);
+    EXPECT_EQ(0, noneRun.found);
+    EXPECT_EQ(16, termRun.found);
+    EXPECT_EQ(0, allRun.hits + allRun.builds + allRun.bypasses);
+    EXPECT_EQ(1, noneRun.constants);
+    EXPECT_EQ(0, noneRun.hits + noneRun.builds + noneRun.bypasses);
+    EXPECT_EQ(1, termRun.constants);
+    EXPECT_EQ(0, termRun.hits + termRun.builds + termRun.bypasses);
+  }
+  EXPECT_EQ(0u, cache->entryCountForTest());
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+}
+
+TEST_F(SearchEngineTest, foldedNamedFilterUsesWholeCompoundPlan) {
+  constexpr std::string_view collection = "whole_count_folded_filter";
+  CollectionHelper helper(collection);
+  auto cache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 24; doc++) {
+    docs.push_back(flatdoc(
+        "id", "folded_" + std::to_string(doc), "body_w", "browse",
+        "keep_s", doc % 2 == 0 ? "yes" : "no"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("folded_0", UpdateMessage::COMMIT).success);
+
+  auto run = [&]() {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    req->topDocs("q").allQuery().getNumber().limit(0)
+        .matchFilter("keep", "keep_s", "yes");
+    SkipStatsGuard stats;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return WholeCountRun{
+      req->getMatchCount("q"),
+      SkipStats::wholeCountHits,
+      SkipStats::wholeCountBuilds,
+      SkipStats::wholeCountBypasses,
+      SkipStats::wholeCountConstant,
+      SkipStats::wholeCountFallbackSuppliers,
+      req->getDocs("q").empty(),
+      false,
+    };
+  };
+
+  WholeCountRun bypass = run();
+  WholeCountRun build = run();
+  WholeCountRun hit = run();
+  EXPECT_EQ(11, bypass.found);
+  EXPECT_EQ(bypass.found, build.found);
+  EXPECT_EQ(build.found, hit.found);
+  EXPECT_EQ(1, bypass.bypasses);
+  EXPECT_EQ(1, bypass.fallbackSuppliers);
+  EXPECT_EQ(1, build.builds);
+  EXPECT_EQ(1, hit.hits);
+  EXPECT_EQ(0, hit.fallbackSuppliers);
+  // The whole Boolean and its separable filter clause intentionally retain
+  // distinct membership keys in Stage 2.
+  EXPECT_EQ(2u, cache->entryCountForTest());
+
+  auto passive = localReq(helper.getSearchEngine());
+  passive->collection(collection);
+  passive->topDocs("q").allQuery().getNumber().limit(0)
+      .matchFilter("keep", "keep_s", "yes");
+  {
+    TopDocsFilterFoldGuard fold(true);
+    SkipStatsGuard stats;
+    passive->execute(false);
+    EXPECT_EQ(0, SkipStats::wholeCountHits + SkipStats::wholeCountBuilds
+                     + SkipStats::wholeCountBypasses
+                     + SkipStats::wholeCountConstant);
+  }
+  ASSERT_OK(passive);
+  EXPECT_EQ(11, passive->getMatchCount("q"));
+}
+
+TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
+  constexpr std::string_view collection = "whole_count_segment_gate";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+
+  std::vector<Doc> firstSegment;
+  std::vector<std::string> firstIds;
+  for (int32_t doc = 0; doc < 8; doc++) {
+    std::string id = "old_" + std::to_string(doc);
+    firstIds.push_back(id);
+    firstSegment.push_back(flatdoc(
+        "id", id, "body_w", doc % 2 == 0 ? "alpha" : "beta"));
+  }
+  ASSERT_TRUE(helper.indexAll(
+      firstSegment, UpdateMessage::COMMIT).success);
+  std::vector<Doc> secondSegment;
+  for (int32_t doc = 0; doc < 8; doc++) {
+    secondSegment.push_back(flatdoc(
+        "id", "new_" + std::to_string(doc), "body_w",
+        doc % 2 == 0 ? "alpha" : "beta"));
+  }
+  ASSERT_TRUE(helper.indexAll(
+      secondSegment, UpdateMessage::COMMIT).success);
+  firstIds.pop_back();
+  ASSERT_TRUE(helper.deleteByIds(
+      firstIds, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(2u, reader->segments().size());
+
+  WholeCountQueryBuilder term = [](auto& mr) {
+    return qb::match(mr, "body_w", "alpha");
+  };
+  WholeCountRun bypass = runWholeCount(
+      helper.getSearchEngine(), collection, term);
+  WholeCountRun build = runWholeCount(
+      helper.getSearchEngine(), collection, term);
+  WholeCountRun hit = runWholeCount(
+      helper.getSearchEngine(), collection, term);
+  EXPECT_EQ(4, bypass.found);
+  EXPECT_EQ(bypass.found, build.found);
+  EXPECT_EQ(build.found, hit.found);
+  EXPECT_EQ(1, bypass.constants);
+  EXPECT_EQ(1, bypass.bypasses);
+  EXPECT_EQ(1, bypass.fallbackSuppliers);
+  EXPECT_EQ(1, build.constants);
+  EXPECT_EQ(1, build.builds);
+  EXPECT_EQ(1, hit.constants);
+  EXPECT_EQ(1, hit.hits);
+
+  WholeCountQueryBuilder empty = [](auto& mr) {
+    return qb::phraseWords(mr, "body_w", {"not", "present"});
+  };
+  WholeCountRun emptyBypass = runWholeCount(
+      helper.getSearchEngine(), collection, empty);
+  WholeCountRun emptyBuild = runWholeCount(
+      helper.getSearchEngine(), collection, empty);
+  WholeCountRun emptyHit = runWholeCount(
+      helper.getSearchEngine(), collection, empty);
+  EXPECT_EQ(0, emptyBypass.found);
+  EXPECT_EQ(0, emptyBuild.found);
+  EXPECT_EQ(0, emptyHit.found);
+  EXPECT_EQ(2, emptyBypass.bypasses);
+  EXPECT_EQ(2, emptyBuild.builds);
+  EXPECT_EQ(2, emptyHit.hits);
+}
+
+TEST_F(SearchEngineTest, wholeCountIsInertWithCacheOffOrPrepare) {
+  constexpr std::string_view cacheOffCollection = "whole_count_cache_off";
+  CollectionHelper cacheOff(cacheOffCollection);
+  auto disabled = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+  cacheOff.getIndexWriter()->filterCache = disabled;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 24; doc++) {
+    docs.push_back(flatdoc(
+        "id", "off_" + std::to_string(doc), "body_w",
+        doc % 3 == 0 ? "alpha beta" : "alpha"));
+  }
+  ASSERT_TRUE(cacheOff.indexAll(docs, UpdateMessage::COMMIT).success);
+  WholeCountQueryBuilder query = [](auto& mr) {
+    return qb::boolean(
+        mr, {qb::match(mr, "body_w", "alpha"),
+             qb::match(mr, "body_w", "beta")});
+  };
+  for (int round = 0; round < 3; round++) {
+    WholeCountRun run = runWholeCount(
+        cacheOff.getSearchEngine(), cacheOffCollection, query);
+    EXPECT_EQ(8, run.found);
+    EXPECT_EQ(0, run.hits + run.builds + run.bypasses + run.constants
+                     + run.fallbackSuppliers);
+  }
+  EXPECT_EQ(0u, disabled->entryCountForTest());
+  EXPECT_EQ(0u, disabled->counters().buildAttempts);
+
+  constexpr std::string_view preparedCollection = "whole_count_prepared";
+  CollectionHelper prepared(preparedCollection);
+  auto preparedCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  prepared.getIndexWriter()->filterCache = preparedCache;
+  ASSERT_TRUE(prepared.indexAll(docs, UpdateMessage::COMMIT).success);
+  for (int round = 0; round < 3; round++) {
+    WholeCountRun run = runWholeCount(
+        prepared.getSearchEngine(), preparedCollection, query,
+        false, true);
+    EXPECT_EQ(8, run.found);
+    EXPECT_EQ(0, run.hits + run.builds + run.bypasses + run.constants
+                     + run.fallbackSuppliers);
+  }
+  EXPECT_EQ(0u, preparedCache->entryCountForTest());
+}
+
+TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
+  constexpr std::string_view collection = "whole_count_fuzzy_core";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  ASSERT_TRUE(helper.indexAll(
+      {flatdoc("id", "f0", "body_w", "color"),
+       flatdoc("id", "f1", "body_w", "colon"),
+       flatdoc("id", "f2", "body_w", "other")},
+      UpdateMessage::COMMIT).success);
+  WholeCountQueryBuilder fuzzy = [](auto& mr) {
+    return qb::fuzzy(mr, "body_w", "color", 1, 0, 20);
+  };
+  WholeCountRun oldBypass = runWholeCount(
+      helper.getSearchEngine(), collection, fuzzy);
+  WholeCountRun oldBuild = runWholeCount(
+      helper.getSearchEngine(), collection, fuzzy);
+  WholeCountRun oldHit = runWholeCount(
+      helper.getSearchEngine(), collection, fuzzy);
+  EXPECT_EQ(2, oldBypass.found);
+  EXPECT_EQ(1, oldBypass.bypasses);
+  EXPECT_EQ(1, oldBuild.builds);
+  EXPECT_EQ(1, oldHit.hits);
+
+  ASSERT_TRUE(helper.indexAll(
+      {flatdoc("id", "f3", "body_w", "colors"),
+       flatdoc("id", "f4", "body_w", "other")},
+      UpdateMessage::COMMIT).success);
+  size_t segmentCount =
+      helper.getIndexWriter()->getIndexReader()->segments().size();
+  ASSERT_GT(segmentCount, 1u);
+  WholeCountRun newBypass = runWholeCount(
+      helper.getSearchEngine(), collection, fuzzy);
+  WholeCountRun newBuild = runWholeCount(
+      helper.getSearchEngine(), collection, fuzzy);
+  WholeCountRun newHit = runWholeCount(
+      helper.getSearchEngine(), collection, fuzzy);
+  EXPECT_EQ(3, newBypass.found);
+  EXPECT_EQ((int64_t) segmentCount, newBypass.bypasses);
+  EXPECT_EQ((int64_t) segmentCount, newBuild.builds);
+  EXPECT_EQ((int64_t) segmentCount, newHit.hits);
+}
+
+TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
+  constexpr std::string_view collection = "whole_count_backoff";
+  CollectionHelper helper(collection);
+  FilterCacheConfig config{
+      .lowWatermarkBytes = 1,
+      .minSegmentDocs = 0,
+      .admissionThreshold = 1,
+  };
+  auto cache = std::make_shared<FilterCache>(config);
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 32; doc++) {
+    docs.push_back(flatdoc(
+        "id", "backoff_" + std::to_string(doc), "body_w",
+        doc % 4 == 0 ? "alpha beta" : "alpha"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  TermQuery alpha("body_w", "alpha");
+  TermQuery beta("body_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  Query::Context context(
+      pool, *reader, {}, nullptr,
+      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = {}});
+  auto* weight = query.createWeight(context, 0);
+  auto* use = context.getFilterUse(
+      query, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan plan(
+      *weight, use, context.filterUses);
+  auto built = plan.resolve(*reader, reader->segments()[0], nullptr);
+  ASSERT_TRUE(built.available);
+  EXPECT_EQ(8, built.count);
+  cache->sweep();
+  ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
+
+  uint64_t thrashSkips = cache->counters().thrashBuildSkips;
+  WholeCountRun fallback = runWholeCount(
+      helper.getSearchEngine(), collection, [](auto& mr) {
+        return qb::boolean(
+            mr, {qb::match(mr, "body_w", "alpha"),
+                 qb::match(mr, "body_w", "beta")});
+      });
+  EXPECT_EQ(8, fallback.found);
+  EXPECT_EQ(1, fallback.bypasses);
+  EXPECT_EQ(1, fallback.fallbackSuppliers);
+  EXPECT_EQ(0, fallback.builds + fallback.hits);
+  EXPECT_EQ(thrashSkips + 1, cache->counters().thrashBuildSkips);
 }
 
 TEST_F(SearchEngineTest, singleTermLimitZeroFacetFallsBackOnCacheMiss) {
@@ -1866,6 +2398,7 @@ TEST_F(SearchEngineTest, cachedNumericFilterHitIgnoresShapeToggle) {
         qb::valI64(topDocs.mr(), N / 2 - 1), nullptr));
     SkipStatsGuard stats;
     {
+      WholeMembershipPlanGuard wholeGuard(true);
       NumericRangeShapeGuard shapeGuard(disableShapes);
       req->execute(false);
     }

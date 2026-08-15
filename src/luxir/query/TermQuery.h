@@ -160,6 +160,16 @@ public:
                                                 query.shouldUseFrontierBound());
     }
 
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      if (domain != nullptr || segment.liveDocs() != nullptr) {
+        return std::nullopt;
+      }
+      return cachedTermInfo == nullptr
+          ? 0
+          : (int64_t) cachedTermInfo->docFreq(segment.ord);
+    }
+
     // A term's exact match count is its docFreq - free from the term stats -
     // unless deletions could have removed some of its docs.
 

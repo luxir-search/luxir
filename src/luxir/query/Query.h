@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -858,12 +859,15 @@ public:
       return *allocationArena;
     }
 
-    FilterCache::Use* getFilterUse(const Query& query) {
+    FilterCache::Use* getFilterUse(
+        const Query& query,
+        FilterCache::AdmissionLane lane =
+            FilterCache::AdmissionLane::CLAUSE) {
       if (filterUses == nullptr) return nullptr;
       FilterKeyBuilder builder;
       FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
       auto key = std::move(builder).finish(scope, filterKeyContext);
-      return key ? filterUses->get(*key, scope) : nullptr;
+      return key ? filterUses->get(*key, scope, lane) : nullptr;
     }
 
     // code must have static storage duration.
@@ -1109,6 +1113,14 @@ public:
     /// True when the request permits scorer-level competitive pruning.
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
+
+    /// Exact O(1) per-segment membership count without constructing a
+    /// supplier. A null result means the caller must execute the query.
+    virtual std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) {
+      unused(segment, domain);
+      return std::nullopt;
+    }
 
     /// Policy family for choosing the sparse-filtered top-k density knee.
     /// Existing and ineligible weights retain the conjunction-family default.

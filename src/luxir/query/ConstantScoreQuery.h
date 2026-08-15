@@ -235,6 +235,11 @@ public:
       if (childSupplier == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
     }
+
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      return childWeight->constantCount(segment, domain);
+    }
   };
 };
 

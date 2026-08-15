@@ -16,6 +16,7 @@
 namespace luxir::QueryPrep {
 
 inline bool disableDirectPostingsMaterializationForTests = false;
+inline bool disableWholeMembershipPlanForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
 // bypass instead of preserving the postings supplier as the gather feed.
 inline bool disableSparseBatchPostingsFeedForTests = false;
@@ -522,6 +523,85 @@ inline std::unique_ptr<DocSet> materializeRawFilter(
       weight, prepared, segment, nullptr,
       Query::SupplierExecutionMode::RAW_MEMBERSHIP);
 }
+
+struct WholeMembershipResult {
+  bool available = false;
+  DomainHandle docs;
+  int64_t count = 0;
+};
+
+// Request-owned whole-query membership fact. Constant counts precede cache
+// traffic; cache values remain raw and the incoming effective domain is
+// composed once at the Use boundary.
+class WholeMembershipPlan {
+  Query::Weight* weight = nullptr;
+  FilterCache::Use* cacheUse = nullptr;
+  std::shared_ptr<FilterCache::UseRegistry> lifetime;
+  PreparedDomainDependence domainDependence =
+      PreparedDomainDependence::QUERY_CANONICAL;
+
+public:
+  WholeMembershipPlan() = default;
+
+  WholeMembershipPlan(
+      Query::Weight& weight, FilterCache::Use* cacheUse,
+      std::shared_ptr<FilterCache::UseRegistry> lifetime,
+      PreparedDomainDependence domainDependence =
+          PreparedDomainDependence::QUERY_CANONICAL)
+    : weight(&weight), cacheUse(cacheUse), lifetime(std::move(lifetime)),
+      domainDependence(domainDependence) {}
+
+  bool empty() const { return weight == nullptr; }
+  bool hasCacheUse() const { return cacheUse != nullptr; }
+
+  WholeMembershipResult resolve(
+      IndexReader& reader, IndexReader::Segment& segment,
+      DocSet* incomingDomain) const {
+    if (weight == nullptr || weight->needsPrepare()) return {};
+
+    auto constant = weight->constantCount(segment, incomingDomain);
+    if (constant.has_value()) {
+      skipCount(SkipStats::wholeCountConstant);
+      return {true, {}, *constant};
+    }
+    if (cacheUse == nullptr) return {};
+
+    auto probe = cacheUse->probe((size_t) segment.ord);
+    if (probe.kind() == FilterCache::Probe::Kind::HIT) {
+      DocSet* docs = cacheUse->effectiveDocSet(
+          (size_t) segment.ord, reader, incomingDomain);
+      if (docs == nullptr) return {};
+      skipCount(SkipStats::wholeCountHits);
+      return {
+        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
+      };
+    }
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      if (domainDependence
+          != PreparedDomainDependence::QUERY_CANONICAL) {
+        throw std::logic_error(
+            "whole membership publication requires a query-canonical source");
+      }
+      auto buildStart = std::chrono::steady_clock::now();
+      auto raw = materializeRawFilter(*weight, nullptr, segment);
+      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+      cacheUse->publishRaw(
+          (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
+      DocSet* docs = cacheUse->effectiveDocSet(
+          (size_t) segment.ord, reader, incomingDomain);
+      if (docs == nullptr) return {};
+      skipCount(SkipStats::wholeCountBuilds);
+      return {
+        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
+      };
+    }
+
+    // Probe destruction releases RequestSlot::resolving before the caller
+    // constructs and streams its ordinary fallback supplier.
+    skipCount(SkipStats::wholeCountBypasses);
+    return {};
+  }
+};
 
 enum class FilterSupplierMode : uint8_t {
   // Pruned scored TOP_k keeps the calibrated density route: sparse filters
