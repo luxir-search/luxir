@@ -32,6 +32,7 @@ public:
     static inline bool disableSortForTests = false;
     static inline bool disableRepeatDedupForTests = false;
     static inline bool disableRawBoundsForTests = false;
+    static inline bool disableCompetitiveBlocksForTests = false;
   };
 
   struct RepeatGroup {
@@ -1057,6 +1058,14 @@ public:
     std::span<const int32_t> impactMultiplicities;
     MatcherPolicy matcher;
     float minCompetitiveScore = 0.0f;
+    // Competitive-block gate certificate (TermQuery shape): lead postings at
+    // or below competitiveUpTo may compete; competitiveBound is the certified
+    // composed bound, so threshold rises below it keep the certificate.
+    int32_t competitiveUpTo = PostingsReader::END;
+    float competitiveBound = std::numeric_limits<float>::infinity();
+    // Monotone impact-group resume hints, one per conjunction term.
+    std::span<int32_t> impactCursors;
+    int64_t skippedImpactBlocks = 0;
     int32_t shallowTarget = -1;
     int32_t docid = -1;
     int32_t checkedDocid = -1;
@@ -1090,9 +1099,89 @@ public:
       }
     }
 
-    int32_t doApproximationNext() { return doNext(conjunctionEnums[0]->next()); }
+    // Cold path of the competitive-block gate. Windows are keyed to the LEAD
+    // (rarest) term's impact blocks, Lucene mergeImpacts-style: the lead's
+    // firstCompetitiveTarget group-hops its dead blocks, and each surviving
+    // lead block [doc, windowEnd] is then bounded by the other terms' parse-
+    // free range bounds over the same window. The composed exact-phrase bound
+    // over a range is min over terms of that term's max impact there (phrase
+    // freq <= each term's freq, and the per-term impacts are scored with the
+    // phrase's own scorer), so a window whose min falls below the threshold
+    // holds no competitive doc. Keying to the lead keeps certificates wide
+    // (one cold call per ~128 lead postings), where a min-over-terms window
+    // would collapse to the densest term's ~128-posting doc span and put the
+    // cold path on every lead posting. Certifies [returned doc, competitiveUpTo].
+    LUXIR_NOINLINE int32_t skipNonCompetitiveBlocks(int32_t doc) {
+      if (impacts.empty() || !(minCompetitiveScore > 0.0f)) {
+        competitiveUpTo = PostingsReader::END;
+        competitiveBound = impacts.empty()
+            ? std::numeric_limits<float>::infinity() : 0.0f;
+        return doc;
+      }
+      int64_t skippedBefore = skippedImpactBlocks;
+      while (doc != PostingsReader::END) {
+        skipCount(SkipStats::phraseCompetitiveColdLookups);
+        auto landing = impacts[0].firstCompetitiveTarget(
+            doc, minCompetitiveScore, skippedImpactBlocks, impactCursors[0]);
+        impactCursors[0] = landing.group;
+        if (landing.doc == PostingsReader::END) {
+          doc = PostingsReader::END;
+          break;
+        }
+        if (landing.doc > doc) {
+          doc = conjunctionEnums[0]->advance(landing.doc);
+          if (doc > landing.lastDoc) continue;
+        }
+        int32_t windowEnd = landing.lastDoc;
+        float bound = landing.impact;
+        for (size_t i = 1; i < impacts.size() && bound >= minCompetitiveScore;
+             i++) {
+          // Non-lead terms are bounded at GROUP granularity only: group-table
+          // reads, never an L0 group parse. A dense term's parse would cost
+          // more than the fine bound is worth; the lead's own block impacts
+          // carry the fine-grained decisions.
+          const ImpactsIndex& termImpacts = impacts[i];
+          if (termImpacts.numGroups() == 0) {
+            bound = std::min(bound, termImpacts.globalMaxImpact());
+            continue;
+          }
+          int32_t gFrom =
+              termImpacts.groupContainingFrom(impactCursors[i], doc);
+          impactCursors[i] = gFrom;
+          if (gFrom >= termImpacts.numGroups()) {
+            continue;  // past this term's impact data: unbounded
+          }
+          int32_t gTo = termImpacts.groupContainingFrom(gFrom, windowEnd);
+          if (gTo >= termImpacts.numGroups()) continue;  // tail unbounded
+          bound = std::min(
+              bound, termImpacts.maxGroupImpactInRange(gFrom, gTo));
+        }
+        if (bound >= minCompetitiveScore) {
+          competitiveUpTo = windowEnd;
+          competitiveBound = bound;
+          break;
+        }
+        skippedImpactBlocks++;
+        doc = conjunctionEnums[0]->advance(windowEnd + 1);
+      }
+      if (SkipStats::enabled) {
+        SkipStats::phraseImpactBlocksSkipped +=
+            skippedImpactBlocks - skippedBefore;
+      }
+      return doc;
+    }
+
+    int32_t competitiveLead(int32_t doc) {
+      if constexpr (MatcherPolicy::IS_SLOPPY) return doc;
+      if (ScorerControls::disableCompetitiveBlocksForTests) return doc;
+      return doc <= competitiveUpTo ? doc : skipNonCompetitiveBlocks(doc);
+    }
+
+    int32_t doApproximationNext() {
+      return doNext(competitiveLead(conjunctionEnums[0]->next()));
+    }
     int32_t doApproximationAdvance(int32_t target) {
-      return doNext(conjunctionEnums[0]->advance(target));
+      return doNext(competitiveLead(conjunctionEnums[0]->advance(target)));
     }
 
     void resetRepeatGroups() {
@@ -1194,6 +1283,8 @@ public:
     static inline bool& disableSortForTests = ScorerControls::disableSortForTests;
     static inline bool& disableRepeatDedupForTests = ScorerControls::disableRepeatDedupForTests;
     static inline bool& disableRawBoundsForTests = ScorerControls::disableRawBoundsForTests;
+    static inline bool& disableCompetitiveBlocksForTests =
+        ScorerControls::disableCompetitiveBlocksForTests;
 
     static float roundUpToFloat(int64_t value) {
       float rounded = (float) value;
@@ -1227,6 +1318,11 @@ public:
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
+      }
+      if (!MatcherPolicy::IS_SLOPPY && !impacts.empty()) {
+        competitiveBound = 0.0f;
+        impactCursors = targetPool.make_span<int32_t>(impacts.size());
+        std::fill(impactCursors.begin(), impactCursors.end(), -1);
       }
       matcher.init(*this);
     }
@@ -1295,15 +1391,17 @@ public:
       if (windowEnd <= windowStart || docid == PostingsReader::END) {
         return;
       }
+      // Membership fill: never route through the competitive gate, which is
+      // licensed to drop sub-threshold docs.
       if (docid < windowStart) {
-        doApproximationAdvance(windowStart);
+        doNext(conjunctionEnums[0]->advance(windowStart));
       }
       while (docid < windowEnd) {
         if (doMatches()) {
           int32_t index = docid - windowStart;
           windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
         }
-        doApproximationNext();
+        doNext(conjunctionEnums[0]->next());
       }
     }
 
@@ -1342,7 +1440,17 @@ public:
     float phraseFreqForTests() { return matcher.scoreFreq(*this); }
 
     void setMinCompetitiveScore(float minScore) override {
+      bool rose = minScore > minCompetitiveScore;
       minCompetitiveScore = minScore;
+      if constexpr (!MatcherPolicy::IS_SLOPPY) {
+        if (!rose || competitiveUpTo < 0) return;
+        if (minScore > competitiveBound) {
+          competitiveUpTo = -1;
+          skipCount(SkipStats::impactCertificateInvalidations);
+        } else {
+          skipCount(SkipStats::impactCertificateSurvivedRises);
+        }
+      }
     }
 
     float getMaxScore(int32_t upTo) override {

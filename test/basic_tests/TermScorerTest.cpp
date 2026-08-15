@@ -4882,18 +4882,21 @@ TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
     }
 
     int64_t boundRejects;
+    int64_t blocksSkipped;
     int64_t verifies;
     TopDocsCollector prunedCollector(k);
     {
       bool statsWereEnabled = SkipStats::enabled;
       SkipStats::enabled = true;
       int64_t rejectsBefore = SkipStats::phraseBoundRejects;
+      int64_t skippedBefore = SkipStats::phraseImpactBlocksSkipped;
       int64_t verifiesBefore = SkipStats::phraseVerifies;
       auto* scorer = dynamic_cast<PhraseQuery::Scorer*>(
           prunedWeight->createScorer(testIndex.pool, segment));
       ASSERT_NE(scorer, nullptr);
       collectTopK(0, scorer, nullptr, nullptr, prunedCollector);
       boundRejects = SkipStats::phraseBoundRejects - rejectsBefore;
+      blocksSkipped = SkipStats::phraseImpactBlocksSkipped - skippedBefore;
       verifies = SkipStats::phraseVerifies - verifiesBefore;
       SkipStats::enabled = statsWereEnabled;
     }
@@ -4906,9 +4909,10 @@ TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
       EXPECT_EQ(std::bit_cast<uint32_t>(actual[i].score),
                 std::bit_cast<uint32_t>(expected[i].score)) << "k=" << k << " i=" << i;
     }
-    // Every conjunction candidate reaches doMatches, but under the risen
-    // threshold most are rejected by the per-doc bound before position work.
-    EXPECT_GT(boundRejects, 0) << "k=" << k;
+    // Under the risen threshold most candidates never pay position work:
+    // whole lead blocks fall to the competitive-block gate, and survivors
+    // are still screened by the per-doc bound inside doMatches.
+    EXPECT_GT(boundRejects + blocksSkipped, 0) << "k=" << k;
     EXPECT_LT(verifies, exhaustiveMatchCalls) << "k=" << k;
   }
 }

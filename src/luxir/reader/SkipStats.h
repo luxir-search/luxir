@@ -58,6 +58,10 @@ struct SkipStats {
   // bound vs docs that paid a position verification.
   static inline int64_t phraseBoundRejects = 0;
   static inline int64_t phraseVerifies = 0;
+  // Phrase competitive-block gate: cold certificate recomputations and the
+  // per-term impact blocks those lookups proved non-competitive.
+  static inline int64_t phraseCompetitiveColdLookups = 0;
+  static inline int64_t phraseImpactBlocksSkipped = 0;
   // Shallow-advance outcomes: targets answered from the cached shallow block
   // vs calls that had to move the block cursor (search + possible group parse).
   static inline int64_t shallowCacheHits = 0;
@@ -309,6 +313,8 @@ struct SkipStats {
     posBlocksDecoded = 0;
     phraseBoundRejects = 0;
     phraseVerifies = 0;
+    phraseCompetitiveColdLookups = 0;
+    phraseImpactBlocksSkipped = 0;
     shallowCacheHits = 0;
     shallowCursorMoves = 0;
     impactGroupBoundCalls = 0;

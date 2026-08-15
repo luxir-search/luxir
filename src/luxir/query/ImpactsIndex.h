@@ -34,6 +34,9 @@ public:
     int32_t doc;
     int32_t lastDoc;
     float impact;
+    // Landing group, for monotone callers to feed back as the next call's
+    // fromGroup hint (numGroups() on the terminal results).
+    int32_t group;
   };
 
   struct RawRange {
@@ -551,17 +554,21 @@ public:
   // itself when its own block competes (or lies past the impact data), and
   // DocsEnumMeta::END when nothing later can compete. lastDoc and impact certify
   // the competitive landing block; past the impact data they permanently
-  // certify the remainder of the posting list.
+  // certify the remainder of the posting list. Monotone callers pass their
+  // previous landing group as fromGroup to gallop instead of re-searching the
+  // group table from the start.
   CompetitiveTarget firstCompetitiveTarget(int32_t doc, float minScore,
-                                            int64_t& skippedBlocks) const {
+                                            int64_t& skippedBlocks,
+                                            int32_t fromGroup = -1) const {
     if (globalMax < minScore) {
       skippedBlocks += count;
       return {DocsEnumMeta::END, DocsEnumMeta::END,
-              std::numeric_limits<float>::infinity()};
+              std::numeric_limits<float>::infinity(), groupCount};
     }
-    int32_t g = groupContainingFrom(-1, doc);
+    int32_t g = groupContainingFrom(fromGroup, doc);
     if (g >= groupCount) {
-      return {doc, DocsEnumMeta::END, std::numeric_limits<float>::infinity()};
+      return {doc, DocsEnumMeta::END, std::numeric_limits<float>::infinity(),
+              groupCount};
     }
     for (;;) {
       ensureGroupHeadersThrough(g);
@@ -574,7 +581,8 @@ public:
           if (chunk.impacts[i] >= minScore) {
             int32_t blockStart = i == 0 ? (g == 0 ? 0 : groupLastDocs[g - 1] + 1)
                                         : chunk.lastDocs[i - 1] + 1;
-            return {std::max(doc, blockStart), chunk.lastDocs[i], chunk.impacts[i]};
+            return {std::max(doc, blockStart), chunk.lastDocs[i],
+                    chunk.impacts[i], g};
           }
           skippedBlocks++;
         }
@@ -583,7 +591,7 @@ public:
       }
       if (g + 1 >= groupCount) {
         return {DocsEnumMeta::END, DocsEnumMeta::END,
-                std::numeric_limits<float>::infinity()};
+                std::numeric_limits<float>::infinity(), groupCount};
       }
       doc = groupLastDocs[g] + 1;
       g++;
