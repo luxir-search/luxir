@@ -315,6 +315,8 @@ public:
     int64_t skippedImpactBlocks = 0;
     int32_t competitiveUpTo = PostingsReader::END;
     float competitiveBound = 0.0f;
+    // Monotone impact-group resume hint for skipNonCompetitiveBlocks.
+    int32_t competitiveGroupCursor = -1;
 
     Scorer(luxir::DocsFreqEnum& docsEnum, luxir::NormsReader* normsReader,
            luxir::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
@@ -389,6 +391,7 @@ public:
       impacts.build(pool, docsEnum, *simScorer, boost, useFrontierBound);
       competitiveUpTo = PostingsReader::END;
       competitiveBound = hasImpacts() ? 0.0f : std::numeric_limits<float>::infinity();
+      competitiveGroupCursor = -1;
     }
 
     int32_t blockContaining(int32_t target) const {
@@ -407,7 +410,9 @@ public:
       while (doc != PostingsReader::END) {
         skipCount(SkipStats::impactCompetitiveColdLookups);
         auto landing = impacts.firstCompetitiveTarget(doc, minCompetitiveScore,
-                                                      skippedImpactBlocks);
+                                                      skippedImpactBlocks,
+                                                      competitiveGroupCursor);
+        competitiveGroupCursor = landing.group;
         if (landing.doc == PostingsReader::END) {
           return PostingsReader::END;
         }

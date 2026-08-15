@@ -135,6 +135,26 @@ private:
     }
   }
 
+  // Forward gallop over groupLastDocs[fromGroup, limit) for a monotone
+  // caller; fromGroup must already be a valid lower bracket for target.
+  int32_t gallopGroupContaining(int32_t fromGroup, int32_t target,
+                                int32_t limit) const {
+    int32_t lo = fromGroup;
+    int32_t step = 1;
+    while (lo < limit && groupLastDocs[lo] < target) {
+      lo += step;
+      step <<= 1;
+    }
+    if (lo >= limit) {
+      lo = limit;
+    }
+    int32_t bracketLo = std::max(fromGroup, lo - (step >> 1));
+    const int32_t* begin = groupLastDocs + bracketLo;
+    const int32_t* end = groupLastDocs + std::min(lo + 1, limit);
+    const int32_t* it = std::lower_bound(begin, end, target);
+    return (int32_t) (it - groupLastDocs);
+  }
+
   float maxParsedGroupUpper(int32_t fromGroup, int32_t toGroup) const {
     assert(fromGroup >= 0 && fromGroup <= toGroup);
     assert(toGroup < groupHeadersParsed);
@@ -297,38 +317,23 @@ public:
     if (groupCount == 0) {
       return 0;
     }
+    int32_t limit = groupCount;
     if (lazyGroupHeaders) {
-      unused(fromGroup);
       ensureGroupHeadersCoverDoc(target);
-      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupHeadersParsed,
-                                           target);
-      return (int32_t) (it - groupLastDocs);
+      limit = groupHeadersParsed;
     }
-    if (fromGroup < 0 || fromGroup >= groupCount) {
-      if (fromGroup >= groupCount && fromGroup >= 0) {
+    if (fromGroup < 0 || fromGroup >= limit) {
+      if (fromGroup >= limit && fromGroup >= 0 && !lazyGroupHeaders) {
         return groupCount;
       }
-      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupCount, target);
+      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + limit, target);
       return (int32_t) (it - groupLastDocs);
     }
     if (fromGroup > 0 && target <= groupLastDocs[fromGroup - 1]) {
-      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupCount, target);
+      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + limit, target);
       return (int32_t) (it - groupLastDocs);
     }
-    int32_t lo = fromGroup;
-    int32_t step = 1;
-    while (lo < groupCount && groupLastDocs[lo] < target) {
-      lo += step;
-      step <<= 1;
-    }
-    if (lo >= groupCount) {
-      lo = groupCount;
-    }
-    int32_t bracketLo = std::max(fromGroup, lo - (step >> 1));
-    const int32_t* begin = groupLastDocs + bracketLo;
-    const int32_t* end = groupLastDocs + std::min(lo + 1, groupCount);
-    const int32_t* it = std::lower_bound(begin, end, target);
-    return (int32_t) (it - groupLastDocs);
+    return gallopGroupContaining(fromGroup, target, limit);
   }
 
   int32_t groupLastDoc(int32_t group) const {
@@ -615,32 +620,10 @@ public:
   // window walks): gallop forward over the group table from `from`'s group.
   // A target behind the hinted block falls back to the full search.
   int32_t blockContainingFrom(int32_t from, int32_t target) const {
-    if (lazyGroupHeaders) {
-      unused(from);
-      return blockContaining(target);
-    }
     if (from < 0 || from >= count) {
       return from >= count && from >= 0 ? count : blockContaining(target);
     }
-    int32_t g = from / GROUP;
-    if (g > 0 && target <= groupLastDocs[g - 1]) {
-      return blockContaining(target);  // moved backward; rare
-    }
-    // gallop over groups
-    int32_t lo = g;
-    int32_t step = 1;
-    while (lo < groupCount && groupLastDocs[lo] < target) {
-      lo += step;
-      step <<= 1;
-    }
-    if (lo >= groupCount) {
-      lo = groupCount;
-    }
-    int32_t bracketLo = std::max(g, lo - (step >> 1));
-    const int32_t* begin = groupLastDocs + bracketLo;
-    const int32_t* end = groupLastDocs + std::min(lo + 1, groupCount);
-    const int32_t* it = std::lower_bound(begin, end, target);
-    int32_t hitGroup = (int32_t) (it - groupLastDocs);
+    int32_t hitGroup = groupContainingFrom(from / GROUP, target);
     if (hitGroup >= groupCount) {
       return count;
     }
