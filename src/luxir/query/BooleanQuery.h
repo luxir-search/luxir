@@ -436,6 +436,9 @@ public:
   static inline bool disableFilteredUnionWandForTests = false;
   // Test hook: use pull MandNot for prohibited scored disjunctions.
   static inline bool disableBulkExclusionForTests = false;
+  // Test hook: bypass prohibited membership whose benefit comes from removing
+  // verification rather than crossing the density router.
+  static inline bool disableProhibitedVerificationCacheForTests = false;
   // Test hook: route unscored filter suppliers by density instead of admitting
   // exact filters as exhaustive conjunction clauses.
   static inline bool disableFilterClauseCountForTests = false;
@@ -773,10 +776,13 @@ public:
     std::span<Query::Weight*> optionalWeights;
     std::span<Query::Weight*> prohibitedWeights;
     std::span<Query::Weight*> filterWeights;
+    std::span<FilterCache::Use*> prohibitedUses;
     std::span<FilterCache::Use*> filterUses;
+    std::span<uint8_t> prohibitedCacheRoutes;
     int minShouldMatch = 0;
     bool needsScores = false;
     bool allowsPruning = false;
+    bool prohibitedCacheEnabled = false;
     bool sparseFilteredTopKEligible = false;
     SparseFilteredTopKFamily sparseFilteredTopKFamilyKind =
         SparseFilteredTopKFamily::CONJUNCTION;
@@ -803,6 +809,16 @@ public:
                                           int32_t maxDoc) {
       return filterDensityBelow(
           filterCost, maxDoc, kMaskFilterDensityInverse);
+    }
+
+    static QueryPrep::ProhibitedCacheRoute prohibitedCacheRoute(
+        std::span<const uint8_t> routes, size_t clause,
+        size_t segmentOrd, size_t segmentCount) {
+      if (routes.empty()) return QueryPrep::ProhibitedCacheRoute::NONE;
+      assert(segmentOrd < segmentCount);
+      assert(clause * segmentCount + segmentOrd < routes.size());
+      return (QueryPrep::ProhibitedCacheRoute)
+          routes[clause * segmentCount + segmentOrd];
     }
 
     // Match MaxScoreDisjunctionScorer's stable score order when an externally
@@ -1628,6 +1644,11 @@ public:
       protected:
         Query::Scorer* buildScorer(MemPool& targetPool) override {
           if (requiredUnsatisfiable) return nullptr;
+          for (const PullChildPlan& child : prohibited) {
+            QueryPrep::recordProhibitedCacheRoute(
+                child.supplier,
+                QueryPrep::ProhibitedCacheRouteFamily::PULL);
+          }
           return assembleScorer(
               targetPool, supplier.segment, required, optional, prohibited,
               requiredLeadCost, supplier.mandatorySources.size(),
@@ -2642,13 +2663,19 @@ public:
               continue;
             }
             if (prohibited.shape.termDisjunctionClause
-                == Query::ClauseShape::UNKNOWN) {
+                    == Query::ClauseShape::UNKNOWN
+                || prohibited.shape.directDocSet
+                    == Query::DirectDocSetAccess::UNKNOWN) {
               return {ConjunctionPlanStatus::DECLINED, plan};
             }
-            if (prohibited.shape.termDisjunctionClause
-                    != Query::ClauseShape::DIRECT
-                && prohibited.shape.termDisjunctionClause
-                    != Query::ClauseShape::FLAT_DISJUNCTION) {
+            bool termMembership =
+                prohibited.shape.termDisjunctionClause
+                    == Query::ClauseShape::DIRECT
+                || prohibited.shape.termDisjunctionClause
+                    == Query::ClauseShape::FLAT_DISJUNCTION;
+            bool docSetMembership = prohibited.shape.directDocSet
+                == Query::DirectDocSetAccess::SUPPORTED;
+            if (!termMembership && !docSetMembership) {
               return {ConjunctionPlanStatus::DECLINED, plan};
             }
           }
@@ -2967,6 +2994,14 @@ public:
       // the filtered scored-body route.
       MaybeConjunctionBulk buildConjunction(
           MemPool& targetPool, const ConjunctionPlan& plan) {
+        QueryPrep::ProhibitedCacheRouteFamily prohibitedFamily =
+            plan.mode == ConjunctionMode::CANDIDATE
+            ? QueryPrep::ProhibitedCacheRouteFamily::CANDIDATE
+            : QueryPrep::ProhibitedCacheRouteFamily::DENSE_COUNT;
+        for (const PlannedSupplier& prohibited : plan.prohibited) {
+          QueryPrep::recordProhibitedCacheRoute(
+              prohibited.supplier, prohibitedFamily);
+        }
         auto assertBuildDemand = [&](const Query::Demand& demand) {
           assert(demand.horizon == plan.use);
           if (plan.use == BulkUse::COUNT_WINDOWS) {
@@ -3189,6 +3224,7 @@ public:
         size_t prohibitedCount = 0;
         std::span<ConjunctionClauseLayout> prohibitedLayouts;
         std::span<TermQuery::Scorer*> candidateProhibitedTerms;
+        std::span<DocSet*> candidateProhibitedDocSets;
         if (plan.mode == ConjunctionMode::EXHAUSTIVE) {
           prohibitedArr = targetPool.make_arr<Query::Scorer*>(
               plan.prohibited.size());
@@ -3210,10 +3246,20 @@ public:
         } else if (plan.mode == ConjunctionMode::CANDIDATE
                    && !plan.prohibited.empty()) {
           auto& terms = *targetPool.make_vec<TermQuery::Scorer*>();
+          auto& docSets = *targetPool.make_vec<DocSet*>();
           for (const PlannedSupplier& prohibited : plan.prohibited) {
             assert(prohibited.plan != nullptr);
             auto* scorer = prohibited.plan->build(targetPool);
             if (scorer == nullptr) continue;
+            if (prohibited.shape.directDocSet
+                == Query::DirectDocSetAccess::SUPPORTED) {
+              auto* docSetScorer =
+                  dynamic_cast<QueryPrep::DocSetScorer*>(scorer);
+              assert(docSetScorer != nullptr);
+              if (docSetScorer == nullptr) return {};
+              docSets.push_back(docSetScorer->docSet());
+              continue;
+            }
             if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
               terms.push_back(term);
               continue;
@@ -3233,13 +3279,15 @@ public:
             }
           }
           candidateProhibitedTerms = {terms.data(), terms.size()};
+          candidateProhibitedDocSets = {docSets.data(), docSets.size()};
         }
 
         auto* bulk = targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
             targetPool,
             std::span<Query::Scorer*>(arr, plan.entries.size()),
             std::span<Query::Scorer*>(prohibitedArr, prohibitedCount),
-            candidateProhibitedTerms, clauseScores, segment.maxDoc(),
+            candidateProhibitedTerms, candidateProhibitedDocSets,
+            clauseScores, segment.maxDoc(),
             plan.leadCost, plan.nonLeadCost,
             plan.mode != ConjunctionMode::EXHAUSTIVE,
             plan.entries[0].docSetFilter, candidatePostingsLead,
@@ -3542,6 +3590,11 @@ public:
 
       BulkScorer* buildMaxScoreBulk(
           MemPool& targetPool, const MaxScorePlan& plan) {
+        for (const PlannedSupplier& prohibited : plan.prohibited) {
+          QueryPrep::recordProhibitedCacheRoute(
+              prohibited.supplier,
+              QueryPrep::ProhibitedCacheRouteFamily::MAX_SCORE);
+        }
         switch (plan.identityFallback) {
           case DisjunctionIdentityFallback::NONE:
             break;
@@ -3900,6 +3953,7 @@ public:
               pool, segment, mandatorySources, mandatoryScores,
               optionalSources,
               std::span<Query::SegmentSource* const>{},
+              std::span<Query::ScorerSupplier* const>{},
               std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
               needsScores, allowsPruning, executionMode);
         }
@@ -4302,6 +4356,7 @@ public:
                 optionalSources,
                 std::span<Query::SegmentSource* const>{},
                 std::span<Query::ScorerSupplier* const>{},
+                std::span<Query::ScorerSupplier* const>{},
                 minShouldMatch, needsScores, allowsPruning, executionMode);
           }
           if (body != nullptr) {
@@ -4433,6 +4488,7 @@ public:
         std::span<const uint8_t> mandatoryScores,
         std::span<Query::SegmentSource* const> optionalSources,
         std::span<Query::SegmentSource* const> prohibitedSources,
+        std::span<Query::ScorerSupplier* const> prohibitedShapeSuppliers,
         std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch,
         bool needsScores,
@@ -4452,8 +4508,7 @@ public:
           targetPool, segment, mandatorySources, executionMode);
       auto optionalShapeSuppliers = QueryPrep::collectSuppliers(
           targetPool, segment, optionalSources, executionMode);
-      auto prohibitedShapeSuppliers = QueryPrep::collectSuppliers(
-          targetPool, segment, prohibitedSources, executionMode);
+      assert(prohibitedShapeSuppliers.size() == prohibitedSources.size());
       int64_t shapeRequiredCost = segment.maxDoc();
       for (auto* supplier : mandatoryShapeSuppliers) {
         if (supplier != nullptr) {
@@ -4473,30 +4528,39 @@ public:
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
+      IndexReader& reader;
       std::vector<QueryPrep::PreparedSource> mandatorySources;
       std::vector<uint8_t> mandatoryScores;
       std::vector<QueryPrep::PreparedSource> optionalSources;
       std::vector<QueryPrep::PreparedSource> prohibitedSources;
       std::vector<DomainHandle> filterDomains;
+      std::span<const uint8_t> prohibitedCacheRoutes;
       bool hasFilters = false;
+      bool prohibitedCacheEnabled = false;
       int minShouldMatch = 0;
       bool needsScores = false;
       bool allowsPruning = false;
 
     public:
-      BooleanPreparedWeight(std::vector<QueryPrep::PreparedSource>&& mandatorySources,
+      BooleanPreparedWeight(IndexReader& reader,
+                            std::vector<QueryPrep::PreparedSource>&& mandatorySources,
                             std::span<const uint8_t> mandatoryScores,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
                             std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                             std::vector<DomainHandle>&& filterDomains,
-                            bool hasFilters, int minShouldMatch, bool needsScores,
+                            std::span<const uint8_t> prohibitedCacheRoutes,
+                            bool hasFilters, bool prohibitedCacheEnabled,
+                            int minShouldMatch, bool needsScores,
                             bool allowsPruning)
-        : mandatorySources(std::move(mandatorySources)),
+        : reader(reader), mandatorySources(std::move(mandatorySources)),
           mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
           optionalSources(std::move(optionalSources)),
           prohibitedSources(std::move(prohibitedSources)),
           filterDomains(std::move(filterDomains)),
-          hasFilters(hasFilters), minShouldMatch(minShouldMatch),
+          prohibitedCacheRoutes(prohibitedCacheRoutes),
+          hasFilters(hasFilters),
+          prohibitedCacheEnabled(prohibitedCacheEnabled),
+          minShouldMatch(minShouldMatch),
           needsScores(needsScores), allowsPruning(allowsPruning) {}
 
       Query::ScorerSupplier* scorerSupplierImpl(
@@ -4514,12 +4578,24 @@ public:
           filterSuppliers = {targetPool.make_arr<Query::ScorerSupplier*>(1), 1};
           filterSuppliers[0] = targetPool.make<QueryPrep::DocSetSupplier>(filterDomain, segment);
         }
+        auto prohibitedSegmentSources = QueryPrep::segmentSources(
+            targetPool, QueryPrep::preparedSpan(prohibitedSources));
+        auto prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
+            prohibitedSources.size());
+        size_t segmentCount = reader.segments().size();
+        for (size_t i = 0; i < prohibitedSources.size(); i++) {
+          QueryPrep::ProhibitedCacheRoute route = prohibitedCacheRoute(
+              prohibitedCacheRoutes, i, (size_t) segment.ord, segmentCount);
+          prohibitedSuppliers[i] = QueryPrep::prohibitedSupplier(
+              targetPool, prohibitedSources[i], reader, segment,
+              prohibitedCacheEnabled, route, executionMode);
+        }
         return makeSupplier(
           targetPool, segment,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
           mandatoryScores,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
-          QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
+          prohibitedSegmentSources, prohibitedSuppliers,
           filterSuppliers, minShouldMatch, needsScores, allowsPruning,
           executionMode);
       }
@@ -4593,9 +4669,65 @@ public:
       optionalWeights = dropOptional
         ? std::span<Query::Weight*>{}
         : createWeights(context.pool, context, optionalClauses, flags, multiplier);
+      int32_t exclusionFlags = noScore & ~ALLOW_PRUNING;
       prohibitedWeights = createWeights(
           context.pool, context, prohibitedClauses,
-          noScore | EXCLUSION_WINDOW_FILL, 1.0f);
+          exclusionFlags | EXCLUSION_WINDOW_FILL, 1.0f);
+      auto* filterCache = context.topReader.filterCache();
+      prohibitedCacheEnabled = !QueryPrep::disableProhibitedCacheForTests
+          && filterCache != nullptr && filterCache->enabled();
+      if (prohibitedCacheEnabled && !prohibitedWeights.empty()) {
+        size_t segmentCount = context.topReader.segments().size();
+        prohibitedUses = context.pool.make_span<FilterCache::Use*>(
+            prohibitedWeights.size());
+        std::fill(prohibitedUses.begin(), prohibitedUses.end(), nullptr);
+        prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
+            prohibitedWeights.size() * segmentCount);
+        std::fill(
+            prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+
+        MemPool routePool;
+        for (size_t clause = 0; clause < prohibitedWeights.size(); clause++) {
+          Query::Weight* prohibitedWeight = prohibitedWeights[clause];
+          if (prohibitedWeight->matchesAllDocs()) continue;
+          Query::VerificationWork verificationWork =
+              prohibitedClauses[clause]->membershipVerificationWork();
+          bool verificationBearing =
+              verificationWork == Query::VerificationWork::PRESENT
+              || verificationWork == Query::VerificationWork::PARTIAL;
+          bool anyRouted = false;
+          for (auto& segment : context.topReader.segments()) {
+            auto constant = prohibitedWeight->constantCount(segment, nullptr);
+            if (constant.has_value() && *constant == segment.maxDoc()) {
+              continue;
+            }
+            auto savepoint = routePool.getSavePoint();
+            auto* supplier = prohibitedWeight->scorerSupplier(
+                routePool, segment);
+            QueryPrep::ProhibitedCacheRoute route =
+                QueryPrep::ProhibitedCacheRoute::NONE;
+            if (supplier != nullptr) {
+              if (verificationBearing
+                  && !disableProhibitedVerificationCacheForTests) {
+                route = QueryPrep::ProhibitedCacheRoute::VERIFICATION;
+              } else if (!verificationBearing
+                         && QueryPrep::prohibitedDensityRoutesToCache(
+                             supplier->cost(), segment.maxDoc())) {
+                route = QueryPrep::ProhibitedCacheRoute::DENSITY;
+              }
+            }
+            prohibitedCacheRoutes[
+                clause * segmentCount + (size_t) segment.ord] =
+                    (uint8_t) route;
+            anyRouted |= route != QueryPrep::ProhibitedCacheRoute::NONE;
+            routePool.rewind(savepoint);
+          }
+          if (anyRouted) {
+            prohibitedUses[clause] = context.getFilterUse(
+                *prohibitedClauses[clause]);
+          }
+        }
+      }
       int32_t exhaustiveFilterFlags = flags & ~(NEED_SCORES | ALLOW_PRUNING);
       filterWeights = createWeights(context.pool, context, filterClauses,
                                     exhaustiveFilterFlags, 1.0f);
@@ -4702,13 +4834,15 @@ public:
         ctx.parallel};
       auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
       auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
-      auto prohibitedSources = QueryPrep::prepareSources(prohibitedWeights, ctx);
+      auto prohibitedSources = QueryPrep::prepareFilterSources(
+          prohibitedWeights, prohibitedUses, ctx);
 
       return std::make_unique<BooleanPreparedWeight>(
-        std::move(mandatorySources), mandatoryScores,
+        ctx.reader, std::move(mandatorySources), mandatoryScores,
         std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
-        !filterSources.empty(), minShouldMatch, needsScores, allowsPruning);
+        prohibitedCacheRoutes, !filterSources.empty(),
+        prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning);
     }
 
 
@@ -4719,6 +4853,19 @@ public:
       auto mandatorySources = QueryPrep::liveSources(targetPool, mandatoryWeights);
       auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
+      auto prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
+          prohibitedWeights.size());
+      size_t segmentCount = context.topReader.segments().size();
+      for (size_t i = 0; i < prohibitedWeights.size(); i++) {
+        QueryPrep::PreparedSource source;
+        source.weight = prohibitedWeights[i];
+        source.cacheUse = prohibitedUses.empty() ? nullptr : prohibitedUses[i];
+        QueryPrep::ProhibitedCacheRoute route = prohibitedCacheRoute(
+            prohibitedCacheRoutes, i, (size_t) segment.ord, segmentCount);
+        prohibitedSuppliers[i] = QueryPrep::prohibitedSupplier(
+            targetPool, source, context.topReader, segment,
+            prohibitedCacheEnabled, route, executionMode);
+      }
       std::span<Query::ScorerSupplier*> filterSuppliers;
       if (!filterWeights.empty()) {
         filterSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
@@ -4751,7 +4898,8 @@ public:
       }
       return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
                           optionalSources,
-                          prohibitedSources, filterSuppliers, minShouldMatch,
+                          prohibitedSources, prohibitedSuppliers,
+                          filterSuppliers, minShouldMatch,
                           needsScores, allowsPruning, executionMode);
     }
 
@@ -6901,6 +7049,8 @@ public:
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
     std::span<Query::Scorer*> prohibitedScorers;
     std::span<TermQuery::Scorer*> candidateProhibitedTerms;
+    std::span<DocSet*> candidateProhibitedDocSets;
+    std::span<DocSetProbe> candidateProhibitedDocSetProbes;
     std::span<const uint8_t> scoringClauses;
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
     std::span<TermClause> termClauses;  // direct terms or decomposed flat unions
@@ -7538,8 +7688,10 @@ public:
       return size;
     }
 
-    int32_t compactCandidateProhibitedTerms(int32_t size) {
-      if (candidateProhibitedTerms.empty() || size == 0) {
+    int32_t compactCandidateProhibited(int32_t size) {
+      if ((candidateProhibitedTerms.empty()
+           && candidateProhibitedDocSets.empty())
+          || size == 0) {
         return size;
       }
       size_t words = ((size_t) size + 63) >> 6;
@@ -7547,6 +7699,13 @@ public:
       auto matches = clauseBits.first(words);
       for (auto* term : candidateProhibitedTerms) {
         term->addMatchesToCandidates(candDocs.data(), size, matches);
+      }
+      for (DocSetProbe& probe : candidateProhibitedDocSetProbes) {
+        for (int32_t i = 0; i < size; i++) {
+          if (probe.get(candDocs[(size_t) i])) {
+            matches[(size_t) (i >> 6)] |= 1ULL << (i & 63);
+          }
+        }
       }
       int32_t write = 0;
       for (int32_t i = 0; i < size; i++) {
@@ -7766,9 +7925,10 @@ public:
                       true, TermFast, TermTailFast>(c, n, remaining);
             }
           }
-          if (!candidateProhibitedTerms.empty()) {
+          if (!candidateProhibitedTerms.empty()
+              || !candidateProhibitedDocSets.empty()) {
             n = compactCompetitiveCandidates(n);
-            n = compactCandidateProhibitedTerms(n);
+            n = compactCandidateProhibited(n);
           }
           for (int32_t i = 0; i < n; i++) {
             if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
@@ -8433,6 +8593,8 @@ public:
                           std::span<Query::Scorer*> prohibitedScorers,
                           std::span<TermQuery::Scorer*>
                               candidateProhibitedTerms,
+                          std::span<DocSet*>
+                              candidateProhibitedDocSets,
                           std::span<const uint8_t> scoringClauses,
                           int32_t maxDoc, int64_t leadCost,
                           int64_t nonLeadCost, bool scoredConstruction,
@@ -8450,6 +8612,7 @@ public:
         : scorers(scorers),
           prohibitedScorers(prohibitedScorers),
           candidateProhibitedTerms(candidateProhibitedTerms),
+          candidateProhibitedDocSets(candidateProhibitedDocSets),
           scoringClauses(scoringClauses),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
@@ -8505,6 +8668,14 @@ public:
             pool.make_span<DocSetProbe>(candidateFilterDocSets.size());
         for (size_t i = 0; i < candidateFilterDocSets.size(); i++) {
           candidateFilterProbes[i].reset(candidateFilterDocSets[i]);
+        }
+      }
+      if (!candidateProhibitedDocSets.empty()) {
+        candidateProhibitedDocSetProbes =
+            pool.make_span<DocSetProbe>(candidateProhibitedDocSets.size());
+        for (size_t i = 0; i < candidateProhibitedDocSets.size(); i++) {
+          candidateProhibitedDocSetProbes[i].reset(
+              candidateProhibitedDocSets[i]);
         }
       }
       std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
@@ -8601,7 +8772,8 @@ public:
       }
       assert(plannedNegatedCount
              == (!prohibitedScorers.empty()
-                 || !candidateProhibitedTerms.empty()));
+                 || !candidateProhibitedTerms.empty()
+                 || !candidateProhibitedDocSets.empty()));
       negatedCountPath = plannedNegatedCount;
       int32_t denseThresholdInverse =
           !scoredConstruction && sparseEligibleTails

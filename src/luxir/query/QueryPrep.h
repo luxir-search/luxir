@@ -17,6 +17,7 @@ namespace luxir::QueryPrep {
 
 inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
+inline bool disableProhibitedCacheForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
 // bypass instead of preserving the postings supplier as the gather feed.
 inline bool disableSparseBatchPostingsFeedForTests = false;
@@ -159,6 +160,8 @@ public:
       arrDocs = ((ArrDocSet*)docs)->docs();
     }
   }
+
+  DocSet* docSet() const { return docs; }
 
   int32_t next() override {
     if (docs->type == DocSet::ARRAY) {
@@ -312,6 +315,169 @@ public:
         targetPool, docs, segment.maxDoc());
   }
 };
+
+enum class ProhibitedCacheRouteFamily : uint8_t {
+  PULL,
+  DENSE_COUNT,
+  MAX_SCORE,
+  CANDIDATE,
+};
+
+enum class ProhibitedCacheRoute : uint8_t {
+  NONE,
+  DENSITY,
+  VERIFICATION,
+};
+
+enum class ProhibitedCacheOutcome : uint8_t {
+  DISABLED,
+  ROUTING_BYPASS,
+  BYPASS,
+  BUILD,
+  HIT,
+};
+
+inline bool prohibitedDensityRoutesToCache(int64_t cost,
+                                           int32_t maxDoc) noexcept {
+  return cost > 0 && maxDoc > 0
+      && cost > ((int64_t) maxDoc - 1) / kMaskFilterDensityInverse;
+}
+
+// Formation-neutral supplier selected at the prohibited-clause cache seam.
+// It preserves the complete underlying supplier contract while retaining the
+// cache outcome until the Boolean planner commits to a consumption family.
+class ProhibitedSupplier final : public Query::ScorerSupplier {
+  Query::ScorerSupplier* delegate;
+  ProhibitedCacheOutcome outcome;
+  uint8_t recordedFamilies = 0;
+
+  void recordOutcome(ProhibitedCacheRouteFamily family) const {
+    auto record = [&](int64_t& hits, int64_t& builds, int64_t& bypasses,
+                      int64_t& routingBypasses) {
+      switch (outcome) {
+        case ProhibitedCacheOutcome::DISABLED:
+          break;
+        case ProhibitedCacheOutcome::ROUTING_BYPASS:
+          skipCount(routingBypasses);
+          break;
+        case ProhibitedCacheOutcome::BYPASS:
+          skipCount(bypasses);
+          break;
+        case ProhibitedCacheOutcome::BUILD:
+          skipCount(builds);
+          break;
+        case ProhibitedCacheOutcome::HIT:
+          skipCount(hits);
+          break;
+      }
+    };
+    switch (family) {
+      case ProhibitedCacheRouteFamily::PULL:
+        record(SkipStats::prohibitedCachePullHits,
+               SkipStats::prohibitedCachePullBuilds,
+               SkipStats::prohibitedCachePullBypasses,
+               SkipStats::prohibitedCachePullRoutingBypasses);
+        break;
+      case ProhibitedCacheRouteFamily::DENSE_COUNT:
+        record(SkipStats::prohibitedCacheDenseCountHits,
+               SkipStats::prohibitedCacheDenseCountBuilds,
+               SkipStats::prohibitedCacheDenseCountBypasses,
+               SkipStats::prohibitedCacheDenseCountRoutingBypasses);
+        break;
+      case ProhibitedCacheRouteFamily::MAX_SCORE:
+        record(SkipStats::prohibitedCacheMaxScoreHits,
+               SkipStats::prohibitedCacheMaxScoreBuilds,
+               SkipStats::prohibitedCacheMaxScoreBypasses,
+               SkipStats::prohibitedCacheMaxScoreRoutingBypasses);
+        break;
+      case ProhibitedCacheRouteFamily::CANDIDATE:
+        record(SkipStats::prohibitedCacheCandidateHits,
+               SkipStats::prohibitedCacheCandidateBuilds,
+               SkipStats::prohibitedCacheCandidateBypasses,
+               SkipStats::prohibitedCacheCandidateRoutingBypasses);
+        break;
+    }
+  }
+
+public:
+  ProhibitedSupplier(Query::ScorerSupplier* delegate,
+                     ProhibitedCacheOutcome outcome)
+      : delegate(delegate), outcome(outcome) {
+    assert(delegate != nullptr);
+  }
+
+  void recordRoute(ProhibitedCacheRouteFamily family) {
+    uint8_t bit = (uint8_t)(1U << (uint8_t)family);
+    if ((recordedFamilies & bit) != 0) return;
+    recordedFamilies |= bit;
+    recordOutcome(family);
+  }
+
+  int64_t cost() override { return delegate->cost(); }
+
+  Query::ScorerShape describeScorer(
+      const Query::PlanContext& buildContext) const override {
+    return delegate->describeScorer(buildContext);
+  }
+
+  Query::VerificationWork verificationWork(
+      const Query::PlanContext& buildContext) const override {
+    return delegate->verificationWork(buildContext);
+  }
+
+  Query::ScorerPlan* resolve(
+      MemPool& planPool, const Query::PlanContext& planContext) override {
+    return delegate->resolve(planPool, planContext);
+  }
+
+  Query::PlanContext makePlanContext(
+      const Query::Demand& demand) const override {
+    return delegate->makePlanContext(demand);
+  }
+
+  Query::UnresolvedSupplierCause unresolvedScorerCause(
+      const Query::PlanContext& buildContext) const override {
+    return delegate->unresolvedScorerCause(buildContext);
+  }
+
+  bool fillExpansionMemo(
+      const Query::PlanContext& buildContext) override {
+    return delegate->fillExpansionMemo(buildContext);
+  }
+
+  ExactCountTopKCosts exactCountTopKCosts() override {
+    return delegate->exactCountTopKCosts();
+  }
+
+  DocSet* exactDocSet() override { return delegate->exactDocSet(); }
+
+  ScoreBlockFillKind scoreBlockFillKind() const noexcept override {
+    return delegate->scoreBlockFillKind();
+  }
+
+  BulkPlan planBulk(
+      BulkUse use, const BulkScorerContext& bulkContext) override {
+    return delegate->planBulk(use, bulkContext);
+  }
+
+  void recordBulkPlanCommitment(
+      BulkUse use, const BulkScorerContext& bulkContext,
+      const BulkPlan& plan) override {
+    delegate->recordBulkPlanCommitment(use, bulkContext, plan);
+  }
+
+  BulkScorer* buildBulk(
+      MemPool& targetPool, const BulkPlan& plan) override {
+    return delegate->buildBulk(targetPool, plan);
+  }
+};
+
+inline void recordProhibitedCacheRoute(
+    Query::ScorerSupplier* supplier, ProhibitedCacheRouteFamily family) {
+  if (auto* prohibited = dynamic_cast<ProhibitedSupplier*>(supplier)) {
+    prohibited->recordRoute(family);
+  }
+}
 
 inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
                                            IndexReader::Segment& segment,
@@ -523,6 +689,84 @@ inline std::unique_ptr<DocSet> materializeRawFilter(
   return materialize(
       weight, prepared, segment, nullptr,
       Query::SupplierExecutionMode::RAW_MEMBERSHIP);
+}
+
+// Resolve one prohibited clause after its parse-time density router has made
+// the cache-traffic decision. Routed HITs avoid ordinary supplier construction;
+// BUILD publishes raw membership; BYPASS constructs the original supplier once.
+// The wrapper defers observability until the Boolean planner commits a formation.
+inline Query::ScorerSupplier* prohibitedSupplier(
+    MemPool& targetPool, const PreparedSource& source,
+    IndexReader& reader, IndexReader::Segment& segment,
+    bool cacheEnabled, ProhibitedCacheRoute route,
+    Query::SupplierExecutionMode executionMode =
+        Query::SupplierExecutionMode::ORDINARY) {
+  auto ordinary = [&]() {
+    return source.segmentSource().scorerSupplier(
+        targetPool, segment, executionMode);
+  };
+  auto wrap = [&](Query::ScorerSupplier* delegate,
+                  ProhibitedCacheOutcome outcome) -> Query::ScorerSupplier* {
+    return delegate == nullptr ? nullptr
+                               : targetPool.make<ProhibitedSupplier>(
+                                     delegate, outcome);
+  };
+
+  FilterCache::Use* use = source.cacheUse;
+  bool routed = route != ProhibitedCacheRoute::NONE;
+  if (!cacheEnabled || use == nullptr) {
+    return wrap(ordinary(), cacheEnabled && !routed
+                                ? ProhibitedCacheOutcome::ROUTING_BYPASS
+                                : ProhibitedCacheOutcome::DISABLED);
+  }
+  if (!routed) {
+    return wrap(ordinary(), ProhibitedCacheOutcome::ROUTING_BYPASS);
+  }
+  if (source.domainDependence
+          != PreparedDomainDependence::QUERY_CANONICAL
+      || use->scope() == FilterKeyScope::READER_STABLE) {
+    return wrap(ordinary(), ProhibitedCacheOutcome::DISABLED);
+  }
+
+  {
+    auto probe = use->probe((size_t) segment.ord);
+    if (probe.kind() == FilterCache::Probe::Kind::HIT) {
+      DocSet* docs = executionMode
+              == Query::SupplierExecutionMode::RAW_MEMBERSHIP
+          ? probe.docSet()
+          : use->effectiveDocSet((size_t) segment.ord, reader);
+      if (route == ProhibitedCacheRoute::VERIFICATION
+          || (docs != nullptr && prohibitedDensityRoutesToCache(
+                  docs->card(), segment.maxDoc()))) {
+        auto* selected = targetPool.make<DocSetSupplier>(docs, segment);
+        return wrap(selected, ProhibitedCacheOutcome::HIT);
+      }
+      return wrap(ordinary(), ProhibitedCacheOutcome::ROUTING_BYPASS);
+    }
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      auto buildStart = std::chrono::steady_clock::now();
+      auto raw = materializeRawFilter(
+          *source.weight, source.prepared.get(), segment);
+      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
+      use->publishRaw(
+          (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
+      DocSet* docs = executionMode
+              == Query::SupplierExecutionMode::RAW_MEMBERSHIP
+          ? use->rawDocSet((size_t) segment.ord)
+          : use->effectiveDocSet((size_t) segment.ord, reader);
+      if (route == ProhibitedCacheRoute::VERIFICATION
+          || (docs != nullptr && prohibitedDensityRoutesToCache(
+                  docs->card(), segment.maxDoc()))) {
+        auto* selected = targetPool.make<DocSetSupplier>(docs, segment);
+        return wrap(selected, ProhibitedCacheOutcome::BUILD);
+      }
+      return wrap(ordinary(), ProhibitedCacheOutcome::ROUTING_BYPASS);
+    }
+  }
+
+  // Probe destruction releases the request-local resolving claim before the
+  // ordinary supplier can recurse into another cache-aware prohibited clause.
+  return wrap(ordinary(), ProhibitedCacheOutcome::BYPASS);
 }
 
 struct WholeMembershipResult {

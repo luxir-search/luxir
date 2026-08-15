@@ -3012,6 +3012,109 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
   assertRawBuild(sparseBatch);
 }
 
+TEST(FilterCacheTest, recursiveRawBuildUsesRawProhibitedHit) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addIdTermDoc(writer, "0", "body selected");
+  addIdTermDoc(writer, "1", "body selected");
+  addIdTermDoc(writer, "2", "body");
+  writer.commit();
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("0", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto reader = writer.getIndexReader(0);
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+  ASSERT_NE(nullptr, segment.liveDocs());
+
+  TermQuery body("text_w", "body");
+  TermQuery selected("text_w", "selected");
+  std::array<Query*, 1> mandatory{&body};
+  std::array<Query*, 1> prohibited{&selected};
+  BooleanQuery outer(mandatory, {}, prohibited, {});
+
+  {
+    MemPool warmPool;
+    Query::Context warmContext(warmPool, *reader);
+    auto* warmWeight = selected.createWeight(warmContext, 0);
+    auto* warmUse = warmContext.getFilterUse(selected);
+    MemPool execPool;
+    ASSERT_NE(nullptr, QueryPrep::filterSupplier(
+        execPool, *warmWeight, warmUse, *reader, segment,
+        QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
+    ASSERT_NE(nullptr, warmUse->rawDocSet(0));
+    EXPECT_EQ(2, warmUse->rawDocSet(0)->card());
+  }
+
+  auto hitsBefore = writer.getFilterCache()->counters().hits;
+  MemPool contextPool;
+  Query::Context context(contextPool, *reader);
+  auto* weight = outer.createWeight(context, 0);
+  auto* outerUse = context.getFilterUse(outer);
+  auto* prohibitedUse = context.getFilterUse(selected);
+  auto effective = QueryPrep::materializeEffectiveFilter(
+      *weight, outerUse, *reader, segment, nullptr);
+
+  ASSERT_NE(nullptr, prohibitedUse->rawDocSet(0));
+  EXPECT_EQ(2, prohibitedUse->rawDocSet(0)->card());
+  EXPECT_TRUE(prohibitedUse->rawDocSet(0)->get(0));
+  EXPECT_EQ(1, prohibitedUse->effectiveDocSet(0, *reader)->card());
+  ASSERT_NE(nullptr, outerUse->rawDocSet(0));
+  EXPECT_EQ(1, outerUse->rawDocSet(0)->card());
+  EXPECT_TRUE(outerUse->rawDocSet(0)->get(2));
+  ASSERT_NE(nullptr, effective.get());
+  EXPECT_EQ(1, effective.get()->card());
+  EXPECT_TRUE(effective.get()->get(2));
+  EXPECT_GT(writer.getFilterCache()->counters().hits, hitsBefore);
+}
+
+TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addTermDoc(writer, "body selected");
+  addTermDoc(writer, "body");
+  addTermDoc(writer, "body selected");
+  writer.commit();
+  auto reader = writer.getIndexReader(0);
+  auto& segment = reader->segments()[0];
+
+  auto run = [&]() {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    TermQuery body("text_w", "body");
+    TermQuery selected("text_w", "selected");
+    ForcePrepareQuery preparedSelected(&selected);
+    std::array<Query*, 1> mandatory{&body};
+    std::array<Query*, 1> prohibited{&preparedSelected};
+    BooleanQuery query(mandatory, {}, prohibited, {});
+    auto* weight = query.createWeight(context, 0);
+    Query::Weight::PrepareContext prepareContext{
+        *reader, std::span<DocSet* const>{}, false};
+    auto prepared = weight->prepare(prepareContext);
+    if (prepared == nullptr) {
+      ADD_FAILURE() << "Boolean prohibited preparation returned null";
+      return std::unique_ptr<DocSet>();
+    }
+    return QueryPrep::materialize(*prepared, segment, nullptr);
+  };
+
+  SkipStatsScope stats;
+  auto built = run();
+  ASSERT_NE(nullptr, built);
+  EXPECT_EQ(1, built->card());
+  EXPECT_EQ(1, SkipStats::prohibitedCachePullBuilds);
+  SkipStats::reset();
+  auto hit = run();
+  ASSERT_NE(nullptr, hit);
+  EXPECT_EQ(1, hit->card());
+  EXPECT_EQ(1, SkipStats::prohibitedCachePullHits);
+}
+
 TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;

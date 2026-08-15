@@ -31,6 +31,42 @@ struct BulkExclusionGuard {
   }
 };
 
+struct ProhibitedCacheGuard {
+  bool saved = QueryPrep::disableProhibitedCacheForTests;
+
+  explicit ProhibitedCacheGuard(bool disabled) {
+    QueryPrep::disableProhibitedCacheForTests = disabled;
+  }
+
+  ~ProhibitedCacheGuard() {
+    QueryPrep::disableProhibitedCacheForTests = saved;
+  }
+};
+
+struct WholeMembershipGuard {
+  bool saved = QueryPrep::disableWholeMembershipPlanForTests;
+
+  explicit WholeMembershipGuard(bool disabled) {
+    QueryPrep::disableWholeMembershipPlanForTests = disabled;
+  }
+
+  ~WholeMembershipGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = saved;
+  }
+};
+
+struct ProhibitedVerificationCacheGuard {
+  bool saved = BooleanQuery::disableProhibitedVerificationCacheForTests;
+
+  explicit ProhibitedVerificationCacheGuard(bool disabled) {
+    BooleanQuery::disableProhibitedVerificationCacheForTests = disabled;
+  }
+
+  ~ProhibitedVerificationCacheGuard() {
+    BooleanQuery::disableProhibitedVerificationCacheForTests = saved;
+  }
+};
+
 struct SkipStatsGuard {
   bool saved = SkipStats::enabled;
 
@@ -56,6 +92,22 @@ struct Counters {
   int64_t phraseAdmits;
   int64_t phraseRejects;
   int64_t maxScoreWindows;
+  int64_t cachePullHits;
+  int64_t cachePullBuilds;
+  int64_t cachePullBypasses;
+  int64_t cachePullRoutingBypasses;
+  int64_t cacheDenseCountHits;
+  int64_t cacheDenseCountBuilds;
+  int64_t cacheDenseCountBypasses;
+  int64_t cacheDenseCountRoutingBypasses;
+  int64_t cacheMaxScoreHits;
+  int64_t cacheMaxScoreBuilds;
+  int64_t cacheMaxScoreBypasses;
+  int64_t cacheMaxScoreRoutingBypasses;
+  int64_t cacheCandidateHits;
+  int64_t cacheCandidateBuilds;
+  int64_t cacheCandidateBypasses;
+  int64_t cacheCandidateRoutingBypasses;
 };
 
 struct TopRun {
@@ -64,46 +116,9 @@ struct TopRun {
   Counters counters;
 };
 
-api::Query scoredDisjunction(
-    std::pmr::memory_resource& mr, std::string_view left,
-    std::string_view right, std::span<const api::Query> prohibited) {
-  std::array<api::Query, 2> optional = {
-      qb::match(mr, "body_w", left),
-      qb::match(mr, "body_w", right)};
-  return qb::boolean(mr, {}, optional, prohibited, {}, 1);
-}
-
-TopRun runTop(CollectionHelper& helper, bool disabled,
-              std::string_view left, std::string_view right,
-              std::string_view exclusion = "ex0",
-              bool phraseExclusion = false, bool disjunctiveExclusion = false,
-              int32_t topK = 10) {
-  BulkExclusionGuard bulkGuard(disabled);
-  SkipStatsGuard statsGuard;
-  auto req = localReq(helper.getSearchEngine());
-  req->collection("main");
-  auto& top = req->topDocs("q");
-  top.getScores().fields({"id"}).limit(topK);
-
-  std::vector<api::Query> prohibited;
-  if (phraseExclusion) {
-    prohibited.push_back(
-        qb::phraseWords(top.mr(), "body_w", {"exclude", "phrase"}));
-  } else if (disjunctiveExclusion) {
-    std::array<api::Query, 2> terms = {
-        qb::match(top.mr(), "body_w", "ex0"),
-        qb::match(top.mr(), "body_w", "ex1")};
-    prohibited.push_back(qb::boolean(top.mr(), {}, terms));
-  } else {
-    prohibited.push_back(qb::match(top.mr(), "body_w", exclusion));
-  }
-  top.rawQuery() = scoredDisjunction(
-      top.mr(), left, right, prohibited);
-  req->execute(false);
-  EXPECT_TRUE(req->ok()) << req->errorMsg();
-
+TopRun collectTopRun(const LocalReq& req) {
   TopRun result;
-  const auto* docs = req->docList("q");
+  const auto* docs = req.docList("q");
   if (docs != nullptr) {
     const auto* ids = docs->columns.find("id");
     const auto* scores = docs->columns.find("_score_");
@@ -128,8 +143,172 @@ TopRun runTop(CollectionHelper& helper, bool disabled,
       .phraseAdmits = SkipStats::phraseExclusionWindowAdmits,
       .phraseRejects = SkipStats::phraseExclusionWindowRejects,
       .maxScoreWindows = SkipStats::maxScoreInnerWindows,
+      .cachePullHits = SkipStats::prohibitedCachePullHits,
+      .cachePullBuilds = SkipStats::prohibitedCachePullBuilds,
+      .cachePullBypasses = SkipStats::prohibitedCachePullBypasses,
+      .cachePullRoutingBypasses =
+          SkipStats::prohibitedCachePullRoutingBypasses,
+      .cacheDenseCountHits = SkipStats::prohibitedCacheDenseCountHits,
+      .cacheDenseCountBuilds = SkipStats::prohibitedCacheDenseCountBuilds,
+      .cacheDenseCountBypasses = SkipStats::prohibitedCacheDenseCountBypasses,
+      .cacheDenseCountRoutingBypasses =
+          SkipStats::prohibitedCacheDenseCountRoutingBypasses,
+      .cacheMaxScoreHits = SkipStats::prohibitedCacheMaxScoreHits,
+      .cacheMaxScoreBuilds = SkipStats::prohibitedCacheMaxScoreBuilds,
+      .cacheMaxScoreBypasses = SkipStats::prohibitedCacheMaxScoreBypasses,
+      .cacheMaxScoreRoutingBypasses =
+          SkipStats::prohibitedCacheMaxScoreRoutingBypasses,
+      .cacheCandidateHits = SkipStats::prohibitedCacheCandidateHits,
+      .cacheCandidateBuilds = SkipStats::prohibitedCacheCandidateBuilds,
+      .cacheCandidateBypasses = SkipStats::prohibitedCacheCandidateBypasses,
+      .cacheCandidateRoutingBypasses =
+          SkipStats::prohibitedCacheCandidateRoutingBypasses,
   };
   return result;
+}
+
+api::Query scoredDisjunction(
+    std::pmr::memory_resource& mr, std::string_view left,
+    std::string_view right, std::span<const api::Query> prohibited) {
+  std::array<api::Query, 2> optional = {
+      qb::match(mr, "body_w", left),
+      qb::match(mr, "body_w", right)};
+  return qb::boolean(mr, {}, optional, prohibited, {}, 1);
+}
+
+TopRun runTop(CollectionHelper& helper, bool disabled,
+              std::string_view left, std::string_view right,
+              std::string_view exclusion = "ex0",
+              bool phraseExclusion = false, bool disjunctiveExclusion = false,
+              int32_t topK = 10, bool disableProhibitedCache = false) {
+  BulkExclusionGuard bulkGuard(disabled);
+  ProhibitedCacheGuard cacheGuard(disableProhibitedCache);
+  SkipStatsGuard statsGuard;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q");
+  top.getScores().fields({"id"}).limit(topK);
+
+  std::vector<api::Query> prohibited;
+  if (phraseExclusion) {
+    prohibited.push_back(
+        qb::phraseWords(top.mr(), "body_w", {"exclude", "phrase"}));
+  } else if (disjunctiveExclusion) {
+    std::array<api::Query, 2> terms = {
+        qb::match(top.mr(), "body_w", "ex0"),
+        qb::match(top.mr(), "body_w", "ex1")};
+    prohibited.push_back(qb::boolean(top.mr(), {}, terms));
+  } else {
+    prohibited.push_back(qb::match(top.mr(), "body_w", exclusion));
+  }
+  top.rawQuery() = scoredDisjunction(
+      top.mr(), left, right, prohibited);
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+  return collectTopRun(*req);
+}
+
+TopRun runPullTop(CollectionHelper& helper, std::string_view exclusion,
+                  bool disableProhibitedCache = false) {
+  ProhibitedCacheGuard cacheGuard(disableProhibitedCache);
+  SkipStatsGuard statsGuard;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q");
+  top.getScores().fields({"id"}).limit(20);
+  top.rawQuery() = qb::boolean(
+      top.mr(), {qb::match(top.mr(), "body_w", "left")}, {},
+      {qb::match(top.mr(), "body_w", exclusion)});
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return collectTopRun(*req);
+}
+
+TopRun runCandidateTop(CollectionHelper& helper,
+                       std::string_view exclusion = "ex0",
+                       bool disableProhibitedCache = false) {
+  ProhibitedCacheGuard cacheGuard(disableProhibitedCache);
+  SkipStatsGuard statsGuard;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q");
+  top.matchFilter("selection", "body_w", "ex1");
+  top.getScores().fields({"id"}).limit(20);
+  top.rawQuery() = qb::boolean(
+      top.mr(), {qb::match(top.mr(), "body_w", "left")}, {},
+      {qb::match(top.mr(), "body_w", exclusion)});
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return collectTopRun(*req);
+}
+
+enum class ExclusionShape : uint8_t {
+  MULTIPLE,
+  NESTED_OR,
+  EMPTY,
+  MATCH_ALL,
+};
+
+TopRun runExclusionShape(CollectionHelper& helper, ExclusionShape shape,
+                         bool disableProhibitedCache = false) {
+  ProhibitedCacheGuard cacheGuard(disableProhibitedCache);
+  SkipStatsGuard statsGuard;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q");
+  top.getScores().fields({"id"}).limit(20);
+  std::vector<api::Query> prohibited;
+  if (shape == ExclusionShape::MULTIPLE) {
+    prohibited.push_back(qb::match(top.mr(), "body_w", "ex0"));
+    prohibited.push_back(qb::match(top.mr(), "body_w", "ex1"));
+  } else if (shape == ExclusionShape::NESTED_OR) {
+    std::array<api::Query, 2> members = {
+        qb::match(top.mr(), "body_w", "ex0"),
+        qb::match(top.mr(), "body_w", "ex1")};
+    prohibited.push_back(qb::boolean(top.mr(), {}, members));
+  } else if (shape == ExclusionShape::EMPTY) {
+    prohibited.push_back(qb::match(top.mr(), "body_w", "missing_ex"));
+  } else {
+    prohibited.push_back(qb::all());
+  }
+  top.rawQuery() = qb::boolean(
+      top.mr(), {qb::match(top.mr(), "body_w", "left")}, {}, prohibited);
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return collectTopRun(*req);
+}
+
+struct CountRun {
+  int64_t count = 0;
+  int64_t hits = 0;
+  int64_t builds = 0;
+  int64_t bypasses = 0;
+  int64_t routingBypasses = 0;
+};
+
+CountRun runCachedCount(CollectionHelper& helper,
+                        bool disableProhibitedCache = false) {
+  ProhibitedCacheGuard cacheGuard(disableProhibitedCache);
+  WholeMembershipGuard wholeGuard(true);
+  SkipStatsGuard statsGuard;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q").getNumber().limit(0);
+  top.rawQuery() = qb::boolean(
+      top.mr(),
+      {qb::match(top.mr(), "body_w", "left"),
+       qb::match(top.mr(), "body_w", "right")}, {},
+      {qb::match(top.mr(), "body_w", "ex0")});
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return {
+      req->getMatchCount(),
+      SkipStats::prohibitedCacheDenseCountHits,
+      SkipStats::prohibitedCacheDenseCountBuilds,
+      SkipStats::prohibitedCacheDenseCountBypasses,
+      SkipStats::prohibitedCacheDenseCountRoutingBypasses,
+  };
 }
 
 int64_t runCount(CollectionHelper& helper, bool disabled,
@@ -176,6 +355,12 @@ void addSegment(CollectionHelper& helper, std::string_view prefix,
     }
     if ((doc % 13) == 0) {
       body += " exclude phrase";
+    }
+    if ((doc % 100) == 0) {
+      body += " array_ex";
+    }
+    if (doc == 1) {
+      body += " sparse_ex";
     }
     docs.push_back(flatdoc(
         "id", std::string(prefix) + std::to_string(doc),
@@ -257,6 +442,171 @@ TEST_F(BulkExclusionTest, segmentAdmissionIsIndependent) {
   EXPECT_GT(bulk.counters.engagements, 0);
   EXPECT_GT(bulk.counters.positiveSegmentFallbacks, 0);
   EXPECT_GT(bulk.counters.fills, bulk.counters.windows);
+}
+
+TEST_F(BulkExclusionTest, cachedMaxScoreExclusionBuildsThenHits) {
+  addSegment(helper, "m0_", 5000, true, true);
+  addSegment(helper, "m1_", 5000, true, true);
+
+  TopRun oracle = runTop(
+      helper, false, "left", "right", "ex0", false, false, 100, true);
+  TopRun bypass = runTop(
+      helper, false, "left", "right", "ex0", false, false, 100);
+  TopRun build = runTop(
+      helper, false, "left", "right", "ex0", false, false, 100);
+  TopRun hit = runTop(
+      helper, false, "left", "right", "ex0", false, false, 100);
+
+  expectSameTop(oracle, bypass);
+  expectSameTop(oracle, build);
+  expectSameTop(oracle, hit);
+  EXPECT_GT(bypass.counters.cacheMaxScoreBypasses, 0);
+  EXPECT_GT(build.counters.cacheMaxScoreBuilds, 0);
+  EXPECT_GT(hit.counters.cacheMaxScoreHits, 0);
+  EXPECT_GT(hit.counters.engagements, 0);
+}
+
+TEST_F(BulkExclusionTest, verificationRoutedPhraseExclusionBuildsThenHits) {
+  ProhibitedVerificationCacheGuard verificationGuard(false);
+  addSegment(helper, "ph_", 5000, true, true);
+
+  TopRun oracle = runTop(
+      helper, false, "left", "right", "ex0", true, false, 100, true);
+  TopRun bypass = runTop(
+      helper, false, "left", "right", "ex0", true, false, 100);
+  TopRun build = runTop(
+      helper, false, "left", "right", "ex0", true, false, 100);
+  TopRun hit = runTop(
+      helper, false, "left", "right", "ex0", true, false, 100);
+  expectSameTop(oracle, bypass);
+  expectSameTop(oracle, build);
+  expectSameTop(oracle, hit);
+  EXPECT_GT(bypass.counters.cacheMaxScoreBypasses, 0);
+  EXPECT_GT(build.counters.cacheMaxScoreBuilds, 0);
+  EXPECT_GT(hit.counters.cacheMaxScoreHits, 0);
+  EXPECT_EQ(0, hit.counters.phraseAdmits);
+}
+
+TEST_F(BulkExclusionTest, pullConsumesCachedBitsetAndArrayExclusions) {
+  addSegment(helper, "p_", 10000, true, true);
+
+  TopRun denseOracle = runPullTop(helper, "ex0", true);
+  runPullTop(helper, "ex0");
+  runPullTop(helper, "ex0");
+  TopRun denseHit = runPullTop(helper, "ex0");
+  expectSameTop(denseOracle, denseHit);
+  EXPECT_GT(denseHit.counters.cachePullHits, 0);
+
+  TopRun arrayOracle = runPullTop(helper, "array_ex", true);
+  runPullTop(helper, "array_ex");
+  runPullTop(helper, "array_ex");
+  TopRun arrayHit = runPullTop(helper, "array_ex");
+  expectSameTop(arrayOracle, arrayHit);
+  EXPECT_GT(arrayHit.counters.cachePullHits, 0);
+}
+
+TEST_F(BulkExclusionTest, denseCountConsumesCachedExclusion) {
+  addSegment(helper, "c0_", 5000, true, true);
+  addSegment(helper, "c1_", 5000, true, true);
+
+  CountRun oracle = runCachedCount(helper, true);
+  CountRun bypass = runCachedCount(helper);
+  CountRun build = runCachedCount(helper);
+  CountRun hit = runCachedCount(helper);
+  EXPECT_EQ(oracle.count, bypass.count);
+  EXPECT_EQ(oracle.count, build.count);
+  EXPECT_EQ(oracle.count, hit.count);
+  EXPECT_GT(bypass.bypasses, 0);
+  EXPECT_GT(build.builds, 0);
+  EXPECT_GT(hit.hits, 0);
+}
+
+TEST_F(BulkExclusionTest, candidateConjunctionProbesCachedExclusion) {
+  addSegment(helper, "b_", 10000, true, true);
+
+  TopRun oracle = runCandidateTop(helper, "ex0", true);
+  TopRun bypass = runCandidateTop(helper);
+  TopRun build = runCandidateTop(helper);
+  TopRun hit = runCandidateTop(helper);
+  expectSameTop(oracle, bypass);
+  expectSameTop(oracle, build);
+  expectSameTop(oracle, hit);
+  EXPECT_GT(bypass.counters.cacheCandidateBypasses, 0);
+  EXPECT_GT(build.counters.cacheCandidateBuilds, 0);
+  EXPECT_GT(hit.counters.cacheCandidateHits, 0);
+
+  TopRun arrayOracle = runCandidateTop(helper, "array_ex", true);
+  runCandidateTop(helper, "array_ex");
+  runCandidateTop(helper, "array_ex");
+  TopRun arrayHit = runCandidateTop(helper, "array_ex");
+  expectSameTop(arrayOracle, arrayHit);
+  EXPECT_GT(arrayHit.counters.cacheCandidateHits, 0);
+}
+
+TEST_F(BulkExclusionTest, sparseExclusionBypassesBeforeSighting) {
+  addSegment(helper, "s_", 10000, true, true);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto* cache = reader->filterCache();
+  ASSERT_NE(nullptr, cache);
+  size_t entriesBefore = cache->entryCountForTest();
+
+  TopRun first = runPullTop(helper, "sparse_ex");
+  TopRun second = runPullTop(helper, "sparse_ex");
+  TopRun third = runPullTop(helper, "sparse_ex");
+  EXPECT_GT(first.counters.cachePullRoutingBypasses, 0);
+  EXPECT_GT(second.counters.cachePullRoutingBypasses, 0);
+  EXPECT_GT(third.counters.cachePullRoutingBypasses, 0);
+  EXPECT_EQ(0, third.counters.cachePullHits);
+  EXPECT_EQ(0, third.counters.cachePullBuilds);
+  EXPECT_EQ(0, third.counters.cachePullBypasses);
+  EXPECT_EQ(entriesBefore, cache->entryCountForTest());
+}
+
+TEST_F(BulkExclusionTest, multipleNestedEmptyAndMatchAllExclusions) {
+  addSegment(helper, "n_", 10000, true, true);
+
+  TopRun multipleOracle = runExclusionShape(
+      helper, ExclusionShape::MULTIPLE, true);
+  runExclusionShape(helper, ExclusionShape::MULTIPLE);
+  runExclusionShape(helper, ExclusionShape::MULTIPLE);
+  TopRun multipleHit = runExclusionShape(helper, ExclusionShape::MULTIPLE);
+  expectSameTop(multipleOracle, multipleHit);
+  EXPECT_GE(multipleHit.counters.cachePullHits, 2);
+
+  TopRun nestedOracle = runExclusionShape(
+      helper, ExclusionShape::NESTED_OR, true);
+  runExclusionShape(helper, ExclusionShape::NESTED_OR);
+  runExclusionShape(helper, ExclusionShape::NESTED_OR);
+  TopRun nestedHit = runExclusionShape(helper, ExclusionShape::NESTED_OR);
+  expectSameTop(nestedOracle, nestedHit);
+  EXPECT_GT(nestedHit.counters.cachePullHits, 0);
+  EXPECT_EQ(multipleHit.ids, nestedHit.ids);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto* cache = reader->filterCache();
+  ASSERT_NE(nullptr, cache);
+  size_t entriesBeforeConstants = cache->entryCountForTest();
+  TopRun emptyOracle = runExclusionShape(
+      helper, ExclusionShape::EMPTY, true);
+  TopRun empty = runExclusionShape(helper, ExclusionShape::EMPTY);
+  expectSameTop(emptyOracle, empty);
+  TopRun all = runExclusionShape(helper, ExclusionShape::MATCH_ALL);
+  EXPECT_TRUE(all.ids.empty());
+  EXPECT_EQ(entriesBeforeConstants, cache->entryCountForTest());
+}
+
+TEST_F(BulkExclusionTest, cachedExclusionComposesDeleteLiveness) {
+  addSegment(helper, "d_", 10000, true, true);
+  runPullTop(helper, "ex0");
+  runPullTop(helper, "ex0");
+  TopRun beforeDelete = runPullTop(helper, "ex0");
+  EXPECT_GT(beforeDelete.counters.cachePullHits, 0);
+
+  ASSERT_TRUE(helper.deleteById("d_0", UpdateMessage::COMMIT).success);
+  TopRun oracle = runPullTop(helper, "ex0", true);
+  TopRun hit = runPullTop(helper, "ex0");
+  expectSameTop(oracle, hit);
+  EXPECT_GT(hit.counters.cachePullHits, 0);
 }
 
 TEST_F(BulkExclusionTest, randomizedCountAndScoreMatchDisabledOracle) {

@@ -45,6 +45,18 @@ struct SkipStatsGuard {
   }
 };
 
+struct ProhibitedCacheGuard {
+  bool saved = QueryPrep::disableProhibitedCacheForTests;
+
+  ProhibitedCacheGuard() {
+    QueryPrep::disableProhibitedCacheForTests = true;
+  }
+
+  ~ProhibitedCacheGuard() {
+    QueryPrep::disableProhibitedCacheForTests = saved;
+  }
+};
+
 enum class PhraseShape {
   ORDINARY,
   REPEATED
@@ -95,6 +107,7 @@ int64_t runCount(CollectionHelper& helper, bool disableWindowPath,
                  PhraseShape shape, bool withTermExclusion = false,
                  bool rejectedShape = false) {
   NegatedCountGuard guard(disableWindowPath);
+  ProhibitedCacheGuard cacheGuard;
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q").getNumber().limit(0);
