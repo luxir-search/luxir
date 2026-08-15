@@ -192,8 +192,10 @@ public:
       traits |= IS_CONSTANT_SCORING | MATCHES_ALL_DOCS;
     }
 
-    Query::ScorerSupplier* scorerSupplier(
-        MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, luxir::IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      unused(executionMode);
       return targetPool.make<AllQuery::Supplier>(segment, score);
     }
 

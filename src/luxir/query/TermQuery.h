@@ -275,8 +275,11 @@ public:
           MemPool& targetPool, const BulkPlan& plan) override;
     };
 
-    Query::ScorerSupplier* scorerSupplier(luxir::MemPool& targetPool,
-                                          luxir::IndexReader::Segment& segment) override {
+    Query::ScorerSupplier* scorerSupplierImpl(
+        luxir::MemPool& targetPool,
+        luxir::IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      unused(executionMode);
       return targetPool.make<Supplier>(*this, segment);
     }
 

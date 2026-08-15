@@ -184,8 +184,11 @@ public:
         return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
       }
 
-      Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
-        auto* childSupplier = child.segmentSource().scorerSupplier(targetPool, segment);
+      Query::ScorerSupplier* scorerSupplierImpl(
+          MemPool& targetPool, IndexReader::Segment& segment,
+          Query::SupplierExecutionMode executionMode) override {
+        auto* childSupplier = child.segmentSource().scorerSupplier(
+            targetPool, segment, executionMode);
         if (childSupplier == nullptr) return nullptr;
         return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
       }
@@ -224,8 +227,11 @@ public:
       return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
     }
 
-    Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
-      auto* childSupplier = childWeight->scorerSupplier(targetPool, segment);
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      auto* childSupplier = childWeight->scorerSupplier(
+          targetPool, segment, executionMode);
       if (childSupplier == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
     }

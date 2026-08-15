@@ -486,6 +486,13 @@ FilterCache::Use::publishReaderStable(
   return value;
 }
 
+DocSet* FilterCache::Use::rawDocSet(size_t segmentOrd) {
+  if (segmentOrd >= requestSlots.size()) return nullptr;
+  auto& requestSlot = *requestSlots[segmentOrd];
+  std::lock_guard<std::mutex> lock(requestSlot.mutex);
+  return requestSlot.raw;
+}
+
 DocSet* FilterCache::Use::effectiveDocSet(
     size_t segmentOrd, IndexReader& reader, DocSet* domain) {
   // PrepareContext domains already carry liveness, so that path is raw AND

@@ -30,10 +30,11 @@ public:
       traits |= IS_CONSTANT_SCORING;  // vacuously constant
     }
 
-    Query::ScorerSupplier* scorerSupplier(
+    Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool,
-        luxir::IndexReader::Segment& segment) override {
-      unused(targetPool, segment);
+        luxir::IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      unused(targetPool, segment, executionMode);
       return nullptr;
     }
 

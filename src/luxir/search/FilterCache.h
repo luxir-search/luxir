@@ -329,6 +329,7 @@ public:
 
     DocSet* adoptOwnedRaw(size_t segmentOrd, Probe& probe,
                           std::unique_ptr<DocSet> raw);
+    DocSet* rawDocSet(size_t segmentOrd);
     DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader,
                             DocSet* domain = nullptr);
     bool wasAdmitted() const { return admitted; }

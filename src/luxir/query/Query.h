@@ -403,6 +403,15 @@ public:
     SCORED_WINDOWS,
   };
 
+  // Supplier construction is ordinarily allowed to compose cached membership
+  // with the reader/domain visible to the request. RAW_MEMBERSHIP requires
+  // query membership independent of both: compound sources propagate the mode
+  // and cache-backed children expose only pinned raw values.
+  enum class SupplierExecutionMode : uint8_t {
+    ORDINARY,
+    RAW_MEMBERSHIP,
+  };
+
   struct Demand {
     int64_t candidates = std::numeric_limits<int64_t>::max();
     int64_t span = std::numeric_limits<int64_t>::max();
@@ -732,8 +741,16 @@ public:
   public:
     /// Return temporary per-segment planning state allocated from targetPool.
     /// A null supplier means this source cannot match the segment.
-    virtual Query::ScorerSupplier* scorerSupplier(
-        MemPool& targetPool, IndexReader::Segment& segment) = 0;
+    Query::ScorerSupplier* scorerSupplier(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        SupplierExecutionMode executionMode =
+            SupplierExecutionMode::ORDINARY) {
+      return scorerSupplierImpl(targetPool, segment, executionMode);
+    }
+
+    virtual Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        SupplierExecutionMode executionMode) = 0;
 
     /// Direct scorer construction implemented by SegmentSources whose supplier
     /// delegates its build to the source.

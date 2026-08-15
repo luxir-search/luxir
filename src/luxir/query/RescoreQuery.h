@@ -381,9 +381,10 @@ class RescoreQuery final : public Query {
   static Query::ScorerSupplier* wrapSupplier(
       MemPool& targetPool, IndexReader::Segment& segment,
       Query::SegmentSource& childSource, ValueProgram& program,
-      float multiplier, bool needsChildScore, bool pruning) {
+      float multiplier, bool needsChildScore, bool pruning,
+      Query::SupplierExecutionMode executionMode) {
     Query::ScorerSupplier* childSupplier =
-        childSource.scorerSupplier(targetPool, segment);
+        childSource.scorerSupplier(targetPool, segment, executionMode);
     if (childSupplier == nullptr) return nullptr;
     return targetPool.make<Supplier>(
         childSupplier, &program, &segment, multiplier, needsChildScore, pruning);
@@ -443,12 +444,15 @@ public:
             targetPool, supplier->makePlanContext(demand))->build(targetPool);
       }
 
-      Query::ScorerSupplier* scorerSupplier(
-          MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::ScorerSupplier* scorerSupplierImpl(
+          MemPool& targetPool, IndexReader::Segment& segment,
+          Query::SupplierExecutionMode executionMode) override {
         Query::SegmentSource& source = child.segmentSource();
-        if (!scored) return source.scorerSupplier(targetPool, segment);
+        if (!scored) {
+          return source.scorerSupplier(targetPool, segment, executionMode);
+        }
         return wrapSupplier(targetPool, segment, source, *program, multiplier,
-                            needsChildScore, pruning);
+                            needsChildScore, pruning, executionMode);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -497,13 +501,16 @@ public:
           targetPool, supplier->makePlanContext(demand))->build(targetPool);
     }
 
-    Query::ScorerSupplier* scorerSupplier(
-        MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
       if (!scored) {
-        return childWeight->scorerSupplier(targetPool, segment);
+        return childWeight->scorerSupplier(
+            targetPool, segment, executionMode);
       }
       return wrapSupplier(targetPool, segment, *childWeight, *program,
-                          multiplier, needsChildScore, allowsPruning());
+                          multiplier, needsChildScore, allowsPruning(),
+                          executionMode);
     }
 
 

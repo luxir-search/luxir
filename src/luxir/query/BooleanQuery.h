@@ -1241,6 +1241,7 @@ public:
       int minShouldMatch;
       bool needsScores;
       bool allowsPruning;
+      Query::SupplierExecutionMode executionMode;
 
       static Query::ScorerShape emptyShape() {
         Query::ScorerShape shape;
@@ -1620,7 +1621,8 @@ public:
                int64_t shapeRequiredCost,
                int minShouldMatch,
                bool needsScores,
-               bool allowsPruning)
+               bool allowsPruning,
+               Query::SupplierExecutionMode executionMode)
         : pool(pool), segment(segment), mandatorySources(mandatorySources),
           mandatoryScores(mandatoryScores),
           optionalSources(optionalSources), prohibitedSources(prohibitedSources),
@@ -1630,7 +1632,8 @@ public:
           prohibitedShapeSuppliers(prohibitedShapeSuppliers),
           shapeRequiredCost(shapeRequiredCost),
           minShouldMatch(minShouldMatch),
-          needsScores(needsScores), allowsPruning(allowsPruning) {}
+          needsScores(needsScores), allowsPruning(allowsPruning),
+          executionMode(executionMode) {}
 
       int64_t cost() override {
         int64_t maxDoc = segment.maxDoc();
@@ -3791,17 +3794,17 @@ public:
         if (mandatorySources.size() == 1 && optionalSources.empty()
             && minShouldMatch < 1) {
           bodySupplier = mandatorySources[0]->scorerSupplier(
-              pool, segment);
+              pool, segment, executionMode);
         } else if (mandatorySources.empty() && optionalSources.size() == 1) {
           bodySupplier = optionalSources[0]->scorerSupplier(
-              pool, segment);
+              pool, segment, executionMode);
         } else {
           bodySupplier = makeSupplier(
               pool, segment, mandatorySources, mandatoryScores,
               optionalSources,
               std::span<Query::SegmentSource* const>{},
               std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
-              needsScores, allowsPruning);
+              needsScores, allowsPruning, executionMode);
         }
         if (bodySupplier == nullptr) {
           return noBulkPlan();
@@ -4202,7 +4205,7 @@ public:
                 optionalSources,
                 std::span<Query::SegmentSource* const>{},
                 std::span<Query::ScorerSupplier* const>{},
-                minShouldMatch, needsScores, allowsPruning);
+                minShouldMatch, needsScores, allowsPruning, executionMode);
           }
           if (body != nullptr) {
             BulkScorerContext childContext{
@@ -4336,22 +4339,24 @@ public:
         std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch,
         bool needsScores,
-        bool allowsPruning) {
+        bool allowsPruning,
+        Query::SupplierExecutionMode executionMode) {
       // Weight-time optional removal can expose a Boolean child that
       // normalization could not unwrap while the optionals were still present.
       // Preserve the child's complete supplier contract, including bulkScorer.
       if (minShouldMatch < 1 && mandatorySources.size() == 1
           && optionalSources.empty()
           && prohibitedSources.empty() && filterSuppliers.empty()) {
-        auto* child = mandatorySources[0]->scorerSupplier(targetPool, segment);
+        auto* child = mandatorySources[0]->scorerSupplier(
+            targetPool, segment, executionMode);
         if (child != nullptr) return child;
       }
       auto mandatoryShapeSuppliers = QueryPrep::collectSuppliers(
-          targetPool, segment, mandatorySources);
+          targetPool, segment, mandatorySources, executionMode);
       auto optionalShapeSuppliers = QueryPrep::collectSuppliers(
-          targetPool, segment, optionalSources);
+          targetPool, segment, optionalSources, executionMode);
       auto prohibitedShapeSuppliers = QueryPrep::collectSuppliers(
-          targetPool, segment, prohibitedSources);
+          targetPool, segment, prohibitedSources, executionMode);
       int64_t shapeRequiredCost = segment.maxDoc();
       for (auto* supplier : mandatoryShapeSuppliers) {
         if (supplier != nullptr) {
@@ -4367,7 +4372,7 @@ public:
         targetPool, segment, mandatorySources, mandatoryScores, optionalSources,
         prohibitedSources, filterSuppliers, mandatoryShapeSuppliers,
         optionalShapeSuppliers, prohibitedShapeSuppliers, shapeRequiredCost,
-        minShouldMatch, needsScores, allowsPruning);
+        minShouldMatch, needsScores, allowsPruning, executionMode);
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
@@ -4397,7 +4402,15 @@ public:
           hasFilters(hasFilters), minShouldMatch(minShouldMatch),
           needsScores(needsScores), allowsPruning(allowsPruning) {}
 
-      Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::ScorerSupplier* scorerSupplierImpl(
+          MemPool& targetPool, IndexReader::Segment& segment,
+          Query::SupplierExecutionMode executionMode) override {
+        if (hasFilters
+            && executionMode
+                == Query::SupplierExecutionMode::RAW_MEMBERSHIP) {
+          throw std::logic_error(
+              "raw membership cannot consume a prepared filter domain");
+        }
         std::span<Query::ScorerSupplier*> filterSuppliers;
         if (hasFilters) {
           auto* filterDomain = filterDomains[(size_t)segment.ord].get();
@@ -4410,7 +4423,8 @@ public:
           mandatoryScores,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
-          filterSuppliers, minShouldMatch, needsScores, allowsPruning);
+          filterSuppliers, minShouldMatch, needsScores, allowsPruning,
+          executionMode);
       }
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
@@ -4601,7 +4615,10 @@ public:
     }
 
 
-    Query::ScorerSupplier* scorerSupplier(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::ScorerSupplier* scorerSupplierImpl(
+        luxir::MemPool& targetPool,
+        luxir::IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
       auto mandatorySources = QueryPrep::liveSources(targetPool, mandatoryWeights);
       auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
@@ -4631,13 +4648,14 @@ public:
                   ? needsScores
                         ? filteredDisjunctionBatchDensityInverseForTests
                         : QueryPrep::kSparseBatchCountOwnDensityInverse
-                  : 0);
+                  : 0,
+              executionMode);
         }
       }
       return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
                           optionalSources,
                           prohibitedSources, filterSuppliers, minShouldMatch,
-                          needsScores, allowsPruning);
+                          needsScores, allowsPruning, executionMode);
     }
 
     int64_t sparseFilteredTopKCost(

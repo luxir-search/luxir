@@ -161,8 +161,10 @@ public:
       }
     };
 
-    Query::ScorerSupplier* scorerSupplier(
-        MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      unused(executionMode);
       SegFieldInfo* info = segmentInfo(segment);
       if (info == nullptr || info->docsWithField == 0) return nullptr;
       return targetPool.make<Supplier>(segment, *info, constantScore);

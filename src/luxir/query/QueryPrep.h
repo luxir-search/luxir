@@ -116,11 +116,14 @@ inline std::span<Query::SegmentSource*> segmentSources(MemPool& targetPool,
 // over child costs - and pick lead iterators - before any scorer is built.
 inline std::span<Query::ScorerSupplier*> collectSuppliers(MemPool& targetPool,
                                                           IndexReader::Segment& segment,
-                                                          std::span<Query::SegmentSource* const> sources) {
+                                                          std::span<Query::SegmentSource* const> sources,
+                                                          Query::SupplierExecutionMode executionMode =
+                                                              Query::SupplierExecutionMode::ORDINARY) {
   if (sources.empty()) return {};
   auto* suppliers = targetPool.make_arr<Query::ScorerSupplier*>(sources.size());
   for (size_t i = 0; i < sources.size(); i++) {
-    suppliers[i] = sources[i]->scorerSupplier(targetPool, segment);
+    suppliers[i] = sources[i]->scorerSupplier(
+        targetPool, segment, executionMode);
   }
   return {suppliers, sources.size()};
 }
@@ -310,7 +313,9 @@ public:
 
 inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
                                            IndexReader::Segment& segment,
-                                           DocSet* domain) {
+                                           DocSet* domain,
+                                           Query::SupplierExecutionMode executionMode =
+                                               Query::SupplierExecutionMode::ORDINARY) {
   // Used from prepare() paths, which can run deep in a work-stealing stack.
   // Use the thread-local pool (its inline buffer lives in TLS, not on this
   // stack frame) rather than a stack-resident MemPool, and keep scorer
@@ -318,7 +323,7 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
   auto guard = MemPool::threadLocalPoolGuard();
   MemPool& scratch = guard.pool();
   DocSetBuilder builder(segment.maxDoc());
-  auto* supplier = source.scorerSupplier(scratch, segment);
+  auto* supplier = source.scorerSupplier(scratch, segment, executionMode);
   if (supplier != nullptr) {
     Query::ScorerSupplier::BulkScorerContext bulkContext;
     auto plan = supplier->planBulk(
@@ -399,11 +404,13 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
 inline std::unique_ptr<DocSet> materialize(Query::Weight& weight,
                                            Query::Weight::PreparedWeight* prepared,
                                            IndexReader::Segment& segment,
-                                           DocSet* domain) {
+                                           DocSet* domain,
+                                           Query::SupplierExecutionMode executionMode =
+                                               Query::SupplierExecutionMode::ORDINARY) {
   Query::SegmentSource& source = prepared != nullptr
     ? static_cast<Query::SegmentSource&>(*prepared)
     : static_cast<Query::SegmentSource&>(weight);
-  return materialize(source, segment, domain);
+  return materialize(source, segment, domain, executionMode);
 }
 
 // Prepared source over one pinned whole-reader cache value. This is distinct
@@ -423,8 +430,13 @@ public:
                          {segment.segInfo.seg_id, segment.maxDoc()});
   }
 
-  Query::ScorerSupplier* scorerSupplier(
-      MemPool& targetPool, IndexReader::Segment& segment) override {
+  Query::ScorerSupplier* scorerSupplierImpl(
+      MemPool& targetPool, IndexReader::Segment& segment,
+      Query::SupplierExecutionMode executionMode) override {
+    if (executionMode == Query::SupplierExecutionMode::RAW_MEMBERSHIP) {
+      throw std::logic_error(
+          "raw membership cannot consume reader-stable live membership");
+    }
     return targetPool.make<DocSetSupplier>(docSet(segment), segment);
   }
 
@@ -506,7 +518,9 @@ inline std::unique_ptr<DocSet> materializeRawFilter(
     throw std::logic_error(
         "raw filter materialization requires NEED_SCORES and ALLOW_PRUNING off");
   }
-  return materialize(weight, prepared, segment, nullptr);
+  return materialize(
+      weight, prepared, segment, nullptr,
+      Query::SupplierExecutionMode::RAW_MEMBERSHIP);
 }
 
 enum class FilterSupplierMode : uint8_t {
@@ -555,7 +569,9 @@ inline Query::ScorerSupplier* filterSupplier(
     MemPool& targetPool, const PreparedSource& source,
     IndexReader& reader, IndexReader::Segment& segment,
     FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
-    int32_t sparseBatchDensityInverse = 0) {
+    int32_t sparseBatchDensityInverse = 0,
+    Query::SupplierExecutionMode executionMode =
+        Query::SupplierExecutionMode::ORDINARY) {
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
   auto* use = source.cacheUse;
@@ -566,7 +582,12 @@ inline Query::ScorerSupplier* filterSupplier(
     use = nullptr;
   }
   if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
-    return segmentSource.scorerSupplier(targetPool, segment);
+    if (executionMode == Query::SupplierExecutionMode::RAW_MEMBERSHIP) {
+      throw std::logic_error(
+          "raw membership cannot consume reader-stable live membership");
+    }
+    return segmentSource.scorerSupplier(
+        targetPool, segment, executionMode);
   }
 
   // Gate before cache traffic. DENSITY_ROUTED leaves sparse filters on pruned
@@ -578,7 +599,8 @@ inline Query::ScorerSupplier* filterSupplier(
   // planning. On cache bypass, SPARSE_BATCH retains postings for the batch
   // gatherer; admitted cache builds still publish a DocSet, and cache hits
   // borrow one. Sparse entries also populate through facet/domain consumers.
-  auto* uncached = segmentSource.scorerSupplier(targetPool, segment);
+  auto* uncached = segmentSource.scorerSupplier(
+      targetPool, segment, executionMode);
   if (uncached == nullptr) return nullptr;
   int64_t cost = uncached->cost();
   if (use == nullptr
@@ -593,9 +615,11 @@ inline Query::ScorerSupplier* filterSupplier(
 
   auto probe = use->probe((size_t) segment.ord);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    DocSet* effective = use->effectiveDocSet(
-        (size_t) segment.ord, reader);
-    return targetPool.make<DocSetSupplier>(effective, segment);
+    DocSet* docs = executionMode
+            == Query::SupplierExecutionMode::RAW_MEMBERSHIP
+        ? probe.docSet()
+        : use->effectiveDocSet((size_t) segment.ord, reader);
+    return targetPool.make<DocSetSupplier>(docs, segment);
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
@@ -615,21 +639,26 @@ inline Query::ScorerSupplier* filterSupplier(
     use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
   }
 
-  DocSet* effective = use->effectiveDocSet((size_t) segment.ord, reader);
-  return targetPool.make<DocSetSupplier>(effective, segment);
+  DocSet* docs = executionMode
+          == Query::SupplierExecutionMode::RAW_MEMBERSHIP
+      ? use->rawDocSet((size_t) segment.ord)
+      : use->effectiveDocSet((size_t) segment.ord, reader);
+  return targetPool.make<DocSetSupplier>(docs, segment);
 }
 
 inline Query::ScorerSupplier* filterSupplier(
     MemPool& targetPool, Query::Weight& weight, FilterCache::Use* use,
     IndexReader& reader, IndexReader::Segment& segment,
     FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
-    int32_t sparseBatchDensityInverse = 0) {
+    int32_t sparseBatchDensityInverse = 0,
+    Query::SupplierExecutionMode executionMode =
+        Query::SupplierExecutionMode::ORDINARY) {
   PreparedSource source;
   source.weight = &weight;
   source.cacheUse = use;
   return filterSupplier(
       targetPool, source, reader, segment, mode,
-      sparseBatchDensityInverse);
+      sparseBatchDensityInverse, executionMode);
 }
 
 struct ExactDomainSource {

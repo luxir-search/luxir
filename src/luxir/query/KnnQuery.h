@@ -403,8 +403,10 @@ public:
           std::span<const Hit>(hits.data(), hits.size()));
       }
 
-      Query::ScorerSupplier* scorerSupplier(
-          MemPool& target, IndexReader::Segment& segment) override {
+      Query::ScorerSupplier* scorerSupplierImpl(
+          MemPool& target, IndexReader::Segment& segment,
+          Query::SupplierExecutionMode executionMode) override {
+        unused(executionMode);
         if ((size_t)segment.ord >= perSegHits.size()) return nullptr;
         auto& hits = perSegHits[(size_t)segment.ord];
         if (hits.empty()) return nullptr;
@@ -931,9 +933,10 @@ public:
       return nullptr;
     }
 
-    Query::ScorerSupplier* scorerSupplier(
-        MemPool& target, IndexReader::Segment& segment) override {
-      unused(target, segment);
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& target, IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      unused(target, segment, executionMode);
       return nullptr;
     }
 

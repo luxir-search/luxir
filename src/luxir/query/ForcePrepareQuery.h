@@ -41,8 +41,11 @@ public:
 
       // Pass-through: matches and scores are the child's, so its supplier is too
       // (cost and get both delegate, no wrapping).
-      Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
-        return child.segmentSource().scorerSupplier(targetPool, segment);
+      Query::ScorerSupplier* scorerSupplierImpl(
+          MemPool& targetPool, IndexReader::Segment& segment,
+          Query::SupplierExecutionMode executionMode) override {
+        return child.segmentSource().scorerSupplier(
+            targetPool, segment, executionMode);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -75,8 +78,11 @@ public:
       return QueryPrep::createScorer(targetPool, segment, *childWeight);
     }
 
-    Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
-      return childWeight->scorerSupplier(targetPool, segment);
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      return childWeight->scorerSupplier(
+          targetPool, segment, executionMode);
     }
   };
 };

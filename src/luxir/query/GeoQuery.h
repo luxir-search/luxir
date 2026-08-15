@@ -323,8 +323,10 @@ public:
     }
   };
 
-  Query::ScorerSupplier* scorerSupplier(
-      MemPool& targetPool, IndexReader::Segment& segment) override {
+  Query::ScorerSupplier* scorerSupplierImpl(
+      MemPool& targetPool, IndexReader::Segment& segment,
+      Query::SupplierExecutionMode executionMode) override {
+    unused(executionMode);
     if (query.isEmpty()) return nullptr;
     SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;

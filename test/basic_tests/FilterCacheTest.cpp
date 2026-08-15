@@ -302,6 +302,61 @@ public:
   }
 };
 
+class FailSecondSupplierQuery final : public Query {
+  Query& child;
+  int32_t supplierCalls = 0;
+
+  class Weight final : public Query::Weight {
+    Query::Weight* child;
+    int32_t* supplierCalls;
+
+  public:
+    Weight(Query::Context& context, int32_t flags, Query::Weight* child,
+           int32_t* supplierCalls)
+      : Query::Weight(context, flags), child(child),
+        supplierCalls(supplierCalls) {
+      traits = child->getFlags();
+    }
+
+    Query::ScorerSupplier* scorerSupplierImpl(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        Query::SupplierExecutionMode executionMode) override {
+      (*supplierCalls)++;
+      if (*supplierCalls == 2) {
+        throw std::runtime_error("injected raw materialization failure");
+      }
+      return child->scorerSupplier(targetPool, segment, executionMode);
+    }
+
+    Query::Scorer* createScorer(
+        MemPool& targetPool, IndexReader::Segment& segment) override {
+      return child->createScorer(targetPool, segment);
+    }
+  };
+
+public:
+  explicit FailSecondSupplierQuery(Query& child) : child(child) {}
+
+  ScoreProfile scoreProfile() const override {
+    return child.scoreProfile();
+  }
+
+  FilterKeyScope appendFilterKey(
+      FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
+    return child.appendFilterKey(out, ctx);
+  }
+
+  Query::Weight* createWeight(
+      Query::Context& context, int32_t flags,
+      float multiplier = 1.0f) override {
+    auto* childWeight = child.createWeight(context, flags, multiplier);
+    return context.pool.make<Weight>(
+        context, flags, childWeight, &supplierCalls);
+  }
+
+  int32_t calls() const { return supplierCalls; }
+};
+
 std::unique_ptr<DocSet> docs(int32_t maxDoc,
                              std::initializer_list<int32_t> values) {
   DocSetBuilder builder(maxDoc);
@@ -2433,6 +2488,173 @@ TEST(FilterCacheTest, rawMaterializationEnforcesExhaustiveFlags) {
   auto* pruning = query.createWeight(context, Query::ALLOW_PRUNING);
   EXPECT_THROW(QueryPrep::materializeRawFilter(
       *pruning, nullptr, reader->segments()[0]), std::logic_error);
+}
+
+TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addIdTermDoc(writer, "0", "body selected alpha");
+  addIdTermDoc(writer, "1", "body selected beta");
+  addIdTermDoc(writer, "2", "body alpha");
+  writer.commit();
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("0", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto reader = writer.getIndexReader(0);
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+  ASSERT_NE(nullptr, segment.liveDocs());
+
+  TermQuery selected("text_w", "selected");
+  {
+    MemPool contextPool;
+    Query::Context context(contextPool, *reader);
+    auto* weight = selected.createWeight(context, 0);
+    auto* use = context.getFilterUse(selected);
+    MemPool execPool;
+    ASSERT_NE(nullptr, QueryPrep::filterSupplier(
+        execPool, *weight, use, *reader, segment,
+        QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
+    ASSERT_NE(nullptr, use->rawDocSet(0));
+    EXPECT_EQ(2, use->rawDocSet(0)->card());
+    EXPECT_EQ(1, use->effectiveDocSet(0, *reader)->card());
+  }
+
+  auto assertRawBuild = [&](Query& query) {
+    auto before = writer.getFilterCache()->counters();
+    MemPool contextPool;
+    Query::Context context(contextPool, *reader);
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(query);
+    auto effective = QueryPrep::materializeEffectiveFilter(
+        *weight, use, *reader, segment, nullptr);
+    ASSERT_NE(nullptr, effective.get());
+    ASSERT_NE(nullptr, use->rawDocSet(0));
+    EXPECT_EQ(2, use->rawDocSet(0)->card());
+    EXPECT_TRUE(use->rawDocSet(0)->get(0));
+    EXPECT_EQ(1, effective.get()->card());
+    EXPECT_FALSE(effective.get()->get(0));
+    auto after = writer.getFilterCache()->counters();
+    EXPECT_GT(after.hits, before.hits);
+    EXPECT_EQ(before.builds + 1, after.builds);
+  };
+
+  TermQuery body("text_w", "body");
+  std::array<Query*, 1> mandatory{&body};
+  std::array<Query*, 1> filters{&selected};
+  BooleanQuery exhaustive(mandatory, {}, {}, filters);
+  assertRawBuild(exhaustive);
+
+  TermQuery alpha("text_w", "alpha");
+  TermQuery beta("text_w", "beta");
+  std::array<Query*, 2> optional{&alpha, &beta};
+  BooleanQuery sparseBatch({}, optional, {}, filters, 1);
+  assertRawBuild(sparseBatch);
+}
+
+TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addIdTermDoc(writer, "0", "body selected");
+  addIdTermDoc(writer, "1", "body selected");
+  addIdTermDoc(writer, "2", "body");
+  writer.commit();
+  auto oldReader = writer.getIndexReader(0);
+  ASSERT_EQ(1u, oldReader->segments().size());
+  ASSERT_EQ(nullptr, oldReader->segments()[0].liveDocs());
+
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("0", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto newReader = writer.getIndexReader(0);
+  ASSERT_NE(oldReader, newReader);
+  ASSERT_EQ(oldReader->segments()[0].segInfo.seg_id,
+            newReader->segments()[0].segInfo.seg_id);
+  ASSERT_NE(nullptr, newReader->segments()[0].liveDocs());
+
+  TermQuery selected("text_w", "selected");
+  TermQuery body("text_w", "body");
+  std::array<Query*, 1> mandatory{&body};
+  std::array<Query*, 1> filters{&selected};
+  BooleanQuery outer(mandatory, {}, {}, filters);
+
+  {
+    MemPool contextPool;
+    Query::Context context(contextPool, *newReader);
+    auto* weight = selected.createWeight(context, 0);
+    auto* use = context.getFilterUse(selected);
+    MemPool execPool;
+    ASSERT_NE(nullptr, QueryPrep::filterSupplier(
+        execPool, *weight, use, *newReader, newReader->segments()[0],
+        QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE));
+  }
+
+  {
+    MemPool contextPool;
+    Query::Context context(contextPool, *newReader);
+    auto* weight = outer.createWeight(context, 0);
+    auto* use = context.getFilterUse(outer);
+    auto effective = QueryPrep::materializeEffectiveFilter(
+        *weight, use, *newReader, newReader->segments()[0], nullptr);
+    ASSERT_NE(nullptr, use->rawDocSet(0));
+    EXPECT_EQ(2, use->rawDocSet(0)->card());
+    ASSERT_NE(nullptr, effective.get());
+    EXPECT_EQ(1, effective.get()->card());
+  }
+
+  auto beforeOld = writer.getFilterCache()->counters();
+  {
+    MemPool contextPool;
+    Query::Context context(contextPool, *oldReader);
+    auto* weight = outer.createWeight(context, 0);
+    auto* use = context.getFilterUse(outer);
+    auto effective = QueryPrep::materializeEffectiveFilter(
+        *weight, use, *oldReader, oldReader->segments()[0], nullptr);
+    ASSERT_NE(nullptr, effective.get());
+    EXPECT_EQ(2, effective.get()->card());
+    EXPECT_TRUE(effective.get()->get(0));
+    EXPECT_GT(writer.getFilterCache()->counters().hits, beforeOld.hits);
+  }
+}
+
+TEST(FilterCacheTest, recursiveRawBuildExceptionReleasesBothClaims) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  IndexWriter writer(dir, {}, nullptr, config);
+  addTermDoc(writer, "body selected");
+  addTermDoc(writer, "body");
+  writer.commit();
+  auto reader = writer.getIndexReader(0);
+
+  TermQuery selected("text_w", "selected");
+  FailSecondSupplierQuery failing(selected);
+  TermQuery body("text_w", "body");
+  std::array<Query*, 1> mandatory{&body};
+  std::array<Query*, 1> filters{&failing};
+  BooleanQuery outer(mandatory, {}, {}, filters);
+
+  MemPool contextPool;
+  Query::Context context(contextPool, *reader);
+  auto* weight = outer.createWeight(context, 0);
+  auto* outerUse = context.getFilterUse(outer);
+  auto* innerUse = context.getFilterUse(failing);
+  EXPECT_THROW(QueryPrep::materializeEffectiveFilter(
+      *weight, outerUse, *reader, reader->segments()[0], nullptr),
+      std::runtime_error);
+  EXPECT_EQ(2, failing.calls());
+  EXPECT_EQ(0u, writer.getFilterCache()->counters().builds);
+
+  auto outerRetry = outerUse->probe(0);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, outerRetry.kind());
+  auto innerRetry = innerUse->probe(0);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, innerRetry.kind());
 }
 
 TEST(FilterCacheTest, readerStableUseRejectsRawByproductPublication) {
