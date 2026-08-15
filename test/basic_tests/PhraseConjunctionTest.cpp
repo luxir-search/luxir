@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "luxir/query/BooleanQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -58,6 +59,18 @@ struct SkipStatsGuard {
   ~SkipStatsGuard() {
     SkipStats::enabled = saved;
     SkipStats::reset();
+  }
+};
+
+struct WholeMembershipPlanGuard {
+  bool saved = QueryPrep::disableWholeMembershipPlanForTests;
+
+  WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = true;
+  }
+
+  ~WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = saved;
   }
 };
 
@@ -111,6 +124,7 @@ public:
 
   Run run(Shape shape, bool disableFlatten, int32_t slop = 0) {
     ApproxFlattenGuard flattenGuard(disableFlatten);
+    WholeMembershipPlanGuard wholeGuard;
     SkipStatsGuard statsGuard;
     int64_t posSeeksBefore = SkipStats::posSeeks;
     int64_t phraseVerifiesBefore = SkipStats::phraseVerifies;

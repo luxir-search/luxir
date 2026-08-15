@@ -805,20 +805,40 @@ public:
     }
 
     Query::Weight* wholeMembershipWeight = nullptr;
+    Query::Weight* wholeRankingWeight = nullptr;
     FilterCache::Use* wholeMembershipUse = nullptr;
+    float wholeConstantScore = 0.0f;
     bool pureCount = !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
         && !weight->needsPrepare() && filterWeights.empty();
-    if (pureCount) {
-      wholeMembershipWeight = weight;
-      bool everySegmentConstant = weight->matchesAllDocs();
+    bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
+        && exactCountTopK && !weight->needsPrepare()
+        && filterWeights.empty();
+    if (pureCount || wholeTopKCount) {
+      if (wholeTopKCount && countWeight != nullptr
+          && !countWeight->needsScores()
+          && !countWeight->allowsPruning()) {
+        wholeMembershipWeight = countWeight;
+      } else if (pureCount) {
+        wholeMembershipWeight = weight;
+      } else {
+        int32_t membershipFlags =
+            requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+        wholeMembershipWeight =
+            query->createWeight(*qcontext, membershipFlags);
+      }
+      assert(!wholeMembershipWeight->needsScores());
+      assert(!wholeMembershipWeight->allowsPruning());
+
+      bool everySegmentConstant = wholeMembershipWeight->matchesAllDocs();
       if (!everySegmentConstant) {
         everySegmentConstant = true;
         for (auto& segment : req.reader->segments()) {
           DocSet* rootDomain = segment.liveDocs() == nullptr
               ? nullptr : &segment.liveDocs()->docset();
-          if (!weight->constantCount(segment, rootDomain).has_value()) {
+          if (!wholeMembershipWeight->constantCount(
+                  segment, rootDomain).has_value()) {
             everySegmentConstant = false;
             break;
           }
@@ -829,12 +849,47 @@ public:
         wholeMembershipUse = qcontext->getFilterUse(
             *query, FilterCache::AdmissionLane::WHOLE);
       }
+      if (!everySegmentConstant && wholeMembershipUse == nullptr) {
+        wholeMembershipWeight = nullptr;
+      }
+
+      if (wholeTopKCount && wholeMembershipWeight != nullptr
+          && !weight->isConstantScoring()) {
+        Query::Weight* countFreeRankingWeight = rankingWeight;
+        if (countFreeRankingWeight == nullptr) {
+          int32_t rankingFlags =
+              requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
+          countFreeRankingWeight =
+              query->createWeight(*qcontext, rankingFlags);
+        }
+        bool reroute = foldFilters
+            && !countFreeRankingWeight->needsPrepare()
+            && TopDocsReq::admitSparseFilteredTopK(
+                *countFreeRankingWeight, *req.reader, limit);
+        if (reroute) {
+          bool unionFamily = countFreeRankingWeight->sparseFilteredTopKFamily()
+              == Query::Weight::SparseFilteredTopKFamily::UNION;
+          wholeRankingWeight = weight;
+          skipCount(SkipStats::sparseFilteredTopKReroutes);
+          if (unionFamily) {
+            skipCount(SkipStats::sparseFilteredTopKUnionReroutes);
+          }
+        } else {
+          wholeRankingWeight = countFreeRankingWeight;
+        }
+      } else if (wholeTopKCount && wholeMembershipWeight != nullptr) {
+        Query::ScoreProfile profile = query->scoreProfile();
+        if (profile.kind != Query::ScoreProfile::Kind::VARIABLE) {
+          wholeConstantScore = profile.value;
+        }
+      }
     }
 
     auto* qr = luxir::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *qcontext, query, weight,
       countWeight, rankingWeight, limit, std::move(parsedSorts),
-      requirements, wholeMembershipWeight, wholeMembershipUse,
+      requirements, wholeMembershipWeight, wholeRankingWeight,
+      wholeMembershipUse, wholeConstantScore,
       filters, filterWeights, domainQuery, domainQueryWeight,
       domainFilterWeights);
 

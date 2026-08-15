@@ -153,8 +153,8 @@ class DocSetScorer final : public Query::ConstantScorer {
   }
 
 public:
-  DocSetScorer(DocSet* docs, int32_t maxDoc)
-      : ConstantScorer(0.0f), docs(docs), maxDoc(maxDoc) {
+  DocSetScorer(DocSet* docs, int32_t maxDoc, float score = 0.0f)
+      : ConstantScorer(score), docs(docs), maxDoc(maxDoc) {
     if (docs->type == DocSet::ARRAY) {
       arrDocs = ((ArrDocSet*)docs)->docs();
     }
@@ -219,9 +219,10 @@ public:
 };
 
 inline Query::Scorer* createDocSetScorer(MemPool& targetPool, DocSet* docs,
-                                         IndexReader::Segment& segment) {
+                                         IndexReader::Segment& segment,
+                                         float score = 0.0f) {
   if (docs == nullptr || docs->card() == 0) return nullptr;
-  return targetPool.make<DocSetScorer>(docs, segment.maxDoc());
+  return targetPool.make<DocSetScorer>(docs, segment.maxDoc(), score);
 }
 
 // Supplier over a pre-materialized filter domain (a prepared boolean's per-segment
@@ -530,6 +531,11 @@ struct WholeMembershipResult {
   int64_t count = 0;
 };
 
+enum class WholeMembershipConsumer : uint8_t {
+  COUNT,
+  TOP_K_COUNT,
+};
+
 // Request-owned whole-query membership fact. Constant counts precede cache
 // traffic; cache values remain raw and the incoming effective domain is
 // composed once at the Use boundary.
@@ -539,6 +545,12 @@ class WholeMembershipPlan {
   std::shared_ptr<FilterCache::UseRegistry> lifetime;
   PreparedDomainDependence domainDependence =
       PreparedDomainDependence::QUERY_CANONICAL;
+  WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT;
+
+  void record(int64_t& countCounter, int64_t& topKCountCounter) const {
+    skipCount(consumer == WholeMembershipConsumer::COUNT
+        ? countCounter : topKCountCounter);
+  }
 
 public:
   WholeMembershipPlan() = default;
@@ -547,12 +559,21 @@ public:
       Query::Weight& weight, FilterCache::Use* cacheUse,
       std::shared_ptr<FilterCache::UseRegistry> lifetime,
       PreparedDomainDependence domainDependence =
-          PreparedDomainDependence::QUERY_CANONICAL)
+          PreparedDomainDependence::QUERY_CANONICAL,
+      WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT)
     : weight(&weight), cacheUse(cacheUse), lifetime(std::move(lifetime)),
-      domainDependence(domainDependence) {}
+      domainDependence(domainDependence), consumer(consumer) {}
 
   bool empty() const { return weight == nullptr; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
+  bool isTopKCount() const {
+    return consumer == WholeMembershipConsumer::TOP_K_COUNT;
+  }
+
+  void recordFallbackSupplier() const {
+    record(SkipStats::wholeCountFallbackSuppliers,
+           SkipStats::wholeTopKCountFallbackSuppliers);
+  }
 
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,
@@ -561,7 +582,8 @@ public:
 
     auto constant = weight->constantCount(segment, incomingDomain);
     if (constant.has_value()) {
-      skipCount(SkipStats::wholeCountConstant);
+      record(SkipStats::wholeCountConstant,
+             SkipStats::wholeTopKCountConstant);
       return {true, {}, *constant};
     }
     if (cacheUse == nullptr) return {};
@@ -571,7 +593,7 @@ public:
       DocSet* docs = cacheUse->effectiveDocSet(
           (size_t) segment.ord, reader, incomingDomain);
       if (docs == nullptr) return {};
-      skipCount(SkipStats::wholeCountHits);
+      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits);
       return {
         true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
       };
@@ -590,7 +612,7 @@ public:
       DocSet* docs = cacheUse->effectiveDocSet(
           (size_t) segment.ord, reader, incomingDomain);
       if (docs == nullptr) return {};
-      skipCount(SkipStats::wholeCountBuilds);
+      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds);
       return {
         true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
       };
@@ -598,7 +620,8 @@ public:
 
     // Probe destruction releases RequestSlot::resolving before the caller
     // constructs and streams its ordinary fallback supplier.
-    skipCount(SkipStats::wholeCountBypasses);
+    record(SkipStats::wholeCountBypasses,
+           SkipStats::wholeTopKCountBypasses);
     return {};
   }
 };

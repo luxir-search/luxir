@@ -310,6 +310,66 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*lreq));
 }
 
+TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
+  CollectionHelper h("main");
+  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  ASSERT_TRUE(h.indexAll(
+      {flatdoc("id", "a", "foo_w", "alpha beta", "keep_s", "yes"),
+       flatdoc("id", "b", "foo_w", "alpha beta", "keep_s", "no"),
+       flatdoc("id", "c", "foo_w", "alpha", "keep_s", "yes"),
+       flatdoc("id", "d", "foo_w", "alpha beta", "keep_s", "yes")},
+      UpdateMessage::COMMIT).success);
+
+  auto rankedQuery = [](std::pmr::memory_resource& mr) {
+    return qb::boolean(
+        mr, {qb::match(mr, "foo_w", "alpha"),
+             qb::match(mr, "foo_w", "beta")});
+  };
+  for (int round = 0; round < 3; round++) {
+    auto warm = localReq(luxirNode->getSearchEngine());
+    warm->collection("main");
+    auto& topDocs = warm->topDocs("q").getNumber().getScores()
+        .fields({"id"}).limit(10);
+    topDocs.rawQuery() = rankedQuery(topDocs.mr());
+    warm->execute(false);
+    ASSERT_OK(warm);
+    EXPECT_EQ(3, warm->getMatchCount("q"));
+  }
+
+  auto lreq = localReq(luxirNode->getSearchEngine());
+  lreq->collection("main");
+  auto& fusion =
+      lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.get_number = true;
+  addField(fusion, "id", mr);
+  fusion.rrf.emplace().k = 60;
+
+  auto& source = addSource(fusion, "ranked", mr);
+  source.limit = 10;
+  source.get_number = true;
+  source.get_scores = true;
+  source.query = arenaQuery(mr, rankedQuery(mr));
+  addNamedFilter(
+      fusion.filter, "keep", qb::match(mr, "keep_s", "yes"), mr);
+
+  bool saved = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  lreq->execute(false);
+  int64_t wholeHits = SkipStats::wholeTopKCountHits;
+  int64_t wholeBuilds = SkipStats::wholeTopKCountBuilds;
+  int64_t wholeBypasses = SkipStats::wholeTopKCountBypasses;
+  SkipStats::enabled = saved;
+  ASSERT_OK(lreq);
+  EXPECT_EQ(1, wholeHits);
+  EXPECT_EQ(0, wholeBuilds);
+  EXPECT_EQ(0, wholeBypasses);
+  EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*lreq));
+}
+
 TEST_F(FusionOpTest, sharedKnnFilter) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), luxir::api::VectorMetric::L2);

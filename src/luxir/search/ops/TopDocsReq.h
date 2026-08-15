@@ -152,6 +152,8 @@ public:
   Query::Weight* weight;
   Query::Weight* countWeight;
   Query::Weight* rankingWeight;
+  Query::Weight* wholeRankingWeight;
+  float wholeConstantScore;
   int64_t topCount; // maximum number of docs to return.
   std::span<std::pair<std::string_view, Query*>> filters;
   std::span<Query::Weight*> filterWeights;
@@ -373,14 +375,12 @@ public:
       return true;
     }
 
-    void countThenCollectTopK(
-        MemPool& pool, int32_t segnum, BulkScorer* countBulk,
+    void collectKnownCountTopK(
+        MemPool& pool, int32_t segnum, int64_t count,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
-        DocSetBuilder* builder, TopDocsCollector& collector,
+        TopDocsCollector& collector,
         int32_t maxDoc, bool allowPruning,
         BulkScorer* exactScorer = nullptr) {
-      int64_t count = countMatchesWindowed(
-          countBulk, collectorFilter, builder, maxDoc);
       int64_t before = collector.totalHits();
       if (rankingSupplier != nullptr) {
         Query::ScorerSupplier::BulkScorerContext bulkContext;
@@ -413,6 +413,19 @@ public:
       int64_t ranked = collector.totalHits() - before;
       assert(count >= ranked);
       collector.hitCount += count - ranked;
+    }
+
+    void countThenCollectTopK(
+        MemPool& pool, int32_t segnum, BulkScorer* countBulk,
+        Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
+        DocSetBuilder* builder, TopDocsCollector& collector,
+        int32_t maxDoc, bool allowPruning,
+        BulkScorer* exactScorer = nullptr) {
+      int64_t count = countMatchesWindowed(
+          countBulk, collectorFilter, builder, maxDoc);
+      collectKnownCountTopK(
+          pool, segnum, count, rankingSupplier, collectorFilter,
+          collector, maxDoc, allowPruning, exactScorer);
     }
 
     bool composeVariableScoreExactCountTopK(
@@ -667,12 +680,14 @@ public:
               *op.req.reader, seg, domain);
         }
         bool wholeCountAvailable = wholeCountResult.available;
+        bool wholeTopKCountAvailable = wholeCountAvailable
+            && op.wholeMembershipPlan.isTopKCount();
         bool wholeFallbackSupplierPending =
             !wholeCountAvailable && op.wholeMembershipPlan.hasCacheUse();
         auto obtainMainSupplier = [&]() {
           if (supplier == nullptr) {
             if (wholeFallbackSupplierPending) {
-              skipCount(SkipStats::wholeCountFallbackSuppliers);
+              op.wholeMembershipPlan.recordFallbackSupplier();
               wholeFallbackSupplierPending = false;
             }
             supplier = mainScorerSupplier(poolGuard.pool(), seg);
@@ -699,16 +714,56 @@ public:
           }
         }
         bool identityResult =
-            (wholeCountAvailable || exactDomain || matchEverything
+            ((wholeCountAvailable && !wholeTopKCountAvailable)
+             || exactDomain || matchEverything
              || borrowedDomain != nullptr)
             && (rankFromDocOrder || data->topCount() == 0);
 
         std::optional<DocSetBuilder> builder;
-        if (output.size() > 0 && !identityResult) {
+        if (output.size() > 0 && !identityResult
+            && !wholeTopKCountAvailable) {
           builder.emplace(seg.maxDoc());
         }
 
-        if (identityResult) {
+        if (wholeTopKCountAvailable) {
+          assert(rankFromDocOrder);
+          assert(data->scoreCollector->topCount > 0);
+          if (op.weight->isConstantScoring()) {
+            int64_t ranked = 0;
+            if (wholeCountResult.count > 0) {
+              Query::Scorer* scorer = nullptr;
+              DocSet* collectorFilter = domain;
+              if (wholeCountResult.docs.get() != nullptr) {
+                scorer = QueryPrep::createDocSetScorer(
+                    poolGuard.pool(), wholeCountResult.docs.get(), seg,
+                    op.wholeConstantScore);
+                collectorFilter = nullptr;
+              } else {
+                auto* rankingSupplier = obtainMainSupplier();
+                if (rankingSupplier != nullptr) {
+                  scorer = buildBoundedConstantScorer(
+                      poolGuard.pool(), *rankingSupplier, collectorFilter,
+                      data->scoreCollector->topCount);
+                }
+              }
+              if (scorer != nullptr) {
+                ranked = collectFirstKConstant(
+                    segnum, scorer, collectorFilter,
+                    *data->scoreCollector, data->scoreCollector->topCount);
+              }
+            }
+            assert(wholeCountResult.count >= ranked);
+            data->addHits(wholeCountResult.count - ranked);
+          } else {
+            assert(op.wholeRankingWeight != nullptr);
+            auto* rankingSupplier = op.wholeRankingWeight->scorerSupplier(
+                poolGuard.pool(), seg);
+            collectKnownCountTopK(
+                poolGuard.pool(), segnum, wholeCountResult.count,
+                rankingSupplier, domain, *data->scoreCollector,
+                seg.maxDoc(), op.wholeRankingWeight->allowsPruning());
+          }
+        } else if (identityResult) {
           DocSet* identityDomain = wholeCountAvailable
               ? wholeCountResult.docs.get()
               : exactDomain
@@ -1242,20 +1297,28 @@ public:
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
     SortPlan&& sortPlan, CollectionRequirements requirements,
     Query::Weight* wholeMembershipWeight,
+    Query::Weight* wholeRankingWeight,
     FilterCache::Use* wholeMembershipUse,
+    float wholeConstantScore,
     std::span<std::pair<std::string_view, Query*>> filters,
     std::span<Query::Weight*> filterWeights,
     Query* domainQuery, Query::Weight* domainQueryWeight,
     std::span<Query::Weight*> domainFilterWeights)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
       weight(weight), countWeight(countWeight), rankingWeight(rankingWeight),
+      wholeRankingWeight(wholeRankingWeight),
+      wholeConstantScore(wholeConstantScore),
       topCount(topCount), filters(filters), filterWeights(filterWeights),
       requirements(requirements),
       sortPlan(std::move(sortPlan)) {
     if (wholeMembershipWeight != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan(
           *wholeMembershipWeight, wholeMembershipUse,
-          qcontext.filterUses);
+          qcontext.filterUses,
+          PreparedDomainDependence::QUERY_CANONICAL,
+          requirements.needRankedDocs
+              ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
+              : QueryPrep::WholeMembershipConsumer::COUNT);
     }
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());

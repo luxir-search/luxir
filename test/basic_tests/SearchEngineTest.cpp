@@ -474,6 +474,102 @@ WholeCountRun runWholeCount(
   };
 }
 
+enum class WholeTopKFamily {
+  TERM,
+  INTERSECTION,
+  UNION,
+  PHRASE,
+  BOOSTED,
+};
+
+api::Query wholeTopKQuery(std::pmr::memory_resource& mr,
+                          WholeTopKFamily family,
+                          std::string_view key, bool constant) {
+  std::string a = std::string(key) + "a";
+  std::string b = std::string(key) + "b";
+  api::Query query;
+  switch (family) {
+    case WholeTopKFamily::TERM:
+      query = qb::match(mr, "body_w", a);
+      break;
+    case WholeTopKFamily::INTERSECTION:
+      query = qb::boolean(
+          mr, {qb::match(mr, "body_w", a),
+               qb::match(mr, "body_w", b)});
+      break;
+    case WholeTopKFamily::UNION:
+      query = qb::boolean(
+          mr, {}, {qb::match(mr, "body_w", a),
+                   qb::match(mr, "body_w", b)});
+      break;
+    case WholeTopKFamily::PHRASE:
+      query = qb::phraseText(mr, "body_w", a + " " + b);
+      break;
+    case WholeTopKFamily::BOOSTED:
+      query = qb::boost(mr, qb::match(mr, "body_w", a), 2.25f);
+      break;
+  }
+  return constant ? qb::constantScore(mr, query, 3.25f) : query;
+}
+
+struct WholeTopKRun {
+  int64_t found = 0;
+  std::vector<std::string> ids;
+  std::map<std::string, float> scores;
+  int64_t hits = 0;
+  int64_t builds = 0;
+  int64_t bypasses = 0;
+  int64_t constants = 0;
+  int64_t fallbackSuppliers = 0;
+  int64_t compositions = 0;
+  int64_t profitabilityRejects = 0;
+  int64_t bulkFallbacks = 0;
+  int64_t sparseReroutes = 0;
+  int64_t maxScoreOuterWindows = 0;
+  int64_t maxScoreBufferCompactions = 0;
+  int64_t maxScoreDeadOuterJumps = 0;
+};
+
+WholeTopKRun runWholeTopK(
+    SearchEngine& engine, std::string_view collection,
+    WholeTopKFamily family, std::string_view key, int64_t limit,
+    bool constant = false, bool exactCount = true) {
+  auto req = localReq(engine);
+  req->collection(collection);
+  auto& topDocs = req->topDocs("q").getScores().fields({"id"}).limit(limit);
+  if (exactCount) topDocs.getNumber();
+  topDocs.rawQuery() = wholeTopKQuery(
+      topDocs.mr(), family, key, constant);
+
+  SkipStatsGuard stats;
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  return {
+    exactCount ? req->getMatchCount("q") : -1,
+    resultIds(*req, "q"),
+    resultScoreMap(*req, "q"),
+    SkipStats::wholeTopKCountHits,
+    SkipStats::wholeTopKCountBuilds,
+    SkipStats::wholeTopKCountBypasses,
+    SkipStats::wholeTopKCountConstant,
+    SkipStats::wholeTopKCountFallbackSuppliers,
+    SkipStats::exactCountTopKCompositions,
+    SkipStats::exactCountTopKProfitabilityRejects,
+    SkipStats::exactCountTopKBulkFallbacks,
+    SkipStats::sparseFilteredTopKReroutes,
+    SkipStats::maxScoreOuterWindows,
+    SkipStats::maxScoreBufferCompactions,
+    SkipStats::maxScoreDeadOuterJumps,
+  };
+}
+
+void expectSameWholeTopK(const WholeTopKRun& expected,
+                         const WholeTopKRun& actual) {
+  EXPECT_EQ(expected.found, actual.found);
+  EXPECT_EQ(expected.ids, actual.ids);
+  expectSameScoreMap(expected.scores, actual.scores);
+}
+
 struct SparseFilteredTopKResult {
   std::vector<std::string> ids;
   std::map<std::string, float> scores;
@@ -482,6 +578,13 @@ struct SparseFilteredTopKResult {
   int64_t densityRejects;
   int64_t shapeRejects;
   int64_t disjunctionBatchScoreWindows;
+  int64_t wholeHits;
+  int64_t wholeBuilds;
+  int64_t wholeBypasses;
+  int64_t wholeFallbackSuppliers;
+  int64_t exactCompositions;
+  int64_t exactProfitabilityRejects;
+  int64_t exactBulkFallbacks;
 };
 
 void indexSparseFilteredTopKDocs(CollectionHelper& helper) {
@@ -526,6 +629,13 @@ SparseFilteredTopKResult runSparseFilteredTopK(
     SkipStats::sparseFilteredTopKDensityRejects,
     SkipStats::sparseFilteredTopKShapeRejects,
     SkipStats::filteredDisjBatchScoreWindows,
+    SkipStats::wholeTopKCountHits,
+    SkipStats::wholeTopKCountBuilds,
+    SkipStats::wholeTopKCountBypasses,
+    SkipStats::wholeTopKCountFallbackSuppliers,
+    SkipStats::exactCountTopKCompositions,
+    SkipStats::exactCountTopKProfitabilityRejects,
+    SkipStats::exactCountTopKBulkFallbacks,
   };
 }
 
@@ -1529,6 +1639,269 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
                  qb::match(mr, "body_w", "beta")});
       });
   EXPECT_EQ(8, fallback.found);
+  EXPECT_EQ(1, fallback.bypasses);
+  EXPECT_EQ(1, fallback.fallbackSuppliers);
+  EXPECT_EQ(0, fallback.builds + fallback.hits);
+  EXPECT_EQ(thrashSkips + 1, cache->counters().thrashBuildSkips);
+}
+
+TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
+  constexpr std::string_view enabledCollection = "whole_topk_count_matrix";
+  constexpr std::string_view disabledCollection =
+      "whole_topk_count_matrix_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  auto cache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  enabled.getIndexWriter()->filterCache = cache;
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+
+  struct Case {
+    WholeTopKFamily family;
+    int64_t limit;
+    bool constant;
+    std::string key;
+  };
+  std::vector<Case> cases;
+  for (WholeTopKFamily family :
+       {WholeTopKFamily::TERM, WholeTopKFamily::INTERSECTION,
+        WholeTopKFamily::UNION, WholeTopKFamily::PHRASE,
+        WholeTopKFamily::BOOSTED}) {
+    for (int64_t limit : {10, 100, 1000}) {
+      for (bool constant : {false, true}) {
+        cases.push_back({
+          family, limit, constant,
+          "s3" + std::to_string(cases.size()) + "x"
+        });
+      }
+    }
+  }
+
+  std::vector<Doc> docs;
+  std::vector<std::string> deleted;
+  for (int32_t doc = 0; doc < 1100; doc++) {
+    std::string body = "filler";
+    for (const Case& testCase : cases) {
+      std::string a = testCase.key + "a";
+      std::string b = testCase.key + "b";
+      auto append = [&](const std::string& token) {
+        body += " ";
+        body += token;
+      };
+      switch (testCase.family) {
+        case WholeTopKFamily::TERM:
+        case WholeTopKFamily::BOOSTED:
+          if ((doc & 1) == 0) append(a);
+          break;
+        case WholeTopKFamily::INTERSECTION:
+          if ((doc & 1) == 0) append(a);
+          if ((doc % 3) == 0) append(b);
+          break;
+        case WholeTopKFamily::UNION:
+          if ((doc & 1) == 0) append(a);
+          if ((doc % 5) == 0) append(b);
+          break;
+        case WholeTopKFamily::PHRASE:
+          if ((doc % 4) == 0) {
+            append(a);
+            append(b);
+          } else if ((doc % 7) == 0) {
+            append(a);
+            append("gap");
+            append(b);
+          }
+          break;
+      }
+    }
+    std::string id = "matrix_" + std::to_string(doc);
+    docs.push_back(flatdoc("id", id, "body_w", body));
+    if ((doc % 97) == 0) deleted.push_back(id);
+  }
+  ASSERT_TRUE(enabled.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(disabled.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(enabled.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(disabled.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  for (const Case& testCase : cases) {
+    SCOPED_TRACE(testCase.key);
+    WholeTopKRun offA = runWholeTopK(
+        disabled.getSearchEngine(), disabledCollection,
+        testCase.family, testCase.key, testCase.limit,
+        testCase.constant);
+    WholeTopKRun offB = runWholeTopK(
+        disabled.getSearchEngine(), disabledCollection,
+        testCase.family, testCase.key, testCase.limit,
+        testCase.constant);
+    expectSameWholeTopK(offA, offB);
+    EXPECT_EQ(0, offA.hits + offA.builds + offA.bypasses
+                     + offA.constants + offA.fallbackSuppliers);
+
+    WholeTopKRun bypass = runWholeTopK(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.family, testCase.key, testCase.limit,
+        testCase.constant);
+    WholeTopKRun build = runWholeTopK(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.family, testCase.key, testCase.limit,
+        testCase.constant);
+    WholeTopKRun hit = runWholeTopK(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.family, testCase.key, testCase.limit,
+        testCase.constant);
+    expectSameWholeTopK(offA, bypass);
+    expectSameWholeTopK(offA, build);
+    expectSameWholeTopK(offA, hit);
+    EXPECT_EQ(1, bypass.bypasses);
+    EXPECT_EQ(1, bypass.fallbackSuppliers);
+    EXPECT_EQ(1, build.builds);
+    EXPECT_EQ(1, hit.hits);
+    EXPECT_EQ(0, build.fallbackSuppliers);
+    EXPECT_EQ(0, hit.fallbackSuppliers);
+  }
+  EXPECT_EQ(cases.size(), cache->entryCountForTest());
+}
+
+TEST_F(SearchEngineTest, wholeTopKCountConstantGateAndLimitOnlyStayCacheFree) {
+  constexpr std::string_view collection = "whole_topk_count_o1";
+  CollectionHelper helper(collection);
+  auto cache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 64; doc++) {
+    docs.push_back(flatdoc(
+        "id", "o1_" + std::to_string(doc), "body_w",
+        (doc & 1) == 0 ? "s3o1a" : "other",
+        "group_s", (doc % 3) == 0 ? "a" : "b"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  WholeTopKRun exact = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::TERM,
+      "s3o1", 10);
+  EXPECT_EQ(32, exact.found);
+  EXPECT_EQ(1, exact.constants);
+  EXPECT_EQ(0, exact.hits + exact.builds + exact.bypasses);
+  EXPECT_EQ(0u, cache->entryCountForTest());
+
+  WholeTopKRun limitOnly = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::TERM,
+      "s3o1", 10, false, false);
+  EXPECT_EQ(exact.ids, limitOnly.ids);
+  expectSameScoreMap(exact.scores, limitOnly.scores);
+  EXPECT_EQ(0, limitOnly.hits + limitOnly.builds + limitOnly.bypasses
+                   + limitOnly.constants + limitOnly.fallbackSuppliers);
+  EXPECT_EQ(0u, cache->entryCountForTest());
+
+  auto domainReq = localReq(helper.getSearchEngine());
+  domainReq->collection(collection);
+  auto& domainTopK = domainReq->topDocs("q").matchQuery(
+      "body_w", "s3o1a").getNumber().getScores().fields({"id"}).limit(10);
+  domainTopK.facet("groups", "group_s").limit(-1);
+  {
+    SkipStatsGuard stats;
+    domainReq->execute(false);
+    EXPECT_EQ(0, SkipStats::wholeTopKCountHits
+                     + SkipStats::wholeTopKCountBuilds
+                     + SkipStats::wholeTopKCountBypasses
+                     + SkipStats::wholeTopKCountConstant);
+  }
+  ASSERT_OK(domainReq);
+
+  auto sortedReq = localReq(helper.getSearchEngine());
+  sortedReq->collection(collection);
+  auto& sortedTopK = sortedReq->topDocs("q").matchQuery(
+      "body_w", "s3o1a").getNumber().fields({"id"}).limit(10);
+  qb::sort(sortedTopK, "id", qb::ASC);
+  {
+    SkipStatsGuard stats;
+    sortedReq->execute(false);
+    EXPECT_EQ(0, SkipStats::wholeTopKCountHits
+                     + SkipStats::wholeTopKCountBuilds
+                     + SkipStats::wholeTopKCountBypasses
+                     + SkipStats::wholeTopKCountConstant);
+  }
+  ASSERT_OK(sortedReq);
+}
+
+TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
+  constexpr std::string_view collection = "whole_topk_count_segments";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  std::vector<Doc> first;
+  std::vector<Doc> second;
+  for (int32_t doc = 0; doc < 24; doc++) {
+    first.push_back(flatdoc(
+        "id", "first_" + std::to_string(doc), "body_w",
+        (doc & 1) == 0 ? "s3sega s3segb" : "s3sega"));
+    second.push_back(flatdoc(
+        "id", "second_" + std::to_string(doc), "body_w", "other"));
+  }
+  ASSERT_TRUE(helper.indexAll(first, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(second, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(2u,
+            helper.getIndexWriter()->getIndexReader()->segments().size());
+
+  WholeTopKRun bypass = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
+      "s3seg", 10);
+  WholeTopKRun build = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
+      "s3seg", 10);
+  WholeTopKRun hit = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
+      "s3seg", 10);
+  EXPECT_EQ(12, hit.found);
+  expectSameWholeTopK(bypass, build);
+  expectSameWholeTopK(build, hit);
+  EXPECT_EQ(2, bypass.bypasses);
+  EXPECT_EQ(2, build.builds);
+  EXPECT_EQ(2, hit.hits);
+}
+
+TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
+  constexpr std::string_view collection = "whole_topk_count_backoff";
+  CollectionHelper helper(collection);
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .lowWatermarkBytes = 1,
+      .minSegmentDocs = 0,
+      .admissionThreshold = 1,
+  });
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 64; doc++) {
+    docs.push_back(flatdoc(
+        "id", "topk_backoff_" + std::to_string(doc), "body_w",
+        (doc % 4) == 0 ? "s3backa s3backb" : "s3backa"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  TermQuery a("body_w", "s3backa");
+  TermQuery b("body_w", "s3backb");
+  std::array<Query*, 2> required{&a, &b};
+  BooleanQuery query(required, {}, {}, {});
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  Query::Context context(
+      pool, *reader, {}, nullptr,
+      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = {}});
+  auto* weight = query.createWeight(context, 0);
+  auto* use = context.getFilterUse(
+      query, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan plan(
+      *weight, use, context.filterUses);
+  ASSERT_TRUE(plan.resolve(*reader, reader->segments()[0], nullptr).available);
+  cache->sweep();
+  ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
+
+  uint64_t thrashSkips = cache->counters().thrashBuildSkips;
+  WholeTopKRun fallback = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
+      "s3back", 10);
+  EXPECT_EQ(16, fallback.found);
   EXPECT_EQ(1, fallback.bypasses);
   EXPECT_EQ(1, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
@@ -2703,11 +3076,100 @@ TEST_F(SearchEngineTest, sparseFilteredTopKRerouteAdmitsConjunctionShapes) {
 
   auto exact = runSparseFilteredTopK(
       engine, collection, FilteredCountShape::TERM, "sparse", 10, true);
-  EXPECT_EQ(0, exact.reroutes);
+  EXPECT_EQ(1, exact.reroutes);
 
   auto unfiltered = runSparseFilteredTopK(
       engine, collection, FilteredCountShape::TERM, "", 10);
   EXPECT_EQ(0, unfiltered.reroutes);
+}
+
+TEST_F(SearchEngineTest,
+       wholeTopKCountHitPreservesFoldedSparseRankingDisposition) {
+  constexpr std::string_view collection =
+      "whole_topk_count_sparse_reroute";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  indexSparseFilteredTopKDocs(helper);
+  auto& engine = helper.getSearchEngine();
+
+  SparseFilteredTopKResult countFree = runSparseFilteredTopK(
+      engine, collection, FilteredCountShape::INTERSECTION,
+      "between", 100);
+  SparseFilteredTopKResult bypass = runSparseFilteredTopK(
+      engine, collection, FilteredCountShape::INTERSECTION,
+      "between", 100, true);
+  SparseFilteredTopKResult build = runSparseFilteredTopK(
+      engine, collection, FilteredCountShape::INTERSECTION,
+      "between", 100, true);
+  SparseFilteredTopKResult hit = runSparseFilteredTopK(
+      engine, collection, FilteredCountShape::INTERSECTION,
+      "between", 100, true);
+
+  EXPECT_EQ(countFree.ids, bypass.ids);
+  EXPECT_EQ(countFree.ids, build.ids);
+  EXPECT_EQ(countFree.ids, hit.ids);
+  expectSameScoreMap(countFree.scores, bypass.scores);
+  expectSameScoreMap(countFree.scores, build.scores);
+  expectSameScoreMap(countFree.scores, hit.scores);
+  EXPECT_EQ(1, countFree.reroutes);
+  EXPECT_EQ(1, bypass.reroutes);
+  EXPECT_EQ(1, build.reroutes);
+  EXPECT_EQ(1, hit.reroutes);
+  EXPECT_EQ(0, countFree.wholeHits + countFree.wholeBuilds
+                   + countFree.wholeBypasses);
+  EXPECT_EQ(1, bypass.wholeBypasses);
+  EXPECT_EQ(1, bypass.wholeFallbackSuppliers);
+  EXPECT_EQ(1, build.wholeBuilds);
+  EXPECT_EQ(1, hit.wholeHits);
+  EXPECT_EQ(0, hit.wholeFallbackSuppliers);
+}
+
+TEST_F(SearchEngineTest,
+       wholeTopKCountHitUsesCountFreeMaxScoreRankingAccounting) {
+  constexpr std::string_view collection = "whole_topk_count_max_score";
+  CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  std::vector<Doc> docs;
+  docs.reserve(2048);
+  for (int32_t doc = 0; doc < 2048; doc++) {
+    std::string body = "filler";
+    if ((doc & 1) == 0) body += " s3maxa";
+    if ((doc % 7) == 0) {
+      body += " s3maxb s3maxb s3maxb s3maxb";
+    }
+    docs.push_back(flatdoc(
+        "id", "max_" + std::to_string(doc), "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  WholeTopKRun bypass = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::UNION,
+      "s3max", 10);
+  WholeTopKRun build = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::UNION,
+      "s3max", 10);
+  WholeTopKRun hit = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::UNION,
+      "s3max", 10);
+  WholeTopKRun countFree = runWholeTopK(
+      helper.getSearchEngine(), collection, WholeTopKFamily::UNION,
+      "s3max", 10, false, false);
+
+  expectSameWholeTopK(bypass, build);
+  expectSameWholeTopK(build, hit);
+  EXPECT_EQ(countFree.ids, hit.ids);
+  expectSameScoreMap(countFree.scores, hit.scores);
+  EXPECT_EQ(1, hit.hits);
+  EXPECT_EQ(0, countFree.hits + countFree.builds
+                   + countFree.bypasses + countFree.constants);
+  EXPECT_GT(countFree.maxScoreOuterWindows, 0);
+  EXPECT_EQ(countFree.maxScoreOuterWindows, hit.maxScoreOuterWindows);
+  EXPECT_EQ(countFree.maxScoreBufferCompactions,
+            hit.maxScoreBufferCompactions);
+  EXPECT_EQ(countFree.maxScoreDeadOuterJumps,
+            hit.maxScoreDeadOuterJumps);
 }
 
 TEST_F(SearchEngineTest,
@@ -2934,6 +3396,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
   };
   auto run = [&](bool disabled) {
     FilteredDisjunctionBatchGuard guard(disabled);
+    WholeMembershipPlanGuard wholeGuard(true);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& cur = req->topDocs("q").getNumber().withStats()
@@ -2977,6 +3440,11 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   constexpr std::string_view collection = "exact_count_topk_composition";
   constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
   CollectionHelper helper(collection);
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{
+        .minSegmentDocs = 0,
+        .admissionThreshold = 100,
+      });
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -3004,6 +3472,7 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
     int64_t count;
     int64_t compositions;
     int64_t sparseSinglePassRejects;
+    int64_t wholeBypasses;
   };
   auto run = [&](std::string_view filter, bool disableSparseDecision) {
     TopKCountCompositionGuard compositionGuard(
@@ -3027,6 +3496,7 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
       req->getMatchCount("q"),
       SkipStats::exactCountTopKCompositions,
       SkipStats::exactCountTopKSparseFilterSinglePassRejects,
+      SkipStats::wholeTopKCountBypasses,
     };
   };
 
@@ -3037,13 +3507,16 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   EXPECT_EQ(forcedComposition.scores, singlePass.scores);
   EXPECT_EQ(0, singlePass.compositions);
   EXPECT_GT(singlePass.sparseSinglePassRejects, 0);
+  EXPECT_EQ(1, singlePass.wholeBypasses);
   EXPECT_GT(forcedComposition.compositions, 0);
   EXPECT_EQ(0, forcedComposition.sparseSinglePassRejects);
+  EXPECT_EQ(1, forcedComposition.wholeBypasses);
 
   Result equalCosts = run("equal", false);
   EXPECT_EQ(60, equalCosts.count);
   EXPECT_GT(equalCosts.compositions, 0);
   EXPECT_EQ(0, equalCosts.sparseSinglePassRejects);
+  EXPECT_EQ(1, equalCosts.wholeBypasses);
 }
 
 TEST_F(SearchEngineTest,
@@ -3077,6 +3550,7 @@ TEST_F(SearchEngineTest,
     int64_t compositions;
   };
   auto run = [&](bool disableComposition) {
+    WholeMembershipPlanGuard wholeGuard(true);
     TopKCountCompositionGuard compositionGuard(
         disableComposition,
         TopDocsReq::kExactCountTopKMinCandidateDensityInverse);
@@ -3826,6 +4300,7 @@ ConstantTopKRun runConstantConjTopK(SearchEngine& engine, int64_t limit,
   ConstantTopKRun run;
   {
     SkipStatsGuard stats;
+    WholeMembershipPlanGuard wholeGuard(true);
     OldConstantShapeGuard shape(oldShape);
     req->execute(false);
     run.captures = SkipStats::constantWindowCaptures;

@@ -12,6 +12,7 @@
 
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
@@ -62,6 +63,18 @@ struct SkipStatsGuard {
   ~SkipStatsGuard() {
     SkipStats::enabled = saved;
     SkipStats::reset();
+  }
+};
+
+struct WholeMembershipPlanGuard {
+  bool saved = QueryPrep::disableWholeMembershipPlanForTests;
+
+  WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = true;
+  }
+
+  ~WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = saved;
   }
 };
 
@@ -219,6 +232,7 @@ public:
 
   RequestRun runScoredConjunction(bool disabled) {
     DisjTwoPhaseGuard disjGuard(disabled);
+    WholeMembershipPlanGuard wholeGuard;
     SkipStatsGuard statsGuard;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
@@ -322,6 +336,7 @@ public:
 
   RequestRun runProhibited(bool disabled) {
     DisjTwoPhaseGuard disjGuard(disabled);
+    WholeMembershipPlanGuard wholeGuard;
     SkipStatsGuard statsGuard;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
