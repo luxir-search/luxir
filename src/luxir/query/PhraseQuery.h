@@ -33,6 +33,7 @@ public:
     static inline bool disableRepeatDedupForTests = false;
     static inline bool disableRawBoundsForTests = false;
     static inline bool disableCompetitiveBlocksForTests = false;
+    static inline bool disableSloppyGallopForTests = false;
   };
 
   struct RepeatGroup {
@@ -858,6 +859,35 @@ public:
       return true;
     }
 
+    // advanceSlot for nextMatch's walk: hop the active slot over positions
+    // that can neither cross capturedSecond nor land within slop of
+    // endPosition. Candidate lengths shrink monotonically as the active slot
+    // approaches endPosition, so skipped positions all carry lengths above
+    // slop - the emission test ignores them and they can never set an
+    // emitted matchLength. The capturedSecond+1 cap keeps every crossing
+    // position visited. Repeat-group slots pull from a shared buffer and
+    // keep the stepwise walk.
+    template<class S>
+    bool advanceSlotGallop(S& scorer, int32_t slot, int64_t capturedSecond) {
+      if (scorer.slotGroup[(size_t) slot] >= 0
+          || ScorerControls::disableSloppyGallopForTests) {
+        return advanceSlot(scorer, slot);
+      }
+      int64_t targetRebased = std::min(
+          endPosition - (int64_t) slop, capturedSecond + 1);
+      int64_t targetActual =
+          targetRebased + (int64_t) scorer.positions[(size_t) slot];
+      if (targetActual <= (int64_t) actual[(size_t) slot] + 1) {
+        return advanceSlot(scorer, slot);
+      }
+      int32_t position = scorer.slotPosEnums[(size_t) slot]->advancePosition(
+          (int32_t) std::min(targetActual,
+                             (int64_t) PostingsReader::END - 1));
+      if (position == PostingsReader::END) return false;
+      setPosition(scorer, slot, position);
+      return true;
+    }
+
     template<class S>
     int32_t collidingSlot(const S& scorer, int32_t slot) const {
       int32_t group = scorer.slotGroup[(size_t) slot];
@@ -942,7 +972,13 @@ public:
       auto [activeStart, capturedSecond] = minAndCapturedSecond(scorer);
       int32_t active = activeStart;
       matchLength = endPosition - rebased[(size_t) active];
-      while (advanceSlot(scorer, active)) {
+      for (;;) {
+        // Skipping is only possible while the walk is outside the slop zone,
+        // so the in-zone steady state pays one comparison, not a gallop probe.
+        bool advanced = matchLength > (int64_t) slop
+            ? advanceSlotGallop(scorer, active, capturedSecond)
+            : advanceSlot(scorer, active);
+        if (!advanced) break;
         if (!resolveCollisions(scorer, active)) break;
         if (rebased[(size_t) active] > capturedSecond) {
           if (matchLength <= (int64_t) slop) return true;
@@ -1285,6 +1321,8 @@ public:
     static inline bool& disableRawBoundsForTests = ScorerControls::disableRawBoundsForTests;
     static inline bool& disableCompetitiveBlocksForTests =
         ScorerControls::disableCompetitiveBlocksForTests;
+    static inline bool& disableSloppyGallopForTests =
+        ScorerControls::disableSloppyGallopForTests;
 
     static float roundUpToFloat(int64_t value) {
       float rounded = (float) value;

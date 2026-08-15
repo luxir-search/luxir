@@ -392,3 +392,50 @@ TEST_F(PhraseSlopTest, multiValueGapCrossesAtOneHundred) {
   EXPECT_EQ(1u, runPhrase(index, context, terms, positions, 100, false, "body_mv").size());
   EXPECT_EQ(1u, runPhrase(index, context, terms, positions, 101, false, "body_mv").size());
 }
+
+// The far-position gallop is an internal permutation of the sloppy walk:
+// hits, score bits, and freqs must be identical with it disabled. Long docs
+// with a dense term throughout and sparse anchors exercise the skip on every
+// candidate; the repeated-term case covers mixed group/non-group slots.
+TEST_F(PhraseSlopTest, gallopMatchesStepwiseWalk) {
+  std::mt19937 rng(0x6A110Fu);
+  TestIndex index;
+  TestField field(index, "body_w");
+  field.startIndexing();
+  for (int32_t doc = 0; doc < 120; doc++) {
+    int32_t len = 200 + (int32_t) (rng() % 300);
+    std::string text;
+    for (int32_t i = 0; i < len; i++) {
+      if (!text.empty()) text.push_back(' ');
+      uint32_t r = rng() % 100;
+      if (r < 45) text += "the";
+      else if (r < 48) text += "rare";
+      else if (r < 60) text += "mid";
+      else text += "pad";
+    }
+    field.add(doc, text);
+  }
+  index.flush();
+  field.startReading();
+  auto scope = index.pool.rewindScopeGuard();
+  Query::Context context(index.pool, *index.reader);
+
+  std::vector<std::string_view> cases[] = {
+      {"rare", "the"},
+      {"the", "rare"},
+      {"rare", "mid", "the"},
+      {"the", "rare", "the"},
+  };
+  for (auto& terms : cases) {
+    std::vector<int32_t> offsets;
+    for (int32_t i = 0; i < (int32_t) terms.size(); i++) offsets.push_back(i);
+    for (int32_t slop : {1, 3, 9}) {
+      auto gallop = runPhrase(index, context, terms, offsets, slop);
+      PhraseQuery::SloppyScorer::disableSloppyGallopForTests = true;
+      auto stepwise = runPhrase(index, context, terms, offsets, slop);
+      PhraseQuery::SloppyScorer::disableSloppyGallopForTests = false;
+      EXPECT_FALSE(gallop.empty()) << terms[0] << " slop=" << slop;
+      EXPECT_EQ(stepwise, gallop) << terms[0] << " slop=" << slop;
+    }
+  }
+}
