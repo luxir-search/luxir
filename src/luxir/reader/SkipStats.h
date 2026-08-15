@@ -256,6 +256,7 @@ struct SkipStats {
   static inline int64_t wholeFieldSortHits = 0;
   static inline int64_t wholeFieldSortBuilds = 0;
   static inline int64_t wholeFieldSortBypasses = 0;
+  static inline int64_t wholeFieldSortRoutingBypasses = 0;
   static inline int64_t wholeFieldSortConstant = 0;
   static inline int64_t wholeFieldSortFallbackSuppliers = 0;
   static inline int64_t wholeFieldSortBestFirstActivations = 0;
@@ -499,6 +500,7 @@ struct SkipStats {
     wholeFieldSortHits = 0;
     wholeFieldSortBuilds = 0;
     wholeFieldSortBypasses = 0;
+    wholeFieldSortRoutingBypasses = 0;
     wholeFieldSortConstant = 0;
     wholeFieldSortFallbackSuppliers = 0;
     wholeFieldSortBestFirstActivations = 0;

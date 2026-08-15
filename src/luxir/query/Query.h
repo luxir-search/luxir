@@ -367,6 +367,16 @@ public:
     UNKNOWN,
   };
 
+  // Economic shape of membership production. Unlike reportedTwoPhase, this
+  // survives a compound scorer that internalizes child verification behind
+  // next()/advance() and therefore reports a single-phase outer protocol.
+  enum class VerificationWork : uint8_t {
+    PRESENT,
+    PARTIAL,
+    ABSENT,
+    UNKNOWN,
+  };
+
   enum class ClauseShape : uint8_t {
     DIRECT,
     FLAT_DISJUNCTION,
@@ -497,6 +507,13 @@ public:
   // Unknown and custom queries are conservatively variable-scoring.
   virtual ScoreProfile scoreProfile() const { return ScoreProfile::variable(); }
 
+  // Query-tree fact used when the consumer cannot gain a segment-specific
+  // best-first route. Definite PRESENT must mean membership production has
+  // verification work that a materialized whole-query set avoids.
+  virtual VerificationWork membershipVerificationWork() const {
+    return VerificationWork::UNKNOWN;
+  }
+
   // Structural membership key: the filter projection of this query, with
   // score-only state omitted. Consumers that need query identity, such as a
   // future request cache, must not reuse this method. Queries whose membership
@@ -618,6 +635,19 @@ public:
         const PlanContext& buildContext) const {
       unused(buildContext);
       return {};
+    }
+
+    virtual VerificationWork verificationWork(
+        const PlanContext& buildContext) const {
+      switch (describeScorer(buildContext).reportedTwoPhase) {
+        case ReportedTwoPhase::YES:
+          return VerificationWork::PRESENT;
+        case ReportedTwoPhase::NO:
+          return VerificationWork::ABSENT;
+        case ReportedTwoPhase::UNKNOWN:
+          return VerificationWork::UNKNOWN;
+      }
+      std::unreachable();
     }
 
     /// Resolve one exact construction arm into a pool-owned affine token.

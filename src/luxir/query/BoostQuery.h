@@ -23,6 +23,10 @@ public:
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
 
+  VerificationWork membershipVerificationWork() const override {
+    return child->membershipVerificationWork();
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);

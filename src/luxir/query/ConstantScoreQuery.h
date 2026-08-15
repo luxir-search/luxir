@@ -152,6 +152,9 @@ public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
   Query* getChild() const { return child; }
+  VerificationWork membershipVerificationWork() const override {
+    return child->membershipVerificationWork();
+  }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);

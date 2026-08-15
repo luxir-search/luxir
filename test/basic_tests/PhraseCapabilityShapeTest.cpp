@@ -4,7 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include "luxir/query/BooleanQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/TermQuery.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -64,6 +66,68 @@ TEST_F(PhraseCapabilityShapeTest, presentAndMissingTermsAreNonemptyAndEmpty) {
 
   EXPECT_EQ(Query::MatchState::EMPTY,
             shape(missingTerms, positions).matchState);
+}
+
+TEST_F(PhraseCapabilityShapeTest,
+       compoundKeepsNestedVerificationSeparateFromOuterProtocol) {
+  std::array<std::string_view, 2> phraseTerms{"common", "rare"};
+  std::array<int32_t, 2> positions{0, 1};
+  PhraseQuery phrase("body_w", phraseTerms, positions);
+  TermQuery rare("body_w", "rare");
+  std::array<Query*, 2> phraseRequired{&phrase, &rare};
+  BooleanQuery phraseConjunction(phraseRequired, {}, {}, {});
+  EXPECT_EQ(Query::VerificationWork::PRESENT,
+            phraseConjunction.membershipVerificationWork());
+
+  Query::Context phraseContext(pool, *reader);
+  auto* phraseWeight = phraseConjunction.createWeight(phraseContext, 0);
+  auto* phraseSupplier = phraseWeight->scorerSupplier(
+      pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, phraseSupplier);
+  auto phrasePlanContext = phraseSupplier->makePlanContext(
+      Query::Demand::fromLeadCost(phraseSupplier->cost()));
+  EXPECT_EQ(Query::ReportedTwoPhase::NO,
+            phraseSupplier->describeScorer(
+                phrasePlanContext).reportedTwoPhase);
+  EXPECT_EQ(Query::VerificationWork::PRESENT,
+            phraseSupplier->verificationWork(phrasePlanContext));
+
+  std::array<Query*, 2> phraseOptional{&phrase, &rare};
+  BooleanQuery phraseDisjunction({}, phraseOptional, {}, {});
+  EXPECT_EQ(Query::VerificationWork::PARTIAL,
+            phraseDisjunction.membershipVerificationWork());
+  Query::Context disjunctionContext(pool, *reader);
+  auto* disjunctionWeight = phraseDisjunction.createWeight(
+      disjunctionContext, 0);
+  auto* disjunctionSupplier = disjunctionWeight->scorerSupplier(
+      pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, disjunctionSupplier);
+  auto disjunctionPlanContext = disjunctionSupplier->makePlanContext(
+      Query::Demand::fromLeadCost(disjunctionSupplier->cost()));
+  EXPECT_EQ(Query::VerificationWork::PARTIAL,
+            disjunctionSupplier->verificationWork(
+                disjunctionPlanContext));
+
+  TermQuery common("body_w", "common");
+  std::array<Query*, 2> termRequired{&common, &rare};
+  BooleanQuery termConjunction(termRequired, {}, {}, {});
+  EXPECT_EQ(Query::VerificationWork::ABSENT,
+            termConjunction.membershipVerificationWork());
+  Query::Context termContext(pool, *reader);
+  auto* termWeight = termConjunction.createWeight(termContext, 0);
+  auto* termSupplier = termWeight->scorerSupplier(
+      pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, termSupplier);
+  auto termPlanContext = termSupplier->makePlanContext(
+      Query::Demand::fromLeadCost(termSupplier->cost()));
+  EXPECT_EQ(Query::ReportedTwoPhase::NO,
+            termSupplier->describeScorer(
+                termPlanContext).reportedTwoPhase);
+  EXPECT_EQ(Query::ClauseShape::FLAT_CONJUNCTION,
+            termSupplier->describeScorer(
+                termPlanContext).termConjunctionClause);
+  EXPECT_EQ(Query::VerificationWork::ABSENT,
+            termSupplier->verificationWork(termPlanContext));
 }
 
 TEST_F(PhraseCapabilityShapeTest,

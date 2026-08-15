@@ -547,6 +547,7 @@ class WholeMembershipPlan {
   PreparedDomainDependence domainDependence =
       PreparedDomainDependence::QUERY_CANONICAL;
   WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT;
+  std::span<const uint8_t> fieldSortCacheRoutes;
 
   void record(int64_t& countCounter, int64_t& topKCountCounter,
               int64_t& fieldSortCounter) const {
@@ -571,9 +572,11 @@ public:
       std::shared_ptr<FilterCache::UseRegistry> lifetime,
       PreparedDomainDependence domainDependence =
           PreparedDomainDependence::QUERY_CANONICAL,
-      WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT)
+      WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT,
+      std::span<const uint8_t> fieldSortCacheRoutes = {})
     : weight(&weight), cacheUse(cacheUse), lifetime(std::move(lifetime)),
-      domainDependence(domainDependence), consumer(consumer) {}
+      domainDependence(domainDependence), consumer(consumer),
+      fieldSortCacheRoutes(fieldSortCacheRoutes) {}
 
   bool empty() const { return weight == nullptr; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
@@ -590,6 +593,11 @@ public:
            SkipStats::wholeFieldSortFallbackSuppliers);
   }
 
+  void recordRoutingBypass() const {
+    assert(consumer == WholeMembershipConsumer::FIELD_SORT);
+    skipCount(SkipStats::wholeFieldSortRoutingBypasses);
+  }
+
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,
       DocSet* incomingDomain) const {
@@ -601,6 +609,15 @@ public:
              SkipStats::wholeTopKCountConstant,
              SkipStats::wholeFieldSortConstant);
       return {true, {}, *constant};
+    }
+    // FIELD_SORT routing rejects a cache representation before probe(), so it
+    // neither records an admission sighting nor competes for cache capacity.
+    assert(fieldSortCacheRoutes.empty()
+           || (size_t)segment.ord < fieldSortCacheRoutes.size());
+    if (!fieldSortCacheRoutes.empty()
+        && fieldSortCacheRoutes[(size_t)segment.ord] == 0) {
+      recordRoutingBypass();
+      return {};
     }
     if (cacheUse == nullptr) return {};
 

@@ -595,6 +595,7 @@ struct WholeFieldSortRun {
   int64_t hits = 0;
   int64_t builds = 0;
   int64_t bypasses = 0;
+  int64_t routingBypasses = 0;
   int64_t constants = 0;
   int64_t fallbackSuppliers = 0;
   int64_t cachedBestFirst = 0;
@@ -609,7 +610,8 @@ WholeFieldSortRun runWholeFieldSort(
     std::string_view key, std::string_view sort,
     qb::SortDir direction, int64_t limit = 7,
     bool exactCount = true, bool getScores = false,
-    bool forceBestFirst = false, bool withSubOp = false) {
+    bool forceBestFirst = false, bool withSubOp = false,
+    bool twoPhase = false, bool optionalTwoPhase = false) {
   auto req = localReq(engine);
   req->collection(collection);
   auto& topDocs = req->topDocs("q").fields({"id"}).limit(limit);
@@ -617,9 +619,28 @@ WholeFieldSortRun runWholeFieldSort(
   if (getScores) topDocs.getScores();
   std::string a = std::string(key) + "a";
   std::string b = std::string(key) + "b";
-  topDocs.rawQuery() = qb::boolean(
-      topDocs.mr(), {qb::match(topDocs.mr(), "body_w", a),
-                     qb::match(topDocs.mr(), "body_w", b)});
+  if (optionalTwoPhase) {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {},
+        {qb::phraseText(topDocs.mr(), "body_w", a + " " + b),
+         qb::match(topDocs.mr(), "body_w", a)});
+  } else if (twoPhase) {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(),
+        {qb::phraseText(topDocs.mr(), "body_w", a + " " + b),
+         qb::match(topDocs.mr(), "body_w", a)});
+  } else if (forceBestFirst) {
+    // The forced tests exercise cache-backed best-first, so use a docs-only
+    // shape that is eligible for that route. The fixture terms co-occur, which
+    // keeps the result oracle identical to the ordinary conjunction shape.
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {}, {qb::match(topDocs.mr(), "body_w", a),
+                           qb::match(topDocs.mr(), "body_w", b)});
+  } else {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {qb::match(topDocs.mr(), "body_w", a),
+                       qb::match(topDocs.mr(), "body_w", b)});
+  }
   qb::sort(topDocs, sort, direction);
   if (withSubOp) topDocs.facet("groups", "group_s").limit(-1);
 
@@ -634,6 +655,7 @@ WholeFieldSortRun runWholeFieldSort(
     SkipStats::wholeFieldSortHits,
     SkipStats::wholeFieldSortBuilds,
     SkipStats::wholeFieldSortBypasses,
+    SkipStats::wholeFieldSortRoutingBypasses,
     SkipStats::wholeFieldSortConstant,
     SkipStats::wholeFieldSortFallbackSuppliers,
     SkipStats::wholeFieldSortBestFirstActivations,
@@ -665,7 +687,8 @@ void indexWholeFieldSortDocs(CollectionHelper& helper) {
     Membership{"s4scoresort", 2}, Membership{"s4scoreexpr", 2},
     Membership{"s4subop", 2}, Membership{"s4fusion", 2},
     Membership{"s4backoff", 2}, Membership{"s4multi", 2},
-    Membership{"s4doc", 2},
+    Membership{"s4doc", 2}, Membership{"s4gate", 2},
+    Membership{"s4phrase", 2},
   };
   for (int32_t segment = 0; segment < 2; segment++) {
     std::vector<Doc> docs;
@@ -2084,7 +2107,8 @@ TEST_F(SearchEngineTest,
         7, true, false, true);
     expectSameWholeFieldSort(offA, offB);
     EXPECT_EQ(0, offA.hits + offA.builds + offA.bypasses
-                     + offA.constants + offA.fallbackSuppliers);
+                     + offA.routingBypasses + offA.constants
+                     + offA.fallbackSuppliers);
 
     WholeFieldSortRun bypass = runWholeFieldSort(
         enabled.getSearchEngine(), enabledCollection,
@@ -2103,19 +2127,105 @@ TEST_F(SearchEngineTest,
     expectSameWholeFieldSort(offA, hit);
     ASSERT_TRUE(hit.found.has_value());
     EXPECT_EQ(testCase.found, *hit.found);
-    EXPECT_EQ(2, bypass.bypasses);
-    EXPECT_EQ(2, bypass.fallbackSuppliers);
-    EXPECT_EQ(2, build.builds);
-    EXPECT_EQ(2, hit.hits);
     if (testCase.bestFirst) {
+      EXPECT_EQ(2, bypass.bypasses);
+      EXPECT_EQ(2, bypass.fallbackSuppliers);
+      EXPECT_EQ(2, build.builds);
+      EXPECT_EQ(2, hit.hits);
+      EXPECT_EQ(0, bypass.routingBypasses + build.routingBypasses
+                       + hit.routingBypasses);
       EXPECT_EQ(2, build.cachedBestFirst);
       EXPECT_EQ(2, hit.cachedBestFirst);
       EXPECT_EQ(0, build.ladderFallbacks + hit.ladderFallbacks);
     } else {
+      // Definite docs-only shapes without a viable best-first plan never
+      // probe the cache; every request keeps the ordinary supplier route.
+      EXPECT_EQ(2, bypass.routingBypasses);
+      EXPECT_EQ(2, build.routingBypasses);
+      EXPECT_EQ(2, hit.routingBypasses);
+      EXPECT_EQ(0, bypass.bypasses + build.builds + hit.hits);
+      EXPECT_EQ(0, bypass.fallbackSuppliers + build.fallbackSuppliers
+                       + hit.fallbackSuppliers);
       EXPECT_EQ(0, build.cachedBestFirst + hit.cachedBestFirst);
-      EXPECT_EQ(2, build.ladderFallbacks);
-      EXPECT_EQ(2, hit.ladderFallbacks);
+      EXPECT_EQ(0, build.ladderFallbacks + hit.ladderFallbacks);
     }
+  }
+}
+
+TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
+  constexpr std::string_view enabledCollection = "whole_field_sort_gate";
+  constexpr std::string_view disabledCollection =
+      "whole_field_sort_gate_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  auto cache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  enabled.getIndexWriter()->filterCache = cache;
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+  indexWholeFieldSortDocs(enabled);
+  indexWholeFieldSortDocs(disabled);
+
+  auto offDocsOnly = runWholeFieldSort(
+      disabled.getSearchEngine(), disabledCollection,
+      "s4gate", "sort_s", qb::DESC);
+  auto countersBefore = cache->counters();
+  for (int round = 0; round < 3; round++) {
+    auto routed = runWholeFieldSort(
+        enabled.getSearchEngine(), enabledCollection,
+        "s4gate", "sort_s", qb::DESC);
+    expectSameWholeFieldSort(offDocsOnly, routed);
+    EXPECT_EQ(2, routed.routingBypasses);
+    EXPECT_EQ(0, routed.hits + routed.builds + routed.bypasses
+                     + routed.fallbackSuppliers + routed.cachedBestFirst
+                     + routed.ladderFallbacks);
+  }
+  auto countersAfter = cache->counters();
+  EXPECT_EQ(countersBefore.hits, countersAfter.hits);
+  EXPECT_EQ(countersBefore.misses, countersAfter.misses);
+  EXPECT_EQ(countersBefore.admissions, countersAfter.admissions);
+  EXPECT_EQ(countersBefore.buildAttempts, countersAfter.buildAttempts);
+
+  auto offTwoPhase = runWholeFieldSort(
+      disabled.getSearchEngine(), disabledCollection,
+      "s4phrase", "sort_s", qb::DESC, 7, true,
+      false, false, false, true);
+  auto bypass = runWholeFieldSort(
+      enabled.getSearchEngine(), enabledCollection,
+      "s4phrase", "sort_s", qb::DESC, 7, true,
+      false, false, false, true);
+  auto build = runWholeFieldSort(
+      enabled.getSearchEngine(), enabledCollection,
+      "s4phrase", "sort_s", qb::DESC, 7, true,
+      false, false, false, true);
+  auto hit = runWholeFieldSort(
+      enabled.getSearchEngine(), enabledCollection,
+      "s4phrase", "sort_s", qb::DESC, 7, true,
+      false, false, false, true);
+  expectSameWholeFieldSort(offTwoPhase, bypass);
+  expectSameWholeFieldSort(offTwoPhase, build);
+  expectSameWholeFieldSort(offTwoPhase, hit);
+  EXPECT_EQ(2, bypass.bypasses);
+  EXPECT_EQ(2, build.builds);
+  EXPECT_EQ(2, hit.hits);
+  EXPECT_EQ(0, bypass.routingBypasses + build.routingBypasses
+                   + hit.routingBypasses);
+  EXPECT_EQ(2, build.ladderFallbacks);
+  EXPECT_EQ(2, hit.ladderFallbacks);
+
+  auto offPartial = runWholeFieldSort(
+      disabled.getSearchEngine(), disabledCollection,
+      "s4phrase", "sort_s", qb::DESC, 7, true,
+      false, false, false, false, true);
+  for (int round = 0; round < 3; round++) {
+    auto routed = runWholeFieldSort(
+        enabled.getSearchEngine(), enabledCollection,
+        "s4phrase", "sort_s", qb::DESC, 7, true,
+        false, false, false, false, true);
+    expectSameWholeFieldSort(offPartial, routed);
+    EXPECT_EQ(2, routed.routingBypasses);
+    EXPECT_EQ(0, routed.hits + routed.builds + routed.bypasses
+                     + routed.cachedBestFirst + routed.ladderFallbacks);
   }
 }
 
@@ -2148,9 +2258,14 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
   expectSameWholeFieldSort(offEconomic, economicBypass);
   expectSameWholeFieldSort(offEconomic, economicBuild);
   expectSameWholeFieldSort(offEconomic, economicHit);
+  EXPECT_EQ(2, economicBypass.routingBypasses);
+  EXPECT_EQ(2, economicBuild.routingBypasses);
+  EXPECT_EQ(2, economicHit.routingBypasses);
+  EXPECT_EQ(0, economicBypass.bypasses + economicBuild.builds
+                   + economicHit.hits);
   EXPECT_EQ(0, economicBuild.cachedBestFirst + economicHit.cachedBestFirst);
-  EXPECT_EQ(2, economicBuild.ladderFallbacks);
-  EXPECT_EQ(2, economicHit.ladderFallbacks);
+  EXPECT_EQ(0, economicBuild.ladderFallbacks
+                   + economicHit.ladderFallbacks);
   EXPECT_GT(economicBuild.bulk + economicHit.bulk, 0);
 
   auto offExpression = runWholeFieldSort(
@@ -2171,10 +2286,13 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
       false, true);
   expectSameWholeFieldSort(offExpression, expressionBuild);
   expectSameWholeFieldSort(offExpression, expressionHit);
+  EXPECT_EQ(2, expressionBuild.routingBypasses);
+  EXPECT_EQ(2, expressionHit.routingBypasses);
+  EXPECT_EQ(0, expressionBuild.builds + expressionHit.hits);
   EXPECT_EQ(0, expressionBuild.cachedBestFirst
                    + expressionHit.cachedBestFirst);
-  EXPECT_EQ(2, expressionBuild.ladderFallbacks);
-  EXPECT_EQ(2, expressionHit.ladderFallbacks);
+  EXPECT_EQ(0, expressionBuild.ladderFallbacks
+                   + expressionHit.ladderFallbacks);
   EXPECT_EQ(offExpression.found, expressionHit.found);
 
   auto offNoCount = runWholeFieldSort(
@@ -2213,7 +2331,8 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
           key, sort, direction, 7, false, getScores, true);
       expectSameWholeFieldSort(off, actual);
       EXPECT_EQ(0, actual.hits + actual.builds + actual.bypasses
-                       + actual.constants + actual.fallbackSuppliers);
+                       + actual.routingBypasses + actual.constants
+                       + actual.fallbackSuppliers);
     }
   }
 
@@ -2228,7 +2347,8 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
         false, true, true);
     expectSameWholeFieldSort(offSubOp, actual);
     EXPECT_EQ(0, actual.hits + actual.builds + actual.bypasses
-                     + actual.constants + actual.fallbackSuppliers);
+                     + actual.routingBypasses + actual.constants
+                     + actual.fallbackSuppliers);
   }
 
   auto offEmpty = runWholeFieldSort(
@@ -2248,11 +2368,12 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
   expectSameWholeFieldSort(offEmpty, emptyHit);
   EXPECT_TRUE(emptyHit.ids.empty());
   EXPECT_EQ(0, *emptyHit.found);
-  EXPECT_EQ(2, emptyBuild.builds);
-  EXPECT_EQ(2, emptyHit.hits);
+  EXPECT_EQ(2, emptyBypass.routingBypasses);
+  EXPECT_EQ(2, emptyBuild.routingBypasses);
+  EXPECT_EQ(2, emptyHit.routingBypasses);
+  EXPECT_EQ(0, emptyBypass.bypasses + emptyBuild.builds + emptyHit.hits);
   EXPECT_EQ(0, emptyBuild.cachedBestFirst + emptyHit.cachedBestFirst);
-  EXPECT_EQ(2, emptyBuild.ladderFallbacks);
-  EXPECT_EQ(2, emptyHit.ladderFallbacks);
+  EXPECT_EQ(0, emptyBuild.ladderFallbacks + emptyHit.ladderFallbacks);
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortConstantFactFallsBackWithoutCacheUse) {
@@ -2315,8 +2436,11 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
 
   auto reader = helper.getIndexWriter()->getIndexReader();
   TermQuery a("body_w", "s4backoffa");
-  TermQuery b("body_w", "s4backoffb");
-  std::array<Query*, 2> required{&a, &b};
+  std::array<std::string_view, 2> phraseTerms{
+      "s4backoffa", "s4backoffb"};
+  std::array<int32_t, 2> phrasePositions{0, 1};
+  PhraseQuery phrase("body_w", phraseTerms, phrasePositions);
+  std::array<Query*, 2> required{&phrase, &a};
   BooleanQuery query(required, {}, {}, {});
   MemPool pool;
   auto schema = helper.collection().getSchema();
@@ -2337,7 +2461,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
   WholeFieldSortRun fallback = runWholeFieldSort(
       helper.getSearchEngine(), collection,
       "s4backoff", "sort_i", qb::ASC, 9, true,
-      false, true);
+      false, false, false, true);
   EXPECT_EQ(9u, fallback.ids.size());
   EXPECT_EQ(64, *fallback.found);
   EXPECT_EQ(1, fallback.bypasses);
@@ -2384,8 +2508,8 @@ TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
     source.limit = 200;
     source.get_number = true;
     auto query = qb::boolean(
-        mr, {qb::match(mr, "body_w", "s4fusiona"),
-             qb::match(mr, "body_w", "s4fusionb")});
+        mr, {}, {qb::match(mr, "body_w", "s4fusiona"),
+                 qb::match(mr, "body_w", "s4fusionb")});
     auto* storedQuery = (api::Query*) mr.allocate(
         sizeof(api::Query), alignof(api::Query));
     new (storedQuery) api::Query(query);

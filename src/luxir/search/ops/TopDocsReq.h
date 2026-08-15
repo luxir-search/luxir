@@ -91,6 +91,97 @@ public:
     CONSTANT_FIRST_K,
   };
 
+  struct FieldSortBestFirstPlan {
+    FieldSortCollector::KeyBlockPlan keys;
+    int64_t expectedFloor = 0;
+
+    bool available() const noexcept { return keys.batch != nullptr; }
+  };
+
+  static FieldSortBestFirstPlan planFieldSortBestFirst(
+      FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
+    if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
+      return {};
+    }
+    auto keys = collector.maskedKeyBlockPlan();
+    if (keys.batch == nullptr) return {};
+    int64_t expectedFloor = std::min<int64_t>(
+        keys.leafCount,
+        (collector.topCount * (int64_t)maxDoc + card - 1) / card);
+    if (2 * expectedFloor >= keys.leafCount
+        && !forceFieldSortBestFirst) {
+      return {};
+    }
+    return {keys, expectedFloor};
+  }
+
+  static bool fieldSortCanUseMaskedBestFirst(const SortPlan& sortPlan) {
+    if (sortPlan.clauses.size() != 1
+        || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
+      return false;
+    }
+    auto type = const_cast<FieldType&>(
+        sortPlan.clauses[0].getSortField().getFieldType()).type();
+    return type == FieldType::INT || type == FieldType::DATE
+        || type == FieldType::FLOAT || type == FieldType::DOUBLE;
+  }
+
+  // Cached membership pays for FIELD_SORT when it removes verification work
+  // from the query-driven ladder, or when its estimated cardinality unlocks
+  // the exact-set best-first route. Flat term conjunction cost is only the
+  // cheapest posting list, not a useful estimate of intersection membership,
+  // so it cannot establish the best-first route by itself. VerificationWork
+  // includes nested two-phase children hidden behind a single-phase compound
+  // protocol. Plan before getFilterUse(): a request rejected in every segment
+  // must not create a Use, record a WHOLE-lane sighting, or admit metadata.
+  static bool planFieldSortWholeMembershipRoutes(
+      Query& query, Query::Weight& weight, IndexReader& reader,
+      const SortPlan& sortPlan, int64_t topCount,
+      std::span<uint8_t> routes) {
+    assert(routes.size() == reader.segments().size());
+    bool canUseBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
+    if (!canUseBestFirst) {
+      bool routed = query.membershipVerificationWork()
+          == Query::VerificationWork::PRESENT;
+      std::fill(routes.begin(), routes.end(), (uint8_t)routed);
+      return routed;
+    }
+    FieldSortCollector collector(
+        topCount, sortPlan.clauses, &reader, false);
+    MemPool pool;
+    bool anyRouted = false;
+    for (auto& segment : reader.segments()) {
+      auto savepoint = pool.getSavePoint();
+      auto* supplier = weight.scorerSupplier(pool, segment);
+      int64_t estimatedCard = supplier == nullptr ? 0 : supplier->cost();
+      if (segment.liveDocs() != nullptr) {
+        estimatedCard = std::min(
+            estimatedCard,
+            (int64_t)segment.liveDocs()->docset().card());
+      }
+      bool routed = false;
+      if (supplier != nullptr) {
+        auto context = supplier->makePlanContext(
+            Query::Demand::fromLeadCost(
+                estimatedCard, Query::ExecutionUse::MATCH_WINDOWS));
+        routed = supplier->verificationWork(context)
+            == Query::VerificationWork::PRESENT;
+        if (!routed && canUseBestFirst
+            && supplier->describeScorer(context).termConjunctionClause
+                != Query::ClauseShape::FLAT_CONJUNCTION) {
+          collector.setSegment(
+              segment.ord, &segment.postingsReader(), &pool, estimatedCard);
+          routed = planFieldSortBestFirst(
+              collector, estimatedCard, segment.maxDoc()).available();
+        }
+      }
+      routes[(size_t)segment.ord] = (uint8_t)routed;
+      anyRouted |= routed;
+      pool.rewind(savepoint);
+    }
+    return anyRouted;
+  }
+
   static int32_t sparseFilteredTopKDensityInverse(
       Query::Weight::SparseFilteredTopKFamily family, int64_t topCount) {
     if (topCount <= 0) return 0;
@@ -687,11 +778,11 @@ public:
         bool wholeFallbackSupplierPending =
             !wholeMembershipAvailable && op.wholeMembershipPlan.hasCacheUse();
         auto obtainMainSupplier = [&]() {
+          if (wholeFallbackSupplierPending) {
+            op.wholeMembershipPlan.recordFallbackSupplier();
+            wholeFallbackSupplierPending = false;
+          }
           if (supplier == nullptr) {
-            if (wholeFallbackSupplierPending) {
-              op.wholeMembershipPlan.recordFallbackSupplier();
-              wholeFallbackSupplierPending = false;
-            }
             supplier = mainScorerSupplier(poolGuard.pool(), seg);
           }
           return supplier;
@@ -884,7 +975,7 @@ public:
             // requires the expected visit floor (ceil(k/d) blocks) to be
             // sub-saturating; at ceil(k/d) >= blockCount the bound floor
             // covers every block and bound order cannot beat doc order.
-            if (maySkipNoncompetitiveDocs && !disableFieldSortBestFirst
+            if (maySkipNoncompetitiveDocs
                 && !requiresPreparePhase
                 && !data->fieldCollector->needsScores
                 && !data->fieldCollector->hasExpr
@@ -908,51 +999,42 @@ public:
                   || (domainSet != nullptr
                       && (domainSet->type == DocSet::BITSET
                           || domainSet->type == DocSet::ARRAY))) {
-                auto plan = data->fieldCollector->maskedKeyBlockPlan();
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
-                if (plan.batch != nullptr && card > 0) {
-                  // Expected leaf visit floor: the driver gathers leaves, so
-                  // both the activation test and the work cap are in leaf
-                  // units. The 2x margin matches the walk's leaf-descent
-                  // gate: at floor ~= leafCount, bound-ordering everything
-                  // through a heap is strictly worse than the forward walk.
-                  int64_t expectedFloor = std::min<int64_t>(
-                      plan.leafCount,
-                      (data->fieldCollector->topCount * (int64_t)seg.maxDoc()
-                       + card - 1) / card);
-                  if (2 * expectedFloor < plan.leafCount
-                      || forceFieldSortBestFirst) {
-                    // Cap generously above the expected floor so uniform
-                    // data reaches proof termination; the forward-sweep
-                    // fallback keeps adversarial tie plateaus linear.
-                    int64_t workCap = forceFieldSortWorkCapForTests > 0
-                        ? forceFieldSortWorkCapForTests
-                        : std::min(plan.leafCount, 4 * expectedFloor + 64);
-                    if (!allDocs && domainSet->type == DocSet::ARRAY) {
-                      collectTopKArrayBestFirst(
-                          segnum, ((ArrDocSet*)domainSet)->docs(),
-                          *data->fieldCollector, poolGuard.pool(), workCap);
-                    } else {
-                      std::span<const uint64_t> words;  // empty = every doc
-                      if (!allDocs) {
-                        const FixedBitSet& bits =
-                            ((BitDocSet*)domainSet)->bits();
-                        words = std::span<const uint64_t>(
-                            bits.words,
-                            FixedBitSet::sizeInWords(bits.size()));
-                      }
-                      collectTopKBitSetBestFirst(
-                          segnum, words,
-                          *data->fieldCollector, poolGuard.pool(), workCap);
+                auto bestFirst = planFieldSortBestFirst(
+                    *data->fieldCollector, card, seg.maxDoc());
+                if (bestFirst.available()) {
+                  auto& plan = bestFirst.keys;
+                  // Cap generously above the expected floor so uniform
+                  // data reaches proof termination; the forward-sweep
+                  // fallback keeps adversarial tie plateaus linear.
+                  int64_t workCap = forceFieldSortWorkCapForTests > 0
+                      ? forceFieldSortWorkCapForTests
+                      : std::min(
+                          plan.leafCount, 4 * bestFirst.expectedFloor + 64);
+                  if (!allDocs && domainSet->type == DocSet::ARRAY) {
+                    collectTopKArrayBestFirst(
+                        segnum, ((ArrDocSet*)domainSet)->docs(),
+                        *data->fieldCollector, poolGuard.pool(), workCap);
+                  } else {
+                    std::span<const uint64_t> words;  // empty = every doc
+                    if (!allDocs) {
+                      const FixedBitSet& bits =
+                          ((BitDocSet*)domainSet)->bits();
+                      words = std::span<const uint64_t>(
+                          bits.words,
+                          FixedBitSet::sizeInWords(bits.size()));
                     }
-                    data->fieldCollector->recordSegmentSkipStats(segnum);
-                    if (wholeFieldSortAvailable) {
-                      skipCount(
-                          SkipStats::wholeFieldSortBestFirstActivations);
-                    }
-                    usedBulk = true;
+                    collectTopKBitSetBestFirst(
+                        segnum, words,
+                        *data->fieldCollector, poolGuard.pool(), workCap);
                   }
+                  data->fieldCollector->recordSegmentSkipStats(segnum);
+                  if (wholeFieldSortAvailable) {
+                    skipCount(
+                        SkipStats::wholeFieldSortBestFirstActivations);
+                  }
+                  usedBulk = true;
                 }
               }
             }
@@ -1331,6 +1413,7 @@ public:
     Query::Weight* wholeMembershipWeight,
     Query::Weight* wholeRankingWeight,
     FilterCache::Use* wholeMembershipUse,
+    std::span<const uint8_t> wholeFieldSortCacheRoutes,
     float wholeConstantScore,
     std::span<std::pair<std::string_view, Query*>> filters,
     std::span<Query::Weight*> filterWeights,
@@ -1352,7 +1435,8 @@ public:
               ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
               : requirements.needRankedDocs
                     ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
-                    : QueryPrep::WholeMembershipConsumer::COUNT);
+                    : QueryPrep::WholeMembershipConsumer::COUNT,
+          wholeFieldSortCacheRoutes);
     }
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());

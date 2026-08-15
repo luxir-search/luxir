@@ -619,6 +619,38 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
+  VerificationWork membershipVerificationWork() const override {
+    bool unknown = false;
+    bool partial = false;
+    auto summarize = [&](std::span<Query*> clauses) {
+      for (Query* clause : clauses) {
+        VerificationWork work = clause->membershipVerificationWork();
+        if (work == VerificationWork::PRESENT) return true;
+        partial |= work == VerificationWork::PARTIAL;
+        unknown |= work == VerificationWork::UNKNOWN;
+      }
+      return false;
+    };
+    if (summarize(mandatory) || summarize(filter)) {
+      return VerificationWork::PRESENT;
+    }
+    bool hasRequired = !mandatory.empty() || !filter.empty();
+    if (minShouldMatch >= 1 || !hasRequired) {
+      bool optionalPresent = summarize(optional);
+      int requiredOptionals = std::max(1, minShouldMatch);
+      if (optionalPresent) {
+        if (requiredOptionals >= (int)optional.size()) {
+          return VerificationWork::PRESENT;
+        }
+        partial = true;
+      }
+    }
+    if (summarize(prohibited)) return VerificationWork::PRESENT;
+    if (partial) return VerificationWork::PARTIAL;
+    return unknown ? VerificationWork::UNKNOWN
+                   : VerificationWork::ABSENT;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendTag(FilterKeyTag::BOOLEAN);
@@ -1319,6 +1351,26 @@ public:
         return filled;
       }
 
+      static Query::VerificationWork mergeVerificationWork(
+          std::span<Query::ScorerSupplier* const> suppliers,
+          const Query::PlanContext& buildContext) {
+        bool unknown = false;
+        bool partial = false;
+        for (auto* supplier : suppliers) {
+          if (supplier == nullptr) continue;
+          Query::VerificationWork work =
+              supplier->verificationWork(buildContext);
+          if (work == Query::VerificationWork::PRESENT) {
+            return work;
+          }
+          partial |= work == Query::VerificationWork::PARTIAL;
+          unknown |= work == Query::VerificationWork::UNKNOWN;
+        }
+        if (partial) return Query::VerificationWork::PARTIAL;
+        return unknown ? Query::VerificationWork::UNKNOWN
+                       : Query::VerificationWork::ABSENT;
+      }
+
       static Query::ScorerShape describeResolved(
           Query::ScorerSupplier* supplier,
           const Query::PlanContext& buildContext) {
@@ -1710,6 +1762,51 @@ public:
           positive = opaqueShape(positive.matchState);
         }
         return maskSupplierAccess(positive);
+      }
+
+      Query::VerificationWork verificationWork(
+          const Query::PlanContext& buildContext) const override {
+        Query::PlanContext requiredContext = childPlanContext(
+            buildContext, shapeRequiredCost);
+        Query::VerificationWork result = Query::VerificationWork::ABSENT;
+        auto merge = [&](Query::VerificationWork next) {
+          if (next == Query::VerificationWork::PRESENT
+              || result == Query::VerificationWork::ABSENT
+              || (result == Query::VerificationWork::UNKNOWN
+                  && next == Query::VerificationWork::PARTIAL)) {
+            result = next;
+          }
+        };
+        auto summarize = [&](
+            std::span<Query::ScorerSupplier* const> suppliers,
+            const Query::PlanContext& context) {
+          Query::VerificationWork next =
+              mergeVerificationWork(suppliers, context);
+          merge(next);
+        };
+        summarize(mandatoryShapeSuppliers, requiredContext);
+        summarize(filterSuppliers, requiredContext);
+
+        bool hasRequired = !mandatorySources.empty()
+            || !filterSuppliers.empty();
+        Query::PlanContext unboundedContext = childPlanContext(
+            buildContext, std::numeric_limits<int64_t>::max());
+        if (minShouldMatch >= 1 || !hasRequired) {
+          Query::VerificationWork optional = mergeVerificationWork(
+              optionalShapeSuppliers, unboundedContext);
+          if (optional == Query::VerificationWork::PRESENT) {
+            size_t liveOptionals = std::count_if(
+                optionalShapeSuppliers.begin(), optionalShapeSuppliers.end(),
+                [](auto* supplier) { return supplier != nullptr; });
+            int requiredOptionals = std::max(1, minShouldMatch);
+            if (requiredOptionals < (int)liveOptionals) {
+              optional = Query::VerificationWork::PARTIAL;
+            }
+          }
+          merge(optional);
+        }
+        summarize(prohibitedShapeSuppliers, unboundedContext);
+        return result;
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(

@@ -807,6 +807,7 @@ public:
     Query::Weight* wholeMembershipWeight = nullptr;
     Query::Weight* wholeRankingWeight = nullptr;
     FilterCache::Use* wholeMembershipUse = nullptr;
+    std::span<uint8_t> wholeFieldSortCacheRoutes;
     float wholeConstantScore = 0.0f;
     bool pureCount = !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
@@ -849,12 +850,26 @@ public:
         }
       }
       auto* cache = req.reader->filterCache();
+      bool fieldSortFullyRouted = false;
       if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
-        wholeMembershipUse = qcontext->getFilterUse(
-            *query, FilterCache::AdmissionLane::WHOLE);
+        bool acquireUse = true;
+        if (wholeFieldSort) {
+          wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
+              req.reader->segments().size());
+          acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
+              *query, *wholeMembershipWeight, *req.reader, parsedSorts, limit,
+              wholeFieldSortCacheRoutes);
+          fieldSortFullyRouted = !acquireUse;
+        }
+        if (acquireUse) {
+          wholeMembershipUse = qcontext->getFilterUse(
+              *query, FilterCache::AdmissionLane::WHOLE);
+        }
       }
-      if (!everySegmentConstant && wholeMembershipUse == nullptr) {
+      if (!everySegmentConstant && wholeMembershipUse == nullptr
+          && !fieldSortFullyRouted) {
         wholeMembershipWeight = nullptr;
+        wholeFieldSortCacheRoutes = {};
       }
 
       if (wholeTopKCount && wholeMembershipWeight != nullptr
@@ -893,7 +908,7 @@ public:
       req.arena, req, name, topDocsReq, *qcontext, query, weight,
       countWeight, rankingWeight, limit, std::move(parsedSorts),
       requirements, wholeMembershipWeight, wholeRankingWeight,
-      wholeMembershipUse, wholeConstantScore,
+      wholeMembershipUse, wholeFieldSortCacheRoutes, wholeConstantScore,
       filters, filterWeights, domainQuery, domainQueryWeight,
       domainFilterWeights);
 

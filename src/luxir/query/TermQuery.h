@@ -61,6 +61,10 @@ public:
     return hasInjectedTermStats;
   }
 
+  VerificationWork membershipVerificationWork() const override {
+    return VerificationWork::ABSENT;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);

@@ -265,6 +265,10 @@ public:
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
 
+  VerificationWork membershipVerificationWork() const override {
+    return VerificationWork::PRESENT;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
