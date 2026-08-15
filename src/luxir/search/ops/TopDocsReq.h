@@ -673,17 +673,19 @@ public:
             skipCount(SkipStats::exactDomainStreamFallbacks);
           }
         }
-        QueryPrep::WholeMembershipResult wholeCountResult;
+        QueryPrep::WholeMembershipResult wholeMembershipResult;
         if (!exactDomain && !matchEverything
             && !op.wholeMembershipPlan.empty()) {
-          wholeCountResult = op.wholeMembershipPlan.resolve(
+          wholeMembershipResult = op.wholeMembershipPlan.resolve(
               *op.req.reader, seg, domain);
         }
-        bool wholeCountAvailable = wholeCountResult.available;
-        bool wholeTopKCountAvailable = wholeCountAvailable
+        bool wholeMembershipAvailable = wholeMembershipResult.available;
+        bool wholeTopKCountAvailable = wholeMembershipAvailable
             && op.wholeMembershipPlan.isTopKCount();
+        bool wholeFieldSortAvailable = wholeMembershipAvailable
+            && op.wholeMembershipPlan.isFieldSort();
         bool wholeFallbackSupplierPending =
-            !wholeCountAvailable && op.wholeMembershipPlan.hasCacheUse();
+            !wholeMembershipAvailable && op.wholeMembershipPlan.hasCacheUse();
         auto obtainMainSupplier = [&]() {
           if (supplier == nullptr) {
             if (wholeFallbackSupplierPending) {
@@ -697,7 +699,7 @@ public:
         // A root, non-prepared filter-only Boolean can expose its one cached
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
-        if (!exactDomain && !wholeCountAvailable
+        if (!exactDomain && !wholeMembershipAvailable
             && !requiresPreparePhase && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
             && (rankFromDocOrder || data->topCount() == 0)) {
@@ -714,7 +716,8 @@ public:
           }
         }
         bool identityResult =
-            ((wholeCountAvailable && !wholeTopKCountAvailable)
+            ((wholeMembershipAvailable && !wholeTopKCountAvailable
+                                       && !wholeFieldSortAvailable)
              || exactDomain || matchEverything
              || borrowedDomain != nullptr)
             && (rankFromDocOrder || data->topCount() == 0);
@@ -730,12 +733,12 @@ public:
           assert(data->scoreCollector->topCount > 0);
           if (op.weight->isConstantScoring()) {
             int64_t ranked = 0;
-            if (wholeCountResult.count > 0) {
+            if (wholeMembershipResult.count > 0) {
               Query::Scorer* scorer = nullptr;
               DocSet* collectorFilter = domain;
-              if (wholeCountResult.docs.get() != nullptr) {
+              if (wholeMembershipResult.docs.get() != nullptr) {
                 scorer = QueryPrep::createDocSetScorer(
-                    poolGuard.pool(), wholeCountResult.docs.get(), seg,
+                    poolGuard.pool(), wholeMembershipResult.docs.get(), seg,
                     op.wholeConstantScore);
                 collectorFilter = nullptr;
               } else {
@@ -752,25 +755,25 @@ public:
                     *data->scoreCollector, data->scoreCollector->topCount);
               }
             }
-            assert(wholeCountResult.count >= ranked);
-            data->addHits(wholeCountResult.count - ranked);
+            assert(wholeMembershipResult.count >= ranked);
+            data->addHits(wholeMembershipResult.count - ranked);
           } else {
             assert(op.wholeRankingWeight != nullptr);
             auto* rankingSupplier = op.wholeRankingWeight->scorerSupplier(
                 poolGuard.pool(), seg);
             collectKnownCountTopK(
-                poolGuard.pool(), segnum, wholeCountResult.count,
+                poolGuard.pool(), segnum, wholeMembershipResult.count,
                 rankingSupplier, domain, *data->scoreCollector,
                 seg.maxDoc(), op.wholeRankingWeight->allowsPruning());
           }
         } else if (identityResult) {
-          DocSet* identityDomain = wholeCountAvailable
-              ? wholeCountResult.docs.get()
+          DocSet* identityDomain = wholeMembershipAvailable
+              ? wholeMembershipResult.docs.get()
               : exactDomain
                     ? exactDomainDocs
                     : borrowedDomain != nullptr ? borrowedDomain : domain;
-          int64_t total = wholeCountAvailable
-              ? wholeCountResult.count
+          int64_t total = wholeMembershipAvailable
+              ? wholeMembershipResult.count
               : identityDomain == nullptr
                     ? seg.maxDoc() : identityDomain->card();
           int64_t ranked = 0;
@@ -791,9 +794,11 @@ public:
           }
           assert(total >= ranked);
           data->addHits(total - ranked);
-        } else if ((supplier = obtainMainSupplier());
-                   supplier != nullptr) {
-          DocSet* filter = domain;
+        } else if (wholeFieldSortAvailable
+                   || (supplier = obtainMainSupplier()) != nullptr) {
+          DocSet* filter = wholeFieldSortAvailable
+                  && wholeMembershipResult.docs.get() != nullptr
+              ? wholeMembershipResult.docs.get() : domain;
           std::unique_ptr<DocSet> newDomain;
           // Keeps owned sets or request-pinned cache borrows alive; `filter`
           // may alias one directly, so the handles outlive collection below.
@@ -841,15 +846,18 @@ public:
           if (counted) {
             // fall through to the sub-calc/merge tail below
           } else if (data->useFieldSort) {
-            // Competitive block pruning skips (and cannot count) noncompetitive
-            // docs, so it is off whenever the request needs an exact hit count
-            // or a materialized domain.
-            bool allowSortPruning = !disableFieldSortPruning
-                && !op.requirements.needExactCount
-                && builderPtr == nullptr;
+            // Ranking permission and completeness production are separate
+            // facts. A known whole-membership card satisfies exact count, but
+            // its borrowed set is not a produced sub-op domain.
+            bool mustStreamForCompleteness =
+                (op.requirements.needExactCount && !wholeFieldSortAvailable)
+                || builderPtr != nullptr;
+            bool maySkipNoncompetitiveDocs =
+                !disableFieldSortPruning && !mustStreamForCompleteness;
             // Candidate pruning must beat what the source would still cost:
             // the query estimate, capped by an external filter's cardinality.
-            int64_t sortSourceCost = supplier->cost();
+            int64_t sortSourceCost = wholeFieldSortAvailable
+                ? wholeMembershipResult.count : supplier->cost();
             if (collectorFilter != nullptr) {
               sortSourceCost = std::min(sortSourceCost,
                                         (int64_t)collectorFilter->card());
@@ -861,6 +869,7 @@ public:
                 segnum, &seg.postingsReader(), &poolGuard.pool(),
                 sortSourceCost);
             bool usedBulk = false;
+            int64_t fieldHitsBefore = data->fieldCollector->hitCount;
             // A MATCH_WINDOWS plan taken by a declined arm is retained here
             // so the ordinary bulk arm never re-plans the same context.
             std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
@@ -875,14 +884,17 @@ public:
             // requires the expected visit floor (ceil(k/d) blocks) to be
             // sub-saturating; at ceil(k/d) >= blockCount the bound floor
             // covers every block and bound order cannot beat doc order.
-            if (allowSortPruning && !disableFieldSortBestFirst
+            if (maySkipNoncompetitiveDocs && !disableFieldSortBestFirst
                 && !requiresPreparePhase
                 && !data->fieldCollector->needsScores
                 && !data->fieldCollector->hasExpr
                 && data->fieldCollector->topCount > 0) {
               DocSet* domainSet = nullptr;
               bool allDocs = false;
-              if (collectorFilter == nullptr) {
+              if (wholeFieldSortAvailable
+                  && wholeMembershipResult.docs.get() != nullptr) {
+                domainSet = wholeMembershipResult.docs.get();
+              } else if (collectorFilter == nullptr && supplier != nullptr) {
                 domainSet = supplier->exactDocSet();
                 // Match-all with no deletes and no filters: the domain is
                 // every doc (deletes would have arrived as a liveDocs
@@ -935,10 +947,20 @@ public:
                           *data->fieldCollector, poolGuard.pool(), workCap);
                     }
                     data->fieldCollector->recordSegmentSkipStats(segnum);
+                    if (wholeFieldSortAvailable) {
+                      skipCount(
+                          SkipStats::wholeFieldSortBestFirstActivations);
+                    }
                     usedBulk = true;
                   }
                 }
               }
+            }
+            if (!usedBulk && wholeFieldSortAvailable) {
+              skipCount(SkipStats::wholeFieldSortLadderFallbacks);
+            }
+            if (!usedBulk && supplier == nullptr) {
+              supplier = obtainMainSupplier();
             }
             // Seeded two-pass query-driven route: no materialized domain
             // exists (else best-first took it), but the sole dense numeric
@@ -951,7 +973,8 @@ public:
             // at least one expected match per key block. forceFieldSortSeeding
             // bypasses only the two economic gates, never correctness or
             // capability.
-            if (!usedBulk && allowSortPruning && !disableFieldSortSeeding
+            if (!usedBulk && supplier != nullptr
+                && maySkipNoncompetitiveDocs && !disableFieldSortSeeding
                 && !disableFieldSortBulk && !requiresPreparePhase
                 && !data->fieldCollector->needsScores
                 && !data->fieldCollector->hasExpr
@@ -1018,7 +1041,7 @@ public:
                       collectTopKMatchWindowed(
                           segnum, seedBulk, collectorFilter, builderPtr,
                           *data->fieldCollector, seg.maxDoc(),
-                          allowSortPruning);
+                          maySkipNoncompetitiveDocs);
                       data->fieldCollector->recordSegmentSkipStats(segnum);
                       usedBulk = true;
                     }
@@ -1026,7 +1049,7 @@ public:
                 }
               }
             }
-            if (!usedBulk && !disableFieldSortBulk
+            if (!usedBulk && supplier != nullptr && !disableFieldSortBulk
                 && !data->fieldCollector->needsScores) {
               auto plan = matchWindowsPlan.has_value()
                   ? *matchWindowsPlan
@@ -1054,12 +1077,13 @@ public:
                 skipCount(SkipStats::fieldSortBulkCollections);
                 collectTopKMatchWindowed(
                     segnum, bulk, collectorFilter, builderPtr,
-                    *data->fieldCollector, seg.maxDoc(), allowSortPruning);
+                    *data->fieldCollector, seg.maxDoc(),
+                    maySkipNoncompetitiveDocs);
                 data->fieldCollector->recordSegmentSkipStats(segnum);
                 usedBulk = true;
               }
             }
-            if (!usedBulk) {
+            if (!usedBulk && supplier != nullptr) {
               auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
               if (scorer != nullptr) {
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
@@ -1068,9 +1092,17 @@ public:
                       *data->fieldCollector, poolGuard.pool(), seg);
                 }
                 collectTopK(segnum, scorer, collectorFilter, builderPtr,
-                            *data->fieldCollector, allowSortPruning);
+                            *data->fieldCollector,
+                            maySkipNoncompetitiveDocs);
                 data->fieldCollector->recordSegmentSkipStats(segnum);
               }
+            }
+            if (op.requirements.needExactCount
+                && wholeFieldSortAvailable) {
+              int64_t collected =
+                  data->fieldCollector->hitCount - fieldHitsBefore;
+              assert(wholeMembershipResult.count >= collected);
+              data->addHits(wholeMembershipResult.count - collected);
             }
           } else {
             // Pruning is enabled only when an exact count can either be omitted
@@ -1316,9 +1348,11 @@ public:
           *wholeMembershipWeight, wholeMembershipUse,
           qcontext.filterUses,
           PreparedDomainDependence::QUERY_CANONICAL,
-          requirements.needRankedDocs
-              ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
-              : QueryPrep::WholeMembershipConsumer::COUNT);
+          this->sortPlan.useFieldSort
+              ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
+              : requirements.needRankedDocs
+                    ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
+                    : QueryPrep::WholeMembershipConsumer::COUNT);
     }
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());

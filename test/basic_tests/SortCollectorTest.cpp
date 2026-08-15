@@ -3,6 +3,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/search/FieldSortCollector.h"
 #include "luxir/search/SortField.h"
 #include "luxir/search/SearchOverrides.h"
@@ -87,6 +88,19 @@ public:
     disableTopDocsFilterFold = disabled;
   }
   ~TopDocsFilterFoldGuard() { disableTopDocsFilterFold = saved; }
+};
+
+class WholeMembershipPlanGuard {
+  bool saved;
+
+public:
+  explicit WholeMembershipPlanGuard(bool disabled)
+      : saved(QueryPrep::disableWholeMembershipPlanForTests) {
+    QueryPrep::disableWholeMembershipPlanForTests = disabled;
+  }
+  ~WholeMembershipPlanGuard() {
+    QueryPrep::disableWholeMembershipPlanForTests = saved;
+  }
 };
 
 class BestFirstGuard {
@@ -212,6 +226,7 @@ protected:
 };
 
 TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
+  WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper;
   std::vector<Doc> segment;
   std::vector<std::string> deleted;
@@ -536,6 +551,7 @@ TEST_F(SortCollectorTest, collectWindowFallbackCountsEachHitOnce) {
 }
 
 TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
+  WholeMembershipPlanGuard wholeGuard(true);
   constexpr int32_t segmentDocs = DocsEnumMeta::L1_DOCS + 257;
   CollectionHelper helper;
   std::vector<std::string> deleted;
@@ -2319,6 +2335,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
 // swept over match-all and term shapes, both drivers, both directions, and
 // limits around the block size.
 TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
+  WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper;
   helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
@@ -2447,6 +2464,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
 // small block count means the expected-floor gate always declines, so the
 // force override drives the route and the gate itself is asserted once.
 TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
+  WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper("best_first_sort");
   helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
@@ -2637,6 +2655,7 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
 // work; ties exercise the segdoc guard when the pass-2 cursor runs behind
 // pass-1 admissions.
 TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
+  WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper("seeded_sort");
   helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
@@ -2795,6 +2814,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
 // matchless-seed abort); both must abandon the schedule and let the sweep
 // complete correctness.
 TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
+  WholeMembershipPlanGuard wholeGuard(true);
   constexpr int32_t kBigSegDocs = 13 * 4096;
   constexpr int32_t kProbeStart = 12 * 4096;
   CollectionHelper helper("seeded_abort");
@@ -2851,6 +2871,7 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
 // a 7-value tie column (empty-interval termination), missing values, and
 // deletes.
 void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
+  WholeMembershipPlanGuard wholeGuard(true);
   {
     CollectionHelper helper;
     helper.getIndexWriter()->mergePolicy->setMergeFactor(10);

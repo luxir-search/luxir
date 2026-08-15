@@ -815,12 +815,16 @@ public:
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
         && exactCountTopK && !weight->needsPrepare()
         && filterWeights.empty();
-    if (pureCount || wholeTopKCount) {
+    bool wholeFieldSort = !QueryPrep::disableWholeMembershipPlanForTests
+        && limit > 0 && parsedSorts.useFieldSort
+        && !weight->needsScores() && !requirements.needExactDomain
+        && !weight->needsPrepare() && filterWeights.empty();
+    if (pureCount || wholeTopKCount || wholeFieldSort) {
       if (wholeTopKCount && countWeight != nullptr
           && !countWeight->needsScores()
           && !countWeight->allowsPruning()) {
         wholeMembershipWeight = countWeight;
-      } else if (pureCount) {
+      } else if (pureCount || wholeFieldSort) {
         wholeMembershipWeight = weight;
       } else {
         int32_t membershipFlags =

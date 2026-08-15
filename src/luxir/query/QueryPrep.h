@@ -534,6 +534,7 @@ struct WholeMembershipResult {
 enum class WholeMembershipConsumer : uint8_t {
   COUNT,
   TOP_K_COUNT,
+  FIELD_SORT,
 };
 
 // Request-owned whole-query membership fact. Constant counts precede cache
@@ -547,9 +548,19 @@ class WholeMembershipPlan {
       PreparedDomainDependence::QUERY_CANONICAL;
   WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT;
 
-  void record(int64_t& countCounter, int64_t& topKCountCounter) const {
-    skipCount(consumer == WholeMembershipConsumer::COUNT
-        ? countCounter : topKCountCounter);
+  void record(int64_t& countCounter, int64_t& topKCountCounter,
+              int64_t& fieldSortCounter) const {
+    switch (consumer) {
+      case WholeMembershipConsumer::COUNT:
+        skipCount(countCounter);
+        break;
+      case WholeMembershipConsumer::TOP_K_COUNT:
+        skipCount(topKCountCounter);
+        break;
+      case WholeMembershipConsumer::FIELD_SORT:
+        skipCount(fieldSortCounter);
+        break;
+    }
   }
 
 public:
@@ -569,10 +580,14 @@ public:
   bool isTopKCount() const {
     return consumer == WholeMembershipConsumer::TOP_K_COUNT;
   }
+  bool isFieldSort() const {
+    return consumer == WholeMembershipConsumer::FIELD_SORT;
+  }
 
   void recordFallbackSupplier() const {
     record(SkipStats::wholeCountFallbackSuppliers,
-           SkipStats::wholeTopKCountFallbackSuppliers);
+           SkipStats::wholeTopKCountFallbackSuppliers,
+           SkipStats::wholeFieldSortFallbackSuppliers);
   }
 
   WholeMembershipResult resolve(
@@ -583,7 +598,8 @@ public:
     auto constant = weight->constantCount(segment, incomingDomain);
     if (constant.has_value()) {
       record(SkipStats::wholeCountConstant,
-             SkipStats::wholeTopKCountConstant);
+             SkipStats::wholeTopKCountConstant,
+             SkipStats::wholeFieldSortConstant);
       return {true, {}, *constant};
     }
     if (cacheUse == nullptr) return {};
@@ -593,7 +609,8 @@ public:
       DocSet* docs = cacheUse->effectiveDocSet(
           (size_t) segment.ord, reader, incomingDomain);
       if (docs == nullptr) return {};
-      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits);
+      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+             SkipStats::wholeFieldSortHits);
       return {
         true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
       };
@@ -612,7 +629,8 @@ public:
       DocSet* docs = cacheUse->effectiveDocSet(
           (size_t) segment.ord, reader, incomingDomain);
       if (docs == nullptr) return {};
-      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds);
+      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
+             SkipStats::wholeFieldSortBuilds);
       return {
         true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
       };
@@ -621,7 +639,8 @@ public:
     // Probe destruction releases RequestSlot::resolving before the caller
     // constructs and streams its ordinary fallback supplier.
     record(SkipStats::wholeCountBypasses,
-           SkipStats::wholeTopKCountBypasses);
+           SkipStats::wholeTopKCountBypasses,
+           SkipStats::wholeFieldSortBypasses);
     return {};
   }
 };

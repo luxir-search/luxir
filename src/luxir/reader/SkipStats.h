@@ -253,6 +253,13 @@ struct SkipStats {
   static inline int64_t wholeTopKCountBypasses = 0;
   static inline int64_t wholeTopKCountConstant = 0;
   static inline int64_t wholeTopKCountFallbackSuppliers = 0;
+  static inline int64_t wholeFieldSortHits = 0;
+  static inline int64_t wholeFieldSortBuilds = 0;
+  static inline int64_t wholeFieldSortBypasses = 0;
+  static inline int64_t wholeFieldSortConstant = 0;
+  static inline int64_t wholeFieldSortFallbackSuppliers = 0;
+  static inline int64_t wholeFieldSortBestFirstActivations = 0;
+  static inline int64_t wholeFieldSortLadderFallbacks = 0;
   static inline int64_t numericRangeSparseVerifyArms = 0;
   static inline int64_t numericRangeComplementArms = 0;
   static inline int64_t numericRangePointsArms = 0;
@@ -489,6 +496,13 @@ struct SkipStats {
     wholeTopKCountBypasses = 0;
     wholeTopKCountConstant = 0;
     wholeTopKCountFallbackSuppliers = 0;
+    wholeFieldSortHits = 0;
+    wholeFieldSortBuilds = 0;
+    wholeFieldSortBypasses = 0;
+    wholeFieldSortConstant = 0;
+    wholeFieldSortFallbackSuppliers = 0;
+    wholeFieldSortBestFirstActivations = 0;
+    wholeFieldSortLadderFallbacks = 0;
     numericRangeSparseVerifyArms = 0;
     numericRangeComplementArms = 0;
     numericRangePointsArms = 0;

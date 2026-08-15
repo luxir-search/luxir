@@ -818,10 +818,10 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 // child's bound and first unseen doc are at least as bad against the same
 // bottom). workCap bounds leaf gather attempts on pathological tie
 // plateaus; on cap, unvisited leaves are swept forward in doc order under
-// the same classification. Every in-domain doc is gathered at most once,
-// so hitCount keeps the pruned-path semantics (counts gathered docs;
-// pruning is off when exact counts are required). The domain
-// representation lives in `gather`, which feeds one leaf's in-domain
+// the same classification. Every in-domain doc is gathered at most once, so
+// hitCount keeps the pruned-path semantics (counts gathered docs). An exact
+// hit count may instead come from the same known domain's cardinality.
+// The domain representation lives in `gather`, which feeds one leaf's in-domain
 // (docs, keys) to admitGathered; the bitset and array entry points below
 // supply it.
 // Mixed coarse/leaf bound frontier shared by the bound-ordered drivers: a
