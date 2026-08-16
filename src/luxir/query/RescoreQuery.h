@@ -398,6 +398,23 @@ public:
   Query* getChild() const { return child; }
   ValueProgram& getProgram() const { return *program; }
 
+  bool canOmitWeightForCacheFirstMembership() const override {
+    return child->canOmitWeightForCacheFirstMembership();
+  }
+
+  bool directCountAvailable(IndexReader& reader) const override {
+    return child->directCountAvailable(reader);
+  }
+
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    if (!std::isfinite(multiplier) || multiplier < 0.0f) {
+      throw std::runtime_error(
+          "rescore multiplier must be finite and non-negative");
+    }
+    child->validateLogical(context, 1.0f);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -468,7 +485,7 @@ public:
   public:
     Weight(Context& context, RescoreQuery& query, int32_t flags,
            float multiplier)
-      : Query::Weight(context, flags), program(query.program),
+      : Query::Weight(context, query, flags), program(query.program),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0),
         needsChildScore(scored && program->needsScore) {
       int32_t childFlags = needsChildScore ? flags : flags & ~NEED_SCORES;
@@ -525,9 +542,6 @@ public:
 
 inline Query::Weight* RescoreQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  if (!std::isfinite(multiplier) || multiplier < 0.0f) {
-    throw std::runtime_error("rescore multiplier must be finite and non-negative");
-  }
   return context.pool.make<RescoreQuery::Weight>(
       context, *this, flags, multiplier);
 }

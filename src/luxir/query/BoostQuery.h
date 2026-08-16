@@ -27,6 +27,20 @@ public:
     return child->membershipVerificationWork();
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override {
+    return child->canOmitWeightForCacheFirstMembership();
+  }
+
+  bool directCountAvailable(IndexReader& reader) const override {
+    return child->directCountAvailable(reader);
+  }
+
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    child->validateLogical(
+        context, checkedBoostProduct(multiplier, boost));
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -39,14 +53,13 @@ public:
   ScoreProfile scoreProfile() const override {
     ScoreProfile profile = child->scoreProfile();
     if (profile.kind == ScoreProfile::Kind::VARIABLE) return profile;
-    profile.value = checkedBoostProduct(profile.value, boost);
+    profile.value *= boost;
     return profile;
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    return child->createWeight(context, flags,
-                               checkedBoostProduct(multiplier, boost));
+    return child->createWeight(context, flags, multiplier * boost);
   }
 };
 

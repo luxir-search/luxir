@@ -298,7 +298,38 @@ struct CachedFieldInfo {
 inline constexpr int64_t kMaskFilterDensityInverse = 256;
 
 class Query {
+  // Context memos must distinguish successive stack Query objects that reuse
+  // an address. Copies and moves are new logical objects and start unassigned.
+  inline static std::atomic<uint64_t> nextRequestMemoIdentity{1};
+  mutable std::atomic<uint64_t> requestMemoIdentity{0};
+
+  uint64_t getRequestMemoIdentity() const {
+    uint64_t identity = requestMemoIdentity.load(std::memory_order_relaxed);
+    if (identity != 0) return identity;
+
+    uint64_t proposed = nextRequestMemoIdentity.fetch_add(
+        1, std::memory_order_relaxed);
+    assert(proposed != 0);
+    if (requestMemoIdentity.compare_exchange_strong(
+            identity, proposed, std::memory_order_relaxed)) {
+      return proposed;
+    }
+    return identity;
+  }
+
 public:
+  Query() = default;
+  Query(const Query&) noexcept {}
+  Query(Query&&) noexcept {}
+  Query& operator=(const Query&) noexcept {
+    requestMemoIdentity.store(0, std::memory_order_relaxed);
+    return *this;
+  }
+  Query& operator=(Query&&) noexcept {
+    requestMemoIdentity.store(0, std::memory_order_relaxed);
+    return *this;
+  }
+
   class Context;
   class Weight;
   class Scorer;
@@ -515,9 +546,33 @@ public:
   }
 
   // True only when omitting createWeight on a fully resident membership hit
-  // preserves every request-visible validation and warning for this logical
-  // query. Unknown and custom queries remain conservative by default.
-  virtual bool supportsCacheFirstMembership() const { return false; }
+  // preserves semantics after the request's logical validation pass. Unknown
+  // and custom queries remain conservative by default.
+  virtual bool canOmitWeightForCacheFirstMembership() const { return false; }
+
+  // Query fact used by pure-count planning. True means the cold Weight path
+  // can answer the exact count directly for this reader, without membership
+  // enumeration or cache materialization.
+  virtual bool directCountAvailable(IndexReader& reader) const {
+    unused(reader);
+    return false;
+  }
+
+  // Validate the complete logical tree once during serial request planning,
+  // before cache lookup or Weight construction. Every concrete query must
+  // make an explicit validation decision. A composite MUST override
+  // validateLogicalImpl to visit every raw child, including score-only and
+  // otherwise unused clauses, and pass the multiplier that applies to that
+  // child's score semantics.
+  void validateLogical(Context& context, float multiplier = 1.0f) const;
+
+protected:
+  virtual void validateLogicalImpl(Context& context, float multiplier) const {
+    unused(context);
+    checkedBoostProduct(multiplier, 1.0f);
+  }
+
+public:
 
   // Structural membership key: the filter projection of this query, with
   // score-only state omitted. Consumers that need query identity, such as a
@@ -543,11 +598,11 @@ public:
 
   /// The constant a uniform-scoring weight contributes: its boost product
   /// when scores are requested, 0 otherwise (built unscored means score 0
-  /// and zero bounds).
+  /// and zero bounds). The serial logical pass has already validated the
+  /// product, so Weight construction is deliberately non-validating.
   static float constantWhenScored(int32_t flags, float multiplier,
                                   float local = 1.0f) {
-    return (flags & NEED_SCORES) != 0 ? checkedBoostProduct(multiplier, local)
-                                      : 0.0f;
+    return (flags & NEED_SCORES) != 0 ? multiplier * local : 0.0f;
   }
 
   /// Per-segment planning state. Suppliers are allocated from the segment-local
@@ -804,6 +859,31 @@ public:
     std::unique_ptr<google::protobuf::Arena> standaloneArena;
     google::protobuf::Arena* allocationArena;
 
+    struct CachedFilterIdentity {
+      FilterKeyScope scope;
+      std::optional<FilterKey> key;
+    };
+
+    boost::unordered_node_map<uint64_t, CachedFilterIdentity> filterIdentities;
+    boost::unordered_node_map<uint64_t, void*> logicalPlans;
+#ifndef NDEBUG
+    boost::unordered_node_map<uint64_t, bool> logicallyValidatedQueries;
+#endif
+
+    const CachedFilterIdentity& filterIdentity(const Query& query) {
+      uint64_t identity = query.getRequestMemoIdentity();
+      auto found = filterIdentities.find(identity);
+      if (found != filterIdentities.end()) return found->second;
+
+      FilterKeyBuilder builder;
+      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
+      auto key = std::move(builder).finish(scope, filterKeyContext);
+      auto [inserted, created] = filterIdentities.emplace(
+          identity, CachedFilterIdentity{scope, std::move(key)});
+      assert(created);
+      return inserted->second;
+    }
+
   public:
     using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
 
@@ -894,15 +974,47 @@ public:
       return *allocationArena;
     }
 
+    // Serial request-build memo. A query may create several Weights for
+    // ranking, count, domain, and routing products; logical normalization is
+    // query-shaped and belongs here once, not in every Weight constructor.
+    // Each Query identity owns at most one concrete Plan type.
+    template <typename Plan, typename Create>
+    Plan& getOrCreateLogicalPlan(const Query& query, Create&& create) {
+      uint64_t identity = query.getRequestMemoIdentity();
+      auto found = logicalPlans.find(identity);
+      if (found != logicalPlans.end()) return *(Plan*) found->second;
+
+      Plan* plan = std::forward<Create>(create)();
+      auto [inserted, created] = logicalPlans.emplace(identity, plan);
+      assert(created);
+      return *(Plan*) inserted->second;
+    }
+
+#ifndef NDEBUG
+    void recordLogicalValidation(const Query& query) {
+      logicallyValidatedQueries.emplace(query.getRequestMemoIdentity(), true);
+    }
+
+    bool logicalValidationActive() const {
+      return !logicallyValidatedQueries.empty();
+    }
+
+    void assertLogicalValidation(const Query& query) const {
+      if (logicallyValidatedQueries.empty()) return;
+      assert(logicallyValidatedQueries.contains(
+          query.getRequestMemoIdentity())
+          && "Weight owner was not visited by logical validation");
+    }
+#endif
+
     FilterCache::Use* getFilterUse(
         const Query& query,
         FilterCache::AdmissionLane lane =
             FilterCache::AdmissionLane::CLAUSE) {
       if (filterUses == nullptr) return nullptr;
-      FilterKeyBuilder builder;
-      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
-      auto key = std::move(builder).finish(scope, filterKeyContext);
-      return key ? filterUses->get(*key, scope, lane) : nullptr;
+      const auto& identity = filterIdentity(query);
+      return identity.key
+          ? filterUses->get(*identity.key, identity.scope, lane) : nullptr;
     }
 
     // Shape-specific consumers can require a cache lifetime without letting a
@@ -912,23 +1024,23 @@ public:
         const Query& query, FilterKeyScope requiredScope,
         FilterCache::AdmissionLane lane) {
       if (filterUses == nullptr) return nullptr;
-      FilterKeyBuilder builder;
-      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
-      if (scope != requiredScope) return nullptr;
-      auto key = std::move(builder).finish(scope, filterKeyContext);
-      return key ? filterUses->get(*key, scope, lane) : nullptr;
+      const auto& identity = filterIdentity(query);
+      if (identity.scope != requiredScope) return nullptr;
+      return identity.key
+          ? filterUses->get(*identity.key, identity.scope, lane) : nullptr;
     }
 
     std::optional<FilterCache::ExistingCandidate> lookupExistingFilterUse(
-        const Query& query,
-        FilterKeyScope requiredScope = FilterKeyScope::SEGMENT_STABLE) {
+        const Query& query, bool allowReaderStable = false) {
       if (filterUses == nullptr) return std::nullopt;
-      FilterKeyBuilder builder;
-      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
-      if (scope != requiredScope) return std::nullopt;
-      auto key = std::move(builder).finish(scope, filterKeyContext);
-      if (!key) return std::nullopt;
-      return filterUses->lookupExisting(*key, scope);
+      const auto& identity = filterIdentity(query);
+      if (identity.scope == FilterKeyScope::UNCACHEABLE
+          || (identity.scope == FilterKeyScope::READER_STABLE
+              && !allowReaderStable)) {
+        return std::nullopt;
+      }
+      if (!identity.key) return std::nullopt;
+      return filterUses->lookupExisting(*identity.key, identity.scope);
     }
 
     FilterCache::Use* acceptExistingFilterUse(
@@ -1088,7 +1200,14 @@ public:
       UNION,
     };
 
-    Weight(Query::Context& context, int32_t inputFlags) : context(context), inputFlags(inputFlags) {}
+    Weight(Query::Context& context, const Query& query, int32_t inputFlags)
+      : context(context), inputFlags(inputFlags) {
+#ifndef NDEBUG
+      context.assertLogicalValidation(query);
+#else
+      unused(query);
+#endif
+    }
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
@@ -1544,6 +1663,13 @@ public:
     }
   };
 };
+
+inline void Query::validateLogical(Context& context, float multiplier) const {
+  validateLogicalImpl(context, multiplier);
+#ifndef NDEBUG
+  context.recordLogicalValidation(*this);
+#endif
+}
 
 // Lazy intersection of direct filter scorers over one L1-sized
 // production window. Unlike DocSet this has no segment-wide identity or

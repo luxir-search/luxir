@@ -39,6 +39,8 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
@@ -612,7 +614,7 @@ public:
   public:
     Weight(Context& context, NumericRangeQuery& query, int32_t flags,
            float constantScore)
-        : Query::Weight(context, flags), query(query),
+        : Query::Weight(context, query, flags), query(query),
           constantScore(constantScore) {
       traits |= IS_CONSTANT_SCORING;
       segInfos = context.readSegInfos(query.getField());

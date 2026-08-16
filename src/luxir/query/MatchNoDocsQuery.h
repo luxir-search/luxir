@@ -11,6 +11,13 @@ class MatchNoDocsQuery final : public luxir::Query {
 public:
   MatchNoDocsQuery() {}
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
+  bool directCountAvailable(IndexReader& reader) const override {
+    unused(reader);
+    return true;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
@@ -21,12 +28,13 @@ public:
   MatchNoDocsQuery::Weight* createWeight(Context& context, int32_t flags,
                                          float multiplier = 1.0f) override {
     unused(multiplier);
-    return context.pool.make<MatchNoDocsQuery::Weight>(context, flags);
+    return context.pool.make<MatchNoDocsQuery::Weight>(context, *this, flags);
   }
 
   class Weight final : public Query::Weight {
   public:
-    Weight(Context& context, int32_t flags) : Query::Weight(context, flags) {
+    Weight(Context& context, const MatchNoDocsQuery& query, int32_t flags)
+      : Query::Weight(context, query, flags) {
       traits |= IS_CONSTANT_SCORING;  // vacuously constant
     }
 

@@ -155,6 +155,20 @@ public:
   VerificationWork membershipVerificationWork() const override {
     return child->membershipVerificationWork();
   }
+  bool canOmitWeightForCacheFirstMembership() const override {
+    return child->canOmitWeightForCacheFirstMembership();
+  }
+  bool directCountAvailable(IndexReader& reader) const override {
+    return child->directCountAvailable(reader);
+  }
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    if (!std::isfinite(constantScore)) {
+      throw std::runtime_error("constant score must be finite");
+    }
+    checkedBoostProduct(multiplier, constantScore);
+    child->validateLogical(context, 1.0f);
+  }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -207,7 +221,7 @@ public:
 
   public:
     Weight(Context& context, ConstantScoreQuery& query, int32_t flags, float multiplier)
-      : Query::Weight(context, flags),
+      : Query::Weight(context, query, flags),
         constantScore(constantWhenScored(flags, multiplier, query.constantScore)) {
       // The child constrains matches; this wrapper replaces its score.
       childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);

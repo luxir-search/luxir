@@ -307,6 +307,7 @@ public:
     // recency, admission, or feedback effects until acceptExisting commits
     // the complete candidate.
     std::vector<std::shared_ptr<const SegmentValue>> existingCandidates;
+    std::shared_ptr<const ReaderValue> existingReaderCandidate;
     bool existingAccepted = false;
     std::vector<std::unique_ptr<RequestSlot>> requestSlots;
     std::vector<SegmentIdentity> readerSegments;
@@ -418,11 +419,14 @@ public:
              AdmissionLane lane = AdmissionLane::CLAUSE);
     // lookupExisting is an inert, complete-residency preflight. A successful
     // candidate remains invisible to execution until acceptExisting commits
-    // it and applies the ordinary shared-hit effects for every segment. The
-    // preflight is first-registration-only for a request key.
+    // it and applies the ordinary shared-hit effects for each resident value.
+    // The preflight is first-registration-only for a request key.
     std::optional<ExistingCandidate> lookupExisting(
         const FilterKey& key,
         FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE);
+    // READER_STABLE acceptance has no domain argument. Its caller must have
+    // established that this request is on the exact reader and canonical root
+    // domain before lookup; effectiveDocSet rechecks before serving values.
     Use* acceptExisting(
         ExistingCandidate&& candidate, AdmissionLane lane);
     size_t size() const { return uses.size(); }
@@ -588,6 +592,9 @@ private:
       Use& use, size_t segmentOrd,
       const std::shared_ptr<SegmentSlot>& slot,
       const std::shared_ptr<const SegmentValue>& value);
+  void acceptReaderSharedHit(
+      Use& use, const std::shared_ptr<FilterEntry>& entry,
+      const std::shared_ptr<const ReaderValue>& value);
   void observeAdmissionLane(Use& use, AdmissionLane lane);
   AdmissionRing& admissionFor(AdmissionLane lane);
   void recordCapacityEviction(

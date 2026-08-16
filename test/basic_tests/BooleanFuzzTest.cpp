@@ -115,14 +115,14 @@ struct DisjTwoPhaseGuard {
 };
 
 struct UnscoredOptionalDropGuard {
-  bool saved = BooleanQuery::Weight::disableUnscoredOptionalDropForTests;
+  bool saved = BooleanQuery::disableUnscoredOptionalDropForTests;
 
   explicit UnscoredOptionalDropGuard(bool disabled) {
-    BooleanQuery::Weight::disableUnscoredOptionalDropForTests = disabled;
+    BooleanQuery::disableUnscoredOptionalDropForTests = disabled;
   }
 
   ~UnscoredOptionalDropGuard() {
-    BooleanQuery::Weight::disableUnscoredOptionalDropForTests = saved;
+    BooleanQuery::disableUnscoredOptionalDropForTests = saved;
   }
 };
 

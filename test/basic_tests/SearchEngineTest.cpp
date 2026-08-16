@@ -1340,6 +1340,11 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
   CollectionHelper helper(collection);
   helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
+  SchemaBuilder schema;
+  auto& geo = schema.field("where");
+  geo.type = api::FieldDef::FieldClass::GEO_POINT;
+  geo.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
 
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 96; doc++) {
@@ -1362,8 +1367,16 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     }
     if ((doc % 4) == 0) body += "presto ";
     if ((doc % 6) == 0) body += "prefix ";
-    docs.push_back(flatdoc(
-        "id", "whole_" + std::to_string(doc), "body_w", body));
+    Doc indexed = flatdoc("id", "whole_" + std::to_string(doc),
+                          "rank_i", (int64_t) doc,
+                          "tag_s", (doc & 1) == 0 ? "alpha" : "zulu",
+                          "where", std::vector<double>{
+                              (double) doc - 48.0,
+                              (double) (doc % 31) - 15.0});
+    if ((doc % 13) != 0) {
+      indexed.push_back({"body_w", body});
+    }
+    docs.push_back(std::move(indexed));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.deleteById("whole_0", UpdateMessage::COMMIT).success);
@@ -1382,6 +1395,16 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
   families.emplace_back("intersection", [=](auto& mr) {
     return conjunction(mr, "alpha", "beta");
   });
+  families.emplace_back("required optional", [](auto& mr) {
+    return qb::boolean(
+        mr, {qb::match(mr, "body_w", "alpha")},
+        {qb::match(mr, "body_w", "gamma")});
+  });
+  families.emplace_back("duplicate terms", [](auto& mr) {
+    return qb::boolean(
+        mr, {qb::boost(mr, qb::match(mr, "body_w", "alpha"), 1.0f),
+             qb::boost(mr, qb::match(mr, "body_w", "alpha"), 1.0f)});
+  });
   families.emplace_back("union", [](auto& mr) {
     return qb::boolean(
         mr, {}, {qb::match(mr, "body_w", "beta"),
@@ -1399,6 +1422,11 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     return qb::boolean(
         mr, {qb::all()}, {}, {qb::match(mr, "body_w", "gamma")});
   });
+  families.emplace_back("filtered boolean", [](auto& mr) {
+    return qb::boolean(
+        mr, {qb::match(mr, "body_w", "alpha")}, {}, {},
+        {qb::match(mr, "body_w", "epsilon")});
+  });
   families.emplace_back("boosted", [=](auto& mr) {
     return qb::boost(mr, conjunction(mr, "alpha", "delta"), 3.0f);
   });
@@ -1406,14 +1434,38 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     return qb::constantScore(
         mr, conjunction(mr, "beta", "epsilon"), 4.0f);
   });
+  families.emplace_back("rescore", [=](auto& mr) {
+    return qb::rescore(
+        mr, conjunction(mr, "gamma", "epsilon"), "add(score,1)");
+  });
   families.emplace_back("prefix", [](auto& mr) {
     return qb::prefix(mr, "body_w", "pre");
   });
   families.emplace_back("wildcard", [](auto& mr) {
     return qb::wildcard(mr, "body_w", "col*");
   });
+  families.emplace_back("regex", [](auto& mr) {
+    return qb::regex(mr, "body_w", "col.*");
+  });
+  families.emplace_back("term range", [](auto& mr) {
+    return qb::range(mr, "tag_s", qb::valStr(mr, "a"), nullptr,
+                     qb::valStr(mr, "m"), nullptr);
+  });
   families.emplace_back("fuzzy", [](auto& mr) {
     return qb::fuzzy(mr, "body_w", "color", 1, 0, 20);
+  });
+  families.emplace_back("exists", [](auto& mr) {
+    return qb::exists(mr, "body_w");
+  });
+  families.emplace_back("numeric range", [](auto& mr) {
+    return qb::range(mr, "rank_i", qb::valI64(mr, 10), nullptr,
+                     qb::valI64(mr, 50), nullptr);
+  });
+  families.emplace_back("geo box", [](auto& mr) {
+    return qb::geoBox(mr, "where", -5.0, 5.0, -20.0, 20.0);
+  });
+  families.emplace_back("geo distance", [](auto& mr) {
+    return qb::geoDistance(mr, "where", 0.0, 0.0, 1000000.0);
   });
 
   for (const auto& [name, buildQuery] : families) {
@@ -1433,8 +1485,7 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     EXPECT_EQ(0, build.fallbackSuppliers);
     EXPECT_EQ(1, hit.hits);
     EXPECT_EQ(0, hit.fallbackSuppliers);
-    EXPECT_EQ(name == "phrase" || name == "sloppy phrase" ? 1 : 0,
-              hit.weightSkips);
+    EXPECT_EQ(1, hit.weightSkips);
 
     if (name == "phrase") {
       auto req = localReq(helper.getSearchEngine());
@@ -1453,6 +1504,27 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
                 req->errorMsg().find("query boost product must be finite"));
       EXPECT_EQ(0, SkipStats::cacheFirstMembershipWeightSkips);
     }
+    if (name == "duplicate terms") {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection(collection);
+      auto& topDocs = req->topDocs("q").getNumber().limit(0);
+      topDocs.rawQuery() = qb::boolean(
+          topDocs.mr(),
+          {qb::boost(topDocs.mr(),
+                     qb::match(topDocs.mr(), "body_w", "alpha"),
+                     std::numeric_limits<float>::max()),
+           qb::boost(topDocs.mr(),
+                     qb::match(topDocs.mr(), "body_w", "alpha"),
+                     std::numeric_limits<float>::max())});
+
+      SkipStatsGuard stats;
+      req->execute(false);
+      EXPECT_FALSE(req->ok());
+      EXPECT_NE(std::string::npos,
+                req->errorMsg().find(
+                    "summed duplicate-term boost must be finite"));
+      EXPECT_EQ(0, SkipStats::cacheFirstMembershipWeightSkips);
+    }
   }
 
   WholeCountRun unboostedHit = runWholeCount(
@@ -1465,6 +1537,113 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
         return conjunction(mr, "beta", "epsilon");
       });
   EXPECT_EQ(1, unwrappedConstantHit.hits);
+}
+
+TEST_F(SearchEngineTest,
+       logicalValidationPrecedesDisabledColdAndWarmCachePlanning) {
+  enum class InvalidShape {
+    UNUSED_MATCH_NONE_BOOST_OVERFLOW,
+    NONFINITE_CONSTANT_SCORE,
+  };
+  enum class CacheState {
+    DISABLED,
+    COLD,
+    WARM,
+  };
+
+  auto validQuery = [](std::pmr::memory_resource& mr, InvalidShape shape) {
+    auto phrase = qb::phraseWords(mr, "body_w", {"quick", "fox"});
+    if (shape == InvalidShape::UNUSED_MATCH_NONE_BOOST_OVERFLOW) {
+      return qb::boolean(mr, {phrase});
+    }
+    return qb::constantScore(mr, phrase, 1.0f);
+  };
+
+  auto invalidQuery = [](std::pmr::memory_resource& mr, InvalidShape shape) {
+    auto phrase = qb::phraseWords(mr, "body_w", {"quick", "fox"});
+    if (shape == InvalidShape::UNUSED_MATCH_NONE_BOOST_OVERFLOW) {
+      auto none = qb::phraseWords(mr, "body_w", {});
+      auto hidden = qb::boost(
+          mr,
+          qb::constantScore(
+              mr, none, std::numeric_limits<float>::max()),
+          std::numeric_limits<float>::max());
+      // This optional never affects membership and is dropped by every
+      // unscored Weight. Full-tree validation still visits its score state.
+      return qb::boolean(mr, {phrase}, {hidden});
+    }
+    return qb::constantScore(
+        mr, phrase, std::numeric_limits<float>::infinity());
+  };
+
+  auto run = [&](InvalidShape shape, CacheState state) {
+    LuxirConfig config;
+    config.filterCacheBytes = 0;
+    LuxirNode node(config);
+    constexpr std::string_view collection = "logical_validation_cache_state";
+    CollectionHelper helper(node, collection);
+    FilterCacheConfig cacheConfig{
+      .maxBytes = state == CacheState::DISABLED ? 0 : 64u << 20,
+      .minSegmentDocs = 0,
+    };
+    auto cache = std::make_shared<FilterCache>(cacheConfig);
+    helper.getIndexWriter()->filterCache = cache;
+    EXPECT_TRUE(helper.indexAll(std::array{
+        flatdoc("id", "1", "body_w", "quick fox"),
+        flatdoc("id", "2", "body_w", "quick brown fox"),
+        flatdoc("id", "3", "body_w", "quick fox again"),
+        flatdoc("id", "4", "body_w", "slow turtle")},
+        UpdateMessage::COMMIT).success);
+
+    if (state == CacheState::WARM) {
+      WholeCountRun bypass = runWholeCount(
+          node.getSearchEngine(), collection,
+          [&](auto& mr) { return validQuery(mr, shape); });
+      WholeCountRun build = runWholeCount(
+          node.getSearchEngine(), collection,
+          [&](auto& mr) { return validQuery(mr, shape); });
+      WholeCountRun hit = runWholeCount(
+          node.getSearchEngine(), collection,
+          [&](auto& mr) { return validQuery(mr, shape); });
+      EXPECT_EQ(bypass.found, build.found);
+      EXPECT_EQ(build.found, hit.found);
+      EXPECT_EQ(1, hit.weightSkips);
+    }
+
+    auto before = cache->counters();
+    auto request = localReq(node.getSearchEngine());
+    request->collection(collection);
+    auto& topDocs = request->topDocs("q").getNumber().limit(0);
+    topDocs.rawQuery() = invalidQuery(topDocs.mr(), shape);
+    SkipStatsGuard stats;
+    request->execute(false);
+    EXPECT_FALSE(request->ok());
+    EXPECT_EQ(0, SkipStats::cacheFirstMembershipWeightSkips);
+    auto after = cache->counters();
+    EXPECT_EQ(before.hits, after.hits);
+    EXPECT_EQ(before.misses, after.misses);
+    EXPECT_EQ(before.admissions, after.admissions);
+    EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+    EXPECT_EQ(before.builds, after.builds);
+    EXPECT_EQ(before.readerStableHits, after.readerStableHits);
+    return request->errorMsg();
+  };
+
+  for (InvalidShape shape : {
+           InvalidShape::UNUSED_MATCH_NONE_BOOST_OVERFLOW,
+           InvalidShape::NONFINITE_CONSTANT_SCORE}) {
+    SCOPED_TRACE((int) shape);
+    std::string disabled = run(shape, CacheState::DISABLED);
+    std::string cold = run(shape, CacheState::COLD);
+    std::string warm = run(shape, CacheState::WARM);
+    EXPECT_EQ(disabled, cold);
+    EXPECT_EQ(cold, warm);
+    std::string_view expected =
+        shape == InvalidShape::UNUSED_MATCH_NONE_BOOST_OVERFLOW
+        ? "query boost product must be finite"
+        : "constant score must be finite";
+    EXPECT_NE(std::string::npos, disabled.find(expected));
+  }
 }
 
 TEST_F(SearchEngineTest, limitZeroGetScoresUsesUnscoredWholeMembership) {
@@ -1523,6 +1702,9 @@ TEST_F(SearchEngineTest, wholeCountConstantGateAvoidsWholeAdmission) {
   WholeCountQueryBuilder term = [](auto& mr) {
     return qb::match(mr, "body_w", "alpha");
   };
+  WholeCountQueryBuilder singletonBoolean = [](auto& mr) {
+    return qb::boolean(mr, {qb::match(mr, "body_w", "alpha")});
+  };
   WholeCountQueryBuilder none = [](auto& mr) {
     return qb::phraseWords(mr, "body_w", {});
   };
@@ -1533,14 +1715,23 @@ TEST_F(SearchEngineTest, wholeCountConstantGateAvoidsWholeAdmission) {
         helper.getSearchEngine(), collection, none);
     WholeCountRun termRun = runWholeCount(
         helper.getSearchEngine(), collection, term);
+    WholeCountRun singletonBooleanRun = runWholeCount(
+        helper.getSearchEngine(), collection, singletonBoolean);
     EXPECT_EQ(32, allRun.found);
     EXPECT_EQ(0, noneRun.found);
     EXPECT_EQ(16, termRun.found);
+    EXPECT_EQ(16, singletonBooleanRun.found);
     EXPECT_EQ(0, allRun.hits + allRun.builds + allRun.bypasses);
     EXPECT_EQ(1, noneRun.constants);
     EXPECT_EQ(0, noneRun.hits + noneRun.builds + noneRun.bypasses);
     EXPECT_EQ(1, termRun.constants);
     EXPECT_EQ(0, termRun.hits + termRun.builds + termRun.bypasses);
+    EXPECT_EQ(1, singletonBooleanRun.constants);
+    EXPECT_EQ(0, singletonBooleanRun.hits + singletonBooleanRun.builds
+                     + singletonBooleanRun.bypasses);
+    EXPECT_EQ(0, allRun.weightSkips + noneRun.weightSkips
+                     + termRun.weightSkips
+                     + singletonBooleanRun.weightSkips);
   }
   EXPECT_EQ(0u, cache->entryCountForTest());
   EXPECT_EQ(0u, cache->counters().buildAttempts);

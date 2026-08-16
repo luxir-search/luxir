@@ -17,6 +17,13 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
+  bool directCountAvailable(IndexReader& reader) const override {
+    unused(reader);
+    return true;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
@@ -188,7 +195,7 @@ public:
     float score;
   public:
     Weight(Context& context, AllQuery& query, int32_t flags, float score)
-      : Query::Weight(context, flags), query(query), score(score) {
+      : Query::Weight(context, query, flags), query(query), score(score) {
       traits |= IS_CONSTANT_SCORING | MATCHES_ALL_DOCS;
     }
 

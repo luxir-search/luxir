@@ -35,6 +35,9 @@ class BooleanQuery final : public luxir::Query {
   int minShouldMatch;
 
 public:
+  // Test hook: keep score-only optional clauses in unscored plans.
+  static inline bool disableUnscoredOptionalDropForTests = false;
+
   enum NormalizeRule : uint32_t {
     R1_REQUIRED_INLINE = 1u << 0,
     R2_DISJUNCTION_FLATTEN = 1u << 1,
@@ -59,6 +62,14 @@ public:
     boost::container::small_vector<std::type_index, 16> filterTypes;
   };
 
+  struct CompiledPlanTestView {
+    const void* identity = nullptr;
+    std::span<Query* const> mandatory;
+    std::span<Query* const> optional;
+    std::span<Query* const> prohibited;
+    std::span<Query* const> filter;
+  };
+
 private:
   using ClauseList = boost::container::small_vector<Query*, 16>;
 
@@ -77,6 +88,22 @@ private:
         prohibited(query.prohibited.begin(), query.prohibited.end()),
         filter(query.filter.begin(), query.filter.end()),
         minShouldMatch(query.minShouldMatch) {}
+  };
+
+  struct CompiledBoolean {
+    std::span<Query*> mandatory;
+    std::span<Query*> optional;
+    std::span<Query*> prohibited;
+    std::span<Query*> filter;
+    int minShouldMatch = 0;
+    Query* singleChild = nullptr;
+    uint32_t ruleMask = 0;
+
+    bool dropsOptional(bool needsScores) const {
+      return !disableUnscoredOptionalDropForTests && !needsScores
+          && (!mandatory.empty() || !filter.empty())
+          && minShouldMatch < 1;
+    }
   };
 
   struct TransparentBoolean {
@@ -322,11 +349,11 @@ private:
         && lhs.getField() == rhs.getField() && lhs.getTerm() == rhs.getTerm();
   }
 
-  // Weight-time duplicate-clause normalization. Lucene dedups at rewrite, not
-  // query creation; a Luxir query tree is built per request and has no rewrite
-  // phase, so weight creation is the equivalent seam - it keeps query objects
-  // untouched (merges clone into the request pool) and sits where the
-  // similarity would be consulted if query-term weighting ever became a knob.
+  // Request-plan duplicate-clause normalization. Lucene dedups at rewrite,
+  // not query creation; a Luxir query tree is built per request and has no
+  // rewrite phase, so the serial logical plan is the equivalent seam. It
+  // keeps query objects untouched, persists merged clones in the request pool,
+  // and is shared by every Weight created for this Query.
   // Luxir intentionally sums boosts: Lucene's computeQueryTermWeight only
   // saturates duplicate qtf when BM25 k3 is configured, the default is linear
   // (equal to boost summing), and Luxir has no qtf hook.
@@ -408,6 +435,59 @@ private:
     auto* kept = pool.make_arr<Query*>(out.size());
     std::copy(out.begin(), out.end(), kept);
     return {kept, out.size()};
+  }
+
+  static std::span<Query*> persistClauses(
+      MemPool& pool, std::span<Query*> clauses) {
+    if (clauses.empty()) return {};
+    auto* persisted = pool.make_arr<Query*>(clauses.size());
+    std::copy(clauses.begin(), clauses.end(), persisted);
+    return {persisted, clauses.size()};
+  }
+
+  CompiledBoolean& logicalPlan(Context& context) const {
+    return context.getOrCreateLogicalPlan<CompiledBoolean>(*this, [&]() {
+      NormalizedBoolean normalized = normalize(context.pool);
+      auto* compiled = context.pool.make<CompiledBoolean>();
+      compiled->singleChild = normalized.singleChild;
+      compiled->ruleMask = normalized.ruleMask;
+      compiled->minShouldMatch = normalized.minShouldMatch;
+      if (compiled->singleChild != nullptr) return compiled;
+
+      auto mandatoryClauses = mergeDuplicateScoringTerms(
+          context.pool, normalized.mandatory);
+      int32_t removedOptional = 0;
+      auto optionalClauses = mergeDuplicateScoringTerms(
+          context.pool, normalized.optional, &removedOptional);
+      auto prohibitedClauses = dropDuplicateFilterTerms(
+          context.pool, normalized.prohibited);
+      auto filterClauses = dropDuplicateFilterTerms(
+          context.pool, normalized.filter);
+
+      // Luxir-defined min_match semantics under duplicate removal, split by
+      // the intent the value expresses (Lucene instead refuses to dedup when
+      // min_match > 1 and lets duplicates satisfy multiple match slots):
+      // - Above half the raw clauses, preserve the miss budget.
+      // - At or below half, preserve the absolute distinct-term count.
+      if (compiled->minShouldMatch > 1 && removedOptional > 0) {
+        if ((int64_t) compiled->minShouldMatch * 2
+            > (int64_t) normalized.optional.size()) {
+          compiled->minShouldMatch = std::max(
+              1, compiled->minShouldMatch - removedOptional);
+        } else {
+          compiled->minShouldMatch = std::min(
+              compiled->minShouldMatch, (int32_t) optionalClauses.size());
+        }
+      }
+
+      // NormalizedBoolean owns small_vector storage. Persist every final span
+      // in the request pool so all Weights for this Query share one plan.
+      compiled->mandatory = persistClauses(context.pool, mandatoryClauses);
+      compiled->optional = persistClauses(context.pool, optionalClauses);
+      compiled->prohibited = persistClauses(context.pool, prohibitedClauses);
+      compiled->filter = persistClauses(context.pool, filterClauses);
+      return compiled;
+    });
   }
 
 public:
@@ -654,6 +734,78 @@ public:
                    : VerificationWork::ABSENT;
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override {
+    auto allSupported = [](std::span<Query*> clauses) {
+      return std::all_of(
+          clauses.begin(), clauses.end(), [](Query* clause) {
+            return clause->canOmitWeightForCacheFirstMembership();
+          });
+    };
+    bool dropOptional = (!mandatory.empty() || !filter.empty())
+        && minShouldMatch < 1;
+    return allSupported(mandatory) && allSupported(prohibited)
+        && allSupported(filter)
+        && (dropOptional || allSupported(optional));
+  }
+
+  bool directCountAvailable(IndexReader& reader) const override {
+    if (prohibited.empty() && filter.empty()) {
+      if (mandatory.size() == 1 && optional.empty()) {
+        return mandatory[0]->directCountAvailable(reader);
+      }
+      if (mandatory.empty() && optional.size() == 1) {
+        return optional[0]->directCountAvailable(reader);
+      }
+      if (mandatory.empty() && optional.empty()) return true;
+    }
+    return false;
+  }
+
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    checkedBoostProduct(multiplier, 1.0f);
+    CompiledBoolean& plan = logicalPlan(context);
+
+    auto validate = [&](std::span<Query*> clauses, float childMultiplier) {
+      for (Query* clause : clauses) {
+        clause->validateLogical(context, childMultiplier);
+      }
+    };
+    validate(mandatory, multiplier);
+    validate(optional, multiplier);
+    validate(prohibited, 1.0f);
+    validate(filter, 1.0f);
+
+#ifndef NDEBUG
+    auto isImmediateRawClause = [&](Query* query) {
+      auto contains = [query](std::span<Query*> clauses) {
+        return std::find(clauses.begin(), clauses.end(), query)
+            != clauses.end();
+      };
+      return contains(mandatory) || contains(optional)
+          || contains(prohibited) || contains(filter);
+    };
+    auto recordGenerated = [&](Query* query) {
+      if (query == nullptr || isImmediateRawClause(query)) return;
+      while (auto* boost = dynamic_cast<BoostQuery*>(query)) {
+        context.recordLogicalValidation(*query);
+        query = boost->getChild();
+      }
+      context.recordLogicalValidation(*query);
+    };
+    recordGenerated(plan.singleChild);
+    auto recordGeneratedClauses = [&](std::span<Query*> clauses) {
+      for (Query* clause : clauses) recordGenerated(clause);
+    };
+    recordGeneratedClauses(plan.mandatory);
+    recordGeneratedClauses(plan.optional);
+    recordGeneratedClauses(plan.prohibited);
+    recordGeneratedClauses(plan.filter);
+#else
+    unused(plan);
+#endif
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendTag(FilterKeyTag::BOOLEAN);
@@ -750,13 +902,25 @@ public:
     return view;
   }
 
+  CompiledPlanTestView compiledPlanForTest(Context& context) const {
+    CompiledBoolean& plan = logicalPlan(context);
+    return {
+      .identity = &plan,
+      .mandatory = {plan.mandatory.data(), plan.mandatory.size()},
+      .optional = {plan.optional.data(), plan.optional.size()},
+      .prohibited = {plan.prohibited.data(), plan.prohibited.size()},
+      .filter = {plan.filter.data(), plan.filter.size()},
+    };
+  }
+
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    NormalizedBoolean plan = normalize(context.pool);
+    CompiledBoolean& plan = logicalPlan(context);
     if (plan.singleChild != nullptr) {
       return plan.singleChild->createWeight(context, flags, multiplier);
     }
-    return context.pool.make<BooleanQuery::Weight>(context, plan, flags, multiplier);
+    return context.pool.make<BooleanQuery::Weight>(
+        context, *this, plan, flags, multiplier);
   }
 
   struct ConjunctionClauseLayout {
@@ -4634,21 +4798,19 @@ public:
 
 
   public:
-    static inline bool disableUnscoredOptionalDropForTests = false;
-
-    Weight(Context& context, NormalizedBoolean& query, int32_t flags, float multiplier)
-      : Query::Weight(context, flags) {
+    Weight(Context& context, const BooleanQuery& owner,
+           CompiledBoolean& query, int32_t flags,
+           float multiplier)
+      : Query::Weight(context, owner, flags) {
       needsScores = (flags & Query::NEED_SCORES) != 0;
       allowsPruning = (flags & Query::ALLOW_PRUNING) != 0;
       // Only mandatory and optional clauses can contribute to score.
       int32_t noScore = flags & ~NEED_SCORES;
-      // Duplicate clauses normalize here (see mergeDuplicateScoringTerms).
-      auto mandatoryClauses = mergeDuplicateScoringTerms(context.pool, query.mandatory);
-      int32_t removedOptional = 0;
-      auto optionalClauses =
-        mergeDuplicateScoringTerms(context.pool, query.optional, &removedOptional);
-      auto prohibitedClauses = dropDuplicateFilterTerms(context.pool, query.prohibited);
-      auto filterClauses = dropDuplicateFilterTerms(context.pool, query.filter);
+      auto mandatoryClauses = query.mandatory;
+      auto optionalClauses = query.optional;
+      auto prohibitedClauses = query.prohibited;
+      auto filterClauses = query.filter;
+      minShouldMatch = query.minShouldMatch;
       if (!filterClauses.empty()) {
         filterUses = context.pool.make_span<FilterCache::Use*>(filterClauses.size());
         for (size_t i = 0; i < filterClauses.size(); i++) {
@@ -4663,9 +4825,7 @@ public:
       // "+a b" count-only requests to the single-clause count() shortcut.
       // minShouldMatch >= 1 makes the optional group a membership constraint
       // even under a mandatory clause, so it must be kept.
-      bool dropOptional = !disableUnscoredOptionalDropForTests && !needsScores
-        && (!mandatoryClauses.empty() || !filterClauses.empty())
-        && query.minShouldMatch < 1;
+      bool dropOptional = query.dropsOptional(needsScores);
       optionalWeights = dropOptional
         ? std::span<Query::Weight*>{}
         : createWeights(context.pool, context, optionalClauses, flags, multiplier);
@@ -4731,29 +4891,6 @@ public:
       int32_t exhaustiveFilterFlags = flags & ~(NEED_SCORES | ALLOW_PRUNING);
       filterWeights = createWeights(context.pool, context, filterClauses,
                                     exhaustiveFilterFlags, 1.0f);
-      // Luxir-defined min_match semantics under duplicate removal, split by
-      // the intent the value expresses (Lucene instead refuses to dedup when
-      // min_match > 1 and lets duplicates satisfy multiple match slots):
-      // - min_match above half the clauses ("10 words, mm=9") is a MISS
-      //   BUDGET: the user allows N - mm absences. Each removed duplicate
-      //   decrements min_match (floored at 1), keeping the budget constant: a
-      //   doc containing the duplicated term satisfies that slot, and a doc
-      //   missing it is charged for the absence only once.
-      // - min_match at or below half ("10 words, mm=2") is an ABSOLUTE
-      //   COUNT: match at least mm distinct words. It stays as-is, capped
-      //   at the deduped clause count so an all-duplicates query remains
-      //   satisfiable.
-      // The common producer is min_match computed from raw token counts of
-      // pasted text, where repeats would otherwise skew either reading.
-      minShouldMatch = query.minShouldMatch;
-      if (minShouldMatch > 1 && removedOptional > 0) {
-        if ((int64_t) minShouldMatch * 2 > (int64_t) query.optional.size()) {
-          minShouldMatch = std::max(1, minShouldMatch - removedOptional);
-        } else {
-          minShouldMatch = std::min(minShouldMatch, (int32_t) optionalClauses.size());
-        }
-      }
-
       if (QueryPrep::anyNeedsPrepare(mandatoryWeights) ||
           QueryPrep::anyNeedsPrepare(optionalWeights) ||
           QueryPrep::anyNeedsPrepare(prohibitedWeights) ||

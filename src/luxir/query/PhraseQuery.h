@@ -269,7 +269,7 @@ public:
     return VerificationWork::PRESENT;
   }
 
-  bool supportsCacheFirstMembership() const override { return true; }
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
@@ -364,7 +364,7 @@ public:
 
   public:
     Weight(Query::Context& context, PhraseQuery& query, int32_t flags, float multiplier)
-        : Query::Weight(context, flags), query(query) {
+        : Query::Weight(context, query, flags), query(query) {
       bool needScores = (flags & NEED_SCORES) != 0;
       if (!needScores) traits |= IS_CONSTANT_SCORING;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());

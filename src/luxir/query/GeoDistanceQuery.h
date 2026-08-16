@@ -41,6 +41,8 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);

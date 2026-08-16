@@ -574,6 +574,61 @@ TEST_F(BooleanNormalizeTest, singleClauseUnwrapPreservesWeightTraitsAndCount) {
               filterOnly.createWeight(context, Query::NEED_SCORES)), nullptr);
 }
 
+TEST_F(BooleanNormalizeTest,
+       compiledPlanStorageSurvivesRepeatedWeightConstruction) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "a b", "b"};
+  buildBodyIndex(testIndex, bodies);
+
+  TermQuery a1("body_w", "a", 2.0f);
+  TermQuery a2("body_w", "a", 3.0f);
+  Query* mandatory[] = {&a1, &a2};
+  BooleanQuery query(mandatory, {}, {}, {});
+  MemPool pool;
+  Query::Context context(pool, *testIndex.reader);
+
+  query.validateLogical(context);
+  auto initial = query.compiledPlanForTest(context);
+  ASSERT_EQ(1u, initial.mandatory.size());
+  Query* merged = initial.mandatory[0];
+  ASSERT_NE(&a1, merged);
+  ASSERT_NE(&a2, merged);
+
+  unused(query.createWeight(context, 0));
+  unused(query.createWeight(context, Query::NEED_SCORES));
+  auto repeated = query.compiledPlanForTest(context);
+  EXPECT_EQ(initial.identity, repeated.identity);
+  EXPECT_EQ(initial.mandatory.data(), repeated.mandatory.data());
+  EXPECT_EQ(merged, repeated.mandatory[0]);
+
+#ifndef NDEBUG
+  class MissingChildValidationQuery final : public Query {
+    Query& child;
+
+  public:
+    explicit MissingChildValidationQuery(Query& child) : child(child) {}
+
+    FilterKeyScope appendFilterKey(
+        FilterKeyBuilder& out, const FilterKeyContext& keyContext) const override {
+      unused(out, keyContext);
+      return FilterKeyScope::UNCACHEABLE;
+    }
+
+    Weight* createWeight(Context& weightContext, int32_t flags,
+                         float multiplier = 1.0f) override {
+      return child.createWeight(weightContext, flags, multiplier);
+    }
+  };
+
+  TermQuery unvisited("body_w", "b");
+  MissingChildValidationQuery missing(unvisited);
+  missing.validateLogical(context);
+  EXPECT_DEATH(
+      { unused(missing.createWeight(context, 0)); },
+      "Weight owner was not visited by logical validation");
+#endif
+}
+
 TEST_F(BooleanNormalizeTest, noScorePlanDropsRankOnlyOptionalWithFilter) {
   TestIndex testIndex;
   const std::string_view bodies[] = {"a f", "f"};

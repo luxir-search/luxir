@@ -15,6 +15,11 @@ class ForcePrepareQuery final : public luxir::Query {
 public:
   explicit ForcePrepareQuery(Query* child) : child(child) {}
 
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    child->validateLogical(context, multiplier);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -59,7 +64,7 @@ public:
 
   public:
     Weight(Context& context, ForcePrepareQuery& query, int32_t flags, float multiplier)
-      : Query::Weight(context, flags) {
+      : Query::Weight(context, query, flags) {
       childWeight = query.child->createWeight(context, flags, multiplier);
       // Forces prepare; scoring behavior is otherwise the child's.
       traits |= NEEDS_PREPARE | (childWeight->getFlags() & IS_CONSTANT_SCORING);

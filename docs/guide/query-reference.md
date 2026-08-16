@@ -154,11 +154,11 @@ least one indexed term for the field.
 | `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
 
 The engine also applies a current clause budget of `64` and may apply a lower
-operator limit. If the operator limit reduces a requested cap, the response
-contains `fuzzy_clamped`; if the scoring-clause budget truncates the selected
-expansions, it contains `fuzzy_scoring_truncated`. The documented default cap
-is not itself warned. Scoring uses blended BM25 statistics; filter context is
-constant-scoring, but both use the same expansion set and match set.
+operator limit. Expansion truncation is silent execution policy; the
+dictionary-dependent result does not change response metadata. Scoring uses
+blended BM25 statistics; filter context is constant-scoring, but both use the
+same expansion set and match set. Simple-query syntax still warns when it
+clamps an unsupported edit distance before constructing the fuzzy query.
 
 ## Range
 

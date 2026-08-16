@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <format>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -89,6 +88,14 @@ public:
   int getPrefixLength() const { return prefixLength; }
   int getMaxExpansions() const { return maxExpansions; }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    unused(context);
+    checkedBoostProduct(multiplier, boost);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendTag(FilterKeyTag::FUZZY);
@@ -102,7 +109,6 @@ public:
     int effectiveLimit = std::min({userExpansionLimit(), operatorLimit,
                                    FUZZY_CLAUSE_BUDGET});
     out.appendInt32(effectiveLimit);
-    out.appendFloat(boost);
     return FilterKeyScope::CORE_STABLE;
   }
 
@@ -143,10 +149,6 @@ private:
   void truncateCandidates(Context& context,
                           std::vector<ExpansionCandidate>& candidates) const {
     int matched = (int)candidates.size();
-    int userLimit = userExpansionLimit();
-    int operatorLimit = context.limits.fuzzyMaxExpansions > 0
-        ? context.limits.fuzzyMaxExpansions
-        : std::numeric_limits<int>::max();
     int limit = clauseLimit(context);
 
     if (matched > limit) {
@@ -155,21 +157,6 @@ private:
       candidates.resize((size_t)limit);
     } else {
       std::sort(candidates.begin(), candidates.end(), betterExpansion);
-    }
-
-    if (matched > operatorLimit && operatorLimit < userLimit) {
-      context.warn("fuzzy_clamped",
-                   std::format("fuzzy expansion matched {} terms for field '{}' term '{}'; "
-                               "operator limit {} kept closest terms",
-                               matched, getField(), getTerm(), operatorLimit));
-    }
-    if (matched > FUZZY_CLAUSE_BUDGET
-        && userLimit >= FUZZY_CLAUSE_BUDGET
-        && operatorLimit >= FUZZY_CLAUSE_BUDGET) {
-      context.warn("fuzzy_scoring_truncated",
-                   std::format("fuzzy expansion matched {} terms for field '{}' term '{}'; "
-                               "kept top {} by damp with term-order tie-break",
-                               matched, getField(), getTerm(), FUZZY_CLAUSE_BUDGET));
     }
   }
 
@@ -213,7 +200,13 @@ public:
   // decides only whether the kept clauses score, never which docs match.
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    return rewriteToDisjunction(context)->createWeight(context, flags, multiplier);
+    Query* rewritten = rewriteToDisjunction(context);
+#ifndef NDEBUG
+    if (context.logicalValidationActive()) {
+      rewritten->validateLogical(context, multiplier);
+    }
+#endif
+    return rewritten->createWeight(context, flags, multiplier);
   }
 };
 

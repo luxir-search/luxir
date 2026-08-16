@@ -285,6 +285,11 @@ class UncacheableQuery final : public Query {
 public:
   explicit UncacheableQuery(Query& child) : child(child) {}
 
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    child.validateLogical(context, multiplier);
+  }
+
   ScoreProfile scoreProfile() const override {
     return child.scoreProfile();
   }
@@ -311,9 +316,10 @@ class FailSecondSupplierQuery final : public Query {
     int32_t* supplierCalls;
 
   public:
-    Weight(Query::Context& context, int32_t flags, Query::Weight* child,
+    Weight(Query::Context& context, const Query& query, int32_t flags,
+           Query::Weight* child,
            int32_t* supplierCalls)
-      : Query::Weight(context, flags), child(child),
+      : Query::Weight(context, query, flags), child(child),
         supplierCalls(supplierCalls) {
       traits = child->getFlags();
     }
@@ -337,6 +343,11 @@ class FailSecondSupplierQuery final : public Query {
 public:
   explicit FailSecondSupplierQuery(Query& child) : child(child) {}
 
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    child.validateLogical(context, multiplier);
+  }
+
   ScoreProfile scoreProfile() const override {
     return child.scoreProfile();
   }
@@ -351,7 +362,7 @@ public:
       float multiplier = 1.0f) override {
     auto* childWeight = child.createWeight(context, flags, multiplier);
     return context.pool.make<Weight>(
-        context, flags, childWeight, &supplierCalls);
+        context, *this, flags, childWeight, &supplierCalls);
   }
 
   int32_t calls() const { return supplierCalls; }
@@ -681,6 +692,104 @@ TEST(FilterCacheTest, existingAcceptanceRevalidatesEverySegment) {
   EXPECT_FALSE(firstWhole.get(
       key, FilterKeyScope::SEGMENT_STABLE,
       FilterCache::AdmissionLane::WHOLE)->wasAdmitted());
+}
+
+TEST(FilterCacheTest, existingReaderAcceptanceIsInertUntilCommit) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addTermDoc(writer, "first");
+  addTermDoc(writer, "second");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto domains = canonicalDomains(*reader);
+
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  ASSERT_TRUE(cache.onReaderPublished(*reader));
+  FilterKey key("existing-reader-resident");
+  {
+    FilterCache::UseRegistry populate(cache, *reader);
+    auto* use = populate.get(
+        key, FilterKeyScope::READER_STABLE,
+        FilterCache::AdmissionLane::CLAUSE);
+    auto probe = use->probeReaderStable(*reader, domains);
+    ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
+    use->publishReaderStable(
+        probe, oneDocPerSegment(*reader), 10);
+  }
+
+  auto before = cache.counters();
+  FilterCache::UseRegistry request(cache, *reader);
+  auto candidate = request.lookupExisting(
+      key, FilterKeyScope::READER_STABLE);
+  ASSERT_TRUE(candidate.has_value());
+  EXPECT_EQ(0u, request.size());
+  auto afterLookup = cache.counters();
+  EXPECT_EQ(before.hits, afterLookup.hits);
+  EXPECT_EQ(before.readerStableHits, afterLookup.readerStableHits);
+  EXPECT_EQ(before.misses, afterLookup.misses);
+  EXPECT_EQ(before.admissions, afterLookup.admissions);
+  EXPECT_EQ(before.buildAttempts, afterLookup.buildAttempts);
+
+  auto* acceptedUse = request.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, acceptedUse);
+  EXPECT_TRUE(acceptedUse->hasAcceptedExisting());
+  EXPECT_EQ(before.hits + 1, cache.counters().hits);
+  EXPECT_EQ(before.readerStableHits + 1,
+            cache.counters().readerStableHits);
+  for (auto& segment : reader->segments()) {
+    DocSet* accepted = acceptedUse->effectiveDocSet(
+        (size_t) segment.ord, *reader,
+        domains[(size_t) segment.ord]);
+    ASSERT_NE(nullptr, accepted);
+    EXPECT_EQ(1, accepted->card());
+  }
+}
+
+TEST(FilterCacheTest, existingReaderAcceptanceRejectsPublishedReader) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addTermDoc(writer, "first");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto domains = canonicalDomains(*reader);
+
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  ASSERT_TRUE(cache.onReaderPublished(*reader));
+  FilterKey key("existing-reader-stale");
+  {
+    FilterCache::UseRegistry populate(cache, *reader);
+    auto* use = populate.get(
+        key, FilterKeyScope::READER_STABLE,
+        FilterCache::AdmissionLane::CLAUSE);
+    auto probe = use->probeReaderStable(*reader, domains);
+    ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
+    use->publishReaderStable(probe, oneDocPerSegment(*reader), 10);
+  }
+
+  FilterCache::UseRegistry request(cache, *reader);
+  auto candidate = request.lookupExisting(
+      key, FilterKeyScope::READER_STABLE);
+  ASSERT_TRUE(candidate.has_value());
+
+  addTermDoc(writer, "second");
+  writer.commit();
+  auto nextReader = writer.getIndexReader();
+  ASSERT_GT(nextReader->commitTime(), reader->commitTime());
+  ASSERT_TRUE(cache.onReaderPublished(*nextReader));
+  auto beforeAccept = cache.counters();
+
+  EXPECT_EQ(nullptr, request.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE));
+  EXPECT_EQ(0u, request.size());
+  auto afterAccept = cache.counters();
+  EXPECT_EQ(beforeAccept.hits, afterAccept.hits);
+  EXPECT_EQ(beforeAccept.readerStableHits, afterAccept.readerStableHits);
+  EXPECT_EQ(beforeAccept.admissions, afterAccept.admissions);
 }
 
 TEST(FilterCacheTest, incompleteExistingLookupHasNoCacheEffects) {
@@ -4402,6 +4511,175 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
   ASSERT_NO_THROW(cache->validateForTest());
 }
 
+TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
+  LuxirConfig config;
+  config.filterCacheBytes = 0;
+  LuxirNode node(config);
+  constexpr std::string_view collection = "filter_cache_fuzzy_boost";
+  luxir::test::CollectionHelper helper(node, collection);
+  FilterCacheConfig cacheConfig = testConfig();
+  cacheConfig.admissionThreshold = 1;
+  cacheConfig.minSegmentDocs = 0;
+  auto cache = std::make_shared<FilterCache>(cacheConfig);
+  helper.getIndexWriter()->filterCache = cache;
+
+  ASSERT_TRUE(helper.indexAll(std::array{
+      luxir::test::flatdoc("id", "1", "body_w", "color"),
+      luxir::test::flatdoc("id", "2", "body_w", "colon"),
+      luxir::test::flatdoc("id", "3", "body_w", "colors"),
+      luxir::test::flatdoc("id", "4", "body_w", "other")},
+      UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto schema = helper.collection().getSchema();
+
+  auto count = [&](float boost) {
+    MemPool pool;
+    FilterKeyContext keyContext{.schemaGen = schema->gen_, .timeZone = {}};
+    Query::Context context(pool, *reader, {}, nullptr, keyContext);
+    FuzzyQuery query("body_w", "color", 1, 0, 20, boost);
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(
+        query, FilterCache::AdmissionLane::WHOLE);
+    QueryPrep::WholeMembershipPlan plan(
+        *weight, use, context.filterUses);
+    int64_t result = 0;
+    for (auto& segment : reader->segments()) {
+      DocSet* domain = segment.liveDocs() == nullptr
+          ? nullptr : &segment.liveDocs()->docset();
+      auto resolved = plan.resolve(*reader, segment, domain);
+      EXPECT_TRUE(resolved.available);
+      result += resolved.count;
+    }
+    return result;
+  };
+
+  int64_t plain = count(1.0f);
+  auto afterPlain = cache->counters();
+  int64_t boosted = count(3.0f);
+  auto afterBoosted = cache->counters();
+  EXPECT_EQ(plain, boosted);
+  EXPECT_EQ(3, plain);
+  EXPECT_EQ(1u, cache->entryCountForTest());
+  EXPECT_EQ(afterPlain.builds, afterBoosted.builds);
+  EXPECT_GT(afterBoosted.hits, afterPlain.hits);
+}
+
+TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
+  LuxirConfig config;
+  config.filterCacheBytes = 0;
+  LuxirNode node(config);
+  constexpr std::string_view collection = "filter_cache_knn_count_first";
+  luxir::test::CollectionHelper helper(node, collection);
+  installVectorSchema(helper.collection());
+  auto cache = std::make_shared<FilterCache>(testConfig());
+  helper.getIndexWriter()->filterCache = cache;
+
+  std::vector<luxir::test::Doc> input;
+  for (int32_t i = 0; i < 24; i++) {
+    input.push_back(luxir::test::flatdoc(
+        "id", std::to_string(i),
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
+  std::array<float, 2> queryVector{0.0f, 0.0f};
+
+  struct Run {
+    int64_t count;
+    int64_t weightSkips;
+    int64_t prepares;
+  };
+  auto run = [&]() {
+    auto request = luxir::test::localReq(node.getSearchEngine());
+    auto& cursor = request->collection(collection)
+                       .topDocs("q").getNumber().limit(0);
+    cursor.rawQuery() = luxir::test::qb::knn(
+        cursor.mr(), "embedding_v", queryVector, 4, 0,
+        /*exact=*/true);
+    OwnedFilterStatsGuard stats;
+    request->execute(false);
+    EXPECT_TRUE(request->ok()) << request->toString();
+    return Run{
+        request->getMatchCount("q"),
+        SkipStats::cacheFirstMembershipWeightSkips,
+        KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed)};
+  };
+
+  int64_t preparesBefore = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  Run bypass = run();
+  Run build = run();
+  Run hit = run();
+  EXPECT_EQ(4, bypass.count);
+  EXPECT_EQ(bypass.count, build.count);
+  EXPECT_EQ(build.count, hit.count);
+  EXPECT_EQ(preparesBefore + 1, bypass.prepares);
+  EXPECT_EQ(bypass.prepares + 1, build.prepares);
+  EXPECT_EQ(build.prepares, hit.prepares);
+  EXPECT_EQ(0, bypass.weightSkips);
+  EXPECT_EQ(0, build.weightSkips);
+  EXPECT_EQ(1, hit.weightSkips);
+  EXPECT_EQ(1u, cache->counters().readerStableHits);
+}
+
+TEST(FilterCacheIntegrationTest,
+     nestedCanonicalKnnRetainsReaderStableWholeMembership) {
+  LuxirConfig config;
+  config.filterCacheBytes = 0;
+  LuxirNode node(config);
+  constexpr std::string_view collection = "filter_cache_nested_knn_count";
+  luxir::test::CollectionHelper helper(node, collection);
+  installVectorSchema(helper.collection());
+  auto cache = std::make_shared<FilterCache>(testConfig());
+  helper.getIndexWriter()->filterCache = cache;
+
+  std::vector<luxir::test::Doc> input;
+  for (int32_t i = 0; i < 24; i++) {
+    input.push_back(luxir::test::flatdoc(
+        "id", std::to_string(i),
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
+  std::array<float, 2> queryVector{0.0f, 0.0f};
+
+  struct Run {
+    int64_t count;
+    int64_t prepares;
+  };
+  auto run = [&]() {
+    auto request = luxir::test::localReq(node.getSearchEngine());
+    auto& root = request->collection(collection)
+                     .topDocs("root").allQuery().limit(0);
+    auto& nested = root.topDocs("near").getNumber().limit(0);
+    nested.rawQuery() = luxir::test::qb::knn(
+        nested.mr(), "embedding_v", queryVector, 4, 0,
+        /*exact=*/true);
+    request->execute(false);
+    EXPECT_TRUE(request->ok()) << request->toString();
+    const auto* rootResult = request->docList("root");
+    EXPECT_NE(nullptr, rootResult);
+    const auto* nestedResult = rootResult == nullptr
+        ? nullptr : rootResult->ops.find("near");
+    const auto* nestedDocs = nestedResult == nullptr
+        ? nullptr : (**nestedResult).docList();
+    return Run{
+        nestedDocs != nullptr && nestedDocs->found ? *nestedDocs->found : 0,
+        KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed)};
+  };
+
+  int64_t preparesBefore = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  Run bypass = run();
+  Run build = run();
+  Run hit = run();
+  EXPECT_EQ(4, bypass.count);
+  EXPECT_EQ(bypass.count, build.count);
+  EXPECT_EQ(build.count, hit.count);
+  EXPECT_EQ(preparesBefore + 1, bypass.prepares);
+  EXPECT_EQ(bypass.prepares + 1, build.prepares);
+  EXPECT_EQ(build.prepares, hit.prepares);
+  EXPECT_EQ(1u, cache->counters().readerStableHits);
+}
+
 TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   LuxirConfig config;
   config.filterCacheBytes = 0;
@@ -5002,6 +5280,8 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
 
 TEST(FilterKeyTest, fuzzyIsCoreStableAndIncludesEffectiveLimit) {
   FuzzyQuery fuzzy("title", "luxir", 2, 1, 0);
+  FuzzyQuery boostedFuzzy("title", "luxir", 2, 1, 0, 3.0f);
+  BoostQuery wrappedFuzzy(&fuzzy, 3.0f);
   FilterKeyContext first{.schemaGen = 5, .coreGen = 10,
                          .fuzzyMaxExpansions = 40, .timeZone = "UTC"};
   FilterKeyContext otherCore = first;
@@ -5011,6 +5291,8 @@ TEST(FilterKeyTest, fuzzyIsCoreStableAndIncludesEffectiveLimit) {
 
   EXPECT_NE(keyFor(fuzzy, first), keyFor(fuzzy, otherCore));
   EXPECT_NE(keyFor(fuzzy, first), keyFor(fuzzy, otherLimit));
+  EXPECT_EQ(keyFor(fuzzy, first), keyFor(boostedFuzzy, first));
+  EXPECT_EQ(keyFor(fuzzy, first), keyFor(wrappedFuzzy, first));
 }
 
 TEST(FilterKeyTest, everyConcreteQueryMakesAnExplicitScopeDecision) {

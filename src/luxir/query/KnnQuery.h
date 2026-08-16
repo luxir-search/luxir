@@ -102,6 +102,26 @@ class KnnQuery final : public luxir::Query {
   float minScanFraction;
   bool exact;
 
+  void validateKnnLogical() const {
+    if (!fieldType.knnSearchable()) {
+      throw std::runtime_error(std::format(
+          "KnnQuery on vector field '{}' without a metric", field));
+    }
+    if (fieldType.dims() > 0
+        && (int32_t) queryVec.size() != fieldType.dims()) {
+      throw std::runtime_error(std::format(
+          "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
+          queryVec.size(), fieldType.dims(), field));
+    }
+    for (float value : queryVec) {
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::format(
+            "KnnQuery: query vector for field '{}' must contain only finite values",
+            field));
+      }
+    }
+  }
+
 public:
   /// One result hit within a segment.  docId is the local docRank within the
   /// segment; score is converted to "higher is better" regardless of vector
@@ -274,6 +294,15 @@ public:
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    unused(context);
+    checkedBoostProduct(multiplier, 1.0f);
+    validateKnnLogical();
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
@@ -311,29 +340,9 @@ public:
 
   public:
     Weight(Query::Context& context, KnnQuery& query, int32_t flags, float multiplier)
-      : Query::Weight(context, flags), query(query),
+      : Query::Weight(context, query, flags), query(query),
         boost(constantWhenScored(flags, multiplier)) {
       traits |= NEEDS_PREPARE;  // index-level ANN pass
-      if (!query.getFieldType().knnSearchable()) {
-        throw std::runtime_error(std::format(
-          "KnnQuery on vector field '{}' without a metric", query.getField()));
-      }
-      if (query.getFieldType().dims() > 0 &&
-          (int32_t)query.getQueryVec().size() != query.getFieldType().dims()) {
-        throw std::runtime_error(std::format(
-          "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-          query.getQueryVec().size(), query.getFieldType().dims(), query.getField()));
-      }
-      // NaN scores would break the strict-total-order contract every bounded
-      // candidate cut relies on (see betterHit); reject bad queries loudly
-      // instead of ranking them arbitrarily.
-      for (float v : query.getQueryVec()) {
-        if (!std::isfinite(v)) {
-          throw std::runtime_error(std::format(
-            "KnnQuery: query vector for field '{}' must contain only finite values",
-            query.getField()));
-        }
-      }
     }
 
     class KnnPreparedWeight final : public Query::Weight::PreparedWeight {

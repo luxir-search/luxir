@@ -536,7 +536,7 @@ TEST_F(FuzzyQueryTest, unsetMaxExpansionsDefaultsToFifty) {
   EXPECT_EQ(60u, req2->getDocs().size());
 }
 
-TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
+TEST_F(FuzzyQueryTest, scoringClauseBudgetTruncatesSilently) {
   CollectionHelper helper{"main"};
   constexpr int32_t kMatches = FuzzyQuery::FUZZY_CLAUSE_BUDGET + 1;
   for (int32_t i = 0; i < kMatches; i++) {
@@ -547,8 +547,8 @@ TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
                  i == kMatches - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
-  // Explicit max_expansions above the budget: the budget clamps and warns
-  // (the silent default-50 path can't reach it).
+  // Explicit max_expansions above the budget: the budget clamps without a
+  // request warning. The truncation is execution policy, not response data.
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
       .fuzzyQuery("body_w", "aaaaa", 1, 0, 100)
@@ -556,16 +556,7 @@ TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ((size_t)FuzzyQuery::FUZZY_CLAUSE_BUDGET, req->getDocs().size());
-  ASSERT_TRUE(req->hasWarning("fuzzy_scoring_truncated"));
-  std::string message;
-  for (const auto& warning : req->respWarnings()) {
-    if (warning.code == "fuzzy_scoring_truncated") {
-      message = std::string(warning.message);
-      break;
-    }
-  }
-  EXPECT_NE(message.find("matched 65 terms"), std::string::npos) << message;
-  EXPECT_NE(message.find("top 64"), std::string::npos) << message;
+  EXPECT_TRUE(req->respWarnings().empty());
 }
 
 TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
@@ -650,7 +641,7 @@ TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   EXPECT_LT(pruned.visited, bruteForce.visited);
 }
 
-TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
+TEST_F(FuzzyQueryTest, operatorExpansionClampIsSilent) {
   CollectionHelper helper{"main"};
   constexpr int32_t kDocs = 10005;
   std::vector<Doc> docs;
@@ -662,12 +653,12 @@ TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
   // Explicit max_expansions above the operator limit: the operator clamp
-  // engages and warns (the default-50 cap sits far below the operator limit).
+  // engages without making response contents depend on a dictionary walk.
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
       .fuzzyQuery("body_w", "aaaaaaaa", 2, 0, 20000)
       .fields({"id"}).limit(1);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_TRUE(req->hasWarning("fuzzy_clamped"));
+  EXPECT_TRUE(req->respWarnings().empty());
 }

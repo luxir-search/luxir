@@ -360,17 +360,17 @@ partial success. The output can be piped directly into the
 
 ## Warnings and errors
 
-Warnings declare a request that succeeded with a bounded degradation. For
-example, `fuzzy_scoring_truncated` means the scoring-clause budget selected
-fewer expansions than the query requested:
+Warnings declare a request that succeeded after recovering from or clamping
+user-facing input. For example, simple-query fuzzy syntax clamps an edit
+distance above the supported maximum:
 
 ```json
-{"warnings":[{"code":"fuzzy_scoring_truncated","message":"..."}]}
+{"warnings":[{"code":"fuzzy_clamped","message":"..."}]}
 ```
 
 Treat warning `code` as the machine key and `message` as human detail. The
-engine does not silently drop or clamp query behavior. A lower operator limit
-uses the distinct `fuzzy_clamped` code.
+fuzzy query expansion limits are execution policy and do not produce response
+warnings.
 
 Unknown JSON keys, invalid enums, wrong field types, and expression syntax
 errors are rejected. Before execution, `?explain=request` returns the canonical

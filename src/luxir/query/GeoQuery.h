@@ -106,7 +106,7 @@ class GeoQueryWeight final : public Query::Weight {
 public:
   GeoQueryWeight(Query::Context& context, QueryType& query, int32_t flags,
                  float constantScore)
-      : Query::Weight(context, flags), query(query),
+      : Query::Weight(context, query, flags), query(query),
         constantScore(constantScore) {
     traits |= IS_CONSTANT_SCORING;
     segInfos = context.readSegInfos(query.getField());

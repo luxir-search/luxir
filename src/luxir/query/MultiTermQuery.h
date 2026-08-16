@@ -32,6 +32,8 @@ public:
     return ScoreProfile::automatic(1.0f);
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
 
@@ -196,7 +198,7 @@ public:
     }
 
     Weight(Context& context, MultiTermQuery& query, int32_t flags, float multiplier)
-      : Query::Weight(context, flags), query(query),
+      : Query::Weight(context, query, flags), query(query),
         boost(constantWhenScored(flags, multiplier)),
         canUseLazy((flags & (NEED_SCORES | ALLOW_PRUNING))
                      == (NEED_SCORES | ALLOW_PRUNING)

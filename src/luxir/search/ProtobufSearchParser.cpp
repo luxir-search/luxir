@@ -44,7 +44,8 @@ struct SearchParserImpl {
   static constexpr size_t MAX_SUBOP_RANGE_BUCKETS = 1024;
 
   enum class TopDocsPlacement : uint8_t {
-    OP_TREE,
+    ROOT_OP,
+    NESTED_OP,
     FUSION_SOURCE,
   };
 
@@ -304,7 +305,9 @@ public:
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
-        auto* qr = parseTopDocs(name, topDocs, TopDocsPlacement::OP_TREE);
+        auto placement = depth == 1 ? TopDocsPlacement::ROOT_OP
+                                    : TopDocsPlacement::NESTED_OP;
+        auto* qr = parseTopDocs(name, topDocs, placement);
         addSubs(*qr, topDocs.ops, depth);
         return qr;
       },
@@ -636,8 +639,8 @@ public:
     return out;
   }
 
-  // Build Weights for a filter list.  Weight ctors that may throw (e.g. KnnQuery
-  // dim validation) are resolved here; the resulting span is passed to the op ctor.
+  // Build Weights for a filter list after the serial logical-validation pass;
+  // the resulting span is passed to the op constructor.
   std::span<Query::Weight*> buildFilterWeights(
       std::span<std::pair<std::string_view, Query*>> filters,
       Query::Context& qcontext, int32_t requestFlags) {
@@ -699,7 +702,7 @@ public:
     bool countClauseDisabled =
         BooleanQuery::disableFilterClauseCountForTests
         && limit == 0 && topDocsReq.get_number;
-    bool attachSubOps = placement == TopDocsPlacement::OP_TREE;
+    bool attachSubOps = placement != TopDocsPlacement::FUSION_SOURCE;
     CollectionRequirements requirements{
       .needRankedDocs = limit > 0,
       .needExactCount = topDocsReq.get_number,
@@ -725,14 +728,30 @@ public:
       domainQuery = req.requestPool.make<ForcePrepareQuery>(domainQuery);
     }
 
-    // Sort field schema lookup and Weight ctors that may throw are resolved
-    // here in the parser and passed to the TopDocsReq ctor.
     auto parsedSorts = parseSorts(topDocsReq.sorts);
     auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader,
       {}, &req.warnings,
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},
       req.filterUses);
+    // One unconditional serial pass validates the complete effective query,
+    // including score decorations that an unscored Weight would not consume.
+    // Folded filters are already children of query; passive filters remain
+    // separate roots and must be visited explicitly.
+    query->validateLogical(*qcontext);
+    if (domainQuery != query && req.testForcePrepare) {
+      // The test-only domain product has its own ForcePrepareQuery root. Its
+      // child is already in the effective tree, but the wrapper itself is a
+      // separate createWeight root and must make the same explicit visit.
+      domainQuery->validateLogical(*qcontext);
+    }
+    if (!foldFilters) {
+      for (const auto& [filterName, filterQuery] : filters) {
+        unused(filterName);
+        filterQuery->validateLogical(*qcontext);
+      }
+    }
+
     // Flags for this request's main query. Filters inherit these after
     // buildFilterWeights clears NEED_SCORES.
     //
@@ -763,9 +782,11 @@ public:
         && (foldFilters || filters.empty());
     FilterCache::Use* cacheFirstMembershipUse = nullptr;
     auto* cache = req.reader->filterCache();
-    if (pureCountShape && query->supportsCacheFirstMembership()
+    if (pureCountShape && query->canOmitWeightForCacheFirstMembership()
+        && !query->directCountAvailable(*req.reader)
         && cache != nullptr && cache->enabled()) {
-      auto candidate = qcontext->lookupExistingFilterUse(*query);
+      auto candidate = qcontext->lookupExistingFilterUse(
+          *query, placement == TopDocsPlacement::ROOT_OP);
       if (candidate.has_value()) {
         cacheFirstMembershipUse = qcontext->acceptExistingFilterUse(
             std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
@@ -842,8 +863,12 @@ public:
         && weight != nullptr && limit > 0 && parsedSorts.useFieldSort
         && !weight->needsScores() && !requirements.needExactDomain
         && filterWeights.empty();
+    // Nested TopDocs under a match-all parent can inherit the canonical
+    // reader domain. Preserve the landed probe there and let
+    // probeReaderStable enforce the runtime domain gate. Fusion sources have
+    // a different ownership shape and remain excluded.
     bool readerStableWhole = weight != nullptr && weight->needsPrepare()
-        && placement == TopDocsPlacement::OP_TREE
+        && placement != TopDocsPlacement::FUSION_SOURCE
         && (pureCount || wholeFieldSort);
     if (weight != nullptr && weight->needsPrepare() && !readerStableWhole) {
       pureCount = false;
@@ -1019,7 +1044,12 @@ public:
     // weights.  All sources share the same reader/pool, so any qcontext
     // works; reusing one avoids an otherwise-unneeded allocation.
     // Shared filters use the same request flag path as TopDocs filters.
-    auto sharedFilterWeights = buildFilterWeights(sharedFilters, sources.front()->qcontext, Query::NEED_SCORES);
+    for (const auto& [filterName, filterQuery] : sharedFilters) {
+      unused(filterName);
+      filterQuery->validateLogical(sources.front()->qcontext);
+    }
+    auto sharedFilterWeights = buildFilterWeights(
+        sharedFilters, sources.front()->qcontext, Query::NEED_SCORES);
 
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());

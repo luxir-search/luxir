@@ -65,6 +65,22 @@ public:
     return VerificationWork::ABSENT;
   }
 
+  bool canOmitWeightForCacheFirstMembership() const override { return true; }
+
+  bool directCountAvailable(IndexReader& reader) const override {
+    return std::none_of(
+        reader.segments().begin(), reader.segments().end(),
+        [](const IndexReader::Segment& segment) {
+          return segment.liveDocs() != nullptr;
+        });
+  }
+
+  void validateLogicalImpl(
+      Context& context, float multiplier = 1.0f) const override {
+    unused(context);
+    checkedBoostProduct(multiplier, boost);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
@@ -95,8 +111,8 @@ public:
     float boost;
   public:
     Weight(Context& context, TermQuery& query, int32_t flags, float multiplier)
-            : Query::Weight(context, flags), query(query),
-              boost(checkedBoostProduct(multiplier, query.getBoost())) {
+            : Query::Weight(context, query, flags), query(query),
+              boost(multiplier * query.getBoost()) {
       bool needScores = (flags & NEED_SCORES) != 0;
       // Filter-style terms match normally but always score 0.
       if (!needScores) traits |= IS_CONSTANT_SCORING;

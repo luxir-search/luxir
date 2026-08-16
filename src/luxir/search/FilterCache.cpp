@@ -252,6 +252,28 @@ void FilterCache::acceptSharedHit(
   counter.hits.fetch_add(1, std::memory_order_relaxed);
 }
 
+void FilterCache::acceptReaderSharedHit(
+    Use& use, const std::shared_ptr<FilterEntry>& entry,
+    const std::shared_ptr<const ReaderValue>& value) {
+  value->cacheHits.fetch_add(1, std::memory_order_relaxed);
+  if (entry->readerValue.load(std::memory_order_acquire) != value) {
+    // Match the reader eviction transition so a candidate pinned before
+    // detach clears any zero-hit debt installed by that detach.
+    std::lock_guard<FilterEntry> feedbackLock(*entry);
+    entry->readerDeadBuildStreak.store(0, std::memory_order_relaxed);
+    entry->readerBuildBypassesRemaining.store(0, std::memory_order_relaxed);
+  } else {
+    entry->readerDeadBuildStreak.store(0, std::memory_order_relaxed);
+    entry->readerBuildBypassesRemaining.store(0, std::memory_order_relaxed);
+  }
+  uint64_t now = nextEpoch();
+  value->touch(now, evictionClock.load(std::memory_order_relaxed));
+  entry->lastUsed.store(now, std::memory_order_relaxed);
+  use.pinReaderValue(value);
+  counter.hits.fetch_add(1, std::memory_order_relaxed);
+  counter.readerStableHits.fetch_add(1, std::memory_order_relaxed);
+}
+
 void FilterCache::Use::pinReaderValue(
     const std::shared_ptr<const ReaderValue>& value) {
   if (value == nullptr) return;
@@ -443,30 +465,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
   }
 
   auto sharedHit = [&](std::shared_ptr<const ReaderValue> hitValue) {
-    hitValue->cacheHits.fetch_add(1, std::memory_order_relaxed);
-    if (localEntry->readerValue.load(std::memory_order_acquire) != hitValue) {
-      // A borrower that won before capacity detach resets feedback after the
-      // detach transition has installed any zero-hit debt.
-      std::lock_guard<FilterEntry> feedbackLock(*localEntry);
-      localEntry->readerDeadBuildStreak.store(0,
-                                              std::memory_order_relaxed);
-      localEntry->readerBuildBypassesRemaining.store(
-          0, std::memory_order_relaxed);
-    } else {
-      localEntry->readerDeadBuildStreak.store(0,
-                                              std::memory_order_relaxed);
-      localEntry->readerBuildBypassesRemaining.store(
-          0, std::memory_order_relaxed);
-    }
-    uint64_t now = cache->nextEpoch();
-    hitValue->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
-    localEntry->lastUsed.store(now, std::memory_order_relaxed);
-    cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
-    cache->counter.readerStableHits.fetch_add(1,
-                                              std::memory_order_relaxed);
-    // Pin at the cache boundary: consumers may drop the wrapper that holds
-    // the only other reference while borrowed DocSet pointers remain live.
-    pinReaderValue(hitValue);
+    cache->acceptReaderSharedHit(*this, localEntry, hitValue);
     return ReaderProbe(ReaderProbe::Kind::HIT, std::move(localEntry),
                        std::move(hitValue), false, false);
   };
@@ -609,6 +608,21 @@ DocSet* FilterCache::Use::effectiveDocSet(
   if (segment.segInfo.seg_id != readerSegments[segmentOrd].segId
       || segment.maxDoc() != readerSegments[segmentOrd].maxDoc) {
     return nullptr;
+  }
+  if (scope_ == FilterKeyScope::READER_STABLE) {
+    std::shared_ptr<const ReaderValue> value;
+    {
+      std::lock_guard<std::mutex> lock(readerStateMutex);
+      value = readerPin;
+    }
+    if (value == nullptr || value->readerVersion() != readerVersion
+        || reader.commitTime() != readerVersion) {
+      return nullptr;
+    }
+    DocSet* canonical = segment.liveDocs() == nullptr
+        ? nullptr : &segment.liveDocs()->docset();
+    if (domain != nullptr && domain != canonical) return nullptr;
+    return value->docSet(segmentOrd, readerSegments[segmentOrd]);
   }
   auto& requestSlot = *requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
@@ -1014,12 +1028,25 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
     uint64_t readerVersion,
     std::span<const SegmentIdentity> readerSegments) {
   if (!enabled() || readerSegments.empty()
-      || scope == FilterKeyScope::UNCACHEABLE
-      || scope == FilterKeyScope::READER_STABLE) {
+      || scope == FilterKeyScope::UNCACHEABLE) {
     return nullptr;
   }
   auto entry = findEntry(key);
   if (entry == nullptr || entry->scope != scope) return nullptr;
+
+  if (scope == FilterKeyScope::READER_STABLE) {
+    auto value = entry->readerValue.load(std::memory_order_acquire);
+    if (value == nullptr || value->readerVersion() != readerVersion) {
+      return nullptr;
+    }
+    auto use = std::unique_ptr<Use>(new Use(
+        this, key, scope, entry, {},
+        std::vector<SegmentIdentity>(readerSegments.begin(),
+                                     readerSegments.end()),
+        readerCoreGen, readerVersion, false, 0));
+    use->existingReaderCandidate = std::move(value);
+    return use;
+  }
 
   auto active = activeSegments.load(std::memory_order_acquire);
   auto current = entry->slots.load(std::memory_order_acquire);
@@ -1060,10 +1087,46 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane) {
   if (use.cache != this) return false;
   if (use.existingAccepted) {
     observeAdmissionLane(use, lane);
+    if (use.scope_ == FilterKeyScope::READER_STABLE) {
+      uint8_t laneBit = (uint8_t)(1U << (uint8_t)lane);
+      if ((use.readerAdmissionRecordedLanes & laneBit) == 0) {
+        admissionFor(lane).record(use.key.hash());
+        use.readerAdmissionRecordedLanes |= laneBit;
+      }
+    }
     return true;
   }
-  if (use.entry == nullptr || use.scope_ == FilterKeyScope::READER_STABLE
-      || use.existingCandidates.size() != use.readerSegments.size()
+  if (use.entry == nullptr) return false;
+  if (use.scope_ == FilterKeyScope::READER_STABLE) {
+    // Unlike probeReaderStable, acceptance has no domain argument. Its caller
+    // must have established an exact-reader canonical root domain before
+    // lookup. The accepted Use still rechecks that domain in effectiveDocSet
+    // before exposing the value.
+    auto value = use.existingReaderCandidate;
+    auto active = activeSegments.load(std::memory_order_acquire);
+    bool valid = value != nullptr
+        && value->readerVersion() == use.readerVersion
+        && active->readerVersion == use.readerVersion
+        && active->segments.size() == use.readerSegments.size();
+    for (const auto& identity : use.readerSegments) {
+      valid = valid && isActive(*active, identity);
+    }
+    if (!valid) return false;
+
+    observeAdmissionLane(use, lane);
+    uint8_t laneBit = (uint8_t)(1U << (uint8_t)lane);
+    if ((use.readerAdmissionRecordedLanes & laneBit) == 0) {
+      admissionFor(lane).record(use.key.hash());
+      use.readerAdmissionRecordedLanes |= laneBit;
+    }
+    use.admitted = true;
+    acceptReaderSharedHit(use, use.entry, value);
+    use.existingReaderCandidate.reset();
+    use.existingAccepted = true;
+    maybeSweep();
+    return true;
+  }
+  if (use.existingCandidates.size() != use.readerSegments.size()
       || use.slotsByOrd.size() != use.readerSegments.size()) {
     return false;
   }
