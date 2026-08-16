@@ -826,10 +826,6 @@ class WholeMembershipPlan {
       throw std::logic_error(
           "resident-only membership requires an accepted cache use");
     }
-    if (consumer != WholeMembershipConsumer::COUNT) {
-      throw std::logic_error(
-          "resident-only membership currently supports pure count only");
-    }
   }
 
   void record(int64_t& countCounter, int64_t& topKCountCounter,
@@ -1150,6 +1146,12 @@ inline Query::ScorerSupplier* filterSupplier(
 }
 
 struct ExactDomainSource {
+  enum class Source : uint8_t {
+    WEIGHT,
+    ACCEPTED_EXISTING,
+  };
+
+  Source source = Source::WEIGHT;
   Query::Weight* weight = nullptr;
   FilterCache::Use* cacheUse = nullptr;
 };
@@ -1175,6 +1177,17 @@ inline ExactDomainResult tryExactDomain(
   sets.reserve(sources.size() + (domain == nullptr ? 0 : 1));
   bool allAvailable = true;
   for (const auto& source : sources) {
+    if (source.source == ExactDomainSource::Source::ACCEPTED_EXISTING) {
+      assert(source.cacheUse != nullptr);
+      DocSet* exact = source.cacheUse->effectiveDocSet(
+          (size_t) segment.ord, reader);
+      if (exact == nullptr) {
+        throw std::logic_error(
+            "accepted exact-domain source lost a segment value");
+      }
+      sets.push_back(exact);
+      continue;
+    }
     if (source.weight == nullptr || source.weight->needsPrepare()) {
       allAvailable = false;
       continue;
@@ -1234,7 +1247,16 @@ class ExactDomainPlan {
 
 public:
   void add(Query::Weight& weight, FilterCache::Use* cacheUse) {
-    sources.push_back({&weight, cacheUse});
+    sources.push_back({ExactDomainSource::Source::WEIGHT, &weight, cacheUse});
+  }
+
+  void addAcceptedExisting(FilterCache::Use& cacheUse) {
+    if (!cacheUse.hasAcceptedExisting()) {
+      throw std::logic_error(
+          "resident exact-domain source requires an accepted cache use");
+    }
+    sources.push_back({
+        ExactDomainSource::Source::ACCEPTED_EXISTING, nullptr, &cacheUse});
   }
 
   bool empty() const { return sources.empty(); }

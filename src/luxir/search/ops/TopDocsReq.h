@@ -98,6 +98,14 @@ public:
     bool available() const noexcept { return keys.batch != nullptr; }
   };
 
+  struct CacheFirstFieldSortPlan {
+    FilterCache::Use* acceptedUse = nullptr;
+    std::span<uint8_t> routes;
+    bool decided = false;
+
+    bool omitsWeight() const noexcept { return acceptedUse != nullptr; }
+  };
+
   static FieldSortBestFirstPlan planFieldSortBestFirst(
       FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
     if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
@@ -124,6 +132,98 @@ public:
         sortPlan.clauses[0].getSortField().getFieldType()).type();
     return type == FieldType::INT || type == FieldType::DATE
         || type == FieldType::FLOAT || type == FieldType::DOUBLE;
+  }
+
+  static int64_t residentFieldSortCard(
+      const FilterCache::ExistingCandidate& candidate,
+      IndexReader::Segment& segment) {
+    const BitDocSet* liveDocs = segment.liveDocs() == nullptr
+        ? nullptr : &segment.liveDocs()->docset();
+    return candidate.residentCard((size_t)segment.ord, liveDocs);
+  }
+
+  // A complete inert candidate supplies exact per-segment cardinalities.
+  // Return true only when every segment selects the existing best-first
+  // economics. card <= 0 remains a rejection exactly as in
+  // planFieldSortBestFirst(); needing no execution work does not authorize
+  // cache hit effects for a rejected route.
+  static bool planResidentFieldSortBestFirstRoutes(
+      const FilterCache::ExistingCandidate& candidate,
+      IndexReader& reader, const SortPlan& sortPlan, int64_t topCount,
+      std::span<uint8_t> routes) {
+    assert(routes.size() == reader.segments().size());
+    assert(fieldSortCanUseMaskedBestFirst(sortPlan));
+    FieldSortCollector collector(
+        topCount, sortPlan.clauses, &reader, false);
+    MemPool pool;
+    bool allRouted = true;
+    for (auto& segment : reader.segments()) {
+      auto savepoint = pool.getSavePoint();
+      int64_t card = residentFieldSortCard(candidate, segment);
+      bool routed = false;
+      if (card > 0) {
+        collector.setSegment(
+            segment.ord, &segment.postingsReader(), &pool, card);
+        routed = planFieldSortBestFirst(
+            collector, card, segment.maxDoc()).available();
+      }
+      routes[(size_t)segment.ord] = (uint8_t)routed;
+      allRouted &= routed;
+      pool.rewind(savepoint);
+    }
+    return allRouted;
+  }
+
+  // Move only the provable Stage 4b decisions ahead of Weight construction.
+  // An incomplete lookup or dynamic conjunction returns undecided so the
+  // landed Weight-bearing router remains authoritative.
+  static CacheFirstFieldSortPlan planCacheFirstFieldSortWholeMembership(
+      Query& query, Query::PlanningContext& planning, IndexReader& reader,
+      const SortPlan& sortPlan, int64_t topCount,
+      bool allowReaderStable) {
+    Query::VerificationWork verification =
+        query.membershipVerificationWork();
+    bool verificationRoute =
+        verification == Query::VerificationWork::PRESENT;
+    bool numericBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
+    Query::FieldSortConjunction conjunction = numericBestFirst
+        ? query.fieldSortConjunction(planning)
+        : Query::FieldSortConjunction::NOT_FLAT;
+
+    bool mayInspectResident = verificationRoute
+        || (numericBestFirst
+            && conjunction == Query::FieldSortConjunction::NOT_FLAT);
+    if (!mayInspectResident) {
+      if (numericBestFirst
+          && conjunction == Query::FieldSortConjunction::DYNAMIC_TERMS) {
+        return {};
+      }
+      auto routes = planning.pool.make_span<uint8_t>(
+          reader.segments().size());
+      std::fill(routes.begin(), routes.end(), 0);
+      return {nullptr, routes, true};
+    }
+
+    auto candidate = planning.lookupExistingFilterUse(
+        query, allowReaderStable);
+    if (!candidate.has_value()) return {};
+
+    auto routes = planning.pool.make_span<uint8_t>(
+        reader.segments().size());
+    bool allRouted;
+    if (verificationRoute) {
+      std::fill(routes.begin(), routes.end(), 1);
+      allRouted = true;
+    } else {
+      allRouted = planResidentFieldSortBestFirstRoutes(
+          *candidate, reader, sortPlan, topCount, routes);
+    }
+    if (!allRouted) return {nullptr, routes, true};
+
+    FilterCache::Use* use = planning.acceptExistingFilterUse(
+        std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+    return use == nullptr ? CacheFirstFieldSortPlan{}
+                          : CacheFirstFieldSortPlan{use, routes, true};
   }
 
   // Cached membership pays for FIELD_SORT when it removes verification work
@@ -238,13 +338,16 @@ public:
   }
 
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
-  Query::Context& qcontext;
+  Query::PlanningContext& planning;
+  Query::Context* weightContext;
   Query* query;
   Query::Weight* weight;
   Query::Weight* countWeight;
   Query::Weight* rankingWeight;
   Query::Weight* wholeRankingWeight;
-  float wholeConstantScore;
+  bool wholeConstantRanking;
+  Query::ScoreProfile scoreProfile;
+  bool requestNeedsScores;
   int64_t topCount; // maximum number of docs to return.
   std::span<std::pair<std::string_view, Query*>> filters;
   std::span<Query::Weight*> filterWeights;
@@ -279,7 +382,7 @@ public:
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         return new MergeableCollector(
             op.topCount, op.sortPlan, op.req.reader.get(),
-            op.weight != nullptr && op.weight->needsScores());
+            op.requestNeedsScores);
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
@@ -566,7 +669,7 @@ public:
       auto* countBulk = countSupplier.buildBulk(pool, countPlan);
       if (countBulk == nullptr) return false;
       auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
-          pool, thisOp().qcontext.topReader.segments()[segnum]);
+          pool, thisOp().planning.topReader.segments()[segnum]);
       auto* exactScorer = scoringSupplier.buildBulk(pool, scoringPlan);
       if (exactScorer == nullptr) return false;
       assert(exactScorer->supportsExactCandidateScoring());
@@ -610,7 +713,7 @@ public:
       int64_t captured = 0;
       if (count > 0) {
         auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
-            pool, thisOp().qcontext.topReader.segments()[segnum]);
+            pool, thisOp().planning.topReader.segments()[segnum]);
         if (rankingSupplier == nullptr) return false;
         auto* rankingScorer = buildBoundedConstantScorer(
             pool, *rankingSupplier, collectorFilter, collector.topCount);
@@ -642,7 +745,7 @@ public:
       if (filterPtrs.empty()) return {};
       if (filterPtrs.size() == 1) {
         auto result = std::move(filters[0]);
-        return std::move(result).pinnedWith(op.qcontext.filterUses);
+        return std::move(result).pinnedWith(op.planning.filterUses);
       }
       return DomainHandle(DocSet::intersect(filterPtrs));
     }
@@ -737,7 +840,7 @@ public:
 
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        auto& seg = op.qcontext.topReader.segments()[segnum];
+        auto& seg = op.planning.topReader.segments()[segnum];
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         // Keep ownership until release so a scoring error cannot orphan it.
@@ -753,7 +856,6 @@ public:
         bool exactDomain = false;
         DocSet* exactDomainDocs = nullptr;
         if (!requiresPreparePhase && op.requirements.needExactDomain
-            && !op.requirements.needRankedDocs
             && !op.exactDomainPlan.empty()) {
           auto result = op.exactDomainPlan.produce(
               poolGuard.pool(), *op.req.reader, seg, domain);
@@ -763,7 +865,7 @@ public:
               output[(size_t)segnum] = domainHandle;
             } else {
               output[(size_t)segnum] = std::move(result.docs)
-                  .pinnedWith(op.qcontext.filterUses);
+                  .pinnedWith(op.planning.filterUses);
             }
             exactDomainDocs = output[(size_t)segnum].get();
             skipCount(SkipStats::exactDomainDocSetCollections);
@@ -810,7 +912,7 @@ public:
             if (!output.empty()) {
               output[(size_t)segnum] =
                   DomainHandle::pinned(
-                      borrowedDomain, op.qcontext.filterUses);
+                      borrowedDomain, op.planning.filterUses);
             }
           }
         }
@@ -828,10 +930,9 @@ public:
         }
 
         if (wholeTopKCountAvailable) {
-          assert(op.weight != nullptr);
           assert(rankFromDocOrder);
           assert(data->scoreCollector->topCount > 0);
-          if (op.weight->isConstantScoring()) {
+          if (op.wholeConstantRanking) {
             int64_t ranked = 0;
             if (wholeMembershipResult.count > 0) {
               Query::Scorer* scorer = nullptr;
@@ -839,7 +940,7 @@ public:
               if (wholeMembershipResult.docs.get() != nullptr) {
                 scorer = QueryPrep::createDocSetScorer(
                     poolGuard.pool(), wholeMembershipResult.docs.get(), seg,
-                    op.wholeConstantScore);
+                    op.scoreProfile.value);
                 collectorFilter = nullptr;
               } else {
                 auto* rankingSupplier = obtainMainSupplier();
@@ -859,7 +960,13 @@ public:
             data->addHits(wholeMembershipResult.count - ranked);
           } else {
             assert(op.wholeRankingWeight != nullptr);
-            auto* rankingSupplier = op.wholeRankingWeight->scorerSupplier(
+            Query::SegmentSource& rankingSource =
+                preparedWeight != nullptr
+                    && op.wholeRankingWeight == op.weight
+                ? static_cast<Query::SegmentSource&>(*preparedWeight)
+                : static_cast<Query::SegmentSource&>(
+                      *op.wholeRankingWeight);
+            auto* rankingSupplier = rankingSource.scorerSupplier(
                 poolGuard.pool(), seg);
             collectKnownCountTopK(
                 poolGuard.pool(), segnum, wholeMembershipResult.count,
@@ -880,16 +987,25 @@ public:
           if (rankFromDocOrder && data->topCount() > 0) {
             // Equal scores reduce ranking to doc order, so the domain's first
             // K docs are its top K.
-            if (supplier == nullptr) {
+            if (supplier == nullptr && op.weight != nullptr) {
               supplier = obtainMainSupplier();
             }
-            auto* scorer = supplier == nullptr ? nullptr
-              : buildBoundedConstantScorer(
-                    poolGuard.pool(), *supplier, identityDomain,
-                    data->topCount());
+            Query::Scorer* scorer = nullptr;
+            DocSet* collectorFilter = identityDomain;
+            if (supplier != nullptr) {
+              scorer = buildBoundedConstantScorer(
+                  poolGuard.pool(), *supplier, identityDomain,
+                  data->topCount());
+            } else if (identityDomain != nullptr) {
+              scorer = QueryPrep::createDocSetScorer(
+                  poolGuard.pool(), identityDomain, seg,
+                  op.scoreProfile.value);
+              collectorFilter = nullptr;
+            }
             if (scorer != nullptr) {
-              ranked = collectFirstKConstant(segnum, scorer, identityDomain,
-                                             *data->scoreCollector, data->topCount());
+              ranked = collectFirstKConstant(
+                  segnum, scorer, collectorFilter,
+                  *data->scoreCollector, data->topCount());
             }
           }
           assert(total >= ranked);
@@ -1050,6 +1166,16 @@ public:
             }
             if (!usedBulk && wholeFieldSortAvailable) {
               skipCount(SkipStats::wholeFieldSortLadderFallbacks);
+            }
+            if (!usedBulk && wholeFieldSortAvailable
+                && op.weight == nullptr) {
+              assert(wholeMembershipResult.docs.get() != nullptr);
+              supplier = poolGuard.pool().make<QueryPrep::DocSetSupplier>(
+                  wholeMembershipResult.docs.get(), seg);
+              // The accepted whole value is already composed with the root
+              // domain. It is the execution source, not an outer filter over
+              // a query scorer that no longer exists.
+              collectorFilter = nullptr;
             }
             if (!usedBulk && supplier == nullptr) {
               supplier = obtainMainSupplier();
@@ -1418,22 +1544,27 @@ public:
   // execution sources in. A fully resident validated membership plan may omit
   // the main Weight entirely.
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
-    Query::Context& qcontext, Query* query, Query::Weight* weight,
+    Query::PlanningContext& planning, Query::Context* weightContext,
+    Query* query, Query::Weight* weight,
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
     SortPlan&& sortPlan, CollectionRequirements requirements,
     Query::Weight* wholeMembershipWeight,
     Query::Weight* wholeRankingWeight,
     FilterCache::Use* wholeMembershipUse,
     std::span<const uint8_t> wholeFieldSortCacheRoutes,
-    float wholeConstantScore,
+    bool wholeConstantRanking, Query::ScoreProfile scoreProfile,
+    bool requestNeedsScores,
     std::span<std::pair<std::string_view, Query*>> filters,
     std::span<Query::Weight*> filterWeights,
     Query* domainQuery, Query::Weight* domainQueryWeight,
-    std::span<Query::Weight*> domainFilterWeights)
-    : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
+    std::span<Query::Weight*> domainFilterWeights,
+    std::span<FilterCache::Use*> residentExactDomainUses)
+    : SearchOp(req, name), topDocsProto(topDocsProto), planning(planning),
+      weightContext(weightContext), query(query),
       weight(weight), countWeight(countWeight), rankingWeight(rankingWeight),
       wholeRankingWeight(wholeRankingWeight),
-      wholeConstantScore(wholeConstantScore),
+      wholeConstantRanking(wholeConstantRanking), scoreProfile(scoreProfile),
+      requestNeedsScores(requestNeedsScores),
       topCount(topCount), filters(filters), filterWeights(filterWeights),
       requirements(requirements),
       sortPlan(std::move(sortPlan)) {
@@ -1445,39 +1576,53 @@ public:
     if (wholeMembershipWeight != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan(
           *wholeMembershipWeight, wholeMembershipUse,
-          qcontext.filterUses,
+          planning.filterUses,
           PreparedDomainDependence::QUERY_CANONICAL,
           wholeConsumer,
           wholeFieldSortCacheRoutes);
     } else if (wholeMembershipUse != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan::acceptedExisting(
-          *wholeMembershipUse, qcontext.filterUses, wholeConsumer);
+          *wholeMembershipUse, planning.filterUses, wholeConsumer);
     }
     if (weight == nullptr) {
-      if (wholeMembershipUse == nullptr || requirements.needRankedDocs
-          || !requirements.needExactCount || requirements.needExactDomain
-          || this->sortPlan.useFieldSort || !filterWeights.empty()) {
+      bool residentWhole = wholeMembershipUse != nullptr
+          && !requirements.needExactDomain
+          && ((this->sortPlan.useFieldSort
+                  && requirements.needRankedDocs && !requestNeedsScores)
+              || (requirements.needExactCount
+                  && (!requirements.needRankedDocs
+                      || scoreProfile.kind
+                          != Query::ScoreProfile::Kind::VARIABLE)));
+      bool residentExact = !residentExactDomainUses.empty()
+          && requirements.needExactDomain && !this->sortPlan.useFieldSort
+          && (!requirements.needRankedDocs
+              || scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE);
+      if ((!residentWhole && !residentExact) || !filterWeights.empty()) {
         throw std::logic_error(
-            "Weight-free TopDocs requires complete pure-count membership");
+            "Weight-free TopDocs requires complete resident membership");
       }
     }
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());
-      filterUses = qcontext.pool.make_span<FilterCache::Use*>(filters.size());
+      filterUses = planning.pool.make_span<FilterCache::Use*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
-        filterUses[i] = qcontext.getFilterUse(*filters[i].second);
+        filterUses[i] = planning.getFilterUse(*filters[i].second);
       }
     }
-    if (domainQueryWeight != nullptr) {
+    if (!residentExactDomainUses.empty()) {
+      for (auto* use : residentExactDomainUses) {
+        exactDomainPlan.addAcceptedExisting(*use);
+      }
+    } else if (domainQueryWeight != nullptr) {
       if (!domainQueryWeight->matchesAllDocs()) {
         exactDomainPlan.add(
-            *domainQueryWeight, qcontext.getFilterUse(*domainQuery));
+            *domainQueryWeight, planning.getFilterUse(*domainQuery));
       }
       assert(domainFilterWeights.size() == filters.size());
       for (size_t i = 0; i < domainFilterWeights.size(); i++) {
         exactDomainPlan.add(
             *domainFilterWeights[i],
-            qcontext.getFilterUse(*filters[i].second));
+            planning.getFilterUse(*filters[i].second));
       }
     }
   }

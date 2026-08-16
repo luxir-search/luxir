@@ -155,14 +155,21 @@ public:
   VerificationWork membershipVerificationWork() const override {
     return child->membershipVerificationWork();
   }
+  FieldSortConjunction fieldSortConjunction(
+      PlanningContext& context) const override {
+    return child->fieldSortConjunction(context);
+  }
   bool canOmitWeightForCacheFirstMembership() const override {
     return child->canOmitWeightForCacheFirstMembership();
   }
   bool directCountAvailable(IndexReader& reader) const override {
     return child->directCountAvailable(reader);
   }
+  bool exactDomainIdentity() const override {
+    return child->exactDomainIdentity();
+  }
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     if (!std::isfinite(constantScore)) {
       throw std::runtime_error("constant score must be finite");
     }

@@ -406,8 +406,12 @@ public:
     return child->directCountAvailable(reader);
   }
 
+  bool exactDomainIdentity() const override {
+    return child->exactDomainIdentity();
+  }
+
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     if (!std::isfinite(multiplier) || multiplier < 0.0f) {
       throw std::runtime_error(
           "rescore multiplier must be finite and non-negative");

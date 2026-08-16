@@ -286,7 +286,7 @@ public:
   explicit UncacheableQuery(Query& child) : child(child) {}
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     child.validateLogical(context, multiplier);
   }
 
@@ -344,7 +344,7 @@ public:
   explicit FailSecondSupplierQuery(Query& child) : child(child) {}
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     child.validateLogical(context, multiplier);
   }
 

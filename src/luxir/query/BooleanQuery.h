@@ -445,7 +445,7 @@ private:
     return {persisted, clauses.size()};
   }
 
-  CompiledBoolean& logicalPlan(Context& context) const {
+  CompiledBoolean& logicalPlan(PlanningContext& context) const {
     return context.getOrCreateLogicalPlan<CompiledBoolean>(*this, [&]() {
       NormalizedBoolean normalized = normalize(context.pool);
       auto* compiled = context.pool.make<CompiledBoolean>();
@@ -734,6 +734,47 @@ public:
                    : VerificationWork::ABSENT;
   }
 
+  FieldSortConjunction fieldSortConjunction(
+      PlanningContext& context) const override {
+    CompiledBoolean& plan = logicalPlan(context);
+    if (plan.singleChild != nullptr) {
+      return plan.singleChild->fieldSortConjunction(context);
+    }
+
+    bool hasRequired = !plan.mandatory.empty() || !plan.filter.empty();
+    if (!hasRequired || !plan.prohibited.empty()
+        || (!plan.optional.empty() && !plan.dropsOptional(false))) {
+      return FieldSortConjunction::NOT_FLAT;
+    }
+
+    bool hasOther = false;
+    bool hasDynamicTerms = false;
+    auto classify = [&](std::span<Query*> clauses) {
+      for (Query* clause : clauses) {
+        while (auto* boost = dynamic_cast<BoostQuery*>(clause)) {
+          clause = boost->getChild();
+        }
+        while (auto* constant = dynamic_cast<ConstantScoreQuery*>(clause)) {
+          clause = constant->getChild();
+          while (auto* boost = dynamic_cast<BoostQuery*>(clause)) {
+            clause = boost->getChild();
+          }
+        }
+        if (dynamic_cast<TermQuery*>(clause) != nullptr) continue;
+        if (dynamic_cast<MultiTermQuery*>(clause) != nullptr) {
+          hasDynamicTerms = true;
+        } else {
+          hasOther = true;
+        }
+      }
+    };
+    classify(plan.mandatory);
+    classify(plan.filter);
+    if (hasDynamicTerms) return FieldSortConjunction::DYNAMIC_TERMS;
+    return hasOther ? FieldSortConjunction::NOT_FLAT
+                    : FieldSortConjunction::FLAT_LITERAL_TERMS;
+  }
+
   bool canOmitWeightForCacheFirstMembership() const override {
     auto allSupported = [](std::span<Query*> clauses) {
       return std::all_of(
@@ -762,7 +803,7 @@ public:
   }
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     checkedBoostProduct(multiplier, 1.0f);
     CompiledBoolean& plan = logicalPlan(context);
 
@@ -903,7 +944,7 @@ public:
   }
 
   CompiledPlanTestView compiledPlanForTest(Context& context) const {
-    CompiledBoolean& plan = logicalPlan(context);
+    CompiledBoolean& plan = logicalPlan(context.planningContext());
     return {
       .identity = &plan,
       .mandatory = {plan.mandatory.data(), plan.mandatory.size()},
@@ -915,7 +956,7 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    CompiledBoolean& plan = logicalPlan(context);
+    CompiledBoolean& plan = logicalPlan(context.planningContext());
     if (plan.singleChild != nullptr) {
       return plan.singleChild->createWeight(context, flags, multiplier);
     }

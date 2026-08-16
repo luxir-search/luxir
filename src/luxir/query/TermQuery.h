@@ -76,7 +76,7 @@ public:
   }
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     unused(context);
     checkedBoostProduct(multiplier, boost);
   }

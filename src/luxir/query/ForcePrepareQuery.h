@@ -16,13 +16,17 @@ public:
   explicit ForcePrepareQuery(Query* child) : child(child) {}
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     child->validateLogical(context, multiplier);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
+  }
+
+  bool exactDomainIdentity() const override {
+    return child->exactDomainIdentity();
   }
 
   Weight* createWeight(Context& context, int32_t flags,

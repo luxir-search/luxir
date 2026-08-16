@@ -297,7 +297,7 @@ public:
   bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     unused(context);
     checkedBoostProduct(multiplier, 1.0f);
     validateKnnLogical();

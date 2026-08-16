@@ -587,7 +587,7 @@ TEST_F(BooleanNormalizeTest,
   MemPool pool;
   Query::Context context(pool, *testIndex.reader);
 
-  query.validateLogical(context);
+  query.validateLogical(context.planningContext());
   auto initial = query.compiledPlanForTest(context);
   ASSERT_EQ(1u, initial.mandatory.size());
   Query* merged = initial.mandatory[0];
@@ -622,7 +622,7 @@ TEST_F(BooleanNormalizeTest,
 
   TermQuery unvisited("body_w", "b");
   MissingChildValidationQuery missing(unvisited);
-  missing.validateLogical(context);
+  missing.validateLogical(context.planningContext());
   EXPECT_DEATH(
       { unused(missing.createWeight(context, 0)); },
       "Weight owner was not visited by logical validation");

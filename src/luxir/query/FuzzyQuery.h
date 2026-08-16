@@ -91,7 +91,7 @@ public:
   bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   void validateLogicalImpl(
-      Context& context, float multiplier = 1.0f) const override {
+      PlanningContext& context, float multiplier = 1.0f) const override {
     unused(context);
     checkedBoostProduct(multiplier, boost);
   }
@@ -203,7 +203,7 @@ public:
     Query* rewritten = rewriteToDisjunction(context);
 #ifndef NDEBUG
     if (context.logicalValidationActive()) {
-      rewritten->validateLogical(context, multiplier);
+      rewritten->validateLogical(context.planningContext(), multiplier);
     }
 #endif
     return rewritten->createWeight(context, flags, multiplier);

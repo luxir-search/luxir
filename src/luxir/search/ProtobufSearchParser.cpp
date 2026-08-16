@@ -729,8 +729,9 @@ public:
     }
 
     auto parsedSorts = parseSorts(topDocsReq.sorts);
-    auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader,
-      {}, &req.warnings,
+    auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
+      req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
+      &req.warnings,
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},
       req.filterUses);
@@ -738,17 +739,17 @@ public:
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
     // separate roots and must be visited explicitly.
-    query->validateLogical(*qcontext);
+    query->validateLogical(*planningContext);
     if (domainQuery != query && req.testForcePrepare) {
       // The test-only domain product has its own ForcePrepareQuery root. Its
       // child is already in the effective tree, but the wrapper itself is a
       // separate createWeight root and must make the same explicit visit.
-      domainQuery->validateLogical(*qcontext);
+      domainQuery->validateLogical(*planningContext);
     }
     if (!foldFilters) {
       for (const auto& [filterName, filterQuery] : filters) {
         unused(filterName);
-        filterQuery->validateLogical(*qcontext);
+        filterQuery->validateLogical(*planningContext);
       }
     }
 
@@ -776,6 +777,11 @@ public:
     if (allowPruning) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
+    Query::ScoreProfile scoreProfile = query->scoreProfile();
+    bool exactCountTopK = requirements.needRankedDocs
+        && requirements.needExactCount && !requirements.needExactDomain
+        && !parsedSorts.useFieldSort
+        && parsedSorts.rankNeedsScores;
     bool pureCountShape = !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
@@ -785,28 +791,137 @@ public:
     if (pureCountShape && query->canOmitWeightForCacheFirstMembership()
         && !query->directCountAvailable(*req.reader)
         && cache != nullptr && cache->enabled()) {
-      auto candidate = qcontext->lookupExistingFilterUse(
+      auto candidate = planningContext->lookupExistingFilterUse(
           *query, placement == TopDocsPlacement::ROOT_OP);
       if (candidate.has_value()) {
-        cacheFirstMembershipUse = qcontext->acceptExistingFilterUse(
+        cacheFirstMembershipUse = planningContext->acceptExistingFilterUse(
             std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
       }
       if (cacheFirstMembershipUse != nullptr) {
         skipCount(SkipStats::cacheFirstMembershipWeightSkips);
       }
     }
-    auto* weight = cacheFirstMembershipUse == nullptr
-        ? query->createWeight(*qcontext, requestFlags) : nullptr;
+
+    bool cacheFirstTopKCount = false;
+    if (cacheFirstMembershipUse == nullptr
+        && placement == TopDocsPlacement::ROOT_OP
+        && !QueryPrep::disableWholeMembershipPlanForTests
+        && exactCountTopK && (foldFilters || filters.empty())
+        && query->canOmitWeightForCacheFirstMembership()
+        && !query->directCountAvailable(*req.reader)
+        && cache != nullptr && cache->enabled()) {
+      auto candidate = planningContext->lookupExistingFilterUse(*query, true);
+      if (candidate.has_value()) {
+        cacheFirstMembershipUse = planningContext->acceptExistingFilterUse(
+            std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+      }
+      cacheFirstTopKCount = cacheFirstMembershipUse != nullptr;
+      if (cacheFirstTopKCount) {
+        skipCount(SkipStats::cacheFirstTopKCountWeightSkips);
+        if (scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE) {
+          skipCount(SkipStats::cacheFirstConstantTopKWeightSkips);
+        }
+      }
+    }
+
+    std::span<FilterCache::Use*> residentExactDomainUses;
+    bool cacheFirstExactDomain = false;
+    bool constantExactDomainRanking = requirements.needRankedDocs
+        && scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE;
+    bool canOmitForExactDomain = placement == TopDocsPlacement::ROOT_OP
+        && requirements.needExactDomain && !parsedSorts.useFieldSort
+        && (!requirements.needRankedDocs || constantExactDomainRanking)
+        && cache != nullptr && cache->enabled();
+    if (canOmitForExactDomain) {
+      bool domainIdentity = domainQuery->exactDomainIdentity();
+      auto sourceQueries = req.requestPool.make_span<Query*>(
+          (size_t)!domainIdentity + filters.size());
+      size_t sourceIndex = 0;
+      bool allOmittable = true;
+      if (!domainIdentity) {
+        sourceQueries[sourceIndex++] = domainQuery;
+        allOmittable =
+            domainQuery->canOmitWeightForCacheFirstMembership();
+      }
+      for (size_t i = 0; i < filters.size(); i++) {
+        sourceQueries[sourceIndex++] = filters[i].second;
+        allOmittable &=
+            filters[i].second->canOmitWeightForCacheFirstMembership();
+      }
+      if (allOmittable && !sourceQueries.empty()) {
+        bool allowReaderStable = sourceQueries.size() == 1;
+        residentExactDomainUses = planningContext->acceptExistingFilterUses(
+            sourceQueries, allowReaderStable,
+            FilterCache::AdmissionLane::CLAUSE);
+        cacheFirstExactDomain = !residentExactDomainUses.empty();
+      }
+      if (cacheFirstExactDomain) {
+        skipCount(SkipStats::cacheFirstExactDomainWeightSkips);
+        if (constantExactDomainRanking) {
+          skipCount(SkipStats::cacheFirstConstantTopKWeightSkips);
+        }
+      }
+    }
+
+    bool cacheFirstFieldSort = false;
+    bool fieldSortRoutesPreplanned = false;
+    std::span<uint8_t> cacheFirstFieldSortRoutes;
+    bool cacheFirstFieldSortShape =
+        placement == TopDocsPlacement::ROOT_OP
+        && !QueryPrep::disableWholeMembershipPlanForTests
+        && limit > 0 && parsedSorts.useFieldSort
+        && (requestFlags & Query::NEED_SCORES) == 0
+        && !requirements.needExactDomain
+        && (foldFilters || filters.empty())
+        && query->canOmitWeightForCacheFirstMembership()
+        && cache != nullptr && cache->enabled();
+    if (cacheFirstFieldSortShape) {
+      auto fieldSortPreflight =
+          TopDocsReq::planCacheFirstFieldSortWholeMembership(
+              *query, *planningContext, *req.reader, parsedSorts, limit,
+              true);
+      cacheFirstMembershipUse = fieldSortPreflight.acceptedUse;
+      cacheFirstFieldSortRoutes = fieldSortPreflight.routes;
+      fieldSortRoutesPreplanned = fieldSortPreflight.decided;
+      cacheFirstFieldSort = fieldSortPreflight.omitsWeight();
+      if (cacheFirstFieldSort) {
+        skipCount(SkipStats::cacheFirstFieldSortWeightSkips);
+      }
+    }
+
+    bool omitMainWeight = (cacheFirstMembershipUse != nullptr
+            && (!cacheFirstTopKCount
+                || scoreProfile.kind
+                    != Query::ScoreProfile::Kind::VARIABLE))
+        || cacheFirstExactDomain || cacheFirstFieldSort;
+    bool cacheFirstVariableRanking = cacheFirstTopKCount
+        && scoreProfile.kind == Query::ScoreProfile::Kind::VARIABLE;
+    int32_t mainWeightFlags = cacheFirstVariableRanking
+        ? requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING
+        : requestFlags;
+    Query::Context* qcontext = nullptr;
+    if (omitMainWeight) {
+      skipCount(SkipStats::cacheFirstQueryContextsOmitted);
+    } else {
+      qcontext = Query::Context::create(&req.arena, *planningContext);
+      skipCount(SkipStats::queryContextsCreated);
+    }
+    auto* weight = omitMainWeight
+        ? nullptr : query->createWeight(*qcontext, mainWeightFlags);
+    if (cacheFirstTopKCount && weight != nullptr) {
+      skipCount(SkipStats::cacheFirstTopKRankingWeights);
+    }
     bool sparseFilteredTopKReroute = weight != nullptr
-        && allowPruning && foldFilters
+        && (allowPruning || cacheFirstVariableRanking) && foldFilters
         && !requirements.needExactDomain && !weight->needsPrepare()
         && TopDocsReq::admitSparseFilteredTopK(
             *weight, *req.reader, limit);
     if (sparseFilteredTopKReroute) {
       bool unionFamily = weight->sparseFilteredTopKFamily()
           == Query::Weight::SparseFilteredTopKFamily::UNION;
+      mainWeightFlags &= ~Query::ALLOW_PRUNING;
+      weight = query->createWeight(*qcontext, mainWeightFlags);
       requestFlags &= ~Query::ALLOW_PRUNING;
-      weight = query->createWeight(*qcontext, requestFlags);
       skipCount(SkipStats::sparseFilteredTopKReroutes);
       if (unionFamily) {
         skipCount(SkipStats::sparseFilteredTopKUnionReroutes);
@@ -814,11 +929,8 @@ public:
     }
     Query::Weight* countWeight = nullptr;
     Query::Weight* rankingWeight = nullptr;
-    bool exactCountTopK = requirements.needRankedDocs
-        && requirements.needExactCount && !requirements.needExactDomain
-        && !parsedSorts.useFieldSort
-        && parsedSorts.rankNeedsScores;
-    if (weight != nullptr && !disableTopKCountComposition && exactCountTopK
+    if (weight != nullptr && !cacheFirstTopKCount
+        && !disableTopKCountComposition && exactCountTopK
         && !weight->needsPrepare() && weight->canComposeExactCountTopK()
         // A constant-score ranking pass is bounded only when no collector
         // filter can reject its first K matches. Variable-score composition
@@ -831,13 +943,16 @@ public:
       countWeight = query->createWeight(*qcontext, countFlags);
       rankingWeight = query->createWeight(*qcontext, rankingFlags);
     }
-    auto filterWeights = foldFilters
+    auto filterWeights = foldFilters || cacheFirstExactDomain || filters.empty()
       ? std::span<Query::Weight*>{}
       : buildFilterWeights(filters, *qcontext, requestFlags);
     Query::Weight* domainQueryWeight = nullptr;
     std::span<Query::Weight*> domainFilterWeights;
-    if (!requirements.needRankedDocs && requirements.needExactDomain) {
-      if (foldFilters) {
+    if (!cacheFirstExactDomain && requirements.needExactDomain
+        && (!requirements.needRankedDocs
+            || (constantExactDomainRanking
+                && !parsedSorts.useFieldSort))) {
+      if (foldFilters || requirements.needRankedDocs) {
         int32_t domainFlags =
             requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
         domainQueryWeight =
@@ -853,16 +968,20 @@ public:
     Query::Weight* wholeMembershipWeight = nullptr;
     Query::Weight* wholeRankingWeight = nullptr;
     FilterCache::Use* wholeMembershipUse = nullptr;
-    std::span<uint8_t> wholeFieldSortCacheRoutes;
-    float wholeConstantScore = 0.0f;
+    std::span<uint8_t> wholeFieldSortCacheRoutes =
+        cacheFirstFieldSortRoutes;
+    bool wholeConstantRanking = false;
     bool pureCount = pureCountShape && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
-        && weight != nullptr && exactCountTopK && !weight->needsPrepare()
+        && exactCountTopK
+        && (cacheFirstTopKCount
+            || (weight != nullptr && !weight->needsPrepare()))
         && filterWeights.empty();
     bool wholeFieldSort = !QueryPrep::disableWholeMembershipPlanForTests
-        && weight != nullptr && limit > 0 && parsedSorts.useFieldSort
-        && !weight->needsScores() && !requirements.needExactDomain
-        && filterWeights.empty();
+        && limit > 0 && parsedSorts.useFieldSort
+        && (cacheFirstFieldSort
+            || (weight != nullptr && !weight->needsScores()))
+        && !requirements.needExactDomain && filterWeights.empty();
     // Nested TopDocs under a match-all parent can inherit the canonical
     // reader domain. Preserve the landed probe there and let
     // probeReaderStable enforce the runtime domain gate. Fusion sources have
@@ -910,11 +1029,18 @@ public:
         if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
           bool acquireUse = true;
           if (wholeFieldSort && !readerStableWhole) {
-            wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
-                req.reader->segments().size());
-            acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
-                *query, *wholeMembershipWeight, *req.reader, parsedSorts, limit,
-                wholeFieldSortCacheRoutes);
+            if (!fieldSortRoutesPreplanned) {
+              wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
+                  req.reader->segments().size());
+              acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
+                  *query, *wholeMembershipWeight, *req.reader, parsedSorts,
+                  limit, wholeFieldSortCacheRoutes);
+            } else {
+              acquireUse = std::any_of(
+                  wholeFieldSortCacheRoutes.begin(),
+                  wholeFieldSortCacheRoutes.end(),
+                  [](uint8_t routed) { return routed != 0; });
+            }
             fieldSortFullyRouted = !acquireUse;
           }
           // An accepted reader-stable value replaces the ANN preparation pass.
@@ -936,7 +1062,11 @@ public:
         }
       }
 
-      if (weight != nullptr && wholeTopKCount
+      if (cacheFirstTopKCount && wholeTopKCount
+          && scoreProfile.kind == Query::ScoreProfile::Kind::VARIABLE) {
+        assert(weight != nullptr);
+        wholeRankingWeight = weight;
+      } else if (weight != nullptr && wholeTopKCount
           && wholeMembershipWeight != nullptr
           && !weight->isConstantScoring()) {
         Query::Weight* countFreeRankingWeight = rankingWeight;
@@ -961,21 +1091,24 @@ public:
         } else {
           wholeRankingWeight = countFreeRankingWeight;
         }
-      } else if (wholeTopKCount && wholeMembershipWeight != nullptr) {
-        Query::ScoreProfile profile = query->scoreProfile();
-        if (profile.kind != Query::ScoreProfile::Kind::VARIABLE) {
-          wholeConstantScore = profile.value;
-        }
       }
+      wholeConstantRanking = wholeTopKCount
+          && (weight == nullptr
+                  ? scoreProfile.kind
+                      != Query::ScoreProfile::Kind::VARIABLE
+                  : weight->isConstantScoring());
     }
 
     auto* qr = luxir::arenaCreate<TopDocsReq>(
-      req.arena, req, name, topDocsReq, *qcontext, query, weight,
+      req.arena, req, name, topDocsReq, *planningContext, qcontext,
+      query, weight,
       countWeight, rankingWeight, limit, std::move(parsedSorts),
       requirements, wholeMembershipWeight, wholeRankingWeight,
-      wholeMembershipUse, wholeFieldSortCacheRoutes, wholeConstantScore,
+      wholeMembershipUse, wholeFieldSortCacheRoutes,
+      wholeConstantRanking, scoreProfile,
+      (requestFlags & Query::NEED_SCORES) != 0,
       filters, filterWeights, domainQuery, domainQueryWeight,
-      domainFilterWeights);
+      domainFilterWeights, residentExactDomainUses);
 
     if (firstQuery == nullptr) {
       firstQuery = qr;
@@ -1040,16 +1173,25 @@ public:
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseNamedFilters(parser, fusionProto.filter);
-    // Reuse the first source's qcontext to build the shared filter
-    // weights.  All sources share the same reader/pool, so any qcontext
-    // works; reusing one avoids an otherwise-unneeded allocation.
+    // Reuse the first source's execution Context when it has one. A fully
+    // resident source may be Context-free, in which case shared filter
+    // Weights are unresolved execution and create the Context here.
     // Shared filters use the same request flag path as TopDocs filters.
     for (const auto& [filterName, filterQuery] : sharedFilters) {
       unused(filterName);
-      filterQuery->validateLogical(sources.front()->qcontext);
+      filterQuery->validateLogical(sources.front()->planning);
     }
-    auto sharedFilterWeights = buildFilterWeights(
-        sharedFilters, sources.front()->qcontext, Query::NEED_SCORES);
+    std::span<Query::Weight*> sharedFilterWeights;
+    if (!sharedFilters.empty()) {
+      Query::Context* sharedContext = sources.front()->weightContext;
+      if (sharedContext == nullptr) {
+        sharedContext = Query::Context::create(
+            &req.arena, sources.front()->planning);
+        skipCount(SkipStats::queryContextsCreated);
+      }
+      sharedFilterWeights = buildFilterWeights(
+          sharedFilters, *sharedContext, Query::NEED_SCORES);
+    }
 
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());

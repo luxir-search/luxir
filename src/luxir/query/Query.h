@@ -330,6 +330,7 @@ public:
     return *this;
   }
 
+  class PlanningContext;
   class Context;
   class Weight;
   class Scorer;
@@ -406,6 +407,15 @@ public:
     PARTIAL,
     ABSENT,
     UNKNOWN,
+  };
+
+  // Logical approximation of the Weight-time flat-term-conjunction veto in
+  // the field-sort cache router. DYNAMIC_TERMS means a MultiTerm child can
+  // only be classified after Weight construction and segment expansion.
+  enum class FieldSortConjunction : uint8_t {
+    NOT_FLAT,
+    FLAT_LITERAL_TERMS,
+    DYNAMIC_TERMS,
   };
 
   enum class ClauseShape : uint8_t {
@@ -545,6 +555,12 @@ public:
     return VerificationWork::UNKNOWN;
   }
 
+  virtual FieldSortConjunction fieldSortConjunction(
+      PlanningContext& context) const {
+    unused(context);
+    return FieldSortConjunction::NOT_FLAT;
+  }
+
   // True only when omitting createWeight on a fully resident membership hit
   // preserves semantics after the request's logical validation pass. Unknown
   // and custom queries remain conservative by default.
@@ -558,16 +574,22 @@ public:
     return false;
   }
 
+  // True when this query contributes no restriction to a separable exact
+  // domain. Score-only wrappers delegate because this is membership-only.
+  virtual bool exactDomainIdentity() const { return false; }
+
   // Validate the complete logical tree once during serial request planning,
   // before cache lookup or Weight construction. Every concrete query must
   // make an explicit validation decision. A composite MUST override
   // validateLogicalImpl to visit every raw child, including score-only and
   // otherwise unused clauses, and pass the multiplier that applies to that
   // child's score semantics.
-  void validateLogical(Context& context, float multiplier = 1.0f) const;
+  void validateLogical(
+      PlanningContext& context, float multiplier = 1.0f) const;
 
 protected:
-  virtual void validateLogicalImpl(Context& context, float multiplier) const {
+  virtual void validateLogicalImpl(
+      PlanningContext& context, float multiplier) const {
     unused(context);
     checkedBoostProduct(multiplier, 1.0f);
   }
@@ -853,12 +875,10 @@ public:
     virtual bool outputIsSubsetOfDomain() const noexcept { return false; }
   };
 
-  /// Gives context to a Query (i.e. what index it's being used on amongst other things) when creating weights
-  /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
-  class Context {
-    std::unique_ptr<google::protobuf::Arena> standaloneArena;
-    google::protobuf::Arena* allocationArena;
-
+  // Serial query planning exists before execution Context construction. It
+  // owns logical/key memos, validation tracking, and request cache Uses, but
+  // deliberately does not initialize per-segment field readers.
+  class PlanningContext {
     struct CachedFilterIdentity {
       FilterKeyScope scope;
       std::optional<FilterKey> key;
@@ -885,8 +905,6 @@ public:
     }
 
   public:
-    using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
-
     struct Limits {
       int32_t fuzzyMaxExpansions = 10000;
 
@@ -898,27 +916,17 @@ public:
     IndexReader& topReader;
     std::shared_ptr<FilterCache::UseRegistry> filterUses;
     FilterKeyContext filterKeyContext;
-    // Weight* top = nullptr;  // if we don't need a top-weight, we can reuse a Context for multiple queries in the same request.
-
-    std::span<FieldReader> fieldReaders;
-    FieldInfoMap fieldInfoMap;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
 
-    // Ctor used by Context::create for arena allocation: the factory does the
-    // work that can throw (pool allocation, FieldReader init, map bucket
-    // allocation) and passes the results in, so this only binds/moves members.
-    Context(google::protobuf::Arena& arena, MemPool& pool,
-            IndexReader& topReader,
-            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
-            Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
-            FilterKeyContext filterKeyContext = {},
-            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : allocationArena(&arena), pool(pool), topReader(topReader),
-        filterUses(std::move(filterUses)),
-        filterKeyContext(filterKeyContext),
-        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)),
-        limits(limits), warnings(warnings) {
+    PlanningContext(
+        MemPool& pool, IndexReader& topReader, Limits limits = {},
+        std::vector<api::Warning>* warnings = nullptr,
+        FilterKeyContext filterKeyContext = {},
+        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
+      : pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
+        filterKeyContext(filterKeyContext), limits(limits),
+        warnings(warnings) {
       this->filterKeyContext.coreGen = topReader.coreGen();
       this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
       auto* filterCache = topReader.filterCache();
@@ -926,52 +934,6 @@ public:
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
             filterCache, topReader);
       }
-    }
-
-    // Convenience ctor for stack-allocated Contexts (tests, non-arena code):
-    // does its own allocation/init inline.
-    Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
-            std::vector<api::Warning>* warnings = nullptr,
-            FilterKeyContext filterKeyContext = {},
-            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : standaloneArena(std::make_unique<google::protobuf::Arena>()),
-        allocationArena(standaloneArena.get()),
-        pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
-        filterKeyContext(filterKeyContext),
-        fieldInfoMap(4, pool.getAllocator()),
-        limits(limits), warnings(warnings) {
-      this->filterKeyContext.coreGen = topReader.coreGen();
-      this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
-      auto* filterCache = topReader.filterCache();
-      if (this->filterUses == nullptr) {
-        this->filterUses = std::make_shared<FilterCache::UseRegistry>(
-            filterCache, topReader);
-      }
-      auto numSegs = topReader.segments().size();
-      fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&fieldReaders[i]) FieldReader(topReader.segments()[i].postingsReader());
-      }
-    }
-
-    static Context* create(google::protobuf::Arena* arena, MemPool& pool, IndexReader& topReader,
-                           Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
-                           FilterKeyContext filterKeyContext = {},
-                           std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr) {
-      auto numSegs = topReader.segments().size();
-      auto* readers = (FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader));
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&readers[i]) FieldReader(topReader.segments()[i].postingsReader());
-      }
-      FieldInfoMap map(4, pool.getAllocator());
-      return luxir::arenaCreate<Context>(
-        *arena, *arena, pool, topReader,
-        std::span<FieldReader>(readers, numSegs), std::move(map),
-        limits, warnings, filterKeyContext, std::move(filterUses));
-    }
-
-    google::protobuf::Arena& arena() const noexcept {
-      return *allocationArena;
     }
 
     // Serial request-build memo. A query may create several Weights for
@@ -1050,12 +1012,216 @@ public:
           : filterUses->acceptExisting(std::move(candidate), lane);
     }
 
+    // Accept a complete set of separable resident sources as one planning
+    // decision. Duplicate structural keys share the same request Use. A
+    // concurrent cache detach can still invalidate an acceptance after the
+    // inert lookups; in that case callers retain the ordinary Weight path.
+    // Earlier accepts are not rolled back: their still-resident values remain
+    // request-pinned and their hit/recency effects are a deliberately accepted
+    // small overstatement for this rare race.
+    std::span<FilterCache::Use*> acceptExistingFilterUses(
+        std::span<Query* const> queries, bool allowReaderStable,
+        FilterCache::AdmissionLane lane) {
+      if (queries.empty() || filterUses == nullptr) return {};
+
+      struct UniqueCandidate {
+        const CachedFilterIdentity* identity;
+        std::optional<FilterCache::ExistingCandidate> candidate;
+        FilterCache::Use* use = nullptr;
+      };
+      std::vector<UniqueCandidate> unique;
+      unique.reserve(queries.size());
+      auto uniqueByQuery = pool.make_span<size_t>(queries.size());
+      for (size_t i = 0; i < queries.size(); i++) {
+        const auto& identity = filterIdentity(*queries[i]);
+        if (identity.scope == FilterKeyScope::UNCACHEABLE
+            || (identity.scope == FilterKeyScope::READER_STABLE
+                && !allowReaderStable)
+            || !identity.key) {
+          return {};
+        }
+        size_t found = unique.size();
+        for (size_t j = 0; j < unique.size(); j++) {
+          if (unique[j].identity->scope == identity.scope
+              && *unique[j].identity->key == *identity.key) {
+            found = j;
+            break;
+          }
+        }
+        if (found == unique.size()) {
+          auto candidate = filterUses->lookupExisting(
+              *identity.key, identity.scope);
+          if (!candidate.has_value()) return {};
+          unique.push_back({&identity, std::move(candidate), nullptr});
+        }
+        uniqueByQuery[i] = found;
+      }
+
+      for (auto& value : unique) {
+        value.use = filterUses->acceptExisting(
+            std::move(*value.candidate), lane);
+        if (value.use == nullptr) return {};
+      }
+      auto result = pool.make_span<FilterCache::Use*>(queries.size());
+      for (size_t i = 0; i < queries.size(); i++) {
+        result[i] = unique[uniqueByQuery[i]].use;
+      }
+      return result;
+    }
+
     // code must have static storage duration.
     void warn(std::string_view code, std::string_view message) {
       if (warnings == nullptr) return;
       char* copy = pool.alloc(message.size());
       std::memcpy(copy, message.data(), message.size());
       warnings->push_back({code, std::string_view(copy, message.size())});
+    }
+
+  };
+
+  /// Gives execution construction access to per-segment field state while
+  /// borrowing the serial planning state that already validated and keyed the
+  /// query tree. A Context is not generally thread-safe.
+  class Context {
+    std::optional<PlanningContext> ownedPlanning;
+    PlanningContext& planning;
+    std::unique_ptr<google::protobuf::Arena> standaloneArena;
+    google::protobuf::Arena* allocationArena;
+
+  public:
+    using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
+    using Limits = PlanningContext::Limits;
+
+    MemPool& pool;
+    IndexReader& topReader;
+    std::shared_ptr<FilterCache::UseRegistry>& filterUses;
+    FilterKeyContext& filterKeyContext;
+    Limits& limits;
+    std::span<FieldReader> fieldReaders;
+    FieldInfoMap fieldInfoMap;
+
+    Context(google::protobuf::Arena& arena, PlanningContext& planning,
+            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap)
+      : planning(planning), allocationArena(&arena),
+        pool(planning.pool), topReader(planning.topReader),
+        filterUses(planning.filterUses),
+        filterKeyContext(planning.filterKeyContext), limits(planning.limits),
+        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {}
+
+    // Arena-owned form used by standalone embedders that do not already have
+    // serial planning state.
+    Context(google::protobuf::Arena& arena, MemPool& pool,
+            IndexReader& topReader,
+            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
+            Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
+            FilterKeyContext filterKeyContext = {},
+            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
+      : ownedPlanning(std::in_place, pool, topReader, limits, warnings,
+                      filterKeyContext, std::move(filterUses)),
+        planning(*ownedPlanning), allocationArena(&arena),
+        pool(planning.pool), topReader(planning.topReader),
+        filterUses(planning.filterUses),
+        filterKeyContext(planning.filterKeyContext), limits(planning.limits),
+        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {}
+
+    // Convenience ctor for stack-allocated Contexts (tests, non-arena code).
+    Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
+            std::vector<api::Warning>* warnings = nullptr,
+            FilterKeyContext filterKeyContext = {},
+            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
+      : ownedPlanning(std::in_place, pool, topReader, limits, warnings,
+                      filterKeyContext, std::move(filterUses)),
+        planning(*ownedPlanning),
+        standaloneArena(std::make_unique<google::protobuf::Arena>()),
+        allocationArena(standaloneArena.get()),
+        pool(planning.pool), topReader(planning.topReader),
+        filterUses(planning.filterUses),
+        filterKeyContext(planning.filterKeyContext), limits(planning.limits),
+        fieldInfoMap(4, pool.getAllocator()) {
+      auto numSegs = topReader.segments().size();
+      fieldReaders = {
+        (FieldReader*)pool.alloc(
+            sizeof(FieldReader) * numSegs, alignof(FieldReader)),
+        numSegs
+      };
+      for (size_t i = 0; i < numSegs; i++) {
+        new (&fieldReaders[i]) FieldReader(
+            topReader.segments()[i].postingsReader());
+      }
+    }
+
+    static Context* create(google::protobuf::Arena* arena,
+                           PlanningContext& planning) {
+      auto numSegs = planning.topReader.segments().size();
+      auto* readers = (FieldReader*)planning.pool.alloc(
+          sizeof(FieldReader) * numSegs, alignof(FieldReader));
+      for (size_t i = 0; i < numSegs; i++) {
+        new (&readers[i]) FieldReader(
+            planning.topReader.segments()[i].postingsReader());
+      }
+      FieldInfoMap map(4, planning.pool.getAllocator());
+      return luxir::arenaCreate<Context>(
+          *arena, *arena, planning,
+          std::span<FieldReader>(readers, numSegs), std::move(map));
+    }
+
+    static Context* create(
+        google::protobuf::Arena* arena, MemPool& pool,
+        IndexReader& topReader, Limits limits = {},
+        std::vector<api::Warning>* warnings = nullptr,
+        FilterKeyContext filterKeyContext = {},
+        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr) {
+      auto numSegs = topReader.segments().size();
+      auto* readers = (FieldReader*)pool.alloc(
+          sizeof(FieldReader) * numSegs, alignof(FieldReader));
+      for (size_t i = 0; i < numSegs; i++) {
+        new (&readers[i]) FieldReader(
+            topReader.segments()[i].postingsReader());
+      }
+      FieldInfoMap map(4, pool.getAllocator());
+      return luxir::arenaCreate<Context>(
+          *arena, *arena, pool, topReader,
+          std::span<FieldReader>(readers, numSegs), std::move(map),
+          limits, warnings, filterKeyContext, std::move(filterUses));
+    }
+
+    PlanningContext& planningContext() const noexcept { return planning; }
+
+    google::protobuf::Arena& arena() const noexcept {
+      return *allocationArena;
+    }
+
+    template <typename Plan, typename Create>
+    Plan& getOrCreateLogicalPlan(const Query& query, Create&& create) {
+      return planning.getOrCreateLogicalPlan<Plan>(
+          query, std::forward<Create>(create));
+    }
+
+#ifndef NDEBUG
+    bool logicalValidationActive() const {
+      return planning.logicalValidationActive();
+    }
+
+    void assertLogicalValidation(const Query& query) const {
+      planning.assertLogicalValidation(query);
+    }
+#endif
+
+    FilterCache::Use* getFilterUse(
+        const Query& query,
+        FilterCache::AdmissionLane lane =
+            FilterCache::AdmissionLane::CLAUSE) {
+      return planning.getFilterUse(query, lane);
+    }
+
+    FilterCache::Use* getFilterUse(
+        const Query& query, FilterKeyScope requiredScope,
+        FilterCache::AdmissionLane lane) {
+      return planning.getFilterUse(query, requiredScope, lane);
+    }
+
+    void warn(std::string_view code, std::string_view message) {
+      planning.warn(code, message);
     }
 
     // return number of segments
@@ -1664,7 +1830,8 @@ public:
   };
 };
 
-inline void Query::validateLogical(Context& context, float multiplier) const {
+inline void Query::validateLogical(
+    PlanningContext& context, float multiplier) const {
   validateLogicalImpl(context, multiplier);
 #ifndef NDEBUG
   context.recordLogicalValidation(*this);

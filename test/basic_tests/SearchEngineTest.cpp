@@ -454,6 +454,8 @@ struct WholeCountRun {
   bool docsEmpty = false;
   bool hasScoreValues = false;
   int64_t weightSkips = 0;
+  int64_t contextsCreated = 0;
+  int64_t contextsOmitted = 0;
 };
 
 using WholeCountQueryBuilder =
@@ -492,6 +494,8 @@ WholeCountRun runWholeCount(
     req->getDocs("q").empty(),
     hasScoreValues,
     SkipStats::cacheFirstMembershipWeightSkips,
+    SkipStats::queryContextsCreated,
+    SkipStats::cacheFirstQueryContextsOmitted,
   };
 }
 
@@ -549,6 +553,11 @@ struct WholeTopKRun {
   int64_t maxScoreOuterWindows = 0;
   int64_t maxScoreBufferCompactions = 0;
   int64_t maxScoreDeadOuterJumps = 0;
+  int64_t cacheFirstCountWeightSkips = 0;
+  int64_t cacheFirstConstantWeightSkips = 0;
+  int64_t cacheFirstRankingWeights = 0;
+  int64_t contextsCreated = 0;
+  int64_t contextsOmitted = 0;
 };
 
 WholeTopKRun runWholeTopK(
@@ -581,6 +590,11 @@ WholeTopKRun runWholeTopK(
     SkipStats::maxScoreOuterWindows,
     SkipStats::maxScoreBufferCompactions,
     SkipStats::maxScoreDeadOuterJumps,
+    SkipStats::cacheFirstTopKCountWeightSkips,
+    SkipStats::cacheFirstConstantTopKWeightSkips,
+    SkipStats::cacheFirstTopKRankingWeights,
+    SkipStats::queryContextsCreated,
+    SkipStats::cacheFirstQueryContextsOmitted,
   };
 }
 
@@ -589,6 +603,87 @@ void expectSameWholeTopK(const WholeTopKRun& expected,
   EXPECT_EQ(expected.found, actual.found);
   EXPECT_EQ(expected.ids, actual.ids);
   expectSameScoreMap(expected.scores, actual.scores);
+}
+
+struct ResidentExactDomainRun {
+  int64_t found = -1;
+  std::vector<std::string> ids;
+  std::map<std::string, float> scores;
+  std::map<std::string, int64_t> facets;
+  double avg = std::numeric_limits<double>::quiet_NaN();
+  double sum = std::numeric_limits<double>::quiet_NaN();
+  int64_t exactWeightSkips = 0;
+  int64_t constantWeightSkips = 0;
+  int64_t docSetCollections = 0;
+  int64_t streamFallbacks = 0;
+  int64_t contextsCreated = 0;
+  int64_t contextsOmitted = 0;
+};
+
+ResidentExactDomainRun runResidentExactDomain(
+    SearchEngine& engine, std::string_view collection,
+    std::string_view key, int64_t limit, bool constant,
+    bool getNumber, bool withFacet, bool withStats) {
+  auto req = localReq(engine);
+  req->collection(collection);
+  auto& topDocs = req->topDocs("q").getScores().fields({"id"}).limit(limit);
+  if (getNumber) topDocs.getNumber();
+  std::string phrase = std::string(key) + "a " + std::string(key) + "b";
+  auto query = qb::phraseText(topDocs.mr(), "body_w", phrase);
+  topDocs.rawQuery() = constant
+      ? qb::constantScore(topDocs.mr(), query, 3.25f)
+      : query;
+  topDocs.matchFilter("selected", "filter_w", "selected");
+  if (withFacet) topDocs.facet("groups", "group_s").limit(-1);
+  if (withStats) {
+    topDocs.avg("avg", "value_i");
+    topDocs.sum("sum", "value_i");
+  }
+
+  ResidentExactDomainRun result;
+  {
+    SkipStatsGuard stats;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    result.exactWeightSkips =
+        SkipStats::cacheFirstExactDomainWeightSkips;
+    result.constantWeightSkips =
+        SkipStats::cacheFirstConstantTopKWeightSkips;
+    result.docSetCollections = SkipStats::exactDomainDocSetCollections;
+    result.streamFallbacks = SkipStats::exactDomainStreamFallbacks;
+    result.contextsCreated = SkipStats::queryContextsCreated;
+    result.contextsOmitted = SkipStats::cacheFirstQueryContextsOmitted;
+  }
+  if (getNumber) result.found = req->getMatchCount("q");
+  result.ids = resultIds(*req, "q");
+  result.scores = resultScoreMap(*req, "q");
+  if (withFacet) {
+    result.facets = resultFacetMap(*req, "q", "groups");
+  }
+  if (withStats) {
+    const auto* docs = req->docList("q");
+    EXPECT_NE(docs, nullptr);
+    if (docs != nullptr) {
+      result.avg = std::get<double>(docs->ops.at("avg")->kind);
+      result.sum = std::get<double>(docs->ops.at("sum")->kind);
+    }
+  }
+  return result;
+}
+
+void expectSameResidentExactDomain(
+    const ResidentExactDomainRun& expected,
+    const ResidentExactDomainRun& actual) {
+  EXPECT_EQ(expected.found, actual.found);
+  EXPECT_EQ(expected.ids, actual.ids);
+  expectSameScoreMap(expected.scores, actual.scores);
+  EXPECT_EQ(expected.facets, actual.facets);
+  if (!std::isnan(expected.avg)) {
+    EXPECT_DOUBLE_EQ(expected.avg, actual.avg);
+  }
+  if (!std::isnan(expected.sum)) {
+    EXPECT_DOUBLE_EQ(expected.sum, actual.sum);
+  }
 }
 
 struct WholeFieldSortRun {
@@ -605,6 +700,14 @@ struct WholeFieldSortRun {
   int64_t bestFirst = 0;
   int64_t seeded = 0;
   int64_t bulk = 0;
+  int64_t weightSkips = 0;
+  int64_t contextsCreated = 0;
+  int64_t contextsOmitted = 0;
+};
+
+enum class WholeFieldSortQueryShape : uint8_t {
+  STANDARD,
+  MULTITERM_CONJUNCTION,
 };
 
 WholeFieldSortRun runWholeFieldSort(
@@ -613,7 +716,9 @@ WholeFieldSortRun runWholeFieldSort(
     qb::SortDir direction, int64_t limit = 7,
     bool exactCount = true, bool getScores = false,
     bool forceBestFirst = false, bool withSubOp = false,
-    bool twoPhase = false, bool optionalTwoPhase = false) {
+    bool twoPhase = false, bool optionalTwoPhase = false,
+    WholeFieldSortQueryShape queryShape =
+        WholeFieldSortQueryShape::STANDARD) {
   auto req = localReq(engine);
   req->collection(collection);
   auto& topDocs = req->topDocs("q").fields({"id"}).limit(limit);
@@ -621,7 +726,12 @@ WholeFieldSortRun runWholeFieldSort(
   if (getScores) topDocs.getScores();
   std::string a = std::string(key) + "a";
   std::string b = std::string(key) + "b";
-  if (optionalTwoPhase) {
+  if (queryShape == WholeFieldSortQueryShape::MULTITERM_CONJUNCTION) {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(),
+        {qb::match(topDocs.mr(), "body_w", a),
+         qb::prefix(topDocs.mr(), "body_w", b)});
+  } else if (optionalTwoPhase) {
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(), {},
         {qb::phraseText(topDocs.mr(), "body_w", a + " " + b),
@@ -665,6 +775,9 @@ WholeFieldSortRun runWholeFieldSort(
     SkipStats::fieldSortBestFirstActivations,
     SkipStats::fieldSortSeededActivations,
     SkipStats::fieldSortBulkCollections,
+    SkipStats::cacheFirstFieldSortWeightSkips,
+    SkipStats::queryContextsCreated,
+    SkipStats::cacheFirstQueryContextsOmitted,
   };
 }
 
@@ -1481,11 +1594,17 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     EXPECT_TRUE(bypass.docsEmpty);
     EXPECT_EQ(1, bypass.bypasses);
     EXPECT_EQ(1, bypass.fallbackSuppliers);
+    EXPECT_EQ(1, bypass.contextsCreated);
+    EXPECT_EQ(0, bypass.contextsOmitted);
     EXPECT_EQ(1, build.builds);
     EXPECT_EQ(0, build.fallbackSuppliers);
+    EXPECT_EQ(1, build.contextsCreated);
+    EXPECT_EQ(0, build.contextsOmitted);
     EXPECT_EQ(1, hit.hits);
     EXPECT_EQ(0, hit.fallbackSuppliers);
     EXPECT_EQ(1, hit.weightSkips);
+    EXPECT_EQ(0, hit.contextsCreated);
+    EXPECT_EQ(1, hit.contextsOmitted);
 
     if (name == "phrase") {
       auto req = localReq(helper.getSearchEngine());
@@ -2102,6 +2221,8 @@ TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
     expectSameWholeTopK(offA, offB);
     EXPECT_EQ(0, offA.hits + offA.builds + offA.bypasses
                      + offA.constants + offA.fallbackSuppliers);
+    EXPECT_EQ(1, offA.contextsCreated);
+    EXPECT_EQ(0, offA.contextsOmitted);
 
     WholeTopKRun bypass = runWholeTopK(
         enabled.getSearchEngine(), enabledCollection,
@@ -2120,10 +2241,21 @@ TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
     expectSameWholeTopK(offA, hit);
     EXPECT_EQ(1, bypass.bypasses);
     EXPECT_EQ(1, bypass.fallbackSuppliers);
+    EXPECT_EQ(1, bypass.contextsCreated);
+    EXPECT_EQ(0, bypass.contextsOmitted);
     EXPECT_EQ(1, build.builds);
+    EXPECT_EQ(1, build.contextsCreated);
+    EXPECT_EQ(0, build.contextsOmitted);
     EXPECT_EQ(1, hit.hits);
     EXPECT_EQ(0, build.fallbackSuppliers);
     EXPECT_EQ(0, hit.fallbackSuppliers);
+    EXPECT_EQ(1, hit.cacheFirstCountWeightSkips);
+    EXPECT_EQ((int64_t)testCase.constant,
+              hit.cacheFirstConstantWeightSkips);
+    EXPECT_EQ((int64_t)!testCase.constant,
+              hit.cacheFirstRankingWeights);
+    EXPECT_EQ((int64_t)!testCase.constant, hit.contextsCreated);
+    EXPECT_EQ((int64_t)testCase.constant, hit.contextsOmitted);
   }
   EXPECT_EQ(cases.size(), cache->entryCountForTest());
 }
@@ -2189,6 +2321,93 @@ TEST_F(SearchEngineTest, wholeTopKCountConstantGateAndLimitOnlyStayCacheFree) {
                      + SkipStats::wholeTopKCountConstant);
   }
   ASSERT_OK(sortedReq);
+}
+
+TEST_F(SearchEngineTest,
+       residentExactDomainOmitsRootWeightsAcrossExactConsumers) {
+  constexpr std::string_view enabledCollection =
+      "resident_exact_domain_consumers";
+  constexpr std::string_view disabledCollection =
+      "resident_exact_domain_consumers_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+
+  struct Case {
+    std::string_view key;
+    int64_t limit;
+    bool constant;
+    bool getNumber;
+    bool facet;
+    bool stats;
+  };
+  constexpr std::array cases{
+    Case{"s4facet", 0, false, true, true, false},
+    Case{"s4stats", 0, false, true, false, true},
+    Case{"s4constcount", 7, true, true, true, false},
+    Case{"s4constdomain", 7, true, false, true, false},
+  };
+
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 96; doc++) {
+    std::string body = "filler";
+    for (size_t i = 0; i < cases.size(); i++) {
+      if (doc % (int32_t)(i + 2) == 0) {
+        body += " " + std::string(cases[i].key) + "a "
+            + std::string(cases[i].key) + "b";
+      }
+    }
+    docs.push_back(flatdoc(
+        "id", "resident_" + std::to_string(doc),
+        "body_w", body,
+        "filter_w", doc % 5 == 0 ? "other" : "selected",
+        "group_s", doc % 2 == 0 ? "even" : "odd",
+        "value_i", doc));
+  }
+  ASSERT_TRUE(enabled.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(disabled.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  for (const Case& testCase : cases) {
+    SCOPED_TRACE(testCase.key);
+    auto off = runResidentExactDomain(
+        disabled.getSearchEngine(), disabledCollection,
+        testCase.key, testCase.limit, testCase.constant,
+        testCase.getNumber, testCase.facet, testCase.stats);
+    auto cold = runResidentExactDomain(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.key, testCase.limit, testCase.constant,
+        testCase.getNumber, testCase.facet, testCase.stats);
+    auto build = runResidentExactDomain(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.key, testCase.limit, testCase.constant,
+        testCase.getNumber, testCase.facet, testCase.stats);
+    auto hit = runResidentExactDomain(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.key, testCase.limit, testCase.constant,
+        testCase.getNumber, testCase.facet, testCase.stats);
+
+    expectSameResidentExactDomain(off, cold);
+    expectSameResidentExactDomain(off, build);
+    expectSameResidentExactDomain(off, hit);
+    EXPECT_EQ(0, off.exactWeightSkips + off.constantWeightSkips);
+    EXPECT_EQ(1, off.contextsCreated);
+    EXPECT_EQ(0, off.contextsOmitted);
+    EXPECT_GT(cold.streamFallbacks, 0);
+    EXPECT_EQ(1, cold.contextsCreated);
+    EXPECT_EQ(0, cold.contextsOmitted);
+    EXPECT_GT(build.docSetCollections, 0);
+    EXPECT_EQ(1, build.contextsCreated);
+    EXPECT_EQ(0, build.contextsOmitted);
+    EXPECT_EQ(1, hit.exactWeightSkips);
+    EXPECT_GT(hit.docSetCollections, 0);
+    EXPECT_EQ((int64_t)(testCase.constant && testCase.limit > 0),
+              hit.constantWeightSkips);
+    EXPECT_EQ(0, hit.contextsCreated);
+    EXPECT_EQ(1, hit.contextsOmitted);
+  }
 }
 
 TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
@@ -2322,6 +2541,8 @@ TEST_F(SearchEngineTest,
     EXPECT_EQ(0, offA.hits + offA.builds + offA.bypasses
                      + offA.routingBypasses + offA.constants
                      + offA.fallbackSuppliers);
+    EXPECT_EQ(0, offA.weightSkips + offA.contextsOmitted);
+    EXPECT_EQ(1, offA.contextsCreated);
 
     WholeFieldSortRun bypass = runWholeFieldSort(
         enabled.getSearchEngine(), enabledCollection,
@@ -2338,6 +2559,10 @@ TEST_F(SearchEngineTest,
     expectSameWholeFieldSort(offA, bypass);
     expectSameWholeFieldSort(offA, build);
     expectSameWholeFieldSort(offA, hit);
+    EXPECT_EQ(1, bypass.contextsCreated);
+    EXPECT_EQ(1, build.contextsCreated);
+    EXPECT_EQ(0, bypass.weightSkips + bypass.contextsOmitted
+                     + build.weightSkips + build.contextsOmitted);
     ASSERT_TRUE(hit.found.has_value());
     EXPECT_EQ(testCase.found, *hit.found);
     if (testCase.bestFirst) {
@@ -2345,6 +2570,9 @@ TEST_F(SearchEngineTest,
       EXPECT_EQ(2, bypass.fallbackSuppliers);
       EXPECT_EQ(2, build.builds);
       EXPECT_EQ(2, hit.hits);
+      EXPECT_EQ(1, hit.weightSkips);
+      EXPECT_EQ(0, hit.contextsCreated);
+      EXPECT_EQ(1, hit.contextsOmitted);
       EXPECT_EQ(0, bypass.routingBypasses + build.routingBypasses
                        + hit.routingBypasses);
       EXPECT_EQ(2, build.cachedBestFirst);
@@ -2361,6 +2589,8 @@ TEST_F(SearchEngineTest,
                        + hit.fallbackSuppliers);
       EXPECT_EQ(0, build.cachedBestFirst + hit.cachedBestFirst);
       EXPECT_EQ(0, build.ladderFallbacks + hit.ladderFallbacks);
+      EXPECT_EQ(0, hit.weightSkips + hit.contextsOmitted);
+      EXPECT_EQ(1, hit.contextsCreated);
     }
   }
 }
@@ -2392,6 +2622,8 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
     EXPECT_EQ(0, routed.hits + routed.builds + routed.bypasses
                      + routed.fallbackSuppliers + routed.cachedBestFirst
                      + routed.ladderFallbacks);
+    EXPECT_EQ(0, routed.weightSkips + routed.contextsOmitted);
+    EXPECT_EQ(1, routed.contextsCreated);
   }
   auto countersAfter = cache->counters();
   EXPECT_EQ(countersBefore.hits, countersAfter.hits);
@@ -2421,6 +2653,13 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
   EXPECT_EQ(2, bypass.bypasses);
   EXPECT_EQ(2, build.builds);
   EXPECT_EQ(2, hit.hits);
+  EXPECT_EQ(0, bypass.weightSkips + bypass.contextsOmitted
+                   + build.weightSkips + build.contextsOmitted);
+  EXPECT_EQ(1, bypass.contextsCreated);
+  EXPECT_EQ(1, build.contextsCreated);
+  EXPECT_EQ(1, hit.weightSkips);
+  EXPECT_EQ(0, hit.contextsCreated);
+  EXPECT_EQ(1, hit.contextsOmitted);
   EXPECT_EQ(0, bypass.routingBypasses + build.routingBypasses
                    + hit.routingBypasses);
   EXPECT_EQ(2, build.ladderFallbacks);
@@ -2440,6 +2679,96 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
     EXPECT_EQ(0, routed.hits + routed.builds + routed.bypasses
                      + routed.cachedBestFirst + routed.ladderFallbacks);
   }
+}
+
+TEST_F(SearchEngineTest,
+       wholeFieldSortMultiTermConjunctionKeepsWeightRouter) {
+  constexpr std::string_view enabledCollection =
+      "whole_field_sort_multiterm";
+  constexpr std::string_view disabledCollection =
+      "whole_field_sort_multiterm_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+  indexWholeFieldSortDocs(enabled);
+  indexWholeFieldSortDocs(disabled);
+
+  auto run = [&](SearchEngine& engine, std::string_view collection) {
+    return runWholeFieldSort(
+        engine, collection, "s4multi", "sort_i", qb::ASC,
+        7, true, false, true, false, false, false,
+        WholeFieldSortQueryShape::MULTITERM_CONJUNCTION);
+  };
+  WholeFieldSortRun off = run(
+      disabled.getSearchEngine(), disabledCollection);
+  WholeFieldSortRun bypass = run(
+      enabled.getSearchEngine(), enabledCollection);
+  WholeFieldSortRun build = run(
+      enabled.getSearchEngine(), enabledCollection);
+  WholeFieldSortRun hit = run(
+      enabled.getSearchEngine(), enabledCollection);
+
+  expectSameWholeFieldSort(off, bypass);
+  expectSameWholeFieldSort(off, build);
+  expectSameWholeFieldSort(off, hit);
+  EXPECT_EQ(2, bypass.bypasses);
+  EXPECT_EQ(2, build.builds);
+  EXPECT_EQ(2, hit.hits);
+  EXPECT_EQ(2, build.cachedBestFirst);
+  EXPECT_EQ(2, hit.cachedBestFirst);
+  EXPECT_EQ(0, hit.weightSkips + hit.contextsOmitted);
+  EXPECT_EQ(1, hit.contextsCreated);
+}
+
+TEST_F(SearchEngineTest, wholeFieldSortPartialResidencyKeepsOrdinaryPath) {
+  constexpr std::string_view enabledCollection =
+      "whole_field_sort_partial";
+  constexpr std::string_view disabledCollection =
+      "whole_field_sort_partial_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+
+  auto addSegment = [](CollectionHelper& helper, int32_t segment) {
+    std::vector<Doc> docs;
+    for (int32_t local = 0; local < 64; local++) {
+      int32_t global = segment * 64 + local;
+      docs.push_back(flatdoc(
+          "id", "s4partial_" + std::to_string(global),
+          "body_w", (local & 1) == 0
+              ? "s4parta s4partb" : "other",
+          "sort_i", (int64_t)((global * 23) % 29)));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  };
+  addSegment(enabled, 0);
+  addSegment(disabled, 0);
+
+  for (int round = 0; round < 3; round++) {
+    runWholeFieldSort(
+        enabled.getSearchEngine(), enabledCollection,
+        "s4part", "sort_i", qb::ASC, 7, true, false, true);
+  }
+  addSegment(enabled, 1);
+  addSegment(disabled, 1);
+
+  WholeFieldSortRun off = runWholeFieldSort(
+      disabled.getSearchEngine(), disabledCollection,
+      "s4part", "sort_i", qb::ASC, 7, true, false, true);
+  WholeFieldSortRun partial = runWholeFieldSort(
+      enabled.getSearchEngine(), enabledCollection,
+      "s4part", "sort_i", qb::ASC, 7, true, false, true);
+  expectSameWholeFieldSort(off, partial);
+  EXPECT_EQ(1, partial.hits);
+  EXPECT_EQ(1, partial.builds);
+  EXPECT_EQ(0, partial.weightSkips + partial.contextsOmitted);
+  EXPECT_EQ(1, partial.contextsCreated);
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
@@ -4658,6 +4987,7 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
     int64_t identities = 0;
     int64_t docSetDomains = 0;
     int64_t domainWindows = 0;
+    int64_t exactWeightSkips = 0;
   };
   auto run = [&](std::string_view filterField, int64_t limit,
                  bool passive, bool nested) {
@@ -4680,6 +5010,8 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
       result.identities = SkipStats::filterDocSetIdentityCollections;
       result.docSetDomains = SkipStats::exactDomainDocSetCollections;
       result.domainWindows = SkipStats::bulkDomainWindowsFed;
+      result.exactWeightSkips =
+          SkipStats::cacheFirstExactDomainWeightSkips;
     }
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     result.ids = resultIds(*req, "q");
@@ -4724,6 +5056,7 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
   EXPECT_EQ(0, hitZero.identities);
   EXPECT_GT(hitZero.docSetDomains, 0);
   EXPECT_EQ(0, hitZero.domainWindows);
+  EXPECT_EQ(1, hitZero.exactWeightSkips);
   EXPECT_GT(cache->counters().hits, beforeZeroHit.hits);
   EXPECT_EQ(10, hitZero.found);
   EXPECT_TRUE(hitZero.ids.empty());
@@ -4737,8 +5070,10 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
   run("keep_top_s", 4, false, true);
   auto beforeTopHit = cache->counters();
   auto hitTop = run("keep_top_s", 4, false, true);
-  EXPECT_GT(hitTop.identities, 0);
+  EXPECT_EQ(0, hitTop.identities);
+  EXPECT_GT(hitTop.docSetDomains, 0);
   EXPECT_EQ(0, hitTop.domainWindows);
+  EXPECT_EQ(1, hitTop.exactWeightSkips);
   EXPECT_GT(cache->counters().hits, beforeTopHit.hits);
   EXPECT_EQ(10, hitTop.found);
   EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d4", "d5"}),

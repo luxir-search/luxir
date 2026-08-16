@@ -63,7 +63,7 @@ public:
     if (!filterWeights.empty()) {
       assert(!this->sources.empty());
       assert(filterWeights.size() == filters.size());
-      auto& context = this->sources.front()->qcontext;
+      auto& context = this->sources.front()->planning;
       filterUses = context.pool.make_span<FilterCache::Use*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
         filterUses[i] = context.getFilterUse(*filters[i].second);
@@ -179,7 +179,7 @@ public:
         auto result = std::move(filterDocSets[0]);
         assert(!op.sources.empty());
         return std::move(result).pinnedWith(
-            op.sources.front()->qcontext.filterUses);
+            op.sources.front()->planning.filterUses);
       }
       return DomainHandle(DocSet::intersect(filterPtrs));
     }

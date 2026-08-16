@@ -265,6 +265,13 @@ struct SkipStats {
   static inline int64_t wholeCountConstant = 0;
   static inline int64_t wholeCountFallbackSuppliers = 0;
   static inline int64_t cacheFirstMembershipWeightSkips = 0;
+  static inline int64_t cacheFirstExactDomainWeightSkips = 0;
+  static inline int64_t cacheFirstTopKCountWeightSkips = 0;
+  static inline int64_t cacheFirstConstantTopKWeightSkips = 0;
+  static inline int64_t cacheFirstTopKRankingWeights = 0;
+  static inline int64_t cacheFirstFieldSortWeightSkips = 0;
+  static inline int64_t queryContextsCreated = 0;
+  static inline int64_t cacheFirstQueryContextsOmitted = 0;
   static inline int64_t wholeTopKCountHits = 0;
   static inline int64_t wholeTopKCountBuilds = 0;
   static inline int64_t wholeTopKCountBypasses = 0;
@@ -526,6 +533,13 @@ struct SkipStats {
     wholeCountConstant = 0;
     wholeCountFallbackSuppliers = 0;
     cacheFirstMembershipWeightSkips = 0;
+    cacheFirstExactDomainWeightSkips = 0;
+    cacheFirstTopKCountWeightSkips = 0;
+    cacheFirstConstantTopKWeightSkips = 0;
+    cacheFirstTopKRankingWeights = 0;
+    cacheFirstFieldSortWeightSkips = 0;
+    queryContextsCreated = 0;
+    cacheFirstQueryContextsOmitted = 0;
     wholeTopKCountHits = 0;
     wholeTopKCountBuilds = 0;
     wholeTopKCountBypasses = 0;

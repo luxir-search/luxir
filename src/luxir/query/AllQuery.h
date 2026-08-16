@@ -24,6 +24,8 @@ public:
     return true;
   }
 
+  bool exactDomainIdentity() const override { return true; }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
