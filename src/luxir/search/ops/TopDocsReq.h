@@ -685,7 +685,9 @@ public:
         std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
         tg != nullptr
       };
-      if (op.weight->needsPrepare()) {
+      if (op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
+        preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);
+      } else if (op.weight->needsPrepare()) {
         preparedWeight = op.weight->prepare(queryCtx);
       }
 
@@ -768,7 +770,7 @@ public:
         if (!exactDomain && !matchEverything
             && !op.wholeMembershipPlan.empty()) {
           wholeMembershipResult = op.wholeMembershipPlan.resolve(
-              *op.req.reader, seg, domain);
+              *op.req.reader, seg, domain, preparedWeight.get());
         }
         bool wholeMembershipAvailable = wholeMembershipResult.available;
         bool wholeTopKCountAvailable = wholeMembershipAvailable
@@ -976,7 +978,7 @@ public:
             // sub-saturating; at ceil(k/d) >= blockCount the bound floor
             // covers every block and bound order cannot beat doc order.
             if (maySkipNoncompetitiveDocs
-                && !requiresPreparePhase
+                && (!requiresPreparePhase || wholeFieldSortAvailable)
                 && !data->fieldCollector->needsScores
                 && !data->fieldCollector->hasExpr
                 && data->fieldCollector->topCount > 0) {

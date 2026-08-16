@@ -97,6 +97,8 @@ public:
     uint64_t evictions = 0;
     uint64_t capacityDeadBuilds = 0;
     uint64_t thrashBuildSkips = 0;
+    uint64_t readerDeadBuilds = 0;
+    uint64_t readerThrashBuildSkips = 0;
     uint64_t purges = 0;
     uint64_t oversizedKeyBypasses = 0;
     uint64_t readerStableHits = 0;
@@ -166,6 +168,8 @@ public:
     std::vector<SegmentDocs> segments;
     size_t charge;
     uint32_t buildCostMicros;
+    const bool claimedBuild;
+    mutable std::atomic<uint64_t> cacheHits{0};
     double density = 0;
     mutable std::atomic<uint64_t> lastUsed;
     mutable std::atomic<double> priority;
@@ -173,7 +177,7 @@ public:
     ReaderValue(uint64_t readerVersion,
                 std::span<const SegmentIdentity> identities,
                 std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch,
-                uint32_t buildCostMicros);
+                uint32_t buildCostMicros, bool claimedBuild);
 
   public:
     uint64_t readerVersion() const { return readerVersion_; }
@@ -432,6 +436,11 @@ private:
     std::atomic<std::shared_ptr<const SlotVector>> slots;
     std::atomic<std::shared_ptr<const ReaderValue>> readerValue;
     std::atomic<bool> readerBuilding{false};
+    // ReaderValues are one atomic cache unit. This entry-stable ghost orders
+    // zero-hit capacity feedback with shared HIT reset and survives refreshes.
+    std::atomic_flag readerFeedbackTransition = ATOMIC_FLAG_INIT;
+    std::atomic<uint32_t> readerDeadBuildStreak{0};
+    std::atomic<uint32_t> readerBuildBypassesRemaining{0};
     std::mutex mutex;
     std::atomic<uint64_t> lastUsed{0};
     const size_t metadataCharge;
@@ -442,6 +451,16 @@ private:
       : scope(scope), slots(std::make_shared<const SlotVector>()),
         lastUsed(epoch),
         metadataCharge(metadataCharge) {}
+
+    void lock() {
+      while (readerFeedbackTransition.test_and_set(
+          std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+    void unlock() {
+      readerFeedbackTransition.clear(std::memory_order_release);
+    }
   };
 
   struct ActiveSnapshot {
@@ -461,6 +480,8 @@ private:
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> capacityDeadBuilds{0};
     std::atomic<uint64_t> thrashBuildSkips{0};
+    std::atomic<uint64_t> readerDeadBuilds{0};
+    std::atomic<uint64_t> readerThrashBuildSkips{0};
     std::atomic<uint64_t> purges{0};
     std::atomic<uint64_t> oversizedKeyBypasses{0};
     std::atomic<uint64_t> readerStableHits{0};
@@ -529,6 +550,9 @@ private:
   void recordCapacityEviction(
       const std::shared_ptr<SegmentSlot>& slot,
       const std::shared_ptr<const SegmentValue>& value);
+  void recordReaderCapacityEviction(
+      const std::shared_ptr<FilterEntry>& entry,
+      const std::shared_ptr<const ReaderValue>& value);
   std::shared_ptr<const SegmentValue> publish(
       Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
       bool byproduct, uint32_t buildCostMicros);

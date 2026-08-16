@@ -43,6 +43,11 @@ struct SearchParserImpl {
   static constexpr size_t MAX_RANGE_BUCKETS = 100000;
   static constexpr size_t MAX_SUBOP_RANGE_BUCKETS = 1024;
 
+  enum class TopDocsPlacement : uint8_t {
+    OP_TREE,
+    FUSION_SOURCE,
+  };
+
   struct ParsedFences {
     std::span<const int64_t> values;
     int64_t affineGap = 0;
@@ -299,7 +304,7 @@ public:
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
-        auto* qr = parseTopDocs(name, topDocs, true);
+        auto* qr = parseTopDocs(name, topDocs, TopDocsPlacement::OP_TREE);
         addSubs(*qr, topDocs.ops, depth);
         return qr;
       },
@@ -648,12 +653,12 @@ public:
     return weights;
   }
 
-  // Build a TopDocsReq from a TopDocs proto. The caller says whether its
-  // sub-ops are consumers: ordinary TopDocs attaches them, while Fusion
-  // ignores per-source ops by spec.
+  // Build a TopDocsReq from a TopDocs proto. Placement is semantic: ordinary
+  // TopDocs can serve a canonical-root whole-reader fact, while a Fusion
+  // source delivers candidates into a parent-owned domain.
   TopDocsReq* parseTopDocs(std::string_view name,
                            const luxir::api::TopDocs& topDocsReq,
-                           bool attachSubOps) {
+                           TopDocsPlacement placement) {
     /*
     message TopDocs {
             Query query = 1;
@@ -694,6 +699,7 @@ public:
     bool countClauseDisabled =
         BooleanQuery::disableFilterClauseCountForTests
         && limit == 0 && topDocsReq.get_number;
+    bool attachSubOps = placement == TopDocsPlacement::OP_TREE;
     CollectionRequirements requirements{
       .needRankedDocs = limit > 0,
       .needExactCount = topDocsReq.get_number,
@@ -812,14 +818,21 @@ public:
     bool pureCount = !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
-        && !weight->needsPrepare() && filterWeights.empty();
+        && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
         && exactCountTopK && !weight->needsPrepare()
         && filterWeights.empty();
     bool wholeFieldSort = !QueryPrep::disableWholeMembershipPlanForTests
         && limit > 0 && parsedSorts.useFieldSort
         && !weight->needsScores() && !requirements.needExactDomain
-        && !weight->needsPrepare() && filterWeights.empty();
+        && filterWeights.empty();
+    bool readerStableWhole = weight->needsPrepare()
+        && placement == TopDocsPlacement::OP_TREE
+        && (pureCount || wholeFieldSort);
+    if (weight->needsPrepare() && !readerStableWhole) {
+      pureCount = false;
+      wholeFieldSort = false;
+    }
     if (pureCount || wholeTopKCount || wholeFieldSort) {
       if (wholeTopKCount && countWeight != nullptr
           && !countWeight->needsScores()
@@ -853,7 +866,7 @@ public:
       bool fieldSortFullyRouted = false;
       if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
         bool acquireUse = true;
-        if (wholeFieldSort) {
+        if (wholeFieldSort && !readerStableWhole) {
           wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
               req.reader->segments().size());
           acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
@@ -861,9 +874,16 @@ public:
               wholeFieldSortCacheRoutes);
           fieldSortFullyRouted = !acquireUse;
         }
+        // An accepted reader-stable value replaces the ANN preparation pass.
+        // Its bounded kNN membership is also a valid ladder fallback, while
+        // numeric best-first still rechecks exact cardinality per segment.
         if (acquireUse) {
-          wholeMembershipUse = qcontext->getFilterUse(
-              *query, FilterCache::AdmissionLane::WHOLE);
+          wholeMembershipUse = readerStableWhole
+              ? qcontext->getFilterUse(
+                    *query, FilterKeyScope::READER_STABLE,
+                    FilterCache::AdmissionLane::WHOLE)
+              : qcontext->getFilterUse(
+                    *query, FilterCache::AdmissionLane::WHOLE);
         }
       }
       if (!everySegmentConstant && wholeMembershipUse == nullptr
@@ -962,7 +982,8 @@ public:
     sources.reserve(fusionProto.sources.size());
     for (auto& [srcName, srcProto] : lastWins(fusionProto.sources)) {  // dedup duplicate source names, last-wins
       size_t idx = sources.size();
-      auto* src = parseTopDocs(srcName, *srcProto, false);
+      auto* src = parseTopDocs(
+          srcName, *srcProto, TopDocsPlacement::FUSION_SOURCE);
       src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
         static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
       };

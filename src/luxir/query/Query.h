@@ -900,6 +900,20 @@ public:
       return key ? filterUses->get(*key, scope, lane) : nullptr;
     }
 
+    // Shape-specific consumers can require a cache lifetime without letting a
+    // rejected scope create admission traffic. The key is structural work only;
+    // the registry is touched after the scope predicate accepts it.
+    FilterCache::Use* getFilterUse(
+        const Query& query, FilterKeyScope requiredScope,
+        FilterCache::AdmissionLane lane) {
+      if (filterUses == nullptr) return nullptr;
+      FilterKeyBuilder builder;
+      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
+      if (scope != requiredScope) return nullptr;
+      auto key = std::move(builder).finish(scope, filterKeyContext);
+      return key ? filterUses->get(*key, scope, lane) : nullptr;
+    }
+
     // code must have static storage duration.
     void warn(std::string_view code, std::string_view message) {
       if (warnings == nullptr) return;

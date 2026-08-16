@@ -177,6 +177,7 @@ public:
   // this impossible for conforming engines; nonzero means selector wiring
   // broke and deepen rounds silently regressed to re-returning the pool.
   static inline std::atomic<int64_t> staleHitsForTests{0};
+  static inline std::atomic<int64_t> prepareCallsForTests{0};
 
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
@@ -429,6 +430,7 @@ public:
 
   public:
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+      prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       IndexReader& reader = ctx.reader;
       size_t numSegs = reader.segments().size();
       std::vector<std::vector<Hit>> perSegHits(numSegs);

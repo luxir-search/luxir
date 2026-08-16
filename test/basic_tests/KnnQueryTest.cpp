@@ -11,6 +11,7 @@
 
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/query/VectorEngine.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchOverrides.h"
@@ -163,6 +164,18 @@ protected:
     }
     ~EngineWrapperGuard() {
       KnnQuery::engineWrapperForTests = nullptr;
+    }
+  };
+
+  struct WholeMembershipPlanGuard {
+    bool saved;
+
+    explicit WholeMembershipPlanGuard(bool disabled)
+      : saved(QueryPrep::disableWholeMembershipPlanForTests) {
+      QueryPrep::disableWholeMembershipPlanForTests = disabled;
+    }
+    ~WholeMembershipPlanGuard() {
+      QueryPrep::disableWholeMembershipPlanForTests = saved;
     }
   };
 
@@ -1692,6 +1705,261 @@ TEST_F(KnnQueryTest, filterCacheMatchesUncachedExactAndIvfWithDeletes) {
     EXPECT_EQ(uncached.end(),
               std::find(uncached.begin(), uncached.end(), "d40"));
   }
+}
+
+TEST_F(KnnQueryTest, wholeReaderCountAndFieldSortSkipAnnPrepare) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  FilterCacheConfig cacheConfig;
+  cacheConfig.maxBytes = 4 * 1024 * 1024;
+  cacheConfig.minSegmentDocs = 0;
+  cacheConfig.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(cacheConfig);
+  h.getIndexWriter()->filterCache = cache;
+  for (int32_t i = 0; i < 64; i++) {
+    h.index(flatdoc(
+        "id", "d" + std::to_string(i), "rank_i", (int64_t)(64 - i),
+        "group_s", (i & 1) == 0 ? "keep" : "drop",
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto runCount = [&](std::span<const float> vector, int32_t k,
+                      bool foldedFilter) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q").getNumber().limit(0);
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", vector, k, 0,
+                             /*exact=*/true);
+    if (foldedFilter) addMatchFilter(cur, "selected", "group_s", "keep");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    int64_t count = req->getMatchCount("q");
+    req->done();
+    return count;
+  };
+  auto runFieldSort = [&](std::span<const float> vector, int32_t k) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main")
+                    .topDocs("q").fields({"id"}).getNumber().limit(4);
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", vector, k, 0,
+                             /*exact=*/true);
+    qb::sort(cur, "rank_i", qb::ASC);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    auto ids = resultIds(*req);
+    int64_t count = req->getMatchCount("q");
+    req->done();
+    return std::pair(count, std::move(ids));
+  };
+
+  std::array<float, 2> countVector{0.0f, 0.0f};
+  std::array<float, 2> sortVector{0.25f, 0.0f};
+  int64_t prepareStart = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  int64_t uncachedCount;
+  std::pair<int64_t, std::vector<std::string>> uncachedSort;
+  {
+    WholeMembershipPlanGuard guard(true);
+    uncachedCount = runCount(countVector, 7, false);
+    uncachedSort = runFieldSort(sortVector, 8);
+  }
+  ASSERT_EQ(7, uncachedCount);
+  ASSERT_EQ(8, uncachedSort.first);
+  ASSERT_EQ((std::vector<std::string>{"d7", "d6", "d5", "d4"}),
+            uncachedSort.second);
+  ASSERT_EQ(prepareStart + 2,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+
+  auto beforeCountBuild = cache->counters();
+  EXPECT_EQ(uncachedCount, runCount(countVector, 7, false));
+  auto countBuilt = cache->counters();
+  EXPECT_EQ(beforeCountBuild.builds + 1, countBuilt.builds);
+  int64_t afterCountBuild = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  EXPECT_EQ(uncachedCount, runCount(countVector, 7, false));
+  EXPECT_EQ(afterCountBuild,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(countBuilt.readerStableHits + 1,
+            cache->counters().readerStableHits);
+
+  auto beforeSortBuild = cache->counters();
+  EXPECT_EQ(uncachedSort, runFieldSort(sortVector, 8));
+  auto sortBuilt = cache->counters();
+  EXPECT_EQ(beforeSortBuild.builds + 1, sortBuilt.builds);
+  int64_t afterSortBuild = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  EXPECT_EQ(uncachedSort, runFieldSort(sortVector, 8));
+  EXPECT_EQ(afterSortBuild,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(sortBuilt.readerStableHits + 1,
+            cache->counters().readerStableHits);
+
+  std::array<float, 2> foldedVector{1.0f, 0.0f};
+  EXPECT_EQ(5, runCount(foldedVector, 5, true));
+  auto foldedBuilt = cache->counters();
+  int64_t afterFoldedBuild = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  EXPECT_EQ(5, runCount(foldedVector, 5, true));
+  EXPECT_EQ(afterFoldedBuild,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(foldedBuilt.readerStableHits + 1,
+            cache->counters().readerStableHits);
+
+  auto beforeScored = cache->counters();
+  int64_t scoredPrepareStart = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  for (int repeat = 0; repeat < 3; repeat++) {
+    auto* req = makeKnnReq(
+        *luxirNode, "embedding_v", {31.0f, 0.0f}, 6,
+        /*nprobe=*/0, /*refineCandidates=*/0, /*exact=*/true);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    EXPECT_EQ(6u, resultIds(*req).size());
+    req->done();
+  }
+  auto afterScored = cache->counters();
+  EXPECT_EQ(scoredPrepareStart + 3,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(beforeScored.admissions, afterScored.admissions);
+  EXPECT_EQ(beforeScored.builds, afterScored.builds);
+  EXPECT_EQ(beforeScored.readerStableHits, afterScored.readerStableHits);
+  ASSERT_NO_THROW(cache->validateForTest());
+}
+
+TEST_F(KnnQueryTest, wholeReaderRefreshAndDeleteOnlyRefreshRebuild) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  FilterCacheConfig cacheConfig;
+  cacheConfig.maxBytes = 4 * 1024 * 1024;
+  cacheConfig.minSegmentDocs = 0;
+  cacheConfig.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(cacheConfig);
+  h.getIndexWriter()->filterCache = cache;
+  for (int32_t i = 0; i < 32; i++) {
+    h.index(flatdoc(
+        "id", "d" + std::to_string(i), "rank_i", (int64_t)i,
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+  std::array<float, 2> queryVector{0.0f, 0.0f};
+
+  auto run = [&]() {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main")
+                    .topDocs("q").fields({"id"}).getNumber().limit(6);
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", queryVector, 6, 0,
+                             /*exact=*/true);
+    qb::sort(cur, "rank_i", qb::ASC);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    auto result = resultIds(*req);
+    req->done();
+    return result;
+  };
+
+  EXPECT_EQ((std::vector<std::string>{"d0", "d1", "d2", "d3", "d4", "d5"}),
+            run());
+  int64_t initialPrepare = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  EXPECT_EQ((std::vector<std::string>{"d0", "d1", "d2", "d3", "d4", "d5"}),
+            run());
+  EXPECT_EQ(initialPrepare,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  auto firstReader = h.getIndexWriter()->getIndexReader();
+
+  h.index(flatdoc("id", "far", "rank_i", (int64_t)100,
+                  "embedding_v", std::vector<float>{100.0f, 0.0f}));
+  h.commit({"*"});
+  auto secondReader = h.getIndexWriter()->getIndexReader();
+  ASSERT_GT(secondReader->commitTime(), firstReader->commitTime());
+  auto beforeRefreshBuild = cache->counters();
+  EXPECT_EQ((std::vector<std::string>{"d0", "d1", "d2", "d3", "d4", "d5"}),
+            run());
+  EXPECT_EQ(beforeRefreshBuild.readerStableRefreshes + 1,
+            cache->counters().readerStableRefreshes);
+
+  std::vector<std::string> deletes{"d0"};
+  h.deleteByIds(deletes, UpdateMessage::COMMIT);
+  auto thirdReader = h.getIndexWriter()->getIndexReader();
+  ASSERT_GT(thirdReader->commitTime(), secondReader->commitTime());
+  auto beforeDeleteBuild = cache->counters();
+  EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d3", "d4", "d5", "d6"}),
+            run());
+  EXPECT_EQ(beforeDeleteBuild.readerStableRefreshes + 1,
+            cache->counters().readerStableRefreshes);
+  int64_t deleteBuildPrepare = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d3", "d4", "d5", "d6"}),
+            run());
+  EXPECT_EQ(deleteBuildPrepare,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_GE(cache->counters().readerStableRetires, 2u);
+  ASSERT_NO_THROW(cache->validateForTest());
+}
+
+TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  FilterCacheConfig cacheConfig;
+  cacheConfig.maxBytes = 4 * 1024 * 1024;
+  cacheConfig.minSegmentDocs = 0;
+  cacheConfig.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(cacheConfig);
+  h.getIndexWriter()->filterCache = cache;
+  for (int32_t i = 0; i < 16; i++) {
+    h.index(flatdoc(
+        "id", "d" + std::to_string(i), "rank_i", (int64_t)(16 - i),
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto run = [&]() {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
+    fusion.limit = 4;
+    fusion.get_number = true;
+    fusion.rrf.emplace().k = 60;
+    auto* fields = build::allocArray(fusion.fields, 1, req->mr);
+    fields[0] = build::arenaStr(req->mr, "id");
+
+    using Pair = std::pair<std::string_view, api::TopDocs>;
+    auto* sources = (Pair*) req->mr.allocate(sizeof(Pair), alignof(Pair));
+    std::uninitialized_value_construct_n(sources, 1);
+    sources[0].first = build::arenaStr(req->mr, "vec");
+    fusion.sources = api::map_view<std::string_view, api::TopDocs>(
+        std::span<const Pair>(sources, 1));
+    auto& source = sources[0].second;
+    source.limit = 4;
+    source.get_number = true;
+    auto* query = (api::Query*) req->mr.allocate(
+        sizeof(api::Query), alignof(api::Query));
+    new (query) api::Query(qb::knn(
+        req->mr, "embedding_v", {0.0f, 0.0f}, 6, 0,
+        /*exact=*/true));
+    source.query = query;
+    auto* sorts = build::allocArray(source.sorts, 1, req->mr);
+    sorts[0].expr = build::arenaStr(req->mr, "rank_i");
+    sorts[0].dir = api::SortSpec_::SortDir::ASC;
+
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    auto ids = resultIds(*req, "f");
+    req->done();
+    return ids;
+  };
+
+  int64_t prepares = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  for (int repeat = 0; repeat < 3; repeat++) {
+    EXPECT_EQ((std::vector<std::string>{"d5", "d4", "d3", "d2"}),
+              run());
+  }
+  EXPECT_EQ(prepares + 3,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(0u, cache->counters().admissions);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  EXPECT_EQ(0u, cache->entryCountForTest());
 }
 
 TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {

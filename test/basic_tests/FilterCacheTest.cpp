@@ -3338,6 +3338,172 @@ TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
   ASSERT_NO_THROW(cache.validateForTest());
 }
 
+TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
+  LuxirConfig nodeConfig;
+  nodeConfig.filterCacheBytes = 0;
+  LuxirNode node(nodeConfig);
+  luxir::test::CollectionHelper helper(node, "filter_cache_reader_backoff");
+  ASSERT_TRUE(helper.indexAll(std::array{
+      luxir::test::flatdoc("id", "1", "body_w", "body"),
+      luxir::test::flatdoc("id", "2", "body_w", "body")},
+      UpdateMessage::COMMIT).success);
+  auto writer = helper.getIndexWriter();
+  auto reader = writer->getIndexReader();
+  auto domains = canonicalDomains(*reader);
+
+  FilterCacheConfig sizingConfig = testConfig();
+  sizingConfig.admissionThreshold = 1;
+  FilterCache sizing(sizingConfig);
+  sizing.onReaderPublished(*reader);
+  FilterCache::UseRegistry sizingRequest(sizing, *reader);
+  auto* sizingUse = sizingRequest.get(
+      FilterKey("reader-sizing"), FilterKeyScope::READER_STABLE);
+  auto sizingProbe = sizingUse->probeReaderStable(*reader, domains);
+  ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, sizingProbe.kind());
+  size_t charge = sizingUse->publishReaderStable(
+      sizingProbe, oneDocPerSegment(*reader), 1)->ramBytesUsed();
+
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = 2 * charge;
+  config.maxBytes = 2 * charge - 1;
+  config.lowWatermarkBytes = config.maxBytes;
+  auto cache = std::make_shared<FilterCache>(config);
+  writer->filterCache = cache;
+  cache->onReaderPublished(*reader);
+
+  auto publish = [&](IndexReader& targetReader, const FilterKey& key,
+                     uint32_t cost) {
+    auto targetDomains = canonicalDomains(targetReader);
+    FilterCache::UseRegistry request(*cache, targetReader);
+    auto* use = request.get(key, FilterKeyScope::READER_STABLE);
+    auto probe = use->probeReaderStable(targetReader, targetDomains);
+    EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
+    return use->publishReaderStable(
+        probe, oneDocPerSegment(targetReader), cost);
+  };
+
+  FilterKey victim("reader-victim");
+  FilterKey keeper("reader-keeper");
+  publish(*reader, victim, 1);
+  publish(*reader, keeper, std::numeric_limits<uint32_t>::max());
+  ASSERT_EQ(1u, cache->counters().readerDeadBuilds);
+
+  for (int bypass = 0; bypass < 2; bypass++) {
+    FilterCache::UseRegistry request(*cache, *reader);
+    auto probe = request.get(victim, FilterKeyScope::READER_STABLE)
+        ->probeReaderStable(*reader, domains);
+    EXPECT_EQ(FilterCache::ReaderProbe::Kind::BYPASS, probe.kind());
+  }
+  ASSERT_EQ(2u, cache->counters().readerThrashBuildSkips);
+
+  std::vector<std::string> deletes{"1"};
+  helper.deleteByIds(deletes, UpdateMessage::COMMIT);
+  auto nextReader = writer->getIndexReader();
+  ASSERT_GT(nextReader->commitTime(), reader->commitTime());
+  auto nextDomains = canonicalDomains(*nextReader);
+  EXPECT_EQ(0u, cache->bytesUsed());
+
+  publish(*nextReader, victim, 1);
+  {
+    FilterCache::UseRegistry hitRequest(*cache, *nextReader);
+    auto hit = hitRequest.get(victim, FilterKeyScope::READER_STABLE)
+        ->probeReaderStable(*nextReader, nextDomains);
+    ASSERT_EQ(FilterCache::ReaderProbe::Kind::HIT, hit.kind());
+  }
+
+  publish(*nextReader, FilterKey("reader-evictor"),
+          std::numeric_limits<uint32_t>::max());
+  EXPECT_EQ(1u, cache->counters().readerDeadBuilds)
+      << "a shared HIT must prevent new zero-hit debt";
+  FilterCache::UseRegistry retryRequest(*cache, *nextReader);
+  auto retry = retryRequest.get(victim, FilterKeyScope::READER_STABLE)
+      ->probeReaderStable(*nextReader, nextDomains);
+  EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD, retry.kind());
+  EXPECT_EQ(2u, cache->counters().readerThrashBuildSkips);
+  ASSERT_NO_THROW(cache->validateForTest());
+}
+
+TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
+  LuxirConfig nodeConfig;
+  nodeConfig.filterCacheBytes = 0;
+  LuxirNode node(nodeConfig);
+  luxir::test::CollectionHelper helper(node, "filter_cache_whole_knn_gate");
+  installVectorSchema(helper.collection());
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(config);
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<luxir::test::Doc> input;
+  for (int32_t i = 0; i < 8; i++) {
+    input.push_back(luxir::test::flatdoc(
+        "id", std::to_string(i),
+        "embedding_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto schema = helper.collection().getSchema();
+  auto* fieldType = dynamic_cast<VectorFieldType*>(
+      schema->getFieldTypePtr("embedding_v"));
+  ASSERT_NE(nullptr, fieldType);
+  std::array<float, 2> queryVector{0.0f, 0.0f};
+  KnnQuery query("embedding_v", *fieldType, queryVector, 3, 0, 0, 0.0f,
+                 /*exact=*/true);
+
+  int64_t prepares = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  for (int repeat = 0; repeat < 2; repeat++) {
+    MemPool pool;
+    FilterKeyContext keyContext{.schemaGen = schema->gen_,
+                                .timeZone = {}};
+    Query::Context context(pool, *reader, {}, nullptr, keyContext);
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(
+        query, FilterKeyScope::READER_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    ASSERT_NE(nullptr, use);
+    QueryPrep::WholeMembershipPlan plan(
+        *weight, use, context.filterUses,
+        PreparedDomainDependence::QUERY_CANONICAL,
+        QueryPrep::WholeMembershipConsumer::COUNT);
+    std::vector<std::unique_ptr<DocSet>> ownedDomains;
+    std::vector<DocSet*> nestedDomains;
+    for (auto& segment : reader->segments()) {
+      ownedDomains.push_back(docs(segment.maxDoc(), {0}));
+      nestedDomains.push_back(ownedDomains.back().get());
+    }
+    Query::Weight::PrepareContext prepareContext{
+        *reader, nestedDomains, /*parallel=*/false};
+    auto prepared = plan.prepareMainWeight(prepareContext);
+    ASSERT_NE(nullptr, prepared);
+    auto result = plan.resolve(
+        *reader, reader->segments()[0], nestedDomains[0], prepared.get());
+    EXPECT_FALSE(result.available);
+  }
+  {
+    MemPool pool;
+    FilterKeyContext keyContext{.schemaGen = schema->gen_, .timeZone = {}};
+    Query::Context context(pool, *reader, {}, nullptr, keyContext);
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(
+        query, FilterKeyScope::READER_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    QueryPrep::WholeMembershipPlan plan(
+        *weight, use, context.filterUses,
+        PreparedDomainDependence::PREPARE_DOMAIN,
+        QueryPrep::WholeMembershipConsumer::COUNT);
+    auto rootDomains = canonicalDomains(*reader);
+    Query::Weight::PrepareContext prepareContext{
+        *reader, rootDomains, /*parallel=*/false};
+    EXPECT_THROW(plan.prepareMainWeight(prepareContext), std::logic_error);
+  }
+  EXPECT_EQ(prepares + 2,
+            KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
+  EXPECT_EQ(0u, cache->counters().admissions);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  EXPECT_EQ(0u, cache->entryCountForTest());
+}
+
 TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   LuxirConfig nodeConfig;
   nodeConfig.filterCacheBytes = 0;
@@ -4050,45 +4216,82 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
 
   constexpr int32_t k = 1024;
   std::array<float, 2> queryVector{0.0f, 0.0f};
-  EXPECT_EQ(k, runKnnFilter(
-      node, collection, queryVector, k, /*exact=*/true).count);
-  EXPECT_EQ(k, runKnnFilter(
-      node, collection, queryVector, k, /*exact=*/true).count);
   auto reader = writer->getIndexReader();
   auto schema = helper.collection().getSchema();
   auto* fieldType = dynamic_cast<VectorFieldType*>(
       schema->getFieldTypePtr("embedding_v"));
   ASSERT_NE(nullptr, fieldType);
 
-  AllQuery all;
   KnnQuery knn("embedding_v", *fieldType, queryVector, k, 0, 0, 0.0f,
                /*exact=*/true);
-  std::array<Query*, 1> required{&all};
-  std::array<Query*, 1> filters{&knn};
-  BooleanQuery boolean(required, {}, {}, filters);
+  auto domains = canonicalDomains(*reader);
+  {
+    MemPool buildPool;
+    FilterKeyContext buildKeyContext;
+    buildKeyContext.schemaGen = schema->gen_;
+    Query::Context buildContext(
+        buildPool, *reader, Query::Context::Limits{}, nullptr,
+        buildKeyContext);
+    auto* buildWeight = knn.createWeight(buildContext, 0);
+    auto* buildUse = buildContext.getFilterUse(
+        knn, FilterKeyScope::READER_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    QueryPrep::WholeMembershipPlan buildPlan(
+        *buildWeight, buildUse, buildContext.filterUses);
+    Query::Weight::PrepareContext buildPrepareContext{
+        *reader, domains, /*parallel=*/false};
+    auto buildPrepared = buildPlan.prepareMainWeight(buildPrepareContext);
+    int64_t built = 0;
+    for (auto& segment : reader->segments()) {
+      auto result = buildPlan.resolve(
+          *reader, segment, domains[(size_t)segment.ord],
+          buildPrepared.get());
+      ASSERT_TRUE(result.available);
+      built += result.count;
+    }
+    ASSERT_EQ(k, built);
+  }
+
   MemPool contextPool;
   FilterKeyContext keyContext;
   keyContext.schemaGen = schema->gen_;
   Query::Context context(
       contextPool, *reader, Query::Context::Limits{}, nullptr, keyContext);
-  auto* weight = boolean.createWeight(context, 0);
+  auto* weight = knn.createWeight(context, 0);
   ASSERT_TRUE(weight->needsPrepare());
-  auto domains = canonicalDomains(*reader);
+  auto* use = context.getFilterUse(
+      knn, FilterKeyScope::READER_STABLE,
+      FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan plan(
+      *weight, use, context.filterUses);
   Query::Weight::PrepareContext prepareContext{
       *reader, domains, /*parallel=*/false};
   uint64_t hitsBefore = cache->counters().readerStableHits;
-  auto prepared = weight->prepare(prepareContext);
+  auto prepared = plan.prepareMainWeight(prepareContext);
   ASSERT_NE(nullptr, prepared);
   ASSERT_EQ(hitsBefore + 1, cache->counters().readerStableHits);
 
-  auto collectPrepared = [&]() -> int64_t {
+  std::vector<DomainHandle> cachedMembership;
+  cachedMembership.reserve(reader->segments().size());
+  int64_t cachedCount = 0;
+  for (auto& segment : reader->segments()) {
+    auto result = plan.resolve(
+        *reader, segment, domains[(size_t)segment.ord], prepared.get());
+    ASSERT_TRUE(result.available);
+    cachedCount += result.count;
+    cachedMembership.push_back(std::move(result.docs));
+  }
+  ASSERT_EQ(k, cachedCount);
+  // Only the plan result's request-lifetime pin remains. Retirement must not
+  // invalidate the DocSets after the prepared cache wrapper is destroyed.
+  prepared.reset();
+
+  auto collectMembership = [&]() -> int64_t {
     int64_t total = 0;
     for (auto& segment : reader->segments()) {
       MemPool pool;
-      auto* supplier = prepared->scorerSupplier(pool, segment);
-      if (supplier == nullptr) continue;
-      auto* scorer = test::buildScorerForTests(
-          pool, *supplier, std::numeric_limits<int64_t>::max());
+      auto* scorer = QueryPrep::createDocSetScorer(
+          pool, cachedMembership[(size_t)segment.ord].get(), segment);
       if (scorer == nullptr) continue;
       while (scorer->next() != PostingsReader::END) total++;
     }
@@ -4102,18 +4305,18 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   std::thread collector([&] {
     bool signaled = false;
     try {
-      if (collectPrepared() != k) collectFailed.store(true);
+      if (collectMembership() != k) collectFailed.store(true);
       rounds.fetch_add(1, std::memory_order_relaxed);
       collecting.count_down();
       signaled = true;
       while (!publicationDone.load(std::memory_order_acquire)) {
-        if (collectPrepared() != k) collectFailed.store(true);
+        if (collectMembership() != k) collectFailed.store(true);
         rounds.fetch_add(1, std::memory_order_relaxed);
       }
       // These post-retirement passes make the borrowed-DocSet lifetime bug
       // deterministic under ASan while remaining part of the same request.
       for (int i = 0; i < 8; i++) {
-        if (collectPrepared() != k) collectFailed.store(true);
+        if (collectMembership() != k) collectFailed.store(true);
         rounds.fetch_add(1, std::memory_order_relaxed);
       }
     } catch (...) {

@@ -586,12 +586,23 @@ inline std::unique_ptr<DocSet> materialize(Query::Weight& weight,
 // and callers borrow them directly without a liveDocs composition pass.
 class ReaderStablePreparedWeight final
     : public Query::Weight::PreparedWeight {
+public:
+  enum class CacheOutcome : uint8_t {
+    HIT,
+    BUILD,
+  };
+
+private:
   std::shared_ptr<const FilterCache::ReaderValue> value;
+  CacheOutcome cacheOutcome;
 
 public:
   explicit ReaderStablePreparedWeight(
-      std::shared_ptr<const FilterCache::ReaderValue> value)
-    : value(std::move(value)) {}
+      std::shared_ptr<const FilterCache::ReaderValue> value,
+      CacheOutcome cacheOutcome)
+    : value(std::move(value)), cacheOutcome(cacheOutcome) {}
+
+  CacheOutcome outcome() const noexcept { return cacheOutcome; }
 
   DocSet* docSet(IndexReader::Segment& segment) const {
     return value->docSet((size_t) segment.ord,
@@ -644,9 +655,12 @@ inline std::vector<PreparedSource> prepareFilterSources(
     if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
       auto probe = use->probeReaderStable(ctx.reader, ctx.domainPerSeg);
       std::shared_ptr<const FilterCache::ReaderValue> value;
+      ReaderStablePreparedWeight::CacheOutcome outcome =
+          ReaderStablePreparedWeight::CacheOutcome::HIT;
       if (probe.kind() == FilterCache::ReaderProbe::Kind::HIT) {
         value = probe.sharedValue();
       } else if (probe.kind() == FilterCache::ReaderProbe::Kind::BUILD) {
+        outcome = ReaderStablePreparedWeight::CacheOutcome::BUILD;
         auto buildStart = std::chrono::steady_clock::now();
         auto prepared = weight->prepare(ctx);
         Query::SegmentSource& segmentSource = prepared != nullptr
@@ -667,7 +681,7 @@ inline std::vector<PreparedSource> prepareFilterSources(
       }
       if (value != nullptr) {
         source.setPrepared(std::make_unique<ReaderStablePreparedWeight>(
-            std::move(value)));
+            std::move(value), outcome));
         out.emplace_back(std::move(source));
         continue;
       }
@@ -830,6 +844,32 @@ public:
   bool isFieldSort() const {
     return consumer == WholeMembershipConsumer::FIELD_SORT;
   }
+  bool isReaderStable() const {
+    return cacheUse != nullptr
+        && cacheUse->scope() == FilterKeyScope::READER_STABLE;
+  }
+
+  bool preparesMainWeight(const Query::Weight& mainWeight) const {
+    return weight == &mainWeight && weight->needsPrepare()
+        && isReaderStable();
+  }
+
+  std::unique_ptr<Query::Weight::PreparedWeight> prepareMainWeight(
+      Query::Weight::PrepareContext& ctx) const {
+    if (weight == nullptr || !preparesMainWeight(*weight)) {
+      throw std::logic_error(
+          "whole reader membership cannot prepare a different main weight");
+    }
+    if (domainDependence != PreparedDomainDependence::QUERY_CANONICAL) {
+      throw std::logic_error(
+          "whole reader membership publication requires a query-canonical source");
+    }
+    std::array<Query::Weight*, 1> weights{weight};
+    std::array<FilterCache::Use*, 1> uses{cacheUse};
+    auto sources = prepareFilterSources(weights, uses, ctx);
+    assert(sources.size() == 1);
+    return std::move(sources[0].prepared);
+  }
 
   void recordFallbackSupplier() const {
     record(SkipStats::wholeCountFallbackSuppliers,
@@ -844,8 +884,25 @@ public:
 
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,
-      DocSet* incomingDomain) const {
-    if (weight == nullptr || weight->needsPrepare()) return {};
+      DocSet* incomingDomain,
+      Query::Weight::PreparedWeight* prepared = nullptr) const {
+    if (weight == nullptr) return {};
+    if (weight->needsPrepare()) {
+      auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared);
+      if (!isReaderStable() || cached == nullptr) return {};
+      DocSet* docs = cached->docSet(segment);
+      if (cached->outcome()
+          == ReaderStablePreparedWeight::CacheOutcome::HIT) {
+        record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+               SkipStats::wholeFieldSortHits);
+      } else {
+        record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
+               SkipStats::wholeFieldSortBuilds);
+      }
+      return {
+        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
+      };
+    }
 
     auto constant = weight->constantCount(segment, incomingDomain);
     if (constant.has_value()) {

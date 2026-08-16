@@ -53,9 +53,10 @@ FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
 FilterCache::ReaderValue::ReaderValue(
     uint64_t readerVersion, std::span<const SegmentIdentity> identities,
     std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch,
-    uint32_t buildCostMicros)
+    uint32_t buildCostMicros, bool claimedBuild)
   : readerVersion_(readerVersion), charge(0),
-    buildCostMicros(buildCostMicros), lastUsed(epoch), priority(0) {
+    buildCostMicros(buildCostMicros), claimedBuild(claimedBuild),
+    lastUsed(epoch), priority(0) {
   if (identities.size() != docs.size()) {
     throw std::invalid_argument(
         "reader-stable DocSets must align with reader segments");
@@ -434,24 +435,67 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
     return {};
   }
 
-  auto value = localEntry->readerValue.load(std::memory_order_acquire);
-  if (value != nullptr && value->readerVersion() == readerVersion) {
+  auto sharedHit = [&](std::shared_ptr<const ReaderValue> hitValue) {
+    hitValue->cacheHits.fetch_add(1, std::memory_order_relaxed);
+    if (localEntry->readerValue.load(std::memory_order_acquire) != hitValue) {
+      // A borrower that won before capacity detach resets feedback after the
+      // detach transition has installed any zero-hit debt.
+      std::lock_guard<FilterEntry> feedbackLock(*localEntry);
+      localEntry->readerDeadBuildStreak.store(0,
+                                              std::memory_order_relaxed);
+      localEntry->readerBuildBypassesRemaining.store(
+          0, std::memory_order_relaxed);
+    } else {
+      localEntry->readerDeadBuildStreak.store(0,
+                                              std::memory_order_relaxed);
+      localEntry->readerBuildBypassesRemaining.store(
+          0, std::memory_order_relaxed);
+    }
     uint64_t now = cache->nextEpoch();
-    value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
+    hitValue->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
     localEntry->lastUsed.store(now, std::memory_order_relaxed);
     cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
-    cache->counter.readerStableHits.fetch_add(1, std::memory_order_relaxed);
+    cache->counter.readerStableHits.fetch_add(1,
+                                              std::memory_order_relaxed);
     // Pin at the cache boundary: consumers may drop the wrapper that holds
-    // the only other reference (a prepared-source local) while borrowed
-    // DocSet pointers are still live in the request. The Use outlives them.
-    pinReaderValue(value);
+    // the only other reference while borrowed DocSet pointers remain live.
+    pinReaderValue(hitValue);
     return ReaderProbe(ReaderProbe::Kind::HIT, std::move(localEntry),
-                       std::move(value), false, false);
+                       std::move(hitValue), false, false);
+  };
+
+  auto value = localEntry->readerValue.load(std::memory_order_acquire);
+  if (value != nullptr && value->readerVersion() == readerVersion) {
+    return sharedHit(std::move(value));
+  }
+
+  if (readerVersion
+      != cache->publishedReaderVersion.load(std::memory_order_acquire)) {
+    cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+  std::unique_lock<std::mutex> entryLock(localEntry->mutex);
+  if (!localEntry->resident) {
+    cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
+    return {};
+  }
+  std::unique_lock<FilterEntry> feedbackLock(*localEntry);
+  entryLock.unlock();
+  value = localEntry->readerValue.load(std::memory_order_acquire);
+  if (value != nullptr && value->readerVersion() == readerVersion) {
+    feedbackLock.unlock();
+    return sharedHit(std::move(value));
   }
 
   cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
-  if (readerVersion
-      != cache->publishedReaderVersion.load(std::memory_order_acquire)) {
+  if (localEntry->readerBuilding.load(std::memory_order_acquire)) return {};
+  uint32_t bypasses = localEntry->readerBuildBypassesRemaining.load(
+      std::memory_order_relaxed);
+  if (bypasses != 0) {
+    localEntry->readerBuildBypassesRemaining.store(
+        bypasses - 1, std::memory_order_relaxed);
+    cache->counter.readerThrashBuildSkips.fetch_add(
+        1, std::memory_order_relaxed);
     return {};
   }
   bool expected = false;
@@ -460,8 +504,6 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
           std::memory_order_relaxed)) {
     return {};
   }
-  // ReaderValue eviction feedback is deferred until the READER_STABLE whole-
-  // membership stage; segment backoff cannot represent an atomic reader unit.
   cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
   uint64_t now = cache->nextEpoch();
   localEntry->lastUsed.store(now, std::memory_order_relaxed);
@@ -780,6 +822,23 @@ void FilterCache::recordCapacityEviction(
   counter.capacityDeadBuilds.fetch_add(1, std::memory_order_relaxed);
 }
 
+void FilterCache::recordReaderCapacityEviction(
+    const std::shared_ptr<FilterEntry>& entry,
+    const std::shared_ptr<const ReaderValue>& value) {
+  if (!value->claimedBuild
+      || value->cacheHits.load(std::memory_order_relaxed) != 0) {
+    return;
+  }
+  uint32_t streak = entry->readerDeadBuildStreak.load(
+      std::memory_order_relaxed);
+  if (streak != std::numeric_limits<uint32_t>::max()) streak++;
+  entry->readerDeadBuildStreak.store(streak, std::memory_order_relaxed);
+  uint32_t bypasses = streak >= 10 ? 1024U : 1U << streak;
+  entry->readerBuildBypassesRemaining.store(
+      bypasses, std::memory_order_relaxed);
+  counter.readerDeadBuilds.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
                            const SegmentIdentity& identity) const {
   auto iter = std::lower_bound(snapshot.segments.begin(), snapshot.segments.end(),
@@ -836,6 +895,12 @@ bool FilterCache::eraseEntry(
     return item.second == entry;
   });
   if (erased != 0) {
+    // Reader feedback is entry-stable, so deleting the entry deletes its
+    // ghost even when the caller already detached the resident value.
+    std::lock_guard<FilterEntry> feedbackLock(*entry);
+    entry->readerDeadBuildStreak.store(0, std::memory_order_relaxed);
+    entry->readerBuildBypassesRemaining.store(0,
+                                               std::memory_order_relaxed);
     metadataBytes.fetch_sub(entry->metadataCharge, std::memory_order_relaxed);
     return true;
   }
@@ -1037,7 +1102,7 @@ FilterCache::publishReaderValue(
   }
   auto mutableLocal = std::shared_ptr<ReaderValue>(new ReaderValue(
       use.readerVersion, use.readerSegments, std::move(liveExact),
-      nextEpoch(), buildCostMicros));
+      nextEpoch(), buildCostMicros, probe.ownsClaim));
   std::shared_ptr<const ReaderValue> local = mutableLocal;
   auto localEntry = probe.entry;
   bool inserted = false;
@@ -1260,10 +1325,13 @@ void FilterCache::sweep() {
           if (residentBytes.load(std::memory_order_relaxed)
               <= config.lowWatermarkBytes) break;
           if (candidate.readerValue != nullptr) {
+            std::lock_guard<FilterEntry> feedbackLock(*candidate.entry);
             auto expected = candidate.readerValue;
             if (candidate.entry->readerValue.compare_exchange_strong(
                     expected, nullptr, std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
+              recordReaderCapacityEviction(candidate.entry,
+                                           candidate.readerValue);
               residentBytes.fetch_sub(
                   candidate.readerValue->ramBytesUsed(),
                   std::memory_order_relaxed);
@@ -1349,16 +1417,23 @@ void FilterCache::sweepMetadata() {
       }
       if (canErase) {
         candidate.entry->resident = false;
+        std::lock_guard<FilterEntry> readerFeedbackLock(*candidate.entry);
         if (overBytes) {
           readerValue = candidate.entry->readerValue.exchange(
               nullptr, std::memory_order_acq_rel);
           if (readerValue != nullptr) {
+            recordReaderCapacityEviction(candidate.entry, readerValue);
             residentBytes.fetch_sub(readerValue->ramBytesUsed(),
                                     std::memory_order_relaxed);
             advanceEvictionClock(readerValue->evictionPriority());
             counter.evictions.fetch_add(1, std::memory_order_relaxed);
           }
         }
+        // Metadata eviction removes the entry-stable reader ghost itself.
+        candidate.entry->readerDeadBuildStreak.store(
+            0, std::memory_order_relaxed);
+        candidate.entry->readerBuildBypassesRemaining.store(
+            0, std::memory_order_relaxed);
         for (const auto& slot : *slots) {
           std::lock_guard<SegmentSlot> feedbackLock(*slot);
           slot->active.store(false, std::memory_order_release);
@@ -1399,12 +1474,17 @@ void FilterCache::clear() {
     {
       std::lock_guard<std::mutex> lock(candidate.entry->mutex);
       candidate.entry->resident = false;
+      std::lock_guard<FilterEntry> readerFeedbackLock(*candidate.entry);
       auto readerValue = candidate.entry->readerValue.exchange(
           nullptr, std::memory_order_acq_rel);
       if (readerValue != nullptr) {
         residentBytes.fetch_sub(readerValue->ramBytesUsed(),
                                 std::memory_order_relaxed);
       }
+      candidate.entry->readerDeadBuildStreak.store(
+          0, std::memory_order_relaxed);
+      candidate.entry->readerBuildBypassesRemaining.store(
+          0, std::memory_order_relaxed);
       auto slots = candidate.entry->slots.load(std::memory_order_acquire);
       for (const auto& slot : *slots) {
         std::lock_guard<SegmentSlot> feedbackLock(*slot);
@@ -1435,6 +1515,10 @@ FilterCache::CounterValues FilterCache::counters() const {
       .capacityDeadBuilds = counter.capacityDeadBuilds.load(
           std::memory_order_relaxed),
       .thrashBuildSkips = counter.thrashBuildSkips.load(
+          std::memory_order_relaxed),
+      .readerDeadBuilds = counter.readerDeadBuilds.load(
+          std::memory_order_relaxed),
+      .readerThrashBuildSkips = counter.readerThrashBuildSkips.load(
           std::memory_order_relaxed),
       .purges = counter.purges.load(std::memory_order_relaxed),
       .oversizedKeyBypasses = counter.oversizedKeyBypasses.load(
@@ -1499,6 +1583,15 @@ void FilterCache::validateForTest() {
 
     auto slots = entry.slots.load(std::memory_order_acquire);
     auto readerValue = entry.readerValue.load(std::memory_order_acquire);
+    uint32_t readerStreak = entry.readerDeadBuildStreak.load(
+        std::memory_order_relaxed);
+    uint32_t readerBypasses = entry.readerBuildBypassesRemaining.load(
+        std::memory_order_relaxed);
+    if (readerBypasses > 1024
+        || (readerBypasses != 0 && readerStreak == 0)) {
+      throw std::logic_error(
+          "FilterCache validation: invalid reader build backoff");
+    }
     if (entry.scope == FilterKeyScope::READER_STABLE) {
       if (!slots->empty()) {
         throw std::logic_error(
@@ -1541,6 +1634,9 @@ void FilterCache::validateForTest() {
     } else if (readerValue != nullptr) {
       throw std::logic_error(
           "FilterCache validation: slot entry owns reader-stable value");
+    } else if (readerStreak != 0 || readerBypasses != 0) {
+      throw std::logic_error(
+          "FilterCache validation: slot entry owns reader build backoff");
     }
     uint64_t previousSegId = 0;
     bool first = true;
