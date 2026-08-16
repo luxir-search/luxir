@@ -514,6 +514,11 @@ public:
     return VerificationWork::UNKNOWN;
   }
 
+  // True only when omitting createWeight on a fully resident membership hit
+  // preserves every request-visible validation and warning for this logical
+  // query. Unknown and custom queries remain conservative by default.
+  virtual bool supportsCacheFirstMembership() const { return false; }
+
   // Structural membership key: the filter projection of this query, with
   // score-only state omitted. Consumers that need query identity, such as a
   // future request cache, must not reuse this method. Queries whose membership
@@ -912,6 +917,25 @@ public:
       if (scope != requiredScope) return nullptr;
       auto key = std::move(builder).finish(scope, filterKeyContext);
       return key ? filterUses->get(*key, scope, lane) : nullptr;
+    }
+
+    std::optional<FilterCache::ExistingCandidate> lookupExistingFilterUse(
+        const Query& query,
+        FilterKeyScope requiredScope = FilterKeyScope::SEGMENT_STABLE) {
+      if (filterUses == nullptr) return std::nullopt;
+      FilterKeyBuilder builder;
+      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
+      if (scope != requiredScope) return std::nullopt;
+      auto key = std::move(builder).finish(scope, filterKeyContext);
+      if (!key) return std::nullopt;
+      return filterUses->lookupExisting(*key, scope);
+    }
+
+    FilterCache::Use* acceptExistingFilterUse(
+        FilterCache::ExistingCandidate&& candidate,
+        FilterCache::AdmissionLane lane) {
+      return filterUses == nullptr ? nullptr
+          : filterUses->acceptExisting(std::move(candidate), lane);
     }
 
     // code must have static storage duration.

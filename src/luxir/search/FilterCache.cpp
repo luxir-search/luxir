@@ -230,6 +230,28 @@ void FilterCache::Use::releaseRequestClaim(size_t segmentOrd) {
   requestSlot.condition.notify_all();
 }
 
+void FilterCache::acceptSharedHit(
+    Use& use, size_t segmentOrd,
+    const std::shared_ptr<SegmentSlot>& slot,
+    const std::shared_ptr<const SegmentValue>& value) {
+  value->cacheHits.fetch_add(1, std::memory_order_relaxed);
+  if (slot->value.load(std::memory_order_acquire) != value) {
+    // A borrower that won before capacity detach resets feedback after the
+    // detach transition has installed any zero-hit debt.
+    std::lock_guard<SegmentSlot> lock(*slot);
+    slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+    slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
+  } else {
+    slot->deadBuildStreak.store(0, std::memory_order_relaxed);
+    slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
+  }
+  uint64_t now = nextEpoch();
+  value->touch(now, evictionClock.load(std::memory_order_relaxed));
+  use.entry->lastUsed.store(now, std::memory_order_relaxed);
+  use.pinValue(segmentOrd, value);
+  counter.hits.fetch_add(1, std::memory_order_relaxed);
+}
+
 void FilterCache::Use::pinReaderValue(
     const std::shared_ptr<const ReaderValue>& value) {
   if (value == nullptr) return;
@@ -270,23 +292,8 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
   };
   auto sharedHit = [&](std::shared_ptr<SegmentSlot> slot,
                        std::shared_ptr<const SegmentValue> value) {
-    value->cacheHits.fetch_add(1, std::memory_order_relaxed);
-    if (slot->value.load(std::memory_order_acquire) != value) {
-      // A hit that borrowed the old value before capacity eviction must reset
-      // feedback after the eviction transition finishes.
-      std::lock_guard<SegmentSlot> lock(*slot);
-      slot->deadBuildStreak.store(0, std::memory_order_relaxed);
-      slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
-    } else {
-      slot->deadBuildStreak.store(0, std::memory_order_relaxed);
-      slot->buildBypassesRemaining.store(0, std::memory_order_relaxed);
-    }
-    uint64_t now = cache->nextEpoch();
-    value->touch(now, cache->evictionClock.load(std::memory_order_relaxed));
-    entry->lastUsed.store(now, std::memory_order_relaxed);
-    pinValue(segmentOrd, value);
+    cache->acceptSharedHit(*this, segmentOrd, slot, value);
     releaseRequestClaim(segmentOrd);
-    cache->counter.hits.fetch_add(1, std::memory_order_relaxed);
     DocSet* raw = value->docSet();
     return Probe(Probe::Kind::HIT, std::move(slot), std::move(value), false,
                  raw);
@@ -709,6 +716,34 @@ FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
   return result;
 }
 
+std::optional<FilterCache::ExistingCandidate>
+FilterCache::UseRegistry::lookupExisting(
+    const FilterKey& key, FilterKeyScope scope) {
+  #ifndef NDEBUG
+  assert(owningThread == std::this_thread::get_id());
+  #endif
+  if (cache == nullptr || uses.contains(key)) return std::nullopt;
+  auto use = cache->lookupExisting(
+      key, scope, readerCoreGen, readerVersion, segments);
+  if (use == nullptr) return std::nullopt;
+  return ExistingCandidate(std::move(use));
+}
+
+FilterCache::Use* FilterCache::UseRegistry::acceptExisting(
+    ExistingCandidate&& candidate, AdmissionLane lane) {
+  #ifndef NDEBUG
+  assert(owningThread == std::this_thread::get_id());
+  #endif
+  if (cache == nullptr || candidate.use == nullptr
+      || uses.contains(candidate.use->key)
+      || !cache->acceptExisting(*candidate.use, lane)) {
+    return nullptr;
+  }
+  Use* result = candidate.use.get();
+  uses.emplace(result->key, std::move(candidate.use));
+  return result;
+}
+
 size_t FilterCache::UseRegistry::ownedBytesForTest() {
   size_t result = 0;
   for (auto& [key, use] : uses) {
@@ -972,6 +1007,90 @@ std::unique_ptr<FilterCache::Use> FilterCache::beginUse(
   observeAdmissionLane(*use, lane);
   maybeSweep();
   return use;
+}
+
+std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
+    const FilterKey& key, FilterKeyScope scope, uint64_t readerCoreGen,
+    uint64_t readerVersion,
+    std::span<const SegmentIdentity> readerSegments) {
+  if (!enabled() || readerSegments.empty()
+      || scope == FilterKeyScope::UNCACHEABLE
+      || scope == FilterKeyScope::READER_STABLE) {
+    return nullptr;
+  }
+  auto entry = findEntry(key);
+  if (entry == nullptr || entry->scope != scope) return nullptr;
+
+  auto active = activeSegments.load(std::memory_order_acquire);
+  auto current = entry->slots.load(std::memory_order_acquire);
+  std::vector<std::shared_ptr<SegmentSlot>> aligned(readerSegments.size());
+  std::vector<std::shared_ptr<const SegmentValue>> candidates(
+      readerSegments.size());
+  for (size_t i = 0; i < readerSegments.size(); i++) {
+    const auto& identity = readerSegments[i];
+    auto found = std::lower_bound(
+        current->begin(), current->end(), identity,
+        [](const std::shared_ptr<SegmentSlot>& slot,
+           const SegmentIdentity& target) {
+          return std::tie(slot->segId, slot->maxDoc)
+              < std::tie(target.segId, target.maxDoc);
+        });
+    if (found == current->end() || (*found)->segId != identity.segId
+        || (*found)->maxDoc != identity.maxDoc
+        || !(*found)->active.load(std::memory_order_acquire)
+        || !isActive(*active, identity)) {
+      return nullptr;
+    }
+    auto value = (*found)->value.load(std::memory_order_acquire);
+    if (value == nullptr) return nullptr;
+    aligned[i] = *found;
+    candidates[i] = std::move(value);
+  }
+
+  auto use = std::unique_ptr<Use>(new Use(
+      this, key, scope, entry, std::move(aligned),
+      std::vector<SegmentIdentity>(readerSegments.begin(),
+                                   readerSegments.end()),
+      readerCoreGen, readerVersion, false, 0));
+  use->existingCandidates = std::move(candidates);
+  return use;
+}
+
+bool FilterCache::acceptExisting(Use& use, AdmissionLane lane) {
+  if (use.cache != this) return false;
+  if (use.existingAccepted) {
+    observeAdmissionLane(use, lane);
+    return true;
+  }
+  if (use.entry == nullptr || use.scope_ == FilterKeyScope::READER_STABLE
+      || use.existingCandidates.size() != use.readerSegments.size()
+      || use.slotsByOrd.size() != use.readerSegments.size()) {
+    return false;
+  }
+
+  // Revalidate the whole candidate before applying any effect. A subsequent
+  // capacity detach is safe: each candidate pin remains a valid immutable
+  // value, and acceptSharedHit orders its feedback reset with that detach.
+  auto active = activeSegments.load(std::memory_order_acquire);
+  for (size_t i = 0; i < use.readerSegments.size(); i++) {
+    const auto& identity = use.readerSegments[i];
+    const auto& slot = use.slotsByOrd[i];
+    if (slot == nullptr || use.existingCandidates[i] == nullptr
+        || !slot->active.load(std::memory_order_acquire)
+        || slot->segId != identity.segId || slot->maxDoc != identity.maxDoc
+        || !isActive(*active, identity)) {
+      return false;
+    }
+  }
+
+  observeAdmissionLane(use, lane);
+  for (size_t i = 0; i < use.readerSegments.size(); i++) {
+    acceptSharedHit(use, i, use.slotsByOrd[i], use.existingCandidates[i]);
+  }
+  use.existingCandidates.clear();
+  use.existingAccepted = true;
+  maybeSweep();
+  return true;
 }
 
 void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {

@@ -278,7 +278,8 @@ public:
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         return new MergeableCollector(
-            op.topCount, op.sortPlan, op.req.reader.get(), op.weight->needsScores());
+            op.topCount, op.sortPlan, op.req.reader.get(),
+            op.weight != nullptr && op.weight->needsScores());
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
@@ -292,7 +293,8 @@ public:
           subCalcs.emplace_back(subCalc);
         }
       }
-      requiresPreparePhase = op.weight->needsPrepare();
+      requiresPreparePhase =
+          op.weight != nullptr && op.weight->needsPrepare();
       for (auto* weight : op.filterWeights) {
         if (weight->needsPrepare()) {
           requiresPreparePhase = true;
@@ -384,6 +386,7 @@ public:
 
     Query::ScorerSupplier* mainScorerSupplier(MemPool& pool, IndexReader::Segment& seg) {
       auto& op = thisOp();
+      assert(op.weight != nullptr);
       Query::SegmentSource& source = preparedWeight != nullptr
         ? static_cast<Query::SegmentSource&>(*preparedWeight)
         : static_cast<Query::SegmentSource&>(*op.weight);
@@ -404,7 +407,8 @@ public:
         const TopDocsCollector& collector,
         DocSetBuilder* builder) noexcept {
       const auto& op = thisOp();
-      if (collector.topCount <= 0 || !op.weight->isConstantScoring()) {
+      if (collector.topCount <= 0 || op.weight == nullptr
+          || !op.weight->isConstantScoring()) {
         return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
       }
       if (!TopDocsReq::disableConstantWindowCaptureForTests
@@ -685,9 +689,10 @@ public:
         std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
         tg != nullptr
       };
-      if (op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
+      if (op.weight != nullptr
+          && op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
         preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);
-      } else if (op.weight->needsPrepare()) {
+      } else if (op.weight != nullptr && op.weight->needsPrepare()) {
         preparedWeight = op.weight->prepare(queryCtx);
       }
 
@@ -725,7 +730,7 @@ public:
       // scorer, so the whole collection ladder below is skipped.  (Scores must
       // be constant for doc order to be the ranking; a rescore over a
       // match-all matches everything but reorders it.)
-      bool matchEverything = op.weight->matchesAllDocs()
+      bool matchEverything = op.weight != nullptr && op.weight->matchesAllDocs()
         && op.weight->isConstantScoring() && op.filterWeights.empty();
       std::unique_ptr<MergeableCollector> data;
       int64_t numSegs = (int64_t)op.req.reader->segments().size();
@@ -793,7 +798,8 @@ public:
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
         if (!exactDomain && !wholeMembershipAvailable
-            && !requiresPreparePhase && domain == nullptr && op.filterWeights.empty()
+            && op.weight != nullptr && !requiresPreparePhase
+            && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
             && (rankFromDocOrder || data->topCount() == 0)) {
           supplier = obtainMainSupplier();
@@ -822,6 +828,7 @@ public:
         }
 
         if (wholeTopKCountAvailable) {
+          assert(op.weight != nullptr);
           assert(rankFromDocOrder);
           assert(data->scoreCollector->topCount > 0);
           if (op.weight->isConstantScoring()) {
@@ -992,9 +999,10 @@ public:
                 // Match-all with no deletes and no filters: the domain is
                 // every doc (deletes would have arrived as a liveDocs
                 // domain in collectorFilter per the root domain contract).
-                allDocs =
-                    domainSet == nullptr && op.weight->matchesAllDocs();
-              } else if (op.weight->matchesAllDocs()) {
+                allDocs = domainSet == nullptr && op.weight != nullptr
+                    && op.weight->matchesAllDocs();
+              } else if (op.weight != nullptr
+                         && op.weight->matchesAllDocs()) {
                 domainSet = collectorFilter;
               }
               if (allDocs
@@ -1189,6 +1197,7 @@ public:
               data->addHits(wholeMembershipResult.count - collected);
             }
           } else {
+            assert(op.weight != nullptr);
             // Pruning is enabled only when an exact count can either be omitted
             // or supplied by an exhaustive count/domain pass or an already-known
             // domain. Without pruning, windowed scoring still beats the
@@ -1405,9 +1414,9 @@ public:
   };
 
 
-  // ProtobufSearchParser resolves everything that can fail (sort field schema
-  // lookup, Weight construction, filter weights) and passes the results in, so
-  // this ctor just binds members.
+  // ProtobufSearchParser resolves everything that can fail and passes the
+  // execution sources in. A fully resident validated membership plan may omit
+  // the main Weight entirely.
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::Context& qcontext, Query* query, Query::Weight* weight,
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
@@ -1428,17 +1437,29 @@ public:
       topCount(topCount), filters(filters), filterWeights(filterWeights),
       requirements(requirements),
       sortPlan(std::move(sortPlan)) {
+    auto wholeConsumer = this->sortPlan.useFieldSort
+        ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
+        : requirements.needRankedDocs
+              ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
+              : QueryPrep::WholeMembershipConsumer::COUNT;
     if (wholeMembershipWeight != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan(
           *wholeMembershipWeight, wholeMembershipUse,
           qcontext.filterUses,
           PreparedDomainDependence::QUERY_CANONICAL,
-          this->sortPlan.useFieldSort
-              ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
-              : requirements.needRankedDocs
-                    ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
-                    : QueryPrep::WholeMembershipConsumer::COUNT,
+          wholeConsumer,
           wholeFieldSortCacheRoutes);
+    } else if (wholeMembershipUse != nullptr) {
+      wholeMembershipPlan = QueryPrep::WholeMembershipPlan::acceptedExisting(
+          *wholeMembershipUse, qcontext.filterUses, wholeConsumer);
+    }
+    if (weight == nullptr) {
+      if (wholeMembershipUse == nullptr || requirements.needRankedDocs
+          || !requirements.needExactCount || requirements.needExactDomain
+          || this->sortPlan.useFieldSort || !filterWeights.empty()) {
+        throw std::logic_error(
+            "Weight-free TopDocs requires complete pure-count membership");
+      }
     }
     if (!filterWeights.empty()) {
       assert(filterWeights.size() == filters.size());

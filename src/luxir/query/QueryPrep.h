@@ -799,6 +799,13 @@ enum class WholeMembershipConsumer : uint8_t {
 // traffic; cache values remain raw and the incoming effective domain is
 // composed once at the Use boundary.
 class WholeMembershipPlan {
+  enum class Source : uint8_t {
+    EMPTY,
+    WEIGHT,
+    ACCEPTED_EXISTING,
+  };
+
+  Source source = Source::EMPTY;
   Query::Weight* weight = nullptr;
   FilterCache::Use* cacheUse = nullptr;
   std::shared_ptr<FilterCache::UseRegistry> lifetime;
@@ -806,6 +813,24 @@ class WholeMembershipPlan {
       PreparedDomainDependence::QUERY_CANONICAL;
   WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT;
   std::span<const uint8_t> fieldSortCacheRoutes;
+
+  struct AcceptedExistingTag {};
+
+  WholeMembershipPlan(
+      AcceptedExistingTag, FilterCache::Use& cacheUse,
+      std::shared_ptr<FilterCache::UseRegistry> lifetime,
+      WholeMembershipConsumer consumer)
+    : source(Source::ACCEPTED_EXISTING), cacheUse(&cacheUse),
+      lifetime(std::move(lifetime)), consumer(consumer) {
+    if (!cacheUse.hasAcceptedExisting()) {
+      throw std::logic_error(
+          "resident-only membership requires an accepted cache use");
+    }
+    if (consumer != WholeMembershipConsumer::COUNT) {
+      throw std::logic_error(
+          "resident-only membership currently supports pure count only");
+    }
+  }
 
   void record(int64_t& countCounter, int64_t& topKCountCounter,
               int64_t& fieldSortCounter) const {
@@ -832,11 +857,19 @@ public:
           PreparedDomainDependence::QUERY_CANONICAL,
       WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT,
       std::span<const uint8_t> fieldSortCacheRoutes = {})
-    : weight(&weight), cacheUse(cacheUse), lifetime(std::move(lifetime)),
-      domainDependence(domainDependence), consumer(consumer),
-      fieldSortCacheRoutes(fieldSortCacheRoutes) {}
+    : source(Source::WEIGHT), weight(&weight), cacheUse(cacheUse),
+      lifetime(std::move(lifetime)), domainDependence(domainDependence),
+      consumer(consumer), fieldSortCacheRoutes(fieldSortCacheRoutes) {}
 
-  bool empty() const { return weight == nullptr; }
+  static WholeMembershipPlan acceptedExisting(
+      FilterCache::Use& cacheUse,
+      std::shared_ptr<FilterCache::UseRegistry> lifetime,
+      WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT) {
+    return WholeMembershipPlan(
+        AcceptedExistingTag{}, cacheUse, std::move(lifetime), consumer);
+  }
+
+  bool empty() const { return source == Source::EMPTY; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
   bool isTopKCount() const {
     return consumer == WholeMembershipConsumer::TOP_K_COUNT;
@@ -850,7 +883,8 @@ public:
   }
 
   bool preparesMainWeight(const Query::Weight& mainWeight) const {
-    return weight == &mainWeight && weight->needsPrepare()
+    return source == Source::WEIGHT && weight == &mainWeight
+        && weight->needsPrepare()
         && isReaderStable();
   }
 
@@ -886,7 +920,21 @@ public:
       IndexReader& reader, IndexReader::Segment& segment,
       DocSet* incomingDomain,
       Query::Weight::PreparedWeight* prepared = nullptr) const {
-    if (weight == nullptr) return {};
+    if (source == Source::EMPTY) return {};
+    if (source == Source::ACCEPTED_EXISTING) {
+      DocSet* docs = cacheUse->effectiveDocSet(
+          (size_t) segment.ord, reader, incomingDomain);
+      if (docs == nullptr) {
+        throw std::logic_error(
+            "accepted complete membership lost a segment value");
+      }
+      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+             SkipStats::wholeFieldSortHits);
+      return {
+        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
+      };
+    }
+    assert(source == Source::WEIGHT && weight != nullptr);
     if (weight->needsPrepare()) {
       auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared);
       if (!isReaderStable() || cached == nullptr) return {};

@@ -453,6 +453,7 @@ struct WholeCountRun {
   int64_t fallbackSuppliers = 0;
   bool docsEmpty = false;
   bool hasScoreValues = false;
+  int64_t weightSkips = 0;
 };
 
 using WholeCountQueryBuilder =
@@ -490,6 +491,7 @@ WholeCountRun runWholeCount(
     SkipStats::wholeCountFallbackSuppliers,
     req->getDocs("q").empty(),
     hasScoreValues,
+    SkipStats::cacheFirstMembershipWeightSkips,
   };
 }
 
@@ -1431,6 +1433,26 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     EXPECT_EQ(0, build.fallbackSuppliers);
     EXPECT_EQ(1, hit.hits);
     EXPECT_EQ(0, hit.fallbackSuppliers);
+    EXPECT_EQ(name == "phrase" || name == "sloppy phrase" ? 1 : 0,
+              hit.weightSkips);
+
+    if (name == "phrase") {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection(collection);
+      auto& topDocs = req->topDocs("q").getNumber().limit(0);
+      auto phrase =
+          qb::phraseWords(topDocs.mr(), "body_w", {"quick", "fox"});
+      auto inner = qb::boost(
+          topDocs.mr(), phrase, std::numeric_limits<float>::max());
+      topDocs.rawQuery() = qb::boost(topDocs.mr(), inner, 2.0f);
+
+      SkipStatsGuard stats;
+      req->execute(false);
+      EXPECT_FALSE(req->ok());
+      EXPECT_NE(std::string::npos,
+                req->errorMsg().find("query boost product must be finite"));
+      EXPECT_EQ(0, SkipStats::cacheFirstMembershipWeightSkips);
+    }
   }
 
   WholeCountRun unboostedHit = runWholeCount(

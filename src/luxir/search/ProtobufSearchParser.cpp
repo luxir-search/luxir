@@ -757,8 +757,27 @@ public:
     if (allowPruning) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
-    auto* weight = query->createWeight(*qcontext, requestFlags);
-    bool sparseFilteredTopKReroute = allowPruning && foldFilters
+    bool pureCountShape = !QueryPrep::disableWholeMembershipPlanForTests
+        && limit == 0 && topDocsReq.get_number
+        && !requirements.needExactDomain && !parsedSorts.useFieldSort
+        && (foldFilters || filters.empty());
+    FilterCache::Use* cacheFirstMembershipUse = nullptr;
+    auto* cache = req.reader->filterCache();
+    if (pureCountShape && query->supportsCacheFirstMembership()
+        && cache != nullptr && cache->enabled()) {
+      auto candidate = qcontext->lookupExistingFilterUse(*query);
+      if (candidate.has_value()) {
+        cacheFirstMembershipUse = qcontext->acceptExistingFilterUse(
+            std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+      }
+      if (cacheFirstMembershipUse != nullptr) {
+        skipCount(SkipStats::cacheFirstMembershipWeightSkips);
+      }
+    }
+    auto* weight = cacheFirstMembershipUse == nullptr
+        ? query->createWeight(*qcontext, requestFlags) : nullptr;
+    bool sparseFilteredTopKReroute = weight != nullptr
+        && allowPruning && foldFilters
         && !requirements.needExactDomain && !weight->needsPrepare()
         && TopDocsReq::admitSparseFilteredTopK(
             *weight, *req.reader, limit);
@@ -778,7 +797,7 @@ public:
         && requirements.needExactCount && !requirements.needExactDomain
         && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
-    if (!disableTopKCountComposition && exactCountTopK
+    if (weight != nullptr && !disableTopKCountComposition && exactCountTopK
         && !weight->needsPrepare() && weight->canComposeExactCountTopK()
         // A constant-score ranking pass is bounded only when no collector
         // filter can reject its first K matches. Variable-score composition
@@ -815,26 +834,25 @@ public:
     FilterCache::Use* wholeMembershipUse = nullptr;
     std::span<uint8_t> wholeFieldSortCacheRoutes;
     float wholeConstantScore = 0.0f;
-    bool pureCount = !QueryPrep::disableWholeMembershipPlanForTests
-        && limit == 0 && topDocsReq.get_number
-        && !requirements.needExactDomain && !parsedSorts.useFieldSort
-        && filterWeights.empty();
+    bool pureCount = pureCountShape && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
-        && exactCountTopK && !weight->needsPrepare()
+        && weight != nullptr && exactCountTopK && !weight->needsPrepare()
         && filterWeights.empty();
     bool wholeFieldSort = !QueryPrep::disableWholeMembershipPlanForTests
-        && limit > 0 && parsedSorts.useFieldSort
+        && weight != nullptr && limit > 0 && parsedSorts.useFieldSort
         && !weight->needsScores() && !requirements.needExactDomain
         && filterWeights.empty();
-    bool readerStableWhole = weight->needsPrepare()
+    bool readerStableWhole = weight != nullptr && weight->needsPrepare()
         && placement == TopDocsPlacement::OP_TREE
         && (pureCount || wholeFieldSort);
-    if (weight->needsPrepare() && !readerStableWhole) {
+    if (weight != nullptr && weight->needsPrepare() && !readerStableWhole) {
       pureCount = false;
       wholeFieldSort = false;
     }
     if (pureCount || wholeTopKCount || wholeFieldSort) {
-      if (wholeTopKCount && countWeight != nullptr
+      if (cacheFirstMembershipUse != nullptr) {
+        wholeMembershipUse = cacheFirstMembershipUse;
+      } else if (wholeTopKCount && countWeight != nullptr
           && !countWeight->needsScores()
           && !countWeight->allowsPruning()) {
         wholeMembershipWeight = countWeight;
@@ -846,53 +864,55 @@ public:
         wholeMembershipWeight =
             query->createWeight(*qcontext, membershipFlags);
       }
-      assert(!wholeMembershipWeight->needsScores());
-      assert(!wholeMembershipWeight->allowsPruning());
+      if (wholeMembershipWeight != nullptr) {
+        assert(!wholeMembershipWeight->needsScores());
+        assert(!wholeMembershipWeight->allowsPruning());
 
-      bool everySegmentConstant = wholeMembershipWeight->matchesAllDocs();
-      if (!everySegmentConstant) {
-        everySegmentConstant = true;
-        for (auto& segment : req.reader->segments()) {
-          DocSet* rootDomain = segment.liveDocs() == nullptr
-              ? nullptr : &segment.liveDocs()->docset();
-          if (!wholeMembershipWeight->constantCount(
-                  segment, rootDomain).has_value()) {
-            everySegmentConstant = false;
-            break;
+        bool everySegmentConstant = wholeMembershipWeight->matchesAllDocs();
+        if (!everySegmentConstant) {
+          everySegmentConstant = true;
+          for (auto& segment : req.reader->segments()) {
+            DocSet* rootDomain = segment.liveDocs() == nullptr
+                ? nullptr : &segment.liveDocs()->docset();
+            if (!wholeMembershipWeight->constantCount(
+                    segment, rootDomain).has_value()) {
+              everySegmentConstant = false;
+              break;
+            }
           }
         }
-      }
-      auto* cache = req.reader->filterCache();
-      bool fieldSortFullyRouted = false;
-      if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
-        bool acquireUse = true;
-        if (wholeFieldSort && !readerStableWhole) {
-          wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
-              req.reader->segments().size());
-          acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
-              *query, *wholeMembershipWeight, *req.reader, parsedSorts, limit,
-              wholeFieldSortCacheRoutes);
-          fieldSortFullyRouted = !acquireUse;
+        bool fieldSortFullyRouted = false;
+        if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
+          bool acquireUse = true;
+          if (wholeFieldSort && !readerStableWhole) {
+            wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
+                req.reader->segments().size());
+            acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
+                *query, *wholeMembershipWeight, *req.reader, parsedSorts, limit,
+                wholeFieldSortCacheRoutes);
+            fieldSortFullyRouted = !acquireUse;
+          }
+          // An accepted reader-stable value replaces the ANN preparation pass.
+          // Its bounded kNN membership is also a valid ladder fallback, while
+          // numeric best-first still rechecks exact cardinality per segment.
+          if (acquireUse) {
+            wholeMembershipUse = readerStableWhole
+                ? qcontext->getFilterUse(
+                      *query, FilterKeyScope::READER_STABLE,
+                      FilterCache::AdmissionLane::WHOLE)
+                : qcontext->getFilterUse(
+                      *query, FilterCache::AdmissionLane::WHOLE);
+          }
         }
-        // An accepted reader-stable value replaces the ANN preparation pass.
-        // Its bounded kNN membership is also a valid ladder fallback, while
-        // numeric best-first still rechecks exact cardinality per segment.
-        if (acquireUse) {
-          wholeMembershipUse = readerStableWhole
-              ? qcontext->getFilterUse(
-                    *query, FilterKeyScope::READER_STABLE,
-                    FilterCache::AdmissionLane::WHOLE)
-              : qcontext->getFilterUse(
-                    *query, FilterCache::AdmissionLane::WHOLE);
+        if (!everySegmentConstant && wholeMembershipUse == nullptr
+            && !fieldSortFullyRouted) {
+          wholeMembershipWeight = nullptr;
+          wholeFieldSortCacheRoutes = {};
         }
-      }
-      if (!everySegmentConstant && wholeMembershipUse == nullptr
-          && !fieldSortFullyRouted) {
-        wholeMembershipWeight = nullptr;
-        wholeFieldSortCacheRoutes = {};
       }
 
-      if (wholeTopKCount && wholeMembershipWeight != nullptr
+      if (weight != nullptr && wholeTopKCount
+          && wholeMembershipWeight != nullptr
           && !weight->isConstantScoring()) {
         Query::Weight* countFreeRankingWeight = rankingWeight;
         if (countFreeRankingWeight == nullptr) {

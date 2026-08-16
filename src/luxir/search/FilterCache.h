@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
 #include <unordered_map>
@@ -73,6 +74,7 @@ class FilterCache {
 
 public:
   class Use;
+  class UseRegistry;
 
   enum class AdmissionLane : uint8_t {
     CLAUSE,
@@ -301,6 +303,11 @@ public:
     FilterKeyScope scope_;
     std::shared_ptr<FilterEntry> entry;
     std::vector<std::shared_ptr<SegmentSlot>> slotsByOrd;
+    // Pure preflight pins. They are not request-visible and carry no hit,
+    // recency, admission, or feedback effects until acceptExisting commits
+    // the complete candidate.
+    std::vector<std::shared_ptr<const SegmentValue>> existingCandidates;
+    bool existingAccepted = false;
     std::vector<std::unique_ptr<RequestSlot>> requestSlots;
     std::vector<SegmentIdentity> readerSegments;
     uint64_t readerCoreGen;
@@ -354,9 +361,27 @@ public:
     DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader,
                             DocSet* domain = nullptr);
     bool wasAdmitted() const { return admitted; }
+    bool hasAcceptedExisting() const { return existingAccepted; }
     FilterKeyScope scope() const { return scope_; }
     const void* entryIdentityForTest() const { return entry.get(); }
     size_t ownedBytesForTest();
+  };
+
+  // Opaque complete-residency preflight. It cannot participate in execution
+  // or request-local dedup until UseRegistry::acceptExisting consumes it.
+  class ExistingCandidate {
+    std::unique_ptr<Use> use;
+
+    explicit ExistingCandidate(std::unique_ptr<Use> use)
+      : use(std::move(use)) {}
+
+    friend class UseRegistry;
+
+  public:
+    ExistingCandidate(const ExistingCandidate&) = delete;
+    ExistingCandidate& operator=(const ExistingCandidate&) = delete;
+    ExistingCandidate(ExistingCandidate&&) noexcept = default;
+    ExistingCandidate& operator=(ExistingCandidate&&) noexcept = default;
   };
 
   // Request-local full-key dedup and value ownership. It always exists; cache
@@ -391,6 +416,15 @@ public:
     Use* get(const FilterKey& key,
              FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE,
              AdmissionLane lane = AdmissionLane::CLAUSE);
+    // lookupExisting is an inert, complete-residency preflight. A successful
+    // candidate remains invisible to execution until acceptExisting commits
+    // it and applies the ordinary shared-hit effects for every segment. The
+    // preflight is first-registration-only for a request key.
+    std::optional<ExistingCandidate> lookupExisting(
+        const FilterKey& key,
+        FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE);
+    Use* acceptExisting(
+        ExistingCandidate&& candidate, AdmissionLane lane);
     size_t size() const { return uses.size(); }
     size_t ownedBytesForTest();
   };
@@ -545,6 +579,15 @@ private:
                                 uint64_t readerCoreGen, uint64_t readerVersion,
                                 std::span<const SegmentIdentity> readerSegments,
                                 AdmissionLane lane);
+  std::unique_ptr<Use> lookupExisting(
+      const FilterKey& key, FilterKeyScope scope,
+      uint64_t readerCoreGen, uint64_t readerVersion,
+      std::span<const SegmentIdentity> readerSegments);
+  bool acceptExisting(Use& use, AdmissionLane lane);
+  void acceptSharedHit(
+      Use& use, size_t segmentOrd,
+      const std::shared_ptr<SegmentSlot>& slot,
+      const std::shared_ptr<const SegmentValue>& value);
   void observeAdmissionLane(Use& use, AdmissionLane lane);
   AdmissionRing& admissionFor(AdmissionLane lane);
   void recordCapacityEviction(

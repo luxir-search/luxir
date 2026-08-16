@@ -595,6 +595,216 @@ TEST(FilterCacheTest, admissionIsOncePerDistinctKeyPerRequest) {
       << "a claim is not a completed cache build";
 }
 
+TEST(FilterCacheTest, existingLookupIsInertUntilCompleteAcceptance) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{
+    FilterCache::SegmentIdentity{1, 100},
+    FilterCache::SegmentIdentity{2, 100},
+  };
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("complete-resident");
+
+  {
+    FilterCache::UseRegistry populate(cache, 1, segments);
+    auto* use = populate.get(key);
+    for (size_t i = 0; i < segments.size(); i++) {
+      auto probe = use->probe(i);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+      use->publishRaw(i, probe, docs(100, {(int32_t)i + 3}), 10);
+    }
+  }
+
+  auto before = cache.counters();
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto candidate = request.lookupExisting(key);
+  ASSERT_TRUE(candidate.has_value());
+  EXPECT_EQ(0u, request.size());
+  auto afterLookup = cache.counters();
+  EXPECT_EQ(before.hits, afterLookup.hits);
+  EXPECT_EQ(before.misses, afterLookup.misses);
+  EXPECT_EQ(before.admissions, afterLookup.admissions);
+  EXPECT_EQ(before.buildAttempts, afterLookup.buildAttempts);
+
+  auto* acceptedUse = request.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, acceptedUse);
+  EXPECT_EQ(1u, request.size());
+  EXPECT_EQ(before.hits + segments.size(), cache.counters().hits);
+  for (size_t i = 0; i < segments.size(); i++) {
+    auto probe = acceptedUse->probe(i);
+    ASSERT_EQ(FilterCache::Probe::Kind::HIT, probe.kind());
+    ASSERT_NE(nullptr, probe.docSet());
+    EXPECT_TRUE(probe.docSet()->get((int32_t)i + 3));
+  }
+  // Request-local serving after acceptance does not double-count shared hits.
+  EXPECT_EQ(before.hits + segments.size(), cache.counters().hits);
+}
+
+TEST(FilterCacheTest, existingAcceptanceRevalidatesEverySegment) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 2;
+  FilterCache cache(config);
+  std::array oldSegments{
+    FilterCache::SegmentIdentity{1, 100},
+    FilterCache::SegmentIdentity{2, 100},
+  };
+  ASSERT_TRUE(cache.onReaderPublished(1, oldSegments));
+  FilterKey key("stale-complete-resident");
+  {
+    FilterCache::UseRegistry first(cache, 1, oldSegments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+              first.get(key)->probe(0).kind());
+  }
+  {
+    FilterCache::UseRegistry populate(cache, 1, oldSegments);
+    auto* use = populate.get(key);
+    for (size_t i = 0; i < oldSegments.size(); i++) {
+      auto probe = use->probe(i);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+      use->publishRaw(i, probe, docs(100, {(int32_t)i + 7}), 10);
+    }
+  }
+
+  FilterCache::UseRegistry request(cache, 1, oldSegments);
+  auto candidate = request.lookupExisting(key);
+  ASSERT_TRUE(candidate.has_value());
+  auto before = cache.counters();
+  std::array newSegments{FilterCache::SegmentIdentity{2, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(2, newSegments));
+  EXPECT_EQ(nullptr, request.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE));
+  EXPECT_EQ(0u, request.size());
+  EXPECT_EQ(before.hits, cache.counters().hits);
+  FilterCache::UseRegistry firstWhole(cache, 2, newSegments);
+  EXPECT_FALSE(firstWhole.get(
+      key, FilterKeyScope::SEGMENT_STABLE,
+      FilterCache::AdmissionLane::WHOLE)->wasAdmitted());
+}
+
+TEST(FilterCacheTest, incompleteExistingLookupHasNoCacheEffects) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 2;
+  FilterCache cache(config);
+  std::array segments{
+    FilterCache::SegmentIdentity{1, 100},
+    FilterCache::SegmentIdentity{2, 100},
+  };
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("partially-resident");
+  {
+    FilterCache::UseRegistry first(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+              first.get(key)->probe(0).kind());
+  }
+  {
+    FilterCache::UseRegistry populate(cache, 1, segments);
+    auto* use = populate.get(key);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, docs(100, {9}), 10);
+  }
+
+  auto before = cache.counters();
+  FilterCache::UseRegistry request(cache, 1, segments);
+  EXPECT_FALSE(request.lookupExisting(key).has_value());
+  EXPECT_EQ(0u, request.size());
+  auto after = cache.counters();
+  EXPECT_EQ(before.hits, after.hits);
+  EXPECT_EQ(before.misses, after.misses);
+  EXPECT_EQ(before.admissions, after.admissions);
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  FilterCache::UseRegistry firstWhole(cache, 1, segments);
+  EXPECT_FALSE(firstWhole.get(
+      key, FilterKeyScope::SEGMENT_STABLE,
+      FilterCache::AdmissionLane::WHOLE)->wasAdmitted());
+}
+
+TEST(FilterCacheTest, existingAcceptancePreservesLaneAdmission) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 2;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("lane-specific-resident");
+
+  {
+    FilterCache::UseRegistry firstClause(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+              firstClause.get(key)->probe(0).kind());
+  }
+  {
+    FilterCache::UseRegistry secondClause(cache, 1, segments);
+    auto* use = secondClause.get(key);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, docs(100, {5}), 10);
+  }
+
+  FilterCache::UseRegistry firstWhole(cache, 1, segments);
+  auto firstCandidate = firstWhole.lookupExisting(key);
+  ASSERT_TRUE(firstCandidate.has_value());
+  auto* firstUse = firstWhole.acceptExisting(
+      std::move(*firstCandidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, firstUse);
+  EXPECT_FALSE(firstUse->wasAdmitted());
+
+  FilterCache::UseRegistry secondWhole(cache, 1, segments);
+  auto secondCandidate = secondWhole.lookupExisting(key);
+  ASSERT_TRUE(secondCandidate.has_value());
+  auto* secondUse = secondWhole.acceptExisting(
+      std::move(*secondCandidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, secondUse);
+  EXPECT_TRUE(secondUse->wasAdmitted());
+}
+
+TEST(FilterCacheTest, existingAcceptanceResetsDetachDebt) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey candidateKey("detached-candidate");
+  FilterKey replacementKey("high-priority-replacement");
+
+  {
+    FilterCache::UseRegistry populate(cache, 1, segments);
+    auto* use = populate.get(candidateKey);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, bitDocs(4096, 7), 1);
+  }
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto candidate = request.lookupExisting(candidateKey);
+  ASSERT_TRUE(candidate.has_value());
+
+  {
+    FilterCache::UseRegistry replacement(cache, 1, segments);
+    auto* use = replacement.get(replacementKey);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, bitDocs(4096, 11), 100'000);
+  }
+  ASSERT_EQ(1u, cache.counters().capacityDeadBuilds);
+
+  auto* acceptedUse = request.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, acceptedUse);
+  auto accepted = acceptedUse->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::HIT, accepted.kind());
+  ASSERT_NE(nullptr, accepted.docSet());
+  EXPECT_TRUE(accepted.docSet()->get(7));
+
+  FilterCache::UseRegistry retry(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            retry.get(candidateKey)->probe(0).kind());
+}
+
 TEST(FilterCacheTest, admissionLanesIsolateScanTraffic) {
   auto verify = [](FilterCache::AdmissionLane seededLane,
                    FilterCache::AdmissionLane floodLane) {

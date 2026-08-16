@@ -264,6 +264,7 @@ struct SkipStats {
   static inline int64_t wholeCountBypasses = 0;
   static inline int64_t wholeCountConstant = 0;
   static inline int64_t wholeCountFallbackSuppliers = 0;
+  static inline int64_t cacheFirstMembershipWeightSkips = 0;
   static inline int64_t wholeTopKCountHits = 0;
   static inline int64_t wholeTopKCountBuilds = 0;
   static inline int64_t wholeTopKCountBypasses = 0;
@@ -524,6 +525,7 @@ struct SkipStats {
     wholeCountBypasses = 0;
     wholeCountConstant = 0;
     wholeCountFallbackSuppliers = 0;
+    cacheFirstMembershipWeightSkips = 0;
     wholeTopKCountHits = 0;
     wholeTopKCountBuilds = 0;
     wholeTopKCountBypasses = 0;

@@ -269,6 +269,8 @@ public:
     return VerificationWork::PRESENT;
   }
 
+  bool supportsCacheFirstMembership() const override { return true; }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
