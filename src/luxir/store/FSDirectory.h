@@ -10,22 +10,18 @@
 
 namespace luxir {
 
-/// InputFile backed by mmap. The fd is kept open so that even if the
-/// underlying file is unlinked, the mapping (and fd) remain valid.
+/// InputFile backed by mmap. The mapping remains valid after its fd is closed
+/// and after the underlying file is unlinked.
 class MMapInputFile : public InputFile {
-  int fd_;
   char* data_;
   size_t sz_;
 
 public:
-  MMapInputFile(int fd, char* data, size_t size) : fd_(fd), data_(data), sz_(size) {}
+  MMapInputFile(char* data, size_t size) : data_(data), sz_(size) {}
 
   ~MMapInputFile() override {
     if (data_ && sz_ > 0) {
       munmap(data_, sz_);
-    }
-    if (fd_ >= 0) {
-      ::close(fd_);
     }
   }
 
@@ -185,7 +181,8 @@ public:
 
     auto sz = (size_t)st.st_size;
     if (sz == 0) {
-      return std::make_shared<MMapInputFile>(fd, nullptr, 0);
+      ::close(fd);
+      return std::make_shared<MMapInputFile>(nullptr, 0);
     }
 
     void* mapped = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -194,7 +191,13 @@ public:
       return {};
     }
 
-    return std::make_shared<MMapInputFile>(fd, (char*)mapped, sz);
+    ::close(fd);
+    try {
+      return std::make_shared<MMapInputFile>((char*)mapped, sz);
+    } catch (...) {
+      munmap(mapped, sz);
+      throw;
+    }
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {
@@ -228,9 +231,8 @@ public:
       fsFile.openFd();
     }
     fsFile.closeFd();
-    // Atomic rename from temp to final path.  Existing mmap readers of the
-    // old inode are unaffected because rename replaces the directory entry
-    // while the old inode stays alive (held by open fd + mmap).
+    // Atomic rename from temp to final path. Existing mmap readers of the old
+    // inode are unaffected because the mapping keeps the old inode alive.
     std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
   }
 
