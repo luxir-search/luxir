@@ -708,6 +708,9 @@ struct WholeFieldSortRun {
 enum class WholeFieldSortQueryShape : uint8_t {
   STANDARD,
   MULTITERM_CONJUNCTION,
+  MAND_OPT,
+  FILTER_SINGLETON,
+  CONJ_OPT,
 };
 
 WholeFieldSortRun runWholeFieldSort(
@@ -731,6 +734,20 @@ WholeFieldSortRun runWholeFieldSort(
         topDocs.mr(),
         {qb::match(topDocs.mr(), "body_w", a),
          qb::prefix(topDocs.mr(), "body_w", b)});
+  } else if (queryShape == WholeFieldSortQueryShape::MAND_OPT) {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {qb::match(topDocs.mr(), "body_w", a)},
+        {qb::match(topDocs.mr(), "body_w", b)});
+  } else if (queryShape == WholeFieldSortQueryShape::FILTER_SINGLETON) {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(), {}, {qb::match(topDocs.mr(), "body_w", b)}, {},
+        {qb::match(topDocs.mr(), "body_w", a)});
+  } else if (queryShape == WholeFieldSortQueryShape::CONJ_OPT) {
+    topDocs.rawQuery() = qb::boolean(
+        topDocs.mr(),
+        {qb::match(topDocs.mr(), "body_w", a),
+         qb::match(topDocs.mr(), "body_w", b)},
+        {qb::match(topDocs.mr(), "body_w", a)});
   } else if (optionalTwoPhase) {
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(), {},
@@ -2673,6 +2690,108 @@ TEST_F(SearchEngineTest,
       EXPECT_EQ(0, build.ladderFallbacks + hit.ladderFallbacks);
       EXPECT_EQ(0, hit.weightSkips + hit.contextsOmitted);
       EXPECT_EQ(1, hit.contextsCreated);
+    }
+  }
+}
+
+TEST_F(SearchEngineTest, wholeFieldSortDroppedOptionalSingletonServesResident) {
+  constexpr std::string_view enabledCollection = "whole_field_sort_mandopt";
+  constexpr std::string_view disabledCollection =
+      "whole_field_sort_mandopt_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+  indexWholeFieldSortDocs(enabled);
+  indexWholeFieldSortDocs(disabled);
+
+  // '+a b' and filter(a)-with-optional-b drop the optional clause for
+  // unscored requests, so membership is the lone required clause and the
+  // flat-conjunction veto must not fire: the resident route serves them like
+  // any single-clause shape.
+  struct Serving {
+    WholeFieldSortQueryShape shape;
+    std::string_view key;
+  };
+  constexpr std::array servingCases{
+    Serving{WholeFieldSortQueryShape::FILTER_SINGLETON, "s4expr"},
+    Serving{WholeFieldSortQueryShape::MAND_OPT, "s4econ"},
+  };
+  for (const Serving& testCase : servingCases) {
+    SCOPED_TRACE((int)testCase.shape);
+    WholeFieldSortRun off = runWholeFieldSort(
+        disabled.getSearchEngine(), disabledCollection,
+        testCase.key, "sort_i", qb::ASC, 7, true, false, true,
+        false, false, false, testCase.shape);
+    EXPECT_EQ(0, off.hits + off.builds + off.bypasses + off.routingBypasses);
+
+    if (testCase.shape == WholeFieldSortQueryShape::FILTER_SINGLETON) {
+      // The landed router takes one direct round on the first sighting of a
+      // filter-singleton key before its cache ladder starts; the resident
+      // classification is already NOT_FLAT on that round.
+      WholeFieldSortRun first = runWholeFieldSort(
+          enabled.getSearchEngine(), enabledCollection,
+          testCase.key, "sort_i", qb::ASC, 7, true, false, true,
+          false, false, false, testCase.shape);
+      expectSameWholeFieldSort(off, first);
+      EXPECT_EQ(2, first.routingBypasses);
+    }
+
+    WholeFieldSortRun bypass = runWholeFieldSort(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.key, "sort_i", qb::ASC, 7, true, false, true,
+        false, false, false, testCase.shape);
+    WholeFieldSortRun build = runWholeFieldSort(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.key, "sort_i", qb::ASC, 7, true, false, true,
+        false, false, false, testCase.shape);
+    WholeFieldSortRun hit = runWholeFieldSort(
+        enabled.getSearchEngine(), enabledCollection,
+        testCase.key, "sort_i", qb::ASC, 7, true, false, true,
+        false, false, false, testCase.shape);
+    expectSameWholeFieldSort(off, bypass);
+    expectSameWholeFieldSort(off, build);
+    expectSameWholeFieldSort(off, hit);
+    ASSERT_TRUE(hit.found.has_value());
+    EXPECT_EQ(254, *hit.found);
+    EXPECT_EQ(2, bypass.bypasses);
+    EXPECT_EQ(2, build.builds);
+    EXPECT_EQ(2, hit.hits);
+    EXPECT_EQ(2, build.cachedBestFirst);
+    EXPECT_EQ(2, hit.cachedBestFirst);
+    EXPECT_EQ(0, bypass.routingBypasses + build.routingBypasses
+                     + hit.routingBypasses);
+    EXPECT_EQ(0, bypass.weightSkips + bypass.contextsOmitted
+                     + build.weightSkips + build.contextsOmitted);
+    EXPECT_EQ(1, bypass.contextsCreated);
+    EXPECT_EQ(1, build.contextsCreated);
+    EXPECT_EQ(1, hit.weightSkips);
+    EXPECT_EQ(0, hit.contextsCreated);
+    EXPECT_EQ(1, hit.contextsOmitted);
+  }
+
+  // A genuine literal conjunction keeps the veto, with or without a
+  // droppable optional beside it: the residue is still a conjunction.
+  for (auto shape : {WholeFieldSortQueryShape::STANDARD,
+                     WholeFieldSortQueryShape::CONJ_OPT}) {
+    SCOPED_TRACE((int)shape);
+    WholeFieldSortRun off = runWholeFieldSort(
+        disabled.getSearchEngine(), disabledCollection,
+        "s4gate", "sort_i", qb::ASC, 7, true, false, false,
+        false, false, false, shape);
+    for (int round = 0; round < 3; round++) {
+      WholeFieldSortRun routed = runWholeFieldSort(
+          enabled.getSearchEngine(), enabledCollection,
+          "s4gate", "sort_i", qb::ASC, 7, true, false, false,
+          false, false, false, shape);
+      expectSameWholeFieldSort(off, routed);
+      EXPECT_EQ(2, routed.routingBypasses);
+      EXPECT_EQ(0, routed.hits + routed.builds + routed.bypasses
+                       + routed.fallbackSuppliers + routed.cachedBestFirst);
+      EXPECT_EQ(0, routed.weightSkips + routed.contextsOmitted);
+      EXPECT_EQ(1, routed.contextsCreated);
     }
   }
 }

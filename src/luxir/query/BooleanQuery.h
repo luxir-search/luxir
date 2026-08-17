@@ -104,6 +104,18 @@ private:
           && (!mandatory.empty() || !filter.empty())
           && minShouldMatch < 1;
     }
+
+    // The one clause that alone determines unscored membership, or null.
+    // Optional clauses that drop under !needsScores cannot change the match
+    // set, so a lone required clause is the entire membership shape; a
+    // mandatory clause and a filter clause are interchangeable here.
+    Query* unscoredSingleChild() const {
+      if (singleChild != nullptr) return singleChild;
+      if (!prohibited.empty()) return nullptr;
+      if (!optional.empty() && !dropsOptional(false)) return nullptr;
+      if (mandatory.size() + filter.size() != 1) return nullptr;
+      return mandatory.empty() ? filter.front() : mandatory.front();
+    }
   };
 
   struct TransparentBoolean {
@@ -737,8 +749,11 @@ public:
   FieldSortConjunction fieldSortConjunction(
       PlanningContext& context) const override {
     CompiledBoolean& plan = logicalPlan(context);
-    if (plan.singleChild != nullptr) {
-      return plan.singleChild->fieldSortConjunction(context);
+    // A dropped-optional singleton classifies as its residue: '+a b' resolves
+    // to the same execution as bare 'a', which is not a conjunction, so the
+    // flat-conjunction veto must not fire on it.
+    if (Query* child = plan.unscoredSingleChild()) {
+      return child->fieldSortConjunction(context);
     }
 
     bool hasRequired = !plan.mandatory.empty() || !plan.filter.empty();
@@ -772,7 +787,7 @@ public:
     classify(plan.filter);
     if (hasDynamicTerms) return FieldSortConjunction::DYNAMIC_TERMS;
     return hasOther ? FieldSortConjunction::NOT_FLAT
-                    : FieldSortConjunction::FLAT_LITERAL_TERMS;
+                    : FieldSortConjunction::FLAT_LITERAL_CONJUNCTION;
   }
 
   bool canOmitWeightForCacheFirstMembership() const override {

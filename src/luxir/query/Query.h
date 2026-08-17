@@ -410,11 +410,13 @@ public:
   };
 
   // Logical approximation of the Weight-time flat-term-conjunction veto in
-  // the field-sort cache router. DYNAMIC_TERMS means a MultiTerm child can
+  // the field-sort cache router. The veto is for genuine conjunctions of two
+  // or more literal terms; a shape whose unscored residue is a single clause
+  // classifies as that residue. DYNAMIC_TERMS means a MultiTerm child can
   // only be classified after Weight construction and segment expansion.
   enum class FieldSortConjunction : uint8_t {
     NOT_FLAT,
-    FLAT_LITERAL_TERMS,
+    FLAT_LITERAL_CONJUNCTION,
     DYNAMIC_TERMS,
   };
 
