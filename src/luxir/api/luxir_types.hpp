@@ -221,7 +221,7 @@ struct AuxStats {
   std::string_view kind;
   std::string_view field;
   std::string_view name;
-  uint64_t gen = 0;
+  std::string_view gen;
   uint64_t commit_time = 0;
   uint64_t built_core_gen = 0;
   uint64_t bytes = 0;
@@ -257,12 +257,12 @@ struct StatsTotals {
   uint64_t bytes = 0;
 };
 struct SegmentStats {
-  uint64_t seg_id = 0;
-  uint64_t live_gen = 0;
+  std::string_view seg;
+  std::string_view live_gen;
+  std::string_view schema_gen;
   uint64_t min_update_version = 0;
   uint64_t max_update_version = 0;
   uint64_t first_commit_time = 0;
-  uint64_t schema_gen = 0;
   uint64_t bytes = 0;
   std::span<const AuxStats> overlays;
   int32_t max_doc = 0;
@@ -278,7 +278,7 @@ struct IndexStats {
   uint64_t index_gen = 0;
   uint64_t core_gen = 0;
   uint64_t update_version = 0;
-  uint64_t schema_gen = 0;
+  std::string_view schema_gen;
   uint64_t active_merges = 0;
   std::span<const AuxStats> aux_indexes;
   FilterCacheStats filter_cache;
@@ -291,7 +291,7 @@ struct ShardStats {
 struct CollectionStats {
   std::string_view name;
   StatsTotals totals;
-  uint64_t schema_gen = 0;
+  std::string_view schema_gen;
   std::span<const ShardStats> shards;
   std::string_view error;
 };

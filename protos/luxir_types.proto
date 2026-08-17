@@ -1033,7 +1033,7 @@ message StatsTotals {
 message CollectionStats {
   string name = 1;
   StatsTotals totals = 2;
-  uint64 schema_gen = 3;
+  string schema_gen = 3;  // sortable-string spelling (see SegmentStats); empty = no schema
   repeated ShardStats shards = 4;
   string error = 5;
 }
@@ -1049,23 +1049,32 @@ message IndexStats {
   uint64 index_gen = 2;
   uint64 core_gen = 3;
   uint64 update_version = 4;
-  uint64 schema_gen = 5;
+  string schema_gen = 5;  // sortable-string spelling (see SegmentStats); empty = no schema
   uint64 active_merges = 6;
   repeated AuxStats aux_indexes = 7;
   FilterCacheStats filter_cache = 8;
   repeated SegmentStats segments = 9;
 }
 
+// Ids and generations that appear in filenames are reported in their
+// filesystem spelling so stats output correlates directly with directory
+// listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
+// while generations are the length-prefixed base36 sortable strings embedded
+// in filenames (e.g. live_gen "01" -> file "s0a__L01", schema_gen "02" ->
+// file "_schema_02").  Sortable strings order the same as the numbers they
+// encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
+// means none.  Generations that never appear on disk (index_gen, core_gen,
+// update_version) stay numeric.
 message SegmentStats {
-  uint64 seg_id = 1;
-  uint64 live_gen = 2;
+  string seg = 1;
+  string live_gen = 2;
   uint64 min_update_version = 3;
   uint64 max_update_version = 4;
   uint64 first_commit_time = 5;
   int32 max_doc = 6;
   int32 live_docs = 7;
   int32 deleted_docs = 8;
-  uint64 schema_gen = 9;
+  string schema_gen = 9;
   bool committed = 10;
   bool merging = 11;
   uint32 merge_level = 12;
@@ -1077,7 +1086,7 @@ message AuxStats {
   string kind = 1;
   string field = 2;
   string name = 3;
-  uint64 gen = 4;
+  string gen = 4;  // sortable-string spelling as embedded in the files' names (see SegmentStats)
   uint64 commit_time = 5;
   uint64 built_core_gen = 6;
   repeated string files = 7;

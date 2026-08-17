@@ -7,10 +7,18 @@
 #include "LuxirNode.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/reader/Postings.h"
 #include "luxir/schema/Schema.h"
 
 namespace luxir {
 namespace {
+
+// Filesystem spelling for a generation that appears in filenames; empty
+// (omitted in JSON) when there is no generation and therefore no file.
+std::string_view sortableGen(uint64_t gen, std::pmr::memory_resource& resource) {
+  if (gen == 0) return {};
+  return api::build::arenaStr(resource, Postings::getSortableString(gen));
+}
 
 void addTotals(api::StatsTotals& dst, const api::StatsTotals& src) {
   dst.collections += src.collections;
@@ -28,7 +36,7 @@ void copyAuxStats(api::AuxStats& dst, const IndexWriter::AuxStats& src,
   dst.kind = api::build::arenaStr(resource, src.kind);
   dst.field = api::build::arenaStr(resource, src.field);
   dst.name = api::build::arenaStr(resource, src.name);
-  dst.gen = src.gen;
+  dst.gen = sortableGen(src.gen, resource);
   dst.commit_time = src.commitTime;
   dst.built_core_gen = src.builtCoreGen;
   dst.bytes = src.bytes;
@@ -63,7 +71,7 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
   dst.index_gen = src.indexGen;
   dst.core_gen = src.coreGen;
   dst.update_version = src.updateVersion;
-  dst.schema_gen = src.schemaGen;
+  dst.schema_gen = sortableGen(src.schemaGen, resource);
   dst.active_merges = src.activeMerges;
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
@@ -76,15 +84,15 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
   for (std::size_t i = 0; i < src.segmentStats.size(); i++) {
     const auto& in = src.segmentStats[i];
     auto& out = segments[i];
-    out.seg_id = in.segId;
-    out.live_gen = in.liveGen;
+    out.seg = api::build::arenaStr(resource, Postings::getIndexFileNamePrefix(in.segId));
+    out.live_gen = sortableGen(in.liveGen, resource);
     out.min_update_version = in.minUpdateVersion;
     out.max_update_version = in.maxUpdateVersion;
     out.first_commit_time = in.firstCommitTime;
     out.max_doc = in.maxDoc;
     out.live_docs = in.liveDocs;
     out.deleted_docs = in.maxDoc - in.liveDocs;
-    out.schema_gen = in.schemaGen;
+    out.schema_gen = sortableGen(in.schemaGen, resource);
     out.committed = in.committed;
     out.merging = in.merging;
     out.merge_level = (uint32_t)in.mergeLevel;
@@ -122,7 +130,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     }
 
     auto schema = entry.collection->getSchema();
-    collectionStats.schema_gen = schema ? schema->gen_ : 0;
+    collectionStats.schema_gen = sortableGen(schema ? schema->gen_ : 0, resource);
 
     auto shard = entry.collection->getShard();
     assert(shard);

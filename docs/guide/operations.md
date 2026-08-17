@@ -192,6 +192,15 @@ of segment bytes. With `?segments=true` each segment reports its own `bytes`
 (data + deletes + overlays) and each aux entry reports the bytes of its listed
 files.
 
+Ids and generations that appear in filenames use their filesystem spelling so
+the response correlates directly with a directory listing: each segment's
+`seg` is its data-file prefix (e.g. `s0a`), while `live_gen`, `schema_gen`,
+and aux `gen` are the sortable strings embedded in filenames (segment `s0a`
+with `live_gen` `01` has its deletes in `s0a__L01`; `schema_gen` `02` is the
+file `_schema_02`). These strings sort in generation order, and an absent
+field means none (no deletes file, no schema). Generations that never appear
+on disk (`index_gen`, `core_gen`, `update_version`) stay numeric.
+
 Set log verbosity with:
 
 ```bash

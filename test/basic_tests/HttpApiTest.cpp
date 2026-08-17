@@ -222,6 +222,15 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   auto* segmentBytes = (*segments)[0]["bytes"].get_if<int64_t>();
   ASSERT_NE(nullptr, segmentBytes);
   EXPECT_GT(*segmentBytes, 0);
+
+  // Filesystem-visible ids use their on-disk spelling: "seg" is the segment's
+  // data-file prefix, and live_gen is absent when there are no deletes.
+  auto* seg = (*segments)[0]["seg"].get_if<std::string>();
+  ASSERT_NE(nullptr, seg);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
+  EXPECT_FALSE((*segments)[0].contains("live_gen"));
 }
 
 TEST_F(HttpApiTest, statsRoutingErrors) {
