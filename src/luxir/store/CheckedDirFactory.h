@@ -39,7 +39,7 @@ public:
   CheckedDirectory(std::shared_ptr<Directory> delegate, CheckedDirMode mode, bool verbose = false)
       : delegate_(std::move(delegate)), mode_(mode), verbose_(verbose) {}
 
-  void listFiles(std::vector<std::string>& target) override {
+  void listFiles(std::vector<FileInfo>& target) override {
     delegate_->listFiles(target);
   }
 

@@ -155,14 +155,22 @@ public:
     std::filesystem::create_directories(basePath_);
   }
 
-  void listFiles(std::vector<std::string>& target) override {
+  void listFiles(std::vector<FileInfo>& target) override {
     auto startIdx = target.size();
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
-      if (entry.is_regular_file()) {
-        target.push_back(entry.path().filename().string());
+      // A file may be deleted between readdir and stat; skip on any error.
+      std::error_code ec;
+      if (!entry.is_regular_file(ec) || ec) {
+        continue;
       }
+      auto size = entry.file_size(ec);
+      if (ec) {
+        continue;
+      }
+      target.push_back({entry.path().filename().string(), (uint64_t)size});
     }
-    std::sort(target.begin() + (int64_t)startIdx, target.end());
+    std::sort(target.begin() + (int64_t)startIdx, target.end(),
+              [](const FileInfo& a, const FileInfo& b) { return a.name < b.name; });
   }
 
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {

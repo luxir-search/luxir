@@ -186,6 +186,12 @@ node, collection, and index levels, and each level sets only the counts that
 mean something there - `collections` only on the node total, `shards` only on
 node and collection totals.
 
+Totals also report on-disk `bytes`, where the index level counts the whole
+directory (manifest, schema files, in-flight files), so it can exceed the sum
+of segment bytes. With `?segments=true` each segment reports its own `bytes`
+(data + deletes + overlays) and each aux entry reports the bytes of its listed
+files.
+
 Set log verbosity with:
 
 ```bash

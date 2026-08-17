@@ -152,21 +152,21 @@ std::vector<const luxir::api::AuxIndexInfo*> vectorOverlays(const IndexInfoHolde
 }
 
 std::vector<std::string> vectorOverlayFiles(Directory& dir) {
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   std::vector<std::string> out;
   for (const auto& file : files) {
-    if (file.find("__vec.") != std::string::npos) out.push_back(file);
+    if (file.name.find("__vec.") != std::string::npos) out.push_back(file.name);
   }
   return out;
 }
 
 bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   auto prefix = Postings::getIndexFileNamePrefix(segId);
   for (const auto& file : files) {
-    if (file.starts_with(prefix)) return false;
+    if (file.name.starts_with(prefix)) return false;
   }
   return true;
 }
@@ -316,6 +316,19 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   EXPECT_EQ(idx->d, 4);
   EXPECT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
+
+  // The overlay's stats bytes match the file's size in the directory listing.
+  std::vector<Directory::FileInfo> files;
+  shardDir.listFiles(files);
+  uint64_t fileSize = 0;
+  for (const auto& f : files) {
+    if (f.name == aux.files[0]) fileSize = f.size;
+  }
+  ASSERT_GT(fileSize, 0u);
+  auto stats = h.getIndexWriter()->stats(true);
+  ASSERT_EQ(1u, stats.segmentStats.size());
+  ASSERT_EQ(1u, stats.segmentStats[0].overlays.size());
+  EXPECT_EQ(fileSize, stats.segmentStats[0].overlays[0].bytes);
 }
 
 // The mmap-lists layout must serve identically whether the aux file's memory

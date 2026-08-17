@@ -180,15 +180,7 @@ static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
 
   auto indexWriter = helper.getIndexWriter();
   auto& dir = indexWriter->dir;
-  std::vector<std::string> files;
-  dir.listFiles(files);
-  // std::println(std::cout, "Index files: {}", files);
-  // calculate the total size of the index
-  int64_t totalSize = 0;
-  for (const auto& file : files) {
-    auto f = dir.openFile(file);
-    totalSize += f->size();
-  }
+  int64_t totalSize = (int64_t)dir.totalBytes();
   // std::println(std::cout, "Total index size: {} bytes", totalSize);
 
   state.counters["rate"] = benchmark::Counter(state.iterations(),benchmark::Counter::kIsRate);

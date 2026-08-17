@@ -147,11 +147,11 @@ uint32_t randomForceMergeTarget(Rng& r) {
 }
 
 bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   auto prefix = Postings::getIndexFileNamePrefix(segId);
   for (const auto& file : files) {
-    if (file.starts_with(prefix)) return false;
+    if (file.name.starts_with(prefix)) return false;
   }
   return true;
 }
@@ -322,17 +322,22 @@ TEST_F(IndexWriterTest, statsConcurrentWithCommitsAndMerges) {
       ASSERT_LE(s.committedSegments, s.segments);
       ASSERT_EQ(s.segments, s.segmentStats.size());
       ASSERT_LE(s.liveDocs, s.maxDocs);
-      uint64_t committed = 0, maxDocs = 0, liveDocs = 0;
+      uint64_t committed = 0, maxDocs = 0, liveDocs = 0, segBytes = 0;
       for (const auto& seg : s.segmentStats) {
         if (seg.committed) committed++;
         ASSERT_LE(seg.liveDocs, seg.maxDoc);
         maxDocs += (uint64_t)seg.maxDoc;
         liveDocs += (uint64_t)seg.liveDocs;
+        segBytes += seg.bytes;
       }
       // Per-segment records must add up to the rolled-up totals.
       ASSERT_EQ(committed, s.committedSegments);
       ASSERT_EQ(maxDocs, s.maxDocs);
       ASSERT_EQ(liveDocs, s.liveDocs);
+      // Segment bytes and totalBytes come from the same listing; a segment
+      // that disappeared between the segment snapshot and the listing
+      // reports 0, so <= holds even mid-merge.
+      ASSERT_LE(segBytes, s.totalBytes);
       samples++;
     }
   });
@@ -349,6 +354,25 @@ TEST_F(IndexWriterTest, statsConcurrentWithCommitsAndMerges) {
   auto final = iw.stats(true);
   EXPECT_EQ(200u, final.maxDocs);
   EXPECT_EQ(final.segments, final.committedSegments);
+}
+
+TEST_F(IndexWriterTest, statsBytes) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  for (int i = 0; i < 3; i++) addDoc(iw);
+  iw.commit();
+  for (int i = 0; i < 2; i++) addDoc(iw);
+  iw.commit();
+
+  auto s = iw.stats(true);
+  EXPECT_EQ(s.totalBytes, dir.totalBytes());
+  uint64_t segBytes = 0;
+  for (const auto& seg : s.segmentStats) {
+    EXPECT_GT(seg.bytes, 0u);
+    segBytes += seg.bytes;
+  }
+  // The manifest (and any other non-segment files) account for the gap.
+  EXPECT_LT(segBytes, s.totalBytes);
 }
 
 // Test retrieving IndexReader from the IndexWriter
@@ -1194,13 +1218,13 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   // Check that no files exist with the deleted segment prefix
   // Use the Directory's listFiles method to get all files
   auto& dir = helper.getIndexWriter()->dir;
-  std::vector<std::string> allFiles;
+  std::vector<Directory::FileInfo> allFiles;
   dir.listFiles(allFiles);
-  
+
   // Verify that no files exist with the deleted segment's prefix
-  for (const auto& filename : allFiles) {
-    EXPECT_FALSE(filename.starts_with(deletedPrefix)) 
-      << "File " << filename << " should have been deleted by deletePrefix() but still exists";
+  for (const auto& file : allFiles) {
+    EXPECT_FALSE(file.name.starts_with(deletedPrefix))
+      << "File " << file.name << " should have been deleted by deletePrefix() but still exists";
   }
   
   // Verify the new document is searchable and we now have 2 documents

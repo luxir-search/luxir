@@ -45,8 +45,6 @@ public:
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t firstCommitTime = 0;  // first time this segment was committed as part of the index.
     uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index (or 1 if currently committing)
-    // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
-    int64_t sizeInBytes = 0;
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
@@ -126,6 +124,7 @@ public:
     uint64_t gen = 0;
     uint64_t commitTime = 0;
     uint64_t builtCoreGen = 0;
+    uint64_t bytes = 0;
     std::vector<std::string> files;
   };
 
@@ -136,6 +135,7 @@ public:
     uint64_t maxUpdateVersion = 0;
     uint64_t firstCommitTime = 0;
     uint64_t schemaGen = 0;
+    uint64_t bytes = 0;
     std::vector<AuxStats> overlays;
     int32_t maxDoc = 0;
     int32_t liveDocs = 0;
@@ -155,6 +155,7 @@ public:
     uint64_t maxDocs = 0;
     uint64_t liveDocs = 0;
     uint64_t activeMerges = 0;
+    uint64_t totalBytes = 0;
     std::vector<AuxStats> auxIndexes;
     std::vector<SegmentStats> segmentStats;
     FilterCache::CounterValues filterCacheCounters;

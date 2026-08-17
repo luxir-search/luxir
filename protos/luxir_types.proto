@@ -1027,6 +1027,7 @@ message StatsTotals {
   uint64 max_docs = 5;
   uint64 live_docs = 6;
   uint64 deleted_docs = 7;
+  uint64 bytes = 8;  // on-disk bytes; the index level reports the whole directory including metadata and in-flight files
 }
 
 message CollectionStats {
@@ -1069,6 +1070,7 @@ message SegmentStats {
   bool merging = 11;
   uint32 merge_level = 12;
   repeated AuxStats overlays = 13;
+  uint64 bytes = 14;
 }
 
 message AuxStats {
@@ -1079,6 +1081,7 @@ message AuxStats {
   uint64 commit_time = 5;
   uint64 built_core_gen = 6;
   repeated string files = 7;
+  uint64 bytes = 8;  // bytes of this entry's files; informational, already counted under its segment
 }
 
 message FilterCacheStats {

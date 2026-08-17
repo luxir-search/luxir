@@ -204,6 +204,9 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   ASSERT_NE(nullptr, committedCount);
   EXPECT_GT(*segmentCount, 0);
   EXPECT_EQ(*segmentCount, *committedCount);
+  auto* totalBytes = root["totals"]["bytes"].get_if<int64_t>();
+  ASSERT_NE(nullptr, totalBytes);
+  EXPECT_GT(*totalBytes, 0);
 
   auto* collections = root["collections"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, collections);
@@ -216,6 +219,9 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   auto* committed = (*segments)[0]["committed"].get_if<bool>();
   ASSERT_NE(nullptr, committed);
   EXPECT_TRUE(*committed);
+  auto* segmentBytes = (*segments)[0]["bytes"].get_if<int64_t>();
+  ASSERT_NE(nullptr, segmentBytes);
+  EXPECT_GT(*segmentBytes, 0);
 }
 
 TEST_F(HttpApiTest, statsRoutingErrors) {

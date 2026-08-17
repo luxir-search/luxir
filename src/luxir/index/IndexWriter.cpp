@@ -2501,6 +2501,38 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
     if (segment.committed) out.committedSegments++;
   }
 
+  // On-disk bytes, from a single directory listing taken outside indexMutex
+  // (never hold indexMutex across statx).  A file that disappeared between the
+  // segment snapshot above and this listing simply contributes 0.
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  for (const auto& file : files) {
+    out.totalBytes += file.size;
+  }
+  auto fileSize = [&files](const std::string& name) -> uint64_t {
+    auto it = std::lower_bound(files.begin(), files.end(), name,
+                               [](const Directory::FileInfo& f, const std::string& n) { return f.name < n; });
+    return (it != files.end() && it->name == name) ? it->size : 0;
+  };
+  auto fillAuxBytes = [&fileSize](AuxStats& aux) {
+    for (const auto& name : aux.files) {
+      aux.bytes += fileSize(name);
+    }
+  };
+  for (auto& aux : out.auxIndexes) fillAuxBytes(aux);
+  for (auto& segment : out.segmentStats) {
+    // Prefix attribution is unambiguous: the length-prefixed base36 segId
+    // encoding means no segId string is a prefix of another, and '_' is not
+    // an id character.
+    auto prefix = Postings::getIndexFileNamePrefix(segment.segId);
+    auto it = std::lower_bound(files.begin(), files.end(), prefix,
+                               [](const Directory::FileInfo& f, const std::string& p) { return f.name < p; });
+    for (; it != files.end() && it->name.starts_with(prefix); ++it) {
+      segment.bytes += it->size;
+    }
+    for (auto& overlay : segment.overlays) fillAuxBytes(overlay);
+  }
+
   auto cache = getFilterCache();
   if (cache) {
     auto config = cache->configuration();

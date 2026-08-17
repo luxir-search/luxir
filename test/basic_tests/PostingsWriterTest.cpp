@@ -1170,7 +1170,7 @@ TEST_F(PostingsTest, intCol) {
   }
 
   // All this should have been able to be done in a single segment file.
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   ASSERT_EQ(files.size(), 1);
 

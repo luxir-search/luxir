@@ -44,7 +44,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
 
   state.counters["rate="] = benchmark::Counter(val.size()*iter, benchmark::Counter::kIsIterationInvariantRate);
   state.counters["inverterSz"] = inverterSz;
-  state.counters["indexSz"] = dir.totalFileSize();
+  state.counters["indexSz"] = dir.totalBytes();
 }
 
 

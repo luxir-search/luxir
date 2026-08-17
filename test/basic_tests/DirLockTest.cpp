@@ -94,9 +94,10 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   auto dir = reader.create("main");
 
   EXPECT_TRUE(dir->openFile("hello") != nullptr);
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   EXPECT_NO_THROW(dir->listFiles(files));
-  EXPECT_EQ(files, std::vector<std::string>{"hello"});
+  ASSERT_EQ(1, files.size());
+  EXPECT_EQ("hello", files[0].name);
 
   EXPECT_THROW(dir->createFile("other"), ReadOnlyError);
   EXPECT_THROW(dir->deleteFile("hello"), ReadOnlyError);
@@ -117,7 +118,8 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   // Nothing above reached the filesystem.
   files.clear();
   writableDir->listFiles(files);
-  EXPECT_EQ(files, std::vector<std::string>{"hello"});
+  ASSERT_EQ(1, files.size());
+  EXPECT_EQ("hello", files[0].name);
 }
 
 // The decorator carries the guarantee for any backend, not just the fs one.

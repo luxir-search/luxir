@@ -55,7 +55,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool docPer
   state.counters["flush_rate"] = sz * iters / flushSecs;
   state.counters["total_rate"] = sz * iters / (invertSecs + flushSecs);
   state.counters["inverterSz"] = inverterSz;
-  state.counters["indexSz"] = dir.totalFileSize();
+  state.counters["indexSz"] = dir.totalBytes();
 }
 
 

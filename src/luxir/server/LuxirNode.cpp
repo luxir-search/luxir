@@ -106,11 +106,11 @@ void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
     // durable and published, so a cleanup failure must not fail the request
     // (loadSchema always picks the highest generation anyway).
     try {
-      std::vector<std::string> files;
+      std::vector<Directory::FileInfo> files;
       shard->dir->listFiles(files);
       for (const auto& f : files) {
-        if (f.starts_with(SCHEMA_PREFIX) && f != fileName) {
-          shard->dir->deleteFile(f);
+        if (f.name.starts_with(SCHEMA_PREFIX) && f.name != fileName) {
+          shard->dir->deleteFile(f.name);
         }
       }
     } catch (const std::exception& e) {
@@ -128,11 +128,11 @@ bool Collection::loadSchema() {
 
   // Find the latest schema file by lexicographic order (sortable naming).
   std::string lastSchemaFile;
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   shard->dir->listFiles(files);
   for (const auto& f : files) {
-    if (f.starts_with(SCHEMA_PREFIX)) {
-      if (f > lastSchemaFile) lastSchemaFile = f;
+    if (f.name.starts_with(SCHEMA_PREFIX)) {
+      if (f.name > lastSchemaFile) lastSchemaFile = f.name;
     }
   }
 
@@ -164,8 +164,8 @@ bool Collection::loadSchema() {
     files.clear();
     shard->dir->listFiles(files);
     for (const auto& f : files) {
-      if (f.starts_with(SCHEMA_PREFIX)) {
-        if (f > lastSchemaFile) lastSchemaFile = f;
+      if (f.name.starts_with(SCHEMA_PREFIX)) {
+        if (f.name > lastSchemaFile) lastSchemaFile = f.name;
       }
     }
   }

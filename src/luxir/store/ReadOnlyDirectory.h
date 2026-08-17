@@ -30,7 +30,7 @@ public:
   ReadOnlyDirectory(std::shared_ptr<Directory> delegate, std::string name)
       : delegate_(std::move(delegate)), name_(std::move(name)) {}
 
-  void listFiles(std::vector<std::string>& target) override {
+  void listFiles(std::vector<FileInfo>& target) override {
     delegate_->listFiles(target);
   }
 

@@ -225,11 +225,11 @@ TEST_F(VectorColTest, indexingStreamsReleasedBeforeFieldFlush) {
   inverter.finishDoc();
   testIndex.flush();
 
-  std::vector<std::string> files;
+  std::vector<Directory::FileInfo> files;
   testIndex.dir.listFiles(files);
   std::string dataPrefix = Postings::getIndexFileNamePrefix(segId) + "_";
-  size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const std::string& file) {
-    return file.starts_with(dataPrefix);
+  size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const Directory::FileInfo& file) {
+    return file.name.starts_with(dataPrefix);
   });
   EXPECT_EQ(3u, dataFiles);
 }

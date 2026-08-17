@@ -41,8 +41,10 @@ TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   if (dumpPath == nullptr) return;
   uint64_t segId = index.reader->segments()[0].segInfo.seg_id;
   std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::vector<Directory::FileInfo> infos;
+  index.dir.listFiles(infos);
   std::vector<std::string> files;
-  index.dir.listFiles(files);
+  for (const auto& info : infos) files.push_back(info.name);
   std::sort(files.begin(), files.end());
   std::ofstream dump(dumpPath, std::ios::binary | std::ios::trunc);
   ASSERT_TRUE(dump.good());

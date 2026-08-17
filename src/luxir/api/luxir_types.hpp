@@ -224,6 +224,7 @@ struct AuxStats {
   uint64_t gen = 0;
   uint64_t commit_time = 0;
   uint64_t built_core_gen = 0;
+  uint64_t bytes = 0;
   std::span<const std::string_view> files;
 };
 struct FilterCacheStats {
@@ -253,6 +254,7 @@ struct StatsTotals {
   uint64_t max_docs = 0;
   uint64_t live_docs = 0;
   uint64_t deleted_docs = 0;
+  uint64_t bytes = 0;
 };
 struct SegmentStats {
   uint64_t seg_id = 0;
@@ -261,6 +263,7 @@ struct SegmentStats {
   uint64_t max_update_version = 0;
   uint64_t first_commit_time = 0;
   uint64_t schema_gen = 0;
+  uint64_t bytes = 0;
   std::span<const AuxStats> overlays;
   int32_t max_doc = 0;
   int32_t live_docs = 0;

@@ -110,12 +110,7 @@ public:
     // re-init secondary rng off of first
     r2.init(r());
 
-    std::vector<std::string> files;
-    dir.listFiles(files);
-    indexSize = 0;
-    for (auto& fname : files) {
-      indexSize += dir.openFile(fname)->size();
-    }
+    indexSize = dir.totalBytes();
 
     // TODO: refactor this somewhere more useful.  Directory?
     // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;

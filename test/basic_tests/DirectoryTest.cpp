@@ -25,10 +25,10 @@ protected:
     dir.finishFile(*f);
 
     // check if dir contents are in sorted order
-    std::vector<std::string> resultListing;
+    std::vector<Directory::FileInfo> resultListing;
     dir.listFiles(resultListing);
     for (uint32_t i=1; i<resultListing.size(); i++) {
-      ASSERT_LT(resultListing[i-1], resultListing[i]);
+      ASSERT_LT(resultListing[i-1].name, resultListing[i].name);
     }
 
     // test not finding a file
@@ -47,30 +47,38 @@ protected:
   }
 
   void doDir(Directory& dir) {
-    std::vector<std::string> lst;
+    std::vector<Directory::FileInfo> lst;
 
     dir.listFiles(lst);
     ASSERT_EQ(lst.size(), 0);
 
     addFile(dir, "f5", "12345");
     lst.resize(0); dir.listFiles(lst);
-    ASSERT_EQ("f5", lst[0]);
+    ASSERT_EQ("f5", lst[0].name);
 
     // add file at end
     addFile(dir, "f5a", "123456");
     lst.resize(0); dir.listFiles(lst);
-    ASSERT_EQ("f5a", lst[1]);
+    ASSERT_EQ("f5a", lst[1].name);
 
     // add file at start
     std::string aaa_data = "123456789abcdefghijklmnopqrstuvwxyz";
     addFile(dir, "aaa", aaa_data);
     lst.resize(0); dir.listFiles(lst);
-    ASSERT_EQ("aaa", lst[0]);
+    ASSERT_EQ("aaa", lst[0].name);
 
     // add file in middle
     addFile(dir, "bbb", "qwertyuiop");
     lst.resize(0); dir.listFiles(lst);
-    ASSERT_EQ("bbb", lst[1]);
+    ASSERT_EQ("bbb", lst[1].name);
+
+    // sizes match written payload lengths, and totalBytes() is their sum
+    ASSERT_EQ(4, lst.size());
+    ASSERT_EQ(aaa_data.size(), lst[0].size);  // aaa
+    ASSERT_EQ(10, lst[1].size);               // bbb
+    ASSERT_EQ(5, lst[2].size);                // f5
+    ASSERT_EQ(6, lst[3].size);                // f5a
+    ASSERT_EQ(aaa_data.size() + 10 + 5 + 6, dir.totalBytes());
 
     // remove a non-existing file
     bool found = dir.deleteFile("doesntexist");
@@ -113,7 +121,7 @@ protected:
     lst.resize(0);
     dir.listFiles(lst);
     ASSERT_EQ(lst.size(), 3);
-    ASSERT_EQ("f5", lst[1]);
+    ASSERT_EQ("f5", lst[1].name);
 
     // test delete of open file
     {
@@ -306,11 +314,11 @@ TEST_F(DirectoryTest, fsdirPersistence) {
   // Reopen the directory - files should still be there
   {
     FSDirectory dir(path);
-    std::vector<std::string> files;
+    std::vector<Directory::FileInfo> files;
     dir.listFiles(files);
     ASSERT_EQ(2, files.size());
-    ASSERT_EQ("persist1", files[0]);
-    ASSERT_EQ("persist2", files[1]);
+    ASSERT_EQ("persist1", files[0].name);
+    ASSERT_EQ("persist2", files[1].name);
 
     auto f = dir.openFile("persist1");
     ASSERT_TRUE(f != nullptr);

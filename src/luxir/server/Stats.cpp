@@ -20,6 +20,7 @@ void addTotals(api::StatsTotals& dst, const api::StatsTotals& src) {
   dst.max_docs += src.max_docs;
   dst.live_docs += src.live_docs;
   dst.deleted_docs += src.deleted_docs;
+  dst.bytes += src.bytes;
 }
 
 void copyAuxStats(api::AuxStats& dst, const IndexWriter::AuxStats& src,
@@ -30,6 +31,7 @@ void copyAuxStats(api::AuxStats& dst, const IndexWriter::AuxStats& src,
   dst.gen = src.gen;
   dst.commit_time = src.commitTime;
   dst.built_core_gen = src.builtCoreGen;
+  dst.bytes = src.bytes;
   auto* files = api::build::allocArray(dst.files, src.files.size(), resource);
   for (std::size_t i = 0; i < src.files.size(); i++) {
     files[i] = api::build::arenaStr(resource, src.files[i]);
@@ -86,6 +88,7 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
     out.committed = in.committed;
     out.merging = in.merging;
     out.merge_level = (uint32_t)in.mergeLevel;
+    out.bytes = in.bytes;
 
     auto* overlays = api::build::allocArray(out.overlays, in.overlays.size(), resource);
     for (std::size_t oi = 0; oi < in.overlays.size(); oi++) {
@@ -141,6 +144,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     indexTotals.live_docs = writerStats.liveDocs;
     assert(writerStats.liveDocs <= writerStats.maxDocs);
     indexTotals.deleted_docs = writerStats.maxDocs - writerStats.liveDocs;
+    indexTotals.bytes = writerStats.totalBytes;
 
     collectionStats.totals = indexTotals;
     collectionStats.totals.shards = 1;

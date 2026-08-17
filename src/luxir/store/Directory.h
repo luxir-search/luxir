@@ -26,9 +26,15 @@ public:
 // Implementations of Directory are thread safe.
 class Directory {
 public:
+  struct FileInfo {
+    std::string name;
+    uint64_t size = 0;
+  };
+
   // TODO: add a prefix option?
-  // appends a list of names to the referenced vector
-  virtual void listFiles(std::vector<std::string> &target) = 0;
+  // Appends; the appended range is sorted by name.  Sizes are a best-effort
+  // snapshot and entries vanishing mid-scan are skipped, never thrown.
+  virtual void listFiles(std::vector<FileInfo> &target) = 0;
 
   // Open a file for reading.  If expectSynced is true, the caller asserts that
   // this file should have been fsynced (e.g. it was referenced from a committed
@@ -41,11 +47,11 @@ public:
   virtual bool deleteFile(const std::string_view name) = 0;
 
   virtual void deletePrefix(const std::string_view prefix) {
-    std::vector<std::string> files;
+    std::vector<FileInfo> files;
     listFiles(files);
     for (const auto &file : files) {
-      if (file.starts_with(prefix)) {
-        deleteFile(file);
+      if (file.name.starts_with(prefix)) {
+        deleteFile(file.name);
       }
     }
   }
@@ -67,6 +73,17 @@ public:
 
   // remove all files from the directory
   virtual void clear() = 0;
+
+  // Sum of file sizes from a single listFiles snapshot.
+  uint64_t totalBytes() {
+    std::vector<FileInfo> files;
+    listFiles(files);
+    uint64_t total = 0;
+    for (const auto &file : files) {
+      total += file.size;
+    }
+    return total;
+  }
 
   virtual ~Directory() = default;
 };
@@ -91,11 +108,11 @@ public:
     files = std::move(other.files);
   }
 
-  void listFiles(std::vector<std::string>& target) override {
+  void listFiles(std::vector<FileInfo>& target) override {
     std::lock_guard<std::mutex> lock(mutex);
-    target.reserve(files.size());
+    target.reserve(target.size() + files.size());
     for (const auto&[name, ifile] : files) {
-      target.push_back(name);
+      target.push_back({name, (uint64_t)ifile->size()});
     }
   }
 
@@ -169,15 +186,6 @@ public:
     files.erase(it);
     files[std::string(to)] = std::move(value);
   }
-
-  int64_t totalFileSize() {
-    std::lock_guard<std::mutex> lock(mutex);
-    int64_t totalSize = 0;
-    for (const auto&[name, ifile] : files) {
-      totalSize += ifile->size();
-    }
-    return totalSize;
-  };
 
   void clear() override {
     DIR_DEBUG("DIR about to clear all files");
