@@ -994,6 +994,145 @@ TEST(FilterCacheTest, admissionLanePromotionDeduplicatesEachRequest) {
   EXPECT_EQ(2u, cache.entryCountForTest());
 }
 
+TEST(FilterCacheTest, wholeLanePopulatesBelowMinimumSegmentDocs) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.minSegmentDocs = 1000;
+  FilterCache cache(config);
+  std::array segments{
+    FilterCache::SegmentIdentity{1, 1000},
+    FilterCache::SegmentIdentity{2, 100},
+  };
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("whole-tiny-segment");
+
+  {
+    FilterCache::UseRegistry populate(cache, 1, segments);
+    auto* use = populate.get(
+        key, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    auto large = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, large.kind());
+    use->publishRaw(0, large, docs(1000, {3}), 10);
+    auto tiny = use->probe(1);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, tiny.kind());
+    use->publishRaw(1, tiny, docs(100, {7}), 10);
+  }
+  EXPECT_EQ(2u, cache.counters().builds);
+
+  FilterCache::UseRegistry hit(cache, 1, segments);
+  auto candidate = hit.lookupExisting(key);
+  ASSERT_TRUE(candidate.has_value());
+  auto* use = hit.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, use);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+  auto tinyHit = use->probe(1);
+  ASSERT_EQ(FilterCache::Probe::Kind::HIT, tinyHit.kind());
+  ASSERT_NE(nullptr, tinyHit.docSet());
+  EXPECT_TRUE(tinyHit.docSet()->get(7));
+}
+
+TEST(FilterCacheTest, clauseLaneDoesNotPopulateBelowMinimumSegmentDocs) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.minSegmentDocs = 1000;
+  FilterCache cache(config);
+  std::array segments{
+    FilterCache::SegmentIdentity{1, 1000},
+    FilterCache::SegmentIdentity{2, 100},
+  };
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("clause-tiny-segment");
+
+  {
+    FilterCache::UseRegistry populate(cache, 1, segments);
+    auto* use = populate.get(
+        key, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::CLAUSE);
+    auto large = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, large.kind());
+    use->publishRaw(0, large, docs(1000, {3}), 10);
+    auto tiny = use->probe(1);
+    ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, tiny.kind());
+    use->publishRaw(1, tiny, docs(100, {7}), 10);
+  }
+  EXPECT_EQ(1u, cache.counters().builds);
+
+  FilterCache::UseRegistry verify(cache, 1, segments);
+  EXPECT_FALSE(verify.lookupExisting(key).has_value());
+  auto* use = verify.get(
+      key, FilterKeyScope::SEGMENT_STABLE,
+      FilterCache::AdmissionLane::CLAUSE);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(1).kind());
+}
+
+TEST(FilterCacheTest, clauseEntryUpgradesTinySegmentsAfterWholeAdmission) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 2;
+  config.minSegmentDocs = 1000;
+  FilterCache cache(config);
+  std::array segments{
+    FilterCache::SegmentIdentity{1, 1000},
+    FilterCache::SegmentIdentity{2, 100},
+  };
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("clause-then-whole-tiny-segment");
+
+  {
+    FilterCache::UseRegistry firstClause(cache, 1, segments);
+    auto* use = firstClause.get(
+        key, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::CLAUSE);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0).kind());
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(1).kind());
+  }
+  {
+    FilterCache::UseRegistry secondClause(cache, 1, segments);
+    auto* use = secondClause.get(
+        key, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::CLAUSE);
+    auto large = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, large.kind());
+    use->publishRaw(0, large, docs(1000, {3}), 10);
+    auto tiny = use->probe(1);
+    ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, tiny.kind());
+    use->publishRaw(1, tiny, docs(100, {7}), 10);
+  }
+  {
+    FilterCache::UseRegistry firstWhole(cache, 1, segments);
+    EXPECT_FALSE(firstWhole.lookupExisting(key).has_value());
+    auto* use = firstWhole.get(
+        key, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    EXPECT_FALSE(use->wasAdmitted());
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+    auto tiny = use->probe(1);
+    ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, tiny.kind());
+  }
+  {
+    FilterCache::UseRegistry secondWhole(cache, 1, segments);
+    auto* use = secondWhole.get(
+        key, FilterKeyScope::SEGMENT_STABLE,
+        FilterCache::AdmissionLane::WHOLE);
+    EXPECT_TRUE(use->wasAdmitted());
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+    auto tiny = use->probe(1);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, tiny.kind());
+    use->publishRaw(1, tiny, docs(100, {7}), 10);
+  }
+
+  FilterCache::UseRegistry hit(cache, 1, segments);
+  auto candidate = hit.lookupExisting(key);
+  ASSERT_TRUE(candidate.has_value());
+  auto* use = hit.acceptExisting(
+      std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, use);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(1).kind());
+}
+
 TEST(FilterCacheTest, publishHitsEmptyAndForcesCardinality) {
   FilterCache cache(testConfig());
   std::array segments{FilterCache::SegmentIdentity{7, 1024}};

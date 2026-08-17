@@ -1659,6 +1659,88 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
 }
 
 TEST_F(SearchEngineTest,
+       wholeCountCachesBelowMinimumSegmentsAndOmitsWeightAndContext) {
+  LuxirConfig nodeConfig;
+  nodeConfig.filterCacheBytes = 0;
+  LuxirNode enabledNode(nodeConfig);
+  LuxirNode disabledNode(nodeConfig);
+  constexpr std::string_view collection = "whole_count_tiny_segment";
+  CollectionHelper enabled(enabledNode, collection);
+  CollectionHelper disabled(disabledNode, collection);
+
+  FilterCacheConfig enabledConfig{
+    .minSegmentDocs = 5,
+    .admissionThreshold = 2,
+  };
+  auto cache = std::make_shared<FilterCache>(enabledConfig);
+  enabled.getIndexWriter()->filterCache = cache;
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{
+        .maxBytes = 0,
+        .minSegmentDocs = 5,
+        .admissionThreshold = 2,
+      });
+
+  for (CollectionHelper* helper : {&enabled, &disabled}) {
+    std::vector<Doc> large;
+    for (int32_t doc = 0; doc < 8; doc++) {
+      large.push_back(flatdoc(
+          "id", "large_" + std::to_string(doc), "body_w",
+          (doc & 1) == 0 ? "quick fox" : "quick turtle"));
+    }
+    ASSERT_TRUE(helper->indexAll(large, UpdateMessage::COMMIT).success);
+    std::vector<Doc> tiny;
+    for (int32_t doc = 0; doc < 2; doc++) {
+      tiny.push_back(flatdoc(
+          "id", "tiny_" + std::to_string(doc), "body_w",
+          (doc & 1) == 0 ? "quick fox" : "quick turtle"));
+    }
+    ASSERT_TRUE(helper->indexAll(tiny, UpdateMessage::COMMIT).success);
+  }
+
+  auto reader = enabled.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  std::vector<int32_t> segmentSizes;
+  for (const auto& segment : reader->segments()) {
+    segmentSizes.push_back(segment.maxDoc());
+  }
+  std::sort(segmentSizes.begin(), segmentSizes.end());
+  EXPECT_EQ((std::vector<int32_t>{2, 8}), segmentSizes);
+
+  auto query = [](std::pmr::memory_resource& mr) {
+    return qb::phraseWords(mr, "body_w", {"quick", "fox"});
+  };
+  WholeCountRun cacheDisabled = runWholeCount(
+      disabled.getSearchEngine(), collection, query);
+  WholeCountRun cold = runWholeCount(
+      enabled.getSearchEngine(), collection, query);
+  WholeCountRun build = runWholeCount(
+      enabled.getSearchEngine(), collection, query);
+  WholeCountRun hit = runWholeCount(
+      enabled.getSearchEngine(), collection, query);
+
+  EXPECT_EQ(5, cacheDisabled.found);
+  EXPECT_EQ(cacheDisabled.found, cold.found);
+  EXPECT_EQ(cold.found, build.found);
+  EXPECT_EQ(build.found, hit.found);
+  EXPECT_EQ(0, cacheDisabled.weightSkips);
+  EXPECT_EQ(0, cold.weightSkips);
+  EXPECT_EQ(0, build.weightSkips);
+  EXPECT_EQ(1, hit.weightSkips);
+  EXPECT_EQ(1, cacheDisabled.contextsCreated);
+  EXPECT_EQ(1, cold.contextsCreated);
+  EXPECT_EQ(1, build.contextsCreated);
+  EXPECT_EQ(0, hit.contextsCreated);
+  EXPECT_EQ(0, cacheDisabled.contextsOmitted);
+  EXPECT_EQ(0, cold.contextsOmitted);
+  EXPECT_EQ(0, build.contextsOmitted);
+  EXPECT_EQ(1, hit.contextsOmitted);
+  EXPECT_EQ(2, build.builds);
+  EXPECT_EQ(2, hit.hits);
+  EXPECT_EQ(2u, cache->counters().builds);
+}
+
+TEST_F(SearchEngineTest,
        logicalValidationPrecedesDisabledColdAndWarmCachePlanning) {
   enum class InvalidShape {
     UNUSED_MATCH_NONE_BOOST_OVERFLOW,

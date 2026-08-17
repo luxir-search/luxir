@@ -219,6 +219,14 @@ void FilterCache::Use::pinValue(
   }
 }
 
+bool FilterCache::Use::allowsSegmentPopulation(int32_t maxDoc) const {
+  uint8_t wholeLaneBit =
+      (uint8_t)(1U << (uint8_t)AdmissionLane::WHOLE);
+  return cache != nullptr
+      && (maxDoc >= cache->config.minSegmentDocs
+          || (observedAdmissionLanes & wholeLaneBit) != 0);
+}
+
 void FilterCache::Use::releaseRequestClaim(size_t segmentOrd) {
   if (segmentOrd >= requestSlots.size()) return;
   auto& requestSlot = *requestSlots[segmentOrd];
@@ -344,7 +352,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
     return sharedHit(std::move(slot), std::move(value));
   }
 
-  if (!admitted || slot->maxDoc < cache->config.minSegmentDocs
+  if (!admitted || !allowsSegmentPopulation(slot->maxDoc)
       || readerCoreGen < cache->publishedCoreGen.load(std::memory_order_acquire)) {
     cache->counter.misses.fetch_add(1, std::memory_order_relaxed);
     return bypass();
@@ -1230,7 +1238,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
           && slot->active.load(std::memory_order_acquire)
           && slot->segId == identity.segId
           && slot->maxDoc == identity.maxDoc
-          && slot->maxDoc >= config.minSegmentDocs
+          && use.allowsSegmentPopulation(slot->maxDoc)
           && use.readerCoreGen >= publishedCoreGen.load(std::memory_order_acquire)
           && isActive(*active, identity)
           && local->card() != slot->maxDoc

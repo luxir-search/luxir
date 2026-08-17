@@ -28,6 +28,10 @@ struct FilterCacheConfig {
   size_t maxBytes = 64ULL * 1024 * 1024;
   size_t lowWatermarkBytes = 0;
   size_t maxEntryBytes = 0;
+  // Segment values below this floor may be populated only by a WHOLE-lane Use:
+  // complete reader residency unlocks Weight omission. CLAUSE-only Uses retain
+  // the floor to prevent per-clause churn; shared values remain reusable by
+  // either lane after publication.
   #ifdef NDEBUG
   int32_t minSegmentDocs = 1000;
   #else
@@ -337,6 +341,7 @@ public:
                   const std::shared_ptr<const SegmentValue>& value);
     void pinReaderValue(const std::shared_ptr<const ReaderValue>& value);
     void releaseRequestClaim(size_t segmentOrd);
+    bool allowsSegmentPopulation(int32_t maxDoc) const;
 
   public:
     Probe probe(size_t segmentOrd);
