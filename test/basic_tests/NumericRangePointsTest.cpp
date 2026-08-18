@@ -117,6 +117,15 @@ int64_t exactCount(IndexReader& reader, std::string_view field,
   return state.weight->count(reader.segments()[0]);
 }
 
+std::optional<int64_t> weightConstantCount(IndexReader& reader,
+                                           std::string_view field,
+                                           int64_t lo, int64_t hi,
+                                           DocSet* domain = nullptr) {
+  MemPool pool;
+  QueryState state(pool, reader, field, lo, hi);
+  return state.weight->constantCount(reader.segments()[0], domain);
+}
+
 std::optional<SegFieldInfo> tryFieldInfo(IndexReader::Segment& segment,
                                          std::string_view field) {
   MemPool pool;
@@ -257,8 +266,34 @@ TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
       EXPECT_EQ(selectedScorer(*reader, field, lo, hi, 0), expected);
       EXPECT_EQ(materialized(*reader, field, lo, hi), expected);
       EXPECT_EQ(exactCount(*reader, field, lo, hi), (int64_t)expected.size());
+      auto constant = weightConstantCount(*reader, field, lo, hi);
+      if (field == "point_single") {
+        ASSERT_TRUE(constant.has_value());
+      }
+      if (constant.has_value()) {
+        EXPECT_EQ((int64_t)expected.size(), *constant);
+      }
     }
   }
+
+  // Shape coverage for the constant-count probe: all-match counts every doc
+  // with a value even multi-valued, a multi-valued partial range needs
+  // execution, a restricted domain always does, and an absent column is
+  // zero under any domain.
+  EXPECT_EQ((int64_t)oracle(single, -6000, 6000).size(),
+            *weightConstantCount(*reader, "point_single", -6000, 6000));
+  EXPECT_EQ((int64_t)oracle(multi, -8000, 8000).size(),
+            *weightConstantCount(*reader, "point_multi", -8000, 8000));
+  EXPECT_FALSE(weightConstantCount(*reader, "point_multi", 0, 100)
+                   .has_value());
+  DocSetBuilder domainBuilder(N);
+  domainBuilder.add(1);
+  auto domain = domainBuilder.build();
+  EXPECT_FALSE(weightConstantCount(*reader, "point_single", 0, 100,
+                                   domain.get()).has_value());
+  EXPECT_EQ(0, *weightConstantCount(*reader, "missing_i", 0, 100));
+  EXPECT_EQ(0, *weightConstantCount(*reader, "missing_i", 0, 100,
+                                    domain.get()));
 }
 
 TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {

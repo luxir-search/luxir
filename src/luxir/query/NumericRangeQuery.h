@@ -620,6 +620,50 @@ public:
       segInfos = context.readSegInfos(query.getField());
     }
 
+    // Exact count from the range structures alone, never a scan: a range
+    // covering the whole column counts every doc with a value, and a
+    // partial range over a single-valued points column is the difference
+    // of two ordinal positions (one leaf descent per bound). Multi-valued
+    // partial ranges and points-less columns return null rather than run
+    // the crossing-blocks walk the bulk count path uses - that walk is the
+    // right cost at execution, not inside a per-segment constant probe.
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      SegFieldInfo* segInfo = nullptr;
+      if (!segmentInfo(segment, segInfo)) {
+        return 0;
+      }
+      MemPool pool;
+      auto* reader = pool.make<IntColReader>(
+          segment.postingsReader(), *segInfo);
+      if (reader->numValues() == 0) return 0;
+      int64_t colMin = reader->getMin();
+      int64_t colMax = reader->getMax();
+      if (colMax < query.getLo() || query.getHi() < colMin) return 0;
+      if (domain != nullptr || segment.liveDocs() != nullptr) {
+        return std::nullopt;
+      }
+      if (query.getLo() <= colMin && colMax <= query.getHi()) {
+        return reader->docsWithValue();
+      }
+      if (segInfo->pointsMetaOff == 0 || reader->multiValued()) {
+        return std::nullopt;
+      }
+      auto* points = pool.make<PointsReader>(
+          segment.postingsReader(), *segInfo);
+      if (points->pointCount() != (uint64_t)reader->numValues()) {
+        throw std::runtime_error(
+            "NumericRangeQuery: points/column value count mismatch");
+      }
+      auto fence = points->fenceRange(query.getLo(), query.getHi());
+      if (fence.empty) return 0;
+      auto residuals = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
+      auto raw = pool.make_span<int64_t>(points->maxPointsPerLeaf());
+      auto [begin, end] = exactPointPositions(
+          *points, fence, query.getLo(), query.getHi(), residuals, raw);
+      return (int64_t)(end - begin);
+    }
+
     class Supplier final : public Query::ScorerSupplier {
       // Crossing values cost about 2x a dense scan. Require at least
       // half the values to be structurally prunable before using zone maps.
