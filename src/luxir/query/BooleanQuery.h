@@ -4729,6 +4729,36 @@ public:
       auto optionalShapeSuppliers = QueryPrep::collectSuppliers(
           targetPool, segment, optionalSources, executionMode);
       assert(prohibitedShapeSuppliers.size() == prohibitedSources.size());
+      // A pure disjunction whose live clauses reduce to one in this segment
+      // is that clause: its matches and scores are the boolean's. Preserve
+      // the survivor's complete supplier contract, including bulkScorer, so
+      // a dropped-clause singleton keeps the clause's own execution routes.
+      // A clause is dead only when its own shape proves it empty; the cost
+      // check just keeps describeScorer off live-clause construction.
+      if (minShouldMatch <= 1 && mandatorySources.empty()
+          && prohibitedSources.empty() && filterSuppliers.empty()) {
+        Query::ScorerSupplier* survivor = nullptr;
+        bool single = true;
+        for (auto* supplier : optionalShapeSuppliers) {
+          if (supplier == nullptr) continue;
+          if (supplier->cost() == 0) {
+            auto planContext = supplier->makePlanContext(
+                Query::Demand::fromLeadCost(0));
+            if (supplier->describeScorer(planContext).matchState
+                == Query::MatchState::EMPTY) {
+              continue;
+            }
+          }
+          if (survivor != nullptr) {
+            single = false;
+            break;
+          }
+          survivor = supplier;
+        }
+        if (single && survivor != nullptr) {
+          return survivor;
+        }
+      }
       int64_t shapeRequiredCost = segment.maxDoc();
       for (auto* supplier : mandatoryShapeSuppliers) {
         if (supplier != nullptr) {
