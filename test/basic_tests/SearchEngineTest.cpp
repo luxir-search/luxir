@@ -2171,9 +2171,15 @@ TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
   WholeCountRun newHit = runWholeCount(
       helper.getSearchEngine(), collection, fuzzy);
   EXPECT_EQ(3, newBypass.found);
-  EXPECT_EQ((int64_t) segmentCount, newBypass.bypasses);
-  EXPECT_EQ((int64_t) segmentCount, newBuild.builds);
-  EXPECT_EQ((int64_t) segmentCount, newHit.hits);
+  // The old core re-admits under the new expansion generation. The new
+  // segment has a single live expansion clause, so the rewritten
+  // disjunction's count is a constant df there and never touches the cache.
+  EXPECT_EQ(1, newBypass.bypasses);
+  EXPECT_EQ(1, newBuild.builds);
+  EXPECT_EQ(1, newHit.hits);
+  EXPECT_EQ(1, newBypass.constants);
+  EXPECT_EQ(1, newBuild.constants);
+  EXPECT_EQ(1, newHit.constants);
 }
 
 TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
@@ -3111,12 +3117,18 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
   expectSameWholeFieldSort(offEmpty, emptyHit);
   EXPECT_TRUE(emptyHit.ids.empty());
   EXPECT_EQ(0, *emptyHit.found);
-  EXPECT_EQ(2, emptyBypass.routingBypasses);
-  EXPECT_EQ(2, emptyBuild.routingBypasses);
-  EXPECT_EQ(2, emptyHit.routingBypasses);
+  // Every clause of the disjunction is dead, so the membership count is a
+  // constant zero per segment. The constant preempts cache routing entirely
+  // and the sort itself serves through the ladder.
+  EXPECT_EQ(0, emptyBypass.routingBypasses + emptyBuild.routingBypasses
+                   + emptyHit.routingBypasses);
+  EXPECT_EQ(2, emptyBypass.constants);
+  EXPECT_EQ(2, emptyBuild.constants);
+  EXPECT_EQ(2, emptyHit.constants);
   EXPECT_EQ(0, emptyBypass.bypasses + emptyBuild.builds + emptyHit.hits);
   EXPECT_EQ(0, emptyBuild.cachedBestFirst + emptyHit.cachedBestFirst);
-  EXPECT_EQ(0, emptyBuild.ladderFallbacks + emptyHit.ladderFallbacks);
+  EXPECT_EQ(2, emptyBuild.ladderFallbacks);
+  EXPECT_EQ(2, emptyHit.ladderFallbacks);
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortConstantFactFallsBackWithoutCacheUse) {
@@ -5330,7 +5342,11 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
     for (int i = 0; i < 3; i++) {
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection(collection);
-      req->topDocs("q").allQuery().getNumber().limit(0)
+      // A scored query keeps the fold from collapsing to a lone filter
+      // clause whose count is a constant df: constant-served requests never
+      // execute, so they would not admit the filter into the cache.
+      req->topDocs("q").getNumber().limit(0)
+          .matchQuery("body_w", "apple")
           .matchFilter("filter", field, "yes");
       req->execute(false);
       EXPECT_TRUE(req->ok()) << req->errorMsg();

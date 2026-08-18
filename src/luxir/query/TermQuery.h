@@ -182,16 +182,18 @@ public:
 
     std::optional<int64_t> constantCount(
         IndexReader::Segment& segment, DocSet* domain) override {
+      if (cachedTermInfo == nullptr) {
+        return 0;
+      }
       if (domain != nullptr || segment.liveDocs() != nullptr) {
         return std::nullopt;
       }
-      return cachedTermInfo == nullptr
-          ? 0
-          : (int64_t) cachedTermInfo->docFreq(segment.ord);
+      return (int64_t) cachedTermInfo->docFreq(segment.ord);
     }
 
     // A term's exact match count is its docFreq - free from the term stats -
-    // unless deletions could have removed some of its docs.
+    // unless deletions could have removed some of its docs. A term absent
+    // from the whole reader counts zero under any domain.
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
     // in this segment) so compound scorers can order leaders by cost. The

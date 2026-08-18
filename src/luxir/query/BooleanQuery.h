@@ -4998,6 +4998,40 @@ public:
       }
     }
 
+    // Membership count free from index stats, composed from the clauses.
+    // Two shapes answer: a lone required clause delegates (optional clauses
+    // beside it never gate membership while minShouldMatch is unset, whether
+    // or not their weights were dropped), and a pure disjunction whose
+    // clauses all report constant counts is exact when at most one clause is
+    // nonempty - a union with nothing has no overlap. Two or more live
+    // clauses have unknown overlap, and prohibited clauses need execution.
+    std::optional<int64_t> constantCount(
+        IndexReader::Segment& segment, DocSet* domain) override {
+      if (!prohibitedWeights.empty()) {
+        return std::nullopt;
+      }
+      size_t required = mandatoryWeights.size() + filterWeights.size();
+      if (required == 1 && minShouldMatch < 1) {
+        Query::Weight* child = mandatoryWeights.empty()
+            ? filterWeights.front() : mandatoryWeights.front();
+        if (child == nullptr) return std::nullopt;
+        return child->constantCount(segment, domain);
+      }
+      if (required == 0 && minShouldMatch <= 1 && !optionalWeights.empty()) {
+        int64_t count = 0;
+        int liveClauses = 0;
+        for (Query::Weight* clause : optionalWeights) {
+          if (clause == nullptr) return std::nullopt;
+          auto clauseCount = clause->constantCount(segment, domain);
+          if (!clauseCount.has_value()) return std::nullopt;
+          if (*clauseCount != 0 && ++liveClauses > 1) return std::nullopt;
+          count += *clauseCount;
+        }
+        return count;
+      }
+      return std::nullopt;
+    }
+
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       auto filterSources = QueryPrep::prepareFilterSources(
           filterWeights, filterUses, ctx);

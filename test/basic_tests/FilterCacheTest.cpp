@@ -2291,6 +2291,51 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   EXPECT_EQ(0, *noneWeight->constantCount(segment, restricted.get()));
   EXPECT_FALSE(alphaWeight->constantCount(
       segment, restricted.get()).has_value());
+
+  TermQuery beta("text_w", "beta");
+  TermQuery ghost("text_w", "ghost");
+  TermQuery wraith("text_w", "wraith");
+  std::array<Query*, 2> alphaOrGhost{&alpha, &ghost};
+  std::array<Query*, 2> alphaOrBeta{&alpha, &beta};
+  std::array<Query*, 2> ghostOrWraith{&ghost, &wraith};
+  std::array<Query*, 1> alphaOnly{&alpha};
+  std::array<Query*, 1> betaOnly{&beta};
+  BooleanQuery deadClauseUnion({}, alphaOrGhost, {}, {}, 1);
+  BooleanQuery liveUnion({}, alphaOrBeta, {}, {}, 1);
+  BooleanQuery deadUnion({}, ghostOrWraith, {}, {});
+  BooleanQuery mandOpt(alphaOnly, betaOnly, {}, {});
+  BooleanQuery gatedOpt(alphaOnly, betaOnly, {}, {}, 1);
+  BooleanQuery excluded(alphaOnly, {}, betaOnly, {});
+  auto* deadClauseUnionWeight = deadClauseUnion.createWeight(context, 0);
+  auto* liveUnionWeight = liveUnion.createWeight(context, 0);
+  auto* deadUnionWeight = deadUnion.createWeight(context, 0);
+  auto* mandOptWeight = mandOpt.createWeight(context, 0);
+  auto* gatedOptWeight = gatedOpt.createWeight(context, 0);
+  auto* excludedWeight = excluded.createWeight(context, 0);
+
+  // A union whose other clauses are empty counts as its one live clause;
+  // two live clauses have unknown overlap. Dropped (non-gating) optionals
+  // leave the lone required clause's count; a gating optional group or a
+  // prohibited clause needs execution.
+  EXPECT_EQ(2, *deadClauseUnionWeight->constantCount(segment, nullptr));
+  EXPECT_FALSE(liveUnionWeight->constantCount(segment, nullptr).has_value());
+  EXPECT_EQ(0, *deadUnionWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(0, *deadUnionWeight->constantCount(segment, restricted.get()));
+  EXPECT_EQ(2, *mandOptWeight->constantCount(segment, nullptr));
+  EXPECT_FALSE(gatedOptWeight->constantCount(segment, nullptr).has_value());
+  EXPECT_FALSE(excludedWeight->constantCount(segment, nullptr).has_value());
+  EXPECT_FALSE(deadClauseUnionWeight->constantCount(
+      segment, restricted.get()).has_value());
+
+  ExistsQuery exists("text_w");
+  ExistsQuery absentField("other_w");
+  auto* existsWeight = exists.createWeight(context, 0);
+  auto* absentFieldWeight = absentField.createWeight(context, 0);
+  EXPECT_EQ(3, *existsWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(0, *absentFieldWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(0, *absentFieldWeight->constantCount(segment, restricted.get()));
+  EXPECT_FALSE(existsWeight->constantCount(
+      segment, restricted.get()).has_value());
 }
 
 TEST(FilterCacheTest,
