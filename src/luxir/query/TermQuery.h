@@ -441,7 +441,9 @@ public:
       }
       // The impacts index resolves the whole hop internally (skipping dead
       // groups on their corner bounds without parsing them); the enum advances
-      // ONCE per competitive landing rather than once per block.
+      // ONCE per competitive landing rather than once per block. doc may run
+      // ahead of the enum (a window skip hopping from a window boundary); the
+      // enum only moves once a landing past its position is known.
       while (doc != PostingsReader::END) {
         skipCount(SkipStats::impactCompetitiveColdLookups);
         auto landing = impacts.firstCompetitiveTarget(doc, minCompetitiveScore,
@@ -453,8 +455,8 @@ public:
         }
         competitiveUpTo = landing.lastDoc;
         competitiveBound = landing.impact;
-        if (landing.doc == doc) {
-          return doc;
+        if (landing.doc <= docsEnum.docId()) {
+          return docsEnum.docId();
         }
         doc = docsEnum.advance(landing.doc);
         if (doc <= competitiveUpTo) {
@@ -462,6 +464,17 @@ public:
         }
       }
       return doc;
+    }
+
+    // Window-skip advance: move to the first competitive posting at or after
+    // target. Unlike advance(), the impacts index resolves the hop first, so
+    // the enum lands once on a competitive block instead of decoding the
+    // block at target only to hop away from it.
+    int32_t advanceCompetitiveFrom(int32_t target) {
+      if (!hasImpacts() || !(minCompetitiveScore > 0.0f)) {
+        return docsEnum.advance(target);
+      }
+      return skipNonCompetitiveBlocks(target);
     }
 
     int32_t competitivePosting(int32_t doc) {
@@ -1359,7 +1372,7 @@ public:
 
       int32_t doc = scorer->docId();
       if (doc < min) {
-        doc = scorer->advance(min);
+        doc = scorer->advanceCompetitiveFrom(min);
       }
       while (doc < max) {
         windowStart = doc;
@@ -1385,7 +1398,7 @@ public:
             out.max = max;
             return PostingsReader::END;
           }
-          doc = scorer->advance(windowEnd);
+          doc = scorer->advanceCompetitiveFrom(windowEnd);
           continue;
         }
 

@@ -5610,8 +5610,11 @@ TEST_F(TermScorerTest, termCompetitiveCertificatesTrackThetaAndBlockTransitions)
 
     int32_t lastImpactDoc = weakScorer->impacts.groupLastDoc(
         weakScorer->impacts.numGroups() - 1);
+    // Past the impacts index the certificate opens to END. The hop reports
+    // the first competitive posting at or after max(enum, target); with the
+    // enum exhausted that is the enum's own END position.
     EXPECT_EQ(weakScorer->skipNonCompetitiveBlocks(lastImpactDoc + 1),
-              lastImpactDoc + 1);
+              PostingsReader::END);
     EXPECT_EQ(weakScorer->competitiveUpTo, PostingsReader::END);
     EXPECT_TRUE(std::isinf(weakScorer->competitiveBound));
 
