@@ -166,7 +166,7 @@ TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
   LuxirConfig config;
   CLI::App app;
   config.addOptions(app);
-  app.parse("--index.merge-factor 1000");
+  app.parse("--indexing.merge-factor 1000");
   ASSERT_EQ(config.index.merge_factor, 1000);
 
   LuxirNode node(config);
@@ -178,7 +178,7 @@ TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
   LuxirConfig invalidConfig;
   CLI::App invalidApp;
   invalidConfig.addOptions(invalidApp);
-  EXPECT_THROW(invalidApp.parse("--index.merge-factor 1"), CLI::ValidationError);
+  EXPECT_THROW(invalidApp.parse("--indexing.merge-factor 1"), CLI::ValidationError);
 }
 
 

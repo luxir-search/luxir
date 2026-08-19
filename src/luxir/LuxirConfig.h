@@ -57,7 +57,7 @@ struct IndexConfig {
   // IndexWriter::perInverterRamBytes / perInverterMaxDocs.
   int64_t max_inverter_ram_mb = 64;              // RAM cap (MiB)
   int64_t max_inverter_docs = 8 * 1024 * 1024;   // doc-count cap
-  int64_t max_index_ram_mb = 0;                  // shared index RAM cap (MiB), 0 = unlimited
+  int64_t max_index_ram_mb = 0;                  // shared indexing RAM cap (MiB), 0 = unlimited
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
 };

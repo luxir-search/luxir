@@ -1026,7 +1026,7 @@ message StatsRequest {
 message StatsResponse {
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
-  IndexRamStats index_ram = 3;
+  IndexRamStats indexing_ram = 3;
 }
 
 // Rolled-up counts.  Only the fields meaningful at a given level are set, so

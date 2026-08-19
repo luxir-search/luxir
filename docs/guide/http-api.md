@@ -20,7 +20,7 @@ uses the same vocabulary as protobuf.
 
 Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update
-does by default unless `--no-ingest.auto-create-collection` is set.
+does by default unless `--no-indexing.auto-create-collection` is set.
 
 `_create` is strict: creating a name that already exists is a `409` error, and
 the optional `schema` (same shape as a `_schema` set) is installed before the

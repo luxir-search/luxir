@@ -165,7 +165,7 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   ASSERT_FALSE(glz::read_json(nodeJson, nodeStats.body())) << nodeStats.body();
   EXPECT_TRUE(nodeJson.contains("totals"));
   EXPECT_TRUE(nodeJson.contains("collections"));
-  EXPECT_TRUE(nodeJson.contains("index_ram"));
+  EXPECT_TRUE(nodeJson.contains("indexing_ram"));
 
   auto collectionStats =
       httpRequest(port(), http::verb::get, "/collections/main/_stats");
@@ -1418,7 +1418,7 @@ TEST_F(HttpApiTest, ndjsonDeferredInlineUpdateEnforcesRequestBodyCap) {
   localServer.shutdown();
 
   EXPECT_EQ(200, update.result_int()) << update.body();
-  EXPECT_NE(update.body().find("_update_ inline request exceeds ingest.max-request-body"),
+  EXPECT_NE(update.body().find("_update_ inline request exceeds indexing.max-request-body"),
             std::string::npos) << update.body();
 }
 
@@ -1557,7 +1557,7 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
   localServer.shutdown();
 
   EXPECT_EQ(400, update.result_int()) << update.body();
-  EXPECT_NE(update.body().find("all_or_none NDJSON group exceeds ingest.max-request-body"),
+  EXPECT_NE(update.body().find("all_or_none NDJSON group exceeds indexing.max-request-body"),
             std::string::npos) << update.body();
 }
 

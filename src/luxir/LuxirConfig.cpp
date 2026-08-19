@@ -53,48 +53,48 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
 
-  app.add_option("--index.max-inverter-ram-mb", index.max_inverter_ram_mb,
+  app.add_option("--indexing.max-inverter-ram-mb", index.max_inverter_ram_mb,
                  "Per-inverter RAM cap (MiB) before an auto-flush to a segment")
       ->default_val(index.max_inverter_ram_mb)
       ->check(CLI::PositiveNumber);
-  app.add_option("--index.max-inverter-docs", index.max_inverter_docs,
+  app.add_option("--indexing.max-inverter-docs", index.max_inverter_docs,
                  "Per-inverter doc-count cap before an auto-flush to a segment")
       ->default_val(index.max_inverter_docs)
       ->check(CLI::PositiveNumber);
-  app.add_option("--index.merge-factor", index.merge_factor,
+  app.add_option("--indexing.merge-factor", index.merge_factor,
                  "Same-level segments required to trigger a merge")
       ->default_val(index.merge_factor)
       ->check(CLI::PositiveNumber)
       ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));
-  app.add_option("--max-index-ram", index.max_index_ram_mb,
-                 "Shared index RAM cap for merge admission (MiB, 0 = unlimited)")
+  app.add_option("--indexing.max-ram-mb", index.max_index_ram_mb,
+                 "Shared indexing RAM cap for merge admission and inverter flushing (MiB, 0 = unlimited)")
       ->default_val(index.max_index_ram_mb)
       ->check(CLI::NonNegativeNumber);
-  app.add_option("--index.pressure-flush-floor-mb", index.pressure_flush_floor_mb,
-                 "Min idle-inverter size (MiB) to flush when over the shared index RAM cap")
+  app.add_option("--indexing.pressure-flush-floor-mb", index.pressure_flush_floor_mb,
+                 "Min idle-inverter size (MiB) to flush when over the shared indexing RAM cap")
       ->default_val(index.pressure_flush_floor_mb)
       ->check(CLI::PositiveNumber);
 
-  app.add_option("--ingest.max-request-body", ingest.max_request_body,
+  app.add_option("--indexing.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")
       ->transform(CLI::AsSizeValue(false))
       ->default_str("32MB");
-  app.add_option("--ingest.max-record", ingest.max_record,
+  app.add_option("--indexing.max-record", ingest.max_record,
                  "Max size of one NDJSON record / document (default: max-request-body)")
       ->transform(CLI::AsSizeValue(false));
-  app.add_option("--ingest.stream-batch-size", ingest.stream_batch_size,
+  app.add_option("--indexing.stream-batch-size", ingest.stream_batch_size,
                  "Streaming NDJSON: byte size for internal (non-atomic) mini-batches")
       ->transform(CLI::AsSizeValue(false))
       ->default_str("1MB");
-  app.add_option("--ingest.stream-batch-docs", ingest.stream_batch_docs,
+  app.add_option("--indexing.stream-batch-docs", ingest.stream_batch_docs,
                  "Streaming NDJSON: doc count for internal (non-atomic) mini-batches")
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
-  app.add_option("--ingest.max-inflight-batches", ingest.max_inflight_batches,
+  app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
                  "Streaming NDJSON: batches in flight per connection (0 = task arena concurrency + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
-  app.add_flag("--ingest.auto-create-collection,!--no-ingest.auto-create-collection",
+  app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",
                ingest.auto_create_collection, "Create missing collections on first use")
       ->default_val(ingest.auto_create_collection);
 

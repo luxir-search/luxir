@@ -225,7 +225,7 @@ POST /collections/books/_search
 The same server holds multiple collections as independent index namespaces.
 They share the process scheduler and memory, and Luxir does not currently
 provide per-collection tenant quotas or authorization boundaries. Auto-create
-is on by default; set `--no-ingest.auto-create-collection` if a write to an
+is on by default; set `--no-indexing.auto-create-collection` if a write to an
 unknown collection should be rejected.
 
 ## Committing

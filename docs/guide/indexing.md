@@ -14,7 +14,7 @@ POST /collections/{collection}/_update
 
 A write to a missing collection creates it by default. Collection names are a
 single path component and names beginning with `_` are reserved. Disable
-automatic creation with `--no-ingest.auto-create-collection` when collection
+automatic creation with `--no-indexing.auto-create-collection` when collection
 names must be provisioned elsewhere.
 
 ## JSON updates
@@ -243,15 +243,15 @@ can be copied with a pipe and no format conversion.
 An unbounded stream and all-or-none atomicity cannot both be promised: rollback
 requires retaining the atomic unit. An NDJSON group with `all_or_none: true` is
 therefore accumulated as one bounded request and is subject to
-`--ingest.max-request-body`. Ordinary streaming groups remain unbounded.
+`--indexing.max-request-body`. Ordinary streaming groups remain unbounded.
 
 The relevant server controls are:
 
-- `--ingest.max-request-body` for buffered JSON bodies and atomic groups
+- `--indexing.max-request-body` for buffered JSON bodies and atomic groups
   (default `32MB`).
-- `--ingest.max-record` for one NDJSON record (defaults to the buffered-body
+- `--indexing.max-record` for one NDJSON record (defaults to the buffered-body
   limit).
-- `--ingest.stream-batch-size` and `--ingest.stream-batch-docs` for internal
+- `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for internal
   non-atomic handoff granularity.
 
 At present a single HTTP NDJSON connection pipelines storage and indexing but

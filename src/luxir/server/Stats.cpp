@@ -161,8 +161,8 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
   }
 
   auto& ram = node.getIndexRamBudget();
-  response.index_ram.limit_bytes = (uint64_t)ram.totalBytes();
-  response.index_ram.reserved_bytes = (uint64_t)ram.reservedBytes();
+  response.indexing_ram.limit_bytes = (uint64_t)ram.totalBytes();
+  response.indexing_ram.reserved_bytes = (uint64_t)ram.reservedBytes();
 }
 
 } // namespace luxir

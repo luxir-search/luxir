@@ -299,7 +299,7 @@ struct StatsRequest { std::optional<Target> collection; bool segments = false; }
 struct StatsResponse {
   StatsTotals totals;
   std::span<const CollectionStats> collections;
-  IndexRamStats index_ram;
+  IndexRamStats indexing_ram;
 };
 
 struct Vector { std::optional<ArrFloat> f32; };                  // needs ArrFloat

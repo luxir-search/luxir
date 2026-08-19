@@ -238,28 +238,29 @@ it and resume after the buffer drains below half. Increase it only when more
 per-connection buffering is a measured win; total memory scales with the number
 of simultaneously slow streams.
 
-## Indexing memory and ingest limits
+## Indexing memory and request limits
 
 ```bash
 luxir \
-  --index.max-inverter-ram-mb=64 \
-  --index.max-inverter-docs=8388608 \
-  --max-index-ram=8192
+  --indexing.max-inverter-ram-mb=64 \
+  --indexing.max-inverter-docs=8388608 \
+  --indexing.max-ram-mb=8192
 ```
 
-- `index.max-inverter-ram-mb` and `index.max-inverter-docs` trigger automatic
+- `indexing.max-inverter-ram-mb` and `indexing.max-inverter-docs` trigger automatic
   segment flushes that bound active indexing structures.
-- `max-index-ram` is the shared node-wide MiB budget used for merge admission;
-  `0` leaves it unlimited.
+- `indexing.max-ram-mb` is the shared node-wide MiB budget used for merge
+  admission and for flushing idle inverters under memory pressure; `0` leaves
+  it unlimited.
 
-The HTTP ingest limits distinguish bounded material from streams:
+The HTTP request limits distinguish bounded material from streams:
 
 ```bash
 luxir \
-  --ingest.max-request-body=32MB \
-  --ingest.max-record=32MB \
-  --ingest.stream-batch-size=1MB \
-  --ingest.stream-batch-docs=10000
+  --indexing.max-request-body=32MB \
+  --indexing.max-record=32MB \
+  --indexing.stream-batch-size=1MB \
+  --indexing.stream-batch-docs=10000
 ```
 
 - `max-request-body` caps buffered JSON requests and atomic NDJSON groups.

@@ -1932,7 +1932,7 @@ private:
     assert(state != nullptr);
     assert(state->batch != nullptr);
     if (request->sourceBytes > state->maxRequestBody) {
-      failStreamingUpdate("_update_ inline request exceeds ingest.max-request-body");
+      failStreamingUpdate("_update_ inline request exceeds indexing.max-request-body");
       return false;
     }
     if (state->batch->docs.size() != 0) {
@@ -2119,7 +2119,7 @@ private:
       if (control.kind == HttpStreamControlKind::Noop) {
         state->batch->sourceBytes += record.size();
         if (state->group.allOrNone() && state->batch->sourceBytes > state->maxRequestBody) {
-          failStreamingInput("all_or_none NDJSON group exceeds ingest.max-request-body");
+          failStreamingInput("all_or_none NDJSON group exceeds indexing.max-request-body");
           return false;
         }
         if (state->batch->docs.size() == 0 &&
@@ -2136,7 +2136,7 @@ private:
     state->batch->sourceBytes += record.size();
     if (state->group.allOrNone()) {
       if (state->batch->sourceBytes > state->maxRequestBody) {
-        failStreamingInput("all_or_none NDJSON group exceeds ingest.max-request-body");
+        failStreamingInput("all_or_none NDJSON group exceeds indexing.max-request-body");
         return false;
       }
       return true;
@@ -2488,7 +2488,7 @@ private:
         });
   }
 
-  // A 413 for a request body past ingest.max-request-body.  The body was not fully
+  // A 413 for a request body past indexing.max-request-body.  The body was not fully
   // consumed, so the connection cannot be reused - respond, then close.
   void respondPayloadTooLarge() {
     keepAlive_ = false;
@@ -2497,7 +2497,7 @@ private:
       if (v != 0) httpVersion_ = v;
     }
     respondSimple(http::status::payload_too_large, "application/json",
-                  renderErrorBody("request body exceeds ingest.max-request-body"));
+                  renderErrorBody("request body exceeds indexing.max-request-body"));
   }
 
   void doClose() {
