@@ -67,7 +67,8 @@ public:
   // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
   CommitInfo* commitInfo = nullptr;
 
-  // This inverter's share of the global indexing RAM budget. IndexWriter::releaseInverter
+  // This inverter's share of the global indexing RAM budget. Bound (at zero bytes)
+  // by the IndexWriter when it creates the inverter; IndexWriter::releaseInverter
   // resyncs it to memSize() once per batch; the guard's destructor returns the bytes when
   // the inverter is destroyed (after its flush completes, or at writer close), so flushing
   // inverters stay counted until their RAM is actually freed. Not used by the Inverter itself.

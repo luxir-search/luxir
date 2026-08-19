@@ -1,8 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
-#include <mutex>
 #include <optional>
 
 namespace luxir {
@@ -14,6 +14,12 @@ namespace luxir {
 // task's release path) - work waits, threads never do.  That rule is what makes
 // the budget safe to share across TBB task workers: a thread parked on a full
 // budget could be the only thread able to run the task that would release it.
+//
+// Lock-free: both counters are relaxed atomics.  The budget is advisory
+// accounting - no data is published through it - so no ordering is needed.
+// The one pairing the old mutex provided that atomics do not is
+// setTotalBytes() racing an admission check, which can admit against the
+// stale cap; the soft cap (below) already tolerates that.
 //
 // The cap is deliberately soft: forceAcquire() overdraws so a client that has
 // nothing in flight can always make progress (and so a single reservation larger
@@ -84,6 +90,18 @@ public:
       return true;
     }
 
+    // Unconditionally resizes this reservation, overdrawing the cap like
+    // forceAcquire.  Returns true when the pool is over its cap afterwards
+    // (never when uncapped), so a resync plus the over-budget check costs a
+    // single atomic op.
+    bool forceResize(int64_t newBytes) {
+      assert(newBytes >= 0);
+      assert(budget != nullptr);
+      bool over = budget->forceAdjust(newBytes - bytes);
+      bytes = newBytes;
+      return over;
+    }
+
     int64_t size() const {
       return bytes;
     }
@@ -94,20 +112,37 @@ public:
   };
 
 private:
-  mutable std::mutex mutex;
-  int64_t total = 0;
-  int64_t reserved = 0;
+  std::atomic<int64_t> total = 0;
+  std::atomic<int64_t> reserved = 0;
 
   bool tryResize(int64_t oldBytes, int64_t newBytes) {
-    const std::lock_guard<std::mutex> lock(mutex);
-    assert(oldBytes >= 0 && newBytes >= 0 && reserved >= oldBytes);
-    int64_t withoutGuard = reserved - oldBytes;
-    if (newBytes > oldBytes && total != 0
-        && (withoutGuard > total || newBytes > total - withoutGuard)) {
-      return false;
+    assert(oldBytes >= 0 && newBytes >= 0);
+    if (newBytes <= oldBytes) {
+      [[maybe_unused]] int64_t prev =
+          reserved.fetch_sub(oldBytes - newBytes, std::memory_order_relaxed);
+      assert(prev >= oldBytes);
+      return true;
     }
-    reserved = withoutGuard + newBytes;
+    int64_t cap = total.load(std::memory_order_relaxed);
+    int64_t cur = reserved.load(std::memory_order_relaxed);
+    do {
+      assert(cur >= oldBytes);
+      int64_t withoutGuard = cur - oldBytes;
+      if (cap != 0 && (withoutGuard > cap || newBytes > cap - withoutGuard)) {
+        return false;
+      }
+    } while (!reserved.compare_exchange_weak(cur, cur - oldBytes + newBytes,
+                                             std::memory_order_relaxed));
     return true;
+  }
+
+  // Moves reserved by delta unconditionally; true when the pool ends up over
+  // its cap (never when uncapped).
+  bool forceAdjust(int64_t delta) {
+    int64_t now = reserved.fetch_add(delta, std::memory_order_relaxed) + delta;
+    assert(now >= 0);
+    int64_t cap = total.load(std::memory_order_relaxed);
+    return cap != 0 && now > cap;
   }
 
 public:
@@ -117,12 +152,7 @@ public:
 
   bool tryAcquire(int64_t bytes) {
     assert(bytes >= 0);
-    const std::lock_guard<std::mutex> lock(mutex);
-    if (total != 0 && reserved + bytes > total) {
-      return false;
-    }
-    reserved += bytes;
-    return true;
+    return tryResize(0, bytes);
   }
 
   std::optional<Guard> tryAcquireGuard(int64_t bytes) {
@@ -134,38 +164,33 @@ public:
 
   Guard forceAcquire(int64_t bytes) {
     assert(bytes >= 0);
-    const std::lock_guard<std::mutex> lock(mutex);
-    reserved += bytes;
+    forceAdjust(bytes);
     return Guard(*this, bytes);
   }
 
   void release(int64_t bytes) {
     assert(bytes >= 0);
-    const std::lock_guard<std::mutex> lock(mutex);
-    assert(reserved >= bytes);
-    reserved -= bytes;
+    [[maybe_unused]] int64_t prev = reserved.fetch_sub(bytes, std::memory_order_relaxed);
+    assert(prev >= bytes);
   }
 
   // True when reservations exceed the cap (never when uncapped).
   bool overBudget() const {
-    const std::lock_guard<std::mutex> lock(mutex);
-    return total != 0 && reserved > total;
+    int64_t cap = total.load(std::memory_order_relaxed);
+    return cap != 0 && reserved.load(std::memory_order_relaxed) > cap;
   }
 
   void setTotalBytes(int64_t totalBytes) {
     assert(totalBytes >= 0);
-    const std::lock_guard<std::mutex> lock(mutex);
-    total = totalBytes;
+    total.store(totalBytes, std::memory_order_relaxed);
   }
 
   int64_t totalBytes() const {
-    const std::lock_guard<std::mutex> lock(mutex);
-    return total;
+    return total.load(std::memory_order_relaxed);
   }
 
   int64_t reservedBytes() const {
-    const std::lock_guard<std::mutex> lock(mutex);
-    return reserved;
+    return reserved.load(std::memory_order_relaxed);
   }
 };
 

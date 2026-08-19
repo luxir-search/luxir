@@ -56,6 +56,25 @@ TEST(IndexRamBudgetTest, GuardReleasesOnDestructionAndMove) {
   budget.release(10);
 }
 
+TEST(IndexRamBudgetTest, GuardForceResizeReportsOverBudget) {
+  IndexRamBudget budget(10);
+  IndexRamBudget::Guard guard(budget, 0);
+
+  EXPECT_FALSE(guard.forceResize(8));
+  EXPECT_EQ(8, budget.reservedBytes());
+  EXPECT_TRUE(guard.forceResize(25)); // overdraws like forceAcquire
+  EXPECT_EQ(25, budget.reservedBytes());
+  EXPECT_FALSE(guard.forceResize(3));
+  EXPECT_EQ(3, budget.reservedBytes());
+
+  guard.release();
+  EXPECT_EQ(0, budget.reservedBytes());
+
+  IndexRamBudget uncapped;
+  IndexRamBudget::Guard unGuard(uncapped, 0);
+  EXPECT_FALSE(unGuard.forceResize(1 << 30)); // uncapped never reports over
+}
+
 TEST(IndexRamBudgetTest, GuardResizeIsAtomic) {
   IndexRamBudget budget(10);
   auto guard = budget.tryAcquireGuard(4);

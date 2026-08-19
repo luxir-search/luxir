@@ -492,6 +492,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
   const std::lock_guard<std::mutex> lock(indexMutex);
   if (idleInverters.empty()) {
     auto newInverter = std::make_unique<Inverter>(dir, ++lastSegId, schemaProvider_);
+    newInverter->ramGuard = IndexRamBudget::Guard(*indexRamBudget, 0);
     inverter = newInverter.get();
     busyInverters.emplace(inverter, std::move(newInverter));
   }
@@ -523,10 +524,10 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   }
 
   // Resync this inverter's share of the global indexing RAM budget - once per
-  // batch, not per doc. Move-assign releases the old reservation; the new one is
-  // held until the inverter is destroyed (after flush), so flushing inverters
-  // stay counted until their RAM is actually freed.
-  inverter.ramGuard = indexRamBudget->forceAcquire((int64_t)inverter.memSize());
+  // batch, not per doc - and note whether the pool is over its cap. The
+  // reservation is held until the inverter is destroyed (after flush), so
+  // flushing inverters stay counted until their RAM is actually freed.
+  bool ramOverBudget = inverter.ramGuard.forceResize((int64_t)inverter.memSize());
 
   // Size-based auto-flush is driven by the caller (ProtoUpdateMessage::handle passes
   // flush=true at end of batch when inverter.shouldFlush() is true), not decided here:
@@ -553,14 +554,14 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   }
 
   // Global-budget pressure: if total indexing RAM (inverters plus merge
-  // reservations) is over the cap, flush the largest idle inverter - possibly
-  // the one just released. At most one pressure flush in flight (the
+  // reservations) was over the cap at the resync above, flush the largest idle
+  // inverter - possibly the one just released. At most one pressure flush in flight (the
   // flushingInverters gate): flushes already draining will free RAM, and the
   // next release re-evaluates (batches are pushed through the indexing graph,
   // so releases keep arriving while there is anything to shed; once traffic
   // stops, commit reclaims what remains). The size floor avoids shedding tiny
   // inverters (and spamming tiny segments) when merges hold most of the budget.
-  if (flushingInverters.empty() && indexRamBudget->overBudget()) {
+  if (flushingInverters.empty() && ramOverBudget) {
     Inverter* victim = nullptr;
     for (auto& entry : idleInverters) {
       if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
