@@ -182,6 +182,25 @@ TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
 }
 
 
+// The per-inverter RAM cap is clamped below the MemPool 4 GiB addressability
+// ceiling, with headroom for one batch's overshoot past the cap.
+TEST_F(IndexWriterTest, inverterRamCapClampedToPoolAddressability) {
+  LuxirConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  app.parse("--indexing.max-inverter-ram-mb 8192");
+  config.normalize();
+  EXPECT_EQ(config.index.max_inverter_ram_mb, 4000000000LL / (1024 * 1024));
+  // Clamped cap plus a full 256 KiB-block overshoot still fits addressability.
+  EXPECT_LE((uint64_t)config.index.max_inverter_ram_mb * 1024 * 1024,
+            (uint64_t)MemPool::MAX_BUFFERS * MemPool::BYTE_BLOCK_SIZE - 256 * 1024 * 1024);
+
+  LuxirConfig defaultConfig;
+  defaultConfig.normalize();
+  EXPECT_EQ(defaultConfig.index.max_inverter_ram_mb, LuxirConfig{}.index.max_inverter_ram_mb);
+}
+
+
 TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   auto dir = std::make_unique<RAMDir>();
   {

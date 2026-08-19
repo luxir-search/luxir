@@ -156,6 +156,10 @@ public:
   static constexpr uint32_t BYTE_BLOCK_SHIFT = 18;
   static constexpr uint32_t BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
   static constexpr uint32_t BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
+  // Byte-block addresses pack (bufferIdx << BYTE_BLOCK_SHIFT) | pos into 32 bits,
+  // so one pool can hold at most this many blocks (4 GiB at full block size).
+  // nextBuffer() throws rather than letting bbAddress() wrap and alias blocks.
+  static constexpr uint32_t MAX_BUFFERS = 1u << (32 - BYTE_BLOCK_SHIFT);
   static constexpr uint32_t HEADER_SIZE = sizeof(int32_t); // size of the header at the beginning of each buffer
 
   /** index into the buffers array pointing to the current buffer used as the head */

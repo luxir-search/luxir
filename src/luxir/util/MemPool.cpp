@@ -1,4 +1,6 @@
 
+#include <stdexcept>
+
 #include "MemPool.h"
 
 namespace luxir {
@@ -40,6 +42,11 @@ void MemPool::nextBuffer(size_t sz) {
     }
     allocSize += bufferSize(buffer);
   } else {
+    if (buffers.size() >= MAX_BUFFERS) {
+      // Indexing paths surface this as a failed update; the config clamp on
+      // indexing.max-inverter-ram-mb keeps inverters from ever getting here.
+      throw std::length_error("MemPool exceeded its 4GiB addressability limit");
+    }
     initNewBuffer(new char[nextSize], nextSize);  // not 0 initialized.
   }
   // for new allocations, we want to let memory checkers find reads from uninitialized memory

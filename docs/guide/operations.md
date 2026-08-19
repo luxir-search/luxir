@@ -248,7 +248,9 @@ luxir \
 ```
 
 - `indexing.max-inverter-ram-mb` and `indexing.max-inverter-docs` trigger automatic
-  segment flushes that bound active indexing structures.
+  segment flushes that bound active indexing structures. The RAM cap is clamped
+  to 3814 MiB (with a startup warning): an inverter's memory pool can address at
+  most 4 GiB, and the clamp leaves headroom for one update batch's overshoot.
 - `indexing.max-ram-mb` is the shared node-wide MiB budget used for merge
   admission and for flushing idle inverters under memory pressure; `0` leaves
   it unlimited.

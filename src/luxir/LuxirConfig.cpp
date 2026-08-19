@@ -116,6 +116,18 @@ void LuxirConfig::normalize() {
     throw std::runtime_error("--read-only requires --store.backend=fs; there is no "
                              "existing data directory to serve with backend=" + store.backend);
   }
+
+  // An inverter's MemPool can address at most 4 GiB, and the per-inverter size
+  // check runs once per update batch, so an inverter can overshoot the cap by
+  // one batch's growth before it flushes. Clamp the cap to ~4e9 bytes, leaving
+  // ~281 MiB of headroom for that overshoot (MemPool itself throws at the hard
+  // ceiling if a pathological batch exceeds even that).
+  constexpr int64_t maxInverterRamCapMb = 4000000000LL / (1024 * 1024);  // 3814
+  if (index.max_inverter_ram_mb > maxInverterRamCapMb) {
+    spdlog::warn("indexing.max-inverter-ram-mb={} exceeds the inverter pool's addressability; clamping to {}",
+                 index.max_inverter_ram_mb, maxInverterRamCapMb);
+    index.max_inverter_ram_mb = maxInverterRamCapMb;
+  }
 }
 
 void LuxirConfig::apply() const {
