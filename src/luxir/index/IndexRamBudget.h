@@ -24,11 +24,18 @@ namespace luxir {
 // (tryForceAcquire), with starved drivers registering an admission callback that
 // release() pings so the token passes to the next starved merge.  Keeps the
 // no-thread-ever-waits rule; turns worst-case overshoot from sum-over-merges
-// into one batch.
+// into one batch.  (With inverter RAM folded into reserved, over-cap is the
+// steady state under heavy indexing load - the token's grant condition must not
+// key on raw reserved-vs-total or it would never grant.)
 //
-// Current reservation client: parallel field merges (SegmentMerger).  Planned:
-// inverter RAM as tracked (non-reserved) usage that shrinks merge headroom so
-// flushes win under pressure, and vector index builds as reservations.
+// Current reservation clients: parallel field merges (SegmentMerger), and
+// inverter RAM (each Inverter carries a Guard that IndexWriter::releaseInverter
+// resyncs to memSize() once per batch, so accumulated inverter RAM shrinks merge
+// headroom and vice versa; an over-budget release sheds that writer's largest
+// idle inverter).  Pressure shedding is per-writer: another writer's idle
+// inverters are reclaimed only by its own releases or commits - node-wide
+// victim selection would need a writer registry (same cluster as the
+// overdraft-token TODO).  Planned: vector index builds as reservations.
 class IndexRamBudget {
 public:
   class Guard {
@@ -137,6 +144,12 @@ public:
     const std::lock_guard<std::mutex> lock(mutex);
     assert(reserved >= bytes);
     reserved -= bytes;
+  }
+
+  // True when reservations exceed the cap (never when uncapped).
+  bool overBudget() const {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return total != 0 && reserved > total;
   }
 
   void setTotalBytes(int64_t totalBytes) {

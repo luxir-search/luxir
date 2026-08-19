@@ -8,7 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test/LuxirTest.h"
@@ -28,9 +30,24 @@ struct CapGuard {
   std::shared_ptr<IndexWriter> iw;
   size_t ram;
   size_t docs;
+  size_t floor;
   explicit CapGuard(std::shared_ptr<IndexWriter> w)
-    : iw(std::move(w)), ram(iw->perInverterRamBytes), docs(iw->perInverterMaxDocs) {}
-  ~CapGuard() { iw->perInverterRamBytes = ram; iw->perInverterMaxDocs = docs; }
+    : iw(std::move(w)), ram(iw->perInverterRamBytes), docs(iw->perInverterMaxDocs),
+      floor(iw->pressureFlushFloorBytes) {}
+  ~CapGuard() {
+    iw->perInverterRamBytes = ram;
+    iw->perInverterMaxDocs = docs;
+    iw->pressureFlushFloorBytes = floor;
+  }
+};
+
+// Restores the node-wide IndexRamBudget cap on scope exit (the node is shared
+// across tests).
+struct BudgetTotalGuard {
+  IndexRamBudget& budget;
+  int64_t saved;
+  explicit BudgetTotalGuard(IndexRamBudget& b) : budget(b), saved(b.totalBytes()) {}
+  ~BudgetTotalGuard() { budget.setTotalBytes(saved); }
 };
 }  // namespace
 
@@ -95,4 +112,83 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   req->execute();
   ASSERT_OK(req);
   EXPECT_EQ(req->getMatchCount("q"), nDocs);
+}
+
+// Waits for the budget's reservations to drain back to at most `bound` (the
+// last inverter is destroyed shortly AFTER its flush is observable, so a
+// post-commit check must poll).
+static void awaitDrain(IndexRamBudget& budget, int64_t bound) {
+  for (int i = 0; i < 5000 && budget.reservedBytes() > bound; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_LE(budget.reservedBytes(), bound) << "inverter RAM accounting leaked";
+}
+
+// Global indexing RAM budget: an over-budget release flushes the largest idle
+// inverter even though no per-inverter cap was hit, so accumulation across
+// messages is also bounded by the shared (node-wide) budget.
+TEST_F(AutoFlushTest, overBudgetReleaseFlushesIdleInverter) {
+  CollectionHelper helper;
+  auto iw = helper.getIndexWriter();
+  CapGuard capGuard(iw);
+  iw->pressureFlushFloorBytes = 1;  // any idle inverter is a valid victim
+
+  auto& budget = LuxirTest::luxirNode->getIndexRamBudget();
+  BudgetTotalGuard budgetGuard(budget);
+  const int64_t baselineReserved = budget.reservedBytes();
+  budget.setTotalBytes(1);  // any accounted inverter RAM overdraws the cap
+
+  const int nDocs = 8;
+  for (int i = 0; i < nDocs; i++) {
+    // One doc per message. The first release accounts the inverter's RAM, trips
+    // the budget, and pressure-flushes it from the idle pool (no commit involved).
+    helper.index(flatdoc("id", "id" + std::to_string(i), "foo_w", "brown fox jumped"),
+                 UpdateMessage::NO_COMMIT);
+  }
+  budget.setTotalBytes(budgetGuard.saved);  // commit-time flushes/merges run unpressured
+  helper.commit();
+
+  auto reader = iw->getIndexReader();
+  EXPECT_GT(reader->segments().size(), 1u)
+      << "an over-budget release should flush an idle inverter into its own segment";
+
+  int64_t totalDocs = 0;
+  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  EXPECT_EQ(totalDocs, nDocs);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->topDocs("q").allQuery().withStats().limit(100);
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(req->getMatchCount("q"), nDocs);
+
+  // The release side: every inverter was destroyed after the commit, so the
+  // guards returned all accounted bytes.
+  awaitDrain(budget, baselineReserved);
+}
+
+// The floor: an over-budget release does not shed inverters smaller than
+// pressureFlushFloorBytes - tiny segments give no meaningful RAM relief (e.g.
+// when merge reservations hold most of the budget).
+TEST_F(AutoFlushTest, pressureFlushRespectsFloor) {
+  CollectionHelper helper;
+  auto iw = helper.getIndexWriter();
+  CapGuard capGuard(iw);  // floor left at its default, far above these tiny inverters
+
+  auto& budget = LuxirTest::luxirNode->getIndexRamBudget();
+  BudgetTotalGuard budgetGuard(budget);
+  budget.setTotalBytes(1);
+
+  const int nDocs = 8;
+  for (int i = 0; i < nDocs; i++) {
+    helper.index(flatdoc("id", "id" + std::to_string(i), "foo_w", "brown fox jumped"),
+                 UpdateMessage::NO_COMMIT);
+  }
+  budget.setTotalBytes(budgetGuard.saved);
+  helper.commit();
+
+  auto reader = iw->getIndexReader();
+  EXPECT_EQ(reader->segments().size(), 1u)
+      << "below-floor inverters must not be pressure-flushed";
 }

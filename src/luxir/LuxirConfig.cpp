@@ -70,6 +70,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Shared index RAM cap for merge admission (MiB, 0 = unlimited)")
       ->default_val(index.max_index_ram_mb)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--index.pressure-flush-floor-mb", index.pressure_flush_floor_mb,
+                 "Min idle-inverter size (MiB) to flush when over the shared index RAM cap")
+      ->default_val(index.pressure_flush_floor_mb)
+      ->check(CLI::PositiveNumber);
 
   app.add_option("--ingest.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")

@@ -474,6 +474,11 @@ public:
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = 8 * 1024 * 1024;
 
+  // Minimum memSize() for an idle inverter to be flushed under global RAM budget
+  // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
+  // without meaningful RAM relief, e.g. when merge reservations hold the budget.
+  size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
+
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
   // Debug builds default the byte floors to 1 so every text merge with enough

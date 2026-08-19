@@ -6,6 +6,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "luxir/util/MemPool.h"
 #include "luxir/schema/Schema.h"
+#include "IndexRamBudget.h"
 #include "PostingsWriter.h"
 #include "StoredFieldsWriter.h"
 
@@ -65,6 +66,12 @@ public:
   // If the flush of this inverter is part of a commit, then this will point to the CommitInfo
   // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
   CommitInfo* commitInfo = nullptr;
+
+  // This inverter's share of the global indexing RAM budget. IndexWriter::releaseInverter
+  // resyncs it to memSize() once per batch; the guard's destructor returns the bytes when
+  // the inverter is destroyed (after its flush completes, or at writer close), so flushing
+  // inverters stay counted until their RAM is actually freed. Not used by the Inverter itself.
+  IndexRamBudget::Guard ramGuard;
 
   // The lowest and highest update numbers for this inverter, including deletes.
   // Should be updated by calls to updateVersions() after obtaining the inverter.

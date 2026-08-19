@@ -522,11 +522,16 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     assert(false); // should never happen
   }
 
-  // TODO: update and check global statistics
+  // Resync this inverter's share of the global indexing RAM budget - once per
+  // batch, not per doc. Move-assign releases the old reservation; the new one is
+  // held until the inverter is destroyed (after flush), so flushing inverters
+  // stay counted until their RAM is actually freed.
+  inverter.ramGuard = indexRamBudget->forceAcquire((int64_t)inverter.memSize());
+
   // Size-based auto-flush is driven by the caller (ProtoUpdateMessage::handle passes
   // flush=true at end of batch when inverter.shouldFlush() is true), not decided here:
-  // the message handler owns the safe flush point (a closed undo scope). Phase 2's
-  // global budget will add IndexWriter-side marking on top of this seam.
+  // the message handler owns the safe flush point (a closed undo scope). The global
+  // budget check below only ever flushes idle inverters.
 
   // if this inverter is part of a commit, initiate a flush.
   if (inverter.commitInfo != nullptr || flush) {
@@ -545,6 +550,30 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     // return inverter to idle pool
     idleInverters.emplace(&inverter, std::move(it->second));
     busyInverters.erase(it);
+  }
+
+  // Global-budget pressure: if total indexing RAM (inverters plus merge
+  // reservations) is over the cap, flush the largest idle inverter - possibly
+  // the one just released. At most one pressure flush in flight (the
+  // flushingInverters gate): flushes already draining will free RAM, and the
+  // next release re-evaluates (batches are pushed through the indexing graph,
+  // so releases keep arriving while there is anything to shed; once traffic
+  // stops, commit reclaims what remains). The size floor avoids shedding tiny
+  // inverters (and spamming tiny segments) when merges hold most of the budget.
+  if (flushingInverters.empty() && indexRamBudget->overBudget()) {
+    Inverter* victim = nullptr;
+    for (auto& entry : idleInverters) {
+      if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
+        victim = entry.first;
+      }
+    }
+    if (victim != nullptr && victim->memSize() >= pressureFlushFloorBytes) {
+      INDEX_DEBUG("over indexing RAM budget, flushing idle inverter={}", *victim);
+      auto vit = idleInverters.find(victim);
+      flushingInverters.emplace(victim, std::move(vit->second));
+      idleInverters.erase(vit);
+      segmentFlushNode->try_put(victim);
+    }
   }
 }
 
