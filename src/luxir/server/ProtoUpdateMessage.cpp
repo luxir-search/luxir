@@ -1,8 +1,11 @@
 #include "luxir/util/proto.h"
 #include "ProtoUpdateMessage.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/schema/Schema.h"
 
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <new>
+#include <optional>
 #include <variant>
 
 namespace luxir {
@@ -23,12 +26,56 @@ static std::string currentExceptionMessage() {
 }
 
 
+// The request's field_map collapsed to protobuf last-wins entries: input doc key ->
+// schema field, "" = drop. Views alias the request, which outlives update processing.
+class FieldNameMap {
+  boost::unordered_flat_map<std::string_view, std::string_view> entries;
+  bool dropUnmapped;
+
+public:
+  explicit FieldNameMap(const luxir::api::UpdateRequest& req) : dropUnmapped(req.drop_unmapped) {
+    for (const auto& [from, to] : lastWins(req.field_map)) {
+      entries.emplace(from, *to);
+    }
+  }
+
+  // The schema field to index the input key under, or nullopt to drop the field.
+  std::optional<std::string_view> resolve(std::string_view name) const {
+    if (entries.empty()) {
+      return name;  // drop_unmapped without a map is rejected at validation
+    }
+    auto iter = entries.find(name);
+    if (iter == entries.end()) {
+      if (dropUnmapped) return std::nullopt;
+      return name;
+    }
+    if (iter->second.empty()) return std::nullopt;
+    return iter->second;
+  }
+};
+
+
+// Rejects a bad field_map once at the request level, before any inverter work, so it
+// surfaces as one message-level error rather than repeating on every doc.
+static void validateFieldMap(const luxir::api::UpdateRequest& req) {
+  if (req.drop_unmapped && req.field_map.empty()) {
+    throw std::runtime_error("drop_unmapped requires a non-empty field_map");
+  }
+  for (const auto& [from, to] : req.field_map) {
+    unused(from);
+    if (!to.empty() && !Schema::validFieldName(to)) {
+      throw std::runtime_error("field_map target is not a valid field name: " + std::string(to));
+    }
+  }
+}
+
+
 // The value of the doc's unique id field, or empty if not present.
 // "id" is the schema-defined name for the unique id field.
-static std::string_view docId(const luxir::api::Map& doc) {
+static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fieldMap) {
   std::string_view result;
   for (const auto& [name, valView] : doc.fields) {
-    if (name != "id") {
+    if (fieldMap.resolve(name) != std::string_view("id")) {
       continue;
     }
     const IndexVal& val = *valView;
@@ -48,6 +95,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   auto& request = *msg.req;
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
+  const FieldNameMap fieldMap(request);
   std::vector<Inverter::IndexHandler*> handlers;
 
   // first docid this request's adds will use; needed for all_or_none rollback.
@@ -67,7 +115,9 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
     try {
       int idx = 0;
-      for (const auto& [fname, fval] : lastWins(doc.fields)) {  // dedup duplicate field keys, last-wins
+      // dedup duplicate field keys post-mapping, last-wins
+      for (const auto& [fname, fval] :
+           lastWins(doc.fields, [&](std::string_view name) { return fieldMap.resolve(name); })) {
         auto handler = handlers[idx];
         if (handler == nullptr || *handler != fname) {
           handlers[idx] = handler = &inverter.getIndexHandler(fname);
@@ -90,7 +140,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       auto* response = msg.getResponse();
       auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc));
+      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
       err.index = docIndex;
       err.error_message = luxir::api::build::arenaStr(msg.responseArena(), currentExceptionMessage());
 
@@ -115,7 +165,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     }
 
     if (returnIds) {
-      msg.addId(docId(doc));
+      msg.addId(docId(doc, fieldMap));
     }
   }
 
@@ -129,6 +179,8 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
 
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  validateFieldMap(*req);
+
   // Check if we have columns (not yet implemented)
   if (!req->columns.empty()) {
     std::cout << "\tindexer got columns (not yet implemented!): " << req->columns.size() << std::endl;

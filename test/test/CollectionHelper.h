@@ -171,6 +171,18 @@ public:
     UpdateBuilder& allowDups(bool v = true) { request_.allow_dups = v; return *this; }
     UpdateBuilder& allOrNone(bool v = true) { request_.all_or_none = v; return *this; }
     UpdateBuilder& returnIds(bool v = true) { request_.return_ids = v; return *this; }
+    UpdateBuilder& fieldMap(std::initializer_list<std::pair<std::string_view, std::string_view>> entries) {
+      using Pair = std::pair<std::string_view, std::string_view>;
+      Pair* a = (Pair*)mr_.allocate(sizeof(Pair) * entries.size(), alignof(Pair));
+      std::size_t i = 0;
+      for (const auto& [from, to] : entries) {
+        a[i++] = {build::arenaStr(mr_, from), build::arenaStr(mr_, to)};
+      }
+      request_.field_map = luxir::api::map_view<std::string_view, std::string_view>(
+          std::span<const Pair>(a, entries.size()));
+      return *this;
+    }
+    UpdateBuilder& dropUnmapped(bool v = true) { request_.drop_unmapped = v; return *this; }
     UpdateBuilder& collection(std::string_view name) {
       auto& t = request_.collection.emplace();
       std::string_view* a = build::allocArray(t.name, 1, mr_);

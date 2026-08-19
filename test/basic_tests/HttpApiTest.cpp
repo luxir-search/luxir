@@ -629,6 +629,106 @@ TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
       << hreq.rawResponse();
 }
 
+TEST_F(HttpApiTest, bufferedUpdateAppliesFieldMap) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"fm1","headline":"fieldmaptoken alpha"}],)"
+      R"("field_map":{"headline":"title_w"},"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "fieldmaptoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"fm1"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonUpdateControlAppliesFieldMap) {
+  // The group's field_map picks two keys out of a foreign doc shape and drops the rest.
+  std::string body =
+      R"({"_update_":{"field_map":{"doc_id":"id","headline":"title_w"},"drop_unmapped":true}})" "\n"
+      R"({"doc_id":"fs1","headline":"streamfmtoken alpha","noise":"boom"})" "\n"
+      R"({"doc_id":"fs2","headline":"streamfmtoken beta","noise":"boom"})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "streamfmtoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"fs1", "fs2"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+// The marquee shape: an existing NDJSON dump indexes as-is, mapping on the URL.
+TEST_F(HttpApiTest, ndjsonUrlFieldMapIndexesForeignFile) {
+  std::string body =
+      R"({"bookId":"uf1","headline":"urlfmtoken alpha","junk":"boom"})" "\n"
+      R"({"bookId":"uf2","headline":"urlfmtoken beta","junk":"boom"})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?field_map=bookId:id,headline:title_w&drop_unmapped=true&commit=true",
+      std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "urlfmtoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"uf1", "uf2"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+// A group that sets its own field_map owns the pair for its docs; a later implicit
+// group falls back to the URL default.
+TEST_F(HttpApiTest, urlFieldMapYieldsToGroupMap) {
+  std::string body =
+      R"({"_update_":{"field_map":{"alt_id":"id","alt_head":"title_w"},"drop_unmapped":true}})" "\n"
+      R"({"alt_id":"gm1","alt_head":"groupfmtoken alpha","bookId":"ignored"})" "\n"
+      R"({"_end_":{}})" "\n"
+      R"({"bookId":"gm2","headline":"groupfmtoken beta","junk":"boom"})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?field_map=bookId:id,headline:title_w&drop_unmapped=true",
+      std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "groupfmtoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"gm1", "gm2"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, bufferedUpdateUrlFieldMap) {
+  auto update = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?field_map=headline:title_w",
+      R"({"docs":[{"id":"bu1","headline":"buffurltoken alpha"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "buffurltoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"bu1"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, urlFieldMapRejectsMalformedEntry) {
+  auto update = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?field_map=noseparator",
+      R"({"id":"x1","title_w":"whatever"})" "\n", "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("field_map entry 'noseparator'"), std::string::npos)
+      << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonEndRejectsFieldMap) {
+  std::string body =
+      R"({"_end_":{"field_map":{"a":"b"}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("_end_ control cannot carry submit-time field 'field_map'"),
+            std::string::npos) << update.body();
+}
+
 // "found" is opt-in: it appears only when get_number is requested (an exact count
 // forgoes dynamic pruning).  A default query carries no count, and absence must be
 // omitted rather than rendered as found:0 (indistinguishable from zero matches).

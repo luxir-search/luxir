@@ -175,6 +175,12 @@ struct HttpStreamGroup {
   bool allowDups() const { return request && request->proto.allow_dups; }
   bool allOrNone() const { return request && request->proto.all_or_none; }
   bool returnIds() const { return request && request->proto.return_ids; }
+  bool dropUnmapped() const { return request && request->proto.drop_unmapped; }
+  // View into the opening _update_'s arena; batches keep it alive via requestOwner.
+  luxir::api::map_view<std::string_view, std::string_view> fieldMap() const {
+    return request ? request->proto.field_map
+                   : luxir::api::map_view<std::string_view, std::string_view>{};
+  }
 };
 
 struct HttpStreamUpdateState {
@@ -210,6 +216,10 @@ struct HttpStreamUpdateState {
   std::size_t maxInFlight;
   std::uint64_t nextSubmitOrdinal = 0;
   std::uint64_t nextFoldOrdinal = 0;
+  // Stream-level field-map default from ?field_map=/?drop_unmapped= URL params; a
+  // group that sets either knob overrides the pair for its docs.
+  std::vector<std::pair<std::string, std::string>> urlFieldMap;
+  bool urlDropUnmapped = false;
   bool urlCommit = false;
   bool emitAfterBatch = false;
   bool resetGroupAfterBatch = false;
@@ -566,6 +576,14 @@ private:
         }
         urlCommit = true;
       }
+      std::vector<std::pair<std::string, std::string>> urlFieldMap;
+      bool urlDropUnmapped = false;
+      std::string paramErr;
+      if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
+          !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
+        respondSimple(http::status::bad_request, "application/json", renderErrorBody(paramErr));
+        return;
+      }
       // Refuse before lifting the body limit: otherwise a read-only node reads an
       // unbounded NDJSON stream only to reject it.  The body is unread, so like
       // respondPayloadTooLarge() this ends the connection rather than reusing it.
@@ -576,7 +594,7 @@ private:
         return;
       }
       parser_->body_limit(boost::none);
-      startStreamingUpdate(std::move(coll), urlCommit);
+      startStreamingUpdate(std::move(coll), urlCommit, std::move(urlFieldMap), urlDropUnmapped);
       return;
     }
 
@@ -809,7 +827,15 @@ private:
         handleSearch(req.body(), coll, format);
       }
     } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
-      handleUpdate(req.body(), coll);
+      std::vector<std::pair<std::string, std::string>> urlFieldMap;
+      bool urlDropUnmapped = false;
+      std::string paramErr;
+      if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
+          !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
+        respondSimple(http::status::bad_request, "application/json", renderErrorBody(paramErr));
+        return;
+      }
+      handleUpdate(req.body(), coll, urlFieldMap, urlDropUnmapped);
     } else if (target == "/_stats" || parseStatsPath(target, coll)) {
       if (req.method() != http::verb::get) {
         respondMethodNotAllowed("GET", "method not allowed; stats are read with GET");
@@ -990,7 +1016,9 @@ private:
     engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
 
-  void handleUpdate(const std::string& body, const std::string& coll) {
+  void handleUpdate(const std::string& body, const std::string& coll,
+                    const std::vector<std::pair<std::string, std::string>>& urlFieldMap,
+                    bool urlDropUnmapped) {
     auto state = std::make_shared<HttpUpdateState>();
     try {
       std::string err;
@@ -998,6 +1026,13 @@ private:
         throw std::runtime_error(err.empty() ? "malformed update request" : err);
       }
       setCollectionTarget(state->proto.collection, coll, state->resource);
+      // Same unit rule as streaming groups: a body that sets either field-map knob
+      // owns the pair; otherwise the URL-param default applies.
+      if (state->proto.field_map.empty() && !state->proto.drop_unmapped &&
+          (!urlFieldMap.empty() || urlDropUnmapped)) {
+        copyFieldMap(state->proto, urlFieldMap, state->resource);
+        state->proto.drop_unmapped = urlDropUnmapped;
+      }
     } catch (const std::exception& e) {
       respondSimple(http::status::bad_request, "application/json",
                     renderErrorBody(e.what()));
@@ -1318,13 +1353,73 @@ private:
     }
   }
 
+  // Parses repeatable ?field_map=from:to,from2:to2 URL params into entries for
+  // UpdateRequest.field_map. The LAST ':' splits an entry, so input keys may contain
+  // ':'; an empty target ("notes:") drops the key. Input keys containing ',' need the
+  // body/control-object form.
+  static bool parseFieldMapParams(const std::vector<UrlParam>& params,
+                                  std::vector<std::pair<std::string, std::string>>& out,
+                                  std::string& err) {
+    for (const auto& p : params) {
+      if (p.key != "field_map") continue;
+      std::string_view rest = p.value;
+      while (!rest.empty()) {
+        auto comma = rest.find(',');
+        std::string_view entry = rest.substr(0, comma);
+        rest = (comma == std::string_view::npos) ? std::string_view() : rest.substr(comma + 1);
+        auto colon = entry.rfind(':');
+        if (colon == std::string_view::npos || colon == 0) {
+          err = "field_map entry '" + std::string(entry) +
+                "' is not from:to (an empty to drops the key)";
+          return false;
+        }
+        std::string_view to = entry.substr(colon + 1);
+        if (!to.empty() && !Schema::validFieldName(to)) {
+          err = "field_map target is not a valid field name: " + std::string(to);
+          return false;
+        }
+        out.emplace_back(entry.substr(0, colon), to);
+      }
+    }
+    return true;
+  }
+
+  static bool parseDropUnmappedParam(const std::vector<UrlParam>& params, bool& out,
+                                     std::string& err) {
+    if (const std::string* value = findParam(params, "drop_unmapped")) {
+      if (*value == "true") {
+        out = true;
+      } else if (*value == "false") {
+        out = false;
+      } else {
+        err = "invalid drop_unmapped value '" + *value + "' (valid: true, false)";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static void copyFieldMap(luxir::api::UpdateRequest& proto,
+                           const std::vector<std::pair<std::string, std::string>>& entries,
+                           std::pmr::memory_resource& resource) {
+    using Pair = std::pair<std::string_view, std::string_view>;
+    Pair* a = (Pair*)resource.allocate(sizeof(Pair) * entries.size(), alignof(Pair));
+    for (std::size_t i = 0; i < entries.size(); i++) {
+      a[i] = {luxir::api::build::arenaStr(resource, entries[i].first),
+              luxir::api::build::arenaStr(resource, entries[i].second)};
+    }
+    proto.field_map = luxir::api::map_view<std::string_view, std::string_view>(
+        std::span<const Pair>(a, entries.size()));
+  }
+
   static bool validateEndControlPayload(const luxir::api::Map& payload, std::string& err) {
     for (const auto& [name, val] : payload.fields) {
       unused(val);
       if (name == "request_id" || name == "commit") continue;
       if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "docs" || name == "delete_ids" ||
-          name == "columns" || name == "stream_id") {
+          name == "columns" || name == "stream_id" || name == "field_map" ||
+          name == "drop_unmapped") {
         err = "_end_ control cannot carry submit-time field '" + std::string(name) + "'";
         return false;
       }
@@ -1339,7 +1434,8 @@ private:
       unused(val);
       if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "request_id" || name == "commit" ||
-          name == "docs" || name == "delete_ids") {
+          name == "docs" || name == "delete_ids" || name == "field_map" ||
+          name == "drop_unmapped") {
         continue;
       }
       err = "unsupported _update_ control field '" + std::string(name) + "'";
@@ -1430,7 +1526,9 @@ private:
     return decodeStreamControlPayload(entry.first, *payload, recordBytes, control, err);
   }
 
-  void startStreamingUpdate(std::string coll, bool urlCommit) {
+  void startStreamingUpdate(std::string coll, bool urlCommit,
+                            std::vector<std::pair<std::string, std::string>> urlFieldMap,
+                            bool urlDropUnmapped) {
     const auto& ingest = node_.getConfig().ingest;
     std::size_t arenaConcurrency =
         (std::size_t)std::max(1, node_.getTaskArena().max_concurrency());
@@ -1446,6 +1544,8 @@ private:
     state->defaultCollectionName = std::move(coll);
     state->group.collectionName = state->defaultCollectionName;
     state->urlCommit = urlCommit;
+    state->urlFieldMap = std::move(urlFieldMap);
+    state->urlDropUnmapped = urlDropUnmapped;
     state->ioPin = makeIoPin();
 
     // http::async_read_some uses its dynamic buffer capacity to select a socket
@@ -1784,6 +1884,19 @@ private:
     state->interval.submitted = true;
   }
 
+  // The (field_map, drop_unmapped) pair travels as a unit: a group that sets either
+  // knob owns both; otherwise the stream's URL-param default applies. URL entries are
+  // copied into the batch arena so the batch proto never references stream state.
+  static void applyStreamBatchFieldMap(HttpStreamUpdateState& state, HttpStreamBatchState& batch) {
+    if (!state.group.fieldMap().empty() || state.group.dropUnmapped()) {
+      batch.proto.field_map = state.group.fieldMap();
+      batch.proto.drop_unmapped = state.group.dropUnmapped();
+    } else if (!state.urlFieldMap.empty() || state.urlDropUnmapped) {
+      copyFieldMap(batch.proto, state.urlFieldMap, batch.resource);
+      batch.proto.drop_unmapped = state.urlDropUnmapped;
+    }
+  }
+
   bool submitStreamBatch(const luxir::api::CommitParams* commitParams,
                          bool barrierSubmission = false) {
     auto state = streamUpdate_;
@@ -1795,6 +1908,7 @@ private:
     state->batch->proto.docs = state->batch->docs.finish();
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
+    applyStreamBatchFieldMap(*state, *state->batch);
     state->batch->proto.request_id =
         luxir::api::build::arenaStr(state->batch->resource, state->group.requestId);
     // Once the folded prefix reaches the retention cap, later slices can skip
@@ -1832,6 +1946,7 @@ private:
     accountStreamSubmission(*state->batch, request->proto.docs.size(), request->proto.delete_ids.size());
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
+    applyStreamBatchFieldMap(*state, *state->batch);
     state->batch->proto.return_ids =
         state->group.returnIds() && state->interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds;
     if (!state->batch->proto.collection) {

@@ -555,9 +555,12 @@ struct UpdateRequest {                                         // needs Target,C
   map_view<std::string_view, Column> columns;
   std::span<const std::string_view> delete_ids;
   std::optional<CommitParams> commit;
+  // Input doc key -> schema field for this request's docs ("" target = drop the key).
+  map_view<std::string_view, std::string_view> field_map;
   bool allow_dups = false;
   bool all_or_none = false;
   bool return_ids = false;
+  bool drop_unmapped = false;
 };
 
 // ===================== trivial-destructibility checks =====================

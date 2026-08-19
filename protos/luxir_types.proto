@@ -699,6 +699,19 @@ message UpdateRequest {
 
   // Commit parameters.  If present, this request will commit; if absent, no commit is performed.
   CommitParams commit = 10;
+
+  // Renames input document keys onto schema fields for this request's docs, applied
+  // before schema lookup: a doc key found in the map indexes under the mapped name.
+  // An entry mapping to "" drops that input key.  After mapping, a name appearing
+  // more than once in a doc keeps the last occurrence (the same last-wins rule as
+  // duplicate keys).  Keys not in the map index under their own name unless
+  // drop_unmapped is set.  This reshapes a foreign document stream per request,
+  // without editing the input or the schema.
+  map<string, string> field_map = 11;
+
+  // If true, doc keys not present in field_map are dropped instead of indexed.
+  // Requires a non-empty field_map (note "id" is dropped too unless mapped).
+  bool drop_unmapped = 12;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one

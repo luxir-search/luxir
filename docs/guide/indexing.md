@@ -52,10 +52,57 @@ The request fields are:
 | `all_or_none` | Roll back the whole request if one document fails. Default `false`. |
 | `return_ids` | Include successfully indexed IDs in request order. |
 | `commit` | Make changes visible, with optional commit controls. |
+| `field_map` | Rename input document keys onto schema fields for this request. |
+| `drop_unmapped` | Drop doc keys not present in `field_map` instead of indexing them. |
 
 The protobuf request contains a reserved `columns` member, but the current
 update handler does not consume it. Send row maps through `docs`; do not
 populate `columns`. See [gRPC API](grpc.md).
+
+## Field mapping
+
+`field_map` reshapes a foreign document stream at ingest, so an existing NDJSON
+dump indexes as-is: no editing the file, no schema change. Point Luxir at the
+file and put the mapping on the URL:
+
+```bash
+curl -X POST 'http://localhost:9400/collections/books/_update?field_map=bookId:id,headline:title_w&drop_unmapped=true&commit=true' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @books.ndjson
+```
+
+Each `from:to` entry indexes input key `from` under schema field `to`. The last
+`:` in an entry splits it, so input keys may contain colons; an empty target
+(`internal_notes:`) drops that key. The parameter repeats
+(`?field_map=a:b&field_map=c:d`) if one value gets long; input keys containing
+commas need the body form below. `drop_unmapped=true` drops every key not in
+the map, so only the mapped keys index -- note that includes `id`, so map your
+id key explicitly (`id:id` if the input already uses that name).
+
+Keys not in the map index under their own name by default. After mapping, a
+name appearing more than once in a document keeps the last occurrence, the same
+last-wins rule as a duplicated key. Mapping applies to top-level keys of each
+document; it does not flatten nested objects.
+
+The same two knobs are fields of the update request itself (and of a streaming
+`_update_` control object, where they apply to that group's documents):
+
+```http
+POST /collections/books/_update
+Content-Type: application/json
+
+{
+  "docs": [{"bookId": "b1", "headline": "dune"}],
+  "field_map": {"bookId": "id", "headline": "title_w"},
+  "drop_unmapped": true,
+  "commit": {}
+}
+```
+
+A request or group that sets either knob owns both, and the URL default is
+ignored for it; otherwise the URL values apply. The mapping is a property of
+the load, not the collection: the same dump can be re-shaped differently per
+request.
 
 ## IDs, overwrites, and deletes
 
@@ -153,8 +200,8 @@ Three record forms make up the stream grammar:
 
 - A normal JSON object is a document.
 - `{"_update_": {...}}` opens a group and supplies normal update options such
-  as `request_id`, `allow_dups`, `all_or_none`, `return_ids`, or a collection
-  override.
+  as `request_id`, `allow_dups`, `all_or_none`, `return_ids`, `field_map`,
+  `drop_unmapped`, or a collection override.
 - `{"_end_": {...}}` closes the group and may commit. An empty object is a
   checkpoint that closes and reports the current group without ending the
   HTTP stream.

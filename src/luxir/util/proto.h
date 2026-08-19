@@ -3,6 +3,7 @@
 #include <iterator>
 #include <memory_resource>
 #include <new>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -97,18 +98,28 @@ T* arenaCreate(google::protobuf::Arena& arena, Args&&... args) {
 // pointers alias the input map's values (same backing storage), so the map/bytes must
 // outlive the result. Use wherever protobuf-map dedup semantics matter (request field
 // maps, op maps, etc.).
-template <class MapView>
-auto lastWins(const MapView& m) {
+//
+// keyFn rewrites each key to the key the entry is deduplicated and emitted under, or
+// returns nullopt to drop the entry entirely - so entries whose REWRITTEN keys collide
+// also collapse last-wins (doc field maps under UpdateRequest.field_map).
+template <class MapView, class KeyFn>
+auto lastWins(const MapView& m, KeyFn&& keyFn) {
   using ValPtr = decltype(&std::begin(m)->second);  // const V*
   std::vector<std::pair<std::string_view, ValPtr>> out;
   std::unordered_map<std::string_view, size_t> pos;
   for (const auto& kv : m) {
-    std::string_view key{kv.first};
-    auto [it, inserted] = pos.try_emplace(key, out.size());
-    if (inserted) out.emplace_back(key, &kv.second);
+    std::optional<std::string_view> key = keyFn(std::string_view{kv.first});
+    if (!key) continue;
+    auto [it, inserted] = pos.try_emplace(*key, out.size());
+    if (inserted) out.emplace_back(*key, &kv.second);
     else out[it->second].second = &kv.second;  // later value wins, position preserved
   }
   return out;
+}
+
+template <class MapView>
+auto lastWins(const MapView& m) {
+  return lastWins(m, [](std::string_view key) { return std::optional<std::string_view>(key); });
 }
 
 
