@@ -788,6 +788,18 @@ private:
     std::string coll;
     if (req.method() == http::verb::get && target == "/health") {
       respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
+    } else if (target == "/collections/_list" || target == "/collections") {
+      // GET /collections is a synonym for the canonical _list spelling, which
+      // also accepts POST (matching the other _-verb endpoints; any body is
+      // ignored - the request has no parameters).
+      bool allowPost = target == "/collections/_list";
+      if (req.method() != http::verb::get &&
+          !(allowPost && req.method() == http::verb::post)) {
+        respondMethodNotAllowed(allowPost ? "GET, POST" : "GET",
+                                "method not allowed; collections are listed with GET");
+        return;
+      }
+      handleCollectionList();
     } else if (target == "/collections/_create") {
       if (req.method() != http::verb::post && req.method() != http::verb::put) {
         respondMethodNotAllowed("POST, PUT", "method not allowed; collections are created with POST or PUT");
@@ -1080,6 +1092,31 @@ private:
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
+  }
+
+  // Names only - /_stats carries the detail.  Pretty-printed like the other
+  // for-humans admin reads.  A pure in-memory snapshot, so it runs inline on
+  // the io thread.
+  void handleCollectionList() {
+    http::status status = http::status::ok;
+    std::string out;
+    try {
+      auto entries = node_.collectionEntries();
+      std::vector<std::string_view> names(entries.size());
+      for (std::size_t i = 0; i < entries.size(); i++) names[i] = entries[i].name;
+      luxir::api::ListCollectionsResponse response;
+      response.collections = names;
+      std::string compact;
+      if (!luxir::api::write_json(response, compact)) {
+        throw std::runtime_error("failed to serialize list collections response");
+      }
+      glz::prettify_json(compact, out);
+      out += '\n';
+    } catch (const std::exception& e) {
+      status = http::status::internal_server_error;
+      out = renderErrorBody(e.what());
+    }
+    respondSimple(status, "application/json", std::move(out));
   }
 
   void handleCollectionCreate(const std::string& body) {

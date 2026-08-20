@@ -99,6 +99,7 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
   // Reads stay available, and the update to a collection that does not exist is
   // refused as read-only rather than auto-creating it.
   EXPECT_EQ(200, httpRequest(port, http::verb::get, "/_stats").result_int());
+  EXPECT_EQ(200, httpRequest(port, http::verb::get, "/collections").result_int());
   EXPECT_EQ(200, httpRequest(port, http::verb::get, "/collections/main/_schema").result_int());
   expectRefused("update of absent collection", http::verb::post, "/collections/absent/_update",
                 R"({"docs":[{"id":"r4"}],"commit":{}})");

@@ -13,6 +13,7 @@ uses the same vocabulary as protobuf.
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
+| `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`. |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node totals and per-collection operational statistics. |

@@ -105,6 +105,50 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
   server.shutdown();
 }
 
+TEST_F(CollectionAdminApiTest, listCollections) {
+  LuxirNode node;
+  HttpServer server(node, 2, 0);
+  server.start();
+  int port = server.getPort();
+
+  ASSERT_EQ(200, httpRequest(port, http::verb::post, "/collections/_create",
+                             R"({"name":"list_b"})").result_int());
+  ASSERT_EQ(200, httpRequest(port, http::verb::post, "/collections/_create",
+                             R"({"name":"list_a"})").result_int());
+
+  // GET and POST /collections/_list and the GET /collections synonym agree.
+  auto canonical = httpRequest(port, http::verb::get, "/collections/_list");
+  ASSERT_EQ(200, canonical.result_int()) << canonical.body();
+  auto posted = httpRequest(port, http::verb::post, "/collections/_list");
+  ASSERT_EQ(200, posted.result_int()) << posted.body();
+  EXPECT_EQ(canonical.body(), posted.body());
+  auto synonym = httpRequest(port, http::verb::get, "/collections");
+  ASSERT_EQ(200, synonym.result_int()) << synonym.body();
+  EXPECT_EQ(canonical.body(), synonym.body());
+
+  // Names are sorted; the startup default "main" is included.
+  const std::string& body = canonical.body();
+  auto a = body.find("\"list_a\"");
+  auto b = body.find("\"list_b\"");
+  auto m = body.find("\"main\"");
+  ASSERT_NE(a, std::string::npos) << body;
+  ASSERT_NE(b, std::string::npos) << body;
+  ASSERT_NE(m, std::string::npos) << body;
+  EXPECT_TRUE(a < b && b < m) << body;
+
+  ASSERT_EQ(200, httpRequest(port, http::verb::post, "/collections/_delete",
+                             R"({"name":"list_b"})").result_int());
+  auto after = httpRequest(port, http::verb::get, "/collections");
+  EXPECT_EQ(after.body().find("\"list_b\""), std::string::npos) << after.body();
+  EXPECT_NE(after.body().find("\"list_a\""), std::string::npos) << after.body();
+
+  // POST is only accepted on the explicit _list spelling.
+  EXPECT_EQ(405, httpRequest(port, http::verb::post, "/collections").result_int());
+  EXPECT_EQ(405, httpRequest(port, http::verb::delete_, "/collections/_list").result_int());
+
+  server.shutdown();
+}
+
 TEST_F(CollectionAdminApiTest, createWithSchemaPublishesConfiguredCollection) {
   LuxirNode node;
   HttpServer server(node, 2, 0);

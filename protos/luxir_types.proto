@@ -1015,6 +1015,11 @@ message DeleteCollectionResponse {
   string name = 1;
 }
 
+// Names of every collection on the node, sorted.
+message ListCollectionsResponse {
+  repeated string collections = 1;
+}
+
 // Operational statistics. An absent collection target requests every
 // collection on the node; per-segment records are opt-in because they are the
 // only unbounded part of the response.

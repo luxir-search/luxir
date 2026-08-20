@@ -76,7 +76,7 @@ struct ColFloat; struct ColDouble; struct ColMap; struct IndexInfo; struct AuxIn
 struct SegmentInfo; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
-struct DeleteCollectionRequest; struct DeleteCollectionResponse;
+struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct FilterCacheStats; struct IndexRamStats;
@@ -334,6 +334,7 @@ struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef>
 struct CreateCollectionResponse { std::string_view name; };
 struct DeleteCollectionRequest { std::string_view name; };
 struct DeleteCollectionResponse { std::string_view name; };
+struct ListCollectionsResponse { std::span<const std::string_view> collections; };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ColMap { std::span<const Map> v; };                       // span<incomplete Map> OK
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
@@ -583,7 +584,7 @@ LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap) LUXIR_TD(IndexInfo) LUXI
 LUXIR_TD(SegmentInfo) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::Error)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
-LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse)
+LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
@@ -619,6 +620,7 @@ LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
+LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(FilterCacheStats)

@@ -92,7 +92,9 @@ Restart the read-only node to pick up newer commits and release pinned files.
 Create and delete collections with `POST /collections/_create` and
 `POST /collections/_delete` (or unary `luxir.Admin/CreateCollection` /
 `DeleteCollection`). Deleting a collection also deletes its stored data; there
-is no undo.
+is no undo. `GET /collections` (canonically `/collections/_list`) returns the
+sorted collection names, including any that failed to load; `/_stats` has the
+per-collection detail.
 
 Deletion is synchronous and wins over concurrent use. When the call returns,
 the name resolves to nothing, the on-disk data is gone, and the name can be
