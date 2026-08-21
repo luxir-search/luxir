@@ -240,6 +240,20 @@ it and resume after the buffer drains below half. Increase it only when more
 per-connection buffering is a measured win; total memory scales with the number
 of simultaneously slow streams.
 
+## Memory budgets
+
+`--max-ram-mb` is the node-wide budget (MiB) for memory Luxir manages
+explicitly. It defaults to 25% of system RAM - or of the cgroup memory limit
+when the process runs under one, so a container is sized by what the kernel
+actually enforces rather than by the host's RAM. Subsystem budgets are derived
+from it, so raising or lowering this one value moves them together. `0` leaves
+the node unlimited. The resolved values are logged at startup.
+
+```bash
+luxir --max-ram-mb=16384          # node budget; indexing gets 8192
+luxir --indexing.max-ram-mb=4096  # override just the indexing share
+```
+
 ## Indexing memory and request limits
 
 ```bash
@@ -254,8 +268,9 @@ luxir \
   to 3814 MiB (with a startup warning): an inverter's memory pool can address at
   most 4 GiB, and the clamp leaves headroom for one update batch's overshoot.
 - `indexing.max-ram-mb` is the shared node-wide MiB budget used for merge
-  admission and for flushing idle inverters under memory pressure; `0` leaves
-  it unlimited.
+  admission and for flushing idle inverters under memory pressure. It defaults
+  to half of `--max-ram-mb`, and to none at all on a `--read-only` node, which
+  never indexes. `0` leaves it unlimited.
 
 The HTTP request limits distinguish bounded material from streams:
 

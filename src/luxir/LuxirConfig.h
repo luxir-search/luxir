@@ -57,7 +57,11 @@ struct IndexConfig {
   // IndexWriter::perInverterRamBytes / perInverterMaxDocs.
   int64_t max_inverter_ram_mb = 64;              // RAM cap (MiB)
   int64_t max_inverter_docs = 8 * 1024 * 1024;   // doc-count cap
-  int64_t max_index_ram_mb = 0;                  // shared indexing RAM cap (MiB), 0 = unlimited
+  // Shared indexing RAM cap (MiB) for merge admission and inverter flushing.
+  // -1 = auto: half of the node-wide max_ram_mb, or 0 on a read-only node (it
+  // never indexes, so it carves out no indexing share).  0 = unlimited.
+  // Resolved by LuxirConfig::resolveRamBudgets().
+  int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
 };
@@ -119,6 +123,13 @@ struct LuxirConfig {
   // writer are not picked up until restart.
   bool read_only = false;
 
+  // Node-wide RAM budget (MiB): what this process may use for the memory it
+  // manages explicitly - indexing structures today, caches as they are folded
+  // in.  -1 = auto (25% of system RAM, or of the cgroup limit under a
+  // container); 0 = unlimited.  Subsystem budgets left at their own auto
+  // sentinel take a share of this.  Resolved by resolveRamBudgets().
+  int64_t max_ram_mb = -1;
+
   std::string log_level = "info";
   size_t filterCacheBytes = 64ULL * 1024 * 1024;
   ServerConfig server;
@@ -130,11 +141,22 @@ struct LuxirConfig {
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);
 
+  /// Resolve the auto (-1) RAM sentinels: max_ram_mb to a share of system RAM,
+  /// index.max_ram_mb to a share of that.  Idempotent, and called both by
+  /// normalize() and by LuxirNode, so a config built in code (tests, embedding)
+  /// gets the same budgets as one parsed from the command line.
+  void resolveRamBudgets();
+
   /// Normalize and validate config after parsing.
   void normalize();
 
   /// Apply non-node settings (e.g. spdlog level). Call after parse.
   void apply() const;
 };
+
+/// RAM this process should consider available, in bytes: total system RAM,
+/// capped by the cgroup memory limit when running under one.  0 when it cannot
+/// be determined.
+int64_t systemRamBytes();
 
 } // namespace luxir

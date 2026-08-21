@@ -201,6 +201,38 @@ TEST_F(IndexWriterTest, inverterRamCapClampedToPoolAddressability) {
 }
 
 
+// The node-wide RAM budget derives from system RAM, and the indexing cap from
+// the node budget, unless either is set explicitly.
+TEST_F(IndexWriterTest, ramBudgetsDeriveFromNodeBudget) {
+  ASSERT_GT(systemRamBytes(), 0);
+  LuxirConfig autoConfig;
+  autoConfig.normalize();
+  EXPECT_EQ(autoConfig.max_ram_mb, systemRamBytes() / (1024 * 1024) / 4);
+  EXPECT_EQ(autoConfig.index.max_ram_mb, autoConfig.max_ram_mb / 2);
+
+  auto parsed = [](const std::string& args) {
+    LuxirConfig config;
+    CLI::App app;
+    config.addOptions(app);
+    app.parse(args);
+    config.normalize();
+    return config;
+  };
+
+  // The node budget flows to the indexing share; an explicit share overrides it.
+  EXPECT_EQ(parsed("--max-ram-mb 16384").index.max_ram_mb, 8192);
+  EXPECT_EQ(parsed("--max-ram-mb 16384 --indexing.max-ram-mb 1024").index.max_ram_mb, 1024);
+  // 0 is unlimited, and an unlimited node budget leaves indexing unlimited too.
+  EXPECT_EQ(parsed("--max-ram-mb 0").index.max_ram_mb, 0);
+  // A read-only node never indexes, so it carves out no indexing share.
+  EXPECT_EQ(parsed("--read-only --store.backend fs --max-ram-mb 16384").index.max_ram_mb, 0);
+
+  // A node built from a config that never saw normalize() still gets budgets.
+  LuxirNode node{LuxirConfig{}};
+  EXPECT_EQ(node.getIndexRamBudget().totalBytes(), autoConfig.index.max_ram_mb * 1024 * 1024);
+}
+
+
 TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   auto dir = std::make_unique<RAMDir>();
   {

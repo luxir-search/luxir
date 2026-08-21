@@ -40,6 +40,9 @@ int luxir_main(int argc, char** argv) {
              config.store.data_dir);
   }
 
+  LOG_INFO("RAM budget: max-ram-mb={} indexing.max-ram-mb={} (system RAM {} MiB; 0 = unlimited)",
+           config.max_ram_mb, config.index.max_ram_mb, systemRamBytes() / (1024 * 1024));
+
   LOG_INFO("Logging: compile-time={}, runtime={}",
            spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
            spdlog::level::to_string_view(spdlog::get_level()));

@@ -1,8 +1,40 @@
 #include "LuxirConfig.h"
+#include <unistd.h>
+#include <fstream>
 #include <limits>
 #include "spdlog/spdlog.h"
 
 namespace luxir {
+
+namespace {
+
+// Single integer from a one-line file; 0 if it is missing or not a number
+// (cgroup v2 spells "no limit" as the word "max").
+int64_t readInt64File(const char* path) {
+  std::ifstream in(path);
+  int64_t value = 0;
+  if (in >> value && value > 0) return value;
+  return 0;
+}
+
+}  // namespace
+
+int64_t systemRamBytes() {
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long pageSize = sysconf(_SC_PAGESIZE);
+  if (pages <= 0 || pageSize <= 0) return 0;
+  int64_t bytes = (int64_t)pages * (int64_t)pageSize;
+
+  // Under a container the cgroup limit is what the kernel actually enforces, so
+  // sizing off the host's physical RAM would overcommit by a wide margin.  Both
+  // "no limit" spellings (v2 "max", v1's huge sentinel) fail the < bytes test.
+  for (const char* path : {"/sys/fs/cgroup/memory.max",                      // v2
+                           "/sys/fs/cgroup/memory/memory.limit_in_bytes"}) {  // v1
+    int64_t limit = readInt64File(path);
+    if (limit > 0 && limit < bytes) bytes = limit;
+  }
+  return bytes;
+}
 
 /*
 Rough hierarchy:
@@ -26,6 +58,13 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-shard filter cache payload budget (0 disables it)")
       ->transform(CLI::AsSizeValue(false))
       ->default_str("64MB");
+  // No default_val: the -1 sentinel in the bound field is what tells
+  // resolveRamBudgets() the user did not set one.
+  app.add_option("--max-ram-mb", max_ram_mb,
+                 "Node-wide RAM budget (MiB) that subsystem budgets are derived from "
+                 "(0 = unlimited)")
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("25% of system RAM");
 
   // No default_val: leaving the bound field at its sentinel (<0) lets normalize()
   // derive the gRPC port as http.port + 1 unless the user sets one explicitly.
@@ -66,10 +105,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.merge_factor)
       ->check(CLI::PositiveNumber)
       ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));
-  app.add_option("--indexing.max-ram-mb", index.max_index_ram_mb,
+  app.add_option("--indexing.max-ram-mb", index.max_ram_mb,
                  "Shared indexing RAM cap for merge admission and inverter flushing (MiB, 0 = unlimited)")
-      ->default_val(index.max_index_ram_mb)
-      ->check(CLI::NonNegativeNumber);
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("50% of --max-ram-mb");
   app.add_option("--indexing.pressure-flush-floor-mb", index.pressure_flush_floor_mb,
                  "Min idle-inverter size (MiB) to flush when over the shared indexing RAM cap")
       ->default_val(index.pressure_flush_floor_mb)
@@ -104,7 +143,40 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->check(CLI::PositiveNumber);
 }
 
+void LuxirConfig::resolveRamBudgets() {
+  if (max_ram_mb < 0) {
+    int64_t systemMb = systemRamBytes() / (1024 * 1024);
+    // A quarter leaves room for the OS page cache (mapped segments are read
+    // through it), the allocator's own overhead, and everything not yet on a
+    // budget.  Unknown system RAM falls back to unlimited rather than to a
+    // guess that could be far too small on a big machine.
+    max_ram_mb = systemMb / 4;
+  }
+
+  if (index.max_ram_mb < 0) {
+    // Half the node budget: indexing is one of two big consumers, the other
+    // being the search-side caches and reader structures.  A read-only node
+    // never indexes, so it carves out nothing (0 is also "unlimited" for the
+    // budget object, which is moot when nothing ever reserves against it).
+    index.max_ram_mb = read_only ? 0 : max_ram_mb / 2;
+  }
+}
+
 void LuxirConfig::normalize() {
+  resolveRamBudgets();
+
+  // Only an explicitly set share can exceed the node budget; a derived one is
+  // half of it.  Warned here rather than in resolveRamBudgets(), which runs
+  // again per node and must stay quiet on repeat.
+  if (max_ram_mb > 0 && index.max_ram_mb > max_ram_mb) {
+    spdlog::warn("indexing.max-ram-mb={} exceeds the node budget max-ram-mb={}",
+                 index.max_ram_mb, max_ram_mb);
+  }
+  if (index.max_ram_mb > 0 && index.max_ram_mb < index.max_inverter_ram_mb) {
+    spdlog::warn("indexing.max-ram-mb={} is below indexing.max-inverter-ram-mb={}: one inverter "
+                 "can fill the whole shared budget", index.max_ram_mb, index.max_inverter_ram_mb);
+  }
+
   // Default the gRPC port to one past the HTTP port unless it was set explicitly.
   if (server.grpc.port < 0) server.grpc.port = server.http.port + 1;
 

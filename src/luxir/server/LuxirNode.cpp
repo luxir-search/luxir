@@ -175,8 +175,12 @@ bool Collection::loadSchema() {
 
 
 LuxirNode::LuxirNode(LuxirConfig config)
-  : config(std::move(config)),
-    indexRamBudget(this->config.index.max_index_ram_mb * 1024 * 1024) {
+  : config(std::move(config)) {
+  // A config assembled in code (tests, embedding) has not been through
+  // normalize(), so resolve the RAM sentinels here too - before the writers
+  // created by createSingletons() take a pointer to the budget.
+  this->config.resolveRamBudgets();
+  indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
