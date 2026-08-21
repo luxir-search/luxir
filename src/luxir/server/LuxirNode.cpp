@@ -420,7 +420,6 @@ std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name) {
     [colPtr]() { return colPtr->getSchema(); }, &indexRamBudget,
     FilterCacheConfig{.maxBytes = config.filterCacheBytes}, config.index.merge_factor);
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
-  col->shard->iw->perInverterMaxDocs = (size_t)config.index.max_inverter_docs;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
 
   // Load the latest persisted schema if one exists.

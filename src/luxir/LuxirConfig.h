@@ -56,17 +56,16 @@ struct IndexConfig {
   // batch that trips the check (it is evaluated once per batch, not per doc).
   static constexpr int64_t MAX_INVERTER_RAM_CAP_MB = 4000000000LL / (1024 * 1024);
 
-  // Per-inverter auto-flush caps, checked once at the end of each update batch:
-  // an inverter past either cap is flushed to a segment and the next batch gets
-  // a fresh one.  See IndexWriter::perInverterRamBytes / perInverterMaxDocs.
+  // Per-inverter auto-flush cap, checked once at the end of each update batch:
+  // an inverter past it is flushed to a segment and the next batch gets a fresh
+  // one.  See IndexWriter::perInverterRamBytes.
   //
-  // The RAM cap is a backstop, not a budget of its own: bounding total indexing
-  // RAM is the shared max_ram_mb's job (inverters reserve against it and idle
-  // ones are shed under pressure), so -1 = auto just keeps one inverter from
-  // outgrowing that shared cap - or from outgrowing pool addressability, which
-  // is what it resolves to when the shared cap is unlimited.
+  // It is a backstop, not a budget of its own: bounding total indexing RAM is
+  // the shared max_ram_mb's job (inverters reserve against it and idle ones are
+  // shed under pressure), so -1 = auto just keeps one inverter from outgrowing
+  // that shared cap - or from outgrowing pool addressability, which is what it
+  // resolves to when the shared cap is unlimited.
   int64_t max_inverter_ram_mb = -1;              // RAM cap (MiB), -1 = auto
-  int64_t max_inverter_docs = 8 * 1024 * 1024;   // doc-count cap
   // Shared indexing RAM cap (MiB) for merge admission and inverter flushing.
   // -1 = auto: half of the node-wide max_ram_mb, or 0 on a read-only node (it
   // never indexes, so it carves out no indexing share).  0 = unlimited.

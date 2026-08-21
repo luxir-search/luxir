@@ -25,12 +25,20 @@ public:
   // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
-  // Hard cap on a segment's maxDoc, enforced at merge admission (flush cannot
-  // approach it - RAM bounds an in-RAM segment orders of magnitude lower).
-  // Capping a full bit below END makes doc-id arithmetic structurally safe:
-  // doc + c cannot overflow int32 for any c <= 1 << 30, and can never collide
-  // with END, so window/block cursor math needs no per-site overflow audits.
+  // Soft cap on a segment's maxDoc: merge admission gates on it and an inverter
+  // flushes at it (IndexWriter::perInverterMaxDocs), though the batch that trips
+  // that check may carry a flushed segment a little past it.  Capping a full bit
+  // below END makes doc-id arithmetic structurally safe: doc + c cannot overflow
+  // int32 for any c <= 1 << 30, and can never collide with END, so window/block
+  // cursor math needs no per-site overflow audits.
   static constexpr int32_t MAX_SEGMENT_DOCS = (1 << 30) - 1;
+
+  // Where doc ids actually stop being safe, far above the soft cap: real cursor
+  // offsets are window/block sized (DocsEnumMeta::L1_DOCS = 4096 is the largest),
+  // so a doc id below this can neither overflow int32 nor reach END.  Asserts
+  // check this rather than MAX_SEGMENT_DOCS, so they trip on a runaway doc id and
+  // stay quiet on a legal overshoot of the soft cap.
+  static constexpr int32_t HARD_MAX_DOC = END - (1 << 20);
 
   // Static factory method to create PostingsReader with optional handling of missing files.
   // Returns nullptr if missingFileOK=true and any required files are missing.

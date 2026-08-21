@@ -98,10 +98,6 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->check(CLI::PositiveNumber)
       ->default_str("--indexing.max-ram-mb, capped at " +
                     std::to_string(IndexConfig::MAX_INVERTER_RAM_CAP_MB));
-  app.add_option("--indexing.max-inverter-docs", index.max_inverter_docs,
-                 "Per-inverter doc-count cap before an auto-flush to a segment")
-      ->default_val(index.max_inverter_docs)
-      ->check(CLI::PositiveNumber);
   app.add_option("--indexing.merge-factor", index.merge_factor,
                  "Same-level segments required to trigger a merge")
       ->default_val(index.merge_factor)

@@ -471,11 +471,16 @@ public:
   // segment on release and the next batch obtains a fresh one.  Total indexing
   // RAM is bounded by indexRamBudget, not by these; the RAM cap only keeps a
   // single inverter from outgrowing that budget or the pool's addressability,
-  // and the doc cap is a backstop for the structures that scale with doc count
-  // (docmap/norms).  Both are set from LuxirConfig at collection creation; the
-  // defaults here apply to a directly constructed writer.
+  // and is set from LuxirConfig at collection creation (the default here applies
+  // to a directly constructed writer).
+  //
+  // The doc cap has no config knob: it is the same soft MAX_SEGMENT_DOCS limit
+  // merges are admitted against, which sits a full bit below INT32_MAX so doc-id
+  // arithmetic needs no per-site overflow checks - and that slack also absorbs
+  // the overshoot of the batch that trips the check.  RAM stops a real inverter
+  // orders of magnitude sooner; tests lower it to flush at exact doc boundaries.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
-  size_t perInverterMaxDocs = 8 * 1024 * 1024;
+  size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
 
   // Minimum memSize() for an idle inverter to be flushed under global RAM budget
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
