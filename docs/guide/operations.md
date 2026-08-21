@@ -258,19 +258,27 @@ luxir --indexing.max-ram-mb=4096  # override just the indexing share
 
 ```bash
 luxir \
-  --indexing.max-inverter-ram-mb=64 \
-  --indexing.max-inverter-docs=8388608 \
-  --indexing.max-ram-mb=8192
+  --indexing.max-ram-mb=8192 \
+  --indexing.max-inverter-ram-mb=2048 \
+  --indexing.max-inverter-docs=8388608
 ```
 
-- `indexing.max-inverter-ram-mb` and `indexing.max-inverter-docs` trigger automatic
-  segment flushes that bound active indexing structures. The RAM cap is clamped
-  to 3814 MiB (with a startup warning): an inverter's memory pool can address at
-  most 4 GiB, and the clamp leaves headroom for one update batch's overshoot.
-- `indexing.max-ram-mb` is the shared node-wide MiB budget used for merge
-  admission and for flushing idle inverters under memory pressure. It defaults
-  to half of `--max-ram-mb`, and to none at all on a `--read-only` node, which
-  never indexes. `0` leaves it unlimited.
+- `indexing.max-ram-mb` is the shared MiB budget for all of a node's indexing
+  work: merges reserve against it before they start, and inverters count their
+  RAM against it, so a release that finds the budget over its cap flushes the
+  largest idle inverter. It defaults to half of `--max-ram-mb`, and to none at
+  all on a `--read-only` node, which never indexes. `0` leaves it unlimited.
+- `indexing.max-inverter-ram-mb` and `indexing.max-inverter-docs` flush one
+  inverter to a segment when it grows past either, checked at the end of an
+  update batch. Total indexing RAM is `indexing.max-ram-mb`'s job, so the RAM
+  cap defaults to that shared cap: one inverter may hold the whole indexing
+  budget (with a single stream there is nothing else holding it) but no more.
+  It is clamped to 3814 MiB - an inverter's memory pool can address at most
+  4 GiB, and the clamp leaves headroom for one batch's overshoot - so an
+  explicit larger value is clamped with a startup warning.
+- Lower `indexing.max-inverter-ram-mb` to trade merge work for flush latency and
+  peak RSS: smaller flushes land sooner and cost less at once, at the price of
+  more segments to merge.
 
 The HTTP request limits distinguish bounded material from streams:
 

@@ -466,11 +466,14 @@ public:
   ~IndexWriter();
   void close();
 
-  // Per-inverter auto-flush caps (Phase 1). When a non-atomic update indexes past
-  // either cap, the current inverter is flushed to a segment mid-request and a fresh
-  // one obtained, bounding the RAM an unbounded (e.g. non-stop-stream) update holds.
-  // Defaults: 64 MiB RAM; a large doc backstop (docmap/norms scale with doc count).
-  // Set from LuxirConfig at collection creation.
+  // Per-inverter auto-flush caps, evaluated once at the end of each update batch
+  // (ProtoUpdateMessage::handle): an inverter past either cap is flushed to a
+  // segment on release and the next batch obtains a fresh one.  Total indexing
+  // RAM is bounded by indexRamBudget, not by these; the RAM cap only keeps a
+  // single inverter from outgrowing that budget or the pool's addressability,
+  // and the doc cap is a backstop for the structures that scale with doc count
+  // (docmap/norms).  Both are set from LuxirConfig at collection creation; the
+  // defaults here apply to a directly constructed writer.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = 8 * 1024 * 1024;
 

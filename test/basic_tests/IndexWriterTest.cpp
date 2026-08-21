@@ -190,14 +190,10 @@ TEST_F(IndexWriterTest, inverterRamCapClampedToPoolAddressability) {
   config.addOptions(app);
   app.parse("--indexing.max-inverter-ram-mb 8192");
   config.normalize();
-  EXPECT_EQ(config.index.max_inverter_ram_mb, 4000000000LL / (1024 * 1024));
+  EXPECT_EQ(config.index.max_inverter_ram_mb, IndexConfig::MAX_INVERTER_RAM_CAP_MB);
   // Clamped cap plus a full 256 KiB-block overshoot still fits addressability.
   EXPECT_LE((uint64_t)config.index.max_inverter_ram_mb * 1024 * 1024,
             (uint64_t)MemPool::MAX_BUFFERS * MemPool::BYTE_BLOCK_SIZE - 256 * 1024 * 1024);
-
-  LuxirConfig defaultConfig;
-  defaultConfig.normalize();
-  EXPECT_EQ(defaultConfig.index.max_inverter_ram_mb, LuxirConfig{}.index.max_inverter_ram_mb);
 }
 
 
@@ -226,6 +222,15 @@ TEST_F(IndexWriterTest, ramBudgetsDeriveFromNodeBudget) {
   EXPECT_EQ(parsed("--max-ram-mb 0").index.max_ram_mb, 0);
   // A read-only node never indexes, so it carves out no indexing share.
   EXPECT_EQ(parsed("--read-only --store.backend fs --max-ram-mb 16384").index.max_ram_mb, 0);
+
+  // One inverter may hold the whole indexing budget, but never more than the
+  // pool can address - which is all an unlimited budget leaves to bound it.
+  EXPECT_EQ(parsed("--max-ram-mb 4096").index.max_inverter_ram_mb, 2048);
+  EXPECT_EQ(parsed("--max-ram-mb 0").index.max_inverter_ram_mb,
+            IndexConfig::MAX_INVERTER_RAM_CAP_MB);
+  EXPECT_EQ(parsed("--max-ram-mb 65536").index.max_inverter_ram_mb,
+            IndexConfig::MAX_INVERTER_RAM_CAP_MB);
+  EXPECT_EQ(parsed("--max-ram-mb 4096 --indexing.max-inverter-ram-mb 64").index.max_inverter_ram_mb, 64);
 
   // A node built from a config that never saw normalize() still gets budgets.
   LuxirNode node{LuxirConfig{}};

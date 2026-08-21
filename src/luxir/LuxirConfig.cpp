@@ -1,5 +1,6 @@
 #include "LuxirConfig.h"
 #include <unistd.h>
+#include <algorithm>
 #include <fstream>
 #include <limits>
 #include "spdlog/spdlog.h"
@@ -94,8 +95,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
 
   app.add_option("--indexing.max-inverter-ram-mb", index.max_inverter_ram_mb,
                  "Per-inverter RAM cap (MiB) before an auto-flush to a segment")
-      ->default_val(index.max_inverter_ram_mb)
-      ->check(CLI::PositiveNumber);
+      ->check(CLI::PositiveNumber)
+      ->default_str("--indexing.max-ram-mb, capped at " +
+                    std::to_string(IndexConfig::MAX_INVERTER_RAM_CAP_MB));
   app.add_option("--indexing.max-inverter-docs", index.max_inverter_docs,
                  "Per-inverter doc-count cap before an auto-flush to a segment")
       ->default_val(index.max_inverter_docs)
@@ -160,6 +162,15 @@ void LuxirConfig::resolveRamBudgets() {
     // budget object, which is moot when nothing ever reserves against it).
     index.max_ram_mb = read_only ? 0 : max_ram_mb / 2;
   }
+
+  if (index.max_inverter_ram_mb < 0) {
+    // One inverter may hold the whole indexing budget - with a single stream
+    // there is nothing else to hold it - but never more, and never more than
+    // the pool can address.
+    index.max_inverter_ram_mb =
+        index.max_ram_mb > 0 ? (std::min)(index.max_ram_mb, IndexConfig::MAX_INVERTER_RAM_CAP_MB)
+                             : IndexConfig::MAX_INVERTER_RAM_CAP_MB;
+  }
 }
 
 void LuxirConfig::normalize() {
@@ -189,16 +200,13 @@ void LuxirConfig::normalize() {
                              "existing data directory to serve with backend=" + store.backend);
   }
 
-  // An inverter's MemPool can address at most 4 GiB, and the per-inverter size
-  // check runs once per update batch, so an inverter can overshoot the cap by
-  // one batch's growth before it flushes. Clamp the cap to ~4e9 bytes, leaving
-  // ~281 MiB of headroom for that overshoot (MemPool itself throws at the hard
-  // ceiling if a pathological batch exceeds even that).
-  constexpr int64_t maxInverterRamCapMb = 4000000000LL / (1024 * 1024);  // 3814
-  if (index.max_inverter_ram_mb > maxInverterRamCapMb) {
+  // Only an explicit value can be over the pool's addressability; the derived
+  // one is already clamped (MemPool itself throws at the hard ceiling if a
+  // pathological batch overshoots even the headroom the clamp leaves).
+  if (index.max_inverter_ram_mb > IndexConfig::MAX_INVERTER_RAM_CAP_MB) {
     spdlog::warn("indexing.max-inverter-ram-mb={} exceeds the inverter pool's addressability; clamping to {}",
-                 index.max_inverter_ram_mb, maxInverterRamCapMb);
-    index.max_inverter_ram_mb = maxInverterRamCapMb;
+                 index.max_inverter_ram_mb, IndexConfig::MAX_INVERTER_RAM_CAP_MB);
+    index.max_inverter_ram_mb = IndexConfig::MAX_INVERTER_RAM_CAP_MB;
   }
 }
 

@@ -315,8 +315,9 @@ public:
   }
 
   // True when this inverter has grown past a size cap and should be flushed to a
-  // segment. Checked at doc boundaries during non-atomic updates (an atomic
-  // all_or_none request must hold one inverter for rollback, so it never flushes).
+  // segment. Checked once at the end of an update batch, never mid-request: a
+  // whole message stays in one inverter so within-request id overwrites resolve
+  // in memory (see ProtoUpdateMessage::handle).
   bool shouldFlush(size_t ramCap, size_t docCap) {
     return memSize() > ramCap || (size_t)getMaxDoc() > docCap;
   }
