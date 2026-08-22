@@ -370,4 +370,24 @@ TEST(JsonDialect, FieldDefStrictReads) {
   }
 }
 
+TEST(JsonDialect, UnknownKeyIsNamed) {
+  std::pmr::monotonic_buffer_resource mr;
+  std::string err;
+  {  // dialect reader: the error names the key and points at it, not at its value
+    P::SearchRequest r;
+    EXPECT_FALSE(P::read_json(r, R"({"query": {"match": {"title_w": "x"}}, "feilds": ["id"]})", mr, &err));
+    EXPECT_EQ(0u, err.find(R"(1:40: unknown_key "feilds")")) << err;
+  }
+  {  // generated reader: same shape
+    P::SearchRequest r;
+    EXPECT_FALSE(P::read_json(r, R"({"ops":{"a":{"top_docs":{"quary":{}}}}})", mr, &err));
+    EXPECT_EQ(0u, err.find(R"(1:26: unknown_key "quary")")) << err;
+  }
+  {  // a key refused by a dialect rule (val after sugar) is named too
+    P::Match m;
+    EXPECT_FALSE(P::read_json(m, R"({"title_w":"x","val":"y"})", mr, &err));
+    EXPECT_EQ(0u, err.find(R"(1:16: unknown_key "val")")) << err;
+  }
+}
+
 }  // namespace
