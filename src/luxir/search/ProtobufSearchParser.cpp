@@ -669,7 +669,7 @@ public:
             optional sint64 limit = 3;
             bool get_number = 4;          // return the number of matching documents
             bool get_scores = 5;          // return the relevancy score for each document returned
-            repeated string fields = 6;   // fields to return for each document
+            repeated string fields = 6;   // fields to return for each document (empty: every retrievable field)
             repeated SortSpec sorts = 7;
     }
     */

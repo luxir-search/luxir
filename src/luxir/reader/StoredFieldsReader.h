@@ -238,6 +238,12 @@ public:
   int32_t maxDoc() const { return maxDoc_; }
   int64_t maxChunkBytes() const { return maxChunkBytes_; }
 
+  // Every field name this resource holds, in segment-local field-id order.
+  // The views point into the resource's metadata in the segment file, so they
+  // stay valid for as long as the PostingsReader this reader was opened on is
+  // alive - beyond this reader object itself.
+  std::span<const std::string_view> fieldNames() const { return fieldNames_; }
+
   // Cheap metadata-only read for merge admission.  Does not allocate or build
   // chunk offset readers; it only peeks at the stored-fields metadata header.
   static int64_t peekMaxChunkBytes(PostingsReader& postingsReader,

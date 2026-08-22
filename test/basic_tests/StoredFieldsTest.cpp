@@ -861,6 +861,16 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
                                         "body", std::string("default resource"),
                                         "paragraphs", std::string("custom resource"))));
 
+  // The default projection discovers fields in every stored resource, named
+  // families included.
+  auto req2 = localReq(ch.getSearchEngine());
+  req2->collection("main").topDocs("q").allQuery().limit(-1);
+  req2->execute();
+  ASSERT_OK(req2);
+  EXPECT_TRUE(containsDoc(req2->getDocs(), flatdoc("id", std::string("d1"),
+                                                   "body", std::string("default resource"),
+                                                   "paragraphs", std::string("custom resource"))));
+
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 

@@ -136,22 +136,129 @@ TEST_F(DocFormatTest, rowCountWithoutColumnsOrDocs) {
   EXPECT_TRUE(dl->docs.empty());
   EXPECT_EQ(3, req->getMatchCount());
 
-  // No fields requested but hits returned: row_count still says how many,
-  // and the rows are present (empty maps), not dropped.
+}
+
+// No fields named: the default projection returns every retrievable field -
+// id, stored text, string and numeric columns - as per-document rows whatever
+// document_format says (discovered fields are never dense columns).  Engine
+// fields (_version_) are left out unless named.
+TEST_F(DocFormatTest, defaultProjectionReturnsEveryRetrievableField) {
+  CollectionHelper ch;
+  indexBooks(ch);
+
+  for (auto fmt : {api::DocFormat::DEFAULT, api::DocFormat::ROWS, api::DocFormat::COLUMNS}) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().documentFormat(fmt).limit(-1);
+    req->execute();
+    ASSERT_OK(req);
+    const auto* dl = req->docList("q");
+    ASSERT_NE(dl, nullptr);
+    EXPECT_EQ(3, dl->row_count);
+    EXPECT_TRUE(dl->columns.empty());
+    ASSERT_EQ(3u, dl->docs.size());
+    for (const auto& row : dl->docs) {
+      EXPECT_EQ(nullptr, row.fields.find("_version_"));
+    }
+    auto docs = req->getDocs();
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b1"),
+                                      "title_t", std::string("dune novel"),
+                                      "year_i", (int64_t)1965,
+                                      "rating_f", 4.5f, "price_d", 9.99,
+                                      "tags_ss", vecs("classic", "scifi")));
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b2"),
+                                      "title_t", std::string("dune messiah")));
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b3"),
+                                      "title_t", std::string("foundation"),
+                                      "year_i", (int64_t)1951));
+  }
+
+  // _version_ is written for documents indexed with overwrite.  The default
+  // projection still leaves it out; named, it comes back like any column.
+  ch.index(flatdoc("id", std::string("b4"), "title_t", std::string("versioned")),
+           UpdateMessage::COMMIT, /*overwrite=*/true);
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("title_t", "versioned").limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b4"), "title_t", std::string("versioned")));
+
+  auto named = localReq(ch.getSearchEngine());
+  named->collection("main").topDocs("q").matchQuery("title_t", "versioned")
+      .fields({"id", "_version_"}).limit(-1);
+  named->execute();
+  ASSERT_OK(named);
+  auto namedDocs = named->getDocs();
+  ASSERT_EQ(1u, namedDocs.size());
+  EXPECT_NE(nullptr, find(namedDocs[0], "_version_"));
+}
+
+// _score_ is asked for explicitly (get_scores), so it keeps the
+// document_format placement even when the fields are discovered: a dense
+// column under columns format, beside the discovered rows; a row key under
+// rows format.
+TEST_F(DocFormatTest, defaultProjectionKeepsScoreColumnUnderColumnsFormat) {
+  CollectionHelper ch;
+  indexBooks(ch);
+
+  auto run = [&](api::DocFormat fmt) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery("title_t", "dune")
+        .getScores().documentFormat(fmt).limit(-1);
+    req->execute();
+    EXPECT_TRUE(req->responses[0]->proto.error.empty()) << req->toString();
+    return req;
+  };
+
+  auto cols = run(api::DocFormat::COLUMNS);
+  const auto* dl = cols->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_EQ(1u, dl->columns.size());
+  EXPECT_NE(nullptr, dl->columns.find("_score_"));
+  ASSERT_EQ(2u, dl->docs.size());
+  for (const auto& row : dl->docs) {
+    EXPECT_EQ(nullptr, row.fields.find("_score_"));
+    EXPECT_NE(nullptr, row.fields.find("title_t"));
+  }
+
+  auto rows = run(api::DocFormat::ROWS);
+  const auto* dl2 = rows->docList("q");
+  ASSERT_NE(dl2, nullptr);
+  EXPECT_TRUE(dl2->columns.empty());
+  ASSERT_EQ(2u, dl2->docs.size());
+  for (const auto& row : dl2->docs) {
+    EXPECT_NE(nullptr, row.fields.find("_score_"));
+    EXPECT_NE(nullptr, row.fields.find("title_t"));
+  }
+}
+
+// Discovery reads each segment's own metadata, so a dynamic field held by
+// only one segment appears only on that segment's documents.  Vector columns
+// are never part of the default projection; naming one returns it.
+TEST_F(DocFormatTest, defaultProjectionDiscoversPerSegmentAndSkipsVectors) {
+  CollectionHelper ch;
+  ch.index(flatdoc("id", std::string("s1"), "first_s", std::string("one"),
+                   "emb_v", std::vector<float>{1, 0}),
+           UpdateMessage::COMMIT);
+  ch.index(flatdoc("id", std::string("s2"), "second_i", (int64_t)2),
+           UpdateMessage::COMMIT);
+
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(2u, docs.size());
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("s1"), "first_s", std::string("one")));
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("s2"), "second_i", (int64_t)2));
+
   auto req2 = localReq(ch.getSearchEngine());
-  req2->collection("main").topDocs("q").allQuery()
-      .fields({})
-      .documentFormat(api::DocFormat::ROWS)
-      .limit(-1);
+  req2->collection("main").topDocs("q").allQuery().fields({"id", "emb_v"}).limit(-1);
   req2->execute();
   ASSERT_OK(req2);
-  const auto* dl2 = req2->docList("q");
-  ASSERT_NE(dl2, nullptr);
-  EXPECT_EQ(3, dl2->row_count);
-  ASSERT_EQ(3u, dl2->docs.size());
-  for (const auto& row : dl2->docs) {
-    EXPECT_TRUE(row.fields.empty());
-  }
+  EXPECT_CONTAINS_DOC(req2->getDocs(), flatdoc("id", std::string("s1"),
+                                               "emb_v", std::vector<float>{1, 0}));
 }
 
 // COLUMNS stays the wire shape it always was, now with the authoritative

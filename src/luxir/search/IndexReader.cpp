@@ -1,12 +1,16 @@
 #include "IndexReader.h"
+#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/util/MemPool.h"
 
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_types.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
+#include <set>
 #include <span>
 
 #include "OrdMapImpl.h"
@@ -317,5 +321,36 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
 }
 
 
+
+
+std::span<const std::string_view> IndexReader::projectableFields() {
+  std::call_once(projectableOnce, [this] {
+    // Both name sources are views into segment files held open by the
+    // segment's PostingsReader: the field index (fi.fieldname) and the stored
+    // resource's metadata (StoredFieldsReader::fieldNames).  No copies needed.
+    std::set<std::string_view> names;
+    for (auto& seg : segs) {
+      auto& postingsReader = seg.postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      FieldReader fieldReader(postingsReader);
+      while (fieldReader.readNextField()) {
+        SegFieldInfo fi;
+        fieldReader.readFieldInfo(fi);
+        if (fi.type == FieldType::BIN && (fi.flags & FieldType::STORED)) {
+          // A stored-fields resource: its metadata lists the fields it holds.
+          // An empty resource is never written, but guard the reader's
+          // precondition anyway.
+          if (fi.numValues <= 0) continue;
+          StoredFieldsReader sfr(postingsReader, fi);
+          for (std::string_view name : sfr.fieldNames()) names.emplace(name);
+        } else if (fi.flags & FieldType::COLUMN_STORED) {
+          names.emplace(std::string_view(fi.fieldname.data(), fi.fieldname.size()));
+        }
+      }
+    }
+    projectable.assign(names.begin(), names.end());
+  });
+  return projectable;
+}
 
 }

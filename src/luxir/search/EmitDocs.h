@@ -726,7 +726,12 @@ public:
   int64_t offset;
   bool getNumber;
   bool getScores;
+  // Placement.  rowsMode: requested fields go to per-document maps
+  // (DocList.docs) instead of dense columns.  scoresInRows: the synthetic
+  // _score_ goes into those maps too; otherwise it is a dense column even
+  // when rowsMode holds (discovered fields in rows beside a score column).
   bool rowsMode;
+  bool scoresInRows;
   // Snapshot of req.tg != nullptr: req.tg points at submit()'s stack and may
   // dangle by the time a resumed emitter runs.
   bool parallel;
@@ -738,11 +743,12 @@ public:
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<const std::string_view> fields, int32_t maxBatchSize,
                  int64_t offset, bool getNumber, bool getScores, bool rowsMode,
-                 bool parallel, size_t colCap)
+                 bool scoresInRows, bool parallel, size_t colCap)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
-        getScores(getScores), rowsMode(rowsMode), parallel(parallel), colCap(colCap),
+        getScores(getScores), rowsMode(rowsMode), scoresInRows(scoresInRows),
+        parallel(parallel), colCap(colCap),
         // If no documents were collected, we still need to send an empty response
         totalBatches(numCollected > 0 ? numCollected : 1) {}
 
@@ -963,8 +969,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     }
 
-    if (returnScores && !rowsMode) {
-      auto& scoresProto = build::columnSlot(columnsProto, colCap, "_score_", mr);
+    if (returnScores && !scoresInRows) {
+      auto& scoresProto = build::columnSlot(docListProto.columns, colCap, "_score_", mr);
       auto& floatColProto = scoresProto.kind.template emplace<luxir::api::ColFloat>();
       float* scores = build::allocArray(floatColProto.v, columnSize, mr);
       for (int i = 0; i < columnSize; i++) {
@@ -986,9 +992,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       // Scores bypass the scratch column: every doc has one, and a direct
       // write avoids the all-present column's sentinel ambiguity (a real
       // 0.0 score would collide with ColFloat's default missing_val).
-      size_t fieldCap = scratchColumns.size() + (returnScores ? 1 : 0);
+      bool scoreRows = returnScores && scoresInRows;
+      size_t fieldCap = scratchColumns.size() + (scoreRows ? 1 : 0);
       auto* rows = scatterColumnsToRows(scratchColumns, docListProto, (size_t)columnSize, fieldCap, mr);
-      if (returnScores) {
+      if (scoreRows) {
         for (int i = 0; i < columnSize; i++) {
           build::mapSlot<luxir::api::Val>(rows[i].fields, fieldCap, "_score_", mr)->kind =
               getScore(batchStart + i);
@@ -1015,6 +1022,45 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
   return true;
 }
 
+// The projection for a request that names no fields: every field the reader
+// can project - column-backed scalars and strings, and stored values - except
+// vectors (large and rarely wanted unasked), geo points (not yet projectable),
+// and engine-reserved names (leading underscore, i.e. _version_).  Discovery
+// is physical (IndexReader::projectableFields, union over segments) and then
+// filtered through the request's schema, so a name the schema no longer knows
+// or no longer marks retrievable is dropped, never thrown on.  "id" leads,
+// the rest are alphabetical.  The returned views are the reader's catalog
+// views, which req.reader pins for the request's lifetime.
+inline std::span<const std::string_view> defaultProjection(SearchRequest& req) {
+  auto catalog = req.reader->projectableFields();
+  std::vector<std::string_view> picked;
+  picked.reserve(catalog.size());
+  for (std::string_view name : catalog) {
+    if (name.empty() || name[0] == '_') continue;
+    FieldType* fieldType = req.schema->getFieldTypePtr(name);
+    if (fieldType == nullptr) continue;
+    switch (fieldType->type()) {
+      case FieldType::Type::INT:
+      case FieldType::Type::FLOAT:
+      case FieldType::Type::DOUBLE:
+      case FieldType::Type::DATE:
+      case FieldType::Type::STRING:
+      case FieldType::Type::ID:
+      case FieldType::Type::TEXT:
+        break;
+      default:
+        continue;
+    }
+    if (!fieldType->hasColumn() && !fieldType->isStored()) continue;
+    picked.push_back(name);
+  }
+  auto idIt = std::ranges::find(picked, std::string_view("id"));
+  if (idIt != picked.end()) std::rotate(picked.begin(), idIt, idIt + 1);
+  auto out = req.requestPool.make_span<std::string_view>(picked.size());
+  std::ranges::copy(picked, out.begin());
+  return out;
+}
+
 // Entry point shared by TopDocsReq and FusionOp: creates a request-arena-owned
 // emitter and produces batches until done or paused.  See DocEmitter above for
 // the resumable-emission contract.
@@ -1039,11 +1085,22 @@ void emitDocsResponse(SearchRequest& req,
     maxBatchSize = 256;
   }
 
+  // No fields named: project the default set.
+  bool discovered = fields.empty();
+  if (discovered) fields = defaultProjection(req);
+
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
-  bool rowsMode = docFormat == luxir::api::DocFormat::ROWS
-                  || (docFormat != luxir::api::DocFormat::COLUMNS
-                      && req.docFormatDefault == luxir::api::DocFormat::ROWS);
+  bool formatRows = docFormat == luxir::api::DocFormat::ROWS
+                    || (docFormat != luxir::api::DocFormat::COLUMNS
+                        && req.docFormatDefault == luxir::api::DocFormat::ROWS);
+  // DocList placement is explicitly requested -> dense columns, discovered ->
+  // docs[i]: the column set is a property of the request, never of what the
+  // index happens to hold.  So discovered fields land in rows whatever
+  // document_format says, while _score_ (asked for by get_scores) keeps the
+  // format's placement - a column under columns format, beside the rows.
+  bool rowsMode = discovered || formatRows;
+  bool scoresInRows = formatRows;
 
   // Upper bound on distinct response columns: one per requested field plus the
   // synthetic _score_ column. Used to pre-size the columns map's slot array.
@@ -1054,7 +1111,7 @@ void emitDocsResponse(SearchRequest& req,
   auto* emitter = luxir::arenaCreate<Impl>(req.arena, req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, fields,
-      maxBatchSize, offset, getNumber, getScores, rowsMode,
+      maxBatchSize, offset, getNumber, getScores, rowsMode, scoresInRows,
       /*parallel=*/req.tg != nullptr, colCap);
   req.streamStarted();
   emitter->produce();

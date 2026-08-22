@@ -255,6 +255,24 @@ TEST_F(HttpApiTest, malformedJsonIs400) {
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos);
 }
 
+// No "fields" in the request: every retrievable field of each hit comes back
+// (engine fields such as _version_ only when named).
+TEST_F(HttpApiTest, searchWithoutFieldsReturnsEveryRetrievableField) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"dp1","title_w":"default projection","rank_i":7}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "projection").execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  auto docs = hreq.getDocs();
+  ASSERT_EQ(1u, docs.size()) << hreq.rawResponse();
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("dp1"),
+                                    "title_w", std::string("default projection"),
+                                    "rank_i", (int64_t)7));
+  EXPECT_EQ(std::string::npos, hreq.rawResponse().find("_version_")) << hreq.rawResponse();
+}
+
 TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"u1","title_w":"hello world","title_s":"Hello"}],"commit":{}})");

@@ -103,7 +103,10 @@ message TopDocs {
   optional sint64 limit = 4;
   bool get_number = 5;          // return the number of matching documents
   bool get_scores = 6;          // return the relevancy score for each document returned
-  repeated string fields = 7;   // fields to return for each document
+  // Fields to return for each document.  Empty returns every retrievable field
+  // (stored or column-backed; not vectors or engine fields such as _version_),
+  // discovered from the index and placed in per-document rows (DocList.docs).
+  repeated string fields = 7;
   repeated SortSpec sorts = 8;
   int32 batch_size = 9;         // maximum number of documents to return in a single streaming response
                                 // if max_batch_size >= limit, multiple responses may be generated
@@ -146,7 +149,7 @@ message Fusion {
   int64 offset = 4;
   bool get_number = 5;
   bool get_scores = 6;
-  repeated string fields = 7;
+  repeated string fields = 7;   // as TopDocs.fields; empty returns every retrievable field
   int32 batch_size = 8;
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
 

@@ -55,7 +55,7 @@ The top-document fields are:
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
-| `fields` | Fields to retrieve. |
+| `fields` | Fields to retrieve. Omitted: every retrievable field (see below). |
 | `sorts` | Value expressions used as sort keys. No list means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
 | `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
@@ -115,6 +115,15 @@ No document fields are loaded.
 to row documents: a missing field is an absent key. Set
 `document_format: "columns"` when consumers prefer every supported projected
 key in every row, with missing cells rendered as `null` by HTTP.
+
+With no `fields`, every retrievable field comes back: stored text, string,
+numeric, date, and `id` values, discovered from the index itself (so dynamic
+suffix fields appear under their concrete names), `id` first and the rest in
+name order. Vector fields and engine fields such as `_version_` are returned
+only when named. Discovered fields are always placed in row documents, whatever
+`document_format` says; naming fields is what produces dense columns. `_score_`
+is requested explicitly (`get_scores`), so it keeps the format's placement: a
+dense column under `columns`, a row key under `rows`.
 
 The underlying gRPC response remains a typed `DocList`: dense columns and row
 maps can coexist, `row_count` is authoritative, and `_score_` is a synthetic

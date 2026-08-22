@@ -310,6 +310,35 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*lreq));
 }
 
+// No fusion-level fields: the default projection applies to the fused list
+// too - every retrievable field, as per-document rows.
+TEST_F(FusionOpTest, defaultProjectionWhenNoFieldsNamed) {
+  CollectionHelper h("main");
+  ASSERT_TRUE(h.indexAll(
+      {flatdoc("id", "a", "foo_w", "alpha beta"),
+       flatdoc("id", "b", "foo_w", "alpha")},
+      UpdateMessage::COMMIT).success);
+
+  auto lreq = localReq(luxirNode->getSearchEngine());
+  lreq->collection("main");
+  auto& fusion =
+      lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.rrf.emplace().k = 60;
+  setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "alpha", 10);
+  lreq->execute(false);
+  ASSERT_OK(lreq);
+
+  const auto* dl = lreq->docList("f");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_TRUE(dl->columns.empty());
+  ASSERT_EQ(2u, dl->docs.size());
+  auto docs = lreq->getDocs("f");
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id", "a", "foo_w", "alpha beta"));
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id", "b", "foo_w", "alpha"));
+}
+
 TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
   CollectionHelper h("main");
   h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(

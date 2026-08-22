@@ -64,7 +64,7 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     } else {
       topDocs.matchQuery(qfield, "0");
     }
-    topDocs.limit(topLimit).getNumber(true).getScores(false);
+    topDocs.limit(topLimit).getNumber(true).getScores(false).fields({"id"});
 
     // add the field we want to facet
     auto& facet = topDocs.facet("f", ffield);

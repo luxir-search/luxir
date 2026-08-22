@@ -363,6 +363,7 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
                       qb::match(topDocs.mr(), field2, "0")});
     topDocs.limit(10)
            .getNumber(true)    // count all matches -> iterate the full conjunction
+           .fields({"id"})
            .getScores(false);
 
     req->execute(para);

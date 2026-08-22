@@ -1,6 +1,8 @@
 #pragma once
 #include <memory>
+#include <mutex>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "DocSet.h"
@@ -203,11 +205,24 @@ public:
     return sharedFilterCache.get();
   }
 
+  // Names of the fields some segment of this reader can project into a
+  // DocList: column-backed fields (COLUMN_STORED, any non-BIN type) and the
+  // fields held by each stored-fields resource.  Physical and
+  // schema-independent - read from segment metadata, so dynamic
+  // (suffix-template) fields appear under their concrete names.  Sorted and
+  // unique.  Built once on first use and immutable afterwards (segments never
+  // change under a reader).  The views point into segment metadata that this
+  // reader's PostingsReaders keep mapped, so they are valid for as long as the
+  // caller holds the reader.
+  std::span<const std::string_view> projectableFields();
+
   IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
               std::shared_ptr<FilterCache> filterCache = nullptr);
 
 private:
   std::vector<Segment> segs;
+  std::once_flag projectableOnce;
+  std::vector<std::string_view> projectable;
   std::vector<std::shared_ptr<AuxReader>> auxReadersList;
   std::shared_ptr<FilterCache> sharedFilterCache;
   uint64_t coreGeneration = 0;
