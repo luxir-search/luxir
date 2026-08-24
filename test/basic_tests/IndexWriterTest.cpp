@@ -680,6 +680,8 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
   luxir::Signal::unlisten("segmentMergeBody");
 
   EXPECT_FALSE(iw->testMergeRunning());
+  EXPECT_EQ(0, LuxirTest::luxirNode->getIndexRamBudget().pendingMergeDemandBytes())
+      << "cancelled merge driver leaked published demand";
   EXPECT_TRUE(waitCommitDone.load(std::memory_order_relaxed));
   // Benign ordering: the waitForMerges commit may register before or after the
   // failure tail's decrement walk.  Both orderings succeed - a late joiner sees

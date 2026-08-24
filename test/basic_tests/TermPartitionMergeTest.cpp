@@ -5,13 +5,18 @@
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/TermsEnum.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
 #include "test/SegmentTest.h"
 #include "test/TestIndex.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace luxir;
@@ -360,4 +365,95 @@ TEST(TermPartitionMergeTest, BudgetFallbackStaysSerial) {
   SegFieldInfo info = readBodyInfo(index.pool, index.reader->segments()[0]);
   EXPECT_GT(info.nTerms, 0);
   EXPECT_TRUE(info.rangeTableLoc.isNull());
+}
+
+TEST(TermPartitionMergeTest, ZeroStreamRangeDemandCapsAtTightenedBudget) {
+  auto schema = textSchema();
+  TestIndex left;
+  TestIndex right;
+  buildSources(left, schema, true, 0);
+  buildSources(right, schema, true, 20);
+
+  std::array<PostingsReader*, 2> readers = {
+      &left.reader->segments()[0].postingsReader(),
+      &right.reader->segments()[0].postingsReader()};
+  std::array<LiveDocs*, 2> liveDocs = {nullptr, nullptr};
+  RAMDir outputDir;
+  PostingsWriter writer(outputDir, 901, -1);
+  int64_t planningCap = 16 * MergeCostModel::LIGHT_BYTES;
+  IndexRamBudget budget(planningCap);
+  auto blocker = budget.forceAcquire(planningCap);
+  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4);
+
+  std::atomic<int64_t> rangeDemand = 0;
+  std::atomic<int64_t> tightenedCap = 0;
+  std::atomic<int32_t> rangeBatches = 0;
+  std::atomic<int> mergeBodies = 0;
+  std::atomic<bool> releaseBodies = false;
+  std::exception_ptr mergeFailure;
+  std::thread mergeThread;
+  auto cleanup = luxir::scope_guard([&]() {
+    releaseBodies.store(true, std::memory_order_relaxed);
+    blocker.release();
+    if (mergeThread.joinable()) mergeThread.join();
+    Signal::unlisten("mergeAdmissionDemand");
+    Signal::unlisten("segmentMergeBody");
+  });
+
+  Signal::listen("mergeAdmissionDemand", [&](void* a, void*, void* c) -> void* {
+    int32_t batches = *(int32_t*)c;
+    if (batches < 2 || rangeBatches.load(std::memory_order_relaxed) != 0) {
+      return nullptr;
+    }
+    int64_t demand = *(int64_t*)a;
+    int64_t cap = std::max<int64_t>(1, demand / 2);
+    rangeDemand.store(demand, std::memory_order_relaxed);
+    rangeBatches.store(batches, std::memory_order_relaxed);
+    tightenedCap.store(cap, std::memory_order_relaxed);
+    // The range plan was made against planningCap.  Tightening here isolates
+    // the demand aggregator: all zero-stream ranges remain selected, while the
+    // pressure-visible aggregate must clamp to the new whole-pool size.
+    budget.setTotalBytes(cap);
+    return nullptr;
+  });
+  Signal::listen("segmentMergeBody", [&](void*, void*, void*) -> void* {
+    mergeBodies.fetch_add(1, std::memory_order_relaxed);
+    while (!releaseBodies.load(std::memory_order_relaxed)) {
+      std::this_thread::yield();
+    }
+    return nullptr;
+  });
+
+  mergeThread = std::thread([&]() {
+    try {
+      merger.merge();
+    } catch (...) {
+      mergeFailure = std::current_exception();
+    }
+  });
+  for (int i = 0; i < 5000
+                  && (rangeDemand.load(std::memory_order_relaxed) == 0
+                      || mergeBodies.load(std::memory_order_relaxed) == 0); i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(rangeBatches.load(std::memory_order_relaxed), 1);
+  ASSERT_GT(rangeDemand.load(std::memory_order_relaxed),
+            tightenedCap.load(std::memory_order_relaxed));
+  EXPECT_EQ(tightenedCap.load(std::memory_order_relaxed),
+            budget.pendingMergeDemandBytes());
+
+  blocker.release();
+  releaseBodies.store(true, std::memory_order_relaxed);
+  mergeThread.join();
+  if (mergeFailure != nullptr) std::rethrow_exception(mergeFailure);
+  writer.finish();
+  EXPECT_EQ(0, budget.pendingMergeDemandBytes());
+  EXPECT_EQ(0, budget.reservedBytes());
+
+  PostingsReader outputReader(outputDir, 901);
+  FieldReader fields(outputReader);
+  ASSERT_TRUE(fields.seek("body"));
+  SegFieldInfo info;
+  fields.readFieldInfo(info);
+  EXPECT_FALSE(info.rangeTableLoc.isNull());
 }

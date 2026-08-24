@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+
 #include "luxir/index/IndexRamBudget.h"
 
 using namespace luxir;
@@ -86,4 +88,54 @@ TEST(IndexRamBudgetTest, GuardResizeIsAtomic) {
   EXPECT_EQ(8, budget.reservedBytes());
   EXPECT_TRUE(guard->tryResize(3));
   EXPECT_EQ(3, budget.reservedBytes());
+}
+
+TEST(IndexRamBudgetTest, MergeDemandAggregatesCapsAndUnregisters) {
+  IndexRamBudget budget(10);
+  std::atomic<int> pressurePings = 0;
+  auto pressure = budget.registerPressureListener([&]() {
+    pressurePings.fetch_add(1, std::memory_order_relaxed);
+  });
+  auto first = budget.registerMergeDemand([]() {});
+  auto second = budget.registerMergeDemand([]() {});
+  auto guard = budget.tryAcquireGuard(2);
+  ASSERT_TRUE(guard.has_value());
+
+  first.publish(7);
+  EXPECT_EQ(7, budget.pendingMergeDemandBytes());
+  EXPECT_FALSE(budget.pressureNeeded());
+
+  second.publish(8);
+  EXPECT_EQ(10, budget.pendingMergeDemandBytes());
+  EXPECT_TRUE(budget.pressureNeeded());
+  EXPECT_GT(pressurePings.load(std::memory_order_relaxed), 0);
+
+  first.reset();
+  EXPECT_EQ(8, budget.pendingMergeDemandBytes());
+  second.publish(0);
+  EXPECT_EQ(0, budget.pendingMergeDemandBytes());
+  EXPECT_FALSE(budget.pressureNeeded());
+}
+
+TEST(IndexRamBudgetTest, DrainingDiscountsPressureUntilReservationRelease) {
+  IndexRamBudget budget(10);
+  std::atomic<int> admissionPings = 0;
+  auto demand = budget.registerMergeDemand([&]() {
+    admissionPings.fetch_add(1, std::memory_order_relaxed);
+    EXPECT_FALSE(budget.pressureNeeded());
+  });
+  auto guard = budget.tryAcquireGuard(10);
+  ASSERT_TRUE(guard.has_value());
+
+  demand.publish(5);
+  EXPECT_TRUE(budget.pressureNeeded());
+  EXPECT_TRUE(guard->tryMarkDrainingForPressure());
+  EXPECT_EQ(10, budget.reservedBytes());
+  EXPECT_EQ(10, budget.drainingBytesCount());
+  EXPECT_FALSE(budget.pressureNeeded());
+
+  guard->release();
+  EXPECT_EQ(0, budget.reservedBytes());
+  EXPECT_EQ(0, budget.drainingBytesCount());
+  EXPECT_EQ(1, admissionPings.load(std::memory_order_relaxed));
 }

@@ -227,6 +227,16 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
       this->segmentFlushBody(*inverter);
     }, FLUSH_PRIORITY);
 
+  // Budget callbacks never take indexMutex or flush inline.  They coalesce on
+  // this elevated-priority graph node, whose body rechecks global pressure and
+  // claims victims against the budget before changing writer state.
+  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(updateGraph, 1,
+    [this](tbb::flow::continue_msg,
+           PressureCheckMultiFunc::output_ports_type& op) {
+      unused(op);
+      this->pressureCheckBody();
+    }, FLUSH_PRIORITY);
+
   commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
     [](UpdateMessage* msg) -> size_t {
       INDEX_DEBUG("commitSequencerNode: msg={} commitNum={}", (void*)&msg, msg->commitNum);
@@ -277,6 +287,10 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
         }
       }
     }, MERGE_PRIORITY);
+
+  pressureRegistration = indexRamBudget->registerPressureListener([this]() noexcept {
+    requestPressureCheck();
+  });
 }
 
 IndexWriter::~IndexWriter() {
@@ -292,6 +306,11 @@ void IndexWriter::close() {
   // message either entered before this and is waited for below, or is rejected
   // there: no update can reach storage once this returns.
   if (closed.exchange(true, std::memory_order_release)) return;
+
+  // Stop new budget callbacks before draining the graph.  Registration reset
+  // synchronizes with a callback already copied out of the budget; any task it
+  // queued before reset is included in wait_for_all below.
+  pressureRegistration.reset();
 
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
@@ -517,28 +536,88 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
 }
 
 
-// True when the pool would still be over its cap after every in-flight flush
-// of this writer completes, i.e. when shedding another live inverter can
-// actually help.  Without the discount a burst of sheds would keep firing on
-// the fresh inverters that replace the shed ones (their reservations are held
-// until each flush completes), flushing them at the size floor until the
-// burst drains.
-//
-// One live inverter can still park the pool at the cap and starve merge
-// admission (SegmentMerger::MergeAdmissionDriver falls back to one
-// force-admitted batch at a time); reserving merge headroom is deliberately
-// NOT this gate's job - it belongs to the budget/admission redesign (the
-// overdraft-token TODO in IndexRamBudget.h).
-//
-// Caller holds indexMutex.  O(#flushing) - a few dozen guards at most, once
-// per released batch.  Guard sizes are as of each inverter's last release,
-// which is the granularity the pool is kept at anyway.
-bool IndexWriter::liveRamOverBudget() const {
-  int64_t flushingBytes = 0;
-  for (const auto& entry : flushingInverters) {
-    flushingBytes += entry.first->ramGuard.size();
+void IndexWriter::requestPressureCheck() noexcept {
+  bool expected = false;
+  if (!pressureCheckQueued.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
   }
-  return indexRamBudget->reservedBytes() - flushingBytes > indexRamBudget->totalBytes();
+  try {
+    if (!pressureCheckNode->try_put(tbb::flow::continue_msg{})) {
+      pressureCheckQueued.store(false, std::memory_order_release);
+    }
+  } catch (...) {
+    pressureCheckQueued.store(false, std::memory_order_release);
+  }
+}
+
+void IndexWriter::pressureCheckBody() {
+  // Clear at entry: a notification concurrent with this check queues one more
+  // pass, while a notification before entry is covered by this pass.  This is
+  // the coalescing boundary that avoids both lost wakeups and self-requeue loops
+  // when this writer has no eligible victim.
+  pressureCheckQueued.store(false, std::memory_order_release);
+  if (closed.load(std::memory_order_relaxed)) return;
+
+  const std::lock_guard<std::mutex> lock(indexMutex);
+  pressureShedIdleLocked();
+}
+
+// Caller holds indexMutex.  A pressure claim and the budget's global draining
+// increment are one transaction, so concurrent writers may all inspect local
+// victims but only still-needed victims transition to flushing.
+bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
+  auto it = idleInverters.find(&inverter);
+  assert(it != idleInverters.end());
+
+  if (pressure) {
+    if (!inverter.ramGuard.tryMarkDrainingForPressure()) return false;
+  } else {
+    inverter.ramGuard.markDraining();
+  }
+
+  decltype(flushingInverters)::iterator flushingIt;
+  try {
+    auto [inserted, success] =
+        flushingInverters.emplace(&inverter, std::move(it->second));
+    assert(success);
+    flushingIt = inserted;
+    idleInverters.erase(it);
+  } catch (...) {
+    inverter.ramGuard.clearDraining();
+    throw;
+  }
+
+  bool accepted = false;
+  try {
+    accepted = segmentFlushNode->try_put(&inverter);
+  } catch (...) {
+  }
+  if (accepted) return true;
+
+  auto inverterPtr = std::move(flushingIt->second);
+  flushingInverters.erase(flushingIt);
+  idleInverters.emplace(&inverter, std::move(inverterPtr));
+  inverter.ramGuard.clearDraining();
+  return false;
+}
+
+// Caller holds indexMutex.  Largest-local-first minimizes segment count; the
+// budget-side claim prevents broadcasts to multiple writers from over-shedding
+// once the global pressure target is met.
+void IndexWriter::pressureShedIdleLocked() {
+  if (!indexRamBudget->pressurePossible()) return;
+  for (;;) {
+    Inverter* victim = nullptr;
+    for (auto& entry : idleInverters) {
+      if (entry.first->memSize() < pressureFlushFloorBytes) continue;
+      if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
+        victim = entry.first;
+      }
+    }
+    if (victim == nullptr || !startIdleFlushLocked(*victim, true)) return;
+    INDEX_DEBUG("indexing RAM pressure, flushing idle inverter={}", *victim);
+  }
 }
 
 void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
@@ -554,10 +633,10 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   }
 
   // Resync this inverter's share of the global indexing RAM budget - once per
-  // batch, not per doc - and note whether the pool is over its cap. The
+  // batch, not per doc. The
   // reservation is held until the inverter is destroyed (after flush), so
   // flushing inverters stay counted until their RAM is actually freed.
-  bool ramOverBudget = inverter.ramGuard.forceResize((int64_t)inverter.memSize());
+  inverter.ramGuard.forceResize((int64_t)inverter.memSize());
 
   // Size-based auto-flush is driven by the caller (ProtoUpdateMessage::handle passes
   // flush=true at end of batch when inverter.shouldFlush() is true), not decided here:
@@ -572,9 +651,14 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     } else {
       INDEX_DEBUG("inverter={} flush requested.", inverter);
     }
-    flushingInverters.emplace(&inverter, std::move(it->second));
+    auto [flushingIt, success] =
+        flushingInverters.emplace(&inverter, std::move(it->second));
+    assert(success);
+    flushingIt->second->ramGuard.markDraining();
     it = busyInverters.erase(it);
-    segmentFlushNode->try_put(&inverter);
+    if (!segmentFlushNode->try_put(&inverter)) {
+      throw std::runtime_error("Segment flush node rejected a released inverter");
+    }
   }
   else {
     INDEX_DEBUG("releaseInverter: inverter={} adding back to idleInverters.", inverter);
@@ -583,35 +667,10 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     busyInverters.erase(it);
   }
 
-  // Global-budget pressure: if total indexing RAM (inverters plus merge
-  // reservations) was over the cap at the resync above, flush the largest idle
-  // inverter - possibly the one just released - unless the flushes already in
-  // flight would bring the pool back under the cap on their own.  Flushing
-  // inverters keep their reservation until the flush completes, so without
-  // discounting them a burst of sheds would keep firing on the fresh inverters
-  // that replace the shed ones, flushing them at the size floor until the
-  // burst drains.  Every release re-evaluates (batches are pushed through the
-  // indexing graph, so releases keep arriving while there is anything to
-  // shed; once traffic stops, commit reclaims what remains), and under a
-  // firehose that sheds one inverter per release until live RAM is back under
-  // budget, so the drain rate tracks the inflow rather than being capped at one
-  // flush at a time.  The size floor avoids shedding tiny inverters (and
-  // spamming tiny segments) when merges hold most of the budget.
-  if (ramOverBudget && liveRamOverBudget()) {
-    Inverter* victim = nullptr;
-    for (auto& entry : idleInverters) {
-      if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
-        victim = entry.first;
-      }
-    }
-    if (victim != nullptr && victim->memSize() >= pressureFlushFloorBytes) {
-      INDEX_DEBUG("over indexing RAM budget, flushing idle inverter={}", *victim);
-      auto vit = idleInverters.find(victim);
-      flushingInverters.emplace(victim, std::move(vit->second));
-      idleInverters.erase(vit);
-      segmentFlushNode->try_put(victim);
-    }
-  }
+  // Re-evaluate even when raw reservations fit: pending merge demand may need
+  // headroom.  Already-draining guards are discounted globally by the budget,
+  // suppressing floor-sized respawn flushes while the current victims drain.
+  pressureShedIdleLocked();
 }
 
 
@@ -724,12 +783,13 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     }
 
     // now look at all idle inverters and initiate a flush if necessary.
-    for (auto it = idleInverters.begin(); it != idleInverters.end(); it++) {
-      if (it->second->minVersion <= msg.updateVersion) {
-        if (it->second->commitInfo == nullptr) {
+    for (auto it = idleInverters.begin(); it != idleInverters.end();) {
+      auto current = it++;
+      if (current->second->minVersion <= msg.updateVersion) {
+        if (current->second->commitInfo == nullptr) {
           INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
-                      *it->second.get());
-          it->second->commitInfo = &commitInfo;
+                      *current->second.get());
+          current->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
         }
         else {
@@ -737,11 +797,9 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
           LOG_ERROR("Idle inverter is part of another commit.");
         }
 
-        // move the inverter to the flushing list
-        auto [flushingIt, success] = flushingInverters.emplace(it->first, std::move(it->second));
-        idleInverters.erase(it);
-        // send the inverter to the segment flush node
-        segmentFlushNode->try_put(flushingIt->second.get());
+        if (!startIdleFlushLocked(*current->second, false)) {
+          throw std::runtime_error("Segment flush node rejected a commit inverter");
+        }
       }
     }
 

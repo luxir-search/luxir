@@ -19,7 +19,9 @@
 
 #include <array>
 #include <atomic>
+#include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -148,9 +150,9 @@ class SegmentMerger {
   //  - Batches are enumerated up front and sorted largest-cost-first, so the
   //    longest field merge starts earliest and small column merges pack around it.
   //  - admitLoop() launches every pending batch whose streams fit and whose RAM
-  //    reserves; it is re-run from each task's completion path - completions are
-  //    the only moments capacity grows, so admission is event-driven and no thread
-  //    ever blocks on the budget.
+  //    reserves.  Failed RAM admissions publish merge demand, and budget capacity
+  //    releases ping the driver to retry, so admission is event-driven and no
+  //    thread ever blocks on the budget.
   //  - The driver's only wait is tg.wait() on its own running tasks.  If nothing
   //    is in flight and nothing fits, it force-admits the head batch (bounded
   //    budget overdraft): the merge always makes progress, an oversized field
@@ -306,10 +308,15 @@ class SegmentMerger {
     std::vector<Batch> pending;
     int32_t inFlight = 0;
     int32_t inFlightStreams = 0;
+    std::exception_ptr callbackFailure;
+    IndexRamBudget::MergeDemandRegistration demandRegistration;
 
   public:
     MergeAdmissionDriver(SegmentMerger& merger, IndexRamBudget& budget, std::vector<Batch>&& batches)
-      : merger(merger), budget(budget), context(), tg(context), pending(std::move(batches)) {}
+      : merger(merger), budget(budget), context(), tg(context), pending(std::move(batches)),
+        demandRegistration(budget.registerMergeDemand([this]() noexcept {
+          admissionCallback();
+        })) {}
 
     void run() {
       for (;;) {
@@ -333,6 +340,7 @@ class SegmentMerger {
         tg.wait();
       }
       tg.wait();
+      rethrowCallbackFailure();
     }
 
     void addBatches(std::vector<Batch>&& batches) {
@@ -367,17 +375,33 @@ class SegmentMerger {
         {
           const std::lock_guard<std::mutex> lock(mutex);
           if (context.is_group_execution_cancelled()) {
+            demandRegistration.publish(0);
             return admittedAny;
           }
 
+          int32_t hypotheticalStreams = inFlightStreams;
+          int32_t hypotheticalBatches = 0;
+          int64_t pendingDemand = 0;
           for (size_t i = 0; i < pending.size(); i++) {
             Batch& candidate = pending[i];
-            if (inFlightStreams + candidate.streams > MergeCostModel::MAX_STREAMS) {
+            if (hypotheticalStreams + candidate.streams > MergeCostModel::MAX_STREAMS) {
               continue;
             }
+            hypotheticalStreams += candidate.streams;
+            hypotheticalBatches++;
 
             auto guard = budget.tryAcquireGuard(candidate.cost);
             if (!guard) {
+              // Pending is largest-cost-first.  A RAM-starved candidate consumes
+              // virtual stream slots just as if it had admitted, so a cheaper
+              // later batch cannot steal the slots being reclaimed for the head
+              // work.  This makes demand describe the same ordered schedule we
+              // would launch if RAM were infinite.  Zero-stream range batches
+              // are all counted; the budget caps aggregate demand at one pool.
+              int64_t available = std::numeric_limits<int64_t>::max() - pendingDemand;
+              pendingDemand = candidate.cost >= available
+                  ? std::numeric_limits<int64_t>::max()
+                  : pendingDemand + candidate.cost;
               continue;
             }
 
@@ -389,6 +413,15 @@ class SegmentMerger {
             haveBatch = true;
             admittedAny = true;
             break;
+          }
+
+          // Publish only a stable scan.  If a real batch admitted, the next
+          // iteration rescans against its streams and reservation before exposing
+          // demand, avoiding a transient request for work that just became live.
+          if (!haveBatch) {
+            Signal::emit("mergeAdmissionDemand", &pendingDemand, &hypotheticalStreams,
+                         &hypotheticalBatches);
+            demandRegistration.publish(pendingDemand);
           }
         }
 
@@ -437,7 +470,32 @@ class SegmentMerger {
       }
 
       spawn(std::move(batch), std::move(admission));
+      // The forced batch is now represented by reserved RAM rather than pending
+      // demand.  Recompute immediately so pressure reclaim targets only the work
+      // that can coexist with its stream reservation.
+      admitLoop();
       return true;
+    }
+
+    void admissionCallback() noexcept {
+      try {
+        admitLoop();
+      } catch (...) {
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          if (callbackFailure == nullptr) callbackFailure = std::current_exception();
+        }
+        context.cancel_group_execution();
+      }
+    }
+
+    void rethrowCallbackFailure() {
+      std::exception_ptr failure;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        failure = callbackFailure;
+      }
+      if (failure != nullptr) std::rethrow_exception(failure);
     }
 
     struct BatchTask {

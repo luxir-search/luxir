@@ -15,6 +15,7 @@
 
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/index/MergeCostModel.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/store/Directory.h"
@@ -279,4 +280,191 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
     for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
     EXPECT_EQ(totalDocs, 61);
   }
+}
+
+// Demand publication itself must wake an idle writer.  There is deliberately
+// no releaseInverter call after demand appears: without the pressure-listener
+// registry this inverter would pin the pool forever and the merge driver would
+// have no writer-side event on which to trigger shedding.
+TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+
+  IndexRamBudget budget;
+  std::atomic<int> flushesStarted = 0;
+  Signal::listen("segmentFlushBody", [&](void*, void*, void*) -> void* {
+    flushesStarted.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  });
+  auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
+
+  {
+    IndexWriter iw(dir, [&]() { return schema; }, &budget);
+    iw.pressureFlushFloorBytes = 1;
+    auto& inverter = iw.obtainInverter();
+    for (int i = 0; i < 30; i++) {
+      inverter.startDoc();
+      inverter.getIndexHandler("body").index(
+          inverter, std::string_view("some repeated body text for sizing"));
+      inverter.finishDoc();
+    }
+    iw.releaseInverter(inverter);
+
+    int64_t parked = budget.reservedBytes();
+    ASSERT_GT(parked, 0);
+    budget.setTotalBytes(parked);
+    auto demand = budget.registerMergeDemand([]() {});
+    demand.publish(1);
+
+    for (int i = 0; i < 5000 && flushesStarted.load(std::memory_order_relaxed) == 0; i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(1, flushesStarted.load(std::memory_order_relaxed));
+
+    demand.publish(0);
+    budget.setTotalBytes(0);
+    iw.commit();
+    EXPECT_EQ(1u, iw.getIndexReader()->segments().size());
+  }
+}
+
+// Hold the demand-triggered inverter flush.  Once it releases its reservation,
+// the budget callback must admit multiple field batches, which are then held at
+// segmentMergeBody.  This is the regression shape: without published demand the
+// idle inverter parks the pool and merging remains serial until that inverter
+// happens to be released by some unrelated event.
+TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  for (int field = 0; field < 6; field++) {
+    std::string name = "text" + std::to_string(field);
+    schema->fieldTypeMap[name] = std::make_shared<TextFieldType>(
+        name, FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+  }
+
+  IndexRamBudget budget;
+  IndexWriter iw(dir, [&]() { return schema; }, &budget);
+  iw.mergePolicy->setMergeFactor(2);
+  iw.termPartitionMinBytes = INT64_MAX;
+  iw.pressureFlushFloorBytes = 1;
+
+  auto addDoc = [&](Inverter& inverter, int ord) {
+    inverter.startDoc();
+    for (int field = 0; field < 6; field++) {
+      std::string name = "text" + std::to_string(field);
+      std::string value = "common term" + std::to_string(ord);
+      inverter.getIndexHandler(name).index(inverter, value);
+    }
+    inverter.finishDoc();
+  };
+
+  auto& firstSource = iw.obtainInverter();
+  addDoc(firstSource, 0);
+  iw.releaseInverter(firstSource, true);
+  iw.commit();
+  ASSERT_EQ(1u, iw.getIndexReader()->segments().size());
+
+  // Keep the parked inverter busy while obtaining the second source inverter,
+  // then hold that source flush.  Releasing the parked inverter while the source
+  // is held leaves it idle before the source flush triggers the automatic merge.
+  auto& parkedInverter = iw.obtainInverter();
+  addDoc(parkedInverter, 10);
+  auto& secondSource = iw.obtainInverter();
+  addDoc(secondSource, 1);
+
+  std::atomic<int> sourceFlushesStarted = 0;
+  std::atomic<int> pressureFlushesStarted = 0;
+  std::atomic<int> mergeBodies = 0;
+  std::atomic<int64_t> maxDemand = 0;
+  std::atomic<int32_t> maxHypotheticalStreams = 0;
+  std::atomic<bool> releaseSourceFlush = false;
+  std::atomic<bool> releasePressureFlush = false;
+  std::atomic<bool> releaseMerges = false;
+  auto cleanup = luxir::scope_guard([&]() {
+    releaseSourceFlush.store(true, std::memory_order_relaxed);
+    releasePressureFlush.store(true, std::memory_order_relaxed);
+    releaseMerges.store(true, std::memory_order_relaxed);
+    iw.close();
+    Signal::unlisten("segmentFlushBody");
+    Signal::unlisten("segmentMergeBody");
+    Signal::unlisten("mergeAdmissionDemand");
+  });
+
+  Signal::listen("segmentFlushBody", [&](void* a, void*, void*) -> void* {
+    if (a == &secondSource) {
+      sourceFlushesStarted.fetch_add(1, std::memory_order_relaxed);
+      while (!releaseSourceFlush.load(std::memory_order_relaxed)) {
+        std::this_thread::yield();
+      }
+    } else if (a == &parkedInverter) {
+      pressureFlushesStarted.fetch_add(1, std::memory_order_relaxed);
+      while (!releasePressureFlush.load(std::memory_order_relaxed)) {
+        std::this_thread::yield();
+      }
+    }
+    return nullptr;
+  });
+  Signal::listen("segmentMergeBody", [&](void*, void*, void*) -> void* {
+    mergeBodies.fetch_add(1, std::memory_order_relaxed);
+    while (!releaseMerges.load(std::memory_order_relaxed)) {
+      std::this_thread::yield();
+    }
+    return nullptr;
+  });
+  Signal::listen("mergeAdmissionDemand", [&](void* a, void* b, void*) -> void* {
+    int64_t demand = *(int64_t*)a;
+    int64_t previous = maxDemand.load(std::memory_order_relaxed);
+    while (previous < demand
+           && !maxDemand.compare_exchange_weak(
+               previous, demand, std::memory_order_relaxed)) {
+    }
+    int32_t streams = *(int32_t*)b;
+    int32_t previousStreams = maxHypotheticalStreams.load(std::memory_order_relaxed);
+    while (previousStreams < streams
+           && !maxHypotheticalStreams.compare_exchange_weak(
+               previousStreams, streams, std::memory_order_relaxed)) {
+    }
+    return nullptr;
+  });
+
+  iw.releaseInverter(secondSource, true);
+  for (int i = 0; i < 5000
+                  && sourceFlushesStarted.load(std::memory_order_relaxed) == 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(1, sourceFlushesStarted.load(std::memory_order_relaxed));
+
+  iw.releaseInverter(parkedInverter);
+  int64_t cap = 16 * MergeCostModel::LIGHT_BYTES;
+  parkedInverter.ramGuard.forceResize(cap);
+  budget.setTotalBytes(cap);
+  releaseSourceFlush.store(true, std::memory_order_relaxed);
+
+  for (int i = 0; i < 5000
+                  && pressureFlushesStarted.load(std::memory_order_relaxed) == 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(1, pressureFlushesStarted.load(std::memory_order_relaxed));
+  EXPECT_EQ(5 * (MergeCostModel::LIGHT_BYTES + 4),
+            maxDemand.load(std::memory_order_relaxed))
+      << "only five three-stream text batches fit the virtual stream schedule";
+  EXPECT_EQ(15, maxHypotheticalStreams.load(std::memory_order_relaxed));
+
+  releasePressureFlush.store(true, std::memory_order_relaxed);
+  for (int i = 0; i < 5000 && mergeBodies.load(std::memory_order_relaxed) < 2; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_GE(mergeBodies.load(std::memory_order_relaxed), 2)
+      << "flush release must admit another batch while the head remains held";
+
+  releaseMerges.store(true, std::memory_order_relaxed);
+  for (int i = 0; i < 5000 && iw.testMergeRunning(); i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_FALSE(iw.testMergeRunning());
+  EXPECT_EQ(0, budget.pendingMergeDemandBytes());
+  budget.setTotalBytes(0);
+  iw.commit();
 }

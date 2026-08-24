@@ -444,6 +444,12 @@ public:
   using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
 
+  using PressureCheckMultiFunc =
+      tbb::flow::multifunction_node<tbb::flow::continue_msg, std::tuple<void*>>;
+  std::unique_ptr<PressureCheckMultiFunc> pressureCheckNode;
+  std::atomic<bool> pressureCheckQueued = false;
+  IndexRamBudget::PressureRegistration pressureRegistration;
+
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
 
@@ -570,7 +576,6 @@ public:
 
   // Releases an inverter back to the pool.
   void releaseInverter(Inverter& inverter, bool flush=false);
-  bool liveRamOverBudget() const;
 
   // Asynchronous commit that calls the callback when the commit is finished.  This should be preferred over blocking.
   void commit(std::function <void()>&& callback, UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
@@ -580,6 +585,11 @@ public:
   void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
 
 private:
+  void requestPressureCheck() noexcept;
+  void pressureCheckBody();
+  void pressureShedIdleLocked();
+  bool startIdleFlushLocked(Inverter& inverter, bool pressure);
+
   class ForceMergeMessage final : public MergeMessage {
   public:
     void handle(IndexWriter& iw) override { unused(iw); }
