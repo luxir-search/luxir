@@ -1463,11 +1463,30 @@ private:
     // When per-family codec/chunk-size becomes meaningful, look up the
     // StoredFieldType in the current schema here.
     StoredFieldsWriter writer(postingsWriter, resourceName);
+    std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
     for (auto& seg : segs) {
       const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
       StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
+
+      // Verbatim chunk copy: with no deletions every local doc maps to
+      // base + localId, and compressed chunk bodies are position-independent,
+      // so the whole source region is copied without decompression - the
+      // dominant cost of a large merge is otherwise this resource's serial
+      // LZ4 recompression.  Bodies reference the source's field-id table, so
+      // it must adopt into ours; deletions or a table mismatch fall back to
+      // the doc-by-doc re-add below.
+      if (!seg.hasDeletes() && writer.adoptFieldTable(reader.fieldNames())) {
+        writer.alignForRawAppend(seg.base);
+        reader.readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
+        writer.appendRawChunkRegion(seg.base, reader.chunkRegionPtr(),
+                                    reader.chunkRegionBytes(),
+                                    srcChunkFirstDocs, srcChunkOffsets,
+                                    reader.maxDoc(), reader.maxChunkBytes());
+        continue;
+      }
+
       int32_t maxDocIn = seg.postingsReader->maxDoc();
       for (int32_t localId = 0; localId < maxDocIn; localId++) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);

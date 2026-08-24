@@ -241,8 +241,27 @@ public:
   // Every field name this resource holds, in segment-local field-id order.
   // The views point into the resource's metadata in the segment file, so they
   // stay valid for as long as the PostingsReader this reader was opened on is
-  // alive - beyond this reader object itself.
+  // alive - beyond this reader object itself.  Merges also use this table to
+  // decide whether compressed chunk bodies (which reference these ids) can be
+  // copied verbatim.
   std::span<const std::string_view> fieldNames() const { return fieldNames_; }
+
+  // Raw access to the contiguous chunks region ([int32 uncompressedSize][LZ4
+  // bytes] per chunk, metadata excluded), for verbatim copy by merges.
+  const char* chunkRegionPtr() const { return chunkIS.ptr(chunksStart); }
+  int64_t chunkRegionBytes() const { return chunksRegionEnd - chunksStart; }
+
+  // Copy out the chunk directory: per-chunk first docID and file offset
+  // relative to the region start (the mono2 sentinel is not included).
+  void readChunkDirectory(std::vector<int64_t>& firstDocs,
+                          std::vector<int64_t>& fileOffsets) const {
+    firstDocs.resize((size_t)numChunks_);
+    fileOffsets.resize((size_t)numChunks_);
+    for (int32_t i = 0; i < numChunks_; i++) {
+      firstDocs[(size_t)i] = firstDocCol->valueAt(i);
+      fileOffsets[(size_t)i] = chunkOffsetCol->valueAt(i);
+    }
+  }
 
   // Cheap metadata-only read for merge admission.  Does not allocate or build
   // chunk offset readers; it only peeks at the stored-fields metadata header.

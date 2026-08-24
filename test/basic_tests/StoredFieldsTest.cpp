@@ -465,6 +465,61 @@ TEST_F(StoredFieldsTest, mergePreservesMultiValuedGrouping) {
   EXPECT_EQ(d1.vals[0].second, (std::vector<std::string>{"p", "q"}));
 }
 
+// A source segment whose field-id table conflicts with the output's cannot be
+// chunk-copied (compressed bodies reference the ids) and must fall back to the
+// doc-by-doc re-add.  Segment A sees body first, segment B sees title first,
+// segment C matches A again - so the merge runs copy, re-add, copy, which also
+// exercises sealing the re-add path's partial chunk before a raw append.
+TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
+  RAMDir dir;
+  auto schema = makeSchema();
+  {
+    IndexWriter iw(dir, [&]() { return schema; });
+    {
+      auto& inv = iw.obtainInverter();
+      inv.startDoc();
+      inv.getIndexHandler("body").index(inv, std::string_view("a-body"));
+      inv.getIndexHandler("title").index(inv, std::string_view("a-title"));
+      inv.finishDoc();
+      iw.releaseInverter(inv, true);
+      iw.commit();
+    }
+    {
+      auto& inv = iw.obtainInverter();
+      inv.startDoc();
+      inv.getIndexHandler("title").index(inv, std::string_view("b-title"));
+      inv.getIndexHandler("body").index(inv, std::string_view("b-body"));
+      inv.finishDoc();
+      iw.releaseInverter(inv, true);
+      iw.commit();
+    }
+    {
+      auto& inv = iw.obtainInverter();
+      inv.startDoc();
+      inv.getIndexHandler("body").index(inv, std::string_view("c-body"));
+      inv.finishDoc();
+      iw.releaseInverter(inv, true);
+      iw.commit();
+    }
+    ASSERT_EQ(iw.getIndexReader()->segments().size(), 3u);
+    iw.mergeSegments();
+  }
+
+  auto reader = std::make_shared<IndexReader>(dir);
+  ASSERT_EQ(reader->segments().size(), 1u);
+  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  ASSERT_NE(sfr, nullptr);
+  EXPECT_EQ(sfr->maxDoc(), 3);
+  EXPECT_EQ(readStored(*sfr, 0).flat(),
+            (std::vector<std::pair<std::string, std::string>>{
+                {"body", "a-body"}, {"title", "a-title"}}));
+  EXPECT_EQ(readStored(*sfr, 1).flat(),
+            (std::vector<std::pair<std::string, std::string>>{
+                {"title", "b-title"}, {"body", "b-body"}}));
+  EXPECT_EQ(readStored(*sfr, 2).flat(),
+            (std::vector<std::pair<std::string, std::string>>{{"body", "c-body"}}));
+}
+
 // Two TEXT fields routing to two different stored-fields resources (column
 // families) in the same segment.  Each resource writes its own chunks and
 // its own doc->chunk columns.
@@ -610,6 +665,37 @@ TEST_F(StoredFieldsTest, emptySegment) {
 // End-to-end: a STORED TEXT field should come back in search results when
 // requested via TopDocs.fields.
 class StoredFieldsSearchTest : public luxir::LuxirTest {};
+
+// A segment with deletions cannot be chunk-copied (doc ids compact); the merge
+// re-adds its live docs and the deleted doc's values must not survive.
+TEST_F(StoredFieldsSearchTest, mergeWithDeletesDropsDeletedStored) {
+  using namespace luxir::test;
+  CollectionHelper ch;
+
+  ch.index(flatdoc("id", std::string("d1"), "body_t", std::string("first")),
+           UpdateMessage::NO_COMMIT);
+  ch.index(flatdoc("id", std::string("d2"), "body_t", std::string("second")),
+           UpdateMessage::NO_COMMIT);
+  ch.index(flatdoc("id", std::string("d3"), "body_t", std::string("third")),
+           UpdateMessage::COMMIT);
+  // Delete d2, then force-merge to one segment: the merge sees deletions.
+  ASSERT_TRUE(ch.deleteById("d2", UpdateMessage::COMMIT, 1).success);
+
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "body_t"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(2, docs.size());
+  EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"),
+                                        "body_t", std::string("first"))));
+  EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d3"),
+                                        "body_t", std::string("third"))));
+}
+
 
 TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
   using namespace luxir::test;

@@ -226,6 +226,71 @@ public:
     return (int32_t)chunkFirstDocs.size();
   }
 
+  // --- Verbatim chunk-copy support (merges) -------------------------------
+  //
+  // Compressed chunk bodies are position-independent (doc offsets are
+  // chunk-relative) but reference the segment-local field-id table, so a
+  // source segment's chunks may be appended verbatim only when its table maps
+  // identically into this writer's.  A merge of a no-deletions source calls:
+  //   1. adoptFieldTable(source names)  - false means re-add doc by doc
+  //   2. alignForRawAppend(docBase)     - seal/pad so chunks cover [0, docBase)
+  //   3. appendRawChunkRegion(...)      - bulk-copy chunks, rebase directory
+
+  // Adopt the source's field-id table: every existing id must map to the same
+  // name; names beyond our table extend it.  Returns false (table unchanged)
+  // on any mismatch.
+  bool adoptFieldTable(std::span<const std::string_view> names) {
+    size_t common = (std::min)(names.size(), fieldNames.size());
+    for (size_t i = 0; i < common; i++) {
+      if (std::string_view(fieldNames[i].data(), fieldNames[i].size()) != names[i]) {
+        return false;
+      }
+    }
+    for (size_t i = fieldNames.size(); i < names.size(); i++) {
+      uint32_t id = (uint32_t)fieldNames.size();
+      fieldNames.emplace_back(postingsWriter.copyTerm(names[i]));
+      fieldNameToId.emplace(std::string(names[i]), id);
+    }
+    return true;
+  }
+
+  // Seal any partially accumulated chunk and pad empty docs so the written
+  // chunk sequence covers exactly [0, nextDoc).
+  void alignForRawAppend(int32_t nextDoc) {
+    if (currentDoc >= 0) {
+      finalizeCurrentDoc();
+    }
+    for (int32_t d = lastFinalizedDoc + 1; d < nextDoc; d++) {
+      appendEmptyDoc(d);
+    }
+    if (!chunkDocOffsets.empty()) {
+      flushChunk();
+    }
+    assert(lastFinalizedDoc == nextDoc - 1);
+  }
+
+  // Append a source segment's entire chunks region verbatim.  region/bytes
+  // are the source chunks ([int32 uncompressedSize][LZ4 bytes] each, metadata
+  // excluded); firstDocs/offsets its chunk directory (offsets relative to the
+  // region start); srcMaxDoc its doc count and srcMaxChunkBytes its stored
+  // max uncompressed chunk size.
+  void appendRawChunkRegion(int32_t docBase, const char* region, int64_t regionBytes,
+                            std::span<const int64_t> firstDocs,
+                            std::span<const int64_t> offsets,
+                            int32_t srcMaxDoc, int64_t srcMaxChunkBytes) {
+    assert(currentDoc < 0 && chunkDocOffsets.empty());
+    assert(lastFinalizedDoc == docBase - 1);
+    assert(firstDocs.size() == offsets.size() && !firstDocs.empty());
+    int64_t outBase = (int64_t)chunkOutput->size() - chunksStart;
+    for (size_t i = 0; i < firstDocs.size(); i++) {
+      chunkFirstDocs.push_back(docBase + firstDocs[i]);
+      chunkFileOffsets.push_back(outBase + offsets[i]);
+    }
+    chunkOutput->write(region, (size_t)regionBytes);
+    maxChunkBytes = (std::max)(maxChunkBytes, srcMaxChunkBytes);
+    lastFinalizedDoc = docBase + srcMaxDoc - 1;
+  }
+
 private:
   void transitionToDoc(int32_t docID) {
     assert(docID >= 0);
