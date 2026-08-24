@@ -13,6 +13,13 @@
 #include <thread>
 #include <vector>
 
+#include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/IndexWriter.h"
+#include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/store/Directory.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -191,4 +198,85 @@ TEST_F(AutoFlushTest, pressureFlushRespectsFloor) {
   auto reader = iw->getIndexReader();
   EXPECT_EQ(reader->segments().size(), 1u)
       << "below-floor inverters must not be pressure-flushed";
+}
+
+// The pressure gate allows concurrent sheds and discounts in-flight flushes:
+// while the pool stays over cap net of flushes already draining, every release
+// sheds another idle inverter (the old gate allowed only one shed in flight,
+// capping the drain rate at one single-threaded flush); once the in-flight
+// flushes cover the overage, fresh inverters are NOT shed, so a shed burst
+// does not respawn as a stream of floor-sized segments.  Flushes are held in
+// flight via the segmentFlushBody test seam.
+TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+
+  IndexRamBudget budget(0);  // per-step caps set below
+  std::atomic<int> flushesStarted{0};
+  std::atomic<bool> releaseFlushes{false};
+  Signal::listen("segmentFlushBody", [&](void*, void*, void*) -> void* {
+    flushesStarted.fetch_add(1);
+    while (!releaseFlushes.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return nullptr;
+  });
+  auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
+
+  {
+    IndexWriter iw(dir, [&]() { return schema; }, &budget);
+    iw.pressureFlushFloorBytes = 1;  // every inverter is a valid victim
+
+    // Three concurrently-busy inverters so obtainInverter cannot reuse an
+    // idle one: A and B sizable, C small.
+    auto addDocs = [](Inverter& inv, int n) {
+      for (int i = 0; i < n; i++) {
+        inv.startDoc();
+        inv.getIndexHandler("body").index(
+            inv, std::string_view("some repeated body text for sizing"));
+        inv.finishDoc();
+      }
+    };
+    auto& invA = iw.obtainInverter();
+    addDocs(invA, 30);
+    auto& invB = iw.obtainInverter();
+    addDocs(invB, 30);
+    auto& invC = iw.obtainInverter();
+    addDocs(invC, 1);
+
+    budget.setTotalBytes(1);  // any accounted inverter RAM overdraws the cap
+    iw.releaseInverter(invA);  // resyncs A's guard, over cap -> shed A
+    int64_t rA = budget.reservedBytes();
+    ASSERT_GT(rA, 1);
+    iw.releaseInverter(invB);  // over cap even net of A's in-flight flush -> shed B too
+    for (int i = 0; i < 5000 && flushesStarted.load() < 2; i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(flushesStarted.load(), 2)
+        << "second over-budget release must shed with a flush already in flight";
+
+    // Cap between C's size and A+B: the pool is over cap, but the in-flight
+    // flushes cover the overage, so releasing C must not shed it.
+    int64_t rAB = budget.reservedBytes();
+    budget.setTotalBytes(rAB / 2);
+    iw.releaseInverter(invC);
+    int64_t rC = budget.reservedBytes() - rAB;
+    ASSERT_LT(rC, rAB / 2) << "test premise: C must fit under the cap alone";
+    ASSERT_GT(budget.reservedBytes(), rAB / 2) << "test premise: pool over cap";
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(flushesStarted.load(), 2)
+        << "in-flight flushes cover the overage; C must not be shed";
+
+    budget.setTotalBytes(0);  // unlimited: commit-time flushes run unpressured
+    releaseFlushes.store(true);
+    iw.commit();
+
+    auto reader = iw.getIndexReader();
+    EXPECT_EQ(reader->segments().size(), 3u);  // A shed, B shed, C at commit
+    int64_t totalDocs = 0;
+    for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+    EXPECT_EQ(totalDocs, 61);
+  }
 }

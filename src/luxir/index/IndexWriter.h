@@ -436,6 +436,11 @@ public:
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > updateSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> updateFinishNode;
 
+  // Graph node priorities (higher runs first; update batches stay at
+  // tbb::flow::no_priority).  See the node construction in the ctor.
+  static constexpr tbb::flow::node_priority_t MERGE_PRIORITY = 1;
+  static constexpr tbb::flow::node_priority_t FLUSH_PRIORITY = 2;
+
   using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
 
@@ -565,6 +570,7 @@ public:
 
   // Releases an inverter back to the pool.
   void releaseInverter(Inverter& inverter, bool flush=false);
+  bool liveRamOverBudget() const;
 
   // Asynchronous commit that calls the callback when the commit is finished.  This should be preferred over blocking.
   void commit(std::function <void()>&& callback, UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);

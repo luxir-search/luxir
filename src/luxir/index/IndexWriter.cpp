@@ -212,14 +212,20 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
   tbb::flow::make_edge(*processUpdateNode, *updateSequencerNode);
   tbb::flow::make_edge(*updateSequencerNode, *updateFinishNode);
 
-  // now the commit nodes
+  // now the commit nodes.  Flushes and merges run at a higher graph priority
+  // than update batches: a prioritized graph task is submitted as a critical
+  // task in the graph's arena, so workers take it ahead of any queued batch.
+  // A flush frees inverter RAM while every queued batch adds to it, so under a
+  // firehose (hundreds of batches in flight) a flush that waited its turn
+  // behind them would let the budget overshoot by the whole queue; a merge
+  // that waited would let segments pile up for the commit to pay for.
   segmentFlushNode = std::make_unique<InverterMultiFunc>(updateGraph, tbb::flow::unlimited,
     [this](Inverter* inverter,
     InverterMultiFunc::output_ports_type& op) {
       unused(op);
       // TODO: handle exceptions
       this->segmentFlushBody(*inverter);
-    });
+    }, FLUSH_PRIORITY);
 
   commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
     [](UpdateMessage* msg) -> size_t {
@@ -270,7 +276,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
           LOG_ERROR("mergeSegmentsNode completion threw: exception={}", e2.what());
         }
       }
-    });
+    }, MERGE_PRIORITY);
 }
 
 IndexWriter::~IndexWriter() {
@@ -511,6 +517,30 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
 }
 
 
+// True when the pool would still be over its cap after every in-flight flush
+// of this writer completes, i.e. when shedding another live inverter can
+// actually help.  Without the discount a burst of sheds would keep firing on
+// the fresh inverters that replace the shed ones (their reservations are held
+// until each flush completes), flushing them at the size floor until the
+// burst drains.
+//
+// One live inverter can still park the pool at the cap and starve merge
+// admission (SegmentMerger::MergeAdmissionDriver falls back to one
+// force-admitted batch at a time); reserving merge headroom is deliberately
+// NOT this gate's job - it belongs to the budget/admission redesign (the
+// overdraft-token TODO in IndexRamBudget.h).
+//
+// Caller holds indexMutex.  O(#flushing) - a few dozen guards at most, once
+// per released batch.  Guard sizes are as of each inverter's last release,
+// which is the granularity the pool is kept at anyway.
+bool IndexWriter::liveRamOverBudget() const {
+  int64_t flushingBytes = 0;
+  for (const auto& entry : flushingInverters) {
+    flushingBytes += entry.first->ramGuard.size();
+  }
+  return indexRamBudget->reservedBytes() - flushingBytes > indexRamBudget->totalBytes();
+}
+
 void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // The undo scope is the update message that held this inverter; marks must
   // not outlive the release.
@@ -555,13 +585,19 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
 
   // Global-budget pressure: if total indexing RAM (inverters plus merge
   // reservations) was over the cap at the resync above, flush the largest idle
-  // inverter - possibly the one just released. At most one pressure flush in flight (the
-  // flushingInverters gate): flushes already draining will free RAM, and the
-  // next release re-evaluates (batches are pushed through the indexing graph,
-  // so releases keep arriving while there is anything to shed; once traffic
-  // stops, commit reclaims what remains). The size floor avoids shedding tiny
-  // inverters (and spamming tiny segments) when merges hold most of the budget.
-  if (flushingInverters.empty() && ramOverBudget) {
+  // inverter - possibly the one just released - unless the flushes already in
+  // flight would bring the pool back under the cap on their own.  Flushing
+  // inverters keep their reservation until the flush completes, so without
+  // discounting them a burst of sheds would keep firing on the fresh inverters
+  // that replace the shed ones, flushing them at the size floor until the
+  // burst drains.  Every release re-evaluates (batches are pushed through the
+  // indexing graph, so releases keep arriving while there is anything to
+  // shed; once traffic stops, commit reclaims what remains), and under a
+  // firehose that sheds one inverter per release until live RAM is back under
+  // budget, so the drain rate tracks the inflow rather than being capped at one
+  // flush at a time.  The size floor avoids shedding tiny inverters (and
+  // spamming tiny segments) when merges hold most of the budget.
+  if (ramOverBudget && liveRamOverBudget()) {
     Inverter* victim = nullptr;
     for (auto& entry : idleInverters) {
       if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
@@ -762,6 +798,9 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
+  // Test seam; emitted before any lock so a blocking listener can hold flushes
+  // in flight without stalling releaseInverter.
+  Signal::emit("segmentFlushBody", &inverter);
 
   std::vector<std::string> flushedFiles;
   bool success = false;
