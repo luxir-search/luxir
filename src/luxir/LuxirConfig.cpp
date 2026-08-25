@@ -66,6 +66,12 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "(0 = unlimited)")
       ->check(CLI::NonNegativeNumber)
       ->default_str("25% of system RAM");
+  app.add_option("--malloc-mmap-threshold", malloc_mmap_threshold,
+                 "glibc malloc mmap threshold in bytes (0 = glibc dynamic default, "
+                 "-1 = pin at the MemPool block size; recommended for "
+                 "memory-constrained nodes)")
+      ->check(CLI::Number)
+      ->default_str("0");
 
   // No default_val: leaving the bound field at its sentinel (<0) lets normalize()
   // derive the gRPC port as http.port + 1 unless the user sets one explicitly.

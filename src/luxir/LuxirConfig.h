@@ -139,6 +139,16 @@ struct LuxirConfig {
   // sentinel take a share of this.  Resolved by resolveRamBudgets().
   int64_t max_ram_mb = -1;
 
+  // glibc malloc mmap threshold (bytes): allocations at or above it are mmap'd
+  // and returned to the OS on free.  0 = leave glibc's dynamic default (no
+  // mallopt call); -1 = pin at MemPool::BYTE_BLOCK_SIZE so pool blocks and
+  // large buffers bypass malloc arenas - arenas retain freed memory and
+  // serialize cross-thread frees, so pinning cuts indexing RSS and wall-clock
+  // sharply on memory-constrained nodes, at some cost to queries that malloc
+  // above the threshold per request (large facet counters); > 0 = explicit
+  // bytes.  Applied once at startup by luxir_main.
+  int64_t malloc_mmap_threshold = 0;
+
   std::string log_level = "info";
   size_t filterCacheBytes = 64ULL * 1024 * 1024;
   ServerConfig server;

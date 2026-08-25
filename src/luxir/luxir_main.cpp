@@ -2,7 +2,12 @@
 #include <optional>
 #include <sstream>
 #include <thread>
+#include <climits>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include "luxir/luxir_main.h"
+#include "luxir/util/MemPool.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
@@ -26,6 +31,19 @@ int luxir_main(int argc, char** argv) {
   } catch (const CLI::ParseError &e) {
     return app.exit(e);
   }
+
+#ifdef __GLIBC__
+  // An explicit mallopt permanently disables glibc's dynamic mmap-threshold
+  // ratchet (freeing an mmap'd chunk raises the threshold to its size, up to
+  // 32M, after which mid-size allocations are arena-retained on free and
+  // cross-thread frees serialize on arena mutexes).  See the config comment
+  // for the tradeoff; 0 leaves glibc untouched.
+  if (config.malloc_mmap_threshold != 0) {
+    int64_t t = config.malloc_mmap_threshold < 0 ? (int64_t)MemPool::BYTE_BLOCK_SIZE
+                                                 : config.malloc_mmap_threshold;
+    mallopt(M_MMAP_THRESHOLD, (int)std::min(t, (int64_t)INT_MAX));
+  }
+#endif
 
   try {
     config.normalize();
