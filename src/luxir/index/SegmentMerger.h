@@ -1279,8 +1279,13 @@ private:
                         output.plan.lower, output.plan.upper, rangePool);
       output.result = writer.finishTermRun();
       termsOut.flush(true);
-      docsOut.flush(true);
-      posOut.flush(true);
+      // A nonempty row embeds these file numbers in the terms stream, so make
+      // their per-range files durable before release. Empty ranges produce no
+      // row and should leave header-only streams buffered for reuse/collapse.
+      if (output.result.nTerms != 0) {
+        docsOut.flush(true);
+        posOut.flush(true);
+      }
 
       Signal::emit("termRangeStreamsCheckedOut", &output.docsBase, &output.posBase,
                    &rangeOrd);
@@ -1320,6 +1325,12 @@ private:
         rows.push_back(TermRangeRow{
             (uint64_t) termOrd, (uint32_t) blockOrd, 0, output.docsBase, output.posBase,
             termsBase, result.docsBytes, result.posBytes});
+        // Absolute bases normally live only in IndexFieldInfo and are patched
+        // before serialization. TermRangeRow is the one append-only exception;
+        // sparse survivor filenums let us pin its files instead of rewriting it.
+        std::array<uint32_t, 3> rowFiles = {
+            termsBase.filenum(), output.docsBase.filenum(), output.posBase.filenum()};
+        merger.postingsWriter.protectOutputFiles(rowFiles);
         termsOut.appendFile(output.termsFile);
         blockOffsets.insert(blockOffsets.end(), result.termBlockOffsets.begin(),
                             result.termBlockOffsets.end());

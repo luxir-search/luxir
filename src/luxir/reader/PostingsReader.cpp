@@ -50,23 +50,39 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   segInfoOffset = firstIS.size() - sizeof(int32_t) - segInfoSize;
   firstIS.seek(segInfoOffset);
   maxdoc = firstIS.readVint();
-  int nFiles = firstIS.readVint();
+  uint32_t physicalFileCount = firstIS.readVint();
+  if (physicalFileCount == 0) {
+    throw std::runtime_error("Segment physical-file list is empty");
+  }
+  std::vector<uint32_t> physicalFileNums;
+  physicalFileNums.reserve(physicalFileCount);
+  uint32_t previous = 0;
+  for (uint32_t i = 0; i < physicalFileCount; i++) {
+    uint32_t fileNum = firstIS.readVint();
+    if ((i == 0 && fileNum != 0) || (i != 0 && fileNum <= previous)) {
+      throw std::runtime_error("Segment physical-file list is not strictly sorted from file 0");
+    }
+    physicalFileNums.push_back(fileNum);
+    previous = fileNum;
+  }
 
-  files.reserve(nFiles);
-  inputStreams.reserve(nFiles);
+  files.resize((size_t) physicalFileNums.back() + 1);
+  inputStreams.resize((size_t) physicalFileNums.back() + 1);
 
-  for (int i=1; i<nFiles; i++) {
-    files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i), expectSynced));
-    if (files.back().get() == nullptr) {
+  for (size_t i = 1; i < physicalFileNums.size(); i++) {
+    uint32_t fileNum = physicalFileNums[i];
+    std::string fileName = Postings::getIndexFileName(segStr, fileNum);
+    files[fileNum] = dir.openFile(fileName, expectSynced);
+    if (files[fileNum] == nullptr) {
       if (missingFileOK) {
         return false;
       }
       throw std::filesystem::filesystem_error(
-              std::format("Can't find/open segment file '{}'", Postings::getIndexFileName(segStr, i)),
+              std::format("Can't find/open segment file '{}'", fileName),
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
-    validateSegmentFileHeader(*files.back(), Postings::getIndexFileName(segStr, i));
-    inputStreams.emplace_back(files.back()->getInputStream());
+    validateSegmentFileHeader(*files[fileNum], fileName);
+    inputStreams[fileNum] = files[fileNum]->getInputStream();
   }
   return true;
 }

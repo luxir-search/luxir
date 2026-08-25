@@ -105,6 +105,30 @@ struct SegFieldInfo {
   // single-valued fields valueRank == docRank so no map is needed.
   seg_location valDocLoc;
   int64_t valDocMetaOff;
+
+  // Within-file references are relative; these are the complete set of
+  // segment-global bases.  Relocate them together before FieldInfo is
+  // serialized so adding a new absolute base cannot silently update only one
+  // writer path.  {0,0} is the null sentinel, not file 0 offset 0.
+  template <typename Relocator>
+  void relocateLocations(Relocator&& relocator) {
+    auto relocate = [&](seg_location& location) {
+      if (!location.isNull()) location = relocator(location);
+    };
+    relocate(termBlockIndexLoc);
+    relocate(termsLoc);
+    relocate(docsLoc);
+    relocate(posLoc);
+    relocate(trieLoc);
+    relocate(rangeTableLoc);
+    relocate(docsWithFieldEndLoc);
+    relocate(columnLoc);
+    relocate(pointsLoc);
+    relocate(normsLoc);
+    relocate(monoLoc);
+    relocate(mono2Loc);
+    relocate(valDocLoc);
+  }
 };
 
 

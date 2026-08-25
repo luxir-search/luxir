@@ -18,6 +18,8 @@ class seg_location {
   static constexpr uint64_t OFFSET_MASK = (~uint64_t(0)) >> FILENUM_BITS;
 
 public:
+  static constexpr uint64_t maxOffset() noexcept { return OFFSET_MASK; }
+
   seg_location() noexcept : x(0) {}
 
   seg_location(uint32_t fnum, uint64_t offset) noexcept {
@@ -113,6 +115,13 @@ public:
 
   size_t buffered() const noexcept { return start == nullptr ? 0 : (size_t)(pos - start); }
 
+  bool hasFlushedBytes() const noexcept { return flushedSize != 0; }
+
+  // A stream is relocatable while all of its bytes are still owned by its
+  // current output buffer.  Keep this predicate at the stream boundary so a
+  // RAM-delegating File can broaden it later without changing segment finalize.
+  bool isRelocatable() const noexcept { return !hasFlushedBytes(); }
+
   size_t reserved() const noexcept {
     return pos == nullptr ? 0 : (size_t)(end - pos);
   }
@@ -145,6 +154,32 @@ public:
   // Flushes both sides, destructively appends file, updates size accounting,
   // and leaves this stream ready for continued writes.
   void appendFile(RAMFile& file);
+
+  // Append a relocatable stream as one affine region.  The source starts at
+  // offset zero, so aligning its new base preserves every within-file
+  // alignment.  Returns false if the source has spilled or the combined file
+  // would exceed seg_location's 44-bit offset space.
+  bool tryAppendRelocatable(OutputStream& source, size_t alignment,
+                            uint64_t& baseOffset) {
+    assert(this != &source);
+    assert(alignment > 0);
+    if (!source.isRelocatable()) return false;
+
+    uint64_t current = (uint64_t) size();
+    uint64_t sourceBytes = (uint64_t) source.buffered();
+    uint64_t padding = (alignment - current % alignment) % alignment;
+    if (current > seg_location::maxOffset()
+        || padding > seg_location::maxOffset() - current
+        || sourceBytes > seg_location::maxOffset() - current - padding) {
+      return false;
+    }
+
+    align(alignment);
+    baseOffset = (uint64_t) size();
+    write(source.start, source.buffered());
+    source.pos = source.start;
+    return true;
+  }
 
   // pretend that numBytes have been written and move ptr() that many bytes forward in the buffer.
   // requires reserved() >= numBytes as a prerequisite.

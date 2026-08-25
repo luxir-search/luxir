@@ -17,7 +17,10 @@ class DocsEnum;
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
 // This does not contain deleted docs, so instances can be shared by different index versions.
 class PostingsReader {
-  std::vector<std::shared_ptr<InputFile>> files;  // keeps files live while this PostingsReader is live.
+  // Indexed by physical filenum and intentionally sparse. Segment finalize
+  // folds buffered streams without renaming survivors, which keeps already
+  // spilled filesystem/object-store keys stable.
+  std::vector<std::shared_ptr<InputFile>> files;
   std::vector<InputStream> inputStreams;
   int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
@@ -61,12 +64,12 @@ public:
     return maxdoc;
   }
 
-  // Total bytes in the base segment files this reader can merge.  inputStreams
-  // contains every postings and column file named by the segment info.
+  // Total bytes in the physical base-segment files this reader can merge.
   uint64_t sizeInBytes() const noexcept {
     uint64_t total = 0;
-    for (const auto& stream : inputStreams) {
-      uint64_t bytes = (uint64_t) stream.size();
+    for (const auto& file : files) {
+      if (file == nullptr) continue;
+      uint64_t bytes = (uint64_t) file->size();
       total = bytes > std::numeric_limits<uint64_t>::max() - total
           ? std::numeric_limits<uint64_t>::max() : total + bytes;
     }
@@ -75,6 +78,7 @@ public:
 
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
+    assert(files[fnum] != nullptr);
     return files[fnum].get();
   }
 
@@ -85,6 +89,7 @@ public:
   // though?  How to coordinate?
   InputStream getInputStream(uint32_t fnum) {
     assert(fnum < inputStreams.size());
+    assert(files[fnum] != nullptr);
     return inputStreams[fnum];
   }
 

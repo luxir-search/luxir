@@ -11,6 +11,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -57,8 +58,8 @@ private:
   int32_t maxDoc;  // set by caller
   int64_t sizeInBytes = 0; // total size of all files written
 
-  // files available for use, sorted so largest are at the back.  This is done to keep the smallest files small
-  // so they can be just appended to the end of a large file (when we implement that functionallity.)
+  // Files available for use, sorted so largest are at the back. Reusing the
+  // largest keeps residual streams small enough to fold into file 0 at finish.
   std::vector<OutputStream*> freeFiles;
   std::string segStr;
 
@@ -66,6 +67,13 @@ private:
     OutputStream out;
     std::unique_ptr<File> file;
     uint32_t fileNum;
+    bool collapseProtected = false;
+    bool collapsed = false;
+  };
+
+  struct FileRelocation {
+    uint32_t fileNum;
+    uint64_t baseOffset;
   };
   std::deque<DataFile> files;
   // These are dequeues so elements don't move
@@ -193,6 +201,18 @@ public:
     }
   }
 
+  // A TermRangeRow is already embedded in the shared terms stream by segment
+  // finalize.  Pin every file it names so collapse never has to patch an
+  // append-only row in place.  Survivor filenums remain stable because file 0
+  // stores a sparse physical-file list.
+  void protectOutputFiles(std::span<const uint32_t> fileNums) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    for (uint32_t fileNum : fileNums) {
+      assert(fileNum < (uint32_t) files.size());
+      files[fileNum].collapseProtected = true;
+    }
+  }
+
 
   uint64_t getSegId() const {
     return segId;
@@ -212,9 +232,9 @@ public:
     // Make sure that there are no outstanding files.
     // Do this for non-debug mode as well?
     assert(freeFiles.size() == files.size());
+    std::vector<uint32_t> survivorFileNums = collapseFiles();
     writeFieldIndex();
-    writeSegmentInfo();
-    // TODO: implement compound files for small files
+    writeSegmentInfo(survivorFileNums);
 
     // The StreamVByte AVX tail decoder used by postings iteration, and the
     // LinearPack bulk decoder used by ord columns, may read up to
@@ -224,17 +244,18 @@ public:
     // written above, which already provide far more trailing slack, so it is
     // skipped. Padding past its segment-info size marker would also break the
     // end-relative read in PostingsReader.
-    if (files.size() > 1) {
+    if (survivorFileNums.size() > 1) {
       static const char svbPad[SVB_OVERREAD_PAD] = {};
-      for (size_t i = 1; i < files.size(); i++) {
-        files[i].out.write(svbPad, SVB_OVERREAD_PAD);
+      for (uint32_t fileNum : survivorFileNums) {
+        if (fileNum != 0) files[fileNum].out.write(svbPad, SVB_OVERREAD_PAD);
       }
     }
 
     if (filenames) {
-      filenames->reserve(filenames->size() + files.size());
+      filenames->reserve(filenames->size() + survivorFileNums.size());
     }
-    for (auto& dataFile : files) {
+    for (uint32_t fileNum : survivorFileNums) {
+      auto& dataFile = files[fileNum];
       sizeInBytes += dataFile.out.size();
       dataFile.out.close();
       directory.finishFile(*dataFile.file);
@@ -243,6 +264,7 @@ public:
       }
     }
 
+    freeFiles.clear();
     fieldInfos.resize(0);
     files.resize(0);
     return true;
@@ -265,13 +287,66 @@ public:
   uint64_t writeLiveDocs(const screaming::FixedBitSet& liveBits, int32_t numLiveDocs);
 
 private:
-  void writeSegmentInfo() {
+  std::vector<uint32_t> collapseFiles() {
+    assert(!files.empty());
+    std::vector<FileRelocation> relocations;
+    relocations.reserve(files.size());
+    for (uint32_t fileNum = 0; fileNum < (uint32_t) files.size(); fileNum++) {
+      relocations.push_back({fileNum, 0});
+    }
+
+    // File 0 is mandatory for field and segment metadata, so it is the only
+    // target that guarantees a tiny segment becomes one physical file.  Keep
+    // survivor filenums sparse instead of densely renumbering them: a stream
+    // that already spilled can retain its storage key, avoiding rename/copy
+    // work on filesystems and future object stores.
+    OutputStream& target = files[0].out;
+    for (uint32_t fileNum = 1; fileNum < (uint32_t) files.size(); fileNum++) {
+      DataFile& source = files[fileNum];
+      if (source.collapseProtected) continue;
+      uint64_t baseOffset = 0;
+      if (target.tryAppendRelocatable(source.out, 8, baseOffset)) {
+        source.collapsed = true;
+        relocations[fileNum] = {0, baseOffset};
+      }
+    }
+
+    auto relocate = [&](seg_location location) {
+      uint32_t fileNum = location.filenum();
+      if (fileNum >= relocations.size()) {
+        throw std::logic_error("FieldInfo references an unknown segment file");
+      }
+      const FileRelocation& relocation = relocations[fileNum];
+      if (location.offset() > seg_location::maxOffset() - relocation.baseOffset) {
+        throw std::length_error("relocated segment offset exceeds seg_location");
+      }
+      return seg_location(relocation.fileNum,
+                          relocation.baseOffset + location.offset());
+    };
+    for (auto& fieldInfo : fieldInfos) {
+      fieldInfo.relocateLocations(relocate);
+    }
+
+    std::vector<uint32_t> survivors;
+    survivors.reserve(files.size());
+    for (uint32_t fileNum = 0; fileNum < (uint32_t) files.size(); fileNum++) {
+      if (!files[fileNum].collapsed) survivors.push_back(fileNum);
+    }
+    assert(!survivors.empty() && survivors[0] == 0);
+    return survivors;
+  }
+
+  void writeSegmentInfo(std::span<const uint32_t> survivorFileNums) {
     // TODO: if maxDoc==0, does this cause issues elsewhere?
     // assert(maxDoc >= 1);
     OutputStream& out = files[0].out;
     auto outStart = out.size();
     out.writeVint(maxDoc);
-    out.writeVint(files.size());
+    // Physical filenums are intentionally sparse.  Dense renumbering would
+    // require renaming a file after it had started spilling, which becomes an
+    // object-store copy.  Readers keep a filenum-indexed table with holes.
+    out.writeVint((uint32_t) survivorFileNums.size());
+    for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
     auto segInfoSize = out.size() - outStart;
     out.writeInt(segInfoSize);
   }

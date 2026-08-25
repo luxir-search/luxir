@@ -176,6 +176,16 @@ SegFieldInfo readBodyInfo(MemPool& pool, Segment& segment) {
   return info;
 }
 
+size_t baseFileCount(Directory& directory, uint64_t segId) {
+  std::vector<Directory::FileInfo> files;
+  directory.listFiles(files);
+  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  return (size_t) std::count_if(files.begin(), files.end(), [&](const auto& file) {
+    return file.name.starts_with(prefix + "_")
+        && !file.name.starts_with(prefix + "__");
+  });
+}
+
 FieldSnapshot snapshotField(MemPool& pool, Segment& segment) {
   SegFieldInfo info = readBodyInfo(pool, segment);
   FieldSnapshot snapshot;
@@ -420,12 +430,40 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
 TEST(TermPartitionMergeTest, EmptyRangesAreOmitted) {
   auto schema = textSchema();
   TestIndex oneRange;
-  SegFieldInfo oneInfo = buildSparseRanges(oneRange, schema, true);
+  std::atomic<int32_t> checkedOut = 0;
+  SegFieldInfo oneInfo;
+  {
+    Signal::listen("termRangeStreamsCheckedOut", [&](void*, void*, void*) -> void* {
+      checkedOut.fetch_add(1, std::memory_order_relaxed);
+      while (checkedOut.load(std::memory_order_relaxed) < 4) {
+        std::this_thread::yield();
+      }
+      return nullptr;
+    });
+    auto signalCleanup = luxir::scope_guard([]() {
+      Signal::unlisten("termRangeStreamsCheckedOut");
+    });
+    oneInfo = buildSparseRanges(oneRange, schema, true);
+  }
   ASSERT_FALSE(oneInfo.rangeTableLoc.isNull());
+  ASSERT_EQ(4, checkedOut.load(std::memory_order_relaxed));
   InputStream table = oneRange.reader->segments()[0].postingsReader()
       .getInputStreamSeek(oneInfo.rangeTableLoc);
   const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
   EXPECT_EQ(1u, header->nRanges);
+  const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
+  EXPECT_NE(nullptr, oneRange.reader->segments()[0].postingsReader()
+                         .getFile(rows[0].termsBase.filenum()));
+  EXPECT_NE(nullptr, oneRange.reader->segments()[0].postingsReader()
+                         .getFile(rows[0].docsBase.filenum()));
+  EXPECT_NE(nullptr, oneRange.reader->segments()[0].postingsReader()
+                         .getFile(rows[0].posBase.filenum()));
+  EXPECT_EQ(3u, baseFileCount(oneRange.dir,
+                              oneRange.reader->segments()[0].segInfo.seg_id));
+  FieldSnapshot snapshot = snapshotField(oneRange.pool,
+                                         oneRange.reader->segments()[0]);
+  ASSERT_EQ(1u, snapshot.terms.size());
+  ASSERT_EQ(1u, snapshot.terms[0].postings.size());
 
   TestIndex allEmpty;
   SegFieldInfo emptyInfo = buildSparseRanges(allEmpty, schema, false);

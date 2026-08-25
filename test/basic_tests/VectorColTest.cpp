@@ -209,10 +209,10 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
   std::filesystem::remove_all(path);
 }
 
-// Stored fields and vectors each hold a stream while documents are indexed.
-// Both must release it before the full-text field checks out its three streams,
-// allowing the segment to stay at that three-stream high-water mark.
-TEST_F(VectorColTest, indexingStreamsReleasedBeforeFieldFlush) {
+// Stored fields and vectors release their indexing streams before the full-text
+// flush reuses them. None spills on this tiny segment, so finalize can fold the
+// three-stream high-water mark back into mandatory file 0.
+TEST_F(VectorColTest, indexingStreamsReuseAndCollapse) {
   TestIndex testIndex;
   auto& inverter = testIndex.getInverter();
   uint64_t segId = inverter.getSegId();
@@ -231,7 +231,7 @@ TEST_F(VectorColTest, indexingStreamsReleasedBeforeFieldFlush) {
   size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const Directory::FileInfo& file) {
     return file.name.starts_with(dataPrefix);
   });
-  EXPECT_EQ(3u, dataFiles);
+  EXPECT_EQ(1u, dataFiles);
 }
 
 // Low-level: multi-valued vector round-trip using the default "_vs" suffix.
