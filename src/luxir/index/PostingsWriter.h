@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
+#include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/store/OutputStream.h"
@@ -28,6 +29,7 @@
 #include "luxir/codec/Codec.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/screaming.h"
+#include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
 
 
@@ -49,6 +51,9 @@ namespace luxir {
  */
 class PostingsWriter {
 public:
+  static constexpr uint64_t SMALL_SEGMENT_BYTES = 64ULL << 20;
+  static constexpr size_t RAM_SPILL_BYTES = 4ULL << 20;
+
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
   };
@@ -63,6 +68,14 @@ private:
   std::vector<OutputStream*> freeFiles;
   std::string segStr;
 
+  // Actual RAM retained by filesystem delegating files is a separate forced
+  // reservation from inverter or merge working memory. Writes never wait, but
+  // reservation growth still wakes the existing pressure machinery.
+  std::mutex delegatedRamMutex;
+  IndexRamBudget::Guard delegatedRamGuard;
+  int64_t delegatedRamBytes = 0;
+  bool ramDelegatingFiles = false;
+
   struct DataFile {
     OutputStream out;
     std::unique_ptr<File> file;
@@ -75,6 +88,7 @@ private:
     uint32_t fileNum;
     uint64_t baseOffset;
   };
+  static constexpr uint32_t DROPPED_FILE = UINT32_MAX;
   std::deque<DataFile> files;
   // These are dequeues so elements don't move
   // TODO: put these in the pool?
@@ -88,9 +102,33 @@ public:
   uint64_t segId;
 
 public:
-  PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
+  PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc = -1,
+                 IndexRamBudget* ramBudget = nullptr,
+                 bool ramDelegatingFiles = false)
+      : directory(dir), maxDoc(maxDoc),
+        delegatedRamGuard(ramBudget == nullptr
+            ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
+        ramDelegatingFiles(ramDelegatingFiles), segId(segId)
   {
     segStr = Postings::getSortableString(segId);
+  }
+
+  void configureRamDelegation(bool enabled,
+                              IndexRamBudget* ramBudget = nullptr) {
+    {
+      const std::lock_guard<std::mutex> lock(delegatedRamMutex);
+      if (ramBudget != nullptr && !delegatedRamGuard) {
+        assert(delegatedRamBytes == 0);
+        delegatedRamGuard = IndexRamBudget::Guard(*ramBudget, 0);
+      }
+      ramDelegatingFiles = enabled;
+    }
+    if (!enabled) {
+      // Called only after indexing has quiesced or before a merge starts.
+      // Existing candidate streams must spill too; changing only future file
+      // creation would retain threshold times stream-count RAM on a big flush.
+      for (auto& file : files) file.out.disableRamBuffering();
+    }
   }
 
   Directory& getDirectory() {
@@ -135,7 +173,14 @@ private:
     while (freeFiles.size() < numFiles) {
       uint32_t fnum = (uint32_t)files.size();
       // TODO: in the future, if this does IO, we may not want to lock?
-      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segStr, fnum));
+      Directory::FileCreateOptions options;
+      options.ramDelegating = ramDelegatingFiles;
+      options.ramSpillBytes = RAM_SPILL_BYTES;
+      options.ramBytesChanged = [this](int64_t delta) noexcept {
+        adjustDelegatedRam(delta);
+      };
+      std::unique_ptr<File> file = directory.createFile(
+          Postings::getIndexFileName(segStr, fnum), std::move(options));
       files.emplace_back(DataFile{OutputStream{},std::move(file), fnum});
       files.back().out.setFile( files.back().file.get());
       files.back().out.streamNumber = fnum;
@@ -232,6 +277,7 @@ public:
     // Make sure that there are no outstanding files.
     // Do this for non-debug mode as well?
     assert(freeFiles.size() == files.size());
+    Signal::emit("postingsBeforeCollapse", this);
     std::vector<uint32_t> survivorFileNums = collapseFiles();
     writeFieldIndex();
     writeSegmentInfo(survivorFileNums);
@@ -267,6 +313,7 @@ public:
     freeFiles.clear();
     fieldInfos.resize(0);
     files.resize(0);
+    assert(delegatedRamBytes == 0);
     return true;
   }
 
@@ -287,6 +334,14 @@ public:
   uint64_t writeLiveDocs(const screaming::FixedBitSet& liveBits, int32_t numLiveDocs);
 
 private:
+  void adjustDelegatedRam(int64_t delta) noexcept {
+    const std::lock_guard<std::mutex> lock(delegatedRamMutex);
+    assert(delta >= -delegatedRamBytes);
+    delegatedRamBytes += delta;
+    assert(delegatedRamBytes >= 0);
+    if (delegatedRamGuard) delegatedRamGuard.forceResize(delegatedRamBytes);
+  }
+
   std::vector<uint32_t> collapseFiles() {
     assert(!files.empty());
     std::vector<FileRelocation> relocations;
@@ -300,12 +355,36 @@ private:
     // survivor filenums sparse instead of densely renumbering them: a stream
     // that already spilled can retain its storage key, avoiding rename/copy
     // work on filesystems and future object stores.
+    // A stream holding only the LUXIR002 header carried no data.  If nothing
+    // references it, drop it outright instead of folding eight bytes plus
+    // alignment pad into file 0.  A zero-length structure can still park a
+    // FieldInfo base at a header-only file's tail, so referenced ones are
+    // appended like any other stream (the reader must be able to open the
+    // location's file even to read zero bytes).
+    std::vector<bool> referenced(files.size(), false);
+    for (auto& fieldInfo : fieldInfos) {
+      fieldInfo.relocateLocations([&](seg_location location) {
+        if (location.filenum() < referenced.size()) {
+          referenced[location.filenum()] = true;
+        }
+        return location;
+      });
+    }
+
     OutputStream& target = files[0].out;
     for (uint32_t fileNum = 1; fileNum < (uint32_t) files.size(); fileNum++) {
       DataFile& source = files[fileNum];
       if (source.collapseProtected) continue;
+      if (!referenced[fileNum] && source.out.isRelocatable()
+          && source.out.size() == Postings::LUXIR_HEADER.size()) {
+        // Buffered bytes are discarded at destruction (FSFile never flushes on
+        // destroy; a delegating file releases its RAM accounting there too).
+        source.collapsed = true;
+        relocations[fileNum] = {DROPPED_FILE, 0};
+        continue;
+      }
       uint64_t baseOffset = 0;
-      if (target.tryAppendRelocatable(source.out, 8, baseOffset)) {
+      if (target.tryAppendRelocatable(source.out, MAX_ALIGN, baseOffset)) {
         source.collapsed = true;
         relocations[fileNum] = {0, baseOffset};
       }
@@ -317,6 +396,9 @@ private:
         throw std::logic_error("FieldInfo references an unknown segment file");
       }
       const FileRelocation& relocation = relocations[fileNum];
+      if (relocation.fileNum == DROPPED_FILE) {
+        throw std::logic_error("FieldInfo references a dropped header-only segment file");
+      }
       if (location.offset() > seg_location::maxOffset() - relocation.baseOffset) {
         throw std::length_error("relocated segment offset exceeds seg_location");
       }
@@ -1704,7 +1786,7 @@ public:
 
     // The reader addresses the block-offset table as a uint64_t array straight
     // out of the mapping, so it has to start 8-aligned.
-    termOutput.align(8);
+    termOutput.align(MAX_ALIGN);
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
     assert((int)result.termBlockOffsets.size()
            == ((result.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1);

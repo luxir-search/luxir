@@ -10,6 +10,8 @@
 
 namespace luxir {
 
+class RAMDelegatingFile;
+
 /// InputFile backed by mmap. The mapping remains valid after its fd is closed
 /// and after the underlying file is unlinked.
 class MMapInputFile : public InputFile {
@@ -45,6 +47,7 @@ public:
 class FSFile : public File {
   friend class OutputStream;
   friend class FSDirectory;
+  friend class RAMDelegatingFile;
 
   std::filesystem::path path_;
   std::filesystem::path tmpPath_;  // write to temp, rename on finish
@@ -132,12 +135,171 @@ public:
     if (otherSize == 0) return;
 
     openFd();
-    for (const auto& [buffer, size] : in.buffers) {
-      writeToFd(buffer.get(), size);
+    for (const auto& buffer : in.buffers) {
+      writeToFd(buffer.data.get(), buffer.used);
     }
     fileSize_ += otherSize;
     in.fileSize = 0;
+    in.allocatedSize = 0;
     in.buffers.clear();
+  }
+};
+
+
+/// FS output that retains its complete byte image in RAM until it either
+/// exceeds a safety threshold or segment finalize decides it must survive.
+/// The final FSFile always uses the original name, so spilling never changes
+/// the physical filenum or future object-store key.
+class RAMDelegatingFile : public File {
+  friend class FSDirectory;
+
+  std::filesystem::path path_;
+  RAMFile ramFile;
+  std::unique_ptr<FSFile> delegate;
+  std::function<void(int64_t)> ramBytesChanged;
+  size_t spillBytes;
+  bool bufferingEnabled = true;
+
+  void accountChange(int64_t delta) noexcept {
+    if (delta == 0 || !ramBytesChanged) return;
+    try {
+      ramBytesChanged(delta);
+    } catch (...) {
+      // File cleanup must not throw. The PostingsWriter accounting callback is
+      // noexcept; this also contains any future callback implementation.
+    }
+  }
+
+  void accountRamOperation(size_t before) noexcept {
+    size_t after = ramFile.allocatedBytes();
+    if (after >= before) {
+      accountChange((int64_t) (after - before));
+    } else {
+      accountChange(-(int64_t) (before - after));
+    }
+  }
+
+  void flushActiveToRam(OutputStream& os) {
+    size_t before = ramFile.allocatedBytes();
+    ramFile.flush(os, true);
+    accountRamOperation(before);
+  }
+
+  void allocateRamBuffer(OutputStream& os) {
+    size_t before = ramFile.allocatedBytes();
+    // Make the threshold a write-time boundary, not a finalize-time check.
+    // OutputStream flushes when this bounded active region fills and more data
+    // remains, so a write that crosses the threshold spills before continuing.
+    size_t remaining = spillBytes - ramFile.size();
+    size_t previous = ramFile.buffers.empty()
+        ? RAMFile::START_BUFFER_SIZE / 2 : ramFile.buffers.back().used;
+    size_t capacity = std::max((size_t) RAMFile::START_BUFFER_SIZE,
+        std::min(previous << 1, (size_t) 0x100000));
+    capacity = std::min(capacity, remaining);
+    ramFile.newBuffer(capacity);
+    auto& buffer = ramFile.buffers.back();
+    os.start = buffer.data.get();
+    os.pos = os.start;
+    os.end = os.start + buffer.capacity;
+    accountRamOperation(before);
+  }
+
+  void materializeRam() {
+    if (delegate != nullptr) return;
+    delegate = std::make_unique<FSFile>(name_, path_);
+    size_t before = ramFile.allocatedBytes();
+    delegate->destructiveAppend(ramFile);
+    accountRamOperation(before);
+  }
+
+  void spill(OutputStream& os, bool deferNewBuff, bool activeAlreadyFlushed) {
+    if (!activeAlreadyFlushed) flushActiveToRam(os);
+    materializeRam();
+    os.flushedSize = delegate->size();
+    os.start = os.pos = os.end = nullptr;
+    bufferingEnabled = false;
+    if (!deferNewBuff) delegate->flush(os, false);
+  }
+
+  void flush(OutputStream& os, bool deferNewBuff) override {
+    if (delegate != nullptr) {
+      delegate->flush(os, deferNewBuff);
+      return;
+    }
+
+    flushActiveToRam(os);
+    if (!bufferingEnabled || ramFile.size() >= spillBytes) {
+      spill(os, deferNewBuff, true);
+    } else if (!deferNewBuff) {
+      allocateRamBuffer(os);
+    }
+  }
+
+  void close(OutputStream& os) override {
+    if (delegate != nullptr) {
+      delegate->close(os);
+    } else {
+      flush(os, true);
+    }
+  }
+
+  bool isRelocatable(const OutputStream& os) const override {
+    return delegate == nullptr && bufferingEnabled
+        && os.size() < spillBytes;
+  }
+
+  void appendRelocatableTo(OutputStream& source,
+                           OutputStream& target) override {
+    assert(isRelocatable(source));
+    flushActiveToRam(source);
+    ramFile.appendTo(target);
+    size_t before = ramFile.allocatedBytes();
+    ramFile.clear();
+    accountRamOperation(before);
+    source.flushedSize = 0;
+    source.start = source.pos = source.end = nullptr;
+  }
+
+  void disableRamBuffering(OutputStream& os) override {
+    if (delegate != nullptr) return;
+    bufferingEnabled = false;
+    spill(os, false, false);
+  }
+
+public:
+  RAMDelegatingFile(std::string_view name, const std::filesystem::path& path,
+                    size_t spillBytes,
+                    std::function<void(int64_t)>&& ramBytesChanged)
+      : File(name), path_(path), ramFile(name),
+        ramBytesChanged(std::move(ramBytesChanged)), spillBytes(spillBytes) {
+    assert(spillBytes > 0);
+  }
+
+  ~RAMDelegatingFile() override {
+    accountChange(-(int64_t) ramFile.allocatedBytes());
+  }
+
+  size_t size() override {
+    return delegate != nullptr ? delegate->size() : ramFile.size();
+  }
+
+  void destructiveAppend(RAMFile& in) override {
+    if (delegate != nullptr) {
+      delegate->destructiveAppend(in);
+      return;
+    }
+
+    uint64_t combined = (uint64_t) ramFile.size() + (uint64_t) in.size();
+    if (!bufferingEnabled || combined > spillBytes) {
+      materializeRam();
+      bufferingEnabled = false;
+      delegate->destructiveAppend(in);
+      return;
+    }
+
+    size_t before = ramFile.allocatedBytes();
+    ramFile.destructiveAppend(in);
+    accountRamOperation(before);
   }
 };
 
@@ -212,6 +374,17 @@ public:
     return std::make_unique<FSFile>(name, filePath(name));
   }
 
+  std::unique_ptr<File> createFile(
+      std::string_view name, FileCreateOptions options) override {
+    if (!options.ramDelegating) return createFile(name);
+    if (options.ramSpillBytes == 0) {
+      throw std::invalid_argument("RAM-delegating file requires a spill threshold");
+    }
+    return std::make_unique<RAMDelegatingFile>(
+        name, filePath(name), options.ramSpillBytes,
+        std::move(options.ramBytesChanged));
+  }
+
   bool deleteFile(std::string_view name) override {
     auto path = filePath(name);
     return std::filesystem::remove(path);
@@ -233,7 +406,13 @@ public:
   }
 
   void finishFile(File& file) override {
-    auto& fsFile = dynamic_cast<FSFile&>(file);
+    FSFile* fsFilePtr = dynamic_cast<FSFile*>(&file);
+    if (fsFilePtr == nullptr) {
+      auto& ramFile = dynamic_cast<RAMDelegatingFile&>(file);
+      ramFile.materializeRam();
+      fsFilePtr = ramFile.delegate.get();
+    }
+    FSFile& fsFile = *fsFilePtr;
     // If nothing was ever flushed (empty file), still create it on disk
     if (fsFile.fd_ < 0) {
       fsFile.openFd();

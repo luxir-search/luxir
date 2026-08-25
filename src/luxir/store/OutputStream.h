@@ -7,6 +7,7 @@
 namespace luxir {
 
 class OutputStream;
+class RAMDelegatingFile;
 
 // A segment-global position (consists of a file number and a file offset)
 // It's made into its own type to enhance type safety so it won't accidentally
@@ -71,6 +72,17 @@ protected:
 
   virtual void close(OutputStream &os) = 0;
 
+  // A relocatable file can transfer its complete logical byte image into a
+  // target stream. The default covers an ordinary stream whose bytes have
+  // never left its active buffer; RAMDelegatingFile broadens this to all of
+  // its RAM-resident buffers.
+  virtual bool isRelocatable(const OutputStream& os) const;
+  virtual void appendRelocatableTo(OutputStream& source, OutputStream& target);
+
+  // Once a segment is known to be large, a delegating backend materializes
+  // immediately. Ordinary files have nothing to do.
+  virtual void disableRamBuffering(OutputStream& os) { unused(os); }
+
 public:
   explicit File(const std::string_view &name) : name_(name) {}
 
@@ -91,7 +103,7 @@ class OutputStream {
 
   friend class RAMFile;
   friend class FSFile;
-  friend class FSFile;
+  friend class RAMDelegatingFile;
 
   // the associated File object controls the lifetime of the buffer
   char *pos = nullptr;
@@ -117,10 +129,13 @@ public:
 
   bool hasFlushedBytes() const noexcept { return flushedSize != 0; }
 
-  // A stream is relocatable while all of its bytes are still owned by its
-  // current output buffer.  Keep this predicate at the stream boundary so a
-  // RAM-delegating File can broaden it later without changing segment finalize.
-  bool isRelocatable() const noexcept { return !hasFlushedBytes(); }
+  // Relocatability belongs to the File because a delegating backend may own
+  // earlier RAM buffers in addition to this stream's active buffer.
+  bool isRelocatable() const noexcept {
+    return target != nullptr && target->isRelocatable(*this);
+  }
+
+  void disableRamBuffering() { target->disableRamBuffering(*this); }
 
   size_t reserved() const noexcept {
     return pos == nullptr ? 0 : (size_t)(end - pos);
@@ -166,7 +181,7 @@ public:
     if (!source.isRelocatable()) return false;
 
     uint64_t current = (uint64_t) size();
-    uint64_t sourceBytes = (uint64_t) source.buffered();
+    uint64_t sourceBytes = (uint64_t) source.size();
     uint64_t padding = (alignment - current % alignment) % alignment;
     if (current > seg_location::maxOffset()
         || padding > seg_location::maxOffset() - current
@@ -176,8 +191,8 @@ public:
 
     align(alignment);
     baseOffset = (uint64_t) size();
-    write(source.start, source.buffered());
-    source.pos = source.start;
+    source.target->appendRelocatableTo(source, *this);
+    assert(source.size() == 0);
     return true;
   }
 
@@ -298,6 +313,17 @@ public:
   }
 };
 
+inline bool File::isRelocatable(const OutputStream& os) const {
+  return !os.hasFlushedBytes();
+}
+
+inline void File::appendRelocatableTo(OutputStream& source,
+                                      OutputStream& target) {
+  assert(isRelocatable(source));
+  target.write(source.start, source.buffered());
+  source.pos = source.start;
+}
+
 
 inline void seg_location::write(OutputStream& os) const {
   os.writeVint(filenum());
@@ -305,21 +331,28 @@ inline void seg_location::write(OutputStream& os) const {
 }
 
 
-// TODO: make a RAMDelegatingFile that starts out in RAM and after a certain size spills to (and delegates to) another
-// type of File.
+// In-memory file used directly by RAMDir and as the retained byte image inside
+// FSDirectory's RAMDelegatingFile.
 class RAMFile : public File {
   friend class OutputStream;
 
   friend class RAMInputFile;
   friend class FSFile;
+  friend class RAMDelegatingFile;
 
-  using element_type = std::pair<std::unique_ptr<char[]>, size_t>;
+  struct Buffer {
+    std::unique_ptr<char[]> data;
+    size_t used;
+    size_t capacity;
+  };
 
-  std::vector<element_type> buffers;
+  std::vector<Buffer> buffers;
   size_t fileSize = 0;
+  size_t allocatedSize = 0;
 
   void newBuffer(size_t size) {
-    buffers.emplace_back(new char[size], size);
+    buffers.push_back({std::make_unique_for_overwrite<char[]>(size), 0, size});
+    allocatedSize += size;
   }
 
   void flush(OutputStream &os, bool deferNewBuff) override {
@@ -327,19 +360,20 @@ class RAMFile : public File {
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
 
-    if (!buffers.empty() && os.start == buffers.back().first.get()) {
-      buffers.back().second = thisBufferSize;  // truncate to actually used space
+    if (!buffers.empty() && os.start == buffers.back().data.get()) {
+      buffers.back().used = thisBufferSize;
     }
 
     if (!deferNewBuff) {
       // doubling strategy up to 1MiB
-      auto prevBufferSize = buffers.empty() ? START_BUFFER_SIZE / 2 : (uint32_t)buffers.back().second;
+      auto prevBufferSize = buffers.empty()
+          ? START_BUFFER_SIZE / 2 : (uint32_t)buffers.back().used;
       auto bufSize = std::max(START_BUFFER_SIZE, std::min(prevBufferSize << 1, 0x100000u));
       newBuffer(bufSize);
-      auto&[ptr, sz] = buffers.back();
-      os.start = ptr.get();
+      auto& buffer = buffers.back();
+      os.start = buffer.data.get();
       os.pos = os.start;
-      os.end = os.start + sz;
+      os.end = os.start + buffer.capacity;
     } else {
       os.start = os.pos = os.end = nullptr;
     }
@@ -363,13 +397,15 @@ public:
     return fileSize;
   }
 
+  size_t allocatedBytes() const noexcept { return allocatedSize; }
+
   /// copies size() bytes to the destination
   size_t copyTo(void *dest) {
     char *ptr = (char *) dest;
-    for (const auto&[data, sz] : buffers) {
+    for (const auto& buffer : buffers) {
       assert(ptr - (char *) dest <= fileSize);
-      memcpy(ptr, data.get(), sz);
-      ptr += sz;
+      memcpy(ptr, buffer.data.get(), buffer.used);
+      ptr += buffer.used;
     }
     assert(ptr - (char *) dest == fileSize);
     return ptr - (char *) dest;
@@ -379,6 +415,14 @@ public:
   /// This invalidates further use of the file or associated output stream.
   void clear() {
     buffers.clear();
+    fileSize = 0;
+    allocatedSize = 0;
+  }
+
+  void appendTo(OutputStream& out) const {
+    for (const auto& buffer : buffers) {
+      out.write(buffer.data.get(), buffer.used);
+    }
   }
 
   /// appends the input RAMFile by stealing its buffers.
@@ -388,11 +432,13 @@ public:
   void destructiveAppend(RAMFile &in) override {
     if (this == &in) return; // no-op
     auto otherSize = in.size();
-    for (auto& pair : in.buffers) {
-      buffers.emplace_back(std::move(pair));
+    for (auto& buffer : in.buffers) {
+      buffers.emplace_back(std::move(buffer));
     }
     fileSize += otherSize;
+    allocatedSize += in.allocatedSize;
     in.fileSize = 0;
+    in.allocatedSize = 0;
     in.buffers.clear();
   }
 };

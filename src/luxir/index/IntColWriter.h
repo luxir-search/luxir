@@ -51,7 +51,7 @@ private:
     overallMin = std::min(overallMin, plan.zone.min);
     overallMax = std::max(overallMax, plan.zone.max);
 
-    if (plan.raw()) out.align(8);
+    if (plan.raw()) out.align(MAX_ALIGN);
     plan.info.setPayload(out.size() - colStart, plan.bits);
     if (plan.raw()) {
       out.write(block.data(), block.size_bytes());
@@ -112,13 +112,13 @@ public:
       values.clear();
     }
 
-    out.align(8);
+    out.align(MAX_ALIGN);
     int64_t metaOff = out.size() - colStart;
     if (!blockInfo.empty()) {
       out.write(blockInfo.data(), blockInfo.size() * sizeof(NumBlockInfo));
     }
     if (writeZones) {
-      out.align(8);
+      out.align(MAX_ALIGN);
       if (!blockZones.empty()) {
         out.write(blockZones.data(), blockZones.size() * sizeof(NumBlockZone));
       }

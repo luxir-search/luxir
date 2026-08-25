@@ -46,8 +46,9 @@ public:
   // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
   // string column RAMFiles). Handlers that hold such memory bump this via
   // IndexHandler::accountExtraRam at their allocation sites, so memSize() is O(1) -
-  // no per-doc walk of indexHandlers. Directory-backed postings output streams spill
-  // to disk and are deliberately NOT counted.
+  // no per-doc walk of indexHandlers. RAM-delegating postings output is not part
+  // of this estimate because PostingsWriter reserves its actual allocation
+  // separately against the same IndexRamBudget.
   size_t extraRamBytes = 0;
   void addExtraRam(int64_t delta) { extraRamBytes = (size_t)((int64_t)extraRamBytes + delta); }
 
@@ -97,7 +98,10 @@ public:
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
 
-  Inverter(luxir::Directory& dir, uint64_t segId, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segId) {
+  Inverter(luxir::Directory& dir, uint64_t segId,
+           const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
+           IndexRamBudget* ramBudget = nullptr)
+      : postingsWriter(dir, segId, -1, ramBudget, true) {
     if (schemaProvider) {
       this->schemaProvider = schemaProvider;
     } else {

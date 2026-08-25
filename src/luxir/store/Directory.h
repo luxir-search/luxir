@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -26,6 +27,12 @@ public:
 // Implementations of Directory are thread safe.
 class Directory {
 public:
+  struct FileCreateOptions {
+    std::function<void(int64_t)> ramBytesChanged;
+    size_t ramSpillBytes = 0;
+    bool ramDelegating = false;
+  };
+
   struct FileInfo {
     std::string name;
     uint64_t size = 0;
@@ -42,6 +49,14 @@ public:
   virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) = 0;
 
   virtual std::unique_ptr<File> createFile(const std::string_view name) = 0;
+
+  // Backends that support delayed materialization may honor these options.
+  // Other backends retain their normal behavior through this default.
+  virtual std::unique_ptr<File> createFile(
+      const std::string_view name, FileCreateOptions options) {
+    unused(options);
+    return createFile(name);
+  }
 
   // Returns true if file was found and deleted, false if not found.
   virtual bool deleteFile(const std::string_view name) = 0;

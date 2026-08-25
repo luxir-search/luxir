@@ -575,6 +575,11 @@ public:
     assert(termPartitionMaxRanges == MergeCostModel::DERIVED_TERM_RANGES
            || (termPartitionMaxRanges >= 2
                && termPartitionMaxRanges <= MergeCostModel::MAX_TERM_RANGES_CAP));
+    // File-count cost scales with output size, but retaining complete output
+    // streams in RAM does not. Only estimated-small merges request delegation;
+    // each skewed stream still has its own safety spill threshold.
+    postingsWriter.configureRamDelegation(
+        estimatedOutputBytes < PostingsWriter::SMALL_SEGMENT_BYTES, &ramBudget);
   }
 
   void merge() {
@@ -1360,7 +1365,7 @@ private:
         outputFieldInfo->docsLoc = rows[0].docsBase;
         outputFieldInfo->posLoc = rows[0].posBase;
         // 8-aligned: the reader reads this table as a uint64_t array in place.
-        termsOut.align(8);
+        termsOut.align(MAX_ALIGN);
         outputFieldInfo->termBlockIndexLoc = termsOut.slocation();
         termsOut.write(blockOffsets.data(), blockOffsets.size() * sizeof(blockOffsets[0]));
 
@@ -1371,7 +1376,7 @@ private:
         outputFieldInfo->trieLoc = termsOut.slocation();
         termsOut.write(trieBytes.data(), trieBytes.size());
 
-        termsOut.align(8);
+        termsOut.align(MAX_ALIGN);
         outputFieldInfo->rangeTableLoc = termsOut.slocation();
         termsOut.writeInt((int32_t) rows.size());
         termsOut.writeInt(blockOrd);

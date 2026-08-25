@@ -291,7 +291,7 @@ public:
     writeU16(out, 0x1111);
     writeU64(out, pointCount);
     assert((uint64_t)(out.size() - pointsStart) == pointsMetaOff + FIXED_HEADER_SIZE);
-    out.align(8);
+    out.align(MAX_ALIGN);
     out.write(leafMin.data(), leafMin.size() * sizeof(int64_t));
     out.write(leafMax.data(), leafMax.size() * sizeof(int64_t));
     out.write(leafFP.data(), leafFP.size() * sizeof(uint64_t));

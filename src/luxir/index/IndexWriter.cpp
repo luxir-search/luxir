@@ -516,7 +516,8 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
   Inverter* inverter = nullptr;
   const std::lock_guard<std::mutex> lock(indexMutex);
   if (idleInverters.empty()) {
-    auto newInverter = std::make_unique<Inverter>(dir, ++lastSegId, schemaProvider_);
+    auto newInverter = std::make_unique<Inverter>(
+        dir, ++lastSegId, schemaProvider_, indexRamBudget);
     newInverter->ramGuard = IndexRamBudget::Guard(*indexRamBudget, 0);
     inverter = newInverter.get();
     busyInverters.emplace(inverter, std::move(newInverter));
@@ -624,6 +625,13 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // The undo scope is the update message that held this inverter; marks must
   // not outlive the release.
   inverter.clearUndoLog();
+
+  // This is the first quiescent point where the output size proxy is known.
+  // Spill candidates as soon as an inverter proves large, including when it
+  // returns idle without flushing, so only expected-small segments retain
+  // complete filesystem output in RAM.
+  inverter.postingsWriter.configureRamDelegation(
+      inverter.memSize() < PostingsWriter::SMALL_SEGMENT_BYTES);
 
   const std::lock_guard<std::mutex> lock(indexMutex);
   auto it = busyInverters.find(&inverter);

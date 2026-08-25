@@ -155,6 +155,8 @@ TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
 // written. It is segment-fatal: the inverter is discarded rather than reused
 // for the next request.
 TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
+  constexpr size_t VECTOR_VALUES =
+      PostingsWriter::RAM_SPILL_BYTES / sizeof(float) + 512;
   std::string pathTemplate =
       (std::filesystem::temp_directory_path() / "luxir_vector_io_XXXXXX").string();
   ASSERT_NE(nullptr, ::mkdtemp(pathTemplate.data()));
@@ -168,8 +170,10 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
       std::pmr::monotonic_buffer_resource mr;
       luxir::api::UpdateRequest request;
       auto* docs = luxir::api::build::allocArray(request.docs, 1, mr);
+      // Cross the delegating-file safety threshold so the poisoned backing
+      // path is reached during the streamed write, before commit/finalize.
       CollectionHelper::convertDocToProto(
-          flatdoc("vec_v", std::vector<float>(512, 1.0f)), docs[0], mr);
+          flatdoc("vec_v", std::vector<float>(VECTOR_VALUES, 1.0f)), docs[0], mr);
       if (commit) request.commit.emplace();
 
       class BlockingMessage : public ProtoUpdateMessage {

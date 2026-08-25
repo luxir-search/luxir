@@ -417,7 +417,7 @@ public:
                        NUM_INDEX_DIMS, NUM_DATA_DIMS, {0x11, 0x11, 0x11},
                        totalPoints};
     out.write(&header, sizeof(header));
-    out.align(8);
+    out.align(MAX_ALIGN);
     out.write(innerNodes.data(), innerNodes.size() * sizeof(InnerNode));
     out.write(minLat.data(), minLat.size() * sizeof(int32_t));
     out.write(maxLat.data(), maxLat.size() * sizeof(int32_t));

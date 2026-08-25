@@ -60,6 +60,13 @@ public:
     return delegate_->createFile(name);
   }
 
+  std::unique_ptr<File> createFile(
+      std::string_view name, FileCreateOptions options) override {
+    if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({}, ramDelegating={})",
+                            name, options.ramDelegating);
+    return delegate_->createFile(name, std::move(options));
+  }
+
   bool deleteFile(std::string_view name) override {
     {
       std::lock_guard lock(mu_);

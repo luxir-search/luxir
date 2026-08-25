@@ -170,6 +170,11 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
 
 bool Inverter::flush(std::vector<std::string>* filenames) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
+  // Index-time stored/vector streams begin as candidates because their final
+  // segment size is not known when they are checked out. Once flushing starts,
+  // a large inverter spills every existing candidate before further output.
+  postingsWriter.configureRamDelegation(
+      memSize() < PostingsWriter::SMALL_SEGMENT_BYTES);
 
   // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
   // go in sorted field order, so lets do the same thing here and sort first.
