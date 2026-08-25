@@ -15,7 +15,12 @@ namespace luxir {
 // merged segment's file count and is the effective parallelism dial.
 struct MergeCostModel {
   static constexpr int64_t LIGHT_BYTES = 1024 * 1024;
-  static constexpr int32_t MAX_STREAMS = 16;
+  // Provisional file-parallelism cap.  Eight partitioned text ranges consume
+  // sixteen streams before counting their shared terms stream or other fields.
+  // This should become size-scaled with stream-buffer memory rather than remain
+  // a topology-only constant.
+  static constexpr int32_t MAX_STREAMS = 32;
+  static constexpr int64_t TERM_RANGE_SOURCE_BYTES = 64 * 1024;
   static constexpr int64_t STORED_CHUNK_BUFFER_MULTIPLIER = 5;
   static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
@@ -39,6 +44,8 @@ struct MergeCostModel {
 
   // Peak checked-out OutputStreams for each writer path.
   static constexpr int32_t TEXT_STREAMS = 3;      // TextWriter owns term/doc/pos streams together.
+  static constexpr int32_t TERM_RANGE_STREAMS = 2;  // Range-local docs and positions.
+  static constexpr int32_t TERM_COORDINATOR_STREAMS = 1;  // Shared terms stream.
   static constexpr int32_t ORD_COL_STREAMS = 3;   // TextWriter phase dominates OrdColWriter's peak of 2.
   static constexpr int32_t INT_COL_STREAMS = 3;   // values + optional endValueRank + optional docsWithVal.
   static constexpr int32_t STR_COL_STREAMS = 5;   // values + endValueRank + valDoc + endOffset + docsWithVal.
@@ -58,6 +65,12 @@ struct MergeCostModel {
 
   static int64_t storedFieldsBytes(int64_t maxChunkBytes) {
     return LIGHT_BYTES + maxChunkBytes * STORED_CHUNK_BUFFER_MULTIPLIER;
+  }
+
+  // TextWriter block buffers dominate the fixed part.  Each source also owns
+  // a TermsEnum and its decode state for the duration of the range merge.
+  static int64_t termRangeWorkingBytes(int64_t sources) {
+    return LIGHT_BYTES + sources * TERM_RANGE_SOURCE_BYTES;
   }
 
   static int64_t pointsBytes(int64_t sourceRuns, int64_t totalValues,

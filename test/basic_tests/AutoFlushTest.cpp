@@ -447,10 +447,10 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   ASSERT_EQ(1, pressureFlushesStarted.load(std::memory_order_relaxed));
-  EXPECT_EQ(5 * (MergeCostModel::LIGHT_BYTES + 4),
+  EXPECT_EQ(6 * (MergeCostModel::LIGHT_BYTES + 4),
             maxDemand.load(std::memory_order_relaxed))
-      << "only five three-stream text batches fit the virtual stream schedule";
-  EXPECT_EQ(15, maxHypotheticalStreams.load(std::memory_order_relaxed));
+      << "all six text batches fit the expanded virtual stream schedule";
+  EXPECT_EQ(18, maxHypotheticalStreams.load(std::memory_order_relaxed));
 
   releasePressureFlush.store(true, std::memory_order_relaxed);
   for (int i = 0; i < 5000 && mergeBodies.load(std::memory_order_relaxed) < 2; i++) {

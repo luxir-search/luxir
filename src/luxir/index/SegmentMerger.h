@@ -214,6 +214,8 @@ class SegmentMerger {
       IndexRamBudget::Guard ramGuard;
       int32_t streams = 0;
 
+      friend class MergeAdmissionDriver;
+
     public:
       BatchAdmission() = default;
       BatchAdmission(MergeAdmissionDriver& driver, IndexRamBudget::Guard&& ramGuard, int32_t streams)
@@ -343,11 +345,18 @@ class SegmentMerger {
       rethrowCallbackFailure();
     }
 
-    void addBatches(std::vector<Batch>&& batches) {
+    // Atomically replaces a running parent batch's stream reservation with a
+    // smaller coordinator lease while making its child batches visible.  If
+    // the slots were released first, many text fields could accumulate idle
+    // coordinators and leave no two-stream slot for any range to make progress.
+    void replaceWithBatches(BatchAdmission& parent, int32_t retainedStreams,
+                            HeldStreams& heldStreams, std::vector<Batch>&& batches) {
       bool accepted = false;
       {
         const std::lock_guard<std::mutex> lock(mutex);
         if (!context.is_group_execution_cancelled()) {
+          assert(parent.driver == this);
+          assert(retainedStreams >= 0 && retainedStreams <= parent.streams);
           pending.reserve(pending.size() + batches.size());
           for (auto& batch : batches) {
             pending.push_back(std::move(batch));
@@ -356,6 +365,11 @@ class SegmentMerger {
             if (a.cost != b.cost) return a.cost > b.cost;
             return a.name < b.name;
           });
+          int32_t releasedStreams = parent.streams - retainedStreams;
+          assert(inFlightStreams >= releasedStreams);
+          inFlightStreams -= releasedStreams;
+          parent.streams = 0;
+          heldStreams = HeldStreams(*this, retainedStreams);
           accepted = true;
         }
       }
@@ -396,8 +410,8 @@ class SegmentMerger {
               // virtual stream slots just as if it had admitted, so a cheaper
               // later batch cannot steal the slots being reclaimed for the head
               // work.  This makes demand describe the same ordered schedule we
-              // would launch if RAM were infinite.  Zero-stream range batches
-              // are all counted; the budget caps aggregate demand at one pool.
+              // would launch if RAM were infinite.  The budget caps aggregate
+              // demand at one pool before applying it to pressure.
               int64_t available = std::numeric_limits<int64_t>::max() - pendingDemand;
               pendingDemand = candidate.cost >= available
                   ? std::numeric_limits<int64_t>::max()
@@ -449,9 +463,10 @@ class SegmentMerger {
         // Only force-admit a batch whose streams fit: unlike RAM, stream slots
         // must never overdraw (they bound the segment's file count).  Returning
         // false with pending work is safe from livelock only because held
-        // streams (a partition coordinator's) imply that coordinator still has
-        // running tasks or pending zero-stream range batches - one of which is
-        // always admittable here.
+        // streams (a partition coordinator's) imply pending two-stream range
+        // work.  replaceWithBatches publishes that work before reducing the
+        // parent to its one-stream lease, so at least one range remains able to
+        // run whenever only coordinator leases remain.
         size_t selected = pending.size();
         for (size_t i = 0; i < pending.size(); i++) {
           if (inFlightStreams + pending[i].streams <= MergeCostModel::MAX_STREAMS) {
@@ -906,6 +921,10 @@ private:
     return docsWithField * 2 + dictionaryBytes;
   }
 
+  // Range count follows source posting bytes, not the indexing RAM cap.  Range
+  // docs and positions stream directly to checked-out segment files; only term
+  // blocks remain buffered so stitch() can preserve the reader invariant that
+  // every range's termsBase shares the block-index stream's file.
   std::optional<std::vector<TermRangePlan>> planTermRanges(
       std::span<MergeFieldInfo*> compactFields, MemPool& pool) {
     struct SafetyBlock {
@@ -1026,23 +1045,8 @@ private:
       return plan;
     };
 
-    std::vector<TermRangePlan> plan;
-    int64_t budgetBytes = ramBudget.totalBytes();
-    for (;;) {
-      plan = buildPlan(desiredRanges);
-      if (plan.size() < 2) return std::nullopt;
-      uint64_t largest = 0;
-      for (const auto& range : plan) largest = std::max(largest, range.bytes);
-      if (budgetBytes != 0 && desiredRanges > 2
-          && largest > (uint64_t) budgetBytes / 4) {
-        desiredRanges--;
-        continue;
-      }
-      if (budgetBytes != 0 && largest > (uint64_t) budgetBytes / 2) {
-        return std::nullopt;
-      }
-      break;
-    }
+    std::vector<TermRangePlan> plan = buildPlan(desiredRanges);
+    if (plan.size() < 2) return std::nullopt;
 
     int64_t worstBlocks = (sourceTerms + Postings::TERMS_BLOCK_SIZE - 1)
         / Postings::TERMS_BLOCK_SIZE + (int64_t) plan.size() - 1;
@@ -1133,17 +1137,13 @@ private:
     struct RangeOutput {
       TermRangePlan plan;
       RAMFile termsFile;
-      RAMFile docsFile;
-      RAMFile posFile;
       TextWriter::RangeResult result;
       seg_location docsBase;
       seg_location posBase;
 
       RangeOutput(TermRangePlan&& plan, int32_t ord)
         : plan(std::move(plan)),
-          termsFile("merge-range-terms-" + std::to_string(ord)),
-          docsFile("merge-range-docs-" + std::to_string(ord)),
-          posFile("merge-range-pos-" + std::to_string(ord)) {}
+          termsFile("merge-range-terms-" + std::to_string(ord)) {}
     };
 
     SegmentMerger& merger;
@@ -1158,10 +1158,9 @@ private:
     DocStream normDocsWithField;
     NormsWriter::PreparedNorms preparedNorms;
     PostingsWriter::IndexFieldInfo* outputFieldInfo = nullptr;
-    std::array<OutputStreamPtr, 3> streams;
+    OutputStreamPtr termsStream;
     std::vector<std::unique_ptr<RangeOutput>> outputs;
-    std::mutex completionMutex;
-    int32_t completed = 0;
+    std::atomic<int32_t> completed = 0;
     int32_t flags;
 
   public:
@@ -1190,10 +1189,12 @@ private:
       preparedNorms = NormsWriter::prepare(pool, merger.postingsWriter, *outputFieldInfo,
                                            normBytes, normDocsWithField,
                                            numNormDocsWithField);
-      streams = merger.postingsWriter.getOutputStreams<3>();
+      // Terms are stitched into one shared stream because TermsEnum reuses a
+      // single termsIS across range rows.  docsBase and posBase encode their
+      // own file numbers, so range postings need no equivalent coordinator file.
+      termsStream = merger.postingsWriter.getOutputStream();
 
       ramGuard = admission.takeRamGuard();
-      heldStreams = admission.takeStreams();
 
       outputs.reserve(plans.size());
       for (size_t i = 0; i < plans.size(); i++) {
@@ -1202,11 +1203,12 @@ private:
 
       std::vector<MergeAdmissionDriver::Batch> batches;
       batches.reserve(outputs.size());
+      int64_t rangeCost =
+          MergeCostModel::termRangeWorkingBytes((int64_t) compactFields.size());
       for (size_t i = 0; i < outputs.size(); i++) {
         MergeAdmissionDriver::Batch batch;
-        batch.cost = outputs[i]->plan.bytes > (uint64_t) INT64_MAX
-            ? INT64_MAX : (int64_t) outputs[i]->plan.bytes;
-        batch.streams = 0;
+        batch.cost = rangeCost;
+        batch.streams = MergeCostModel::TERM_RANGE_STREAMS;
         batch.name = std::string((std::string_view) outputFieldInfo->fieldname)
             + "#" + std::to_string(i);
         batch.body = [self, i](MergeAdmissionDriver&, MergeAdmissionDriver::Batch&,
@@ -1215,7 +1217,8 @@ private:
         };
         batches.push_back(std::move(batch));
       }
-      driver.addBatches(std::move(batches));
+      driver.replaceWithBatches(admission, MergeCostModel::TERM_COORDINATOR_STREAMS,
+                                heldStreams, std::move(batches));
     }
 
   private:
@@ -1225,8 +1228,11 @@ private:
       MemPool& rangePool = poolGuard.pool();
 
       OutputStream termsOut(&output.termsFile);
-      OutputStream docsOut(&output.docsFile);
-      OutputStream posOut(&output.posFile);
+      auto rangeStreams = merger.postingsWriter.getOutputStreams<2>();
+      OutputStream& docsOut = *rangeStreams[0];
+      OutputStream& posOut = *rangeStreams[1];
+      output.docsBase = docsOut.slocation();
+      output.posBase = posOut.slocation();
       PostingsWriter::IndexFieldInfo rangeFieldInfo{};
       rangeFieldInfo.type = FieldType::TEXT;
       rangeFieldInfo.flags = flags;
@@ -1243,23 +1249,17 @@ private:
       docsOut.flush(true);
       posOut.flush(true);
 
-      bool last;
-      {
-        const std::lock_guard<std::mutex> lock(completionMutex);
-        if (output.result.nTerms != 0) {
-          output.docsBase = streams[1]->slocation();
-          streams[1]->appendFile(output.docsFile);
-          output.posBase = streams[2]->slocation();
-          streams[2]->appendFile(output.posFile);
-        }
-        completed++;
-        last = completed == (int32_t) outputs.size();
-      }
+      Signal::emit("termRangeStreamsCheckedOut", &output.docsBase, &output.posBase,
+                   &rangeOrd);
+      for (auto& stream : rangeStreams) stream.reset();
+
+      bool last = completed.fetch_add(1, std::memory_order_acq_rel) + 1
+          == (int32_t) outputs.size();
       if (last) stitch();
     }
 
     void stitch() {
-      OutputStream& termsOut = *streams[0];
+      OutputStream& termsOut = *termsStream;
       std::vector<uint64_t> blockOffsets;
       std::vector<TermRangeRow> rows;
       TrieBuilder trieBuilder;
@@ -1344,7 +1344,7 @@ private:
         outputFieldInfo->flags |= FieldType::TERM_RANGES;
       }
 
-      for (auto& stream : streams) stream.reset();
+      termsStream.reset();
       NormsWriter::writeValues(pool, merger.postingsWriter, *outputFieldInfo,
                                preparedNorms, normDocsWithField);
       heldStreams.release();

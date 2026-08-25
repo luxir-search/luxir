@@ -14,7 +14,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
@@ -304,7 +303,24 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
   TestIndex serial;
   TestIndex partitioned;
   buildSources(serial, schema, false);
-  buildSources(partitioned, schema, true);
+
+  // Hold all four ranges after writing but before returning their docs/pos
+  // leases.  This makes file ownership deterministic: every range must have
+  // checked out a distinct pair before any pair can be reused.
+  std::atomic<int32_t> checkedOut = 0;
+  {
+    Signal::listen("termRangeStreamsCheckedOut", [&](void*, void*, void*) -> void* {
+      checkedOut.fetch_add(1, std::memory_order_relaxed);
+      while (checkedOut.load(std::memory_order_relaxed) < 4) {
+        std::this_thread::yield();
+      }
+      return nullptr;
+    });
+    auto signalCleanup = luxir::scope_guard([]() {
+      Signal::unlisten("termRangeStreamsCheckedOut");
+    });
+    buildSources(partitioned, schema, true);
+  }
 
   Segment& serialSegment = serial.reader->segments()[0];
   Segment& partitionedSegment = partitioned.reader->segments()[0];
@@ -312,6 +328,25 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
   SegFieldInfo partitionedInfo = readBodyInfo(partitioned.pool, partitionedSegment);
   ASSERT_TRUE(serialInfo.rangeTableLoc.isNull());
   ASSERT_FALSE(partitionedInfo.rangeTableLoc.isNull());
+  ASSERT_EQ(4, checkedOut.load(std::memory_order_relaxed));
+
+  InputStream table = partitionedSegment.postingsReader()
+      .getInputStreamSeek(partitionedInfo.rangeTableLoc);
+  const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
+  const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
+  ASSERT_EQ(4u, header->nRanges);
+  std::vector<uint32_t> postingFiles;
+  postingFiles.reserve((size_t) header->nRanges * 2);
+  for (uint32_t i = 0; i < header->nRanges; i++) {
+    EXPECT_EQ(partitionedInfo.termBlockIndexLoc.filenum(), rows[i].termsBase.filenum());
+    EXPECT_NE(rows[i].termsBase.filenum(), rows[i].docsBase.filenum());
+    EXPECT_NE(rows[i].termsBase.filenum(), rows[i].posBase.filenum());
+    postingFiles.push_back(rows[i].docsBase.filenum());
+    postingFiles.push_back(rows[i].posBase.filenum());
+  }
+  std::sort(postingFiles.begin(), postingFiles.end());
+  auto uniqueEnd = std::unique(postingFiles.begin(), postingFiles.end());
+  EXPECT_EQ(postingFiles.size(), (size_t) (uniqueEnd - postingFiles.begin()));
 
   FieldSnapshot oracle = snapshotField(serial.pool, serialSegment);
   FieldSnapshot actual = snapshotField(partitioned.pool, partitionedSegment);
@@ -357,103 +392,12 @@ TEST(TermPartitionMergeTest, EmptyRangesAreOmitted) {
   EXPECT_TRUE(emptyInfo.termBlockIndexLoc.isNull());
 }
 
-TEST(TermPartitionMergeTest, BudgetFallbackStaysSerial) {
+TEST(TermPartitionMergeTest, TinyBudgetStillPartitions) {
   auto schema = textSchema();
   IndexRamBudget budget(64);
   TestIndex index;
   buildSources(index, schema, true, 0, &budget);
   SegFieldInfo info = readBodyInfo(index.pool, index.reader->segments()[0]);
   EXPECT_GT(info.nTerms, 0);
-  EXPECT_TRUE(info.rangeTableLoc.isNull());
-}
-
-TEST(TermPartitionMergeTest, ZeroStreamRangeDemandCapsAtTightenedBudget) {
-  auto schema = textSchema();
-  TestIndex left;
-  TestIndex right;
-  buildSources(left, schema, true, 0);
-  buildSources(right, schema, true, 20);
-
-  std::array<PostingsReader*, 2> readers = {
-      &left.reader->segments()[0].postingsReader(),
-      &right.reader->segments()[0].postingsReader()};
-  std::array<LiveDocs*, 2> liveDocs = {nullptr, nullptr};
-  RAMDir outputDir;
-  PostingsWriter writer(outputDir, 901, -1);
-  int64_t planningCap = 16 * MergeCostModel::LIGHT_BYTES;
-  IndexRamBudget budget(planningCap);
-  auto blocker = budget.forceAcquire(planningCap);
-  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4);
-
-  std::atomic<int64_t> rangeDemand = 0;
-  std::atomic<int64_t> tightenedCap = 0;
-  std::atomic<int32_t> rangeBatches = 0;
-  std::atomic<int> mergeBodies = 0;
-  std::atomic<bool> releaseBodies = false;
-  std::exception_ptr mergeFailure;
-  std::thread mergeThread;
-  auto cleanup = luxir::scope_guard([&]() {
-    releaseBodies.store(true, std::memory_order_relaxed);
-    blocker.release();
-    if (mergeThread.joinable()) mergeThread.join();
-    Signal::unlisten("mergeAdmissionDemand");
-    Signal::unlisten("segmentMergeBody");
-  });
-
-  Signal::listen("mergeAdmissionDemand", [&](void* a, void*, void* c) -> void* {
-    int32_t batches = *(int32_t*)c;
-    if (batches < 2 || rangeBatches.load(std::memory_order_relaxed) != 0) {
-      return nullptr;
-    }
-    int64_t demand = *(int64_t*)a;
-    int64_t cap = std::max<int64_t>(1, demand / 2);
-    rangeDemand.store(demand, std::memory_order_relaxed);
-    rangeBatches.store(batches, std::memory_order_relaxed);
-    tightenedCap.store(cap, std::memory_order_relaxed);
-    // The range plan was made against planningCap.  Tightening here isolates
-    // the demand aggregator: all zero-stream ranges remain selected, while the
-    // pressure-visible aggregate must clamp to the new whole-pool size.
-    budget.setTotalBytes(cap);
-    return nullptr;
-  });
-  Signal::listen("segmentMergeBody", [&](void*, void*, void*) -> void* {
-    mergeBodies.fetch_add(1, std::memory_order_relaxed);
-    while (!releaseBodies.load(std::memory_order_relaxed)) {
-      std::this_thread::yield();
-    }
-    return nullptr;
-  });
-
-  mergeThread = std::thread([&]() {
-    try {
-      merger.merge();
-    } catch (...) {
-      mergeFailure = std::current_exception();
-    }
-  });
-  for (int i = 0; i < 5000
-                  && (rangeDemand.load(std::memory_order_relaxed) == 0
-                      || mergeBodies.load(std::memory_order_relaxed) == 0); i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  ASSERT_GT(rangeBatches.load(std::memory_order_relaxed), 1);
-  ASSERT_GT(rangeDemand.load(std::memory_order_relaxed),
-            tightenedCap.load(std::memory_order_relaxed));
-  EXPECT_EQ(tightenedCap.load(std::memory_order_relaxed),
-            budget.pendingMergeDemandBytes());
-
-  blocker.release();
-  releaseBodies.store(true, std::memory_order_relaxed);
-  mergeThread.join();
-  if (mergeFailure != nullptr) std::rethrow_exception(mergeFailure);
-  writer.finish();
-  EXPECT_EQ(0, budget.pendingMergeDemandBytes());
-  EXPECT_EQ(0, budget.reservedBytes());
-
-  PostingsReader outputReader(outputDir, 901);
-  FieldReader fields(outputReader);
-  ASSERT_TRUE(fields.seek("body"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
   EXPECT_FALSE(info.rangeTableLoc.isNull());
 }
