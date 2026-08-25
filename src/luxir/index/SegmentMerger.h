@@ -256,6 +256,11 @@ class SegmentMerger {
         return true;
       }
 
+      void forceRepriceRam(int64_t bytes) {
+        assert(bytes >= ramGuard.size());
+        ramGuard.forceResize(bytes);
+      }
+
       HeldStreams takeStreams() {
         assert(driver != nullptr);
         HeldStreams held(*driver, streams);
@@ -304,6 +309,7 @@ class SegmentMerger {
   private:
     SegmentMerger& merger;
     IndexRamBudget& budget;
+    const int32_t maxStreams;
     oneapi::tbb::task_group_context context;
     oneapi::tbb::task_group tg;
     std::mutex mutex;
@@ -314,11 +320,15 @@ class SegmentMerger {
     IndexRamBudget::MergeDemandRegistration demandRegistration;
 
   public:
-    MergeAdmissionDriver(SegmentMerger& merger, IndexRamBudget& budget, std::vector<Batch>&& batches)
-      : merger(merger), budget(budget), context(), tg(context), pending(std::move(batches)),
+    MergeAdmissionDriver(SegmentMerger& merger, IndexRamBudget& budget,
+                         int32_t maxStreams, std::vector<Batch>&& batches)
+      : merger(merger), budget(budget), maxStreams(maxStreams), context(), tg(context),
+        pending(std::move(batches)),
         demandRegistration(budget.registerMergeDemand([this]() noexcept {
           admissionCallback();
-        })) {}
+        })) {
+      assert(maxStreams >= MergeCostModel::STREAM_BUDGET_FLOOR);
+    }
 
     void run() {
       for (;;) {
@@ -398,7 +408,7 @@ class SegmentMerger {
           int64_t pendingDemand = 0;
           for (size_t i = 0; i < pending.size(); i++) {
             Batch& candidate = pending[i];
-            if (hypotheticalStreams + candidate.streams > MergeCostModel::MAX_STREAMS) {
+            if (hypotheticalStreams + candidate.streams > maxStreams) {
               continue;
             }
             hypotheticalStreams += candidate.streams;
@@ -469,7 +479,7 @@ class SegmentMerger {
         // run whenever only coordinator leases remain.
         size_t selected = pending.size();
         for (size_t i = 0; i < pending.size(); i++) {
-          if (inFlightStreams + pending[i].streams <= MergeCostModel::MAX_STREAMS) {
+          if (inFlightStreams + pending[i].streams <= maxStreams) {
             selected = i;
             break;
           }
@@ -537,6 +547,8 @@ class SegmentMerger {
   std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
+  const uint64_t estimatedOutputBytes;
+  const int32_t streamBudget;
   int64_t termPartitionMinBytes;
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
@@ -552,13 +564,17 @@ public:
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
                 int32_t termPartitionMaxRanges)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
+    estimatedOutputBytes(estimateOutputBytes(preaders)),
+    streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
     termPartitionMaxRanges(termPartitionMaxRanges)
   {
     assert(preaders.size() == liveDocs.size());
     assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
-    assert(termPartitionMaxRanges >= 2 && termPartitionMaxRanges <= MergeCostModel::MAX_TERM_RANGES);
+    assert(termPartitionMaxRanges == MergeCostModel::DERIVED_TERM_RANGES
+           || (termPartitionMaxRanges >= 2
+               && termPartitionMaxRanges <= MergeCostModel::MAX_TERM_RANGES_CAP));
   }
 
   void merge() {
@@ -593,7 +609,8 @@ public:
     // Set maxDoc to total number of live documents
     postingsWriter.setMaxDoc(totalLive);
 
-    MERGER_DEBUG("SegmentMerger: total live docs to merge: {}", totalLive);
+    MERGER_DEBUG("SegmentMerger: total live docs to merge: {}, estimated bytes: {}, stream budget: {}",
+                 totalLive, estimatedOutputBytes, streamBudget);
 
     // Now build the docId maps based on liveDocs, then release the liveDocs.
     for (size_t i = 0; i < segs.size(); i++) {
@@ -648,7 +665,7 @@ public:
       return a.name < b.name;
     });
 
-    MergeAdmissionDriver driver(*this, ramBudget, std::move(batches));
+    MergeAdmissionDriver driver(*this, ramBudget, streamBudget, std::move(batches));
     driver.run();
 
     // Caller is responsible for calling postingsWriter.finish()
@@ -656,6 +673,16 @@ public:
   }
 
 private:
+  static uint64_t estimateOutputBytes(std::span<PostingsReader*> readers) {
+    uint64_t total = 0;
+    for (const auto* reader : readers) {
+      uint64_t bytes = reader->sizeInBytes();
+      total = bytes > std::numeric_limits<uint64_t>::max() - total
+          ? std::numeric_limits<uint64_t>::max() : total + bytes;
+    }
+    return total;
+  }
+
   static bool isStoredField(const SegFieldInfo& info) {
     return info.type == FieldType::BIN && (info.flags & FieldType::STORED) != 0;
   }
@@ -921,10 +948,12 @@ private:
     return docsWithField * 2 + dictionaryBytes;
   }
 
-  // Range count follows source posting bytes, not the indexing RAM cap.  Range
-  // docs and positions stream directly to checked-out segment files; only term
-  // blocks remain buffered so stitch() can preserve the reader invariant that
-  // every range's termsBase shares the block-index stream's file.
+  // Range count follows source posting bytes, not the indexing RAM cap, with a
+  // ceiling derived from this merge's size-scaled stream budget (an explicit
+  // setting can only lower it).  Range docs and positions stream directly to
+  // checked-out segment files; only term blocks remain buffered so stitch()
+  // can preserve the reader invariant that every range's termsBase shares the
+  // block-index stream's file.
   std::optional<std::vector<TermRangePlan>> planTermRanges(
       std::span<MergeFieldInfo*> compactFields, MemPool& pool) {
     struct SafetyBlock {
@@ -993,9 +1022,13 @@ private:
       return std::nullopt;
     }
 
+    int32_t maxRanges = MergeCostModel::maxTermRangesForStreams(streamBudget);
+    if (termPartitionMaxRanges != MergeCostModel::DERIVED_TERM_RANGES) {
+      maxRanges = std::min(maxRanges, termPartitionMaxRanges);
+    }
     uint64_t quotient = totalBytes / (uint64_t) termPartitionMinRangeBytes;
     int32_t desiredRanges = (int32_t) std::min<uint64_t>(
-        (uint64_t) termPartitionMaxRanges, std::max<uint64_t>(2, quotient));
+        (uint64_t) maxRanges, std::max<uint64_t>(2, quotient));
 
     auto buildPlan = [&](int32_t rangeTarget) {
       std::vector<std::string> splits;
@@ -1405,18 +1438,23 @@ private:
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
       int64_t serialCost = estimateCost(mergeFieldInfos);
       int64_t coordinatorCost = partitionCoordinatorCost(compactFields);
-      if (admission.repriceRam(std::max(serialCost, coordinatorCost))) {
-        auto rangePlan = planTermRanges(compactFields, pool);
-        if (rangePlan.has_value()) {
-          if (!admission.repriceRam(coordinatorCost)) std::unreachable();
-          auto coordinator = std::make_shared<PartitionCoordinator>(
-              *this, admissionDriver, std::move(mergeFieldInfos),
-              std::move(*rangePlan), allFlags);
-          coordinator->start(coordinator, admission);
-          return;
-        }
-        if (!admission.repriceRam(serialCost)) std::unreachable();
+      // Partitioning is an on-disk plan decision, so it must not depend on
+      // transient pool occupancy after this batch has started.  The temporary
+      // coordinator lease is bounded by merged norms plus source dictionaries,
+      // comparable to the state consumed by the serial path.  Forced growth
+      // notifies budget pressure immediately, allowing inverter shedding where
+      // reclaimable RAM exists without blocking or retrying in this batch.
+      admission.forceRepriceRam(std::max(serialCost, coordinatorCost));
+      auto rangePlan = planTermRanges(compactFields, pool);
+      if (rangePlan.has_value()) {
+        if (!admission.repriceRam(coordinatorCost)) std::unreachable();
+        auto coordinator = std::make_shared<PartitionCoordinator>(
+            *this, admissionDriver, std::move(mergeFieldInfos),
+            std::move(*rangePlan), allFlags);
+        coordinator->start(coordinator, admission);
+        return;
       }
+      if (!admission.repriceRam(serialCost)) std::unreachable();
     }
     Stream normBytes;
     DocStream normDocsWithField(pool);

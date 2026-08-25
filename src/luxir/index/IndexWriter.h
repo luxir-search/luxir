@@ -513,7 +513,9 @@ public:
   int64_t termPartitionMinBytes = 1;
   int64_t termPartitionMinRangeBytes = 1;
 #endif
-  int32_t termPartitionMaxRanges = MergeCostModel::MAX_TERM_RANGES;
+  // Zero derives the ceiling from this merge's size-scaled stream budget.
+  // Tests and constrained deployments may set an explicit 2..64 ceiling.
+  int32_t termPartitionMaxRanges = MergeCostModel::DERIVED_TERM_RANGES;
 
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.

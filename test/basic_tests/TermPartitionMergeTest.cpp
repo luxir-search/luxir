@@ -62,6 +62,25 @@ std::string termName(int32_t ord) {
   return term;
 }
 
+std::string wideTermName(int32_t ord) {
+  std::string term(PackedTerm::MAX_LEN, 'a');
+  term[0] = 't';
+  uint32_t digits = (uint32_t) ord;
+  for (int32_t i = 8; i > 0; i--) {
+    term[(size_t) i] = (char) ('0' + digits % 10);
+    digits /= 10;
+  }
+  term[9] = '_';
+  uint64_t bits = (uint64_t) ord + 0x9e3779b97f4a7c15ULL;
+  for (size_t i = 10; i < term.size(); i++) {
+    bits ^= bits >> 12;
+    bits ^= bits << 25;
+    bits ^= bits >> 27;
+    term[i] = (char) ('a' + bits % 26);
+  }
+  return term;
+}
+
 int32_t recomputePackedBlockCount(const std::vector<PostingSnapshot>& postings) {
   uint32_t base = 0;
   int32_t packed = 0;
@@ -93,14 +112,14 @@ int32_t recomputePackedBlockCount(const std::vector<PostingSnapshot>& postings) 
 
 void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
                   bool partitioned, int32_t termBase = 0,
-                  IndexRamBudget* budget = nullptr) {
+                  IndexRamBudget* budget = nullptr, int32_t maxRanges = 4) {
   index.iw = std::make_unique<IndexWriter>(
       index.dir, [schema] { return schema; }, budget);
   index.iw->mergePolicy->setMergeFactor(1000);
   if (partitioned) {
     index.iw->termPartitionMinBytes = 1;
     index.iw->termPartitionMinRangeBytes = 1;
-    index.iw->termPartitionMaxRanges = 4;
+    index.iw->termPartitionMaxRanges = maxRanges;
   } else {
     // The unpartitioned oracle must stay serial even under the debug-build
     // tiny default thresholds.
@@ -124,6 +143,29 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
   index.iw->mergeSegments();
   index.initReader();
   ASSERT_EQ(1u, index.reader->segments().size());
+}
+
+void buildWideDictionarySources(TestIndex& index,
+                                const std::shared_ptr<Schema>& schema) {
+  index.iw = std::make_unique<IndexWriter>(
+      index.dir, [schema] { return schema; });
+  index.iw->mergePolicy->setMergeFactor(1000);
+  TestField body(index, "body");
+
+  std::string value;
+  value.reserve(1600 * (PackedTerm::MAX_LEN + 1));
+  for (int32_t term = 0; term < 1600; term++) {
+    value += wideTermName(term);
+    value.push_back(' ');
+  }
+  for (int32_t segment = 0; segment < 4; segment++) {
+    body.startIndexing();
+    body.add(0, value);
+    body.add(1, value);
+    index.flush();
+  }
+  index.initReader();
+  ASSERT_EQ(4u, index.reader->segments().size());
 }
 
 SegFieldInfo readBodyInfo(MemPool& pool, Segment& segment) {
@@ -400,4 +442,59 @@ TEST(TermPartitionMergeTest, TinyBudgetStillPartitions) {
   SegFieldInfo info = readBodyInfo(index.pool, index.reader->segments()[0]);
   EXPECT_GT(info.nTerms, 0);
   EXPECT_FALSE(info.rangeTableLoc.isNull());
+}
+
+TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
+  auto schema = textSchema();
+  TestIndex sources;
+  buildWideDictionarySources(sources, schema);
+
+  std::vector<PostingsReader*> readers;
+  std::vector<LiveDocs*> liveDocs;
+  int64_t docsWithField = 0;
+  int64_t dictionaryBytes = 0;
+  for (auto& segment : sources.reader->segments()) {
+    readers.push_back(&segment.postingsReader());
+    liveDocs.push_back(nullptr);
+    SegFieldInfo info = readBodyInfo(sources.pool, segment);
+    docsWithField += info.docsWithField;
+    dictionaryBytes += (int64_t) (info.termBlockIndexLoc.offset()
+        - info.termsLoc.offset());
+  }
+  int64_t serialCost = MergeCostModel::LIGHT_BYTES + docsWithField * 2;
+  int64_t coordinatorCost = dictionaryBytes + docsWithField * 2;
+  ASSERT_GT(coordinatorCost, serialCost);
+
+  int64_t cap = 2 * MergeCostModel::LIGHT_BYTES;
+  IndexRamBudget budget(cap);
+  [[maybe_unused]] auto blocker = budget.forceAcquire(cap);
+  ASSERT_EQ(cap, budget.reservedBytes());
+  RAMDir outputDir;
+  PostingsWriter writer(outputDir, 901, -1);
+  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4);
+  merger.merge();
+  writer.finish();
+
+  PostingsReader outputReader(outputDir, 901);
+  FieldReader fields(outputReader);
+  ASSERT_TRUE(fields.seek("body"));
+  SegFieldInfo info;
+  fields.readFieldInfo(info);
+  EXPECT_FALSE(info.rangeTableLoc.isNull());
+}
+
+TEST(TermPartitionMergeTest, DerivedRangeLimitExceedsEight) {
+  auto schema = textSchema();
+  TestIndex index;
+  buildSources(index, schema, true, 0, nullptr,
+               MergeCostModel::DERIVED_TERM_RANGES);
+
+  Segment& segment = index.reader->segments()[0];
+  SegFieldInfo info = readBodyInfo(index.pool, segment);
+  ASSERT_FALSE(info.rangeTableLoc.isNull());
+  InputStream table = segment.postingsReader().getInputStreamSeek(info.rangeTableLoc);
+  const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
+  EXPECT_GT(header->nRanges, 8u);
+  EXPECT_LE(header->nRanges, (uint32_t) MergeCostModel::maxTermRangesForStreams(
+                                 MergeCostModel::STREAM_BUDGET_FLOOR));
 }

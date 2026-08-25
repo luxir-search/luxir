@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <vector>
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
@@ -58,6 +59,18 @@ public:
 
   int32_t maxDoc() const noexcept {
     return maxdoc;
+  }
+
+  // Total bytes in the base segment files this reader can merge.  inputStreams
+  // contains every postings and column file named by the segment info.
+  uint64_t sizeInBytes() const noexcept {
+    uint64_t total = 0;
+    for (const auto& stream : inputStreams) {
+      uint64_t bytes = (uint64_t) stream.size();
+      total = bytes > std::numeric_limits<uint64_t>::max() - total
+          ? std::numeric_limits<uint64_t>::max() : total + bytes;
+    }
+    return total;
   }
 
   InputFile* getFile(uint32_t fnum) {

@@ -153,5 +153,29 @@ TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
 
   auto reader = helper.getIndexWriter()->getIndexReader();
   ASSERT_EQ(1, reader->segments().size());
-  EXPECT_LE(mergedSegmentFileCount(helper), MergeCostModel::MAX_STREAMS);
+  EXPECT_LE(mergedSegmentFileCount(helper), MergeCostModel::STREAM_BUDGET_FLOOR);
+}
+
+TEST(MergeCostModelTest, StreamBudgetAndRangeLimitScaleWithOutputBytes) {
+  constexpr uint64_t target = MergeCostModel::TARGET_FILE_BYTES;
+  EXPECT_EQ(32, MergeCostModel::streamBudgetForBytes(0));
+  EXPECT_EQ(32, MergeCostModel::streamBudgetForBytes(target * 31));
+  EXPECT_EQ(32, MergeCostModel::streamBudgetForBytes(target * 32));
+  EXPECT_EQ(33, MergeCostModel::streamBudgetForBytes(target * 33));
+  EXPECT_EQ(127, MergeCostModel::streamBudgetForBytes(target * 127));
+  EXPECT_EQ(128, MergeCostModel::streamBudgetForBytes(target * 128));
+  EXPECT_EQ(128, MergeCostModel::streamBudgetForBytes(UINT64_MAX));
+
+  int32_t previous = 0;
+  for (uint64_t files = 0; files <= 160; files++) {
+    int32_t current = MergeCostModel::streamBudgetForBytes(target * files);
+    EXPECT_GE(current, previous);
+    previous = current;
+  }
+
+  EXPECT_EQ(16, MergeCostModel::maxTermRangesForStreams(32));
+  EXPECT_EQ(16, MergeCostModel::maxTermRangesForStreams(33));
+  EXPECT_EQ(17, MergeCostModel::maxTermRangesForStreams(34));
+  EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(128));
+  EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(256));
 }
