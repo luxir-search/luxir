@@ -19,6 +19,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <memory_resource>
 #include <numeric>
 #include <ranges>
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/OrdColReader.h"
@@ -38,6 +40,7 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/util/screaming.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
 
@@ -624,11 +627,11 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
   }
 }
 
-// ROWS format: scatter loaded columns into per-doc field maps (DocList.docs).
-// The loaders always fill column-shaped storage (pre-sized spans, filled in
-// parallel per segment); in ROWS mode that storage is arena scratch never
-// attached to the response, and this post-wait pass moves the values into
-// rows.  Presence uses the exact per-column contracts the COLUMNS wire shape
+// Row placement: scatter loaded columns into per-doc field maps
+// (DocList.docs).  The loaders always fill column-shaped storage (pre-sized
+// spans, filled in parallel per segment); for row-placed fields that storage
+// is arena scratch never attached to the response, and this post-wait pass
+// moves the values into rows.  Presence uses the exact per-column contracts the COLUMNS wire shape
 // already guarantees: single-valued sentinel (missing_val, exact after
 // finishPendingCols), multi-valued empty array, vector unset f32.  Missing =
 // key absent; no sentinels in rows.  Values share the arena-backed spans and
@@ -685,6 +688,19 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
   return rows;
 }
 
+// One resolved returned-field entry (see resolveReturnFields).  fieldType is
+// resolved from the request schema at selector resolution, so explicit-name
+// errors surface before any batch is assembled and the emit loop does no
+// per-batch schema lookups; null marks the _score_ pseudo-field.  rows: the
+// field's values go to per-document maps (DocList.docs) instead of a dense
+// column - set for discovered names (empty / wildcard selectors), and for
+// every entry under ROWS format.
+struct ReturnField {
+  std::string_view name;
+  FieldType* fieldType;
+  bool rows;
+};
+
 // Streams a final ranked list of (segdoc, score) pairs back to the client as
 // one or more SearchResponses.  Both TopDocsReq and FusionOp use this (via
 // emitDocsResponse below) after their own ranking is complete.  The caller's
@@ -721,34 +737,33 @@ public:
   GetScore getScore;
   int64_t numCollected;
   int64_t totalHits;
-  std::span<const std::string_view> fields;
+  std::span<const ReturnField> fields;  // resolved selectors, each carrying its placement
   int32_t maxBatchSize;
   int64_t offset;
   bool getNumber;
   bool getScores;
-  // Placement.  rowsMode: requested fields go to per-document maps
-  // (DocList.docs) instead of dense columns.  scoresInRows: the synthetic
-  // _score_ goes into those maps too; otherwise it is a dense column even
-  // when rowsMode holds (discovered fields in rows beside a score column).
-  bool rowsMode;
+  // scoresInRows: the synthetic _score_ goes into the per-document maps;
+  // otherwise it is a dense column even when fields land in rows (discovered
+  // fields in rows beside a score column).
   bool scoresInRows;
   // Snapshot of req.tg != nullptr: req.tg points at submit()'s stack and may
   // dangle by the time a resumed emitter runs.
   bool parallel;
-  size_t colCap;
+  size_t colCap;  // dense response columns map capacity (column-placed fields + _score_)
+  size_t rowCap;  // scratch columns map capacity (row-placed fields)
   int64_t totalBatches;
   int64_t batchStart = 0;  // resume cursor
 
   DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
-                 std::span<const std::string_view> fields, int32_t maxBatchSize,
-                 int64_t offset, bool getNumber, bool getScores, bool rowsMode,
-                 bool scoresInRows, bool parallel, size_t colCap)
+                 std::span<const ReturnField> fields, int32_t maxBatchSize,
+                 int64_t offset, bool getNumber, bool getScores,
+                 bool scoresInRows, bool parallel, size_t colCap, size_t rowCap)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
-        getScores(getScores), rowsMode(rowsMode), scoresInRows(scoresInRows),
-        parallel(parallel), colCap(colCap),
+        getScores(getScores), scoresInRows(scoresInRows),
+        parallel(parallel), colCap(colCap), rowCap(rowCap),
         // If no documents were collected, we still need to send an empty response
         totalBatches(numCollected > 0 ? numCollected : 1) {}
 
@@ -849,11 +864,11 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     std::vector<uint8_t> segRunLength;
     std::ranges::copy(bySeg, std::back_inserter(segRunLength));
 
-    // In ROWS mode the loaders fill arena scratch columns that are never
-    // attached to the response; the post-wait scatter pass moves the values
-    // into docListProto.docs.  The loaders themselves are format-blind.
+    // Row-placed fields (ReturnField::rows) load into arena scratch columns
+    // that are never attached to the response; the post-wait scatter pass
+    // moves the values into docListProto.docs.  The loaders themselves are
+    // placement-blind.
     SearchResponse::ColumnsType scratchColumns;
-    auto& columnsProto = rowsMode ? scratchColumns : docListProto.columns;
 
     // Single-valued columns register here so the post-wait finish pass can
     // pick each column's exact missing_val and fill the missing slots.
@@ -880,14 +895,16 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     } tgJoin{tg};
 
-    for (std::string_view field: fields) {
+    for (const ReturnField& rf : fields) {
       // should we allow _scores_ as a field name?
-      if (field == "_score_") {
+      if (rf.fieldType == nullptr) {  // the _score_ pseudo-field
         returnScores = true;
         continue;
       }
-
-      auto& fieldType = *req.schema->getFieldTypeEx(field);
+      std::string_view field = rf.name;
+      FieldType& fieldType = *rf.fieldType;
+      auto& target = rf.rows ? scratchColumns : docListProto.columns;
+      size_t targetCap = rf.rows ? rowCap : colCap;
 
       // Collect any STORED field (column or not) into the candidate map;
       // the per-resource strategy is decided after the loop.  Rationale:
@@ -897,7 +914,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       auto recordStoredReq = [&](std::string_view resourceName) {
         std::span<std::string_view> starget;
         std::span<luxir::api::ArrStr> mtarget;
-        auto& fieldCol = build::columnSlot(columnsProto, colCap, field, mr);
+        auto& fieldCol = build::columnSlot(target, targetCap, field, mr);
         uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                              starget, mtarget, pendingCols, mr);
         storedByResource[resourceName].push_back(
@@ -906,22 +923,22 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 
       switch (fieldType.type()) {
         case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, target, targetCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::FLOAT: {
-          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
+          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, target, targetCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::DOUBLE: {
-          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
+          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, target, targetCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::DATE: {
           // DATE is epoch millis in the int column; emit the raw millis as
           // col_i.  ISO-8601 string rendering is an input-side / JSON-layer
           // concern, not the typed gRPC column.
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, target, targetCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::ID:
@@ -929,7 +946,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           if (fieldType.isStored()) {
             recordStoredReq(fieldType.storedResource_);
           } else if (fieldType.hasColumn()) {
-            loadStrCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
+            loadStrCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, target, targetCap, tg, pendingCols, mr);
           }
           break;
         }
@@ -940,7 +957,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           break;
         }
         case FieldType::Type::VECTOR: {
-          loadVectorCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, mr);
+          loadVectorCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, target, targetCap, tg, mr);
           break;
         }
         default:
@@ -988,11 +1005,11 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
 
-    if (rowsMode && columnSize > 0) {
-      // Scores bypass the scratch column: every doc has one, and a direct
-      // write avoids the all-present column's sentinel ambiguity (a real
-      // 0.0 score would collide with ColFloat's default missing_val).
-      bool scoreRows = returnScores && scoresInRows;
+    // Scores bypass the scratch column: every doc has one, and a direct
+    // write avoids the all-present column's sentinel ambiguity (a real
+    // 0.0 score would collide with ColFloat's default missing_val).
+    bool scoreRows = returnScores && scoresInRows;
+    if ((scratchColumns.size() > 0 || scoreRows) && columnSize > 0) {
       size_t fieldCap = scratchColumns.size() + (scoreRows ? 1 : 0);
       auto* rows = scatterColumnsToRows(scratchColumns, docListProto, (size_t)columnSize, fieldCap, mr);
       if (scoreRows) {
@@ -1022,43 +1039,128 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
   return true;
 }
 
-// The projection for a request that names no fields: every field the reader
-// can project - column-backed scalars and strings, and stored values - except
-// vectors (large and rarely wanted unasked), geo points (not yet projectable),
-// and engine-reserved names (leading underscore, i.e. _version_).  Discovery
-// is physical (IndexReader::projectableFields, union over segments) and then
-// filtered through the request's schema, so a name the schema no longer knows
-// or no longer marks retrievable is dropped, never thrown on.  "id" leads,
-// the rest are alphabetical.  The returned views are the reader's catalog
-// views, which req.reader pins for the request's lifetime.
-inline std::span<const std::string_view> defaultProjection(SearchRequest& req) {
-  auto catalog = req.reader->projectableFields();
-  std::vector<std::string_view> picked;
-  picked.reserve(catalog.size());
-  for (std::string_view name : catalog) {
-    if (name.empty() || name[0] == '_') continue;
-    FieldType* fieldType = req.schema->getFieldTypePtr(name);
-    if (fieldType == nullptr) continue;
-    switch (fieldType->type()) {
-      case FieldType::Type::INT:
-      case FieldType::Type::FLOAT:
-      case FieldType::Type::DOUBLE:
-      case FieldType::Type::DATE:
-      case FieldType::Type::STRING:
-      case FieldType::Type::ID:
-      case FieldType::Type::TEXT:
-        break;
-      default:
-        continue;
-    }
-    if (!fieldType->hasColumn() && !fieldType->isStored()) continue;
-    picked.push_back(name);
+// The discovery filter over the reader's physical field catalog
+// (IndexReader::projectableFields): admits every field the reader can project
+// - column-backed scalars and strings, and stored values - except vectors
+// (large and rarely wanted unasked), geo points (not yet projectable), and
+// engine-reserved names (leading underscore, i.e. _version_).  Filtering goes
+// through the request's schema, so a name the schema no longer knows or no
+// longer marks retrievable is dropped, never thrown on.  Returns the field's
+// schema type when admitted, null otherwise.  Shared by the no-fields default
+// projection and by wildcard expansion.
+inline FieldType* discoverable(SearchRequest& req, std::string_view name) {
+  if (name.empty() || name[0] == '_') return nullptr;
+  FieldType* fieldType = req.schema->getFieldTypePtr(name);
+  if (fieldType == nullptr) return nullptr;
+  switch (fieldType->type()) {
+    case FieldType::Type::INT:
+    case FieldType::Type::FLOAT:
+    case FieldType::Type::DOUBLE:
+    case FieldType::Type::DATE:
+    case FieldType::Type::STRING:
+    case FieldType::Type::ID:
+    case FieldType::Type::TEXT:
+      break;
+    default:
+      return nullptr;
   }
-  auto idIt = std::ranges::find(picked, std::string_view("id"));
-  if (idIt != picked.end()) std::rotate(picked.begin(), idIt, idIt + 1);
-  auto out = req.requestPool.make_span<std::string_view>(picked.size());
-  std::ranges::copy(picked, out.begin());
-  return out;
+  return (fieldType->hasColumn() || fieldType->isStored()) ? fieldType : nullptr;
+}
+
+// Returned-fields selector match: '*' matches any (possibly empty) run of
+// bytes, every other byte is literal.  Iterative single-star backtracking.
+inline bool globMatch(std::string_view pattern, std::string_view name) {
+  size_t p = 0, n = 0;
+  size_t starP = std::string_view::npos, starN = 0;
+  while (n < name.size()) {
+    if (p < pattern.size() && pattern[p] == '*') {
+      starP = p++;
+      starN = n;
+    } else if (p < pattern.size() && pattern[p] == name[n]) {
+      p++;
+      n++;
+    } else if (starP != std::string_view::npos) {
+      p = starP + 1;
+      n = ++starN;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.size() && pattern[p] == '*') p++;
+  return p == pattern.size();
+}
+
+// Resolve the request's returned-field selectors.  An empty list projects the
+// default set: every catalog name the discovery filter admits, "id" first,
+// the rest in name order.  A selector containing '*' is a pattern: it expands
+// in place to the catalog names it matches (name order), through the same
+// filter - so patterns never surface vectors, geo, or engine '_' names, and a
+// pattern matching nothing contributes nothing, never an error.  Explicit
+// names may name anything, including _version_ and vectors; an unknown name
+// throws here, before any batch is assembled.  Explicit wins on collision: a
+// name also given explicitly anywhere in the list is skipped by every
+// pattern, a name matched by several patterns is kept once, at its first
+// match, and a repeated explicit name collapses to its first occurrence (a
+// repeat would re-emplace the same output Column and orphan the earlier
+// stored-field target).  Discovered entries are marked rows=true - the
+// response's column set is a property of the request, never of what the index
+// holds.  The plan is allocated from the protobuf request arena: emission
+// starts on task-group threads and concurrent ops must not race (protobuf
+// Arena allocation is thread-safe; the request MemPool is not).  The names
+// are reader-catalog or request-proto views, pinned for the request's
+// lifetime, as are the schema's FieldTypes.
+inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
+                                                  std::span<const std::string_view> fields) {
+  auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
+  std::vector<ReturnField> picked;
+  auto pushExplicit = [&](std::string_view f) {
+    for (auto& rf : picked) {
+      if (rf.name == f) return;  // explicit lists are small; linear scan
+    }
+    FieldType* fieldType = f == "_score_" ? nullptr : req.schema->getFieldTypeEx(f).get();
+    picked.push_back({f, fieldType, false});
+  };
+  if (fields.empty()) {
+    auto catalog = req.reader->projectableFields();
+    picked.reserve(catalog.size());
+    for (std::string_view name : catalog) {
+      if (FieldType* fieldType = discoverable(req, name)) picked.push_back({name, fieldType, true});
+    }
+    auto idIt = std::ranges::find(picked, std::string_view("id"), &ReturnField::name);
+    if (idIt != picked.end()) std::rotate(picked.begin(), idIt, idIt + 1);
+  } else if (std::ranges::none_of(fields, isPattern)) {
+    picked.reserve(fields.size());
+    for (std::string_view f : fields) pushExplicit(f);
+  } else {
+    auto catalog = req.reader->projectableFields();
+    boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> taken;
+    for (std::string_view f : fields) {
+      if (!isPattern(f)) taken.insert(f);
+    }
+    for (std::string_view f : fields) {
+      if (!isPattern(f)) {
+        pushExplicit(f);
+        continue;
+      }
+      // The catalog is sorted: gallop to the pattern's literal prefix and
+      // stop as soon as the prefix no longer holds.
+      std::string_view prefix = f.substr(0, f.find('*'));
+      const std::string_view* end = catalog.data() + catalog.size();
+      for (const std::string_view* it = screaming::gallopLowerBound(catalog.data(), end, prefix);
+           it != end && it->starts_with(prefix); ++it) {
+        FieldType* fieldType;
+        if (globMatch(f, *it) && (fieldType = discoverable(req, *it)) != nullptr
+            && taken.insert(*it).second) {
+          picked.push_back({*it, fieldType, true});
+        }
+      }
+    }
+  }
+  if (picked.empty()) return {};
+  auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * picked.size(),
+                                                      alignof(ReturnField));
+  std::uninitialized_copy(picked.begin(), picked.end(), out);
+  return {out, picked.size()};
 }
 
 // Entry point shared by TopDocsReq and FusionOp: creates a request-arena-owned
@@ -1085,34 +1187,45 @@ void emitDocsResponse(SearchRequest& req,
     maxBatchSize = 256;
   }
 
-  // No fields named: project the default set.
-  bool discovered = fields.empty();
-  if (discovered) fields = defaultProjection(req);
+  // Resolve selectors: empty projects the default set, '*' entries expand
+  // against the reader's catalog (see resolveReturnFields).  Placement is
+  // per field: explicitly requested -> dense columns, discovered -> docs[i]
+  // (the column set is a property of the request, never of what the index
+  // happens to hold) - except under ROWS format, where everything goes to
+  // rows.  _score_ (asked for by get_scores) always keeps the format's
+  // placement - a column under columns format, beside any rows.
+  std::span<ReturnField> rfields = resolveReturnFields(req, fields);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
   bool formatRows = docFormat == luxir::api::DocFormat::ROWS
                     || (docFormat != luxir::api::DocFormat::COLUMNS
                         && req.docFormatDefault == luxir::api::DocFormat::ROWS);
-  // DocList placement is explicitly requested -> dense columns, discovered ->
-  // docs[i]: the column set is a property of the request, never of what the
-  // index happens to hold.  So discovered fields land in rows whatever
-  // document_format says, while _score_ (asked for by get_scores) keeps the
-  // format's placement - a column under columns format, beside the rows.
-  bool rowsMode = discovered || formatRows;
+  if (formatRows) {
+    for (auto& rf : rfields) rf.rows = true;
+  }
   bool scoresInRows = formatRows;
 
-  // Upper bound on distinct response columns: one per requested field plus the
-  // synthetic _score_ column. Used to pre-size the columns map's slot array.
-  size_t colCap = fields.size() + 1;
+  // Capacities for the two column maps (columnSlot allocates the whole
+  // backing array on first insertion, so each cap is paid per batch): the
+  // dense response map holds the column-placed fields plus the synthetic
+  // _score_; the scratch map holds the row-placed fields (_score_ bypasses
+  // scratch and is written per row directly).  Split so ["id", "*"] over a
+  // large dynamic-field catalog does not reserve a catalog-sized array for
+  // the one-entry dense map, and vice versa.
+  size_t colCap = 1, rowCap = 0;
+  for (const auto& rf : rfields) {
+    if (rf.fieldType == nullptr) continue;  // _score_ pseudo-field
+    (rf.rows ? rowCap : colCap)++;
+  }
 
   using Impl = DocEmitterImpl<std::decay_t<GetDocList>, std::decay_t<GetDoc>,
                               std::decay_t<GetScore>>;
   auto* emitter = luxir::arenaCreate<Impl>(req.arena, req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
-      std::forward<GetScore>(getScore), numCollected, totalHits, fields,
-      maxBatchSize, offset, getNumber, getScores, rowsMode, scoresInRows,
-      /*parallel=*/req.tg != nullptr, colCap);
+      std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
+      maxBatchSize, offset, getNumber, getScores, scoresInRows,
+      /*parallel=*/req.tg != nullptr, colCap, rowCap);
   req.streamStarted();
   emitter->produce();
 }

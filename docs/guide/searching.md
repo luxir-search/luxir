@@ -125,6 +125,14 @@ only when named. Discovered fields are always placed in row documents, whatever
 is requested explicitly (`get_scores`), so it keeps the format's placement: a
 dense column under `columns`, a row key under `rows`.
 
+A `fields` entry containing `*` is a wildcard pattern (`"attr_*"`,
+`"*_s"`, `"t*s"`). It expands through the same discovery as the empty case:
+matching retrievable fields come back as row documents, vectors and engine
+fields never match, and a pattern matching nothing is not an error. A field
+also named explicitly is returned once, in its explicit placement, so
+`"fields": ["id", "*"]` returns an `id` column beside rows of everything
+else.
+
 The underlying gRPC response remains a typed `DocList`: dense columns and row
 maps can coexist, `row_count` is authoritative, and `_score_` is a synthetic
 float column when requested.

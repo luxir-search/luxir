@@ -160,7 +160,9 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
   that ask for exact counts run exhaustively.
 - Lexicographic sorting by column values, query score, and reader-local
   `(segment, docid)`, with ascending/descending directions, result limits, and
-  field projection. Ordered page-after pagination is not implemented yet.
+  field projection: named fields, `*` wildcard patterns, or every retrievable
+  field when `fields` is omitted. Ordered page-after pagination is not
+  implemented yet.
 - Row- or column-oriented results per request (`document_format`): JSON
   defaults to row-oriented docs (missing field = absent key), gRPC to dense
   columns (missing = per-column sentinel) for analytics-friendly decoding.

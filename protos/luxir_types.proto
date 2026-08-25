@@ -86,9 +86,9 @@ message GenOp {
 // Placement preference for returned document fields: dense columns
 // (DocList.columns) vs per-document maps (DocList.docs).  DEFAULT resolves
 // per transport: HTTP/JSON -> ROWS, gRPC -> COLUMNS.  Under COLUMNS,
-// explicitly named fields are returned as dense columns (discovered fields -
-// wildcards, stored families - will use docs when those selectors land);
-// under ROWS everything is returned in docs.
+// explicitly named fields are returned as dense columns while discovered
+// fields (empty or wildcard selectors) use docs; under ROWS everything is
+// returned in docs.
 enum DocFormat {
   DEFAULT = 0;
   ROWS = 1;
@@ -106,6 +106,10 @@ message TopDocs {
   // Fields to return for each document.  Empty returns every retrievable field
   // (stored or column-backed; not vectors or engine fields such as _version_),
   // discovered from the index and placed in per-document rows (DocList.docs).
+  // A name containing '*' is a pattern expanded the same way: the matching
+  // retrievable fields, in rows; matching nothing is not an error.  Explicitly
+  // named fields win on collision and may name anything, vectors and engine
+  // fields included.
   repeated string fields = 7;
   repeated SortSpec sorts = 8;
   int32 batch_size = 9;         // maximum number of documents to return in a single streaming response
@@ -149,7 +153,7 @@ message Fusion {
   int64 offset = 4;
   bool get_number = 5;
   bool get_scores = 6;
-  repeated string fields = 7;   // as TopDocs.fields; empty returns every retrievable field
+  repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8;
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
 

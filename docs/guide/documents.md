@@ -127,7 +127,8 @@ Columns and stored fields solve different problems:
   Text defaults to stored so retrieval returns the pre-analysis string.
 
 Omitting `fields` returns every retrievable field except vectors and engine
-fields; name fields to project a subset (see
+fields; name fields, or use `*` wildcard patterns such as `"attr_*"`, to
+project a subset (see
 [Searching](searching.md#field-retrieval-and-result-shape)). HTTP row format
 omits missing fields; HTTP column format includes the requested key with
 `null`. Geo columns are a current
