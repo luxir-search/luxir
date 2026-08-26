@@ -560,6 +560,17 @@ struct from<JSON, luxir::api::SearchRequest> {
     static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
     api::SearchOp *shorthandOp = nullptr;
     api::TopDocs *td = nullptr;
+    bool reusedShorthand = false;
+    // A second read can overlay shorthand fields onto an already-decoded request.
+    // Capture q before scanning so an ordinary shorthand body's root "ops" key
+    // remains sub-ops even when that map itself contains an op named q.
+    if (const auto *q = value.ops.find("q")) {
+      auto *op = const_cast<api::SearchOp *>(q->pointer());
+      if (op != nullptr) {
+        td = std::get_if<api::TopDocs>(&op->kind);
+        reusedShorthand = td != nullptr;
+      }
+    }
     auto shorthand = [&]() -> api::TopDocs & {
       if (td == nullptr) {
         void *addr = ctx.memory_resource().allocate(sizeof(api::SearchOp), alignof(api::SearchOp));
@@ -603,10 +614,14 @@ struct from<JSON, luxir::api::SearchRequest> {
           } else if (key == "limit") {
             util::from_json<O>(shorthand().limit, ctx, vit, vend);
           } else if (key == "fields") {
-            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, shorthand().fields);
+            auto &topDocs = shorthand();
+            if (reusedShorthand) topDocs.fields = {};
+            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, topDocs.fields);
             glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
           } else if (key == "sorts") {
-            decltype(auto) sorts = ::hpp_proto::detail::as_modifiable(ctx, shorthand().sorts);
+            auto &topDocs = shorthand();
+            if (reusedShorthand) topDocs.sorts = {};
+            decltype(auto) sorts = ::hpp_proto::detail::as_modifiable(ctx, topDocs.sorts);
             glz::util::parse_repeated<O>(false, sorts, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
@@ -623,7 +638,7 @@ struct from<JSON, luxir::api::SearchRequest> {
           return bool(ctx.error);
         },
         [](auto &, auto &) {});
-    if (td == nullptr) {
+    if (td == nullptr || reusedShorthand) {
       return;
     }
     // Shorthand: whatever "ops" carried belongs to the op (sub-ops), and the

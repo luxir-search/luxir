@@ -3,6 +3,7 @@
 #include <cassert>
 #include <array>
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -713,6 +714,66 @@ private:
     std::string value;
   };
 
+  struct SearchUrlOverlay {
+    std::string json;
+    bool hasTopDocs = false;
+    bool empty = true;
+  };
+
+  static void appendJsonStringLiteral(std::string& out, std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    out += '"';
+    for (char c : value) {
+      switch (c) {
+        case '"': out += R"(\")"; break;
+        case '\\': out += R"(\\)"; break;
+        case '\b': out += R"(\b)"; break;
+        case '\f': out += R"(\f)"; break;
+        case '\n': out += R"(\n)"; break;
+        case '\r': out += R"(\r)"; break;
+        case '\t': out += R"(\t)"; break;
+        default: {
+          auto u = (unsigned char)c;
+          if (u < 0x20) {
+            out += R"(\u00)";
+            out += hex[u >> 4];
+            out += hex[u & 0x0f];
+          } else {
+            out += c;
+          }
+        }
+      }
+    }
+    out += '"';
+  }
+
+  struct OverlayJsonBuilder {
+    std::string json{"{"};
+    bool first = true;
+
+    void key(std::string_view name) {
+      if (!first) json += ',';
+      first = false;
+      appendJsonStringLiteral(json, name);
+      json += ':';
+    }
+
+    void string(std::string_view name, std::string_view value) {
+      key(name);
+      appendJsonStringLiteral(json, value);
+    }
+
+    void raw(std::string_view name, std::string_view value) {
+      key(name);
+      json += value;
+    }
+
+    std::string finish() {
+      json += '}';
+      return std::move(json);
+    }
+  };
+
   // Standard form-decoding: %XX hex escapes and '+' as space. Malformed escapes
   // pass through literally (lenient - the URL is an open channel).
   static std::string urlDecode(std::string_view s) {
@@ -767,6 +828,199 @@ private:
     return nullptr;
   }
 
+  template <typename T>
+  static bool appendIntegerParam(const std::vector<UrlParam>& params, std::string_view name,
+                                 std::string_view expected, bool topDocs,
+                                 OverlayJsonBuilder& json, SearchUrlOverlay& overlay,
+                                 std::string& err) {
+    const std::string* text = findParam(params, name);
+    if (text == nullptr) return true;
+    T value{};
+    auto [end, ec] = std::from_chars(text->data(), text->data() + text->size(), value);
+    if (ec != std::errc{} || end != text->data() + text->size()) {
+      err = "invalid URL parameter '" + std::string(name) + "': expected " +
+            std::string(expected) + ", got '" + *text + "'";
+      return false;
+    }
+    json.raw(name, std::to_string(value));
+    overlay.hasTopDocs |= topDocs;
+    return true;
+  }
+
+  static bool appendBoolParam(const std::vector<UrlParam>& params, std::string_view name,
+                              bool topDocs, OverlayJsonBuilder& json,
+                              SearchUrlOverlay& overlay, std::string& err) {
+    const std::string* text = findParam(params, name);
+    if (text == nullptr) return true;
+    if (*text != "true" && *text != "false") {
+      err = "invalid URL parameter '" + std::string(name) +
+            "': expected true or false, got '" + *text + "'";
+      return false;
+    }
+    json.raw(name, *text);
+    overlay.hasTopDocs |= topDocs;
+    return true;
+  }
+
+  static void appendStringParam(const std::vector<UrlParam>& params, std::string_view name,
+                                bool topDocs, OverlayJsonBuilder& json,
+                                SearchUrlOverlay& overlay) {
+    if (const std::string* text = findParam(params, name)) {
+      json.string(name, *text);
+      overlay.hasTopDocs |= topDocs;
+    }
+  }
+
+  static bool asciiWhitespace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+  }
+
+  static bool parseSortClause(std::string_view text, std::string_view& expr,
+                              std::optional<std::string_view>& dir) {
+    std::size_t end = text.size();
+    while (end > 0 && asciiWhitespace(text[end - 1])) end--;
+    if (end == 0) return false;
+
+    std::size_t tokenStart = end;
+    while (tokenStart > 0 && !asciiWhitespace(text[tokenStart - 1])) tokenStart--;
+    std::string_view token = text.substr(tokenStart, end - tokenStart);
+    if (token == "asc" || token == "desc") {
+      std::size_t exprEnd = tokenStart;
+      while (exprEnd > 0 && asciiWhitespace(text[exprEnd - 1])) exprEnd--;
+      if (exprEnd == 0) return false;
+      expr = text.substr(0, exprEnd);
+      dir = token;
+    } else {
+      expr = text.substr(0, end);
+      dir.reset();
+    }
+    return true;
+  }
+
+  static bool appendFieldsParam(const std::vector<UrlParam>& params,
+                                OverlayJsonBuilder& json, SearchUrlOverlay& overlay,
+                                std::string& err) {
+    const std::string* text = findParam(params, "fields");
+    if (text == nullptr) return true;
+    overlay.hasTopDocs = true;
+    json.key("fields");
+    json.json += '[';
+    if (!text->empty()) {
+      std::size_t start = 0;
+      bool first = true;
+      for (;;) {
+        std::size_t comma = text->find(',', start);
+        std::string_view field(*text);
+        field = field.substr(start, comma == std::string::npos ? comma : comma - start);
+        if (field.empty()) {
+          err = "invalid URL parameter 'fields': empty list item in '" + *text + "'";
+          return false;
+        }
+        if (!first) json.json += ',';
+        first = false;
+        appendJsonStringLiteral(json.json, field);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
+    }
+    json.json += ']';
+    return true;
+  }
+
+  static bool appendSortParams(const std::vector<UrlParam>& params,
+                               OverlayJsonBuilder& json, SearchUrlOverlay& overlay,
+                               std::string& err) {
+    std::vector<std::string_view> values;
+    bool haveEmpty = false;
+    bool haveNonEmpty = false;
+    for (const auto& param : params) {
+      if (param.key != "sort") continue;
+      values.push_back(param.value);
+      haveEmpty |= param.value.empty();
+      haveNonEmpty |= !param.value.empty();
+    }
+    if (values.empty()) return true;
+    if (haveEmpty && haveNonEmpty) {
+      err = "invalid URL parameter 'sort': empty value cannot be combined with other sort values";
+      return false;
+    }
+
+    overlay.hasTopDocs = true;
+    // The body field is plural "sorts". The singular URL name is deliberate:
+    // each repeated sort parameter contributes one ordered clause.
+    json.key("sorts");
+    json.json += '[';
+    if (haveNonEmpty) {
+      bool first = true;
+      for (std::string_view value : values) {
+        std::string_view expr;
+        std::optional<std::string_view> dir;
+        if (!parseSortClause(value, expr, dir)) {
+          err = "invalid URL parameter 'sort': expected a non-empty expression optionally "
+                "followed by ' asc' or ' desc', got '" + std::string(value) + "'";
+          return false;
+        }
+        if (!first) json.json += ',';
+        first = false;
+        json.json += R"({"field":)";
+        appendJsonStringLiteral(json.json, expr);
+        if (dir) {
+          json.json += R"(,"dir":)";
+          appendJsonStringLiteral(json.json, *dir);
+        }
+        json.json += '}';
+      }
+    }
+    json.json += ']';
+    return true;
+  }
+
+  static bool parseSearchUrlOverlay(const std::vector<UrlParam>& params,
+                                    SearchUrlOverlay& overlay, std::string& err) {
+    OverlayJsonBuilder json;
+    appendStringParam(params, "request_id", false, json, overlay);
+    if (!appendIntegerParam<std::uint64_t>(params, "freshness_ms",
+                                          "unsigned 64-bit decimal integer", false,
+                                          json, overlay, err)) return false;
+    appendStringParam(params, "time_zone", false, json, overlay);
+    if (!appendBoolParam(params, "profile", false, json, overlay, err)) return false;
+    if (!appendIntegerParam<std::int32_t>(params, "max_parallel",
+                                         "signed 32-bit decimal integer", false,
+                                         json, overlay, err)) return false;
+
+    appendStringParam(params, "query", true, json, overlay);
+    if (!appendIntegerParam<std::int64_t>(params, "limit",
+                                         "signed 64-bit decimal integer", true,
+                                         json, overlay, err) ||
+        !appendIntegerParam<std::int64_t>(params, "offset",
+                                         "signed 64-bit decimal integer", true,
+                                         json, overlay, err) ||
+        !appendFieldsParam(params, json, overlay, err) ||
+        !appendSortParams(params, json, overlay, err) ||
+        !appendIntegerParam<std::int32_t>(params, "batch_size",
+                                         "signed 32-bit decimal integer", true,
+                                         json, overlay, err)) {
+      return false;
+    }
+    if (const std::string* text = findParam(params, "document_format")) {
+      if (*text != "default" && *text != "rows" && *text != "columns") {
+        err = "invalid URL parameter 'document_format': expected default, rows, or columns, got '" +
+              *text + "'";
+        return false;
+      }
+      json.string("document_format", *text);
+      overlay.hasTopDocs = true;
+    }
+    if (!appendBoolParam(params, "get_number", true, json, overlay, err) ||
+        !appendBoolParam(params, "get_scores", true, json, overlay, err)) {
+      return false;
+    }
+
+    overlay.empty = json.first;
+    overlay.json = json.finish();
+    return true;
+  }
+
   void route(http::request<http::string_body> req) {
     httpVersion_ = req.version();
     keepAlive_ = req.keep_alive();
@@ -812,7 +1066,22 @@ private:
         return;
       }
       handleCollectionDelete(req.body());
-    } else if (req.method() == http::verb::post && parseSearchPath(target, coll)) {
+    } else if (parseSearchPath(target, coll)) {
+      if (req.method() != http::verb::get && req.method() != http::verb::post) {
+        respondMethodNotAllowed("GET, POST", "method not allowed; searches use GET or POST");
+        return;
+      }
+      if (req.method() == http::verb::get && !req.body().empty()) {
+        respondSimple(http::status::bad_request, "application/json",
+                      renderErrorBody("GET _search does not accept a request body; use POST"));
+        return;
+      }
+      SearchUrlOverlay overlay;
+      std::string overlayErr;
+      if (!parseSearchUrlOverlay(params, overlay, overlayErr)) {
+        respondSimple(http::status::bad_request, "application/json", renderErrorBody(overlayErr));
+        return;
+      }
       auto format = HttpSearchFormat::ENVELOPE;
       if (const std::string* f = findParam(params, "format")) {
         if (*f == "docs") {
@@ -834,9 +1103,9 @@ private:
                         renderErrorBody("format=docs cannot be combined with explain"));
           return;
         }
-        handleExplain(req.body(), coll);
+        handleExplain(req.body(), coll, overlay);
       } else {
-        handleSearch(req.body(), coll, format);
+        handleSearch(req.body(), coll, format, overlay);
       }
     } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
       std::vector<std::pair<std::string, std::string>> urlFieldMap;
@@ -911,9 +1180,20 @@ private:
   // form) with the path-derived collection applied (overwrites a body-supplied one).
   // Throws with a client-facing message on malformed input.
   static void parseEffectiveRequest(const std::string& body, const std::string& coll,
+                                    const SearchUrlOverlay& overlay,
                                     HttpSearchRequestState& state) {
     // Build the NON-OWNING request directly into the request state's arena.
-    parseQueryRequest(body, state.proto, state.resource);
+    parseQueryRequest(body.empty() ? "{}" : std::string_view(body), state.proto, state.resource);
+    if (overlay.hasTopDocs && !state.proto.ops.empty()) {
+      const auto* q = state.proto.ops.find("q");
+      if (q == nullptr || std::get_if<luxir::api::TopDocs>(&(**q).kind) == nullptr) {
+        throw std::runtime_error(
+            "URL TopDocs parameters target ops.q, but the request body has no top_docs op named 'q'");
+      }
+    }
+    if (!overlay.empty) {
+      overlayQueryRequest(overlay.json, state.proto, state.resource);
+    }
     setCollectionTarget(state.proto.collection, coll, state.resource);
   }
 
@@ -921,11 +1201,12 @@ private:
   // JSON of the effective request INSTEAD of executing it. Sugar expands, shorthand
   // lowers, and the output is itself a valid request body (posting it back runs the
   // identical query). Parse + serialize only - no engine work, so it runs inline.
-  void handleExplain(const std::string& body, const std::string& coll) {
+  void handleExplain(const std::string& body, const std::string& coll,
+                     const SearchUrlOverlay& overlay) {
     HttpSearchRequestState state;
     std::string out;
     try {
-      parseEffectiveRequest(body, coll, state);
+      parseEffectiveRequest(body, coll, overlay, state);
       // Mirrors the URL-param check in route(): the docs format can also be
       // selected in the body, and it composes with explain no better.
       if (state.proto.response_format == luxir::api::ResponseFormat::DOCS) {
@@ -984,11 +1265,12 @@ private:
     return nullptr;
   }
 
-  void handleSearch(const std::string& body, const std::string& coll, HttpSearchFormat format) {
+  void handleSearch(const std::string& body, const std::string& coll, HttpSearchFormat format,
+                    const SearchUrlOverlay& overlay) {
     auto* arena = createArena();
     auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
-      parseEffectiveRequest(body, coll, *requestState);
+      parseEffectiveRequest(body, coll, overlay, *requestState);
     } catch (const std::exception& e) {
       releaseArena(arena);
       respondSimple(http::status::bad_request, "application/json",

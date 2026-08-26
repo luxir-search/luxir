@@ -102,6 +102,57 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
     EXPECT_FALSE(P::read_json(r, R"({"ops":{},"bogus":1})", mr)); }
 }
 
+TEST(JsonDialect, SearchRequestSecondPassOverlay) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest r;
+  ASSERT_TRUE(P::read_json(r, R"({
+    "request_id":"body",
+    "ops":{
+      "q":{"top_docs":{
+        "query":"title_w:body",
+        "limit":20,
+        "fields":["body_a","body_b"],
+        "sorts":[{"field":"old_i","dir":"asc"}]
+      }},
+      "cats":{"field_facet":{"field":"cat_s"}}
+    }
+  })", mr));
+
+  ASSERT_TRUE(P::merge_json(r, R"({
+    "request_id":"url",
+    "limit":3,
+    "fields":["url_a"],
+    "sorts":[{"field":"new_i","dir":"desc"}]
+  })", mr));
+
+  EXPECT_EQ("url", r.request_id);
+  ASSERT_EQ(2u, r.ops.size());
+  EXPECT_EQ("cat_s", std::get<P::FieldFacet>((**r.ops.find("cats")).kind).field);
+  const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
+  EXPECT_EQ(3, *td.limit);
+  ASSERT_TRUE(td.query.has_value());
+  EXPECT_EQ("title_w:body", std::get<P::ExprQuery>(td.query->kind).q);
+  ASSERT_EQ(1u, td.fields.size());
+  EXPECT_EQ("url_a", td.fields[0]);
+  ASSERT_EQ(1u, td.sorts.size());
+  EXPECT_EQ("new_i", td.sorts[0].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::DESC, td.sorts[0].dir);
+}
+
+TEST(JsonDialect, SearchRequestShorthandOpsNamedQStaysSubOp) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest r;
+  ASSERT_TRUE(P::read_json(r, R"({
+    "ops":{"q":{"field_facet":{"field":"cat_s"}}},
+    "query":"title_w:dune"
+  })", mr));
+
+  ASSERT_EQ(1u, r.ops.size());
+  const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
+  ASSERT_EQ(1u, td.ops.size());
+  EXPECT_EQ("cat_s", std::get<P::FieldFacet>((**td.ops.find("q")).kind).field);
+}
+
 TEST(JsonDialect, ValWritesUntagged) {
   std::pmr::monotonic_buffer_resource mr;
   P::Val v;

@@ -9,7 +9,7 @@ uses the same vocabulary as protobuf.
 | Method and path | Purpose |
 |---|---|
 | `GET /health` | Process liveness. |
-| `POST /collections/{collection}/_search` | Search; bounded JSON request, chunked NDJSON response. |
+| `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
@@ -36,6 +36,11 @@ Send bounded search, schema, and update messages as `application/json`. Send a
 document stream to `_update` as `application/x-ndjson`; one complete JSON value
 must end on each line.
 
+GET search requests have no body. Search request fields may be written as typed
+URL parameters; on POST they overlay the parsed JSON body, with URL values
+winning field by field. See [Searching](searching.md#url-request-field-overlay)
+for the whitelist and value grammars.
+
 Search responses use `application/x-ndjson` with HTTP chunked transfer coding.
 Each normal line is one complete response batch. A small default-limit search
 usually has one line and therefore also parses as an ordinary JSON object. Use
@@ -57,9 +62,9 @@ Unknown JSON keys, unknown oneof arms, invalid enum names, excessive nesting,
 and wrong value shapes are request errors. A body typo is not ignored. URL
 query parameters are intentionally an open middleware channel: unknown
 parameters are currently accepted and ignored, while recognized parameters
-validate their values. Add `?explain=request` to a query to return the canonical
-parsed request without executing it; posting the result back has the same
-semantics.
+validate their lexical values. Add `?explain=request` to a query to return the
+canonical effective request, including URL overlays, without executing it;
+posting the result back has the same semantics.
 
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":{"name":["books"]}` even when the original body omitted it.
@@ -73,9 +78,9 @@ contract to rollback of the explicit atomic unit.
 
 Malformed JSON and HTTP-dialect validation failures detected before submission
 return `400` with a JSON error body. Oversized buffered bodies return `413`.
-The schema and stats routes return `405` with an `Allow` header for a wrong
-method; other routes currently fall through to `404`, so method handling is
-not uniform.
+The search, schema, and stats routes return `405` with an `Allow` header for a
+wrong method; other routes currently fall through to `404`, so method handling
+is not uniform.
 After a normal search has been submitted, query planning or execution errors
 appear as an `error` field in the HTTP-success NDJSON envelope. The server does
 not yet have a complete HTTP status taxonomy, so clients must inspect response

@@ -598,7 +598,9 @@ LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
   bool encode(const M &, std::vector<std::byte> &out);                                      \
   bool write_json(const M &, std::string &out);                                             \
   bool read_json(M &, std::string_view json, std::pmr::memory_resource &arena,              \
-                 std::string *error = nullptr);
+                 std::string *error = nullptr);                                              \
+  bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
+                  std::string *error = nullptr);
 LUXIR_ENTRY(Target) LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(GenOp)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)

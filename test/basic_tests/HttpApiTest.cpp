@@ -1720,6 +1720,287 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_EQ(canonical, echo2.body());
 }
 
+TEST_F(HttpApiTest, searchGetUrlOnly) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("u1"), "title_w", std::string("dune novel"),
+            "title_s", std::string("Dune")),
+    flatdoc("id", std::string("u2"), "title_w", std::string("foundation"),
+            "title_s", std::string("Foundation")),
+  }, UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?query=title_w%3Adune&limit=10&fields=id%2Ctitle_s");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("id":"u1")"), std::string::npos) << res.body();
+  EXPECT_NE(res.body().find(R"("title_s":"Dune")"), std::string::npos) << res.body();
+  EXPECT_EQ(res.body().find(R"("id":"u2")"), std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, searchGetLimitOnlyMatchesAll) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("all1"), "title_w", std::string("one")),
+    flatdoc("id", std::string("all2"), "title_w", std::string("two")),
+  }, UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?limit=1&fields=id&get_number=true");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(1u, lines.size()) << res.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, lines[0])) << lines[0];
+  ASSERT_NE(nullptr, root["found"].get_if<int64_t>());
+  EXPECT_EQ(2, *root["found"].get_if<int64_t>());
+  auto* docs = root["docs"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, docs);
+  EXPECT_EQ(1u, docs->size());
+}
+
+TEST_F(HttpApiTest, searchPostUrlOverlayWins) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("over1"), "title_w", std::string("dune"),
+            "title_s", std::string("Dune")),
+    flatdoc("id", std::string("over2"), "title_w", std::string("foundation"),
+            "title_s", std::string("Foundation")),
+  }, UpdateMessage::COMMIT);
+
+  const std::string target =
+      "/collections/main/_search?query=title_w%3Adune&limit=10&fields=id%2Ctitle_s";
+  auto overlaid = httpRequest(port(), http::verb::post, target,
+      R"({"query":"title_w:foundation","limit":0,"fields":["id"]})");
+  auto urlOnly = httpRequest(port(), http::verb::get, target);
+  ASSERT_EQ(200, overlaid.result_int()) << overlaid.body();
+  EXPECT_EQ(urlOnly.body(), overlaid.body());
+}
+
+TEST_F(HttpApiTest, searchUrlOverlayPreservesSiblingOps) {
+  const std::string body = R"({"ops":{
+    "q":{"top_docs":{"query":"title_w:body","fields":["id"]}},
+    "cats":{"field_facet":{"field":"cat_s"}}
+  }})";
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&query=title_w%3Aurl&fields=title_s", body);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, echo.body())) << echo.body();
+  auto* ops = root["ops"].get_if<glz::generic_i64::object_t>();
+  ASSERT_NE(nullptr, ops);
+  EXPECT_TRUE(ops->contains("cats"));
+  auto& td = root["ops"]["q"]["top_docs"];
+  EXPECT_EQ("title_w:url", *td["query"]["expr"]["q"].get_if<std::string>());
+  auto* fields = td["fields"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, fields);
+  ASSERT_EQ(1u, fields->size());
+  EXPECT_EQ("title_s", *(*fields)[0].get_if<std::string>());
+}
+
+TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("ep1"), "title_w", std::string("dune")),
+  }, UpdateMessage::COMMIT);
+
+  const std::string target =
+      "/collections/main/_search?query=title_w%3Adune&limit=4&fields=id&get_number=true";
+  auto direct = httpRequest(port(), http::verb::get, target);
+  auto echo = httpRequest(port(), http::verb::get, target + "&explain=request");
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  auto postback = httpRequest(port(), http::verb::post, "/collections/main/_search", echo.body());
+  ASSERT_EQ(200, postback.result_int()) << postback.body();
+  EXPECT_EQ(direct.body(), postback.body());
+
+  auto echo2 = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request", echo.body());
+  ASSERT_EQ(200, echo2.result_int()) << echo2.body();
+  EXPECT_EQ(echo.body(), echo2.body());
+}
+
+TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
+  const std::string target =
+      "/collections/main/_search?explain=request"
+      "&request_id=url%22%5Cvalue&freshness_ms=17&time_zone=UTC&profile=true&max_parallel=1"
+      "&query=title_w%3Adune&limit=bad&limit=7&offset=-2&fields=id%2Ctitle_s"
+      "&sort=price_i+desc&sort=score&batch_size=5&document_format=columns"
+      "&get_number=true&get_scores=false";
+  auto echo = httpRequest(port(), http::verb::get, target);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, echo.body())) << echo.body();
+  EXPECT_EQ("url\"\\value", *root["request_id"].get_if<std::string>());
+  EXPECT_EQ(17, *root["freshness_ms"].get_if<int64_t>());
+  EXPECT_EQ("UTC", *root["time_zone"].get_if<std::string>());
+  EXPECT_TRUE(*root["profile"].get_if<bool>());
+  EXPECT_EQ(1, *root["max_parallel"].get_if<int64_t>());
+  auto& td = root["ops"]["q"]["top_docs"];
+  EXPECT_EQ(7, *td["limit"].get_if<int64_t>());
+  EXPECT_EQ(-2, *td["offset"].get_if<int64_t>());
+  EXPECT_EQ(5, *td["batch_size"].get_if<int64_t>());
+  EXPECT_EQ("columns", *td["document_format"].get_if<std::string>());
+  EXPECT_TRUE(*td["get_number"].get_if<bool>());
+  auto* sorts = td["sorts"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, sorts);
+  ASSERT_EQ(2u, sorts->size());
+  EXPECT_EQ("price_i", *(*sorts)[0]["expr"].get_if<std::string>());
+  EXPECT_EQ("desc", *(*sorts)[0]["dir"].get_if<std::string>());
+  EXPECT_EQ("score", *(*sorts)[1]["expr"].get_if<std::string>());
+}
+
+TEST_F(HttpApiTest, searchUrlQueryIsJsonStringValue) {
+  auto echo = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?explain=request&query=title_w%3Adune%22%5Cprobe");
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, echo.body())) << echo.body();
+  auto& td = root["ops"]["q"]["top_docs"];
+  EXPECT_EQ("title_w:dune\"\\probe", *td["query"]["expr"]["q"].get_if<std::string>());
+  EXPECT_FALSE(td.contains("limit"));
+}
+
+TEST_F(HttpApiTest, searchUrlFieldsGrammar) {
+  auto repeated = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&fields=bad%2C%2C&fields=id%2Ctitle_s",
+      R"({"fields":["body"]})");
+  ASSERT_EQ(200, repeated.result_int()) << repeated.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, repeated.body())) << repeated.body();
+  auto* fields = root["ops"]["q"]["top_docs"]["fields"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, fields);
+  ASSERT_EQ(2u, fields->size());
+  EXPECT_EQ("id", *(*fields)[0].get_if<std::string>());
+  EXPECT_EQ("title_s", *(*fields)[1].get_if<std::string>());
+
+  auto cleared = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&fields=", R"({"fields":["body"]})");
+  ASSERT_EQ(200, cleared.result_int()) << cleared.body();
+  ASSERT_FALSE(glz::read_json(root, cleared.body())) << cleared.body();
+  EXPECT_FALSE(root["ops"]["q"]["top_docs"].contains("fields"));
+
+  for (std::string_view value : {"id%2C", "%2Cid", "id%2C%2Ctitle_s"}) {
+    auto bad = httpRequest(port(), http::verb::get,
+        "/collections/main/_search?fields=" + std::string(value));
+    EXPECT_EQ(400, bad.result_int()) << bad.body();
+    EXPECT_NE(bad.body().find("invalid URL parameter 'fields': empty list item"),
+              std::string::npos) << bad.body();
+  }
+}
+
+TEST_F(HttpApiTest, searchUrlSortGrammar) {
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&sort=price_i+desc"
+      "&sort=sum%28x_i%2Cy_i%29+asc",
+      R"({"sorts":[{"field":"old_i","dir":"asc"}]})");
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, echo.body())) << echo.body();
+  auto* sorts = root["ops"]["q"]["top_docs"]["sorts"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, sorts);
+  ASSERT_EQ(2u, sorts->size());
+  EXPECT_EQ("price_i", *(*sorts)[0]["expr"].get_if<std::string>());
+  EXPECT_EQ("desc", *(*sorts)[0]["dir"].get_if<std::string>());
+  EXPECT_EQ("sum(x_i,y_i)", *(*sorts)[1]["expr"].get_if<std::string>());
+
+  auto cleared = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&sort=",
+      R"({"sorts":[{"field":"old_i"}]})");
+  ASSERT_EQ(200, cleared.result_int()) << cleared.body();
+  ASSERT_FALSE(glz::read_json(root, cleared.body())) << cleared.body();
+  EXPECT_FALSE(root["ops"]["q"]["top_docs"].contains("sorts"));
+
+  auto mixed = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?sort=&sort=price_i");
+  EXPECT_EQ(400, mixed.result_int()) << mixed.body();
+  EXPECT_NE(mixed.body().find("invalid URL parameter 'sort': empty value cannot be combined"),
+            std::string::npos) << mixed.body();
+}
+
+TEST_F(HttpApiTest, searchUrlKnownValueErrorsNameParam) {
+  const std::array badValues{
+    std::pair{"freshness_ms", "-1"},
+    std::pair{"profile", "TRUE"},
+    std::pair{"max_parallel", "1x"},
+    std::pair{"limit", "1.0"},
+    std::pair{"offset", "9223372036854775808"},
+    std::pair{"batch_size", "2147483648"},
+    std::pair{"document_format", "row"},
+    std::pair{"get_number", "1"},
+    std::pair{"get_scores", "falsex"},
+  };
+  for (const auto& [name, value] : badValues) {
+    std::string target = "/collections/main/_search?" + std::string(name) + "=" + value;
+    auto bad = httpRequest(port(), http::verb::get, target);
+    EXPECT_EQ(400, bad.result_int()) << name << ": " << bad.body();
+    EXPECT_NE(bad.body().find("invalid URL parameter '" + std::string(name) + "':"),
+              std::string::npos) << bad.body();
+  }
+}
+
+TEST_F(HttpApiTest, searchUrlSemanticValidationMatchesBody) {
+  auto urlZone = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?time_zone=Not%2FA%2FZone&limit=0");
+  auto bodyZone = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"time_zone":"Not/A/Zone","limit":0})");
+  EXPECT_EQ(bodyZone.result_int(), urlZone.result_int());
+  EXPECT_EQ(bodyZone.body(), urlZone.body());
+
+  auto urlParallel = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?max_parallel=2&limit=0");
+  auto bodyParallel = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"max_parallel":2,"limit":0})");
+  EXPECT_EQ(bodyParallel.result_int(), urlParallel.result_int());
+  EXPECT_EQ(bodyParallel.body(), urlParallel.body());
+}
+
+TEST_F(HttpApiTest, searchUrlTopDocsQMaterializationRule) {
+  for (std::string_view body : {"{}", R"({"time_zone":"UTC"})"}) {
+    auto echo = httpRequest(port(), http::verb::post,
+        "/collections/main/_search?explain=request&query=title_w%3Adune", std::string(body));
+    ASSERT_EQ(200, echo.result_int()) << echo.body();
+    EXPECT_NE(echo.body().find(R"("q":{"top_docs")"), std::string::npos) << echo.body();
+  }
+
+  const std::string missingQ = R"({"ops":{"cats":{"field_facet":{"field":"cat_s"}}}})";
+  auto bad = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?limit=2", missingQ);
+  EXPECT_EQ(400, bad.result_int()) << bad.body();
+  EXPECT_NE(bad.body().find(
+      "URL TopDocs parameters target ops.q, but the request body has no top_docs op named 'q'"),
+      std::string::npos) << bad.body();
+
+  auto wrongQ = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?fields=id",
+      R"({"ops":{"q":{"field_facet":{"field":"cat_s"}}}})");
+  EXPECT_EQ(400, wrongQ.result_int()) << wrongQ.body();
+
+  auto lastQTopDocs = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&limit=2",
+      R"({"ops":{"q":{"field_facet":{"field":"cat_s"}},"q":{"top_docs":{"limit":1}}}})");
+  EXPECT_EQ(200, lastQTopDocs.result_int()) << lastQTopDocs.body();
+  auto lastQFacet = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?limit=2",
+      R"({"ops":{"q":{"top_docs":{"limit":1}},"q":{"field_facet":{"field":"cat_s"}}}})");
+  EXPECT_EQ(400, lastQFacet.result_int()) << lastQFacet.body();
+
+  auto requestOnly = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&time_zone=UTC", missingQ);
+  EXPECT_EQ(200, requestOnly.result_int()) << requestOnly.body();
+}
+
+TEST_F(HttpApiTest, searchMethodPolicy) {
+  auto head = httpRequest(port(), http::verb::head, "/collections/main/_search");
+  EXPECT_EQ(405, head.result_int());
+  EXPECT_EQ("GET, POST", head[http::field::allow]);
+
+  auto getBody = httpRequest(port(), http::verb::get, "/collections/main/_search", "{}");
+  EXPECT_EQ(400, getBody.result_int()) << getBody.body();
+  EXPECT_NE(getBody.body().find("GET _search does not accept a request body; use POST"),
+            std::string::npos) << getBody.body();
+
+  auto emptyPost = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?limit=0");
+  EXPECT_EQ(200, emptyPost.result_int()) << emptyPost.body();
+}
+
 // URL-parameter policy: unknown parameters are accepted and ignored (the URL is
 // an open channel - correlation ids, middleware); recognized keys enforce values.
 TEST_F(HttpApiTest, urlParamPolicy) {

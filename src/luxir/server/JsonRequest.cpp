@@ -22,4 +22,12 @@ void parseQueryRequest(std::string_view body, luxir::api::SearchRequest& out,
   }
 }
 
+void overlayQueryRequest(std::string_view overlay, luxir::api::SearchRequest& out,
+                         std::pmr::memory_resource& arena) {
+  std::string err;
+  if (!luxir::api::merge_json(out, overlay, arena, &err)) {
+    throw std::runtime_error(!err.empty() ? err : "invalid URL request-field overlay");
+  }
+}
+
 } // namespace luxir

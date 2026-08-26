@@ -25,4 +25,10 @@ namespace luxir {
 void parseQueryRequest(std::string_view body, luxir::api::SearchRequest& out,
                        std::pmr::memory_resource& arena);
 
+// Apply a root-field JSON overlay to an already parsed request. The unified
+// SearchRequest reader reuses an existing top_docs op named q for shorthand
+// TopDocs fields and otherwise preserves request-level fields not present here.
+void overlayQueryRequest(std::string_view overlay, luxir::api::SearchRequest& out,
+                         std::pmr::memory_resource& arena);
+
 } // namespace luxir

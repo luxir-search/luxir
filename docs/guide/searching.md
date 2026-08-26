@@ -6,11 +6,63 @@ operations and nests facets or metrics under the query whose match set they
 should consume. Both are the same model: the small form becomes a `top_docs`
 operation named `q`.
 
-All HTTP searches use:
+HTTP searches accept either method:
 
 ```
+GET  /collections/{collection}/_search?<request fields>
 POST /collections/{collection}/_search
 ```
+
+GET has no request body. POST accepts the usual JSON body and the same URL
+request-field overlay as GET. A recognized URL field wins over the corresponding
+body field, which makes saved POST requests easy to adjust from a link.
+
+## URL request-field overlay
+
+This is a complete browser-usable search:
+
+```http
+GET /collections/books/_search?query=title_w:dune&limit=10&fields=id,title_s
+```
+
+The recognized request-level parameters are:
+
+| Parameter | Value |
+|---|---|
+| `request_id` | String. |
+| `freshness_ms` | Unsigned 64-bit decimal integer. |
+| `time_zone` | String; validated by the search engine like the body field. |
+| `profile` | Exactly `true` or `false`. |
+| `max_parallel` | Signed 32-bit decimal integer; supported modes are validated by the search engine. |
+
+The recognized top-document parameters are:
+
+| Parameter | Value |
+|---|---|
+| `query` | Expression query string, exactly like a JSON string in the body `query` position. |
+| `limit`, `offset` | Signed 64-bit decimal integer. |
+| `fields` | Comma-separated field names. An empty value clears the body list; an empty list item is an error. |
+| `sort` | One sort clause per parameter: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
+| `batch_size` | Signed 32-bit decimal integer. |
+| `document_format` | Exactly `default`, `rows`, or `columns`. |
+| `get_number`, `get_scores` | Exactly `true` or `false`. |
+
+URL form decoding happens before these grammars are applied, so `+` in a
+`sort` value is a space. `sort=` clears the body sort list. Empty and non-empty
+`sort` occurrences cannot be mixed. Scalar parameters and `fields` use their
+last occurrence; repeated `sort` parameters accumulate in URL order.
+
+Top-document URL parameters target the operation named `q`. If the body has no
+operations, that operation is created. If the body has operations but its
+last `q` is not a `top_docs` operation, the request is rejected instead of
+guessing another target. Request-level URL parameters apply to every operation
+shape.
+
+Unknown URL parameters are accepted and ignored as an open channel for
+middleware metadata. Recognized parameters reject lexically invalid values.
+The existing `format=docs` parameter controls response framing and is not a
+request-field overlay. Add `explain=request` to return the effective request,
+including the overlay, as a body that can be posted back for identical results.
 
 ## One result list
 
