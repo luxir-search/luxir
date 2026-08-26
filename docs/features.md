@@ -225,7 +225,7 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
   depth and size limits are built in (the public port is treated as
   hostile).
 - Request/response correlation ids on gRPC streams and updates; per-request
-  freshness bound (`freshness_us`) on reads.
+  freshness bound (`freshness_ms`) on reads.
 
 ## Operations
 

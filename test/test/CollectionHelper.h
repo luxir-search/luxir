@@ -200,6 +200,11 @@ public:
       p.max_segments = maxSegments;
       return *this;
     }
+    UpdateBuilder& commitWithin(uint64_t ms) {
+      request_.commit.emplace().commit_within_ms = ms;
+      return *this;
+    }
+
     UpdateBuilder& commitWithAux(std::span<const std::string> names) {
       auto& params = request_.commit.emplace();
       std::string_view* a = build::allocArray(params.build_aux_indexes, names.size(), mr_);

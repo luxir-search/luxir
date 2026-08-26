@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <memory_resource>
+#include <algorithm>
 #include <limits>
 #include <string>
 
@@ -55,7 +56,8 @@ public:
     if (req->commit.has_value()) {
       commit = COMMIT;
       const auto& params = *req->commit;
-      commit_within = params.commit_within_us;
+      commit_within_ms = (int64_t)std::min<uint64_t>(
+          params.commit_within_ms, (uint64_t)std::numeric_limits<int64_t>::max());
       waitForMerges = params.wait_for_merges;
       constexpr uint32_t maxInt32 = (uint32_t)std::numeric_limits<int32_t>::max();
       maxSegments = params.max_segments > maxInt32

@@ -295,6 +295,11 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
 
 IndexWriter::~IndexWriter() {
   close();
+  // Detach the deferred-commit slot BEFORE the final drain: after detach() no
+  // timer callback can start, and a submit a racing callback already made is a
+  // graph task covered by the wait below.  (Completion-side re-arms are guarded
+  // by `closed`, which close() published before draining the graph.)
+  DeadlineScheduler::global().detach(autoCommitSlot);
   // A submit racing close() is rejected by startUpdateNode, but that rejection is
   // still a graph task; wait for it before the nodes are destroyed.
   updateGraph.wait_for_all();
@@ -707,6 +712,116 @@ void IndexWriter::commit(std::function<void()>&& callback, UpdateMessage::Commit
   updateMessage.release();
 }
 
+
+// Deferred-commit machinery.  Invariants (all under autoCommitMutex):
+//  - autoCommitPending means data sequenced since the last covering commit carries
+//    a deadline (the min of its windows).  Set/cleared only from startUpdateBody
+//    (serial), so it is exactly ordered against the commits that satisfy it.
+//  - The scheduler slot is armed only while no auto-commit is in flight; the
+//    completion callback re-arms if new deadline data arrived meanwhile.  A commit
+//    slower than the window therefore degrades to back-to-back auto-commits, never
+//    a growing queue of them.
+void IndexWriter::deferCommitWithin(int64_t withinMs, uint64_t updateVersion) {
+  const auto now = DeadlineScheduler::Clock::now();
+  // Saturate: a window past the clock's range would overflow the addition (UB,
+  // typically wrapping the deadline into the past).  Stay below the slot's
+  // time_point::max() disarmed sentinel.
+  const int64_t maxMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      DeadlineScheduler::Clock::time_point::max() - now).count() - 1000;
+  auto due = now + std::chrono::milliseconds(std::min(withinMs, maxMs));
+  bool arm;
+  {
+    const std::lock_guard<std::mutex> lock(autoCommitMutex);
+    // Reach the (process-global) scheduler only when this update TIGHTENED the
+    // window: in a steady stream all carrying the same T, the first update
+    // after each commit arms the timer and every later one is just this
+    // writer-local lock + compare.
+    const bool tightened = !autoCommitPending || due < autoCommitDeadline;
+    if (tightened) autoCommitDeadline = due;
+    autoCommitPending = true;
+    autoCommitMaxVersion = updateVersion;  // monotonic: only the serial entry node calls this
+    arm = tightened && !autoCommitInFlight;
+    due = autoCommitDeadline;
+  }
+  // Arm outside the lock: the scheduler callback takes autoCommitMutex.  arm()
+  // only tightens, so a racing stale arm can at worst fire early; the callback
+  // re-checks the deadline and re-arms.
+  if (arm) DeadlineScheduler::global().arm(autoCommitSlot, due);
+}
+
+// Called after a commit is durably published, with its watermark.  Clearing on
+// publication (not graph entry) means a FAILED commit leaves the pending
+// deadline in place: the synthetic auto-commit retries (paced by
+// autoCommitFinished), and deferred data behind a failed explicit commit is
+// still covered by its own timer.
+void IndexWriter::deferredCommitPublished(uint64_t highestUpdateVersion) {
+  const std::lock_guard<std::mutex> lock(autoCommitMutex);
+  if (autoCommitPending && autoCommitMaxVersion <= highestUpdateVersion) {
+    autoCommitPending = false;
+    // The slot may still fire at the stale deadline; the callback no-ops on
+    // !autoCommitPending.
+  }
+}
+
+// Runs on the DeadlineScheduler thread.
+void IndexWriter::autoCommitTimerFired() {
+  DeadlineScheduler::Clock::time_point rearm{};
+  {
+    const std::lock_guard<std::mutex> lock(autoCommitMutex);
+    if (!autoCommitPending || autoCommitInFlight) return;
+    if (DeadlineScheduler::Clock::now() < autoCommitDeadline) {
+      rearm = autoCommitDeadline;  // spurious early fire (stale tighter arm)
+    } else {
+      autoCommitInFlight = true;
+    }
+  }
+  if (rearm != DeadlineScheduler::Clock::time_point{}) {
+    // Must not throw on the scheduler thread; the slot is already registered
+    // here so arm() cannot allocate, but stay defensive.
+    try {
+      DeadlineScheduler::global().arm(autoCommitSlot, rearm);
+    } catch (const std::exception& e) {
+      LOG_ERROR("deferred-commit re-arm failed: {}", e.what());
+    }
+    return;
+  }
+  // Submit outside the lock: try_put may run startUpdateBody inline on this
+  // thread, and that takes autoCommitMutex.  On a closed writer the message
+  // is rejected at the graph entry and the callback still runs (with closed
+  // observed true, so it will not re-arm).
+  try {
+    commit([this] { autoCommitFinished(); }, UpdateMessage::COMMIT);
+  } catch (const std::exception& e) {
+    LOG_ERROR("deferred auto-commit submit failed: {}", e.what());
+    autoCommitFinished();
+  }
+}
+
+void IndexWriter::autoCommitFinished() {
+  bool arm = false;
+  DeadlineScheduler::Clock::time_point due{};
+  {
+    const std::lock_guard<std::mutex> lock(autoCommitMutex);
+    autoCommitInFlight = false;
+    // Pending here means either new deadline data arrived while this commit ran
+    // (future deadline - resume its timer exactly), or the commit FAILED and
+    // publication never cleared it (deadline now stale - floor the retry so a
+    // persistently failing commit pipeline is paced, not spun).
+    if (autoCommitPending && !closed.load(std::memory_order_relaxed)) {
+      const auto now = DeadlineScheduler::Clock::now();
+      if (autoCommitDeadline <= now) autoCommitDeadline = now + std::chrono::seconds(1);
+      arm = true;
+      due = autoCommitDeadline;
+    }
+  }
+  if (arm) {
+    try {
+      DeadlineScheduler::global().arm(autoCommitSlot, due);
+    } catch (const std::exception& e) {
+      LOG_ERROR("deferred-commit re-arm failed: {}", e.what());
+    }
+  }
+}
 
 void IndexWriter::commit(UpdateMessage::CommitType commitType) {
   class BlockingUpdateMessage : public UpdateMessage {
@@ -1288,7 +1403,11 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     currentSegmentOverlays_ = std::move(segmentOverlayInfos);
     lastCommitTime = commitTime;
     lastAdvertisedCommitTime = commitTime;
+    commitCount.fetch_add(1, std::memory_order_relaxed);
   }
+  // publishOnly commits publish a merge layout without flushing later-arrived
+  // inverter state, so they must not satisfy deferred-commit deadlines.
+  if (!msg.publishOnly) deferredCommitPublished(msg.commitInfo->highestUpdateVersion);
 
   // Files from the previous lists that aren't in the new commit are now
   // unreferenced. The commit is already visible, so cleanup is best-effort.
@@ -2592,6 +2711,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     out.commitTime = lastAdvertisedCommitTime.load(std::memory_order_relaxed);
+    out.commits = commitCount.load(std::memory_order_relaxed);
     out.indexGen = indexGen;
     out.coreGen = coreGen;
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);

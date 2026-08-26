@@ -66,7 +66,7 @@ One request contains:
 
 - `collection`: the target collection.
 - `ops`: named `top_docs`, `fusion`, facet, range-facet, or metric operations.
-- `freshness_us` and `time_zone`: request-level view/date controls.
+- `freshness_ms` and `time_zone`: request-level view/date controls.
 - `profile`: include instrumented per-segment execution details on the final
   response; string field facets are currently instrumented.
 - `max_parallel`: `0` for automatic intra-request parallelism, `1` for a

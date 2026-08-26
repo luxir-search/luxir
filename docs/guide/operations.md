@@ -117,10 +117,10 @@ its broken on-disk state.
 ## Visibility policy
 
 Commits are the freshness boundary. An immediate `"commit": {}` waits until a
-new index view is published. `commit_within_us` can coalesce publication and
+new index view is published. `commit_within_ms` can coalesce publication and
 return before the update is visible while still bounding staleness.
 
-Search `freshness_us` expresses how stale a reader may be; `0` requires the
+Search `freshness_ms` expresses how stale a reader may be; `0` requires the
 latest commit. Decide these together:
 
 - Interactive writes that must be read immediately should use an immediate

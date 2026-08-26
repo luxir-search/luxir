@@ -267,7 +267,7 @@ form, or mixed directly with query keys at the shorthand root:
 ```json
 {
   "request_id": "search-42",
-  "freshness_us": 50000,
+  "freshness_ms": 50,
   "time_zone": "America/Denver",
   "profile": true,
   "max_parallel": 1,
@@ -285,7 +285,7 @@ In the shorthand, an `ops` key holds the query's sub-operations (facets and
 metrics over its result domain), exactly as it does inside a full-form
 `top_docs`.
 
-`freshness_us` bounds how stale an index view may be; `0` requires the latest
+`freshness_ms` bounds how stale an index view may be; `0` requires the latest
 commit. `time_zone` supplies the civil frame for every date query and facet in
 the request. `max_parallel: 0` lets the engine choose intra-request parallelism
 and is the default; `1` executes the request on one worker thread; `-1`

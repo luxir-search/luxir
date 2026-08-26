@@ -539,7 +539,7 @@ struct to<JSON, luxir::api::Val> {
 };
 
 // ----- SearchRequest: full form, root top_docs shorthand, or both at one root -----
-// Read accepts request-level keys (request_id, collection, ops, freshness_us,
+// Read accepts request-level keys (request_id, collection, ops, freshness_ms,
 // time_zone, response_format, profile, max_parallel) and TopDocs keys mixed at
 // the root: any TopDocs key lazily creates the shorthand op, registered as
 // ops["q"]. "ops" is ambiguous until the scan ends - it is SearchRequest.ops in
@@ -581,8 +581,8 @@ struct from<JSON, luxir::api::SearchRequest> {
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
-          } else if (key == "freshness_us") {
-            util::from_json<O>(value.freshness_us, ctx, vit, vend);
+          } else if (key == "freshness_ms") {
+            util::from_json<O>(value.freshness_ms, ctx, vit, vend);
           } else if (key == "time_zone") {
             util::from_json<O>(value.time_zone, ctx, vit, vend);
           } else if (key == "response_format") {

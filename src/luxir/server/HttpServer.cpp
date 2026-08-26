@@ -1370,7 +1370,7 @@ private:
                                const luxir::api::CommitParams& src,
                                std::pmr::memory_resource& resource) {
     auto& params = out.emplace();
-    params.commit_within_us = src.commit_within_us;
+    params.commit_within_ms = src.commit_within_ms;
     params.wait_for_merges = src.wait_for_merges;
     params.max_segments = src.max_segments;
     std::string_view* names =

@@ -16,6 +16,7 @@
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/FilterCache.h"
 #include "luxir/server/LuxirError.h"
+#include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
 #include "UpdateMessage.h"
 #include "VectorIndexBuilder.h"
@@ -146,6 +147,7 @@ public:
 
   struct Stats {
     uint64_t commitTime = 0;
+    uint64_t commits = 0;  // commits performed by this writer instance
     uint64_t indexGen = 0;
     uint64_t coreGen = 0;
     uint64_t updateVersion = 0;
@@ -424,6 +426,27 @@ public:
   std::atomic_uint64_t lastCommitTime;
   std::atomic_uint64_t lastAdvertisedCommitTime;
 
+  // Commits performed by this writer instance (process lifetime, not persisted).
+  std::atomic_uint64_t commitCount = 0;
+
+  // Deferred-commit (commit_within_ms) state, guarded by autoCommitMutex.
+  // pending/deadline registration and clearing happen on the serial graph entry
+  // node (startUpdateBody), so they are exactly ordered against the commits that
+  // satisfy them; the scheduler callback and auto-commit completion run on other
+  // threads.  The slot may fire spuriously (stale arm after an explicit commit
+  // cleared pending); the callback re-checks state and no-ops or re-arms.
+  std::mutex autoCommitMutex;
+  DeadlineScheduler::Clock::time_point autoCommitDeadline{};
+  bool autoCommitPending = false;   // uncommitted data with a deadline exists
+  bool autoCommitInFlight = false;  // auto-commit submitted, not yet done(); the
+                                    // slot is not re-armed until it completes, so
+                                    // auto-commits never stack behind a slow commit
+  uint64_t autoCommitMaxVersion = 0;  // highest updateVersion registered pending;
+                                      // publication clears pending only once a
+                                      // commit watermark covers it, so a FAILED
+                                      // commit leaves the deadline to retry
+  DeadlineScheduler::Slot autoCommitSlot{[this] { autoCommitTimerFired(); }};
+
   // TBB flow graph nodes for processing updates.
   using UpdateMessageFunc = tbb::flow::function_node<UpdateMessage*, UpdateMessage*>;
   using UpdateMessageMultiFunc = tbb::flow::multifunction_node<UpdateMessage*, std::tuple<UpdateMessage*>>;
@@ -606,6 +629,12 @@ private:
     void done(IndexWriter& iw) override;
   };
 
+  // Deferred-commit (commit_within_ms) machinery; see the state block above.
+  void deferCommitWithin(int64_t withinMs, uint64_t updateVersion);
+  void deferredCommitPublished(uint64_t highestUpdateVersion);
+  void autoCommitTimerFired();
+  void autoCommitFinished();
+
   void startUpdateBody(UpdateMessage& msg) {
     // Rejection must come before the sequence numbers are assigned: they must stay
     // dense for the sequencer nodes.  Closing is terminal, so nothing follows a
@@ -617,6 +646,27 @@ private:
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
     msg.updateOrdinal = updateOrdinal++;
     msg.commitNum = 0;
+    if (msg.commit != UpdateMessage::NO_COMMIT && !msg.publishOnly &&
+        msg.commit_within_ms > 0 && msg.maxSegments == 0 && !msg.waitForMerges &&
+        msg.buildAuxIndexes.empty()) {
+      // Plain deferred commit: the deadline machinery owns it from here.  The
+      // downgrade happens only after scheduling succeeds - if the scheduler
+      // cannot arm (first-arm thread spawn or allocation failure), the message
+      // keeps COMMIT and commits immediately, which trivially satisfies the
+      // window and, crucially, still flows through the graph: throwing here
+      // would strand the ordinal this message just consumed and hang the
+      // sequencer.  (Parameterized commits ignore commit_within_ms:
+      // max_segments is documented to wait for the merged layout, and
+      // aux/merge params have no deferred meaning.  Pending deadlines are
+      // cleared by commit publication watermarks, not here, so a failed
+      // commit leaves them to retry.)
+      try {
+        deferCommitWithin(msg.commit_within_ms, msg.updateVersion);
+        msg.commit = UpdateMessage::NO_COMMIT;
+      } catch (const std::exception& e) {
+        LOG_ERROR("commit_within scheduling failed; committing immediately: {}", e.what());
+      }
+    }
     INDEX_DEBUG("startUpdateBody: msg={} updateVersion={} updateOrdinal={} commitNum={}",
                 (void*)&msg, msg.updateVersion, msg.updateOrdinal, msg.commitNum);
   }

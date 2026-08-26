@@ -134,7 +134,7 @@ struct PhraseQuery {
   std::span<const std::int32_t> positions;
 };
 struct CommitParams {
-  uint64_t commit_within_us = 0;
+  uint64_t commit_within_ms = 0;
   std::span<const std::string_view> build_aux_indexes;
   bool wait_for_merges = false;
   uint32_t max_segments = 0;
@@ -398,7 +398,7 @@ struct SearchRequest {                                          // needs Target
   std::string_view request_id;
   std::optional<Target> collection;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  uint64_t freshness_us = 0;
+  uint64_t freshness_ms = 0;
   std::string_view time_zone;
   ResponseFormat response_format = ResponseFormat::ENVELOPE;
   bool profile = false;

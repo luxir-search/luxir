@@ -138,7 +138,7 @@ publication:
 
 | Field | Meaning |
 |---|---|
-| `commit_within_us` | Publish within this many microseconds. `0` is immediate; a positive value lets the update response return before publication. |
+| `commit_within_ms` | Publish within this many milliseconds. `0` is immediate; a positive value lets the update response return before publication. |
 | `build_aux_indexes` | Missing vector overlays to build, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. |
 | `wait_for_merges` | Wait for in-flight merges before publishing. |
 | `max_segments` | Force the committed data down to at most this many segments before returning. `0` means no forced merge. |

@@ -29,8 +29,13 @@ message SearchRequest {
   // An alternative could be to put the tag/name in the SearchOp itself
   map<string, SearchOp> ops = 3;
 
-  // index view freshness requirement in microseconds. 0 (the default) means latest commit must be used.
-  uint64 freshness_us = 4;
+  // Index view freshness tolerance in milliseconds. 0 (the default) requires the
+  // latest advertised commit: index with a commit, wait for the response, and a
+  // freshness_ms=0 search is guaranteed to see it (a happens-before contract).
+  // A positive value lets the search reuse a reader up to this stale, avoiding
+  // reader churn under frequent commits. It is a tolerance, not a latency bound:
+  // there is no guaranteed time from ingest to visibility.
+  uint64 freshness_ms = 4;
 
   // Civil frame for date math and offset-less date literals. Empty is UTC;
   // accepts Z, UTC, fixed offsets, or a case-sensitive IANA zone name.
@@ -640,12 +645,18 @@ message Bucket {
 // Parameters governing how a commit is performed.  Presence of this message in an
 // UpdateRequest indicates the request should commit; absence means no commit.
 message CommitParams {
-  // Commit within this many microseconds.
+  // Commit within this many milliseconds.
   // This parameter can be useful to ensure that too many commits aren't being done that can hurt
   // both indexing and search performance, but still places an upper bound on how stale the data can be.
   // The default value of 0 causes an immediate commit before the response is sent,
   // while a positive value will not wait for the commit before the response is sent.
-  uint64 commit_within_us = 1;
+  // Deferred commits coalesce: the writer commits once per deadline window, so a
+  // stream of updates all carrying commit_within_ms=T yields about one commit per T
+  // rather than one per update (the earliest outstanding deadline wins; any
+  // explicit commit satisfies all outstanding deadlines).  Applies to plain
+  // commits only: a commit that also sets max_segments, build_aux_indexes, or
+  // wait_for_merges is performed immediately.
+  uint64 commit_within_ms = 1;
 
   // Build missing aux overlays as part of this commit. An overlay already
   // present on a segment is retained rather than rebuilt.
@@ -663,7 +674,7 @@ message CommitParams {
   // the merged index is durably published: at return, everything this commit
   // made visible lives in <= max_segments segments (concurrent ingestion after
   // this commit may add new segments; they are not covered by the promise).
-  // The response waits for the merged layout even when commit_within_us is
+  // The response waits for the merged layout even when commit_within_ms is
   // positive.
   uint32 max_segments = 4;
 }

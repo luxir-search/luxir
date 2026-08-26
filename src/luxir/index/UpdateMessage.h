@@ -63,8 +63,14 @@ public:
     SILENT_COMMIT = 2,     // the commit will be "silent" (won't necessarily cause new searchers to be opened)
     // CONSISTENT_COMMIT = 3; // FUTURE - ensure distributed searchers will see new data
   };
-  CommitType commit;
-  int32_t commit_within;  // TODO: implement this
+  CommitType commit = NO_COMMIT;
+  // Deferred-commit window in milliseconds; meaningful only with commit != NO_COMMIT.
+  // Positive on a plain commit (no maxSegments/aux/waitForMerges): the writer
+  // downgrades the message to NO_COMMIT at the graph entry and guarantees an
+  // auto-commit covering it within this window, coalescing across messages so a
+  // stream of updates all carrying T produces ~one commit per T (see
+  // IndexWriter::startUpdateBody).  0 = commit immediately.
+  int64_t commit_within_ms = 0;
   int32_t maxSegments = 0;  // 0 means no client-requested merge target.
 
   // Internal synthetic commits use this to publish an already-produced segment

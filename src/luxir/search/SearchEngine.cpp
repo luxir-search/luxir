@@ -1,3 +1,5 @@
+#include <limits>
+
 #include "SearchEngine.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
@@ -107,8 +109,12 @@ void SearchEngine::getResources(SearchRequest& req) {
 
   // get the index reader
   req.schema = collection->getSchema();
-  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(
-      request.freshness_us);
+  // The API freshness tolerance is milliseconds; the reader clock domain is
+  // microseconds (commit times).  Saturate: an absurd tolerance means "any".
+  constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
+  uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
+      ? maxUs : request.freshness_ms * 1000;
+  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(freshnessUs);
   auto* filterCache = req.reader->filterCache();
   req.filterUses = std::make_shared<FilterCache::UseRegistry>(
       filterCache, *req.reader);
