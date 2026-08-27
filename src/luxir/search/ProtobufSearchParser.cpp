@@ -61,12 +61,7 @@ struct SearchParserImpl {
   using OpsMap = decltype(ReqProto::ops);
 
   void warnOnce(std::string_view code, const std::string& message) {
-    for (const api::Warning& warning : req.warnings) {
-      if (warning.code == code && warning.message == message) return;
-    }
-    char* copy = req.requestPool.alloc(message.size());
-    std::memcpy(copy, message.data(), message.size());
-    req.warnings.push_back({code, std::string_view(copy, message.size())});
+    req.warnOnce(code, message);
   }
 
   ParsedFences makeAffineFences(std::string_view facetName,

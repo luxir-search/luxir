@@ -53,6 +53,29 @@ struct DomainView {
   }
 };
 
+// Walk every document in a null (all docs), array, or bitset domain. The
+// bitset arm mirrors the established column-domain loop: never ask
+// nextSetBit() to start at maxDoc when the last document is set.
+template <class F>
+void forEachDomainDoc(DocSet* domain, int32_t maxDoc, F&& callback) {
+  if (domain == nullptr) {
+    for (int32_t doc = 0; doc < maxDoc; doc++) callback(doc);
+    return;
+  }
+  if (domain->type == DocSet::Type::ARRAY) {
+    for (int32_t doc : ((ArrDocSet*)domain)->docs()) callback(doc);
+    return;
+  }
+
+  const FixedBitSet& bits = ((BitDocSet*)domain)->bits();
+  int32_t doc = -1;
+  while (doc + 1 < maxDoc) {
+    doc = bits.nextSetBit(doc + 1);
+    if (doc >= maxDoc) break;
+    callback(doc);
+  }
+}
+
 // Count one term's postings in the domain. Counting callers materialize an
 // array domain's bitset once per (segment, facet), so the common route for
 // every domain shape is one block-wise walk of the postings: word and

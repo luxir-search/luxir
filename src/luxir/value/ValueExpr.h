@@ -33,6 +33,7 @@ enum class ValueNodeKind : uint8_t {
 struct ValueNode {
   ValueNodeKind kind = ValueNodeKind::CONSTANT;
   ValueType type = ValueType::INT64;
+  ValueNature nature = ValueNature::NUMBER;
   ValueOpcode opcode = ValueOpcode::NONE;
   const ValueFunction* function = nullptr;
   std::array<uint32_t, 2> children{};

@@ -145,6 +145,7 @@ public:
   }
 
   void fillExecutionProfile(SearchResponse& response);
+  void warnOnce(std::string_view code, std::string_view message);
 
   /// Flow-control advice returned by reply().  The response is always accepted
   /// (or dropped, for CANCEL); the status only tells a streaming producer what

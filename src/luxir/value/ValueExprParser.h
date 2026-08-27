@@ -1,9 +1,7 @@
 #pragma once
 
-#include <charconv>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -16,7 +14,9 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Cursor.h"
 #include "luxir/util/proto.h"
+#include "luxir/value/AggregateFunctionRegistry.h"
 #include "luxir/value/ValueExpr.h"
+#include "luxir/value/ValueExprGrammar.h"
 #include "luxir/value/ValueLex.h"
 
 namespace luxir {
@@ -33,38 +33,75 @@ class ValueExprParser {
 
   const ValueExprOptions& opts;
   google::protobuf::Arena& arena;
-  Cursor cur{std::string_view{}};
+  Cursor* cur = nullptr;
   ValueProgram* program = nullptr;
   int localBudget = DEFAULT_NESTING_BUDGET;
   int* budget;
 
-  struct DepthScope {
-    ValueExprParser& parser;
-
-    DepthScope(ValueExprParser& parser, size_t pos) : parser(parser) {
-      if (*parser.budget <= 0) {
-        parser.fail(pos, "expression nesting exceeds the supported depth");
-      }
-      --*parser.budget;
-    }
-    ~DepthScope() { ++*parser.budget; }
-  };
-
 public:
+  using Node = uint32_t;
+
   ValueExprParser(const ValueExprOptions& opts, google::protobuf::Arena& arena)
       : opts(opts), arena(arena), budget(opts.nestingBudget ? opts.nestingBudget : &localBudget) {}
 
   ValueProgram* parse(std::string_view expression) {
+    Cursor cursor(expression);
+    ValueProgram* result = parsePartial(cursor);
+    cursor.skipWs();
+    if (!cursor.atEnd()) fail(cursor.position(), "unexpected trailing input");
+    cur = nullptr;
+    return result;
+  }
+
+  // Parse one expression from the cursor's current absolute position and stop
+  // before a caller-owned comma or close parenthesis. The caller and this
+  // parser therefore share source positions without substring translation.
+  ValueProgram* parsePartial(Cursor& cursor) {
     if (opts.schema == nullptr) throw std::runtime_error("ValueExpr requires a schema");
-    cur = Cursor(expression);
+    cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
-    cur.skipWs();
-    if (cur.atEnd()) fail(0, "empty value expression");
-    program->rootNode = parseValue();
-    cur.skipWs();
-    if (!cur.atEnd()) fail(cur.position(), "unexpected trailing input");
+    cur->skipWs();
+    if (cur->atEnd()) fail(cur->position(), "empty value expression");
+    ValueExprGrammar grammar(*this, *cur);
+    program->rootNode = grammar.parseExpression();
     program->constantScalar = findConstantScalar();
     return program;
+  }
+
+  void enterDepth(size_t pos) {
+    if (*budget <= 0) fail(pos, "expression nesting exceeds the supported depth");
+    --*budget;
+  }
+
+  void leaveDepth() { ++*budget; }
+
+  uint32_t makeUnary(char op, size_t pos, uint32_t child) {
+    assert(op == '-');
+    return makeFunction(ValueFunctionRegistry::find("neg"), pos, {child, 0}, 1);
+  }
+
+  uint32_t makeBinary(char op, size_t pos, uint32_t left, uint32_t right) {
+    const char* name = nullptr;
+    switch (op) {
+      case '+': name = "add"; break;
+      case '-': name = "sub"; break;
+      case '*': name = "mul"; break;
+      case '/': name = "div"; break;
+      default: std::unreachable();
+    }
+    return makeFunction(ValueFunctionRegistry::find(name), pos, {left, right}, 2);
+  }
+
+  template <class Grammar>
+  uint32_t parseAtom(Grammar& grammar) {
+    unused(grammar);
+    return parseValue();
+  }
+
+  [[noreturn]] void fail(size_t pos, std::string_view message) const {
+    throw std::runtime_error(fmt::format(
+        "value expression parse error at byte {}: {} (context: \"{}\")",
+        pos, message, cur->errorContext(pos)));
   }
 
 private:
@@ -139,22 +176,15 @@ private:
     return std::nullopt;
   }
 
-  [[noreturn]] void fail(size_t pos, std::string_view message) const {
-    size_t from = pos > 20 ? pos - 20 : 0;
-    throw std::runtime_error(fmt::format(
-        "value expression parse error at byte {}: {} (context: \"{}<HERE>{}\")",
-        pos, message, cur.slice(from, pos), cur.slice(pos, pos + 20)));
-  }
-
   uint32_t append(ValueNode node) {
     program->addNode(node);
     return (uint32_t)program->nodes.size() - 1;
   }
 
   uint32_t parseValue() {
-    cur.skipWs();
-    size_t pos = cur.position();
-    char c = cur.peek();
+    cur->skipWs();
+    size_t pos = cur->position();
+    char c = cur->peek();
     if (c == '$') return parseVariable();
     if (c == '"' || c == '\'') {
       fail(pos, "a quoted string is only valid as the argument of col(\"name\")");
@@ -162,9 +192,9 @@ private:
     if (c == '+' || c == '-' || c == '.' || value::lex::digit(c)) {
       return parseNumber();
     }
-    std::string_view name = value::lex::scanIdentifier(cur);
+    std::string_view name = value::lex::scanIdentifier(*cur);
     if (name.empty()) fail(pos, "expected a number, numeric column, variable, score, or function");
-    if (cur.peek() == '(') return parseCall(name, pos);
+    if (cur->peek() == '(') return parseCall(name, pos);
     if (name == "score" || (opts.sortIntrinsics && name == "_score_")) {
       ValueNode node;
       node.kind = ValueNodeKind::SCORE;
@@ -186,39 +216,27 @@ private:
   }
 
   uint32_t parseNumber() {
-    size_t pos = cur.position();
-    std::string_view text = value::lex::scanNumber(cur);
-    if (text.empty()) fail(pos, "invalid numeric literal");
-    char next = cur.peek();
-    if (!cur.atEnd() && cur.wsLen() == 0 && next != ',' && next != ')') {
-      fail(pos, fmt::format("invalid numeric literal '{}'", cur.slice(pos, cur.position() + 1)));
-    }
+    size_t pos = cur->position();
+    value::lex::NumericLiteral literal = value::lex::parseNumericLiteral(
+        *cur, [&](size_t at, std::string_view message) { fail(at, message); });
 
     ValueNode node;
     node.kind = ValueNodeKind::CONSTANT;
     node.sourcePos = pos;
-    node.text = program->copyString(text);
-    bool floating = text.find_first_of(".eE") != std::string_view::npos;
-    if (!floating) {
-      auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), node.intValue);
-      if (ec != std::errc() || ptr != text.data() + text.size()) {
-        fail(pos, fmt::format("int64 literal '{}' is out of range", text));
-      }
-      node.type = ValueType::INT64;
-    } else {
-      auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), node.doubleValue);
-      if (ec != std::errc() || ptr != text.data() + text.size() ||
-          !std::isfinite(node.doubleValue)) {
-        fail(pos, fmt::format("double literal '{}' must be finite", text));
-      }
+    node.text = program->copyString(literal.text);
+    if (literal.floating) {
       node.type = ValueType::DOUBLE;
+      node.doubleValue = literal.doubleValue;
+    } else {
+      node.type = ValueType::INT64;
+      node.intValue = literal.intValue;
     }
     return append(node);
   }
 
   uint32_t parseVariable() {
-    size_t pos = cur.position();
-    std::string_view name = value::lex::scanVariable(cur);
+    size_t pos = cur->position();
+    std::string_view name = value::lex::scanVariable(*cur);
     if (name.empty()) fail(pos, "'$' must be followed by a variable name");
     const auto* view = opts.vars.find(name);
     if (view == nullptr) {
@@ -305,6 +323,8 @@ private:
       node.type = field->multiValued()
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
+      node.nature = field->type() == FieldType::DATE
+          ? ValueNature::DATE : ValueNature::NUMBER;
     }
     node.sourcePos = pos;
     node.text = program->copyString(name);
@@ -312,29 +332,38 @@ private:
   }
 
   uint32_t parseCall(std::string_view name, size_t pos) {
-    DepthScope depth(*this, pos);
-    cur.advance();
+    ValueExprDepthGuard guard(*this, pos);
+    cur->advance();
     if (name == "col") return parseExplicitColumn(pos);
-    const ValueFunction* function = ValueFunctionRegistry::find(name);
-    if (function == nullptr) fail(pos, fmt::format("unknown value function '{}()'", name));
+    ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
+    const ValueFunction* function = lookup.value;
+    if (function == nullptr) {
+      if (lookup.aggregate != nullptr) {
+        fail(pos, fmt::format(
+            "{}() is a bucket aggregate and is not valid in a per-document value expression",
+            name));
+      }
+      fail(pos, fmt::format("unknown value function '{}()'", name));
+    }
 
     std::array<uint32_t, 2> args{};
     uint8_t count = 0;
-    cur.skipWs();
-    if (!cur.consume(')')) {
+    cur->skipWs();
+    if (!cur->consume(')')) {
+      ValueExprGrammar grammar(*this, *cur);
       for (;;) {
         if (count == args.size()) {
-          fail(cur.position(), fmt::format("{}() accepts at most {} arguments", name,
+          fail(cur->position(), fmt::format("{}() accepts at most {} arguments", name,
                                            function->maxArity));
         }
-        args[count++] = parseValue();
-        auto separator = value::lex::consumeListSeparator(cur);
+        args[count++] = grammar.parseExpression();
+        auto separator = value::lex::consumeListSeparator(*cur);
         if (separator == value::lex::ListSeparator::CLOSE) break;
         if (separator != value::lex::ListSeparator::COMMA) {
-          fail(cur.position(), fmt::format("expected ',' or ')' in {}(...)", name));
+          fail(cur->position(), fmt::format("expected ',' or ')' in {}(...)", name));
         }
-        cur.skipWs();
-        if (cur.peek() == ')') fail(cur.position(), "trailing comma is not allowed");
+        cur->skipWs();
+        if (cur->peek() == ')') fail(cur->position(), "trailing comma is not allowed");
       }
     }
     if (count < function->minArity || count > function->maxArity) {
@@ -345,8 +374,29 @@ private:
       fail(pos, fmt::format("{}() expects {} to {} arguments", name,
                             function->minArity, function->maxArity));
     }
-    std::array<ValueType, 2> types{};
-    for (uint8_t i = 0; i < count; i++) types[i] = program->nodes[args[i]].type;
+    return makeFunction(function, pos, args, count);
+  }
+
+  uint32_t parseExplicitColumn(size_t pos) {
+    cur->skipWs();
+    if (cur->peek() != '"' && cur->peek() != '\'') {
+      fail(cur->position(), "col() expects one quoted field name, for example col(\"price_i\")");
+    }
+    std::string_view name = value::lex::scanQuoted(*cur, program->resource,
+        [&](size_t at, std::string_view message) { fail(at, message); });
+    cur->skipWs();
+    if (!cur->consume(')')) fail(cur->position(), "col() expects exactly one quoted field name");
+    return parseColumn(name, pos);
+  }
+
+  uint32_t makeFunction(const ValueFunction* function, size_t pos,
+                        std::array<uint32_t, 2> args, uint8_t count) {
+    assert(function != nullptr);
+    std::array<ResolvedValue, 2> resolvedArgs{};
+    for (uint8_t i = 0; i < count; i++) {
+      const ValueNode& arg = program->nodes[args[i]];
+      resolvedArgs[i] = {arg.type, arg.nature};
+    }
 
     ValueNode node;
     node.kind = ValueNodeKind::FUNCTION;
@@ -357,23 +407,14 @@ private:
     node.sourcePos = pos;
     node.text = function->name;
     try {
-      node.type = function->resolveType(std::span<const ValueType>(types.data(), count));
+      ResolvedValue resolved = function->resolve(
+          std::span<const ResolvedValue>(resolvedArgs.data(), count));
+      node.type = resolved.type;
+      node.nature = resolved.nature;
     } catch (const std::exception& error) {
-      fail(pos, fmt::format("{}(): {}", name, error.what()));
+      fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
     return append(node);
-  }
-
-  uint32_t parseExplicitColumn(size_t pos) {
-    cur.skipWs();
-    if (cur.peek() != '"' && cur.peek() != '\'') {
-      fail(cur.position(), "col() expects one quoted field name, for example col(\"price_i\")");
-    }
-    std::string_view name = value::lex::scanQuoted(cur, program->resource,
-        [&](size_t at, std::string_view message) { fail(at, message); });
-    cur.skipWs();
-    if (!cur.consume(')')) fail(cur.position(), "col() expects exactly one quoted field name");
-    return parseColumn(name, pos);
   }
 };
 

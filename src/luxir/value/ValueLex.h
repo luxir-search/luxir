@@ -1,9 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <cstdint>
 #include <memory_resource>
 #include <string_view>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "luxir/util/Cursor.h"
 
@@ -73,6 +78,53 @@ inline std::string_view scanNumber(Cursor& cur) {
     }
   }
   return cur.slice(start, cur.position());
+}
+
+struct NumericLiteral {
+  std::string_view text;
+  bool floating = false;
+  int64_t intValue = 0;
+  double doubleValue = 0.0;
+};
+
+template <class Fail>
+NumericLiteral parseNumericLiteral(Cursor& cur, Fail&& fail) {
+  size_t pos = cur.position();
+  NumericLiteral literal;
+  literal.text = scanNumber(cur);
+  if (literal.text.empty()) {
+    fail(pos, "invalid numeric literal");
+    return literal;
+  }
+  char next = cur.peek();
+  if (!cur.atEnd() && cur.wsLen() == 0 && next != ',' && next != ')'
+      && next != '+' && next != '-' && next != '*' && next != '/') {
+    fail(pos, fmt::format("invalid numeric literal '{}'",
+                          cur.slice(pos, cur.position() + 1)));
+    return literal;
+  }
+
+  literal.floating =
+      literal.text.find_first_of(".eE") != std::string_view::npos;
+  std::string_view parsed = literal.text;
+  if (parsed.starts_with('+')) parsed.remove_prefix(1);
+  if (!literal.floating) {
+    auto [ptr, ec] = std::from_chars(parsed.data(),
+                                     parsed.data() + parsed.size(),
+                                     literal.intValue);
+    if (ec != std::errc() || ptr != parsed.data() + parsed.size()) {
+      fail(pos, fmt::format("int64 literal '{}' is out of range", literal.text));
+    }
+    return literal;
+  }
+
+  auto [ptr, ec] = std::from_chars(parsed.data(), parsed.data() + parsed.size(),
+                                   literal.doubleValue);
+  if (ec != std::errc() || ptr != parsed.data() + parsed.size()
+      || !std::isfinite(literal.doubleValue)) {
+    fail(pos, fmt::format("double literal '{}' must be finite", literal.text));
+  }
+  return literal;
 }
 
 // Single and double quotes have identical semantics. Only quote, apostrophe,

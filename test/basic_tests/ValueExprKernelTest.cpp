@@ -49,7 +49,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   ArenaOwner memory;
   MemPool pool;
 
-  ValueProgram* program = parseValue(memory, *schema, "add(def(x_i,7),2)");
+  ValueProgram* program = parseValue(memory, *schema, "def(x_i,7) + 2 * 1");
   auto bound = program->bind(pool, segment);
   std::array<int64_t, 3> expected{BIG + 2, 9, -3};
   for (int32_t doc = 0; doc < 3; doc++) {
@@ -84,6 +84,14 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
     EXPECT_FALSE(reducerBound->evalPoint(2, 0.0f).valid) << expression;
   }
 
+  ValueProgram* dividedArray =
+      parseValue(memory, *schema, "avg(values_is / den_i)");
+  auto dividedArrayBound = dividedArray->bind(pool, segment);
+  EXPECT_DOUBLE_EQ(-1.0,
+                   dividedArrayBound->evalPoint(0, 0.0f).doubleValue);
+  EXPECT_FALSE(dividedArrayBound->evalPoint(1, 0.0f).valid);
+  EXPECT_FALSE(dividedArrayBound->evalPoint(2, 0.0f).valid);
+
   ValueProgram* floating = parseValue(memory, *schema, "add(f_f,2.0)");
   auto floatingBound = floating->bind(pool, segment);
   const ValueBounds& floatBounds = floatingBound->bounds(floating->rootNode);
@@ -98,6 +106,22 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   EXPECT_EQ(3000, dateBounds.intMax);
   EXPECT_TRUE(dateBounds.mayBeMissing);
 
+  ValueProgram* dateArithmetic =
+      parseValue(memory, *schema, "(when_dt + 1000) - when_dt");
+  EXPECT_EQ(ValueNature::NUMBER, dateArithmetic->root().nature);
+  auto dateArithmeticBound = dateArithmetic->bind(pool, segment);
+  EXPECT_EQ(1000, dateArithmeticBound->evalPoint(0, 0.0f).intValue);
+  EXPECT_EQ(1000, dateArithmeticBound->evalPoint(1, 0.0f).intValue);
+  EXPECT_FALSE(dateArithmeticBound->evalPoint(2, 0.0f).valid);
+
+  ValueProgram* dayBucket =
+      parseValue(memory, *schema, "floor(when_dt / 86400000)");
+  EXPECT_EQ(ValueNature::NUMBER, dayBucket->root().nature);
+  auto dayBucketBound = dayBucket->bind(pool, segment);
+  EXPECT_DOUBLE_EQ(0.0, dayBucketBound->evalPoint(0, 0.0f).doubleValue);
+  EXPECT_DOUBLE_EQ(0.0, dayBucketBound->evalPoint(1, 0.0f).doubleValue);
+  EXPECT_FALSE(dayBucketBound->evalPoint(2, 0.0f).valid);
+
   ValueProgram* absent = parseValue(memory, *schema, "absent_i");
   auto absentBound = absent->bind(pool, segment);
   const ValueBounds& absentBounds = absentBound->bounds(absent->rootNode);
@@ -108,11 +132,11 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
 
 TEST_F(ValueExprKernelTest, negativeValuesAndRuntimeFiniteGuard) {
   CollectionHelper helper;
-  helper.index(flatdoc("id_s", "neg", "x_i", -9, "den_i", -1),
+  helper.index(flatdoc("id_s", "neg", "x_i", -9, "den_i", -2),
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "zero", "x_i", 0, "den_i", 0),
                UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("id_s", "pos", "x_i", 4, "den_i", 1),
+  helper.index(flatdoc("id_s", "pos", "x_i", 4, "den_i", 2),
                UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto& segment = reader->segments()[0];
@@ -125,13 +149,39 @@ TEST_F(ValueExprKernelTest, negativeValuesAndRuntimeFiniteGuard) {
   EXPECT_EQ(9, absBound->evalPoint(0, 0.0f).intValue);
   EXPECT_EQ(0, absBound->evalPoint(1, 0.0f).intValue);
 
-  ValueProgram* division = parseValue(memory, *schema, "div(1,den_i)");
-  auto divisionBound = division->bind(pool, segment);
-  EXPECT_EQ(BoundsCertainty::UNBOUNDED,
-            divisionBound->bounds(division->rootNode).certainty);
-  EXPECT_EQ(-1, divisionBound->evalPoint(0, 0.0f).intValue);
-  EXPECT_THROW(divisionBound->evalPoint(1, 0.0f), std::runtime_error);
-  EXPECT_EQ(1, divisionBound->evalPoint(2, 0.0f).intValue);
+  for (std::string_view expression : {"div(1,den_i)", "1 / den_i"}) {
+    ValueProgram* division = parseValue(memory, *schema, expression);
+    EXPECT_EQ(ValueType::DOUBLE, division->root().type);
+    auto divisionBound = division->bind(pool, segment);
+    const ValueBounds& bounds = divisionBound->bounds(division->rootNode);
+    EXPECT_EQ(BoundsCertainty::UNBOUNDED, bounds.certainty);
+    EXPECT_TRUE(bounds.mayBeMissing);
+    EXPECT_DOUBLE_EQ(-0.5,
+                     divisionBound->evalPoint(0, 0.0f).doubleValue);
+    EXPECT_FALSE(divisionBound->evalPoint(1, 0.0f).valid);
+    EXPECT_DOUBLE_EQ(0.5,
+                     divisionBound->evalPoint(2, 0.0f).doubleValue);
+
+    std::array<int32_t, 3> docs{0, 1, 2};
+    std::array<ValueResult, 3> batch;
+    divisionBound->evalBatch(docs, {}, batch);
+    EXPECT_TRUE(batch[0].valid);
+    EXPECT_FALSE(batch[1].valid);
+    EXPECT_TRUE(batch[2].valid);
+  }
+
+  ValueProgram* withDefault = parseValue(memory, *schema, "def(1 / den_i, 7)");
+  auto defaultBound = withDefault->bind(pool, segment);
+  ValueResult defaulted = defaultBound->evalPoint(1, 0.0f);
+  ASSERT_TRUE(defaulted.valid);
+  EXPECT_DOUBLE_EQ(7.0, defaulted.doubleValue);
+
+  ValueProgram* constantZero = parseValue(memory, *schema, "1 / 0");
+  auto constantZeroBound = constantZero->bind(pool, segment);
+  const ValueBounds& zeroBounds =
+      constantZeroBound->bounds(constantZero->rootNode);
+  EXPECT_TRUE(zeroBounds.alwaysMissing);
+  EXPECT_FALSE(constantZeroBound->evalPoint(0, 0.0f).valid);
 }
 
 TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
@@ -148,7 +198,7 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
   try {
     logarithm->bind(pool, segment);
     FAIL() << "expected log bounds failure";
-  } catch (const std::runtime_error& error) {
+  } catch (const ValueEvaluationError& error) {
     std::string message = error.what();
     EXPECT_NE(message.find("x_i"), std::string::npos) << message;
     EXPECT_NE(message.find("max("), std::string::npos) << message;

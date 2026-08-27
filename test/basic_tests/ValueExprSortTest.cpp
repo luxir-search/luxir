@@ -60,6 +60,49 @@ TEST_F(ValueExprSortTest, directionsMissingLastDefAndVariable) {
             run("add(def(price_i,$fallback),1)", qb::ASC, 0));
 }
 
+TEST_F(ValueExprSortTest, divisionIsDoubleAndZeroDenominatorSortsMissingLast) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "half", "den_i", 2),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "zero", "den_i", 0),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "quarter", "den_i", 4),
+               UpdateMessage::COMMIT);
+
+  auto run = [&](std::string_view expression) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
+    qb::sort(top, expression, qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return ids(*req);
+  };
+
+  EXPECT_EQ((std::vector<std::string>{"quarter", "half", "zero"}),
+            run("1 / den_i"));
+  EXPECT_EQ((std::vector<std::string>{"zero", "quarter", "half"}),
+            run("def(div(1,den_i),-1)"));
+}
+
+TEST_F(ValueExprSortTest, dateScalingDemotesAndFloorSortsEpochDays) {
+  constexpr int64_t DAY = 86400000;
+  CollectionHelper helper;
+  helper.index(flatdoc("id_s", "day2", "when_dt", 2 * DAY + 1000),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "day1", "when_dt", DAY + 2000),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q").allQuery().limit(10).fields({"id_s"});
+  qb::sort(top, "floor(when_dt / 86400000)", qb::ASC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ((std::vector<std::string>{"day1", "day2"}), ids(*req));
+}
+
 TEST_F(ValueExprSortTest, bareMultiValuedIntSortsByFirstValue) {
   // Multi-valued numeric columns store per-doc values unsorted, so the bare
   // field sort key is the FIRST stored value; min/max are explicit reducers.

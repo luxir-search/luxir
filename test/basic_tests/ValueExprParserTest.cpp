@@ -62,6 +62,105 @@ TEST(ValueExprParserTest, grammarTypesAndReservedLeaves) {
   EXPECT_EQ(ValueNodeKind::DOCID, parser.parse("_docid_")->root().kind);
 }
 
+TEST(ValueExprParserTest, infixPrecedenceParenthesesAndUnary) {
+  auto schema = Schema::createDefaultSchema();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+
+  ValueProgram* precedence = parser.parse("price_i + 2 * 3");
+  EXPECT_EQ(ValueOpcode::ADD, precedence->root().opcode);
+  EXPECT_EQ(ValueOpcode::MUL,
+            precedence->nodes[precedence->root().children[1]].opcode);
+
+  ValueProgram* parentheses = parser.parse("(price_i + 2) * 3");
+  EXPECT_EQ(ValueOpcode::MUL, parentheses->root().opcode);
+  EXPECT_EQ(ValueOpcode::ADD,
+            parentheses->nodes[parentheses->root().children[0]].opcode);
+
+  ValueProgram* unary = parser.parse("-price_i + +2");
+  EXPECT_EQ(ValueOpcode::ADD, unary->root().opcode);
+  EXPECT_EQ(ValueOpcode::NEG, unary->nodes[unary->root().children[0]].opcode);
+
+  ValueProgram* functionArg = parser.parse("add(price_i * 2, 1)");
+  EXPECT_EQ(ValueOpcode::ADD, functionArg->root().opcode);
+  EXPECT_EQ(ValueOpcode::MUL,
+            functionArg->nodes[functionArg->root().children[0]].opcode);
+
+  ValueProgram* constant = parser.parse("1 + 2 * 3");
+  ASSERT_TRUE(constant->constantScalar.has_value());
+  EXPECT_EQ(7, constant->constantScalar->intValue);
+
+  ValueProgram* division = parser.parse("5 / 2");
+  EXPECT_EQ(ValueType::DOUBLE, division->root().type);
+  ASSERT_TRUE(division->constantScalar.has_value());
+  EXPECT_DOUBLE_EQ(2.5, division->constantScalar->doubleValue);
+  EXPECT_EQ(ValueType::DOUBLE, parser.parse("div(5,2)")->root().type);
+}
+
+TEST(ValueExprParserTest, infixErrorsReportOperatorOffsets) {
+  auto schema = Schema::createDefaultSchema();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+
+  expectParseError(parser, "price_i + * 2", "byte 10");
+  expectParseError(parser, "(price_i + 1", "byte 12");
+}
+
+TEST(ValueExprParserTest, flatInfixChainsConsumeAndRestoreNestingBudget) {
+  auto schema = Schema::createDefaultSchema();
+  TestArena memory;
+  auto chain = [](int terms) {
+    std::string expression = "1";
+    for (int i = 1; i < terms; i++) expression += "+1";
+    return expression;
+  };
+
+  int budget = 8;
+  ValueExprOptions options{schema.get(), {}, &budget};
+  ValueExprParser parser(options, *memory.arena);
+  expectParseError(parser, chain(10), "nesting exceeds");
+  EXPECT_EQ(8, budget);
+  EXPECT_NO_THROW(parser.parse(chain(8)));
+  EXPECT_EQ(8, budget);
+
+  int siblingBudget = 4;
+  ValueExprOptions siblingOptions{schema.get(), {}, &siblingBudget};
+  ValueExprParser siblingParser(siblingOptions, *memory.arena);
+  EXPECT_NO_THROW(siblingParser.parse("add(1+2+3+4,5+6+7+8)"));
+  EXPECT_EQ(4, siblingBudget);
+}
+
+TEST(ValueExprParserTest, logicalDateRules) {
+  auto schema = Schema::createDefaultSchema();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+
+  EXPECT_EQ(ValueNature::DATE, parser.parse("when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::DATE,
+            parser.parse("when_dt + 1000")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("when_dt - when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::DATE,
+            parser.parse("avg(stamps_dts)")->root().nature);
+  EXPECT_EQ(ValueNature::DATE,
+            parser.parse("def(when_dt,0)")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("2 * when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("when_dt / 86400000")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("-when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("floor(when_dt / 86400000)")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("div(avg(stamps_dts), 1000)")->root().nature);
+
+  expectParseError(parser, "when_dt + when_dt", "cannot add two DATE");
+}
+
 TEST(ValueExprParserTest, variablesAndArrayReducers) {
   auto schema = Schema::createDefaultSchema();
   TestArena memory;
@@ -81,6 +180,7 @@ TEST(ValueExprParserTest, variablesAndArrayReducers) {
   EXPECT_EQ(ValueType::INT64, parser.parse("min($values)")->root().type);
   EXPECT_EQ(ValueType::DOUBLE, parser.parse("avg($values)")->root().type);
   EXPECT_EQ(ValueType::INT64_ARRAY, parser.parse("def($values,$values)")->root().type);
+  EXPECT_EQ(ValueType::DOUBLE_ARRAY, parser.parse("$values / 2")->root().type);
 }
 
 TEST(ValueExprParserTest, reportsArityTypeVariableAndLiteralErrors) {
@@ -141,7 +241,9 @@ TEST(ValueExprParserTest, registryEntriesAreComplete) {
   auto entries = ValueFunctionRegistry::entries();
   ASSERT_FALSE(entries.empty());
   for (const ValueFunction& function : entries) {
-    EXPECT_NE(nullptr, function.resolveType) << function.name;
+    EXPECT_NE(nullptr, function.resolve) << function.name;
+    EXPECT_TRUE(function.supports(FunctionCapability::DOCUMENT_VALUE))
+        << function.name;
     EXPECT_NE(nullptr, function.evalPoint) << function.name;
     EXPECT_NE(nullptr, function.evalBatch) << function.name;
     EXPECT_NE(nullptr, function.boundsPropagate) << function.name;

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace luxir {
@@ -51,6 +52,16 @@ public:
     if (to > input.size()) to = input.size();
     if (from > to) from = to;
     return input.substr(from, to - from);
+  }
+
+  std::string errorContext(size_t at, size_t radius = 20) const {
+    size_t from = at > radius ? at - radius : 0;
+    std::string context;
+    context.reserve(slice(from, at).size() + 6 + slice(at, at + radius).size());
+    context.append(slice(from, at));
+    context.append("<HERE>");
+    context.append(slice(at, at + radius));
+    return context;
   }
 
   bool startsWith(std::string_view s) const {

@@ -3,7 +3,10 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <utility>
 
 namespace luxir {
 
@@ -13,6 +16,33 @@ enum class ValueType : uint8_t {
   INT64_ARRAY,
   DOUBLE_ARRAY,
   COLUMN_ONLY,
+};
+
+// Logical meaning carried independently of the physical numeric lane. DATE
+// values use the INT64/DOUBLE lanes but retain enough type information for
+// expression and aggregate validation.
+enum class ValueNature : uint8_t {
+  NUMBER,
+  DATE,
+};
+
+inline std::string_view valueNatureName(ValueNature nature) {
+  switch (nature) {
+    case ValueNature::NUMBER: return "number";
+    case ValueNature::DATE: return "DATE";
+  }
+  return "unknown";
+}
+
+struct ResolvedValue {
+  ValueType type = ValueType::INT64;
+  ValueNature nature = ValueNature::NUMBER;
+};
+
+class ValueEvaluationError : public std::runtime_error {
+public:
+  explicit ValueEvaluationError(std::string message)
+      : std::runtime_error(std::move(message)) {}
 };
 
 inline bool valueArray(ValueType type) {
@@ -103,7 +133,6 @@ enum class BoundsInvalidity : uint8_t {
   POSITIVE_INFINITY,
   NEGATIVE_INFINITY,
   INTEGER_OVERFLOW,
-  DIVIDE_BY_ZERO,
 };
 
 struct ValueBounds {

@@ -152,9 +152,9 @@ private:
   // ---- errors ----
 
   [[noreturn]] void fail(size_t pos, std::string_view msg) {
-    size_t from = pos > 20 ? pos - 20 : 0;
-    throw std::runtime_error(fmt::format("expr parse error at byte {}: {} (context: \"{}<HERE>{}\")",
-                                         pos, msg, cur.slice(from, pos), cur.slice(pos, pos + 20)));
+    throw std::runtime_error(fmt::format(
+        "expr parse error at byte {}: {} (context: \"{}\")",
+        pos, msg, cur.errorContext(pos)));
   }
 
   // ---- arena emission ----

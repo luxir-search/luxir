@@ -15,65 +15,109 @@
 namespace luxir {
 namespace {
 
-void requireNumeric(std::span<const ValueType> args) {
-  for (ValueType type : args) {
-    if (type == ValueType::COLUMN_ONLY) {
+void requireNumeric(std::span<const ResolvedValue> args) {
+  for (const ResolvedValue& arg : args) {
+    if (arg.type == ValueType::COLUMN_ONLY) {
       throw std::runtime_error(
           "a non-numeric column is only valid as the complete sort expression");
     }
   }
 }
 
-ValueType unarySame(std::span<const ValueType> args) {
+ResolvedValue unaryDemote(std::span<const ResolvedValue> args) {
   requireNumeric(args);
-  return args[0];
+  return {args[0].type, ValueNature::NUMBER};
 }
 
-ValueType unaryDouble(std::span<const ValueType> args) {
+ResolvedValue unaryDouble(std::span<const ResolvedValue> args) {
   requireNumeric(args);
-  return valueArray(args[0]) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
+  return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
+          ValueNature::NUMBER};
 }
 
-ValueType binaryNumeric(std::span<const ValueType> args) {
+ValueType binaryNumericType(std::span<const ResolvedValue> args) {
   requireNumeric(args);
-  if (valueArray(args[0]) && valueArray(args[1])) {
+  if (valueArray(args[0].type) && valueArray(args[1].type)) {
     throw std::runtime_error(
         "array-to-array arithmetic is not implicit; reduce one side with min(), max(), or avg()");
   }
-  bool array = valueArray(args[0]) || valueArray(args[1]);
-  bool floating = valueDouble(args[0]) || valueDouble(args[1]);
+  bool array = valueArray(args[0].type) || valueArray(args[1].type);
+  bool floating = valueDouble(args[0].type) || valueDouble(args[1].type);
   if (array) return floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY;
   return floating ? ValueType::DOUBLE : ValueType::INT64;
 }
 
-ValueType defType(std::span<const ValueType> args) {
+ResolvedValue addResolve(std::span<const ResolvedValue> args) {
+  ValueType type = binaryNumericType(args);
+  int dates = (int)std::ranges::count(args, ValueNature::DATE,
+                                      &ResolvedValue::nature);
+  if (dates == 2) throw std::runtime_error("cannot add two DATE values");
+  return {type, dates == 1 ? ValueNature::DATE : ValueNature::NUMBER};
+}
+
+ResolvedValue subResolve(std::span<const ResolvedValue> args) {
+  ValueType type = binaryNumericType(args);
+  if (args[0].nature == ValueNature::NUMBER
+      && args[1].nature == ValueNature::DATE) {
+    throw std::runtime_error("cannot subtract a DATE from a number");
+  }
+  if (args[0].nature == ValueNature::DATE
+      && args[1].nature == ValueNature::NUMBER) {
+    return {type, ValueNature::DATE};
+  }
+  return {type, ValueNature::NUMBER};
+}
+
+ResolvedValue mulResolve(std::span<const ResolvedValue> args) {
+  return {binaryNumericType(args), ValueNature::NUMBER};
+}
+
+ResolvedValue divResolve(std::span<const ResolvedValue> args) {
+  ValueType type = binaryNumericType(args);
+  return {valueArray(type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
+          ValueNature::NUMBER};
+}
+
+ResolvedValue defResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
-  if (valueArray(args[0]) != valueArray(args[1])) {
+  if (valueArray(args[0].type) != valueArray(args[1].type)) {
     throw std::runtime_error("both arguments must be scalars or both must be arrays");
   }
-  bool floating = valueDouble(args[0]) || valueDouble(args[1]);
-  if (valueArray(args[0])) return floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY;
-  return floating ? ValueType::DOUBLE : ValueType::INT64;
+  bool floating = valueDouble(args[0].type) || valueDouble(args[1].type);
+  ValueType type = valueArray(args[0].type)
+      ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
+      : (floating ? ValueType::DOUBLE : ValueType::INT64);
+  ValueNature nature = std::ranges::find(args, ValueNature::DATE,
+                                         &ResolvedValue::nature) != args.end()
+      ? ValueNature::DATE : ValueNature::NUMBER;
+  return {type, nature};
 }
 
-ValueType minMaxType(std::span<const ValueType> args) {
+ResolvedValue minMaxResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   if (args.size() == 1) {
-    if (!valueArray(args[0])) throw std::runtime_error("the one-argument form requires an array");
-    return valueScalarType(args[0]);
+    if (!valueArray(args[0].type)) {
+      throw std::runtime_error("the one-argument form requires an array");
+    }
+    return {valueScalarType(args[0].type), args[0].nature};
   }
-  return binaryNumeric(args);
+  ValueNature nature = std::ranges::find(args, ValueNature::DATE,
+                                         &ResolvedValue::nature) != args.end()
+      ? ValueNature::DATE : ValueNature::NUMBER;
+  return {binaryNumericType(args), nature};
 }
 
-ValueType avgType(std::span<const ValueType> args) {
+ResolvedValue avgResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
-  if (!valueArray(args[0])) throw std::runtime_error("avg() requires a numeric array");
-  return ValueType::DOUBLE;
+  if (!valueArray(args[0].type)) {
+    throw std::runtime_error("avg() requires a numeric array");
+  }
+  return {ValueType::DOUBLE, args[0].nature};
 }
 
 [[noreturn]] void runtimeInvalid(const ValueNode& node, int32_t docid,
                                  std::string_view reason) {
-  throw std::runtime_error(fmt::format(
+  throw ValueEvaluationError(fmt::format(
       "value function {}() {} at segment doc {}", node.text, reason, docid));
 }
 
@@ -90,6 +134,12 @@ ValueResult promote(ValueResult value, ValueType type) {
   return value;
 }
 
+bool zeroScalar(const ValueResult& value) {
+  assert(value.valid && !valueArray(value.type));
+  return value.type == ValueType::DOUBLE
+      ? value.doubleValue == 0.0 : value.intValue == 0;
+}
+
 ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResult right,
                              int32_t docid) {
   if (!left.valid || !right.valid) return ValueResult::missing(node.type);
@@ -97,6 +147,9 @@ ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResul
   if (floating) {
     double a = left.type == ValueType::DOUBLE ? left.doubleValue : (double)left.intValue;
     double b = right.type == ValueType::DOUBLE ? right.doubleValue : (double)right.intValue;
+    if (node.opcode == ValueOpcode::DIV && b == 0.0) {
+      return ValueResult::missing(node.type);
+    }
     double out;
     switch (node.opcode) {
       case ValueOpcode::ADD: out = a + b; break;
@@ -123,13 +176,6 @@ ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResul
     case ValueOpcode::MUL:
       overflow = __builtin_mul_overflow(left.intValue, right.intValue, &out);
       break;
-    case ValueOpcode::DIV:
-      if (right.intValue == 0) runtimeInvalid(node, docid, "divided by zero");
-      if (left.intValue == std::numeric_limits<int64_t>::min() && right.intValue == -1) {
-        runtimeInvalid(node, docid, "overflowed int64");
-      }
-      out = left.intValue / right.intValue;
-      break;
     case ValueOpcode::MIN: out = std::min(left.intValue, right.intValue); break;
     case ValueOpcode::MAX: out = std::max(left.intValue, right.intValue); break;
     default: throw std::runtime_error("invalid binary ValueExpr opcode");
@@ -141,7 +187,7 @@ ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResul
 bool unaryOpcode(ValueOpcode opcode) {
   return opcode == ValueOpcode::NEG || opcode == ValueOpcode::ABS
       || opcode == ValueOpcode::SQRT || opcode == ValueOpcode::LOG
-      || opcode == ValueOpcode::LOG1P;
+      || opcode == ValueOpcode::LOG1P || opcode == ValueOpcode::FLOOR;
 }
 
 bool reducerOpcode(ValueOpcode opcode) {
@@ -218,6 +264,7 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
       case ValueOpcode::SQRT: out = std::sqrt(input); break;
       case ValueOpcode::LOG: out = std::log(input); break;
       case ValueOpcode::LOG1P: out = std::log1p(input); break;
+      case ValueOpcode::FLOOR: out = std::floor(input); break;
       default: std::unreachable();
     }
     if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
@@ -227,6 +274,18 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
   ValueResult second = program.evalNode(node.children[1], docid, score);
   if (valueArray(node.type)) {
     if (!first.valid || !second.valid) return ValueResult::missing(node.type);
+    if (node.opcode == ValueOpcode::DIV) {
+      if (!valueArray(second.type)) {
+        if (zeroScalar(second)) return ValueResult::missing(node.type);
+      } else {
+        for (int64_t i = 0; i < second.array.size; i++) {
+          ValueResult denominator = program.evalArrayElement(second.array, i);
+          if (!denominator.valid || zeroScalar(denominator)) {
+            return ValueResult::missing(node.type);
+          }
+        }
+      }
+    }
     int64_t size = valueArray(first.type) ? first.array.size : second.array.size;
     return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
                                    docid, score, size);
@@ -273,6 +332,7 @@ ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& nod
       case ValueOpcode::SQRT: out = std::sqrt(input); break;
       case ValueOpcode::LOG: out = std::log(input); break;
       case ValueOpcode::LOG1P: out = std::log1p(input); break;
+      case ValueOpcode::FLOOR: out = std::floor(input); break;
       default: std::unreachable();
     }
     if (!std::isfinite(out)) runtimeInvalid(node, array.docid, "produced NaN or infinity");
@@ -389,6 +449,10 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
       outLow = std::log1p(low);
       outHigh = std::log1p(high);
       break;
+    case ValueOpcode::FLOOR:
+      outLow = std::floor(low);
+      outHigh = std::floor(high);
+      break;
     default:
       throw std::runtime_error("invalid unary ValueExpr opcode");
   }
@@ -450,21 +514,6 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
         high = *std::max_element(products.begin(), products.end());
         break;
       }
-      case ValueOpcode::DIV: {
-        if (bmin <= 0 && bmax >= 0) {
-          if (bmin == 0 && bmax == 0 && right.minAttained) {
-            return ValueBounds::invalid(
-                node.type, BoundsInvalidity::DIVIDE_BY_ZERO, mayMissing);
-          }
-          return ValueBounds::unbounded(node.type, mayMissing);
-        }
-        std::array<__int128, 4> quotients{
-            (__int128)amin / bmin, (__int128)amin / bmax,
-            (__int128)amax / bmin, (__int128)amax / bmax};
-        low = *std::min_element(quotients.begin(), quotients.end());
-        high = *std::max_element(quotients.begin(), quotients.end());
-        break;
-      }
       case ValueOpcode::MIN:
         low = std::min(amin, bmin);
         high = std::min(amax, bmax);
@@ -515,11 +564,11 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     }
     case ValueOpcode::DIV: {
       if (bmin <= 0.0 && bmax >= 0.0) {
-        if (bmin == 0.0 && bmax == 0.0 && right.minAttained) {
-          return ValueBounds::invalid(
-              node.type, BoundsInvalidity::DIVIDE_BY_ZERO, mayMissing);
+        if (bmin == 0.0 && bmax == 0.0
+            && right.minAttained && right.maxAttained) {
+          return ValueBounds::unbounded(node.type, true, true);
         }
-        return ValueBounds::unbounded(node.type, mayMissing);
+        return ValueBounds::unbounded(node.type, true);
       }
       std::array<double, 4> quotients{
           amin / bmin, amin / bmax, amax / bmin, amax / bmax};
@@ -595,33 +644,39 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
   return binaryBounds(node, args[0], args[1]);
 }
 
+constexpr uint8_t DOC = functionCapabilities(FunctionCapability::DOCUMENT_VALUE);
+constexpr uint8_t DOC_BUCKET = functionCapabilities(
+    FunctionCapability::DOCUMENT_VALUE, FunctionCapability::BUCKET_SCALAR);
+
 constexpr ValueFunction FUNCTIONS[] = {
-    {ValueOpcode::DEF, "def", defType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 2, 2},
-    {ValueOpcode::ADD, "add", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 2, 2},
-    {ValueOpcode::SUB, "sub", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 2, 2},
-    {ValueOpcode::MUL, "mul", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 2, 2},
-    {ValueOpcode::DIV, "div", binaryNumeric, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 2, 2},
-    {ValueOpcode::NEG, "neg", unarySame, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 1},
-    {ValueOpcode::ABS, "abs", unarySame, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 1},
-    {ValueOpcode::SQRT, "sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 1},
-    {ValueOpcode::LOG, "log", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 1},
-    {ValueOpcode::LOG1P, "log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 1},
-    {ValueOpcode::MIN, "min", minMaxType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 2},
-    {ValueOpcode::MAX, "max", minMaxType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 2},
-    {ValueOpcode::AVG, "avg", avgType, evalFunctionPoint, evalFunctionBatch, propagateBounds,
-     evalFunctionElement, 1, 1},
+    {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 2, 2, DOC},
+    {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+    {ValueOpcode::SUB, "sub", subResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+    {ValueOpcode::MUL, "mul", mulResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+    {ValueOpcode::DIV, "div", divResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+    {ValueOpcode::NEG, "neg", unaryDemote, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+    {ValueOpcode::ABS, "abs", unaryDemote, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+    {ValueOpcode::SQRT, "sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+    {ValueOpcode::LOG, "log", unaryDouble, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+    {ValueOpcode::LOG1P, "log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+    {ValueOpcode::FLOOR, "floor", unaryDouble, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+    {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 2, DOC},
+    {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 2, DOC},
+    {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
+     propagateBounds, evalFunctionElement, 1, 1, DOC},
 };
 
 ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
@@ -650,26 +705,24 @@ ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
                                    const ValueBounds& bounds) {
   if (node.kind == ValueNodeKind::FUNCTION && node.opcode == ValueOpcode::LOG) {
     std::string_view argument = program.nodes[node.children[0]].text;
-    throw std::runtime_error(fmt::format(
+    throw ValueEvaluationError(fmt::format(
         "log() is invalid over the segment bounds of '{}'; use log(max({}, 1)) to clamp "
         "or log1p({}) when that is the intended transform",
         argument, argument, argument));
   }
   if (node.kind == ValueNodeKind::FUNCTION && node.opcode == ValueOpcode::LOG1P) {
-    throw std::runtime_error(
+    throw ValueEvaluationError(
         "log1p() is invalid for a value <= -1 in this segment; clamp its argument first");
   }
   if (node.kind == ValueNodeKind::FUNCTION && node.opcode == ValueOpcode::SQRT) {
-    throw std::runtime_error(
+    throw ValueEvaluationError(
         "sqrt() is invalid for a negative value in this segment; clamp its argument first");
   }
-  if (bounds.invalidity == BoundsInvalidity::DIVIDE_BY_ZERO) {
-    throw std::runtime_error("div() has a proven zero denominator in this segment");
-  }
   if (bounds.invalidity == BoundsInvalidity::INTEGER_OVERFLOW) {
-    throw std::runtime_error(fmt::format("{}() provably overflows int64 in this segment", node.text));
+    throw ValueEvaluationError(fmt::format(
+        "{}() provably overflows int64 in this segment", node.text));
   }
-  throw std::runtime_error(fmt::format(
+  throw ValueEvaluationError(fmt::format(
       "{}() provably produces NaN or infinity in this segment", node.text));
 }
 
