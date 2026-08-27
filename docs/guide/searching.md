@@ -220,11 +220,13 @@ the first value is the one key that needs no per-document scan. Sort by
 willing to pay the scan.
 
 Value expressions support numeric constants, `$name` values from the sort's
-`vars` map, the reserved `score` leaf, and these functions:
+`vars` map, the reserved `score` leaf, parentheses, and normal arithmetic
+precedence. `*` and `/` bind more tightly than `+` and `-`; unary `-` binds to
+its following value. The function spellings remain available:
 
 - Arithmetic: `add`, `sub`, `mul`, and `div`.
 - Defaults: `def(value, fallback)` substitutes only when `value` is missing.
-- Unary math: `neg`, `abs`, `sqrt`, `log`, and `log1p`.
+- Unary math: `neg`, `abs`, `sqrt`, `log`, `log1p`, and `floor`.
 - Multi-valued reducers: `min`, `max`, and `avg`. A composed array-valued root
   must use one of these explicit reducers. The two-argument `min` and `max`
   forms compare scalar values and are useful for clamping.
@@ -233,16 +235,31 @@ For example:
 
 ```json
 {
-  "expr": "add(popularity_i,mul(score,$weight))",
+  "expr": "popularity_i + score * $weight",
   "vars": {"weight": 0.25},
   "dir": "desc"
 }
 ```
 
-Integer-only arithmetic remains int64; a double operand promotes that operation
-to double. Array arithmetic permits scalar broadcasting but does not implicitly
-zip two arrays. NaN, infinity, invalid math domains, division by zero, and int64
-overflow are rejected rather than becoming sortable sentinels.
+Integer-only addition, subtraction, and multiplication remain int64; a double
+operand promotes that operation to double. Division always returns double. A
+zero denominator makes that value missing rather than failing the request;
+`def(value,fallback)` can opt it back in. For an array division, only the
+zero-denominator elements are absent, and reducers use the quotients that are
+present. Array arithmetic permits scalar broadcasting but does not implicitly
+zip two arrays. NaN, infinity, invalid math domains, and int64 overflow remain
+evaluation errors.
+
+DATE values retain their DATE meaning through `def`, `min`, `max`, `avg`, and
+DATE plus or minus a number. DATE minus DATE produces a number. Multiplication,
+division, unary minus, and unary math such as `floor` demote DATE to a number;
+adding two DATE values or subtracting a DATE from a number is rejected. For
+example, `floor(when_dt / 86400000)` produces an epoch-day number.
+
+A rescore expression is stricter than a sort expression: it must produce a
+finite value for every matched document. A missing rescore value fails the
+search and names `def()` and an `exists()` child query as the two ways to make
+the expression total.
 
 Missing values sort last in both directions. Several sort specifications form
 an ordered lexicographic sort. `score` and `_score_` sort by the query score, and

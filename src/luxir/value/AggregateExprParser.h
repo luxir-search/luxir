@@ -58,6 +58,9 @@ public:
     program->rootNode = grammar.parseExpression();
     cur->skipWs();
     if (!cur->atEnd()) fail(cur->position(), "unexpected trailing input");
+    if (program->leaves.empty()) {
+      fail(0, "expression contains no aggregate function");
+    }
     cur = nullptr;
     return program;
   }
@@ -83,6 +86,7 @@ public:
         ? BucketValueType::DOUBLE : BucketValueType::INT128;
     node.nature = resolved.nature;
     node.opcode = function.opcode;
+    node.function = &function;
     node.children[0] = child;
     node.sourcePos = pos;
     return program->addNode(node);
@@ -109,6 +113,7 @@ public:
         ? BucketValueType::DOUBLE : BucketValueType::INT128;
     node.nature = resolved.nature;
     node.opcode = function.opcode;
+    node.function = &function;
     node.children = {left, right};
     node.sourcePos = pos;
     return program->addNode(node);

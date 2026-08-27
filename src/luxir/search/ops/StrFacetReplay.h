@@ -15,6 +15,7 @@
 #include "FacetExecution.h"
 #include "SkinnyCounter.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/DomainIter.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir {
@@ -218,6 +219,48 @@ public:
     return found == selected.end() ? -1 : found->second;
   }
 };
+
+// Visit each document in the parent domain that belongs to at least one
+// selected bucket. Single-valued columns pass one owner; multi-valued columns
+// group every selected owner for a document into one callback. That grouping
+// is what lets child replay evaluate a document once and scatter its value.
+template <typename SelectedMap, typename Callback>
+void forEachSelectedBucketDoc(
+    DocSet* domain, OrdColReader& parentColumn, int32_t maxDoc,
+    const SelectedMap& selectedMap, Callback&& callback) {
+  int64_t parentMissing = 0;
+  if (!parentColumn.multiValued()) {
+    forEachOrdValue(
+        domain, parentColumn, maxDoc, parentMissing,
+        [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
+          int32_t owner = StrFacetSelectedOrdMap::owner(
+              selectedMap, storedOrd);
+          if (owner >= 0) {
+            callback(docid, std::span<const int32_t>(&owner, 1));
+          }
+        });
+    return;
+  }
+
+  std::vector<int32_t> owners;
+  owners.reserve(4);
+  int32_t currentDoc = -1;
+  auto flush = [&]() LUXIR_INLINE {
+    if (!owners.empty()) callback(currentDoc, std::span<const int32_t>(owners));
+    owners.clear();
+  };
+  forEachOrdValue(
+      domain, parentColumn, maxDoc, parentMissing,
+      [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
+        if (docid != currentDoc) {
+          flush();
+          currentDoc = docid;
+        }
+        int32_t owner = StrFacetSelectedOrdMap::owner(selectedMap, storedOrd);
+        if (owner >= 0) owners.push_back(owner);
+      });
+  flush();
+}
 
 // One uniform child-count representation spans all selected parent owners.
 // This keeps representation dispatch outside the document loop. A packed key

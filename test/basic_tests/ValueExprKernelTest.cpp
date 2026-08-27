@@ -36,6 +36,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   constexpr int64_t BIG = 9007199254740993LL;
   helper.index(flatdoc("id_s", "a", "x_i", BIG, "f_f", -1.5f,
                        "values_is", vec_i(-3, 5), "den_i", -1,
+                       "divisors_is", vec_i(2, 0, 4),
                        "when_dt", int64_t{1000}), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "f_f", 4.25f,
                        "values_is", vec_i(2, 8, 4), "den_i", 0,
@@ -91,6 +92,14 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
                    dividedArrayBound->evalPoint(0, 0.0f).doubleValue);
   EXPECT_FALSE(dividedArrayBound->evalPoint(1, 0.0f).valid);
   EXPECT_FALSE(dividedArrayBound->evalPoint(2, 0.0f).valid);
+
+  ValueProgram* sparseDivision =
+      parseValue(memory, *schema, "avg(12 / divisors_is)");
+  auto sparseDivisionBound = sparseDivision->bind(pool, segment);
+  ValueResult sparseAverage = sparseDivisionBound->evalPoint(0, 0.0f);
+  ASSERT_TRUE(sparseAverage.valid);
+  EXPECT_DOUBLE_EQ(4.5, sparseAverage.doubleValue);
+  EXPECT_FALSE(sparseDivisionBound->evalPoint(1, 0.0f).valid);
 
   ValueProgram* floating = parseValue(memory, *schema, "add(f_f,2.0)");
   auto floatingBound = floating->bind(pool, segment);

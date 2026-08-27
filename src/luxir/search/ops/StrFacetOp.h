@@ -468,6 +468,35 @@ public:
     std::vector<uint8_t> topTermsSegments;
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
+
+    class InlineSegmentScope {
+      std::span<SearchOp::InlineCalculator*> calculators;
+      int32_t segnum;
+      size_t started = 0;
+
+    public:
+      InlineSegmentScope(
+          std::span<SearchOp::InlineCalculator*> calculators,
+          int32_t segnum)
+          : calculators(calculators), segnum(segnum) {
+        try {
+          for (; started < calculators.size(); started++) {
+            calculators[started]->startSeg(segnum);
+          }
+        } catch (...) {
+          for (size_t i = 0; i < started; i++) {
+            calculators[i]->endSeg(segnum);
+          }
+          throw;
+        }
+      }
+
+      ~InlineSegmentScope() {
+        for (size_t i = 0; i < started; i++) {
+          calculators[i]->endSeg(segnum);
+        }
+      }
+    };
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots),
@@ -550,9 +579,8 @@ public:
     void calc2(int32_t segnum, DocSet* domain,
                ExecutionProfilePieceState* profile) {
       inlineDriver.contribute([&](MergeableStrFacetInline& data) {
-        for (auto* calc : data.inlineCalcs) {
-          calc->startSeg(segnum);
-        }
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        InlineSegmentScope inlineScope(data.inlineCalcs, segnum);
         SegFieldInfo segFieldInfo;
         PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
@@ -562,8 +590,6 @@ public:
           profile->wire.strategy = "inline";
           profile->details.emplace_back(domainDesc(domain));
         }
-        auto poolGuard = MemPool::threadLocalPoolGuard();
-
         FieldReader fieldReader(postingsReader);
         bool found = fieldReader.seek(thisOp().fieldName);
         if (found) {
@@ -1284,9 +1310,14 @@ public:
           }
           return a.first < b.first;
         }
+        void* aMetric = a.second + sizeof(int64_t);
+        void* bMetric = b.second + sizeof(int64_t);
+        bool aMissing = sortCalc->isMissing(aMetric);
+        bool bMissing = sortCalc->isMissing(bMetric);
+        if (aMissing != bMissing) return !aMissing;
+        if (aMissing) return a.first < b.first;
         int asize, bsize;
-        int cmp = sortCalc->compare(a.second + sizeof(int64_t),
-                                    b.second + sizeof(int64_t), asize, bsize);
+        int cmp = sortCalc->compare(aMetric, bMetric, asize, bsize);
         if (cmp == 0) {
           return a.first < b.first; // tie-break by bucketid asc
         }
@@ -1379,6 +1410,10 @@ public:
             .output = FacetOutputSlot{(int32_t)i}
         });
       }
+      // Inline results and sort comparisons are complete. Release their
+      // per-bucket state before any selected-bucket child bindings allocate
+      // their own state.
+      mergedData.reset();
       executeResultChildren(selectedBuckets);
     }
 
@@ -1676,8 +1711,7 @@ public:
       }
     }
 
-    template <bool TrackProfile, bool ParentMulti,
-              bool ChildPresent, bool ChildMulti,
+    template <bool TrackProfile, bool ChildPresent, bool ChildMulti,
               typename Bank, typename SelectedMap>
     void replayValues(
         Bank& bank, const SelectedMap& selectedMap,
@@ -1686,71 +1720,32 @@ public:
         OrdMap::SegToGlobal::BulkGlobalOrds* childGlobalOrds,
         std::vector<int64_t>& missingCounts,
         int64_t& routedDocs, int64_t& routedValues) {
-      int64_t parentMissing = 0;
       int64_t numChildOrds = child.ordMap->numOrds();
-      if constexpr (!ParentMulti) {
-        forEachOrdValue(
-            domain, parentColumn, maxDoc, parentMissing,
-            [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
-              int32_t owner = StrFacetSelectedOrdMap::owner(
-                  selectedMap, storedOrd);
-              if (owner < 0) return;
-              if constexpr (TrackProfile) routedDocs++;
-              bool haveChildValue = false;
-              if constexpr (ChildPresent) {
-                haveChildValue = visitChildOrds<ChildMulti>(
-                    docid, *childColumn, *childIterator, *childGlobalOrds,
-                    [&](int64_t ord) LUXIR_INLINE {
+      forEachSelectedBucketDoc(
+          domain, parentColumn, maxDoc, selectedMap,
+          [&](int32_t docid,
+              std::span<const int32_t> owners) LUXIR_INLINE {
+            if constexpr (TrackProfile) routedDocs++;
+            bool haveChildValue = false;
+            if constexpr (ChildPresent) {
+              haveChildValue = visitChildOrds<ChildMulti>(
+                  docid, *childColumn, *childIterator, *childGlobalOrds,
+                  [&](int64_t ord) LUXIR_INLINE {
+                    for (int32_t owner : owners) {
                       StrFacetReplayBank::increment(
                           bank, owner, ord, numChildOrds);
-                      if constexpr (TrackProfile) routedValues++;
-                    });
-              }
-              if (!haveChildValue && child.missing) {
+                    }
+                    if constexpr (TrackProfile) {
+                      routedValues += (int64_t)owners.size();
+                    }
+                  });
+            }
+            if (!haveChildValue && child.missing) {
+              for (int32_t owner : owners) {
                 missingCounts[(size_t)owner]++;
               }
-            });
-      } else {
-        std::vector<int32_t> owners;
-        owners.reserve(4);
-        int32_t currentDoc = -1;
-        auto flush = [&]() LUXIR_INLINE {
-          if (owners.empty()) return;
-          if constexpr (TrackProfile) routedDocs++;
-          bool haveChildValue = false;
-          if constexpr (ChildPresent) {
-            haveChildValue = visitChildOrds<ChildMulti>(
-                currentDoc, *childColumn, *childIterator, *childGlobalOrds,
-                [&](int64_t ord) LUXIR_INLINE {
-                  for (int32_t owner : owners) {
-                    StrFacetReplayBank::increment(
-                        bank, owner, ord, numChildOrds);
-                  }
-                  if constexpr (TrackProfile) {
-                    routedValues += (int64_t)owners.size();
-                  }
-                });
-          }
-          if (!haveChildValue && child.missing) {
-            for (int32_t owner : owners) {
-              missingCounts[(size_t)owner]++;
             }
-          }
-          owners.clear();
-        };
-        forEachOrdValue(
-            domain, parentColumn, maxDoc, parentMissing,
-            [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
-              if (docid != currentDoc) {
-                flush();
-                currentDoc = docid;
-              }
-              int32_t owner = StrFacetSelectedOrdMap::owner(
-                  selectedMap, storedOrd);
-              if (owner >= 0) owners.push_back(owner);
-            });
-        flush();
-      }
+          });
     }
 
     template <bool TrackProfile, typename Bank>
@@ -1801,36 +1796,17 @@ public:
       selected.visit([&](const auto& selectedMap) {
         DocSet* domain = source.domains[(size_t)segnum].get();
         if (!childFieldFound) {
-          if (parentColumn.multiValued()) {
-            replayValues<TrackProfile, true, false, false>(
-                bank, selectedMap, parentColumn, maxDoc, domain,
-                nullptr, nullptr, nullptr, missingCounts,
-                routedDocs, routedValues);
-          } else {
-            replayValues<TrackProfile, false, false, false>(
-                bank, selectedMap, parentColumn, maxDoc, domain,
-                nullptr, nullptr, nullptr, missingCounts,
-                routedDocs, routedValues);
-          }
-        } else if (parentColumn.multiValued()) {
-          if (childColumn->multiValued()) {
-            replayValues<TrackProfile, true, true, true>(
-                bank, selectedMap, parentColumn, maxDoc, domain,
-                &*childColumn, &*childIterator, &*childGlobalOrds,
-                missingCounts, routedDocs, routedValues);
-          } else {
-            replayValues<TrackProfile, true, true, false>(
-                bank, selectedMap, parentColumn, maxDoc, domain,
-                &*childColumn, &*childIterator, &*childGlobalOrds,
-                missingCounts, routedDocs, routedValues);
-          }
+          replayValues<TrackProfile, false, false>(
+              bank, selectedMap, parentColumn, maxDoc, domain,
+              nullptr, nullptr, nullptr, missingCounts,
+              routedDocs, routedValues);
         } else if (childColumn->multiValued()) {
-          replayValues<TrackProfile, false, true, true>(
+          replayValues<TrackProfile, true, true>(
               bank, selectedMap, parentColumn, maxDoc, domain,
               &*childColumn, &*childIterator, &*childGlobalOrds,
               missingCounts, routedDocs, routedValues);
         } else {
-          replayValues<TrackProfile, false, true, false>(
+          replayValues<TrackProfile, true, false>(
               bank, selectedMap, parentColumn, maxDoc, domain,
               &*childColumn, &*childIterator, &*childGlobalOrds,
               missingCounts, routedDocs, routedValues);

@@ -86,6 +86,12 @@ public:
     return false;
   }
 
+  // Resident state retained by one ordinary per-bucket calculator while its
+  // segments are fed. Stateless operations keep the default zero estimate.
+  virtual size_t facetBucketResidentBytes() const {
+    return 0;
+  }
+
   // Result-stage facet children may bind to parent-produced sources. The
   // default operation has no specialized binding and uses BUCKET_DOMAINS.
   // The returned executor is owned by the parent coordinator.
@@ -269,6 +275,9 @@ public:
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};
+    // Runs before FacetMap mutates its key map. Implementations may reject a
+    // new bucket here; insert/update/merge callbacks must not throw.
+    virtual void prepareEntry() {}
     virtual int insert(void* entry, int32_t docid, int space) = 0;
     virtual int update(void* entry, int32_t docid) = 0;
     virtual std::pair<int, int> merge(void* target, void* from) = 0;
@@ -276,6 +285,10 @@ public:
     virtual std::pair<int, int> mergeNew(void* target, void* from, int space) = 0;
     virtual int finalize(void* entry, int64_t count) = 0;
     virtual int compare(void* a, void* b, int& asize, int& bsize) = 0;
+    virtual bool isMissing(void* entry) {
+      unused(entry);
+      return false;
+    }
     virtual void fillResult(std::span<char*>) = 0;
 
   };
@@ -298,9 +311,13 @@ public:
   FacetMap() = default;
 
   void add(const Key& key, int32_t docid) {
-    auto [iter, inserted] = map.insert({key, nullptr});
+    auto iter = map.find(key);
+    bool inserted = iter == map.end();
 
     if (inserted) {
+      for (auto* calc : calcs) calc->prepareEntry();
+      std::tie(iter, inserted) = map.insert({key, nullptr});
+      assert(inserted);
       auto ptr = pool.reserve(sizeof(int64_t));
       int space = (int)pool.spaceLeft();
       auto start = ptr;
@@ -340,8 +357,12 @@ public:
 
   void merge(FacetMap<Key>& other) {
     for (auto& [key, otherPtr] : other.map) {
-      auto [iter, inserted] = map.insert({key, nullptr});
+      auto iter = map.find(key);
+      bool inserted = iter == map.end();
       if (inserted) {
+        for (auto* calc : calcs) calc->prepareEntry();
+        std::tie(iter, inserted) = map.insert({key, nullptr});
+        assert(inserted);
         auto ptr = pool.reserve(sizeof(int64_t));
         int space = (int)pool.spaceLeft();
         auto start = ptr;

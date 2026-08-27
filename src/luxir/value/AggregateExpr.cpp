@@ -1,109 +1,12 @@
 #include "luxir/value/AggregateExpr.h"
 
-#include <cmath>
 #include <limits>
 #include <stdexcept>
 
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/util/NumericUtils.h"
 
 namespace luxir {
-namespace {
-
-double asDouble(const BucketScalar& value) {
-  return value.type == BucketValueType::DOUBLE
-      ? value.doubleValue : (double)value.intValue;
-}
-
-BucketScalar evalUnary(const AggregateNode& node, const BucketScalar& child) {
-  if (child.failure != AggregateFailure::NONE) {
-    return BucketScalar::failed(node.type, node.nature, child.failure);
-  }
-  if (!child.valid) return BucketScalar::missing(node.type, node.nature);
-  if (node.type == BucketValueType::DOUBLE) {
-    double input = asDouble(child);
-    double result;
-    switch (node.opcode) {
-      case ValueOpcode::NEG: result = -input; break;
-      case ValueOpcode::ABS: result = std::abs(input); break;
-      case ValueOpcode::SQRT: result = std::sqrt(input); break;
-      case ValueOpcode::LOG: result = std::log(input); break;
-      case ValueOpcode::LOG1P: result = std::log1p(input); break;
-      case ValueOpcode::FLOOR: result = std::floor(input); break;
-      default: std::unreachable();
-    }
-    if (!std::isfinite(result)) {
-      return BucketScalar::failed(node.type, node.nature,
-                                  AggregateFailure::NON_FINITE_EXPRESSION);
-    }
-    return BucketScalar::floating(result, node.nature);
-  }
-  __int128 result;
-  if (node.opcode == ValueOpcode::ABS && child.intValue >= 0) {
-    return BucketScalar::integer(child.intValue, node.nature);
-  }
-  if (__builtin_sub_overflow((__int128)0, child.intValue, &result)) {
-    return BucketScalar::failed(node.type, node.nature,
-                                AggregateFailure::INT128_OVERFLOW);
-  }
-  return BucketScalar::integer(result, node.nature);
-}
-
-BucketScalar evalBinary(const AggregateNode& node, const BucketScalar& left,
-                        const BucketScalar& right) {
-  if (left.failure != AggregateFailure::NONE) {
-    return BucketScalar::failed(node.type, node.nature, left.failure);
-  }
-  if (right.failure != AggregateFailure::NONE) {
-    return BucketScalar::failed(node.type, node.nature, right.failure);
-  }
-  if (!left.valid || !right.valid) {
-    return BucketScalar::missing(node.type, node.nature);
-  }
-  if (node.type == BucketValueType::DOUBLE) {
-    double a = asDouble(left);
-    double b = asDouble(right);
-    if (node.opcode == ValueOpcode::DIV && b == 0.0) {
-      return BucketScalar::missing(node.type, node.nature);
-    }
-    double result;
-    switch (node.opcode) {
-      case ValueOpcode::ADD: result = a + b; break;
-      case ValueOpcode::SUB: result = a - b; break;
-      case ValueOpcode::MUL: result = a * b; break;
-      case ValueOpcode::DIV: result = a / b; break;
-      default: std::unreachable();
-    }
-    if (!std::isfinite(result)) {
-      return BucketScalar::failed(node.type, node.nature,
-                                  AggregateFailure::NON_FINITE_EXPRESSION);
-    }
-    return BucketScalar::floating(result, node.nature);
-  }
-
-  __int128 result = 0;
-  bool overflow = false;
-  switch (node.opcode) {
-    case ValueOpcode::ADD:
-      overflow = __builtin_add_overflow(left.intValue, right.intValue, &result);
-      break;
-    case ValueOpcode::SUB:
-      overflow = __builtin_sub_overflow(left.intValue, right.intValue, &result);
-      break;
-    case ValueOpcode::MUL:
-      overflow = __builtin_mul_overflow(left.intValue, right.intValue, &result);
-      break;
-    default:
-      std::unreachable();
-  }
-  if (overflow) {
-    return BucketScalar::failed(node.type, node.nature,
-                                AggregateFailure::INT128_OVERFLOW);
-  }
-  return BucketScalar::integer(result, node.nature);
-}
-
-} // namespace
-
 std::string_view aggregateFailureReason(AggregateFailure failure) {
   switch (failure) {
     case AggregateFailure::NONE: return {};
@@ -125,64 +28,96 @@ std::string_view aggregateFailureReason(AggregateFailure failure) {
   return "aggregate evaluation failed";
 }
 
-AggregateAccumulator::AggregateAccumulator(const AggregateProgram& program)
-    : program(&program), states(program.stateBytes) {
-  for (const AggregateLeaf& leaf : program.leaves) {
-    leaf.resolved.state.init(states.data() + leaf.stateOffset);
+AggregateFailure AggregateStateView::failure() const {
+  return loadUnaligned<AggregateFailure>(storage);
+}
+
+void AggregateStateView::setFailure(AggregateFailure reason) {
+  storeUnaligned<AggregateFailure>(storage, reason);
+}
+
+void* AggregateStateView::leafState(const AggregateLeaf& leaf) const {
+  return storage + sizeof(AggregateFailure) + leaf.stateOffset;
+}
+
+void AggregateStateView::init() {
+  setFailure(AggregateFailure::NONE);
+  for (const AggregateLeaf& leaf : program->leaves) {
+    leaf.resolved.state.init(leafState(leaf));
   }
 }
 
-void AggregateAccumulator::add(uint32_t leafIndex, const ValueResult& value) {
-  if (!value.valid) return;
-  if (failed()) return;
+void AggregateStateView::add(uint32_t leafIndex, const ValueResult& value) {
+  if (!value.valid || failed()) return;
   const AggregateLeaf& leaf = program->leaves[leafIndex];
-  leaf.resolved.state.accumulate(states.data() + leaf.stateOffset, value);
+  leaf.resolved.state.accumulate(leafState(leaf), value);
 }
 
-void AggregateAccumulator::fail(AggregateFailure reason) {
-  if (failure == AggregateFailure::NONE) failure = reason;
+void AggregateStateView::fail(AggregateFailure reason) {
+  if (!failed()) setFailure(reason);
 }
 
-BucketScalar AggregateAccumulator::evaluate(
-    std::span<const BucketScalar> aggregates) const {
-  std::vector<BucketScalar> values(program->nodes.size());
+void AggregateStateView::merge(const AggregateStateView& source) {
+  if (source.failed()) fail(source.failure());
+  for (const AggregateLeaf& leaf : program->leaves) {
+    leaf.resolved.state.merge(leafState(leaf), source.leafState(leaf));
+  }
+}
+
+BucketScalar AggregateStateView::evaluate(AggregateEvalScratch& scratch) const {
+  scratch.nodes.resize(program->nodes.size());
   for (size_t i = 0; i < program->nodes.size(); i++) {
     const AggregateNode& node = program->nodes[i];
     switch (node.kind) {
       case AggregateNodeKind::CONSTANT:
-        values[i] = node.type == BucketValueType::DOUBLE
+        scratch.nodes[i] = node.type == BucketValueType::DOUBLE
             ? BucketScalar::floating(node.doubleValue, node.nature)
             : BucketScalar::integer(node.intValue, node.nature);
         break;
       case AggregateNodeKind::AGGREGATE:
-        values[i] = aggregates[node.aggregate];
+        scratch.nodes[i] = scratch.aggregates[node.aggregate];
         break;
-      case AggregateNodeKind::UNARY:
-        values[i] = evalUnary(node, values[node.children[0]]);
+      case AggregateNodeKind::UNARY: {
+        assert(node.function != nullptr);
+        std::array<BucketScalar, 1> args{
+            scratch.nodes[node.children[0]]};
+        scratch.nodes[i] = node.function->evalBucketScalar(
+            args,
+            node.type == BucketValueType::DOUBLE
+                ? ValueType::DOUBLE : ValueType::INT64,
+            node.nature);
         break;
+      }
       case AggregateNodeKind::BINARY:
-        values[i] = evalBinary(node, values[node.children[0]],
-                               values[node.children[1]]);
+        assert(node.function != nullptr);
+        std::array<BucketScalar, 2> args{
+            scratch.nodes[node.children[0]],
+            scratch.nodes[node.children[1]]};
+        scratch.nodes[i] = node.function->evalBucketScalar(
+            args,
+            node.type == BucketValueType::DOUBLE
+                ? ValueType::DOUBLE : ValueType::INT64,
+            node.nature);
         break;
     }
   }
-  return values[program->rootNode];
+  return scratch.nodes[program->rootNode];
 }
 
-BucketScalar AggregateAccumulator::finish() const {
+BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
   const AggregateNode& root = program->root();
-  if (failure != AggregateFailure::NONE) {
-    return BucketScalar::failed(root.type, root.nature, failure);
+  AggregateFailure stateFailure = failure();
+  if (stateFailure != AggregateFailure::NONE) {
+    return BucketScalar::failed(root.type, root.nature, stateFailure);
   }
-  std::vector<BucketScalar> aggregates(program->leaves.size());
+  scratch.aggregates.resize(program->leaves.size());
   for (size_t i = 0; i < program->leaves.size(); i++) {
     const AggregateLeaf& leaf = program->leaves[i];
-    BucketScalar value = leaf.resolved.state.finish(
-        states.data() + leaf.stateOffset);
+    BucketScalar value = leaf.resolved.state.finish(leafState(leaf));
     value.nature = leaf.resolved.nature;
-    aggregates[i] = value;
+    scratch.aggregates[i] = value;
   }
-  BucketScalar result = evaluate(aggregates);
+  BucketScalar result = evaluate(scratch);
   if (result.valid && result.type == BucketValueType::INT128
       && (result.intValue < std::numeric_limits<int64_t>::min()
           || result.intValue > std::numeric_limits<int64_t>::max())) {
@@ -192,18 +127,47 @@ BucketScalar AggregateAccumulator::finish() const {
   return result;
 }
 
+BucketScalar AggregateStateView::finish() const {
+  AggregateEvalScratch scratch;
+  return finish(scratch);
+}
+
+AggregateAccumulator::AggregateAccumulator(const AggregateProgram& program)
+    : program(&program), states(AggregateStateView::bytes(program)) {
+  AggregateStateView(program, states.data()).init();
+}
+
+void AggregateAccumulator::add(uint32_t leafIndex, const ValueResult& value) {
+  AggregateStateView(*program, states.data()).add(leafIndex, value);
+}
+
+void AggregateAccumulator::fail(AggregateFailure reason) {
+  AggregateStateView(*program, states.data()).fail(reason);
+}
+
+bool AggregateAccumulator::failed() const {
+  return AggregateStateView(
+      *program, const_cast<std::byte*>(states.data())).failed();
+}
+
+BucketScalar AggregateAccumulator::finish(AggregateEvalScratch& scratch) const {
+  return AggregateStateView(
+      *program, const_cast<std::byte*>(states.data())).finish(scratch);
+}
+
+BucketScalar AggregateAccumulator::finish() const {
+  AggregateEvalScratch scratch;
+  return finish(scratch);
+}
+
 AggregateAccumulator* AggregateAccumulator::merge(
     AggregateAccumulator* target, AggregateAccumulator* source) {
   if (target->program != source->program) {
     throw std::runtime_error("cannot merge different aggregate programs");
   }
-  if (target->failure == AggregateFailure::NONE) {
-    target->failure = source->failure;
-  }
-  for (const AggregateLeaf& leaf : target->program->leaves) {
-    leaf.resolved.state.merge(target->states.data() + leaf.stateOffset,
-                              source->states.data() + leaf.stateOffset);
-  }
+  AggregateStateView targetView(*target->program, target->states.data());
+  AggregateStateView sourceView(*source->program, source->states.data());
+  targetView.merge(sourceView);
   return target;
 }
 

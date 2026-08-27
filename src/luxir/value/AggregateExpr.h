@@ -115,11 +115,17 @@ struct AggregateNode {
   BucketValueType type = BucketValueType::INT128;
   ValueNature nature = ValueNature::NUMBER;
   ValueOpcode opcode = ValueOpcode::NONE;
+  const ValueFunction* function = nullptr;
   std::array<uint32_t, 2> children{};
   uint32_t aggregate = 0;
   size_t sourcePos = 0;
   __int128 intValue = 0;
   double doubleValue = 0.0;
+};
+
+struct AggregateEvalScratch {
+  std::vector<BucketScalar> aggregates;
+  std::vector<BucketScalar> nodes;
 };
 
 class AggregateProgram {
@@ -142,12 +148,38 @@ public:
   const AggregateNode& root() const { return nodes[rootNode]; }
 };
 
+// A non-owning aggregate state stored in caller-provided bytes. Facet entries
+// are packed without alignment, so every state callback and header access goes
+// through the unaligned load/store helpers.
+class AggregateStateView {
+  const AggregateProgram* program;
+  std::byte* storage;
+
+  AggregateFailure failure() const;
+  void setFailure(AggregateFailure reason);
+  void* leafState(const AggregateLeaf& leaf) const;
+  BucketScalar evaluate(AggregateEvalScratch& scratch) const;
+
+public:
+  AggregateStateView(const AggregateProgram& program, void* storage)
+      : program(&program), storage(static_cast<std::byte*>(storage)) {}
+
+  static uint32_t bytes(const AggregateProgram& program) {
+    return (uint32_t)sizeof(AggregateFailure) + program.stateBytes;
+  }
+
+  void init();
+  void add(uint32_t leaf, const ValueResult& value);
+  void fail(AggregateFailure reason);
+  bool failed() const { return failure() != AggregateFailure::NONE; }
+  void merge(const AggregateStateView& source);
+  BucketScalar finish(AggregateEvalScratch& scratch) const;
+  BucketScalar finish() const;
+};
+
 class AggregateAccumulator {
   const AggregateProgram* program = nullptr;
   std::vector<std::byte> states;
-  AggregateFailure failure = AggregateFailure::NONE;
-
-  BucketScalar evaluate(std::span<const BucketScalar> aggregates) const;
 
 public:
   int64_t releaseCount = 0;
@@ -157,7 +189,8 @@ public:
 
   void add(uint32_t leaf, const ValueResult& value);
   void fail(AggregateFailure reason);
-  bool failed() const { return failure != AggregateFailure::NONE; }
+  bool failed() const;
+  BucketScalar finish(AggregateEvalScratch& scratch) const;
   BucketScalar finish() const;
 
   static AggregateAccumulator* merge(AggregateAccumulator* target,

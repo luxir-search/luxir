@@ -59,7 +59,7 @@ enum class NullValue { NULL_VALUE = 0 };
 namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
-struct Target; struct SearchRequest; struct SearchOp; struct GenOp; struct TopDocs;
+struct Target; struct SearchRequest; struct SearchOp; struct GenOp; struct ExprOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
@@ -386,6 +386,10 @@ struct Domain {
   std::span<const NamedQuery> filter;
 };
 struct GenOp { std::string_view name; std::span<const Val> args; };
+struct ExprOp {
+  std::string_view expr;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+};
 struct FieldFacet {
   std::string_view field;
   std::optional<std::int64_t> limit;
@@ -458,8 +462,8 @@ struct RangeFacet {                                             // needs Val,Cal
   std::string_view time_zone;
   bool missing = false;
 };
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,GenOp
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp> kind;
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,GenOp,ExprOp
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp, ExprOp> kind;
 };
 struct Warning { std::string_view code; std::string_view message; };
 struct ExecutionProfilePiece {
@@ -566,7 +570,7 @@ struct UpdateRequest {                                         // needs Target,C
 
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
-LUXIR_TD(Target) LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(GenOp) LUXIR_TD(TopDocs)
+LUXIR_TD(Target) LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(GenOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(NamedQuery) LUXIR_TD(BooleanQuery)
@@ -601,7 +605,7 @@ LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
                  std::string *error = nullptr);                                              \
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
-LUXIR_ENTRY(Target) LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(GenOp)
+LUXIR_ENTRY(Target) LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(GenOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(NamedQuery) LUXIR_ENTRY(BooleanQuery)

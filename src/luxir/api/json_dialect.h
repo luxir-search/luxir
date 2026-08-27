@@ -69,6 +69,40 @@ inline bool numberTokenIsFloat(const auto* it, const auto* end) {
 
 namespace glz {
 
+template <auto Opts, typename Message>
+void readExprVarsSugar(Message &value, std::string_view &expression,
+                       std::string_view expressionKey,
+                       hpp_proto::concepts::is_non_owning_context auto &ctx,
+                       auto &it, auto &end) {
+  if constexpr (!check_ws_handled(Opts)) {
+    if (skip_ws<Opts>(ctx, it, end)) return;
+  }
+  static constexpr auto O = ws_handled<Opts>();
+  if ((char)*it == '"') {
+    util::from_json<O>(expression, ctx, it, end);
+    return;
+  }
+  static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+  std::string_view key;
+  decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+  util::scan_object_fields<O, true>(
+      ctx, it, end, keyTarget, [](auto &, auto &) {},
+      [&](auto &vit, auto &vend) {
+        if (key == expressionKey) {
+          util::from_json<V>(expression, ctx, vit, vend);
+        } else if (key == "vars") {
+          decltype(auto) vars =
+              ::hpp_proto::detail::as_modifiable(ctx, value.vars);
+          glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
+        } else {
+          ctx.error = error_code::unknown_key;
+          return true;
+        }
+        return bool(ctx.error);
+      },
+      [](auto &, auto &) {});
+}
+
 // ----- Map: a plain JSON object (no "fields" wrapper key) -----
 template <>
 struct from<JSON, luxir::api::Map> {
@@ -171,27 +205,67 @@ struct from<JSON, luxir::api::ExprQuery> {
   template <auto Opts>
   static void op(luxir::api::ExprQuery &value, hpp_proto::concepts::is_non_owning_context auto &ctx,
                  auto &it, auto &end) {
+    readExprVarsSugar<Opts>(value, value.q, "q", ctx, it, end);
+  }
+};
+
+// ----- ExprOp: bare string = expr-only sugar -----
+template <>
+struct from<JSON, luxir::api::ExprOp> {
+  template <auto Opts>
+  static void op(luxir::api::ExprOp &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    readExprVarsSugar<Opts>(value, value.expr, "expr", ctx, it, end);
+  }
+};
+
+// ----- SearchOp: canonical one-arm object, or a bare string (ExprOp sugar) -----
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
+              "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
+template <>
+struct from<JSON, luxir::api::SearchOp> {
+  template <auto Opts>
+  static void op(luxir::api::SearchOp &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    namespace api = luxir::api;
     if constexpr (!check_ws_handled(Opts)) {
-      if (skip_ws<Opts>(ctx, it, end)) {
-        return;
-      }
+      if (skip_ws<Opts>(ctx, it, end)) return;
     }
     static constexpr auto O = ws_handled<Opts>();
     if ((char)*it == '"') {
-      util::from_json<O>(value.q, ctx, it, end);
+      auto &expr = value.kind.template emplace<api::ExprOp>();
+      util::from_json<O>(expr.expr, ctx, it, end);
       return;
     }
     static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
     std::string_view key;
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    bool sawArm = false;
     util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
-          if (key == "q") {
-            util::from_json<V>(value.q, ctx, vit, vend);
-          } else if (key == "vars") {
-            decltype(auto) vars = ::hpp_proto::detail::as_modifiable(ctx, value.vars);
-            glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
+          if (sawArm) {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          sawArm = true;
+          auto arm = [&]<typename T>(std::in_place_type_t<T>) {
+            util::from_json<V>(value.kind.template emplace<T>(), ctx, vit, vend);
+          };
+          if (key == "top_docs") {
+            arm(std::in_place_type<api::TopDocs>);
+          } else if (key == "fusion") {
+            arm(std::in_place_type<api::Fusion>);
+          } else if (key == "field_facet") {
+            arm(std::in_place_type<api::FieldFacet>);
+          } else if (key == "range_facet") {
+            arm(std::in_place_type<api::RangeFacet>);
+          } else if (key == "gen_op") {
+            arm(std::in_place_type<api::GenOp>);
+          } else if (key == "expr_op") {
+            arm(std::in_place_type<api::ExprOp>);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

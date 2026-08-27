@@ -15,6 +15,7 @@
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/StrFacetOp.h"
 #include "luxir/search/ops/StatsOp.h"
+#include "luxir/search/ops/ExprStatsOp.h"
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
@@ -25,6 +26,7 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/Overloaded.h"
 #include "luxir/value/ValueExprParser.h"
+#include "luxir/value/AggregateExprParser.h"
 
 namespace luxir {
 
@@ -348,6 +350,12 @@ public:
               + std::string(statsField) + "'");
         }
         return luxir::arenaCreate<StatsOp>(req.arena, req, name, statsField, statsType, kind);
+      },
+      [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
+        AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
+        AggregateProgram* program =
+            AggregateExprParser(options, req.arena).parse(exprOp.expr);
+        return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);

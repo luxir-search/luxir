@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <thread>
 #include <CLI/CLI.hpp>
@@ -122,6 +123,9 @@ struct SearchConfig {
   // A request-shape limit like the query parsers' nesting budget, but much
   // lower: every level is a full search operation, not just a query node.
   int max_op_depth = 10;
+  // Request-wide ceiling for resident aggregate state held by facet inline and
+  // replay bindings. Zero disables the ceiling.
+  size_t facet_aggregate_state_max_bytes = 64ULL * 1024 * 1024;
 };
 
 struct LuxirConfig {

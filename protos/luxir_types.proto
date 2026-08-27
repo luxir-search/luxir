@@ -78,6 +78,7 @@ message SearchOp {
     FieldFacet field_facet = 8;
     RangeFacet range_facet = 9;
     GenOp gen_op = 15;
+    ExprOp expr_op = 16;
     // future: something like terms component... stream out all terms of one or more (or all) fields
   }
 }
@@ -86,6 +87,13 @@ message SearchOp {
 message GenOp {
   string name = 1;       // the name of the operation
   repeated Val args = 2; // arguments to the operation
+}
+
+// An expression aggregate over the operation's incoming document domain.
+// The operation name is the key in the enclosing ops map.
+message ExprOp {
+  string expr = 1;
+  map<string, Val> vars = 2;
 }
 
 // Placement preference for returned document fields: dense columns

@@ -9,6 +9,7 @@
 namespace luxir {
 
 class BoundValueProgram;
+struct BucketScalar;
 struct ValueNode;
 
 enum class ValueOpcode : uint8_t {
@@ -56,6 +57,9 @@ struct ValueFunction {
                                           std::span<const ValueBounds> args);
   using EvalElement = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
                                       const ValueArrayRef& array, int64_t index);
+  using EvalBucketScalar = BucketScalar (*)(
+      std::span<const BucketScalar> args, ValueType type,
+      ValueNature nature);
 
   ValueOpcode opcode = ValueOpcode::NONE;
   std::string_view name;
@@ -67,8 +71,12 @@ struct ValueFunction {
   uint8_t minArity = 0;
   uint8_t maxArity = 0;
   uint8_t capabilities = functionCapabilities(FunctionCapability::DOCUMENT_VALUE);
+  EvalBucketScalar evalBucketScalar = nullptr;
 
   bool supports(FunctionCapability capability) const {
+    if (capability == FunctionCapability::BUCKET_SCALAR) {
+      return evalBucketScalar != nullptr;
+    }
     return (capabilities & (uint8_t)capability) != 0;
   }
 };

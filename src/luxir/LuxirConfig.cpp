@@ -145,6 +145,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Max nesting depth of search operations in one request")
       ->default_val(search.max_op_depth)
       ->check(CLI::PositiveNumber);
+  app.add_option("--search.facet-aggregate-state-max-bytes",
+                 search.facet_aggregate_state_max_bytes,
+                 "Request-wide byte ceiling for facet aggregate state (0 = unlimited)")
+      ->default_val(search.facet_aggregate_state_max_bytes)
+      ->check(CLI::NonNegativeNumber);
 }
 
 void LuxirConfig::resolveRamBudgets() {

@@ -329,6 +329,42 @@ TEST(JsonDialect, ExprQueryStringAndObjectForms) {
   EXPECT_EQ(out, R"({"expr":{"q":"status:active"}})");
 }
 
+TEST(JsonDialect, ExprOpStringAndObjectForms) {
+  std::pmr::monotonic_buffer_resource mr;
+
+  P::SearchOp bare;
+  ASSERT_TRUE(P::read_json(bare, R"json("avg(price_i)")json", mr));
+  ASSERT_TRUE(std::holds_alternative<P::ExprOp>(bare.kind));
+  EXPECT_EQ("avg(price_i)", std::get<P::ExprOp>(bare.kind).expr);
+
+  P::SearchOp arm;
+  ASSERT_TRUE(P::read_json(
+      arm, R"json({"expr_op":"sum(price_i) / $scale"})json", mr));
+  ASSERT_TRUE(std::holds_alternative<P::ExprOp>(arm.kind));
+  EXPECT_EQ("sum(price_i) / $scale", std::get<P::ExprOp>(arm.kind).expr);
+
+  P::SearchOp object;
+  ASSERT_TRUE(P::read_json(
+      object,
+      R"json({"expr_op":{"expr":"sum(price_i) * $scale","vars":{"scale":2}}})json",
+      mr));
+  const auto& expr = std::get<P::ExprOp>(object.kind);
+  const auto* scale = expr.vars.find("scale");
+  ASSERT_NE(nullptr, scale);
+  EXPECT_EQ(2, (**scale).asInt());
+
+  P::SearchRequest request;
+  ASSERT_TRUE(P::read_json(
+      request, R"json({"ops":{"metric":"avg(price_i)"}})json", mr));
+  ASSERT_NE(nullptr, request.ops.find("metric"));
+  EXPECT_EQ("avg(price_i)",
+            std::get<P::ExprOp>((**request.ops.find("metric")).kind).expr);
+
+  std::string out;
+  ASSERT_TRUE(P::write_json(bare, out));
+  EXPECT_EQ(R"json({"expr_op":{"expr":"avg(price_i)"}})json", out);
+}
+
 TEST(JsonDialect, SortSpecFieldAlias) {
   std::pmr::monotonic_buffer_resource mr;
   P::SortSpec sort;

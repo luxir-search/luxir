@@ -29,6 +29,15 @@ inline bool disableFieldSortBulk = false;
 // force bucket chunking.
 inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 
+// Test override for the range-facet result-child state chunk. Zero selects the
+// production ceiling. The optional counter observes opened blocks.
+inline std::size_t forcedRangeFacetBindingStateChunkBytes = 0;
+inline std::size_t* rangeFacetBindingBlockCounter = nullptr;
+
+// Test override for the request-wide facet aggregate-state ceiling. Zero uses
+// LuxirConfig.
+inline std::size_t forcedFacetAggregateStateByteBudget = 0;
+
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key
 // bounds and the request needs no exact count or domain.

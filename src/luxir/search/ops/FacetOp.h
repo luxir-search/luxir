@@ -452,6 +452,7 @@ public:
 class IntFacetRangeReq : public FacetReq {
   static constexpr size_t BUCKET_BUILDER_FIXED_BYTES = 128;
   static constexpr size_t BUCKET_DOMAIN_BYTE_BUDGET = 64 * 1024 * 1024;
+  static constexpr size_t BINDING_STATE_CHUNK_BYTES = 64 * 1024 * 1024;
   std::span<const int64_t> fences;
   int64_t affineGap;
   FieldType::Type valueType;
@@ -654,9 +655,11 @@ public:
       executeResultChildren(merged, emitted);
     }
 
-    // Post-selection sub-op execution keeps every bucket/child binding alive
-    // while feeding one segment at a time. Within a segment, bucket chunks cap
-    // the simultaneous worst-case bitset footprint.
+    // Post-selection sub-op execution sizes each bucket block from the child
+    // plans' retained bytes, feeds every segment, and destroys the bindings
+    // before opening the next block. Stateless and small children retain the
+    // old one-pass shape. Within a segment, the domain-builder byte budget may
+    // split that block further.
     void executeResultChildren(const MergeableRangeFacet& merged,
                                std::span<const size_t> emitted) {
       if (thisOp().subOps.empty() || emitted.empty()) return;
@@ -680,43 +683,72 @@ public:
         children.push_back(child);
       }
 
-      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings;
-      bindings.reserve(buckets.size() * children.size());
-      for (const auto& bucket : buckets) {
-        assert(bucket.output.value >= 0);
-        assert(bucket.output.value < (int32_t)buckets.size());
-        for (SearchOp* child : children) {
-          bindings.emplace_back(child->createCalculator(
-              this, bucket.output.value, (int64_t)buckets.size()));
+      size_t residentBytesPerBucket = 0;
+      for (SearchOp* child : children) {
+        size_t childBytes = child->facetBucketResidentBytes();
+        if (childBytes > std::numeric_limits<size_t>::max()
+                             - residentBytesPerBucket) {
+          residentBytesPerBucket = std::numeric_limits<size_t>::max();
+          break;
         }
+        residentBytesPerBucket += childBytes;
       }
+      size_t stateChunkBytes = forcedRangeFacetBindingStateChunkBytes != 0
+          ? forcedRangeFacetBindingStateChunkBytes
+          : BINDING_STATE_CHUNK_BYTES;
+      size_t bindingBlockSize = std::max<size_t>(
+          1, stateChunkBytes / std::max<size_t>(1, residentBytesPerBucket));
 
-      if (input.empty()) {
-        std::span<const DomainHandle> noDomains;
-        for (auto& binding : bindings) binding->calcAll(nullptr, noDomains);
-        return;
-      }
+      for (size_t blockBegin = 0; blockBegin < buckets.size();
+           blockBegin += bindingBlockSize) {
+        if (rangeFacetBindingBlockCounter != nullptr) {
+          (*rangeFacetBindingBlockCounter)++;
+        }
+        size_t blockSize = std::min(
+            bindingBlockSize, buckets.size() - blockBegin);
+        auto block = std::span<const SelectedFacetBucket<int64_t>>(buckets)
+                         .subspan(blockBegin, blockSize);
 
-      for (size_t segnum = 0; segnum < input.size(); segnum++) {
-        int32_t maxDoc =
-            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
-        size_t builderBytes = (size_t)(((uint64_t)maxDoc + 63) / 64) * 8
-                            + BUCKET_BUILDER_FIXED_BYTES;
-        size_t byteBudget = forcedRangeFacetBucketDomainByteBudget != 0
-            ? forcedRangeFacetBucketDomainByteBudget
-            : BUCKET_DOMAIN_BYTE_BUDGET;
-        size_t bucketsPerChunk = std::max<size_t>(
-            1, byteBudget / builderBytes);
-        for (size_t begin = 0; begin < buckets.size();
-             begin += bucketsPerChunk) {
-          size_t chunkSize = std::min(bucketsPerChunk, buckets.size() - begin);
-          auto chunk = std::span<const SelectedFacetBucket<int64_t>>(buckets)
-                           .subspan(begin, chunkSize);
-          std::vector<DomainHandle> domains = bucketDomains(segnum, chunk);
-          for (size_t bucket = 0; bucket < chunkSize; bucket++) {
-            for (size_t child = 0; child < children.size(); child++) {
-              bindings[(begin + bucket) * children.size() + child]->calc(
-                  nullptr, (int32_t)segnum, domains[bucket]);
+        std::vector<std::unique_ptr<SearchOp::Calculator>> bindings;
+        bindings.reserve(blockSize * children.size());
+        for (const auto& bucket : block) {
+          assert(bucket.output.value >= 0);
+          assert(bucket.output.value < (int32_t)buckets.size());
+          for (SearchOp* child : children) {
+            bindings.emplace_back(child->createCalculator(
+                this, bucket.output.value, (int64_t)buckets.size()));
+          }
+        }
+
+        if (input.empty()) {
+          std::span<const DomainHandle> noDomains;
+          for (auto& binding : bindings) {
+            binding->calcAll(nullptr, noDomains);
+          }
+          continue;
+        }
+
+        for (size_t segnum = 0; segnum < input.size(); segnum++) {
+          int32_t maxDoc =
+              thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+          size_t builderBytes = (size_t)(((uint64_t)maxDoc + 63) / 64) * 8
+                              + BUCKET_BUILDER_FIXED_BYTES;
+          size_t byteBudget = forcedRangeFacetBucketDomainByteBudget != 0
+              ? forcedRangeFacetBucketDomainByteBudget
+              : BUCKET_DOMAIN_BYTE_BUDGET;
+          size_t bucketsPerChunk = std::max<size_t>(
+              1, byteBudget / builderBytes);
+          for (size_t chunkBegin = 0; chunkBegin < block.size();
+               chunkBegin += bucketsPerChunk) {
+            size_t chunkSize = std::min(
+                bucketsPerChunk, block.size() - chunkBegin);
+            auto chunk = block.subspan(chunkBegin, chunkSize);
+            std::vector<DomainHandle> domains = bucketDomains(segnum, chunk);
+            for (size_t bucket = 0; bucket < chunkSize; bucket++) {
+              for (size_t child = 0; child < children.size(); child++) {
+                bindings[(chunkBegin + bucket) * children.size() + child]
+                    ->calc(nullptr, (int32_t)segnum, domains[bucket]);
+              }
             }
           }
         }

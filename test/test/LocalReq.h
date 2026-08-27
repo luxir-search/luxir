@@ -51,6 +51,10 @@ public:
   OpCursor& min(std::string_view name, std::string_view field);         // GenOp "min"
   OpCursor& max(std::string_view name, std::string_view field);         // GenOp "max"
   OpCursor& stats(std::string_view name, std::string_view field);       // GenOp "stats"
+  OpCursor& expr(std::string_view name, std::string_view expression);   // ExprOp leaf
+  template <typename T>
+  OpCursor& expr(std::string_view name, std::string_view expression,
+                 std::string_view varName, T value);                    // ExprOp + one var
 
   // --- configure a TopDocs/Fusion op (assert kind) ---
   OpCursor& allQuery();
@@ -171,6 +175,14 @@ public:
   OpCursor& facet(std::string_view name, std::string_view field) { return rootCursor_.facet(name, field); }
   OpCursor& rangeFacet(std::string_view name, std::string_view field) { return rootCursor_.rangeFacet(name, field); }
   OpCursor& avg(std::string_view name, std::string_view field) { return rootCursor_.avg(name, field); }
+  OpCursor& expr(std::string_view name, std::string_view expression) {
+    return rootCursor_.expr(name, expression);
+  }
+  template <typename T>
+  OpCursor& expr(std::string_view name, std::string_view expression,
+                 std::string_view varName, T value) {
+    return rootCursor_.expr(name, expression, varName, value);
+  }
   OpCursor& sum(std::string_view name, std::string_view field) { return rootCursor_.sum(name, field); }
   OpCursor& min(std::string_view name, std::string_view field) { return rootCursor_.min(name, field); }
   OpCursor& max(std::string_view name, std::string_view field) { return rootCursor_.max(name, field); }
@@ -462,6 +474,28 @@ inline OpCursor& OpCursor::max(std::string_view name, std::string_view field) {
 }
 inline OpCursor& OpCursor::stats(std::string_view name, std::string_view field) {
   return genOpHelper(name, "stats", field);
+}
+inline OpCursor& OpCursor::expr(std::string_view name,
+                                std::string_view expression) {
+  auto* sub = req_->arenaNew<luxir::api::SearchOp>();
+  req_->appendOp(*subOps_, name, sub);
+  auto& expr = sub->kind.emplace<luxir::api::ExprOp>();
+  expr.expr = build::arenaStr(req_->mr, expression);
+  return *this;
+}
+template <typename T>
+inline OpCursor& OpCursor::expr(std::string_view name,
+                                std::string_view expression,
+                                std::string_view varName, T value) {
+  static_assert(std::is_same_v<T, int64_t> || std::is_same_v<T, double>);
+  auto* sub = req_->arenaNew<luxir::api::SearchOp>();
+  req_->appendOp(*subOps_, name, sub);
+  auto& expr = sub->kind.emplace<luxir::api::ExprOp>();
+  expr.expr = build::arenaStr(req_->mr, expression);
+  auto* variable = build::mapSlot<luxir::api::Val>(
+      expr.vars, 1, varName, req_->mr);
+  variable->kind = value;
+  return *this;
 }
 inline OpCursor& OpCursor::genOpHelper(std::string_view name, std::string_view fn, std::string_view field) {
   auto* sub = req_->arenaNew<luxir::api::SearchOp>();

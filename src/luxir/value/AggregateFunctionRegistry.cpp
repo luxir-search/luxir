@@ -3,23 +3,22 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
+
+#include "luxir/util/NumericUtils.h"
 
 namespace luxir {
 namespace {
 
 template <class State>
 State loadState(const void* source) {
-  State state;
-  std::memcpy(&state, source, sizeof(state));
-  return state;
+  return loadUnaligned<State>(source);
 }
 
 template <class State>
 void storeState(void* target, const State& state) {
-  std::memcpy(target, &state, sizeof(state));
+  storeUnaligned<State>(target, state);
 }
 
 struct IntSumState {

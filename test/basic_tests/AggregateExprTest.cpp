@@ -7,10 +7,12 @@
 #include <vector>
 
 #include "luxir/search/ops/ExprStatsOp.h"
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/value/AggregateExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/QueryBuild.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -22,6 +24,25 @@ class ArenaOwner {
 public:
   google::protobuf::Arena* arena = createArena();
   ~ArenaOwner() { releaseArena(arena); }
+};
+
+class FacetAggregateOverrideGuard {
+  FacetFeedStrategy feed = forcedFacetFeedStrategy;
+  FacetSubOpInlineMode inlineMode = forcedFacetSubOpInline;
+  size_t aggregateBudget = forcedFacetAggregateStateByteBudget;
+  size_t rangeDomainBudget = forcedRangeFacetBucketDomainByteBudget;
+  size_t rangeStateChunk = forcedRangeFacetBindingStateChunkBytes;
+  size_t* rangeBlockCounter = rangeFacetBindingBlockCounter;
+
+public:
+  ~FacetAggregateOverrideGuard() {
+    forcedFacetFeedStrategy = feed;
+    forcedFacetSubOpInline = inlineMode;
+    forcedFacetAggregateStateByteBudget = aggregateBudget;
+    forcedRangeFacetBucketDomainByteBudget = rangeDomainBudget;
+    forcedRangeFacetBindingStateChunkBytes = rangeStateChunk;
+    rangeFacetBindingBlockCounter = rangeBlockCounter;
+  }
 };
 
 AggregateProgram* parseAggregate(ArenaOwner& memory, Schema& schema,
@@ -99,6 +120,26 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   expectParseError(memory, *schema, "avg(prices_is)",
                    "avg(...), min(...), or max(...)");
   expectParseError(memory, *schema, "price_i", "must be an aggregate call");
+  expectParseError(memory, *schema, "1",
+                   "expression contains no aggregate function");
+  api::Val constantVar;
+  constantVar.kind = int64_t{2};
+  using ConstantPair = std::pair<
+      std::string_view, ::hpp_proto::indirect_view<api::Val>>;
+  std::array<ConstantPair, 1> constantPairs{{{"scale", {&constantVar}}}};
+  AggregateExprOptions constantOptions{
+      schema.get(),
+      api::map_view<std::string_view,
+                    ::hpp_proto::indirect_view<api::Val>>{constantPairs},
+      "constant"};
+  try {
+    AggregateExprParser(constantOptions, *memory.arena).parse("$scale");
+    FAIL() << "expected aggregate-free variable expression to fail";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string(error.what()).find(
+                  "expression contains no aggregate function"),
+              std::string::npos) << error.what();
+  }
   expectParseError(memory, *schema, "sum()", "expects exactly 1 argument");
   expectParseError(memory, *schema, "sum(price_i + * 2)", "byte 14");
   expectParseError(memory, *schema, "min(sum(price_i), 2)",
@@ -294,6 +335,23 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
     EXPECT_NE(nullptr, state.merge) << function.name;
     EXPECT_NE(nullptr, state.finish) << function.name;
   }
+  for (const ValueFunction& function : ValueFunctionRegistry::entries()) {
+    EXPECT_EQ(function.evalBucketScalar != nullptr,
+              function.supports(FunctionCapability::BUCKET_SCALAR))
+        << function.name;
+  }
+  for (std::string_view name : {
+           "add", "sub", "mul", "div", "neg", "abs", "sqrt", "log",
+           "log1p", "floor"}) {
+    const ValueFunction* function = ValueFunctionRegistry::find(name);
+    ASSERT_NE(nullptr, function) << name;
+    EXPECT_NE(nullptr, function->evalBucketScalar) << name;
+  }
+  for (std::string_view name : {"def", "min", "max", "avg"}) {
+    const ValueFunction* function = ValueFunctionRegistry::find(name);
+    ASSERT_NE(nullptr, function) << name;
+    EXPECT_EQ(nullptr, function->evalBucketScalar) << name;
+  }
 }
 
 TEST_F(AggregateExprTest, dataFailuresMergeAndFinishAsNull) {
@@ -387,4 +445,263 @@ TEST_F(AggregateExprTest, runtimeWarningsAreThreadSafeAndDeduplicated) {
   ASSERT_EQ(1u, req->respWarnings().size());
   EXPECT_EQ("aggregate_eval_failed", req->respWarnings()[0].code);
   EXPECT_EQ(message, req->respWarnings()[0].message);
+}
+
+TEST_F(AggregateExprTest, exprOpExecutesOverRootDomain) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "a", "price_i", 10), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "b", "price_i", 20), UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").expr(
+      "revenue", "sum(price_i * $scale)", "scale", int64_t{2});
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(60, req->scalar<int64_t>("revenue"));
+}
+
+TEST_F(AggregateExprTest, stringFacetInlineSortsExprMetricByOpName) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "cat_s", "a", "price_i", 10,
+                       "qty_i", 2), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "b", "price_i", 30,
+                       "qty_i", 1), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "3", "cat_s", "a", "price_i", 20,
+                       "qty_i", 1), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "cat_s", "c", "price_i", 99),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("categories", "cat_s").limit(3);
+  facet.expr("weighted", "sum(price_i * qty_i) / sum(qty_i)");
+  qb::sort(facet, "weighted", qb::DESC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* result = req->responses[0]->proto.ops.at("categories")->facetResult();
+  ASSERT_NE(nullptr, result);
+  const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+  ASSERT_EQ(3u, ids.size());
+  EXPECT_EQ("b", ids[0]);
+  EXPECT_EQ("a", ids[1]);
+  EXPECT_EQ("c", ids[2]);
+  const auto& values = std::get<api::ArrVal>(result->ops.at("weighted")->kind).v;
+  ASSERT_EQ(3u, values.size());
+  EXPECT_DOUBLE_EQ(30.0, values[0].asDouble());
+  EXPECT_DOUBLE_EQ(40.0 / 3.0, values[1].asDouble());
+  EXPECT_TRUE(values[2].isNull());
+  EXPECT_EQ(0u, req->facetAggregateStateBytes.load());
+
+  auto asc = localReq(helper.getSearchEngine());
+  auto& ascFacet = asc->collection("main")
+      .facet("categories", "cat_s").limit(3);
+  ascFacet.expr("weighted", "sum(price_i * qty_i) / sum(qty_i)");
+  qb::sort(ascFacet, "weighted", qb::ASC);
+  asc->execute(false);
+  ASSERT_TRUE(asc->ok()) << asc->errorMsg();
+  const auto* ascResult =
+      asc->responses[0]->proto.ops.at("categories")->facetResult();
+  ASSERT_NE(nullptr, ascResult);
+  const auto& ascIds = std::get<api::ColStr>(ascResult->bucket_ids->kind).v;
+  ASSERT_EQ(3u, ascIds.size());
+  EXPECT_EQ("a", ascIds[0]);
+  EXPECT_EQ("b", ascIds[1]);
+  EXPECT_EQ("c", ascIds[2]);
+}
+
+TEST_F(AggregateExprTest, stringFacetInlineEmitsNullAndWarningOnFailure) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "cat_s", "bad", "x_i", -1),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "ok", "x_i", 4),
+               UpdateMessage::COMMIT);
+
+  FacetAggregateOverrideGuard guard;
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
+  facet.expr("root", "sqrt(sum(x_i))");
+  facet.expr("missing", "sum(absent_i)");
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(nullptr, result);
+  const auto& roots = std::get<api::ArrVal>(result->ops.at("root")->kind).v;
+  const auto& missing = std::get<api::ArrVal>(result->ops.at("missing")->kind).v;
+  ASSERT_EQ(2u, roots.size());
+  EXPECT_TRUE(roots[0].isNull());
+  EXPECT_DOUBLE_EQ(2.0, roots[1].asDouble());
+  EXPECT_TRUE(missing[0].isNull());
+  EXPECT_TRUE(missing[1].isNull());
+  ASSERT_EQ(1u, req->respWarnings().size());
+  EXPECT_EQ("aggregate_eval_failed", req->respWarnings()[0].code);
+  EXPECT_NE(std::string(req->respWarnings()[0].message).find("aggregate op 'root'"),
+            std::string::npos);
+}
+
+TEST_F(AggregateExprTest, selectedStringBucketDomainsUseOrdinaryCalculator) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "cat_s", "a", "x_i", 10),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "a", "x_i", 20),
+               UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "3", "cat_s", "b", "x_i", 30),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "cat_s", "c", "x_i", 100),
+               UpdateMessage::COMMIT);
+
+  FacetAggregateOverrideGuard guard;
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
+  forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
+  facet.expr("metric", "avg(x_i)");
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(nullptr, result);
+  const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+  const auto& values = std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+  ASSERT_EQ(2u, ids.size());
+  EXPECT_EQ("a", ids[0]);
+  EXPECT_EQ("b", ids[1]);
+  EXPECT_DOUBLE_EQ(15.0, values[0].asDouble());
+  EXPECT_DOUBLE_EQ(30.0, values[1].asDouble());
+}
+
+TEST_F(AggregateExprTest, forcedStringReplayMatchesBucketDomains) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "parent_ss", vecs("a", "b"),
+                       "x_i", 10, "qty_i", 2), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "parent_ss", vecs("a"),
+                       "x_i", 20, "qty_i", 1), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "3", "parent_ss", vecs("b", "c"),
+                       "x_i", 30, "qty_i", 3), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "parent_ss", vecs("c"),
+                       "x_i", 40, "qty_i", 4), UpdateMessage::COMMIT);
+
+  FacetAggregateOverrideGuard guard;
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
+  auto run = [&](FacetFeedStrategy feed) {
+    forcedFacetFeedStrategy = feed;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").facet("f", "parent_ss").limit(2);
+    facet.expr("ratio", "sum(x_i) / sum(qty_i)");
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(0u, req->facetAggregateStateBytes.load());
+    std::vector<std::byte> encoded;
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    EXPECT_NE(nullptr, result);
+    if (result != nullptr) {
+      EXPECT_TRUE(api::encode(*result, encoded));
+    }
+    return encoded;
+  };
+
+  auto domains = run(FacetFeedStrategy::BUCKET_DOMAINS);
+  EXPECT_EQ(domains, run(FacetFeedStrategy::STRING_COLUMN_REPLAY));
+}
+
+TEST_F(AggregateExprTest, facetAggregateStateBudgetCoversInlineAndReplay) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "cat_s", "a", "x_i", 10),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "b", "x_i", 20),
+               UpdateMessage::COMMIT);
+
+  FacetAggregateOverrideGuard guard;
+  forcedFacetAggregateStateByteBudget = 1;
+  auto run = [&](bool replay) {
+    forcedFacetSubOpInline = replay ? FacetSubOpInlineMode::SORT_KEY_ONLY
+                                    : FacetSubOpInlineMode::ALL;
+    forcedFacetFeedStrategy = replay
+        ? FacetFeedStrategy::STRING_COLUMN_REPLAY
+        : FacetFeedStrategy::BUCKET_DOMAINS;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").facet("limited", "cat_s").limit(2);
+    facet.expr("metric", "sum(x_i)");
+    if (!replay) qb::sort(facet, "metric", qb::DESC);
+    req->execute(false);
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(req->errorMsg().find("facet 'limited' metric 'metric'"),
+              std::string::npos);
+    EXPECT_NE(req->errorMsg().find("estimate"), std::string::npos);
+    EXPECT_NE(req->errorMsg().find("limit of 1 bytes"), std::string::npos);
+  };
+  run(false);
+  run(true);
+}
+
+TEST_F(AggregateExprTest, facetAggregateStateBudgetComesFromNodeConfig) {
+  LuxirConfig config;
+  config.search.facet_aggregate_state_max_bytes = 1;
+  LuxirNode node(config);
+  CollectionHelper helper(node);
+  helper.index(flatdoc("id", "1", "cat_s", "a", "x_i", 10),
+               UpdateMessage::COMMIT);
+
+  FacetAggregateOverrideGuard guard;
+  forcedFacetAggregateStateByteBudget = 0;
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("configured", "cat_s").limit(1);
+  facet.expr("metric", "sum(x_i)");
+  req->execute(false);
+
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find("facet 'configured' metric 'metric'"),
+            std::string::npos);
+  EXPECT_NE(req->errorMsg().find("limit of 1 bytes"), std::string::npos);
+}
+
+TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
+  CollectionHelper helper;
+  for (int64_t i = 0; i < 70; i++) {
+    helper.index(flatdoc("id", std::to_string(i), "bucket_i", i,
+                         "x_i", i + 1),
+                 i == 34 || i == 69 ? UpdateMessage::COMMIT
+                                    : UpdateMessage::NO_COMMIT);
+  }
+
+  size_t blocks = 0;
+  FacetAggregateOverrideGuard guard;
+  forcedRangeFacetBucketDomainByteBudget = 1;
+  forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
+  rangeFacetBindingBlockCounter = &blocks;
+  auto run = [&](std::string_view expression, int64_t multiplier) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").rangeFacet("ranges", "bucket_i")
+        .range(0, 70, 1).mincount(0);
+    facet.expr("metric", expression);
+    req->execute(false);
+
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* result =
+        req->responses[0]->proto.ops.at("ranges")->facetResult();
+    EXPECT_NE(nullptr, result);
+    if (result != nullptr) {
+      const auto& values =
+          std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+      EXPECT_EQ(70u, values.size());
+      for (size_t i = 0; i < values.size(); i++) {
+        EXPECT_EQ(((int64_t)i + 1) * multiplier, values[i].asInt());
+      }
+    }
+  };
+
+  run("sum(x_i)", 1);
+  EXPECT_EQ(1u, blocks);
+
+  std::string heavyExpression;
+  for (int i = 0; i < 100; i++) {
+    if (!heavyExpression.empty()) heavyExpression += "+";
+    heavyExpression += "sum(x_i)";
+  }
+  blocks = 0;
+  run(heavyExpression, 100);
+  EXPECT_GT(blocks, 1u);
 }

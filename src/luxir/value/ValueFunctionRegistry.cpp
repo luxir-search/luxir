@@ -11,6 +11,7 @@
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/NumericUtils.h"
+#include "luxir/value/AggregateExpr.h"
 
 namespace luxir {
 namespace {
@@ -134,54 +135,263 @@ ValueResult promote(ValueResult value, ValueType type) {
   return value;
 }
 
-bool zeroScalar(const ValueResult& value) {
-  assert(value.valid && !valueArray(value.type));
+enum class ScalarKernelFailure : uint8_t {
+  NONE,
+  INTEGER_OVERFLOW,
+  NON_FINITE,
+};
+
+template <class Int>
+struct ScalarKernelValue {
+  bool valid = false;
+  bool floating = false;
+  ScalarKernelFailure failure = ScalarKernelFailure::NONE;
+  Int intValue = 0;
+  double doubleValue = 0.0;
+};
+
+template <class Int>
+ScalarKernelValue<Int> integerKernelValue(Int value) {
+  ScalarKernelValue<Int> result;
+  result.valid = true;
+  result.intValue = value;
+  return result;
+}
+
+template <class Int>
+ScalarKernelValue<Int> floatingKernelValue(double value) {
+  ScalarKernelValue<Int> result;
+  result.valid = true;
+  result.floating = true;
+  result.doubleValue = value;
+  return result;
+}
+
+template <class Int>
+ScalarKernelValue<Int> failedKernelValue(ScalarKernelFailure failure,
+                                         bool floating) {
+  ScalarKernelValue<Int> result;
+  result.floating = floating;
+  result.failure = failure;
+  return result;
+}
+
+template <class Int>
+double kernelDouble(const ScalarKernelValue<Int>& value) {
+  return value.floating ? value.doubleValue : (double)value.intValue;
+}
+
+template <class Int>
+ScalarKernelValue<Int> evalUnaryKernel(
+    ValueOpcode opcode, const ScalarKernelValue<Int>& input,
+    bool outputDouble) {
+  if (!input.valid) return {};
+  if (outputDouble) {
+    double value = kernelDouble(input);
+    double output = 0.0;
+    switch (opcode) {
+      case ValueOpcode::NEG: output = -value; break;
+      case ValueOpcode::ABS: output = std::abs(value); break;
+      case ValueOpcode::SQRT: output = std::sqrt(value); break;
+      case ValueOpcode::LOG: output = std::log(value); break;
+      case ValueOpcode::LOG1P: output = std::log1p(value); break;
+      case ValueOpcode::FLOOR: output = std::floor(value); break;
+      case ValueOpcode::NONE:
+      case ValueOpcode::DEF:
+      case ValueOpcode::ADD:
+      case ValueOpcode::SUB:
+      case ValueOpcode::MUL:
+      case ValueOpcode::DIV:
+      case ValueOpcode::MIN:
+      case ValueOpcode::MAX:
+      case ValueOpcode::AVG:
+        throw std::logic_error("invalid unary ValueExpr opcode");
+    }
+    if (!std::isfinite(output)) {
+      return failedKernelValue<Int>(ScalarKernelFailure::NON_FINITE, true);
+    }
+    return floatingKernelValue<Int>(output);
+  }
+
+  Int output = 0;
+  bool overflow = false;
+  switch (opcode) {
+    case ValueOpcode::NEG:
+      overflow = __builtin_sub_overflow((Int)0, input.intValue, &output);
+      break;
+    case ValueOpcode::ABS:
+      if (input.intValue >= 0) return integerKernelValue(input.intValue);
+      overflow = __builtin_sub_overflow((Int)0, input.intValue, &output);
+      break;
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::ADD:
+    case ValueOpcode::SUB:
+    case ValueOpcode::MUL:
+    case ValueOpcode::DIV:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::MIN:
+    case ValueOpcode::MAX:
+    case ValueOpcode::AVG:
+      throw std::logic_error("invalid integer unary ValueExpr opcode");
+  }
+  return overflow
+      ? failedKernelValue<Int>(ScalarKernelFailure::INTEGER_OVERFLOW, false)
+      : integerKernelValue(output);
+}
+
+template <class Int>
+ScalarKernelValue<Int> evalBinaryKernel(
+    ValueOpcode opcode, const ScalarKernelValue<Int>& left,
+    const ScalarKernelValue<Int>& right, bool outputDouble) {
+  if (!left.valid || !right.valid) return {};
+  if (outputDouble) {
+    double a = kernelDouble(left);
+    double b = kernelDouble(right);
+    if (opcode == ValueOpcode::DIV && b == 0.0) return {};
+    double output = 0.0;
+    switch (opcode) {
+      case ValueOpcode::ADD: output = a + b; break;
+      case ValueOpcode::SUB: output = a - b; break;
+      case ValueOpcode::MUL: output = a * b; break;
+      case ValueOpcode::DIV: output = a / b; break;
+      case ValueOpcode::MIN: output = std::min(a, b); break;
+      case ValueOpcode::MAX: output = std::max(a, b); break;
+      case ValueOpcode::NONE:
+      case ValueOpcode::DEF:
+      case ValueOpcode::NEG:
+      case ValueOpcode::ABS:
+      case ValueOpcode::SQRT:
+      case ValueOpcode::LOG:
+      case ValueOpcode::LOG1P:
+      case ValueOpcode::FLOOR:
+      case ValueOpcode::AVG:
+        throw std::logic_error("invalid binary ValueExpr opcode");
+    }
+    if (!std::isfinite(output)) {
+      return failedKernelValue<Int>(ScalarKernelFailure::NON_FINITE, true);
+    }
+    return floatingKernelValue<Int>(output);
+  }
+
+  Int output = 0;
+  bool overflow = false;
+  switch (opcode) {
+    case ValueOpcode::ADD:
+      overflow = __builtin_add_overflow(left.intValue, right.intValue,
+                                        &output);
+      break;
+    case ValueOpcode::SUB:
+      overflow = __builtin_sub_overflow(left.intValue, right.intValue,
+                                        &output);
+      break;
+    case ValueOpcode::MUL:
+      overflow = __builtin_mul_overflow(left.intValue, right.intValue,
+                                        &output);
+      break;
+    case ValueOpcode::MIN:
+      output = std::min(left.intValue, right.intValue);
+      break;
+    case ValueOpcode::MAX:
+      output = std::max(left.intValue, right.intValue);
+      break;
+    case ValueOpcode::NONE:
+    case ValueOpcode::DEF:
+    case ValueOpcode::DIV:
+    case ValueOpcode::NEG:
+    case ValueOpcode::ABS:
+    case ValueOpcode::SQRT:
+    case ValueOpcode::LOG:
+    case ValueOpcode::LOG1P:
+    case ValueOpcode::FLOOR:
+    case ValueOpcode::AVG:
+      throw std::logic_error("invalid integer binary ValueExpr opcode");
+  }
+  return overflow
+      ? failedKernelValue<Int>(ScalarKernelFailure::INTEGER_OVERFLOW, false)
+      : integerKernelValue(output);
+}
+
+ScalarKernelValue<int64_t> kernelValue(const ValueResult& value) {
+  if (!value.valid) return {};
   return value.type == ValueType::DOUBLE
-      ? value.doubleValue == 0.0 : value.intValue == 0;
+      ? floatingKernelValue<int64_t>(value.doubleValue)
+      : integerKernelValue<int64_t>(value.intValue);
 }
 
 ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResult right,
                              int32_t docid) {
-  if (!left.valid || !right.valid) return ValueResult::missing(node.type);
-  bool floating = node.type == ValueType::DOUBLE;
-  if (floating) {
-    double a = left.type == ValueType::DOUBLE ? left.doubleValue : (double)left.intValue;
-    double b = right.type == ValueType::DOUBLE ? right.doubleValue : (double)right.intValue;
-    if (node.opcode == ValueOpcode::DIV && b == 0.0) {
-      return ValueResult::missing(node.type);
-    }
-    double out;
-    switch (node.opcode) {
-      case ValueOpcode::ADD: out = a + b; break;
-      case ValueOpcode::SUB: out = a - b; break;
-      case ValueOpcode::MUL: out = a * b; break;
-      case ValueOpcode::DIV: out = a / b; break;
-      case ValueOpcode::MIN: out = std::min(a, b); break;
-      case ValueOpcode::MAX: out = std::max(a, b); break;
-      default: throw std::runtime_error("invalid binary ValueExpr opcode");
-    }
-    if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
-    return ValueResult::floating(out);
+  ScalarKernelValue<int64_t> result = evalBinaryKernel(
+      node.opcode, kernelValue(left), kernelValue(right),
+      node.type == ValueType::DOUBLE);
+  if (result.failure == ScalarKernelFailure::INTEGER_OVERFLOW) {
+    runtimeInvalid(node, docid, "overflowed int64");
   }
+  if (result.failure == ScalarKernelFailure::NON_FINITE) {
+    runtimeInvalid(node, docid, "produced NaN or infinity");
+  }
+  if (!result.valid) return ValueResult::missing(node.type);
+  return result.floating ? ValueResult::floating(result.doubleValue)
+                         : ValueResult::integer(result.intValue);
+}
 
-  int64_t out = 0;
-  bool overflow = false;
-  switch (node.opcode) {
-    case ValueOpcode::ADD:
-      overflow = __builtin_add_overflow(left.intValue, right.intValue, &out);
-      break;
-    case ValueOpcode::SUB:
-      overflow = __builtin_sub_overflow(left.intValue, right.intValue, &out);
-      break;
-    case ValueOpcode::MUL:
-      overflow = __builtin_mul_overflow(left.intValue, right.intValue, &out);
-      break;
-    case ValueOpcode::MIN: out = std::min(left.intValue, right.intValue); break;
-    case ValueOpcode::MAX: out = std::max(left.intValue, right.intValue); break;
-    default: throw std::runtime_error("invalid binary ValueExpr opcode");
+ValueResult evalUnaryScalar(const ValueNode& node, ValueResult input,
+                            int32_t docid) {
+  ScalarKernelValue<int64_t> result = evalUnaryKernel(
+      node.opcode, kernelValue(input), node.type == ValueType::DOUBLE);
+  if (result.failure == ScalarKernelFailure::INTEGER_OVERFLOW) {
+    runtimeInvalid(node, docid, "overflowed int64");
   }
-  if (overflow) runtimeInvalid(node, docid, "overflowed int64");
-  return ValueResult::integer(out);
+  if (result.failure == ScalarKernelFailure::NON_FINITE) {
+    runtimeInvalid(node, docid, "produced NaN or infinity");
+  }
+  if (!result.valid) return ValueResult::missing(node.type);
+  return result.floating ? ValueResult::floating(result.doubleValue)
+                         : ValueResult::integer(result.intValue);
+}
+
+ScalarKernelValue<__int128> kernelValue(const BucketScalar& value) {
+  if (!value.valid) return {};
+  return value.type == BucketValueType::DOUBLE
+      ? floatingKernelValue<__int128>(value.doubleValue)
+      : integerKernelValue<__int128>(value.intValue);
+}
+
+template <ValueOpcode Opcode, size_t Arity>
+BucketScalar evalBucketOperation(
+    std::span<const BucketScalar> args, ValueType type, ValueNature nature) {
+  static_assert(Arity == 1 || Arity == 2);
+  assert(args.size() == Arity);
+  BucketValueType bucketType = type == ValueType::DOUBLE
+      ? BucketValueType::DOUBLE : BucketValueType::INT128;
+  for (const BucketScalar& arg : args) {
+    if (arg.failure != AggregateFailure::NONE) {
+      return BucketScalar::failed(bucketType, nature, arg.failure);
+    }
+  }
+  ScalarKernelValue<__int128> result;
+  if constexpr (Arity == 1) {
+    result = evalUnaryKernel(
+        Opcode, kernelValue(args[0]), type == ValueType::DOUBLE);
+  } else {
+    result = evalBinaryKernel(
+        Opcode, kernelValue(args[0]), kernelValue(args[1]),
+        type == ValueType::DOUBLE);
+  }
+  if (result.failure == ScalarKernelFailure::INTEGER_OVERFLOW) {
+    return BucketScalar::failed(bucketType, nature,
+                                AggregateFailure::INT128_OVERFLOW);
+  }
+  if (result.failure == ScalarKernelFailure::NON_FINITE) {
+    return BucketScalar::failed(bucketType, nature,
+                                AggregateFailure::NON_FINITE_EXPRESSION);
+  }
+  if (!result.valid) return BucketScalar::missing(bucketType, nature);
+  return result.floating ? BucketScalar::floating(result.doubleValue, nature)
+                         : BucketScalar::integer(result.intValue, nature);
 }
 
 bool unaryOpcode(ValueOpcode opcode) {
@@ -212,15 +422,16 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
     bool reducer = node.childCount == 1;
     if (reducer) {
       if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
-      ValueResult aggregate = program.evalArrayElement(first.array, 0);
+      ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
       long double sum = 0.0;
-      if (node.opcode == ValueOpcode::AVG) {
-        sum = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue : aggregate.intValue;
-      }
-      for (int64_t i = 1; i < first.array.size; i++) {
+      int64_t present = 0;
+      for (int64_t i = 0; i < first.array.size; i++) {
         ValueResult next = program.evalArrayElement(first.array, i);
+        if (!next.valid) continue;
         if (node.opcode == ValueOpcode::AVG) {
           sum += next.type == ValueType::DOUBLE ? next.doubleValue : next.intValue;
+        } else if (!aggregate.valid) {
+          aggregate = next;
         } else if (node.type == ValueType::DOUBLE) {
           double a = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue
                                                         : (double)aggregate.intValue;
@@ -232,9 +443,11 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
               ? std::min(aggregate.intValue, next.intValue)
               : std::max(aggregate.intValue, next.intValue);
         }
+        present++;
       }
+      if (present == 0) return ValueResult::missing(node.type);
       if (node.opcode == ValueOpcode::AVG) {
-        double out = (double)(sum / first.array.size);
+        double out = (double)(sum / present);
         if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
         return ValueResult::floating(out);
       }
@@ -248,44 +461,12 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
       return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
                                      docid, score, first.array.size);
     }
-    if (node.type == ValueType::INT64) {
-      if (first.intValue == std::numeric_limits<int64_t>::min()) {
-        runtimeInvalid(node, docid, "overflowed int64");
-      }
-      return ValueResult::integer(node.opcode == ValueOpcode::NEG
-                                      ? -first.intValue
-                                      : std::abs(first.intValue));
-    }
-    double input = first.type == ValueType::DOUBLE ? first.doubleValue : (double)first.intValue;
-    double out;
-    switch (node.opcode) {
-      case ValueOpcode::NEG: out = -input; break;
-      case ValueOpcode::ABS: out = std::abs(input); break;
-      case ValueOpcode::SQRT: out = std::sqrt(input); break;
-      case ValueOpcode::LOG: out = std::log(input); break;
-      case ValueOpcode::LOG1P: out = std::log1p(input); break;
-      case ValueOpcode::FLOOR: out = std::floor(input); break;
-      default: std::unreachable();
-    }
-    if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
-    return ValueResult::floating(out);
+    return evalUnaryScalar(node, first, docid);
   }
 
   ValueResult second = program.evalNode(node.children[1], docid, score);
   if (valueArray(node.type)) {
     if (!first.valid || !second.valid) return ValueResult::missing(node.type);
-    if (node.opcode == ValueOpcode::DIV) {
-      if (!valueArray(second.type)) {
-        if (zeroScalar(second)) return ValueResult::missing(node.type);
-      } else {
-        for (int64_t i = 0; i < second.array.size; i++) {
-          ValueResult denominator = program.evalArrayElement(second.array, i);
-          if (!denominator.valid || zeroScalar(denominator)) {
-            return ValueResult::missing(node.type);
-          }
-        }
-      }
-    }
     int64_t size = valueArray(first.type) ? first.array.size : second.array.size;
     return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
                                    docid, score, size);
@@ -316,27 +497,7 @@ ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& nod
   if (unaryOpcode(node.opcode)) {
     ValueNode scalar = node;
     scalar.type = valueScalarType(node.type);
-    if (scalar.type == ValueType::INT64) {
-      if (first.intValue == std::numeric_limits<int64_t>::min()) {
-        runtimeInvalid(node, array.docid, "overflowed int64");
-      }
-      return ValueResult::integer(node.opcode == ValueOpcode::NEG
-                                      ? -first.intValue
-                                      : std::abs(first.intValue));
-    }
-    double input = first.type == ValueType::DOUBLE ? first.doubleValue : (double)first.intValue;
-    double out;
-    switch (node.opcode) {
-      case ValueOpcode::NEG: out = -input; break;
-      case ValueOpcode::ABS: out = std::abs(input); break;
-      case ValueOpcode::SQRT: out = std::sqrt(input); break;
-      case ValueOpcode::LOG: out = std::log(input); break;
-      case ValueOpcode::LOG1P: out = std::log1p(input); break;
-      case ValueOpcode::FLOOR: out = std::floor(input); break;
-      default: std::unreachable();
-    }
-    if (!std::isfinite(out)) runtimeInvalid(node, array.docid, "produced NaN or infinity");
-    return ValueResult::floating(out);
+    return evalUnaryScalar(scalar, first, array.docid);
   }
   ValueResult second = operand(node.children[1]);
   ValueNode scalar = node;
@@ -645,38 +806,46 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
 }
 
 constexpr uint8_t DOC = functionCapabilities(FunctionCapability::DOCUMENT_VALUE);
-constexpr uint8_t DOC_BUCKET = functionCapabilities(
-    FunctionCapability::DOCUMENT_VALUE, FunctionCapability::BUCKET_SCALAR);
 
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, DOC},
+     propagateBounds, evalFunctionElement, 2, 2, DOC, nullptr},
     {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 2, 2, DOC,
+     evalBucketOperation<ValueOpcode::ADD, 2>},
     {ValueOpcode::SUB, "sub", subResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 2, 2, DOC,
+     evalBucketOperation<ValueOpcode::SUB, 2>},
     {ValueOpcode::MUL, "mul", mulResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 2, 2, DOC,
+     evalBucketOperation<ValueOpcode::MUL, 2>},
     {ValueOpcode::DIV, "div", divResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 2, 2, DOC,
+     evalBucketOperation<ValueOpcode::DIV, 2>},
     {ValueOpcode::NEG, "neg", unaryDemote, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 1, 1, DOC,
+     evalBucketOperation<ValueOpcode::NEG, 1>},
     {ValueOpcode::ABS, "abs", unaryDemote, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 1, 1, DOC,
+     evalBucketOperation<ValueOpcode::ABS, 1>},
     {ValueOpcode::SQRT, "sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 1, 1, DOC,
+     evalBucketOperation<ValueOpcode::SQRT, 1>},
     {ValueOpcode::LOG, "log", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 1, 1, DOC,
+     evalBucketOperation<ValueOpcode::LOG, 1>},
     {ValueOpcode::LOG1P, "log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 1, 1, DOC,
+     evalBucketOperation<ValueOpcode::LOG1P, 1>},
     {ValueOpcode::FLOOR, "floor", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC_BUCKET},
+     propagateBounds, evalFunctionElement, 1, 1, DOC,
+     evalBucketOperation<ValueOpcode::FLOOR, 1>},
     {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 2, DOC},
+     propagateBounds, evalFunctionElement, 1, 2, DOC, nullptr},
     {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 2, DOC},
+     propagateBounds, evalFunctionElement, 1, 2, DOC, nullptr},
     {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, DOC},
+     propagateBounds, evalFunctionElement, 1, 1, DOC, nullptr},
 };
 
 ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
