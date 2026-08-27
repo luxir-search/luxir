@@ -5,10 +5,13 @@
 #include <tbb/task_group.h>
 
 #include "bench/luxir_bench.h"
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/search/ops/FacetOp.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -192,6 +195,90 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
       state.iterations(), benchmark::Counter::kIsRate);
 }
 
+enum class AggregateFacetBenchMode {
+  BUCKET_DOMAIN,
+  INLINE_SORT,
+  INLINE_SORT_GENERIC
+};
+
+// A deliberately small corpus keeps these aggregate hot-path lanes useful in
+// routine --bench runs. BUCKET_DOMAIN measures the ordinary aggregate
+// calculator over selected facet domains; INLINE_SORT measures per-document
+// accumulation into the buckets whose metric participates in selection, and
+// INLINE_SORT_GENERIC keeps the same lane on the fallback state layout.
+static void BM_AggregateFacet(benchmark::State& state,
+                              AggregateFacetBenchMode mode) {
+  constexpr int64_t DOCS = 200'000;
+  constexpr std::string_view SHAPE = "9555";
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(DOCS, 10, SHAPE, docsPerSeg);
+  CollectionHelper helper;
+  bool reused = helper.indexMatchesShape(docsPerSeg);
+  if (!reused) buildBenchIndex(helper, DOCS, docsPerSeg);
+
+  SearchOverridesGuard guard(forcedFacetFeedStrategy,
+                              forcedFacetSubOpInline,
+                              inlineAggregateStatsForTests,
+                              disableDenseFacetStateForTests);
+  forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
+  forcedFacetSubOpInline = mode != AggregateFacetBenchMode::BUCKET_DOMAIN
+      ? FacetSubOpInlineMode::ALL
+      : FacetSubOpInlineMode::SORT_KEY_ONLY;
+  disableDenseFacetStateForTests =
+      mode == AggregateFacetBenchMode::INLINE_SORT_GENERIC;
+  InlineAggregateStats inlineStats;
+  inlineAggregateStatsForTests = mode != AggregateFacetBenchMode::BUCKET_DOMAIN
+      ? &inlineStats : nullptr;
+
+  int64_t fingerprint = -1;
+  for (auto _ : state) {
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    std::string_view facetField =
+        mode == AggregateFacetBenchMode::BUCKET_DOMAIN
+            ? "short_u10_s" : "short_u10k_s";
+    auto& facet = req->collection("main").facet("f", facetField).limit(10);
+    facet.expr("metric", "avg(u10k_i)");
+    if (mode != AggregateFacetBenchMode::BUCKET_DOMAIN) {
+      qb::sort(facet, "metric", qb::DESC);
+    }
+    req->execute(false);
+    if (!req->ok()) {
+      state.SkipWithError(req->errorMsg());
+      break;
+    }
+
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+    const auto& metrics =
+        std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+    int64_t current = 0;
+    for (size_t i = 0; i < ids.size(); i++) {
+      current = current * 31 + java_string_hashcode(ids[i]);
+      current = current * 31 + (int64_t)metrics[i].asDouble();
+    }
+    benchmark::DoNotOptimize(current);
+    if (fingerprint != -1) {
+      ASSERT_EQ(fingerprint, current);
+    }
+    fingerprint = current;
+  }
+  state.counters["docs"] = (double)DOCS;
+  state.counters["fp"] = fingerprint;
+  state.counters["reused"] = reused;
+  state.counters["rate"] = benchmark::Counter(
+      state.iterations(), benchmark::Counter::kIsRate);
+  if (mode != AggregateFacetBenchMode::BUCKET_DOMAIN) {
+    ASSERT_EQ(0, inlineStats.finalizedBytes.load());
+    ASSERT_EQ(81'256, inlineStats.peakFinalizedBytes.load());
+    ASSERT_EQ(mode == AggregateFacetBenchMode::INLINE_SORT ? 17 : 26,
+              inlineStats.stateBytesPerBucket.load());
+    state.counters["finalized_peak"] =
+        (double)inlineStats.peakFinalizedBytes.load();
+    state.counters["state_bytes"] =
+        (double)inlineStats.stateBytesPerBucket.load();
+  }
+}
+
 
 constexpr int32_t nDocs = 10'000'000;
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
@@ -259,3 +346,9 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s",
 
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, bucket_domain,
+                        AggregateFacetBenchMode::BUCKET_DOMAIN);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort,
+                        AggregateFacetBenchMode::INLINE_SORT);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_generic,
+                        AggregateFacetBenchMode::INLINE_SORT_GENERIC);

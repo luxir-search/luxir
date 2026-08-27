@@ -120,6 +120,35 @@ struct ValueResult {
   }
 };
 
+// Compact scalar-only transport for aggregate batches. The ValueType is fixed
+// by the resolved input program, so carrying the array reference and type tag
+// from ValueResult through every document only burns cache bandwidth.
+struct ScalarValueResult {
+  union {
+    int64_t intValue;
+    double doubleValue;
+  };
+  bool valid = false;
+
+  ScalarValueResult() : intValue(0) {}
+
+  static ScalarValueResult integer(int64_t value) {
+    ScalarValueResult out;
+    out.intValue = value;
+    out.valid = true;
+    return out;
+  }
+
+  static ScalarValueResult floating(double value) {
+    ScalarValueResult out;
+    out.doubleValue = value;
+    out.valid = true;
+    return out;
+  }
+};
+
+static_assert(sizeof(ScalarValueResult) == 16);
+
 // BOUNDED means both endpoints are proven. UNBOUNDED is lack of knowledge,
 // not a statement that the expression produces infinities. INVALID means the
 // interval proves that at least one present input produces NaN, infinity, a

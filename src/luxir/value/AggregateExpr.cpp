@@ -53,6 +53,23 @@ void AggregateStateView::add(uint32_t leafIndex, const ValueResult& value) {
   leaf.resolved.state.accumulate(leafState(leaf), value, leaf.arguments);
 }
 
+void AggregateStateView::addBatch(
+    uint32_t leafIndex, std::span<const ScalarValueResult> values) {
+  if (failed()) return;
+  const AggregateLeaf& leaf = program->leaves[leafIndex];
+  leaf.resolved.state.accumulateBatch(
+      leafState(leaf), values, leaf.arguments);
+}
+
+void AggregateStateView::addRawBatch(
+    uint32_t leafIndex, std::span<const int64_t> values,
+    FieldType::Type columnType) {
+  if (failed()) return;
+  const AggregateLeaf& leaf = program->leaves[leafIndex];
+  leaf.resolved.state.accumulateRawBatch(
+      leafState(leaf), values, columnType, leaf.arguments);
+}
+
 void AggregateStateView::fail(AggregateFailure reason) {
   if (!failed()) setFailure(reason);
 }
@@ -111,6 +128,22 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
   if (stateFailure != AggregateFailure::NONE) {
     return BucketScalar::failed(root.type, root.nature, stateFailure);
   }
+  auto validateOutput = [](BucketScalar result) {
+    if (result.valid && result.type == BucketValueType::INT128
+        && (result.intValue < std::numeric_limits<int64_t>::min()
+            || result.intValue > std::numeric_limits<int64_t>::max())) {
+      return BucketScalar::failed(result.type, result.nature,
+                                  AggregateFailure::INT64_OUTPUT_OVERFLOW);
+    }
+    return result;
+  };
+  if (root.kind == AggregateNodeKind::AGGREGATE) {
+    const AggregateLeaf& leaf = program->leaves[root.aggregate];
+    BucketScalar result = leaf.resolved.state.finish(
+        leafState(leaf), leaf.arguments);
+    result.nature = leaf.resolved.nature;
+    return validateOutput(result);
+  }
   scratch.aggregates.resize(program->leaves.size());
   for (size_t i = 0; i < program->leaves.size(); i++) {
     const AggregateLeaf& leaf = program->leaves[i];
@@ -120,13 +153,7 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
     scratch.aggregates[i] = value;
   }
   BucketScalar result = evaluate(scratch);
-  if (result.valid && result.type == BucketValueType::INT128
-      && (result.intValue < std::numeric_limits<int64_t>::min()
-          || result.intValue > std::numeric_limits<int64_t>::max())) {
-    return BucketScalar::failed(result.type, result.nature,
-                                AggregateFailure::INT64_OUTPUT_OVERFLOW);
-  }
-  return result;
+  return validateOutput(result);
 }
 
 BucketScalar AggregateStateView::finish() const {
@@ -141,6 +168,18 @@ AggregateAccumulator::AggregateAccumulator(const AggregateProgram& program)
 
 void AggregateAccumulator::add(uint32_t leafIndex, const ValueResult& value) {
   AggregateStateView(*program, states.data()).add(leafIndex, value);
+}
+
+void AggregateAccumulator::addBatch(
+    uint32_t leafIndex, std::span<const ScalarValueResult> values) {
+  AggregateStateView(*program, states.data()).addBatch(leafIndex, values);
+}
+
+void AggregateAccumulator::addRawBatch(
+    uint32_t leafIndex, std::span<const int64_t> values,
+    FieldType::Type columnType) {
+  AggregateStateView(*program, states.data()).addRawBatch(
+      leafIndex, values, columnType);
 }
 
 void AggregateAccumulator::fail(AggregateFailure reason) {
@@ -188,13 +227,31 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value) {
   target.kind.emplace<int64_t>((int64_t)value.intValue);
 }
 
-std::vector<BoundValueProgram*> bindAggregateInputs(
+std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
     IndexReader::Segment& segment) {
-  std::vector<BoundValueProgram*> bindings;
+  std::vector<BoundAggregateInput> bindings;
   bindings.reserve(program.leaves.size());
-  for (const AggregateLeaf& leaf : program.leaves) {
-    bindings.push_back(leaf.input->bind(pool, segment));
+  for (uint32_t index = 0; index < program.leaves.size(); index++) {
+    const AggregateLeaf& leaf = program.leaves[index];
+    const ValueNode& root = leaf.input->root();
+    BoundValueProgram* values = leaf.input->bind(pool, segment);
+    bool bareColumn = root.kind == ValueNodeKind::COLUMN
+        && !valueArray(root.type);
+    BoundValueNode& rootBinding = values->nodes[leaf.input->rootNode];
+    bindings.push_back({
+        .values = values,
+        .leaf = &leaf,
+        .columnIterator = bareColumn && rootBinding.bulkIterator
+            ? &*rootBinding.bulkIterator : nullptr,
+        .accumulateRawPoint = leaf.resolved.state.accumulateRawPoint,
+        .arguments = leaf.arguments,
+        .leafStateOffset = (uint32_t)sizeof(AggregateFailure)
+            + leaf.stateOffset,
+        .leafIndex = index,
+        .columnType = root.columnType,
+        .bareColumn = bareColumn
+    });
   }
   return bindings;
 }

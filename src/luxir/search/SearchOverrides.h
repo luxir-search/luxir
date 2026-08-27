@@ -41,6 +41,15 @@ inline std::size_t forcedRequestMemoryMaxBytes = 0;
 inline std::atomic<size_t>* facetAggregateStateReservationCounterForTests =
     nullptr;
 
+struct InlineAggregateStats {
+  std::atomic<size_t> finalizedBytes{0};
+  std::atomic<size_t> peakFinalizedBytes{0};
+  std::atomic<size_t> stateBytesPerBucket{0};
+};
+
+inline InlineAggregateStats* inlineAggregateStatsForTests = nullptr;
+inline bool disableDenseFacetStateForTests = false;
+
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key
 // bounds and the request needs no exact count or domain.

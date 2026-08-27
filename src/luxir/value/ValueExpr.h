@@ -84,10 +84,12 @@ public:
 struct BoundValueNode {
   std::optional<IntColReader> column;
   std::optional<IntColReader::SparseIterator> iterator;
+  std::optional<IntColReader::BulkIterator> bulkIterator;
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;
   int64_t valueEnd = 0;
+  int32_t bulkLastDoc = -1;
   bool cachedPresent = false;
 };
 
@@ -105,9 +107,16 @@ public:
                     IndexReader::Segment& segment);
 
   ValueResult evalPoint(int32_t docid, float score);
+  // Aggregate/facet scans call this with monotonically increasing document
+  // IDs, allowing a bare column to keep its bulk decoder hot.
+  ValueResult evalSequentialPoint(int32_t docid, float score);
+  bool evalSequentialInt64(int32_t docid, int64_t& value);
+  bool evalSequentialDouble(int32_t docid, double& value);
   ValueResult evalNode(uint32_t node, int32_t docid, float score);
   void evalBatch(std::span<const int32_t> docids, std::span<const float> scores,
                  std::span<ValueResult> results);
+  void evalScalarBatch(std::span<const int32_t> docids,
+                       std::span<ScalarValueResult> results);
   ValueResult evalArrayElement(const ValueArrayRef& array, int64_t index);
   const ValueBounds& bounds(uint32_t node) const { return nodes[node].bounds; }
   const ValueBounds& boundsForScore(const ValueBounds& scoreBounds);
@@ -118,6 +127,11 @@ public:
   int64_t arraySize(uint32_t node, int32_t docid, float score);
 
 private:
+  ValueResult evalColumnSequential(uint32_t node, int32_t docid,
+                                   float score);
+  bool readColumnSequential(uint32_t node, int32_t docid, int64_t& raw);
+  void evalColumnBatch(uint32_t node, std::span<const int32_t> docids,
+                       std::span<ValueResult> results);
   void propagateBounds(const ValueBounds& scoreBounds);
 };
 

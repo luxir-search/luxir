@@ -87,6 +87,16 @@ struct AggregateStateOps {
                         std::span<const AggregateConstant> arguments);
   using Accumulate = void (*)(void* state, const ValueResult& value,
                               std::span<const AggregateConstant> arguments);
+  using AccumulateBatch = void (*)(
+      void* state, std::span<const ScalarValueResult> values,
+      std::span<const AggregateConstant> arguments);
+  using AccumulateRawPoint = void (*)(
+      void* state, int64_t raw, FieldType::Type columnType,
+      std::span<const AggregateConstant> arguments);
+  using AccumulateRawBatch = void (*)(
+      void* state, std::span<const int64_t> raw,
+      FieldType::Type columnType,
+      std::span<const AggregateConstant> arguments);
   using Merge = void (*)(void* target, const void* source,
                          std::span<const AggregateConstant> arguments);
   using Finish = BucketScalar (*)(
@@ -95,17 +105,36 @@ struct AggregateStateOps {
   uint32_t bytes = 0;
   Init init = nullptr;
   Accumulate accumulate = nullptr;
+  AccumulateBatch accumulateBatch = nullptr;
+  AccumulateRawPoint accumulateRawPoint = nullptr;
+  AccumulateRawBatch accumulateRawBatch = nullptr;
   Merge merge = nullptr;
   Finish finish = nullptr;
+};
 
-  // A batch accumulate entry point is deliberately deferred until facet state
-  // layout is repacked; that round determines the useful batch memory shape.
+// Optional packed state for a bare, single-valued column that is present on
+// every document. The enclosing FacetMap count is then the aggregate value
+// count, so avg need not duplicate that uint64_t in every metric entry.
+struct DenseFacetStateOps {
+  using Init = void (*)(void* state);
+  using AccumulateRawPoint = void (*)(void* state, int64_t raw);
+  using Fail = void (*)(void* state, AggregateFailure failure);
+  using Merge = void (*)(void* target, const void* source);
+  using Finish = BucketScalar (*)(const void* state, int64_t count);
+
+  uint32_t bytes = 0;
+  Init init = nullptr;
+  AccumulateRawPoint accumulateRawPoint = nullptr;
+  Fail fail = nullptr;
+  Merge merge = nullptr;
+  Finish finish = nullptr;
 };
 
 struct ResolvedAggregate {
   BucketValueType type = BucketValueType::INT128;
   ValueNature nature = ValueNature::NUMBER;
   AggregateStateOps state;
+  const DenseFacetStateOps* denseFacetState = nullptr;
 };
 
 struct AggregateLeaf {
@@ -191,6 +220,9 @@ public:
 
   void init();
   void add(uint32_t leaf, const ValueResult& value);
+  void addBatch(uint32_t leaf, std::span<const ScalarValueResult> values);
+  void addRawBatch(uint32_t leaf, std::span<const int64_t> values,
+                   FieldType::Type columnType);
   void fail(AggregateFailure reason);
   bool failed() const { return failure() != AggregateFailure::NONE; }
   void merge(const AggregateStateView& source);
@@ -209,6 +241,9 @@ public:
   explicit AggregateAccumulator(const AggregateProgram& program);
 
   void add(uint32_t leaf, const ValueResult& value);
+  void addBatch(uint32_t leaf, std::span<const ScalarValueResult> values);
+  void addRawBatch(uint32_t leaf, std::span<const int64_t> values,
+                   FieldType::Type columnType);
   void fail(AggregateFailure reason);
   bool failed() const;
   BucketScalar finish(AggregateEvalScratch& scratch) const;
@@ -219,7 +254,61 @@ public:
 };
 
 void writeAggregateValue(api::Val& target, const BucketScalar& value);
-std::vector<BoundValueProgram*> bindAggregateInputs(
+struct BoundAggregateInput {
+  BoundValueProgram* values = nullptr;
+  const AggregateLeaf* leaf = nullptr;
+  IntColReader::BulkIterator* columnIterator = nullptr;
+  AggregateStateOps::AccumulateRawPoint accumulateRawPoint = nullptr;
+  std::span<const AggregateConstant> arguments;
+  uint32_t leafStateOffset = 0;
+  uint32_t leafIndex = 0;
+  FieldType::Type columnType = FieldType::NONE;
+  bool bareColumn = false;
+
+  bool readRawPoint(int32_t docid, int64_t& raw) {
+    if (columnIterator == nullptr) return false;
+    IntColReader::BulkIterator& iterator = *columnIterator;
+    if (iterator.docId() < docid) iterator.advance(docid);
+    if (iterator.docId() != docid) return false;
+    raw = iterator.value();
+    return true;
+  }
+
+  ValueResult evalPoint(int32_t docid) {
+    return values->evalSequentialPoint(docid, 0.0f);
+  }
+
+  void evalBatch(std::span<const int32_t> docids,
+                 std::span<ScalarValueResult> results) {
+    values->evalScalarBatch(docids, results);
+  }
+
+  void accumulatePoint(void* aggregateState, int32_t docid) {
+    void* leafState = static_cast<std::byte*>(aggregateState)
+        + leafStateOffset;
+    if (bareColumn) {
+      int64_t raw;
+      if (!readRawPoint(docid, raw)) return;
+      accumulateRawPoint(leafState, raw, columnType, arguments);
+      return;
+    }
+    ValueResult value = values->evalSequentialPoint(docid, 0.0f);
+    if (value.valid) {
+      leaf->resolved.state.accumulate(
+          leafState, value, arguments);
+    }
+  }
+
+  void accumulateBatch(void* aggregateState,
+                       std::span<const ScalarValueResult> batch) const {
+    void* leafState = static_cast<std::byte*>(aggregateState)
+        + leafStateOffset;
+    leaf->resolved.state.accumulateBatch(leafState, batch, arguments);
+  }
+
+};
+
+std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
     IndexReader::Segment& segment);
 

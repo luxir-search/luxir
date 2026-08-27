@@ -25,6 +25,20 @@ void requireNumeric(std::span<const ResolvedValue> args) {
   }
 }
 
+ValueResult decodeScalarColumnValue(const ValueNode& node, int64_t raw) {
+  if (node.columnType == FieldType::FLOAT) {
+    double decoded = (double)sortableInt32ToFloat((int32_t)raw);
+    return std::isnan(decoded) ? ValueResult::missing(node.type)
+                               : ValueResult::floating(decoded);
+  }
+  if (node.columnType == FieldType::DOUBLE) {
+    double decoded = sortableInt64ToDouble(raw);
+    return std::isnan(decoded) ? ValueResult::missing(node.type)
+                               : ValueResult::floating(decoded);
+  }
+  return ValueResult::integer(raw);
+}
+
 ResolvedValue unaryDemote(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   return {args[0].type, ValueNature::NUMBER};
@@ -1076,6 +1090,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
         fields.readFieldInfo(info);
         bound.column.emplace(postings, info);
         bound.iterator.emplace(*bound.column);
+        bound.bulkIterator.emplace(*bound.column);
         bool missing = bound.column->docsWithValue() < postings.maxDoc();
         auto encoded = bound.column->encodedBounds();
         if (!encoded.hasValues) {
@@ -1190,18 +1205,8 @@ ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float s
     return ValueResult::arrayValue(node.type, index, docid, score,
                                    bound.valueEnd - bound.valueStart);
   }
-  int64_t raw = bound.iterator->values().valueAt(bound.valueStart);
-  if (node.columnType == FieldType::FLOAT) {
-    double decoded = (double)sortableInt32ToFloat((int32_t)raw);
-    if (std::isnan(decoded)) return ValueResult::missing(node.type);
-    return ValueResult::floating(decoded);
-  }
-  if (node.columnType == FieldType::DOUBLE) {
-    double decoded = sortableInt64ToDouble(raw);
-    if (std::isnan(decoded)) return ValueResult::missing(node.type);
-    return ValueResult::floating(decoded);
-  }
-  return ValueResult::integer(raw);
+  return decodeScalarColumnValue(
+      node, bound.iterator->values().valueAt(bound.valueStart));
 }
 
 ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
@@ -1221,6 +1226,115 @@ ValueResult BoundValueProgram::evalPoint(int32_t docid, float score) {
   return evalNode(program.rootNode, docid, score);
 }
 
+ValueResult BoundValueProgram::evalColumnSequential(
+    uint32_t index, int32_t docid, float score) {
+  unused(score);
+  const ValueNode& node = program.nodes[index];
+  assert(!valueArray(node.type));
+  int64_t raw;
+  if (!readColumnSequential(index, docid, raw)) {
+    return ValueResult::missing(node.type);
+  }
+  return decodeScalarColumnValue(node, raw);
+}
+
+bool BoundValueProgram::readColumnSequential(
+    uint32_t index, int32_t docid, int64_t& raw) {
+  BoundValueNode& bound = nodes[index];
+  if (!bound.column) return false;
+  if (docid < bound.bulkLastDoc) {
+    bound.bulkIterator.reset();
+    bound.bulkIterator.emplace(*bound.column);
+  }
+  bound.bulkLastDoc = docid;
+  int32_t found = bound.bulkIterator->docId();
+  if (found < docid) found = bound.bulkIterator->advance(docid);
+  if (found != docid) return false;
+  raw = bound.bulkIterator->values().valueAt(bound.bulkIterator->rank());
+  return true;
+}
+
+ValueResult BoundValueProgram::evalSequentialPoint(int32_t docid,
+                                                   float score) {
+  const ValueNode& root = program.root();
+  if (root.kind == ValueNodeKind::COLUMN && !valueArray(root.type)) {
+    return evalColumnSequential(program.rootNode, docid, score);
+  }
+  return evalPoint(docid, score);
+}
+
+bool BoundValueProgram::evalSequentialInt64(int32_t docid, int64_t& value) {
+  const ValueNode& root = program.root();
+  if (root.kind == ValueNodeKind::COLUMN && root.type == ValueType::INT64) {
+    return readColumnSequential(program.rootNode, docid, value);
+  }
+  ValueResult result = evalSequentialPoint(docid, 0.0f);
+  if (!result.valid) return false;
+  value = result.intValue;
+  return true;
+}
+
+bool BoundValueProgram::evalSequentialDouble(int32_t docid, double& value) {
+  const ValueNode& root = program.root();
+  if (root.kind == ValueNodeKind::COLUMN && root.type == ValueType::DOUBLE) {
+    int64_t raw;
+    if (!readColumnSequential(program.rootNode, docid, raw)) return false;
+    if (root.columnType == FieldType::FLOAT) {
+      value = (double)sortableInt32ToFloat((int32_t)raw);
+    } else {
+      value = sortableInt64ToDouble(raw);
+    }
+    return !std::isnan(value);
+  }
+  ValueResult result = evalSequentialPoint(docid, 0.0f);
+  if (!result.valid) return false;
+  value = result.doubleValue;
+  return true;
+}
+
+void BoundValueProgram::evalColumnBatch(
+    uint32_t index, std::span<const int32_t> docids,
+    std::span<ValueResult> results) {
+  for (size_t i = 0; i < docids.size(); i++) {
+    results[i] = evalColumnSequential(index, docids[i], 0.0f);
+  }
+}
+
+void BoundValueProgram::evalScalarBatch(
+    std::span<const int32_t> docids,
+    std::span<ScalarValueResult> results) {
+  if (results.size() != docids.size()) {
+    throw std::runtime_error("ValueExpr scalar batch spans have different lengths");
+  }
+  const ValueNode& root = program.root();
+  if (root.kind == ValueNodeKind::COLUMN && !valueArray(root.type)) {
+    if (root.type == ValueType::DOUBLE) {
+      for (size_t i = 0; i < docids.size(); i++) {
+        double value;
+        results[i] = evalSequentialDouble(docids[i], value)
+            ? ScalarValueResult::floating(value) : ScalarValueResult{};
+      }
+    } else {
+      for (size_t i = 0; i < docids.size(); i++) {
+        int64_t value;
+        results[i] = evalSequentialInt64(docids[i], value)
+            ? ScalarValueResult::integer(value) : ScalarValueResult{};
+      }
+    }
+    return;
+  }
+  for (size_t i = 0; i < docids.size(); i++) {
+    ValueResult value = evalSequentialPoint(docids[i], 0.0f);
+    if (!value.valid) {
+      results[i] = ScalarValueResult{};
+    } else if (root.type == ValueType::DOUBLE) {
+      results[i] = ScalarValueResult::floating(value.doubleValue);
+    } else {
+      results[i] = ScalarValueResult::integer(value.intValue);
+    }
+  }
+}
+
 void BoundValueProgram::evalBatch(std::span<const int32_t> docids,
                                   std::span<const float> scores,
                                   std::span<ValueResult> results) {
@@ -1228,6 +1342,10 @@ void BoundValueProgram::evalBatch(std::span<const int32_t> docids,
     throw std::runtime_error("ValueExpr batch spans have different lengths");
   }
   const ValueNode& root = program.root();
+  if (root.kind == ValueNodeKind::COLUMN && !valueArray(root.type)) {
+    evalColumnBatch(program.rootNode, docids, results);
+    return;
+  }
   if (root.kind == ValueNodeKind::FUNCTION) {
     root.function->evalBatch(*this, root, docids, scores, results);
     return;

@@ -32,6 +32,8 @@ auto facetAggregateOverrides() {
       forcedFacetFeedStrategy, forcedFacetSubOpInline,
       forcedRequestMemoryMaxBytes,
       facetAggregateStateReservationCounterForTests,
+      inlineAggregateStatsForTests,
+      disableDenseFacetStateForTests,
       forcedRangeFacetBucketDomainByteBudget,
       forcedRangeFacetBindingStateChunkBytes,
       rangeFacetBindingBlockCounter);
@@ -59,12 +61,12 @@ void expectParseError(ArenaOwner& memory, Schema& schema,
 BucketScalar evaluate(AggregateProgram& program, IndexReader::Segment& segment) {
   MemPool pool;
   AggregateAccumulator accumulator(program);
-  std::vector<BoundValueProgram*> bindings =
+  std::vector<BoundAggregateInput> bindings =
       bindAggregateInputs(program, pool, segment);
   int32_t maxDoc = segment.postingsReader().maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t leaf = 0; leaf < bindings.size(); leaf++) {
-      accumulator.add((uint32_t)leaf, bindings[leaf]->evalPoint(doc, 0.0f));
+      accumulator.add((uint32_t)leaf, bindings[leaf].evalPoint(doc));
     }
   }
   return accumulator.finish();
@@ -337,6 +339,9 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
     EXPECT_GT(state.bytes, 0u) << function.name;
     EXPECT_NE(nullptr, state.init) << function.name;
     EXPECT_NE(nullptr, state.accumulate) << function.name;
+    EXPECT_NE(nullptr, state.accumulateBatch) << function.name;
+    EXPECT_NE(nullptr, state.accumulateRawPoint) << function.name;
+    EXPECT_NE(nullptr, state.accumulateRawBatch) << function.name;
     EXPECT_NE(nullptr, state.merge) << function.name;
     EXPECT_NE(nullptr, state.finish) << function.name;
   }
@@ -364,6 +369,19 @@ TEST_F(AggregateExprTest, dataFailuresMergeAndFinishAsNull) {
 
   AggregateProgram* doubleSum =
       parseAggregate(memory, *schema, "sum(price_d)");
+
+  AggregateProgram* intSum =
+      parseAggregate(memory, *schema, "sum(price_i)");
+  AggregateAccumulator batched(*intSum);
+  std::array<ScalarValueResult, 4> integers{
+      ScalarValueResult::integer(std::numeric_limits<int64_t>::max()),
+      ScalarValueResult{},
+      ScalarValueResult::integer(-std::numeric_limits<int64_t>::max()),
+      ScalarValueResult::integer(1)};
+  batched.addBatch(0, integers);
+  ASSERT_TRUE(batched.finish().valid);
+  EXPECT_EQ((__int128)1, batched.finish().intValue);
+
   AggregateAccumulator left(*doubleSum);
   AggregateAccumulator right(*doubleSum);
   left.add(0, ValueResult::floating(std::numeric_limits<double>::max()));
@@ -371,6 +389,14 @@ TEST_F(AggregateExprTest, dataFailuresMergeAndFinishAsNull) {
   EXPECT_NO_THROW(AggregateAccumulator::merge(&left, &right));
   BucketScalar nonFinite = left.finish();
   EXPECT_EQ(AggregateFailure::NON_FINITE_SUM, nonFinite.failure);
+
+  AggregateAccumulator nonFiniteBatch(*doubleSum);
+  std::array<ScalarValueResult, 2> floating{
+      ScalarValueResult::floating(std::numeric_limits<double>::max()),
+      ScalarValueResult::floating(std::numeric_limits<double>::max())};
+  nonFiniteBatch.addBatch(0, floating);
+  EXPECT_EQ(AggregateFailure::NON_FINITE_SUM,
+            nonFiniteBatch.finish().failure);
 
   AggregateProgram* average =
       parseAggregate(memory, *schema, "avg(price_d)");
@@ -695,7 +721,7 @@ TEST_F(AggregateExprTest, inlineFacetUsesTrueStrideAndChunkedReservations) {
   auto schema = helper.collection().getSchema();
   AggregateProgram* program =
       parseAggregate(memory, *schema, "min(metric_d)");
-  constexpr size_t EXPECTED_STRIDE = 17;
+  constexpr size_t EXPECTED_STRIDE = 10;
   ASSERT_EQ(EXPECTED_STRIDE, AggregateStateView::bytes(*program));
 
   std::atomic<size_t> reservations{0};
@@ -714,14 +740,73 @@ TEST_F(AggregateExprTest, inlineFacetUsesTrueStrideAndChunkedReservations) {
   EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
 
+TEST_F(AggregateExprTest, denseIntAvgInlineUsesFacetCountState) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "1", "cat_s", "a", "metric_i", 10),
+      flatdoc("id", "2", "cat_s", "a", "metric_i", 20),
+      flatdoc("id", "3", "cat_s", "b", "metric_i", 100),
+  }, UpdateMessage::COMMIT).success);
+
+  InlineAggregateStats stats;
+  auto guard = facetAggregateOverrides();
+  inlineAggregateStatsForTests = &stats;
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
+  facet.expr("metric", "avg(metric_i)");
+  qb::sort(facet, "metric", qb::DESC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+  const auto& values =
+      std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+  ASSERT_EQ(2u, ids.size());
+  EXPECT_EQ("b", ids[0]);
+  EXPECT_EQ("a", ids[1]);
+  EXPECT_DOUBLE_EQ(100.0, values[0].asDouble());
+  EXPECT_DOUBLE_EQ(15.0, values[1].asDouble());
+  EXPECT_EQ(17u, stats.stateBytesPerBucket.load());
+  EXPECT_EQ(0u, stats.finalizedBytes.load());
+  EXPECT_EQ(24u, stats.peakFinalizedBytes.load());
+}
+
+TEST_F(AggregateExprTest, missingIntColumnKeepsExplicitAvgCount) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "1", "cat_s", "a", "metric_i", 10),
+      flatdoc("id", "2", "cat_s", "a"),
+  }, UpdateMessage::COMMIT).success);
+
+  InlineAggregateStats stats;
+  auto guard = facetAggregateOverrides();
+  inlineAggregateStatsForTests = &stats;
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s").limit(1);
+  facet.expr("metric", "avg(metric_i)");
+  qb::sort(facet, "metric", qb::DESC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& values =
+      std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+  ASSERT_EQ(1u, values.size());
+  EXPECT_DOUBLE_EQ(10.0, values[0].asDouble());
+  EXPECT_EQ(26u, stats.stateBytesPerBucket.load());
+}
+
 TEST_F(AggregateExprTest, defaultBudgetCoversHighCardinalityParallelExtremes) {
   constexpr size_t BUCKETS = 278741;
-  constexpr size_t STRIDE = 17;
+  constexpr size_t STRIDE = 10;
   constexpr size_t LIVE_PIECES = 32 + 1;
   constexpr size_t CHUNK_BYTES = 64 * 1024;
   constexpr size_t REQUIRED =
       BUCKETS * STRIDE * LIVE_PIECES + LIVE_PIECES * CHUNK_BYTES;
-  static_assert(REQUIRED == 158536389);
+  static_assert(REQUIRED == 94147218);
   // The breaker defaults to 0 (track, never reject); the documented sizing
   // guidance for operators enabling it must still cover this workload.
   EXPECT_EQ(0u, SearchConfig{}.request_memory_max_bytes);

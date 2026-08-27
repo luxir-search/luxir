@@ -1396,15 +1396,15 @@ public:
 
       // fill in results from inline calculators
       std::vector<char*> results;
-      std::vector<size_t> finalizedSlots;
+      std::vector<int64_t> resultCounts;
       results.reserve(valVec.size());
-      finalizedSlots.reserve(valVec.size());
+      resultCounts.reserve(valVec.size());
       for (const Bucket& bucket : valVec) {
         results.push_back(bucket.entry + sizeof(int64_t));
-        finalizedSlots.push_back(bucket.finalizedSlot);
+        resultCounts.push_back(loadUnaligned<int64_t>(bucket.entry));
       }
       for (auto calc : mergedData->inlineCalcs) {
-        calc->fillResult(results, finalizedSlots);
+        calc->fillResult(results, resultCounts);
       }
 
       std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;

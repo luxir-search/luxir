@@ -76,6 +76,16 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
     EXPECT_TRUE(batch[i].valid);
     EXPECT_EQ(expected[i], batch[i].intValue);
   }
+
+  ValueProgram* bareColumn = parseValue(memory, *schema, "x_i");
+  auto bareBound = bareColumn->bind(pool, segment);
+  std::array<ScalarValueResult, 3> scalarBatch;
+  bareBound->evalScalarBatch(docs, scalarBatch);
+  ASSERT_TRUE(scalarBatch[0].valid);
+  EXPECT_EQ(BIG, scalarBatch[0].intValue);
+  EXPECT_FALSE(scalarBatch[1].valid);
+  ASSERT_TRUE(scalarBatch[2].valid);
+  EXPECT_EQ(-5, scalarBatch[2].intValue);
   for (auto [expression, expectedValue] : {
            std::pair<std::string_view, double>{"min(values_is)", -3.0},
            {"max(values_is)", 5.0}, {"avg(values_is)", 1.0},

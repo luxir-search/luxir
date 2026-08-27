@@ -291,7 +291,7 @@ public:
       return false;
     }
     virtual void fillResult(std::span<char*> entries,
-                            std::span<const size_t> finalizedSlots) = 0;
+                            std::span<const int64_t> counts) = 0;
 
   };
 
