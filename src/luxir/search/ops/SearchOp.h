@@ -315,6 +315,49 @@ class FacetMap {
     return {insertedIter, true};
   }
 
+  char* insertEntry(int32_t docid) {
+    auto ptr = pool.reserve(sizeof(int64_t));
+    int space = (int)pool.spaceLeft();
+    auto start = ptr;
+    storeUnaligned<int64_t>(ptr, 1);
+    space -= sizeof(int64_t);
+    ptr += sizeof(int64_t);
+    for (auto* calc : calcs) {
+      auto calcSpace = calc->insert(ptr, docid, space);
+      if (calcSpace < 0) {
+        int used = (int)(ptr - start);
+        auto newptr = pool.reserve(used + (-calcSpace));
+        memcpy(newptr, start, used);
+        start = newptr;
+        ptr = newptr + used;
+        space = (int)pool.spaceLeft() - used;
+        calcSpace = calc->insert(ptr, docid, space);
+        assert(calcSpace >= 0);
+      }
+      space -= calcSpace;
+      ptr += calcSpace;
+    }
+    auto allocated = pool.alloc(ptr - start);
+    assert(allocated == start);
+    unused(allocated);
+    return start;
+  }
+
+  void updateEntry(char* ptr, int32_t docid) {
+    storeUnaligned<int64_t>(ptr, loadUnaligned<int64_t>(ptr) + 1);
+    ptr += sizeof(int64_t);
+    if (calcs.size() == 1) {
+      auto calcSpace = calcs.front()->update(ptr, docid);
+      assert(calcSpace >= 0);
+      return;
+    }
+    for (auto* calc : calcs) {
+      auto calcSpace = calc->update(ptr, docid);
+      assert(calcSpace >= 0);
+      ptr += calcSpace;
+    }
+  }
+
 public:
   boost::unordered_flat_map<Key, char*> map;
   std::span<SearchOp::InlineCalculator*> calcs;
@@ -325,43 +368,25 @@ public:
 
   void add(const Key& key, int32_t docid) {
     auto [iter, inserted] = findOrInsert(key);
-
     if (inserted) {
-      auto ptr = pool.reserve(sizeof(int64_t));
-      int space = (int)pool.spaceLeft();
-      auto start = ptr;
-      storeUnaligned<int64_t>(ptr, 1);
-      space -= sizeof(int64_t);
-      ptr += sizeof(int64_t);
-      for (auto* calc : calcs) {
-        auto calcSpace = calc->insert(ptr, docid, space);
-        if (calcSpace < 0) {
-          int used = (int)(ptr - start);
-          auto newptr = pool.reserve(used + (-calcSpace));
-          memcpy(newptr, start, used);
-          start = newptr;
-          ptr = newptr + used;
-          space = (int)pool.spaceLeft() - used;
-          calcSpace = calc->insert(ptr, docid, space);
-          assert(calcSpace >= 0);
-        }
-        space -= calcSpace;
-        ptr += calcSpace;
-      }
-      iter->second = start;  // store the pointer to the start of the entry
-      auto allocated = pool.alloc(ptr - start);  // allocate the space used by this entry
-      assert(allocated == start);
-      unused(allocated);
+      iter->second = insertEntry(docid);
     } else {
-      auto ptr = iter->second;
-      storeUnaligned<int64_t>(ptr, loadUnaligned<int64_t>(ptr) + 1);
-      ptr += sizeof(int64_t);
-      for (auto* calc : calcs) {
-        auto calcSpace = calc->update(ptr, docid);
-        assert(calcSpace >= 0);
-        ptr += calcSpace;
-      }
+      updateEntry(iter->second, docid);
     }
+  }
+
+  // The caller knows that repeated visits through one segment local ordinal
+  // resolve to the same key. Cache the stable pool entry after its first hit;
+  // later hits avoid a hash probe without changing packed-entry ownership.
+  void addKnown(const Key& key, char*& knownEntry, int32_t docid) {
+    if (knownEntry != nullptr) {
+      updateEntry(knownEntry, docid);
+      return;
+    }
+    auto [iter, inserted] = findOrInsert(key);
+    if (inserted) iter->second = insertEntry(docid);
+    else updateEntry(iter->second, docid);
+    knownEntry = iter->second;
   }
 
   void merge(FacetMap<Key>& other) {

@@ -34,6 +34,7 @@ auto facetAggregateOverrides() {
       facetAggregateStateReservationCounterForTests,
       inlineAggregateStatsForTests,
       disableDenseFacetStateForTests,
+      enableInlineFacetEntryCache,
       forcedRangeFacetBucketDomainByteBudget,
       forcedRangeFacetBindingStateChunkBytes,
       rangeFacetBindingBlockCounter);
@@ -752,6 +753,7 @@ TEST_F(AggregateExprTest, denseIntAvgInlineUsesFacetCountState) {
   auto guard = facetAggregateOverrides();
   inlineAggregateStatsForTests = &stats;
   forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  enableInlineFacetEntryCache = true;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
   facet.expr("metric", "avg(metric_i)");

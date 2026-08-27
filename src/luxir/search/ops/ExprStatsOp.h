@@ -241,24 +241,12 @@ public:
       return result;
     }
 
-    void addDoc(void* entry, int32_t docid) {
+    void addGenericDoc(void* entry, int32_t docid) {
       if (segmentFailure != AggregateFailure::NONE) {
-        if (denseFacetState != nullptr) {
-          denseFacetState->fail(entry, segmentFailure);
-        } else {
-          state(entry).fail(segmentFailure);
-        }
+        state(entry).fail(segmentFailure);
         return;
       }
       try {
-        if (denseFacetState != nullptr) {
-          assert(bindings.size() == 1);
-          int64_t raw;
-          if (bindings.front().readRawPoint(docid, raw)) {
-            denseFacetState->accumulateRawPoint(entry, raw);
-          }
-          return;
-        }
         if (bindings.size() == 1) {
           bindings.front().accumulatePoint(entry, docid);
         } else {
@@ -267,12 +255,23 @@ public:
           }
         }
       } catch (const ValueEvaluationError&) {
-        if (denseFacetState != nullptr) {
-          denseFacetState->fail(entry, AggregateFailure::VALUE_EVALUATION);
-        } else {
-          state(entry).fail(AggregateFailure::VALUE_EVALUATION);
-        }
+        state(entry).fail(AggregateFailure::VALUE_EVALUATION);
       }
+    }
+
+    void addDenseDoc(void* entry, int32_t docid) {
+      if (segmentFailure != AggregateFailure::NONE) {
+        denseFacetState->fail(entry, segmentFailure);
+        return;
+      }
+      // resolveDenseFacetState proved a scalar column present on every doc.
+      // Its value rank is therefore the doc id: skip the generic iterator's
+      // missing checks and feed the raw column value straight to packed state.
+      assert(bindings.size() == 1);
+      auto* iterator = bindings.front().columnIterator;
+      assert(iterator != nullptr);
+      denseFacetState->accumulateRawPoint(
+          entry, iterator->values().valueAt(docid));
     }
 
     bool valid(size_t slot) const {
@@ -356,12 +355,14 @@ public:
       } else {
         state(entry).init();
       }
-      addDoc(entry, docid);
+      if (denseFacetState != nullptr) addDenseDoc(entry, docid);
+      else addGenericDoc(entry, docid);
       return (int)entryBytes;
     }
 
     int update(void* entry, int32_t docid) override {
-      addDoc(entry, docid);
+      if (denseFacetState != nullptr) addDenseDoc(entry, docid);
+      else addGenericDoc(entry, docid);
       return (int)entryBytes;
     }
 

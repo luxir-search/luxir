@@ -50,6 +50,11 @@ struct InlineAggregateStats {
 inline InlineAggregateStats* inlineAggregateStatsForTests = nullptr;
 inline bool disableDenseFacetStateForTests = false;
 
+// Opt-in for the general low-cardinality inline-facet entry cache. Keep this
+// separate from expression-metric fast paths so regression measurements can
+// exclude an optimization that applies equally to other inline calculators.
+inline bool enableInlineFacetEntryCache = false;
+
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key
 // bounds and the request needs no exact count or domain.

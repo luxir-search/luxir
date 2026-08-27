@@ -607,15 +607,39 @@ public:
         if (thisOp().ordMap) {
           mapping = thisOp().ordMap->getSegToGlobal(segnum);
         }
+        // At low cardinality the same small set of ords is revisited for most
+        // documents. Cache each local ord's stable FacetMap pool entry so the
+        // hot walk pays one hash probe per segment term, not per value. Keep
+        // the table bounded: at higher cardinality the existing hash path is
+        // dominated by entry creation and avoids per-collector pointer arrays.
+        constexpr int64_t MAX_CACHED_INLINE_ORDS = 2 * 1024;
+        std::vector<char*> knownEntries;
+        int64_t domainSize = domain ? domain->card() : maxDoc;
+        if (enableInlineFacetEntryCache
+            && found && segFieldInfo.nTerms <= MAX_CACHED_INLINE_ORDS
+            && domainSize >= segFieldInfo.nTerms * 4) {
+          knownEntries.resize((size_t)segFieldInfo.nTerms, nullptr);
+        }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
         if (mapping.bits == 0) {
           // Identity segment (always so for one segment): local ords ARE global
           // ords, so the column value is the key with nothing in between.
-          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int32_t val)LUXIR_INLINE {
-              data.counts.add((int64_t)val - 1, docid);
-            });
+          if (knownEntries.empty()) {
+            facetReq.facetSegOrdCol(
+                domain, segnum, missing_num, segFieldInfo,
+                [&](int32_t docid, int32_t val) LUXIR_INLINE {
+                  data.counts.add((int64_t)val - 1, docid);
+                });
+          } else {
+            facetReq.facetSegOrdCol(
+                domain, segnum, missing_num, segFieldInfo,
+                [&](int32_t docid, int32_t val) LUXIR_INLINE {
+                  size_t localOrd = (size_t)val - 1;
+                  data.counts.addKnown(
+                      (int64_t)localOrd, knownEntries[localOrd], docid);
+                });
+          }
         } else {
           // Remapped segment: globalOrd() decodes a delta frame, so it is only
           // free while consecutive documents stay inside one.  The counting
@@ -624,10 +648,23 @@ public:
           // drained through the calculators' own merge(), which is worth it if
           // a multi-segment metric-sorted facet ever shows up hot.
           OrdMap::SegToGlobal::BulkGlobalOrds mapped(mapping);
-          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
-            [&](int32_t docid, int32_t val)LUXIR_INLINE {
-              data.counts.add(mapped.globalOrd((int64_t)val - 1), docid);
-            });
+          if (knownEntries.empty()) {
+            facetReq.facetSegOrdCol(
+                domain, segnum, missing_num, segFieldInfo,
+                [&](int32_t docid, int32_t val) LUXIR_INLINE {
+                  data.counts.add(
+                      mapped.globalOrd((int64_t)val - 1), docid);
+                });
+          } else {
+            facetReq.facetSegOrdCol(
+                domain, segnum, missing_num, segFieldInfo,
+                [&](int32_t docid, int32_t val) LUXIR_INLINE {
+                  size_t localOrd = (size_t)val - 1;
+                  data.counts.addKnown(
+                      mapped.globalOrd((int64_t)localOrd),
+                      knownEntries[localOrd], docid);
+                });
+          }
         }
 
         data.missing_num += missing_num;
