@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <latch>
 #include <limits>
 #include <string>
 #include <thread>
@@ -26,24 +27,15 @@ public:
   ~ArenaOwner() { releaseArena(arena); }
 };
 
-class FacetAggregateOverrideGuard {
-  FacetFeedStrategy feed = forcedFacetFeedStrategy;
-  FacetSubOpInlineMode inlineMode = forcedFacetSubOpInline;
-  size_t aggregateBudget = forcedFacetAggregateStateByteBudget;
-  size_t rangeDomainBudget = forcedRangeFacetBucketDomainByteBudget;
-  size_t rangeStateChunk = forcedRangeFacetBindingStateChunkBytes;
-  size_t* rangeBlockCounter = rangeFacetBindingBlockCounter;
-
-public:
-  ~FacetAggregateOverrideGuard() {
-    forcedFacetFeedStrategy = feed;
-    forcedFacetSubOpInline = inlineMode;
-    forcedFacetAggregateStateByteBudget = aggregateBudget;
-    forcedRangeFacetBucketDomainByteBudget = rangeDomainBudget;
-    forcedRangeFacetBindingStateChunkBytes = rangeStateChunk;
-    rangeFacetBindingBlockCounter = rangeBlockCounter;
-  }
-};
+auto facetAggregateOverrides() {
+  return SearchOverridesGuard(
+      forcedFacetFeedStrategy, forcedFacetSubOpInline,
+      forcedRequestMemoryMaxBytes,
+      facetAggregateStateReservationCounterForTests,
+      forcedRangeFacetBucketDomainByteBudget,
+      forcedRangeFacetBindingStateChunkBytes,
+      rangeFacetBindingBlockCounter);
+}
 
 AggregateProgram* parseAggregate(ArenaOwner& memory, Schema& schema,
                                  std::string_view expression,
@@ -67,10 +59,8 @@ void expectParseError(ArenaOwner& memory, Schema& schema,
 BucketScalar evaluate(AggregateProgram& program, IndexReader::Segment& segment) {
   MemPool pool;
   AggregateAccumulator accumulator(program);
-  std::vector<BoundValueProgram*> bindings;
-  for (const AggregateLeaf& leaf : program.leaves) {
-    bindings.push_back(leaf.input->bind(pool, segment));
-  }
+  std::vector<BoundValueProgram*> bindings =
+      bindAggregateInputs(program, pool, segment);
   int32_t maxDoc = segment.postingsReader().maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t leaf = 0; leaf < bindings.size(); leaf++) {
@@ -90,25 +80,28 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
 
   AggregateProgram* expression =
       parseAggregate(memory, *schema, "sum(price_i * 2) + max(foo_i)");
-  EXPECT_EQ(ValueOpcode::ADD, expression->root().opcode);
+  ASSERT_NE(nullptr, expression->root().function);
+  EXPECT_EQ(ValueOpcode::ADD, expression->root().function->opcode);
   ASSERT_EQ(2u, expression->leaves.size());
   EXPECT_EQ(ValueOpcode::MUL, expression->leaves[0].input->root().opcode);
 
   AggregateProgram* functionForms = parseAggregate(
       memory, *schema, "add(sum(price_i), div(max(foo_i), 2))");
-  EXPECT_EQ(ValueOpcode::ADD, functionForms->root().opcode);
+  ASSERT_NE(nullptr, functionForms->root().function);
+  EXPECT_EQ(ValueOpcode::ADD, functionForms->root().function->opcode);
   EXPECT_EQ(ValueOpcode::DIV,
-            functionForms->nodes[functionForms->root().children[1]].opcode);
+            functionForms->nodes[functionForms->root().children[1]]
+                .function->opcode);
   EXPECT_EQ(ValueOpcode::ADD,
             parseAggregate(memory, *schema, "add(1, sum(price_i))")
-                ->root().opcode);
+                ->root().function->opcode);
   EXPECT_EQ(ValueOpcode::ABS,
             parseAggregate(memory, *schema, "abs(sum(price_i))")
-                ->root().opcode);
+                ->root().function->opcode);
   EXPECT_EQ(ValueOpcode::FLOOR,
             parseAggregate(memory, *schema,
                            "floor(sum(price_i) / sum(foo_i))")
-                ->root().opcode);
+                ->root().function->opcode);
 
   AggregateProgram* nested =
       parseAggregate(memory, *schema, "avg(avg(prices_is))");
@@ -118,7 +111,7 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   expectParseError(memory, *schema, "avg(prices_is)",
                    "requires one scalar per document");
   expectParseError(memory, *schema, "avg(prices_is)",
-                   "avg(...), min(...), or max(...)");
+                   ValueFunctionRegistry::arrayReducerNames());
   expectParseError(memory, *schema, "price_i", "must be an aggregate call");
   expectParseError(memory, *schema, "1",
                    "expression contains no aggregate function");
@@ -141,9 +134,17 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
               std::string::npos) << error.what();
   }
   expectParseError(memory, *schema, "sum()", "expects exactly 1 argument");
+  expectParseError(memory, *schema, "sum(price_i 2)",
+                   "byte 12: expected ')'");
+  expectParseError(memory, *schema, "sum(price_i",
+                   "byte 11: expected ')'");
+  expectParseError(memory, *schema, "sum(price_i, 2)",
+                   "expects exactly 1 argument");
   expectParseError(memory, *schema, "sum(price_i + * 2)", "byte 14");
-  expectParseError(memory, *schema, "min(sum(price_i), 2)",
-                   "sum() is a bucket aggregate");
+  AggregateProgram* bucketMinimum =
+      parseAggregate(memory, *schema, "min(sum(price_i), 2)");
+  ASSERT_NE(nullptr, bucketMinimum->root().function);
+  EXPECT_EQ(ValueOpcode::MIN, bucketMinimum->root().function->opcode);
   expectParseError(memory, *schema, "def(sum(price_i), 0)",
                    "def() is a per-document value function");
   expectParseError(memory, *schema, "avg(score)",
@@ -282,6 +283,16 @@ TEST_F(AggregateExprTest, exactSumsMissingDefAndPerDocReducers) {
   ASSERT_TRUE(reduced.valid);
   EXPECT_DOUBLE_EQ(3.5, reduced.doubleValue);
 
+  BucketScalar pooledSum = eval("sum(sum(values_is))");
+  ASSERT_TRUE(pooledSum.valid);
+  EXPECT_EQ(BucketValueType::INT128, pooledSum.type);
+  EXPECT_EQ((__int128)9, pooledSum.intValue);
+  BucketScalar pooledAverage =
+      eval("sum(sum(values_is)) / sum(count(values_is))");
+  ASSERT_TRUE(pooledAverage.valid);
+  EXPECT_DOUBLE_EQ(3.0, pooledAverage.doubleValue);
+  EXPECT_NE(reduced.doubleValue, pooledAverage.doubleValue);
+
   BucketScalar missing = eval("sum(absent_i) + 1");
   EXPECT_FALSE(missing.valid);
   api::Val output;
@@ -310,10 +321,6 @@ TEST_F(AggregateExprTest, outputOverflowBecomesContainedFailure) {
   EXPECT_NO_THROW(writeAggregateValue(output, value));
   EXPECT_TRUE(output.isNull());
 
-  api::Val rawWideOutput;
-  writeAggregateValue(rawWideOutput, BucketScalar::integer(
-      (__int128)std::numeric_limits<int64_t>::max() + 1));
-  EXPECT_TRUE(rawWideOutput.isNull());
 }
 
 TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
@@ -321,8 +328,6 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
   ArenaOwner memory;
   for (const AggregateFunction& function : AggregateFunctionRegistry::entries()) {
     EXPECT_NE(nullptr, function.resolve) << function.name;
-    EXPECT_TRUE(function.supports(FunctionCapability::BUCKET_AGGREGATE))
-        << function.name;
     EXPECT_EQ(1, function.minArguments) << function.name;
     EXPECT_EQ(1, function.maxArguments) << function.name;
     AggregateProgram* program = parseAggregate(
@@ -336,18 +341,17 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
     EXPECT_NE(nullptr, state.finish) << function.name;
   }
   for (const ValueFunction& function : ValueFunctionRegistry::entries()) {
-    EXPECT_EQ(function.evalBucketScalar != nullptr,
-              function.supports(FunctionCapability::BUCKET_SCALAR))
-        << function.name;
+    EXPECT_NE(nullptr, function.evalPoint) << function.name;
   }
   for (std::string_view name : {
            "add", "sub", "mul", "div", "neg", "abs", "sqrt", "log",
-           "log1p", "floor"}) {
+           "log1p", "floor", "min", "max"}) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     ASSERT_NE(nullptr, function) << name;
     EXPECT_NE(nullptr, function->evalBucketScalar) << name;
   }
-  for (std::string_view name : {"def", "min", "max", "avg"}) {
+  for (std::string_view name : {
+           "def", "avg", "sum", "count"}) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     ASSERT_NE(nullptr, function) << name;
     EXPECT_EQ(nullptr, function->evalBucketScalar) << name;
@@ -461,6 +465,41 @@ TEST_F(AggregateExprTest, exprOpExecutesOverRootDomain) {
   EXPECT_EQ(60, req->scalar<int64_t>("revenue"));
 }
 
+TEST_F(AggregateExprTest, columnNaNsAreMissingAndInfinitiesReachAggregates) {
+  CollectionHelper helper;
+  helper.index(flatdoc(
+      "id", "a", "low_d", -std::numeric_limits<double>::infinity(),
+      "nan_d", std::numeric_limits<double>::quiet_NaN(),
+      "total_d", 1.0), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc(
+      "id", "b", "low_d", 5.0, "nan_d", 7.0,
+      "total_d", std::numeric_limits<double>::infinity()),
+      UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& collection = req->collection("main");
+  collection.expr("minimum", "min(low_d)");
+  collection.expr("bucket_minimum", "min(min(low_d), 0)");
+  collection.expr("without_nan", "min(nan_d)");
+  collection.expr("total", "sum(total_d)");
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(-std::numeric_limits<double>::infinity(),
+            req->scalar<double>("minimum"));
+  EXPECT_EQ(-std::numeric_limits<double>::infinity(),
+            req->scalar<double>("bucket_minimum"));
+  EXPECT_DOUBLE_EQ(7.0, req->scalar<double>("without_nan"));
+  const auto* total = req->responses[0]->proto.ops.find("total");
+  ASSERT_NE(nullptr, total);
+  EXPECT_TRUE((**total).isNull());
+  ASSERT_EQ(1u, req->respWarnings().size());
+  EXPECT_NE(req->respWarnings()[0].message.find("aggregate op 'total'"),
+            std::string_view::npos);
+  EXPECT_NE(req->respWarnings()[0].message.find("sum produced"),
+            std::string_view::npos);
+}
+
 TEST_F(AggregateExprTest, stringFacetInlineSortsExprMetricByOpName) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "1", "cat_s", "a", "price_i", 10,
@@ -491,7 +530,7 @@ TEST_F(AggregateExprTest, stringFacetInlineSortsExprMetricByOpName) {
   EXPECT_DOUBLE_EQ(30.0, values[0].asDouble());
   EXPECT_DOUBLE_EQ(40.0 / 3.0, values[1].asDouble());
   EXPECT_TRUE(values[2].isNull());
-  EXPECT_EQ(0u, req->facetAggregateStateBytes.load());
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
 
   auto asc = localReq(helper.getSearchEngine());
   auto& ascFacet = asc->collection("main")
@@ -517,7 +556,7 @@ TEST_F(AggregateExprTest, stringFacetInlineEmitsNullAndWarningOnFailure) {
   helper.index(flatdoc("id", "2", "cat_s", "ok", "x_i", 4),
                UpdateMessage::COMMIT);
 
-  FacetAggregateOverrideGuard guard;
+  auto guard = facetAggregateOverrides();
   forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
@@ -552,7 +591,7 @@ TEST_F(AggregateExprTest, selectedStringBucketDomainsUseOrdinaryCalculator) {
   helper.index(flatdoc("id", "4", "cat_s", "c", "x_i", 100),
                UpdateMessage::COMMIT);
 
-  FacetAggregateOverrideGuard guard;
+  auto guard = facetAggregateOverrides();
   forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
   auto req = localReq(helper.getSearchEngine());
@@ -583,7 +622,7 @@ TEST_F(AggregateExprTest, forcedStringReplayMatchesBucketDomains) {
   helper.index(flatdoc("id", "4", "parent_ss", vecs("c"),
                        "x_i", 40, "qty_i", 4), UpdateMessage::COMMIT);
 
-  FacetAggregateOverrideGuard guard;
+  auto guard = facetAggregateOverrides();
   forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   auto run = [&](FacetFeedStrategy feed) {
     forcedFacetFeedStrategy = feed;
@@ -592,7 +631,7 @@ TEST_F(AggregateExprTest, forcedStringReplayMatchesBucketDomains) {
     facet.expr("ratio", "sum(x_i) / sum(qty_i)");
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
-    EXPECT_EQ(0u, req->facetAggregateStateBytes.load());
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
     std::vector<std::byte> encoded;
     const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
     EXPECT_NE(nullptr, result);
@@ -606,15 +645,15 @@ TEST_F(AggregateExprTest, forcedStringReplayMatchesBucketDomains) {
   EXPECT_EQ(domains, run(FacetFeedStrategy::STRING_COLUMN_REPLAY));
 }
 
-TEST_F(AggregateExprTest, facetAggregateStateBudgetCoversInlineAndReplay) {
+TEST_F(AggregateExprTest, requestMemoryBreakerCoversInlineAndReplay) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "1", "cat_s", "a", "x_i", 10),
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "2", "cat_s", "b", "x_i", 20),
                UpdateMessage::COMMIT);
 
-  FacetAggregateOverrideGuard guard;
-  forcedFacetAggregateStateByteBudget = 1;
+  auto guard = facetAggregateOverrides();
+  forcedRequestMemoryMaxBytes = 1;
   auto run = [&](bool replay) {
     forcedFacetSubOpInline = replay ? FacetSubOpInlineMode::SORT_KEY_ONLY
                                     : FacetSubOpInlineMode::ALL;
@@ -627,25 +666,118 @@ TEST_F(AggregateExprTest, facetAggregateStateBudgetCoversInlineAndReplay) {
     if (!replay) qb::sort(facet, "metric", qb::DESC);
     req->execute(false);
     EXPECT_FALSE(req->ok());
+    EXPECT_NE(req->errorMsg().find(
+                  "request memory breaker 'facet aggregate state'"),
+              std::string::npos);
     EXPECT_NE(req->errorMsg().find("facet 'limited' metric 'metric'"),
               std::string::npos);
-    EXPECT_NE(req->errorMsg().find("estimate"), std::string::npos);
-    EXPECT_NE(req->errorMsg().find("limit of 1 bytes"), std::string::npos);
+    EXPECT_NE(req->errorMsg().find("attempted total"), std::string::npos);
+    EXPECT_NE(req->errorMsg().find("ceiling of 1 bytes"),
+              std::string::npos);
   };
   run(false);
   run(true);
 }
 
-TEST_F(AggregateExprTest, facetAggregateStateBudgetComesFromNodeConfig) {
+TEST_F(AggregateExprTest, inlineFacetUsesTrueStrideAndChunkedReservations) {
+  constexpr int32_t BUCKETS = 5000;
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  docs.reserve(BUCKETS);
+  for (int32_t i = 0; i < BUCKETS; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i),
+                           "cat_s", "bucket-" + std::to_string(i),
+                           "metric_d", (double)i));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  ArenaOwner memory;
+  auto schema = helper.collection().getSchema();
+  AggregateProgram* program =
+      parseAggregate(memory, *schema, "min(metric_d)");
+  constexpr size_t EXPECTED_STRIDE = 17;
+  ASSERT_EQ(EXPECTED_STRIDE, AggregateStateView::bytes(*program));
+
+  std::atomic<size_t> reservations{0};
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  forcedRequestMemoryMaxBytes = 160 * 1024;
+  facetAggregateStateReservationCounterForTests = &reservations;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s").limit(1);
+  facet.expr("metric", "min(metric_d)");
+  qb::sort(facet, "metric", qb::DESC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_LE(reservations.load(), 3u);
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
+}
+
+TEST_F(AggregateExprTest, defaultBudgetCoversHighCardinalityParallelExtremes) {
+  constexpr size_t BUCKETS = 278741;
+  constexpr size_t STRIDE = 17;
+  constexpr size_t LIVE_PIECES = 32 + 1;
+  constexpr size_t CHUNK_BYTES = 64 * 1024;
+  constexpr size_t REQUIRED =
+      BUCKETS * STRIDE * LIVE_PIECES + LIVE_PIECES * CHUNK_BYTES;
+  static_assert(REQUIRED == 158536389);
+  // The breaker defaults to 0 (track, never reject); the documented sizing
+  // guidance for operators enabling it must still cover this workload.
+  EXPECT_EQ(0u, SearchConfig{}.request_memory_max_bytes);
+  EXPECT_GE(160ULL * 1024 * 1024, REQUIRED);
+
+  constexpr size_t STATE_BYTES = BUCKETS * STRIDE;
+  constexpr size_t RESERVED_PER_PIECE =
+      ((STATE_BYTES + CHUNK_BYTES - 1) / CHUNK_BYTES) * CHUNK_BYTES;
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  forcedRequestMemoryMaxBytes = 0;
+  auto req = localReq(luxirNode->getSearchEngine());
+  std::latch reserved(LIVE_PIECES);
+  std::latch release(1);
+  std::array<std::exception_ptr, LIVE_PIECES> errors;
+  std::array<std::thread, LIVE_PIECES> workers;
+  for (size_t i = 0; i < workers.size(); i++) {
+    workers[i] = std::thread([&, i] {
+      size_t bytes = 0;
+      try {
+        bytes = req->memoryTracker.chargeUpTo(
+            RESERVED_PER_PIECE, RESERVED_PER_PIECE,
+            "facet aggregate state", "facet 'f' metric 'minimum'");
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+      reserved.count_down();
+      release.wait();
+      if (bytes != 0) req->memoryTracker.release(bytes);
+    });
+  }
+  reserved.wait();
+  EXPECT_EQ(RESERVED_PER_PIECE * LIVE_PIECES,
+            req->memoryTracker.bytes());
+  release.count_down();
+  for (std::thread& worker : workers) worker.join();
+  for (const std::exception_ptr& error : errors) {
+    if (error == nullptr) continue;
+    try {
+      std::rethrow_exception(error);
+    } catch (const std::exception& exception) {
+      ADD_FAILURE() << exception.what();
+    }
+  }
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
+}
+
+TEST_F(AggregateExprTest, requestMemoryBreakerComesFromNodeConfig) {
   LuxirConfig config;
-  config.search.facet_aggregate_state_max_bytes = 1;
+  config.search.request_memory_max_bytes = 1;
   LuxirNode node(config);
   CollectionHelper helper(node);
   helper.index(flatdoc("id", "1", "cat_s", "a", "x_i", 10),
                UpdateMessage::COMMIT);
 
-  FacetAggregateOverrideGuard guard;
-  forcedFacetAggregateStateByteBudget = 0;
+  auto guard = facetAggregateOverrides();
+  forcedRequestMemoryMaxBytes = 0;
   forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("configured", "cat_s").limit(1);
@@ -653,9 +785,13 @@ TEST_F(AggregateExprTest, facetAggregateStateBudgetComesFromNodeConfig) {
   req->execute(false);
 
   EXPECT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find(
+                "request memory breaker 'facet aggregate state'"),
+            std::string::npos);
   EXPECT_NE(req->errorMsg().find("facet 'configured' metric 'metric'"),
             std::string::npos);
-  EXPECT_NE(req->errorMsg().find("limit of 1 bytes"), std::string::npos);
+  EXPECT_NE(req->errorMsg().find("ceiling of 1 bytes"),
+            std::string::npos);
 }
 
 TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
@@ -668,7 +804,7 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
   }
 
   size_t blocks = 0;
-  FacetAggregateOverrideGuard guard;
+  auto guard = facetAggregateOverrides();
   forcedRangeFacetBucketDomainByteBudget = 1;
   forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
   rangeFacetBindingBlockCounter = &blocks;

@@ -2,13 +2,14 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <fmt/format.h>
 
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/ops/FacetExecution.h"
@@ -24,16 +25,24 @@ namespace luxir {
 // Expression aggregate over an incoming domain, with ordinary bucket-domain,
 // inline string-facet, and selected-column replay execution bindings.
 class ExprStatsOp : public SearchOp {
+  static constexpr std::string_view FACET_STATE_BREAKER =
+      "facet aggregate state";
+
   AggregateProgram& aggregate;
-  mutable std::atomic<bool> warningEmitted{false};
+
+  size_t chargeFacetState(size_t preferredBytes, size_t minimumBytes,
+                          std::string_view detail) {
+    size_t charged = req.memoryTracker.chargeUpTo(
+        preferredBytes, minimumBytes, FACET_STATE_BREAKER, detail);
+    if (facetAggregateStateReservationCounterForTests != nullptr) {
+      facetAggregateStateReservationCounterForTests->fetch_add(
+          1, std::memory_order_relaxed);
+    }
+    return charged;
+  }
 
   void warnFailure(const BucketScalar& result) const {
     if (result.failure == AggregateFailure::NONE) return;
-    bool expected = false;
-    if (!warningEmitted.compare_exchange_strong(
-            expected, true, std::memory_order_relaxed)) {
-      return;
-    }
     req.warnOnce("aggregate_eval_failed", fmt::format(
         "aggregate op '{}' emitted null: {}", name,
         aggregateFailureReason(result.failure)));
@@ -109,11 +118,8 @@ public:
           auto poolGuard = MemPool::threadLocalPoolGuard();
           MemPool& pool = poolGuard.pool();
           auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
-          std::vector<BoundValueProgram*> bindings;
-          bindings.reserve(thisOp().aggregate.leaves.size());
-          for (const AggregateLeaf& leaf : thisOp().aggregate.leaves) {
-            bindings.push_back(leaf.input->bind(pool, segment));
-          }
+          std::vector<BoundValueProgram*> bindings = bindAggregateInputs(
+              thisOp().aggregate, pool, segment);
 
           std::array<int32_t, BATCH_SIZE> docs;
           std::array<ValueResult, BATCH_SIZE> results;
@@ -140,21 +146,21 @@ public:
   };
 
   class InlineCalc final : public InlineCalculator {
+    static constexpr size_t RESERVATION_CHUNK_BYTES = 64 * 1024;
+
     std::vector<BoundValueProgram*> bindings;
-    std::string_view facetName;
+    std::vector<BucketScalar> finalized;
+    std::string chargeDetail;
     AggregateEvalScratch scratch;
     AggregateFailure segmentFailure = AggregateFailure::NONE;
     size_t chargedBytes = 0;
+    size_t reservationRemainder = 0;
     uint32_t entryBytes;
 
     ExprStatsOp& thisOp() { return (ExprStatsOp&)getOp(); }
 
     AggregateStateView state(void* entry) {
       return AggregateStateView(thisOp().aggregate, entry);
-    }
-
-    BucketScalar loadResult(const void* entry) const {
-      return loadUnaligned<BucketScalar>(entry);
     }
 
     void addDoc(void* entry, int32_t docid) {
@@ -188,15 +194,14 @@ public:
     InlineCalc(SearchOp& op, Calculator* parent, int64_t slot,
                int64_t numSlots)
         : InlineCalculator(op, parent, slot, numSlots),
-          facetName(parent->getOp().name),
-          entryBytes(std::max(
-              AggregateStateView::bytes(
-                  static_cast<ExprStatsOp&>(op).aggregate),
-              (uint32_t)sizeof(BucketScalar))) {}
+          chargeDetail(fmt::format("facet '{}' metric '{}'",
+                                   parent->getOp().name, op.name)),
+          entryBytes(AggregateStateView::bytes(
+              static_cast<ExprStatsOp&>(op).aggregate)) {}
 
     ~InlineCalc() override {
       if (chargedBytes != 0) {
-        thisOp().req.releaseFacetAggregateState(chargedBytes);
+        thisOp().req.memoryTracker.release(chargedBytes);
       }
     }
 
@@ -227,27 +232,41 @@ public:
       return {(int)entryBytes, (int)entryBytes};
     }
 
+    void beginFinalize(size_t entries) override {
+      if (reservationRemainder != 0) {
+        thisOp().req.memoryTracker.release(reservationRemainder);
+        chargedBytes -= reservationRemainder;
+        reservationRemainder = 0;
+      }
+      finalized.clear();
+      finalized.reserve(entries);
+    }
+
     int finalize(void* entry, int64_t count) override {
       unused(count);
-      BucketScalar result = state(entry).finish(scratch);
-      storeUnaligned<BucketScalar>(entry, result);
+      finalized.push_back(state(entry).finish(scratch));
       return (int)entryBytes;
     }
 
-    int compare(void* a, void* b, int& asize, int& bsize) override {
-      asize = (int)entryBytes;
-      bsize = (int)entryBytes;
-      return compareResults(loadResult(a), loadResult(b));
+    int compare(size_t a, size_t b) override {
+      return compareResults(finalized[a], finalized[b]);
     }
 
-    bool isMissing(void* entry) override {
-      return !loadResult(entry).valid;
+    bool isMissing(size_t entry) override {
+      return !finalized[entry].valid;
     }
 
     void prepareEntry() override {
-      thisOp().req.chargeFacetAggregateState(entryBytes, facetName,
-                                             thisOp().name);
-      chargedBytes += entryBytes;
+      if (reservationRemainder < entryBytes) {
+        size_t minimum = entryBytes - reservationRemainder;
+        size_t preferred = entryBytes >= RESERVATION_CHUNK_BYTES
+            ? minimum : RESERVATION_CHUNK_BYTES - reservationRemainder;
+        size_t reserved = thisOp().chargeFacetState(
+            preferred, minimum, chargeDetail);
+        chargedBytes += reserved;
+        reservationRemainder += reserved;
+      }
+      reservationRemainder -= entryBytes;
     }
 
     void startSeg(int32_t segnum) override {
@@ -256,10 +275,7 @@ public:
       try {
         MemPool& pool = MemPool::threadLocal();
         auto& segment = thisOp().req.reader->segments()[(size_t)segnum];
-        bindings.reserve(thisOp().aggregate.leaves.size());
-        for (const AggregateLeaf& leaf : thisOp().aggregate.leaves) {
-          bindings.push_back(leaf.input->bind(pool, segment));
-        }
+        bindings = bindAggregateInputs(thisOp().aggregate, pool, segment);
       } catch (const ValueEvaluationError&) {
         bindings.clear();
         segmentFailure = AggregateFailure::VALUE_EVALUATION;
@@ -272,8 +288,12 @@ public:
       segmentFailure = AggregateFailure::NONE;
     }
 
-    void fillResult(std::span<char*> entries) override {
-      for (char* entry : entries) thisOp().warnFailure(loadResult(entry));
+    void fillResult(std::span<char*> entries,
+                    std::span<const size_t> finalizedSlots) override {
+      assert(entries.size() == finalizedSlots.size());
+      for (size_t slot : finalizedSlots) {
+        thisOp().warnFailure(finalized[slot]);
+      }
 
       auto& mr = op.req.lastResponse->mr;
       auto* value = getTarget(nullptr, [&](api::Val& target) {
@@ -283,7 +303,7 @@ public:
       auto& arr = oneofMut<api::ArrVal>(*value);
       for (size_t i = 0; i < entries.size(); i++) {
         writeAggregateValue(const_cast<api::Val&>(arr.v[i]),
-                            loadResult(entries[i]));
+                            finalized[finalizedSlots[i]]);
         entries[i] += entryBytes;
       }
     }
@@ -295,6 +315,7 @@ public:
     StringFacetColumnSource source;
     StrFacetSelectedOrdMap::Selected selectedBuckets;
     std::vector<std::byte> states;
+    std::string chargeDetail;
     AggregateEvalScratch scratch;
     size_t chargedBytes = 0;
     uint32_t stride;
@@ -302,7 +323,7 @@ public:
     void releaseStates() {
       if (chargedBytes == 0) return;
       std::vector<std::byte>().swap(states);
-      child.req.releaseFacetAggregateState(chargedBytes);
+      child.req.memoryTracker.release(chargedBytes);
       chargedBytes = 0;
     }
 
@@ -353,12 +374,10 @@ public:
       StrFacetSelectedOrdMap selected(mapping, selectedBuckets);
 
       std::vector<BoundValueProgram*> bindings;
-      bindings.reserve(child.aggregate.leaves.size());
       bool bindingFailed = false;
       try {
-        for (const AggregateLeaf& leaf : child.aggregate.leaves) {
-          bindings.push_back(leaf.input->bind(poolGuard.pool(), segment));
-        }
+        bindings = bindAggregateInputs(
+            child.aggregate, poolGuard.pool(), segment);
       } catch (const ValueEvaluationError&) {
         bindings.clear();
         bindingFailed = true;
@@ -427,6 +446,8 @@ public:
                          const StringFacetColumnSource& source)
         : child(child), parent(parent), source(source),
           selectedBuckets(StrFacetSelectedOrdMap::selectedBuckets(source.buckets)),
+          chargeDetail(fmt::format("facet '{}' metric '{}'",
+                                   parent.getOp().name, child.name)),
           stride(AggregateStateView::bytes(child.aggregate)) {}
 
     ~ColumnReplayExecutor() override {
@@ -444,14 +465,13 @@ public:
     void execute() override {
       size_t numOwners = source.buckets.size();
       if (numOwners > std::numeric_limits<size_t>::max() / stride) {
-        throw std::runtime_error(fmt::format(
-            "facet '{}' metric '{}': aggregate state byte estimate overflow",
-            parent.getOp().name, child.name));
+        child.req.memoryTracker.chargeOverflow(
+            FACET_STATE_BREAKER, chargeDetail);
       }
       size_t bytes = numOwners * stride;
-      child.req.chargeFacetAggregateState(
-          bytes, parent.getOp().name, child.name);
-      chargedBytes = bytes;
+      if (bytes != 0) {
+        chargedBytes = child.chargeFacetState(bytes, bytes, chargeDetail);
+      }
       states.resize(chargedBytes);
       for (size_t owner = 0; owner < numOwners; owner++) {
         state((int32_t)owner).init();

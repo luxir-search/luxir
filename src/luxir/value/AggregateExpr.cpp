@@ -43,14 +43,14 @@ void* AggregateStateView::leafState(const AggregateLeaf& leaf) const {
 void AggregateStateView::init() {
   setFailure(AggregateFailure::NONE);
   for (const AggregateLeaf& leaf : program->leaves) {
-    leaf.resolved.state.init(leafState(leaf));
+    leaf.resolved.state.init(leafState(leaf), leaf.arguments);
   }
 }
 
 void AggregateStateView::add(uint32_t leafIndex, const ValueResult& value) {
   if (!value.valid || failed()) return;
   const AggregateLeaf& leaf = program->leaves[leafIndex];
-  leaf.resolved.state.accumulate(leafState(leaf), value);
+  leaf.resolved.state.accumulate(leafState(leaf), value, leaf.arguments);
 }
 
 void AggregateStateView::fail(AggregateFailure reason) {
@@ -60,7 +60,8 @@ void AggregateStateView::fail(AggregateFailure reason) {
 void AggregateStateView::merge(const AggregateStateView& source) {
   if (source.failed()) fail(source.failure());
   for (const AggregateLeaf& leaf : program->leaves) {
-    leaf.resolved.state.merge(leafState(leaf), source.leafState(leaf));
+    leaf.resolved.state.merge(
+        leafState(leaf), source.leafState(leaf), leaf.arguments);
   }
 }
 
@@ -113,7 +114,8 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
   scratch.aggregates.resize(program->leaves.size());
   for (size_t i = 0; i < program->leaves.size(); i++) {
     const AggregateLeaf& leaf = program->leaves[i];
-    BucketScalar value = leaf.resolved.state.finish(leafState(leaf));
+    BucketScalar value = leaf.resolved.state.finish(
+        leafState(leaf), leaf.arguments);
     value.nature = leaf.resolved.nature;
     scratch.aggregates[i] = value;
   }
@@ -181,13 +183,20 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value) {
     target.kind.emplace<double>(value.doubleValue);
     return;
   }
-  if (value.intValue < std::numeric_limits<int64_t>::min()
-      || value.intValue > std::numeric_limits<int64_t>::max()) {
-    target.kind.emplace<google::protobuf::NullValue>(
-        google::protobuf::NullValue::NULL_VALUE);
-    return;
-  }
+  assert(value.intValue >= std::numeric_limits<int64_t>::min()
+         && value.intValue <= std::numeric_limits<int64_t>::max());
   target.kind.emplace<int64_t>((int64_t)value.intValue);
+}
+
+std::vector<BoundValueProgram*> bindAggregateInputs(
+    const AggregateProgram& program, MemPool& pool,
+    IndexReader::Segment& segment) {
+  std::vector<BoundValueProgram*> bindings;
+  bindings.reserve(program.leaves.size());
+  for (const AggregateLeaf& leaf : program.leaves) {
+    bindings.push_back(leaf.input->bind(pool, segment));
+  }
+  return bindings;
 }
 
 } // namespace luxir

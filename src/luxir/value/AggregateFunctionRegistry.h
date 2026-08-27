@@ -9,27 +9,15 @@
 
 namespace luxir {
 
-enum class AggregateOpcode : uint8_t {
-  AVG,
-  SUM,
-  MIN,
-  MAX,
-};
-
 struct AggregateFunction {
-  using Resolve = ResolvedAggregate (*)(const ValueNode* input);
+  using Resolve = ResolvedAggregate (*)(
+      const ValueNode* input,
+      std::span<const AggregateConstant> trailingArguments);
 
-  AggregateOpcode opcode;
   std::string_view name;
   uint8_t minArguments = 0;
   uint8_t maxArguments = 0;
   Resolve resolve = nullptr;
-  uint8_t capabilities = functionCapabilities(
-      FunctionCapability::BUCKET_AGGREGATE);
-
-  bool supports(FunctionCapability capability) const {
-    return (capabilities & (uint8_t)capability) != 0;
-  }
 };
 
 struct ExpressionFunctionLookup {

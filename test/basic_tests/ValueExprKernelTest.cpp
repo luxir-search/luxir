@@ -36,10 +36,14 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   constexpr int64_t BIG = 9007199254740993LL;
   helper.index(flatdoc("id_s", "a", "x_i", BIG, "f_f", -1.5f,
                        "values_is", vec_i(-3, 5), "den_i", -1,
+                       "values_ds", vec(1.5, -0.25),
+                       "overflow_is", vec_i(
+                           std::numeric_limits<int64_t>::max(), 1),
                        "divisors_is", vec_i(2, 0, 4),
                        "when_dt", int64_t{1000}), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "f_f", 4.25f,
                        "values_is", vec_i(2, 8, 4), "den_i", 0,
+                       "values_ds", vec(2.0),
                        "when_dt", int64_t{3000}), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "x_i", -5, "f_f", 0.0f,
                        "den_i", 1), UpdateMessage::COMMIT);
@@ -74,7 +78,8 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   }
   for (auto [expression, expectedValue] : {
            std::pair<std::string_view, double>{"min(values_is)", -3.0},
-           {"max(values_is)", 5.0}, {"avg(values_is)", 1.0}}) {
+           {"max(values_is)", 5.0}, {"avg(values_is)", 1.0},
+           {"sum(values_is)", 2.0}}) {
     ValueProgram* reducer = parseValue(memory, *schema, expression);
     auto reducerBound = reducer->bind(pool, segment);
     ValueResult result = reducerBound->evalPoint(0, 0.0f);
@@ -84,6 +89,88 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
     EXPECT_DOUBLE_EQ(expectedValue, actual) << expression;
     EXPECT_FALSE(reducerBound->evalPoint(2, 0.0f).valid) << expression;
   }
+
+  ValueProgram* sum = parseValue(memory, *schema, "sum(values_is)");
+  auto sumBound = sum->bind(pool, segment);
+  const ValueBounds& sumBounds = sumBound->bounds(sum->rootNode);
+  EXPECT_EQ(BoundsCertainty::UNBOUNDED, sumBounds.certainty);
+  EXPECT_TRUE(sumBounds.mayBeMissing);
+  std::array<int32_t, 3> reducerDocs{0, 1, 2};
+  std::array<ValueResult, 3> sumBatch;
+  sumBound->evalBatch(reducerDocs, {}, sumBatch);
+  ASSERT_TRUE(sumBatch[0].valid);
+  EXPECT_EQ(2, sumBatch[0].intValue);
+  ASSERT_TRUE(sumBatch[1].valid);
+  EXPECT_EQ(14, sumBatch[1].intValue);
+  EXPECT_FALSE(sumBatch[2].valid);
+
+  ValueProgram* doubleSum = parseValue(memory, *schema, "sum(values_ds)");
+  auto doubleSumBound = doubleSum->bind(pool, segment);
+  EXPECT_DOUBLE_EQ(1.25,
+                   doubleSumBound->evalPoint(0, 0.0f).doubleValue);
+  EXPECT_FALSE(doubleSumBound->evalPoint(2, 0.0f).valid);
+  std::array<ValueResult, 3> doubleSumBatch;
+  doubleSumBound->evalBatch(reducerDocs, {}, doubleSumBatch);
+  EXPECT_DOUBLE_EQ(1.25, doubleSumBatch[0].doubleValue);
+  EXPECT_DOUBLE_EQ(2.0, doubleSumBatch[1].doubleValue);
+  EXPECT_FALSE(doubleSumBatch[2].valid);
+
+  ValueProgram* overflow = parseValue(memory, *schema, "sum(overflow_is)");
+  auto overflowBound = overflow->bind(pool, segment);
+  EXPECT_FALSE(overflowBound->evalPoint(0, 0.0f).valid);
+
+  ValueProgram* count = parseValue(memory, *schema, "count(values_is)");
+  auto countBound = count->bind(pool, segment);
+  const ValueBounds& countBounds = countBound->bounds(count->rootNode);
+  ASSERT_EQ(BoundsCertainty::BOUNDED, countBounds.certainty);
+  EXPECT_EQ(0, countBounds.intMin);
+  EXPECT_EQ(std::numeric_limits<int64_t>::max(), countBounds.intMax);
+  EXPECT_FALSE(countBounds.mayBeMissing);
+  std::array<ValueResult, 3> countBatch;
+  countBound->evalBatch(reducerDocs, {}, countBatch);
+  EXPECT_EQ(2, countBatch[0].intValue);
+  EXPECT_EQ(3, countBatch[1].intValue);
+  EXPECT_EQ(0, countBatch[2].intValue);
+
+  ValueProgram* scalarCount = parseValue(memory, *schema, "count(x_i)");
+  auto scalarCountBound = scalarCount->bind(pool, segment);
+  const ValueBounds& scalarCountBounds =
+      scalarCountBound->bounds(scalarCount->rootNode);
+  ASSERT_EQ(BoundsCertainty::BOUNDED, scalarCountBounds.certainty);
+  EXPECT_EQ(0, scalarCountBounds.intMin);
+  EXPECT_EQ(1, scalarCountBounds.intMax);
+  EXPECT_FALSE(scalarCountBounds.mayBeMissing);
+  std::array<ValueResult, 3> scalarCountBatch;
+  scalarCountBound->evalBatch(reducerDocs, {}, scalarCountBatch);
+  EXPECT_EQ(1, scalarCountBatch[0].intValue);
+  EXPECT_EQ(0, scalarCountBatch[1].intValue);
+  EXPECT_EQ(1, scalarCountBatch[2].intValue);
+
+  ValueProgram* sparseCount =
+      parseValue(memory, *schema, "count(12 / divisors_is)");
+  auto sparseCountBound = sparseCount->bind(pool, segment);
+  EXPECT_EQ(2, sparseCountBound->evalPoint(0, 0.0f).intValue);
+  EXPECT_EQ(0, sparseCountBound->evalPoint(1, 0.0f).intValue);
+
+  std::array<int64_t, 0> noValues;
+  api::Val empty;
+  empty.kind = api::ArrInt{noValues};
+  using Pair = std::pair<
+      std::string_view, ::hpp_proto::indirect_view<api::Val>>;
+  std::array<Pair, 1> emptyPairs{{{"empty", {&empty}}}};
+  ValueExprOptions emptyOptions{
+      schema.get(), api::map_view<
+                        std::string_view,
+                        ::hpp_proto::indirect_view<api::Val>>{emptyPairs}};
+  ValueProgram* emptySum =
+      ValueExprParser(emptyOptions, *memory.arena).parse("sum($empty)");
+  ValueProgram* emptyCount =
+      ValueExprParser(emptyOptions, *memory.arena).parse("count($empty)");
+  EXPECT_FALSE(emptySum->bind(pool, segment)->evalPoint(0, 0.0f).valid);
+  ValueResult emptyCountValue =
+      emptyCount->bind(pool, segment)->evalPoint(0, 0.0f);
+  ASSERT_TRUE(emptyCountValue.valid);
+  EXPECT_EQ(0, emptyCountValue.intValue);
 
   ValueProgram* dividedArray =
       parseValue(memory, *schema, "avg(values_is / den_i)");
@@ -301,18 +388,43 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   EXPECT_EQ(BoundsInvalidity::POSITIVE_INFINITY, infinite.invalidity);
 }
 
-TEST_F(ValueExprKernelTest, nonFiniteColumnEndpointIsRejectedAtBind) {
+TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
   CollectionHelper helper;
-  helper.index(flatdoc("id_s", "finite", "weight_d", 1.0),
+  helper.index(flatdoc("id_s", "finite", "weight_d", 1.0,
+                       "clean_d", 1.0),
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "infinite", "weight_d",
-                       std::numeric_limits<double>::infinity()),
+                       std::numeric_limits<double>::infinity(),
+                       "clean_d", std::numeric_limits<double>::infinity()),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "nan", "weight_d",
+                       std::numeric_limits<double>::quiet_NaN()),
                UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;
-  ValueProgram* program = parseValue(memory, *schema, "add(weight_d,0.0)");
-  EXPECT_THROW(program->bind(pool, reader->segments()[0]),
-               std::runtime_error);
+  ValueProgram* program = parseValue(memory, *schema, "weight_d");
+  BoundValueProgram* bound = program->bind(pool, reader->segments()[0]);
+  EXPECT_DOUBLE_EQ(1.0, bound->evalPoint(0, 0.0f).doubleValue);
+  ValueResult infinite = bound->evalPoint(1, 0.0f);
+  ASSERT_TRUE(infinite.valid);
+  EXPECT_EQ(std::numeric_limits<double>::infinity(), infinite.doubleValue);
+  EXPECT_FALSE(bound->evalPoint(2, 0.0f).valid);
+
+  ValueProgram* minimum = parseValue(memory, *schema, "min(clean_d,0)");
+  BoundValueProgram* minimumBound =
+      minimum->bind(pool, reader->segments()[0]);
+  EXPECT_DOUBLE_EQ(0.0, minimumBound->evalPoint(0, 0.0f).doubleValue);
+  EXPECT_DOUBLE_EQ(0.0, minimumBound->evalPoint(1, 0.0f).doubleValue);
+  EXPECT_FALSE(minimumBound->evalPoint(2, 0.0f).valid);
+
+  ValueProgram* maximum = parseValue(
+      memory, *schema, "max(clean_d,clean_d)");
+  BoundValueProgram* maximumBound =
+      maximum->bind(pool, reader->segments()[0]);
+  EXPECT_DOUBLE_EQ(1.0, maximumBound->evalPoint(0, 0.0f).doubleValue);
+  EXPECT_EQ(std::numeric_limits<double>::infinity(),
+            maximumBound->evalPoint(1, 0.0f).doubleValue);
+  EXPECT_FALSE(maximumBound->evalPoint(2, 0.0f).valid);
 }

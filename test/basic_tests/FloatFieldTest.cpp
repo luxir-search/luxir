@@ -156,10 +156,9 @@ TEST_F(FloatFieldTest, sortDouble) {
   ASSERT_EQ((std::vector<std::string>{"a", "c", "b"}), ids);
 }
 
-// Facet-inline avg (the per-bucket InlineCalc path) must iterate every value
-// of a multi-valued field and divide by the number of values seen, matching
-// the non-inline path - not by the bucket's doc count.
-TEST_F(FloatFieldTest, avgFacetInline) {
+// Multi-valued inputs require an explicit per-document reducer. The bucket
+// average then gives each document with a value equal weight.
+TEST_F(FloatFieldTest, avgFacetInlineUsesExplicitPerDocReducer) {
   CollectionHelper helper;
 
   helper.index(flatdoc("id_s", "a", "color_s", "red", "vals_ds", vec(1.0, 3.0), "nums_is", vec_i(10, 20)),
@@ -173,8 +172,8 @@ TEST_F(FloatFieldTest, avgFacetInline) {
   req->collection("main").topDocs("q").allQuery().limit(10);
   auto& facet = req->facet("f", "color_s");
   facet.limit(-1);
-  facet.avg("avgd", "vals_ds");
-  facet.avg("avgi", "nums_is");
+  facet.expr("avgd", "avg(avg(vals_ds))");
+  facet.expr("avgi", "avg(avg(nums_is))");
   qb::sort(facet, "avgd", qb::ASC);
   req->execute();
   ASSERT_OK(req);
@@ -186,16 +185,15 @@ TEST_F(FloatFieldTest, avgFacetInline) {
   ASSERT_EQ("red", bids.v[0]);
   ASSERT_EQ("blue", bids.v[1]);
 
-  // red: (1+3+5)/3 values = 3.0 (dividing by its 2 docs would give 4.5)
-  // blue: 6/1 value = 6.0 (dividing by its 2 docs would give 3.0)
-  ASSERT_DOUBLE_EQ(3.0, std::get<luxir::api::ArrDouble>(fr->ops.at("avgd")->kind).v[0]);
-  ASSERT_DOUBLE_EQ(6.0, std::get<luxir::api::ArrDouble>(fr->ops.at("avgd")->kind).v[1]);
-
-  // multi-valued int through the same inline path
-  // red: (10+20+30)/3 = 20.0 ; blue has no values -> NaN, matching the
-  // non-inline path (rendered as null by the JSON layer)
-  ASSERT_DOUBLE_EQ(20.0, std::get<luxir::api::ArrDouble>(fr->ops.at("avgi")->kind).v[0]);
-  ASSERT_TRUE(std::isnan(std::get<luxir::api::ArrDouble>(fr->ops.at("avgi")->kind).v[1]));
+  const auto& avgd = std::get<luxir::api::ArrVal>(fr->ops.at("avgd")->kind).v;
+  const auto& avgi = std::get<luxir::api::ArrVal>(fr->ops.at("avgi")->kind).v;
+  // red: avg(1,3)=2 and avg(5)=5, then (2+5)/2 = 3.5.
+  // blue: the missing document is skipped, leaving avg(6) = 6.
+  ASSERT_DOUBLE_EQ(3.5, avgd[0].asDouble());
+  ASSERT_DOUBLE_EQ(6.0, avgd[1].asDouble());
+  // red: avg(10,20)=15 and avg(30)=30, then (15+30)/2 = 22.5.
+  ASSERT_DOUBLE_EQ(22.5, avgi[0].asDouble());
+  ASSERT_TRUE(avgi[1].isNull());
 }
 
 // avg must decode the sortable bits before summing - the sum of raw encoded

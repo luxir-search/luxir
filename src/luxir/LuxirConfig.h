@@ -123,9 +123,14 @@ struct SearchConfig {
   // A request-shape limit like the query parsers' nesting budget, but much
   // lower: every level is a full search operation, not just a query node.
   int max_op_depth = 10;
-  // Request-wide ceiling for resident aggregate state held by facet inline and
-  // replay bindings. Zero disables the ceiling.
-  size_t facet_aggregate_state_max_bytes = 64ULL * 1024 * 1024;
+  // Per-request query-memory breaker ceiling; zero (the default) tracks but
+  // never rejects. Facet aggregate state is the first charge site; sorts and
+  // domains will join it over time. Sizing guidance when enabling: a
+  // 278,741-bucket min/max metric needs a 17-byte state;
+  // 278,741 * 17 * (32 live collectors + one merge copy), plus 33 * 64 KiB
+  // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
+  // Early-merge degradation is future work.
+  size_t request_memory_max_bytes = 0;
 };
 
 struct LuxirConfig {

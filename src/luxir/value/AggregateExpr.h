@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory_resource>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -75,11 +76,21 @@ struct BucketScalar {
   }
 };
 
+struct AggregateConstant {
+  ValueType type = ValueType::INT64;
+  int64_t intValue = 0;
+  double doubleValue = 0.0;
+};
+
 struct AggregateStateOps {
-  using Init = void (*)(void* state);
-  using Accumulate = void (*)(void* state, const ValueResult& value);
-  using Merge = void (*)(void* target, const void* source);
-  using Finish = BucketScalar (*)(const void* state);
+  using Init = void (*)(void* state,
+                        std::span<const AggregateConstant> arguments);
+  using Accumulate = void (*)(void* state, const ValueResult& value,
+                              std::span<const AggregateConstant> arguments);
+  using Merge = void (*)(void* target, const void* source,
+                         std::span<const AggregateConstant> arguments);
+  using Finish = BucketScalar (*)(
+      const void* state, std::span<const AggregateConstant> arguments);
 
   uint32_t bytes = 0;
   Init init = nullptr;
@@ -100,6 +111,7 @@ struct ResolvedAggregate {
 struct AggregateLeaf {
   ValueProgram* input = nullptr;
   ResolvedAggregate resolved;
+  std::span<const AggregateConstant> arguments;
   uint32_t stateOffset = 0;
 };
 
@@ -114,7 +126,6 @@ struct AggregateNode {
   AggregateNodeKind kind = AggregateNodeKind::CONSTANT;
   BucketValueType type = BucketValueType::INT128;
   ValueNature nature = ValueNature::NUMBER;
-  ValueOpcode opcode = ValueOpcode::NONE;
   const ValueFunction* function = nullptr;
   std::array<uint32_t, 2> children{};
   uint32_t aggregate = 0;
@@ -146,6 +157,16 @@ public:
   }
 
   const AggregateNode& root() const { return nodes[rootNode]; }
+
+  std::span<const AggregateConstant> copyConstants(
+      std::span<const AggregateConstant> values) {
+    if (values.empty()) return {};
+    auto* target = (AggregateConstant*)resource.allocate(
+        sizeof(AggregateConstant) * values.size(),
+        alignof(AggregateConstant));
+    std::uninitialized_copy(values.begin(), values.end(), target);
+    return {target, values.size()};
+  }
 };
 
 // A non-owning aggregate state stored in caller-provided bytes. Facet entries
@@ -198,5 +219,8 @@ public:
 };
 
 void writeAggregateValue(api::Val& target, const BucketScalar& value);
+std::vector<BoundValueProgram*> bindAggregateInputs(
+    const AggregateProgram& program, MemPool& pool,
+    IndexReader::Segment& segment);
 
 } // namespace luxir

@@ -664,8 +664,8 @@ ResidentExactDomainRun runResidentExactDomain(
     const auto* docs = req->docList("q");
     EXPECT_NE(docs, nullptr);
     if (docs != nullptr) {
-      result.avg = std::get<double>(docs->ops.at("avg")->kind);
-      result.sum = std::get<double>(docs->ops.at("sum")->kind);
+      result.avg = docs->ops.at("avg")->asDouble();
+      result.sum = (double)docs->ops.at("sum")->asInt();
     }
   }
   return result;
@@ -1295,12 +1295,12 @@ TEST_F(SearchEngineTest, prunedTopDocsFacetTwoPassMatchesExhaustiveMultiSegment)
   expectPrunedFacetTwoPassMatchesExhaustive(helper, 3);
 }
 
-TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
+TEST_F(SearchEngineTest, aggregateOpsEmptyIndexEmitNull) {
   CollectionHelper helper;
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  req->requestId("test_stats_ops_empty_index_emit_nan");
+  req->requestId("test_aggregate_ops_empty_index_emit_null");
 
   auto& topDocs = req->topDocs("q").allQuery().getNumber();
   topDocs.avg("nested_avg", "foo_i");
@@ -1317,17 +1317,17 @@ TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   const auto& response = req->responses[0]->proto;
   ASSERT_FALSE(hasError(response)) << req->toString();
   ASSERT_TRUE(response.ops.contains("root_avg")) << req->toString();
-  EXPECT_TRUE(std::isnan(req->scalar<double>("root_avg")));
-  EXPECT_TRUE(std::isnan(req->scalar<double>("root_sum")));
-  EXPECT_TRUE(std::isnan(req->scalar<double>("root_min")));
-  EXPECT_TRUE(std::isnan(req->scalar<double>("root_max")));
+  EXPECT_TRUE(response.ops.at("root_avg")->isNull());
+  EXPECT_TRUE(response.ops.at("root_sum")->isNull());
+  EXPECT_TRUE(response.ops.at("root_min")->isNull());
+  EXPECT_TRUE(response.ops.at("root_max")->isNull());
 
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr);
   ASSERT_EQ(0, docs->found.value_or(0));
   ASSERT_TRUE(docs->ops.contains("nested_avg")) << req->toString();
-  EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_avg")->kind)));
-  EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_sum")->kind)));
+  EXPECT_TRUE(docs->ops.at("nested_avg")->isNull());
+  EXPECT_TRUE(docs->ops.at("nested_sum")->isNull());
 }
 
 // Root-level min/max across 2 segments over int, float, double, and
@@ -1351,21 +1351,21 @@ TEST_F(SearchEngineTest, minMaxOps) {
   req->max("max_f", "foo_f");
   req->min("min_d", "foo_d");
   req->max("max_d", "foo_d");
-  req->min("min_is", "prices_is");
-  req->max("max_is", "prices_is");
+  req->expr("min_is", "min(min(prices_is))");
+  req->expr("max_is", "max(max(prices_is))");
 
   req->execute();
 
   ASSERT_EQ(1u, req->responses.size()) << req->toString();
   ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
-  EXPECT_EQ(-8.0, req->scalar<double>("min_i"));
-  EXPECT_EQ(23.0, req->scalar<double>("max_i"));
+  EXPECT_EQ(-8, req->scalar<int64_t>("min_i"));
+  EXPECT_EQ(23, req->scalar<int64_t>("max_i"));
   EXPECT_EQ(-2.5, req->scalar<double>("min_f"));
   EXPECT_EQ(1.25, req->scalar<double>("max_f"));
   EXPECT_EQ(-1e100, req->scalar<double>("min_d"));
   EXPECT_EQ(3.5, req->scalar<double>("max_d"));
-  EXPECT_EQ(3.0, req->scalar<double>("min_is"));
-  EXPECT_EQ(45.0, req->scalar<double>("max_is"));
+  EXPECT_EQ(3, req->scalar<int64_t>("min_is"));
+  EXPECT_EQ(45, req->scalar<int64_t>("max_is"));
 }
 
 TEST_F(SearchEngineTest, sumOps) {
@@ -1388,28 +1388,47 @@ TEST_F(SearchEngineTest, sumOps) {
   req->sum("sum_i", "foo_i");
   req->sum("sum_f", "foo_f");
   req->sum("sum_d", "foo_d");
-  req->sum("sum_is", "prices_is");
+  req->expr("sum_is", "sum(avg(prices_is))");
 
   req->execute();
 
   ASSERT_OK(req);
-  EXPECT_EQ(1.0, req->scalar<double>("sum_i"));
+  EXPECT_EQ(1, req->scalar<int64_t>("sum_i"));
   EXPECT_EQ(0.0, req->scalar<double>("sum_f"));
   EXPECT_EQ(2.25, req->scalar<double>("sum_d"));
-  EXPECT_EQ(103.0, req->scalar<double>("sum_is"));
-  EXPECT_EQ(1.0, std::get<double>(req->docList("q")->ops.at("nested_i")->kind));
+  EXPECT_DOUBLE_EQ(109.0 / 3.0, req->scalar<double>("sum_is"));
+  EXPECT_EQ(1, req->docList("q")->ops.at("nested_i")->asInt());
 }
 
-TEST_F(SearchEngineTest, sumRejectsDateFields) {
+TEST_F(SearchEngineTest, dateAggregatesPreserveDatesAndRejectSum) {
   CollectionHelper helper;
+  helper.index(flatdoc("id", "a", "when_dt", int64_t{1000}),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "b", "when_dt", int64_t{3000}),
+               UpdateMessage::COMMIT);
+
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  req->sum("bad", "when_dt");
+  req->avg("average", "when_dt");
+  req->min("minimum", "when_dt");
+  req->max("maximum", "when_dt");
 
   req->execute();
 
-  ASSERT_FALSE(req->ok());
-  EXPECT_NE(std::string::npos, req->errorMsg().find("cannot sum DATE field 'when_dt'"));
+  ASSERT_OK(req);
+  EXPECT_DOUBLE_EQ(2000.0, req->scalar<double>("average"));
+  EXPECT_EQ(1000, req->scalar<int64_t>("minimum"));
+  EXPECT_EQ(3000, req->scalar<int64_t>("maximum"));
+
+  auto invalid = localReq(luxirNode->getSearchEngine());
+  invalid->collection("main");
+  invalid->sum("bad", "when_dt");
+
+  invalid->execute();
+
+  ASSERT_FALSE(invalid->ok());
+  EXPECT_NE(std::string::npos,
+            invalid->errorMsg().find("cannot aggregate a DATE expression"));
 }
 
 // limit 0 ("count/aggregate only, no docs") must return an accurate count and any
@@ -3470,10 +3489,12 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, facetOf("f4").counts.at(1));
     ASSERT_EQ(1, facetOf("f4").counts.at(2));
     // check the sub-op avg
-    ASSERT_EQ(3, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v.size());
-    ASSERT_EQ(5, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[0]);
-    ASSERT_EQ(17, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[1]);
-    ASSERT_EQ(23, std::get<luxir::api::ArrDouble>(facetOf("f4").ops.at("avgsub")->kind).v[2]);
+    const auto& avgsub = std::get<luxir::api::ArrVal>(
+        facetOf("f4").ops.at("avgsub")->kind).v;
+    ASSERT_EQ(3, avgsub.size());
+    ASSERT_EQ(5, avgsub[0].asDouble());
+    ASSERT_EQ(17, avgsub[1].asDouble());
+    ASSERT_EQ(23, avgsub[2].asDouble());
 
     // check the fifth facet
     ASSERT_EQ(2, fBidsS("f5").v.size());
@@ -3520,7 +3541,7 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, facetOf("f9").counts.at(4));
 
     // check the avg
-    ASSERT_EQ(std::get<double>(resp.ops.at("avg")->kind), 15);
+    ASSERT_EQ(resp.ops.at("avg")->asDouble(), 15);
   }
 
 
@@ -5236,12 +5257,12 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
       const auto& groupIds =
           std::get<api::ColStr>(facetResult->bucket_ids->kind);
       const auto& avgs =
-          std::get<api::ArrDouble>(facetResult->ops.at("avg")->kind);
+          std::get<api::ArrVal>(facetResult->ops.at("avg")->kind);
       const auto& subResults =
           std::get<api::ArrVal>(facetResult->ops.at("subs")->kind);
       for (size_t i = 0; i < groupIds.v.size(); i++) {
         std::string group(groupIds.v[i]);
-        result.avgs[group] = avgs.v[i];
+        result.avgs[group] = avgs.v[i].asDouble();
         const auto& subFacet =
             std::get<api::FacetResult>(subResults.v[i].kind);
         const auto& subIds =

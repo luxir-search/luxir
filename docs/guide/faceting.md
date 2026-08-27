@@ -85,24 +85,48 @@ category values occur?" Integer/date/text field facets currently support
 sorts. Use a range facet when numeric values should be bucketed rather than
 enumerated.
 
-## Numeric metrics
+## Expression metrics
 
-`avg`, `sum`, `min`, and `max` are generic operations over a numeric column. They
-ignore missing values and return `null` when no value exists in the domain:
+An expression metric folds document values over its incoming domain. `avg`,
+`sum`, `min`, and `max` are the bucket aggregates. The shortest JSON form is a
+bare expression string in an operation position:
 
 ```json
-"average_price": {
-  "gen_op": {"name":"avg","args":["price_f"]}
-}
+"average_price": "avg(price_f)"
 ```
 
-`sum` adds every value occurrence, including every element of a multi-valued
-field. Integer sums are accumulated exactly and then returned as a `double`, so
-values beyond 2^53 may be rounded in the response.
+The equivalent explicit forms are
+`{"expr_op":"avg(price_f)"}` and
+`{"expr_op":{"expr":"avg(price_f)"}}`. The object form also accepts a
+`vars` map for scalar `$name` values.
 
-At the root of `top_docs.ops`, the result is one scalar over the entire match
-domain. Nested under a string or ID facet, it is evaluated independently for
-each returned bucket:
+Aggregate arguments use the same numeric value-expression language as sort and
+rescore expressions, including arithmetic, parentheses, `def`, unary math, and
+explicit per-document array reducers. This makes composite metrics direct:
+
+```json
+"weighted_price": "sum(price_f * qty_i) / sum(qty_i)"
+```
+
+A bare multi-valued column is not implicitly pooled. For example,
+`avg(prices_fs)` is rejected; use `avg(avg(prices_fs))` to average each
+document's array first and then average those per-document values across the
+bucket. Missing document values are skipped by an aggregate. `def(value, 0)`
+can opt a missing value back into its denominator or sum.
+
+Integer `sum`, `min`, and `max` results are returned as int64 values; integer
+sums accumulate exactly. `avg` and any floating-point expression return a
+double. A domain with no contributing values returns `null`. Data-dependent
+overflow or a non-finite aggregate also returns `null` and adds a response
+warning rather than failing the request.
+
+For DATE values, `avg`, `min`, and `max` are legal and retain date meaning;
+`sum(DATE)` is rejected as a unit clash. Multiplication, division, unary minus,
+and unary math demote a DATE expression to an ordinary number.
+
+At the request root or directly under `top_docs.ops`, the result is one scalar
+over the incoming domain. Nested under a string or ID facet, it is evaluated
+independently for each bucket:
 
 ```json
 "categories": {
@@ -111,11 +135,9 @@ each returned bucket:
     "limit": 10,
     "ops": {
       "average_price": {
-        "gen_op": {"name":"avg","args":["price_f"]}
+        "expr_op": "avg(price_f)"
       },
-      "lowest_price": {
-        "gen_op": {"name":"min","args":["price_f"]}
-      }
+      "lowest_price": "min(price_f)"
     }
   }
 }
@@ -140,7 +162,7 @@ Sort a string/ID facet by one of its metric operations:
     "field": "category_s",
     "limit": 5,
     "ops": {
-      "average_price": {"gen_op":{"name":"avg","args":["price_f"]}}
+      "average_price": "avg(price_f)"
     },
     "sorts": [{"expr":"average_price","dir":"desc"}]
   }
@@ -148,9 +170,18 @@ Sort a string/ID facet by one of its metric operations:
 ```
 
 Facet sort expressions are resolved contextually as metric operation names;
-document value expressions are not evaluated for buckets. Only one facet sort
-key is supported. Custom count and bucket-value sort specifications are not yet
-supported; omit `sorts` for the default count order.
+document value expressions are not evaluated for buckets. Both `asc` and
+`desc` are supported, and a missing or failed metric sorts last in either
+direction. Only one facet sort key is supported. Custom count and bucket-value
+sort specifications are not yet supported; omit `sorts` for the default count
+order.
+
+Facet aggregate state is bounded by the server's
+`search.request-memory-max-bytes` per-request query-memory ceiling. The engine
+charges the resolved state stride for every simultaneously resident bucket. A
+metric needed to sort candidates cannot be deferred; if its estimated state
+would exceed the ceiling, the request-memory breaker reports its attempted
+total and ceiling together with the facet and metric names.
 
 ## Nested facets
 
@@ -229,10 +260,18 @@ counts. `mincount: 0` retains all of them; a positive value filters after
 counting. NaN and infinity values fall outside every floating-point bucket, and
 a gap too fine for the field's representation at that magnitude is rejected.
 
-Range-facet sub-operations and custom sorts are not implemented. The HTTP
-renderer currently emits `null` for float/double range bucket bounds even
-though counts and the typed gRPC bounds are correct; integer and date bounds
-render normally over HTTP.
+Range facets accept sub-operations. Each retained range bucket supplies its
+document domain to the child operation, so an expression metric or nested
+string facet has the same semantics as it does under a string bucket. Empty
+range buckets therefore emit null expression metrics. The executor processes
+stateful child bindings in bounded blocks rather than retaining every bucket's
+state at once. Range facets with sub-operations are limited to 1,024 buckets.
+Custom sorts are not yet supported for range facets; buckets remain in fence
+order.
+
+The HTTP renderer currently emits `null` for float/double range bucket bounds
+even though counts and the typed gRPC bounds are correct; integer and date
+bounds render normally over HTTP.
 
 For numeric/date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
@@ -266,6 +305,10 @@ adding to the previous fence. A sequence starting on January 31 therefore
 produces February 28 or 29 and then March 31 instead of drifting. Days across a
 daylight-saving change can be 23 or 25 physical hours. Week buckets begin on
 Monday.
+
+For a fixed UTC epoch-day number in the value-expression language, use
+`floor(when_dt / 86400000)`. Use a date range facet with `calendar_gap` instead
+when day bucketing must follow a civil time zone and daylight-saving changes.
 
 Nonexistent civil fences shift forward through the zone transition. If a zone
 change removes a whole nominal bucket, Luxir removes the zero-width bucket and

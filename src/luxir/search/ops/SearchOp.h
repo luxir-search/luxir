@@ -283,13 +283,15 @@ public:
     virtual std::pair<int, int> merge(void* target, void* from) = 0;
     // mergeNew is called when entry did not exist for target
     virtual std::pair<int, int> mergeNew(void* target, void* from, int space) = 0;
+    virtual void beginFinalize(size_t entries) = 0;
     virtual int finalize(void* entry, int64_t count) = 0;
-    virtual int compare(void* a, void* b, int& asize, int& bsize) = 0;
-    virtual bool isMissing(void* entry) {
+    virtual int compare(size_t a, size_t b) = 0;
+    virtual bool isMissing(size_t entry) {
       unused(entry);
       return false;
     }
-    virtual void fillResult(std::span<char*>) = 0;
+    virtual void fillResult(std::span<char*> entries,
+                            std::span<const size_t> finalizedSlots) = 0;
 
   };
 
@@ -299,9 +301,20 @@ public:
 //   [int64 doc count][one variable-size blob per inline calculator]
 // Entries start wherever the previous one ended, so nothing in an entry can be
 // assumed aligned - go through load/storeUnaligned here, and declare
-// calculator entry structs LUXIR_UNALIGNED (see StatsOp::InlineCalc::Entry).
+// calculator entry structs LUXIR_UNALIGNED.
 template <typename Key>
 class FacetMap {
+  using Iterator = typename boost::unordered_flat_map<Key, char*>::iterator;
+
+  std::pair<Iterator, bool> findOrInsert(const Key& key) {
+    auto iter = map.find(key);
+    if (iter != map.end()) return {iter, false};
+    for (auto* calc : calcs) calc->prepareEntry();
+    auto [insertedIter, inserted] = map.insert({key, nullptr});
+    assert(inserted);
+    return {insertedIter, true};
+  }
+
 public:
   boost::unordered_flat_map<Key, char*> map;
   std::span<SearchOp::InlineCalculator*> calcs;
@@ -311,13 +324,9 @@ public:
   FacetMap() = default;
 
   void add(const Key& key, int32_t docid) {
-    auto iter = map.find(key);
-    bool inserted = iter == map.end();
+    auto [iter, inserted] = findOrInsert(key);
 
     if (inserted) {
-      for (auto* calc : calcs) calc->prepareEntry();
-      std::tie(iter, inserted) = map.insert({key, nullptr});
-      assert(inserted);
       auto ptr = pool.reserve(sizeof(int64_t));
       int space = (int)pool.spaceLeft();
       auto start = ptr;
@@ -357,12 +366,8 @@ public:
 
   void merge(FacetMap<Key>& other) {
     for (auto& [key, otherPtr] : other.map) {
-      auto iter = map.find(key);
-      bool inserted = iter == map.end();
+      auto [iter, inserted] = findOrInsert(key);
       if (inserted) {
-        for (auto* calc : calcs) calc->prepareEntry();
-        std::tie(iter, inserted) = map.insert({key, nullptr});
-        assert(inserted);
         auto ptr = pool.reserve(sizeof(int64_t));
         int space = (int)pool.spaceLeft();
         auto start = ptr;
@@ -406,6 +411,7 @@ public:
   }
 
   void finalize() {
+    for (auto* calc : calcs) calc->beginFinalize(map.size());
     for (auto iter : map) {
       auto ptr = iter.second;
       auto count = loadUnaligned<int64_t>(ptr);

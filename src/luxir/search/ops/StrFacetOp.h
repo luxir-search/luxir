@@ -1275,10 +1275,15 @@ public:
       auto missing = thisOp().missing;
       mergedData->counts.finalize();
 
-      // (global ord, entry).  Ties break on the ord rather than the term text,
+      // (global ord, entry, finalized slot). Ties break on the ord rather than
+      // the term text,
       // which is the same rule the non-inline path applies
       // (sortByCountDescAndLimit over ordCounts) - one bucket order for both.
-      using Bucket = std::pair<int64_t, char*>;
+      struct Bucket {
+        int64_t ord;
+        char* entry;
+        size_t finalizedSlot;
+      };
       std::vector<Bucket> valVec;
       auto& counts = mergedData->counts.map;
       auto missing_count = mergedData->missing_num;
@@ -1303,23 +1308,20 @@ public:
       // the bounded selection and the final ordering of what it kept.
       auto better = [sortCalc, reversed](const Bucket& a, const Bucket& b) {
         if (sortCalc == nullptr) {
-          auto acount = loadUnaligned<int64_t>(a.second);
-          auto bcount = loadUnaligned<int64_t>(b.second);
+          auto acount = loadUnaligned<int64_t>(a.entry);
+          auto bcount = loadUnaligned<int64_t>(b.entry);
           if (acount != bcount) {
             return acount > bcount;
           }
-          return a.first < b.first;
+          return a.ord < b.ord;
         }
-        void* aMetric = a.second + sizeof(int64_t);
-        void* bMetric = b.second + sizeof(int64_t);
-        bool aMissing = sortCalc->isMissing(aMetric);
-        bool bMissing = sortCalc->isMissing(bMetric);
+        bool aMissing = sortCalc->isMissing(a.finalizedSlot);
+        bool bMissing = sortCalc->isMissing(b.finalizedSlot);
         if (aMissing != bMissing) return !aMissing;
-        if (aMissing) return a.first < b.first;
-        int asize, bsize;
-        int cmp = sortCalc->compare(aMetric, bMetric, asize, bsize);
+        if (aMissing) return a.ord < b.ord;
+        int cmp = sortCalc->compare(a.finalizedSlot, b.finalizedSlot);
         if (cmp == 0) {
-          return a.first < b.first; // tie-break by bucketid asc
+          return a.ord < b.ord; // tie-break by bucketid asc
         }
         return reversed ? cmp > 0 : cmp < 0;
       };
@@ -1331,29 +1333,35 @@ public:
         // call into the sort key's calculator and two dereferences into the
         // scattered entry pool, plus one 16-byte vector slot per bucket.  A
         // heap of `limit` costs one failed comparison per bucket and only
-        // ~limit*ln(n/limit) replacements, and grows its storage on demand
-        // (a deep limit over few surviving buckets allocates for the
+        // ~limit*ln(n/limit) replacements. Finalized scalar scratch and the
+        // compact selection records are materialized once per bucket before
+        // this loop, never inside a comparison; the heap itself grows on
+        // demand (a deep limit over few surviving buckets allocates for the
         // survivors, not the limit).
         // ExpandingPQ evicts the GREATEST element under its comparator, so
         // passing the returned order directly is what keeps the best: top()
         // is then the worst of the best-so-far, which is the one to beat.
         ExpandingPQ<Bucket, decltype(better)> pq((size_t)limit, better);
+        size_t finalizedSlot = 0;
         for (auto& [key, val] : counts) {
           int64_t count = loadUnaligned<int64_t>(val);
           if (minCount == -1 || count >= minCount) {
-            pq.insertWithOverflow({key, val});
+            pq.insertWithOverflow({key, val, finalizedSlot});
           }
+          finalizedSlot++;
         }
         std::vector<Bucket> top = pq.release();
         std::sort(top.begin(), top.end(), better);
         valVec = std::move(top);
       } else if (limit < 0) {
         // Every bucket is returned, so there is nothing to select against.
+        size_t finalizedSlot = 0;
         for (auto& [key, val] : counts) {
           int64_t count = loadUnaligned<int64_t>(val);
           if (minCount == -1 || count >= minCount) {
-            valVec.emplace_back(key, val);
+            valVec.push_back({key, val, finalizedSlot});
           }
+          finalizedSlot++;
         }
         std::sort(valVec.begin(), valVec.end(), better);
       }
@@ -1369,9 +1377,8 @@ public:
                           *thisOp().req.reader, thisOp().fieldName);
       std::vector<std::string> keys;
       keys.reserve(valVec.size());
-      for (auto [ord, entry] : valVec) {
-        unused(entry);
-        keys.emplace_back(ordMapStr.ordToStr(ord));
+      for (const Bucket& bucket : valVec) {
+        keys.emplace_back(ordMapStr.ordToStr(bucket.ord));
       }
 
       // fill in the facet result proto (non-owning: size known from valVec)
@@ -1381,7 +1388,7 @@ public:
       int64_t* countArr = build::allocArray(facetResultProto.counts, n, mr);
       for (size_t i = 0; i < n; i++) {
         ids[i] = build::arenaStr(mr, keys[i]);  // copy the (transient) string into the arena
-        countArr[i] = loadUnaligned<int64_t>(valVec[i].second);
+        countArr[i] = loadUnaligned<int64_t>(valVec[i].entry);
       }
       if (missing) {
         facetResultProto.missing = missing_count;
@@ -1389,12 +1396,15 @@ public:
 
       // fill in results from inline calculators
       std::vector<char*> results;
+      std::vector<size_t> finalizedSlots;
       results.reserve(valVec.size());
-      for (auto [key, val] : valVec) {
-        results.push_back(val + sizeof(int64_t));
+      finalizedSlots.reserve(valVec.size());
+      for (const Bucket& bucket : valVec) {
+        results.push_back(bucket.entry + sizeof(int64_t));
+        finalizedSlots.push_back(bucket.finalizedSlot);
       }
       for (auto calc : mergedData->inlineCalcs) {
-        calc->fillResult(results);
+        calc->fillResult(results, finalizedSlots);
       }
 
       std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
@@ -1404,8 +1414,8 @@ public:
             .key = keys[i],
             // Now known, and it is what StringFacetColumnSource documents its
             // bucket ids to be: the global ordinal for this OrdMap epoch.
-            .id = FacetBucketId{valVec[i].first},
-            .count = loadUnaligned<int64_t>(valVec[i].second),
+            .id = FacetBucketId{valVec[i].ord},
+            .count = loadUnaligned<int64_t>(valVec[i].entry),
             .owner = FacetOwnerSlot{(int32_t)i},
             .output = FacetOutputSlot{(int32_t)i}
         });

@@ -25,8 +25,8 @@ class LocalReq;
 
 // Fluent cursor over one op (or the request root). Cursors are owned by LocalReq in a
 // std::deque, so a reference stays valid as later chain calls add more cursors. The configure
-// methods assert the op kind. Descend with topDocs()/facet(); stat helpers add
-// a GenOp leaf and return the calling cursor. Climb back with end().
+// methods assert the op kind. Descend with topDocs()/facet(); aggregate helpers
+// add an ExprOp leaf and return the calling cursor. Climb back with end().
 //
 // The concrete luxir::api classes are the public API: reads go through their named accessors
 // (val.docList()/asDouble(), map_view.find). This cursor only hides the ARENA/build-by-backing
@@ -46,11 +46,10 @@ public:
   OpCursor& topDocs(std::string_view name);
   OpCursor& facet(std::string_view name, std::string_view field);       // FieldFacet
   OpCursor& rangeFacet(std::string_view name, std::string_view field);  // RangeFacet
-  OpCursor& avg(std::string_view name, std::string_view field);         // GenOp "avg"
-  OpCursor& sum(std::string_view name, std::string_view field);         // GenOp "sum"
-  OpCursor& min(std::string_view name, std::string_view field);         // GenOp "min"
-  OpCursor& max(std::string_view name, std::string_view field);         // GenOp "max"
-  OpCursor& stats(std::string_view name, std::string_view field);       // GenOp "stats"
+  OpCursor& avg(std::string_view name, std::string_view field);
+  OpCursor& sum(std::string_view name, std::string_view field);
+  OpCursor& min(std::string_view name, std::string_view field);
+  OpCursor& max(std::string_view name, std::string_view field);
   OpCursor& expr(std::string_view name, std::string_view expression);   // ExprOp leaf
   template <typename T>
   OpCursor& expr(std::string_view name, std::string_view expression,
@@ -104,7 +103,8 @@ public:
 private:
   luxir::api::TopDocs& asTopDocs();          // assert + return the TopDocs arm
   luxir::api::Query& getOrCreateQuery();      // get-or-create the TopDocs query
-  OpCursor& genOpHelper(std::string_view name, std::string_view fn, std::string_view field);
+  OpCursor& aggregateExpr(std::string_view name, std::string_view fn,
+                          std::string_view field);
 };
 
 // In-process search-request harness. Builds a CONCRETE luxir::api::SearchRequest (`view`)
@@ -186,7 +186,6 @@ public:
   OpCursor& sum(std::string_view name, std::string_view field) { return rootCursor_.sum(name, field); }
   OpCursor& min(std::string_view name, std::string_view field) { return rootCursor_.min(name, field); }
   OpCursor& max(std::string_view name, std::string_view field) { return rootCursor_.max(name, field); }
-  OpCursor& stats(std::string_view name, std::string_view field) { return rootCursor_.stats(name, field); }
 
   LocalReq& execute(bool parallel = true) {
     engine.submit(*this, parallel ? 0 : 1);
@@ -461,19 +460,16 @@ inline OpCursor& OpCursor::rangeFacet(std::string_view name, std::string_view fi
   return req_->pushCursor(this, sub, &f.ops);
 }
 inline OpCursor& OpCursor::avg(std::string_view name, std::string_view field) {
-  return genOpHelper(name, "avg", field);
+  return aggregateExpr(name, "avg", field);
 }
 inline OpCursor& OpCursor::sum(std::string_view name, std::string_view field) {
-  return genOpHelper(name, "sum", field);
+  return aggregateExpr(name, "sum", field);
 }
 inline OpCursor& OpCursor::min(std::string_view name, std::string_view field) {
-  return genOpHelper(name, "min", field);
+  return aggregateExpr(name, "min", field);
 }
 inline OpCursor& OpCursor::max(std::string_view name, std::string_view field) {
-  return genOpHelper(name, "max", field);
-}
-inline OpCursor& OpCursor::stats(std::string_view name, std::string_view field) {
-  return genOpHelper(name, "stats", field);
+  return aggregateExpr(name, "max", field);
 }
 inline OpCursor& OpCursor::expr(std::string_view name,
                                 std::string_view expression) {
@@ -497,15 +493,13 @@ inline OpCursor& OpCursor::expr(std::string_view name,
   variable->kind = value;
   return *this;
 }
-inline OpCursor& OpCursor::genOpHelper(std::string_view name, std::string_view fn, std::string_view field) {
-  auto* sub = req_->arenaNew<luxir::api::SearchOp>();
-  req_->appendOp(*subOps_, name, sub);
-  auto& g = sub->kind.emplace<luxir::api::GenOp>();
-  g.name = build::arenaStr(req_->mr, fn);
-  luxir::api::Val* args = build::allocArray(g.args, 1, req_->mr);
-  args[0].kind = build::arenaStr(req_->mr, field);
-  // GenOp is a leaf: stay on the cursor it was added to, so stat ops chain.
-  return *this;
+inline OpCursor& OpCursor::aggregateExpr(std::string_view name,
+                                         std::string_view fn,
+                                         std::string_view field) {
+  std::string expression;
+  expression.reserve(fn.size() + field.size() + 2);
+  expression.append(fn).append("(").append(field).append(")");
+  return expr(name, expression);
 }
 
 inline OpCursor& OpCursor::allQuery() { getOrCreateQuery().kind = true; return *this; }  // the `all` arm

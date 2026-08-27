@@ -61,6 +61,11 @@ const api::FacetResult& rootFacetResult(const LocalReq& req,
   return *req.responses[0]->proto.ops.at(name)->facetResult();
 }
 
+std::span<const api::Val> metricValues(const api::FacetResult& result,
+                                       std::string_view name) {
+  return std::get<api::ArrVal>(result.ops.at(name)->kind).v;
+}
+
 std::vector<std::byte> encodeFacetResult(const LocalReq& req,
                                          std::string_view name) {
   std::vector<std::byte> encoded;
@@ -132,6 +137,16 @@ TimeZone zone(std::string_view name) {
   return value.value_or(TimeZone::utc());
 }
 
+std::optional<std::string_view> avgExpressionField(
+    const api::SearchOp& op) {
+  const auto* expr = std::get_if<api::ExprOp>(&op.kind);
+  if (expr == nullptr || !expr->expr.starts_with("avg(")
+      || !expr->expr.ends_with(')')) {
+    return std::nullopt;
+  }
+  return expr->expr.substr(4, expr->expr.size() - 5);
+}
+
 int64_t localLo(std::string_view text, const TimeZone& timeZone,
                 int64_t now = 0) {
   auto value = parseDateRange(text, now, timeZone);
@@ -147,64 +162,6 @@ public:
   ~PointsRangeFacetTestGuard() {
     IntFacetRangeReq::disablePointsRangeFacetForTests = savedDisabled;
     SkipStats::enabled = savedStatsEnabled;
-  }
-};
-
-class FacetCounterModeGuard {
-  FacetCounterMode saved = forcedFacetCounterMode;
-public:
-  ~FacetCounterModeGuard() {
-    forcedFacetCounterMode = saved;
-  }
-};
-
-class StrFacetStrategyGuard {
-  StrFacetStrategy saved = forcedStrFacetStrategy;
-public:
-  ~StrFacetStrategyGuard() {
-    forcedStrFacetStrategy = saved;
-  }
-};
-
-class FacetFeedStrategyGuard {
-  FacetFeedStrategy saved = forcedFacetFeedStrategy;
-public:
-  ~FacetFeedStrategyGuard() {
-    forcedFacetFeedStrategy = saved;
-  }
-};
-
-class FacetSubOpInlineGuard {
-  FacetSubOpInlineMode saved = forcedFacetSubOpInline;
-public:
-  ~FacetSubOpInlineGuard() {
-    forcedFacetSubOpInline = saved;
-  }
-};
-
-class FacetBucketDomainSourceGuard {
-  FacetBucketDomainSource saved = forcedFacetBucketDomainSource;
-public:
-  ~FacetBucketDomainSourceGuard() {
-    forcedFacetBucketDomainSource = saved;
-  }
-};
-
-class RangeFacetBucketDomainBudgetGuard {
-  std::size_t saved = forcedRangeFacetBucketDomainByteBudget;
-public:
-  ~RangeFacetBucketDomainBudgetGuard() {
-    forcedRangeFacetBucketDomainByteBudget = saved;
-  }
-};
-
-class StrFacetReplayGuard {
-  StrFacetReplaySelector savedSelector = forcedStrFacetReplaySelector;
-  StrFacetReplayBankStrategy savedBank = forcedStrFacetReplayBank;
-public:
-  ~StrFacetReplayGuard() {
-    forcedStrFacetReplaySelector = savedSelector;
-    forcedStrFacetReplayBank = savedBank;
   }
 };
 
@@ -419,7 +376,7 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
   ASSERT_EQ((size_t)segments,
             helper.getIndexWriter()->getIndexReader()->segments().size());
 
-  FacetCounterModeGuard guard;
+  SearchOverridesGuard guard(forcedFacetCounterMode);
   auto run = [&](FacetCounterMode mode, int64_t mincount) {
     forcedFacetCounterMode = mode;
     auto req = localReq(luxirNode->getSearchEngine());
@@ -477,7 +434,7 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
   ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  StrFacetStrategyGuard guard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy);
   auto run = [&](StrFacetStrategy strategy, int domainKind) {
     forcedStrFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
@@ -590,7 +547,7 @@ TEST_F(FacetTest, complementStagingWrapBoundaries) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_EQ(1u, helper.durableSegmentCount());
 
-  StrFacetStrategyGuard guard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy);
   auto complement = filteredFacetBuckets(
       helper, StrFacetStrategy::COLUMN_COMPLEMENT, "w_s");
   for (int32_t k : {255, 256, 511, 512}) {
@@ -616,7 +573,7 @@ TEST_F(FacetTest, complementHashedStagingParity) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_EQ(1u, helper.durableSegmentCount());
 
-  StrFacetStrategyGuard guard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy);
   auto complement = filteredFacetBuckets(
       helper, StrFacetStrategy::COLUMN_COMPLEMENT, "w_s");
   EXPECT_EQ(93u, complement.size());
@@ -650,7 +607,7 @@ TEST_F(FacetTest, remappedOrdFrameBoundary) {
   }, UpdateMessage::COMMIT).success);
   ASSERT_EQ(2u, helper.durableSegmentCount());
 
-  StrFacetStrategyGuard guard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy);
   auto expected = filteredFacetBuckets(
       helper, StrFacetStrategy::COLUMN_DOMAIN, "f_s");
   EXPECT_EQ(expected, filteredFacetBuckets(
@@ -682,7 +639,7 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   }, UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  StrFacetStrategyGuard guard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy);
   auto run = [&](StrFacetStrategy strategy, std::string_view field,
                  int64_t limit, int64_t mincount, bool missing) {
     forcedStrFacetStrategy = strategy;
@@ -751,7 +708,7 @@ TEST_F(FacetTest, spanCounterTopKOverflowShortCircuit) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  FacetCounterModeGuard guard;
+  SearchOverridesGuard guard(forcedFacetCounterMode);
   auto topBucket = [&](FacetCounterMode mode, int64_t limit) {
     forcedFacetCounterMode = mode;
     auto req = localReq(luxirNode->getSearchEngine());
@@ -1967,7 +1924,7 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
   helper.index(flatdoc("cat_s", "c", "foo_i", 50, "bar_i", 3), UpdateMessage::COMMIT);
 
   auto run = [&](FacetSubOpInlineMode mode) {
-    FacetSubOpInlineGuard guard;
+    SearchOverridesGuard guard(forcedFacetSubOpInline);
     forcedFacetSubOpInline = mode;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
@@ -1992,8 +1949,12 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
       buckets.emplace_back(id);
     }
     for (auto count : result->counts) counts.push_back(count);
-    for (auto v : std::get<luxir::api::ArrDouble>(result->ops.at("avg_foo")->kind).v) foo.push_back(v);
-    for (auto v : std::get<luxir::api::ArrDouble>(result->ops.at("avg_bar")->kind).v) bar.push_back(v);
+    for (const auto& v : metricValues(*result, "avg_foo")) {
+      foo.push_back(v.asDouble());
+    }
+    for (const auto& v : metricValues(*result, "avg_bar")) {
+      bar.push_back(v.asDouble());
+    }
     return std::tuple(buckets, counts, foo, bar);
   };
 
@@ -2098,11 +2059,10 @@ TEST_F(FacetTest, boundedSelectionMatchesOrderingEveryBucket) {
     EXPECT_NE(result, nullptr) << req->toString();
     if (result == nullptr) return buckets;
     const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
-    const auto& avg = std::get<luxir::api::ArrDouble>(
-        result->ops.at("avg_foo")->kind).v;
+    auto avg = metricValues(*result, "avg_foo");
     EXPECT_EQ(ids.size(), avg.size());
     for (size_t i = 0; i < ids.size(); i++) {
-      buckets.emplace_back(ids[i], avg[i]);
+      buckets.emplace_back(ids[i], avg[i].asDouble());
     }
     return buckets;
   };
@@ -2149,7 +2109,7 @@ TEST_F(FacetTest, bucketDomainSourcesAgree) {
   ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  FacetBucketDomainSourceGuard guard;
+  SearchOverridesGuard guard(forcedFacetBucketDomainSource);
   // A finite limit with no sort key keeps the metrics on the post-selection
   // feed, which is the stage under test.
   auto addFacets = [](auto& cursor) {
@@ -2310,11 +2270,11 @@ TEST_F(FacetTest, sortBySubOp) {
     EXPECT_EQ(1, facet->counts[0]);
     EXPECT_EQ(2, facet->counts[1]);
     EXPECT_EQ(3, facet->counts[2]);
-    const auto& avg = std::get<luxir::api::ArrDouble>(facet->ops.at("avgsub")->kind);
-    ASSERT_EQ(3, (int)avg.v.size());
-    EXPECT_EQ(1, avg.v[0]);
-    EXPECT_EQ(50, avg.v[1]);
-    EXPECT_EQ(100, avg.v[2]);
+    auto avg = metricValues(*facet, "avgsub");
+    ASSERT_EQ(3, (int)avg.size());
+    EXPECT_EQ(1, avg[0].asDouble());
+    EXPECT_EQ(50, avg[1].asDouble());
+    EXPECT_EQ(100, avg[2].asDouble());
   }
 
   // Descending avg with a finite limit smaller than the bucket count: keep the
@@ -2327,15 +2287,15 @@ TEST_F(FacetTest, sortBySubOp) {
     ASSERT_EQ(2, (int)bucketIds.v.size());
     EXPECT_EQ("a", bucketIds.v[0]);
     EXPECT_EQ("c", bucketIds.v[1]);
-    const auto& avg = std::get<luxir::api::ArrDouble>(facet->ops.at("avgsub")->kind);
-    ASSERT_EQ(2, (int)avg.v.size());
-    EXPECT_EQ(100, avg.v[0]);
-    EXPECT_EQ(50, avg.v[1]);
+    auto avg = metricValues(*facet, "avgsub");
+    ASSERT_EQ(2, (int)avg.size());
+    EXPECT_EQ(100, avg[0].asDouble());
+    EXPECT_EQ(50, avg[1].asDouble());
   }
 }
 
 // min/max sub-ops on a string facet across 2 segments, including a bucket
-// whose docs carry no value for the stats field (reports NaN).  Runs both the
+// whose docs carry no value for the metric field (reports null). Runs both the
 // deferred per-bucket path (finite limit, no sort) and the inline path
 // (limit -1); results must agree.
 TEST_F(FacetTest, minMaxSubOps) {
@@ -2345,7 +2305,7 @@ TEST_F(FacetTest, minMaxSubOps) {
   //   a: {10, 30, -5} -> min -5, max 30
   //   b: {7, 7}       -> min 7, max 7
   //   c: {42}         -> min 42, max 42 (second segment only)
-  //   d: no foo_i     -> NaN
+  //   d: no foo_i     -> null
   helper.index(flatdoc("cat_s", "a", "foo_i", 10), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("cat_s", "a", "foo_i", 30), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("cat_s", "b", "foo_i", 7), UpdateMessage::NO_COMMIT);
@@ -2375,24 +2335,23 @@ TEST_F(FacetTest, minMaxSubOps) {
     EXPECT_EQ("b", bucketIds.v[1]);
     EXPECT_EQ("d", bucketIds.v[2]);
     EXPECT_EQ("c", bucketIds.v[3]);
-    const auto& mn = std::get<luxir::api::ArrDouble>(facetResult->ops.at("mn")->kind);
-    const auto& mx = std::get<luxir::api::ArrDouble>(facetResult->ops.at("mx")->kind);
-    ASSERT_EQ(4, (int)mn.v.size()) << "limit=" << limit;
-    ASSERT_EQ(4, (int)mx.v.size()) << "limit=" << limit;
-    EXPECT_EQ(-5, mn.v[0]);
-    EXPECT_EQ(30, mx.v[0]);
-    EXPECT_EQ(7, mn.v[1]);
-    EXPECT_EQ(7, mx.v[1]);
-    EXPECT_TRUE(std::isnan(mn.v[2])) << "limit=" << limit;
-    EXPECT_TRUE(std::isnan(mx.v[2])) << "limit=" << limit;
-    EXPECT_EQ(42, mn.v[3]);
-    EXPECT_EQ(42, mx.v[3]);
+    auto mn = metricValues(*facetResult, "mn");
+    auto mx = metricValues(*facetResult, "mx");
+    ASSERT_EQ(4, (int)mn.size()) << "limit=" << limit;
+    ASSERT_EQ(4, (int)mx.size()) << "limit=" << limit;
+    EXPECT_EQ(-5, mn[0].asInt());
+    EXPECT_EQ(30, mx[0].asInt());
+    EXPECT_EQ(7, mn[1].asInt());
+    EXPECT_EQ(7, mx[1].asInt());
+    EXPECT_TRUE(mn[2].isNull()) << "limit=" << limit;
+    EXPECT_TRUE(mx[2].isNull()) << "limit=" << limit;
+    EXPECT_EQ(42, mn[3].asInt());
+    EXPECT_EQ(42, mx[3].asInt());
   }
 }
 
-// Facet sorted by a min sub-op, with a bucket that has no values for the stats
-// field: empty buckets order below every non-empty bucket (first in ASC, last
-// in DESC) so NaN never reaches the sort comparator.
+// Facet sorted by a min sub-op, with a bucket that has no values for the metric
+// field: empty buckets sort after every non-empty bucket in both directions.
 TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
   CollectionHelper helper;
   helper.clear();
@@ -2420,23 +2379,23 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
     return req;
   };
 
-  // Ascending: the empty bucket first, then b(1), c(50), a(100).
+  // Ascending: b(1), c(50), a(100), then the empty bucket.
   {
     auto req = runFacet(10, qb::ASC);
     const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
     ASSERT_NE(facet, nullptr);
     const auto& bucketIds = std::get<luxir::api::ColStr>(facet->bucket_ids->kind);
     ASSERT_EQ(4, (int)bucketIds.v.size());
-    EXPECT_EQ("d", bucketIds.v[0]);
-    EXPECT_EQ("b", bucketIds.v[1]);
-    EXPECT_EQ("c", bucketIds.v[2]);
-    EXPECT_EQ("a", bucketIds.v[3]);
-    const auto& mn = std::get<luxir::api::ArrDouble>(facet->ops.at("mn")->kind);
-    ASSERT_EQ(4, (int)mn.v.size());
-    EXPECT_TRUE(std::isnan(mn.v[0]));
-    EXPECT_EQ(1, mn.v[1]);
-    EXPECT_EQ(50, mn.v[2]);
-    EXPECT_EQ(100, mn.v[3]);
+    EXPECT_EQ("b", bucketIds.v[0]);
+    EXPECT_EQ("c", bucketIds.v[1]);
+    EXPECT_EQ("a", bucketIds.v[2]);
+    EXPECT_EQ("d", bucketIds.v[3]);
+    auto mn = metricValues(*facet, "mn");
+    ASSERT_EQ(4, (int)mn.size());
+    EXPECT_EQ(1, mn[0].asInt());
+    EXPECT_EQ(50, mn[1].asInt());
+    EXPECT_EQ(100, mn[2].asInt());
+    EXPECT_TRUE(mn[3].isNull());
   }
 
   // Descending with a limit that cuts the (last-sorted) empty bucket off.
@@ -2449,11 +2408,11 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
     EXPECT_EQ("a", bucketIds.v[0]);
     EXPECT_EQ("c", bucketIds.v[1]);
     EXPECT_EQ("b", bucketIds.v[2]);
-    const auto& mn = std::get<luxir::api::ArrDouble>(facet->ops.at("mn")->kind);
-    ASSERT_EQ(3, (int)mn.v.size());
-    EXPECT_EQ(100, mn.v[0]);
-    EXPECT_EQ(50, mn.v[1]);
-    EXPECT_EQ(1, mn.v[2]);
+    auto mn = metricValues(*facet, "mn");
+    ASSERT_EQ(3, (int)mn.size());
+    EXPECT_EQ(100, mn[0].asInt());
+    EXPECT_EQ(50, mn[1].asInt());
+    EXPECT_EQ(1, mn[2].asInt());
   }
 }
 
@@ -2500,17 +2459,18 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   const auto& bucketIds = std::get<luxir::api::ColStr>(facetResult->bucket_ids->kind);
   ASSERT_EQ(totalDocs, (int)bucketIds.v.size());
   ASSERT_EQ(totalDocs, (int)facetResult->counts.size());
-  const auto& avgScoreResult = std::get<luxir::api::ArrDouble>(facetResult->ops.at("avg_score")->kind);
-  const auto& avgBonusResult = std::get<luxir::api::ArrDouble>(facetResult->ops.at("avg_bonus")->kind);
-  ASSERT_EQ(totalDocs, (int)avgScoreResult.v.size());
-  ASSERT_EQ(totalDocs, (int)avgBonusResult.v.size());
+  auto avgScoreResult = metricValues(*facetResult, "avg_score");
+  auto avgBonusResult = metricValues(*facetResult, "avg_bonus");
+  ASSERT_EQ(totalDocs, (int)avgScoreResult.size());
+  ASSERT_EQ(totalDocs, (int)avgBonusResult.size());
 
   std::vector<int> checkIndexes = {0, 10, 11, 2999, 3000, totalDocs - 1};
   for (int idx : checkIndexes) {
     EXPECT_EQ(categoryName(idx), bucketIds.v[idx]);
     EXPECT_EQ(1, facetResult->counts[idx]);
-    EXPECT_DOUBLE_EQ((double)idx, avgScoreResult.v[idx]);
-    EXPECT_DOUBLE_EQ((double)(totalDocs - idx), avgBonusResult.v[idx]);
+    EXPECT_DOUBLE_EQ((double)idx, avgScoreResult[idx].asDouble());
+    EXPECT_DOUBLE_EQ((double)(totalDocs - idx),
+                     avgBonusResult[idx].asDouble());
   }
 }
 
@@ -2518,22 +2478,22 @@ TEST_F(FacetTest, sumInlineSortsAndAccumulatesIntegersExactly) {
   CollectionHelper helper;
   helper.clear();
   constexpr int64_t twoTo53 = int64_t{1} << 53;
-  helper.index(flatdoc("cat_s", "a", "amount_is", vec_i(twoTo53, 1),
+  helper.index(flatdoc("cat_s", "a", "amount_is", vec_i(twoTo53, twoTo53 + 1),
                        "id", "a1"),
                UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(2), "id", "b1"),
+  helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(2, 20), "id", "b1"),
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("cat_s", "c", "id", "c1"), UpdateMessage::COMMIT);
-  helper.index(flatdoc("cat_s", "a", "amount_is", vec_i(-twoTo53),
+  helper.index(flatdoc("cat_s", "a", "amount_is", vec_i(-twoTo53 + 1, 7),
                        "id", "a2"),
                UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(3), "id", "b2"),
+  helper.index(flatdoc("cat_s", "b", "amount_is", vec_i(3, 30), "id", "b2"),
                UpdateMessage::COMMIT);
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& facet = req->facet("categories", "cat_s").limit(-1);
-  facet.sum("total", "amount_is");
+  facet.expr("total", "sum(min(amount_is))");
   qb::sort(facet, "total", qb::DESC);
 
   req->execute();
@@ -2542,15 +2502,15 @@ TEST_F(FacetTest, sumInlineSortsAndAccumulatesIntegersExactly) {
   const auto* result = req->responses[0]->proto.ops.at("categories")->facetResult();
   ASSERT_NE(result, nullptr);
   const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
-  const auto& totals = std::get<luxir::api::ArrDouble>(result->ops.at("total")->kind).v;
+  auto totals = metricValues(*result, "total");
   ASSERT_EQ(3u, ids.size());
   ASSERT_EQ(ids.size(), totals.size());
   EXPECT_EQ("b", ids[0]);
-  EXPECT_EQ(5.0, totals[0]);
+  EXPECT_EQ(5, totals[0].asInt());
   EXPECT_EQ("a", ids[1]);
-  EXPECT_EQ(1.0, totals[1]);
+  EXPECT_EQ(1, totals[1].asInt());
   EXPECT_EQ("c", ids[2]);
-  EXPECT_TRUE(std::isnan(totals[2]));
+  EXPECT_TRUE(totals[2].isNull());
 }
 
 // Range facet sub-ops: each returned bucket's domain feeds the child ops
@@ -2583,16 +2543,16 @@ TEST_F(FacetTest, rangeFacetSubOps) {
   };
   const std::array<int64_t, 3> counts = {2, 1, 1};
   expectRangeResult(*result, bounds, counts, -1);
-  const auto& avg = std::get<api::ArrDouble>(result->ops.at("avg_score")->kind).v;
+  auto avg = metricValues(*result, "avg_score");
   ASSERT_EQ(3u, avg.size());
-  EXPECT_EQ(15, avg[0]);  // (10+20)/2; the keep=n doc is outside the domain
-  EXPECT_EQ(30, avg[1]);
-  EXPECT_EQ(50, avg[2]);
-  const auto& sum = std::get<api::ArrDouble>(result->ops.at("sum_score")->kind).v;
+  EXPECT_EQ(15, avg[0].asDouble());  // (10+20)/2; keep=n is outside the domain
+  EXPECT_EQ(30, avg[1].asDouble());
+  EXPECT_EQ(50, avg[2].asDouble());
+  auto sum = metricValues(*result, "sum_score");
   ASSERT_EQ(3u, sum.size());
-  EXPECT_EQ(30, sum[0]);
-  EXPECT_EQ(30, sum[1]);
-  EXPECT_EQ(50, sum[2]);
+  EXPECT_EQ(30, sum[0].asInt());
+  EXPECT_EQ(30, sum[1].asInt());
+  EXPECT_EQ(50, sum[2].asInt());
 }
 
 // Multi-valued bucket field: a doc with several values in one bucket joins
@@ -2627,10 +2587,10 @@ TEST_F(FacetTest, rangeFacetSubOpsMultiValueAndMincount) {
   expectRangeResult(result, bounds, counts, -1);
   // Sums are per-document: doc1 contributes 10 once to [0,10) despite two
   // in-bucket values, and doc3 contributes 7 to both returned buckets.
-  const auto& sum = std::get<api::ArrDouble>(result.ops.at("sum_score")->kind).v;
+  auto sum = metricValues(result, "sum_score");
   ASSERT_EQ(2u, sum.size());
-  EXPECT_EQ(17, sum[0]);  // 10 + 7
-  EXPECT_EQ(57, sum[1]);  // 50 + 7
+  EXPECT_EQ(17, sum[0].asInt());  // 10 + 7
+  EXPECT_EQ(57, sum[1].asInt());  // 50 + 7
 }
 
 // A range facet as a bucket child of a string facet: its FacetResult lands in
@@ -2698,7 +2658,7 @@ TEST_F(FacetTest, intFacetNestedUnderStringFacetUsesDistinctSlots) {
   EXPECT_EQ(9, bIds[0]);
 }
 
-TEST_F(FacetTest, stringFacetWithStatNestedUnderRangeFacet) {
+TEST_F(FacetTest, stringFacetWithMetricNestedUnderRangeFacet) {
   CollectionHelper helper;
   helper.index(flatdoc("range_i", 5, "group_s", "x", "score_i", 10),
                UpdateMessage::NO_COMMIT);
@@ -2727,21 +2687,21 @@ TEST_F(FacetTest, stringFacetWithStatNestedUnderRangeFacet) {
   }
   const auto& first = *groups[0].facetResult();
   const auto& firstIds = std::get<api::ColStr>(first.bucket_ids->kind).v;
-  const auto& firstSums = std::get<api::ArrDouble>(first.ops.at("score")->kind).v;
+  auto firstSums = metricValues(first, "score");
   ASSERT_EQ(2u, firstIds.size());
   EXPECT_EQ("x", firstIds[0]);
   EXPECT_EQ("y", firstIds[1]);
-  EXPECT_EQ(50, firstSums[0]);
-  EXPECT_EQ(20, firstSums[1]);
+  EXPECT_EQ(50, firstSums[0].asInt());
+  EXPECT_EQ(20, firstSums[1].asInt());
 
   const auto& second = *groups[1].facetResult();
   const auto& secondIds = std::get<api::ColStr>(second.bucket_ids->kind).v;
-  const auto& secondSums = std::get<api::ArrDouble>(second.ops.at("score")->kind).v;
+  auto secondSums = metricValues(second, "score");
   ASSERT_EQ(2u, secondIds.size());
   EXPECT_EQ("x", secondIds[0]);
   EXPECT_EQ("z", secondIds[1]);
-  EXPECT_EQ(30, secondSums[0]);
-  EXPECT_EQ(50, secondSums[1]);
+  EXPECT_EQ(30, secondSums[0].asInt());
+  EXPECT_EQ(50, secondSums[1].asInt());
 }
 
 TEST_F(FacetTest, rangeFacetSubOpsChunkedBudgetMatchesDefault) {
@@ -2757,7 +2717,7 @@ TEST_F(FacetTest, rangeFacetSubOpsChunkedBudgetMatchesDefault) {
       flatdoc("range_i", 31, "score_i", 60),
   }, UpdateMessage::COMMIT).success);
 
-  RangeFacetBucketDomainBudgetGuard guard;
+  SearchOverridesGuard guard(forcedRangeFacetBucketDomainByteBudget);
   auto run = [&](std::size_t budget) {
     forcedRangeFacetBucketDomainByteBudget = budget;
     auto req = localReq(helper.getSearchEngine());
@@ -2874,7 +2834,7 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   ASSERT_NE(fFacet, nullptr) << req->toString();
   EXPECT_EQ(0, (int)std::get<luxir::api::ColStr>(fFacet->bucket_ids->kind).v.size());
   ASSERT_TRUE(docs->ops.contains("a")) << req->toString();
-  EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("a")->kind)));
+  EXPECT_TRUE(docs->ops.at("a")->isNull());
 }
 
 TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
@@ -3179,11 +3139,11 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
     const auto* f = docs->ops.at("f")->facetResult();
     ASSERT_NE(f, nullptr) << req->toString();
     const auto& bucketIds = std::get<luxir::api::ColStr>(f->bucket_ids->kind);
-    const auto& avgArr = std::get<luxir::api::ArrDouble>(f->ops.at("av")->kind);
+    auto avgArr = metricValues(*f, "av");
     ASSERT_EQ(3, (int)bucketIds.v.size()) << "limit=" << limit << "\n" << req->toString();
     std::map<std::string, double> got;
     for (int i = 0; i < (int)bucketIds.v.size(); i++)
-      got[std::string(bucketIds.v[i])] = avgArr.v[i];
+      got[std::string(bucketIds.v[i])] = avgArr[i].asDouble();
     EXPECT_DOUBLE_EQ(20.0, got["x"]) << "limit=" << limit << "\n" << req->toString();
     EXPECT_DOUBLE_EQ(30.0, got["y"]) << "limit=" << limit << "\n" << req->toString();
     EXPECT_DOUBLE_EQ(100.0, got["z"]) << "limit=" << limit << "\n" << req->toString();
@@ -3220,7 +3180,8 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   EXPECT_EQ("x", bucketIds.v[0]);
   EXPECT_EQ(2, f->counts[0]);
   // bucket x = {A,B}; avg = (10+20)/2 = 15. C,D lack cat_s and must NOT leak in.
-  EXPECT_DOUBLE_EQ(15.0, std::get<luxir::api::ArrDouble>(f->ops.at("av")->kind).v[0]) << req->toString();
+  EXPECT_DOUBLE_EQ(15.0, metricValues(*f, "av")[0].asDouble())
+      << req->toString();
 }
 
 TEST_F(FacetTest, topDocsUnderFacetRejected) {
@@ -3296,8 +3257,8 @@ TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {
       flatdoc("id", "6", "cat_s", "c", "sub_s", "x", "metric_i", 60),
   }, UpdateMessage::COMMIT).success);
 
-  StrFacetStrategyGuard countGuard;
-  FacetFeedStrategyGuard feedGuard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy,
+                             forcedFacetFeedStrategy);
   auto run = [&](StrFacetStrategy countStrategy,
                  FacetFeedStrategy feedStrategy) {
     forcedStrFacetStrategy = countStrategy;
@@ -3358,8 +3319,9 @@ TEST_F(FacetTest, stringColumnReplayMatchesBucketDomainsAcrossArities) {
   }, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
 
-  FacetFeedStrategyGuard feedGuard;
-  StrFacetReplayGuard replayGuard;
+  SearchOverridesGuard guard(forcedFacetFeedStrategy,
+                             forcedStrFacetReplaySelector,
+                             forcedStrFacetReplayBank);
   auto run = [&](std::string_view parentField, std::string_view childField,
                  bool filtered, FacetFeedStrategy feed,
                  StrFacetReplaySelector selector,
@@ -3834,14 +3796,8 @@ protected:
       std::vector<AvgOpDef> avgOps;
       for (const auto& [opName, subPtr] : facetOp.ops) {
         const auto& sub = *subPtr;
-        if (std::holds_alternative<luxir::api::GenOp>(sub.kind)) {
-          const auto& genOp = std::get<luxir::api::GenOp>(sub.kind);
-          if (genOp.name == "avg" || genOp.name == "average") {
-            avgOps.push_back({
-                std::string(opName),
-                fieldOrdinal(std::get<std::string_view>(genOp.args[0].kind))
-            });
-          }
+        if (auto field = avgExpressionField(sub)) {
+          avgOps.push_back({std::string(opName), fieldOrdinal(*field)});
         }
       }
       bool hasAvg = !avgOps.empty();
@@ -3923,7 +3879,7 @@ protected:
       } else if (hasAvg) {
         // avg fields (avgval_i / avgval2_i) are always present, so every bucket
         // has count values per avgOp and avg = sum/count (no empty-bucket
-        // 0.0-vs-NaN). One avgOp may be the sort key; the rest are annotations.
+        // zero-vs-null seam). One avgOp may be the sort key; the rest are annotations.
         struct B { std::string val; int64_t count; std::vector<int64_t> sums; };
         std::vector<B> buckets;
         for (const auto& [val, count] : strCounts) {
@@ -4090,9 +4046,8 @@ protected:
         // get IndexHandlers for the fields that exist in this segment
         auto* idHandler = &inverter.getIndexHandler("id");
         // Dedicated avg-targets: single-valued ints, indexed for EVERY doc in
-        // every segment so an avg() sub-op never sees an empty bucket (which
-        // would make the inline path report 0.0 but the post-hoc path NaN, and
-        // make sort-by-avg ill-defined). Two of them, to test multiple
+        // every segment so an avg() sub-op never sees an empty bucket. Two of
+        // them test multiple
         // simultaneous avg sub-ops on different fields.
         auto* avgHandler = &inverter.getIndexHandler("avgval_i");
         auto* avgHandler2 = &inverter.getIndexHandler("avgval2_i");
@@ -4474,20 +4429,18 @@ public:
               for (int i = 0; i < (int)expected.counts.size(); i++)
                 EXPECT_EQ(actual.counts[i], expected.counts[i]) << "count " << i << ": " << ctx;
               if (ff.missing) { EXPECT_EQ(actual.missing.value_or(0), expected.missing.value_or(0)) << "missing: " << ctx; }
-              // avg() sub-op result: arr_d with one entry per returned bucket.
+              // avg() sub-op result: one typed Val per returned bucket.
               for (const auto& [opName, subPtr] : ff.ops) {
                 const auto& sub = *subPtr;
-                if (std::holds_alternative<luxir::api::GenOp>(sub.kind)) {
-                  const auto& genOp = std::get<luxir::api::GenOp>(sub.kind);
-                  if (genOp.name != "avg" && genOp.name != "average") continue;
+                if (avgExpressionField(sub)) {
                   // Empty facets emit no sub-op result (model omits it too).
                   if (!expected.avgOps.contains(std::string(opName))) continue;
                   ASSERT_TRUE(actual.ops.contains(opName)) << "actual avg missing: " << ctx << "\n" << req->toString();
-                  const auto& aArr = std::get<luxir::api::ArrDouble>(actual.ops.at(opName)->kind);
+                  const auto& aArr = std::get<luxir::api::ArrVal>(actual.ops.at(opName)->kind);
                   const auto& eArr = expected.avgOps.at(std::string(opName));
                   ASSERT_EQ(aArr.v.size(), eArr.size()) << "avg arr size: " << ctx << "\n" << req->toString();
                   for (int i = 0; i < (int)eArr.size(); i++)
-                    EXPECT_DOUBLE_EQ(aArr.v[i], eArr[i]) << "avg[" << i << "]: " << ctx;
+                    EXPECT_DOUBLE_EQ(aArr.v[i].asDouble(), eArr[i]) << "avg[" << i << "]: " << ctx;
                 }
               }
               // Nested sub-facet results: ops[name].arr.v[i].facet, one per bucket.
@@ -4563,7 +4516,7 @@ TEST_F(RandomFacetTest, randomFaceting) {
   // requests, each issuing several queries x a facet per field (many facet
   // computations, the same field faceted under multiple domains). Indexes and
   // requests are independent work dimensions, so scale each by sqrt(effort).
-  StrFacetStrategyGuard guard;
+  SearchOverridesGuard guard(forcedStrFacetStrategy);
   for (StrFacetStrategy strategy : {
       StrFacetStrategy::AUTO,
       StrFacetStrategy::TOP_TERMS,

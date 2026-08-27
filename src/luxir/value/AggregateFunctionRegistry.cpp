@@ -40,16 +40,18 @@ struct IntExtremeState {
 
 struct DoubleExtremeState {
   double value = 0.0;
-  AggregateFailure failure = AggregateFailure::NONE;
   bool seen = false;
 };
 
 template <class State>
-void initState(void* target) {
+void initState(void* target, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   storeState(target, State{});
 }
 
-void addIntSum(void* target, const ValueResult& value) {
+void addIntSum(void* target, const ValueResult& value,
+               std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   IntSumState state = loadState<IntSumState>(target);
   if (state.failure != AggregateFailure::NONE) return;
   __int128 sum;
@@ -69,7 +71,9 @@ void addIntSum(void* target, const ValueResult& value) {
   storeState(target, state);
 }
 
-void mergeIntSum(void* target, const void* source) {
+void mergeIntSum(void* target, const void* source,
+                 std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   IntSumState left = loadState<IntSumState>(target);
   IntSumState right = loadState<IntSumState>(source);
   if (left.failure != AggregateFailure::NONE) return;
@@ -95,7 +99,9 @@ void mergeIntSum(void* target, const void* source) {
   storeState(target, left);
 }
 
-BucketScalar finishIntSum(const void* source) {
+BucketScalar finishIntSum(
+    const void* source, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   IntSumState state = loadState<IntSumState>(source);
   if (state.failure != AggregateFailure::NONE) {
     return BucketScalar::failed(BucketValueType::INT128,
@@ -106,7 +112,9 @@ BucketScalar finishIntSum(const void* source) {
                           : BucketScalar::integer(state.sum);
 }
 
-BucketScalar finishIntAvg(const void* source) {
+BucketScalar finishIntAvg(
+    const void* source, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   IntSumState state = loadState<IntSumState>(source);
   if (state.failure != AggregateFailure::NONE) {
     return BucketScalar::failed(BucketValueType::DOUBLE,
@@ -124,7 +132,9 @@ BucketScalar finishIntAvg(const void* source) {
 }
 
 template <bool Average>
-void addDoubleSum(void* target, const ValueResult& value) {
+void addDoubleSum(void* target, const ValueResult& value,
+                  std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   DoubleSumState state = loadState<DoubleSumState>(target);
   if (state.failure != AggregateFailure::NONE) return;
   double sum = state.sum + value.doubleValue;
@@ -146,7 +156,9 @@ void addDoubleSum(void* target, const ValueResult& value) {
 }
 
 template <bool Average>
-void mergeDoubleSum(void* target, const void* source) {
+void mergeDoubleSum(void* target, const void* source,
+                    std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   DoubleSumState left = loadState<DoubleSumState>(target);
   DoubleSumState right = loadState<DoubleSumState>(source);
   if (left.failure != AggregateFailure::NONE) return;
@@ -173,7 +185,9 @@ void mergeDoubleSum(void* target, const void* source) {
   storeState(target, left);
 }
 
-BucketScalar finishDoubleSum(const void* source) {
+BucketScalar finishDoubleSum(
+    const void* source, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   DoubleSumState state = loadState<DoubleSumState>(source);
   if (state.failure != AggregateFailure::NONE) {
     return BucketScalar::failed(BucketValueType::DOUBLE,
@@ -184,7 +198,9 @@ BucketScalar finishDoubleSum(const void* source) {
                           : BucketScalar::floating(state.sum);
 }
 
-BucketScalar finishDoubleAvg(const void* source) {
+BucketScalar finishDoubleAvg(
+    const void* source, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   DoubleSumState state = loadState<DoubleSumState>(source);
   if (state.failure != AggregateFailure::NONE) {
     return BucketScalar::failed(BucketValueType::DOUBLE,
@@ -202,7 +218,9 @@ BucketScalar finishDoubleAvg(const void* source) {
 }
 
 template <bool Minimum>
-void addIntExtreme(void* target, const ValueResult& value) {
+void addIntExtreme(void* target, const ValueResult& value,
+                   std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   IntExtremeState state = loadState<IntExtremeState>(target);
   if (!state.seen) {
     state.value = value.intValue;
@@ -216,14 +234,17 @@ void addIntExtreme(void* target, const ValueResult& value) {
 }
 
 template <bool Minimum>
-void mergeIntExtreme(void* target, const void* source) {
+void mergeIntExtreme(void* target, const void* source,
+                     std::span<const AggregateConstant> arguments) {
   IntExtremeState right = loadState<IntExtremeState>(source);
   if (!right.seen) return;
   ValueResult value = ValueResult::integer(right.value);
-  addIntExtreme<Minimum>(target, value);
+  addIntExtreme<Minimum>(target, value, arguments);
 }
 
-BucketScalar finishIntExtreme(const void* source) {
+BucketScalar finishIntExtreme(
+    const void* source, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   IntExtremeState state = loadState<IntExtremeState>(source);
   return state.seen ? BucketScalar::integer(state.value)
                     : BucketScalar::missing(BucketValueType::INT128,
@@ -231,14 +252,10 @@ BucketScalar finishIntExtreme(const void* source) {
 }
 
 template <bool Minimum>
-void addDoubleExtreme(void* target, const ValueResult& value) {
+void addDoubleExtreme(void* target, const ValueResult& value,
+                      std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   DoubleExtremeState state = loadState<DoubleExtremeState>(target);
-  if (state.failure != AggregateFailure::NONE) return;
-  if (!std::isfinite(value.doubleValue)) {
-    state.failure = AggregateFailure::NON_FINITE_EXPRESSION;
-    storeState(target, state);
-    return;
-  }
   if (!state.seen) {
     state.value = value.doubleValue;
     state.seen = true;
@@ -251,27 +268,18 @@ void addDoubleExtreme(void* target, const ValueResult& value) {
 }
 
 template <bool Minimum>
-void mergeDoubleExtreme(void* target, const void* source) {
+void mergeDoubleExtreme(void* target, const void* source,
+                        std::span<const AggregateConstant> arguments) {
   DoubleExtremeState right = loadState<DoubleExtremeState>(source);
-  if (right.failure != AggregateFailure::NONE) {
-    DoubleExtremeState left = loadState<DoubleExtremeState>(target);
-    if (left.failure == AggregateFailure::NONE) {
-      left.failure = right.failure;
-      storeState(target, left);
-    }
-    return;
-  }
   if (!right.seen) return;
   ValueResult value = ValueResult::floating(right.value);
-  addDoubleExtreme<Minimum>(target, value);
+  addDoubleExtreme<Minimum>(target, value, arguments);
 }
 
-BucketScalar finishDoubleExtreme(const void* source) {
+BucketScalar finishDoubleExtreme(
+    const void* source, std::span<const AggregateConstant> arguments) {
+  unused(arguments);
   DoubleExtremeState state = loadState<DoubleExtremeState>(source);
-  if (state.failure != AggregateFailure::NONE) {
-    return BucketScalar::failed(BucketValueType::DOUBLE,
-                                ValueNature::NUMBER, state.failure);
-  }
   return state.seen ? BucketScalar::floating(state.value)
                     : BucketScalar::missing(BucketValueType::DOUBLE,
                                             ValueNature::NUMBER);
@@ -303,15 +311,21 @@ AggregateStateOps doubleExtremeOps(bool minimum) {
           finishDoubleExtreme};
 }
 
-ResolvedAggregate resolveAvg(const ValueNode* input) {
+ResolvedAggregate resolveAvg(
+    const ValueNode* input,
+    std::span<const AggregateConstant> trailingArguments) {
   assert(input != nullptr);
+  assert(trailingArguments.empty());
   bool floating = input->type == ValueType::DOUBLE;
   return {BucketValueType::DOUBLE, input->nature,
           floating ? doubleSumOps(true) : intSumOps(true)};
 }
 
-ResolvedAggregate resolveSum(const ValueNode* input) {
+ResolvedAggregate resolveSum(
+    const ValueNode* input,
+    std::span<const AggregateConstant> trailingArguments) {
   assert(input != nullptr);
+  assert(trailingArguments.empty());
   if (input->nature == ValueNature::DATE) {
     throw std::runtime_error("sum() cannot aggregate a DATE expression");
   }
@@ -321,16 +335,22 @@ ResolvedAggregate resolveSum(const ValueNode* input) {
           floating ? doubleSumOps(false) : intSumOps(false)};
 }
 
-ResolvedAggregate resolveMin(const ValueNode* input) {
+ResolvedAggregate resolveMin(
+    const ValueNode* input,
+    std::span<const AggregateConstant> trailingArguments) {
   assert(input != nullptr);
+  assert(trailingArguments.empty());
   bool floating = input->type == ValueType::DOUBLE;
   return {floating ? BucketValueType::DOUBLE : BucketValueType::INT128,
           input->nature,
           floating ? doubleExtremeOps(true) : intExtremeOps(true)};
 }
 
-ResolvedAggregate resolveMax(const ValueNode* input) {
+ResolvedAggregate resolveMax(
+    const ValueNode* input,
+    std::span<const AggregateConstant> trailingArguments) {
   assert(input != nullptr);
+  assert(trailingArguments.empty());
   bool floating = input->type == ValueType::DOUBLE;
   return {floating ? BucketValueType::DOUBLE : BucketValueType::INT128,
           input->nature,
@@ -338,10 +358,10 @@ ResolvedAggregate resolveMax(const ValueNode* input) {
 }
 
 constexpr AggregateFunction FUNCTIONS[] = {
-    {AggregateOpcode::AVG, "avg", 1, 1, resolveAvg},
-    {AggregateOpcode::SUM, "sum", 1, 1, resolveSum},
-    {AggregateOpcode::MIN, "min", 1, 1, resolveMin},
-    {AggregateOpcode::MAX, "max", 1, 1, resolveMax},
+    {"avg", 1, 1, resolveAvg},
+    {"sum", 1, 1, resolveSum},
+    {"min", 1, 1, resolveMin},
+    {"max", 1, 1, resolveMax},
 };
 
 } // namespace

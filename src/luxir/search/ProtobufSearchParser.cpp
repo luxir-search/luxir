@@ -14,7 +14,6 @@
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/StrFacetOp.h"
-#include "luxir/search/ops/StatsOp.h"
 #include "luxir/search/ops/ExprStatsOp.h"
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
@@ -319,38 +318,6 @@ public:
         addSubs(*facet, facetReq.ops, depth);
         return facet;
       },
-      [&](const luxir::api::GenOp& genOp) -> SearchOp* {
-        StatsOp::Kind kind;
-        if (genOp.name == "avg" || genOp.name == "average") {
-          kind = StatsOp::AVG;
-        } else if (genOp.name == "sum") {
-          kind = StatsOp::SUM;
-        } else if (genOp.name == "min") {
-          kind = StatsOp::MIN;
-        } else if (genOp.name == "max") {
-          kind = StatsOp::MAX;
-        } else {
-          throw std::runtime_error("Unknown generic operation: " + std::string(genOp.name));
-        }
-        if (genOp.args.empty()) {
-          throw std::runtime_error("Generic operation '" + std::string(genOp.name) + "' requires a field argument");
-        }
-        std::string_view statsField = ProtobufQueryParser::getString(genOp.args[0]);
-        auto& statsFtype = req.schema->getFieldTypeEx(statsField);
-        auto statsType = statsFtype->type();
-        if (statsType != FieldType::Type::INT
-            && statsType != FieldType::Type::FLOAT
-            && statsType != FieldType::Type::DOUBLE
-            && statsType != FieldType::Type::DATE) {
-          throw std::runtime_error("Generic operation '" + std::string(genOp.name)
-              + "' requires a numeric or DATE field");
-        }
-        if (kind == StatsOp::SUM && statsType == FieldType::Type::DATE) {
-          throw std::runtime_error("Generic operation 'sum' cannot sum DATE field '"
-              + std::string(statsField) + "'");
-        }
-        return luxir::arenaCreate<StatsOp>(req.arena, req, name, statsField, statsType, kind);
-      },
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
         AggregateProgram* program =
@@ -624,8 +591,9 @@ public:
         if (valueArray(root.type)) {
           throw std::runtime_error(fmt::format(
               "sort expression '{}' produces a {}; choose an explicit reducer such as "
-              "min(...), max(...), or avg(...)",
-              sortSpec.expr, valueTypeName(root.type)));
+              "{}",
+              sortSpec.expr, valueTypeName(root.type),
+              ValueFunctionRegistry::arrayReducerNames()));
         }
         out.clauses.emplace_back(*program, order);
         out.rankNeedsScores |= program->needsScore;

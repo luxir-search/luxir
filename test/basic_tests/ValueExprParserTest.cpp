@@ -145,6 +145,8 @@ TEST(ValueExprParserTest, logicalDateRules) {
             parser.parse("when_dt - when_dt")->root().nature);
   EXPECT_EQ(ValueNature::DATE,
             parser.parse("avg(stamps_dts)")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("count(stamps_dts)")->root().nature);
   EXPECT_EQ(ValueNature::DATE,
             parser.parse("def(when_dt,0)")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
@@ -159,6 +161,8 @@ TEST(ValueExprParserTest, logicalDateRules) {
             parser.parse("div(avg(stamps_dts), 1000)")->root().nature);
 
   expectParseError(parser, "when_dt + when_dt", "cannot add two DATE");
+  expectParseError(parser, "sum(stamps_dts)",
+                   "cannot reduce a DATE array");
 }
 
 TEST(ValueExprParserTest, variablesAndArrayReducers) {
@@ -179,6 +183,9 @@ TEST(ValueExprParserTest, variablesAndArrayReducers) {
   EXPECT_EQ(ValueType::INT64, parser.parse("add($n,1)")->root().type);
   EXPECT_EQ(ValueType::INT64, parser.parse("min($values)")->root().type);
   EXPECT_EQ(ValueType::DOUBLE, parser.parse("avg($values)")->root().type);
+  EXPECT_EQ(ValueType::INT64, parser.parse("sum($values)")->root().type);
+  EXPECT_EQ(ValueType::INT64, parser.parse("count($values)")->root().type);
+  EXPECT_EQ(ValueType::INT64, parser.parse("count(price_i)")->root().type);
   EXPECT_EQ(ValueType::INT64_ARRAY, parser.parse("def($values,$values)")->root().type);
   EXPECT_EQ(ValueType::DOUBLE_ARRAY, parser.parse("$values / 2")->root().type);
 }
@@ -190,11 +197,15 @@ TEST(ValueExprParserTest, reportsArityTypeVariableAndLiteralErrors) {
 
   {
     ValueExprParser parser(options, *memory.arena);
-    expectParseError(parser, "add(1)", "expects 2 arguments");
+    expectParseError(parser, "add(1)", "expects exactly 2 arguments");
   }
   {
     ValueExprParser parser(options, *memory.arena);
     expectParseError(parser, "avg(price_i)", "requires a numeric array");
+  }
+  {
+    ValueExprParser parser(options, *memory.arena);
+    expectParseError(parser, "sum(price_i)", "requires a numeric array");
   }
   {
     ValueExprParser parser(options, *memory.arena);
@@ -211,6 +222,16 @@ TEST(ValueExprParserTest, reportsArityTypeVariableAndLiteralErrors) {
   {
     ValueExprParser parser(options, *memory.arena);
     expectParseError(parser, "1e", "invalid numeric literal");
+  }
+  {
+    ValueExprParser parser(options, *memory.arena);
+    expectParseError(parser, "min(when_dt,1)",
+                     "cannot compare a DATE and a number");
+  }
+  {
+    ValueExprParser parser(options, *memory.arena);
+    expectParseError(parser, "max(1,when_dt)",
+                     "cannot compare a DATE and a number");
   }
 }
 
@@ -242,10 +263,18 @@ TEST(ValueExprParserTest, registryEntriesAreComplete) {
   ASSERT_FALSE(entries.empty());
   for (const ValueFunction& function : entries) {
     EXPECT_NE(nullptr, function.resolve) << function.name;
-    EXPECT_TRUE(function.supports(FunctionCapability::DOCUMENT_VALUE))
-        << function.name;
     EXPECT_NE(nullptr, function.evalPoint) << function.name;
     EXPECT_NE(nullptr, function.evalBatch) << function.name;
     EXPECT_NE(nullptr, function.boundsPropagate) << function.name;
   }
+  const ValueFunction* sum = ValueFunctionRegistry::find("sum");
+  const ValueFunction* count = ValueFunctionRegistry::find("count");
+  const ValueFunction* avg = ValueFunctionRegistry::find("avg");
+  ASSERT_NE(nullptr, sum);
+  ASSERT_NE(nullptr, count);
+  ASSERT_NE(nullptr, avg);
+  EXPECT_NE(sum->evalPoint, avg->evalPoint);
+  EXPECT_NE(count->evalPoint, avg->evalPoint);
+  EXPECT_NE(sum->evalPoint, count->evalPoint);
+  EXPECT_NE(sum->evalElement, count->evalElement);
 }

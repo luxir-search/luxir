@@ -194,7 +194,7 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
       renderSearchResponseLine(req->responses[0]->proto));
 }
 
-TEST_F(JsonResponseTest, facetStatsRenderPerBucketAndEmptyAsNull) {
+TEST_F(JsonResponseTest, facetMetricsRenderPerBucketAndEmptyAsNull) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "1", "cat_s", "a", "price_i", (int64_t)10),

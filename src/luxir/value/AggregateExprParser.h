@@ -1,10 +1,13 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -54,7 +57,7 @@ public:
     program = arenaCreate<AggregateProgram>(arena, arena);
     cur->skipWs();
     if (cur->atEnd()) fail(0, "empty aggregate expression");
-    ValueExprGrammar grammar(*this, *cur);
+    ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
     cur->skipWs();
     if (!cur->atEnd()) fail(cur->position(), "unexpected trailing input");
@@ -65,56 +68,19 @@ public:
     return program;
   }
 
-  void enterDepth(size_t pos) {
-    if (*budget <= 0) fail(pos, "expression nesting exceeds the supported depth");
-    --*budget;
-  }
-
-  void leaveDepth() { ++*budget; }
-
-  uint32_t makeUnary(char op, size_t pos, uint32_t child) {
-    assert(op == '-');
-    return makeUnary(*ValueFunctionRegistry::find("neg"), pos, child);
-  }
-
-  uint32_t makeUnary(const ValueFunction& function, size_t pos,
-                     uint32_t child) {
-    ResolvedValue resolved = resolveFunction(function, pos, {child, 0}, 1);
+  uint32_t makeFunction(std::string_view name, size_t pos,
+                        std::span<const uint32_t> children) {
+    const ValueFunction* function = ValueFunctionRegistry::find(name);
+    assert(function != nullptr && function->evalBucketScalar != nullptr);
+    ResolvedValue resolved = resolveFunction(*function, pos, children);
     AggregateNode node;
-    node.kind = AggregateNodeKind::UNARY;
+    node.kind = children.size() == 1
+        ? AggregateNodeKind::UNARY : AggregateNodeKind::BINARY;
     node.type = valueDouble(resolved.type)
         ? BucketValueType::DOUBLE : BucketValueType::INT128;
     node.nature = resolved.nature;
-    node.opcode = function.opcode;
-    node.function = &function;
-    node.children[0] = child;
-    node.sourcePos = pos;
-    return program->addNode(node);
-  }
-
-  uint32_t makeBinary(char op, size_t pos, uint32_t left, uint32_t right) {
-    const char* name = nullptr;
-    switch (op) {
-      case '+': name = "add"; break;
-      case '-': name = "sub"; break;
-      case '*': name = "mul"; break;
-      case '/': name = "div"; break;
-      default: std::unreachable();
-    }
-    return makeBinary(*ValueFunctionRegistry::find(name), pos, left, right);
-  }
-
-  uint32_t makeBinary(const ValueFunction& function, size_t pos,
-                      uint32_t left, uint32_t right) {
-    ResolvedValue resolved = resolveFunction(function, pos, {left, right}, 2);
-    AggregateNode node;
-    node.kind = AggregateNodeKind::BINARY;
-    node.type = valueDouble(resolved.type)
-        ? BucketValueType::DOUBLE : BucketValueType::INT128;
-    node.nature = resolved.nature;
-    node.opcode = function.opcode;
-    node.function = &function;
-    node.children = {left, right};
+    node.function = function;
+    std::copy(children.begin(), children.end(), node.children.begin());
     node.sourcePos = pos;
     return program->addNode(node);
   }
@@ -137,12 +103,21 @@ public:
     }
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     if (lookup.aggregate != nullptr
-        && lookup.aggregate->supports(FunctionCapability::BUCKET_AGGREGATE)) {
-      return parseAggregate(*lookup.aggregate, pos);
+        && !(lookup.value != nullptr
+             && lookup.value->evalBucketScalar != nullptr
+             && grammar.hasTopLevelComma())) {
+      return parseAggregate(grammar, *lookup.aggregate, pos);
     }
     if (lookup.value != nullptr
-        && lookup.value->supports(FunctionCapability::BUCKET_SCALAR)) {
-      return parseBucketFunction(grammar, *lookup.value, pos);
+        && lookup.value->evalBucketScalar != nullptr) {
+      std::array<uint32_t, 2> args{};
+      uint8_t count = grammar.parseArguments(
+          name, pos, lookup.value->minArity, lookup.value->maxArity,
+          [&](uint8_t argument) {
+            args[argument] = grammar.parseExpression();
+          });
+      return makeFunction(name, pos,
+                          std::span<const uint32_t>(args.data(), count));
     }
     if (lookup.value != nullptr) {
       fail(pos, fmt::format(
@@ -161,10 +136,9 @@ public:
 
 private:
   ResolvedValue resolveFunction(const ValueFunction& function, size_t pos,
-                                std::array<uint32_t, 2> children,
-                                uint8_t count) {
+                                std::span<const uint32_t> children) {
     std::array<ResolvedValue, 2> args{};
-    for (uint8_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < children.size(); i++) {
       const AggregateNode& child = program->nodes[children[i]];
       args[i] = {
           child.type == BucketValueType::DOUBLE
@@ -173,7 +147,7 @@ private:
     }
     try {
       return function.resolve(
-          std::span<const ResolvedValue>(args.data(), count));
+          std::span<const ResolvedValue>(args.data(), children.size()));
     } catch (const std::exception& error) {
       fail(pos, error.what());
     }
@@ -228,75 +202,30 @@ private:
   }
 
   template <class Grammar>
-  uint32_t parseBucketFunction(Grammar& grammar,
-                               const ValueFunction& function,
-                               size_t pos) {
-    ValueExprDepthGuard guard(*this, pos);
-
-    cur->advance();
-    std::array<uint32_t, 2> args{};
-    uint8_t count = 0;
-    cur->skipWs();
-    if (!cur->consume(')')) {
-      for (;;) {
-        if (count == args.size()) {
-          fail(cur->position(), fmt::format(
-              "{}() accepts at most {} arguments", function.name,
-              function.maxArity));
-        }
-        args[count++] = grammar.parseExpression();
-        auto separator = value::lex::consumeListSeparator(*cur);
-        if (separator == value::lex::ListSeparator::CLOSE) break;
-        if (separator != value::lex::ListSeparator::COMMA) {
-          fail(cur->position(), fmt::format(
-              "expected ',' or ')' in {}(...)", function.name));
-        }
-        cur->skipWs();
-        if (cur->peek() == ')') {
-          fail(cur->position(), "trailing comma is not allowed");
-        }
-      }
-    }
-    if (count < function.minArity || count > function.maxArity) {
-      fail(pos, fmt::format("{}() expects exactly {} argument{}",
-                            function.name, function.minArity,
-                            function.minArity == 1 ? "" : "s"));
-    }
-    return count == 1 ? makeUnary(function, pos, args[0])
-                      : makeBinary(function, pos, args[0], args[1]);
-  }
-
-  uint32_t parseAggregate(const AggregateFunction& function, size_t pos) {
+  uint32_t parseAggregate(Grammar& grammar,
+                          const AggregateFunction& function, size_t pos) {
     std::string_view name = function.name;
-    ValueExprDepthGuard guard(*this, pos);
-    cur->advance();
-    cur->skipWs();
-    size_t argumentStart = cur->position();
-
     ValueProgram* input = nullptr;
-    uint8_t argumentCount = 0;
-    if (cur->peek() != ')') {
-      ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false};
-      try {
-        input = ValueExprParser(valueOptions, arena).parsePartial(*cur);
-      } catch (const std::runtime_error& error) {
-        throw std::runtime_error(fmt::format("op '{}': {}", opts.opName, error.what()));
-      }
-      argumentCount = 1;
-    }
-    size_t argumentEnd = cur->position();
-    cur->skipWs();
-    if (!cur->consume(')')) {
-      fail(cur->position(), fmt::format(
-          "{}() expects exactly {} argument{}", name,
-          function.maxArguments, function.maxArguments == 1 ? "" : "s"));
-    }
-    if (argumentCount < function.minArguments
-        || argumentCount > function.maxArguments) {
-      fail(argumentStart, fmt::format(
-          "{}() expects exactly {} argument{}", name,
-          function.minArguments, function.minArguments == 1 ? "" : "s"));
-    }
+    size_t argumentStart = 0;
+    size_t argumentEnd = 0;
+    std::vector<AggregateConstant> trailing;
+    grammar.parseArguments(
+        name, pos, function.minArguments, function.maxArguments,
+        [&](uint8_t argument) {
+          if (argument == 0) {
+            argumentStart = cur->position();
+            ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false};
+            try {
+              input = ValueExprParser(valueOptions, arena).parsePartial(*cur);
+            } catch (const std::runtime_error& error) {
+              throw std::runtime_error(fmt::format(
+                  "op '{}': {}", opts.opName, error.what()));
+            }
+            argumentEnd = cur->position();
+          } else {
+            trailing.push_back(parseAggregateConstant());
+          }
+        });
 
     if (input != nullptr && input->needsScore) {
       throw std::runtime_error(fmt::format(
@@ -307,8 +236,9 @@ private:
       std::string_view argument = cur->slice(argumentStart, argumentEnd);
       fail(pos, fmt::format(
           "{}() requires one scalar per document; '{}' produces a {}; "
-          "reduce it per document first with avg(...), min(...), or max(...)",
-          name, argument, valueTypeName(input->root().type)));
+          "reduce it per document first with {}",
+          name, argument, valueTypeName(input->root().type),
+          ValueFunctionRegistry::arrayReducerNames()));
     }
     if (input != nullptr && input->root().type == ValueType::COLUMN_ONLY) {
       fail(pos, fmt::format("{}() requires a numeric expression", name));
@@ -316,7 +246,8 @@ private:
 
     ResolvedAggregate resolved;
     try {
-      resolved = function.resolve(input == nullptr ? nullptr : &input->root());
+      resolved = function.resolve(
+          input == nullptr ? nullptr : &input->root(), trailing);
     } catch (const std::exception& error) {
       fail(pos, error.what());
     }
@@ -324,6 +255,7 @@ private:
     AggregateLeaf leaf;
     leaf.input = input;
     leaf.resolved = resolved;
+    leaf.arguments = program->copyConstants(trailing);
     leaf.stateOffset = program->stateBytes;
     program->stateBytes += leaf.resolved.state.bytes;
     uint32_t leafIndex = (uint32_t)program->leaves.size();
@@ -336,6 +268,44 @@ private:
     node.aggregate = leafIndex;
     node.sourcePos = pos;
     return program->addNode(node);
+  }
+
+  AggregateConstant parseAggregateConstant() {
+    cur->skipWs();
+    size_t pos = cur->position();
+    if (cur->peek() == '$') {
+      std::string_view name = value::lex::scanVariable(*cur);
+      if (name.empty()) fail(pos, "'$' must be followed by a variable name");
+      const auto* view = opts.vars.find(name);
+      if (view == nullptr) fail(pos, fmt::format("undefined variable ${}", name));
+      const api::Val& value = **view;
+      if (const auto* integer = std::get_if<int64_t>(&value.kind)) {
+        return {ValueType::INT64, *integer, 0.0};
+      }
+      if (const auto* floating = std::get_if<double>(&value.kind)) {
+        if (!std::isfinite(*floating)) {
+          fail(pos, fmt::format("variable ${} contains NaN or infinity", name));
+        }
+        return {ValueType::DOUBLE, 0, *floating};
+      }
+      if (const auto* floating = std::get_if<float>(&value.kind)) {
+        if (!std::isfinite(*floating)) {
+          fail(pos, fmt::format("variable ${} contains NaN or infinity", name));
+        }
+        return {ValueType::DOUBLE, 0, (double)*floating};
+      }
+      fail(pos, fmt::format(
+          "aggregate parameter ${} must be a numeric scalar", name));
+    }
+    if (cur->peek() == '+' || cur->peek() == '-' || cur->peek() == '.'
+        || value::lex::digit(cur->peek())) {
+      value::lex::NumericLiteral literal = value::lex::parseNumericLiteral(
+          *cur, [&](size_t at, std::string_view message) { fail(at, message); });
+      return literal.floating
+          ? AggregateConstant{ValueType::DOUBLE, 0, literal.doubleValue}
+          : AggregateConstant{ValueType::INT64, literal.intValue, 0.0};
+    }
+    fail(pos, "aggregate trailing arguments must be numeric constants or scalar variables");
   }
 };
 

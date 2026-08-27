@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -34,9 +35,11 @@ inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 inline std::size_t forcedRangeFacetBindingStateChunkBytes = 0;
 inline std::size_t* rangeFacetBindingBlockCounter = nullptr;
 
-// Test override for the request-wide facet aggregate-state ceiling. Zero uses
+// Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.
-inline std::size_t forcedFacetAggregateStateByteBudget = 0;
+inline std::size_t forcedRequestMemoryMaxBytes = 0;
+inline std::atomic<size_t>* facetAggregateStateReservationCounterForTests =
+    nullptr;
 
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key

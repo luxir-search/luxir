@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "luxir/value/ValueTypes.h"
@@ -30,21 +31,6 @@ enum class ValueOpcode : uint8_t {
   AVG,
 };
 
-enum class FunctionCapability : uint8_t {
-  DOCUMENT_VALUE = 1,
-  BUCKET_SCALAR = 2,
-  BUCKET_AGGREGATE = 4,
-};
-
-constexpr uint8_t functionCapabilities(FunctionCapability a) {
-  return (uint8_t)a;
-}
-
-constexpr uint8_t functionCapabilities(FunctionCapability a,
-                                       FunctionCapability b) {
-  return (uint8_t)a | (uint8_t)b;
-}
-
 struct ValueFunction {
   using Resolve = ResolvedValue (*)(std::span<const ResolvedValue> args);
   using EvalPoint = ValueResult (*)(BoundValueProgram& program, const ValueNode& node,
@@ -70,21 +56,14 @@ struct ValueFunction {
   EvalElement evalElement = nullptr;
   uint8_t minArity = 0;
   uint8_t maxArity = 0;
-  uint8_t capabilities = functionCapabilities(FunctionCapability::DOCUMENT_VALUE);
   EvalBucketScalar evalBucketScalar = nullptr;
-
-  bool supports(FunctionCapability capability) const {
-    if (capability == FunctionCapability::BUCKET_SCALAR) {
-      return evalBucketScalar != nullptr;
-    }
-    return (capabilities & (uint8_t)capability) != 0;
-  }
 };
 
 class ValueFunctionRegistry {
 public:
   static const ValueFunction* find(std::string_view name);
   static std::span<const ValueFunction> entries();
+  static std::string arrayReducerNames();
 };
 
 } // namespace luxir

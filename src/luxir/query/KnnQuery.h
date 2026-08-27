@@ -2175,7 +2175,7 @@ private:
       }
 
       // unique_ptr guards the obtained accumulator against a throw before
-      // release (same idiom as StatsOp / FacetOp).
+      // release (same idiom as FacetOp).
       std::unique_ptr<RescoreAccumulator> acc(merger.obtain());
       for (size_t i = bucketBegin; i < bucketEnd;) {
         int32_t docId = v2d.resolve(candidates[i].valueRank);

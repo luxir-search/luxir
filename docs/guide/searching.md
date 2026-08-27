@@ -227,9 +227,13 @@ its following value. The function spellings remain available:
 - Arithmetic: `add`, `sub`, `mul`, and `div`.
 - Defaults: `def(value, fallback)` substitutes only when `value` is missing.
 - Unary math: `neg`, `abs`, `sqrt`, `log`, `log1p`, and `floor`.
-- Multi-valued reducers: `min`, `max`, and `avg`. A composed array-valued root
-  must use one of these explicit reducers. The two-argument `min` and `max`
-  forms compare scalar values and are useful for clamping.
+- Multi-valued reducers: `min`, `max`, `avg`, `sum`, and `count`. Integer
+  `sum` overflow makes that document's value missing; `sum` rejects DATE
+  arrays. Missing or empty arrays reduce to missing except for `count`, which
+  returns zero. `count` also returns one or zero for a present or missing
+  numeric scalar. A composed array-valued root must use an explicit reducer.
+  The two-argument `min` and `max` forms compare scalar values and are useful
+  for clamping.
 
 For example:
 
@@ -247,8 +251,10 @@ zero denominator makes that value missing rather than failing the request;
 `def(value,fallback)` can opt it back in. For an array division, only the
 zero-denominator elements are absent, and reducers use the quotients that are
 present. Array arithmetic permits scalar broadcasting but does not implicitly
-zip two arrays. NaN, infinity, invalid math domains, and int64 overflow remain
-evaluation errors.
+zip two arrays. A NaN read from a stored numeric column is missing. Stored
+infinities remain values, including for `min` and `max`; a non-finite result
+produced by arithmetic, an invalid math domain, or int64 overflow remains an
+evaluation error.
 
 DATE values retain their DATE meaning through `def`, `min`, `max`, `avg`, and
 DATE plus or minus a number. DATE minus DATE produces a number. Multiplication,
@@ -293,9 +299,7 @@ POST /collections/books/_search
           "categories": {
             "field_facet": {"field":"category_s","limit":10}
           },
-          "average_price": {
-            "gen_op": {"name":"avg","args":["price_f"]}
-          }
+          "average_price": "avg(price_f)"
         }
       }
     }
@@ -320,9 +324,11 @@ POST /collections/books/_search
 ```
 
 The document list is promoted to `found` and `docs` in the HTTP envelope;
-nested and sibling operation results appear under `ops`. `avg`, `sum`, `min`,
-and `max` generic operations work on numeric columns and ignore missing values.
-An empty metric domain renders as `null` in JSON.
+nested and sibling operation results appear under `ops`. Expression metrics
+fold `avg`, `sum`, `min`, or `max` over value expressions and ignore missing
+document values. Integer results stay typed as integers; averages and
+floating-point results are doubles. An empty metric domain renders as `null`
+in JSON.
 
 See [Faceting](faceting.md) for terms, range, date, nested, and per-bucket
 operations. See [Vector Search](vector-search.md#hybrid-search-with-rrf) for a

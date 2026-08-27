@@ -12,6 +12,7 @@
 #include "luxir/LuxirConfig.h"
 #include "IndexReader.h"
 #include "FilterCache.h"
+#include "RequestMemTracker.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -76,6 +77,7 @@ class SearchRequest {
 public:
   SearchEngine& engine;
   const SearchConfig searchConfig;
+  RequestMemTracker memoryTracker;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
@@ -107,7 +109,6 @@ public:
   // copied onto the FINAL response's SearchResponse.warnings.  Message views
   // point into requestPool, which outlives response serialization.
   std::vector<api::Warning> warnings;
-  std::atomic<size_t> facetAggregateStateBytes{0};
   // Empty, with no backing allocation, unless an instrumented op observes
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
@@ -147,9 +148,6 @@ public:
 
   void fillExecutionProfile(SearchResponse& response);
   void warnOnce(std::string_view code, std::string_view message);
-  void chargeFacetAggregateState(size_t bytes, std::string_view facetName,
-                                 std::string_view metricName);
-  void releaseFacetAggregateState(size_t bytes);
 
   /// Flow-control advice returned by reply().  The response is always accepted
   /// (or dropped, for CANCEL); the status only tells a streaming producer what

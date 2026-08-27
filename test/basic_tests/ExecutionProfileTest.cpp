@@ -51,12 +51,6 @@ const api::ExecutionProfileOp& profileOp(
   return response.profile->ops.front();
 }
 
-class FacetFeedStrategyGuard {
-  FacetFeedStrategy saved = forcedFacetFeedStrategy;
-public:
-  ~FacetFeedStrategyGuard() { forcedFacetFeedStrategy = saved; }
-};
-
 // details is free-form prose for humans and NOT an API, but tests ship with the
 // code, so matching a marker in it is a fine way to confirm the intended path
 // fired.  Match a distinguishing fragment, never a whole rendered line - the
@@ -224,7 +218,7 @@ TEST_F(ExecutionProfileTest, nestedAutoSelectsReplayAndFallsBack) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  FacetFeedStrategyGuard guard;
+  SearchOverridesGuard guard(forcedFacetFeedStrategy);
   auto run = [&](FacetFeedStrategy feed, bool filtered) {
     forcedFacetFeedStrategy = feed;
     auto req = localReq(helper.getSearchEngine());

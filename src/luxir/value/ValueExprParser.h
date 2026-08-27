@@ -62,40 +62,25 @@ public:
     program = arenaCreate<ValueProgram>(arena, arena);
     cur->skipWs();
     if (cur->atEnd()) fail(cur->position(), "empty value expression");
-    ValueExprGrammar grammar(*this, *cur);
+    ValueExprGrammar grammar(*this, *cur, *budget);
     program->rootNode = grammar.parseExpression();
     program->constantScalar = findConstantScalar();
     return program;
   }
 
-  void enterDepth(size_t pos) {
-    if (*budget <= 0) fail(pos, "expression nesting exceeds the supported depth");
-    --*budget;
-  }
-
-  void leaveDepth() { ++*budget; }
-
-  uint32_t makeUnary(char op, size_t pos, uint32_t child) {
-    assert(op == '-');
-    return makeFunction(ValueFunctionRegistry::find("neg"), pos, {child, 0}, 1);
-  }
-
-  uint32_t makeBinary(char op, size_t pos, uint32_t left, uint32_t right) {
-    const char* name = nullptr;
-    switch (op) {
-      case '+': name = "add"; break;
-      case '-': name = "sub"; break;
-      case '*': name = "mul"; break;
-      case '/': name = "div"; break;
-      default: std::unreachable();
-    }
-    return makeFunction(ValueFunctionRegistry::find(name), pos, {left, right}, 2);
+  uint32_t makeFunction(std::string_view name, size_t pos,
+                        std::span<const uint32_t> args) {
+    const ValueFunction* function = ValueFunctionRegistry::find(name);
+    assert(function != nullptr);
+    std::array<uint32_t, 2> children{};
+    assert(args.size() <= children.size());
+    std::copy(args.begin(), args.end(), children.begin());
+    return appendFunction(function, pos, children, (uint8_t)args.size());
   }
 
   template <class Grammar>
   uint32_t parseAtom(Grammar& grammar) {
-    unused(grammar);
-    return parseValue();
+    return parseValue(grammar);
   }
 
   [[noreturn]] void fail(size_t pos, std::string_view message) const {
@@ -181,7 +166,8 @@ private:
     return (uint32_t)program->nodes.size() - 1;
   }
 
-  uint32_t parseValue() {
+  template <class Grammar>
+  uint32_t parseValue(Grammar& grammar) {
     cur->skipWs();
     size_t pos = cur->position();
     char c = cur->peek();
@@ -194,7 +180,7 @@ private:
     }
     std::string_view name = value::lex::scanIdentifier(*cur);
     if (name.empty()) fail(pos, "expected a number, numeric column, variable, score, or function");
-    if (cur->peek() == '(') return parseCall(name, pos);
+    if (cur->peek() == '(') return parseCall(grammar, name, pos);
     if (name == "score" || (opts.sortIntrinsics && name == "_score_")) {
       ValueNode node;
       node.kind = ValueNodeKind::SCORE;
@@ -331,10 +317,9 @@ private:
     return append(node);
   }
 
-  uint32_t parseCall(std::string_view name, size_t pos) {
-    ValueExprDepthGuard guard(*this, pos);
-    cur->advance();
-    if (name == "col") return parseExplicitColumn(pos);
+  template <class Grammar>
+  uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
+    if (name == "col") return parseExplicitColumn(grammar, pos);
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -347,50 +332,33 @@ private:
     }
 
     std::array<uint32_t, 2> args{};
-    uint8_t count = 0;
-    cur->skipWs();
-    if (!cur->consume(')')) {
-      ValueExprGrammar grammar(*this, *cur);
-      for (;;) {
-        if (count == args.size()) {
-          fail(cur->position(), fmt::format("{}() accepts at most {} arguments", name,
-                                           function->maxArity));
-        }
-        args[count++] = grammar.parseExpression();
-        auto separator = value::lex::consumeListSeparator(*cur);
-        if (separator == value::lex::ListSeparator::CLOSE) break;
-        if (separator != value::lex::ListSeparator::COMMA) {
-          fail(cur->position(), fmt::format("expected ',' or ')' in {}(...)", name));
-        }
-        cur->skipWs();
-        if (cur->peek() == ')') fail(cur->position(), "trailing comma is not allowed");
-      }
-    }
-    if (count < function->minArity || count > function->maxArity) {
-      if (function->minArity == function->maxArity) {
-        fail(pos, fmt::format("{}() expects {} argument{}", name, function->minArity,
-                              function->minArity == 1 ? "" : "s"));
-      }
-      fail(pos, fmt::format("{}() expects {} to {} arguments", name,
-                            function->minArity, function->maxArity));
-    }
-    return makeFunction(function, pos, args, count);
+    uint8_t count = grammar.parseArguments(
+        name, pos, function->minArity, function->maxArity,
+        [&](uint8_t argument) {
+          args[argument] = grammar.parseExpression();
+        });
+    return appendFunction(function, pos, args, count);
   }
 
-  uint32_t parseExplicitColumn(size_t pos) {
-    cur->skipWs();
-    if (cur->peek() != '"' && cur->peek() != '\'') {
-      fail(cur->position(), "col() expects one quoted field name, for example col(\"price_i\")");
-    }
-    std::string_view name = value::lex::scanQuoted(*cur, program->resource,
-        [&](size_t at, std::string_view message) { fail(at, message); });
-    cur->skipWs();
-    if (!cur->consume(')')) fail(cur->position(), "col() expects exactly one quoted field name");
+  template <class Grammar>
+  uint32_t parseExplicitColumn(Grammar& grammar, size_t pos) {
+    std::string_view name;
+    grammar.parseArguments("col", pos, 1, 1, [&](uint8_t argument) {
+      unused(argument);
+      cur->skipWs();
+      if (cur->peek() != '"' && cur->peek() != '\'') {
+        fail(cur->position(),
+             "col() expects one quoted field name, for example col(\"price_i\")");
+      }
+      name = value::lex::scanQuoted(
+          *cur, program->resource,
+          [&](size_t at, std::string_view message) { fail(at, message); });
+    });
     return parseColumn(name, pos);
   }
 
-  uint32_t makeFunction(const ValueFunction* function, size_t pos,
-                        std::array<uint32_t, 2> args, uint8_t count) {
+  uint32_t appendFunction(const ValueFunction* function, size_t pos,
+                          std::array<uint32_t, 2> args, uint8_t count) {
     assert(function != nullptr);
     std::array<ResolvedValue, 2> resolvedArgs{};
     for (uint8_t i = 0; i < count; i++) {

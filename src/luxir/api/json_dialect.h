@@ -221,7 +221,7 @@ struct from<JSON, luxir::api::ExprOp> {
 };
 
 // ----- SearchOp: canonical one-arm object, or a bare string (ExprOp sugar) -----
-static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 6,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
 struct from<JSON, luxir::api::SearchOp> {
@@ -262,8 +262,6 @@ struct from<JSON, luxir::api::SearchOp> {
             arm(std::in_place_type<api::FieldFacet>);
           } else if (key == "range_facet") {
             arm(std::in_place_type<api::RangeFacet>);
-          } else if (key == "gen_op") {
-            arm(std::in_place_type<api::GenOp>);
           } else if (key == "expr_op") {
             arm(std::in_place_type<api::ExprOp>);
           } else {

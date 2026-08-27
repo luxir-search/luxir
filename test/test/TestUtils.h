@@ -4,12 +4,36 @@
 #include <array>
 #include <map>
 #include <string>
+#include <tuple>
 #include "LuxirTest.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/query/Query.h"
 #include "luxir/util/Overloaded.h"
 
 namespace luxir::test {
+
+template <class... Values>
+class SearchOverridesGuard {
+  std::tuple<Values*...> targets;
+  std::tuple<Values...> saved;
+
+  template <size_t... Index>
+  void restore(std::index_sequence<Index...>) {
+    ((*std::get<Index>(targets) = std::get<Index>(saved)), ...);
+  }
+
+public:
+  explicit SearchOverridesGuard(Values&... values)
+      : targets(&values...), saved(values...) {}
+  SearchOverridesGuard(const SearchOverridesGuard&) = delete;
+  SearchOverridesGuard& operator=(const SearchOverridesGuard&) = delete;
+  ~SearchOverridesGuard() {
+    restore(std::index_sequence_for<Values...>{});
+  }
+};
+
+template <class... Values>
+SearchOverridesGuard(Values&...) -> SearchOverridesGuard<Values...>;
 
 inline Query::ScorerPlan* resolveScorerPlanForTests(
     MemPool& pool, Query::ScorerSupplier& supplier, int64_t candidates,
