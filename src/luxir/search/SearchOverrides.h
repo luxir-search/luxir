@@ -165,17 +165,15 @@ enum class FacetBucketDomainSource {
 // (LUXIR_FACET_SUBOP_INLINE).  Inlining pays the whole domain per metric and
 // covers every bucket; the post-selection bucket-domain feed pays only the
 // documents the RETURNED buckets hold, plus a fixed cost per bucket.  So
-// inlining wins when the returned buckets cover most of the domain, or when the
-// domain is small enough that the per-bucket fixed cost dominates, and loses
-// badly otherwise - on a 300k-document grid, moving two extra metrics onto the
-// bucket-domain feed was free from realized cardinality 1,000 upward and cost
-// 2.4x at cardinality 10.
+// inlining wins when the returned buckets cover most of a sufficiently large
+// domain and loses when the ord-column/batch feed can replay a small domain
+// cheaply.
 //
 // AUTO is the shipping rule: a sort key must be inlined (its value decides
 // which buckets are returned at all), and limit==-1 inlines everything because
-// every bucket is returned, which is the coverage-is-total case.  ALL and
-// SORT_KEY_ONLY pin the two sides so the crossover between them can be measured
-// at a finite limit before a rule is written for it.
+// every bucket is returned. At finite limits, full bucket coverage is only a
+// candidate; the string facet resolves it from the matching domain size. ALL
+// and SORT_KEY_ONLY remain authoritative A/B controls.
 enum class FacetSubOpInlineMode {
   AUTO, ALL, SORT_KEY_ONLY
 };

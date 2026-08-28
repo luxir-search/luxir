@@ -1976,31 +1976,49 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
   EXPECT_EQ(5, bar[1]);   // (7 + 3) / 2
 }
 
-// AUTO inlines every sub-op exactly when the limit returns every bucket, and
-// only when a sort key already forced the inline pass. The profile is the
-// evidence: with the extras inlined nothing is left for the post-selection
-// feed, so no "result-feed=" detail is emitted at all.
-TEST_F(FacetTest, subOpInlineAutoFollowsBucketCoverage) {
+// Finite full-bucket coverage is only a candidate for AUTO: a 10K matching
+// domain leaves the extra metrics on the feed, while the 48K threshold promotes
+// them. Forced modes remain authoritative on both sides of the crossover.
+TEST_F(FacetTest, subOpInlineAutoUsesDomainCrossover) {
   CollectionHelper helper;
-  for (int i = 0; i < 40; i++) {
-    helper.index(flatdoc("cat_s", "c" + std::to_string(i % 4),   // 4 buckets
-                         "wide_s", "w" + std::to_string(i),      // 40 buckets
-                         "foo_i", (int64_t)i, "bar_i", (int64_t)(40 - i)),
-                 i == 39 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  constexpr int32_t DOCS_PER_SEGMENT = 24 * 1024;
+  constexpr int32_t TINY_DOCS_PER_SEGMENT = 5 * 1024;
+  for (int32_t segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    docs.reserve(DOCS_PER_SEGMENT);
+    for (int32_t i = 0; i < DOCS_PER_SEGMENT; i++) {
+      int32_t bucket = i % 10;
+      docs.push_back(flatdoc(
+          "cat_s", "c" + std::to_string(bucket),
+          "tiny_s", i < TINY_DOCS_PER_SEGMENT ? "yes" : "no",
+          "foo_i", (int64_t)(bucket * 10 + i % 3),
+          "bar_i", (int64_t)(i % 100),
+          "baz_i", (int64_t)1));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   }
 
-  auto feedDetails = [&](const char* field, bool sorted) {
+  auto feedDetails = [&](bool tinyDomain, FacetSubOpInlineMode mode) {
+    SearchOverridesGuard guard(forcedFacetSubOpInline);
+    forcedFacetSubOpInline = mode;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main").profile();
-    req->topDocs().getNumber(true).allQuery();
-    auto& facet = req->facet("f", field);
-    facet.limit(10);
-    facet.avg("avg_foo", "foo_i");
-    facet.avg("avg_bar", "bar_i");
-    if (sorted) {
+    auto configure = [](auto& facet) {
+      facet.limit(10);
+      facet.avg("avg_foo", "foo_i");
+      facet.avg("avg_bar", "bar_i");
+      facet.sum("sum_baz", "baz_i");
       qb::sort(facet, "avg_foo", qb::DESC);
+    };
+    if (tinyDomain) {
+      auto& top = req->topDocs("q");
+      top.getNumber(true).matchQuery("tiny_s", "yes");
+      configure(top.facet("f", "cat_s"));
+    } else {
+      configure(req->facet("f", "cat_s"));
     }
     req->execute(true);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
     std::string details;
     const auto& profile = req->responses[0]->proto.profile;
     EXPECT_TRUE(profile.has_value()) << req->toString();
@@ -2016,15 +2034,14 @@ TEST_F(FacetTest, subOpInlineAutoFollowsBucketCoverage) {
     return details;
   };
 
-  // 4 buckets, limit 10 -> every bucket returned, and sorted, so the extras
-  // ride the inline pass and nothing reaches the bucket-domain feed.
-  EXPECT_EQ(feedDetails("cat_s", true).find("result-feed="), std::string::npos);
-  // 40 buckets, limit 10 -> ten of forty come back, so the extras stay on the
-  // feed where they only read the winners' documents.
-  EXPECT_NE(feedDetails("wide_s", true).find("result-feed="), std::string::npos);
-  // No sort key: the count pass is free to take a strategy the inline path
-  // cannot reach, so coverage alone does not move the extras.
-  EXPECT_NE(feedDetails("cat_s", false).find("result-feed="), std::string::npos);
+  EXPECT_NE(feedDetails(true, FacetSubOpInlineMode::AUTO)
+                .find("result-feed="), std::string::npos);
+  EXPECT_EQ(feedDetails(false, FacetSubOpInlineMode::AUTO)
+                .find("result-feed="), std::string::npos);
+  EXPECT_EQ(feedDetails(true, FacetSubOpInlineMode::ALL)
+                .find("result-feed="), std::string::npos);
+  EXPECT_NE(feedDetails(false, FacetSubOpInlineMode::SORT_KEY_ONLY)
+                .find("result-feed="), std::string::npos);
 }
 
 // A finite limit selects into a bounded heap instead of ordering every bucket,

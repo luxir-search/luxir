@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -94,8 +95,14 @@ inline void collectSparseCounts(
 //
 
 class StrFacetOp : public FieldFacetReq {
+  // Refittable AUTO crossover. With ten buckets and three metrics, inline-all
+  // won at 100K matching docs and lost at 10K; 48K is the initial bracketed
+  // boundary.
+  static constexpr int64_t INLINE_ALL_MIN_DOMAIN = 48 * 1024;
+
   std::shared_ptr<OrdMap> ordMap;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
+  bool inlineAllCandidate = false;
 
 public:
   class MergeableStrData : public luxir::MergeableData {
@@ -372,19 +379,12 @@ public:
     }
 
     // Whether the REMAINING sub-ops join the count pass or stay behind for the
-    // post-selection bucket-domain feed. The feed reads only the documents the
-    // RETURNED buckets hold, and pays a fixed cost per bucket on top; inlining
-    // reads the whole domain per sub-op and pays no per-bucket cost. So the
-    // question is whether every bucket comes back: then the feed re-reads the
-    // whole domain anyway and only the fixed cost separates them.
-    //
-    // Measured on a 300k slice, three metrics sorted by one, at limit 10: at
-    // cardinality 10 - every bucket returned - inlining all of them wins 1.3x
-    // unfiltered and 3.6x at 1% selectivity, the gain growing as the domain
-    // shrinks and the per-bucket fixed cost dominates. At cardinality 100 and
-    // 1,000 it LOSES 30-43%, because ten buckets of many hold little of the
-    // domain. numOrds is an index-wide bound, so `limit >= buckets` is
-    // conservative for a filtered domain: it can only under-claim coverage.
+    // post-selection bucket-domain feed. limit==-1 still inlines all because
+    // every bucket is returned. A finite limit that covers the index-wide
+    // bucket bound only records a candidate here: calcAll resolves it from the
+    // actual matching domain. The ord-column/batch feed made small-domain
+    // replay cheap; with ten buckets and three metrics, inline-all won at 100K
+    // matching docs and lost at 10K.
     //
     // Restricted to requests that are already inlining something (a sort key,
     // whose value decides which buckets are returned at all). Without one, the
@@ -393,14 +393,20 @@ public:
     // that trade has not been measured. LUXIR_FACET_SUBOP_INLINE=all is how to
     // measure it.
     int64_t buckets = ordMap ? ordMap->numOrds() : 0;
-    bool inlineAll = limit == -1
-        || (!inlineSubOps.empty() && limit >= buckets);
+    bool inlineAll = limit == -1;
+    inlineAllCandidate = limit != -1 && !inlineSubOps.empty()
+        && limit >= buckets
+        && std::ranges::any_of(subOps, [](const auto& subOp) {
+             return subOp.second->canInline();
+           });
     if (forcedFacetSubOpInline == FacetSubOpInlineMode::ALL) {
       inlineAll = true;
     } else if (forcedFacetSubOpInline == FacetSubOpInlineMode::SORT_KEY_ONLY) {
       inlineAll = false;
+      inlineAllCandidate = false;
     }
     if (inlineAll) {
+      inlineAllCandidate = false;
       std::vector<std::string_view> moved;
       for (auto& subOp : subOps) {
         if (subOp.second->canInline()) {
@@ -468,10 +474,14 @@ public:
   class Calc : public Calculator {
     ExecutionProfileRun* profileRun;
     std::vector<DomainHandle> input;
+    std::vector<std::pair<const std::string_view, SearchOp*>> inlineOps;
+    std::vector<std::pair<const std::string_view, SearchOp*>> feedOps;
     std::vector<uint8_t> topTermsSegments;
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
+    std::atomic<int32_t> gatheredDomainsSeen{0};
     int64_t inlineExpectedValues = -1;
+    bool inlinePlanResolved = false;
 
     static int64_t scaleExpectedValues(
         int64_t domainSize, int64_t segmentValues, int32_t maxDoc) {
@@ -513,6 +523,9 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots),
         profileRun(op.addExecutionProfileRun()),
+        inlineOps(((StrFacetOp&)op).inlineSubOps),
+        feedOps(((StrFacetOp&)op).subOps.begin(),
+                ((StrFacetOp&)op).subOps.end()),
         driver(op.req.reader->segments().size(),
                [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
         inlineDriver(op.req.reader->segments().size(),
@@ -521,7 +534,7 @@ public:
       topTermsSegments.resize(op.req.reader->segments().size());
       inlineDriver.setCreator([this]() {
         auto* p = new MergeableStrFacetInline;
-        for (auto& [key, subop] : thisOp().inlineSubOps) {
+        for (auto& [key, subop] : inlineOps) {
           auto* calc = subop->createInlineCalculator(this, -1, -1);
           p->inlineCalcs.push_back(calc);
         }
@@ -541,6 +554,71 @@ public:
       return (StrFacetOp&)getOp();
     }
 
+    void promoteRemainingInline() {
+      std::vector<std::pair<const std::string_view, SearchOp*>> remaining;
+      remaining.reserve(feedOps.size());
+      for (auto& subOp : feedOps) {
+        if (subOp.second->canInline()) {
+          inlineOps.push_back(subOp);
+        } else {
+          remaining.push_back(subOp);
+        }
+      }
+      feedOps.swap(remaining);
+    }
+
+    void resolveInlinePlan(std::span<const DomainHandle> domains) {
+      assert(!inlinePlanResolved);
+      assert(domains.size() == thisOp().reader.segments().size());
+      int64_t totalDomainSize = 0;
+      inlineExpectedValues = inlineOps.empty() ? -1 : 0;
+      for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        auto& postings = thisOp().reader.segments()[segnum].postingsReader();
+        int32_t maxDoc = postings.maxDoc();
+        int64_t domainSize = domains[segnum].get() != nullptr
+            ? domains[segnum].get()->card() : maxDoc;
+        if (domainSize > std::numeric_limits<int64_t>::max()
+                             - totalDomainSize) {
+          totalDomainSize = std::numeric_limits<int64_t>::max();
+        } else {
+          totalDomainSize += domainSize;
+        }
+        if (inlineOps.empty()) continue;
+        FieldReader reader(postings);
+        if (!reader.seek(thisOp().fieldName)) continue;
+        SegFieldInfo info;
+        reader.readFieldInfo(info);
+        int64_t expected = scaleExpectedValues(
+            domainSize, info.numValues, maxDoc);
+        if (expected > std::numeric_limits<int64_t>::max()
+                           - inlineExpectedValues) {
+          inlineExpectedValues = std::numeric_limits<int64_t>::max();
+        } else {
+          inlineExpectedValues += expected;
+        }
+      }
+      if (thisOp().inlineAllCandidate
+          && totalDomainSize >= INLINE_ALL_MIN_DOMAIN) {
+        promoteRemainingInline();
+      }
+      inlinePlanResolved = true;
+    }
+
+    void dispatchSegments(oneapi::tbb::task_group* tg,
+                          std::span<const DomainHandle> domains) {
+      if (domains.empty()) {
+        calcSegment(tg, -1, {});
+        return;
+      }
+      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
+        DomainHandle domain = domains[(size_t)segnum];
+        assert(domain.isDeliverable());
+        task_group_run(tg, [this, tg, segnum, domain]() {
+          calcSegment(tg, segnum, domain);
+        });
+      }
+    }
+
 
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       auto* ourVal = parent->getTargetForSub(resp, this);
@@ -554,41 +632,42 @@ public:
           || std::holds_alternative<std::monostate>(ourVal->kind)));
       auto& fr = oneofMut<luxir::api::FacetResult>(*ourVal);
       // Cap = max distinct sub-op Vals written into this FacetResult's ops map.
-      // Both post-selection sub-ops (from subOps) and inline calculators
-      // (fillResult, from inlineSubOps) bubble through here, and the two sets are
-      // disjoint (init() moves inline ops out of subOps), so the backing array
-      // must be sized for their sum or opsSlot's pre-sized array overflows.
-      std::size_t cap = thisOp().subOps.size() + thisOp().inlineSubOps.size();
+      // Both post-selection sub-ops and inline calculators bubble through
+      // here. Their calculator-local partitions are disjoint, so the backing
+      // array must be sized for their sum or opsSlot's pre-sized array
+      // overflows.
+      std::size_t cap = feedOps.size() + inlineOps.size();
       return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
     };
     void calcAll(oneapi::tbb::task_group* tg,
                  std::span<const DomainHandle> domains) override {
-      if (!thisOp().inlineSubOps.empty()) {
-        inlineExpectedValues = 0;
-        for (size_t segnum = 0; segnum < domains.size(); segnum++) {
-          auto& postings = thisOp().reader.segments()[segnum].postingsReader();
-          int32_t maxDoc = postings.maxDoc();
-          FieldReader reader(postings);
-          if (!reader.seek(thisOp().fieldName)) continue;
-          SegFieldInfo info;
-          reader.readFieldInfo(info);
-          int64_t domainSize = domains[segnum].get() != nullptr
-              ? domains[segnum].get()->card() : maxDoc;
-          int64_t expected = scaleExpectedValues(
-              domainSize, info.numValues, maxDoc);
-          if (expected > std::numeric_limits<int64_t>::max()
-                             - inlineExpectedValues) {
-            inlineExpectedValues = std::numeric_limits<int64_t>::max();
-            break;
-          }
-          inlineExpectedValues += expected;
-        }
-      }
-      Calculator::calcAll(tg, domains);
+      resolveInlinePlan(domains);
+      dispatchSegments(tg, domains);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
+      if (thisOp().inlineAllCandidate) {
+        if (segnum == -1) {
+          std::span<const DomainHandle> noDomains;
+          calcAll(tg, noDomains);
+          return;
+        }
+        assert(domainHandle.isDeliverable());
+        input[(size_t)segnum] = std::move(domainHandle);
+        int32_t seen = gatheredDomainsSeen.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
+        assert(seen <= (int32_t)input.size());
+        if (seen == (int32_t)input.size()) {
+          calcAll(tg, input);
+        }
+        return;
+      }
+      calcSegment(tg, segnum, std::move(domainHandle));
+    }
+
+    void calcSegment(oneapi::tbb::task_group* tg, int32_t segnum,
+                     DomainHandle domainHandle) {
       // Result-child execution is synchronous under the bucket-domain stage,
       // so the per-segment parent count needs no task group.
       unused(tg);
@@ -604,7 +683,7 @@ public:
 
       if (profileRun != nullptr) {
         auto profile = profilePiece(profileRun, segnum);
-        if (!thisOp().inlineSubOps.empty()) {
+        if (!inlineOps.empty()) {
           calc2(segnum, domain, profile.get());
         } else {
           calcOrdMap(segnum, domain, profile.get());
@@ -612,7 +691,7 @@ public:
         return;
       }
 
-      if (!thisOp().inlineSubOps.empty()) {
+      if (!inlineOps.empty()) {
         calc2(segnum, domain, nullptr);
         return;
       } else {
@@ -1598,13 +1677,13 @@ public:
 
     void executeResultChildren(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
-      if (thisOp().subOps.empty()) return;
+      if (feedOps.empty()) return;
 
       bool tryReplay = thisOp().ordMap != nullptr
           && (forcedFacetFeedStrategy
                   == FacetFeedStrategy::STRING_COLUMN_REPLAY
               || (forcedFacetFeedStrategy == FacetFeedStrategy::AUTO
-                  && thisOp().subOps.size() == 1));
+                  && feedOps.size() == 1));
       if (tryReplay) {
         StringFacetColumnSource source{
             .field = thisOp().fieldName,
@@ -1614,8 +1693,8 @@ public:
         };
         FacetChildContext context{.parent = *this, .stringColumn = &source};
         std::vector<std::unique_ptr<FacetChildExecutor>> bindings;
-        bindings.reserve(thisOp().subOps.size());
-        for (auto& [name, child] : thisOp().subOps) {
+        bindings.reserve(feedOps.size());
+        for (auto& [name, child] : feedOps) {
           unused(name);
           auto* binding = child->bindFacetChild(context);
           if (binding == nullptr
@@ -1628,11 +1707,11 @@ public:
         }
         bool forced = forcedFacetFeedStrategy
             == FacetFeedStrategy::STRING_COLUMN_REPLAY;
-        bool dominant = bindings.size() == thisOp().subOps.size()
+        bool dominant = bindings.size() == feedOps.size()
             && std::ranges::all_of(bindings, [](const auto& binding) {
               return binding->dominatesBucketDomains();
             });
-        if (bindings.size() == thisOp().subOps.size()
+        if (bindings.size() == feedOps.size()
             && (forced || dominant)) {
           if (profileRun != nullptr) {
             for (auto& piece : profileRun->pieces) {
@@ -1670,8 +1749,8 @@ public:
       }
 
       std::vector<SearchOp*> children;
-      children.reserve(thisOp().subOps.size());
-      for (auto& [name, child] : thisOp().subOps) {
+      children.reserve(feedOps.size());
+      for (auto& [name, child] : feedOps) {
         unused(name);
         children.push_back(child);
       }
