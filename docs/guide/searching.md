@@ -75,7 +75,7 @@ Content-Type: application/json
 {
   "query": "title_w:(dune OR messiah) AND year_i:>=1965",
   "filter": [
-    {"name": "available", "query": "stock_i:>0"}
+    "stock_i:>0"
   ],
   "limit": 10,
   "get_number": true,
@@ -291,7 +291,7 @@ POST /collections/books/_search
     "results": {
       "top_docs": {
         "query": "title_w:dune",
-        "filter": [{"name":"available","query":"stock_i:>0"}],
+        "filter": ["stock_i:>0"],
         "limit": 10,
         "get_number": true,
         "fields": ["id","title_w","price_f"],

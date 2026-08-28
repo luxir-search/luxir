@@ -30,8 +30,10 @@
 //   named like a canonical key needs the canonical form. Writes are always canonical.
 // - Query reads accept a bare STRING anywhere a query object goes: it is sugar for
 //   the expr arm ({"query": "status:active AND year:>=1960"}), which also gives
-//   TopDocs.filter string filters for free. ExprQuery itself reads a bare string as
-//   its q ({"expr": "..."} == {"expr": {"q": "..."}}). A Query object takes exactly
+//   Filter string sugar. Filter objects without except_ops are structured queries;
+//   routed filters use exactly {query, except_ops}, with a nonempty string array.
+//   ExprQuery itself reads a bare string as its q
+//   ({"expr": "..."} == {"expr": {"q": "..."}}). A Query object takes exactly
 //   ONE arm key (proto3 canonical JSON; a second arm is an error, not last-wins).
 //   A numeric "boost" sibling wraps that arm in BoostQuery; an object-valued
 //   "boost" is the BoostQuery arm itself. Writes stay canonical, so echo mode
@@ -43,6 +45,8 @@
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
 
 #pragma once
+
+#include <cstring>
 
 // NOTE: relies on luxir_types_json.hpp having defined the luxir::api types and included
 // <hpp_proto/json.hpp>; kept as a separate file only so JSON-dialect code has one home.
@@ -483,6 +487,251 @@ struct from<JSON, luxir::api::Query> {
   }
 };
 
+inline void prefixFilterJsonError(auto &ctx, size_t index) {
+  std::string detail(ctx.custom_error_message);
+  std::string message = "filter[" + std::to_string(index) + "]";
+  if (!detail.empty()) {
+    message += ": ";
+    message += detail;
+  }
+  char* stored = (char*)ctx.memory_resource().allocate(message.size(), 1);
+  std::memcpy(stored, message.data(), message.size());
+  ctx.custom_error_message = std::string_view(stored, message.size());
+}
+
+template <auto Options>
+void readFilterArray(std::span<const luxir::api::Filter> &value,
+                     hpp_proto::concepts::is_non_owning_context auto &ctx,
+                     auto &it, auto &end) {
+  constexpr auto Opts = ws_handled_off<Options>();
+  if (!util::parse_opening<Options>('[', ctx, it, end)) return;
+  if (skip_ws<Opts>(ctx, it, end)) return;
+  const auto n = util::number_of_elements<Opts>(']', ctx, it, end);
+  if (bool(ctx.error)) return;
+
+  decltype(auto) filters = ::hpp_proto::detail::as_modifiable(ctx, value);
+  const size_t oldSize = filters.size();
+  filters.resize(oldSize + n);
+  for (size_t i = oldSize; i < filters.size(); i++) {
+    util::from_json<Opts>(filters[i], ctx, it, end);
+    if (bool(ctx.error)) {
+      prefixFilterJsonError(ctx, i);
+      return;
+    }
+    if (skip_ws<Opts>(ctx, it, end)) return;
+    if (i + 1 < filters.size()
+        && match_invalid_end<',', Opts>(ctx, it, end)) {
+      return;
+    }
+  }
+  util::match_ending<Opts>(']', ctx, it, end);
+}
+
+// ----- Filter: a bare Query, or a strict routing wrapper -----
+template <>
+struct from<JSON, luxir::api::Filter> {
+  template <auto Opts>
+  static void op(luxir::api::Filter &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    namespace api = luxir::api;
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+          value.query, ctx, it, end);
+      return;
+    }
+    if ((char)*it != '{') {
+      from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+          value.query, ctx, it, end);
+      return;
+    }
+
+    // A valid wrapper's first key must be query or except_ops. Any other
+    // object is parsed wholly as a structured Query.
+    auto probe = it;
+    ++probe;
+    static constexpr auto P = ws_handled_off<Opts>();
+    if (skip_ws<P>(ctx, probe, end)) return;
+    bool wrapper = false;
+    if ((char)*probe != '}') {
+      std::string_view firstKey;
+      decltype(auto) firstKeyTarget =
+          ::hpp_proto::detail::as_modifiable(ctx, firstKey);
+      util::parse_key_and_colon<ws_handled<Opts>()>(
+          firstKeyTarget, ctx, probe, end);
+      if (bool(ctx.error)) return;
+      wrapper = firstKey == "query" || firstKey == "except_ops";
+    }
+    if (!wrapper) {
+      from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+          value.query, ctx, it, end);
+      return;
+    }
+
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    bool sawQuery = false;
+    bool sawExceptOps = false;
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "query" && !sawQuery) {
+            sawQuery = true;
+            from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<V>(
+                value.query, ctx, vit, vend);
+          } else if (key == "except_ops" && !sawExceptOps) {
+            sawExceptOps = true;
+            decltype(auto) exceptOps =
+                ::hpp_proto::detail::as_modifiable(ctx, value.except_ops);
+            glz::util::parse_repeated<V>(false, exceptOps, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [&](auto &after, auto &) {
+          if ((char)*after != '}' || bool(ctx.error)) return;
+          if (!sawQuery || !sawExceptOps) {
+            ctx.error = error_code::missing_key;
+            ctx.custom_error_message =
+                "routing wrapper requires exactly query and except_ops";
+          } else if (value.except_ops.empty()) {
+            ctx.error = error_code::syntax_error;
+            ctx.custom_error_message =
+                "except_ops must be nonempty; use the bare filter form instead";
+          }
+        });
+  }
+};
+
+template <>
+struct to<JSON, luxir::api::Filter> {
+  template <auto Opts, class B>
+  static void op(const luxir::api::Filter &value, is_context auto &ctx,
+                 B &b, auto &ix) noexcept {
+    if (value.except_ops.empty()) {
+      if (value.query.has_value()) {
+        serialize<JSON>::template op<Opts>(*value.query, ctx, b, ix);
+      } else {
+        dump<"{}">(b, ix);
+      }
+      return;
+    }
+    dump<"{\"query\":" >(b, ix);
+    if (value.query.has_value()) {
+      serialize<JSON>::template op<Opts>(*value.query, ctx, b, ix);
+    } else {
+      dump<"null">(b, ix);
+    }
+    dump<",\"except_ops\":" >(b, ix);
+    serialize<JSON>::template op<Opts>(value.except_ops, ctx, b, ix);
+    dump<'}'>(b, ix);
+  }
+};
+
+template <>
+struct from<JSON, luxir::api::TopDocs> {
+  template <auto Opts>
+  static void op(luxir::api::TopDocs &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    namespace api = luxir::api;
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "query") {
+            from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+                value.query, ctx, vit, vend);
+          } else if (key == "filter") {
+            readFilterArray<O>(value.filter, ctx, vit, vend);
+          } else if (key == "offset") {
+            util::from_json<O>(value.offset, ctx, vit, vend);
+          } else if (key == "limit") {
+            util::from_json<O>(value.limit, ctx, vit, vend);
+          } else if (key == "get_number") {
+            util::from_json<O>(value.get_number, ctx, vit, vend);
+          } else if (key == "get_scores") {
+            util::from_json<O>(value.get_scores, ctx, vit, vend);
+          } else if (key == "fields") {
+            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
+            glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+          } else if (key == "sorts") {
+            decltype(auto) sorts = ::hpp_proto::detail::as_modifiable(ctx, value.sorts);
+            glz::util::parse_repeated<O>(false, sorts, ctx, vit, vend);
+          } else if (key == "batch_size") {
+            util::from_json<O>(value.batch_size, ctx, vit, vend);
+          } else if (key == "document_format") {
+            util::from_json<O>(value.document_format, ctx, vit, vend);
+          } else if (key == "ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+template <>
+struct from<JSON, luxir::api::Fusion> {
+  template <auto Opts>
+  static void op(luxir::api::Fusion &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "sources") {
+            decltype(auto) sources =
+                ::hpp_proto::detail::as_modifiable(ctx, value.sources);
+            glz::util::parse_repeated<O>(true, sources, ctx, vit, vend);
+          } else if (key == "filter") {
+            readFilterArray<O>(value.filter, ctx, vit, vend);
+          } else if (key == "limit") {
+            util::from_json<O>(value.limit, ctx, vit, vend);
+          } else if (key == "offset") {
+            util::from_json<O>(value.offset, ctx, vit, vend);
+          } else if (key == "get_number") {
+            util::from_json<O>(value.get_number, ctx, vit, vend);
+          } else if (key == "get_scores") {
+            util::from_json<O>(value.get_scores, ctx, vit, vend);
+          } else if (key == "fields") {
+            decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
+            glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+          } else if (key == "batch_size") {
+            util::from_json<O>(value.batch_size, ctx, vit, vend);
+          } else if (key == "document_format") {
+            util::from_json<O>(value.document_format, ctx, vit, vend);
+          } else if (key == "rrf") {
+            util::from_json<O>(value.rrf, ctx, vit, vend);
+          } else if (key == "ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
 // ----- Val: a raw JSON value (untagged) -----
 template <>
 struct from<JSON, luxir::api::Val> {
@@ -679,8 +928,7 @@ struct from<JSON, luxir::api::SearchRequest> {
             from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
                 shorthand().query, ctx, vit, vend);
           } else if (key == "filter") {
-            decltype(auto) filter = ::hpp_proto::detail::as_modifiable(ctx, shorthand().filter);
-            glz::util::parse_repeated<O>(false, filter, ctx, vit, vend);
+            readFilterArray<O>(shorthand().filter, ctx, vit, vend);
           } else if (key == "offset") {
             util::from_json<O>(shorthand().offset, ctx, vit, vend);
           } else if (key == "limit") {

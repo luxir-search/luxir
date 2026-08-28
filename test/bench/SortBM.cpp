@@ -104,7 +104,7 @@ static void recordFieldSortCounters(benchmark::State& state) {
       (double)SkipStats::fieldSortSeedPass2Skips;
 }
 
-// Near-unique int sort under a cached named filter: the serverbench sort10
+// Near-unique int sort under a cached filter: the serverbench sort10
 // red-cell shape. filterBelow selects u10k_i < filterBelow (0 = unfiltered;
 // 1000 ~= 10% density, 100 ~= 1%, 10 ~= 0.1%).
 static void BM_IntSortFiltered(benchmark::State& state, int64_t nDocs,
@@ -131,8 +131,7 @@ static void BM_IntSortFiltered(benchmark::State& state, int64_t nDocs,
     auto& top = req->topDocs("q").allQuery().limit(10).fields({"id"});
     qb::sort(top, "u10m_i", qb::ASC);
     if (filterBelow > 0) {
-      top.filter("f" + std::to_string(filterBelow),
-                 qb::range(top.mr(), "u10k_i", nullptr, nullptr, nullptr,
+      top.filter(qb::range(top.mr(), "u10k_i", nullptr, nullptr, nullptr,
                            qb::valI64(top.mr(), filterBelow)));
     }
     req->execute(false);

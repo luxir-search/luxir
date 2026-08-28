@@ -321,7 +321,6 @@ protected:
     cur.allQuery().fields({"id"}).getNumber().limit(-1);
     auto& top = std::get<api::TopDocs>(cur.rawOp().kind);
     auto* filter = build::allocArray(top.filter, 1, cur.mr());
-    filter[0].name = "near";
     auto* stored = (api::Query*)cur.mr().allocate(
         sizeof(api::Query), alignof(api::Query));
     new (stored) api::Query(qb::knn(
@@ -331,14 +330,11 @@ protected:
     return lreq;
   }
 
-  // Append a single-match NamedQuery filter to a TopDocs cursor.  No qb helper
-  // covers TopDocs.filter / NamedQuery, so build the span on the raw op.
-  static void addMatchFilter(OpCursor& cur, std::string_view name,
-                             std::string_view field, std::string_view value) {
+  static void addMatchFilter(OpCursor& cur, std::string_view field,
+                             std::string_view value) {
     auto& mr = cur.mr();
     auto& td = std::get<api::TopDocs>(cur.rawOp().kind);
-    api::NamedQuery* nf = build::allocArray(td.filter, 1, mr);
-    nf[0].name = build::arenaStr(mr, name);
+    api::Filter* nf = build::allocArray(td.filter, 1, mr);
     auto* q = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
     new (q) api::Query(qb::match(mr, field, value));
     nf[0].query = q;
@@ -794,7 +790,7 @@ TEST_F(KnnQueryTest, topDocsFilterConstrainsKnnSearch) {
   auto* req = LocalReq::create(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   configKnn(cur, "embedding_v", {1.0f, 0.0f}, 2);
-  addMatchFilter(cur, "red", "color_s", "red");
+  addMatchFilter(cur, "color_s", "red");
 
   req->execute();
 
@@ -1634,7 +1630,7 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
     configKnn(cur, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
               /*nprobe=*/0, /*refineCandidates=*/200,
               exact, exact ? 0.0f : 1.0f);
-    addMatchFilter(cur, "red", "color_s", "red");
+    addMatchFilter(cur, "color_s", "red");
     return req;
   };
 
@@ -1730,7 +1726,7 @@ TEST_F(KnnQueryTest, wholeReaderCountAndFieldSortSkipAnnPrepare) {
     auto& cur = req->collection("main").topDocs("q").getNumber().limit(0);
     cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", vector, k, 0,
                              /*exact=*/true);
-    if (foldedFilter) addMatchFilter(cur, "selected", "group_s", "keep");
+    if (foldedFilter) addMatchFilter(cur, "group_s", "keep");
     req->execute();
     EXPECT_TRUE(req->ok()) << req->toString();
     int64_t count = req->getMatchCount("q");
@@ -2020,7 +2016,7 @@ TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
                      /*nprobe=*/4, /*exact=*/false, /*refineCandidates=*/160);
     };
     cur.rawQuery() = wrapInBoolean ? qb::boolean(cur.mr(), /*required=*/{knn()}) : knn();
-    addMatchFilter(cur, "keep", "keep_s", "yes");
+    addMatchFilter(cur, "keep_s", "yes");
     return req;
   };
 
@@ -2372,7 +2368,7 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
     auto* req = LocalReq::create(luxirNode->getSearchEngine());
     auto& cur = req->collection("main").topDocs("q");
     configKnn(cur, "embedding_v", {0, 0, 0, 0}, 3, nprobe, /*refineCandidates=*/96);
-    addMatchFilter(cur, "blue", "color_s", "blue");
+    addMatchFilter(cur, "color_s", "blue");
     return req;
   };
 

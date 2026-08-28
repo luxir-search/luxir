@@ -17,7 +17,7 @@ POST /collections/main/_search
 Filters take them too:
 
 ```
-{"query": {...}, "filter": [{"name": "live", "query": "status_s:active AND year_i:[1960 TO 1970}"}]}
+{"query": {...}, "filter": ["status_s:active AND year_i:[1960 TO 1970]"]}
 ```
 
 The string form is shorthand for the `expr` arm:

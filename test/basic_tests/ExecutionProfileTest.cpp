@@ -321,7 +321,7 @@ TEST_F(ExecutionProfileTest, reportsPointOrdLoadsForArrayDomains) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("profile_sparse").profile();
-  auto& q = req->topDocs("q").allQuery().limit(0).matchFilter("f", "sel_s", "t");
+  auto& q = req->topDocs("q").allQuery().limit(0).matchFilter("sel_s", "t");
   q.facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);

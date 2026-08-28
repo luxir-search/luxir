@@ -75,16 +75,19 @@ protected:
     a[old.size()] = build::arenaStr(mr, field);
   }
 
-  // Append a named filter (a NamedQuery) to a span<const NamedQuery> (Fusion.filter or
-  // TopDocs.filter), pointing the entry at an arena copy of the pre-built query.
-  static void addNamedFilter(std::span<const luxir::api::NamedQuery>& filter,
-                             std::string_view name, const luxir::api::Query& q,
-                             std::pmr::memory_resource& mr) {
+  static void addFilter(std::span<const luxir::api::Filter>& filter,
+                        const luxir::api::Query& q,
+                        std::pmr::memory_resource& mr,
+                        std::initializer_list<std::string_view> exceptOps = {}) {
     auto old = filter;
-    luxir::api::NamedQuery* a = build::allocArray(filter, old.size() + 1, mr);
+    luxir::api::Filter* a = build::allocArray(filter, old.size() + 1, mr);
     for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
-    a[old.size()].name = build::arenaStr(mr, name);
     a[old.size()].query = arenaQuery(mr, q);
+    auto* except = build::allocArray(a[old.size()].except_ops, exceptOps.size(), mr);
+    size_t i = 0;
+    for (std::string_view op : exceptOps) {
+      except[i++] = build::arenaStr(mr, op);
+    }
   }
 
   // Append a sort spec to a TopDocs source (realloc-grow preserves prior entries).
@@ -230,7 +233,7 @@ TEST_F(FusionOpTest, sharedFilter) {
 
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
 
-  addNamedFilter(fusion.filter, "colorRed", qb::match(mr, "color_s", "red"), mr);
+  addFilter(fusion.filter, qb::match(mr, "color_s", "red"), mr);
 
   lreq->execute();
   ASSERT_OK(lreq);
@@ -247,6 +250,26 @@ TEST_F(FusionOpTest, sharedFilter) {
   EXPECT_NEAR(scores[1], 1.0f / 62.0f, 1e-6f);
 
   lreq->done();
+}
+
+TEST_F(FusionOpTest, routedSharedFilterIsRejected) {
+  CollectionHelper helper("main");
+  helper.index(flatdoc("foo_w", "apple", "color_s", "red"),
+               UpdateMessage::COMMIT);
+
+  auto lreq = localReq(luxirNode->getSearchEngine());
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.rrf.emplace().k = 60;
+  setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
+  addFilter(fusion.filter, qb::match(mr, "color_s", "red"), mr, {"brands"});
+
+  ExpectLog quiet("Search request failed:");
+  lreq->execute();
+  EXPECT_NE(std::string::npos,
+            lreq->errorMsg().find("fusion.filter[0].except_ops is not supported"))
+      << lreq->errorMsg();
 }
 
 TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
@@ -292,8 +315,7 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   auto& rankedSource = addSource(fusion, "ranked", mr);
   rankedSource.limit = 10;
   rankedSource.query = arenaQuery(mr, countQuery(mr));
-  addNamedFilter(
-      fusion.filter, "keep", qb::match(mr, "keep_s", "yes"), mr);
+  addFilter(fusion.filter, qb::match(mr, "keep_s", "yes"), mr);
 
   bool saved = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -381,8 +403,7 @@ TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
   source.get_number = true;
   source.get_scores = true;
   source.query = arenaQuery(mr, rankedQuery(mr));
-  addNamedFilter(
-      fusion.filter, "keep", qb::match(mr, "keep_s", "yes"), mr);
+  addFilter(fusion.filter, qb::match(mr, "keep_s", "yes"), mr);
 
   bool saved = SkipStats::enabled;
   SkipStats::enabled = true;
@@ -422,7 +443,7 @@ TEST_F(FusionOpTest, sharedKnnFilter) {
 
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
 
-  addNamedFilter(fusion.filter, "near", qb::knn(mr, "embedding_v", {0.0f, 1.0f}, 1), mr);
+  addFilter(fusion.filter, qb::knn(mr, "embedding_v", {0.0f, 1.0f}, 1), mr);
 
   lreq->execute();
   ASSERT_OK(lreq);
@@ -537,12 +558,12 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
   fusion.rrf.emplace().k = 60;
 
   // Shared filter: color_s = red.
-  addNamedFilter(fusion.filter, "colorRed", qb::match(mr, "color_s", "red"), mr);
+  addFilter(fusion.filter, qb::match(mr, "color_s", "red"), mr);
 
   // Per-source filter: owner_s = alice (applied to the text source only).
   auto& textSrc = addSource(fusion, "text", mr);
   setTextSource(textSrc, mr, "foo_w", "apple", 10);
-  addNamedFilter(textSrc.filter, "ownerAlice", qb::match(mr, "owner_s", "alice"), mr);
+  addFilter(textSrc.filter, qb::match(mr, "owner_s", "alice"), mr);
 
   lreq->execute();
   ASSERT_OK(lreq);

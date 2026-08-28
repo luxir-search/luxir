@@ -424,7 +424,7 @@ CachedSearchResult runCachedSearch(LuxirNode& node, std::string_view collection,
   request->collection(collection)
       .topDocs("q")
       .matchQuery("body_w", "body")
-      .matchFilter("selection", "filter_w", filter)
+      .matchFilter("filter_w", filter)
       .fields({"id"})
       .getNumber()
       .limit(-1);
@@ -533,7 +533,6 @@ std::vector<std::unique_ptr<DocSet>> oneDocPerSegment(IndexReader& reader) {
 void addFilter(luxir::test::OpCursor& cursor, const api::Query& query) {
   auto& top = std::get<api::TopDocs>(cursor.rawOp().kind);
   auto* filter = api::build::allocArray(top.filter, 1, cursor.mr());
-  filter[0].name = "selection";
   auto* stored = (api::Query*)cursor.mr().allocate(sizeof(api::Query),
                                                    alignof(api::Query));
   new (stored) api::Query(query);
@@ -2678,7 +2677,7 @@ TEST(FilterCacheIntegrationTest,
     auto request = luxir::test::localReq(node.getSearchEngine());
     auto& cursor = request->collection(collection)
         .topDocs("q")
-        .matchFilter("selection", "filter_w", filterTerm)
+        .matchFilter("filter_w", filterTerm)
         .fields({"id"})
         .limit(100);
     if (shape == QueryShape::TERM_LED_ONE) {
@@ -2972,7 +2971,7 @@ ExactFilteredConjResult runExactFilteredConj(
           {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
            luxir::test::qb::match(cursor.mr(), "body_w", "beta"),
            luxir::test::qb::match(cursor.mr(), "body_w", "gamma")});
-      cursor.matchFilter("selection", "filter_w", "selected");
+      cursor.matchFilter("filter_w", "selected");
       break;
     case ExactFilteredConjShape::RARE_TERM:
       cursor.rawQuery() = luxir::test::qb::boolean(
@@ -2982,20 +2981,20 @@ ExactFilteredConjResult runExactFilteredConj(
            luxir::test::qb::match(cursor.mr(), "body_w", "gamma")});
       // The wide filter keeps the feed (rare, df 20) under the DocSet
       // provenance ratio gate; "selected" (df 50) sits inside it.
-      cursor.matchFilter("wide", "second_filter_w", "wide");
+      cursor.matchFilter("second_filter_w", "wide");
       break;
     case ExactFilteredConjShape::PHRASE:
       cursor.rawQuery() = luxir::test::qb::phraseWords(
           cursor.mr(), "body_w", {"quick", "fox"});
-      cursor.matchFilter("selection", "filter_w", "selected");
+      cursor.matchFilter("filter_w", "selected");
       break;
     case ExactFilteredConjShape::TWO_FILTERS:
       cursor.rawQuery() = luxir::test::qb::boolean(
           cursor.mr(),
           {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
            luxir::test::qb::match(cursor.mr(), "body_w", "beta")});
-      cursor.matchFilter("selection", "filter_w", "selected");
-      cursor.matchFilter("wide", "second_filter_w", "wide");
+      cursor.matchFilter("filter_w", "selected");
+      cursor.matchFilter("second_filter_w", "wide");
       break;
     case ExactFilteredConjShape::RARE_TERM_TWO_FILTERS:
       cursor.rawQuery() = luxir::test::qb::boolean(
@@ -3003,8 +3002,8 @@ ExactFilteredConjResult runExactFilteredConj(
           {luxir::test::qb::match(cursor.mr(), "body_w", "alpha"),
            luxir::test::qb::match(cursor.mr(), "body_w", "rare"),
            luxir::test::qb::match(cursor.mr(), "body_w", "gamma")});
-      cursor.matchFilter("selection", "filter_w", "selected");
-      cursor.matchFilter("wide", "second_filter_w", "wide");
+      cursor.matchFilter("filter_w", "selected");
+      cursor.matchFilter("second_filter_w", "wide");
       break;
   }
   request->execute(false);
@@ -4458,7 +4457,7 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   registryRequest->collection("filter_cache_it")
       .topDocs("registry")
       .matchQuery("body_w", "body")
-      .matchFilter("selection", "filter_w", "keep")
+      .matchFilter("filter_w", "keep")
       .getNumber()
       .limit(0);
   registryRequest->execute();
@@ -5126,8 +5125,8 @@ TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
     auto& top = request->collection("filter_cache_facet")
                     .topDocs("q")
                     .matchQuery("body_w", "body")
-                    .matchFilter("selection", "filter_w", "keep")
-                    .matchFilter("group", "group_s", "a")
+                    .matchFilter("filter_w", "keep")
+                    .matchFilter("group_s", "a")
                     .getNumber()
                     .limit(0);
     top.facet("groups", "group_s").limit(-1);
@@ -5613,12 +5612,11 @@ api::Query buildFilter(FilterKind kind, std::pmr::memory_resource& mr) {
 
 void addConcurrencyFilter(OpCursor& cursor, const api::Query& query) {
   auto& top = std::get<api::TopDocs>(cursor.rawOp().kind);
-  auto* named = api::build::allocArray(top.filter, 1, cursor.mr());
-  named[0].name = "selection";
+  auto* filter = api::build::allocArray(top.filter, 1, cursor.mr());
   auto* stored = (api::Query*)cursor.mr().allocate(sizeof(api::Query),
                                                     alignof(api::Query));
   new (stored) api::Query(query);
-  named[0].query = stored;
+  filter[0].query = stored;
 }
 
 Doc docFor(int32_t id) {

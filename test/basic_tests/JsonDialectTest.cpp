@@ -269,6 +269,49 @@ TEST(JsonDialect, QueryBareStringIsExprSugar) {
   EXPECT_FALSE(P::read_json(two, R"({"match":{"title_w":"dune"},"all":true})", mr));
 }
 
+TEST(JsonDialect, FilterBareAndRoutedForms) {
+  std::pmr::monotonic_buffer_resource mr;
+
+  P::TopDocs td;
+  ASSERT_TRUE(P::read_json(
+      td,
+      R"({"filter":["brand_s:acme",{"match":{"status_s":"active"}},{"query":"price_i:<1000","except_ops":["brands"]}]})",
+      mr));
+  ASSERT_EQ(3u, td.filter.size());
+  ASSERT_TRUE(td.filter[0].query.has_value());
+  EXPECT_EQ("brand_s:acme",
+            std::get<P::ExprQuery>(td.filter[0].query->kind).q);
+  EXPECT_TRUE(td.filter[0].except_ops.empty());
+  ASSERT_TRUE(td.filter[1].query.has_value());
+  EXPECT_EQ("status_s",
+            std::get<P::Match>(td.filter[1].query->kind).field);
+  EXPECT_TRUE(td.filter[1].except_ops.empty());
+  ASSERT_TRUE(td.filter[2].query.has_value());
+  ASSERT_EQ(1u, td.filter[2].except_ops.size());
+  EXPECT_EQ("brands", td.filter[2].except_ops[0]);
+}
+
+TEST(JsonDialect, FilterRoutingWrapperIsStrict) {
+  std::pmr::monotonic_buffer_resource mr;
+  std::string err;
+
+  P::TopDocs extra;
+  EXPECT_FALSE(P::read_json(
+      extra,
+      R"({"filter":[{"query":"brand_s:acme","except_ops":["brands"],"extra":true}]})",
+      mr, &err));
+  EXPECT_NE(std::string::npos, err.find("filter[0]")) << err;
+  EXPECT_NE(std::string::npos, err.find("extra")) << err;
+
+  P::TopDocs empty;
+  EXPECT_FALSE(P::read_json(
+      empty,
+      R"({"filter":[{"query":"brand_s:acme","except_ops":[]}]})",
+      mr, &err));
+  EXPECT_NE(std::string::npos, err.find("filter[0]")) << err;
+  EXPECT_NE(std::string::npos, err.find("bare filter form")) << err;
+}
+
 TEST(JsonDialect, QueryBoostSiblingSugarAndArm) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query flat;

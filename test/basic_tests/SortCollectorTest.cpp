@@ -2510,7 +2510,7 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     req->collection("best_first_sort");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     cur.allQuery();
-    if (!field.empty()) cur.matchFilter("f", field, value);
+    if (!field.empty()) cur.matchFilter(field, value);
     if (exactCount) cur.getNumber();
     for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
     req->execute(false);

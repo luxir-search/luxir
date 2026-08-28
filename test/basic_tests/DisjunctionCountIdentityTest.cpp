@@ -116,7 +116,7 @@ public:
     auto& cursor = req->topDocs("q").getNumber().limit(0);
     cursor.rawQuery() = makeQuery(cursor);
     if (externalFilter) {
-      cursor.matchFilter("keep", "gate_s", "keep");
+      cursor.matchFilter("gate_s", "keep");
     }
     if (materializeDomain) {
       cursor.facet("buckets", "bucket_s").limit(-1);

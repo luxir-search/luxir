@@ -233,7 +233,7 @@ TopRun runCandidateTop(CollectionHelper& helper,
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q");
-  top.matchFilter("selection", "body_w", "ex1");
+  top.matchFilter("body_w", "ex1");
   top.getScores().fields({"id"}).limit(20);
   top.rawQuery() = qb::boolean(
       top.mr(), {qb::match(top.mr(), "body_w", "left")}, {},

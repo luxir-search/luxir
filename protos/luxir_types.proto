@@ -103,8 +103,7 @@ enum DocFormat {
 
 message TopDocs {
   Query query = 1;            // unset selects all documents (browse / filter-only search)
-  // A set of named filters on the main query.
-  repeated NamedQuery filter = 2;
+  repeated Filter filter = 2;
   int64 offset = 3;
   optional sint64 limit = 4;
   bool get_number = 5;          // return the number of matching documents
@@ -145,7 +144,7 @@ message Fusion {
 
   // Filter applied to every source.  Shared across sources so it's only
   // computed once per segment.
-  repeated NamedQuery filter = 2;
+  repeated Filter filter = 2;
 
   // Maximum number of fused documents to return.
   optional sint64 limit = 3;
@@ -342,10 +341,9 @@ message GeoDistanceQuery {
   double radius_meters = 4; // inclusive radius, finite and non-negative
 }
 
-// Attach a name to a query so it can be referenced by other queries or facets.
-message NamedQuery {
-  string name = 1;
-  Query query = 2;
+message Filter {
+  Query query = 1;
+  repeated string except_ops = 2;
 }
 
 message BooleanQuery {
@@ -528,13 +526,10 @@ message RangeFacet {
 
 // A "domain" defines a set of documents to do computations over (like facets)
 message Domain {
-  string op_name = 1;                 // The name of a search operation that yields a set of documents. If missing
-                                      // The first TopDocs operation in the request is assumed.
-  Query root = 2;                     // Resets the domain to this root query.
-  repeated string include_filter = 3; // Names of filters to apply (normally not needed unless a new root was selected)
-                                      // A special name of "*" means all filters applied to the reference domain.
-  repeated string exclude_filter = 4; // Names of filters to exclude (i.e. not apply) Used for multi-select faceting.
-  repeated NamedQuery filter = 5;     // Additional named filters to apply
+  reserved 1, 4;
+  Query query = 2;
+  optional bool apply_parent_filters = 3;
+  repeated Query filter = 5;
 }
 
 // A declared degradation: the request was served, but not exactly as written.

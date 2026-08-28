@@ -61,7 +61,7 @@ namespace luxir::api {
 // ---- forward declarations (all messages) ----
 struct Target; struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
-struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
+struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
@@ -352,9 +352,13 @@ struct BooleanQuery {                                            // span<incompl
   std::span<const Query> prohibited;
   int32_t min_match = 0;
 };
+struct Filter {
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::span<const std::string_view> except_ops;
+};
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
-  std::span<const NamedQuery> filter;
+  std::span<const Filter> filter;
   int64_t offset = 0;
   std::optional<std::int64_t> limit;
   std::span<const std::string_view> fields;
@@ -367,7 +371,7 @@ struct TopDocs {                                                 // all indirect
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion
   map_view<std::string_view, TopDocs> sources;
-  std::span<const NamedQuery> filter;
+  std::span<const Filter> filter;
   std::optional<std::int64_t> limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
@@ -379,11 +383,9 @@ struct Fusion {                                                  // needs TopDoc
   bool get_scores = false;
 };
 struct Domain {
-  std::string_view op_name;
-  ::hpp_proto::optional_indirect_view<Query> root;
-  std::span<const std::string_view> include_filter;
-  std::span<const std::string_view> exclude_filter;
-  std::span<const NamedQuery> filter;
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::span<const Query> filter;
+  std::optional<bool> apply_parent_filters;
 };
 struct ExprOp {
   std::string_view expr;
@@ -548,7 +550,6 @@ struct Query {                                                 // needs Match,Bo
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery>
       kind;
 };
-struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
 struct UpdateRequest {                                         // needs Target,Column,CommitParams
   std::string_view request_id;
   int64_t stream_id = 0;
@@ -572,7 +573,7 @@ struct UpdateRequest {                                         // needs Target,C
 LUXIR_TD(Target) LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
-LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(NamedQuery) LUXIR_TD(BooleanQuery)
+LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
 LUXIR_TD(Warning) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
@@ -607,7 +608,7 @@ LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
 LUXIR_ENTRY(Target) LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
-LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(NamedQuery) LUXIR_ENTRY(BooleanQuery)
+LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)

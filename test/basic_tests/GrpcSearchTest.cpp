@@ -9,6 +9,7 @@
 #include "test/GrpcClient.h"
 #include "test/GrpcLuxirTest.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/TestUtils.h"
 #include "luxir/server/GRPCServer.h"
 
@@ -204,6 +205,47 @@ TEST_F(GrpcSearchTest, responseFormatDocsIsRejected) {
   while (stream.Read(&response)) {}
   auto status = stream.Finish();
   EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, status.error_code());
+}
+
+TEST_F(GrpcSearchTest, routedFilterValidation) {
+  CollectionHelper helper;
+  helper.index(flatdoc("brand_s", "acme"), UpdateMessage::COMMIT);
+
+  auto finish = [&](const luxir::api::SearchRequest& request) {
+    grpc::ClientContext context;
+    HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+        channel.get(), rpc::Search, &context);
+    EXPECT_TRUE(stream.Write(request));
+    EXPECT_TRUE(stream.WritesDone());
+    std::string error;
+    Reply<luxir::api::SearchResponse> response;
+    while (stream.Read(&response)) {
+      if (!response.msg.error.empty()) error = response.msg.error;
+    }
+    return std::pair{stream.Finish(), error};
+  };
+
+  auto routed = localReq(luxirNode->getSearchEngine());
+  routed->collection("main");
+  auto& top = routed->topDocs("q").allQuery();
+  top.facet("brands", "brand_s");
+  top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+  auto [routedStatus, routedError] = finish(routed->proto);
+  EXPECT_TRUE(routedStatus.ok());
+  EXPECT_NE(std::string::npos,
+            routedError.find(
+                "multi-select filter routing is not implemented yet"));
+
+  auto missing = localReq(luxirNode->getSearchEngine());
+  missing->collection("main");
+  auto& missingTop = missing->topDocs("q").allQuery();
+  auto& missingProto = std::get<luxir::api::TopDocs>(missingTop.rawOp().kind);
+  luxir::api::build::allocArray(missingProto.filter, 1, missingTop.mr());
+  auto [missingStatus, missingError] = finish(missing->proto);
+  EXPECT_TRUE(missingStatus.ok());
+  EXPECT_NE(std::string::npos,
+            missingError.find(
+                "top_docs.filter[0].query requires a query kind"));
 }
 
 // A client that cancels the RPC while the emitter is paused must not strand

@@ -91,7 +91,7 @@ segment and then rescore candidates from the full-precision column.
 
 ## Filter inside kNN
 
-Put ordinary named filters on the same `top_docs` operation:
+Put ordinary filters on the same `top_docs` operation:
 
 ```json
 {
@@ -102,7 +102,7 @@ Put ordinary named filters on the same `top_docs` operation:
       "k":20
     }
   },
-  "filter":[{"name":"fiction","query":"kind_s:fiction"}],
+  "filter":["kind_s:fiction"],
   "limit":20,
   "fields":["id","title_w"]
 }
@@ -142,7 +142,7 @@ POST /collections/books/_search
             "limit": 100
           }
         },
-        "filter": [{"name":"fiction","query":"kind_s:fiction"}],
+        "filter": ["kind_s:fiction"],
         "rrf": {"k":60},
         "limit": 10,
         "get_scores": true,

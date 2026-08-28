@@ -24,6 +24,11 @@
 
 namespace luxir {
 
+struct ParsedFilter {
+  Query* query;
+  std::span<const std::string_view> exceptOps;
+};
+
 
 class TopDocsReq : public SearchOp {
 protected:
@@ -349,7 +354,7 @@ public:
   Query::ScoreProfile scoreProfile;
   bool requestNeedsScores;
   int64_t topCount; // maximum number of docs to return.
-  std::span<std::pair<std::string_view, Query*>> filters;
+  std::span<ParsedFilter> filters;
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
   CollectionRequirements requirements;
@@ -1554,7 +1559,7 @@ public:
     std::span<const uint8_t> wholeFieldSortCacheRoutes,
     bool wholeConstantRanking, Query::ScoreProfile scoreProfile,
     bool requestNeedsScores,
-    std::span<std::pair<std::string_view, Query*>> filters,
+    std::span<ParsedFilter> filters,
     std::span<Query::Weight*> filterWeights,
     Query* domainQuery, Query::Weight* domainQueryWeight,
     std::span<Query::Weight*> domainFilterWeights,
@@ -1606,7 +1611,7 @@ public:
       assert(filterWeights.size() == filters.size());
       filterUses = planning.pool.make_span<FilterCache::Use*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
-        filterUses[i] = planning.getFilterUse(*filters[i].second);
+        filterUses[i] = planning.getFilterUse(*filters[i].query);
       }
     }
     if (!residentExactDomainUses.empty()) {
@@ -1622,7 +1627,7 @@ public:
       for (size_t i = 0; i < domainFilterWeights.size(); i++) {
         exactDomainPlan.add(
             *domainFilterWeights[i],
-            planning.getFilterUse(*filters[i].second));
+            planning.getFilterUse(*filters[i].query));
       }
     }
   }

@@ -1,7 +1,7 @@
 # Structured query reference
 
 Every structured query is a JSON object with exactly one query arm. Query
-objects compose uniformly inside boolean clauses, named filters, wrappers, kNN
+objects compose uniformly inside boolean clauses, filters, wrappers, kNN
 filter domains, and fusion sources. This page is the field-level reference;
 [Searching](searching.md) covers result collection and the
 [query language](query-language.md) covers the strict expression shorthand.
@@ -90,12 +90,19 @@ but do not constrain the match set by default. With only optional clauses, at
 least one must match. Set `min_match` to make the optional group an explicit
 constraint.
 
-Top-level `top_docs.filter` uses `NamedQuery` objects instead of anonymous
-boolean filters because names can identify reusable domains:
+Top-level `top_docs.filter` accepts bare query strings and structured query
+objects. A routing wrapper adds `except_ops` when sibling operations should not
+see the filter:
 
 ```json
-"filter":[{"name":"live","query":{"match":{"status_s":"active"}}}]
+"filter":[
+  {"match":{"status_s":"active"}},
+  {"query":"brand_s:acme","except_ops":["brands"]}
+]
 ```
+
+Routing wrappers are accepted by the JSON and protobuf APIs but currently fail
+validation until routed filter execution is implemented.
 
 ## Phrase
 

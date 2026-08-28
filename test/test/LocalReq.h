@@ -60,8 +60,9 @@ public:
   OpCursor& existsQuery(std::string_view field);
   OpCursor& matchQuery(std::string_view field, std::string_view value);
   OpCursor& matchQuery(std::string_view field, std::string_view value, luxir::api::Match_::Operator op);
-  OpCursor& filter(std::string_view name, const luxir::api::Query& query);  // append to TopDocs.filter
-  OpCursor& matchFilter(std::string_view name, std::string_view field, std::string_view value);
+  OpCursor& filter(const luxir::api::Query& query,
+                   std::initializer_list<std::string_view> exceptOps = {});
+  OpCursor& matchFilter(std::string_view field, std::string_view value);
   OpCursor& prefixQuery(std::string_view field, std::string_view prefix);
   OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
                        int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
@@ -158,6 +159,7 @@ public:
     view.profile = enabled;
     return *this;
   }
+  ReqProto& rawRequest() { return view; }
   LocalReq& requestId(std::string_view id) {
     view.request_id = build::arenaStr(mr, id);
     return *this;
@@ -524,26 +526,32 @@ inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view v
   std::get<luxir::api::Match>(getOrCreateQuery().kind).operator_ = op;
   return *this;
 }
-inline OpCursor& OpCursor::filter(std::string_view name, const luxir::api::Query& query) {
+inline OpCursor& OpCursor::filter(
+    const luxir::api::Query& query,
+    std::initializer_list<std::string_view> exceptOps) {
   auto& td = asTopDocs();
   auto old = td.filter;
   auto* a = build::allocArray(td.filter, old.size() + 1, req_->mr);
   std::copy(old.begin(), old.end(), a);
-  auto& named = a[old.size()];
-  named.name = build::arenaStr(req_->mr, name);
+  auto& filter = a[old.size()];
   auto* q = req_->arenaNew<luxir::api::Query>();
   *q = query;  // shallow copy; members are arena-backed
-  named.query = q;
+  filter.query = q;
+  auto* except = build::allocArray(filter.except_ops, exceptOps.size(), req_->mr);
+  size_t i = 0;
+  for (std::string_view op : exceptOps) {
+    except[i++] = build::arenaStr(req_->mr, op);
+  }
   return *this;
 }
-inline OpCursor& OpCursor::matchFilter(std::string_view name, std::string_view field, std::string_view value) {
+inline OpCursor& OpCursor::matchFilter(std::string_view field, std::string_view value) {
   luxir::api::Query q;
   auto& m = q.kind.emplace<luxir::api::Match>();
   m.field = build::arenaStr(req_->mr, field);
   auto* v = req_->arenaNew<luxir::api::Val>();
   v->kind = build::arenaStr(req_->mr, value);
   m.val = v;
-  return filter(name, q);
+  return filter(q);
 }
 inline OpCursor& OpCursor::simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames) {
   auto& s = getOrCreateQuery().kind.emplace<luxir::api::SimpleQuery>();

@@ -148,9 +148,8 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
   escaping; `$vars` substitute request values without re-parsing them, so
   user input cannot inject syntax.  Strict grammar, byte-offset parse
   errors; degrading gracefully is `simple_query`'s job.
-- Named non-scoring filters on top-docs and fusion sources - and a filter
-  is where an expression string shines: `"filter": [{"name": "live",
-  "query": "status_s:active AND year_i:>=1960"}]`.
+- Non-scoring filters on top-docs and fusion sources - and a filter is where
+  an expression string shines: `"filter": ["status_s:active AND year_i:>=1960"]`.
 
 ## Search and ranking
 

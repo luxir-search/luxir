@@ -46,7 +46,7 @@ public:
   // rankingSinks are set by the parser to deliver to FusionOp::Calc.
   std::vector<TopDocsReq*> sources;
   int64_t topCount;
-  std::span<std::pair<std::string_view, Query*>> filters;  // shared fusion-level filters
+  std::span<ParsedFilter> filters;  // shared fusion-level filters
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
   int32_t rrfK = 60;
@@ -55,7 +55,7 @@ public:
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
   FusionOp(SearchRequest& req, std::string_view name, const ReqFusion& fusionProto,
            std::vector<TopDocsReq*>&& sources, int64_t topCount,
-           std::span<std::pair<std::string_view, Query*>> filters,
+           std::span<ParsedFilter> filters,
            std::span<Query::Weight*> filterWeights, int32_t rrfK)
     : SearchOp(req, name), fusionProto(fusionProto),
       sources(std::move(sources)), topCount(topCount), filters(filters),
@@ -66,7 +66,7 @@ public:
       auto& context = this->sources.front()->planning;
       filterUses = context.pool.make_span<FilterCache::Use*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
-        filterUses[i] = context.getFilterUse(*filters[i].second);
+        filterUses[i] = context.getFilterUse(*filters[i].query);
       }
     }
   }

@@ -259,9 +259,8 @@ public:
     return &rootOp;
   }
 
-  // Op and filter names appear in path-based addressing (debug/warning entries like
-  // ops.q.top_docs.filter[0]), URL overlays, and cross-references (Domain
-  // include/exclude), so they are restricted to path-safe characters.
+  // Op names appear in path-based addressing and URL overlays, so they are
+  // restricted to path-safe characters.
   static void validateName(std::string_view name, const char* kind) {
     bool ok = !name.empty();
     for (char c : name) {
@@ -613,7 +612,7 @@ public:
   // Build Weights for a filter list after the serial logical-validation pass;
   // the resulting span is passed to the op constructor.
   std::span<Query::Weight*> buildFilterWeights(
-      std::span<std::pair<std::string_view, Query*>> filters,
+      std::span<ParsedFilter> filters,
       Query::Context& qcontext, int32_t requestFlags) {
     if (filters.empty()) return {};
     // Filters constrain matches but never contribute to score. Preserve any
@@ -622,7 +621,7 @@ public:
         & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
     auto weights = req.requestPool.make_span<Query::Weight*>(filters.size());
     for (size_t i = 0; i < filters.size(); i++) {
-      weights[i] = filters[i].second->createWeight(qcontext, filterFlags);
+      weights[i] = filters[i].query->createWeight(qcontext, filterFlags);
     }
     return weights;
   }
@@ -664,10 +663,19 @@ public:
     // limit to actual number of docs in the index (or all if limit == -1)
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
-    auto filters = parseNamedFilters(parser, topDocsReq.filter);
+    auto filters = parseFilters(parser, topDocsReq.filter, topDocsReq.ops, false);
+
+    // Stage 1 gate: validation and parse-product retention are complete, but
+    // execution does not route filters around sibling ops until the next stage.
+    for (size_t i = 0; i < filters.size(); i++) {
+      if (!filters[i].exceptOps.empty()) {
+        throw std::runtime_error("top_docs.filter[" + std::to_string(i)
+            + "].except_ops: multi-select filter routing is not implemented yet");
+      }
+    }
 
     // By default TopDocs filters are ordinary Boolean filter clauses, so one
-    // query tree owns both matching and preparation. Keep the named filter
+    // query tree owns both matching and preparation. Keep the routed filter
     // metadata on TopDocsReq; the toggle preserves the former passive domain
     // path as the benchmark baseline.
     bool countClauseDisabled =
@@ -687,7 +695,7 @@ public:
       mandatory[0] = query;
       auto filterClauses = req.requestPool.make_span<Query*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
-        filterClauses[i] = filters[i].second;
+        filterClauses[i] = filters[i].query;
       }
       query = req.requestPool.make<BooleanQuery>(
         mandatory, std::span<Query*>{}, std::span<Query*>{}, filterClauses);
@@ -718,9 +726,8 @@ public:
       domainQuery->validateLogical(*planningContext);
     }
     if (!foldFilters) {
-      for (const auto& [filterName, filterQuery] : filters) {
-        unused(filterName);
-        filterQuery->validateLogical(*planningContext);
+      for (const auto& filter : filters) {
+        filter.query->validateLogical(*planningContext);
       }
     }
 
@@ -815,9 +822,9 @@ public:
             domainQuery->canOmitWeightForCacheFirstMembership();
       }
       for (size_t i = 0; i < filters.size(); i++) {
-        sourceQueries[sourceIndex++] = filters[i].second;
+        sourceQueries[sourceIndex++] = filters[i].query;
         allOmittable &=
-            filters[i].second->canOmitWeightForCacheFirstMembership();
+            filters[i].query->canOmitWeightForCacheFirstMembership();
       }
       if (allOmittable && !sourceQueries.empty()) {
         bool allowReaderStable = sourceQueries.size() == 1;
@@ -1087,19 +1094,42 @@ public:
     return qr;
   }
 
-  std::span<std::pair<std::string_view, Query*>> parseNamedFilters(
+  std::span<ParsedFilter> parseFilters(
       ProtobufQueryParser& parser,
-      std::span<const luxir::api::NamedQuery> filtersProto) {
-    std::span<std::pair<std::string_view, Query*>> out;
+      std::span<const luxir::api::Filter> filtersProto,
+      OpsMap siblingOps, bool fusion) {
+    std::span<ParsedFilter> out;
     if (!filtersProto.empty()) {
-      out = req.requestPool.make_span<std::pair<std::string_view, Query*>>(filtersProto.size());
+      out = req.requestPool.make_span<ParsedFilter>(filtersProto.size());
       for (size_t i = 0; i < filtersProto.size(); i++) {
         auto& f = filtersProto[i];
-        validateName(f.name, "filter");
-        if (!f.query.has_value()) {
-          throw std::runtime_error("filter '" + std::string(f.name) + "' requires a query");
+        std::string path = (fusion ? "fusion.filter[" : "top_docs.filter[")
+            + std::to_string(i) + "]";
+        if (!f.query.has_value()
+            || std::holds_alternative<std::monostate>(f.query->kind)) {
+          throw std::runtime_error(path + ".query requires a query kind");
         }
-        out[i] = {f.name, parser.parse(*f.query)};
+        if (fusion && !f.except_ops.empty()) {
+          throw std::runtime_error(path
+              + ".except_ops is not supported on Fusion filters");
+        }
+        for (size_t j = 0; j < f.except_ops.size(); j++) {
+          std::string_view key = f.except_ops[j];
+          if (key.find('/') != std::string_view::npos) {
+            throw std::runtime_error(path + ".except_ops[" + std::to_string(j)
+                + "] contains '/'; deeper paths are reserved");
+          }
+          if (!siblingOps.contains(key)) {
+            throw std::runtime_error(path + ".except_ops contains unknown sibling op key '"
+                + std::string(key) + "'");
+          }
+          auto prior = f.except_ops.first(j);
+          if (std::ranges::find(prior, key) != prior.end()) {
+            throw std::runtime_error(path + ".except_ops contains duplicate op key '"
+                + std::string(key) + "'");
+          }
+        }
+        out[i] = {parser.parse(*f.query), f.except_ops};
       }
     }
     return out;
@@ -1143,14 +1173,13 @@ public:
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
     ProtobufQueryParser parser(parseContext);
-    auto sharedFilters = parseNamedFilters(parser, fusionProto.filter);
+    auto sharedFilters = parseFilters(parser, fusionProto.filter, fusionProto.ops, true);
     // Reuse the first source's execution Context when it has one. A fully
     // resident source may be Context-free, in which case shared filter
     // Weights are unresolved execution and create the Context here.
     // Shared filters use the same request flag path as TopDocs filters.
-    for (const auto& [filterName, filterQuery] : sharedFilters) {
-      unused(filterName);
-      filterQuery->validateLogical(sources.front()->planning);
+    for (const auto& filter : sharedFilters) {
+      filter.query->validateLogical(sources.front()->planning);
     }
     std::span<Query::Weight*> sharedFilterWeights;
     if (!sharedFilters.empty()) {

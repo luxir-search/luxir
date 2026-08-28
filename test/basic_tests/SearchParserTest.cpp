@@ -267,7 +267,7 @@ TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
   auto shapeReq = localReq(luxirNode->getSearchEngine());
   shapeReq->collection("main");
   shapeReq->topDocs("q").exprQuery("body_w:a AND (body_w:b OR body_w:c)")
-      .withStats().fields({"id"}).limit(-1).matchFilter("keep", "keep_s", "yes");
+      .withStats().fields({"id"}).limit(-1).matchFilter("keep_s", "yes");
   shapeReq->schema = helper.collection().getSchema();
   shapeReq->reader = helper.getIndexWriter()->getIndexReader();
   ProtobufSearchParser parser(*shapeReq);
@@ -283,7 +283,7 @@ TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs("folded").exprQuery("body_w:a AND (body_w:b OR body_w:c)")
-      .withStats().fields({"id"}).limit(-1).matchFilter("keep", "keep_s", "yes");
+      .withStats().fields({"id"}).limit(-1).matchFilter("keep_s", "yes");
   auto& twin = req->topDocs("twin").withStats().fields({"id"}).limit(-1);
   twin.rawQuery() = qb::boolean(twin.mr(),
       /*required=*/{qb::match(twin.mr(), "body_w", "a")},
@@ -310,7 +310,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   auto shapeReq = localReq(luxirNode->getSearchEngine());
   shapeReq->collection("main");
   shapeReq->topDocs("q").withStats().fields({"id"}).limit(-1)
-      .matchFilter("keep", "keep_s", "yes");
+      .matchFilter("keep_s", "yes");
   shapeReq->schema = helper.collection().getSchema();
   shapeReq->reader = helper.getIndexWriter()->getIndexReader();
   ProtobufSearchParser parser(*shapeReq);
@@ -326,7 +326,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   req->topDocs("q").withStats().fields({"id"}).limit(-1)
-      .matchFilter("keep", "keep_s", "yes");
+      .matchFilter("keep_s", "yes");
   req->execute();
   ASSERT_OK(req);
   EXPECT_EQ(2, req->getMatchCount("q"));
