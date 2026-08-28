@@ -641,19 +641,18 @@ public:
                 });
           }
         } else {
-          // Remapped segment: globalOrd() decodes a delta frame, so it is only
-          // free while consecutive documents stay inside one.  The counting
-          // reps avoid that by tallying local ords and draining once (see
-          // countSegment); doing the same here means a local-keyed FacetMap
-          // drained through the calculators' own merge(), which is worth it if
-          // a multi-segment metric-sorted facet ever shows up hot.
-          OrdMap::SegToGlobal::BulkGlobalOrds mapped(mapping);
+          // Remapped segment ords arrive in document order, so use the point
+          // globalOrd()/deltaAt accessor: it decodes one packed value per random
+          // arrival. BulkGlobalOrds is for ordered local-ord drains, where its
+          // decoded frame is reused. Local staging may still win with enough
+          // repeats; countSegment's skinny repeats>2 crossover is the prior art
+          // for that measured follow-up.
           if (knownEntries.empty()) {
             facetReq.facetSegOrdCol(
                 domain, segnum, missing_num, segFieldInfo,
                 [&](int32_t docid, int32_t val) LUXIR_INLINE {
                   data.counts.add(
-                      mapped.globalOrd((int64_t)val - 1), docid);
+                      mapping.globalOrd((int64_t)val - 1), docid);
                 });
           } else {
             facetReq.facetSegOrdCol(
@@ -661,7 +660,7 @@ public:
                 [&](int32_t docid, int32_t val) LUXIR_INLINE {
                   size_t localOrd = (size_t)val - 1;
                   data.counts.addKnown(
-                      mapped.globalOrd((int64_t)localOrd),
+                      mapping.globalOrd((int64_t)localOrd),
                       knownEntries[localOrd], docid);
                 });
           }
