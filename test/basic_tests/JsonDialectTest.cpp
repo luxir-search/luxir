@@ -229,6 +229,23 @@ TEST(JsonDialect, RangeQuery) {
   EXPECT_FALSE(r.lte.has_value());
 }
 
+TEST(JsonDialect, InQueryCanonicalForm) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  ASSERT_TRUE(P::read_json(
+      q, R"({"in":{"field":"brand_s","values":["acme","globex"]}})", mr));
+  const auto& in = std::get<P::InQuery>(q.kind);
+  EXPECT_EQ("brand_s", in.field);
+  ASSERT_EQ(2u, in.values.size());
+  EXPECT_EQ("globex", std::get<std::string_view>(in.values[1].kind));
+
+  std::string canonical;
+  ASSERT_TRUE(P::write_json(q, canonical));
+  EXPECT_EQ(
+      R"({"in":{"field":"brand_s","values":["acme","globex"]}})",
+      canonical);
+}
+
 TEST(JsonDialect, ExistsQuery) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query q;

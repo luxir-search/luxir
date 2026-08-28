@@ -19,7 +19,9 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/StringColumnInSetQuery.h"
 #include "luxir/query/TermQuery.h"
+#include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermRangeQuery.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/ValCoerce.h"
@@ -247,6 +249,76 @@ public:
           "Exists query requires an indexed or column-stored field: {}", field));
     }
     return pool.make<ExistsQuery>(field);
+  }
+
+  Query* createInQuery(std::string_view field,
+                       std::span<const luxir::api::Val> values) {
+    if (values.empty()) {
+      throw std::runtime_error(std::format(
+          "In query field '{}' requires at least one value", field));
+    }
+
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (isNumericColumnType(fieldType.type())) {
+      if (!fieldType.hasColumn()) {
+        throw std::runtime_error(std::format(
+            "In query field '{}' does not support exact equality through an index or column",
+            field));
+      }
+      std::vector<int64_t> encoded;
+      encoded.reserve(values.size());
+      for (const api::Val& value : values) {
+        encoded.push_back(fieldType.coerceColInt64(
+            value, field, coerceContext));
+      }
+      std::sort(encoded.begin(), encoded.end());
+      if (std::adjacent_find(encoded.begin(), encoded.end()) != encoded.end()) {
+        throw std::runtime_error(std::format(
+            "In query field '{}' has duplicate values after coercion", field));
+      }
+      if (encoded.size() == 1) {
+        return pool.make<NumericRangeQuery>(field, encoded[0], encoded[0]);
+      }
+      auto stored = pool.copy_span(std::span<int64_t>(encoded));
+      return pool.make<NumericRangeQuery>(
+          field, std::span<const int64_t>(stored));
+    }
+
+    bool termBacked = fieldType.type() == FieldType::Type::TEXT
+        || fieldType.type() == FieldType::Type::STRING
+        || fieldType.type() == FieldType::Type::ID;
+    bool rawStringColumn = fieldType.type() == FieldType::Type::STRING
+        && !fieldType.indexed() && fieldType.hasColumn();
+    if (!termBacked || (!fieldType.indexed() && !rawStringColumn)) {
+      throw std::runtime_error(std::format(
+          "In query field '{}' does not support exact equality through an index or column",
+          field));
+    }
+
+    std::vector<std::string_view> terms;
+    terms.reserve(values.size());
+    for (const api::Val& value : values) {
+      char buf[coerce::TEXT_BUF_SIZE];
+      std::string_view term = fieldType.coerceTerm(value, field, buf);
+      if (rawStringColumn) {
+        if (term.data() == buf) term = poolCopy(term);
+      } else {
+        term = PackedTerm::truncate(term);
+        if (term.data() == buf) term = copyTerm(term);
+      }
+      terms.push_back(term);
+    }
+    std::sort(terms.begin(), terms.end());
+    if (std::adjacent_find(terms.begin(), terms.end()) != terms.end()) {
+      throw std::runtime_error(std::format(
+          "In query field '{}' has duplicate values after coercion", field));
+    }
+    auto stored = pool.copy_span(std::span<std::string_view>(terms));
+    std::span<const std::string_view> selected(stored);
+    if (rawStringColumn) {
+      return pool.make<StringColumnInSetQuery>(field, selected);
+    }
+    return pool.make<TermInSetQuery>(field, selected);
   }
 
   // Normalize multiterm query input (a prefix or fuzzy term) for a TEXT

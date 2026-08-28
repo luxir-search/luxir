@@ -69,6 +69,13 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
   return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match);
 }
 
+luxir::Query* ProtobufQueryParser::parseIn(
+    const luxir::api::InQuery& inQuery) {
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings);
+  return builder.createInQuery(inQuery.field, inQuery.values);
+}
+
 std::span<std::string_view> ProtobufQueryParser::toSpan(std::span<const std::string_view> vals) {
   auto out = pool.make_span<std::string_view>(vals.size());
   for (size_t i = 0; i < vals.size(); i++) {
@@ -441,6 +448,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
   return std::visit(luxir::overloaded{
     [&](const luxir::api::Match& m) -> luxir::Query* { return parseMatch(m); },
+    [&](const luxir::api::InQuery& i) -> luxir::Query* { return parseIn(i); },
     [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parsePhrase(p); },
     [&](const luxir::api::PrefixQuery& p) -> luxir::Query* { return parsePrefix(p); },
     [&](const luxir::api::WildcardQuery& w) -> luxir::Query* { return parseWildcard(w); },

@@ -61,7 +61,7 @@ namespace luxir::api {
 // ---- forward declarations (all messages) ----
 struct Target; struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
-struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct Filter; struct BooleanQuery;
+struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct InQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
@@ -499,6 +499,10 @@ struct Match {
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
 };
+struct InQuery {
+  std::string_view field;
+  std::span<const Val> values;
+};
 struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> score;
@@ -544,10 +548,11 @@ struct ExprQuery {                                             // map value indi
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
-struct Query {                                                 // needs Match,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,Boost,Rescore
+struct Query {                                                 // needs Match,InQuery,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,Boost,Rescore
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
-               GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery>
+               GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
+               InQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs Target,Column,CommitParams
@@ -573,7 +578,7 @@ struct UpdateRequest {                                         // needs Target,C
 LUXIR_TD(Target) LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
-LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
+LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(InQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
 LUXIR_TD(Warning) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
@@ -608,7 +613,7 @@ LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
 LUXIR_ENTRY(Target) LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
-LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
+LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(InQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)

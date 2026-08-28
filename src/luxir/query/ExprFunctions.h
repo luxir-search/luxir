@@ -29,7 +29,7 @@ namespace luxir::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 19> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -49,6 +49,7 @@ inline constexpr std::array<std::string_view, 19> ARM_NAMES = {
     "rescore",        // RescoreQuery
     "wildcard",       // WildcardQuery
     "regex",          // RegexQuery
+    "in",             // InQuery - structured-only (repeated Val input)
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");

@@ -237,7 +237,7 @@ void roundTripType(const char* nm) {
 // The one hand-maintained list: every message type. Add a message -> add a line.
 #define LUXIR_MSGS(X)                                                                              \
   X(Target) X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
-  X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(Filter)    \
+  X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(InQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(Domain)                                                            \

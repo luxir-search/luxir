@@ -207,6 +207,7 @@ message Query {
     RescoreQuery rescore = 16;      // preserves matches and replaces each hit's score
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
+    InQuery in = 19;                // constant-score exact value-set membership
     // TODO: function?
   }
 }
@@ -287,6 +288,14 @@ message Match {
     OR = 1;                    // a doc matches if any analyzed term matches
     AND = 2;                   // a doc must match every analyzed term
   }
+}
+
+// Constant-score exact value-set membership. Values are never analyzed:
+// term-backed fields compare raw indexed terms, while numeric/date fields
+// use the same field-native scalar coercion as ingest.
+message InQuery {
+  string field = 1;
+  repeated Val values = 2;
 }
 
 // Matches documents whose field value falls in the given range.  All bounds

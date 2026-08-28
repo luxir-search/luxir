@@ -1,9 +1,11 @@
 #pragma once
 
 #include <optional>
+#include <span>
 #include <string_view>
 
 #include "TermsEnum.h"
+#include "luxir/util/screaming.h"
 
 namespace luxir {
 
@@ -129,6 +131,34 @@ public:
                  std::optional<std::string_view> upper, bool includeUpper)
     : ScanTermsEnum(te), lower(lower), upper(upper),
       includeLower(includeLower), includeUpper(includeUpper) {}
+};
+
+// Accepts an explicit sorted unique term set. Dictionary seeks and candidate
+// advancement both move forward; when the dictionary lands past a requested
+// term, galloping skips the corresponding run in the provided set.
+class ExplicitTermsEnum final : public FilteredTermsEnum {
+  const std::string_view* candidate;
+  const std::string_view* end;
+
+public:
+  ExplicitTermsEnum(TermsEnum& te, std::span<const std::string_view> terms)
+    : FilteredTermsEnum(te), candidate(terms.data()),
+      end(terms.data() + terms.size()) {}
+
+  bool next() override {
+    if (exhausted) return false;
+    if (started) candidate++;
+    else started = true;
+
+    while (candidate != end) {
+      if (!te.seekCeil(*candidate)) return finish();
+      std::string_view indexed = termView();
+      if (indexed == *candidate) return true;
+      candidate = screaming::gallopLowerBound(
+          candidate + 1, end, indexed);
+    }
+    return finish();
+  }
 };
 
 } // namespace luxir

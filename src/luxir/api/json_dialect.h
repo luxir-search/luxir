@@ -452,6 +452,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::WildcardQuery>);
           } else if (key == "regex") {
             arm(std::in_place_type<api::RegexQuery>);
+          } else if (key == "in") {
+            arm(std::in_place_type<api::InQuery>);
           } else if (key == "fuzzy") {
             arm(std::in_place_type<api::FuzzyQuery>);
           } else if (key == "simple_query") {
