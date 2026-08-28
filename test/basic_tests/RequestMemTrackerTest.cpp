@@ -38,6 +38,16 @@ TEST(RequestMemTrackerTest, partialChargePreservesReservationSemantics) {
   tracker.release(10);
 }
 
+TEST(RequestMemTrackerTest, nonThrowingChargeLeavesDeniedReservationAlone) {
+  RequestMemTracker tracker(10);
+  tracker.charge(6, "test", "initial");
+  EXPECT_FALSE(tracker.tryCharge(5));
+  EXPECT_EQ(6u, tracker.bytes());
+  EXPECT_TRUE(tracker.tryCharge(4));
+  EXPECT_EQ(10u, tracker.bytes());
+  tracker.release(10);
+}
+
 TEST(RequestMemTrackerTest, unlimitedTrackerStillRejectsCounterOverflow) {
   RequestMemTracker tracker(0);
   constexpr size_t MAX = std::numeric_limits<size_t>::max();

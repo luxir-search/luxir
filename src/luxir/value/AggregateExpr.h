@@ -113,7 +113,7 @@ struct AggregateStateOps {
 };
 
 // Optional packed state for a bare, single-valued column that is present on
-// every document. The enclosing FacetMap count is then the aggregate value
+// every document. The enclosing ordinal-entry count is then the aggregate value
 // count, so avg need not duplicate that uint64_t in every metric entry.
 struct DenseFacetStateOps {
   using Init = void (*)(void* state);

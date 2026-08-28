@@ -7,6 +7,7 @@
 #include <malloc.h>
 #endif
 #include "luxir/luxir_main.h"
+#include "luxir/util/MappedAlloc.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/server/GRPCServer.h"
@@ -41,6 +42,7 @@ int luxir_main(int argc, char** argv) {
   if (config.malloc_mmap_threshold != 0) {
     int64_t t = config.malloc_mmap_threshold < 0 ? (int64_t)MemPool::BYTE_BLOCK_SIZE
                                                  : config.malloc_mmap_threshold;
+    mappedAllocationFloor = (size_t)t;
     mallopt(M_MMAP_THRESHOLD, (int)std::min(t, (int64_t)INT_MAX));
   }
 #endif

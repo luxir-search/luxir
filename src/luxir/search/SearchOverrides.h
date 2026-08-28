@@ -48,12 +48,33 @@ struct InlineAggregateStats {
 };
 
 inline InlineAggregateStats* inlineAggregateStatsForTests = nullptr;
+struct InlineFacetEntryStats {
+  std::atomic<size_t> denseTables{0};
+  std::atomic<size_t> sparseTables{0};
+  std::atomic<size_t> denseMerges{0};
+  std::atomic<size_t> mixedMerges{0};
+  std::atomic<size_t> denseFallbacks{0};
+  std::atomic<size_t> entryStride{0};
+};
+inline InlineFacetEntryStats* inlineFacetEntryStatsForTests = nullptr;
 inline bool disableDenseFacetStateForTests = false;
 
-// Opt-in for the general low-cardinality inline-facet entry cache. Keep this
-// separate from expression-metric fast paths so regression measurements can
-// exclude an optimization that applies equally to other inline calculators.
-inline bool enableInlineFacetEntryCache = false;
+enum class InlineFacetEntryMode {
+  AUTO, FORCE_DENSE, FORCE_SPARSE
+};
+
+// Test/bench control (LUXIR_INLINE_FACET_ENTRY). AUTO uses the crossover;
+// dense/sparse pin the inline facet entry representation.
+inline InlineFacetEntryMode initInlineFacetEntryMode() {
+  const char* e = std::getenv("LUXIR_INLINE_FACET_ENTRY");
+  if (e == nullptr) return InlineFacetEntryMode::AUTO;
+  std::string_view v(e);
+  if (v == "dense") return InlineFacetEntryMode::FORCE_DENSE;
+  if (v == "sparse") return InlineFacetEntryMode::FORCE_SPARSE;
+  return InlineFacetEntryMode::AUTO;
+}
+inline InlineFacetEntryMode forcedInlineFacetEntryMode =
+    initInlineFacetEntryMode();
 
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key

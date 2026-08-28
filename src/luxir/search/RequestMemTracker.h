@@ -22,6 +22,7 @@ public:
 
   void charge(size_t bytes, std::string_view breaker,
               std::string_view detail);
+  bool tryCharge(size_t bytes);
   size_t chargeUpTo(size_t preferredBytes, size_t minimumBytes,
                     std::string_view breaker, std::string_view detail);
   [[noreturn]] void chargeOverflow(std::string_view breaker,

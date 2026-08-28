@@ -33,8 +33,9 @@ auto facetAggregateOverrides() {
       forcedRequestMemoryMaxBytes,
       facetAggregateStateReservationCounterForTests,
       inlineAggregateStatsForTests,
+      inlineFacetEntryStatsForTests,
       disableDenseFacetStateForTests,
-      enableInlineFacetEntryCache,
+      forcedInlineFacetEntryMode,
       forcedRangeFacetBucketDomainByteBudget,
       forcedRangeFacetBindingStateChunkBytes,
       rangeFacetBindingBlockCounter);
@@ -607,6 +608,184 @@ TEST_F(AggregateExprTest, stringFacetInlineEmitsNullAndWarningOnFailure) {
             std::string::npos);
 }
 
+TEST_F(AggregateExprTest,
+       denseAndSparseInlineEntriesMatchOnRemappedMultiValueSegments) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "1", "cat_ss", vecs("a", "c"), "x_i", 1),
+      flatdoc("id", "2", "cat_ss", vecs("b"), "x_i", 10),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "3", "x_i", 100),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "4", "cat_ss", vecs("b", "c"), "x_i", 20),
+      flatdoc("id", "5", "cat_ss", vecs("d"), "x_i", 5),
+  }, UpdateMessage::COMMIT).success);
+
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  auto run = [&](InlineFacetEntryMode mode) {
+    forcedInlineFacetEntryMode = mode;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").facet("f", "cat_ss").limit(4);
+    facet.expr("metric", "avg(x_i)");
+    qb::sort(facet, "metric", qb::DESC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+    std::vector<std::byte> encoded;
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    EXPECT_NE(nullptr, result);
+    if (result != nullptr) {
+      EXPECT_TRUE(api::encode(*result, encoded));
+    }
+    return encoded;
+  };
+
+  EXPECT_EQ(run(InlineFacetEntryMode::FORCE_DENSE),
+            run(InlineFacetEntryMode::FORCE_SPARSE));
+}
+
+TEST_F(AggregateExprTest, deniedDenseInlineEntriesFallBackToSparse) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t i = 0; i < 100; i++) {
+    docs.push_back(flatdoc(
+        "id", std::to_string(i), "cat_s", "bucket-" + std::to_string(i),
+        "pick_s", i == 0 ? "yes" : "no", "x_i", i + 1));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  InlineFacetEntryStats stats;
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  forcedInlineFacetEntryMode = InlineFacetEntryMode::FORCE_DENSE;
+  inlineFacetEntryStatsForTests = &stats;
+  forcedRequestMemoryMaxBytes = 512;
+  auto req = localReq(helper.getSearchEngine());
+  auto& top = req->topDocs("q");
+  top.getNumber(true).matchQuery("pick_s", "yes");
+  auto& facet = top.facet("f", "cat_s").limit(1);
+  facet.expr("metric", "sum(x_i)");
+  qb::sort(facet, "metric", qb::DESC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(0u, stats.denseTables.load());
+  EXPECT_EQ(1u, stats.sparseTables.load());
+  EXPECT_EQ(1u, stats.denseFallbacks.load());
+  const auto* result = req->docList("q")->ops.at("f")->facetResult();
+  ASSERT_NE(nullptr, result);
+  ASSERT_EQ(1u, result->counts.size());
+  EXPECT_EQ(1, result->counts[0]);
+  const auto& values =
+      std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+  ASSERT_EQ(1u, values.size());
+  EXPECT_EQ(1, values[0].asInt());
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
+}
+
+TEST_F(AggregateExprTest, denseInlineMergePropagatesAggregateFailure) {
+  CollectionHelper helper;
+  constexpr int32_t SEGMENTS = 8;
+  constexpr int32_t DOCS_PER_SEGMENT = 1000;
+  for (int32_t segment = 0; segment < SEGMENTS; segment++) {
+    std::vector<Doc> docs;
+    docs.reserve(DOCS_PER_SEGMENT);
+    for (int32_t doc = 0; doc < DOCS_PER_SEGMENT; doc++) {
+      docs.push_back(flatdoc(
+          "id", std::to_string(segment * DOCS_PER_SEGMENT + doc),
+          "cat_s", "a", "x_i", segment == 3 ? -1 : 4));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+
+  InlineFacetEntryStats stats;
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  forcedInlineFacetEntryMode = InlineFacetEntryMode::FORCE_DENSE;
+  inlineFacetEntryStatsForTests = &stats;
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s").limit(1);
+  facet.expr("metric", "sum(sqrt(x_i))");
+  qb::sort(facet, "metric", qb::DESC);
+  req->execute(true);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_GT(stats.denseMerges.load(), 0u);
+  const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& values =
+      std::get<api::ArrVal>(result->ops.at("metric")->kind).v;
+  ASSERT_EQ(1u, values.size());
+  EXPECT_TRUE(values[0].isNull());
+  ASSERT_EQ(1u, req->respWarnings().size());
+  EXPECT_EQ("aggregate_eval_failed", req->respWarnings()[0].code);
+}
+
+TEST_F(AggregateExprTest, budgetedInlineFacetTableMergesSparseIntoDense) {
+  RequestMemTracker tracker(1200);
+  InlineFacetEntryStats stats;
+  {
+    OrdinalFacetEntryTable dense;
+    OrdinalFacetEntryTable sparse;
+    std::span<SearchOp::InlineCalculator*> calculators;
+    dense.configure(calculators, tracker, 100, "dense", &stats);
+    sparse.configure(calculators, tracker, 100, "sparse", &stats);
+    dense.initialize(1, true, false);
+    EXPECT_EQ(100u * sizeof(int64_t) + sizeof(int64_t), tracker.bytes());
+    sparse.initialize(1, true, false);
+
+    EXPECT_EQ(1u, stats.denseTables.load());
+    EXPECT_EQ(1u, stats.sparseTables.load());
+    EXPECT_EQ(1u, stats.denseFallbacks.load());
+    dense.add(7, 0);
+    sparse.add(7, 1);
+    sparse.add(9, 2);
+    dense.merge(sparse);
+
+    EXPECT_EQ(1u, stats.mixedMerges.load());
+    ASSERT_EQ(2u, dense.size());
+    int64_t count7 = -1;
+    int64_t count9 = -1;
+    dense.forEachEntry([&](int64_t ord, char* entry) {
+      if (ord == 7) count7 = loadUnaligned<int64_t>(entry);
+      if (ord == 9) count9 = loadUnaligned<int64_t>(entry);
+    });
+    EXPECT_EQ(2, count7);
+    EXPECT_EQ(1, count9);
+    EXPECT_GT(tracker.bytes(), 0u);
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST_F(AggregateExprTest, inlineMincountZeroRemainsTouchedOnly) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "1", "cat_s", "x", "pick_s", "yes", "x_i", 3),
+      flatdoc("id", "2", "cat_s", "y", "pick_s", "no", "x_i", 5),
+      flatdoc("id", "3", "cat_s", "z", "pick_s", "no", "x_i", 7),
+  }, UpdateMessage::COMMIT).success);
+
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  forcedInlineFacetEntryMode = InlineFacetEntryMode::FORCE_DENSE;
+  auto req = localReq(helper.getSearchEngine());
+  auto& top = req->topDocs("q");
+  top.getNumber(true).matchQuery("pick_s", "yes");
+  auto& facet = top.facet("f", "cat_s").limit(-1).mincount(0);
+  facet.expr("metric", "sum(x_i)");
+  qb::sort(facet, "metric", qb::DESC);
+  req->execute(false);
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* result = req->docList("q")->ops.at("f")->facetResult();
+  const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+  ASSERT_EQ(1u, ids.size());
+  EXPECT_EQ("x", ids[0]);
+  EXPECT_EQ(1, result->counts[0]);
+}
+
 TEST_F(AggregateExprTest, selectedStringBucketDomainsUseOrdinaryCalculator) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "1", "cat_s", "a", "x_i", 10),
@@ -706,7 +885,7 @@ TEST_F(AggregateExprTest, requestMemoryBreakerCoversInlineAndReplay) {
   run(true);
 }
 
-TEST_F(AggregateExprTest, inlineFacetUsesTrueStrideAndChunkedReservations) {
+TEST_F(AggregateExprTest, inlineFacetUsesPackedTableStrideAndReservation) {
   constexpr int32_t BUCKETS = 5000;
   CollectionHelper helper;
   std::vector<Doc> docs;
@@ -725,11 +904,11 @@ TEST_F(AggregateExprTest, inlineFacetUsesTrueStrideAndChunkedReservations) {
   constexpr size_t EXPECTED_STRIDE = 10;
   ASSERT_EQ(EXPECTED_STRIDE, AggregateStateView::bytes(*program));
 
-  std::atomic<size_t> reservations{0};
+  InlineFacetEntryStats stats;
   auto guard = facetAggregateOverrides();
   forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
-  forcedRequestMemoryMaxBytes = 160 * 1024;
-  facetAggregateStateReservationCounterForTests = &reservations;
+  forcedRequestMemoryMaxBytes = 256 * 1024;
+  inlineFacetEntryStatsForTests = &stats;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(1);
   facet.expr("metric", "min(metric_d)");
@@ -737,7 +916,8 @@ TEST_F(AggregateExprTest, inlineFacetUsesTrueStrideAndChunkedReservations) {
   req->execute(false);
 
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_LE(reservations.load(), 3u);
+  EXPECT_EQ(sizeof(int64_t) + EXPECTED_STRIDE, stats.entryStride.load());
+  EXPECT_EQ(1u, stats.denseTables.load());
   EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
 
@@ -753,7 +933,7 @@ TEST_F(AggregateExprTest, denseIntAvgInlineUsesFacetCountState) {
   auto guard = facetAggregateOverrides();
   inlineAggregateStatsForTests = &stats;
   forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
-  enableInlineFacetEntryCache = true;
+  forcedInlineFacetEntryMode = InlineFacetEntryMode::FORCE_DENSE;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
   facet.expr("metric", "avg(metric_i)");

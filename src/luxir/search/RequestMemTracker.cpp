@@ -7,6 +7,8 @@
 
 #include <fmt/format.h>
 
+#include "luxir/util/luxir_util.h"
+
 namespace luxir {
 
 [[noreturn]] void RequestMemTracker::throwLimit(
@@ -41,6 +43,21 @@ void RequestMemTracker::charge(size_t bytes, std::string_view breaker,
   if (bytes == 0) return;
   size_t charged = chargeUpTo(bytes, bytes, breaker, detail);
   assert(charged == bytes);
+  unused(charged);
+}
+
+bool RequestMemTracker::tryCharge(size_t bytes) {
+  if (bytes == 0) return true;
+  size_t current = chargedBytes.load(std::memory_order_relaxed);
+  for (;;) {
+    if (bytes > std::numeric_limits<size_t>::max() - current) return false;
+    size_t total = current + bytes;
+    if (maxBytes != 0 && total > maxBytes) return false;
+    if (chargedBytes.compare_exchange_weak(
+            current, total, std::memory_order_relaxed)) {
+      return true;
+    }
+  }
 }
 
 size_t RequestMemTracker::chargeUpTo(
@@ -76,6 +93,7 @@ void RequestMemTracker::release(size_t bytes) {
   if (bytes == 0) return;
   size_t previous = chargedBytes.fetch_sub(bytes, std::memory_order_relaxed);
   assert(previous >= bytes);
+  unused(previous);
 }
 
 } // namespace luxir

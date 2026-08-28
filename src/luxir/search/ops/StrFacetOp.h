@@ -308,14 +308,17 @@ public:
     // hash for every document counted.  Global ords (OrdMap) removed that
     // constraint; term text is now resolved once per emitted bucket, in
     // facetResult2, exactly as the non-inline path does it.
-    FacetMap<int64_t> counts;
+    OrdinalFacetEntryTable counts;
     int64_t missing_num = 0; // number of missing values in this segment
     std::vector<SearchOp::InlineCalculator*> inlineCalcs;
     static MergeableStrFacetInline* merge(MergeableStrFacetInline* a, MergeableStrFacetInline* b) {
-      // merge the smaller collector into the larger collector, or if both the same size, merge
-      // the less competitive collector into the more competitive collector.
-      if (a->counts.map.size() < b->counts.map.size()) {
-        std::swap(a,b);
+      // Mixed representations always merge into dense. Otherwise merge the
+      // smaller touched set into the larger one; dense/dense therefore walks
+      // the smaller touched list without scanning the ordinal space.
+      if (a->counts.dense() != b->counts.dense()) {
+        if (b->counts.dense()) std::swap(a, b);
+      } else if (a->counts.size() < b->counts.size()) {
+        std::swap(a, b);
       }
 
       a->counts.merge(b->counts);
@@ -468,6 +471,15 @@ public:
     std::vector<uint8_t> topTermsSegments;
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
+    int64_t inlineExpectedValues = -1;
+
+    static int64_t scaleExpectedValues(
+        int64_t domainSize, int64_t segmentValues, int32_t maxDoc) {
+      if (domainSize == 0 || segmentValues == 0 || maxDoc == 0) return 0;
+      __int128 scaled = (__int128)domainSize * segmentValues / maxDoc;
+      return scaled > std::numeric_limits<int64_t>::max()
+          ? std::numeric_limits<int64_t>::max() : (int64_t)scaled;
+    }
 
     class InlineSegmentScope {
       std::span<SearchOp::InlineCalculator*> calculators;
@@ -513,7 +525,14 @@ public:
           auto* calc = subop->createInlineCalculator(this, -1, -1);
           p->inlineCalcs.push_back(calc);
         }
-        p->counts.calcs = p->inlineCalcs;
+        std::string detail = p->inlineCalcs.size() == 1
+            ? std::format("facet '{}' metric '{}'", thisOp().facetName,
+                          p->inlineCalcs.front()->getOp().name)
+            : std::format("facet '{}' inline metrics", thisOp().facetName);
+        p->counts.configure(
+            p->inlineCalcs, thisOp().req.memoryTracker,
+            thisOp().ordMap ? thisOp().ordMap->numOrds() : 0,
+            std::move(detail), inlineFacetEntryStatsForTests);
         return p;
       });
     }
@@ -542,6 +561,32 @@ public:
       std::size_t cap = thisOp().subOps.size() + thisOp().inlineSubOps.size();
       return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
     };
+    void calcAll(oneapi::tbb::task_group* tg,
+                 std::span<const DomainHandle> domains) override {
+      if (!thisOp().inlineSubOps.empty()) {
+        inlineExpectedValues = 0;
+        for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+          auto& postings = thisOp().reader.segments()[segnum].postingsReader();
+          int32_t maxDoc = postings.maxDoc();
+          FieldReader reader(postings);
+          if (!reader.seek(thisOp().fieldName)) continue;
+          SegFieldInfo info;
+          reader.readFieldInfo(info);
+          int64_t domainSize = domains[segnum].get() != nullptr
+              ? domains[segnum].get()->card() : maxDoc;
+          int64_t expected = scaleExpectedValues(
+              domainSize, info.numValues, maxDoc);
+          if (expected > std::numeric_limits<int64_t>::max()
+                             - inlineExpectedValues) {
+            inlineExpectedValues = std::numeric_limits<int64_t>::max();
+            break;
+          }
+          inlineExpectedValues += expected;
+        }
+      }
+      Calculator::calcAll(tg, domains);
+    }
+
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       // Result-child execution is synchronous under the bucket-domain stage,
@@ -607,39 +652,29 @@ public:
         if (thisOp().ordMap) {
           mapping = thisOp().ordMap->getSegToGlobal(segnum);
         }
-        // At low cardinality the same small set of ords is revisited for most
-        // documents. Cache each local ord's stable FacetMap pool entry so the
-        // hot walk pays one hash probe per segment term, not per value. Keep
-        // the table bounded: at higher cardinality the existing hash path is
-        // dominated by entry creation and avoids per-collector pointer arrays.
-        constexpr int64_t MAX_CACHED_INLINE_ORDS = 2 * 1024;
-        std::vector<char*> knownEntries;
         int64_t domainSize = domain ? domain->card() : maxDoc;
-        if (enableInlineFacetEntryCache
-            && found && segFieldInfo.nTerms <= MAX_CACHED_INLINE_ORDS
-            && domainSize >= segFieldInfo.nTerms * 4) {
-          knownEntries.resize((size_t)segFieldInfo.nTerms, nullptr);
+        if (found) {
+          int64_t expectedValues = inlineExpectedValues >= 0
+              ? inlineExpectedValues
+              : scaleExpectedValues(
+                    domainSize, segFieldInfo.numValues, maxDoc);
+          data.counts.initialize(
+              expectedValues,
+              forcedInlineFacetEntryMode
+                  == InlineFacetEntryMode::FORCE_DENSE,
+              forcedInlineFacetEntryMode
+                  == InlineFacetEntryMode::FORCE_SPARSE);
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
         if (mapping.bits == 0) {
           // Identity segment (always so for one segment): local ords ARE global
           // ords, so the column value is the key with nothing in between.
-          if (knownEntries.empty()) {
-            facetReq.facetSegOrdCol(
-                domain, segnum, missing_num, segFieldInfo,
-                [&](int32_t docid, int32_t val) LUXIR_INLINE {
-                  data.counts.add((int64_t)val - 1, docid);
-                });
-          } else {
-            facetReq.facetSegOrdCol(
-                domain, segnum, missing_num, segFieldInfo,
-                [&](int32_t docid, int32_t val) LUXIR_INLINE {
-                  size_t localOrd = (size_t)val - 1;
-                  data.counts.addKnown(
-                      (int64_t)localOrd, knownEntries[localOrd], docid);
-                });
-          }
+          facetReq.facetSegOrdCol(
+              domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t val) LUXIR_INLINE {
+                data.counts.add((int64_t)val - 1, docid);
+              });
         } else {
           // Remapped segment ords arrive in document order, so use the point
           // globalOrd()/deltaAt accessor: it decodes one packed value per random
@@ -647,23 +682,12 @@ public:
           // decoded frame is reused. Local staging may still win with enough
           // repeats; countSegment's skinny repeats>2 crossover is the prior art
           // for that measured follow-up.
-          if (knownEntries.empty()) {
-            facetReq.facetSegOrdCol(
-                domain, segnum, missing_num, segFieldInfo,
-                [&](int32_t docid, int32_t val) LUXIR_INLINE {
-                  data.counts.add(
-                      mapping.globalOrd((int64_t)val - 1), docid);
-                });
-          } else {
-            facetReq.facetSegOrdCol(
-                domain, segnum, missing_num, segFieldInfo,
-                [&](int32_t docid, int32_t val) LUXIR_INLINE {
-                  size_t localOrd = (size_t)val - 1;
-                  data.counts.addKnown(
-                      mapping.globalOrd((int64_t)localOrd),
-                      knownEntries[localOrd], docid);
-                });
-          }
+          facetReq.facetSegOrdCol(
+              domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int32_t val) LUXIR_INLINE {
+                data.counts.add(
+                    mapping.globalOrd((int64_t)val - 1), docid);
+              });
         }
 
         data.missing_num += missing_num;
@@ -1321,7 +1345,7 @@ public:
         size_t finalizedSlot;
       };
       std::vector<Bucket> valVec;
-      auto& counts = mergedData->counts.map;
+      auto& counts = mergedData->counts;
       auto missing_count = mergedData->missing_num;
 
       // Count and bucket-value sorts are future work; sub-op sort is supported.
@@ -1367,7 +1391,7 @@ public:
         // what a high-cardinality metric-ordered facet spends most of its time
         // on: at 278,741 buckets that is ~5M comparisons, each one a virtual
         // call into the sort key's calculator and two dereferences into the
-        // scattered entry pool, plus one 16-byte vector slot per bucket.  A
+        // entry table, plus one compact vector slot per bucket. A
         // heap of `limit` costs one failed comparison per bucket and only
         // ~limit*ln(n/limit) replacements. Finalized scalar scratch and the
         // compact selection records are materialized once per bucket before
@@ -1379,26 +1403,28 @@ public:
         // is then the worst of the best-so-far, which is the one to beat.
         ExpandingPQ<Bucket, decltype(better)> pq((size_t)limit, better);
         size_t finalizedSlot = 0;
-        for (auto& [key, val] : counts) {
+        counts.forEachEntry([&](int64_t key, char* val) {
           int64_t count = loadUnaligned<int64_t>(val);
           if (minCount == -1 || count >= minCount) {
             pq.insertWithOverflow({key, val, finalizedSlot});
           }
           finalizedSlot++;
-        }
+        });
+        assert(finalizedSlot == counts.size());
         std::vector<Bucket> top = pq.release();
         std::sort(top.begin(), top.end(), better);
         valVec = std::move(top);
       } else if (limit < 0) {
         // Every bucket is returned, so there is nothing to select against.
         size_t finalizedSlot = 0;
-        for (auto& [key, val] : counts) {
+        counts.forEachEntry([&](int64_t key, char* val) {
           int64_t count = loadUnaligned<int64_t>(val);
           if (minCount == -1 || count >= minCount) {
             valVec.push_back({key, val, finalizedSlot});
           }
           finalizedSlot++;
-        }
+        });
+        assert(finalizedSlot == counts.size());
         std::sort(valVec.begin(), valVec.end(), better);
       }
       // limit == 0 returns no buckets, and never looks at one.

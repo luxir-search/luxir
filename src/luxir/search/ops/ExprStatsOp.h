@@ -208,17 +208,12 @@ public:
   };
 
   class InlineCalc final : public InlineCalculator {
-    static constexpr size_t RESERVATION_CHUNK_BYTES = 64 * 1024;
-
     std::vector<BoundAggregateInput> bindings;
     std::vector<uint64_t> finalizedValues;
     std::vector<uint64_t> finalizedValid;
-    std::string chargeDetail;
     AggregateEvalScratch scratch;
     AggregateFailure segmentFailure = AggregateFailure::NONE;
-    size_t chargedBytes = 0;
     size_t trackedFinalizedBytes = 0;
-    size_t reservationRemainder = 0;
     const DenseFacetStateOps* denseFacetState;
     BucketValueType resultType;
     uint32_t entryBytes;
@@ -323,8 +318,6 @@ public:
     InlineCalc(SearchOp& op, Calculator* parent, int64_t slot,
                int64_t numSlots)
         : InlineCalculator(op, parent, slot, numSlots),
-          chargeDetail(fmt::format("facet '{}' metric '{}'",
-                                   parent->getOp().name, op.name)),
           denseFacetState(static_cast<ExprStatsOp&>(op).denseFacetState),
           resultType(static_cast<ExprStatsOp&>(op).aggregate.root().type),
           entryBytes(denseFacetState != nullptr
@@ -343,13 +336,11 @@ public:
         inlineAggregateStatsForTests->finalizedBytes.fetch_sub(
             trackedFinalizedBytes, std::memory_order_relaxed);
       }
-      if (chargedBytes != 0) {
-        thisOp().req.memoryTracker.release(chargedBytes);
-      }
     }
 
-    int insert(void* entry, int32_t docid, int space) override {
-      if (space < (int)entryBytes) return -(int)entryBytes;
+    uint32_t fixedEntryBytes() const override { return entryBytes; }
+
+    void insert(void* entry, int32_t docid) override {
       if (denseFacetState != nullptr) {
         denseFacetState->init(entry);
       } else {
@@ -357,29 +348,22 @@ public:
       }
       if (denseFacetState != nullptr) addDenseDoc(entry, docid);
       else addGenericDoc(entry, docid);
-      return (int)entryBytes;
     }
 
-    int update(void* entry, int32_t docid) override {
+    void update(void* entry, int32_t docid) override {
       if (denseFacetState != nullptr) addDenseDoc(entry, docid);
       else addGenericDoc(entry, docid);
-      return (int)entryBytes;
     }
 
-    std::pair<int, int> merge(void* target, void* from) override {
+    void merge(void* target, void* from) override {
       if (denseFacetState != nullptr) {
         denseFacetState->merge(target, from);
       } else {
         state(target).merge(state(from));
       }
-      return {(int)entryBytes, (int)entryBytes};
     }
 
-    std::pair<int, int> mergeNew(void* target, void* from,
-                                 int space) override {
-      if (space < (int)entryBytes) {
-        return {-(int)entryBytes, (int)entryBytes};
-      }
+    void mergeNew(void* target, void* from) override {
       if (denseFacetState != nullptr) {
         denseFacetState->init(target);
         denseFacetState->merge(target, from);
@@ -387,22 +371,16 @@ public:
         state(target).init();
         state(target).merge(state(from));
       }
-      return {(int)entryBytes, (int)entryBytes};
     }
 
     void beginFinalize(size_t entries) override {
-      if (reservationRemainder != 0) {
-        thisOp().req.memoryTracker.release(reservationRemainder);
-        chargedBytes -= reservationRemainder;
-        reservationRemainder = 0;
-      }
       finalizedValues.clear();
       finalizedValues.reserve(entries);
       finalizedValid.assign((entries + 63) / 64, 0);
       trackFinalizedCapacity();
     }
 
-    int finalize(void* entry, int64_t count) override {
+    void finalize(void* entry, int64_t count) override {
       BucketScalar result = finishState(entry, count);
       size_t slot = finalizedValues.size();
       if (result.valid) {
@@ -411,7 +389,6 @@ public:
       finalizedValues.push_back(result.type == BucketValueType::DOUBLE
           ? std::bit_cast<uint64_t>(result.doubleValue)
           : (uint64_t)(int64_t)result.intValue);
-      return (int)entryBytes;
     }
 
     int compare(size_t a, size_t b) override {
@@ -420,19 +397,6 @@ public:
 
     bool isMissing(size_t entry) override {
       return !valid(entry);
-    }
-
-    void prepareEntry() override {
-      if (reservationRemainder < entryBytes) {
-        size_t minimum = entryBytes - reservationRemainder;
-        size_t preferred = entryBytes >= RESERVATION_CHUNK_BYTES
-            ? minimum : RESERVATION_CHUNK_BYTES - reservationRemainder;
-        size_t reserved = thisOp().chargeFacetState(
-            preferred, minimum, chargeDetail);
-        chargedBytes += reserved;
-        reservationRemainder += reserved;
-      }
-      reservationRemainder -= entryBytes;
     }
 
     void startSeg(int32_t segnum) override {

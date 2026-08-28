@@ -198,7 +198,8 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
 enum class AggregateFacetBenchMode {
   BUCKET_DOMAIN,
   INLINE_SORT,
-  INLINE_SORT_CACHE,
+  INLINE_SORT_DENSE,
+  INLINE_SORT_SPARSE,
   INLINE_SORT_GENERIC
 };
 
@@ -233,9 +234,9 @@ static AggregateFacetRunStats measureFacetRuns(
 // A deliberately small corpus keeps these aggregate hot-path lanes useful in
 // routine --bench runs. BUCKET_DOMAIN measures the ordinary aggregate
 // calculator over selected facet domains; INLINE_SORT measures per-document
-// causal expression-metric accumulation, INLINE_SORT_CACHE adds the general
-// ord-to-entry cache, and INLINE_SORT_GENERIC keeps the same lane on the
-// fallback state layout.
+// causal expression-metric accumulation, the DENSE/SPARSE modes pin the entry
+// representation, and INLINE_SORT_GENERIC keeps the same lane on the fallback
+// state layout.
 static void BM_AggregateFacet(benchmark::State& state,
                               AggregateFacetBenchMode mode,
                               int32_t bucketCardinality) {
@@ -250,19 +251,27 @@ static void BM_AggregateFacet(benchmark::State& state,
   SearchOverridesGuard guard(forcedFacetFeedStrategy,
                               forcedFacetSubOpInline,
                               inlineAggregateStatsForTests,
+                              inlineFacetEntryStatsForTests,
                               disableDenseFacetStateForTests,
-                              enableInlineFacetEntryCache);
+                              forcedInlineFacetEntryMode);
   forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
   forcedFacetSubOpInline = mode != AggregateFacetBenchMode::BUCKET_DOMAIN
       ? FacetSubOpInlineMode::ALL
       : FacetSubOpInlineMode::SORT_KEY_ONLY;
   disableDenseFacetStateForTests =
       mode == AggregateFacetBenchMode::INLINE_SORT_GENERIC;
-  enableInlineFacetEntryCache =
-      mode == AggregateFacetBenchMode::INLINE_SORT_CACHE;
+  forcedInlineFacetEntryMode =
+      mode == AggregateFacetBenchMode::INLINE_SORT_DENSE
+          ? InlineFacetEntryMode::FORCE_DENSE
+      : mode == AggregateFacetBenchMode::INLINE_SORT_SPARSE
+          ? InlineFacetEntryMode::FORCE_SPARSE
+          : InlineFacetEntryMode::AUTO;
   InlineAggregateStats inlineStats;
+  InlineFacetEntryStats entryStats;
   inlineAggregateStatsForTests = mode != AggregateFacetBenchMode::BUCKET_DOMAIN
       ? &inlineStats : nullptr;
+  inlineFacetEntryStatsForTests = mode != AggregateFacetBenchMode::BUCKET_DOMAIN
+      ? &entryStats : nullptr;
 
   int64_t fingerprint = -1;
   for (auto _ : state) {
@@ -324,10 +333,18 @@ static void BM_AggregateFacet(benchmark::State& state,
     ASSERT_EQ(finalizedPeak, inlineStats.peakFinalizedBytes.load());
     ASSERT_EQ(mode != AggregateFacetBenchMode::INLINE_SORT_GENERIC ? 17 : 26,
               inlineStats.stateBytesPerBucket.load());
+    ASSERT_EQ(sizeof(int64_t) + inlineStats.stateBytesPerBucket.load(),
+              entryStats.entryStride.load());
     state.counters["finalized_peak"] =
         (double)inlineStats.peakFinalizedBytes.load();
     state.counters["state_bytes"] =
         (double)inlineStats.stateBytesPerBucket.load();
+    state.counters["entry_stride"] =
+        (double)entryStats.entryStride.load();
+    state.counters["dense_tables"] =
+        (double)entryStats.denseTables.load();
+    state.counters["sparse_tables"] =
+        (double)entryStats.sparseTables.load();
   }
 }
 
@@ -406,11 +423,17 @@ LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_1k,
                         AggregateFacetBenchMode::INLINE_SORT, 1000);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_10k,
                         AggregateFacetBenchMode::INLINE_SORT, 10'000);
-LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_cache_10,
-                        AggregateFacetBenchMode::INLINE_SORT_CACHE, 10);
-LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_cache_1k,
-                        AggregateFacetBenchMode::INLINE_SORT_CACHE, 1000);
-LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_cache_10k,
-                        AggregateFacetBenchMode::INLINE_SORT_CACHE, 10'000);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_dense_10,
+                        AggregateFacetBenchMode::INLINE_SORT_DENSE, 10);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_dense_1k,
+                        AggregateFacetBenchMode::INLINE_SORT_DENSE, 1000);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_dense_10k,
+                        AggregateFacetBenchMode::INLINE_SORT_DENSE, 10'000);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_sparse_10,
+                        AggregateFacetBenchMode::INLINE_SORT_SPARSE, 10);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_sparse_1k,
+                        AggregateFacetBenchMode::INLINE_SORT_SPARSE, 1000);
+LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_sparse_10k,
+                        AggregateFacetBenchMode::INLINE_SORT_SPARSE, 10'000);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_generic,
                         AggregateFacetBenchMode::INLINE_SORT_GENERIC, 10'000);
