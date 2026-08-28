@@ -1737,21 +1737,21 @@ public:
     static bool visitChildOrds(
         int32_t docid, OrdColReader& childColumn,
         OrdColReader::Iterator& childIterator,
-        OrdMap::SegToGlobal::BulkGlobalOrds& childGlobalOrds,
+        const OrdMap::SegToGlobal& childMapping,
         Visit&& visit) {
       if (childIterator.docId() < docid) childIterator.advance(docid);
       if (childIterator.docId() != docid) return false;
       if constexpr (!ChildMulti) {
         int32_t storedOrd = childIterator.value();
         if (storedOrd == 0) return false;
-        visit(childGlobalOrds.globalOrd((int64_t)storedOrd - 1));
+        visit(childMapping.globalOrd((int64_t)storedOrd - 1));
         return true;
       } else {
         auto [start, end] = childColumn.getStartEndValueRank(
             childIterator.rank());
         for (int64_t rank = start; rank < end; rank++) {
           int32_t storedOrd = childIterator.values().valueAt(rank);
-          visit(childGlobalOrds.globalOrd((int64_t)storedOrd - 1));
+          visit(childMapping.globalOrd((int64_t)storedOrd - 1));
         }
         return start != end;
       }
@@ -1763,7 +1763,7 @@ public:
         Bank& bank, const SelectedMap& selectedMap,
         OrdColReader& parentColumn, int32_t maxDoc, DocSet* domain,
         OrdColReader* childColumn, OrdColReader::Iterator* childIterator,
-        OrdMap::SegToGlobal::BulkGlobalOrds* childGlobalOrds,
+        const OrdMap::SegToGlobal* childMapping,
         std::vector<int64_t>& missingCounts,
         int64_t& routedDocs, int64_t& routedValues) {
       int64_t numChildOrds = child.ordMap->numOrds();
@@ -1775,7 +1775,7 @@ public:
             bool haveChildValue = false;
             if constexpr (ChildPresent) {
               haveChildValue = visitChildOrds<ChildMulti>(
-                  docid, *childColumn, *childIterator, *childGlobalOrds,
+                  docid, *childColumn, *childIterator, *childMapping,
                   [&](int64_t ord) LUXIR_INLINE {
                     for (int32_t owner : owners) {
                       StrFacetReplayBank::increment(
@@ -1820,13 +1820,11 @@ public:
       std::optional<OrdColReader> childColumn;
       std::optional<OrdColReader::Iterator> childIterator;
       auto childMapping = child.ordMap->getSegToGlobal(segnum);
-      std::optional<OrdMap::SegToGlobal::BulkGlobalOrds> childGlobalOrds;
       if (childFieldFound) {
         childFieldInfo.emplace();
         childFieldReader.readFieldInfo(*childFieldInfo);
         childColumn.emplace(postingsReader, *childFieldInfo);
         childIterator.emplace(*childColumn);
-        childGlobalOrds.emplace(childMapping);
       }
 
       if (!childFieldFound && !child.missing) {
@@ -1849,12 +1847,12 @@ public:
         } else if (childColumn->multiValued()) {
           replayValues<TrackProfile, true, true>(
               bank, selectedMap, parentColumn, maxDoc, domain,
-              &*childColumn, &*childIterator, &*childGlobalOrds,
+              &*childColumn, &*childIterator, &childMapping,
               missingCounts, routedDocs, routedValues);
         } else {
           replayValues<TrackProfile, true, false>(
               bank, selectedMap, parentColumn, maxDoc, domain,
-              &*childColumn, &*childIterator, &*childGlobalOrds,
+              &*childColumn, &*childIterator, &childMapping,
               missingCounts, routedDocs, routedValues);
         }
       });
