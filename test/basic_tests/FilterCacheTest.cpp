@@ -1222,6 +1222,31 @@ TEST(FilterCacheTest, publicationRevalidatesPurgeCoreAndIdentity) {
             wrongSize.get(key)->probe(0).kind());
 }
 
+TEST(FilterCacheTest, routedAccountingOwnsRejectedSegmentValue) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array oldSegments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(4, oldSegments);
+  RequestMemTracker tracker(0);
+
+  {
+    FilterCache::UseRegistry request(cache, 4, oldSegments);
+    auto* use = request.get(FilterKey("routed-stale-segment"));
+    use->enableRoutedAccounting(0, tracker, "segment 0");
+    auto claim = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+
+    std::array newSegments{FilterCache::SegmentIdentity{2, 100}};
+    cache.onReaderPublished(5, newSegments);
+    auto value = use->publishRaw(
+        0, claim, docs(100, {3, 7}), 1);
+    EXPECT_EQ(value->ramBytesUsed(), tracker.bytes());
+    EXPECT_EQ(0u, cache.bytesUsed());
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
 TEST(FilterCacheTest, oldSchemaPopulationCannotHitNewSchemaKey) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
@@ -4058,6 +4083,39 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   EXPECT_EQ(0u, cache->bytesUsed());
   EXPECT_EQ(1u, cache->counters().publishRejects);
   ASSERT_NO_THROW(cache->validateForTest());
+}
+
+TEST(FilterCacheTest, routedAccountingOwnsRejectedReaderValue) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addTermDoc(writer, "body");
+  writer.commit();
+  auto reader = writer.getIndexReader();
+  auto domains = canonicalDomains(*reader);
+  auto identities = readerIdentitiesForTest(*reader);
+
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  cache.onReaderPublished(*reader);
+  RequestMemTracker tracker(0);
+
+  {
+    FilterCache::UseRegistry request(cache, *reader);
+    auto* use = request.get(
+        FilterKey("routed-stale-reader"), FilterKeyScope::READER_STABLE);
+    use->enableRoutedAccounting(0, tracker, "segment 0");
+    auto claim = use->probeReaderStable(*reader, domains);
+    ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, claim.kind());
+
+    ASSERT_TRUE(cache.onReaderPublished(
+        reader->coreGen(), reader->commitTime() + 1, identities));
+    auto value = use->publishReaderStable(
+        claim, oneDocPerSegment(*reader), 1);
+    EXPECT_EQ(value->ramBytesUsed(), tracker.bytes());
+    EXPECT_EQ(0u, cache.bytesUsed());
+  }
+  EXPECT_EQ(0u, tracker.bytes());
 }
 
 TEST(FilterCacheTest, readerPublishRaceCannotResurrectStaleValue) {

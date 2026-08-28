@@ -479,11 +479,18 @@ inline void recordProhibitedCacheRoute(
   }
 }
 
+enum class MaterializeMode : uint8_t {
+  ORDINARY,
+  DOMAIN_DRIVEN,
+};
+
 inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
                                            IndexReader::Segment& segment,
                                            DocSet* domain,
                                            Query::SupplierExecutionMode executionMode =
-                                               Query::SupplierExecutionMode::ORDINARY) {
+                                               Query::SupplierExecutionMode::ORDINARY,
+                                           MaterializeMode materializeMode =
+                                               MaterializeMode::ORDINARY) {
   // Used from prepare() paths, which can run deep in a work-stealing stack.
   // Use the thread-local pool (its inline buffer lives in TLS, not on this
   // stack frame) rather than a stack-resident MemPool, and keep scorer
@@ -493,36 +500,43 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
   DocSetBuilder builder(segment.maxDoc());
   auto* supplier = source.scorerSupplier(scratch, segment, executionMode);
   if (supplier != nullptr) {
-    Query::ScorerSupplier::BulkScorerContext bulkContext;
-    auto plan = supplier->planBulk(
-        Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
-    bool plannedNo =
-        plan.available == Query::ScorerSupplier::BulkAnswer::NO;
-    if (plannedNo) {
-      supplier->recordBulkPlanCommitment(
-          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-          bulkContext, plan);
-    }
-    auto* bulk = plannedNo ? nullptr : supplier->buildBulk(scratch, plan);
-    if (bulk != nullptr) {
-      if (domain == nullptr
-          && !disableDirectPostingsMaterializationForTests
-          && bulk->appendDocs(builder)) {
+    if (materializeMode == MaterializeMode::ORDINARY) {
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto plan = supplier->planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+      bool plannedNo =
+          plan.available == Query::ScorerSupplier::BulkAnswer::NO;
+      if (plannedNo) {
+        supplier->recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, plan);
+      }
+      auto* bulk = plannedNo ? nullptr : supplier->buildBulk(scratch, plan);
+      if (bulk != nullptr) {
+        if (domain == nullptr
+            && !disableDirectPostingsMaterializationForTests
+            && bulk->appendDocs(builder)) {
+          return builder.build();
+        }
+        int64_t count = 0;
+        for (int32_t cursor = 0;
+             cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+          int32_t next = bulk->countNextWindow(
+              count, &builder, domain, cursor, segment.maxDoc());
+          if (next == PostingsReader::END) break;
+          assert(next > cursor);
+          cursor = next;
+        }
+        assert(count == builder.card());
         return builder.build();
       }
-      int64_t count = 0;
-      for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
-        int32_t next = bulk->countNextWindow(count, &builder, domain, cursor, segment.maxDoc());
-        if (next == PostingsReader::END) break;
-        assert(next > cursor);
-        cursor = next;
-      }
-      assert(count == builder.card());
-      return builder.build();
     }
 
     Query::Demand demand = Query::Demand::fromLeadCost(
-        std::numeric_limits<int64_t>::max());
+        materializeMode == MaterializeMode::DOMAIN_DRIVEN
+                && domain != nullptr
+            ? domain->card()
+            : std::numeric_limits<int64_t>::max());
     Query::ScorerPlan* scorerPlan = supplier->resolve(
         scratch, supplier->makePlanContext(demand));
     auto* scorer = scorerPlan->build(scratch);
@@ -535,7 +549,8 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
         if (doc == PostingsReader::END) break;
         builder.add(doc);
       }
-    } else if (domain->type == DocSet::Type::BITSET) {
+    } else if (domain->type == DocSet::Type::BITSET
+               && materializeMode == MaterializeMode::ORDINARY) {
       const FixedBitSet& bits = ((BitDocSet*) domain)->bits();
       for (;;) {
         auto doc = scorer->next();
@@ -545,23 +560,38 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
         }
       }
     } else {
-      // Sparse array domain: drive from the array and advance the scorer,
-      // galloping the array cursor to wherever the scorer lands.
-      std::span<int32_t> docs = ((ArrDocSet*) domain)->docs();
-      const int32_t* p = docs.data();
-      const int32_t* end = p + docs.size();
-      while (p != end) {
-        int32_t target = *p;
+      // Domain-driven materialization makes the selective eligibility set the
+      // lead for either representation. The ordinary ARRAY path is already
+      // filter-driven and shares this implementation.
+      auto consume = [&](int32_t target) {
         if (scorer->docId() < target && scorer->advance(target) == PostingsReader::END) {
-          break;
+          return false;
         }
-        int32_t landing = scorer->docId();
-        if (landing == target) {
+        if (scorer->docId() == target) {
           builder.add(target);
-          p++;
-        } else {
-          assert(landing > target);
-          p = screaming::gallopLowerBound(p + 1, end, landing);
+        }
+        return true;
+      };
+      if (domain->type == DocSet::Type::BITSET) {
+        const FixedBitSet& bits = ((BitDocSet*) domain)->bits();
+        int32_t doc = bits.nextSetBit(0);
+        while (doc < segment.maxDoc() && consume(doc)) {
+          doc = bits.nextSetBit(
+              std::max(doc + 1, scorer->docId()));
+        }
+      } else {
+        // The scorer can leap beyond multiple ARRAY entries. Gallop the
+        // eligibility cursor to its landing instead of advancing one by one.
+        std::span<int32_t> docs = ((ArrDocSet*) domain)->docs();
+        const int32_t* p = docs.data();
+        const int32_t* end = p + docs.size();
+        while (p != end) {
+          int32_t target = *p;
+          if (!consume(target)) break;
+          int32_t landing = scorer->docId();
+          p = landing == target
+              ? p + 1
+              : screaming::gallopLowerBound(p + 1, end, landing);
         }
       }
     }
@@ -574,11 +604,13 @@ inline std::unique_ptr<DocSet> materialize(Query::Weight& weight,
                                            IndexReader::Segment& segment,
                                            DocSet* domain,
                                            Query::SupplierExecutionMode executionMode =
-                                               Query::SupplierExecutionMode::ORDINARY) {
+                                               Query::SupplierExecutionMode::ORDINARY,
+                                           MaterializeMode materializeMode =
+                                               MaterializeMode::ORDINARY) {
   Query::SegmentSource& source = prepared != nullptr
     ? static_cast<Query::SegmentSource&>(*prepared)
     : static_cast<Query::SegmentSource&>(weight);
-  return materialize(source, segment, domain, executionMode);
+  return materialize(source, segment, domain, executionMode, materializeMode);
 }
 
 // Prepared source over one pinned whole-reader cache value. This is distinct

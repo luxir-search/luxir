@@ -272,6 +272,32 @@ TEST_F(FusionOpTest, routedSharedFilterIsRejected) {
       << lreq->errorMsg();
 }
 
+TEST_F(FusionOpTest, routedSourceFilterExplainsIgnoredOps) {
+  CollectionHelper helper("main");
+  helper.index(flatdoc("foo_w", "apple", "color_s", "red"),
+               UpdateMessage::COMMIT);
+
+  auto lreq = localReq(luxirNode->getSearchEngine());
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.rrf.emplace().k = 60;
+  auto& source = addSource(fusion, "text", mr);
+  setTextSource(source, mr, "foo_w", "apple", 10);
+  addFilter(
+      source.filter, qb::match(mr, "color_s", "red"), mr, {"ignored"});
+
+  ExpectLog quiet("Search request failed:");
+  lreq->execute();
+  EXPECT_NE(lreq->errorMsg().find("fusion source 'text'.filter[0].except_ops"),
+            std::string::npos)
+      << lreq->errorMsg();
+  EXPECT_NE(lreq->errorMsg().find(
+                "per-source ops are ignored under Fusion, so filter routing has no target"),
+            std::string::npos)
+      << lreq->errorMsg();
+}
+
 TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   CollectionHelper h("main");
   h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(

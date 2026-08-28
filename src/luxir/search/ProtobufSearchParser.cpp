@@ -38,6 +38,7 @@ namespace {
 struct SearchParserImpl {
   SearchRequest& req;
   TopDocsReq* firstQuery = nullptr;
+  size_t nonDefaultDomainVariants = 0;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
@@ -663,14 +664,42 @@ public:
     // limit to actual number of docs in the index (or all if limit == -1)
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
+    if (placement == TopDocsPlacement::FUSION_SOURCE) {
+      for (size_t i = 0; i < topDocsReq.filter.size(); i++) {
+        if (!topDocsReq.filter[i].except_ops.empty()) {
+          throw std::runtime_error(
+              "fusion source '" + std::string(name) + "'.filter["
+              + std::to_string(i)
+              + "].except_ops: per-source ops are ignored under Fusion, so "
+                "filter routing has no target");
+        }
+      }
+    }
     auto filters = parseFilters(parser, topDocsReq.filter, topDocsReq.ops, false);
 
-    // Stage 1 gate: validation and parse-product retention are complete, but
-    // execution does not route filters around sibling ops until the next stage.
-    for (size_t i = 0; i < filters.size(); i++) {
-      if (!filters[i].exceptOps.empty()) {
-        throw std::runtime_error("top_docs.filter[" + std::to_string(i)
-            + "].except_ops: multi-select filter routing is not implemented yet");
+    DomainVariantPlan domainVariants;
+    bool routedFilters = std::any_of(
+        filters.begin(), filters.end(), [](const ParsedFilter& filter) {
+          return !filter.exceptOps.empty();
+        });
+    if (routedFilters) {
+      domainVariants.begin(filters.size());
+      for (auto& [key, searchOp] : lastWins(topDocsReq.ops)) {
+        unused(searchOp);
+        size_t before = domainVariants.nonDefaultVariantCount();
+        domainVariants.addChild(key, [&](size_t filter) {
+          return std::ranges::find(filters[filter].exceptOps, key)
+              != filters[filter].exceptOps.end();
+        });
+        if (domainVariants.nonDefaultVariantCount() != before) {
+          if (nonDefaultDomainVariants
+              >= DomainVariantPlan::MAX_NON_DEFAULT_VARIANTS) {
+            throw std::runtime_error(
+                "op '" + std::string(key)
+                + "': routed filter variant cap 64 exceeded");
+          }
+          nonDefaultDomainVariants++;
+        }
       }
     }
 
@@ -687,7 +716,7 @@ public:
       .needExactCount = topDocsReq.get_number,
       .needExactDomain = attachSubOps && !topDocsReq.ops.empty()
     };
-    bool foldFilters = !filters.empty()
+    bool foldFilters = !routedFilters && !filters.empty()
         && !disableTopDocsFilterFold
         && !countClauseDisabled;
     if (foldFilters) {
@@ -806,7 +835,8 @@ public:
     bool cacheFirstExactDomain = false;
     bool constantExactDomainRanking = requirements.needRankedDocs
         && scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE;
-    bool canOmitForExactDomain = placement == TopDocsPlacement::ROOT_OP
+    bool canOmitForExactDomain = !routedFilters
+        && placement == TopDocsPlacement::ROOT_OP
         && requirements.needExactDomain && !parsedSorts.useFieldSort
         && (!requirements.needRankedDocs || constantExactDomainRanking)
         && cache != nullptr && cache->enabled();
@@ -886,6 +916,16 @@ public:
     }
     auto* weight = omitMainWeight
         ? nullptr : query->createWeight(*qcontext, mainWeightFlags);
+    Query::Weight* variantMembershipWeight = nullptr;
+    if (routedFilters) {
+      assert(weight != nullptr);
+      int32_t membershipFlags =
+          requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+      variantMembershipWeight =
+          !weight->needsScores() && !weight->allowsPruning()
+              ? weight
+              : query->createWeight(*qcontext, membershipFlags);
+    }
     if (cacheFirstTopKCount && weight != nullptr) {
       skipCount(SkipStats::cacheFirstTopKRankingWeights);
     }
@@ -926,7 +966,7 @@ public:
       : buildFilterWeights(filters, *qcontext, requestFlags);
     Query::Weight* domainQueryWeight = nullptr;
     std::span<Query::Weight*> domainFilterWeights;
-    if (!cacheFirstExactDomain && requirements.needExactDomain
+    if (!routedFilters && !cacheFirstExactDomain && requirements.needExactDomain
         && (!requirements.needRankedDocs
             || (constantExactDomainRanking
                 && !parsedSorts.useFieldSort))) {
@@ -1079,13 +1119,14 @@ public:
 
     auto* qr = luxir::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *planningContext, qcontext,
-      query, weight,
+      query, weight, variantMembershipWeight,
       countWeight, rankingWeight, limit, std::move(parsedSorts),
       requirements, wholeMembershipWeight, wholeRankingWeight,
       wholeMembershipUse, wholeFieldSortCacheRoutes,
       wholeConstantRanking, scoreProfile,
       (requestFlags & Query::NEED_SCORES) != 0,
-      filters, filterWeights, domainQuery, domainQueryWeight,
+      filters, filterWeights, std::move(domainVariants),
+      domainQuery, domainQueryWeight,
       domainFilterWeights, residentExactDomainUses);
 
     if (firstQuery == nullptr) {

@@ -7,10 +7,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +21,7 @@
 
 #include "luxir/search/DocSet.h"
 #include "luxir/search/FilterKey.h"
+#include "luxir/search/RequestMemTracker.h"
 
 namespace luxir {
 
@@ -300,8 +303,25 @@ public:
       bool rawOwned = false;
       std::unique_ptr<DocSet> ownedRaw;
       std::vector<std::shared_ptr<const SegmentValue>> pins;
+      std::vector<std::shared_ptr<const SegmentValue>> requestOwnedPins;
       std::unique_ptr<DocSet> liveEffective;
       std::vector<DomainEffective> domainEffective;
+      RequestMemTracker* routedTracker = nullptr;
+      size_t routedBytes = 0;
+      std::string routedDetail;
+
+      void chargeRouted(size_t bytes) {
+        if (routedTracker == nullptr || bytes == 0) return;
+        if (bytes > std::numeric_limits<size_t>::max() - routedBytes) {
+          routedTracker->chargeOverflow("domain variants", routedDetail);
+        }
+        routedTracker->charge(bytes, "domain variants", routedDetail);
+        routedBytes += bytes;
+      }
+
+      ~RequestSlot() {
+        if (routedTracker != nullptr) routedTracker->release(routedBytes);
+      }
     };
 
     FilterCache* cache;
@@ -322,6 +342,10 @@ public:
     bool admitted;
     std::mutex readerStateMutex;
     std::shared_ptr<const ReaderValue> readerPin;
+    bool readerPinRequestOwned = false;
+    RequestMemTracker* readerRoutedTracker = nullptr;
+    size_t readerRoutedBytes = 0;
+    std::string readerRoutedDetail;
     uint8_t observedAdmissionLanes = 0;
     uint8_t readerAdmissionRecordedLanes = 0;
 
@@ -338,12 +362,17 @@ public:
     friend class ExistingCandidate;
 
     void pinValue(size_t segmentOrd,
-                  const std::shared_ptr<const SegmentValue>& value);
-    void pinReaderValue(const std::shared_ptr<const ReaderValue>& value);
+                  const std::shared_ptr<const SegmentValue>& value,
+                  bool requestOwned = false);
+    void pinReaderValue(
+        const std::shared_ptr<const ReaderValue>& value,
+        bool requestOwned = false);
     void releaseRequestClaim(size_t segmentOrd);
     bool allowsSegmentPopulation(int32_t maxDoc) const;
 
   public:
+    ~Use();
+
     Probe probe(size_t segmentOrd);
     ReaderProbe probeReaderStable(
         IndexReader& reader, std::span<DocSet* const> domainPerSeg);
@@ -369,6 +398,9 @@ public:
     DocSet* rawDocSet(size_t segmentOrd);
     DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader,
                             DocSet* domain = nullptr);
+    void enableRoutedAccounting(
+        size_t segmentOrd, RequestMemTracker& tracker,
+        std::string_view detail);
     bool wasAdmitted() const { return admitted; }
     bool hasAcceptedExisting() const { return existingAccepted; }
     FilterKeyScope scope() const { return scope_; }
@@ -475,6 +507,9 @@ public:
     // domain before lookup; effectiveDocSet rechecks before serving values.
     Use* acceptExisting(
         ExistingCandidate&& candidate, AdmissionLane lane);
+    void enableRoutedAccounting(
+        size_t segmentOrd, RequestMemTracker& tracker,
+        std::string_view detail);
     size_t size() const { return uses.size(); }
     size_t ownedBytesForTest();
   };

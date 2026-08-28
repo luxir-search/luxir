@@ -15,6 +15,7 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/EmitDocs.h"
 #include "luxir/search/FieldSortCollector.h"
 #include "luxir/search/MergeableCollector.h"
@@ -347,6 +348,7 @@ public:
   Query::Context* weightContext;
   Query* query;
   Query::Weight* weight;
+  Query::Weight* variantMembershipWeight;
   Query::Weight* countWeight;
   Query::Weight* rankingWeight;
   Query::Weight* wholeRankingWeight;
@@ -357,6 +359,7 @@ public:
   std::span<ParsedFilter> filters;
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
+  DomainVariantPlan domainVariants;
   CollectionRequirements requirements;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
@@ -394,11 +397,20 @@ public:
       };
 
       if (op.subOps.size() > 0) {
-        output.resize(op.req.reader->segments().size());
+        if (op.domainVariants.empty()) {
+          output.resize(op.req.reader->segments().size());
+        }
         subCalcs.reserve(op.subOps.size());
+        if (!op.domainVariants.empty()) {
+          subCalcVariants.reserve(op.subOps.size());
+        }
         for (auto& [key, subOp] : op.subOps) {
           auto* subCalc = subOp->createCalculator(this, -1);
           subCalcs.emplace_back(subCalc);
+          if (!op.domainVariants.empty()) {
+            subCalcVariants.push_back(
+                op.domainVariants.variantForChild(key));
+          }
         }
       }
       requiresPreparePhase =
@@ -432,6 +444,7 @@ public:
     // collected set or borrows request-pinned cache state.
     std::vector<DomainHandle> output;
     std::vector<std::unique_ptr<Calculator>> subCalcs;
+    std::vector<size_t> subCalcVariants;
 
     // Prepared path state. Root delivery already supplies every segment
     // domain at once. A nested streaming parent can still use the per-segment
@@ -447,6 +460,9 @@ public:
     std::vector<DomainHandle> effectiveDomains;
     std::vector<DocSet*> effectiveDomainViews;
     std::vector<QueryPrep::PreparedSource> preparedFilterSources;
+    std::vector<std::vector<DomainHandle>> preparedRoutedFilters;
+    std::vector<std::shared_ptr<DomainVariantPlan::Reservation>>
+        preparedRoutedReservations;
     std::unique_ptr<Query::Weight::PreparedWeight> preparedWeight;
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -778,8 +794,72 @@ public:
         baseDomains,
         tg != nullptr
       };
+      bool routed = !op.domainVariants.empty();
+      bool mainNeedsPrepare = op.weight != nullptr
+          && (op.wholeMembershipPlan.preparesMainWeight(*op.weight)
+              || op.weight->needsPrepare());
+      if (routed) {
+        size_t segmentCount = op.req.reader->segments().size();
+        if (mainNeedsPrepare) {
+          preparedRoutedFilters.resize(segmentCount);
+          preparedRoutedReservations.resize(segmentCount);
+        }
+        for (size_t i = 0; i < segmentCount; i++) {
+          auto& seg = op.req.reader->segments()[i];
+          std::string detail = "top_docs '" + std::string(op.name)
+              + "' segment " + std::to_string(i);
+          if (mainNeedsPrepare) {
+            preparedRoutedReservations[i] =
+                op.domainVariants.reserveProduction(
+                    op.req.memoryTracker, seg.maxDoc(), detail);
+          }
+          op.planning.filterUses->enableRoutedAccounting(
+              i, op.req.memoryTracker, detail);
+        }
+      }
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
+
+      if (routed) {
+        if (mainNeedsPrepare) {
+          for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
+            preparedRoutedFilters[i] = materializeRoutedFilters(
+                (int32_t) i, baseDomains[i],
+                preparedRoutedReservations[i]);
+            effectiveDomains[i] = op.domainVariants.defaultDomain(
+                inputDomains[i], preparedRoutedFilters[i]);
+            assert(effectiveDomains[i].isDeliverable());
+            effectiveDomainViews[i] = effectiveDomains[i].get();
+          }
+          Query::Weight::PrepareContext queryCtx{
+            *op.req.reader,
+            std::span<DocSet* const>(
+                effectiveDomainViews.data(), effectiveDomainViews.size()),
+            tg != nullptr
+          };
+          if (op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
+            preparedWeight =
+                op.wholeMembershipPlan.prepareMainWeight(queryCtx);
+          } else {
+            preparedWeight = op.weight->prepare(queryCtx);
+          }
+          if (preparedWeight != nullptr
+              && preparedWeight->domainDependence()
+                  != PreparedDomainDependence::QUERY_CANONICAL) {
+            throw std::runtime_error(
+                "top_docs '" + std::string(op.name)
+                + "': per-variant preparation for this query shape is not "
+                  "implemented yet");
+          }
+          effectiveDomainViews.clear();
+          effectiveDomains.clear();
+        }
+        dispatch(
+            tg,
+            std::span<const DomainHandle>(
+                inputDomains.data(), inputDomains.size()));
+        return;
+      }
 
       for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
         if (op.filterWeights.empty()) {
@@ -824,6 +904,159 @@ public:
       }
     }
 
+    std::vector<DomainHandle> materializeRoutedFilters(
+        int32_t segnum, DocSet* baseDomain,
+        const std::shared_ptr<DomainVariantPlan::Reservation>& reservation) {
+      auto& op = thisOp();
+      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      std::vector<DomainHandle> filters;
+      filters.reserve(op.filterWeights.size());
+      for (size_t i = 0; i < op.filterWeights.size(); i++) {
+        DomainHandle filter = requiresPreparePhase
+            ? QueryPrep::materializeEffectiveFilter(
+                  preparedFilterSources[i], *op.req.reader, seg, baseDomain)
+            : QueryPrep::materializeEffectiveFilter(
+                  *op.filterWeights[i], op.filterUses[i],
+                  *op.req.reader, seg, baseDomain);
+        if (filter.get() != nullptr && filter.isDeliverable()) {
+          reservation->grow(filter.get()->ramBytesUsed());
+        }
+        filters.push_back(
+            std::move(filter).pinnedWith(op.planning.filterUses));
+        assert(filters.back().isDeliverable());
+      }
+      return filters;
+    }
+
+    struct RoutedProduction {
+      DomainHandle defaultEligibility;
+      std::vector<DomainHandle> filters;
+      std::vector<DomainHandle> domains;
+      std::shared_ptr<DomainVariantPlan::Reservation> reservation;
+      bool captureSharedRaw = false;
+
+      bool domainsReady() const { return !domains.empty(); }
+    };
+
+    Query::SegmentSource& variantMembershipSource() {
+      auto& op = thisOp();
+      if (preparedWeight != nullptr) {
+        return *preparedWeight;
+      }
+      assert(op.variantMembershipWeight != nullptr);
+      return *op.variantMembershipWeight;
+    }
+
+    RoutedProduction prepareRoutedProduction(
+        MemPool& pool, int32_t segnum, DomainHandle baseDomain) {
+      auto& op = thisOp();
+      assert(!op.domainVariants.empty());
+      assert(baseDomain.isDeliverable());
+      auto& seg = op.planning.topReader.segments()[(size_t) segnum];
+      std::string detail = "top_docs '" + std::string(op.name)
+          + "' segment " + std::to_string(segnum);
+      RoutedProduction result;
+      std::shared_ptr<DomainVariantPlan::Reservation> reservation;
+      if (preparedRoutedReservations.empty()) {
+        reservation = op.domainVariants.reserveProduction(
+            op.req.memoryTracker, seg.maxDoc(), detail);
+        op.planning.filterUses->enableRoutedAccounting(
+            (size_t) segnum, op.req.memoryTracker, detail);
+        result.filters = materializeRoutedFilters(
+            segnum, baseDomain.get(), reservation);
+      } else {
+        assert((size_t) segnum < preparedRoutedReservations.size());
+        reservation = std::move(
+            preparedRoutedReservations[(size_t) segnum]);
+        result.filters = std::move(
+            preparedRoutedFilters[(size_t) segnum]);
+        assert(reservation != nullptr);
+        if (result.filters.empty()) {
+          result.filters = materializeRoutedFilters(
+              segnum, baseDomain.get(), reservation);
+        }
+      }
+      result.defaultEligibility = op.domainVariants.defaultDomain(
+          baseDomain, result.filters);
+      assert(result.defaultEligibility.isDeliverable());
+
+      Query::SegmentSource& source = variantMembershipSource();
+      bool implicitMatches = op.weight->matchesAllDocs();
+      auto* supplier = implicitMatches
+          ? nullptr : source.scorerSupplier(pool, seg);
+      DocSet* reusableRaw = preparedWeight == nullptr && supplier != nullptr
+          ? supplier->exactDocSet() : nullptr;
+      int64_t rawCost = implicitMatches
+          ? seg.maxDoc() : supplier == nullptr ? 0 : supplier->cost();
+      auto selection = op.domainVariants.selectOffer(
+          rawCost, seg.maxDoc(), baseDomain, result.filters,
+          implicitMatches, reusableRaw != nullptr,
+          op.topCount == 0
+              || (op.weight->isConstantScoring()
+                  && !op.sortPlan.useFieldSort));
+      DomainVariantPlan::CostedOffer selected;
+      bool admitted = false;
+      for (size_t i = 0; i < selection.count; i++) {
+        if (reservation->tryGrow(selection.offers[i].peakBytes)) {
+          selected = selection.offers[i];
+          admitted = true;
+          break;
+        }
+      }
+      if (!admitted) {
+        auto leastMemory = std::min_element(
+            selection.offers.begin(),
+            selection.offers.begin() + (std::ptrdiff_t) selection.count,
+            [](const auto& left, const auto& right) {
+              return left.peakBytes < right.peakBytes;
+            });
+        reservation->grow(leastMemory->peakBytes);
+        selected = *leastMemory;
+      }
+
+      std::vector<DomainHandle> domains;
+      switch (selected.offer) {
+        case DomainVariantPlan::Offer::IDENTITY:
+          result.domains = op.domainVariants.produceShared(
+              baseDomain, result.filters);
+          break;
+        case DomainVariantPlan::Offer::SHARED_M: {
+          if (implicitMatches) {
+            result.domains = op.domainVariants.produceShared(
+                baseDomain, result.filters);
+          } else if (reusableRaw != nullptr) {
+            DomainHandle rawMatches = op.domainVariants.constrainRaw(
+                DomainHandle::pinned(
+                    reusableRaw, op.planning.filterUses),
+                baseDomain);
+            result.domains = op.domainVariants.produceShared(
+                std::move(rawMatches), result.filters);
+          } else {
+            // Capture M in the existing ranking walk. Bulk paths fall back to
+            // scorer-driven collection because their in-window filtering does
+            // not expose pre-filter match words yet.
+            result.captureSharedRaw = true;
+          }
+          break;
+        }
+        case DomainVariantPlan::Offer::INDEPENDENT:
+          result.domains = op.domainVariants.produceIndependent(
+              baseDomain, result.filters, [&](DocSet* eligibility) {
+                return DomainHandle(QueryPrep::materialize(
+                    source, seg, eligibility,
+                    Query::SupplierExecutionMode::ORDINARY,
+                    QueryPrep::MaterializeMode::DOMAIN_DRIVEN));
+              });
+          break;
+      }
+      result.reservation = std::move(reservation);
+      if (result.domainsReady()) {
+        op.domainVariants.retainReservation(
+            result.domains, result.reservation);
+      }
+      return result;
+    }
+
     void doCollect(
         oneapi::tbb::task_group* tg, int32_t segnum,
         DomainHandle domainHandle) {
@@ -841,11 +1074,20 @@ public:
       bool matchEverything = op.weight != nullptr && op.weight->matchesAllDocs()
         && op.weight->isConstantScoring() && op.filterWeights.empty();
       std::unique_ptr<MergeableCollector> data;
+      std::optional<RoutedProduction> routedProduction;
+      DocSet* routedBaseDomain = nullptr;
       int64_t numSegs = (int64_t)op.req.reader->segments().size();
 
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto& seg = op.planning.topReader.segments()[segnum];
+        if (!op.domainVariants.empty()) {
+          routedBaseDomain = domain;
+          routedProduction.emplace(prepareRoutedProduction(
+              poolGuard.pool(), segnum, domainHandle));
+          domainHandle = routedProduction->defaultEligibility;
+          domain = domainHandle.get();
+        }
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         // Keep ownership until release so a scoring error cannot orphan it.
@@ -921,16 +1163,23 @@ public:
             }
           }
         }
+        bool routedDomainsReady = routedProduction.has_value()
+            && routedProduction->domainsReady();
+        bool routedDefaultIdentity = routedDomainsReady
+            && (op.weight->isConstantScoring() || data->topCount() == 0);
         bool identityResult =
             ((wholeMembershipAvailable && !wholeTopKCountAvailable
                                        && !wholeFieldSortAvailable)
              || exactDomain || matchEverything
-             || borrowedDomain != nullptr)
+             || borrowedDomain != nullptr || routedDefaultIdentity)
             && (rankFromDocOrder || data->topCount() == 0);
 
         std::optional<DocSetBuilder> builder;
-        if (output.size() > 0 && !identityResult
-            && !wholeTopKCountAvailable) {
+        bool captureSharedRaw = routedProduction.has_value()
+            && routedProduction->captureSharedRaw;
+        if (captureSharedRaw
+            || (output.size() > 0 && !identityResult
+                && !wholeTopKCountAvailable)) {
           builder.emplace(seg.maxDoc());
         }
 
@@ -983,7 +1232,11 @@ public:
               ? wholeMembershipResult.docs.get()
               : exactDomain
                     ? exactDomainDocs
-                    : borrowedDomain != nullptr ? borrowedDomain : domain;
+                    : borrowedDomain != nullptr
+                          ? borrowedDomain
+                          : routedDomainsReady
+                                ? routedProduction->domains[0].get()
+                                : domain;
           int64_t total = wholeMembershipAvailable
               ? wholeMembershipResult.count
               : identityDomain == nullptr
@@ -1024,7 +1277,8 @@ public:
           // Keeps owned sets or request-pinned cache borrows alive; `filter`
           // may alias one directly, so the handles outlive collection below.
           std::vector<DomainHandle> filters;
-          if (!requiresPreparePhase && !thisOp().filterWeights.empty()) {
+          if (!requiresPreparePhase && op.domainVariants.empty()
+              && !thisOp().filterWeights.empty()) {
             std::vector<DocSet*> filterPtrs;
             for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
               filters.push_back(QueryPrep::materializeEffectiveFilter(
@@ -1066,19 +1320,36 @@ public:
           }
           if (counted) {
             // fall through to the sub-calc/merge tail below
+          } else if (routedDomainsReady && !data->useFieldSort
+                     && op.requirements.needExactCount
+                     && data->scoreCollector->topCount > 0) {
+            int64_t count = routedProduction->domains[0].get() == nullptr
+                ? seg.maxDoc()
+                : routedProduction->domains[0].get()->card();
+            collectKnownCountTopK(
+                poolGuard.pool(), segnum, count, supplier, collectorFilter,
+                *data->scoreCollector, seg.maxDoc(),
+                op.weight->allowsPruning());
           } else if (data->useFieldSort) {
             // Ranking permission and completeness production are separate
             // facts. A known whole-membership card satisfies exact count, but
             // its borrowed set is not a produced sub-op domain.
+            bool routedExactDomain = routedDomainsReady;
             bool mustStreamForCompleteness =
-                (op.requirements.needExactCount && !wholeFieldSortAvailable)
+                (op.requirements.needExactCount && !wholeFieldSortAvailable
+                 && !routedExactDomain)
                 || builderPtr != nullptr;
             bool maySkipNoncompetitiveDocs =
                 !disableFieldSortPruning && !mustStreamForCompleteness;
             // Candidate pruning must beat what the source would still cost:
             // the query estimate, capped by an external filter's cardinality.
             int64_t sortSourceCost = wholeFieldSortAvailable
-                ? wholeMembershipResult.count : supplier->cost();
+                ? wholeMembershipResult.count
+                : routedExactDomain
+                      ? routedProduction->domains[0].get() == nullptr
+                            ? seg.maxDoc()
+                            : routedProduction->domains[0].get()->card()
+                      : supplier->cost();
             if (collectorFilter != nullptr) {
               sortSourceCost = std::min(sortSourceCost,
                                         (int64_t)collectorFilter->card());
@@ -1196,7 +1467,7 @@ public:
             // at least one expected match per key block. forceFieldSortSeeding
             // bypasses only the two economic gates, never correctness or
             // capability.
-            if (!usedBulk && supplier != nullptr
+            if (!usedBulk && supplier != nullptr && !captureSharedRaw
                 && maySkipNoncompetitiveDocs && !disableFieldSortSeeding
                 && !disableFieldSortBulk && !requiresPreparePhase
                 && !data->fieldCollector->needsScores
@@ -1272,7 +1543,8 @@ public:
                 }
               }
             }
-            if (!usedBulk && supplier != nullptr && !disableFieldSortBulk
+            if (!usedBulk && supplier != nullptr && !captureSharedRaw
+                && !disableFieldSortBulk
                 && !data->fieldCollector->needsScores) {
               auto plan = matchWindowsPlan.has_value()
                   ? *matchWindowsPlan
@@ -1316,16 +1588,25 @@ public:
                 }
                 collectTopK(segnum, scorer, collectorFilter, builderPtr,
                             *data->fieldCollector,
-                            maySkipNoncompetitiveDocs);
+                            maySkipNoncompetitiveDocs, nullptr,
+                            captureSharedRaw
+                                ? DomainBuildMode::RAW_QUERY_MATCHES
+                                : DomainBuildMode::FILTERED_MATCHES,
+                            routedBaseDomain);
                 data->fieldCollector->recordSegmentSkipStats(segnum);
               }
             }
             if (op.requirements.needExactCount
-                && wholeFieldSortAvailable) {
+                && (wholeFieldSortAvailable || routedExactDomain)) {
               int64_t collected =
                   data->fieldCollector->hitCount - fieldHitsBefore;
-              assert(wholeMembershipResult.count >= collected);
-              data->addHits(wholeMembershipResult.count - collected);
+              int64_t exactCount = wholeFieldSortAvailable
+                  ? wholeMembershipResult.count
+                  : routedProduction->domains[0].get() == nullptr
+                        ? seg.maxDoc()
+                        : routedProduction->domains[0].get()->card();
+              assert(exactCount >= collected);
+              data->addHits(exactCount - collected);
             }
           } else {
             assert(op.weight != nullptr);
@@ -1377,12 +1658,13 @@ public:
               }
             }
             bool useSparseConstantPull =
-                builderPtr != nullptr
+                builderPtr != nullptr && !captureSharedRaw
                 && data->scoreCollector->topCount > 0
                 && op.weight->isConstantScoring()
                 && op.weight->prefersPullForSparseArrayDomain()
                 && supplier->cost() <= DocSetBuilder::arrayLimitFor(seg.maxDoc());
             auto buildDeclaredBulk = [&]() -> BulkScorer* {
+              if (captureSharedRaw) return nullptr;
               Query::ScorerSupplier::BulkUse use =
                   constantRoute
                           == ConstantScoreDisposition::LIMIT_ONLY
@@ -1481,15 +1763,29 @@ public:
                   collectTopK(
                       segnum, scorer, collectorFilter, builderPtr,
                       *data->scoreCollector, allowPruning,
-                      &scoreAccumulator);
+                      &scoreAccumulator,
+                      captureSharedRaw
+                          ? DomainBuildMode::RAW_QUERY_MATCHES
+                          : DomainBuildMode::FILTERED_MATCHES,
+                      routedBaseDomain);
                 }
               }
             }
           }
         }
         if (builder.has_value()) {
-          output[(size_t)segnum] =
-              DomainHandle(std::move(builder->build()));
+          DomainHandle built(std::move(builder->build()));
+          if (captureSharedRaw) {
+            assert(routedProduction.has_value());
+            routedProduction->domains = op.domainVariants.produceShared(
+                std::move(built), routedProduction->filters);
+            op.domainVariants.retainReservation(
+                routedProduction->domains,
+                routedProduction->reservation);
+            routedProduction->captureSharedRaw = false;
+          } else {
+            output[(size_t)segnum] = std::move(built);
+          }
         }
       }
       // For maximum parallelism, we want to launch sub-tasks that depend on matching documents
@@ -1504,8 +1800,17 @@ public:
       // launch the sub-calculators in parallel after that.
       for (int i = subCalcs.size() - 1; i >= 0; i--) {
         // TODO: launch sub-calculators in parallel (except for the first one).
-        DomainHandle newDomain = matchEverything
-            ? domainHandle : output[(size_t)segnum];
+        DomainHandle newDomain;
+        if (routedProduction.has_value()) {
+          assert(routedProduction->domainsReady());
+          assert(subCalcs.size() == subCalcVariants.size());
+          size_t variant = subCalcVariants[(size_t) i];
+          assert(variant < routedProduction->domains.size());
+          newDomain = routedProduction->domains[variant];
+        } else {
+          newDomain = matchEverything
+              ? domainHandle : output[(size_t)segnum];
+        }
         assert(newDomain.isDeliverable());
         subCalcs[i]->calc(tg, segnum, std::move(newDomain));
       }
@@ -1551,6 +1856,7 @@ public:
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::PlanningContext& planning, Query::Context* weightContext,
     Query* query, Query::Weight* weight,
+    Query::Weight* variantMembershipWeight,
     Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
     SortPlan&& sortPlan, CollectionRequirements requirements,
     Query::Weight* wholeMembershipWeight,
@@ -1561,16 +1867,19 @@ public:
     bool requestNeedsScores,
     std::span<ParsedFilter> filters,
     std::span<Query::Weight*> filterWeights,
+    DomainVariantPlan&& domainVariants,
     Query* domainQuery, Query::Weight* domainQueryWeight,
     std::span<Query::Weight*> domainFilterWeights,
     std::span<FilterCache::Use*> residentExactDomainUses)
     : SearchOp(req, name), topDocsProto(topDocsProto), planning(planning),
       weightContext(weightContext), query(query),
-      weight(weight), countWeight(countWeight), rankingWeight(rankingWeight),
+      weight(weight), variantMembershipWeight(variantMembershipWeight),
+      countWeight(countWeight), rankingWeight(rankingWeight),
       wholeRankingWeight(wholeRankingWeight),
       wholeConstantRanking(wholeConstantRanking), scoreProfile(scoreProfile),
       requestNeedsScores(requestNeedsScores),
       topCount(topCount), filters(filters), filterWeights(filterWeights),
+      domainVariants(std::move(domainVariants)),
       requirements(requirements),
       sortPlan(std::move(sortPlan)) {
     auto wholeConsumer = this->sortPlan.useFieldSort

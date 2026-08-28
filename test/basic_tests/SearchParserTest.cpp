@@ -480,6 +480,49 @@ TEST_F(SearchParserTest, getNumberControlsPruningWeightFlag) {
   EXPECT_EQ(std::optional<bool>(false), parseAllowsPruning(true));
 }
 
+TEST_F(SearchParserTest, domainVariantPlanIsInertOrDedupedAtParseTime) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "d1", "brand_s", "acme"),
+    flatdoc("id", "d2", "brand_s", "beta"),
+  }, UpdateMessage::COMMIT);
+
+  auto parse = [&](bool routed) {
+    auto request = localReq(helper.getSearchEngine());
+    auto& top = request->collection("main").topDocs("q").allQuery().limit(0);
+    top.facet("a", "brand_s").limit(-1);
+    top.facet("b", "brand_s").limit(-1);
+    top.facet("default", "brand_s").limit(-1);
+    if (routed) {
+      top.filter(qb::match(top.mr(), "brand_s", "acme"), {"a", "b"});
+    } else {
+      top.matchFilter("brand_s", "acme");
+    }
+    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->schema = helper.collection().getSchema();
+    ProtobufSearchParser parser(*request);
+    auto* root = static_cast<RootOp*>(parser.parse());
+    EXPECT_TRUE(root->domainVariants.empty());
+    return std::pair{std::move(request),
+                     dynamic_cast<TopDocsReq*>(root->subOps.at("q"))};
+  };
+
+  auto [ordinaryRequest, ordinary] = parse(false);
+  unused(ordinaryRequest);
+  ASSERT_NE(ordinary, nullptr);
+  EXPECT_TRUE(ordinary->domainVariants.empty());
+  EXPECT_EQ(1, ordinary->domainVariants.variantCount());
+
+  auto [routedRequest, routed] = parse(true);
+  unused(routedRequest);
+  ASSERT_NE(routed, nullptr);
+  EXPECT_FALSE(routed->domainVariants.empty());
+  EXPECT_EQ(1, routed->domainVariants.nonDefaultVariantCount());
+  EXPECT_EQ(routed->domainVariants.variantForChild("a"),
+            routed->domainVariants.variantForChild("b"));
+  EXPECT_EQ(0, routed->domainVariants.variantForChild("default"));
+}
+
 TEST_F(SearchParserTest, opNestingDepthCapped) {
   CollectionHelper helper;
   helper.indexAll(std::array{flatdoc("id", "d1", "body_w", "a")}, UpdateMessage::COMMIT);

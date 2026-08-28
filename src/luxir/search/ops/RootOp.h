@@ -1,11 +1,14 @@
 #pragma once
 
 #include "SearchOp.h"
+#include "luxir/search/DomainVariantPlan.h"
 
 namespace luxir {
 
 class RootOp : public SearchOp {
 public:
+  DomainVariantPlan domainVariants;
+
   RootOp(SearchRequest& req) : SearchOp(req, "root") {
   }
 
@@ -40,6 +43,10 @@ public:
     }
 
     void start(oneapi::tbb::task_group* tg) {
+      // Root-domain messages are not parsed yet, so this stage's root plan is
+      // structurally inert. The same parent-owned seam is ready for that later
+      // syntax without routing through child calculators.
+      assert(static_cast<RootOp&>(op).domainVariants.empty());
       assert(subCalcs.empty());
       subCalcs.reserve(op.subOps.size());
       for (auto [key, subOp] : op.subOps) {

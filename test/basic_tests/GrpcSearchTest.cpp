@@ -232,9 +232,7 @@ TEST_F(GrpcSearchTest, routedFilterValidation) {
   top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
   auto [routedStatus, routedError] = finish(routed->proto);
   EXPECT_TRUE(routedStatus.ok());
-  EXPECT_NE(std::string::npos,
-            routedError.find(
-                "multi-select filter routing is not implemented yet"));
+  EXPECT_TRUE(routedError.empty()) << routedError;
 
   auto missing = localReq(luxirNode->getSearchEngine());
   missing->collection("main");

@@ -9,6 +9,8 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
+#include <set>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -341,6 +343,40 @@ void appendRawFilter(OpCursor& cursor, const api::Query& query) {
   filters[old.size()].query = stored;
 }
 
+void appendRoutedFilter(
+    OpCursor& cursor, const api::Query& query,
+    std::span<const std::string> exceptOps) {
+  auto& topDocs = std::get<api::TopDocs>(cursor.rawOp().kind);
+  auto old = topDocs.filter;
+  api::Filter* filters =
+      api::build::allocArray(topDocs.filter, old.size() + 1, cursor.mr());
+  std::copy(old.begin(), old.end(), filters);
+  auto* stored = (api::Query*) cursor.mr().allocate(
+      sizeof(api::Query), alignof(api::Query));
+  new (stored) api::Query(query);
+  auto& filter = filters[old.size()];
+  filter.query = stored;
+  auto* except = api::build::allocArray(
+      filter.except_ops, exceptOps.size(), cursor.mr());
+  for (size_t i = 0; i < exceptOps.size(); i++) {
+    except[i] = api::build::arenaStr(cursor.mr(), exceptOps[i]);
+  }
+}
+
+api::Query stringInQuery(
+    std::pmr::memory_resource& mr, std::string_view field,
+    std::initializer_list<std::string_view> values) {
+  api::Query query;
+  auto& in = query.kind.emplace<api::InQuery>();
+  in.field = api::build::arenaStr(mr, field);
+  auto* stored = api::build::allocArray(in.values, values.size(), mr);
+  size_t i = 0;
+  for (std::string_view value : values) {
+    stored[i++].kind = api::build::arenaStr(mr, value);
+  }
+  return query;
+}
+
 std::map<std::string, float> resultScoreMap(const LocalReq& req,
                                              std::string_view opName) {
   std::map<std::string, float> out;
@@ -358,13 +394,10 @@ std::map<std::string, float> resultScoreMap(const LocalReq& req,
   return out;
 }
 
-std::map<std::string, int64_t> resultFacetMap(const LocalReq& req,
-                                               std::string_view opName,
-                                               std::string_view facetName) {
+std::map<std::string, int64_t> resultFacetMap(
+    const api::DocList& docs, std::string_view facetName) {
   std::map<std::string, int64_t> out;
-  const auto* docs = req.docList(opName);
-  if (docs == nullptr) return out;
-  const auto* value = docs->ops.find(facetName);
+  const auto* value = docs.ops.find(facetName);
   if (value == nullptr) return out;
   const auto* facet = std::get_if<api::FacetResult>(&(*value)->kind);
   if (facet == nullptr || !facet->bucket_ids.has_value()) return out;
@@ -374,6 +407,15 @@ std::map<std::string, int64_t> resultFacetMap(const LocalReq& req,
     out.emplace(std::string(ids->v[i]), facet->counts[i]);
   }
   return out;
+}
+
+std::map<std::string, int64_t> resultFacetMap(const LocalReq& req,
+                                               std::string_view opName,
+                                               std::string_view facetName) {
+  const auto* docs = req.docList(opName);
+  return docs == nullptr
+      ? std::map<std::string, int64_t>{}
+      : resultFacetMap(*docs, facetName);
 }
 
 void expectSameScoreMap(const std::map<std::string, float>& expected,
@@ -3800,20 +3842,452 @@ TEST_F(SearchEngineTest, opNameCharset) {
   }
 }
 
-TEST_F(SearchEngineTest, jsonRoutedFilterReachesStageGate) {
+TEST_F(SearchEngineTest, jsonRoutedFilterExecutes) {
   CollectionHelper helper;
-  helper.index(flatdoc("brand_s", "acme"), UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "brand_s", "acme"),
+    flatdoc("id", "b", "brand_s", "globex"),
+  }, UpdateMessage::COMMIT);
 
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(
-      R"({"query":"brand_s:acme","filter":[{"query":"brand_s:acme","except_ops":["brands"]}],"ops":{"brands":{"field_facet":{"field":"brand_s"}}}})",
+      R"({"limit":0,"get_number":true,"filter":[{"query":"brand_s:acme","except_ops":["brands"]}],"ops":{"brands":{"field_facet":{"field":"brand_s","limit":-1}}}})",
       req->rawRequest(), req->mr);
   req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"globex", 1}}),
+            resultFacetMap(*req, "q", "brands"));
+}
+
+TEST_F(SearchEngineTest, routedFiltersServeSidewaysFacetsStatsAndDefault) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "color_s", "red",
+            "tags_ss", vecs("x", "y"), "price_i", 10),
+    flatdoc("id", "2", "brand_s", "acme", "color_s", "blue",
+            "tags_ss", vecs("y"), "price_i", 20),
+    flatdoc("id", "3", "brand_s", "beta", "color_s", "red",
+            "tags_ss", vecs("x"), "price_i", 30),
+    flatdoc("id", "4", "brand_s", "beta", "color_s", "blue",
+            "tags_ss", vecs("z"), "price_i", 40),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery()
+      .getNumber().fields({"id"}).limit(-1);
+  top.facet("brands", "brand_s").limit(-1);
+  top.facet("brands_copy", "brand_s").limit(-1);
+  top.facet("colors", "color_s").limit(-1);
+  top.facet("default_tags", "tags_ss").limit(-1);
+  top.sum("price", "price_i");
+  top.filter(
+      qb::match(top.mr(), "brand_s", "acme"),
+      {"brands", "brands_copy", "price"});
+  top.filter(qb::match(top.mr(), "color_s", "red"), {"colors"});
+  req->execute();
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_EQ((std::vector<std::string>{"1"}), resultIds(*req, "q"));
+  const std::map<std::string, int64_t> brands{{"acme", 1}, {"beta", 1}};
+  EXPECT_EQ(brands, resultFacetMap(*req, "q", "brands"));
+  EXPECT_EQ(brands, resultFacetMap(*req, "q", "brands_copy"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"blue", 1}, {"red", 1}}),
+            resultFacetMap(*req, "q", "colors"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"x", 1}, {"y", 1}}),
+            resultFacetMap(*req, "q", "default_tags"));
+  ASSERT_NE(req->docList("q"), nullptr);
+  EXPECT_EQ(40, req->docList("q")->ops.at("price")->asInt());
+}
+
+TEST_F(SearchEngineTest, routedMultiValueFilterComposesWithInQuery) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "tags_ss", vecs("x", "y")),
+    flatdoc("id", "2", "brand_s", "acme", "tags_ss", vecs("y")),
+    flatdoc("id", "3", "brand_s", "beta", "tags_ss", vecs("x", "z")),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->testForcePrepare = true;
+  auto& top = req->collection("main").topDocs("q").allQuery()
+      .getNumber().limit(0);
+  top.facet("tags", "tags_ss").limit(-1);
+  top.filter(stringInQuery(top.mr(), "brand_s", {"acme"}));
+  top.filter(qb::match(top.mr(), "tags_ss", "x"), {"tags"});
+  req->execute();
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_EQ((std::map<std::string, int64_t>{{"x", 1}, {"y", 2}}),
+            resultFacetMap(*req, "q", "tags"));
+}
+
+TEST_F(SearchEngineTest, routedFiltersSupportExpressionSort) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "body_w", "common", "brand_s", "acme",
+            "color_s", "red", "price_i", 30),
+    flatdoc("id", "2", "body_w", "common", "brand_s", "acme",
+            "color_s", "red", "price_i", 10),
+    flatdoc("id", "3", "body_w", "common", "brand_s", "beta",
+            "color_s", "red", "price_i", 20),
+    flatdoc("id", "4", "body_w", "common", "brand_s", "beta",
+            "color_s", "blue", "price_i", 5),
+  }, UpdateMessage::COMMIT);
+
+  SearchOverridesGuard guard(DomainVariantPlan::forcedOfferForTests);
+  DomainVariantPlan::forcedOfferForTests =
+      DomainVariantPlan::Offer::SHARED_M;
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q")
+      .matchQuery("body_w", "common").getNumber().fields({"id"}).limit(-1);
+  top.facet("brands", "brand_s").limit(-1);
+  top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+  top.filter(qb::match(top.mr(), "color_s", "red"));
+  qb::sort(top, "add(price_i,0)", qb::ASC);
+  req->execute();
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+  EXPECT_EQ((std::vector<std::string>{"2", "1"}), resultIds(*req, "q"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 2}, {"beta", 1}}),
+            resultFacetMap(*req, "q", "brands"));
+}
+
+TEST_F(SearchEngineTest, routedDomainProductionOffersAgree) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "body_w", "common", "brand_s", "acme",
+            "color_s", "red"),
+    flatdoc("id", "2", "body_w", "common", "brand_s", "acme",
+            "color_s", "blue"),
+    flatdoc("id", "3", "body_w", "common", "brand_s", "beta",
+            "color_s", "red"),
+    flatdoc("id", "4", "body_w", "other", "brand_s", "beta",
+            "color_s", "blue"),
+  }, UpdateMessage::COMMIT);
+
+  SearchOverridesGuard guard(DomainVariantPlan::forcedOfferForTests);
+  for (auto offer : {
+           DomainVariantPlan::Offer::IDENTITY,
+           DomainVariantPlan::Offer::SHARED_M,
+           DomainVariantPlan::Offer::INDEPENDENT}) {
+    DomainVariantPlan::forcedOfferForTests = offer;
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& top = req->collection("main").topDocs("q")
+        .allQuery().getNumber().limit(0);
+    top.facet("brands", "brand_s").limit(-1);
+    top.facet("colors", "color_s").limit(-1);
+    top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+    top.filter(qb::match(top.mr(), "color_s", "red"), {"colors"});
+    req->execute();
+
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(1, req->getMatchCount());
+    EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 1}}),
+              resultFacetMap(*req, "q", "brands"));
+    EXPECT_EQ((std::map<std::string, int64_t>{{"blue", 1}, {"red", 1}}),
+              resultFacetMap(*req, "q", "colors"));
+  }
+}
+
+TEST_F(SearchEngineTest, routedVariableQueryOffersAgreeAcrossRepresentations) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  std::map<std::string, int64_t> expectedBrands;
+  std::map<std::string, int64_t> expectedColors;
+  int64_t expectedDefault = 0;
+  for (int32_t doc = 0; doc < 512; doc++) {
+    bool base = doc < 480 && doc != 33;
+    bool main = doc % 5 != 0;
+    bool sparse = doc % 32 == 1;
+    bool dense = doc % 4 != 3;
+    std::string brand = sparse ? "acme" : "beta";
+    std::string color = dense ? "red" : "blue";
+    docs.push_back(flatdoc(
+        "id", std::to_string(doc), "scope_s", doc < 480 ? "keep" : "drop",
+        "body_w", main ? "common" : "other",
+        "brand_s", brand, "color_s", color));
+    if (!base || !main) continue;
+    if (sparse && dense) expectedDefault++;
+    if (dense) expectedBrands[brand]++;
+    if (sparse) expectedColors[color]++;
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("33", UpdateMessage::COMMIT).success);
+
+  SearchOverridesGuard guard(DomainVariantPlan::forcedOfferForTests);
+  for (auto offer : {
+           DomainVariantPlan::Offer::SHARED_M,
+           DomainVariantPlan::Offer::INDEPENDENT}) {
+    DomainVariantPlan::forcedOfferForTests = offer;
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& outer = req->collection("main").topDocs("outer")
+        .allQuery().limit(0);
+    outer.matchFilter("scope_s", "keep");
+    auto& top = outer.topDocs("q").matchQuery("body_w", "common")
+        .getNumber().limit(3);
+    top.facet("brands", "brand_s").limit(-1);
+    top.facet("colors", "color_s").limit(-1);
+    top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+    top.filter(qb::match(top.mr(), "color_s", "red"), {"colors"});
+    req->execute();
+
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto* outerDocs = req->docList("outer");
+    ASSERT_NE(outerDocs, nullptr);
+    const auto* topValue = outerDocs->ops.find("q");
+    ASSERT_NE(topValue, nullptr);
+    const auto* topDocs = (*topValue)->docList();
+    ASSERT_NE(topDocs, nullptr);
+    ASSERT_TRUE(topDocs->found.has_value());
+    EXPECT_EQ(expectedDefault, *topDocs->found);
+    EXPECT_EQ(expectedBrands, resultFacetMap(*topDocs, "brands"));
+    EXPECT_EQ(expectedColors, resultFacetMap(*topDocs, "colors"));
+  }
+}
+
+TEST_F(SearchEngineTest, routedSharedBitSetIsFrozenForSiblingConsumers) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 512; doc++) {
+    docs.push_back(flatdoc(
+        "id", std::to_string(doc), "body_w", "common",
+        "brand_s", (doc & 1) == 0 ? "acme" : "beta",
+        "color_s", doc % 4 == 3 ? "blue" : "red"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  SearchOverridesGuard guard(DomainVariantPlan::forcedOfferForTests);
+  DomainVariantPlan::forcedOfferForTests =
+      DomainVariantPlan::Offer::SHARED_M;
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q")
+      .matchQuery("body_w", "common").getNumber().limit(0);
+  top.facet("brands_a", "brand_s").limit(-1);
+  top.facet("brands_b", "brand_s").limit(-1);
+  top.facet("colors", "color_s").limit(-1);
+  top.filter(
+      qb::match(top.mr(), "brand_s", "acme"),
+      {"brands_a", "brands_b"});
+  top.filter(qb::match(top.mr(), "color_s", "red"), {"colors"});
+  req->execute();
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(256, req->getMatchCount());
+  const std::map<std::string, int64_t> brands{
+      {"acme", 256}, {"beta", 128}};
+  EXPECT_EQ(brands, resultFacetMap(*req, "q", "brands_a"));
+  EXPECT_EQ(brands, resultFacetMap(*req, "q", "brands_b"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"red", 256}}),
+            resultFacetMap(*req, "q", "colors"));
+}
+
+TEST_F(SearchEngineTest, routedNestedTopDocsRespectsInheritedLiveDomain) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "scope_s", "keep", "brand_s", "acme",
+            "color_s", "red"),
+    flatdoc("id", "2", "scope_s", "keep", "brand_s", "beta",
+            "color_s", "red"),
+    flatdoc("id", "3", "scope_s", "drop", "brand_s", "acme",
+            "color_s", "red"),
+    flatdoc("id", "4", "scope_s", "keep", "brand_s", "beta",
+            "color_s", "blue"),
+  }, UpdateMessage::COMMIT);
+  ASSERT_TRUE(helper.deleteById("4", UpdateMessage::COMMIT).success);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& outer = req->collection("main").topDocs("outer")
+      .allQuery().limit(0);
+  outer.matchFilter("scope_s", "keep");
+  auto& inner = outer.topDocs("inner").allQuery().getNumber().limit(0);
+  inner.facet("brands", "brand_s").limit(-1);
+  inner.filter(qb::match(inner.mr(), "brand_s", "acme"), {"brands"});
+  inner.filter(qb::match(inner.mr(), "color_s", "red"));
+  req->execute();
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* outerDocs = req->docList("outer");
+  ASSERT_NE(outerDocs, nullptr);
+  const auto* innerValue = outerDocs->ops.find("inner");
+  ASSERT_NE(innerValue, nullptr);
+  const auto* innerDocs = (*innerValue)->docList();
+  ASSERT_NE(innerDocs, nullptr);
+  ASSERT_TRUE(innerDocs->found.has_value());
+  EXPECT_EQ(1, *innerDocs->found);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 1}}),
+            resultFacetMap(*innerDocs, "brands"));
+}
+
+TEST_F(SearchEngineTest, routedDomainArtifactsUseRequestMemoryBreaker) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme"),
+    flatdoc("id", "2", "brand_s", "beta"),
+  }, UpdateMessage::COMMIT);
+
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  forcedRequestMemoryMaxBytes = 1;
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
+  top.facet("brands", "brand_s").limit(-1);
+  top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
   ExpectLog quiet("Search request failed:");
   req->execute();
-  EXPECT_NE(std::string::npos,
-            req->errorMsg().find("multi-select filter routing is not implemented yet"))
+  EXPECT_NE(req->errorMsg().find("request memory breaker 'domain variants'"),
+            std::string::npos)
       << req->errorMsg();
+}
+
+TEST_F(SearchEngineTest, routedFiltersReuseFilterCacheArtifacts) {
+  CollectionHelper helper;
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .minSegmentDocs = 0,
+      .admissionThreshold = 1,
+  });
+  helper.getIndexWriter()->filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 64; doc++) {
+    docs.push_back(flatdoc(
+        "id", std::to_string(doc),
+        "brand_s", (doc & 1) == 0 ? "acme" : "beta",
+        "color_s", doc % 4 < 2 ? "red" : "blue"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto run = [&]() {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& top = req->collection("main").topDocs("q")
+        .allQuery().getNumber().limit(0);
+    top.facet("brands", "brand_s").limit(-1);
+    top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+    top.filter(qb::match(top.mr(), "color_s", "red"));
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(16, req->getMatchCount());
+  };
+  run();
+  uint64_t hits = cache->counters().hits;
+  run();
+  EXPECT_GT(cache->counters().hits, hits);
+}
+
+TEST_F(SearchEngineTest, routedFilterVariantCapIsPerRequest) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  for (size_t parent = 0; parent < 2; parent++) {
+    auto& top = req->topDocs("q" + std::to_string(parent))
+        .allQuery().limit(0);
+    size_t variants = parent == 0 ? 33 : 32;
+    for (size_t i = 0; i < variants; i++) {
+      std::string op = "f" + std::to_string(parent) + "_" + std::to_string(i);
+      top.facet(op, "brand_s").limit(-1);
+      std::array<std::string, 1> except{op};
+      appendRoutedFilter(top, qb::all(), except);
+    }
+  }
+  ExpectLog quiet("Search request failed:");
+  req->execute();
+  EXPECT_NE(req->errorMsg().find("op '"), std::string::npos)
+      << req->errorMsg();
+  EXPECT_NE(req->errorMsg().find("variant cap 64 exceeded"), std::string::npos)
+      << req->errorMsg();
+}
+
+TEST_F(SearchEngineTest, randomRoutedFiltersMatchExactOracle) {
+  CollectionHelper helper;
+  struct ModelDoc {
+    std::array<int, 3> values;
+  };
+  std::vector<ModelDoc> model;
+  for (int a = 0; a < 3; a++) {
+    for (int b = 0; b < 3; b++) {
+      for (int c = 0; c < 3; c++) {
+        model.push_back({{a, b, c}});
+        helper.index(
+            flatdoc("id", std::to_string(model.size()),
+                    "f0_s", "v" + std::to_string(a),
+                    "f1_s", "v" + std::to_string(b),
+                    "f2_s", "v" + std::to_string(c)),
+            model.size() == 13 ? UpdateMessage::COMMIT
+                               : UpdateMessage::NO_COMMIT);
+      }
+    }
+  }
+  helper.commit();
+
+  struct FilterModel {
+    int field;
+    int value;
+    std::set<std::string> except;
+  };
+  std::mt19937 random(0x5eed1234);
+  const std::array<std::string, 4> opNames{
+      "facet0", "facet1", "facet2", "facet3"};
+  for (int iteration = 0; iteration < 100; iteration++) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").allQuery()
+        .getNumber().limit(0);
+    for (size_t op = 0; op < opNames.size(); op++) {
+      top.facet(opNames[op], "f" + std::to_string(op % 3) + "_s")
+          .limit(-1);
+    }
+
+    std::vector<FilterModel> filters;
+    int filterCount = 1 + (int) (random() % 5);
+    for (int filter = 0; filter < filterCount; filter++) {
+      FilterModel modelFilter{
+          .field = (int) (random() % 3),
+          .value = (int) (random() % 3),
+          .except = {},
+      };
+      for (const auto& op : opNames) {
+        if ((random() & 3U) == 0) modelFilter.except.insert(op);
+      }
+      if (filter == 0) modelFilter.except.insert(opNames[0]);
+      std::vector<std::string> except(
+          modelFilter.except.begin(), modelFilter.except.end());
+      appendRoutedFilter(
+          top,
+          qb::match(
+              top.mr(), "f" + std::to_string(modelFilter.field) + "_s",
+              "v" + std::to_string(modelFilter.value)),
+          except);
+      filters.push_back(std::move(modelFilter));
+    }
+
+    req->execute((random() & 1U) != 0);
+    ASSERT_TRUE(req->ok()) << "iteration=" << iteration << " "
+                           << req->errorMsg();
+
+    auto matches = [&](const ModelDoc& doc, std::string_view op) {
+      for (const auto& filter : filters) {
+        if (filter.except.contains(std::string(op))) continue;
+        if (doc.values[(size_t) filter.field] != filter.value) return false;
+      }
+      return true;
+    };
+    int64_t defaultCount = 0;
+    for (const auto& doc : model) defaultCount += matches(doc, "");
+    EXPECT_EQ(defaultCount, req->getMatchCount()) << "iteration=" << iteration;
+    for (size_t op = 0; op < opNames.size(); op++) {
+      std::map<std::string, int64_t> expected;
+      for (const auto& doc : model) {
+        if (!matches(doc, opNames[op])) continue;
+        expected["v" + std::to_string(doc.values[op % 3])]++;
+      }
+      EXPECT_EQ(expected, resultFacetMap(*req, "q", opNames[op]))
+          << "iteration=" << iteration << " op=" << opNames[op];
+    }
+  }
 }
 
 TEST_F(SearchEngineTest, protobufRoutedFilterValidation) {

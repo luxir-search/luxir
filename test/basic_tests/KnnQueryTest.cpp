@@ -483,6 +483,66 @@ TEST_F(KnnQueryTest, multiSegment) {
   req->done();
 }
 
+TEST_F(KnnQueryTest, routedFilterRejectsDomainSensitivePreparation) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "color_s", "red", "embedding_v",
+                  std::vector<float>{1, 0, 0}));
+  h.index(flatdoc("id", "b", "color_s", "blue", "embedding_v",
+                  std::vector<float>{0, 1, 0}));
+  h.commit({"*"});
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& top = request->collection("main").topDocs("q").limit(2);
+  top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
+  top.facet("colors", "color_s").limit(-1);
+  top.filter(qb::match(top.mr(), "color_s", "red"), {"colors"});
+  ExpectLog quiet("Search request failed:");
+  request->execute();
+  EXPECT_NE(request->errorMsg().find(
+                "per-variant preparation for this query shape is not implemented yet"),
+            std::string::npos)
+      << request->errorMsg();
+}
+
+TEST_F(KnnQueryTest, routedPreparedFilterUsesParentBaseDomain) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int32_t i = 0; i < 8; i++) {
+    h.index(flatdoc(
+        "id", std::to_string(i),
+        "color_s", (i & 1) == 0 ? "red" : "blue",
+        "embedding_v", std::vector<float>{(float) (8 - i), (float) i, 0}));
+    h.commit();
+  }
+  h.commit({"*"});
+  ASSERT_EQ(8u, h.getIndexWriter()->getIndexReader()->segments().size());
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& top = request->collection("main").topDocs("q")
+      .allQuery().getNumber().limit(0);
+  top.facet("colors", "color_s").limit(-1);
+  top.filter(
+      qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 3), {"colors"});
+  request->execute(false);
+
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(3, request->getMatchCount());
+  const auto& docs = *request->docList("q");
+  const auto* value = docs.ops.find("colors");
+  ASSERT_NE(value, nullptr);
+  const auto& facet = std::get<api::FacetResult>((*value)->kind);
+  const auto& ids = std::get<api::ColStr>(facet.bucket_ids->kind);
+  ASSERT_EQ(2u, ids.v.size());
+  std::map<std::string, int64_t> counts;
+  for (size_t i = 0; i < ids.v.size(); i++) {
+    counts[std::string(ids.v[i])] = facet.counts[i];
+  }
+  EXPECT_EQ((std::map<std::string, int64_t>{{"blue", 4}, {"red", 4}}),
+            counts);
+}
+
 // Multi-valued: a doc owns several vectors; FAISS hits must be grouped back to
 // the owning doc (one hit per doc, best score) via the valueRank->docId column.
 // An interleaved no-vector doc ("g") makes identity (valueRank==docId) resolve a

@@ -2,6 +2,7 @@
 
 #include "test/LuxirTest.h"
 #include "luxir/search/DocSet.h"
+#include "luxir/search/DomainVariantPlan.h"
 
 namespace luxir::test {
 
@@ -62,6 +63,41 @@ TEST_F(DocSetTest, borrowedDomainRequiresPinBeforeDelivery) {
 
   pinned = {};
   EXPECT_TRUE(weak.expired());
+}
+
+TEST_F(DocSetTest, retentionDoesNotInventBorrowedStorageOwnership) {
+  auto docs = std::make_shared<ArrDocSet>(std::vector<int32_t>{3});
+  auto retained = std::make_shared<int>(7);
+  EXPECT_THROW(
+      unused(std::move(DomainHandle::borrowed(docs.get()))
+                 .retainedWith(retained)),
+      std::invalid_argument);
+}
+
+TEST_F(DocSetTest, domainVariantOffersCostRankingAndProductionTogether) {
+  DomainVariantPlan plan;
+  plan.begin(2);
+  plan.addChild("sideways", [](size_t filter) { return filter == 0; });
+
+  auto dense = [](int32_t maxDoc, int32_t card) {
+    auto docs = std::make_unique<RAMBitDocSet>(maxDoc);
+    for (int32_t doc = 0; doc < card; doc++) {
+      docs->mutableBits().set(doc);
+    }
+    return DomainHandle(std::move(docs));
+  };
+  std::array<DomainHandle, 2> filters{
+      dense(10000, 4000), dense(10000, 5000)};
+
+  auto exactParent = plan.selectOffer(
+      10000, 10000, {}, filters, false, false, true);
+  EXPECT_EQ(DomainVariantPlan::Offer::INDEPENDENT,
+            exactParent.offers[0].offer);
+
+  auto rankedParent = plan.selectOffer(
+      10000, 10000, {}, filters, false, false, false);
+  EXPECT_EQ(DomainVariantPlan::Offer::SHARED_M,
+            rankedParent.offers[0].offer);
 }
 
 TEST_F(DocSetTest, unionTwoArrays) {

@@ -349,6 +349,11 @@ public:
   }
 };
 
+enum class DomainBuildMode : uint8_t {
+  FILTERED_MATCHES,
+  RAW_QUERY_MATCHES,
+};
+
 // Drive a per-segment Scorer through the optional `filter` domain, feeding (doc, score)
 // into `collector`.  If `builder` is non-null, also records every matched doc for use as
 // a sub-op domain (see TopDocsReq's per-segment subCalc dispatch).  Templated on Collector
@@ -366,7 +371,9 @@ public:
 template <typename Collector>
 void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                  DocSetBuilder* builder, Collector& collector, bool allowPruning = true,
-                 MaxScoreAccumulator* accumulator = nullptr) {
+                 MaxScoreAccumulator* accumulator = nullptr,
+                 DomainBuildMode buildMode = DomainBuildMode::FILTERED_MATCHES,
+                 DocSet* rawDomain = nullptr) {
   constexpr int32_t kAccumulatorPollPeriod = 1024;
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
   int32_t accumulatorPollCount = 0;
@@ -465,6 +472,24 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   [[maybe_unused]] bool sortPrune = false;
   if constexpr (hasSortRanges) {
     sortPrune = allowPruning && builder == nullptr;
+  }
+
+  if (buildMode == DomainBuildMode::RAW_QUERY_MATCHES) {
+    assert(builder != nullptr);
+    DocSetProbe rawEligibility(rawDomain);
+    DocSetProbe accepted(filter);
+    for (;;) {
+      int32_t doc = scorer->next();
+      if (doc == PostingsReader::END) break;
+      if (!rawEligibility.get(doc)) continue;
+      // The builder captures M after the inherited domain but before routed
+      // filters. Ranking still observes the complete default filter below.
+      builder->add(doc);
+      if (!accepted.get(doc)) continue;
+      auto score = needScores ? scorer->score() : 0.0f;
+      collectOne(doc, score);
+    }
+    return;
   }
 
   if (filter == nullptr || filter->type == DocSet::BITSET) {

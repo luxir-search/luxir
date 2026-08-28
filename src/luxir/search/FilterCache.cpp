@@ -205,8 +205,15 @@ FilterCache::Use::Use(FilterCache* cache, FilterKey key,
   }
 }
 
+FilterCache::Use::~Use() {
+  if (readerRoutedTracker != nullptr) {
+    readerRoutedTracker->release(readerRoutedBytes);
+  }
+}
+
 void FilterCache::Use::pinValue(
-    size_t segmentOrd, const std::shared_ptr<const SegmentValue>& value) {
+    size_t segmentOrd, const std::shared_ptr<const SegmentValue>& value,
+    bool requestOwned) {
   if (value == nullptr || segmentOrd >= requestSlots.size()) return;
   auto& requestSlot = *requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
@@ -214,8 +221,18 @@ void FilterCache::Use::pinValue(
     requestSlot.raw = value->docSet();
     requestSlot.rawOwned = false;
   }
-  if (requestSlot.pins.empty() || requestSlot.pins.back() != value) {
+  bool alreadyPinned = std::ranges::find(requestSlot.pins, value)
+      != requestSlot.pins.end();
+  if (!alreadyPinned) {
+    if (requestOwned) {
+      requestSlot.chargeRouted(value->ramBytesUsed());
+      requestSlot.requestOwnedPins.push_back(value);
+    }
     requestSlot.pins.push_back(value);
+  } else {
+    assert(!requestOwned
+           || std::ranges::find(requestSlot.requestOwnedPins, value)
+                  != requestSlot.requestOwnedPins.end());
   }
 }
 
@@ -283,14 +300,25 @@ void FilterCache::acceptReaderSharedHit(
 }
 
 void FilterCache::Use::pinReaderValue(
-    const std::shared_ptr<const ReaderValue>& value) {
+    const std::shared_ptr<const ReaderValue>& value,
+    bool requestOwned) {
   if (value == nullptr) return;
   std::lock_guard<std::mutex> lock(readerStateMutex);
   if (readerPin != nullptr && readerPin != value) {
     throw std::logic_error(
         "one reader-stable Use cannot borrow multiple ReaderValues");
   }
+  if (readerPin != nullptr) {
+    assert(readerPinRequestOwned == requestOwned);
+  }
+  if (requestOwned && readerRoutedTracker != nullptr
+      && readerRoutedBytes == 0) {
+    readerRoutedTracker->charge(
+        value->ramBytesUsed(), "domain variants", readerRoutedDetail);
+    readerRoutedBytes = value->ramBytesUsed();
+  }
   readerPin = value;
+  readerPinRequestOwned = requestOwned;
 }
 
 FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd) {
@@ -557,6 +585,7 @@ DocSet* FilterCache::Use::adoptOwnedRaw(
   {
     std::lock_guard<std::mutex> lock(requestSlot.mutex);
     if (requestSlot.raw == nullptr) {
+      requestSlot.chargeRouted(raw->ramBytesUsed());
       requestSlot.ownedRaw = std::move(raw);
       requestSlot.raw = requestSlot.ownedRaw.get();
       requestSlot.rawOwned = true;
@@ -592,7 +621,6 @@ FilterCache::Use::publishReaderStable(
     uint32_t buildCostMicros) {
   auto value = cache->publishReaderValue(
       *this, probe, std::move(liveExact), buildCostMicros);
-  pinReaderValue(value);
   return value;
 }
 
@@ -601,6 +629,66 @@ DocSet* FilterCache::Use::rawDocSet(size_t segmentOrd) {
   auto& requestSlot = *requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
   return requestSlot.raw;
+}
+
+void FilterCache::Use::enableRoutedAccounting(
+    size_t segmentOrd, RequestMemTracker& tracker,
+    std::string_view detail) {
+  if (segmentOrd >= requestSlots.size()) return;
+  if (scope_ == FilterKeyScope::READER_STABLE) {
+    std::lock_guard<std::mutex> lock(readerStateMutex);
+    if (readerRoutedTracker != nullptr
+        && readerRoutedTracker != &tracker) {
+      throw std::logic_error(
+          "one filter use cannot span request memory trackers");
+    }
+    if (readerRoutedTracker == nullptr) {
+      if (readerPinRequestOwned && readerPin != nullptr) {
+        tracker.charge(
+            readerPin->ramBytesUsed(), "domain variants", detail);
+        readerRoutedBytes = readerPin->ramBytesUsed();
+      }
+      readerRoutedTracker = &tracker;
+      readerRoutedDetail = detail;
+    }
+    return;
+  }
+  auto& requestSlot = *requestSlots[segmentOrd];
+  std::lock_guard<std::mutex> lock(requestSlot.mutex);
+  if (requestSlot.routedTracker != nullptr
+      && requestSlot.routedTracker != &tracker) {
+    throw std::logic_error(
+        "one filter use cannot span request memory trackers");
+  }
+  if (requestSlot.routedTracker != nullptr) return;
+
+  size_t bytes = 0;
+  auto include = [&](DocSet* docs) {
+    if (docs == nullptr) return;
+    size_t artifactBytes = docs->ramBytesUsed();
+    if (artifactBytes > std::numeric_limits<size_t>::max() - bytes) {
+      tracker.chargeOverflow("domain variants", detail);
+    }
+    bytes += artifactBytes;
+  };
+  auto includeBytes = [&](size_t artifactBytes) {
+    if (artifactBytes > std::numeric_limits<size_t>::max() - bytes) {
+      tracker.chargeOverflow("domain variants", detail);
+    }
+    bytes += artifactBytes;
+  };
+  if (requestSlot.rawOwned) include(requestSlot.ownedRaw.get());
+  for (auto& value : requestSlot.requestOwnedPins) {
+    includeBytes(value->ramBytesUsed());
+  }
+  include(requestSlot.liveEffective.get());
+  for (auto& effective : requestSlot.domainEffective) {
+    include(effective.docs.get());
+  }
+  tracker.charge(bytes, "domain variants", detail);
+  requestSlot.routedTracker = &tracker;
+  requestSlot.routedDetail = detail;
+  requestSlot.routedBytes = bytes;
 }
 
 DocSet* FilterCache::Use::effectiveDocSet(
@@ -644,6 +732,7 @@ DocSet* FilterCache::Use::effectiveDocSet(
     auto docs = DocSet::intersect(sets);
     docs->card();
     DocSet* result = docs.get();
+    requestSlot.chargeRouted(docs->ramBytesUsed());
     requestSlot.domainEffective.push_back({domain, std::move(docs)});
     return result;
   }
@@ -654,8 +743,10 @@ DocSet* FilterCache::Use::effectiveDocSet(
   }
   std::array<DocSet*, 2> sets{
       raw, &segment.liveDocs()->docset()};
-  requestSlot.liveEffective = DocSet::intersect(sets);
-  requestSlot.liveEffective->card();
+  auto docs = DocSet::intersect(sets);
+  docs->card();
+  requestSlot.chargeRouted(docs->ramBytesUsed());
+  requestSlot.liveEffective = std::move(docs);
   return requestSlot.liveEffective.get();
 }
 
@@ -764,6 +855,15 @@ FilterCache::Use* FilterCache::UseRegistry::acceptExisting(
   Use* result = candidate.use.get();
   uses.emplace(result->key, std::move(candidate.use));
   return result;
+}
+
+void FilterCache::UseRegistry::enableRoutedAccounting(
+    size_t segmentOrd, RequestMemTracker& tracker,
+    std::string_view detail) {
+  for (auto& [key, use] : uses) {
+    unused(key);
+    use->enableRoutedAccounting(segmentOrd, tracker, detail);
+  }
 }
 
 size_t FilterCache::UseRegistry::ownedBytesForTest() {
@@ -1265,7 +1365,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     }
   }
 
-  use.pinValue(segmentOrd, chosen);
+  use.pinValue(segmentOrd, chosen, chosen == local && !inserted);
   if (probe != nullptr) probe->releaseClaims();
   if (chosen == local && !inserted && attempted) {
     counter.publishRejects.fetch_add(1, std::memory_order_relaxed);
@@ -1364,6 +1464,7 @@ FilterCache::publishReaderValue(
     counter.builds.fetch_add(1, std::memory_order_relaxed);
   }
   if (inserted) maybeSweep();
+  use.pinReaderValue(chosen, chosen == local && !inserted);
   return chosen;
 }
 

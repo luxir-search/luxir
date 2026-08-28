@@ -68,6 +68,16 @@ public:
 // ownership pin that keeps its storage alive. borrowed() creates a temporary
 // non-deliverable result that must be promoted with pinnedWith().
 class DomainHandle {
+  struct RetainedLifetime {
+    std::shared_ptr<const void> storage;
+    std::shared_ptr<const void> retained;
+
+    RetainedLifetime(
+        std::shared_ptr<const void> storage,
+        std::shared_ptr<const void> retained)
+      : storage(std::move(storage)), retained(std::move(retained)) {}
+  };
+
   DocSet* docs = nullptr;
   std::shared_ptr<const void> lifetime;
 
@@ -106,6 +116,23 @@ public:
       throw std::invalid_argument("borrowed domain requires a lifetime pin");
     }
     lifetime = std::move(owner);
+    return std::move(*this);
+  }
+
+  // Retain an additional owner under the same delivery lifetime. Unlike
+  // pinnedWith(), this composes with an already-owned DocSet and also works
+  // for the null identity domain. Domain-production reservations use this so
+  // their charge follows the last async consumer without a parallel lifetime
+  // mechanism.
+  template <typename T>
+  DomainHandle retainedWith(std::shared_ptr<T> retained) && {
+    if (retained == nullptr) return std::move(*this);
+    if (docs != nullptr && lifetime == nullptr) {
+      throw std::invalid_argument(
+          "borrowed domain requires its storage pin before retention");
+    }
+    lifetime = std::make_shared<RetainedLifetime>(
+        std::move(lifetime), std::move(retained));
     return std::move(*this);
   }
 
