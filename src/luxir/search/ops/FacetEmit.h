@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -40,7 +41,7 @@ class FieldBucketFinalizer {
   using Final = FinalizedFacetBucket<Key, Payload>;
 
   std::vector<Final> pins;
-  std::unordered_map<Key, size_t> pinByKey;
+  boost::unordered_flat_map<Key, size_t> pinByKey;
   std::vector<Candidate> regular;
   [[no_unique_address]] Better better;
   int64_t minCount;
@@ -49,6 +50,9 @@ class FieldBucketFinalizer {
   bool bounded;
 
   void preservePin(Candidate candidate) {
+    // Every key the page rejects lands here, so a facet with nothing selected
+    // must not pay a hash lookup per key to learn there is no pin to preserve.
+    if (pinByKey.empty()) return;
     auto pin = pinByKey.find(candidate.key);
     if (pin == pinByKey.end()) return;
     Final& selected = pins[pin->second];
@@ -118,10 +122,12 @@ public:
     for (size_t i = begin; i < regular.size(); i++) {
       auto& bucket = regular[i];
       size_t pinIndex = std::numeric_limits<size_t>::max();
-      auto pin = pinByKey.find(bucket.key);
-      if (pin != pinByKey.end()) {
-        pinIndex = pin->second;
-        coveredPins[pinIndex] = 1;
+      if (!pinByKey.empty()) {
+        auto pin = pinByKey.find(bucket.key);
+        if (pin != pinByKey.end()) {
+          pinIndex = pin->second;
+          coveredPins[pinIndex] = 1;
+        }
       }
       out.push_back({
           .key = std::move(bucket.key),
@@ -148,6 +154,15 @@ std::vector<FinalizedFacetBucket<Key, Payload>> finalizeFieldBuckets(
   return finalizer.finish();
 }
 
+// Default field-facet order: count desc, key asc. Named so a caller that
+// streams into FieldBucketFinalizer orders its page the same way the
+// vector-taking wrapper below does.
+inline constexpr auto countFieldBucketOrder =
+    [](const auto& a, const auto& b) {
+      if (a.count != b.count) return a.count > b.count;
+      return a.key < b.key;
+    };
+
 template<typename Key, typename Payload = std::monostate>
 std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
     std::vector<FacetCandidate<Key, Payload>> candidates,
@@ -155,10 +170,7 @@ std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
     int64_t minCount, int64_t offset, int64_t limit) {
   return finalizeFieldBuckets(
       std::move(candidates), pins, minCount, offset, limit,
-      [](const auto& a, const auto& b) {
-        if (a.count != b.count) return a.count > b.count;
-        return a.key < b.key;
-      });
+      countFieldBucketOrder);
 }
 
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING

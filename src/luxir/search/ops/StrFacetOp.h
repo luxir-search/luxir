@@ -436,37 +436,49 @@ public:
   std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
       std::vector<std::pair<int64_t, int64_t>>& ordCounts,
       bool allowZeroPadding) const {
-    std::vector<FacetCandidate<int64_t>> candidates;
-    candidates.reserve(ordCounts.size());
-    for (auto [ord, count] : ordCounts) {
-      candidates.push_back({ord, count, {}});
-    }
-
     std::vector<std::optional<int64_t>> pins;
     pins.reserve(pinnedBuckets.size());
     for (const auto& pin : pinnedBuckets) {
       pins.push_back(pin.ord);
     }
 
+    // ordCounts holds one entry per counted ord, which for a high-cardinality
+    // field is most of the domain's distinct values. Stream it through the
+    // finalizer's bounded heap rather than copying it into a candidate vector
+    // first: a uniform 2M-value field over a 10M-doc domain would otherwise
+    // allocate and fill tens of MB per request to return one page.
+    FieldBucketFinalizer<int64_t, std::monostate,
+                         decltype(countFieldBucketOrder)>
+        finalizer(std::span<const std::optional<int64_t>>(pins),
+                  minCount, 0, limit, countFieldBucketOrder);
+    for (auto [ord, count] : ordCounts) {
+      finalizer.add({ord, count, {}});
+    }
+
+    // Zero-count padding can only be needed when the counted ords do not
+    // already fill the page, so sizes decide that before anything is built -
+    // and when they do not fill it there are fewer of them than the page.
     if (allowZeroPadding && minCount == 0) {
-      boost::unordered_flat_set<int64_t> present;
-      present.reserve(ordCounts.size());
-      for (auto [ord, count] : ordCounts) {
-        unused(count);
-        present.insert(ord);
-      }
       int64_t numGlobalOrds = ordMap ? ordMap->numOrds() : 0;
       size_t target = limit < 0 ? (size_t)numGlobalOrds : (size_t)limit;
-      for (int64_t ord = 0;
-           ord < numGlobalOrds && candidates.size() < target; ord++) {
-        if (present.contains(ord)) continue;
-        candidates.push_back({ord, 0, {}});
+      if (ordCounts.size() < target) {
+        boost::unordered_flat_set<int64_t> present;
+        present.reserve(ordCounts.size());
+        for (auto [ord, count] : ordCounts) {
+          unused(count);
+          present.insert(ord);
+        }
+        size_t emitted = ordCounts.size();
+        for (int64_t ord = 0;
+             ord < numGlobalOrds && emitted < target; ord++) {
+          if (present.contains(ord)) continue;
+          finalizer.add({ord, 0, {}});
+          emitted++;
+        }
       }
     }
 
-    return finalizeCountFieldBuckets(
-        std::move(candidates), std::span<const std::optional<int64_t>>(pins),
-        minCount, 0, limit);
+    return finalizer.finish();
   }
 
   class Calc : public Calculator {
