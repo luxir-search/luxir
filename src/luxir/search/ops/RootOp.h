@@ -20,18 +20,6 @@ public:
     std::vector<std::unique_ptr<Calculator>> subCalcs;
     std::vector<size_t> subCalcVariants;
 
-    static void checkPreparedSources(
-        std::span<const QueryPrep::PreparedSource> sources) {
-      for (const auto& source : sources) {
-        if (source.domainDependence
-            != PreparedDomainDependence::QUERY_CANONICAL) {
-          throw std::runtime_error(
-              "root: per-variant preparation for this domain query shape "
-              "is not implemented yet");
-        }
-      }
-    }
-
   public:
     Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots) : SearchOp::Calculator(op, parent, slot, numSlots) {}
 
@@ -109,21 +97,93 @@ public:
         std::span<DocSet* const>(liveViews.data(), liveViews.size()),
         tg != nullptr
       };
-      auto prepared = QueryPrep::prepareFilterSources(
-          weights, uses, prepareContext);
-      checkPreparedSources(prepared);
+      std::vector<QueryPrep::PreparedSource> prepared(weights.size());
+      std::vector<size_t> extraSources;
+      std::vector<size_t> resetExtraSources;
+      std::vector<Query::Weight*> extraWeights;
+      std::vector<FilterCache::Use*> extraUses;
+      for (size_t source = 0; source < weights.size(); source++) {
+        prepared[source].weight = weights[source];
+        prepared[source].cacheUse = uses[source];
+        if (root.domainVariants.sourceIsExtra(source)) {
+          extraSources.push_back(source);
+          extraWeights.push_back(weights[source]);
+          extraUses.push_back(uses[source]);
+        }
+        if (root.domainVariants.sourceIsResetExtra(source)) {
+          resetExtraSources.push_back(source);
+        }
+      }
+      auto preparedExtras = QueryPrep::prepareFilterSources(
+          extraWeights, extraUses, prepareContext);
+      for (size_t i = 0; i < extraSources.size(); i++) {
+        prepared[extraSources[i]] = std::move(preparedExtras[i]);
+      }
+
+      std::vector<std::shared_ptr<DomainVariantPlan::Reservation>>
+          reservations(domains.size());
+      std::vector<std::vector<DomainHandle>> extraSets(
+          domains.size(), std::vector<DomainHandle>(weights.size()));
+      for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        auto& segment = op.req.reader->segments()[segnum];
+        std::string detail = "root segment " + std::to_string(segnum);
+        reservations[segnum] = root.domainVariants.reserveProduction(
+            op.req.memoryTracker, segment.maxDoc(), detail);
+        root.planning->filterUses->enableRoutedAccounting(
+            segnum, op.req.memoryTracker, detail);
+        for (size_t source : resetExtraSources) {
+          DomainHandle set = QueryPrep::materializeEffectiveFilter(
+              prepared[source], *op.req.reader, segment,
+              domains[segnum].get());
+          if (set.get() != nullptr && set.isDeliverable()) {
+            reservations[segnum]->grow(set.get()->ramBytesUsed());
+          }
+          extraSets[segnum][source] =
+              std::move(set).pinnedWith(root.planning->filterUses);
+        }
+      }
+
+      size_t variantCount = root.domainVariants.variantCount();
+      std::vector<std::vector<DomainHandle>> eligibility(
+          domains.size(), std::vector<DomainHandle>(variantCount));
+      for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        for (size_t variant = 1; variant < variantCount; variant++) {
+          if (root.domainVariants.frame(variant)
+              != DomainVariantPlan::Frame::RESET) {
+            continue;
+          }
+          std::vector<DomainHandle> parts;
+          parts.push_back(domains[segnum]);
+          for (size_t source : root.domainVariants.extraSources(variant)) {
+            parts.push_back(extraSets[segnum][source]);
+          }
+          eligibility[segnum][variant] = DomainVariantPlan::compose(
+              std::move(parts));
+        }
+      }
+
+      auto preparedVariants = root.domainVariants.prepareResetVariants(
+          prepared, eligibility,
+          std::span<DocSet* const>(liveViews.data(), liveViews.size()),
+          *op.req.reader, tg != nullptr,
+          [&](size_t variant, size_t segnum) {
+            auto& segment = op.req.reader->segments()[segnum];
+            return root.domainVariants.reserveVariantPreparation(
+                op.req.memoryTracker, segment.maxDoc(),
+                "root variant " + std::to_string(variant)
+                    + " segment " + std::to_string(segnum));
+          });
 
       std::vector<std::vector<DomainHandle>> produced;
       produced.reserve(domains.size());
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
         auto& segment = op.req.reader->segments()[segnum];
-        std::string detail = "root segment " + std::to_string(segnum);
-        auto reservation = root.domainVariants.reserveProduction(
-            op.req.memoryTracker, segment.maxDoc(), detail);
-        root.planning->filterUses->enableRoutedAccounting(
-            segnum, op.req.memoryTracker, detail);
+        auto reservation = reservations[segnum];
 
         auto materialize = [&](size_t source) {
+          if (root.domainVariants.sourceIsResetExtra(source)) {
+            return extraSets[segnum][source];
+          }
           DomainHandle set = QueryPrep::materializeEffectiveFilter(
               prepared[source], *op.req.reader, segment,
               domains[segnum].get());
@@ -137,6 +197,11 @@ public:
             root.domainVariants.variantCount());
         variants[0] = domains[segnum];
         for (size_t variant = 1; variant < variants.size(); variant++) {
+          if (preparedVariants.ready[variant] != 0) {
+            variants[variant] =
+                preparedVariants.domains[segnum][variant];
+            continue;
+          }
           std::vector<DomainHandle> parts;
           if (root.domainVariants.frame(variant)
               == DomainVariantPlan::Frame::INHERIT) {

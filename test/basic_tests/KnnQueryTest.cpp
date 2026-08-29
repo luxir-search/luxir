@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/query/VectorEngine.h"
@@ -483,53 +484,231 @@ TEST_F(KnnQueryTest, multiSegment) {
   req->done();
 }
 
-TEST_F(KnnQueryTest, routedFilterRejectsDomainSensitivePreparation) {
+TEST_F(KnnQueryTest, routedFilterRepreparesTopKForSidewaysFacet) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2);
-  h.index(flatdoc("id", "a", "color_s", "red", "embedding_v",
+  h.index(flatdoc("id", "a", "brand_s", "acme", "embedding_v",
                   std::vector<float>{1, 0, 0}));
-  h.index(flatdoc("id", "b", "color_s", "blue", "embedding_v",
+  h.index(flatdoc("id", "d", "brand_s", "acme", "embedding_v",
                   std::vector<float>{0, 1, 0}));
-  h.commit({"*"});
+  h.commit();
+  h.index(flatdoc("id", "b", "brand_s", "beta", "embedding_v",
+                  std::vector<float>{0.99f, 0.01f, 0}));
+  h.index(flatdoc("id", "c", "brand_s", "beta", "embedding_v",
+                  std::vector<float>{0.98f, 0.02f, 0}));
+  h.commit();
+  ASSERT_EQ(2u, h.getIndexWriter()->getIndexReader()->segments().size());
 
   auto request = localReq(luxirNode->getSearchEngine());
-  auto& top = request->collection("main").topDocs("q").limit(2);
+  auto& top = request->collection("main").topDocs("q")
+      .getNumber().fields({"id"}).limit(2);
   top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
-  top.facet("colors", "color_s").limit(-1);
-  top.filter(qb::match(top.mr(), "color_s", "red"), {"colors"});
-  ExpectLog quiet("Search request failed:");
+  top.facet("brands", "brand_s").limit(-1);
+  top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+  int64_t prepares = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
   request->execute();
-  EXPECT_NE(request->errorMsg().find(
-                "per-variant preparation for this query shape is not implemented yet"),
-            std::string::npos)
-      << request->errorMsg();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(2, request->getMatchCount());
+  EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*request));
+  const auto& result = *request->docList("q")->ops.at("brands")->facetResult();
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  ASSERT_EQ(2u, ids.size());
+  EXPECT_EQ("acme", ids[0]);
+  EXPECT_EQ("beta", ids[1]);
+  EXPECT_EQ(1, result.counts[0]);
+  EXPECT_EQ(1, result.counts[1]);
+  // Carving the default {a,d} top-k would be {acme:2}; the sideways result
+  // instead comes from the independently prepared all-brand top-k {a,b}.
+  EXPECT_EQ(prepares + 2, KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed));
 }
 
-TEST_F(KnnQueryTest, resetDomainRejectsDomainSensitivePreparation) {
+TEST_F(KnnQueryTest, selectedFacetComposesWithDomainSensitiveMain) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2);
-  h.index(flatdoc("id", "a", "color_s", "red", "embedding_v",
+  h.index(flatdoc("id", "a", "brand_s", "acme", "embedding_v",
                   std::vector<float>{1, 0, 0}));
-  h.index(flatdoc("id", "b", "color_s", "blue", "embedding_v",
+  h.index(flatdoc("id", "d", "brand_s", "acme", "embedding_v",
                   std::vector<float>{0, 1, 0}));
+  h.index(flatdoc("id", "b", "brand_s", "beta", "embedding_v",
+                  std::vector<float>{0.99f, 0.01f, 0}));
   h.commit({"*"});
 
   auto request = localReq(luxirNode->getSearchEngine());
-  auto& top = request->collection("main").topDocs("q").allQuery().limit(0);
-  auto& facet = top.facet("colors", "color_s").limit(-1);
+  auto& top = request->collection("main").topDocs("q")
+      .getNumber().limit(0);
+  top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
+  auto& facet = top.facet("brands", "brand_s").limit(-1);
+  auto& rawFacet = std::get<api::FieldFacet>(facet.rawOp().kind);
+  auto* selected = build::allocArray(rawFacet.selected, 1, facet.mr());
+  selected[0].kind = build::arenaStr(facet.mr(), "acme");
+  request->execute();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(2, request->getMatchCount());
+  const auto& result = *request->docList("q")->ops.at("brands")->facetResult();
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  ASSERT_EQ(2u, ids.size());
+  EXPECT_EQ("acme", ids[0]);
+  EXPECT_EQ("beta", ids[1]);
+  EXPECT_EQ(1, result.counts[0]);
+  EXPECT_EQ(1, result.counts[1]);
+}
+
+TEST_F(KnnQueryTest, resetDomainPreparesKnnInsideFullEligibility) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "scope_s", "drop", "brand_s", "beta",
+                  "embedding_v", std::vector<float>{1, 0, 0}));
+  h.index(flatdoc("id", "b", "scope_s", "keep", "brand_s", "acme",
+                  "embedding_v", std::vector<float>{0.99f, 0.01f, 0}));
+  h.index(flatdoc("id", "c", "scope_s", "keep", "brand_s", "beta",
+                  "embedding_v", std::vector<float>{0.98f, 0.02f, 0}));
+  h.commit({"*"});
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& top = request->collection("main").topDocs("q")
+      .allQuery().getNumber().limit(0);
+  top.filter(qb::match(top.mr(), "scope_s", "keep"));
+  auto& facet = top.facet("brands", "brand_s").limit(-1);
   auto& domain = facet.rawOp().domain.emplace();
   auto* query = (api::Query*) facet.mr().allocate(
       sizeof(api::Query), alignof(api::Query));
   new (query) api::Query(
-      qb::knn(facet.mr(), "embedding_v", {1, 0, 0}, 2));
+      qb::knn(facet.mr(), "embedding_v", {1, 0, 0}, 1));
   domain.query = query;
-  ExpectLog quiet("Search request failed:");
+  domain.apply_parent_filters = true;
+  auto* filters = build::allocArray(domain.filter, 1, facet.mr());
+  filters[0] = qb::match(facet.mr(), "brand_s", "beta");
   request->execute();
-  EXPECT_NE(request->errorMsg().find(
-                "per-variant preparation for this domain query shape is not "
-                "implemented yet"),
-            std::string::npos)
-      << request->errorMsg();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(2, request->getMatchCount());
+  const auto& result = *request->docList("q")->ops.at("brands")->facetResult();
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  ASSERT_EQ(1u, ids.size());
+  EXPECT_EQ("beta", ids[0]);
+  EXPECT_EQ(1, result.counts[0]);
+}
+
+TEST_F(KnnQueryTest, rootDomainPreparesKnnInsideLocalFilter) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "brand_s", "acme", "embedding_v",
+                  std::vector<float>{1, 0, 0}));
+  h.index(flatdoc("id", "b", "brand_s", "beta", "embedding_v",
+                  std::vector<float>{0.9f, 0.1f, 0}));
+  h.commit({"*"});
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  request->collection("main");
+  auto& facet = request->facet("brands", "brand_s").limit(-1);
+  auto& domain = facet.rawOp().domain.emplace();
+  auto* query = (api::Query*) facet.mr().allocate(
+      sizeof(api::Query), alignof(api::Query));
+  new (query) api::Query(
+      qb::knn(facet.mr(), "embedding_v", {1, 0, 0}, 1));
+  domain.query = query;
+  auto* filters = build::allocArray(domain.filter, 1, facet.mr());
+  filters[0] = qb::match(facet.mr(), "brand_s", "beta");
+  request->execute();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  const auto& result =
+      *request->responses[0]->proto.ops.at("brands")->facetResult();
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  ASSERT_EQ(1u, ids.size());
+  EXPECT_EQ("beta", ids[0]);
+  EXPECT_EQ(1, result.counts[0]);
+}
+
+TEST_F(KnnQueryTest, readerCanonicalDomainSourceRepreparesOutsideLiveFrame) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  FilterCacheConfig config;
+  config.maxBytes = 4 * 1024 * 1024;
+  config.minSegmentDocs = 0;
+  config.admissionThreshold = 1;
+  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(config);
+  h.index(flatdoc("id", "a", "brand_s", "acme", "embedding_v",
+                  std::vector<float>{1, 0, 0}));
+  h.index(flatdoc("id", "b", "brand_s", "beta", "embedding_v",
+                  std::vector<float>{0.9f, 0.1f, 0}));
+  h.commit({"*"});
+  auto cache = h.getIndexWriter()->getFilterCache();
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  request->collection("main");
+  auto addDomain = [&](std::string_view name, bool betaOnly) {
+    auto& facet = request->facet(name, "brand_s").limit(-1);
+    auto& domain = facet.rawOp().domain.emplace();
+    auto* query = (api::Query*) facet.mr().allocate(
+        sizeof(api::Query), alignof(api::Query));
+    new (query) api::Query(
+        qb::knn(facet.mr(), "embedding_v", {1, 0, 0}, 1));
+    domain.query = query;
+    if (betaOnly) {
+      auto* filters = build::allocArray(domain.filter, 1, facet.mr());
+      filters[0] = qb::match(facet.mr(), "brand_s", "beta");
+    }
+  };
+  addDomain("all_brands", false);
+  addDomain("beta_brands", true);
+  int64_t prepares = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  auto before = cache->counters();
+  request->execute();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  // One reader-stable kNN value plus the beta filter artifact.
+  EXPECT_EQ(before.builds + 2, cache->counters().builds);
+  EXPECT_EQ(prepares + 2, KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed));
+  const auto& all =
+      *request->responses[0]->proto.ops.at("all_brands")->facetResult();
+  const auto& beta =
+      *request->responses[0]->proto.ops.at("beta_brands")->facetResult();
+  EXPECT_EQ("acme", std::get<api::ColStr>(all.bucket_ids->kind).v[0]);
+  EXPECT_EQ("beta", std::get<api::ColStr>(beta.bucket_ids->kind).v[0]);
+}
+
+TEST_F(KnnQueryTest, identicalEffectiveVariantsShareKnnPreparation) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "brand_s", "acme", "embedding_v",
+                  std::vector<float>{1, 0, 0}));
+  h.index(flatdoc("id", "b", "brand_s", "beta", "embedding_v",
+                  std::vector<float>{0, 1, 0}));
+  h.commit({"*"});
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& top = request->collection("main").topDocs("q").limit(0);
+  top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
+  top.facet("brands", "brand_s").limit(-1);
+  top.filter(qb::all(), {"brands"});
+  int64_t prepares = KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  request->execute();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(prepares + 1, KnnQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed));
+}
+
+TEST_F(KnnQueryTest, forcePrepareCanonicalMainPreparesOnceAcrossVariants) {
+  CollectionHelper h("main");
+  h.index(flatdoc("id", "a", "text_w", "hit", "brand_s", "acme"));
+  h.index(flatdoc("id", "b", "text_w", "hit", "brand_s", "beta"));
+  h.commit({"*"});
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  request->testForcePrepare = true;
+  auto& top = request->collection("main").topDocs("q")
+      .matchQuery("text_w", "hit").limit(0);
+  top.facet("brands", "brand_s").limit(-1);
+  top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
+  int64_t prepares = ForcePrepareQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed);
+  request->execute();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(prepares + 1, ForcePrepareQuery::prepareCallsForTests.load(
+      std::memory_order_relaxed));
 }
 
 TEST_F(KnnQueryTest, routedPreparedFilterUsesParentBaseDomain) {

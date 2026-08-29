@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <utility>
 
 #include "Query.h"
@@ -13,6 +14,8 @@ class ForcePrepareQuery final : public luxir::Query {
   Query* child;
 
 public:
+  static inline std::atomic<int64_t> prepareCallsForTests{0};
+
   explicit ForcePrepareQuery(Query* child) : child(child) {}
 
   void validateLogicalImpl(
@@ -75,6 +78,7 @@ public:
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+      prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
       if (childWeight->needsPrepare()) {

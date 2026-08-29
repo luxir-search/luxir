@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -15,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-#include "luxir/query/Query.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/RequestMemTracker.h"
 
@@ -310,6 +311,23 @@ public:
     });
   }
 
+  bool sourceIsExtra(size_t source) const {
+    assert(source < querySources.size());
+    return std::ranges::any_of(variants, [&](const Variant& variant) {
+      return std::ranges::find(variant.extraSources, source)
+          != variant.extraSources.end();
+    });
+  }
+
+  bool sourceIsResetExtra(size_t source) const {
+    assert(source < querySources.size());
+    return std::ranges::any_of(variants, [&](const Variant& variant) {
+      return variant.frame == Frame::RESET
+          && std::ranges::find(variant.extraSources, source)
+              != variant.extraSources.end();
+    });
+  }
+
   bool needsInheritProduction() const {
     return std::ranges::any_of(variants, [](const Variant& variant) {
       return variant.frame == Frame::INHERIT;
@@ -340,6 +358,18 @@ public:
   size_t inheritBase(size_t variant) const {
     assert(frame(variant) == Frame::INHERIT);
     return variant == 0 ? 0 : variants[variant - 1].inheritBase;
+  }
+
+  size_t representativeInheritVariant(size_t inheritBase) const {
+    assert(inheritBase < inheritBaseCount());
+    if (inheritBase == 0) return 0;
+    for (size_t variant = 1; variant < variantCount(); variant++) {
+      if (frame(variant) == Frame::INHERIT
+          && this->inheritBase(variant) == inheritBase) {
+        return variant;
+      }
+    }
+    std::unreachable();
   }
 
   size_t resetSource(size_t variant) const {
@@ -376,6 +406,17 @@ public:
     // owned query/filter artifacts grow the charge at materialization time.
     size_t bytes = saturatedMultiply(
         3 + domainOverrideCount, estimatedSetBytes(maxDoc));
+    return std::make_shared<Reservation>(
+        tracker, bytes, std::move(detail));
+  }
+
+  std::shared_ptr<Reservation> reserveVariantPreparation(
+      RequestMemTracker& tracker, int32_t maxDoc,
+      std::string detail) const {
+    // One full-set allowance represents the prepared artifact and one covers
+    // materialization scratch. The retained M_v grows this reservation by its
+    // actual representation bytes after materialization.
+    size_t bytes = saturatedMultiply(2, estimatedSetBytes(maxDoc));
     return std::make_shared<Reservation>(
         tracker, bytes, std::move(detail));
   }
@@ -522,6 +563,243 @@ public:
     if (sets.empty()) return {};
     if (sets.size() == 1) return freeze(std::move(single));
     return freeze(DomainHandle(DocSet::intersect(sets)));
+  }
+
+  // Exact content equality for whole-reader preparation dedupe. Pointer
+  // identity is the common cheap case. Null is the all-docs identity, so a
+  // materialized full set compares equal to it as well.
+  static bool sameEffectiveDomain(
+      DocSet* left, DocSet* right, int32_t maxDoc) {
+    if (left == right) return true;
+    auto allDocs = [&](DocSet* set) {
+      if (set == nullptr) return true;
+      if (set->card() != maxDoc) return false;
+      if (set->type == DocSet::ARRAY) {
+        auto docs = ((ArrDocSet*) set)->docs();
+        return docs.empty()
+            ? maxDoc == 0
+            : docs.front() == 0 && docs.back() == maxDoc - 1;
+      }
+      const auto& bits = ((BitDocSet*) set)->bits();
+      if (bits.size() != maxDoc) return false;
+      size_t words = FixedBitSet::sizeInWords(maxDoc);
+      for (size_t i = 0; i < words; i++) {
+        uint64_t expected = ~0ULL;
+        if (i + 1 == words && (maxDoc & 63) != 0) {
+          expected = (1ULL << (maxDoc & 63)) - 1ULL;
+        }
+        if (bits.words[i] != expected) return false;
+      }
+      return true;
+    };
+    if (left == nullptr || right == nullptr) {
+      return allDocs(left) && allDocs(right);
+    }
+    if (left->card() != right->card()) return false;
+    if (left->type == DocSet::ARRAY && right->type == DocSet::ARRAY) {
+      return std::ranges::equal(
+          ((ArrDocSet*) left)->docs(), ((ArrDocSet*) right)->docs());
+    }
+    if (left->type == DocSet::BITSET && right->type == DocSet::BITSET) {
+      const auto& leftBits = ((BitDocSet*) left)->bits();
+      const auto& rightBits = ((BitDocSet*) right)->bits();
+      if (leftBits.size() != rightBits.size()) return false;
+      size_t fullWords = (size_t) leftBits.size() >> 6;
+      if (fullWords != 0 && std::memcmp(
+          leftBits.words, rightBits.words,
+          fullWords * sizeof(uint64_t)) != 0) {
+        return false;
+      }
+      int32_t tailBits = leftBits.size() & 63;
+      if (tailBits == 0) return true;
+      uint64_t mask = (1ULL << tailBits) - 1ULL;
+      return (leftBits.words[fullWords] & mask)
+          == (rightBits.words[fullWords] & mask);
+    }
+    auto* array = left->type == DocSet::ARRAY
+        ? (ArrDocSet*) left : (ArrDocSet*) right;
+    auto* bitset = left->type == DocSet::BITSET
+        ? (BitDocSet*) left : (BitDocSet*) right;
+    for (int32_t doc : array->docs()) {
+      if (!bitset->bits().get(doc)) return false;
+    }
+    return true;
+  }
+
+  static bool sameWholeReaderEffectiveDomain(
+      const std::vector<std::vector<DomainHandle>>& domains,
+      size_t left, size_t right, std::span<IndexReader::Segment> segments) {
+    assert(domains.size() == segments.size());
+    for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+      if (!sameEffectiveDomain(
+              domains[segnum][left].get(), domains[segnum][right].get(),
+              segments[segnum].maxDoc())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  struct PreparedResetVariants {
+    std::vector<std::vector<DomainHandle>> domains;
+    std::vector<uint8_t> ready;
+  };
+
+  template <typename Reserve>
+  PreparedResetVariants prepareResetVariants(
+      std::vector<QueryPrep::PreparedSource>& preparedSources,
+      const std::vector<std::vector<DomainHandle>>& eligibility,
+      std::span<DocSet* const> canonicalDomains,
+      IndexReader& reader, bool parallel, Reserve&& reserve) const {
+    auto segments = reader.segments();
+    assert(preparedSources.size() == sourceCount());
+    assert(eligibility.size() == segments.size());
+    assert(canonicalDomains.size() == segments.size());
+    size_t count = variantCount();
+
+    // A group key is the interned query-source index plus exact effective
+    // domain content across every segment. Pointer identity handles the usual
+    // case; sameEffectiveDomain closes semantic aliases such as an excluded
+    // match-all filter that produces a separately materialized full set.
+    struct Group {
+      size_t source;
+      size_t variant;
+    };
+    std::vector<Group> groups;
+    std::vector<size_t> groupForVariant(
+        count, std::numeric_limits<size_t>::max());
+    for (size_t variant = 1; variant < count; variant++) {
+      if (frame(variant) != Frame::RESET) continue;
+      size_t source = resetSource(variant);
+      auto found = std::ranges::find_if(groups, [&](const Group& group) {
+        return group.source == source
+            && sameWholeReaderEffectiveDomain(
+                eligibility, variant, group.variant, segments);
+      });
+      if (found == groups.end()) {
+        groupForVariant[variant] = groups.size();
+        groups.push_back({source, variant});
+      } else {
+        groupForVariant[variant] = (size_t) (found - groups.begin());
+      }
+    }
+
+    std::vector<std::vector<size_t>> groupsBySource(sourceCount());
+    for (size_t group = 0; group < groups.size(); group++) {
+      groupsBySource[groups[group].source].push_back(group);
+    }
+    PreparedResetVariants result;
+    result.domains.assign(
+        segments.size(), std::vector<DomainHandle>(count));
+    result.ready.assign(count, 0);
+    std::vector<std::vector<DomainHandle>> groupMatches(
+        groups.size(), std::vector<DomainHandle>(segments.size()));
+    for (size_t source = 0; source < sourceCount(); source++) {
+      if (groupsBySource[source].empty()) continue;
+      bool preparedAsExtra = sourceIsExtra(source);
+      if (!preparedAsExtra) {
+        auto canonical = std::ranges::find_if(
+            groupsBySource[source], [&](size_t group) {
+              size_t variant = groups[group].variant;
+              for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+                if (!sameEffectiveDomain(
+                        eligibility[segnum][variant].get(),
+                        canonicalDomains[segnum],
+                        segments[segnum].maxDoc())) {
+                  return false;
+                }
+              }
+              return true;
+            });
+        if (canonical != groupsBySource[source].end()) {
+          std::iter_swap(groupsBySource[source].begin(), canonical);
+        }
+      }
+      size_t firstGroup = groupsBySource[source].front();
+      size_t firstVariant = groups[firstGroup].variant;
+      if (!preparedAsExtra) {
+        std::vector<DocSet*> views(segments.size());
+        for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+          views[segnum] = eligibility[segnum][firstVariant].get();
+        }
+        Query::Weight::PrepareContext context{
+          reader,
+          std::span<DocSet* const>(views.data(), views.size()),
+          parallel
+        };
+        std::array<Query::Weight*, 1> weights{sourceWeight(source)};
+        std::array<FilterCache::Use*, 1> uses{sourceUse(source)};
+        auto prepared = QueryPrep::prepareFilterSources(
+            weights, uses, context);
+        preparedSources[source] = std::move(prepared[0]);
+      }
+      if (preparedSources[source].domainDependence
+          == PreparedDomainDependence::QUERY_CANONICAL) {
+        continue;
+      }
+
+      for (size_t group : groupsBySource[source]) {
+        size_t variant = groups[group].variant;
+        std::vector<std::shared_ptr<Reservation>> reservations(
+            segments.size());
+        for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+          reservations[segnum] = reserve(variant, segnum);
+        }
+        Query::Weight::PreparedWeight* variantWeight = nullptr;
+        std::unique_ptr<Query::Weight::PreparedWeight> ownedWeight;
+        bool reuseInitial = !preparedAsExtra && group == firstGroup;
+        if (preparedAsExtra) {
+          reuseInitial = true;
+          for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+            if (!sameEffectiveDomain(
+                    eligibility[segnum][variant].get(),
+                    canonicalDomains[segnum], segments[segnum].maxDoc())) {
+              reuseInitial = false;
+              break;
+            }
+          }
+        }
+        if (reuseInitial) {
+          variantWeight = preparedSources[source].prepared.get();
+        } else {
+          std::vector<DocSet*> views(segments.size());
+          for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+            views[segnum] = eligibility[segnum][variant].get();
+          }
+          Query::Weight::PrepareContext context{
+            reader,
+            std::span<DocSet* const>(views.data(), views.size()),
+            parallel
+          };
+          ownedWeight = sourceWeight(source)->prepare(context);
+          variantWeight = ownedWeight.get();
+        }
+        for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+          auto reservation = reservations[segnum];
+          DomainHandle matches(QueryPrep::materialize(
+              *sourceWeight(source), variantWeight, segments[segnum],
+              eligibility[segnum][variant].get()));
+          if (matches.get() != nullptr) {
+            reservation->grow(matches.get()->ramBytesUsed());
+          }
+          groupMatches[group][segnum] =
+              std::move(matches).retainedWith(reservation);
+        }
+      }
+    }
+    for (size_t variant = 1; variant < count; variant++) {
+      size_t group = groupForVariant[variant];
+      if (group == std::numeric_limits<size_t>::max()
+          || preparedSources[groups[group].source].domainDependence
+              == PreparedDomainDependence::QUERY_CANONICAL) {
+        continue;
+      }
+      result.ready[variant] = 1;
+      for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+        result.domains[segnum][variant] = groupMatches[group][segnum];
+      }
+    }
+    return result;
   }
 
   void retainReservation(
