@@ -382,11 +382,6 @@ public:
   CanonicalValueSet canonicalizeFieldValues(
       std::string_view field, ValueSequence values,
       bool preserveInputOrder = false) {
-    if (values.size() > ValueSequence::MAX_VALUES) {
-      throw std::runtime_error(std::format(
-          "AnyOfQuery values exceeds the {} value limit",
-          ValueSequence::MAX_VALUES));
-    }
     if (values.empty()) {
       return CanonicalValueSet(field);
     }

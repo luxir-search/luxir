@@ -431,11 +431,6 @@ public:
           + location
           + ": selected is only supported on facets directly inside TopDocs.ops");
     }
-    if (selected.size() > ValueSequence::MAX_VALUES) {
-      throw std::runtime_error(std::format(
-          "facet '{}': selected exceeds the {} selection limit",
-          facetName, ValueSequence::MAX_VALUES));
-    }
   }
 
   static std::string selectionValueText(const api::Val& value) {

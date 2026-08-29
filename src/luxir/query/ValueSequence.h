@@ -22,8 +22,6 @@ public:
     MUST_NOT_BE_NULL,
   };
 
-  static constexpr size_t MAX_VALUES = 1024;
-
 private:
   using ValSpan = std::span<const api::Val>;
   using StrSpan = std::span<const std::string_view>;

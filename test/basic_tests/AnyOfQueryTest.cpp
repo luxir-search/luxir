@@ -143,12 +143,19 @@ TEST(AnyOfQueryBuilderTest, numericIntervalsCoalesceAndValueCountIsLimited) {
   EXPECT_EQ(90, predicate->intervals()[1].lo);
   EXPECT_EQ(90, predicate->intervals()[1].hi);
 
-  std::vector<int64_t> tooMany(ValueSequence::MAX_VALUES + 1);
-  api::Val oversized;
-  oversized.kind.emplace<api::ArrInt>().v = tooMany;
-  EXPECT_THROW(builder.canonicalizeFieldValues(
-      "num_i", ValueSequence(oversized, "AnyOfQuery values")),
-      std::runtime_error);
+  // No arbitrary value-count limit: request size is the natural bound.
+  std::vector<int64_t> many(5000);
+  for (size_t i = 0; i < many.size(); i++) {
+    many[i] = (int64_t)(i * 2);
+  }
+  api::Val large;
+  large.kind.emplace<api::ArrInt>().v = many;
+  CanonicalValueSet largeSet = builder.canonicalizeFieldValues(
+      "num_i", ValueSequence(large, "AnyOfQuery values"));
+  auto* largePredicate = dynamic_cast<NumericPredicateQuery*>(
+      builder.createAnyOfQuery(largeSet));
+  ASSERT_NE(nullptr, largePredicate);
+  EXPECT_EQ(many.size(), largePredicate->intervals().size());
 }
 
 TEST_F(AnyOfQueryTest, indexedTermsSingleParityAndUnion) {

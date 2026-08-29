@@ -4911,21 +4911,6 @@ TEST_F(FacetTest, selectedValidationIsParseTime) {
   EXPECT_EQ(10, duplicateIds[0]);
   EXPECT_EQ(1, duplicateResult.counts[0]);
 
-  auto req = localReq(luxirNode->getSearchEngine());
-  auto& facetCursor = req->collection("main").topDocs("q").allQuery()
-      .facet("f", "brand_s");
-  auto& facet = std::get<api::FieldFacet>(facetCursor.rawOp().kind);
-  auto* sequence = api::build::allocMessage<api::Val>(req->mr);
-  auto& strings = sequence->kind.emplace<api::ArrStr>();
-  auto* selected = api::build::allocArray(strings.v, 1025, req->mr);
-  for (size_t i = 0; i < strings.v.size(); i++) {
-    selected[i] = api::build::arenaStr(req->mr, std::to_string(i));
-  }
-  facet.selected = sequence;
-  ExpectLog quiet("Search request failed:");
-  req->execute();
-  EXPECT_NE(std::string::npos, req->errorMsg().find("1024 selection limit"))
-      << req->errorMsg();
 }
 
 TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
