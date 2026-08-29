@@ -35,7 +35,7 @@
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
-#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/QueryPrep.h"
@@ -5427,9 +5427,9 @@ TEST(FilterKeyTest, dateMathKeysFollowCoercedBuckets) {
   DateRange same = *parseDateRange("NOW/DAY", evening, utc);
   DateRange next = *parseDateRange("NOW/DAY", tomorrow, utc);
 
-  NumericRangeQuery firstQuery("when", first.lo, first.hiExclusive - 1);
-  NumericRangeQuery sameQuery("when", same.lo, same.hiExclusive - 1);
-  NumericRangeQuery nextQuery("when", next.lo, next.hiExclusive - 1);
+  NumericPredicateQuery firstQuery("when", first.lo, first.hiExclusive - 1);
+  NumericPredicateQuery sameQuery("when", same.lo, same.hiExclusive - 1);
+  NumericPredicateQuery nextQuery("when", next.lo, next.hiExclusive - 1);
   FilterKeyContext ctx{.schemaGen = 7, .timeZone = "UTC"};
 
   EXPECT_EQ(keyFor(firstQuery, ctx), keyFor(sameQuery, ctx));
@@ -5437,7 +5437,7 @@ TEST(FilterKeyTest, dateMathKeysFollowCoercedBuckets) {
 }
 
 TEST(FilterKeyTest, discriminatesTimezoneAndSchemaGeneration) {
-  NumericRangeQuery query("when", 100, 200);
+  NumericPredicateQuery query("when", 100, 200);
   FilterKeyContext utc{.schemaGen = 3, .timeZone = "UTC"};
   FilterKeyContext newYork{.schemaGen = 3, .timeZone = "America/New_York"};
   FilterKeyContext newSchema{.schemaGen = 4, .timeZone = "UTC"};
@@ -5544,7 +5544,7 @@ TEST(FilterKeyTest, everyConcreteQueryMakesAnExplicitScopeDecision) {
   std::array<int32_t, 2> phrasePositions{0, 1};
   PhraseQuery phrase("f", phraseTerms, phrasePositions, 0);
   ExistsQuery exists("f");
-  NumericRangeQuery numeric("n", 1, 2);
+  NumericPredicateQuery numeric("n", 1, 2);
   PrefixQuery prefix("f", "pre");
   TermRangeQuery range("f", "a", true, "z", false);
   FuzzyQuery fuzzy("f", "term", 1);
@@ -5592,7 +5592,7 @@ constexpr int32_t DOC_UNIVERSE = 96;
 enum class FilterKind : uint8_t {
   DENSE_TERM,
   SPARSE_TERM,
-  NUMERIC_RANGE,
+  NUMERIC_PREDICATE_RANGE,
   REQUIRED_AND_FILTER,
   REQUIRED_AND_OPTIONAL,
   MATCH_NONE,
@@ -5615,7 +5615,7 @@ bool matchesFilter(FilterKind kind, int32_t id) {
       return id % 3 == 0;
     case FilterKind::SPARSE_TERM:
       return id % 17 == 0;
-    case FilterKind::NUMERIC_RANGE: {
+    case FilterKind::NUMERIC_PREDICATE_RANGE: {
       int32_t value = id % 19;
       return value >= 5 && value <= 11;
     }
@@ -5643,7 +5643,7 @@ api::Query buildFilter(FilterKind kind, std::pmr::memory_resource& mr) {
       return qb::match(mr, "tag_s", "t0");
     case FilterKind::SPARSE_TERM:
       return qb::match(mr, "sparse_s", "rare");
-    case FilterKind::NUMERIC_RANGE:
+    case FilterKind::NUMERIC_PREDICATE_RANGE:
       return qb::range(mr, "num_i", qb::valI64(mr, 5), nullptr,
                        qb::valI64(mr, 11), nullptr);
     case FilterKind::REQUIRED_AND_FILTER: {

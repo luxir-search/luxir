@@ -12,6 +12,7 @@
 #include "FieldReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/PointsWriter.h"
+#include "luxir/util/screaming.h"
 
 namespace luxir {
 
@@ -97,6 +98,16 @@ public:
   struct LeafValueBounds {
     uint16_t lower = 0;
     uint16_t upper = 0;
+  };
+
+  struct ValueRange {
+    int64_t lo;
+    int64_t hi;
+  };
+
+  struct OrdinalRange {
+    uint64_t begin;
+    uint64_t end;
   };
 
   struct Point {
@@ -254,6 +265,102 @@ public:
     return bounds;
   }
 
+  // Resolve sorted, disjoint value intervals to sorted, disjoint point
+  // ordinal runs. The one-interval path is the original range lookup. For a
+  // set, leaves are visited once in value order and the interval cursor
+  // gallops forward with them; each touched leaf's values are decoded at most
+  // once. Adjacent ordinal runs are merged when the value gap is absent from
+  // the dictionary.
+  size_t ordinalRanges(std::span<const ValueRange> ranges,
+                       std::span<OrdinalRange> output,
+                       std::span<uint32_t> residualScratch,
+                       std::span<int64_t> valueScratch) const {
+    if (ranges.empty()) return 0;
+    if (output.size() < ranges.size()) {
+      throw std::invalid_argument(
+          "PointsReader: ordinal range output is too small");
+    }
+    assert(std::is_sorted(
+        ranges.begin(), ranges.end(),
+        [](const ValueRange& a, const ValueRange& b) { return a.lo < b.lo; }));
+
+    size_t outputSize = 0;
+    auto append = [&](uint64_t begin, uint64_t end) {
+      if (begin == end) return;
+      if (outputSize != 0 && output[outputSize - 1].end == begin) {
+        output[outputSize - 1].end = end;
+      } else {
+        output[outputSize++] = {begin, end};
+      }
+    };
+
+    FenceRange fence = fenceRange(ranges.front().lo, ranges.back().hi);
+    if (fence.empty) return 0;
+    if (ranges.size() == 1) {
+      LeafValueBounds first = valueBounds(
+          fence.firstLeaf, ranges[0].lo, ranges[0].hi,
+          residualScratch, valueScratch);
+      uint64_t begin = leafOrdinalStart(fence.firstLeaf) + first.lower;
+      uint64_t end;
+      if (fence.firstLeaf == fence.lastLeaf) {
+        end = leafOrdinalStart(fence.firstLeaf) + first.upper;
+      } else {
+        LeafValueBounds last = valueBounds(
+            fence.lastLeaf, ranges[0].lo, ranges[0].hi,
+            residualScratch, valueScratch);
+        end = leafOrdinalStart(fence.lastLeaf) + last.upper;
+      }
+      append(begin, end);
+      return outputSize;
+    }
+
+    int64_t rangeCursor = 0;
+    for (uint32_t leaf = fence.firstLeaf; leaf <= fence.lastLeaf; leaf++) {
+      int64_t leafLo = leafMin(leaf);
+      int64_t leafHi = leafMax(leaf);
+      rangeCursor = screaming::gallopLowerBound(
+          rangeCursor, (int64_t)ranges.size(), leafLo,
+          [&](int64_t index) { return ranges[(size_t)index].hi; });
+      if (rangeCursor == (int64_t)ranges.size()) break;
+      if (ranges[(size_t)rangeCursor].lo > leafHi) continue;
+
+      uint16_t count = 0;
+      int64_t valueCursor = 0;
+      for (size_t i = (size_t)rangeCursor;
+           i < ranges.size() && ranges[i].lo <= leafHi; i++) {
+        const ValueRange& range = ranges[i];
+        if (range.hi < leafLo) continue;
+        uint16_t begin;
+        uint16_t end;
+        if (range.lo <= leafLo && leafHi <= range.hi) {
+          LeafInfo info = leafInfo(leaf);
+          begin = 0;
+          end = info.count;
+        } else {
+          if (count == 0) {
+            count = decodeLeafValuesInto(
+                leaf, valueScratch, residualScratch);
+          }
+          valueCursor = screaming::gallopLowerBound(
+              valueCursor, count, range.lo,
+              [&](int64_t index) { return valueScratch[(size_t)index]; });
+          begin = (uint16_t)valueCursor;
+          if (range.hi == std::numeric_limits<int64_t>::max()) {
+            valueCursor = count;
+          } else {
+            valueCursor = screaming::gallopLowerBound(
+                valueCursor, count, range.hi + 1,
+                [&](int64_t index) { return valueScratch[(size_t)index]; });
+          }
+          end = (uint16_t)valueCursor;
+        }
+        uint64_t leafStart = leafOrdinalStart(leaf);
+        append(leafStart + begin, leafStart + end);
+      }
+    }
+    return outputSize;
+  }
+
   // Global ordinal of the first point whose value is at least value.
   uint64_t ordinalOfFirstAtLeast(int64_t value,
                                  std::span<uint32_t> residualScratch,
@@ -363,6 +470,30 @@ public:
     }
   }
 
+  uint16_t decodeLeafValuesInto(
+      uint32_t leafIndex, std::span<int64_t> values,
+      std::span<uint32_t> residualScratch) const {
+    LeafInfo info = leafInfo(leafIndex);
+    if (values.size() < info.count || residualScratch.size() < info.count) {
+      throw std::invalid_argument(
+          "PointsReader: leaf value scratch is too small");
+    }
+    const char* docPayload =
+        points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
+    const char* valuePayload = docPayload + info.docBytes;
+    if (info.valueFormat <= 32) {
+      IndexCodec::numericCodec.decodeWithMeta(valuePayload, residualScratch.data(),
+                                               info.count, info.valueFormat);
+      for (uint32_t i = 0; i < info.count; i++) {
+        values[i] = (int64_t)((uint64_t)residualScratch[i] * info.valueGcd
+                              + (uint64_t)info.valueMin);
+      }
+    } else {
+      memcpy(values.data(), valuePayload, (size_t)info.count * sizeof(int64_t));
+    }
+    return info.count;
+  }
+
   uint16_t decodeLeafInto(uint32_t leafIndex, std::span<int64_t> values,
                           std::span<uint32_t> docids,
                           std::span<uint32_t> residualScratch) const {
@@ -373,7 +504,6 @@ public:
     }
 
     const char* docPayload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
-    const char* valuePayload = docPayload + info.docBytes;
     if (info.docCodec == PointsWriter::DOC_CONTIG) {
       for (uint32_t i = 0; i < info.count; i++) docids[i] = info.docBase + i;
     } else if (info.docCodec == PointsWriter::DOC_FOR) {
@@ -407,17 +537,7 @@ public:
       invalid("reserved docid codec");
     }
 
-    if (info.valueFormat <= 32) {
-      IndexCodec::numericCodec.decodeWithMeta(valuePayload, residualScratch.data(),
-                                               info.count, info.valueFormat);
-      for (uint32_t i = 0; i < info.count; i++) {
-        values[i] = (int64_t)((uint64_t)residualScratch[i] * info.valueGcd
-                              + (uint64_t)info.valueMin);
-      }
-    } else {
-      memcpy(values.data(), valuePayload, (size_t)info.count * sizeof(int64_t));
-    }
-    return info.count;
+    return decodeLeafValuesInto(leafIndex, values, residualScratch);
   }
 
   void validate() const {

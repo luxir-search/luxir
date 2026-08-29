@@ -11,8 +11,10 @@
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/QueryBuilder.h"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/query/TermQuery.h"
 #include "test/CollectionHelper.h"
+#include "test/SchemaBuilder.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/LuxirTest.h"
@@ -93,7 +95,7 @@ TEST(AnyOfQueryBuilderTest, canonicalTermShapes) {
   api::Val oneValue;
   oneValue.kind.emplace<api::ArrStr>().v = one;
   CanonicalValueSet oneCanonical = builder.canonicalizeFieldValues(
-      "body_un", ValueSequence(oneValue));
+      "body_un", ValueSequence(oneValue, "AnyOfQuery values"));
   auto* singleton = dynamic_cast<ConstantScoreQuery*>(
       builder.createAnyOfQuery(oneCanonical));
   ASSERT_NE(nullptr, singleton);
@@ -105,7 +107,7 @@ TEST(AnyOfQueryBuilderTest, canonicalTermShapes) {
   api::Val twoValues;
   twoValues.kind.emplace<api::ArrStr>().v = two;
   CanonicalValueSet twoCanonical = builder.canonicalizeFieldValues(
-      "body_un", ValueSequence(twoValues));
+      "body_un", ValueSequence(twoValues, "AnyOfQuery values"));
   ASSERT_EQ(2u, twoCanonical.size());
   for (size_t i = 0; i < twoCanonical.size(); i++) {
     auto* clause = dynamic_cast<ConstantScoreQuery*>(
@@ -117,9 +119,36 @@ TEST(AnyOfQueryBuilderTest, canonicalTermShapes) {
   api::Val emptyValue;
   emptyValue.kind.emplace<api::ArrStr>();
   CanonicalValueSet emptyCanonical = builder.canonicalizeFieldValues(
-      "body_un", ValueSequence(emptyValue));
+      "body_un", ValueSequence(emptyValue, "AnyOfQuery values"));
   EXPECT_NE(nullptr, dynamic_cast<MatchNoDocsQuery*>(
       builder.createAnyOfQuery(emptyCanonical)));
+}
+
+TEST(AnyOfQueryBuilderTest, numericIntervalsCoalesceAndValueCountIsLimited) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+
+  std::array<int64_t, 4> input{90, 45, 44, 46};
+  api::Val value;
+  value.kind.emplace<api::ArrInt>().v = input;
+  CanonicalValueSet canonical = builder.canonicalizeFieldValues(
+      "num_i", ValueSequence(value, "AnyOfQuery values"));
+  auto* predicate = dynamic_cast<NumericPredicateQuery*>(
+      builder.createAnyOfQuery(canonical));
+  ASSERT_NE(nullptr, predicate);
+  ASSERT_EQ(2, predicate->intervals().size());
+  EXPECT_EQ(44, predicate->intervals()[0].lo);
+  EXPECT_EQ(46, predicate->intervals()[0].hi);
+  EXPECT_EQ(90, predicate->intervals()[1].lo);
+  EXPECT_EQ(90, predicate->intervals()[1].hi);
+
+  std::vector<int64_t> tooMany(ValueSequence::MAX_VALUES + 1);
+  api::Val oversized;
+  oversized.kind.emplace<api::ArrInt>().v = tooMany;
+  EXPECT_THROW(builder.canonicalizeFieldValues(
+      "num_i", ValueSequence(oversized, "AnyOfQuery values")),
+      std::runtime_error);
 }
 
 TEST_F(AnyOfQueryTest, indexedTermsSingleParityAndUnion) {
@@ -269,4 +298,103 @@ TEST_F(AnyOfQueryTest, invalidValueKindsAreParseTimeErrors) {
     nested.kind.emplace<api::ArrInt>();
     return anyOfQuery(mr, "brand_s", {nested});
   }, "must be a scalar field value, not a nested array");
+}
+
+// A points leaf holds a contiguous run of values, and fenceRange() resolves an
+// interval to whole leaves. For a single range every interior leaf is entirely
+// inside the bounds, so leaf-granular inclusion is safe. A value SET has gaps:
+// two far-apart values can fence to the same leaf, and unioning at leaf
+// granularity would admit every value between them. These pin the per-value
+// filtering that prevents that, on both the points and column arms.
+class AnyOfLeafStraddleTest : public LuxirTest {
+public:
+  CollectionHelper helper;
+
+  struct Arms {
+    int64_t sparse = 0;
+    int64_t complement = 0;
+    int64_t points = 0;
+    int64_t zone = 0;
+  };
+  Arms arms;
+
+  void indexValues(bool points, const std::vector<int64_t>& values) {
+    SchemaBuilder b;
+    auto& f = b.field("pt");
+    f.type = api::FieldDef::FieldClass::INT;
+    f.index = points ? api::FieldDef::IndexMode::RANGE
+                     : api::FieldDef::IndexMode::NONE;
+    b.set(helper.collection());
+
+    std::vector<Doc> docs;
+    for (int64_t value : values) {
+      docs.push_back(flatdoc("id", "v" + std::to_string(value), "pt", value));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+
+  std::vector<std::string> runAnyOf(std::initializer_list<int64_t> selected) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q");
+    std::vector<api::Val> vals;
+    for (int64_t value : selected) vals.push_back(intVal(value));
+    api::Query query;
+    auto& anyOf = query.kind.emplace<api::AnyOfQuery>();
+    anyOf.field = api::build::arenaStr(top.mr(), "pt");
+    auto* sequence = api::build::allocMessage<api::Val>(top.mr());
+    auto& mixed = sequence->kind.emplace<api::ArrVal>();
+    api::Val* stored = api::build::allocArray(mixed.v, vals.size(), top.mr());
+    std::copy(vals.begin(), vals.end(), stored);
+    anyOf.values = sequence;
+    top.rawQuery() = query;
+    top.fields({"id"}).limit(-1);
+    SkipStats::reset();
+    SkipStats::enabled = true;
+    req->execute();
+    SkipStats::enabled = false;
+    arms = {SkipStats::numericPredicateSparseVerifyArms,
+            SkipStats::numericPredicateComplementArms,
+            SkipStats::numericPredicatePointsArms,
+            SkipStats::numericPredicateZoneArms};
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  }
+};
+
+// Few enough docs that every value shares one points leaf, so both selected
+// values fence to that leaf with the unselected ones sitting between them.
+TEST_F(AnyOfLeafStraddleTest, pointsGapValuesWithinOneLeafDoNotMatch) {
+  indexValues(true, {10, 11, 500, 999, 1000, 1001, 5000});
+  EXPECT_EQ((std::vector<std::string>{"v10", "v1000"}), runAnyOf({10, 1000}));
+  EXPECT_GT(arms.points, 0) << "expected the points arm";
+  EXPECT_EQ((std::vector<std::string>{"v10", "v11", "v5000"}),
+            runAnyOf({10, 11, 5000}));
+  EXPECT_EQ((std::vector<std::string>{}), runAnyOf({12, 998}));
+}
+
+TEST_F(AnyOfLeafStraddleTest, pointsGapValuesAcrossManyLeavesDoNotMatch) {
+  std::vector<int64_t> values;
+  for (int64_t i = 0; i < 4000; i += 2) values.push_back(i);
+  indexValues(true, values);
+
+  EXPECT_EQ((std::vector<std::string>{"v0", "v2000", "v3998"}),
+            runAnyOf({0, 2000, 3998}));
+  EXPECT_GT(arms.points, 0) << "expected the points arm";
+  // Odd values were never indexed: every selected value falls in a gap.
+  EXPECT_EQ((std::vector<std::string>{}), runAnyOf({1, 1999, 3997}));
+  // Adjacent indexed values coalesce into one interval; the absent odd value
+  // between them must not widen it into a range that admits anything else.
+  EXPECT_EQ((std::vector<std::string>{"v1000", "v1002"}),
+            runAnyOf({1000, 1001, 1002}));
+}
+
+// The same gaps must be respected when the field has no points index and the
+// query falls to the doc-order column arms.
+TEST_F(AnyOfLeafStraddleTest, columnOnlyGapValuesDoNotMatch) {
+  indexValues(false, {10, 11, 500, 999, 1000, 1001, 5000});
+  EXPECT_EQ(0, arms.points);
+  EXPECT_EQ((std::vector<std::string>{"v10", "v1000"}), runAnyOf({10, 1000}));
+  EXPECT_EQ((std::vector<std::string>{"v10", "v11", "v5000"}),
+            runAnyOf({10, 11, 5000}));
+  EXPECT_EQ((std::vector<std::string>{}), runAnyOf({12, 998}));
 }

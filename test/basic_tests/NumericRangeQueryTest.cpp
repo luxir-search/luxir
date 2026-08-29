@@ -25,7 +25,7 @@ namespace api = luxir::api;
 // scanning the field's numeric column.  Tests assert the exact set of matching
 // id_s values so bound handling, missing values, multi-valued "any", encoded
 // sortable order, and two-phase conjunctions are all observable from results.
-class NumericRangeQueryTest : public LuxirTest {
+class NumericPredicateQueryTest : public LuxirTest {
 protected:
   // Run a top-level query built from `build` (given the request arena) and
   // return the sorted id_s of the matching docs.
@@ -62,7 +62,7 @@ auto i64Range(std::string_view field, std::optional<int64_t> gte, std::optional<
 
 }  // namespace
 
-TEST_F(NumericRangeQueryTest, intBoundsMissingAndOpen) {
+TEST_F(NumericPredicateQueryTest, intBoundsMissingAndOpen) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "num_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "num_i", 10), UpdateMessage::NO_COMMIT);
@@ -96,7 +96,7 @@ TEST_F(NumericRangeQueryTest, intBoundsMissingAndOpen) {
   EXPECT_TRUE(idsFor(i64Range("num_i", 20, 10)).empty());
 }
 
-TEST_F(NumericRangeQueryTest, numericMatchEquality) {
+TEST_F(NumericPredicateQueryTest, numericMatchEquality) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "num_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "num_i", 10), UpdateMessage::NO_COMMIT);
@@ -121,7 +121,7 @@ TEST_F(NumericRangeQueryTest, numericMatchEquality) {
   EXPECT_TRUE(idsFor(i64Range("num_i", 999, 999)).empty());
 }
 
-TEST_F(NumericRangeQueryTest, multiValuedAnyAndEmptyArray) {
+TEST_F(NumericPredicateQueryTest, multiValuedAnyAndEmptyArray) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "prices_is", vec_i(20, 35, 45)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "prices_is", 35), UpdateMessage::NO_COMMIT);
@@ -137,7 +137,7 @@ TEST_F(NumericRangeQueryTest, multiValuedAnyAndEmptyArray) {
   EXPECT_EQ(sorted({"a", "b", "d"}), idsFor(i64Range("prices_is", std::nullopt, std::nullopt)));
 }
 
-TEST_F(NumericRangeQueryTest, floatSortableOrderAndSignedZero) {
+TEST_F(NumericPredicateQueryTest, floatSortableOrderAndSignedZero) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "val_f", -3.5f), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "val_f", -0.5f), UpdateMessage::NO_COMMIT);
@@ -165,7 +165,7 @@ TEST_F(NumericRangeQueryTest, floatSortableOrderAndSignedZero) {
   }));
 }
 
-TEST_F(NumericRangeQueryTest, doubleRange) {
+TEST_F(NumericPredicateQueryTest, doubleRange) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "val_d", -2.5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "val_d", 3.14), UpdateMessage::NO_COMMIT);
@@ -182,7 +182,7 @@ TEST_F(NumericRangeQueryTest, doubleRange) {
   EXPECT_EQ(sorted({"c"}), idsFor(dRange(1e9, std::nullopt)));
 }
 
-TEST_F(NumericRangeQueryTest, dateRangeIsoStrings) {
+TEST_F(NumericPredicateQueryTest, dateRangeIsoStrings) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "when_dt", "2000-01-01"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "when_dt", "2010-06-15T12:00:00Z"), UpdateMessage::NO_COMMIT);
@@ -201,7 +201,7 @@ TEST_F(NumericRangeQueryTest, dateRangeIsoStrings) {
   EXPECT_EQ(sorted({"a"}), idsFor(dtRange(nullptr, nullptr, nullptr, "2010-06-15T12:00:00Z")));
 }
 
-TEST_F(NumericRangeQueryTest, conjunctionAndConstantScore) {
+TEST_F(NumericPredicateQueryTest, conjunctionAndConstantScore) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "text_w", "red apple", "num_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "text_w", "red apple", "num_i", 15), UpdateMessage::NO_COMMIT);
@@ -252,7 +252,7 @@ TEST(NumericRangeBuilder, validation) {
   EXPECT_NE(builder.createRangeQuery("num_i", &a, nullptr, &b, nullptr), nullptr);
 }
 
-TEST_F(NumericRangeQueryTest, int64Extremes) {
+TEST_F(NumericPredicateQueryTest, int64Extremes) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "lo", "num_i", std::numeric_limits<int64_t>::min()),
                UpdateMessage::NO_COMMIT);

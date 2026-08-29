@@ -36,7 +36,7 @@ enum class FilterKeyTag : uint8_t {
   TERM = 3,
   PHRASE = 4,
   EXISTS = 5,
-  NUMERIC_RANGE = 6,
+  NUMERIC_PREDICATE_RANGE = 6,
   PREFIX = 7,
   TERM_RANGE = 8,
   FUZZY = 9,

@@ -16,6 +16,15 @@ namespace luxir {
 // the arm once and then walk a contiguous scalar span. ArrVal and legacy
 // span-of-Val producers retain element-wise dispatch for their mixed values.
 class ValueSequence {
+public:
+  enum class NullError {
+    SCALAR_REQUIRED,
+    MUST_NOT_BE_NULL,
+  };
+
+  static constexpr size_t MAX_VALUES = 1024;
+
+private:
   using ValSpan = std::span<const api::Val>;
   using StrSpan = std::span<const std::string_view>;
   using IntSpan = std::span<const int64_t>;
@@ -24,13 +33,12 @@ class ValueSequence {
   using BoolSpan = std::span<const bool>;
   using BinSpan = std::span<const ::hpp_proto::bytes_view>;
 
-  struct Invalid {
-    const api::Val* value;
-  };
+  struct Unchecked {};
 
-  std::variant<Invalid, ValSpan, StrSpan, IntSpan, DoubleSpan,
+  std::variant<ValSpan, StrSpan, IntSpan, DoubleSpan,
                FloatSpan, BoolSpan, BinSpan> values = ValSpan{};
 
+  ValueSequence(ValSpan value, Unchecked) : values(value) {}
   explicit ValueSequence(StrSpan value) : values(value) {}
   explicit ValueSequence(IntSpan value) : values(value) {}
   explicit ValueSequence(DoubleSpan value) : values(value) {}
@@ -58,16 +66,36 @@ class ValueSequence {
     return "an unsupported value";
   }
 
+  static void rejectInvalid(const api::Val& value, std::string_view name,
+                            NullError nullError) {
+    if (nullError == NullError::MUST_NOT_BE_NULL && coerce::isNull(value)) {
+      throw std::runtime_error(std::format("{} must not be null", name));
+    }
+    throw std::runtime_error(std::format(
+        "{} must contain scalar field values, not {}",
+        name, invalidKind(value)));
+  }
+
 public:
-  enum class NullError {
-    SCALAR_REQUIRED,
-    MUST_NOT_BE_NULL,
-  };
-
   ValueSequence() = default;
-  explicit ValueSequence(ValSpan values) : values(values) {}
+  ValueSequence(ValSpan input, std::string_view name,
+                NullError nullError = NullError::SCALAR_REQUIRED) {
+    for (size_t i = 0; i < input.size(); i++) {
+      if (scalar(input[i])) continue;
+      if (nullError == NullError::MUST_NOT_BE_NULL
+          && coerce::isNull(input[i])) {
+        throw std::runtime_error(std::format(
+            "{}[{}] must not be null", name, i));
+      }
+      throw std::runtime_error(std::format(
+          "{}[{}] must be a scalar field value, not {}",
+          name, i, invalidKind(input[i])));
+    }
+    values = input;
+  }
 
-  explicit ValueSequence(const api::Val& value) {
+  ValueSequence(const api::Val& value, std::string_view name,
+                NullError nullError = NullError::SCALAR_REQUIRED) {
     std::visit([&](const auto& arm) {
       using Arm = std::decay_t<decltype(arm)>;
       if constexpr (std::is_same_v<Arm, std::string_view>
@@ -78,7 +106,7 @@ public:
                     || std::is_same_v<Arm, ::hpp_proto::bytes_view>) {
         values = std::span(&arm, (size_t)1);
       } else if constexpr (std::is_same_v<Arm, api::ArrVal>) {
-        values = ValSpan(arm.v);
+        *this = ValueSequence(ValSpan(arm.v), name, nullError);
       } else if constexpr (std::is_same_v<Arm, api::ArrStr>
                            || std::is_same_v<Arm, api::ArrInt>
                            || std::is_same_v<Arm, api::ArrDouble>
@@ -86,70 +114,32 @@ public:
                            || std::is_same_v<Arm, api::ArrBin>) {
         values = std::span(arm.v);
       } else {
-        values = Invalid{&value};
+        rejectInvalid(value, name, nullError);
       }
     }, value.kind);
   }
 
   size_t size() const {
     return std::visit([](const auto& viewed) -> size_t {
-      using Viewed = std::decay_t<decltype(viewed)>;
-      if constexpr (std::is_same_v<Viewed, Invalid>) return 1;
-      else return viewed.size();
+      return viewed.size();
     }, values);
   }
 
   bool empty() const { return size() == 0; }
 
-  void validate(std::string_view name,
-                NullError nullError = NullError::SCALAR_REQUIRED) const {
-    std::visit([&](const auto& viewed) {
-      using Viewed = std::decay_t<decltype(viewed)>;
-      if constexpr (std::is_same_v<Viewed, Invalid>) {
-        if (nullError == NullError::MUST_NOT_BE_NULL
-            && coerce::isNull(*viewed.value)) {
-          throw std::runtime_error(std::format("{} must not be null", name));
-        }
-        throw std::runtime_error(std::format(
-            "{} must contain scalar field values, not {}",
-            name, invalidKind(*viewed.value)));
-      } else if constexpr (std::is_same_v<Viewed, ValSpan>) {
-        for (size_t i = 0; i < viewed.size(); i++) {
-          if (!scalar(viewed[i])) {
-            if (nullError == NullError::MUST_NOT_BE_NULL
-                && coerce::isNull(viewed[i])) {
-              throw std::runtime_error(std::format(
-                  "{}[{}] must not be null", name, i));
-            }
-            throw std::runtime_error(std::format(
-                "{}[{}] must be a scalar field value, not {}",
-                name, i, invalidKind(viewed[i])));
-          }
-        }
-      }
-    }, values);
-  }
-
   ValueSequence element(size_t index) const {
     return std::visit([&](const auto& viewed) -> ValueSequence {
       using Viewed = std::decay_t<decltype(viewed)>;
-      if constexpr (std::is_same_v<Viewed, Invalid>) {
-        return ValueSequence(*viewed.value);
-      } else {
-        return ValueSequence(viewed.subspan(index, 1));
-      }
+      if constexpr (std::is_same_v<Viewed, ValSpan>) {
+        return ValueSequence(viewed.subspan(index, 1), Unchecked{});
+      } else return ValueSequence(viewed.subspan(index, 1));
     }, values);
   }
 
   template<typename F>
   decltype(auto) visit(F&& visitor) const {
     return std::visit([&](const auto& viewed) -> decltype(auto) {
-      using Viewed = std::decay_t<decltype(viewed)>;
-      if constexpr (std::is_same_v<Viewed, Invalid>) {
-        throw std::logic_error("invalid ValueSequence was not validated");
-      } else {
-        return visitor(viewed);
-      }
+      return visitor(viewed);
     }, values);
   }
 };

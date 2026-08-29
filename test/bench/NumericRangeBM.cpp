@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "bench/luxir_bench.h"
-#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/random.h"
 #include "test/SchemaBuilder.h"
@@ -139,7 +139,7 @@ int32_t countMatches(Query::Scorer* scorer) {
   return count;
 }
 
-Query::Scorer* createScorer(NumericRangeQuery::Weight& weight, MemPool& pool,
+Query::Scorer* createScorer(NumericPredicateQuery::Weight& weight, MemPool& pool,
                             IndexReader::Segment& segment, BenchArm arm) {
   switch (arm) {
     case POINTS_FORCED:
@@ -178,8 +178,8 @@ int32_t fullScanCount(NumericRangeBenchIndex& fixture, const FieldSpec& field,
                       int64_t hi) {
   MemPool pool;
   Query::Context context(pool, *fixture.getIndex().reader);
-  NumericRangeQuery query(field.name, 7, hi);
-  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+  NumericPredicateQuery query(field.name, 7, hi);
+  auto* weight = static_cast<NumericPredicateQuery::Weight*>(
       query.createWeight(context, 0));
   auto& segment = fixture.getIndex().reader->segments()[0];
   return countMatches(weight->createFullScanScorerForTests(pool, segment));
@@ -206,8 +206,8 @@ void BM_NumericRangePoints(benchmark::State& state, FieldShape shape,
   for (auto _ : state) {
     MemPool pool;
     Query::Context context(pool, *fixture.getIndex().reader);
-    NumericRangeQuery query(field.name, 7, hi);
-    auto* weight = static_cast<NumericRangeQuery::Weight*>(
+    NumericPredicateQuery query(field.name, 7, hi);
+    auto* weight = static_cast<NumericPredicateQuery::Weight*>(
         query.createWeight(context, 0));
     auto& segment = fixture.getIndex().reader->segments()[0];
     int32_t count = countMatches(createScorer(*weight, pool, segment, arm));

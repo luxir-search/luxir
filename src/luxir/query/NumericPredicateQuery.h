@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -22,49 +23,77 @@ namespace luxir {
 // order-preserving encoded int64 (INT raw, FLOAT/DOUBLE Lucene sortable bits,
 // DATE epoch millis), so pruning and comparisons happen in encoded space. A
 // document matches when any value satisfies the range or set.
-class NumericRangeQuery final : public Query {
+class NumericPredicateQuery final : public Query {
   std::string_view field;
-  int64_t lo;
-  int64_t hi;
+  PointsReader::ValueRange envelope;
   std::span<const int64_t> exactValues;
+  std::span<const PointsReader::ValueRange> exactIntervals;
 
 public:
   static inline bool disableShapesForTests = false;
 
-  NumericRangeQuery(std::string_view field, int64_t lo, int64_t hi)
-    : field(field), lo(lo), hi(hi) {}
+  NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi)
+    : field(field), envelope{lo, hi} {}
 
-  NumericRangeQuery(std::string_view field,
-                    std::span<const int64_t> exactValues)
-    : field(field), lo(exactValues.front()), hi(exactValues.back()),
-      exactValues(exactValues) {
+  NumericPredicateQuery(std::string_view field,
+                        std::span<const int64_t> exactValues,
+                        std::span<const PointsReader::ValueRange> intervals)
+    : field(field), envelope{exactValues.front(), exactValues.back()},
+      exactValues(exactValues), exactIntervals(intervals) {
     assert(exactValues.size() > 1);
+    assert(!intervals.empty());
     assert(std::is_sorted(exactValues.begin(), exactValues.end()));
     assert(std::adjacent_find(exactValues.begin(), exactValues.end())
            == exactValues.end());
   }
 
   std::string_view getField() const { return field; }
-  int64_t getLo() const { return lo; }
-  int64_t getHi() const { return hi; }
+  int64_t getLo() const { return envelope.lo; }
+  int64_t getHi() const { return envelope.hi; }
   bool isExactSet() const { return !exactValues.empty(); }
   std::span<const int64_t> getExactValues() const { return exactValues; }
+  std::span<const PointsReader::ValueRange> intervals() const {
+    return exactIntervals.empty()
+        ? std::span<const PointsReader::ValueRange>(&envelope, 1)
+        : exactIntervals;
+  }
 
   bool matchesValue(int64_t value) const {
-    return exactValues.empty()
-        ? lo <= value && value <= hi
-        : std::binary_search(exactValues.begin(), exactValues.end(), value);
+    if (exactValues.empty()) return envelope.lo <= value && value <= envelope.hi;
+    auto found = std::lower_bound(
+        exactIntervals.begin(), exactIntervals.end(), value,
+        [](const PointsReader::ValueRange& interval, int64_t target) {
+          return interval.hi < target;
+        });
+    return found != exactIntervals.end() && found->lo <= value;
   }
 
   bool intersects(int64_t min, int64_t max) const {
-    if (exactValues.empty()) return !(max < lo || hi < min);
-    auto found = std::lower_bound(exactValues.begin(), exactValues.end(), min);
-    return found != exactValues.end() && *found <= max;
+    if (exactValues.empty()) {
+      return !(max < envelope.lo || envelope.hi < min);
+    }
+    auto found = std::lower_bound(
+        exactIntervals.begin(), exactIntervals.end(), min,
+        [](const PointsReader::ValueRange& interval, int64_t target) {
+          return interval.hi < target;
+        });
+    return found != exactIntervals.end() && found->lo <= max;
   }
 
   bool covers(int64_t min, int64_t max) const {
-    if (exactValues.empty()) return lo <= min && max <= hi;
-    return min == max && matchesValue(min);
+    if (exactValues.empty()) return envelope.lo <= min && max <= envelope.hi;
+    auto found = std::lower_bound(
+        exactIntervals.begin(), exactIntervals.end(), min,
+        [](const PointsReader::ValueRange& interval, int64_t target) {
+          return interval.hi < target;
+        });
+    return found != exactIntervals.end()
+        && found->lo <= min && max <= found->hi;
+  }
+
+  float valueMatchCost() const {
+    if (!isExactSet()) return 1.0f;
+    return (float)(std::bit_width(exactIntervals.size()) + 1);
   }
   ScoreProfile scoreProfile() const override {
     return ScoreProfile::automatic(1.0f);
@@ -76,11 +105,11 @@ public:
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
     out.appendTag(exactValues.empty()
-        ? FilterKeyTag::NUMERIC_RANGE : FilterKeyTag::ANY_OF);
+        ? FilterKeyTag::NUMERIC_PREDICATE_RANGE : FilterKeyTag::ANY_OF);
     out.appendString(field);
     if (exactValues.empty()) {
-      out.appendInt64(lo);
-      out.appendInt64(hi);
+      out.appendInt64(envelope.lo);
+      out.appendInt64(envelope.hi);
     } else {
       out.appendSize(exactValues.size());
       for (int64_t value : exactValues) out.appendInt64(value);
@@ -94,18 +123,18 @@ public:
     return context.pool.make<Weight>(context, *this, flags, score);
   }
 
-  // RangeScorer is the sparse two-phase verifier and, when instantiated with
-  // IntColReader::Iterator, the benchmark's full column-scan baseline.
+  // PredicateScorer is the sparse two-phase verifier and, when instantiated
+  // with IntColReader::Iterator, the benchmark's full column-scan baseline.
   template <class ColIter>
-  class RangeScorer final : public Query::ConstantScorer {
+  class PredicateScorer final : public Query::ConstantScorer {
     IntColReader& reader;
     ColIter iter;
-    const NumericRangeQuery& query;
+    const NumericPredicateQuery& query;
     bool allMatch;
     bool multi;
     int32_t docid = -1;
 
-    bool valueInRange() {
+    bool valueMatches() {
       if (docid == PostingsReader::END) return false;
       if (!multi) {
         if (allMatch) return true;
@@ -120,7 +149,7 @@ public:
     }
 
   public:
-    RangeScorer(IntColReader& reader, const NumericRangeQuery& query,
+    PredicateScorer(IntColReader& reader, const NumericPredicateQuery& query,
                 bool allMatch,
                 float constantScore)
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
@@ -135,24 +164,26 @@ public:
       return docid;
     }
     int32_t approximationDocId() override { return docid; }
-    bool matches() override { return valueInRange(); }
+    bool matches() override { return valueMatches(); }
     float matchCost() override {
       if (allMatch) return 0.0f;
-      if (!multi) return 1.0f;
+      if (!multi) return query.valueMatchCost();
       int64_t docs = reader.docsWithValue();
-      return docs > 0 ? (float)reader.numValues() / (float)docs : 1.0f;
+      float valuesPerDoc = docs > 0
+          ? (float)reader.numValues() / (float)docs : 1.0f;
+      return valuesPerDoc * query.valueMatchCost();
     }
 
     int32_t next() override {
       for (;;) {
         docid = iter.next();
-        if (docid == PostingsReader::END || valueInRange()) return docid;
+        if (docid == PostingsReader::END || valueMatches()) return docid;
       }
     }
     int32_t advance(int32_t target) override {
       assert(docid < target);
       docid = iter.advance(target);
-      while (docid != PostingsReader::END && !valueInRange()) {
+      while (docid != PostingsReader::END && !valueMatches()) {
         docid = iter.next();
       }
       return docid;
@@ -195,15 +226,15 @@ public:
     uint64_t gcd = block.gcd;
     assert(gcd != 0);
     uint64_t lower = 0;
-    if (lo > zone.min) {
-      uint64_t delta = (uint64_t)lo - (uint64_t)zone.min;
+    if (envelope.lo > zone.min) {
+      uint64_t delta = (uint64_t)envelope.lo - (uint64_t)zone.min;
       lower = delta / gcd + (delta % gcd != 0);
     }
     uint64_t upper;
-    if (hi >= zone.max) {
+    if (envelope.hi >= zone.max) {
       upper = ((uint64_t)zone.max - (uint64_t)zone.min) / gcd;
     } else {
-      upper = ((uint64_t)hi - (uint64_t)zone.min) / gcd;
+      upper = ((uint64_t)envelope.hi - (uint64_t)zone.min) / gcd;
     }
     // A compressed block's maximum persisted residual fits its format<=32.
     // Saturation keeps a defensive release build correct at both signed
@@ -226,7 +257,7 @@ public:
     explicit CrossingValues(IntColReader& reader) : reader(reader) {}
 
     bool matches(int64_t valueRank, const BlockPlan& plan,
-                 const NumericRangeQuery& query) {
+                 const NumericPredicateQuery& query) {
       int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
       auto block = reader.blockInfo(blockNum);
       if (!query.isExactSet()
@@ -256,7 +287,7 @@ public:
     screaming::BitSet::Selector* selector = nullptr;
     CrossingValues crossing;
     std::span<uint64_t> iterBits;
-    const NumericRangeQuery& query;
+    const NumericPredicateQuery& query;
     int32_t maxDoc;
     int32_t docid = -1;
     int32_t iterWindowStart = 0;
@@ -415,7 +446,7 @@ public:
   public:
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
                   std::span<const BlockPlan> plans,
-                  const NumericRangeQuery& query,
+                  const NumericPredicateQuery& query,
                   int32_t maxDoc, float constantScore)
       : Query::ConstantScorer(constantScore), reader(reader), plans(plans),
           crossing(reader),
@@ -459,7 +490,7 @@ public:
     }
   };
 
-  class RangeBulkScorer final : public BulkScorer {
+  class PredicateBulkScorer final : public BulkScorer {
     static constexpr int32_t WINDOW_SIZE = 4096;
     static constexpr int32_t WINDOW_WORDS = WINDOW_SIZE / 64;
 
@@ -541,7 +572,7 @@ public:
     }
 
   public:
-    RangeBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc,
+    PredicateBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc,
                     float constantScore)
         : scorer(scorer),
           windowBits(pool.make_arr<uint64_t>(WINDOW_WORDS), WINDOW_WORDS),
@@ -604,12 +635,13 @@ public:
   using PointsArrayBulkScorer = PointsMaterialize::PointsArrayBulkScorer;
   using PointsBitBulkScorer = PointsMaterialize::PointsBitBulkScorer;
   class Weight final : public Query::Weight {
-    NumericRangeQuery& query;
+    NumericPredicateQuery& query;
     std::span<SegFieldInfo*> segInfos;
     float constantScore;
 
     static int64_t estimateCost(IntColReader& reader,
-                                std::span<const BlockPlan> plans) {
+                                std::span<const BlockPlan> plans,
+                                bool exactSet) {
       int64_t estimate = 0;
       for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
         int64_t count = reader.valuesInBlock(blockNum);
@@ -618,7 +650,13 @@ public:
             estimate += count;
             break;
           case BlockRelation::CROSSES:
-            estimate += (count + 1) / 2;
+            // A crossing zone gives no exact cardinality. A range crosses a
+            // block at one end and matches part of it, so charge the measured
+            // half-block heuristic. A value set has gaps throughout the block
+            // and no comparable midpoint, so charge its full value count as a
+            // conservative upper bound. Points-backed fields replace both with
+            // exact point ordinal counts below.
+            estimate += exactSet ? count : (count + 1) / 2;
             break;
           case BlockRelation::OUTSIDE:
             break;
@@ -627,19 +665,23 @@ public:
       return std::min<int64_t>(estimate, reader.docsWithValue());
     }
 
-    static std::pair<uint64_t, uint64_t> exactPointPositions(
-        PointsReader& points, const PointsReader::FenceRange& fence,
-        int64_t lo, int64_t hi, std::span<uint32_t> residualScratch,
-        std::span<int64_t> rawScratch) {
-      auto first = points.valueBounds(fence.firstLeaf, lo, hi,
-                                      residualScratch, rawScratch);
-      uint64_t loPos = points.leafOrdinalStart(fence.firstLeaf) + first.lower;
-      if (fence.firstLeaf == fence.lastLeaf) {
-        return {loPos, points.leafOrdinalStart(fence.firstLeaf) + first.upper};
-      }
-      auto last = points.valueBounds(fence.lastLeaf, lo, hi,
-                                     residualScratch, rawScratch);
-      return {loPos, points.leafOrdinalStart(fence.lastLeaf) + last.upper};
+    static size_t fillPointRanges(
+        PointsReader& points, const NumericPredicateQuery& query,
+        std::span<PointsReader::OrdinalRange> output) {
+      MemPool scratchPool;
+      auto residuals = scratchPool.make_span<uint32_t>(
+          points.maxPointsPerLeaf());
+      auto values = scratchPool.make_span<int64_t>(
+          points.maxPointsPerLeaf());
+      return points.ordinalRanges(
+          query.intervals(), output, residuals, values);
+    }
+
+    static uint64_t pointCount(
+        std::span<const PointsReader::OrdinalRange> ranges) {
+      uint64_t count = 0;
+      for (const auto& range : ranges) count += range.end - range.begin;
+      return count;
     }
 
     bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& segInfo) const {
@@ -649,7 +691,7 @@ public:
     }
 
   public:
-    Weight(Context& context, NumericRangeQuery& query, int32_t flags,
+    Weight(Context& context, NumericPredicateQuery& query, int32_t flags,
            float constantScore)
         : Query::Weight(context, query, flags), query(query),
           constantScore(constantScore) {
@@ -657,13 +699,13 @@ public:
       segInfos = context.readSegInfos(query.getField());
     }
 
-    // Exact count from the range structures alone, never a scan: a range
-    // covering the whole column counts every doc with a value, and a
-    // partial range over a single-valued points column is the difference
-    // of two ordinal positions (one leaf descent per bound). Multi-valued
-    // partial ranges and points-less columns return null rather than run
-    // the crossing-blocks walk the bulk count path uses - that walk is the
-    // right cost at execution, not inside a per-segment constant probe.
+    // Exact count from predicate structures alone, never a column scan: a
+    // predicate covering the whole column counts every doc with a value, and
+    // a partial predicate over a single-valued points column sums its exact
+    // ordinal runs. Multi-valued partial predicates and points-less columns
+    // return null rather than run the crossing-block walk the bulk count path
+    // uses; that walk is the right cost at execution, not inside a per-segment
+    // constant probe.
     std::optional<int64_t> constantCount(
         IndexReader::Segment& segment, DocSet* domain) override {
       SegFieldInfo* segInfo = nullptr;
@@ -683,7 +725,6 @@ public:
       if (query.covers(colMin, colMax)) {
         return reader->docsWithValue();
       }
-      if (query.isExactSet()) return std::nullopt;
       if (segInfo->pointsMetaOff == 0 || reader->multiValued()) {
         return std::nullopt;
       }
@@ -691,15 +732,12 @@ public:
           segment.postingsReader(), *segInfo);
       if (points->pointCount() != (uint64_t)reader->numValues()) {
         throw std::runtime_error(
-            "NumericRangeQuery: points/column value count mismatch");
+            "NumericPredicateQuery: points/column value count mismatch");
       }
-      auto fence = points->fenceRange(query.getLo(), query.getHi());
-      if (fence.empty) return 0;
-      auto residuals = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
-      auto raw = pool.make_span<int64_t>(points->maxPointsPerLeaf());
-      auto [begin, end] = exactPointPositions(
-          *points, fence, query.getLo(), query.getHi(), residuals, raw);
-      return (int64_t)(end - begin);
+      auto ranges = pool.make_span<PointsReader::OrdinalRange>(
+          query.intervals().size());
+      size_t count = fillPointRanges(*points, query, ranges);
+      return (int64_t)pointCount(ranges.first(count));
     }
 
     class Supplier final : public Query::ScorerSupplier {
@@ -721,72 +759,59 @@ public:
         SCAN,
       };
 
-      NumericRangeQuery::Weight& weight;
+      NumericPredicateQuery::Weight& weight;
       MemPool& planPool;
       IndexReader::Segment& segment;
       IntColReader& reader;
       PointsReader* points;
       std::span<const BlockPlan> plans;
-      PointsReader::FenceRange fence;
+      std::span<const PointsReader::OrdinalRange> pointRanges;
+      uint64_t pointValueCount;
       int64_t estimatedCost;
+      Query::MatchState matchState;
       bool allMatch;
       bool useZoneMap;
-      bool exactReady = false;
-      uint64_t loPos = 0;
-      uint64_t hiPos = 0;
 
-      std::pair<uint64_t, uint64_t> exactPositions(MemPool& pool) {
+      Materialized materializePoints(MemPool& pool) {
         assert(points != nullptr);
-        assert(!weight.query.isExactSet());
-        if (!exactReady) {
-          auto scratchGuard = pool.rewindScopeGuard();
-          auto residuals = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
-          auto raw = pool.make_span<int64_t>(points->maxPointsPerLeaf());
-          std::tie(loPos, hiPos) = Weight::exactPointPositions(
-              *points, fence, weight.query.getLo(), weight.query.getHi(),
-              residuals, raw);
-          exactReady = true;
-        }
-        return {loPos, hiPos};
-      }
-
-      Materialized materializePoints(MemPool& pool, uint64_t begin,
-                                     uint64_t end) {
-        assert(points != nullptr && begin <= end);
-        uint64_t expected = end - begin;
+        uint64_t expected = pointValueCount;
         auto docScratch = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
         if (PointsMaterialize::useBitset(expected, segment.maxDoc())) {
           auto words = pool.make_span<uint64_t>(
               FixedBitSet::sizeInWords(segment.maxDoc()));
           std::fill(words.begin(), words.end(), 0);
           FixedBitSet bits(words.data(), segment.maxDoc());
-          points->emitOrdinalRange(begin, end, docScratch,
-              [&bits](int32_t doc) { bits.set(doc); },
-              [&bits](int32_t runBegin, int32_t runEnd) {
-                PointsMaterialize::setRun(bits, runBegin, runEnd);
-              },
-              [&bits](int32_t wordIndex, uint64_t word) {
-                bits.words[wordIndex] |= word;
-              });
+          for (const auto& range : pointRanges) {
+            points->emitOrdinalRange(range.begin, range.end, docScratch,
+                [&bits](int32_t doc) { bits.set(doc); },
+                [&bits](int32_t runBegin, int32_t runEnd) {
+                  PointsMaterialize::setRun(bits, runBegin, runEnd);
+                },
+                [&bits](int32_t wordIndex, uint64_t word) {
+                  bits.words[wordIndex] |= word;
+                });
+          }
           return {{}, words.data()};
         }
 
         auto docs = pool.make_span<int32_t>((size_t)expected);
         size_t size = 0;
-        points->emitOrdinalRange(begin, end, docScratch,
-            [&docs, &size](int32_t doc) { docs[size++] = doc; },
-            [&docs, &size](int32_t runBegin, int32_t runEnd) {
-              for (int32_t doc = runBegin; doc < runEnd; doc++) {
-                docs[size++] = doc;
-              }
-            },
-            [&docs, &size](int32_t wordIndex, uint64_t word) {
-              while (word != 0) {
-                int32_t bit = (int32_t)std::countr_zero(word);
-                docs[size++] = wordIndex * 64 + bit;
-                word &= word - 1;
-              }
-            });
+        for (const auto& range : pointRanges) {
+          points->emitOrdinalRange(range.begin, range.end, docScratch,
+              [&docs, &size](int32_t doc) { docs[size++] = doc; },
+              [&docs, &size](int32_t runBegin, int32_t runEnd) {
+                for (int32_t doc = runBegin; doc < runEnd; doc++) {
+                  docs[size++] = doc;
+                }
+              },
+              [&docs, &size](int32_t wordIndex, uint64_t word) {
+                while (word != 0) {
+                  int32_t bit = (int32_t)std::countr_zero(word);
+                  docs[size++] = wordIndex * 64 + bit;
+                  word &= word - 1;
+                }
+              });
+        }
         assert(size == expected);
         boost::sort::spreadsort::integer_sort(docs.begin(), docs.end());
         if (reader.multiValued()) {
@@ -795,8 +820,7 @@ public:
         return {docs.first(size), nullptr};
       }
 
-      Materialized materializeComplement(MemPool& pool, uint64_t begin,
-                                         uint64_t end) {
+      Materialized materializeComplement(MemPool& pool) {
         assert(points != nullptr && !reader.multiValued());
         auto words = pool.make_span<uint64_t>(
             FixedBitSet::sizeInWords(segment.maxDoc()));
@@ -820,10 +844,16 @@ public:
         auto clearWord = [&bits](int32_t wordIndex, uint64_t word) {
           bits.words[wordIndex] &= ~word;
         };
+        uint64_t cursor = 0;
+        for (const auto& range : pointRanges) {
+          points->emitOrdinalRange(
+              cursor, range.begin, docScratch,
+              clearDoc, clearDocRun, clearWord);
+          cursor = range.end;
+        }
         points->emitOrdinalRange(
-            0, begin, docScratch, clearDoc, clearDocRun, clearWord);
-        points->emitOrdinalRange(end, points->pointCount(), docScratch,
-                                 clearDoc, clearDocRun, clearWord);
+            cursor, points->pointCount(), docScratch,
+            clearDoc, clearDocRun, clearWord);
         return {{}, words.data()};
       }
 
@@ -839,11 +869,11 @@ public:
 
       BulkScorer* phaseOneBulkScorer(MemPool& pool) {
         if (!useZoneMap) return nullptr;
-        skipCount(SkipStats::numericRangeZoneArms);
+        skipCount(SkipStats::numericPredicateZoneArms);
         auto* scorer = pool.make<ZoneMapScorer>(
             pool, reader, plans, weight.query,
             segment.maxDoc(), weight.constantScore);
-        return pool.make<RangeBulkScorer>(
+        return pool.make<PredicateBulkScorer>(
             pool, scorer, segment.maxDoc(), weight.constantScore);
       }
 
@@ -869,11 +899,12 @@ public:
         return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
       }
 
-      static Query::ScorerShape shapeFor(ScorerArm arm) {
+      static Query::ScorerShape shapeFor(
+          ScorerArm arm, Query::MatchState matchState) {
         bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
             || arm == ScorerArm::SCAN;
         return {
-          .matchState = Query::MatchState::NONEMPTY,
+          .matchState = matchState,
           .directKind = Query::DirectScorerKind::OTHER,
           .reportedTwoPhase = twoPhase
               ? Query::ReportedTwoPhase::YES
@@ -888,31 +919,30 @@ public:
       }
 
       Query::Scorer* buildScorer(
-          MemPool& targetPool, ScorerArm arm, uint64_t begin,
-          uint64_t end, bool complement) {
+          MemPool& targetPool, ScorerArm arm, bool complement) {
         switch (arm) {
           case ScorerArm::SPARSE_VERIFY:
-            skipCount(SkipStats::numericRangeSparseVerifyArms);
+            skipCount(SkipStats::numericPredicateSparseVerifyArms);
             return targetPool.make<
-                RangeScorer<IntColReader::SparseIterator>>(
+                PredicateScorer<IntColReader::SparseIterator>>(
                     reader, weight.query,
                     allMatch, weight.constantScore);
           case ScorerArm::POINTS:
             if (complement) {
-              skipCount(SkipStats::numericRangeComplementArms);
+              skipCount(SkipStats::numericPredicateComplementArms);
               return scorerFor(targetPool,
-                  materializeComplement(targetPool, begin, end));
+                  materializeComplement(targetPool));
             }
-            skipCount(SkipStats::numericRangePointsArms);
+            skipCount(SkipStats::numericPredicatePointsArms);
             return scorerFor(targetPool,
-                materializePoints(targetPool, begin, end));
+                materializePoints(targetPool));
           case ScorerArm::ZONE_MAP:
-            skipCount(SkipStats::numericRangeZoneArms);
+            skipCount(SkipStats::numericPredicateZoneArms);
             return targetPool.make<ZoneMapScorer>(
                 targetPool, reader, plans, weight.query,
                 segment.maxDoc(), weight.constantScore);
           case ScorerArm::SCAN:
-            return targetPool.make<RangeScorer<IntColReader::Iterator>>(
+            return targetPool.make<PredicateScorer<IntColReader::Iterator>>(
                 reader, weight.query, allMatch,
                 weight.constantScore);
         }
@@ -922,23 +952,19 @@ public:
       class Plan final : public Query::ScorerPlan {
         Supplier& supplier;
         ScorerArm arm;
-        uint64_t loPos;
-        uint64_t hiPos;
         bool complement;
 
       protected:
         Query::Scorer* buildScorer(MemPool& targetPool) override {
-          return supplier.buildScorer(
-              targetPool, arm, loPos, hiPos, complement);
+          return supplier.buildScorer(targetPool, arm, complement);
         }
 
       public:
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost, ScorerArm arm,
-             uint64_t loPos, uint64_t hiPos, bool complement)
+             bool complement)
           : Query::ScorerPlan(planContext, shape, cost),
-            supplier(supplier), arm(arm), loPos(loPos), hiPos(hiPos),
-            complement(complement) {}
+            supplier(supplier), arm(arm), complement(complement) {}
       };
 
       struct BulkState final : Query::ScorerSupplier::BulkBuildState {
@@ -948,8 +974,6 @@ public:
         };
 
         Arm arm;
-        uint64_t begin = 0;
-        uint64_t end = 0;
         bool complement = false;
 
         BulkState(const Supplier* owner, Arm arm)
@@ -960,8 +984,7 @@ public:
 
       int64_t exactCount() {
         if (points != nullptr && !reader.multiValued()) {
-          auto [begin, end] = exactPositions(planPool);
-          return (int64_t)(end - begin);
+          return (int64_t)pointValueCount;
         }
         CrossingValues crossing(reader);
         if (!reader.multiValued()) {
@@ -1014,15 +1037,18 @@ public:
       }
 
     public:
-      Supplier(NumericRangeQuery::Weight& weight, MemPool& planPool,
+      Supplier(NumericPredicateQuery::Weight& weight, MemPool& planPool,
                IndexReader::Segment& segment,
                IntColReader& reader, std::span<const BlockPlan> plans,
-               int64_t estimatedCost, bool allMatch, PointsReader* points,
-               PointsReader::FenceRange fence)
+               int64_t estimatedCost, Query::MatchState matchState,
+               bool allMatch, PointsReader* points,
+               std::span<const PointsReader::OrdinalRange> pointRanges,
+               uint64_t pointValueCount)
           : weight(weight), planPool(planPool), segment(segment),
             reader(reader), points(points),
-            plans(plans), fence(fence), estimatedCost(estimatedCost),
-            allMatch(allMatch) {
+            plans(plans), pointRanges(pointRanges),
+            pointValueCount(pointValueCount), estimatedCost(estimatedCost),
+            matchState(matchState), allMatch(allMatch) {
         int64_t prunableValues = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
           if (plans[(size_t)blockNum].relation != BlockRelation::CROSSES) {
@@ -1039,54 +1065,45 @@ public:
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
-        if (buildContext.numericRangeDisableShapesForTests) return {};
+        if (buildContext.numericPredicateDisableShapesForTests) return {};
         ScorerArm arm = selectScorerArm(buildContext.demand);
-        return shapeFor(arm);
+        return shapeFor(arm, matchState);
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
           const Query::PlanContext& buildContext) const override {
-        return buildContext.numericRangeDisableShapesForTests
+        return buildContext.numericPredicateDisableShapesForTests
             ? Query::UnresolvedSupplierCause::NUMERIC_GEO
             : Query::UnresolvedSupplierCause::NONE;
       }
 
       Query::Scorer* createPointsScorerForTests(MemPool& targetPool) {
         if (points == nullptr) return nullptr;
-        auto [begin, end] = exactPositions(targetPool);
-        return scorerFor(targetPool,
-            materializePoints(targetPool, begin, end));
+        return scorerFor(targetPool, materializePoints(targetPool));
       }
 
       Query::Scorer* createComplementScorerForTests(MemPool& targetPool) {
         if (points == nullptr || reader.multiValued()) return nullptr;
-        auto [begin, end] = exactPositions(targetPool);
-        return scorerFor(targetPool,
-            materializeComplement(targetPool, begin, end));
+        return scorerFor(targetPool, materializeComplement(targetPool));
       }
 
       Query::ScorerPlan* resolve(
           MemPool& planPool,
           const Query::PlanContext& planContext) override {
         ScorerArm arm = selectScorerArm(planContext.demand);
-        uint64_t begin = 0;
-        uint64_t end = 0;
-        bool complement = false;
-        if (arm == ScorerArm::POINTS) {
-          std::tie(begin, end) = exactPositions(planPool);
-          complement = useComplement(end - begin);
-        }
+        bool complement = arm == ScorerArm::POINTS
+            && useComplement(pointValueCount);
         return planPool.make<Plan>(
-            *this, planContext, shapeFor(arm), cost(), arm,
-            begin, end, complement);
+            *this, planContext, shapeFor(arm, matchState), cost(), arm,
+            complement);
       }
 
       Query::PlanContext makePlanContext(
           const Query::Demand& demand) const override {
         Query::PlanContext context;
         context.demand = demand;
-        context.numericRangeDisableShapesForTests =
-            NumericRangeQuery::disableShapesForTests;
+        context.numericPredicateDisableShapesForTests =
+            NumericPredicateQuery::disableShapesForTests;
         return context;
       }
 
@@ -1112,12 +1129,9 @@ public:
           };
         }
         if (points != nullptr) {
-          auto [begin, end] = exactPositions(planPool);
           auto* state = planPool.make<BulkState>(
               this, BulkState::Arm::POINTS);
-          state->begin = begin;
-          state->end = end;
-          state->complement = useComplement(end - begin);
+          state->complement = useComplement(pointValueCount);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
             BulkAnswer::NO, state,
@@ -1150,13 +1164,11 @@ public:
         }
         assert(points != nullptr);
         if (state.complement) {
-          skipCount(SkipStats::numericRangeComplementArms);
-          return bulkFor(targetPool,
-              materializeComplement(targetPool, state.begin, state.end));
+          skipCount(SkipStats::numericPredicateComplementArms);
+          return bulkFor(targetPool, materializeComplement(targetPool));
         }
-        skipCount(SkipStats::numericRangePointsArms);
-        return bulkFor(targetPool,
-            materializePoints(targetPool, state.begin, state.end));
+        skipCount(SkipStats::numericPredicatePointsArms);
+        return bulkFor(targetPool, materializePoints(targetPool));
       }
 
     };
@@ -1179,27 +1191,45 @@ public:
             reader->blockInfo(i), reader->blockZone(i));
       }
       bool allMatch = query.covers(colMin, colMax);
-      int64_t cost = estimateCost(*reader, plans);
+      int64_t cost = estimateCost(*reader, plans, query.isExactSet());
       PointsReader* points = nullptr;
-      PointsReader::FenceRange fence;
-      if (segInfo->pointsMetaOff != 0 && !query.isExactSet()) {
+      std::span<const PointsReader::OrdinalRange> pointRanges;
+      uint64_t pointValueCount = 0;
+      Query::MatchState matchState = Query::MatchState::UNKNOWN;
+      if (segInfo->pointsMetaOff != 0) {
         points = targetPool.make<PointsReader>(segment.postingsReader(), *segInfo);
         if (points->pointCount() != (uint64_t)reader->numValues()) {
-          throw std::runtime_error("NumericRangeQuery: points/column value count mismatch");
+          throw std::runtime_error("NumericPredicateQuery: points/column value count mismatch");
         }
-        fence = points->fenceRange(query.getLo(), query.getHi());
-        if (fence.empty) return nullptr;
-        uint64_t fenceCount = fence.endOrdinal - fence.firstOrdinal;
+        auto storedRanges = targetPool.make_span<PointsReader::OrdinalRange>(
+            query.intervals().size());
+        size_t rangeCount = fillPointRanges(*points, query, storedRanges);
+        pointRanges = storedRanges.first(rangeCount);
+        pointValueCount = pointCount(pointRanges);
+        uint64_t docCost = pointValueCount;
         if (reader->multiValued()) {
           // Repeated docids make this a safe upper bound, not an exact count
           // of unique matching documents.
-          fenceCount = std::min<uint64_t>(fenceCount, reader->docsWithValue());
+          docCost = std::min<uint64_t>(docCost, reader->docsWithValue());
         }
-        cost = (int64_t)fenceCount;
+        cost = (int64_t)docCost;
+        matchState = pointValueCount == 0
+            ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
+      } else {
+        bool hasInside = false;
+        bool hasCrosses = false;
+        for (const BlockPlan& plan : plans) {
+          hasInside |= plan.relation == BlockRelation::INSIDE;
+          hasCrosses |= plan.relation == BlockRelation::CROSSES;
+        }
+        matchState = hasInside ? Query::MatchState::NONEMPTY
+            : hasCrosses ? Query::MatchState::UNKNOWN
+                         : Query::MatchState::EMPTY;
       }
       return targetPool.make<Supplier>(*this, targetPool, segment, *reader,
-                                       plans, cost,
-                                       allMatch, points, fence);
+                                       plans, cost, matchState,
+                                       allMatch, points, pointRanges,
+                                       pointValueCount);
     }
 
     Query::Scorer* createScorer(MemPool& targetPool,
@@ -1237,7 +1267,7 @@ public:
       int64_t colMax = reader->getMax();
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
       bool allMatch = query.covers(colMin, colMax);
-      return targetPool.make<RangeScorer<IntColReader::Iterator>>(
+      return targetPool.make<PredicateScorer<IntColReader::Iterator>>(
           *reader, query, allMatch, constantScore);
     }
 

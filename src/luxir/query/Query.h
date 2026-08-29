@@ -505,7 +505,7 @@ public:
     bool phraseDisableSortForTests = false;
     bool phraseDisableRepeatDedupForTests = false;
     bool phraseDisableShapesForTests = false;
-    bool numericRangeDisableShapesForTests = false;
+    bool numericPredicateDisableShapesForTests = false;
     bool disableBooleanTwoPhaseForTests = false;
     bool disableDisjunctionTwoPhaseForTests = false;
     bool disableMandNotTwoPhaseForTests = false;

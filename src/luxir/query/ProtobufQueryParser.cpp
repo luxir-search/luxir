@@ -77,7 +77,8 @@ luxir::Query* ProtobufQueryParser::parseAnyOf(
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings);
   CanonicalValueSet values = builder.canonicalizeFieldValues(
-      anyOfQuery.field, ValueSequence(*anyOfQuery.values));
+      anyOfQuery.field,
+      ValueSequence(*anyOfQuery.values, "AnyOfQuery values"));
   return builder.createAnyOfQuery(values);
 }
 

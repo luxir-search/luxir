@@ -21,7 +21,7 @@
 #include "test/SchemaBuilder.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/BoostQuery.h"
-#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
@@ -331,12 +331,12 @@ struct NumericRangeShapeGuard {
   bool saved;
 
   explicit NumericRangeShapeGuard(bool disabled)
-    : saved(NumericRangeQuery::disableShapesForTests) {
-    NumericRangeQuery::disableShapesForTests = disabled;
+    : saved(NumericPredicateQuery::disableShapesForTests) {
+    NumericPredicateQuery::disableShapesForTests = disabled;
   }
 
   ~NumericRangeShapeGuard() {
-    NumericRangeQuery::disableShapesForTests = saved;
+    NumericPredicateQuery::disableShapesForTests = saved;
   }
 };
 
@@ -7447,7 +7447,7 @@ TEST_F(TermScorerTest, NumericRangeFiltersMatchPullAcrossScoredBodyShapes) {
   ASSERT_EQ(reader->maxDoc(), nDocs);
   ASSERT_GT(reader->maxDoc(), DocsEnumMeta::L1_DOCS);
 
-  NumericRangeQuery fatRange("range_i", 0, 799);
+  NumericPredicateQuery fatRange("range_i", 0, 799);
   TermQuery termFilter("body_w", "term_filter");
   std::vector<Query*> rangeFilter = {&fatRange};
   std::vector<Query*> termRangeFilters = {&fatRange, &termFilter};
@@ -7925,7 +7925,7 @@ TEST_F(TermScorerTest, SparseFilteredTermUnionWandMatchesDisjunctionPull) {
   TermQuery peakA("body_w", "wand_peak_a");
   TermQuery peakB("body_w", "wand_peak_b");
   TermQuery filter("body_w", "wand_filter");
-  NumericRangeQuery rangeFilter("wand_filter_i", 1, 1);
+  NumericPredicateQuery rangeFilter("wand_filter_i", 1, 1);
   std::vector<Query*> optional = {&common, &peakA, &peakB};
 
   struct Run {

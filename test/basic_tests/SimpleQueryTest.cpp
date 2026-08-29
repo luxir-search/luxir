@@ -90,7 +90,7 @@ TEST_F(SimpleQueryTest, fieldedTermStaysOnField) {
 
 TEST_F(SimpleQueryTest, numericFieldExactMatch) {
   // popularity:10 style: field:value on a numeric column is an exact match
-  // (a degenerate [10,10] range), lowered to a NumericRangeQuery
+  // (a degenerate [10,10] range), lowered to a NumericPredicateQuery
   helper.index(flatdoc("id", "n1", "title_un", "alpha", "pop_i", "10"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "n2", "title_un", "beta", "pop_i", "20"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "n3", "title_un", "gamma", "pop_i", "10"), UpdateMessage::COMMIT);

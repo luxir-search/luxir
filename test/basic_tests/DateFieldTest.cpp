@@ -7,7 +7,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/util/DateTime.h"
 
@@ -173,7 +173,7 @@ TEST(DateMathQueryBuilder, usesOneExplicitNowAndRoundingWindow) {
   QueryBuilder builder(pool, *schema, CoerceContext{now, TimeZone::utc()});
   api::Val val;
   val.kind = std::string_view("NOW/DAY");
-  auto* range = dynamic_cast<NumericRangeQuery*>(
+  auto* range = dynamic_cast<NumericPredicateQuery*>(
       builder.createMatchQuery("when_dt", val));
   ASSERT_NE(nullptr, range);
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T00:00:00Z"), range->getLo());

@@ -7,7 +7,7 @@
 #include <span>
 #include <vector>
 
-#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/util/NumericUtils.h"
@@ -48,8 +48,8 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
                   int64_t lo, int64_t hi) {
   MemPool pool;
   Query::Context context(pool, reader);
-  NumericRangeQuery query(field, lo, hi);
-  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+  NumericPredicateQuery query(field, lo, hi);
+  auto* weight = static_cast<NumericPredicateQuery::Weight*>(
       query.createWeight(context, 0));
   auto& segment = reader.segments()[0];
 
@@ -290,20 +290,20 @@ TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
   ASSERT_EQ(1u, reader->segments().size());
   MemPool pool;
   Query::Context context(pool, *reader);
-  NumericRangeQuery query("deleted_only_i", 10, 10);
-  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+  NumericPredicateQuery query("deleted_only_i", 10, 10);
+  auto* weight = static_cast<NumericPredicateQuery::Weight*>(
       query.createWeight(context, 0));
   auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, supplier);
   Query::PlanContext buildContext;
   buildContext.demand = Query::Demand::fromLeadCost(
       std::numeric_limits<int64_t>::max());
-  EXPECT_EQ(Query::MatchState::NONEMPTY,
+  EXPECT_EQ(Query::MatchState::UNKNOWN,
             supplier->describeScorer(buildContext).matchState);
   Query::Scorer* scorer = supplier->resolve(pool, buildContext)->build(pool);
   ASSERT_NE(nullptr, scorer);
   EXPECT_NE(nullptr,
-            dynamic_cast<NumericRangeQuery::ZoneMapScorer*>(scorer));
+            dynamic_cast<NumericPredicateQuery::ZoneMapScorer*>(scorer));
   EXPECT_EQ((std::vector<int32_t>{0}), collect(scorer));
 
   auto req = localReq(helper.getSearchEngine());
@@ -329,7 +329,7 @@ TEST_F(NumericRangeZoneMapTest, countDeclinesDeletedSegment) {
 
   MemPool pool;
   Query::Context context(pool, *index.reader);
-  NumericRangeQuery query("deleted_i", 0, 100);
+  NumericPredicateQuery query("deleted_i", 0, 100);
   auto* weight = query.createWeight(context, 0);
   ASSERT_NE(index.reader->segments()[0].liveDocs(), nullptr);
   EXPECT_EQ(weight->count(index.reader->segments()[0]), -1);
@@ -350,8 +350,8 @@ TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
 
   auto makeFilter = [&](MemPool& pool) {
     Query::Context context(pool, *index.reader);
-    NumericRangeQuery query("window_i", 1, 1);
-    auto* weight = static_cast<NumericRangeQuery::Weight*>(
+    NumericPredicateQuery query("window_i", 1, 1);
+    auto* weight = static_cast<NumericPredicateQuery::Weight*>(
         query.createWeight(context, 0));
     auto* scorer = weight->createZoneMapScorerForTests(
         pool, context.topReader.segments()[0]);
@@ -412,9 +412,9 @@ TEST_F(NumericRangeZoneMapTest, materializeFiltersBitAndArrayDomains) {
 
   MemPool pool;
   Query::Context context(pool, *index.reader);
-  NumericRangeQuery query("domain_i", 0,
+  NumericPredicateQuery query("domain_i", 0,
                           IntColReader::BLOCK_SIZE - 1);
-  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+  auto* weight = static_cast<NumericPredicateQuery::Weight*>(
       query.createWeight(context, 0));
   auto& segment = index.reader->segments()[0];
   auto expected = collect(weight->createFullScanScorerForTests(pool, segment));
@@ -510,8 +510,8 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
 
   MemPool pool;
   Query::Context context(pool, *index.reader);
-  NumericRangeQuery query("predicted_cross_i", target, target);
-  auto* weight = static_cast<NumericRangeQuery::Weight*>(
+  NumericPredicateQuery query("predicted_cross_i", target, target);
+  auto* weight = static_cast<NumericPredicateQuery::Weight*>(
       query.createWeight(context, 0));
   EXPECT_EQ(collect(weight->createZoneMapScorerForTests(pool, segment)),
             expected);

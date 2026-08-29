@@ -108,11 +108,11 @@ class NumericRangeShapeGuard {
 
 public:
   explicit NumericRangeShapeGuard(bool disabled)
-    : saved(NumericRangeQuery::disableShapesForTests) {
-    NumericRangeQuery::disableShapesForTests = disabled;
+    : saved(NumericPredicateQuery::disableShapesForTests) {
+    NumericPredicateQuery::disableShapesForTests = disabled;
   }
   ~NumericRangeShapeGuard() {
-    NumericRangeQuery::disableShapesForTests = saved;
+    NumericPredicateQuery::disableShapesForTests = saved;
   }
 };
 
@@ -5012,10 +5012,10 @@ TEST_F(SearchEngineTest, cachedNumericFilterHitIgnoresShapeToggle) {
       SkipStats::conjPlanUnknownIsland,
       SkipStats::conjPlanUnknownIslandNumericGeo,
       SkipStats::conjDenseCountWindows,
-      SkipStats::numericRangePointsArms
-          + SkipStats::numericRangeComplementArms
-          + SkipStats::numericRangeZoneArms
-          + SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::numericPredicatePointsArms
+          + SkipStats::numericPredicateComplementArms
+          + SkipStats::numericPredicateZoneArms
+          + SkipStats::numericPredicateSparseVerifyArms,
     };
   };
 
@@ -6909,10 +6909,10 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
       SkipStats::conjPlanUnknownIsland,
       SkipStats::conjPlanUnknownIslandNumericGeo,
       SkipStats::conjDenseCountWindows,
-      SkipStats::numericRangePointsArms,
-      SkipStats::numericRangeComplementArms,
-      SkipStats::numericRangeZoneArms,
-      SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::numericPredicatePointsArms,
+      SkipStats::numericPredicateComplementArms,
+      SkipStats::numericPredicateZoneArms,
+      SkipStats::numericPredicateSparseVerifyArms,
       {
         SkipStats::bulkBuiltThenRejected,
         SkipStats::bulkBuiltThenRejectedWrapperRoute,
@@ -7010,9 +7010,9 @@ TEST_F(SearchEngineTest,
     return Run{
       req->getMatchCount("q"), resultIds(*req, "q"),
       SkipStats::conjPlanUnknownIslandNumericGeo,
-      SkipStats::numericRangePointsArms,
-      SkipStats::numericRangeComplementArms,
-      SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::numericPredicatePointsArms,
+      SkipStats::numericPredicateComplementArms,
+      SkipStats::numericPredicateSparseVerifyArms,
       SkipStats::fieldSortBulkCollections,
     };
   };
@@ -7101,9 +7101,9 @@ TEST_F(SearchEngineTest,
     return Run{
       req->getMatchCount("q"),
       SkipStats::conjDenseCountWindows,
-      SkipStats::numericRangePointsArms,
-      SkipStats::numericRangeComplementArms,
-      SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::numericPredicatePointsArms,
+      SkipStats::numericPredicateComplementArms,
+      SkipStats::numericPredicateSparseVerifyArms,
     };
   };
 
@@ -7173,9 +7173,9 @@ TEST_F(SearchEngineTest,
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     return Run{
       req->getMatchCount("q"),
-      SkipStats::numericRangePointsArms,
-      SkipStats::numericRangeComplementArms,
-      SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::numericPredicatePointsArms,
+      SkipStats::numericPredicateComplementArms,
+      SkipStats::numericPredicateSparseVerifyArms,
     };
   };
 
@@ -7240,9 +7240,9 @@ TEST_F(SearchEngineTest,
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     return Run{
       req->getMatchCount("q"),
-      SkipStats::numericRangePointsArms,
-      SkipStats::numericRangeComplementArms,
-      SkipStats::numericRangeSparseVerifyArms,
+      SkipStats::numericPredicatePointsArms,
+      SkipStats::numericPredicateComplementArms,
+      SkipStats::numericPredicateSparseVerifyArms,
     };
   };
 

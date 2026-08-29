@@ -12,7 +12,7 @@
 #include "BoostQuery.h"
 #include "ConstantScoreQuery.h"
 #include "MultiTermQuery.h"
-#include "NumericRangeQuery.h"
+#include "NumericPredicateQuery.h"
 #include "PhraseQuery.h"
 #include "TermQuery.h"
 #include "ScoreCompact.h"
@@ -1121,8 +1121,8 @@ public:
               demand, PhraseQuery::ScorerControls::disableSortForTests,
               PhraseQuery::ScorerControls::disableRepeatDedupForTests,
               PhraseQuery::disableShapesForTests);
-      buildContext.numericRangeDisableShapesForTests =
-          NumericRangeQuery::disableShapesForTests;
+      buildContext.numericPredicateDisableShapesForTests =
+          NumericPredicateQuery::disableShapesForTests;
       buildContext.disableBooleanTwoPhaseForTests =
           disableTwoPhaseForTests;
       buildContext.disableDisjunctionTwoPhaseForTests =

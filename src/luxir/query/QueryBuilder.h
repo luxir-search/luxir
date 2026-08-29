@@ -17,7 +17,7 @@
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
-#include "luxir/query/NumericRangeQuery.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
@@ -161,7 +161,7 @@ public:
 
   // The numeric field types stored in the shared int column (INT raw,
   // FLOAT/DOUBLE sortable bits, DATE epoch millis).  Match and range on these
-  // build a NumericRangeQuery over the column.  Public because schema-aware
+  // build a NumericPredicateQuery over the column. Public because schema-aware
   // string parsers select arms by the same classification.
   static bool isNumericColumnType(FieldType::Type t) {
     return t == FieldType::Type::INT || t == FieldType::Type::FLOAT
@@ -366,11 +366,12 @@ public:
   }
 
   CanonicalValueSet canonicalizeFieldValues(
-      std::string_view field, ValueSequence values,
-      std::string_view valueName = "AnyOfQuery values",
-      ValueSequence::NullError nullError =
-          ValueSequence::NullError::SCALAR_REQUIRED) {
-    values.validate(valueName, nullError);
+      std::string_view field, ValueSequence values) {
+    if (values.size() > ValueSequence::MAX_VALUES) {
+      throw std::runtime_error(std::format(
+          "AnyOfQuery values exceeds the {} value limit",
+          ValueSequence::MAX_VALUES));
+    }
     if (values.empty()) {
       return CanonicalValueSet(field);
     }
@@ -438,9 +439,22 @@ public:
       }
       auto encoded = values.numerics();
       if (encoded.size() == 1) {
-        return pool.make<NumericRangeQuery>(field, encoded[0], encoded[0]);
+        return pool.make<NumericPredicateQuery>(field, encoded[0], encoded[0]);
       }
-      return pool.make<NumericRangeQuery>(field, encoded);
+      auto intervals = pool.make_span<PointsReader::ValueRange>(encoded.size());
+      size_t intervalCount = 0;
+      for (int64_t value : encoded) {
+        if (intervalCount != 0
+            && intervals[intervalCount - 1].hi
+                != std::numeric_limits<int64_t>::max()
+            && value == intervals[intervalCount - 1].hi + 1) {
+          intervals[intervalCount - 1].hi = value;
+        } else {
+          intervals[intervalCount++] = {value, value};
+        }
+      }
+      return pool.make<NumericPredicateQuery>(
+          field, encoded, intervals.first(intervalCount));
     }
 
     bool termBacked = fieldType.type() == FieldType::Type::TEXT
@@ -728,7 +742,7 @@ public:
   // an open-ended side).  At most one of gte/gt (lower) and one of lte/lt
   // (upper) may be set.
   //
-  // Numeric/date column fields build a NumericRangeQuery: bounds coerce to
+  // Numeric/date column fields build a NumericPredicateQuery: bounds coerce to
   // the field's encoded int64 (FieldType::coerceColInt64) and fold to an
   // inclusive [lo, hi] window; an empty range collapses to match-nothing.
   //
@@ -858,7 +872,7 @@ public:
       hi = *hiEnc - 1;
     }
     if (lo > hi) return matchNoDocs();  // empty range
-    return pool.make<NumericRangeQuery>(field, lo, hi);
+    return pool.make<NumericPredicateQuery>(field, lo, hi);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.
