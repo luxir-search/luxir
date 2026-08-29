@@ -7123,6 +7123,34 @@ TEST_F(TermScorerTest, queryPrepDirectTermMaterializationMatchesWindows) {
       savedDirectDisable;
 }
 
+// Domain-driven materialization with a bitset eligibility set whose last
+// member is the segment's final document: the eligibility cursor must stop
+// at the segment end instead of probing the bitset past its size.
+TEST_F(TermScorerTest, queryPrepDomainDrivenBitsetReachesSegmentEnd) {
+  const int32_t N = 300;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    f.add(doc, "filler");
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  auto domain = makeEveryNthDocSet(segment.maxDoc(), 1, false);
+
+  TermQuery query("body_w", "filler");
+  auto* weight = query.createWeight(qContext, 0);
+  auto matches = QueryPrep::materialize(
+      *weight, nullptr, segment, domain.get(),
+      Query::SupplierExecutionMode::ORDINARY,
+      QueryPrep::MaterializeMode::DOMAIN_DRIVEN);
+  EXPECT_EQ((int64_t)segment.maxDoc(), matches->card());
+}
+
 // "+a b" without scores: the optional clause is a pure score add under a
 // mandatory clause, so a non-scoring weight drops it - membership is
 // unchanged and the single-clause count() shortcut engages (Lucene's

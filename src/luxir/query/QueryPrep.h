@@ -576,8 +576,9 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
         const FixedBitSet& bits = ((BitDocSet*) domain)->bits();
         int32_t doc = bits.nextSetBit(0);
         while (doc < segment.maxDoc() && consume(doc)) {
-          doc = bits.nextSetBit(
-              std::max(doc + 1, scorer->docId()));
+          int32_t next = std::max(doc + 1, scorer->docId());
+          if (next >= segment.maxDoc()) break;
+          doc = bits.nextSetBit(next);
         }
       } else {
         // The scorer can leap beyond multiple ARRAY entries. Gallop the
