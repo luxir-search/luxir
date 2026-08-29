@@ -183,9 +183,8 @@ public:
     if (value) appendTerm(*value);
   }
 
-  std::optional<FilterKey> finish(FilterKeyScope scope,
-                                  const FilterKeyContext& ctx) && {
-    if (scope == FilterKeyScope::UNCACHEABLE) return std::nullopt;
+  FilterKey finishStructural(FilterKeyScope scope,
+                             const FilterKeyContext& ctx) && {
     FilterKeyBuilder envelope;
     envelope.appendUInt64(ctx.schemaGen);
     envelope.bytes.push_back((std::byte)scope);
@@ -198,6 +197,12 @@ public:
     envelope.appendString(ctx.timeZone);
     envelope.appendBytes(bytes);
     return FilterKey(std::move(envelope.bytes));
+  }
+
+  std::optional<FilterKey> finish(FilterKeyScope scope,
+                                  const FilterKeyContext& ctx) && {
+    if (scope == FilterKeyScope::UNCACHEABLE) return std::nullopt;
+    return std::move(*this).finishStructural(scope, ctx);
   }
 };
 

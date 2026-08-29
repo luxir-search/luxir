@@ -224,7 +224,40 @@ struct from<JSON, luxir::api::ExprOp> {
   }
 };
 
-// ----- SearchOp: canonical one-arm object, or a bare string (ExprOp sugar) -----
+// ----- Domain: strict keys, with bare Query sugar in filter -----
+template <>
+struct from<JSON, luxir::api::Domain> {
+  template <auto Opts>
+  static void op(luxir::api::Domain &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    namespace api = luxir::api;
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "query") {
+            from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+                value.query, ctx, vit, vend);
+          } else if (key == "apply_parent_filters") {
+            util::from_json<O>(value.apply_parent_filters, ctx, vit, vend);
+          } else if (key == "filter") {
+            decltype(auto) filters =
+                ::hpp_proto::detail::as_modifiable(ctx, value.filter);
+            glz::util::parse_repeated<O>(false, filters, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
 static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 6,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
@@ -247,9 +280,15 @@ struct from<JSON, luxir::api::SearchOp> {
     std::string_view key;
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
     bool sawArm = false;
+    bool sawDomain = false;
     util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
+          if (key == "domain" && !sawDomain) {
+            sawDomain = true;
+            util::from_json<V>(value.domain, ctx, vit, vend);
+            return bool(ctx.error);
+          }
           if (sawArm) {
             ctx.error = error_code::unknown_key;
             return true;

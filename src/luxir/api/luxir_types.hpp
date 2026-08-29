@@ -468,8 +468,9 @@ struct RangeFacet {                                             // needs Val,Cal
   SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,ExprOp
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,ExprOp,Domain
   std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, ExprOp> kind;
+  std::optional<Domain> domain;
 };
 struct Warning { std::string_view code; std::string_view message; };
 struct ExecutionProfilePiece {

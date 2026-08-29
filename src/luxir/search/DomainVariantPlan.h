@@ -15,17 +15,48 @@
 #include <utility>
 #include <vector>
 
+#include "luxir/query/Query.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/RequestMemTracker.h"
 
 namespace luxir {
 
-// Parse-time routing shape plus the per-segment production race for sibling
-// domains. Variant 0 is implicit and contains every filter. Stored variants
-// are the distinct non-default filter subsets requested by direct children.
+// Parse-time sibling-domain identity plus the per-segment production race.
+// Variant 0 is implicit: inherited M with every parent filter and no local
+// filters. Stored variants extend that identity with a frame, routed parent
+// filter subset, and ordered local-filter source list.
 class DomainVariantPlan {
-  struct Variant {
+public:
+  static constexpr size_t MAX_NON_DEFAULT_VARIANTS = 64;
+
+  enum class Frame : uint8_t {
+    INHERIT,
+    RESET,
+  };
+
+  struct QuerySpec {
+    Query* query;
+    FilterKey identity;
+  };
+
+private:
+  struct QuerySource {
+    Query* query;
+    FilterKey identity;
+    Query::Weight* weight = nullptr;
+    FilterCache::Use* use = nullptr;
+  };
+
+  struct InheritBase {
     std::vector<uint64_t> included;
+  };
+
+  struct Variant {
+    Frame frame = Frame::INHERIT;
+    std::vector<uint64_t> included;
+    size_t inheritBase = 0;
+    size_t resetSource = std::numeric_limits<size_t>::max();
+    std::vector<size_t> extraSources;
   };
 
   struct ChildRoute {
@@ -34,15 +65,56 @@ class DomainVariantPlan {
   };
 
   size_t filterCount = 0;
+  size_t domainOverrideCount = 0;
+  std::vector<InheritBase> inheritBases;
   std::vector<Variant> variants;
   std::vector<ChildRoute> childRoutes;
+  std::vector<QuerySource> querySources;
 
-  bool includes(size_t variant, size_t filter) const {
-    assert(variant <= variants.size());
-    assert(filter < filterCount);
-    if (variant == 0) return true;
-    const auto& words = variants[variant - 1].included;
+  static bool bitIncluded(
+      std::span<const uint64_t> words, size_t filter) {
     return (words[filter >> 6] & (1ULL << (filter & 63))) != 0;
+  }
+
+  bool baseIncludes(size_t baseVariant, size_t filter) const {
+    assert(baseVariant <= inheritBases.size());
+    assert(filter < filterCount);
+    if (baseVariant == 0) return true;
+    return bitIncluded(inheritBases[baseVariant - 1].included, filter);
+  }
+
+  size_t internSource(const QuerySpec& spec) {
+    auto found = std::find_if(
+        querySources.begin(), querySources.end(),
+        [&](const QuerySource& source) {
+          return source.identity == spec.identity;
+        });
+    if (found != querySources.end()) {
+      return (size_t) (found - querySources.begin());
+    }
+    querySources.push_back({spec.query, spec.identity});
+    return querySources.size() - 1;
+  }
+
+  size_t internInheritBase(const std::vector<uint64_t>& included) {
+    bool all = true;
+    for (size_t filter = 0; filter < filterCount; filter++) {
+      if (!bitIncluded(included, filter)) {
+        all = false;
+        break;
+      }
+    }
+    if (all) return 0;
+    auto found = std::find_if(
+        inheritBases.begin(), inheritBases.end(),
+        [&](const InheritBase& base) {
+          return base.included == included;
+        });
+    if (found != inheritBases.end()) {
+      return (size_t) (found - inheritBases.begin()) + 1;
+    }
+    inheritBases.push_back({included});
+    return inheritBases.size();
   }
 
   static int64_t saturatedAdd(int64_t left, int64_t right) {
@@ -64,30 +136,20 @@ class DomainVariantPlan {
     return domain;
   }
 
-  DomainHandle compose(
-      size_t variant, DomainHandle identity,
+  DomainHandle composeBase(
+      size_t baseVariant, DomainHandle identity,
       std::span<const DomainHandle> filters) const {
     assert(filters.size() == filterCount);
-    std::vector<DocSet*> parts;
+    std::vector<DomainHandle> parts;
     parts.reserve(filterCount + 1);
-    DomainHandle single;
-    if (identity.get() != nullptr) {
-      parts.push_back(identity.get());
-      single = identity;
-    }
+    parts.push_back(std::move(identity));
     for (size_t i = 0; i < filterCount; i++) {
-      if (!includes(variant, i) || filters[i].get() == nullptr) continue;
-      parts.push_back(filters[i].get());
-      single = filters[i];
+      if (baseIncludes(baseVariant, i)) parts.push_back(filters[i]);
     }
-    if (parts.empty()) return {};
-    if (parts.size() == 1) return freeze(std::move(single));
-    return freeze(DomainHandle(DocSet::intersect(parts)));
+    return compose(std::move(parts));
   }
 
 public:
-  static constexpr size_t MAX_NON_DEFAULT_VARIANTS = 64;
-
   enum class Offer : uint8_t {
     IDENTITY,
     SHARED_M,
@@ -146,49 +208,157 @@ public:
   void begin(size_t count) {
     assert(variants.empty());
     assert(childRoutes.empty());
-    assert(count > 0);
+    assert(querySources.empty());
     filterCount = count;
   }
 
   template <typename Excluded>
-  void addChild(std::string_view key, Excluded&& excluded) {
-    assert(filterCount > 0);
+  bool addChild(
+      std::string_view key, Excluded&& excluded,
+      const QuerySpec* resetQuery = nullptr,
+      bool applyParentFilters = false,
+      std::span<const QuerySpec> extraFilters = {}) {
+    Frame frame = resetQuery == nullptr ? Frame::INHERIT : Frame::RESET;
     std::vector<uint64_t> included((filterCount + 63) >> 6, 0);
-    bool nonDefault = false;
-    for (size_t i = 0; i < filterCount; i++) {
-      if (excluded(i)) {
-        nonDefault = true;
-      } else {
-        included[i >> 6] |= 1ULL << (i & 63);
+    if (frame == Frame::INHERIT || applyParentFilters) {
+      for (size_t i = 0; i < filterCount; i++) {
+        if (!excluded(i)) included[i >> 6] |= 1ULL << (i & 63);
       }
     }
-    if (!nonDefault) {
+
+    Variant candidate;
+    candidate.frame = frame;
+    candidate.included = std::move(included);
+    if (frame == Frame::INHERIT) {
+      candidate.inheritBase = internInheritBase(candidate.included);
+    } else {
+      candidate.resetSource = internSource(*resetQuery);
+    }
+    candidate.extraSources.reserve(extraFilters.size());
+    for (const auto& filter : extraFilters) {
+      candidate.extraSources.push_back(internSource(filter));
+    }
+
+    if (candidate.frame == Frame::INHERIT
+        && candidate.inheritBase == 0
+        && candidate.extraSources.empty()) {
       childRoutes.push_back({key, 0});
-      return;
+      return false;
     }
 
     auto found = std::find_if(
         variants.begin(), variants.end(), [&](const Variant& variant) {
-          return variant.included == included;
+          return variant.frame == candidate.frame
+              && variant.included == candidate.included
+              && variant.resetSource == candidate.resetSource
+              && variant.extraSources == candidate.extraSources;
         });
     size_t variant;
-    if (found == variants.end()) {
+    bool created = found == variants.end();
+    if (created) {
       if (variants.size() >= MAX_NON_DEFAULT_VARIANTS) {
+        bool domainOverride = resetQuery != nullptr || !extraFilters.empty();
         throw std::runtime_error(
             "op '" + std::string(key)
-            + "': routed filter variant cap 64 exceeded");
+            + (domainOverride
+                    ? "': domain variant cap 64 exceeded"
+                    : "': routed filter variant cap 64 exceeded"));
       }
-      variants.push_back({std::move(included)});
+      variants.push_back(std::move(candidate));
+      if (resetQuery != nullptr || !extraFilters.empty()) {
+        domainOverrideCount++;
+      }
       variant = variants.size();
     } else {
       variant = (size_t) (found - variants.begin()) + 1;
     }
     childRoutes.push_back({key, (uint8_t) variant});
+    return created;
+  }
+
+  void buildWeights(
+      Query::Context& context, Query::PlanningContext& planning,
+      int32_t requestFlags) {
+    int32_t filterFlags = requestFlags
+        & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    for (auto& source : querySources) {
+      source.weight = source.query->createWeight(context, filterFlags);
+      source.use = planning.getFilterUse(*source.query);
+    }
   }
 
   bool empty() const { return variants.empty(); }
   size_t nonDefaultVariantCount() const { return variants.size(); }
   size_t variantCount() const { return empty() ? 1 : variants.size() + 1; }
+  size_t inheritBaseCount() const { return inheritBases.size() + 1; }
+  size_t sourceCount() const { return querySources.size(); }
+
+  Query::Weight* sourceWeight(size_t source) const {
+    assert(source < querySources.size());
+    return querySources[source].weight;
+  }
+
+  FilterCache::Use* sourceUse(size_t source) const {
+    assert(source < querySources.size());
+    return querySources[source].use;
+  }
+
+  bool sourcesNeedPrepare() const {
+    return std::ranges::any_of(querySources, [](const QuerySource& source) {
+      assert(source.weight != nullptr);
+      return source.weight->needsPrepare();
+    });
+  }
+
+  bool needsInheritProduction() const {
+    return std::ranges::any_of(variants, [](const Variant& variant) {
+      return variant.frame == Frame::INHERIT;
+    });
+  }
+
+  bool hasResetVariants() const {
+    return std::ranges::any_of(variants, [](const Variant& variant) {
+      return variant.frame == Frame::RESET;
+    });
+  }
+
+  bool needsResetParentFilters() const {
+    for (const auto& variant : variants) {
+      if (variant.frame != Frame::RESET) continue;
+      for (size_t filter = 0; filter < filterCount; filter++) {
+        if (bitIncluded(variant.included, filter)) return true;
+      }
+    }
+    return false;
+  }
+
+  Frame frame(size_t variant) const {
+    assert(variant < variantCount());
+    return variant == 0 ? Frame::INHERIT : variants[variant - 1].frame;
+  }
+
+  size_t inheritBase(size_t variant) const {
+    assert(frame(variant) == Frame::INHERIT);
+    return variant == 0 ? 0 : variants[variant - 1].inheritBase;
+  }
+
+  size_t resetSource(size_t variant) const {
+    assert(variant > 0 && frame(variant) == Frame::RESET);
+    return variants[variant - 1].resetSource;
+  }
+
+  std::span<const size_t> extraSources(size_t variant) const {
+    assert(variant < variantCount());
+    if (variant == 0) return {};
+    return variants[variant - 1].extraSources;
+  }
+
+  bool includesFilter(size_t variant, size_t filter) const {
+    assert(variant < variantCount());
+    assert(filter < filterCount);
+    if (variant == 0) return true;
+    return bitIncluded(variants[variant - 1].included, filter);
+  }
 
   size_t estimatedSetBytes(int32_t maxDoc) const {
     size_t bitset = sizeof(RAMBitDocSet)
@@ -201,13 +371,11 @@ public:
   std::shared_ptr<Reservation> reserveProduction(
       RequestMemTracker& tracker, int32_t maxDoc,
       std::string detail) const {
-    // Three full-set scratch allowances cover the ARRAY vector's growth
-    // capacity plus the simultaneously live BITSET during promotion, and the
-    // equivalent vector shrink/intersection transient, without forcing sparse
-    // builders to reserve their maximum capacity. Request-owned filter sets
-    // are charged on their Use slots, shared cache values remain charged to
-    // the cache, and returned owned filters grow this reservation exactly.
-    size_t bytes = saturatedMultiply(3, estimatedSetBytes(maxDoc));
+    // Three full-set scratch allowances cover ARRAY growth and promotion
+    // transients. Produced outputs are reserved by the selected offer and
+    // owned query/filter artifacts grow the charge at materialization time.
+    size_t bytes = saturatedMultiply(
+        3 + domainOverrideCount, estimatedSetBytes(maxDoc));
     return std::make_shared<Reservation>(
         tracker, bytes, std::move(detail));
   }
@@ -221,26 +389,24 @@ public:
     return found == childRoutes.end() ? 0 : found->variant;
   }
 
-  // Initial total-work rule. SHARED_M either reuses an artifact and retains
-  // the ordinary default ranking walk, or captures raw M in one exhaustive
-  // ranking walk. INDEPENDENT pays one membership execution per variant plus
-  // the ordinary default ranking walk unless those exact domains answer the
-  // parent directly. Intersection constants are deliberately left equal
-  // until measurements refit them.
+  // The stage-3 race is deliberately over inherited-M bases only. Local G
+  // filters compose after the selected base is produced, while reset variants
+  // are independent executions and never create a raw-M requirement.
   Selection selectOffer(
       int64_t rawQueryCost, int32_t maxDoc, DomainHandle base,
       std::span<const DomainHandle> filters, bool implicitMatches,
       bool reusableRawArtifact, bool exactDomainsServeParent) const {
-    assert(!empty());
+    assert(needsInheritProduction());
     assert(filters.size() == filterCount);
     int64_t rawCost = std::max<int64_t>(0, rawQueryCost);
     int64_t independentMembershipCost = 0;
     int64_t defaultRankingCost = rawCost;
-    for (size_t variant = 0; variant < variantCount(); variant++) {
+    for (size_t variant = 0; variant < inheritBaseCount(); variant++) {
       int64_t eligibility = base.get() == nullptr
           ? (int64_t) maxDoc : (int64_t) base.get()->card();
       for (size_t filter = 0; filter < filterCount; filter++) {
-        if (includes(variant, filter) && filters[filter].get() != nullptr) {
+        if (baseIncludes(variant, filter)
+            && filters[filter].get() != nullptr) {
           eligibility = std::min<int64_t>(
               eligibility, filters[filter].get()->card());
         }
@@ -251,7 +417,7 @@ public:
       if (variant == 0) defaultRankingCost = variantCost;
     }
     size_t setBytes = estimatedSetBytes(maxDoc);
-    size_t produced = variantCount();
+    size_t produced = inheritBaseCount();
     Selection selection;
     if (implicitMatches) {
       selection.offers[selection.count++] = {
@@ -313,26 +479,26 @@ public:
     return freeze(DomainHandle(DocSet::intersect(parts)));
   }
 
-  std::vector<DomainHandle> produceShared(
+  std::vector<DomainHandle> produceSharedBases(
       DomainHandle rawMatches,
       std::span<const DomainHandle> filters) const {
-    assert(!empty());
-    std::vector<DomainHandle> output(variantCount());
+    assert(needsInheritProduction());
+    std::vector<DomainHandle> output(inheritBaseCount());
     for (size_t variant = 0; variant < output.size(); variant++) {
-      output[variant] = compose(variant, rawMatches, filters);
+      output[variant] = composeBase(variant, rawMatches, filters);
       assert(output[variant].isDeliverable());
     }
     return output;
   }
 
   template <typename Producer>
-  std::vector<DomainHandle> produceIndependent(
+  std::vector<DomainHandle> produceIndependentBases(
       DomainHandle base,
       std::span<const DomainHandle> filters, Producer&& producer) const {
-    assert(!empty());
-    std::vector<DomainHandle> output(variantCount());
+    assert(needsInheritProduction());
+    std::vector<DomainHandle> output(inheritBaseCount());
     for (size_t variant = 0; variant < output.size(); variant++) {
-      DomainHandle eligibility = compose(variant, base, filters);
+      DomainHandle eligibility = composeBase(variant, base, filters);
       output[variant] = freeze(producer(eligibility.get()));
       assert(output[variant].isDeliverable());
     }
@@ -341,7 +507,21 @@ public:
 
   DomainHandle defaultDomain(
       DomainHandle base, std::span<const DomainHandle> filters) const {
-    return compose(0, std::move(base), filters);
+    return composeBase(0, std::move(base), filters);
+  }
+
+  static DomainHandle compose(std::vector<DomainHandle> parts) {
+    std::vector<DocSet*> sets;
+    DomainHandle single;
+    sets.reserve(parts.size());
+    for (auto& part : parts) {
+      if (part.get() == nullptr) continue;
+      sets.push_back(part.get());
+      single = part;
+    }
+    if (sets.empty()) return {};
+    if (sets.size() == 1) return freeze(std::move(single));
+    return freeze(DomainHandle(DocSet::intersect(sets)));
   }
 
   void retainReservation(

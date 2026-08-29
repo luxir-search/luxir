@@ -352,6 +352,35 @@ TEST(JsonDialect, FilterRoutingWrapperIsStrict) {
   EXPECT_NE(std::string::npos, err.find("bare filter form")) << err;
 }
 
+TEST(JsonDialect, OpDomainUsesStrictKeysAndBareFilterQueries) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchOp op;
+  ASSERT_TRUE(P::read_json(op, R"({"field_facet":{"field":"brand_s"},
+    "domain":{"query":"stock_s:yes","apply_parent_filters":true,
+      "filter":["color_s:red",{"match":{"size_s":"large"}}]}})", mr));
+  ASSERT_TRUE(op.domain.has_value());
+  ASSERT_TRUE(op.domain->query.has_value());
+  EXPECT_EQ("stock_s:yes",
+            std::get<P::ExprQuery>(op.domain->query->kind).q);
+  EXPECT_EQ(true, op.domain->apply_parent_filters);
+  ASSERT_EQ(2u, op.domain->filter.size());
+  EXPECT_EQ("color_s:red",
+            std::get<P::ExprQuery>(op.domain->filter[0].kind).q);
+  EXPECT_EQ("size_s",
+            std::get<P::Match>(op.domain->filter[1].kind).field);
+
+  std::string encoded;
+  ASSERT_TRUE(P::write_json(op, encoded));
+  EXPECT_NE(std::string::npos, encoded.find("\"domain\""));
+  EXPECT_NE(std::string::npos, encoded.find("\"apply_parent_filters\":true"));
+
+  P::SearchOp unknown;
+  std::string error;
+  EXPECT_FALSE(P::read_json(unknown, R"json({"expr_op":"sum(price_i)",
+    "domain":{"query":{"all":true},"unknown":1}})json", mr, &error));
+  EXPECT_NE(std::string::npos, error.find("unknown")) << error;
+}
+
 TEST(JsonDialect, QueryBoostSiblingSugarAndArm) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query flat;

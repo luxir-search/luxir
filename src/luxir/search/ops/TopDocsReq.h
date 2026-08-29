@@ -397,7 +397,8 @@ public:
       };
 
       if (op.subOps.size() > 0) {
-        if (op.domainVariants.empty()) {
+        if (op.domainVariants.empty()
+            || !op.domainVariants.needsInheritProduction()) {
           output.resize(op.req.reader->segments().size());
         }
         subCalcs.reserve(op.subOps.size());
@@ -420,6 +421,10 @@ public:
           requiresPreparePhase = true;
           break;
         }
+      }
+      if (!op.domainVariants.empty()
+          && op.domainVariants.sourcesNeedPrepare()) {
+        requiresPreparePhase = true;
       }
       if (requiresPreparePhase) {
         auto numSegs = op.req.reader->segments().size();
@@ -460,6 +465,8 @@ public:
     std::vector<DomainHandle> effectiveDomains;
     std::vector<DocSet*> effectiveDomainViews;
     std::vector<QueryPrep::PreparedSource> preparedFilterSources;
+    std::vector<QueryPrep::PreparedSource> preparedResetFilterSources;
+    std::vector<QueryPrep::PreparedSource> preparedDomainSources;
     std::vector<std::vector<DomainHandle>> preparedRoutedFilters;
     std::vector<std::shared_ptr<DomainVariantPlan::Reservation>>
         preparedRoutedReservations;
@@ -820,6 +827,46 @@ public:
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
 
+      if (routed
+          && (op.domainVariants.sourceCount() > 0
+              || op.domainVariants.needsResetParentFilters())) {
+        std::vector<DocSet*> liveDomains;
+        liveDomains.reserve(op.req.reader->segments().size());
+        for (auto& segment : op.req.reader->segments()) {
+          liveDomains.push_back(segment.liveDocs() == nullptr
+              ? nullptr : &segment.liveDocs()->docset());
+        }
+        Query::Weight::PrepareContext liveCtx{
+          *op.req.reader,
+          std::span<DocSet* const>(
+              liveDomains.data(), liveDomains.size()),
+          tg != nullptr
+        };
+        if (op.domainVariants.needsResetParentFilters()) {
+          preparedResetFilterSources = QueryPrep::prepareFilterSources(
+              op.filterWeights, op.filterUses, liveCtx);
+        }
+        std::vector<Query::Weight*> domainWeights(
+            op.domainVariants.sourceCount());
+        std::vector<FilterCache::Use*> domainUses(
+            op.domainVariants.sourceCount());
+        for (size_t source = 0; source < domainWeights.size(); source++) {
+          domainWeights[source] = op.domainVariants.sourceWeight(source);
+          domainUses[source] = op.domainVariants.sourceUse(source);
+        }
+        preparedDomainSources = QueryPrep::prepareFilterSources(
+            domainWeights, domainUses, liveCtx);
+        for (const auto& source : preparedDomainSources) {
+          if (source.domainDependence
+              != PreparedDomainDependence::QUERY_CANONICAL) {
+            throw std::runtime_error(
+                "top_docs '" + std::string(op.name)
+                + "': per-variant preparation for this domain query shape "
+                  "is not implemented yet");
+          }
+        }
+      }
+
       if (routed) {
         if (mainNeedsPrepare) {
           for (size_t i = 0; i < op.req.reader->segments().size(); i++) {
@@ -844,6 +891,7 @@ public:
             preparedWeight = op.weight->prepare(queryCtx);
           }
           if (preparedWeight != nullptr
+              && op.domainVariants.needsInheritProduction()
               && preparedWeight->domainDependence()
                   != PreparedDomainDependence::QUERY_CANONICAL) {
             throw std::runtime_error(
@@ -928,14 +976,63 @@ public:
       return filters;
     }
 
+    std::vector<DomainHandle> materializeResetParentFilters(
+        int32_t segnum,
+        const std::shared_ptr<DomainVariantPlan::Reservation>& reservation) {
+      auto& op = thisOp();
+      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      DocSet* live = seg.liveDocs() == nullptr
+          ? nullptr : &seg.liveDocs()->docset();
+      std::vector<DomainHandle> filters;
+      filters.reserve(op.filterWeights.size());
+      for (size_t i = 0; i < op.filterWeights.size(); i++) {
+        DomainHandle filter = requiresPreparePhase
+            ? QueryPrep::materializeEffectiveFilter(
+                  preparedResetFilterSources[i], *op.req.reader, seg, live)
+            : QueryPrep::materializeEffectiveFilter(
+                  *op.filterWeights[i], op.filterUses[i],
+                  *op.req.reader, seg, live);
+        if (filter.get() != nullptr && filter.isDeliverable()) {
+          reservation->grow(filter.get()->ramBytesUsed());
+        }
+        filters.push_back(
+            std::move(filter).pinnedWith(op.planning.filterUses));
+      }
+      return filters;
+    }
+
+    DomainHandle materializeDomainSource(
+        size_t source, int32_t segnum, DocSet* base,
+        const std::shared_ptr<DomainVariantPlan::Reservation>& reservation) {
+      auto& op = thisOp();
+      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      DomainHandle result = preparedDomainSources.empty()
+          ? QueryPrep::materializeEffectiveFilter(
+                *op.domainVariants.sourceWeight(source),
+                op.domainVariants.sourceUse(source),
+                *op.req.reader, seg, base)
+          : QueryPrep::materializeEffectiveFilter(
+                preparedDomainSources[source], *op.req.reader, seg, base);
+      if (result.get() != nullptr && result.isDeliverable()) {
+        reservation->grow(result.get()->ramBytesUsed());
+      }
+      return std::move(result).pinnedWith(op.planning.filterUses);
+    }
+
     struct RoutedProduction {
       DomainHandle defaultEligibility;
       std::vector<DomainHandle> filters;
+      std::vector<DomainHandle> resetFilters;
+      std::vector<DomainHandle> inheritBases;
       std::vector<DomainHandle> domains;
       std::shared_ptr<DomainVariantPlan::Reservation> reservation;
       bool captureSharedRaw = false;
+      bool inheritReady = false;
 
-      bool domainsReady() const { return !domains.empty(); }
+      DomainHandle inheritDefault() const {
+        assert(inheritReady);
+        return domains[0];
+      }
     };
 
     Query::SegmentSource& variantMembershipSource() {
@@ -945,6 +1042,67 @@ public:
       }
       assert(op.variantMembershipWeight != nullptr);
       return *op.variantMembershipWeight;
+    }
+
+    void finishResetDomains(RoutedProduction& result, int32_t segnum) {
+      auto& op = thisOp();
+      auto& seg = op.req.reader->segments()[(size_t) segnum];
+      DocSet* live = seg.liveDocs() == nullptr
+          ? nullptr : &seg.liveDocs()->docset();
+      for (size_t variant = 1;
+           variant < op.domainVariants.variantCount(); variant++) {
+        if (op.domainVariants.frame(variant)
+            != DomainVariantPlan::Frame::RESET) {
+          continue;
+        }
+        std::vector<DomainHandle> parts;
+        parts.push_back(materializeDomainSource(
+            op.domainVariants.resetSource(variant), segnum, live,
+            result.reservation));
+        for (size_t filter = 0; filter < result.resetFilters.size(); filter++) {
+          if (op.domainVariants.includesFilter(variant, filter)) {
+            parts.push_back(result.resetFilters[filter]);
+          }
+        }
+        for (size_t source : op.domainVariants.extraSources(variant)) {
+          parts.push_back(materializeDomainSource(
+              source, segnum, live, result.reservation));
+        }
+        result.domains[variant] = DomainVariantPlan::compose(
+            std::move(parts));
+        result.domains[variant] =
+            std::move(result.domains[variant]).retainedWith(
+                result.reservation);
+      }
+    }
+
+    void finishInheritDomains(RoutedProduction& result, int32_t segnum) {
+      auto& op = thisOp();
+      assert(!result.inheritBases.empty());
+      result.domains[0] = result.inheritBases[0];
+      result.domains[0] = std::move(result.domains[0]).retainedWith(
+          result.reservation);
+      for (size_t variant = 1;
+           variant < op.domainVariants.variantCount(); variant++) {
+        if (op.domainVariants.frame(variant)
+            != DomainVariantPlan::Frame::INHERIT) {
+          continue;
+        }
+        DomainHandle base = result.inheritBases[
+            op.domainVariants.inheritBase(variant)];
+        std::vector<DomainHandle> parts;
+        parts.push_back(base);
+        for (size_t source : op.domainVariants.extraSources(variant)) {
+          parts.push_back(materializeDomainSource(
+              source, segnum, base.get(), result.reservation));
+        }
+        result.domains[variant] = DomainVariantPlan::compose(
+            std::move(parts));
+        result.domains[variant] =
+            std::move(result.domains[variant]).retainedWith(
+                result.reservation);
+      }
+      result.inheritReady = true;
     }
 
     RoutedProduction prepareRoutedProduction(
@@ -979,6 +1137,17 @@ public:
       result.defaultEligibility = op.domainVariants.defaultDomain(
           baseDomain, result.filters);
       assert(result.defaultEligibility.isDeliverable());
+      result.reservation = reservation;
+      result.domains.resize(op.domainVariants.variantCount());
+      if (op.domainVariants.needsResetParentFilters()) {
+        result.resetFilters = materializeResetParentFilters(
+            segnum, reservation);
+      }
+      finishResetDomains(result, segnum);
+
+      if (!op.domainVariants.needsInheritProduction()) {
+        return result;
+      }
 
       Query::SegmentSource& source = variantMembershipSource();
       bool implicitMatches = op.weight->matchesAllDocs();
@@ -1014,22 +1183,21 @@ public:
         selected = *leastMemory;
       }
 
-      std::vector<DomainHandle> domains;
       switch (selected.offer) {
         case DomainVariantPlan::Offer::IDENTITY:
-          result.domains = op.domainVariants.produceShared(
+          result.inheritBases = op.domainVariants.produceSharedBases(
               baseDomain, result.filters);
           break;
         case DomainVariantPlan::Offer::SHARED_M: {
           if (implicitMatches) {
-            result.domains = op.domainVariants.produceShared(
+            result.inheritBases = op.domainVariants.produceSharedBases(
                 baseDomain, result.filters);
           } else if (reusableRaw != nullptr) {
             DomainHandle rawMatches = op.domainVariants.constrainRaw(
                 DomainHandle::pinned(
                     reusableRaw, op.planning.filterUses),
                 baseDomain);
-            result.domains = op.domainVariants.produceShared(
+            result.inheritBases = op.domainVariants.produceSharedBases(
                 std::move(rawMatches), result.filters);
           } else {
             // Capture M in the existing ranking walk. Bulk paths fall back to
@@ -1040,7 +1208,7 @@ public:
           break;
         }
         case DomainVariantPlan::Offer::INDEPENDENT:
-          result.domains = op.domainVariants.produceIndependent(
+          result.inheritBases = op.domainVariants.produceIndependentBases(
               baseDomain, result.filters, [&](DocSet* eligibility) {
                 return DomainHandle(QueryPrep::materialize(
                     source, seg, eligibility,
@@ -1049,10 +1217,8 @@ public:
               });
           break;
       }
-      result.reservation = std::move(reservation);
-      if (result.domainsReady()) {
-        op.domainVariants.retainReservation(
-            result.domains, result.reservation);
+      if (!result.captureSharedRaw) {
+        finishInheritDomains(result, segnum);
       }
       return result;
     }
@@ -1164,7 +1330,7 @@ public:
           }
         }
         bool routedDomainsReady = routedProduction.has_value()
-            && routedProduction->domainsReady();
+            && routedProduction->inheritReady;
         bool routedDefaultIdentity = routedDomainsReady
             && (op.weight->isConstantScoring() || data->topCount() == 0);
         bool identityResult =
@@ -1777,11 +1943,10 @@ public:
           DomainHandle built(std::move(builder->build()));
           if (captureSharedRaw) {
             assert(routedProduction.has_value());
-            routedProduction->domains = op.domainVariants.produceShared(
+            routedProduction->inheritBases =
+                op.domainVariants.produceSharedBases(
                 std::move(built), routedProduction->filters);
-            op.domainVariants.retainReservation(
-                routedProduction->domains,
-                routedProduction->reservation);
+            finishInheritDomains(*routedProduction, segnum);
             routedProduction->captureSharedRaw = false;
           } else {
             output[(size_t)segnum] = std::move(built);
@@ -1802,11 +1967,19 @@ public:
         // TODO: launch sub-calculators in parallel (except for the first one).
         DomainHandle newDomain;
         if (routedProduction.has_value()) {
-          assert(routedProduction->domainsReady());
           assert(subCalcs.size() == subCalcVariants.size());
           size_t variant = subCalcVariants[(size_t) i];
           assert(variant < routedProduction->domains.size());
-          newDomain = routedProduction->domains[variant];
+          if (variant == 0 && !routedProduction->inheritReady) {
+            newDomain = matchEverything
+                ? domainHandle : output[(size_t)segnum];
+          } else {
+            if (op.domainVariants.frame(variant)
+                == DomainVariantPlan::Frame::INHERIT) {
+              assert(routedProduction->inheritReady);
+            }
+            newDomain = routedProduction->domains[variant];
+          }
         } else {
           newDomain = matchEverything
               ? domainHandle : output[(size_t)segnum];

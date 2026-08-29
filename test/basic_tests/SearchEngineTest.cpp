@@ -24,6 +24,8 @@
 #include "luxir/reader/SkipStats.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ProtobufSearchParser.h"
+#include "luxir/search/ops/RootOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/JsonRequest.h"
@@ -363,6 +365,27 @@ void appendRoutedFilter(
   }
 }
 
+void setResetDomain(
+    OpCursor& cursor, const api::Query& query,
+    bool applyParentFilters = false) {
+  auto& domain = cursor.rawOp().domain.emplace();
+  auto* stored = (api::Query*) cursor.mr().allocate(
+      sizeof(api::Query), alignof(api::Query));
+  new (stored) api::Query(query);
+  domain.query = stored;
+  if (applyParentFilters) domain.apply_parent_filters = true;
+}
+
+void appendDomainFilter(OpCursor& cursor, const api::Query& query) {
+  auto& domain = cursor.rawOp().domain.has_value()
+      ? *cursor.rawOp().domain : cursor.rawOp().domain.emplace();
+  auto old = domain.filter;
+  api::Query* filters =
+      api::build::allocArray(domain.filter, old.size() + 1, cursor.mr());
+  std::copy(old.begin(), old.end(), filters);
+  filters[old.size()] = query;
+}
+
 api::Query stringInQuery(
     std::pmr::memory_resource& mr, std::string_view field,
     std::initializer_list<std::string_view> values) {
@@ -394,19 +417,24 @@ std::map<std::string, float> resultScoreMap(const LocalReq& req,
   return out;
 }
 
-std::map<std::string, int64_t> resultFacetMap(
-    const api::DocList& docs, std::string_view facetName) {
+std::map<std::string, int64_t> facetMap(const api::FacetResult& facet) {
   std::map<std::string, int64_t> out;
-  const auto* value = docs.ops.find(facetName);
-  if (value == nullptr) return out;
-  const auto* facet = std::get_if<api::FacetResult>(&(*value)->kind);
-  if (facet == nullptr || !facet->bucket_ids.has_value()) return out;
-  const auto* ids = std::get_if<api::ColStr>(&facet->bucket_ids->kind);
-  if (ids == nullptr || ids->v.size() != facet->counts.size()) return out;
+  if (!facet.bucket_ids.has_value()) return out;
+  const auto* ids = std::get_if<api::ColStr>(&facet.bucket_ids->kind);
+  if (ids == nullptr || ids->v.size() != facet.counts.size()) return out;
   for (size_t i = 0; i < ids->v.size(); i++) {
-    out.emplace(std::string(ids->v[i]), facet->counts[i]);
+    out.emplace(std::string(ids->v[i]), facet.counts[i]);
   }
   return out;
+}
+
+std::map<std::string, int64_t> resultFacetMap(
+    const api::DocList& docs, std::string_view facetName) {
+  const auto* value = docs.ops.find(facetName);
+  if (value == nullptr) return {};
+  const auto* facet = std::get_if<api::FacetResult>(&(*value)->kind);
+  return facet == nullptr ? std::map<std::string, int64_t>{}
+                          : facetMap(*facet);
 }
 
 std::map<std::string, int64_t> resultFacetMap(const LocalReq& req,
@@ -3861,6 +3889,150 @@ TEST_F(SearchEngineTest, jsonRoutedFilterExecutes) {
             resultFacetMap(*req, "q", "brands"));
 }
 
+TEST_F(SearchEngineTest, opDomainsImplementInheritedAndResetFrames) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "main_s", "yes", "brand_s", "acme",
+            "color_s", "red", "stock_s", "yes", "price_i", 10),
+    flatdoc("id", "2", "main_s", "yes", "brand_s", "acme",
+            "color_s", "blue", "stock_s", "no", "price_i", 20),
+    flatdoc("id", "3", "main_s", "yes", "brand_s", "beta",
+            "color_s", "red", "stock_s", "yes", "price_i", 30),
+    flatdoc("id", "4", "main_s", "no", "brand_s", "beta",
+            "color_s", "blue", "stock_s", "yes", "price_i", 40),
+    flatdoc("id", "5", "main_s", "no", "brand_s", "gamma",
+            "color_s", "red", "stock_s", "no", "price_i", 50),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"json({"ops":{
+    "q":{"top_docs":{"query":"main_s:yes","filter":["brand_s:acme"],
+      "limit":0,"get_number":true,"ops":{
+        "default":{"field_facet":{"field":"color_s","limit":-1}},
+        "local":{"field_facet":{"field":"brand_s","limit":-1},
+          "domain":{"filter":["color_s:red"]}},
+        "reset":{"field_facet":{"field":"brand_s","limit":-1},
+          "domain":{"query":"stock_s:yes"}},
+        "reset_g":{"field_facet":{"field":"brand_s","limit":-1},
+          "domain":{"query":"stock_s:yes","filter":["color_s:red"]}},
+        "reset_apply":{"field_facet":{"field":"brand_s","limit":-1},
+          "domain":{"query":"stock_s:yes","apply_parent_filters":true}},
+        "sum":{"expr_op":"sum(price_i)",
+          "domain":{"query":"stock_s:yes","filter":["color_s:red"]}}
+      }}},
+    "root_reset":{"field_facet":{"field":"brand_s","limit":-1},
+      "domain":{"query":"stock_s:yes"}}
+  }})json", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+  EXPECT_EQ((std::map<std::string, int64_t>{{"blue", 1}, {"red", 1}}),
+            resultFacetMap(*req, "q", "default"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}}),
+            resultFacetMap(*req, "q", "local"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 2}}),
+            resultFacetMap(*req, "q", "reset"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 1}}),
+            resultFacetMap(*req, "q", "reset_g"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}}),
+            resultFacetMap(*req, "q", "reset_apply"));
+  ASSERT_NE(req->docList("q"), nullptr);
+  EXPECT_EQ(40, req->docList("q")->ops.at("sum")->asInt());
+  const auto* rootValue = req->responses[0]->proto.ops.find("root_reset");
+  ASSERT_NE(rootValue, nullptr);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 2}}),
+            facetMap(std::get<api::FacetResult>((*rootValue)->kind)));
+}
+
+TEST_F(SearchEngineTest, resetDomainEqualsIndependentMainQuery) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "main_s", "yes", "brand_s", "acme",
+            "stock_s", "yes"),
+    flatdoc("id", "2", "main_s", "yes", "brand_s", "acme",
+            "stock_s", "no"),
+    flatdoc("id", "3", "main_s", "no", "brand_s", "beta",
+            "stock_s", "yes"),
+  }, UpdateMessage::COMMIT);
+
+  auto overridden = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"query":"main_s:yes","filter":["brand_s:acme"],
+    "limit":0,"ops":{"f":{"field_facet":{"field":"brand_s","limit":-1},
+      "domain":{"query":"stock_s:yes"}}}})",
+      overridden->rawRequest(), overridden->mr);
+  overridden->collection("main");
+  overridden->execute();
+  ASSERT_TRUE(overridden->ok()) << overridden->errorMsg();
+
+  auto independent = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"query":"stock_s:yes","limit":0,
+    "ops":{"f":{"field_facet":{"field":"brand_s","limit":-1}}}})",
+      independent->rawRequest(), independent->mr);
+  independent->collection("main");
+  independent->execute();
+  ASSERT_TRUE(independent->ok()) << independent->errorMsg();
+  EXPECT_EQ(resultFacetMap(*independent, "q", "f"),
+            resultFacetMap(*overridden, "q", "f"));
+}
+
+TEST_F(SearchEngineTest, selectedComposesWithEveryDomainFrame) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "main_s", "yes", "brand_s", "acme",
+            "color_s", "red", "stock_s", "yes"),
+    flatdoc("id", "2", "main_s", "yes", "brand_s", "acme",
+            "color_s", "blue", "stock_s", "no"),
+    flatdoc("id", "3", "main_s", "yes", "brand_s", "beta",
+            "color_s", "red", "stock_s", "yes"),
+    flatdoc("id", "4", "main_s", "no", "brand_s", "beta",
+            "color_s", "blue", "stock_s", "yes"),
+  }, UpdateMessage::COMMIT);
+
+  auto run = [&](std::string_view domain) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    std::string json = R"({"query":"main_s:yes","filter":["stock_s:yes"],
+      "limit":0,"get_number":true,"ops":{"brands":{"field_facet":{
+        "field":"brand_s","limit":-1,"selected":["acme"]})";
+    json += domain;
+    json += "}}}";
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(1, req->getMatchCount());
+    return resultFacetMap(*req, "q", "brands");
+  };
+
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 1}}),
+            run(""));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 1}}),
+            run(R"(,"domain":{"filter":["color_s:red"]})"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 2}, {"beta", 1}}),
+            run(R"(,"domain":{"query":"main_s:yes"})"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}, {"beta", 1}}),
+            run(R"(,"domain":{"query":"main_s:yes","apply_parent_filters":true})"));
+}
+
+TEST_F(SearchEngineTest, resetDomainHandlesSegmentWithNoMatches) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme", "stock_s", "yes"),
+               UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "2", "brand_s", "beta", "stock_s", "no"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"limit":0,"ops":{"f":{"field_facet":{
+    "field":"brand_s","limit":-1},"domain":{"query":"stock_s:yes"}}}})",
+      req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ((std::map<std::string, int64_t>{{"acme", 1}}),
+            resultFacetMap(*req, "q", "f"));
+}
+
 TEST_F(SearchEngineTest, routedFiltersServeSidewaysFacetsStatsAndDefault) {
   CollectionHelper helper;
   helper.indexAll(std::array{
@@ -4198,7 +4370,7 @@ TEST_F(SearchEngineTest, routedFilterVariantCapIsPerRequest) {
   req->execute();
   EXPECT_NE(req->errorMsg().find("op '"), std::string::npos)
       << req->errorMsg();
-  EXPECT_NE(req->errorMsg().find("variant cap 64 exceeded"), std::string::npos)
+  EXPECT_NE(req->errorMsg().find("routed filter variant cap 64 exceeded"), std::string::npos)
       << req->errorMsg();
 }
 
@@ -4229,6 +4401,17 @@ TEST_F(SearchEngineTest, randomRoutedFiltersMatchExactOracle) {
     int value;
     std::set<std::string> except;
   };
+  enum class DomainKind : uint8_t {
+    NONE,
+    EXTRA_FILTER,
+    RESET,
+    RESET_APPLY,
+  };
+  struct DomainModel {
+    DomainKind kind;
+    int field;
+    int value;
+  };
   std::mt19937 random(0x5eed1234);
   const std::array<std::string, 4> opNames{
       "facet0", "facet1", "facet2", "facet3"};
@@ -4236,9 +4419,24 @@ TEST_F(SearchEngineTest, randomRoutedFiltersMatchExactOracle) {
     auto req = localReq(luxirNode->getSearchEngine());
     auto& top = req->collection("main").topDocs("q").allQuery()
         .getNumber().limit(0);
+    std::array<DomainModel, 4> domains;
     for (size_t op = 0; op < opNames.size(); op++) {
-      top.facet(opNames[op], "f" + std::to_string(op % 3) + "_s")
-          .limit(-1);
+      auto& facet = top.facet(
+          opNames[op], "f" + std::to_string(op % 3) + "_s").limit(-1);
+      auto& domain = domains[op];
+      domain.kind = (DomainKind) (random() % 4);
+      domain.field = (int) (random() % 3);
+      domain.value = (int) (random() % 3);
+      auto predicate = qb::match(
+          top.mr(), "f" + std::to_string(domain.field) + "_s",
+          "v" + std::to_string(domain.value));
+      if (domain.kind == DomainKind::EXTRA_FILTER) {
+        appendDomainFilter(facet, predicate);
+      } else if (domain.kind == DomainKind::RESET
+                 || domain.kind == DomainKind::RESET_APPLY) {
+        setResetDomain(
+            facet, predicate, domain.kind == DomainKind::RESET_APPLY);
+      }
     }
 
     std::vector<FilterModel> filters;
@@ -4268,7 +4466,7 @@ TEST_F(SearchEngineTest, randomRoutedFiltersMatchExactOracle) {
     ASSERT_TRUE(req->ok()) << "iteration=" << iteration << " "
                            << req->errorMsg();
 
-    auto matches = [&](const ModelDoc& doc, std::string_view op) {
+    auto matchesFilters = [&](const ModelDoc& doc, std::string_view op) {
       for (const auto& filter : filters) {
         if (filter.except.contains(std::string(op))) continue;
         if (doc.values[(size_t) filter.field] != filter.value) return false;
@@ -4276,12 +4474,27 @@ TEST_F(SearchEngineTest, randomRoutedFiltersMatchExactOracle) {
       return true;
     };
     int64_t defaultCount = 0;
-    for (const auto& doc : model) defaultCount += matches(doc, "");
+    for (const auto& doc : model) {
+      defaultCount += matchesFilters(doc, "");
+    }
     EXPECT_EQ(defaultCount, req->getMatchCount()) << "iteration=" << iteration;
     for (size_t op = 0; op < opNames.size(); op++) {
       std::map<std::string, int64_t> expected;
       for (const auto& doc : model) {
-        if (!matches(doc, opNames[op])) continue;
+        const auto& domain = domains[op];
+        bool reset = domain.kind == DomainKind::RESET
+            || domain.kind == DomainKind::RESET_APPLY;
+        if (reset
+            && doc.values[(size_t) domain.field] != domain.value) {
+          continue;
+        }
+        bool applyParent = !reset
+            || domain.kind == DomainKind::RESET_APPLY;
+        if (applyParent && !matchesFilters(doc, opNames[op])) continue;
+        if (domain.kind == DomainKind::EXTRA_FILTER
+            && doc.values[(size_t) domain.field] != domain.value) {
+          continue;
+        }
         expected["v" + std::to_string(doc.values[op % 3])]++;
       }
       EXPECT_EQ(expected, resultFacetMap(*req, "q", opNames[op]))
@@ -4324,6 +4537,95 @@ TEST_F(SearchEngineTest, protobufRoutedFilterValidation) {
   EXPECT_NE(std::string::npos,
             missingQuery->errorMsg().find("top_docs.filter[0].query requires a query kind"))
       << missingQuery->errorMsg();
+}
+
+TEST_F(SearchEngineTest, opDomainValidationIsParseTime) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme", "price_i", 10),
+               UpdateMessage::COMMIT);
+
+  auto expectError = [&](std::string_view json, std::string_view expected) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("main");
+    ExpectLog quiet("Search request failed:");
+    req->execute();
+    EXPECT_NE(std::string::npos, req->errorMsg().find(expected))
+        << req->errorMsg();
+  };
+
+  expectError(R"({"limit":0,"ops":{"f":{"field_facet":{
+    "field":"brand_s"},"domain":{"apply_parent_filters":false}}}})",
+      "apply_parent_filters requires domain.query");
+  expectError(R"json({"limit":0,"ops":{"outer":{"field_facet":{
+    "field":"brand_s","ops":{"inner":{"expr_op":"sum(price_i)",
+      "domain":{"query":{"all":true}}}}}}}})json",
+      "under a facet bucket: domain is only supported");
+  expectError(R"json({"ops":{"f":{"fusion":{
+    "sources":{"s":{"query":{"all":true}}},"rrf":{},
+    "ops":{"x":{"expr_op":"sum(price_i)",
+      "domain":{"query":{"all":true}}}}}}}})json",
+      "under Fusion.ops: domain is only supported");
+
+  auto missing = localReq(luxirNode->getSearchEngine());
+  auto& facet = missing->collection("main").topDocs("q").allQuery()
+      .facet("f", "brand_s");
+  auto& domain = facet.rawOp().domain.emplace();
+  api::build::allocArray(domain.filter, 1, missing->mr);
+  ExpectLog quiet("Search request failed:");
+  missing->execute();
+  EXPECT_NE(std::string::npos,
+            missing->errorMsg().find("domain.filter[0] requires a query kind"))
+      << missing->errorMsg();
+}
+
+TEST_F(SearchEngineTest, resetAndLocalDomainsShareRequestVariantCap) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
+  for (int i = 0; i < 65; i++) {
+    auto& facet = top.facet("f" + std::to_string(i), "brand_s");
+    auto query = qb::match(
+        top.mr(), "brand_s", "v" + std::to_string(i));
+    if ((i & 1) == 0) {
+      setResetDomain(facet, query);
+    } else {
+      appendDomainFilter(facet, query);
+    }
+  }
+  ExpectLog quiet("Search request failed:");
+  req->execute();
+  EXPECT_NE(std::string::npos,
+            req->errorMsg().find("domain variant cap 64 exceeded"))
+      << req->errorMsg();
+}
+
+TEST_F(SearchEngineTest, structurallyEqualDomainsShareVariant) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
+  setResetDomain(top.facet("a", "brand_s"),
+                 qb::match(top.mr(), "brand_s", "acme"));
+  setResetDomain(top.facet("b", "brand_s"),
+                 qb::match(top.mr(), "brand_s", "acme"));
+  req->schema = helper.collection().getSchema();
+  req->reader = helper.getIndexWriter()->getIndexReader();
+  ProtobufSearchParser parser(*req);
+  auto* root = parser.parse();
+  auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+  ASSERT_NE(nullptr, parsed);
+  EXPECT_EQ(2u, parsed->domainVariants.variantCount());
+  EXPECT_EQ(parsed->domainVariants.variantForChild("a"),
+            parsed->domainVariants.variantForChild("b"));
+  ASSERT_EQ(1u, parsed->domainVariants.sourceCount());
+  EXPECT_FALSE(parsed->domainVariants.sourceWeight(0)->needsScores());
+  EXPECT_FALSE(parsed->domainVariants.sourceWeight(0)->allowsPruning());
 }
 
 TEST_F(SearchEngineTest, topDocsFilters) {

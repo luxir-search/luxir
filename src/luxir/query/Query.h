@@ -981,6 +981,12 @@ public:
           ? filterUses->get(*identity.key, identity.scope, lane) : nullptr;
     }
 
+    FilterKey structuralFilterKey(const Query& query) const {
+      FilterKeyBuilder builder;
+      FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
+      return std::move(builder).finishStructural(scope, filterKeyContext);
+    }
+
     // Shape-specific consumers can require a cache lifetime without letting a
     // rejected scope create admission traffic. The key is structural work only;
     // the registry is touched after the scope predicate accepts it.

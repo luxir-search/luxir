@@ -80,6 +80,7 @@ message SearchOp {
     ExprOp expr_op = 15;
     // future: something like terms component... stream out all terms of one or more (or all) fields
   }
+  Domain domain = 20;
 }
 
 // An expression aggregate over the operation's incoming document domain.

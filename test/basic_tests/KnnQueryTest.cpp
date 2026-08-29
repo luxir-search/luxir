@@ -505,6 +505,33 @@ TEST_F(KnnQueryTest, routedFilterRejectsDomainSensitivePreparation) {
       << request->errorMsg();
 }
 
+TEST_F(KnnQueryTest, resetDomainRejectsDomainSensitivePreparation) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  h.index(flatdoc("id", "a", "color_s", "red", "embedding_v",
+                  std::vector<float>{1, 0, 0}));
+  h.index(flatdoc("id", "b", "color_s", "blue", "embedding_v",
+                  std::vector<float>{0, 1, 0}));
+  h.commit({"*"});
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& top = request->collection("main").topDocs("q").allQuery().limit(0);
+  auto& facet = top.facet("colors", "color_s").limit(-1);
+  auto& domain = facet.rawOp().domain.emplace();
+  auto* query = (api::Query*) facet.mr().allocate(
+      sizeof(api::Query), alignof(api::Query));
+  new (query) api::Query(
+      qb::knn(facet.mr(), "embedding_v", {1, 0, 0}, 2));
+  domain.query = query;
+  ExpectLog quiet("Search request failed:");
+  request->execute();
+  EXPECT_NE(request->errorMsg().find(
+                "per-variant preparation for this domain query shape is not "
+                "implemented yet"),
+            std::string::npos)
+      << request->errorMsg();
+}
+
 TEST_F(KnnQueryTest, routedPreparedFilterUsesParentBaseDomain) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2);

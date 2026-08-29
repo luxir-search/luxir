@@ -69,6 +69,15 @@ struct SearchParserImpl {
     bool affine = false;
   };
 
+  struct ParsedDomain {
+    Query* query = nullptr;
+    bool applyParentFilters = false;
+    std::vector<Query*> filters;
+  };
+
+  using ParsedDomains =
+      std::unordered_map<std::string_view, ParsedDomain>;
+
   // The request's named-op maps (SearchRequest.ops, TopDocs.ops, FieldFacet.ops,
   // RangeFacet.ops) all share this non-owning type: a span of (name, SearchOp
   // view) pairs over the request bytes (luxir::api::map_view<sv, indirect_view<SearchOp>>).
@@ -268,6 +277,32 @@ public:
   RootOp* parse() {
     RootOp& rootOp = *luxir::arenaCreate<RootOp>(req.arena, req);
     rootOp.parent = nullptr;
+
+    ParseContext parseContext{
+      req.requestPool, *req.schema, req.arena,
+      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+      "root", &req.warnings};
+    ProtobufQueryParser parser(parseContext);
+    ParsedDomains domains = parseChildDomains(req.proto.ops, parser);
+    if (!domains.empty()) {
+      rootOp.planning = luxir::arenaCreate<Query::PlanningContext>(
+          req.arena, req.requestPool, *req.reader,
+          Query::PlanningContext::Limits{}, &req.warnings,
+          FilterKeyContext{.schemaGen = req.schema->gen_,
+                           .timeZone = req.proto.time_zone},
+          req.filterUses);
+      validateDomainQueries(domains, *rootOp.planning);
+      rootOp.domainVariants.begin(0);
+      addDomainVariants(
+          req.proto.ops, {}, domains, rootOp.planning,
+          rootOp.domainVariants);
+      if (!rootOp.domainVariants.empty()) {
+        rootOp.weightContext = Query::Context::create(
+            &req.arena, *rootOp.planning);
+        rootOp.domainVariants.buildWeights(
+            *rootOp.weightContext, *rootOp.planning, 0);
+      }
+    }
     addSubs(rootOp, req.proto.ops, 0, OpsPlacement::REQUEST_ROOT);
     return &rootOp;
   }
@@ -311,6 +346,16 @@ public:
 
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
+    if (searchOp.domain.has_value()
+        && placement != OpsPlacement::REQUEST_ROOT
+        && placement != OpsPlacement::TOP_DOCS) {
+      std::string location = placement == OpsPlacement::FUSION
+          ? "Fusion.ops" : "a facet bucket";
+      throw std::runtime_error(
+          "op '" + std::string(name) + "' under " + location
+          + ": domain is only supported for ops dispatched by the request "
+            "root or TopDocs");
+    }
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
     return std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
@@ -797,6 +842,104 @@ public:
     return weights;
   }
 
+  ParsedDomains parseChildDomains(
+      OpsMap ops, ProtobufQueryParser& parser) {
+    ParsedDomains out;
+    for (const auto& [key, childView] : lastWins(ops)) {
+      const api::SearchOp& child = **childView;
+      if (!child.domain.has_value()) continue;
+      const api::Domain& domain = *child.domain;
+      std::string path = "op '" + std::string(key) + "'.domain";
+      if (domain.apply_parent_filters.has_value()
+          && !domain.query.has_value()) {
+        throw std::runtime_error(
+            path + ".apply_parent_filters requires domain.query");
+      }
+
+      ParsedDomain parsed;
+      parsed.applyParentFilters =
+          domain.apply_parent_filters.value_or(false);
+      if (domain.query.has_value()) {
+        if (std::holds_alternative<std::monostate>(domain.query->kind)) {
+          throw std::runtime_error(path + ".query requires a query kind");
+        }
+        parsed.query = parser.parse(*domain.query);
+      }
+      parsed.filters.reserve(domain.filter.size());
+      for (size_t i = 0; i < domain.filter.size(); i++) {
+        if (std::holds_alternative<std::monostate>(
+                domain.filter[i].kind)) {
+          throw std::runtime_error(
+              path + ".filter[" + std::to_string(i)
+              + "] requires a query kind");
+        }
+        parsed.filters.push_back(parser.parse(domain.filter[i]));
+      }
+      if (parsed.query == nullptr && parsed.filters.empty()) continue;
+      out.emplace(key, std::move(parsed));
+    }
+    return out;
+  }
+
+  void validateDomainQueries(
+      const ParsedDomains& domains, Query::PlanningContext& planning) {
+    for (const auto& [key, domain] : domains) {
+      unused(key);
+      if (domain.query != nullptr) {
+        domain.query->validateLogical(planning);
+      }
+      for (auto* filter : domain.filters) {
+        filter->validateLogical(planning);
+      }
+    }
+  }
+
+  void addDomainVariants(
+      OpsMap ops, std::span<ParsedFilter> filters,
+      const ParsedDomains& domains, Query::PlanningContext* planning,
+      DomainVariantPlan& plan) {
+    for (const auto& [key, childView] : lastWins(ops)) {
+      unused(childView);
+      auto found = domains.find(key);
+      const ParsedDomain* domain =
+          found == domains.end() ? nullptr : &found->second;
+      std::optional<DomainVariantPlan::QuerySpec> reset;
+      std::vector<DomainVariantPlan::QuerySpec> extras;
+      if (domain != nullptr) {
+        assert(planning != nullptr);
+        if (domain->query != nullptr) {
+          reset.emplace(DomainVariantPlan::QuerySpec{
+              domain->query,
+              planning->structuralFilterKey(*domain->query)});
+        }
+        extras.reserve(domain->filters.size());
+        for (auto* filter : domain->filters) {
+          extras.push_back({
+              filter, planning->structuralFilterKey(*filter)});
+        }
+      }
+      bool created = plan.addChild(
+          key,
+          [&](size_t filter) {
+            return std::ranges::find(filters[filter].exceptOps, key)
+                != filters[filter].exceptOps.end();
+          },
+          reset ? &*reset : nullptr,
+          domain != nullptr && domain->applyParentFilters,
+          extras);
+      if (!created) continue;
+      if (nonDefaultDomainVariants
+          >= DomainVariantPlan::MAX_NON_DEFAULT_VARIANTS) {
+        throw std::runtime_error(
+            "op '" + std::string(key)
+            + (domain != nullptr
+                    ? "': domain variant cap 64 exceeded"
+                    : "': routed filter variant cap 64 exceeded"));
+      }
+      nonDefaultDomainVariants++;
+    }
+  }
+
   Query* combineSelectionPredicates(std::span<Query*> predicates,
                                     api::SelectionMode mode) {
     assert(!predicates.empty());
@@ -954,31 +1097,19 @@ public:
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(topDocsReq, placement, parseContext));
+    ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
 
     DomainVariantPlan domainVariants;
-    bool routedFilters = std::any_of(
+    bool routedFilterSyntax = std::any_of(
         filters.begin(), filters.end(), [](const ParsedFilter& filter) {
           return !filter.exceptOps.empty();
         });
-    if (routedFilters) {
+    bool routedFilters = routedFilterSyntax || !parsedDomains.empty();
+    if (routedFilterSyntax && parsedDomains.empty()) {
       domainVariants.begin(filters.size());
-      for (auto& [key, searchOp] : lastWins(topDocsReq.ops)) {
-        unused(searchOp);
-        size_t before = domainVariants.nonDefaultVariantCount();
-        domainVariants.addChild(key, [&](size_t filter) {
-          return std::ranges::find(filters[filter].exceptOps, key)
-              != filters[filter].exceptOps.end();
-        });
-        if (domainVariants.nonDefaultVariantCount() != before) {
-          if (nonDefaultDomainVariants
-              >= DomainVariantPlan::MAX_NON_DEFAULT_VARIANTS) {
-            throw std::runtime_error(
-                "op '" + std::string(key)
-                + "': routed filter variant cap 64 exceeded");
-          }
-          nonDefaultDomainVariants++;
-        }
-      }
+      addDomainVariants(
+          topDocsReq.ops, filters, parsedDomains, nullptr,
+          domainVariants);
     }
 
     // By default TopDocs filters are ordinary Boolean filter clauses, so one
@@ -1036,6 +1167,14 @@ public:
       for (const auto& filter : filters) {
         filter.query->validateLogical(*planningContext);
       }
+    }
+    validateDomainQueries(parsedDomains, *planningContext);
+    if (!parsedDomains.empty()) {
+      domainVariants.begin(filters.size());
+      addDomainVariants(
+          topDocsReq.ops, filters, parsedDomains, planningContext,
+          domainVariants);
+      routedFilters = !domainVariants.empty();
     }
 
     // Flags for this request's main query. Filters inherit these after
@@ -1242,6 +1381,10 @@ public:
     auto filterWeights = foldFilters || cacheFirstExactDomain || filters.empty()
       ? std::span<Query::Weight*>{}
       : buildFilterWeights(filters, *qcontext, requestFlags);
+    if (domainVariants.sourceCount() > 0) {
+      domainVariants.buildWeights(
+          *qcontext, *planningContext, requestFlags);
+    }
     Query::Weight* domainQueryWeight = nullptr;
     std::span<Query::Weight*> domainFilterWeights;
     if (!routedFilters && !cacheFirstExactDomain && requirements.needExactDomain
@@ -1457,6 +1600,12 @@ public:
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto) {
     for (const auto& [childName, childView] : lastWins(fusionProto.ops)) {
       const api::SearchOp& child = **childView;
+      if (child.domain.has_value()) {
+        throw std::runtime_error(
+            "op '" + std::string(childName)
+            + "' under Fusion.ops: domain is only supported for ops "
+              "dispatched by the request root or TopDocs");
+      }
       if (const auto* facet = std::get_if<api::FieldFacet>(&child.kind)) {
         validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
       } else if (const auto* facet =
