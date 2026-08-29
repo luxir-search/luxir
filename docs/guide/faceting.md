@@ -331,3 +331,73 @@ change removes a whole nominal bucket, Luxir removes the zero-width bucket and
 returns a `calendar_bucket_skipped` warning rather than silently changing the
 calendar. See [Dates and Time Zones](dates.md) for the date-math and civil-time
 contract.
+
+## Query facets
+
+A `query_facet` names an ordered set of arbitrary query buckets. In JSON,
+`buckets` is an object: each object key is the bucket name and each value is a
+query. A bare string uses the `expr` query syntax; structured queries use their
+ordinary object form.
+
+```json
+"price_tiers": {
+  "query_facet": {
+    "buckets": {
+      "budget": "price_i:[* TO 100]",
+      "mid": {"range":{"field":"price_i","gte":100,"lt":1000}},
+      "nearby": {"match":{"field":"region_s","val":"local"}}
+    },
+    "ops": {
+      "average_price": "avg(price_i)"
+    }
+  }
+}
+```
+
+The response keeps request order and retains every requested bucket, including
+zero counts:
+
+```json
+{
+  "buckets": [
+    {"val":"budget","count":12,"average_price":72.5},
+    {"val":"mid","count":31,"average_price":340.0},
+    {"val":"nearby","count":0,"average_price":null}
+  ]
+}
+```
+
+Query buckets count documents, not value occurrences. A document contributes
+at most once to a query bucket even when several field values make its query
+match. Field and range facets instead count matching field values, so one
+multi-valued document can contribute to several value-derived counts.
+
+Any query kind can define a bucket, including boolean, range, expression, and
+kNN queries. A kNN bucket prepares against the facet's complete incoming
+domain, so its `k` nearest documents are chosen from the same filtered domain
+the facet sees. Query facets have no bucket-count limit; request size is the
+natural bound.
+
+The `ops` map runs independently over each bucket's document domain. It accepts
+the same expression metrics and nested facets as other fixed-bucket facets.
+
+For multi-select navigation, put a nonempty `selected` on a query facet
+directly under `top_docs.ops`. Values are bucket names:
+
+```json
+"price_tiers": {
+  "query_facet": {
+    "buckets": {
+      "budget": "price_i:[* TO 100]",
+      "mid": "price_i:[100 TO 1000]"
+    },
+    "selected": ["budget","mid"],
+    "selection_mode": "any"
+  }
+}
+```
+
+The default `any` mode refines the result list to the union while computing
+this facet sideways, without its own derived filter. Sibling operations see
+the filter. `selection_mode: "all"` requires every selected bucket and uses
+the resulting strict incoming domain for this facet as well.

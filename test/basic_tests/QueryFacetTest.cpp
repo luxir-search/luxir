@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <memory>
@@ -101,6 +102,73 @@ api::FieldFacet& addFieldFacetOp(api::QueryFacet& facet,
   child.field = build::arenaStr(mr, field);
   child.limit = -1;
   return child;
+}
+
+struct VectorFacetDoc {
+  float x;
+  int64_t price;
+  bool keep;
+  bool hasVector;
+  std::string_view brand;
+};
+
+constexpr std::array VECTOR_FACET_DOCS{
+  VectorFacetDoc{0.0f, 0, true, true, "red"},
+  VectorFacetDoc{1.0f, 10, true, true, "blue"},
+  VectorFacetDoc{2.0f, 20, false, true, "red"},
+  VectorFacetDoc{3.0f, 30, true, true, "blue"},
+  VectorFacetDoc{0.0f, 40, true, false, "red"},
+  VectorFacetDoc{4.0f, 50, false, true, "blue"},
+};
+
+void installVectorFacetSchema(Collection& collection) {
+  SchemaBuilder schema;
+  auto& vectors = schema.templ("_v");
+  vectors.type = api::FieldDef::FieldClass::VECTOR;
+  vectors.column = true;
+  vectors.metric = api::VectorMetric::L2;
+  vectors.dims = 2;
+  schema.set(collection);
+}
+
+void indexVectorFacetCorpus(CollectionHelper& helper) {
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "scope_s", "keep", "brand_s", "red",
+            "price_i", 0, "embedding_v", std::vector<float>{0, 0}),
+    flatdoc("id", "b", "scope_s", "keep", "brand_s", "blue",
+            "price_i", 10, "embedding_v", std::vector<float>{1, 0}),
+    flatdoc("id", "c", "scope_s", "drop", "brand_s", "red",
+            "price_i", 20, "embedding_v", std::vector<float>{2, 0}),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+    flatdoc("id", "d", "scope_s", "keep", "brand_s", "blue",
+            "price_i", 30, "embedding_v", std::vector<float>{3, 0}),
+    flatdoc("id", "e", "scope_s", "keep", "brand_s", "red",
+            "price_i", 40),
+    flatdoc("id", "f", "scope_s", "drop", "brand_s", "blue",
+            "price_i", 50, "embedding_v", std::vector<float>{4, 0}),
+  }, UpdateMessage::COMMIT);
+}
+
+std::vector<const VectorFacetDoc*> bruteKnn(
+    float queryX, size_t k, bool keepOnly) {
+  std::vector<std::pair<float, const VectorFacetDoc*>> candidates;
+  for (const VectorFacetDoc& doc : VECTOR_FACET_DOCS) {
+    if (!doc.hasVector || (keepOnly && !doc.keep)) continue;
+    float delta = doc.x - queryX;
+    candidates.push_back({delta * delta, &doc});
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& left, const auto& right) {
+              return left.first < right.first;
+            });
+  std::vector<const VectorFacetDoc*> result;
+  size_t count = std::min(k, candidates.size());
+  result.reserve(count);
+  for (size_t i = 0; i < count; i++) {
+    result.push_back(candidates[i].second);
+  }
+  return result;
 }
 
 TEST(QueryFacetJson, ObjectFormPreservesOrderAndQuerySugar) {
@@ -662,26 +730,118 @@ TEST_F(QueryFacetParserTest, RandomTermAndRangeBucketsMatchDocumentOracle) {
   }
 }
 
-TEST_F(QueryFacetParserTest, PreparedBucketQueriesAreRejectedClearly) {
+TEST_F(QueryFacetParserTest, PreparedAndStreamingBucketsMatchOracle) {
   CollectionHelper helper;
-  SchemaBuilder schema;
-  auto& vectors = schema.templ("_v");
-  vectors.type = api::FieldDef::FieldClass::VECTOR;
-  vectors.column = true;
-  vectors.metric = api::VectorMetric::IP;
-  schema.set(helper.collection());
-  helper.index(flatdoc("id", "1", "embedding_v",
-                       std::vector<float>{1.0f, 0.0f}),
-               UpdateMessage::COMMIT);
+  installVectorFacetSchema(helper.collection());
+  indexVectorFacetCorpus(helper);
+
+  for (bool filtered : {false, true}) {
+    auto request = localReq(helper.getSearchEngine());
+    auto& top = request->topDocs("q").allQuery();
+    if (filtered) top.matchFilter("scope_s", "keep");
+    auto& cursor = top.facet("mixed", "brand_s");
+    auto& facet = queryFacet(cursor);
+    auto* buckets = addBuckets(facet, cursor.mr(), 2);
+    setBucket(buckets[0], cursor.mr(), "near",
+              qb::knn(cursor.mr(), "embedding_v", {0, 0}, 4, 0, true));
+    setBucket(buckets[1], cursor.mr(), "red",
+              qb::match(cursor.mr(), "brand_s", "red"));
+    request->execute();
+
+    ASSERT_TRUE(request->ok()) << request->errorMsg();
+    int64_t red = 0;
+    for (const VectorFacetDoc& doc : VECTOR_FACET_DOCS) {
+      if ((!filtered || doc.keep) && doc.brand == "red") red++;
+    }
+    EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                  {"near", (int64_t)bruteKnn(0, 4, filtered).size()},
+                  {"red", red}}),
+              queryRows(*request->docList("q")->ops.at("mixed")->facetResult()))
+        << "filtered=" << filtered;
+  }
+}
+
+TEST_F(QueryFacetParserTest, PreparedBucketSubOpsStayAligned) {
+  CollectionHelper helper;
+  installVectorFacetSchema(helper.collection());
+  indexVectorFacetCorpus(helper);
 
   auto request = localReq(helper.getSearchEngine());
-  auto& cursor = request->topDocs("q").allQuery().facet("near", "brand_s");
+  auto& cursor = request->topDocs("q").allQuery().facet("mixed", "brand_s");
   auto& facet = queryFacet(cursor);
-  auto* buckets = addBuckets(facet, cursor.mr(), 1);
-  setBucket(buckets[0], cursor.mr(), "nearest",
-            qb::knn(cursor.mr(), "embedding_v", {1.0f, 0.0f}, 1));
-  expectError(*request,
-              "query_facet buckets with prepared queries not implemented yet");
+  auto* buckets = addBuckets(facet, cursor.mr(), 2);
+  setBucket(buckets[0], cursor.mr(), "near",
+            qb::knn(cursor.mr(), "embedding_v", {0, 0}, 2, 0, true));
+  setBucket(buckets[1], cursor.mr(), "red",
+            qb::match(cursor.mr(), "brand_s", "red"));
+  addExprOp(facet, cursor.mr(), "avg_price", "avg(price_i)");
+  request->execute();
+
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  const auto& result = *request->docList("q")->ops.at("mixed")->facetResult();
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"near", 2}, {"red", 3}}), queryRows(result));
+  const auto& avgs = std::get<api::ArrVal>(
+      result.ops.at("avg_price")->kind).v;
+  ASSERT_EQ(2u, avgs.size());
+  auto nearest = bruteKnn(0, 2, false);
+  double expectedNear = (double)(nearest[0]->price + nearest[1]->price) / 2;
+  EXPECT_DOUBLE_EQ(expectedNear, avgs[0].asDouble());
+  EXPECT_DOUBLE_EQ(20.0, avgs[1].asDouble());
+}
+
+TEST_F(QueryFacetParserTest, PreparedBucketKeepsEmptySlotsAligned) {
+  CollectionHelper helper;
+  installVectorFacetSchema(helper.collection());
+
+  auto request = localReq(helper.getSearchEngine());
+  auto& cursor = request->facet("mixed", "brand_s");
+  auto& facet = queryFacet(cursor);
+  auto* buckets = addBuckets(facet, cursor.mr(), 2);
+  setBucket(buckets[0], cursor.mr(), "near",
+            qb::knn(cursor.mr(), "embedding_v", {0, 0}, 2, 0, true));
+  setBucket(buckets[1], cursor.mr(), "all", qb::all());
+  addExprOp(facet, cursor.mr(), "avg_price", "avg(price_i)");
+  request->execute();
+
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  const auto& result =
+      *request->responses[0]->proto.ops.at("mixed")->facetResult();
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"near", 0}, {"all", 0}}), queryRows(result));
+  const auto& avgs = std::get<api::ArrVal>(
+      result.ops.at("avg_price")->kind).v;
+  ASSERT_EQ(2u, avgs.size());
+  EXPECT_TRUE(avgs[0].isNull());
+  EXPECT_TRUE(avgs[1].isNull());
+}
+
+TEST_F(QueryFacetParserTest, SelectedPreparedAndStreamingBucketsWork) {
+  CollectionHelper helper;
+  installVectorFacetSchema(helper.collection());
+  indexVectorFacetCorpus(helper);
+
+  for (bool selectPrepared : {false, true}) {
+    auto request = localReq(helper.getSearchEngine());
+    auto& top = request->topDocs("q").allQuery().getNumber().limit(0);
+    auto& cursor = top.facet("mixed", "brand_s");
+    auto& facet = queryFacet(cursor);
+    auto* buckets = addBuckets(facet, cursor.mr(), 2);
+    setBucket(buckets[0], cursor.mr(), "near",
+              qb::knn(cursor.mr(), "embedding_v", {0, 0}, 2, 0, true));
+    setBucket(buckets[1], cursor.mr(), "red",
+              qb::match(cursor.mr(), "brand_s", "red"));
+    setSelected(facet, cursor.mr(),
+                {selectPrepared ? "near" : "red"}, true);
+    request->execute();
+
+    ASSERT_TRUE(request->ok()) << request->errorMsg();
+    EXPECT_EQ(selectPrepared ? 2 : 3, request->getMatchCount("q"));
+    EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                  {"near", 2}, {"red", 3}}),
+              queryRows(*request->docList("q")->ops.at("mixed")->facetResult()))
+        << "selectPrepared=" << selectPrepared;
+  }
 }
 
 } // namespace

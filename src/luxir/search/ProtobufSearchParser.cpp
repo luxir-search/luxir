@@ -1107,11 +1107,6 @@ public:
         plan.bucketQueries.size());
     for (size_t i = 0; i < weights.size(); i++) {
       weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
-      if (weights[i]->needsPrepare()) {
-        throw std::runtime_error(
-            "facet '" + std::string(facetName)
-            + "': query_facet buckets with prepared queries not implemented yet");
-      }
     }
     return luxir::arenaCreate<QueryFacetReq>(
         req.arena, req, facetReq, facetName, plan.bucketQueries, weights);

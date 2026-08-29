@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <string_view>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -561,6 +562,8 @@ public:
   }
   virtual void bindingBlockStarted() const {}
 
+  virtual bool requiresWholeReaderDomain() const { return false; }
+
   virtual std::vector<size_t> emittedBuckets(
       const MergeableFixedBuckets& merged,
       std::span<const uint8_t> pinned) const {
@@ -580,6 +583,7 @@ public:
 
   class Calc : public Calculator {
     SegmentMergeDriver<MergeableFixedBuckets> driver;
+    std::atomic<int32_t> gatheredDomainsSeen{0};
 
   protected:
     // Per-segment incoming domains stay retained through result-stage sub-op
@@ -595,6 +599,34 @@ public:
     virtual std::vector<DomainHandle> bucketDomains(
         size_t segnum,
         std::span<const SelectedFacetBucket<size_t>> buckets) = 0;
+    virtual void prepareGatheredDomains(oneapi::tbb::task_group* tg) {
+      unused(tg);
+    }
+
+    void collectInputSegment(int32_t segnum) {
+      DocSet* domain = input[(size_t)segnum].get();
+      driver.contribute([&](MergeableFixedBuckets& data) {
+        if (data.counts.empty()) {
+          data.counts.assign(fixedOp().bucketCount(), 0);
+        }
+        collectSegment(data, segnum, domain);
+      });
+    }
+
+    void prepareAndDispatch(oneapi::tbb::task_group* tg) {
+      prepareGatheredDomains(tg);
+      for (int32_t segnum = 0; segnum < (int32_t)input.size(); segnum++) {
+        task_group_run(tg, [this, segnum]() {
+          collectInputSegment(segnum);
+        });
+      }
+    }
+
+    void startGatheredDispatch(oneapi::tbb::task_group* tg) {
+      task_group_run(tg, [this, tg]() {
+        prepareAndDispatch(tg);
+      });
+    }
 
     void facetResult(MergeableFixedBuckets& merged) {
       auto& mr = op.req.lastResponse->mr;
@@ -734,20 +766,38 @@ public:
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domainHandle) final {
-      unused(tg);
       assert(domainHandle.isDeliverable());
       if (segnum == -1) {
         driver.completeEmpty();
         return;
       }
-      DocSet* domain = domainHandle.get();
       input[(size_t)segnum] = std::move(domainHandle);
-      driver.contribute([&](MergeableFixedBuckets& data) {
-        if (data.counts.empty()) {
-          data.counts.assign(fixedOp().bucketCount(), 0);
-        }
-        collectSegment(data, segnum, domain);
-      });
+      if (!fixedOp().requiresWholeReaderDomain()) {
+        collectInputSegment(segnum);
+        return;
+      }
+      int32_t seen = gatheredDomainsSeen.fetch_add(
+          1, std::memory_order_acq_rel) + 1;
+      assert(seen <= (int32_t)input.size());
+      if (seen == (int32_t)input.size()) startGatheredDispatch(tg);
+    }
+
+    void calcAll(oneapi::tbb::task_group* tg,
+                 std::span<const DomainHandle> domains) final {
+      if (!fixedOp().requiresWholeReaderDomain()) {
+        Calculator::calcAll(tg, domains);
+        return;
+      }
+      assert(domains.size() == input.size());
+      if (domains.empty()) {
+        driver.completeEmpty();
+        return;
+      }
+      std::copy(domains.begin(), domains.end(), input.begin());
+      for (const DomainHandle& domain : input) {
+        assert(domain.isDeliverable());
+      }
+      startGatheredDispatch(tg);
     }
   };
 };
@@ -966,6 +1016,7 @@ class QueryFacetReq : public FixedBucketFacetReq {
   const ReqQueryFacet& queryFacet;
   std::span<Query*> bucketQueries;
   std::span<Query::Weight*> bucketWeights;
+  bool preparedBuckets;
 
 public:
   QueryFacetReq(
@@ -975,9 +1026,14 @@ public:
     : FixedBucketFacetReq(
           req, {}, facetName, 0, false, {}, queryFacet.buckets.size(), {}),
       queryFacet(queryFacet), bucketQueries(bucketQueries),
-      bucketWeights(bucketWeights) {
+      bucketWeights(bucketWeights),
+      preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
     assert(bucketQueries.size() == queryFacet.buckets.size());
     assert(bucketWeights.size() == queryFacet.buckets.size());
+  }
+
+  bool requiresWholeReaderDomain() const override {
+    return preparedBuckets;
   }
 
   void emitBucketResult(
@@ -996,17 +1052,42 @@ public:
   }
 
   class Calc : public FixedBucketFacetReq::Calc {
+    std::vector<QueryPrep::PreparedSource> preparedSources;
+
     QueryFacetReq& queryOp() {
       return (QueryFacetReq&)getOp();
+    }
+
+    Query::SegmentSource& bucketSource(size_t bucket) {
+      return preparedSources.empty()
+          ? static_cast<Query::SegmentSource&>(
+                *queryOp().bucketWeights[bucket])
+          : preparedSources[bucket].segmentSource();
     }
 
     DomainHandle materializeBucket(size_t segnum, size_t bucket) {
       auto& segment = queryOp().reader.segments()[segnum];
       DocSet* domain = input[segnum].get();
       return DomainHandle(QueryPrep::materialize(
-          *queryOp().bucketWeights[bucket], nullptr, segment, domain,
+          bucketSource(bucket), segment, domain,
           Query::SupplierExecutionMode::ORDINARY,
           QueryPrep::MaterializeMode::ORDINARY));
+    }
+
+    void prepareGatheredDomains(oneapi::tbb::task_group* tg) override {
+      std::vector<DocSet*> domains;
+      domains.reserve(input.size());
+      for (const DomainHandle& domain : input) {
+        domains.push_back(domain.get());
+      }
+      Query::Weight::PrepareContext context{
+        *queryOp().req.reader,
+        std::span<DocSet* const>(domains.data(), domains.size()),
+        tg != nullptr
+      };
+      preparedSources = QueryPrep::prepareSources(
+          queryOp().bucketWeights, context);
+      assert(preparedSources.size() == queryOp().bucketCount());
     }
 
     void collectSegment(
@@ -1015,7 +1096,7 @@ public:
       auto& segment = queryOp().reader.segments()[(size_t)segnum];
       bool countOnly = domain == nullptr && queryOp().subOps.empty();
       for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
-        if (countOnly) {
+        if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
           int64_t count = queryOp().bucketWeights[bucket]->count(segment);
           if (count >= 0) {
             data.counts[bucket] += count;
