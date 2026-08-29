@@ -12,6 +12,7 @@
 
 #include "luxir/api/build.h"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/reader/SkipStats.h"
 #include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -388,6 +389,33 @@ TEST_F(QueryFacetParserTest, ValidationPrecedesExecution) {
                   {"cheap", 1}, {"mid", 1}}),
               queryRows(*request->docList("q")->ops.at("prices")->facetResult()));
   }
+}
+
+TEST_F(QueryFacetParserTest, UnusedSelectionRefinerIsNotPlanned) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "stock_s", "yes"),
+    flatdoc("id", "2", "brand_s", "beta", "stock_s", "yes"),
+    flatdoc("id", "3", "brand_s", "acme", "stock_s", "no"),
+  }, UpdateMessage::COMMIT);
+
+  SkipStatsScope stats;
+  auto request = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"json({"ops":{"q":{"top_docs":{
+    "limit":0,
+    "filter":[{"match":{"field":"stock_s","val":"yes"}}],
+    "ops":{"brands":{"query_facet":{
+      "buckets":{"acme":{"match":{"field":"brand_s","val":"acme"}},
+                 "beta":{"match":{"field":"brand_s","val":"beta"}}},
+      "selected":"acme"}}}}}}})json",
+      request->rawRequest(), request->mr);
+  request->collection("main");
+  request->execute(false);
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  EXPECT_EQ(1, SkipStats::selectionRefinersElided);
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"acme", 1}, {"beta", 1}}),
+            queryRows(*request->docList("q")->ops.at("brands")->facetResult()));
 }
 
 TEST_F(QueryFacetParserTest, OrderedOverlappingBucketsRespectIncomingDomain) {

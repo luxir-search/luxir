@@ -43,6 +43,10 @@ struct FacetParsePlan {
   std::span<Query*> bucketQueries;
   std::span<const size_t> selectedBuckets;
   Query::PlanningContext* planning = nullptr;
+  // Whether the selection's derived filter was planned. Selected bucket
+  // queries are normally validated through that filter; when it is elided
+  // (no consumer), the facet-side sweep must validate them instead.
+  bool refinerPlanned = true;
 };
 
 struct SearchParserImpl {
@@ -1087,8 +1091,11 @@ public:
       }
       FacetParsePlan& plan = prepared->second;
       plan.planning = &planning;
-      std::unordered_set<size_t> selected(
-          plan.selectedBuckets.begin(), plan.selectedBuckets.end());
+      std::unordered_set<size_t> selected;
+      if (plan.refinerPlanned) {
+        selected.insert(plan.selectedBuckets.begin(),
+                        plan.selectedBuckets.end());
+      }
       for (size_t i = 0; i < plan.bucketQueries.size(); i++) {
         if (!selected.contains(i)) {
           plan.bucketQueries[i]->validateLogical(planning);
@@ -1116,10 +1123,18 @@ public:
       const luxir::api::TopDocs& topDocsReq,
       TopDocsPlacement topDocsPlacement,
       ParseContext& parseContext,
-      ProtobufQueryParser& parser) {
+      ProtobufQueryParser& parser,
+      bool refinedResultRequested) {
     auto children = lastWins(topDocsReq.ops);
     std::sort(children.begin(), children.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
+    auto selectionHasConsumer = [&](
+        std::span<const std::string_view> exceptOps) {
+      if (refinedResultRequested) return true;
+      return std::ranges::any_of(children, [&](const auto& child) {
+        return std::ranges::find(exceptOps, child.first) == exceptOps.end();
+      });
+    };
 
     std::vector<ParsedFilter> derived;
     for (const auto& [key, childView] : children) {
@@ -1154,6 +1169,17 @@ public:
                 .bucketQueries = {},
                 .selectedBuckets = {}});
 
+        std::span<const std::string_view> exceptOps;
+        if (fieldProto->selection_mode == api::SelectionMode::ANY) {
+          auto except = req.requestPool.make_span<std::string_view>(1);
+          except[0] = key;
+          exceptOps = except;
+        }
+        if (!selectionHasConsumer(exceptOps)) {
+          skipCount(SkipStats::selectionRefinersElided);
+          continue;
+        }
+
         Query* predicate;
         if (fieldProto->selection_mode == api::SelectionMode::ANY) {
           predicate = builder.createAnyOfQuery(canonical);
@@ -1165,12 +1191,6 @@ public:
           }
           predicate = combineSelectionPredicates(
               clauses, api::SelectionMode::ALL);
-        }
-        std::span<const std::string_view> exceptOps;
-        if (fieldProto->selection_mode == api::SelectionMode::ANY) {
-          auto except = req.requestPool.make_span<std::string_view>(1);
-          except[0] = key;
-          exceptOps = except;
         }
         derived.push_back({predicate, exceptOps});
         continue;
@@ -1195,6 +1215,17 @@ public:
         auto& range = static_cast<IntFacetRangeReq&>(*facet);
         auto indexes = range.selectedBucketIndexes();
         auto fences = range.bucketFences();
+        std::span<const std::string_view> exceptOps;
+        if (rangeProto->selection_mode == api::SelectionMode::ANY) {
+          auto except = req.requestPool.make_span<std::string_view>(1);
+          except[0] = key;
+          exceptOps = except;
+        }
+        if (!selectionHasConsumer(exceptOps)) {
+          skipCount(SkipStats::selectionRefinersElided);
+          continue;
+        }
+
         auto clauses = req.requestPool.make_span<Query*>(indexes.size());
         for (size_t i = 0; i < indexes.size(); i++) {
           size_t bucket = indexes[i];
@@ -1203,12 +1234,6 @@ public:
         }
         Query* predicate = combineSelectionPredicates(
             clauses, rangeProto->selection_mode);
-        std::span<const std::string_view> exceptOps;
-        if (rangeProto->selection_mode == api::SelectionMode::ANY) {
-          auto except = req.requestPool.make_span<std::string_view>(1);
-          except[0] = key;
-          exceptOps = except;
-        }
         derived.push_back({predicate, exceptOps});
         continue;
       }
@@ -1217,8 +1242,18 @@ public:
           key, *queryProto, placement, parser);
       auto [prepared, inserted] = preparedFacets.emplace(&child, plan);
       assert(inserted);
-      unused(prepared);
       if (plan.selectedBuckets.empty()) continue;
+      std::span<const std::string_view> exceptOps;
+      if (queryProto->selection_mode == api::SelectionMode::ANY) {
+        auto except = req.requestPool.make_span<std::string_view>(1);
+        except[0] = key;
+        exceptOps = except;
+      }
+      if (!selectionHasConsumer(exceptOps)) {
+        prepared->second.refinerPlanned = false;
+        skipCount(SkipStats::selectionRefinersElided);
+        continue;
+      }
       auto clauses = req.requestPool.make_span<Query*>(
           plan.selectedBuckets.size());
       for (size_t i = 0; i < clauses.size(); i++) {
@@ -1226,12 +1261,6 @@ public:
       }
       Query* predicate = combineSelectionPredicates(
           clauses, queryProto->selection_mode);
-      std::span<const std::string_view> exceptOps;
-      if (queryProto->selection_mode == api::SelectionMode::ANY) {
-        auto except = req.requestPool.make_span<std::string_view>(1);
-        except[0] = key;
-        exceptOps = except;
-      }
       derived.push_back({predicate, exceptOps});
     }
     return derived;
@@ -1302,7 +1331,8 @@ public:
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(
-            topDocsReq, placement, parseContext, parser));
+            topDocsReq, placement, parseContext, parser,
+            specifiedLimit != 0 || topDocsReq.get_number));
     ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
 
     DomainVariantPlan domainVariants;

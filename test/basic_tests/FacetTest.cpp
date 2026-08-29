@@ -4622,6 +4622,32 @@ TEST_F(FacetTest, selectedFacetsRefineSidewaysWithUnionBuckets) {
   expectRangeResult(prices, bounds, counts, -1);
 }
 
+TEST_F(FacetTest, unusedAnySelectionRefinerIsNotPlanned) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "stock_s", "yes"),
+    flatdoc("id", "2", "brand_s", "beta", "stock_s", "yes"),
+    flatdoc("id", "3", "brand_s", "acme", "stock_s", "no"),
+  }, UpdateMessage::COMMIT);
+
+  SkipStatsScope stats;
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"json({"ops":{"q":{"top_docs":{
+    "limit":0,
+    "filter":[{"match":{"field":"stock_s","val":"yes"}}],
+    "ops":{"brands":{"field_facet":{"field":"brand_s","limit":-1,
+      "selected":["acme"]}}}}}}})json",
+      req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, SkipStats::selectionRefinersElided);
+  EXPECT_TRUE(req->getDocs().empty());
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"acme", 1}, {"beta", 1}}),
+            stringFacetRows(topFacetResult(*req, "q", "brands")));
+}
+
 TEST_F(FacetTest, selectedFieldPinsAppendAfterNaturalPage) {
   SearchOverridesGuard strategyGuard(forcedStrFacetStrategy);
   forcedStrFacetStrategy = StrFacetStrategy::TOP_TERMS;
