@@ -46,12 +46,18 @@ class CanonicalValueSet {
   using Numerics = std::span<const int64_t>;
   std::string_view field;
   std::variant<std::monostate, Terms, Numerics> values;
+  std::variant<std::monostate, Terms, Numerics> inputOrder;
 
   explicit CanonicalValueSet(std::string_view field) : field(field) {}
   CanonicalValueSet(std::string_view field, Terms terms)
       : field(field), values(terms) {}
   CanonicalValueSet(std::string_view field, Numerics numerics)
       : field(field), values(numerics) {}
+  CanonicalValueSet(std::string_view field, Terms terms, Terms inputOrder)
+      : field(field), values(terms), inputOrder(inputOrder) {}
+  CanonicalValueSet(std::string_view field, Numerics numerics,
+                    Numerics inputOrder)
+      : field(field), values(numerics), inputOrder(inputOrder) {}
 
 public:
   CanonicalValueSet() = default;
@@ -77,6 +83,14 @@ public:
 
   Terms terms() const { return std::get<Terms>(values); }
   Numerics numerics() const { return std::get<Numerics>(values); }
+  Terms termsInInputOrder() const {
+    if (auto* ordered = std::get_if<Terms>(&inputOrder)) return *ordered;
+    return terms();
+  }
+  Numerics numericsInInputOrder() const {
+    if (auto* ordered = std::get_if<Numerics>(&inputOrder)) return *ordered;
+    return numerics();
+  }
 
   CanonicalValueSet element(size_t index) const {
     if (termBacked()) {
@@ -366,7 +380,8 @@ public:
   }
 
   CanonicalValueSet canonicalizeFieldValues(
-      std::string_view field, ValueSequence values) {
+      std::string_view field, ValueSequence values,
+      bool preserveInputOrder = false) {
     if (values.size() > ValueSequence::MAX_VALUES) {
       throw std::runtime_error(std::format(
           "AnyOfQuery values exceeds the {} value limit",
@@ -385,9 +400,23 @@ public:
           encoded.push_back(coerceAnyOfNumeric(fieldType, field, value));
         }
       });
+      std::vector<int64_t> inputOrder;
+      if (preserveInputOrder) {
+        for (int64_t value : encoded) {
+          if (!std::ranges::contains(inputOrder, value)) {
+            inputOrder.push_back(value);
+          }
+        }
+      }
       std::sort(encoded.begin(), encoded.end());
       encoded.erase(std::unique(encoded.begin(), encoded.end()), encoded.end());
       auto stored = pool.copy_span(std::span<int64_t>(encoded));
+      if (preserveInputOrder) {
+        auto ordered = pool.copy_span(std::span<int64_t>(inputOrder));
+        return CanonicalValueSet(
+            field, std::span<const int64_t>(stored),
+            std::span<const int64_t>(ordered));
+      }
       return CanonicalValueSet(
           field, std::span<const int64_t>(stored));
     }
@@ -419,9 +448,23 @@ public:
         terms.push_back(term);
       }
     });
+    std::vector<std::string_view> inputOrder;
+    if (preserveInputOrder) {
+      for (std::string_view term : terms) {
+        if (!std::ranges::contains(inputOrder, term)) {
+          inputOrder.push_back(term);
+        }
+      }
+    }
     std::sort(terms.begin(), terms.end());
     terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
     auto stored = pool.copy_span(std::span<std::string_view>(terms));
+    if (preserveInputOrder) {
+      auto ordered = pool.copy_span(std::span<std::string_view>(inputOrder));
+      return CanonicalValueSet(
+          field, std::span<const std::string_view>(stored),
+          std::span<const std::string_view>(ordered));
+    }
     return CanonicalValueSet(
         field, std::span<const std::string_view>(stored));
   }

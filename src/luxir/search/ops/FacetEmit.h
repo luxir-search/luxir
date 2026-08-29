@@ -48,11 +48,18 @@ class FieldBucketFinalizer {
   size_t retain;
   bool bounded;
 
+  void preservePin(Candidate candidate) {
+    auto pin = pinByKey.find(candidate.key);
+    if (pin == pinByKey.end()) return;
+    Final& selected = pins[pin->second];
+    selected.count = candidate.count;
+    selected.payload = std::move(candidate.payload);
+  }
+
 public:
-  // Field facets have two result partitions. Pins are extracted during
-  // enumeration, before the ordinary page is filtered and selected, so they
-  // neither consume its limit nor inherit its mincount. Finite pages retain a
-  // bounded heap; callers need not materialize every candidate.
+  // Pins compete in the ordinary page. A pin that mincount or the bounded heap
+  // rejects is preserved with its exact payload so finish() can append it.
+  // Callers need not materialize every candidate.
   FieldBucketFinalizer(std::span<const std::optional<Key>> requestedPins,
       int64_t minCount, int64_t offset, int64_t limit, Better better) :
       better(std::move(better)), minCount(minCount),
@@ -75,14 +82,10 @@ public:
   }
 
   void add(Candidate candidate) {
-    auto pin = pinByKey.find(candidate.key);
-    if (pin != pinByKey.end()) {
-      Final& selected = pins[pin->second];
-      selected.count = candidate.count;
-      selected.payload = std::move(candidate.payload);
+    if (minCount != -1 && candidate.count < minCount) {
+      preservePin(std::move(candidate));
       return;
     }
-    if (minCount != -1 && candidate.count < minCount) return;
     if (!bounded) {
       regular.push_back(std::move(candidate));
     } else if (regular.size() < retain) {
@@ -90,8 +93,11 @@ public:
       std::push_heap(regular.begin(), regular.end(), better);
     } else if (retain != 0 && better(candidate, regular.front())) {
       std::pop_heap(regular.begin(), regular.end(), better);
+      preservePin(std::move(regular.back()));
       regular.back() = std::move(candidate);
       std::push_heap(regular.begin(), regular.end(), better);
+    } else {
+      preservePin(std::move(candidate));
     }
   }
 
@@ -102,15 +108,30 @@ public:
   std::vector<Final> finish() {
     std::sort(regular.begin(), regular.end(), better);
     size_t begin = std::min(offset, regular.size());
-    std::vector<Final> out = std::move(pins);
-    out.reserve(out.size() + regular.size() - begin);
+    for (size_t i = 0; i < begin; i++) {
+      preservePin(std::move(regular[i]));
+    }
+
+    std::vector<uint8_t> coveredPins(pins.size());
+    std::vector<Final> out;
+    out.reserve(regular.size() - begin + pins.size());
     for (size_t i = begin; i < regular.size(); i++) {
       auto& bucket = regular[i];
+      size_t pinIndex = std::numeric_limits<size_t>::max();
+      auto pin = pinByKey.find(bucket.key);
+      if (pin != pinByKey.end()) {
+        pinIndex = pin->second;
+        coveredPins[pinIndex] = 1;
+      }
       out.push_back({
           .key = std::move(bucket.key),
           .count = bucket.count,
           .payload = std::move(bucket.payload),
+          .pinIndex = pinIndex,
       });
+    }
+    for (size_t i = 0; i < pins.size(); i++) {
+      if (coveredPins[i] == 0) out.push_back(std::move(pins[i]));
     }
     return out;
   }

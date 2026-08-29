@@ -484,17 +484,17 @@ public:
       QueryBuilder builder(req.requestPool, *req.schema,
                            selectionContext, facetName, &req.warnings);
       ownedSelected = builder.canonicalizeFieldValues(
-          facetField, selectedValues);
+          facetField, selectedValues, true);
       preparedSelected = &ownedSelected;
     }
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
       if (ftype->type() == FieldType::Type::DATE
           || ftype->type() == FieldType::Type::INT) {
-        selectedInts = preparedSelected->numerics();
+        selectedInts = preparedSelected->numericsInInputOrder();
       } else if (ftype->type() == FieldType::Type::ID
                  || ftype->type() == FieldType::Type::STRING
                  || ftype->type() == FieldType::Type::TEXT) {
-        selectedStrings = preparedSelected->terms();
+        selectedStrings = preparedSelected->termsInInputOrder();
       }
     }
 
@@ -985,7 +985,7 @@ public:
         QueryBuilder builder(req.requestPool, *req.schema,
                              parseContext.coerceContext, key, &req.warnings);
         CanonicalValueSet canonical = builder.canonicalizeFieldValues(
-            fieldProto->field, selected);
+            fieldProto->field, selected, true);
         FacetReq* facet = createFieldFacetReq(
             key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
         preparedFieldFacets.emplace(fieldProto, facet);

@@ -444,28 +444,23 @@ public:
 
     std::vector<std::optional<int64_t>> pins;
     pins.reserve(pinnedBuckets.size());
-    boost::unordered_flat_set<int64_t> pinnedOrds;
     for (const auto& pin : pinnedBuckets) {
       pins.push_back(pin.ord);
-      if (pin.ord.has_value()) pinnedOrds.insert(*pin.ord);
     }
 
     if (allowZeroPadding && minCount == 0) {
       boost::unordered_flat_set<int64_t> present;
       present.reserve(ordCounts.size());
-      size_t regular = 0;
       for (auto [ord, count] : ordCounts) {
         unused(count);
         present.insert(ord);
-        if (!pinnedOrds.contains(ord)) regular++;
       }
       int64_t numGlobalOrds = ordMap ? ordMap->numOrds() : 0;
       size_t target = limit < 0 ? (size_t)numGlobalOrds : (size_t)limit;
       for (int64_t ord = 0;
-           ord < numGlobalOrds && regular < target; ord++) {
-        if (present.contains(ord) || pinnedOrds.contains(ord)) continue;
+           ord < numGlobalOrds && candidates.size() < target; ord++) {
+        if (present.contains(ord)) continue;
         candidates.push_back({ord, 0, {}});
-        regular++;
       }
     }
 

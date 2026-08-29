@@ -72,6 +72,8 @@ The controls are:
 | `missing` | Return the count of documents with no accepted value. |
 | `sorts` | Sort a string/ID facet by one named metric sub-operation. |
 | `ops` | Per-bucket sub-facets or numeric metrics on string/ID facets. |
+| `selected` | Values that refine the result set and remain visible as buckets. |
+| `selection_mode` | Match any selected value (default) or require all of them. |
 
 String and ID facets default to count descending, then bucket value ascending
 as a deterministic tie break. Setting `mincount: 0` can include values that
@@ -84,6 +86,15 @@ category values occur?" Integer/date/text field facets currently support
 `limit`, positive `mincount`, and `missing`, but not sub-operations or custom
 sorts. Use a range facet when numeric values should be bucketed rather than
 enumerated.
+
+A nonempty `selected` is supported for facets directly under `top_docs.ops`.
+The selected values refine the document result; `selection_mode: "all"`
+requires every value instead of the default any-value match. The field facet's
+ordinary page is still finalized over all buckets. A selected value that lands
+in that page appears once at its natural sorted position. After the page,
+selected values not already emitted append in request order with exact counts.
+These appended buckets are exempt from `mincount`, may name values absent from
+the index, and carry the same sub-operation results as ordinary buckets.
 
 ## Expression metrics
 
@@ -268,6 +279,11 @@ stateful child bindings in bounded blocks rather than retaining every bucket's
 state at once. Range facets with sub-operations are limited to 1,024 buckets.
 Custom sorts are not yet supported for range facets; buckets remain in fence
 order.
+
+Range facet `selected` values are generated bucket lower fences. They refine
+the result in the same way and remain in fence order; selection only exempts a
+range bucket from `mincount` admission. This is the same union rule as field
+facets, whose natural order is their requested sort rather than fence order.
 
 The HTTP renderer currently emits `null` for float/double range bucket bounds
 even though counts and the typed gRPC bounds are correct; integer and date

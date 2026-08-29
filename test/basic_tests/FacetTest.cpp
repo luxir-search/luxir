@@ -4581,7 +4581,7 @@ TEST_F(RandomFacetTest, randomFaceting) {
   }
 }
 
-TEST_F(FacetTest, selectedFacetsRefineSidewaysAndPinBuckets) {
+TEST_F(FacetTest, selectedFacetsRefineSidewaysWithUnionBuckets) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "1", "brand_s", "acme", "price_i", 50),
@@ -4609,13 +4609,12 @@ TEST_F(FacetTest, selectedFacetsRefineSidewaysAndPinBuckets) {
 
   const auto& brands = topFacetResult(*req, "q", "brands");
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
-                {"acme", 1}, {"globex", 0}, {"initech", 1}}),
+                {"acme", 1}, {"globex", 0}}),
             stringFacetRows(brands));
   auto averages = metricValues(brands, "avg_price");
-  ASSERT_EQ(3u, averages.size());
+  ASSERT_EQ(2u, averages.size());
   EXPECT_DOUBLE_EQ(150.0, averages[0].asDouble());
   EXPECT_TRUE(averages[1].isNull());
-  EXPECT_DOUBLE_EQ(150.0, averages[2].asDouble());
 
   const auto& prices = topFacetResult(*req, "q", "prices");
   std::array<std::pair<int64_t, int64_t>, 2> bounds{{{0, 100}, {100, 200}}};
@@ -4623,7 +4622,7 @@ TEST_F(FacetTest, selectedFacetsRefineSidewaysAndPinBuckets) {
   expectRangeResult(prices, bounds, counts, -1);
 }
 
-TEST_F(FacetTest, selectedFieldPinsAreSeparateFromDiscoveryPage) {
+TEST_F(FacetTest, selectedFieldPinsAppendAfterNaturalPage) {
   SearchOverridesGuard strategyGuard(forcedStrFacetStrategy);
   forcedStrFacetStrategy = StrFacetStrategy::TOP_TERMS;
 
@@ -4648,8 +4647,38 @@ TEST_F(FacetTest, selectedFieldPinsAreSeparateFromDiscoveryPage) {
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(1, req->getMatchCount());
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
-                {"absent", 0}, {"rare", 1}, {"common", 3}}),
+                {"common", 3}, {"absent", 0}, {"rare", 1}}),
             stringFacetRows(topFacetResult(*req, "q", "brands")));
+}
+
+TEST_F(FacetTest, selectedFieldPinsMergeWithOffsetPages) {
+  auto finalize = [](int64_t offset, int64_t limit,
+                     std::string_view selected) {
+    std::vector<FacetCandidate<std::string>> candidates{
+        {"alpha", 4, {}}, {"beta", 3, {}},
+        {"gamma", 2, {}}, {"delta", 1, {}}};
+    std::array<std::optional<std::string>, 1> pins{
+        std::string(selected)};
+    auto finalized = finalizeCountFieldBuckets(
+        std::move(candidates),
+        std::span<const std::optional<std::string>>(pins),
+        1, offset, limit);
+    std::vector<std::pair<std::string, int64_t>> rows;
+    for (auto& bucket : finalized) {
+      rows.emplace_back(std::move(*bucket.key), bucket.count);
+    }
+    return rows;
+  };
+
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"alpha", 4}, {"beta", 3}}),
+            finalize(0, 2, "beta"));
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"beta", 3}, {"gamma", 2}}),
+            finalize(1, 2, "gamma"));
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"gamma", 2}, {"alpha", 4}}),
+            finalize(2, 1, "alpha"));
 }
 
 TEST_F(FacetTest, selectedPinsUseInlineSubOpFinalization) {
@@ -4672,13 +4701,13 @@ TEST_F(FacetTest, selectedPinsUseInlineSubOpFinalization) {
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   const auto& result = topFacetResult(*req, "q", "brands");
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
-                {"absent", 0}, {"acme", 2}, {"beta", 1}}),
+                {"beta", 1}, {"absent", 0}, {"acme", 2}}),
             stringFacetRows(result));
   auto averages = metricValues(result, "avg_price");
   ASSERT_EQ(3u, averages.size());
-  EXPECT_TRUE(averages[0].isNull());
-  EXPECT_DOUBLE_EQ(15.0, averages[1].asDouble());
-  EXPECT_DOUBLE_EQ(30.0, averages[2].asDouble());
+  EXPECT_DOUBLE_EQ(30.0, averages[0].asDouble());
+  EXPECT_TRUE(averages[1].isNull());
+  EXPECT_DOUBLE_EQ(15.0, averages[2].asDouble());
 }
 
 TEST_F(FacetTest, selectedEmptyRangeBucketRunsSubOps) {
@@ -4728,9 +4757,9 @@ TEST_F(FacetTest, selectedIntFieldPinsShareFieldFinalization) {
   EXPECT_EQ(1, req->getMatchCount());
   const auto& result = topFacetResult(*req, "q", "codes");
   const auto& ids = std::get<api::ColInt>(result.bucket_ids->kind).v;
-  EXPECT_EQ((std::vector<int64_t>{2, 99, 1}),
+  EXPECT_EQ((std::vector<int64_t>{1, 99, 2}),
             (std::vector<int64_t>(ids.begin(), ids.end())));
-  EXPECT_EQ((std::vector<int64_t>{1, 0, 3}),
+  EXPECT_EQ((std::vector<int64_t>{3, 0, 1}),
             (std::vector<int64_t>(
                 result.counts.begin(), result.counts.end())));
 }
@@ -4923,6 +4952,7 @@ TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
   struct Selection {
     std::vector<int> values;
     api::SelectionMode mode;
+    int64_t limit;
   };
   std::mt19937 random(0x51ec7ed);
   for (int iteration = 0; iteration < 50; iteration++) {
@@ -4934,6 +4964,7 @@ TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
       auto& selection = selections[(size_t)facet];
       selection.mode = (random() & 1U) == 0
           ? api::SelectionMode::ANY : api::SelectionMode::ALL;
+      selection.limit = 1 + (int64_t)(random() % 2);
       int count = 1 + (int)(random() % 2);
       int first = (int)(random() % 3);
       selection.values.push_back(first);
@@ -4946,7 +4977,7 @@ TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
       }
       auto& cursor = top.facet(
           "facet" + std::to_string(facet),
-          "f" + std::to_string(facet) + "_s").limit(-1);
+          "f" + std::to_string(facet) + "_s").limit(selection.limit);
       setSelected(cursor, values, selection.mode);
     }
     req->execute();
@@ -4968,9 +4999,9 @@ TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
     EXPECT_EQ(expectedFound, req->getMatchCount());
 
     for (int facet = 0; facet < 3; facet++) {
-      std::map<std::string, int64_t> expected;
+      std::map<std::string, int64_t> counts;
       for (int selected : selections[(size_t)facet].values) {
-        expected["v" + std::to_string(selected)] = 0;
+        counts["v" + std::to_string(selected)] = 0;
       }
       for (const auto& doc : model) {
         bool inDomain = true;
@@ -4980,14 +5011,31 @@ TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
           if (!ownSideways && !matches(doc, filter)) inDomain = false;
         }
         if (inDomain) {
-          expected["v" + std::to_string(doc.values[(size_t)facet])]++;
+          counts["v" + std::to_string(doc.values[(size_t)facet])]++;
         }
       }
-      std::map<std::string, int64_t> actual;
-      for (const auto& [key, count] : stringFacetRows(
-               topFacetResult(*req, "q", "facet" + std::to_string(facet)))) {
-        actual[key] = count;
+
+      std::vector<std::pair<std::string, int64_t>> expected;
+      for (const auto& [key, count] : counts) {
+        if (count > 0) expected.emplace_back(key, count);
       }
+      std::sort(expected.begin(), expected.end(), [](const auto& a,
+                                                     const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+      });
+      expected.resize(std::min(
+          expected.size(),
+          (size_t)selections[(size_t)facet].limit));
+      for (int selected : selections[(size_t)facet].values) {
+        std::string key = "v" + std::to_string(selected);
+        bool emitted = std::ranges::any_of(
+            expected, [&](const auto& bucket) { return bucket.first == key; });
+        if (!emitted) expected.emplace_back(key, counts[key]);
+      }
+
+      auto actual = stringFacetRows(
+          topFacetResult(*req, "q", "facet" + std::to_string(facet)));
       EXPECT_EQ(expected, actual) << "iteration=" << iteration
                                   << " facet=" << facet;
     }
