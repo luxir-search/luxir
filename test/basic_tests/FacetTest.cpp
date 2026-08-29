@@ -8,6 +8,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <variant>
 #include <unordered_map>
 #include <tbb/task_group.h>
@@ -25,6 +26,7 @@
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/StrFacetOp.h"
+#include "luxir/server/JsonRequest.h"
 #include "luxir/util/NumericUtils.h"
 
 using namespace luxir;
@@ -59,6 +61,35 @@ void setRangeFacetSchema(CollectionHelper& helper,
 const api::FacetResult& rootFacetResult(const LocalReq& req,
                                         std::string_view name) {
   return *req.responses[0]->proto.ops.at(name)->facetResult();
+}
+
+const api::FacetResult& topFacetResult(const LocalReq& req,
+                                       std::string_view top,
+                                       std::string_view facet) {
+  const auto* docs = req.docList(top);
+  EXPECT_NE(nullptr, docs);
+  return *docs->ops.at(facet)->facetResult();
+}
+
+std::vector<std::pair<std::string, int64_t>> stringFacetRows(
+    const api::FacetResult& result) {
+  const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+  std::vector<std::pair<std::string, int64_t>> rows;
+  for (size_t i = 0; i < ids.size(); i++) {
+    rows.emplace_back(ids[i], result.counts[i]);
+  }
+  return rows;
+}
+
+void setSelected(OpCursor& cursor, std::span<const std::string> values,
+                 api::SelectionMode mode = api::SelectionMode::ANY) {
+  auto& facet = std::get<api::FieldFacet>(cursor.rawOp().kind);
+  auto* selected = api::build::allocArray(
+      facet.selected, values.size(), cursor.mr());
+  for (size_t i = 0; i < values.size(); i++) {
+    selected[i].kind = api::build::arenaStr(cursor.mr(), values[i]);
+  }
+  facet.selection_mode = mode;
 }
 
 std::span<const api::Val> metricValues(const api::FacetResult& result,
@@ -4545,4 +4576,391 @@ TEST_F(RandomFacetTest, randomFaceting) {
         (int)scaleTestDimension(2, 2),
         (int)scaleTestDimension(100, 2));
   }
+}
+
+TEST_F(FacetTest, selectedFacetsRefineSidewaysAndPinBuckets) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "price_i", 50),
+    flatdoc("id", "2", "brand_s", "acme", "price_i", 150),
+    flatdoc("id", "3", "brand_s", "globex", "price_i", 50),
+    flatdoc("id", "4", "brand_s", "globex", "price_i", 250),
+    flatdoc("id", "5", "brand_s", "initech", "price_i", 50),
+    flatdoc("id", "6", "brand_s", "initech", "price_i", 150),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"json({"ops":{"q":{"top_docs":{
+    "limit":0,"get_number":true,
+    "ops":{
+      "brands":{"field_facet":{"field":"brand_s","limit":1,
+        "mincount":1,"selected":["acme","globex"],
+        "ops":{"avg_price":"avg(price_i)"}}},
+      "prices":{"range_facet":{"field":"price_i","start":0,"end":300,
+        "gap":100,"mincount":2,"selected":[100]}}
+    }}}}})json", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+
+  const auto& brands = topFacetResult(*req, "q", "brands");
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"acme", 1}, {"globex", 0}, {"initech", 1}}),
+            stringFacetRows(brands));
+  auto averages = metricValues(brands, "avg_price");
+  ASSERT_EQ(3u, averages.size());
+  EXPECT_DOUBLE_EQ(150.0, averages[0].asDouble());
+  EXPECT_TRUE(averages[1].isNull());
+  EXPECT_DOUBLE_EQ(150.0, averages[2].asDouble());
+
+  const auto& prices = topFacetResult(*req, "q", "prices");
+  std::array<std::pair<int64_t, int64_t>, 2> bounds{{{0, 100}, {100, 200}}};
+  std::array<int64_t, 2> counts{{2, 1}};
+  expectRangeResult(prices, bounds, counts, -1);
+}
+
+TEST_F(FacetTest, selectedFieldPinsAreSeparateFromDiscoveryPage) {
+  SearchOverridesGuard strategyGuard(forcedStrFacetStrategy);
+  forcedStrFacetStrategy = StrFacetStrategy::TOP_TERMS;
+
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "common"),
+    flatdoc("id", "2", "brand_s", "common"),
+    flatdoc("id", "3", "brand_s", "common"),
+    flatdoc("id", "4", "brand_s", "rare"),
+    flatdoc("id", "5", "brand_s", "other"),
+    flatdoc("id", "6", "brand_s", "other"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"ops":{"q":{"top_docs":{
+    "limit":0,"get_number":true,
+    "ops":{"brands":{"field_facet":{"field":"brand_s","limit":1,
+      "mincount":2,"selected":["absent","rare"]}}}}}}})",
+      req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"absent", 0}, {"rare", 1}, {"common", 3}}),
+            stringFacetRows(topFacetResult(*req, "q", "brands")));
+}
+
+TEST_F(FacetTest, selectedPinsUseInlineSubOpFinalization) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "price_i", 10),
+    flatdoc("id", "2", "brand_s", "acme", "price_i", 20),
+    flatdoc("id", "3", "brand_s", "beta", "price_i", 30),
+    flatdoc("id", "4", "brand_s", "gamma", "price_i", 5),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"json({"limit":0,"ops":{"brands":{"field_facet":{
+    "field":"brand_s","limit":1,"selected":["absent","acme"],
+    "sorts":[{"expr":"avg_price","dir":"desc"}],
+    "ops":{"avg_price":"avg(price_i)"}}}}})json",
+    req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto& result = topFacetResult(*req, "q", "brands");
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"absent", 0}, {"acme", 2}, {"beta", 1}}),
+            stringFacetRows(result));
+  auto averages = metricValues(result, "avg_price");
+  ASSERT_EQ(3u, averages.size());
+  EXPECT_TRUE(averages[0].isNull());
+  EXPECT_DOUBLE_EQ(15.0, averages[1].asDouble());
+  EXPECT_DOUBLE_EQ(30.0, averages[2].asDouble());
+}
+
+TEST_F(FacetTest, selectedEmptyRangeBucketRunsSubOps) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "price_i", 10),
+    flatdoc("id", "2", "price_i", 20),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"json({"limit":0,"get_number":true,
+    "ops":{"prices":{"range_facet":{"field":"price_i",
+      "start":0,"end":200,"gap":100,"mincount":1,"selected":[100],
+      "ops":{"avg_price":"avg(price_i)"}}}}})json",
+    req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(0, req->getMatchCount());
+  const auto& result = topFacetResult(*req, "q", "prices");
+  std::array<std::pair<int64_t, int64_t>, 2> bounds{{{0, 100}, {100, 200}}};
+  std::array<int64_t, 2> counts{{2, 0}};
+  expectRangeResult(result, bounds, counts, -1);
+  auto averages = metricValues(result, "avg_price");
+  ASSERT_EQ(2u, averages.size());
+  EXPECT_DOUBLE_EQ(15.0, averages[0].asDouble());
+  EXPECT_TRUE(averages[1].isNull());
+}
+
+TEST_F(FacetTest, selectedIntFieldPinsShareFieldFinalization) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "code_i", 1),
+    flatdoc("id", "2", "code_i", 1),
+    flatdoc("id", "3", "code_i", 1),
+    flatdoc("id", "4", "code_i", 2),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"limit":0,"get_number":true,
+    "ops":{"codes":{"field_facet":{"field":"code_i","limit":1,
+      "mincount":2,"selected":[99,2]}}}})",
+    req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  const auto& result = topFacetResult(*req, "q", "codes");
+  const auto& ids = std::get<api::ColInt>(result.bucket_ids->kind).v;
+  EXPECT_EQ((std::vector<int64_t>{99, 2, 1}),
+            (std::vector<int64_t>(ids.begin(), ids.end())));
+  EXPECT_EQ((std::vector<int64_t>{0, 1, 3}),
+            (std::vector<int64_t>(
+                result.counts.begin(), result.counts.end())));
+}
+
+TEST_F(FacetTest, emptySelectedIsByteIdenticalToAbsent) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme"),
+    flatdoc("id", "2", "brand_s", "beta"),
+  }, UpdateMessage::COMMIT);
+
+  auto run = [&](std::string_view selection) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    std::string json = R"({"limit":0,"ops":{"f":{"field_facet":{"field":"brand_s","limit":-1)";
+    json += selection;
+    json += "}}}}";
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::byte> encoded;
+    EXPECT_TRUE(api::encode(topFacetResult(*req, "q", "f"), encoded));
+    return encoded;
+  };
+  EXPECT_EQ(run(""), run(R"(,"selected":[],"selection_mode":"any")"));
+}
+
+TEST_F(FacetTest, selectedAllIsStrictOnMultiValuedFields) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "tags_ss", vecs("x", "y")),
+    flatdoc("id", "2", "tags_ss", vecs("x")),
+    flatdoc("id", "3", "tags_ss", vecs("y")),
+    flatdoc("id", "4", "tags_ss", vecs("x", "y", "z")),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"ops":{"q":{"top_docs":{
+    "limit":0,"get_number":true,
+    "ops":{"tags":{"field_facet":{"field":"tags_ss","limit":-1,
+      "selected":["x","y"],"selection_mode":"all"}}}}}}})",
+      req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"x", 2}, {"y", 2}, {"z", 1}}),
+            stringFacetRows(topFacetResult(*req, "q", "tags")));
+}
+
+TEST_F(FacetTest, selectedComposesWithExplicitRoutedFilter) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "stock_s", "yes"),
+    flatdoc("id", "2", "brand_s", "acme", "stock_s", "no"),
+    flatdoc("id", "3", "brand_s", "beta", "stock_s", "no"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"ops":{"q":{"top_docs":{
+    "limit":0,"get_number":true,
+    "filter":[{"query":"stock_s:yes","except_ops":["brands"]}],
+    "ops":{"brands":{"field_facet":{"field":"brand_s","limit":-1,
+      "selected":["acme"]}}}}}}})", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"acme", 2}, {"beta", 1}}),
+            stringFacetRows(topFacetResult(*req, "q", "brands")));
+}
+
+TEST_F(FacetTest, selectedValidationIsParseTime) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme", "price_i", 10),
+               UpdateMessage::COMMIT);
+
+  auto expectError = [&](std::string_view json, std::string_view error) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("main");
+    ExpectLog quiet("Search request failed:");
+    req->execute();
+    EXPECT_NE(std::string::npos, req->errorMsg().find(error))
+        << req->errorMsg();
+  };
+
+  expectError(R"({"limit":0,"ops":{"f":{"field_facet":{
+    "field":"brand_s","selection_mode":"all"}}}})",
+      "selection_mode requires nonempty selected");
+  expectError(R"({"limit":0,"ops":{"f":{"field_facet":{
+    "field":"price_i","selected":[1,1.0]}}}})",
+      "duplicate selected value after coercion");
+  expectError(R"({"limit":0,"ops":{"f":{"field_facet":{
+    "field":"brand_s","selected":[null]}}}})",
+      "selected[0] must not be null");
+  expectError(R"({"limit":0,"ops":{"f":{"range_facet":{
+    "field":"price_i","start":0,"end":30,"gap":10,"selected":[15]}}}})",
+      "15 is not a generated range lower fence");
+  expectError(R"({"ops":{"f":{"field_facet":{"field":"brand_s",
+    "selected":["acme"]}}}})", "at request root");
+  expectError(R"({"limit":0,"ops":{"outer":{"field_facet":{
+    "field":"brand_s","ops":{"inner":{"field_facet":{"field":"brand_s",
+    "selected":["acme"]}}}}}}})", "at nested facet bucket");
+  expectError(R"({"ops":{"f":{"fusion":{"ops":{"brands":{"field_facet":{
+    "field":"brand_s","selected":["acme"]}}}}}}})", "at Fusion.ops");
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& facetCursor = req->collection("main").topDocs("q").allQuery()
+      .facet("f", "brand_s");
+  auto& facet = std::get<api::FieldFacet>(facetCursor.rawOp().kind);
+  auto* selected = api::build::allocArray(facet.selected, 1025, req->mr);
+  for (size_t i = 0; i < facet.selected.size(); i++) {
+    selected[i].kind = api::build::arenaStr(req->mr, std::to_string(i));
+  }
+  ExpectLog quiet("Search request failed:");
+  req->execute();
+  EXPECT_NE(std::string::npos, req->errorMsg().find("1024 selection limit"))
+      << req->errorMsg();
+}
+
+TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
+  CollectionHelper helper;
+  struct ModelDoc {
+    std::array<int, 3> values;
+  };
+  std::vector<ModelDoc> model;
+  for (int a = 0; a < 3; a++) {
+    for (int b = 0; b < 3; b++) {
+      for (int c = 0; c < 3; c++) {
+        model.push_back({{a, b, c}});
+        helper.index(
+            flatdoc("id", std::to_string(model.size()),
+                    "f0_s", "v" + std::to_string(a),
+                    "f1_s", "v" + std::to_string(b),
+                    "f2_s", "v" + std::to_string(c)),
+            model.size() == 27 ? UpdateMessage::COMMIT
+                               : UpdateMessage::NO_COMMIT);
+      }
+    }
+  }
+
+  struct Selection {
+    std::vector<int> values;
+    api::SelectionMode mode;
+  };
+  std::mt19937 random(0x51ec7ed);
+  for (int iteration = 0; iteration < 50; iteration++) {
+    std::array<Selection, 3> selections;
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").allQuery()
+        .getNumber().limit(0);
+    for (int facet = 0; facet < 3; facet++) {
+      auto& selection = selections[(size_t)facet];
+      selection.mode = (random() & 1U) == 0
+          ? api::SelectionMode::ANY : api::SelectionMode::ALL;
+      int count = 1 + (int)(random() % 2);
+      int first = (int)(random() % 3);
+      selection.values.push_back(first);
+      if (count == 2) {
+        selection.values.push_back((first + 1 + (int)(random() % 2)) % 3);
+      }
+      std::vector<std::string> values;
+      for (int value : selection.values) {
+        values.push_back("v" + std::to_string(value));
+      }
+      auto& cursor = top.facet(
+          "facet" + std::to_string(facet),
+          "f" + std::to_string(facet) + "_s").limit(-1);
+      setSelected(cursor, values, selection.mode);
+    }
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+
+    auto matches = [&](const ModelDoc& doc, int facet) {
+      const auto& selection = selections[(size_t)facet];
+      int matches = (int)std::ranges::count(
+          selection.values, doc.values[(size_t)facet]);
+      return selection.mode == api::SelectionMode::ANY
+          ? matches != 0 : matches == (int)selection.values.size();
+    };
+    int64_t expectedFound = 0;
+    for (const auto& doc : model) {
+      if (matches(doc, 0) && matches(doc, 1) && matches(doc, 2)) {
+        expectedFound++;
+      }
+    }
+    EXPECT_EQ(expectedFound, req->getMatchCount());
+
+    for (int facet = 0; facet < 3; facet++) {
+      std::map<std::string, int64_t> expected;
+      for (int selected : selections[(size_t)facet].values) {
+        expected["v" + std::to_string(selected)] = 0;
+      }
+      for (const auto& doc : model) {
+        bool inDomain = true;
+        for (int filter = 0; filter < 3; filter++) {
+          bool ownSideways = filter == facet
+              && selections[(size_t)facet].mode == api::SelectionMode::ANY;
+          if (!ownSideways && !matches(doc, filter)) inDomain = false;
+        }
+        if (inDomain) {
+          expected["v" + std::to_string(doc.values[(size_t)facet])]++;
+        }
+      }
+      std::map<std::string, int64_t> actual;
+      for (const auto& [key, count] : stringFacetRows(
+               topFacetResult(*req, "q", "facet" + std::to_string(facet)))) {
+        actual[key] = count;
+      }
+      EXPECT_EQ(expected, actual) << "iteration=" << iteration
+                                  << " facet=" << facet;
+    }
+  }
+}
+
+TEST_F(FacetTest, selectedAnyVariantsUseTheRoutedFilterCap) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
+  for (int i = 0; i < 65; i++) {
+    auto& facet = top.facet("f" + std::to_string(i), "brand_s");
+    std::array<std::string, 1> selected{"acme"};
+    setSelected(facet, selected);
+  }
+  ExpectLog quiet("Search request failed:");
+  req->execute();
+  EXPECT_NE(std::string::npos,
+            req->errorMsg().find("routed filter variant cap 64 exceeded"))
+      << req->errorMsg();
 }

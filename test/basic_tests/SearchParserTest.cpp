@@ -297,6 +297,34 @@ TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
                            responseScores(*req, "folded"));
 }
 
+TEST_F(SearchParserTest, selectedFiltersAppendInChildKeyOrder) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "brand_s", "acme"),
+               UpdateMessage::COMMIT);
+
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& top = request->collection("main").topDocs("q").allQuery().limit(0);
+  top.filter(qb::all());
+  for (std::string_view key : {"z", "a"}) {
+    auto& cursor = top.facet(key, "brand_s");
+    auto& facet = std::get<api::FieldFacet>(cursor.rawOp().kind);
+    auto* selected = api::build::allocArray(facet.selected, 1, cursor.mr());
+    selected[0].kind = api::build::arenaStr(cursor.mr(), "acme");
+  }
+  request->schema = helper.collection().getSchema();
+  request->reader = helper.getIndexWriter()->getIndexReader();
+  ProtobufSearchParser parser(*request);
+  SearchOp* root = parser.parse();
+  auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+  ASSERT_NE(nullptr, parsed);
+  ASSERT_EQ(3u, parsed->filters.size());
+  EXPECT_TRUE(parsed->filters[0].exceptOps.empty());
+  ASSERT_EQ(1u, parsed->filters[1].exceptOps.size());
+  ASSERT_EQ(1u, parsed->filters[2].exceptOps.size());
+  EXPECT_EQ("a", parsed->filters[1].exceptOps[0]);
+  EXPECT_EQ("z", parsed->filters[2].exceptOps[0]);
+}
+
 TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   CollectionHelper helper;
   helper.indexAll(std::array{

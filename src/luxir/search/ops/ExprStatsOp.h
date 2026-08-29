@@ -429,10 +429,13 @@ public:
       });
       auto& arr = oneofMut<api::ArrVal>(*value);
       for (size_t i = 0; i < entries.size(); i++) {
-        BucketScalar result = finishState(entries[i], counts[i]);
+        BucketScalar result = entries[i] == nullptr
+            ? BucketScalar::missing(
+                  resultType, thisOp().aggregate.root().nature)
+            : finishState(entries[i], counts[i]);
         thisOp().warnFailure(result);
         writeAggregateValue(const_cast<api::Val&>(arr.v[i]), result);
-        entries[i] += entryBytes;
+        if (entries[i] != nullptr) entries[i] += entryBytes;
       }
     }
   };

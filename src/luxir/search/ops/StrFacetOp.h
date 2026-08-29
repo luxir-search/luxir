@@ -19,7 +19,6 @@
 #include "StrFacetPlanning.h"
 #include "StrFacetReplay.h"
 #include "luxir/util/SegmentMergeDriver.h"
-#include "luxir/util/heap.h"
 #include "luxir/util/log.h"
 
 namespace luxir {
@@ -47,7 +46,8 @@ inline const char* domainDesc(DocSet* domain) {
 template<typename Counter>
 inline void collectSparseCounts(
     Counter& counter, int64_t min, int64_t limit,
-    std::vector<std::pair<int64_t, int64_t>>& ordCounts) {
+    std::vector<std::pair<int64_t, int64_t>>& ordCounts,
+    bool allowEarlyStop = true) {
   // Overflowed ords are guaranteed to outrank every non-overflowed ord. Fold
   // their low bits first and clear those slots so a later scan cannot count
   // them twice.
@@ -58,7 +58,7 @@ inline void collectSparseCounts(
   });
 
   bool sortingByCountDesc = true;  // FUTURE
-  if (sortingByCountDesc && limit != -1
+  if (allowEarlyStop && sortingByCountDesc && limit != -1
       && (int64_t)ordCounts.size() >= limit) {
     // The top-K is already in hand, so release the potentially large sparse
     // table instead of scanning it.
@@ -101,6 +101,11 @@ class StrFacetOp : public FieldFacetReq {
   static constexpr int64_t INLINE_ALL_MIN_DOMAIN = 48 * 1024;
 
   std::shared_ptr<OrdMap> ordMap;
+  struct PinnedBucket {
+    std::string_view key;
+    std::optional<int64_t> ord;
+  };
+  std::vector<PinnedBucket> pinnedBuckets;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
   bool inlineAllCandidate = false;
 
@@ -345,9 +350,19 @@ public:
   // (see TopDocsReq's ctor comment).
   StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
-    std::shared_ptr<OrdMap> ordMap) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
+    std::shared_ptr<OrdMap> ordMap,
+    std::span<const std::string_view> selected) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+                {}, selected),
   ordMap(std::move(ordMap)) {
+    if (!selected.empty()) {
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, fieldName);
+      pinnedBuckets.reserve(selected.size());
+      for (std::string_view key : selected) {
+        pinnedBuckets.push_back({key, lookup.strToOrd(key)});
+      }
+    }
     enableExecutionProfile();
   }
 
@@ -418,57 +433,45 @@ public:
     }
   }
 
-  void normalizeOrdCounts(
+  std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
       std::vector<std::pair<int64_t, int64_t>>& ordCounts,
       bool allowZeroPadding) const {
-    auto min = std::max<int64_t>(minCount, 1);
-    std::erase_if(ordCounts, [&](const auto& entry) {
-      return entry.second < min;
-    });
-
-    sortByCountDescAndLimit(ordCounts, limit);
-    if (!allowZeroPadding || minCount != 0) return;
-    int64_t numGlobalOrds = ordMap ? ordMap->numOrds() : 0;
-    int64_t target = (limit < 0) ? numGlobalOrds : limit;
-    if ((int64_t)ordCounts.size() >= target) return;
-
-    boost::unordered_flat_set<int64_t> present;
-    present.reserve(ordCounts.size());
+    std::vector<FacetCandidate<int64_t>> candidates;
+    candidates.reserve(ordCounts.size());
     for (auto [ord, count] : ordCounts) {
-      unused(count);
-      present.insert(ord);
+      candidates.push_back({ord, count, {}});
     }
-    for (int64_t ord = 0;
-         ord < numGlobalOrds && (int64_t)ordCounts.size() < target; ord++) {
-      if (!present.contains(ord)) ordCounts.emplace_back(ord, 0);
-    }
-  }
 
-  void resolveOrdCounts(
-      std::span<const std::pair<int64_t, int64_t>> ordCounts,
-      OrdMapStr& ordMapStr,
-      std::vector<std::pair<std::string, int64_t>>& countVec,
-      std::vector<SelectedFacetBucket<std::string_view>>* selectedBuckets)
-      const {
-    countVec.clear();
-    countVec.reserve(ordCounts.size());
-    if (selectedBuckets != nullptr) {
-      selectedBuckets->clear();
-      selectedBuckets->reserve(ordCounts.size());
+    std::vector<std::optional<int64_t>> pins;
+    pins.reserve(pinnedBuckets.size());
+    boost::unordered_flat_set<int64_t> pinnedOrds;
+    for (const auto& pin : pinnedBuckets) {
+      pins.push_back(pin.ord);
+      if (pin.ord.has_value()) pinnedOrds.insert(*pin.ord);
     }
-    for (auto [ord, count] : ordCounts) {
-      countVec.emplace_back(ordMapStr.ordToStr(ord), count);
-      if (selectedBuckets != nullptr) {
-        int32_t output = (int32_t)selectedBuckets->size();
-        selectedBuckets->push_back({
-            .key = countVec.back().first,
-            .id = FacetBucketId{ord},
-            .count = count,
-            .owner = FacetOwnerSlot{output},
-            .output = FacetOutputSlot{output}
-        });
+
+    if (allowZeroPadding && minCount == 0) {
+      boost::unordered_flat_set<int64_t> present;
+      present.reserve(ordCounts.size());
+      size_t regular = 0;
+      for (auto [ord, count] : ordCounts) {
+        unused(count);
+        present.insert(ord);
+        if (!pinnedOrds.contains(ord)) regular++;
+      }
+      int64_t numGlobalOrds = ordMap ? ordMap->numOrds() : 0;
+      size_t target = limit < 0 ? (size_t)numGlobalOrds : (size_t)limit;
+      for (int64_t ord = 0;
+           ord < numGlobalOrds && regular < target; ord++) {
+        if (present.contains(ord) || pinnedOrds.contains(ord)) continue;
+        candidates.push_back({ord, 0, {}});
+        regular++;
       }
     }
+
+    return finalizeCountFieldBuckets(
+        std::move(candidates), std::span<const std::optional<int64_t>>(pins),
+        minCount, 0, limit);
   }
 
   class Calc : public Calculator {
@@ -776,7 +779,8 @@ public:
     void calcOrdMap(int32_t segnum, DocSet* domain,
                     ExecutionProfilePieceState* profile) {
       driver.contribute([&](MergeableStrData& data) {
-        countSegment(data, segnum, domain, profile, true);
+        countSegment(data, segnum, domain, profile,
+                     thisOp().pinnedBuckets.empty());
       });
     }
 
@@ -1288,7 +1292,8 @@ public:
         auto* spanCounts = std::get_if<SpanCounter>(&mergedData->counts);
         // Collect nonzero counts first. Explicit mincount=0 pads zero-count
         // buckets after sorting/truncating the competitive nonzero buckets.
-        auto min = std::max<int64_t>(thisOp().minCount, 1);
+        auto min = thisOp().pinnedBuckets.empty()
+            ? std::max<int64_t>(thisOp().minCount, 1) : 1;
 
         if (allTopTerms) {
           assert(thisOp().ordMap != nullptr);
@@ -1323,7 +1328,9 @@ public:
           // counts are enough to fill the limit.
           bool sortingByCountDesc = true;  // FUTURE
 
-          if (sortingByCountDesc && limit != -1 && (int64_t)ordCounts.size() >= limit) {
+          if (thisOp().pinnedBuckets.empty()
+              && sortingByCountDesc && limit != -1
+              && (int64_t)ordCounts.size() >= limit) {
             // already have enough counts, from overflow, and they are guaranteed to be larger than anything that didn't overflow.
           } else {
             for (size_t ord = 0; ord < skinnyCounts->counts.size(); ord++) {
@@ -1334,7 +1341,8 @@ public:
             }
           }
         } else if (spanCounts) {
-          collectSparseCounts(*spanCounts, min, limit, ordCounts);
+          collectSparseCounts(*spanCounts, min, limit, ordCounts,
+                              thisOp().pinnedBuckets.empty());
         } else {
           assert(false);
         }
@@ -1376,15 +1384,40 @@ public:
     void finishOrdCounts(
         std::vector<std::pair<int64_t, int64_t>> ordCounts,
         int64_t missingCount, bool allowZeroPadding = true) {
-      thisOp().normalizeOrdCounts(ordCounts, allowZeroPadding);
+      auto finalized = thisOp().finalizeOrdCounts(ordCounts, allowZeroPadding);
 
       std::vector<std::pair<std::string, int64_t>> countVec;
       std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
                          *thisOp().req.reader, thisOp().fieldName);
-      thisOp().resolveOrdCounts(
-          ordCounts, ordMapStr, countVec, &selectedBuckets);
+      countVec.reserve(finalized.size());
+      selectedBuckets.reserve(finalized.size());
+      for (const auto& bucket : finalized) {
+        std::string_view key;
+        std::optional<FacetBucketId> id;
+        FacetBucketFlags flags = FacetBucketFlags::NONE;
+        if (bucket.pinned()) {
+          const auto& pin = thisOp().pinnedBuckets[bucket.pinIndex];
+          key = pin.key;
+          if (pin.ord.has_value()) id = FacetBucketId{*pin.ord};
+          flags = FacetBucketFlags::PINNED;
+        } else {
+          assert(bucket.key.has_value());
+          key = ordMapStr.ordToStr(*bucket.key);
+          id = FacetBucketId{*bucket.key};
+        }
+        countVec.emplace_back(key, bucket.count);
+        int32_t output = (int32_t)selectedBuckets.size();
+        selectedBuckets.push_back({
+            .key = countVec.back().first,
+            .id = id,
+            .count = bucket.count,
+            .owner = FacetOwnerSlot{output},
+            .output = FacetOutputSlot{output},
+            .flags = flags,
+        });
+      }
 
       auto& mr = op.req.lastResponse->mr;
       luxir::api::FacetResult* result = nullptr;
@@ -1414,16 +1447,10 @@ public:
       auto missing = thisOp().missing;
       mergedData->counts.finalize();
 
-      // (global ord, entry, finalized slot). Ties break on the ord rather than
-      // the term text,
-      // which is the same rule the non-inline path applies
-      // (sortByCountDescAndLimit over ordCounts) - one bucket order for both.
-      struct Bucket {
-        int64_t ord;
+      struct InlinePayload {
         char* entry;
         size_t finalizedSlot;
       };
-      std::vector<Bucket> valVec;
       auto& counts = mergedData->counts;
       auto missing_count = mergedData->missing_num;
 
@@ -1443,70 +1470,37 @@ public:
             thisOp().fieldFacet.sorts[0].dir == luxir::api::SortSpec_::SortDir::DESC;
       }
 
-      // "a comes before b" in the returned order.  One definition, used by both
-      // the bounded selection and the final ordering of what it kept.
-      auto better = [sortCalc, reversed](const Bucket& a, const Bucket& b) {
+      auto better = [sortCalc, reversed](const auto& a, const auto& b) {
         if (sortCalc == nullptr) {
-          auto acount = loadUnaligned<int64_t>(a.entry);
-          auto bcount = loadUnaligned<int64_t>(b.entry);
-          if (acount != bcount) {
-            return acount > bcount;
-          }
-          return a.ord < b.ord;
+          if (a.count != b.count) return a.count > b.count;
+          return a.key < b.key;
         }
-        bool aMissing = sortCalc->isMissing(a.finalizedSlot);
-        bool bMissing = sortCalc->isMissing(b.finalizedSlot);
+        bool aMissing = sortCalc->isMissing(a.payload.finalizedSlot);
+        bool bMissing = sortCalc->isMissing(b.payload.finalizedSlot);
         if (aMissing != bMissing) return !aMissing;
-        if (aMissing) return a.ord < b.ord;
-        int cmp = sortCalc->compare(a.finalizedSlot, b.finalizedSlot);
-        if (cmp == 0) {
-          return a.ord < b.ord; // tie-break by bucketid asc
-        }
+        if (aMissing) return a.key < b.key;
+        int cmp = sortCalc->compare(a.payload.finalizedSlot,
+                                    b.payload.finalizedSlot);
+        if (cmp == 0) return a.key < b.key;
         return reversed ? cmp > 0 : cmp < 0;
       };
 
-      if (limit > 0) {
-        // Bounded selection.  Sorting every bucket to return `limit` of them is
-        // what a high-cardinality metric-ordered facet spends most of its time
-        // on: at 278,741 buckets that is ~5M comparisons, each one a virtual
-        // call into the sort key's calculator and two dereferences into the
-        // entry table, plus one compact vector slot per bucket. A
-        // heap of `limit` costs one failed comparison per bucket and only
-        // ~limit*ln(n/limit) replacements. Finalized scalar scratch and the
-        // compact selection records are materialized once per bucket before
-        // this loop, never inside a comparison; the heap itself grows on
-        // demand (a deep limit over few surviving buckets allocates for the
-        // survivors, not the limit).
-        // ExpandingPQ evicts the GREATEST element under its comparator, so
-        // passing the returned order directly is what keeps the best: top()
-        // is then the worst of the best-so-far, which is the one to beat.
-        ExpandingPQ<Bucket, decltype(better)> pq((size_t)limit, better);
-        size_t finalizedSlot = 0;
-        counts.forEachEntry([&](int64_t key, char* val) {
-          int64_t count = loadUnaligned<int64_t>(val);
-          if (minCount == -1 || count >= minCount) {
-            pq.insertWithOverflow({key, val, finalizedSlot});
-          }
+      std::vector<std::optional<int64_t>> pins;
+      pins.reserve(thisOp().pinnedBuckets.size());
+      for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
+      FieldBucketFinalizer<int64_t, InlinePayload, decltype(better)> finalizer(
+          std::span<const std::optional<int64_t>>(pins),
+          minCount, 0, limit, better);
+      size_t finalizedSlot = 0;
+      if (finalizer.needsCandidates()) {
+        counts.forEachEntry([&](int64_t key, char* entry) {
+          finalizer.add({key, loadUnaligned<int64_t>(entry),
+                         {entry, finalizedSlot}});
           finalizedSlot++;
         });
         assert(finalizedSlot == counts.size());
-        std::vector<Bucket> top = pq.release();
-        std::sort(top.begin(), top.end(), better);
-        valVec = std::move(top);
-      } else if (limit < 0) {
-        // Every bucket is returned, so there is nothing to select against.
-        size_t finalizedSlot = 0;
-        counts.forEachEntry([&](int64_t key, char* val) {
-          int64_t count = loadUnaligned<int64_t>(val);
-          if (minCount == -1 || count >= minCount) {
-            valVec.push_back({key, val, finalizedSlot});
-          }
-          finalizedSlot++;
-        });
-        assert(finalizedSlot == counts.size());
-        std::sort(valVec.begin(), valVec.end(), better);
       }
-      // limit == 0 returns no buckets, and never looks at one.
+      auto finalized = finalizer.finish();
 
       // Term text for the buckets that survived selection, and only those -
       // ordToStr seeks the dictionary once per bucket instead of once per
@@ -1517,19 +1511,24 @@ public:
       OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
                           *thisOp().req.reader, thisOp().fieldName);
       std::vector<std::string> keys;
-      keys.reserve(valVec.size());
-      for (const Bucket& bucket : valVec) {
-        keys.emplace_back(ordMapStr.ordToStr(bucket.ord));
+      keys.reserve(finalized.size());
+      for (const auto& bucket : finalized) {
+        if (bucket.pinned()) {
+          keys.emplace_back(thisOp().pinnedBuckets[bucket.pinIndex].key);
+        } else {
+          assert(bucket.key.has_value());
+          keys.emplace_back(ordMapStr.ordToStr(*bucket.key));
+        }
       }
 
-      // fill in the facet result proto (non-owning: size known from valVec)
+      // fill in the facet result proto (non-owning: size known up front)
       auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
-      size_t n = valVec.size();
+      size_t n = finalized.size();
       std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
       int64_t* countArr = build::allocArray(facetResultProto.counts, n, mr);
       for (size_t i = 0; i < n; i++) {
         ids[i] = build::arenaStr(mr, keys[i]);  // copy the (transient) string into the arena
-        countArr[i] = loadUnaligned<int64_t>(valVec[i].entry);
+        countArr[i] = finalized[i].count;
       }
       if (missing) {
         facetResultProto.missing = missing_count;
@@ -1538,27 +1537,33 @@ public:
       // fill in results from inline calculators
       std::vector<char*> results;
       std::vector<int64_t> resultCounts;
-      results.reserve(valVec.size());
-      resultCounts.reserve(valVec.size());
-      for (const Bucket& bucket : valVec) {
-        results.push_back(bucket.entry + sizeof(int64_t));
-        resultCounts.push_back(loadUnaligned<int64_t>(bucket.entry));
+      results.reserve(finalized.size());
+      resultCounts.reserve(finalized.size());
+      for (const auto& bucket : finalized) {
+        results.push_back(bucket.payload.has_value()
+            ? bucket.payload->entry + sizeof(int64_t) : nullptr);
+        resultCounts.push_back(bucket.count);
       }
       for (auto calc : mergedData->inlineCalcs) {
         calc->fillResult(results, resultCounts);
       }
 
       std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
-      selectedBuckets.reserve(valVec.size());
-      for (size_t i = 0; i < valVec.size(); i++) {
+      selectedBuckets.reserve(finalized.size());
+      for (size_t i = 0; i < finalized.size(); i++) {
+        std::optional<FacetBucketId> id;
+        FacetBucketFlags flags = FacetBucketFlags::NONE;
+        if (finalized[i].key.has_value()) {
+          id = FacetBucketId{*finalized[i].key};
+        }
+        if (finalized[i].pinned()) flags = FacetBucketFlags::PINNED;
         selectedBuckets.push_back({
             .key = keys[i],
-            // Now known, and it is what StringFacetColumnSource documents its
-            // bucket ids to be: the global ordinal for this OrdMap epoch.
-            .id = FacetBucketId{valVec[i].ord},
-            .count = loadUnaligned<int64_t>(valVec[i].entry),
+            .id = id,
+            .count = finalized[i].count,
             .owner = FacetOwnerSlot{(int32_t)i},
-            .output = FacetOutputSlot{(int32_t)i}
+            .output = FacetOutputSlot{(int32_t)i},
+            .flags = flags,
         });
       }
       // Inline results and sort comparisons are complete. Release their
@@ -1816,8 +1821,14 @@ public:
         assert(owner >= 0 && owner < (int32_t)rows.size());
         assert(output >= 0 && output < (int32_t)arr.v.size());
         auto& ordCounts = rows[(size_t)owner];
-        child.normalizeOrdCounts(ordCounts, true);
-        child.resolveOrdCounts(ordCounts, ordMapStr, countVec, nullptr);
+        auto finalized = child.finalizeOrdCounts(ordCounts, true);
+        countVec.clear();
+        countVec.reserve(finalized.size());
+        for (const auto& result : finalized) {
+          assert(!result.pinned() && result.key.has_value());
+          countVec.emplace_back(
+              ordMapStr.ordToStr(*result.key), result.count);
+        }
         auto& facetResultProto = oneofMut<luxir::api::FacetResult>(
             const_cast<luxir::api::Val&>(arr.v[(size_t)output]));
         emitBuckets(facetResultProto, countVec, mr);

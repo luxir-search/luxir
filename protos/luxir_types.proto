@@ -496,6 +496,11 @@ message SimpleQuery {
 }
 
 
+enum SelectionMode {
+  ANY = 0;
+  ALL = 1;
+}
+
 message FieldFacet {
   string field = 1;
   optional sint64 limit = 2;         // maximum number of buckets to return
@@ -503,6 +508,8 @@ message FieldFacet {
   bool missing = 4;
   repeated SortSpec sorts = 5; // how to sort the buckets, if not specified, the default is by count descending
   map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
+  repeated Val selected = 7;
+  SelectionMode selection_mode = 8;
 }
 
 message CalendarGap {
@@ -531,6 +538,8 @@ message RangeFacet {
   repeated SortSpec sorts = 7; // how to sort the buckets, if not specified, the default is by bucket id ascending
   map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
   string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only
+  repeated Val selected = 11; // generated bucket lower fences
+  SelectionMode selection_mode = 12;
 }
 
 // A "domain" defines a set of documents to do computations over (like facets)

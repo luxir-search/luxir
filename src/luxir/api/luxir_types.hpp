@@ -92,6 +92,7 @@ namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
+enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
@@ -397,6 +398,8 @@ struct FieldFacet {
   std::optional<std::int64_t> mincount;
   std::span<const SortSpec> sorts;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::span<const Val> selected;
+  SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
 struct SearchRequest {                                          // needs Target
@@ -461,6 +464,8 @@ struct RangeFacet {                                             // needs Val,Cal
   std::span<const SortSpec> sorts;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::string_view time_zone;
+  std::span<const Val> selected;
+  SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,ExprOp

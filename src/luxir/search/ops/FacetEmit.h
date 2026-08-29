@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <optional>
+#include <span>
 #include <string>
+#include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
@@ -10,21 +15,129 @@
 
 namespace luxir {
 
-template<typename K>
-void sortByCountDescAndLimit(std::vector<std::pair<K, int64_t>>& buckets, int64_t limit) {
-  auto cmp = [](const auto& a, const auto& b) {
-    if (a.second != b.second) {
-      return a.second > b.second;
-    }
-    return a.first < b.first;
-  };
+template<typename Key, typename Payload = std::monostate>
+struct FacetCandidate {
+  Key key;
+  int64_t count;
+  Payload payload;
+};
 
-  if (limit >= 0 && limit < (int64_t)buckets.size()) {
-    std::partial_sort(buckets.begin(), buckets.begin() + limit, buckets.end(), cmp);
-    buckets.resize(limit);
-  } else {
-    std::sort(buckets.begin(), buckets.end(), cmp);
+template<typename Key, typename Payload = std::monostate>
+struct FinalizedFacetBucket {
+  std::optional<Key> key;
+  int64_t count = 0;
+  std::optional<Payload> payload;
+  size_t pinIndex = std::numeric_limits<size_t>::max();
+
+  bool pinned() const {
+    return pinIndex != std::numeric_limits<size_t>::max();
   }
+};
+
+template<typename Key, typename Payload, typename Better>
+class FieldBucketFinalizer {
+  using Candidate = FacetCandidate<Key, Payload>;
+  using Final = FinalizedFacetBucket<Key, Payload>;
+
+  std::vector<Final> pins;
+  std::unordered_map<Key, size_t> pinByKey;
+  std::vector<Candidate> regular;
+  [[no_unique_address]] Better better;
+  int64_t minCount;
+  size_t offset;
+  size_t retain;
+  bool bounded;
+
+public:
+  // Field facets have two result partitions. Pins are extracted during
+  // enumeration, before the ordinary page is filtered and selected, so they
+  // neither consume its limit nor inherit its mincount. Finite pages retain a
+  // bounded heap; callers need not materialize every candidate.
+  FieldBucketFinalizer(std::span<const std::optional<Key>> requestedPins,
+      int64_t minCount, int64_t offset, int64_t limit, Better better) :
+      better(std::move(better)), minCount(minCount),
+      offset(offset < 0 ? 0 : (size_t)offset), retain(0),
+      bounded(limit >= 0) {
+    pins.reserve(requestedPins.size());
+    pinByKey.reserve(requestedPins.size());
+    for (size_t i = 0; i < requestedPins.size(); i++) {
+      pins.push_back({.key = requestedPins[i], .pinIndex = i});
+      if (requestedPins[i].has_value()) {
+        pinByKey.emplace(*requestedPins[i], i);
+      }
+    }
+    if (bounded) {
+      uint64_t requested = (uint64_t)this->offset + (uint64_t)limit;
+      retain = requested > std::numeric_limits<size_t>::max()
+          ? std::numeric_limits<size_t>::max() : (size_t)requested;
+      regular.reserve(std::min<size_t>(retain, 64));
+    }
+  }
+
+  void add(Candidate candidate) {
+    auto pin = pinByKey.find(candidate.key);
+    if (pin != pinByKey.end()) {
+      Final& selected = pins[pin->second];
+      selected.count = candidate.count;
+      selected.payload = std::move(candidate.payload);
+      return;
+    }
+    if (minCount != -1 && candidate.count < minCount) return;
+    if (!bounded) {
+      regular.push_back(std::move(candidate));
+    } else if (regular.size() < retain) {
+      regular.push_back(std::move(candidate));
+      std::push_heap(regular.begin(), regular.end(), better);
+    } else if (retain != 0 && better(candidate, regular.front())) {
+      std::pop_heap(regular.begin(), regular.end(), better);
+      regular.back() = std::move(candidate);
+      std::push_heap(regular.begin(), regular.end(), better);
+    }
+  }
+
+  bool needsCandidates() const {
+    return !pinByKey.empty() || !bounded || retain != 0;
+  }
+
+  std::vector<Final> finish() {
+    std::sort(regular.begin(), regular.end(), better);
+    size_t begin = std::min(offset, regular.size());
+    std::vector<Final> out = std::move(pins);
+    out.reserve(out.size() + regular.size() - begin);
+    for (size_t i = begin; i < regular.size(); i++) {
+      auto& bucket = regular[i];
+      out.push_back({
+          .key = std::move(bucket.key),
+          .count = bucket.count,
+          .payload = std::move(bucket.payload),
+      });
+    }
+    return out;
+  }
+};
+
+template<typename Key, typename Payload, typename Better>
+std::vector<FinalizedFacetBucket<Key, Payload>> finalizeFieldBuckets(
+    std::vector<FacetCandidate<Key, Payload>> candidates,
+    std::span<const std::optional<Key>> pins,
+    int64_t minCount, int64_t offset, int64_t limit, Better better) {
+  FieldBucketFinalizer<Key, Payload, Better> finalizer(
+      pins, minCount, offset, limit, std::move(better));
+  for (auto& candidate : candidates) finalizer.add(std::move(candidate));
+  return finalizer.finish();
+}
+
+template<typename Key, typename Payload = std::monostate>
+std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
+    std::vector<FacetCandidate<Key, Payload>> candidates,
+    std::span<const std::optional<Key>> pins,
+    int64_t minCount, int64_t offset, int64_t limit) {
+  return finalizeFieldBuckets(
+      std::move(candidates), pins, minCount, offset, limit,
+      [](const auto& a, const auto& b) {
+        if (a.count != b.count) return a.count > b.count;
+        return a.key < b.key;
+      });
 }
 
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING

@@ -153,6 +153,29 @@ TEST(JsonDialect, SearchRequestShorthandOpsNamedQStaysSubOp) {
   EXPECT_EQ("cat_s", std::get<P::FieldFacet>((**td.ops.find("q")).kind).field);
 }
 
+TEST(JsonDialect, FacetSelectionsUseLowercaseEnumNames) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchOp field;
+  ASSERT_TRUE(P::read_json(field, R"({"field_facet":{"field":"tag_ss",
+    "selected":["x","y"],"selection_mode":"all"}})", mr));
+  const auto& fieldFacet = std::get<P::FieldFacet>(field.kind);
+  ASSERT_EQ(2u, fieldFacet.selected.size());
+  EXPECT_EQ("x", fieldFacet.selected[0].asString());
+  EXPECT_EQ(P::SelectionMode::ALL, fieldFacet.selection_mode);
+  std::string encoded;
+  ASSERT_TRUE(P::write_json(field, encoded));
+  EXPECT_TRUE(encoded.contains("\"selected\":[\"x\",\"y\"]"));
+  EXPECT_NE(std::string::npos, encoded.find(R"("selection_mode":"all")"));
+
+  P::SearchOp range;
+  ASSERT_TRUE(P::read_json(range, R"({"range_facet":{"field":"price_i",
+    "start":0,"end":20,"gap":10,"selected":[10]}})", mr));
+  const auto& rangeFacet = std::get<P::RangeFacet>(range.kind);
+  ASSERT_EQ(1u, rangeFacet.selected.size());
+  EXPECT_EQ(10, rangeFacet.selected[0].asInt());
+  EXPECT_EQ(P::SelectionMode::ANY, rangeFacet.selection_mode);
+}
+
 TEST(JsonDialect, ValWritesUntagged) {
   std::pmr::monotonic_buffer_resource mr;
   P::Val v;

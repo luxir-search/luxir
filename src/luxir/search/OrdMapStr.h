@@ -1,4 +1,6 @@
 #pragma once
+#include <optional>
+
 #include "OrdMap.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/util/MemPool.h"
@@ -60,6 +62,26 @@ public:
 
     tenum->seekOrd(segOrd);
     return (std::string_view) tenum->term();
+  }
+
+  // Resolve an exact term without requiring every requested key to have a
+  // global ordinal. A full segment is sufficient when present; otherwise the
+  // first segment containing the term supplies the stable global mapping.
+  std::optional<int64_t> strToOrd(std::string_view term) {
+    if (ordMap == nullptr) return std::nullopt;
+    int firstFull = ordMap->firstFullSeg();
+    if (firstFull >= 0) {
+      TermsEnum* tenum = getTermsEnum(firstFull);
+      return tenum->seek(term) ? std::optional<int64_t>(tenum->ord())
+                               : std::nullopt;
+    }
+    for (int32_t segnum = 0; segnum < (int32_t)enums.size(); segnum++) {
+      auto mapping = ordMap->getSegToGlobal(segnum);
+      if (mapping.numOrds == 0) continue;
+      TermsEnum* tenum = getTermsEnum(segnum);
+      if (tenum->seek(term)) return mapping.globalOrd(tenum->ord());
+    }
+    return std::nullopt;
   }
 };
 }

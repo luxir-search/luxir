@@ -107,8 +107,16 @@ public:
 class FieldFacetReq : public FacetReq {
 public:
   const ReqFieldFacet& fieldFacet;
-  FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing, fieldFacet.sorts), fieldFacet(fieldFacet){}
+  std::span<const int64_t> selectedInts;
+  std::span<const std::string_view> selectedStrings;
+
+  FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
+    std::string_view fieldName, std::string_view facetName, int64_t limit,
+    int64_t minCount, bool missing, std::span<const int64_t> selectedInts,
+    std::span<const std::string_view> selectedStrings) :
+  FacetReq(req, fieldName, facetName, limit, minCount, missing, fieldFacet.sorts),
+  fieldFacet(fieldFacet), selectedInts(selectedInts),
+  selectedStrings(selectedStrings) {}
 
   virtual ~FieldFacetReq() = default;
 
@@ -183,8 +191,10 @@ public:
   // scanGlobalRange and passes them in (see TopDocsReq's ctor comment).
   IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
-    int64_t globalMin, int64_t globalMax, bool useVector) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
+    int64_t globalMin, int64_t globalMax, bool useVector,
+    std::span<const int64_t> selected) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+                selected, {}),
   globalMin(globalMin), globalMax(globalMax), useVector(useVector) {}
 
   bool canEmitAsBucketChild() const override {
@@ -295,22 +305,32 @@ public:
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      std::vector<std::pair<int64_t, int64_t>> countVec;
+      std::vector<FacetCandidate<int64_t>> candidates;
       // Both storage types (monostate -> neither -> empty result, e.g. empty index).
       if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
         for (auto [val, count] : *countMap) {
-          if (count >= minCount) {
-            countVec.emplace_back(val, count);
-          }
+          candidates.push_back({val, count, {}});
         }
       } else if (auto* countVector = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
         for (size_t i = 0; i < countVector->size(); i++) {
-          if ((*countVector)[i] > 0 && (*countVector)[i] >= minCount) {
-            countVec.emplace_back(merged.minValue + i, (*countVector)[i]);
+          if ((*countVector)[i] > 0) {
+            candidates.push_back({merged.minValue + (int64_t)i,
+                                  (*countVector)[i], {}});
           }
         }
       }
-      sortByCountDescAndLimit(countVec, limit);
+      std::vector<std::optional<int64_t>> pins;
+      pins.reserve(thisOp().selectedInts.size());
+      for (int64_t selected : thisOp().selectedInts) pins.emplace_back(selected);
+      auto finalized = finalizeCountFieldBuckets(
+          std::move(candidates), std::span<const std::optional<int64_t>>(pins),
+          minCount, 0, limit);
+      std::vector<std::pair<int64_t, int64_t>> countVec;
+      countVec.reserve(finalized.size());
+      for (const auto& bucket : finalized) {
+        assert(bucket.key.has_value());
+        countVec.emplace_back(*bucket.key, bucket.count);
+      }
       emitBuckets(facetResultProto, countVec, mr);
       if (missing) {
         facetResultProto.missing = merged.missing_num;
@@ -347,8 +367,12 @@ class FullTextFacetReq : public FieldFacetReq {
   };
 
 public:
-  FullTextFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
+  FullTextFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
+    std::string_view fieldName, std::string_view facetName, int64_t limit,
+    int64_t minCount, bool missing,
+    std::span<const std::string_view> selected) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+                {}, selected) {}
 
   bool canEmitAsBucketChild() const override {
     return true;
@@ -429,13 +453,24 @@ public:
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      std::vector<std::pair<std::string, int64_t>> countVec;
+      std::vector<FacetCandidate<std::string>> candidates;
       for (auto [val, count] : merged.counts) {
-        if (minCount == -1 || count >= minCount) {
-          countVec.emplace_back(val, count);
-        }
+        candidates.push_back({std::move(val), count, {}});
       }
-      sortByCountDescAndLimit(countVec, limit);
+      std::vector<std::optional<std::string>> pins;
+      pins.reserve(thisOp().selectedStrings.size());
+      for (std::string_view selected : thisOp().selectedStrings) {
+        pins.emplace_back(selected);
+      }
+      auto finalized = finalizeCountFieldBuckets(
+          std::move(candidates), std::span<const std::optional<std::string>>(pins),
+          minCount, 0, limit);
+      std::vector<std::pair<std::string, int64_t>> countVec;
+      countVec.reserve(finalized.size());
+      for (auto& bucket : finalized) {
+        assert(bucket.key.has_value());
+        countVec.emplace_back(std::move(*bucket.key), bucket.count);
+      }
       emitBuckets(facetResultProto, countVec, mr);
       if (missing) {
         facetResultProto.missing = merged.missing_num;
@@ -454,6 +489,7 @@ class IntFacetRangeReq : public FacetReq {
   static constexpr size_t BUCKET_DOMAIN_BYTE_BUDGET = 64 * 1024 * 1024;
   static constexpr size_t BINDING_STATE_CHUNK_BYTES = 64 * 1024 * 1024;
   std::span<const int64_t> fences;
+  std::span<const size_t> selectedBuckets;
   int64_t affineGap;
   FieldType::Type valueType;
   bool affine;
@@ -473,14 +509,21 @@ class IntFacetRangeReq : public FacetReq {
 public:
   static inline bool disablePointsRangeFacetForTests = false;
 
+  std::span<const int64_t> bucketFences() const { return fences; }
+  std::span<const size_t> selectedBucketIndexes() const {
+    return selectedBuckets;
+  }
+
   // rangeFacet must reference the request proto (not a temporary): FacetReq
   // captures a span over rangeFacet.sorts that points into the request bytes.
   IntFacetRangeReq(SearchRequest& req, const ReqRangeFacet& rangeFacet,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
-    FieldType::Type valueType, int64_t minCount, bool missing)
+    FieldType::Type valueType, int64_t minCount, bool missing,
+    std::span<const size_t> selectedBuckets)
   : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts),
-    fences(fences), affineGap(affineGap), valueType(valueType), affine(affine) {}
+    fences(fences), selectedBuckets(selectedBuckets), affineGap(affineGap), valueType(valueType),
+    affine(affine) {}
 
   virtual ~IntFacetRangeReq() = default;
 
@@ -615,9 +658,11 @@ public:
 
       std::vector<size_t> emitted;
       emitted.reserve(thisOp().bucketCount());
+      std::vector<uint8_t> pinned(thisOp().bucketCount());
+      for (size_t bucket : thisOp().selectedBuckets) pinned[bucket] = 1;
       for (size_t i = 0; i < thisOp().bucketCount(); i++) {
         int64_t count = merged.counts.empty() ? 0 : merged.counts[i];
-        if (count >= minCount) emitted.push_back(i);
+        if (pinned[i] != 0 || count >= minCount) emitted.push_back(i);
       }
 
       size_t n = emitted.size();
@@ -652,7 +697,7 @@ public:
       if (missing) {
         facetResultProto.missing = merged.missing_num;
       }
-      executeResultChildren(merged, emitted);
+      executeResultChildren(merged, emitted, pinned);
     }
 
     // Post-selection sub-op execution sizes each bucket block from the child
@@ -661,7 +706,8 @@ public:
     // old one-pass shape. Within a segment, the domain-builder byte budget may
     // split that block further.
     void executeResultChildren(const MergeableRangeFacet& merged,
-                               std::span<const size_t> emitted) {
+                               std::span<const size_t> emitted,
+                               std::span<const uint8_t> pinned) {
       if (thisOp().subOps.empty() || emitted.empty()) return;
 
       std::vector<SelectedFacetBucket<int64_t>> buckets;
@@ -672,7 +718,9 @@ public:
             .id = FacetBucketId{(int64_t)emitted[i]},
             .count = merged.counts.empty() ? 0 : merged.counts[emitted[i]],
             .owner = FacetOwnerSlot{(int32_t)i},
-            .output = FacetOutputSlot{(int32_t)i}
+            .output = FacetOutputSlot{(int32_t)i},
+            .flags = pinned[emitted[i]] != 0
+                ? FacetBucketFlags::PINNED : FacetBucketFlags::NONE
         });
       }
 
