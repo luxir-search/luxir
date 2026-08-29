@@ -9,6 +9,11 @@ namespace luxir {
 
 class OrdMapStr {
 public:
+  struct TermStats {
+    std::optional<int64_t> globalOrd;
+    int64_t docFreq = 0;
+  };
+
   MemPool& pool;
   OrdMap* ordMap;
   IndexReader& index;
@@ -82,6 +87,26 @@ public:
       if (tenum->seek(term)) return mapping.globalOrd(tenum->ord());
     }
     return std::nullopt;
+  }
+
+  // Resolve a global ordinal and sum its exact segment docFreqs in one pass.
+  // This is the point-stat counterpart to strToOrd: callers that need both
+  // should not resolve the term and then walk the dictionaries again.
+  TermStats termStats(std::string_view term) {
+    TermStats result;
+    if (ordMap == nullptr) return result;
+    for (int32_t segnum = 0; segnum < (int32_t)enums.size(); segnum++) {
+      auto mapping = ordMap->getSegToGlobal(segnum);
+      if (mapping.numOrds == 0) continue;
+      TermsEnum* tenum = getTermsEnum(segnum);
+      if (!tenum->seek(term)) continue;
+      int64_t globalOrd = mapping.globalOrd(tenum->ord());
+      assert(!result.globalOrd.has_value()
+             || *result.globalOrd == globalOrd);
+      result.globalOrd = globalOrd;
+      result.docFreq += tenum->docFreq();
+    }
+    return result;
   }
 };
 }

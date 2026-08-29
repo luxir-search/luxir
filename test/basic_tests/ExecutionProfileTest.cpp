@@ -12,6 +12,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/server/JsonRequest.h"
 #include "luxir/server/JsonResponse.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -204,6 +205,37 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
     EXPECT_TRUE(detailsMention(piece, "global docFreq top terms"));
     EXPECT_TRUE(detailsMention(piece, "3 listed"));
   }
+}
+
+TEST_F(ExecutionProfileTest, selectedTailKeepsGlobalTopTermsPath) {
+  CollectionHelper helper("profile_selected_top_terms");
+  std::vector<Doc> docs;
+  docs.reserve(128);
+  for (int i = 0; i < 128; i++) {
+    std::string value = i < 64 ? "head"
+        : i == 64 ? "tail" : "other-" + std::to_string(i);
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", value));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"({"ops":{"q":{"top_docs":{"limit":0,
+    "ops":{"cats":{"field_facet":{"field":"cat_s","limit":1,
+      "selected":["head","tail"]}}}}}}})",
+      req->rawRequest(), req->mr);
+  req->collection("profile_selected_top_terms").profile();
+  req->execute(false);
+  ASSERT_OK(req);
+
+  const auto* result = req->docList("q")->ops.at("cats")->facetResult();
+  ASSERT_NE(nullptr, result);
+  ASSERT_EQ(2u, result->counts.size());
+  EXPECT_EQ(64, result->counts[0]);
+  EXPECT_EQ(1, result->counts[1]);
+  const auto& pieces = profileOp(*req, "cats").pieces;
+  ASSERT_EQ(1u, pieces.size());
+  EXPECT_EQ("toplist", pieces[0].strategy);
+  EXPECT_TRUE(detailsMention(pieces[0], "parent-count=top-terms"));
 }
 
 TEST_F(ExecutionProfileTest, nestedAutoSelectsReplayAndFallsBack) {

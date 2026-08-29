@@ -104,13 +104,9 @@ class StrFacetOp : public FieldFacetReq {
   struct PinnedBucket {
     std::string_view key;
     std::optional<int64_t> ord;
+    int64_t indexDocFreq;
   };
   std::vector<PinnedBucket> pinnedBuckets;
-  // Whether the top-terms shortcut can answer every selected value. It carries
-  // an exact df for the terms it lists and only a bound for the rest, so a pin
-  // it lists is answerable from it and a pin it does not list is what forces
-  // the segments to actually be counted.
-  bool pinsInTopTerms = true;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
   bool inlineAllCandidate = false;
 
@@ -365,19 +361,8 @@ public:
       OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, fieldName);
       pinnedBuckets.reserve(selected.size());
       for (std::string_view key : selected) {
-        pinnedBuckets.push_back({key, lookup.strToOrd(key)});
-      }
-      const auto* topTerms =
-          this->ordMap ? &this->ordMap->topTerms().entries : nullptr;
-      for (const auto& pin : pinnedBuckets) {
-        if (!pin.ord.has_value()) continue;  // absent value counts zero anyway
-        bool listed = false;
-        if (topTerms != nullptr) {
-          for (const auto& entry : *topTerms) {
-            if (entry.ord == *pin.ord) { listed = true; break; }
-          }
-        }
-        if (!listed) { pinsInTopTerms = false; break; }
+        auto stats = lookup.termStats(key);
+        pinnedBuckets.push_back({key, stats.globalOrd, stats.docFreq});
       }
     }
     enableExecutionProfile();
@@ -813,7 +798,7 @@ public:
     void calcOrdMap(int32_t segnum, DocSet* domain,
                     ExecutionProfilePieceState* profile) {
       driver.contribute([&](MergeableStrData& data) {
-        countSegment(data, segnum, domain, profile, thisOp().pinsInTopTerms);
+        countSegment(data, segnum, domain, profile, true);
       });
     }
 
@@ -1331,18 +1316,12 @@ public:
         // what lets everything below take its early exits: the page no longer
         // has to be collected in full just because a value is pinned.
         if (!thisOp().pinnedBuckets.empty() && allTopTerms) {
-          // Answered from global statistics, so a selected value's count is the
-          // df the list carries for it.
-          const auto& entries = thisOp().ordMap->topTerms().entries;
+          // TOP_TERMS only carries the natural page. Selected values use the
+          // exact point stats resolved with their ords, so an unlisted tail
+          // does not disable the whole-index shortcut.
           pinCounts.reserve(thisOp().pinnedBuckets.size());
           for (const auto& pin : thisOp().pinnedBuckets) {
-            int64_t count = 0;
-            if (pin.ord.has_value()) {
-              for (const auto& entry : entries) {
-                if (entry.ord == *pin.ord) { count = entry.df; break; }
-              }
-            }
-            pinCounts.push_back(count);
+            pinCounts.push_back(pin.indexDocFreq);
           }
         } else if (!thisOp().pinnedBuckets.empty()) {
           pinCounts.reserve(thisOp().pinnedBuckets.size());
