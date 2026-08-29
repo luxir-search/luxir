@@ -43,10 +43,13 @@
 //   canonical (the object form).
 // - SortSpec reads `field` as an alias for `expr`, for the common bare-column sort.
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
+// - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
+//   repeated QueryBucket form preserves that object's document order for gRPC parity.
 
 #pragma once
 
 #include <cstring>
+#include <unordered_set>
 
 // NOTE: relies on luxir_types_json.hpp having defined the luxir::api types and included
 // <hpp_proto/json.hpp>; kept as a separate file only so JSON-dialect code has one home.
@@ -257,8 +260,129 @@ struct from<JSON, luxir::api::Domain> {
   }
 };
 
+// ----- QueryFacet: buckets are an ordered JSON object, not a repeated array -----
+template <auto Opts>
+void readQueryFacetBuckets(
+    std::span<const luxir::api::QueryBucket> &value,
+    hpp_proto::concepts::is_non_owning_context auto &ctx,
+    auto &it, auto &end) {
+  namespace api = luxir::api;
+  static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+  std::string_view name;
+  decltype(auto) nameTarget = ::hpp_proto::detail::as_modifiable(ctx, name);
+  decltype(auto) buckets = ::hpp_proto::detail::as_modifiable(ctx, value);
+  std::unordered_set<std::string_view> names;
+  util::scan_object_fields<Opts, true>(
+      ctx, it, end, nameTarget, [](auto &, auto &) {},
+      [&](auto &vit, auto &vend) {
+        if (name.empty()) {
+          ctx.error = error_code::syntax_error;
+          ctx.custom_error_message = "query_facet bucket names must be nonempty";
+          return true;
+        }
+        size_t index = buckets.size();
+        buckets.resize(index + 1);
+        char* stored = (char*)ctx.memory_resource().allocate(name.size(), 1);
+        std::memcpy(stored, name.data(), name.size());
+        buckets[index].name = std::string_view(stored, name.size());
+        if (!names.insert(buckets[index].name).second) {
+          ctx.error = error_code::syntax_error;
+          ctx.custom_error_message = "duplicate query_facet bucket name";
+          return true;
+        }
+        from<JSON, ::hpp_proto::optional_indirect_view<api::Query>>::template op<O>(
+            buckets[index].query, ctx, vit, vend);
+        return bool(ctx.error);
+      },
+      [](auto &, auto &) {});
+  if (!bool(ctx.error) && buckets.empty()) {
+    ctx.error = error_code::syntax_error;
+    ctx.custom_error_message = "query_facet buckets must be nonempty";
+  }
+}
+
+template <>
+struct from<JSON, luxir::api::QueryFacet> {
+  template <auto Opts>
+  static void op(luxir::api::QueryFacet &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    namespace api = luxir::api;
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    bool sawBuckets = false;
+    bool sawOps = false;
+    bool sawSelected = false;
+    bool sawSelectionMode = false;
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "buckets" && !sawBuckets) {
+            sawBuckets = true;
+            readQueryFacetBuckets<O>(value.buckets, ctx, vit, vend);
+          } else if (key == "ops" && !sawOps) {
+            sawOps = true;
+            decltype(auto) ops =
+                ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "selected" && !sawSelected) {
+            sawSelected = true;
+            from<JSON, ::hpp_proto::optional_indirect_view<api::Val>>::template op<O>(
+                value.selected, ctx, vit, vend);
+          } else if (key == "selection_mode" && !sawSelectionMode) {
+            sawSelectionMode = true;
+            util::from_json<O>(value.selection_mode, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+    if (!bool(ctx.error) && !sawBuckets) {
+      ctx.error = error_code::missing_key;
+      ctx.custom_error_message = "query_facet requires buckets";
+    }
+  }
+};
+
+template <>
+struct to<JSON, luxir::api::QueryFacet> {
+  template <auto Opts, class B>
+  static void op(const luxir::api::QueryFacet &value, is_context auto &ctx,
+                 B &b, auto &ix) noexcept {
+    dump<"{\"buckets\":{" >(b, ix);
+    for (size_t i = 0; i < value.buckets.size(); i++) {
+      if (i != 0) dump<','>(b, ix);
+      serialize<JSON>::template op<Opts>(value.buckets[i].name, ctx, b, ix);
+      dump<':'>(b, ix);
+      if (value.buckets[i].query.has_value()) {
+        serialize<JSON>::template op<Opts>(
+            *value.buckets[i].query, ctx, b, ix);
+      } else {
+        dump<"null">(b, ix);
+      }
+    }
+    dump<'}'>(b, ix);
+    if (!value.ops.empty()) {
+      dump<",\"ops\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(value.ops, ctx, b, ix);
+    }
+    if (value.selected.has_value()) {
+      dump<",\"selected\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.selected, ctx, b, ix);
+    }
+    if (value.selection_mode != luxir::api::SelectionMode::ANY) {
+      dump<",\"selection_mode\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(value.selection_mode, ctx, b, ix);
+    }
+    dump<'}'>(b, ix);
+  }
+};
+
 // ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
-static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 6,
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
 struct from<JSON, luxir::api::SearchOp> {
@@ -305,6 +429,8 @@ struct from<JSON, luxir::api::SearchOp> {
             arm(std::in_place_type<api::FieldFacet>);
           } else if (key == "range_facet") {
             arm(std::in_place_type<api::RangeFacet>);
+          } else if (key == "query_facet") {
+            arm(std::in_place_type<api::QueryFacet>);
           } else if (key == "expr_op") {
             arm(std::in_place_type<api::ExprOp>);
           } else {

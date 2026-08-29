@@ -65,7 +65,7 @@ struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct Rescore
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
-struct FieldFacet; struct CalendarGap; struct RangeFacet;
+struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
@@ -402,6 +402,16 @@ struct FieldFacet {
   SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
+struct QueryBucket {
+  std::string_view name;
+  ::hpp_proto::optional_indirect_view<Query> query;
+};
+struct QueryFacet {
+  std::span<const QueryBucket> buckets;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  ::hpp_proto::optional_indirect_view<Val> selected;
+  SelectionMode selection_mode = SelectionMode::ANY;
+};
 struct SearchRequest {                                          // needs Target
   std::string_view request_id;
   std::optional<Target> collection;
@@ -468,8 +478,8 @@ struct RangeFacet {                                             // needs Val,Cal
   SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,ExprOp,Domain
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, ExprOp> kind;
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp> kind;
   std::optional<Domain> domain;
 };
 struct Warning { std::string_view code; std::string_view message; };
@@ -589,6 +599,7 @@ LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(Fuzz
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
 LUXIR_TD(Warning) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
+LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult) LUXIR_TD(Bucket)
 LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(NamedValue) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
@@ -624,7 +635,8 @@ LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXI
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
-LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
+LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
+LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
 LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(Bucket) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
 LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(NamedValue) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)

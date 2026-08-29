@@ -77,6 +77,7 @@ message SearchOp {
     // TODO: hmmm, should different facet types be be encapsulated by a single "Facet" message?
     FieldFacet field_facet = 8;
     RangeFacet range_facet = 9;
+    QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
     // future: something like terms component... stream out all terms of one or more (or all) fields
   }
@@ -541,6 +542,18 @@ message RangeFacet {
   string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only
   Val selected = 11; // generated bucket lower fences
   SelectionMode selection_mode = 12;
+}
+
+message QueryBucket {
+  string name = 1; // output label and selection key, facet-local
+  Query query = 2; // required; the bucket predicate
+}
+
+message QueryFacet {
+  repeated QueryBucket buckets = 1; // response order = request order
+  map<string, SearchOp> ops = 6; // sub-ops per bucket
+  Val selected = 7; // bucket name (string) or array of names
+  SelectionMode selection_mode = 8;
 }
 
 // A "domain" defines a set of documents to do computations over (like facets)

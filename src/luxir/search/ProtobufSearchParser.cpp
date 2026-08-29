@@ -38,12 +38,17 @@ namespace luxir {
 // ~12s of frontend and ~2GB of peak RSS.
 namespace {
 
+struct FacetParsePlan {
+  FacetReq* execution = nullptr;
+  std::span<Query*> bucketQueries;
+  std::span<const size_t> selectedBuckets;
+};
+
 struct SearchParserImpl {
   SearchRequest& req;
   TopDocsReq* firstQuery = nullptr;
   size_t nonDefaultDomainVariants = 0;
-  std::unordered_map<const api::FieldFacet*, FacetReq*> preparedFieldFacets;
-  std::unordered_map<const api::RangeFacet*, FacetReq*> preparedRangeFacets;
+  std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
@@ -368,10 +373,11 @@ public:
       [&](const luxir::api::Fusion& fusion) -> SearchOp* { return parseFusion(name, fusion); },
       [&](const luxir::api::FieldFacet& facetReq) -> SearchOp* {
         FacetReq* facet;
-        auto prepared = preparedFieldFacets.find(&facetReq);
-        if (prepared != preparedFieldFacets.end()) {
-          facet = prepared->second;
-          preparedFieldFacets.erase(prepared);
+        auto prepared = preparedFacets.find(&searchOp);
+        if (prepared != preparedFacets.end()) {
+          facet = prepared->second.execution;
+          assert(facet != nullptr && prepared->second.bucketQueries.empty());
+          preparedFacets.erase(prepared);
         } else {
           facet = createFieldFacetReq(name, facetReq, placement);
         }
@@ -380,15 +386,34 @@ public:
       },
       [&](const luxir::api::RangeFacet& facetReq) -> SearchOp* {
         FacetReq* facet;
-        auto prepared = preparedRangeFacets.find(&facetReq);
-        if (prepared != preparedRangeFacets.end()) {
-          facet = prepared->second;
-          preparedRangeFacets.erase(prepared);
+        auto prepared = preparedFacets.find(&searchOp);
+        if (prepared != preparedFacets.end()) {
+          facet = prepared->second.execution;
+          assert(facet != nullptr && prepared->second.bucketQueries.empty());
+          preparedFacets.erase(prepared);
         } else {
           facet = createRangeFacetReq(name, facetReq, placement);
         }
         addSubs(*facet, facetReq.ops, depth, OpsPlacement::FACET_BUCKET);
         return facet;
+      },
+      [&](const luxir::api::QueryFacet& facetReq) -> SearchOp* {
+        auto prepared = preparedFacets.find(&searchOp);
+        if (prepared != preparedFacets.end()) {
+          assert(prepared->second.execution == nullptr
+                 && !prepared->second.bucketQueries.empty());
+          preparedFacets.erase(prepared);
+        } else {
+          ParseContext parseContext{
+            req.requestPool, *req.schema, req.arena,
+            CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+            name, &req.warnings};
+          ProtobufQueryParser parser(parseContext);
+          FacetParsePlan plan = createQueryFacetPlan(
+              name, facetReq, placement, parser);
+          validateQueryFacetQueries(plan);
+        }
+        throw std::runtime_error("query_facet execution not implemented yet");
       },
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
@@ -950,10 +975,127 @@ public:
         predicates);
   }
 
+  FacetParsePlan createQueryFacetPlan(
+      std::string_view facetName, const api::QueryFacet& facetReq,
+      OpsPlacement placement, ProtobufQueryParser& parser) {
+    validateSelectionEnvelope(facetName, facetReq, placement);
+    if (facetReq.buckets.empty()) {
+      throw std::runtime_error("facet '" + std::string(facetName)
+          + "': query_facet buckets must be nonempty");
+    }
+
+    FacetParsePlan plan;
+    plan.bucketQueries = req.requestPool.make_span<Query*>(
+        facetReq.buckets.size());
+    std::unordered_map<std::string_view, size_t> bucketIndexes;
+    bucketIndexes.reserve(facetReq.buckets.size());
+    for (size_t i = 0; i < facetReq.buckets.size(); i++) {
+      const api::QueryBucket& bucket = facetReq.buckets[i];
+      if (bucket.name.empty()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': query_facet bucket names must be nonempty");
+      }
+      if (!bucketIndexes.emplace(bucket.name, i).second) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': duplicate query_facet bucket name '"
+            + std::string(bucket.name) + "'");
+      }
+      if (!bucket.query.has_value()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': query_facet bucket '" + std::string(bucket.name)
+            + "' requires a query");
+      }
+      try {
+        plan.bucketQueries[i] = parser.parse(*bucket.query);
+      } catch (const std::runtime_error& error) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': query_facet bucket '" + std::string(bucket.name)
+            + "': " + error.what());
+      }
+    }
+
+    std::string valueName = "facet '" + std::string(facetName)
+        + "': selected";
+    ValueSequence selected = facetReq.selected.has_value()
+        ? ValueSequence(*facetReq.selected, valueName,
+                        ValueSequence::NullError::MUST_NOT_BE_NULL)
+        : ValueSequence();
+    if (selected.empty()) return plan;
+
+    auto indexes = req.requestPool.make_span<size_t>(selected.size());
+    std::unordered_set<std::string_view> seen;
+    size_t out = 0;
+    selected.visit([&](const auto& viewed) {
+      for (const auto& value : viewed) {
+        std::string_view selectedName;
+        using Value = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Value, api::Val>) {
+          const auto* text = std::get_if<std::string_view>(&value.kind);
+          if (text == nullptr) {
+            throw std::runtime_error(valueName + " values must be strings");
+          }
+          selectedName = *text;
+        } else if constexpr (std::is_same_v<Value, std::string_view>) {
+          selectedName = value;
+        } else {
+          throw std::runtime_error(valueName + " values must be strings");
+        }
+        auto found = bucketIndexes.find(selectedName);
+        if (found == bucketIndexes.end()) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': selected bucket name '" + std::string(selectedName)
+              + "' does not match any query_facet bucket");
+        }
+        if (!seen.insert(selectedName).second) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': duplicate selected bucket name '"
+              + std::string(selectedName) + "'");
+        }
+        indexes[out++] = found->second;
+      }
+    });
+    plan.selectedBuckets = indexes;
+    return plan;
+  }
+
+  void validateQueryFacetQueries(const FacetParsePlan& plan) {
+    auto* planning = luxir::arenaCreate<Query::PlanningContext>(
+        req.arena, req.requestPool, *req.reader,
+        Query::PlanningContext::Limits{}, &req.warnings,
+        FilterKeyContext{.schemaGen = req.schema->gen_,
+                         .timeZone = req.proto.time_zone},
+        req.filterUses);
+    for (Query* query : plan.bucketQueries) {
+      query->validateLogical(*planning);
+    }
+  }
+
+  void validateUnselectedQueryFacetQueries(
+      OpsMap ops, Query::PlanningContext& planning) {
+    for (const auto& [key, childView] : lastWins(ops)) {
+      unused(key);
+      const api::SearchOp& child = **childView;
+      auto prepared = preparedFacets.find(&child);
+      if (prepared == preparedFacets.end()
+          || prepared->second.bucketQueries.empty()) {
+        continue;
+      }
+      const FacetParsePlan& plan = prepared->second;
+      std::unordered_set<size_t> selected(
+          plan.selectedBuckets.begin(), plan.selectedBuckets.end());
+      for (size_t i = 0; i < plan.bucketQueries.size(); i++) {
+        if (!selected.contains(i)) {
+          plan.bucketQueries[i]->validateLogical(planning);
+        }
+      }
+    }
+  }
+
   std::vector<ParsedFilter> prepareFacetSelections(
       const luxir::api::TopDocs& topDocsReq,
       TopDocsPlacement topDocsPlacement,
-      ParseContext& parseContext) {
+      ParseContext& parseContext,
+      ProtobufQueryParser& parser) {
     auto children = lastWins(topDocsReq.ops);
     std::sort(children.begin(), children.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -963,7 +1105,9 @@ public:
       const api::SearchOp& child = **childView;
       const auto* fieldProto = std::get_if<api::FieldFacet>(&child.kind);
       const auto* rangeProto = std::get_if<api::RangeFacet>(&child.kind);
-      if (fieldProto == nullptr && rangeProto == nullptr) continue;
+      const auto* queryProto = std::get_if<api::QueryFacet>(&child.kind);
+      if (fieldProto == nullptr && rangeProto == nullptr
+          && queryProto == nullptr) continue;
 
       OpsPlacement placement = topDocsPlacement == TopDocsPlacement::FUSION_SOURCE
           ? OpsPlacement::FUSION : OpsPlacement::TOP_DOCS;
@@ -983,7 +1127,11 @@ public:
             fieldProto->field, selected, true);
         FacetReq* facet = createFieldFacetReq(
             key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
-        preparedFieldFacets.emplace(fieldProto, facet);
+        preparedFacets.emplace(
+            &child, FacetParsePlan{
+                .execution = facet,
+                .bucketQueries = {},
+                .selectedBuckets = {}});
 
         Query* predicate;
         if (fieldProto->selection_mode == api::SelectionMode::ANY) {
@@ -1007,30 +1155,58 @@ public:
         continue;
       }
 
-      validateSelectionEnvelope(key, *rangeProto, placement);
-      std::string valueName = "facet '" + std::string(key)
-          + "': selected";
-      ValueSequence selected = rangeProto->selected.has_value()
-          ? ValueSequence(*rangeProto->selected, valueName,
-                          ValueSequence::NullError::MUST_NOT_BE_NULL)
-          : ValueSequence();
-      if (selected.empty()) continue;
-      FacetReq* facet = createRangeFacetReq(
-          key, *rangeProto, OpsPlacement::TOP_DOCS);
-      preparedRangeFacets.emplace(rangeProto, facet);
-      auto& range = static_cast<IntFacetRangeReq&>(*facet);
-      auto indexes = range.selectedBucketIndexes();
-      auto fences = range.bucketFences();
-      auto clauses = req.requestPool.make_span<Query*>(indexes.size());
-      for (size_t i = 0; i < indexes.size(); i++) {
-        size_t bucket = indexes[i];
-        clauses[i] = req.requestPool.make<NumericPredicateQuery>(
-            range.fieldName, fences[bucket], fences[bucket + 1] - 1);
+      if (rangeProto != nullptr) {
+        validateSelectionEnvelope(key, *rangeProto, placement);
+        std::string valueName = "facet '" + std::string(key)
+            + "': selected";
+        ValueSequence selected = rangeProto->selected.has_value()
+            ? ValueSequence(*rangeProto->selected, valueName,
+                            ValueSequence::NullError::MUST_NOT_BE_NULL)
+            : ValueSequence();
+        if (selected.empty()) continue;
+        FacetReq* facet = createRangeFacetReq(
+            key, *rangeProto, OpsPlacement::TOP_DOCS);
+        preparedFacets.emplace(
+            &child, FacetParsePlan{
+                .execution = facet,
+                .bucketQueries = {},
+                .selectedBuckets = {}});
+        auto& range = static_cast<IntFacetRangeReq&>(*facet);
+        auto indexes = range.selectedBucketIndexes();
+        auto fences = range.bucketFences();
+        auto clauses = req.requestPool.make_span<Query*>(indexes.size());
+        for (size_t i = 0; i < indexes.size(); i++) {
+          size_t bucket = indexes[i];
+          clauses[i] = req.requestPool.make<NumericPredicateQuery>(
+              range.fieldName, fences[bucket], fences[bucket + 1] - 1);
+        }
+        Query* predicate = combineSelectionPredicates(
+            clauses, rangeProto->selection_mode);
+        std::span<const std::string_view> exceptOps;
+        if (rangeProto->selection_mode == api::SelectionMode::ANY) {
+          auto except = req.requestPool.make_span<std::string_view>(1);
+          except[0] = key;
+          exceptOps = except;
+        }
+        derived.push_back({predicate, exceptOps});
+        continue;
+      }
+
+      FacetParsePlan plan = createQueryFacetPlan(
+          key, *queryProto, placement, parser);
+      auto [prepared, inserted] = preparedFacets.emplace(&child, plan);
+      assert(inserted);
+      unused(prepared);
+      if (plan.selectedBuckets.empty()) continue;
+      auto clauses = req.requestPool.make_span<Query*>(
+          plan.selectedBuckets.size());
+      for (size_t i = 0; i < clauses.size(); i++) {
+        clauses[i] = plan.bucketQueries[plan.selectedBuckets[i]];
       }
       Query* predicate = combineSelectionPredicates(
-          clauses, rangeProto->selection_mode);
+          clauses, queryProto->selection_mode);
       std::span<const std::string_view> exceptOps;
-      if (rangeProto->selection_mode == api::SelectionMode::ANY) {
+      if (queryProto->selection_mode == api::SelectionMode::ANY) {
         auto except = req.requestPool.make_span<std::string_view>(1);
         except[0] = key;
         exceptOps = except;
@@ -1104,7 +1280,8 @@ public:
         parser, topDocsReq.filter, topDocsReq.ops, false);
     auto filters = appendDerivedFilters(
         explicitFilters,
-        prepareFacetSelections(topDocsReq, placement, parseContext));
+        prepareFacetSelections(
+            topDocsReq, placement, parseContext, parser));
     ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
 
     DomainVariantPlan domainVariants;
@@ -1176,6 +1353,8 @@ public:
         filter.query->validateLogical(*planningContext);
       }
     }
+    validateUnselectedQueryFacetQueries(
+        topDocsReq.ops, *planningContext);
     validateDomainQueries(parsedDomains, *planningContext);
     if (!parsedDomains.empty()) {
       domainVariants.begin(filters.size());
@@ -1618,6 +1797,9 @@ public:
         validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
       } else if (const auto* facet =
                      std::get_if<api::RangeFacet>(&child.kind)) {
+        validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
+      } else if (const auto* facet =
+                     std::get_if<api::QueryFacet>(&child.kind)) {
         validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
       }
     }
