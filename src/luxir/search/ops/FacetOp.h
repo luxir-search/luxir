@@ -319,12 +319,31 @@ public:
           }
         }
       }
+      // Selected values are reconciled against the finished page, and the
+      // count for one the page does not hold is read straight out of the
+      // counter rather than carried through selection.
       std::vector<std::optional<int64_t>> pins;
+      std::vector<PinnedBucketValue<>> pinValues;
       pins.reserve(thisOp().selectedInts.size());
-      for (int64_t selected : thisOp().selectedInts) pins.emplace_back(selected);
+      pinValues.reserve(thisOp().selectedInts.size());
+      for (int64_t selected : thisOp().selectedInts) {
+        pins.emplace_back(selected);
+        int64_t count = 0;
+        if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
+          auto it = countMap->find(selected);
+          if (it != countMap->end()) count = it->second;
+        } else if (auto* countVector =
+                       std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
+          int64_t index = selected - merged.minValue;
+          if (index >= 0 && (size_t)index < countVector->size()) {
+            count = (*countVector)[index];
+          }
+        }
+        pinValues.push_back({count, {}});
+      }
       auto finalized = finalizeCountFieldBuckets(
-          std::move(candidates), std::span<const std::optional<int64_t>>(pins),
-          minCount, 0, limit);
+          std::move(candidates), minCount, 0, limit);
+      mergePinnedBuckets<int64_t, std::monostate>(finalized, pins, pinValues);
       std::vector<std::pair<int64_t, int64_t>> countVec;
       countVec.reserve(finalized.size());
       for (const auto& bucket : finalized) {
@@ -458,13 +477,19 @@ public:
         candidates.push_back({std::move(val), count, {}});
       }
       std::vector<std::optional<std::string>> pins;
+      std::vector<PinnedBucketValue<>> pinValues;
       pins.reserve(thisOp().selectedStrings.size());
+      pinValues.reserve(thisOp().selectedStrings.size());
       for (std::string_view selected : thisOp().selectedStrings) {
         pins.emplace_back(selected);
+        int64_t count = 0;
+        auto it = merged.counts.find(std::string(selected));
+        if (it != merged.counts.end()) count = it->second;
+        pinValues.push_back({count, {}});
       }
       auto finalized = finalizeCountFieldBuckets(
-          std::move(candidates), std::span<const std::optional<std::string>>(pins),
-          minCount, 0, limit);
+          std::move(candidates), minCount, 0, limit);
+      mergePinnedBuckets<std::string, std::monostate>(finalized, pins, pinValues);
       std::vector<std::pair<std::string, int64_t>> countVec;
       countVec.reserve(finalized.size());
       for (auto& bucket : finalized) {

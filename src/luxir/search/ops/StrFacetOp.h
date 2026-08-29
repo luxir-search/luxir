@@ -106,6 +106,11 @@ class StrFacetOp : public FieldFacetReq {
     std::optional<int64_t> ord;
   };
   std::vector<PinnedBucket> pinnedBuckets;
+  // Whether the top-terms shortcut can answer every selected value. It carries
+  // an exact df for the terms it lists and only a bound for the rest, so a pin
+  // it lists is answerable from it and a pin it does not list is what forces
+  // the segments to actually be counted.
+  bool pinsInTopTerms = true;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
   bool inlineAllCandidate = false;
 
@@ -362,6 +367,18 @@ public:
       for (std::string_view key : selected) {
         pinnedBuckets.push_back({key, lookup.strToOrd(key)});
       }
+      const auto* topTerms =
+          this->ordMap ? &this->ordMap->topTerms().entries : nullptr;
+      for (const auto& pin : pinnedBuckets) {
+        if (!pin.ord.has_value()) continue;  // absent value counts zero anyway
+        bool listed = false;
+        if (topTerms != nullptr) {
+          for (const auto& entry : *topTerms) {
+            if (entry.ord == *pin.ord) { listed = true; break; }
+          }
+        }
+        if (!listed) { pinsInTopTerms = false; break; }
+      }
     }
     enableExecutionProfile();
   }
@@ -433,15 +450,13 @@ public:
     }
   }
 
+  // pinCounts carries the count each selected value was found to have, read by
+  // point lookup from the counter while it was still alive (see facetResult).
+  // Selection never sees the pins, so nothing here scales with how many are set.
   std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
       std::vector<std::pair<int64_t, int64_t>>& ordCounts,
-      bool allowZeroPadding) const {
-    std::vector<std::optional<int64_t>> pins;
-    pins.reserve(pinnedBuckets.size());
-    for (const auto& pin : pinnedBuckets) {
-      pins.push_back(pin.ord);
-    }
-
+      bool allowZeroPadding,
+      std::span<const int64_t> pinCounts = {}) const {
     // ordCounts holds one entry per counted ord, which for a high-cardinality
     // field is most of the domain's distinct values. Stream it through the
     // finalizer's bounded heap rather than copying it into a candidate vector
@@ -449,11 +464,11 @@ public:
     // allocate and fill tens of MB per request to return one page.
     FieldBucketFinalizer<int64_t, std::monostate,
                          decltype(countFieldBucketOrder)>
-        finalizer(std::span<const std::optional<int64_t>>(pins),
-                  minCount, 0, limit, countFieldBucketOrder);
-    for (auto [ord, count] : ordCounts) {
-      finalizer.add({ord, count, {}});
-    }
+        finalizer(minCount, 0, limit, countFieldBucketOrder);
+    finalizer.addRange(ordCounts.begin(), ordCounts.end(),
+        [](const std::pair<int64_t, int64_t>& entry) {
+          return FacetCandidate<int64_t>{entry.first, entry.second, {}};
+        });
 
     // Zero-count padding can only be needed when the counted ords do not
     // already fill the page, so sizes decide that before anything is built -
@@ -478,7 +493,19 @@ public:
       }
     }
 
-    return finalizer.finish();
+    auto page = finalizer.finish();
+    if (!pinnedBuckets.empty()) {
+      std::vector<std::optional<int64_t>> pinKeys;
+      std::vector<PinnedBucketValue<>> pinValues;
+      pinKeys.reserve(pinnedBuckets.size());
+      pinValues.reserve(pinnedBuckets.size());
+      for (size_t i = 0; i < pinnedBuckets.size(); i++) {
+        pinKeys.push_back(pinnedBuckets[i].ord);
+        pinValues.push_back({i < pinCounts.size() ? pinCounts[i] : 0, {}});
+      }
+      mergePinnedBuckets<int64_t, std::monostate>(page, pinKeys, pinValues);
+    }
+    return page;
   }
 
   class Calc : public Calculator {
@@ -786,8 +813,7 @@ public:
     void calcOrdMap(int32_t segnum, DocSet* domain,
                     ExecutionProfilePieceState* profile) {
       driver.contribute([&](MergeableStrData& data) {
-        countSegment(data, segnum, domain, profile,
-                     thisOp().pinnedBuckets.empty());
+        countSegment(data, segnum, domain, profile, thisOp().pinsInTopTerms);
       });
     }
 
@@ -1289,6 +1315,8 @@ public:
         missing_count = mergedData->missing_num;
       }
 
+      // Counts for the selected values, filled from the live counter below.
+      std::vector<int64_t> pinCounts;
       bool haveOrdCounts =
           allTopTerms
           || !std::holds_alternative<std::monostate>(mergedData->counts);
@@ -1297,10 +1325,54 @@ public:
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
         auto* vecCounts = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
         auto* spanCounts = std::get_if<SpanCounter>(&mergedData->counts);
+
+        // What each selected value counted, read straight from the counter
+        // before collection folds its overflow and clears those slots. This is
+        // what lets everything below take its early exits: the page no longer
+        // has to be collected in full just because a value is pinned.
+        if (!thisOp().pinnedBuckets.empty() && allTopTerms) {
+          // Answered from global statistics, so a selected value's count is the
+          // df the list carries for it.
+          const auto& entries = thisOp().ordMap->topTerms().entries;
+          pinCounts.reserve(thisOp().pinnedBuckets.size());
+          for (const auto& pin : thisOp().pinnedBuckets) {
+            int64_t count = 0;
+            if (pin.ord.has_value()) {
+              for (const auto& entry : entries) {
+                if (entry.ord == *pin.ord) { count = entry.df; break; }
+              }
+            }
+            pinCounts.push_back(count);
+          }
+        } else if (!thisOp().pinnedBuckets.empty()) {
+          pinCounts.reserve(thisOp().pinnedBuckets.size());
+          for (const auto& pin : thisOp().pinnedBuckets) {
+            int64_t count = 0;
+            if (pin.ord.has_value()) {
+              int64_t ord = *pin.ord;
+              if (mapCounts) {
+                auto it = mapCounts->find(ord);
+                if (it != mapCounts->end()) count = it->second;
+              } else if (vecCounts) {
+                if (ord >= 0 && (size_t)ord < vecCounts->size()) {
+                  count = (*vecCounts)[ord];
+                }
+              } else if (skinnyCounts) {
+                if (ord >= 0 && (size_t)ord < skinnyCounts->max) {
+                  count = skinnyCounts->total(ord);
+                }
+              } else if (spanCounts) {
+                if (ord >= 0 && (size_t)ord < spanCounts->maxOrd) {
+                  count = spanCounts->total(ord);
+                }
+              }
+            }
+            pinCounts.push_back(count);
+          }
+        }
         // Collect nonzero counts first. Explicit mincount=0 pads zero-count
         // buckets after sorting/truncating the competitive nonzero buckets.
-        auto min = thisOp().pinnedBuckets.empty()
-            ? std::max<int64_t>(thisOp().minCount, 1) : 1;
+        auto min = std::max<int64_t>(thisOp().minCount, 1);
 
         if (allTopTerms) {
           assert(thisOp().ordMap != nullptr);
@@ -1335,8 +1407,7 @@ public:
           // counts are enough to fill the limit.
           bool sortingByCountDesc = true;  // FUTURE
 
-          if (thisOp().pinnedBuckets.empty()
-              && sortingByCountDesc && limit != -1
+          if (sortingByCountDesc && limit != -1
               && (int64_t)ordCounts.size() >= limit) {
             // already have enough counts, from overflow, and they are guaranteed to be larger than anything that didn't overflow.
           } else {
@@ -1348,8 +1419,7 @@ public:
             }
           }
         } else if (spanCounts) {
-          collectSparseCounts(*spanCounts, min, limit, ordCounts,
-                              thisOp().pinnedBuckets.empty());
+          collectSparseCounts(*spanCounts, min, limit, ordCounts);
         } else {
           assert(false);
         }
@@ -1385,13 +1455,16 @@ public:
       }
 
       mergedData.reset();
-      finishOrdCounts(std::move(ordCounts), missing_count, haveOrdCounts);
+      finishOrdCounts(std::move(ordCounts), missing_count, haveOrdCounts,
+                      pinCounts);
     }
 
     void finishOrdCounts(
         std::vector<std::pair<int64_t, int64_t>> ordCounts,
-        int64_t missingCount, bool allowZeroPadding = true) {
-      auto finalized = thisOp().finalizeOrdCounts(ordCounts, allowZeroPadding);
+        int64_t missingCount, bool allowZeroPadding = true,
+        std::span<const int64_t> pinCounts = {}) {
+      auto finalized = thisOp().finalizeOrdCounts(ordCounts, allowZeroPadding,
+                                                  pinCounts);
 
       std::vector<std::pair<std::string, int64_t>> countVec;
       std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
@@ -1492,22 +1565,43 @@ public:
         return reversed ? cmp > 0 : cmp < 0;
       };
 
-      std::vector<std::optional<int64_t>> pins;
-      pins.reserve(thisOp().pinnedBuckets.size());
-      for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
       FieldBucketFinalizer<int64_t, InlinePayload, decltype(better)> finalizer(
-          std::span<const std::optional<int64_t>>(pins),
           minCount, 0, limit, better);
+
+      // A selected value's metrics live in the entry the one enumeration below
+      // already visits, and its finalized slot is that enumeration's index, so
+      // both are captured in passing. A facet with nothing selected never
+      // enters the branch.
+      boost::unordered_flat_map<int64_t, size_t> pinByOrd;
+      std::vector<std::optional<int64_t>> pinKeys;
+      std::vector<PinnedBucketValue<InlinePayload>> pinValues(
+          thisOp().pinnedBuckets.size());
+      pinKeys.reserve(thisOp().pinnedBuckets.size());
+      for (size_t i = 0; i < thisOp().pinnedBuckets.size(); i++) {
+        const auto& pin = thisOp().pinnedBuckets[i];
+        pinKeys.push_back(pin.ord);
+        if (pin.ord.has_value()) pinByOrd.emplace(*pin.ord, i);
+      }
+      const bool capturePins = !pinByOrd.empty();
+
       size_t finalizedSlot = 0;
       if (finalizer.needsCandidates()) {
         counts.forEachEntry([&](int64_t key, char* entry) {
-          finalizer.add({key, loadUnaligned<int64_t>(entry),
-                         {entry, finalizedSlot}});
+          int64_t count = loadUnaligned<int64_t>(entry);
+          finalizer.add({key, count, {entry, finalizedSlot}});
+          if (capturePins) {
+            auto pin = pinByOrd.find(key);
+            if (pin != pinByOrd.end()) {
+              pinValues[pin->second] =
+                  {count, InlinePayload{entry, finalizedSlot}};
+            }
+          }
           finalizedSlot++;
         });
         assert(finalizedSlot == counts.size());
       }
       auto finalized = finalizer.finish();
+      mergePinnedBuckets<int64_t, InlinePayload>(finalized, pinKeys, pinValues);
 
       // Term text for the buckets that survived selection, and only those -
       // ordToStr seeks the dictionary once per bucket instead of once per

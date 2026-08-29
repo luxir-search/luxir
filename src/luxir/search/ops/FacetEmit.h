@@ -20,7 +20,10 @@ template<typename Key, typename Payload = std::monostate>
 struct FacetCandidate {
   Key key;
   int64_t count;
-  Payload payload;
+  // A count-only facet carries no payload, and the empty member must not cost
+  // it anything: with monostate padded to a member the candidate is 24 bytes,
+  // which makes every `regular.size()` in the selection loop a division.
+  [[no_unique_address]] Payload payload;
 };
 
 template<typename Key, typename Payload = std::monostate>
@@ -35,13 +38,15 @@ struct FinalizedFacetBucket {
   }
 };
 
+// Bounded selection of a facet's ordinary page. The finalizer knows nothing
+// about selected values: it sees every counted key exactly once and spends one
+// comparison on it. Pins are reconciled against the finished page by
+// mergePinnedBuckets below, which costs the caller nothing when none are set.
 template<typename Key, typename Payload, typename Better>
 class FieldBucketFinalizer {
   using Candidate = FacetCandidate<Key, Payload>;
   using Final = FinalizedFacetBucket<Key, Payload>;
 
-  std::vector<Final> pins;
-  boost::unordered_flat_map<Key, size_t> pinByKey;
   std::vector<Candidate> regular;
   [[no_unique_address]] Better better;
   int64_t minCount;
@@ -49,34 +54,12 @@ class FieldBucketFinalizer {
   size_t retain;
   bool bounded;
 
-  void preservePin(Candidate candidate) {
-    // Every key the page rejects lands here, so a facet with nothing selected
-    // must not pay a hash lookup per key to learn there is no pin to preserve.
-    if (pinByKey.empty()) return;
-    auto pin = pinByKey.find(candidate.key);
-    if (pin == pinByKey.end()) return;
-    Final& selected = pins[pin->second];
-    selected.count = candidate.count;
-    selected.payload = std::move(candidate.payload);
-  }
-
 public:
-  // Pins compete in the ordinary page. A pin that mincount or the bounded heap
-  // rejects is preserved with its exact payload so finish() can append it.
-  // Callers need not materialize every candidate.
-  FieldBucketFinalizer(std::span<const std::optional<Key>> requestedPins,
-      int64_t minCount, int64_t offset, int64_t limit, Better better) :
+  FieldBucketFinalizer(int64_t minCount, int64_t offset, int64_t limit,
+                       Better better) :
       better(std::move(better)), minCount(minCount),
       offset(offset < 0 ? 0 : (size_t)offset), retain(0),
       bounded(limit >= 0) {
-    pins.reserve(requestedPins.size());
-    pinByKey.reserve(requestedPins.size());
-    for (size_t i = 0; i < requestedPins.size(); i++) {
-      pins.push_back({.key = requestedPins[i], .pinIndex = i});
-      if (requestedPins[i].has_value()) {
-        pinByKey.emplace(*requestedPins[i], i);
-      }
-    }
     if (bounded) {
       uint64_t requested = (uint64_t)this->offset + (uint64_t)limit;
       retain = requested > std::numeric_limits<size_t>::max()
@@ -86,10 +69,7 @@ public:
   }
 
   void add(Candidate candidate) {
-    if (minCount != -1 && candidate.count < minCount) {
-      preservePin(std::move(candidate));
-      return;
-    }
+    if (minCount != -1 && candidate.count < minCount) return;
     if (!bounded) {
       regular.push_back(std::move(candidate));
     } else if (regular.size() < retain) {
@@ -97,59 +77,105 @@ public:
       std::push_heap(regular.begin(), regular.end(), better);
     } else if (retain != 0 && better(candidate, regular.front())) {
       std::pop_heap(regular.begin(), regular.end(), better);
-      preservePin(std::move(regular.back()));
       regular.back() = std::move(candidate);
       std::push_heap(regular.begin(), regular.end(), better);
-    } else {
-      preservePin(std::move(candidate));
+    }
+  }
+
+  // Selection over a whole range, for a caller that produces its candidates one
+  // at a time. mincount and the retained page size are fixed for the request,
+  // but a per-candidate add() cannot hold them in registers - push_heap writes
+  // through the same vector those members sit beside, so each key reloads them.
+  template<typename It, typename ToCandidate>
+  void addRange(It first, It last, ToCandidate toCandidate) {
+    const int64_t min = minCount;
+    const size_t keep = retain;
+    if (!bounded || keep == 0) {
+      for (It it = first; it != last; ++it) add(toCandidate(*it));
+      return;
+    }
+    for (It it = first; it != last; ++it) {
+      Candidate candidate = toCandidate(*it);
+      if (min != -1 && candidate.count < min) continue;
+      if (regular.size() < keep) {
+        regular.push_back(candidate);
+        std::push_heap(regular.begin(), regular.end(), better);
+      } else if (better(candidate, regular.front())) {
+        std::pop_heap(regular.begin(), regular.end(), better);
+        regular.back() = candidate;
+        std::push_heap(regular.begin(), regular.end(), better);
+      }
     }
   }
 
   bool needsCandidates() const {
-    return !pinByKey.empty() || !bounded || retain != 0;
+    return !bounded || retain != 0;
   }
 
   std::vector<Final> finish() {
     std::sort(regular.begin(), regular.end(), better);
     size_t begin = std::min(offset, regular.size());
-    for (size_t i = 0; i < begin; i++) {
-      preservePin(std::move(regular[i]));
-    }
-
-    std::vector<uint8_t> coveredPins(pins.size());
     std::vector<Final> out;
-    out.reserve(regular.size() - begin + pins.size());
+    out.reserve(regular.size() - begin);
     for (size_t i = begin; i < regular.size(); i++) {
       auto& bucket = regular[i];
-      size_t pinIndex = std::numeric_limits<size_t>::max();
-      if (!pinByKey.empty()) {
-        auto pin = pinByKey.find(bucket.key);
-        if (pin != pinByKey.end()) {
-          pinIndex = pin->second;
-          coveredPins[pinIndex] = 1;
-        }
-      }
       out.push_back({
           .key = std::move(bucket.key),
           .count = bucket.count,
           .payload = std::move(bucket.payload),
-          .pinIndex = pinIndex,
       });
-    }
-    for (size_t i = 0; i < pins.size(); i++) {
-      if (coveredPins[i] == 0) out.push_back(std::move(pins[i]));
     }
     return out;
   }
 };
 
+// What a selected value is worth once the page is known: the count (and
+// payload) the caller recovered for it by point lookup, for the pins the page
+// does not already hold.
+template<typename Payload = std::monostate>
+struct PinnedBucketValue {
+  int64_t count = 0;
+  std::optional<Payload> payload;
+};
+
+// Selected values merge into the natural page: one the page already holds is
+// marked in place, one it does not hold is appended with the value looked up
+// for it. The page is at most `limit` buckets and pins are few, so this is a
+// scan over the result rather than anything the selection loop has to carry.
+template<typename Key, typename Payload>
+void mergePinnedBuckets(
+    std::vector<FinalizedFacetBucket<Key, Payload>>& page,
+    std::span<const std::optional<Key>> pinKeys,
+    std::span<const PinnedBucketValue<Payload>> pinValues) {
+  if (pinKeys.empty()) return;
+  assert(pinKeys.size() == pinValues.size());
+  for (size_t i = 0; i < pinKeys.size(); i++) {
+    bool covered = false;
+    if (pinKeys[i].has_value()) {
+      for (auto& bucket : page) {
+        if (bucket.key.has_value() && *bucket.key == *pinKeys[i]) {
+          bucket.pinIndex = i;
+          covered = true;
+          break;
+        }
+      }
+    }
+    if (covered) continue;
+    page.push_back({
+        .key = pinKeys[i],
+        .count = pinValues[i].count,
+        .payload = pinValues[i].payload,
+        .pinIndex = i,
+    });
+  }
+}
+
 template<typename Key, typename Payload, typename Better>
 std::vector<FinalizedFacetBucket<Key, Payload>> finalizeFieldBuckets(
     std::vector<FacetCandidate<Key, Payload>> candidates,
-    std::span<const std::optional<Key>> pins,
     int64_t minCount, int64_t offset, int64_t limit, Better better) {
   FieldBucketFinalizer<Key, Payload, Better> finalizer(
-      pins, minCount, offset, limit, std::move(better));
+      minCount, offset, limit, std::move(better));
   for (auto& candidate : candidates) finalizer.add(std::move(candidate));
   return finalizer.finish();
 }
@@ -166,11 +192,9 @@ inline constexpr auto countFieldBucketOrder =
 template<typename Key, typename Payload = std::monostate>
 std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
     std::vector<FacetCandidate<Key, Payload>> candidates,
-    std::span<const std::optional<Key>> pins,
     int64_t minCount, int64_t offset, int64_t limit) {
   return finalizeFieldBuckets(
-      std::move(candidates), pins, minCount, offset, limit,
-      countFieldBucketOrder);
+      std::move(candidates), minCount, offset, limit, countFieldBucketOrder);
 }
 
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING

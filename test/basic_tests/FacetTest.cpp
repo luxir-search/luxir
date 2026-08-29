@@ -4659,10 +4659,16 @@ TEST_F(FacetTest, selectedFieldPinsMergeWithOffsetPages) {
         {"gamma", 2, {}}, {"delta", 1, {}}};
     std::array<std::optional<std::string>, 1> pins{
         std::string(selected)};
+    // What a caller recovers by point lookup for a pin the page may not hold.
+    std::array<PinnedBucketValue<>, 1> pinValues{};
+    for (const auto& candidate : candidates) {
+      if (candidate.key == selected) pinValues[0] = {candidate.count, {}};
+    }
     auto finalized = finalizeCountFieldBuckets(
-        std::move(candidates),
-        std::span<const std::optional<std::string>>(pins),
-        1, offset, limit);
+        std::move(candidates), 1, offset, limit);
+    mergePinnedBuckets<std::string, std::monostate>(
+        finalized, std::span<const std::optional<std::string>>(pins),
+        std::span<const PinnedBucketValue<>>(pinValues));
     std::vector<std::pair<std::string, int64_t>> rows;
     for (auto& bucket : finalized) {
       rows.emplace_back(std::move(*bucket.key), bucket.count);

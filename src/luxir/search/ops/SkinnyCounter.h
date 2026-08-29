@@ -39,6 +39,17 @@ public:
     }
   }
 
+  /// Count for one key, without enumerating. Selected facet values are
+  /// recovered this way, so that pinning a value costs a lookup per pin
+  /// instead of forcing the whole counter to be enumerated.
+  ValType total(KeyType key) const {
+    assert(key >= 0 && (size_t)key < max);
+    ValType t = (ValType)counts[key];
+    auto it = overflow.find(key);
+    if (it != overflow.end()) t += it->second;
+    return t;
+  }
+
   /// Merge another SkinnyCounter into this one.  They must have the same "max".
   void LUXIR_NOINLINE merge(const SkinnyCounter& other) {
     assert(other.max == max);
