@@ -42,6 +42,7 @@ struct FacetParsePlan {
   FacetReq* execution = nullptr;
   std::span<Query*> bucketQueries;
   std::span<const size_t> selectedBuckets;
+  Query::PlanningContext* planning = nullptr;
 };
 
 struct SearchParserImpl {
@@ -398,10 +399,12 @@ public:
         return facet;
       },
       [&](const luxir::api::QueryFacet& facetReq) -> SearchOp* {
+        FacetParsePlan plan;
         auto prepared = preparedFacets.find(&searchOp);
         if (prepared != preparedFacets.end()) {
           assert(prepared->second.execution == nullptr
                  && !prepared->second.bucketQueries.empty());
+          plan = prepared->second;
           preparedFacets.erase(prepared);
         } else {
           ParseContext parseContext{
@@ -409,11 +412,13 @@ public:
             CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
             name, &req.warnings};
           ProtobufQueryParser parser(parseContext);
-          FacetParsePlan plan = createQueryFacetPlan(
+          plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
           validateQueryFacetQueries(plan);
         }
-        throw std::runtime_error("query_facet execution not implemented yet");
+        FacetReq* facet = createQueryFacetReq(name, facetReq, plan);
+        addSubs(*facet, facetReq.ops, depth, OpsPlacement::FACET_BUCKET);
+        return facet;
       },
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
@@ -1058,15 +1063,15 @@ public:
     return plan;
   }
 
-  void validateQueryFacetQueries(const FacetParsePlan& plan) {
-    auto* planning = luxir::arenaCreate<Query::PlanningContext>(
+  void validateQueryFacetQueries(FacetParsePlan& plan) {
+    plan.planning = luxir::arenaCreate<Query::PlanningContext>(
         req.arena, req.requestPool, *req.reader,
         Query::PlanningContext::Limits{}, &req.warnings,
         FilterKeyContext{.schemaGen = req.schema->gen_,
                          .timeZone = req.proto.time_zone},
         req.filterUses);
     for (Query* query : plan.bucketQueries) {
-      query->validateLogical(*planning);
+      query->validateLogical(*plan.planning);
     }
   }
 
@@ -1080,7 +1085,8 @@ public:
           || prepared->second.bucketQueries.empty()) {
         continue;
       }
-      const FacetParsePlan& plan = prepared->second;
+      FacetParsePlan& plan = prepared->second;
+      plan.planning = &planning;
       std::unordered_set<size_t> selected(
           plan.selectedBuckets.begin(), plan.selectedBuckets.end());
       for (size_t i = 0; i < plan.bucketQueries.size(); i++) {
@@ -1089,6 +1095,26 @@ public:
         }
       }
     }
+  }
+
+  FacetReq* createQueryFacetReq(
+      std::string_view facetName, const api::QueryFacet& facetReq,
+      const FacetParsePlan& plan) {
+    assert(plan.planning != nullptr);
+    Query::Context* context = Query::Context::create(
+        &req.arena, *plan.planning);
+    auto weights = req.requestPool.make_span<Query::Weight*>(
+        plan.bucketQueries.size());
+    for (size_t i = 0; i < weights.size(); i++) {
+      weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
+      if (weights[i]->needsPrepare()) {
+        throw std::runtime_error(
+            "facet '" + std::string(facetName)
+            + "': query_facet buckets with prepared queries not implemented yet");
+      }
+    }
+    return luxir::arenaCreate<QueryFacetReq>(
+        req.arena, req, facetReq, facetName, plan.bucketQueries, weights);
   }
 
   std::vector<ParsedFilter> prepareFacetSelections(

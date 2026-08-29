@@ -32,6 +32,7 @@ using ReqTopDocs = luxir::api::TopDocs;
 using ReqFusion = luxir::api::Fusion;
 using ReqFieldFacet = luxir::api::FieldFacet;
 using ReqRangeFacet = luxir::api::RangeFacet;
+using ReqQueryFacet = luxir::api::QueryFacet;
 using ReqSortList = std::span<const luxir::api::SortSpec>;
 
 struct CollectionRequirements {
