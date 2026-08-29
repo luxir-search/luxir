@@ -49,7 +49,7 @@ inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
     "rescore",        // RescoreQuery
     "wildcard",       // WildcardQuery
     "regex",          // RegexQuery
-    "in",             // InQuery - structured-only (repeated Val input)
+    "any_of",         // AnyOfQuery - structured-only (Val sequence input)
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");

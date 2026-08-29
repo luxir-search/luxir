@@ -23,7 +23,7 @@ public:
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
-    out.appendTag(FilterKeyTag::IN);
+    out.appendTag(FilterKeyTag::ANY_OF);
     out.appendString(field);
     out.appendSize(terms.size());
     for (std::string_view term : terms) out.appendTerm(term);

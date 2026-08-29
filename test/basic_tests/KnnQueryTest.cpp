@@ -541,8 +541,9 @@ TEST_F(KnnQueryTest, selectedFacetComposesWithDomainSensitiveMain) {
   top.rawQuery() = qb::knn(top.mr(), "embedding_v", {1, 0, 0}, 2);
   auto& facet = top.facet("brands", "brand_s").limit(-1);
   auto& rawFacet = std::get<api::FieldFacet>(facet.rawOp().kind);
-  auto* selected = build::allocArray(rawFacet.selected, 1, facet.mr());
-  selected[0].kind = build::arenaStr(facet.mr(), "acme");
+  auto* selected = build::allocMessage<api::Val>(facet.mr());
+  selected->kind = build::arenaStr(facet.mr(), "acme");
+  rawFacet.selected = selected;
   request->execute();
   ASSERT_TRUE(request->ok()) << request->errorMsg();
   EXPECT_EQ(2, request->getMatchCount());

@@ -7,11 +7,13 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "luxir/analysis/Analyzer.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/AutomatonQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
@@ -19,18 +21,70 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
-#include "luxir/query/StringColumnInSetQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermRangeQuery.h"
+#include "luxir/query/ValueSequence.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/Clock.h"
+#include "luxir/util/DateTime.h"
+#include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 #include "luxir/util/automaton/RegExpParser.h"
 
 namespace luxir {
+
+// Pool-backed, sorted, unique field-native values. Canonicalization is kept
+// separate from query shape selection so facet pins and their derived filter
+// can consume the same bytes instead of independently reproducing the rules.
+class CanonicalValueSet {
+  friend class QueryBuilder;
+
+  using Terms = std::span<const std::string_view>;
+  using Numerics = std::span<const int64_t>;
+  std::string_view field;
+  std::variant<std::monostate, Terms, Numerics> values;
+
+  explicit CanonicalValueSet(std::string_view field) : field(field) {}
+  CanonicalValueSet(std::string_view field, Terms terms)
+      : field(field), values(terms) {}
+  CanonicalValueSet(std::string_view field, Numerics numerics)
+      : field(field), values(numerics) {}
+
+public:
+  CanonicalValueSet() = default;
+
+  bool empty() const {
+    return std::visit([](const auto& viewed) -> bool {
+      using Viewed = std::decay_t<decltype(viewed)>;
+      if constexpr (std::is_same_v<Viewed, std::monostate>) return true;
+      else return viewed.empty();
+    }, values);
+  }
+
+  size_t size() const {
+    return std::visit([](const auto& viewed) -> size_t {
+      using Viewed = std::decay_t<decltype(viewed)>;
+      if constexpr (std::is_same_v<Viewed, std::monostate>) return 0;
+      else return viewed.size();
+    }, values);
+  }
+
+  bool termBacked() const { return std::holds_alternative<Terms>(values); }
+  bool numeric() const { return std::holds_alternative<Numerics>(values); }
+
+  Terms terms() const { return std::get<Terms>(values); }
+  Numerics numerics() const { return std::get<Numerics>(values); }
+
+  CanonicalValueSet element(size_t index) const {
+    if (termBacked()) {
+      return CanonicalValueSet(field, terms().subspan(index, 1));
+    }
+    return CanonicalValueSet(field, numerics().subspan(index, 1));
+  }
+};
 
 // Builds Query objects from primitives. Independent of JSON / Protobuf so both
 // can use it.
@@ -116,6 +170,58 @@ public:
 
 private:
 
+  template<typename T>
+  int64_t coerceAnyOfNumeric(FieldType& fieldType, std::string_view field,
+                             const T& value) {
+    if constexpr (std::is_same_v<T, api::Val>) {
+      return fieldType.coerceColInt64(value, field, coerceContext);
+    } else {
+      switch (fieldType.type()) {
+        case FieldType::Type::INT:
+          return coerce::toInt64Scalar(value, field);
+        case FieldType::Type::FLOAT:
+          return (int64_t)floatToSortableInt32(
+              coerce::toFloatScalar(value, field));
+        case FieldType::Type::DOUBLE:
+          return doubleToSortableInt64(
+              coerce::toDoubleScalar(value, field));
+        case FieldType::Type::DATE:
+          if constexpr (std::is_same_v<T, int64_t>) {
+            return value;
+          } else if constexpr (std::is_same_v<T, std::string_view>) {
+            int64_t now = coerceContext.dateMathNowEpochMillis.value_or(
+                currentEpochMillis());
+            if (auto millis = parseDateToEpochMillis(
+                    value, now, coerceContext.timeZone)) {
+              return *millis;
+            }
+            throw std::runtime_error(std::format(
+                "DATE field '{}': cannot parse '{}' as a date "
+                "(expected ISO-8601, epoch millis, or date math)",
+                field, value));
+          } else {
+            api::Val scalar = coerce::scalarVal(value);
+            coerce::throwCoerce(field, scalar, "a date");
+          }
+        default:
+          break;
+      }
+      api::Val scalar = coerce::scalarVal(value);
+      return fieldType.coerceColInt64(scalar, field, coerceContext);
+    }
+  }
+
+  template<typename T>
+  std::string_view coerceAnyOfTerm(FieldType& fieldType,
+                                   std::string_view field, const T& value,
+                                   std::span<char> buf) {
+    if constexpr (std::is_same_v<T, api::Val>) {
+      return fieldType.coerceTerm(value, field, buf);
+    } else {
+      return coerce::toTextScalar(value, field, buf);
+    }
+  }
+
   // Resolve a field to its TextFieldType, throwing if it is not a text field:
   // phrase / analyzed queries only make sense over analyzed text.
   TextFieldType& textFieldType(std::string_view field) {
@@ -165,6 +271,14 @@ private:
     char* dst = pool.alloc(term.size());
     std::memcpy(dst, term.data(), term.size());
     return {dst, term.size()};
+  }
+
+  std::string_view normalizeMultiterm(TokenChain& chain,
+                                      std::string_view text) {
+    std::string norm(text);
+    chain.normalizeTerm(norm);
+    if (norm == text) return text;
+    return copyTerm(norm);
   }
 
   // Collapse a term list into the right query type:
@@ -251,74 +365,98 @@ public:
     return pool.make<ExistsQuery>(field);
   }
 
-  Query* createInQuery(std::string_view field,
-                       std::span<const luxir::api::Val> values) {
+  CanonicalValueSet canonicalizeFieldValues(
+      std::string_view field, ValueSequence values,
+      std::string_view valueName = "AnyOfQuery values",
+      ValueSequence::NullError nullError =
+          ValueSequence::NullError::SCALAR_REQUIRED) {
+    values.validate(valueName, nullError);
     if (values.empty()) {
-      throw std::runtime_error(std::format(
-          "In query field '{}' requires at least one value", field));
+      return CanonicalValueSet(field);
     }
 
     FieldType& fieldType = *schema.getFieldTypeEx(field);
     if (isNumericColumnType(fieldType.type())) {
-      if (!fieldType.hasColumn()) {
-        throw std::runtime_error(std::format(
-            "In query field '{}' does not support exact equality through an index or column",
-            field));
-      }
       std::vector<int64_t> encoded;
       encoded.reserve(values.size());
-      for (const api::Val& value : values) {
-        encoded.push_back(fieldType.coerceColInt64(
-            value, field, coerceContext));
-      }
+      values.visit([&](const auto& viewed) {
+        for (const auto& value : viewed) {
+          encoded.push_back(coerceAnyOfNumeric(fieldType, field, value));
+        }
+      });
       std::sort(encoded.begin(), encoded.end());
-      if (std::adjacent_find(encoded.begin(), encoded.end()) != encoded.end()) {
-        throw std::runtime_error(std::format(
-            "In query field '{}' has duplicate values after coercion", field));
-      }
-      if (encoded.size() == 1) {
-        return pool.make<NumericRangeQuery>(field, encoded[0], encoded[0]);
-      }
+      encoded.erase(std::unique(encoded.begin(), encoded.end()), encoded.end());
       auto stored = pool.copy_span(std::span<int64_t>(encoded));
-      return pool.make<NumericRangeQuery>(
+      return CanonicalValueSet(
           field, std::span<const int64_t>(stored));
     }
 
     bool termBacked = fieldType.type() == FieldType::Type::TEXT
         || fieldType.type() == FieldType::Type::STRING
         || fieldType.type() == FieldType::Type::ID;
-    bool rawStringColumn = fieldType.type() == FieldType::Type::STRING
-        && !fieldType.indexed() && fieldType.hasColumn();
-    if (!termBacked || (!fieldType.indexed() && !rawStringColumn)) {
+    if (!termBacked) {
       throw std::runtime_error(std::format(
-          "In query field '{}' does not support exact equality through an index or column",
+          "Field '{}' does not support exact value canonicalization",
           field));
     }
 
+    std::unique_ptr<TokenChain> normalizer;
+    if (fieldType.type() == FieldType::Type::TEXT) {
+      normalizer = ((TextFieldType&)fieldType).createAnalyzer(field);
+    }
     std::vector<std::string_view> terms;
     terms.reserve(values.size());
-    for (const api::Val& value : values) {
-      char buf[coerce::TEXT_BUF_SIZE];
-      std::string_view term = fieldType.coerceTerm(value, field, buf);
-      if (rawStringColumn) {
-        if (term.data() == buf) term = poolCopy(term);
-      } else {
+    values.visit([&](const auto& viewed) {
+      for (const auto& value : viewed) {
+        char buf[coerce::TEXT_BUF_SIZE];
+        std::string_view term = coerceAnyOfTerm(fieldType, field, value, buf);
+        if (normalizer != nullptr) {
+          term = normalizeMultiterm(*normalizer, term);
+        }
         term = PackedTerm::truncate(term);
-        if (term.data() == buf) term = copyTerm(term);
+        if (term.data() == buf) term = poolCopy(term);
+        terms.push_back(term);
       }
-      terms.push_back(term);
-    }
+    });
     std::sort(terms.begin(), terms.end());
-    if (std::adjacent_find(terms.begin(), terms.end()) != terms.end()) {
-      throw std::runtime_error(std::format(
-          "In query field '{}' has duplicate values after coercion", field));
-    }
+    terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
     auto stored = pool.copy_span(std::span<std::string_view>(terms));
-    std::span<const std::string_view> selected(stored);
-    if (rawStringColumn) {
-      return pool.make<StringColumnInSetQuery>(field, selected);
+    return CanonicalValueSet(
+        field, std::span<const std::string_view>(stored));
+  }
+
+  Query* createAnyOfQuery(const CanonicalValueSet& values) {
+    if (values.empty()) return matchNoDocs();
+
+    std::string_view field = values.field;
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (values.numeric()) {
+      if (!isNumericColumnType(fieldType.type()) || !fieldType.hasColumn()) {
+        throw std::runtime_error(std::format(
+            "AnyOf query field '{}' does not support exact equality through an index or column",
+            field));
+      }
+      auto encoded = values.numerics();
+      if (encoded.size() == 1) {
+        return pool.make<NumericRangeQuery>(field, encoded[0], encoded[0]);
+      }
+      return pool.make<NumericRangeQuery>(field, encoded);
     }
-    return pool.make<TermInSetQuery>(field, selected);
+
+    bool termBacked = fieldType.type() == FieldType::Type::TEXT
+        || fieldType.type() == FieldType::Type::STRING
+        || fieldType.type() == FieldType::Type::ID;
+    if (!values.termBacked() || !termBacked || !fieldType.indexed()) {
+      throw std::runtime_error(std::format(
+          "AnyOf query field '{}' does not support exact equality through an index or column",
+          field));
+    }
+    auto terms = values.terms();
+    if (terms.size() == 1) {
+      Query* term = pool.make<TermQuery>(field, terms[0]);
+      return pool.make<ConstantScoreQuery>(term);
+    }
+    return pool.make<TermInSetQuery>(field, terms);
   }
 
   // Normalize multiterm query input (a prefix or fuzzy term) for a TEXT
@@ -330,10 +468,7 @@ public:
   std::string_view normalizeMultiterm(TextFieldType& fieldType, std::string_view field,
                                       std::string_view text) {
     auto chain = fieldType.createAnalyzer(field);
-    std::string norm(text);
-    chain->normalizeTerm(norm);
-    if (norm == text) return text;
-    return copyTerm(norm);
+    return normalizeMultiterm(*chain, text);
   }
 
   // Build a prefix query over term-backed fields. The prefix is normalized

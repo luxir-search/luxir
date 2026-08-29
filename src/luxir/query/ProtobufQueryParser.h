@@ -44,7 +44,7 @@ class ProtobufQueryParser {
   Schema& schema;     // = context.schema
 
   Query* parseMatch(const luxir::api::Match& matchQuery);
-  Query* parseIn(const luxir::api::InQuery& inQuery);
+  Query* parseAnyOf(const luxir::api::AnyOfQuery& anyOfQuery);
 
   // Copy a repeated string field into a pool-allocated MUTABLE span of
   // string_views (createPhraseFromTerms rewrites entries in place).  The source

@@ -119,6 +119,24 @@ TEST_F(ExecutionHierarchyTest, constantScorePlanRetainsChildPlan) {
   EXPECT_FLOAT_EQ(4.0f, scorer->score());
 }
 
+TEST_F(ExecutionHierarchyTest, constantScoreTermPreservesDocsOnlyAccess) {
+  TermQuery term("body_w", "rare");
+  ConstantScoreQuery query(&term);
+  Query::Context context(pool, *reader);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+
+  Query::PlanContext planContext = Query::PlanContext::fromLeadCost(
+      1, Query::ExecutionUse::COUNT_WINDOWS);
+  EXPECT_EQ(Query::DocsOnlyAccess::SUPPORTED,
+            supplier->describeScorer(planContext).docsOnly);
+  auto* plan = supplier->resolve(pool, planContext);
+  auto* docs = plan->buildDocsOnly(pool);
+  ASSERT_NE(nullptr, docs);
+  EXPECT_EQ(0, docs->nextDoc());
+}
+
 TEST_F(ExecutionHierarchyTest, boostIsPlanTransparentAndNoDocsHasNoSupplier) {
   TermQuery term("body_w", "rare");
   BoostQuery boost(&term, 2.0f);

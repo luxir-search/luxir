@@ -84,11 +84,14 @@ std::vector<std::pair<std::string, int64_t>> stringFacetRows(
 void setSelected(OpCursor& cursor, std::span<const std::string> values,
                  api::SelectionMode mode = api::SelectionMode::ANY) {
   auto& facet = std::get<api::FieldFacet>(cursor.rawOp().kind);
+  auto* sequence = api::build::allocMessage<api::Val>(cursor.mr());
+  auto& strings = sequence->kind.emplace<api::ArrStr>();
   auto* selected = api::build::allocArray(
-      facet.selected, values.size(), cursor.mr());
+      strings.v, values.size(), cursor.mr());
   for (size_t i = 0; i < values.size(); i++) {
-    selected[i].kind = api::build::arenaStr(cursor.mr(), values[i]);
+    selected[i] = api::build::arenaStr(cursor.mr(), values[i]);
   }
+  facet.selected = sequence;
   facet.selection_mode = mode;
 }
 
@@ -4725,9 +4728,9 @@ TEST_F(FacetTest, selectedIntFieldPinsShareFieldFinalization) {
   EXPECT_EQ(1, req->getMatchCount());
   const auto& result = topFacetResult(*req, "q", "codes");
   const auto& ids = std::get<api::ColInt>(result.bucket_ids->kind).v;
-  EXPECT_EQ((std::vector<int64_t>{99, 2, 1}),
+  EXPECT_EQ((std::vector<int64_t>{2, 99, 1}),
             (std::vector<int64_t>(ids.begin(), ids.end())));
-  EXPECT_EQ((std::vector<int64_t>{0, 1, 3}),
+  EXPECT_EQ((std::vector<int64_t>{1, 0, 3}),
             (std::vector<int64_t>(
                 result.counts.begin(), result.counts.end())));
 }
@@ -4802,6 +4805,35 @@ TEST_F(FacetTest, selectedComposesWithExplicitRoutedFilter) {
             stringFacetRows(topFacetResult(*req, "q", "brands")));
 }
 
+TEST_F(FacetTest, selectedTextFoldIsSharedByPinsAndFilter) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "body_un", "Thomas alpha"),
+    flatdoc("id", "2", "body_un", "thomas beta"),
+    flatdoc("id", "3", "body_un", "other"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"ops":{"q":{"top_docs":{
+    "limit":-1,"fields":["id"],"get_number":true,
+    "ops":{"terms":{"field_facet":{"field":"body_un","limit":0,
+      "selected":["ThOmAs"]}}}}}}})", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+
+  std::vector<std::string> ids;
+  for (const Doc& doc : req->getDocs()) {
+    ids.push_back(std::get<std::string>(*find(doc, "id")));
+  }
+  std::sort(ids.begin(), ids.end());
+  EXPECT_EQ((std::vector<std::string>{"1", "2"}), ids);
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"thomas", 2}}),
+            stringFacetRows(topFacetResult(*req, "q", "terms")));
+}
+
 TEST_F(FacetTest, selectedValidationIsParseTime) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "1", "brand_s", "acme", "price_i", 10),
@@ -4821,9 +4853,6 @@ TEST_F(FacetTest, selectedValidationIsParseTime) {
     "field":"brand_s","selection_mode":"all"}}}})",
       "selection_mode requires nonempty selected");
   expectError(R"({"limit":0,"ops":{"f":{"field_facet":{
-    "field":"price_i","selected":[1,1.0]}}}})",
-      "duplicate selected value after coercion");
-  expectError(R"({"limit":0,"ops":{"f":{"field_facet":{
     "field":"brand_s","selected":[null]}}}})",
       "selected[0] must not be null");
   expectError(R"({"limit":0,"ops":{"f":{"range_facet":{
@@ -4837,14 +4866,33 @@ TEST_F(FacetTest, selectedValidationIsParseTime) {
   expectError(R"({"ops":{"f":{"fusion":{"ops":{"brands":{"field_facet":{
     "field":"brand_s","selected":["acme"]}}}}}}})", "at Fusion.ops");
 
+  auto duplicates = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"limit":0,"get_number":true,
+    "ops":{"f":{"field_facet":{"field":"price_i","limit":0,
+      "selected":[10,10.0]}}}})",
+      duplicates->rawRequest(), duplicates->mr);
+  duplicates->collection("main");
+  duplicates->execute();
+  ASSERT_TRUE(duplicates->ok()) << duplicates->errorMsg();
+  EXPECT_EQ(1, duplicates->getMatchCount());
+  const auto& duplicateResult = topFacetResult(*duplicates, "q", "f");
+  const auto& duplicateIds =
+      std::get<api::ColInt>(duplicateResult.bucket_ids->kind).v;
+  ASSERT_EQ(1u, duplicateIds.size());
+  EXPECT_EQ(10, duplicateIds[0]);
+  EXPECT_EQ(1, duplicateResult.counts[0]);
+
   auto req = localReq(luxirNode->getSearchEngine());
   auto& facetCursor = req->collection("main").topDocs("q").allQuery()
       .facet("f", "brand_s");
   auto& facet = std::get<api::FieldFacet>(facetCursor.rawOp().kind);
-  auto* selected = api::build::allocArray(facet.selected, 1025, req->mr);
-  for (size_t i = 0; i < facet.selected.size(); i++) {
-    selected[i].kind = api::build::arenaStr(req->mr, std::to_string(i));
+  auto* sequence = api::build::allocMessage<api::Val>(req->mr);
+  auto& strings = sequence->kind.emplace<api::ArrStr>();
+  auto* selected = api::build::allocArray(strings.v, 1025, req->mr);
+  for (size_t i = 0; i < strings.v.size(); i++) {
+    selected[i] = api::build::arenaStr(req->mr, std::to_string(i));
   }
+  facet.selected = sequence;
   ExpectLog quiet("Search request failed:");
   req->execute();
   EXPECT_NE(std::string::npos, req->errorMsg().find("1024 selection limit"))

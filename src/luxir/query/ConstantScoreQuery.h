@@ -74,7 +74,7 @@ class ConstantScoreQuery final : public luxir::Query {
         .termDisjunctionClause = Query::ClauseShape::NONE,
         .termConjunctionClause = Query::ClauseShape::NONE,
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
-        .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
+        .docsOnly = child.docsOnly,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
       };
     }
@@ -89,6 +89,10 @@ class ConstantScoreQuery final : public luxir::Query {
         if (childScorer == nullptr) return nullptr;
         return targetPool.make<ConstantScoreQuery::Scorer>(
             childScorer, constantScore);
+      }
+
+      DocsOnlyEnum* buildDocsOnlyEnum(MemPool& targetPool) override {
+        return childPlan->buildDocsOnly(targetPool);
       }
 
     public:

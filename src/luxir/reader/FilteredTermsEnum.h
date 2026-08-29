@@ -147,15 +147,22 @@ public:
 
   bool next() override {
     if (exhausted) return false;
-    if (started) candidate++;
-    else started = true;
+    if (started) {
+      candidate++;
+      if (candidate == end || !te.nextTerm()) return finish();
+    } else {
+      started = true;
+      if (candidate == end || !te.seekCeilForward(*candidate)) return finish();
+    }
 
     while (candidate != end) {
-      if (!te.seekCeil(*candidate)) return finish();
       std::string_view indexed = termView();
       if (indexed == *candidate) return true;
-      candidate = screaming::gallopLowerBound(
-          candidate + 1, end, indexed);
+      if (*candidate < indexed) {
+        candidate = screaming::gallopLowerBound(candidate + 1, end, indexed);
+        if (candidate != end && *candidate == indexed) return true;
+      }
+      if (candidate != end && !te.seekCeilForward(*candidate)) return finish();
     }
     return finish();
   }

@@ -386,17 +386,20 @@ void appendDomainFilter(OpCursor& cursor, const api::Query& query) {
   filters[old.size()] = query;
 }
 
-api::Query stringInQuery(
+api::Query stringAnyOfQuery(
     std::pmr::memory_resource& mr, std::string_view field,
     std::initializer_list<std::string_view> values) {
   api::Query query;
-  auto& in = query.kind.emplace<api::InQuery>();
-  in.field = api::build::arenaStr(mr, field);
-  auto* stored = api::build::allocArray(in.values, values.size(), mr);
+  auto& anyOf = query.kind.emplace<api::AnyOfQuery>();
+  anyOf.field = api::build::arenaStr(mr, field);
+  auto* sequence = api::build::allocMessage<api::Val>(mr);
+  auto& strings = sequence->kind.emplace<api::ArrStr>();
+  auto* stored = api::build::allocArray(strings.v, values.size(), mr);
   size_t i = 0;
   for (std::string_view value : values) {
-    stored[i++].kind = api::build::arenaStr(mr, value);
+    stored[i++] = api::build::arenaStr(mr, value);
   }
+  anyOf.values = sequence;
   return query;
 }
 
@@ -4074,7 +4077,7 @@ TEST_F(SearchEngineTest, routedFiltersServeSidewaysFacetsStatsAndDefault) {
   EXPECT_EQ(40, req->docList("q")->ops.at("price")->asInt());
 }
 
-TEST_F(SearchEngineTest, routedMultiValueFilterComposesWithInQuery) {
+TEST_F(SearchEngineTest, routedMultiValueFilterComposesWithAnyOfQuery) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "1", "brand_s", "acme", "tags_ss", vecs("x", "y")),
@@ -4087,7 +4090,7 @@ TEST_F(SearchEngineTest, routedMultiValueFilterComposesWithInQuery) {
   auto& top = req->collection("main").topDocs("q").allQuery()
       .getNumber().limit(0);
   top.facet("tags", "tags_ss").limit(-1);
-  top.filter(stringInQuery(top.mr(), "brand_s", {"acme"}));
+  top.filter(stringAnyOfQuery(top.mr(), "brand_s", {"acme"}));
   top.filter(qb::match(top.mr(), "tags_ss", "x"), {"tags"});
   req->execute();
 

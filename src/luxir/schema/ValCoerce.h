@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 namespace luxir::coerce {
 
@@ -75,46 +76,96 @@ inline std::string describe(const api::Val& val) {
 inline constexpr double INT64_LO = -9223372036854775808.0;
 inline constexpr double INT64_HI = 9223372036854775808.0;
 
-inline int64_t toInt64(const api::Val& val, std::string_view fieldName) {
-  // expected arm first, coercions after
-  if (auto i = std::get_if<int64_t>(&val.kind)) return *i;
-  if (auto s = std::get_if<std::string_view>(&val.kind)) {
-    if (auto v = parseInt64(*s)) return *v;
-    // A decimal string with an integral value ("3.0") narrows exactly like a
-    // double Val does - the same visible literal must not diverge between a
-    // JSON number and query-string/quoted text (index == query invariant).
-    if (auto d = parseDouble(*s)) {
-      if (*d >= INT64_LO && *d < INT64_HI && std::trunc(*d) == *d) return (int64_t)*d;
+// Wrap a scalar as a Val for error reporting and for the mixed-value paths
+// that deliberately route through FieldType's virtual coercion entry points.
+inline api::Val scalarVal(auto value) {
+  api::Val val;
+  val.kind = value;
+  return val;
+}
+
+// Typed scalar entry points let homogeneous array consumers select the Val arm
+// once, outside their element loop. They intentionally mirror the Val coercion
+// contract below; scalarVal is only called on a failing typed-coercion path.
+template<typename T>
+inline int64_t toInt64Scalar(T value, std::string_view fieldName) {
+  using V = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<V, int64_t>) {
+    return value;
+  } else if constexpr (std::is_same_v<V, std::string_view>) {
+    if (auto parsed = parseInt64(value)) return *parsed;
+    if (auto parsed = parseDouble(value)) {
+      if (*parsed >= INT64_LO && *parsed < INT64_HI
+          && std::trunc(*parsed) == *parsed) {
+        return (int64_t)*parsed;
+      }
       throw std::runtime_error(fmt::format(
-          "field '{}': cannot use '{}' as an integer (value is not integral)", fieldName, *s));
+          "field '{}': cannot use '{}' as an integer (value is not integral)",
+          fieldName, value));
     }
     throw std::runtime_error(fmt::format(
-        "field '{}': cannot parse '{}' as an integer", fieldName, *s));
-  }
-  // narrowing double -> int only when integral (NaN/inf/out-of-range fail the checks)
-  if (auto d = std::get_if<double>(&val.kind)) {
-    if (*d >= INT64_LO && *d < INT64_HI && std::trunc(*d) == *d) return (int64_t)*d;
+        "field '{}': cannot parse '{}' as an integer", fieldName, value));
+  } else if constexpr (std::is_same_v<V, double>) {
+    if (value >= INT64_LO && value < INT64_HI && std::trunc(value) == value) {
+      return (int64_t)value;
+    }
+    api::Val val = scalarVal(value);
     throwCoerce(fieldName, val, "an integer (value is not integral)");
-  }
-  if (auto f = std::get_if<float>(&val.kind)) {
-    double d = (double)*f;
-    if (d >= INT64_LO && d < INT64_HI && std::trunc(d) == d) return (int64_t)d;
+  } else if constexpr (std::is_same_v<V, float>) {
+    double widened = (double)value;
+    if (widened >= INT64_LO && widened < INT64_HI
+        && std::trunc(widened) == widened) {
+      return (int64_t)widened;
+    }
+    api::Val val = scalarVal(value);
     throwCoerce(fieldName, val, "an integer (value is not integral)");
+  } else {
+    api::Val val = scalarVal(value);
+    throwCoerce(fieldName, val, "an integer");
   }
+}
+
+inline int64_t toInt64(const api::Val& val, std::string_view fieldName) {
+  // expected arm first, coercions after
+  if (auto i = std::get_if<int64_t>(&val.kind)) return toInt64Scalar(*i, fieldName);
+  if (auto s = std::get_if<std::string_view>(&val.kind)) return toInt64Scalar(*s, fieldName);
+  if (auto d = std::get_if<double>(&val.kind)) return toInt64Scalar(*d, fieldName);
+  if (auto f = std::get_if<float>(&val.kind)) return toInt64Scalar(*f, fieldName);
   throwCoerce(fieldName, val, "an integer");
 }
 
-inline double toDouble(const api::Val& val, std::string_view fieldName) {
-  if (auto d = std::get_if<double>(&val.kind)) return *d;
-  if (auto f = std::get_if<float>(&val.kind)) return (double)*f;
-  // widening int -> double accepted (inexact above 2^53, like the proto/JSON ecosystem)
-  if (auto i = std::get_if<int64_t>(&val.kind)) return (double)*i;
-  if (auto s = std::get_if<std::string_view>(&val.kind)) {
-    if (auto v = parseDouble(*s)) return *v;
+template<typename T>
+inline double toDoubleScalar(T value, std::string_view fieldName) {
+  using V = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<V, double>) {
+    return value;
+  } else if constexpr (std::is_same_v<V, float>) {
+    return (double)value;
+  } else if constexpr (std::is_same_v<V, int64_t>) {
+    return (double)value;
+  } else if constexpr (std::is_same_v<V, std::string_view>) {
+    if (auto parsed = parseDouble(value)) return *parsed;
     throw std::runtime_error(fmt::format(
-        "field '{}': cannot parse '{}' as a number", fieldName, *s));
+        "field '{}': cannot parse '{}' as a number", fieldName, value));
+  } else {
+    api::Val val = scalarVal(value);
+    throwCoerce(fieldName, val, "a number");
   }
+}
+
+inline double toDouble(const api::Val& val, std::string_view fieldName) {
+  if (auto d = std::get_if<double>(&val.kind)) return toDoubleScalar(*d, fieldName);
+  if (auto f = std::get_if<float>(&val.kind)) return toDoubleScalar(*f, fieldName);
+  if (auto i = std::get_if<int64_t>(&val.kind)) return toDoubleScalar(*i, fieldName);
+  if (auto s = std::get_if<std::string_view>(&val.kind)) return toDoubleScalar(*s, fieldName);
   throwCoerce(fieldName, val, "a number");
+}
+
+template<typename T>
+inline float toFloatScalar(T value, std::string_view fieldName) {
+  using V = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<V, float>) return value;
+  else return (float)toDoubleScalar(value, fieldName);
 }
 
 inline float toFloat(const api::Val& val, std::string_view fieldName) {
@@ -126,6 +177,28 @@ inline float toFloat(const api::Val& val, std::string_view fieldName) {
 // shortest-round-trip double up to 24).
 inline constexpr size_t TEXT_BUF_SIZE = 32;
 
+template<typename T>
+inline std::string_view toTextScalar(T value, std::string_view fieldName,
+                                     std::span<char> buf) {
+  using V = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<V, std::string_view>) {
+    return value;
+  } else if constexpr (std::is_same_v<V, ::hpp_proto::bytes_view>) {
+    return std::string_view((const char*)value.data(), value.size());
+  } else if constexpr (std::is_same_v<V, bool>) {
+    return value ? std::string_view("true") : std::string_view("false");
+  } else if constexpr (std::is_same_v<V, int64_t>
+                       || std::is_same_v<V, double>
+                       || std::is_same_v<V, float>) {
+    assert(buf.size() >= TEXT_BUF_SIZE);
+    char* end = std::to_chars(buf.data(), buf.data() + buf.size(), value).ptr;
+    return std::string_view(buf.data(), end - buf.data());
+  } else {
+    api::Val val = scalarVal(value);
+    throwCoerce(fieldName, val, "text");
+  }
+}
+
 // Term/text rendering (the lossless direction): numeric and bool arms render
 // a canonical form into buf ("3" for int 3 AND double 3.0 - shortest
 // round-trip to_chars) and return a view of it; string/bytes arms pass
@@ -133,33 +206,13 @@ inline constexpr size_t TEXT_BUF_SIZE = 32;
 // before buf is reused or dies.
 inline std::string_view toText(const api::Val& val, std::string_view fieldName,
                                std::span<char> buf) {
-  if (auto s = std::get_if<std::string_view>(&val.kind)) return *s;
-  if (auto b = std::get_if<::hpp_proto::bytes_view>(&val.kind)) {
-    return std::string_view((const char*)b->data(), b->size());
-  }
-  if (auto b = std::get_if<bool>(&val.kind)) {
-    return *b ? std::string_view("true") : std::string_view("false");
-  }
-  assert(buf.size() >= TEXT_BUF_SIZE);
-  char* end;
-  if (auto i = std::get_if<int64_t>(&val.kind)) {
-    end = std::to_chars(buf.data(), buf.data() + buf.size(), *i).ptr;
-  } else if (auto d = std::get_if<double>(&val.kind)) {
-    end = std::to_chars(buf.data(), buf.data() + buf.size(), *d).ptr;
-  } else if (auto f = std::get_if<float>(&val.kind)) {
-    end = std::to_chars(buf.data(), buf.data() + buf.size(), *f).ptr;
-  } else {
-    throwCoerce(fieldName, val, "text");
-  }
-  return std::string_view(buf.data(), end - buf.data());
-}
-
-// Wrap a scalar as a Val (for routing typed values through the coercion
-// virtuals and for element-wise array handling).
-inline api::Val scalarVal(auto x) {
-  api::Val v;
-  v.kind = x;
-  return v;
+  if (auto s = std::get_if<std::string_view>(&val.kind)) return toTextScalar(*s, fieldName, buf);
+  if (auto b = std::get_if<::hpp_proto::bytes_view>(&val.kind)) return toTextScalar(*b, fieldName, buf);
+  if (auto b = std::get_if<bool>(&val.kind)) return toTextScalar(*b, fieldName, buf);
+  if (auto i = std::get_if<int64_t>(&val.kind)) return toTextScalar(*i, fieldName, buf);
+  if (auto d = std::get_if<double>(&val.kind)) return toTextScalar(*d, fieldName, buf);
+  if (auto f = std::get_if<float>(&val.kind)) return toTextScalar(*f, fieldName, buf);
+  throwCoerce(fieldName, val, "text");
 }
 
 // Visit the elements of an array-arm Val as scalar Vals, for element-wise

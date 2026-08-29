@@ -151,6 +151,32 @@ template <class M>
 void fillMessage(M& m, std::pmr::memory_resource& mr, int depth) {
   if (depth > kMaxDepth) return;
   glz::for_each_field(m, [&](auto& mem) { fillField(mem, mr, depth); });
+
+  // These fields are value sequences, not arbitrary Val payloads. Keep the generic fixture
+  // inside the semantic domain accepted by the parser, and avoid an explicit null Val whose
+  // JSON representation is intentionally indistinguishable from an absent optional field.
+  if constexpr (std::is_same_v<M, P::AnyOfQuery>) {
+    P::Val* values = B::allocMessage<P::Val>(mr);
+    auto& strings = values->kind.emplace<P::ArrStr>();
+    std::string_view* items = B::allocArray(strings.v, 2, mr);
+    items[0] = "x";
+    items[1] = "y";
+    m.values = values;
+  } else if constexpr (std::is_same_v<M, P::FieldFacet>) {
+    P::Val* selected = B::allocMessage<P::Val>(mr);
+    auto& strings = selected->kind.emplace<P::ArrStr>();
+    std::string_view* items = B::allocArray(strings.v, 2, mr);
+    items[0] = "x";
+    items[1] = "y";
+    m.selected = selected;
+  } else if constexpr (std::is_same_v<M, P::RangeFacet>) {
+    P::Val* selected = B::allocMessage<P::Val>(mr);
+    auto& ints = selected->kind.emplace<P::ArrInt>();
+    std::int64_t* items = B::allocArray(ints.v, 2, mr);
+    items[0] = 1;
+    items[1] = 2;
+    m.selected = selected;
+  }
 }
 
 template <class V>
@@ -237,7 +263,7 @@ void roundTripType(const char* nm) {
 // The one hand-maintained list: every message type. Add a message -> add a line.
 #define LUXIR_MSGS(X)                                                                              \
   X(Target) X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
-  X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(InQuery) X(Filter)    \
+  X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(Domain)                                                            \

@@ -76,7 +76,7 @@ public:
                                  const FilterKeyContext& ctx) const override {
     unused(ctx);
     out.appendTag(exactValues.empty()
-        ? FilterKeyTag::NUMERIC_RANGE : FilterKeyTag::IN);
+        ? FilterKeyTag::NUMERIC_RANGE : FilterKeyTag::ANY_OF);
     out.appendString(field);
     if (exactValues.empty()) {
       out.appendInt64(lo);

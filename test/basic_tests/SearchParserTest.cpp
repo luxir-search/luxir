@@ -308,8 +308,9 @@ TEST_F(SearchParserTest, selectedFiltersAppendInChildKeyOrder) {
   for (std::string_view key : {"z", "a"}) {
     auto& cursor = top.facet(key, "brand_s");
     auto& facet = std::get<api::FieldFacet>(cursor.rawOp().kind);
-    auto* selected = api::build::allocArray(facet.selected, 1, cursor.mr());
-    selected[0].kind = api::build::arenaStr(cursor.mr(), "acme");
+    auto* selected = api::build::allocMessage<api::Val>(cursor.mr());
+    selected->kind = api::build::arenaStr(cursor.mr(), "acme");
+    facet.selected = selected;
   }
   request->schema = helper.collection().getSchema();
   request->reader = helper.getIndexWriter()->getIndexReader();

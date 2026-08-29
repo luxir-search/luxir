@@ -159,8 +159,10 @@ TEST(JsonDialect, FacetSelectionsUseLowercaseEnumNames) {
   ASSERT_TRUE(P::read_json(field, R"({"field_facet":{"field":"tag_ss",
     "selected":["x","y"],"selection_mode":"all"}})", mr));
   const auto& fieldFacet = std::get<P::FieldFacet>(field.kind);
-  ASSERT_EQ(2u, fieldFacet.selected.size());
-  EXPECT_EQ("x", fieldFacet.selected[0].asString());
+  ASSERT_TRUE(fieldFacet.selected.has_value());
+  const auto& fieldSelected = std::get<P::ArrStr>(fieldFacet.selected->kind).v;
+  ASSERT_EQ(2u, fieldSelected.size());
+  EXPECT_EQ("x", fieldSelected[0]);
   EXPECT_EQ(P::SelectionMode::ALL, fieldFacet.selection_mode);
   std::string encoded;
   ASSERT_TRUE(P::write_json(field, encoded));
@@ -171,8 +173,10 @@ TEST(JsonDialect, FacetSelectionsUseLowercaseEnumNames) {
   ASSERT_TRUE(P::read_json(range, R"({"range_facet":{"field":"price_i",
     "start":0,"end":20,"gap":10,"selected":[10]}})", mr));
   const auto& rangeFacet = std::get<P::RangeFacet>(range.kind);
-  ASSERT_EQ(1u, rangeFacet.selected.size());
-  EXPECT_EQ(10, rangeFacet.selected[0].asInt());
+  ASSERT_TRUE(rangeFacet.selected.has_value());
+  const auto& rangeSelected = std::get<P::ArrInt>(rangeFacet.selected->kind).v;
+  ASSERT_EQ(1u, rangeSelected.size());
+  EXPECT_EQ(10, rangeSelected[0]);
   EXPECT_EQ(P::SelectionMode::ANY, rangeFacet.selection_mode);
 }
 
@@ -252,20 +256,22 @@ TEST(JsonDialect, RangeQuery) {
   EXPECT_FALSE(r.lte.has_value());
 }
 
-TEST(JsonDialect, InQueryCanonicalForm) {
+TEST(JsonDialect, AnyOfQueryCanonicalForm) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query q;
   ASSERT_TRUE(P::read_json(
-      q, R"({"in":{"field":"brand_s","values":["acme","globex"]}})", mr));
-  const auto& in = std::get<P::InQuery>(q.kind);
-  EXPECT_EQ("brand_s", in.field);
-  ASSERT_EQ(2u, in.values.size());
-  EXPECT_EQ("globex", std::get<std::string_view>(in.values[1].kind));
+      q, R"({"any_of":{"field":"brand_s","values":["acme","globex"]}})", mr));
+  const auto& anyOf = std::get<P::AnyOfQuery>(q.kind);
+  EXPECT_EQ("brand_s", anyOf.field);
+  ASSERT_TRUE(anyOf.values.has_value());
+  const auto& values = std::get<P::ArrStr>(anyOf.values->kind).v;
+  ASSERT_EQ(2u, values.size());
+  EXPECT_EQ("globex", values[1]);
 
   std::string canonical;
   ASSERT_TRUE(P::write_json(q, canonical));
   EXPECT_EQ(
-      R"({"in":{"field":"brand_s","values":["acme","globex"]}})",
+      R"({"any_of":{"field":"brand_s","values":["acme","globex"]}})",
       canonical);
 }
 

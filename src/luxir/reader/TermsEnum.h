@@ -873,7 +873,7 @@ protected:
   // then seek to and load that block, leaving the enum at ord 0 of it.
   // Targets in a gap between two blocks route to the later block; such targets
   // cannot be existing terms, and seekCeil must be able to land on that block.
-  // Shared by seek(), seekForward(), and seekCeil().
+  // Shared by seek(), seekCeilForward(), and seekCeil().
   void seekBlock(std::string_view target, int32_t firstBlock) {
     TrieReader trie(trieBase, (uint64_t)fieldInfo.trieRootOff, numTermBlocks);
     termBlockIndex = trie.floorBlock(target);
@@ -894,16 +894,17 @@ public:
     return found;
   }
 
-  /// Forward-only seek for sorted iteration. Target must be >= the current term.
-  /// If the target is in the current block, scans forward with nextTerm().
-  /// Otherwise descends the trie and asserts the result is at or after the next block.
-  /// Can be called without a prior seek() - the first call will load the first block.
-  bool seekForward(std::string_view target) {
+  /// Forward-only ceil for sorted iteration. Target must be >= the current
+  /// term. Positions on the smallest term >= target and returns true, or
+  /// returns false at dictionary exhaustion. Unlike seekCeil, this never
+  /// restarts before the current block.
+  bool seekCeilForward(std::string_view target) {
     if (fieldInfo.nTerms == 0) return false;
     if (termBlockIndex < 0) {
-      // Not yet positioned - load first block
       termBlockIndex = 0;
       readTermBlock();
+    } else {
+      assert(!(target < term()));
     }
 
     int32_t nextBlock = termBlockIndex + 1;
@@ -920,19 +921,24 @@ public:
       seekBlock(target, nextBlock);
     }
 
-    // Linear forward scan within the current block.  Stops at the first term
-    // >= target (the insertion point), so a subsequent seekForward starts from
-    // the correct position.
-    bool found = false;
-    for (;;) {
-      auto cmp = term() <=> target;
-      if (cmp == 0) { found = true; break; }
-      if (cmp > 0) break;
-      if (ordInBlock >= maxOrdInBlock) break;
-      readNextTermInBlock();
+    while (term() < target) {
+      if (!nextTerm()) {
+        sharedLen = 0;
+        return false;
+      }
     }
     sharedLen = 0;
-    return found;
+    return true;
+  }
+
+  /// Forward-only exact seek. On a miss with a ceil, remains positioned on
+  /// that ceil; on exhaustion, remains on the last term.
+  bool seekForward(std::string_view target) {
+    // Historical callers treat an out-of-order target as a plain miss. Keep
+    // that exact-seek behavior while seekCeilForward retains its stronger
+    // monotonic precondition and positioned result contract.
+    if (termBlockIndex >= 0 && target < term()) return false;
+    return seekCeilForward(target) && term() == target;
   }
 
   /// Positions on the smallest term that is >= target.

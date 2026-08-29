@@ -409,7 +409,9 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': selection_mode must be ANY or ALL");
     }
-    if (facetReq.selected.empty()) {
+    ValueSequence selected = facetReq.selected.has_value()
+        ? ValueSequence(*facetReq.selected) : ValueSequence();
+    if (selected.empty()) {
       if (facetReq.selection_mode != api::SelectionMode::ANY) {
         throw std::runtime_error("facet '" + std::string(facetName)
             + "': selection_mode requires nonempty selected");
@@ -425,16 +427,9 @@ public:
           + location
           + ": selected is only supported on facets directly inside TopDocs.ops");
     }
-    if (facetReq.selected.size() > 1024) {
+    if (selected.size() > 1024) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': selected exceeds the 1024 selection limit");
-    }
-    for (size_t i = 0; i < facetReq.selected.size(); i++) {
-      if (coerce::isNull(facetReq.selected[i])) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': selected[" + std::to_string(i)
-            + "] must not be null");
-      }
     }
   }
 
@@ -449,8 +444,10 @@ public:
     }, value.kind);
   }
 
-  FacetReq* createFieldFacetReq(std::string_view facetName,
-      const luxir::api::FieldFacet& facetReq, OpsPlacement placement) {
+  FacetReq* createFieldFacetReq(
+      std::string_view facetName, const luxir::api::FieldFacet& facetReq,
+      OpsPlacement placement,
+      const CanonicalValueSet* preparedSelected = nullptr) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     std::string_view facetField = facetReq.field;
     int64_t limit = 5; // default limit
@@ -469,48 +466,29 @@ public:
 
     std::span<const int64_t> selectedInts;
     std::span<const std::string_view> selectedStrings;
-    if (!facetReq.selected.empty()) {
+    ValueSequence selectedValues = facetReq.selected.has_value()
+        ? ValueSequence(*facetReq.selected) : ValueSequence();
+    CanonicalValueSet ownedSelected;
+    if (preparedSelected == nullptr && !selectedValues.empty()) {
       CoerceContext selectionContext{
           req.dateMathNowEpochMillis, *req.timeZone};
+      QueryBuilder builder(req.requestPool, *req.schema,
+                           selectionContext, facetName, &req.warnings);
+      std::string valueName = "facet '" + std::string(facetName)
+          + "': selected";
+      ownedSelected = builder.canonicalizeFieldValues(
+          facetField, selectedValues, valueName,
+          ValueSequence::NullError::MUST_NOT_BE_NULL);
+      preparedSelected = &ownedSelected;
+    }
+    if (preparedSelected != nullptr && !preparedSelected->empty()) {
       if (ftype->type() == FieldType::Type::DATE
           || ftype->type() == FieldType::Type::INT) {
-        auto canonical = req.requestPool.make_span<int64_t>(
-            facetReq.selected.size());
-        std::unordered_set<int64_t> seen;
-        for (size_t i = 0; i < facetReq.selected.size(); i++) {
-          canonical[i] = ftype->coerceColInt64(
-              facetReq.selected[i], facetField, selectionContext);
-          if (!seen.insert(canonical[i]).second) {
-            throw std::runtime_error("facet '" + std::string(facetName)
-                + "': duplicate selected value after coercion: "
-                + selectionValueText(facetReq.selected[i]));
-          }
-        }
-        selectedInts = canonical;
+        selectedInts = preparedSelected->numerics();
       } else if (ftype->type() == FieldType::Type::ID
                  || ftype->type() == FieldType::Type::STRING
                  || ftype->type() == FieldType::Type::TEXT) {
-        auto canonical = req.requestPool.make_span<std::string_view>(
-            facetReq.selected.size());
-        std::unordered_set<std::string_view> seen;
-        for (size_t i = 0; i < facetReq.selected.size(); i++) {
-          char buf[coerce::TEXT_BUF_SIZE];
-          std::string_view term = ftype->coerceTerm(
-              facetReq.selected[i], facetField, buf);
-          term = PackedTerm::truncate(term);
-          if (term.data() == buf) {
-            char* copy = req.requestPool.alloc(term.size());
-            std::memcpy(copy, term.data(), term.size());
-            term = std::string_view(copy, term.size());
-          }
-          canonical[i] = term;
-          if (!seen.insert(term).second) {
-            throw std::runtime_error("facet '" + std::string(facetName)
-                + "': duplicate selected value after coercion: "
-                + selectionValueText(facetReq.selected[i]));
-          }
-        }
-        selectedStrings = canonical;
+        selectedStrings = preparedSelected->terms();
       }
     }
 
@@ -641,26 +619,43 @@ public:
     auto resolveSelectedBuckets = [&](const ParsedFences& parsed,
                                       auto&& encode) {
       std::span<size_t> selected;
-      if (facetReq.selected.empty()) return selected;
-      selected = req.requestPool.make_span<size_t>(facetReq.selected.size());
+      ValueSequence selectedValues = facetReq.selected.has_value()
+          ? ValueSequence(*facetReq.selected) : ValueSequence();
+      std::string valueName = "facet '" + std::string(facetName)
+          + "': selected";
+      selectedValues.validate(
+          valueName, ValueSequence::NullError::MUST_NOT_BE_NULL);
+      if (selectedValues.empty()) return selected;
+      selected = req.requestPool.make_span<size_t>(selectedValues.size());
       std::unordered_set<size_t> seen;
-      for (size_t i = 0; i < facetReq.selected.size(); i++) {
-        int64_t fence = encode(facetReq.selected[i]);
-        auto found = std::lower_bound(
-            parsed.values.begin(), parsed.values.end() - 1, fence);
-        if (found == parsed.values.end() - 1 || *found != fence) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': selected value " + selectionValueText(facetReq.selected[i])
-              + " is not a generated range lower fence");
+      size_t i = 0;
+      selectedValues.visit([&](const auto& viewed) {
+        for (const auto& value : viewed) {
+          const api::Val* val;
+          api::Val scalar;
+          if constexpr (std::is_same_v<std::decay_t<decltype(value)>, api::Val>) {
+            val = &value;
+          } else {
+            scalar = coerce::scalarVal(value);
+            val = &scalar;
+          }
+          int64_t fence = encode(*val);
+          auto found = std::lower_bound(
+              parsed.values.begin(), parsed.values.end() - 1, fence);
+          if (found == parsed.values.end() - 1 || *found != fence) {
+            throw std::runtime_error("facet '" + std::string(facetName)
+                + "': selected value " + selectionValueText(*val)
+                + " is not a generated range lower fence");
+          }
+          size_t bucket = (size_t)(found - parsed.values.begin());
+          if (!seen.insert(bucket).second) {
+            throw std::runtime_error("facet '" + std::string(facetName)
+                + "': duplicate selected value after coercion: "
+                + selectionValueText(*val));
+          }
+          selected[i++] = bucket;
         }
-        size_t bucket = (size_t)(found - parsed.values.begin());
-        if (!seen.insert(bucket).second) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': duplicate selected value after coercion: "
-              + selectionValueText(facetReq.selected[i]));
-        }
-        selected[i] = bucket;
-      }
+      });
       return selected;
     };
 
@@ -973,24 +968,29 @@ public:
           ? OpsPlacement::FUSION : OpsPlacement::TOP_DOCS;
       if (fieldProto != nullptr) {
         validateSelectionEnvelope(key, *fieldProto, placement);
-        if (fieldProto->selected.empty()) continue;
-
-        FacetReq* facet = createFieldFacetReq(
-            key, *fieldProto, OpsPlacement::TOP_DOCS);
-        preparedFieldFacets.emplace(fieldProto, facet);
+        ValueSequence selected = fieldProto->selected.has_value()
+            ? ValueSequence(*fieldProto->selected) : ValueSequence();
+        if (selected.empty()) continue;
 
         QueryBuilder builder(req.requestPool, *req.schema,
                              parseContext.coerceContext, key, &req.warnings);
+        std::string valueName = "facet '" + std::string(key)
+            + "': selected";
+        CanonicalValueSet canonical = builder.canonicalizeFieldValues(
+            fieldProto->field, selected, valueName,
+            ValueSequence::NullError::MUST_NOT_BE_NULL);
+        FacetReq* facet = createFieldFacetReq(
+            key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
+        preparedFieldFacets.emplace(fieldProto, facet);
+
         Query* predicate;
         if (fieldProto->selection_mode == api::SelectionMode::ANY) {
-          predicate = builder.createInQuery(
-              fieldProto->field, fieldProto->selected);
+          predicate = builder.createAnyOfQuery(canonical);
         } else {
           auto clauses = req.requestPool.make_span<Query*>(
-              fieldProto->selected.size());
+              canonical.size());
           for (size_t i = 0; i < clauses.size(); i++) {
-            clauses[i] = builder.createInQuery(
-                fieldProto->field, fieldProto->selected.subspan(i, 1));
+            clauses[i] = builder.createAnyOfQuery(canonical.element(i));
           }
           predicate = combineSelectionPredicates(
               clauses, api::SelectionMode::ALL);
@@ -1006,7 +1006,9 @@ public:
       }
 
       validateSelectionEnvelope(key, *rangeProto, placement);
-      if (rangeProto->selected.empty()) continue;
+      ValueSequence selected = rangeProto->selected.has_value()
+          ? ValueSequence(*rangeProto->selected) : ValueSequence();
+      if (selected.empty()) continue;
       FacetReq* facet = createRangeFacetReq(
           key, *rangeProto, OpsPlacement::TOP_DOCS);
       preparedRangeFacets.emplace(rangeProto, facet);

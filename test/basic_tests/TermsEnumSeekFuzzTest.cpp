@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FilteredTermsEnum.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/TermsEnum.h"
 #include "test/CollectionHelper.h"
@@ -202,6 +203,33 @@ TEST_F(TermsEnumSeekFuzzTest, GapRoutingAcrossSeparatorBoundary) {
   TermsEnum ceilEnum(guard.pool(), seg->postingsReader(), field.fieldInfo);
   ASSERT_TRUE(ceilEnum.seekCeil("azm"));
   EXPECT_EQ((std::string_view)ceilEnum.term(), "azzz");
+}
+
+TEST_F(TermsEnumSeekFuzzTest, ExplicitTermsForwardMergeCrossesBlocksAndGaps) {
+  TestIndex ti;
+  TestField field(ti, "explicit_s");
+  std::vector<std::string> terms;
+  for (int i = 0; i < Postings::TERMS_BLOCK_SIZE * 2 + 3; i++) {
+    terms.push_back("t" + std::string(3 - std::to_string(i).size(), '0')
+                    + std::to_string(i));
+  }
+  indexTerms(ti, field, terms);
+
+  std::vector<std::string> requested = {
+      "s999", "t000", "t000a", "t010", "t010a", "t031",
+      "t031z", "t032", "t032a", "t033", "t064", "t066", "u000"};
+  std::vector<std::string_view> views(requested.begin(), requested.end());
+
+  auto guard = field.testIndex.pool.rewindScopeGuard();
+  auto* seg = field.currentSegment();
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  ExplicitTermsEnum selected(te, views);
+  std::vector<std::string> actual;
+  while (selected.next()) actual.emplace_back(selected.termView());
+
+  EXPECT_EQ((std::vector<std::string>{
+                "t000", "t010", "t031", "t032", "t033", "t064", "t066"}),
+            actual);
 }
 
 TEST_F(TermsEnumSeekFuzzTest, SharedPrefixLenMatchesAdjacentTerms) {

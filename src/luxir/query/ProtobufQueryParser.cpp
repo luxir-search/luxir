@@ -69,11 +69,16 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
   return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match);
 }
 
-luxir::Query* ProtobufQueryParser::parseIn(
-    const luxir::api::InQuery& inQuery) {
+luxir::Query* ProtobufQueryParser::parseAnyOf(
+    const luxir::api::AnyOfQuery& anyOfQuery) {
+  if (!anyOfQuery.values.has_value()) {
+    throw std::runtime_error("AnyOfQuery requires values");
+  }
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings);
-  return builder.createInQuery(inQuery.field, inQuery.values);
+  CanonicalValueSet values = builder.canonicalizeFieldValues(
+      anyOfQuery.field, ValueSequence(*anyOfQuery.values));
+  return builder.createAnyOfQuery(values);
 }
 
 std::span<std::string_view> ProtobufQueryParser::toSpan(std::span<const std::string_view> vals) {
@@ -448,7 +453,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
   return std::visit(luxir::overloaded{
     [&](const luxir::api::Match& m) -> luxir::Query* { return parseMatch(m); },
-    [&](const luxir::api::InQuery& i) -> luxir::Query* { return parseIn(i); },
+    [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseAnyOf(a); },
     [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parsePhrase(p); },
     [&](const luxir::api::PrefixQuery& p) -> luxir::Query* { return parsePrefix(p); },
     [&](const luxir::api::WildcardQuery& w) -> luxir::Query* { return parseWildcard(w); },

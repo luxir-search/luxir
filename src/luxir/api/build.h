@@ -26,6 +26,12 @@
 
 namespace luxir::api::build {
 
+template<class T>
+T* allocMessage(std::pmr::memory_resource& mr) {
+  T* value = (T*)mr.allocate(sizeof(T), alignof(T));
+  return new (value) T();
+}
+
 // Allocate n value-initialized T in the arena, point `target` at them, return the
 // mutable array for index-fill. n is known up front (e.g. the batch doc count).
 template <class T>
