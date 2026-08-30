@@ -28,6 +28,21 @@ namespace luxir {
 struct ParsedFilter {
   Query* query;
   std::span<const std::string_view> exceptOps;
+  // Selection ANY keeps one logical routed filter while sourcing its value
+  // memberships independently from the cache. Ordinary filters and
+  // single-value selections leave this empty and use query directly.
+  std::span<Query* const> unionSources{};
+
+  size_t sourceCount() const {
+    return unionSources.empty() ? 1 : unionSources.size();
+  }
+
+  Query* source(size_t index) const {
+    assert(index < sourceCount());
+    return unionSources.empty() ? query : unionSources[index];
+  }
+
+  bool composesUnion() const { return !unionSources.empty(); }
 };
 
 
@@ -759,6 +774,49 @@ public:
       return true;
     }
 
+    DomainHandle materializeFilter(
+        size_t filterIndex, size_t sourceOffset,
+        IndexReader::Segment& seg, DocSet* baseDomain,
+        const std::vector<QueryPrep::PreparedSource>* prepared,
+        const std::shared_ptr<DomainVariantPlan::Reservation>& reservation) {
+      auto& op = thisOp();
+      const auto& filter = op.filters[filterIndex];
+      std::vector<DomainHandle> sources;
+      std::vector<DocSet*> sourcePtrs;
+      sources.reserve(filter.sourceCount());
+      sourcePtrs.reserve(filter.sourceCount());
+      for (size_t i = 0; i < filter.sourceCount(); i++) {
+        size_t source = sourceOffset + i;
+        DomainHandle docs = prepared != nullptr
+            ? QueryPrep::materializeEffectiveFilter(
+                  (*prepared)[source], *op.req.reader, seg, baseDomain)
+            : QueryPrep::materializeEffectiveFilter(
+                  *op.filterWeights[source], op.filterUses[source],
+                  *op.req.reader, seg, baseDomain);
+        if (reservation != nullptr && docs.get() != nullptr
+            && docs.isDeliverable()) {
+          reservation->grow(docs.get()->ramBytesUsed());
+        }
+        if (docs.get() == nullptr && filter.composesUnion()) {
+          return {};
+        }
+        sourcePtrs.push_back(docs.get());
+        sources.push_back(std::move(docs));
+      }
+      if (!filter.composesUnion()) {
+        assert(sources.size() == 1);
+        return std::move(sources[0]);
+      }
+
+      assert(sourcePtrs.size() > 1);
+      skipCount(SkipStats::selectionUnionCompositions);
+      DomainHandle result(DocSet::union_(sourcePtrs));
+      if (reservation != nullptr && result.get() != nullptr) {
+        reservation->grow(result.get()->ramBytesUsed());
+      }
+      return result;
+    }
+
     DomainHandle buildEffectiveDomain(
         int32_t segnum, DocSet* baseDomain) {
       auto& op = thisOp();
@@ -767,13 +825,18 @@ public:
 
       std::vector<DomainHandle> filters;
       std::vector<DocSet*> filterPtrs;
-      filters.reserve(op.filterWeights.size());
-      filterPtrs.reserve(op.filterWeights.size());
-      for (size_t i = 0; i < op.filterWeights.size(); i++) {
-        filters.push_back(QueryPrep::materializeEffectiveFilter(
-          preparedFilterSources[i], *op.req.reader, seg, baseDomain));
-        filterPtrs.push_back(filters.back().get());
+      filters.reserve(op.filters.size());
+      filterPtrs.reserve(op.filters.size());
+      size_t source = 0;
+      for (size_t i = 0; i < op.filters.size(); i++) {
+        filters.push_back(materializeFilter(
+            i, source, seg, baseDomain, &preparedFilterSources, nullptr));
+        source += op.filters[i].sourceCount();
+        if (filters.back().get() != nullptr) {
+          filterPtrs.push_back(filters.back().get());
+        }
       }
+      assert(source == op.filterWeights.size());
       if (filterPtrs.empty()) return {};
       if (filterPtrs.size() == 1) {
         auto result = std::move(filters[0]);
@@ -1134,21 +1197,19 @@ public:
       auto& op = thisOp();
       auto& seg = op.req.reader->segments()[(size_t) segnum];
       std::vector<DomainHandle> filters;
-      filters.reserve(op.filterWeights.size());
-      for (size_t i = 0; i < op.filterWeights.size(); i++) {
-        DomainHandle filter = requiresPreparePhase
-            ? QueryPrep::materializeEffectiveFilter(
-                  preparedFilterSources[i], *op.req.reader, seg, baseDomain)
-            : QueryPrep::materializeEffectiveFilter(
-                  *op.filterWeights[i], op.filterUses[i],
-                  *op.req.reader, seg, baseDomain);
-        if (filter.get() != nullptr && filter.isDeliverable()) {
-          reservation->grow(filter.get()->ramBytesUsed());
-        }
+      filters.reserve(op.filters.size());
+      size_t source = 0;
+      for (size_t i = 0; i < op.filters.size(); i++) {
+        DomainHandle filter = materializeFilter(
+            i, source, seg, baseDomain,
+            requiresPreparePhase ? &preparedFilterSources : nullptr,
+            reservation);
+        source += op.filters[i].sourceCount();
         filters.push_back(
             std::move(filter).pinnedWith(op.planning.filterUses));
         assert(filters.back().isDeliverable());
       }
+      assert(source == op.filterWeights.size());
       return filters;
     }
 
@@ -1160,20 +1221,16 @@ public:
       DocSet* live = seg.liveDocs() == nullptr
           ? nullptr : &seg.liveDocs()->docset();
       std::vector<DomainHandle> filters;
-      filters.reserve(op.filterWeights.size());
-      for (size_t i = 0; i < op.filterWeights.size(); i++) {
-        DomainHandle filter = requiresPreparePhase
-            ? QueryPrep::materializeEffectiveFilter(
-                  preparedResetFilterSources[i], *op.req.reader, seg, live)
-            : QueryPrep::materializeEffectiveFilter(
-                  *op.filterWeights[i], op.filterUses[i],
-                  *op.req.reader, seg, live);
-        if (filter.get() != nullptr && filter.isDeliverable()) {
-          reservation->grow(filter.get()->ramBytesUsed());
-        }
-        filters.push_back(
-            std::move(filter).pinnedWith(op.planning.filterUses));
+      filters.reserve(op.filters.size());
+      size_t source = 0;
+      for (size_t i = 0; i < op.filters.size(); i++) {
+        filters.push_back(std::move(materializeFilter(
+            i, source, seg, live,
+            requiresPreparePhase ? &preparedResetFilterSources : nullptr,
+            reservation)).pinnedWith(op.planning.filterUses));
+        source += op.filters[i].sourceCount();
       }
+      assert(source == op.filterWeights.size());
       return filters;
     }
 
@@ -2294,11 +2351,15 @@ public:
       }
     }
     if (!filterWeights.empty()) {
-      assert(filterWeights.size() == filters.size());
-      filterUses = planning.pool.make_span<FilterCache::Use*>(filters.size());
-      for (size_t i = 0; i < filters.size(); i++) {
-        filterUses[i] = planning.getFilterUse(*filters[i].query);
+      filterUses = planning.pool.make_span<FilterCache::Use*>(
+          filterWeights.size());
+      size_t source = 0;
+      for (const auto& filter : filters) {
+        for (size_t i = 0; i < filter.sourceCount(); i++) {
+          filterUses[source++] = planning.getFilterUse(*filter.source(i));
+        }
       }
+      assert(source == filterWeights.size());
     }
     if (!residentExactDomainUses.empty()) {
       for (auto* use : residentExactDomainUses) {
@@ -2309,12 +2370,16 @@ public:
         exactDomainPlan.add(
             *domainQueryWeight, planning.getFilterUse(*domainQuery));
       }
-      assert(domainFilterWeights.size() == filters.size());
-      for (size_t i = 0; i < domainFilterWeights.size(); i++) {
-        exactDomainPlan.add(
-            *domainFilterWeights[i],
-            planning.getFilterUse(*filters[i].query));
+      size_t source = 0;
+      for (const auto& filter : filters) {
+        assert(!filter.composesUnion());
+        for (size_t i = 0; i < filter.sourceCount(); i++) {
+          exactDomainPlan.add(
+              *domainFilterWeights[source++],
+              planning.getFilterUse(*filter.source(i)));
+        }
       }
+      assert(source == domainFilterWeights.size());
     }
   }
 

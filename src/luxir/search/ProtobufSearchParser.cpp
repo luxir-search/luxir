@@ -865,10 +865,19 @@ public:
     // future request flags, but clear NEED_SCORES.
     int32_t filterFlags = requestFlags
         & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
-    auto weights = req.requestPool.make_span<Query::Weight*>(filters.size());
-    for (size_t i = 0; i < filters.size(); i++) {
-      weights[i] = filters[i].query->createWeight(qcontext, filterFlags);
+    size_t sourceCount = 0;
+    for (const auto& filter : filters) {
+      sourceCount += filter.sourceCount();
     }
+    auto weights = req.requestPool.make_span<Query::Weight*>(sourceCount);
+    size_t source = 0;
+    for (const auto& filter : filters) {
+      for (size_t i = 0; i < filter.sourceCount(); i++) {
+        weights[source++] =
+            filter.source(i)->createWeight(qcontext, filterFlags);
+      }
+    }
+    assert(source == weights.size());
     return weights;
   }
 
@@ -970,18 +979,12 @@ public:
     }
   }
 
-  Query* combineSelectionPredicates(std::span<Query*> predicates,
-                                    api::SelectionMode mode) {
+  Query* combineAnySelectionPredicates(std::span<Query*> predicates) {
     assert(!predicates.empty());
-    if (mode == api::SelectionMode::ANY) {
-      if (predicates.size() == 1) return predicates[0];
-      return req.requestPool.make<BooleanQuery>(
-          std::span<Query*>{}, predicates, std::span<Query*>{},
-          std::span<Query*>{}, 1);
-    }
+    if (predicates.size() == 1) return predicates[0];
     return req.requestPool.make<BooleanQuery>(
-        std::span<Query*>{}, std::span<Query*>{}, std::span<Query*>{},
-        predicates);
+        std::span<Query*>{}, predicates, std::span<Query*>{},
+        std::span<Query*>{}, 1);
   }
 
   FacetParsePlan createQueryFacetPlan(
@@ -1180,19 +1183,23 @@ public:
           continue;
         }
 
-        Query* predicate;
-        if (fieldProto->selection_mode == api::SelectionMode::ANY) {
-          predicate = builder.createAnyOfQuery(canonical);
-        } else {
-          auto clauses = req.requestPool.make_span<Query*>(
-              canonical.size());
-          for (size_t i = 0; i < clauses.size(); i++) {
-            clauses[i] = builder.createAnyOfQuery(canonical.element(i));
-          }
-          predicate = combineSelectionPredicates(
-              clauses, api::SelectionMode::ALL);
+        auto clauses = req.requestPool.make_span<Query*>(canonical.size());
+        for (size_t i = 0; i < clauses.size(); i++) {
+          clauses[i] = builder.createAnyOfQuery(canonical.element(i));
+          skipCount(SkipStats::selectionValueFiltersPlanned);
         }
-        derived.push_back({predicate, exceptOps});
+        if (fieldProto->selection_mode == api::SelectionMode::ANY) {
+          Query* predicate = combineAnySelectionPredicates(clauses);
+          derived.push_back({
+              predicate, exceptOps,
+              clauses.size() == 1 ? std::span<Query* const>{} : clauses});
+          skipCount(SkipStats::selectionLogicalFiltersPlanned);
+        } else {
+          for (Query* clause : clauses) {
+            derived.push_back({clause, exceptOps});
+            skipCount(SkipStats::selectionLogicalFiltersPlanned);
+          }
+        }
         continue;
       }
 
@@ -1231,10 +1238,20 @@ public:
           size_t bucket = indexes[i];
           clauses[i] = req.requestPool.make<NumericPredicateQuery>(
               range.fieldName, fences[bucket], fences[bucket + 1] - 1);
+          skipCount(SkipStats::selectionValueFiltersPlanned);
         }
-        Query* predicate = combineSelectionPredicates(
-            clauses, rangeProto->selection_mode);
-        derived.push_back({predicate, exceptOps});
+        if (rangeProto->selection_mode == api::SelectionMode::ANY) {
+          Query* predicate = combineAnySelectionPredicates(clauses);
+          derived.push_back({
+              predicate, exceptOps,
+              clauses.size() == 1 ? std::span<Query* const>{} : clauses});
+          skipCount(SkipStats::selectionLogicalFiltersPlanned);
+        } else {
+          for (Query* clause : clauses) {
+            derived.push_back({clause, exceptOps});
+            skipCount(SkipStats::selectionLogicalFiltersPlanned);
+          }
+        }
         continue;
       }
 
@@ -1258,10 +1275,20 @@ public:
           plan.selectedBuckets.size());
       for (size_t i = 0; i < clauses.size(); i++) {
         clauses[i] = plan.bucketQueries[plan.selectedBuckets[i]];
+        skipCount(SkipStats::selectionValueFiltersPlanned);
       }
-      Query* predicate = combineSelectionPredicates(
-          clauses, queryProto->selection_mode);
-      derived.push_back({predicate, exceptOps});
+      if (queryProto->selection_mode == api::SelectionMode::ANY) {
+        Query* predicate = combineAnySelectionPredicates(clauses);
+        derived.push_back({
+            predicate, exceptOps,
+            clauses.size() == 1 ? std::span<Query* const>{} : clauses});
+        skipCount(SkipStats::selectionLogicalFiltersPlanned);
+      } else {
+        for (Query* clause : clauses) {
+          derived.push_back({clause, exceptOps});
+          skipCount(SkipStats::selectionLogicalFiltersPlanned);
+        }
+      }
     }
     return derived;
   }
@@ -1401,7 +1428,9 @@ public:
     }
     if (!foldFilters) {
       for (const auto& filter : filters) {
-        filter.query->validateLogical(*planningContext);
+        for (size_t i = 0; i < filter.sourceCount(); i++) {
+          filter.source(i)->validateLogical(*planningContext);
+        }
       }
     }
     validateUnselectedQueryFacetQueries(

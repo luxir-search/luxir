@@ -4600,26 +4600,75 @@ TEST_F(FacetTest, selectedFacetsRefineSidewaysWithUnionBuckets) {
         "mincount":1,"selected":["acme","globex"],
         "ops":{"avg_price":"avg(price_i)"}}},
       "prices":{"range_facet":{"field":"price_i","start":0,"end":300,
-        "gap":100,"mincount":2,"selected":[100]}}
+        "gap":100,"mincount":2,"selected":[0,100]}}
     }}}}})json", req->rawRequest(), req->mr);
   req->collection("main");
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_EQ(3, req->getMatchCount());
 
   const auto& brands = topFacetResult(*req, "q", "brands");
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
-                {"acme", 1}, {"globex", 0}}),
+                {"acme", 2}, {"globex", 1}}),
             stringFacetRows(brands));
   auto averages = metricValues(brands, "avg_price");
   ASSERT_EQ(2u, averages.size());
-  EXPECT_DOUBLE_EQ(150.0, averages[0].asDouble());
-  EXPECT_TRUE(averages[1].isNull());
+  EXPECT_DOUBLE_EQ(100.0, averages[0].asDouble());
+  EXPECT_DOUBLE_EQ(50.0, averages[1].asDouble());
 
   const auto& prices = topFacetResult(*req, "q", "prices");
   std::array<std::pair<int64_t, int64_t>, 2> bounds{{{0, 100}, {100, 200}}};
   std::array<int64_t, 2> counts{{2, 1}};
   expectRangeResult(prices, bounds, counts, -1);
+}
+
+TEST_F(FacetTest, selectedAnyComposesPerValueCacheEntries) {
+  CollectionHelper helper;
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .minSegmentDocs = 0,
+      .admissionThreshold = 1,
+  });
+  helper.getIndexWriter()->filterCache = cache;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "brand_s", "acme", "color_s", "red"),
+    flatdoc("id", "2", "brand_s", "acme", "color_s", "blue"),
+    flatdoc("id", "3", "brand_s", "acme", "color_s", "green"),
+    flatdoc("id", "4", "brand_s", "beta", "color_s", "red"),
+    flatdoc("id", "5", "brand_s", "beta", "color_s", "blue"),
+    flatdoc("id", "6", "brand_s", "beta", "color_s", "green"),
+  }, UpdateMessage::COMMIT);
+
+  auto prime = localReq(luxirNode->getSearchEngine());
+  auto& primeTop = prime->collection("main").topDocs("q")
+      .allQuery().getNumber().limit(0);
+  primeTop.facet("brands", "brand_s").limit(-1);
+  primeTop.filter(
+      qb::match(primeTop.mr(), "color_s", "red"), {"brands"});
+  prime->execute();
+  ASSERT_TRUE(prime->ok()) << prime->errorMsg();
+  EXPECT_EQ(2, prime->getMatchCount());
+
+  auto before = cache->counters();
+  SkipStatsScope stats;
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& top = req->collection("main").topDocs("q")
+      .allQuery().getNumber().limit(0);
+  std::array<std::string, 2> selected{"red", "blue"};
+  setSelected(top.facet("colors", "color_s").limit(-1), selected);
+  top.facet("brands", "brand_s").limit(-1);
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+
+  EXPECT_EQ(4, req->getMatchCount());
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                {"acme", 2}, {"beta", 2}}),
+            stringFacetRows(topFacetResult(*req, "q", "brands")));
+  EXPECT_EQ(2, SkipStats::selectionValueFiltersPlanned);
+  EXPECT_EQ(1, SkipStats::selectionLogicalFiltersPlanned);
+  EXPECT_EQ(1, SkipStats::selectionUnionCompositions);
+  auto after = cache->counters();
+  EXPECT_EQ(before.hits + 1, after.hits);
+  EXPECT_EQ(before.builds + 1, after.builds);
 }
 
 TEST_F(FacetTest, unusedAnySelectionRefinerIsNotPlanned) {
@@ -4828,6 +4877,7 @@ TEST_F(FacetTest, selectedAllIsStrictOnMultiValuedFields) {
     flatdoc("id", "4", "tags_ss", vecs("x", "y", "z")),
   }, UpdateMessage::COMMIT);
 
+  SkipStatsScope stats;
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"ops":{"q":{"top_docs":{
     "limit":0,"get_number":true,
@@ -4841,6 +4891,9 @@ TEST_F(FacetTest, selectedAllIsStrictOnMultiValuedFields) {
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
                 {"x", 2}, {"y", 2}, {"z", 1}}),
             stringFacetRows(topFacetResult(*req, "q", "tags")));
+  EXPECT_EQ(2, SkipStats::selectionValueFiltersPlanned);
+  EXPECT_EQ(2, SkipStats::selectionLogicalFiltersPlanned);
+  EXPECT_EQ(0, SkipStats::selectionUnionCompositions);
 }
 
 TEST_F(FacetTest, selectedComposesWithExplicitRoutedFilter) {
@@ -4851,6 +4904,7 @@ TEST_F(FacetTest, selectedComposesWithExplicitRoutedFilter) {
     flatdoc("id", "3", "brand_s", "beta", "stock_s", "no"),
   }, UpdateMessage::COMMIT);
 
+  SkipStatsScope stats;
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"ops":{"q":{"top_docs":{
     "limit":0,"get_number":true,
@@ -4864,6 +4918,9 @@ TEST_F(FacetTest, selectedComposesWithExplicitRoutedFilter) {
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
                 {"acme", 2}, {"beta", 1}}),
             stringFacetRows(topFacetResult(*req, "q", "brands")));
+  EXPECT_EQ(1, SkipStats::selectionValueFiltersPlanned);
+  EXPECT_EQ(1, SkipStats::selectionLogicalFiltersPlanned);
+  EXPECT_EQ(0, SkipStats::selectionUnionCompositions);
 }
 
 TEST_F(FacetTest, selectedTextFoldIsSharedByPinsAndFilter) {
