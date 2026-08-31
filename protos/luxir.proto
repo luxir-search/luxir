@@ -56,4 +56,5 @@ service Admin {
   rpc CreateCollection(luxir.proto.CreateCollectionRequest) returns (luxir.proto.CreateCollectionResponse) {}
   rpc DeleteCollection(luxir.proto.DeleteCollectionRequest) returns (luxir.proto.DeleteCollectionResponse) {}
   rpc Stats(luxir.proto.StatsRequest) returns (luxir.proto.StatsResponse) {}
+  rpc CacheControl(luxir.proto.CacheControlRequest) returns (luxir.proto.CacheControlResponse) {}
 }

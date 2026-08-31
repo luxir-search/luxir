@@ -605,6 +605,66 @@ TEST(FilterCacheTest, admissionIsOncePerDistinctKeyPerRequest) {
       << "a claim is not a completed cache build";
 }
 
+// The two flush postures are distinct measurement scenarios: clear() alone
+// keeps admission-lane sightings, so a known key re-admits and rebuilds
+// immediately (eviction refill); clear() + resetAdmission() restarts the
+// whole observation ladder (first sighting). dump() reports resident entries
+// with a printable key extraction, and resetCounters() zeroes cumulative
+// stats without touching residency.
+TEST(FilterCacheTest, flushPosturesAndDump) {
+  FilterCache cache(testConfig());
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("flushposture:term");
+
+  auto probeOnce = [&](bool publishOnBuild) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(key);
+    auto probe = use->probe(0);
+    auto kind = probe.kind();
+    if (kind == FilterCache::Probe::Kind::BUILD && publishOnBuild) {
+      use->publishRaw(0, probe, bitDocs(4096, 7), 10);
+    }
+    return kind;
+  };
+
+  // Ladder to residency: bypass, build, hit.
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, probeOnce(true));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, probeOnce(true));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, probeOnce(true));
+
+  size_t resident = 0;
+  auto rows = cache.dump(10, &resident);
+  ASSERT_EQ(1u, resident);
+  ASSERT_EQ(1u, rows.size());
+  EXPECT_NE(rows[0].keyText.find("flushposture:term"), std::string::npos);
+  EXPECT_EQ(1u, rows[0].segmentsResident);
+  EXPECT_GT(rows[0].bytes, 0u);
+  EXPECT_GT(rows[0].hits, 0u);
+
+  // Refill posture: values gone, sightings kept, so the next probe claims a
+  // build immediately rather than restarting the ladder.
+  cache.clear();
+  EXPECT_EQ(0u, cache.dump(10, &resident).size());
+  EXPECT_EQ(0u, resident);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, probeOnce(true));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, probeOnce(true));
+
+  // First-sighting posture: forgetting admission history restarts the ladder.
+  cache.clear();
+  cache.resetAdmission();
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, probeOnce(true));
+
+  EXPECT_GT(cache.counters().hits, 0u);
+  EXPECT_GT(cache.counters().builds, 0u);
+  cache.resetCounters();
+  auto counters = cache.counters();
+  EXPECT_EQ(0u, counters.hits);
+  EXPECT_EQ(0u, counters.misses);
+  EXPECT_EQ(0u, counters.builds);
+  EXPECT_EQ(0u, counters.admissions);
+}
+
 TEST(FilterCacheTest, existingLookupIsInertUntilCompleteAcceptance) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;

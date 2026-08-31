@@ -80,6 +80,8 @@ struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListColl
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct FilterCacheStats; struct IndexRamStats;
+struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
+struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct Error; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
@@ -302,6 +304,37 @@ struct StatsResponse {
   std::span<const CollectionStats> collections;
   IndexRamStats indexing_ram;
 };
+struct CacheControlRequest {                                    // needs Target
+  std::optional<Target> collection;
+  uint32_t dump_limit = 0;
+  bool flush = false;
+  bool reset_admission = false;
+  bool reset_counters = false;
+  bool dump = false;
+};
+struct CacheEntryDump {
+  uint64_t key_hash = 0;
+  uint64_t bytes = 0;
+  uint64_t hits = 0;
+  uint64_t last_used_epoch = 0;
+  std::string_view key_text;
+  std::string_view scope;
+  uint32_t key_bytes = 0;
+  uint32_t segments_resident = 0;
+  bool reader_value = false;
+};
+struct ShardCacheControl {                                      // needs FilterCacheStats,CacheEntryDump
+  FilterCacheStats stats;
+  uint64_t entries_resident = 0;
+  std::span<const CacheEntryDump> entries;
+  uint32_t shard_id = 0;
+};
+struct CollectionCacheControl {                                 // needs ShardCacheControl
+  std::string_view name;
+  std::span<const ShardCacheControl> shards;
+  std::string_view error;
+};
+struct CacheControlResponse { std::span<const CollectionCacheControl> collections; };
 
 struct Vector { std::optional<ArrFloat> f32; };                  // needs ArrFloat
 struct ArrArrBin { std::span<const ArrBin> v; };
@@ -614,6 +647,8 @@ LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(Li
 LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
+LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
+LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 #undef LUXIR_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
@@ -654,6 +689,8 @@ LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(FilterCacheStats)
 LUXIR_ENTRY(IndexRamStats)
+LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
+LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

@@ -901,6 +901,14 @@ bool FilterCache::AdmissionRing::record(uint64_t fingerprint) {
   return before + 1 >= threshold;
 }
 
+void FilterCache::AdmissionRing::reset() {
+  std::lock_guard<std::mutex> lock(mutex);
+  std::fill(history.begin(), history.end(), 0);
+  frequencies.clear();
+  cursor = 0;
+  filled = 0;
+}
+
 FilterCache::AdmissionRing& FilterCache::admissionFor(AdmissionLane lane) {
   return lane == AdmissionLane::CLAUSE
       ? clauseAdmission : wholeAdmission;
@@ -1791,6 +1799,91 @@ void FilterCache::clear() {
     }
     eraseEntry(candidate.key, candidate.entry);
   }
+}
+
+void FilterCache::resetAdmission() {
+  clauseAdmission.reset();
+  wholeAdmission.reset();
+}
+
+void FilterCache::resetCounters() {
+  counter.hits.store(0, std::memory_order_relaxed);
+  counter.misses.store(0, std::memory_order_relaxed);
+  counter.admissions.store(0, std::memory_order_relaxed);
+  counter.buildAttempts.store(0, std::memory_order_relaxed);
+  counter.builds.store(0, std::memory_order_relaxed);
+  counter.byproductInserts.store(0, std::memory_order_relaxed);
+  counter.publishRejects.store(0, std::memory_order_relaxed);
+  counter.evictions.store(0, std::memory_order_relaxed);
+  counter.capacityDeadBuilds.store(0, std::memory_order_relaxed);
+  counter.thrashBuildSkips.store(0, std::memory_order_relaxed);
+  counter.readerDeadBuilds.store(0, std::memory_order_relaxed);
+  counter.readerThrashBuildSkips.store(0, std::memory_order_relaxed);
+  counter.purges.store(0, std::memory_order_relaxed);
+  counter.oversizedKeyBypasses.store(0, std::memory_order_relaxed);
+  counter.readerStableHits.store(0, std::memory_order_relaxed);
+  counter.readerStableRefreshes.store(0, std::memory_order_relaxed);
+  counter.readerStableRetires.store(0, std::memory_order_relaxed);
+}
+
+std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
+                                                      size_t* totalResident) {
+  std::vector<EntryDump> rows;
+  size_t resident = 0;
+  entries.cvisit_all([&](const auto& item) {
+    const FilterKey& key = item.first;
+    const std::shared_ptr<FilterEntry>& entry = item.second;
+    EntryDump row;
+    auto readerValue = entry->readerValue.load(std::memory_order_acquire);
+    if (readerValue != nullptr) {
+      row.readerValue = true;
+      row.bytes += readerValue->ramBytesUsed();
+      row.hits += readerValue->cacheHits.load(std::memory_order_relaxed);
+    }
+    auto slots = entry->slots.load(std::memory_order_acquire);
+    for (const auto& slot : *slots) {
+      auto value = slot->value.load(std::memory_order_acquire);
+      if (value == nullptr) continue;
+      row.segmentsResident++;
+      row.bytes += value->ramBytesUsed();
+      row.hits += value->cacheHits.load(std::memory_order_relaxed);
+    }
+    if (row.bytes == 0) return;
+    resident++;
+    row.keyHash = key.hash();
+    row.keyBytes = key.bytes().size();
+    row.scope = entry->scope;
+    row.lastUsed = entry->lastUsed.load(std::memory_order_relaxed);
+    // Printable-run extraction: runs of 3+ printable bytes, space-joined,
+    // capped. Field names and terms in the serialized key stay readable.
+    std::string& text = row.keyText;
+    std::string run;
+    for (std::byte b : key.bytes()) {
+      char c = (char)b;
+      if (c >= 0x20 && c < 0x7f) {
+        run.push_back(c);
+        continue;
+      }
+      if (run.size() >= 3) {
+        if (!text.empty()) text.push_back(' ');
+        text.append(run);
+      }
+      run.clear();
+      if (text.size() >= 96) break;
+    }
+    if (run.size() >= 3 && text.size() < 96) {
+      if (!text.empty()) text.push_back(' ');
+      text.append(run);
+    }
+    if (text.size() > 96) text.resize(96);
+    rows.push_back(std::move(row));
+  });
+  if (totalResident != nullptr) *totalResident = resident;
+  std::sort(rows.begin(), rows.end(), [](const EntryDump& a, const EntryDump& b) {
+    return a.bytes > b.bytes;
+  });
+  if (rows.size() > limit) rows.resize(limit);
+  return rows;
 }
 
 FilterCache::CounterValues FilterCache::counters() const {

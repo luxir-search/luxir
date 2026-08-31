@@ -169,6 +169,8 @@ using DeleteCollectionReqProto = luxir::api::DeleteCollectionRequest;
 using DeleteCollectionRespProto = luxir::api::DeleteCollectionResponse;
 using StatsReqProto = luxir::api::StatsRequest;
 using StatsRespProto = luxir::api::StatsResponse;
+using CacheControlReqProto = luxir::api::CacheControlRequest;
+using CacheControlRespProto = luxir::api::CacheControlResponse;
 using HelloReqProto = luxir::api::HelloRequest;
 using HelloRespProto = luxir::api::HelloReply;
 
@@ -845,6 +847,34 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   }
 }
 
+//   rpc CacheControl(CacheControlRequest) returns (CacheControlResponse)  [unary]
+static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<CacheControlReqProto>>();
+  if (!parseRequest(readBuf, *request, "CacheControl")) {
+    call.decrementOutstanding();
+    return;
+  }
+
+  // A dump is unbounded like per-segment stats, and a flush walks the entry
+  // map; keep both off the completion-queue thread.
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+      try {
+        CacheControlRespProto response;
+        std::pmr::monotonic_buffer_resource respArena;
+        gatherCacheControl(call.server.getLuxirNode(), request->proto, response,
+                           respArena);
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
 //   rpc SayHello(HelloRequest) returns (HelloReply)  [unary] - demo
 static void handleSayHello(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<HelloReqProto> request;
@@ -926,6 +956,7 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
     {"/luxir.Admin/Stats",              {handleStats}},
+    {"/luxir.Admin/CacheControl",       {handleCacheControl}},
     {"/luxir.Greeter/SayHello",         {handleSayHello}},
     {"/luxir.Greeter/SayHello2",        {handleSayHello2}},
     {"/luxir.Greeter/SayHelloStreaming",{handleSayHelloStreaming}},

@@ -165,4 +165,88 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
   response.indexing_ram.reserved_bytes = (uint64_t)ram.reservedBytes();
 }
 
+void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,
+                        api::CacheControlResponse& response,
+                        std::pmr::memory_resource& resource) {
+  std::vector<LuxirNode::CollectionEntry> entries;
+  if (request.collection) {
+    auto collection = node.resolveCollection(&*request.collection);
+    std::string_view name = LuxirNode::kDefaultCollectionName;
+    if (!request.collection->name.empty()) name = request.collection->name.back();
+    entries.push_back({std::string(name), std::move(collection), {}});
+  } else {
+    entries = node.collectionEntries();
+  }
+
+  size_t dumpLimit = request.dump_limit != 0 ? request.dump_limit : 100;
+
+  auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
+  for (std::size_t i = 0; i < entries.size(); i++) {
+    const auto& entry = entries[i];
+    auto& collectionControl = collections[i];
+    collectionControl.name = api::build::arenaStr(resource, entry.name);
+    if (!entry.error.empty()) {
+      collectionControl.error = api::build::arenaStr(resource, entry.error);
+      continue;
+    }
+
+    auto shard = entry.collection->getShard();
+    assert(shard);
+    auto writer = shard->getIndexWriter();
+    assert(writer);
+    auto cache = writer->filterCache;
+
+    auto* shards = api::build::allocArray(collectionControl.shards, 1, resource);
+    auto& shardControl = shards[0];
+    shardControl.shard_id = 0;
+    if (cache == nullptr) continue;
+
+    if (request.flush) cache->clear();
+    if (request.reset_admission) cache->resetAdmission();
+    if (request.reset_counters) cache->resetCounters();
+
+    auto counters = cache->counters();
+    auto& stats = shardControl.stats;
+    stats.enabled = cache->enabled();
+    stats.max_bytes = cache->configuration().maxBytes;
+    stats.resident_bytes = cache->bytesUsed();
+    stats.metadata_bytes = cache->metadataBytesUsed();
+    stats.hits = counters.hits;
+    stats.misses = counters.misses;
+    stats.admissions = counters.admissions;
+    stats.builds = counters.builds;
+    stats.byproduct_inserts = counters.byproductInserts;
+    stats.publish_rejects = counters.publishRejects;
+    stats.evictions = counters.evictions;
+    stats.purges = counters.purges;
+    stats.oversized_key_bypasses = counters.oversizedKeyBypasses;
+    stats.reader_stable_hits = counters.readerStableHits;
+    stats.reader_stable_refreshes = counters.readerStableRefreshes;
+    stats.reader_stable_retires = counters.readerStableRetires;
+
+    if (!request.dump) continue;
+    size_t resident = 0;
+    auto rows = cache->dump(dumpLimit, &resident);
+    shardControl.entries_resident = resident;
+    auto* dumped = api::build::allocArray(shardControl.entries, rows.size(), resource);
+    for (std::size_t r = 0; r < rows.size(); r++) {
+      const auto& row = rows[r];
+      auto& out = dumped[r];
+      out.key_hash = row.keyHash;
+      out.key_bytes = (uint32_t)row.keyBytes;
+      out.key_text = api::build::arenaStr(resource, row.keyText);
+      std::string_view scope = row.scope == FilterKeyScope::READER_STABLE
+          ? "READER_STABLE"
+          : row.scope == FilterKeyScope::CORE_STABLE ? "CORE_STABLE"
+                                                     : "SEGMENT_STABLE";
+      out.scope = scope;
+      out.reader_value = row.readerValue;
+      out.bytes = row.bytes;
+      out.segments_resident = row.segmentsResident;
+      out.hits = row.hits;
+      out.last_used_epoch = row.lastUsed;
+    }
+  }
+}
+
 } // namespace luxir

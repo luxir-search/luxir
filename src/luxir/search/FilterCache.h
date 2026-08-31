@@ -621,6 +621,7 @@ private:
   public:
     AdmissionRing(size_t size, uint32_t threshold);
     bool record(uint64_t fingerprint);
+    void reset();
   };
 
   FilterCacheConfig config;
@@ -707,6 +708,29 @@ public:
   bool onReaderPublished(IndexReader& reader);
   void sweep();
   void clear();
+  // Forgets admission-lane sighting history. clear() alone leaves the rings
+  // populated, so a re-request of a known query re-admits and builds
+  // immediately (the eviction-refill posture); clear() + resetAdmission()
+  // restarts the whole sighting ladder (the first-sighting posture).
+  void resetAdmission();
+  void resetCounters();
+
+  // Diagnostic snapshot of resident entries, largest payload first, capped at
+  // limit. keyText is the printable-byte extraction from the serialized key
+  // (field names and terms survive; structure bytes do not). totalResident
+  // receives the uncapped count of entries holding at least one value.
+  struct EntryDump {
+    uint64_t keyHash = 0;
+    size_t keyBytes = 0;
+    std::string keyText;
+    FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE;
+    bool readerValue = false;
+    size_t bytes = 0;
+    uint32_t segmentsResident = 0;
+    uint64_t hits = 0;
+    uint64_t lastUsed = 0;
+  };
+  std::vector<EntryDump> dump(size_t limit, size_t* totalResident);
 
   CounterValues counters() const;
   size_t bytesUsed() const { return residentBytes.load(std::memory_order_relaxed); }

@@ -1181,6 +1181,57 @@ message IndexRamStats {
   uint64 reserved_bytes = 2;
 }
 
+// Admin control over the per-collection filter cache. Actions compose and
+// apply in this order: flush, reset_admission, reset_counters, then dump.
+// flush drops resident values and entry metadata; sighting history survives,
+// so a re-request of a known query re-admits and rebuilds immediately (the
+// eviction-refill posture). flush + reset_admission also forgets sightings,
+// so the next request restarts the whole observation ladder (the
+// first-sighting posture). reset_counters zeroes the cumulative stats.
+// Omitting the collection targets every collection.
+message CacheControlRequest {
+  Target collection = 1;
+  bool flush = 2;
+  bool reset_admission = 3;
+  bool reset_counters = 4;
+  bool dump = 5;
+  uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
+}
+
+// One resident cache entry. key_text is the printable-byte extraction from
+// the serialized key (field names and terms survive; structure bytes do
+// not); key_hash identifies the entry exactly. bytes counts resident value
+// payloads; segments_resident counts slots currently holding a value;
+// reader_value marks a whole-reader live-exact value.
+message CacheEntryDump {
+  uint64 key_hash = 1;
+  uint32 key_bytes = 2;
+  string key_text = 3;
+  string scope = 4;  // SEGMENT_STABLE | CORE_STABLE | READER_STABLE
+  bool reader_value = 5;
+  uint64 bytes = 6;
+  uint32 segments_resident = 7;
+  uint64 hits = 8;
+  uint64 last_used_epoch = 9;
+}
+
+message ShardCacheControl {
+  uint32 shard_id = 1;
+  FilterCacheStats stats = 2;  // gathered after the requested actions
+  repeated CacheEntryDump entries = 3;  // largest payload first, capped
+  uint64 entries_resident = 4;  // uncapped resident-entry count at dump time
+}
+
+message CollectionCacheControl {
+  string name = 1;
+  repeated ShardCacheControl shards = 2;
+  string error = 3;
+}
+
+message CacheControlResponse {
+  repeated CollectionCacheControl collections = 1;
+}
+
 //
 // Schema
 //
