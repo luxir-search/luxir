@@ -29,7 +29,8 @@ public:
   HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes = -1);
   ~HttpServer();
 
-  // Bind, begin accepting, and spawn shard threads. Non-blocking; getPort() is
+  // Bind and begin accepting. Shard threads spawn lazily as connections are
+  // assigned. Non-blocking; getPort() is
   // valid after this returns.  Throws on bind failure.
   void start();
 
@@ -60,7 +61,6 @@ private:
   // Sessions and off-io work pins co-own their shard so executor teardown is
   // safe on any thread after HttpServer has joined the shard runner.
   std::vector<std::shared_ptr<HttpIoShard>> shards;
-  std::size_t nextShard = 0;
   std::shared_ptr<HttpSessionRegistry> registry;
 
   void doAccept();

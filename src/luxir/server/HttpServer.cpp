@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <atomic>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -60,6 +61,10 @@ public:
   net::io_context ioc{1};
   std::optional<net::executor_work_guard<net::io_context::executor_type>> workGuard;
   std::thread thread;
+  // Live connections assigned here. Incremented by the accept thread at
+  // assignment, decremented by session teardown (any thread); drives
+  // least-connections assignment in doAccept.
+  std::atomic<int64_t> liveConnections{0};
 };
 
 using HttpSearchReqProto = luxir::api::SearchRequest;
@@ -305,7 +310,10 @@ public:
     : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
       highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {}
 
-  ~HttpSession() { if (deregister_) deregister_(); }
+  ~HttpSession() {
+    if (deregister_) deregister_();
+    shard_->liveConnections.fetch_sub(1, std::memory_order_relaxed);
+  }
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
 
@@ -2986,7 +2994,6 @@ void HttpServer::start() {
     shard->workGuard.emplace(shard->ioc.get_executor());
     shards.push_back(std::move(shard));
   }
-  nextShard = 0;
 
   acceptor.emplace(acceptIoc);
   acceptor->open(ep.protocol());
@@ -2997,21 +3004,51 @@ void HttpServer::start() {
 
   doAccept();
 
-  for (auto& shard : shards) {
-    shard->thread = std::thread([shard] { shard->ioc.run(); });
-  }
-  acceptThread = std::thread([this] { acceptIoc.run(); });
+  // Shard threads spawn on first connection assignment (doAccept), so an
+  // idle or lightly loaded server carries only the threads it has used.
+  // Once spawned, a shard thread runs until shutdown.
+  acceptThread = std::thread([this] {
+    nameThisThread("luxir_accept");
+    acceptIoc.run();
+  });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
 }
 
 void HttpServer::doAccept() {
-  auto shard = shards[nextShard];
+  // Least-connections assignment, preferring an already-running shard on
+  // ties. Sequential short-lived connections therefore reuse one warm
+  // thread instead of round-robin spawning every shard, while concurrent
+  // connections still fan out one per shard. Also balances better than
+  // round-robin for long-lived connections of unequal lifetime. Counts are
+  // exact enough: assignment happens only here, and a stale decrement just
+  // delays reuse by one accept.
+  std::size_t idx = 0;
+  auto score = [this](std::size_t i) {
+    return std::pair<int64_t, int>(
+        shards[i]->liveConnections.load(std::memory_order_relaxed),
+        shards[i]->thread.joinable() ? 0 : 1);
+  };
+  for (std::size_t i = 1; i < shards.size(); i++) {
+    if (score(i) < score(idx)) idx = i;
+  }
+  auto shard = shards[idx];
   acceptor->async_accept(shard->ioc.get_executor(),
-      [this, shard](beast::error_code ec, tcp::socket sock) {
+      [this, shard, idx](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
         if (!ec) {
-          nextShard = (nextShard + 1) % shards.size();
+          shard->liveConnections.fetch_add(1, std::memory_order_relaxed);
+          // Only the accept thread spawns shard threads, and shutdown joins
+          // this thread before touching them, so joinable() is race-free:
+          // false = never assigned, true = running until shutdown.
+          if (!shard->thread.joinable()) {
+            shard->thread = std::thread([shard, idx] {
+              char name[16];
+              snprintf(name, sizeof(name), "luxir_http_%zu", idx);
+              nameThisThread(name);
+              shard->ioc.run();
+            });
+          }
           // Small request/response exchanges on a keep-alive connection stall
           // ~40ms per round trip under Nagle + delayed ACK; disable Nagle like
           // every HTTP server does.  Best-effort: an ec here is not fatal.

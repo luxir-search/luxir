@@ -1,9 +1,15 @@
 #pragma once
 #include <optional>
+#include <pthread.h>
 #include <oneapi/tbb/flow_graph.h>
 #include <oneapi/tbb/task_group.h>
 
 namespace luxir {
+
+/// Label the calling thread for ps/top/gdb (15-char kernel limit).
+inline void nameThisThread(const char* name) {
+  pthread_setname_np(pthread_self(), name);
+}
 
 
 /// enqueue/run a task in a task_group, or run it directly if the task_group is null.

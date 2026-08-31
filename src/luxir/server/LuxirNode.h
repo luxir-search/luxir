@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -12,9 +13,11 @@
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
+#include "oneapi/tbb/task_scheduler_observer.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/LuxirConfig.h"
 #include "luxir/util/SharedLazyMap.h"
+#include "luxir/util/thread.h"
 
 namespace luxir {
 
@@ -239,6 +242,25 @@ private:
   std::unique_ptr<DirectoryFactory> dirFactory;
 
   oneapi::tbb::task_arena taskArena;
+
+  // Labels arena worker threads for ps/top/gdb. Masters (transport threads
+  // executing in the arena) keep their own names. Declared after taskArena:
+  // observation detaches before the arena tears down.
+  class ArenaThreadNamer : public oneapi::tbb::task_scheduler_observer {
+  public:
+    explicit ArenaThreadNamer(oneapi::tbb::task_arena& arena)
+      : oneapi::tbb::task_scheduler_observer(arena) {
+      observe(true);
+    }
+    void on_scheduler_entry(bool worker) override {
+      if (!worker) return;
+      char name[16];
+      snprintf(name, sizeof(name), "luxir_tbb_%d",
+               oneapi::tbb::this_task_arena::current_thread_index());
+      nameThisThread(name);
+    }
+  };
+  ArenaThreadNamer arenaThreadNamer{taskArena};
 };
 
 }
