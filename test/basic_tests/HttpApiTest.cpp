@@ -2396,6 +2396,74 @@ TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
   sock.shutdown(tcp::socket::shutdown_both, ec);
 }
 
+TEST_F(HttpApiTest, shutdownDrainsWorkAcrossIoShards) {
+  LuxirConfig config;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 8;
+  LuxirNode node(config);
+  HttpServer localServer(node, 4, 0, 4096);
+  localServer.start();
+
+  std::string payload(8 * 1024, 'z');
+  std::string seed = R"({"docs":[)";
+  for (int i = 0; i < 256; i++) {
+    if (i != 0) seed += ',';
+    seed += R"({"id":"shutdown-)" + std::to_string(i) +
+        R"(","title_w":"shardshutdown","blob_sc":")" + payload + R"("})";
+  }
+  seed += R"(],"commit":{}})";
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/shutdown_shards/_update", std::move(seed));
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  net::io_context clientIoc;
+  tcp::resolver resolver(clientIoc);
+  auto endpoint = resolver.resolve("127.0.0.1", std::to_string(localServer.getPort()));
+  std::vector<std::unique_ptr<beast::tcp_stream>> connections;
+  for (int i = 0; i < 4; i++) {
+    auto connection = std::make_unique<beast::tcp_stream>(clientIoc);
+    connection->connect(endpoint);
+    connections.push_back(std::move(connection));
+  }
+
+  for (int i = 0; i < 2; i++) {
+    http::request<http::string_body> request{
+        http::verb::post, "/collections/shutdown_shards/_search", 11};
+    request.set(http::field::host, "127.0.0.1");
+    request.set(http::field::content_type, "application/json");
+    request.keep_alive(true);
+    request.body() =
+        R"({"query":{"all":true},"max_parallel":0,"limit":256,"batch_size":16,"fields":["id","blob_sc"]})";
+    request.prepare_payload();
+    http::write(*connections[i], request);
+  }
+
+  for (int i = 2; i < 4; i++) {
+    std::string body;
+    for (int doc = 0; doc < 64; doc++) {
+      body += R"({"id":"shutdown-stream-)" + std::to_string(i) + '-' +
+          std::to_string(doc) + R"(","title_w":"shardshutdown","blob_sc":")" +
+          payload + R"("})" "\n";
+    }
+    http::request<http::string_body> request{
+        http::verb::post, "/collections/shutdown_stream/_update", 11};
+    request.set(http::field::host, "127.0.0.1");
+    request.set(http::field::content_type, "application/x-ndjson");
+    request.keep_alive(false);
+    request.body() = std::move(body);
+    request.prepare_payload();
+    http::write(*connections[i], request);
+  }
+
+  EXPECT_NO_THROW(localServer.shutdown());
+
+  for (auto& connection : connections) {
+    beast::error_code ec;
+    connection->socket().shutdown(tcp::socket::shutdown_both, ec);
+    connection->socket().close(ec);
+  }
+}
+
 // ?format=docs: every line is a bare document - no envelope, no batching
 // visible on the wire regardless of batch_size.
 TEST_F(HttpApiTest, docsFormatIsPureDocLines) {

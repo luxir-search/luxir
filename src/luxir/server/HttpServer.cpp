@@ -3038,7 +3038,18 @@ void HttpServer::shutdown() {
   }
 #endif
 
-  // 1) Stop accepting. The accept context has one runner, so this is serialized
+  // 1) Close the registry gate before asking the accept loop to stop. A
+  //    connection accepted in the close window then self-closes in run().
+  //    Snapshot live sessions while holding the same gate, keeping them alive
+  //    until their close has been posted.
+  std::vector<std::shared_ptr<HttpSession>> live;
+  {
+    std::lock_guard<std::mutex> lk(registry->mtx);
+    registry->shuttingDown = true;
+    for (auto& w : registry->sessions) if (auto s = w.lock()) live.push_back(std::move(s));
+  }
+
+  // 2) Stop accepting. The accept context has one runner, so this is serialized
   //    with the accept loop without a strand.
   if (acceptor) {
     net::post(acceptor->get_executor(), [this] {
@@ -3047,17 +3058,7 @@ void HttpServer::shutdown() {
     });
   }
 
-  // 2) Mark shutting down and snapshot live sessions (keeping them alive while we
-  //    close them).  A connection accepted in the close window self-closes in
-  //    run() because shuttingDown is already set here.
-  std::vector<std::shared_ptr<HttpSession>> live;
-  {
-    std::lock_guard<std::mutex> lk(registry->mtx);
-    registry->shuttingDown = true;
-    for (auto& w : registry->sessions) if (auto s = w.lock()) live.push_back(std::move(s));
-  }
-
-  // 3) Close each live connection, then drop our refs.  Closing unblocks idle
+  // 3) Close each live connection, then drop our refs. Closing unblocks idle
   //    reads; in-flight queries keep the io_context alive via their work guards
   //    until they finish (and release their response arenas).
   for (auto& s : live) s->closeFromServer();
@@ -3066,12 +3067,26 @@ void HttpServer::shutdown() {
   // No worker context may exit until the accept loop is quiescent: a successful
   // accept racing the close can still hand a session to the worker context.
   if (acceptThread.joinable()) acceptThread.join();
+#ifndef NDEBUG
+  assert(!acceptThread.joinable());
+#endif
 
   // 4) Release each keep-alive guard and let run() return once that shard's work
   //    drains. Never call stop(): uninvoked handlers hold sessions which co-own
   //    their shard, creating a retention cycle instead of a clean teardown.
   for (auto& shard : shards) shard->workGuard.reset();
-  for (auto& shard : shards) if (shard->thread.joinable()) shard->thread.join();
+  for (auto& shard : shards) {
+    if (shard->thread.joinable()) shard->thread.join();
+#ifndef NDEBUG
+    assert(!shard->thread.joinable());
+#endif
+  }
+
+  // The acceptor and registry may only be released after every executor that
+  // references them has drained. Sessions can briefly outlive this point on an
+  // arena thread; they co-own the registry and shard they need for destruction.
+  acceptor.reset();
+  registry.reset();
   shards.clear();
   started = false;
 }
