@@ -27,6 +27,7 @@
 #include <boost/asio/strand.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 
 // prettify_json is a pure text transform (no api-type serialization), so this TU needs
 // glaze but not the Luxir JSON dialect. prettify.hpp is not self-contained: read_iterators
@@ -55,22 +56,26 @@ using tcp = net::ip::tcp;
 
 class HttpSession;
 
+class HttpIoShard {
+public:
+  net::io_context ioc{1};
+  std::optional<net::executor_work_guard<net::io_context::executor_type>> workGuard;
+  std::thread thread;
+};
+
 using HttpSearchReqProto = luxir::api::SearchRequest;
 using HttpUpdateReqProto = luxir::api::UpdateRequest;
 
-// Pins the io_context on behalf of off-io-thread work (engine / task-arena
-// tasks).  The guard keeps run() from returning until the work completes (the
-// graceful-drain contract of HttpServer::shutdown()); the shared_ptr keeps the
-// context itself alive so the guard's executor copy - a non-owning view of the
-// context - can be destroyed on any thread, in any lambda-capture order, even
-// after shutdown() has joined the io threads.  `ioc` is declared first so it
-// outlives the guard's strand teardown.  Off-io holders must use this (via
-// HttpSession::makeIoPin), never a raw executor_work_guard.
-struct IoPin {
-  std::shared_ptr<net::io_context> ioc;
-  net::executor_work_guard<net::any_io_executor> guard;
-  IoPin(std::shared_ptr<net::io_context> ioc, net::any_io_executor ex)
-    : ioc(std::move(ioc)), guard(std::move(ex)) {}
+// Pins one shard on behalf of off-io-thread work (engine / task-arena tasks).
+// The guard keeps run() from returning until the work completes; the shared_ptr
+// keeps the context alive so its non-owning executor can be destroyed on any
+// thread after shutdown has joined the runner. `shard` is declared first so it
+// outlives guard teardown. Off-io holders must use HttpSession::makeShardPin().
+struct ShardPin {
+  std::shared_ptr<HttpIoShard> shard;
+  net::executor_work_guard<net::io_context::executor_type> guard;
+  explicit ShardPin(std::shared_ptr<HttpIoShard> shard)
+    : shard(std::move(shard)), guard(this->shard->ioc.get_executor()) {}
 };
 
 struct HttpSearchRequestState {
@@ -209,7 +214,7 @@ struct HttpStreamUpdateState {
   std::map<std::uint64_t, HttpStreamBatchResult> completedBatchResults;
   std::optional<HttpStreamControl> pendingControl;
   std::optional<std::string> inputFailurePending;
-  std::shared_ptr<IoPin> ioPin;
+  std::shared_ptr<ShardPin> shardPin;
   HttpStreamInterval interval;
   std::size_t docsSeen = 0;
   std::size_t docsIndexedSoFar = 0;
@@ -252,13 +257,13 @@ struct HttpStreamUpdateState {
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
 // arena thread; it renders one NDJSON line and hands it to the session strand.
 // Holds a shared_ptr to the session so the connection outlives in-flight work,
-// and an IoPin so shutdown drains this request and the io_context survives the
+// and a ShardPin so shutdown drains this request and its shard survives the
 // request's teardown here on the task-arena thread.
 class HttpSearchRequest : public SearchRequest {
 public:
   std::unique_ptr<HttpSearchRequestState> requestState;
   std::shared_ptr<HttpSession> session;
-  std::shared_ptr<IoPin> ioPin;
+  std::shared_ptr<ShardPin> shardPin;
   HttpSearchFormat format = HttpSearchFormat::ENVELOPE;
   // DOCS-format framing state.  Document bodies render unlocked (pure per
   // batch); for multi-op requests - one emitter per op, concurrent replies -
@@ -287,7 +292,7 @@ public:
   ReplyStatus replyDocs(SearchResponse& response);
   void resumeWhenDrained(std::function<void()> resume) override;
   // done() is inherited: releaseArena(&arena) frees this request (and its
-  // IoPin).  reply() calls it eagerly once the final line is enqueued - the line
+  // ShardPin). reply() calls it eagerly once the final line is enqueued - the line
   // owns its bytes, so cleanup does not wait for the write to complete.
 };
 
@@ -296,9 +301,9 @@ public:
 // thread producers reach it through enqueueLine.
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
-  HttpSession(std::shared_ptr<net::io_context> ioc, tcp::socket&& sock, LuxirNode& node,
+  HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
               std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
-    : ioc_(std::move(ioc)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
+    : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
       highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {}
 
   ~HttpSession() { if (deregister_) deregister_(); }
@@ -403,21 +408,18 @@ public:
         });
   }
 
-  // Every off-io-thread holder of this session's executor must pin the context
-  // through this helper, never via a raw executor_work_guard: IoPin's member
-  // order guarantees the io_context outlives the guard's teardown wherever the
-  // last reference drops.
-  std::shared_ptr<IoPin> makeIoPin() {
-    return std::make_shared<IoPin>(ioc_, stream_.get_executor());
+  // Every off-io-thread holder of this session must pin its shard through this
+  // helper, never via a raw executor_work_guard.
+  std::shared_ptr<ShardPin> makeShardPin() {
+    return std::make_shared<ShardPin>(shard_);
   }
 
 private:
   struct Pending { std::string line; bool last; };
 
-  // Co-owns the io_context: the last session ref can drop on a task-arena thread
-  // after shutdown() has joined, and ~stream_ releases its strand through the
-  // context.  Declared first so it is destroyed last.
-  std::shared_ptr<net::io_context> ioc_;
+  // The last session ref can drop on a task-arena thread after shutdown has
+  // joined. Declared first so the shard is destroyed after stream_.
+  std::shared_ptr<HttpIoShard> shard_;
   beast::tcp_stream stream_;
   LuxirNode& node_;
   std::shared_ptr<HttpSessionRegistry> registry_;
@@ -1300,7 +1302,7 @@ private:
     sreq->docsState.multiOp = docsMultiOp;
     // Pin the io_context: shutdown drains until this query finishes, and the
     // context survives the request's teardown on the task-arena thread.
-    sreq->ioPin = makeIoPin();
+    sreq->shardPin = makeShardPin();
 
     // Route by max_parallel: dispatch() moves the synchronous engine.submit()
     // off the strand so this io thread is not blocked for the query's duration.
@@ -1333,8 +1335,8 @@ private:
       return;
     }
 
-    auto ioPin = makeIoPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin] {
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
       http::status status = http::status::ok;
       std::string out;
       try {
@@ -1370,7 +1372,7 @@ private:
       }
 
       net::post(self->stream_.get_executor(),
-          [self, ioPin, status, body = std::move(out)]() mutable {
+          [self, shardPin, status, body = std::move(out)]() mutable {
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
@@ -1417,8 +1419,8 @@ private:
       return;
     }
 
-    auto ioPin = makeIoPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin] {
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
       http::status status = http::status::ok;
       std::string out;
       try {
@@ -1445,7 +1447,7 @@ private:
       }
 
       net::post(self->stream_.get_executor(),
-          [self, ioPin, status, body = std::move(out)]() mutable {
+          [self, shardPin, status, body = std::move(out)]() mutable {
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
@@ -1467,8 +1469,8 @@ private:
       return;
     }
 
-    auto ioPin = makeIoPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin] {
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
       http::status status = http::status::ok;
       std::string out;
       try {
@@ -1493,7 +1495,7 @@ private:
       }
 
       net::post(self->stream_.get_executor(),
-          [self, ioPin, status, body = std::move(out)]() mutable {
+          [self, shardPin, status, body = std::move(out)]() mutable {
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
@@ -1542,9 +1544,9 @@ private:
   }
 
   void handleStats(std::optional<std::string> coll, bool includeSegments) {
-    auto ioPin = makeIoPin();
+    auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), coll = std::move(coll), includeSegments, ioPin] {
+        [self = shared_from_this(), coll = std::move(coll), includeSegments, shardPin] {
           http::status status = http::status::ok;
           std::string out;
           try {
@@ -1571,7 +1573,7 @@ private:
           }
 
           net::post(self->stream_.get_executor(),
-                    [self, ioPin, status, body = std::move(out)]() mutable {
+                    [self, shardPin, status, body = std::move(out)]() mutable {
                       self->respondSimple(status, "application/json", std::move(body));
                     });
         });
@@ -1597,8 +1599,8 @@ private:
 
     // updateSchema persists (fsync) under the collection's schema lock, so run
     // it off the io thread like handleUpdate.
-    auto ioPin = makeIoPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin, mode, coll] {
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, coll] {
       http::status status = http::status::ok;
       std::string out;
       try {
@@ -1620,7 +1622,7 @@ private:
       }
 
       net::post(self->stream_.get_executor(),
-          [self, ioPin, status, body = std::move(out)]() mutable {
+          [self, shardPin, status, body = std::move(out)]() mutable {
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
@@ -1865,7 +1867,7 @@ private:
     state->urlCommit = urlCommit;
     state->urlFieldMap = std::move(urlFieldMap);
     state->urlDropUnmapped = urlDropUnmapped;
-    state->ioPin = makeIoPin();
+    state->shardPin = makeShardPin();
 
     // http::async_read_some uses its dynamic buffer capacity to select a socket
     // read size (capped at 64 KiB).  Header parsing otherwise leaves flat_buffer
@@ -2039,7 +2041,7 @@ private:
     if (state) {
       state->failed = true;
       state->completedBatchResults.clear();
-      if (state->inFlight == 0) state->ioPin.reset();
+      if (state->inFlight == 0) state->shardPin.reset();
     }
     // A pipelined batch can fail while the next body read is outstanding.
     // Beast's composed read still owns the parser in that case; its completion
@@ -2478,7 +2480,7 @@ private:
     state->inFlightBatches.erase(entry);
 
     if (state->failed || streamUpdate_ != state) {
-      if (state->inFlight == 0) state->ioPin.reset();
+      if (state->inFlight == 0) state->shardPin.reset();
       return;
     }
 
@@ -2628,9 +2630,9 @@ private:
     state->urlCommit = false;
     state->urlCommitInFlight = true;
 
-    auto ioPin = state->ioPin;
+    auto shardPin = state->shardPin;
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), state, writers = std::move(writers), ioPin] {
+        [self = shared_from_this(), state, writers = std::move(writers), shardPin] {
           std::string err;
           try {
             for (const auto& [name, writer] : writers) {
@@ -2644,7 +2646,7 @@ private:
           }
 
           net::post(self->stream_.get_executor(),
-              [self, state, ioPin, err = std::move(err)]() mutable {
+              [self, state, shardPin, err = std::move(err)]() mutable {
                 if (self->streamUpdate_ != state || state->failed) return;
                 state->urlCommitInFlight = false;
                 if (!err.empty()) {
@@ -2738,7 +2740,7 @@ private:
     if (streamUpdate_ && !streamUpdate_->failed) {
       streamUpdate_->failed = true;
       streamUpdate_->completedBatchResults.clear();
-      if (streamUpdate_->inFlight == 0) streamUpdate_->ioPin.reset();
+      if (streamUpdate_->inFlight == 0) streamUpdate_->shardPin.reset();
     }
     // Pending entries are just owned strings (their arenas were freed in reply()),
     // so dropping them frees everything.
@@ -2966,8 +2968,7 @@ HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBuf
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
         streamBufferBytes > 0 ? streamBufferBytes
-                              : node.getConfig().server.stream_buffer_bytes)),
-    ioc(std::make_shared<net::io_context>()) {}
+                              : node.getConfig().server.stream_buffer_bytes)) {}
 
 HttpServer::~HttpServer() { shutdown(); }
 
@@ -2980,7 +2981,13 @@ void HttpServer::start() {
   tcp::endpoint ep(net::ip::make_address(host), (unsigned short)requestedPort);
 
   registry = std::make_shared<HttpSessionRegistry>();
-  workGuard.emplace(ioc->get_executor());
+  shards.reserve(n);
+  for (int i = 0; i < n; i++) {
+    auto shard = std::make_shared<HttpIoShard>();
+    shard->workGuard.emplace(shard->ioc.get_executor());
+    shards.push_back(std::move(shard));
+  }
+  nextShard = 0;
 
   acceptor.emplace(acceptIoc);
   acceptor->open(ep.protocol());
@@ -2991,24 +2998,27 @@ void HttpServer::start() {
 
   doAccept();
 
-  threads.reserve(n);
-  for (int i = 0; i < n; i++) threads.emplace_back([this] { ioc->run(); });
+  for (auto& shard : shards) {
+    shard->thread = std::thread([shard] { shard->ioc.run(); });
+  }
   acceptThread = std::thread([this] { acceptIoc.run(); });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
 }
 
 void HttpServer::doAccept() {
-  acceptor->async_accept(net::make_strand(*ioc),
-      [this](beast::error_code ec, tcp::socket sock) {
+  auto shard = shards[nextShard];
+  acceptor->async_accept(net::make_strand(shard->ioc),
+      [this, shard](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
         if (!ec) {
+          nextShard = (nextShard + 1) % shards.size();
           // Small request/response exchanges on a keep-alive connection stall
           // ~40ms per round trip under Nagle + delayed ACK; disable Nagle like
           // every HTTP server does.  Best-effort: an ec here is not fatal.
           beast::error_code nde;
           sock.set_option(tcp::no_delay(true), nde);
-          std::make_shared<HttpSession>(ioc, std::move(sock), node, registry,
+          std::make_shared<HttpSession>(shard, std::move(sock), node, registry,
                                         streamBufferBytes_)->run();
         }
         if (acceptor && acceptor->is_open()) doAccept();
@@ -3023,8 +3033,8 @@ void HttpServer::shutdown() {
 #ifndef NDEBUG
   assert(acceptThread.get_id() != std::this_thread::get_id()
          && "HttpServer::shutdown() must not be called from the accept thread");
-  for (auto& t : threads) {
-    assert(t.get_id() != std::this_thread::get_id()
+  for (auto& shard : shards) {
+    assert(shard->thread.get_id() != std::this_thread::get_id()
            && "HttpServer::shutdown() must not be called from an io thread");
   }
 #endif
@@ -3058,14 +3068,12 @@ void HttpServer::shutdown() {
   // accept racing the close can still hand a session to the worker context.
   if (acceptThread.joinable()) acceptThread.join();
 
-  // 4) Release the keep-alive guard and let run() return once work drains.
-  //    This must stay a drain - never ioc->stop().  stop() would leave uninvoked
-  //    handlers owned by the context; those handlers hold session refs and each
-  //    session co-owns the context, so stopping would create a retention cycle
-  //    instead of a clean teardown.
-  workGuard.reset();
-  for (auto& t : threads) if (t.joinable()) t.join();
-  threads.clear();
+  // 4) Release each keep-alive guard and let run() return once that shard's work
+  //    drains. Never call stop(): uninvoked handlers hold sessions which co-own
+  //    their shard, creating a retention cycle instead of a clean teardown.
+  for (auto& shard : shards) shard->workGuard.reset();
+  for (auto& shard : shards) if (shard->thread.joinable()) shard->thread.join();
+  shards.clear();
   started = false;
 }
 

@@ -158,12 +158,11 @@ TEST_F(HttpApiTest, health) {
   EXPECT_NE(res.body().find(R"("status")"), std::string::npos);
 }
 
-// Enabled with the per-thread io_context implementation: four connections
-// accepted in sequence must land on four different shards, and a persistent
-// connection must never migrate between shard threads.
-TEST_F(HttpApiTest, DISABLED_connectionsStayPinnedToIoShards) {
+// Four connections accepted in sequence must land on four different shards,
+// and a persistent connection must never migrate between shard threads.
+TEST_F(HttpApiTest, connectionsStayPinnedToIoShards) {
   helper.index(flatdoc("id", std::string("shard-affinity"),
-                       "title_w", std::string("shard affinity")),
+                       "affinity_s", std::string("shard-affinity")),
                UpdateMessage::COMMIT);
 
   HttpServer shardServer(*LuxirTest::luxirNode, 4, 0);
@@ -192,24 +191,35 @@ TEST_F(HttpApiTest, DISABLED_connectionsStayPinnedToIoShards) {
     request.set(http::field::content_type, "application/json");
     request.keep_alive(true);
     request.body() =
-        R"({"query":{"all":true},"limit":0,"get_number":true,"profile":true,"max_parallel":-1})";
+        R"({"profile":true,"max_parallel":-1,"ops":{"affinity":{"field_facet":{"field":"affinity_s","limit":-1}}}})";
     request.prepare_payload();
     http::write(connection.stream, request);
 
     http::response<http::string_body> response;
     http::read(connection.stream, connection.buffer, response);
-    if (response.result() != http::status::ok) return std::nullopt;
+    if (response.result() != http::status::ok) {
+      ADD_FAILURE() << response;
+      return std::nullopt;
+    }
 
     glz::generic_i64 root;
     if (glz::read_json(root, response.body()) || !root.is_object() ||
         !root.contains("profile")) {
+      ADD_FAILURE() << response.body();
       return std::nullopt;
     }
     auto* ops = root["profile"]["ops"].get_if<glz::generic_i64::array_t>();
-    if (ops == nullptr || ops->empty()) return std::nullopt;
+    if (ops == nullptr || ops->empty()) {
+      ADD_FAILURE() << response.body();
+      return std::nullopt;
+    }
     auto* pieces = (*ops)[0]["pieces"].get_if<glz::generic_i64::array_t>();
-    if (pieces == nullptr || pieces->empty()) return std::nullopt;
+    if (pieces == nullptr || pieces->empty()) {
+      ADD_FAILURE() << response.body();
+      return std::nullopt;
+    }
     auto* threadId = (*pieces)[0]["thread_id"].get_if<int64_t>();
+    if (threadId == nullptr) ADD_FAILURE() << response.body();
     return threadId == nullptr ? std::nullopt : std::optional<int64_t>(*threadId);
   };
 

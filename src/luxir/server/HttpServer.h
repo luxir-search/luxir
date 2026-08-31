@@ -6,12 +6,12 @@
 #include <memory>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/executor_work_guard.hpp>
 #include "LuxirNode.h"
 
 namespace luxir {
 
 class HttpSessionRegistry;  // tracks live sessions for graceful shutdown (defined in the .cpp)
+class HttpIoShard;
 
 // A hand-written async HTTP/JSON front end (Boost.Beast) beside the gRPC server.
 // Endpoints: /collections/{c}/_search, /_update, /_schema, /_stats, plus
@@ -49,22 +49,17 @@ private:
   int port_ = 0;
   bool started = false;
 
-  // Shared: sessions and off-io work pins co-own the context so their teardown
-  // (strand release through the context's allocator) is safe from any thread,
-  // even after shutdown() has joined the io threads.  The context may therefore
-  // briefly outlive this object.  See IoPin in HttpServer.cpp.
-  std::shared_ptr<boost::asio::io_context> ioc;
   // Accepting is isolated from request execution so an inline search cannot
   // delay new connections. The outstanding async_accept keeps this context
   // alive until shutdown closes the acceptor.
   boost::asio::io_context acceptIoc{1};
   std::optional<boost::asio::ip::tcp::acceptor> acceptor;
   std::thread acceptThread;
-  std::vector<std::thread> threads;
+  // Sessions and off-io work pins co-own their shard so executor teardown is
+  // safe on any thread after HttpServer has joined the shard runner.
+  std::vector<std::shared_ptr<HttpIoShard>> shards;
+  std::size_t nextShard = 0;
   std::shared_ptr<HttpSessionRegistry> registry;
-  // Keeps run() from returning while idle; reset during shutdown so run() returns
-  // once in-flight work has drained.
-  std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> workGuard;
 
   void doAccept();
 };
