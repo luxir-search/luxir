@@ -1,12 +1,10 @@
 #pragma once
 
-#include <algorithm>
 #include <assert.h>
-#include <cstring>
 #include <string_view>
 
+#include "AutomatonSeekCore.h"
 #include "FilteredTermsEnum.h"
-#include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
 
 namespace luxir {
@@ -14,25 +12,27 @@ namespace luxir {
 // Shared forward-only driver for byte automata.  DEAD is the concept-level
 // sentinel returned by nextLiveByte when no outgoing byte is live.
 template <typename A>
-class AutomatonSeekEnum : public FilteredTermsEnum {
+class AutomatonSeekEnum : public AutomatonSeekCore<A> {
+  using Core = AutomatonSeekCore<A>;
+
 public:
-  // What successor() found.  A ZERO_EXTENSION is the term it was given plus a
-  // 0x00 byte: nothing can sort between the two, so the caller only ever has to
-  // step to reach it and never reads the bytes - which is why they are not
-  // written.  JUMP is a target the caller has to compare against and may seek
-  // to, and is the only case that fills the output buffer.
-  enum class Successor { NONE, ZERO_EXTENSION, JUMP };
+  using Successor = typename Core::Successor;
+  using Core::successor;
+  using Core::termView;
 
 protected:
-  static constexpr int DEAD = -1;
-  std::string_view prefix;
-  A automaton;
-  typename A::State initialState;
-  typename A::State* stack;
-  // The seek target: `prefix`, then a successor of the current term's suffix.
-  // The prefix half is written once at construction and never changes, so
-  // building a target only rewrites the bytes after it.
-  char seekBuffer[PackedTerm::MAX_LEN + 1];
+  using Core::automaton;
+  using Core::exhausted;
+  using Core::finish;
+  using Core::initialState;
+  using Core::matchSuffix;
+  using typename Core::MatchStatus;
+  using Core::prefix;
+  using Core::seekBuffer;
+  using Core::stack;
+  using Core::started;
+  using typename Core::Status;
+  using Core::te;
   int previousLiveDepth = 0;
   // A seek lands on a term the automaton never walked to, so the shared prefix
   // the dictionary reports there is shared with a term this enum never saw.
@@ -55,44 +55,8 @@ protected:
     int64_t jumps;
   };
 
-public:
-  // `out`/`outLen` are written only for JUMP.
-  static Successor successor(const A& automaton, std::string_view term,
-                             const typename A::State* states, int liveDepth,
-                             char* out, int& outLen) {
-    int length = (int)term.size();
-    outLen = 0;
-    if (liveDepth == length) {
-      int byte = automaton.nextLiveByte(states[length], 0);
-      if (byte != DEAD) {
-        // Extending by 0x00 leaves the term itself as the whole prefix of the
-        // result, so reporting the kind tells the caller everything the bytes
-        // would have and the copy is skipped.
-        if (byte == 0) return Successor::ZERO_EXTENSION;
-        if (length != 0) memcpy(out, term.data(), (size_t)length);
-        out[length] = (char)(uint8_t)byte;
-        outLen = length + 1;
-        return Successor::JUMP;
-      }
-    }
-    for (int pos = liveDepth == length ? length - 1 : liveDepth; pos >= 0; pos--) {
-      uint8_t byte = (uint8_t)term[(size_t)pos];
-      if (byte == 0xff) continue;
-      int next = automaton.nextLiveByte(states[pos], (int)byte + 1);
-      if (next != DEAD) {
-        if (pos != 0) memcpy(out, term.data(), (size_t)pos);
-        out[pos] = (char)(uint8_t)next;
-        outLen = pos + 1;
-        return Successor::JUMP;
-      }
-    }
-    return Successor::NONE;
-  }
-
-protected:
-
   void resetStack() {
-    stack[0] = initialState;
+    Core::resetStack();
     previousLiveDepth = 0;
     chainBroken = true;
   }
@@ -125,32 +89,12 @@ protected:
     // least that much of it, so it does too and the check is skipped.
     s.examined++;
     int common = shared - s.prefixLen;
-    if (common > s.liveDepth) {
-      // This term repeats the previous one through the byte that killed the
-      // automaton, so it dies in the same place.  Rejected without stepping and
-      // without reading a term byte; liveDepth still describes it.
-      return Status::REJECT;
-    }
     std::string_view suffix = termView().substr((size_t)s.prefixLen);
-    const int suffixLen = (int)suffix.size();
-    const char* suffixBytes = suffix.data();
-    typename A::State* const states = stack;
-    int64_t steps = s.steps;
-    int i = common;
-    for (; i < suffixLen; i++) {
-      typename A::State next = a.step(states[i], (uint8_t)suffixBytes[i]);
-      steps++;
-      if (!a.canMatch(next)) break;
-      states[i + 1] = next;
-    }
-    s.steps = steps;
-    // The loop leaves `i` at the depth reached: the index of the byte that
-    // killed the automaton, or suffixLen when every byte stepped.
-    s.liveDepth = i;
-    return i == suffixLen && a.isMatch(states[suffixLen]) ? Status::ACCEPT : Status::REJECT;
+    return matchSuffix(a, suffix, common, s.liveDepth, s.steps) == MatchStatus::ACCEPT
+        ? Status::ACCEPT : Status::REJECT;
   }
 
-  bool advanceAutomaton(const A& a, Scan& s) {
+  [[gnu::always_inline]] bool advanceAutomaton(const A& a, Scan& s) {
     // acceptAutomaton() classifies without moving the enum, so it is still on
     // the term whose successor is wanted: its suffix is what successor() needs.
     std::string_view current = termView();
@@ -206,32 +150,15 @@ private:
     return finish();
   }
 
-  void init(MemPool& pool) {
-    stack = (typename A::State*)pool.alloc((PackedTerm::MAX_LEN + 1) * sizeof(typename A::State),
-                                            alignof(typename A::State));
-    // Any term this enum can accept starts with prefix and is at most MAX_LEN
-    // bytes long, so a longer prefix accepts nothing.  The guard only keeps the
-    // copy in bounds for a caller that builds such an enum anyway.
-    if (!prefix.empty() && prefix.size() <= PackedTerm::MAX_LEN) {
-      memcpy(seekBuffer, prefix.data(), prefix.size());
-    }
-  }
-
 public:
   AutomatonSeekEnum(MemPool& pool, TermsEnum& te, std::string_view prefix, A automaton)
-      : FilteredTermsEnum(te), prefix(prefix), automaton(std::move(automaton)),
-        initialState(this->automaton.start()) {
-    init(pool);
-  }
+      : Core(pool, te, prefix, std::move(automaton)) {}
 
   // The caller supplies the state already reached by `prefix` when the
   // automaton spans the whole term rather than just the suffix.
   AutomatonSeekEnum(MemPool& pool, TermsEnum& te, std::string_view prefix, A automaton,
                     typename A::State initialState)
-      : FilteredTermsEnum(te), prefix(prefix), automaton(std::move(automaton)),
-        initialState(initialState) {
-    init(pool);
-  }
+      : Core(pool, te, prefix, std::move(automaton), initialState) {}
 
   // The scan loop, fused: it calls acceptAutomaton()/advanceAutomaton()
   // directly, so a run of rejected terms costs no virtual dispatch and keeps

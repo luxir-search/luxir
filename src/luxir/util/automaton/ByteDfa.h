@@ -87,6 +87,30 @@ public:
     return DEAD;
   }
 
+  int32_t liveByteRangeMax(State state, uint8_t byte) const {
+    if (state == DEAD) return DEAD;
+    for (const Range& range : transitions(state)) {
+      if (byte >= range.min && byte <= range.max) return range.max;
+    }
+    return DEAD;
+  }
+
+  // True when every byte from every state stays in the live DFA.  A term can
+  // then never hit DEAD, and its lexicographic automaton successor is always
+  // the zero extension.  Dictionary intersection may replace construction of
+  // that known successor with nextTerm() without changing the visited terms.
+  bool allStatesLiveOnAllBytes() const {
+    for (State state = 0; state < (State)stateCount; state++) {
+      int32_t nextByte = 0;
+      for (const Range& range : transitions(state)) {
+        if (range.min != nextByte) return false;
+        nextByte = (int32_t)range.max + 1;
+      }
+      if (nextByte != 256) return false;
+    }
+    return stateCount != 0;
+  }
+
   bool matches(std::string_view bytes) const {
     State state = start();
     for (unsigned char byte : bytes) {
@@ -157,6 +181,7 @@ public:
   static constexpr State DEAD = ByteDfaView::DEAD;
 
 private:
+  static constexpr int64_t COMMON_SUFFIX_WORK_LIMIT = 1'000'000;
   std::vector<Range> ranges;
   std::vector<uint32_t> offsets;
   std::vector<uint8_t> accepts;
@@ -165,6 +190,32 @@ private:
   ByteDfaView makeView() const {
     return {ranges.data(), offsets.data(), accepts.data(), table.empty() ? nullptr : table.data(),
             (uint32_t)accepts.size()};
+  }
+
+  bool isCyclic(int64_t& work) const {
+    size_t n = accepts.size();
+    std::vector<uint32_t> indegree(n);
+    for (State state = 0; state < (State)n; state++) {
+      for (const Range& range : makeView().transitions(state)) {
+        if (++work > COMMON_SUFFIX_WORK_LIMIT) return false;
+        indegree[(size_t)range.dest]++;
+      }
+    }
+    std::queue<State> pending;
+    for (State state = 0; state < (State)n; state++) {
+      if (indegree[(size_t)state] == 0) pending.push(state);
+    }
+    size_t removed = 0;
+    while (!pending.empty()) {
+      State state = pending.front();
+      pending.pop();
+      removed++;
+      for (const Range& range : makeView().transitions(state)) {
+        if (++work > COMMON_SUFFIX_WORK_LIMIT) return false;
+        if (--indegree[(size_t)range.dest] == 0) pending.push(range.dest);
+      }
+    }
+    return removed != n;
   }
 
 public:
@@ -267,11 +318,51 @@ public:
   bool isMatch(State state) const { return makeView().isMatch(state); }
   State step(State state, uint8_t byte) const { return makeView().step(state, byte); }
   int32_t nextLiveByte(State state, int32_t byte) const { return makeView().nextLiveByte(state, byte); }
+  int32_t liveByteRangeMax(State state, uint8_t byte) const {
+    return makeView().liveByteRangeMax(state, byte);
+  }
   bool matches(std::string_view bytes) const { return makeView().matches(bytes); }
   size_t size() const { return makeView().size(); }
   std::span<const Range> transitions(State state) const { return makeView().transitions(state); }
   std::string commonPrefix() const { return makeView().commonPrefix(); }
   std::pair<std::string, State> commonPrefixAndState() const { return makeView().commonPrefixAndState(); }
+  std::string commonSuffix() const {
+    ByteDfaView dfa = makeView();
+    if (dfa.classify() != Kind::NORMAL) return {};
+
+    int64_t work = 0;
+    if (!isCyclic(work) || work > COMMON_SUFFIX_WORK_LIMIT) return {};
+
+    std::vector<uint8_t> states(accepts.begin(), accepts.end());
+    std::vector<uint8_t> predecessors(states.size());
+    std::string reversed;
+    for (;;) {
+      if (states[0]) break;
+      std::fill(predecessors.begin(), predecessors.end(), 0);
+      int byte = -1;
+      for (State source = 0; source < (State)states.size(); source++) {
+        for (const Range& range : dfa.transitions(source)) {
+          if (++work > COMMON_SUFFIX_WORK_LIMIT) return {};
+          if (!states[(size_t)range.dest]) continue;
+          if (range.min != range.max) {
+            std::reverse(reversed.begin(), reversed.end());
+            return reversed;
+          }
+          if (byte == -1) byte = range.min;
+          else if (byte != range.min) {
+            std::reverse(reversed.begin(), reversed.end());
+            return reversed;
+          }
+          predecessors[(size_t)source] = 1;
+        }
+      }
+      if (byte == -1) break;
+      reversed.push_back((char)(uint8_t)byte);
+      states.swap(predecessors);
+    }
+    std::reverse(reversed.begin(), reversed.end());
+    return reversed;
+  }
   Kind classify(std::string* value = nullptr) const { return makeView().classify(value); }
 };
 

@@ -3,7 +3,7 @@
 #include <string_view>
 
 #include "MultiTermQuery.h"
-#include "luxir/reader/AutomatonSeekEnum.h"
+#include "luxir/reader/DfaIntersectEnum.h"
 #include "luxir/util/automaton/ByteDfa.h"
 
 namespace luxir {
@@ -28,18 +28,16 @@ private:
   std::string_view pattern;
   automaton::ByteDfaView dfa;
   automaton::ByteDfaKind classification;
-  // Bytes required by the enum selected from the DFA classification.
-  std::string_view enumBytes;
-  automaton::ByteDfaView::State initialState;
+  std::string_view exactOrPrefix;
+  DfaScanPlan scanPlan;
 
 public:
   AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
-                 std::string_view enumBytes,
-                 automaton::ByteDfaView::State initialState)
+                 std::string_view exactOrPrefix, DfaScanPlan scanPlan)
       : MultiTermQuery(field), kind(kind), pattern(pattern), dfa(dfa),
-        classification(classification), enumBytes(enumBytes),
-        initialState(initialState) {}
+        classification(classification), exactOrPrefix(exactOrPrefix),
+        scanPlan(scanPlan) {}
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
@@ -53,18 +51,19 @@ public:
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
     switch (classification) {
       case automaton::ByteDfaKind::SINGLE:
-        return pool.make<ExactTermTermsEnum>(te, enumBytes);
+        return pool.make<ExactTermTermsEnum>(te, exactOrPrefix);
       case automaton::ByteDfaKind::PREFIX:
       case automaton::ByteDfaKind::ALL:
-        return pool.make<PrefixTermsEnum>(te, enumBytes);
+        return pool.make<PrefixTermsEnum>(te, exactOrPrefix);
       case automaton::ByteDfaKind::NORMAL:
-        return pool.make<AutomatonSeekEnum<automaton::ByteDfaView>>(
-            pool, te, enumBytes, dfa, initialState);
+        return pool.make<DfaIntersectEnum>(pool, te, dfa, scanPlan);
       case automaton::ByteDfaKind::NONE:
         assert(false);
     }
     return nullptr;
   }
+
+  const DfaScanPlan& getScanPlan() const { return scanPlan; }
 };
 
 } // namespace luxir

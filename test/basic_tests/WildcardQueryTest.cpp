@@ -4,6 +4,9 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/LuxirTest.h"
+#include "luxir/query/AutomatonQuery.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/schema/Schema.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -70,4 +73,21 @@ TEST_F(WildcardQueryE2ETest, invalidPatternNamesInput) {
   EXPECT_FALSE(req->ok());
   EXPECT_NE(req->errorMsg().find("color_s"), std::string::npos);
   EXPECT_NE(req->errorMsg().find("foo\\"), std::string::npos);
+}
+
+TEST_F(WildcardQueryE2ETest, suffixScanPlanPlumbing) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+
+  for (std::string_view pattern : {"*sband", "*ology", "comp*ing"}) {
+    auto* query = dynamic_cast<AutomatonQuery*>(
+        builder.createWildcardQuery("foo_s", pattern));
+    ASSERT_NE(query, nullptr) << pattern;
+    EXPECT_FALSE(query->getScanPlan().commonSuffix.empty()) << pattern;
+  }
+  auto* regex = dynamic_cast<AutomatonQuery*>(
+      builder.createRegexQuery("foo_s", ".*ization"));
+  ASSERT_NE(regex, nullptr);
+  EXPECT_EQ(regex->getScanPlan().commonSuffix, "ization");
 }

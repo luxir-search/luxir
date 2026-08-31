@@ -7,6 +7,7 @@
 
 #include "luxir/reader/AutomatonSeekEnum.h"
 #include "luxir/reader/BruteDfaTermsEnum.h"
+#include "luxir/reader/DfaIntersectEnum.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 #include "luxir/util/automaton/RegExpParser.h"
 #include "test/LuxirTest.h"
@@ -18,6 +19,17 @@ using namespace luxir::test;
 
 namespace {
 
+struct DfaStats {
+  int64_t examined = 0;
+  int64_t steps = 0;
+  int64_t jumps = 0;
+  int64_t successorPlans = 0;
+  int64_t targetComparisons = 0;
+  int64_t linearTerms = 0;
+  int64_t suffixRejects = 0;
+  int64_t dfaTerms = 0;
+};
+
 void addTerms(TestIndex& index, TestField& field, const std::vector<std::string>& terms) {
   field.startIndexing();
   for (size_t i = 0; i < terms.size(); i++) field.add((int)i, terms[i]);
@@ -26,7 +38,29 @@ void addTerms(TestIndex& index, TestField& field, const std::vector<std::string>
 }
 
 std::vector<std::string> collectSmart(TestField& field, const ByteDfa& dfa, int64_t* examined = nullptr,
-                                      int64_t* jumps = nullptr) {
+                                      int64_t* jumps = nullptr, DfaStats* stats = nullptr) {
+  auto guard = field.testIndex.pool.rewindScopeGuard();
+  auto* segment = field.currentSegment();
+  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
+  auto view = dfa.view();
+  auto [prefix, state] = view.commonPrefixAndState();
+  std::string commonSuffix = dfa.commonSuffix();
+  DfaScanPlan plan{prefix, commonSuffix, state};
+  DfaIntersectEnum e(guard.pool(), terms, view, plan);
+  std::vector<std::string> out;
+  while (e.next()) out.emplace_back(e.termView());
+  if (examined != nullptr) *examined = e.termsExamined();
+  if (jumps != nullptr) *jumps = e.jumps();
+  if (stats != nullptr) {
+    *stats = {e.termsExamined(), e.dpSteps(), e.jumps(), e.successorPlans(),
+              e.targetComparisons(), e.linearTerms(), e.suffixRejects(),
+              e.dfaTerms()};
+  }
+  return out;
+}
+
+std::vector<std::string> collectLegacy(TestField& field, const ByteDfa& dfa,
+                                       DfaStats& stats) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
   TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
@@ -35,8 +69,9 @@ std::vector<std::string> collectSmart(TestField& field, const ByteDfa& dfa, int6
   AutomatonSeekEnum<ByteDfaView> e(guard.pool(), terms, prefix, view, state);
   std::vector<std::string> out;
   while (e.next()) out.emplace_back(e.termView());
-  if (examined != nullptr) *examined = e.termsExamined();
-  if (jumps != nullptr) *jumps = e.jumps();
+  stats.examined = e.termsExamined();
+  stats.steps = e.dpSteps();
+  stats.jumps = e.jumps();
   return out;
 }
 
@@ -122,9 +157,123 @@ TEST_F(AutomatonSeekTest, RegexDifferential) {
   TestIndex index;
   TestField field(index, "value_s");
   addTerms(index, field, corpus(rng));
-  for (std::string_view pattern : {"[ab]pp.*", "a{2,3}bc*", "(cat|ban).*"}) {
+  for (std::string_view pattern : {"[ab]pp.*", "a{2,3}bc*", "(cat|ban).*",
+                                   ".*a", "[ab]*c", "(app|ban).*a"}) {
     Budget budget(10000000);
     ByteDfa dfa = compileRegex(pattern, budget);
     EXPECT_EQ(collectSmart(field, dfa), collectBrute(field, dfa)) << pattern;
+  }
+}
+
+TEST_F(AutomatonSeekTest, ScanOraclePatternCorpus) {
+  struct Pattern {
+    std::string_view text;
+    bool regex;
+  };
+  const std::vector<Pattern> patterns = {
+    {"*ology", false}, {"*sband", false}, {"comp*ing", false},
+    {"*graph*", false}, {"match_*_end", false}, {"a?b", false},
+    {"*tail", false}, {"prefix*end", false},
+    {".*ization", true}, {"[jkqxz][a-z]*ess", true},
+    {"[a-f0-9]{8,}", true}, {"(inter|under)[a-z]*", true},
+    {"(re|un)[a-z]*ing", true}, {"[a-z]*ph[oi]lic", true},
+    {"[a-z]+ization", true}, {"(app|ban).*a", true},
+    {"[bcd]o[aeiou]t", true},
+  };
+  ASSERT_EQ(patterns.size(), 17);
+
+  std::mt19937 rng(0x4a9c31);
+  TestIndex index;
+  TestField field(index, "value_s");
+  addTerms(index, field, corpus(rng));
+  for (const Pattern& pattern : patterns) {
+    Budget budget(10000000);
+    ByteDfa dfa = pattern.regex ? compileRegex(pattern.text, budget)
+                                : compileWildcard(pattern.text, budget);
+    EXPECT_EQ(collectSmart(field, dfa), collectBrute(field, dfa)) << pattern.text;
+  }
+}
+
+TEST_F(AutomatonSeekTest, LeadingSuffixUsesLinearRanges) {
+  TestIndex index;
+  TestField field(index, "value_s");
+  std::vector<std::string> terms;
+  for (int i = 0; i < 600; i++) {
+    std::string term = "term" + std::to_string(i);
+    term += i % 37 == 0 ? "ology" : "other";
+    terms.push_back(std::move(term));
+  }
+  addTerms(index, field, terms);
+  Budget budget(10000000);
+  ByteDfa dfa = compileWildcard("*ology", budget);
+  DfaStats stats;
+  EXPECT_EQ(collectSmart(field, dfa, nullptr, nullptr, &stats), collectBrute(field, dfa));
+  EXPECT_GT(stats.linearTerms, stats.examined * 10);
+  EXPECT_GT(stats.suffixRejects, 500);
+  EXPECT_EQ(stats.dfaTerms,
+            stats.examined + stats.linearTerms - stats.suffixRejects);
+}
+
+TEST_F(AutomatonSeekTest, SuffixEmptyPreservesSuccessorOracle) {
+  std::mt19937 rng(0x99da27);
+  TestIndex index;
+  TestField field(index, "value_s");
+  addTerms(index, field, corpus(rng));
+
+  for (std::string_view pattern : {"[a-f0-9]{8,}", "(inter|under)[a-z]*",
+                                   "[bcd]o[aeiou]t"}) {
+    Budget budget(10000000);
+    ByteDfa dfa = compileRegex(pattern, budget);
+    ASSERT_TRUE(dfa.commonSuffix().empty()) << pattern;
+    DfaStats legacy;
+    DfaStats current;
+    auto expected = collectLegacy(field, dfa, legacy);
+    auto actual = collectSmart(field, dfa, nullptr, nullptr, &current);
+    EXPECT_EQ(actual, expected) << pattern;
+    EXPECT_EQ(current.examined, legacy.examined) << pattern;
+    EXPECT_EQ(current.steps, legacy.steps) << pattern;
+    EXPECT_EQ(current.jumps, legacy.jumps) << pattern;
+    EXPECT_EQ(current.linearTerms, 0) << pattern;
+    EXPECT_EQ(current.suffixRejects, 0) << pattern;
+    EXPECT_EQ(current.dfaTerms, current.examined) << pattern;
+  }
+
+  Budget budget(10000000);
+  ByteDfa dfa = compileWildcard("*graph*", budget);
+  ASSERT_TRUE(dfa.commonSuffix().empty());
+  ASSERT_TRUE(dfa.view().allStatesLiveOnAllBytes());
+  DfaStats legacy;
+  DfaStats current;
+  EXPECT_EQ(collectSmart(field, dfa, nullptr, nullptr, &current),
+            collectLegacy(field, dfa, legacy));
+  EXPECT_EQ(current.examined, legacy.examined);
+  EXPECT_EQ(current.steps, legacy.steps);
+  EXPECT_EQ(current.jumps, legacy.jumps);
+  EXPECT_EQ(current.targetComparisons, 0);
+  EXPECT_EQ(current.linearTerms, 0);
+  EXPECT_EQ(current.dfaTerms, current.examined);
+}
+
+TEST_F(AutomatonSeekTest, SuffixDifferentialAcrossDictionaryEdges) {
+  TestIndex index;
+  TestField field(index, "value_s");
+  std::vector<std::string> terms;
+  terms.emplace_back("\0a_tail", 7);
+  terms.emplace_back("\0b_other", 8);
+  for (int i = 0; i < 100; i++) {
+    std::string term(80, (char)('a' + i % 4));
+    term += std::to_string(i);
+    term += i % 9 == 0 ? "tail" : "nope";
+    terms.push_back(std::move(term));
+  }
+  terms.push_back(std::string(PackedTerm::MAX_LEN - 4, 'm') + "tail");
+  terms.push_back(std::string(PackedTerm::MAX_LEN - 4, (char)0xff) + "tail");
+  terms.push_back(std::string(1, (char)0xff) + "other");
+  addTerms(index, field, terms);
+
+  for (std::string_view wildcard : {"*tail", "*other"}) {
+    Budget budget(10000000);
+    ByteDfa dfa = compileWildcard(wildcard, budget);
+    EXPECT_EQ(collectSmart(field, dfa), collectBrute(field, dfa)) << wildcard;
   }
 }

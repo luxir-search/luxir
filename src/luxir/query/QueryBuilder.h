@@ -605,17 +605,26 @@ private:
       throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
                                            label, field, pattern, e.what()));
     }
-    std::string enumBytes;
-    automaton::ByteDfaKind kind = compiled.classify(&enumBytes);
+    std::string exactOrPrefix;
+    automaton::ByteDfaKind kind = compiled.classify(&exactOrPrefix);
     if (kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
+    std::string commonPrefix;
+    std::string commonSuffix;
     automaton::ByteDfaView::State initialState = compiled.start();
     if (kind == automaton::ByteDfaKind::NORMAL) {
-      auto [commonPrefix, state] = compiled.commonPrefixAndState();
-      enumBytes = std::move(commonPrefix);
+      auto prefixAndState = compiled.commonPrefixAndState();
+      commonPrefix = std::move(prefixAndState.first);
+      auto state = prefixAndState.second;
+      commonSuffix = compiled.commonSuffix();
       initialState = state;
+      exactOrPrefix.clear();
     }
-    return pool.make<AutomatonQuery>(field, queryKind, poolCopy(pattern),
-        compiled.freeze(pool), kind, poolCopy(enumBytes), initialState);
+    std::string_view patternCopy = poolCopy(pattern);
+    std::string_view exactOrPrefixCopy = poolCopy(exactOrPrefix);
+    DfaScanPlan scanPlan{poolCopy(commonPrefix), poolCopy(commonSuffix), initialState};
+    automaton::ByteDfaView frozen = compiled.freeze(pool);
+    return pool.make<AutomatonQuery>(field, queryKind, patternCopy, frozen, kind,
+                                    exactOrPrefixCopy, scanPlan);
   }
 
 public:

@@ -60,6 +60,22 @@ static void strings(std::string& current, int32_t left, std::vector<std::string>
   }
 }
 
+static std::string bruteCommonSuffix(const std::vector<std::string>& accepted) {
+  if (accepted.empty()) return {};
+  size_t length = accepted[0].size();
+  for (size_t i = 1; i < accepted.size(); i++) {
+    size_t limit = std::min(length, accepted[i].size());
+    size_t shared = 0;
+    while (shared < limit
+           && accepted[0][accepted[0].size() - shared - 1]
+               == accepted[i][accepted[i].size() - shared - 1]) {
+      shared++;
+    }
+    length = shared;
+  }
+  return accepted[0].substr(accepted[0].size() - length);
+}
+
 static Automaton randomAutomaton(std::mt19937& rng, Budget& budget, int32_t depth) {
   if (depth == 0) {
     int32_t c = 'a' + (int32_t)(rng() % 3);
@@ -183,6 +199,77 @@ TEST(WildcardTest, compileAndClassify) {
   EXPECT_EQ(compile(std::string(300, 'a') + "*").classify(), ByteDfa::Kind::NONE);
   Budget budget(1000000);
   EXPECT_EQ(ByteDfa(Automaton::empty(budget), budget).classify(), ByteDfa::Kind::NONE);
+}
+
+TEST(ByteDfaTest, CommonSuffixCompilerDifferential) {
+  std::vector<std::string> corpus;
+  std::string current;
+  strings(current, 6, corpus);
+
+  auto checkWildcard = [&](std::string_view pattern) {
+    Budget budget(10000000);
+    ByteDfa dfa = compileWildcard(pattern, budget);
+    std::vector<std::string> accepted;
+    for (const std::string& value : corpus) {
+      if (dfa.matches(value)) accepted.push_back(value);
+    }
+    ASSERT_FALSE(accepted.empty()) << pattern;
+    EXPECT_EQ(dfa.commonSuffix(), bruteCommonSuffix(accepted)) << pattern;
+  };
+  auto checkRegex = [&](std::string_view pattern) {
+    Budget budget(10000000);
+    ByteDfa dfa = compileRegex(pattern, budget);
+    std::vector<std::string> accepted;
+    for (const std::string& value : corpus) {
+      if (dfa.matches(value)) accepted.push_back(value);
+    }
+    ASSERT_FALSE(accepted.empty()) << pattern;
+    EXPECT_EQ(dfa.commonSuffix(), bruteCommonSuffix(accepted)) << pattern;
+  };
+
+  for (std::string_view pattern : {"*ab", "a*bc", "a*b", "a*b*"}) {
+    checkWildcard(pattern);
+  }
+  for (std::string_view pattern : {"[ab]*c", "(ab)*c", "(a|b)+c",
+                                   "([ab]*c|bc)", "[ab]+"}) {
+    checkRegex(pattern);
+  }
+}
+
+TEST(ByteDfaTest, CommonSuffixScanShapes) {
+  auto wildcardSuffix = [](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileWildcard(pattern, budget).commonSuffix();
+  };
+  auto regexSuffix = [](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileRegex(pattern, budget).commonSuffix();
+  };
+
+  EXPECT_EQ(wildcardSuffix("*sband"), "sband");
+  EXPECT_EQ(wildcardSuffix("*ology"), "ology");
+  EXPECT_EQ(wildcardSuffix("comp*ing"), "ing");
+  EXPECT_EQ(regexSuffix(".*ization"), "ization");
+  EXPECT_EQ(regexSuffix("[a-z]*ph[oi]lic"), "lic");
+
+  // Finite NORMAL DFAs deliberately stay on the exact successor path.
+  EXPECT_EQ(regexSuffix("[ab]{2}ology"), "");
+}
+
+TEST(ByteDfaTest, TotalLiveTransitions) {
+  auto wildcard = [](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileWildcard(pattern, budget).view().allStatesLiveOnAllBytes();
+  };
+  auto regex = [](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileRegex(pattern, budget).view().allStatesLiveOnAllBytes();
+  };
+
+  EXPECT_TRUE(wildcard("*graph*"));
+  EXPECT_TRUE(wildcard("*ology"));
+  EXPECT_FALSE(wildcard("comp*ing"));
+  EXPECT_FALSE(regex("[a-f0-9]{8,}"));
 }
 
 TEST(WildcardTest, errorsAreClean) {

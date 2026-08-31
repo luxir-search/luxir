@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <initializer_list>
 #include <random>
 #include <string>
@@ -156,10 +157,16 @@ void expectSame(const std::vector<Match>& brute, const std::vector<Match>& seek,
   SCOPED_TRACE("q=" + hex(query) + " prefixLen=" + std::to_string(prefixLen)
                + " k=" + std::to_string(k) + " prefixMode=" + std::to_string((int)prefixMode));
   ASSERT_EQ(seek.size(), brute.size());
+  float bruteSum = 0.0f;
+  float seekSum = 0.0f;
   for (int i = 0; i < (int)brute.size(); i++) {
     EXPECT_EQ(hex(seek[(size_t)i].term), hex(brute[(size_t)i].term)) << "match " << i;
-    EXPECT_FLOAT_EQ(seek[(size_t)i].score, brute[(size_t)i].score) << "match " << i;
+    EXPECT_EQ(std::bit_cast<uint32_t>(seek[(size_t)i].score),
+              std::bit_cast<uint32_t>(brute[(size_t)i].score)) << "match " << i;
+    seekSum += seek[(size_t)i].score;
+    bruteSum += brute[(size_t)i].score;
   }
+  EXPECT_EQ(std::bit_cast<uint32_t>(seekSum), std::bit_cast<uint32_t>(bruteSum));
 }
 
 void expectEnumsEqual(TestField& field, std::string_view query, int prefixLen, int k,
@@ -241,6 +248,21 @@ TEST_F(FuzzySeekTest, DifferentialRandomMultiBlock) {
 
   std::mt19937 rng(0x5eed51f7);
   for (int i = 0; i < 10; i++) queries.push_back(randomTerm(rng, 8));
+  expectCrossProduct(field, queries);
+}
+
+TEST_F(FuzzySeekTest, ScanOracle216Configs) {
+  TestIndex ti;
+  TestField field(ti, "foo_s");
+  indexTerms(ti, field, multiBlockTerms());
+  const std::vector<std::string> queries = {
+    "", "a", "ab", "apple", "applf", "banana",
+    std::string("caf") + bytes({0xc3, 0xa9}),
+    bytes({0x80}), bytes({0xff}), bytes({'a', 0xff}),
+    repeated('m', PackedTerm::MAX_LEN),
+    repeated('q', PackedTerm::MAX_LEN + 3),
+  };
+  ASSERT_EQ(queries.size() * 3 * 3 * 2, 216);
   expectCrossProduct(field, queries);
 }
 

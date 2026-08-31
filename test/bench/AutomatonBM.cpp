@@ -4,8 +4,8 @@
 #include <vector>
 
 #include "bench/luxir_bench.h"
-#include "luxir/reader/AutomatonSeekEnum.h"
 #include "luxir/reader/BruteDfaTermsEnum.h"
+#include "luxir/reader/DfaIntersectEnum.h"
 #include "luxir/util/automaton/RegExpParser.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 #include "test/TestIndex.h"
@@ -66,7 +66,9 @@ void BM_AutomatonEnum(benchmark::State& state, std::string_view pattern, bool re
     } else {
       auto view = dfa.view();
       auto [prefix, initialState] = view.commonPrefixAndState();
-      AutomatonSeekEnum<ByteDfaView> terms(guard.pool(), source, prefix, view, initialState);
+      std::string commonSuffix = dfa.commonSuffix();
+      DfaScanPlan plan{prefix, commonSuffix, initialState};
+      DfaIntersectEnum terms(guard.pool(), source, view, plan);
       matched = count(terms);
     }
     benchmark::DoNotOptimize(matched);
