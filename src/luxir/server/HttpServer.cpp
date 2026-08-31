@@ -2982,9 +2982,7 @@ void HttpServer::start() {
   registry = std::make_shared<HttpSessionRegistry>();
   workGuard.emplace(ioc->get_executor());
 
-  // The acceptor runs on its own strand so its operations (async_accept in the
-  // accept loop, and close() during shutdown) are serialized on one executor.
-  acceptor.emplace(net::make_strand(*ioc));
+  acceptor.emplace(acceptIoc);
   acceptor->open(ep.protocol());
   acceptor->set_option(net::socket_base::reuse_address(true));
   acceptor->bind(ep);
@@ -2995,6 +2993,7 @@ void HttpServer::start() {
 
   threads.reserve(n);
   for (int i = 0; i < n; i++) threads.emplace_back([this] { ioc->run(); });
+  acceptThread = std::thread([this] { acceptIoc.run(); });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
 }
@@ -3022,14 +3021,16 @@ void HttpServer::shutdown() {
   // self-call would deadlock.  Current callers (main / test thread, destructor)
   // satisfy this; assert to catch a future io-thread caller.
 #ifndef NDEBUG
+  assert(acceptThread.get_id() != std::this_thread::get_id()
+         && "HttpServer::shutdown() must not be called from the accept thread");
   for (auto& t : threads) {
     assert(t.get_id() != std::this_thread::get_id()
            && "HttpServer::shutdown() must not be called from an io thread");
   }
 #endif
 
-  // 1) Stop accepting.  Posted onto the acceptor's strand so it does not race the
-  //    accept loop; the drain below keeps the io_context alive until it runs.
+  // 1) Stop accepting. The accept context has one runner, so this is serialized
+  //    with the accept loop without a strand.
   if (acceptor) {
     net::post(acceptor->get_executor(), [this] {
       beast::error_code ec;
@@ -3052,6 +3053,10 @@ void HttpServer::shutdown() {
   //    until they finish (and release their response arenas).
   for (auto& s : live) s->closeFromServer();
   live.clear();
+
+  // No worker context may exit until the accept loop is quiescent: a successful
+  // accept racing the close can still hand a session to the worker context.
+  if (acceptThread.joinable()) acceptThread.join();
 
   // 4) Release the keep-alive guard and let run() return once work drains.
   //    This must stay a drain - never ioc->stop().  stop() would leave uninvoked

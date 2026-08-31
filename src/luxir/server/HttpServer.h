@@ -54,7 +54,12 @@ private:
   // even after shutdown() has joined the io threads.  The context may therefore
   // briefly outlive this object.  See IoPin in HttpServer.cpp.
   std::shared_ptr<boost::asio::io_context> ioc;
+  // Accepting is isolated from request execution so an inline search cannot
+  // delay new connections. The outstanding async_accept keeps this context
+  // alive until shutdown closes the acceptor.
+  boost::asio::io_context acceptIoc{1};
   std::optional<boost::asio::ip::tcp::acceptor> acceptor;
+  std::thread acceptThread;
   std::vector<std::thread> threads;
   std::shared_ptr<HttpSessionRegistry> registry;
   // Keeps run() from returning while idle; reset during shutdown so run() returns
