@@ -158,6 +158,85 @@ TEST_F(HttpApiTest, health) {
   EXPECT_NE(res.body().find(R"("status")"), std::string::npos);
 }
 
+// Enabled with the per-thread io_context implementation: four connections
+// accepted in sequence must land on four different shards, and a persistent
+// connection must never migrate between shard threads.
+TEST_F(HttpApiTest, DISABLED_connectionsStayPinnedToIoShards) {
+  helper.index(flatdoc("id", std::string("shard-affinity"),
+                       "title_w", std::string("shard affinity")),
+               UpdateMessage::COMMIT);
+
+  HttpServer shardServer(*LuxirTest::luxirNode, 4, 0);
+  shardServer.start();
+
+  struct Connection {
+    beast::tcp_stream stream;
+    beast::flat_buffer buffer;
+    explicit Connection(net::io_context& ioc) : stream(ioc) {}
+  };
+
+  net::io_context clientIoc;
+  tcp::resolver resolver(clientIoc);
+  auto endpoint = resolver.resolve("127.0.0.1", std::to_string(shardServer.getPort()));
+  std::vector<std::unique_ptr<Connection>> connections;
+  for (int i = 0; i < 4; i++) {
+    auto connection = std::make_unique<Connection>(clientIoc);
+    connection->stream.connect(endpoint);
+    connections.push_back(std::move(connection));
+  }
+
+  auto requestThreadId = [](Connection& connection) -> std::optional<int64_t> {
+    http::request<http::string_body> request(
+        http::verb::post, "/collections/main/_search", 11);
+    request.set(http::field::host, "127.0.0.1");
+    request.set(http::field::content_type, "application/json");
+    request.keep_alive(true);
+    request.body() =
+        R"({"query":{"all":true},"limit":0,"get_number":true,"profile":true,"max_parallel":-1})";
+    request.prepare_payload();
+    http::write(connection.stream, request);
+
+    http::response<http::string_body> response;
+    http::read(connection.stream, connection.buffer, response);
+    if (response.result() != http::status::ok) return std::nullopt;
+
+    glz::generic_i64 root;
+    if (glz::read_json(root, response.body()) || !root.is_object() ||
+        !root.contains("profile")) {
+      return std::nullopt;
+    }
+    auto* ops = root["profile"]["ops"].get_if<glz::generic_i64::array_t>();
+    if (ops == nullptr || ops->empty()) return std::nullopt;
+    auto* pieces = (*ops)[0]["pieces"].get_if<glz::generic_i64::array_t>();
+    if (pieces == nullptr || pieces->empty()) return std::nullopt;
+    auto* threadId = (*pieces)[0]["thread_id"].get_if<int64_t>();
+    return threadId == nullptr ? std::nullopt : std::optional<int64_t>(*threadId);
+  };
+
+  std::set<int64_t> shardThreads;
+  std::vector<int64_t> firstThreads;
+  for (auto& connection : connections) {
+    auto threadId = requestThreadId(*connection);
+    ASSERT_TRUE(threadId.has_value());
+    firstThreads.push_back(*threadId);
+    shardThreads.insert(*threadId);
+  }
+  EXPECT_EQ(4u, shardThreads.size());
+
+  for (std::size_t i = 0; i < connections.size(); i++) {
+    auto threadId = requestThreadId(*connections[i]);
+    ASSERT_TRUE(threadId.has_value());
+    EXPECT_EQ(firstThreads[i], *threadId);
+  }
+
+  for (auto& connection : connections) {
+    beast::error_code ec;
+    connection->stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+  }
+  connections.clear();
+  shardServer.shutdown();
+}
+
 TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   auto nodeStats = httpRequest(port(), http::verb::get, "/_stats");
   ASSERT_EQ(200, nodeStats.result_int()) << nodeStats.body();
