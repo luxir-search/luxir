@@ -775,6 +775,7 @@ struct WholeFieldSortRun {
   int64_t weightSkips = 0;
   int64_t contextsCreated = 0;
   int64_t contextsOmitted = 0;
+  int64_t phraseVerifies = 0;
 };
 
 enum class WholeFieldSortQueryShape : uint8_t {
@@ -867,6 +868,7 @@ WholeFieldSortRun runWholeFieldSort(
     SkipStats::cacheFirstFieldSortWeightSkips,
     SkipStats::queryContextsCreated,
     SkipStats::cacheFirstQueryContextsOmitted,
+    SkipStats::phraseVerifies,
   };
 }
 
@@ -2962,6 +2964,8 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
                    + hit.routingBypasses);
   EXPECT_EQ(2, build.ladderFallbacks);
   EXPECT_EQ(2, hit.ladderFallbacks);
+  EXPECT_EQ(offTwoPhase.phraseVerifies, build.phraseVerifies);
+  EXPECT_EQ(0, hit.phraseVerifies);
 
   auto offPartial = runWholeFieldSort(
       disabled.getSearchEngine(), disabledCollection,

@@ -373,7 +373,9 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                  DocSetBuilder* builder, Collector& collector, bool allowPruning = true,
                  MaxScoreAccumulator* accumulator = nullptr,
                  DomainBuildMode buildMode = DomainBuildMode::FILTERED_MATCHES,
-                 DocSet* rawDomain = nullptr) {
+                 DocSet* rawDomain = nullptr,
+                 Query::ReportedTwoPhase reportedTwoPhase =
+                     Query::ReportedTwoPhase::UNKNOWN) {
   constexpr int32_t kAccumulatorPollPeriod = 1024;
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
   int32_t accumulatorPollCount = 0;
@@ -490,6 +492,122 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       collectOne(doc, score);
     }
     return;
+  }
+
+  // A field-sort pull scorer with an externally driveable approximation must
+  // consult sort competitiveness before exact verification. This is a protocol
+  // choice for the scorer's whole lifetime: this arm drives only the exposed
+  // DocsPosEnums and calls matchesAt(), then returns without reaching the
+  // next()/advance() loops below.
+  constexpr bool hasExternalSortGate = requires {
+    collector.heapFull();
+    collector.competitiveCandidate(segnum, (int32_t)0, 0.0f);
+  };
+  if constexpr (hasSortRanges && hasExternalSortGate) {
+    bool externalApprox = buildMode == DomainBuildMode::FILTERED_MATCHES
+        && sortPrune && !needScores
+        && collector.topCount > 0
+        && reportedTwoPhase == Query::ReportedTwoPhase::YES;
+    std::span<DocsPosEnum*> approximations = externalApprox
+        ? scorer->approximationEnums() : std::span<DocsPosEnum*>{};
+    if (!approximations.empty()) {
+      skipCount(SkipStats::fieldSortExternalApproxActivations);
+      DocsPosEnum* lead = approximations[0];
+
+      auto align = [&](int32_t target) {
+        if (lead->docId() < target) target = lead->advance(target);
+        for (;;) {
+          if (target == PostingsReader::END) return target;
+          bool restart = false;
+          for (size_t i = 1; i < approximations.size(); i++) {
+            DocsPosEnum* approximation = approximations[i];
+            if (approximation->docId() < target) {
+              int32_t doc = approximation->advance(target);
+              assert(doc >= target);
+              if (doc > target) {
+                target = lead->advance(doc);
+                restart = true;
+                break;
+              }
+            }
+          }
+          if (!restart) return target;
+        }
+      };
+
+      auto nextApproximation = [&]() {
+        return align(lead->next());
+      };
+
+      BitDocSet* bitDocs = filter != nullptr && filter->type == DocSet::BITSET
+          ? (BitDocSet*)filter : nullptr;
+      assert(filter == nullptr || filter->type == DocSet::BITSET
+          || filter->type == DocSet::ARRAY);
+      const FixedBitSet* domainBits = bitDocs != nullptr
+          ? &bitDocs->bits() : nullptr;
+      std::span<const int32_t> domainDocs =
+          filter != nullptr && filter->type == DocSet::ARRAY
+              ? ((ArrDocSet*)filter)->docs()
+              : std::span<const int32_t>{};
+      if (filter != nullptr && filter->type == DocSet::ARRAY
+          && domainDocs.empty()) {
+        return;
+      }
+      const int32_t* domainCur = domainDocs.data();
+      const int32_t* domainEnd = domainCur + domainDocs.size();
+
+      int32_t candidate = -1;
+      int32_t cursor = 0;
+      for (;;) {
+        auto range = collector.nextCompetitiveRange(segnum, cursor);
+        if (range.begin == PostingsReader::END) return;
+        if (candidate < range.begin) candidate = align(range.begin);
+        if (candidate == PostingsReader::END) return;
+        if (candidate >= range.end) {
+          cursor = candidate;
+          continue;
+        }
+
+        while (candidate < range.end) {
+          skipCount(SkipStats::fieldSortExternalApproxCandidates);
+          bool inDomain = true;
+          if (domainBits != nullptr) {
+            inDomain = domainBits->get(candidate);
+          } else if (filter != nullptr) {
+            domainCur = screaming::gallopLowerBound(
+                domainCur, domainEnd, candidate);
+            if (domainCur == domainEnd) return;
+            if (*domainCur != candidate) {
+              skipCount(SkipStats::fieldSortExternalApproxDomainRejects);
+              candidate = align(*domainCur);
+              if (candidate == PostingsReader::END) return;
+              continue;
+            }
+            domainCur++;
+          }
+          if (!inDomain) {
+            skipCount(SkipStats::fieldSortExternalApproxDomainRejects);
+            candidate = nextApproximation();
+            if (candidate == PostingsReader::END) return;
+            continue;
+          }
+          if (collector.heapFull()
+              && !collector.competitiveCandidate(segnum, candidate, 0.0f)) {
+            skipCount(SkipStats::fieldSortExternalApproxBoundRejects);
+            candidate = nextApproximation();
+            if (candidate == PostingsReader::END) return;
+            continue;
+          }
+          skipCount(SkipStats::fieldSortExternalApproxVerifications);
+          if (scorer->matchesAt(candidate)) {
+            collectOne(candidate, 0.0f);
+          }
+          candidate = nextApproximation();
+          if (candidate == PostingsReader::END) return;
+        }
+        cursor = candidate;
+      }
+    }
   }
 
   if (filter == nullptr || filter->type == DocSet::BITSET) {

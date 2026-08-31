@@ -344,16 +344,14 @@ public:
   // loop (with the clause walk, copy loops, and heap sift inlined here, the
   // per-doc call overhead alone cost ~10% on single-field sort benchmarks), so
   // everything off that path is a LUXIR_NOINLINE helper.
-  void collect(int32_t segment, int32_t docid, float score) {
-    hitCount++;
-    if (topCount == 0) return;
-
+  //
+  // The external two-phase field-sort driver calls this before exact
+  // verification. The heap must already be full: before that, every exact
+  // match is needed to mature the bottom.
+  bool LUXIR_INLINE competitiveCandidate(
+      int32_t segment, int32_t docid, float score) {
+    assert(heapFull());
     segdoc doc(segment, docid);
-    if (pq.size() < (size_t)topCount) {
-      warmup(doc, score);
-      return;
-    }
-
     SortDoc& bottom = pq.top();
     int cmp;
     if (soleColumn != nullptr) [[likely]] {
@@ -369,7 +367,21 @@ public:
     } else {
       cmp = compareCurrentDoc(bottom, doc, score);
     }
-    if (cmp > 0) [[unlikely]] {
+    return cmp > 0;
+  }
+
+  void collect(int32_t segment, int32_t docid, float score) {
+    hitCount++;
+    if (topCount == 0) return;
+
+    segdoc doc(segment, docid);
+    if (pq.size() < (size_t)topCount) {
+      warmup(doc, score);
+      return;
+    }
+
+    SortDoc& bottom = pq.top();
+    if (competitiveCandidate(segment, docid, score)) [[unlikely]] {
       admit(bottom, doc, score);
     }
   }

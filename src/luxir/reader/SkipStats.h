@@ -224,6 +224,15 @@ struct SkipStats {
   // (the visited-block count the bound rules could not skip).
   static inline int64_t fieldSortWarmupRanges = 0;
   static inline int64_t fieldSortCompetitiveRanges = 0;
+  // External two-phase field-sort pull driver: segment activations,
+  // approximation conjunction landings in competitive ranges, candidates
+  // rejected by the outer domain, exact verification calls, and candidates
+  // rejected by the live heap bottom before exact verification.
+  static inline int64_t fieldSortExternalApproxActivations = 0;
+  static inline int64_t fieldSortExternalApproxCandidates = 0;
+  static inline int64_t fieldSortExternalApproxDomainRejects = 0;
+  static inline int64_t fieldSortExternalApproxVerifications = 0;
+  static inline int64_t fieldSortExternalApproxBoundRejects = 0;
   // Docs pushed through the bulk key-gather path, and the gathered-doc index
   // of the last heap change - "how late did the top-k stop moving".
   static inline int64_t fieldSortDocsGathered = 0;
@@ -515,6 +524,11 @@ struct SkipStats {
     fieldSortBulkCollections = 0;
     fieldSortWarmupRanges = 0;
     fieldSortCompetitiveRanges = 0;
+    fieldSortExternalApproxActivations = 0;
+    fieldSortExternalApproxCandidates = 0;
+    fieldSortExternalApproxDomainRejects = 0;
+    fieldSortExternalApproxVerifications = 0;
+    fieldSortExternalApproxBoundRejects = 0;
     fieldSortDocsGathered = 0;
     fieldSortGatherAtLastAdmission = 0;
     fieldSortIrreducibleBlocks = 0;

@@ -429,19 +429,19 @@ public:
           }
         }
       }
-      requiresPreparePhase =
+      requiresWholeIndexPrepare =
           op.weight != nullptr && op.weight->needsPrepare();
       for (auto* weight : op.filterWeights) {
         if (weight->needsPrepare()) {
-          requiresPreparePhase = true;
+          requiresWholeIndexPrepare = true;
           break;
         }
       }
       if (!op.domainVariants.empty()
           && op.domainVariants.sourcesNeedPrepare()) {
-        requiresPreparePhase = true;
+        requiresWholeIndexPrepare = true;
       }
-      if (requiresPreparePhase) {
+      if (requiresWholeIndexPrepare) {
         auto numSegs = op.req.reader->segments().size();
         inputDomains.resize(numSegs);
         inputDomainViews.resize(numSegs);
@@ -473,7 +473,7 @@ public:
     // requires the all-domain preparation phase. This is distinct from the
     // main weight's Weight::needsPrepare() trait because a filter alone can
     // require the phase.
-    bool requiresPreparePhase = false;
+    bool requiresWholeIndexPrepare = false;
     std::atomic<int32_t> gatheredDomainsSeen{0};
     std::vector<DomainHandle> inputDomains;
     std::vector<DocSet*> inputDomainViews;
@@ -499,7 +499,7 @@ public:
         completeEmpty(tg);
         return;
       }
-      if (!requiresPreparePhase) {
+      if (!requiresWholeIndexPrepare) {
         task_group_run(tg, [this, tg, segnum, domain]() {
           doCollect(tg, segnum, domain);
         });
@@ -522,7 +522,7 @@ public:
         completeEmpty(tg);
         return;
       }
-      if (!requiresPreparePhase) {
+      if (!requiresWholeIndexPrepare) {
         dispatch(tg, domains);
         return;
       }
@@ -543,13 +543,20 @@ public:
       return source.scorerSupplier(pool, seg);
     }
 
-    static Query::Scorer* buildPullScorer(
+    static Query::ScorerPlan* resolvePullScorer(
         MemPool& pool, Query::ScorerSupplier& supplier,
         int64_t candidates = std::numeric_limits<int64_t>::max()) {
       Query::Demand demand = Query::Demand::fromLeadCost(
           candidates);
-      Query::ScorerPlan* plan = supplier.resolve(
+      return supplier.resolve(
           pool, supplier.makePlanContext(demand));
+    }
+
+    static Query::Scorer* buildPullScorer(
+        MemPool& pool, Query::ScorerSupplier& supplier,
+        int64_t candidates = std::numeric_limits<int64_t>::max()) {
+      Query::ScorerPlan* plan = resolvePullScorer(
+          pool, supplier, candidates);
       return plan->build(pool);
     }
 
@@ -1202,7 +1209,7 @@ public:
       for (size_t i = 0; i < op.filters.size(); i++) {
         DomainHandle filter = materializeFilter(
             i, source, seg, baseDomain,
-            requiresPreparePhase ? &preparedFilterSources : nullptr,
+            requiresWholeIndexPrepare ? &preparedFilterSources : nullptr,
             reservation);
         source += op.filters[i].sourceCount();
         filters.push_back(
@@ -1226,7 +1233,7 @@ public:
       for (size_t i = 0; i < op.filters.size(); i++) {
         filters.push_back(std::move(materializeFilter(
             i, source, seg, live,
-            requiresPreparePhase ? &preparedResetFilterSources : nullptr,
+            requiresWholeIndexPrepare ? &preparedResetFilterSources : nullptr,
             reservation)).pinnedWith(op.planning.filterUses));
         source += op.filters[i].sourceCount();
       }
@@ -1529,7 +1536,7 @@ public:
         DocSet* borrowedDomain = nullptr;
         bool exactDomain = false;
         DocSet* exactDomainDocs = nullptr;
-        if (!requiresPreparePhase && op.requirements.needExactDomain
+        if (!requiresWholeIndexPrepare && op.requirements.needExactDomain
             && !op.exactDomainPlan.empty()) {
           auto result = op.exactDomainPlan.produce(
               poolGuard.pool(), *op.req.reader, seg, domain);
@@ -1574,7 +1581,7 @@ public:
         // required clause as the exact result. Outer domains remain explicit
         // intersections and must use the collection ladder below.
         if (!exactDomain && !wholeMembershipAvailable
-            && op.weight != nullptr && !requiresPreparePhase
+            && op.weight != nullptr && !requiresWholeIndexPrepare
             && domain == nullptr && op.filterWeights.empty()
             && op.weight->isConstantScoring()
             && (rankFromDocOrder || data->topCount() == 0)) {
@@ -1704,7 +1711,7 @@ public:
           // Keeps owned sets or request-pinned cache borrows alive; `filter`
           // may alias one directly, so the handles outlive collection below.
           std::vector<DomainHandle> filters;
-          if (!requiresPreparePhase && op.domainVariants.empty()
+          if (!requiresWholeIndexPrepare && op.domainVariants.empty()
               && !thisOp().filterWeights.empty()) {
             std::vector<DocSet*> filterPtrs;
             for (size_t i = 0; i < thisOp().filterWeights.size(); i++) {
@@ -1725,7 +1732,8 @@ public:
           }
           DocSetBuilder* builderPtr = builder.has_value() ? &*builder : nullptr;
           bool sourcePreparedAgainstFilter =
-            requiresPreparePhase && preparedWeight != nullptr && filter == domain;
+              requiresWholeIndexPrepare && preparedWeight != nullptr
+              && filter == domain;
           DocSet* collectorFilter =
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
@@ -1733,7 +1741,7 @@ public:
           // A constant-count plan satisfies this segment without constructing
           // an executor.
           bool counted = false;
-          if (!requiresPreparePhase && builderPtr == nullptr && filter == nullptr
+          if (!requiresWholeIndexPrepare && builderPtr == nullptr && filter == nullptr
               && !data->useFieldSort && data->scoreCollector->topCount == 0) {
             Query::ScorerSupplier::BulkScorerContext countContext;
             countContext.requireConstantCount = true;
@@ -1804,7 +1812,7 @@ public:
             // sub-saturating; at ceil(k/d) >= blockCount the bound floor
             // covers every block and bound order cannot beat doc order.
             if (maySkipNoncompetitiveDocs
-                && (!requiresPreparePhase || wholeFieldSortAvailable)
+                && (!requiresWholeIndexPrepare || wholeFieldSortAvailable)
                 && !data->fieldCollector->needsScores
                 && !data->fieldCollector->hasExpr
                 && data->fieldCollector->topCount > 0) {
@@ -1871,7 +1879,7 @@ public:
               skipCount(SkipStats::wholeFieldSortLadderFallbacks);
             }
             if (!usedBulk && wholeFieldSortAvailable
-                && op.weight == nullptr) {
+                && wholeMembershipResult.docs.get() != nullptr) {
               assert(wholeMembershipResult.docs.get() != nullptr);
               supplier = poolGuard.pool().make<QueryPrep::DocSetSupplier>(
                   wholeMembershipResult.docs.get(), seg);
@@ -1896,7 +1904,7 @@ public:
             // capability.
             if (!usedBulk && supplier != nullptr && !captureSharedRaw
                 && maySkipNoncompetitiveDocs && !disableFieldSortSeeding
-                && !disableFieldSortBulk && !requiresPreparePhase
+                && !disableFieldSortBulk && !requiresWholeIndexPrepare
                 && !data->fieldCollector->needsScores
                 && !data->fieldCollector->hasExpr
                 && data->fieldCollector->topCount > 0) {
@@ -2006,7 +2014,11 @@ public:
               }
             }
             if (!usedBulk && supplier != nullptr) {
-              auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
+              Query::ScorerPlan* pullPlan = resolvePullScorer(
+                  poolGuard.pool(), *supplier);
+              Query::ReportedTwoPhase reportedTwoPhase =
+                  pullPlan->shape().reportedTwoPhase;
+              auto* scorer = pullPlan->build(poolGuard.pool());
               if (scorer != nullptr) {
                 std::optional<FieldSortCollector::ExpressionBindings> expressionBindings;
                 if (data->fieldCollector->hasExpr && data->fieldCollector->topCount > 0) {
@@ -2019,7 +2031,7 @@ public:
                             captureSharedRaw
                                 ? DomainBuildMode::RAW_QUERY_MATCHES
                                 : DomainBuildMode::FILTERED_MATCHES,
-                            routedBaseDomain);
+                            routedBaseDomain, reportedTwoPhase);
                 data->fieldCollector->recordSegmentSkipStats(segnum);
               }
             }

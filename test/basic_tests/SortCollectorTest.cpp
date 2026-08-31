@@ -2332,8 +2332,9 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
 // Zone-based competitive pruning must return exactly what exhaustive
 // collection returns. The corpus spans multiple 4096-value zone blocks per
 // segment, includes deletes, ties, and a segment with missing values, and is
-// swept over match-all and term shapes, both drivers, both directions, and
-// limits around the block size.
+// swept over match-all, term, exact-phrase, and sloppy-phrase shapes, both
+// drivers, both directions, and limits around the block size. Phrase runs
+// additionally cover null/live-doc, dense BITSET, and sparse ARRAY domains.
 TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper;
@@ -2345,44 +2346,74 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
     for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
       std::string id = std::to_string(docId);
       int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
-      std::string body = (docId & 1) == 0 ? "alpha" : "other";
-      if (seg == 1 && i % 13 == 0) {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "ties_i", (int64_t)(docId % 7),
-                             "mono_i", (int64_t)docId,
-                             "rev_i", (int64_t)(20000 - docId)),
-                     UpdateMessage::NO_COMMIT);
-      } else {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "rand_i", rand,
-                             "ties_i", (int64_t)(docId % 7),
-                             "mono_i", (int64_t)docId,
-                             "rev_i", (int64_t)(20000 - docId)),
-                     UpdateMessage::NO_COMMIT);
+      std::string body;
+      switch (docId & 3) {
+        case 0: body = "alpha quick fox"; break;
+        case 1: body = "other quick brown fox"; break;
+        case 2: body = "alpha fox quick"; break;
+        default: body = "other quick slow red fox"; break;
       }
-      if (docId % 97 == 0) deleted.push_back(id);
+      Doc doc;
+      if (seg == 1 && i % 13 == 0) {
+        doc = flatdoc("id", id, "id_s", id, "body_w", body,
+                      "ties_i", (int64_t)(docId % 7),
+                      "mono_i", (int64_t)docId,
+                      "rev_i", (int64_t)(20000 - docId),
+                      "group_s", "g" + std::to_string(docId % 5));
+      } else {
+        doc = flatdoc("id", id, "id_s", id, "body_w", body,
+                      "rand_i", rand,
+                      "ties_i", (int64_t)(docId % 7),
+                      "mono_i", (int64_t)docId,
+                      "rev_i", (int64_t)(20000 - docId),
+                      "group_s", "g" + std::to_string(docId % 5));
+      }
+      if ((docId & 1) == 0) doc.push_back(NameVal{"dense_s", "y"});
+      if (docId % 100 == 0) doc.push_back(NameVal{"sparse_s", "y"});
+      helper.index(doc, UpdateMessage::NO_COMMIT);
+      // Segment 0 retains a null live-doc domain; segment 1 exercises deletes.
+      if (seg == 1 && docId % 97 == 0) deleted.push_back(id);
     }
     helper.commit();
   }
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
+  enum class PhraseShape { NONE, EXACT, SLOPPY };
+  enum class FilterDomain { NONE, BITSET, ARRAY };
   struct Sorts {
     std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
   };
   auto run = [&](bool disablePruning, bool forcePull, bool matchAll,
-                 const Sorts& sorts, int32_t limit, bool exactCount) {
+                 const Sorts& sorts, int32_t limit, bool exactCount,
+                 PhraseShape phraseShape = PhraseShape::NONE,
+                 FilterDomain filterDomain = FilterDomain::NONE,
+                 bool domainBuilder = false, bool forcePrepare = false) {
     SortPruningGuard pruningGuard(disablePruning);
     FieldSortBulkGuard bulkGuard(forcePull);
+    TopDocsFilterFoldGuard foldGuard(true);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
+    req->testForcePrepare = forcePrepare;
     req->collection("main");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
-    if (matchAll) {
+    if (phraseShape != PhraseShape::NONE) {
+      auto phrase = qb::phraseWords(cur.mr(), "body_w", {"quick", "fox"});
+      if (phraseShape == PhraseShape::SLOPPY) {
+        std::get<api::PhraseQuery>(phrase.kind).slop = 1;
+      }
+      cur.rawQuery() = std::move(phrase);
+    } else if (matchAll) {
       cur.allQuery();
     } else {
       cur.rawQuery() = qb::match(cur.mr(), "body_w", "alpha");
     }
+    if (filterDomain == FilterDomain::BITSET) {
+      cur.matchFilter("dense_s", "y");
+    } else if (filterDomain == FilterDomain::ARRAY) {
+      cur.matchFilter("sparse_s", "y");
+    }
     if (exactCount) cur.getNumber();
+    if (domainBuilder) cur.facet("groups", "group_s").limit(-1);
     for (const auto& [field, dir] : sorts.clauses) qb::sort(cur, field, dir);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -2391,12 +2422,28 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
       int64_t found = 0;
       int64_t blocksSkipped = 0;
       int64_t bulkCollections = 0;
+      int64_t externalActivations = 0;
+      int64_t externalCandidates = 0;
+      int64_t externalDomainRejects = 0;
+      int64_t externalVerifications = 0;
+      int64_t externalBoundRejects = 0;
+      int64_t phraseVerifies = 0;
     } result;
     result.ids = resultIds(*req);
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
     result.blocksSkipped = SkipStats::fieldSortBlocksSkipped;
     result.bulkCollections = SkipStats::fieldSortBulkCollections;
+    result.externalActivations =
+        SkipStats::fieldSortExternalApproxActivations;
+    result.externalCandidates = SkipStats::fieldSortExternalApproxCandidates;
+    result.externalDomainRejects =
+        SkipStats::fieldSortExternalApproxDomainRejects;
+    result.externalVerifications =
+        SkipStats::fieldSortExternalApproxVerifications;
+    result.externalBoundRejects =
+        SkipStats::fieldSortExternalApproxBoundRejects;
+    result.phraseVerifies = SkipStats::phraseVerifies;
     return result;
   };
 
@@ -2452,6 +2499,231 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   EXPECT_EQ(exactExhaustive.found, exactPruned.found);
   EXPECT_EQ(exactPruned.blocksSkipped, 0);
 
+  // External two-phase collection must preserve the exhaustive result for
+  // exact and sloppy phrases across all numeric bound/tie shapes and outer
+  // domain representations. Dense and sparse term filters materialize above
+  // and below DocSetBuilder's BITSET promotion threshold respectively.
+  for (PhraseShape phraseShape : {PhraseShape::EXACT, PhraseShape::SLOPPY}) {
+    for (FilterDomain filterDomain :
+         {FilterDomain::NONE, FilterDomain::BITSET, FilterDomain::ARRAY}) {
+      for (const Sorts& sorts :
+           {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc, revDesc}) {
+        auto exhaustive = run(true, true, false, sorts, 9, false,
+                              phraseShape, filterDomain);
+        auto pruned = run(false, true, false, sorts, 9, false,
+                          phraseShape, filterDomain);
+        EXPECT_EQ(exhaustive.ids, pruned.ids)
+            << "phrase=" << (int32_t)phraseShape
+            << " domain=" << (int32_t)filterDomain
+            << " sort=" << sorts.clauses[0].first;
+        EXPECT_EQ(0, exhaustive.externalActivations);
+        EXPECT_GT(pruned.externalActivations, 0);
+      }
+    }
+  }
+
+  auto exactProof = run(false, true, false, randAsc, 9, false,
+                        PhraseShape::EXACT);
+  EXPECT_GT(exactProof.externalActivations, 0);
+  EXPECT_GT(exactProof.externalCandidates, exactProof.externalVerifications);
+  EXPECT_GT(exactProof.externalBoundRejects, 0);
+  EXPECT_EQ(exactProof.externalVerifications, exactProof.phraseVerifies);
+
+  auto sloppyProof = run(false, true, false, randDesc, 9, false,
+                         PhraseShape::SLOPPY);
+  EXPECT_GT(sloppyProof.externalActivations, 0);
+  EXPECT_GT(sloppyProof.externalBoundRejects, 0);
+  EXPECT_EQ(sloppyProof.externalVerifications, sloppyProof.phraseVerifies);
+
+  auto bitDomain = run(false, true, false, randAsc, 9, false,
+                       PhraseShape::EXACT, FilterDomain::BITSET);
+  auto arrayDomain = run(false, true, false, randAsc, 9, false,
+                         PhraseShape::EXACT, FilterDomain::ARRAY);
+  EXPECT_GT(bitDomain.externalDomainRejects, 0);
+  EXPECT_GT(arrayDomain.externalDomainRejects, 0);
+
+  // Exact counts and produced sub-op domains require exhaustive membership and
+  // therefore cannot select the external approximation arm.
+  auto phraseCount = run(false, true, false, randAsc, 9, true,
+                         PhraseShape::EXACT);
+  auto phraseDomain = run(false, true, false, randAsc, 9, false,
+                          PhraseShape::EXACT, FilterDomain::NONE, true);
+  EXPECT_EQ(0, phraseCount.externalActivations);
+  EXPECT_EQ(0, phraseDomain.externalActivations);
+  EXPECT_GT(phraseCount.phraseVerifies, 0);
+  EXPECT_GT(phraseDomain.phraseVerifies, 0);
+
+  // Whole-index preparation changes the segment source, not the scorer's
+  // external two-phase capability.
+  auto prepared = run(false, true, false, randAsc, 9, false,
+                      PhraseShape::EXACT, FilterDomain::NONE, false, true);
+  EXPECT_GT(prepared.externalActivations, 0);
+  EXPECT_GT(prepared.externalBoundRejects, 0);
+
+}
+
+// The external two-phase field-sort driver (approximation conjunction plus
+// the live-bottom competitive gate ahead of positional verification) must
+// return exactly what exhaustive collection returns. Exact and sloppy
+// phrases, both directions, a secondary sort clause (which forbids equality
+// skipping), missing values, deletes, folded and materialized filters, and
+// limits from 1 to most-of-corpus. The parity matrix runs with whole
+// membership disabled so the pull arm itself executes; a separate enabled
+// section pins the resident ladder taking over on repeats - including the
+// fallback where built membership becomes the execution source while the
+// main weight is retained.
+TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
+  CollectionHelper helper("phrase_field_sort");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kDocsPerSeg = 5000;
+  std::vector<std::string> deleted;
+  int32_t docId = 0;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
+      std::string id = std::to_string(docId);
+      int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
+      // ~1/3 exact "red fox", ~1/3 slop-1 only, ~1/3 non-match at slop <= 1.
+      std::string body = (docId % 3) == 0 ? "one red fox two"
+          : (docId % 3) == 1              ? "one red pad fox two"
+                                          : "one fox red two";
+      std::string par = (docId & 1) == 0 ? "even" : "odd";
+      if (seg == 1 && i % 13 == 0) {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "par_w", par, "ties_i", (int64_t)(docId % 7)),
+                     UpdateMessage::NO_COMMIT);
+      } else {
+        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
+                             "par_w", par, "rand_i", rand,
+                             "ties_i", (int64_t)(docId % 7)),
+                     UpdateMessage::NO_COMMIT);
+      }
+      if (docId % 97 == 0) deleted.push_back(id);
+    }
+    helper.commit();
+  }
+  ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  struct Sorts {
+    std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
+  };
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t found = 0;
+    int64_t activations = 0;
+    int64_t candidates = 0;
+    int64_t domainRejects = 0;
+    int64_t boundRejects = 0;
+    int64_t verifications = 0;
+    int64_t wholeHits = 0;
+    int64_t wholeBuilds = 0;
+  };
+  // filterMode: 0 = none, 1 = folded into the query, 2 = materialized
+  // effective filter (the arm's domain-intersection shape).
+  auto run = [&](bool disablePruning, int32_t slop, const Sorts& sorts,
+                 int32_t limit, bool exactCount, int32_t filterMode) {
+    SortPruningGuard pruningGuard(disablePruning);
+    TopDocsFilterFoldGuard foldGuard(filterMode == 2);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("phrase_field_sort");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
+    phrase.field = "body_w";
+    phrase.text = "red fox";
+    phrase.slop = slop;
+    if (filterMode != 0) {
+      cur.filter(qb::match(cur.mr(), "par_w", "even"));
+    }
+    if (exactCount) cur.getNumber();
+    for (const auto& [field, dir] : sorts.clauses) qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Result result;
+    result.ids = resultIds(*req);
+    const auto* docs = req->docList("q");
+    if (docs != nullptr && docs->found) result.found = *docs->found;
+    result.activations = SkipStats::fieldSortExternalApproxActivations;
+    result.candidates = SkipStats::fieldSortExternalApproxCandidates;
+    result.domainRejects = SkipStats::fieldSortExternalApproxDomainRejects;
+    result.boundRejects = SkipStats::fieldSortExternalApproxBoundRejects;
+    result.verifications = SkipStats::fieldSortExternalApproxVerifications;
+    result.wholeHits = SkipStats::wholeFieldSortHits;
+    result.wholeBuilds = SkipStats::wholeFieldSortBuilds;
+    return result;
+  };
+
+  Sorts randAsc{{{"rand_i", qb::ASC}}};
+  Sorts randDesc{{{"rand_i", qb::DESC}}};
+  Sorts tiesThenRand{{{"ties_i", qb::ASC}, {"rand_i", qb::ASC}}};
+  Sorts idAsc{{{"id_s", qb::ASC}}};
+
+  {
+    WholeMembershipPlanGuard wholeGuard(true);
+    for (int32_t slop : {0, 1}) {
+      for (const Sorts& sorts : {randAsc, randDesc, tiesThenRand, idAsc}) {
+        for (int32_t limit : {1, 9, 987}) {
+          for (int32_t filterMode : {0, 2}) {
+            auto exhaustive = run(true, slop, sorts, limit, false, filterMode);
+            auto pruned = run(false, slop, sorts, limit, false, filterMode);
+            EXPECT_EQ(exhaustive.ids, pruned.ids)
+                << "slop=" << slop << " limit=" << limit
+                << " filterMode=" << filterMode
+                << " sort=" << sorts.clauses[0].first;
+          }
+        }
+      }
+    }
+
+    // Proof signature: the arm activates, the live-bottom gate rejects
+    // candidates before verification, and verification stays below the
+    // candidate stream. An exhaustive run never activates it.
+    auto pruned = run(false, 0, randAsc, 9, false, 0);
+    EXPECT_GT(pruned.activations, 0);
+    EXPECT_GT(pruned.boundRejects, 0);
+    EXPECT_LT(pruned.verifications, pruned.candidates);
+    EXPECT_EQ(run(true, 0, randAsc, 9, false, 0).activations, 0);
+
+    // The materialized filter rejects candidates ahead of verification.
+    EXPECT_GT(run(false, 0, randAsc, 9, false, 2).domainRejects, 0);
+
+    // An exact hit count disables the arm and stays exact.
+    auto exactExhaustivePhrase = run(true, 0, randAsc, 9, true, 0);
+    auto exactPrunedPhrase = run(false, 0, randAsc, 9, true, 0);
+    EXPECT_EQ(exactExhaustivePhrase.ids, exactPrunedPhrase.ids);
+    EXPECT_EQ(exactExhaustivePhrase.found, exactPrunedPhrase.found);
+    EXPECT_EQ(exactPrunedPhrase.activations, 0);
+
+    // Sloppy widens the match set: the slop-1 spelling must change found.
+    EXPECT_GT(run(true, 1, randAsc, 9, true, 0).found,
+              run(true, 0, randAsc, 9, true, 0).found);
+  }
+
+  // Whole membership enabled: repeats climb the bypass/build/hit ladder and
+  // the resident value takes over as the execution source (the main weight
+  // stays constructed - the fallback must still drop to the built DocSet).
+  // Results must stay identical to the membership-off exhaustive answer on
+  // every rung, for both the numeric sort and the string sort (whose
+  // best-first plan is unavailable, forcing the DocSetSupplier fallback).
+  {
+    std::vector<std::string> expectedRand;
+    std::vector<std::string> expectedId;
+    {
+      WholeMembershipPlanGuard wholeGuard(true);
+      expectedRand = run(true, 0, randAsc, 9, false, 0).ids;
+      expectedId = run(true, 0, idAsc, 9, false, 0).ids;
+    }
+    WholeMembershipPlanGuard wholeGuard(false);
+    int64_t ladder = 0;
+    for (int32_t rep = 0; rep < 4; rep++) {
+      auto viaRand = run(false, 0, randAsc, 9, false, 0);
+      auto viaId = run(false, 0, idAsc, 9, false, 0);
+      EXPECT_EQ(expectedRand, viaRand.ids) << "rep=" << rep;
+      EXPECT_EQ(expectedId, viaId.ids) << "rep=" << rep;
+      ladder += viaRand.wholeHits + viaRand.wholeBuilds
+          + viaId.wholeHits + viaId.wholeBuilds;
+    }
+    EXPECT_GT(ladder, 0);
+  }
 }
 
 // The best-first exact-domain driver must return exactly what the doc-order
