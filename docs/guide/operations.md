@@ -214,18 +214,22 @@ Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
 
 ## Threads and streaming backpressure
 
-HTTP and gRPC each default to half the detected hardware threads, with a
-minimum of one:
+HTTP defaults to one connection-I/O shard per detected hardware thread, with a
+minimum of one, plus one dedicated accept thread. gRPC defaults to half the
+detected hardware threads, also with a minimum of one:
 
 ```bash
 luxir --server.http.threads=8 --server.grpc.threads=8
 ```
 
-These are network event-loop/completion-queue threads, not the search worker
-pool. Search work runs on a shared work-stealing scheduler so long queries do
-not occupy connection threads. The current gRPC unary update handler waits for
-indexing on its completion-queue thread; streaming update and search use their
-separate flow-control paths.
+`--server.http.threads` sets the number of shards, not the total HTTP thread
+count; each shard owns one `io_context` and one runner. Connections are
+assigned round-robin at accept and remain pinned to their shard. These and the
+gRPC completion-queue threads are separate from the search worker pool. Search
+work runs on a shared work-stealing scheduler so long queries do not occupy
+connection threads. The current gRPC unary update handler waits for indexing
+on its completion-queue thread; streaming update and search use their separate
+flow-control paths.
 
 Search requests normally use automatic intra-request parallelism. Set the
 request-level `max_parallel` to `1` for single-threaded diagnosis or controlled

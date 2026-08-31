@@ -72,8 +72,8 @@ int luxir_main(int argc, char** argv) {
   try {
     LuxirNode node{config};
 
-    // The HTTP/JSON server runs on its own io threads; start it (non-blocking)
-    // before the blocking gRPC run().
+    // The HTTP/JSON server runs on its own connection-I/O shards and accept
+    // thread; start it (non-blocking) before the blocking gRPC run().
     std::optional<HttpServer> httpServer;
     if (config.server.http.enabled) {
       httpServer.emplace(node, config.server.http.resolveThreads(), config.server.http.port);

@@ -84,7 +84,8 @@ void LuxirConfig::addOptions(CLI::App& app) {
   // -p is the HTTP port: the HTTP/JSON API is the surface developers hit first.
   app.add_option("--server.http.port,-p", server.http.port, "HTTP/JSON listen port")
       ->default_val(server.http.port);
-  app.add_option("--server.http.threads", server.http.threads, "Number of HTTP server threads (0 = auto)")
+  app.add_option("--server.http.threads", server.http.threads,
+                 "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")

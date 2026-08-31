@@ -80,9 +80,11 @@ every core busy even when work is skewed.
 Both API surfaces multiplex connections with event loops. Search and streaming
 response paths keep connection handling separate from long-running engine work.
 
-- A small pool of io threads multiplexes all connections: the HTTP server
-  is an asynchronous proactor, and the gRPC server runs
-  on completion queues.
+- HTTP uses one single-runner `io_context` per configured connection shard,
+  plus a dedicated accept context and thread. Successful accepts are assigned
+  round-robin and the connection stays pinned to that shard; an idle shard
+  parks independently and does no per-request work for active shards. The
+  gRPC server runs on completion queues.
 - Search work is dispatched onto the work-stealing scheduler, so a long query
   cannot starve the network and a busy network cannot starve queries. The gRPC
   unary update path currently waits for indexing on its completion-queue
