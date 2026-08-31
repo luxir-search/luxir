@@ -24,7 +24,6 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/none.hpp>
-#include <boost/asio/strand.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/executor_work_guard.hpp>
@@ -138,7 +137,7 @@ struct HttpStreamBatchState {
   std::size_t deleteCount = 0;
   std::size_t firstDocIndex = 0;
   // The engine receives a raw UpdateMessage pointer.  The in-flight map owns
-  // this batch, and the batch owns the message until the strand folds its
+  // this batch, and the batch owns the message until the shard folds its
   // completion.
   std::shared_ptr<ProtoUpdateMessage> message;
 
@@ -255,7 +254,7 @@ struct HttpStreamUpdateState {
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
-// arena thread; it renders one NDJSON line and hands it to the session strand.
+// arena thread; it renders one NDJSON line and hands it to the session shard.
 // Holds a shared_ptr to the session so the connection outlives in-flight work,
 // and a ShardPin so shutdown drains this request and its shard survives the
 // request's teardown here on the task-arena thread.
@@ -296,9 +295,9 @@ public:
   // owns its bytes, so cleanup does not wait for the write to complete.
 };
 
-// Per-connection state.  All socket access and write-queue mutation happen on the
-// connection's strand (asio analog of the gRPC BiStreamingRequest mutex); cross-
-// thread producers reach it through enqueueLine.
+// Per-connection state. All socket access and mutable session state live on the
+// connection's single-threaded shard; cross-thread producers enter through the
+// executor-facing helpers below.
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
   HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
@@ -310,7 +309,7 @@ public:
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
 
-  // Posts a socket close onto this session's strand, unblocking any outstanding
+  // Posts a socket close onto this session's shard, unblocking any outstanding
   // read/write so the connection drains during shutdown.
   void closeFromServer() {
     net::post(stream_.get_executor(), [self = shared_from_this()] {
@@ -321,7 +320,7 @@ public:
   }
 
   // Callable from any thread.  Queues a rendered NDJSON line (an owned string)
-  // on the strand.  No completion callback: reply() already freed the arena the
+  // on the shard. No completion callback: reply() already freed the arena the
   // line was rendered from, so the write depends on nothing but the string.
   // Returns the connection's buffered bytes including this line - the producer's
   // flow-control signal (compare against highWater()).  Accounted here, before
@@ -334,7 +333,7 @@ public:
       // failed), so an exception reaching the catch below can only mean the
       // handler never ran - which keeps the rollback there exact.  Without
       // this, dispatch running the handler INLINE (caller already on the
-      // strand) could propagate a post-queue failure into that catch and
+      // shard) could propagate a post-queue failure into that catch and
       // double-subtract bytes a completion path subtracts again.
       net::dispatch(stream_.get_executor(),
           [self = shared_from_this(), line = std::move(line), last]() mutable {
@@ -369,7 +368,7 @@ public:
   // Callable from any thread.  Parks a paused producer's resume callback; it is
   // handed to the task arena once buffered bytes drop below the low-water mark,
   // or immediately if the connection has failed (the resumed producer's next
-  // reply() then observes CANCEL).  Registration runs on the strand, serialized
+  // reply() then observes CANCEL). Registration runs on the shard, serialized
   // with write completions, so a wakeup cannot be lost.
   void whenDrained(std::function<void()> resume) {
     net::dispatch(stream_.get_executor(),
@@ -436,14 +435,14 @@ private:
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
   // producers but not yet written to the socket (pendingQ_ + inflightLine_);
-  // it is the only cross-thread piece - everything else is strand-only.
+  // it is the only cross-thread piece - everything else is shard-only.
   std::atomic<int64_t> queuedBytes_{0};
   std::atomic<bool> aborted_{false};  // producer-visible mirror of errored_
   int64_t highWater_;
   int64_t lowWater_;
   std::vector<std::function<void()>> drainWaiters_;  // parked producer resumes
 
-  // Streaming write state - strand only.
+  // Streaming write state - shard only.
   std::deque<Pending> pendingQ_;
   std::string inflightLine_;  // owns the chunk buffer during its async_write
   std::optional<http::response<http::empty_body>> res_;
@@ -456,9 +455,9 @@ private:
   bool terminalStreamingFailure_ = false;
 
   // Engine completion runs on the update graph.  Extract every non-owning
-  // response field there, then hand an owning result to the session strand.
+  // response field there, then hand an owning result to the session shard.
   // The in-flight batch entry owns this message; the callback keeps it alive
-  // while that entry is erased, including the case where the strand runs
+  // while that entry is erased, including the case where the shard runs
   // before done() has returned on the engine thread.
   class StreamingUpdateMessage final
     : public ProtoUpdateMessage,
@@ -1305,9 +1304,9 @@ private:
     sreq->shardPin = makeShardPin();
 
     // Route by max_parallel: dispatch() moves the synchronous engine.submit()
-    // off the strand so this io thread is not blocked for the query's duration.
+    // off the shard so this io thread is not blocked for the query's duration.
     // max_parallel=-1 deliberately IS inline: the whole query runs right here
-    // on the strand thread (a scheduling-overhead baseline; blocks this
+    // on the shard thread (a scheduling-overhead baseline; blocks this
     // connection's io until it completes).  reply() posts results back here.
     engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
@@ -2163,7 +2162,7 @@ private:
     unused(inserted);
     state->inFlight++;
 
-    // This handler runs on the session strand.  execute enters the node arena
+    // This handler runs on the session shard. execute enters the node arena
     // only for the immediate try_put and returns without waiting for indexing.
     // Consecutive calls therefore reach startUpdateNode in stream order; enqueue
     // would not preserve the updateVersion ordering required by overwrite.
@@ -2755,7 +2754,7 @@ private:
     else doClose();
   }
 
-  // Strand only.  Hands parked producer resumes to the task arena once the
+  // Shard only. Hands parked producer resumes to the task arena once the
   // queue has drained below low-water (or unconditionally after an error).
   // Must not throw: it runs inside io handlers (ioc->run() has no catch), and
   // a lost waiter strands its request forever - so an enqueue allocation
@@ -2859,7 +2858,7 @@ void HttpSession::run() {
       reg->sessions.erase(it);
     };
   }
-  net::dispatch(stream_.get_executor(),
+  net::post(stream_.get_executor(),
       beast::bind_front_handler(&HttpSession::doRead, shared_from_this()));
 }
 
@@ -2920,7 +2919,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       // Multi-op requests have one emitter per op replying concurrently: the
       // framing decisions and the queue posts must agree on order, so both
       // happen under a SHORT critical section (marker render + posts; the
-      // strand does the actual writes).  Single-op requests have a single
+      // shard does the actual writes). Single-op requests have a single
       // producer whose replies are already sequenced by the completion
       // protocol - no lock, and the normal path is unchanged.
       std::optional<std::lock_guard<std::mutex>> lock;
@@ -3008,7 +3007,7 @@ void HttpServer::start() {
 
 void HttpServer::doAccept() {
   auto shard = shards[nextShard];
-  acceptor->async_accept(net::make_strand(shard->ioc),
+  acceptor->async_accept(shard->ioc.get_executor(),
       [this, shard](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
         if (!ec) {
