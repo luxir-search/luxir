@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <limits>
@@ -28,6 +29,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 // prettify_json is a pure text transform (no api-type serialization), so this TU needs
 // glaze but not the Luxir JSON dialect. prettify.hpp is not self-contained: read_iterators
@@ -59,8 +61,12 @@ class HttpSession;
 class HttpIoShard {
 public:
   net::io_context ioc{1};
-  std::optional<net::executor_work_guard<net::io_context::executor_type>> workGuard;
+  net::steady_timer idleTimer{ioc};
+  // Shard 0 is the warm floor after its first assignment. The accept thread
+  // creates this guard before spawning that thread; shutdown alone resets it.
+  std::optional<net::executor_work_guard<net::io_context::executor_type>> floorGuard;
   std::thread thread;
+  std::atomic<std::uint64_t> activityEpoch{0};
   // Live connections assigned here. Incremented by the accept thread at
   // assignment, decremented by session teardown (any thread); drives
   // least-connections assignment in doAccept.
@@ -312,7 +318,10 @@ public:
 
   ~HttpSession() {
     if (deregister_) deregister_();
-    shard_->liveConnections.fetch_sub(1, std::memory_order_relaxed);
+    // Publish activity before publishing the transition to zero. The idle
+    // timer's acquire load of liveConnections then observes this epoch bump.
+    shard_->activityEpoch.fetch_add(1, std::memory_order_release);
+    shard_->liveConnections.fetch_sub(1, std::memory_order_release);
   }
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
@@ -2969,18 +2978,21 @@ void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
   session->whenDrained(std::move(resume));
 }
 
-HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes)
+HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes,
+                       std::chrono::milliseconds shardIdlePeriod)
   : node(node), nthreads(threads), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
         streamBufferBytes > 0 ? streamBufferBytes
-                              : node.getConfig().server.stream_buffer_bytes)) {}
+                              : node.getConfig().server.stream_buffer_bytes)),
+    shardIdlePeriod(shardIdlePeriod) {}
 
 HttpServer::~HttpServer() { shutdown(); }
 
 void HttpServer::start() {
   if (started) return;
+  shutdownRequested.store(false, std::memory_order_release);
   int n = nthreads > 0 ? nthreads
                        : (int)std::max(1u, std::thread::hardware_concurrency());
 
@@ -2990,9 +3002,7 @@ void HttpServer::start() {
   registry = std::make_shared<HttpSessionRegistry>();
   shards.reserve(n);
   for (int i = 0; i < n; i++) {
-    auto shard = std::make_shared<HttpIoShard>();
-    shard->workGuard.emplace(shard->ioc.get_executor());
-    shards.push_back(std::move(shard));
+    shards.push_back(std::make_shared<HttpIoShard>());
   }
 
   acceptor.emplace(acceptIoc);
@@ -3004,15 +3014,67 @@ void HttpServer::start() {
 
   doAccept();
 
-  // Shard threads spawn on first connection assignment (doAccept), so an
-  // idle or lightly loaded server carries only the threads it has used.
-  // Once spawned, a shard thread runs until shutdown.
+  // Shard threads spawn on first connection assignment. Shard 0 stays warm
+  // after that first use; other shards exit after their independent idle
+  // linger and can be spawned again by a later assignment.
   acceptThread = std::thread([this] {
     nameThisThread("luxir_accept");
     acceptIoc.run();
   });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
+}
+
+void HttpServer::armShardIdle(std::size_t idx) {
+  assert(idx != 0);
+  HttpIoShard* shard = shards[idx].get();
+  std::uint64_t observedEpoch = shard->activityEpoch.load(std::memory_order_acquire);
+  shard->idleTimer.expires_after(shardIdlePeriod);
+  // The server owns every shard until shutdown has joined and drained all
+  // contexts. Keep maintenance handlers non-owning so a stopped context cannot
+  // retain its own shard.
+  shard->idleTimer.async_wait([this, shard, idx, observedEpoch](beast::error_code ec) {
+    if (shutdownRequested.load(std::memory_order_acquire)) return;
+    if (ec) return;
+
+    int64_t live = shard->liveConnections.load(std::memory_order_acquire);
+    std::uint64_t currentEpoch = shard->activityEpoch.load(std::memory_order_acquire);
+    if (live == 0 && currentEpoch == observedEpoch) return;
+    armShardIdle(idx);
+  });
+}
+
+void HttpServer::spawnShard(std::size_t idx) {
+  auto shard = shards[idx];
+  assert(!shard->thread.joinable());
+  if (idx == 0) {
+    if (!shard->floorGuard) shard->floorGuard.emplace(shard->ioc.get_executor());
+  } else if (!shutdownRequested.load(std::memory_order_acquire)) {
+    armShardIdle(idx);
+  }
+  // A close-window accept can spawn after this shard's cancel handler ran.
+  // During shutdown its session and queued handlers are the only work needed;
+  // arming a new linger timer here would delay join by the full idle period.
+
+  shard->thread = std::thread([this, shard, idx] {
+    runningShardThreads.fetch_add(1, std::memory_order_relaxed);
+    char name[16];
+    snprintf(name, sizeof(name), "luxir_http_%zu", idx);
+    nameThisThread(name);
+    shard->ioc.run();
+    runningShardThreads.fetch_sub(1, std::memory_order_relaxed);
+    net::post(acceptIoc, [this, idx] { shardExited(idx); });
+  });
+}
+
+void HttpServer::shardExited(std::size_t idx) {
+  auto shard = shards[idx];
+  assert(shard->thread.joinable());
+  // The runner has finished ioc.run() before posting this notification, but it
+  // may still be returning from net::post, so join can briefly wait.
+  shard->thread.join();
+  shard->ioc.restart();
+  if (shard->liveConnections.load(std::memory_order_acquire) > 0) spawnShard(idx);
 }
 
 void HttpServer::doAccept() {
@@ -3037,18 +3099,12 @@ void HttpServer::doAccept() {
       [this, shard, idx](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
         if (!ec) {
-          shard->liveConnections.fetch_add(1, std::memory_order_relaxed);
-          // Only the accept thread spawns shard threads, and shutdown joins
-          // this thread before touching them, so joinable() is race-free:
-          // false = never assigned, true = running until shutdown.
-          if (!shard->thread.joinable()) {
-            shard->thread = std::thread([shard, idx] {
-              char name[16];
-              snprintf(name, sizeof(name), "luxir_http_%zu", idx);
-              nameThisThread(name);
-              shard->ioc.run();
-            });
-          }
+          shard->activityEpoch.fetch_add(1, std::memory_order_release);
+          shard->liveConnections.fetch_add(1, std::memory_order_release);
+          // Only the accept thread spawns and reaps. joinable() therefore means
+          // spawned and not yet reaped; the runner may already have returned.
+          // shardExited() respawns if this assignment lands in that window.
+          if (!shard->thread.joinable()) spawnShard(idx);
           // Small request/response exchanges on a keep-alive connection stall
           // ~40ms per round trip under Nagle + delayed ACK; disable Nagle like
           // every HTTP server does.  Best-effort: an ec here is not fatal.
@@ -3075,7 +3131,23 @@ void HttpServer::shutdown() {
   }
 #endif
 
-  // 1) Close the registry gate before asking the accept loop to stop. A
+  // 1) Tell every idle timer to retire, regardless of whether its completion
+  //    races cancellation. The cancel handlers are non-owning; virgin or
+  //    already-parked contexts execute them in the final inline drain.
+  shutdownRequested.store(true, std::memory_order_release);
+  for (auto& shard : shards) {
+    HttpIoShard* shardPtr = shard.get();
+    net::post(shard->ioc, [shardPtr] {
+      try {
+        shardPtr->idleTimer.cancel();
+      } catch (...) {
+        // The shutdown flag still prevents a later completion from rearming.
+        // steady_timer offers no error_code cancel overload in this Boost.
+      }
+    });
+  }
+
+  // 2) Close the registry gate before asking the accept loop to stop. A
   //    connection accepted in the close window then self-closes in run().
   //    Snapshot live sessions while holding the same gate, keeping them alive
   //    until their close has been posted.
@@ -3086,7 +3158,7 @@ void HttpServer::shutdown() {
     for (auto& w : registry->sessions) if (auto s = w.lock()) live.push_back(std::move(s));
   }
 
-  // 2) Stop accepting. The accept context has one runner, so this is serialized
+  // 3) Stop accepting. The accept context has one runner, so this is serialized
   //    with the accept loop without a strand.
   if (acceptor) {
     net::post(acceptor->get_executor(), [this] {
@@ -3095,29 +3167,43 @@ void HttpServer::shutdown() {
     });
   }
 
-  // 3) Close each live connection, then drop our refs. Closing unblocks idle
+  // 4) Close each live connection, then drop our refs. Closing unblocks idle
   //    reads; in-flight queries keep the io_context alive via their work guards
   //    until they finish (and release their response arenas).
   for (auto& s : live) s->closeFromServer();
   live.clear();
 
-  // No worker context may exit until the accept loop is quiescent: a successful
-  // accept racing the close can still hand a session to the worker context.
+  // The accept loop must be quiescent before shutdown releases shard 0's floor
+  // guard or joins workers: a successful accept racing the close can still
+  // assign a connection and spawn a shard.
   if (acceptThread.joinable()) acceptThread.join();
 #ifndef NDEBUG
   assert(!acceptThread.joinable());
 #endif
 
-  // 4) Release each keep-alive guard and let run() return once that shard's work
-  //    drains. Never call stop(): uninvoked handlers hold sessions which co-own
-  //    their shard, creating a retention cycle instead of a clean teardown.
-  for (auto& shard : shards) shard->workGuard.reset();
+  // 5) Release shard 0's permanent floor guard, then join every runner. Other
+  //    shards are held only by real io work, their idle timer, and ShardPins.
+  //    Never call stop(): uninvoked handlers hold sessions which co-own their
+  //    shard, creating a retention cycle instead of a clean teardown.
+  if (!shards.empty()) shards[0]->floorGuard.reset();
   for (auto& shard : shards) {
     if (shard->thread.joinable()) shard->thread.join();
 #ifndef NDEBUG
     assert(!shard->thread.joinable());
 #endif
   }
+
+  // 6) A runner can return just before a connection or maintenance handler is
+  //    posted, leaving work queued on a stopped context. With every dedicated
+  //    runner joined, drain every shard inline without filtering by its prior
+  //    thread state.
+  for (auto& shard : shards) {
+    if (shard->ioc.stopped()) shard->ioc.restart();
+    shard->ioc.run();
+  }
+#ifndef NDEBUG
+  assert(runningShardThreads.load(std::memory_order_relaxed) == 0);
+#endif
 
   // The acceptor and registry may only be released after every executor that
   // references them has drained. Sessions can briefly outlive this point on an

@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <filesystem>
@@ -41,6 +42,16 @@ protected:
   }
 
   int port() { return server->getPort(); }
+
+  static bool waitForShardThreads(HttpServer& server, int expected,
+                                  std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+      if (server.getRunningShardThreads() == expected) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return server.getRunningShardThreads() == expected;
+  }
 
   static std::set<std::string> idsOf(const std::vector<Doc>& docs) {
     std::set<std::string> s;
@@ -245,6 +256,114 @@ TEST_F(HttpApiTest, connectionsStayPinnedToIoShards) {
   }
   connections.clear();
   shardServer.shutdown();
+}
+
+TEST_F(HttpApiTest, idleIoShardsExitAndRespawn) {
+  HttpServer idleServer(*LuxirTest::luxirNode, 4, 0, -1,
+                        std::chrono::milliseconds(30));
+  idleServer.start();
+
+  struct Connection {
+    beast::tcp_stream stream;
+    beast::flat_buffer buffer;
+    explicit Connection(net::io_context& ioc) : stream(ioc) {}
+  };
+
+  net::io_context clientIoc;
+  tcp::resolver resolver(clientIoc);
+  auto endpoint = resolver.resolve("127.0.0.1", std::to_string(idleServer.getPort()));
+  std::vector<std::unique_ptr<Connection>> connections;
+  for (int i = 0; i < 4; i++) {
+    auto connection = std::make_unique<Connection>(clientIoc);
+    connection->stream.connect(endpoint);
+    connections.push_back(std::move(connection));
+  }
+  ASSERT_TRUE(waitForShardThreads(idleServer, 4, std::chrono::seconds(3)));
+
+  for (auto& connection : connections) {
+    http::request<http::empty_body> request(http::verb::get, "/health", 11);
+    request.set(http::field::host, "127.0.0.1");
+    request.keep_alive(true);
+    http::write(connection->stream, request);
+    http::response<http::string_body> response;
+    http::read(connection->stream, connection->buffer, response);
+    ASSERT_EQ(200, response.result_int()) << response.body();
+  }
+
+  for (auto& connection : connections) {
+    beast::error_code ec;
+    connection->stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+    connection->stream.socket().close(ec);
+  }
+  connections.clear();
+  ASSERT_TRUE(waitForShardThreads(idleServer, 1, std::chrono::seconds(3)))
+      << "running shard threads=" << idleServer.getRunningShardThreads();
+
+  // Occupy the warm floor so the next connection must revive a parked shard.
+  auto floorConnection = std::make_unique<Connection>(clientIoc);
+  floorConnection->stream.connect(endpoint);
+  http::request<http::empty_body> floorRequest(http::verb::get, "/health", 11);
+  floorRequest.set(http::field::host, "127.0.0.1");
+  floorRequest.keep_alive(true);
+  http::write(floorConnection->stream, floorRequest);
+  http::response<http::string_body> floorResponse;
+  http::read(floorConnection->stream, floorConnection->buffer, floorResponse);
+  ASSERT_EQ(200, floorResponse.result_int()) << floorResponse.body();
+
+  auto revived = httpRequest(idleServer.getPort(), http::verb::get, "/health");
+  EXPECT_EQ(200, revived.result_int()) << revived.body();
+
+  beast::error_code ec;
+  floorConnection->stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+  floorConnection->stream.socket().close(ec);
+  idleServer.shutdown();
+}
+
+TEST_F(HttpApiTest, idleIoShardChurn) {
+  HttpServer idleServer(*LuxirTest::luxirNode, 4, 0, -1,
+                        std::chrono::milliseconds(1));
+  idleServer.start();
+
+  // Keep shard 0 occupied so sequential connections repeatedly exercise the
+  // exit/reap/respawn window on the non-floor shards.
+  net::io_context holderIoc;
+  tcp::resolver holderResolver(holderIoc);
+  beast::tcp_stream holder(holderIoc);
+  holder.connect(holderResolver.resolve(
+      "127.0.0.1", std::to_string(idleServer.getPort())));
+  http::request<http::empty_body> holderRequest(http::verb::get, "/health", 11);
+  holderRequest.set(http::field::host, "127.0.0.1");
+  holderRequest.keep_alive(true);
+  http::write(holder, holderRequest);
+  beast::flat_buffer holderBuffer;
+  http::response<http::string_body> holderResponse;
+  http::read(holder, holderBuffer, holderResponse);
+  ASSERT_EQ(200, holderResponse.result_int()) << holderResponse.body();
+
+  for (int i = 0; i < 300; i++) {
+    auto response = httpRequest(idleServer.getPort(), http::verb::get, "/health");
+    ASSERT_EQ(200, response.result_int()) << "request=" << i << ' ' << response.body();
+  }
+
+  std::atomic<int> failures{0};
+  std::vector<std::thread> clients;
+  for (int i = 0; i < 24; i++) {
+    clients.emplace_back([&idleServer, &failures] {
+      try {
+        auto response = httpRequest(idleServer.getPort(), http::verb::get, "/health");
+        if (response.result_int() != 200) failures.fetch_add(1, std::memory_order_relaxed);
+      } catch (...) {
+        failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto& client : clients) client.join();
+  EXPECT_EQ(0, failures.load(std::memory_order_relaxed));
+
+  beast::error_code ec;
+  holder.socket().shutdown(tcp::socket::shutdown_both, ec);
+  holder.socket().close(ec);
+  idleServer.shutdown();
 }
 
 TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {

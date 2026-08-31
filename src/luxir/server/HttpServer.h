@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 #include <optional>
@@ -26,12 +28,16 @@ public:
   // thread is additional.
   // streamBufferBytes <= 0 means "use server.stream_buffer_bytes from the node
   // config" (per-connection response buffering cap; see ServerConfig).
-  HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes = -1);
+  // shardIdlePeriod controls how long an unused non-floor shard stays alive;
+  // shard 0 remains running after its first connection assignment.
+  HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes = -1,
+             std::chrono::milliseconds shardIdlePeriod = std::chrono::seconds(60));
   ~HttpServer();
 
   // Bind and begin accepting. Shard threads spawn lazily as connections are
-  // assigned. Non-blocking; getPort() is
-  // valid after this returns.  Throws on bind failure.
+  // assigned. Shard 0 stays warm after first use; other shards exit after an
+  // idle linger and respawn on demand. Non-blocking; getPort() is valid after
+  // this returns. Throws on bind failure.
   void start();
 
   // Stop accepting, drain in-flight work, and join workers.  Idempotent.
@@ -39,6 +45,9 @@ public:
   void shutdown();
 
   int getPort() const { return port_; }
+  int getRunningShardThreads() const {
+    return runningShardThreads.load(std::memory_order_relaxed);
+  }
   LuxirNode& getLuxirNode() { return node; }
 
   HttpServer(const HttpServer&) = delete;
@@ -49,8 +58,11 @@ private:
   int nthreads;
   int requestedPort;
   int64_t streamBufferBytes_;
+  std::chrono::milliseconds shardIdlePeriod;
   int port_ = 0;
   bool started = false;
+  std::atomic<bool> shutdownRequested{false};
+  std::atomic<int> runningShardThreads{0};
 
   // Accepting is isolated from request execution so an inline search cannot
   // delay new connections. The outstanding async_accept keeps this context
@@ -64,6 +76,9 @@ private:
   std::shared_ptr<HttpSessionRegistry> registry;
 
   void doAccept();
+  void armShardIdle(std::size_t idx);
+  void spawnShard(std::size_t idx);
+  void shardExited(std::size_t idx);
 };
 
 } // namespace luxir
