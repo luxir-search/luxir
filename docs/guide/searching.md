@@ -362,13 +362,15 @@ metrics over its result domain), exactly as it does inside a full-form
 
 `freshness_ms` bounds how stale an index view may be; `0` requires the latest
 commit. `time_zone` supplies the civil frame for every date query and facet in
-the request. `max_parallel: 0` lets the engine choose intra-request parallelism
-and is the default; `1` executes the request on one worker thread; `-1`
-executes it inline on the transport thread that received it (no scheduler
-handoff at all - useful for isolating scheduling overhead, at the cost of
-blocking that connection's thread). Values above `1` are reserved and
-currently rejected. The path collection overrides any
-collection target in the HTTP body.
+the request. `max_parallel` caps intra-request parallelism, executed on the
+server's shared worker pool: `1` executes the request serially on one worker
+thread; `-1` removes the cap. `0`, the default, lets the engine choose -
+today that is serial execution directly on the transport thread that received
+the request (no scheduler handoff at all; cheap queries skip scheduling
+entirely, at the cost of occupying that connection's thread for the query's
+duration). Set `1` to move a request you expect to be expensive off the
+connection thread. Values above `1` are reserved and currently rejected. The
+path collection overrides any collection target in the HTTP body.
 
 `request_id` is echoed by gRPC responses for correlation within a bidirectional
 stream. The custom HTTP response envelope does not currently include it.
@@ -410,8 +412,8 @@ segment), or intersecting each term's postings with the domain.
 Treat `strategy` and the typed numeric fields as diagnostics, not a stable
 performance promise. `details` is prose for humans and is not part of the API:
 its wording, ordering, and entry count change with the engine, so do not build
-tooling on it. Use `max_parallel: 1` when comparing segment timings without
-parallel scheduling as a variable.
+tooling on it. Serial execution (the default, or `max_parallel: 1`) keeps
+parallel scheduling out of segment-timing comparisons.
 
 ## Streaming HTTP responses
 

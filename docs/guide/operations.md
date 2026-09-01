@@ -225,18 +225,17 @@ luxir --server.http.threads=8 --server.grpc.threads=8
 `--server.http.threads` sets the number of shards, not the total HTTP thread
 count; each shard owns one `io_context` and one runner. Connections are
 assigned round-robin at accept and remain pinned to their shard. These and the
-gRPC completion-queue threads are separate from the search worker pool. Search
-work runs on a shared work-stealing scheduler so long queries do not occupy
-connection threads. The current gRPC unary update handler waits for indexing
-on its completion-queue thread; streaming update and search use their separate
-flow-control paths.
-
-Search requests normally use automatic intra-request parallelism. Set the
-request-level `max_parallel` to `1` for single-threaded diagnosis or controlled
-profiling (still dispatched to the shared scheduler); `-1` additionally skips
-the scheduler handoff entirely and runs the request on the receiving transport
-thread (isolates scheduling overhead; blocks that thread). `0` is automatic
-and values above `1` are not implemented yet.
+Search requests default to serial execution directly on the transport thread
+that received them (an HTTP io shard or gRPC completion-queue thread): no
+scheduler handoff, no idle-worker wakeups, at the cost of occupying that
+connection's thread for the query's duration. The request-level `max_parallel`
+moves a request onto the shared work-stealing scheduler instead: `1` runs it
+serially there (use this for requests expected to be expensive, so they do not
+delay other traffic on the same connection thread), `-1` runs it with
+unlimited intra-request parallelism, and values above `1` are reserved for a
+bounded parallelism budget and not implemented yet. The current gRPC unary
+update handler waits for indexing on its completion-queue thread; streaming
+update and search use their separate flow-control paths.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above

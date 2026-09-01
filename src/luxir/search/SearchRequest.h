@@ -164,10 +164,12 @@ public:
   virtual ReplyStatus reply(SearchResponse& response) = 0;
 
   /// Called by a streaming producer after reply() returned PAUSE.  The
-  /// transport must invoke `resume` exactly once, on a task-arena thread, when
-  /// the connection drains below its low-water mark (or immediately on error -
-  /// the producer's next reply() then observes CANCEL).  The default is for
-  /// transports without flow control: resume immediately.
+  /// transport must invoke `resume` exactly once when the connection drains
+  /// below its low-water mark (or immediately on error - the producer's next
+  /// reply() then observes CANCEL).  Which thread fires it is the transport's
+  /// placement choice (the connection's io shard for default-lane HTTP
+  /// requests, a task-arena worker otherwise); producers must not assume one.
+  /// The default is for transports without flow control: resume immediately.
   virtual void resumeWhenDrained(std::function<void()> resume) { resume(); }
 
   /// This is called when the reply has completed (e.g. it has been written to a socket and not just buffered)

@@ -382,9 +382,9 @@ public:
     return queued;
   }
 
-  // Callable from any thread.  Parks a paused producer's resume callback; it is
-  // handed to the task arena once buffered bytes drop below the low-water mark,
-  // or immediately if the connection has failed (the resumed producer's next
+  // Callable from any thread.  Parks a paused producer's resume callback; it
+  // is fired once buffered bytes drop below the low-water mark, or
+  // immediately if the connection has failed (the resumed producer's next
   // reply() then observes CANCEL). Registration runs on the shard, serialized
   // with write completions, so a wakeup cannot be lost.
   void whenDrained(std::function<void()> resume) {
@@ -429,6 +429,8 @@ public:
   std::shared_ptr<ShardPin> makeShardPin() {
     return std::make_shared<ShardPin>(shard_);
   }
+
+  LuxirNode& node() { return node_; }
 
 private:
   struct Pending { std::string line; bool last; };
@@ -1320,11 +1322,12 @@ private:
     // context survives the request's teardown on the task-arena thread.
     sreq->shardPin = makeShardPin();
 
-    // Route by max_parallel: dispatch() moves the synchronous engine.submit()
-    // off the shard so this io thread is not blocked for the query's duration.
-    // max_parallel=-1 deliberately IS inline: the whole query runs right here
-    // on the shard thread (a scheduling-overhead baseline; blocks this
-    // connection's io until it completes).  reply() posts results back here.
+    // Route by max_parallel: the default (0) deliberately runs the whole
+    // query right here on the shard thread - serial, no scheduler, blocking
+    // this connection's io until it completes.  Non-zero values move the
+    // synchronous engine.submit() onto the task arena so this io thread is
+    // not occupied for the query's duration; reply() then posts results back
+    // here.
     engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
 
@@ -2771,11 +2774,15 @@ private:
     else doClose();
   }
 
-  // Shard only. Hands parked producer resumes to the task arena once the
-  // queue has drained below low-water (or unconditionally after an error).
+  // Shard only. Fires parked producer resumes once the queue has drained
+  // below low-water (or unconditionally after an error).  Resumes are POSTED
+  // to this connection's shard, not invoked: an already-drained park must not
+  // recurse into produce(), and running production here keeps a default-lane
+  // request on the thread that owns it (arena-lane requests re-enqueue
+  // themselves - see HttpSearchRequest::resumeWhenDrained).
   // Must not throw: it runs inside io handlers (ioc->run() has no catch), and
-  // a lost waiter strands its request forever - so an enqueue allocation
-  // failure falls back to running the resume inline.
+  // a lost waiter strands its request forever - so a post allocation failure
+  // falls back to running the resume inline.
   void maybeFireDrainWaiters() {
     if (drainWaiters_.empty()) return;
     if (!errored_ && queuedBytes_.load(std::memory_order_relaxed) > lowWater_) return;
@@ -2783,7 +2790,7 @@ private:
     drainWaiters_.clear();
     for (auto& w : waiters) {
       try {
-        node_.getTaskArena().enqueue(w);  // copies; w stays valid if this throws
+        net::post(stream_.get_executor(), w);  // copies; w stays valid if this throws
       } catch (...) {
         if (w) w();
       }
@@ -2975,6 +2982,19 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
+  if (maxParallel != 0) {
+    // The request opted its query work off the io plane (max_parallel != 0),
+    // so resumed production belongs on the arena too.  The wrapper runs on
+    // the shard (see maybeFireDrainWaiters) and must not throw: fall back to
+    // producing inline rather than stranding the stream.
+    resume = [&node = session->node(), resume = std::move(resume)] {
+      try {
+        node.getTaskArena().enqueue(resume);
+      } catch (...) {
+        if (resume) resume();
+      }
+    };
+  }
   session->whenDrained(std::move(resume));
 }
 

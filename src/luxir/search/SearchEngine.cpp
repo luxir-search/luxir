@@ -15,8 +15,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
     if (!req.timeZone) throw std::runtime_error(req.timeZoneError);
     if (req.maxParallel > 1 || req.maxParallel < -1) {
       throw std::runtime_error(
-          "max_parallel must be -1 (run on the submitting thread), 0 (auto), or 1 "
-          "(single-threaded); values above 1 are not implemented");
+          "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
+          "on the shared executor), or -1 (unlimited parallelism); values "
+          "above 1 are reserved for a parallelism budget and not implemented");
     }
     getResources(req);
     // LOG_DEBUG("submitBody: IndexReader commitTime={}", req.reader->commitTime());
@@ -80,13 +81,17 @@ void SearchEngine::submitBody(SearchRequest& req) {
 }
 
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
-  if (maxParallel == -1) {
+  if (maxParallel == 0) {
+    // Default lane: the whole query runs serially right here on the receiving
+    // transport thread.  No scheduler hop, and the arena's parked width never
+    // wakes - the transport accepts that this thread is occupied for the
+    // query's duration.
     submit(req, maxParallel);
   } else {
-    // 0 and 1 both run on the shared arena; 1 just skips the task_group, so
-    // "don't parallelize me" never moves the request outside the TBB-governed
-    // thread set (a second executor would contend with arena work the market
-    // cannot see).  -1 is the no-scheduler lane when that isolation matters.
+    // Every explicit non-zero value is an arena contract: 1 = serial off the
+    // receiving thread, -1 = unlimited intra-request parallelism (>1 reserved
+    // for a bounded width budget).  Query work stays inside the TBB-governed
+    // thread set either way.
     node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
   }
 }
@@ -95,7 +100,7 @@ void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
   req.maxParallel = maxParallel;
   std::optional<oneapi::tbb::task_group> stackTg;
-  if (maxParallel == 0 && req.tg == nullptr) {
+  if (maxParallel == -1 && req.tg == nullptr) {
     req.tg = &stackTg.emplace();
   }
   submitBody(req);

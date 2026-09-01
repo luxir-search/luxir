@@ -202,7 +202,7 @@ TEST_F(HttpApiTest, connectionsStayPinnedToIoShards) {
     request.set(http::field::content_type, "application/json");
     request.keep_alive(true);
     request.body() =
-        R"({"profile":true,"max_parallel":-1,"ops":{"affinity":{"field_facet":{"field":"affinity_s","limit":-1}}}})";
+        R"({"profile":true,"max_parallel":0,"ops":{"affinity":{"field_facet":{"field":"affinity_s","limit":-1}}}})";
     request.prepare_payload();
     http::write(connection.stream, request);
 
@@ -531,7 +531,8 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
       R"({"docs":[{"id":"mp1","http_mp_s":"x"},{"id":"mp2","http_mp_s":"x"},{"id":"mp3","http_mp_s":"y"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
-  // -1 = inline on the strand, 1 = serial search pool, 0 = TBB arena; same answer.
+  // 0 = inline on the shard, 1 = serial on the arena, -1 = parallel on the
+  // arena; same answer from every lane.
   for (std::string mp : {"-1", "0", "1"}) {
     auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
         R"({"max_parallel":)" + mp +
@@ -2904,45 +2905,51 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
 
-  net::io_context cioc;
-  tcp::socket sock(cioc);
-  sock.open(tcp::v4());
-  // Small receive buffer (set before connect) so the kernel absorbs little and
-  // the server's write queue backs up quickly.
-  sock.set_option(net::socket_base::receive_buffer_size(8192));
-  sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
-                             (unsigned short)bpServer.getPort()));
+  // All three dispatch lanes pause and drain: the default (0) parks and
+  // resumes on the connection shard; 1 and -1 re-enqueue their resumes onto
+  // the arena (HttpSearchRequest::resumeWhenDrained's arena-lane wrapper).
+  for (std::string mp : {"0", "1", "-1"}) {
+    net::io_context cioc;
+    tcp::socket sock(cioc);
+    sock.open(tcp::v4());
+    // Small receive buffer (set before connect) so the kernel absorbs little
+    // and the server's write queue backs up quickly.
+    sock.set_option(net::socket_base::receive_buffer_size(8192));
+    sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                               (unsigned short)bpServer.getPort()));
 
-  int64_t pausesBefore = streamPauseCount.load();
+    int64_t pausesBefore = streamPauseCount.load();
 
-  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
-  req.set(http::field::host, "127.0.0.1");
-  req.set(http::field::content_type, "application/json");
-  req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})";
-  req.prepare_payload();
-  http::write(sock, req);
+    http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_search", 11);
+    req.set(http::field::host, "127.0.0.1");
+    req.set(http::field::content_type, "application/json");
+    req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" +
+        mp + R"(,"fields":["id","pad_s"]})";
+    req.prepare_payload();
+    http::write(sock, req);
 
-  // Withhold reads until the connection backs up and the emitter parks.
-  bool paused = false;
-  for (int i = 0; i < 400 && !paused; i++) {
-    paused = streamPauseCount.load() > pausesBefore;
-    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    // Withhold reads until the connection backs up and the emitter parks.
+    bool paused = false;
+    for (int i = 0; i < 400 && !paused; i++) {
+      paused = streamPauseCount.load() > pausesBefore;
+      if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_TRUE(paused) << "max_parallel=" << mp;
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(sock, buffer, res);
+    EXPECT_EQ(200, res.result_int()) << "max_parallel=" << mp;
+
+    // Every doc arrived once the client drained the stream.
+    size_t count = 0;
+    std::string_view body = res.body();
+    for (size_t pos = 0; (pos = body.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
+    EXPECT_EQ(2000u, count) << "max_parallel=" << mp;
+
+    beast::error_code ec;
+    sock.shutdown(tcp::socket::shutdown_both, ec);
   }
-  EXPECT_TRUE(paused);
-
-  beast::flat_buffer buffer;
-  http::response<http::string_body> res;
-  http::read(sock, buffer, res);
-  EXPECT_EQ(200, res.result_int());
-
-  // Every doc arrived once the client drained the stream.
-  size_t count = 0;
-  std::string_view body = res.body();
-  for (size_t pos = 0; (pos = body.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
-  EXPECT_EQ(2000u, count);
-
-  beast::error_code ec;
-  sock.shutdown(tcp::socket::shutdown_both, ec);
   bpServer.shutdown();
 }
 

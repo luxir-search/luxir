@@ -81,14 +81,16 @@ Both API surfaces multiplex connections with event loops. Search and streaming
 response paths keep connection handling separate from long-running engine work.
 
 - HTTP uses one single-runner `io_context` per configured connection shard,
-  plus a dedicated accept context and thread. Successful accepts are assigned
-  round-robin and the connection stays pinned to that shard; an idle shard
-  parks independently and does no per-request work for active shards. The
-  gRPC server runs on completion queues.
-- Search work is dispatched onto the work-stealing scheduler, so a long query
-  cannot starve the network and a busy network cannot starve queries. The gRPC
-  unary update path currently waits for indexing on its completion-queue
-  handler; it is the exception to the non-blocking transport model.
+  plus a dedicated accept context and thread. Successful accepts go to the
+  shard with the fewest live connections and the connection stays pinned to
+  that shard; an idle shard parks independently and does no per-request work
+  for active shards. The gRPC server runs on completion queues.
+- Search work defaults to serial execution inline on the connection thread
+  that received it: cheap queries pay no scheduler handoff, and request rate
+  never wakes idle workers. A request can instead opt onto the shared
+  work-stealing scheduler (`max_parallel != 0`) so an expensive query does
+  not occupy its connection thread. The gRPC unary update path currently
+  waits for indexing on its completion-queue handler.
 - Ingest is streaming and incremental: NDJSON bodies are parsed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is

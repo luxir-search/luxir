@@ -616,14 +616,14 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
   req.requestState = std::move(requestState);
   req.parent = &call;
-  // Run the (synchronous) submit off this completion-queue thread (via
-  // dispatch()): the cq thread must keep processing WRITE completions for
-  // response flow control to advance, and a long query must not head-of-line
-  // block the other calls served by this cq.  max_parallel=-1 opts out and runs
-  // the query inline right here (a scheduling-overhead baseline that accepts
-  // both costs).  The call outlives the request because its
-  // outstanding-response count stays positive until the final reply, and
-  // requestActive keeps pipelined requests on this stream ordered.
+  // Route by max_parallel (via dispatch()): the default (0) runs the whole
+  // query serially right here on this completion-queue thread - the cheapest
+  // path, accepting that this cq's other calls wait for the query's duration
+  // (a paused streaming producer parks and returns, so flow control still
+  // advances).  Non-zero values run on the task arena instead, keeping this
+  // cq thread free to process completions.  The call outlives the request
+  // because its outstanding-response count stays positive until the final
+  // reply, and requestActive keeps pipelined requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   engine.dispatch(req, req.proto.max_parallel);
 }

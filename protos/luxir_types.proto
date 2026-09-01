@@ -53,12 +53,13 @@ message SearchRequest {
   // is request-wide so every operation observes the same instrumentation mode.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 = auto (engine decides), 1 = single-threaded
-  // (on the server's serial search executor), -1 = single-threaded on the very
-  // thread that received the request - no cross-thread dispatch at all, so that
-  // transport thread is blocked for the query's duration (a scheduling-overhead
-  // baseline / embedded mode, not a serving default).  Values above 1 are
-  // reserved for a future parallelism budget and are rejected for now.
+  // Maximum intra-request parallelism, executed on the server's shared worker
+  // pool: 1 = serial, -1 = unlimited; values above 1 are reserved for a
+  // bounded parallelism budget and are rejected for now.  0 (the default)
+  // lets the engine decide - today that is serial execution directly on the
+  // thread that received the request, with no cross-thread dispatch at all:
+  // cheap queries skip scheduling entirely, at the cost of occupying that
+  // transport thread for the query's duration.
   int32 max_parallel = 8;
 }
 
