@@ -171,8 +171,6 @@ class QueryBuilder {
   };
 
 public:
-  static constexpr size_t MAX_PHRASE_SLOTS = 256;
-
   // The numeric field types stored in the shared int column (INT raw,
   // FLOAT/DOUBLE sortable bits, DATE epoch millis).  Match and range on these
   // build a NumericPredicateQuery over the column. Public because schema-aware
@@ -311,11 +309,6 @@ private:
     if (inputTerms.size() != inputPositions.size()) {
       throw std::runtime_error("Phrase query internal term/position size mismatch");
     }
-    if (inputTerms.size() > MAX_PHRASE_SLOTS) {
-      throw std::runtime_error(std::format(
-          "Phrase query exceeds the {} slot limit", MAX_PHRASE_SLOTS));
-    }
-
     std::vector<std::string_view> terms;
     std::vector<int32_t> positions;
     terms.reserve(inputTerms.size());
@@ -943,11 +936,6 @@ public:
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
-    if (values.size() > MAX_PHRASE_SLOTS) {
-      throw std::runtime_error(std::format(
-          "Phrase query exceeds the {} raw-value limit", MAX_PHRASE_SLOTS));
-    }
-
     TextFieldType& fieldType = positionalTextFieldType(field);
     auto chain = fieldType.createAnalyzer(field);
     TokenChain& tc = *chain;
@@ -960,10 +948,6 @@ public:
     std::vector<int64_t> positions;
 
     auto emit = [&](int64_t position) {
-      if (terms.size() >= MAX_PHRASE_SLOTS) {
-        throw std::runtime_error(std::format(
-            "Phrase query exceeds the {} analyzed-slot limit", MAX_PHRASE_SLOTS));
-      }
       terms.push_back(copyTerm(tok.text));
       positions.push_back(position);
     };
@@ -1015,11 +999,6 @@ public:
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
-    if (terms.size() > MAX_PHRASE_SLOTS) {
-      throw std::runtime_error(std::format(
-          "Phrase query exceeds the {} slot limit", MAX_PHRASE_SLOTS));
-    }
-
     // Verbatim terms still honor the indexed-term length cap; rewrite entries
     // in place (the span is mutable by contract).
     for (auto& t : terms) t = PackedTerm::truncate(t);

@@ -223,18 +223,53 @@ TEST_F(QueryAnalysisTest, structuredNegativeSlopRejected) {
   EXPECT_NE(req->errorMsg().find("slop must be nonnegative"), std::string::npos);
 }
 
-TEST_F(QueryAnalysisTest, structuredRawSlotCapRejectedBeforeCopy) {
-  auto req = localReq(helper.getSearchEngine());
-  auto& cur = req->collection("main").topDocs("q");
-  auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
-  phrase.field = "body_un";
-  auto* terms = api::build::allocArray(
-      phrase.terms, QueryBuilder::MAX_PHRASE_SLOTS + 1, cur.mr());
-  for (size_t i = 0; i < QueryBuilder::MAX_PHRASE_SLOTS + 1; i++) terms[i] = "x";
-  cur.withStats();
-  req->execute();
-  EXPECT_FALSE(req->ok());
-  EXPECT_NE(req->errorMsg().find("raw-slot limit"), std::string::npos);
+TEST_F(QueryAnalysisTest, paragraphScalePhraseMatchesAcrossInputForms) {
+  constexpr std::string_view sentence =
+      "the search engine reads each document and records useful terms while "
+      "the query planner reorders repeated words so every matching passage "
+      "returns the same ranked result without changing its meaning";
+  std::string paragraph;
+  for (int32_t i = 0; i < 14; i++) {
+    if (!paragraph.empty()) paragraph.push_back(' ');
+    paragraph.append(sentence);
+  }
+
+  std::vector<std::string_view> words;
+  for (size_t begin = 0; begin < paragraph.size();) {
+    size_t end = paragraph.find(' ', begin);
+    if (end == std::string::npos) end = paragraph.size();
+    words.emplace_back(paragraph.data() + begin, end - begin);
+    begin = end + 1;
+  }
+  ASSERT_GT(words.size(), 256u);
+
+  helper.index(flatdoc("id", "long", "body_w", paragraph),
+               UpdateMessage::COMMIT);
+
+  {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q")
+        .phraseText("body_w", paragraph).withStats();
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(1, req->getMatchCount());
+  }
+
+  for (bool analyzedWords : {true, false}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
+    phrase.field = "body_w";
+    auto& input = analyzedWords ? phrase.words : phrase.terms;
+    auto* values = api::build::allocArray(input, words.size(), cur.mr());
+    for (size_t i = 0; i < words.size(); i++) values[i] = words[i];
+    cur.withStats();
+    req->execute();
+    ASSERT_TRUE(req->ok())
+        << (analyzedWords ? "words: " : "terms: ") << req->errorMsg();
+    EXPECT_EQ(1, req->getMatchCount())
+        << (analyzedWords ? "words" : "terms");
+  }
 }
 
 TEST(QueryBuilderPhraseCanonicalization, validatesAndNormalizesSlots) {
@@ -289,20 +324,10 @@ TEST(QueryBuilderPhraseCanonicalization, validatesAndNormalizesSlots) {
   EXPECT_THROW(builder.createPhraseFromTerms("no_positions", ab, {}, 0), std::runtime_error);
 }
 
-TEST(QueryBuilderPhraseCanonicalization, capsAnalysisAndRejectsNormalizedOverflow) {
+TEST(QueryBuilderPhraseCanonicalization, rejectsNormalizedOverflow) {
   MemPool pool;
   auto schema = Schema::createDefaultSchema();
   QueryBuilder builder(pool, *schema, CoerceContext{});
-
-  std::string many;
-  for (size_t i = 0; i < QueryBuilder::MAX_PHRASE_SLOTS + 1; i++) {
-    if (!many.empty()) many.push_back(' ');
-    many += "x";
-  }
-  std::string_view manyView = many;
-  EXPECT_THROW(builder.createPhraseQuery(
-      "body_w", std::span<const std::string_view>(&manyView, 1), {}, 1),
-      std::runtime_error);
 
   std::vector<std::string_view> values = {"a b", "c"};
   std::vector<int32_t> positions = {0, std::numeric_limits<int32_t>::max()};

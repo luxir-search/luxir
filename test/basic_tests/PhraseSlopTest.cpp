@@ -254,6 +254,53 @@ TEST_F(PhraseSlopTest, executionPlanAndDriverParity) {
   }
 }
 
+TEST_F(PhraseSlopTest, repeatPhraseResultsMatchAcrossAllPlanToggles) {
+  TestIndex index;
+  TestField field(index, "body_w");
+  field.startIndexing();
+  field.add(0, "a b a");
+  field.add(1, "a x b a");
+  field.add(2, "a b x a");
+  field.add(3, "a b a a b a");
+  field.add(4, "b a b a");
+  field.add(5, "a x x b x a");
+  index.flush();
+  field.startReading();
+
+  auto scope = index.pool.rewindScopeGuard();
+  Query::Context context(index.pool, *index.reader);
+  std::vector<std::string_view> terms = {"a", "b", "a"};
+  std::vector<int32_t> positions = {0, 1, 2};
+  std::array<std::array<std::vector<PhraseHit>, 4>, 2> runs;
+
+  bool savedSort = PhraseQuery::ScorerControls::disableSortForTests;
+  bool savedDedup =
+      PhraseQuery::ScorerControls::disableRepeatDedupForTests;
+  for (size_t slopIndex = 0; slopIndex < runs.size(); slopIndex++) {
+    int32_t slop = slopIndex == 0 ? 0 : 3;
+    for (bool disableSort : {false, true}) {
+      for (bool disableDedup : {false, true}) {
+        PhraseQuery::ScorerControls::disableSortForTests = disableSort;
+        PhraseQuery::ScorerControls::disableRepeatDedupForTests =
+            disableDedup;
+        size_t key = (disableSort ? 2u : 0u) | (disableDedup ? 1u : 0u);
+        runs[slopIndex][key] = runPhrase(
+            index, context, terms, positions, slop);
+      }
+    }
+  }
+  PhraseQuery::ScorerControls::disableSortForTests = savedSort;
+  PhraseQuery::ScorerControls::disableRepeatDedupForTests = savedDedup;
+
+  for (size_t slopIndex = 0; slopIndex < runs.size(); slopIndex++) {
+    ASSERT_FALSE(runs[slopIndex][0].empty());
+    for (size_t key = 1; key < runs[slopIndex].size(); key++) {
+      EXPECT_EQ(runs[slopIndex][0], runs[slopIndex][key])
+          << "slop=" << (slopIndex == 0 ? 0 : 3) << " key=" << key;
+    }
+  }
+}
+
 TEST_F(PhraseSlopTest, bruteForceExistenceParity) {
   constexpr std::string_view vocab[] = {"a", "b", "c"};
   std::mt19937 rng(0x51A9u);

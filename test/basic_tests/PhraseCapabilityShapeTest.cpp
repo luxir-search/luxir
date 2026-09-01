@@ -1,6 +1,7 @@
 #include <array>
 #include <limits>
 #include <string_view>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -179,4 +180,29 @@ TEST_F(PhraseCapabilityShapeTest,
   auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
 
   ASSERT_NE(nullptr, buildScorerForTests(pool, *supplier, 18));
+}
+
+TEST_F(PhraseCapabilityShapeTest,
+       estimateDedupUsesMinimumOrdinalAndCostTermOrder) {
+  std::array<std::string_view, 6> terms{
+      "common", "r", "rare", "r", "x", "common"};
+  std::array<int32_t, 6> positions{0, 1, 2, 3, 4, 5};
+  PhraseQuery query("body_w", terms, positions);
+  Query::Context context(pool, *reader);
+  auto* weight = dynamic_cast<PhraseQuery::Weight*>(
+      query.createWeight(context, 0));
+  ASSERT_NE(nullptr, weight);
+  auto& segment = reader->segments()[0];
+
+  EXPECT_EQ((std::vector<int32_t>{0, 1, 2, 1, 4, 0}),
+            weight->querySlotSourcesForTests(segment));
+  EXPECT_EQ((std::vector<int32_t>{2, 4, 1, 0}),
+            weight->conjunctionOrderForTests(segment));
+
+  // The disabled-sort fallback retains query order while choosing the same
+  // minimum original ordinal for every repeated term.
+  EXPECT_EQ((std::vector<int32_t>{0, 1, 2, 1, 4, 0}),
+            weight->querySlotSourcesForTests(segment, true));
+  EXPECT_EQ((std::vector<int32_t>{0, 1, 2, 4}),
+            weight->conjunctionOrderForTests(segment, true));
 }

@@ -102,63 +102,71 @@ private:
     }
     result.nonempty = true;
 
-    result.querySlotSources.resize(states.size());
-    bool dedupRepeats = !disableRepeatDedup || slop > 0;
-    for (int32_t i = 0; i < (int32_t) states.size(); i++) {
-      int32_t first = i;
-      if (dedupRepeats) {
-        for (int32_t j = 0; j < i; j++) {
-          if (queryTerms[(size_t) j] == queryTerms[(size_t) i]) {
-            first = j;
-            break;
-          }
-        }
-      }
-      result.querySlotSources[(size_t) i] = first;
-      if (first == i) result.conjunctionOrder.push_back(i);
-    }
-
     auto byCost = [&](int32_t a, int32_t b) {
-      const auto& sa = *states[(size_t) result.querySlotSources[(size_t) a]];
-      const auto& sb = *states[(size_t) result.querySlotSources[(size_t) b]];
+      const auto& sa = *states[(size_t) a];
+      const auto& sb = *states[(size_t) b];
       if (sa.docFreq != sb.docFreq) return sa.docFreq < sb.docFreq;
       int32_t ta = narrowedTotalTermFreq(sa);
       int32_t tb = narrowedTotalTermFreq(sb);
       if (ta != tb) return ta < tb;
-      return false;
+      return queryTerms[(size_t) a] < queryTerms[(size_t) b];
     };
-    if (!disableSort) {
-      std::stable_sort(
-          result.conjunctionOrder.begin(), result.conjunctionOrder.end(),
-          byCost);
-    }
-
     result.slotOrder.resize(states.size());
     for (size_t i = 0; i < result.slotOrder.size(); i++) {
       result.slotOrder[i] = (int32_t) i;
     }
     if (!disableSort) {
       std::stable_sort(
-          result.slotOrder.begin(), result.slotOrder.end(),
-          [&](int32_t a, int32_t b) {
-            if (byCost(a, b)) return true;
-            if (byCost(b, a)) return false;
-            return a < b;
-          });
+          result.slotOrder.begin(), result.slotOrder.end(), byCost);
+    }
+
+    result.querySlotSources.resize(states.size());
+    bool dedupRepeats = !disableRepeatDedup || slop > 0;
+    if (disableSort) {
+      // Preserve the test-only text-order plan. Repeat dedup cannot ride the
+      // disabled cost sort, so retain the old first-occurrence fallback.
+      for (int32_t i = 0; i < (int32_t) states.size(); i++) {
+        int32_t source = i;
+        if (dedupRepeats) {
+          for (int32_t j = 0; j < i; j++) {
+            if (queryTerms[(size_t) j] == queryTerms[(size_t) i]) {
+              source = j;
+              break;
+            }
+          }
+        }
+        result.querySlotSources[(size_t) i] = source;
+        if (source == i) result.conjunctionOrder.push_back(i);
+      }
+    } else {
+      // Equal terms share stats and are adjacent in slotOrder. Collapse each
+      // run while preserving the minimum query ordinal as its enum source.
+      for (size_t begin = 0; begin < result.slotOrder.size();) {
+        size_t end = begin + 1;
+        if (dedupRepeats) {
+          std::string_view term = queryTerms[
+              (size_t) result.slotOrder[begin]];
+          while (end < result.slotOrder.size()
+                 && queryTerms[(size_t) result.slotOrder[end]] == term) {
+            end++;
+          }
+        }
+        int32_t source = result.slotOrder[begin];
+        for (size_t i = begin + 1; i < end; i++) {
+          source = std::min(source, result.slotOrder[i]);
+        }
+        for (size_t i = begin; i < end; i++) {
+          result.querySlotSources[
+              (size_t) result.slotOrder[i]] = source;
+        }
+        result.conjunctionOrder.push_back(source);
+        begin = end;
+      }
     }
 
     result.slotGroup.assign(states.size(), -1);
-    for (size_t i = 0; i < result.slotOrder.size(); i++) {
-      if (result.slotGroup[i] >= 0) continue;
-      int32_t source = result.querySlotSources[
-          (size_t) result.slotOrder[i]];
-      std::vector<int32_t> members;
-      for (size_t j = i; j < result.slotOrder.size(); j++) {
-        int32_t candidateSource = result.querySlotSources[
-            (size_t) result.slotOrder[j]];
-        if (candidateSource == source) members.push_back((int32_t) j);
-      }
-      if (members.size() < 2) continue;
+    auto addRepeatGroup = [&](std::vector<int32_t> members) {
+      if (members.size() < 2) return;
       std::sort(members.begin(), members.end(), [&](int32_t a, int32_t b) {
         int32_t aOrdinal = result.slotOrder[(size_t) a];
         int32_t bOrdinal = result.slotOrder[(size_t) b];
@@ -174,6 +182,39 @@ private:
         result.slotGroup[(size_t) slot] = group;
       }
       result.groupSlots.push_back(std::move(members));
+    };
+    if (disableSort) {
+      // Sources are not adjacent in the text-order test plan.
+      for (size_t i = 0; i < result.slotOrder.size(); i++) {
+        if (result.slotGroup[i] >= 0) continue;
+        int32_t source = result.querySlotSources[
+            (size_t) result.slotOrder[i]];
+        std::vector<int32_t> members;
+        for (size_t j = i; j < result.slotOrder.size(); j++) {
+          int32_t candidateSource = result.querySlotSources[
+              (size_t) result.slotOrder[j]];
+          if (candidateSource == source) members.push_back((int32_t) j);
+        }
+        addRepeatGroup(std::move(members));
+      }
+    } else {
+      for (size_t begin = 0; begin < result.slotOrder.size();) {
+        int32_t source = result.querySlotSources[
+            (size_t) result.slotOrder[begin]];
+        size_t end = begin + 1;
+        while (end < result.slotOrder.size()
+               && result.querySlotSources[(size_t) result.slotOrder[end]]
+                   == source) {
+          end++;
+        }
+        std::vector<int32_t> members;
+        members.reserve(end - begin);
+        for (size_t i = begin; i < end; i++) {
+          members.push_back((int32_t) i);
+        }
+        addRepeatGroup(std::move(members));
+        begin = end;
+      }
     }
 
     assert(!result.conjunctionOrder.empty());
@@ -385,6 +426,20 @@ public:
         simScorer = context.pool.make<Similarity::BM25Scorer>(
             similarity.getScorer(multiplier, cachedFieldInfo->fieldStats, (float) idf));
       }
+    }
+
+    std::vector<int32_t> querySlotSourcesForTests(
+        IndexReader::Segment& segment, bool disableSort = false,
+        bool disableRepeatDedup = false) const {
+      return estimateScorer(
+          segment, disableSort, disableRepeatDedup).querySlotSources;
+    }
+
+    std::vector<int32_t> conjunctionOrderForTests(
+        IndexReader::Segment& segment, bool disableSort = false,
+        bool disableRepeatDedup = false) const {
+      return estimateScorer(
+          segment, disableSort, disableRepeatDedup).conjunctionOrder;
     }
 
     Query::Scorer* buildScorer(
