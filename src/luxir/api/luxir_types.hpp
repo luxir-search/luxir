@@ -79,7 +79,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct FilterCacheStats; struct IndexRamStats;
+struct QueryCacheStats; struct IndexRamStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct Error; }
@@ -230,7 +230,7 @@ struct AuxStats {
   uint64_t bytes = 0;
   std::span<const std::string_view> files;
 };
-struct FilterCacheStats {
+struct QueryCacheStats {
   uint64_t max_bytes = 0;
   uint64_t resident_bytes = 0;
   uint64_t metadata_bytes = 0;
@@ -284,7 +284,7 @@ struct IndexStats {
   std::string_view schema_gen;
   uint64_t active_merges = 0;
   std::span<const AuxStats> aux_indexes;
-  FilterCacheStats filter_cache;
+  QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;
 };
 struct ShardStats {
@@ -323,8 +323,8 @@ struct CacheEntryDump {
   uint32_t segments_resident = 0;
   bool reader_value = false;
 };
-struct ShardCacheControl {                                      // needs FilterCacheStats,CacheEntryDump
-  FilterCacheStats stats;
+struct ShardCacheControl {                                      // needs QueryCacheStats,CacheEntryDump
+  QueryCacheStats stats;
   uint64_t entries_resident = 0;
   std::span<const CacheEntryDump> entries;
   uint32_t shard_id = 0;
@@ -646,7 +646,7 @@ LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
-LUXIR_TD(FilterCacheStats) LUXIR_TD(IndexRamStats)
+LUXIR_TD(QueryCacheStats) LUXIR_TD(IndexRamStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 #undef LUXIR_TD
@@ -687,7 +687,7 @@ LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
-LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(FilterCacheStats)
+LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(IndexRamStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)

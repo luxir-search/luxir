@@ -174,7 +174,7 @@ liveness, not a deep read/write check of every collection or storage device.
 Use `GET /_stats` for node-wide operational state or
 `GET /collections/{collection}/_stats` for one collection. The response
 distinguishes writer-visible segments from committed segments and reports
-document counts, generations, merge activity, filter-cache counters, and the
+document counts, generations, merge activity, query-cache counters, and the
 node-wide indexing RAM budget. Per-segment records are omitted by default; add
 `?segments=true` when diagnosing segment layout. A node-wide sample includes
 load-failure tombstones with their `error` and excludes them from totals. Each

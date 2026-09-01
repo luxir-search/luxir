@@ -2676,9 +2676,9 @@ TEST(FilterCacheIntegrationTest,
   FilteredConjunctionBatchSizeGuard batchSizeGuard(
       Postings::DOCS_BLOCK_SIZE);
   LuxirConfig cachedConfig;
-  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  cachedConfig.queryCacheBytes = 4 * 1024 * 1024;
   LuxirConfig uncachedConfig;
-  uncachedConfig.filterCacheBytes = 0;
+  uncachedConfig.queryCacheBytes = 0;
   LuxirNode cachedNode(cachedConfig);
   LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection =
@@ -3140,9 +3140,9 @@ void expectSameExactFilteredConj(const ExactFilteredConjResult& expected,
 TEST(FilterCacheIntegrationTest,
      filteredConjMultiTermMatchesCachedAndPostingsFilters) {
   LuxirConfig cachedConfig;
-  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  cachedConfig.queryCacheBytes = 4 * 1024 * 1024;
   LuxirConfig uncachedConfig;
-  uncachedConfig.filterCacheBytes = 0;
+  uncachedConfig.queryCacheBytes = 0;
   LuxirNode cachedNode(cachedConfig);
   LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection =
@@ -3176,7 +3176,7 @@ TEST(FilterCacheIntegrationTest,
 
 TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filtered_conj_ratio_gate";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
@@ -3199,9 +3199,9 @@ TEST(FilterCacheIntegrationTest, filteredConjMultiTermRatioGateDeclines) {
 TEST(FilterCacheIntegrationTest,
      candidateTermFeedMatchesKillSwitchForBothFilterProvenances) {
   LuxirConfig cachedConfig;
-  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  cachedConfig.queryCacheBytes = 4 * 1024 * 1024;
   LuxirConfig uncachedConfig;
-  uncachedConfig.filterCacheBytes = 0;
+  uncachedConfig.queryCacheBytes = 0;
   LuxirNode cachedNode(cachedConfig);
   LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection = "exact_candidate_term_feed";
@@ -3239,7 +3239,7 @@ TEST(FilterCacheIntegrationTest,
 
 TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filtered_conj_phrase_tail";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
@@ -3256,7 +3256,7 @@ TEST(FilterCacheIntegrationTest, filteredConjPhraseTailDeclines) {
 
 TEST(FilterCacheIntegrationTest, candidateTermFeedHandlesTwoFilters) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "exact_candidate_two_filters";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
@@ -3278,7 +3278,7 @@ TEST(FilterCacheIntegrationTest, candidateTermFeedHandlesTwoFilters) {
 TEST(FilterCacheIntegrationTest,
      exactCandidateFilterLeadKeepsExistingRouteAndCounters) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "exact_candidate_filter_lead";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
@@ -3306,7 +3306,7 @@ TEST(FilterCacheIntegrationTest,
 
 TEST(FilterCacheIntegrationTest, candidateTermFeedDensityCapDeclines) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "exact_candidate_density_cap";
   ASSERT_TRUE(indexExactFilteredConjDocs(node, collection));
@@ -3330,9 +3330,9 @@ TEST(FilterCacheIntegrationTest, candidateTermFeedDensityCapDeclines) {
 // gate and must keep engaging under the same override.
 TEST(FilterCacheIntegrationTest, candidateTermFeedDocSetRatioDeclines) {
   LuxirConfig cachedConfig;
-  cachedConfig.filterCacheBytes = 4 * 1024 * 1024;
+  cachedConfig.queryCacheBytes = 4 * 1024 * 1024;
   LuxirConfig uncachedConfig;
-  uncachedConfig.filterCacheBytes = 0;
+  uncachedConfig.queryCacheBytes = 0;
   LuxirNode cachedNode(cachedConfig);
   LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection = "exact_candidate_docset_ratio";
@@ -3821,7 +3821,7 @@ TEST(FilterCacheTest, readerStableUseRejectsRawByproductPublication) {
 
 TEST(FilterCacheTest, readerProbeCountsDeferredBypassesAndMisses) {
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode node(nodeConfig);
   luxir::test::CollectionHelper helper(node, "filter_cache_reader_counters");
   FilterCacheConfig config = testConfig();
@@ -3927,7 +3927,7 @@ TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
 
 TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode node(nodeConfig);
   luxir::test::CollectionHelper helper(node, "filter_cache_reader_backoff");
   ASSERT_TRUE(helper.indexAll(std::array{
@@ -4013,7 +4013,7 @@ TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
 
 TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode node(nodeConfig);
   luxir::test::CollectionHelper helper(node, "filter_cache_whole_knn_gate");
   installVectorSchema(helper.collection());
@@ -4093,7 +4093,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
 
 TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode node(nodeConfig);
   luxir::test::CollectionHelper helper(node, "filter_cache_reader_retire");
   FilterCacheConfig config = testConfig();
@@ -4181,7 +4181,7 @@ TEST(FilterCacheTest, routedAccountingOwnsRejectedReaderValue) {
 TEST(FilterCacheTest, readerPublishRaceCannotResurrectStaleValue) {
   constexpr int ENTRY_COUNT = 128;
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode node(nodeConfig);
   luxir::test::CollectionHelper helper(node, "filter_cache_reader_race");
   FilterCacheConfig config = testConfig();
@@ -4548,9 +4548,9 @@ TEST(DocSetScorerTest, nullSourceBulkScorerEmitsAllDocs) {
 
 TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   LuxirConfig onConfig;
-  onConfig.filterCacheBytes = 4 * 1024 * 1024;
+  onConfig.queryCacheBytes = 4 * 1024 * 1024;
   LuxirConfig offConfig;
-  offConfig.filterCacheBytes = 0;
+  offConfig.queryCacheBytes = 0;
   LuxirNode onNode(onConfig);
   LuxirNode offNode(offConfig);
   luxir::test::CollectionHelper on(onNode, "filter_cache_it");
@@ -4616,7 +4616,7 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
 
 TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_reset";
   luxir::test::CollectionHelper helper(node, collection);
@@ -4644,7 +4644,7 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   writer->testDeleteAllData();
   // A namespace rewind rebuilds from the writer's CONSTRUCTION config, not
   // the installed cache's: a test-assigned policy must not outlive a reset.
-  // This writer was constructed with the cache disabled (filterCacheBytes 0).
+  // This writer was constructed with the cache disabled (queryCacheBytes 0).
   auto autoCache = writer->getFilterCache();
   ASSERT_NE(firstCache, autoCache);
   EXPECT_FALSE(autoCache->enabled());
@@ -4689,7 +4689,7 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
 
 TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershipKnn) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   luxir::test::CollectionHelper helper(node, "filter_cache_membership");
   auto writer = helper.getIndexWriter();
@@ -4758,7 +4758,7 @@ TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershi
 
 TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   luxir::test::CollectionHelper helper(node, "filter_cache_knn_refresh");
   installVectorSchema(helper.collection());
@@ -4814,7 +4814,7 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
 
 TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_fuzzy_boost";
   luxir::test::CollectionHelper helper(node, collection);
@@ -4867,7 +4867,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
 
 TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_knn_count_first";
   luxir::test::CollectionHelper helper(node, collection);
@@ -4925,7 +4925,7 @@ TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
 TEST(FilterCacheIntegrationTest,
      nestedCanonicalKnnRetainsReaderStableWholeMembership) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_nested_knn_count";
   luxir::test::CollectionHelper helper(node, collection);
@@ -4983,7 +4983,7 @@ TEST(FilterCacheIntegrationTest,
 
 TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   constexpr std::string_view collection = "filter_cache_knn_pin";
   luxir::test::CollectionHelper helper(node, collection);
@@ -5140,7 +5140,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
 
 TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
   LuxirConfig config;
-  config.filterCacheBytes = 0;
+  config.queryCacheBytes = 0;
   LuxirNode node(config);
   luxir::test::CollectionHelper helper(node, "filter_cache_knn_gate");
   installVectorSchema(helper.collection());
@@ -5198,7 +5198,7 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
     ~FoldGuard() { disableTopDocsFilterFold = saved; }
   } foldGuard;
   LuxirConfig config;
-  config.filterCacheBytes = 4 * 1024 * 1024;
+  config.queryCacheBytes = 4 * 1024 * 1024;
   LuxirNode node(config);
   luxir::test::CollectionHelper helper(node, "filter_cache_mixed");
   std::vector<luxir::test::Doc> input;
@@ -5225,7 +5225,7 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
 
 TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
   LuxirConfig config;
-  config.filterCacheBytes = 4 * 1024 * 1024;
+  config.queryCacheBytes = 4 * 1024 * 1024;
   LuxirNode node(config);
   luxir::test::CollectionHelper helper(node, "filter_cache_facet");
   std::vector<luxir::test::Doc> docs;
@@ -6010,7 +6010,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
 #endif
 
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode node(nodeConfig);
   CollectionHelper helper(node, collection);
   auto writer = helper.getIndexWriter();

@@ -42,8 +42,8 @@ Rough hierarchy:
 [store]          # storage backend
 [index]          # indexing behavior (ram buffer, etc.)
 [merge]          # merge policy/scheduling
-[cache.filter]   # named cache instances
-[cache.query]
+[cache.query]    # named cache instances
+[cache.results]
 [query]          # query parsing defaults
 [request]        # request handling (threads, timeouts)
 [search]         # search defaults (hits, etc.)
@@ -55,8 +55,8 @@ void LuxirConfig::addOptions(CLI::App& app) {
                "Serve an existing data directory without the write lock; rejects all updates");
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);
-  app.add_option("--filter-cache-bytes", filterCacheBytes,
-                 "Per-shard filter cache payload budget (0 disables it)")
+  app.add_option("--query-cache-bytes", queryCacheBytes,
+                 "Per-shard query cache payload budget (0 disables it)")
       ->transform(CLI::AsSizeValue(false))
       ->default_str("64MB");
   // No default_val: the -1 sentinel in the bound field is what tells

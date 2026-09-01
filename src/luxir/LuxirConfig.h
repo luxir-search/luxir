@@ -159,7 +159,7 @@ struct LuxirConfig {
   int64_t malloc_mmap_threshold = 0;
 
   std::string log_level = "info";
-  size_t filterCacheBytes = 64ULL * 1024 * 1024;
+  size_t queryCacheBytes = 64ULL * 1024 * 1024;
   ServerConfig server;
   StoreConfig store;
   IndexConfig index;

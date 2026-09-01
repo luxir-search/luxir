@@ -46,7 +46,7 @@ void copyAuxStats(api::AuxStats& dst, const IndexWriter::AuxStats& src,
   }
 }
 
-void fillFilterCacheStats(api::FilterCacheStats& dst, const IndexWriter::Stats& src) {
+void fillQueryCacheStats(api::QueryCacheStats& dst, const IndexWriter::Stats& src) {
   dst.enabled = src.filterCacheEnabled;
   dst.max_bytes = src.filterCacheMaxBytes;
   dst.resident_bytes = src.filterCacheResidentBytes;
@@ -78,7 +78,7 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
   for (std::size_t i = 0; i < src.auxIndexes.size(); i++) {
     copyAuxStats(aux[i], src.auxIndexes[i], resource);
   }
-  fillFilterCacheStats(dst.filter_cache, src);
+  fillQueryCacheStats(dst.query_cache, src);
 
   auto* segments = api::build::allocArray(dst.segments, src.segmentStats.size(), resource);
   for (std::size_t i = 0; i < src.segmentStats.size(); i++) {

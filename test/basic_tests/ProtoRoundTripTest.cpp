@@ -287,7 +287,7 @@ void roundTripType(const char* nm) {
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
-  X(SegmentStats) X(AuxStats) X(FilterCacheStats) X(IndexRamStats)                                 \
+  X(SegmentStats) X(AuxStats) X(QueryCacheStats) X(IndexRamStats)                                 \
   X(HelloRequest) X(HelloReply)
 
 TEST(ProtoRoundTrip, AllMessages) {

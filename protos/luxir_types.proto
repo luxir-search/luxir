@@ -1117,7 +1117,7 @@ message IndexStats {
   string schema_gen = 5;  // sortable-string spelling (see SegmentStats); empty = no schema
   uint64 active_merges = 6;
   repeated AuxStats aux_indexes = 7;
-  FilterCacheStats filter_cache = 8;
+  QueryCacheStats query_cache = 8;
   repeated SegmentStats segments = 9;
 }
 
@@ -1158,7 +1158,7 @@ message AuxStats {
   uint64 bytes = 8;  // bytes of this entry's files; informational, already counted under its segment
 }
 
-message FilterCacheStats {
+message QueryCacheStats {
   bool enabled = 1;
   uint64 max_bytes = 2;
   uint64 resident_bytes = 3;
@@ -1182,7 +1182,7 @@ message IndexRamStats {
   uint64 reserved_bytes = 2;
 }
 
-// Admin control over the per-collection filter cache. Actions compose and
+// Admin control over the per-collection query cache. Actions compose and
 // apply in this order: flush, reset_admission, reset_counters, then dump.
 // flush drops resident values and entry metadata; sighting history survives,
 // so a re-request of a known query re-admits and rebuilds immediately (the
@@ -1218,7 +1218,7 @@ message CacheEntryDump {
 
 message ShardCacheControl {
   uint32 shard_id = 1;
-  FilterCacheStats stats = 2;  // gathered after the requested actions
+  QueryCacheStats stats = 2;  // gathered after the requested actions
   repeated CacheEntryDump entries = 3;  // largest payload first, capped
   uint64 entries_resident = 4;  // uncapped resident-entry count at dump time
 }

@@ -418,7 +418,7 @@ std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name) {
   auto* colPtr = col.get();
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
     [colPtr]() { return colPtr->getSchema(); }, &indexRamBudget,
-    FilterCacheConfig{.maxBytes = config.filterCacheBytes}, config.index.merge_factor);
+    FilterCacheConfig{.maxBytes = config.queryCacheBytes}, config.index.merge_factor);
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
 

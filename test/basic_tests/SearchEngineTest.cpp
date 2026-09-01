@@ -1771,7 +1771,7 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
 TEST_F(SearchEngineTest,
        wholeCountCachesBelowMinimumSegmentsAndOmitsWeightAndContext) {
   LuxirConfig nodeConfig;
-  nodeConfig.filterCacheBytes = 0;
+  nodeConfig.queryCacheBytes = 0;
   LuxirNode enabledNode(nodeConfig);
   LuxirNode disabledNode(nodeConfig);
   constexpr std::string_view collection = "whole_count_tiny_segment";
@@ -1889,7 +1889,7 @@ TEST_F(SearchEngineTest,
 
   auto run = [&](InvalidShape shape, CacheState state) {
     LuxirConfig config;
-    config.filterCacheBytes = 0;
+    config.queryCacheBytes = 0;
     LuxirNode node(config);
     constexpr std::string_view collection = "logical_validation_cache_state";
     CollectionHelper helper(node, collection);
