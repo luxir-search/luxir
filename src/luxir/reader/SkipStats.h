@@ -91,6 +91,11 @@ struct SkipStats {
   static inline int64_t maxScorePartitionLatchBreaks = 0;
   static inline int64_t maxScoreThresholdRefreshes = 0;
   static inline int64_t maxScoreHalfWindowClips = 0;
+  static inline int64_t maxScoreExactConstantPartitions = 0;
+  static inline int64_t maxScoreRequiredIntersectionWindows = 0;
+  static inline int64_t maxScoreRequiredIntersectionBitsetWindows = 0;
+  static inline int64_t maxScoreRequiredIntersectionLeapfrogAdvances = 0;
+  static inline int64_t maxScoreRequiredIntersectionDocs = 0;
   static inline int64_t mandOptWindowSkips = 0;
   static inline int64_t mandOptConjunctionWindows = 0;
   static inline int64_t mandOptWindowEvals = 0;
@@ -397,6 +402,11 @@ struct SkipStats {
     maxScorePartitionLatchBreaks = 0;
     maxScoreThresholdRefreshes = 0;
     maxScoreHalfWindowClips = 0;
+    maxScoreExactConstantPartitions = 0;
+    maxScoreRequiredIntersectionWindows = 0;
+    maxScoreRequiredIntersectionBitsetWindows = 0;
+    maxScoreRequiredIntersectionLeapfrogAdvances = 0;
+    maxScoreRequiredIntersectionDocs = 0;
     mandOptWindowSkips = 0;
     mandOptConjunctionWindows = 0;
     mandOptWindowEvals = 0;

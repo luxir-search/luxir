@@ -1002,6 +1002,7 @@ public:
     int minShouldMatch = 0;
     bool needsScores = false;
     bool allowsPruning = false;
+    bool uniformConstantCandidate = false;
     bool prohibitedCacheEnabled = false;
     bool sparseFilteredTopKEligible = false;
     SparseFilteredTopKFamily sparseFilteredTopKFamilyKind =
@@ -1509,6 +1510,7 @@ public:
       int minShouldMatch;
       bool needsScores;
       bool allowsPruning;
+      bool uniformConstantCandidate;
       Query::SupplierExecutionMode executionMode;
 
       static Query::ScorerShape emptyShape() {
@@ -1915,6 +1917,7 @@ public:
                int minShouldMatch,
                bool needsScores,
                bool allowsPruning,
+               bool uniformConstantCandidate,
                Query::SupplierExecutionMode executionMode)
         : pool(pool), segment(segment), mandatorySources(mandatorySources),
           mandatoryScores(mandatoryScores),
@@ -1926,6 +1929,7 @@ public:
           shapeRequiredCost(shapeRequiredCost),
           minShouldMatch(minShouldMatch),
           needsScores(needsScores), allowsPruning(allowsPruning),
+          uniformConstantCandidate(uniformConstantCandidate),
           executionMode(executionMode) {}
 
       int64_t cost() override {
@@ -2372,6 +2376,7 @@ public:
         DisjunctionIdentityFallback identityFallback =
             DisjunctionIdentityFallback::NONE;
         size_t identityLargestIndex = 0;
+        bool uniformConstantCandidate = false;
 
         MaxScorePlan()
           : BooleanBulkBuildState(Kind::MAX_SCORE) {}
@@ -3722,6 +3727,7 @@ public:
         auto* state = pool.make<MaxScorePlan>();
         state->owner = this;
         state->aggregateClauseCost = aggregateClauseCost;
+        state->uniformConstantCandidate = uniformConstantCandidate;
         state->optional = pool.make_span<PlannedSupplier>(optional.size());
         state->optionalCosts = retainCosts
             ? pool.make_span<int64_t>(optional.size())
@@ -3862,7 +3868,7 @@ public:
                 == MaxScoreCountRoute::DISJUNCTION_OF_CONJUNCTIONS,
             plan.countRoute
                 == MaxScoreCountRoute::DISJUNCTION_IDENTITY,
-            plan.identityLargestIndex);
+            plan.identityLargestIndex, plan.uniformConstantCandidate);
       }
 
       int64_t minFilterCost() const {
@@ -4175,7 +4181,8 @@ public:
               std::span<Query::SegmentSource* const>{},
               std::span<Query::ScorerSupplier* const>{},
               std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
-              needsScores, allowsPruning, executionMode);
+              needsScores, allowsPruning, uniformConstantCandidate,
+              executionMode);
         }
         if (bodySupplier == nullptr) {
           return noBulkPlan();
@@ -4577,7 +4584,8 @@ public:
                 std::span<Query::SegmentSource* const>{},
                 std::span<Query::ScorerSupplier* const>{},
                 std::span<Query::ScorerSupplier* const>{},
-                minShouldMatch, needsScores, allowsPruning, executionMode);
+                minShouldMatch, needsScores, allowsPruning,
+                uniformConstantCandidate, executionMode);
           }
           if (body != nullptr) {
             BulkScorerContext childContext{
@@ -4713,6 +4721,7 @@ public:
         int minShouldMatch,
         bool needsScores,
         bool allowsPruning,
+        bool uniformConstantCandidate,
         Query::SupplierExecutionMode executionMode) {
       // Weight-time optional removal can expose a Boolean child that
       // normalization could not unwrap while the optionals were still present.
@@ -4774,7 +4783,8 @@ public:
         targetPool, segment, mandatorySources, mandatoryScores, optionalSources,
         prohibitedSources, filterSuppliers, mandatoryShapeSuppliers,
         optionalShapeSuppliers, prohibitedShapeSuppliers, shapeRequiredCost,
-        minShouldMatch, needsScores, allowsPruning, executionMode);
+        minShouldMatch, needsScores, allowsPruning,
+        uniformConstantCandidate, executionMode);
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
@@ -4790,6 +4800,7 @@ public:
       int minShouldMatch = 0;
       bool needsScores = false;
       bool allowsPruning = false;
+      bool uniformConstantCandidate = false;
 
     public:
       BooleanPreparedWeight(IndexReader& reader,
@@ -4801,7 +4812,8 @@ public:
                             std::span<const uint8_t> prohibitedCacheRoutes,
                             bool hasFilters, bool prohibitedCacheEnabled,
                             int minShouldMatch, bool needsScores,
-                            bool allowsPruning)
+                            bool allowsPruning,
+                            bool uniformConstantCandidate)
         : reader(reader), mandatorySources(std::move(mandatorySources)),
           mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
           optionalSources(std::move(optionalSources)),
@@ -4811,7 +4823,8 @@ public:
           hasFilters(hasFilters),
           prohibitedCacheEnabled(prohibitedCacheEnabled),
           minShouldMatch(minShouldMatch),
-          needsScores(needsScores), allowsPruning(allowsPruning) {}
+          needsScores(needsScores), allowsPruning(allowsPruning),
+          uniformConstantCandidate(uniformConstantCandidate) {}
 
       Query::ScorerSupplier* scorerSupplierImpl(
           MemPool& targetPool, IndexReader::Segment& segment,
@@ -4847,7 +4860,7 @@ public:
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           prohibitedSegmentSources, prohibitedSuppliers,
           filterSuppliers, minShouldMatch, needsScores, allowsPruning,
-          executionMode);
+          uniformConstantCandidate, executionMode);
       }
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
@@ -4915,6 +4928,12 @@ public:
       optionalWeights = dropOptional
         ? std::span<Query::Weight*>{}
         : createWeights(context.pool, context, optionalClauses, flags, multiplier);
+      uniformConstantCandidate = !optionalWeights.empty()
+          && std::all_of(
+              optionalWeights.begin(), optionalWeights.end(),
+              [](Query::Weight* weight) {
+                return weight->isConstantScoring();
+              });
       int32_t exclusionFlags = noScore & ~ALLOW_PRUNING;
       prohibitedWeights = createWeights(
           context.pool, context, prohibitedClauses,
@@ -5099,7 +5118,8 @@ public:
         std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
         prohibitedCacheRoutes, !filterSources.empty(),
-        prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning);
+        prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning,
+        uniformConstantCandidate);
     }
 
 
@@ -5157,7 +5177,8 @@ public:
                           optionalSources,
                           prohibitedSources, prohibitedSuppliers,
                           filterSuppliers, minShouldMatch,
-                          needsScores, allowsPruning, executionMode);
+                          needsScores, allowsPruning,
+                          uniformConstantCandidate, executionMode);
     }
 
     int64_t sparseFilteredTopKCost(
@@ -10286,6 +10307,8 @@ public:
     // most the not-yet-swept non-essential clauses can add when sweeps run from
     // s = splitIndex-1 downward.
     std::span<double> nonEssentialPrefixMax;
+    std::span<size_t> nonEssentialPrefixConstantCounts;
+    std::span<float> constantTotals;
     std::span<float> compactThresholds;
     std::span<float> compactThresholdMcs;
     std::span<bool> compactThresholdReady;
@@ -10309,6 +10332,9 @@ public:
     std::span<Query::Scorer*> exclusionScorers;  // flattened OR
     std::span<uint64_t> exclusionBits;           // current production window
     WindowFilter* windowFilter = nullptr;
+    std::span<Query::Scorer*> requiredScorers;
+    std::span<int64_t> requiredScorerCosts;
+    WindowBitIntersection requiredIntersection;
 
     int32_t maxDoc;
     int64_t aggregateClauseCost;
@@ -10330,6 +10356,8 @@ public:
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     float nextPartitionMcs = std::numeric_limits<float>::infinity();
     double scoreBoundFactor = 1.0;
+    float uniformConstant = 0.0f;
+    bool exactUniformConstant = false;
     bool disjConjCountPath = false;
 
     void configureDisjunctionCountIdentity(luxir::MemPool& pool,
@@ -10443,6 +10471,27 @@ public:
       return scoreCanReach(score, bound, minCompetitiveScore, scoreBoundFactor);
     }
 
+    bool constantCanReach(size_t contributionCount) const {
+      assert(exactUniformConstant);
+      assert(contributionCount < constantTotals.size());
+      return constantTotals[contributionCount] >= minCompetitiveScore;
+    }
+
+    size_t constantContributionCount(float maxScore) const {
+      assert(exactUniformConstant);
+      return uniformConstant == 0.0f || maxScore != 0.0f ? 1 : 0;
+    }
+
+    float constantCompetitiveThreshold(size_t remainingCount) const {
+      assert(exactUniformConstant);
+      for (size_t matched = 0; matched + remainingCount < constantTotals.size(); matched++) {
+        if (constantTotals[matched + remainingCount] >= minCompetitiveScore) {
+          return constantTotals[matched];
+        }
+      }
+      return std::numeric_limits<float>::infinity();
+    }
+
     static float firstFloatGreaterThan(double value) {
       if (std::isnan(value)) {
         return std::numeric_limits<float>::infinity();
@@ -10499,6 +10548,16 @@ public:
     }
 
     size_t computeWindowSplit() const {
+      if (exactUniformConstant) {
+        size_t contributionCount = 0;
+        size_t s = 0;
+        for (; s < scorers.size(); s++) {
+          float maxScore = windowMax[(size_t) windowOrder[s]];
+          contributionCount += constantContributionCount(maxScore);
+          if (constantCanReach(contributionCount)) break;
+        }
+        return s;
+      }
       double sum = 0.0;
       size_t s = 0;
       for (; s < scorers.size(); s++) {
@@ -10512,6 +10571,18 @@ public:
     }
 
     float computeNextPartitionMcs() const {
+      if (exactUniformConstant) {
+        size_t contributionCount = 0;
+        for (size_t s = 0; s < scorers.size(); s++) {
+          float maxScore = windowMax[(size_t) windowOrder[s]];
+          contributionCount += constantContributionCount(maxScore);
+          if (constantCanReach(contributionCount)) {
+            return std::nextafter(constantTotals[contributionCount],
+                                  std::numeric_limits<float>::infinity());
+          }
+        }
+        return std::numeric_limits<float>::infinity();
+      }
       double sum = 0.0;
       for (size_t s = 0; s < scorers.size(); s++) {
         float maxScore = windowMax[(size_t) windowOrder[s]];
@@ -10558,9 +10629,26 @@ public:
     void promoteRequiredScorers() {
       assert(scorers.size() - splitIndex == 1);
       firstRequired = splitIndex;
+      if (exactUniformConstant) {
+        size_t requiredCount = constantContributionCount(
+            windowMax[(size_t) windowOrder[splitIndex]]);
+        while (firstRequired > 0) {
+          size_t boundCount = requiredCount;
+          if (firstRequired > 1) {
+            boundCount += nonEssentialPrefixConstantCounts[firstRequired - 2];
+          }
+          if (constantCanReach(boundCount)) {
+            break;
+          }
+          firstRequired--;
+          requiredCount += constantContributionCount(
+              windowMax[(size_t) windowOrder[firstRequired]]);
+        }
+        return;
+      }
       double maxRequiredScore = (double) windowMax[(size_t) windowOrder[splitIndex]];
-      // Required promotion is only a sweep-time intersection, not an essential
-      // fill change. The invariant is: after promoting windowOrder[firstRequired],
+      // Generic promotion is only a sweep-time intersection. The invariant is:
+      // after promoting windowOrder[firstRequired],
       // any buffer doc that misses that clause cannot reach theta even if it
       // takes every lower non-essential clause. That makes dropping it from the
       // union buffer safe for top-k scoring; count/domain paths do not use this
@@ -10584,10 +10672,20 @@ public:
       nextPartitionMcs = computeNextPartitionMcs();
       markEssentialScorers();
       std::fill(compactThresholdReady.begin(), compactThresholdReady.end(), false);
-      double acc = 0.0;
-      for (size_t s = 0; s < splitIndex; s++) {
-        acc += (double) windowMax[(size_t) windowOrder[s]];
-        nonEssentialPrefixMax[s] = acc;
+      if (exactUniformConstant) {
+        skipCount(SkipStats::maxScoreExactConstantPartitions);
+        size_t contributionCount = 0;
+        for (size_t s = 0; s < splitIndex; s++) {
+          contributionCount += constantContributionCount(
+              windowMax[(size_t) windowOrder[s]]);
+          nonEssentialPrefixConstantCounts[s] = contributionCount;
+        }
+      } else {
+        double acc = 0.0;
+        for (size_t s = 0; s < splitIndex; s++) {
+          acc += (double) windowMax[(size_t) windowOrder[s]];
+          nonEssentialPrefixMax[s] = acc;
+        }
       }
       firstRequired = splitIndex;
       if (scorers.size() - splitIndex == 1) {
@@ -10709,6 +10807,64 @@ public:
       }
       windowEnd = std::min(std::min(std::min(requestedEnd, outerWindowEnd), max), maxDoc);
       skipCount(SkipStats::maxScoreAnchorJumps);
+    }
+
+    std::span<Query::Scorer*> prepareRequiredScorers() {
+      assert(exactUniformConstant);
+      assert(firstRequired < splitIndex);
+      size_t count = 0;
+      for (size_t s = firstRequired; s < scorers.size(); s++) {
+        int32_t scorerIndex = windowOrder[s];
+        Query::Scorer* scorer = scorers[(size_t) scorerIndex];
+        int64_t cost = clauseCosts.empty() ? 0 : clauseCosts[(size_t) scorerIndex];
+        size_t insert = count;
+        while (insert > 0 && cost < requiredScorerCosts[insert - 1]) {
+          requiredScorers[insert] = requiredScorers[insert - 1];
+          requiredScorerCosts[insert] = requiredScorerCosts[insert - 1];
+          insert--;
+        }
+        requiredScorers[insert] = scorer;
+        requiredScorerCosts[insert] = cost;
+        count++;
+      }
+      return requiredScorers.first(count);
+    }
+
+    int32_t seekRequiredIntersection(std::span<Query::Scorer*> required,
+                                     int32_t target) {
+      assert(required.size() >= 2);
+      for (;;) {
+        Query::Scorer* lead = required[0];
+        int32_t leadDoc = lead->docId();
+        if (leadDoc < target) {
+          leadDoc = lead->advance(target);
+          skipCount(SkipStats::maxScoreRequiredIntersectionLeapfrogAdvances);
+        }
+        if (leadDoc == PostingsReader::END) {
+          return leadDoc;
+        }
+
+        bool restart = false;
+        for (size_t i = 1; i < required.size(); i++) {
+          Query::Scorer* scorer = required[i];
+          int32_t doc = scorer->docId();
+          if (doc < leadDoc) {
+            doc = scorer->advance(leadDoc);
+            skipCount(SkipStats::maxScoreRequiredIntersectionLeapfrogAdvances);
+          }
+          if (doc == PostingsReader::END) {
+            return doc;
+          }
+          if (doc > leadDoc) {
+            target = doc;
+            restart = true;
+            break;
+          }
+        }
+        if (!restart) {
+          return leadDoc;
+        }
+      }
     }
 
     void clearWindowBits() {
@@ -11191,15 +11347,20 @@ public:
     float cachedCompetitiveThreshold(size_t sweepLevel) {
       bool refresh = compactThresholdReady[sweepLevel];
       if (!refresh || compactThresholdMcs[sweepLevel] != minCompetitiveScore) {
-        // A stale threshold from a lower mcs in this partition is the ideal
-        // bisection seed: the exact result moves at most a few ulps.
-        compactThresholds[sweepLevel] =
-            refresh
-              ? competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
-                                          nonEssentialPrefixMax[sweepLevel],
-                                          (double) compactThresholds[sweepLevel])
-              : competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
-                                          nonEssentialPrefixMax[sweepLevel]);
+        if (exactUniformConstant) {
+          compactThresholds[sweepLevel] = constantCompetitiveThreshold(
+              nonEssentialPrefixConstantCounts[sweepLevel]);
+        } else {
+          // A stale threshold from a lower mcs in this partition is the ideal
+          // bisection seed: the exact result moves at most a few ulps.
+          compactThresholds[sweepLevel] =
+              refresh
+                ? competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
+                                            nonEssentialPrefixMax[sweepLevel],
+                                            (double) compactThresholds[sweepLevel])
+                : competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
+                                            nonEssentialPrefixMax[sweepLevel]);
+        }
         if (refresh) {
           skipCount(SkipStats::maxScoreThresholdRefreshes);
         }
@@ -11235,8 +11396,8 @@ public:
       }
     }
 
-    void applyNonEssentialSweeps(ScoreWindow& out) {
-      if (splitIndex > 0) {
+    void applyNonEssentialSweeps(ScoreWindow& out, size_t sweepCount) {
+      if (sweepCount > 0) {
         skipCount(SkipStats::maxScoreSweepWindows);
         if (SkipStats::enabled) {
           SkipStats::maxScoreSweepCalls += 1;
@@ -11248,7 +11409,7 @@ public:
       // scorer monotone through the window; compactCompetitive runs before each
       // sweep and guarantees every removed doc cannot reach theta even if all
       // remaining unswept clauses hit their window maxima.
-      for (size_t s = splitIndex; s-- > 0; ) {
+      for (size_t s = sweepCount; s-- > 0; ) {
         out.size = compactCompetitive(out, s);
         if (out.size == 0) {
           return;
@@ -11292,6 +11453,50 @@ public:
         }
       }
       finishCompetitive(out);
+    }
+
+    void applyNonEssentialSweeps(ScoreWindow& out) {
+      applyNonEssentialSweeps(out, splitIndex);
+    }
+
+    void fillRequiredIntersectionCandidates(
+        ScoreWindow& out, DocSet* filter, const FixedBitSet* domainBits,
+        std::span<Query::Scorer*> required) {
+      assert(exactUniformConstant);
+      assert(firstRequired < splitIndex);
+      assert(required.size() == scorers.size() - firstRequired);
+      prepareOutputWindow(out);
+      skipCount(SkipStats::maxScoreRequiredIntersectionWindows);
+      int32_t card = requiredIntersection.prepare(required, windowStart, windowEnd);
+      skipCount(SkipStats::maxScoreRequiredIntersectionBitsetWindows);
+      if (card == 0) {
+        return;
+      }
+
+      float requiredScore = constantTotals[required.size()];
+      int32_t innerSize = windowEnd - windowStart;
+      auto bits = requiredIntersection.bits();
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t wordBits = bits[(size_t) word];
+        while (wordBits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(wordBits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowStart + index;
+          if (acceptsDoc(filter, domainBits, doc)) {
+            out.docs[(size_t) out.size] = doc;
+            out.scores[(size_t) out.size] = requiredScore;
+            out.size++;
+          }
+          wordBits &= wordBits - 1;
+        }
+      }
+      if (SkipStats::enabled) {
+        SkipStats::maxScoreRequiredIntersectionDocs += out.size;
+      }
+      applyNonEssentialSweeps(out, firstRequired);
     }
 
     void finalizeCandidates(ScoreWindow& out) {
@@ -11399,7 +11604,8 @@ public:
                        int32_t maxDoc, int64_t aggregateClauseCost,
                        bool enableDisjConjCount,
                        bool enableDisjunctionCountIdentity,
-                       size_t identityLargestIndex)
+                       size_t identityLargestIndex,
+                       bool uniformConstantCandidate)
             : scorers(scorers),
               clauseCosts(clauseCosts),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -11423,6 +11629,27 @@ public:
               aggregateClauseCost(aggregateClauseCost) {
       assert(clauseCosts.empty() || scorers.size() == clauseCosts.size());
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+      if (uniformConstantCandidate && !scorers.empty()) {
+        auto contribution = scorers[0]->constantContribution();
+        exactUniformConstant = contribution.has_value()
+          && std::isfinite(*contribution) && *contribution >= 0.0f;
+        for (size_t i = 1; exactUniformConstant && i < scorers.size(); i++) {
+          auto next = scorers[i]->constantContribution();
+          exactUniformConstant = next.has_value() && *next == *contribution;
+        }
+        if (exactUniformConstant) {
+          uniformConstant = *contribution;
+          nonEssentialPrefixConstantCounts = pool.make_span<size_t>(scorers.size());
+          constantTotals = pool.make_span<float>(scorers.size() + 1);
+          requiredScorers = pool.make_span<Query::Scorer*>(scorers.size());
+          requiredScorerCosts = pool.make_span<int64_t>(scorers.size());
+          requiredIntersection.initialize(pool);
+          constantTotals[0] = 0.0f;
+          for (size_t i = 1; i < constantTotals.size(); i++) {
+            constantTotals[i] = constantTotals[i - 1] + uniformConstant;
+          }
+        }
+      }
       for (size_t i = 0; i < scorers.size(); i++) {
         clauseMax[i] = optionalUpperBound(
             scorers[i]->getMaxScoreForSetup(PostingsReader::END));
@@ -11505,39 +11732,55 @@ public:
         return next;
       } else if (splitIndex < scorers.size()) {
         if (!disableWindowDispatchForTests) {
-          int32_t top1 = PostingsReader::END;
-          int32_t top2 = PostingsReader::END;
-          int32_t top1Index = -1;
-          if (!positionEssentialScorers(top1, top2, top1Index) || top1 >= outerWindowEnd) {
-            int32_t next = consumeOuterWindow(out, max);
-            numCandidates += out.size;
-            return next;
-          }
-          anchorWindowAt(top1, max);
-          if (scorers.size() - splitIndex == 1) {
+          if (exactUniformConstant && firstRequired < splitIndex) {
+            auto required = prepareRequiredScorers();
+            int32_t common = seekRequiredIntersection(required, windowStart);
+            if (common >= outerWindowEnd) {
+              int32_t next = consumeOuterWindow(out, max);
+              numCandidates += out.size;
+              return next;
+            }
+            anchorWindowAt(common, max);
             if (!prepareFilterWindow(out)) {
               return windowEnd >= max ? PostingsReader::END : windowEnd;
             }
-            fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
-          } else if (top2 >= windowEnd) {
-            skipCount(SkipStats::maxScoreTop2Conversions);
-            if (!prepareFilterWindow(out)) {
-              return windowEnd >= max ? PostingsReader::END : windowEnd;
-            }
-            fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
-          } else if (top2 - kWindowSize / 2 >= top1) {
-            windowEnd = std::min(windowEnd, top2);
-            skipCount(SkipStats::maxScoreHalfWindowClips);
-            if (!prepareFilterWindow(out)) {
-              return windowEnd >= max ? PostingsReader::END : windowEnd;
-            }
-            fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+            fillRequiredIntersectionCandidates(out, filter, domainBits, required);
           } else {
-            if (!prepareFilterWindow(out)) {
-              return windowEnd >= max ? PostingsReader::END : windowEnd;
+            int32_t top1 = PostingsReader::END;
+            int32_t top2 = PostingsReader::END;
+            int32_t top1Index = -1;
+            if (!positionEssentialScorers(top1, top2, top1Index)
+                || top1 >= outerWindowEnd) {
+              int32_t next = consumeOuterWindow(out, max);
+              numCandidates += out.size;
+              return next;
             }
-            fillEssentialCandidates(filter, domainBits);
-            finalizeCandidates(out);
+            anchorWindowAt(top1, max);
+            if (scorers.size() - splitIndex == 1) {
+              if (!prepareFilterWindow(out)) {
+                return windowEnd >= max ? PostingsReader::END : windowEnd;
+              }
+              fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+            } else if (top2 >= windowEnd) {
+              skipCount(SkipStats::maxScoreTop2Conversions);
+              if (!prepareFilterWindow(out)) {
+                return windowEnd >= max ? PostingsReader::END : windowEnd;
+              }
+              fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+            } else if (top2 - kWindowSize / 2 >= top1) {
+              windowEnd = std::min(windowEnd, top2);
+              skipCount(SkipStats::maxScoreHalfWindowClips);
+              if (!prepareFilterWindow(out)) {
+                return windowEnd >= max ? PostingsReader::END : windowEnd;
+              }
+              fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+            } else {
+              if (!prepareFilterWindow(out)) {
+                return windowEnd >= max ? PostingsReader::END : windowEnd;
+              }
+              fillEssentialCandidates(filter, domainBits);
+              finalizeCandidates(out);
+            }
           }
         } else if (scorers.size() - splitIndex == 1) {
           if (!prepareFilterWindow(out)) {

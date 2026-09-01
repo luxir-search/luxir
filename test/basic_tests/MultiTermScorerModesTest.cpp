@@ -1,13 +1,17 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/QueryBuild.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 #include "luxir/query/BooleanQuery.h"
@@ -15,6 +19,7 @@
 #include "luxir/query/QueryPrep.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/DocsEnum.h"
+#include "luxir/search/Collector.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -163,6 +168,104 @@ constexpr DrivePattern kPatterns[] = {
     {5, 40000},      // giant strides toward maxDoc
 };
 
+struct ConstantTopKRun {
+  std::vector<TopDocsCollector::ScoreDoc> docs;
+  int64_t exactPartitions = 0;
+  int64_t deadOuterJumps = 0;
+  int64_t requiredIntersectionWindows = 0;
+  int64_t requiredProbeCandidates = 0;
+};
+
+ConstantTopKRun runConstantTopK(
+    const std::vector<std::vector<int32_t>>& clauseDocs,
+    std::span<const float> contributions, int32_t maxDoc, int32_t topK,
+    bool allowPruning, bool reverseClauses = false) {
+  assert(clauseDocs.size() == contributions.size());
+  MemPool pool;
+  auto scorers = pool.make_span<Query::Scorer*>(clauseDocs.size());
+  auto costs = pool.make_span<int64_t>(clauseDocs.size());
+  int64_t aggregateCost = 0;
+  for (size_t i = 0; i < clauseDocs.size(); i++) {
+    size_t source = reverseClauses ? clauseDocs.size() - 1 - i : i;
+    auto words = pool.make_span<uint64_t>(FixedBitSet::sizeInWords(maxDoc));
+    std::fill(words.begin(), words.end(), 0);
+    FixedBitSet bits(words.data(), maxDoc);
+    for (int32_t doc : clauseDocs[source]) {
+      bits.set(doc);
+    }
+    scorers[i] = pool.make<MultiTermQuery::Scorer>(
+        bits, maxDoc, contributions[source]);
+    costs[i] = (int64_t) clauseDocs[source].size();
+    aggregateCost += costs[i];
+  }
+
+  auto* bulk = pool.make<BooleanQuery::MaxScoreBulkScorer>(
+      pool, scorers, costs, std::span<Query::Scorer*>{}, maxDoc,
+      aggregateCost, false, false, 0, true);
+  TopDocsCollector collector(topK);
+  ConstantTopKRun run;
+  {
+    SkipStatsGuard stats;
+    collectTopKWindowed(0, bulk, nullptr, collector, nullptr, maxDoc,
+                        allowPruning);
+    run.exactPartitions = SkipStats::maxScoreExactConstantPartitions;
+    run.deadOuterJumps = SkipStats::maxScoreDeadOuterJumps;
+    run.requiredIntersectionWindows =
+        SkipStats::maxScoreRequiredIntersectionWindows;
+    run.requiredProbeCandidates = SkipStats::maxScoreRequiredProbeCandidates;
+  }
+  auto sorted = collector.sort();
+  run.docs.assign(sorted.begin(), sorted.end());
+  return run;
+}
+
+void expectSameScoreDocs(const ConstantTopKRun& expected,
+                         const ConstantTopKRun& actual) {
+  ASSERT_EQ(expected.docs.size(), actual.docs.size());
+  for (size_t i = 0; i < expected.docs.size(); i++) {
+    EXPECT_EQ(expected.docs[i].doc, actual.docs[i].doc) << "i=" << i;
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected.docs[i].score),
+              std::bit_cast<uint32_t>(actual.docs[i].score)) << "i=" << i;
+  }
+}
+
+ConstantTopKRun runPrefixDisjunctionTopK(
+    TestIndex& ti, ScorerMode mode, bool allowPruning,
+    bool reverseClauses = false) {
+  ScorerModeGuard modeGuard(mode);
+  auto poolGuard = ti.pool.rewindScopeGuard();
+  Query::Context context(ti.pool, *ti.reader);
+  PrefixQuery a("body_w", "a");
+  PrefixQuery b("body_w", "b");
+  std::array<Query*, 2> optional = reverseClauses
+      ? std::array<Query*, 2>{&b, &a}
+      : std::array<Query*, 2>{&a, &b};
+  BooleanQuery query({}, optional, {}, {});
+  auto* weight = query.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  auto* supplier = weight->scorerSupplier(
+      ti.pool, context.topReader.segments()[0]);
+  EXPECT_NE(nullptr, supplier);
+  auto* bulk = supplier == nullptr ? nullptr : supplier->bulkScorer(ti.pool);
+  EXPECT_NE(nullptr, dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(bulk));
+
+  TopDocsCollector collector(10);
+  ConstantTopKRun run;
+  if (bulk != nullptr) {
+    SkipStatsGuard stats;
+    collectTopKWindowed(0, bulk, nullptr, collector, nullptr,
+                        context.topReader.segments()[0].maxDoc(), allowPruning);
+    run.exactPartitions = SkipStats::maxScoreExactConstantPartitions;
+    run.deadOuterJumps = SkipStats::maxScoreDeadOuterJumps;
+    run.requiredIntersectionWindows =
+        SkipStats::maxScoreRequiredIntersectionWindows;
+    run.requiredProbeCandidates = SkipStats::maxScoreRequiredProbeCandidates;
+  }
+  auto sorted = collector.sort();
+  run.docs.assign(sorted.begin(), sorted.end());
+  return run;
+}
+
 std::vector<int32_t> collectDocs(TestIndex& ti, ScorerMode mode,
                                  DrivePattern pattern) {
   ScorerModeGuard guard(mode);
@@ -288,6 +391,164 @@ TEST_F(MultiTermScorerModesTest, mixedShapeParity) {
   EXPECT_EQ(3000u, collectDocs(ti, ScorerMode::FORCE_EAGER, {0, 0}).size());
   expectModeParity(ti);
   expectSelectionAndEarlyExit(ti);
+}
+
+TEST_F(MultiTermScorerModesTest,
+       uniformConstantLatticeTerminatesAfterTopKScoreSaturates) {
+  constexpr int32_t maxDoc = 9000;
+  std::vector<std::vector<int32_t>> clauses(2);
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    if (doc % 2 == 0) clauses[0].push_back(doc);
+    if (doc % 3 == 0) clauses[1].push_back(doc);
+  }
+  std::array<float, 2> contributions = {1.0f, 1.0f};
+
+  auto exhaustive = runConstantTopK(
+      clauses, contributions, maxDoc, 10, false);
+  auto pruned = runConstantTopK(
+      clauses, contributions, maxDoc, 10, true);
+  auto reversed = runConstantTopK(
+      clauses, contributions, maxDoc, 10, true, true);
+  expectSameScoreDocs(exhaustive, pruned);
+  expectSameScoreDocs(exhaustive, reversed);
+  EXPECT_GT(pruned.exactPartitions, 0);
+  EXPECT_GT(pruned.deadOuterJumps, 0);
+}
+
+TEST_F(MultiTermScorerModesTest,
+       requiredIntersectionFindsLateScoreWinnersWithoutRequiredProbes) {
+  constexpr int32_t maxDoc = 9000;
+  std::vector<std::vector<int32_t>> clauses(2);
+  for (int32_t doc = 0; doc < 2000; doc++) {
+    clauses[(size_t) (doc & 1)].push_back(doc);
+  }
+  for (int32_t doc : {5000, 7000}) {
+    clauses[0].push_back(doc);
+    clauses[1].push_back(doc);
+  }
+  std::array<float, 2> contributions = {1.0f, 1.0f};
+
+  auto exhaustive = runConstantTopK(
+      clauses, contributions, maxDoc, 10, false);
+  auto pruned = runConstantTopK(
+      clauses, contributions, maxDoc, 10, true);
+  auto reversed = runConstantTopK(
+      clauses, contributions, maxDoc, 10, true, true);
+  expectSameScoreDocs(exhaustive, pruned);
+  expectSameScoreDocs(exhaustive, reversed);
+  EXPECT_GT(pruned.requiredIntersectionWindows, 0);
+  EXPECT_EQ(0, pruned.requiredProbeCandidates);
+}
+
+TEST_F(MultiTermScorerModesTest,
+       requiredIntersectionMatchesExhaustiveAcrossMultiTermScorerModes) {
+  std::map<int32_t, std::string> docs;
+  for (int32_t doc = 0; doc < 200; doc++) {
+    append(docs, doc, doc % 2 == 0 ? "aalpha" : "bbeta");
+  }
+  append(docs, 4500, "aalpha");
+  append(docs, 4500, "bbeta");
+  append(docs, 5000, "other");
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, docs);
+
+  for (ScorerMode mode : {ScorerMode::FORCE_EAGER,
+                          ScorerMode::FORCE_WINDOWED,
+                          ScorerMode::FORCE_HEAP}) {
+    auto exhaustive = runPrefixDisjunctionTopK(ti, mode, false);
+    auto pruned = runPrefixDisjunctionTopK(ti, mode, true);
+    auto reversed = runPrefixDisjunctionTopK(ti, mode, true, true);
+    expectSameScoreDocs(exhaustive, pruned);
+    expectSameScoreDocs(exhaustive, reversed);
+    EXPECT_GT(pruned.requiredIntersectionWindows, 0);
+    EXPECT_EQ(0, pruned.requiredProbeCandidates);
+  }
+}
+
+TEST_F(MultiTermScorerModesTest,
+       constantLatticeUsesRepeatedFloatAdditionAndRejectsMixedValues) {
+  constexpr int32_t maxDoc = 9000;
+  std::vector<std::vector<int32_t>> clauses(3);
+  for (int32_t doc = 0; doc < maxDoc; doc += 7) {
+    for (auto& clause : clauses) clause.push_back(doc);
+  }
+  std::array<float, 3> uniform = {0.1f, 0.1f, 0.1f};
+  auto uniformExhaustive = runConstantTopK(
+      clauses, uniform, maxDoc, 3, false);
+  auto uniformPruned = runConstantTopK(
+      clauses, uniform, maxDoc, 3, true);
+  expectSameScoreDocs(uniformExhaustive, uniformPruned);
+  ASSERT_FALSE(uniformPruned.docs.empty());
+  float repeated = 0.0f;
+  for (float contribution : uniform) repeated += contribution;
+  EXPECT_EQ(std::bit_cast<uint32_t>(repeated),
+            std::bit_cast<uint32_t>(uniformPruned.docs[0].score));
+  EXPECT_GT(uniformPruned.exactPartitions, 0);
+
+  std::array<float, 3> mixed = {0.1f, 0.1f, 0.2f};
+  auto mixedExhaustive = runConstantTopK(
+      clauses, mixed, maxDoc, 3, false);
+  auto mixedPruned = runConstantTopK(
+      clauses, mixed, maxDoc, 3, true);
+  expectSameScoreDocs(mixedExhaustive, mixedPruned);
+  EXPECT_EQ(0, mixedPruned.exactPartitions);
+}
+
+TEST_F(MultiTermScorerModesTest,
+       constantDisjunctionOrderAndParallelMergeMatchExhaustive) {
+  CollectionHelper helper;
+  for (int32_t segment = 0; segment < 3; segment++) {
+    for (int32_t doc = 0; doc < 64; doc++) {
+      std::string body;
+      if (doc % 2 == 0) body = "alpha";
+      if (doc % 3 == 0) body += body.empty() ? "beta" : " beta";
+      if (body.empty()) body = "other";
+      helper.index(
+          flatdoc("id", "s" + std::to_string(segment) + "d"
+                            + std::to_string(doc),
+                  "body_w", body),
+          doc == 63 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+    }
+  }
+
+  auto run = [&](bool reverseClauses, bool parallel, bool exhaustive) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q");
+    auto alpha = qb::prefix(top.mr(), "body_w", "a");
+    auto beta = qb::prefix(top.mr(), "body_w", "b");
+    top.rawQuery() = reverseClauses
+        ? qb::boolean(top.mr(), {}, {beta, alpha})
+        : qb::boolean(top.mr(), {}, {alpha, beta});
+    top.fields({"id"}).getScores().limit(10);
+    if (exhaustive) top.getNumber();
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->toString();
+
+    std::vector<std::pair<std::string, uint32_t>> result;
+    const auto* docs = req->docList("q");
+    if (docs == nullptr) return result;
+    const auto* idColumn = docs->columns.find("id");
+    const auto* scoreColumn = docs->columns.find("_score_");
+    if (idColumn == nullptr || scoreColumn == nullptr) return result;
+    const auto* ids = std::get_if<luxir::api::ColStr>(&idColumn->kind);
+    const auto* scores =
+        std::get_if<luxir::api::ColFloat>(&scoreColumn->kind);
+    if (ids == nullptr || scores == nullptr) return result;
+    EXPECT_EQ(ids->v.size(), scores->v.size());
+    for (size_t i = 0; i < std::min(ids->v.size(), scores->v.size()); i++) {
+      result.emplace_back(
+          std::string(ids->v[i]), std::bit_cast<uint32_t>(scores->v[i]));
+    }
+    return result;
+  };
+
+  auto exhaustive = run(false, false, true);
+  ASSERT_EQ(10u, exhaustive.size());
+  EXPECT_EQ(exhaustive, run(false, false, false));
+  EXPECT_EQ(exhaustive, run(true, false, false));
+  EXPECT_EQ(exhaustive, run(false, true, false));
+  EXPECT_EQ(exhaustive, run(true, true, false));
 }
 
 // AUTO spills to the eager union when the retained-state budget is exceeded.
