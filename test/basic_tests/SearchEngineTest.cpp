@@ -1751,7 +1751,7 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
       EXPECT_FALSE(req->ok());
       EXPECT_NE(std::string::npos,
                 req->errorMsg().find(
-                    "summed duplicate-term boost must be finite"));
+                    "summed duplicate-clause boost must be finite"));
       EXPECT_EQ(0, SkipStats::cacheFirstMembershipWeightSkips);
     }
   }

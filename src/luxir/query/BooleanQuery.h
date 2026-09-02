@@ -4,8 +4,11 @@
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <typeindex>
+
+#include <boost/unordered/unordered_flat_map.hpp>
 
 #include "Query.h"
 #include "AllQuery.h"
@@ -188,8 +191,15 @@ private:
       // A sole required child may lift its rank-only optionals into an outer
       // Boolean that has no optional constraint of its own. This is the same
       // required body and the same optional score decoration, while exposing
-      // outer filters to cost-ordered required planning. Multiple required
-      // children stay opaque because lifting would reorder their score sums.
+      // outer filters to cost-ordered required planning. Semantically any
+      // required child under a zero minShouldMatch outer could lift (every
+      // optional is rank-only once a required clause exists, and the score
+      // is the same sum re-associated), but lifting from one of several
+      // required children turns a conjunction that probes the child's
+      // optionals per candidate into a flat mandatory/optional plan, which
+      // consumes a dense optional wholesale. Until the mandatory/optional
+      // planner probes such optionals per candidate, multi-child lifting
+      // is a measured regression, so it stays opaque here.
       bool liftRankOnlyOptionals =
           !parentIsFilter && inner != nullptr
           && inner->minShouldMatch == 0 && parents.size() == 1
@@ -340,25 +350,80 @@ private:
     return plan;
   }
 
-  struct DedupableTerm {
-    TermQuery* term = nullptr;
-    float wrapperBoost = 1.0f;
+  struct PeeledClause {
+    Query* core;
+    float boost;
   };
 
-  static DedupableTerm dedupableTerm(Query* query) {
-    float wrapperBoost = 1.0f;
-    while (auto* wrapped = dynamic_cast<BoostQuery*>(query)) {
-      wrapperBoost = checkedBoostProduct(wrapperBoost, wrapped->getBoost());
-      query = wrapped->getChild();
-    }
-    auto* term = dynamic_cast<TermQuery*>(query);
-    if (term == nullptr || term->hasInjectedStats()) return {};
-    return {term, wrapperBoost};
+  static PeeledClause peelScoringClause(Query* query) {
+    float boost = 1.0f;
+    Query* core = query->peelBoost(boost);
+    return {core, boost};
   }
 
-  static bool sameTermIdentity(const TermQuery& lhs, const TermQuery& rhs) {
-    return lhs.shouldUseFrontierBound() == rhs.shouldUseFrontierBound()
-        && lhs.getField() == rhs.getField() && lhs.getTerm() == rhs.getTerm();
+  struct IdentityHash {
+    using is_avalanching = void;
+
+    size_t operator()(uint64_t value) const { return (size_t) value; }
+  };
+
+  struct DuplicateSlot {
+    size_t representative;
+    float boost = 0.0f;
+    int32_t count = 1;
+  };
+
+  struct DuplicateGroups {
+    boost::container::small_vector<int32_t, 16> byClause;
+    boost::container::small_vector<DuplicateSlot, 16> slots;
+    int32_t duplicateSlots = 0;
+  };
+
+  static DuplicateGroups findDuplicateGroups(
+      MemPool& pool, std::span<Query*> clauses, bool sumBoosts) {
+    DuplicateGroups result;
+    result.byClause.resize(clauses.size(), -1);
+    if (clauses.size() < 2) return result;
+
+    using Entry = std::pair<const uint64_t, int32_t>;
+    using SlotByHash = boost::unordered_flat_map<
+        uint64_t, int32_t, IdentityHash, std::equal_to<uint64_t>,
+        MemPool::allocator<Entry>>;
+    SlotByHash slotByHash(
+        0, IdentityHash{}, std::equal_to<uint64_t>{},
+        MemPool::allocator<Entry>(pool));
+    slotByHash.reserve(clauses.size());
+    result.slots.reserve(clauses.size());
+    for (size_t i = 0; i < clauses.size(); i++) {
+      PeeledClause peeled = peelScoringClause(clauses[i]);
+      uint64_t hash = peeled.core->hash();
+      auto found = slotByHash.find(hash);
+      if (found == slotByHash.end()) {
+        int32_t slot = (int32_t) result.slots.size();
+        slotByHash.emplace(hash, slot);
+        result.slots.push_back({i, peeled.boost, 1});
+        continue;
+      }
+      int32_t slot = found->second;
+      DuplicateSlot& duplicate = result.slots[(size_t) slot];
+      Query* representative =
+          peelScoringClause(clauses[duplicate.representative]).core;
+      if (!representative->equals(*peeled.core)) continue;
+      if (duplicate.count == 1) {
+        result.byClause[duplicate.representative] = slot;
+        result.duplicateSlots++;
+      }
+      result.byClause[i] = slot;
+      duplicate.count++;
+      if (sumBoosts) {
+        duplicate.boost += peeled.boost;
+        if (!std::isfinite(duplicate.boost)) {
+          throw std::runtime_error(
+              "summed duplicate-clause boost must be finite");
+        }
+      }
+    }
+    return result;
   }
 
   // Request-plan duplicate-clause normalization. Lucene dedups at rewrite,
@@ -370,79 +435,56 @@ private:
   // saturates duplicate qtf when BM25 k3 is configured, the default is linear
   // (equal to boost summing), and Luxir has no qtf hook.
   //
-  // TODO: replace the O(n^2) scans with hashing, extend identity beyond
-  // TermQuery (needs Query equality), and do full duplicate removal ACROSS
-  // the mandatory/optional/prohibited lists (an optional clause duplicating
-  // a mandatory one folds its boost into the mandatory clause; a prohibited
-  // duplicate of a required clause matches nothing).
-  static std::span<Query*> mergeDuplicateScoringTerms(luxir::MemPool& pool,
-                                                      std::span<Query*> clauses,
-                                                      int32_t* removedOut = nullptr) {
+  // TODO: full duplicate removal ACROSS the mandatory/optional/prohibited
+  // lists (an optional clause duplicating a mandatory one folds its boost
+  // into the mandatory clause; a prohibited duplicate of a required clause
+  // matches nothing).
+  static std::span<Query*> mergeDuplicateScoringClauses(
+      luxir::MemPool& pool, std::span<Query*> clauses,
+      int32_t* removedOut = nullptr) {
+    DuplicateGroups duplicates = findDuplicateGroups(pool, clauses, true);
+    if (duplicates.duplicateSlots == 0) {
+      if (removedOut != nullptr) *removedOut = 0;
+      return clauses;
+    }
+
     boost::container::small_vector<Query*, 16> out;
-    boost::container::small_vector<bool, 16> consumed(clauses.size(), false);
-    bool changed = false;
     for (size_t i = 0; i < clauses.size(); i++) {
-      if (consumed[i]) continue;
-      Query* query = clauses[i];
-      auto dedup = dedupableTerm(query);
-      if (dedup.term != nullptr) {
-        auto* term = dedup.term;
-        float boost = checkedBoostProduct(dedup.wrapperBoost, term->getBoost());
-        bool merged = false;
-        for (size_t j = i + 1; j < clauses.size(); j++) {
-          if (consumed[j]) continue;
-          auto other = dedupableTerm(clauses[j]);
-          if (other.term == nullptr || !sameTermIdentity(*term, *other.term)) continue;
-          boost += checkedBoostProduct(other.wrapperBoost, other.term->getBoost());
-          if (!std::isfinite(boost)) {
-            throw std::runtime_error("summed duplicate-term boost must be finite");
-          }
-          consumed[j] = true;
-          merged = true;
-        }
-        if (merged) {
-          query = pool.make<TermQuery>(term->getField(), term->getTerm(), boost,
-                                       term->shouldUseFrontierBound());
-          changed = true;
-        }
+      int32_t group = duplicates.byClause[i];
+      if (group < 0) {
+        out.push_back(clauses[i]);
+        continue;
       }
-      out.push_back(query);
+      DuplicateSlot& duplicate = duplicates.slots[(size_t) group];
+      if (i != duplicate.representative) continue;
+      Query* core = peelScoringClause(clauses[i]).core;
+      if (auto* term = dynamic_cast<TermQuery*>(core)) {
+        core = pool.make<TermQuery>(
+            term->getField(), term->getTerm(), duplicate.boost,
+            term->shouldUseFrontierBound());
+      } else {
+        core = scoringClause(pool, core, duplicate.boost);
+      }
+      out.push_back(core);
     }
     if (removedOut != nullptr) {
       *removedOut = (int32_t) (clauses.size() - out.size());
-    }
-    if (!changed) {
-      return clauses;
     }
     auto* kept = pool.make_arr<Query*>(out.size());
     std::copy(out.begin(), out.end(), kept);
     return {kept, out.size()};
   }
 
-  static std::span<Query*> dropDuplicateFilterTerms(luxir::MemPool& pool,
-                                                    std::span<Query*> clauses) {
+  static std::span<Query*> dropDuplicateMembershipClauses(
+      luxir::MemPool& pool, std::span<Query*> clauses) {
+    DuplicateGroups duplicates = findDuplicateGroups(pool, clauses, false);
+    if (duplicates.duplicateSlots == 0) return clauses;
     boost::container::small_vector<Query*, 16> out;
-    bool changed = false;
     for (size_t i = 0; i < clauses.size(); i++) {
-      auto term = dedupableTerm(clauses[i]);
-      bool duplicate = false;
-      if (term.term != nullptr) {
-        for (Query* prior : out) {
-          auto priorTerm = dedupableTerm(prior);
-          if (priorTerm.term != nullptr && sameTermIdentity(*priorTerm.term, *term.term)) {
-            duplicate = true;
-            break;
-          }
-        }
-      }
-      if (duplicate) {
-        changed = true;
-        continue;
-      }
+      int32_t group = duplicates.byClause[i];
+      if (group >= 0
+          && i != duplicates.slots[(size_t) group].representative) continue;
       out.push_back(clauses[i]);
-    }
-    if (!changed) {
-      return clauses;
     }
     auto* kept = pool.make_arr<Query*>(out.size());
     std::copy(out.begin(), out.end(), kept);
@@ -466,14 +508,14 @@ private:
       compiled->minShouldMatch = normalized.minShouldMatch;
       if (compiled->singleChild != nullptr) return compiled;
 
-      auto mandatoryClauses = mergeDuplicateScoringTerms(
+      auto mandatoryClauses = mergeDuplicateScoringClauses(
           context.pool, normalized.mandatory);
       int32_t removedOptional = 0;
-      auto optionalClauses = mergeDuplicateScoringTerms(
+      auto optionalClauses = mergeDuplicateScoringClauses(
           context.pool, normalized.optional, &removedOptional);
-      auto prohibitedClauses = dropDuplicateFilterTerms(
+      auto prohibitedClauses = dropDuplicateMembershipClauses(
           context.pool, normalized.prohibited);
-      auto filterClauses = dropDuplicateFilterTerms(
+      auto filterClauses = dropDuplicateMembershipClauses(
           context.pool, normalized.filter);
 
       // Luxir-defined min_match semantics under duplicate removal, split by
@@ -712,6 +754,42 @@ public:
                std::span<Query*> filter, int minShouldMatch = 0)
           : mandatory(mandatory), optional(optional), prohibited(prohibited), filter(filter),
             minShouldMatch(minShouldMatch) {
+  }
+
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const BooleanQuery*>(&other);
+    if (rhs == nullptr || minShouldMatch != rhs->minShouldMatch
+        || mandatory.size() != rhs->mandatory.size()
+        || optional.size() != rhs->optional.size()
+        || prohibited.size() != rhs->prohibited.size()
+        || filter.size() != rhs->filter.size()) {
+      return false;
+    }
+    auto sameList = [](std::span<Query*> a, std::span<Query*> b) {
+      for (size_t i = 0; i < a.size(); i++) {
+        if (!sameScoringClause(a[i], b[i])) return false;
+      }
+      return true;
+    };
+    return sameList(mandatory, rhs->mandatory)
+        && sameList(optional, rhs->optional)
+        && sameList(prohibited, rhs->prohibited)
+        && sameList(filter, rhs->filter);
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), minShouldMatch);
+    auto mixList = [&](std::span<Query*> clauses) {
+      value = mixHash(value, clauses.size());
+      for (Query* clause : clauses) {
+        value = mixHash(value, scoringClauseHash(clause));
+      }
+    };
+    mixList(mandatory);
+    mixList(optional);
+    mixList(prohibited);
+    mixList(filter);
+    return value;
   }
 
   VerificationWork membershipVerificationWork() const override {

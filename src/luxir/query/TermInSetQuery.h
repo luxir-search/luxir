@@ -18,6 +18,20 @@ public:
                  std::span<const std::string_view> terms)
     : MultiTermQuery(field), terms(terms) {}
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const TermInSetQuery*>(&other);
+    return rhs != nullptr && field == rhs->field
+        && terms.size() == rhs->terms.size()
+        && std::equal(terms.begin(), terms.end(), rhs->terms.begin());
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, terms.size());
+    for (std::string_view term : terms) value = mixHash(value, term);
+    return value;
+  }
+
   std::span<const std::string_view> getTerms() const { return terms; }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

@@ -395,6 +395,13 @@ public:
                std::optional<float> constantOutput = std::nullopt)
     : child(child), program(program), constantOutput(constantOutput) {}
 
+  bool equals(const Query& other) const override {
+    unused(other);
+    return false;
+  }
+
+  uint64_t hashImpl() const override { return Query::hashImpl(); }
+
   Query* getChild() const { return child; }
   ValueProgram& getProgram() const { return *program; }
 

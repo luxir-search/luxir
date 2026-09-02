@@ -39,12 +39,24 @@ public:
         classification(classification), exactOrPrefix(exactOrPrefix),
         scanPlan(scanPlan) {}
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const AutomatonQuery*>(&other);
+    return rhs != nullptr && kind == rhs->kind && field == rhs->field
+        && pattern == rhs->pattern;
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), kind);
+    value = mixHash(value, field);
+    return mixHash(value, pattern);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
-    unused(ctx);
     out.appendTag(kind == Kind::WILDCARD ? FilterKeyTag::WILDCARD : FilterKeyTag::REGEX);
     out.appendString(field);
     out.appendTerm(pattern);
+    unused(ctx);
     return FilterKeyScope::SEGMENT_STABLE;
   }
 

@@ -18,6 +18,17 @@ public:
   PrefixQuery(std::string_view field, std::string_view prefix)
     : MultiTermQuery(field), prefix(prefix) {}
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const PrefixQuery*>(&other);
+    return rhs != nullptr && field == rhs->field && prefix == rhs->prefix;
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = Query::hashImpl();
+    value = mixHash(value, field);
+    return mixHash(value, prefix);
+  }
+
   std::string_view getPrefix() const { return prefix; }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

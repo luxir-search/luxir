@@ -20,6 +20,16 @@ public:
     }
   }
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const BoostQuery*>(&other);
+    return rhs != nullptr && sameScoringClause(
+        const_cast<BoostQuery*>(this), const_cast<BoostQuery*>(rhs));
+  }
+
+  uint64_t hashImpl() const override {
+    return scoringClauseHash(const_cast<BoostQuery*>(this));
+  }
+
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
 
@@ -48,6 +58,11 @@ public:
       PlanningContext& context, float multiplier = 1.0f) const override {
     child->validateLogical(
         context, checkedBoostProduct(multiplier, boost));
+  }
+
+  Query* peelBoost(float& boost) override {
+    boost = checkedBoostProduct(boost, this->boost);
+    return child->peelBoost(boost);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

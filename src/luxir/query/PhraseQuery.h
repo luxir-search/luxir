@@ -301,6 +301,26 @@ public:
     assert(slop >= 0);
   }
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const PhraseQuery*>(&other);
+    return rhs != nullptr && field == rhs->field && slop == rhs->slop
+        && terms.size() == rhs->terms.size()
+        && positions.size() == rhs->positions.size()
+        && std::equal(terms.begin(), terms.end(), rhs->terms.begin())
+        && std::equal(positions.begin(), positions.end(),
+                      rhs->positions.begin());
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, slop);
+    value = mixHash(value, terms.size());
+    for (std::string_view term : terms) value = mixHash(value, term);
+    value = mixHash(value, positions.size());
+    for (int32_t position : positions) value = mixHash(value, position);
+    return value;
+  }
+
   [[nodiscard]] std::string_view getField() const { return field; }
   [[nodiscard]] std::span<std::string_view> getTerms() const { return terms; }
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }

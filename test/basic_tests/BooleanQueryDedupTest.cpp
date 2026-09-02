@@ -13,6 +13,9 @@
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/PhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/Collector.h"
@@ -92,6 +95,82 @@ protected:
   }
 
 };
+
+TEST(QueryEqualsTest, boostPeelingAndWrappers) {
+  TermQuery term2("f", "a", 2.0f);
+  TermQuery term3("f", "a", 3.0f);
+  TermQuery noFrontier("f", "a", 2.0f, false);
+  Similarity::TermStats stats{.docFreq = 1, .totalTermFreq = 1};
+  TermQuery injected("f", "a", stats);
+
+  EXPECT_TRUE(term2.equals(term3));
+  EXPECT_EQ(term2.hash(), term3.hash());
+  EXPECT_FALSE(term2.equals(noFrontier));
+  EXPECT_FALSE(injected.equals(injected));
+
+  BoostQuery boost3OfTerm2(&term2, 3.0f);
+  BoostQuery boost2OfTerm3(&term3, 2.0f);
+  TermQuery term1("f", "a");
+  BoostQuery boost3OfTerm1(&term1, 3.0f);
+  EXPECT_TRUE(Query::sameScoringClause(
+      &boost3OfTerm2, &boost2OfTerm3));
+  EXPECT_FALSE(Query::sameScoringClause(
+      &boost3OfTerm2, &boost3OfTerm1));
+  EXPECT_TRUE(boost3OfTerm2.equals(boost2OfTerm3));
+  EXPECT_FALSE(boost3OfTerm2.equals(boost3OfTerm1));
+  EXPECT_EQ(boost3OfTerm2.hash(), boost2OfTerm3.hash());
+  EXPECT_EQ(Query::scoringClauseHash(&boost3OfTerm2),
+            Query::scoringClauseHash(&boost2OfTerm3));
+
+  ForcePrepareQuery prepare2(&term2);
+  ForcePrepareQuery prepare3(&term3);
+  EXPECT_FALSE(prepare2.equals(prepare3));
+
+  ConstantScoreQuery constant2(&term1, 2.0f);
+  ConstantScoreQuery constant3(&term1, 3.0f);
+  EXPECT_FALSE(constant2.equals(constant3));
+}
+
+TEST(QueryEqualsTest, phraseAndBooleanStructure) {
+  std::array<std::string_view, 2> phraseTerms1{"new", "york"};
+  std::array<std::string_view, 2> phraseTerms2{"new", "york"};
+  std::array<std::string_view, 2> reversedTerms{"york", "new"};
+  std::array<int32_t, 2> adjacent1{0, 1};
+  std::array<int32_t, 2> adjacent2{0, 1};
+  std::array<int32_t, 2> gapped{0, 2};
+  PhraseQuery phrase1("f", phraseTerms1, adjacent1, 0);
+  PhraseQuery phrase2("f", phraseTerms2, adjacent2, 0);
+  PhraseQuery otherField("g", phraseTerms2, adjacent2, 0);
+  PhraseQuery otherTerms("f", reversedTerms, adjacent2, 0);
+  PhraseQuery otherPositions("f", phraseTerms2, gapped, 0);
+  PhraseQuery otherSlop("f", phraseTerms2, adjacent2, 1);
+
+  EXPECT_TRUE(phrase1.equals(phrase2));
+  EXPECT_EQ(phrase1.hash(), phrase2.hash());
+  EXPECT_FALSE(phrase1.equals(otherField));
+  EXPECT_FALSE(phrase1.equals(otherTerms));
+  EXPECT_FALSE(phrase1.equals(otherPositions));
+  EXPECT_FALSE(phrase1.equals(otherSlop));
+
+  TermQuery a1("f", "a");
+  TermQuery b1("f", "b");
+  TermQuery a2("f", "a");
+  TermQuery b2("f", "b");
+  Query* ab1[] = {&a1, &b1};
+  Query* ab2[] = {&a2, &b2};
+  Query* ba[] = {&b2, &a2};
+  BooleanQuery first({}, ab1, {}, {}, 1);
+  BooleanQuery equal({}, ab2, {}, {}, 1);
+  BooleanQuery reordered({}, ba, {}, {}, 1);
+  BooleanQuery otherMin({}, ab2, {}, {}, 2);
+
+  EXPECT_TRUE(first.equals(equal));
+  EXPECT_EQ(first.hash(), equal.hash());
+  uint64_t cachedHash = first.hash();
+  EXPECT_EQ(cachedHash, first.hash());
+  EXPECT_FALSE(first.equals(reordered));
+  EXPECT_FALSE(first.equals(otherMin));
+}
 
 TEST_F(BooleanQueryDedupTest, optionalDuplicateScoresExactlyLikeBoostTwo) {
   TestIndex testIndex;
@@ -433,4 +512,120 @@ TEST_F(BooleanQueryDedupTest, weightDedupClonesAndWalksPostingsOnce) {
   ASSERT_GT(mandatorySingleDecodes, 0);
   EXPECT_EQ(countDecodes(mandatoryDup), mandatorySingleDecodes);
   EXPECT_EQ(countDecodes(mandatoryInjected), 2 * mandatorySingleDecodes);
+}
+
+TEST_F(BooleanQueryDedupTest, structuralDuplicatesWalkPostingsOnce) {
+  TestIndex testIndex;
+  std::vector<std::string> bodyStorage;
+  std::vector<std::string_view> bodies;
+  for (int32_t i = 0; i < 320; i++) {
+    bodyStorage.push_back(i % 3 == 0 ? "new york towns" : "new york");
+  }
+  for (auto& body : bodyStorage) bodies.push_back(body);
+  buildBodyIndex(testIndex, bodies);
+
+  auto countDecodes = [&](Query& query) {
+    bool saved = SkipStats::enabled;
+    SkipStats::enabled = true;
+    SkipStats::reset();
+    collectHits(*testIndex.reader, query);
+    int64_t decodes =
+        SkipStats::docBlocksDecoded + SkipStats::scoredWordProbeAdvances;
+    SkipStats::enabled = saved;
+    return decodes;
+  };
+
+  std::string_view phraseTerms1[] = {"new", "york"};
+  std::string_view phraseTerms2[] = {"new", "york"};
+  int32_t positions[] = {0, 1};
+  PhraseQuery phrase1("body_w", phraseTerms1, positions);
+  PhraseQuery phrase2("body_w", phraseTerms2, positions);
+  Query* duplicatePhrases[] = {&phrase1, &phrase2};
+  BooleanQuery phrasePair({}, duplicatePhrases, {}, {});
+  Query* singlePhraseClause[] = {&phrase1};
+  BooleanQuery singlePhrase({}, singlePhraseClause, {}, {});
+
+  MemPool phrasePool;
+  Query::Context phraseContext(phrasePool, *testIndex.reader);
+  auto phrasePlan = phrasePair.compiledPlanForTest(phraseContext);
+  ASSERT_EQ(1u, phrasePlan.optional.size());
+  auto* mergedPhrase = dynamic_cast<BoostQuery*>(phrasePlan.optional[0]);
+  ASSERT_NE(nullptr, mergedPhrase);
+  EXPECT_EQ(2.0f, mergedPhrase->getBoost());
+  EXPECT_EQ(&phrase1, mergedPhrase->getChild());
+  int64_t phraseDecodes = countDecodes(singlePhrase);
+  ASSERT_GT(phraseDecodes, 0);
+  EXPECT_EQ(phraseDecodes, countDecodes(phrasePair));
+
+  TermQuery new1("body_w", "new");
+  TermQuery york1("body_w", "york");
+  Query* required1[] = {&new1, &york1};
+  BooleanQuery conjunction1(required1, {}, {}, {});
+  TermQuery new2("body_w", "new");
+  TermQuery york2("body_w", "york");
+  Query* required2[] = {&new2, &york2};
+  BooleanQuery conjunction2(required2, {}, {}, {});
+  Query* duplicateConjunctions[] = {&conjunction1, &conjunction2};
+  BooleanQuery conjunctionPair({}, duplicateConjunctions, {}, {});
+  Query* singleConjunctionClause[] = {&conjunction1};
+  BooleanQuery singleConjunction({}, singleConjunctionClause, {}, {});
+
+  MemPool conjunctionPool;
+  Query::Context conjunctionContext(conjunctionPool, *testIndex.reader);
+  auto conjunctionPlan = conjunctionPair.compiledPlanForTest(
+      conjunctionContext);
+  ASSERT_EQ(1u, conjunctionPlan.optional.size());
+  auto* mergedConjunction =
+      dynamic_cast<BoostQuery*>(conjunctionPlan.optional[0]);
+  ASSERT_NE(nullptr, mergedConjunction);
+  EXPECT_EQ(2.0f, mergedConjunction->getBoost());
+  EXPECT_EQ(&conjunction1, mergedConjunction->getChild());
+  int64_t conjunctionDecodes = countDecodes(singleConjunction);
+  ASSERT_GT(conjunctionDecodes, 0);
+  EXPECT_EQ(conjunctionDecodes, countDecodes(conjunctionPair));
+}
+
+TEST_F(BooleanQueryDedupTest, scoringAndMembershipDedupStayDistinct) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a b", "a c", "a"};
+  buildBodyIndex(testIndex, bodies);
+
+  TermQuery a1("body_w", "a");
+  TermQuery a2("body_w", "a");
+  ConstantScoreQuery score2(&a1, 2.0f);
+  ConstantScoreQuery score3(&a2, 3.0f);
+  Query* scoringClauses[] = {&score2, &score3};
+  BooleanQuery scoring({}, scoringClauses, {}, {});
+  MemPool scoringPool;
+  Query::Context scoringContext(scoringPool, *testIndex.reader);
+  EXPECT_EQ(2u, scoring.compiledPlanForTest(scoringContext).optional.size());
+
+  // Membership roles dedup by the same equality: differing constants stay
+  // apart, equal wrappers drop.
+  Query* filterClauses[] = {&score2, &score3};
+  BooleanQuery membership({}, {}, {}, filterClauses);
+  MemPool membershipPool;
+  Query::Context membershipContext(membershipPool, *testIndex.reader);
+  EXPECT_EQ(2u,
+            membership.compiledPlanForTest(membershipContext).filter.size());
+  ConstantScoreQuery score2Again(&a2, 2.0f);
+  Query* equalFilterClauses[] = {&score2, &score2Again};
+  BooleanQuery equalMembership({}, {}, {}, equalFilterClauses);
+  MemPool equalPool;
+  Query::Context equalContext(equalPool, *testIndex.reader);
+  EXPECT_EQ(1u, equalMembership.compiledPlanForTest(equalContext).filter.size());
+
+  TermQuery rankB("body_w", "b");
+  TermQuery rankC("body_w", "c");
+  Query* required1[] = {&a1};
+  Query* required2[] = {&a2};
+  Query* optional1[] = {&rankB};
+  Query* optional2[] = {&rankC};
+  BooleanQuery withRankB(required1, optional1, {}, {}, 0);
+  BooleanQuery withRankC(required2, optional2, {}, {}, 0);
+  Query* nestedClauses[] = {&withRankB, &withRankC};
+  BooleanQuery nested({}, nestedClauses, {}, {});
+  MemPool nestedPool;
+  Query::Context nestedContext(nestedPool, *testIndex.reader);
+  EXPECT_EQ(2u, nested.compiledPlanForTest(nestedContext).optional.size());
 }

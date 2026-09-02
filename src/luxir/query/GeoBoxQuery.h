@@ -53,6 +53,24 @@ public:
     if (minLon <= maxLon && maxLongitude < minLongitude) empty = true;
   }
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const GeoBoxQuery*>(&other);
+    return rhs != nullptr && field == rhs->field
+        && minLatitude == rhs->minLatitude
+        && maxLatitude == rhs->maxLatitude
+        && minLongitude == rhs->minLongitude
+        && maxLongitude == rhs->maxLongitude && empty == rhs->empty;
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, minLatitude);
+    value = mixHash(value, maxLatitude);
+    value = mixHash(value, minLongitude);
+    value = mixHash(value, maxLongitude);
+    return mixHash(value, empty);
+  }
+
   std::string_view getField() const { return field; }
   int32_t getMinLatitude() const { return minLatitude; }
   int32_t getMaxLatitude() const { return maxLatitude; }

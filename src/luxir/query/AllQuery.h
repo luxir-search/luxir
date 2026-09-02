@@ -13,6 +13,12 @@ public:
 
   AllQuery() {}
 
+  bool equals(const Query& other) const override {
+    return dynamic_cast<const AllQuery*>(&other) != nullptr;
+  }
+
+  uint64_t hashImpl() const override { return Query::hashImpl(); }
+
   ScoreProfile scoreProfile() const override {
     return ScoreProfile::automatic(1.0f);
   }

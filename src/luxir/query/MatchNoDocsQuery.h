@@ -11,6 +11,12 @@ class MatchNoDocsQuery final : public luxir::Query {
 public:
   MatchNoDocsQuery() {}
 
+  bool equals(const Query& other) const override {
+    return dynamic_cast<const MatchNoDocsQuery*>(&other) != nullptr;
+  }
+
+  uint64_t hashImpl() const override { return Query::hashImpl(); }
+
   bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   bool directCountAvailable(IndexReader& reader) const override {

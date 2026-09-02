@@ -394,6 +394,17 @@ TEST_F(BooleanNormalizeTest, requiredInlineGatesMandatoryOptionalsAndMinMatch) {
   auto constrainingView = shape(constrainingOuter);
   EXPECT_EQ(2, constrainingView.mandatoryCount);
   EXPECT_EQ(0u, constrainingView.ruleMask & BooleanQuery::R1_REQUIRED_INLINE);
+
+  Query* constrainingOuterOptional[] = {&root};
+  Query* constrainingOuterRequired[] = {&rankOnly};
+  BooleanQuery outerMinMatch(constrainingOuterRequired,
+                             constrainingOuterOptional, {}, {}, 1);
+  auto outerMinMatchView = shape(outerMinMatch);
+  EXPECT_EQ(1, outerMinMatchView.mandatoryCount);
+  EXPECT_EQ(std::type_index(typeid(BooleanQuery)),
+            outerMinMatchView.mandatoryTypes[0]);
+  EXPECT_EQ(0u, outerMinMatchView.ruleMask
+                    & BooleanQuery::R1_REQUIRED_INLINE);
 }
 
 TEST_F(BooleanNormalizeTest, filterInlineDropsRankOnlyOptionalsButKeepsMinMatchOpaque) {

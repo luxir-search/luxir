@@ -155,6 +155,20 @@ class ConstantScoreQuery final : public luxir::Query {
 public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const ConstantScoreQuery*>(&other);
+    return rhs != nullptr
+        && std::bit_cast<uint32_t>(constantScore)
+            == std::bit_cast<uint32_t>(rhs->constantScore)
+        && child->equals(*rhs->child);
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(
+        Query::hashImpl(), std::bit_cast<uint32_t>(constantScore));
+    return mixHash(value, child->hash());
+  }
+
   Query* getChild() const { return child; }
   VerificationWork membershipVerificationWork() const override {
     return child->membershipVerificationWork();

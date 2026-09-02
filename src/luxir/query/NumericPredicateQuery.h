@@ -47,6 +47,39 @@ public:
            == exactValues.end());
   }
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const NumericPredicateQuery*>(&other);
+    if (rhs == nullptr || field != rhs->field
+        || envelope.lo != rhs->envelope.lo || envelope.hi != rhs->envelope.hi
+        || exactValues.size() != rhs->exactValues.size()
+        || exactIntervals.size() != rhs->exactIntervals.size()
+        || !std::equal(exactValues.begin(), exactValues.end(),
+                       rhs->exactValues.begin())) {
+      return false;
+    }
+    return std::equal(
+        exactIntervals.begin(), exactIntervals.end(),
+        rhs->exactIntervals.begin(),
+        [](const PointsReader::ValueRange& a,
+           const PointsReader::ValueRange& b) {
+          return a.lo == b.lo && a.hi == b.hi;
+        });
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, envelope.lo);
+    value = mixHash(value, envelope.hi);
+    value = mixHash(value, exactValues.size());
+    for (int64_t exact : exactValues) value = mixHash(value, exact);
+    value = mixHash(value, exactIntervals.size());
+    for (const auto& interval : exactIntervals) {
+      value = mixHash(value, interval.lo);
+      value = mixHash(value, interval.hi);
+    }
+    return value;
+  }
+
   std::string_view getField() const { return field; }
   int64_t getLo() const { return envelope.lo; }
   int64_t getHi() const { return envelope.hi; }

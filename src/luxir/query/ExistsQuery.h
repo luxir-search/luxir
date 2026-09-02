@@ -19,6 +19,15 @@ class ExistsQuery final : public Query {
 public:
   explicit ExistsQuery(std::string_view field) : field(field) {}
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const ExistsQuery*>(&other);
+    return rhs != nullptr && field == rhs->field;
+  }
+
+  uint64_t hashImpl() const override {
+    return mixHash(Query::hashImpl(), field);
+  }
+
   std::string_view getField() const { return field; }
   ScoreProfile scoreProfile() const override {
     return ScoreProfile::automatic(1.0f);

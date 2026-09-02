@@ -11,6 +11,9 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string_view>
+#include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 #include <luxir/util/heap.h>
@@ -299,37 +302,26 @@ inline constexpr int64_t kMaskFilterDensityInverse = 256;
 
 class Query {
   // Context memos must distinguish successive stack Query objects that reuse
-  // an address. Copies and moves are new logical objects and start unassigned.
+  // an address, so the identity comes from a process-wide counter on first
+  // use. Both memo slots are only reached from planning (createWeight and
+  // logical plans), which runs single-threaded per request, so plain members
+  // suffice; a default copy of a planned query shares its memo identity and
+  // its structural hash, which is correct because the copy has the same
+  // structure and the same non-owning clause pointers.
   inline static std::atomic<uint64_t> nextRequestMemoIdentity{1};
-  mutable std::atomic<uint64_t> requestMemoIdentity{0};
+  mutable uint64_t requestMemoIdentity = 0;
+  mutable uint64_t cachedHash = 0;
 
   uint64_t getRequestMemoIdentity() const {
-    uint64_t identity = requestMemoIdentity.load(std::memory_order_relaxed);
-    if (identity != 0) return identity;
-
-    uint64_t proposed = nextRequestMemoIdentity.fetch_add(
-        1, std::memory_order_relaxed);
-    assert(proposed != 0);
-    if (requestMemoIdentity.compare_exchange_strong(
-            identity, proposed, std::memory_order_relaxed)) {
-      return proposed;
+    if (requestMemoIdentity == 0) {
+      requestMemoIdentity = nextRequestMemoIdentity.fetch_add(
+          1, std::memory_order_relaxed);
+      assert(requestMemoIdentity != 0);
     }
-    return identity;
+    return requestMemoIdentity;
   }
 
 public:
-  Query() = default;
-  Query(const Query&) noexcept {}
-  Query(Query&&) noexcept {}
-  Query& operator=(const Query&) noexcept {
-    requestMemoIdentity.store(0, std::memory_order_relaxed);
-    return *this;
-  }
-  Query& operator=(Query&&) noexcept {
-    requestMemoIdentity.store(0, std::memory_order_relaxed);
-    return *this;
-  }
-
   class PlanningContext;
   class Context;
   class Weight;
@@ -596,15 +588,66 @@ protected:
     checkedBoostProduct(multiplier, 1.0f);
   }
 
+  template <typename T>
+  static uint64_t mixHash(uint64_t seed, T value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    return Hash::hash(&value, sizeof(value), seed);
+  }
+
+  static uint64_t mixHash(uint64_t seed, std::string_view value) {
+    return Hash::hash(value.data(), value.size(), seed);
+  }
+
+  virtual uint64_t hashImpl() const {
+    std::string_view name = typeid(*this).name();
+    return Hash::hash(name.data(), name.size());
+  }
+
 public:
 
   // Structural membership key: the filter projection of this query, with
-  // score-only state omitted. Consumers that need query identity, such as a
-  // future request cache, must not reuse this method. Queries whose membership
-  // depends on scores must return UNCACHEABLE. Every concrete query must make
-  // an explicit cacheability decision.
+  // score-only state omitted. Consumers that need query identity must use
+  // equals() and hash(). Queries whose membership depends on scores must
+  // return UNCACHEABLE. Every concrete query must make an explicit
+  // cacheability decision.
   virtual FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                          const FilterKeyContext& ctx) const = 0;
+
+  // Scoring identity splits a clause into the boost it carries and the core
+  // that boost scales: BoostQuery wrappers and TermQuery's inline boost peel
+  // off. Equality and hashing consumers must use sameScoringClause() and
+  // scoringClauseHash() when the boost contributes to identity.
+  virtual Query* peelBoost(float& boost) {
+    unused(boost);
+    return this;
+  }
+
+  virtual bool equals(const Query& other) const {
+    unused(other);
+    return false;
+  }
+
+  uint64_t hash() const {
+    if (cachedHash != 0) return cachedHash;
+    uint64_t value = hashImpl();
+    cachedHash = value == 0 ? 1 : value;
+    return cachedHash;
+  }
+
+  static bool sameScoringClause(Query* a, Query* b) {
+    float aBoost = 1.0f;
+    float bBoost = 1.0f;
+    Query* aCore = a->peelBoost(aBoost);
+    Query* bCore = b->peelBoost(bBoost);
+    return std::bit_cast<uint32_t>(aBoost) == std::bit_cast<uint32_t>(bBoost)
+        && aCore->equals(*bCore);
+  }
+
+  static uint64_t scoringClauseHash(Query* query) {
+    float boost = 1.0f;
+    Query* core = query->peelBoost(boost);
+    return mixHash(core->hash(), std::bit_cast<uint32_t>(boost));
+  }
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.

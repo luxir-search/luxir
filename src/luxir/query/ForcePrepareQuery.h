@@ -18,6 +18,16 @@ public:
 
   explicit ForcePrepareQuery(Query* child) : child(child) {}
 
+  bool equals(const Query& other) const override {
+    const auto* rhs = dynamic_cast<const ForcePrepareQuery*>(&other);
+    return rhs != nullptr && sameScoringClause(
+        child, rhs->child);
+  }
+
+  uint64_t hashImpl() const override {
+    return mixHash(Query::hashImpl(), scoringClauseHash(child));
+  }
+
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     child->validateLogical(context, multiplier);

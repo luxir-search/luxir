@@ -296,24 +296,25 @@ public:
     return std::holds_alternative<bool>(q.kind);
   }
 
-  static const api::Match* dedupableMatch(const api::Query& q) {
+  static const api::Query* peeledGeneratedClause(const api::Query& q) {
     const api::Query* query = &q;
     while (const auto* boost = std::get_if<api::BoostQuery>(&query->kind)) {
       if (!boost->query) return nullptr;
       query = &*boost->query;
     }
-    const auto* m = std::get_if<api::Match>(&query->kind);
-    if (m == nullptr || !m->val.has_value()
-        || !std::holds_alternative<std::string_view>(m->val->kind)) {
-      return nullptr;
-    }
-    return m;
+    return query;
   }
 
-  static bool sameMatchIdentity(const api::Match& lhs, const api::Match& rhs) {
-    return lhs.field == rhs.field
-        && std::get<std::string_view>(lhs.val->kind)
-           == std::get<std::string_view>(rhs.val->kind);
+  static bool sameGeneratedScoringIdentity(const api::Query& lhs,
+                                           const api::Query& rhs) {
+    const api::Query* lhsCore = peeledGeneratedClause(lhs);
+    const api::Query* rhsCore = peeledGeneratedClause(rhs);
+    if (lhsCore == nullptr || rhsCore == nullptr) return false;
+    // genBool emits analyzed string matches, exact phrases with default
+    // positions/slop, and nested Booleans. It emits no internal score wrappers
+    // or other query state, so its full structural summary is a complete
+    // scoring identity after top-level BoostQuery peeling.
+    return querySummary(*lhsCore) == querySummary(*rhsCore);
   }
 
   static std::vector<const api::Query*> dedupOptionalOracle(std::span<const api::Query> clauses,
@@ -323,13 +324,10 @@ public:
     for (size_t i = 0; i < clauses.size(); i++) {
       if (consumed[i]) continue;
       const api::Query* q = &clauses[i];
-      if (const auto* m = dedupableMatch(*q)) {
-        for (size_t j = i + 1; j < clauses.size(); j++) {
-          if (consumed[j]) continue;
-          const auto* other = dedupableMatch(clauses[j]);
-          if (other != nullptr && sameMatchIdentity(*m, *other)) {
-            consumed[j] = true;
-          }
+      for (size_t j = i + 1; j < clauses.size(); j++) {
+        if (consumed[j]) continue;
+        if (sameGeneratedScoringIdentity(*q, clauses[j])) {
+          consumed[j] = true;
         }
       }
       out.push_back(q);

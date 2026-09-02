@@ -337,14 +337,14 @@ filter clause is present; set `min_match` to make the optional group a real
 constraint ("at least N of these"). With only optional clauses, at least
 one must match.
 
-Duplicate optional terms are merged into a single weighted clause, and
+Duplicate optional clauses are merged into a single weighted clause, and
 `min_match` adjusts by the intent its value expresses. A `min_match` above
-half the terms ("10 words, `min_match=9`") is a miss budget - you allowed
+half the clauses ("10 clauses, `min_match=9`") is a miss budget - you allowed
 one absence - so each merged-away duplicate decrements it (never below 1),
-and a document containing the duplicated term matches exactly as if the
-duplicates were kept. A `min_match` at or below half ("10 words,
+and a document matching the duplicated clause behaves exactly as if the
+duplicates were kept. A `min_match` at or below half ("10 clauses,
 `min_match=2`") means "match at least that many distinct words" and stays
-as-is, capped at the number of distinct terms. Either way, `min_match`
+as-is, capped at the number of distinct clauses. Either way, `min_match`
 computed from raw token counts (for example, a percentage of pasted text)
 behaves sensibly when the text repeats words.
 
