@@ -54,36 +54,12 @@ public:
     if (minLon <= maxLon && maxLongitude < minLongitude) empty = true;
   }
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const GeoBoxQuery&>(other);
-    return field == rhs.field && minLatitude == rhs.minLatitude
-        && maxLatitude == rhs.maxLatitude
-        && minLongitude == rhs.minLongitude
-        && maxLongitude == rhs.maxLongitude && empty == rhs.empty;
-  }
-
-  uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), field);
-    value = mixHash(value, minLatitude);
-    value = mixHash(value, maxLatitude);
-    value = mixHash(value, minLongitude);
-    value = mixHash(value, maxLongitude);
-    return mixHash(value, empty);
-  }
-
   std::string_view getField() const { return field; }
   int32_t getMinLatitude() const { return minLatitude; }
   int32_t getMaxLatitude() const { return maxLatitude; }
   int32_t getMinLongitude() const { return minLongitude; }
   int32_t getMaxLongitude() const { return maxLongitude; }
   bool isEmpty() const { return empty; }
-  ScoreProfile scoreProfile() const override {
-    return ScoreProfile::automatic(1.0f);
-  }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
-
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

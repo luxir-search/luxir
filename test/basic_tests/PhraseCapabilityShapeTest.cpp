@@ -7,6 +7,7 @@
 
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/query/TermQuery.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
@@ -78,7 +79,7 @@ TEST_F(PhraseCapabilityShapeTest,
   std::array<Query*, 2> phraseRequired{&phrase, &rare};
   BooleanQuery phraseConjunction(phraseRequired, {}, {}, {});
   EXPECT_EQ(Query::VerificationWork::PRESENT,
-            phraseConjunction.membershipVerificationWork());
+            membershipVerificationWork(phraseConjunction));
 
   Query::Context phraseContext(pool, *reader);
   auto* phraseWeight = phraseConjunction.createWeight(phraseContext, 0);
@@ -96,7 +97,7 @@ TEST_F(PhraseCapabilityShapeTest,
   std::array<Query*, 2> phraseOptional{&phrase, &rare};
   BooleanQuery phraseDisjunction({}, phraseOptional, {}, {});
   EXPECT_EQ(Query::VerificationWork::PARTIAL,
-            phraseDisjunction.membershipVerificationWork());
+            membershipVerificationWork(phraseDisjunction));
   Query::Context disjunctionContext(pool, *reader);
   auto* disjunctionWeight = phraseDisjunction.createWeight(
       disjunctionContext, 0);
@@ -113,7 +114,7 @@ TEST_F(PhraseCapabilityShapeTest,
   std::array<Query*, 2> termRequired{&common, &rare};
   BooleanQuery termConjunction(termRequired, {}, {}, {});
   EXPECT_EQ(Query::VerificationWork::ABSENT,
-            termConjunction.membershipVerificationWork());
+            membershipVerificationWork(termConjunction));
   Query::Context termContext(pool, *reader);
   auto* termWeight = termConjunction.createWeight(termContext, 0);
   auto* termSupplier = termWeight->scorerSupplier(

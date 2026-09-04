@@ -24,6 +24,7 @@
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryBuilder.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/Overloaded.h"
@@ -1468,7 +1469,7 @@ public:
     if (allowPruning) {
       requestFlags |= Query::ALLOW_PRUNING;
     }
-    Query::ScoreProfile scoreProfile = query->scoreProfile();
+    Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
     bool exactCountTopK = requirements.needRankedDocs
         && requirements.needExactCount && !requirements.needExactDomain
         && !parsedSorts.useFieldSort
@@ -1479,8 +1480,8 @@ public:
         && (foldFilters || filters.empty());
     FilterCache::Use* cacheFirstMembershipUse = nullptr;
     auto* cache = req.reader->filterCache();
-    if (pureCountShape && query->canOmitWeightForCacheFirstMembership()
-        && !query->directCountAvailable(*req.reader)
+    if (pureCountShape && canOmitWeightForCacheFirstMembership(*query)
+        && !directCountAvailable(*query, *req.reader)
         && cache != nullptr && cache->enabled()) {
       auto candidate = planningContext->lookupExistingFilterUse(
           *query, placement == TopDocsPlacement::ROOT_OP);
@@ -1498,8 +1499,8 @@ public:
         && placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
         && exactCountTopK && (foldFilters || filters.empty())
-        && query->canOmitWeightForCacheFirstMembership()
-        && !query->directCountAvailable(*req.reader)
+        && canOmitWeightForCacheFirstMembership(*query)
+        && !directCountAvailable(*query, *req.reader)
         && cache != nullptr && cache->enabled()) {
       auto candidate = planningContext->lookupExistingFilterUse(*query, true);
       if (candidate.has_value()) {
@@ -1525,7 +1526,7 @@ public:
         && (!requirements.needRankedDocs || constantExactDomainRanking)
         && cache != nullptr && cache->enabled();
     if (canOmitForExactDomain) {
-      bool domainIdentity = domainQuery->exactDomainIdentity();
+      bool domainIdentity = exactDomainIdentity(*domainQuery);
       auto sourceQueries = req.requestPool.make_span<Query*>(
           (size_t)!domainIdentity + filters.size());
       size_t sourceIndex = 0;
@@ -1533,12 +1534,12 @@ public:
       if (!domainIdentity) {
         sourceQueries[sourceIndex++] = domainQuery;
         allOmittable =
-            domainQuery->canOmitWeightForCacheFirstMembership();
+            canOmitWeightForCacheFirstMembership(*domainQuery);
       }
       for (size_t i = 0; i < filters.size(); i++) {
         sourceQueries[sourceIndex++] = filters[i].query;
         allOmittable &=
-            filters[i].query->canOmitWeightForCacheFirstMembership();
+            canOmitWeightForCacheFirstMembership(*filters[i].query);
       }
       if (allOmittable && !sourceQueries.empty()) {
         bool allowReaderStable = sourceQueries.size() == 1;
@@ -1565,7 +1566,7 @@ public:
         && (requestFlags & Query::NEED_SCORES) == 0
         && !requirements.needExactDomain
         && (foldFilters || filters.empty())
-        && query->canOmitWeightForCacheFirstMembership()
+        && canOmitWeightForCacheFirstMembership(*query)
         && cache != nullptr && cache->enabled();
     if (cacheFirstFieldSortShape) {
       auto fieldSortPreflight =

@@ -134,16 +134,21 @@ private:
                                                 bool allowConstantScore) {
     float boost = 1.0f;
     while (true) {
-      if (query->getKind() == QueryKind::BOOST) {
-        auto* wrapped = static_cast<BoostQuery*>(query);
-        boost = checkedBoostProduct(boost, wrapped->getBoost());
-        query = wrapped->getChild();
-        continue;
-      }
-      if (allowConstantScore
-          && query->getKind() == QueryKind::CONSTANT_SCORE) {
-        query = static_cast<ConstantScoreQuery*>(query)->getChild();
-        continue;
+      switch (query->getKind()) {
+        case QueryKind::BOOST: {
+          auto* wrapped = static_cast<BoostQuery*>(query);
+          boost = checkedBoostProduct(boost, wrapped->getBoost());
+          query = wrapped->getChild();
+          continue;
+        }
+        case QueryKind::CONSTANT_SCORE:
+          if (allowConstantScore) {
+            query = static_cast<ConstantScoreQuery*>(query)->getChild();
+            continue;
+          }
+          break;
+        default:
+          break;
       }
       break;
     }
@@ -347,7 +352,7 @@ private:
     if (plan.prohibited.empty() && plan.filter.empty()) {
       if (plan.minShouldMatch == 0 && plan.mandatory.size() == 1
           && plan.optional.empty()
-          && plan.mandatory[0]->scoreProfile().kind
+          && luxir::scoreProfile(*plan.mandatory[0]).kind
               != ScoreProfile::Kind::AUTO_UNIFORM) {
         plan.singleChild = plan.mandatory[0];
       } else if (plan.minShouldMatch <= 1 && plan.mandatory.empty()
@@ -368,7 +373,7 @@ private:
 
   static PeeledClause peelScoringClause(Query* query) {
     float boost = 1.0f;
-    Query* core = query->peelBoost(boost);
+    Query* core = luxir::peelBoost(query, boost);
     return {core, boost};
   }
 
@@ -407,7 +412,7 @@ private:
     result.slots.reserve(clauses.size());
     for (size_t i = 0; i < clauses.size(); i++) {
       PeeledClause peeled = peelScoringClause(clauses[i]);
-      uint64_t hash = peeled.core->hash();
+      uint64_t hash = queryHash(*peeled.core);
       auto found = slotByHash.find(hash);
       if (found == slotByHash.end()) {
         int32_t slot = (int32_t) result.slots.size();
@@ -419,7 +424,7 @@ private:
       DuplicateSlot& duplicate = result.slots[(size_t) slot];
       Query* representative =
           peelScoringClause(clauses[duplicate.representative]).core;
-      if (!representative->equals(*peeled.core)) continue;
+      if (!queryEquals(*representative, *peeled.core)) continue;
       if (duplicate.count == 1) {
         result.byClause[duplicate.representative] = slot;
         result.duplicateSlots++;
@@ -770,9 +775,7 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const BooleanQuery&>(other);
+  bool shapeEquals(const BooleanQuery& rhs) const {
     if (minShouldMatch != rhs.minShouldMatch
         || mandatory.size() != rhs.mandatory.size()
         || optional.size() != rhs.optional.size()
@@ -792,8 +795,8 @@ public:
         && sameList(filter, rhs.filter);
   }
 
-  uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), minShouldMatch);
+  uint64_t shapeHash() const {
+    uint64_t value = Hash::hash(&kind, sizeof(kind));
     auto mixList = [&](std::span<Query*> clauses) {
       value = mixSampledSequence(
           value, clauses,
@@ -808,12 +811,12 @@ public:
     return value;
   }
 
-  VerificationWork membershipVerificationWork() const override {
+  VerificationWork shapeMembershipVerificationWork() const {
     bool unknown = false;
     bool partial = false;
     auto summarize = [&](std::span<Query*> clauses) {
       for (Query* clause : clauses) {
-        VerificationWork work = clause->membershipVerificationWork();
+        VerificationWork work = luxir::membershipVerificationWork(*clause);
         if (work == VerificationWork::PRESENT) return true;
         partial |= work == VerificationWork::PARTIAL;
         unknown |= work == VerificationWork::UNKNOWN;
@@ -888,11 +891,11 @@ public:
                     : FieldSortConjunction::FLAT_LITERAL_CONJUNCTION;
   }
 
-  bool canOmitWeightForCacheFirstMembership() const override {
+  bool shapeCanOmitWeightForCacheFirstMembership() const {
     auto allSupported = [](std::span<Query*> clauses) {
       return std::all_of(
           clauses.begin(), clauses.end(), [](Query* clause) {
-            return clause->canOmitWeightForCacheFirstMembership();
+            return luxir::canOmitWeightForCacheFirstMembership(*clause);
           });
     };
     bool dropOptional = (!mandatory.empty() || !filter.empty())
@@ -902,13 +905,13 @@ public:
         && (dropOptional || allSupported(optional));
   }
 
-  bool directCountAvailable(IndexReader& reader) const override {
+  bool shapeDirectCountAvailable(IndexReader& reader) const {
     if (prohibited.empty() && filter.empty()) {
       if (mandatory.size() == 1 && optional.empty()) {
-        return mandatory[0]->directCountAvailable(reader);
+        return luxir::directCountAvailable(*mandatory[0], reader);
       }
       if (mandatory.empty() && optional.size() == 1) {
-        return optional[0]->directCountAvailable(reader);
+        return luxir::directCountAvailable(*optional[0], reader);
       }
       if (mandatory.empty() && optional.empty()) return true;
     }
@@ -956,14 +959,14 @@ public:
     return scope;
   }
 
-  ScoreProfile scoreProfile() const override {
+  ScoreProfile shapeScoreProfile() const {
     float sum = 0.0f;
     bool explicitScore = false;
 
     // AUTO_UNIFORM mandatory clauses are membership-only. Variable and
     // explicit mandatory clauses contribute normally.
     for (Query* clause : mandatory) {
-      ScoreProfile profile = clause->scoreProfile();
+      ScoreProfile profile = luxir::scoreProfile(*clause);
       if (profile.kind == ScoreProfile::Kind::VARIABLE) {
         return ScoreProfile::variable();
       }
@@ -987,7 +990,7 @@ public:
       // A non-zero optional contribution is data-dependent unless every
       // optional must match. Zero-uniform optionals do not affect the sum.
       for (Query* clause : optional) {
-        ScoreProfile profile = clause->scoreProfile();
+        ScoreProfile profile = luxir::scoreProfile(*clause);
         if (profile.kind == ScoreProfile::Kind::VARIABLE
             || profile.value != 0.0f) {
           return ScoreProfile::variable();
@@ -999,7 +1002,7 @@ public:
     }
 
     for (Query* clause : optional) {
-      ScoreProfile profile = clause->scoreProfile();
+      ScoreProfile profile = luxir::scoreProfile(*clause);
       if (profile.kind == ScoreProfile::Kind::VARIABLE) {
         return ScoreProfile::variable();
       }
@@ -1159,7 +1162,7 @@ public:
       bool parentNeedsScores = (flags & NEED_SCORES) != 0;
       for (size_t i = 0; i < queries.size(); i++) {
         bool contributes = parentNeedsScores
-            && queries[i]->scoreProfile().kind
+            && luxir::scoreProfile(*queries[i]).kind
                 != ScoreProfile::Kind::AUTO_UNIFORM;
         mandatoryScores[i] = contributes ? 1 : 0;
         mandatoryWeights[i] = queries[i]->createWeight(
@@ -5027,7 +5030,7 @@ public:
           Query::Weight* prohibitedWeight = prohibitedWeights[clause];
           if (prohibitedWeight->matchesAllDocs()) continue;
           Query::VerificationWork verificationWork =
-              prohibitedClauses[clause]->membershipVerificationWork();
+              luxir::membershipVerificationWork(*prohibitedClauses[clause]);
           bool verificationBearing =
               verificationWork == Query::VerificationWork::PRESENT
               || verificationWork == Query::VerificationWork::PARTIAL;
@@ -12469,3 +12472,7 @@ public:
 };
 
 } // namespace luxir
+
+// Boolean shape helpers above call the free dispatch functions.
+// Include guards make this safe when QueryShape.h includes BooleanQuery.h.
+#include "QueryShape.h"

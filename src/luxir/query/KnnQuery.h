@@ -286,43 +286,6 @@ public:
       nprobe(nprobe), refineCandidates(refineCandidates),
       minScanFraction(minScanFraction), exact(exact) {}
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const KnnQuery&>(other);
-    return field == rhs.field && k == rhs.k
-        && nprobe == rhs.nprobe
-        && refineCandidates == rhs.refineCandidates
-        && std::bit_cast<uint32_t>(minScanFraction)
-            == std::bit_cast<uint32_t>(rhs.minScanFraction)
-        && exact == rhs.exact && queryVec.size() == rhs.queryVec.size()
-        && fieldType.dims() == rhs.fieldType.dims()
-        && fieldType.metric() == rhs.fieldType.metric()
-        && fieldType.normalized() == rhs.fieldType.normalized()
-        && fieldType.normalizeOnWrite()
-            == rhs.fieldType.normalizeOnWrite()
-        && (queryVec.empty()
-            || memcmp(queryVec.data(), rhs.queryVec.data(),
-                      queryVec.size_bytes()) == 0);
-  }
-
-  uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), field);
-    value = mixHash(value, k);
-    value = mixHash(value, nprobe);
-    value = mixHash(value, refineCandidates);
-    value = mixHash(value, std::bit_cast<uint32_t>(minScanFraction));
-    value = mixHash(value, exact);
-    value = mixSampledSequence(
-        value, std::as_bytes(queryVec),
-        [](uint64_t seed, std::byte byte) {
-          return mixHash(seed, byte);
-        });
-    value = mixHash(value, fieldType.dims());
-    value = mixHash(value, (int32_t) fieldType.metric());
-    value = mixHash(value, fieldType.normalized());
-    return mixHash(value, fieldType.normalizeOnWrite());
-  }
-
   std::string_view getField() const noexcept { return field; }
   const VectorFieldType& getFieldType() const noexcept { return fieldType; }
   std::span<const float> getQueryVec() const noexcept { return queryVec; }
@@ -331,8 +294,6 @@ public:
   int32_t getRefineCandidates() const noexcept { return refineCandidates; }
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {

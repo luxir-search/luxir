@@ -19,15 +19,7 @@ public:
   explicit ForcePrepareQuery(Query* child)
     : Query(QueryKind::FORCE_PREPARE), child(child) {}
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const ForcePrepareQuery&>(other);
-    return sameScoringClause(child, rhs.child);
-  }
-
-  uint64_t hashImpl() const override {
-    return mixHash(Query::hashImpl(), scoringClauseHash(child));
-  }
+  Query* getChild() const { return child; }
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -37,10 +29,6 @@ public:
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
-  }
-
-  bool exactDomainIdentity() const override {
-    return child->exactDomainIdentity();
   }
 
   Weight* createWeight(Context& context, int32_t flags,

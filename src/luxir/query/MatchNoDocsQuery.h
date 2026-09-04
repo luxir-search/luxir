@@ -11,19 +11,6 @@ class MatchNoDocsQuery final : public luxir::Query {
 public:
   MatchNoDocsQuery() : Query(QueryKind::NONE) {}
 
-  bool equals(const Query& other) const override {
-    return other.getKind() == kind;
-  }
-
-  uint64_t hashImpl() const override { return Query::hashImpl(); }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
-
-  bool directCountAvailable(IndexReader& reader) const override {
-    unused(reader);
-    return true;
-  }
-
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

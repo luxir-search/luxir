@@ -21,40 +21,12 @@ public:
     }
   }
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const BoostQuery&>(other);
-    return sameScoringClause(const_cast<BoostQuery*>(this),
-                             const_cast<BoostQuery*>(&rhs));
-  }
-
-  uint64_t hashImpl() const override {
-    return mixHash(Query::hashImpl(),
-                   scoringClauseHash(const_cast<BoostQuery*>(this)));
-  }
-
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
-
-  VerificationWork membershipVerificationWork() const override {
-    return child->membershipVerificationWork();
-  }
 
   FieldSortConjunction fieldSortConjunction(
       PlanningContext& context) const override {
     return child->fieldSortConjunction(context);
-  }
-
-  bool canOmitWeightForCacheFirstMembership() const override {
-    return child->canOmitWeightForCacheFirstMembership();
-  }
-
-  bool directCountAvailable(IndexReader& reader) const override {
-    return child->directCountAvailable(reader);
-  }
-
-  bool exactDomainIdentity() const override {
-    return child->exactDomainIdentity();
   }
 
   void validateLogicalImpl(
@@ -63,25 +35,9 @@ public:
         context, checkedBoostProduct(multiplier, boost));
   }
 
-  Query* peelBoost(float& boost) override {
-    boost = checkedBoostProduct(boost, this->boost);
-    return child->peelBoost(boost);
-  }
-
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
-  }
-
-  // A boost is a pure multiplier: it scales the child's uniform value but
-  // never changes its kind, so a boosted automatic constant is still
-  // suppressed in required position. constant_score (^=) is the opt-in for
-  // a constant that scores everywhere.
-  ScoreProfile scoreProfile() const override {
-    ScoreProfile profile = child->scoreProfile();
-    if (profile.kind == ScoreProfile::Kind::VARIABLE) return profile;
-    profile.value *= boost;
-    return profile;
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,

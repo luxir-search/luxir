@@ -43,21 +43,6 @@ public:
         injectedTermStats(injectedTermStats), boost(boost),
         useFrontierBound(useFrontierBound), hasInjectedTermStats(true) {}
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const TermQuery&>(other);
-    return !hasInjectedTermStats && !rhs.hasInjectedTermStats
-        && field == rhs.field && term == rhs.term
-        && useFrontierBound == rhs.useFrontierBound;
-  }
-
-  uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), field);
-    value = mixHash(value, term);
-    value = mixHash(value, useFrontierBound);
-    return mixHash(value, hasInjectedTermStats);
-  }
-
   std::string_view getField() const {
     return field;
   }
@@ -78,29 +63,10 @@ public:
     return hasInjectedTermStats;
   }
 
-  VerificationWork membershipVerificationWork() const override {
-    return VerificationWork::ABSENT;
-  }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
-
-  bool directCountAvailable(IndexReader& reader) const override {
-    return std::none_of(
-        reader.segments().begin(), reader.segments().end(),
-        [](const IndexReader::Segment& segment) {
-          return segment.liveDocs() != nullptr;
-        });
-  }
-
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     unused(context);
     checkedBoostProduct(multiplier, boost);
-  }
-
-  Query* peelBoost(float& boost) override {
-    boost = checkedBoostProduct(boost, this->boost);
-    return this;
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

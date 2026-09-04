@@ -157,36 +157,11 @@ public:
     : Query(QueryKind::CONSTANT_SCORE), child(child),
       constantScore(constantScore) {}
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const ConstantScoreQuery&>(other);
-    return std::bit_cast<uint32_t>(constantScore)
-            == std::bit_cast<uint32_t>(rhs.constantScore)
-        && child->equals(*rhs.child);
-  }
-
-  uint64_t hashImpl() const override {
-    uint64_t value = mixHash(
-        Query::hashImpl(), std::bit_cast<uint32_t>(constantScore));
-    return mixHash(value, child->hash());
-  }
-
   Query* getChild() const { return child; }
-  VerificationWork membershipVerificationWork() const override {
-    return child->membershipVerificationWork();
-  }
+  float getConstantScore() const { return constantScore; }
   FieldSortConjunction fieldSortConjunction(
       PlanningContext& context) const override {
     return child->fieldSortConjunction(context);
-  }
-  bool canOmitWeightForCacheFirstMembership() const override {
-    return child->canOmitWeightForCacheFirstMembership();
-  }
-  bool directCountAvailable(IndexReader& reader) const override {
-    return child->directCountAvailable(reader);
-  }
-  bool exactDomainIdentity() const override {
-    return child->exactDomainIdentity();
   }
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -200,10 +175,6 @@ public:
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
   }
-  ScoreProfile scoreProfile() const override {
-    return ScoreProfile::explicitUniform(constantScore);
-  }
-
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override {
     return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,

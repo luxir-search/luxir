@@ -9,7 +9,6 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
-#include "BooleanQuery.h"
 #include "MatchNoDocsQuery.h"
 #include "Query.h"
 #include "TermQuery.h"
@@ -82,33 +81,12 @@ public:
       maxEdits(maxEdits),
       prefixLength(std::min(prefixLength, (int)term.size())), maxExpansions(maxExpansions) {}
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const FuzzyQuery&>(other);
-    return field == rhs.field && term == rhs.term
-        && maxEdits == rhs.maxEdits && prefixLength == rhs.prefixLength
-        && maxExpansions == rhs.maxExpansions
-        && std::bit_cast<uint32_t>(boost)
-            == std::bit_cast<uint32_t>(rhs.boost);
-  }
-
-  uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), field);
-    value = mixHash(value, term);
-    value = mixHash(value, maxEdits);
-    value = mixHash(value, prefixLength);
-    value = mixHash(value, maxExpansions);
-    return mixHash(value, std::bit_cast<uint32_t>(boost));
-  }
-
   std::string_view getField() const { return field; }
   float getBoost() const { return boost; }
   std::string_view getTerm() const { return term; }
   int getMaxEdits() const { return maxEdits; }
   int getPrefixLength() const { return prefixLength; }
   int getMaxExpansions() const { return maxExpansions; }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -186,48 +164,60 @@ private:
   // on-by-default typo handling because misspellings are rare; blending makes
   // edit-distance damp the intended separator. (Stats and damped boosts only
   // matter when the request needs scores; the clause set is the same either way.)
-  Query* rewriteToDisjunction(Context& context) const {
-    CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(getField());
-    if (cachedFieldInfo == nullptr) return context.pool.make<MatchNoDocsQuery>();
-
-    MemPool scratch;
-    auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
-    truncateCandidates(context, candidates);
-    if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
-
-    Similarity::TermStats blendedStats = {};
-    for (const ExpansionCandidate& candidate : candidates) {
-      blendedStats.docFreq = std::max(blendedStats.docFreq, candidate.termStats.docFreq);
-      blendedStats.totalTermFreq = std::max(blendedStats.totalTermFreq,
-                                            candidate.termStats.totalTermFreq);
-    }
-
-    auto* clauses = context.pool.make_arr<Query*>(candidates.size());
-    for (size_t i = 0; i < candidates.size(); i++) {
-      const ExpansionCandidate& candidate = candidates[i];
-      std::string_view termCopy = copyTerm(context.pool, candidate.term);
-      clauses[i] = context.pool.make<TermQuery>(
-          getField(), termCopy, blendedStats, getBoost() * candidate.damp);
-    }
-
-    return context.pool.make<BooleanQuery>(
-        std::span<Query*>{}, std::span<Query*>(clauses, candidates.size()),
-        std::span<Query*>{}, std::span<Query*>{});
-  }
+  Query* rewriteToDisjunction(Context& context) const;
 
 public:
   // The expansion set is selected here, independent of `flags`: NEED_SCORES
   // decides only whether the kept clauses score, never which docs match.
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    Query* rewritten = rewriteToDisjunction(context);
-#ifndef NDEBUG
-    if (context.logicalValidationActive()) {
-      rewritten->validateLogical(context.planningContext(), multiplier);
-    }
-#endif
-    return rewritten->createWeight(context, flags, multiplier);
-  }
+                              float multiplier = 1.0f) override;
 };
+
+} // namespace luxir
+
+#include "BooleanQuery.h"
+
+namespace luxir {
+
+inline Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
+  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(getField());
+  if (cachedFieldInfo == nullptr) return context.pool.make<MatchNoDocsQuery>();
+
+  MemPool scratch;
+  auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
+  truncateCandidates(context, candidates);
+  if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
+
+  Similarity::TermStats blendedStats = {};
+  for (const ExpansionCandidate& candidate : candidates) {
+    blendedStats.docFreq = std::max(
+        blendedStats.docFreq, candidate.termStats.docFreq);
+    blendedStats.totalTermFreq = std::max(
+        blendedStats.totalTermFreq, candidate.termStats.totalTermFreq);
+  }
+
+  auto* clauses = context.pool.make_arr<Query*>(candidates.size());
+  for (size_t i = 0; i < candidates.size(); i++) {
+    const ExpansionCandidate& candidate = candidates[i];
+    std::string_view termCopy = copyTerm(context.pool, candidate.term);
+    clauses[i] = context.pool.make<TermQuery>(
+        getField(), termCopy, blendedStats, getBoost() * candidate.damp);
+  }
+
+  return context.pool.make<BooleanQuery>(
+      std::span<Query*>{}, std::span<Query*>(clauses, candidates.size()),
+      std::span<Query*>{}, std::span<Query*>{});
+}
+
+inline Query::Weight* FuzzyQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  Query* rewritten = rewriteToDisjunction(context);
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
+}
 
 } // namespace luxir

@@ -396,26 +396,10 @@ public:
     : Query(QueryKind::RESCORE), child(child), program(program),
       constantOutput(constantOutput) {}
 
-  bool equals(const Query& other) const override {
-    unused(other);
-    return false;
-  }
-
-  uint64_t hashImpl() const override { return Query::hashImpl(); }
-
   Query* getChild() const { return child; }
   ValueProgram& getProgram() const { return *program; }
-
-  bool canOmitWeightForCacheFirstMembership() const override {
-    return child->canOmitWeightForCacheFirstMembership();
-  }
-
-  bool directCountAvailable(IndexReader& reader) const override {
-    return child->directCountAvailable(reader);
-  }
-
-  bool exactDomainIdentity() const override {
-    return child->exactDomainIdentity();
+  const std::optional<float>& getConstantOutput() const {
+    return constantOutput;
   }
 
   void validateLogicalImpl(
@@ -430,12 +414,6 @@ public:
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
-  }
-
-  ScoreProfile scoreProfile() const override {
-    return constantOutput.has_value()
-        ? ScoreProfile::explicitUniform(*constantOutput)
-        : ScoreProfile::variable();
   }
 
   Weight* createWeight(Context& context, int32_t flags,

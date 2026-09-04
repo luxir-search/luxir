@@ -291,10 +291,6 @@ public:
     child.validateLogical(context, multiplier);
   }
 
-  ScoreProfile scoreProfile() const override {
-    return child.scoreProfile();
-  }
-
   FilterKeyScope appendFilterKey(
       FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -349,10 +345,6 @@ public:
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     child.validateLogical(context, multiplier);
-  }
-
-  ScoreProfile scoreProfile() const override {
-    return child.scoreProfile();
   }
 
   FilterKeyScope appendFilterKey(

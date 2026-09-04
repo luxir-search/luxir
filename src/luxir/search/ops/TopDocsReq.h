@@ -8,6 +8,7 @@
 #include <functional>
 #include "SearchOp.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/SkipStats.h"
@@ -203,7 +204,7 @@ public:
       const SortPlan& sortPlan, int64_t topCount,
       bool allowReaderStable) {
     Query::VerificationWork verification =
-        query.membershipVerificationWork();
+        membershipVerificationWork(query);
     bool verificationRoute =
         verification == Query::VerificationWork::PRESENT;
     bool numericBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
@@ -262,7 +263,7 @@ public:
     assert(routes.size() == reader.segments().size());
     bool canUseBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
     if (!canUseBestFirst) {
-      bool routed = query.membershipVerificationWork()
+      bool routed = membershipVerificationWork(query)
           == Query::VerificationWork::PRESENT;
       std::fill(routes.begin(), routes.end(), (uint8_t)routed);
       return routed;

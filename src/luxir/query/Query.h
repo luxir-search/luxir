@@ -335,9 +335,10 @@ protected:
   Query() = delete;
 
 private:
-  // Structural hash, computed once by hash(). Only planning reaches it, and
+  // Structural hash, computed once by queryHash(). Only planning reaches it, and
   // planning runs single-threaded per request; a default copy carries it.
   mutable uint64_t cachedHash = 0;
+  friend uint64_t queryHash(const Query& query);
 #ifndef NDEBUG
   // Set on nodes the planner creates after logical validation (merged
   // clauses, boost wrappers, the match-all seed) so the validation
@@ -571,38 +572,11 @@ public:
     }
   };
 
-  // Unknown and custom queries are conservatively variable-scoring.
-  virtual ScoreProfile scoreProfile() const { return ScoreProfile::variable(); }
-
-  // Query-tree fact used when the consumer cannot gain a segment-specific
-  // best-first route. Definite PRESENT must mean membership production has
-  // verification work that a materialized whole-query set avoids.
-  virtual VerificationWork membershipVerificationWork() const {
-    return VerificationWork::UNKNOWN;
-  }
-
   virtual FieldSortConjunction fieldSortConjunction(
       PlanningContext& context) const {
     unused(context);
     return FieldSortConjunction::NOT_FLAT;
   }
-
-  // True only when omitting createWeight on a fully resident membership hit
-  // preserves semantics after the request's logical validation pass. Unknown
-  // and custom queries remain conservative by default.
-  virtual bool canOmitWeightForCacheFirstMembership() const { return false; }
-
-  // Query fact used by pure-count planning. True means the cold Weight path
-  // can answer the exact count directly for this reader, without membership
-  // enumeration or cache materialization.
-  virtual bool directCountAvailable(IndexReader& reader) const {
-    unused(reader);
-    return false;
-  }
-
-  // True when this query contributes no restriction to a separable exact
-  // domain. Score-only wrappers delegate because this is membership-only.
-  virtual bool exactDomainIdentity() const { return false; }
 
   // Validate the complete logical tree once during serial request planning,
   // before cache lookup or Weight construction. Every concrete query must
@@ -631,7 +605,7 @@ protected:
   }
 
   // Hashes only enough sequence content to bucket equality candidates. The
-  // exact equals() check must not be preceded by an unbounded payload walk.
+  // exact queryEquals() check must not be preceded by an unbounded payload walk.
   template <typename T, typename MixElement>
   static uint64_t mixSampledSequence(
       uint64_t seed, std::span<T> sequence, MixElement mixElement) {
@@ -649,55 +623,15 @@ protected:
     return seed;
   }
 
-  virtual uint64_t hashImpl() const {
-    return Hash::hash(&kind, sizeof(kind));
-  }
-
 public:
 
   // Structural membership key: the filter projection of this query, with
   // score-only state omitted. Consumers that need query identity must use
-  // equals() and hash(). Queries whose membership depends on scores must
+  // queryEquals() and queryHash(). Queries whose membership depends on scores must
   // return UNCACHEABLE. Every concrete query must make an explicit
   // cacheability decision.
   virtual FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                          const FilterKeyContext& ctx) const = 0;
-
-  // Scoring identity splits a clause into the boost it carries and the core
-  // that boost scales: BoostQuery wrappers and TermQuery's inline boost peel
-  // off. Equality and hashing consumers must use sameScoringClause() and
-  // scoringClauseHash() when the boost contributes to identity.
-  virtual Query* peelBoost(float& boost) {
-    unused(boost);
-    return this;
-  }
-
-  virtual bool equals(const Query& other) const {
-    unused(other);
-    return false;
-  }
-
-  uint64_t hash() const {
-    if (cachedHash != 0) return cachedHash;
-    uint64_t value = hashImpl();
-    cachedHash = value == 0 ? 1 : value;
-    return cachedHash;
-  }
-
-  static bool sameScoringClause(Query* a, Query* b) {
-    float aBoost = 1.0f;
-    float bBoost = 1.0f;
-    Query* aCore = a->peelBoost(aBoost);
-    Query* bCore = b->peelBoost(bBoost);
-    return std::bit_cast<uint32_t>(aBoost) == std::bit_cast<uint32_t>(bBoost)
-        && aCore->equals(*bCore);
-  }
-
-  static uint64_t scoringClauseHash(Query* query) {
-    float boost = 1.0f;
-    Query* core = query->peelBoost(boost);
-    return mixHash(core->hash(), std::bit_cast<uint32_t>(boost));
-  }
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
@@ -1939,6 +1873,18 @@ public:
     }
   };
 };
+
+const Query* peelBoost(const Query* query, float& boost);
+Query* peelBoost(Query* query, float& boost);
+bool sameScoringClause(const Query* a, const Query* b);
+uint64_t scoringClauseHash(const Query* query);
+bool queryEquals(const Query& a, const Query& b);
+uint64_t queryHash(const Query& query);
+Query::ScoreProfile scoreProfile(const Query& query);
+bool canOmitWeightForCacheFirstMembership(const Query& query);
+bool exactDomainIdentity(const Query& query);
+bool directCountAvailable(const Query& query, IndexReader& reader);
+Query::VerificationWork membershipVerificationWork(const Query& query);
 
 inline void Query::validateLogical(
     PlanningContext& context, float multiplier) const {

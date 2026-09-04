@@ -17,6 +17,7 @@
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/query/TermQuery.h"
 
 using namespace luxir;
@@ -172,8 +173,8 @@ TEST_F(BooleanNormalizeTest, positionalUniformScores) {
 
   ExistsQuery exists("body_w");
   EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM,
-            exists.scoreProfile().kind);
-  EXPECT_FLOAT_EQ(1.0f, exists.scoreProfile().value);
+            scoreProfile(exists).kind);
+  EXPECT_FLOAT_EQ(1.0f, scoreProfile(exists).value);
   for (const auto& [doc, score] : collectScores(*testIndex.reader, exists)) {
     unused(doc);
     EXPECT_FLOAT_EQ(1.0f, score);
@@ -182,8 +183,8 @@ TEST_F(BooleanNormalizeTest, positionalUniformScores) {
   Query* requiredAuto[] = {&exists};
   BooleanQuery suppressed(requiredAuto, {}, {}, {});
   EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM,
-            suppressed.scoreProfile().kind);
-  EXPECT_FLOAT_EQ(0.0f, suppressed.scoreProfile().value);
+            scoreProfile(suppressed).kind);
+  EXPECT_FLOAT_EQ(0.0f, scoreProfile(suppressed).value);
   for (const auto& [doc, score] : collectScores(*testIndex.reader, suppressed)) {
     unused(doc);
     EXPECT_FLOAT_EQ(0.0f, score);
@@ -193,8 +194,8 @@ TEST_F(BooleanNormalizeTest, positionalUniformScores) {
   // suppressed automatic uniform back into scoring; constant_score does.
   BoostQuery boostedAuto(&exists, 3.0f);
   EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM,
-            boostedAuto.scoreProfile().kind);
-  EXPECT_FLOAT_EQ(3.0f, boostedAuto.scoreProfile().value);
+            scoreProfile(boostedAuto).kind);
+  EXPECT_FLOAT_EQ(3.0f, scoreProfile(boostedAuto).value);
   Query* requiredBoosted[] = {&boostedAuto};
   BooleanQuery stillSuppressed(requiredBoosted, {}, {}, {});
   for (const auto& [doc, score] : collectScores(*testIndex.reader, stillSuppressed)) {
@@ -204,7 +205,7 @@ TEST_F(BooleanNormalizeTest, positionalUniformScores) {
 
   ConstantScoreQuery explicitConstant(&exists, 3.0f);
   EXPECT_EQ(Query::ScoreProfile::Kind::EXPLICIT_UNIFORM,
-            explicitConstant.scoreProfile().kind);
+            scoreProfile(explicitConstant).kind);
   Query* requiredExplicit[] = {&explicitConstant};
   BooleanQuery scoredFilter(requiredExplicit, {}, {}, {});
   for (const auto& [doc, score] : collectScores(*testIndex.reader, scoredFilter)) {
@@ -223,7 +224,7 @@ TEST_F(BooleanNormalizeTest, positionalUniformScores) {
   Query* disjuncts[] = {&exists, &exists};
   BooleanQuery disjunction({}, disjuncts, {}, {});
   EXPECT_EQ(Query::ScoreProfile::Kind::VARIABLE,
-            disjunction.scoreProfile().kind);
+            scoreProfile(disjunction).kind);
   Query* nestedRequired[] = {&disjunction};
   BooleanQuery nested(nestedRequired, {}, {}, {});
   for (const auto& [doc, score] : collectScores(*testIndex.reader, nested)) {

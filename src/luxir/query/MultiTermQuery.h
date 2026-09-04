@@ -29,11 +29,6 @@ public:
     : Query(kind), field(field) {}
 
   std::string_view getField() const { return field; }
-  ScoreProfile scoreProfile() const override {
-    return ScoreProfile::automatic(1.0f);
-  }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;

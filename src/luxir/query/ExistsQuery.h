@@ -20,22 +20,7 @@ public:
   explicit ExistsQuery(std::string_view field)
     : Query(QueryKind::EXISTS), field(field) {}
 
-  bool equals(const Query& other) const override {
-    if (other.getKind() != kind) return false;
-    const auto& rhs = static_cast<const ExistsQuery&>(other);
-    return field == rhs.field;
-  }
-
-  uint64_t hashImpl() const override {
-    return mixHash(Query::hashImpl(), field);
-  }
-
   std::string_view getField() const { return field; }
-  ScoreProfile scoreProfile() const override {
-    return ScoreProfile::automatic(1.0f);
-  }
-
-  bool canOmitWeightForCacheFirstMembership() const override { return true; }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
