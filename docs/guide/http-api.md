@@ -54,9 +54,9 @@ unbounded request or response into one in-memory JSON value.
 JSON field names and enums are lowercase `snake_case`. Values use natural JSON
 forms where their message type is known. For example, a kNN query vector is an
 array of numbers, a query can be a bare expression string, and
-`{"match":{"title_w":"dune"}}` is accepted field-name sugar. A vector inside
-a dynamic document `Val` is the current exception: HTTP cannot select the
-typed `vec` arm, so vector documents must be indexed through gRPC for now.
+`{"match":{"title_w":"dune"}}` is accepted field-name sugar. Document vector
+fields also accept bare number arrays. The schema interprets a number array as
+one vector and an array of number arrays as a multi-valued vector list.
 
 Unknown JSON keys, unknown oneof arms, invalid enum names, excessive nesting,
 and wrong value shapes are request errors. A body typo is not ignored. URL

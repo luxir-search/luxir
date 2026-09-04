@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace luxir::coerce {
 
@@ -63,6 +64,8 @@ inline std::string describe(const api::Val& val) {
   if (auto b = std::get_if<bool>(&val.kind)) return *b ? "true" : "false";
   if (isNull(val)) return "null";
   if (isArray(val)) return "an array value";
+  if (std::holds_alternative<api::Vector>(val.kind)) return "a vector value";
+  if (std::holds_alternative<api::ArrVector>(val.kind)) return "a vector array value";
   return "an unsupported value kind";
 }
 
@@ -243,6 +246,77 @@ bool forEachElement(const api::Val& val, F&& fn) {
     for (const auto& v : a->v) fn(v);
     return true;
   }
+  return false;
+}
+
+// Append one dense vector to floats and return its element count.
+inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
+                            int32_t ordinal, std::vector<float>& floats) {
+  size_t start = floats.size();
+  // Error-message prefix, formatted lazily so the success path does no formatting.
+  auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
+  auto appendDouble = [&](double d, size_t index) {
+    float f = (float)d;
+    if (!std::isfinite(f)) throw std::runtime_error(fmt::format(
+        "field '{}': {}element {} is outside finite float32 range", fieldName, prefix(), index));
+    floats.push_back(f);
+  };
+  if (const auto* vec = std::get_if<api::Vector>(&one.kind)) {
+    if (!vec->f32.has_value()) throw std::runtime_error(fmt::format(
+        "field '{}': {}unsupported or unset vector encoding", fieldName, prefix()));
+    floats.insert(floats.end(), vec->f32->v.begin(), vec->f32->v.end());
+  } else if (const auto* arr = std::get_if<api::ArrFloat>(&one.kind)) {
+    floats.insert(floats.end(), arr->v.begin(), arr->v.end());
+  } else if (const auto* arr = std::get_if<api::ArrDouble>(&one.kind)) {
+    for (size_t i = 0; i < arr->v.size(); i++) appendDouble(arr->v[i], i);
+  } else if (const auto* arr = std::get_if<api::ArrInt>(&one.kind)) {
+    for (int64_t value : arr->v) floats.push_back((float)value);
+  } else if (const auto* arr = std::get_if<api::ArrVal>(&one.kind)) {
+    for (size_t i = 0; i < arr->v.size(); i++) {
+      const auto& kind = arr->v[i].kind;
+      if (const auto* value = std::get_if<float>(&kind)) floats.push_back(*value);
+      else if (const auto* value = std::get_if<double>(&kind)) appendDouble(*value, i);
+      else if (const auto* value = std::get_if<int64_t>(&kind)) floats.push_back((float)*value);
+      else throw std::runtime_error(fmt::format("field '{}': {}element {} is not a number",
+                                                fieldName, prefix(), i));
+    }
+  } else if (ordinal >= 0) {
+    throw std::runtime_error(fmt::format("field '{}': vector {} is not a vector",
+                                         fieldName, ordinal));
+  } else {
+    throwCoerce(fieldName, one, "a vector");
+  }
+  return (int32_t)(floats.size() - start);
+}
+
+// Append the dense vectors represented by val to floats, one contiguous run per
+// vector, recording each vector's element count in lens. Returns true when val
+// is a list and false when it is one vector.
+inline bool toVectors(const api::Val& val, std::string_view fieldName,
+                      std::vector<float>& floats, std::vector<int32_t>& lens) {
+  floats.clear(); lens.clear();
+  auto append = [&](const api::Val& one, int32_t ordinal) {
+    lens.push_back(appendVector(one, fieldName, ordinal, floats));
+  };
+  if (const auto* arr = std::get_if<api::ArrVector>(&val.kind)) {
+    for (size_t i = 0; i < arr->v.size(); i++) {
+      api::Val one;
+      one.kind = arr->v[i];
+      append(one, (int32_t)i);
+    }
+    return true;
+  }
+  if (const auto* arr = std::get_if<api::ArrVal>(&val.kind)) {
+    bool firstIsNumber = !arr->v.empty()
+        && (std::holds_alternative<int64_t>(arr->v.front().kind)
+            || std::holds_alternative<double>(arr->v.front().kind)
+            || std::holds_alternative<float>(arr->v.front().kind));
+    if (!firstIsNumber) {
+      for (size_t i = 0; i < arr->v.size(); i++) append(arr->v[i], (int32_t)i);
+      return true;
+    }
+  }
+  append(val, -1);
   return false;
 }
 

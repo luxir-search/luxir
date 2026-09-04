@@ -778,6 +778,39 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "embedding": {"type":"vector", "dims":3, "metric":"l2"},
+      "neighbors_vs": {"type":"vector", "dims":2, "metric":"l2", "multi":true}
+    }
+  })");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"vec-http","embedding":[1.25,2.5,3.75],)"
+      R"("neighbors_vs":[[0.25,0.75],[0.5,0.5]]}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto search = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"knn":{"field":"embedding","query":[1.25,2.5,3.75],)"
+      R"("k":1,"exact":true}},"fields":["id","embedding","neighbors_vs"]})");
+  ASSERT_EQ(200, search.result_int()) << search.body();
+  EXPECT_NE(search.body().find(R"("embedding":[1.25,2.5,3.75])"),
+            std::string::npos) << search.body();
+  EXPECT_NE(search.body().find(R"("neighbors_vs":[[0.25,0.75],[0.5,0.5]])"),
+            std::string::npos) << search.body();
+
+  auto partial = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"vec-good","embedding":[1,2,3]},)"
+      R"({"id":"vec-bad","embedding":[1,2]}]})");
+  ASSERT_EQ(200, partial.result_int()) << partial.body();
+  EXPECT_NE(partial.body().find(R"("status":"partial")"), std::string::npos)
+      << partial.body();
+  EXPECT_NE(partial.body().find(R"("errors":[)"), std::string::npos) << partial.body();
+  EXPECT_NE(partial.body().find("embedding"), std::string::npos) << partial.body();
+}
+
 TEST_F(HttpApiTest, updateDeleteIds) {
   auto index = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"u1","title_w":"delete token"},{"id":"u2","title_w":"delete token"}],"commit":{}})");

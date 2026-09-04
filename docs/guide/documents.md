@@ -37,15 +37,16 @@ errors. Luxir does not silently accept a misspelled query option.
 
 ## Missing, null, and empty
 
-For scalar, text, and geo fields, an absent field and an explicit JSON `null`
-both mean that the document has no value for that field. The document does not
-enter the field's postings or column, `exists` does not match it, and row-format
-retrieval omits the key. A vector field currently accepts only a vector/array
-shape when present; omit it rather than sending `null`.
+For every field type, an absent field and an explicit JSON `null` both mean
+that the document has no value for that field. The document does not enter the
+field's postings or column, `exists` does not match it, and row-format retrieval
+omits the key.
 
 An empty array on a multi-valued field likewise supplies no values. Use a
-scalar for a single-valued field and an array for a field declared `multi`.
-Supplying several values to a single-valued field is an update error.
+single value for a single-valued field and an array for a field declared
+`multi`. For vectors, `[]` supplies no vectors to a multi-valued field but is
+an invalid empty vector on a single-valued field. Supplying several values to
+a single-valued field is an update error.
 
 Missing values do not acquire a schema default. Search result columns use a
 type-specific missing sentinel internally; HTTP column-format output renders
@@ -89,7 +90,8 @@ for a field at ingest can be used to match or bound that field later.
   date math. Update messages interpret offset-less date text in UTC; search
   requests may supply a query time zone. See [Dates](dates.md).
 - Geo points and vectors have array shapes described in their dedicated guides;
-  they are not generic numeric multi-value fields.
+  they are not generic numeric multi-value fields. A vector is a number array;
+  integer elements are accepted, while doubles must narrow to finite float32.
 
 Coercion is deliberately not a best-effort parser: trailing garbage, an object
 where a scalar is expected, a wrong vector dimension, or an invalid coordinate
@@ -103,15 +105,16 @@ The outer JSON shape follows the schema:
 {
   "tags_ss": ["fiction","classic"],
   "years_is": [1965,1969],
-  "locations": [[-74.0060,40.7128],[-0.1278,51.5074]]
+  "locations": [[-74.0060,40.7128],[-0.1278,51.5074]],
+  "embedding_vs": [[0.8,0.1,0.1],[0.2,0.7,0.1]]
 }
 ```
 
 String, text, numeric, and date multi-fields use an array of scalar values. A
-multi-geo field uses an array of `[lon,lat]` points. Multi-vector documents use
-the typed protobuf `Val.arr_vec` arm; HTTP document arrays are not promoted to
-vectors yet. The field must be declared `multi: true`; the `_ss`, `_is`, `_fs`,
-`_ds`, `_dts`, and `_vs` default suffixes already are.
+multi-geo field uses an array of `[lon,lat]` points. A multi-vector field uses
+an array of number arrays. A bare number array is also accepted as a
+one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
+`_fs`, `_ds`, `_dts`, and `_vs` default suffixes already are.
 
 A multi-valued text field analyzes each input value separately and inserts a
 position gap of `100` between values. A phrase therefore does not cross values

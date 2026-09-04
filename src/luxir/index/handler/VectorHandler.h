@@ -2,19 +2,21 @@
 
 #include "StrColHandler.h"
 #include "luxir/schema/FieldType.h"
+#include "luxir/schema/ValCoerce.h"
 #include "luxir/util/log.h"
 
 #include <cassert>
 #include <cmath>
+#include <span>
 #include <vector>
 
 namespace luxir::handler {
 
-/// Dense-float-vector field handler.  Values arrive as luxir::api::Vector
-/// (single) or luxir::api::ArrVector (multi-valued); we reinterpret each f32
-/// vector as a fixed-size byte blob and delegate to the binary-column path
-/// inherited from StrColHandler.  The column's existing fixed-size fast path
-/// captures per-segment dims automatically (mono2MetaOff = dims*4).
+/// Dense-float-vector field handler. Typed Vector / ArrVector values and
+/// schema-directed numeric Val arrays are copied to an owned f32 buffer, then stored as
+/// fixed-size byte blobs through the binary-column path inherited from
+/// StrColHandler. The column's existing fixed-size fast path captures
+/// per-segment dims automatically (mono2MetaOff = dims*4).
 ///
 /// dims_ tracks the vector size observed so far in this segment.  If the
 /// owning VectorFieldType declares a non-zero dims, it seeds dims_ and any
@@ -29,7 +31,9 @@ class VectorHandler final : public StrColHandler {
   VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
-  std::vector<float> normalizedScratch;
+  std::vector<float> floats;
+  std::vector<int32_t> lens;
+  std::vector<std::string_view> views;
 
 public:
   VectorHandler(Inverter& inverter, const std::string_view& fieldName,
@@ -54,23 +58,39 @@ protected:
 public:
   void index(Inverter& inverter, const IndexVal& val) override {
     pendingDims_ = 0;  // dims learned by a previous (possibly failed) value don't carry over
+    if (coerce::isNull(val)) return;
+
     bool multi = (fieldType->flags_ & FieldType::MULTI_VALUED) != 0;
-    if (std::holds_alternative<luxir::api::Vector>(val.kind)) {
-      if (multi) {
-        // A single Vector on a multi-valued field is treated as a one-element list.
-        indexOne(inverter, std::get<luxir::api::Vector>(val.kind));
-      } else {
-        indexSingleVec(inverter, std::get<luxir::api::Vector>(val.kind));
-      }
-    } else if (std::holds_alternative<luxir::api::ArrVector>(val.kind)) {
+    views.clear();
+    bool isList = coerce::toVectors(val, std::string_view(fieldName), floats, lens);
+    if (isList && !multi && !lens.empty()) {
+      throw std::runtime_error(fmt::format(
+          "field '{}': single-valued field received a list of {} vectors",
+          std::string_view(fieldName), lens.size()));
+    }
+    if (lens.empty()) {
       if (!multi) {
-        throw std::runtime_error(fmt::format(
-            "VectorHandler: field '{}' is single-valued but received arr_vec",
-            std::string_view(fieldName)));
+        throw std::runtime_error(fmt::format("field '{}': empty vector",
+                                             std::string_view(fieldName)));
       }
-      indexMultiVec(inverter, std::get<luxir::api::ArrVector>(val.kind));
+      return;
+    }
+
+    views.reserve(lens.size());
+    size_t offset = 0;
+    for (size_t i = 0; i < lens.size(); i++) {
+      auto vec = std::span<float>(floats).subspan(offset, (size_t)lens[i]);
+      offset += (size_t)lens[i];
+      if (validate(vec, isList ? (int32_t)i : -1)) views.push_back(bytesOf(vec));
+    }
+    if (views.empty()) return;
+
+    commitDims();
+    if (multi) {
+      indexMulti(inverter, std::span<const std::string_view>(views));
     } else {
-      throw std::runtime_error("VectorHandler: expected vec or arr_vec");
+      assert(views.size() == 1);
+      indexSingle(inverter, views[0]);
     }
   }
 
@@ -90,126 +110,45 @@ private:
     }
   }
 
-  // Validate a Vector against the effective dims, learning pendingDims_ on the
-  // first vector of a value.  Returns the f32 floats, or nullptr if the value
-  // should be skipped: a cosine field's zero / near-zero vector has no
-  // direction, so we drop it (and log) rather than fail the whole update.
-  // Throws on hard errors (bad encoding, empty vector, dims mismatch).
-  const luxir::api::ArrFloat* validate(const luxir::api::Vector& vec, double* normSq = nullptr) {
-    if (!vec.f32.has_value()) {
+  // Returns false for a zero / near-zero cosine vector. Otherwise validates
+  // dimensions and applies write-time normalization in place.
+  bool validate(std::span<float> vec, int32_t ordinal) {
+    auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
+    if (vec.empty()) {
       throw std::runtime_error(fmt::format(
-          "VectorHandler: field '{}' got Vector with unsupported / unset encoding",
-          std::string_view(fieldName)));
+          "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
     }
-    auto& f = (*vec.f32);
-    int32_t n = f.v.size();
-    if (n == 0) {
-      throw std::runtime_error(fmt::format(
-          "VectorHandler: empty vector in field '{}'", std::string_view(fieldName)));
-    }
+    int32_t n = (int32_t)vec.size();
     int32_t expected = effectiveDims();
     if (expected == 0) {
       pendingDims_ = n;
     } else if (n != expected) {
       throw std::runtime_error(fmt::format(
-          "VectorHandler: field '{}' expects dims={}, got {}",
-          std::string_view(fieldName), expected, n));
+          "field '{}': {}expected dims={}, got {}",
+          std::string_view(fieldName), prefix(), expected, n));
     }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
-      double sum = 0.0;
-      for (float x : f.v) {
+      double normSq = 0.0;
+      for (float x : vec) {
         double d = (double)x;
-        sum += d * d;
+        normSq += d * d;
       }
-      if (!std::isfinite(sum) || sum <= MIN_COSINE_NORM_SQ) {
+      if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) {
         // No cosine direction - skip this value rather than abort the update.
         LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
                  std::string_view(fieldName));
-        return nullptr;
+        return false;
       }
-      if (normSq != nullptr) *normSq = sum;
+      if (normalizeOnWrite) {
+        float invNorm = (float)(1.0 / std::sqrt(normSq));
+        for (float& x : vec) x *= invNorm;
+      }
     }
-    return &f;
+    return true;
   }
 
-  static std::string_view bytesOf(const luxir::api::ArrFloat& vec) {
-    return std::string_view((const char*)vec.v.data(),
-                            (size_t)vec.v.size() * sizeof(float));
-  }
-
-  static std::string_view bytesOf(const float* data, int32_t dims) {
-    return std::string_view((const char*)data, (size_t)dims * sizeof(float));
-  }
-
-  std::string_view storedBytes(const luxir::api::ArrFloat& vec,
-                               double normSq,
-                               std::vector<float>& scratch) const {
-    if (!normalizeOnWrite) return bytesOf(vec);
-
-    size_t start = scratch.size();
-    scratch.resize(start + (size_t)vec.v.size());
-    float invNorm = (float)(1.0 / std::sqrt(normSq));
-    for (int32_t i = 0; i < (int32_t)vec.v.size(); i++) {
-      scratch[start + (size_t)i] = vec.v[i] * invNorm;
-    }
-    return bytesOf(scratch.data() + start, vec.v.size());
-  }
-
-  void indexSingleVec(Inverter& inverter, const luxir::api::Vector& vec) {
-    double normSq = 0.0;
-    auto* f = validate(vec, &normSq);
-    if (f == nullptr) return;  // skipped: doc gets no value for this field
-    commitDims();
-    normalizedScratch.clear();
-    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v.size());
-    indexSingle(inverter, storedBytes(*f, normSq, normalizedScratch));
-  }
-
-  void indexOne(Inverter& inverter, const luxir::api::Vector& vec) {
-    double normSq = 0.0;
-    auto* f = validate(vec, &normSq);
-    if (f == nullptr) return;  // skipped: doc gets no value for this field
-    commitDims();
-    normalizedScratch.clear();
-    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v.size());
-    std::string_view views[] = { storedBytes(*f, normSq, normalizedScratch) };
-    indexMulti(inverter, std::span<const std::string_view>(views));
-  }
-
-  void indexMultiVec(Inverter& inverter, const luxir::api::ArrVector& arr) {
-    auto& vecs = arr.v;
-    // Empty list = "no value for this doc" (indistinguishable from field
-    // unset); skip without recording the doc in docsWithValue.
-    if (vecs.empty()) return;
-    // Validate first so dims_ is locked before we capture byte views.
-    std::vector<const luxir::api::ArrFloat*> floats;
-    std::vector<double> normSq;
-    floats.reserve(vecs.size());
-    normSq.reserve(vecs.size());
-    for (auto& v : vecs) {
-      double sq = 0.0;
-      auto* f = validate(v, &sq);
-      if (f == nullptr) continue;  // skip zero / near-zero cosine vector
-      floats.push_back(f);
-      normSq.push_back(sq);
-    }
-    // All values skipped => doc has no vector value (like an empty list).
-    if (floats.empty()) return;
-    commitDims();
-
-    std::vector<std::string_view> views;
-    views.reserve(floats.size());
-    normalizedScratch.clear();
-    if (normalizeOnWrite) {
-      // storedBytes returns views into normalizedScratch; reserve the full
-      // batch before appending so earlier views cannot be invalidated.
-      normalizedScratch.reserve((size_t)dims_ * floats.size());
-    }
-    for (size_t i = 0; i < floats.size(); i++) {
-      views.push_back(storedBytes(*floats[i], normSq[i], normalizedScratch));
-    }
-    assert(!normalizeOnWrite || normalizedScratch.size() == (size_t)dims_ * floats.size());
-    indexMulti(inverter, std::span<const std::string_view>(views));
+  static std::string_view bytesOf(std::span<const float> vec) {
+    return std::string_view((const char*)vec.data(), vec.size_bytes());
   }
 };
 

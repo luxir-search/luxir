@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <unistd.h>
 
 #include "test/CollectionHelper.h"
@@ -42,6 +43,33 @@ static luxir::api::Val makeVec(std::pmr::memory_resource& mr, std::initializer_l
   std::size_t i = 0;
   for (float f : floats) a[i++] = f;
   return v;
+}
+
+static luxir::api::Val makeDoubles(std::pmr::memory_resource& mr,
+                                   std::initializer_list<double> values) {
+  luxir::api::Val val;
+  auto& arr = val.kind.emplace<luxir::api::ArrDouble>();
+  double* out = luxir::api::build::allocArray(arr.v, values.size(), mr);
+  std::copy(values.begin(), values.end(), out);
+  return val;
+}
+
+static luxir::api::Val makeInts(std::pmr::memory_resource& mr,
+                                std::initializer_list<int64_t> values) {
+  luxir::api::Val val;
+  auto& arr = val.kind.emplace<luxir::api::ArrInt>();
+  int64_t* out = luxir::api::build::allocArray(arr.v, values.size(), mr);
+  std::copy(values.begin(), values.end(), out);
+  return val;
+}
+
+static luxir::api::Val makeVals(std::pmr::memory_resource& mr,
+                                std::initializer_list<luxir::api::Val> values) {
+  luxir::api::Val val;
+  auto& arr = val.kind.emplace<luxir::api::ArrVal>();
+  luxir::api::Val* out = luxir::api::build::allocArray(arr.v, values.size(), mr);
+  std::copy(values.begin(), values.end(), out);
+  return val;
 }
 
 static void indexVal(Inverter& inverter, Inverter::IndexHandler& handler, const luxir::api::Val& val) {
@@ -286,6 +314,145 @@ TEST_F(VectorColTest, multiValuedRoundTrip) {
   }
 }
 
+TEST_F(VectorColTest, coercesNumericArrayArms) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto& handler = inverter.getIndexHandler("vec_v");
+  std::pmr::monotonic_buffer_resource mr;
+
+  inverter.setDoc(0);
+  indexVal(inverter, handler, makeDoubles(mr, {1.5, 2.5, 3.5}));
+  inverter.setDoc(1);
+  indexVal(inverter, handler, makeInts(mr, {4, 5, 6}));
+  inverter.setDoc(2);
+  indexVal(inverter, handler,
+           makeVals(mr, {coerce::scalarVal((int64_t)7),
+                         coerce::scalarVal(8.5),
+                         coerce::scalarVal(9.5f)}));
+
+  testIndex.flush();
+  testIndex.initReader();
+  auto& seg = testIndex.reader->segments()[0];
+  FieldReader fields(seg.postingsReader());
+  ASSERT_TRUE(fields.seek("vec_v"));
+  SegFieldInfo info;
+  fields.readFieldInfo(info);
+  VectorReader reader(seg.postingsReader(), info);
+  ASSERT_EQ(3, reader.docsWithValue());
+  auto vec0 = reader.singleVectorAt(0);
+  auto vec1 = reader.singleVectorAt(1);
+  auto vec2 = reader.singleVectorAt(2);
+  EXPECT_EQ((std::vector<float>{1.5f, 2.5f, 3.5f}),
+            (std::vector<float>(vec0.begin(), vec0.end())));
+  EXPECT_EQ((std::vector<float>{4, 5, 6}),
+            (std::vector<float>(vec1.begin(), vec1.end())));
+  EXPECT_EQ((std::vector<float>{7, 8.5f, 9.5f}),
+            (std::vector<float>(vec2.begin(), vec2.end())));
+}
+
+TEST_F(VectorColTest, coercesMultiVectorJsonShapes) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto& handler = inverter.getIndexHandler("emb_vs");
+  std::pmr::monotonic_buffer_resource mr;
+
+  inverter.setDoc(0);
+  indexVal(inverter, handler,
+           makeVals(mr, {makeDoubles(mr, {1, 2}), makeInts(mr, {3, 4})}));
+  inverter.setDoc(1);
+  indexVal(inverter, handler, makeDoubles(mr, {5, 6}));
+  inverter.setDoc(2);
+  indexVal(inverter, handler, makeVals(mr, {}));
+
+  testIndex.flush();
+  testIndex.initReader();
+  auto& seg = testIndex.reader->segments()[0];
+  FieldReader fields(seg.postingsReader());
+  ASSERT_TRUE(fields.seek("emb_vs"));
+  SegFieldInfo info;
+  fields.readFieldInfo(info);
+  VectorReader reader(seg.postingsReader(), info);
+  EXPECT_EQ(2, reader.docsWithValue());
+  EXPECT_EQ(3, reader.numVectors());
+  auto [start, end] = reader.valueRange(1);
+  ASSERT_EQ(1, end - start);
+  auto vec = reader.vectorAtRank(start);
+  EXPECT_EQ((std::vector<float>{5, 6}),
+            (std::vector<float>(vec.begin(), vec.end())));
+}
+
+TEST_F(VectorColTest, rejectsInvalidCoercedVectorShapesAndSkipsNull) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto& single = inverter.getIndexHandler("vec_v");
+  auto& multi = inverter.getIndexHandler("emb_vs");
+  std::pmr::monotonic_buffer_resource mr;
+
+  EXPECT_THROW(indexVal(inverter, single,
+                        makeVals(mr, {makeDoubles(mr, {1, 2})})), std::runtime_error);
+  try {
+    indexVal(inverter, single, makeVals(mr, {}));
+    FAIL() << "expected empty vector to fail";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("empty vector"), std::string::npos) << e.what();
+  }
+  EXPECT_THROW(indexVal(inverter, single, coerce::scalarVal((int64_t)1)), std::runtime_error);
+  EXPECT_THROW(indexVal(inverter, single, coerce::scalarVal(std::string_view("1,2"))),
+               std::runtime_error);
+  EXPECT_THROW(indexVal(inverter, single,
+                        makeVals(mr, {coerce::scalarVal((int64_t)1),
+                                      coerce::scalarVal(std::string_view("x"))})),
+               std::runtime_error);
+
+  luxir::api::Val unset;
+  luxir::api::Val nullVal;
+  nullVal.kind = google::protobuf::NullValue::NULL_VALUE;
+  EXPECT_NO_THROW(indexVal(inverter, single, unset));
+  EXPECT_NO_THROW(indexVal(inverter, single, nullVal));
+  EXPECT_NO_THROW(indexVal(inverter, multi, makeVals(mr, {})));
+
+  try {
+    indexVal(inverter, multi, makeVals(mr, {makeVals(mr, {})}));
+    FAIL() << "expected empty contained vector to fail";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("vector 0"), std::string::npos) << e.what();
+    EXPECT_NE(std::string(e.what()).find("empty vector"), std::string::npos) << e.what();
+  }
+}
+
+TEST_F(VectorColTest, coercedValidationPrecedesStreamingWrite) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto& handler = inverter.getIndexHandler("emb_vs");
+  auto* vectorHandler = dynamic_cast<handler::VectorHandler*>(&handler);
+  ASSERT_NE(nullptr, vectorHandler);
+  std::pmr::monotonic_buffer_resource mr;
+
+  inverter.setDoc(0);
+  EXPECT_THROW(indexVal(inverter, handler,
+                        makeVals(mr, {makeDoubles(mr, {1, 2}),
+                                      makeDoubles(mr, {3, 4, 5})})),
+               std::runtime_error);
+  EXPECT_EQ(0, vectorHandler->dims());
+
+  inverter.setDoc(1);
+  EXPECT_NO_THROW(indexVal(inverter, handler,
+                           makeVals(mr, {makeDoubles(mr, {1, 2, 3}),
+                                         makeInts(mr, {4, 5, 6})})));
+  EXPECT_EQ(3, vectorHandler->dims());
+
+  testIndex.flush();
+  testIndex.initReader();
+  auto& seg = testIndex.reader->segments()[0];
+  FieldReader fields(seg.postingsReader());
+  ASSERT_TRUE(fields.seek("emb_vs"));
+  SegFieldInfo info;
+  fields.readFieldInfo(info);
+  VectorReader reader(seg.postingsReader(), info);
+  EXPECT_EQ(1, reader.docsWithValue());
+  EXPECT_EQ(2, reader.numVectors());
+}
+
 // valueRank -> docId reverse map for multi-valued vectors.  Uses sparse doc ids
 // (gaps) so the test fails if the map stored a dense rank-among-docs-with-field
 // instead of the real segment-local docId.
@@ -416,7 +583,7 @@ TEST_F(VectorColTest, strictDimsRejectsMismatch) {
 
   std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(0);
-  auto wrong = makeVec(mr, {1, 2, 3});  // 3 dims vs declared 4
+  auto wrong = makeDoubles(mr, {1, 2, 3});  // coerced 3 dims vs declared 4
   EXPECT_THROW(indexVal(inverter, vh, wrong), std::runtime_error);
 
   inverter.setDoc(1);
@@ -515,7 +682,9 @@ TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
   f.metric = luxir::api::VectorMetric::COSINE;
   b.set(h.collection());
 
-  Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
+  // This pins the default normalized column storage for cosine fields. A
+  // coerced double array follows the same path as a typed float vector.
+  Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<double>{3.0, 4.0});
   h.index(doc, UpdateMessage::COMMIT);
 
   auto req = localReq(h.getSearchEngine());
@@ -648,6 +817,24 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
   inverter.setDoc(0);
   auto zero = makeVec(mr, {0.0f, 0.0f});
   EXPECT_NO_THROW(indexVal(inverter, vh, zero));
+}
+
+TEST_F(VectorColTest, rejectsDoubleValuesOutsideFiniteFloat32Range) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/1);
+  handler::VectorHandler vh(inverter, "strict_v", strictType);
+  std::pmr::monotonic_buffer_resource mr;
+
+  EXPECT_THROW(indexVal(inverter, vh,
+                        makeDoubles(mr, {std::numeric_limits<double>::max()})),
+               std::runtime_error);
+  EXPECT_THROW(indexVal(inverter, vh,
+                        makeDoubles(mr, {std::numeric_limits<double>::infinity()})),
+               std::runtime_error);
+  EXPECT_THROW(indexVal(inverter, vh,
+                        makeDoubles(mr, {std::numeric_limits<double>::quiet_NaN()})),
+               std::runtime_error);
 }
 
 // Schema round-trip: toProto/fromProto preserves VECTOR field with dims.

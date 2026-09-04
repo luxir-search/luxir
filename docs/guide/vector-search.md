@@ -23,6 +23,12 @@ curl http://localhost:9400/collections/books/_schema -d '{
       "type": "vector",
       "dims": 3,
       "metric": "cosine"
+    },
+    "passages_vs": {
+      "type": "vector",
+      "dims": 3,
+      "metric": "cosine",
+      "multi": true
     }
   }
 }'
@@ -34,15 +40,28 @@ first vector in each segment establishes them. Explicit dimensions are easier
 to operate because a bad producer fails immediately against a collection-wide
 contract.
 
-## Index vectors through typed gRPC values
+## Index vectors
 
-Document vectors currently require the typed protobuf `Val.vec` arm. A bare
-array inside an HTTP document is decoded as a generic numeric array and is not
-promoted to `Vector`, so HTTP vector ingest is not implemented yet. kNN query
-vectors over HTTP do work because `KnnQuery.query` has a statically known vector
-type.
+Over HTTP, a bare number array is one vector. A multi-valued vector field uses
+an array of number arrays; it also accepts a bare number array as a one-vector
+list.
 
-The protobuf text shape of a row update is:
+```bash
+curl http://localhost:9400/collections/books/_update \
+  -H 'content-type: application/json' \
+  -d '{
+    "docs": [{
+      "id": "b1",
+      "title_w": "dune",
+      "embedding_v": [0.8, 0.1, 0.1],
+      "passages_vs": [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1]]
+    }],
+    "commit": {}
+  }'
+```
+
+Generated gRPC clients use the typed `Val.vec` and `Val.arr_vec` arms. The
+equivalent protobuf text shape for the single-valued field is:
 
 ```proto
 collection { name: "books" }
@@ -58,9 +77,8 @@ docs {
 commit {}
 ```
 
-Generated clients construct the same `UpdateRequest` and send it through
-`Indexer.Update` or `Indexer.UpdateStream`. Set `multi: true` for several
-vectors per document and populate `Val.arr_vec` with several `Vector.f32`
+Send the request through `Indexer.Update` or `Indexer.UpdateStream`. For
+several vectors per document, populate `Val.arr_vec` with several `Vector.f32`
 values. Search collapses them to one hit per document using that document's
 best similarity.
 

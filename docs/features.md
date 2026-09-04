@@ -88,9 +88,9 @@ engine is built the way it is.
   arrive. Clients do not need to choose a bounded bulk-request size; several
   streams are currently needed to saturate a many-core host. Individual HTTP
   records and explicit atomic groups remain bounded.
-- Vector document values currently require the typed gRPC `Val.vec`/`arr_vec`
-  arms; HTTP document arrays are not promoted to vector values yet. HTTP kNN
-  query vectors are supported.
+- Vector documents use bare number arrays over HTTP and typed
+  `Val.vec`/`arr_vec` arms over gRPC. Multi-valued vector fields accept an
+  array of number arrays, or a bare array as a one-vector list.
 - Row documents on the current update path. The protobuf `columns` member is
   reserved but not consumed yet.
 - Update/overwrite by id, delete by id, duplicate-allowed mode, and
