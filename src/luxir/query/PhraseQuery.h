@@ -295,30 +295,37 @@ public:
 
   PhraseQuery(std::string_view field, std::span<std::string_view> terms,
               std::span<const int32_t> positions, int32_t slop = 0)
-      : field(field), terms(terms), positions(positions), slop(slop) {
+      : Query(QueryKind::PHRASE), field(field), terms(terms),
+        positions(positions), slop(slop) {
     assert(terms.size() == positions.size());
     assert(terms.size() >= 2);
     assert(slop >= 0);
   }
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const PhraseQuery*>(&other);
-    return rhs != nullptr && field == rhs->field && slop == rhs->slop
-        && terms.size() == rhs->terms.size()
-        && positions.size() == rhs->positions.size()
-        && std::equal(terms.begin(), terms.end(), rhs->terms.begin())
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const PhraseQuery&>(other);
+    return field == rhs.field && slop == rhs.slop
+        && terms.size() == rhs.terms.size()
+        && positions.size() == rhs.positions.size()
+        && std::equal(terms.begin(), terms.end(), rhs.terms.begin())
         && std::equal(positions.begin(), positions.end(),
-                      rhs->positions.begin());
+                      rhs.positions.begin());
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), field);
     value = mixHash(value, slop);
-    value = mixHash(value, terms.size());
-    for (std::string_view term : terms) value = mixHash(value, term);
-    value = mixHash(value, positions.size());
-    for (int32_t position : positions) value = mixHash(value, position);
-    return value;
+    value = mixSampledSequence(
+        value, terms,
+        [](uint64_t seed, std::string_view term) {
+          return mixHash(seed, term);
+        });
+    return mixSampledSequence(
+        value, positions,
+        [](uint64_t seed, int32_t position) {
+          return mixHash(seed, position);
+        });
   }
 
   [[nodiscard]] std::string_view getField() const { return field; }
@@ -334,8 +341,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::PHRASE);
     out.appendString(field);
     out.appendSize(terms.size());
     for (std::string_view term : terms) out.appendTerm(term);

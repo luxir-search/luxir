@@ -281,25 +281,27 @@ public:
            std::span<const float> queryVec, int32_t k,
            int32_t nprobe = 0, int32_t refineCandidates = 0,
            float minScanFraction = 0.0f, bool exact = false)
-    : field(field), fieldType(fieldType), queryVec(queryVec), k(k),
+    : Query(QueryKind::KNN), field(field), fieldType(fieldType),
+      queryVec(queryVec), k(k),
       nprobe(nprobe), refineCandidates(refineCandidates),
       minScanFraction(minScanFraction), exact(exact) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const KnnQuery*>(&other);
-    return rhs != nullptr && field == rhs->field && k == rhs->k
-        && nprobe == rhs->nprobe
-        && refineCandidates == rhs->refineCandidates
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const KnnQuery&>(other);
+    return field == rhs.field && k == rhs.k
+        && nprobe == rhs.nprobe
+        && refineCandidates == rhs.refineCandidates
         && std::bit_cast<uint32_t>(minScanFraction)
-            == std::bit_cast<uint32_t>(rhs->minScanFraction)
-        && exact == rhs->exact && queryVec.size() == rhs->queryVec.size()
-        && fieldType.dims() == rhs->fieldType.dims()
-        && fieldType.metric() == rhs->fieldType.metric()
-        && fieldType.normalized() == rhs->fieldType.normalized()
+            == std::bit_cast<uint32_t>(rhs.minScanFraction)
+        && exact == rhs.exact && queryVec.size() == rhs.queryVec.size()
+        && fieldType.dims() == rhs.fieldType.dims()
+        && fieldType.metric() == rhs.fieldType.metric()
+        && fieldType.normalized() == rhs.fieldType.normalized()
         && fieldType.normalizeOnWrite()
-            == rhs->fieldType.normalizeOnWrite()
+            == rhs.fieldType.normalizeOnWrite()
         && (queryVec.empty()
-            || memcmp(queryVec.data(), rhs->queryVec.data(),
+            || memcmp(queryVec.data(), rhs.queryVec.data(),
                       queryVec.size_bytes()) == 0);
   }
 
@@ -310,10 +312,11 @@ public:
     value = mixHash(value, refineCandidates);
     value = mixHash(value, std::bit_cast<uint32_t>(minScanFraction));
     value = mixHash(value, exact);
-    value = mixHash(value, queryVec.size());
-    if (!queryVec.empty()) {
-      value = Hash::hash(queryVec.data(), queryVec.size_bytes(), value);
-    }
+    value = mixSampledSequence(
+        value, std::as_bytes(queryVec),
+        [](uint64_t seed, std::byte byte) {
+          return mixHash(seed, byte);
+        });
     value = mixHash(value, fieldType.dims());
     value = mixHash(value, (int32_t) fieldType.metric());
     value = mixHash(value, fieldType.normalized());
@@ -340,8 +343,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::KNN);
     out.appendString(field);
     out.appendSize(queryVec.size());
     for (float value : queryVec) out.appendFloat(value);

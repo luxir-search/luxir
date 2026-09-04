@@ -11,10 +11,10 @@ class AllQuery final : public luxir::Query {
 public:
   static inline bool disableDenseClauseForTests = false;
 
-  AllQuery() {}
+  AllQuery() : Query(QueryKind::ALL) {}
 
   bool equals(const Query& other) const override {
-    return dynamic_cast<const AllQuery*>(&other) != nullptr;
+    return other.getKind() == kind;
   }
 
   uint64_t hashImpl() const override { return Query::hashImpl(); }
@@ -34,8 +34,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::ALL);
     return FilterKeyScope::SEGMENT_STABLE;
   }
 

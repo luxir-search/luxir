@@ -33,19 +33,22 @@ public:
 
   TermQuery(std::string_view field, std::string_view term, float boost = 1.0f,
             bool useFrontierBound = true)
-      : field(field), term(term), boost(boost), useFrontierBound(useFrontierBound) {}
+      : Query(QueryKind::TERM), field(field), term(term), boost(boost),
+        useFrontierBound(useFrontierBound) {}
 
   TermQuery(std::string_view field, std::string_view term,
             const Similarity::TermStats& injectedTermStats, float boost = 1.0f,
             bool useFrontierBound = true)
-      : field(field), term(term), injectedTermStats(injectedTermStats), boost(boost),
+      : Query(QueryKind::TERM), field(field), term(term),
+        injectedTermStats(injectedTermStats), boost(boost),
         useFrontierBound(useFrontierBound), hasInjectedTermStats(true) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const TermQuery*>(&other);
-    return rhs != nullptr && !hasInjectedTermStats
-        && !rhs->hasInjectedTermStats && field == rhs->field
-        && term == rhs->term && useFrontierBound == rhs->useFrontierBound;
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const TermQuery&>(other);
+    return !hasInjectedTermStats && !rhs.hasInjectedTermStats
+        && field == rhs.field && term == rhs.term
+        && useFrontierBound == rhs.useFrontierBound;
   }
 
   uint64_t hashImpl() const override {
@@ -102,8 +105,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::TERM);
     out.appendString(field);
     out.appendTerm(term);
     // Membership key: boost, the frontier-bound granularity flag, and
@@ -1454,9 +1457,11 @@ public:
 
 inline BulkScorer* TermQuery::Weight::Supplier::buildBulk(
     MemPool& targetPool, const BulkPlan& plan) {
+  using DirectTermScorer = TermQuery::Scorer;
   assert(plan.available == BulkAnswer::YES);
   assert(!plan.hasConstantCount());
-  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight.createScorer(targetPool, segment));
+  auto* scorer = dynamic_cast<DirectTermScorer*>(
+      weight.createScorer(targetPool, segment));
   if (scorer == nullptr) {
     return nullptr;
   }

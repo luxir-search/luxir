@@ -283,7 +283,8 @@ class UncacheableQuery final : public Query {
   Query& child;
 
 public:
-  explicit UncacheableQuery(Query& child) : child(child) {}
+  explicit UncacheableQuery(Query& child)
+    : Query(QueryKind::TEST), child(child) {}
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -296,7 +297,8 @@ public:
 
   FilterKeyScope appendFilterKey(
       FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
-    unused(out, ctx);
+    out.appendKind(kind);
+    unused(ctx);
     return FilterKeyScope::UNCACHEABLE;
   }
 
@@ -341,7 +343,8 @@ class FailSecondSupplierQuery final : public Query {
   };
 
 public:
-  explicit FailSecondSupplierQuery(Query& child) : child(child) {}
+  explicit FailSecondSupplierQuery(Query& child)
+    : Query(QueryKind::TEST), child(child) {}
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -354,6 +357,7 @@ public:
 
   FilterKeyScope appendFilterKey(
       FilterKeyBuilder& out, const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     return child.appendFilterKey(out, ctx);
   }
 
@@ -5296,7 +5300,7 @@ std::optional<FilterKey> optionalKeyFor(const Query& query,
 
 FilterKey floatKey(uint32_t bits) {
   FilterKeyBuilder builder;
-  builder.appendTag(FilterKeyTag::CONSTANT_SCORE);
+  builder.appendKind(QueryKind::CONSTANT_SCORE);
   builder.appendFloat(std::bit_cast<float>(bits));
   return std::move(builder)
       .finish(FilterKeyScope::SEGMENT_STABLE, {})
@@ -5307,12 +5311,13 @@ class KeyOnlyTermQuery final : public Query {
   std::string_view term;
 
 public:
-  explicit KeyOnlyTermQuery(std::string_view term) : term(term) {}
+  explicit KeyOnlyTermQuery(std::string_view term)
+    : Query(QueryKind::TEST), term(term) {}
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::TERM);
     out.appendTerm(term);
     return FilterKeyScope::SEGMENT_STABLE;
   }

@@ -23,7 +23,8 @@ public:
 
   GeoDistanceQuery(std::string_view field, double centerLatitude,
                    double centerLongitude, double radiusMeters)
-      : field(field), centerLatitude(centerLatitude),
+      : Query(QueryKind::GEO_DISTANCE), field(field),
+        centerLatitude(centerLatitude),
         centerLongitude(centerLongitude), radiusMeters(radiusMeters) {
     geo::checkLatitude(centerLatitude);
     geo::checkLongitude(centerLongitude);
@@ -33,14 +34,15 @@ public:
   }
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const GeoDistanceQuery*>(&other);
-    return rhs != nullptr && field == rhs->field
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const GeoDistanceQuery&>(other);
+    return field == rhs.field
         && std::bit_cast<uint64_t>(centerLatitude)
-            == std::bit_cast<uint64_t>(rhs->centerLatitude)
+            == std::bit_cast<uint64_t>(rhs.centerLatitude)
         && std::bit_cast<uint64_t>(centerLongitude)
-            == std::bit_cast<uint64_t>(rhs->centerLongitude)
+            == std::bit_cast<uint64_t>(rhs.centerLongitude)
         && std::bit_cast<uint64_t>(radiusMeters)
-            == std::bit_cast<uint64_t>(rhs->radiusMeters);
+            == std::bit_cast<uint64_t>(rhs.radiusMeters);
   }
 
   uint64_t hashImpl() const override {
@@ -63,8 +65,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::GEO_DISTANCE);
     out.appendString(field);
     out.appendDouble(centerLatitude);
     out.appendDouble(centerLongitude);

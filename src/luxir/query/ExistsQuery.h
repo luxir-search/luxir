@@ -17,11 +17,13 @@ class ExistsQuery final : public Query {
   std::string_view field;
 
 public:
-  explicit ExistsQuery(std::string_view field) : field(field) {}
+  explicit ExistsQuery(std::string_view field)
+    : Query(QueryKind::EXISTS), field(field) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const ExistsQuery*>(&other);
-    return rhs != nullptr && field == rhs->field;
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const ExistsQuery&>(other);
+    return field == rhs.field;
   }
 
   uint64_t hashImpl() const override {
@@ -37,8 +39,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::EXISTS);
     out.appendString(field);
     return FilterKeyScope::SEGMENT_STABLE;
   }

@@ -39,6 +39,32 @@ class DocSet;
 class DocSetBuilder;
 class WindowFilter;
 
+enum class QueryKind : uint8_t {
+  TERM = 1,
+  PHRASE,
+  BOOLEAN,
+  BOOST,
+  CONSTANT_SCORE,
+  FORCE_PREPARE,
+  FUZZY,
+  NUMERIC_PREDICATE,
+  KNN,
+  AUTOMATON,
+  PREFIX,
+  TERM_RANGE,
+  TERM_IN_SET,
+  EXISTS,
+  GEO_BOX,
+  GEO_DISTANCE,
+  ALL,
+  NONE,
+  RESCORE,
+  TEST,
+};
+
+static_assert((uint8_t)QueryKind::TEST
+              < (uint8_t)FilterKeyTag::BOOLEAN_MANDATORY);
+
 enum class PreparedDomainDependence : uint8_t {
   // Prepared output is the canonical result of the query and may be
   // published under the query's segment/core-stable filter key.
@@ -302,6 +328,13 @@ struct CachedFieldInfo {
 inline constexpr int64_t kMaskFilterDensityInverse = 256;
 
 class Query {
+protected:
+  const QueryKind kind;
+
+  explicit Query(QueryKind kind) : kind(kind) {}
+  Query() = delete;
+
+private:
   // Structural hash, computed once by hash(). Only planning reaches it, and
   // planning runs single-threaded per request; a default copy carries it.
   mutable uint64_t cachedHash = 0;
@@ -313,6 +346,8 @@ class Query {
 #endif
 
 public:
+  QueryKind getKind() const { return kind; }
+
   void markPlannerGenerated() {
 #ifndef NDEBUG
     plannerGenerated = true;
@@ -595,9 +630,27 @@ protected:
     return Hash::hash(value.data(), value.size(), seed);
   }
 
+  // Hashes only enough sequence content to bucket equality candidates. The
+  // exact equals() check must not be preceded by an unbounded payload walk.
+  template <typename T, typename MixElement>
+  static uint64_t mixSampledSequence(
+      uint64_t seed, std::span<T> sequence, MixElement mixElement) {
+    seed = mixHash(seed, sequence.size());
+    constexpr size_t SAMPLE_SIZE = 4;
+    size_t headEnd = std::min(sequence.size(), SAMPLE_SIZE);
+    for (size_t i = 0; i < headEnd; i++) {
+      seed = mixElement(seed, sequence[i]);
+    }
+    size_t tailStart = sequence.size() <= SAMPLE_SIZE * 2
+        ? headEnd : sequence.size() - SAMPLE_SIZE;
+    for (size_t i = tailStart; i < sequence.size(); i++) {
+      seed = mixElement(seed, sequence[i]);
+    }
+    return seed;
+  }
+
   virtual uint64_t hashImpl() const {
-    std::string_view name = typeid(*this).name();
-    return Hash::hash(name.data(), name.size());
+    return Hash::hash(&kind, sizeof(kind));
   }
 
 public:

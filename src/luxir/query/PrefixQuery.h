@@ -16,11 +16,12 @@ class PrefixQuery final : public MultiTermQuery {
 
 public:
   PrefixQuery(std::string_view field, std::string_view prefix)
-    : MultiTermQuery(field), prefix(prefix) {}
+    : MultiTermQuery(QueryKind::PREFIX, field), prefix(prefix) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const PrefixQuery*>(&other);
-    return rhs != nullptr && field == rhs->field && prefix == rhs->prefix;
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const PrefixQuery&>(other);
+    return field == rhs.field && prefix == rhs.prefix;
   }
 
   uint64_t hashImpl() const override {
@@ -33,8 +34,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::PREFIX);
     out.appendString(field);
     out.appendTerm(prefix);
     return FilterKeyScope::SEGMENT_STABLE;

@@ -14,20 +14,23 @@ class BoostQuery final : public Query {
   float boost;
 
 public:
-  BoostQuery(Query* child, float boost) : child(child), boost(boost) {
+  BoostQuery(Query* child, float boost)
+    : Query(QueryKind::BOOST), child(child), boost(boost) {
     if (!std::isfinite(boost) || boost < 0.0f) {
       throw std::invalid_argument("query boost must be finite and non-negative");
     }
   }
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const BoostQuery*>(&other);
-    return rhs != nullptr && sameScoringClause(
-        const_cast<BoostQuery*>(this), const_cast<BoostQuery*>(rhs));
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const BoostQuery&>(other);
+    return sameScoringClause(const_cast<BoostQuery*>(this),
+                             const_cast<BoostQuery*>(&rhs));
   }
 
   uint64_t hashImpl() const override {
-    return scoringClauseHash(const_cast<BoostQuery*>(this));
+    return mixHash(Query::hashImpl(),
+                   scoringClauseHash(const_cast<BoostQuery*>(this)));
   }
 
   Query* getChild() const { return child; }

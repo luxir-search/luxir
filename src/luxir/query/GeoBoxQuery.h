@@ -27,7 +27,8 @@ public:
   using Weight = GeoQueryWeight<GeoBoxQuery, BKDBoxRelation>;
 
   GeoBoxQuery(std::string_view field, double minLat, double maxLat,
-              double minLon, double maxLon) : field(field) {
+              double minLon, double maxLon)
+    : Query(QueryKind::GEO_BOX), field(field) {
     geo::checkLatitude(minLat);
     geo::checkLatitude(maxLat);
     geo::checkLongitude(minLon);
@@ -54,12 +55,12 @@ public:
   }
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const GeoBoxQuery*>(&other);
-    return rhs != nullptr && field == rhs->field
-        && minLatitude == rhs->minLatitude
-        && maxLatitude == rhs->maxLatitude
-        && minLongitude == rhs->minLongitude
-        && maxLongitude == rhs->maxLongitude && empty == rhs->empty;
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const GeoBoxQuery&>(other);
+    return field == rhs.field && minLatitude == rhs.minLatitude
+        && maxLatitude == rhs.maxLatitude
+        && minLongitude == rhs.minLongitude
+        && maxLongitude == rhs.maxLongitude && empty == rhs.empty;
   }
 
   uint64_t hashImpl() const override {
@@ -85,8 +86,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::GEO_BOX);
     out.appendString(field);
     out.appendInt32(minLatitude);
     out.appendInt32(maxLatitude);

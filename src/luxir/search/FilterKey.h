@@ -17,6 +17,8 @@
 
 namespace luxir {
 
+enum class QueryKind : uint8_t;
+
 enum class FilterKeyScope : uint8_t {
   SEGMENT_STABLE = 0,
   CORE_STABLE = 1,
@@ -29,31 +31,13 @@ inline FilterKeyScope strongestFilterKeyScope(FilterKeyScope a,
   return (uint8_t)a >= (uint8_t)b ? a : b;
 }
 
-// In-memory keys cannot outlive their process-local encoder, so tags only need to be distinct within a build.
+// In-memory keys cannot outlive their process-local encoder, so tags only need
+// to be distinct within a build. Renumbering them is therefore harmless.
 enum class FilterKeyTag : uint8_t {
-  ALL = 1,
-  NONE = 2,
-  TERM = 3,
-  PHRASE = 4,
-  EXISTS = 5,
-  NUMERIC_PREDICATE_RANGE = 6,
-  PREFIX = 7,
-  TERM_RANGE = 8,
-  FUZZY = 9,
-  GEO_BOX = 10,
-  GEO_DISTANCE = 11,
-  KNN = 12,
-  BOOLEAN = 13,
-  CONSTANT_SCORE = 14,
-  BOOST = 15,
-  FORCE_PREPARE = 16,
-  BOOLEAN_MANDATORY = 17,
-  BOOLEAN_OPTIONAL = 18,
-  BOOLEAN_PROHIBITED = 19,
-  BOOLEAN_FILTER = 20,
-  WILDCARD = 21,
-  REGEX = 22,
-  ANY_OF = 23
+  BOOLEAN_MANDATORY = 21,
+  BOOLEAN_OPTIONAL = 22,
+  BOOLEAN_PROHIBITED = 23,
+  BOOLEAN_FILTER = 24,
 };
 
 // Correctness envelope: schemaGen and timeZone always, plus coreGen for CORE_STABLE scope.
@@ -119,8 +103,16 @@ class FilterKeyBuilder {
   }
 
 public:
+  void appendKind(QueryKind kind) {
+    bytes.push_back((std::byte)kind);
+  }
+
   void appendTag(FilterKeyTag tag) {
     bytes.push_back((std::byte)tag);
+  }
+
+  void appendByte(uint8_t value) {
+    bytes.push_back((std::byte)value);
   }
 
   void appendBool(bool value) {

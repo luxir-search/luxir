@@ -9,10 +9,10 @@ namespace luxir {
 // yields a null scorer for every segment.
 class MatchNoDocsQuery final : public luxir::Query {
 public:
-  MatchNoDocsQuery() {}
+  MatchNoDocsQuery() : Query(QueryKind::NONE) {}
 
   bool equals(const Query& other) const override {
-    return dynamic_cast<const MatchNoDocsQuery*>(&other) != nullptr;
+    return other.getKind() == kind;
   }
 
   uint64_t hashImpl() const override { return Query::hashImpl(); }
@@ -26,8 +26,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::NONE);
     return FilterKeyScope::SEGMENT_STABLE;
   }
 

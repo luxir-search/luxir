@@ -24,7 +24,7 @@ public:
   enum class Kind { WILDCARD, REGEX };
 
 private:
-  Kind kind;
+  Kind automatonKind;
   std::string_view pattern;
   automaton::ByteDfaView dfa;
   automaton::ByteDfaKind classification;
@@ -35,25 +35,28 @@ public:
   AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
                  std::string_view exactOrPrefix, DfaScanPlan scanPlan)
-      : MultiTermQuery(field), kind(kind), pattern(pattern), dfa(dfa),
+      : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
+        pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
         scanPlan(scanPlan) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const AutomatonQuery*>(&other);
-    return rhs != nullptr && kind == rhs->kind && field == rhs->field
-        && pattern == rhs->pattern;
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const AutomatonQuery&>(other);
+    return automatonKind == rhs.automatonKind && field == rhs.field
+        && pattern == rhs.pattern;
   }
 
   uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), kind);
+    uint64_t value = mixHash(Query::hashImpl(), automatonKind);
     value = mixHash(value, field);
     return mixHash(value, pattern);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
-    out.appendTag(kind == Kind::WILDCARD ? FilterKeyTag::WILDCARD : FilterKeyTag::REGEX);
+    out.appendKind(kind);
+    out.appendByte((uint8_t)automatonKind);
     out.appendString(field);
     out.appendTerm(pattern);
     unused(ctx);

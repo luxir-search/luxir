@@ -16,6 +16,7 @@
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/Collector.h"
@@ -170,6 +171,19 @@ TEST(QueryEqualsTest, phraseAndBooleanStructure) {
   EXPECT_EQ(cachedHash, first.hash());
   EXPECT_FALSE(first.equals(reordered));
   EXPECT_FALSE(first.equals(otherMin));
+}
+
+TEST(QueryEqualsTest, sampledHashDoesNotWeakenExactEquality) {
+  std::array<std::string_view, 12> first{
+      "00", "01", "02", "03", "04", "05",
+      "06", "07", "08", "09", "10", "11"};
+  std::array<std::string_view, 12> middleDifferent{
+      "00", "01", "02", "03", "04", "05x",
+      "06", "07", "08", "09", "10", "11"};
+  TermInSetQuery firstQuery("f", first);
+  TermInSetQuery middleDifferentQuery("f", middleDifferent);
+
+  EXPECT_FALSE(firstQuery.equals(middleDifferentQuery));
 }
 
 TEST_F(BooleanQueryDedupTest, optionalDuplicateScoresExactlyLikeBoostTwo) {

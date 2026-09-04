@@ -26,6 +26,10 @@
 namespace luxir {
 
 class BooleanQuery final : public luxir::Query {
+  using DirectTermScorer = TermQuery::Scorer;
+  using PreparedDocSetScorer = QueryPrep::DocSetScorer;
+  using PreparedDocSetSupplier = QueryPrep::DocSetSupplier;
+
   std::span<Query*> mandatory;
   std::span<Query*> optional;
   std::span<Query*> prohibited;
@@ -130,20 +134,22 @@ private:
                                                 bool allowConstantScore) {
     float boost = 1.0f;
     while (true) {
-      if (auto* wrapped = dynamic_cast<BoostQuery*>(query)) {
+      if (query->getKind() == QueryKind::BOOST) {
+        auto* wrapped = static_cast<BoostQuery*>(query);
         boost = checkedBoostProduct(boost, wrapped->getBoost());
         query = wrapped->getChild();
         continue;
       }
-      if (allowConstantScore) {
-        if (auto* wrapped = dynamic_cast<ConstantScoreQuery*>(query)) {
-          query = wrapped->getChild();
-          continue;
-        }
+      if (allowConstantScore
+          && query->getKind() == QueryKind::CONSTANT_SCORE) {
+        query = static_cast<ConstantScoreQuery*>(query)->getChild();
+        continue;
       }
       break;
     }
-    return {dynamic_cast<BooleanQuery*>(query), boost};
+    return {query->getKind() == QueryKind::BOOLEAN
+                ? static_cast<BooleanQuery*>(query) : nullptr,
+            boost};
   }
 
   static Query* scoringClause(MemPool& pool, Query* query, float boost) {
@@ -162,10 +168,10 @@ private:
   static bool isComplementForm(const BooleanQuery& query) {
     bool optionalCarrier = query.mandatory.empty()
         && query.optional.size() == 1
-        && dynamic_cast<AllQuery*>(query.optional[0]) != nullptr;
+        && query.optional[0]->getKind() == QueryKind::ALL;
     bool requiredCarrier = query.optional.empty()
         && query.mandatory.size() == 1
-        && dynamic_cast<AllQuery*>(query.mandatory[0]) != nullptr;
+        && query.mandatory[0]->getKind() == QueryKind::ALL;
     return (optionalCarrier || requiredCarrier) && !query.prohibited.empty()
         && query.filter.empty() && query.minShouldMatch <= 1;
   }
@@ -256,7 +262,7 @@ private:
       size_t i = 0;
       while (i < list.size()) {
         if (plan.mandatory.size() + plan.filter.size() <= 1) return;
-        if (dynamic_cast<AllQuery*>(list[i]) != nullptr) {
+        if (list[i]->getKind() == QueryKind::ALL) {
           list.erase(list.begin() + (ptrdiff_t) i);
           plan.ruleMask |= R5_MATCH_ALL_ELIMINATE;
           continue;
@@ -463,7 +469,8 @@ private:
       DuplicateSlot& duplicate = duplicates.slots[(size_t) group];
       if (i != duplicate.representative) continue;
       Query* core = peelScoringClause(clauses[i]).core;
-      if (auto* term = dynamic_cast<TermQuery*>(core)) {
+      if (core->getKind() == QueryKind::TERM) {
+        auto* term = static_cast<TermQuery*>(core);
         core = pool.make<TermQuery>(
             term->getField(), term->getTerm(), duplicate.boost,
             term->shouldUseFrontierBound());
@@ -758,17 +765,19 @@ public:
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
-          : mandatory(mandatory), optional(optional), prohibited(prohibited), filter(filter),
+          : Query(QueryKind::BOOLEAN), mandatory(mandatory), optional(optional),
+            prohibited(prohibited), filter(filter),
             minShouldMatch(minShouldMatch) {
   }
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const BooleanQuery*>(&other);
-    if (rhs == nullptr || minShouldMatch != rhs->minShouldMatch
-        || mandatory.size() != rhs->mandatory.size()
-        || optional.size() != rhs->optional.size()
-        || prohibited.size() != rhs->prohibited.size()
-        || filter.size() != rhs->filter.size()) {
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const BooleanQuery&>(other);
+    if (minShouldMatch != rhs.minShouldMatch
+        || mandatory.size() != rhs.mandatory.size()
+        || optional.size() != rhs.optional.size()
+        || prohibited.size() != rhs.prohibited.size()
+        || filter.size() != rhs.filter.size()) {
       return false;
     }
     auto sameList = [](std::span<Query*> a, std::span<Query*> b) {
@@ -777,19 +786,20 @@ public:
       }
       return true;
     };
-    return sameList(mandatory, rhs->mandatory)
-        && sameList(optional, rhs->optional)
-        && sameList(prohibited, rhs->prohibited)
-        && sameList(filter, rhs->filter);
+    return sameList(mandatory, rhs.mandatory)
+        && sameList(optional, rhs.optional)
+        && sameList(prohibited, rhs.prohibited)
+        && sameList(filter, rhs.filter);
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), minShouldMatch);
     auto mixList = [&](std::span<Query*> clauses) {
-      value = mixHash(value, clauses.size());
-      for (Query* clause : clauses) {
-        value = mixHash(value, scoringClauseHash(clause));
-      }
+      value = mixSampledSequence(
+          value, clauses,
+          [](uint64_t seed, Query* clause) {
+            return mixHash(seed, scoringClauseHash(clause));
+          });
     };
     mixList(mandatory);
     mixList(optional);
@@ -850,17 +860,21 @@ public:
     bool hasDynamicTerms = false;
     auto classify = [&](std::span<Query*> clauses) {
       for (Query* clause : clauses) {
-        while (auto* boost = dynamic_cast<BoostQuery*>(clause)) {
-          clause = boost->getChild();
+        while (clause->getKind() == QueryKind::BOOST) {
+          clause = static_cast<BoostQuery*>(clause)->getChild();
         }
-        while (auto* constant = dynamic_cast<ConstantScoreQuery*>(clause)) {
-          clause = constant->getChild();
-          while (auto* boost = dynamic_cast<BoostQuery*>(clause)) {
-            clause = boost->getChild();
+        while (clause->getKind() == QueryKind::CONSTANT_SCORE) {
+          clause = static_cast<ConstantScoreQuery*>(clause)->getChild();
+          while (clause->getKind() == QueryKind::BOOST) {
+            clause = static_cast<BoostQuery*>(clause)->getChild();
           }
         }
-        if (dynamic_cast<TermQuery*>(clause) != nullptr) continue;
-        if (dynamic_cast<MultiTermQuery*>(clause) != nullptr) {
+        if (clause->getKind() == QueryKind::TERM) continue;
+        QueryKind clauseKind = clause->getKind();
+        if (clauseKind == QueryKind::AUTOMATON
+            || clauseKind == QueryKind::PREFIX
+            || clauseKind == QueryKind::TERM_RANGE
+            || clauseKind == QueryKind::TERM_IN_SET) {
           hasDynamicTerms = true;
         } else {
           hasOther = true;
@@ -921,7 +935,7 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
-    out.appendTag(FilterKeyTag::BOOLEAN);
+    out.appendKind(kind);
     out.appendInt32(minShouldMatch);
     FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE;
     auto appendRole = [&](FilterKeyTag role, std::span<Query*> clauses) {
@@ -1066,14 +1080,14 @@ public:
         SparseFilteredTopKFamily::CONJUNCTION;
 
     static bool sparseFilteredTopKMandatory(Query* query) {
-      while (auto* boost = dynamic_cast<BoostQuery*>(query)) {
-        query = boost->getChild();
+      while (query->getKind() == QueryKind::BOOST) {
+        query = static_cast<BoostQuery*>(query)->getChild();
       }
-      if (dynamic_cast<TermQuery*>(query) != nullptr) {
+      if (query->getKind() == QueryKind::TERM) {
         return true;
       }
-      auto* phrase = dynamic_cast<PhraseQuery*>(query);
-      return phrase != nullptr && phrase->getSlop() == 0;
+      return query->getKind() == QueryKind::PHRASE
+          && static_cast<PhraseQuery*>(query)->getSlop() == 0;
     }
 
     static bool lessMaxScore(float a, float b) {
@@ -3337,12 +3351,12 @@ public:
           switch (shape.directKind) {
             case Query::DirectScorerKind::TERM:
               layout.directTerm =
-                  dynamic_cast<TermQuery::Scorer*>(scorer);
+                  dynamic_cast<DirectTermScorer*>(scorer);
               assert(layout.directTerm != nullptr);
               break;
             case Query::DirectScorerKind::DOC_SET:
               layout.directDocSet =
-                  dynamic_cast<QueryPrep::DocSetScorer*>(scorer);
+                  dynamic_cast<PreparedDocSetScorer*>(scorer);
               assert(layout.directDocSet != nullptr);
               break;
             case Query::DirectScorerKind::OTHER:
@@ -3377,7 +3391,7 @@ public:
                 assert(!layout.termMembers.empty());
 #ifndef NDEBUG
                 for (Query::Scorer* member : layout.termMembers) {
-                  assert(dynamic_cast<TermQuery::Scorer*>(member) != nullptr);
+                  assert(dynamic_cast<DirectTermScorer*>(member) != nullptr);
                 }
 #endif
               }
@@ -3451,7 +3465,7 @@ public:
         std::span<DocSet*> candidateFilterDocSets;
         if (plan.termFeed) {
           assert(plan.independentLeadPlan != nullptr);
-          candidateLeadScoreScorer = dynamic_cast<TermQuery::Scorer*>(
+          candidateLeadScoreScorer = dynamic_cast<DirectTermScorer*>(
               plan.independentLeadPlan->buildIndependent(targetPool));
           assert(candidateLeadScoreScorer != nullptr);
           if (candidateLeadScoreScorer == nullptr) {
@@ -3469,7 +3483,7 @@ public:
             if (!plan.entries[i].filter) continue;
             candidateFilters[i] = 1;
             if (auto* supplier =
-                    dynamic_cast<QueryPrep::DocSetSupplier*>(
+                    dynamic_cast<PreparedDocSetSupplier*>(
                         plan.entries[i].supplier)) {
               candidateFilterDocSets[i] = supplier->docSet();
             }
@@ -3536,13 +3550,13 @@ public:
             if (prohibited.shape.directDocSet
                 == Query::DirectDocSetAccess::SUPPORTED) {
               auto* docSetScorer =
-                  dynamic_cast<QueryPrep::DocSetScorer*>(scorer);
+                  dynamic_cast<PreparedDocSetScorer*>(scorer);
               assert(docSetScorer != nullptr);
               if (docSetScorer == nullptr) return {};
               docSets.push_back(docSetScorer->docSet());
               continue;
             }
-            if (auto* term = dynamic_cast<TermQuery::Scorer*>(scorer)) {
+            if (auto* term = dynamic_cast<DirectTermScorer*>(scorer)) {
               terms.push_back(term);
               continue;
             }
@@ -3552,7 +3566,7 @@ public:
               return {};
             }
             for (auto* member : members) {
-              auto* term = dynamic_cast<TermQuery::Scorer*>(member);
+              auto* term = dynamic_cast<DirectTermScorer*>(member);
               assert(term != nullptr);
               if (term == nullptr) {
                 return {};
@@ -3971,7 +3985,7 @@ public:
         bool arrayFilterFeed = false;
         bool postingsFilterFeed = false;
         if (auto* docSetSupplier =
-                dynamic_cast<QueryPrep::DocSetSupplier*>(filterSupplier)) {
+                dynamic_cast<PreparedDocSetSupplier*>(filterSupplier)) {
           DocSet* docs = docSetSupplier->docSet();
           if (docs == nullptr || docs->card() == 0) {
             return declined();
@@ -4071,7 +4085,7 @@ public:
           filterScorer = plan.filter.plan->build(targetPool);
           assert(filterScorer != nullptr);
           if (plan.postingsFilterFeed) {
-            postingsScorer = dynamic_cast<TermQuery::Scorer*>(filterScorer);
+            postingsScorer = dynamic_cast<DirectTermScorer*>(filterScorer);
             assert(postingsScorer != nullptr);
           }
         }
@@ -4079,7 +4093,7 @@ public:
             plan.optional.size());
         for (size_t i = 0; i < plan.optional.size(); i++) {
           Query::Scorer* scorer = plan.optional[i].plan->build(targetPool);
-          terms[i] = dynamic_cast<TermQuery::Scorer*>(scorer);
+          terms[i] = dynamic_cast<DirectTermScorer*>(scorer);
           assert(terms[i] != nullptr);
         }
         return targetPool.make<BooleanQuery::FilteredDisjunctionBulkScorer>(
@@ -5072,7 +5086,7 @@ public:
       if (constant) traits |= IS_CONSTANT_SCORING;
       if (query.mandatory.empty() && query.optional.empty()
           && query.prohibited.empty() && query.filter.size() == 1
-          && dynamic_cast<TermQuery*>(query.filter[0]) != nullptr) {
+          && query.filter[0]->getKind() == QueryKind::TERM) {
         traits |= PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN;
       }
       bool directTermUnion = mandatoryClauses.empty()
@@ -5081,7 +5095,7 @@ public:
           && std::all_of(
               optionalClauses.begin(), optionalClauses.end(),
               [](Query* clause) {
-                return dynamic_cast<TermQuery*>(clause) != nullptr;
+                return clause->getKind() == QueryKind::TERM;
               });
       bool unfilteredConstantComplement = constant
           && filterWeights.empty() && optionalWeights.empty()
@@ -6898,11 +6912,11 @@ public:
           if (approximation.kind == ApproxSlot::Kind::DOCS_ENUM) {
             kinds[i] = ExactApproxKind::DOCS_ENUM;
           } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
-                     && dynamic_cast<TermQuery::Scorer*>(
+                     && dynamic_cast<DirectTermScorer*>(
                             approximation.scorer) != nullptr) {
             kinds[i] = ExactApproxKind::TERM_SCORER;
           } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
-                     && dynamic_cast<QueryPrep::DocSetScorer*>(
+                     && dynamic_cast<PreparedDocSetScorer*>(
                             approximation.scorer) != nullptr) {
             kinds[i] = ExactApproxKind::DOC_SET;
           } else {
@@ -10423,7 +10437,7 @@ public:
       if (!enabled) return;
       assert(clauseCosts.size() == scorers.size());
       assert(largestIndex < scorers.size());
-      assert(dynamic_cast<TermQuery::Scorer*>(
+      assert(dynamic_cast<DirectTermScorer*>(
           scorers[largestIndex]) != nullptr);
 
       disjCountIdentityOthers =
@@ -10431,7 +10445,7 @@ public:
       size_t other = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
         if (i != largestIndex) {
-          auto* term = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
+          auto* term = dynamic_cast<DirectTermScorer*>(scorers[i]);
           assert(term != nullptr);
           disjCountIdentityOthers[other++] = term;
         }
@@ -10452,7 +10466,7 @@ public:
       size_t termCount = 0;
       bool hasConjunction = false;
       for (auto* scorer : scorers) {
-        if (dynamic_cast<TermQuery::Scorer*>(scorer) != nullptr) {
+        if (dynamic_cast<DirectTermScorer*>(scorer) != nullptr) {
           termCount++;
           continue;
         }
@@ -10461,7 +10475,7 @@ public:
           return;
         }
         for (auto* term : terms) {
-          if (dynamic_cast<TermQuery::Scorer*>(term) == nullptr) {
+          if (dynamic_cast<DirectTermScorer*>(term) == nullptr) {
             return;
           }
         }

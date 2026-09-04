@@ -78,16 +78,18 @@ public:
 
   FuzzyQuery(std::string_view field, std::string_view term, int maxEdits,
              int prefixLength = 0, int maxExpansions = 0, float boost = 1.0f)
-    : field(field), boost(boost), term(term), maxEdits(maxEdits),
+    : Query(QueryKind::FUZZY), field(field), boost(boost), term(term),
+      maxEdits(maxEdits),
       prefixLength(std::min(prefixLength, (int)term.size())), maxExpansions(maxExpansions) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const FuzzyQuery*>(&other);
-    return rhs != nullptr && field == rhs->field && term == rhs->term
-        && maxEdits == rhs->maxEdits && prefixLength == rhs->prefixLength
-        && maxExpansions == rhs->maxExpansions
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const FuzzyQuery&>(other);
+    return field == rhs.field && term == rhs.term
+        && maxEdits == rhs.maxEdits && prefixLength == rhs.prefixLength
+        && maxExpansions == rhs.maxExpansions
         && std::bit_cast<uint32_t>(boost)
-            == std::bit_cast<uint32_t>(rhs->boost);
+            == std::bit_cast<uint32_t>(rhs.boost);
   }
 
   uint64_t hashImpl() const override {
@@ -116,7 +118,7 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
-    out.appendTag(FilterKeyTag::FUZZY);
+    out.appendKind(kind);
     out.appendString(field);
     out.appendTerm(term);
     out.appendInt32(maxEdits);

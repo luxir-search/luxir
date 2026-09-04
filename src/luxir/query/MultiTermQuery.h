@@ -25,7 +25,8 @@ public:
   static inline bool disableDenseFillForTests = false;
   static inline bool disableTruthfulCostForTests = false;
 
-  explicit MultiTermQuery(std::string_view field) : field(field) {}
+  MultiTermQuery(QueryKind kind, std::string_view field)
+    : Query(kind), field(field) {}
 
   std::string_view getField() const { return field; }
   ScoreProfile scoreProfile() const override {

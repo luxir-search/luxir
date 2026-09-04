@@ -33,12 +33,13 @@ public:
   static inline bool disableShapesForTests = false;
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi)
-    : field(field), envelope{lo, hi} {}
+    : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi} {}
 
   NumericPredicateQuery(std::string_view field,
                         std::span<const int64_t> exactValues,
                         std::span<const PointsReader::ValueRange> intervals)
-    : field(field), envelope{exactValues.front(), exactValues.back()},
+    : Query(QueryKind::NUMERIC_PREDICATE), field(field),
+      envelope{exactValues.front(), exactValues.back()},
       exactValues(exactValues), exactIntervals(intervals) {
     assert(exactValues.size() > 1);
     assert(!intervals.empty());
@@ -48,18 +49,19 @@ public:
   }
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const NumericPredicateQuery*>(&other);
-    if (rhs == nullptr || field != rhs->field
-        || envelope.lo != rhs->envelope.lo || envelope.hi != rhs->envelope.hi
-        || exactValues.size() != rhs->exactValues.size()
-        || exactIntervals.size() != rhs->exactIntervals.size()
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const NumericPredicateQuery&>(other);
+    if (field != rhs.field
+        || envelope.lo != rhs.envelope.lo || envelope.hi != rhs.envelope.hi
+        || exactValues.size() != rhs.exactValues.size()
+        || exactIntervals.size() != rhs.exactIntervals.size()
         || !std::equal(exactValues.begin(), exactValues.end(),
-                       rhs->exactValues.begin())) {
+                       rhs.exactValues.begin())) {
       return false;
     }
     return std::equal(
         exactIntervals.begin(), exactIntervals.end(),
-        rhs->exactIntervals.begin(),
+        rhs.exactIntervals.begin(),
         [](const PointsReader::ValueRange& a,
            const PointsReader::ValueRange& b) {
           return a.lo == b.lo && a.hi == b.hi;
@@ -70,14 +72,17 @@ public:
     uint64_t value = mixHash(Query::hashImpl(), field);
     value = mixHash(value, envelope.lo);
     value = mixHash(value, envelope.hi);
-    value = mixHash(value, exactValues.size());
-    for (int64_t exact : exactValues) value = mixHash(value, exact);
-    value = mixHash(value, exactIntervals.size());
-    for (const auto& interval : exactIntervals) {
-      value = mixHash(value, interval.lo);
-      value = mixHash(value, interval.hi);
-    }
-    return value;
+    value = mixSampledSequence(
+        value, exactValues,
+        [](uint64_t seed, int64_t exact) {
+          return mixHash(seed, exact);
+        });
+    return mixSampledSequence(
+        value, exactIntervals,
+        [](uint64_t seed, const PointsReader::ValueRange& interval) {
+          seed = mixHash(seed, interval.lo);
+          return mixHash(seed, interval.hi);
+        });
   }
 
   std::string_view getField() const { return field; }
@@ -136,9 +141,9 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(exactValues.empty()
-        ? FilterKeyTag::NUMERIC_PREDICATE_RANGE : FilterKeyTag::ANY_OF);
+    out.appendByte(exactValues.empty() ? 0 : 1);
     out.appendString(field);
     if (exactValues.empty()) {
       out.appendInt64(envelope.lo);

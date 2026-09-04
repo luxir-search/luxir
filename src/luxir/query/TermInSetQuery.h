@@ -16,28 +16,30 @@ class TermInSetQuery final : public MultiTermQuery {
 public:
   TermInSetQuery(std::string_view field,
                  std::span<const std::string_view> terms)
-    : MultiTermQuery(field), terms(terms) {}
+    : MultiTermQuery(QueryKind::TERM_IN_SET, field), terms(terms) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const TermInSetQuery*>(&other);
-    return rhs != nullptr && field == rhs->field
-        && terms.size() == rhs->terms.size()
-        && std::equal(terms.begin(), terms.end(), rhs->terms.begin());
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const TermInSetQuery&>(other);
+    return field == rhs.field && terms.size() == rhs.terms.size()
+        && std::equal(terms.begin(), terms.end(), rhs.terms.begin());
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), field);
-    value = mixHash(value, terms.size());
-    for (std::string_view term : terms) value = mixHash(value, term);
-    return value;
+    return mixSampledSequence(
+        value, terms,
+        [](uint64_t seed, std::string_view term) {
+          return mixHash(seed, term);
+        });
   }
 
   std::span<const std::string_view> getTerms() const { return terms; }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::ANY_OF);
     out.appendString(field);
     out.appendSize(terms.size());
     for (std::string_view term : terms) out.appendTerm(term);

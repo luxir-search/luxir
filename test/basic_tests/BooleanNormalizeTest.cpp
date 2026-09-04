@@ -617,11 +617,13 @@ TEST_F(BooleanNormalizeTest,
     Query& child;
 
   public:
-    explicit MissingChildValidationQuery(Query& child) : child(child) {}
+    explicit MissingChildValidationQuery(Query& child)
+      : Query(QueryKind::TEST), child(child) {}
 
     FilterKeyScope appendFilterKey(
         FilterKeyBuilder& out, const FilterKeyContext& keyContext) const override {
-      unused(out, keyContext);
+      out.appendKind(kind);
+      unused(keyContext);
       return FilterKeyScope::UNCACHEABLE;
     }
 

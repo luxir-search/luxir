@@ -16,12 +16,13 @@ class ForcePrepareQuery final : public luxir::Query {
 public:
   static inline std::atomic<int64_t> prepareCallsForTests{0};
 
-  explicit ForcePrepareQuery(Query* child) : child(child) {}
+  explicit ForcePrepareQuery(Query* child)
+    : Query(QueryKind::FORCE_PREPARE), child(child) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const ForcePrepareQuery*>(&other);
-    return rhs != nullptr && sameScoringClause(
-        child, rhs->child);
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const ForcePrepareQuery&>(other);
+    return sameScoringClause(child, rhs.child);
   }
 
   uint64_t hashImpl() const override {

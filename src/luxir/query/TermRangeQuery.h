@@ -25,14 +25,15 @@ public:
   TermRangeQuery(std::string_view field, std::optional<std::string_view> lower,
                  bool includeLower, std::optional<std::string_view> upper,
                  bool includeUpper)
-    : MultiTermQuery(field), lower(lower), upper(upper),
+    : MultiTermQuery(QueryKind::TERM_RANGE, field), lower(lower), upper(upper),
       includeLower(includeLower), includeUpper(includeUpper) {}
 
   bool equals(const Query& other) const override {
-    const auto* rhs = dynamic_cast<const TermRangeQuery*>(&other);
-    return rhs != nullptr && field == rhs->field && lower == rhs->lower
-        && upper == rhs->upper && includeLower == rhs->includeLower
-        && includeUpper == rhs->includeUpper;
+    if (other.getKind() != kind) return false;
+    const auto& rhs = static_cast<const TermRangeQuery&>(other);
+    return field == rhs.field && lower == rhs.lower
+        && upper == rhs.upper && includeLower == rhs.includeLower
+        && includeUpper == rhs.includeUpper;
   }
 
   uint64_t hashImpl() const override {
@@ -52,8 +53,8 @@ public:
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
+    out.appendKind(kind);
     unused(ctx);
-    out.appendTag(FilterKeyTag::TERM_RANGE);
     out.appendString(field);
     out.appendOptionalTerm(lower);
     out.appendBool(includeLower);

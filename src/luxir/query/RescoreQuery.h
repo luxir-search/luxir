@@ -393,7 +393,8 @@ class RescoreQuery final : public Query {
 public:
   RescoreQuery(Query* child, ValueProgram* program,
                std::optional<float> constantOutput = std::nullopt)
-    : child(child), program(program), constantOutput(constantOutput) {}
+    : Query(QueryKind::RESCORE), child(child), program(program),
+      constantOutput(constantOutput) {}
 
   bool equals(const Query& other) const override {
     unused(other);
