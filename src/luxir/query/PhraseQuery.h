@@ -302,6 +302,31 @@ public:
     assert(slop >= 0);
   }
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const PhraseQuery&>(other);
+    return field == rhs.field && slop == rhs.slop
+        && terms.size() == rhs.terms.size()
+        && positions.size() == rhs.positions.size()
+        && std::equal(terms.begin(), terms.end(), rhs.terms.begin())
+        && std::equal(positions.begin(), positions.end(),
+                      rhs.positions.begin());
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, slop);
+    value = mixSampledSequence(
+        value, terms,
+        [](uint64_t seed, std::string_view term) {
+          return mixHash(seed, term);
+        });
+    return mixSampledSequence(
+        value, positions,
+        [](uint64_t seed, int32_t position) {
+          return mixHash(seed, position);
+        });
+  }
+
   [[nodiscard]] std::string_view getField() const { return field; }
   [[nodiscard]] std::span<std::string_view> getTerms() const { return terms; }
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }

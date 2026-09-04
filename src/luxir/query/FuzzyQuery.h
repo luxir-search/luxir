@@ -81,6 +81,24 @@ public:
       maxEdits(maxEdits),
       prefixLength(std::min(prefixLength, (int)term.size())), maxExpansions(maxExpansions) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const FuzzyQuery&>(other);
+    return field == rhs.field && term == rhs.term
+        && maxEdits == rhs.maxEdits && prefixLength == rhs.prefixLength
+        && maxExpansions == rhs.maxExpansions
+        && std::bit_cast<uint32_t>(boost)
+            == std::bit_cast<uint32_t>(rhs.boost);
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, term);
+    value = mixHash(value, maxEdits);
+    value = mixHash(value, prefixLength);
+    value = mixHash(value, maxExpansions);
+    return mixHash(value, std::bit_cast<uint32_t>(boost));
+  }
+
   std::string_view getField() const { return field; }
   float getBoost() const { return boost; }
   std::string_view getTerm() const { return term; }

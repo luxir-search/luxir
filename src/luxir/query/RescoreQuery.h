@@ -396,6 +396,13 @@ public:
     : Query(QueryKind::RESCORE), child(child), program(program),
       constantOutput(constantOutput) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    unused(other);
+    return false;
+  }
+
+  uint64_t hashImpl() const override { return Query::hashImpl(); }
+
   Query* getChild() const { return child; }
   ValueProgram& getProgram() const { return *program; }
   const std::optional<float>& getConstantOutput() const {

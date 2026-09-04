@@ -105,10 +105,10 @@ TEST(QueryEqualsTest, boostPeelingAndWrappers) {
   Similarity::TermStats stats{.docFreq = 1, .totalTermFreq = 1};
   TermQuery injected("f", "a", stats);
 
-  EXPECT_TRUE(queryEquals(term2, term3));
-  EXPECT_EQ(queryHash(term2), queryHash(term3));
-  EXPECT_FALSE(queryEquals(term2, noFrontier));
-  EXPECT_FALSE(queryEquals(injected, injected));
+  EXPECT_TRUE(term2.equals(term3));
+  EXPECT_EQ(term2.hash(), term3.hash());
+  EXPECT_FALSE(term2.equals(noFrontier));
+  EXPECT_FALSE(injected.equals(injected));
 
   BoostQuery boost3OfTerm2(&term2, 3.0f);
   BoostQuery boost2OfTerm3(&term3, 2.0f);
@@ -118,19 +118,19 @@ TEST(QueryEqualsTest, boostPeelingAndWrappers) {
       &boost3OfTerm2, &boost2OfTerm3));
   EXPECT_FALSE(sameScoringClause(
       &boost3OfTerm2, &boost3OfTerm1));
-  EXPECT_TRUE(queryEquals(boost3OfTerm2, boost2OfTerm3));
-  EXPECT_FALSE(queryEquals(boost3OfTerm2, boost3OfTerm1));
-  EXPECT_EQ(queryHash(boost3OfTerm2), queryHash(boost2OfTerm3));
+  EXPECT_TRUE(boost3OfTerm2.equals(boost2OfTerm3));
+  EXPECT_FALSE(boost3OfTerm2.equals(boost3OfTerm1));
+  EXPECT_EQ(boost3OfTerm2.hash(), boost2OfTerm3.hash());
   EXPECT_EQ(scoringClauseHash(&boost3OfTerm2),
             scoringClauseHash(&boost2OfTerm3));
 
   ForcePrepareQuery prepare2(&term2);
   ForcePrepareQuery prepare3(&term3);
-  EXPECT_FALSE(queryEquals(prepare2, prepare3));
+  EXPECT_FALSE(prepare2.equals(prepare3));
 
   ConstantScoreQuery constant2(&term1, 2.0f);
   ConstantScoreQuery constant3(&term1, 3.0f);
-  EXPECT_FALSE(queryEquals(constant2, constant3));
+  EXPECT_FALSE(constant2.equals(constant3));
 }
 
 TEST(QueryEqualsTest, phraseAndBooleanStructure) {
@@ -147,12 +147,12 @@ TEST(QueryEqualsTest, phraseAndBooleanStructure) {
   PhraseQuery otherPositions("f", phraseTerms2, gapped, 0);
   PhraseQuery otherSlop("f", phraseTerms2, adjacent2, 1);
 
-  EXPECT_TRUE(queryEquals(phrase1, phrase2));
-  EXPECT_EQ(queryHash(phrase1), queryHash(phrase2));
-  EXPECT_FALSE(queryEquals(phrase1, otherField));
-  EXPECT_FALSE(queryEquals(phrase1, otherTerms));
-  EXPECT_FALSE(queryEquals(phrase1, otherPositions));
-  EXPECT_FALSE(queryEquals(phrase1, otherSlop));
+  EXPECT_TRUE(phrase1.equals(phrase2));
+  EXPECT_EQ(phrase1.hash(), phrase2.hash());
+  EXPECT_FALSE(phrase1.equals(otherField));
+  EXPECT_FALSE(phrase1.equals(otherTerms));
+  EXPECT_FALSE(phrase1.equals(otherPositions));
+  EXPECT_FALSE(phrase1.equals(otherSlop));
 
   TermQuery a1("f", "a");
   TermQuery b1("f", "b");
@@ -166,12 +166,12 @@ TEST(QueryEqualsTest, phraseAndBooleanStructure) {
   BooleanQuery reordered({}, ba, {}, {}, 1);
   BooleanQuery otherMin({}, ab2, {}, {}, 2);
 
-  EXPECT_TRUE(queryEquals(first, equal));
-  EXPECT_EQ(queryHash(first), queryHash(equal));
-  uint64_t cachedHash = queryHash(first);
-  EXPECT_EQ(cachedHash, queryHash(first));
-  EXPECT_FALSE(queryEquals(first, reordered));
-  EXPECT_FALSE(queryEquals(first, otherMin));
+  EXPECT_TRUE(first.equals(equal));
+  EXPECT_EQ(first.hash(), equal.hash());
+  uint64_t cachedHash = first.hash();
+  EXPECT_EQ(cachedHash, first.hash());
+  EXPECT_FALSE(first.equals(reordered));
+  EXPECT_FALSE(first.equals(otherMin));
 }
 
 TEST(QueryEqualsTest, sampledHashDoesNotWeakenExactEquality) {
@@ -184,7 +184,7 @@ TEST(QueryEqualsTest, sampledHashDoesNotWeakenExactEquality) {
   TermInSetQuery firstQuery("f", first);
   TermInSetQuery middleDifferentQuery("f", middleDifferent);
 
-  EXPECT_FALSE(queryEquals(firstQuery, middleDifferentQuery));
+  EXPECT_FALSE(firstQuery.equals(middleDifferentQuery));
 }
 
 TEST_F(BooleanQueryDedupTest, optionalDuplicateScoresExactlyLikeBoostTwo) {

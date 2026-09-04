@@ -48,14 +48,47 @@ public:
            == exactValues.end());
   }
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const NumericPredicateQuery&>(other);
+    if (field != rhs.field
+        || envelope.lo != rhs.envelope.lo || envelope.hi != rhs.envelope.hi
+        || exactValues.size() != rhs.exactValues.size()
+        || exactIntervals.size() != rhs.exactIntervals.size()
+        || !std::equal(exactValues.begin(), exactValues.end(),
+                       rhs.exactValues.begin())) {
+      return false;
+    }
+    return std::equal(
+        exactIntervals.begin(), exactIntervals.end(),
+        rhs.exactIntervals.begin(),
+        [](const PointsReader::ValueRange& a,
+           const PointsReader::ValueRange& b) {
+          return a.lo == b.lo && a.hi == b.hi;
+        });
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, envelope.lo);
+    value = mixHash(value, envelope.hi);
+    value = mixSampledSequence(
+        value, exactValues,
+        [](uint64_t seed, int64_t exact) {
+          return mixHash(seed, exact);
+        });
+    return mixSampledSequence(
+        value, exactIntervals,
+        [](uint64_t seed, const PointsReader::ValueRange& interval) {
+          seed = mixHash(seed, interval.lo);
+          return mixHash(seed, interval.hi);
+        });
+  }
+
   std::string_view getField() const { return field; }
   int64_t getLo() const { return envelope.lo; }
   int64_t getHi() const { return envelope.hi; }
   bool isExactSet() const { return !exactValues.empty(); }
   std::span<const int64_t> getExactValues() const { return exactValues; }
-  std::span<const PointsReader::ValueRange> getExactIntervals() const {
-    return exactIntervals;
-  }
   std::span<const PointsReader::ValueRange> intervals() const {
     return exactIntervals.empty()
         ? std::span<const PointsReader::ValueRange>(&envelope, 1)

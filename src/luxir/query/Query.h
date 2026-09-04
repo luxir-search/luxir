@@ -335,10 +335,9 @@ protected:
   Query() = delete;
 
 private:
-  // Structural hash, computed once by queryHash(). Only planning reaches it, and
+  // Structural hash, computed once by hash(). Only planning reaches it, and
   // planning runs single-threaded per request; a default copy carries it.
   mutable uint64_t cachedHash = 0;
-  friend uint64_t queryHash(const Query& query);
 #ifndef NDEBUG
   // Set on nodes the planner creates after logical validation (merged
   // clauses, boost wrappers, the match-all seed) so the validation
@@ -605,7 +604,7 @@ protected:
   }
 
   // Hashes only enough sequence content to bucket equality candidates. The
-  // exact queryEquals() check must not be preceded by an unbounded payload walk.
+  // exact equals() check must not be preceded by an unbounded payload walk.
   template <typename T, typename MixElement>
   static uint64_t mixSampledSequence(
       uint64_t seed, std::span<T> sequence, MixElement mixElement) {
@@ -623,15 +622,35 @@ protected:
     return seed;
   }
 
+  virtual bool equalsSameKind(const Query& other) const {
+    unused(other);
+    return false;
+  }
+
+  virtual uint64_t hashImpl() const {
+    return Hash::hash(&kind, sizeof(kind));
+  }
+
 public:
 
   // Structural membership key: the filter projection of this query, with
   // score-only state omitted. Consumers that need query identity must use
-  // queryEquals() and queryHash(). Queries whose membership depends on scores must
+  // equals() and hash(). Queries whose membership depends on scores must
   // return UNCACHEABLE. Every concrete query must make an explicit
   // cacheability decision.
   virtual FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                          const FilterKeyContext& ctx) const = 0;
+
+  bool equals(const Query& other) const {
+    return kind == other.kind && equalsSameKind(other);
+  }
+
+  uint64_t hash() const {
+    if (cachedHash != 0) return cachedHash;
+    uint64_t value = hashImpl();
+    cachedHash = value == 0 ? 1 : value;
+    return cachedHash;
+  }
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
@@ -1878,8 +1897,6 @@ const Query* peelBoost(const Query* query, float& boost);
 Query* peelBoost(Query* query, float& boost);
 bool sameScoringClause(const Query* a, const Query* b);
 uint64_t scoringClauseHash(const Query* query);
-bool queryEquals(const Query& a, const Query& b);
-uint64_t queryHash(const Query& query);
 Query::ScoreProfile scoreProfile(const Query& query);
 bool canOmitWeightForCacheFirstMembership(const Query& query);
 bool exactDomainIdentity(const Query& query);

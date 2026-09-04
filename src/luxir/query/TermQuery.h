@@ -43,6 +43,20 @@ public:
         injectedTermStats(injectedTermStats), boost(boost),
         useFrontierBound(useFrontierBound), hasInjectedTermStats(true) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const TermQuery&>(other);
+    return !hasInjectedTermStats && !rhs.hasInjectedTermStats
+        && field == rhs.field && term == rhs.term
+        && useFrontierBound == rhs.useFrontierBound;
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, term);
+    value = mixHash(value, useFrontierBound);
+    return mixHash(value, hasInjectedTermStats);
+  }
+
   std::string_view getField() const {
     return field;
   }

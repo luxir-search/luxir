@@ -20,6 +20,15 @@ public:
   explicit ExistsQuery(std::string_view field)
     : Query(QueryKind::EXISTS), field(field) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const ExistsQuery&>(other);
+    return field == rhs.field;
+  }
+
+  uint64_t hashImpl() const override {
+    return mixHash(Query::hashImpl(), field);
+  }
+
   std::string_view getField() const { return field; }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

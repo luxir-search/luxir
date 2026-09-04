@@ -157,6 +157,19 @@ public:
     : Query(QueryKind::CONSTANT_SCORE), child(child),
       constantScore(constantScore) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const ConstantScoreQuery&>(other);
+    return std::bit_cast<uint32_t>(constantScore)
+            == std::bit_cast<uint32_t>(rhs.constantScore)
+        && child->equals(*rhs.child);
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(
+        Query::hashImpl(), std::bit_cast<uint32_t>(constantScore));
+    return mixHash(value, child->hash());
+  }
+
   Query* getChild() const { return child; }
   float getConstantScore() const { return constantScore; }
   FieldSortConjunction fieldSortConjunction(

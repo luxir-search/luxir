@@ -13,6 +13,13 @@ public:
 
   AllQuery() : Query(QueryKind::ALL) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    unused(other);
+    return true;
+  }
+
+  uint64_t hashImpl() const override { return Query::hashImpl(); }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

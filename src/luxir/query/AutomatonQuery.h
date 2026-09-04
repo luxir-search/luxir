@@ -40,8 +40,17 @@ public:
         classification(classification), exactOrPrefix(exactOrPrefix),
         scanPlan(scanPlan) {}
 
-  Kind getAutomatonKind() const { return automatonKind; }
-  std::string_view getPattern() const { return pattern; }
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const AutomatonQuery&>(other);
+    return automatonKind == rhs.automatonKind && field == rhs.field
+        && pattern == rhs.pattern;
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), automatonKind);
+    value = mixHash(value, field);
+    return mixHash(value, pattern);
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {

@@ -412,7 +412,7 @@ private:
     result.slots.reserve(clauses.size());
     for (size_t i = 0; i < clauses.size(); i++) {
       PeeledClause peeled = peelScoringClause(clauses[i]);
-      uint64_t hash = queryHash(*peeled.core);
+      uint64_t hash = peeled.core->hash();
       auto found = slotByHash.find(hash);
       if (found == slotByHash.end()) {
         int32_t slot = (int32_t) result.slots.size();
@@ -424,7 +424,7 @@ private:
       DuplicateSlot& duplicate = result.slots[(size_t) slot];
       Query* representative =
           peelScoringClause(clauses[duplicate.representative]).core;
-      if (!queryEquals(*representative, *peeled.core)) continue;
+      if (!representative->equals(*peeled.core)) continue;
       if (duplicate.count == 1) {
         result.byClause[duplicate.representative] = slot;
         result.duplicateSlots++;
@@ -775,7 +775,8 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
-  bool shapeEquals(const BooleanQuery& rhs) const {
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const BooleanQuery&>(other);
     if (minShouldMatch != rhs.minShouldMatch
         || mandatory.size() != rhs.mandatory.size()
         || optional.size() != rhs.optional.size()
@@ -795,8 +796,8 @@ public:
         && sameList(filter, rhs.filter);
   }
 
-  uint64_t shapeHash() const {
-    uint64_t value = Hash::hash(&kind, sizeof(kind));
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), minShouldMatch);
     auto mixList = [&](std::span<Query*> clauses) {
       value = mixSampledSequence(
           value, clauses,

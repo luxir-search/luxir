@@ -28,6 +28,23 @@ public:
     : MultiTermQuery(QueryKind::TERM_RANGE, field), lower(lower), upper(upper),
       includeLower(includeLower), includeUpper(includeUpper) {}
 
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const TermRangeQuery&>(other);
+    return field == rhs.field && lower == rhs.lower
+        && upper == rhs.upper && includeLower == rhs.includeLower
+        && includeUpper == rhs.includeUpper;
+  }
+
+  uint64_t hashImpl() const override {
+    uint64_t value = mixHash(Query::hashImpl(), field);
+    value = mixHash(value, lower.has_value());
+    if (lower.has_value()) value = mixHash(value, *lower);
+    value = mixHash(value, includeLower);
+    value = mixHash(value, upper.has_value());
+    if (upper.has_value()) value = mixHash(value, *upper);
+    return mixHash(value, includeUpper);
+  }
+
   const std::optional<std::string_view>& getLower() const { return lower; }
   const std::optional<std::string_view>& getUpper() const { return upper; }
   bool lowerInclusive() const { return includeLower; }

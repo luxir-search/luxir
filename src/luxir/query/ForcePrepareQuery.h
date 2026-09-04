@@ -3,7 +3,7 @@
 #include <atomic>
 #include <utility>
 
-#include "Query.h"
+#include "BoostQuery.h"
 #include "QueryPrep.h"
 
 namespace luxir {
@@ -18,6 +18,15 @@ public:
 
   explicit ForcePrepareQuery(Query* child)
     : Query(QueryKind::FORCE_PREPARE), child(child) {}
+
+  bool equalsSameKind(const Query& other) const override {
+    const auto& rhs = static_cast<const ForcePrepareQuery&>(other);
+    return sameScoringClause(child, rhs.child);
+  }
+
+  uint64_t hashImpl() const override {
+    return mixHash(Query::hashImpl(), scoringClauseHash(child));
+  }
 
   Query* getChild() const { return child; }
 
