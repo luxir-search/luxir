@@ -4080,8 +4080,6 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
   f.startReading();
 
   auto poolFree = testIndex.pool.rewindScopeGuard();
-  Query::Context qContext(testIndex.pool, *testIndex.reader);
-  auto& segment = qContext.topReader.segments()[0];
   TermQuery mand("body_w", "route_mand");
   TermQuery opt("body_w", "route_opt");
   TermQuery filterTerm("body_w", "route_filter");
@@ -4091,12 +4089,17 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
   PhraseQuery phrase("body_w", phraseTerms, positions);
   ForcePrepareQuery wrappedPhrase(&phrase);
   std::span<Query*> empty;
+  // Keep generated queries at stable addresses until qContext is destroyed.
+  std::vector<std::unique_ptr<BooleanQuery>> queries;
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
 
   auto expectNoBulk = [&](std::span<Query*> mandatory, std::span<Query*> optional,
                           std::span<Query*> prohibitedSpan, std::span<Query*> filter,
                           int minShouldMatch) {
-    BooleanQuery query(mandatory, optional, prohibitedSpan, filter, minShouldMatch);
-    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    queries.push_back(std::make_unique<BooleanQuery>(
+        mandatory, optional, prohibitedSpan, filter, minShouldMatch));
+    auto* weight = queries.back()->createWeight(qContext, Query::NEED_SCORES);
     auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
     ASSERT_NE(supplier, nullptr);
     EXPECT_EQ(supplier->bulkScorer(testIndex.pool), nullptr);
@@ -4108,8 +4111,9 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
   std::array<Query*, 1> prohibitedOnly = {&prohibited};
   {
     // A dense direct-term filter routes MandOpt to the window-mask bulk.
-    BooleanQuery query(std::span<Query*>(mandOnly), optOnly, empty, filterOnly, 0);
-    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    queries.push_back(std::make_unique<BooleanQuery>(
+        std::span<Query*>(mandOnly), optOnly, empty, filterOnly, 0));
+    auto* weight = queries.back()->createWeight(qContext, Query::NEED_SCORES);
     auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
     ASSERT_NE(supplier, nullptr);
     EXPECT_NE(supplier->bulkScorer(testIndex.pool), nullptr);
@@ -4128,8 +4132,9 @@ TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
 
   {
     SkipStatsGuard stats;
-    BooleanQuery query(mandOnly, optOnly, empty, filterOnly, 1);
-    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    queries.push_back(std::make_unique<BooleanQuery>(
+        mandOnly, optOnly, empty, filterOnly, 1));
+    auto* weight = queries.back()->createWeight(qContext, Query::NEED_SCORES);
     auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
     ASSERT_NE(supplier, nullptr);
     unused(supplier->bulkScorer(testIndex.pool));

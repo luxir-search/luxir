@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cstring>
 #include <cstdint>
@@ -29,6 +28,8 @@
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/Similarity.h"
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/unordered/unordered_node_map.hpp>
 #include <google/protobuf/arena.h>
 
@@ -301,27 +302,23 @@ struct CachedFieldInfo {
 inline constexpr int64_t kMaskFilterDensityInverse = 256;
 
 class Query {
-  // Context memos must distinguish successive stack Query objects that reuse
-  // an address, so the identity comes from a process-wide counter on first
-  // use. Both memo slots are only reached from planning (createWeight and
-  // logical plans), which runs single-threaded per request, so plain members
-  // suffice; a default copy of a planned query shares its memo identity and
-  // its structural hash, which is correct because the copy has the same
-  // structure and the same non-owning clause pointers.
-  inline static std::atomic<uint64_t> nextRequestMemoIdentity{1};
-  mutable uint64_t requestMemoIdentity = 0;
+  // Structural hash, computed once by hash(). Only planning reaches it, and
+  // planning runs single-threaded per request; a default copy carries it.
   mutable uint64_t cachedHash = 0;
-
-  uint64_t getRequestMemoIdentity() const {
-    if (requestMemoIdentity == 0) {
-      requestMemoIdentity = nextRequestMemoIdentity.fetch_add(
-          1, std::memory_order_relaxed);
-      assert(requestMemoIdentity != 0);
-    }
-    return requestMemoIdentity;
-  }
+#ifndef NDEBUG
+  // Set on nodes the planner creates after logical validation (merged
+  // clauses, boost wrappers, the match-all seed) so the validation
+  // assertion skips them.
+  bool plannerGenerated = false;
+#endif
 
 public:
+  void markPlannerGenerated() {
+#ifndef NDEBUG
+    plannerGenerated = true;
+#endif
+  }
+
   class PlanningContext;
   class Context;
   class Weight;
@@ -929,22 +926,25 @@ public:
       std::optional<FilterKey> key;
     };
 
-    boost::unordered_node_map<uint64_t, CachedFilterIdentity> filterIdentities;
-    boost::unordered_node_map<uint64_t, void*> logicalPlans;
+    // Memos are keyed by query address. Every Query planned through this
+    // context must outlive the context; reusing a query's storage for a
+    // different query while the context is alive is undefined.
+    boost::unordered_node_map<const Query*, CachedFilterIdentity>
+        filterIdentities;
+    boost::unordered_flat_map<const Query*, void*> logicalPlans;
 #ifndef NDEBUG
-    boost::unordered_node_map<uint64_t, bool> logicallyValidatedQueries;
+    boost::unordered_flat_set<const Query*> logicallyValidatedQueries;
 #endif
 
     const CachedFilterIdentity& filterIdentity(const Query& query) {
-      uint64_t identity = query.getRequestMemoIdentity();
-      auto found = filterIdentities.find(identity);
+      auto found = filterIdentities.find(&query);
       if (found != filterIdentities.end()) return found->second;
 
       FilterKeyBuilder builder;
       FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
       auto key = std::move(builder).finish(scope, filterKeyContext);
       auto [inserted, created] = filterIdentities.emplace(
-          identity, CachedFilterIdentity{scope, std::move(key)});
+          &query, CachedFilterIdentity{scope, std::move(key)});
       assert(created);
       return inserted->second;
     }
@@ -984,22 +984,21 @@ public:
     // Serial request-build memo. A query may create several Weights for
     // ranking, count, domain, and routing products; logical normalization is
     // query-shaped and belongs here once, not in every Weight constructor.
-    // Each Query identity owns at most one concrete Plan type.
+    // Each Query address owns at most one concrete Plan type.
     template <typename Plan, typename Create>
     Plan& getOrCreateLogicalPlan(const Query& query, Create&& create) {
-      uint64_t identity = query.getRequestMemoIdentity();
-      auto found = logicalPlans.find(identity);
+      auto found = logicalPlans.find(&query);
       if (found != logicalPlans.end()) return *(Plan*) found->second;
 
       Plan* plan = std::forward<Create>(create)();
-      auto [inserted, created] = logicalPlans.emplace(identity, plan);
+      auto [inserted, created] = logicalPlans.emplace(&query, plan);
       assert(created);
       return *(Plan*) inserted->second;
     }
 
 #ifndef NDEBUG
     void recordLogicalValidation(const Query& query) {
-      logicallyValidatedQueries.emplace(query.getRequestMemoIdentity(), true);
+      logicallyValidatedQueries.insert(&query);
     }
 
     bool logicalValidationActive() const {
@@ -1007,9 +1006,8 @@ public:
     }
 
     void assertLogicalValidation(const Query& query) const {
-      if (logicallyValidatedQueries.empty()) return;
-      assert(logicallyValidatedQueries.contains(
-          query.getRequestMemoIdentity())
+      if (logicallyValidatedQueries.empty() || query.plannerGenerated) return;
+      assert(logicallyValidatedQueries.contains(&query)
           && "Weight owner was not visited by logical validation");
     }
 #endif

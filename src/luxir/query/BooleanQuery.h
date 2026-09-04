@@ -147,7 +147,10 @@ private:
   }
 
   static Query* scoringClause(MemPool& pool, Query* query, float boost) {
-    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+    if (boost == 1.0f) return query;
+    auto* wrapper = pool.make<BoostQuery>(query, boost);
+    wrapper->markPlannerGenerated();
+    return wrapper;
   }
 
   static bool isPureNegative(const BooleanQuery& query) {
@@ -330,7 +333,9 @@ private:
     // construction values remain impossible.
     if (plan.mandatory.empty() && plan.optional.empty() && plan.filter.empty()
         && !plan.prohibited.empty()) {
-      plan.mandatory.push_back(pool.make<AllQuery>());
+      auto* seed = pool.make<AllQuery>();
+      seed->markPlannerGenerated();
+      plan.mandatory.push_back(seed);
     }
 
     if (plan.prohibited.empty() && plan.filter.empty()) {
@@ -462,6 +467,7 @@ private:
         core = pool.make<TermQuery>(
             term->getField(), term->getTerm(), duplicate.boost,
             term->shouldUseFrontierBound());
+        core->markPlannerGenerated();
       } else {
         core = scoringClause(pool, core, duplicate.boost);
       }
@@ -898,7 +904,9 @@ public:
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     checkedBoostProduct(multiplier, 1.0f);
-    CompiledBoolean& plan = logicalPlan(context);
+    // Build the logical plan here so its errors surface as validation
+    // errors; nodes it generates are marked and skip the validation check.
+    logicalPlan(context);
 
     auto validate = [&](std::span<Query*> clauses, float childMultiplier) {
       for (Query* clause : clauses) {
@@ -909,35 +917,6 @@ public:
     validate(optional, multiplier);
     validate(prohibited, 1.0f);
     validate(filter, 1.0f);
-
-#ifndef NDEBUG
-    auto isImmediateRawClause = [&](Query* query) {
-      auto contains = [query](std::span<Query*> clauses) {
-        return std::find(clauses.begin(), clauses.end(), query)
-            != clauses.end();
-      };
-      return contains(mandatory) || contains(optional)
-          || contains(prohibited) || contains(filter);
-    };
-    auto recordGenerated = [&](Query* query) {
-      if (query == nullptr || isImmediateRawClause(query)) return;
-      while (auto* boost = dynamic_cast<BoostQuery*>(query)) {
-        context.recordLogicalValidation(*query);
-        query = boost->getChild();
-      }
-      context.recordLogicalValidation(*query);
-    };
-    recordGenerated(plan.singleChild);
-    auto recordGeneratedClauses = [&](std::span<Query*> clauses) {
-      for (Query* clause : clauses) recordGenerated(clause);
-    };
-    recordGeneratedClauses(plan.mandatory);
-    recordGeneratedClauses(plan.optional);
-    recordGeneratedClauses(plan.prohibited);
-    recordGeneratedClauses(plan.filter);
-#else
-    unused(plan);
-#endif
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
