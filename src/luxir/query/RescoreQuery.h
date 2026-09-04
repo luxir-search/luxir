@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include "luxir/query/Query.h"
+#include "luxir/util/ApiError.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/value/ValueExpr.h"
 
@@ -91,7 +92,7 @@ class RescoreQuery final : public Query {
 
     float convertResult(const ValueResult& result) const {
       if (!result.valid) {
-        throw std::runtime_error(fmt::format(
+        throw RequestError(fmt::format(
             "rescore expression is missing for matched segment doc {}; use def() "
             "in the expression or exists() in the child query",
             doc));
@@ -101,7 +102,7 @@ class RescoreQuery final : public Query {
       if (result.type == ValueType::DOUBLE) {
         double value = result.doubleValue;
         if (!std::isfinite(value) || value < -MAX_FLOAT || value > MAX_FLOAT) {
-          throw std::runtime_error(fmt::format(
+          throw RequestError(fmt::format(
               "rescore expression result is outside the finite float score range "
               "at segment doc {}",
               doc));
@@ -112,7 +113,7 @@ class RescoreQuery final : public Query {
       }
       output *= multiplier;
       if (!std::isfinite(output)) {
-        throw std::runtime_error(fmt::format(
+        throw RequestError(fmt::format(
             "rescore output is outside the finite float score range at segment doc {}",
             doc));
       }
@@ -289,7 +290,7 @@ class RescoreQuery final : public Query {
         const ValueBounds& root =
             expression->bounds(program->rootNode);
         if (root.alwaysMissing) {
-          throw std::runtime_error(
+          throw RequestError(
               "rescore expression is always missing for a matchable "
               "segment; use def() in the expression or exists() in the "
               "child query");

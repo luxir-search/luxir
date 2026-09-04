@@ -11,10 +11,15 @@ const SearchConfig& SearchEngine::searchConfig() const {
 }
 
 void SearchEngine::submitBody(SearchRequest& req) {
+  // Until the calculators start, an unclassified failure is the request's
+  // fault: parsers and planners reject authored input with bare exceptions.
+  // Once execution is under way it is the engine's.  Throw sites that know
+  // better say so with an ApiError, which classifies itself in either phase.
+  ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   try {
-    if (!req.timeZone) throw std::runtime_error(req.timeZoneError);
+    if (!req.timeZone) throw RequestError(req.timeZoneError);
     if (req.maxParallel > 1 || req.maxParallel < -1) {
-      throw std::runtime_error(
+      throw RequestError(
           "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
           "on the shared executor), or -1 (unlimited parallelism); values "
           "above 1 are reserved for a parallelism budget and not implemented");
@@ -32,6 +37,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // the getTarget chain.  Released in done().
     auto* rootCalc = calc.get();
     req.rootCalc = std::move(calc);
+    fallback = ErrorKind::INTERNAL;
     rootCalc->start(req.tg);
 
     if (req.tg) {
@@ -40,24 +46,19 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
   } catch (std::exception& e) {
-    // TODO: distinguish between request errors and server errors.
-
     // Drain any in-flight tasks so they aren't writing into the response while
     // we tear down.  wait() rethrows the first exception, so swallow it here.
     if (req.tg) {
       // TODO: notify other tasks about the error?
       try { req.tg->wait(); } catch (...) {}
     }
-    LOG_WARN("Search request failed: {}", e.what());
-    if (req.lastResponse == nullptr) {
-      req.lastResponse = SearchResponse::create(req, true);
+    ErrorInfo info = classifyException(e, fallback);
+    if (info.kind == ErrorKind::INTERNAL) {
+      LOG_ERROR("Search request failed: {}", info.message);
+    } else {
+      LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
     }
-    // proto.error is a non-owning string_view; e.what() points into the exception object,
-    // which is destroyed when this catch block exits. Copy it into the response arena.
-    // Under req.mutex: a paused emitter resumed by the transport may be
-    // assembling its final batch into lastResponse (getTarget) concurrently.
-    std::lock_guard<std::mutex> lock(req.mutex);
-    req.lastResponse->proto.error = luxir::api::build::arenaStr(req.lastResponse->mr, e.what());
+    req.setError(info);
   }
 
   // Profile slots are written only by segment tasks. Materialize the shared

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "luxir/util/ApiError.h"
+
 #include "StrColHandler.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/schema/ValCoerce.h"
@@ -64,13 +66,13 @@ public:
     views.clear();
     bool isList = coerce::toVectors(val, std::string_view(fieldName), floats, lens);
     if (isList && !multi && !lens.empty()) {
-      throw std::runtime_error(fmt::format(
+      throw DocumentError(fmt::format(
           "field '{}': single-valued field received a list of {} vectors",
           std::string_view(fieldName), lens.size()));
     }
     if (lens.empty()) {
       if (!multi) {
-        throw std::runtime_error(fmt::format("field '{}': empty vector",
+        throw DocumentError(fmt::format("field '{}': empty vector",
                                              std::string_view(fieldName)));
       }
       return;
@@ -115,7 +117,7 @@ private:
   bool validate(std::span<float> vec, int32_t ordinal) {
     auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
     if (vec.empty()) {
-      throw std::runtime_error(fmt::format(
+      throw DocumentError(fmt::format(
           "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
     }
     int32_t n = (int32_t)vec.size();
@@ -123,7 +125,7 @@ private:
     if (expected == 0) {
       pendingDims_ = n;
     } else if (n != expected) {
-      throw std::runtime_error(fmt::format(
+      throw DocumentError(fmt::format(
           "field '{}': {}expected dims={}, got {}",
           std::string_view(fieldName), prefix(), expected, n));
     }

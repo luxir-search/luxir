@@ -466,7 +466,17 @@ Treat warning `code` as the machine key and `message` as human detail. The
 fuzzy query expansion limits are execution policy and do not produce response
 warnings.
 
+Errors have the same shape plus a `kind`:
+
+```json
+{"request_id": "q7", "error": {"kind": "invalid_request", "code": "unknown_field", "message": "Field not found: titel"}}
+```
+
 Unknown JSON keys, invalid enums, wrong field types, and expression syntax
-errors are rejected. Before execution, `?explain=request` returns the canonical
-request that the server parsed; posting that body back executes the same
-request. This expands JSON shorthand, but it is not a post-analysis query plan.
+errors are rejected before submission with HTTP `400`; a query that fails
+after submission returns the same object as the final response line with no
+`docs` or `ops`. `kind` fixes the HTTP status and says whose fault it is, and
+`code` is the stable key; see [HTTP API conventions](http-api.md#errors) for
+the table. Before execution, `?explain=request` returns the canonical request
+that the server parsed; posting that body back executes the same request. This
+expands JSON shorthand, but it is not a post-analysis query plan.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "luxir/util/ApiError.h"
+
 #include "luxir/index/DocStream.h"
 #include "luxir/index/BKDWriter.h"
 #include "luxir/index/Inverter.h"
@@ -48,7 +50,7 @@ inline void writeGeoPoints(PostingsWriter& postingsWriter,
 
 [[noreturn]] inline void throwGeoPointWire(std::string_view fieldName,
                                            std::string_view detail) {
-  throw std::runtime_error(fmt::format(
+  throw DocumentError(fmt::format(
       "field '{}': cannot coerce value to GEO_POINT [x, y] = [lon, lat]: {}",
       fieldName, detail));
 }
@@ -428,7 +430,7 @@ public:
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
     if (points.size() != 1) {
-      throw std::invalid_argument("single-valued GEO_POINT field received multiple points");
+      throw DocumentError("single-valued GEO_POINT field received multiple points");
     }
     index(inverter, points[0].latitude, points[0].longitude);
   }

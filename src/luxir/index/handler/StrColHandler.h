@@ -1,5 +1,7 @@
 #pragma once
 
+#include "luxir/util/ApiError.h"
+
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/OrdCollector.h"
@@ -132,7 +134,7 @@ public:
 
   void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
     if (!(fieldType->flags_ & FieldType::MULTI_VALUED)) {
-      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
+      throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                           std::string_view(fieldName)));
     }
     if (vals.empty()) return;

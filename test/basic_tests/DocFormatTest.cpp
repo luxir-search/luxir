@@ -81,7 +81,7 @@ TEST_F(DocFormatTest, rowsAndColumnsDecodeIdentically) {
         .withStats()
         .limit(-1);
     req->execute();
-    EXPECT_TRUE(req->responses[0]->proto.error.empty()) << req->toString();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
     return std::pair{req->getDocs(), req->getMatchCount()};
   };
 
@@ -207,7 +207,7 @@ TEST_F(DocFormatTest, defaultProjectionKeepsScoreColumnUnderColumnsFormat) {
     req->collection("main").topDocs("q").matchQuery("title_t", "dune")
         .getScores().documentFormat(fmt).limit(-1);
     req->execute();
-    EXPECT_TRUE(req->responses[0]->proto.error.empty()) << req->toString();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
     return req;
   };
 

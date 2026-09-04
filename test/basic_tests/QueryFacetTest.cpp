@@ -64,7 +64,7 @@ void setSelected(api::QueryFacet& facet, std::pmr::memory_resource& mr,
 }
 
 void expectError(LocalReq& request, std::string_view text) {
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   request.execute();
   ASSERT_FALSE(request.ok());
   EXPECT_NE(std::string::npos, request.errorMsg().find(text))

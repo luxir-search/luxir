@@ -14,18 +14,6 @@ using IndexVal = luxir::api::Val;
 using BytesView = ::hpp_proto::bytes_view;
 
 
-// Message for the in-flight exception, including non-std exceptions.
-static std::string currentExceptionMessage() {
-  try {
-    throw;
-  } catch (const std::exception& e) {
-    return e.what();
-  } catch (...) {
-    return "unknown non-standard exception";
-  }
-}
-
-
 // The request's field_map collapsed to protobuf last-wins entries: input doc key ->
 // schema field, "" = drop. Views alias the request, which outlives update processing.
 class FieldNameMap {
@@ -59,12 +47,12 @@ public:
 // surfaces as one message-level error rather than repeating on every doc.
 static void validateFieldMap(const luxir::api::UpdateRequest& req) {
   if (req.drop_unmapped && req.field_map.empty()) {
-    throw std::runtime_error("drop_unmapped requires a non-empty field_map");
+    throw RequestError("drop_unmapped requires a non-empty field_map");
   }
   for (const auto& [from, to] : req.field_map) {
     unused(from);
     if (!to.empty() && !Schema::validFieldName(to)) {
-      throw std::runtime_error("field_map target is not a valid field name: " + std::string(to));
+      throw RequestError("field_map target is not a valid field name: " + std::string(to));
     }
   }
 }
@@ -137,12 +125,21 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       // allocation failure has the same segment-fatal policy.
       throw;
     } catch (...) {
+      // Segment-fatal failures were rethrown above.  A document's own faults
+      // announce themselves (DocumentError, RequestError from the handlers);
+      // anything else is an engine fault, reported on the document it hit and
+      // logged, while the document itself is rolled back like any other.
       failed++;
+      ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
+      if (info.kind == ErrorKind::INTERNAL) {
+        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
+                  info.message);
+      }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
       err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
       err.index = docIndex;
-      err.error_message = luxir::api::build::arenaStr(msg.responseArena(), currentExceptionMessage());
+      err.error = luxir::api::build::arenaError(msg.responseArena(), info);
 
       if (allOrNone) {
         // Undo the id map mutations of the whole request (including queued

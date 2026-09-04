@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "luxir/util/ApiError.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/DirectoryFactory.h"
 #include "luxir/index/IndexRamBudget.h"
@@ -32,29 +33,39 @@ class Library;
 class Collection;
 class LuxirNode;
 
-class CollectionResolutionError : public std::runtime_error {
+// Resolving a request's collection target failed.  The concrete subclasses fix
+// the classification; the base is thrown directly only for internal invariants
+// and requires an explicit kind.
+class CollectionResolutionError : public ApiError {
 public:
-  using std::runtime_error::runtime_error;
+  using ApiError::ApiError;
 };
 
+// The name cannot denote a collection on any route (INVALID_REQUEST).
 class InvalidCollectionNameError : public CollectionResolutionError {
 public:
-  using CollectionResolutionError::CollectionResolutionError;
+  explicit InvalidCollectionNameError(const std::string& message)
+    : CollectionResolutionError(ErrorKind::INVALID_REQUEST, "invalid_collection_name", message) {}
 };
 
 class CollectionNotFoundError : public CollectionResolutionError {
 public:
-  using CollectionResolutionError::CollectionResolutionError;
+  explicit CollectionNotFoundError(const std::string& message)
+    : CollectionResolutionError(ErrorKind::NOT_FOUND, "collection_not_found", message) {}
 };
 
+// The collection exists but cannot serve: being deleted, a delete failed
+// partway, or it failed to load at startup (UNAVAILABLE).
 class CollectionUnavailableError : public CollectionResolutionError {
 public:
-  using CollectionResolutionError::CollectionResolutionError;
+  explicit CollectionUnavailableError(const std::string& message)
+    : CollectionResolutionError(ErrorKind::UNAVAILABLE, "collection_unavailable", message) {}
 };
 
-class CollectionExistsError : public std::runtime_error {
+class CollectionExistsError : public ApiError {
 public:
-  using std::runtime_error::runtime_error;
+  explicit CollectionExistsError(const std::string& message)
+    : ApiError(ErrorKind::ALREADY_EXISTS, "collection_exists", message) {}
 };
 
 class Shard {

@@ -159,16 +159,28 @@ ID remains intact:
   "update_version": 9,
   "status": "partial",
   "errors": [
-    {"id": "b2", "error_message": "...", "index": 1}
-  ]
+    {"id": "b2", "index": 1, "error": {"kind": "invalid_request", "code": "unknown_field", "message": "..."}}
+  ],
+  "total_errors": 1
 }
 ```
+
+Each entry names the document by `id` and by `index` in the request and
+carries the same `error` object every Luxir error uses: `kind`, a stable
+`code` (`invalid_value` for a value the field rejects, `unknown_field` for a
+field the schema does not define), and a human `message`. A document that an
+engine fault stopped is reported the same way with kind `internal`.
+`total_errors` counts every failed document; it exceeds the length of
+`errors` only when a transport retained a prefix of them.
 
 The response status is:
 
 - `ok`: every attempted change succeeded.
 - `partial`: some documents succeeded and some failed.
-- `error`: no document took effect, or a request-level/commit failure occurred.
+- `error`: no document took effect, or a request-level failure occurred. A
+  request-level failure (a bad `field_map`, the commit pipeline, a closed
+  writer) also sets the top-level `error` object; per-document failures leave
+  it unset.
 
 With `all_or_none: true`, processing stops at the first bad document and rolls
 back documents and deletes already applied by that request. Atomicity covers
@@ -223,8 +235,11 @@ For example, two independently reported groups followed by one commit:
 ```
 
 The response is NDJSON too, one update response per completed group. A stream
-may retain only the first 100 returned IDs and errors for a group; counts and
-indexing are not capped by that reporting bound.
+may retain only the first 100 returned IDs and errors for a group; indexing
+and `total_errors` are not capped by that reporting bound. A request-level
+failure ends the stream: its response line carries `status: "error"` and the
+`error` object alongside whatever the group had already reported, and no later
+records from that connection are accepted.
 
 To send an existing file without letting `curl` reinterpret newlines:
 

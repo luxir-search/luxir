@@ -8,6 +8,8 @@
 #include <string_view>
 #include <utility>
 
+#include "luxir/util/ApiError.h"
+
 namespace luxir {
 
 enum class ValueType : uint8_t {
@@ -39,10 +41,12 @@ struct ResolvedValue {
   ValueNature nature = ValueNature::NUMBER;
 };
 
-class ValueEvaluationError : public std::runtime_error {
+// An expression that cannot be evaluated as written (type mismatch, bad
+// argument): a request error even when detected against document values.
+class ValueEvaluationError : public ApiError {
 public:
-  explicit ValueEvaluationError(std::string message)
-      : std::runtime_error(std::move(message)) {}
+  explicit ValueEvaluationError(const std::string& message)
+      : ApiError(ErrorKind::INVALID_REQUEST, "invalid_expression", message) {}
 };
 
 inline bool valueArray(ValueType type) {

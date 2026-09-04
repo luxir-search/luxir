@@ -3,9 +3,9 @@
 #include <memory>
 #include <string>
 #include <exception>
-#include <stacktrace>
 #include <execinfo.h>
 #include <cxxabi.h>
+#include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
 
 namespace luxir {
@@ -16,14 +16,14 @@ inline std::string getStackTrace() {
   void* array[maxFrames];
   int size = backtrace(array, maxFrames);
   char** strings = backtrace_symbols(array, size);
-  
+
   std::string result;
   for (int i = 0; i < size; i++) {
     // Try to demangle C++ names
     char* mangled_name = nullptr;
     char* offset_begin = nullptr;
     char* offset_end = nullptr;
-    
+
     // Find parentheses and +address offset surrounding mangled name
     for (char* p = strings[i]; *p; ++p) {
       if (*p == '(') {
@@ -35,12 +35,12 @@ inline std::string getStackTrace() {
         break;
       }
     }
-    
+
     if (mangled_name && offset_begin && offset_end && mangled_name < offset_begin) {
       *mangled_name++ = '\0';
       *offset_begin++ = '\0';
       *offset_end = '\0';
-      
+
       int status;
       char* real_name = abi::__cxa_demangle(mangled_name, nullptr, nullptr, &status);
       if (status == 0) {
@@ -63,29 +63,27 @@ inline std::string getStackTrace() {
       result += "\n";
     }
   }
-  
+
   free(strings);
   return result;
 }
 
-// TODO: have subclasses that can have more specific info?
-// Example: ids (outside of the error message) of the document(s) that caused the error, etc.
+// The failure recorded on an update message: its client-facing classification
+// plus the exception for callers that want to rethrow.  The message is the
+// exception's own text - diagnostics such as stack traces go to the log, never
+// to the client.
 class LuxirError {
 public:
-  int64_t error_code;
-  // perhaps a list of errors to provide more context as error propagation occurs?  Or we could just modify the error string.
-  std::string message;  // guaranteed to be set in the event of an exception, no need to touch eptr just for that.
+  ErrorInfo info;
   std::exception_ptr eptr;
 
-  LuxirError(const std::exception& e) : eptr(std::current_exception()) {
-    message = std::string("Unexpected exception: ").append(e.what());
-    message += "\nStack trace:\n";
-    message += getStackTrace();
-    error_code = 1;
-  }
+  LuxirError(const std::exception& e, ErrorKind fallback)
+    : info(classifyException(e, fallback)), eptr(std::current_exception()) {}
+
+  explicit LuxirError(ErrorInfo info) : info(std::move(info)) {}
 
   const std::string& what() const {
-    return message;
+    return info.message;
   }
 };
 
@@ -121,9 +119,16 @@ public:
 
   // Sets a new error only if no error is already set and returns nullptr if successful.
   // If there was an error previously set, no modification is made and the previous error is returned.
-  LuxirError* setException(const std::exception& e) {
-    auto err = std::make_unique<LuxirError>(e);
-    LOG_ERROR(err->what());
+  // An exception that is not an ApiError is classified as `fallback`; the update
+  // graph's default is INTERNAL because a request-class failure inside it is
+  // expected to announce itself with a typed throw.
+  LuxirError* setException(const std::exception& e, ErrorKind fallback = ErrorKind::INTERNAL) {
+    auto err = std::make_unique<LuxirError>(e, fallback);
+    if (dynamic_cast<const ApiError*>(&e) != nullptr) {
+      LOG_WARN("update rejected: {}", err->what());
+    } else {
+      LOG_ERROR("update failed: {}\nStack trace:\n{}", err->what(), getStackTrace());
+    }
     return setLuxirError(std::move(err));
   }
 
@@ -149,6 +154,11 @@ public:
     } else {
       return "(ok)";
     }
+  }
+
+  // The recorded failure; only meaningful when errored().
+  const ErrorInfo& info() const {
+    return error.load(std::memory_order_acquire)->info;
   }
 
   // Don't use this method to check for an error, use !ok() or errored() instead.

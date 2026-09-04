@@ -49,10 +49,10 @@ int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fiel
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     int64_t now = context.dateMathNowEpochMillis.value_or(currentEpochMillis());
     if (auto ms = parseDateToEpochMillis(*s, now, context.timeZone)) return *ms;
-    throw std::runtime_error(fmt::format(
+    throw RequestError(fmt::format(
         "DATE field '{}': cannot parse '{}' as a date "
         "(expected ISO-8601, epoch millis, or date math)",
-        fieldName, *s));
+        fieldName, *s), "invalid_value");
   }
   coerce::throwCoerce(fieldName, val, "a date");
 }
@@ -64,10 +64,10 @@ DateRange DateFieldType::coerceDateRange(const api::Val& val,
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     int64_t now = context.dateMathNowEpochMillis.value_or(currentEpochMillis());
     if (auto r = parseDateRange(*s, now, context.timeZone)) return *r;
-    throw std::runtime_error(fmt::format(
+    throw RequestError(fmt::format(
         "DATE field '{}': cannot parse '{}' as a date "
         "(expected ISO-8601, epoch millis, or date math)",
-        fieldName, *s));
+        fieldName, *s), "invalid_value");
   }
   coerce::throwCoerce(fieldName, val, "a date");
 }

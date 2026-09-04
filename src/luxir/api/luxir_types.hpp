@@ -63,7 +63,7 @@ struct Target; struct SearchRequest; struct SearchOp; struct ExprOp; struct TopD
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
+struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
@@ -82,9 +82,15 @@ struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
-namespace UpdateResponse_ { struct Error; }
+namespace UpdateResponse_ { struct DocError; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
+namespace Error_ {
+enum class Kind {
+  UNKNOWN = 0, INVALID_REQUEST = 1, NOT_FOUND = 2, ALREADY_EXISTS = 3, FAILED_PRECONDITION = 4,
+  RESOURCE_EXHAUSTED = 5, UNAVAILABLE = 6, INTERNAL = 7
+};
+}
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace CalendarGap_ {
@@ -143,18 +149,26 @@ struct CommitParams {
   uint32_t max_segments = 0;
 };
 
+struct Error {
+  using Kind = luxir::api::Error_::Kind;
+  std::string_view code;
+  std::string_view message;
+  Kind kind = Kind::UNKNOWN;                                    // align 4 (enum)
+};
+
 namespace UpdateResponse_ {
-struct Error { std::string_view id; std::string_view error_message; int32_t index = 0; };
+struct DocError { std::string_view id; std::optional<Error> error; int32_t index = 0; };
 } // namespace UpdateResponse_
 
 struct UpdateResponse {
   using Status = luxir::api::UpdateResponse_::Status;
-  using Error = luxir::api::UpdateResponse_::Error;
+  using DocError = luxir::api::UpdateResponse_::DocError;
   std::string_view request_id;
   uint64_t update_version = 0;
   std::span<const std::string_view> ids;
-  std::span<const Error> errors;
-  std::string_view error_message;
+  std::span<const DocError> errors;
+  int64_t total_errors = 0;
+  std::optional<Error> error;
   Status status = Status::UNKNOWN;                              // align 4 (enum)
 };
 
@@ -296,7 +310,7 @@ struct CollectionStats {
   StatsTotals totals;
   std::string_view schema_gen;
   std::span<const ShardStats> shards;
-  std::string_view error;
+  std::optional<Error> error;
 };
 struct StatsRequest { std::optional<Target> collection; bool segments = false; };
 struct StatsResponse {
@@ -332,7 +346,7 @@ struct ShardCacheControl {                                      // needs QueryCa
 struct CollectionCacheControl {                                 // needs ShardCacheControl
   std::string_view name;
   std::span<const ShardCacheControl> shards;
-  std::string_view error;
+  std::optional<Error> error;
 };
 struct CacheControlResponse { std::span<const CollectionCacheControl> collections; };
 
@@ -535,7 +549,7 @@ struct ExecutionProfile { std::span<const ExecutionProfileOp> ops; };
 struct SearchResponse {
   std::string_view request_id;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
-  std::string_view error;
+  std::optional<Error> error;
   std::span<const Warning> warnings;
   std::optional<ExecutionProfile> profile;
   bool more = false;
@@ -630,7 +644,7 @@ LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
-LUXIR_TD(Warning) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
+LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult) LUXIR_TD(Bucket)
@@ -641,7 +655,7 @@ LUXIR_TD(ArrArrDouble) LUXIR_TD(ArrArrBin) LUXIR_TD(Vector) LUXIR_TD(ArrVector) 
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap) LUXIR_TD(IndexInfo) LUXIR_TD(AuxIndexInfo)
 LUXIR_TD(SegmentInfo) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
-LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::Error)
+LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
@@ -668,7 +682,7 @@ LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXI
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
-LUXIR_ENTRY(Warning) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
+LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)

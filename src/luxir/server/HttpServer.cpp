@@ -48,6 +48,7 @@
 #include "ProtoUpdateMessage.h"
 #include "Stats.h"
 #include "luxir/util/thread.h"
+#include "luxir/util/ApiError.h"
 
 namespace luxir {
 
@@ -87,6 +88,24 @@ struct ShardPin {
   explicit ShardPin(std::shared_ptr<HttpIoShard> shard)
     : shard(std::move(shard)), guard(this->shard->ioc.get_executor()) {}
 };
+
+// The HTTP status for a classified failure: the error's kind decides, except
+// for two conditions with an HTTP idiom of their own.
+static http::status httpStatusFor(const ErrorInfo& info) {
+  if (info.code == "method_not_allowed") return http::status::method_not_allowed;
+  if (info.code == "request_too_large") return http::status::payload_too_large;
+  switch (info.kind) {
+    case ErrorKind::INVALID_REQUEST: return http::status::bad_request;
+    case ErrorKind::NOT_FOUND: return http::status::not_found;
+    case ErrorKind::ALREADY_EXISTS: return http::status::conflict;
+    case ErrorKind::FAILED_PRECONDITION: return http::status::forbidden;
+    case ErrorKind::RESOURCE_EXHAUSTED: return http::status::too_many_requests;
+    case ErrorKind::UNAVAILABLE: return http::status::service_unavailable;
+    case ErrorKind::INTERNAL:
+    case ErrorKind::UNKNOWN: break;
+  }
+  return http::status::internal_server_error;
+}
 
 struct HttpSearchRequestState {
   std::pmr::monotonic_buffer_resource resource;
@@ -133,7 +152,7 @@ struct HttpStreamControl {
 
 struct HttpStreamAccumError {
   std::string id;
-  std::string errorMessage;
+  ErrorInfo error;
   std::int32_t index = 0;
 };
 
@@ -160,7 +179,9 @@ struct HttpStreamBatchState {
 struct HttpStreamBatchResult {
   std::vector<std::string> ids;
   std::vector<HttpStreamAccumError> errors;
-  std::string errorMessage;
+  // The batch's request-level failure (status ERROR), or the completion's own
+  // failure when `failed`.
+  std::optional<ErrorInfo> error;
   luxir::api::UpdateResponse_::Status status = luxir::api::UpdateResponse_::Status::OK;
   std::uint64_t updateVersion = 0;
   std::size_t docCount = 0;
@@ -223,7 +244,7 @@ struct HttpStreamUpdateState {
   std::map<std::uint64_t, std::shared_ptr<HttpStreamBatchState>> inFlightBatches;
   std::map<std::uint64_t, HttpStreamBatchResult> completedBatchResults;
   std::optional<HttpStreamControl> pendingControl;
-  std::optional<std::string> inputFailurePending;
+  std::optional<ErrorInfo> inputFailurePending;
   std::shared_ptr<ShardPin> shardPin;
   HttpStreamInterval interval;
   std::size_t docsSeen = 0;
@@ -287,7 +308,7 @@ public:
   // True once output has been handed to the session (enqueued, not necessarily
   // flushed) - the boundary past which an error must abort the chunked stream
   // rather than answer with a plain HTTP error response.
-  bool docsOutputCommitted = false;
+  bool outputCommitted = false;
 
   HttpSearchRequest(SearchEngine& engine, std::unique_ptr<HttpSearchRequestState> requestState,
                     std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
@@ -300,6 +321,10 @@ public:
   // All defined after HttpSession.
   ReplyStatus reply(SearchResponse& response) override;
   ReplyStatus replyDocs(SearchResponse& response);
+  // A response could not be rendered or queued: the client must not wait for
+  // a final line that never comes.  Before any output, answer with an internal
+  // error; after it, abort the stream so the truncation is visible.
+  void failDelivery(const SearchResponse& response) noexcept;
   void resumeWhenDrained(std::function<void()> resume) override;
   // done() is inherited: releaseArena(&arena) frees this request (and its
   // ShardPin). reply() calls it eagerly once the final line is enqueued - the line
@@ -467,6 +492,7 @@ private:
   std::optional<http::response<http::empty_body>> res_;
   std::optional<http::response_serializer<http::empty_body>> sr_;
   bool writeOutstanding_ = false;
+  std::string requestId_;  // the current request's id (URL param, then the parsed body)
   bool headerSent_ = false;
   bool lastSeen_ = false;
   bool chunkLastSent_ = false;
@@ -510,19 +536,20 @@ private:
           auto* resp = finishResponse();
           result_.status = resp->status;
           result_.updateVersion = resp->update_version;
-          result_.errorMessage = std::string(resp->error_message);
+          if (resp->error) result_.error = luxir::api::build::errorInfo(*resp->error);
           result_.ids.reserve(resp->ids.size());
           for (std::string_view id : resp->ids) result_.ids.emplace_back(id);
           result_.errors.reserve(resp->errors.size());
           for (const auto& e : resp->errors) {
-            result_.errors.push_back({std::string(e.id), std::string(e.error_message), e.index});
+            result_.errors.push_back({std::string(e.id),
+                                      e.error ? luxir::api::build::errorInfo(*e.error)
+                                              : ErrorInfo::of(ErrorKind::INTERNAL,
+                                                              "document error without detail"),
+                                      e.index});
           }
-        } catch (const std::exception& e) {
-          result_.failed = true;
-          result_.errorMessage = e.what();
         } catch (...) {
           result_.failed = true;
-          result_.errorMessage = "unknown non-standard exception";
+          result_.error = currentExceptionInfo(ErrorKind::INTERNAL);
         }
 
         auto keepAlive = shared_from_this();
@@ -584,15 +611,21 @@ private:
       target = target.substr(0, q);
     }
 
+    // A URL request_id is known before the body arrives, so it identifies even
+    // a request whose body never parses or is refused unread as too large.  A
+    // parsed body's request_id replaces it.
+    std::vector<UrlParam> params = parseParams(query);
+    requestId_.clear();
+    if (const std::string* id = findParam(params, "request_id")) requestId_ = *id;
+
     std::string coll;
     if (parser_->get().method() == http::verb::post && parseUpdatePath(target, coll) &&
         isNdjsonContentType(std::string_view(parser_->get()[http::field::content_type]))) {
-      std::vector<UrlParam> params = parseParams(query);
       bool urlCommit = false;
       if (const std::string* commit = findParam(params, "commit")) {
         if (*commit != "true") {
-          respondSimple(http::status::bad_request, "application/json",
-                        renderErrorBody("unknown commit mode '" + *commit + "' (valid: true)"));
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                     "unknown commit mode '" + *commit + "' (valid: true)"));
           return;
         }
         urlCommit = true;
@@ -602,7 +635,7 @@ private:
       std::string paramErr;
       if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
           !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
-        respondSimple(http::status::bad_request, "application/json", renderErrorBody(paramErr));
+        respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
         return;
       }
       // Refuse before lifting the body limit: otherwise a read-only node reads an
@@ -610,8 +643,7 @@ private:
       // respondPayloadTooLarge() this ends the connection rather than reusing it.
       if (node_.readOnly()) {
         keepAlive_ = false;
-        respondSimple(http::status::forbidden, "application/json",
-                      renderErrorBody(readOnlyMessage(target)));
+        respondError(readOnlyError(target));
         return;
       }
       parser_->body_limit(boost::none);
@@ -621,7 +653,21 @@ private:
 
     std::uint64_t bodyLimit = (std::uint64_t)node_.getConfig().ingest.max_request_body;
     if (parser_->content_length() && *parser_->content_length() > bodyLimit) {
-      respondPayloadTooLarge();
+      // The body will not be read, so classify from the headers alone: an
+      // unknown path, a wrong method, or a read-only refusal outranks the size
+      // of a body nobody would have consumed.  Each answer closes the
+      // connection, as respondPayloadTooLarge() does.
+      RouteMatch match = matchRoute(target);
+      keepAlive_ = false;
+      if (match.route == Route::NONE) {
+        respondError(ErrorInfo::of(ErrorKind::NOT_FOUND, "no such route: " + std::string(target)));
+      } else if (!methodAllowed(match.allow, parser_->get().method())) {
+        respondMethodNotAllowed(match, parser_->get().method(), target);
+      } else if (node_.readOnly() && isMutatingRequest(parser_->get().method(), target)) {
+        respondError(readOnlyError(target));
+      } else {
+        respondPayloadTooLarge();
+      }
       return;
     }
     parser_->body_limit(bodyLimit);
@@ -673,8 +719,9 @@ private:
     return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
   }
 
-  static std::string readOnlyMessage(std::string_view target) {
-    return "node is read-only (--read-only): " + std::string(target) + " is not allowed";
+  static ErrorInfo readOnlyError(std::string_view target) {
+    return {ErrorKind::FAILED_PRECONDITION, "read_only",
+            "node is read-only (--read-only): " + std::string(target) + " is not allowed"};
   }
 
   static bool parseCollectionPath(std::string_view target, std::string_view suffix, std::string& coll) {
@@ -1041,6 +1088,59 @@ private:
     return true;
   }
 
+  // Known paths answer a wrong method with 405 and an Allow header; only an
+  // unknown path is 404.  A read-only node then refuses mutations with 403.
+  enum class Route {
+    NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA
+  };
+
+  struct RouteMatch {
+    Route route = Route::NONE;
+    std::string_view allow;  // the methods the path accepts, as an Allow header value
+    std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
+    std::string coll;
+  };
+
+  static RouteMatch matchRoute(std::string_view target) {
+    RouteMatch m;
+    if (target == "/health") {
+      m.route = Route::HEALTH; m.allow = "GET";
+    } else if (target == "/collections/_list") {
+      // The canonical _list spelling also accepts POST (matching the other
+      // _-verb endpoints; any body is ignored - the request has no parameters).
+      m.route = Route::COLLECTION_LIST; m.allow = "GET, POST";
+    } else if (target == "/collections") {
+      m.route = Route::COLLECTION_LIST; m.allow = "GET";  // synonym for _list
+    } else if (target == "/collections/_create") {
+      m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
+    } else if (target == "/collections/_delete") {
+      m.route = Route::COLLECTION_DELETE; m.allow = "POST";
+    } else if (parseSearchPath(target, m.coll)) {
+      m.route = Route::SEARCH; m.allow = "GET, POST";
+    } else if (parseUpdatePath(target, m.coll)) {
+      m.route = Route::UPDATE; m.allow = "POST";
+    } else if (target == "/_stats" || parseStatsPath(target, m.coll)) {
+      m.route = Route::STATS; m.allow = "GET";
+    } else if (parseSchemaPath(target, m.coll)) {
+      m.route = Route::SCHEMA; m.allow = "GET, POST";
+      m.hint = "schema writes are POST (mode=set adds or replaces the named definitions, "
+               "mode=replace_all replaces the whole schema)";
+    }
+    return m;
+  }
+
+  static bool methodAllowed(std::string_view allow, http::verb method) {
+    std::string_view name = http::to_string(method);
+    while (!allow.empty()) {
+      auto comma = allow.find(',');
+      if (allow.substr(0, comma) == name) return true;
+      if (comma == std::string_view::npos) break;
+      allow.remove_prefix(comma + 1);
+      while (!allow.empty() && allow.front() == ' ') allow.remove_prefix(1);
+    }
+    return false;
+  }
+
   void route(http::request<http::string_body> req) {
     httpVersion_ = req.version();
     keepAlive_ = req.keep_alive();
@@ -1053,137 +1153,125 @@ private:
     }
     std::vector<UrlParam> params = parseParams(query);
 
+    RouteMatch match = matchRoute(target);
+    if (match.route == Route::NONE) {
+      respondError(ErrorInfo::of(ErrorKind::NOT_FOUND, "no such route: " + std::string(target)));
+      return;
+    }
+    if (!methodAllowed(match.allow, req.method())) {
+      respondMethodNotAllowed(match, req.method(), target);
+      return;
+    }
     if (node_.readOnly() && isMutatingRequest(req.method(), target)) {
-      respondSimple(http::status::forbidden, "application/json",
-                    renderErrorBody(readOnlyMessage(target)));
+      respondError(readOnlyError(target));
       return;
     }
 
-    std::string coll;
-    if (req.method() == http::verb::get && target == "/health") {
-      respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
-    } else if (target == "/collections/_list" || target == "/collections") {
-      // GET /collections is a synonym for the canonical _list spelling, which
-      // also accepts POST (matching the other _-verb endpoints; any body is
-      // ignored - the request has no parameters).
-      bool allowPost = target == "/collections/_list";
-      if (req.method() != http::verb::get &&
-          !(allowPost && req.method() == http::verb::post)) {
-        respondMethodNotAllowed(allowPost ? "GET, POST" : "GET",
-                                "method not allowed; collections are listed with GET");
-        return;
-      }
-      handleCollectionList();
-    } else if (target == "/collections/_create") {
-      if (req.method() != http::verb::post && req.method() != http::verb::put) {
-        respondMethodNotAllowed("POST, PUT", "method not allowed; collections are created with POST or PUT");
-        return;
-      }
-      handleCollectionCreate(req.body());
-    } else if (target == "/collections/_delete") {
-      if (req.method() != http::verb::post) {
-        respondMethodNotAllowed("POST", "method not allowed; collections are deleted with POST");
-        return;
-      }
-      handleCollectionDelete(req.body());
-    } else if (parseSearchPath(target, coll)) {
-      if (req.method() != http::verb::get && req.method() != http::verb::post) {
-        respondMethodNotAllowed("GET, POST", "method not allowed; searches use GET or POST");
-        return;
-      }
-      if (req.method() == http::verb::get && !req.body().empty()) {
-        respondSimple(http::status::bad_request, "application/json",
-                      renderErrorBody("GET _search does not accept a request body; use POST"));
-        return;
-      }
-      SearchUrlOverlay overlay;
-      std::string overlayErr;
-      if (!parseSearchUrlOverlay(params, overlay, overlayErr)) {
-        respondSimple(http::status::bad_request, "application/json", renderErrorBody(overlayErr));
-        return;
-      }
-      auto format = HttpSearchFormat::ENVELOPE;
-      if (const std::string* f = findParam(params, "format")) {
-        if (*f == "docs") {
-          format = HttpSearchFormat::DOCS;
+    const std::string& coll = match.coll;
+    switch (match.route) {
+      case Route::HEALTH:
+        respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
+        break;
+      case Route::COLLECTION_LIST:
+        handleCollectionList();
+        break;
+      case Route::COLLECTION_CREATE:
+        handleCollectionCreate(req.body());
+        break;
+      case Route::COLLECTION_DELETE:
+        handleCollectionDelete(req.body());
+        break;
+      case Route::SEARCH: {
+        if (req.method() == http::verb::get && !req.body().empty()) {
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                     "GET _search does not accept a request body; use POST"));
+          return;
+        }
+        SearchUrlOverlay overlay;
+        std::string overlayErr;
+        if (!parseSearchUrlOverlay(params, overlay, overlayErr)) {
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, overlayErr));
+          return;
+        }
+        auto format = HttpSearchFormat::ENVELOPE;
+        if (const std::string* f = findParam(params, "format")) {
+          if (*f == "docs") {
+            format = HttpSearchFormat::DOCS;
+          } else {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                       "unknown format '" + *f + "' (valid: docs)"));
+            return;
+          }
+        }
+        if (const std::string* explain = findParam(params, "explain")) {
+          if (*explain != "request") {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                       "unknown explain mode '" + *explain + "' (valid: request)"));
+            return;
+          }
+          if (format != HttpSearchFormat::ENVELOPE) {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                       "format=docs cannot be combined with explain"));
+            return;
+          }
+          handleExplain(req.body(), coll, overlay);
         } else {
-          respondSimple(http::status::bad_request, "application/json",
-                        renderErrorBody("unknown format '" + *f + "' (valid: docs)"));
+          handleSearch(req.body(), coll, format, overlay);
+        }
+        break;
+      }
+      case Route::UPDATE: {
+        std::vector<std::pair<std::string, std::string>> urlFieldMap;
+        bool urlDropUnmapped = false;
+        std::string paramErr;
+        if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
+            !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
           return;
         }
+        handleUpdate(req.body(), coll, urlFieldMap, urlDropUnmapped);
+        break;
       }
-      if (const std::string* explain = findParam(params, "explain")) {
-        if (*explain != "request") {
-          respondSimple(http::status::bad_request, "application/json",
-                        renderErrorBody("unknown explain mode '" + *explain + "' (valid: request)"));
-          return;
+      case Route::STATS: {
+        bool includeSegments = false;
+        if (const std::string* value = findParam(params, "segments")) {
+          if (*value == "true") {
+            includeSegments = true;
+          } else if (*value != "false") {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                       "invalid segments value '" + *value +
+                                           "' (valid: true, false)"));
+            return;
+          }
         }
-        if (format != HttpSearchFormat::ENVELOPE) {
-          respondSimple(http::status::bad_request, "application/json",
-                        renderErrorBody("format=docs cannot be combined with explain"));
-          return;
+        handleStats(target == "/_stats" ? std::nullopt : std::optional<std::string>(coll),
+                    includeSegments);
+        break;
+      }
+      case Route::SCHEMA: {
+        // Writes are POST; the operation is the visible, typeable ?mode= param,
+        // never an invisible HTTP verb.  mode=set (the default, and curl's
+        // zero-flag path) sets each named definition exactly; the destructive
+        // mode=replace_all must be typed.  PUT/PATCH are reserved.
+        if (req.method() == http::verb::get) {
+          handleSchemaGet(coll);
+          break;
         }
-        handleExplain(req.body(), coll, overlay);
-      } else {
-        handleSearch(req.body(), coll, format, overlay);
-      }
-    } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
-      std::vector<std::pair<std::string, std::string>> urlFieldMap;
-      bool urlDropUnmapped = false;
-      std::string paramErr;
-      if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
-          !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
-        respondSimple(http::status::bad_request, "application/json", renderErrorBody(paramErr));
-        return;
-      }
-      handleUpdate(req.body(), coll, urlFieldMap, urlDropUnmapped);
-    } else if (target == "/_stats" || parseStatsPath(target, coll)) {
-      if (req.method() != http::verb::get) {
-        respondMethodNotAllowed("GET", "method not allowed; stats are read with GET");
-        return;
-      }
-
-      bool includeSegments = false;
-      if (const std::string* value = findParam(params, "segments")) {
-        if (*value == "true") {
-          includeSegments = true;
-        } else if (*value != "false") {
-          respondSimple(http::status::bad_request, "application/json",
-                        renderErrorBody("invalid segments value '" + *value +
-                                        "' (valid: true, false)"));
-          return;
-        }
-      }
-      handleStats(target == "/_stats" ? std::nullopt : std::optional<std::string>(coll),
-                  includeSegments);
-    } else if (parseSchemaPath(target, coll)) {
-      // Writes are POST; the operation is the visible, typeable ?mode= param,
-      // never an invisible HTTP verb.  mode=set (the default, and curl's
-      // zero-flag path) sets each named definition exactly; the destructive
-      // mode=replace_all must be typed.  PUT/PATCH are reserved.
-      if (req.method() == http::verb::get) {
-        handleSchemaGet(coll);
-      } else if (req.method() == http::verb::post) {
         auto mode = luxir::api::SchemaRequest_::Mode::SET;
         if (const std::string* m = findParam(params, "mode")) {
           if (*m == "replace_all") {
             mode = luxir::api::SchemaRequest_::Mode::REPLACE_ALL;
           } else if (*m != "set") {
-            respondSimple(http::status::bad_request, "application/json",
-                          renderErrorBody("unknown mode '" + *m + "' (valid: set, replace_all)"));
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                       "unknown mode '" + *m + "' (valid: set, replace_all)"));
             return;
           }
         }
         handleSchemaSet(req.body(), coll, mode);
-      } else {
-        respondMethodNotAllowed(
-            "GET, POST",
-            "method not allowed; schema writes are POST (mode=set adds or replaces the "
-            "named definitions, mode=replace_all replaces the whole schema)");
+        break;
       }
-    } else {
-      respondSimple(http::status::not_found, "application/json",
-                    renderErrorBody("not found"));
+      case Route::NONE:
+        break;
     }
   }
 
@@ -1207,7 +1295,7 @@ private:
     if (overlay.hasTopDocs && !state.proto.ops.empty()) {
       const auto* q = state.proto.ops.find("q");
       if (q == nullptr || std::get_if<luxir::api::TopDocs>(&(**q).kind) == nullptr) {
-        throw std::runtime_error(
+        throw RequestError(
             "URL TopDocs parameters target ops.q, but the request body has no top_docs op named 'q'");
       }
     }
@@ -1227,19 +1315,19 @@ private:
     std::string out;
     try {
       parseEffectiveRequest(body, coll, overlay, state);
+      requestId_ = std::string(state.proto.request_id);
       // Mirrors the URL-param check in route(): the docs format can also be
       // selected in the body, and it composes with explain no better.
       if (state.proto.response_format == luxir::api::ResponseFormat::DOCS) {
-        respondSimple(http::status::bad_request, "application/json",
-                      renderErrorBody("format=docs cannot be combined with explain"));
+        respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                   "format=docs cannot be combined with explain"));
         return;
       }
       if (!luxir::api::write_json(state.proto, out)) {
-        throw std::runtime_error("failed to serialize request");
+        throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize request");
       }
     } catch (const std::exception& e) {
-      respondSimple(http::status::bad_request, "application/json",
-                    renderErrorBody(e.what()));
+      respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
     respondSimple(http::status::ok, "application/json", out);
@@ -1293,10 +1381,10 @@ private:
       parseEffectiveRequest(body, coll, overlay, *requestState);
     } catch (const std::exception& e) {
       releaseArena(arena);
-      respondSimple(http::status::bad_request, "application/json",
-                    renderErrorBody(e.what()));
+      respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
+    requestId_ = std::string(requestState->proto.request_id);
     // The URL param is an alias for the request-level proto field (for clients
     // that cannot set query params).  The param cannot express an explicit
     // envelope, so either source selecting DOCS wins - no conflict exists.
@@ -1307,7 +1395,7 @@ private:
     if (format == HttpSearchFormat::DOCS) {
       if (const char* err = validateDocsFormat(requestState->proto)) {
         releaseArena(arena);
-        respondSimple(http::status::bad_request, "application/json", renderErrorBody(err));
+        respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
         return;
       }
       docsMultiOp = requestState->proto.ops.size() > 1;
@@ -1318,6 +1406,7 @@ private:
         *arena, engine, std::move(requestState), shared_from_this(), *arena);
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
+    sreq->docsState.requestId = sreq->proto.request_id;
     // Pin the io_context: shutdown drains until this query finishes, and the
     // context survives the request's teardown on the task-arena thread.
     sreq->shardPin = makeShardPin();
@@ -1338,7 +1427,7 @@ private:
     try {
       std::string err;
       if (!luxir::api::read_json(state->proto, body, state->resource, &err)) {
-        throw std::runtime_error(err.empty() ? "malformed update request" : err);
+        throw RequestError(err.empty() ? "malformed update request" : err, "invalid_json");
       }
       setCollectionTarget(state->proto.collection, coll, state->resource);
       // Same unit rule as streaming groups: a body that sets either field-map knob
@@ -1348,16 +1437,16 @@ private:
         copyFieldMap(state->proto, urlFieldMap, state->resource);
         state->proto.drop_unmapped = urlDropUnmapped;
       }
+      requestId_ = std::string(state->proto.request_id);
     } catch (const std::exception& e) {
-      respondSimple(http::status::bad_request, "application/json",
-                    renderErrorBody(e.what()));
+      respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
 
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
-      http::status status = http::status::ok;
       std::string out;
+      std::optional<ErrorInfo> failure;
       try {
         std::shared_ptr<Collection> collection =
             self->node_.resolveOrCreateCollection(state->proto.collection ? &*state->proto.collection : nullptr);
@@ -1382,17 +1471,14 @@ private:
         if (!luxir::api::write_json(*resp, out)) {
           throw std::runtime_error("failed to serialize update response");
         }
-      } catch (const CollectionResolutionError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
       } catch (const std::exception& e) {
-        status = http::status::internal_server_error;
-        out = renderErrorBody(e.what());
+        failure = classifyException(e, ErrorKind::INTERNAL);
       }
 
       net::post(self->stream_.get_executor(),
-          [self, shardPin, status, body = std::move(out)]() mutable {
-            self->respondSimple(status, "application/json", std::move(body));
+          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+            if (failure) self->respondError(*failure);
+            else self->respondSimple(http::status::ok, "application/json", std::move(body));
           });
     });
   }
@@ -1401,8 +1487,8 @@ private:
   // for-humans admin reads.  A pure in-memory snapshot, so it runs inline on
   // the io thread.
   void handleCollectionList() {
-    http::status status = http::status::ok;
     std::string out;
+    std::optional<ErrorInfo> failure;
     try {
       auto entries = node_.collectionEntries();
       std::vector<std::string_view> names(entries.size());
@@ -1416,10 +1502,10 @@ private:
       glz::prettify_json(compact, out);
       out += '\n';
     } catch (const std::exception& e) {
-      status = http::status::internal_server_error;
-      out = renderErrorBody(e.what());
+      failure = classifyException(e, ErrorKind::INTERNAL);
     }
-    respondSimple(status, "application/json", std::move(out));
+    if (failure) respondError(*failure);
+    else respondSimple(http::status::ok, "application/json", std::move(out));
   }
 
   void handleCollectionCreate(const std::string& body) {
@@ -1431,17 +1517,17 @@ private:
     try {
       std::string err;
       if (!luxir::api::read_json(state->request, body, state->resource, &err)) {
-        throw std::runtime_error(err.empty() ? "malformed create collection request" : err);
+        throw RequestError(err.empty() ? "malformed create collection request" : err, "invalid_json");
       }
     } catch (const std::exception& e) {
-      respondSimple(http::status::bad_request, "application/json", renderErrorBody(e.what()));
+      respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
 
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
-      http::status status = http::status::ok;
       std::string out;
+      std::optional<ErrorInfo> failure;
       try {
         self->node_.createCollection(
             nullptr, state->request.name,
@@ -1451,23 +1537,14 @@ private:
         if (!luxir::api::write_json(response, out)) {
           throw std::runtime_error("failed to serialize create collection response");
         }
-      } catch (const InvalidCollectionNameError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
-      } catch (const SchemaError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
-      } catch (const CollectionExistsError& e) {
-        status = http::status::conflict;
-        out = renderErrorBody(e.what());
       } catch (const std::exception& e) {
-        status = http::status::internal_server_error;
-        out = renderErrorBody(e.what());
+        failure = classifyException(e, ErrorKind::INTERNAL);
       }
 
       net::post(self->stream_.get_executor(),
-          [self, shardPin, status, body = std::move(out)]() mutable {
-            self->respondSimple(status, "application/json", std::move(body));
+          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+            if (failure) self->respondError(*failure);
+            else self->respondSimple(http::status::ok, "application/json", std::move(body));
           });
     });
   }
@@ -1481,17 +1558,17 @@ private:
     try {
       std::string err;
       if (!luxir::api::read_json(state->request, body, state->resource, &err)) {
-        throw std::runtime_error(err.empty() ? "malformed delete collection request" : err);
+        throw RequestError(err.empty() ? "malformed delete collection request" : err, "invalid_json");
       }
     } catch (const std::exception& e) {
-      respondSimple(http::status::bad_request, "application/json", renderErrorBody(e.what()));
+      respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
 
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
-      http::status status = http::status::ok;
       std::string out;
+      std::optional<ErrorInfo> failure;
       try {
         self->node_.deleteCollection(state->request.name);
         luxir::api::DeleteCollectionResponse response;
@@ -1499,23 +1576,14 @@ private:
         if (!luxir::api::write_json(response, out)) {
           throw std::runtime_error("failed to serialize delete collection response");
         }
-      } catch (const InvalidCollectionNameError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
-      } catch (const CollectionNotFoundError& e) {
-        status = http::status::not_found;
-        out = renderErrorBody(e.what());
-      } catch (const CollectionUnavailableError& e) {
-        status = http::status::not_found;
-        out = renderErrorBody(e.what());
       } catch (const std::exception& e) {
-        status = http::status::internal_server_error;
-        out = renderErrorBody(e.what());
+        failure = classifyException(e, ErrorKind::INTERNAL);
       }
 
       net::post(self->stream_.get_executor(),
-          [self, shardPin, status, body = std::move(out)]() mutable {
-            self->respondSimple(status, "application/json", std::move(body));
+          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+            if (failure) self->respondError(*failure);
+            else self->respondSimple(http::status::ok, "application/json", std::move(body));
           });
     });
   }
@@ -1543,8 +1611,8 @@ private:
   void handleSchemaGet(const std::string& coll) {
     // Read-only: never creates the collection, and the schema is an atomic
     // load + pure render, so this runs inline on the io thread.
-    http::status status = http::status::ok;
     std::string out;
+    std::optional<ErrorInfo> failure;
     try {
       std::pmr::monotonic_buffer_resource targetResource;
       std::optional<luxir::api::Target> target;
@@ -1552,22 +1620,19 @@ private:
       auto collection = node_.resolveCollection(&*target);
       auto schema = collection->getSchema();
       out = renderSchemaBody(*schema);
-    } catch (const CollectionResolutionError& e) {
-      status = http::status::not_found;
-      out = renderErrorBody(e.what());
     } catch (const std::exception& e) {
-      status = http::status::internal_server_error;
-      out = renderErrorBody(e.what());
+      failure = classifyException(e, ErrorKind::INTERNAL);
     }
-    respondSimple(status, "application/json", std::move(out));
+    if (failure) respondError(*failure);
+    else respondSimple(http::status::ok, "application/json", std::move(out));
   }
 
   void handleStats(std::optional<std::string> coll, bool includeSegments) {
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue(
         [self = shared_from_this(), coll = std::move(coll), includeSegments, shardPin] {
-          http::status status = http::status::ok;
           std::string out;
+          std::optional<ErrorInfo> failure;
           try {
             std::pmr::monotonic_buffer_resource resource;
             luxir::api::StatsRequest request;
@@ -1583,17 +1648,14 @@ private:
             }
             glz::prettify_json(compact, out);
             out += '\n';
-          } catch (const CollectionResolutionError& e) {
-            status = http::status::not_found;
-            out = renderErrorBody(e.what());
           } catch (const std::exception& e) {
-            status = http::status::internal_server_error;
-            out = renderErrorBody(e.what());
+            failure = classifyException(e, ErrorKind::INTERNAL);
           }
 
           net::post(self->stream_.get_executor(),
-                    [self, shardPin, status, body = std::move(out)]() mutable {
-                      self->respondSimple(status, "application/json", std::move(body));
+                    [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+                      if (failure) self->respondError(*failure);
+                      else self->respondSimple(http::status::ok, "application/json", std::move(body));
                     });
         });
   }
@@ -1608,11 +1670,10 @@ private:
     try {
       std::string err;
       if (!luxir::api::read_json(state->def, body, state->resource, &err)) {
-        throw std::runtime_error(err.empty() ? "malformed schema" : err);
+        throw RequestError(err.empty() ? "malformed schema" : err, "invalid_json");
       }
     } catch (const std::exception& e) {
-      respondSimple(http::status::bad_request, "application/json",
-                    renderErrorBody(e.what()));
+      respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
 
@@ -1620,8 +1681,8 @@ private:
     // it off the io thread like handleUpdate.
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, coll] {
-      http::status status = http::status::ok;
       std::string out;
+      std::optional<ErrorInfo> failure;
       try {
         std::pmr::monotonic_buffer_resource targetResource;
         std::optional<luxir::api::Target> target;
@@ -1629,32 +1690,31 @@ private:
         auto collection = self->node_.resolveOrCreateCollection(&*target);
         auto newSchema = collection->updateSchema(state->def, mode);
         out = renderSchemaBody(*newSchema);
-      } catch (const SchemaError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
-      } catch (const CollectionResolutionError& e) {
-        status = http::status::bad_request;
-        out = renderErrorBody(e.what());
       } catch (const std::exception& e) {
-        status = http::status::internal_server_error;
-        out = renderErrorBody(e.what());
+        failure = classifyException(e, ErrorKind::INTERNAL);
       }
 
       net::post(self->stream_.get_executor(),
-          [self, shardPin, status, body = std::move(out)]() mutable {
-            self->respondSimple(status, "application/json", std::move(body));
+          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+            if (failure) self->respondError(*failure);
+            else self->respondSimple(http::status::ok, "application/json", std::move(body));
           });
     });
   }
 
-  void respondMethodNotAllowed(std::string_view allow, std::string_view message) {
+  void respondMethodNotAllowed(const RouteMatch& match, http::verb method, std::string_view target) {
+    std::string message = std::string(http::to_string(method)) + " is not allowed for " +
+                          std::string(target) + "; allowed: " + std::string(match.allow);
+    if (!match.hint.empty()) message += "; " + std::string(match.hint);
+    ErrorInfo info{ErrorKind::INVALID_REQUEST, "method_not_allowed", std::move(message)};
+    std::string_view allow = match.allow;
     auto resp = std::make_shared<http::response<http::string_body>>(
         http::status::method_not_allowed, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, "application/json");
     resp->set(http::field::allow, allow);
     resp->keep_alive(keepAlive_);
-    resp->body() = renderErrorBody(message);
+    resp->body() = renderErrorBody(info, requestId_);
     resp->prepare_payload();
     http::async_write(stream_, *resp,
         [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
@@ -1936,7 +1996,8 @@ private:
 
     bool needBuffer = ec == http::error::need_buffer;
     if (ec && !needBuffer) {
-      failStreamingUpdate("failed to read NDJSON request body: " + ec.message());
+      failStreamingUpdate(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                        "failed to read NDJSON request body: " + ec.message()));
       return;
     }
 
@@ -1944,7 +2005,7 @@ private:
     if (produced > 0) {
       state->framer.feed(std::string_view(state->readBuf.data(), produced));
       if (state->framer.error()) {
-        failStreamingInput(state->framer.message());
+        failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large", state->framer.message()});
         return;
       }
     }
@@ -1978,8 +2039,13 @@ private:
     state.group.collectionName = state.defaultCollectionName;
   }
 
+  // The response line for the current interval.  `terminal` is the failure
+  // ending the stream, if any: the line then reports status ERROR and the
+  // error alongside whatever the interval had folded so far.  total_errors
+  // counts every failed document even past the retention cap on `errors`.
   static bool renderStreamIntervalResponseLine(const HttpStreamUpdateState& state,
                                                std::string_view requestId,
+                                               const ErrorInfo* terminal,
                                                std::string& out) {
     const auto& interval = state.interval;
     std::pmr::monotonic_buffer_resource responseResource;
@@ -1992,27 +2058,26 @@ private:
     for (const auto& id : interval.ids) ids.push_back(luxir::api::build::arenaStr(responseResource, id));
     resp.ids = ids.finish();
 
-    luxir::api::build::SpanBuilder<luxir::api::UpdateResponse_::Error> errors(responseResource);
+    luxir::api::build::SpanBuilder<luxir::api::UpdateResponse_::DocError> errors(responseResource);
     errors.reserve(interval.errors.size());
     for (const auto& src : interval.errors) {
       auto& dst = errors.emplace_back();
       dst.id = luxir::api::build::arenaStr(responseResource, src.id);
-      dst.error_message = luxir::api::build::arenaStr(responseResource, src.errorMessage);
       dst.index = src.index;
+      dst.error = luxir::api::build::arenaError(responseResource, src.error);
     }
     resp.errors = errors.finish();
+    resp.total_errors = (int64_t)interval.totalErrors;
 
-    if (interval.totalErrors == 0) {
+    if (terminal != nullptr) {
+      resp.status = luxir::api::UpdateResponse_::Status::ERROR;
+      resp.error = luxir::api::build::arenaError(responseResource, *terminal);
+    } else if (interval.totalErrors == 0) {
       resp.status = luxir::api::UpdateResponse_::Status::OK;
     } else if (interval.anySuccess) {
       resp.status = luxir::api::UpdateResponse_::Status::PARTIAL;
     } else {
       resp.status = luxir::api::UpdateResponse_::Status::ERROR;
-    }
-    if (interval.totalErrors > interval.errors.size()) {
-      std::string msg = "retained first " + std::to_string(interval.errors.size()) + " of " +
-          std::to_string(interval.totalErrors) + " errors";
-      resp.error_message = luxir::api::build::arenaStr(responseResource, msg);
     }
 
     out.clear();
@@ -2021,14 +2086,14 @@ private:
     return true;
   }
 
-  static bool renderStreamErrorResponseLine(std::string_view requestId, std::uint64_t updateVersion,
-                                            std::string_view message, std::string& out) {
+  // The terminal line when no stream state survives to render an interval.
+  static bool renderStreamFailureLine(std::string_view requestId, const ErrorInfo& failure,
+                                      std::string& out) {
     std::pmr::monotonic_buffer_resource responseResource;
     luxir::api::UpdateResponse resp;
     resp.request_id = luxir::api::build::arenaStr(responseResource, requestId);
-    resp.update_version = updateVersion;
     resp.status = luxir::api::UpdateResponse_::Status::ERROR;
-    resp.error_message = luxir::api::build::arenaStr(responseResource, message);
+    resp.error = luxir::api::build::arenaError(responseResource, failure);
 
     out.clear();
     if (!luxir::api::write_json(resp, out)) return false;
@@ -2042,8 +2107,8 @@ private:
     if (!force && !streamIntervalHasActivity(*state)) return true;
 
     std::string out;
-    if (!renderStreamIntervalResponseLine(*state, currentStreamResponseRequestId(*state), out)) {
-      failStreamingUpdate("failed to serialize update response");
+    if (!renderStreamIntervalResponseLine(*state, currentStreamResponseRequestId(*state), nullptr, out)) {
+      failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "failed to serialize update response"));
       return false;
     }
     state->emittedLine = true;
@@ -2053,7 +2118,9 @@ private:
     return true;
   }
 
-  void failStreamingUpdate(std::string message) {
+  // Ends the stream with `failure`: the terminal response line when the
+  // chunked response has begun, a plain HTTP error otherwise.
+  void failStreamingUpdate(ErrorInfo failure) {
     auto state = streamUpdate_;
     if (state && state->failed) return;
     std::size_t docsIndexed = state ? state->docsIndexedSoFar : 0;
@@ -2068,33 +2135,34 @@ private:
     if (!state || !state->readInFlight) parser_.reset();
     keepAlive_ = false;
     terminalStreamingFailure_ = true;
-    message += " (docs_indexed_so_far=" + std::to_string(docsIndexed) + ")";
+    failure.message += " (docs_indexed_so_far=" + std::to_string(docsIndexed) + ")";
+    std::string_view requestId = state ? currentStreamResponseRequestId(*state) : std::string_view();
     if (headerSent_) {
       std::string out;
-      std::string_view requestId = state ? currentStreamResponseRequestId(*state) : std::string_view();
-      std::uint64_t updateVersion = state ? state->interval.lastUpdateVersion : 0;
-      if (!renderStreamErrorResponseLine(requestId, updateVersion, message, out)) {
+      bool rendered = state ? renderStreamIntervalResponseLine(*state, requestId, &failure, out)
+                            : renderStreamFailureLine(requestId, failure, out);
+      if (!rendered) {
         doTerminalStreamingClose();
         return;
       }
       enqueueLine(std::move(out), true);
       return;
     }
-    respondSimple(http::status::bad_request, "application/json", renderErrorBody(message));
+    respondError(failure, requestId);
   }
 
-  // Fatal input is ordered after every batch submitted before the bad record.
-  // Preserve that stream position by draining and folding the submitted prefix
-  // before rendering the failure and its docs_indexed_so_far count.
-  void failStreamingInput(std::string message) {
+  // A failure ordered after every batch already admitted: fatal input, or a
+  // batch's request-level failure while later batches are in flight.  The
+  // admitted prefix drains and folds first, so the terminal line's counts and
+  // evidence cover everything the stream actually did.
+  void failStreamingInput(ErrorInfo failure) {
     auto state = streamUpdate_;
     if (!state || state->failed || state->inputFailurePending) return;
-    if (state->inFlight == 0) {
-      failStreamingUpdate(std::move(message));
+    if (state->inFlight == 0 && !state->barrierPending) {
+      failStreamingUpdate(std::move(failure));
       return;
     }
-    assert(!state->barrierPending);
-    state->inputFailurePending = std::move(message);
+    state->inputFailurePending = std::move(failure);
     state->barrierPending = true;
   }
 
@@ -2110,7 +2178,7 @@ private:
     state->group.open = true;
   }
 
-  HttpStreamWriterTarget* streamWriterTarget(const std::string& collectionName, std::string& err) {
+  HttpStreamWriterTarget* streamWriterTarget(const std::string& collectionName, ErrorInfo& err) {
     auto state = streamUpdate_;
     assert(state != nullptr);
     auto [it, inserted] = state->writerCache.try_emplace(collectionName);
@@ -2122,12 +2190,8 @@ private:
       setCollectionTarget(target, collectionName, targetResource);
       it->second.collection = node_.resolveOrCreateCollection(&*target);
       it->second.indexWriter = it->second.collection->getShard()->getIndexWriter();
-    } catch (const std::exception& e) {
-      err = e.what();
-      state->writerCache.erase(it);
-      return nullptr;
     } catch (...) {
-      err = "unknown non-standard exception";
+      err = currentExceptionInfo(ErrorKind::INTERNAL);
       state->writerCache.erase(it);
       return nullptr;
     }
@@ -2153,18 +2217,19 @@ private:
     if (!barrierSubmission && !state->canAdmit()) return false;
     assert(state->inFlight < state->maxInFlight);
 
-    std::string err;
+    ErrorInfo err;
     HttpStreamWriterTarget* target = streamWriterTarget(state->batch->collectionName, err);
     if (target == nullptr) {
-      failStreamingUpdate("failed to resolve collection '" + state->batch->collectionName + "': " + err);
+      failStreamingUpdate(std::move(err));
       return false;
     }
     // The stream holds a cached writer, so a collection deleted mid-stream is only
     // visible here.  A batch that races the close is instead rejected inside the
     // graph and folded as a batch error; the batch after it ends the stream here.
     if (target->indexWriter->isClosed()) {
-      failStreamingUpdate("NDJSON batch rejected: index writer for collection '" +
-                          state->batch->collectionName + "' is closed");
+      failStreamingUpdate({ErrorKind::UNAVAILABLE, "writer_closed",
+                           "NDJSON batch rejected: index writer for collection '" +
+                               state->batch->collectionName + "' is closed"});
       return false;
     }
 
@@ -2187,13 +2252,11 @@ private:
     // Consecutive calls therefore reach startUpdateNode in stream order; enqueue
     // would not preserve the updateVersion ordering required by overwrite.
     bool success = false;
-    std::string submitError;
+    std::optional<ErrorInfo> submitError;
     try {
       node_.getTaskArena().execute([&] { success = iw->submitUpdate(message.get()); });
-    } catch (const std::exception& e) {
-      submitError = e.what();
     } catch (...) {
-      submitError = "unknown non-standard exception";
+      submitError = currentExceptionInfo(ErrorKind::INTERNAL);
     }
     if (!success) {
       HttpStreamBatchResult result;
@@ -2201,9 +2264,12 @@ private:
       result.deleteCount = batch->deleteCount;
       result.firstDocIndex = batch->firstDocIndex;
       result.failed = true;
-      result.errorMessage = submitError.empty()
-          ? "update graph rejected the NDJSON batch"
-          : "update graph submission failed: " + submitError;
+      if (submitError) {
+        submitError->message = "update graph submission failed: " + submitError->message;
+        result.error = std::move(submitError);
+      } else {
+        result.error = ErrorInfo::of(ErrorKind::INTERNAL, "update graph rejected the NDJSON batch");
+      }
       // Dead today: startUpdateNode is a queueing function_node, so try_put
       // always accepts.  This becomes reentrant under a rejecting policy.
       onStreamBatchDone(state, ordinal, std::move(result));
@@ -2272,11 +2338,12 @@ private:
     assert(state != nullptr);
     assert(state->batch != nullptr);
     if (request->sourceBytes > state->maxRequestBody) {
-      failStreamingUpdate("_update_ inline request exceeds indexing.max-request-body");
+      failStreamingUpdate({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large",
+                           "_update_ inline request exceeds indexing.max-request-body"});
       return false;
     }
     if (state->batch->docs.size() != 0) {
-      failStreamingUpdate("internal error: inline _update_ encountered a non-empty stream batch");
+      failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "internal error: inline _update_ encountered a non-empty stream batch"));
       return false;
     }
 
@@ -2297,7 +2364,7 @@ private:
     state->batchReady = true;
     bool submitted = submitPreparedStreamBatch(true);
     if (!submitted && !state->failed) {
-      failStreamingUpdate("internal error: failed to submit inline _update_ barrier");
+      failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "internal error: failed to submit inline _update_ barrier"));
     }
     return false;
   }
@@ -2324,7 +2391,7 @@ private:
       state->resetGroupAfterBatch = true;
       bool submitted = submitStreamBatch(commitParams, true);
       if (!submitted && !state->failed) {
-        failStreamingUpdate("internal error: failed to submit NDJSON close barrier");
+        failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "internal error: failed to submit NDJSON close barrier"));
       }
       return false;
     }
@@ -2380,9 +2447,9 @@ private:
     assert(state->completedBatchResults.empty());
 
     if (state->inputFailurePending) {
-      std::string message = std::move(*state->inputFailurePending);
+      ErrorInfo failure = std::move(*state->inputFailurePending);
       state->inputFailurePending.reset();
-      failStreamingUpdate(std::move(message));
+      failStreamingUpdate(std::move(failure));
       return;
     }
 
@@ -2437,14 +2504,15 @@ private:
     luxir::api::Map map;
     std::string err;
     if (!luxir::api::read_json(map, record, state->batch->resource, &err)) {
-      failStreamingInput(err.empty() ? "malformed NDJSON record" : err);
+      failStreamingInput({ErrorKind::INVALID_REQUEST, "invalid_json",
+                          err.empty() ? "malformed NDJSON record" : err});
       return false;
     }
 
     HttpStreamControl control;
     bool isControl = false;
     if (!extractStreamControl(map, control, isControl, record.size(), err)) {
-      failStreamingInput(err);
+      failStreamingInput(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
       return false;
     }
 
@@ -2459,7 +2527,8 @@ private:
       if (control.kind == HttpStreamControlKind::Noop) {
         state->batch->sourceBytes += record.size();
         if (state->group.allOrNone() && state->batch->sourceBytes > state->maxRequestBody) {
-          failStreamingInput("all_or_none NDJSON group exceeds indexing.max-request-body");
+          failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large",
+                              "all_or_none NDJSON group exceeds indexing.max-request-body"});
           return false;
         }
         if (state->batch->docs.size() == 0 &&
@@ -2476,7 +2545,8 @@ private:
     state->batch->sourceBytes += record.size();
     if (state->group.allOrNone()) {
       if (state->batch->sourceBytes > state->maxRequestBody) {
-        failStreamingInput("all_or_none NDJSON group exceeds indexing.max-request-body");
+        failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large",
+                              "all_or_none NDJSON group exceeds indexing.max-request-body"});
         return false;
       }
       return true;
@@ -2515,10 +2585,25 @@ private:
       state->completedBatchResults.erase(next);
       state->nextFoldOrdinal++;
       if (nextResult.failed) {
-        failStreamingUpdate("NDJSON update batch failed: " + nextResult.errorMessage);
+        ErrorInfo failure =
+            nextResult.error.value_or(ErrorInfo::of(ErrorKind::INTERNAL, "unknown failure"));
+        failure.message = "NDJSON update batch failed: " + failure.message;
+        failStreamingUpdate(std::move(failure));
         return;
       }
       foldStreamBatchResult(nextResult);
+      if (nextResult.error) {
+        // A request-level failure (status ERROR with an error set: the commit
+        // pipeline, a closed writer, a bad field_map) ends the stream.  What
+        // follows would fail the same way, and the response line must report
+        // it as the request's failure, never as a document's.  The batch's
+        // own evidence (document errors, update version) was folded above;
+        // batches already in flight drain before the terminal line.
+        failStreamingInput(*nextResult.error);
+        if (state->failed) return;
+        // Otherwise the failure waits behind the barrier: keep folding what
+        // has already completed so the terminal line covers it.
+      }
     }
 
     if (state->barrierPending) {
@@ -2550,8 +2635,11 @@ private:
       interval.anySuccess = true;
     }
 
-    for (const auto& id : result.ids) {
-      if (interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds) interval.ids.push_back(id);
+    // Ids on a request-level failure are not proof of anything durable.
+    if (result.status != luxir::api::UpdateResponse_::Status::ERROR) {
+      for (const auto& id : result.ids) {
+        if (interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds) interval.ids.push_back(id);
+      }
     }
 
     for (const auto& err : result.errors) {
@@ -2561,16 +2649,7 @@ private:
       if (err.index >= 0) globalIndex += (std::size_t)err.index;
       std::size_t intervalIndex =
           globalIndex >= interval.firstDocIndex ? globalIndex - interval.firstDocIndex : 0;
-      interval.errors.push_back({err.id, err.errorMessage, cappedErrorIndex(intervalIndex)});
-    }
-
-    if (!result.errorMessage.empty() && result.status == luxir::api::UpdateResponse_::Status::ERROR) {
-      interval.totalErrors++;
-      if (interval.errors.size() < HttpStreamUpdateState::kMaxRetainedErrors) {
-        std::size_t intervalIndex =
-            result.firstDocIndex >= interval.firstDocIndex ? result.firstDocIndex - interval.firstDocIndex : 0;
-        interval.errors.push_back({"", result.errorMessage, cappedErrorIndex(intervalIndex)});
-      }
+      interval.errors.push_back({err.id, err.error, cappedErrorIndex(intervalIndex)});
     }
   }
 
@@ -2600,7 +2679,7 @@ private:
             return;
           }
         } else if (state->framer.error()) {
-          failStreamingInput(state->framer.message());
+          failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large", state->framer.message()});
           return;
         }
       }
@@ -2620,9 +2699,9 @@ private:
     parser_.reset();
 
     if (state->urlCommit) {
-      std::string err;
+      ErrorInfo err;
       if (streamWriterTarget(state->defaultCollectionName, err) == nullptr) {
-        failStreamingUpdate("failed to resolve collection '" + state->defaultCollectionName + "': " + err);
+        failStreamingUpdate(std::move(err));
         return;
       }
       submitUrlCommits();
@@ -2652,24 +2731,23 @@ private:
     auto shardPin = state->shardPin;
     node_.getTaskArena().enqueue(
         [self = shared_from_this(), state, writers = std::move(writers), shardPin] {
-          std::string err;
+          std::optional<ErrorInfo> err;
           try {
             for (const auto& [name, writer] : writers) {
               unused(name);
               writer->commit();
             }
-          } catch (const std::exception& e) {
-            err = e.what();
           } catch (...) {
-            err = "unknown non-standard exception";
+            err = currentExceptionInfo(ErrorKind::INTERNAL);
           }
 
           net::post(self->stream_.get_executor(),
               [self, state, shardPin, err = std::move(err)]() mutable {
                 if (self->streamUpdate_ != state || state->failed) return;
                 state->urlCommitInFlight = false;
-                if (!err.empty()) {
-                  self->failStreamingUpdate("NDJSON EOF commit failed: " + err);
+                if (err) {
+                  err->message = "NDJSON EOF commit failed: " + err->message;
+                  self->failStreamingUpdate(std::move(*err));
                   return;
                 }
                 self->finishStreamingUpdate();
@@ -2832,6 +2910,17 @@ private:
         });
   }
 
+  // Every failure answered with an HTTP error status: the status follows the
+  // error's kind (httpStatusFor); the body is the same {request_id, error}
+  // object an in-band error line carries.
+  void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
+  void respondError(const ErrorInfo& info, std::string_view requestId) {
+    respondSimple(httpStatusFor(info), "application/json", renderErrorBody(info, requestId));
+  }
+  void respondException(const std::exception& e, ErrorKind fallback) {
+    respondError(classifyException(e, fallback));
+  }
+
   // A 413 for a request body past indexing.max-request-body.  The body was not fully
   // consumed, so the connection cannot be reused - respond, then close.
   void respondPayloadTooLarge() {
@@ -2840,8 +2929,8 @@ private:
       unsigned v = parser_->get().version();
       if (v != 0) httpVersion_ = v;
     }
-    respondSimple(http::status::payload_too_large, "application/json",
-                  renderErrorBody("request body exceeds indexing.max-request-body"));
+    respondError({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large",
+                  "request body exceeds indexing.max-request-body"});
   }
 
   void doClose() {
@@ -2900,10 +2989,11 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
       status = ReplyStatus::CANCEL;  // connection failed; skip the render
     } else {
       int64_t queued = session->enqueueLine(renderSearchResponseLine(response.proto), last);
+      outputCommitted = true;
       if (queued > session->highWater()) status = ReplyStatus::PAUSE;
     }
   } catch (...) {
-    // fall through to cleanup
+    failDelivery(response);
   }
   if (last) {
     done();  // releases the request arena (this), its work guard, and session ref
@@ -2925,14 +3015,13 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
   try {
     if (session->aborted()) {
       status = ReplyStatus::CANCEL;
-    } else if (!response.proto.error.empty()) {
-      if (docsOutputCommitted) {
+    } else if (response.proto.error.has_value()) {
+      if (outputCommitted) {
         session->abortStream();
       } else {
-        // TODO: distinguish request errors from server errors (submitBody has
-        // the same gap); everything surfaces as 400 for now.
-        session->respondErrorFromEngine(http::status::bad_request,
-                                        renderErrorBody(response.proto.error));
+        ErrorInfo info = luxir::api::build::errorInfo(*response.proto.error);
+        session->respondErrorFromEngine(httpStatusFor(info),
+                                        renderErrorBody(info, response.proto.request_id));
       }
     } else {
       // Document bodies are a pure function of the batch: render them OUTSIDE
@@ -2966,12 +3055,12 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
         // Only after enqueueLine accepts the bytes: a throwing dispatch rolls
         // the queue back, and the error path must then still be free to answer
         // with a plain HTTP error rather than abort a stream that never began.
-        docsOutputCommitted = true;
+        outputCommitted = true;
         if (queued > session->highWater()) status = ReplyStatus::PAUSE;
       }
     }
   } catch (...) {
-    // fall through to cleanup
+    failDelivery(response);
   }
   if (last) {
     done();  // releases the request arena (this), its work guard, and session ref
@@ -2979,6 +3068,20 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
     releaseArena(&response.arena);  // this batch's own arena
   }
   return status;
+}
+
+void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
+  try {
+    if (outputCommitted) {
+      session->abortStream();
+      return;
+    }
+    ErrorInfo info = ErrorInfo::of(ErrorKind::INTERNAL, "failed to render the response");
+    session->respondErrorFromEngine(httpStatusFor(info),
+                                    renderErrorBody(info, response.proto.request_id));
+  } catch (...) {
+    try { session->abortStream(); } catch (...) {}
+  }
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {

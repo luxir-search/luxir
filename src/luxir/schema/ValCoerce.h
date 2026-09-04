@@ -1,6 +1,7 @@
 #pragma once
 
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/util/ApiError.h"
 
 #include <fmt/format.h>
 
@@ -71,8 +72,8 @@ inline std::string describe(const api::Val& val) {
 
 [[noreturn]] inline void throwCoerce(std::string_view fieldName, const api::Val& val,
                                      std::string_view target) {
-  throw std::runtime_error(fmt::format("field '{}': cannot coerce {} to {}",
-                                       fieldName, describe(val), target));
+  throw RequestError(fmt::format("field '{}': cannot coerce {} to {}",
+                                       fieldName, describe(val), target), "invalid_value");
 }
 
 // int64 range bounds exactly representable as doubles: [-2^63, 2^63).
@@ -102,12 +103,12 @@ inline int64_t toInt64Scalar(T value, std::string_view fieldName) {
           && std::trunc(*parsed) == *parsed) {
         return (int64_t)*parsed;
       }
-      throw std::runtime_error(fmt::format(
+      throw RequestError(fmt::format(
           "field '{}': cannot use '{}' as an integer (value is not integral)",
-          fieldName, value));
+          fieldName, value), "invalid_value");
     }
-    throw std::runtime_error(fmt::format(
-        "field '{}': cannot parse '{}' as an integer", fieldName, value));
+    throw RequestError(fmt::format(
+        "field '{}': cannot parse '{}' as an integer", fieldName, value), "invalid_value");
   } else if constexpr (std::is_same_v<V, double>) {
     if (value >= INT64_LO && value < INT64_HI && std::trunc(value) == value) {
       return (int64_t)value;
@@ -148,8 +149,8 @@ inline double toDoubleScalar(T value, std::string_view fieldName) {
     return (double)value;
   } else if constexpr (std::is_same_v<V, std::string_view>) {
     if (auto parsed = parseDouble(value)) return *parsed;
-    throw std::runtime_error(fmt::format(
-        "field '{}': cannot parse '{}' as a number", fieldName, value));
+    throw RequestError(fmt::format(
+        "field '{}': cannot parse '{}' as a number", fieldName, value), "invalid_value");
   } else {
     api::Val val = scalarVal(value);
     throwCoerce(fieldName, val, "a number");
@@ -257,13 +258,13 @@ inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
   auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
   auto appendDouble = [&](double d, size_t index) {
     float f = (float)d;
-    if (!std::isfinite(f)) throw std::runtime_error(fmt::format(
-        "field '{}': {}element {} is outside finite float32 range", fieldName, prefix(), index));
+    if (!std::isfinite(f)) throw RequestError(fmt::format(
+        "field '{}': {}element {} is outside finite float32 range", fieldName, prefix(), index), "invalid_value");
     floats.push_back(f);
   };
   if (const auto* vec = std::get_if<api::Vector>(&one.kind)) {
-    if (!vec->f32.has_value()) throw std::runtime_error(fmt::format(
-        "field '{}': {}unsupported or unset vector encoding", fieldName, prefix()));
+    if (!vec->f32.has_value()) throw RequestError(fmt::format(
+        "field '{}': {}unsupported or unset vector encoding", fieldName, prefix()), "invalid_value");
     floats.insert(floats.end(), vec->f32->v.begin(), vec->f32->v.end());
   } else if (const auto* arr = std::get_if<api::ArrFloat>(&one.kind)) {
     floats.insert(floats.end(), arr->v.begin(), arr->v.end());
@@ -277,12 +278,12 @@ inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
       if (const auto* value = std::get_if<float>(&kind)) floats.push_back(*value);
       else if (const auto* value = std::get_if<double>(&kind)) appendDouble(*value, i);
       else if (const auto* value = std::get_if<int64_t>(&kind)) floats.push_back((float)*value);
-      else throw std::runtime_error(fmt::format("field '{}': {}element {} is not a number",
-                                                fieldName, prefix(), i));
+      else throw RequestError(fmt::format("field '{}': {}element {} is not a number",
+                                                fieldName, prefix(), i), "invalid_value");
     }
   } else if (ordinal >= 0) {
-    throw std::runtime_error(fmt::format("field '{}': vector {} is not a vector",
-                                         fieldName, ordinal));
+    throw RequestError(fmt::format("field '{}': vector {} is not a vector",
+                                         fieldName, ordinal), "invalid_value");
   } else {
     throwCoerce(fieldName, one, "a vector");
   }

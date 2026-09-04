@@ -11,6 +11,7 @@
 #include <oneapi/tbb/flow_graph.h>
 #include "luxir/index/AuxInfo.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
 #include "luxir/search/IndexReader.h"
@@ -24,9 +25,12 @@
 
 namespace luxir {
 
-class IndexWriterClosedError : public std::runtime_error {
+// The writer is closed: the collection is being deleted or the node is
+// shutting down (UNAVAILABLE).
+class IndexWriterClosedError : public ApiError {
 public:
-  using std::runtime_error::runtime_error;
+  explicit IndexWriterClosedError(const std::string& message)
+    : ApiError(ErrorKind::UNAVAILABLE, "writer_closed", message) {}
 };
 
 #define INDEX_TRACE LOG_TRACE
@@ -676,7 +680,8 @@ private:
     try {
       msg.handle(*this);
     } catch (std::exception& e) {
-      LOG_ERROR("processUpdateBody Exception Caught: exception={}", (void*)&msg, e.what());
+      // setException logs the failure at the level its classification deserves.
+      INDEX_DEBUG("processUpdateBody: msg={} failed: {}", (void*)&msg, e.what());
       msg.result.setException(e);
       // message should continue flowing to finishUpdateBody so the sequencers stay happy.
     }

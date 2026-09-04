@@ -205,16 +205,19 @@ std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> c
 std::shared_ptr<Collection> LuxirNode::getCollection(Library* library, std::string_view name) {
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
-    throw CollectionResolutionError("root library is not initialized");
+    throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
   }
 
-  // Resolution is lookup-only: an invalid name can never be in the map, so it
-  // reads as not-found rather than paying a validation scan per request.
+  // Resolution is lookup-only on the hot path: an invalid name can never be in
+  // the map, so the validation scan runs only on a miss, to tell "you wrote a
+  // name that cannot exist" (INVALID_REQUEST) from "no such collection"
+  // (NOT_FOUND) the same way every route does.
   std::string collectionName(name);
   if (auto collection = targetLibrary->collections.get(collectionName)) {
     return checkLoaded(std::move(collection));
   }
 
+  validateCollectionName(collectionName);
   throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
 }
 
@@ -243,7 +246,7 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(std::string_view na
 std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, std::string_view name) {
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
-    throw CollectionResolutionError("root library is not initialized");
+    throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
   }
 
   std::string collectionName(name);
@@ -300,7 +303,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
     Library* library, std::string_view name, const api::SchemaDef* schema) {
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
-    throw CollectionResolutionError("root library is not initialized");
+    throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
   }
 
   std::string collectionName(name);
@@ -349,7 +352,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
 }
 
 void LuxirNode::deleteCollection(std::string_view name) {
-  if (!root) throw CollectionResolutionError("root library is not initialized");
+  if (!root) throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
 
   // Empty means the request never named a collection - a malformed request,
   // not a missing collection.
@@ -363,6 +366,7 @@ void LuxirNode::deleteCollection(std::string_view name) {
   std::string collectionName(name);
   auto collection = root->collections.get(collectionName);
   if (!collection) {
+    validateCollectionName(collectionName);
     throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
   }
   if (collection->unavailableReason == DELETING_REASON) {

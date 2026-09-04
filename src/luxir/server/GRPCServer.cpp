@@ -28,6 +28,8 @@
 #include "luxir/util/TaggedPtr.h"
 #include "luxir/util/thread.h"
 #include "luxir/util/proto.h"
+#include "luxir/util/ApiError.h"
+#include "RpcStatus.h"
 #include "ProtoUpdateMessage.h"
 #include "Stats.h"
 #include "luxir/schema/Schema.h"
@@ -201,6 +203,32 @@ static grpc::Status dumpByteBuffer(grpc::ByteBuffer& buf, std::vector<std::byte>
   return grpc::Status::OK;
 }
 
+static grpc::StatusCode grpcStatusCode(ErrorKind kind) {
+  switch (kind) {
+    case ErrorKind::INVALID_REQUEST: return grpc::StatusCode::INVALID_ARGUMENT;
+    case ErrorKind::NOT_FOUND: return grpc::StatusCode::NOT_FOUND;
+    case ErrorKind::ALREADY_EXISTS: return grpc::StatusCode::ALREADY_EXISTS;
+    case ErrorKind::FAILED_PRECONDITION: return grpc::StatusCode::FAILED_PRECONDITION;
+    case ErrorKind::RESOURCE_EXHAUSTED: return grpc::StatusCode::RESOURCE_EXHAUSTED;
+    case ErrorKind::UNAVAILABLE: return grpc::StatusCode::UNAVAILABLE;
+    case ErrorKind::INTERNAL:
+    case ErrorKind::UNKNOWN: break;
+  }
+  return grpc::StatusCode::INTERNAL;
+}
+
+// The transport status for a classified failure: the kind's gRPC code, the
+// message, and the luxir.proto.Error packed into google.rpc.Status details so
+// a generated client can read the stable code and kind.
+static grpc::Status grpcStatus(const ErrorInfo& info) {
+  grpc::StatusCode code = grpcStatusCode(info.kind);
+  luxir::api::Error wire;
+  wire.kind = (luxir::api::Error::Kind)info.kind;
+  wire.code = info.code;
+  wire.message = info.message;
+  return grpc::Status(code, info.message, encodeRpcStatusDetails((int32_t)code, info.message, wire));
+}
+
 template <typename Message>
 static bool parseRequest(grpc::ByteBuffer& buf, HppRequestState<Message>& state, std::string_view method) {
   auto grpcStatus = dumpByteBuffer(buf, state.wire);
@@ -225,7 +253,7 @@ template <typename Message>
 static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
   auto v = std::make_unique<std::vector<std::byte>>();
   if (!luxir::api::encode(msg, *v)) {
-    LOG_ERROR("gRPC: failed to serialize response");
+    throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize the response");
   }
   if (v->empty()) {
     grpc::Slice slice;
@@ -381,13 +409,16 @@ public:
   }
 
   // Callable from any thread (see decrementOutstanding).
+  // Ends the call with `status` once every response already accepted has
+  // been written: no further requests are read, but nothing accepted is
+  // dropped, so a client of a multiplexed UpdateStream still sees the
+  // acknowledgements that preceded the failure, then the terminal status.
   void finishWithError(grpc::Status status, int32_t finishCount = 1) {
     std::vector<std::function<void()>> waiters;
     {
       const std::lock_guard<std::mutex> lock(mutex);
       responsesExpected -= finishCount;
       readsDone = true;
-      dropPending();
       finishStatus = status;
       kickFinish();
       waiters = std::move(drainWaiters);
@@ -461,9 +492,9 @@ public:
           readsDone = true;
           finishSent = true;
           readerWriter.Finish(
-              grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
-                           "node is read-only (--read-only): " + genericCtx.method() +
-                               " is not allowed"),
+              grpcStatus({ErrorKind::FAILED_PRECONDITION, "read_only",
+                          "node is read-only (--read-only): " + genericCtx.method() +
+                              " is not allowed"}),
               make_tag(FINISH));
           break;
         }
@@ -534,24 +565,16 @@ static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server
   return server.getLuxirNode().resolveOrCreateCollection(target.has_value() ? &*target : nullptr);
 }
 
-static void finishWithException(GenericCallData& call, const std::exception& e) {
-  grpc::StatusCode code = grpc::StatusCode::INTERNAL;
-  if (dynamic_cast<const InvalidCollectionNameError*>(&e) != nullptr) {
-    auto method = call.genericCtx.method();
-    code = method == "/luxir.Admin/CreateCollection" ||
-                   method == "/luxir.Admin/DeleteCollection"
-        ? grpc::StatusCode::INVALID_ARGUMENT
-        : grpc::StatusCode::NOT_FOUND;
-  } else if (dynamic_cast<const CollectionExistsError*>(&e) != nullptr) {
-    code = grpc::StatusCode::ALREADY_EXISTS;
-  } else if (dynamic_cast<const CollectionResolutionError*>(&e) != nullptr) {
-    code = grpc::StatusCode::NOT_FOUND;
-  } else if (dynamic_cast<const SchemaError*>(&e) != nullptr) {
-    code = grpc::StatusCode::INVALID_ARGUMENT;
-  } else if (dynamic_cast<const IndexWriterClosedError*>(&e) != nullptr) {
-    code = grpc::StatusCode::FAILED_PRECONDITION;
-  }
-  call.finishWithError(grpc::Status(code, e.what()));
+static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
+  call.finishWithError(grpcStatus(info));
+}
+
+// Unary handlers run after request parsing, so an unclassified exception is
+// the engine's; the request-class failures they meet (collection resolution,
+// schema validation, read-only storage) are typed.
+static void finishWithException(GenericCallData& call, const std::exception& e,
+                                ErrorKind fallback = ErrorKind::INTERNAL) {
+  finishWithError(call, classifyException(e, fallback));
 }
 
 
@@ -575,7 +598,17 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     ReplyStatus reply(SearchResponse& response) override {
       // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
       response.proto.more = !response.last;
-      grpc::ByteBuffer buf = serializeToByteBuffer(response.proto);
+      grpc::ByteBuffer buf;
+      try {
+        buf = serializeToByteBuffer(response.proto);
+      } catch (const std::exception& e) {
+        // The response cannot be delivered: the call ends with the failure
+        // instead of a silently empty message.
+        parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)),
+                                response.last ? 1 : 0);
+        response.req.replyCallback(response);
+        return ReplyStatus::CANCEL;
+      }
       // Only the request's final response decrements the call's outstanding
       // count: an intermediate batch must not, or a transiently drained queue
       // after the client's WritesDone would Finish the call mid-stream.
@@ -601,15 +634,15 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
   if (!parseRequest(readBuf, *requestState, "Search")) {
     releaseArena(arena);
-    call.decrementOutstanding();  // balance the responsesExpected++ done before handle()
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Search: malformed request"));
     return;
   }
   if (requestState->proto.response_format == luxir::api::ResponseFormat::DOCS) {
     releaseArena(arena);
     // Doc-line framing is an HTTP/NDJSON concept; gRPC responses are already
     // framed DocList messages.
-    call.finishWithError(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                                      "response_format=docs applies to the HTTP NDJSON layer only"));
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                        "response_format=docs applies to the HTTP NDJSON layer only"));
     return;
   }
   auto& engine = call.server.getLuxirNode().getSearchEngine();
@@ -662,7 +695,7 @@ static grpc::ByteBuffer doBlockingUpdate(GRPCServer& server, const UpdateReqProt
 static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<UpdateReqProto> request;
   if (!parseRequest(readBuf, request, "Update")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
     return;
   }
   try {
@@ -677,7 +710,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
   if (!parseRequest(readBuf, *request, "UpdateStream")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "UpdateStream: malformed request"));
     return;
   }
 
@@ -693,8 +726,12 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
     virtual void done(IndexWriter& iw) override {
       unused(iw);
       auto* response = finishResponse();
-      grpc::ByteBuffer buf = serializeToByteBuffer(*response);
-      parent->respondRaw(std::move(buf), 1);       // may delete parent on another thread
+      try {
+        grpc::ByteBuffer buf = serializeToByteBuffer(*response);
+        parent->respondRaw(std::move(buf), 1);     // may delete parent on another thread
+      } catch (const std::exception& e) {
+        parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
+      }
       delete this;                                 // frees request bytes, parse resource, and response
     }
   };
@@ -722,7 +759,7 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
 static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<CreateCollectionReqProto>>();
   if (!parseRequest(readBuf, *request, "CreateCollection")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "CreateCollection: malformed request"));
     return;
   }
 
@@ -749,7 +786,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
 static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<DeleteCollectionReqProto>>();
   if (!parseRequest(readBuf, *request, "DeleteCollection")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "DeleteCollection: malformed request"));
     return;
   }
 
@@ -774,12 +811,11 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
 static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<SchemaReqProto> request;
   if (!parseRequest(readBuf, request, "SetSchema")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetSchema: malformed request"));
     return;
   }
   if (!request.proto.schema.has_value()) {
-    LOG_ERROR("SetSchema: missing schema");
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetSchema: schema is required"));
     return;
   }
   try {
@@ -801,7 +837,7 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<SchemaReqProto> request;
   if (!parseRequest(readBuf, request, "GetSchema")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "GetSchema: malformed request"));
     return;
   }
   try {
@@ -823,7 +859,7 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<StatsReqProto>>();
   if (!parseRequest(readBuf, *request, "Stats")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Stats: malformed request"));
     return;
   }
 
@@ -851,7 +887,7 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<CacheControlReqProto>>();
   if (!parseRequest(readBuf, *request, "CacheControl")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "CacheControl: malformed request"));
     return;
   }
 
@@ -879,7 +915,7 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
 static void handleSayHello(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<HelloReqProto> request;
   if (!parseRequest(readBuf, request, "SayHello")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SayHello: malformed request"));
     return;
   }
   HelloRespProto response;
@@ -894,7 +930,7 @@ static void handleSayHello(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 static void handleSayHello2(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<HelloReqProto> request;
   if (!parseRequest(readBuf, request, "SayHello2")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SayHello2: malformed request"));
     return;
   }
   HelloRespProto response;
@@ -910,7 +946,7 @@ static void handleSayHello2(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 static void handleSayHelloStreaming(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<HelloReqProto> request;
   if (!parseRequest(readBuf, request, "SayHelloStreaming")) {
-    call.decrementOutstanding();
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SayHelloStreaming: malformed request"));
     return;
   }
   std::string name = std::string(request.proto.name);

@@ -69,34 +69,67 @@ posting the result back has the same semantics.
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":{"name":["books"]}` even when the original body omitted it.
 
-## Success, partial updates, and errors
+## Errors
+
+Every failure has one shape, wherever it appears:
+
+```json
+{"request_id": "q7", "error": {"kind": "invalid_request", "code": "unknown_field", "message": "Field not found: titel"}}
+```
+
+`kind` is the coarse class. It fixes the HTTP status and tells a client
+whether to fix the request, the target, or retry, even for a `code` it has
+never seen. `code` is the stable machine key; new codes appear under existing
+kinds without changing the shape. `message` is human detail whose wording is
+not part of the contract. `request_id` is echoed whenever the request carried
+one, in the body or as a `?request_id=` URL parameter, and is omitted
+otherwise.
+
+| `kind` | HTTP status | Meaning |
+|---|---|---|
+| `invalid_request` | 400 (405 for `method_not_allowed`) | The request as written cannot be served. |
+| `not_found` | 404 | The route or the collection does not exist. |
+| `already_exists` | 409 | Creating a collection that already exists. |
+| `failed_precondition` | 403 | The node's state forbids the operation, such as `--read-only`. |
+| `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. |
+| `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
+| `internal` | 500 | A server-side failure the request did not cause. |
+
+Codes today: `invalid_request`, `invalid_json`, `invalid_schema`,
+`invalid_collection_name`, `invalid_value`, `unknown_field`,
+`invalid_expression`, `method_not_allowed`, `request_too_large`,
+`request_memory_exceeded`, `not_found`, `collection_not_found`,
+`collection_unavailable`, `collection_exists`, `read_only`, `writer_closed`,
+and `internal`. A failure that no more specific code describes carries its
+kind's name as the code.
+
+A failure detected before a request is submitted (malformed JSON, a bad URL
+parameter, an unknown or invalid collection name, a wrong method) is answered
+with the kind's HTTP status and this body. Method handling is uniform: every
+known path answers a wrong method with `405` and an `Allow` header, and only
+an unknown path is `404`.
+
+Once a chunked response has begun, its HTTP status cannot change, so a search
+that fails after submission arrives with HTTP 200 as the final NDJSON line in
+the same shape, `{"request_id": ..., "error": {...}, "warnings": [...]}`,
+with no `docs` or `ops`. That final error invalidates every earlier batch line
+of the same request: a client that streamed `more: true` lines must discard
+them. Document-only `format=docs` has no error envelope: a
+failure before output becomes a normal error response, while a failure after
+documents were emitted aborts the body without its terminating chunk so the
+client sees truncation.
 
 HTTP transport success and update success are separate. A syntactically valid
-update can return HTTP success with `status: "partial"` and per-document
-`errors`; clients must inspect the body. `all_or_none: true` changes that update
-contract to rollback of the explicit atomic unit.
-
-Malformed JSON and HTTP-dialect validation failures detected before submission
-return `400` with a JSON error body. Oversized buffered bodies return `413`.
-The search, schema, and stats routes return `405` with an `Allow` header for a
-wrong method; other routes currently fall through to `404`, so method handling
-is not uniform.
-After a normal search has been submitted, query planning or execution errors
-appear as an `error` field in the HTTP-success NDJSON envelope. The server does
-not yet have a complete HTTP status taxonomy, so clients must inspect response
-bodies and must not key behavior to the human error-message text.
-
-Once a chunked response has begun, its HTTP status cannot change. Normal
-envelope mode reports a later search failure as a final `error` response and
-terminates the stream cleanly. Document-only `format=docs` has no error
-envelope: a failure before output becomes a normal error response, while a
-failure after documents were emitted aborts the body without its terminating
-chunk so the client sees truncation. NDJSON ingest can report a terminal error
-record after earlier group acknowledgements; no later records from that
-connection are accepted.
+update returns HTTP success with `status: "partial"` and per-document
+`errors`, each carrying the same `error` object; a request-level failure sets
+`status: "error"` and a top-level `error`. Clients must inspect the body. NDJSON
+ingest reports a request-level failure as a terminal response line after
+earlier group acknowledgements; no later records from that connection are
+accepted. See [Indexing](indexing.md#per-document-failures).
 
 Search warnings are successful results with a bounded declared degradation.
-Use `warnings[].code` as the machine key and the message as diagnostic detail.
+Use `warnings[].code` as the machine key and the message as diagnostic detail;
+warnings declared before a failure ride along with the error.
 
 ## Connection and security boundary
 

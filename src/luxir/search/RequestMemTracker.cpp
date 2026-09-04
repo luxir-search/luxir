@@ -7,6 +7,7 @@
 
 #include <fmt/format.h>
 
+#include "luxir/util/ApiError.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -14,10 +15,10 @@ namespace luxir {
 [[noreturn]] void RequestMemTracker::throwLimit(
     std::string_view breaker, std::string_view detail,
     size_t attemptedTotal) const {
-  throw std::runtime_error(fmt::format(
+  throw ResourceExhaustedError(fmt::format(
       "request memory breaker '{}' rejected {}: attempted total {} bytes "
       "exceeds the ceiling of {} bytes",
-      breaker, detail, attemptedTotal, maxBytes));
+      breaker, detail, attemptedTotal, maxBytes), "request_memory_exceeded");
 }
 
 [[noreturn]] void RequestMemTracker::chargeOverflow(
@@ -27,15 +28,15 @@ namespace luxir {
     throwLimit(breaker, detail, std::numeric_limits<size_t>::max());
   }
   if (maxBytes == 0) {
-    throw std::runtime_error(fmt::format(
+    throw ResourceExhaustedError(fmt::format(
         "request memory breaker '{}' rejected {}: attempted total exceeds {} "
         "bytes (size_t overflow); the ceiling is unlimited",
-        breaker, detail, MAX));
+        breaker, detail, MAX), "request_memory_exceeded");
   }
-  throw std::runtime_error(fmt::format(
+  throw ResourceExhaustedError(fmt::format(
       "request memory breaker '{}' rejected {}: attempted total exceeds {} "
       "bytes (size_t overflow); the ceiling is {} bytes",
-      breaker, detail, MAX, maxBytes));
+      breaker, detail, MAX, maxBytes), "request_memory_exceeded");
 }
 
 void RequestMemTracker::charge(size_t bytes, std::string_view breaker,

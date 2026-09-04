@@ -10,8 +10,14 @@
 
 namespace luxir::test {
 
-// SearchResponse.error is a bare string (empty == success); restores the has_error predicate.
-inline bool hasError(const RespProto& r) { return !r.error.empty(); }
+// SearchResponse.error is present exactly when the request failed.
+inline bool hasError(const RespProto& r) { return r.error.has_value(); }
+inline std::string errorMessage(const RespProto& r) {
+  return r.error ? std::string(r.error->message) : std::string();
+}
+inline std::string errorCode(const RespProto& r) {
+  return r.error ? std::string(r.error->code) : std::string();
+}
 
 // Base-from-member: holds the NON-OWNING request view so it exists before the SearchRequest
 // base ctor (which borrows it) runs.
@@ -201,7 +207,12 @@ public:
 
   // --- result inspection (reads go through the concrete classes' accessors) ---
   bool ok() const { return !responses.empty() && !hasError(responses[0]->proto); }
-  std::string errorMsg() const { return responses.empty() ? "(no response)" : std::string(responses[0]->proto.error); }
+  std::string errorMsg() const { return responses.empty() ? "(no response)" : errorMessage(responses[0]->proto); }
+  std::string errorCode() const { return responses.empty() ? "" : luxir::test::errorCode(responses[0]->proto); }
+  ErrorKind errorKind() const {
+    return responses.empty() || !responses[0]->proto.error ? ErrorKind::UNKNOWN
+                                                            : (ErrorKind)responses[0]->proto.error->kind;
+  }
 
   // Declared degradations (SearchResponse.warnings) ride on the final response.
   std::span<const luxir::api::Warning> respWarnings() const {
@@ -245,7 +256,9 @@ public:
     for (size_t r = 0; r < responses.size(); r++) {
       const auto& resp = responses[r]->proto;
       ret += "  Response[" + std::to_string(r) + "]";
-      if (!resp.error.empty()) ret += " error=\"" + std::string(resp.error) + "\"";
+      if (resp.error) {
+        ret += " error=\"" + std::string(resp.error->code) + ": " + std::string(resp.error->message) + "\"";
+      }
       ret += std::string(" more=") + (resp.more ? "true" : "false") + "\n";
       for (const auto& [name, valPtr] : resp.ops) {
         ret += "    " + std::string(name) + " -> ";

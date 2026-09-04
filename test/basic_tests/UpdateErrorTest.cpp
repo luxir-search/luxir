@@ -82,6 +82,7 @@ TEST_F(UpdateErrorTest, partialFailureMarksDocDeleted) {
   EXPECT_EQ("b1", result.errors[0].id);
   EXPECT_EQ(1, result.errors[0].index);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find(BAD_FIELD));
+  EXPECT_EQ("unknown_field", result.errors[0].code);
 
   auto all = allDocs(helper);
   ASSERT_EQ(2u, all.size());
@@ -263,6 +264,7 @@ TEST_F(UpdateErrorTest, failedDocDoesNotLockVectorDims) {
   ASSERT_EQ(2u, result.errors.size());
   EXPECT_EQ("v1", result.errors[0].id);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("dims"));
+  EXPECT_EQ("invalid_value", result.errors[0].code);
   EXPECT_EQ("v3", result.errors[1].id);
   EXPECT_NE(std::string::npos, result.errors[1].error_message.find("dims=2"));
 

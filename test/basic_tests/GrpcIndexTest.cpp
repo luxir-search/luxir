@@ -6,6 +6,7 @@
 #include <format>
 #include <iostream>
 #include <memory>
+#include <memory_resource>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -17,6 +18,7 @@
 #include "test/GrpcLuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "luxir/server/RpcStatus.h"
 
 // TODO - use a different logger for RPC stuff some point
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -836,7 +838,7 @@ TEST_F(GrpcIndexTest, addDocs) {
 
 }
 
-TEST_F(GrpcIndexTest, unsafeCollectionNameReturnsNotFound) {
+TEST_F(GrpcIndexTest, unsafeCollectionNameIsInvalidArgument) {
   CollectionHelper::UpdateBuilder b;
   Reply<luxir::api::UpdateResponse> response;
   b.collection("../bad");
@@ -845,9 +847,24 @@ TEST_F(GrpcIndexTest, unsafeCollectionNameReturnsNotFound) {
   grpc::ClientContext context;
   grpc::Status status = hppUnaryCall(channel.get(), rpc::Update, &context, b.finish(), &response);
 
-  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, status.error_code());
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, status.error_code());
   EXPECT_NE(status.error_message().find("must start with a lowercase letter"), std::string::npos)
       << status.error_message();
+  // The status details carry the wire Error with the stable code and kind.
+  std::pmr::monotonic_buffer_resource arena;
+  luxir::api::Error detail;
+  ASSERT_TRUE(decodeRpcStatusDetails(status.error_details(), detail, arena));
+  EXPECT_EQ("invalid_collection_name", detail.code);
+  EXPECT_EQ(luxir::api::Error::Kind::INVALID_REQUEST, detail.kind);
+  EXPECT_EQ(status.error_message(), detail.message);
+
+  // The same name is the request's fault on delete too, not a not-found.
+  luxir::api::DeleteCollectionRequest del;
+  del.name = "../bad";
+  grpc::ClientContext delContext;
+  Reply<luxir::api::DeleteCollectionResponse> delReply;
+  auto delStatus = hppUnaryCall(channel.get(), rpc::DeleteCollection, &delContext, del, &delReply);
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, delStatus.error_code()) << delStatus.error_message();
 }
 
 TEST_F(GrpcIndexTest, addDocsStream) {

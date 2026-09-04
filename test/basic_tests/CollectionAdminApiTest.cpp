@@ -201,7 +201,8 @@ TEST_F(CollectionAdminApiTest, deleteWhileIndexingRejectsRacingBatchesCleanly) {
           R"({"docs":[{"id":"race-)" + std::to_string(i) + R"("}]})");
       if (i == 0) firstBatch.count_down();
       if (response.result_int() == 200) continue;
-      if (response.result_int() == 400) {
+      // unavailable while the delete runs, not found once it is done
+      if (response.result_int() == 503 || response.result_int() == 404) {
         sawFailure = true;
       } else {
         unexpectedStatus = response.result_int();

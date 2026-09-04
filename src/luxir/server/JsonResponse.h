@@ -3,6 +3,7 @@
 #include <span>
 #include <string>
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/util/ApiError.h"
 
 namespace luxir {
 
@@ -11,25 +12,28 @@ namespace luxir {
 // flattened to row-major JSON; missing and non-finite slots render as JSON null.
 //
 // Shape:
-//   {"found": <count>, "docs": [ {<field>: <val>, ...}, ... ],
+//   {"request_id": "...", "found": <count>, "docs": [ {<field>: <val>, ...}, ... ],
 //    "ops": {<name>: <row-shaped value>, ...},
 //    "warnings": [ {"code": ..., "message": ...}, ... ],
 //    "profile": {"ops": [...]}, "more": true}
-// Optional keys are omitted when absent. The first DocList is promoted to
-// found/docs; all remaining response ops stay under ops in response order.
-// On engine error:
-//   {"error": "<message>"}
+// Optional keys are omitted when absent (request_id when the request set
+// none). The first DocList is promoted to found/docs; all remaining response
+// ops stay under ops in response order.  On engine error:
+//   {"request_id": "...", "error": {"kind": ..., "code": ..., "message": ...},
+//    "warnings": [...]}
 std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp);
 
-// Build a minimal JSON error body (no trailing newline) for transport-level
-// failures (bad route, malformed request) that never reached the engine.
-std::string renderErrorBody(std::string_view message);
+// The JSON error body (no trailing newline) for a failure answered with an
+// HTTP error status - the same {request_id, error} shape as an in-band error
+// line, restricted to those keys.  requestId is omitted when empty.
+std::string renderErrorBody(const ErrorInfo& info, std::string_view requestId);
 
 // Streaming state for one request's docs-format run framing (held by the
 // transport's request object; frameDocRun mutates it per run).
 struct DocLinesState {
   bool multiOp = false;               // request has more than one DocList op
   std::string_view currentOp;         // op of the last emitted run
+  std::string_view requestId;         // echoed on the first header when set
   bool anyHeaderEmitted = false;      // request warnings ride on the first header
   std::vector<std::string_view> headeredOps;  // ops whose first run was processed
 };
@@ -57,8 +61,9 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp);
 //
 // Single-op requests: pure document lines; a marker precedes them only when
 // there is content to carry - found (set exactly when the request asked
-// get_number) or warnings (degraded execution must not be silent):
-//   {"_header_":{"found":N,"warnings":[...]}}
+// get_number), warnings (degraded execution must not be silent), or the
+// request_id (correlation must not be silent either):
+//   {"_header_":{"request_id":"...","found":N,"warnings":[...]}}
 //
 // Multi-op requests: ops' outputs may interleave in RUNS (batches are emitted
 // as each op's collection completes), and every run is introduced by a meta

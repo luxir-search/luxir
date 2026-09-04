@@ -808,6 +808,7 @@ TEST_F(DateFieldTest, badDateMarksDocFailed) {
   ASSERT_EQ(1, result.errors.size());
   EXPECT_EQ("b1", result.errors[0].id);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("when_dt"));
+  EXPECT_EQ("invalid_value", result.errors[0].code);
 
   auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main").topDocs("q").allQuery().fields({"id"}).limit(10);

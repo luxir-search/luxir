@@ -4,17 +4,18 @@
 #include <memory_resource>
 #include <stdexcept>
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/util/ApiError.h"
 #include "luxir/util/StrRef.h"
 #include "FieldType.h"
 
 namespace luxir {
 
 // A user error in a schema definition (unknown parent, bad analyzer name,
-// reserved-field violation, ...).  Transports map this to a client error
-// (HTTP 400 / gRPC INVALID_ARGUMENT); other exceptions are server-side.
-class SchemaError : public std::runtime_error {
+// reserved-field violation, ...): INVALID_REQUEST / invalid_schema.
+class SchemaError : public ApiError {
 public:
-  using std::runtime_error::runtime_error;
+  explicit SchemaError(const std::string& message)
+    : ApiError(ErrorKind::INVALID_REQUEST, "invalid_schema", message) {}
 };
 
 // Schema objects are currently immutable after construction.
@@ -61,7 +62,7 @@ public:
   const std::shared_ptr<FieldType>& getFieldTypeEx(std::string_view fieldName) const {
     auto it = getFieldType(fieldName);
     if (it == fieldTypeMap.end()) {
-      throw std::runtime_error("Field not found: " + std::string(fieldName));
+      throw RequestError("Field not found: " + std::string(fieldName), "unknown_field");
     }
     return it->second;
   }

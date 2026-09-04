@@ -67,7 +67,8 @@ A read-only node writes nothing at all - no lock file, no trash directory, not
 even the data directory itself, which must already exist. It serves searches,
 schema reads, and `_stats`. Every mutation is refused: updates, NDJSON streams,
 schema writes, and collection create/delete return HTTP `403` (gRPC
-`FAILED_PRECONDITION`), and collections are never auto-created. The refusal is
+`FAILED_PRECONDITION`) with error code `read_only`, and collections are never
+auto-created. The refusal is
 enforced twice - once at request dispatch for a clean error, and again at the
 storage layer, which rejects any write regardless of the path that reached it.
 
@@ -100,8 +101,9 @@ Deletion is synchronous and wins over concurrent use. When the call returns,
 the name resolves to nothing, the on-disk data is gone, and the name can be
 recreated as a fresh empty collection. Requests racing the deletion fail
 cleanly per request: an update batch or NDJSON stream that arrives after
-deletion starts receives an error response, as does a search that resolves the
-collection after that point. A search already executing is unaffected - it
+deletion starts receives an `unavailable` error (HTTP `503`, code
+`collection_unavailable`), as does a search that resolves the collection after
+that point. A search already executing is unaffected - it
 holds its index view for the whole request and completes with correct results.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
@@ -320,8 +322,9 @@ reopens the last durable commit.
 
 At startup, a collection whose top-level index metadata cannot be parsed is
 kept as a tombstone rather than preventing healthy collections from loading.
-Queries and updates to that collection return the recorded load error and the
-server will not silently recreate storage over it. Other segment corruption is
+Queries and updates to that collection return the recorded load error as an
+`unavailable` error (HTTP `503`, code `collection_unavailable`) and the server
+will not silently recreate storage over it. Other segment corruption is
 detected when the affected reader is opened.
 
 ## Current production boundary

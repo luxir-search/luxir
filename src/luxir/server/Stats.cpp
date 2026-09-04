@@ -125,7 +125,8 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     auto& collectionStats = collections[i];
     collectionStats.name = api::build::arenaStr(resource, entry.name);
     if (!entry.error.empty()) {
-      collectionStats.error = api::build::arenaStr(resource, entry.error);
+      collectionStats.error = api::build::arenaError(
+          resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
       continue;
     }
 
@@ -186,7 +187,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     auto& collectionControl = collections[i];
     collectionControl.name = api::build::arenaStr(resource, entry.name);
     if (!entry.error.empty()) {
-      collectionControl.error = api::build::arenaStr(resource, entry.error);
+      collectionControl.error = api::build::arenaError(
+          resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
       continue;
     }
 

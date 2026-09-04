@@ -17,7 +17,7 @@ public:
   using RequestProto = luxir::api::UpdateRequest;
   using ResponseProto = luxir::api::UpdateResponse;
   using ResponseStatus = luxir::api::UpdateResponse_::Status;
-  using Error = luxir::api::UpdateResponse_::Error;
+  using DocError = luxir::api::UpdateResponse_::DocError;
 
 private:
   // response is created on-demand.
@@ -27,7 +27,7 @@ private:
   // variable-count errors/ids arrays are backed by this monotonic arena. Update processing
   // for one message is single-threaded, so a plain monotonic resource suffices.
   std::pmr::monotonic_buffer_resource mr_;
-  luxir::api::build::SpanBuilder<Error> errors_{mr_};
+  luxir::api::build::SpanBuilder<DocError> errors_{mr_};
   luxir::api::build::SpanBuilder<std::string_view> ids_{mr_};
 
   void initResponse(ResponseProto* rsp) {
@@ -39,7 +39,7 @@ public:
   // Build-side helpers: errors/ids accumulate at unknown count; finishResponse() seals them
   // into the response spans. Transient strings are copied into the response arena.
   std::pmr::memory_resource& responseArena() { return mr_; }
-  Error& addError() { return errors_.emplace_back(); }
+  DocError& addError() { return errors_.emplace_back(); }
   void addId(std::string_view id) { ids_.push_back(luxir::api::build::arenaStr(mr_, id)); }
   void clearIds() { ids_.clear(); }
 
@@ -90,10 +90,11 @@ public:
     rsp->update_version = updateVersion;
     if (result.errored()) {
       rsp->status = ResponseStatus::ERROR;
-      rsp->error_message = luxir::api::build::arenaStr(mr_, result.what());
+      rsp->error = luxir::api::build::arenaError(mr_, result.info());
     }
     // Seal the accumulated errors/ids into the non-owning response spans.
     rsp->errors = errors_.finish();
+    rsp->total_errors = (int64_t)rsp->errors.size();
     rsp->ids = ids_.finish();
     return rsp;
   }

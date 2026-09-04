@@ -220,7 +220,7 @@ TEST_F(GrpcSearchTest, routedFilterValidation) {
     std::string error;
     Reply<luxir::api::SearchResponse> response;
     while (stream.Read(&response)) {
-      if (!response.msg.error.empty()) error = response.msg.error;
+      if (response.msg.error) error = std::string(response.msg.error->message);
     }
     return std::pair{stream.Finish(), error};
   };

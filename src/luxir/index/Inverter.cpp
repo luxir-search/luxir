@@ -55,7 +55,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   // First sight of a doc-supplied field name: without this check a template
   // suffix match would admit any string into segment metadata.
   if (!Schema::validFieldName(name)) {
-    throw std::runtime_error("Invalid field name: " + std::string(name));
+    throw RequestError("Invalid field name: " + std::string(name), "unknown_field");
   }
   // perhaps this part should be moved to Schema?
   auto currSchema = schema.get();
@@ -78,7 +78,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   }
 
   if (ftIter == currSchema->end()) {
-    throw std::runtime_error("Field not found in schema: " + std::string(name));
+    throw RequestError("Field not found in schema: " + std::string(name), "unknown_field");
   }
 
   // Create the correct IndexHandler based on the suffix.  This could be moved to FieldType::createIndexHandler()?

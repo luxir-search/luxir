@@ -326,6 +326,21 @@ void appendWarnings(std::string& out, std::span<const luxir::api::Warning> warni
   out += ']';
 }
 
+void appendError(std::string& out, std::string_view kind, std::string_view code,
+                 std::string_view message) {
+  out += R"({"kind":)";
+  appendJsonString(out, kind);
+  out += R"(,"code":)";
+  appendJsonString(out, code);
+  out += R"(,"message":)";
+  appendJsonString(out, message);
+  out += '}';
+}
+
+void appendError(std::string& out, const luxir::api::Error& error) {
+  appendError(out, luxir::errorKindName((luxir::ErrorKind)error.kind), error.code, error.message);
+}
+
 void appendExecutionProfile(std::string& out, const luxir::api::ExecutionProfile& profile) {
   out += R"({"ops":[)";
   for (size_t opIndex = 0; opIndex < profile.ops.size(); opIndex++) {
@@ -480,9 +495,26 @@ void appendOpVal(std::string& out, const luxir::api::Val& val) {
 std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp) {
   std::string out;
   out += '{';
-  if (!resp.error.empty()) {
-    out += R"("error":)";
-    appendJsonString(out, resp.error);
+  bool first = true;
+  auto appendKey = [&](std::string_view name) {
+    if (!first) out += ',';
+    first = false;
+    appendJsonString(out, name);
+    out += ':';
+  };
+  if (!resp.request_id.empty()) {
+    appendKey("request_id");
+    appendJsonString(out, resp.request_id);
+  }
+  if (resp.error.has_value()) {
+    // A failed request carries no op results; warnings declared before the
+    // failure still ride along.
+    appendKey("error");
+    appendError(out, *resp.error);
+    if (!resp.warnings.empty()) {
+      appendKey("warnings");
+      appendWarnings(out, resp.warnings);
+    }
     out += "}\n";
     return out;
   }
@@ -498,13 +530,6 @@ std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp) {
     }
     opIndex++;
   }
-  bool first = true;
-  auto appendKey = [&](std::string_view name) {
-    if (!first) out += ',';
-    first = false;
-    appendJsonString(out, name);
-    out += ':';
-  };
   if (docs) {
     // "found" is opt-in: set only when get_number was requested (an exact
     // count forgoes dynamic pruning).  Omit the key when absent rather than
@@ -579,19 +604,26 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   bool firstForOp =
       std::find(state.headeredOps.begin(), state.headeredOps.end(), run.op) ==
       state.headeredOps.end();
-  // Found goes out with the op's first run; request warnings with the stream's
-  // first header. Degraded execution must not be silent, so warnings force a
-  // header even without get_number.
+  // Found goes out with the op's first run; request warnings and the request
+  // id with the stream's first header. Degraded execution must not be silent,
+  // and neither may correlation, so either forces a header even without
+  // get_number.
   bool haveFound = firstForOp && docs.found.has_value();
   bool haveWarnings = !state.anyHeaderEmitted && !warnings.empty();
+  bool haveRequestId = !state.anyHeaderEmitted && !state.requestId.empty();
   // Multi-op framing: any change of op needs a marker for attribution.
   bool needMarker = state.multiOp && (firstForOp || run.op != state.currentOp);
-  bool haveContent = haveFound || haveWarnings;
+  bool haveContent = haveFound || haveWarnings || haveRequestId;
   if (run.body.empty() && !haveContent) return false;  // nothing to say
 
   if (haveContent || needMarker) {
     marker += R"({"_header_":{)";
     bool first = true;
+    if (haveRequestId) {
+      marker += R"("request_id":)";
+      appendJsonString(marker, state.requestId);
+      first = false;
+    }
     if (state.multiOp) {
       marker += R"("op":)";
       appendJsonString(marker, run.op);
@@ -616,10 +648,16 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   return true;
 }
 
-std::string renderErrorBody(std::string_view message) {
-  std::string out = R"({"error":)";
-  appendJsonString(out, message);
-  out += "}";
+std::string renderErrorBody(const ErrorInfo& info, std::string_view requestId) {
+  std::string out = "{";
+  if (!requestId.empty()) {
+    out += R"("request_id":)";
+    appendJsonString(out, requestId);
+    out += ',';
+  }
+  out += R"("error":)";
+  appendError(out, errorKindName(info.kind), info.code, info.message);
+  out += '}';
   return out;
 }
 

@@ -1254,7 +1254,7 @@ TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   // min_match composes with required clauses: the optional group is a real
   // constraint, and "banana" matches nothing here.
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_TRUE(req->responses[0]->proto.error.empty()) << req->responses[0]->proto.error;
+  EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->errorMsg();
   EXPECT_EQ(0, req->getMatchCount());
 
   req->done();
@@ -2336,12 +2336,12 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
   auto* req = makeKnnReq(*luxirNode, "embedding_v",
                          {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}, 1);
   {
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
   }
   EXPECT_EQ(req->getMatchCount(), 0);
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_NE(req->responses[0]->proto.error.find("finite"), std::string::npos);
+  EXPECT_NE(req->errorMsg().find("finite"), std::string::npos);
   req->done();
 }
 
@@ -2678,7 +2678,7 @@ TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   // Query is 3-d but index is 4-d.
   auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 1);
   {
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
   }
   EXPECT_EQ(req->getMatchCount(), 0);
@@ -2686,7 +2686,7 @@ TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
 
   // A single response is returned with the error string populated.
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_NE(req->responses[0]->proto.error.find("dims 3 do not match segment dims 4"), std::string::npos);
+  EXPECT_NE(req->errorMsg().find("dims 3 do not match segment dims 4"), std::string::npos);
 
   req->done();
 }
@@ -2700,13 +2700,13 @@ TEST_F(KnnQueryTest, emptyQueryVectorReturnsErrorResponse) {
 
   auto* req = makeKnnReq(*luxirNode, "embedding_v", {}, 1);
   {
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
   }
   EXPECT_EQ(req->getMatchCount(), 0);
   EXPECT_TRUE(resultIds(*req).empty());
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_NE(req->responses[0]->proto.error.find("non-empty query vector"), std::string::npos);
+  EXPECT_NE(req->errorMsg().find("non-empty query vector"), std::string::npos);
 
   req->done();
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "luxir/util/ApiError.h"
+
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/NormsWriter.h"
@@ -89,7 +91,7 @@ public:
   // searchable).
   void indexValues(Inverter& inverter, std::span<const std::string_view> vals) {
     if (vals.size() > 1 && !fieldType->multiValued()) {
-      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
+      throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                            std::string_view(fieldName)));
     }
     if (vals.empty()) return;

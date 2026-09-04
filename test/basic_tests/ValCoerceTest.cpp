@@ -194,6 +194,7 @@ TEST_F(ValCoerceTest, ingestBadValueFailsTheDocOnly) {
   ASSERT_EQ(2u, result.errors.size());
   EXPECT_EQ("b1", result.errors[0].id);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("cannot parse"));
+  EXPECT_EQ("invalid_value", result.errors[0].code);
   EXPECT_EQ("b2", result.errors[1].id);
 
   auto req = localReq(helper.getSearchEngine());
@@ -236,6 +237,7 @@ TEST_F(ValCoerceTest, singleValuedStringRejectsArrays) {
   ASSERT_EQ(1u, result.errors.size());
   EXPECT_EQ("b1", result.errors[0].id);
   EXPECT_NE(std::string::npos, result.errors[0].error_message.find("single-valued"));
+  EXPECT_EQ("invalid_value", result.errors[0].code);
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q").allQuery().fields({"id", "tag_s"}).limit(-1);

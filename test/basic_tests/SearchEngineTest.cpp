@@ -3870,7 +3870,7 @@ TEST_F(SearchEngineTest, opNameCharset) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     req->topDocs("bad.name!").matchQuery("foo_w", "hello");
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
     ASSERT_FALSE(req->responses.empty());
     EXPECT_NE(req->errorMsg().find("restricted to"), std::string::npos) << req->errorMsg();
@@ -4315,7 +4315,7 @@ TEST_F(SearchEngineTest, routedDomainArtifactsUseRequestMemoryBreaker) {
   auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
   top.facet("brands", "brand_s").limit(-1);
   top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   req->execute();
   EXPECT_NE(req->errorMsg().find("request memory breaker 'domain variants'"),
             std::string::npos)
@@ -4373,7 +4373,7 @@ TEST_F(SearchEngineTest, routedFilterVariantCapIsPerRequest) {
       appendRoutedFilter(top, qb::all(), except);
     }
   }
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   req->execute();
   EXPECT_NE(req->errorMsg().find("op '"), std::string::npos)
       << req->errorMsg();
@@ -4520,7 +4520,7 @@ TEST_F(SearchEngineTest, protobufRoutedFilterValidation) {
     auto& top = req->topDocs("q").allQuery();
     top.facet("brands", "brand_s");
     top.filter(qb::match(top.mr(), "brand_s", "acme"), exceptOps);
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
     return req->errorMsg();
   };
@@ -4539,7 +4539,7 @@ TEST_F(SearchEngineTest, protobufRoutedFilterValidation) {
   auto& top = missingQuery->topDocs("q").allQuery();
   auto& topProto = std::get<api::TopDocs>(top.rawOp().kind);
   api::build::allocArray(topProto.filter, 1, top.mr());
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   missingQuery->execute();
   EXPECT_NE(std::string::npos,
             missingQuery->errorMsg().find("top_docs.filter[0].query requires a query kind"))
@@ -4555,7 +4555,7 @@ TEST_F(SearchEngineTest, opDomainValidationIsParseTime) {
     auto req = localReq(luxirNode->getSearchEngine());
     parseQueryRequest(json, req->rawRequest(), req->mr);
     req->collection("main");
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
     EXPECT_NE(std::string::npos, req->errorMsg().find(expected))
         << req->errorMsg();
@@ -4579,7 +4579,7 @@ TEST_F(SearchEngineTest, opDomainValidationIsParseTime) {
       .facet("f", "brand_s");
   auto& domain = facet.rawOp().domain.emplace();
   api::build::allocArray(domain.filter, 1, missing->mr);
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   missing->execute();
   EXPECT_NE(std::string::npos,
             missing->errorMsg().find("domain.filter[0] requires a query kind"))
@@ -4603,7 +4603,7 @@ TEST_F(SearchEngineTest, resetAndLocalDomainsShareRequestVariantCap) {
       appendDomainFilter(facet, query);
     }
   }
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   req->execute();
   EXPECT_NE(std::string::npos,
             req->errorMsg().find("domain variant cap 64 exceeded"))
@@ -6408,7 +6408,7 @@ TEST_F(SearchEngineTest, missingCollectionErrors) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection(name);
   req->topDocs("q").allQuery();
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   req->execute();
   ASSERT_FALSE(req->responses.empty());
   EXPECT_NE(req->errorMsg().find("collection '" + name + "' does not exist"),
@@ -6417,16 +6417,19 @@ TEST_F(SearchEngineTest, missingCollectionErrors) {
 }
 
 TEST_F(SearchEngineTest, unsafeCollectionNameErrors) {
-  // Search-time resolution is lookup-only: an invalid name reads as
-  // not-found, with no validation on the request path.
+  // Search-time resolution is lookup-only on the hot path; a miss validates
+  // the name so a name that cannot exist is the request's fault, not a
+  // not-found, the same as on every other route.
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("../bad");
   req->topDocs("q").allQuery();
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   req->execute();
   ASSERT_FALSE(req->responses.empty());
-  EXPECT_NE(req->errorMsg().find("collection '../bad' does not exist"), std::string::npos)
-      << req->errorMsg();
+  EXPECT_NE(req->errorMsg().find("collection '../bad' must start with a lowercase letter"),
+            std::string::npos) << req->errorMsg();
+  EXPECT_EQ("invalid_collection_name", req->errorCode());
+  EXPECT_EQ(ErrorKind::INVALID_REQUEST, req->errorKind());
 }
 
 TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {

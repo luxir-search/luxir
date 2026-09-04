@@ -2846,7 +2846,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
     req->execute(true);
 
     ASSERT_EQ(1u, req->responses.size()) << testCase.name;
-    const std::string error(req->responses[0]->proto.error);
+    const std::string error = errorMessage(req->responses[0]->proto);
     EXPECT_TRUE(hasError(req->responses[0]->proto)) << testCase.name << "\n" << req->toString();
     // Lock in the clear-message contract: the facet name and the specific
     // unsupported-option phrase must both appear.
@@ -4961,7 +4961,7 @@ TEST_F(FacetTest, selectedValidationIsParseTime) {
     auto req = localReq(luxirNode->getSearchEngine());
     parseQueryRequest(json, req->rawRequest(), req->mr);
     req->collection("main");
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     req->execute();
     EXPECT_NE(std::string::npos, req->errorMsg().find(error))
         << req->errorMsg();
@@ -5128,7 +5128,7 @@ TEST_F(FacetTest, selectedAnyVariantsUseTheRoutedFilterCap) {
     std::array<std::string, 1> selected{"acme"};
     setSelected(facet, selected);
   }
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   req->execute();
   EXPECT_NE(std::string::npos,
             req->errorMsg().find("routed filter variant cap 64 exceeded"))

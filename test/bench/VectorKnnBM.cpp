@@ -219,8 +219,8 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
     return false;
   }
   const auto& response = req.responses[0]->proto;
-  if (!response.error.empty()) {
-    error = std::string(response.error);
+  if (response.error) {
+    error = std::string(response.error->message);
     return false;
   }
   const auto* opPtr = response.ops.find("q");
@@ -405,8 +405,8 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
     return false;
   }
   const auto& response = req.responses[0]->proto;
-  if (!response.error.empty()) {
-    error = std::string(response.error);
+  if (response.error) {
+    error = std::string(response.error->message);
     return false;
   }
   const auto* opPtr = response.ops.find("q");

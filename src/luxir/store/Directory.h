@@ -6,6 +6,7 @@
 #include <vector>
 #include <string_view>
 #include <gtl/btree.hpp>
+#include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
 #include "OutputStream.h"
 
@@ -19,9 +20,10 @@ namespace luxir {
 /// Read-only is a node-wide mode (--read-only), but it is enforced here so
 /// that no path - present or future - can put bytes in a data directory this
 /// process does not hold the write lock on.
-class ReadOnlyError : public std::runtime_error {
+class ReadOnlyError : public ApiError {
 public:
-  using std::runtime_error::runtime_error;
+  explicit ReadOnlyError(const std::string& message)
+    : ApiError(ErrorKind::FAILED_PRECONDITION, "read_only", message) {}
 };
 
 // Implementations of Directory are thread safe.

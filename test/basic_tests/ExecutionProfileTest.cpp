@@ -441,8 +441,8 @@ TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
     req->collection("profile_reject").facet("cats", "cat_s").limit(-1);
     req->execute(maxParallel);
     ASSERT_FALSE(req->responses.empty());
-    EXPECT_NE(std::string_view::npos,
-              req->responses.back()->proto.error.find("max_parallel")) << maxParallel;
+    EXPECT_NE(std::string::npos,
+              errorMessage(req->responses.back()->proto).find("max_parallel")) << maxParallel;
   }
 }
 

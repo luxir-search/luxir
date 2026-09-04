@@ -109,6 +109,11 @@ public:
   // copied onto the FINAL response's SearchResponse.warnings.  Message views
   // point into requestPool, which outlives response serialization.
   std::vector<api::Warning> warnings;
+
+  // Record the request's failure on its final response; the first failure
+  // wins.  Takes `mutex`: a paused emitter may be assembling its final batch
+  // into lastResponse concurrently.  A failed request reports no op results.
+  void setError(const ErrorInfo& info);
   // Empty, with no backing allocation, unless an instrumented op observes
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
@@ -221,23 +226,7 @@ private:
   bool finalReady = false;
   bool finalSent = false;
 
-  void maybeSendFinal(bool endingStream) {
-    bool send;
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (endingStream) {
-        assert(activeStreams > 0);
-        activeStreams--;
-      } else {
-        finalReady = true;
-      }
-      send = finalReady && activeStreams == 0 && !finalSent;
-      if (send) finalSent = true;
-    }
-    if (send) {
-      reply(*lastResponse);  // may delete *this*; nothing after this call
-    }
-  }
+  void maybeSendFinal(bool endingStream);
 };
 
 // A response object that can be used to send back results to the client.

@@ -23,8 +23,19 @@
 #include <hpp_proto/indirect_view.hpp>
 
 #include "luxir_types.hpp"
+#include "luxir/util/ApiError.h"
 
 namespace luxir::api::build {
+
+// The engine's ErrorKind and the wire Error.Kind are the same enumeration.
+static_assert((int)Error_::Kind::UNKNOWN == (int)ErrorKind::UNKNOWN &&
+              (int)Error_::Kind::INVALID_REQUEST == (int)ErrorKind::INVALID_REQUEST &&
+              (int)Error_::Kind::NOT_FOUND == (int)ErrorKind::NOT_FOUND &&
+              (int)Error_::Kind::ALREADY_EXISTS == (int)ErrorKind::ALREADY_EXISTS &&
+              (int)Error_::Kind::FAILED_PRECONDITION == (int)ErrorKind::FAILED_PRECONDITION &&
+              (int)Error_::Kind::RESOURCE_EXHAUSTED == (int)ErrorKind::RESOURCE_EXHAUSTED &&
+              (int)Error_::Kind::UNAVAILABLE == (int)ErrorKind::UNAVAILABLE &&
+              (int)Error_::Kind::INTERNAL == (int)ErrorKind::INTERNAL);
 
 template<class T>
 T* allocMessage(std::pmr::memory_resource& mr) {
@@ -55,6 +66,20 @@ inline ::hpp_proto::bytes_view arenaBytes(std::pmr::memory_resource& mr, std::sp
   std::byte* p = (std::byte*)mr.allocate(s.size(), 1);
   std::memcpy(p, s.data(), s.size());
   return ::hpp_proto::bytes_view(p, s.size());
+}
+
+// Copy an ErrorInfo into the arena as the wire Error.
+inline Error arenaError(std::pmr::memory_resource& mr, const ErrorInfo& info) {
+  Error e;
+  e.kind = (Error::Kind)info.kind;
+  e.code = arenaStr(mr, info.code);
+  e.message = arenaStr(mr, info.message);
+  return e;
+}
+
+// Read a wire Error back into an owning ErrorInfo.
+inline ErrorInfo errorInfo(const Error& e) {
+  return {(ErrorKind)e.kind, std::string(e.code), std::string(e.message)};
 }
 
 // --- indirect_view<T> map: map_view<string_view, indirect_view<T>> ---

@@ -26,12 +26,16 @@ struct IndexResult {
     std::string id;
     std::string error_message;
     int32_t index = 0;
+    std::string code;
   };
 
   uint64_t updateVersion = 0;
   bool success = false;  // false if the message errored or the response status is ERROR
   Status status = Status::UNKNOWN;
   std::string error_message;          // message-level error, if any
+  std::string error_code;             // its stable code
+  ErrorKind error_kind = ErrorKind::UNKNOWN;
+  int64_t total_errors = 0;
   std::vector<std::string> ids;       // returned ids (return_ids requests)
   std::vector<Error> errors;          // per-doc errors
 };
@@ -47,7 +51,15 @@ private:
     auto* rsp = msg.finishResponse();
     out.updateVersion = rsp->update_version;
     out.status = rsp->status;
-    out.error_message = std::string(rsp->error_message);
+    out.error_message.clear();
+    out.error_code.clear();
+    out.error_kind = ErrorKind::UNKNOWN;
+    if (rsp->error) {
+      out.error_message = std::string(rsp->error->message);
+      out.error_code = std::string(rsp->error->code);
+      out.error_kind = (ErrorKind)rsp->error->kind;
+    }
+    out.total_errors = rsp->total_errors;
     out.success = !msg.result.errored() && rsp->status != IndexResult::Status::ERROR;
     out.ids.clear();
     out.ids.reserve(rsp->ids.size());
@@ -55,7 +67,8 @@ private:
     out.errors.clear();
     out.errors.reserve(rsp->errors.size());
     for (const auto& e : rsp->errors) {
-      out.errors.push_back({std::string(e.id), std::string(e.error_message), e.index});
+      out.errors.push_back({std::string(e.id), e.error ? std::string(e.error->message) : std::string(),
+                            e.index, e.error ? std::string(e.error->code) : std::string()});
     }
   }
 

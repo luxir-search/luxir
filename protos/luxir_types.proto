@@ -574,6 +574,29 @@ message Warning {
   string message = 2;  // human-readable detail
 }
 
+// A failure.  The same shape everywhere an error appears: SearchResponse.error,
+// UpdateResponse.error and its per-document errors, the HTTP error body, and
+// gRPC status details.  kind is the coarse class: it selects the HTTP status
+// and gRPC status code, and tells a client whether to fix the request, the
+// target, or retry, without knowing the code.  code is the stable machine key
+// (snake_case, like Warning.code); new codes appear under existing kinds
+// without changing this shape.  message is human detail, not a contract.
+message Error {
+  enum Kind {
+    UNKNOWN = 0;
+    INVALID_REQUEST = 1;      // the request as written cannot be served (HTTP 400)
+    NOT_FOUND = 2;            // the addressed collection or route does not exist (404)
+    ALREADY_EXISTS = 3;       // the request would create what already exists (409)
+    FAILED_PRECONDITION = 4;  // the node's state forbids the operation, e.g. --read-only (403)
+    RESOURCE_EXHAUSTED = 5;   // a size or memory ceiling was exceeded (429; 413 for request_too_large)
+    UNAVAILABLE = 6;          // the target exists but cannot serve now: shutting down, being deleted, failed to load (503)
+    INTERNAL = 7;             // a server-side failure the request did not cause (500)
+  }
+  Kind kind = 1;
+  string code = 2;
+  string message = 3;
+}
+
 // Execution details for one request. Operations opt into profiling
 // incrementally; currently string field facets are instrumented.
 message ExecutionProfile {
@@ -612,8 +635,8 @@ message ExecutionProfilePiece {
 message SearchResponse {
   string request_id = 1;
   map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
-  string error = 3;         // If non-empty, the request failed.  ops may be empty or partial.
-  repeated Warning warnings = 4; // declared degradations; the request still succeeded
+  Error error = 3;          // Present iff the request failed; ops is then empty.
+  repeated Warning warnings = 4; // declared degradations; carried on success and on failure
   ExecutionProfile profile = 5; // present only when SearchRequest.profile was true
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
@@ -774,11 +797,11 @@ message UpdateResponse {
     UNKNOWN = 0;          // the default
     OK = 1;               // the update was successful
     PARTIAL = 2;          // part of the request took effect, part failed (see errors)
-    ERROR = 3;            // the request failed.  If error_message is empty, the failure was
+    ERROR = 3;            // the request failed.  If error is unset, the failure was
                           // per-document (see errors) and the request had no visible effect
-                          // on the index.  If error_message is set, the failure was
-                          // request-level (e.g. commit pipeline) and the effect of
-                          // individual documents is indeterminate beyond what errors lists.
+                          // on the index.  If error is set, the failure was request-level
+                          // (e.g. commit pipeline) and the effect of individual documents
+                          // is indeterminate beyond what errors lists.
   }
 
   Status status = 3;
@@ -790,22 +813,25 @@ message UpdateResponse {
   // request-level ERROR the listed documents may have been rolled back.
   repeated string ids = 4;
 
-  message Error {
+  message DocError {
     // the id of the failed document as given in the request (empty if absent or not a
     // string/bytes value)
     string id = 1;
-    string error_message = 2;
     // position of the failed document within the request's document list
-    int32 index = 3;
-    // for an invalid value for a field, we could actually give that field/value in a more structured way
+    int32 index = 2;
+    Error error = 3;
   }
   // Per-document failures.  A failed document has no effect on search results; the
   // previous version of the document, if any, is untouched.
-  repeated Error errors = 5;
+  repeated DocError errors = 5;
 
-  // Request-level error (not tied to a single document), e.g. a failure in the commit
-  // pipeline.  Set when status == ERROR for a non-document failure.
-  string error_message = 6;
+  // Number of failed documents.  Equals the length of errors unless the transport
+  // retained only a prefix (the NDJSON stream keeps the first 100 per group).
+  int64 total_errors = 7;
+
+  // Request-level failure (not tied to a single document), e.g. a failure in the commit
+  // pipeline.  Set exactly when status == ERROR for a non-document failure.
+  Error error = 6;
 }
 
 
@@ -1100,7 +1126,9 @@ message CollectionStats {
   StatsTotals totals = 2;
   string schema_gen = 3;  // sortable-string spelling (see SegmentStats); empty = no schema
   repeated ShardStats shards = 4;
-  string error = 5;
+  // Set for a collection that is not serving (failed to load, or a delete failed
+  // partway); kind is UNAVAILABLE and the message is the recorded reason.
+  Error error = 5;
 }
 
 message ShardStats {
@@ -1226,7 +1254,7 @@ message ShardCacheControl {
 message CollectionCacheControl {
   string name = 1;
   repeated ShardCacheControl shards = 2;
-  string error = 3;
+  Error error = 3;  // as CollectionStats.error
 }
 
 message CacheControlResponse {

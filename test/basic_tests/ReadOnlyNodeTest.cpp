@@ -1,3 +1,4 @@
+#include <memory_resource>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -9,6 +10,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/store/Directory.h"
 #include "test/GrpcClient.h"
+#include "luxir/server/RpcStatus.h"
 #include "test/HttpReq.h"
 #include "test/LuxirTest.h"
 
@@ -83,6 +85,8 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
     auto res = httpRequest(port, method, target, std::move(body), contentType);
     EXPECT_EQ(403, res.result_int()) << what << ": " << res.body();
     EXPECT_NE(res.body().find("read-only"), std::string::npos) << what << ": " << res.body();
+    EXPECT_NE(res.body().find(R"("error":{"kind":"failed_precondition","code":"read_only")"),
+              std::string::npos) << what << ": " << res.body();
   };
 
   expectRefused("update", http::verb::post, "/collections/main/_update",
@@ -134,6 +138,11 @@ TEST_F(ReadOnlyNodeTest, grpcRefusesMutatingMethods) {
       << updateStatus.error_message();
   EXPECT_NE(updateStatus.error_message().find("read-only"), std::string::npos)
       << updateStatus.error_message();
+  std::pmr::monotonic_buffer_resource arena;
+  luxir::api::Error detail;
+  ASSERT_TRUE(decodeRpcStatusDetails(updateStatus.error_details(), detail, arena));
+  EXPECT_EQ("read_only", detail.code);
+  EXPECT_EQ(luxir::api::Error::Kind::FAILED_PRECONDITION, detail.kind);
 
   luxir::api::CreateCollectionRequest create;
   create.name = "read_only_grpc_new";

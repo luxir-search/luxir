@@ -103,6 +103,30 @@ the current handler returns without indexing when it is non-empty and does not
 yet report that as an error. Do not populate `columns`. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
 
+## Errors
+
+A unary method fails with a gRPC status whose code follows the error's
+`kind`: `INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`,
+`FAILED_PRECONDITION`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, or `INTERNAL`.
+The status message is the human detail, and the status details
+(`grpc-status-details-bin`) carry a `google.rpc.Status` whose single detail is
+the `luxir.proto.Error` message, so a generated client reads the stable `code`
+and `kind` without parsing text. A request that does not decode as its
+method's message is `INVALID_ARGUMENT`.
+
+Streaming methods report a failure of an accepted request in-band with the
+same `Error` message: `SearchResponse.error` (the response then carries no
+`ops`, declared `warnings` still ride along, and every earlier batch of that
+request is invalidated) and `UpdateResponse.error` for a request-level update
+failure, with per-document failures in `UpdateResponse.errors[].error` and
+`total_errors` counting them. `request_id` is echoed on both. A message that
+cannot be accepted at all ends the call with a status instead: one that does
+not decode, a search asking for the HTTP-only docs format, or an update whose
+collection cannot be resolved. Responses already accepted are still delivered
+before that status. The kinds, codes, and their meanings are
+transport-independent; see [HTTP API conventions](http-api.md#errors) for the
+table.
+
 ## HTTP JSON versus protobuf values
 
 The HTTP surface is a deliberate JSON dialect over the protobuf model: a

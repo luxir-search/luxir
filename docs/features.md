@@ -223,6 +223,9 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
 - Strict validation everywhere: unknown keys are errors, not silence;
   depth and size limits are built in (the public port is treated as
   hostile).
+- One error shape everywhere: `{kind, code, message}`, in-band and in
+  HTTP error bodies and gRPC status details alike; `kind` fixes the
+  transport status, `code` is the stable key.
 - Request/response correlation ids on gRPC streams and updates; per-request
   freshness bound (`freshness_ms`) on reads.
 

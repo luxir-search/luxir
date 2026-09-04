@@ -1,5 +1,7 @@
 #pragma once
 
+#include "luxir/util/ApiError.h"
+
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/OrdCollector.h"
@@ -112,7 +114,7 @@ private:
   void checkMultiValued(Inverter& inverter, size_t n) {
     unused(inverter);
     if (n > 1 && !fieldType->multiValued()) {
-      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
+      throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                            std::string_view(fieldName)));
     }
   }

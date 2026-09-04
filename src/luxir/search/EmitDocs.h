@@ -785,16 +785,11 @@ void DocEmitterImpl<GetDocList, GetDoc, GetScore>::produce() {
   bool finished = true;
   try {
     finished = produceBatches();
-  } catch (const std::exception& e) {
-    std::lock_guard<std::mutex> lock(req.mutex);
-    if (req.lastResponse->proto.error.empty()) {
-      req.lastResponse->proto.error = luxir::api::build::arenaStr(req.lastResponse->mr, e.what());
-    }
   } catch (...) {
-    std::lock_guard<std::mutex> lock(req.mutex);
-    if (req.lastResponse->proto.error.empty()) {
-      req.lastResponse->proto.error = "unknown error while emitting documents";
-    }
+    // Emission is execution: an unclassified failure is the engine's.  The
+    // request-authored cases (an unknown returned field, an expression that
+    // cannot be evaluated) throw ApiErrors and keep their classification.
+    req.setError(currentExceptionInfo(ErrorKind::INTERNAL));
   }
   if (finished) {
     // The final batch (assembled into req.lastResponse by produceBatches) is

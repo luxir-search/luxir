@@ -600,7 +600,7 @@ TEST_F(HttpApiTest, autoCreateCollectionCanBeDisabled) {
       R"({"docs":[{"id":"auto-off","title_w":"autocreateoff token"}],"commit":{}})");
   localServer.shutdown();
 
-  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_EQ(404, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("collection 'http_auto_create_off' does not exist"),
             std::string::npos) << update.body();
   EXPECT_THROW(node.getCollection("http_auto_create_off"), CollectionResolutionError);
@@ -1798,7 +1798,7 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamFailureRollsBack) {
   EXPECT_EQ((int64_t)0, hreq.found()) << hreq.rawResponse();
 }
 
-TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
+TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs413) {
   LuxirConfig config;
   config.ingest.max_request_body = 1024;
   config.ingest.max_record = 2048;
@@ -1816,7 +1816,7 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
                             std::move(body), "application/x-ndjson");
   localServer.shutdown();
 
-  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_EQ(413, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("all_or_none NDJSON group exceeds indexing.max-request-body"),
             std::string::npos) << update.body();
 }
@@ -3111,6 +3111,209 @@ TEST_F(HttpApiTest, ndjsonCachedWriterFailsCleanlyAfterCollectionDelete) {
   EXPECT_NE(errorLine.find("docs_indexed_so_far"), std::string::npos) << errorLine;
 
   stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+}
+
+
+// ---- error contract ---------------------------------------------------------
+
+TEST_F(HttpApiTest, errorBodyIsStructuredAndEchoesRequestId) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?request_id=r1",
+                         "{not json");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"({"request_id":"r1","error":{"kind":"invalid_request","code":"invalid_json","message":)"),
+            std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, wrongMethodIs405OnEveryKnownRoute) {
+  struct Case { http::verb method; const char* target; const char* allow; };
+  const Case cases[] = {
+      {http::verb::get, "/collections/main/_update", "POST"},
+      {http::verb::delete_, "/health", "GET"},
+      {http::verb::put, "/collections/main/_search", "GET, POST"},
+      {http::verb::delete_, "/collections/main/_schema", "GET, POST"},
+      {http::verb::post, "/collections/main/_stats", "GET"},
+      {http::verb::get, "/collections/_delete", "POST"},
+  };
+  for (const auto& c : cases) {
+    auto res = httpRequest(port(), c.method, c.target);
+    EXPECT_EQ(405, res.result_int()) << c.target << " " << res.body();
+    EXPECT_EQ(c.allow, res[http::field::allow]) << c.target;
+    EXPECT_NE(res.body().find(R"("error":{"kind":"invalid_request","code":"method_not_allowed")"),
+              std::string::npos) << res.body();
+  }
+  auto unknown = httpRequest(port(), http::verb::get, "/nope");
+  EXPECT_EQ(404, unknown.result_int()) << unknown.body();
+  EXPECT_NE(unknown.body().find(R"("error":{"kind":"not_found","code":"not_found")"),
+            std::string::npos) << unknown.body();
+}
+
+TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
+  // A name that cannot denote a collection is the request's fault on every route.
+  for (const char* target : {"/collections/Bad-Name/_schema", "/collections/Bad-Name/_stats"}) {
+    auto res = httpRequest(port(), http::verb::get, target);
+    EXPECT_EQ(400, res.result_int()) << target << " " << res.body();
+    EXPECT_NE(res.body().find(R"("error":{"kind":"invalid_request","code":"invalid_collection_name")"),
+              std::string::npos) << res.body();
+  }
+  auto update = httpRequest(port(), http::verb::post, "/collections/Bad-Name/_update",
+                            R"({"docs":[{"id":"x"}]})");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("code":"invalid_collection_name")"), std::string::npos)
+      << update.body();
+  // A search resolves its collection after submission, so the same failure is
+  // the in-band error line.
+  auto search = httpRequest(port(), http::verb::get, "/collections/Bad-Name/_search");
+  ASSERT_EQ(200, search.result_int()) << search.body();
+  EXPECT_NE(search.body().find(R"({"error":{"kind":"invalid_request","code":"invalid_collection_name")"),
+            std::string::npos) << search.body();
+
+  // A well-formed name nothing answers to is not found.
+  auto missing = httpRequest(port(), http::verb::get, "/collections/http_no_such_coll/_schema");
+  EXPECT_EQ(404, missing.result_int()) << missing.body();
+  EXPECT_NE(missing.body().find(R"("error":{"kind":"not_found","code":"collection_not_found")"),
+            std::string::npos) << missing.body();
+}
+
+TEST_F(HttpApiTest, searchFailureAfterSubmissionIsAnErrorLine) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"request_id":"s1","max_parallel":5,"ops":{"q":{"top_docs":{"query":"title_w:dune"}}}})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(1u, lines.size()) << res.body();
+  EXPECT_NE(lines[0].find(R"({"request_id":"s1","error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),
+            std::string::npos) << res.body();
+  EXPECT_EQ(lines[0].find(R"("docs")"), std::string::npos) << res.body();
+
+  // format=docs has no envelope: before any output the same failure is a
+  // plain HTTP error with the same body.
+  auto docs = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
+      R"({"request_id":"s2","max_parallel":5,"ops":{"q":{"top_docs":{"query":"title_w:dune"}}}})");
+  EXPECT_EQ(400, docs.result_int()) << docs.body();
+  EXPECT_NE(docs.body().find(R"({"request_id":"s2","error":{"kind":"invalid_request")"),
+            std::string::npos) << docs.body();
+}
+
+TEST_F(HttpApiTest, envelopeEchoesRequestId) {
+  helper.index(flatdoc("id", "rid1", "title_w", "requestid token"), UpdateMessage::COMMIT);
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?request_id=q9",
+                         R"({"query":"title_w:requestid","fields":["id"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"({"request_id":"q9",)"), std::string::npos) << res.body();
+  EXPECT_NE(res.body().find(R"("rid1")"), std::string::npos) << res.body();
+
+  // Docs format: the id rides on the first _header_ even without get_number.
+  auto docs = httpRequest(port(), http::verb::post,
+                          "/collections/main/_search?format=docs&request_id=q10",
+                          R"({"query":"title_w:requestid","fields":["id"]})");
+  ASSERT_EQ(200, docs.result_int()) << docs.body();
+  auto lines = splitLines(docs.body());
+  ASSERT_EQ(2u, lines.size()) << docs.body();
+  EXPECT_EQ(R"({"_header_":{"request_id":"q10"}})", lines[0]) << docs.body();
+}
+
+TEST_F(HttpApiTest, updateErrorsAreStructured) {
+  // Request-level: rejected before any document; the message is the reason,
+  // not a stack trace.
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"request_id":"u1","docs":[{"id":"u1"}],"drop_unmapped":true})");
+  ASSERT_EQ(200, bad.result_int()) << bad.body();
+  EXPECT_NE(bad.body().find(R"("request_id":"u1")"), std::string::npos) << bad.body();
+  EXPECT_NE(bad.body().find(R"("status":"error")"), std::string::npos) << bad.body();
+  EXPECT_NE(bad.body().find(R"("error":{"kind":"invalid_request","code":"invalid_request","message":"drop_unmapped requires a non-empty field_map"})"),
+            std::string::npos) << bad.body();
+  EXPECT_EQ(bad.body().find("Stack trace"), std::string::npos) << bad.body();
+
+  // Per-document: the failed doc names itself and carries the same error object.
+  auto partial = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"ok1","title_w":"fine"},{"id":"bad1","bogus":"x"}]})");
+  ASSERT_EQ(200, partial.result_int()) << partial.body();
+  EXPECT_NE(partial.body().find(R"("status":"partial")"), std::string::npos) << partial.body();
+  EXPECT_NE(partial.body().find(R"("errors":[{"id":"bad1","index":1,"error":{"kind":"invalid_request","code":"unknown_field")"),
+            std::string::npos) << partial.body();
+  EXPECT_NE(partial.body().find(R"("total_errors":1)"), std::string::npos) << partial.body();
+  EXPECT_EQ(partial.body().find("error_message"), std::string::npos) << partial.body();
+}
+
+TEST_F(HttpApiTest, ndjsonRequestLevelFailureEndsStreamWithStructuredError) {
+  std::string body =
+      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"id":"ng1","title_w":"ndjson group token"})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n"
+      R"({"_update_":{"request_id":"g2","drop_unmapped":true}})" "\n"
+      R"({"id":"ng2","title_w":"never indexed"})" "\n"
+      "{}\n";
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
+                         std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(2u, lines.size()) << res.body();
+  EXPECT_NE(lines[0].find(R"("request_id":"g1")"), std::string::npos) << res.body();
+  EXPECT_NE(lines[0].find(R"("status":"ok")"), std::string::npos) << res.body();
+  EXPECT_NE(lines[1].find(R"("request_id":"g2")"), std::string::npos) << res.body();
+  EXPECT_NE(lines[1].find(R"("status":"error")"), std::string::npos) << res.body();
+  EXPECT_NE(lines[1].find(R"x("error":{"kind":"invalid_request","code":"invalid_request","message":"drop_unmapped requires a non-empty field_map (docs_indexed_so_far=1)"})x"),
+            std::string::npos) << res.body();
+}
+
+
+TEST_F(HttpApiTest, deleteInvalidNameIs400) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/_delete", R"({"name":"Bad-Name"})");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("error":{"kind":"invalid_request","code":"invalid_collection_name")"),
+            std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, ndjsonTotalErrorsCountsPastRetention) {
+  // The stream keeps the first 100 document errors of a group; total_errors
+  // still counts every one.
+  std::string body = R"({"_update_":{"request_id":"many"}})" "\n";
+  for (int i = 0; i < 101; i++) {
+    body += R"({"id":"bad)" + std::to_string(i) + R"(","bogus":"x"})" "\n";
+  }
+  body += "{}\n";
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
+                         std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(1u, lines.size()) << res.body();
+  EXPECT_NE(lines[0].find(R"("status":"error")"), std::string::npos) << res.body();
+  EXPECT_NE(lines[0].find(R"("total_errors":101)"), std::string::npos) << res.body();
+  EXPECT_NE(lines[0].find(R"("id":"bad99")"), std::string::npos) << res.body();
+  EXPECT_EQ(lines[0].find(R"("id":"bad100")"), std::string::npos) << res.body();
+  EXPECT_EQ(lines[0].find(R"("error":{"kind":"invalid_request","code":"invalid_request")"),
+            std::string::npos) << "no request-level error: " << res.body();
+}
+
+// An oversized body is never read, but the route and method are known from
+// the headers: a wrong method or an unknown path outranks the size.
+TEST_F(HttpApiTest, oversizedBodyStillAnswersRouteAndMethodFirst) {
+  auto send = [&](std::string_view requestLine) {
+    net::io_context cioc;
+    beast::tcp_stream stream(cioc);
+    tcp::resolver resolver(cioc);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
+    stream.expires_after(std::chrono::seconds(10));
+    std::string header = std::string(requestLine) +
+        " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+        "Content-Length: 99000000\r\nConnection: close\r\n\r\n";
+    net::write(stream, net::buffer(header));
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    beast::error_code ec;
+    http::read(stream, buffer, res, ec);
+    return res;
+  };
+  auto wrongMethod = send("PUT /collections/main/_update?request_id=big1");
+  EXPECT_EQ(405, wrongMethod.result_int()) << wrongMethod.body();
+  EXPECT_EQ("POST", wrongMethod[http::field::allow]);
+  EXPECT_NE(wrongMethod.body().find(R"({"request_id":"big1","error":{"kind":"invalid_request","code":"method_not_allowed")"),
+            std::string::npos) << wrongMethod.body();
+  auto unknown = send("POST /nope");
+  EXPECT_EQ(404, unknown.result_int()) << unknown.body();
+  auto tooLarge = send("POST /collections/main/_update?request_id=big2");
+  EXPECT_EQ(413, tooLarge.result_int()) << tooLarge.body();
+  EXPECT_NE(tooLarge.body().find(R"({"request_id":"big2","error":{"kind":"resource_exhausted","code":"request_too_large")"),
+            std::string::npos) << tooLarge.body();
 }
 
 } // namespace luxir::test

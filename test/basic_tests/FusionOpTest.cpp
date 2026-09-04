@@ -265,7 +265,7 @@ TEST_F(FusionOpTest, routedSharedFilterIsRejected) {
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
   addFilter(fusion.filter, qb::match(mr, "color_s", "red"), mr, {"brands"});
 
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   lreq->execute();
   EXPECT_NE(std::string::npos,
             lreq->errorMsg().find("fusion.filter[0].except_ops is not supported"))
@@ -287,7 +287,7 @@ TEST_F(FusionOpTest, routedSourceFilterExplainsIgnoredOps) {
   addFilter(
       source.filter, qb::match(mr, "color_s", "red"), mr, {"ignored"});
 
-  ExpectLog quiet("Search request failed:");
+  ExpectLog quiet("Search request rejected");
   lreq->execute();
   EXPECT_NE(lreq->errorMsg().find("fusion source 'text'.filter[0].except_ops"),
             std::string::npos)
@@ -623,7 +623,7 @@ TEST_F(FusionOpTest, validation) {
     auto* lreq = buildBase();
     auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     fusion.rrf.emplace().k = 60;
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->errorMsg().find("source"), std::string::npos);
@@ -636,7 +636,7 @@ TEST_F(FusionOpTest, validation) {
     auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->errorMsg().find("method"), std::string::npos);
@@ -650,7 +650,7 @@ TEST_F(FusionOpTest, validation) {
     auto& mr = lreq->mr;
     fusion.rrf.emplace().k = -1;
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->errorMsg().find("k"), std::string::npos);
@@ -666,7 +666,7 @@ TEST_F(FusionOpTest, validation) {
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
     auto* sub = build::mapSlot<luxir::api::SearchOp>(fusion.ops, 1, "facet", mr);
     sub->kind.emplace<luxir::api::FieldFacet>().field = build::arenaStr(mr, "color_s");
-    ExpectLog quiet("Search request failed:");
+    ExpectLog quiet("Search request rejected");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->errorMsg().find("sub-ops"), std::string::npos);
