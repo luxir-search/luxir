@@ -247,7 +247,7 @@ POST /collections/main/_search?explain=request
 ```
 
 ```json
-{"collection":{"name":["main"]},"ops":{"q":{"top_docs":{"query":{"match":{"field":"title_w","val":"dune"}}}}}}
+{"collection":"main","ops":{"q":{"top_docs":{"query":{"match":{"field":"title_w","val":"dune"}}}}}}
 ```
 
 Handy for learning the API and for debugging a query that isn't matching what

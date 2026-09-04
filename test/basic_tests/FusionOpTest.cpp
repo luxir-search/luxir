@@ -657,21 +657,6 @@ TEST_F(FusionOpTest, validation) {
     lreq->done();
   }
 
-  // Sub-ops not supported.
-  {
-    auto* lreq = buildBase();
-    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
-    auto& mr = lreq->mr;
-    fusion.rrf.emplace().k = 60;
-    setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
-    auto* sub = build::mapSlot<luxir::api::SearchOp>(fusion.ops, 1, "facet", mr);
-    sub->kind.emplace<luxir::api::FieldFacet>().field = build::arenaStr(mr, "color_s");
-    ExpectLog quiet("Search request rejected");
-    lreq->execute();
-    ASSERT_FALSE(lreq->responses.empty());
-    EXPECT_NE(lreq->errorMsg().find("sub-ops"), std::string::npos);
-    lreq->done();
-  }
 }
 
 

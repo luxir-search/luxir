@@ -67,7 +67,7 @@ canonical effective request, including URL overlays, without executing it;
 posting the result back has the same semantics.
 
 The HTTP path collection is authoritative. Canonical echo may show it as
-`"collection":{"name":["books"]}` even when the original body omitted it.
+`"collection":"books"` even when the original body omitted it.
 
 ## Errors
 

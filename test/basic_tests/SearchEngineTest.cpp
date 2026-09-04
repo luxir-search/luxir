@@ -4568,12 +4568,6 @@ TEST_F(SearchEngineTest, opDomainValidationIsParseTime) {
     "field":"brand_s","ops":{"inner":{"expr_op":"sum(price_i)",
       "domain":{"query":{"all":true}}}}}}}})json",
       "under a facet bucket: domain is only supported");
-  expectError(R"json({"ops":{"f":{"fusion":{
-    "sources":{"s":{"query":{"all":true}}},"rrf":{},
-    "ops":{"x":{"expr_op":"sum(price_i)",
-      "domain":{"query":{"all":true}}}}}}}})json",
-      "under Fusion.ops: domain is only supported");
-
   auto missing = localReq(luxirNode->getSearchEngine());
   auto& facet = missing->collection("main").topDocs("q").allQuery()
       .facet("f", "brand_s");

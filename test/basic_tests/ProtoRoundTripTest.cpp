@@ -37,8 +37,8 @@
 #include <glaze/glaze.hpp>
 
 #include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/api/luxir.hpp"
 #include "luxir/api/build.h"
 
 namespace {
@@ -273,13 +273,14 @@ void roundTripType(const char* nm) {
 
 // The one hand-maintained list: every message type. Add a message -> add a line.
 #define LUXIR_MSGS(X)                                                                              \
-  X(Target) X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
+  X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)             \
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
-  X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
+  X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery)       \
+  X(SimpleQuery) X(RangeQuery) X(GeoBoxQuery) X(GeoDistanceQuery) X(ExprQuery) X(Warning)           \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(QueryBucket) X(QueryFacet) X(Domain)                               \
-  X(SearchResponse) X(DocList) X(FacetResult) X(Bucket) X(CommitParams) X(UpdateRequest)           \
-  X(UpdateResponse) X(NamedValue) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                      \
+  X(SearchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \
+  X(UpdateResponse) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                                    \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
   X(ArrArrBin) X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
   X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerDef)    \
@@ -288,7 +289,8 @@ void roundTripType(const char* nm) {
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
   X(SegmentStats) X(AuxStats) X(QueryCacheStats) X(IndexRamStats)                                 \
-  X(HelloRequest) X(HelloReply)
+  X(CacheControlRequest) X(CacheControlResponse) X(CacheEntryDump)                                \
+  X(ShardCacheControl) X(CollectionCacheControl)
 
 TEST(ProtoRoundTrip, AllMessages) {
 #define RT(T) roundTripType<P::T>(#T);

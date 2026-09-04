@@ -55,9 +55,7 @@ The request fields are:
 | `field_map` | Rename input document keys onto schema fields for this request. |
 | `drop_unmapped` | Drop doc keys not present in `field_map` instead of indexing them. |
 
-The protobuf request contains a reserved `columns` member, but the current
-update handler does not consume it. Send row maps through `docs`; do not
-populate `columns`. See [gRPC API](grpc.md).
+Send row maps through `docs`. See [gRPC API](grpc.md).
 
 ## Field mapping
 
@@ -219,7 +217,7 @@ Three record forms make up the stream grammar:
   HTTP stream.
 
 The URL collection is the default. A control object can set
-`"collection":{"name":["archive"]}` for the following group, which lets one
+`"collection":"archive"` for the following group, which lets one
 connection feed several collections. Options do not leak from one group into
 the next.
 

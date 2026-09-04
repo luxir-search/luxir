@@ -111,7 +111,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema
   auto& request = req.proto;
   auto& node = req.engine.node;
-  auto collection = node.resolveCollection(request.collection ? &*request.collection : nullptr);
+  auto collection = node.resolveCollection(request.collection);
 
   // get the index reader
   req.schema = collection->getSchema();

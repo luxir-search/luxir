@@ -8,7 +8,7 @@
 #include <string_view>
 
 #include "AuxReader.h"
-#include "luxir/api/luxir_types.hpp"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/store/Directory.h"
 #include "luxir/store/OutputStream.h"
 #include "luxir/util/log.h"

@@ -123,11 +123,8 @@ TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
   req->execute(false);
   ASSERT_OK(req);
 
-  auto& result = const_cast<api::FacetResult&>(std::get<api::FacetResult>(
-      req->responses[0]->proto.ops.at("cats")->kind));
-  result.total_buckets = 2;
   EXPECT_EQ(
-      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1,"total_buckets":2}}})" "\n",
+      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n",
       renderSearchResponseLine(req->responses[0]->proto));
 }
 

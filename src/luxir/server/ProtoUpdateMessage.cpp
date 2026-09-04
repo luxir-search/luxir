@@ -178,12 +178,6 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
   validateFieldMap(*req);
 
-  // Check if we have columns (not yet implemented)
-  if (!req->columns.empty()) {
-    std::cout << "\tindexer got columns (not yet implemented!): " << req->columns.size() << std::endl;
-    return;
-  }
-
   // Check if we need an inverter for either deletes or adds
   bool needInverter = !req->delete_ids.empty() || !req->docs.empty();
 

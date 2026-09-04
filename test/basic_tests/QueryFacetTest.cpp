@@ -324,17 +324,6 @@ TEST_F(QueryFacetParserTest, SelectedPlacementMatchesOtherFacets) {
     setSelected(facet, cursor.mr(), {"cheap"}, true);
     expectError(*request, "facet 'prices' at nested facet bucket: selected is only supported on facets directly inside TopDocs.ops");
   }
-  {
-    auto request = localReq(luxirNode->getSearchEngine());
-    auto& fusion = request->topDocs("f").rawOp().kind.emplace<api::Fusion>();
-    auto* child = build::mapSlot<api::SearchOp>(
-        fusion.ops, 1, "prices", request->mr);
-    auto& facet = child->kind.emplace<api::QueryFacet>();
-    auto* buckets = addBuckets(facet, request->mr, 1);
-    setBucket(buckets[0], request->mr, "cheap", qb::all());
-    setSelected(facet, request->mr, {"cheap"}, true);
-    expectError(*request, "facet 'prices' at Fusion.ops: selected is only supported on facets directly inside TopDocs.ops");
-  }
 }
 
 TEST_F(QueryFacetParserTest, SelectionModeRequiresSelected) {
@@ -454,7 +443,6 @@ TEST_F(QueryFacetParserTest, OrderedOverlappingBucketsRespectIncomingDomain) {
   EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
                 {"cheap", 1}, {"mid", 2}, {"under_200", 3}, {"zero", 0}}),
             queryRows(result));
-  EXPECT_FALSE(result.total_buckets.has_value());
   EXPECT_FALSE(result.missing.has_value());
   EXPECT_EQ(0, result.offset);
 }

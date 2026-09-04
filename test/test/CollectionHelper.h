@@ -197,16 +197,13 @@ public:
     }
     UpdateBuilder& dropUnmapped(bool v = true) { request_.drop_unmapped = v; return *this; }
     UpdateBuilder& collection(std::string_view name) {
-      auto& t = request_.collection.emplace();
-      std::string_view* a = build::allocArray(t.name, 1, mr_);
-      a[0] = build::arenaStr(mr_, name);
+      request_.collection = build::arenaStr(mr_, name);
       return *this;
     }
     UpdateBuilder& requestId(std::string_view id) {
       request_.request_id = build::arenaStr(mr_, id);
       return *this;
     }
-    UpdateBuilder& streamId(int64_t id) { request_.stream_id = id; return *this; }
     UpdateBuilder& commit(bool waitForMerges = false, uint32_t maxSegments = 0) {
       auto& p = request_.commit.emplace();
       p.wait_for_merges = waitForMerges;

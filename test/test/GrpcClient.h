@@ -13,7 +13,10 @@
 
 #include <memory>
 #include <memory_resource>
+#include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -22,19 +25,31 @@
 #include <grpcpp/support/byte_buffer.h>
 #include <grpcpp/support/sync_stream.h>
 
-#include "luxir/api/luxir_types.hpp"  // luxir::api::SearchRequest / SearchResponse, UpdateRequest/Response
-#include "luxir/api/luxir.hpp"        // luxir::api::HelloRequest / HelloReply
+#include "luxir/api/luxir_types.hpp"
 
 namespace luxir::test {
+
+struct TrivialSearchRequest {
+  using Pair = std::pair<std::string_view,
+                         ::hpp_proto::indirect_view<luxir::api::SearchOp>>;
+
+  luxir::api::SearchOp op;
+  Pair opPair{"q", {&op}};
+  luxir::api::SearchRequest request;
+
+  TrivialSearchRequest() {
+    op.kind.emplace<luxir::api::TopDocs>().limit = 0;
+    request.ops = luxir::api::map_view<
+        std::string_view, ::hpp_proto::indirect_view<luxir::api::SearchOp>>(
+        std::span<const Pair>(&opPair, 1));
+  }
+};
 
 // RPC method paths (match GRPCServer.cpp lookupMethod()).
 namespace rpc {
 inline constexpr const char* Search            = "/luxir.Searcher/Search";
 inline constexpr const char* Update            = "/luxir.Indexer/Update";
 inline constexpr const char* UpdateStream      = "/luxir.Indexer/UpdateStream";
-inline constexpr const char* SayHello          = "/luxir.Greeter/SayHello";
-inline constexpr const char* SayHello2         = "/luxir.Greeter/SayHello2";
-inline constexpr const char* SayHelloStreaming = "/luxir.Greeter/SayHelloStreaming";
 inline constexpr const char* SetSchema         = "/luxir.Admin/SetSchema";
 inline constexpr const char* GetSchema         = "/luxir.Admin/GetSchema";
 inline constexpr const char* CreateCollection  = "/luxir.Admin/CreateCollection";
@@ -50,7 +65,7 @@ std::string grpcSerialize(const luxir::api::UpdateRequest& msg, grpc::ByteBuffer
 std::string grpcSerialize(const luxir::api::StatsRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out);
-std::string grpcSerialize(const luxir::api::HelloRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::SchemaRequest& msg, grpc::ByteBuffer& out);
 // `storage` retains the raw reply bytes the non-owning `msg` views; `arena` backs nested
 // message allocations. Both must outlive any read of `msg`.
 std::string grpcParse(luxir::api::SearchResponse& msg, const grpc::ByteBuffer& in,
@@ -63,7 +78,7 @@ std::string grpcParse(luxir::api::CreateCollectionResponse& msg, const grpc::Byt
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 std::string grpcParse(luxir::api::DeleteCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
-std::string grpcParse(luxir::api::HelloReply& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::SchemaResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 
 // Holds a parsed non-owning concrete reply + the storage/arena it views. Reuse across reads:

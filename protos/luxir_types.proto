@@ -6,27 +6,16 @@ option java_package = "org.apache.luxir.types";
 option java_outer_classname = "LuxirTypes";
 option objc_class_prefix = "Luxir";
 
-package luxir.proto;
-
-
-/// The target of this operation
-message Target {
-  repeated string name = 1;  // qualified collection name
-
-  // Luxir developers implementing a multi-tenant system could use an API-key (at a higher level... not in luxir) as
-  // a starting point akin to a current-working-directory to qualify the collection name.
-  // Responses containing collection names should likewise be relative.
-}
+package luxir;
 
 // Top-level search request that can contain multiple search operations.
 message SearchRequest {
   // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
   // echo it in the response.  Only really needed when a client streams multiple requests in the same RPC.
   string request_id = 1;
-  Target collection = 2;
+  string collection = 2; // empty selects the default collection, "main"
 
   // Multiple search operations in a single request.
-  // An alternative could be to put the tag/name in the SearchOp itself
   map<string, SearchOp> ops = 3;
 
   // Index view freshness tolerance in milliseconds. 0 (the default) requires the
@@ -73,14 +62,10 @@ message SearchOp {
   oneof kind {
     TopDocs top_docs = 1;
     Fusion fusion = 2;
-    // future: function (or leave that as a query type?)
-
-    // TODO: hmmm, should different facet types be be encapsulated by a single "Facet" message?
     FieldFacet field_facet = 8;
     RangeFacet range_facet = 9;
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
-    // future: something like terms component... stream out all terms of one or more (or all) fields
   }
   Domain domain = 20;
 }
@@ -132,16 +117,17 @@ message TopDocs {
 // and merge their results into a single ranked list.
 //
 // Per-source response-shape fields (`fields`, `batch_size`, `offset`,
-// `get_scores`, `get_number`, `document_format`) and per-source `ops` are
-// ignored - Fusion controls response shape at the top level.  Each source's `query`, `sorts`,
-// `limit`, and any per-source `filter` are used to produce that source's
-// ranked list.
+// `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
+// response shape at the top level. Per-source `ops` are not executed; a facet
+// with `selected` under a source is rejected rather than silently dropped.
+// Each source's `query`, `sorts`, `limit`, and any per-source `filter` are used
+// to produce that source's ranked list.
 //
 // The fusion-level `filter` is applied to every source.  It is computed once
 // per segment and reused, so sharing common filters here avoids redundant
 // work.  If a source also specifies its own filter, the two are ANDed.
 message Fusion {
-  // Named source queries.  Names are used for debugging / explanation and
+  // Named source queries. Names are used for debugging / explanation and
   // (for future weighted-fusion methods) as the key for per-source weights.
   map<string, TopDocs> sources = 1;
 
@@ -164,10 +150,6 @@ message Fusion {
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8;
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
-
-  // Reserved for future fusion sub-ops. Current servers reject a non-empty
-  // map; callers must leave it empty.
-  map<string, SearchOp> ops = 15;
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
@@ -211,7 +193,6 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
-    // TODO: function?
   }
 }
 
@@ -245,7 +226,7 @@ message RescoreQuery {
 // scans the stored vector column by default.  If a vec.<field> aux index is
 // present, the query can dispatch to that aux-backed engine instead.
 //
-// V1 limitations:
+// Limitations:
 //   - The query vector must be non-empty and match the schema / segment dims.
 //   - ANN indexes are best-effort above the candidate / breadth caps.
 //
@@ -271,11 +252,15 @@ message KnnQuery {
                            // in [0,1]. 0 = no floor.
 }
 
-  // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field glob/regex?
-  // the alternative is to add more query types at the top level to be more explicit
+// Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or
+// boolean scalar values; numeric and DATE fields accept string or numeric
+// scalars. Null matches nothing. Arrays and structured values are rejected,
+// and GEO_POINT is unsupported. TEXT values are analyzed and scored; use
+// AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for
+// multi-field text.
 message Match {
   string field = 1;
-  Val val = 2;   // if val is an Array, this could be used for TermsQuery as well...  how to tell if scoring or not though?
+  Val val = 2;
 
   // How to combine the multiple terms an analyzed text field can produce.
   // Unset = OR.  Named after the OpenSearch match "operator".
@@ -420,7 +405,7 @@ message FuzzyQuery {
 message PhraseQuery {
   string field = 1;
 
-  // Only set one of these.  A protobuf "oneof" was originally used, but it adds extra levels of indirection
+  // Set exactly one of these.
   string text = 2;               // un-analyzed text that should yield multiple words when analyzed. ex: "Thomas Anderson"
   repeated string words = 3;     // un-analyzed list of words. ex: ["Yonik","Seeley"]
   repeated string terms = 4;     // analyzed list of terms as strings
@@ -559,7 +544,6 @@ message QueryFacet {
 
 // A "domain" defines a set of documents to do computations over (like facets)
 message Domain {
-  reserved 1, 4;
   Query query = 2;
   optional bool apply_parent_filters = 3;
   repeated Query filter = 5;
@@ -673,22 +657,12 @@ message DocList {
 
 
 message FacetResult {
-  optional sint64 total_buckets =  1; // The total number of buckets *if* it was requested.  This can be expensive to calculate.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
   optional int64 missing = 4; // the number of documents that do not have this field
   map<string, Val> ops = 22;  // sub-operation results performed per bucket, like a sub-facet or statistics.
   int64 offset = 6;
 }
-
-// When facet sub-operations are returned separately, a Bucket is used to represent a single facet bucket
-// as a placeholder in the response for the sub-operation results.
-// Alternatively, we could return a partial result at the top level, with a path specifier.
-message Bucket {
-  Val bucket_id = 1;
-  map<string, Val> ops = 3;
-}
-
 
 //
 //  Indexing
@@ -737,17 +711,9 @@ message UpdateRequest {
   // streaming RPCs.
   string request_id = 1;
 
-  // Reserved for future stream scheduling. Current servers ignore stream_id;
-  // use request_id to correlate responses rather than depending on order.
-  int64 stream_id = 2;
+  string collection = 3; // empty selects the default collection, "main"
 
-  Target collection = 3;
-
-  // Current update handling consumes row maps in docs. The columns member is
-  // reserved for a future aligned-column ingest path; callers must leave it
-  // empty because a non-empty value is not indexed yet.
   repeated Map docs = 4;
-  map<string, Column> columns = 5;
 
   // Document IDs to delete.  Deletes never fail per-id; deleting a nonexistent id
   // is a no-op.
@@ -836,12 +802,6 @@ message UpdateResponse {
 
 
 
-
-// name : value
-message NamedValue {
-  string name = 1;
-  Val val = 2;
-}
 
 message Map {
   // Unordered map of dynamically typed values.
@@ -936,16 +896,7 @@ message ArrVector {
   repeated Vector v = 1;
 }
 
-// although the encoding is the same, the stub mapping is not and could blow up memory for large arrays
-// if we always use 64 byte ints.
-// TODO: if we can do custom decoding, an array that specifies a min/max would be even more efficient
-message ArrInt32 {
-  repeated sint32 v = 1;
-}
-
 message ColStr {
-  // this will cause an additional tag (byte) per string value, but strings are normally somewhat larger anyway
-  // repeated google.protobuf.StringValue v = 1;
   // "" unless a real empty string occurs in the batch, in which case a
   // string greater than every batch value is used (see the
   // ColInt.missing_val sentinel note; the check is exact).
@@ -962,7 +913,7 @@ message Column {
     ColInt col_i = 2;
     ColFloat col_f = 3;
     ColDouble col_d = 4;
-    ArrArrStr multi_s = 5;  // name col_ss? (after dynamic field naming convention in solr)?
+    ArrArrStr multi_s = 5;
     ArrArrInt multi_i = 6;
     ArrArrFloat multi_f = 7;
     ArrArrDouble multi_d = 8;
@@ -1018,59 +969,6 @@ message ColMap {
   repeated Map v = 1;
 }
 
-//
-// Index Management
-//
-
-message IndexInfo {
-  uint64 version = 1;                 // Version of the index format
-  uint64 commit_time = 2;             // Commit time of this index (microseconds since epoch)
-  uint64 index_gen = 3;               // Generation of this index (incremented on each commit)
-  uint64 core_gen = 4;                // Segment composition generation (incremented only when segments change, not deletes)
-  uint64 update_version = 5;          // Highest update version in this index (incremented on each update)
-  uint64 schema_gen = 6;              // Schema generation (incremented on each schema change)
-  repeated SegmentInfo segments = 15; // List if segments in this index
-
-  // Auxiliary indexes built at index scope.  Segment-local overlays live on
-  // SegmentInfo.overlays.
-  repeated AuxIndexInfo aux_indexes = 16;
-}
-
-// An auxiliary index entry built at a particular commit.  Used for both
-// index-level aux indexes and segment-local overlays.
-// Files use the naming convention "s_<name>_<sortable_gen>_<sortable_fnum>".
-message AuxIndexInfo {
-  string kind = 1;             // e.g. "vector_faiss"
-  string field = 2;            // empty if not field-scoped
-  string name = 3;             // unique identifier; convention: "<kind_short>.<field>" (e.g. "vec.title_v")
-  uint64 gen = 4;              // index_gen this aux index was built at
-  uint64 commit_time = 5;      // microseconds since epoch
-  repeated string files = 6;   // segment-style filenames that comprise this aux index
-  bytes opaque_meta = 7;       // kind-specific metadata blob
-
-  // Optional index-level core_gen stamp.  Segment overlays, including vector
-  // ANN overlays, leave this at 0; their validity is segment liveness.
-  // Future index-level aux kinds that embed segment composition may set it and
-  // have writer code invalidate them when core_gen changes.
-  uint64 built_core_gen = 8;
-}
-
-// Per segment information
-message SegmentInfo {
-  uint64 seg_id = 1;                    // Unique identifier for the segment
-  uint64 live_gen = 2;                  // Generation for live docs file (0 = all live, no deletes, no file)
-  uint64 min_version = 3;               // Minimum update version in this segment
-  uint64 max_version = 4;               // Maximum update version in this segment
-  uint64 commit_time = 5;               // First time this segment was committed (microseconds since epoch)
-  int32  max_doc = 6;                   // Number of documents in this segment (ignoring deletes)
-  int32  live_docs = 7;                 // Number of non-deleted documents in this segment
-  uint64 schema_gen = 8;               // Schema generation this segment was indexed under
-
-  // Segment-local auxiliary overlays.  Vector ANN indexes are recorded here
-  // with kind "vector_faiss"; validity is segment liveness, not core_gen.
-  repeated AuxIndexInfo overlays = 9;
-}
-
 message CreateCollectionRequest {
   string name = 1;
   SchemaDef schema = 2;
@@ -1093,11 +991,11 @@ message ListCollectionsResponse {
   repeated string collections = 1;
 }
 
-// Operational statistics. An absent collection target requests every
+// Operational statistics. An empty collection requests every
 // collection on the node; per-segment records are opt-in because they are the
 // only unbounded part of the response.
 message StatsRequest {
-  Target collection = 1;
+  string collection = 1; // empty selects every collection
   bool segments = 2;
 }
 
@@ -1217,9 +1115,9 @@ message IndexRamStats {
 // eviction-refill posture). flush + reset_admission also forgets sightings,
 // so the next request restarts the whole observation ladder (the
 // first-sighting posture). reset_counters zeroes the cumulative stats.
-// Omitting the collection targets every collection.
+// An empty collection targets every collection.
 message CacheControlRequest {
-  Target collection = 1;
+  string collection = 1; // empty selects every collection
   bool flush = 2;
   bool reset_admission = 3;
   bool reset_counters = 4;
@@ -1361,7 +1259,7 @@ message SchemaDef {
 }
 
 message SchemaRequest {
-  Target collection = 1;
+  string collection = 1; // empty selects the default collection, "main"
 
   enum Mode {
     // Each named definition is SET to exactly the request's definition

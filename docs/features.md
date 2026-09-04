@@ -91,8 +91,7 @@ engine is built the way it is.
 - Vector documents use bare number arrays over HTTP and typed
   `Val.vec`/`arr_vec` arms over gRPC. Multi-valued vector fields accept an
   array of number arrays, or a bare array as a one-vector list.
-- Row documents on the current update path. The protobuf `columns` member is
-  reserved but not consumed yet.
+- Row documents through `UpdateRequest.docs`.
 - Update/overwrite by id, delete by id, duplicate-allowed mode, and
   optional per-request atomicity (all-or-none with rollback).
 - Collections auto-create on first write (can be disabled).

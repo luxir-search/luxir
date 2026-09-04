@@ -7,7 +7,7 @@
 #include "luxir/util/MemPool.h"
 
 #include "luxir/api/padded_input.h"
-#include "luxir/api/luxir_types.hpp"
+#include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
 #include <set>

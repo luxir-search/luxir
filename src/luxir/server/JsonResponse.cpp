@@ -456,10 +456,6 @@ void appendFacetResult(std::string& out, const luxir::api::FacetResult& facet) {
     out += R"(,"missing":)";
     appendInt(out, *facet.missing);
   }
-  if (facet.total_buckets.has_value()) {
-    out += R"(,"total_buckets":)";
-    appendInt(out, *facet.total_buckets);
-  }
   out += '}';
 }
 

@@ -661,6 +661,8 @@ private:
       keepAlive_ = false;
       if (match.route == Route::NONE) {
         respondError(ErrorInfo::of(ErrorKind::NOT_FOUND, "no such route: " + std::string(target)));
+      } else if (match.emptyCollection) {
+        respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, "collection name is empty"));
       } else if (!methodAllowed(match.allow, parser_->get().method())) {
         respondMethodNotAllowed(match, parser_->get().method(), target);
       } else if (node_.readOnly() && isMutatingRequest(parser_->get().method(), target)) {
@@ -1099,6 +1101,10 @@ private:
     std::string_view allow;  // the methods the path accepts, as an Allow header value
     std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
     std::string coll;
+    // /collections//{endpoint}: a collection route whose {c} segment is empty.  That
+    // is a malformed URL, not a request for the default collection (which is the
+    // omitted body field), so dispatch rejects it before any handler resolves it.
+    bool emptyCollection = false;
   };
 
   static RouteMatch matchRoute(std::string_view target) {
@@ -1126,6 +1132,9 @@ private:
       m.hint = "schema writes are POST (mode=set adds or replaces the named definitions, "
                "mode=replace_all replaces the whole schema)";
     }
+    bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
+                           m.route == Route::STATS || m.route == Route::SCHEMA;
+    m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
     return m;
   }
 
@@ -1156,6 +1165,10 @@ private:
     RouteMatch match = matchRoute(target);
     if (match.route == Route::NONE) {
       respondError(ErrorInfo::of(ErrorKind::NOT_FOUND, "no such route: " + std::string(target)));
+      return;
+    }
+    if (match.emptyCollection) {
+      respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, "collection name is empty"));
       return;
     }
     if (!methodAllowed(match.allow, req.method())) {
@@ -1275,13 +1288,10 @@ private:
     }
   }
 
-  static void setCollectionTarget(std::optional<luxir::api::Target>& collection,
-                                  const std::string& coll,
+  static void setCollectionTarget(std::string_view& collection,
+                                  std::string_view coll,
                                   std::pmr::memory_resource& resource) {
-    // Collection target: one-element name span, arena-backed (coll is transient).
-    auto& tgt = collection.emplace();
-    std::string_view* nm = luxir::api::build::allocArray(tgt.name, 1, resource);
-    nm[0] = luxir::api::build::arenaStr(resource, coll);
+    collection = luxir::api::build::arenaStr(resource, coll);
   }
 
   // Fill state.proto with the EFFECTIVE request: the parsed body (either dialect
@@ -1357,7 +1367,6 @@ private:
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
-        if (!f->ops.empty()) return "format=docs does not support nested ops";
         // Per-source ops are ignored by fusion execution, but silently discarding
         // authored work behind a format flag would be worse than rejecting it.
         for (const auto& [srcName, src] : f->sources) {
@@ -1449,7 +1458,7 @@ private:
       std::optional<ErrorInfo> failure;
       try {
         std::shared_ptr<Collection> collection =
-            self->node_.resolveOrCreateCollection(state->proto.collection ? &*state->proto.collection : nullptr);
+            self->node_.resolveOrCreateCollection(state->proto.collection);
         auto shard = collection->getShard();
         auto iw = shard->getIndexWriter();
 
@@ -1614,10 +1623,7 @@ private:
     std::string out;
     std::optional<ErrorInfo> failure;
     try {
-      std::pmr::monotonic_buffer_resource targetResource;
-      std::optional<luxir::api::Target> target;
-      setCollectionTarget(target, coll, targetResource);
-      auto collection = node_.resolveCollection(&*target);
+      auto collection = node_.resolveCollection(coll);
       auto schema = collection->getSchema();
       out = renderSchemaBody(*schema);
     } catch (const std::exception& e) {
@@ -1637,7 +1643,7 @@ private:
             std::pmr::monotonic_buffer_resource resource;
             luxir::api::StatsRequest request;
             request.segments = includeSegments;
-            if (coll) setCollectionTarget(request.collection, *coll, resource);
+            if (coll) request.collection = *coll;
 
             luxir::api::StatsResponse response;
             gatherStats(self->node_, request, response, resource);
@@ -1684,10 +1690,7 @@ private:
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
-        std::pmr::monotonic_buffer_resource targetResource;
-        std::optional<luxir::api::Target> target;
-        setCollectionTarget(target, coll, targetResource);
-        auto collection = self->node_.resolveOrCreateCollection(&*target);
+        auto collection = self->node_.resolveOrCreateCollection(coll);
         auto newSchema = collection->updateSchema(state->def, mode);
         out = renderSchemaBody(*newSchema);
       } catch (const std::exception& e) {
@@ -1740,16 +1743,6 @@ private:
         luxir::api::build::allocArray(params.build_aux_indexes, src.build_aux_indexes.size(), resource);
     for (std::size_t i = 0; i < src.build_aux_indexes.size(); i++) {
       names[i] = luxir::api::build::arenaStr(resource, src.build_aux_indexes[i]);
-    }
-  }
-
-  static void copyCollectionTarget(std::optional<luxir::api::Target>& out,
-                                   const luxir::api::Target& src,
-                                   std::pmr::memory_resource& resource) {
-    auto& target = out.emplace();
-    std::string_view* names = luxir::api::build::allocArray(target.name, src.name.size(), resource);
-    for (std::size_t i = 0; i < src.name.size(); i++) {
-      names[i] = luxir::api::build::arenaStr(resource, src.name[i]);
     }
   }
 
@@ -1818,8 +1811,7 @@ private:
       if (name == "request_id" || name == "commit") continue;
       if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "docs" || name == "delete_ids" ||
-          name == "columns" || name == "stream_id" || name == "field_map" ||
-          name == "drop_unmapped") {
+          name == "field_map" || name == "drop_unmapped") {
         err = "_end_ control cannot carry submit-time field '" + std::string(name) + "'";
         return false;
       }
@@ -2023,10 +2015,9 @@ private:
     state.interval.firstDocIndex = state.docsSeen;
   }
 
-  static std::string streamTargetKey(const std::optional<luxir::api::Target>& target,
+  static std::string streamTargetKey(std::string_view target,
                                      const std::string& defaultCollectionName) {
-    if (!target || target->name.empty()) return defaultCollectionName;
-    return std::string(target->name.back());
+    return target.empty() ? defaultCollectionName : std::string(target);
   }
 
   static std::string_view currentStreamResponseRequestId(const HttpStreamUpdateState& state) {
@@ -2185,10 +2176,7 @@ private:
     if (!inserted) return &it->second;
 
     try {
-      std::pmr::monotonic_buffer_resource targetResource;
-      std::optional<luxir::api::Target> target;
-      setCollectionTarget(target, collectionName, targetResource);
-      it->second.collection = node_.resolveOrCreateCollection(&*target);
+      it->second.collection = node_.resolveOrCreateCollection(collectionName);
       it->second.indexWriter = it->second.collection->getShard()->getIndexWriter();
     } catch (...) {
       err = currentExceptionInfo(ErrorKind::INTERNAL);
@@ -2202,8 +2190,8 @@ private:
     auto state = streamUpdate_;
     assert(state != nullptr);
     batch.collectionName = state->group.collectionName;
-    if (state->group.request && state->group.request->proto.collection) {
-      copyCollectionTarget(batch.proto.collection, *state->group.request->proto.collection, batch.resource);
+    if (state->group.request && !state->group.request->proto.collection.empty()) {
+      setCollectionTarget(batch.proto.collection, state->group.request->proto.collection, batch.resource);
     } else {
       setCollectionTarget(batch.proto.collection, state->group.collectionName, batch.resource);
     }
@@ -2356,7 +2344,7 @@ private:
     applyStreamBatchFieldMap(*state, *state->batch);
     state->batch->proto.return_ids =
         state->group.returnIds() && state->interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds;
-    if (!state->batch->proto.collection) {
+    if (state->batch->proto.collection.empty()) {
       setCollectionTarget(state->batch->proto.collection, state->group.collectionName, state->batch->resource);
     }
     state->emitAfterBatch = true;

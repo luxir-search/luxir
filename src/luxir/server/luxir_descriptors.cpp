@@ -29,13 +29,4 @@ void registerLuxirDescriptors() {
   }
 }
 
-bool luxirSchemaResolves() {
-  const auto *pool = google::protobuf::DescriptorPool::generated_pool();
-  const auto *svc = pool->FindServiceByName("luxir.Searcher");
-  return svc != nullptr && svc->FindMethodByName("Search") != nullptr &&
-         pool->FindServiceByName("luxir.Indexer") != nullptr &&
-         pool->FindServiceByName("luxir.Admin") != nullptr &&
-         pool->FindMessageTypeByName("luxir.proto.SearchRequest") != nullptr;
-}
-
 } // namespace luxir

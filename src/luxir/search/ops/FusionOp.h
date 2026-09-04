@@ -37,8 +37,10 @@ namespace luxir {
 // source as its domain.  Per-source filters (if any) are intersected by
 // the source's TopDocsReq with the incoming domain.
 //
-// V1 limitations: top-level Fusion sub-ops (over the union of source
-// matches) are not yet wired; the parser rejects them.
+// A source's TopDocs.ops do not execute because source TopDocs contribute only
+// ranked inputs to the fused result. A facet with selected under a source is
+// rejected rather than silently dropped. Put result-shaping ops on a separate
+// TopDocs request instead.
 class FusionOp : public SearchOp {
 public:
   const ReqFusion& fusionProto;

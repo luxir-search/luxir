@@ -12,7 +12,6 @@
 #include <grpcpp/alarm.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
-#include <absl/strings/str_cat.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
@@ -22,8 +21,6 @@
 #include "GRPCServer.h"
 #include "LuxirNode.h"
 #include "luxir/api/padded_input.h"
-#include "luxir/api/luxir.hpp"
-#include "luxir/util/random.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/TaggedPtr.h"
 #include "luxir/util/thread.h"
@@ -173,8 +170,6 @@ using StatsReqProto = luxir::api::StatsRequest;
 using StatsRespProto = luxir::api::StatsResponse;
 using CacheControlReqProto = luxir::api::CacheControlRequest;
 using CacheControlRespProto = luxir::api::CacheControlResponse;
-using HelloReqProto = luxir::api::HelloRequest;
-using HelloRespProto = luxir::api::HelloReply;
 
 template <typename Message>
 struct HppRequestState {
@@ -218,7 +213,7 @@ static grpc::StatusCode grpcStatusCode(ErrorKind kind) {
 }
 
 // The transport status for a classified failure: the kind's gRPC code, the
-// message, and the luxir.proto.Error packed into google.rpc.Status details so
+// message, and the luxir.Error packed into google.rpc.Status details so
 // a generated client can read the stable code and kind.
 static grpc::Status grpcStatus(const ErrorInfo& info) {
   grpc::StatusCode code = grpcStatusCode(info.kind);
@@ -400,8 +395,7 @@ public:
   }
 
   // Callable from any thread: finish evaluation goes through kickFinish so
-  // Finish is only ever initiated on this call's cq thread (handlers may run
-  // this from task-arena workers, e.g. async SayHelloStreaming).
+  // Finish is only ever initiated on this call's cq thread.
   void decrementOutstanding(int32_t finishCount = 1) {
     const std::lock_guard<std::mutex> lock(mutex);
     responsesExpected -= finishCount;
@@ -545,24 +539,19 @@ public:
 };
 
 
-// Helper to resolve a Collection from a Target proto
-static std::shared_ptr<Collection> resolveCollection(GRPCServer& server, const luxir::api::Target* target) {
-  return server.getLuxirNode().resolveCollection(target);
-}
-
 static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
-                                                     const std::optional<luxir::api::Target>& target) {
-  return resolveCollection(server, target.has_value() ? &*target : nullptr);
+                                                     std::string_view collection) {
+  return server.getLuxirNode().resolveCollection(collection);
 }
 
 template <typename Request>
 static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  return server.getLuxirNode().resolveOrCreateCollection(request.collection.has_value() ? &*request.collection : nullptr);
+  return server.getLuxirNode().resolveOrCreateCollection(request.collection);
 }
 
 static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server,
-                                                              const std::optional<luxir::api::Target>& target) {
-  return server.getLuxirNode().resolveOrCreateCollection(target.has_value() ? &*target : nullptr);
+                                                              std::string_view collection) {
+  return server.getLuxirNode().resolveOrCreateCollection(collection);
 }
 
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
@@ -911,75 +900,6 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   }
 }
 
-//   rpc SayHello(HelloRequest) returns (HelloReply)  [unary] - demo
-static void handleSayHello(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<HelloReqProto> request;
-  if (!parseRequest(readBuf, request, "SayHello")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SayHello: malformed request"));
-    return;
-  }
-  HelloRespProto response;
-  // response.message is a non-owning string_view; keep the backing string alive until
-  // after serialize (StrCat returns a temporary that would otherwise dangle).
-  std::string message = absl::StrCat("Hello ", request.proto.name);
-  response.message = message;
-  call.respondRaw(serializeToByteBuffer(response), 1);
-}
-
-//   rpc SayHello2(HelloRequest) returns (HelloReply)  [unary] - demo
-static void handleSayHello2(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<HelloReqProto> request;
-  if (!parseRequest(readBuf, request, "SayHello2")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SayHello2: malformed request"));
-    return;
-  }
-  HelloRespProto response;
-  std::string message = absl::StrCat("Hello2 ", request.proto.name);
-  response.message = message;
-  call.respondRaw(serializeToByteBuffer(response), 1);
-}
-
-//   rpc SayHelloStreaming(stream HelloRequest) returns (stream HelloReply) - demo
-// Each request produces response_count replies (>=1), optionally async, optionally
-// sleeping between min/max us.  Response bytes are owned, so we copy the few fields we
-// need and decouple from the request entirely.
-static void handleSayHelloStreaming(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<HelloReqProto> request;
-  if (!parseRequest(readBuf, request, "SayHelloStreaming")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SayHelloStreaming: malformed request"));
-    return;
-  }
-  std::string name = std::string(request.proto.name);
-  int count = std::max(1, request.proto.response_count);
-  int minSleepUs = request.proto.min_sleep_us;
-  int maxSleepUs = request.proto.max_sleep_us;
-  bool async = request.proto.async;
-
-  auto produce = [&call, name, count, minSleepUs, maxSleepUs]() {
-    for (int i = 0; i < count; i++) {
-      if (maxSleepUs > 0) {
-        auto now = std::chrono::high_resolution_clock::now();
-        luxir::Rng rng(now.time_since_epoch().count());
-        auto sleepUs = rng.rint(minSleepUs, maxSleepUs);
-        std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
-      }
-      HelloRespProto reply;
-      std::string message = absl::StrCat("Hello ", name);  // keep alive past serialize (non-owning view)
-      reply.message = message;
-      reply.response_number = i + 1;
-      call.respondRaw(serializeToByteBuffer(reply), 0);  // intermediate; balance with decrementOutstanding below
-    }
-    call.decrementOutstanding(1);  // this request is now fully answered
-  };
-
-  if (async) {
-    call.server.getLuxirNode().getTaskArena().enqueue(produce);
-  } else {
-    produce();
-  }
-}
-
-
 // ---- method routing ------------------------------------------------------
 
 static const MethodEntry* lookupMethod(const std::string& method) {
@@ -993,9 +913,6 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
     {"/luxir.Admin/Stats",              {handleStats}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl}},
-    {"/luxir.Greeter/SayHello",         {handleSayHello}},
-    {"/luxir.Greeter/SayHello2",        {handleSayHello2}},
-    {"/luxir.Greeter/SayHelloStreaming",{handleSayHelloStreaming}},
   };
   auto it = table.find(method);
   return it == table.end() ? nullptr : &it->second;

@@ -98,7 +98,9 @@ locations, browse `src/luxir/<area>/`.
 ## Proto Files
 
 Protocol buffer definitions are in `protos/`:
-- `luxir.proto`: Main service definitions
-- `luxir_types.proto`: Common type definitions
+- `luxir.proto`: Public service definitions only
+- `luxir_types.proto`: Public request, response, and value definitions
+- `luxir_index.proto`: Internal on-disk commit manifest, excluded from gRPC reflection
 
-Generated files are output to the build directory (`build/<preset>/protos/*.pb.h`).
+The public and internal wire structs are handwritten in `src/luxir/api/`.
+hpp-proto generates their binary and JSON metadata into the build directory.

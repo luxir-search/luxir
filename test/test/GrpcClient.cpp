@@ -56,7 +56,7 @@ std::string grpcSerialize(const luxir::api::CreateCollectionRequest& msg, grpc::
 std::string grpcSerialize(const luxir::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out) {
   return serialize(msg, out);
 }
-std::string grpcSerialize(const luxir::api::HelloRequest& msg, grpc::ByteBuffer& out) {
+std::string grpcSerialize(const luxir::api::SchemaRequest& msg, grpc::ByteBuffer& out) {
   return serialize(msg, out);
 }
 
@@ -80,7 +80,7 @@ std::string grpcParse(luxir::api::DeleteCollectionResponse& msg, const grpc::Byt
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {
   return parse(msg, in, storage, arena);
 }
-std::string grpcParse(luxir::api::HelloReply& msg, const grpc::ByteBuffer& in,
+std::string grpcParse(luxir::api::SchemaResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {
   return parse(msg, in, storage, arena);
 }

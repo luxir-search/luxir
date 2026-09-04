@@ -6,6 +6,7 @@
 #include "luxir/store/InputStream.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"

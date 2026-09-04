@@ -361,7 +361,7 @@ public:
         && placement != OpsPlacement::REQUEST_ROOT
         && placement != OpsPlacement::TOP_DOCS) {
       std::string location = placement == OpsPlacement::FUSION
-          ? "Fusion.ops" : "a facet bucket";
+          ? "a fusion source's ops" : "a facet bucket";
       throw std::runtime_error(
           "op '" + std::string(name) + "' under " + location
           + ": domain is only supported for ops dispatched by the request "
@@ -460,7 +460,7 @@ public:
     if (placement != OpsPlacement::TOP_DOCS) {
       std::string location = placement == OpsPlacement::REQUEST_ROOT
           ? "request root"
-          : placement == OpsPlacement::FUSION ? "Fusion.ops"
+          : placement == OpsPlacement::FUSION ? "a fusion source's ops"
                                               : "nested facet bucket";
       throw std::runtime_error("facet '" + std::string(facetName) + "' at "
           + location
@@ -1355,7 +1355,7 @@ public:
       }
     }
     auto explicitFilters = parseFilters(
-        parser, topDocsReq.filter, topDocsReq.ops, false);
+        parser, topDocsReq.filter, &topDocsReq.ops, "top_docs.filter");
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(
@@ -1827,19 +1827,18 @@ public:
   std::span<ParsedFilter> parseFilters(
       ProtobufQueryParser& parser,
       std::span<const luxir::api::Filter> filtersProto,
-      OpsMap siblingOps, bool fusion) {
+      const OpsMap* siblingOps, std::string_view pathPrefix) {
     std::span<ParsedFilter> out;
     if (!filtersProto.empty()) {
       out = req.requestPool.make_span<ParsedFilter>(filtersProto.size());
       for (size_t i = 0; i < filtersProto.size(); i++) {
         auto& f = filtersProto[i];
-        std::string path = (fusion ? "fusion.filter[" : "top_docs.filter[")
-            + std::to_string(i) + "]";
+        std::string path = std::string(pathPrefix) + "[" + std::to_string(i) + "]";
         if (!f.query.has_value()
             || std::holds_alternative<std::monostate>(f.query->kind)) {
           throw std::runtime_error(path + ".query requires a query kind");
         }
-        if (fusion && !f.except_ops.empty()) {
+        if (siblingOps == nullptr && !f.except_ops.empty()) {
           throw std::runtime_error(path
               + ".except_ops is not supported on Fusion filters");
         }
@@ -1849,7 +1848,7 @@ public:
             throw std::runtime_error(path + ".except_ops[" + std::to_string(j)
                 + "] contains '/'; deeper paths are reserved");
           }
-          if (!siblingOps.contains(key)) {
+          if (!siblingOps->contains(key)) {
             throw std::runtime_error(path + ".except_ops contains unknown sibling op key '"
                 + std::string(key) + "'");
           }
@@ -1866,27 +1865,6 @@ public:
   }
 
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto) {
-    for (const auto& [childName, childView] : lastWins(fusionProto.ops)) {
-      const api::SearchOp& child = **childView;
-      if (child.domain.has_value()) {
-        throw std::runtime_error(
-            "op '" + std::string(childName)
-            + "' under Fusion.ops: domain is only supported for ops "
-              "dispatched by the request root or TopDocs");
-      }
-      if (const auto* facet = std::get_if<api::FieldFacet>(&child.kind)) {
-        validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
-      } else if (const auto* facet =
-                     std::get_if<api::RangeFacet>(&child.kind)) {
-        validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
-      } else if (const auto* facet =
-                     std::get_if<api::QueryFacet>(&child.kind)) {
-        validateSelectionEnvelope(childName, *facet, OpsPlacement::FUSION);
-      }
-    }
-    if (!fusionProto.ops.empty()) {
-      throw std::runtime_error("Fusion sub-ops are not yet supported");
-    }
     if (fusionProto.sources.empty()) {
       throw std::runtime_error("Fusion requires at least one source");
     }
@@ -1921,7 +1899,8 @@ public:
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
     ProtobufQueryParser parser(parseContext);
-    auto sharedFilters = parseFilters(parser, fusionProto.filter, fusionProto.ops, true);
+    auto sharedFilters = parseFilters(
+        parser, fusionProto.filter, nullptr, "fusion.filter");
     // Reuse the first source's execution Context when it has one. A fully
     // resident source may be Context-free, in which case shared filter
     // Weights are unresolved execution and create the Context here.

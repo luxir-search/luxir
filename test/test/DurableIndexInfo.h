@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 #include "luxir/api/padded_input.h"
-#include "luxir/api/luxir_types.hpp"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/reader/Postings.h"
 #include "luxir/store/Directory.h"
 

@@ -59,21 +59,20 @@ enum class NullValue { NULL_VALUE = 0 };
 namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
-struct Target; struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
+struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
-struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
-struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
+struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
+struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
-struct ArrArrDouble; struct ArrArrBin; struct Vector; struct ArrVector; struct ArrInt32;
+struct ArrArrDouble; struct ArrArrBin; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
-struct ColFloat; struct ColDouble; struct ColMap; struct IndexInfo; struct AuxIndexInfo;
-struct SegmentInfo; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
+struct ColFloat; struct ColDouble; struct ColMap; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
@@ -109,7 +108,6 @@ namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
 
-struct Target { std::span<const std::string_view> name; };
 struct RrfFusion { int32_t k = 0; };
 struct CalendarGap {
   using Unit = luxir::api::CalendarGap_::Unit;
@@ -177,23 +175,11 @@ struct ArrInt { std::span<const std::int64_t> v; };
 struct ArrFloat { std::span<const float> v; };
 struct ArrDouble { std::span<const double> v; };
 struct ArrBin { std::span<const ::hpp_proto::bytes_view> v; };
-struct ArrInt32 { std::span<const std::int32_t> v; };
-
 struct ColStr { std::string_view missing_val; std::span<const std::string_view> v; };
 struct ColInt { int64_t missing_val = 0; std::span<const std::int64_t> v; };
 struct ColFloat { float missing_val = 0.0f; std::span<const float> v; };
 struct ColDouble { double missing_val = 0.0; std::span<const double> v; };
 
-struct AuxIndexInfo {
-  std::string_view kind;
-  std::string_view field;
-  std::string_view name;
-  uint64_t gen = 0;
-  uint64_t commit_time = 0;
-  std::span<const std::string_view> files;
-  ::hpp_proto::bytes_view opaque_meta;
-  uint64_t built_core_gen = 0;
-};
 struct AnalyzerDef { std::string_view tokenizer; std::span<const std::string_view> filters; };
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
@@ -212,28 +198,6 @@ struct FieldDef {
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
 };
-struct SegmentInfo {
-  uint64_t seg_id = 0;
-  uint64_t live_gen = 0;
-  uint64_t min_version = 0;
-  uint64_t max_version = 0;
-  uint64_t commit_time = 0;
-  uint64_t schema_gen = 0;
-  std::span<const AuxIndexInfo> overlays;
-  int32_t max_doc = 0;
-  int32_t live_docs = 0;
-};
-struct IndexInfo {
-  uint64_t version = 0;
-  uint64_t commit_time = 0;
-  uint64_t index_gen = 0;
-  uint64_t core_gen = 0;
-  uint64_t update_version = 0;
-  uint64_t schema_gen = 0;
-  std::span<const SegmentInfo> segments;
-  std::span<const AuxIndexInfo> aux_indexes;
-};
-
 struct AuxStats {
   std::string_view kind;
   std::string_view field;
@@ -312,14 +276,14 @@ struct CollectionStats {
   std::span<const ShardStats> shards;
   std::optional<Error> error;
 };
-struct StatsRequest { std::optional<Target> collection; bool segments = false; };
+struct StatsRequest { std::string_view collection; bool segments = false; };
 struct StatsResponse {
   StatsTotals totals;
   std::span<const CollectionStats> collections;
   IndexRamStats indexing_ram;
 };
-struct CacheControlRequest {                                    // needs Target
-  std::optional<Target> collection;
+struct CacheControlRequest {
+  std::string_view collection;
   uint32_t dump_limit = 0;
   bool flush = false;
   bool reset_admission = false;
@@ -372,9 +336,9 @@ struct SchemaDef {
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
 struct SchemaResponse { std::optional<SchemaDef> schema; };      // needs SchemaDef
-struct SchemaRequest {                                           // needs Target, SchemaDef
+struct SchemaRequest {                                           // needs SchemaDef
   using Mode = luxir::api::SchemaRequest_::Mode;
-  std::optional<Target> collection;
+  std::string_view collection;
   std::optional<SchemaDef> schema;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };
@@ -423,7 +387,6 @@ struct Fusion {                                                  // needs TopDoc
   std::optional<std::int64_t> limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
-  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is one int32)
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
@@ -459,9 +422,9 @@ struct QueryFacet {
   ::hpp_proto::optional_indirect_view<Val> selected;
   SelectionMode selection_mode = SelectionMode::ANY;
 };
-struct SearchRequest {                                          // needs Target
+struct SearchRequest {
   std::string_view request_id;
-  std::optional<Target> collection;
+  std::string_view collection;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   uint64_t freshness_ms = 0;
   std::string_view time_zone;
@@ -470,10 +433,6 @@ struct SearchRequest {                                          // needs Target
   std::int32_t max_parallel = 0;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
-struct Bucket {
-  ::hpp_proto::optional_indirect_view<Val> bucket_id;
-  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
-};
 struct DocList {                                                // needs Column (map by value)
   std::optional<std::int64_t> found;
   map_view<std::string_view, Column> columns;
@@ -486,7 +445,6 @@ struct DocList {                                                // needs Column 
   bool more = false;
 };
 struct FacetResult {                                           // needs Column (optional)
-  std::optional<std::int64_t> total_buckets;
   std::optional<Column> bucket_ids;
   std::span<const std::int64_t> counts;
   std::optional<std::int64_t> missing;
@@ -554,7 +512,6 @@ struct SearchResponse {
   std::optional<ExecutionProfile> profile;
   bool more = false;
 };
-struct NamedValue { std::string_view name; ::hpp_proto::optional_indirect_view<Val> val; };
 struct Match {
   using Operator = luxir::api::Match_::Operator;
   std::string_view field;
@@ -618,14 +575,10 @@ struct Query {                                                 // needs Match,An
                AnyOfQuery>
       kind;
 };
-struct UpdateRequest {                                         // needs Target,Column,CommitParams
+struct UpdateRequest {                                         // needs CommitParams
   std::string_view request_id;
-  int64_t stream_id = 0;
-  std::optional<Target> collection;
-  // Same pair, same contract as DocList: document i is columns row i merged
-  // with docs[i]; a field name never appears in both.
+  std::string_view collection;
   std::span<const Map> docs;
-  map_view<std::string_view, Column> columns;
   std::span<const std::string_view> delete_ids;
   std::optional<CommitParams> commit;
   // Input doc key -> schema field for this request's docs ("" target = drop the key).
@@ -638,7 +591,7 @@ struct UpdateRequest {                                         // needs Target,C
 
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
-LUXIR_TD(Target) LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
+LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
@@ -647,14 +600,14 @@ LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
-LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult) LUXIR_TD(Bucket)
-LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(NamedValue) LUXIR_TD(Map)
+LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
+LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
-LUXIR_TD(ArrArrDouble) LUXIR_TD(ArrArrBin) LUXIR_TD(Vector) LUXIR_TD(ArrVector) LUXIR_TD(ArrInt32)
+LUXIR_TD(ArrArrDouble) LUXIR_TD(ArrArrBin) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
-LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap) LUXIR_TD(IndexInfo) LUXIR_TD(AuxIndexInfo)
-LUXIR_TD(SegmentInfo) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
+LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap)
+LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
@@ -676,7 +629,7 @@ LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
                  std::string *error = nullptr);                                              \
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
-LUXIR_ENTRY(Target) LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
+LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
@@ -686,15 +639,14 @@ LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTR
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
-LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(Bucket) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
-LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(NamedValue) LUXIR_ENTRY(Map)
+LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
+LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)
 LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(ArrArrBin) LUXIR_ENTRY(Vector)
-LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ArrInt32) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
+LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
-LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(ColMap) LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(AuxIndexInfo)
-LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
+LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(ColMap) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)

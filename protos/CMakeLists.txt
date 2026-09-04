@@ -45,7 +45,7 @@ hpp_proto_generate(OUT_VAR _concrete_srcs OUT_DIR "${_concrete_gen}" CONCRETE SN
   CONCRETE_NAMESPACE luxir.api   # -> namespace luxir::api (coexists with templated luxir::proto)
   IMPORT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}" "${_pb_inc}"
   PROTOS "${CMAKE_CURRENT_SOURCE_DIR}/luxir_types.proto"
-         "${CMAKE_CURRENT_SOURCE_DIR}/luxir.proto")
+         "${CMAKE_CURRENT_SOURCE_DIR}/luxir_index.proto")
 # EXCLUDE_FROM_ALL until the engine flip: built on demand (the concrete tests link it);
 # at flip time luxir_lib links it and it joins the default build.
 add_library(luxir_proto_concrete STATIC EXCLUDE_FROM_ALL ${_concrete_srcs})
@@ -60,7 +60,7 @@ set_target_properties(luxir_proto_concrete PROPERTIES CXX_STANDARD 26 CXX_STANDA
 # the dialect is in scope before any glz::meta below. The .pb.cpp (binary codec) is
 # deliberately left alone: it must not pay for glaze.
 foreach(_src ${_concrete_srcs})
-  if(_src MATCHES "\\.json\\.cpp$")
+  if(_src MATCHES "luxir_types\\.json\\.cpp$")
     set_source_files_properties("${_src}" TARGET_DIRECTORY luxir_proto_concrete PROPERTIES
       COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/luxir/api/luxir_types_json.hpp")
   endif()

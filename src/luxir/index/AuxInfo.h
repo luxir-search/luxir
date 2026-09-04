@@ -16,7 +16,7 @@
 #include <hpp_proto/field_types.hpp>  // bytes_view
 
 #include "luxir/api/build.h"
-#include "luxir/api/luxir_types.hpp"
+#include "luxir/api/luxir_index.hpp"
 
 namespace luxir {
 

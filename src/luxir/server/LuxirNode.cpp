@@ -221,22 +221,8 @@ std::shared_ptr<Collection> LuxirNode::getCollection(Library* library, std::stri
   throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
 }
 
-std::shared_ptr<Collection> LuxirNode::resolveCollection(const luxir::api::Target* target) {
-  std::shared_ptr<Library> library = getLibrary(nullptr, "");
-  std::shared_ptr<Collection> collection;
-  if (target != nullptr) {
-    for (int i = 0; i < (int)target->name.size(); i++) {
-      if (i == (int)target->name.size() - 1) {
-        collection = getCollection(library.get(), target->name[i]);
-      } else {
-        library = getLibrary(library.get(), target->name[i]);
-      }
-    }
-  }
-  if (!collection) {
-    collection = getCollection(kDefaultCollectionName);
-  }
-  return collection;
+std::shared_ptr<Collection> LuxirNode::resolveCollection(std::string_view name) {
+  return getCollection(name.empty() ? kDefaultCollectionName : name);
 }
 
 std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(std::string_view name) {
@@ -266,22 +252,8 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, s
   return checkLoaded(std::move(collection));
 }
 
-std::shared_ptr<Collection> LuxirNode::resolveOrCreateCollection(const luxir::api::Target* target) {
-  std::shared_ptr<Library> library = getLibrary(nullptr, "");
-  std::shared_ptr<Collection> collection;
-  if (target != nullptr) {
-    for (int i = 0; i < (int)target->name.size(); i++) {
-      if (i == (int)target->name.size() - 1) {
-        collection = getOrCreateCollection(library.get(), target->name[i]);
-      } else {
-        library = getLibrary(library.get(), target->name[i]);
-      }
-    }
-  }
-  if (!collection) {
-    collection = getOrCreateCollection(kDefaultCollectionName);
-  }
-  return collection;
+std::shared_ptr<Collection> LuxirNode::resolveOrCreateCollection(std::string_view name) {
+  return getOrCreateCollection(name.empty() ? kDefaultCollectionName : name);
 }
 
 std::vector<LuxirNode::CollectionEntry> LuxirNode::collectionEntries() {

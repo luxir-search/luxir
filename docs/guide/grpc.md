@@ -9,6 +9,9 @@ are the source of truth:
 - [`protos/luxir_types.proto`](../../protos/luxir_types.proto) defines search,
   update, schema, document, facet, and response messages.
 
+Both files use the `luxir` package, so services and their request and response
+types share one namespace (for example, `luxir.SearchRequest`).
+
 The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 `9400`. Override it with `--server.grpc.port`.
 
@@ -94,13 +97,9 @@ placed in a dense column. A document row is the merge of `columns[i]` and
 returns one `UpdateResponse` for each. Each message has its own overwrite,
 atomicity, return-ID, and commit settings; all-or-none never spans messages.
 `request_id` is echoed so responses can be associated without depending on
-completion timing. Responses may complete out of request order. The current
-server ignores `stream_id`; it does not create a serialized substream.
+completion timing. Responses may complete out of request order.
 
-Send documents through the repeated `docs` row maps. Although `UpdateRequest`
-already reserves a `columns` map for a future aligned-column representation,
-the current handler returns without indexing when it is non-empty and does not
-yet report that as an error. Do not populate `columns`. Row maps use the field
+Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
 
 ## Errors
@@ -110,7 +109,7 @@ A unary method fails with a gRPC status whose code follows the error's
 `FAILED_PRECONDITION`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, or `INTERNAL`.
 The status message is the human detail, and the status details
 (`grpc-status-details-bin`) carry a `google.rpc.Status` whose single detail is
-the `luxir.proto.Error` message, so a generated client reads the stable `code`
+the `luxir.Error` message, so a generated client reads the stable `code`
 and `kind` without parsing text. A request that does not decode as its
 method's message is `INVALID_ARGUMENT`.
 

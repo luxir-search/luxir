@@ -17,7 +17,7 @@
 
 namespace luxir {
 
-// Mirrors luxir.proto.Error.Kind value for value (api/build.h asserts the
+// Mirrors luxir.Error.Kind value for value (api/build.h asserts the
 // pairing).  Default transport mapping, refined per code by the transports:
 //   INVALID_REQUEST      HTTP 400  gRPC INVALID_ARGUMENT
 //   NOT_FOUND            HTTP 404  gRPC NOT_FOUND

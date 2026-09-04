@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "AuxReader.h"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"

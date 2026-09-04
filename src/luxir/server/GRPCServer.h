@@ -5,10 +5,6 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
 #include "LuxirNode.h"
-// The server itself serves everything through the generic service in the .cpp.
-// This hpp-proto metadata include is kept for callers that still pick it up
-// transitively while the client side migration catches up.
-#include "luxir/api/luxir.hpp"
 
 namespace luxir {
 

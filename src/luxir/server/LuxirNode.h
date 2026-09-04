@@ -22,8 +22,6 @@
 
 namespace luxir {
 
-namespace api { struct Target; }
-
 /// There should normally be a single LuxirNode instance per process.
 /// A single LuxirNode can host many indexes.
 /// There still *may* be multiple LuxirNode instances per process, but it's currently more for testing.
@@ -193,8 +191,8 @@ public:
   std::shared_ptr<Collection> getCollection(std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(std::string_view name);
 
-  std::shared_ptr<Collection> resolveCollection(const luxir::api::Target* target);
-  std::shared_ptr<Collection> resolveOrCreateCollection(const luxir::api::Target* target);
+  std::shared_ptr<Collection> resolveCollection(std::string_view name);
+  std::shared_ptr<Collection> resolveOrCreateCollection(std::string_view name);
 
   // Snapshot fully-created root collections without waiting for creations in
   // flight. Unavailable tombstones retain their recorded error.
@@ -202,19 +200,6 @@ public:
 
   std::shared_ptr<Collection> getCollection(Library* library, std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(Library* library, std::string_view name);
-
-  std::shared_ptr<Library> getLibrary(std::string_view name) {
-    unused(name);
-    return root; // TODO: temporary
-  }
-
-  std::shared_ptr<Library> getLibrary(Library* parent, std::string_view name) {
-    unused(parent, name);
-    if (parent == nullptr) {
-      return root;
-    }
-    return root; // TODO: look up sub-library
-  }
 
   std::shared_ptr<Library> createLibrary(std::string_view name) {
     unused(name);

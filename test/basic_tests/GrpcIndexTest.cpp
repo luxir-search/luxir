@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -512,47 +513,34 @@ TEST_F(GrpcIndexTest, maxSegmentsCommitDurablyPublishesMergedLayout) {
 }
 
 
-TEST_F(GrpcIndexTest, streamingHello) {
-  luxir::api::HelloRequest req;
-  Reply<luxir::api::HelloReply> result;
+TEST_F(GrpcIndexTest, streamingSearch) {
+  TrivialSearchRequest fixture;
+  Reply<luxir::api::SearchResponse> result;
   grpc::ClientContext context;  // need a new one for each RPC
 
   // The grpc write and read interfaces are specified to be thread-safe with respect to each other, which should mean
   // that we can have a separate thread reading responses while the main thread is writing requests.
-  HppClientReaderWriter<luxir::api::HelloRequest, luxir::api::HelloReply> stream(
-    channel.get(), rpc::SayHelloStreaming, &context);
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+    channel.get(), rpc::Search, &context);
 
-  req.async = false;
-  req.min_sleep_us = 1;
-  req.max_sleep_us = 100;
-
-  int numRequests = 0;
-  req.name = "A";
-  bool wrote = stream.Write(req);
-  ASSERT_TRUE(wrote);
-  numRequests++;
-
-  req.name = "B";
-  wrote = stream.Write(req);
-  ASSERT_TRUE(wrote);
-  numRequests++;
-
-  req.name = "C";
-  req.response_count = 2;
-  wrote = stream.Write(req);
-  ASSERT_TRUE(wrote);
-  numRequests += 2;
+  constexpr std::array<std::string_view, 3> ids = {"A", "B", "C"};
+  for (std::string_view id : ids) {
+    fixture.request.request_id = id;
+    ASSERT_TRUE(stream.Write(fixture.request));
+  }
 
   bool ok1 = stream.WritesDone();  // can replace with WriteLast? is it more efficient?
   ASSERT_TRUE(ok1);
 
-  int numResponses = 0;
+  std::array<bool, ids.size()> received{};
   while (stream.Read(&result)) {
-    numResponses++;
-    GRPC_DEBUG("CLIENT RESULT: {}", result.msg.message);
+    EXPECT_FALSE(result.msg.more);
+    auto it = std::find(ids.begin(), ids.end(), result.msg.request_id);
+    ASSERT_NE(ids.end(), it);
+    received[(size_t)(it - ids.begin())] = true;
   }
 
-  ASSERT_EQ(numRequests, numResponses);
+  EXPECT_TRUE(std::ranges::all_of(received, [](bool value) { return value; }));
 
   grpc::Status status = stream.Finish();
   GRPC_DEBUG("CLIENT FINISHED");
@@ -561,56 +549,40 @@ TEST_F(GrpcIndexTest, streamingHello) {
 }
 
 
-// Single streaming request with many requests + multiple responses per request over that stream.
-// Commenting out the lock guard in BiStreamingRequest::respond() should cause this test to fail sometimes.
-TEST_F(GrpcIndexTest, streamingHello2) {
-  Rng r = LuxirTest::rng;
-
-  luxir::api::HelloRequest req;
-  Reply<luxir::api::HelloReply> result;
+// One stream with many requests and a reader active while the writer sends.
+TEST_F(GrpcIndexTest, streamingSearchConcurrentReadWrite) {
+  TrivialSearchRequest fixture;
+  Reply<luxir::api::SearchResponse> result;
   grpc::ClientContext context;  // need a new one for each RPC
 
-  HppClientReaderWriter<luxir::api::HelloRequest, luxir::api::HelloReply> stream(
-    channel.get(), rpc::SayHelloStreaming, &context);
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+    channel.get(), rpc::Search, &context);
 
   oneapi::tbb::task_group tasks;
 
   const int64_t numRequests = 100;
-  int64_t numResponsesExpected = 0;
-  int64_t numResponses = 0;
+  std::vector<bool> received((size_t)numRequests);
 
   tasks.run(
           [&] {
             while (stream.Read(&result)) {
-              numResponses++;
-              /*
-              GRPC_DEBUG("CLIENT RESULT: {}", result.msg.message);
-               */
+              EXPECT_FALSE(result.msg.more);
+              int64_t id = -1;
+              auto [ptr, ec] = std::from_chars(
+                  result.msg.request_id.data(),
+                  result.msg.request_id.data() + result.msg.request_id.size(), id);
+              ASSERT_EQ(std::errc(), ec);
+              ASSERT_EQ(result.msg.request_id.data() + result.msg.request_id.size(), ptr);
+              ASSERT_GE(id, 0);
+              ASSERT_LT(id, numRequests);
+              received[(size_t)id] = true;
             }
           });
 
-  int sleepMin = 1;
-  int sleepMax = 20;
-  int maxResponsesPerRequest = 4;
-
-  req.name = "A";
   for (int i=0; i<numRequests; i++) {
-    req.async = true;
-    if (r.rbool()) {
-      req.min_sleep_us = sleepMin;
-      req.max_sleep_us = sleepMax;
-    } else {
-      req.min_sleep_us = 0;
-      req.max_sleep_us = 0;
-    }
-    req.min_sleep_us = sleepMin;
-    req.max_sleep_us = sleepMax;
-    int responseCount = r.rint(maxResponsesPerRequest) + 1;
-    req.response_count = responseCount;
-    numResponsesExpected += responseCount;
-
-    bool wrote = stream.Write(req);
-    ASSERT_TRUE(wrote);
+    std::string id = std::to_string(i);
+    fixture.request.request_id = id;
+    ASSERT_TRUE(stream.Write(fixture.request));
   }
 
   bool ok = stream.WritesDone();
@@ -619,7 +591,7 @@ TEST_F(GrpcIndexTest, streamingHello2) {
   // Wait to read all responses.  How to do a timeout if one never comes?
   tasks.wait();
 
-  ASSERT_EQ(numResponsesExpected, numResponses);
+  EXPECT_TRUE(std::ranges::all_of(received, [](bool value) { return value; }));
 
   grpc::Status status = stream.Finish();
   GRPC_DEBUG("CLIENT FINISHED");
@@ -631,49 +603,44 @@ TEST_F(GrpcIndexTest, streamingHello2) {
 
 // Test to see if our generic methods of communication (client objects, grpcserver impl, etc) are thread safe.
 // This does not test application logic for thread safety, just the communications infrastructure (and how we use it.)
-// TODO: remove Greeter and add no-op index & query flags
 TEST_F(GrpcIndexTest, threadsafe) {
-  int nTasks = 50; // concurrency will be limited by TBB
+  int nTasks = 50;
   int callsPerTask = 10;
-  tbb::task_group tasks;
-
+  std::vector<std::thread> threads;
+  threads.reserve(nTasks);
 
   for (int i=0; i<nTasks; i++) {
-    tasks.run(
+    threads.emplace_back(
             [=,this]{
               // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
 
-              std::string name = "Name_" + std::to_string(i) + "_";
-              auto namelen = name.size();
-
               for (int j=0; j<callsPerTask; j++) {
-                luxir::api::HelloRequest req;
-                Reply<luxir::api::HelloReply> result;
                 grpc::ClientContext context;  // need a new one for each RPC
-
-
-                name.resize(namelen);
-                name.append(std::to_string(j)); // TODO: this may still create another string
-
-                req.name = name;
-
-                grpc::Status status;
                 if ((i+j)%2 == 0) {
-                  status = hppUnaryCall(channel.get(), rpc::SayHello, &context, req, &result);
+                  std::string id = std::to_string(i) + ":" + std::to_string(j);
+                  luxir::api::UpdateRequest request;
+                  request.collection = "main";
+                  request.request_id = id;
+                  Reply<luxir::api::UpdateResponse> result;
+                  grpc::Status status = hppUnaryCall(
+                      channel.get(), rpc::Update, &context, request, &result);
+                  ASSERT_TRUE(status.ok()) << status.error_message();
+                  EXPECT_EQ(luxir::api::UpdateResponse_::Status::OK, result.msg.status);
+                  EXPECT_EQ(id, result.msg.request_id);
                 } else {
-                  status = hppUnaryCall(channel.get(), rpc::SayHello2, &context, req, &result);
+                  luxir::api::SchemaRequest request;
+                  request.collection = "main";
+                  Reply<luxir::api::SchemaResponse> result;
+                  grpc::Status status = hppUnaryCall(
+                      channel.get(), rpc::GetSchema, &context, request, &result);
+                  ASSERT_TRUE(status.ok()) << status.error_message();
+                  EXPECT_TRUE(result.msg.schema.has_value());
                 }
-                assert(status.ok());
-
-                // std::cout << "Got response " << result.msg.message <<  std::endl;
-
-                ASSERT_TRUE(result.msg.message.ends_with(name));
               }
-            }
-    );
+            });
   }
 
-  tasks.wait();
+  for (auto& thread : threads) thread.join();
 }
 
 //

@@ -10,9 +10,4 @@ namespace luxir {
 // (the well-known types are already there via libprotobuf).
 void registerLuxirDescriptors();
 
-// Test/health helper: true iff the registered descriptors resolve the services and
-// a representative message. Returns bool (no protobuf types) so hpp-only TUs can call
-// it without pulling protobuf headers into the same TU as the hpp serializer.
-bool luxirSchemaResolves();
-
 } // namespace luxir

@@ -110,11 +110,9 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
 void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource) {
   std::vector<LuxirNode::CollectionEntry> entries;
-  if (request.collection) {
-    auto collection = node.resolveCollection(&*request.collection);
-    std::string_view name = LuxirNode::kDefaultCollectionName;
-    if (!request.collection->name.empty()) name = request.collection->name.back();
-    entries.push_back({std::string(name), std::move(collection), {}});
+  if (!request.collection.empty()) {
+    auto collection = node.resolveCollection(request.collection);
+    entries.push_back({std::string(request.collection), std::move(collection), {}});
   } else {
     entries = node.collectionEntries();
   }
@@ -170,11 +168,9 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
                         api::CacheControlResponse& response,
                         std::pmr::memory_resource& resource) {
   std::vector<LuxirNode::CollectionEntry> entries;
-  if (request.collection) {
-    auto collection = node.resolveCollection(&*request.collection);
-    std::string_view name = LuxirNode::kDefaultCollectionName;
-    if (!request.collection->name.empty()) name = request.collection->name.back();
-    entries.push_back({std::string(name), std::move(collection), {}});
+  if (!request.collection.empty()) {
+    auto collection = node.resolveCollection(request.collection);
+    entries.push_back({std::string(request.collection), std::move(collection), {}});
   } else {
     entries = node.collectionEntries();
   }

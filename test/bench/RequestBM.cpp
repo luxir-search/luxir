@@ -12,7 +12,7 @@ using namespace luxir::test;  // HppClientReaderWriter, Reply, rpc::*
 // med is about 5% slower than small (before any optimizations like using hashes or pulling out prefixes from block starts)
 //
 
-static void BM_Req(benchmark::State& state, int writers, int readers, bool async) {
+static void BM_Req(benchmark::State& state, int writers, int readers) {
   unused(writers,readers);
   
   auto channel = GrpcLuxirTest::getChannel();
@@ -21,19 +21,16 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
     return;
   }
 
-  luxir::api::HelloRequest req;
-  Reply<luxir::api::HelloReply> result;
+  TrivialSearchRequest fixture;
+  auto& req = fixture.request;
+  Reply<luxir::api::SearchResponse> result;
   grpc::ClientContext context;  // need a new one for each RPC
-  HppClientReaderWriter<luxir::api::HelloRequest, luxir::api::HelloReply> stream(
-    channel.get(), rpc::SayHelloStreaming, &context);
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+    channel.get(), rpc::Search, &context);
 
   oneapi::tbb::task_group tasks;
 
   const int32_t requestsPerLoop = 200;
-  req.name = "A";
-  req.async = async;
-
-
   int64_t totalReads = 0;
   int64_t totalWrites = 0;
   int64_t loops = 0;
@@ -43,7 +40,7 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
   for (auto _ : state) {
     // auto inside_start = std::chrono::high_resolution_clock::now();
 
-    std::atomic_int32_t expectedResponses;
+    std::atomic_int32_t expectedResponses{0};
     std::atomic_bool writesDone(false);
 
     // moving this outside the loop (and using a latch to wait) made less than 2% difference.
@@ -51,6 +48,8 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
             [&] {
               int32_t numResponses = 0;
               while (stream.Read(&result)) {
+                ASSERT_FALSE(result.msg.more);
+                ASSERT_FALSE(result.msg.request_id.empty());
                 numResponses++;
                 if (writesDone && numResponses >= expectedResponses) {
                   break;
@@ -64,9 +63,9 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
             });
 
     for (int i=0; i<requestsPerLoop; i++) {
-      int responseCount = 1;
-      req.response_count = responseCount;
-      expectedResponses += responseCount;
+      std::string requestId = std::to_string(totalWrites + i);
+      req.request_id = requestId;
+      expectedResponses++;
 
       // set writesDone *before* we actually write to avoid a race condition where
       // the reader can read the last response before I set writesDone (and then blocks on the Read())
@@ -110,5 +109,4 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
 }
 
 
-BENCHMARK_CAPTURE(BM_Req, helloSync, 1, 1, false)->UseRealTime();
-BENCHMARK_CAPTURE(BM_Req, helloAsync, 1, 1, true)->UseRealTime();
+BENCHMARK_CAPTURE(BM_Req, searchStream, 1, 1)->UseRealTime();

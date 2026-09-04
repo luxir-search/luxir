@@ -18,6 +18,7 @@
 #include "luxir/util/Signal.h"
 #include "luxir/util/log.h"
 #include "luxir/api/padded_input.h"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
 #include "test/QueryBuild.h"
 

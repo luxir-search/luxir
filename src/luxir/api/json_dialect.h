@@ -886,9 +886,6 @@ struct from<JSON, luxir::api::Fusion> {
             util::from_json<O>(value.document_format, ctx, vit, vend);
           } else if (key == "rrf") {
             util::from_json<O>(value.rrf, ctx, vit, vend);
-          } else if (key == "ops") {
-            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
-            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

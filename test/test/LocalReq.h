@@ -153,8 +153,7 @@ public:
 
   // --- request-level setters ---
   LocalReq& collection(std::string_view name) {
-    if (!view.collection) view.collection.emplace();
-    appendStr(view.collection->name, name);
+    view.collection = build::arenaStr(mr, name);
     return *this;
   }
   LocalReq& responseFormat(luxir::api::ResponseFormat f) {
