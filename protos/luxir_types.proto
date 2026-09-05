@@ -118,8 +118,8 @@ message TopDocs {
 //
 // Per-source response-shape fields (`fields`, `batch_size`, `offset`,
 // `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
-// response shape at the top level. Per-source `ops` are not executed; a facet
-// with `selected` under a source is rejected rather than silently dropped.
+// response shape at the top level. Per-source `ops` are rejected; put facets
+// and metrics in Fusion.ops.
 // Each source's `query`, `sorts`, `limit`, and any per-source `filter` are used
 // to produce that source's ranked list.
 //
@@ -150,6 +150,10 @@ message Fusion {
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8;
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
+
+  // Runs over every doc in any filtered source ranked list, the set found counts.
+  // Fusion limit and offset do not affect this candidate domain.
+  map<string, SearchOp> ops = 15;
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of

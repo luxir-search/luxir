@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <map>
 #include <memory>
 #include <memory_resource>
 #include <set>
@@ -12,6 +13,7 @@
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/FilterCache.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -272,7 +274,7 @@ TEST_F(FusionOpTest, routedSharedFilterIsRejected) {
       << lreq->errorMsg();
 }
 
-TEST_F(FusionOpTest, routedSourceFilterExplainsIgnoredOps) {
+TEST_F(FusionOpTest, routedSourceFilterHasNoTarget) {
   CollectionHelper helper("main");
   helper.index(flatdoc("foo_w", "apple", "color_s", "red"),
                UpdateMessage::COMMIT);
@@ -293,7 +295,7 @@ TEST_F(FusionOpTest, routedSourceFilterExplainsIgnoredOps) {
             std::string::npos)
       << lreq->errorMsg();
   EXPECT_NE(lreq->errorMsg().find(
-                "per-source ops are ignored under Fusion, so filter routing has no target"),
+                "filter routing has no target on a fusion source"),
             std::string::npos)
       << lreq->errorMsg();
 }
@@ -558,6 +560,96 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
 }
 
 
+TEST_F(FusionOpTest, subOpsUseFusedCandidates) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  auto index = [&](const char* id, const char* text, const char* color,
+                   int price, float distance, const char* keep = "yes",
+                   const char* owner = "yes") {
+    h.index(flatdoc("id", id, "foo_w", text, "color_s", color,
+                   "price_i", price, "embedding_v", std::vector<float>{distance},
+                   "keep_s", keep, "owner_s", owner));
+  };
+  // Text ranks b, a; kNN ranks a, c. The union is a, b, c (sum = 60).
+  index("a", "apple", "red", 10, 0);
+  index("b", "apple", "red", 20, 10);
+  h.commit();
+  index("c", "banana", "blue", 30, 1);
+  h.commit();
+  // This entire segment contributes no candidates. d matches text but is
+  // below its limit; e is outside kNN k. f and g test the two filter scopes.
+  index("d", "apple", "excluded", 1, 20);
+  index("e", "banana", "excluded", 100, 30);
+  index("f", "apple", "excluded", 200, 0.1f, "no");
+  index("g", "apple", "excluded", 300, 40, "yes", "no");
+  h.commit();
+  ASSERT_EQ(3u, h.getIndexWriter()->getIndexReader()->segments().size());
+
+  for (int maxParallel : {0, 1, -1}) {
+    for (int limit : {0, 1, 10}) {
+      auto req = localReq(luxirNode->getSearchEngine());
+      parseQueryRequest(R"json({"ops":{"f":{"fusion":{
+        "sources":{
+          "text":{"query":{"match":{"foo_w":"apple"}},"limit":2,
+                  "sorts":[{"expr":"price_i","dir":"desc"}],
+                  "filter":[{"match":{"owner_s":"yes"}}]},
+          "knn":{"query":{"knn":{"field":"embedding_v","query":[0],"k":2}},
+                 "limit":2}},
+        "filter":[{"match":{"keep_s":"yes"}}],"rrf":{},
+        "get_number":true,"fields":["id"],
+        "ops":{
+          "colors":{"field_facet":{"field":"color_s","ops":{
+            "ids":{"field_facet":{"field":"id"}}}}},
+          "total":{"expr_op":"sum(price_i)"}}
+      }}}})json", req->rawRequest(), req->mr);
+      auto& fusion = std::get<api::Fusion>(
+          const_cast<api::SearchOp&>(*req->rawRequest().ops.at("f")).kind);
+      fusion.limit = limit;
+      fusion.offset = limit == 1 ? 1 : 0;
+      req->execute(maxParallel);
+      ASSERT_OK(req);
+      const auto* docs = req->docList("f");
+      ASSERT_NE(nullptr, docs);
+      EXPECT_EQ(3, docs->found.value_or(-1));
+      EXPECT_EQ((size_t)std::min(limit, 3), resultIds(*req).size());
+      EXPECT_EQ(60, std::get<int64_t>(docs->ops.at("total")->kind));
+      const auto* colors = docs->ops.at("colors")->facetResult();
+      ASSERT_NE(nullptr, colors);
+      const auto& names = std::get<api::ColStr>(colors->bucket_ids->kind).v;
+      ASSERT_EQ(2u, names.size());
+      std::map<std::string, int64_t> counts;
+      const auto& nested = std::get<api::ArrVal>(colors->ops.at("ids")->kind).v;
+      ASSERT_EQ(names.size(), nested.size());
+      for (size_t i = 0; i < names.size(); i++) {
+        counts[std::string(names[i])] = colors->counts[i];
+        const auto* ids = nested[i].facetResult();
+        ASSERT_NE(nullptr, ids);
+        const auto& values = std::get<api::ColStr>(ids->bucket_ids->kind).v;
+        std::set<std::string_view> actual(values.begin(), values.end());
+        EXPECT_EQ(names[i] == "red" ? (std::set<std::string_view>{"a", "b"})
+                                    : (std::set<std::string_view>{"c"}), actual);
+        for (auto count : ids->counts) EXPECT_EQ(1, count);
+      }
+      EXPECT_EQ((std::map<std::string, int64_t>{{"red", 2}, {"blue", 1}}), counts);
+    }
+  }
+}
+
+TEST_F(FusionOpTest, sourceOpsRejected) {
+  CollectionHelper h("main");
+  auto req = localReq(luxirNode->getSearchEngine());
+  parseQueryRequest(R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{
+    "text":{"query":{"all":true},"ops":{"colors":{
+      "field_facet":{"field":"color_s"}}}}}}}}})",
+      req->rawRequest(), req->mr);
+  ExpectLog quiet("Search request rejected");
+  req->execute();
+  EXPECT_NE(std::string::npos, req->errorMsg().find(
+      "fusion source 'text': ops are not executed under Fusion; put them in Fusion.ops"))
+      << req->errorMsg();
+}
+
+
 // Per-source filter intersected with the fusion-level filter.  Each filter
 // should be applied; only docs satisfying both pass through.
 TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
@@ -606,7 +698,7 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
 }
 
 
-// Validation: missing required pieces and unsupported sub-ops surface as
+// Validation: missing required pieces surface as
 // errors in the response.
 TEST_F(FusionOpTest, validation) {
   CollectionHelper h("main");
@@ -674,12 +766,18 @@ TEST_F(FusionOpTest, emptyIndex) {
   fusion.rrf.emplace().k = 60;
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
 
+  auto* facet = build::mapSlot<api::SearchOp>(fusion.ops, 1, "colors", mr);
+  facet->kind.emplace<api::FieldFacet>().field = "color_s";
+
   lreq->execute();
   ASSERT_OK(lreq);
 
   const auto* dl = lreq->docList("f");
   ASSERT_TRUE(dl != nullptr);
   EXPECT_EQ(dl->found.value_or(0), 0);
+  const auto* colors = dl->ops.at("colors")->facetResult();
+  ASSERT_NE(nullptr, colors);
+  EXPECT_TRUE(colors->counts.empty());
 
   lreq->done();
 }

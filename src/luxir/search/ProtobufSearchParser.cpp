@@ -361,7 +361,7 @@ public:
         && placement != OpsPlacement::REQUEST_ROOT
         && placement != OpsPlacement::TOP_DOCS) {
       std::string location = placement == OpsPlacement::FUSION
-          ? "a fusion source's ops" : "a facet bucket";
+          ? "Fusion.ops" : "a facet bucket";
       throw std::runtime_error(
           "op '" + std::string(name) + "' under " + location
           + ": domain is only supported for ops dispatched by the request "
@@ -376,7 +376,7 @@ public:
         addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
         return qr;
       },
-      [&](const luxir::api::Fusion& fusion) -> SearchOp* { return parseFusion(name, fusion); },
+      [&](const luxir::api::Fusion& fusion) -> SearchOp* { return parseFusion(name, fusion, depth); },
       [&](const luxir::api::FieldFacet& facetReq) -> SearchOp* {
         FacetReq* facet;
         auto prepared = preparedFacets.find(&searchOp);
@@ -460,7 +460,7 @@ public:
     if (placement != OpsPlacement::TOP_DOCS) {
       std::string location = placement == OpsPlacement::REQUEST_ROOT
           ? "request root"
-          : placement == OpsPlacement::FUSION ? "a fusion source's ops"
+          : placement == OpsPlacement::FUSION ? "Fusion.ops"
                                               : "nested facet bucket";
       throw std::runtime_error("facet '" + std::string(facetName) + "' at "
           + location
@@ -1125,7 +1125,6 @@ public:
 
   std::vector<ParsedFilter> prepareFacetSelections(
       const luxir::api::TopDocs& topDocsReq,
-      TopDocsPlacement topDocsPlacement,
       ParseContext& parseContext,
       ProtobufQueryParser& parser,
       bool refinedResultRequested) {
@@ -1149,8 +1148,7 @@ public:
       if (fieldProto == nullptr && rangeProto == nullptr
           && queryProto == nullptr) continue;
 
-      OpsPlacement placement = topDocsPlacement == TopDocsPlacement::FUSION_SOURCE
-          ? OpsPlacement::FUSION : OpsPlacement::TOP_DOCS;
+      constexpr auto placement = OpsPlacement::TOP_DOCS;
       if (fieldProto != nullptr) {
         validateSelectionEnvelope(key, *fieldProto, placement);
         std::string valueName = "facet '" + std::string(key)
@@ -1344,13 +1342,17 @@ public:
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
     if (placement == TopDocsPlacement::FUSION_SOURCE) {
+      if (!topDocsReq.ops.empty()) {
+        throw std::runtime_error(
+            "fusion source '" + std::string(name)
+            + "': ops are not executed under Fusion; put them in Fusion.ops");
+      }
       for (size_t i = 0; i < topDocsReq.filter.size(); i++) {
         if (!topDocsReq.filter[i].except_ops.empty()) {
           throw std::runtime_error(
               "fusion source '" + std::string(name) + "'.filter["
               + std::to_string(i)
-              + "].except_ops: per-source ops are ignored under Fusion, so "
-                "filter routing has no target");
+              + "].except_ops: filter routing has no target on a fusion source");
         }
       }
     }
@@ -1359,7 +1361,7 @@ public:
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(
-            topDocsReq, placement, parseContext, parser,
+            topDocsReq, parseContext, parser,
             specifiedLimit != 0 || topDocsReq.get_number));
     ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
 
@@ -1383,11 +1385,10 @@ public:
     bool countClauseDisabled =
         BooleanQuery::disableFilterClauseCountForTests
         && limit == 0 && topDocsReq.get_number;
-    bool attachSubOps = placement != TopDocsPlacement::FUSION_SOURCE;
     CollectionRequirements requirements{
       .needRankedDocs = limit > 0,
       .needExactCount = topDocsReq.get_number,
-      .needExactDomain = attachSubOps && !topDocsReq.ops.empty()
+      .needExactDomain = !topDocsReq.ops.empty()
     };
     bool foldFilters = !routedFilters && !filters.empty()
         && !disableTopDocsFilterFold
@@ -1864,7 +1865,7 @@ public:
     return out;
   }
 
-  SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto) {
+  SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
     if (fusionProto.sources.empty()) {
       throw std::runtime_error("Fusion requires at least one source");
     }
@@ -1880,8 +1881,7 @@ public:
     // collector back to the FusionOp::Calc instead of self-emitting.  The
     // sink closure captures nothing at parse time; it resolves the parent
     // FusionOp::Calc at runtime via the source Calc's parent pointer.
-    // Per-source `ops` are intentionally not attached (Fusion spec ignores
-    // them).  Fusion.sources is a map whose values are TopDocs directly (not
+    // Fusion.sources is a map whose values are TopDocs directly (not
     // indirect), so srcProto is the message itself.
     std::vector<TopDocsReq*> sources;
     sources.reserve(fusionProto.sources.size());
@@ -1935,6 +1935,7 @@ public:
       src->parent = fusion;
     }
 
+    addSubs(*fusion, fusionProto.ops, depth, OpsPlacement::FUSION);
     return fusion;
   }
 

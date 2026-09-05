@@ -387,6 +387,7 @@ struct Fusion {                                                  // needs TopDoc
   std::optional<std::int64_t> limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is one int32)
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)

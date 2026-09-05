@@ -1367,8 +1367,7 @@ private:
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
-        // Per-source ops are ignored by fusion execution, but silently discarding
-        // authored work behind a format flag would be worse than rejecting it.
+        if (!f->ops.empty()) return "format=docs does not support nested ops";
         for (const auto& [srcName, src] : f->sources) {
           if (!src.ops.empty()) return "format=docs does not support nested ops";
         }

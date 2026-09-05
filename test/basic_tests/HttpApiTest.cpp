@@ -2757,14 +2757,44 @@ TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
   EXPECT_EQ(R"({"_header_":{"found":2}})", lines[0]);
 }
 
-// format=docs validation covers fusion source sub-ops (silently discarding
-// authored ops behind a format flag would be worse than rejecting them).
+TEST_F(HttpApiTest, fusionSubOpsEchoAndStreaming) {
+  helper.indexAll(std::array{
+      flatdoc("id", "a", "color_s", "red"),
+      flatdoc("id", "b", "color_s", "red"),
+      flatdoc("id", "c", "color_s", "blue")}, UpdateMessage::COMMIT);
+  const std::string body = R"({"ops":{"f":{"fusion":{
+    "sources":{"all":{"query":{"all":true},"limit":3}},"rrf":{},
+    "limit":2,"batch_size":1,"get_number":true,"fields":["id"],
+    "ops":{"colors":{"field_facet":{"field":"color_s"}}}
+  }}}})";
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request", body);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  EXPECT_NE(std::string::npos, echo.body().find("colors")) << echo.body();
+  auto response = httpRequest(port(), http::verb::post,
+      "/collections/main/_search", echo.body());
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_GE(splitLines(response.body()).size(), 2u) << response.body();
+  EXPECT_NE(std::string::npos, response.body().find(R"("found":3)")) << response.body();
+  EXPECT_NE(std::string::npos, response.body().find(
+      R"("buckets":[{"val":"red","count":2},{"val":"blue","count":1}])"))
+      << response.body();
+}
+
+// format=docs cannot represent nested results from fusion or its sources.
 TEST_F(HttpApiTest, docsFormatRejectsFusionSourceOps) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs",
       R"({"ops":{"q":{"fusion":{"sources":{"a":{"query":{"all":true},)"
       R"("ops":{"f":{"field_facet":{"field":"http_facet_s"}}}}},"rrf":{}}}}})");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("nested ops")) << res.body();
+
+  auto fusionOps = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs",
+      R"({"ops":{"q":{"fusion":{"sources":{"a":{"query":{"all":true}}},
+        "rrf":{},"ops":{"f":{"field_facet":{"field":"http_facet_s"}}}}}}})");
+  EXPECT_EQ(400, fusionOps.result_int()) << fusionOps.body();
+  EXPECT_NE(std::string::npos, fusionOps.body().find("nested ops")) << fusionOps.body();
 
   auto explain = httpRequest(port(), http::verb::post,
       "/collections/main/_search?format=docs&explain=request", R"({"query":{"all":true}})");

@@ -164,7 +164,8 @@ POST /collections/books/_search
         "rrf": {"k":60},
         "limit": 10,
         "get_scores": true,
-        "fields": ["id","title_w"]
+        "fields": ["id","title_w"],
+        "ops": {"authors": {"field_facet": {"field":"author_s"}}}
       }
     }
   }
@@ -176,7 +177,11 @@ For document `d`, RRF computes `sum(1 / (k + rank))` over sources containing
 source and computed once per segment. A source may add its own `filter`; the
 shared and source-specific filters are ANDed. Source `query`, `filter`, `sorts`,
 and `limit` define its ranking; response-shape fields belong on the fusion.
-Fusion-level sub-ops are not implemented, so its `ops` map must be empty.
+Ops under `fusion.ops` run over the fused candidate set: every document in any
+source's ranked list after these filters, exactly the set `found` counts.
+Fusion `limit` and `offset` do not affect facet counts or metrics. Source-level
+`ops` are rejected; put them in `fusion.ops`. For facets over a full text match
+set, put a sibling `top_docs` op at the request root.
 
 RRF source limits are candidate-pool decisions. A document outside a source's
 limit cannot contribute from that source, so choose pools large enough for the

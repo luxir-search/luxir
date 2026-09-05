@@ -37,10 +37,9 @@ namespace luxir {
 // source as its domain.  Per-source filters (if any) are intersected by
 // the source's TopDocsReq with the incoming domain.
 //
-// A source's TopDocs.ops do not execute because source TopDocs contribute only
-// ranked inputs to the fused result. A facet with selected under a source is
-// rejected rather than silently dropped. Put result-shaping ops on a separate
-// TopDocs request instead.
+// Sub-ops run over the fused candidate set: every doc in any source ranked
+// list after shared and per-source filters, exactly the set found counts.
+// Fusion limit and offset do not affect this domain; source ops are rejected.
 class FusionOp : public SearchOp {
 public:
   const ReqFusion& fusionProto;
@@ -100,6 +99,9 @@ public:
 
     // Shared filter DocSet per segment, kept alive until fusion emits.
     std::vector<DomainHandle> segFilters;
+    std::vector<std::unique_ptr<SearchOp::Calculator>> subCalcs;
+    std::vector<DomainHandle> fusedDomains;
+    oneapi::tbb::task_group* taskGroup = nullptr;
 
     bool needsPrepare = false;
     std::atomic<int32_t> preparedDomainsSeen{0};
@@ -118,6 +120,10 @@ public:
       deliveredCollectors.assign(numSources, nullptr);
       for (auto* src : op.sources) {
         sourceCalcs.emplace_back(src->createCalculator(this, -1));
+      }
+      subCalcs.reserve(op.subOps.size());
+      for (auto& [key, subOp] : op.subOps) {
+        subCalcs.emplace_back(subOp->createCalculator(this, -1));
       }
       segFilters.resize(numSegs);
       for (auto* weight : op.filterWeights) {
@@ -147,6 +153,11 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domain) override {
       assert(domain.isDeliverable());
+      // Every segment shares the request task group; only the segment-0 (or
+      // empty-index) dispatch writes it so there is a single writer.  That
+      // dispatch precedes source completion, whose acq_rel counters order the
+      // write before doFusion reads it.
+      if (segnum <= 0) taskGroup = tg;
       if (needsPrepare) {
         task_group_run(tg, [this, tg, segnum, domain]() {
           doPrepareDomain(tg, segnum, domain);
@@ -321,12 +332,35 @@ public:
                   return a.first < b.first;
                 });
 
+      if (!subCalcs.empty()) {
+        std::vector<segdoc> candidates;
+        candidates.reserve(fusedList.size());
+        for (auto& [doc, score] : fusedList) candidates.push_back(doc);
+        std::sort(candidates.begin(), candidates.end());
+        const auto& segments = op.req.reader->segments();
+        fusedDomains.reserve(segments.size());
+        auto doc = candidates.begin();
+        for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+          DocSetBuilder builder(segments[segnum].maxDoc());
+          while (doc != candidates.end() && doc->segment() == segnum) {
+            builder.add(doc->docId());
+            ++doc;
+          }
+          // An empty segment needs an empty set: a null domain means all docs.
+          fusedDomains.emplace_back(builder.build());
+        }
+        for (auto& sub : subCalcs) sub->calcAll(taskGroup, fusedDomains);
+      }
+
       int64_t numCollected = std::min((int64_t)fusedList.size(), op.topCount);
       int64_t totalHits = (int64_t)fused.size();
 
       auto getDocList = [this](SearchResponse* resp) -> luxir::api::DocList& {
-        auto& val = *getTarget(resp);
-        return oneofMut<luxir::api::DocList>(val);
+        luxir::api::DocList* docs = nullptr;
+        getTarget(resp, [&](luxir::api::Val& val) {
+          docs = &oneofMut<luxir::api::DocList>(val);
+        });
+        return *docs;
       };
 
       emitDocsResponse(op.req, getDocList,

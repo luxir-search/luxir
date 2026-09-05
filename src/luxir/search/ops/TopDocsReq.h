@@ -2421,9 +2421,14 @@ public:
       return;
     }
 
+    // Resolve the DocList arm under the response lock: sub-op calculators
+    // set the same arm through getTargetForSub while this emitter runs.
     auto getDocList = [&calc](SearchResponse* resp) -> luxir::api::DocList& {
-      auto& val = *calc.getTarget(resp);
-      return oneofMut<luxir::api::DocList>(val);
+      luxir::api::DocList* docs = nullptr;
+      calc.getTarget(resp, [&](luxir::api::Val& val) {
+        docs = &oneofMut<luxir::api::DocList>(val);
+      });
+      return *docs;
     };
 
     if (mergeableCollector->useFieldSort) {

@@ -4981,6 +4981,11 @@ TEST_F(FacetTest, selectedValidationIsParseTime) {
   expectError(R"({"limit":0,"ops":{"outer":{"field_facet":{
     "field":"brand_s","ops":{"inner":{"field_facet":{"field":"brand_s",
     "selected":["acme"]}}}}}}})", "at nested facet bucket");
+  expectError(R"({"ops":{"f":{"fusion":{"rrf":{},
+    "sources":{"text":{"query":{"all":true}}},
+    "ops":{"brands":{"field_facet":{"field":"brand_s","selected":["acme"]}}}
+  }}}})", "facet 'brands' at Fusion.ops: selected is only supported on facets directly inside TopDocs.ops");
+
   auto duplicates = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"limit":0,"get_number":true,
     "ops":{"f":{"field_facet":{"field":"price_i","limit":0,
