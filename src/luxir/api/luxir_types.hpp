@@ -82,6 +82,7 @@ struct QueryCacheStats; struct IndexRamStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
+namespace KnnQuery_ { struct Ivf; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
 namespace Error_ {
@@ -320,13 +321,16 @@ struct ArrArrStr { std::span<const ArrStr> v; };
 struct ArrArrInt { std::span<const ArrInt> v; };
 struct ArrArrFloat { std::span<const ArrFloat> v; };
 struct ArrArrDouble { std::span<const ArrDouble> v; };
+namespace KnnQuery_ {
+struct Ivf { int32_t nprobe = 0; float min_scan_fraction = 0.0f; };
+} // namespace KnnQuery_
 struct KnnQuery {                                                // needs Vector
+  using Ivf = luxir::api::KnnQuery_::Ivf;
   std::string_view field;
   std::optional<Vector> query;
+  std::optional<Ivf> ivf;
   int32_t k = 0;
-  int32_t nprobe = 0;
   int32_t refine_candidates = 0;
-  float min_scan_fraction = 0.0f;
   bool exact = false;
 };
 struct SchemaDef {
@@ -610,6 +614,7 @@ LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXI
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap)
 LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
+LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)

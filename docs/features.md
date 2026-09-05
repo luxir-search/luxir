@@ -205,8 +205,8 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
 - Multi-valued vector fields with max-similarity collapse per document.
 - ANN indexes are segment overlays: built at commit from the vector column and
   carried through merges automatically, without reindexing documents.
-- Effort knobs: `k`, `nprobe`, `refine_candidates`, `min_scan_fraction`,
-  and an `exact` switch.
+- Effort knobs: `k`, `refine_candidates`, an `exact` switch, and per-engine
+  knobs under `ivf` (`nprobe`, `min_scan_fraction`).
 - Deterministic execution: parallel vector search returns bit-identical
   results to serial.
 

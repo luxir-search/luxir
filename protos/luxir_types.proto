@@ -240,20 +240,30 @@ message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
   Vector query = 2;        // query vector - must match the field's dims
   int32 k = 3;             // number of nearest-neighbor documents to return
-  int32 nprobe = 4;        // merge-stable IVF effort: lists to probe if this field
-                           // were one IVF index with nlist=sqrt(live vectors).
-                           // 0 = adaptive default, with host auto-deepening.
-  int32 refine_candidates = 5; // exact number of approximate candidates fetched for
-                           // full-precision rescore (clamped up to k). 0 = adaptive
-                           // default (fixed headroom plus a k-decaying multiple).
-  bool exact = 6;          // require exact (true top-k) results: the engine uses an
+  bool exact = 4;          // require exact (true top-k) results: the engine uses an
                            // execution path that guarantees them (currently a full
                            // scan of the stored vector column) and does not consult
-                           // approximate ANN indexes. nprobe / min_scan_fraction /
-                           // refine_candidates are ignored. Cost is linear in the
+                           // approximate ANN indexes. refine_candidates and the
+                           // engine knobs below are ignored. Cost is linear in the
                            // number of stored vectors.
-  float min_scan_fraction = 7; // optional floor for the internal scan fraction,
+  int32 refine_candidates = 5; // exact number of approximate candidates pooled from
+                           // the ANN engine for the full-precision rescore and doc
+                           // collapse (clamped up to k). 0 = adaptive default (fixed
+                           // headroom plus a k-decaying multiple). Engine-agnostic:
+                           // it sizes the host-side pool, not the engine's search.
+  Ivf ivf = 6;             // IVF engine effort knobs. Ignored by segments without an
+                           // IVF index and when exact is set.
+
+  // Knobs whose units only make sense for the IVF engine family (IVF+PQ
+  // today). A future engine gets a sibling message with its own knobs (for
+  // example hnsw { ef }) rather than reinterpreting these.
+  message Ivf {
+    int32 nprobe = 1;      // merge-stable IVF effort: lists to probe if this field
+                           // were one IVF index with nlist=sqrt(live vectors).
+                           // 0 = adaptive default, with host auto-deepening.
+    float min_scan_fraction = 2; // optional floor for the internal scan fraction,
                            // in [0,1]. 0 = no floor.
+  }
 }
 
 // Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or

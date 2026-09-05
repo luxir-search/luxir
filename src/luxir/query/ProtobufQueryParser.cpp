@@ -246,15 +246,22 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   if (k <= 0) {
     throw std::runtime_error(std::format("KnnQuery for field '{}' must have k > 0 (got {})", field, k));
   }
-  float minScanFraction = knnQuery.min_scan_fraction;
-  if (minScanFraction < 0.0f || minScanFraction > 1.0f) {
-    throw std::runtime_error(std::format(
-      "KnnQuery for field '{}' has min_scan_fraction {} outside [0,1]",
-      field, minScanFraction));
+  // Engine-specific knobs arrive in per-engine sub-messages; an absent one
+  // means "adaptive default" for every knob it carries.
+  int32_t nprobe = 0;
+  float minScanFraction = 0.0f;
+  if (knnQuery.ivf.has_value()) {
+    nprobe = knnQuery.ivf->nprobe;
+    minScanFraction = knnQuery.ivf->min_scan_fraction;
+    if (minScanFraction < 0.0f || minScanFraction > 1.0f) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' has ivf.min_scan_fraction {} outside [0,1]",
+        field, minScanFraction));
+    }
   }
 
   return pool.make<luxir::KnnQuery>(
-    field, vectorType, queryVec, k, knnQuery.nprobe, knnQuery.refine_candidates,
+    field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
     minScanFraction, knnQuery.exact);
 }
 

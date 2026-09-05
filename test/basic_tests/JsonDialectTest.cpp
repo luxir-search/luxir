@@ -256,6 +256,28 @@ TEST(JsonDialect, RangeQuery) {
   EXPECT_FALSE(r.lte.has_value());
 }
 
+TEST(JsonDialect, KnnQueryEngineKnobsNest) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  ASSERT_TRUE(P::read_json(q,
+      R"({"knn":{"field":"embedding_v","query":[0.5,1.5],"k":3,"refine_candidates":40,)"
+      R"("ivf":{"nprobe":2,"min_scan_fraction":0.25}}})", mr));
+  const auto& k = std::get<P::KnnQuery>(q.kind);
+  EXPECT_EQ(k.field, "embedding_v");
+  EXPECT_EQ(k.k, 3);
+  EXPECT_EQ(k.refine_candidates, 40);
+  ASSERT_TRUE(k.ivf.has_value());
+  EXPECT_EQ(k.ivf->nprobe, 2);
+  EXPECT_EQ(k.ivf->min_scan_fraction, 0.25f);
+
+  // engine knobs are only accepted inside their engine object
+  q = {};
+  EXPECT_FALSE(P::read_json(q,
+      R"({"knn":{"field":"embedding_v","query":[0.5],"k":1,"nprobe":2}})", mr));
+  ASSERT_TRUE(P::read_json(q, R"({"knn":{"field":"embedding_v","query":[0.5],"k":1}})", mr));
+  EXPECT_FALSE(std::get<P::KnnQuery>(q.kind).ivf.has_value());
+}
+
 TEST(JsonDialect, AnyOfQueryCanonicalForm) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query q;

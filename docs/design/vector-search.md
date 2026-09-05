@@ -90,9 +90,12 @@ version, so cleanup can unlink old files without breaking existing readers.
 The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
-Internally, an `nprobe` request becomes a scan fraction
+Internally, an `ivf.nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment
-indexes; that is what makes the knob merge-stable.
+indexes; that is what makes the knob merge-stable. Engine-specific knobs are
+grouped under a per-engine sub-message on the wire (`ivf` today) so a second
+engine adds a sibling with its own units instead of overloading these; the
+host-side knobs (`k`, `refine_candidates`, `exact`) stay at the top level.
 
 For per-segment IVF, Luxir ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan

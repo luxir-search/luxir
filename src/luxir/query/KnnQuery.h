@@ -69,11 +69,12 @@ namespace luxir {
 ///      order for the segment-parallel TopDocsReq pipeline.
 ///
 /// Request knobs (see KnnQuery message in luxir_types.proto for the wire
-/// contract): k = docs to return; nprobe = merge-stable IVF effort (lists to
-/// probe as if the field were ONE IVF index with nlist=sqrt(live vectors) -
-/// explicit pins the effort, 0 adapts and auto-deepens); min_scan_fraction =
-/// optional floor on the internal scan fraction; refine_candidates = pinned
-/// approximate pool size; exact = bypass ANN entirely (column scan contract).
+/// contract): k = docs to return; ivf.nprobe = merge-stable IVF effort (lists
+/// to probe as if the field were ONE IVF index with nlist=sqrt(live vectors) -
+/// explicit pins the effort, 0 adapts and auto-deepens); ivf.min_scan_fraction
+/// = optional floor on the internal scan fraction; refine_candidates = pinned
+/// approximate pool size (host-side, engine-agnostic); exact = bypass ANN
+/// entirely (column scan contract).
 ///
 /// The active query domain is pushed into the engine as the COMPLETE
 /// eligibility predicate: per the PrepareContext contract it is already

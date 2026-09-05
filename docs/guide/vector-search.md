@@ -129,7 +129,7 @@ Put ordinary filters on the same `top_docs` operation:
 The filter is part of vector candidate search, not a post-pass over an
 unfiltered top 20. When enough matching documents exist and the ANN search can
 reach them within its effort cap, `k: 20` means 20 filtered neighbors rather
-than 20 minus whatever a later filter discarded. Adaptive `nprobe` can deepen
+than 20 minus whatever a later filter discarded. Adaptive IVF breadth can deepen
 automatically when filters or multi-value collapse underfill the result.
 
 ## Hybrid search with RRF
@@ -231,24 +231,44 @@ selected commit.
 Each segment is searched with its ANN index when it has one, or by exact scan
 of the vector column when it does not.
 
-`nprobe` is a merge-stable IVF effort knob. The wire name stays familiar, but
+Knobs whose units belong to one ANN engine live in a sub-object named after
+that engine; `ivf` is the only one today. Knobs at the top level of `knn`
+(`k`, `refine_candidates`, `exact`) apply to every engine.
+
+```json
+{
+  "query": {
+    "knn": {
+      "field":"embedding_v",
+      "query":[0.75,0.15,0.10],
+      "k":20,
+      "refine_candidates":400,
+      "ivf": {"nprobe":32}
+    }
+  }
+}
+```
+
+`ivf.nprobe` is a merge-stable IVF effort knob. The name stays familiar, but
 the value is interpreted as the number of lists Luxir would probe if the field
 were a single IVF index built with `nlist = sqrt(live_vector_count)`, capped
 the same way as the builder's `nlist`. That total effort is spread across the
 current per-segment indexes, so pure merges do not change the requested
-effort. When `nprobe` is `0`, Luxir chooses an adaptive default and may
-auto-deepen breadth when filters or doc collapse leave too few live documents.
-An explicit `nprobe` pins the total effort cap.
+effort. When `nprobe` is `0` or the `ivf` object is absent, Luxir chooses an
+adaptive default and may auto-deepen breadth when filters or doc collapse
+leave too few live documents. An explicit `nprobe` pins the total effort cap.
 
 Probed lists are always scanned in full; `nprobe` (which selects lists by
 relevance) is the only work limiter.
 
-`min_scan_fraction` optionally sets a direct floor on the fraction of live
+`ivf.min_scan_fraction` optionally sets a direct floor on the fraction of live
 vector values scanned. It is a float in `[0,1]`; values like `0.001` mean 0.1%
 of the live vector values, not 0.001%.
 
 `refine_candidates` controls overfetch for approximate ANN: how many
-approximate candidates are collected before the full-precision rescore. An
+approximate candidates are collected before the full-precision rescore. It
+sizes the host-side candidate pool rather than any engine's own search, so it
+means the same thing whichever engine produced the candidates. An
 explicit value pins the candidate pool to exactly that many approximate
 candidates (clamped up to `k`) - an absolute count, so large-`k` callers are
 not forced to choose between coarse multiplier steps. When unset, the default
@@ -264,7 +284,8 @@ to one hit per document.
 `exact` requires exact (true top-k) results. It is a result contract, not an
 execution mode: the engine uses a path that guarantees exactness - currently
 an exhaustive scan over the stored vector column - and does not consult
-approximate ANN indexes. `nprobe` and `refine_candidates` are ignored. Cost is
+approximate ANN indexes. `refine_candidates` and the `ivf` knobs are ignored.
+Cost is
 linear in the number of stored vectors. Query semantics are otherwise
 identical to the default path (same filters, same multi-valued collapse, same
 score scale), which makes `exact` the ground truth for measuring ANN recall:
@@ -290,10 +311,10 @@ at query time instead.
 
 ## Recall Semantics
 
-IVF+PQ is approximate. Higher `nprobe` and higher `refine_candidates`
-generally increase recall and latency. Setting `nprobe` to at least the
+IVF+PQ is approximate. Higher `ivf.nprobe` and higher `refine_candidates`
+generally increase recall and latency. Setting `ivf.nprobe` to at least the
 reference `sqrt(live_vector_count)` list count, or setting
-`min_scan_fraction=1`, makes the ANN search exhaustive over IVF lists, but PQ
+`ivf.min_scan_fraction=1`, makes the ANN search exhaustive over IVF lists, but PQ
 ordering still decides which candidates are returned before column rescore.
 For exact results, use the `exact` flag.
 

@@ -266,8 +266,8 @@ grammar and the function-call subset.
 Vector and geographic queries use the same `Query` node but have enough field
 and execution semantics to warrant their own guides:
 
-- [`knn`](vector-search.md) covers `field`, `query`, `k`, `nprobe`,
-  `refine_candidates`, `min_scan_fraction`, and `exact`.
+- [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
+  `exact`, and the per-engine `ivf` object (`nprobe`, `min_scan_fraction`).
 - [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
   inclusive boundaries, dateline crossing, and distance units.
 

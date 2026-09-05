@@ -191,10 +191,13 @@ inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
   float* a = build::allocArray(f32.v, vec.size(), mr);
   std::copy(vec.begin(), vec.end(), a);
   kq.k = k;
-  kq.nprobe = nprobe;
   kq.exact = exact;
   kq.refine_candidates = refineCandidates;
-  kq.min_scan_fraction = minScanFraction;
+  if (nprobe != 0 || minScanFraction != 0) {
+    auto& ivf = kq.ivf.emplace();
+    ivf.nprobe = nprobe;
+    ivf.min_scan_fraction = minScanFraction;
+  }
   return q;
 }
 inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
