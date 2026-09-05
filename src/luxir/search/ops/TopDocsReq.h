@@ -393,15 +393,18 @@ public:
   public:
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       auto* ourVal = parent->getTargetForSub(resp, this);
-      // the Val should either be unset, or have a DocList
-      assert(
-        ourVal != nullptr && (std::holds_alternative<luxir::api::DocList>(ourVal->kind)
-          || std::holds_alternative<std::monostate>(ourVal->kind)));
-      auto& dl = oneofMut<luxir::api::DocList>(*ourVal);
+      assert(ourVal != nullptr);
+      // Our DocList lives in our bucket slot when this TopDocs is a facet
+      // bucket child; the Val should either be unset or already hold it.
+      auto& target = slotTarget<luxir::api::ArrVal>(*ourVal, resp->mr);
+      assert(std::holds_alternative<luxir::api::DocList>(target.kind)
+             || std::holds_alternative<std::monostate>(target.kind));
+      auto& dl = oneofMut<luxir::api::DocList>(target);
       return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
     }
 
-    Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1), collectorMerger(nullptr, nullptr) {
+    Calc(TopDocsReq& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : SearchOp::Calculator(op, parent, slot, numSlots), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         return new MergeableCollector(
@@ -2397,24 +2400,50 @@ public:
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
-    return new Calc(*this, parent);
+    return new Calc(*this, parent, slot, numSlots);
+  }
+
+  // A facet bucket child runs one independent TopDocs per bucket over that
+  // bucket's domain; its DocList lands in the bucket's slot of the parent
+  // FacetResult's ops entry.
+  bool canEmitAsBucketChild() const override { return true; }
+
+  // Retained by one bucket binding while its segments are fed: the
+  // calculator, the merged collector's heap (a score-doc entry, plus one key
+  // per sort clause for a field sort), per-segment domain handles, and the
+  // child calculators the Calc constructs and keeps. A coarse block-sizing
+  // estimate, not memory accounting.
+  size_t facetBucketResidentBytes() const override {
+    size_t perDoc = sortPlan.useFieldSort
+        ? 16 + 16 * sortPlan.clauses.size() : 16;
+    size_t heap = (size_t)topCount > std::numeric_limits<size_t>::max() / perDoc
+        ? std::numeric_limits<size_t>::max() : (size_t)topCount * perDoc;
+    size_t bytes = saturatingAdd(sizeof(Calc), heap);
+    bytes = saturatingAdd(
+        bytes, req.reader->segments().size() * 4 * sizeof(DomainHandle));
+    for (const auto& [name, child] : subOps) {
+      unused(name);
+      bytes = saturatingAdd(bytes, child->facetBucketResidentBytes());
+    }
+    return bytes;
   }
 
 
   // Called after all segments have been collected for a TopN query to fill out
   // the DocList proto.  Hands off the merged collector's ranked output to the
-  // shared streaming emitter (emitDocsResponse), which blocks until field
-  // loading completes and sends multiple streaming responses (all but the
-  // last).  The empty-index case (no segments -> no collector ever obtained)
-  // writes an empty DocList into the request's lastResponse (with found=0 only
-  // when the count was requested); submitBody then sends it.
+  // shared emitter (emitDocsResponse), which blocks until field loading
+  // completes.  At the root or under another root-dispatched op it streams
+  // (all batches but the last go out as they complete); beneath a facet bucket
+  // slot the whole list assembles into the final response instead (see
+  // DocEmission).  The empty-index case (no segments -> no collector ever
+  // obtained) writes an empty DocList (with found=0 only when the count was
+  // requested); submitBody then sends it.
   void fillQueryTopNResponse(TopDocsReq::Calc& calc) {
     auto& qr = *this;
     auto* mergeableCollector = calc.collectorMerger.getData();
 
     if (mergeableCollector == nullptr) {
-      auto& searchResultProto = *calc.getTarget(nullptr);
-      auto& docListProto = oneofMut<luxir::api::DocList>(searchResultProto);
+      auto& docListProto = *calc.slotArm<luxir::api::DocList>(nullptr);
       // found is opt-in (see emitDocsResponse): only populate it when the
       // count was requested, so an empty index matches the non-empty contract.
       if (qr.topDocsProto.get_number) docListProto.found = 0;
@@ -2424,12 +2453,10 @@ public:
     // Resolve the DocList arm under the response lock: sub-op calculators
     // set the same arm through getTargetForSub while this emitter runs.
     auto getDocList = [&calc](SearchResponse* resp) -> luxir::api::DocList& {
-      luxir::api::DocList* docs = nullptr;
-      calc.getTarget(resp, [&](luxir::api::Val& val) {
-        docs = &oneofMut<luxir::api::DocList>(val);
-      });
-      return *docs;
+      return *calc.slotArm<luxir::api::DocList>(resp);
     };
+    DocEmission emission = calc.underBucketSlot()
+        ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
     if (mergeableCollector->useFieldSort) {
       auto& collector = *mergeableCollector->fieldCollector;
@@ -2444,7 +2471,8 @@ public:
         qr.topDocsProto.offset,
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
-        qr.topDocsProto.document_format);
+        qr.topDocsProto.document_format,
+        emission);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -2458,7 +2486,8 @@ public:
         qr.topDocsProto.offset,
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
-        qr.topDocsProto.document_format);
+        qr.topDocsProto.document_format,
+        emission);
     }
   }
 

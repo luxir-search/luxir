@@ -795,11 +795,11 @@ TEST(FilterCacheTest, existingReaderAcceptanceIsInertUntilCommit) {
   EXPECT_EQ(before.readerStableHits + 1,
             cache.counters().readerStableHits);
   for (auto& segment : reader->segments()) {
-    DocSet* accepted = acceptedUse->effectiveDocSet(
+    DomainHandle accepted = acceptedUse->effectiveDomain(
         (size_t) segment.ord, *reader,
         domains[(size_t) segment.ord]);
-    ASSERT_NE(nullptr, accepted);
-    EXPECT_EQ(1, accepted->card());
+    ASSERT_NE(nullptr, accepted.get());
+    EXPECT_EQ(1, accepted.get()->card());
   }
 }
 
@@ -2467,8 +2467,13 @@ TEST(FilterCacheTest,
   ASSERT_TRUE(hit.available);
   EXPECT_EQ(1, hit.count);
   EXPECT_EQ(1, SkipStats::wholeCountHits);
-  EXPECT_EQ(hit.docs.get(), hitUse->effectiveDocSet(
-      0, *reader, incoming.get()));
+  // The resolved membership is the incoming-domain composition, owned by the
+  // result rather than memoized in the Use.
+  ASSERT_NE(nullptr, hit.docs.get());
+  EXPECT_TRUE(hit.docs.isDeliverable());
+  DomainHandle composed = hitUse->effectiveDomain(0, *reader, incoming.get());
+  ASSERT_NE(nullptr, composed.get());
+  EXPECT_EQ(hit.docs.get()->card(), composed.get()->card());
 
   auto emptyDomain = docs(5, {});
   auto allDeleted = hitPlan.resolve(
@@ -3477,7 +3482,7 @@ TEST(FilterCacheTest, pruningBypassDoesNotOfferByproduct) {
   EXPECT_EQ(0u, cache->counters().byproductInserts);
 }
 
-TEST(FilterCacheTest, requestCachesLiveAndDomainCompositionsSeparately) {
+TEST(FilterCacheTest, domainCompositionsAreOwnedAndLiveCompositionIsMemoized) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
@@ -3496,20 +3501,48 @@ TEST(FilterCacheTest, requestCachesLiveAndDomainCompositionsSeparately) {
   auto domain = docs(3, {1, 2});
   auto otherDomain = docs(3, {0, 2});
 
-  DocSet* domainEffective = use->effectiveDocSet(
+  DomainHandle domainEffective = use->effectiveDomain(
       0, *reader, domain.get());
-  DocSet* otherEffective = use->effectiveDocSet(
+  DomainHandle otherEffective = use->effectiveDomain(
       0, *reader, otherDomain.get());
-  DocSet* domainAgain = use->effectiveDocSet(
+  DomainHandle domainAgain = use->effectiveDomain(
       0, *reader, domain.get());
   DocSet* liveEffective = use->effectiveDocSet(0, *reader);
+  DomainHandle liveAgain = use->effectiveDomain(0, *reader, nullptr);
 
-  EXPECT_EQ(1, domainEffective->card());
-  EXPECT_TRUE(domainEffective->get(1));
-  EXPECT_EQ(1, otherEffective->card());
-  EXPECT_TRUE(otherEffective->get(0));
-  EXPECT_EQ(domainEffective, domainAgain);
+  ASSERT_NE(nullptr, domainEffective.get());
+  EXPECT_EQ(1, domainEffective.get()->card());
+  EXPECT_TRUE(domainEffective.get()->get(1));
+  ASSERT_NE(nullptr, otherEffective.get());
+  EXPECT_EQ(1, otherEffective.get()->card());
+  EXPECT_TRUE(otherEffective.get()->get(0));
+  // A domain composition is owned by the caller and never memoized: the Use
+  // retains nothing about the domain, so a later short-lived domain at the
+  // same address cannot be served an earlier composition.
+  EXPECT_TRUE(domainEffective.isDeliverable());
+  ASSERT_NE(nullptr, domainAgain.get());
+  EXPECT_NE(domainEffective.get(), domainAgain.get());
+  EXPECT_EQ(1, domainAgain.get()->card());
+  // The request-stable value is memoized and borrowed.
+  ASSERT_NE(nullptr, liveEffective);
   EXPECT_EQ(2, liveEffective->card());
+  EXPECT_EQ(liveEffective, liveAgain.get());
+  EXPECT_FALSE(liveAgain.isDeliverable());
+
+  // An owned composition outlives both inputs: the domain it was composed
+  // with and the Use that composed it.
+  DomainHandle survivor;
+  {
+    FilterCache::UseRegistry scoped(*cache, reader->coreGen(), identities);
+    auto* scopedUse = scoped.get(FilterKey("domain-composition-scoped"));
+    scopedUse->offerRaw(0, docs(3, {0, 1}), 1);
+    auto transient = docs(3, {1, 2});
+    survivor = scopedUse->effectiveDomain(0, *reader, transient.get());
+  }
+  ASSERT_NE(nullptr, survivor.get());
+  EXPECT_TRUE(survivor.isDeliverable());
+  EXPECT_EQ(1, survivor.get()->card());
+  EXPECT_TRUE(survivor.get()->get(1));
 }
 
 TEST(FilterCacheTest, rawMaterializationEnforcesExhaustiveFlags) {
@@ -5134,7 +5167,9 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   ASSERT_NO_THROW(cache->validateForTest());
 }
 
-TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
+// A kNN filter under a facet bucket prepares against each bucket's domain, so
+// its reader-stable value must neither be served nor sighted for admission.
+TEST(FilterCacheIntegrationTest, nestedBucketKnnDoesNotRecordAdmission) {
   LuxirConfig config;
   config.queryCacheBytes = 0;
   LuxirNode node(config);
@@ -5161,9 +5196,17 @@ TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
     addFilter(nested, luxir::test::qb::knn(
         nested.mr(), "embedding_v", queryVector, 3, 0, true));
     request->execute();
-    EXPECT_FALSE(request->ok()) << request->toString();
-    EXPECT_NE(request->errorMsg().find("cannot emit per bucket"),
-              std::string::npos);
+    ASSERT_TRUE(request->ok()) << request->toString();
+    // Each bucket keeps its own three nearest of its ten documents.
+    const auto* groups = request->docList("q")->ops.at("groups")->facetResult();
+    ASSERT_NE(nullptr, groups);
+    const auto& near = std::get<luxir::api::ArrVal>(
+        groups->ops.at("near")->kind).v;
+    ASSERT_EQ(2u, near.size());
+    for (const auto& bucket : near) {
+      ASSERT_NE(nullptr, bucket.docList());
+      EXPECT_EQ(3, bucket.docList()->row_count);
+    }
   };
 
   runNested();
@@ -5175,7 +5218,7 @@ TEST(FilterCacheIntegrationTest, rejectedNestedKnnDoesNotRecordAdmission) {
 
   runKnnFilter(node, "filter_cache_knn_gate", queryVector, 3);
   EXPECT_EQ(0u, cache->counters().admissions)
-      << "rejected nested requests must not count as an admission sighting";
+      << "nested bucket requests must not count as an admission sighting";
   runKnnFilter(node, "filter_cache_knn_gate", queryVector, 3);
   auto built = cache->counters();
   EXPECT_EQ(1u, built.admissions);

@@ -291,11 +291,6 @@ public:
 
   class Use {
     struct RequestSlot {
-      struct DomainEffective {
-        DocSet* domain;
-        std::unique_ptr<DocSet> docs;
-      };
-
       std::mutex mutex;
       std::condition_variable condition;
       bool resolving = false;
@@ -305,7 +300,6 @@ public:
       std::vector<std::shared_ptr<const SegmentValue>> pins;
       std::vector<std::shared_ptr<const SegmentValue>> requestOwnedPins;
       std::unique_ptr<DocSet> liveEffective;
-      std::vector<DomainEffective> domainEffective;
       RequestMemTracker* routedTracker = nullptr;
       size_t routedBytes = 0;
       std::string routedDetail;
@@ -379,7 +373,7 @@ public:
 
     // Shared-cache insertion and request-local adoption both accept raw filter
     // membership. Domain and liveDocs composition happen afterward through the
-    // same effectiveDocSet seam.
+    // effectiveDocSet / effectiveDomain seam.
     std::shared_ptr<const SegmentValue> publishRaw(
         size_t segmentOrd, Probe& probe, std::unique_ptr<DocSet> raw,
         uint32_t buildCostMicros);
@@ -396,8 +390,19 @@ public:
     DocSet* adoptOwnedRaw(size_t segmentOrd, Probe& probe,
                           std::unique_ptr<DocSet> raw);
     DocSet* rawDocSet(size_t segmentOrd);
-    DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader,
-                            DocSet* domain = nullptr);
+    // The request-stable membership for a segment: the raw value, or raw AND
+    // liveDocs when the segment has deletes. Memoized for the request; the
+    // returned pointer stays valid for the life of this Use. Null when the
+    // membership is unavailable (no raw value, or the segment changed).
+    DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader);
+    // Membership composed with an incoming domain. A null domain, or the
+    // segment's canonical live set, borrows the request-stable value above.
+    // Any other domain yields a caller-owned intersection: nothing about that
+    // domain is retained, so short-lived domains (a facet bucket's per-segment
+    // DocSet) are safe here and cannot alias a later domain at the same
+    // address. A null view means the membership is unavailable.
+    DomainHandle effectiveDomain(size_t segmentOrd, IndexReader& reader,
+                                 DocSet* domain);
     void enableRoutedAccounting(
         size_t segmentOrd, RequestMemTracker& tracker,
         std::string_view detail);

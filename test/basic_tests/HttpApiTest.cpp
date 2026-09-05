@@ -507,6 +507,24 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
       response.body());
 }
 
+TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"pb1","http_pb_s":"x","price_i":1},{"id":"pb2","http_pb_s":"x","price_i":2},)"
+      R"({"id":"pb3","http_pb_s":"y","price_i":3}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"ops":{"cats":{"field_facet":{"field":"http_pb_s","limit":-1,)"
+      R"("ops":{"hits":{"top_docs":{"limit":1,"get_number":true,"fields":["id"],)"
+      R"("sorts":[{"field":"price_i","dir":"desc"}]}}}}}}})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(
+      R"({"ops":{"cats":{"buckets":[)"
+      R"({"val":"x","count":2,"hits":{"found":2,"docs":[{"id":"pb2"}]}},)"
+      R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n",
+      response.body());
+}
+
 TEST_F(HttpApiTest, shorthandCarriesRequestLevelKeys) {
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"sh1","http_sh_s":"x","title_w":"dune saga"},{"id":"sh2","http_sh_s":"y","title_w":"dune"}],"commit":{}})");

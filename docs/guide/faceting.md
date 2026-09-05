@@ -71,7 +71,7 @@ The controls are:
 | `mincount` | Drop buckets below this domain count. |
 | `missing` | Return the count of documents with no accepted value. |
 | `sorts` | Sort a string/ID facet by one named metric sub-operation. |
-| `ops` | Per-bucket sub-facets or numeric metrics on string/ID facets. |
+| `ops` | Per-bucket sub-facets, numeric metrics, or `top_docs` / `fusion` result lists on string/ID facets. |
 | `selected` | Values that refine the result set and remain visible as buckets. |
 | `selection_mode` | Match any selected value (default) or require all of them. |
 
@@ -233,6 +233,64 @@ only the documents in its parent bucket:
 This is one tree, not a follow-up query per bucket. Sub-facets and metrics run
 over the bucket domains as part of the original request.
 
+## Top documents per bucket
+
+A `top_docs` (or `fusion`) operation under a facet returns a ranked list of
+documents for every bucket. It is an ordinary operation: a `top_docs` applies
+its own `query`, `filter`, `sorts`, `limit`, `fields`, and `get_number` to
+that bucket's documents, and a `fusion` fuses its sources over them. A
+`top_docs` without a `query` selects every document in the bucket, and without
+`sorts` such a list is in index order, so give it the query whose ranking you
+want (a text query's scores do not depend on the bucket, so repeating the
+outer query ranks each bucket's documents the way the main result list does)
+or a sort:
+
+```json
+"category": {
+  "field_facet": {
+    "field": "category_s",
+    "limit": 10,
+    "ops": {
+      "best": {
+        "top_docs": {
+          "query": "title_w:dune",
+          "limit": 2,
+          "fields": ["id","title_w"],
+          "get_number": true
+        }
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "buckets": [
+    {
+      "val": "science-fiction",
+      "count": 31,
+      "best": {"found": 31, "docs": [{"id":"b1","title_w":"dune"}, {"id":"b7","title_w":"dune messiah"}]}
+    },
+    {
+      "val": "classic",
+      "count": 18,
+      "best": {"found": 18, "docs": [{"id":"b3","title_w":"dune"}, {"id":"b9","title_w":"children of dune"}]}
+    }
+  ]
+}
+```
+
+Per-bucket lists work under string/ID, range, and query facets. A per-bucket
+`top_docs` may carry its own `ops`, which see every document in the bucket
+that matches that `top_docs` (its query and filters), regardless of its
+`limit`; `fusion` accepts no `ops`. Two differences from a top-level list: it
+is never streamed in batches, so `batch_size` is ignored and every requested
+row arrives in the final response; and a `document_format` left at the default
+follows the transport default rather than the enclosing operation's format.
+Each bucket is ranked independently, which costs one pass over the bucket's
+documents per bucket.
+
 ## Range facets
 
 A `range_facet` builds ordered, half-open `[start,end)` buckets over an int,
@@ -379,7 +437,8 @@ the facet sees. Query facets have no bucket-count limit; request size is the
 natural bound.
 
 The `ops` map runs independently over each bucket's document domain. It accepts
-the same expression metrics and nested facets as other fixed-bucket facets.
+the same expression metrics, nested facets, and per-bucket `top_docs` as other
+fixed-bucket facets.
 
 For multi-select navigation, put a nonempty `selected` on a query facet
 directly under `top_docs.ops`. Values are bucket names:

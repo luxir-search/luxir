@@ -3235,22 +3235,6 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
       << req->toString();
 }
 
-TEST_F(FacetTest, topDocsUnderFacetRejected) {
-  CollectionHelper helper;
-  helper.index(flatdoc("id", "a", "cat_s", "x"), UpdateMessage::COMMIT);
-
-  auto req = localReq(luxirNode->getSearchEngine());
-  req->collection("main");
-  auto& facet = req->facet("f", "cat_s");
-  facet.topDocs("bucket_docs").allQuery().fields({"id"}).getNumber().limit(-1);
-  req->execute();
-
-  ASSERT_FALSE(req->ok());
-  EXPECT_NE(req->errorMsg().find("facet 'f'"), std::string::npos);
-  EXPECT_NE(req->errorMsg().find("child op 'bucket_docs' cannot emit per bucket"),
-            std::string::npos);
-}
-
 // Nested facet: a string facet under a string facet, returning a per-parent-
 // bucket sub-facet (ops[name].arr.v[i].facet parallel to bucket_ids).
 TEST_F(FacetTest, nestedStringFacet) {

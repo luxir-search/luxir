@@ -951,17 +951,16 @@ public:
       Query::Weight::PreparedWeight* prepared = nullptr) const {
     if (source == Source::EMPTY) return {};
     if (source == Source::ACCEPTED_EXISTING) {
-      DocSet* docs = cacheUse->effectiveDocSet(
-          (size_t) segment.ord, reader, incomingDomain);
-      if (docs == nullptr) {
+      DomainHandle docs = cacheUse->effectiveDomain(
+          (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
+      if (docs.get() == nullptr) {
         throw std::logic_error(
             "accepted complete membership lost a segment value");
       }
       record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
              SkipStats::wholeFieldSortHits);
-      return {
-        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
-      };
+      int64_t card = docs.get()->card();
+      return {true, std::move(docs), card};
     }
     assert(source == Source::WEIGHT && weight != nullptr);
     if (weight->needsPrepare()) {
@@ -1001,14 +1000,13 @@ public:
 
     auto probe = cacheUse->probe((size_t) segment.ord);
     if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-      DocSet* docs = cacheUse->effectiveDocSet(
-          (size_t) segment.ord, reader, incomingDomain);
-      if (docs == nullptr) return {};
+      DomainHandle docs = cacheUse->effectiveDomain(
+          (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
+      if (docs.get() == nullptr) return {};
       record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
              SkipStats::wholeFieldSortHits);
-      return {
-        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
-      };
+      int64_t card = docs.get()->card();
+      return {true, std::move(docs), card};
     }
     if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
       if (domainDependence
@@ -1021,13 +1019,14 @@ public:
       uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
       cacheUse->publishRaw(
           (size_t) segment.ord, probe, std::move(raw), buildCostMicros);
-      DocSet* docs = cacheUse->effectiveDocSet(
-          (size_t) segment.ord, reader, incomingDomain);
-      if (docs == nullptr) return {};
+      DomainHandle docs = cacheUse->effectiveDomain(
+          (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
+      if (docs.get() == nullptr) return {};
       record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
              SkipStats::wholeFieldSortBuilds);
+      int64_t card = docs.get()->card();
       return {
-        true, DomainHandle::pinned(docs, lifetime), (int64_t) docs->card()
+        true, std::move(docs), card
       };
     }
 
@@ -1329,8 +1328,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   auto probe = use->probe((size_t) segment.ord);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    return DomainHandle::borrowed(use->effectiveDocSet(
-        (size_t) segment.ord, reader, domain));
+    return use->effectiveDomain((size_t) segment.ord, reader, domain);
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
@@ -1355,16 +1353,13 @@ inline DomainHandle materializeEffectiveFilter(
         && !weight.needsScores() && !weight.allowsPruning()) {
       auto raw = materializeRawFilter(weight, prepared, segment);
       use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
-      return DomainHandle::borrowed(use->effectiveDocSet(
-          (size_t) segment.ord, reader, domain));
+      return use->effectiveDomain((size_t) segment.ord, reader, domain);
     }
     return DomainHandle(
         materialize(weight, prepared, segment, domain));
   }
 
-  DocSet* effective = use->effectiveDocSet(
-      (size_t) segment.ord, reader, domain);
-  return DomainHandle::borrowed(effective);
+  return use->effectiveDomain((size_t) segment.ord, reader, domain);
 }
 
 inline DomainHandle materializeEffectiveFilter(

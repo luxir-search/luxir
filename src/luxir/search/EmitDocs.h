@@ -46,6 +46,23 @@
 
 namespace luxir {
 
+// Batch-local row index and segment run length. One batch holds at most
+// INT32_MAX rows (the DocList row_count is an int32); the same width serves
+// the segment-sorted permutation and the per-segment run lengths.
+using RowIndex = uint32_t;
+
+// How an op's ranked list reaches the client. STREAM: transport batches of
+// bounded size, every batch but the last sent as it completes (the emitter
+// may pause on backpressure and outlive the request body). FINAL_RESPONSE:
+// one batch holding every row, assembled into the request's final response.
+// Required beneath a facet bucket slot: an intermediate response there would
+// carry only a skeletal facet path, and a bucket binding does not outlive its
+// bucket, so nothing may pause.
+enum class DocEmission : uint8_t {
+  STREAM,
+  FINAL_RESPONSE
+};
+
 // Exact missing_val support for single-valued columns.  The sentinel
 // contract (v[i] != missing_val) is only 100% if the filler provably does
 // not occur as a real value in the batch, so the filler is chosen per
@@ -191,7 +208,7 @@ inline uint8_t* allocStringColumn(luxir::api::Column& fieldCol, size_t columnSiz
 // No-op if the field isn't in the segment.  Extracted so the stored-fields
 // path can fall back here when a segment predates the STORED flag.
 inline void loadStrColForSegment(SearchRequest& req, std::string_view field, FieldType& fieldType,
-                                 std::span<uint8_t> idxSpan, std::span<const segdoc> segDocs,
+                                 std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
                                  std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
                                  uint8_t* present, std::pmr::memory_resource& mr)
 {
@@ -257,8 +274,8 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
 inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, FieldType& fieldType,
                                   std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
                                   uint8_t* present,
-                                  std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                                  const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg,
+                                  std::span<const segdoc> segDocs, std::span<RowIndex> sortedIdx,
+                                  const std::span<RowIndex> segRunLength, oneapi::tbb::task_group* tg,
                                   std::pmr::memory_resource& mr)
 {
   int32_t start = 0;
@@ -272,8 +289,8 @@ inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, Fi
 }
 
 inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
-                       std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                       const std::span<uint8_t> segRunLength,
+                       std::span<const segdoc> segDocs, std::span<RowIndex> sortedIdx,
+                       const std::span<RowIndex> segRunLength,
                        SearchResponse::ColumnsType& columnsProto, size_t colCap,
                        oneapi::tbb::task_group* tg, PendingCols& pendingCols, std::pmr::memory_resource& mr)
 {
@@ -336,8 +353,8 @@ struct DoubleColEmit {
 // caller waits on "tg" before releasing the resources).
 template <typename Emit>
 inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
-                       std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                       const std::span<uint8_t> segRunLength,
+                       std::span<const segdoc> segDocs, std::span<RowIndex> sortedIdx,
+                       const std::span<RowIndex> segRunLength,
                        SearchResponse::ColumnsType& columnsProto, size_t colCap,
                        oneapi::tbb::task_group* tg, PendingCols& pendingCols, std::pmr::memory_resource& mr)
 {
@@ -425,7 +442,7 @@ inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, std::
 }
 
 inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view field,
-                                          std::span<uint8_t> idxSpan,
+                                          std::span<RowIndex> idxSpan,
                                           std::span<const segdoc> segDocs,
                                           std::span<luxir::api::Vector> target, std::pmr::memory_resource& mr)
 {
@@ -449,7 +466,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view f
 }
 
 inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view field,
-                                         std::span<uint8_t> idxSpan,
+                                         std::span<RowIndex> idxSpan,
                                          std::span<const segdoc> segDocs,
                                          std::span<luxir::api::ArrVector> target, std::pmr::memory_resource& mr)
 {
@@ -484,8 +501,8 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view fi
 // Multi-valued output:  Column.multi_vec - one ArrVector per doc; missing
 // docs (or docs that indexed an empty list) leave an empty ArrVector.
 inline void loadVectorCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
-                          std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                          const std::span<uint8_t> segRunLength,
+                          std::span<const segdoc> segDocs, std::span<RowIndex> sortedIdx,
+                          const std::span<RowIndex> segRunLength,
                           SearchResponse::ColumnsType& columnsProto, size_t colCap,
                           oneapi::tbb::task_group* tg, std::pmr::memory_resource& mr)
 {
@@ -549,8 +566,8 @@ inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const st
 // present but missing a specific field added later).
 inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
                              std::vector<StoredReq> reqsOwned,
-                             std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                             const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg,
+                             std::span<const segdoc> segDocs, std::span<RowIndex> sortedIdx,
+                             const std::span<RowIndex> segRunLength, oneapi::tbb::task_group* tg,
                              std::pmr::memory_resource& mr)
 {
   // Move into a shared_ptr so every segment task can safely reference the
@@ -719,7 +736,10 @@ struct ReturnField {
 // emitter can therefore outlive submitBody(): it is allocated in the request
 // arena, and everything its callbacks reference is pinned by req.rootCalc
 // (calculator tree: collector output, getTarget chain) or owned by the
-// callbacks themselves.  The final batch is assembled into req.lastResponse
+// callbacks themselves.  That pin covers STREAM emitters only; a
+// FINAL_RESPONSE emitter (a facet bucket child) runs to completion inside
+// produce() and its callbacks are never used again, so its calculator may be
+// destroyed with the bucket.  The final batch is assembled into req.lastResponse
 // but NOT sent here - the completion protocol on SearchRequest (streamEnded /
 // bodyDone) decides who sends it.  All but the final response have more=true.
 class DocEmitter {
@@ -843,7 +863,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     bool returnScores = getScores;
 
     // indirect sort the documents so we can access them in order of both segment and docid
-    std::vector<uint8_t> sortedIdx(segDocs.size()); // uint8_t works for up to 256 docs.
+    std::vector<RowIndex> sortedIdx(segDocs.size());
     std::iota(sortedIdx.begin(), sortedIdx.end(), 0);
     std::ranges::sort(sortedIdx, [&segDocs](auto a, auto b) {
       return segDocs[a] < segDocs[b];
@@ -854,9 +874,9 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
                  | std::views::chunk_by([&segDocs](auto a, auto b) {
       return segDocs[a].segment() == segDocs[b].segment();
     })
-                 | std::views::transform([](const auto& run) { return (uint8_t)run.size(); });
+                 | std::views::transform([](const auto& run) { return (RowIndex)run.size(); });
 
-    std::vector<uint8_t> segRunLength;
+    std::vector<RowIndex> segRunLength;
     std::ranges::copy(bySeg, std::back_inserter(segRunLength));
 
     // Row-placed fields (ReturnField::rows) load into arena scratch columns
@@ -1173,10 +1193,16 @@ void emitDocsResponse(SearchRequest& req,
                       int64_t offset,
                       bool getNumber,
                       bool getScores,
-                      luxir::api::DocFormat docFormat)
+                      luxir::api::DocFormat docFormat,
+                      DocEmission emission)
 {
   int32_t maxBatchSize = batchSize;
-  if (maxBatchSize <= 0) {
+  if (emission == DocEmission::FINAL_RESPONSE) {
+    if (numCollected > std::numeric_limits<int32_t>::max()) {
+      throw std::length_error("too many documents for one response batch");
+    }
+    maxBatchSize = (int32_t)std::max<int64_t>(numCollected, 1);
+  } else if (maxBatchSize <= 0) {
     maxBatchSize = 100;  // what should the default be?
   } else if (maxBatchSize > 256) {
     maxBatchSize = 256;

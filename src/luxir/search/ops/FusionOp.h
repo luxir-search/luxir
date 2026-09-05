@@ -40,6 +40,10 @@ namespace luxir {
 // Sub-ops run over the fused candidate set: every doc in any source ranked
 // list after shared and per-source filters, exactly the set found counts.
 // Fusion limit and offset do not affect this domain; source ops are rejected.
+//
+// As a facet bucket child, one independent fusion runs per bucket over that
+// bucket's domain and its DocList lands in the bucket's slot (see
+// canEmitAsBucketChild).
 class FusionOp : public SearchOp {
 public:
   const ReqFusion& fusionProto;
@@ -113,7 +117,8 @@ public:
     // op.sources.size(), the last delivery launches doFusion.
     std::atomic<int32_t> sourcesDelivered{0};
 
-    Calc(FusionOp& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1) {
+    Calc(FusionOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : SearchOp::Calculator(op, parent, slot, numSlots) {
       auto numSources = op.sources.size();
       auto numSegs = op.req.reader->segments().size();
       sourceCalcs.reserve(numSources);
@@ -144,9 +149,11 @@ public:
 
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       auto* ourVal = parent->getTargetForSub(resp, this);
-      assert(ourVal != nullptr && (std::holds_alternative<luxir::api::DocList>(ourVal->kind)
-        || std::holds_alternative<std::monostate>(ourVal->kind)));
-      auto& dl = oneofMut<luxir::api::DocList>(*ourVal);
+      assert(ourVal != nullptr);
+      auto& target = slotTarget<luxir::api::ArrVal>(*ourVal, resp->mr);
+      assert(std::holds_alternative<luxir::api::DocList>(target.kind)
+             || std::holds_alternative<std::monostate>(target.kind));
+      auto& dl = oneofMut<luxir::api::DocList>(target);
       return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
     }
 
@@ -316,7 +323,7 @@ public:
       for (auto& ranked : rankedPerSource) {
         for (int32_t rank = 0; rank < (int32_t)ranked.size(); rank++) {
           // 1-based rank; RRF: 1 / (k + rank).
-          float contrib = 1.0f / (float)(k + rank + 1);
+          float contrib = 1.0f / (float)((int64_t)k + rank + 1);
           fused[ranked[rank]] += contrib;
         }
       }
@@ -356,12 +363,10 @@ public:
       int64_t totalHits = (int64_t)fused.size();
 
       auto getDocList = [this](SearchResponse* resp) -> luxir::api::DocList& {
-        luxir::api::DocList* docs = nullptr;
-        getTarget(resp, [&](luxir::api::Val& val) {
-          docs = &oneofMut<luxir::api::DocList>(val);
-        });
-        return *docs;
+        return *slotArm<luxir::api::DocList>(resp);
       };
+      DocEmission emission = underBucketSlot()
+          ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
 
       emitDocsResponse(op.req, getDocList,
         numCollected,
@@ -373,13 +378,34 @@ public:
         op.fusionProto.offset,
         op.fusionProto.get_number,
         op.fusionProto.get_scores,
-        op.fusionProto.document_format);
+        op.fusionProto.document_format,
+        emission);
     }
   };
 
 
   Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
-    return new Calc(*this, parent);
+    return new Calc(*this, parent, slot, numSlots);
+  }
+
+  bool canEmitAsBucketChild() const override { return true; }
+
+  // Sources plus the fusion state retained until the bucket's list is emitted:
+  // the fused (segdoc, score) list can hold the union of every source window.
+  size_t facetBucketResidentBytes() const override {
+    size_t bytes = saturatingAdd(
+        sizeof(Calc),
+        req.reader->segments().size() * 2 * sizeof(DomainHandle));
+    for (auto* source : sources) {
+      bytes = saturatingAdd(bytes, source->facetBucketResidentBytes());
+      bytes = saturatingAdd(
+          bytes, (size_t)source->topCount * sizeof(std::pair<segdoc, float>));
+    }
+    for (const auto& [name, child] : subOps) {
+      unused(name);
+      bytes = saturatingAdd(bytes, child->facetBucketResidentBytes());
+    }
+    return bytes;
   }
 };
 

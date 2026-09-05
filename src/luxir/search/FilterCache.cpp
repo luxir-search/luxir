@@ -682,9 +682,6 @@ void FilterCache::Use::enableRoutedAccounting(
     includeBytes(value->ramBytesUsed());
   }
   include(requestSlot.liveEffective.get());
-  for (auto& effective : requestSlot.domainEffective) {
-    include(effective.docs.get());
-  }
   tracker.charge(bytes, "domain variants", detail);
   requestSlot.routedTracker = &tracker;
   requestSlot.routedDetail = detail;
@@ -692,10 +689,9 @@ void FilterCache::Use::enableRoutedAccounting(
 }
 
 DocSet* FilterCache::Use::effectiveDocSet(
-    size_t segmentOrd, IndexReader& reader, DocSet* domain) {
-  // PrepareContext domains already carry liveness, so that path is raw AND
-  // domain. Without a domain this is raw AND liveDocs. Any composed set is
-  // memoized only in this request's Use and is never published to the cache.
+    size_t segmentOrd, IndexReader& reader) {
+  // Raw AND liveDocs, memoized only in this request's Use and never published
+  // to the cache. Domain composition lives in effectiveDomain.
   if (segmentOrd >= readerSegments.size()
       || segmentOrd >= reader.segments().size()) {
     return nullptr;
@@ -715,27 +711,12 @@ DocSet* FilterCache::Use::effectiveDocSet(
         || reader.commitTime() != readerVersion) {
       return nullptr;
     }
-    DocSet* canonical = segment.liveDocs() == nullptr
-        ? nullptr : &segment.liveDocs()->docset();
-    if (domain != nullptr && domain != canonical) return nullptr;
     return value->docSet(segmentOrd, readerSegments[segmentOrd]);
   }
   auto& requestSlot = *requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
   DocSet* raw = requestSlot.raw;
   if (raw == nullptr) return nullptr;
-  if (domain != nullptr) {
-    for (auto& effective : requestSlot.domainEffective) {
-      if (effective.domain == domain) return effective.docs.get();
-    }
-    std::array<DocSet*, 2> sets{raw, domain};
-    auto docs = DocSet::intersect(sets);
-    docs->card();
-    DocSet* result = docs.get();
-    requestSlot.chargeRouted(docs->ramBytesUsed());
-    requestSlot.domainEffective.push_back({domain, std::move(docs)});
-    return result;
-  }
 
   if (segment.liveDocs() == nullptr) return raw;
   if (requestSlot.liveEffective != nullptr) {
@@ -748,6 +729,29 @@ DocSet* FilterCache::Use::effectiveDocSet(
   requestSlot.chargeRouted(docs->ramBytesUsed());
   requestSlot.liveEffective = std::move(docs);
   return requestSlot.liveEffective.get();
+}
+
+DomainHandle FilterCache::Use::effectiveDomain(
+    size_t segmentOrd, IndexReader& reader, DocSet* domain) {
+  // PrepareContext domains already carry liveness, so a composed set is raw
+  // AND domain. The canonical live set is the request-stable value itself.
+  if (domain != nullptr && segmentOrd < reader.segments().size()) {
+    auto& segment = reader.segments()[segmentOrd];
+    DocSet* canonical = segment.liveDocs() == nullptr
+        ? nullptr : &segment.liveDocs()->docset();
+    if (domain == canonical) domain = nullptr;
+  }
+  if (domain == nullptr) {
+    return DomainHandle::borrowed(effectiveDocSet(segmentOrd, reader));
+  }
+  // A reader-stable value is live-exact for the canonical domain only.
+  if (scope_ == FilterKeyScope::READER_STABLE) return {};
+  DocSet* stable = effectiveDocSet(segmentOrd, reader);
+  if (stable == nullptr) return {};
+  std::array<DocSet*, 2> sets{stable, domain};
+  auto docs = DocSet::intersect(sets);
+  docs->card();
+  return DomainHandle(std::move(docs));
 }
 
 size_t FilterCache::Use::ownedBytesForTest() {

@@ -295,14 +295,8 @@ public:
     };
 
     void facetResult(MergeableIntFacet& merged) {
-      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      luxir::api::FacetResult* result = nullptr;
-      getTarget(nullptr, [&](luxir::api::Val& val) {
-        routeTarget<luxir::api::ArrVal>(val, mr, [&](luxir::api::Val& target) {
-          result = &oneofMut<luxir::api::FacetResult>(target);
-        });
-      });
-      auto& facetResultProto = *result;
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result
+      auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -462,14 +456,8 @@ public:
     }
 
     void facetResult(MergeableStrFacet& merged) {
-      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      luxir::api::FacetResult* result = nullptr;
-      getTarget(nullptr, [&](luxir::api::Val& val) {
-        routeTarget<luxir::api::ArrVal>(val, mr, [&](luxir::api::Val& target) {
-          result = &oneofMut<luxir::api::FacetResult>(target);
-        });
-      });
-      auto& facetResultProto = *result;
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result
+      auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -630,12 +618,7 @@ public:
 
     void facetResult(MergeableFixedBuckets& merged) {
       auto& mr = op.req.lastResponse->mr;
-      luxir::api::FacetResult* result = nullptr;
-      getTarget(nullptr, [&](luxir::api::Val& val) {
-        routeTarget<luxir::api::ArrVal>(val, mr, [&](luxir::api::Val& target) {
-          result = &oneofMut<luxir::api::FacetResult>(target);
-        });
-      });
+      auto* result = slotArm<luxir::api::FacetResult>(nullptr);
 
       std::vector<uint8_t> pinned(fixedOp().bucketCount());
       for (size_t bucket : fixedOp().selectedBucketIndexes()) {
@@ -679,13 +662,8 @@ public:
 
       size_t residentBytesPerBucket = 0;
       for (SearchOp* child : children) {
-        size_t childBytes = child->facetBucketResidentBytes();
-        if (childBytes > std::numeric_limits<size_t>::max()
-                             - residentBytesPerBucket) {
-          residentBytesPerBucket = std::numeric_limits<size_t>::max();
-          break;
-        }
-        residentBytesPerBucket += childBytes;
+        residentBytesPerBucket = saturatingAdd(
+            residentBytesPerBucket, child->facetBucketResidentBytes());
       }
       size_t bindingBlockSize = std::max<size_t>(
           1, fixedOp().bindingStateChunkBytes()
@@ -1094,7 +1072,10 @@ public:
         MergeableFixedBuckets& data, int32_t segnum,
         DocSet* domain) override {
       auto& segment = queryOp().reader.segments()[(size_t)segnum];
-      bool countOnly = domain == nullptr && queryOp().subOps.empty();
+      // The count pass never retains matches (result children re-materialize
+      // their selected buckets), so the direct count is eligible whenever the
+      // whole segment is the domain.
+      bool countOnly = domain == nullptr;
       for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
         if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
           int64_t count = queryOp().bucketWeights[bucket]->count(segment);

@@ -35,6 +35,12 @@ using ReqRangeFacet = luxir::api::RangeFacet;
 using ReqQueryFacet = luxir::api::QueryFacet;
 using ReqSortList = std::span<const luxir::api::SortSpec>;
 
+// Byte estimates compose across calculator trees; saturate instead of wrapping.
+inline size_t saturatingAdd(size_t a, size_t b) {
+  return a > std::numeric_limits<size_t>::max() - b
+      ? std::numeric_limits<size_t>::max() : a + b;
+}
+
 struct CollectionRequirements {
   bool needRankedDocs = false;
   bool needExactCount = false;
@@ -162,16 +168,14 @@ public:
 
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
 
-    // Route an emitter to its ordinary Val or to its bucket slot. Array
-    // creation and the visitor both run under the response lock when this is
-    // called from getTarget's visitor.
-    template <typename ArrayArm, typename Visitor>
-    void routeTarget(luxir::api::Val& val, std::pmr::memory_resource& mr,
-                     Visitor&& visitor) {
-      if (slot == -1) {
-        visitor(val);
-        return;
-      }
+    // The Val this calculator fills: `val` itself for an ordinary op, or its
+    // bucket slot in val's ArrayArm (created on first use, sized to numSlots).
+    // Array creation runs under the response lock when this is called from
+    // getTarget's visitor or from getTargetForSub.
+    template <typename ArrayArm>
+    luxir::api::Val& slotTarget(luxir::api::Val& val,
+                                std::pmr::memory_resource& mr) {
+      if (slot == -1) return val;
       assert(slot >= 0);
       assert(slot < numSlots);
       auto& arr = oneofMut<ArrayArm>(val);
@@ -179,7 +183,25 @@ public:
         build::allocArray(arr.v, (size_t)numSlots, mr);
       }
       using Element = std::remove_const_t<typename decltype(arr.v)::element_type>;
-      visitor(const_cast<Element&>(arr.v[(size_t)slot]));
+      return const_cast<Element&>(arr.v[(size_t)slot]);
+    }
+
+    // Route an emitter to its ordinary Val or to its bucket slot.
+    template <typename ArrayArm, typename Visitor>
+    void routeTarget(luxir::api::Val& val, std::pmr::memory_resource& mr,
+                     Visitor&& visitor) {
+      visitor(slotTarget<ArrayArm>(val, mr));
+    }
+
+    // True when this calculator or any ancestor fills a facet bucket slot.
+    // Results beneath a bucket assemble into the final response only: an
+    // intermediate response would carry a skeletal path, and bucket bindings
+    // do not outlive their bucket.
+    bool underBucketSlot() const {
+      for (const Calculator* c = this; c != nullptr; c = c->parent) {
+        if (c->slot != -1) return true;
+      }
+      return false;
     }
 
     ExecutionProfileScope profilePiece(ExecutionProfileRun* run, int32_t segnum) {
@@ -217,6 +239,20 @@ public:
     }
     luxir::api::Val* getTarget(SearchResponse* resp) {
       return getTarget(resp, [](luxir::api::Val&){});
+    }
+
+    // Resolve this calculator's result Val in `resp` (null: the request's
+    // accumulating response), route it to the bucket slot when this
+    // calculator fills one, and establish the Arm there, all under the
+    // response lock. The returned pointer is stable; fill it afterwards.
+    template <typename Arm>
+    Arm* slotArm(SearchResponse* resp) {
+      resp = resp ? resp : op.req.lastResponse;
+      Arm* arm = nullptr;
+      getTarget(resp, [&](luxir::api::Val& val) {
+        arm = &oneofMut<Arm>(slotTarget<luxir::api::ArrVal>(val, resp->mr));
+      });
+      return arm;
     }
 
     // Called by a subCalculator on us to get the target for the subCalculator to set.
