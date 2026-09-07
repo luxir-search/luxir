@@ -1,9 +1,14 @@
 #include "luxir/analysis/Analyzer.h"
 
+#include <algorithm>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include "luxir/api/luxir_types.hpp"
 
 #include <uni_algo/case.h>
 #include <uni_algo/norm.h>
@@ -379,6 +384,144 @@ std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream>
 
 std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> source) {
   return std::make_unique<AccentFoldFilter>(std::move(source));
+}
+
+// ---------------------------------------------------------------------------
+// Component registry
+
+namespace {
+
+std::unique_ptr<Tokenizer> makeWhitespaceTokenizer() { return std::make_unique<WhitespaceTokenizer>(); }
+std::unique_ptr<Tokenizer> makeKeywordTokenizer() { return std::make_unique<KeywordTokenizer>(); }
+std::unique_ptr<TokenStream> makeLowercaseFilter(std::unique_ptr<TokenStream> source) {
+  return std::make_unique<LowercaseFilter>(std::move(source));
+}
+
+void requireNoParams(const api::AnalyzerComponent& def, std::string_view kind) {
+  if (def.params.empty()) return;
+  std::string got;
+  for (const auto& [key, val] : def.params) {
+    if (!got.empty()) got += ", ";
+    got += key;
+  }
+  throw std::invalid_argument(std::string(kind) + " '" + std::string(def.name) +
+                              "' takes no parameters (got: " + got + ")");
+}
+
+// A parameterless tokenizer / filter: any params are rejected and create()
+// forwards to the plain constructor function Make.  Stateful marks a stage
+// that buffers across tokens (see TokenStreamFactory::stateful).
+template <std::unique_ptr<Tokenizer> (*Make)(), bool Stateful = false>
+std::unique_ptr<const TokenizerFactory> plainTokenizer(const api::AnalyzerComponent& def) {
+  requireNoParams(def, "tokenizer");
+  struct Factory : TokenizerFactory {
+    std::unique_ptr<Tokenizer> create() const override { return Make(); }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = std::string(def.name);
+  factory->stateful = Stateful;
+  return factory;
+}
+
+template <std::unique_ptr<TokenStream> (*Make)(std::unique_ptr<TokenStream>), bool Stateful = false>
+std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerComponent& def) {
+  requireNoParams(def, "filter");
+  struct Factory : TokenFilterFactory {
+    std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+      return Make(std::move(source));
+    }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = std::string(def.name);
+  factory->stateful = Stateful;
+  return factory;
+}
+
+struct TokenizerEntry {
+  std::string_view name;
+  std::unique_ptr<const TokenizerFactory> (*make)(const api::AnalyzerComponent&);
+};
+struct FilterEntry {
+  std::string_view name;
+  std::unique_ptr<const TokenFilterFactory> (*make)(const api::AnalyzerComponent&);
+};
+
+// The registries: adding a component is one line here plus its factory (a
+// param-taking one reads its Val params in the maker).  unicode_word is
+// stateful: it carries a segmentation cursor and rebuilds it in reset().
+constexpr TokenizerEntry TOKENIZERS[] = {
+  {"whitespace", plainTokenizer<makeWhitespaceTokenizer>},
+  {"keyword", plainTokenizer<makeKeywordTokenizer>},
+  {"unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>},
+};
+constexpr FilterEntry FILTERS[] = {
+  {"lowercase", plainFilter<makeLowercaseFilter>},
+  {"nfkc_cf", plainFilter<makeNfkcCasefoldFilter>},
+  {"fold", plainFilter<makeAccentFoldFilter>},
+};
+
+template <class Entry, size_t N>
+std::string joinNames(const Entry (&table)[N]) {
+  std::string out;
+  for (const auto& entry : table) {
+    if (!out.empty()) out += ", ";
+    out += entry.name;
+  }
+  return out;
+}
+
+}  // namespace
+
+std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def) {
+  if (def.name.empty()) {
+    throw std::invalid_argument("tokenizer component has no name; valid tokenizers: " + joinNames(TOKENIZERS));
+  }
+  for (const auto& entry : TOKENIZERS) {
+    if (entry.name == def.name) return entry.make(def);
+  }
+  throw std::invalid_argument("unknown tokenizer '" + std::string(def.name) +
+                              "'; valid tokenizers: " + joinNames(TOKENIZERS));
+}
+
+std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def) {
+  if (def.name.empty()) {
+    throw std::invalid_argument("filter component has no name; valid filters: " + joinNames(FILTERS));
+  }
+  for (const auto& entry : FILTERS) {
+    if (entry.name == def.name) return entry.make(def);
+  }
+  throw std::invalid_argument("unknown filter '" + std::string(def.name) +
+                              "'; valid filters: " + joinNames(FILTERS));
+}
+
+std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
+  api::AnalyzerComponent whitespace;
+  whitespace.name = "whitespace";
+  auto tokenizer = makeTokenizerFactory(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
+  std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
+  filters.reserve(def.filters.size());
+  for (const auto& filter : def.filters) {
+    filters.push_back(makeTokenFilterFactory(filter));
+  }
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters)));
+}
+
+Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
+                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs)
+    : tokenizer(std::move(tok)),
+      filters(std::move(fs)),
+      fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
+      stateful(tokenizer->stateful ||
+               std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
+
+std::unique_ptr<TokenChain> Analyzer::createChain() const {
+  std::unique_ptr<Tokenizer> head = fusedHead ? makeStandardTokenizer() : tokenizer->create();
+  auto& headRef = *head;
+  std::unique_ptr<TokenStream> tail = std::move(head);
+  for (size_t i = fusedHead ? 1 : 0; i < filters.size(); i++) {
+    tail = filters[i]->create(std::move(tail));
+  }
+  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
 }
 
 }  // namespace luxir

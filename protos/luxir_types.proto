@@ -1177,9 +1177,20 @@ message CacheControlResponse {
 // Schema
 //
 
+// One analysis-chain component - a tokenizer or a token filter - named by its
+// registry name, plus its parameters.  params values are typed JSON values
+// (string, number, bool, string list), so a stemmer takes
+// {"language": "english"} and a stop filter {"words": ["a", "the"]}; a
+// component that takes no parameters rejects any.  The JSON dialect accepts a
+// bare string for a parameterless component: "lowercase" == {"name": "lowercase"}.
+message AnalyzerComponent {
+  string name = 1;               // e.g., "unicode_word", "nfkc_cf"
+  map<string, Val> params = 2;
+}
+
 message AnalyzerDef {
-  string tokenizer = 1;           // e.g., "whitespace", "keyword"
-  repeated string filters = 2;    // e.g., ["lowercase"] - applied in order
+  AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
+  repeated AnalyzerComponent filters = 2;  // applied in order, e.g., ["nfkc_cf", "fold"]
 }
 
 // Vector similarity metric.  NONE = storage-only, not kNN-searchable;

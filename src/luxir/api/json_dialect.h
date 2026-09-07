@@ -41,6 +41,11 @@
 // - FieldDef reads accept a bare STRING as type-only sugar: {"year": "int"} ==
 //   {"year": {"type": "int"}} in a schema's fields/templates maps. Writes stay
 //   canonical (the object form).
+// - AnalyzerComponent (an AnalyzerDef tokenizer or filter) reads accept a bare
+//   STRING as name-only sugar: "lowercase" == {"name": "lowercase"}. Unlike the
+//   other sugars, writes use the bare string whenever params is empty, so the
+//   common parameterless chain echoes exactly as written; only a component with
+//   params writes the object form.
 // - SortSpec reads `field` as an alias for `expr`, for the common bare-column sort.
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
 // - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
@@ -525,6 +530,61 @@ struct from<JSON, luxir::api::FieldDef> {
           return bool(ctx.error);
         },
         [](auto &, auto &) {});
+  }
+};
+
+// ----- AnalyzerComponent: canonical object, or a bare string (name-only sugar) -----
+template <>
+struct from<JSON, luxir::api::AnalyzerComponent> {
+  template <auto Opts>
+  static void op(luxir::api::AnalyzerComponent &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.name, ctx, it, end);
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "name") {
+            util::from_json<V>(value.name, ctx, vit, vend);
+          } else if (key == "params") {
+            decltype(auto) params = ::hpp_proto::detail::as_modifiable(ctx, value.params);
+            glz::util::parse_repeated<V>(true, params, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// Writes: the bare name for a parameterless component, else {"name", "params"}.
+template <>
+struct to<JSON, luxir::api::AnalyzerComponent> {
+  template <auto Opts, class B>
+  static void op(const luxir::api::AnalyzerComponent &value, is_context auto &ctx, B &b,
+                 auto &ix) noexcept {
+    if (value.params.empty()) {
+      serialize<JSON>::template op<Opts>(value.name, ctx, b, ix);
+      return;
+    }
+    dump<"{\"name\":">(b, ix);
+    serialize<JSON>::template op<Opts>(value.name, ctx, b, ix);
+    dump<",\"params\":">(b, ix);
+    serialize<JSON>::template op<Opts>(value.params, ctx, b, ix);
+    dump<'}'>(b, ix);
   }
 };
 

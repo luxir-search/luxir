@@ -283,25 +283,39 @@ std::unique_ptr<Tokenizer> makeStandardTokenizer();
 // dependent, so it is a separate opt-in filter applied after nfkc_cf.
 std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> source);
 
+namespace api { struct AnalyzerComponent; struct AnalyzerDef; }  // authored definitions (api/luxir_types.hpp)
+
+// Component factories, Lucene's TokenizerFactory / TokenFilterFactory split:
+// one factory per configured component, built ONCE at schema-build time from
+// the authored name + params by the registry below, creating a fresh
+// non-thread-safe stage per chain.  Expensive shared state (a stop set, a
+// synonym map) belongs in the factory, which the compiled Analyzer below
+// shares across every field using that definition; chains are never shared.
 class TokenStreamFactory {
-
-
+public:
+  std::string name;       // registry name, e.g. "unicode_word", "lowercase"
+  bool stateful = false;  // the stage buffers state across tokens; a chain containing one must reset() per value
+  virtual ~TokenStreamFactory() = default;
 };
 
 class TokenizerFactory : public TokenStreamFactory {
-
+public:
+  virtual std::unique_ptr<Tokenizer> create() const = 0;
 };
 
 class TokenFilterFactory : public TokenStreamFactory {
-
+public:
+  virtual std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const = 0;
 };
 
+// The component registry (Analyzer.cpp): the only path from a name to a
+// stage, so validation and construction cannot drift.  An unknown name, or a
+// parameter the component does not take, throws std::invalid_argument with a
+// teaching message (the valid names / the offending keys); Schema::fromProto
+// adds the field name.
+std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def);
+std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def);
 
-// per-field version of Lucene's Analyzer
-class FieldAnalyzer {
-  // TODO: how do we go to something that is not thread-safe?
-
-};
 
 class TokenChain {
 public:
@@ -326,13 +340,36 @@ public:
 };
 
 
-// TODO... does index and query time have different analyzers, or should it be getIndexingChain/getQueryingChain?
-// Analyzer class is thread safe
+// The compiled analysis plan for one authored AnalyzerDef (Lucene's Analyzer):
+// immutable and thread-safe, shared by every field that resolves to the same
+// definition (Schema::fromProto compiles each authored definition once).
+// compile() runs the component registry, so an Analyzer only exists for a
+// fully validated definition and owns everything it needs (the authored
+// views may be freed right after); createChain() instantiates a fresh
+// non-thread-safe chain from it.
+// TODO: index vs query time analyzers (getIndexingChain/getQueryingChain?)
 class Analyzer {
-  // Lucene Analyzer always has to look up by fieldName... we should be able to avoid this
-  TokenChain *createChain() {
-    return nullptr;
-  }
+public:
+  // Read-only by construction: only compile() creates a plan, so the derived
+  // state below is always consistent with the components.
+  const std::unique_ptr<const TokenizerFactory> tokenizer;
+  const std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
+  // unicode_word + nfkc_cf (the common default) fuses into one StandardTokenizer
+  // stage - segmentation and NFKC_CF in a single pass, remaining filters on top.
+  // Equivalent output (see AnalysisTest); decided here, on validated components.
+  const bool fusedHead;
+  const bool stateful;  // some stage buffers state across tokens: chains reset() per value
+
+  // An absent tokenizer means "whitespace".  Throws std::invalid_argument with a
+  // teaching message for an unknown or unnamed component or a parameter it
+  // does not take.
+  static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def);
+
+  std::unique_ptr<TokenChain> createChain() const;
+
+private:
+  Analyzer(std::unique_ptr<const TokenizerFactory> tok,
+           std::vector<std::unique_ptr<const TokenFilterFactory>> fs);
 };
 
 

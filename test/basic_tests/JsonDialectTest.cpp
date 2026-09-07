@@ -547,7 +547,7 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   const P::FieldDef* title = def.fields.find("title");
   ASSERT_NE(nullptr, title);
   EXPECT_EQ(P::FieldDef::FieldClass::TEXT, *title->type);
-  EXPECT_EQ("unicode_word", title->analyzer->tokenizer);
+  EXPECT_EQ("unicode_word", title->analyzer->tokenizer->name);
   EXPECT_TRUE(*title->stored);
   const P::FieldDef* vec = def.fields.find("vec");
   ASSERT_NE(nullptr, vec);
@@ -577,6 +577,54 @@ TEST(JsonDialect, FieldDefStringShorthand) {
   std::string out;
   ASSERT_TRUE(P::write_json(def, out));
   EXPECT_EQ(R"({"fields":{"year":{"type":"int"},"tag":{"type":"string"}}})", out);
+}
+
+TEST(JsonDialect, AnalyzerComponentStringShorthand) {
+  // "lowercase" == {"name": "lowercase"} for the tokenizer and each filter;
+  // params read as typed Vals. A parameterless component writes back as its
+  // bare name; only one with params writes the object form.
+  std::pmr::monotonic_buffer_resource mr;
+  P::FieldDef def;
+  std::string err;
+  ASSERT_TRUE(P::read_json(def,
+      R"({"type":"text","analyzer":{"tokenizer":"whitespace","filters":["lowercase",{"name":"stop","params":{"words":["a","the"],"ignore_case":true}}]}})",
+      mr, &err)) << err;
+  ASSERT_TRUE(def.analyzer.has_value());
+  EXPECT_EQ("whitespace", def.analyzer->tokenizer->name);
+  ASSERT_EQ(2u, def.analyzer->filters.size());
+  EXPECT_EQ("lowercase", def.analyzer->filters[0].name);
+  EXPECT_TRUE(def.analyzer->filters[0].params.empty());
+  const P::AnalyzerComponent& stop = def.analyzer->filters[1];
+  EXPECT_EQ("stop", stop.name);
+  const auto* words = stop.params.find("words");
+  ASSERT_NE(nullptr, words);
+  ASSERT_TRUE(std::holds_alternative<P::ArrStr>((**words).kind));
+  EXPECT_EQ(2u, std::get<P::ArrStr>((**words).kind).v.size());
+  const auto* ignoreCase = stop.params.find("ignore_case");
+  ASSERT_NE(nullptr, ignoreCase);
+  EXPECT_TRUE(std::get<bool>((**ignoreCase).kind));
+
+  std::string out;
+  ASSERT_TRUE(P::write_json(def, out));
+  EXPECT_EQ(
+      R"({"type":"text","analyzer":{"tokenizer":"whitespace","filters":["lowercase",{"name":"stop","params":{"words":["a","the"],"ignore_case":true}}]}})",
+      out);
+
+  // strict object reads: an unknown component key is an error
+  P::FieldDef bad;
+  EXPECT_FALSE(P::read_json(bad, R"({"type":"text","analyzer":{"filters":[{"nam":"lowercase"}]}})", mr));
+  // params must be an object
+  EXPECT_FALSE(P::read_json(bad, R"({"type":"text","analyzer":{"filters":[{"name":"stop","params":5}]}})", mr));
+  EXPECT_FALSE(P::read_json(bad, R"({"type":"text","analyzer":{"filters":[{"name":"stop","params":[1]}]}})", mr));
+  // an absent tokenizer stays absent (sparse presence); an explicit "" is a
+  // present, nameless component (the schema rejects it, the codec does not)
+  P::FieldDef sparse;
+  ASSERT_TRUE(P::read_json(sparse, R"({"type":"text","analyzer":{"filters":["fold"]}})", mr));
+  EXPECT_FALSE(sparse.analyzer->tokenizer.has_value());
+  P::FieldDef nameless;
+  ASSERT_TRUE(P::read_json(nameless, R"({"type":"text","analyzer":{"tokenizer":""}})", mr));
+  ASSERT_TRUE(nameless.analyzer->tokenizer.has_value());
+  EXPECT_TRUE(nameless.analyzer->tokenizer->name.empty());
 }
 
 TEST(JsonDialect, FieldDefStrictReads) {

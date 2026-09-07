@@ -148,78 +148,28 @@ public:
   // original value.  Callers must consume the result before buf is reused.
   virtual std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                                       std::span<char> buf) const;
-
-  // TODO: how to share analyzers (potentially expensive) among FieldTypes?
-  // One way: Have a parent FieldType in the constructor.
 };
 
 
 class TextFieldType : public FieldType {
 public:
-  std::string tokenizer_;                // e.g., "whitespace", "keyword"
-  std::vector<std::string> filters_;     // e.g., {"lowercase"}
+  // The compiled chain (analysis/Analyzer.h), shared with every field that
+  // resolves to the same authored definition.
+  std::shared_ptr<const Analyzer> analyzer_;
 
-  // The component-name registry, kept beside createAnalyzer so the validation
-  // and the construction switch cannot drift.  Schema::fromProto rejects
-  // unknown names with a teaching error before a schema is installed.
-  static constexpr std::string_view VALID_TOKENIZERS = "whitespace, keyword, unicode_word";
-  static constexpr std::string_view VALID_FILTERS = "lowercase, nfkc_cf, fold";
-  static bool validTokenizer(std::string_view t) {
-    return t == "whitespace" || t == "keyword" || t == "unicode_word";
-  }
-  static bool validFilter(std::string_view f) {
-    return f == "lowercase" || f == "nfkc_cf" || f == "fold";
-  }
+  TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
+    : FieldType(name, FieldType::TEXT, flags), analyzer_(std::move(analyzer)) {}
 
-  TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS,
-                std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {})
-    : FieldType(name, FieldType::TEXT, flags), tokenizer_(tokenizer), filters_(std::move(filters)) {}
+  // Parameterless components by name (tests, benches, hand-built schemas);
+  // throws like Analyzer::compile.  Defined in FieldType.cpp so this header
+  // stays independent of the api types.
+  TextFieldType(std::string_view name, int flags = INDEX_DOCS_FREQS_POSITIONS,
+                std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {});
 
-  // Create a new non-thread-safe analyzer for this text field type
+  // Create a new non-thread-safe analyzer chain for this text field type
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
     unused(fieldName);
-
-    // Create tokenizer by name (validated against the registry above at
-    // schema-build time; the trailing else keeps this total).
-    std::unique_ptr<Tokenizer> tok;
-    bool stateful = false;
-    size_t firstFilter = 0;  // index of the first filter still to apply (some get fused into the tokenizer)
-    if (tokenizer_ == "keyword") {
-      tok = std::make_unique<KeywordTokenizer>();
-    } else if (tokenizer_ == "unicode_word") {
-      // UAX#29 word segmentation; carries a cursor, so the chain is stateful.
-      stateful = true;
-      // Optimization: unicode_word + nfkc_cf (the common default) fuses into one
-      // StandardTokenizer - segmentation and NFKC_CF in a single stage. Any
-      // remaining filters (e.g. fold) still apply on top.
-      if (!filters_.empty() && filters_[0] == "nfkc_cf") {
-        tok = makeStandardTokenizer();
-        firstFilter = 1;
-      } else {
-        tok = makeUnicodeWordTokenizer();
-      }
-    } else {
-      // default: "whitespace"
-      tok = std::make_unique<WhitespaceTokenizer>();
-    }
-
-    auto& headRef = *tok;
-    std::unique_ptr<TokenStream> tail = std::move(tok);
-
-    // Apply remaining filters in order
-    for (size_t i = firstFilter; i < filters_.size(); i++) {
-      const auto& filter = filters_[i];
-      if (filter == "lowercase") {
-        tail = std::make_unique<LowercaseFilter>(std::move(tail));
-      } else if (filter == "nfkc_cf") {
-        tail = makeNfkcCasefoldFilter(std::move(tail));
-      } else if (filter == "fold") {
-        tail = makeAccentFoldFilter(std::move(tail));
-      }
-      // easy to add more filters here
-    }
-
-    return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
+    return analyzer_->createChain();
   }
 
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,

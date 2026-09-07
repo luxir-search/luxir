@@ -4,8 +4,10 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <memory_resource>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,6 +18,7 @@
 #include <uni_algo/ranges_word.h>
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/FieldType.h"
 #include "test/LuxirTest.h"
 
@@ -219,13 +222,42 @@ TEST_F(AnalysisTest, chainKeyword) {
   EXPECT_EQ((std::vector<std::string>{"Keep As Is"}), out.terms);
 }
 
-// The collapsed tokenizer: "nocopy_whitespace" is still accepted as an alias and
-// resolves to the same WhitespaceTokenizer behavior.
-TEST_F(AnalysisTest, nocopyWhitespaceAlias) {
-  TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "nocopy_whitespace");
-  auto chain = ft.createAnalyzer("w");
-  auto out = analyze(*chain, "a b c");
-  EXPECT_EQ((std::vector<std::string>{"a", "b", "c"}), out.terms);
+// The registry is the only path from a name to a stage: an unknown name (the
+// old "nocopy_whitespace" alias is gone) is a teaching error naming the valid set.
+TEST_F(AnalysisTest, unknownComponentIsRejected) {
+  try {
+    TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "nocopy_whitespace");
+    FAIL() << "unknown tokenizer accepted";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_EQ("unknown tokenizer 'nocopy_whitespace'; valid tokenizers: whitespace, keyword, unicode_word",
+              std::string(e.what()));
+  }
+  try {
+    TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace", {"stemmer"});
+    FAIL() << "unknown filter accepted";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_EQ("unknown filter 'stemmer'; valid filters: lowercase, nfkc_cf, fold", std::string(e.what()));
+  }
+}
+
+// The compiled Analyzer owns its configuration: chains stay valid after the
+// authored definition and the arena backing its views are gone.
+TEST_F(AnalysisTest, analyzerOutlivesDefinition) {
+  std::shared_ptr<const Analyzer> analyzer;
+  {
+    std::pmr::monotonic_buffer_resource arena;
+    api::AnalyzerDef def;
+    std::string err;
+    ASSERT_TRUE(api::read_json(def, R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]})", arena, &err))
+        << err;
+    analyzer = Analyzer::compile(def);
+  }
+  EXPECT_TRUE(analyzer->fusedHead);
+  EXPECT_EQ("unicode_word", analyzer->tokenizer->name);
+  ASSERT_EQ(2u, analyzer->filters.size());
+  EXPECT_EQ("fold", analyzer->filters[1]->name);
+  auto chain = analyzer->createChain();
+  EXPECT_EQ((std::vector<std::string>{"cafe", "strasse"}), analyze(*chain, "CAFÉ Straße").terms);
 }
 
 // ---------------------------------------------------------------------------

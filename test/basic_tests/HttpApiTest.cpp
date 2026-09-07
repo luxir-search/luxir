@@ -2447,6 +2447,14 @@ TEST_F(HttpApiTest, schemaErrorsAreTeaching) {
   EXPECT_NE(badTok.body().find("unknown tokenizer 'standard'"), std::string::npos) << badTok.body();
   EXPECT_NE(badTok.body().find("whitespace"), std::string::npos) << "lists valid tokenizers";
 
+  // Parameters on a component that takes none: 400 naming the offending key.
+  auto badParam = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"t": {"type": "text",
+          "analyzer": {"filters": [{"name": "lowercase", "params": {"lang": "en"}}]}}}})");
+  EXPECT_EQ(400, badParam.result_int());
+  EXPECT_NE(badParam.body().find("filter 'lowercase' takes no parameters (got: lang)"), std::string::npos)
+      << badParam.body();
+
   // Unknown FieldDef key: strict dialect, 400.
   auto badKey = httpRequest(port(), http::verb::post, "/collections/main/_schema",
       R"({"fields": {"x": {"typ": "int"}}})");

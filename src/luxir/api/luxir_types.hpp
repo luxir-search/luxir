@@ -72,7 +72,7 @@ struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
 struct ArrArrDouble; struct ArrArrBin; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
-struct ColFloat; struct ColDouble; struct ColMap; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
+struct ColFloat; struct ColDouble; struct ColMap; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
@@ -181,7 +181,14 @@ struct ColInt { int64_t missing_val = 0; std::span<const std::int64_t> v; };
 struct ColFloat { float missing_val = 0.0f; std::span<const float> v; };
 struct ColDouble { double missing_val = 0.0; std::span<const double> v; };
 
-struct AnalyzerDef { std::string_view tokenizer; std::span<const std::string_view> filters; };
+struct AnalyzerComponent {
+  std::string_view name;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
+};
+struct AnalyzerDef {                                              // needs AnalyzerComponent
+  std::optional<AnalyzerComponent> tokenizer;
+  std::span<const AnalyzerComponent> filters;
+};
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
@@ -612,7 +619,7 @@ LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUX
 LUXIR_TD(ArrArrDouble) LUXIR_TD(ArrArrBin) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap)
-LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
+LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
@@ -652,7 +659,7 @@ LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(Ar
 LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(ArrArrBin) LUXIR_ENTRY(Vector)
 LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
-LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(ColMap) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
+LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(ColMap) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)

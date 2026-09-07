@@ -4,6 +4,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/store/InputStream.h"
+#include "luxir/store/OutputStream.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
@@ -157,8 +158,8 @@ TEST_F(SchemaTest, inheritanceOverride) {
 
   // Check that the analyzer was overridden
   auto* textFt = (TextFieldType*)(title);
-  EXPECT_EQ("keyword", textFt->tokenizer_);
-  EXPECT_TRUE(textFt->filters_.empty());  // override is atomic, so parent's filters are not kept
+  EXPECT_EQ("keyword", textFt->analyzer_->tokenizer->name);
+  EXPECT_TRUE(textFt->analyzer_->filters.empty());  // override is atomic, so parent's filters are not kept
 }
 
 
@@ -214,9 +215,9 @@ TEST_F(SchemaTest, setWithParentFromBase) {
   EXPECT_FALSE(title->isAbstract());
 
   auto* textFt = (TextFieldType*)(title);
-  EXPECT_EQ("unicode_word", textFt->tokenizer_);  // inherited from _un
-  ASSERT_EQ(1, textFt->filters_.size());
-  EXPECT_EQ("nfkc_cf", textFt->filters_[0]);
+  EXPECT_EQ("unicode_word", textFt->analyzer_->tokenizer->name);  // inherited from _un
+  ASSERT_EQ(1, textFt->analyzer_->filters.size());
+  EXPECT_EQ("nfkc_cf", textFt->analyzer_->filters[0]->name);
 
   // Base fields should still be present
   ASSERT_NE(nullptr, merged->getFieldTypePtr("id"));
@@ -233,7 +234,7 @@ TEST_F(SchemaTest, setReResolvesDescendants) {
   baseB.analyzer(tmpl, "whitespace");
   baseB.field("title").parent = "_body";
   auto base = baseB.build();
-  EXPECT_EQ("whitespace", ((TextFieldType*)base->getFieldTypePtr("title"))->tokenizer_);
+  EXPECT_EQ("whitespace", ((TextFieldType*)base->getFieldTypePtr("title"))->analyzer_->tokenizer->name);
 
   SchemaBuilder mergeB;
   auto& newTmpl = mergeB.templ("_body");
@@ -241,7 +242,7 @@ TEST_F(SchemaTest, setReResolvesDescendants) {
   mergeB.analyzer(newTmpl, "keyword");
   auto merged = mergeB.build(base.get());
 
-  EXPECT_EQ("keyword", ((TextFieldType*)merged->getFieldTypePtr("title"))->tokenizer_)
+  EXPECT_EQ("keyword", ((TextFieldType*)merged->getFieldTypePtr("title"))->analyzer_->tokenizer->name)
     << "descendants must pick up the replaced template";
 }
 
@@ -397,6 +398,103 @@ TEST_F(SchemaTest, analyzerComponentValidation) {
     b.analyzer(f, "nocopy_whitespace");
     EXPECT_THROW(b.build(), SchemaError);
   }
+  {
+    // Parameters on a component that takes none: teaching error naming them.
+    std::pmr::monotonic_buffer_resource mr;
+    api::SchemaDef def;
+    std::string err;
+    ASSERT_TRUE(api::read_json(def,
+        R"({"fields":{"t":{"type":"text","analyzer":{"filters":[{"name":"lowercase","params":{"lang":"en"}}]}}}})",
+        mr, &err)) << err;
+    try {
+      Schema::fromProto(def);
+      FAIL() << "params on a parameterless filter must be rejected";
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string::npos,
+                std::string(e.what()).find("filter 'lowercase' takes no parameters (got: lang) (field: t)"))
+          << e.what();
+    }
+  }
+  {
+    // A tokenizer component without a name is an error, not a silent
+    // whitespace default: params-only input must not be discarded.
+    std::pmr::monotonic_buffer_resource mr;
+    api::SchemaDef def;
+    std::string err;
+    ASSERT_TRUE(api::read_json(def,
+        R"({"fields":{"t":{"type":"text","analyzer":{"tokenizer":{"params":{"x":1}}}}}})", mr, &err)) << err;
+    try {
+      Schema::fromProto(def);
+      FAIL() << "nameless tokenizer accepted";
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("tokenizer component has no name")) << e.what();
+    }
+  }
+  {
+    // Tokenizer params are validated too, including on the fused
+    // unicode_word + nfkc_cf pair (fusion happens after validation).
+    std::pmr::monotonic_buffer_resource mr;
+    api::SchemaDef def;
+    std::string err;
+    ASSERT_TRUE(api::read_json(def,
+        R"({"fields":{"t":{"type":"text","analyzer":{"tokenizer":{"name":"unicode_word","params":{"max":5}},"filters":["nfkc_cf"]}}}})",
+        mr, &err)) << err;
+    try {
+      Schema::fromProto(def);
+      FAIL() << "tokenizer params accepted";
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string::npos,
+                std::string(e.what()).find("tokenizer 'unicode_word' takes no parameters (got: max)")) << e.what();
+    }
+  }
+}
+
+TEST_F(SchemaTest, analyzerPresenceSemantics) {
+  // An analyzer that says nothing inherits; one that names a tokenizer or any
+  // filter replaces the parent's whole analyzer (filters-only gets whitespace).
+  SchemaBuilder b;
+  auto& parent = b.templ("_body");
+  parent.type = FieldClass::TEXT;
+  b.analyzer(parent, "unicode_word", {"nfkc_cf"});
+  auto& inherits = b.field("inherits");
+  inherits.parent = "_body";
+  inherits.analyzer.emplace();  // {}
+  auto& filtersOnly = b.field("filters_only");
+  filtersOnly.parent = "_body";
+  b.analyzer(filtersOnly, std::nullopt, {"lowercase"});
+  auto schema = b.build();
+
+  auto analyzerOf = [&](const char* name) {
+    return ((TextFieldType*)schema->getFieldTypePtr(name))->analyzer_;
+  };
+  EXPECT_EQ("unicode_word", analyzerOf("inherits")->tokenizer->name);
+  ASSERT_EQ(1u, analyzerOf("inherits")->filters.size());
+  EXPECT_EQ("whitespace", analyzerOf("filters_only")->tokenizer->name);
+  ASSERT_EQ(1u, analyzerOf("filters_only")->filters.size());
+  EXPECT_EQ("lowercase", analyzerOf("filters_only")->filters[0]->name);
+}
+
+TEST_F(SchemaTest, analyzerCompiledOncePerDefinition) {
+  // Fields resolving to the same authored definition share one compiled
+  // Analyzer; an identical definition authored separately is its own.
+  SchemaBuilder b;
+  auto& tmpl = b.templ("_body");
+  tmpl.type = FieldClass::TEXT;
+  b.analyzer(tmpl, "unicode_word", {"nfkc_cf", "fold"});
+  b.field("a").parent = "_body";
+  b.field("b").parent = "_body";
+  auto& own = b.field("c");
+  own.type = FieldClass::TEXT;
+  b.analyzer(own, "unicode_word", {"nfkc_cf", "fold"});
+  auto schema = b.build();
+
+  auto analyzerOf = [&](const char* name) {
+    return ((TextFieldType*)schema->getFieldTypePtr(name))->analyzer_;
+  };
+  EXPECT_EQ(analyzerOf("a"), analyzerOf("b"));
+  EXPECT_NE(analyzerOf("a"), analyzerOf("c"));
+  EXPECT_TRUE(analyzerOf("c")->fusedHead);
+  EXPECT_TRUE(analyzerOf("c")->stateful);
 }
 
 
@@ -1003,6 +1101,60 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
+// A protobuf length-delimited field: tag byte + one-byte length + payload.
+static std::string pbLen(int field, std::string_view payload) {
+  std::string out;
+  out += (char)((field << 3) | 2);
+  out += (char)payload.size();
+  out += payload;
+  return out;
+}
+
+TEST_F(SchemaTest, oldAnalyzerSchemaFileIsRejectedAtLoad) {
+  // AnalyzerDef.tokenizer / filters used to be strings at the same tags.  A
+  // schema file from then must fail to load loudly, not decode to a schema
+  // that silently lost its analyzer.  Hand-encoded old shape, for every
+  // component name that existed:
+  //   SchemaDef{fields: {"t": FieldDef{type: TEXT, analyzer: {tokenizer, [filter]}}}}
+  CollectionHelper ch;
+  auto& dir = *ch.collection().getShard()->getDirectory();
+  auto installed = ch.collection().getSchema();
+  // Tokenizer-only and filter-only payloads for every old name, so each field
+  // is rejected on its own, plus the common default pair.
+  const std::pair<const char*, const char*> combos[] = {
+      {"whitespace", nullptr}, {"keyword", nullptr}, {"unicode_word", nullptr},
+      {nullptr, "lowercase"}, {nullptr, "nfkc_cf"}, {nullptr, "fold"},
+      {"unicode_word", "nfkc_cf"}};
+  for (const auto& [tokenizer, filter] : combos) {
+    std::string analyzer;
+    if (tokenizer != nullptr) analyzer += pbLen(1, tokenizer);
+    if (filter != nullptr) analyzer += pbLen(2, filter);
+    std::string fieldDef = std::string("\x10\x01") + pbLen(6, analyzer);
+    std::string entry = pbLen(1, "t") + pbLen(2, fieldDef);
+    std::string schemaDef = pbLen(1, entry);
+
+    std::string fileName = schemaFileName(1000000);  // sorts after any live generation
+    auto file = dir.createFile(fileName);
+    OutputStream out;
+    out.setFile(&*file);
+    out.write(schemaDef.data(), schemaDef.size());
+    out.close();
+    dir.finishFile(*file);
+    std::vector<std::string> syncFiles = {fileName, "."};
+    dir.sync(syncFiles);
+
+    try {
+      ch.collection().loadSchema();
+      FAIL() << "old-format schema file loaded for " << (tokenizer ? tokenizer : "-") << "/"
+             << (filter ? filter : "-");
+    } catch (const std::runtime_error& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("Failed to parse schema file")) << e.what();
+    }
+    EXPECT_EQ(installed, ch.collection().getSchema()) << "a failed load leaves the installed schema alone";
+    dir.deleteFile(fileName);
+  }
+  ch.collection().setSchema(Schema::createDefaultSchema());
+}
 
 TEST_F(SchemaTest, sourceDef) {
   // Verify that sourceDef_ preserves the original SchemaDef (including parent

@@ -4,7 +4,7 @@ Luxir works without a schema: field types come from name suffixes (`title_w`,
 `year_i`, `tags_ss` - see the [Quickstart](quickstart.md)). When you want real
 field names without suffixes, a custom analyzer, or typed vector fields, you
 define a schema. The schema API speaks the same JSON in both directions: what
-`GET` returns is exactly what you `POST`.
+`GET` returns is a valid `POST` body, and posting it back changes nothing.
 
 ## Read the schema
 
@@ -113,6 +113,12 @@ curl http://localhost:9400/collections/main/_schema \
   -d '{"fields": {"year": "int", "author": "string"}}'
 ```
 
+Analyzer components work the same way. Each tokenizer or filter is
+`{"name": ..., "params": {...}}`; a component with no parameters can be
+written as its bare name, which is what the `title` example above does, and
+reads back the same way. Parameters are typed JSON values (a string, number,
+bool, or list), and a component that takes none rejects any.
+
 `mode=replace_all` replaces the whole schema with exactly what you send:
 
 ```bash
@@ -135,13 +141,18 @@ posting a `GET` body back is a no-op under either mode.
 | `multi` | multi-valued |
 | `stored` | keep raw values for retrieval; default on for `text` only |
 | `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
-| `analyzer` | `text` only: `{"tokenizer": ..., "filters": [...]}`; tokenizers: `whitespace`, `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` |
+| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` (none take parameters yet) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none` |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default" - and the schema you read back stays as sparse as the one you
 wrote.
+
+`analyzer` inherits as one unit: an empty `{}` inherits the parent's analyzer,
+while naming a tokenizer or listing any filter replaces the whole chain (filters
+alone get the `whitespace` tokenizer). A tokenizer component you do write must
+have a name.
 
 `column` and `stored` solve different problems. A column is a typed,
 per-field structure used by sorting, faceting, analytics, numeric/geo queries,

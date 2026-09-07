@@ -73,7 +73,15 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   }
   if (auto* l = dynamic_cast<const TextFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const TextFieldType*>(&rhs);
-    return r != nullptr && l->tokenizer_ == r->tokenizer_ && l->filters_ == r->filters_;
+    // Component names only: the default schema's components take no parameters.
+    if (r == nullptr || l->analyzer_->tokenizer->name != r->analyzer_->tokenizer->name ||
+        l->analyzer_->filters.size() != r->analyzer_->filters.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < l->analyzer_->filters.size(); i++) {
+      if (l->analyzer_->filters[i]->name != r->analyzer_->filters[i]->name) return false;
+    }
+    return true;
   }
   if (auto* l = dynamic_cast<const VectorFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const VectorFieldType*>(&rhs);

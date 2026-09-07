@@ -283,7 +283,7 @@ void roundTripType(const char* nm) {
   X(UpdateResponse) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                                    \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
   X(ArrArrBin) X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
-  X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerDef)    \
+  X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
   X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
@@ -296,6 +296,34 @@ TEST(ProtoRoundTrip, AllMessages) {
 #define RT(T) roundTripType<P::T>(#T);
   LUXIR_MSGS(RT)
 #undef RT
+}
+
+TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {
+  // An explicit fixture beside the generic fill: ordered distinct filters and
+  // string / int / bool / list / object / null params survive binary
+  // encode -> decode and come back as the same canonical JSON; an absent
+  // tokenizer stays absent.
+  constexpr std::string_view canon =
+      R"({"filters":[{"name":"stop","params":{"words":["a","the"],"ignore_case":true,"max":3,"lang":"en","opts":{"k":null}}},"fold"]})";
+  std::pmr::monotonic_buffer_resource mr;
+  P::AnalyzerDef in;
+  std::string err;
+  ASSERT_TRUE(P::read_json(in, canon, mr, &err)) << err;
+  EXPECT_FALSE(in.tokenizer.has_value());
+
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(encode(in, wire));
+  std::pmr::monotonic_buffer_resource binaryArena;
+  P::AnalyzerDef out;
+  auto padded = P::copyToPaddedInput(std::span<const std::byte>(wire), binaryArena);
+  ASSERT_TRUE(decode(out, padded, binaryArena));
+  std::string json;
+  ASSERT_TRUE(write_json(out, json));
+  EXPECT_EQ(canon, json);
+  EXPECT_FALSE(out.tokenizer.has_value());
+  ASSERT_EQ(2u, out.filters.size());
+  EXPECT_EQ("fold", out.filters[1].name);
+  EXPECT_EQ(3, std::get<std::int64_t>((**out.filters[0].params.find("max")).kind));
 }
 
 TEST(ProtoRoundTrip, PhraseSlopValues) {

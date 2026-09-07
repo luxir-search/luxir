@@ -47,9 +47,9 @@ struct ResolvedField {
   // it explicitly (even to a value that equals the default).
   bool hasStoredResource = false;
   std::string storedResource;
-  bool hasAnalyzer = false;
-  std::string tokenizer;
-  std::vector<std::string> filters;
+  // The authored analyzer in force: the first non-empty AnalyzerDef in the
+  // parent chain (a view into the source entries); null = the type default.
+  const luxir::api::AnalyzerDef* analyzer = nullptr;
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
   bool hasVectorDims = false;
@@ -109,6 +109,15 @@ static void parseSchemaDef(std::string_view bytes, luxir::api::SchemaDef& def,
   if (!luxir::api::decode(def, padded, arena)) {
     throw std::runtime_error("Failed to parse SchemaDef protobuf");
   }
+}
+
+// An authored analyzer that says something: a tokenizer component (which must
+// then name a tokenizer - params-only input is an error, not a silent default)
+// or any filter.  {} inherits; filters-only replaces the whole parent analyzer
+// and gets the whitespace tokenizer.
+static bool analyzerSet(const luxir::api::FieldDef& def) {
+  return def.analyzer.has_value() &&
+         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty());
 }
 
 // Walk the parent chain and resolve all properties for a field.
@@ -202,17 +211,7 @@ static void resolveField(std::string_view name,
   }
 
   // analyzer: atomic - first non-empty AnalyzerDef in chain wins
-  if (def.analyzer.has_value() && (!def.analyzer->tokenizer.empty() || !def.analyzer->filters.empty())) {
-    r.hasAnalyzer = true;
-    r.tokenizer = std::string(def.analyzer->tokenizer);
-    for (const auto& filter : def.analyzer->filters) {
-      r.filters.push_back(std::string(filter));
-    }
-  } else {
-    r.hasAnalyzer = parentResolved.hasAnalyzer;
-    r.tokenizer = parentResolved.tokenizer;
-    r.filters = parentResolved.filters;
-  }
+  r.analyzer = analyzerSet(def) ? &*def.analyzer : parentResolved.analyzer;
 
   // dims: explicit set on this field overrides (0 = infer from first value);
   // otherwise inherit.
@@ -271,8 +270,7 @@ static void resolveField(std::string_view name,
 static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r) {
   const auto& def = entry.def;
   std::string name(entry.name);
-  if (def.analyzer.has_value() && (!def.analyzer->tokenizer.empty() || !def.analyzer->filters.empty()) &&
-      r.type != FieldClass::TEXT) {
+  if (analyzerSet(def) && r.type != FieldClass::TEXT) {
     throw SchemaError("analyzer is only valid for text fields (field: " + name + ")");
   }
   bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
@@ -435,6 +433,9 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
   validateReservedFields(resolved);
 
   // ---- create FieldType objects from resolved fields ----
+  // Compiled analyzers, one per authored definition, shared by every text
+  // field resolving to it (null = the whitespace default).
+  boost::unordered_flat_map<const luxir::api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   for (auto& [name, r] : resolved) {
     if (!r.hasType) {
       throw SchemaError("Field '" + std::string(name) + "' has no type and no parent to inherit from");
@@ -531,19 +532,17 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
         ft = std::make_shared<StrFieldType>(name, flags);
         break;
       case FieldClass::TEXT: {
-        std::string tokenizer = r.hasAnalyzer ? r.tokenizer : "whitespace";
-        if (tokenizer.empty()) tokenizer = "whitespace";
-        if (!TextFieldType::validTokenizer(tokenizer)) {
-          throw SchemaError("unknown tokenizer '" + tokenizer + "' (field: " + std::string(name) +
-                            "); valid tokenizers: " + std::string(TextFieldType::VALID_TOKENIZERS));
-        }
-        for (const auto& filter : r.filters) {
-          if (!TextFieldType::validFilter(filter)) {
-            throw SchemaError("unknown filter '" + filter + "' (field: " + std::string(name) +
-                              "); valid filters: " + std::string(TextFieldType::VALID_FILTERS));
+        auto& analyzer = analyzers[r.analyzer];
+        if (!analyzer) {
+          // The registry's teaching error (unknown component, unexpected
+          // parameter) plus the field it was found on.
+          try {
+            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{});
+          } catch (const std::invalid_argument& e) {
+            throw SchemaError(std::string(e.what()) + " (field: " + std::string(name) + ")");
           }
         }
-        ft = std::make_shared<TextFieldType>(name, flags, tokenizer, r.filters);
+        ft = std::make_shared<TextFieldType>(name, flags, analyzer);
         break;
       }
       case FieldClass::INT:
@@ -621,9 +620,9 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   auto setAnalyzer = [&](luxir::api::FieldDef& f, const char* tokenizer,
                          std::vector<std::string_view> filters = {}) {
     auto& a = f.analyzer.emplace();
-    a.tokenizer = tokenizer;
-    std::string_view* fl = luxir::api::build::allocArray(a.filters, filters.size(), arena);
-    for (size_t i = 0; i < filters.size(); i++) fl[i] = filters[i];
+    a.tokenizer.emplace().name = tokenizer;
+    auto* fl = luxir::api::build::allocArray(a.filters, filters.size(), arena);
+    for (size_t i = 0; i < filters.size(); i++) fl[i].name = filters[i];
   };
 
   // Concrete fields (id defaults to MATCH+column, _version_ to NONE+column).

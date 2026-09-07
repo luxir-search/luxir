@@ -12,6 +12,7 @@
 
 #include <deque>
 #include <memory_resource>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -43,14 +44,15 @@ public:
   api::FieldDef& field(std::string_view name) { return add(fields_, name); }
   api::FieldDef& templ(std::string_view name) { return add(templates_, name); }
 
-  // Convenience: set an analyzer on a (text) field def.
-  api::FieldDef& analyzer(api::FieldDef& f, std::string_view tokenizer,
+  // Convenience: set an analyzer of parameterless components on a (text)
+  // field def.  nullopt leaves the tokenizer component absent.
+  api::FieldDef& analyzer(api::FieldDef& f, std::optional<std::string_view> tokenizer,
                           std::initializer_list<std::string_view> filters = {}) {
     auto& a = f.analyzer.emplace();
-    a.tokenizer = api::build::arenaStr(arena_, tokenizer);
-    std::string_view* fl = api::build::allocArray(a.filters, filters.size(), arena_);
+    if (tokenizer) a.tokenizer.emplace().name = api::build::arenaStr(arena_, *tokenizer);
+    auto* fl = api::build::allocArray(a.filters, filters.size(), arena_);
     std::size_t i = 0;
-    for (auto filter : filters) fl[i++] = api::build::arenaStr(arena_, filter);
+    for (auto filter : filters) fl[i++].name = api::build::arenaStr(arena_, filter);
     return f;
   }
 
