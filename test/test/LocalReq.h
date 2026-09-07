@@ -86,7 +86,8 @@ public:
   OpCursor& withStats() { return getNumber().getScores(); }
 
   // --- configure a facet op ---
-  OpCursor& limit(int64_t n);     // TopDocs.limit or FieldFacet.limit, by op kind
+  OpCursor& limit(int64_t n);     // TopDocs / Fusion / FieldFacet, by op kind
+  OpCursor& offset(int64_t n);    // TopDocs / Fusion, by op kind
   OpCursor& mincount(int64_t n);  // FieldFacet / RangeFacet
   OpCursor& range(int64_t start, int64_t end, int64_t gap);  // RangeFacet bounds
   OpCursor& rangeFp(double start, double end, double gap);
@@ -631,8 +632,15 @@ inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs()
 
 inline OpCursor& OpCursor::limit(int64_t n) {
   if (auto* td = std::get_if<luxir::api::TopDocs>(&op_->kind)) td->limit = n;
+  else if (auto* f = std::get_if<luxir::api::Fusion>(&op_->kind)) f->limit = n;
   else if (auto* f = std::get_if<luxir::api::FieldFacet>(&op_->kind)) f->limit = n;
   else assert(false && "limit() on an op without a limit field");
+  return *this;
+}
+inline OpCursor& OpCursor::offset(int64_t n) {
+  if (auto* td = std::get_if<luxir::api::TopDocs>(&op_->kind)) td->offset = n;
+  else if (auto* f = std::get_if<luxir::api::Fusion>(&op_->kind)) f->offset = n;
+  else assert(false && "offset() on an op without an offset field");
   return *this;
 }
 inline OpCursor& OpCursor::mincount(int64_t n) {

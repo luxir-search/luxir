@@ -105,6 +105,7 @@ The top-document fields are:
 | `query` | One structured query object or an expression string. Required. |
 | `filter` | Named, non-scoring queries ANDed with the main query. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
+| `offset` | Zero-based rank of the first returned document. Default `0`; must be nonnegative. |
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `fields` | Fields to retrieve. Omitted: every retrievable field (see below). |
@@ -113,8 +114,12 @@ The top-document fields are:
 | `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match domain. |
 
-`offset` exists on the wire but is not applied by the current collector. Do
-not use it for pagination. Ordered page-after pagination is not implemented;
+`offset` skips the first matching documents in ranked order, then returns up to
+`limit` documents. Each response batch's `offset` is the absolute rank of its
+first row; `found` remains the total match count. An offset past the matches
+returns one empty final batch. `limit: -1` returns all remaining matches and
+`limit: 0` returns no rows. Collection retains up to `offset + limit` documents,
+so deep pages cost more. Ordered page-after pagination is not implemented;
 use document-per-line export when the goal is to consume every match.
 
 ## Query forms

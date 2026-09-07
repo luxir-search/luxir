@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <map>
 #include <memory>
 #include <memory_resource>
@@ -858,4 +859,81 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
     ASSERT_EQ(ids, baseline) << "divergent/garbage fused result set at iteration " << iter;
     lreq->done();
   }
+}
+
+
+TEST_F(FusionOpTest, offsetPagesSourceWindows) {
+  CollectionHelper helper;
+  for (int i = 0; i < 10; i++) {
+    helper.index(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i));
+  }
+  helper.commit();
+  auto run = [&](int64_t offset, int64_t limit, int64_t sourceOffset = 0) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cursor = req->collection("main").topDocs("f");
+    auto& fusion = cursor.rawOp().kind.emplace<api::Fusion>();
+    cursor.offset(offset).limit(limit);
+    fusion.get_number = true;
+    fusion.get_scores = true;
+    fusion.rrf.emplace();
+    addField(fusion, "id", req->mr);
+    for (bool descending : {false, true}) {
+      auto& src = addSource(fusion, descending ? "desc" : "asc", req->mr);
+      src.limit = 3;
+      src.offset = sourceOffset;
+      addSort(src, "rank_i", descending ? api::SortSpec::SortDir::DESC
+                                      : api::SortSpec::SortDir::ASC, req->mr);
+    }
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->toString();
+    return req;
+  };
+  auto all = run(0, 100);
+  auto expected = resultIds(*all);
+  ASSERT_EQ(6u, expected.size());
+  std::vector<std::string> pages;
+  std::vector<float> scores;
+  for (int64_t offset = 0; offset < 6; offset += 2) {
+    auto page = run(offset, 2);
+    ASSERT_OK(page);
+    EXPECT_EQ(6, page->docList("f")->found.value_or(-1));
+    EXPECT_EQ(offset, page->docList("f")->offset);
+    auto ids = resultIds(*page);
+    pages.insert(pages.end(), ids.begin(), ids.end());
+    auto pageScores = resultScores(*page);
+    scores.insert(scores.end(), pageScores.begin(), pageScores.end());
+  }
+  EXPECT_EQ(expected, pages);
+  EXPECT_EQ(resultScores(*all), scores);
+  EXPECT_EQ(expected, resultIds(*run(0, 100, INT64_MAX)));
+  auto rest = run(2, -1);
+  EXPECT_EQ((std::vector<std::string>(expected.begin() + 2, expected.end())), resultIds(*rest));
+  EXPECT_EQ(resultIds(*rest), resultIds(*run(2, INT64_MAX)));
+  for (auto [offset, limit] : std::array<std::pair<int64_t, int64_t>, 4>{
+           {{6, 2}, {7, 2}, {INT64_MAX, INT64_MAX}, {2, 0}}}) {
+    auto empty = run(offset, limit);
+    ASSERT_OK(empty);
+    ASSERT_EQ(1u, empty->responses.size());
+    const auto* docs = empty->docList("f");
+    ASSERT_NE(nullptr, docs);
+    EXPECT_EQ(6, docs->found.value_or(-1));
+    EXPECT_EQ(offset, docs->offset);
+    EXPECT_EQ(0, docs->row_count);
+    EXPECT_FALSE(docs->more);
+    EXPECT_FALSE(empty->responses[0]->proto.more);
+  }
+}
+
+TEST_F(FusionOpTest, offsetNegativeRejected) {
+  CollectionHelper helper;
+  auto req = localReq(helper.getSearchEngine());
+  auto& cursor = req->collection("main").topDocs("f");
+  auto& fusion = cursor.rawOp().kind.emplace<api::Fusion>();
+  cursor.offset(-2);
+  fusion.rrf.emplace();
+  addSource(fusion, "all", req->mr).limit = 3;
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("fusion 'f': offset must be >= 0"))
+      << req->errorMsg();
 }

@@ -185,7 +185,10 @@ set, put a sibling `top_docs` op at the request root.
 
 RRF source limits are candidate-pool decisions. A document outside a source's
 limit cannot contribute from that source, so choose pools large enough for the
-recall required by the final fused `limit`.
+recall required by the final fused `limit`. Fusion `offset` skips documents in
+the fused ranked list and returns up to `limit` documents. It cannot reach
+beyond the union of the source windows and does not enlarge those windows;
+deep fusion paging needs larger source limits. Per-source `offset` is ignored.
 
 ## Build ANN overlays
 

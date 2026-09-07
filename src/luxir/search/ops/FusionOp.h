@@ -50,7 +50,7 @@ public:
   // Each source is a full TopDocsReq parented to this FusionOp.  Their
   // rankingSinks are set by the parser to deliver to FusionOp::Calc.
   std::vector<TopDocsReq*> sources;
-  int64_t topCount;
+  int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
   std::span<ParsedFilter> filters;  // shared fusion-level filters
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;

@@ -371,7 +371,7 @@ public:
   bool wholeConstantRanking;
   Query::ScoreProfile scoreProfile;
   bool requestNeedsScores;
-  int64_t topCount; // maximum number of docs to return.
+  int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
   std::span<ParsedFilter> filters;
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
@@ -2444,6 +2444,7 @@ public:
 
     if (mergeableCollector == nullptr) {
       auto& docListProto = *calc.slotArm<luxir::api::DocList>(nullptr);
+      docListProto.offset = qr.topDocsProto.offset;
       // found is opt-in (see emitDocsResponse): only populate it when the
       // count was requested, so an empty index matches the non-empty contract.
       if (qr.topDocsProto.get_number) docListProto.found = 0;

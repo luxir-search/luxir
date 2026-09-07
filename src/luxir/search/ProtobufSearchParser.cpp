@@ -1336,10 +1336,20 @@ public:
       : req.requestPool.make<AllQuery>();
     Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
-    unused(offset); // TODO
+    if (offset < 0) {
+      throw std::runtime_error(
+          "top_docs '" + std::string(name) + "': offset must be >= 0");
+    }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
-    int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
+    int64_t maxDoc = req.reader->maxDoc();
+    int64_t limit = specifiedLimit < 0 ? maxDoc : std::min(specifiedLimit, maxDoc);
+    // Keep limit as the page size for request-shape decisions. Fusion source
+    // offsets are response-shape fields and do not enlarge candidate pools.
+    int64_t topCount = limit;
+    if (limit > 0 && placement != TopDocsPlacement::FUSION_SOURCE) {
+      topCount = offset >= maxDoc ? maxDoc : offset + std::min(limit, maxDoc - offset);
+    }
 
     if (placement == TopDocsPlacement::FUSION_SOURCE) {
       if (!topDocsReq.ops.empty()) {
@@ -1572,7 +1582,7 @@ public:
     if (cacheFirstFieldSortShape) {
       auto fieldSortPreflight =
           TopDocsReq::planCacheFirstFieldSortWholeMembership(
-              *query, *planningContext, *req.reader, parsedSorts, limit,
+              *query, *planningContext, *req.reader, parsedSorts, topCount,
               true);
       cacheFirstMembershipUse = fieldSortPreflight.acceptedUse;
       cacheFirstFieldSortRoutes = fieldSortPreflight.routes;
@@ -1619,7 +1629,7 @@ public:
         && (allowPruning || cacheFirstVariableRanking) && foldFilters
         && !requirements.needExactDomain && !weight->needsPrepare()
         && TopDocsReq::admitSparseFilteredTopK(
-            *weight, *req.reader, limit);
+            *weight, *req.reader, topCount);
     if (sparseFilteredTopKReroute) {
       bool unionFamily = weight->sparseFilteredTopKFamily()
           == Query::Weight::SparseFilteredTopKFamily::UNION;
@@ -1742,7 +1752,7 @@ public:
                   req.reader->segments().size());
               acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
                   *query, *wholeMembershipWeight, *req.reader, parsedSorts,
-                  limit, wholeFieldSortCacheRoutes);
+                  topCount, wholeFieldSortCacheRoutes);
             } else {
               acquireUse = std::any_of(
                   wholeFieldSortCacheRoutes.begin(),
@@ -1787,7 +1797,7 @@ public:
         bool reroute = foldFilters
             && !countFreeRankingWeight->needsPrepare()
             && TopDocsReq::admitSparseFilteredTopK(
-                *countFreeRankingWeight, *req.reader, limit);
+                *countFreeRankingWeight, *req.reader, topCount);
         if (reroute) {
           bool unionFamily = countFreeRankingWeight->sparseFilteredTopKFamily()
               == Query::Weight::SparseFilteredTopKFamily::UNION;
@@ -1810,7 +1820,7 @@ public:
     auto* qr = luxir::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *planningContext, qcontext,
       query, weight, variantMembershipWeight,
-      countWeight, rankingWeight, limit, std::move(parsedSorts),
+      countWeight, rankingWeight, topCount, std::move(parsedSorts),
       requirements, wholeMembershipWeight, wholeRankingWeight,
       wholeMembershipUse, wholeFieldSortCacheRoutes,
       wholeConstantRanking, scoreProfile,
@@ -1866,6 +1876,11 @@ public:
   }
 
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
+    int64_t offset = fusionProto.offset;
+    if (offset < 0) {
+      throw std::runtime_error(
+          "fusion '" + std::string(name) + "': offset must be >= 0");
+    }
     if (fusionProto.sources.empty()) {
       throw std::runtime_error("Fusion requires at least one source");
     }
@@ -1921,10 +1936,13 @@ public:
     }
 
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
-    int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
+    int64_t maxDoc = req.reader->maxDoc();
+    int64_t limit = specifiedLimit < 0 ? maxDoc : std::min(specifiedLimit, maxDoc);
+    int64_t topCount = limit == 0 ? 0
+        : offset >= maxDoc ? maxDoc : offset + std::min(limit, maxDoc - offset);
 
     auto* fusion = luxir::arenaCreate<FusionOp>(
-      req.arena, req, name, fusionProto, std::move(sources), limit,
+      req.arena, req, name, fusionProto, std::move(sources), topCount,
       sharedFilters, sharedFilterWeights, rrfK);
 
     // Sources are children of this FusionOp in the SearchOp tree but not

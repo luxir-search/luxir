@@ -529,3 +529,40 @@ TEST_F(FacetTopDocsTest, cachedMembershipComposesPerBucket) {
     EXPECT_GE(cache->counters().hits, before.hits + 2);
   }
 }
+
+
+TEST_F(FacetTopDocsTest, offsetBucketChildren) {
+  CollectionHelper helper;
+  indexBigBucket(helper);
+  // Both op kinds use FINAL_RESPONSE even with batch_size 1. The small
+  // bucket is exhausted; the big bucket returns only the requested page.
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"json({"ops":{"cats":{"field_facet":{
+    "field":"cat_s","limit":-1,"ops":{
+      "hits":{"top_docs":{"sorts":[{"expr":"n_i","dir":"asc"}],
+        "offset":3,"limit":5,"batch_size":1,"get_number":true,"fields":["id"]}},
+      "fused":{"fusion":{"sources":{"all":{"limit":10,
+        "sorts":[{"expr":"n_i","dir":"asc"}]}},"rrf":{},
+        "offset":3,"limit":5,"batch_size":1,"get_number":true,"fields":["id"]}}
+    }}}}})json", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute();
+  ASSERT_OK(req);
+  ASSERT_EQ(1u, req->responses.size());
+  EXPECT_FALSE(req->responses[0]->proto.more);
+  const auto& result = rootFacet(*req, "cats");
+  ASSERT_EQ((std::vector<std::string>{"big", "small"}), bucketIds(result));
+  for (auto op : {"hits", "fused"}) {
+    for (size_t bucket = 0; bucket < 2; bucket++) {
+      const auto* docs = bucketDocs(result, op, bucket);
+      ASSERT_NE(nullptr, docs);
+      EXPECT_EQ(3, docs->offset);
+      EXPECT_FALSE(docs->more);
+      EXPECT_EQ(bucket == 0 ? 5 : 0, docs->row_count);
+      EXPECT_EQ(bucket == 1 ? 3 : std::string_view(op) == "hits" ? 300 : 10,
+                docs->found.value_or(-1));
+      EXPECT_EQ(bucket == 0 ? (std::vector<std::string>{"d3", "d4", "d5", "d6", "d7"})
+                            : std::vector<std::string>{}, ids(*docs));
+    }
+  }
+}

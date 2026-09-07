@@ -92,6 +92,10 @@ enum DocFormat {
 message TopDocs {
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
+  // Zero-based rank of the first returned document; must be >= 0. Skip this
+  // many ranked matches, then return up to limit (-1: all remaining; 0: none).
+  // Each response DocList.offset is the absolute rank of that batch's first
+  // row, or the requested offset for an empty page. Ignored as a Fusion source.
   int64 offset = 3;
   optional sint64 limit = 4;
   bool get_number = 5;          // return the number of matching documents
@@ -144,6 +148,11 @@ message Fusion {
   }
 
   // Response shape (mirrors TopDocs).
+  // Zero-based rank of the first returned fused document; must be >= 0.
+  // Return up to limit after skipping. Source limits remain candidate-pool
+  // sizes: paging cannot reach beyond the union of their ranked windows.
+  // Each response DocList.offset is the absolute rank of that batch's first
+  // row, or the requested offset for an empty page.
   int64 offset = 4;
   bool get_number = 5;
   bool get_scores = 6;

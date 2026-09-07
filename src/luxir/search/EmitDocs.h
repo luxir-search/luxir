@@ -771,8 +771,7 @@ public:
   bool parallel;
   size_t colCap;  // dense response columns map capacity (column-placed fields + _score_)
   size_t rowCap;  // scratch columns map capacity (row-placed fields)
-  int64_t totalBatches;
-  int64_t batchStart = 0;  // resume cursor
+  int64_t batchStart;  // absolute rank cursor, clamped to numCollected
 
   DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
@@ -784,8 +783,7 @@ public:
         fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
         getScores(getScores), scoresInRows(scoresInRows),
         parallel(parallel), colCap(colCap), rowCap(rowCap),
-        // If no documents were collected, we still need to send an empty response
-        totalBatches(numCollected > 0 ? numCollected : 1) {}
+        batchStart(std::min(offset, numCollected)) {}
 
   void produce() override;
 
@@ -820,8 +818,10 @@ void DocEmitterImpl<GetDocList, GetDoc, GetScore>::produce() {
 
 template <typename GetDocList, typename GetDoc, typename GetScore>
 bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
-  while (batchStart < totalBatches) {
-    int64_t batchEnd = std::min(batchStart + maxBatchSize, numCollected);
+  // An empty page still produces exactly one final DocList. Resumption only
+  // happens after a non-final batch, with ranked documents left to emit.
+  do {
+    int64_t batchEnd = batchStart + std::min<int64_t>(maxBatchSize, numCollected - batchStart);
     int64_t batchSizeLocal = batchEnd - batchStart;
 
     bool lastResponse = batchEnd >= numCollected;
@@ -836,7 +836,9 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     if (!lastResponse) batchArenaGuard.arena = &response.arena;
     auto& docListProto = getDocList(&response);
     auto& mr = response.mr;  // arena backing this response's column data
-    docListProto.offset = offset + batchStart;
+    // Absolute rank of this batch's first row. An empty page (offset past the
+    // collected list) echoes the requested offset instead.
+    docListProto.offset = std::max(offset, batchStart);
     if (!lastResponse) {
       docListProto.more = true;
       response.proto.more = true;  // also set at the response level for easier client handling.
@@ -1035,7 +1037,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     }
 
-    batchStart += maxBatchSize;
+    batchStart = batchEnd;
     if (!lastResponse) {
       batchArenaGuard.arena = nullptr;  // reply() owns the arena release from here
       switch (req.reply(response)) {
@@ -1046,11 +1048,11 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           req.resumeWhenDrained([this] { produce(); });
           return false;  // paused: the stream is NOT over; resume re-enters produce()
         case SearchRequest::ReplyStatus::CANCEL:
-          batchStart = totalBatches;  // client is gone; skip the remaining batches
+          batchStart = numCollected;  // client is gone; skip the remaining batches
           break;
       }
     }
-  }
+  } while (batchStart < numCollected);
   return true;
 }
 
@@ -1198,10 +1200,11 @@ void emitDocsResponse(SearchRequest& req,
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
-    if (numCollected > std::numeric_limits<int32_t>::max()) {
+    int64_t numEmitted = numCollected - std::min(offset, numCollected);
+    if (numEmitted > std::numeric_limits<int32_t>::max()) {
       throw std::length_error("too many documents for one response batch");
     }
-    maxBatchSize = (int32_t)std::max<int64_t>(numCollected, 1);
+    maxBatchSize = (int32_t)std::max<int64_t>(numEmitted, 1);
   } else if (maxBatchSize <= 0) {
     maxBatchSize = 100;  // what should the default be?
   } else if (maxBatchSize > 256) {

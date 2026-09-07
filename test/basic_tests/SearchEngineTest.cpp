@@ -7263,3 +7263,187 @@ TEST_F(SearchEngineTest,
                 + shapesDisabled.complementArms, 0);
   EXPECT_EQ(0, shapesDisabled.sparseVerifyArms);
 }
+
+
+TEST_F(SearchEngineTest, offsetRankedPages) {
+  CollectionHelper helper;
+  for (int i = 0; i < 11; i++) {
+    std::string body = "apple";
+    for (int j = 0; j < i; j++) body += " pear";
+    helper.index(flatdoc("id", std::to_string(i), "body_w", body,
+                        "rank_i", (int64_t)(10 - i)),
+                 i == 5 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  for (bool fieldSort : {false, true}) {
+    auto run = [&](int64_t offset, int64_t limit, bool count) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& q = req->collection("main").topDocs("q")
+          .matchQuery("body_w", "apple").fields({"id"}).getScores()
+          .offset(offset).limit(limit).getNumber(count);
+      if (fieldSort) qb::sort(q, "rank_i", qb::ASC);
+      req->execute();
+      EXPECT_TRUE(req->ok()) << req->toString();
+      return req;
+    };
+    auto all = run(0, 100, true);
+    auto expected = resultIds(*all, "q");
+    ASSERT_EQ(11u, expected.size());
+    for (bool count : {false, true}) {
+      std::vector<std::string> pages;
+      for (int64_t offset = 0; offset < 11; offset += 3) {
+        auto page = run(offset, 3, count);
+        ASSERT_OK(page);
+        EXPECT_EQ(offset, page->docList()->offset);
+        EXPECT_EQ(count ? std::optional<int64_t>(11) : std::nullopt,
+                  page->docList()->found);
+        auto ids = resultIds(*page, "q");
+        pages.insert(pages.end(), ids.begin(), ids.end());
+        auto scores = resultScoreMap(*page, "q");
+        auto allScores = resultScoreMap(*all, "q");
+        for (auto& [id, score] : scores) EXPECT_FLOAT_EQ(allScores.at(id), score);
+      }
+      EXPECT_EQ(expected, pages);
+    }
+    auto remaining = run(3, -1, true);
+    EXPECT_EQ((std::vector<std::string>(expected.begin() + 3, expected.end())),
+              resultIds(*remaining, "q"));
+    auto clamped = run(3, INT64_MAX, true);
+    EXPECT_EQ(resultIds(*remaining, "q"), resultIds(*clamped, "q"));
+    for (auto [offset, limit] : std::array<std::pair<int64_t, int64_t>, 4>{
+             {{11, 2}, {15, 2}, {INT64_MAX, INT64_MAX}, {3, 0}}}) {
+      auto empty = run(offset, limit, true);
+      ASSERT_OK(empty);
+      ASSERT_EQ(1u, empty->responses.size());
+      EXPECT_EQ(11, empty->docList()->found.value_or(-1));
+      EXPECT_EQ(offset, empty->docList()->offset);
+      EXPECT_EQ(0, empty->docList()->row_count);
+      EXPECT_FALSE(empty->docList()->more);
+      EXPECT_FALSE(empty->responses[0]->proto.more);
+    }
+  }
+}
+
+TEST_F(SearchEngineTest, offsetStreamingBatches) {
+  CollectionHelper helper;
+  for (int i = 0; i < 10; i++) {
+    helper.index(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i));
+  }
+  helper.commit();
+  auto req = localReq(helper.getSearchEngine());
+  auto& q = req->collection("main").topDocs("q").allQuery().fields({"id"})
+      .offset(3).limit(5).batchSize(2).getNumber();
+  qb::sort(q, "rank_i", qb::ASC);
+  req->execute();
+  ASSERT_OK(req);
+  ASSERT_EQ(3u, req->responses.size());
+  for (int i = 0; i < 3; i++) {
+    const auto& resp = req->responses[i]->proto;
+    const auto& docs = *resp.ops.at("q")->docList();
+    EXPECT_EQ(3 + 2 * i, docs.offset);
+    EXPECT_EQ(i == 2 ? 1 : 2, docs.row_count);
+    EXPECT_EQ(i != 2, docs.more);
+    EXPECT_EQ(i != 2, resp.more);
+    EXPECT_EQ(10, docs.found.value_or(-1));
+    const auto& ids = std::get<api::ColStr>(docs.columns.at("id").kind).v;
+    for (int j = 0; j < docs.row_count; j++) {
+      EXPECT_EQ(std::to_string(3 + 2 * i + j), ids[j]);
+    }
+  }
+}
+
+TEST_F(SearchEngineTest, offsetEmptyIndexAndNoMatches) {
+  CollectionHelper helper;
+  for (bool populated : {false, true}) {
+    if (populated) helper.index(flatdoc("id", "a", "body_w", "pear"), UpdateMessage::COMMIT);
+    for (bool count : {false, true}) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").topDocs("q").matchQuery("body_w", "apple")
+          .offset(INT64_MAX).limit(5).getNumber(count);
+      req->execute();
+      ASSERT_OK(req);
+      ASSERT_EQ(1u, req->responses.size());
+      ASSERT_NE(nullptr, req->docList());
+      EXPECT_EQ(INT64_MAX, req->docList()->offset);
+      EXPECT_EQ(0, req->docList()->row_count);
+      EXPECT_EQ(count ? std::optional<int64_t>(0) : std::nullopt, req->docList()->found);
+      EXPECT_FALSE(req->docList()->more);
+      EXPECT_FALSE(req->responses[0]->proto.more);
+    }
+  }
+}
+
+TEST_F(SearchEngineTest, offsetNegativeRejected) {
+  CollectionHelper helper;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().offset(-2);
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("top_docs 'q': offset must be >= 0"))
+      << req->errorMsg();
+}
+
+TEST_F(SearchEngineTest, offsetCachedMembership) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
+  for (int i = 0; i < 20; i++) {
+    helper.index(flatdoc("id", std::to_string(i), "body_w",
+                        i < 12 ? "apple pear" : "apple other pear", "rank_i", (int64_t)i));
+  }
+  helper.commit();
+  // A phrase's cached membership removes verification in both ranking paths.
+  for (bool fieldSort : {false, true}) {
+    for (int round = 0; round < 2; round++) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& q = req->collection("main").topDocs("q").fields({"id"})
+          .offset(3).limit(5).getNumber();
+      q.rawQuery() = qb::constantScore(q.mr(), qb::phraseText(q.mr(), "body_w", "apple pear"));
+      if (fieldSort) qb::sort(q, "rank_i", qb::DESC);
+      SkipStatsGuard stats;
+      req->execute(false);
+      ASSERT_OK(req);
+      EXPECT_EQ(12, req->docList()->found.value_or(-1));
+      EXPECT_EQ(fieldSort ? (std::vector<std::string>{"8", "7", "6", "5", "4"})
+                          : (std::vector<std::string>{"3", "4", "5", "6", "7"}),
+                resultIds(*req, "q"));
+      if (round == 1) {
+        EXPECT_GT(fieldSort ? SkipStats::cacheFirstFieldSortWeightSkips
+                            : SkipStats::cacheFirstConstantTopKWeightSkips, 0);
+      }
+    }
+  }
+}
+
+
+TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
+  std::vector<Doc> docs;
+  for (int i = 0; i < 4096; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i,
+                           "body_w", i % 2 == 0 ? "apple pear" : "other"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  // Eight numeric leaf zones: depth 1 admits best-first, depth 3 rejects it.
+  // Warm membership must plan with offset + limit even though limit stays 1.
+  BestFirstGuard bestFirst(false, false);
+  for (int round = 0; round < 3; round++) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& q = req->collection("main").topDocs("q").fields({"id"})
+        .limit(1).offset(round == 2 ? 2 : 0).getNumber();
+    q.rawQuery() = qb::boolean(q.mr(), {},
+        {qb::match(q.mr(), "body_w", "apple"), qb::match(q.mr(), "body_w", "pear")});
+    qb::sort(q, "rank_i", qb::ASC);
+    SkipStatsGuard stats;
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(2048, req->docList()->found.value_or(-1));
+    EXPECT_EQ((std::vector<std::string>{round == 2 ? "4" : "0"}), resultIds(*req, "q"));
+    if (round > 0) {
+      EXPECT_EQ(round == 1 ? 1 : 0, SkipStats::cacheFirstFieldSortWeightSkips);
+    }
+  }
+}

@@ -3373,4 +3373,52 @@ TEST_F(HttpApiTest, oversizedBodyStillAnswersRouteAndMethodFirst) {
             std::string::npos) << tooLarge.body();
 }
 
+TEST_F(HttpApiTest, offsetJsonBody) {
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "title_w", "dune"),
+    flatdoc("id", "b", "title_w", "dune dune"),
+    flatdoc("id", "c", "title_w", "dune dune dune"),
+    flatdoc("id", "d", "title_w", "dune dune dune dune"),
+  }, UpdateMessage::COMMIT);
+  HttpReq all(port());
+  all.matchQuery("title_w", "dune").fields({"id"}).limit(10).withStats().execute();
+  ASSERT_EQ(200, all.status()) << all.rawResponse();
+  auto ids = all.ids();
+  ASSERT_EQ(4u, ids.size());
+  HttpReq page(port());
+  page.matchQuery("title_w", "dune").fields({"id"}).offset(1).limit(2).withStats().execute();
+  ASSERT_EQ(200, page.status()) << page.rawResponse();
+  EXPECT_EQ((std::vector<std::string>{ids[1], ids[2]}), page.ids());
+  EXPECT_EQ(4, page.found());
+}
+
+TEST_F(HttpApiTest, offsetUrlOverlay) {
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "title_w", "dune"),
+    flatdoc("id", "b", "title_w", "dune dune"),
+    flatdoc("id", "c", "title_w", "dune dune dune"),
+    flatdoc("id", "d", "title_w", "dune dune dune dune"),
+  }, UpdateMessage::COMMIT);
+  HttpReq all(port());
+  all.matchQuery("title_w", "dune").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, all.status()) << all.rawResponse();
+  auto ids = all.ids();
+  ASSERT_EQ(4u, ids.size());
+  auto page = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?offset=1&limit=2",
+      R"({"query":"title_w:dune","fields":["id"],"offset":0,"limit":10,"get_number":true})");
+  ASSERT_EQ(200, page.result_int()) << page.body();
+  auto lines = splitLines(page.body());
+  ASSERT_EQ(1u, lines.size());
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, lines[0])) << lines[0];
+  auto* docs = root["docs"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, docs);
+  ASSERT_EQ(2u, docs->size());
+  EXPECT_EQ(ids[1], *(*docs)[0]["id"].get_if<std::string>());
+  EXPECT_EQ(ids[2], *(*docs)[1]["id"].get_if<std::string>());
+  ASSERT_NE(nullptr, root["found"].get_if<int64_t>());
+  EXPECT_EQ(4, *root["found"].get_if<int64_t>());
+}
+
 } // namespace luxir::test
