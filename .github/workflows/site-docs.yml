@@ -1,0 +1,22 @@
+# Rebuild luxir.org when documentation changes on main. The site imports docs/
+# at build time; this just asks Cloudflare Workers Builds to run that build.
+name: Rebuild site docs
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**']
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the site deploy hook
+        env:
+          HOOK_URL: ${{ secrets.SITE_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$HOOK_URL" ]; then
+            echo "SITE_DEPLOY_HOOK_URL is not set; nothing to do."
+            exit 0
+          fi
+          curl --fail --silent --show-error -X POST "$HOOK_URL"
