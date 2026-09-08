@@ -653,7 +653,8 @@ public:
   // the bounded one-time materialization, about 3.4ms at r50, because this
   // bound cannot observe the intermediate. A selectivity-product exposure
   // estimate is the enumerated future refinement. Measured with gcc-release
-  // on Fenrir, 2026-08-11, with the quick-board A/B as the confirming oracle.
+  // on a 16-core Zen 3 desktop, 2026-08-11, with the quick-board A/B as the
+  // confirming oracle.
   static constexpr int64_t WINDOW_FILL_SPAN_SCALE =
       DocsEnumMeta::L1_DOCS;
   static inline int64_t windowFillSpanScaleForTests =

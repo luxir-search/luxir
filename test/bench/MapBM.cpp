@@ -526,7 +526,7 @@ the latter is being selected as the general hash table impl for luxir.  To avoid
 is ifdefed out.
 
 Representative run:
- [main] /mnt/e/opt/code/luxir/cmake-build-release-wsl/bin$ ./luxir_test --bench --benchmark_filter=BM_invert --benchmark_repetitions=60 | grep _mean
+$ ./luxir_test --bench --benchmark_filter=BM_invert --benchmark_repetitions=60 | grep _mean
 2021-01-26T14:47:13-05:00
 Running ./luxir_test
         Run on (12 X 3593.26 MHz CPU s)

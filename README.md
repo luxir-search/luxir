@@ -83,10 +83,14 @@ cmake --build --preset gcc-release
 
 The project is licensed under the [Apache License 2.0](LICENSE). Third-party
 components and their licenses are listed in [NOTICE](NOTICE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report problems and
+contribute, and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ## Current scope
 
-Luxir is moving quickly and interfaces can change. It is currently a
+Luxir is pre-release software. The HTTP and gRPC APIs, configuration, and the
+on-disk index format change without notice, and there is no compatibility
+guarantee before 1.0: expect to reindex when upgrading. It is currently a
 single-node engine with no built-in authentication or TLS; deploy it behind
 your own network and security boundary. Replication, distributed query
 execution, packaged clients, and a collection-management API are not shipped
