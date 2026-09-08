@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 // google.rpc.Status, the payload gRPC clients expect in the
 // grpc-status-details-bin trailer: {code, message, details: [Any]} with the

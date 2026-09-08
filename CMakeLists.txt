@@ -1,3 +1,6 @@
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.16)
 project(Luxir VERSION 0.1)
 set(CMAKE_CXX_STANDARD 26)

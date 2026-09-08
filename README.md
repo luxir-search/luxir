@@ -81,7 +81,8 @@ cmake --build --preset gcc-release
 ./build/gcc-release/bin/luxir
 ```
 
-The project is licensed under the [Apache License 2.0](LICENSE).
+The project is licensed under the [Apache License 2.0](LICENSE). Third-party
+components and their licenses are listed in [NOTICE](NOTICE).
 
 ## Current scope
 

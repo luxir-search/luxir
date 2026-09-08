@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Parse tests for SimpleQueryParser: (string, schema, options) -> api::Query
 // subtree, no engine.  Structural assertions on the emitted tree.  Behaviors
 // adapted from Lucene's TestSimpleQueryParser where the dialects overlap

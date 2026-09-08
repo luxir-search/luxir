@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // JSON codec metadata for the luxir::api wire model: the glaze from/to overrides that the
 // generated glz::meta cannot express, plus the Luxir JSON dialect.
 //

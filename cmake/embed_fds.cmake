@@ -1,3 +1,6 @@
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # Embed a binary file as a C++ byte array header.
 # Usage: cmake -DFDS_IN=<bin> -DOUT_H=<header> -P cmake/embed_fds.cmake
 file(READ "${FDS_IN}" _hex HEX)

@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // HAND-WRITTEN concrete classes for the internal luxir_index.proto manifest.
 // Members are ordered by descending alignment. Generated metadata binds them
 // by member pointer and field number, independent of declaration order.

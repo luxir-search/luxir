@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Behavior tests for the simple_query arm end-to-end: request envelope
 // validation, lowering through ProtobufQueryParser/QueryBuilder, match
 // behavior over a real index, and the warnings channel on the response.

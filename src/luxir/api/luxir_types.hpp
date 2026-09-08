@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // HAND-WRITTEN concrete classes for luxir_types.proto (Phase 1 spike).
 // Mirrors the non-owning instantiation (gen_real_templated/luxir_types.msg.hpp), de-templatized:
 // std::string_view / std::span / map_view / optional_indirect_view / indirect_view / std::optional,

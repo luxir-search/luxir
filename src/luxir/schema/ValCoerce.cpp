@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Out-of-line definitions for the FieldType coercion virtuals (declared in
 // FieldType.h, shared core in ValCoerce.h).  Kept out of the headers so
 // FieldType.h stays independent of the api types.

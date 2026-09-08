@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Golden-wire tests for the Luxir JSON dialect (src/luxir/api/json_dialect.h): literal
 // JSON text in/out, pinning the surface as a contract rather than a self-round-trip.
 // Val is untagged (a raw JSON value): reads dispatch on the token, writes render the arm

@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Luxir JSON dialect: hand-written glaze from/to specializations that override the
 // generated glz::meta where the mechanical proto mapping is not the JSON we want.
 // This file is the single home for JSON *shape* customization; key naming stays

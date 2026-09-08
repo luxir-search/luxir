@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Tests for the Val <-> FieldType coercion contract: one implementation shared
 // by ingest and query build, so a doc ingested via one rule is findable by
 // querying the same literal (the findability invariant).

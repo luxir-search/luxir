@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # Bootstrap deps/ for a fresh checkout:
 #   1. fetch pinned third-party sources that are not checked into the repo
 #      (FastPFOR; also restores the normally-vendored uni-algo if absent)

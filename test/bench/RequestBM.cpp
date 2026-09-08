@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "oneapi/tbb/task_group.h"
 #include "bench/luxir_bench.h"
 #include "test/GrpcLuxirTest.h"

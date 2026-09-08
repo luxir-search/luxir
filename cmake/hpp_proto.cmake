@@ -1,3 +1,6 @@
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # hpp-proto build integration (vendored via deps/hpp-proto submodule + deps/is_utf8).
 #
 # Provides:

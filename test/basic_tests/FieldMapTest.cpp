@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Tests for UpdateRequest.field_map / drop_unmapped: per-request renaming of input
 // doc keys onto schema fields at ingest, "" targets dropping a key, last-wins dedup
 // on the post-mapping name, and request-level validation of the map itself.

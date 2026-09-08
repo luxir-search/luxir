@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # Apply Luxir's local patches to the vcpkg roots and the FastPFOR checkout.
 # Safe to re-run: patches that are already applied are detected and skipped.
 #

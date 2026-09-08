@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Out-of-line ByteBuffer<->bytes adapters for the gRPC test client. The heavy (en/de)code
 // lives in the luxir_proto_concrete lib (luxir::api::encode/decode); this TU only owns the
 // grpc::Slice/ByteBuffer glue so the test TUs don't pull it in. See GrpcClient.h.

@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Tests for update failure handling: failed docs are marked deleted (a partially
 // indexed doc can't be backed out), errors are reported per doc, id-map mutations
 // are rolled back so previous versions survive, and all_or_none makes a request

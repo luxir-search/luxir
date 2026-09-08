@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 
 // The classic std::visit visitor: combine a set of lambdas into one overload set.

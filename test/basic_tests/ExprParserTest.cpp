@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Parse tests for ExprParser: (string, schema, options) -> api::Query subtree,
 // no engine.  Structural assertions on the emitted tree plus the rigorous
 // parse-error contract (expr never degrades; errors carry byte offsets).

@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Standalone validation of the concrete-API test infra: exercises CollectionHelper
 // (Doc -> concrete luxir::api::Map build-by-backing, blocking + async update) and LocalReq
 // (fluent OpCursor builder -> non-owning response via Val accessors) end to end.

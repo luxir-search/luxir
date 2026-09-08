@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 // Error classification.  Every failure that can reach a client resolves to an
 // ErrorInfo {kind, code, message}: kind is the coarse class that picks the

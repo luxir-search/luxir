@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "IndexReader.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/Postings.h"

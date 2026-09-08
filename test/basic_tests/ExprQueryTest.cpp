@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Behavior tests for the expr arm end-to-end: lowering through
 // ProtobufQueryParser/QueryBuilder, match behavior over a real index, the
 // splice of the parsed expansion into the request tree, and the rigorous

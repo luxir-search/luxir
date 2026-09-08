@@ -1,0 +1,44 @@
+Luxir
+Copyright 2020-2026 Yonik Seeley and Luxir contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository includes or fetches the following third-party software, each
+under its own license as noted. Their license texts are kept alongside them.
+
+  uni-algo (deps/uni-algo, vendored, locally patched)
+    https://github.com/uni-algo/uni-algo
+    Public domain (Unlicense) or MIT, at the user's option
+    License: deps/uni-algo/LICENSE.md
+
+  is_utf8 (deps/is_utf8, vendored)
+    https://github.com/simdutf/is_utf8
+    Copyright 2022 The is_utf8 authors
+    MIT License: deps/is_utf8/LICENSE
+
+  hpp-proto (deps/hpp-proto, git submodule)
+    https://github.com/huangminghuang/hpp-proto
+    Copyright (c) 2024 Huang-Ming Huang
+    MIT License: deps/hpp-proto/LICENSE
+
+  FastPFOR (deps/FastPFOR, cloned at build setup by deps/make_deps.sh)
+    https://github.com/fast-pack/FastPFOR
+    By Daniel Lemire and contributors (see deps/FastPFOR/AUTHORS)
+    Apache License 2.0: deps/FastPFOR/LICENSE
+
+This product also contains code adapted from:
+
+  Romu random number generators, by Mark Overton
+    https://www.romu-random.org/
+    Apache License 2.0 (src/luxir/util/random.h)
+
+  splitmix64, by Sebastiano Vigna
+    http://prng.di.unimi.it/splitmix64.c
+    CC0 / public domain (src/luxir/util/random.h)
+
+  MurmurHash64A, by Austin Appleby
+    Public domain (src/luxir/util/luxir_util.h)
+
+Other build-time dependencies (protobuf, gRPC, FAISS, and the other vcpkg
+packages listed in deps/README.txt) are not included in this repository and
+carry their own licenses.

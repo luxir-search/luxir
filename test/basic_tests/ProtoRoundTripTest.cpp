@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Wire-model regression net for the concrete luxir::api classes. Instead of hand-writing an
 // instance + a verifier per message (which silently fails to cover any field someone forgets
 // to add), this drives EVERY message type through one generic round-trip:

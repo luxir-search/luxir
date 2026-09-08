@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 // Inverter auto-flush: the size-based flush is checked ONCE per update message, at
 // the end of the batch (never mid-request). A whole message stays in one inverter,
 // so within-request id overwrites stay correct; a non-stop stream is byte-batched

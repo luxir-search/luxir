@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #include "LuxirNode.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/InputStream.h"

@@ -1,3 +1,6 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 // Arena-backed builders for the concrete luxir::api query/op constructs the OpCursor fluent
 // helpers don't cover (boolean trees, knn, fusion sources, sorts). Every builder allocates
