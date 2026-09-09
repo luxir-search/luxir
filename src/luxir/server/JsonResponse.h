@@ -10,8 +10,8 @@
 
 namespace luxir {
 
-// Render one luxir::api::SearchResponse as a single bespoke JSON object, terminated
-// with a newline (one NDJSON line). Columnar DocList and FacetResult values are
+// Render one luxir::api::SearchResponse as a compact JSON object without a trailing
+// newline; the HTTP transport owns framing. Columnar DocList and FacetResult values are
 // flattened to row-major JSON; missing and non-finite slots render as JSON null.
 //
 // Shape:
@@ -24,7 +24,7 @@ namespace luxir {
 // ops stay under ops in response order.  On engine error:
 //   {"request_id": "...", "error": {"kind": ..., "code": ..., "message": ...},
 //    "warnings": [...]}
-std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp);
+std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp);
 
 // The JSON error body (no trailing newline) for a failure answered with an
 // HTTP error status - the same {request_id, error} shape as an in-band error

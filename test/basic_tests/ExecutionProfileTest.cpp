@@ -90,7 +90,7 @@ TEST_F(ExecutionProfileTest, absentUnlessRequested) {
   ASSERT_OK(req);
   ASSERT_FALSE(req->responses.back()->proto.profile.has_value());
   EXPECT_EQ(std::string::npos,
-            renderSearchResponseLine(req->responses.back()->proto).find("\"profile\""));
+            renderSearchResponseBody(req->responses.back()->proto).find("\"profile\""));
 
   auto offReq = localReq(helper.getSearchEngine());
   offReq->collection("main").profile(false).facet("cats", "cat_s").limit(-1);
@@ -152,7 +152,7 @@ TEST_F(ExecutionProfileTest, reportsMultiSegmentStrategyInputsAndUpgrade) {
   EXPECT_EQ("hash", op.pieces[2].strategy);
   EXPECT_TRUE(detailsMention(op.pieces[2], "want=hash, found=skinny"));
 
-  std::string json = renderSearchResponseLine(req->responses.back()->proto);
+  std::string json = renderSearchResponseBody(req->responses.back()->proto);
   EXPECT_NE(std::string::npos, json.find(R"("profile":{"ops":[{"name":"tags")"));
   EXPECT_NE(std::string::npos, json.find(R"("upgraded shared counters to skinny")"));
 

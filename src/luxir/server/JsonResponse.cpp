@@ -491,7 +491,7 @@ void appendOpVal(std::string& out, const luxir::api::Val& val) {
 
 } // namespace
 
-std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp) {
+std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp) {
   std::string out;
   out += '{';
   bool first = true;
@@ -514,7 +514,7 @@ std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp) {
       appendKey("warnings");
       appendWarnings(out, resp.warnings);
     }
-    out += "}\n";
+    out += '}';
     return out;
   }
 
@@ -576,7 +576,7 @@ std::string renderSearchResponseLine(const luxir::api::SearchResponse& resp) {
     appendKey("more");
     out += "true";
   }
-  out += "}\n";
+  out += '}';
   return out;
 }
 

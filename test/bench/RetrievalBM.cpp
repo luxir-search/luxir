@@ -21,7 +21,7 @@ using namespace luxir::test;
 //                    it to isolate field-loading cost.  ROWS vs COLUMNS
 //                    measures the scatter pass on top of the same loaders.
 //
-//   BM_JsonRender  - renderSearchResponseLine over an already-built
+//   BM_JsonRender  - renderSearchResponseBody over an already-built
 //                    response (built once, outside the timing loop): the
 //                    columns->rows transpose vs the rows passthrough.
 
@@ -126,7 +126,7 @@ static const std::vector<std::string> FIELDS_ID = {"id"};
 static void renderLoop(benchmark::State& state, const luxir::api::SearchResponse& proto) {
   int64_t fp = -1;
   for (auto _ : state) {
-    std::string line = renderSearchResponseLine(proto);
+    std::string line = renderSearchResponseBody(proto);
     int64_t ret = (int64_t)line.size();
     benchmark::DoNotOptimize(line.data());
     if (fp != -1) {

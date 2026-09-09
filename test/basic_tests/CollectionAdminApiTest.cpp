@@ -49,6 +49,27 @@ static LuxirConfig fsConfig(const CollectionAdminDataDir& data) {
   return config;
 }
 
+TEST_F(CollectionAdminApiTest, adminPrettyDefaults) {
+  HttpServer server(*LuxirTest::luxirNode, 2, 0);
+  server.start();
+  for (const char* path : {"/collections/main/_schema", "/collections/_list", "/collections",
+                          "/_stats", "/collections/main/_stats"}) {
+    SCOPED_TRACE(path);
+    auto pretty = httpRequest(server.getPort(), http::verb::get, path);
+    ASSERT_EQ(200, pretty.result_int()) << pretty.body();
+    EXPECT_TRUE(pretty.body().ends_with("\n"));
+    EXPECT_FALSE(pretty.body().ends_with("\n\n"));
+    EXPECT_LT(pretty.body().find('\n'), pretty.body().size() - 1);
+    auto compact = httpRequest(server.getPort(), http::verb::get, std::string(path) + "?pretty=false");
+    ASSERT_EQ(200, compact.result_int()) << compact.body();
+    EXPECT_TRUE(compact.body().ends_with("\n"));
+    EXPECT_EQ(compact.body().size() - 1, compact.body().find('\n'));
+    glz::generic_i64 root;
+    EXPECT_FALSE(glz::read_json(root, compact.body()));
+  }
+  server.shutdown();
+}
+
 TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
   CollectionAdminDataDir data("luxir_collection_admin_lifecycle");
   auto config = fsConfig(data);

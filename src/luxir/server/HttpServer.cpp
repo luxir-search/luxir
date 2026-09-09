@@ -364,7 +364,25 @@ public:
     });
   }
 
-  // Callable from any thread.  Queues a rendered NDJSON line (an owned string)
+  // JSON renderers return bare compact JSON; this is the one place that
+  // owns whitespace and framing. Pretty records are separated by a blank
+  // line, so every pretty record but the last carries the separator.
+  std::string finishJson(std::string compact, bool last = true) const {
+    if (pretty_) {
+      std::string out;
+      glz::prettify_json<PrettyOpts{}>(compact, out);
+      compact = std::move(out);
+    }
+    compact += '\n';
+    if (pretty_ && !last) compact += '\n';
+    return compact;
+  }
+
+  int64_t enqueueJson(std::string compact, bool last) {
+    return enqueueLine(finishJson(std::move(compact), last), last);
+  }
+
+  // Callable from any thread. Queues a framed record (an owned string)
   // on the shard. No completion callback: reply() already freed the arena the
   // line was rendered from, so the write depends on nothing but the string.
   // Returns the connection's buffered bytes including this line - the producer's
@@ -448,7 +466,7 @@ public:
     net::post(stream_.get_executor(),
         [self = shared_from_this(), status, body = std::move(body)]() mutable {
           if (self->errored_ || self->headerSent_) return;
-          self->respondSimple(status, "application/json", std::move(body));
+          self->respondJson(status, std::move(body));
         });
   }
 
@@ -461,6 +479,33 @@ public:
   LuxirNode& node() { return node_; }
 
 private:
+  struct UrlParam {
+    std::string key;
+    std::string value;
+  };
+
+  // Known paths answer a wrong method with 405 and an Allow header; only an
+  // unknown path is 404.  A read-only node then refuses mutations with 403.
+  enum class Route {
+    NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA
+  };
+
+  struct RouteMatch {
+    Route route = Route::NONE;
+    std::string_view allow;  // the methods the path accepts, as an Allow header value
+    std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
+    std::string coll;
+    // /collections//{endpoint}: a collection route whose {c} segment is empty.  That
+    // is a malformed URL, not a request for the default collection (which is the
+    // omitted body field), so dispatch rejects it before any handler resolves it.
+    bool emptyCollection = false;
+    bool prettyDefault = false;
+  };
+
+  struct PrettyOpts : glz::opts {
+    uint8_t indentation_width = 2;
+  };
+
   struct Pending { std::string line; bool last; };
 
   // The last session ref can drop on a task-arena thread after shutdown has
@@ -479,6 +524,10 @@ private:
   // Carried from the request for the (later, async) streaming response.
   unsigned httpVersion_ = 11;
   bool keepAlive_ = false;
+  std::string requestId_;  // URL param, then the parsed body
+  std::vector<UrlParam> urlParams_;
+  RouteMatch route_;
+  bool pretty_ = false;  // fixed before submitting work for this request
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
   // producers but not yet written to the socket (pendingQ_ + inflightLine_);
@@ -495,7 +544,6 @@ private:
   std::optional<http::response<http::empty_body>> res_;
   std::optional<http::response_serializer<http::empty_body>> sr_;
   bool writeOutstanding_ = false;
-  std::string requestId_;  // the current request's id (URL param, then the parsed body)
   bool headerSent_ = false;
   bool lastSeen_ = false;
   bool chunkLastSent_ = false;
@@ -587,6 +635,8 @@ private:
   };
 
   void doRead() {
+    requestId_.clear();
+    pretty_ = false;
     parser_.emplace();
     // The buffered request-body cap is applied after header routing. Streaming
     // NDJSON must be able to carry an unbounded Content-Length; atomic groups are
@@ -617,17 +667,28 @@ private:
     // A URL request_id is known before the body arrives, so it identifies even
     // a request whose body never parses or is refused unread as too large.  A
     // parsed body's request_id replaces it.
-    std::vector<UrlParam> params = parseParams(query);
-    requestId_.clear();
+    urlParams_ = parseParams(query);
+    const auto& params = urlParams_;
     if (const std::string* id = findParam(params, "request_id")) requestId_ = *id;
 
-    std::string coll;
-    if (parser_->get().method() == http::verb::post && parseUpdatePath(target, coll) &&
+    route_ = matchRoute(target);
+    pretty_ = route_.prettyDefault;
+    if (const std::string* pretty = findParam(params, "pretty")) {
+      if (pretty->empty() || *pretty == "true") pretty_ = true;
+      else if (*pretty == "false") pretty_ = false;
+      else {
+        respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+            "invalid URL parameter 'pretty': expected true or false, got '" + *pretty + "'"));
+        return;
+      }
+    }
+
+    if (parser_->get().method() == http::verb::post && route_.route == Route::UPDATE &&
         isNdjsonContentType(std::string_view(parser_->get()[http::field::content_type]))) {
       bool urlCommit = false;
       if (const std::string* commit = findParam(params, "commit")) {
         if (*commit != "true") {
-          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+          respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
                                      "unknown commit mode '" + *commit + "' (valid: true)"));
           return;
         }
@@ -638,19 +699,17 @@ private:
       std::string paramErr;
       if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
           !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
-        respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
+        respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
         return;
       }
       // Refuse before lifting the body limit: otherwise a read-only node reads an
-      // unbounded NDJSON stream only to reject it.  The body is unread, so like
-      // respondPayloadTooLarge() this ends the connection rather than reusing it.
+      // unbounded NDJSON stream only to reject it.
       if (node_.readOnly()) {
-        keepAlive_ = false;
-        respondError(readOnlyError(target));
+        respondBeforeBodyError(readOnlyError(target));
         return;
       }
       parser_->body_limit(boost::none);
-      startStreamingUpdate(std::move(coll), urlCommit, std::move(urlFieldMap), urlDropUnmapped);
+      startStreamingUpdate(std::move(route_.coll), urlCommit, std::move(urlFieldMap), urlDropUnmapped);
       return;
     }
 
@@ -660,7 +719,7 @@ private:
       // unknown path, a wrong method, or a read-only refusal outranks the size
       // of a body nobody would have consumed.  Each answer closes the
       // connection, as respondPayloadTooLarge() does.
-      RouteMatch match = matchRoute(target);
+      const RouteMatch& match = route_;
       keepAlive_ = false;
       if (match.route == Route::NONE) {
         respondError(ErrorInfo::of(ErrorKind::NOT_FOUND, "no such route: " + std::string(target)));
@@ -780,11 +839,6 @@ private:
     contentType = trimHeaderValue(contentType);
     return asciiEqualsIgnoreCase(contentType, "application/x-ndjson");
   }
-
-  struct UrlParam {
-    std::string key;
-    std::string value;
-  };
 
   struct SearchUrlOverlay {
     std::string json;
@@ -1093,23 +1147,6 @@ private:
     return true;
   }
 
-  // Known paths answer a wrong method with 405 and an Allow header; only an
-  // unknown path is 404.  A read-only node then refuses mutations with 403.
-  enum class Route {
-    NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA
-  };
-
-  struct RouteMatch {
-    Route route = Route::NONE;
-    std::string_view allow;  // the methods the path accepts, as an Allow header value
-    std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
-    std::string coll;
-    // /collections//{endpoint}: a collection route whose {c} segment is empty.  That
-    // is a malformed URL, not a request for the default collection (which is the
-    // omitted body field), so dispatch rejects it before any handler resolves it.
-    bool emptyCollection = false;
-  };
-
   static RouteMatch matchRoute(std::string_view target) {
     RouteMatch m;
     if (target == "/health") {
@@ -1117,9 +1154,9 @@ private:
     } else if (target == "/collections/_list") {
       // The canonical _list spelling also accepts POST (matching the other
       // _-verb endpoints; any body is ignored - the request has no parameters).
-      m.route = Route::COLLECTION_LIST; m.allow = "GET, POST";
+      m.route = Route::COLLECTION_LIST; m.allow = "GET, POST"; m.prettyDefault = true;
     } else if (target == "/collections") {
-      m.route = Route::COLLECTION_LIST; m.allow = "GET";  // synonym for _list
+      m.route = Route::COLLECTION_LIST; m.allow = "GET"; m.prettyDefault = true;  // synonym for _list
     } else if (target == "/collections/_create") {
       m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
     } else if (target == "/collections/_delete") {
@@ -1129,9 +1166,9 @@ private:
     } else if (parseUpdatePath(target, m.coll)) {
       m.route = Route::UPDATE; m.allow = "POST";
     } else if (target == "/_stats" || parseStatsPath(target, m.coll)) {
-      m.route = Route::STATS; m.allow = "GET";
+      m.route = Route::STATS; m.allow = "GET"; m.prettyDefault = true;
     } else if (parseSchemaPath(target, m.coll)) {
-      m.route = Route::SCHEMA; m.allow = "GET, POST";
+      m.route = Route::SCHEMA; m.allow = "GET, POST"; m.prettyDefault = true;
       m.hint = "schema writes are POST (mode=set adds or replaces the named definitions, "
                "mode=replace_all replaces the whole schema)";
     }
@@ -1158,14 +1195,10 @@ private:
     keepAlive_ = req.keep_alive();
 
     std::string_view target(req.target());
-    std::string_view query;
-    if (auto q = target.find('?'); q != std::string_view::npos) {
-      query = target.substr(q + 1);
-      target = target.substr(0, q);
-    }
-    std::vector<UrlParam> params = parseParams(query);
+    target = target.substr(0, target.find('?'));
+    const auto& params = urlParams_;
 
-    RouteMatch match = matchRoute(target);
+    const RouteMatch& match = route_;
     if (match.route == Route::NONE) {
       respondError(ErrorInfo::of(ErrorKind::NOT_FOUND, "no such route: " + std::string(target)));
       return;
@@ -1186,7 +1219,7 @@ private:
     const std::string& coll = match.coll;
     switch (match.route) {
       case Route::HEALTH:
-        respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
+        respondJson(http::status::ok, R"({"status":"ok"})");
         break;
       case Route::COLLECTION_LIST:
         handleCollectionList();
@@ -1343,7 +1376,7 @@ private:
       respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
-    respondSimple(http::status::ok, "application/json", out);
+    respondJson(http::status::ok, std::move(out));
   }
 
   // The docs format is pure document lines: every op must produce a DocList,
@@ -1410,6 +1443,9 @@ private:
         return;
       }
       docsMultiOp = requestState->proto.ops.size() > 1;
+      // Best effort: docs is a pipeline format, so pretty does not apply to
+      // the stream (the error response above still honors it).
+      pretty_ = false;
     }
 
     auto& engine = node_.getSearchEngine();
@@ -1489,7 +1525,7 @@ private:
       net::post(self->stream_.get_executor(),
           [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
             if (failure) self->respondError(*failure);
-            else self->respondSimple(http::status::ok, "application/json", std::move(body));
+            else self->respondJson(http::status::ok, std::move(body));
           });
     });
   }
@@ -1506,17 +1542,14 @@ private:
       for (std::size_t i = 0; i < entries.size(); i++) names[i] = entries[i].name;
       luxir::api::ListCollectionsResponse response;
       response.collections = names;
-      std::string compact;
-      if (!luxir::api::write_json(response, compact)) {
+      if (!luxir::api::write_json(response, out)) {
         throw std::runtime_error("failed to serialize list collections response");
       }
-      glz::prettify_json(compact, out);
-      out += '\n';
     } catch (const std::exception& e) {
       failure = classifyException(e, ErrorKind::INTERNAL);
     }
     if (failure) respondError(*failure);
-    else respondSimple(http::status::ok, "application/json", std::move(out));
+    else respondJson(http::status::ok, std::move(out));
   }
 
   void handleCollectionCreate(const std::string& body) {
@@ -1555,7 +1588,7 @@ private:
       net::post(self->stream_.get_executor(),
           [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
             if (failure) self->respondError(*failure);
-            else self->respondSimple(http::status::ok, "application/json", std::move(body));
+            else self->respondJson(http::status::ok, std::move(body));
           });
     });
   }
@@ -1594,14 +1627,14 @@ private:
       net::post(self->stream_.get_executor(),
           [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
             if (failure) self->respondError(*failure);
-            else self->respondSimple(http::status::ok, "application/json", std::move(body));
+            else self->respondJson(http::status::ok, std::move(body));
           });
     });
   }
 
   // ---- /_schema -------------------------------------------------------------
   // The schema JSON is a for-humans surface (it gets pasted into forums and
-  // docs), so responses are pretty-printed.  GET output is a valid write body:
+  // docs), so responses default to pretty.  GET output is a valid write body:
   // both directions speak the authored source form (Schema::toProto), and
   // POSTing a GET body back is a no-op under either mode.
 
@@ -1613,10 +1646,7 @@ private:
     if (!luxir::api::write_json(def, compact)) {
       throw std::runtime_error("failed to serialize schema");
     }
-    std::string pretty;
-    glz::prettify_json(compact, pretty);
-    pretty += '\n';
-    return pretty;
+    return compact;
   }
 
   void handleSchemaGet(const std::string& coll) {
@@ -1632,7 +1662,7 @@ private:
       failure = classifyException(e, ErrorKind::INTERNAL);
     }
     if (failure) respondError(*failure);
-    else respondSimple(http::status::ok, "application/json", std::move(out));
+    else respondJson(http::status::ok, std::move(out));
   }
 
   void handleStats(std::optional<std::string> coll, bool includeSegments) {
@@ -1650,12 +1680,9 @@ private:
             luxir::api::StatsResponse response;
             gatherStats(self->node_, request, response, resource);
 
-            std::string compact;
-            if (!luxir::api::write_json(response, compact)) {
+            if (!luxir::api::write_json(response, out)) {
               throw std::runtime_error("failed to serialize stats response");
             }
-            glz::prettify_json(compact, out);
-            out += '\n';
           } catch (const std::exception& e) {
             failure = classifyException(e, ErrorKind::INTERNAL);
           }
@@ -1663,7 +1690,7 @@ private:
           net::post(self->stream_.get_executor(),
                     [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
                       if (failure) self->respondError(*failure);
-                      else self->respondSimple(http::status::ok, "application/json", std::move(body));
+                      else self->respondJson(http::status::ok, std::move(body));
                     });
         });
   }
@@ -1702,7 +1729,7 @@ private:
       net::post(self->stream_.get_executor(),
           [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
             if (failure) self->respondError(*failure);
-            else self->respondSimple(http::status::ok, "application/json", std::move(body));
+            else self->respondJson(http::status::ok, std::move(body));
           });
     });
   }
@@ -1719,7 +1746,7 @@ private:
     resp->set(http::field::content_type, "application/json");
     resp->set(http::field::allow, allow);
     resp->keep_alive(keepAlive_);
-    resp->body() = renderErrorBody(info, requestId_);
+    resp->body() = finishJson(renderErrorBody(info, requestId_));
     resp->prepare_payload();
     http::async_write(stream_, *resp,
         [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
@@ -2036,7 +2063,7 @@ private:
   // ending the stream, if any: the line then reports status ERROR and the
   // error alongside whatever the interval had folded so far.  total_errors
   // counts every failed document even past the retention cap on `errors`.
-  static bool renderStreamIntervalResponseLine(const HttpStreamUpdateState& state,
+  static bool renderStreamIntervalResponseBody(const HttpStreamUpdateState& state,
                                                std::string_view requestId,
                                                const ErrorInfo* terminal,
                                                std::string& out) {
@@ -2074,13 +2101,11 @@ private:
     }
 
     out.clear();
-    if (!luxir::api::write_json(resp, out)) return false;
-    out += '\n';
-    return true;
+    return luxir::api::write_json(resp, out);
   }
 
   // The terminal line when no stream state survives to render an interval.
-  static bool renderStreamFailureLine(std::string_view requestId, const ErrorInfo& failure,
+  static bool renderStreamFailureBody(std::string_view requestId, const ErrorInfo& failure,
                                       std::string& out) {
     std::pmr::monotonic_buffer_resource responseResource;
     luxir::api::UpdateResponse resp;
@@ -2089,9 +2114,7 @@ private:
     resp.error = luxir::api::build::arenaError(responseResource, failure);
 
     out.clear();
-    if (!luxir::api::write_json(resp, out)) return false;
-    out += '\n';
-    return true;
+    return luxir::api::write_json(resp, out);
   }
 
   bool emitCurrentStreamInterval(bool last, bool force) {
@@ -2100,14 +2123,14 @@ private:
     if (!force && !streamIntervalHasActivity(*state)) return true;
 
     std::string out;
-    if (!renderStreamIntervalResponseLine(*state, currentStreamResponseRequestId(*state), nullptr, out)) {
+    if (!renderStreamIntervalResponseBody(*state, currentStreamResponseRequestId(*state), nullptr, out)) {
       failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "failed to serialize update response"));
       return false;
     }
     state->emittedLine = true;
     state->group.closeRequestId.reset();
     resetStreamInterval(*state);
-    enqueueLine(std::move(out), last);
+    enqueueJson(std::move(out), last);
     return true;
   }
 
@@ -2132,13 +2155,13 @@ private:
     std::string_view requestId = state ? currentStreamResponseRequestId(*state) : std::string_view();
     if (headerSent_) {
       std::string out;
-      bool rendered = state ? renderStreamIntervalResponseLine(*state, requestId, &failure, out)
-                            : renderStreamFailureLine(requestId, failure, out);
+      bool rendered = state ? renderStreamIntervalResponseBody(*state, requestId, &failure, out)
+                            : renderStreamFailureBody(requestId, failure, out);
       if (!rendered) {
         doTerminalStreamingClose();
         return;
       }
-      enqueueLine(std::move(out), true);
+      enqueueJson(std::move(out), true);
       return;
     }
     respondError(failure, requestId);
@@ -2702,6 +2725,7 @@ private:
       emitCurrentStreamInterval(true, true);
       return;
     }
+    // Pretty may retain a trailing blank line when the last ack preceded EOF.
     enqueueLine("", true);
   }
 
@@ -2752,7 +2776,7 @@ private:
     res_->result(http::status::ok);
     res_->version(httpVersion_);
     res_->set(http::field::server, "luxir");
-    res_->set(http::field::content_type, "application/x-ndjson");
+    res_->set(http::field::content_type, pretty_ ? "application/json" : "application/x-ndjson");
     res_->chunked(true);
     res_->keep_alive(keepAlive_);
     sr_.emplace(*res_);
@@ -2880,6 +2904,10 @@ private:
 
   // --- one-shot (non-streaming) responses: health, 404, 400 -----------------
 
+  void respondJson(http::status status, std::string compact) {
+    respondSimple(status, "application/json", finishJson(std::move(compact)));
+  }
+
   void respondSimple(http::status status, std::string_view contentType, std::string body) {
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
@@ -2905,8 +2933,14 @@ private:
   // object an in-band error line carries.
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
   void respondError(const ErrorInfo& info, std::string_view requestId) {
-    respondSimple(httpStatusFor(info), "application/json", renderErrorBody(info, requestId));
+    respondJson(httpStatusFor(info), renderErrorBody(info, requestId));
   }
+  // An unread body cannot be reused as the next request. Answer, then close.
+  void respondBeforeBodyError(const ErrorInfo& info) {
+    keepAlive_ = false;
+    respondError(info);
+  }
+
   void respondException(const std::exception& e, ErrorKind fallback) {
     respondError(classifyException(e, fallback));
   }
@@ -2978,7 +3012,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
     if (session->aborted()) {
       status = ReplyStatus::CANCEL;  // connection failed; skip the render
     } else {
-      int64_t queued = session->enqueueLine(renderSearchResponseLine(response.proto), last);
+      int64_t queued = session->enqueueJson(renderSearchResponseBody(response.proto), last);
       outputCommitted = true;
       if (queued > session->highWater()) status = ReplyStatus::PAUSE;
     }

@@ -88,8 +88,10 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
     auto res = httpRequest(port, method, target, std::move(body), contentType);
     EXPECT_EQ(403, res.result_int()) << what << ": " << res.body();
     EXPECT_NE(res.body().find("read-only"), std::string::npos) << what << ": " << res.body();
-    EXPECT_NE(res.body().find(R"("error":{"kind":"failed_precondition","code":"read_only")"),
-              std::string::npos) << what << ": " << res.body();
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body())) << what << ": " << res.body();
+    EXPECT_EQ("failed_precondition", root["error"]["kind"].get_string());
+    EXPECT_EQ("read_only", root["error"]["code"].get_string());
   };
 
   expectRefused("update", http::verb::post, "/collections/main/_update",

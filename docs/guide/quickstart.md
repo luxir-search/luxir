@@ -74,6 +74,24 @@ POST /collections/main/_search
 {"found":1,"docs":[{"id":"1","author_s":"Sanderson","year_i":2010}]}
 ```
 
+Add `?pretty` to the search URL (`/collections/main/_search?pretty`) for
+readable output:
+
+```json
+{
+  "found": 1,
+  "docs": [
+    {
+      "id": "1",
+      "author_s": "Sanderson",
+      "year_i": 2010
+    }
+  ]
+}
+```
+
+Alternatively, pipe the curl response through `| jq`.
+
 `match` analyzes your text the same way the field was indexed, so `kings`
 finds *"The Way of Kings"*. `fields` chooses what comes back. A
 document that doesn't have a requested field simply omits that key - a doc

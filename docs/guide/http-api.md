@@ -46,6 +46,17 @@ Each normal line is one complete response batch. A small default-limit search
 usually has one line and therefore also parses as an ordinary JSON object. Use
 `?format=docs` for document-per-line export without response envelopes.
 
+Every JSON body ends with a newline. `?pretty` (bare, or `?pretty=true` /
+`?pretty=false`) is a URL-only, best-effort formatting hint that applies to
+every JSON body of the request, errors and ingest acknowledgements included.
+Schema, collection list, and stats responses default to pretty; every other
+route defaults to compact. Indentation is two spaces but is not part of the
+contract. A pretty stream is sent as `application/json`, still chunked, with
+one pretty JSON text per batch separated by blank lines: it is for eyes, not
+for parsers expecting a single document, though `jq` reads the sequence
+directly. Pretty is ignored for `format=docs`, whether selected by URL or
+body, which stays NDJSON.
+
 The server applies backpressure to streaming producers. It does not buffer an
 unbounded request or response into one in-memory JSON value.
 
@@ -62,9 +73,9 @@ Unknown JSON keys, unknown oneof arms, invalid enum names, excessive nesting,
 and wrong value shapes are request errors. A body typo is not ignored. URL
 query parameters are intentionally an open middleware channel: unknown
 parameters are currently accepted and ignored, while recognized parameters
-validate their lexical values. Add `?explain=request` to a query to return the
-canonical effective request, including URL overlays, without executing it;
-posting the result back has the same semantics.
+validate their lexical values (including `pretty`). Add `?explain=request` to
+a query to return the canonical effective request, including URL overlays,
+without executing it; posting the result back has the same semantics.
 
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":"books"` even when the original body omitted it.

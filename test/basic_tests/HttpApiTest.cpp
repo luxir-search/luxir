@@ -81,6 +81,32 @@ protected:
     return lines;
   }
 
+  static void expectJsonObject(const std::string& body, bool pretty) {
+    ASSERT_FALSE(body.empty());
+    EXPECT_TRUE(body.ends_with("\n"));
+    EXPECT_FALSE(body.ends_with("\n\n"));
+    EXPECT_EQ(pretty, body.find('\n') < body.size() - 1);
+    EXPECT_EQ('{', body.front());
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read<glz::opts_validate{}>(root, body)) << body;
+    EXPECT_TRUE(root.is_object());
+  }
+
+  static std::vector<std::string> prettyRecords(const std::string& body) {
+    std::vector<std::string> records;
+    std::size_t start = 0;
+    while (start < body.size()) {
+      auto separator = body.find("\n\n", start);
+      if (separator == std::string::npos) {
+        records.push_back(body.substr(start));
+        break;
+      }
+      records.push_back(body.substr(start, separator + 1 - start));
+      start = separator + 2;
+    }
+    return records;
+  }
+
   static std::vector<std::string> idsInUpdateLine(const std::string& line) {
     std::vector<std::string> out;
     glz::generic_i64 root;
@@ -170,6 +196,187 @@ TEST_F(HttpApiTest, health) {
   auto res = httpRequest(port(), http::verb::get, "/health");
   EXPECT_EQ(200, res.result_int());
   EXPECT_NE(res.body().find(R"("status")"), std::string::npos);
+}
+
+TEST_F(HttpApiTest, prettySearch) {
+  helper.index(flatdoc("id", "pretty"), UpdateMessage::COMMIT);
+  for (const char* query : {"?pretty", "?pretty=true", "?pretty=false&pretty"}) {
+    auto res = httpRequest(port(), http::verb::post,
+        std::string("/collections/main/_search") + query,
+        R"({"query":{"all":true},"fields":["id"]})");
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_EQ("application/json", res[http::field::content_type]);
+    EXPECT_TRUE(res.chunked());
+    expectJsonObject(res.body(), true);
+    EXPECT_TRUE(res.body().starts_with("{\n  \"docs\": ")) << res.body();
+  }
+}
+
+TEST_F(HttpApiTest, prettySearchMultipleBatches) {
+  helper.indexAll(std::array{flatdoc("id", "p1"), flatdoc("id", "p2"), flatdoc("id", "p3")},
+                  UpdateMessage::COMMIT);
+  for (int parallel : {0, -1}) {
+    auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?pretty",
+        R"({"max_parallel":)" + std::to_string(parallel) + R"(,"ops":{
+          "a":{"top_docs":{"query":{"all":true},"limit":-1,"batch_size":1,"fields":["id"]}},
+          "b":{"top_docs":{"query":{"all":true},"limit":-1,"batch_size":1,"fields":["id"]}}
+        }})");
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_EQ("application/json", res[http::field::content_type]);
+    EXPECT_TRUE(res.body().ends_with("\n"));
+    EXPECT_FALSE(res.body().ends_with("\n\n"));
+    auto records = prettyRecords(res.body());
+    ASSERT_GT(records.size(), 1u);
+    std::size_t docs = 0;
+    for (const auto& record : records) {
+      expectJsonObject(record, true);
+      glz::generic_i64 root;
+      ASSERT_FALSE(glz::read_json(root, record));
+      if (root.contains("docs")) docs += root["docs"].get_array().size();
+      if (root.contains("ops")) {
+        for (const auto& [name, op] : root["ops"].get_object()) {
+          if (op.contains("docs")) docs += op["docs"].get_array().size();
+        }
+      }
+    }
+    EXPECT_EQ(6u, docs);
+  }
+}
+
+TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {
+  helper.index(flatdoc("id", "p1"), UpdateMessage::COMMIT);
+  for (bool bodyFormat : {false, true}) {
+    std::string target = "/collections/main/_search?fields=id";
+    if (!bodyFormat) target += "&format=docs";
+    std::string body = bodyFormat ? R"({"query":{"all":true},"response_format":"docs"})"
+                                  : R"({"query":{"all":true}})";
+    auto compact = httpRequest(port(), http::verb::post, target, body);
+    ASSERT_EQ(200, compact.result_int()) << compact.body();
+    for (const char* pretty : {"&pretty", "&pretty=false"}) {
+      auto res = httpRequest(port(), http::verb::post, target + pretty, body);
+      ASSERT_EQ(200, res.result_int()) << res.body();
+      EXPECT_EQ("application/x-ndjson", res[http::field::content_type]);
+      EXPECT_EQ(compact.body(), res.body());
+      EXPECT_EQ("{\"id\":\"p1\"}\n", res.body());
+    }
+    auto explain = httpRequest(port(), http::verb::post, target + "&pretty&explain=request", body);
+    EXPECT_EQ(400, explain.result_int());
+    EXPECT_NE(std::string::npos, explain.body().find("format=docs cannot be combined with explain"));
+  }
+}
+
+TEST_F(HttpApiTest, prettyValidatesUrlValue) {
+  for (const char* contentType : {"application/json", "application/x-ndjson"}) {
+    for (const char* value : {"yes", "1", "0", "TRUE", "%20true"}) {
+      auto res = httpRequest(port(), http::verb::post,
+          std::string("/collections/main/_update?pretty=") + value, "{}", contentType);
+      EXPECT_EQ(400, res.result_int()) << res.body();
+      std::string decoded = std::string_view(value) == "%20true" ? " true" : value;
+      EXPECT_NE(std::string::npos, res.body().find(
+          "invalid URL parameter 'pretty': expected true or false, got '" + decoded + "'"));
+      expectJsonObject(res.body(), false);
+    }
+  }
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"all":true},"pretty":true})");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+}
+
+TEST_F(HttpApiTest, prettyExplainAndErrors) {
+  for (bool pretty : {false, true}) {
+    std::string target = "/collections/main/_search?explain=request";
+    if (pretty) target += "&pretty";
+    auto explain = httpRequest(port(), http::verb::post, target, R"({"query":{"all":true}})");
+    ASSERT_EQ(200, explain.result_int()) << explain.body();
+    expectJsonObject(explain.body(), pretty);
+    auto error = httpRequest(port(), http::verb::post, target, "{bad json");
+    ASSERT_EQ(400, error.result_int()) << error.body();
+    expectJsonObject(error.body(), pretty);
+    auto wrongMethod = httpRequest(port(), http::verb::put, target);
+    ASSERT_EQ(405, wrongMethod.result_int());
+    EXPECT_EQ("GET, POST", wrongMethod[http::field::allow]);
+    expectJsonObject(wrongMethod.body(), pretty);
+  }
+}
+
+TEST_F(HttpApiTest, prettyInBandSearchError) {
+  helper.index(flatdoc("id", "p1"), UpdateMessage::COMMIT);
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?pretty",
+      R"({"query":{"all":true},"fields":["nosuchfield"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_EQ("application/json", res[http::field::content_type]);
+  expectJsonObject(res.body(), true);
+  EXPECT_NE(std::string::npos, res.body().find("\"error\":"));
+}
+
+TEST_F(HttpApiTest, prettyNdjsonIngest) {
+  // Each explicit group end emits an ack; EOF then closes without another record.
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update?pretty",
+      "{\"id\":\"p1\"}\n{\"_end_\":{}}\n{\"id\":\"p2\"}\n{\"_end_\":{}}\n",
+      "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_EQ("application/json", res[http::field::content_type]);
+  EXPECT_TRUE(res.chunked());
+  auto records = prettyRecords(res.body());
+  ASSERT_EQ(2u, records.size()) << res.body();
+  for (const auto& record : records) expectJsonObject(record, true);
+}
+
+TEST_F(HttpApiTest, invalidNdjsonCommitClosesKeepAlive) {
+  net::io_context ioc;
+  beast::tcp_stream stream(ioc);
+  stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), (unsigned short)port()));
+  http::request<http::string_body> req{http::verb::post,
+                                      "/collections/main/_update?commit=no", 11};
+  req.set(http::field::content_type, "application/x-ndjson");
+  req.keep_alive(true);
+  req.body() = "{\"id\":\"unread\"}\n";
+  req.prepare_payload();
+  http::write(stream, req);
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> res;
+  http::read(stream, buffer, res);
+  ASSERT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("unknown commit mode 'no'"));
+  EXPECT_FALSE(res.keep_alive());
+  http::response<http::string_body> next;
+  beast::error_code ec;
+  http::read(stream, buffer, next, ec);
+  EXPECT_EQ(http::error::end_of_stream, ec);
+}
+
+TEST_F(HttpApiTest, prettyNdjsonFailureAfterAck) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update?pretty",
+      "{\"id\":\"p1\"}\n{\"_end_\":{}}\n{bad json\n", "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_EQ("application/json", res[http::field::content_type]);
+  auto records = prettyRecords(res.body());
+  ASSERT_EQ(2u, records.size()) << res.body();
+  for (const auto& record : records) expectJsonObject(record, true);
+  EXPECT_NE(std::string::npos, records.back().find("\"error\":"));
+}
+
+TEST_F(HttpApiTest, prettyResetsOnKeepAlive) {
+  helper.index(flatdoc("id", "p1"), UpdateMessage::COMMIT);
+  net::io_context ioc;
+  beast::tcp_stream stream(ioc);
+  stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), (unsigned short)port()));
+  beast::flat_buffer buffer;
+  for (const char* target : {"/collections/main/_search?fields=id&pretty",
+                             "/collections/main/_search?fields=id&pretty",
+                             "/health", "/collections/main/_search?fields=id"}) {
+    http::request<http::string_body> req{http::verb::get, target, 11};
+    req.keep_alive(true);
+    http::write(stream, req);
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    bool pretty = std::string_view(target).ends_with("&pretty");
+    expectJsonObject(res.body(), pretty);
+    EXPECT_EQ(pretty || std::string_view(target) == "/health"
+                  ? "application/json" : "application/x-ndjson", res[http::field::content_type]);
+  }
 }
 
 // Four connections accepted in sequence must land on four different shards,
@@ -3198,8 +3405,10 @@ TEST_F(HttpApiTest, wrongMethodIs405OnEveryKnownRoute) {
     auto res = httpRequest(port(), c.method, c.target);
     EXPECT_EQ(405, res.result_int()) << c.target << " " << res.body();
     EXPECT_EQ(c.allow, res[http::field::allow]) << c.target;
-    EXPECT_NE(res.body().find(R"("error":{"kind":"invalid_request","code":"method_not_allowed")"),
-              std::string::npos) << res.body();
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body())) << res.body();
+    EXPECT_EQ("invalid_request", root["error"]["kind"].get_string());
+    EXPECT_EQ("method_not_allowed", root["error"]["code"].get_string());
   }
   auto unknown = httpRequest(port(), http::verb::get, "/nope");
   EXPECT_EQ(404, unknown.result_int()) << unknown.body();
@@ -3212,8 +3421,10 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   for (const char* target : {"/collections/Bad-Name/_schema", "/collections/Bad-Name/_stats"}) {
     auto res = httpRequest(port(), http::verb::get, target);
     EXPECT_EQ(400, res.result_int()) << target << " " << res.body();
-    EXPECT_NE(res.body().find(R"("error":{"kind":"invalid_request","code":"invalid_collection_name")"),
-              std::string::npos) << res.body();
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body())) << res.body();
+    EXPECT_EQ("invalid_request", root["error"]["kind"].get_string());
+    EXPECT_EQ("invalid_collection_name", root["error"]["code"].get_string());
   }
   auto update = httpRequest(port(), http::verb::post, "/collections/Bad-Name/_update",
                             R"({"docs":[{"id":"x"}]})");
@@ -3230,8 +3441,10 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   // A well-formed name nothing answers to is not found.
   auto missing = httpRequest(port(), http::verb::get, "/collections/http_no_such_coll/_schema");
   EXPECT_EQ(404, missing.result_int()) << missing.body();
-  EXPECT_NE(missing.body().find(R"("error":{"kind":"not_found","code":"collection_not_found")"),
-            std::string::npos) << missing.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, missing.body())) << missing.body();
+  EXPECT_EQ("not_found", root["error"]["kind"].get_string());
+  EXPECT_EQ("collection_not_found", root["error"]["code"].get_string());
 }
 
 TEST_F(HttpApiTest, searchFailureAfterSubmissionIsAnErrorLine) {

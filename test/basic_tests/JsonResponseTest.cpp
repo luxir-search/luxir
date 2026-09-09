@@ -105,8 +105,8 @@ TEST_F(JsonResponseTest, stringEscapingSimdPathMatchesScalar) {
     expected += refEscape(vals[i]);
     expected += '}';
   }
-  expected += "]}\n";
-  EXPECT_EQ(expected, renderSearchResponseLine(resp));
+  expected += "]}";
+  EXPECT_EQ(expected, renderSearchResponseBody(resp));
 }
 
 TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
@@ -127,8 +127,8 @@ TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, executionProfileShape) {
@@ -151,8 +151,8 @@ TEST_F(JsonResponseTest, executionProfileShape) {
   resp.profile.emplace().ops = {&op, 1};
 
   EXPECT_EQ(
-      R"({"profile":{"ops":[{"name":"cats","pieces":[{"kind":"segment","segment":2,"max_doc":11,"strategy":"hash","cardinality":64,"domain_size":1,"thread_id":123,"elapsed_us":7,"details":["all-docs domain, bulk column scan","want=hash, found=skinny"]}]}]}})" "\n",
-      renderSearchResponseLine(resp));
+      R"({"profile":{"ops":[{"name":"cats","pieces":[{"kind":"segment","segment":2,"max_doc":11,"strategy":"hash","cardinality":64,"domain_size":1,"thread_id":123,"elapsed_us":7,"details":["all-docs domain, bulk column scan","want=hash, found=skinny"]}]}]}})",
+      renderSearchResponseBody(resp));
 }
 
 TEST_F(JsonResponseTest, integerFacetPreservesZeroBucketId) {
@@ -170,8 +170,8 @@ TEST_F(JsonResponseTest, integerFacetPreservesZeroBucketId) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"prices":{"buckets":[{"val":0,"count":2},{"val":7,"count":1}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"ops":{"prices":{"buckets":[{"val":0,"count":2},{"val":7,"count":1}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
@@ -190,8 +190,8 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"prices":{"buckets":[{"val":[0,10],"count":1},{"val":[10,20],"count":2},{"val":[20,30],"count":1}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"ops":{"prices":{"buckets":[{"val":[0,10],"count":1},{"val":[10,20],"count":2},{"val":[20,30],"count":1}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, facetMetricsRenderPerBucketAndEmptyAsNull) {
@@ -214,8 +214,8 @@ TEST_F(JsonResponseTest, facetMetricsRenderPerBucketAndEmptyAsNull) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"cats":{"buckets":[{"val":"a","count":2,"total":40,"minimum":10},{"val":"b","count":2,"total":null,"minimum":null},{"val":"c","count":1,"total":5,"minimum":5}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"ops":{"cats":{"buckets":[{"val":"a","count":2,"total":40,"minimum":10},{"val":"b","count":2,"total":null,"minimum":null},{"val":"c","count":1,"total":5,"minimum":5}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, nestedFacetRowsRecurse) {
@@ -235,8 +235,8 @@ TEST_F(JsonResponseTest, nestedFacetRowsRecurse) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"ops":{"outer":{"buckets":[{"val":"x","count":2,"inner":{"buckets":[{"val":"p","count":1},{"val":"q","count":1}]}},{"val":"y","count":1,"inner":{"buckets":[{"val":"p","count":1}]}}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"ops":{"outer":{"buckets":[{"val":"x","count":2,"inner":{"buckets":[{"val":"p","count":1},{"val":"q","count":1}]}},{"val":"y","count":1,"inner":{"buckets":[{"val":"p","count":1}]}}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
@@ -255,8 +255,8 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
   req->execute(false);
   ASSERT_OK(req);
 
-  EXPECT_EQ(R"({"ops":{"average":20,"empty":null,"empty_sum":null,"total":40}})" "\n",
-            renderSearchResponseLine(req->responses[0]->proto));
+  EXPECT_EQ(R"({"ops":{"average":20,"empty":null,"empty_sum":null,"total":40}})",
+            renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
@@ -275,8 +275,8 @@ TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
 
   // Row maps signal missing structurally: doc 2 has no cat_s/n_i keys.
   EXPECT_EQ(
-      R"({"docs":[{"id":"1","cat_s":"x","n_i":5},{"id":"2"}]})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"docs":[{"id":"1","cat_s":"x","n_i":5},{"id":"2"}]})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, firstDocListIsPromotedAndFacetRemains) {
@@ -295,8 +295,8 @@ TEST_F(JsonResponseTest, firstDocListIsPromotedAndFacetRemains) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":3,"docs":[{"id":"1"},{"id":"2"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"found":3,"docs":[{"id":"1"},{"id":"2"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, promotedDocListNestedOpsHoistIntoOps) {
@@ -316,8 +316,8 @@ TEST_F(JsonResponseTest, promotedDocListNestedOpsHoistIntoOps) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
@@ -337,8 +337,8 @@ TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":2,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":1},{"val":"y","count":1}]}}}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"found":2,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":1},{"val":"y","count":1}]}}}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, secondDocListRendersUnderOps) {
@@ -357,8 +357,8 @@ TEST_F(JsonResponseTest, secondDocListRendersUnderOps) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":3,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"},{"id":"2"}]}}})" "\n",
-      renderSearchResponseLine(req->responses[0]->proto));
+      R"({"found":3,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto));
 }
 
 } // namespace luxir::test
