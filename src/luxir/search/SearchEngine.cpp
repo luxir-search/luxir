@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <limits>
+#include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
 #include "ProtobufSearchParser.h"
@@ -13,6 +14,45 @@ const SearchConfig& SearchEngine::searchConfig() const {
   return node.getConfig().search;
 }
 
+RootOp* SearchEngine::prepare(SearchRequest& req) {
+  if (!req.timeZone) throw RequestError(req.timeZoneError);
+  if (req.maxParallel > 1 || req.maxParallel < -1) {
+    throw RequestError(
+      "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
+      "on the shared executor), or -1 (unlimited parallelism); values "
+      "above 1 are reserved for a parallelism budget and not implemented");
+  }
+  getResources(req);
+  req.lastResponse = SearchResponse::create(req, true);
+
+  ProtobufSearchParser parser(req);
+  return parser.parse();
+}
+
+std::vector<std::string> SearchEngine::explain(const ReqProto& proto) {
+  class ExplainRequest final : public SearchRequest {
+  public:
+    using SearchRequest::SearchRequest;
+    ReplyStatus reply(SearchResponse&) override { return ReplyStatus::OK; }
+  };
+  // String parsers splice their expansions into the request. Give preparation
+  // a disposable deep copy so its pool can die without changing caller views.
+  std::pmr::monotonic_buffer_resource source;
+  std::vector<std::byte> encoded;
+  ReqProto copy;
+  if (!api::encode(proto, encoded)
+      || !api::decode(copy, api::copyToPaddedInput(encoded, source), source)) {
+    throw ApiError(ErrorKind::INTERNAL, "internal", "failed to copy explain request");
+  }
+  std::vector<std::string> notes;
+  google::protobuf::Arena arena;
+  auto* req = arenaCreate<ExplainRequest>(arena, *this, copy, arena);
+  req->maxParallel = proto.max_parallel;
+  req->resolvedFields = &notes;
+  prepare(*req);
+  return notes;
+}
+
 void SearchEngine::submitBody(SearchRequest& req) {
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
@@ -20,19 +60,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   try {
-    if (!req.timeZone) throw RequestError(req.timeZoneError);
-    if (req.maxParallel > 1 || req.maxParallel < -1) {
-      throw RequestError(
-          "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
-          "on the shared executor), or -1 (unlimited parallelism); values "
-          "above 1 are reserved for a parallelism budget and not implemented");
-    }
-    getResources(req);
-    // LOG_DEBUG("submitBody: IndexReader commitTime={}", req.reader->commitTime());
-    req.lastResponse = SearchResponse::create(req, true);
-
-    ProtobufSearchParser parser(req);
-    auto* root = parser.parse();
+    auto* root = prepare(req);
     root->init();
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can

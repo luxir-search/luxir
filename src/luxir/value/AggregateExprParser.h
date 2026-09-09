@@ -31,6 +31,7 @@ struct AggregateExprOptions {
   api::map_view<std::string_view, ::hpp_proto::indirect_view<api::Val>> vars;
   std::string_view opName;
   int* nestingBudget = nullptr;
+  FieldResolver* fieldResolver = nullptr;
 };
 
 class AggregateExprParser {
@@ -217,7 +218,7 @@ private:
         [&](uint8_t argument) {
           if (argument == 0) {
             argumentStart = cur->position();
-            ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false};
+            ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
             try {
               input = ValueExprParser(valueOptions, arena).parsePartial(*cur);
             } catch (const std::runtime_error& error) {

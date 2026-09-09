@@ -18,7 +18,7 @@
 #include "luxir/api/build.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/Cursor.h"
-#include "luxir/schema/Schema.h"
+#include "luxir/query/FieldResolver.h"
 #include "luxir/util/Clock.h"
 
 namespace luxir {
@@ -54,7 +54,7 @@ namespace luxir {
 // ProtobufQueryParser -> QueryBuilder path as every other node.
 struct SimpleQueryOptions {
   // The fields unfielded (bare) clauses expand over; must be non-empty and
-  // every name must resolve to a queryable field (the caller validates).
+  // every name must resolve to a queryable field (validated at construction).
   // The views must outlive the emitted tree (request-backed or static).
   std::span<const std::string_view> fields;
   // Arm selection by FieldType; also answers which names field: syntax may
@@ -76,6 +76,7 @@ struct SimpleQueryOptions {
   // Used only while validating DATE field:value arms. Lowering receives this
   // same whole context through ParseContext/QueryBuilder.
   CoerceContext coerceContext;
+  FieldResolver* fieldResolver = nullptr;
 
   explicit SimpleQueryOptions(const CoerceContext& coerceContext)
     : coerceContext(coerceContext) {}
@@ -97,6 +98,7 @@ class SimpleQueryParser {
   enum class Occur : uint8_t { NONE, MUST, SHOULD, MUST_NOT };
 
   const SimpleQueryOptions& opts;
+  std::optional<FieldResolver> localFields;
   std::pmr::memory_resource& mr;
   Occur defaultOccur;
 
@@ -110,6 +112,7 @@ class SimpleQueryParser {
   struct ExpField {
     std::string_view name;
     FieldType* type;
+    std::string_view physical;
   };
   std::pmr::vector<ExpField> expFields;
 
@@ -169,11 +172,24 @@ public:
     assert(!opts.fields.empty());
     assert(opts.schema != nullptr);
     defaultOccur = opts.operator_ == api::Match_::Operator::AND ? Occur::MUST : Occur::SHOULD;
+    if (!opts.fieldResolver) localFields.emplace(*opts.schema);
     expFields.reserve(opts.fields.size());
     for (std::string_view f : opts.fields) {
-      FieldType* fieldType = opts.schema->getFieldTypePtr(f);
-      assert(fieldType != nullptr && termQueryable(*fieldType));  // caller validated
-      expFields.push_back({f, fieldType});
+      const ResolvedFieldHandle* target;
+      try {
+        target = &resolver().resolve(f, OpClass::SEARCH);
+      } catch (const RequestError& e) {
+        throw std::runtime_error(fmt::format(
+            "simple_query 'fields' entry '{}' is not a queryable text/string/id field: {}", f, e.what()));
+      }
+      if (!termQueryable(*target->fieldType)) {
+        throw std::runtime_error(fmt::format(
+            "simple_query 'fields' entry '{}' is not a queryable text/string/id field", f));
+      }
+      if (std::ranges::any_of(expFields, [&](const auto& previous) {
+            return previous.physical == target->physicalName;
+          })) continue;
+      expFields.push_back({f, target->fieldType, target->physicalName});
     }
   }
 
@@ -454,44 +470,52 @@ private:
   // The queryable FieldType for a field: token's head, or null (degrade).
   // Term-backed fields support every arm; numeric column fields are resolved
   // here too but the caller restricts them to the exact-match arm.
-  FieldType* fieldFor(std::string_view name) {
-    FieldType* fieldType = opts.schema->getFieldTypePtr(name);
-    if (fieldType == nullptr) return nullptr;
-    return termQueryable(*fieldType) || numericQueryable(*fieldType) ? fieldType : nullptr;
+  FieldResolver& resolver() {
+    return opts.fieldResolver ? *opts.fieldResolver : *localFields;
   }
 
-  bool isAllowed(std::string_view name) {
-    return opts.allowed_fields.empty()
-        || std::find(opts.allowed_fields.begin(), opts.allowed_fields.end(), name)
-               != opts.allowed_fields.end();
+  const ResolvedFieldHandle* fieldFor(std::string_view name, OpClass op) {
+    try {
+      return &resolver().resolve(name, op);
+    } catch (const RequestError&) {
+      return nullptr;
+    }
   }
 
-  // Resolve a fielded-term head: non-null when field: syntax applies.  A
-  // queryable name excluded by allowed_fields degrades WITH a declaration;
-  // schema-unknown names are normal text, silently (Gmail's "re: hello").
+  bool isAllowed(const ResolvedFieldHandle& target) {
+    if (opts.allowed_fields.empty()) return true;
+    for (auto name : opts.allowed_fields) {
+      // The list describes SEARCH targets; existence does not widen the grant.
+      auto* allowed = fieldFor(name, OpClass::SEARCH);
+      if (allowed && allowed->physicalName == target.physicalName) return true;
+    }
+    return false;
+  }
+
   FieldType* fieldedHead(std::string_view head) {
-    FieldType* fieldType = fieldFor(head);
-    if (fieldType == nullptr) return nullptr;
-    if (isAllowed(head)) return fieldType;
+    auto* target = fieldFor(head, OpClass::SEARCH);
+    if (!target || (!termQueryable(*target->fieldType)
+                    && !numericQueryable(*target->fieldType))) return nullptr;
+    if (isAllowed(*target)) return target->fieldType;
     warn("field_narrowed",
          fmt::format("field '{}' is outside this request's allowed_fields; treated as text", head));
     return nullptr;
   }
 
   FieldType* fieldedExistsHead(std::string_view head) {
-    FieldType* fieldType = opts.schema->getFieldTypePtr(head);
-    if (fieldType == nullptr) {
+    auto* target = fieldFor(head, OpClass::EXISTS);
+    if (!target) {
       warn("exists_field_unknown",
            fmt::format("field '{}' is unknown; field:* was treated as text", head));
       return nullptr;
     }
-    if (!existsQueryable(*fieldType)) {
+    if (!existsQueryable(*target->fieldType)) {
       warn("exists_field_unqueryable",
            fmt::format("field '{}' is neither indexed nor column-stored; field:* was treated as text",
                        head));
       return nullptr;
     }
-    if (isAllowed(head)) return fieldType;
+    if (isAllowed(*target)) return target->fieldType;
     warn("field_narrowed",
          fmt::format("field '{}' is outside this request's allowed_fields; treated as text", head));
     return nullptr;

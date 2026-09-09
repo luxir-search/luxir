@@ -112,6 +112,8 @@ public:
   // copied onto the FINAL response's SearchResponse.warnings.  Message views
   // point into requestPool, which outlives response serialization.
   std::vector<api::Warning> warnings;
+  // Optional sink for explain; filled by actual parse/lowering, never execution.
+  std::vector<std::string>* resolvedFields = nullptr;
 
   // Record the request's failure on its final response; the first failure
   // wins.  Takes `mutex`: a paused emitter may be assembling its final batch

@@ -14,7 +14,7 @@
 #include <fmt/format.h>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/schema/Schema.h"
+#include "luxir/query/FieldResolver.h"
 #include "luxir/util/Cursor.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
@@ -29,6 +29,8 @@ struct ValueExprOptions {
   api::map_view<std::string_view, ::hpp_proto::indirect_view<api::Val>> vars;
   int* nestingBudget = nullptr;
   bool sortIntrinsics = true;
+  FieldResolver* fieldResolver = nullptr;
+  std::string_view opName = {};
 };
 
 class ValueExprParser {
@@ -287,18 +289,23 @@ private:
   }
 
   uint32_t parseColumn(std::string_view name, size_t pos) {
-    FieldType* field = opts.schema->getFieldTypePtr(name);
-    if (field == nullptr) fail(pos, fmt::format("unknown field '{}'", name));
+    ResolvedFieldHandle target;
+    try {
+      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
+          : opts.schema->resolveFor(name, OpClass::VALUE);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
+    }
+    FieldType* field = target.fieldType;
+    if (field->type() == FieldType::TEXT) {
+      fail(pos, fmt::format("field '{}' is TEXT and has no value column; use a string variant", name));
+    }
     bool numeric = field->type() == FieldType::INT || field->type() == FieldType::DATE ||
                    field->type() == FieldType::FLOAT || field->type() == FieldType::DOUBLE;
-    bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING ||
-                          field->type() == FieldType::TEXT;
+    bool stringSortable = field->type() == FieldType::ID || field->type() == FieldType::STRING;
     if (!numeric && !stringSortable) fail(pos, fmt::format("field '{}' is not sortable", name));
-    if (numeric && !field->hasColumn()) {
+    if (!field->hasColumn()) {
       fail(pos, fmt::format("field '{}' has no column values", name));
-    }
-    if (stringSortable && !field->hasColumn() && !field->indexed()) {
-      fail(pos, fmt::format("field '{}' has no sortable values", name));
     }
 
     ValueNode node;
@@ -316,7 +323,7 @@ private:
           ? ValueNature::DATE : ValueNature::NUMBER;
     }
     node.sourcePos = pos;
-    node.text = program->copyString(name);
+    node.text = program->copyString(target.physicalName);
     return append(node);
   }
 

@@ -55,6 +55,7 @@ struct FacetParsePlan {
 
 struct SearchParserImpl {
   SearchRequest& req;
+  FieldResolver fields;
   TopDocsReq* firstQuery = nullptr;
   size_t nonDefaultDomainVariants = 0;
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
@@ -285,7 +286,7 @@ public:
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
   explicit SearchParserImpl(SearchRequest& req)
-    : req(req), maxOpDepth(req.searchConfig.max_op_depth) {
+    : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
   RootOp* parse() {
@@ -295,7 +296,7 @@ public:
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
-      "root", &req.warnings};
+      "root", &req.warnings, &fields};
     ProtobufQueryParser parser(parseContext);
     ParsedDomains domains = parseChildDomains(req.proto.ops, parser);
     if (!domains.empty()) {
@@ -418,7 +419,7 @@ public:
           ParseContext parseContext{
             req.requestPool, *req.schema, req.arena,
             CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
-            name, &req.warnings};
+            name, &req.warnings, &fields};
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -430,6 +431,7 @@ public:
       },
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
+        options.fieldResolver = &fields;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program);
@@ -487,7 +489,8 @@ public:
       OpsPlacement placement,
       const CanonicalValueSet* preparedSelected = nullptr) {
     validateSelectionEnvelope(facetName, facetReq, placement);
-    std::string_view facetField = facetReq.field;
+    const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
     if (facetReq.limit.has_value()) {
       limit = *facetReq.limit;
@@ -500,7 +503,7 @@ public:
 
     // Resolve everything that could throw here in the parser and pass the
     // results into the op ctors (see TopDocsReq's ctor comment).
-    auto& ftype = req.schema->getFieldTypeEx(facetField);
+    auto* ftype = target.fieldType;
 
     std::span<const int64_t> selectedInts;
     std::span<const std::string_view> selectedStrings;
@@ -515,9 +518,9 @@ public:
       CoerceContext selectionContext{
           req.dateMathNowEpochMillis, *req.timeZone};
       QueryBuilder builder(req.requestPool, *req.schema,
-                           selectionContext, facetName, &req.warnings);
+                           selectionContext, facetName, &req.warnings, &fields);
       ownedSelected = builder.canonicalizeFieldValues(
-          facetField, selectedValues, true);
+          target, selectedValues, true);
       preparedSelected = &ownedSelected;
     }
     if (preparedSelected != nullptr && !preparedSelected->empty()) {
@@ -589,7 +592,8 @@ public:
       std::string_view facetName, const luxir::api::RangeFacet& facetReq,
       OpsPlacement placement) {
     validateSelectionEnvelope(facetName, facetReq, placement);
-    std::string_view facetField = facetReq.field;
+    const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     if (!facetReq.start.has_value() || !facetReq.end.has_value()) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range start and end are required");
@@ -603,7 +607,7 @@ public:
           + "': sorts are not yet supported for range facets");
     }
 
-    auto& fieldType = req.schema->getFieldTypeEx(facetField);
+    auto* fieldType = target.fieldType;
     if (fieldType->type() != FieldType::Type::INT
         && fieldType->type() != FieldType::Type::DATE
         && fieldType->type() != FieldType::Type::FLOAT
@@ -811,6 +815,8 @@ public:
     out.rankNeedsScores = false;
     for (const auto& sortSpec : sorts) {
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
+      options.fieldResolver = &fields;
+      options.opName = "sort";
       ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
       const ValueNode& root = program->root();
       bool scoreRoot = root.kind == ValueNodeKind::SCORE;
@@ -824,7 +830,7 @@ public:
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
       if (root.kind == ValueNodeKind::COLUMN) {
-        auto fieldTypePtr = req.schema->getFieldTypeEx(root.text);
+        auto* fieldTypePtr = req.schema->physical(root.text);
         out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
       } else if (root.kind == ValueNodeKind::SCORE) {
         out.clauses.emplace_back(SortClause::SCORE, order);
@@ -1163,9 +1169,9 @@ public:
         if (selected.empty()) continue;
 
         QueryBuilder builder(req.requestPool, *req.schema,
-                             parseContext.coerceContext, key, &req.warnings);
+                             parseContext.coerceContext, key, &req.warnings, &fields);
         CanonicalValueSet canonical = builder.canonicalizeFieldValues(
-            fieldProto->field, selected, true);
+            fields.resolve(fieldProto->field, OpClass::VALUE), selected, true);
         FacetReq* facet = createFieldFacetReq(
             key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
         preparedFacets.emplace(
@@ -1329,7 +1335,7 @@ public:
     // the request.
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
+      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
@@ -1915,7 +1921,7 @@ public:
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings};
+      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");

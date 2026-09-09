@@ -47,6 +47,7 @@ namespace luxir {
 //
 // Grammar summary (docs/guide/query-language.md is the full reference):
 //   field:value  field:"a phrase"  field:'a phrase'  field:(boolean scope)
+//   field:=value  field:="whole value"  field:=(v1, "v2") (exact membership)
 //   AND / OR / NOT with real precedence (NOT > AND > OR); +req / -prohib
 //   prefixes; juxtaposed clauses are SHOULD.  AND/OR may not mix with +/- or
 //   with juxtaposition at one level (parenthesize) - not Lucene QP's coin
@@ -90,6 +91,9 @@ struct ExprOptions {
   // debits, so stacking parsers cannot reset the available depth.  nullptr =
   // parser-local default (tests).
   int* nestingBudget = nullptr;
+  FieldResolver* fieldResolver = nullptr;
+  // Source offsets survive structural expansion until exact literals are lowered.
+  std::map<const api::Val*, std::pair<std::string_view, size_t>>* exactSources = nullptr;
 };
 
 class ExprParser {
@@ -101,6 +105,7 @@ class ExprParser {
   static constexpr std::string_view ARG_STOPS = ",)]=[";
 
   const ExprOptions& opts;
+  std::optional<FieldResolver> localFields;
   std::pmr::memory_resource& mr;
   Cursor cur{std::string_view{}};
   int localBudget = DEFAULT_NESTING_BUDGET;
@@ -111,7 +116,7 @@ class ExprParser {
   // distribution: title:(a OR b) == title:a OR title:b).
   struct FieldScope {
     std::string_view field;
-    FieldType* type;
+    size_t pos;
   };
 
   enum class Conj : uint8_t { NONE, AND, OR };
@@ -139,7 +144,9 @@ class ExprParser {
 
 public:
   ExprParser(const ExprOptions& opts, std::pmr::memory_resource& arena)
-      : opts(opts), mr(arena), budget(opts.nestingBudget ? opts.nestingBudget : &localBudget) {}
+      : opts(opts), mr(arena), budget(opts.nestingBudget ? opts.nestingBudget : &localBudget) {
+    if (!opts.fieldResolver && opts.schema) localFields.emplace(*opts.schema);
+  }
 
   const api::Query* parse(std::string_view q) {
     cur = Cursor(q);
@@ -234,10 +241,14 @@ private:
     return QueryBuilder::isNumericColumnType(ft.type()) && ft.hasColumn();
   }
 
-  FieldType& resolveField(std::string_view name, size_t pos) {
-    FieldType* ft = opts.schema->getFieldTypePtr(name);
-    if (ft == nullptr) fail(pos, fmt::format("unknown field '{}'", name));
-    return *ft;
+  FieldType& resolveField(std::string_view name, size_t pos, OpClass op) {
+    try {
+      auto& fields = opts.fieldResolver ? *opts.fieldResolver : *localFields;
+      return *fields.resolve(name, op).fieldType;
+    } catch (const RequestError& e) {
+      if (e.code == "unknown_field") fail(pos, fmt::format("unknown field '{}'", name));
+      fail(pos, e.what());
+    }
   }
 
   void requireValueQueryable(std::string_view field, FieldType& ft, size_t pos) {
@@ -317,7 +328,7 @@ private:
   // ends AT the first unescaped ':' without consuming it (the fielded-clause
   // boundary); otherwise ':' is an ordinary byte (positional specials: only
   // the FIRST colon of a clause is structural).
-  Token scanToken(std::string_view stops, bool stopAtColon) {
+  Token scanToken(std::string_view stops, bool stopAtColon, bool decorations = true) {
     Token t;
     t.pos = cur.position();
     std::pmr::vector<char> buf(&mr);
@@ -341,6 +352,9 @@ private:
     }
 
     size_t n = buf.size();
+    t.text = t.escaped ? arenaStr(std::string_view(buf.data(), n))
+                       : cur.slice(t.pos, cur.position());
+    if (!decorations) return t;
     // clean trailing suffix: the last unescaped `mark` followed only by
     // unescaped bytes suffixOk accepts
     auto cleanSuffix = [&](size_t endAt, char mark, auto&& suffixOk) -> size_t {
@@ -381,8 +395,6 @@ private:
       t.starBeforeTilde = true;
     }
 
-    t.text = t.escaped ? arenaStr(std::string_view(buf.data(), n))
-                       : cur.slice(t.pos, cur.position());
     return t;
   }
 
@@ -518,8 +530,8 @@ private:
   // Prohibition there is spelled NOT ("NOT 5").  '+' stays an operator: a
   // leading plus is not part of any numeric literal the coercion accepts,
   // and "+5 required" happens to mean what the writer meant anyway.
-  bool minusSignOfNumber(const FieldScope* scope) const {
-    if (cur.peek() != '-' || scope == nullptr || !numericQueryable(*scope->type)) return false;
+  bool minusSignOfNumber(const FieldScope* scope) {
+    if (cur.peek() != '-' || scope == nullptr || !numericQueryable(resolveField(scope->field, scope->pos, OpClass::SEARCH))) return false;
     char next = cur.peekAt(1);
     return digit(next) || next == '.';
   }
@@ -651,21 +663,22 @@ private:
              "unfielded phrase (expr has no default field): write field:\"...\" or use "
              "simple_query for search-box input");
       }
-      return parsePhraseForm(scope->field, *scope->type);
+      return parsePhraseForm(*scope);
     }
     if (c == '[' || c == '{') {
       if (scope == nullptr) fail(pos, "a range needs a field: field:[low TO high]");
-      return parseRangeForm(scope->field, *scope->type);
+      return parseRangeForm(*scope);
     }
     if (c == '<' || c == '>') {
       if (scope == nullptr) fail(pos, "a comparison needs a field: field:>=value");
-      return parseComparisonForm(scope->field, *scope->type, stops);
+      return parseComparisonForm(*scope, stops);
     }
+    if (c == '=' && scope != nullptr) return parseExactForm(*scope, stops);
     if (c == '$') {
       if (scope == nullptr) {
         fail(pos, "a $variable is a value, not a clause; use field:$name or a function argument");
       }
-      requireValueQueryable(scope->field, *scope->type, pos);
+      requireValueQueryable(scope->field, resolveField(scope->field, scope->pos, OpClass::SEARCH), pos);
       const api::Val* val = parseVarRef();
       return finishDecorations(makeMatch(scope->field, val), "a $variable");
     }
@@ -684,8 +697,7 @@ private:
     if (cur.peek() == ':' && !cur.atEnd()) {
       if (head.empty()) fail(pos, "expected a field name before ':'");
       cur.advance();  // past ':'
-      FieldType& ft = resolveField(head.text, head.pos);
-      return parseValueForm(head.text, ft, stops);
+      return parseValueForm({head.text, head.pos}, stops);
     }
 
     if (head.empty()) fail(pos, fmt::format("unexpected '{}'", cur.peek()));
@@ -703,7 +715,7 @@ private:
     }
 
     if (scope != nullptr) {
-      return emitTerm(scope->field, *scope->type, head);
+      return emitTerm(*scope, head);
     }
     fail(head.pos,
          fmt::format("unfielded term '{}' (expr has no default field): write field:{}, "
@@ -713,35 +725,93 @@ private:
 
   // ---- fielded value forms ----
 
-  const api::Query* parseValueForm(std::string_view field, FieldType& ft, std::string_view stops) {
+  const api::Query* parseValueForm(const FieldScope& scope, std::string_view stops) {
+    auto field = scope.field;
     char c = cur.peek();
     size_t pos = cur.position();
     if (c == '(') {
       cur.advance();
-      FieldScope scope{field, &ft};
       const api::Query* node = parseLevel(&scope, ")");
       if (!cur.consume(')')) fail(pos, "unmatched '(' in field group");
       if (node == nullptr) fail(pos, "empty field group");
       return finishDecorations(node, "a group");
     }
-    if (c == '"' || c == '\'') return parsePhraseForm(field, ft);
-    if (c == '[' || c == '{') return parseRangeForm(field, ft);
-    if (c == '<' || c == '>') return parseComparisonForm(field, ft, stops);
+    if (c == '=') return parseExactForm(scope, stops);
+    if (c == '"' || c == '\'') return parsePhraseForm(scope);
+    if (c == '[' || c == '{') return parseRangeForm(scope);
+    if (c == '<' || c == '>') return parseComparisonForm(scope, stops);
     if (c == '$') {
-      requireValueQueryable(field, ft, pos);
+      requireValueQueryable(field, resolveField(field, scope.pos, OpClass::SEARCH), pos);
       const api::Val* val = parseVarRef();
       return finishDecorations(makeMatch(field, val), "a $variable");
     }
 
     Token value = scanToken(stops, /*stopAtColon=*/false);
     if (value.empty()) fail(pos, fmt::format("expected a value after '{}:'", field));
-    return emitTerm(field, ft, value);
+    return emitTerm(scope, value);
+  }
+
+  const api::Val* parseExactValues(std::string_view stops) {
+    cur.skipWs();
+    size_t pos = cur.position();
+    if (cur.peek() == '$') {
+      auto* value = allocVal({});
+      *value = *parseVarRef();
+      if (opts.exactSources) (*opts.exactSources)[value] = {cur.slice(0, cur.size()), pos};
+      return value;
+    }
+    bool list = cur.consume('(');
+    api::build::SpanBuilder<api::Val> values(mr);
+    do {
+      cur.skipWs();
+      if (cur.atEnd() || cur.peek() == ')' || cur.peek() == ',') {
+        fail(cur.position(), "exact membership needs a value: field:=value or field:=(v1, v2)");
+      }
+      api::Val value;
+      if (cur.peek() == '"' || cur.peek() == '\'') {
+        value.kind = scanQuoted();
+      } else if (cur.peek() == '$') {
+        value = *parseVarRef();
+      } else {
+        auto token = scanToken(list ? ",)" : stops, false, false);
+        if (token.empty()) fail(cur.position(), "expected an exact value");
+        value.kind = token.text;
+      }
+      values.push_back(value);
+      if (!list) break;
+      cur.skipWs();
+      if (cur.consume(')')) break;
+      if (!cur.consume(',')) {
+        fail(cur.position(), "expected ',' or ')' in exact membership list: field:=(v1, v2)");
+      }
+    } while (true);
+    auto* value = allocVal({});
+    api::ArrVal array;
+    array.v = values.finish();
+    value->kind = array;
+    if (opts.exactSources) (*opts.exactSources)[value] = {cur.slice(0, cur.size()), pos};
+    return value;
+  }
+
+  const api::Query* parseExactForm(const FieldScope& scope, std::string_view stops) {
+    auto field = scope.field;
+    size_t pos = cur.position();
+    requireValueQueryable(field, resolveField(field, scope.pos, OpClass::VALUE), pos);
+    cur.advance(); // '='
+    api::AnyOfQuery any;
+    any.field = field;
+    any.values = parseExactValues(stops);
+    auto* query = allocQuery();
+    query->kind = any;
+    return finishDecorations(query, "exact membership");
   }
 
   // A quoted value: the natural arm per field type.  TEXT gets a positional
   // phrase; unanalyzed STRING/ID matches the whole text as one exact term;
   // numeric columns match the exact value (the quotes only delimit).
-  const api::Query* parsePhraseForm(std::string_view field, FieldType& ft) {
+  const api::Query* parsePhraseForm(const FieldScope& scope) {
+    auto field = scope.field;
+    auto& ft = resolveField(field, scope.pos, OpClass::SEARCH);
     requireValueQueryable(field, ft, cur.position());
     std::string_view body = scanQuoted();
     int32_t slop = 0;
@@ -804,7 +874,9 @@ private:
     return allocVal(t.text);
   }
 
-  const api::Query* parseRangeForm(std::string_view field, FieldType& ft) {
+  const api::Query* parseRangeForm(const FieldScope& scope) {
+    auto field = scope.field;
+    auto& ft = resolveField(field, scope.pos, OpClass::VALUE);
     requireValueQueryable(field, ft, cur.position());
     bool loInclusive = cur.peek() == '[';
     cur.advance();
@@ -834,8 +906,10 @@ private:
     return finishDecorations(q, "a range");
   }
 
-  const api::Query* parseComparisonForm(std::string_view field, FieldType& ft,
+  const api::Query* parseComparisonForm(const FieldScope& scope,
                                         std::string_view stops) {
+    auto field = scope.field;
+    auto& ft = resolveField(field, scope.pos, OpClass::VALUE);
     requireValueQueryable(field, ft, cur.position());
     char op = cur.peek();
     cur.advance();
@@ -860,8 +934,11 @@ private:
 
   // ---- term emission (decorations + FieldType arm selection) ----
 
-  const api::Query* emitTerm(std::string_view field, FieldType& ft, const Token& t) {
+  const api::Query* emitTerm(const FieldScope& scope, const Token& t) {
+    auto field = scope.field;
     std::string_view text = t.caretAt == NPOS ? t.text : t.text.substr(0, t.caretAt);
+    auto& ft = resolveField(field, scope.pos,
+        text == "*" && t.trailingStar ? OpClass::EXISTS : OpClass::SEARCH);
 
     // fuzzy: a clean trailing ~N / ~ suffix (mid-token '~' is a literal byte)
     if (t.tildeAt != NPOS) {
@@ -1043,7 +1120,8 @@ private:
     } else if constexpr (isOptional<T>) {
       assignArg(fn, argName, argPos, member.emplace());
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Val>>) {
-      member = parseValValue(argName);
+      member = fn == "any_of" && argName == "values"
+          ? parseExactValues(ARG_STOPS) : parseValValue(argName);
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Query>>) {
       member = parseQueryValue(argName, ",)");
     } else if constexpr (std::is_same_v<T, std::span<const std::string_view>>) {
@@ -1071,8 +1149,11 @@ private:
     if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Query>>) {
       member = parseQueryValue(argName, ",)");
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Val>>) {
-      const api::Val* whole = tryWholeVarValue();
-      member = whole != nullptr ? whole : allocVal(parseRawText(fn));
+      if (fn == "any_of") member = parseExactValues(ARG_STOPS);
+      else {
+        const api::Val* whole = tryWholeVarValue();
+        member = whole != nullptr ? whole : allocVal(parseRawText(fn));
+      }
     } else if constexpr (std::is_same_v<T, std::string_view>) {
       const api::Val* whole = tryWholeVarValue();
       member = whole != nullptr ? varString(*whole, argName) : parseRawText(fn);

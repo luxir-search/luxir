@@ -28,7 +28,7 @@
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermRangeQuery.h"
 #include "luxir/query/ValueSequence.h"
-#include "luxir/schema/Schema.h"
+#include "luxir/query/FieldResolver.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -47,20 +47,20 @@ class CanonicalValueSet {
 
   using Terms = std::span<const std::string_view>;
   using Numerics = std::span<const int64_t>;
-  std::string_view field;
+  ResolvedFieldHandle target{};
   std::variant<std::monostate, Terms, Numerics> values;
   std::variant<std::monostate, Terms, Numerics> inputOrder;
 
-  explicit CanonicalValueSet(std::string_view field) : field(field) {}
-  CanonicalValueSet(std::string_view field, Terms terms)
-      : field(field), values(terms) {}
-  CanonicalValueSet(std::string_view field, Numerics numerics)
-      : field(field), values(numerics) {}
-  CanonicalValueSet(std::string_view field, Terms terms, Terms inputOrder)
-      : field(field), values(terms), inputOrder(inputOrder) {}
-  CanonicalValueSet(std::string_view field, Numerics numerics,
+  explicit CanonicalValueSet(const ResolvedFieldHandle& target) : target(target) {}
+  CanonicalValueSet(const ResolvedFieldHandle& target, Terms terms)
+      : target(target), values(terms) {}
+  CanonicalValueSet(const ResolvedFieldHandle& target, Numerics numerics)
+      : target(target), values(numerics) {}
+  CanonicalValueSet(const ResolvedFieldHandle& target, Terms terms, Terms inputOrder)
+      : target(target), values(terms), inputOrder(inputOrder) {}
+  CanonicalValueSet(const ResolvedFieldHandle& target, Numerics numerics,
                     Numerics inputOrder)
-      : field(field), values(numerics), inputOrder(inputOrder) {}
+      : target(target), values(numerics), inputOrder(inputOrder) {}
 
 public:
   CanonicalValueSet() = default;
@@ -97,9 +97,9 @@ public:
 
   CanonicalValueSet element(size_t index) const {
     if (termBacked()) {
-      return CanonicalValueSet(field, terms().subspan(index, 1));
+      return CanonicalValueSet(target, terms().subspan(index, 1));
     }
-    return CanonicalValueSet(field, numerics().subspan(index, 1));
+    return CanonicalValueSet(target, numerics().subspan(index, 1));
   }
 };
 
@@ -112,15 +112,16 @@ public:
 // returned query tree.
 class QueryBuilder {
   MemPool& pool;
-  Schema& schema;
+  FieldResolver localFields;
+  FieldResolver& fields;
   CoerceContext coerceContext;
   std::string_view opName;
   std::vector<api::Warning>* warnings;
 
   // Per-codepoint approximation of field folding for automaton literals.
   // Combining-sequence patterns may not compose exactly like whole terms.
-  class TextCodepointFolder final : public automaton::CodepointFolder {
-    std::unique_ptr<TokenChain> chain;
+  class FieldCodepointFolder final : public automaton::CodepointFolder {
+    TokenChain* chain;
 
     static void appendUtf8(std::string& out, int32_t codepoint) {
       if (codepoint < 0x80) out.push_back((char)codepoint);
@@ -140,8 +141,7 @@ class QueryBuilder {
     }
 
   public:
-    TextCodepointFolder(TextFieldType& fieldType, std::string_view field)
-        : chain(fieldType.createAnalyzer(field)) {}
+    explicit FieldCodepointFolder(TokenChain* chain) : chain(chain) {}
 
     int32_t fold(int32_t codepoint, int32_t* out, int32_t maxOut) const override {
       std::string bytes;
@@ -239,16 +239,18 @@ private:
 
   // Resolve a field to its TextFieldType, throwing if it is not a text field:
   // phrase / analyzed queries only make sense over analyzed text.
-  TextFieldType& textFieldType(std::string_view field) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+  TextFieldType& textFieldType(const ResolvedFieldHandle& target) {
+    const auto& field = target.physicalName;
+    FieldType& fieldType = *target.fieldType;
     if (fieldType.type() != FieldType::Type::TEXT) {
       throw std::runtime_error(std::format("Phrase query on non-text field: {}", field));
     }
     return (TextFieldType&)fieldType;
   }
 
-  TextFieldType& positionalTextFieldType(std::string_view field) {
-    TextFieldType& fieldType = textFieldType(field);
+  TextFieldType& positionalTextFieldType(const ResolvedFieldHandle& target) {
+    const auto& field = target.physicalName;
+    TextFieldType& fieldType = textFieldType(target);
     if (!fieldType.hasPositions()) {
       throw std::runtime_error(std::format(
           "Phrase query requires indexed positions on field: {}", field));
@@ -293,7 +295,7 @@ private:
     std::string norm(text);
     chain.normalizeTerm(norm);
     if (norm == text) return text;
-    return copyTerm(norm);
+    return poolCopy(norm);
   }
 
   // Collapse a term list into the right query type:
@@ -303,12 +305,13 @@ private:
   //   N terms -> PhraseQuery
   // terms and positions must already live in storage that outlives the query
   // tree (the pool, or the caller's source bytes for pass-through terms).
-  Query* buildPhrase(std::string_view field, std::span<std::string_view> inputTerms,
+  Query* buildPhrase(const ResolvedFieldHandle& target, std::span<std::string_view> inputTerms,
                      std::span<const int64_t> inputPositions, int32_t slop) {
+    auto field = poolCopy(target.physicalName);
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
-    positionalTextFieldType(field);
+    positionalTextFieldType(target);
     if (inputTerms.size() != inputPositions.size()) {
       throw std::runtime_error("Phrase query internal term/position size mismatch");
     }
@@ -358,8 +361,9 @@ public:
 
   QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
                std::string_view opName = {},
-               std::vector<api::Warning>* warnings = nullptr)
-    : pool(pool), schema(schema), coerceContext(coerceContext), opName(opName),
+               std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr)
+    : pool(pool), localFields(schema), fields(fields ? *fields : localFields),
+      coerceContext(coerceContext), opName(opName),
       warnings(warnings) {}
 
   Query* matchNoDocs() {
@@ -367,7 +371,12 @@ public:
   }
 
   Query* createExistsQuery(std::string_view field) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    return createExistsQuery(fields.resolve(field, OpClass::EXISTS, opName));
+  }
+
+  Query* createExistsQuery(const ResolvedFieldHandle& target) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
     if (!fieldType.indexed() && !fieldType.hasColumn()) {
       throw std::runtime_error(std::format(
           "Exists query requires an indexed or column-stored field: {}", field));
@@ -378,11 +387,18 @@ public:
   CanonicalValueSet canonicalizeFieldValues(
       std::string_view field, ValueSequence values,
       bool preserveInputOrder = false) {
+    return canonicalizeFieldValues(fields.resolve(field, OpClass::VALUE, opName), values, preserveInputOrder);
+  }
+
+  CanonicalValueSet canonicalizeFieldValues(
+      const ResolvedFieldHandle& target, ValueSequence values,
+      bool preserveInputOrder = false) {
+    auto field = poolCopy(target.physicalName);
     if (values.empty()) {
-      return CanonicalValueSet(field);
+      return CanonicalValueSet(target);
     }
 
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    FieldType& fieldType = *target.fieldType;
     if (isNumericColumnType(fieldType.type())) {
       std::vector<int64_t> encoded;
       encoded.reserve(values.size());
@@ -405,11 +421,11 @@ public:
       if (preserveInputOrder) {
         auto ordered = pool.copy_span(std::span<int64_t>(inputOrder));
         return CanonicalValueSet(
-            field, std::span<const int64_t>(stored),
+            target, std::span<const int64_t>(stored),
             std::span<const int64_t>(ordered));
       }
       return CanonicalValueSet(
-          field, std::span<const int64_t>(stored));
+          target, std::span<const int64_t>(stored));
     }
 
     bool termBacked = fieldType.type() == FieldType::Type::TEXT
@@ -421,20 +437,24 @@ public:
           field));
     }
 
-    std::unique_ptr<TokenChain> normalizer;
-    if (fieldType.type() == FieldType::Type::TEXT) {
-      normalizer = ((TextFieldType&)fieldType).createAnalyzer(field);
-    }
+    auto* normalizer = fields.chain(target);
     std::vector<std::string_view> terms;
     terms.reserve(values.size());
     values.visit([&](const auto& viewed) {
       for (const auto& value : viewed) {
         char buf[coerce::TEXT_BUF_SIZE];
         std::string_view term = coerceAnyOfTerm(fieldType, field, value, buf);
-        if (normalizer != nullptr) {
-          term = normalizeMultiterm(*normalizer, term);
+        if (fieldType.type() == FieldType::Type::TEXT) {
+          normalizer->head.setValue(term);
+          normalizer->reset();
+          if (normalizer->tail->incrementToken() && normalizer->tail->incrementToken()) {
+            throw std::runtime_error(std::format(
+                "Field '{}': any_of / := requires a single term per exact TEXT value. "
+                "Use match (field:value), phrase (field:\"words\"), or a whole-value string variant",
+                field));
+          }
         }
-        term = PackedTerm::truncate(term);
+        term = normalizeLiteral(target, term, true);
         if (term.data() == buf) term = poolCopy(term);
         terms.push_back(term);
       }
@@ -453,18 +473,18 @@ public:
     if (preserveInputOrder) {
       auto ordered = pool.copy_span(std::span<std::string_view>(inputOrder));
       return CanonicalValueSet(
-          field, std::span<const std::string_view>(stored),
+          target, std::span<const std::string_view>(stored),
           std::span<const std::string_view>(ordered));
     }
     return CanonicalValueSet(
-        field, std::span<const std::string_view>(stored));
+        target, std::span<const std::string_view>(stored));
   }
 
   Query* createAnyOfQuery(const CanonicalValueSet& values) {
     if (values.empty()) return matchNoDocs();
 
-    std::string_view field = values.field;
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    auto field = poolCopy(values.target.physicalName);
+    FieldType& fieldType = *values.target.fieldType;
     if (values.numeric()) {
       if (!isNumericColumnType(fieldType.type()) || !fieldType.hasColumn()) {
         throw std::runtime_error(std::format(
@@ -507,29 +527,35 @@ public:
     return pool.make<TermInSetQuery>(field, terms);
   }
 
-  // Normalize multiterm query input (a prefix or fuzzy term) for a TEXT
-  // field: the field's normalization chain applies - case/character folds,
-  // never segmentation - so THOM* finds what "Thomas" indexed (the classic
-  // multiterm trap; Lucene's Analyzer::normalize).  Returns a view that
-  // outlives the query tree (the input, or a pool copy when folding rewrote
-  // it).  STRING/ID input stays verbatim - callers skip this for them.
-  std::string_view normalizeMultiterm(TextFieldType& fieldType, std::string_view field,
-                                      std::string_view text) {
-    auto chain = fieldType.createAnalyzer(field);
-    return normalizeMultiterm(*chain, text);
+  std::string_view normalizeLiteral(const ResolvedFieldHandle& target,
+                                    std::string_view text, bool exact) {
+    // ID indexing, overwrite, and delete-by-ID share this term-space policy.
+    if (target.fieldType->type() == FieldType::ID) return PackedTerm::truncate(text);
+    if (auto* chain = fields.chain(target)) text = normalizeMultiterm(*chain, text);
+    if (exact && text.size() > PackedTerm::MAX_LEN) {
+      throw std::runtime_error(std::format(
+          "Field '{}': exact value is {} bytes after normalization; maximum is {}. "
+          "Use match/phrase for analyzed text or a shorter whole-value string variant",
+          target.physicalName, text.size(), PackedTerm::MAX_LEN));
+    }
+    return text;
   }
 
   // Build a prefix query over term-backed fields. The prefix is normalized
-  // (not tokenized) for analyzed TEXT fields and used verbatim for STRING/ID;
+  // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
   Query* createPrefixQuery(std::string_view field, std::string_view prefix) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix);
+  }
+
+  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
-        prefix = normalizeMultiterm((TextFieldType&)fieldType, field, prefix);
-        [[fallthrough]];
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
+        prefix = normalizeLiteral(target, prefix, false);
         if (!fieldType.indexed()) {
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
@@ -543,9 +569,14 @@ public:
   }
 
   Query* createWildcardQuery(std::string_view field, std::string_view pattern) {
-    FieldType& fieldType = *checkAutomatonField("Wildcard", field);
-    if (fieldType.type() == FieldType::Type::TEXT) {
-      TextCodepointFolder folder((TextFieldType&)fieldType, field);
+    return createWildcardQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern);
+  }
+
+  Query* createWildcardQuery(const ResolvedFieldHandle& target, std::string_view pattern) {
+    auto field = poolCopy(target.physicalName);
+    checkAutomatonField("Wildcard", target);
+    if (auto* chain = fields.chain(target)) {
+      FieldCodepointFolder folder(chain);
       return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field, pattern,
                                 &folder, automaton::compileWildcard);
     }
@@ -554,9 +585,14 @@ public:
   }
 
   Query* createRegexQuery(std::string_view field, std::string_view pattern) {
-    FieldType& fieldType = *checkAutomatonField("Regex", field);
-    if (fieldType.type() == FieldType::Type::TEXT) {
-      TextCodepointFolder folder((TextFieldType&)fieldType, field);
+    return createRegexQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern);
+  }
+
+  Query* createRegexQuery(const ResolvedFieldHandle& target, std::string_view pattern) {
+    auto field = poolCopy(target.physicalName);
+    checkAutomatonField("Regex", target);
+    if (auto* chain = fields.chain(target)) {
+      FieldCodepointFolder folder(chain);
       return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field, pattern,
                                 &folder, automaton::compileRegex);
     }
@@ -565,8 +601,9 @@ public:
   }
 
 private:
-  FieldType* checkAutomatonField(std::string_view label, std::string_view field) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+  FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
+    const auto& field = target.physicalName;
+    FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
       case FieldType::Type::ID:
@@ -634,19 +671,26 @@ public:
 
   // Build a fuzzy query over term-backed fields. The term is normalized (not
   // tokenized) for analyzed TEXT fields - AUTO edits are computed from the
-  // normalized bytes - and used verbatim for STRING/ID.
+  // normalized bytes - and normalized for STRING; ID is verbatim.
   // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 0 (complete).
   Query* createFuzzyQuery(std::string_view field, std::string_view term,
                           std::optional<int> maxEdits = std::nullopt,
                           std::optional<int> prefixLength = std::nullopt,
                           int maxExpansions = 0) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    return createFuzzyQuery(fields.resolve(field, OpClass::SEARCH, opName), term, maxEdits, prefixLength, maxExpansions);
+  }
+
+  Query* createFuzzyQuery(const ResolvedFieldHandle& target, std::string_view term,
+                          std::optional<int> maxEdits = std::nullopt,
+                          std::optional<int> prefixLength = std::nullopt,
+                          int maxExpansions = 0) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
-        term = normalizeMultiterm((TextFieldType&)fieldType, field, term);
-        break;
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
+        term = normalizeLiteral(target, term, false);
         break;
       default:
         throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
@@ -677,7 +721,7 @@ public:
   // Build a match query for `field` against raw value `value`.
   //   * TEXT field: run the field's analyzer and combine the resulting terms.
   //     Term bytes are copied into the pool (analyzer buffers are transient).
-  //   * STRING / ID field: matched verbatim as a single term, no analysis. The
+  //   * STRING / ID field: one term, normalized for STRING, verbatim for ID. The
   //     value must outlive the query tree (caller's storage).
   // The 0/1/N collapse applies: 0 terms -> match nothing, 1 -> TermQuery,
   // N -> BooleanQuery.
@@ -689,11 +733,16 @@ public:
   // min-should-match boolean.
   Query* createMatchQuery(std::string_view field, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch);
+  }
+
+  Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
+                          Operator op = Operator::OR, int minMatch = 0) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
-        auto& textType = (TextFieldType&)fieldType;
-        auto chain = textType.createAnalyzer(field);
+        auto* chain = fields.chain(target);
         TokenChain& tc = *chain;
         Token& tok = tc.head.getToken();
         TokenStream& tail = *tc.tail;
@@ -730,10 +779,9 @@ public:
         }
         return pool.make<BooleanQuery>(none, clauses, none, none, k);  // min-should-match
       }
-      case FieldType::Type::ID:
       case FieldType::Type::STRING:
-        // Indexed truncated (StrHandler/IdHandler); truncate to match.
-        return pool.make<TermQuery>(field, PackedTerm::truncate(value));
+      case FieldType::Type::ID:
+        return pool.make<TermQuery>(field, normalizeLiteral(target, value, true));
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
       case FieldType::Type::DOUBLE:
@@ -743,7 +791,7 @@ public:
         if (value.empty()) return matchNoDocs();
         luxir::api::Val v;
         v.kind = value;  // string arm; coerceColInt64 parses per the field type
-        return createRangeQuery(field, &v, nullptr, &v, nullptr);
+        return createRangeQuery(target, &v, nullptr, &v, nullptr);
       }
       default:
         throw std::runtime_error(std::format("Match query on unsupported field type: {}", field));
@@ -758,14 +806,20 @@ public:
   // maps) throw.
   Query* createMatchQuery(std::string_view field, const luxir::api::Val& val,
                           Operator op = Operator::OR, int minMatch = 0) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch);
+  }
+
+  Query* createMatchQuery(const ResolvedFieldHandle& target, const luxir::api::Val& val,
+                          Operator op = Operator::OR, int minMatch = 0) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
     if (isNumericColumnType(fieldType.type())) {
       // Exact numeric match == a degenerate inclusive [v, v] range; route
       // through createRangeQuery so it shares the same column validation.  An
       // array/uncoercible Val throws there (multi-value Match semantics are
       // undefined yet); op / min_match don't apply to a single numeric value.
       if (coerce::isNull(val)) return matchNoDocs();
-      return createRangeQuery(field, &val, nullptr, &val, nullptr);
+      return createRangeQuery(target, &val, nullptr, &val, nullptr);
     }
     char buf[coerce::TEXT_BUF_SIZE];
     std::string_view text = coerce::isNull(val)
@@ -778,7 +832,7 @@ public:
     if (text.data() == buf) {
       text = copyTerm(text);
     }
-    return createMatchQuery(field, text, op, minMatch);
+    return createMatchQuery(target, text, op, minMatch);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for
@@ -799,11 +853,18 @@ public:
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
   // term bytes, TEXT bounds fold like the field folds (normalizeMultiterm),
-  // and both truncate the way indexed terms were.
+  // and exact bounds obey the post-normalization length limit.
   Query* createRangeQuery(std::string_view field,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
                           const luxir::api::Val* lte, const luxir::api::Val* lt) {
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    return createRangeQuery(fields.resolve(field, OpClass::VALUE, opName), gte, gt, lte, lt);
+  }
+
+  Query* createRangeQuery(const ResolvedFieldHandle& target,
+                          const luxir::api::Val* gte, const luxir::api::Val* gt,
+                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
     bool numeric = isNumericColumnType(fieldType.type());
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
@@ -835,10 +896,7 @@ public:
         char buf[coerce::TEXT_BUF_SIZE];
         std::string_view t = fieldType.coerceTerm(v, field, buf);
         if (t.data() == buf) t = copyTerm(t);  // rendered numerics live in stack buf
-        if (fieldType.type() == FieldType::Type::TEXT) {
-          t = normalizeMultiterm((TextFieldType&)fieldType, field, t);
-        }
-        return PackedTerm::truncate(t);  // compare in indexed-term space
+        return normalizeLiteral(target, t, true);
       };
       std::optional<std::string_view> lower, upper;
       if (hasGte || hasGt) lower = termBound(hasGte ? *gte : *gt);
@@ -935,12 +993,17 @@ public:
   //     multi-token expansion.
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
                            std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
+    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions, slop);
+  }
+
+  Query* createPhraseQuery(const ResolvedFieldHandle& target, std::span<const std::string_view> values,
+                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
     validatePositions(valuePositions, values.size(), "words");
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
-    TextFieldType& fieldType = positionalTextFieldType(field);
-    auto chain = fieldType.createAnalyzer(field);
+    positionalTextFieldType(target);
+    auto* chain = fields.chain(target);
     TokenChain& tc = *chain;
     Token& tok = tc.head.getToken();
     TokenStream& tail = *tc.tail;
@@ -985,7 +1048,7 @@ public:
       }
     }
 
-    return buildPhrase(field,
+    return buildPhrase(target,
                        std::span<std::string_view>(terms.data(), terms.size()),
                        std::span<const int64_t>(positions.data(), positions.size()), slop);
   }
@@ -997,7 +1060,12 @@ public:
   // The provided span contents are not copied and thus should outlive the returned query.
   Query* createPhraseFromTerms(std::string_view field, std::span<std::string_view> terms,
                                std::span<const int32_t> positions, int32_t slop = 0) {
-    positionalTextFieldType(field);
+    return createPhraseFromTerms(fields.resolve(field, OpClass::SEARCH, opName), terms, positions, slop);
+  }
+
+  Query* createPhraseFromTerms(const ResolvedFieldHandle& target, std::span<std::string_view> terms,
+                               std::span<const int32_t> positions, int32_t slop = 0) {
+    positionalTextFieldType(target);
     validatePositions(positions, terms.size(), "terms");
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
@@ -1020,7 +1088,7 @@ public:
       }
       canonicalPositions = pos;
     }
-    return buildPhrase(field, terms, canonicalPositions, slop);
+    return buildPhrase(target, terms, canonicalPositions, slop);
   }
 };
 

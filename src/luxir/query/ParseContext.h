@@ -11,7 +11,7 @@
 #include <google/protobuf/arena.h>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/schema/Schema.h"
+#include "luxir/query/FieldResolver.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/MemPool.h"
 
@@ -46,13 +46,18 @@ struct ParseContext {
   // Request-facing constructors require this explicitly so adding a parser
   // call site cannot silently fall back to UTC.
   CoerceContext coerceContext;
+  FieldResolver localFields;
+  FieldResolver& fields;
+  std::map<const api::Val*, std::pair<std::string_view, size_t>> exactSources;
 
   ParseContext(MemPool& pool, Schema& schema, google::protobuf::Arena& arena,
                const CoerceContext& coerceContext,
                std::string_view opName,
-               std::vector<api::Warning>* warnings = nullptr)
+               std::vector<api::Warning>* warnings = nullptr,
+               FieldResolver* fields = nullptr)
     : pool(pool), schema(schema), arena(arena), warnings(warnings), opName(opName),
-      coerceContext(coerceContext) {}
+      coerceContext(coerceContext), localFields(schema),
+      fields(fields ? *fields : localFields) {}
 
   // code must be a string with static storage duration (a literal).
   void warn(std::string_view code, std::string_view message) {

@@ -51,6 +51,14 @@ public:
           fieldType(&fieldType),
           stringSortMode(stringSortMode) {
         assert(stringSortMode != StringSortMode::DEFAULT);
+        auto& type = const_cast<FieldType&>(fieldType);
+        if (type.type() == FieldType::TEXT) {
+            throw std::runtime_error("Sort field '" + fieldName +
+                "' is TEXT and has no value column; use a string variant");
+        }
+        if (!type.hasColumn()) {
+            throw std::runtime_error("Sort field '" + fieldName + "' has no value column");
+        }
     }
     
 public:
@@ -103,8 +111,7 @@ public:
                 );
 
             case FieldType::Type::ID:
-            case FieldType::Type::STRING:
-            case FieldType::Type::TEXT: {
+            case FieldType::Type::STRING: {
                 // Use FieldType information to determine if this is an indexed string field
                 if (const_cast<FieldType*>(fieldType)->isSet(FieldType::INDEX_DOCS)) {
                     if (stringSortMode == StringSortMode::SEGMENT &&

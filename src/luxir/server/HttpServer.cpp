@@ -1253,9 +1253,9 @@ private:
           }
         }
         if (const std::string* explain = findParam(params, "explain")) {
-          if (*explain != "request") {
+          if (*explain != "request" && *explain != "resolved") {
             respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-                                       "unknown explain mode '" + *explain + "' (valid: request)"));
+                                       "unknown explain mode '" + *explain + "' (valid: request, resolved)"));
             return;
           }
           if (format != HttpSearchFormat::ENVELOPE) {
@@ -1263,7 +1263,7 @@ private:
                                        "format=docs cannot be combined with explain"));
             return;
           }
-          handleExplain(req.body(), coll, overlay);
+          handleExplain(req.body(), coll, overlay, *explain);
         } else {
           handleSearch(req.body(), coll, format, overlay);
         }
@@ -1351,12 +1351,11 @@ private:
     setCollectionTarget(state.proto.collection, coll, state.resource);
   }
 
-  // ?explain=request: parse exactly as a query would be, then return the canonical
-  // JSON of the effective request INSTEAD of executing it. Sugar expands, shorthand
-  // lowers, and the output is itself a valid request body (posting it back runs the
-  // identical query). Parse + serialize only - no engine work, so it runs inline.
+  // ?explain=request only parses and serializes the canonical request body.
+  // ?explain=resolved adds an envelope with binding notes from preparation;
+  // its request member preserves field spellings and can be posted back.
   void handleExplain(const std::string& body, const std::string& coll,
-                     const SearchUrlOverlay& overlay) {
+                     const SearchUrlOverlay& overlay, std::string_view mode) {
     HttpSearchRequestState state;
     std::string out;
     try {
@@ -1371,6 +1370,17 @@ private:
       }
       if (!luxir::api::write_json(state.proto, out)) {
         throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize request");
+      }
+      if (mode == "resolved") {
+        auto notes = node_.getSearchEngine().explain(state.proto);
+        api::Val value;
+        std::vector<std::string_view> views(notes.begin(), notes.end());
+        value.kind.emplace<api::ArrStr>().v = views;
+        std::string targets;
+        if (!api::write_json(value, targets)) {
+          throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize resolved fields");
+        }
+        out = "{\"request\":" + out + ",\"resolved_fields\":" + targets + "}";
       }
     } catch (const std::exception& e) {
       respondException(e, ErrorKind::INVALID_REQUEST);

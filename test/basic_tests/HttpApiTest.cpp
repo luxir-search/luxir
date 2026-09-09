@@ -2220,6 +2220,25 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_EQ(canonical, echo2.body());
 }
 
+TEST_F(HttpApiTest, explainRequestSkipsEnginePreparation) {
+  const std::string body = R"({"query":{"match":{"unmapped_field":"value"}},"offset":-2})";
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/explain_missing/_search?explain=request", body);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 request;
+  ASSERT_FALSE(glz::read_json(request, echo.body()));
+  EXPECT_EQ("explain_missing", *request["collection"].get_if<std::string>());
+  EXPECT_FALSE(request.contains("request"));
+  EXPECT_FALSE(request.contains("resolved_fields"));
+  auto& top = request["ops"]["q"]["top_docs"];
+  EXPECT_EQ("unmapped_field", *top["query"]["match"]["field"].get_if<std::string>());
+  EXPECT_EQ(-2, *top["offset"].get_if<int64_t>());
+
+  auto resolved = httpRequest(port(), http::verb::post,
+      "/collections/explain_missing/_search?explain=resolved", body);
+  EXPECT_EQ(404, resolved.result_int()) << resolved.body();
+}
+
 TEST_F(HttpApiTest, searchGetUrlOnly) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("u1"), "title_w", std::string("dune novel"),
@@ -2344,6 +2363,11 @@ TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
   EXPECT_EQ("price_i", *(*sorts)[0]["expr"].get_if<std::string>());
   EXPECT_EQ("desc", *(*sorts)[0]["dir"].get_if<std::string>());
   EXPECT_EQ("score", *(*sorts)[1]["expr"].get_if<std::string>());
+
+  auto invalid = httpRequest(port(), http::verb::get,
+      "/collections/main/_search?explain=resolved&offset=-2");
+  EXPECT_EQ(400, invalid.result_int());
+  EXPECT_NE(std::string::npos, invalid.body().find("offset must be >= 0"));
 }
 
 TEST_F(HttpApiTest, searchUrlQueryIsJsonStringValue) {
@@ -3664,6 +3688,77 @@ TEST_F(HttpApiTest, offsetUrlOverlay) {
   EXPECT_EQ(ids[2], *(*docs)[1]["id"].get_if<std::string>());
   ASSERT_NE(nullptr, root["found"].get_if<int64_t>());
   EXPECT_EQ(4, *root["found"].get_if<int64_t>());
+}
+
+} // namespace luxir::test
+
+namespace luxir::test {
+
+// The explain=resolved envelope keeps the canonical request as a replayable member.
+static std::string explainedRequest(const http::response<http::string_body>& response) {
+  glz::generic_i64 envelope;
+  if (glz::read_json(envelope, response.body())) throw std::runtime_error("invalid explain JSON");
+  std::string request;
+  if (glz::write_json(envelope["request"], request)) throw std::runtime_error("invalid explain request");
+  return request;
+}
+
+TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTargets) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({"fields":{
+    "author":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}},
+    "genre":{"type":"string","variants":{"t":"text"},"defaults":{"search":"t"}}
+  }})");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", "Le Guin", "genre", "Science Fiction"),
+                           UpdateMessage::COMMIT).success);
+  std::string body = R"({"query":"genre:Science AND author:=\"Le Guin\"","fields":["id"],
+    "sorts":[{"expr":"author"}],"ops":{"authors":{"field_facet":{"field":"author"}}}})";
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=resolved", body);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 envelope;
+  ASSERT_FALSE(glz::read_json(envelope, echo.body()));
+  std::string notes;
+  ASSERT_FALSE(glz::write_json(envelope["resolved_fields"], notes));
+  for (auto detail : {"genre -> genre__t", "author -> author__s", "facet 'authors': author -> author__s"}) {
+    EXPECT_NE(std::string::npos, notes.find(detail)) << notes;
+  }
+  EXPECT_NE(std::string::npos, echo.body().find(R"("field":"author")")) << echo.body();
+  EXPECT_EQ(std::string::npos, explainedRequest(echo).find("author__s")) << echo.body();
+  auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
+  auto replay = httpRequest(port(), http::verb::post, "/collections/main/_search", explainedRequest(echo));
+  ASSERT_EQ(200, direct.result_int()) << direct.body();
+  EXPECT_EQ(direct.body(), replay.body());
+  auto again = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=resolved", explainedRequest(echo));
+  ASSERT_EQ(200, again.result_int()) << again.body();
+  EXPECT_EQ(echo.body(), again.body());
+}
+
+TEST_F(HttpApiTest, explainResolvedManyVariantTargetsStayInTheBody) {
+  std::string schema = "{\"fields\":{";
+  std::string request = "{\"ops\":{";
+  for (int i = 0; i < 40; i++) {
+    std::string name = "f" + std::to_string(i) + std::string(110, 'x');
+    if (i) { schema += ','; request += ','; }
+    schema += "\"" + name + R"(":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}})";
+    request += "\"f" + std::to_string(i) + R"(":{"field_facet":{"field":")" + name + R"("}})";
+  }
+  schema += "}}";
+  request += "}}";
+  auto set = httpRequest(port(), http::verb::post, "/collections/main/_schema", schema);
+  ASSERT_EQ(200, set.result_int()) << set.body();
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=resolved", request);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 envelope;
+  ASSERT_FALSE(glz::read_json(envelope, echo.body()));
+  auto* notes = envelope["resolved_fields"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, notes);
+  EXPECT_EQ(40u, notes->size());
+  std::string encodedNotes;
+  ASSERT_FALSE(glz::write_json(envelope["resolved_fields"], encodedNotes));
+  EXPECT_GT(encodedNotes.size(), 8192u);
 }
 
 } // namespace luxir::test

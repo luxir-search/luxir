@@ -52,7 +52,7 @@ inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
     "rescore",        // RescoreQuery
     "wildcard",       // WildcardQuery
     "regex",          // RegexQuery
-    "any_of",         // AnyOfQuery - structured-only (Val sequence input)
+    "any_of",         // AnyOfQuery - exact scalar/list input
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -65,6 +65,7 @@ static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(
 // string/Val slots, a sub-expression for Query slots.
 inline constexpr std::string_view mainValueArg(std::string_view fn) {
   if (fn == "match") return "val";
+  if (fn == "any_of") return "values";
   if (fn == "exists") return "field";
   if (fn == "phrase") return "text";
   if (fn == "simple_query") return "q";
@@ -99,6 +100,7 @@ bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
   auto tryArm = [&]<size_t I>() {
     using Arm = std::variant_alternative_t<I, decltype(api::Query::kind)>;
     if constexpr (std::is_same_v<Arm, api::Match> ||
+                  std::is_same_v<Arm, api::AnyOfQuery> ||
                   std::is_same_v<Arm, api::BooleanQuery> ||
                   std::is_same_v<Arm, api::ExistsQuery> ||
                   std::is_same_v<Arm, api::PhraseQuery> ||

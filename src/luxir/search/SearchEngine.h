@@ -9,6 +9,7 @@
 namespace luxir {
 
 class LuxirNode;
+class RootOp;
 struct SearchConfig;
 
 /// The SearchEngine is a singleton owned by the LuxirNode object and is responsible for
@@ -18,6 +19,7 @@ class SearchEngine {
   LuxirNode& node;
 
   void submitBody(SearchRequest& req);
+  RootOp* prepare(SearchRequest& req);
 
   /// get needed resources such as the index reader and schema
   void getResources(SearchRequest& req);
@@ -27,6 +29,9 @@ public:
   }
 
   const SearchConfig& searchConfig() const;
+
+  // Prepare through the ordinary parser/planner, without running calculators.
+  std::vector<std::string> explain(const ReqProto& proto);
 
   // Transport entry point: route the request by max_parallel, then submit().
   // 0 (the default) executes inline on the calling thread (no cross-thread
