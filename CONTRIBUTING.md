@@ -1,47 +1,53 @@
 # Contributing to Luxir
 
-Thanks for your interest. Luxir is pre-release and moving quickly, so this
-page is short and will change.
+Thanks for your interest in Luxir. The project is pre-1.0 and moving quickly:
+interfaces change without back-compat, and the fastest way to have a change
+land is to talk about it before writing much code.
 
-## Terms
+## Questions, ideas, and bugs
 
-Luxir is licensed under the [Apache License 2.0](LICENSE). By submitting a
-contribution you agree that it is licensed under the same terms, as described
-in section 5 of that license. There is no separate contributor agreement or
-sign-off to complete.
+- Questions and ideas: [GitHub Discussions](https://github.com/luxir-search/luxir/discussions).
+- Bugs and feature requests: [GitHub Issues](https://github.com/luxir-search/luxir/issues).
 
-## What is welcome now
+A good bug report includes the commit or version, the exact request you sent,
+the response you got, and what you expected instead. A `curl` reproduction
+against a fresh, empty collection is ideal; the
+[Quickstart](docs/guide/quickstart.md) shows the shape.
 
-- Bug reports with a way to reproduce them: the request, the documents that
-  were indexed, and the observed versus expected result.
-- Small, focused fixes: a wrong result, a crash, a documentation error, a
-  build problem on a supported platform.
-- Questions and design discussion in GitHub issues.
+## Making changes
 
-Before starting anything larger than a focused fix, open an issue describing
-the problem and the approach. The API and the on-disk format change without
-notice before 1.0, and internal designs are still being reshaped, so a pull
-request built on last month's structure can be superseded before it lands.
-An issue first avoids wasted work on both sides.
+1. For anything beyond a small fix, open an issue or discussion first and say
+   what you plan to change. Design questions are cheaper to settle before the
+   code exists, and parts of the engine are being reshaped.
+2. Build and test locally. [Build setup](docs/dev/build-setup.md) covers the
+   toolchain and presets; the [Codebase map](docs/dev/codebase-map.md) explains
+   where things live. The default iteration build is `gcc-debug`; run the
+   `gcc-debug-asan` build as well before submitting.
+3. Add or extend tests for behavior you change. Tests use the helpers in
+   `test/test/` (`CollectionHelper.h`, `TestUtils.h`, `LocalReq.h`) rather
+   than mocks, and stay short.
+4. Follow the conventions in [AGENTS.md](AGENTS.md). That file is written for
+   both people and coding agents working in this tree; the rules are the same.
+5. Open a pull request against `main` with one logical change per PR.
 
-## Building and testing
+Commit messages are concise and describe what changed, for example
+`facets: exact counts for date histograms with time zones`. They do not
+describe process, review rounds, or tooling.
 
-[Build setup](docs/dev/build-setup.md) covers toolchains and dependencies.
-[Codebase map](docs/dev/codebase-map.md) describes where things live, and
-[AGENTS.md](AGENTS.md) holds the build, test, and code conventions used in
-this repository. In short:
+## Documentation
 
-```bash
-cmake --preset gcc-debug
-cmake --build --preset gcc-debug
-./build/gcc-debug/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
-```
+User and design documentation lives in [`docs/`](docs/README.md) as plain
+GitHub-flavored Markdown and is published to <https://luxir.org> on every
+change to `main`. Keep links relative, start each page with a single `#`
+heading, and add new pages to the reading order in `docs/README.md`.
 
-Before submitting, also run the tests under the `gcc-debug-asan` preset.
-Add a test for any behavior change; tests use the helpers in `test/test/` and
-never mock. Keep commit messages concise and say what changed.
+## License
 
-## Security issues
+Luxir is licensed under the [Apache License 2.0](LICENSE). By contributing,
+you agree that your contributions are licensed under the same terms. No
+separate contributor agreement is required at this time.
 
-Do not open a public issue for a security problem. See
-[SECURITY.md](SECURITY.md).
+## Conduct
+
+Everyone taking part is expected to follow the
+[code of conduct](CODE_OF_CONDUCT.md).
