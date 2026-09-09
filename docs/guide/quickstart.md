@@ -56,14 +56,17 @@ each. Name a field `title_t` and it is searchable text; name it `year_i` and
 it is a number you can range and sort on. Define an [explicit schema](schema.md)
 later when you want control - you do not need one to start.
 
-> **Reading the rest of this page:** examples below drop the `curl` wrapper and
-> show just the method, path, and JSON body. To run one, wrap it:
+> **Reading the rest of this page:** requests are shown as HTTP: method, path,
+> and body. On the website, every request block has a **Copy as curl** button
+> that copies the runnable command. Reading the Markdown source, wrap one
+> yourself as above:
 > `curl -X POST http://localhost:9400<path> -H 'Content-Type: application/json' -d '<body>'`.
 
 ## Search
 
-```
+```http
 POST /collections/main/_search
+
 {"query": {"match": {"title_t": "kings"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
 ```
 
@@ -88,8 +91,9 @@ placement there too.)
 Add `get_number` and the response tells you exactly how many documents match,
 not an estimate - even when you only page back a few:
 
-```
+```http
 POST /collections/main/_search
+
 {"query": {"match": {"author_s": "Sanderson"}}, "fields": ["id"], "get_number": true, "limit": 2}
 ```
 
@@ -105,8 +109,9 @@ For a search box where a human types whatever they want, use `simple_query`.
 It parses operators, quotes, and field terms, and it never returns a parse
 error - malformed input just does its best:
 
-```
+```http
 POST /collections/main/_search
+
 {"query": {"simple_query": {"q": "kings | radiance", "fields": ["title_t"]}}, "fields": ["id"], "get_number": true}
 ```
 
@@ -121,8 +126,9 @@ goes is an expression in the [Luxir query language](query-language.md):
 fielded terms, AND/OR/NOT, ranges, and function forms for most structured query
 types. Unlike `simple_query`, malformed input is a parse error, not a guess:
 
-```
+```http
 POST /collections/main/_search
+
 {"query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2020]", "fields": ["id"], "get_number": true}
 ```
 
@@ -139,8 +145,10 @@ Set the content type to `application/x-ndjson` and send one document per line.
 The stream is unbounded - pipe in a file of any size and Luxir indexes it as it
 arrives, without buffering the whole thing:
 
-```
-POST /collections/main/_update      (Content-Type: application/x-ndjson)
+```http
+POST /collections/main/_update
+Content-Type: application/x-ndjson
+
 {"id": "4", "title_t": "Oathbringer", "author_s": "Sanderson", "year_i": 2017}
 {"id": "5", "title_t": "The Well of Ascension", "author_s": "Sanderson", "year_i": 2007}
 {"_end_": {"commit": {}}}
@@ -168,12 +176,13 @@ Add `?format=docs` to a query and the response is bare NDJSON documents - one
 per line, no envelope, no paging. `limit: -1` means every match, streamed over
 one connection; there is no scroll API or cursor token to manage:
 
-```
+```http
 POST /collections/main/_search?format=docs
+
 {"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"]}
 ```
 
-```ndjson
+```jsonl
 {"id":"1","title_t":"The Way of Kings"}
 {"id":"2","title_t":"Words of Radiance"}
 {"id":"3","title_t":"Mistborn: The Final Empire"}
@@ -204,8 +213,9 @@ partial result. A cleanly finished body is a complete result set.
 You never pre-create collections. Index to any name and it comes into existence
 on first use:
 
-```
+```http
 POST /collections/books/_update
+
 {"docs": [{"id": "a", "title_t": "Dune"}], "commit": {}}
 ```
 
@@ -213,8 +223,9 @@ POST /collections/books/_update
 {"update_version":1,"status":"ok"}
 ```
 
-```
+```http
 POST /collections/books/_search
+
 {"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "get_number": true}
 ```
 
@@ -241,8 +252,9 @@ Changes become visible on commit. You have three ways, use whichever fits:
 Add `?explain=request` to a query and Luxir echoes back the canonical request it
 parsed - the shorthand you sent, expanded to the full form:
 
-```
+```http
 POST /collections/main/_search?explain=request
+
 {"query": {"match": {"title_t": "dune"}}}
 ```
 

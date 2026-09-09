@@ -48,7 +48,10 @@ communication with maintainers is written by humans, not generated.
 User and design documentation lives in [`docs/`](docs/README.md) as plain
 GitHub-flavored Markdown and is published to <https://luxir.org> on every
 change to `main`. Keep links relative, start each page with a single `#`
-heading, and add new pages to the reading order in `docs/README.md`.
+heading, and add new pages to the reading order in `docs/README.md`. Show an
+HTTP example as one ```http fence: the request line, any headers, a blank
+line, and the body. The site renders the request line as the block title and
+adds a Copy as curl button; GitHub highlights the fence as-is.
 
 ## License
 

@@ -223,7 +223,7 @@ the next.
 
 For example, two independently reported groups followed by one commit:
 
-```ndjson
+```jsonl
 {"_update_":{"request_id":"fiction","return_ids":true}}
 {"id":"b1","kind_s":"fiction","title_t":"Dune"}
 {}

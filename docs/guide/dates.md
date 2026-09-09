@@ -53,8 +53,9 @@ sense: `when_dt:>=NOW/DAY` means "from the start of today" and
 By default everything above is UTC. Set `time_zone` on a search request to
 give it a civil frame:
 
-```
+```http
 POST /collections/main/_search
+
 {"time_zone": "America/Denver",
  "query": {"range": {"field": "when_dt", "gte": "NOW/DAY"}}}
 ```
@@ -91,8 +92,9 @@ explicit offset.
 Range facets bucket DATE fields with either a fixed gap in milliseconds or a
 calendar gap in the facet's zone:
 
-```
+```http
 POST /collections/main/_search
+
 {"time_zone": "America/Denver",
  "ops": {"per_day": {"range_facet": {
    "field": "when_dt",

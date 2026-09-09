@@ -9,8 +9,9 @@ to parse. `expr` would rather error than guess.
 
 Anywhere the JSON API takes a query object, a bare string is an expression:
 
-```
+```http
 POST /collections/main/_search
+
 {"query": "status_s:active AND year_i:>=1960", "fields": ["id"]}
 ```
 
