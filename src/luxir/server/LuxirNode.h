@@ -112,7 +112,7 @@ class Collection {
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
   std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
-  std::mutex schemaMutex_;  // serializes schema read-modify-write + persistence
+  std::mutex schemaMutex_;  // serializes complete schema transactions on the calling thread
 public:
 
   std::shared_ptr<Shard> getShard() {
@@ -142,6 +142,7 @@ public:
 
 private:
   void setSchemaLocked(std::shared_ptr<Schema> newSchema);
+  void persistSchemaLocked(std::shared_ptr<Schema> newSchema);
 
   friend class Library;
   friend class LuxirNode;

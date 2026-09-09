@@ -1022,15 +1022,19 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
              UpdateMessage::COMMIT);
   }
 
-  // Segment 2: schema now marks "name" as STORED (and drops the column).
+  // Segment 2: enable source storage. Keep the column contract immutable and
+  // store id too, so requesting it forces the shared resource's chunk path.
   {
     auto schema = Schema::createDefaultSchema();
     SchemaBuilder b;
     auto& f = b.field("name");
     f.type = luxir::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
-    f.column = false;
+    f.column = true;
     f.stored = true;
+    auto& id = b.field("id");
+    id.type = luxir::api::FieldDef::FieldClass::ID;
+    id.stored = true;
     schema = b.build(schema.get());
     ch.collection().setSchema(schema);
 

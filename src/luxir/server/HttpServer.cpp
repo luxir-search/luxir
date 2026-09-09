@@ -112,7 +112,7 @@ static http::status httpStatusFor(const ErrorInfo& info) {
 
 struct HttpSearchRequestState {
   std::pmr::monotonic_buffer_resource resource;
-  HttpSearchReqProto proto;  // non-owning; backed by `resource`
+  HttpSearchReqProto proto;  // JSON readers copy search strings into resource
 };
 
 // Response shape for /_search.  Selected by the request-level proto field
@@ -128,7 +128,7 @@ enum class HttpSearchFormat {
 
 struct HttpUpdateState {
   std::pmr::monotonic_buffer_resource resource;
-  HttpUpdateReqProto proto;  // non-owning; backed by `resource`
+  HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
 };
 
 struct HttpStreamWriterTarget {
@@ -138,7 +138,7 @@ struct HttpStreamWriterTarget {
 
 struct HttpStreamControlRequest {
   std::pmr::monotonic_buffer_resource resource;
-  HttpUpdateReqProto proto;  // non-owning; backed by `resource`
+  HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
   std::size_t sourceBytes = 0;
 };
 
@@ -1225,7 +1225,7 @@ private:
         handleCollectionList();
         break;
       case Route::COLLECTION_CREATE:
-        handleCollectionCreate(req.body());
+        handleCollectionCreate(std::move(req.body()));
         break;
       case Route::COLLECTION_DELETE:
         handleCollectionDelete(req.body());
@@ -1303,7 +1303,13 @@ private:
         // zero-flag path) sets each named definition exactly; the destructive
         // mode=replace_all must be typed.  PUT/PATCH are reserved.
         if (req.method() == http::verb::get) {
-          handleSchemaGet(coll);
+          const auto* view = findParam(params, "view");
+          if (view && *view != "authored" && *view != "resolved") {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                "unknown schema view '" + *view + "' (valid: authored, resolved)"));
+            return;
+          }
+          handleSchemaGet(coll, view && *view == "resolved");
           break;
         }
         auto mode = luxir::api::SchemaRequest_::Mode::SET;
@@ -1316,7 +1322,7 @@ private:
             return;
           }
         }
-        handleSchemaSet(req.body(), coll, mode);
+        handleSchemaSet(std::move(req.body()), coll, mode);
         break;
       }
       case Route::NONE:
@@ -1336,7 +1342,8 @@ private:
   static void parseEffectiveRequest(const std::string& body, const std::string& coll,
                                     const SearchUrlOverlay& overlay,
                                     HttpSearchRequestState& state) {
-    // Build the NON-OWNING request directly into the request state's arena.
+    // SearchRequest's readers copy strings (including overlay strings) into
+    // resource. That arena follows the request through async search/reply.
     parseQueryRequest(body.empty() ? "{}" : std::string_view(body), state.proto, state.resource);
     if (overlay.hasTopDocs && !state.proto.ops.empty()) {
       const auto* q = state.proto.ops.find("q");
@@ -1562,15 +1569,17 @@ private:
     else respondJson(http::status::ok, std::move(out));
   }
 
-  void handleCollectionCreate(const std::string& body) {
+  void handleCollectionCreate(std::string body) {
     struct State {
+      std::string body;
       std::pmr::monotonic_buffer_resource resource;
-      luxir::api::CreateCollectionRequest request;
+      luxir::api::CreateCollectionRequest request;  // embedded schema can borrow body
     };
     auto state = std::make_shared<State>();
+    state->body = std::move(body);
     try {
       std::string err;
-      if (!luxir::api::read_json(state->request, body, state->resource, &err)) {
+      if (!luxir::api::read_json(state->request, state->body, state->resource, &err)) {
         throw RequestError(err.empty() ? "malformed create collection request" : err, "invalid_json");
       }
     } catch (const std::exception& e) {
@@ -1659,7 +1668,26 @@ private:
     return compact;
   }
 
-  void handleSchemaGet(const std::string& coll) {
+  void handleSchemaGet(const std::string& coll, bool resolved) {
+    if (resolved) {
+      auto shardPin = makeShardPin();
+      node_.getTaskArena().enqueue([self = shared_from_this(), coll, shardPin] {
+        std::string out;
+        std::optional<ErrorInfo> failure;
+        try {
+          auto collection = self->node_.resolveCollection(coll);
+          out = collection->getShard()->getIndexWriter()->resolvedSchema();
+        } catch (const std::exception& e) {
+          failure = classifyException(e, ErrorKind::INTERNAL);
+        }
+        net::post(self->stream_.get_executor(),
+                  [self, shardPin, failure = std::move(failure), out = std::move(out)]() mutable {
+                    if (failure) self->respondError(*failure);
+                    else self->respondJson(http::status::ok, std::move(out));
+                  });
+      });
+      return;
+    }
     // Read-only: never creates the collection, and the schema is an atomic
     // load + pure render, so this runs inline on the io thread.
     std::string out;
@@ -1705,16 +1733,20 @@ private:
         });
   }
 
-  void handleSchemaSet(const std::string& body, const std::string& coll,
+  void handleSchemaSet(std::string body, const std::string& coll,
                        luxir::api::SchemaRequest_::Mode mode) {
     struct SchemaSetState {
+      std::string body;
       std::pmr::monotonic_buffer_resource resource;
-      luxir::api::SchemaDef def;  // non-owning; backed by `resource`
+      luxir::api::SchemaDef def;  // non-owning; backed by body and resource
     };
     auto state = std::make_shared<SchemaSetState>();
+    // JSON string views can borrow input bytes. Move them into the queued
+    // state before parsing; the Beast request dies when dispatch returns.
+    state->body = std::move(body);
     try {
       std::string err;
-      if (!luxir::api::read_json(state->def, body, state->resource, &err)) {
+      if (!luxir::api::read_json(state->def, state->body, state->resource, &err)) {
         throw RequestError(err.empty() ? "malformed schema" : err, "invalid_json");
       }
     } catch (const std::exception& e) {

@@ -398,12 +398,12 @@ TEST_F(FieldVariantsIngestTest, storedAuthorSurvivesLaterStringBranchFailure) {
   EXPECT_TRUE(match(helper, "author", std::string(255, 'x')).empty());
 }
 
-TEST_F(FieldVariantsIngestTest, lazySchemaRefreshKeepsExistingDispatchersAlive) {
+TEST_F(FieldVariantsIngestTest, schemaPinnedAtConstructionNeverRefreshes) {
   RAMDir dir;
   auto schema = Schema::createDefaultSchema();
   int acquisitions = 0;
   Inverter inv(dir, 1, [&] { acquisitions++; return schema; });
-  EXPECT_EQ(0, acquisitions);
+  EXPECT_EQ(1, acquisitions);
   auto& existing = inv.getIndexHandler("old_s");
   EXPECT_EQ(1, acquisitions);
   EXPECT_EQ(&existing, &inv.getIndexHandler("old_s"));
@@ -413,14 +413,13 @@ TEST_F(FieldVariantsIngestTest, lazySchemaRefreshKeepsExistingDispatchersAlive) 
   added.type = FieldClass::TEXT;
   b.variant(added, "s").type = FieldClass::STRING;
   schema = b.build(schema.get());
-  auto& addedInput = inv.getIndexHandler("added");
-  EXPECT_EQ(2, acquisitions);
+  EXPECT_THROW(inv.getIndexHandler("added"), RequestError);
+  EXPECT_EQ(1, acquisitions);
   inv.startDoc();
   existing.index(inv, "old");
-  addedInput.index(inv, "new");
   inv.finishDoc();
-  EXPECT_EQ(2u, inv.inputHandlers.size());
-  EXPECT_EQ(3u, inv.indexHandlers.size());
+  EXPECT_EQ(1u, inv.inputHandlers.size());
+  EXPECT_EQ(1u, inv.indexHandlers.size());
   EXPECT_TRUE(inv.flush());
 }
 

@@ -917,18 +917,17 @@ TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {
 TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
+  const RangeField fields[] = {{"merge_values_is", true}};
+  setRangeSchema(helper, fields);
 
   std::vector<Doc> source1 = {
       flatdoc("id", "s1-a", "merge_values_is", vec_i(2, 2, 10)),
       flatdoc("id", "s1-b", "merge_values_is", vec_i(14))};
   ASSERT_TRUE(helper.indexAll(source1, UpdateMessage::COMMIT).success);
-  auto preRangeReader = writer->getIndexReader();
-  ASSERT_EQ(preRangeReader->segments().size(), 1);
-  EXPECT_EQ(fieldInfo(preRangeReader->segments()[0],
+  auto firstReader = writer->getIndexReader();
+  ASSERT_EQ(firstReader->segments().size(), 1);
+  EXPECT_NE(fieldInfo(firstReader->segments()[0],
                       "merge_values_is").pointsMetaOff, 0);
-
-  const RangeField fields[] = {{"merge_values_is", true}};
-  setRangeSchema(helper, fields);
   std::vector<Doc> source2 = {
       flatdoc("id", "s2-a", "merge_values_is", vec_i(4, 8)),
       flatdoc("id", "s2-delete", "merge_values_is", vec_i(12, 12)),
@@ -955,8 +954,8 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
     else if (info->pointsMetaOff == 0) synthesizedSources++;
     else pointSources++;
   }
-  EXPECT_EQ(pointSources, 2);
-  EXPECT_EQ(synthesizedSources, 1);
+  EXPECT_EQ(pointSources, 3);
+  EXPECT_EQ(synthesizedSources, 0);
   EXPECT_EQ(absentSources, 1);
 
   writer->mergeSegments();

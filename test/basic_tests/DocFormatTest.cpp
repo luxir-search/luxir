@@ -620,7 +620,6 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   // when a different schema selects a resource this reader does not have.
   text.stored_resource = "_stored_cold_";
   string.stored_resource = "_stored_cold_";
-  string.column = false;
   auto schema = b.build(ch.collection().getSchema().get());
   ch.collection().setSchema(schema);
   auto current = reader->logicalProjectableFields(schema);

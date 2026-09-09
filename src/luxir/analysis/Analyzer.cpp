@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "luxir/api/luxir_types.hpp"
+#include <glaze/glaze.hpp>
 
 #include <uni_algo/case.h>
 #include <uni_algo/norm.h>
@@ -506,12 +507,22 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   for (const auto& filter : def.filters) {
     filters.push_back(makeTokenFilterFactory(filter));
   }
-  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters)));
+  api::AnalyzerDef effective = def;
+  if (!effective.tokenizer) effective.tokenizer = whitespace;
+  std::string json;
+  if (!api::write_json(effective, json)) throw std::runtime_error("Cannot serialize analyzer");
+  // Sort parameter objects recursively; filter order remains semantic.
+  glz::generic_sorted_u64 value;
+  if (glz::read_json(value, json)) throw std::runtime_error("Cannot canonicalize analyzer");
+  // Give the empty chain the same representation everywhere.
+  if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
+  if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(json)));
 }
 
 Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs)
-    : tokenizer(std::move(tok)),
+                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical)
+    : canonical(std::move(canonical)), tokenizer(std::move(tok)),
       filters(std::move(fs)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       stateful(tokenizer->stateful ||

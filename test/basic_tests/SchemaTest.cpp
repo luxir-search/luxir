@@ -989,8 +989,8 @@ TEST_F(SchemaTest, schemaPersistence) {
   InputStream is = file->getInputStream();
   api::SchemaDef persistedDef;
   std::span<const char> persistedBytes(is.ptr(), (size_t)is.left());
-  auto paddedPersistedBytes = api::copyToPaddedInput(std::as_bytes(persistedBytes), arena);
-  ASSERT_TRUE(api::decode(persistedDef, paddedPersistedBytes, arena));
+  auto persistedSchema = Schema::decodeStored(std::as_bytes(persistedBytes));
+  persistedSchema->toProto(&persistedDef, arena);
 
   // The persisted def should contain "title" field
   const api::FieldDef* title = persistedDef.fields.at("title").operator->();

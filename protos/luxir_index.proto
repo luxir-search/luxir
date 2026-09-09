@@ -17,6 +17,23 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
+  // Reserved physical names and their immutable interpretation, including
+  // names removed from the current schema. Retained across merges and reopen.
+  repeated PhysicalFieldSignature field_signatures = 17;
+}
+
+message PhysicalFieldSignature {
+  string name = 1;
+  string logical_name = 2;
+  string label = 3;
+  map<string, string> properties = 4; // canonical JSON values, keyed by property
+}
+
+// Stored in the existing _schema_<generation> file. The public authored
+// SchemaDef remains unchanged; introductions must survive schema-only updates.
+message SchemaInfo {
+  bytes source_def = 1;
+  map<string, uint64> introduced_gen = 2;
 }
 
 // An auxiliary index entry built at a particular commit. Used for both
@@ -45,7 +62,7 @@ message SegmentInfo {
   uint64 commit_time = 5;               // First time this segment was committed (microseconds since epoch)
   int32 max_doc = 6;                    // Number of documents in this segment (ignoring deletes)
   int32 live_docs = 7;                  // Number of non-deleted documents in this segment
-  uint64 schema_gen = 8;                // Schema generation this segment was indexed under
+  uint64 schema_gen = 8;                // Minimum input schema generation; merges never imply backfill
 
   // Segment-local auxiliary overlays. Vector ANN indexes are recorded here
   // with kind "vector_faiss"; validity is segment liveness, not core_gen.

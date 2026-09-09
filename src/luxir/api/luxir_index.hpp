@@ -16,8 +16,21 @@
 #include <vector>
 
 #include <hpp_proto/field_types.hpp>
+#include "luxir/api/luxir_types.hpp"
 
 namespace luxir::api {
+
+struct PhysicalFieldSignature {
+  std::string_view name;
+  std::string_view logical_name;
+  std::string_view label;
+  map_view<std::string_view, std::string_view> properties;
+};
+
+struct SchemaInfo {
+  ::hpp_proto::bytes_view source_def;
+  map_view<std::string_view, uint64_t> introduced_gen;
+};
 
 struct AuxIndexInfo {
   std::string_view kind;
@@ -51,10 +64,12 @@ struct IndexInfo {
   uint64_t schema_gen = 0;
   std::span<const SegmentInfo> segments;
   std::span<const AuxIndexInfo> aux_indexes;
+  std::span<const PhysicalFieldSignature> field_signatures;
 };
 
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
+LUXIR_TD(PhysicalFieldSignature) LUXIR_TD(SchemaInfo)
 #undef LUXIR_TD
 
 #define LUXIR_ENTRY(M)                                                                  \
@@ -66,6 +81,7 @@ LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,         \
                   std::string *error = nullptr);
 LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
+LUXIR_ENTRY(PhysicalFieldSignature) LUXIR_ENTRY(SchemaInfo)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

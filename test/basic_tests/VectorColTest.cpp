@@ -578,11 +578,11 @@ TEST_F(VectorColTest, dimsInferredFromFirstValue) {
 // Strict dims: when the FieldType declares dims=N, mismatched values are rejected
 // even on the first index call (no inference window).
 TEST_F(VectorColTest, strictDimsRejectsMismatch) {
-  TestIndex testIndex;
-  auto& inverter = testIndex.getInverter();
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/4);
-  inverter.schema = std::make_shared<Schema>();
-  inverter.schema->fieldTypeMap["strict_v"] = strictType;
+  schema->fieldTypeMap["strict_v"] = strictType;
+  Inverter inverter(dir, 1, schema);
   auto& vh = inverter.getIndexHandler("strict_v");
 
   std::pmr::monotonic_buffer_resource mr;
@@ -810,13 +810,13 @@ TEST_F(VectorColTest, cosineSkipsZeroVector) {
 }
 
 TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
-  TestIndex testIndex;
-  auto& inverter = testIndex.getInverter();
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
   auto cosineType = std::make_shared<VectorFieldType>(
       "cos_v", /*dims=*/2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
       VectorFieldType::METRIC_COSINE, /*normalized=*/true);
-  inverter.schema = std::make_shared<Schema>();
-  inverter.schema->fieldTypeMap["cos_v"] = cosineType;
+  schema->fieldTypeMap["cos_v"] = cosineType;
+  Inverter inverter(dir, 1, schema);
   auto& vh = inverter.getIndexHandler("cos_v");
 
   std::pmr::monotonic_buffer_resource mr;
@@ -826,11 +826,11 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
 }
 
 TEST_F(VectorColTest, rejectsDoubleValuesOutsideFiniteFloat32Range) {
-  TestIndex testIndex;
-  auto& inverter = testIndex.getInverter();
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/1);
-  inverter.schema = std::make_shared<Schema>();
-  inverter.schema->fieldTypeMap["strict_v"] = strictType;
+  schema->fieldTypeMap["strict_v"] = strictType;
+  Inverter inverter(dir, 1, schema);
   auto& vh = inverter.getIndexHandler("strict_v");
   std::pmr::monotonic_buffer_resource mr;
 

@@ -96,6 +96,7 @@ public:
   /// Filled in by the IndexWriter when the message is received.  Do not change.
   /// A message rejected at the graph entry (closed writer) keeps these defaults.
   uint64_t updateVersion = 0;         // Durable version used for document and delete ordering
+  std::shared_ptr<Schema> schema;     // Pinned at writer admission, before assigning sequence numbers
   uint64_t updateOrdinal = 0;         // Session-local, 0-based update sequencer tag
   uint64_t commitNum = 0;             // The 0-based commit number of this update, used to ensure commits are finished in order
   std::unique_ptr<CommitInfo> commitInfo;  // Commit info for this update, if any.  This is set by the IndexWriter when the commit is processed.

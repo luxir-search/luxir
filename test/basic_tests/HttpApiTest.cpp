@@ -2721,6 +2721,46 @@ TEST_F(HttpApiTest, schemaSetGetRoundTrip) {
   EXPECT_EQ(get.body(), replaceBack.body());
 }
 
+TEST_F(HttpApiTest, schemaBodiesRetainVariantDefaultsAcrossAsyncDispatch) {
+  // Both collection creation and schema POST enqueue a non-owning SchemaDef.
+  // Its optional string views must survive destruction of the Beast request.
+  const std::string schema = R"({"fields":{"author":{
+    "type":"string","stored":true,"stored_resource":"_stored_http_schema_",
+    "variants":{"words_for_search":"text",
+                "folded_for_value":{"type":"string","normalizer":["nfkc_cf"]}},
+    "defaults":{"search":"words_for_search","value":"folded_for_value"}
+  }}})";
+  auto created = httpRequest(port(), http::verb::post, "/collections/_create",
+      R"({"name":"http_schema_body","schema":)" + schema + "}");
+  ASSERT_EQ(200, created.result_int()) << created.body();
+  for (bool post : {false, true}) {
+    if (post) {
+      auto set = httpRequest(port(), http::verb::post, "/collections/http_schema_body/_schema", schema);
+      ASSERT_EQ(200, set.result_int()) << set.body();
+    }
+    auto get = httpRequest(port(), http::verb::get, "/collections/http_schema_body/_schema");
+    ASSERT_EQ(200, get.result_int()) << get.body();
+    glz::generic_i64 json;
+    ASSERT_FALSE(glz::read_json(json, get.body()));
+    auto& author = json["fields"]["author"];
+    EXPECT_EQ("words_for_search", author["defaults"]["search"].get<std::string>());
+    EXPECT_EQ("folded_for_value", author["defaults"]["value"].get<std::string>());
+    EXPECT_EQ("_stored_http_schema_", author["stored_resource"].get<std::string>());
+    EXPECT_EQ("text", author["variants"]["words_for_search"]["type"].get<std::string>());
+    EXPECT_EQ("string", author["variants"]["folded_for_value"]["type"].get<std::string>());
+  }
+  auto update = httpRequest(port(), http::verb::post, "/collections/http_schema_body/_update",
+      R"({"docs":[{"id":"a","author":"Le Guin"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto query = httpRequest(port(), http::verb::post,
+      "/collections/http_schema_body/_search?fields=id",
+      R"({"max_parallel":1,"query":"author:Guin AND author:=\"LE GUIN\""})");
+  ASSERT_EQ(200, query.result_int()) << query.body();
+  EXPECT_NE(std::string::npos, query.body().find(R"("id":"a")")) << query.body();
+  auto deleted = httpRequest(port(), http::verb::post, "/collections/_delete", R"({"name":"http_schema_body"})");
+  EXPECT_EQ(200, deleted.result_int()) << deleted.body();
+}
+
 TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
   auto seed = httpRequest(port(), http::verb::post, "/collections/main/_schema",
                           R"({"fields": {"title": {"type": "text"}}})");

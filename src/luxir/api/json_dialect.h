@@ -200,13 +200,15 @@ struct from<JSON, luxir::api::Match> {
           } else if (key == "min_match") {
             util::from_json<O>(value.min_match, ctx, vit, vend);
           } else {
-            // Sugar: one unknown key acts as field+val (the key is already arena-backed).
+            // Sugar: one unknown key acts as field+val. Transfer its arena
+            // storage so the next option key cannot overwrite the field name.
             if (sawSugar || sawField || sawVal) {
               ctx.error = error_code::unknown_key;
               return true;
             }
             sawSugar = true;
             value.field = key;
+            keyTarget.clear();
             from<JSON, ::hpp_proto::optional_indirect_view<api::Val>>::template op<O>(value.val, ctx,
                                                                                       vit, vend);
           }

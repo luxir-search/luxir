@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <optional>
 #include <string>
@@ -108,11 +109,16 @@ inline std::string format_as(const SegInfo& seg) {
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
 class IndexWriter {
-  // Set once, never cleared. Read in the graph (startUpdateBody), so close()'s
-  // drain is what orders it - no mutual exclusion needed.  See close().
+  // Set once under indexMutex, never cleared. Atomic for advisory readers.
   std::atomic<bool> closed = false;
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
+  // Protected by indexMutex, shared with schema publication and admission.
+  FieldSignatures fieldSignatures;
+  std::map<uint64_t, std::shared_ptr<Schema>> admittedSchemas;
+  std::condition_variable schemaCondition;
+  bool schemaPublishing = false;
+  std::optional<uint64_t> oldestCommittedSchemaGen;
 
 public:
 
@@ -604,7 +610,14 @@ public:
 
 
   // Obtains an inverter for writing documents and sets it's updateVersion.
-  Inverter& obtainInverter(uint64_t updateVersion = 0);
+  // Messages supply their admission pin. Direct clients omit it and pin the
+  // current schema at acquisition under the same publication mutex.
+  Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
+
+  // Validation and the durable schema publication callback run under the same
+  // mutex as admission. The callback must install the schema before returning.
+  void publishSchema(Schema& candidate, const Schema* previous, const std::function<void()>& publish);
+  std::string resolvedSchema();
 
   // Releases an inverter back to the pool.
   void releaseInverter(Inverter& inverter, bool flush=false);
@@ -617,6 +630,7 @@ public:
   void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
 
 private:
+  void awaitSchemaAdmission(std::unique_lock<std::mutex>& lock);
   void requestPressureCheck() noexcept;
   void pressureCheckBody();
   void pressureShedIdleLocked();
@@ -648,6 +662,14 @@ private:
     // rejected message to leave stranded anyway.
     if (closed.load(std::memory_order_relaxed)) {
       throw IndexWriterClosedError("index writer is closed");
+    }
+    {
+      std::unique_lock<std::mutex> lock(indexMutex);
+      awaitSchemaAdmission(lock);
+      msg.schema = schemaProvider_();
+      // Allocate before consuming a sequencer number. This is the admission
+      // linearization point, ordered with Collection's durable publication.
+      admittedSchemas.emplace(updateNumber.load(std::memory_order_relaxed) + 1, msg.schema);
     }
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -688,6 +710,9 @@ private:
       msg.result.setException(e);
       // message should continue flowing to finishUpdateBody so the sequencers stay happy.
     }
+    std::lock_guard<std::mutex> lock(indexMutex);
+    admittedSchemas.erase(msg.updateVersion);
+    if (schemaPublishing) schemaCondition.notify_all();
   }
 
   void finishUpdateBody(UpdateMessage& msg) {

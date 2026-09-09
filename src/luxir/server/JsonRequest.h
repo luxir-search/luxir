@@ -10,7 +10,9 @@
 namespace luxir {
 
 // Parse an HTTP query body into NON-OWNING `out`, whose message data is allocated
-// from `arena` (which must outlive `out`).  The body is the Luxir JSON dialect
+// from `arena` (which must outlive `out`). SearchRequest's JSON readers copy
+// strings into that arena, so the body need not survive parsing. The body is
+// the Luxir JSON dialect
 // (snake_case keys, untagged Val, Match sugar - see src/luxir/api/json_dialect.h)
 // in one of two forms:
 //
@@ -31,6 +33,7 @@ void parseQueryRequest(std::string_view body, luxir::api::SearchRequest& out,
 // Apply a root-field JSON overlay to an already parsed request. The unified
 // SearchRequest reader reuses an existing top_docs op named q for shorthand
 // TopDocs fields and otherwise preserves request-level fields not present here.
+// Overlay strings are copied into arena, just like the original body.
 void overlayQueryRequest(std::string_view overlay, luxir::api::SearchRequest& out,
                          std::pmr::memory_resource& arena);
 

@@ -56,7 +56,7 @@ std::shared_ptr<Schema> Collection::updateSchema(const luxir::api::SchemaDef& de
   // persist -> swap.  Without the lock, two concurrent SETs could each build
   // from the same base and the second swap would silently drop the first's
   // fields (and their persistence passes would delete each other's files).
-  std::lock_guard<std::mutex> lock(schemaMutex_);
+  std::lock_guard lock(schemaMutex_);
   std::shared_ptr<Schema> newSchema;
   if (mode == luxir::api::SchemaRequest_::Mode::SET) {
     auto current = getSchema();
@@ -69,11 +69,22 @@ std::shared_ptr<Schema> Collection::updateSchema(const luxir::api::SchemaDef& de
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
-  std::lock_guard<std::mutex> lock(schemaMutex_);
+  std::lock_guard lock(schemaMutex_);
   setSchemaLocked(std::move(newSchema));
 }
 
 void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
+  newSchema->gen_ = schemaGen_.load();
+  auto previous = getSchema();
+  if (shard && shard->iw) {
+    shard->iw->publishSchema(*newSchema, previous.get(), [&] { persistSchemaLocked(newSchema); });
+  } else {
+    newSchema->inheritIntroductions(previous.get(), {});
+    persistSchemaLocked(newSchema);
+  }
+}
+
+void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
   uint64_t gen = schemaGen_++;
   newSchema->gen_ = gen;
 
@@ -83,12 +94,13 @@ void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
   // regardless of anything after the sync.  A failure BEFORE the sync removes
   // the staged file so a partial write can never be selected at startup.
   if (shard && shard->dir && !newSchema->sourceDef_.empty()) {
+    std::string stored = newSchema->encodeStored();
     std::string fileName = schemaFileName(gen);
     try {
       auto file = shard->dir->createFile(fileName);
       OutputStream out;
       out.setFile(&*file);
-      out.write(newSchema->sourceDef_.data(), newSchema->sourceDef_.size());
+      out.write(stored.data(), stored.size());
       out.close();
       shard->dir->finishFile(*file);
 
@@ -103,6 +115,8 @@ void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
       throw;
     }
 
+    // indexMutex excludes admission from pre-durable validation through this
+    // atomic store. An admission after successful publication sees this schema.
     schema.store(std::move(newSchema));
 
     // Best-effort cleanup of older generations: the new schema is already
@@ -143,19 +157,18 @@ bool Collection::loadSchema() {
     auto file = shard->dir->openFile(lastSchemaFile, true);
     if (file) {
       InputStream is = file->getInputStream();
-      std::pmr::monotonic_buffer_resource schemaArena;  // backs the non-owning SchemaDef
-      luxir::api::SchemaDef def;
       std::span<const char> bytes((const char*)is.ptr(), is.left());
-      auto padded = luxir::api::copyToPaddedInput(std::as_bytes(bytes), schemaArena);
-      if (!luxir::api::decode(def, padded, schemaArena)) {
-        throw std::runtime_error("Failed to parse schema file: " + lastSchemaFile);
+      std::shared_ptr<Schema> newSchema;
+      try {
+        newSchema = Schema::decodeStored(std::as_bytes(bytes));
+      } catch (const std::runtime_error& e) {
+        throw std::runtime_error("Failed to parse schema file: " + lastSchemaFile + ": " + e.what());
       }
 
       // Parse the gen back from the sortable filename suffix
       auto genStr = std::string_view(lastSchemaFile).substr(SCHEMA_PREFIX.size());
       uint64_t gen = Postings::parseSortableString(genStr);
 
-      auto newSchema = Schema::fromProto(def);
       newSchema->gen_ = gen;
       schemaGen_ = gen + 1;  // next setSchema will use gen+1
       schema.store(std::move(newSchema));

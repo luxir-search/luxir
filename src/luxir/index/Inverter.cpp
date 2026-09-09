@@ -54,21 +54,7 @@ void Inverter::clearUndoLog() {
 
 
 Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
-  bool justAcquiredSchema = !schema;
-  if (justAcquiredSchema) schema = schemaProvider();
-  auto resolved = [&] {
-    try {
-      return schema->resolveInput(name);
-    } catch (const RequestError& e) {
-      // Keep the existing refresh-on-unknown behavior until schema pinning.
-      if (justAcquiredSchema || e.code != "unknown_field") throw;
-      auto previous = schema;
-      schema = schemaProvider();
-      if (schema == previous) throw;
-      return schema->resolveInput(name);
-    }
-  }();
-  // Retain the descriptors, not the owner's pointer, across schema refreshes.
+  auto resolved = schema->resolveInput(name);
   auto fieldType = resolved.owner ? resolved.owner->primary : schema->getFieldTypeEx(resolved.physicalName);
   StoredFieldsWriter* writer = nullptr;
   if (fieldType->isStored()

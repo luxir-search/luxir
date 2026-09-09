@@ -232,10 +232,11 @@ TEST(JsonDialect, MatchSugar) {
   EXPECT_EQ(std::get<std::string_view>(m.val->kind), "dune");
 
   m = {};
-  ASSERT_TRUE(P::read_json(m, R"({"price_i":42,"operator":"and"})", mr));
-  EXPECT_EQ(m.field, "price_i");
+  ASSERT_TRUE(P::read_json(m, R"({"long_price_field_i":42,"operator":"and","min_match":1})", mr));
+  EXPECT_EQ(m.field, "long_price_field_i");
   EXPECT_EQ(std::get<std::int64_t>(m.val->kind), 42);
   EXPECT_EQ(m.operator_, P::Match::Operator::AND);
+  EXPECT_EQ(m.min_match, 1);
 
   // two unknown keys / sugar mixed with explicit field or val are rejected
   EXPECT_FALSE(P::read_json(m, R"({"a":"x","b":"y"})", mr));

@@ -41,8 +41,6 @@ private:
   std::vector<int> deleted; // use a docstream for this?
   std::exception_ptr failure_;
 
-  std::function<std::shared_ptr<Schema>()> schemaProvider;
-
 public:
   MemPool pool;
 
@@ -60,7 +58,7 @@ public:
   // For now, we'll directly contain it, but in the future we may want to pass it in.
   PostingsWriter postingsWriter;
 
-  std::shared_ptr<Schema> schema;
+  const std::shared_ptr<Schema> schema;
 
   // Fixed by ProtoUpdateMessage for the duration of one update so every NOW
   // in every document/value resolves identically. Direct test indexing leaves
@@ -104,16 +102,11 @@ public:
   Inverter(luxir::Directory& dir, uint64_t segId,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
            IndexRamBudget* ramBudget = nullptr)
-      : postingsWriter(dir, segId, -1, ramBudget, true) {
-    if (schemaProvider) {
-      this->schemaProvider = schemaProvider;
-    } else {
-      // fallback for tests that create Inverters directly
-      this->schemaProvider = []() {
-        return Schema::createDefaultSchema();
-      };
-    }
-  }
+      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(), ramBudget) {}
+
+  Inverter(luxir::Directory& dir, uint64_t segId, std::shared_ptr<Schema> schema,
+           IndexRamBudget* ramBudget = nullptr)
+      : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)) {}
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 

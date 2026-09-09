@@ -425,7 +425,6 @@ TEST_F(PhraseSlopTest, rawBoundsCoverScoresAndPulsedFallsBack) {
 TEST_F(PhraseSlopTest, multiValueGapCrossesAtOneHundred) {
   TestIndex index;
   index.initWriter();
-  index.inverter->schema = Schema::createDefaultSchema();
   index.inverter->schema->fieldTypeMap["body_mv"] = std::make_shared<TextFieldType>(
       "body_mv", FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::MULTI_VALUED);
   TestField field(index, "body_mv");

@@ -11,6 +11,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/util/StrRef.h"
 #include "FieldType.h"
+#include "FieldSignature.h"
 
 namespace luxir {
 
@@ -62,6 +63,9 @@ public:
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
+  // Concrete and template physical identities, plus materialized dynamic names
+  // whose introduction differs from the current template's introduction.
+  std::map<std::string, uint64_t, std::less<>> introducedGen;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::unique_ptr<LogicalField>,
@@ -84,6 +88,13 @@ public:
   ResolvedFieldHandle resolveFor(std::string_view name, OpClass op) const;
   // Already-resolved physical access: no defaults or __self aliases.
   FieldType* physical(std::string_view name) const;
+
+  FieldSignatures signatures(bool includeTemplates = false) const;
+  void addRootSignatures(std::string_view root, FieldSignatures& out) const;
+  void inheritIntroductions(const Schema* previous, const FieldSignatures& materialized);
+  uint64_t introduction(std::string_view physicalName) const;
+  std::string encodeStored() const;
+  static std::shared_ptr<Schema> decodeStored(std::span<const std::byte> bytes);
 
   // Physical lookup includes suffix-template prototypes, never bindings or
   // __self aliases. Copy a shared_ptr before the Schema's lifetime ends.

@@ -192,7 +192,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     return;
   }
 
-  Inverter& inverter = iw.obtainInverter(this->updateVersion);
+  Inverter& inverter = iw.obtainInverter(this->updateVersion, this->schema);
   inverter.overwrite = !req->allow_dups;
   inverter.coerceContext.dateMathNowEpochMillis = dateMathNowEpochMillis;
 

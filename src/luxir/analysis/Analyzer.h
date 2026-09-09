@@ -353,6 +353,8 @@ public:
 // TODO: index vs query time analyzers (getIndexingChain/getQueryingChain?)
 class Analyzer {
 public:
+  // Canonical effective component names and parameters, before execution fusion.
+  const std::string canonical;
   // Read-only by construction: only compile() creates a plan, so the derived
   // state below is always consistent with the components.
   const std::unique_ptr<const TokenizerFactory> tokenizer;
@@ -372,7 +374,7 @@ public:
 
 private:
   Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-           std::vector<std::unique_ptr<const TokenFilterFactory>> fs);
+           std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical);
 };
 
 
