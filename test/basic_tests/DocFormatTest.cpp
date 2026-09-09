@@ -513,12 +513,42 @@ TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachExactAndSourceForms) {
     ASSERT_FALSE(req->ok());
     EXPECT_NE(std::string::npos, req->errorMsg().find("exact selector"));
   }
-  for (const char* field : {"author__words", "author_hidden", "author_hidden__self"}) {
+  auto stored = project({"author__words"});
+  ASSERT_FALSE(stored->ok());
+  EXPECT_EQ("Field 'author__words' has no retrievable value; retrieve logical root 'author' instead",
+            stored->errorMsg());
+  for (const char* field : {"author_hidden", "author_hidden__self", "author_hidden__words"}) {
     auto req = project({field});
     ASSERT_FALSE(req->ok());
-    EXPECT_NE(std::string::npos, req->errorMsg().find("logical root"));
-    EXPECT_NE(std::string::npos, req->errorMsg().find("source text"));
+    EXPECT_NE(std::string::npos, req->errorMsg().find("logical root 'author_hidden' must enable stored"));
   }
+  SchemaBuilder b;
+  auto& genre = b.field("genre");
+  genre.type = api::FieldDef::FieldClass::STRING;
+  b.variant(genre, "t").type = api::FieldDef::FieldClass::TEXT;
+  auto& number = b.field("number");
+  number.type = api::FieldDef::FieldClass::INT;
+  b.variant(number, "t").type = api::FieldDef::FieldClass::TEXT;
+  auto& unavailable = b.field("unavailable");
+  unavailable.type = api::FieldDef::FieldClass::INT;
+  unavailable.column = false;
+  unavailable.stored = true;  // ignored for numeric primaries
+  b.variant(unavailable, "t").type = api::FieldDef::FieldClass::TEXT;
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "c", "genre", "Science Fiction", "number", 42),
+                           UpdateMessage::COMMIT).success);
+  auto roots = project({"genre", "number"});
+  ASSERT_OK(roots);
+  EXPECT_CONTAINS_DOC(roots->getDocs(), flatdoc("genre", "Science Fiction", "number", (int64_t)42));
+  for (const char* root : {"genre", "number"}) {
+    auto req = project({std::string(root) + "__t"});
+    ASSERT_FALSE(req->ok());
+    EXPECT_EQ(std::format("Field '{}__t' has no retrievable value; retrieve logical root '{}' instead", root, root),
+              req->errorMsg());
+  }
+  auto noSource = project({"unavailable__t"});
+  ASSERT_FALSE(noSource->ok());
+  EXPECT_EQ("Field 'unavailable__t' has no retrievable value", noSource->errorMsg());
   auto unknown = project({"author__missing"});
   ASSERT_FALSE(unknown->ok());
   EXPECT_NE(std::string::npos, unknown->errorMsg().find("Unknown variant label"));

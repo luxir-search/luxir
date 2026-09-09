@@ -298,6 +298,15 @@ private:
     return poolCopy(norm);
   }
 
+  static void checkExactLength(const ResolvedFieldHandle& target, std::string_view text) {
+    if (text.size() > PackedTerm::MAX_LEN) {
+      throw std::runtime_error(std::format(
+          "Field '{}': exact value is {} bytes after normalization; maximum is {}. "
+          "Use match/phrase for analyzed text or a shorter whole-value string variant",
+          target.physicalName, text.size(), PackedTerm::MAX_LEN));
+    }
+  }
+
   // Collapse a term list into the right query type:
   //   0 terms -> match nothing (a phrase with no terms cannot match, and
   //              PhraseQuery itself requires >= 2 terms)
@@ -447,15 +456,20 @@ public:
         if (fieldType.type() == FieldType::Type::TEXT) {
           normalizer->head.setValue(term);
           normalizer->reset();
-          if (normalizer->tail->incrementToken() && normalizer->tail->incrementToken()) {
+          if (!normalizer->tail->incrementToken()) continue;
+          // Token bytes are borrowed only until the next pull, including EOF.
+          term = poolCopy(normalizer->head.getToken().text);
+          if (normalizer->tail->incrementToken()) {
             throw std::runtime_error(std::format(
                 "Field '{}': any_of / := requires a single term per exact TEXT value. "
                 "Use match (field:value), phrase (field:\"words\"), or a whole-value string variant",
                 field));
           }
+          checkExactLength(target, term);
+        } else {
+          term = normalizeLiteral(target, term, true);
+          if (term.data() == buf) term = poolCopy(term);
         }
-        term = normalizeLiteral(target, term, true);
-        if (term.data() == buf) term = poolCopy(term);
         terms.push_back(term);
       }
     });
@@ -532,12 +546,7 @@ public:
     // ID indexing, overwrite, and delete-by-ID share this term-space policy.
     if (target.fieldType->type() == FieldType::ID) return PackedTerm::truncate(text);
     if (auto* chain = fields.chain(target)) text = normalizeMultiterm(*chain, text);
-    if (exact && text.size() > PackedTerm::MAX_LEN) {
-      throw std::runtime_error(std::format(
-          "Field '{}': exact value is {} bytes after normalization; maximum is {}. "
-          "Use match/phrase for analyzed text or a shorter whole-value string variant",
-          target.physicalName, text.size(), PackedTerm::MAX_LEN));
-    }
+    if (exact) checkExactLength(target, text);
     return text;
   }
 

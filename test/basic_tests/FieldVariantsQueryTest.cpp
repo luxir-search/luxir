@@ -193,6 +193,25 @@ TEST_F(FieldVariantsQueryTest, exactSyntaxAndTeachingErrors) {
   EXPECT_NE(std::string::npos, structured->errorMsg().find("single term"));
 }
 
+TEST_F(FieldVariantsQueryTest, textExactMembershipUsesAnalyzedTerm) {
+  auto expected = hits(R"({"match":{"author__self":"Guin!"}})");
+  ASSERT_EQ((std::vector<std::string>{"a", "c"}), expected);
+  EXPECT_EQ(expected, hits(R"({"any_of":{"field":"author__self","values":["Guin!"]}})"));
+  EXPECT_EQ(expected, expr("author__self:=\"Guin!\""));
+  EXPECT_EQ(expected, expr("author__self:=(\"!!!\", \"GUIN!\", \"Guin\")"));
+  for (const char* value : {"", "!!!"}) {
+    EXPECT_TRUE(hits(std::format(R"({{"any_of":{{"field":"author__self","values":["{}"]}}}})", value)).empty());
+    EXPECT_TRUE(expr(std::format("author__self:=\"{}\"", value)).empty());
+  }
+  auto selected = run(R"({"query":{"all":true},"fields":["id"],"ops":{
+    "words":{"field_facet":{"field":"author__self","limit":0,"selected":["Guin!"]}}
+  }})");
+  EXPECT_EQ(expected, ids(*selected));
+  ASSERT_OK(selected);
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{{"guin", 2}}),
+      buckets(*selected->docList()->ops.at("words")->facetResult()));
+}
+
 TEST_F(FieldVariantsQueryTest, normalizerAppliesToLiteralsAndPatterns) {
   for (auto query : {
       R"({"match":{"author__s":"LE CARR\u00c9"}})",

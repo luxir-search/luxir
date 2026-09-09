@@ -1119,9 +1119,16 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
     if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
-      throw RequestError("Field '" + std::string(f) + "' has no retrievable value; retrieve logical root '" +
-                         source.logicalName + "' for source text (its primary must enable stored)",
-                         "invalid_field");
+      auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
+      std::string message = "Field '" + std::string(f) + "' has no retrievable value";
+      bool storedSource = primary->isStored() && (primary->type() == FieldType::TEXT ||
+          primary->type() == FieldType::STRING || primary->type() == FieldType::ID);
+      if (storedSource || primary->hasColumn()) {
+        message += "; retrieve logical root '" + source.logicalName + "' instead";
+      } else if (primary->type() == FieldType::TEXT) {
+        message += "; logical root '" + source.logicalName + "' must enable stored for source text";
+      }
+      throw RequestError(message, "invalid_field");
     }
     picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, false});
   };
