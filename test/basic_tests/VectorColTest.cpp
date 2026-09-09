@@ -75,7 +75,7 @@ static luxir::api::Val makeVals(std::pmr::memory_resource& mr,
   return val;
 }
 
-static void indexVal(Inverter& inverter, Inverter::IndexHandler& handler, const luxir::api::Val& val) {
+static void indexVal(Inverter& inverter, Inverter::InputHandler& handler, const luxir::api::Val& val) {
   handler.index(inverter, val);
 }
 
@@ -90,7 +90,7 @@ static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite = tru
 }
 
 // Index a multi-valued vector value (arr_vec) for the given doc.
-static void indexMultiVec(Inverter& inverter, Inverter::IndexHandler& handler,
+static void indexMultiVec(Inverter& inverter, Inverter::InputHandler& handler,
                           int32_t docid, std::vector<std::vector<float>> vecs) {
   std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(docid);
@@ -427,7 +427,7 @@ TEST_F(VectorColTest, coercedValidationPrecedesStreamingWrite) {
   TestIndex testIndex;
   auto& inverter = testIndex.getInverter();
   auto& handler = inverter.getIndexHandler("emb_vs");
-  auto* vectorHandler = dynamic_cast<handler::VectorHandler*>(&handler);
+  auto* vectorHandler = dynamic_cast<handler::VectorHandler*>(inverter.indexHandlers.at("emb_vs").get());
   ASSERT_NE(nullptr, vectorHandler);
   std::pmr::monotonic_buffer_resource mr;
 
@@ -570,19 +570,20 @@ TEST_F(VectorColTest, dimsInferredFromFirstValue) {
   auto v1 = makeVec(mr, {7, 8, 9, 10, 11});  // wrong dims
   EXPECT_THROW(indexVal(inverter, handler, v1), std::runtime_error);
 
-  auto* vh = dynamic_cast<handler::VectorHandler*>(&handler);
+  auto* vh = dynamic_cast<handler::VectorHandler*>(inverter.indexHandlers.at("vec_v").get());
   ASSERT_NE(nullptr, vh);
   EXPECT_EQ(6, vh->dims());
 }
 
 // Strict dims: when the FieldType declares dims=N, mismatched values are rejected
-// even on the first index call (no inference window).  We construct the handler
-// directly with a strict VectorFieldType to avoid plumbing a custom schema.
+// even on the first index call (no inference window).
 TEST_F(VectorColTest, strictDimsRejectsMismatch) {
   TestIndex testIndex;
   auto& inverter = testIndex.getInverter();
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/4);
-  handler::VectorHandler vh(inverter, "strict_v", strictType);
+  inverter.schema = std::make_shared<Schema>();
+  inverter.schema->fieldTypeMap["strict_v"] = strictType;
+  auto& vh = inverter.getIndexHandler("strict_v");
 
   std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(0);
@@ -814,7 +815,9 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
   auto cosineType = std::make_shared<VectorFieldType>(
       "cos_v", /*dims=*/2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
       VectorFieldType::METRIC_COSINE, /*normalized=*/true);
-  handler::VectorHandler vh(inverter, "cos_v", cosineType);
+  inverter.schema = std::make_shared<Schema>();
+  inverter.schema->fieldTypeMap["cos_v"] = cosineType;
+  auto& vh = inverter.getIndexHandler("cos_v");
 
   std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(0);
@@ -826,7 +829,9 @@ TEST_F(VectorColTest, rejectsDoubleValuesOutsideFiniteFloat32Range) {
   TestIndex testIndex;
   auto& inverter = testIndex.getInverter();
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/1);
-  handler::VectorHandler vh(inverter, "strict_v", strictType);
+  inverter.schema = std::make_shared<Schema>();
+  inverter.schema->fieldTypeMap["strict_v"] = strictType;
+  auto& vh = inverter.getIndexHandler("strict_v");
   std::pmr::monotonic_buffer_resource mr;
 
   EXPECT_THROW(indexVal(inverter, vh,

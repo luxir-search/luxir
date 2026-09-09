@@ -30,7 +30,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
   for (auto _ : state) {
     dir = RAMDir(); // clear dir
     Inverter inverter(dir, 0);
-    Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
+    Inverter::InputHandler& fieldHandler = inverter.getIndexHandler(field);
 
     for (int i=0; i<iter;i++) {
       inverter.startDoc();

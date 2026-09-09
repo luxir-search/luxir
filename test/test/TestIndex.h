@@ -185,7 +185,7 @@ namespace luxir::test {
       return *inverter;
     }
 
-    Inverter::IndexHandler& getIndexHandler(std::string_view name) {
+    Inverter::InputHandler& getIndexHandler(std::string_view name) {
       return getInverter().getIndexHandler(name);
     }
 
@@ -206,7 +206,7 @@ namespace luxir::test {
     TestIndex& testIndex;
     std::string name;
     Inverter* inverter = nullptr;
-    Inverter::IndexHandler* indexHandler = nullptr;
+    Inverter::InputHandler* indexHandler = nullptr;
 
     // segment-level reading
     int currSeg = -1;

@@ -48,6 +48,24 @@ public:
   api::FieldDef& field(std::string_view name) { return add(fields_, name); }
   api::FieldDef& templ(std::string_view name) { return add(templates_, name); }
 
+  api::FieldDef& variant(api::FieldDef& field, std::string_view label) {
+    auto* def = api::build::allocMessage<api::FieldDef>(arena_);
+    if (!field.variants) field.variants.emplace();
+    auto previous = field.variants->entries;
+    auto* entries = api::build::allocArray(field.variants->entries, previous.size() + 1, arena_);
+    if (!previous.empty()) std::copy(previous.begin(), previous.end(), entries);
+    entries[previous.size()] = {api::build::arenaStr(arena_, label), def};
+    return *def;
+  }
+
+  api::FieldDef& normalizer(api::FieldDef& field, std::initializer_list<std::string_view> filters) {
+    auto& def = field.normalizer.emplace();
+    auto* out = api::build::allocArray(def.filters, filters.size(), arena_);
+    size_t i = 0;
+    for (auto filter : filters) out[i++].name = api::build::arenaStr(arena_, filter);
+    return field;
+  }
+
   // Convenience: set an analyzer of parameterless components on a (text)
   // field def.  nullopt leaves the tokenizer component absent.
   api::FieldDef& analyzer(api::FieldDef& f, std::optional<std::string_view> tokenizer,

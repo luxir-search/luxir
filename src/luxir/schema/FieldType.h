@@ -103,6 +103,9 @@ public:
   bool isAbstract() { return (bool) (flags_ & ABSTRACT); }
   bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
+  // Segment flags describe physical structures; schema roles stay in the schema.
+  flag_type segmentFlags() const { return flags_ & ~(ABSTRACT | DERIVED); }
+
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
 

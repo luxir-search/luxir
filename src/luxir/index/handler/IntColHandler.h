@@ -157,7 +157,7 @@ public:
     // TODO: move this to postingsWriter method
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+    fieldInfo.flags = fieldType->segmentFlags();
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -322,7 +322,7 @@ public:
     // TODO: move this to postingsWriter method
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+    fieldInfo.flags = fieldType->segmentFlags();
     flushIntCol(inverter, fieldInfo);
   }
 

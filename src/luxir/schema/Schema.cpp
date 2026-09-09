@@ -680,7 +680,6 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     logical->primary = compiler.create(e.name, r, owned);
     logical->multi = logical->primary->multiValued();
     logical->shape = shapeFamily(r.type);
-    logical->storageOwner = logical->primary.get();
     if (owned.variants) {
       boost::unordered_flat_set<std::string> labels;
       for (const auto& [label, view] : owned.variants->entries) {

@@ -929,11 +929,11 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
 
   CollectionHelper helper;
 
-  // Variable-size: every value has a different length (1..N).
+  // Variable-size: lengths vary within the STRING byte limit.
   std::vector<std::string> varValues;
   varValues.reserve(N);
   for (int i = 0; i < N; i++) {
-    varValues.emplace_back((size_t)(i + 1), (char)('a' + (i % 26)));
+    varValues.emplace_back((size_t)(i % 255 + 1), (char)('a' + (i % 26)));
   }
 
   // Fixed-size: all values same size, different content.

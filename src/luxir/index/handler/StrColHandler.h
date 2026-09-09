@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/util/ApiError.h"
+#include "StringValue.h"
 
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
@@ -27,6 +28,7 @@ namespace luxir::handler {
 ///   - endValueRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
 class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
+  StringValue stringValue;
 
 protected:
   enum class ValueStorage {
@@ -60,6 +62,7 @@ protected:
   StrColHandler(Inverter& inverter, const std::string_view& fieldName,
                 const std::shared_ptr<FieldType>& fieldType, ValueStorage valueStorage)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
+      stringValue(*fieldType),
       docsWithVal(inverter.pool),
       valSizeStream(inverter.pool),
       valCountStream(inverter.pool),
@@ -121,7 +124,43 @@ public:
     indexSingle(inverter, val);
   }
 
+  void index(Inverter& inverter, std::span<const std::string_view> vals) override {
+    indexMulti(inverter, vals);
+  }
+
   void indexSingle(Inverter& inverter, std::string_view term) {
+    appendSingle(inverter, stringValue.normalize(term, std::string_view(fieldName)));
+  }
+
+  void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
+    if (vals.empty()) return;
+    if (!fieldType->multiValued()) {
+      if (vals.size() > 1) {
+        throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
+                                        std::string_view(fieldName)));
+      }
+      indexSingle(inverter, vals[0]);
+      return;
+    }
+    // Validate every value before starting a column row. A later failure must
+    // not leave the row's value count or end offsets incomplete.
+    if (!stringValue.hasNormalizer()) {
+      for (auto val : vals) stringValue.normalize(val, std::string_view(fieldName));
+      appendMulti(inverter, vals);
+      return;
+    }
+    std::vector<std::string> normalized;
+    normalized.reserve(vals.size());
+    for (auto val : vals) {
+      normalized.emplace_back(stringValue.normalize(val, std::string_view(fieldName)));
+    }
+    std::vector<std::string_view> views(normalized.begin(), normalized.end());
+    appendMulti(inverter, views);
+  }
+
+protected:
+  // Raw column appends are also used by VectorHandler after vector validation.
+  void appendSingle(Inverter& inverter, std::string_view term) {
     numDocs++;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
     addValue(inverter, term);
@@ -135,7 +174,7 @@ public:
     }
   }
 
-  void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
+  void appendMulti(Inverter& inverter, std::span<const std::string_view> vals) {
     if (!(fieldType->flags_ & FieldType::MULTI_VALUED)) {
       throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                           std::string_view(fieldName)));
@@ -194,9 +233,6 @@ public:
   }
 
   void flush(Inverter& inverter) override {
-    // Inverter calls this for every handler in a pre-flush pass. Keep direct
-    // handler use safe as well if a caller invokes flush() itself.
-    finishIndexing(inverter);
     if (numDocs == 0) {
       return; // drop the field.
     }
@@ -205,7 +241,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+    fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.numValues = numValuesTotal;
 
     auto maxDoc = inverter.getMaxDoc();

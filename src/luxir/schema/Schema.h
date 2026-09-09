@@ -28,7 +28,7 @@ using PhysicalFieldMap = boost::unordered_flat_map<std::string, std::shared_ptr<
 enum class OpClass { SEARCH, VALUE, EXISTS, RETRIEVE };
 enum class FieldRole { PRIMARY, VARIANT };
 
-// One input shape and storage owner, with independently compiled physical bundles.
+// One input shape, with source storage on the primary and independent physical bundles.
 // Dynamic roots use the template's prototypes; their actual names live in handles.
 struct LogicalField {
   enum class Shape { SCALAR, VECTOR, GEO };
@@ -39,7 +39,6 @@ struct LogicalField {
   std::string value = "self";
   Shape shape = Shape::SCALAR;
   bool multi = false;
-  FieldType* storageOwner = nullptr;
   size_t maxRootLength = 127;
 };
 

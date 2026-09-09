@@ -10,7 +10,6 @@
 // include the actual index handlers
 #include "handler/IdHandler.h"
 #include "handler/StrColHandler.h"
-#include "handler/StoredFieldWrapperHandler.h"
 #include "handler/VectorHandler.h"
 #include "luxir/index/handler/IntColHandler.h"
 #include "luxir/index/handler/StrHandler.h"
@@ -54,37 +53,63 @@ void Inverter::clearUndoLog() {
 }
 
 
-Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name) {
-  // First sight of a doc-supplied field name: without this check a template
-  // suffix match would admit any string into segment metadata.
-  if (!Schema::validFieldName(name)) {
-    throw RequestError("Invalid field name: " + std::string(name), "unknown_field");
+Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
+  bool justAcquiredSchema = !schema;
+  if (justAcquiredSchema) schema = schemaProvider();
+  auto resolved = [&] {
+    try {
+      return schema->resolveInput(name);
+    } catch (const RequestError& e) {
+      // Keep the existing refresh-on-unknown behavior until schema pinning.
+      if (justAcquiredSchema || e.code != "unknown_field") throw;
+      auto previous = schema;
+      schema = schemaProvider();
+      if (schema == previous) throw;
+      return schema->resolveInput(name);
+    }
+  }();
+  // Retain the descriptors, not the owner's pointer, across schema refreshes.
+  auto fieldType = resolved.owner ? resolved.owner->primary : schema->getFieldTypeEx(resolved.physicalName);
+  StoredFieldsWriter* writer = nullptr;
+  if (fieldType->isStored()
+      && (fieldType->type() == FieldType::Type::TEXT
+          || fieldType->type() == FieldType::Type::STRING
+          || fieldType->type() == FieldType::Type::ID)) {
+    const std::string& resourceName = fieldType->storedResource_;
+    const StoredFieldType* resConfig = nullptr;
+    auto* resourceType = schema->getFieldTypePtr(resourceName);
+    if (resourceType != nullptr) {
+      resConfig = dynamic_cast<const StoredFieldType*>(resourceType);
+      if (resConfig == nullptr) {
+        throw std::runtime_error(
+            "Field '" + std::string(name) + "' has STORED set and references '"
+            + resourceName + "', but that schema entry is not a StoredFieldType");
+      }
+    }
+    // resConfig == nullptr means the resource isn't in the schema; writer
+    // will use defaults.  fromProto auto-registers "_stored_", so this only
+    // happens for custom-named resources the user forgot to register.
+    writer = &getOrCreateStoredFields(resourceName, resConfig);
   }
-  // perhaps this part should be moved to Schema?
-  auto currSchema = schema.get();
-  bool justAcquiredSchema = false;
-  if (currSchema == nullptr) {
-    schema = schemaProvider();
-    currSchema = schema.get();
-    justAcquiredSchema = true;
-  }
-  auto fieldType = currSchema->getFieldTypeOrNull(name);
-  // Don't try to refresh the schema if we just acquired it since we don't know how expensive it is.
-  if (!fieldType && !justAcquiredSchema) {
-    schema = schemaProvider();
 
-    // if the schema changed, retry the lookup
-    if (schema.get() != currSchema) {
-      currSchema = schema.get();
-      fieldType = currSchema->getFieldTypeOrNull(name);
+  auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
+  input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType)});
+  if (resolved.owner) {
+    for (const auto& [label, type] : resolved.owner->variants) {
+      input->branches.push_back({label, &createPhysicalHandler(resolved.logicalName + "__" + label, type)});
     }
   }
+  auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
+  assert(inserted);
+  return *iter->second;
+}
 
-  if (!fieldType) {
-    throw RequestError("Field not found in schema: " + std::string(name), "unknown_field");
-  }
-
-  // Create the correct IndexHandler based on the suffix.  This could be moved to FieldType::createIndexHandler()?
+Inverter::IndexHandler& Inverter::createPhysicalHandler(
+    std::string_view name, const std::shared_ptr<FieldType>& fieldType) {
+  // An earlier dispatcher construction may have stopped after this handler.
+  auto existing = indexHandlers.find(name);
+  if (existing != indexHandlers.end()) return *existing->second;
+  // Names are already resolved; dynamic FieldTypes can be template prototypes.
   u_ptr<IndexHandler> fieldHandler;
 
   switch (fieldType->type()) {
@@ -132,40 +157,110 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   }
 
 
-  // Wrap in a StoredFieldWrapperHandler if the field should also have its
-  // raw values persisted to a stored-fields resource.  Applies to TEXT,
-  // STRING, and ID fields.  STORED on numeric fields is currently ignored -
-  // their COLUMN_STORED path already keeps raw values per-doc.
-  //
-  // The target resource is FieldType::storedResource_ (default:
-  // Postings::STORED_DEFAULT_RESOURCE).  Config is looked up in the schema
-  // (a StoredFieldType), falling back to writer defaults if unregistered.
-  if (fieldType->isStored()
-      && (fieldType->type() == FieldType::Type::TEXT
-          || fieldType->type() == FieldType::Type::STRING
-          || fieldType->type() == FieldType::Type::ID)) {
-    const std::string& resourceName = fieldType->storedResource_;
-    const StoredFieldType* resConfig = nullptr;
-    auto* resourceType = currSchema->getFieldTypePtr(resourceName);
-    if (resourceType != nullptr) {
-      resConfig = dynamic_cast<const StoredFieldType*>(resourceType);
-      if (resConfig == nullptr) {
-        throw std::runtime_error(
-            "Field '" + std::string(name) + "' has STORED set and references '"
-            + resourceName + "', but that schema entry is not a StoredFieldType");
-      }
-    }
-    // resConfig == nullptr means the resource isn't in the schema; writer
-    // will use defaults.  fromProto auto-registers "_stored_", so this only
-    // happens for custom-named resources the user forgot to register.
-    auto& writer = getOrCreateStoredFields(resourceName, resConfig);
-    fieldHandler = pool.make_unique<handler::StoredFieldWrapperHandler>(
-        *this, name, fieldType, std::move(fieldHandler), &writer);
-  }
-
   auto [newIter, inserted] = indexHandlers.try_emplace(std::string(name), std::move(fieldHandler));
   assert(inserted);  // we should never (currently) be trying to overwrite an existing handler
   return *(newIter->second);
+}
+
+
+Inverter::InputHandler::InputHandler(Inverter& inverter, const ResolvedFieldHandle& resolved,
+                                     std::shared_ptr<FieldType> fieldType, StoredFieldsWriter* writer)
+    : fieldName(inverter.pool, resolved.logicalName), fieldType(std::move(fieldType)),
+      shape(resolved.owner ? resolved.owner->shape :
+            resolved.fieldType->type() == FieldType::VECTOR ? LogicalField::Shape::VECTOR :
+            resolved.fieldType->type() == FieldType::GEO_POINT ? LogicalField::Shape::GEO :
+            LogicalField::Shape::SCALAR),
+      multi(resolved.owner ? resolved.owner->multi : resolved.fieldType->multiValued()), writer(writer) {}
+
+void Inverter::InputHandler::checkShape(const IndexVal& val) const {
+  if (shape != LogicalField::Shape::SCALAR || !coerce::isArray(val)) return;
+  size_t count = 0;
+  coerce::forEachElement(val, [&](const IndexVal& elem) {
+    if (coerce::isArray(elem)) {
+      throw DocumentError(fmt::format("Field '{}': scalar fields cannot receive nested arrays",
+                                      std::string_view(fieldName)));
+    }
+    count++;
+  });
+  if (count > 1 && !multi) {
+    throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
+                                    std::string_view(fieldName)));
+  }
+}
+
+void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
+  int32_t doc = inverter.getDoc();
+  std::string_view name(fieldName);
+  if (std::holds_alternative<std::string_view>(val.kind)) {
+    writer->addValue(doc, name, std::get<std::string_view>(val.kind));
+  } else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
+    const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
+    writer->addValue(doc, name, std::string_view((const char*)b.data(), b.size()));
+  } else if (std::holds_alternative<luxir::api::ArrStr>(val.kind)) {
+    const auto& arr = std::get<luxir::api::ArrStr>(val.kind).v;
+    writer->addValues(doc, name, std::span<const std::string_view>(arr.data(), arr.size()));
+  } else if (std::holds_alternative<luxir::api::ArrBin>(val.kind)) {
+    const auto& arr = std::get<luxir::api::ArrBin>(val.kind).v;
+    std::vector<std::string_view> views;
+    views.reserve(arr.size());
+    for (const auto& bin : arr) {
+      views.push_back(std::string_view((const char*)bin.data(), bin.size()));
+    }
+    writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
+  } else if (coerce::isNull(val)) {
+    // no value: nothing stored
+  } else if (coerce::isArray(val)) {
+    // numeric / mixed arrays: store each element's canonical rendering
+    // (materialized - buf is per-element transient)
+    char buf[coerce::TEXT_BUF_SIZE];
+    std::vector<std::string> storage;
+    coerce::forEachElement(val, [&](const IndexVal& elem) {
+      storage.emplace_back(fieldType->coerceTerm(elem, name, buf));
+    });
+    std::vector<std::string_view> views(storage.begin(), storage.end());
+    writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
+  } else {
+    // Numeric / bool scalars: store canonical text before normalization.
+    char buf[coerce::TEXT_BUF_SIZE];
+    writer->addValue(doc, name, fieldType->coerceTerm(val, name, buf));
+  }
+}
+
+void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  checkShape(val);
+  // Capture the original value before any branch's analysis or normalization.
+  if (writer) store(inverter, val);
+  forEachBranch([&](IndexHandler& branch) { branch.index(inverter, val); });
+}
+
+// Scalar overloads retain the submitted kind in a non-owning IndexVal. Every
+// physical branch then applies its own coercion, including numeric-to-text.
+void Inverter::InputHandler::index(Inverter& inverter, std::string_view val) {
+  index(inverter, coerce::scalarVal(val));
+}
+
+void Inverter::InputHandler::index(Inverter& inverter, std::span<const std::string_view> vals) {
+  index(inverter, coerce::scalarVal(api::ArrStr{.v = vals}));
+}
+
+void Inverter::InputHandler::index(Inverter& inverter, int64_t val) {
+  index(inverter, coerce::scalarVal(val));
+}
+
+void Inverter::InputHandler::index(Inverter& inverter, std::span<const int64_t> vals) {
+  index(inverter, coerce::scalarVal(api::ArrInt{.v = vals}));
+}
+
+void Inverter::InputHandler::index(Inverter& inverter, double latitude, double longitude) {
+  forEachBranch([&](IndexHandler& branch) { branch.index(inverter, latitude, longitude); });
+}
+
+void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint> points) {
+  if (points.size() > 1 && !multi) {
+    throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
+                                    std::string_view(fieldName)));
+  }
+  forEachBranch([&](IndexHandler& branch) { branch.index(inverter, points); });
 }
 
 

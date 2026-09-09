@@ -59,13 +59,13 @@ public:
   const std::filesystem::path& path() const { return path_; }
 };
 
-std::shared_ptr<Schema> compoundSchema() {
+std::shared_ptr<Schema> compoundSchema(bool multiTag = false) {
   auto schema = std::make_shared<Schema>();
   schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::STORED,
       "whitespace");
   schema->fieldTypeMap["tag"] = std::make_shared<StrFieldType>(
-      "tag", FieldType::COLUMN_STORED);
+      "tag", FieldType::COLUMN_STORED | (multiTag ? FieldType::MULTI_VALUED : 0));
   schema->fieldTypeMap["score"] = std::make_shared<IntFieldType>(
       "score", FieldType::COLUMN_STORED | FieldType::INDEX_RANGE);
   return schema;
@@ -120,8 +120,32 @@ std::string wideTerm(int32_t ord) {
   return term;
 }
 
+// Large column fixtures use many legal STRING values to retain their original
+// byte volume and exercise the same buffering/collapse paths.
+void indexTag(Inverter& inverter, std::string_view value) {
+  auto& input = inverter.getIndexHandler("tag");
+  if (value.size() <= PackedTerm::MAX_LEN) {
+    input.index(inverter, value);
+    return;
+  }
+  std::vector<std::string_view> chunks;
+  for (size_t offset = 0; offset < value.size(); offset += PackedTerm::MAX_LEN) {
+    chunks.push_back(value.substr(offset, PackedTerm::MAX_LEN));
+  }
+  input.index(inverter, std::span<const std::string_view>(chunks));
+}
+
+std::string tagValue(StrColReader& tags, StrColReader::Iterator& iter) {
+  if (!tags.isMultiValued()) return std::string(iter.value());
+  StrColReader::DocValues values(tags);
+  auto [start, end] = iter.valueRange();
+  std::string result;
+  for (int64_t rank = start; rank < end; rank++) result += values.valueAt(rank);
+  return result;
+}
+
 void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
-  auto schema = compoundSchema();
+  auto schema = compoundSchema(largeTagBytes > PackedTerm::MAX_LEN);
   IndexWriter writer(directory, [schema] { return schema; });
   Inverter& inverter = writer.obtainInverter();
   std::string firstTag = largeTagBytes == 0
@@ -130,7 +154,7 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   inverter.startDoc();
   inverter.getIndexHandler("body").index(inverter,
                                            std::string_view("alpha beta"));
-  inverter.getIndexHandler("tag").index(inverter, std::string_view(firstTag));
+  indexTag(inverter, firstTag);
   inverter.getIndexHandler("score").index(inverter, (int64_t) 7);
   inverter.finishDoc();
 
@@ -179,13 +203,13 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   StrColReader::Iterator tagIter(tags);
   ASSERT_EQ(0, tagIter.next());
   if (largeTagBytes == 0) {
-    EXPECT_EQ("x", tagIter.value());
+    EXPECT_EQ("x", tagValue(tags, tagIter));
   } else {
-    EXPECT_EQ(largeTagBytes, tagIter.value().size());
-    EXPECT_TRUE(tagIter.value() == firstTag);
+    EXPECT_EQ(largeTagBytes, tagValue(tags, tagIter).size());
+    EXPECT_TRUE(tagValue(tags, tagIter) == firstTag);
   }
   ASSERT_EQ(2, tagIter.next());
-  EXPECT_EQ("y", tagIter.value());
+  EXPECT_EQ("y", tagValue(tags, tagIter));
   EXPECT_EQ(StrColReader::Iterator::ENDDOC, tagIter.next());
 
   SegFieldInfo scoreInfo = fieldInfo(postings, "score");
@@ -221,7 +245,7 @@ void addMergeSource(IndexWriter& writer, int32_t source,
   std::string tag;
   if (tagBytes != 0) {
     tag = patternedBytes(tagBytes, (char) ('a' + source));
-    inverter.getIndexHandler("tag").index(inverter, std::string_view(tag));
+    indexTag(inverter, tag);
   }
   inverter.finishDoc();
   inverter.startDoc();
@@ -236,7 +260,7 @@ void addMergeSource(IndexWriter& writer, int32_t source,
 }
 
 void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
-  auto schema = compoundSchema();
+  auto schema = compoundSchema(tagBytes > PackedTerm::MAX_LEN);
   IndexWriter writer(directory, [schema] { return schema; });
   writer.mergePolicy->setMergeFactor(1000);
   for (int32_t source = 0; source < 3; source++) {
@@ -282,7 +306,7 @@ void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
     StrColReader::Iterator tagIter(tags);
     for (int32_t doc = 0; doc < 3; doc++) {
       ASSERT_EQ(doc, tagIter.next());
-      std::string_view value = tagIter.value();
+      std::string value = tagValue(tags, tagIter);
       ASSERT_EQ(tagBytes, value.size());
       EXPECT_EQ((char) ('a' + doc), value.front());
     }
@@ -511,7 +535,7 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
   TempDirectory temp;
   FSDirectory directory(temp.path());
   IndexRamBudget budget;
-  auto schema = compoundSchema();
+  auto schema = compoundSchema(true);
   std::atomic<int32_t> phase = 0;
   std::atomic<int64_t> flushReserved = 0;
   std::atomic<int64_t> mergeReserved = 0;
@@ -534,7 +558,7 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
   first.startDoc();
   first.getIndexHandler("body").index(first, std::string_view("first common"));
   std::string firstTag = patternedBytes(256ULL << 10);
-  first.getIndexHandler("tag").index(first, std::string_view(firstTag));
+  indexTag(first, firstTag);
   first.finishDoc();
   int64_t inverterBytes = (int64_t) first.memSize();
   writer.releaseInverter(first, true);
@@ -547,7 +571,7 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
   second.startDoc();
   second.getIndexHandler("body").index(second, std::string_view("second common"));
   std::string secondTag = patternedBytes(256ULL << 10, 'b');
-  second.getIndexHandler("tag").index(second, std::string_view(secondTag));
+  indexTag(second, secondTag);
   second.finishDoc();
   writer.releaseInverter(second, true);
   writer.commit();

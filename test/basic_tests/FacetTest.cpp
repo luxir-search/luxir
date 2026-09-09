@@ -4089,7 +4089,7 @@ protected:
         // simultaneous avg sub-ops on different fields.
         auto* avgHandler = &inverter.getIndexHandler("avgval_i");
         auto* avgHandler2 = &inverter.getIndexHandler("avgval2_i");
-        boost::container::small_vector<Inverter::IndexHandler*,8> handlers(fields.size());
+        boost::container::small_vector<Inverter::InputHandler*,8> handlers(fields.size());
         for (size_t i = 0; i < fields.size(); i++) {
           if (fieldExists[i] < 5) {
             continue; // Field does not exist in this segment

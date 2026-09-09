@@ -390,7 +390,7 @@ void assertSameTopK(const ScoreTopKResult& expected, const ScoreTopKResult& actu
 
 void buildClusteredScoreTopKIndex(IndexWriter& iw, int64_t nDocs) {
   Inverter& inverter = iw.obtainInverter();
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
 
   std::string body;
   for (int64_t doc = 0; doc < nDocs; doc++) {
@@ -445,8 +445,8 @@ void buildAntiCorrelatedFrontierBenchIndex(CollectionHelper& helper, int64_t nDo
   helper.clear();
   auto iw = helper.getIndexWriter();
   Inverter& inverter = iw->obtainInverter();
-  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
 
   std::string body;
   int64_t postingOrd = 0;
@@ -522,8 +522,8 @@ void buildMsmWandBenchIndex(CollectionHelper& helper, int64_t nDocs) {
   helper.clear();
   auto iw = helper.getIndexWriter();
   Inverter& inverter = iw->obtainInverter();
-  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
   int32_t hotLimit = luxir::unit_tests ? 128 : 512;
 
   std::string body;
@@ -548,8 +548,8 @@ void buildCrossSegmentAccumulatorBenchIndex(CollectionHelper& helper,
 
   for (size_t segnum = 0; segnum < docsPerSeg.size(); segnum++) {
     Inverter& inverter = iw->obtainInverter();
-    Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-    Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+    Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+    Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
     int32_t docsInSeg = docsPerSeg[segnum];
 
     std::string body;
@@ -571,8 +571,8 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
   helper.clear();
   auto iw = helper.getIndexWriter();
   Inverter& inverter = iw->obtainInverter();
-  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
 
   std::string body;
   for (int64_t doc = 0; doc < nDocs; doc++) {
@@ -634,8 +634,8 @@ void buildMultiTermAntiCorrelatedIndex(CollectionHelper& helper, int64_t nDocs, 
   helper.clear();
   auto iw = helper.getIndexWriter();
   Inverter& inverter = iw->obtainInverter();
-  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
 
   std::vector<int64_t> postingOrd((size_t) numTerms, 0);
   std::string body;
@@ -660,8 +660,8 @@ void buildDenseManyClauseIndex(CollectionHelper& helper, int64_t nDocs, int32_t 
   helper.clear();
   auto iw = helper.getIndexWriter();
   Inverter& inverter = iw->obtainInverter();
-  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
   std::vector<std::string> terms = makeMtTerms(numTerms);
 
   std::string body;
@@ -830,8 +830,8 @@ void buildPhraseFilterBenchIndex(CollectionHelper& helper, int64_t nDocs,
   helper.clear();
   auto iw = helper.getIndexWriter();
   Inverter& inverter = iw->obtainInverter();
-  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
-  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  Inverter::InputHandler& hId = inverter.getIndexHandler("id");
+  Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
 
   std::string body;
   for (int64_t doc = 0; doc < nDocs; doc++) {
@@ -934,8 +934,8 @@ void buildFullTextBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<
       Inverter& inverter = *inverters[segnum];
       int64_t localIdNum = segmentStartIds[segnum];
 
-      Inverter::IndexHandler& hId   = inverter.getIndexHandler("id");
-      Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+      Inverter::InputHandler& hId   = inverter.getIndexHandler("id");
+      Inverter::InputHandler& hBody = inverter.getIndexHandler("body_w");
 
       std::string body;
       for (int i = 0; i < segDocs; i++) {

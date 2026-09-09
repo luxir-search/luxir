@@ -45,7 +45,7 @@ class IdHandler final : public Inverter::IndexHandler {
   };
   std::vector<UndoEntry> undoLog_;
 
-  Inverter::IndexHandler* versionHandler = nullptr; // lazily resolved on first overwrite
+  Inverter::InputHandler* versionHandler = nullptr; // lazily resolved on first overwrite
 
 public:
   IdHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
@@ -167,7 +167,7 @@ private:
     return idPool->size() + termsHash.memSize() + (deleteHash ? deleteHash->memSize() : 0);
   }
 
-  Inverter::IndexHandler& getVersionHandler(Inverter& inverter) {
+  Inverter::InputHandler& getVersionHandler(Inverter& inverter) {
     if (versionHandler == nullptr) {
       versionHandler = &inverter.getIndexHandler("_version_");
     }
@@ -227,7 +227,7 @@ public:
       PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
       // Write as STRING type since we use the same segment format for now
       fieldInfo.type = FieldType::STRING;
-      fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+      fieldInfo.flags = fieldType->segmentFlags();
 
       OrdCollector ords(guard.pool(), nDocs);
 

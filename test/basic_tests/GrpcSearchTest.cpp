@@ -147,9 +147,9 @@ TEST_F(GrpcSearchTest, backpressurePausesEmitter) {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 1000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_w", pad));
   }
-  ch.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
 
   GRPCServer server(*luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   std::thread serverThread([&] { server.run(); });
@@ -161,7 +161,7 @@ TEST_F(GrpcSearchTest, backpressurePausesEmitter) {
 
   auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("grpc_bp").topDocs("q").allQuery()
-      .fields({"id", "pad_s"}).batchSize(100).limit(-1);
+      .fields({"id", "pad_w"}).batchSize(100).limit(-1);
 
   grpc::ClientContext context;
   HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
@@ -259,9 +259,9 @@ TEST_F(GrpcSearchTest, disconnectWhilePausedCancelsEmitter) {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 1000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_w", pad));
   }
-  ch.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
 
   GRPCServer server(*luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   std::thread serverThread([&] { server.run(); });
@@ -273,7 +273,7 @@ TEST_F(GrpcSearchTest, disconnectWhilePausedCancelsEmitter) {
 
   auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("grpc_bp2").topDocs("q").allQuery()
-      .fields({"id", "pad_s"}).batchSize(100).limit(-1);
+      .fields({"id", "pad_w"}).batchSize(100).limit(-1);
 
   {
     grpc::ClientContext context;

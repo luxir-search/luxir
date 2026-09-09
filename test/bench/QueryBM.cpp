@@ -49,31 +49,31 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
       Inverter& inverter = *inverters[segnum];
       int64_t localIdNum = segmentStartIds[segnum];
       
-      Inverter::IndexHandler& s0 = inverter.getIndexHandler("id");
-      Inverter::IndexHandler& s1 = inverter.getIndexHandler("short_u10_s");
-      Inverter::IndexHandler& s2 = inverter.getIndexHandler("short_u10k_s");
-      Inverter::IndexHandler& s3 = inverter.getIndexHandler("short_u100k_s");
-      Inverter::IndexHandler& s4 = inverter.getIndexHandler("short_u1m_s");
-      Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10_s");
-      Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u10k_s");
-      Inverter::IndexHandler& s7 = inverter.getIndexHandler("med_u1m_s");
+      Inverter::InputHandler& s0 = inverter.getIndexHandler("id");
+      Inverter::InputHandler& s1 = inverter.getIndexHandler("short_u10_s");
+      Inverter::InputHandler& s2 = inverter.getIndexHandler("short_u10k_s");
+      Inverter::InputHandler& s3 = inverter.getIndexHandler("short_u100k_s");
+      Inverter::InputHandler& s4 = inverter.getIndexHandler("short_u1m_s");
+      Inverter::InputHandler& s5 = inverter.getIndexHandler("med_u10_s");
+      Inverter::InputHandler& s6 = inverter.getIndexHandler("med_u10k_s");
+      Inverter::InputHandler& s7 = inverter.getIndexHandler("med_u1m_s");
       // Present on ~1% of docs: the sparse-field shape every other string field
       // here lacks.  Doc-driven counting costs O(domain) no matter how few docs
       // hold a value, so this is where term-driven counting can pay off.
-      Inverter::IndexHandler& s8 = inverter.getIndexHandler("sparse_u1k_s");
+      Inverter::InputHandler& s8 = inverter.getIndexHandler("sparse_u1k_s");
       // 100 uniform values, so one term selects ~1% of docs: the query-driven
       // 1%-selectivity posture (a per-term density no other field here has).
-      Inverter::IndexHandler& s9 = inverter.getIndexHandler("short_u100_s");
+      Inverter::InputHandler& s9 = inverter.getIndexHandler("short_u100_s");
       // 1000 uniform values: ~0.1%/term, the sparse query-driven tier.
-      Inverter::IndexHandler& s10 = inverter.getIndexHandler("short_u1000_s");
-      Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
-      Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
-      Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
+      Inverter::InputHandler& s10 = inverter.getIndexHandler("short_u1000_s");
+      Inverter::InputHandler& i1 = inverter.getIndexHandler("u10_i");
+      Inverter::InputHandler& i2 = inverter.getIndexHandler("u10k_i");
+      Inverter::InputHandler& i3 = inverter.getIndexHandler("u10m_i");
       // Mostly-single-valued multi-valued int: the only field here that makes
       // a column carry an endValueRank mono sidecar, which every multi-valued
       // read consults twice per doc.  1/64 of docs hold a second value, so the
       // value ranks are a near-unit ramp.
-      Inverter::IndexHandler& i4 = inverter.getIndexHandler("u10_is");
+      Inverter::InputHandler& i4 = inverter.getIndexHandler("u10_is");
 
       std::string s;
       for (int i = 0; i < segDocs; i++) {

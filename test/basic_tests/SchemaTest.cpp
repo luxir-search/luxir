@@ -1260,7 +1260,7 @@ TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   EXPECT_EQ("author", input.physicalName);
   EXPECT_EQ(FieldRole::PRIMARY, input.role);
   EXPECT_EQ(input.fieldType, input.owner->primary.get());
-  EXPECT_EQ(input.fieldType, input.owner->storageOwner);
+  EXPECT_TRUE(input.fieldType->isStored());
   EXPECT_EQ(LogicalField::Shape::SCALAR, input.owner->shape);
   EXPECT_EQ("author", s->resolveFor("author", OpClass::SEARCH).physicalName);
   EXPECT_EQ("author__s", s->resolveFor("author", OpClass::VALUE).physicalName);

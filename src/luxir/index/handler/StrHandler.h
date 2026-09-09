@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/util/ApiError.h"
+#include "StringValue.h"
 
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
@@ -20,6 +21,7 @@ namespace luxir::handler {
 /// The column has ords stored for each doc.  Retrieving the corresponding term is done via TermsEnum.
 class StrHandler final : public Inverter::IndexHandler {
   friend Inverter;
+  StringValue stringValue;
 
   // TODO: for unique fields like "id", this could be TermValHash<int32_t>
   TermValHash<DocStream> termsHash; // the set of terms contained in this field
@@ -35,7 +37,7 @@ class StrHandler final : public Inverter::IndexHandler {
 public:
   StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
+      stringValue(*fieldType), termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
   }
 
   ~StrHandler() override = default;
@@ -78,10 +80,7 @@ public:
   }
 
   void indexSingle(Inverter& inverter, std::string_view term) {
-    // Oversized values index truncated (the stored/column value keeps its full
-    // bytes); query-time term building truncates identically, so exact match
-    // on the full value still works.
-    term = PackedTerm::truncate(term);
+    term = stringValue.normalize(term, std::string_view(fieldName));
     // Assign this doc a field-rank the first time it contributes any value, recording
     // rank->docid in docsWithField.  All of a doc's terms then share that rank.
     int32_t doc = inverter.getDoc();
@@ -142,7 +141,7 @@ public:
     TextWriter textWriter(inverter.getPostingsWriter());
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+    fieldInfo.flags = fieldType->segmentFlags();
 
     // Postings are keyed by field-rank, so the ord collector is sized to docsWithField
     // (not maxDoc).  For a full field rank == docid, so we skip the rank->docid table

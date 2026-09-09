@@ -242,23 +242,65 @@ public:
 
 
 
-  // This could also be a Set with a little more work since the fieldname is already in the value.
-  // We don't want the values to move since clients can cache and reuse when indexing.
-  // Handlers are pool-allocated; u_ptr destroys them without freeing.
-  boost::unordered_flat_map<std::string, u_ptr<IndexHandler>,
-                            PackedTermHash, PackedTermEqual> indexHandlers;
+  // Logical input only. Physical handlers are owned exclusively by indexHandlers;
+  // a dispatcher never finishes or flushes them.
+  class InputHandler {
+    friend Inverter;
+    struct Branch {
+      std::string label;
+      IndexHandler* handler;
+    };
+    PackedTerm fieldName;
+    std::shared_ptr<FieldType> fieldType;
+    LogicalField::Shape shape;
+    bool multi;
+    StoredFieldsWriter* writer;
+    std::vector<Branch> branches;
 
+    void store(Inverter& inverter, const IndexVal& val);
+    void checkShape(const IndexVal& val) const;
 
-  // The returned reference will be valid for the duration of indexing this block.
-  // TODO: a version that gets a set at a time, so the inverter can pick the best columns to write directly?
-  // What about adjusting number of files on postings writer? We should be able to make that dynamic up until a max.
-  IndexHandler& getIndexHandler(const std::string_view name) {
-    auto iter = indexHandlers.find(name);
-    if (iter != indexHandlers.end()) {
-      return *iter->second;
+    template<typename F>
+    void forEachBranch(F&& index) {
+      for (const auto& branch : branches) {
+        try {
+          index(*branch.handler);
+        } catch (const DocumentError& e) {
+          throw DocumentError(fmt::format("Field '{}' branch '{}': {}",
+              std::string_view(fieldName), branch.label, e.what()), e.code);
+        } catch (const RequestError& e) {
+          throw RequestError(fmt::format("Field '{}' branch '{}': {}",
+              std::string_view(fieldName), branch.label, e.what()), e.code);
+        }
+        // FileIOException, bad_alloc and engine faults retain their class.
+      }
     }
 
-    return createIndexHandler(name);
+  public:
+    InputHandler(Inverter& inverter, const ResolvedFieldHandle& resolved,
+                 std::shared_ptr<FieldType> fieldType, StoredFieldsWriter* writer);
+    bool operator==(std::string_view name) const { return fieldName == name; }
+
+    void index(Inverter& inverter, std::string_view val);
+    void index(Inverter& inverter, std::span<const std::string_view> vals);
+    void index(Inverter& inverter, int64_t val);
+    void index(Inverter& inverter, std::span<const int64_t> vals);
+    void index(Inverter& inverter, double latitude, double longitude);
+    void index(Inverter& inverter, std::span<const GeoPoint> points);
+    void index(Inverter& inverter, const IndexVal& val);
+  };
+
+  // Handlers are pool-allocated; u_ptr destroys them without freeing. Neither
+  // map moves its handlers, so callers may retain pointers throughout indexing.
+  boost::unordered_flat_map<std::string, u_ptr<IndexHandler>,
+                            PackedTermHash, PackedTermEqual> indexHandlers;
+  boost::unordered_flat_map<std::string, u_ptr<InputHandler>,
+                            PackedTermHash, PackedTermEqual> inputHandlers;
+
+  InputHandler& getIndexHandler(std::string_view name) {
+    auto iter = inputHandlers.find(name);
+    if (iter != inputHandlers.end()) return *iter->second;
+    return createInputHandler(name);
   }
 
 
@@ -336,7 +378,7 @@ public:
   bool flush(std::vector<std::string>* filenames = nullptr);
 
 private:
-  IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createIndexHandler
+  IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler
   // Stored-fields writers, keyed by resource name.  Lazily populated when
   // fields with the STORED flag are first indexed.  PackedTermHash/Equal
   // give transparent lookup by string_view/PackedTerm/std::string.
@@ -345,7 +387,7 @@ private:
 
   // Get-or-create the StoredFieldsWriter for the named resource (column
   // family).  config may be null to use defaults.  Called from
-  // createIndexHandler when wrapping a STORED field.
+  // createInputHandler for the logical storage owner.
   StoredFieldsWriter& getOrCreateStoredFields(std::string_view resourceName,
                                               const StoredFieldType* config) {
     auto it = storedFields_.find(resourceName);
@@ -355,7 +397,9 @@ private:
     return *newIt->second;
   }
 
-  IndexHandler& createIndexHandler(const std::string_view name);
+  InputHandler& createInputHandler(std::string_view name);
+  IndexHandler& createPhysicalHandler(std::string_view name,
+                                      const std::shared_ptr<FieldType>& fieldType);
 
 };
 

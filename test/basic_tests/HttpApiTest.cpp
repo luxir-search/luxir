@@ -1206,6 +1206,35 @@ TEST_F(HttpApiTest, urlFieldMapRejectsMalformedEntry) {
       << update.body();
 }
 
+TEST_F(HttpApiTest, derivedInputKeysAndMapTargets) {
+  SchemaBuilder b;
+  auto& author = b.field("author");
+  author.type = api::FieldDef::FieldClass::TEXT;
+  b.variant(author, "s").type = api::FieldDef::FieldClass::STRING;
+  b.set(helper.collection());
+
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"author__s":"bad"}]})");
+  EXPECT_NE(std::string::npos, bad.body().find("Derived field is not a logical document key"));
+  auto buffered = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"buffered","external__author":"Mapped"}],"field_map":{"external__author":"author"},"commit":{}})");
+  ASSERT_EQ(200, buffered.result_int()) << buffered.body();
+  auto streamed = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?field_map=external__author:author&commit=true",
+      R"({"id":"streamed","external__author":"Mapped"})" "\n"
+      R"({"id":"bad","author__s":"bad"})" "\n", "application/x-ndjson");
+  EXPECT_NE(std::string::npos, streamed.body().find("Derived field is not a logical document key"));
+  for (auto contentType : {"application/json", "application/x-ndjson"}) {
+    auto target = httpRequest(port(), http::verb::post,
+        "/collections/main/_update?field_map=external:author__s", "{}", contentType);
+    EXPECT_EQ(400, target.result_int()) << target.body();
+    EXPECT_NE(std::string::npos, target.body().find("field_map target"));
+  }
+  HttpReq req(port());
+  req.collection("main").matchQuery("author__s", "Mapped").fields({"id"}).execute();
+  EXPECT_EQ(std::set<std::string>({"buffered", "streamed"}), idsOf(req.getDocs()));
+}
+
 TEST_F(HttpApiTest, ndjsonEndRejectsFieldMap) {
   std::string body =
       R"({"_end_":{"field_map":{"a":"b"}}})" "\n";
@@ -1249,7 +1278,7 @@ TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
   for (int i = 0; i < kDocCount; i++) {
     body += R"({"id":"nb)";
     body += std::to_string(i);
-    body += R"(","title_w":"ndbatch","blob_sc":")";
+    body += R"(","title_w":"ndbatch","blob_w":")";
     body += payload;
     body += R"("})";
     body += '\n';
@@ -1283,7 +1312,7 @@ TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
   for (int i = 0; i < kDocCount; i++) {
     body += R"({"id":"cap)";
     body += std::to_string(i);
-    body += R"(","title_w":"captoken","blob_sc":")";
+    body += R"(","title_w":"captoken","blob_w":")";
     body += payload;
     body += R"("})";
     body += '\n';
@@ -1536,7 +1565,7 @@ TEST_F(HttpApiTest, ndjsonDisconnectDrainsPipelinedBatches) {
   std::string body;
   for (int i = 0; i < 128; i++) {
     body += R"({"id":"disconnect-)" + std::to_string(i) +
-        R"(","title_w":"disconnectpipeline","blob_sc":")" + payload + R"("})" "\n";
+        R"(","title_w":"disconnectpipeline","blob_w":")" + payload + R"("})" "\n";
   }
 
   net::io_context cioc;
@@ -1574,7 +1603,7 @@ TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
 TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
   std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < record cap
   std::string body =
-      R"({"id":"big1","title_w":"bigtoken","blob_sc":")" + big + R"("})" "\n"
+      R"({"id":"big1","title_w":"bigtoken","blob_w":")" + big + R"("})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
@@ -1898,7 +1927,7 @@ TEST_F(HttpApiTest, ndjsonDeferredInlineUpdateEnforcesRequestBodyCap) {
   std::string payload(1500, 'z');
   std::string body =
       R"({"id":"defer-pre","title_w":"defercap token"})" "\n"
-      R"({"_update_":{"docs":[{"id":"defer-big","title_w":"defercap token","blob_sc":")" +
+      R"({"_update_":{"docs":[{"id":"defer-big","title_w":"defercap token","blob_w":")" +
       payload + R"("}]}})" "\n";
 
   auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/_update",
@@ -2037,8 +2066,8 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs413) {
   std::string payload(700, 'x');
   std::string body =
       R"({"_update_":{"all_or_none":true}})" "\n"
-      R"({"id":"cap-a","title_w":"capatomic","blob_sc":")" + payload + R"("})" "\n"
-      R"({"id":"cap-b","title_w":"capatomic","blob_sc":")" + payload + R"("})" "\n";
+      R"({"id":"cap-a","title_w":"capatomic","blob_w":")" + payload + R"("})" "\n"
+      R"({"id":"cap-b","title_w":"capatomic","blob_w":")" + payload + R"("})" "\n";
 
   auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
@@ -2799,7 +2828,7 @@ TEST_F(HttpApiTest, shutdownDrainsWorkAcrossIoShards) {
   for (int i = 0; i < 256; i++) {
     if (i != 0) seed += ',';
     seed += R"({"id":"shutdown-)" + std::to_string(i) +
-        R"(","title_w":"shardshutdown","blob_sc":")" + payload + R"("})";
+        R"(","title_w":"shardshutdown","blob_w":")" + payload + R"("})";
   }
   seed += R"(],"commit":{}})";
   auto update = httpRequest(localServer.getPort(), http::verb::post,
@@ -2823,7 +2852,7 @@ TEST_F(HttpApiTest, shutdownDrainsWorkAcrossIoShards) {
     request.set(http::field::content_type, "application/json");
     request.keep_alive(true);
     request.body() =
-        R"({"query":{"all":true},"max_parallel":0,"limit":256,"batch_size":16,"fields":["id","blob_sc"]})";
+        R"({"query":{"all":true},"max_parallel":0,"limit":256,"batch_size":16,"fields":["id","blob_w"]})";
     request.prepare_payload();
     http::write(*connections[i], request);
   }
@@ -2832,7 +2861,7 @@ TEST_F(HttpApiTest, shutdownDrainsWorkAcrossIoShards) {
     std::string body;
     for (int doc = 0; doc < 64; doc++) {
       body += R"({"id":"shutdown-stream-)" + std::to_string(i) + '-' +
-          std::to_string(doc) + R"(","title_w":"shardshutdown","blob_sc":")" +
+          std::to_string(doc) + R"(","title_w":"shardshutdown","blob_w":")" +
           payload + R"("})" "\n";
     }
     http::request<http::string_body> request{
@@ -3061,7 +3090,7 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
   std::vector<Doc> docs;
   for (int i = 0; i < 6; i++) docs.push_back(flatdoc("id", "a" + std::to_string(i), "kind_s", std::string("a")));
   for (int i = 0; i < 4; i++) docs.push_back(flatdoc("id", "b" + std::to_string(i), "kind_s", std::string("b")));
-  ch.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
 
   auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_multi/_search?format=docs",
       R"({"ops":{)"
@@ -3198,9 +3227,9 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_w", pad));
   }
-  ch.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
 
   HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
@@ -3224,7 +3253,7 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
     req.set(http::field::host, "127.0.0.1");
     req.set(http::field::content_type, "application/json");
     req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" +
-        mp + R"(,"fields":["id","pad_s"]})";
+        mp + R"(,"fields":["id","pad_w"]})";
     req.prepare_payload();
     http::write(sock, req);
 
@@ -3285,9 +3314,9 @@ TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
   std::string pad(400, 'x');
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_w", pad));
   }
-  ch.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
 
   std::optional<HttpServer> bpServer;
   bpServer.emplace(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
@@ -3305,7 +3334,7 @@ TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
   http::request<http::string_body> req(http::verb::post, "/collections/http_bp2/_search", 11);
   req.set(http::field::host, "127.0.0.1");
   req.set(http::field::content_type, "application/json");
-  req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})";
+  req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_w"]})";
   req.prepare_payload();
   http::write(sock, req);
 

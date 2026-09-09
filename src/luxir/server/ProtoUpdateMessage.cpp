@@ -87,7 +87,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
   const FieldNameMap fieldMap(request);
-  std::vector<Inverter::IndexHandler*> handlers;
+  std::vector<Inverter::InputHandler*> handlers;
 
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
@@ -109,6 +109,10 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       // dedup duplicate field keys post-mapping, last-wins
       for (const auto& [fname, fval] :
            lastWins(doc.fields, [&](std::string_view name) { return fieldMap.resolve(name); })) {
+        if (fname.find("__") != std::string_view::npos) {
+          throw DocumentError("Derived field is not a logical document key: " + std::string(fname),
+                              "invalid_field_name");
+        }
         auto handler = handlers[idx];
         if (handler == nullptr || *handler != fname) {
           handlers[idx] = handler = &inverter.getIndexHandler(fname);
