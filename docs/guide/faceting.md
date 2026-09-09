@@ -56,6 +56,13 @@ A `field_facet` groups by distinct field value:
 }
 ```
 
+A bare field name uses its `defaults.value` binding. With the author schema
+from [Schema](schema.md#field-variants), faceting `author` counts normalized
+whole-author values from `author__s`. Use `author__self` to facet the primary's
+analyzed tokens. An explicit selector uses exactly that representation and
+fails if it lacks the required structures; a STRING facet needs both indexed
+terms and an ord column, so a column-only string cannot serve it.
+
 The controls are:
 
 | Field | Meaning |
@@ -73,8 +80,8 @@ String and ID facets default to count descending, then bucket value ascending
 as a deterministic tie break. Setting `mincount: 0` can include values that
 exist in the collection but have zero matches in the current domain.
 
-Integer and date fields facet on each distinct column value. Text fields facet
-on analyzed terms, not on the original stored text: faceting `body_t` answers
+Integer and date representations facet on each distinct column value. Text
+representations facet on analyzed terms, not on the original stored text: faceting `body_t` answers
 "which indexed terms occur?", while faceting `category_s` answers "which
 category values occur?" Integer/date/text field facets currently support
 `limit`, positive `mincount`, and `missing`, but not sub-operations or custom
@@ -92,6 +99,48 @@ request order with exact counts. These appended buckets are exempt from
 `mincount`, may name values absent from the index, and carry the same
 sub-operation results as ordinary buckets.
 
+Selection uses the facet's resolved representation for both normalization and
+refinement. With the `names` collection from the schema example:
+
+```http
+POST /collections/names/_search
+
+{
+  "query": {"all":true},
+  "fields": ["id"],
+  "get_number": true,
+  "ops": {
+    "authors": {"field_facet": {
+      "field":"author","limit":10,"selected":["URSULA K. LE GUIN"]
+    }}
+  }
+}
+```
+
+The result list contains only `b1`, the same document selected by bare
+`any_of` on `author` with that value (or `author:="URSULA K. LE GUIN"`). The
+bucket is normalized to `ursula k. le guin`. In the default `any` mode, this
+facet's own buckets are counted without its selection filter, so the other
+author buckets remain visible. Sibling operations see the refinement.
+
+To count words instead:
+
+```http
+POST /collections/names/_search
+
+{
+  "query": {"all":true},
+  "fields": ["id"],
+  "get_number": true,
+  "limit": 0,
+  "ops": {"words":{"field_facet":{"field":"author__self","limit":-1}}}
+}
+```
+
+The token buckets include `guin` and `le`, each with count `2`. A `selected`
+value on this facet uses TEXT exact-token membership; a literal producing
+several terms is an error, just as with `any_of` on `author__self`.
+
 ## Expression metrics
 
 An expression metric folds document values over its incoming domain. `avg`,
@@ -101,6 +150,10 @@ bare expression string in an operation position:
 ```json
 "average_price": "avg(price_f)"
 ```
+
+Column leaves use the value binding, then require the appropriate numeric/date
+column. TEXT has no value column, and a string variant does not make numeric
+metrics legal: `min(author)` in the author example is an error.
 
 The equivalent explicit forms are
 `{"expr_op":"avg(price_f)"}` and
@@ -315,6 +368,9 @@ float, double, or date field:
   "missing": 2
 }
 ```
+
+A bare field uses its value binding. That representation must still be numeric
+or date; a STRING value default does not become a numeric range facet.
 
 `start` and `end` are required, and exactly one of `gap` or `calendar_gap`
 must be present. The final bucket is shortened if the gap does not divide the

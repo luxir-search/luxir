@@ -82,6 +82,12 @@ name appearing more than once in a document keeps the last occurrence, the same
 last-wins rule as a duplicated key. Mapping applies to top-level keys of each
 document; it does not flatten nested objects.
 
+Targets must be logical field names. A variant selector (`author__s`), primary
+selector (`author__self`), or abstract template name is an invalid target and
+fails the request. An external key containing `__` can be renamed or dropped;
+only the final non-dropped document keys must obey the logical naming rule.
+Each surviving key fans out once through its schema variants.
+
 The same two knobs are fields of the update request itself (and of a streaming
 `_update_` control object, where they apply to that group's documents):
 
@@ -101,6 +107,20 @@ A request or group that sets either knob owns both, and the URL default is
 ignored for it; otherwise the URL values apply. The mapping is a property of
 the load, not the collection: the same dump can be re-shaped differently per
 request.
+
+For the `names` collection from [Schema](schema.md#field-variants):
+
+```http
+POST /collections/names/_update
+
+{
+  "docs": [{"bookId":"mapped","external__author":"Octavia Butler","discard__key":"ignored"}],
+  "field_map": {"bookId":"id","external__author":"author","discard__key":""},
+  "commit": {}
+}
+```
+
+This supplies `author` once and populates both `author` and `author__s`.
 
 ## IDs, overwrites, and deletes
 
@@ -146,6 +166,17 @@ HTTP path, `?commit=true` is also available as a convenient end-of-stream
 commit. Frequent forced merges are expensive; `max_segments` is an explicit
 maintenance action, not a normal ingest setting.
 
+Each update message uses the schema pinned at admission. After a successful
+schema publication, newly admitted messages use its definitions; already
+admitted work keeps its original schema. A long NDJSON stream can span several
+messages and schema generations.
+
+Adding a variant does not backfill earlier documents, and merging does not
+create missing representations. Reindex the producer's input to populate them.
+The [resolved schema view](schema.md#resolved-view) reports conservative
+coverage; [live schema edits](schema.md#changes-on-a-live-collection) reject
+incompatible reuse of a physical name with materialized data.
+
 ## Per-document failures
 
 Unless `all_or_none` is set, document validation failures do not poison their
@@ -170,6 +201,12 @@ field the schema does not define), and a human `message`. A document that an
 engine fault stopped is reported the same way with kind `internal`.
 `total_errors` counts every failed document; it exceeds the length of
 `errors` only when a transport retained a prefix of them.
+
+A value rejected by any variant fails the entire document. The message names
+the logical field, branch label (`self` for the primary), and cause. For example,
+a 256-byte normalized string in the author example fails branch `s`, even if
+the TEXT primary accepted it. STRING values are limited to 255 bytes after
+normalization, for indexed and column-only fields alike; IDs still truncate.
 
 The response status is:
 
@@ -247,9 +284,11 @@ curl -X POST http://localhost:9400/collections/books/_update \
   --data-binary @books.ndjson
 ```
 
-The document-per-line [search export](searching.md#stream-every-match) is valid
-input here. Its `_header_` records are recognized and skipped, so collections
-can be copied with a pipe and no format conversion.
+The document-per-line [search export](searching.md#stream-every-match) uses this
+input framing. Its `_header_` records are recognized and skipped. Export logical
+field names for ingestion: explicit variant selectors are not document keys.
+Retrieved primaries may have lost lexical input needed by variants, so a pipe
+is not a general replacement for reindexing from the producer's source.
 
 ## Atomic streams are deliberately bounded
 

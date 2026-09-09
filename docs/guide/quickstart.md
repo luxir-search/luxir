@@ -56,6 +56,10 @@ each. Name a field `title_t` and it is searchable text; name it `year_i` and
 it is a number you can range and sort on. Define an [explicit schema](schema.md)
 later when you want control - you do not need one to start.
 
+When one input should support both word search and whole-value facets or sorts,
+define [field variants](schema.md#field-variants). The schema example supplies
+`author` once and chooses text for search and a normalized string for values.
+
 > **Reading the rest of this page:** requests are shown as HTTP: method, path,
 > and body. On the website, every request block has a **Copy as curl** button
 > that copies the runnable command, with `?pretty` added to the URL so the
@@ -283,6 +287,11 @@ POST /collections/main/_search?explain=request
 
 Handy for learning the API and for debugging a query that isn't matching what
 you expect.
+
+Use [`?explain=resolved`](http-api.md#explain-modes) to inspect which physical
+fields a request uses. It returns `request` and `resolved_fields`, and runs
+ordinary preparation without collecting results. Post back the `request`
+member to execute it.
 
 ## Where to go next
 

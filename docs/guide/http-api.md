@@ -12,6 +12,7 @@ uses the same vocabulary as protobuf.
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
+| `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`. |
@@ -80,6 +81,46 @@ without executing it; posting the result back has the same semantics.
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":"books"` even when the original body omitted it.
 
+### Explain modes
+
+`?explain=request` is parse-and-serialize only. It returns the bare canonical
+request, including URL overlays, without acquiring readers or running semantic
+preparation. The entire response can be posted back as a request.
+
+`?explain=resolved` returns the request together with field-binding notes.
+Using the `names` collection from [Schema](schema.md#field-variants):
+
+```http
+POST /collections/names/_search?explain=resolved
+
+{"query":{"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}},"fields":["id"]}
+```
+
+```json
+{
+  "request": {
+    "collection": "names",
+    "ops": {"q":{"top_docs":{
+      "query":{"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}},
+      "fields":["id"]
+    }}}
+  },
+  "resolved_fields": ["q: author -> author__s"]
+}
+```
+
+Replay the `request` member. Its field spellings stay as authored;
+`resolved_fields` contains contextual mappings to physical names where they
+differ, with repeated identical notes removed. These strings are diagnostics,
+not a serialized execution plan.
+
+Resolved explain runs ordinary search preparation: it acquires readers,
+respects freshness, validates semantics, and may do dictionary, weight, and
+cache work. It does not execute result collection or calculators. It therefore
+needs a usable collection and rejects errors such as a negative offset, which
+request echo can return unchanged. Projection errors that arise during document
+emission are not checked by this mode. Unknown explain modes are request errors.
+
 ## Errors
 
 Every failure has one shape, wherever it appears:
@@ -107,7 +148,7 @@ otherwise.
 | `internal` | 500 | A server-side failure the request did not cause. |
 
 Codes today: `invalid_request`, `invalid_json`, `invalid_schema`,
-`invalid_collection_name`, `invalid_value`, `unknown_field`,
+`invalid_collection_name`, `invalid_field_name`, `invalid_field`, `invalid_value`, `unknown_field`,
 `invalid_expression`, `method_not_allowed`, `request_too_large`,
 `request_memory_exceeded`, `not_found`, `collection_not_found`,
 `collection_unavailable`, `collection_exists`, `read_only`, `writer_closed`,

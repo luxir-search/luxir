@@ -19,7 +19,7 @@ does Luxir do today?"
 6. [Query language](guide/query-language.md) - strict developer expressions
    and injection-safe variables.
 7. [Schema and fields](guide/schema.md) - suffix-based defaults, explicit
-   fields, analyzers, storage, and indexes.
+   fields, variants and bindings, analyzers/normalizers, storage, and indexes.
 8. [Faceting](guide/faceting.md) - terms facets, range/date histograms, nested
    facets, and per-bucket metrics.
 9. [Vector and hybrid search](guide/vector-search.md) - exact and ANN kNN,

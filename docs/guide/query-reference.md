@@ -9,6 +9,23 @@ filter domains, and fusion sources. This page is the field-level reference;
 Unknown arms and unknown fields are errors. Add `?explain=request` to an HTTP
 query to see the canonical request after shorthand expansion.
 
+Bare fields use the schema's operation-specific bindings; explicit `f__label`
+and `f__self` select one representation directly:
+
+| Operation | Bare name |
+|---|---|
+| Match, phrase, simple query, prefix, fuzzy, wildcard, regex | `search`, even inside a filter. |
+| `any_of`, range, field/range facets, sort, column expressions, metrics | `value`, then the operation's capability checks. |
+| Exists, kNN, geo | Primary physical field. |
+| Retrieval | Primary source store or its own column; never the value default. |
+
+Both bindings default to `self`. There is no automatic fallback to a variant
+with different capabilities. [Searching](searching.md#field-bindings) has a
+worked example, including retrieval under explicit selector keys. Default
+projection and wildcards discover logical names only; `author__*` is an error.
+TEXT cannot sort or supply a column expression; `col()` does not bypass that
+check. Numeric metrics still require numeric expressions.
+
 ## Match all and exists
 
 ```json
@@ -23,6 +40,8 @@ query to see the canonical request after shorthand expansion.
 
 `exists` matches documents that supplied at least one accepted value for the
 field. The expression shorthand is `year_i:*`.
+Bare exists uses primary presence; an explicit selector tests that physical
+representation's presence.
 
 ## Match
 
@@ -51,9 +70,53 @@ The HTTP dialect also accepts the field-name form:
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
 
-Text values are analyzed with the field analyzer. String and ID values are
-matched as exact terms. Numeric and date values are coerced through the same
+Text values are analyzed with the resolved field analyzer. String values use
+their normalizer, if configured, and match as exact terms; IDs retain their
+truncation contract. Numeric and date values are coerced through the same
 rules as indexing and matched through their columns.
+
+## Exact membership (`any_of`)
+
+`any_of` matches any listed value in the value representation. With the `names`
+collection from [Schema](schema.md#field-variants):
+
+```http
+POST /collections/names/_search
+
+{
+  "query": {"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}},
+  "fields": ["id"],
+  "get_number": true
+}
+```
+
+```json
+{"found":1,"docs":[{"id":"b1"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `field` | Field to query through its value binding, or an explicit selector. Required. |
+| `values` | Exact values; any matching value admits the document. |
+
+STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
+representations can use their columns. A column-only STRING can sort but
+cannot serve `any_of`.
+
+STRING literals are whole values and use the same normalizer as ingest. TEXT
+literals are exact token membership: analysis producing more than one term
+is rejected with `any_of / := requires a single term per exact TEXT value`
+and a suggestion to use match, phrase, or a whole-value string variant.
+Lookup uses the single analyzed term. For example, `author__self` with `"Guin!"`
+looks up `guin` and matches `b1` and `b3`, just like `"Guin"` or a match query
+for `Guin!`. A literal producing zero terms matches nothing; `"Le Guin"`
+produces several terms and is an error.
+
+Exact STRING literals and bounds over 255 bytes after normalization are
+rejected, as are overlong TEXT term bounds. For TEXT exact membership, the
+255-byte limit applies to the analyzed lookup term.
+IDs still truncate. The expression forms are `field:=value` and
+`field:=(v1, v2)`; see [exact values](query-language.md#exact-values).
 
 ## Boolean
 
@@ -134,9 +197,9 @@ costs `2`, and multi-valued text fields have a position gap of `100`. See
 ```
 
 `prefix` is an indexed-term prefix, not a wildcard expression. Text fields
-apply their multi-term normalization/folding but do not tokenize it; string and
-ID fields use the bytes verbatim. An empty prefix matches documents with at
-least one indexed term for the field.
+apply their multi-term normalization/folding but do not tokenize it; STRING
+uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
+matches documents with at least one indexed term for the field.
 
 ## Fuzzy
 
@@ -155,7 +218,7 @@ least one indexed term for the field.
 | Field | Meaning |
 |---|---|
 | `field` | Indexed term field. Required. |
-| `term` | Term to compare. Text fields normalize/fold but do not tokenize it; string and ID fields use it verbatim. Required. |
+| `term` | Term to compare. TEXT normalizes/folds without tokenizing; STRING uses its normalizer if present; ID uses it verbatim. Required. |
 | `max_edits` | Byte-wise Levenshtein distance from `0` to `2`. Unset uses `0` for terms of at most 2 bytes, `1` through 5 bytes, then `2`. |
 | `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
 | `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
@@ -181,7 +244,8 @@ Numeric and date fields compare column values. Date bounds accept epoch
 milliseconds, ISO-8601, partial dates, and date math; see
 [Dates and time zones](dates.md). String, ID, and text fields range over indexed
 terms in byte order with constant scores. Text bounds receive the field's
-normalization/folding but are not tokenized.
+normalization/folding but are not tokenized; STRING bounds use its normalizer.
+The bare field uses the value binding, including a range with no bounds.
 
 ## Constant score and boost
 
@@ -242,6 +306,11 @@ envelope: an empty `fields` list or an unknown schema field is still a request
 error. Constructs that cannot be honored degrade to literal terms or produce a
 declared search warning. The [Quickstart](quickstart.md#forgiving-end-user-search)
 shows the intended search-box use.
+
+Expansion fields are resolved through `search` and deduplicated by physical
+identity: `author` and `author__self` in the example produce one expansion.
+`allowed_fields` restricts exact resolved search targets; allowing one
+representation does not grant access to its siblings.
 
 ## Expression
 

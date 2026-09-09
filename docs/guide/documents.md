@@ -32,6 +32,17 @@ An unknown field with no matching suffix is a per-document error, not an
 ignored property. Define a concrete field or template through the
 [schema API](schema.md) when suffixes are not the desired public names.
 
+A field with [variants](schema.md#field-variants) still takes one input value
+(or one array for a multi-valued field). Send `author` once; its primary and
+variants each convert that submitted value. Derived names such as `author__s`
+and `author__self` are request selectors, never document keys. A final document
+key containing `__` is a per-document error.
+
+[`field_map`](indexing.md#field-mapping) may rename an external key containing
+`__` onto a logical field, or drop it. It may not target a variant, a `__self`
+selector, or an abstract template name; an invalid target fails the whole
+request. Mapping is rename-or-drop, and the logical field supplies the variants.
+
 Request objects follow a separate but related rule: unknown request keys are
 errors. Luxir does not silently accept a misspelled query option.
 
@@ -63,9 +74,12 @@ searched, but it cannot be overwritten or deleted by ID and has no useful
 external identity. In ordinary collections, treat `id` as required at the
 producer boundary.
 
-Indexed terms, including IDs, are limited to 255 UTF-8-safe bytes. Longer IDs
+IDs are limited to 255 UTF-8-safe bytes in the term space. Longer IDs
 are truncated in the term space, so values that share the same first 255-byte
 prefix collide for overwrite and delete purposes. Keep IDs within that bound.
+STRING fields instead reject values over 255 bytes after normalization,
+including column-only strings. A string variant that exceeds this limit fails
+the document even if its TEXT primary accepts the source.
 
 With the normal `allow_dups: false`, another document with the same ID replaces
 the old document. Replacement is whole-document replacement: fields omitted by
@@ -120,18 +134,76 @@ A multi-valued text field analyzes each input value separately and inserts a
 position gap of `100` between values. A phrase therefore does not cross values
 unless its slop reaches that gap.
 
+With the `_name` and `_names` templates from
+[Schema](schema.md#templates-and-inheritance), one input list supplies both
+representations:
+
+```http
+POST /collections/names/_update
+
+{
+  "docs": [{
+    "id":"n1",
+    "author_name":"Ursula K. Le Guin",
+    "author_names":["Le Guin","LE GUIN","Martin"]
+  }],
+  "commit": {}
+}
+```
+
+```http
+POST /collections/names/_search
+
+{
+  "query": "id:n1",
+  "fields": ["author_name","author_name__s","author_names","author_names__s"],
+  "get_number": true
+}
+```
+
+```json
+{"found":1,"docs":[{"author_name":"Ursula K. Le Guin","author_name__s":"ursula k. le guin","author_names":["Le Guin","LE GUIN","Martin"],"author_names__s":["le guin","martin"]}]}
+```
+
 ## What is returned
 
 Columns and stored fields solve different problems:
 
 - A column retains a typed per-document value for sorting, faceting, numeric
   and geo queries, vector search, and retrieval where that type is supported.
-- A stored field retains the original document value in compressed chunks.
-  Text defaults to stored so retrieval returns the pre-analysis string.
+- A stored TEXT, STRING, or ID primary retains canonical source text in
+  compressed chunks, before analysis or normalization. Numeric and boolean
+  inputs become text: a numeric `42` stored as TEXT returns `"42"`. Text
+  defaults to stored.
 
-Omitting `fields` returns every retrievable field except vectors and engine
+Numeric primaries return their typed column; `stored` is ignored for them.
+Using the `names` collection from [Schema](schema.md#field-variants):
+
+```http
+POST /collections/names/_search
+
+{"query":"id:b1","fields":["edition","edition__label"],"get_number":true}
+```
+
+```json
+{"found":1,"docs":[{"edition":42,"edition__label":"0042"}]}
+```
+
+The submitted `"0042"` is not preserved by the numeric primary. Each branch
+converted the input independently; reindexing needs the producer's input, not
+just the primary's retrieved value.
+
+Bare retrieval and `__self` use the primary's stored source when enabled,
+otherwise its own column. A normalized STRING primary without storage returns
+its normalized column value. Multi-valued string columns are sorted,
+deduplicated sets; stored source lists retain order and duplicates. Variants
+have no stored copy. An exact selector returns that representation's column
+under the selector key; a TEXT variant has no retrievable value.
+
+Omitting `fields` returns retrievable logical fields except vectors and engine
 fields; name fields, or use `*` wildcard patterns such as `"attr_*"`, to
-project a subset (see
+project a subset. Wildcards never expand variants; `author__*` is an error.
+A `stored: false` TEXT primary is omitted even if a variant can be retrieved (see
 [Searching](searching.md#field-retrieval-and-result-shape)). HTTP row format
 omits missing fields; HTTP column format includes the requested key with
 `null`. Geo columns are a current

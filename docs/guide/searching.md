@@ -63,6 +63,8 @@ middleware metadata. Recognized parameters reject lexically invalid values.
 The existing `format=docs` parameter controls response framing and is not a
 request-field overlay. Add `explain=request` to return the effective request,
 including the overlay, as a body that can be posted back for identical results.
+Use `explain=resolved` to also inspect field bindings; it runs ordinary request
+preparation. See [HTTP explain modes](http-api.md#explain-modes).
 
 ## One result list
 
@@ -131,6 +133,7 @@ filters, fusion sources, or another query wrapper.
 |---|---|---|
 | Match all | `{"all":true}` | Constant-scoring all-documents query. |
 | Match | `{"match":{"title_t":"kings"}}` | Analyzes text; the object shown is sugar for explicit `field` and `val`. |
+| Exact membership | `{"any_of":{"field":"category_s","values":["classic","fiction"]}}` | Uses the value binding; expression form `category_s:=(classic, fiction)`. |
 | Exists | `{"exists":{"field":"year_i"}}` | Supplied value exists; expression shorthand is `year_i:*`. |
 | Phrase | `{"phrase":{"field":"title_t","text":"way of kings","slop":0}}` | Position-aware; see the [query language](query-language.md#terms-and-phrases) for slop semantics. |
 | Range | `{"range":{"field":"year_i","gte":1960,"lt":1970}}` | Numeric, date, string, ID, or text term ranges. |
@@ -155,6 +158,67 @@ typed and the strict [Luxir query language](query-language.md) for text your
 application authored. That separation is intentional: one degrades rather than
 fail; the other would rather report the exact byte offset of a bug than guess.
 
+### Field bindings
+
+A bare logical field name selects a representation by operation. Both bindings
+default to `self` unless the [schema](schema.md#default-bindings) sets them:
+
+| Operation | Representation |
+|---|---|
+| Match, phrase, simple query, expression terms/phrases; prefix, fuzzy, wildcard, regex | `search`. A match inside a filter uses the same binding. |
+| `any_of` / `:=`, ranges, field/range facets, sort, column expressions, metrics | `value`, with the operation's normal type and capability checks. |
+| Retrieval | Primary source store, else its own typed column. |
+| Exists (`f:*`), kNN, geo | Primary physical field. |
+
+`f__label` selects exactly that variant; `f__self` forces the primary. Neither
+form consults the defaults or tries a sibling if the operation cannot use it.
+Exists on a bare name tests primary presence; an explicit selector tests that
+representation, which can differ for documents indexed before it was added.
+
+Using the `names` collection from [Schema](schema.md#field-variants), search
+the author's words and sort by the normalized whole value:
+
+```http
+POST /collections/names/_search
+
+{
+  "query": {"match":{"author":"Guin"}},
+  "fields": ["id","author","author__s","author__self"],
+  "get_number": true,
+  "sorts": [{"expr":"author"},{"expr":"id"}]
+}
+```
+
+```json
+{
+  "found": 2,
+  "docs": [
+    {"id":"b3","author":"LE GUIN","author__s":"le guin","author__self":"LE GUIN"},
+    {"id":"b1","author":"Ursula K. Le Guin","author__s":"ursula k. le guin","author__self":"Ursula K. Le Guin"}
+  ]
+}
+```
+
+For an exact whole-author filter, use `any_of`:
+
+```http
+POST /collections/names/_search
+
+{
+  "query": {"all":true},
+  "fields": ["id"],
+  "get_number": true,
+  "filter": [{"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}}]
+}
+```
+
+This returns only `b1`. A `match` filter for `Guin` still analyzes text and
+returns `b1` and `b3`. `any_of` on TEXT is exact token membership: lookup uses
+the single analyzed term, so `author__self` with `"Guin!"` looks up `guin` and
+finds the same documents as a match query for `Guin!`. A literal producing zero
+terms matches nothing. Several terms are an error suggesting match, phrase,
+or a whole-value string variant.
+
 ## Counts and top-k work
 
 `found` is opt-in. Without `get_number`, Luxir can use block score bounds and
@@ -173,7 +237,7 @@ to row documents: a missing field is an absent key. Set
 `document_format: "columns"` when consumers prefer every supported projected
 key in every row, with missing cells rendered as `null` by HTTP.
 
-With no `fields`, every retrievable field comes back: stored text, string,
+With no `fields`, every retrievable logical field comes back: stored text, string,
 numeric, date, and `id` values, discovered from the index itself (so dynamic
 suffix fields appear under their concrete names), `id` first and the rest in
 name order. Vector fields and engine fields such as `_version_` are returned
@@ -189,6 +253,20 @@ fields never match, and a pattern matching nothing is not an error. A field
 also named explicitly is returned once, in its explicit placement, so
 `"fields": ["id", "*"]` returns an `id` column beside rows of everything
 else.
+
+Bare names return the primary's stored source or its own column, independently
+of the search/value bindings. `author__s` returns that representation's value
+under the key `author__s`; `author__self` returns the primary under that key,
+including its stored source. Output keys deduplicate, not physical sources,
+so `author` and `author__self` can both appear.
+
+Default discovery and wildcards never expand into variants. `author*` discovers
+logical names only, while `author__*` is an error asking for an exact selector
+such as `author__s` or `author__self`. A `stored: false` TEXT primary is omitted
+from discovery even if its variant has a column. Naming an unretrievable TEXT
+representation explicitly is an error; retrieve its logical primary for source
+text. A multi-valued string variant returns a sorted, deduplicated set while
+the stored primary retains source order and duplicates.
 
 The underlying gRPC response remains a typed `DocList`: dense columns and row
 maps can coexist, `row_count` is authoritative, and `_score_` is a synthetic
@@ -210,9 +288,14 @@ The `expr` member accepts either a bare field name or a numeric value expression
 For a bare field sort, `field` is accepted as an input alias; responses and
 request echo use the canonical `expr` form.
 Numeric, date, string, and ID field names retain the direct column-sort path.
-Use `col("name")` when a field name is reserved or is not an identifier. Analyzed
-text has no sortable value unless it is indexed for string sorting or copied to
-a `string` column. Documents missing the sort value always sort last, under
+Use `col("name")` when a field name is reserved or is not an identifier. Sorts
+and column-expression leaves use the value binding. Analyzed TEXT has no value
+column, even when indexed; use a string variant. `author__self` and
+`col("author__self")` both fail with a TEXT/no-value-column error in the author
+example. `col("author")` still uses `author__s`: `col()` escapes an identifier,
+not the binding or capability checks. A string column can sort, but
+`min(author)` as a metric fails because it requires a numeric expression.
+Documents missing the sort value always sort last, under
 both directions. Array values produced inside a composed expression require
 an explicit reducer.
 
@@ -503,3 +586,8 @@ after submission returns the same object as the final response line with no
 the table. Before execution, `?explain=request` returns the canonical request
 that the server parsed; posting that body back executes the same request. This
 expands JSON shorthand, but it is not a post-analysis query plan.
+`?explain=resolved` returns `{"request": ..., "resolved_fields": [...]}` and
+runs ordinary preparation without executing result collection. It acquires
+readers, respects freshness, and performs semantic validation and query
+preparation work. Replay its `request` member; the envelope is not a request
+body. See [HTTP explain modes](http-api.md#explain-modes).

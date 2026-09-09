@@ -33,6 +33,11 @@ query, and what a value means is decided by its field, not by its shape:
 `zip_s:02134` stays the string "02134", leading zero and all, because
 `zip_s` is a string field.
 
+On a field with [variants](schema.md#field-variants), the operation also
+chooses a representation: terms and phrases use `defaults.search`; `:=`
+and ranges use `defaults.value`. Both default to the primary (`self`).
+`field__label` and `field__self` explicitly select one representation.
+
 ## Terms and phrases
 
 ```
@@ -59,10 +64,67 @@ Multi-valued text fields place a position gap of 100 between values. This
 discourages accidental cross-value phrases but does not make values an
 absolute boundary: a phrase can cross adjacent values at slop 100 or more.
 
+## Exact values
+
+`:=` is exact membership, equivalent to structured `any_of`. It uses the value
+binding, so a whole-author filter can use the same bare field as text search:
+
+```http
+POST /collections/names/_search
+
+{"query":"author:=(\"Ursula K. Le Guin\", \"George R.R. Martin\")","fields":["id"],"get_number":true}
+```
+
+With the `names` collection from [Schema](schema.md#field-variants), this returns
+`b1` and `b2`. The forms are:
+
+| Form | Meaning |
+|---|---|
+| `author:="Ursula K. Le Guin"` | One whole value through `author__s`. |
+| `author:=("Ursula K. Le Guin", "George R.R. Martin")` | Any listed value. Lists need commas, at least one value, and no trailing comma. |
+| `author__self:=Guin` | Exact token membership on the primary TEXT representation. |
+| `author:=$authors` | A scalar or list from `vars`; the contents are values, never query syntax. |
+
+```http
+POST /collections/names/_search
+
+{
+  "query": {"expr": {
+    "q": "author:=$authors",
+    "vars": {"authors":["Ursula K. Le Guin","George R.R. Martin"]}
+  }},
+  "fields": ["id"],
+  "get_number": true
+}
+```
+
+Single and double quotes both delimit exact values. Quote whitespace,
+parentheses, and commas; the ordinary quoted-string escape rules apply.
+Quotes after `:=` never turn the value into a phrase.
+
+In an unquoted exact value, pattern and score suffix bytes stay literal:
+`tag_s:=mess*` matches the value `mess*`, `tag_s:=x~1` matches `x~1`, and
+`tag_s:=x^2` matches `x^2`. To decorate the query's score, delimit the value:
+`tag_s:="x^2"^3` or `tag_s:=("x^2", "mess*")^2`.
+
+STRING applies its whole-value normalizer. On TEXT, a literal producing more
+than one analyzed term is an error: `author__self:="Le Guin"` reports
+`any_of / := requires a single term per exact TEXT value` and points to
+match, phrase, or a whole-value string variant. `author:=(one two)` reports
+that the list needs a comma or closing parenthesis. These errors include the
+expression byte offset. Exact lookup terms over 255 bytes also produce a
+teaching error. STRING checks the normalized whole value at ingest and query
+time; TEXT exact membership checks the analyzed term. IDs retain their
+truncation contract.
+
+On TEXT, the single analyzed term is what is looked up. `author__self:="Guin!"`
+looks up `guin` and matches the same documents as `author__self:=Guin` or a
+match query for `Guin!`. A literal that analyzes to zero terms matches nothing.
+
 ## Special characters
 
 A character is only special in the position where its meaning applies, so
-most values need no escaping:
+most values need no escaping. Outside the exact-value forms above:
 
 - `:` separates the field name at the first colon only.
   `url_s:https://x.com/a?b=1` and `time_s:12:30:00` parse as you'd hope.
@@ -143,6 +205,13 @@ In a numeric field's group, `-` in front of a number binds to the number:
 `temp_i:(-5)` matches -5 rather than excluding 5. To exclude a value there,
 use `NOT`: `temp_i:(NOT 5)`.
 
+Logical field scopes distribute to each leaf before binding. For the author
+example, `author:(Martin AND >=M)` searches `Martin` on the primary and ranges
+on `author__s`; it returns no documents because `george r.r. martin` sorts
+before `m`. `author__self:(Martin AND >=M)` freezes both leaves on the primary
+and returns `b2`, whose tokens include `martin`. A field named inside the group
+still overrides the enclosing scope.
+
 ## Ranges and comparisons
 
 Any queryable field takes a range. Square brackets include the endpoint,
@@ -161,7 +230,9 @@ year_i:>=1960                    also >, <=, <
 On string, id, and text fields the range runs over the indexed terms in
 plain byte order (no collation), and uses the positional constant-scoring
 rule described below. Text
-endpoints fold the way the field folds, like prefix and fuzzy text.
+endpoints fold the way the field folds, like prefix and fuzzy text. STRING
+bounds pass through its normalizer, if present. Bare ranges use the value
+binding, including comparisons inside a field group.
 
 Endpoints are converted exactly the way field values are at indexing time,
 so querying a literal finds the documents indexed with it.
@@ -238,7 +309,8 @@ exists(year_i)       the same existence query in function form
 ```
 
 `field:*` works on every indexed or column-stored field type and lowers to the
-structured `{"exists":{"field":"field"}}` query. It matches documents that
+structured `{"exists":{"field":"field"}}` query. A bare name tests the primary;
+`field__label:*` tests that variant. It matches documents that
 supplied at least one accepted value: an empty string and text that analyzes to
 zero tokens are present, while an empty multi-valued array is missing. Values
 discarded during ingestion, such as a zero-norm cosine vector, are also missing.
@@ -256,7 +328,8 @@ contributes `0`. Filter and prohibited clauses never score.
 
 Prefix and fuzzy text is folded the way the field folds - `title_t:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
-string fields the text is used exactly as written.
+string fields a configured normalizer applies without splitting the value;
+otherwise the text is used exactly as written.
 
 Fuzzy matching currently requires the first byte to match exactly (the
 default `prefix_length` is 1, which bounds the scan); `hte~1` will not find
@@ -315,6 +388,10 @@ boolean(required=[status_s:active], optional=[title_t:dune, title_t:messiah], mi
 simple_query($user_input, fields=[title_t, body_t], operator=AND)
 all()
 ```
+
+Exact membership is also callable:
+`any_of(("Ursula K. Le Guin", "George R.R. Martin"), field=author)`.
+It has the same value binding and literal rules as `author:=(...)`.
 
 `expr` is already the surrounding language and is written inline. `geo_box`
 and `geo_distance` currently have no function form; use their structured JSON

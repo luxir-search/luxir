@@ -14,8 +14,14 @@ locations, browse `src/luxir/<area>/`.
 
 2. **Search Engine** (`src/luxir/search/`)
    - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment
+     - Physical field catalog records available columns and stored resources;
+       logical retrieval discovery is cached per reader and schema identity
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
      - Implements parallel segment searching using TBB
+     - Ordinary preparation is shared with HTTP `?explain=resolved`;
+       `?explain=request` only parses and serializes
+   - `EmitDocs`: `ReturnField` separates the requested output key from the physical
+     read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
    - `PostingsReader` reads a single segment and owns the open files for that segment
@@ -47,6 +53,9 @@ locations, browse `src/luxir/<area>/`.
    - `ProtobufQueryParser` lowers the wire tree (`luxir::api::Query`) via `QueryBuilder`
      (the single place query-time analysis is applied); `ParseContext` carries the
      request pool, schema, warnings sink, and shared nesting budget
+   - `FieldResolver`: Parse-local handles cached by spelling and operation class,
+     with one mutable analysis/normalization chain per field descriptor;
+     lowering retains the resolved physical target
    - String parsers emit `api::Query` subtrees and lower through the same path:
      `SimpleQueryParser` (never-fails search-box input) and `ExprParser` (the rigorous
      `expr` query language; `Cursor` is its bounds-checked input, `ExprFunctions.h` the
@@ -55,7 +64,13 @@ locations, browse `src/luxir/<area>/`.
 5. **Indexing** (`src/luxir/index/`)
    - `IndexWriter`: Handles multi-threaded indexing with TBB flow graph pipeline.
      - Manages `Inverter` instances, flushing, merging, and commits.
-   - `Inverter`: Low level single-threaded document processing for a single segment.
+     - Pins schema at update admission; validates physical-name signatures before
+       schema publication and drains admitted work for incompatible redefinitions
+   - `Inverter`: Single-threaded document processing under one pinned schema.
+     - `InputHandler`: One logical dispatcher per document key; stores source once
+       when the primary enables it and sends the submitted value to every branch
+     - `IndexHandler`: One physical representation, owned by `indexHandlers`;
+       finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
    - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
      optional points indexes at flush; `SegmentMerger` carries 1-D points
@@ -74,12 +89,25 @@ locations, browse `src/luxir/<area>/`.
    - `DirectoryFactory`: constructs directories (`RAMDirFactory`, `FSDirFactory`, `CheckedDirFactory`)
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
+8. **Schema** (`src/luxir/schema/`)
+   - `LogicalField`: Primary, variants, and search/value bindings;
+     `FieldType` describes one physical representation
+   - `ResolvedFieldHandle`: Logical owner, role, descriptor, and owned logical/physical
+     names; dynamic roots reference immutable template prototypes
+   - `Schema`: Separate logical input, operation-based request, and physical lookup;
+     authored source stays sparse, resolved HTTP view exposes effective settings
+     and introduction/segment generations for conservative coverage
+   - `IndexInfo.field_signatures`: Persisted physical-name semantics;
+     `SchemaInfo`: Authored definition plus introduction history
+
 ## Data Organization
 
 - **Library**: Top-level multi-tenancy container
 - **Collection**: Logical document group with schema
 - **Shard**: Physical collection partition, consists of a single **Index**
 - **Segment**: Immutable index unit
+  - Flush records the pinned schema generation; merge records the minimum input
+    generation, preserving the no-backfill contract
 
 ## Request Flow
 
