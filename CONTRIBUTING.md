@@ -34,6 +34,13 @@ Commit messages are concise and describe what changed, for example
 `facets: exact counts for date histograms with time zones`. They do not
 describe process, review rounds, or tooling.
 
+## Use of AI
+
+We require all use of AI in contributions to follow our [AI policy](AI_POLICY.md).
+In short: AI tools are fine for writing code, but you remain responsible for
+what you submit, you must be able to explain it in your own words, and
+communication with maintainers is written by humans, not generated.
+
 ## Documentation
 
 User and design documentation lives in [`docs/`](docs/README.md) as plain
