@@ -7,11 +7,11 @@ this page gets you to a working search in a few commands.
 
 ## Get Luxir
 
-Luxir is currently a source preview, not a packaged binary or container. Its
-presets assume a prepared Linux/GCC/vcpkg development environment; the current
-setup and its limitations are in [Build Setup](../dev/build-setup.md). The
-release result is `build/gcc-release/bin/luxir`. The commands below assume that
-binary is on your `PATH`.
+Download the release for your platform from <https://luxir.org/download/>,
+unpack it, and put the `luxir` binary on your `PATH`. Releases are built for
+Linux on x86-64. If you would rather build it yourself, or want to work on the
+engine, [Build Setup](../dev/build-setup.md) covers the toolchain and presets;
+the result is `build/gcc-release/bin/luxir`.
 
 ## Start the server
 

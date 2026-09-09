@@ -43,10 +43,11 @@ For the design rationale, see [Architecture](docs/design/architecture.md).
 
 ## Try it
 
-Start a built server and check the HTTP endpoint:
+Download a release from <https://luxir.org/download/>, put the `luxir`
+binary on your `PATH`, start it, and check the HTTP endpoint:
 
 ```bash
-./build/gcc-release/bin/luxir
+luxir
 curl http://localhost:9400/health
 ```
 
@@ -71,9 +72,10 @@ Continue with the [Quickstart](docs/guide/quickstart.md), then use the
 
 ## Build from source
 
-Luxir is pre-1.0 and currently distributed as source. It requires a
-C++26-capable compiler, CMake, Ninja, vcpkg, and the native dependencies listed
-in [Build Setup](docs/dev/build-setup.md). With those dependencies installed:
+Releases with binaries are published on the [download page](https://luxir.org/download/).
+To build from source instead, Luxir requires a C++26-capable compiler, CMake,
+Ninja, vcpkg, and the native dependencies listed in
+[Build Setup](docs/dev/build-setup.md). With those dependencies installed:
 
 ```bash
 cmake --preset gcc-release
@@ -94,7 +96,7 @@ guarantee before 1.0: expect to reindex when upgrading. It is currently a
 single-node engine with no built-in authentication or TLS; deploy it behind
 your own network and security boundary. Replication, distributed query
 execution, packaged clients, and a collection-management API are not shipped
-yet. Source builds also assume a prepared Linux/GCC/vcpkg environment; there is
-no packaged binary or turnkey clean-machine installer yet. The
+yet. Binary releases target Linux on x86-64; other platforms build from source
+and assume a prepared Linux/GCC/vcpkg environment. The
 [operations guide](docs/guide/operations.md) covers the production boundary
 honestly.
