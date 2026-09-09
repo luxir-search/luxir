@@ -62,7 +62,7 @@ curl -X POST http://localhost:9400/collections/books/_update \
 Search it:
 
 ```bash
-curl -X POST http://localhost:9400/collections/books/_search \
+curl -X POST 'http://localhost:9400/collections/books/_search?pretty' \
   -H 'Content-Type: application/json' \
   -d '{"query":{"match":{"title_t":"kings"}},"fields":["id","author_s","year_i"]}'
 ```

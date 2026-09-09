@@ -58,9 +58,10 @@ later when you want control - you do not need one to start.
 
 > **Reading the rest of this page:** requests are shown as HTTP: method, path,
 > and body. On the website, every request block has a **Copy as curl** button
-> that copies the runnable command. Reading the Markdown source, wrap one
+> that copies the runnable command, with `?pretty` added to the URL so the
+> output reads well in a terminal. Reading the Markdown source, wrap one
 > yourself as above:
-> `curl -X POST http://localhost:9400<path> -H 'Content-Type: application/json' -d '<body>'`.
+> `curl -X POST 'http://localhost:9400<path>?pretty' -H 'Content-Type: application/json' -d '<body>'`.
 
 ## Search
 
