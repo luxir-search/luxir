@@ -102,14 +102,14 @@ POST /collections/books/_search
 ```
 
 `k` is the number of nearest-neighbor documents produced by the query node;
-the surrounding `top_docs.limit` controls how many are returned. With no ANN
-overlay, or with `exact: true`, the engine scans the full-precision vector
-column. Once an ANN overlay exists, the default path may use it segment by
-segment and then rescore candidates from the full-precision column.
+the request's `limit` controls how many are returned. With no ANN overlay, or
+with `exact: true`, the engine scans the full-precision vector column. Once an
+ANN overlay exists, the default path may use it segment by segment and then
+rescore candidates from the full-precision column.
 
 ## Filter inside kNN
 
-Put ordinary filters on the same `top_docs` operation:
+Put ordinary filters beside the query:
 
 ```json
 {

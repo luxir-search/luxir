@@ -1,10 +1,10 @@
 # Searching
 
 A Luxir search request describes the result, not a sequence of calls. The
-small form asks for one ranked document list. The full form names several
-operations and nests facets or metrics under the query whose match set they
-should consume. Both are the same model: the small form becomes a `top_docs`
-operation named `q`.
+small form asks for one ranked document list, with facets or metrics nested
+under the query whose match set they should consume. The full form names
+several independent operations. Both are the same model: the small form
+becomes a `top_docs` operation named `q`.
 
 HTTP searches accept either method:
 
@@ -285,29 +285,24 @@ pagination token.
 
 ## One request, several results
 
-Use the full request when the response should include analytics as well as
-documents. The simple fields move unchanged one level under `top_docs`:
+Add `ops` beside the query when the response should include analytics as well
+as documents. Each operation sees every document the query and its filters
+match, regardless of `limit`:
 
 ```http
 POST /collections/books/_search
 
 {
+  "query": "title_t:dune",
+  "filter": ["stock_i:>0"],
+  "limit": 10,
+  "get_number": true,
+  "fields": ["id","title_t","price_f"],
   "ops": {
-    "results": {
-      "top_docs": {
-        "query": "title_t:dune",
-        "filter": ["stock_i:>0"],
-        "limit": 10,
-        "get_number": true,
-        "fields": ["id","title_t","price_f"],
-        "ops": {
-          "categories": {
-            "field_facet": {"field":"category_s","limit":10}
-          },
-          "average_price": "avg(price_f)"
-        }
-      }
-    }
+    "categories": {
+      "field_facet": {"field":"category_s","limit":10}
+    },
+    "average_price": "avg(price_f)"
   }
 }
 ```
@@ -329,20 +324,52 @@ POST /collections/books/_search
 ```
 
 The document list is promoted to `found` and `docs` in the HTTP envelope;
-nested and sibling operation results appear under `ops`. Expression metrics
-fold `avg`, `sum`, `min`, or `max` over value expressions and ignore missing
-document values. Integer results stay typed as integers; averages and
-floating-point results are doubles. An empty metric domain renders as `null`
-in JSON.
+operation results appear under `ops` by name. Expression metrics fold `avg`,
+`sum`, `min`, or `max` over value expressions and ignore missing document
+values. Integer results stay typed as integers; averages and floating-point
+results are doubles. An empty metric domain renders as `null` in JSON.
 
 See [Faceting](faceting.md) for terms, range, date, nested, and per-bucket
 operations. See [Vector Search](vector-search.md#hybrid-search-with-rrf) for a
 full fusion operation with several ranked sources.
 
+## Full request form
+
+The shorthand above is one `top_docs` operation named `q`, and its `ops` are
+that operation's sub-operations. The full form spells this out, naming every
+operation in a request-level `ops` map:
+
+```json
+{
+  "ops": {
+    "q": {
+      "top_docs": {
+        "query": "title_t:dune",
+        "filter": ["stock_i:>0"],
+        "limit": 10,
+        "get_number": true,
+        "fields": ["id","title_t","price_f"],
+        "ops": {
+          "categories": {"field_facet": {"field":"category_s","limit":10}},
+          "average_price": "avg(price_f)"
+        }
+      }
+    }
+  }
+}
+```
+
+The response is the same. Use the full form when a request needs several
+independent operations: a `fusion` beside a `top_docs`, two result lists, or a
+facet over the whole collection with no query. Any top-document key at the
+root selects the shorthand, and `ops` then holds that query's sub-operations
+rather than request operations. `?explain=request` echoes the full form of any
+request.
+
 ## Request-level controls
 
-Request-wide settings work in both body forms - alongside `ops` in the full
-form, or mixed directly with query keys at the shorthand root:
+Request-wide settings mix directly with query keys in the shorthand, and sit
+beside `ops` in the full form:
 
 ```json
 {
@@ -351,19 +378,10 @@ form, or mixed directly with query keys at the shorthand root:
   "time_zone": "America/Denver",
   "profile": true,
   "max_parallel": 1,
-  "ops": {
-    "results": {"top_docs": {"query":"published_dt:>=NOW/DAY","limit":10}}
-  }
+  "query": "published_dt:>=NOW/DAY",
+  "limit": 10
 }
 ```
-
-```json
-{"query": "published_dt:>=NOW/DAY", "limit": 10, "time_zone": "America/Denver", "max_parallel": 1}
-```
-
-In the shorthand, an `ops` key holds the query's sub-operations (facets and
-metrics over its result domain), exactly as it does inside a full-form
-`top_docs`.
 
 `freshness_ms` bounds how stale an index view may be; `0` requires the latest
 commit. `time_zone` supplies the civil frame for every date query and facet in

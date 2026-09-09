@@ -90,7 +90,7 @@ but do not constrain the match set by default. With only optional clauses, at
 least one must match. Set `min_match` to make the optional group an explicit
 constraint.
 
-Top-level `top_docs.filter` accepts bare query strings and structured query
+The query's `filter` list accepts bare query strings and structured query
 objects. A routing wrapper adds `except_ops` when sibling operations should not
 see the filter:
 

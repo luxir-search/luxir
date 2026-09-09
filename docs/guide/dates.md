@@ -60,8 +60,8 @@ POST /collections/main/_search
  "query": {"range": {"field": "when_dt", "gte": "NOW/DAY"}}}
 ```
 
-(`time_zone` is a request-level setting; it mixes directly with query keys in
-the shorthand shown here, and sits beside `ops` in the full request form.)
+(`time_zone` is a request-level setting: it sits beside the query, not inside
+it, and applies to every date in the request.)
 
 The zone can be an IANA name (case-sensitive) or a fixed offset such as
 `+05:30`. It changes three things:
@@ -96,6 +96,7 @@ calendar gap in the facet's zone:
 POST /collections/main/_search
 
 {"time_zone": "America/Denver",
+ "query": {"range": {"field": "when_dt", "gte": "NOW/DAY-7DAYS"}},
  "ops": {"per_day": {"range_facet": {
    "field": "when_dt",
    "start": "NOW/DAY-7DAYS", "end": "NOW/DAY+1DAY",

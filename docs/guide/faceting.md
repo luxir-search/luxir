@@ -1,28 +1,22 @@
 # Faceting and metrics
 
-Facets are search operations over a document domain. Put them under
-`top_docs.ops` and they see every document matched by that query and its
-filters, not merely the hits returned by `limit`. That lets one request return
-the documents for a page and the analytics used to navigate it.
+Facets are search operations over a document domain. Put them in the `ops`
+of a query and they see every document matched by that query and its filters,
+not merely the hits returned by `limit`. That lets one request return the
+documents for a page and the analytics used to navigate it.
 
 ```http
 POST /collections/books/_search
 
 {
+  "query": "title_t:dune",
+  "filter": ["stock_i:>0"],
+  "limit": 10,
+  "get_number": true,
+  "fields": ["id","title_t"],
   "ops": {
-    "results": {
-      "top_docs": {
-        "query": "title_t:dune",
-        "filter": ["stock_i:>0"],
-        "limit": 10,
-        "get_number": true,
-        "fields": ["id","title_t"],
-        "ops": {
-          "categories": {
-            "field_facet": {"field":"category_s","limit":10,"missing":true}
-          }
-        }
-      }
+    "categories": {
+      "field_facet": {"field":"category_s","limit":10,"missing":true}
     }
   }
 }
@@ -87,14 +81,16 @@ category values occur?" Integer/date/text field facets currently support
 sorts. Use a range facet when numeric values should be bucketed rather than
 enumerated.
 
-A nonempty `selected` is supported for facets directly under `top_docs.ops`.
-The selected values refine the document result; `selection_mode: "all"`
-requires every value instead of the default any-value match. The field facet's
-ordinary page is still finalized over all buckets. A selected value that lands
-in that page appears once at its natural sorted position. After the page,
-selected values not already emitted append in request order with exact counts.
-These appended buckets are exempt from `mincount`, may name values absent from
-the index, and carry the same sub-operation results as ordinary buckets.
+A nonempty `selected` is supported for facets directly under the query's
+`ops`: not at the root of a full-form request, under a `fusion`, or nested
+inside another facet. The selected values refine the document result;
+`selection_mode: "all"` requires every value instead of the default any-value
+match. The field facet's ordinary page is still finalized over all buckets. A
+selected value that lands in that page appears once at its natural sorted
+position. After the page, selected values not already emitted append in
+request order with exact counts. These appended buckets are exempt from
+`mincount`, may name values absent from the index, and carry the same
+sub-operation results as ordinary buckets.
 
 ## Expression metrics
 
@@ -135,9 +131,9 @@ For DATE values, `avg`, `min`, and `max` are legal and retain date meaning;
 `sum(DATE)` is rejected as a unit clash. Multiplication, division, unary minus,
 and unary math demote a DATE expression to an ordinary number.
 
-At the request root or directly under `top_docs.ops`, the result is one scalar
-over the incoming domain. Nested under a string or ID facet, it is evaluated
-independently for each bucket:
+Directly under the query's `ops` (or at the root of a full-form request), the
+result is one scalar over the incoming domain. Nested under a string or ID
+facet, it is evaluated independently for each bucket:
 
 ```json
 "categories": {
@@ -441,7 +437,7 @@ the same expression metrics, nested facets, and per-bucket `top_docs` as other
 fixed-bucket facets.
 
 For multi-select navigation, put a nonempty `selected` on a query facet
-directly under `top_docs.ops`. Values are bucket names:
+directly under the query's `ops`. Values are bucket names:
 
 ```json
 "price_tiers": {
