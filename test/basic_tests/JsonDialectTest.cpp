@@ -547,17 +547,17 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   std::string err;
   ASSERT_TRUE(P::read_json(def, wire, mr, &err)) << err;
 
-  const P::FieldDef* title = def.fields.find("title");
+  const P::FieldDef* title = def.fields.at("title").operator->();
   ASSERT_NE(nullptr, title);
   EXPECT_EQ(P::FieldDef::FieldClass::TEXT, *title->type);
   EXPECT_EQ("unicode_word", title->analyzer->tokenizer->name);
   EXPECT_TRUE(*title->stored);
-  const P::FieldDef* vec = def.fields.find("vec");
+  const P::FieldDef* vec = def.fields.at("vec").operator->();
   ASSERT_NE(nullptr, vec);
   EXPECT_EQ(4, *vec->dims);
   EXPECT_EQ(P::VectorMetric::COSINE, *vec->metric);
   EXPECT_FALSE(vec->stored.has_value()) << "sparse presence preserved";
-  const P::FieldDef* tmpl = def.templates.find("_x");
+  const P::FieldDef* tmpl = def.templates.at("_x").operator->();
   ASSERT_NE(nullptr, tmpl);
   EXPECT_TRUE(*tmpl->multi);
 
@@ -572,10 +572,10 @@ TEST(JsonDialect, FieldDefStringShorthand) {
   std::pmr::monotonic_buffer_resource mr;
   P::SchemaDef def;
   ASSERT_TRUE(P::read_json(def, R"({"fields":{"year":"int","tag":"string"}})", mr));
-  const P::FieldDef* year = def.fields.find("year");
+  const P::FieldDef* year = def.fields.at("year").operator->();
   ASSERT_NE(nullptr, year);
   EXPECT_EQ(P::FieldDef::FieldClass::INT, *year->type);
-  EXPECT_EQ(P::FieldDef::FieldClass::STRING, *def.fields.find("tag")->type);
+  EXPECT_EQ(P::FieldDef::FieldClass::STRING, *def.fields.at("tag")->type);
 
   std::string out;
   ASSERT_TRUE(P::write_json(def, out));
@@ -643,8 +643,8 @@ TEST(JsonDialect, FieldDefStrictReads) {
   {  // parent + inherited type reads fine with no type at all
     P::SchemaDef def;
     ASSERT_TRUE(P::read_json(def, R"({"fields":{"t":{"parent":"_un"}}})", mr));
-    EXPECT_FALSE(def.fields.find("t")->type.has_value());
-    EXPECT_EQ("_un", def.fields.find("t")->parent);
+    EXPECT_FALSE(def.fields.at("t")->type.has_value());
+    EXPECT_EQ("_un", def.fields.at("t")->parent);
   }
 }
 

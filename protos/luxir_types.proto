@@ -1205,6 +1205,21 @@ message AnalyzerDef {
   repeated AnalyzerComponent filters = 2;  // applied in order, e.g., ["nfkc_cf", "fold"]
 }
 
+// Presence-bearing wrappers: absent inherits, present replaces, empty clears.
+// The JSON dialect flattens these to an object and an array, respectively.
+message FieldVariants {
+  map<string, FieldDef> entries = 1;
+}
+
+message FieldDefaults {
+  optional string search = 1;  // local label or "self"; absent means self
+  optional string value = 2;
+}
+
+message NormalizerDef {
+  repeated AnalyzerComponent filters = 1;  // STRING only; keyword input, filters only
+}
+
 // Vector similarity metric.  NONE = storage-only, not kNN-searchable;
 // L2 / IP / COSINE select the metric for exact column search and any
 // aux-backed ANN engine.  (File-scope because proto enum values scope to the
@@ -1258,7 +1273,7 @@ message FieldDef {
   // entry in the schema).  Empty / unset means the default "_stored_" resource.
   // Use named resources to group fields into separate column families (e.g.
   // "_stored_embeddings_" for co-located embedding bytes).
-  string stored_resource = 8;
+  optional string stored_resource = 8;
 
   // --- VECTOR fields ---
 
@@ -1280,6 +1295,10 @@ message FieldDef {
   // default to false.  A cosine field skips and logs zero / near-zero vectors
   // when normalized is false.
   optional bool normalize_on_write = 12;
+
+  FieldVariants variants = 13;
+  FieldDefaults defaults = 14;
+  NormalizerDef normalizer = 15;
 }
 
 message SchemaDef {

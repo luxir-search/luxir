@@ -5,6 +5,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
+#include <map>
 #include <stdexcept>
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/ApiError.h"
@@ -21,72 +22,86 @@ public:
     : ApiError(ErrorKind::INVALID_REQUEST, "invalid_schema", message) {}
 };
 
-// Schema objects are currently immutable after construction.
+using PhysicalFieldMap = boost::unordered_flat_map<std::string, std::shared_ptr<FieldType>,
+                                                    PackedTermHash, PackedTermEqual>;
+
+enum class OpClass { SEARCH, VALUE, EXISTS, RETRIEVE };
+enum class FieldRole { PRIMARY, VARIANT };
+
+// One input shape and storage owner, with independently compiled physical bundles.
+// Dynamic roots use the template's prototypes; their actual names live in handles.
+struct LogicalField {
+  enum class Shape { SCALAR, VECTOR, GEO };
+  std::string name;
+  std::shared_ptr<FieldType> primary;
+  std::map<std::string, std::shared_ptr<FieldType>, std::less<>> variants;
+  std::string search = "self";
+  std::string value = "self";
+  Shape shape = Shape::SCALAR;
+  bool multi = false;
+  FieldType* storageOwner = nullptr;
+  size_t maxRootLength = 127;
+};
+
+// Names are owned by the handle; pointers remain valid for the Schema lifetime.
+// A dynamic root uses its template's FieldTypes and LogicalField. For hand-built
+// schemas, owner == nullptr means a single representation with both bindings self.
+// Consumers carry the handle through lowering instead of resolving its name again.
+struct ResolvedFieldHandle {
+  std::string logicalName;
+  std::string physicalName;
+  FieldType* fieldType;
+  FieldRole role;
+  const LogicalField* owner;
+};
+
+// Schema lookup is immutable and never retains names supplied by a request.
 class Schema {
 public:
-  using map_type = boost::unordered_flat_map<std::string, std::shared_ptr<FieldType>, PackedTermHash, PackedTermEqual>;
-  using iterator = map_type::iterator;
-  using const_iterator = map_type::const_iterator;
+  using map_type = PhysicalFieldMap;
 
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
-  std::string sourceDef_;     // serialized bytes of the authored SchemaDef proto (before inheritance resolution)
+  std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
+
+private:
+  using logical_map = boost::unordered_flat_map<std::string, std::unique_ptr<LogicalField>,
+                                               PackedTermHash, PackedTermEqual>;
+  logical_map logicalFields;
+  struct RootField {
+    const std::shared_ptr<FieldType>* primary = nullptr;
+    const LogicalField* owner = nullptr;
+  };
+
+  RootField findRoot(std::string_view root) const;
+  const std::shared_ptr<FieldType>* findPhysical(std::string_view name) const;
 
 public:
-  Schema() {};
+  Schema() = default;
 
-  auto end() const {
-    return fieldTypeMap.end();
+  // Ingest accepts logical document keys only. The returned primary handle
+  // exposes the owner and its variants for the later ingest dispatcher.
+  ResolvedFieldHandle resolveInput(std::string_view docKey) const;
+  ResolvedFieldHandle resolveFor(std::string_view name, OpClass op) const;
+  // Already-resolved physical access: no defaults or __self aliases.
+  FieldType* physical(std::string_view name) const;
+
+  // Physical lookup includes suffix-template prototypes, never bindings or
+  // __self aliases. Copy a shared_ptr before the Schema's lifetime ends.
+  const std::shared_ptr<FieldType>& getFieldTypeEx(std::string_view name) const {
+    auto* type = findPhysical(name);
+    if (!type) throw RequestError("Field not found: " + std::string(name), "unknown_field");
+    return *type;
   }
 
-  // Returns a const_iterator to the FieldType for the fieldName or end() if not found.
-  // Exact-name lookup matches concrete fields only; suffix matching ("title_w" ->
-  // "_w") matches templates (abstract entries) only.
-  const_iterator getFieldType(std::string_view fieldName) const {
-    auto it = fieldTypeMap.find(fieldName);
-    if (it != fieldTypeMap.end()) {
-      if (it->second->isAbstract()) return fieldTypeMap.end();
-      return it;
-    }
-    // Not found - try a suffix match against templates
-    auto underscorePos = fieldName.find_last_of('_');
-    if (underscorePos != std::string_view::npos && underscorePos > 0) {
-      std::string_view suffix = fieldName.substr(underscorePos);
-      it = fieldTypeMap.find(suffix);
-      if (it != fieldTypeMap.end() && it->second->isAbstract()) {
-        return it;
-      }
-    }
-    return fieldTypeMap.end();
+  std::shared_ptr<FieldType> getFieldTypeOrNull(std::string_view name) const {
+    auto* type = findPhysical(name);
+    return type ? *type : std::shared_ptr<FieldType>{};
   }
 
-  // Returns the FieldType for the fieldName or throws an exception if not found.
-  // The shared_ptr reference should be copied before the lifetime of the Schema object ends.
-  const std::shared_ptr<FieldType>& getFieldTypeEx(std::string_view fieldName) const {
-    auto it = getFieldType(fieldName);
-    if (it == fieldTypeMap.end()) {
-      throw RequestError("Field not found: " + std::string(fieldName), "unknown_field");
-    }
-    return it->second;
-  }
-
-  // Returns the FieldType for the fieldName or null (empty shared_ptr) if not found.
-  std::shared_ptr<FieldType> getFieldTypeOrNull(std::string_view fieldName) const {
-    auto it = getFieldType(fieldName);
-    if (it == fieldTypeMap.end()) {
-      return {};
-    }
-    return it->second;
-  }
-
-  // Returns the FieldType for a given field name, or nullptr if not defined.
-  // The returned pointer is only valid for the lifetime of this Schema object.
-  FieldType* getFieldTypePtr(std::string_view fieldName) const {
-    auto it = getFieldType(fieldName);
-    if (it == fieldTypeMap.end()) {
-      return nullptr;
-    }
-    return it->second.get();
+  FieldType* getFieldTypePtr(std::string_view name) const {
+    auto* type = findPhysical(name);
+    return type ? type->get() : nullptr;
   }
 
   // Build a Schema from a SchemaDef proto (fields + templates maps).
@@ -114,6 +129,7 @@ public:
   // LAST underscore of a field name).
   static bool validFieldName(std::string_view name);
   static bool validTemplateName(std::string_view name);
+  static bool validVariantLabel(std::string_view label);
 
   // Create the default schema with built-in fields.
   static std::shared_ptr<Schema> createDefaultSchema();

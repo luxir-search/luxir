@@ -7,6 +7,10 @@
 
 namespace luxir {
 
+void StrFieldType::normalize(std::string& value) const {
+  if (normalizer) normalizer->createChain()->normalizeTerm(value);
+}
+
 TextFieldType::TextFieldType(std::string_view name, int flags, std::string_view tokenizer,
                              std::vector<std::string> filters)
     : FieldType(name, FieldType::TEXT, flags) {

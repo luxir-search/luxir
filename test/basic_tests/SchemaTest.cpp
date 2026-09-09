@@ -746,14 +746,14 @@ TEST_F(SchemaTest, toProtoEmitsAuthoredSourceDeterministically) {
   EXPECT_EQ("zebra", out.fields[3].first);
 
   // Sparse: zebra only authored `type`; nothing else materialized.
-  const api::FieldDef* zebra = out.fields.find("zebra");
+  const api::FieldDef* zebra = out.fields.at("zebra").operator->();
   ASSERT_NE(nullptr, zebra);
   EXPECT_TRUE(zebra->type.has_value());
   EXPECT_FALSE(zebra->index.has_value());
   EXPECT_FALSE(zebra->column.has_value());
 
   // Parent reference preserved (not resolved away).
-  const api::FieldDef* apple = out.fields.find("apple");
+  const api::FieldDef* apple = out.fields.at("apple").operator->();
   ASSERT_NE(nullptr, apple);
   EXPECT_EQ("_un", apple->parent);
 
@@ -943,12 +943,12 @@ TEST_F(SchemaTest, indexModeToProto) {
   api::SchemaDef out;
   schema->toProto(&out, arena);
 
-  const api::FieldDef* tagOut = out.fields.find("tag");
+  const api::FieldDef* tagOut = out.fields.at("tag").operator->();
   ASSERT_NE(nullptr, tagOut);
   ASSERT_TRUE(tagOut->index.has_value());
   EXPECT_EQ(IndexMode::MATCH, *tagOut->index);
 
-  const api::FieldDef* priceOut = out.fields.find("price");
+  const api::FieldDef* priceOut = out.fields.at("price").operator->();
   ASSERT_NE(nullptr, priceOut);
   EXPECT_FALSE(priceOut->index.has_value()) << "unset index stays absent in the authored echo";
 }
@@ -993,7 +993,7 @@ TEST_F(SchemaTest, schemaPersistence) {
   ASSERT_TRUE(api::decode(persistedDef, paddedPersistedBytes, arena));
 
   // The persisted def should contain "title" field
-  const api::FieldDef* title = persistedDef.fields.find("title");
+  const api::FieldDef* title = persistedDef.fields.at("title").operator->();
   ASSERT_NE(nullptr, title) << "Persisted schema should contain 'title' field";
   EXPECT_EQ(FieldClass::TEXT, *title->type);
 
@@ -1179,7 +1179,7 @@ TEST_F(SchemaTest, sourceDef) {
   auto paddedSourceBytes = api::copyToPaddedInput(std::as_bytes(sourceBytes), arena);
   ASSERT_TRUE(api::decode(roundtripped, paddedSourceBytes, arena));
 
-  const api::FieldDef* title = roundtripped.fields.find("title");
+  const api::FieldDef* title = roundtripped.fields.at("title").operator->();
   ASSERT_NE(nullptr, title);
   EXPECT_EQ("_un", title->parent) << "sourceDef should preserve parent references";
   EXPECT_NE(nullptr, roundtripped.templates.find("_un"))
@@ -1227,4 +1227,458 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
     << "Loaded schema should contain 'field3' from the newest schema";
 
   ch.collection().setSchema(Schema::createDefaultSchema());
+}
+
+// Keep the parser, schema compiler, and persisted source on the same path in
+// these fixtures. Returned schemas own all resolved state after this arena dies.
+static std::shared_ptr<Schema> schemaJson(std::string_view json, const Schema* base = nullptr) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  std::string error;
+  if (!api::read_json(def, json, arena, &error)) throw std::runtime_error(error);
+  return Schema::fromProto(def, base);
+}
+
+static std::string authoredJson(const Schema& schema) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  schema.toProto(&def, arena);
+  std::string json;
+  if (!api::write_json(def, json)) throw std::runtime_error("schema JSON encode failed");
+  return json;
+}
+
+TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
+  auto s = schemaJson(R"({"fields":{
+    "author":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}},
+    "genre":{"type":"string","variants":{"t":"text"},"defaults":{"search":"t"}},
+    "edition":{"type":"int","index":"range","variants":{"label":"string"}},
+    "self":"string", "f_":{"type":"text","variants":{"s":"string"}}
+  }})");
+  auto input = s->resolveInput("author");
+  EXPECT_EQ("author", input.logicalName);
+  EXPECT_EQ("author", input.physicalName);
+  EXPECT_EQ(FieldRole::PRIMARY, input.role);
+  EXPECT_EQ(input.fieldType, input.owner->primary.get());
+  EXPECT_EQ(input.fieldType, input.owner->storageOwner);
+  EXPECT_EQ(LogicalField::Shape::SCALAR, input.owner->shape);
+  EXPECT_EQ("author", s->resolveFor("author", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("author__s", s->resolveFor("author", OpClass::VALUE).physicalName);
+  EXPECT_EQ("genre__t", s->resolveFor("genre", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("genre", s->resolveFor("genre", OpClass::VALUE).physicalName);
+  EXPECT_EQ("edition", s->resolveFor("edition", OpClass::VALUE).physicalName);
+  EXPECT_EQ(FieldType::STRING, s->physical("edition__label")->type());
+  for (auto op : {OpClass::SEARCH, OpClass::VALUE, OpClass::EXISTS, OpClass::RETRIEVE}) {
+    EXPECT_EQ("author", s->resolveFor("author__self", op).physicalName);
+    auto variant = s->resolveFor("author__s", op);
+    EXPECT_EQ("author__s", variant.physicalName);
+    EXPECT_EQ(FieldRole::VARIANT, variant.role);
+    EXPECT_EQ(input.owner, variant.owner);
+    EXPECT_EQ(variant.fieldType, variant.owner->variants.at("s").get());
+    EXPECT_EQ("_version_", s->resolveFor("_version___self", op).physicalName);
+    EXPECT_EQ("self", s->resolveFor("self__self", op).physicalName);
+    EXPECT_EQ("f___s", s->resolveFor("f___s", op).physicalName);
+  }
+  EXPECT_EQ("author", s->resolveFor("author", OpClass::EXISTS).physicalName);
+  EXPECT_EQ("author", s->resolveFor("author", OpClass::RETRIEVE).physicalName);
+  auto* derived = s->physical("author__s");
+  EXPECT_TRUE(derived->isDerived());
+  EXPECT_FALSE(derived->isAbstract());
+  EXPECT_FALSE(derived->isStored());
+  EXPECT_EQ(derived, s->fieldTypeMap.at("author__s").get());
+  EXPECT_EQ(derived, s->getFieldTypePtr("author__s"));
+  EXPECT_EQ(input.fieldType, s->physical("author")); // physical never follows a binding
+  EXPECT_THROW(s->physical("author__self"), RequestError);
+  EXPECT_EQ(nullptr, s->getFieldTypePtr("author__self"));
+  EXPECT_FALSE(s->fieldTypeMap.contains("author__self"));
+}
+
+TEST_F(SchemaTest, variantSelectorErrorsAndInputSeparation) {
+  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","variants":{"s":"int"}}},
+                         "fields":{"a":{"parent":"_t"}}})");
+  for (auto name : {"a__s", "a__self", "_version___self", "a__", "external__a"}) {
+    SCOPED_TRACE(name);
+    EXPECT_THROW(s->resolveInput(name), RequestError);
+  }
+  for (auto name : {"missing", "missing__s", "a__missing", "a__S", "a__", "a__1s",
+                    "a__s__s", "a__s_!", "a__*", "_t", "_t__s", "_t__self", "_stored_"}) {
+    SCOPED_TRACE(name);
+    EXPECT_THROW(s->resolveFor(name, OpClass::SEARCH), RequestError);
+  }
+  EXPECT_EQ("a", s->resolveFor("a__SeLf", OpClass::SEARCH).physicalName);
+  EXPECT_EQ(nullptr, s->getFieldTypePtr("a__missing"));
+}
+
+TEST_F(SchemaTest, variantsTemplateInstancesResolveRootBeforeSuffix) {
+  auto base = Schema::createDefaultSchema();
+  auto s = schemaJson(R"({"templates":{
+    "_t":{"type":"text","variants":{"s":"int"},"defaults":{"value":"s"}},
+    "_ts":{"parent":"_t","multi":true}
+  },"fields":{"concrete_t":"string"}})", base.get());
+  auto variant = s->resolveFor("book_t__s", OpClass::VALUE);
+  EXPECT_EQ(FieldType::INT, variant.fieldType->type());
+  EXPECT_EQ("book_t", variant.logicalName);
+  EXPECT_EQ("book_t__s", variant.physicalName);
+  EXPECT_EQ("_t__s", variant.fieldType->name());
+  EXPECT_TRUE(variant.fieldType->isDerived());
+  EXPECT_TRUE(variant.fieldType->isAbstract());
+  EXPECT_EQ(variant.fieldType, s->physical("book_t__s"));
+  EXPECT_EQ(variant.fieldType, s->getFieldTypePtr("book_t__s"));
+  EXPECT_EQ(variant.fieldType, s->resolveFor("book_t", OpClass::VALUE).fieldType);
+  EXPECT_EQ("book_t", s->resolveInput("book_t").physicalName);
+  EXPECT_EQ("book_t", s->resolveFor("book_t__self", OpClass::VALUE).physicalName);
+  EXPECT_TRUE(s->resolveFor("book_ts__s", OpClass::VALUE).fieldType->multiValued());
+  EXPECT_EQ(FieldType::STRING, s->physical("other_s")->type());
+  EXPECT_THROW(s->resolveFor("concrete_t__s", OpClass::VALUE), RequestError);
+  EXPECT_EQ(nullptr, s->getFieldTypePtr("unknown__s")); // never falls through to _s
+  EXPECT_EQ(nullptr, s->getFieldTypePtr("_t__s"));
+  EXPECT_FALSE(s->fieldTypeMap.contains("book_t"));
+  EXPECT_EQ("_t", variant.owner->name);
+  EXPECT_EQ(variant.fieldType, variant.owner->variants.at("s").get());
+  auto other = s->resolveFor("other_t", OpClass::VALUE);
+  EXPECT_EQ("other_t", other.logicalName);
+  EXPECT_EQ("other_t__s", other.physicalName);
+  EXPECT_EQ(variant.owner, other.owner);
+  EXPECT_EQ(variant.fieldType, other.fieldType);
+  auto input = s->resolveInput("book_t");
+  EXPECT_EQ(variant.owner, input.owner);
+  EXPECT_EQ(s->fieldTypeMap.at("_t").get(), input.fieldType);
+  EXPECT_EQ("_t", input.fieldType->name());
+  EXPECT_TRUE(input.fieldType->isAbstract());
+}
+
+TEST_F(SchemaTest, variantsAtomicInheritanceAndDefaultsClearing) {
+  auto s = schemaJson(R"({"templates":{
+    "_base":{"type":"text","multi":true,"variants":{"s":"string","i":"int"},
+             "defaults":{"search":"s","value":"i"}},
+    "_child":{"parent":"_base"}
+  },"fields":{
+    "inherited":{"parent":"_child"},
+    "replaced":{"parent":"_base","variants":{"x":"float"},"defaults":{}},
+    "cleared":{"parent":"_base","variants":{},"defaults":{}},
+    "partial":{"parent":"_base","defaults":{"value":"s"}}
+  }})");
+  EXPECT_EQ("inherited__s", s->resolveFor("inherited", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("inherited__i", s->resolveFor("inherited", OpClass::VALUE).physicalName);
+  EXPECT_TRUE(s->physical("inherited__s")->multiValued());
+  EXPECT_EQ(1u, s->resolveInput("replaced").owner->variants.size());
+  EXPECT_EQ(nullptr, s->getFieldTypePtr("replaced__s"));
+  EXPECT_EQ("replaced", s->resolveFor("replaced", OpClass::VALUE).physicalName);
+  EXPECT_TRUE(s->resolveInput("cleared").owner->variants.empty());
+  EXPECT_EQ("cleared", s->resolveFor("cleared", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("partial", s->resolveFor("partial", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("partial__s", s->resolveFor("partial", OpClass::VALUE).physicalName);
+}
+
+TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
+  auto s = schemaJson(R"({"templates":{
+    "_strings":{"type":"string","multi":true,"stored":true,"stored_resource":"cold",
+                "normalizer":["lowercase"],"variants":{"i":"int"},"defaults":{"value":"i"}},
+    "_text":{"type":"text","multi":true,"stored":true,"analyzer":{"filters":["fold"]}}
+  },"fields":{
+    "a":{"type":"text","variants":{"s":{"parent":"_strings"},"t":{"parent":"_text"}}},
+    "b":{"type":"string","multi":true,"variants":{"t":{"parent":"_text"}}},
+    "c":{"type":"text","variants":{"again":{"parent":"c"}}}
+  }})");
+  auto input = s->resolveInput("a");
+  EXPECT_TRUE(input.fieldType->isStored());
+  EXPECT_FALSE(input.owner->multi);
+  for (const auto& [label, ft] : input.owner->variants) {
+    EXPECT_FALSE(ft->multiValued()) << label;
+    EXPECT_FALSE(ft->isStored()) << label;
+    EXPECT_EQ("_stored_", ft->storedResource_);
+    EXPECT_EQ(input.owner, s->resolveFor("a__" + label, OpClass::VALUE).owner);
+  }
+  EXPECT_EQ(2u, input.owner->variants.size());
+  EXPECT_TRUE(s->physical("b__t")->multiValued());
+  EXPECT_FALSE(s->physical("b__t")->isStored()); // TEXT type default belongs to owner
+  EXPECT_EQ("a", s->resolveFor("a", OpClass::VALUE).physicalName);
+  auto* str = (StrFieldType*)s->physical("a__s");
+  std::string value = "Whole VALUE";
+  str->normalize(value);
+  EXPECT_EQ("whole value", value);
+  EXPECT_EQ(((TextFieldType*)s->physical("c"))->analyzer_,
+            ((TextFieldType*)s->physical("c__again"))->analyzer_); // no spurious owner cycle
+}
+
+TEST_F(SchemaTest, variantOwnershipAndDepthErrors) {
+  for (auto property : {R"("multi":false)", R"("multi":true)", R"("stored":false)",
+                        R"("stored":true)", R"("stored_resource":"cold")", R"("stored_resource":"")",
+                        R"("variants":{})", R"("variants":{"nested":"string"})", R"("defaults":{})",
+                        R"("defaults":{"value":"self"})"}) {
+    SCOPED_TRACE(property);
+    EXPECT_THROW(schemaJson(std::string(R"({"fields":{"a":{"type":"text","variants":{"s":{"type":"string",)") +
+                            property + "}}}}}"), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"a":{"type":"text","variants":{"s":"id"}}}})"), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"a":{"type":"text","variants":{"s":{"parent":"id"}}}}})"), SchemaError);
+  for (auto name : {"id", "_version_"}) {
+    SCOPED_TRACE(name);
+    std::string type = std::string(name) == "id" ? "id" : "int";
+    EXPECT_THROW(schemaJson("{\"fields\":{\"" + std::string(name) + "\":{\"type\":\"" + type +
+                            "\",\"variants\":{\"s\":\"string\"}}}}"), SchemaError);
+    EXPECT_THROW(schemaJson("{\"templates\":{\"_base\":{\"type\":\"int\",\"variants\":{\"s\":\"string\"}}},"
+                            "\"fields\":{\"" + std::string(name) + "\":{\"parent\":\"_base\",\"type\":\"" + type + "\"}}}"), SchemaError);
+  }
+}
+
+TEST_F(SchemaTest, variantShapeFamiliesAndVectorDimensions) {
+  for (auto primary : {"text", "string", "int", "float", "double", "date"}) {
+    SCOPED_TRACE(primary);
+    auto s = schemaJson(std::string(R"({"fields":{"a":{"type":")") + primary +
+      R"(","variants":{"t":"text","s":"string","i":"int","f":"float","d":"double","dt":"date"}}}})");
+    EXPECT_EQ(6u, s->resolveInput("a").owner->variants.size());
+  }
+  auto s = schemaJson(R"({"templates":{"_v":{"type":"vector","dims":3,"metric":"cosine"}},"fields":{
+    "v":{"parent":"_v","multi":true,"variants":{"l2":{"type":"vector","dims":3,"metric":"l2"},
+                                                   "same":{"parent":"_v"}}},
+    "g":{"type":"geo_point","multi":true,"variants":{"range":{"type":"geo_point","index":"range"}}}
+  }})");
+  EXPECT_EQ(LogicalField::Shape::VECTOR, s->resolveInput("v").owner->shape);
+  EXPECT_EQ(3, ((VectorFieldType*)s->physical("v__same"))->dims());
+  EXPECT_TRUE(s->physical("v__l2")->multiValued());
+  EXPECT_EQ(LogicalField::Shape::GEO, s->resolveInput("g").owner->shape);
+  EXPECT_TRUE(s->physical("g__range")->rangeIndexed());
+  for (auto field : {
+      R"({"type":"vector","dims":2,"variants":{"s":"string"}})",
+      R"({"type":"string","variants":{"v":{"type":"vector","dims":2}}})",
+      R"({"type":"geo_point","variants":{"s":"int"}})",
+      R"({"type":"text","variants":{"g":"geo_point"}})",
+      R"({"type":"vector","dims":2,"variants":{"g":"geo_point"}})",
+      R"({"type":"vector","variants":{"v":{"type":"vector","dims":2}}})",
+      R"({"type":"vector","dims":0,"variants":{"v":{"type":"vector","dims":0}}})",
+      R"({"type":"vector","dims":2,"variants":{"v":{"type":"vector"}}})",
+      R"({"type":"vector","dims":2,"variants":{"v":{"type":"vector","dims":3}}})",
+      R"({"type":"vector","dims":2,"variants":{"v":{"type":"vector","dims":-1}}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":") + field + "}}"), SchemaError);
+  }
+}
+
+TEST_F(SchemaTest, variantLabelGrammarAndReservedDelimiter) {
+  for (auto label : {"", "_s", "1s", "s__x", "Self", "SELF", "self", "s-x", "s.x", "s!", "\xc3\xa9"}) {
+    SCOPED_TRACE(label);
+    EXPECT_FALSE(Schema::validVariantLabel(label));
+    EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":{\"type\":\"text\",\"variants\":{\"") +
+                            label + "\":\"string\"}}}}"), SchemaError);
+  }
+  for (auto label : {"s", "S1", "my_label", "x_"}) EXPECT_TRUE(Schema::validVariantLabel(label));
+  EXPECT_THROW(schemaJson(R"({"fields":{"a":{"type":"text","variants":{"s":"int","S":"string"}}}})"), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"a":{"type":"text","variants":{"s":"int","s":"string"}}}})"), SchemaError);
+  EXPECT_FALSE(Schema::validFieldName("a__s"));
+  EXPECT_FALSE(Schema::validTemplateName("__s"));
+  EXPECT_FALSE(Schema::validTemplateName("_t__s"));
+  EXPECT_TRUE(Schema::validFieldName("self"));
+  EXPECT_THROW(schemaJson(R"({"fields":{"a__s":"string"}})"), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"templates":{"__s":"string"}})"), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"templates":{"_t__s":"string"}})"), SchemaError);
+}
+
+TEST_F(SchemaTest, variantParentsMustBeAuthoredAndDefaultsMustExist) {
+  for (auto field : {R"({"type":"text","defaults":{"value":"s"}})",
+                     R"({"type":"text","defaults":{"search":"missing"}})",
+                     R"({"type":"text","defaults":{"value":""}})",
+                     R"({"type":"text","variants":{"s":"string"},"defaults":{"value":"S"}})",
+                     R"({"parent":"a__s"})",
+                     R"({"type":"text","variants":{"s":{"parent":"a__self"}}})",
+                     R"({"type":"text","variants":{"s":{"parent":"unknown"}}})",
+                     R"({"type":"text","variants":{"s":{}}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":") + field + "}}"), SchemaError);
+  }
+  auto base = schemaJson(R"({"templates":{"_t":{"type":"text","variants":{"s":"string"},
+                                               "defaults":{"value":"s"}}}})");
+  for (auto variants : {"{}", R"({"x":"int"})"}) {
+    EXPECT_THROW(schemaJson(std::string(R"({"fields":{"a":{"parent":"_t","variants":)") +
+                            variants + "}}}", base.get()), SchemaError);
+  }
+  auto explicitSelf = schemaJson(R"({"fields":{"a":{"type":"string","defaults":{"search":"SELF","value":"self"}}}})");
+  EXPECT_EQ("a", explicitSelf->resolveFor("a", OpClass::SEARCH).physicalName);
+}
+
+TEST_F(SchemaTest, variantPhysicalLengthsAndUnboundedSelfSelector) {
+  const std::string root(124, 'a');
+  auto s = schemaJson("{\"fields\":{\"" + root + "\":{\"type\":\"text\",\"variants\":{\"s\":\"string\"}}}}");
+  EXPECT_EQ(127u, s->resolveFor(root + "__s", OpClass::VALUE).physicalName.size());
+  EXPECT_THROW(schemaJson("{\"fields\":{\"" + root + "b\":{\"type\":\"text\",\"variants\":{\"s\":\"string\"}}}}"), SchemaError);
+  auto templ = schemaJson(R"({"templates":{"_t":{"type":"text","variants":{"short":"string","longest":"int"}}}})");
+  std::string dynamic = std::string(116, 'a') + "_t"; // 127 - 2 - 7 = 118
+  EXPECT_EQ(127u, templ->resolveFor(dynamic + "__longest", OpClass::VALUE).physicalName.size());
+  dynamic = "a" + dynamic;
+  EXPECT_THROW(templ->resolveInput(dynamic), RequestError);
+  EXPECT_THROW(templ->resolveFor(dynamic + "__short", OpClass::VALUE), RequestError);
+  EXPECT_THROW(templ->getFieldTypePtr(dynamic), RequestError);
+  SchemaBuilder b;
+  std::string longRoot(127, 'x');
+  b.field(longRoot).type = FieldClass::STRING;
+  auto longSchema = b.build();
+  EXPECT_EQ(longRoot, longSchema->resolveFor(longRoot + "__self", OpClass::VALUE).physicalName);
+}
+
+TEST_F(SchemaTest, variantSparseJsonAndProtobufRoundTrips) {
+  auto s = schemaJson(R"({"templates":{
+    "_name":{"type":"text","variants":{"z":"int","s":{"type":"string","normalizer":["nfkc_cf","fold"]}},
+             "defaults":{"value":"s"}},
+    "_names":{"parent":"_name","multi":true}
+  },"fields":{
+    "author":{"parent":"_names"},
+    "clear":{"parent":"_name","variants":{},"defaults":{}},
+    "raw":{"type":"string","normalizer":[],"stored_resource":""}
+  }})");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef out;
+  s->toProto(&out, arena);
+  const auto& author = *out.fields.at("author");
+  EXPECT_EQ("_names", author.parent);
+  EXPECT_FALSE(author.type);
+  EXPECT_FALSE(author.variants);
+  EXPECT_FALSE(author.defaults);
+  const auto& clear = *out.fields.at("clear");
+  ASSERT_TRUE(clear.variants);
+  EXPECT_TRUE(clear.variants->entries.empty());
+  ASSERT_TRUE(clear.defaults);
+  EXPECT_FALSE(clear.defaults->search);
+  EXPECT_FALSE(clear.defaults->value);
+  const auto& labels = out.templates.at("_name")->variants->entries;
+  ASSERT_EQ(2u, labels.size());
+  EXPECT_EQ("s", labels[0].first);
+  EXPECT_EQ("z", labels[1].first);
+  ASSERT_TRUE(out.fields.at("raw")->normalizer);
+  EXPECT_TRUE(out.fields.at("raw")->normalizer->filters.empty());
+  ASSERT_TRUE(out.fields.at("raw")->stored_resource);
+  EXPECT_TRUE(out.fields.at("raw")->stored_resource->empty());
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(out, bytes));
+  api::SchemaDef decoded;
+  ASSERT_TRUE(api::decode(decoded, api::copyToPaddedInput(bytes, arena), arena));
+  auto protoRound = Schema::fromProto(decoded);
+  EXPECT_EQ(s->sourceDef_, protoRound->sourceDef_);
+  std::string json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find("\"variants\":{}"));
+  EXPECT_NE(std::string::npos, json.find("\"defaults\":{}"));
+  EXPECT_NE(std::string::npos, json.find("\"normalizer\":[]"));
+  auto jsonRound = schemaJson(json);
+  EXPECT_EQ(s->sourceDef_, jsonRound->sourceDef_);
+  auto postedGet = schemaJson(json, s.get());
+  EXPECT_EQ(s->sourceDef_, postedGet->sourceDef_);
+  EXPECT_EQ("author__s", postedGet->resolveFor("author", OpClass::VALUE).physicalName);
+  EXPECT_TRUE(postedGet->resolveInput("clear").owner->variants.empty());
+  EXPECT_EQ("book_name__s", postedGet->resolveFor("book_name", OpClass::VALUE).physicalName);
+}
+
+TEST_F(SchemaTest, variantSetRecompilesParentsAndReplacesWholeDefinitions) {
+  auto s = schemaJson(R"({"templates":{
+    "_s":{"type":"string","normalizer":["lowercase"]},
+    "_t":{"type":"text","variants":{"s":{"parent":"_s"}},"defaults":{"value":"s"}}
+  },"fields":{"author":{"parent":"_t"}}})");
+  auto changed = schemaJson(R"({"templates":{"_s":{"type":"int"}}})", s.get());
+  EXPECT_EQ(FieldType::INT, changed->physical("author__s")->type());
+  EXPECT_EQ(FieldType::INT, changed->physical("book_t__s")->type());
+  auto cleared = schemaJson(R"({"templates":{"_t":{"type":"text"}}})", changed.get());
+  EXPECT_TRUE(cleared->resolveInput("author").owner->variants.empty());
+  EXPECT_EQ("author", cleared->resolveFor("author", OpClass::VALUE).physicalName);
+  auto invalidBase = schemaJson(R"({"templates":{"_t":{"type":"text","variants":{"s":"string"}}},
+                                  "fields":{"author":{"parent":"_t","defaults":{"value":"s"}}}})");
+  EXPECT_THROW(schemaJson(R"({"templates":{"_t":{"type":"text","variants":{}}}})", invalidBase.get()), SchemaError);
+}
+
+TEST_F(SchemaTest, stringNormalizerInheritanceWholeValueAndClearing) {
+  auto s = schemaJson(R"({"templates":{"_s":{"type":"string","normalizer":["nfkc_cf","fold"]}},
+    "fields":{"a":{"parent":"_s"},"b":{"parent":"_s"},"raw":{"parent":"_s","normalizer":[]},
+              "t":{"parent":"_s","type":"text"},
+              "owner":{"type":"text","variants":{"s":{"parent":"_s"}}}}})");
+  auto* a = (StrFieldType*)s->physical("a");
+  EXPECT_EQ(a->normalizer, ((StrFieldType*)s->physical("b"))->normalizer);
+  EXPECT_EQ(a->normalizer, ((StrFieldType*)s->physical("owner__s"))->normalizer);
+  EXPECT_EQ(a->normalizer, ((StrFieldType*)s->physical("dynamic_s"))->normalizer);
+  EXPECT_EQ("keyword", a->normalizer->tokenizer->name);
+  std::string value = "LE GUIN Caf\xc3\xa9";
+  a->normalize(value);
+  EXPECT_EQ("le guin cafe", value);
+  value.clear();
+  a->normalize(value);
+  EXPECT_TRUE(value.empty());
+  value = "KEEP Case";
+  ((StrFieldType*)s->physical("raw"))->normalize(value);
+  EXPECT_EQ("KEEP Case", value);
+  StrFieldType identity("identity");
+  identity.normalize(value);
+  EXPECT_EQ("KEEP Case", value);
+}
+
+TEST_F(SchemaTest, stringNormalizerSchemaValidation) {
+  for (auto field : {
+      R"({"type":"text","normalizer":[]})", R"({"type":"int","normalizer":["lowercase"]})",
+      R"({"type":"string","normalizer":["whitespace"]})", R"({"type":"string","normalizer":["keyword"]})",
+      R"({"type":"string","normalizer":["unicode_word"]})", R"({"type":"string","normalizer":["unknown"]})",
+      R"({"type":"string","normalizer":[{}]})",
+      R"({"type":"string","normalizer":[{"name":"fold","params":{"invalid":true}}]})",
+      R"({"type":"string","analyzer":{"tokenizer":"keyword"}})",
+      R"({"type":"text","variants":{"s":{"type":"string","normalizer":["keyword"]}}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":") + field + "}}"), SchemaError);
+  }
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  EXPECT_FALSE(api::read_json(def, R"({"fields":{"a":{"type":"string","normalizer":{"tokenizer":"keyword"}}}})", arena));
+}
+
+TEST_F(SchemaTest, storedResourceEmptyStillInheritsOnPrimary) {
+  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","stored_resource":"cold"}},
+                         "fields":{"a":{"parent":"_t","stored_resource":""}}})");
+  EXPECT_EQ("cold", s->physical("a")->storedResource_);
+  EXPECT_EQ("cold", schemaJson(authoredJson(*s))->physical("a")->storedResource_);
+}
+
+TEST_F(SchemaTest, resolvedHandlesUseHandBuiltFieldTypesWithoutOwners) {
+  Schema s;
+  auto concrete = std::make_shared<TextFieldType>("different_type_name");
+  auto prototype = std::make_shared<StrFieldType>("_s", FieldType::INDEX_DOCS | FieldType::ABSTRACT);
+  s.fieldTypeMap["plain"] = concrete;
+  s.fieldTypeMap["_s"] = prototype;
+  for (auto name : {"plain", "dynamic_s"}) {
+    SCOPED_TRACE(name);
+    auto input = s.resolveInput(name);
+    EXPECT_EQ(nullptr, input.owner);
+    EXPECT_EQ(name, input.logicalName);
+    EXPECT_EQ(name, input.physicalName);
+    EXPECT_EQ(FieldRole::PRIMARY, input.role);
+    EXPECT_EQ(s.getFieldTypePtr(name), input.fieldType);
+    for (auto op : {OpClass::SEARCH, OpClass::VALUE, OpClass::EXISTS, OpClass::RETRIEVE}) {
+      auto bare = s.resolveFor(name, op);
+      auto explicitSelf = s.resolveFor(std::string(name) + "__self", op);
+      EXPECT_EQ(nullptr, bare.owner);
+      EXPECT_EQ(nullptr, explicitSelf.owner);
+      EXPECT_EQ(input.fieldType, bare.fieldType);
+      EXPECT_EQ(input.fieldType, explicitSelf.fieldType);
+      EXPECT_EQ(name, bare.physicalName);
+      EXPECT_EQ(name, explicitSelf.physicalName);
+      EXPECT_THROW(s.resolveFor(std::string(name) + "__x", op), RequestError);
+    }
+  }
+  EXPECT_EQ(concrete, s.getFieldTypeEx("plain"));
+  EXPECT_EQ(prototype, s.getFieldTypeOrNull("dynamic_s"));
+  EXPECT_EQ(nullptr, s.getFieldTypePtr("dynamic_s__x"));
+  EXPECT_EQ(nullptr, s.getFieldTypePtr("_s"));
+  EXPECT_EQ(nullptr, s.getFieldTypeOrNull("missing"));
+  EXPECT_THROW(s.getFieldTypeEx("missing"), RequestError);
+}
+
+TEST_F(SchemaTest, resolvedHandleNamesSurviveCopiesAndMoves) {
+  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","variants":{"s":"string"},
+                                               "defaults":{"value":"s"}}}})");
+  for (auto name : {"short_t", "longer_than_small_string_storage_t"}) {
+    auto handle = [&] {
+      std::string selector = std::string(name) + "__s";
+      return s->resolveFor(selector, OpClass::VALUE);
+    }();
+    auto copy = handle;
+    auto moved = std::move(handle);
+    EXPECT_EQ(name, copy.logicalName);
+    EXPECT_EQ(name, moved.logicalName);
+    EXPECT_EQ(std::string(name) + "__s", copy.physicalName);
+    EXPECT_EQ(copy.physicalName, moved.physicalName);
+    EXPECT_EQ(copy.fieldType, moved.fieldType);
+    EXPECT_EQ(copy.owner, moved.owner);
+  }
 }

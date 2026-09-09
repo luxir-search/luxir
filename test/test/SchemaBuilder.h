@@ -28,7 +28,7 @@
 namespace luxir {
 
 class SchemaBuilder {
-  using Pair = std::pair<std::string_view, api::FieldDef>;
+  using Pair = std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>;
   std::pmr::monotonic_buffer_resource arena_;
   std::deque<Pair> fields_;
   std::deque<Pair> templates_;
@@ -36,8 +36,9 @@ class SchemaBuilder {
   std::vector<Pair> templatesFlat_;
 
   api::FieldDef& add(std::deque<Pair>& out, std::string_view name) {
-    out.push_back({api::build::arenaStr(arena_, name), api::FieldDef{}});
-    return out.back().second;
+    auto* def = api::build::allocMessage<api::FieldDef>(arena_);
+    out.push_back({api::build::arenaStr(arena_, name), def});
+    return *def;
   }
 
 public:
@@ -64,9 +65,9 @@ public:
     fieldsFlat_.assign(fields_.begin(), fields_.end());
     templatesFlat_.assign(templates_.begin(), templates_.end());
     api::SchemaDef d;
-    d.fields = api::map_view<std::string_view, api::FieldDef>(
+    d.fields = api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const Pair>(fieldsFlat_.data(), fieldsFlat_.size()));
-    d.templates = api::map_view<std::string_view, api::FieldDef>(
+    d.templates = api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const Pair>(templatesFlat_.data(), templatesFlat_.size()));
     return d;
   }

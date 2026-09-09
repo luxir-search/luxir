@@ -68,26 +68,24 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
     currSchema = schema.get();
     justAcquiredSchema = true;
   }
-  auto ftIter = currSchema->getFieldType(name);
+  auto fieldType = currSchema->getFieldTypeOrNull(name);
   // Don't try to refresh the schema if we just acquired it since we don't know how expensive it is.
-  if (ftIter == currSchema->end() && !justAcquiredSchema) {
+  if (!fieldType && !justAcquiredSchema) {
     schema = schemaProvider();
 
     // if the schema changed, retry the lookup
     if (schema.get() != currSchema) {
       currSchema = schema.get();
-      ftIter = currSchema->getFieldType(name);
+      fieldType = currSchema->getFieldTypeOrNull(name);
     }
   }
 
-  if (ftIter == currSchema->end()) {
+  if (!fieldType) {
     throw RequestError("Field not found in schema: " + std::string(name), "unknown_field");
   }
 
   // Create the correct IndexHandler based on the suffix.  This could be moved to FieldType::createIndexHandler()?
   u_ptr<IndexHandler> fieldHandler;
-
-  const std::shared_ptr<FieldType>& fieldType = ftIter->second;
 
   switch (fieldType->type()) {
     case FieldType::Type::TEXT:
@@ -148,9 +146,9 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
           || fieldType->type() == FieldType::Type::ID)) {
     const std::string& resourceName = fieldType->storedResource_;
     const StoredFieldType* resConfig = nullptr;
-    auto resIt = currSchema->getFieldType(resourceName);
-    if (resIt != currSchema->end()) {
-      resConfig = dynamic_cast<const StoredFieldType*>(resIt->second.get());
+    auto* resourceType = currSchema->getFieldTypePtr(resourceName);
+    if (resourceType != nullptr) {
+      resConfig = dynamic_cast<const StoredFieldType*>(resourceType);
       if (resConfig == nullptr) {
         throw std::runtime_error(
             "Field '" + std::string(name) + "' has STORED set and references '"

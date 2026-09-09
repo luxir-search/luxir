@@ -850,9 +850,7 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   f.metric = luxir::api::VectorMetric::COSINE;
 
   auto schema = b.build();
-  auto it = schema->getFieldType("embedding");
-  ASSERT_NE(it, schema->end());
-  auto* vft = dynamic_cast<VectorFieldType*>(it->second.get());
+  auto* vft = dynamic_cast<VectorFieldType*>(schema->getFieldTypePtr("embedding"));
   ASSERT_NE(nullptr, vft);
   EXPECT_EQ(384, vft->dims());
   EXPECT_EQ(VectorFieldType::METRIC_COSINE, vft->metric());
@@ -863,7 +861,7 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   luxir::api::SchemaDef outDef;
   std::pmr::monotonic_buffer_resource outMr;
   schema->toProto(&outDef, outMr);
-  const auto* fd = outDef.fields.find("embedding");
+  const auto* fd = outDef.fields.at("embedding").operator->();
   ASSERT_NE(nullptr, fd);
   ASSERT_TRUE(fd->type.has_value());
   EXPECT_EQ(luxir::api::FieldDef_::FieldClass::VECTOR, *fd->type);

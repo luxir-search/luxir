@@ -76,6 +76,7 @@ struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrA
 struct ArrArrDouble; struct ArrArrBin; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct ColMap; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
+struct FieldVariants; struct FieldDefaults; struct NormalizerDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
@@ -192,13 +193,26 @@ struct AnalyzerDef {                                              // needs Analy
   std::optional<AnalyzerComponent> tokenizer;
   std::span<const AnalyzerComponent> filters;
 };
+struct FieldVariants {
+  map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> entries;
+};
+struct FieldDefaults {
+  std::optional<std::string_view> search;
+  std::optional<std::string_view> value;
+};
+struct NormalizerDef {
+  std::span<const AnalyzerComponent> filters;
+};
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using Metric = luxir::api::VectorMetric;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
-  std::string_view stored_resource;
+  std::optional<std::string_view> stored_resource;
+  std::optional<FieldVariants> variants;
+  std::optional<FieldDefaults> defaults;
+  std::optional<NormalizerDef> normalizer;
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
@@ -344,8 +358,8 @@ struct KnnQuery {                                                // needs Vector
   bool exact = false;
 };
 struct SchemaDef {
-  map_view<std::string_view, FieldDef> fields;
-  map_view<std::string_view, FieldDef> templates;
+  map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
+  map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
 };
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
@@ -623,6 +637,7 @@ LUXIR_TD(ArrArrDouble) LUXIR_TD(ArrArrBin) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
+LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
@@ -663,6 +678,7 @@ LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(ArrArrBin) LUXIR_
 LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(ColMap) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
+LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)

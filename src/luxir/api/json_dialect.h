@@ -42,8 +42,10 @@
 //   "boost" is the BoostQuery arm itself. Writes stay canonical, so echo mode
 //   shows the wrapper rather than the sibling sugar.
 // - FieldDef reads accept a bare STRING as type-only sugar: {"year": "int"} ==
-//   {"year": {"type": "int"}} in a schema's fields/templates maps. Writes stay
+//   {"year": {"type": "int"}} in fields, templates, and variants. Writes stay
 //   canonical (the object form).
+// - FieldVariants and NormalizerDef flatten their presence wrappers to a plain
+//   label map and filter array. Empty containers retain presence on the wire.
 // - AnalyzerComponent (an AnalyzerDef tokenizer or filter) reads accept a bare
 //   STRING as name-only sugar: "lowercase" == {"name": "lowercase"}. Unlike the
 //   other sugars, writes use the bare string whenever params is empty, so the
@@ -480,6 +482,39 @@ struct from<JSON, luxir::api::SortSpec> {
   }
 };
 
+template <>
+struct from<JSON, luxir::api::FieldVariants> {
+  template <auto Opts>
+  static void op(luxir::api::FieldVariants &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    decltype(auto) entries = ::hpp_proto::detail::as_modifiable(ctx, value.entries);
+    glz::util::parse_repeated<Opts>(true, entries, ctx, it, end);
+  }
+};
+template <>
+struct to<JSON, luxir::api::FieldVariants> {
+  template <auto Opts, class... Args>
+  static void op(const luxir::api::FieldVariants &value, Args &&...args) noexcept {
+    serialize<JSON>::template op<Opts>(value.entries, std::forward<Args>(args)...);
+  }
+};
+template <>
+struct from<JSON, luxir::api::NormalizerDef> {
+  template <auto Opts>
+  static void op(luxir::api::NormalizerDef &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    decltype(auto) filters = ::hpp_proto::detail::as_modifiable(ctx, value.filters);
+    glz::util::parse_repeated<Opts>(false, filters, ctx, it, end);
+  }
+};
+template <>
+struct to<JSON, luxir::api::NormalizerDef> {
+  template <auto Opts, class... Args>
+  static void op(const luxir::api::NormalizerDef &value, Args &&...args) noexcept {
+    serialize<JSON>::template op<Opts>(value.filters, std::forward<Args>(args)...);
+  }
+};
+
 // ----- FieldDef: canonical object, or a bare string (type-only sugar) -----
 template <>
 struct from<JSON, luxir::api::FieldDef> {
@@ -514,6 +549,12 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.multi, ctx, vit, vend);
           } else if (key == "analyzer") {
             util::from_json<V>(value.analyzer, ctx, vit, vend);
+          } else if (key == "variants") {
+            util::from_json<V>(value.variants, ctx, vit, vend);
+          } else if (key == "defaults") {
+            util::from_json<V>(value.defaults, ctx, vit, vend);
+          } else if (key == "normalizer") {
+            util::from_json<V>(value.normalizer, ctx, vit, vend);
           } else if (key == "stored") {
             util::from_json<V>(value.stored, ctx, vit, vend);
           } else if (key == "stored_resource") {

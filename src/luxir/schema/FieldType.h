@@ -69,6 +69,7 @@ public:
   static constexpr flag_type INDEX_RANGE = (1 << 11);
   // Segment-format marker. It is never supplied by schema configuration.
   static constexpr flag_type TERM_RANGES = (1 << 12);
+  static constexpr flag_type DERIVED = (1 << 13);  // named representation of a logical field
 
   const FieldType::Type type_;
   const std::string name_;
@@ -100,6 +101,7 @@ public:
   std::string_view name() { return name_; }
 
   bool isAbstract() { return (bool) (flags_ & ABSTRACT); }
+  bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
@@ -181,8 +183,14 @@ public:
 
 class StrFieldType : public FieldType {
 public:
-  StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::STRING, flags) {
-  }
+  std::shared_ptr<const Analyzer> normalizer;
+
+  StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED,
+               std::shared_ptr<const Analyzer> normalizer = {})
+    : FieldType(name, FieldType::STRING, flags), normalizer(std::move(normalizer)) {}
+
+  // Hot paths (ingest and query literals) must retain a chain from normalizer->createChain().
+  void normalize(std::string& value) const;
 
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                               std::span<char> buf) const override;
