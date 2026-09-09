@@ -294,7 +294,9 @@ target_link_libraries(luxir_lib PRIVATE uni_algo)
 # should not live in the shared build). Opt-in: merely having the file present
 # used to put its targets in `all`, so a box set up for bench runs paid for them
 # on every ordinary build. Configure with -DLUXIR_LOCAL_TARGETS=ON to enable
-# (cached per build dir, so a bench build dir sets it once).
+# (cached per build dir, so a bench build dir sets it once). Targets the file
+# adds should be EXCLUDE_FROM_ALL and built by name, so enabling it costs an
+# ordinary build nothing.
 option(LUXIR_LOCAL_TARGETS "Include the untracked LocalTargets.cmake" OFF)
 if(LUXIR_LOCAL_TARGETS)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LocalTargets.cmake")
