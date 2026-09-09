@@ -7,13 +7,14 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/schema/Schema.h"
 #include "luxir/util/MemPool.h"
 
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <map>
 #include <memory_resource>
-#include <set>
 #include <span>
 
 #include "OrdMapImpl.h"
@@ -326,12 +327,12 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
 
 
 
-std::span<const std::string_view> IndexReader::projectableFields() {
+std::span<const IndexReader::ProjectableField> IndexReader::projectableFields() {
   std::call_once(projectableOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
     // resource's metadata (StoredFieldsReader::fieldNames).  No copies needed.
-    std::set<std::string_view> names;
+    std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
       auto& postingsReader = seg.postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -339,21 +340,85 @@ std::span<const std::string_view> IndexReader::projectableFields() {
       while (fieldReader.readNextField()) {
         SegFieldInfo fi;
         fieldReader.readFieldInfo(fi);
+        std::string_view physicalName(fi.fieldname.data(), fi.fieldname.size());
         if (fi.type == FieldType::BIN && (fi.flags & FieldType::STORED)) {
           // A stored-fields resource: its metadata lists the fields it holds.
           // An empty resource is never written, but guard the reader's
           // precondition anyway.
           if (fi.numValues <= 0) continue;
           StoredFieldsReader sfr(postingsReader, fi);
-          for (std::string_view name : sfr.fieldNames()) names.emplace(name);
+          for (std::string_view name : sfr.fieldNames()) {
+            auto& resources = sources[name].storedResources;
+            if (std::ranges::find(resources, physicalName) == resources.end()) {
+              resources.push_back(physicalName);
+            }
+          }
         } else if (fi.flags & FieldType::COLUMN_STORED) {
-          names.emplace(std::string_view(fi.fieldname.data(), fi.fieldname.size()));
+          sources[physicalName].column = true;
         }
       }
     }
-    projectable.assign(names.begin(), names.end());
+    std::vector<ProjectableField> fields;
+    fields.reserve(sources.size());
+    for (auto& [name, source] : sources) {
+      source.name = name;
+      fields.push_back(std::move(source));
+    }
+    projectable = std::move(fields);
   });
   return projectable;
+}
+
+std::shared_ptr<const std::vector<std::string_view>> IndexReader::logicalProjectableFields(
+    const std::shared_ptr<Schema>& schema) {
+  std::lock_guard lock(logicalProjectableMutex);
+  if (projectableSchema == schema) return logicalProjectable;
+
+  auto names = std::make_shared<std::vector<std::string_view>>();
+  for (const auto& source : projectableFields()) {
+    auto root = source.name.substr(0, source.name.rfind("__"));
+    if (root.empty() || root[0] == '_') continue;
+    // Only the primary's own sources can admit a root. Its entry is already
+    // in this sorted catalog if present; sibling entries add no candidates.
+    if (root != source.name) continue;
+    FieldType* type;
+    try {
+      type = schema->getFieldTypePtr(root);  // physical primary, never a binding
+    } catch (const RequestError&) {
+      // A template edit may make an old concrete root invalid for this schema.
+      continue;
+    }
+    if (!type) continue;
+    bool stored = type->isStored() && std::ranges::find(source.storedResources,
+        std::string_view(type->storedResource_)) != source.storedResources.end();
+    bool retrievable = false;
+    switch (type->type()) {
+      case FieldType::TEXT:
+        retrievable = stored;
+        break;
+      case FieldType::STRING:
+      case FieldType::ID:
+        // Stored STRING/ID also fall back to their own older segment columns
+        // even if the current schema no longer enables a column.
+        retrievable = stored || (source.column && (type->isStored() || type->hasColumn()));
+        break;
+      case FieldType::INT:
+      case FieldType::FLOAT:
+      case FieldType::DOUBLE:
+      case FieldType::DATE:
+        retrievable = source.column && type->hasColumn();
+        break;
+      default:
+        break;
+    }
+    if (retrievable) names->push_back(root);
+  }
+  // Retain the identity, not its generation number: schemas built in memory
+  // can share a generation. Replacing one cache entry bounds retained schemas
+  // even when the reader stays open through many schema publications.
+  projectableSchema = schema;
+  logicalProjectable = std::move(names);
+  return logicalProjectable;
 }
 
 }

@@ -22,6 +22,7 @@
 namespace luxir {
 class FilterCache;
 class OrdMap;
+class Schema;
 
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
@@ -208,16 +209,32 @@ public:
     return sharedFilterCache.get();
   }
 
-  // Names of the fields some segment of this reader can project into a
+  struct ProjectableField {
+    std::string_view name;
+    bool column = false;
+    std::vector<std::string_view> storedResources;
+  };
+
+  // Fields some segment of this reader can project into a
   // DocList: column-backed fields (COLUMN_STORED, any non-BIN type) and the
   // fields held by each stored-fields resource.  Physical and
   // schema-independent - read from segment metadata, so dynamic
   // (suffix-template) fields appear under their concrete names.  Sorted and
-  // unique.  Built once on first use and immutable afterwards (segments never
+  // unique by name, with column presence and the resources storing that name
+  // retained for schema-specific source selection. Built once on first use
+  // and immutable afterwards (segments never
   // change under a reader).  The views point into segment metadata that this
   // reader's PostingsReaders keep mapped, so they are valid for as long as the
   // caller holds the reader.
-  std::span<const std::string_view> projectableFields();
+  std::span<const ProjectableField> projectableFields();
+
+  // Logical roots whose primary retrieval source is represented in the
+  // physical catalog, excluding vectors, geo and engine names. Sorted for
+  // wildcard prefix traversal. Cache the most recently used schema identity;
+  // callers retain the result across concurrent schema changes. Name views
+  // still point into this reader's segment metadata.
+  std::shared_ptr<const std::vector<std::string_view>> logicalProjectableFields(
+      const std::shared_ptr<Schema>& schema);
 
   IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
               std::shared_ptr<FilterCache> filterCache = nullptr);
@@ -225,7 +242,10 @@ public:
 private:
   std::vector<Segment> segs;
   std::once_flag projectableOnce;
-  std::vector<std::string_view> projectable;
+  std::vector<ProjectableField> projectable;
+  std::mutex logicalProjectableMutex;
+  std::shared_ptr<Schema> projectableSchema;
+  std::shared_ptr<const std::vector<std::string_view>> logicalProjectable;
   std::vector<std::shared_ptr<AuxReader>> auxReadersList;
   std::shared_ptr<FilterCache> sharedFilterCache;
   uint64_t coreGeneration = 0;

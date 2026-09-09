@@ -9,6 +9,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 
 namespace luxir::test {
@@ -395,6 +396,255 @@ TEST_F(DocFormatTest, columnsFormatSetsRowCount) {
   EXPECT_EQ(3, dl->row_count);
   EXPECT_TRUE(dl->docs.empty());
   EXPECT_EQ(2u, dl->columns.size());
+}
+
+class FieldVariantsProjectionTest : public LuxirTest {
+protected:
+  CollectionHelper helper{"main"};
+
+  void SetUp() override {
+    SchemaBuilder b;
+    auto& author = b.field("author");
+    author.type = api::FieldDef::FieldClass::TEXT;
+    auto& s = b.variant(author, "s");
+    s.type = api::FieldDef::FieldClass::STRING;
+    b.normalizer(s, {"nfkc_cf"});
+    b.variant(author, "words").type = api::FieldDef::FieldClass::TEXT;
+    author.defaults.emplace().value = "s";
+    auto& hidden = b.field("author_hidden");
+    hidden.parent = "author";
+    hidden.stored = false;
+    auto& multi = b.field("authors");
+    multi.parent = "author";
+    multi.multi = true;
+    auto& edition = b.field("edition");
+    edition.type = api::FieldDef::FieldClass::INT;
+    b.variant(edition, "label").type = api::FieldDef::FieldClass::STRING;
+    edition.defaults.emplace().value = "label";
+    auto& dynamic = b.templ("_name");
+    dynamic.parent = "author";
+    b.set(helper.collection());
+    ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", "Le Guin",
+        "author_hidden", "Invisible", "authors", vecs("Zed", "Ada", "Zed"),
+        "edition", "0042", "editor_name", "Other Editor"), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "b", "translator_name", "A Translator"),
+                             UpdateMessage::COMMIT).success);
+  }
+
+  LocalReqHandle project(std::initializer_list<std::string> fields,
+                         api::DocFormat format = api::DocFormat::DEFAULT) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().fields(fields)
+        .documentFormat(format).limit(-1);
+    req->execute(false);
+    return req;
+  }
+};
+
+TEST_F(FieldVariantsProjectionTest, discoveryReturnsConcreteLogicalRootsOnce) {
+  for (auto fields : {std::initializer_list<std::string>{}, {"*"}}) {
+    auto req = project(fields);
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
+    ASSERT_EQ(2u, docs.size());
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "a", "author", "Le Guin",
+        "authors", vecs("Zed", "Ada", "Zed"), "edition", (int64_t)42,
+        "editor_name", "Other Editor"));
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "b", "translator_name", "A Translator"));
+    const auto* dl = req->docList("q");
+    ASSERT_NE(dl, nullptr);
+    EXPECT_TRUE(dl->columns.empty());
+    if (fields.size() == 0) {
+      EXPECT_EQ("id", docs[0][0].name);
+    }
+  }
+  auto prefix = project({"id", "author*", "*name", "editor*"});
+  ASSERT_OK(prefix);
+  EXPECT_CONTAINS_DOC(prefix->getDocs(), flatdoc("id", "a", "author", "Le Guin",
+      "authors", vecs("Zed", "Ada", "Zed"), "editor_name", "Other Editor"));
+}
+
+TEST_F(FieldVariantsProjectionTest, selectorsKeepOutputKeysAndRepresentationValues) {
+  for (auto format : {api::DocFormat::ROWS, api::DocFormat::COLUMNS}) {
+    auto req = project({"id", "author", "author__s", "author__self", "author_hidden__s",
+                        "edition", "edition__label", "edition__self",
+                        "authors", "authors__s", "authors__self", "editor_name__s",
+                        "editor_name__self"}, format);
+    ASSERT_OK(req);
+    EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "author", "Le Guin",
+        "author__s", "le guin", "author__self", "Le Guin", "author_hidden__s", "invisible",
+        "edition", (int64_t)42, "edition__label", "0042", "edition__self", (int64_t)42,
+        "authors", vecs("Zed", "Ada", "Zed"), "authors__s", vecs("ada", "zed"),
+        "authors__self", vecs("Zed", "Ada", "Zed"), "editor_name__s", "other editor",
+        "editor_name__self", "Other Editor"));
+    EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "b"));
+    const auto* dl = req->docList("q");
+    ASSERT_NE(dl, nullptr);
+    if (format == api::DocFormat::ROWS) {
+      EXPECT_TRUE(dl->columns.empty());
+    } else {
+      EXPECT_TRUE(dl->docs.empty());
+      EXPECT_NE(nullptr, dl->columns.find("author__self"));
+      EXPECT_NE(nullptr, dl->columns.find("edition__label"));
+    }
+  }
+}
+
+TEST_F(FieldVariantsProjectionTest, explicitKeysWinWildcardPlacementAndDeduplicate) {
+  auto req = project({"*", "author", "author__s", "author", "author__s", "author*"});
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  ASSERT_EQ(2u, dl->columns.size());
+  EXPECT_NE(nullptr, dl->columns.find("author"));
+  EXPECT_NE(nullptr, dl->columns.find("author__s"));
+  for (const auto& row : dl->docs) {
+    EXPECT_EQ(nullptr, row.fields.find("author"));
+    EXPECT_EQ(nullptr, row.fields.find("author__s"));
+  }
+  EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "author", "Le Guin",
+      "author__s", "le guin", "authors", vecs("Zed", "Ada", "Zed"),
+      "edition", (int64_t)42, "editor_name", "Other Editor"));
+}
+
+TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachExactAndSourceForms) {
+  for (const char* pattern : {"author__*", "*__s", "author*__self"}) {
+    auto req = project({pattern});
+    ASSERT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("exact selector"));
+  }
+  for (const char* field : {"author__words", "author_hidden", "author_hidden__self"}) {
+    auto req = project({field});
+    ASSERT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("logical root"));
+    EXPECT_NE(std::string::npos, req->errorMsg().find("source text"));
+  }
+  auto unknown = project({"author__missing"});
+  ASSERT_FALSE(unknown->ok());
+  EXPECT_NE(std::string::npos, unknown->errorMsg().find("Unknown variant label"));
+}
+
+TEST_F(FieldVariantsProjectionTest, logicalCatalogUsesSchemaIdentityAndPrimaryPresence) {
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto schema = helper.collection().getSchema();
+  auto catalog = reader->logicalProjectableFields(schema);
+  EXPECT_EQ(catalog, reader->logicalProjectableFields(schema));
+
+  SchemaBuilder b;
+  auto& hidden = b.field("author_hidden");
+  hidden.parent = "author";
+  hidden.stored = true;
+  auto& author = b.field("author");
+  author.type = api::FieldDef::FieldClass::TEXT;
+  author.stored = false;
+  auto other = b.build(schema.get());
+  other->gen_ = schema->gen_;  // identity must distinguish equal generations
+  auto changed = reader->logicalProjectableFields(other);
+  EXPECT_NE(catalog, changed);
+  EXPECT_EQ(changed, reader->logicalProjectableFields(other));
+  EXPECT_EQ(changed->end(), std::ranges::find(*changed, std::string_view("author")));
+  // author_hidden has only a sibling column in the physical catalog. Merely
+  // enabling source storage in another schema cannot discover absent source.
+  EXPECT_EQ(changed->end(), std::ranges::find(*changed, std::string_view("author_hidden")));
+  EXPECT_NE(catalog->end(), std::ranges::find(*catalog, std::string_view("author")));
+}
+
+TEST_F(DocFormatTest, storedPlainAndNormalizedStringsReturnSourceValues) {
+  CollectionHelper ch;
+  SchemaBuilder b;
+  auto& plain = b.field("plain");
+  plain.type = api::FieldDef::FieldClass::STRING;
+  plain.stored = true;
+  auto& normalized = b.field("normalized");
+  normalized.type = api::FieldDef::FieldClass::STRING;
+  normalized.stored = true;
+  b.normalizer(normalized, {"nfkc_cf"});
+  b.set(ch.collection());
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "plain", "Le Guin", "normalized", "LE GUIN"),
+                       UpdateMessage::COMMIT).success);
+
+  // Plain STRING alone permits the column shortcut, including both aliases.
+  auto plainReq = localReq(ch.getSearchEngine());
+  plainReq->collection("main").topDocs("q").allQuery().fields({"plain", "plain__self"});
+  plainReq->execute();
+  ASSERT_OK(plainReq);
+  EXPECT_CONTAINS_DOC(plainReq->getDocs(), flatdoc("plain", "Le Guin", "plain__self", "Le Guin"));
+
+  // The normalized peer forces their shared resource through stored retrieval.
+  auto mixedReq = localReq(ch.getSearchEngine());
+  mixedReq->collection("main").topDocs("q").allQuery()
+      .fields({"plain", "normalized", "plain__self", "normalized__self"});
+  mixedReq->execute();
+  ASSERT_OK(mixedReq);
+  EXPECT_CONTAINS_DOC(mixedReq->getDocs(), flatdoc("plain", "Le Guin", "normalized", "LE GUIN",
+      "plain__self", "Le Guin", "normalized__self", "LE GUIN"));
+}
+
+TEST_F(DocFormatTest, storedStringPrimaryPreservesSourceWithOnlyColumnBackedOutputs) {
+  CollectionHelper ch;
+  SchemaBuilder b;
+  auto& names = b.field("names_");
+  names.type = api::FieldDef::FieldClass::STRING;
+  names.multi = true;
+  names.stored = true;
+  auto& variant = b.variant(names, "s");
+  variant.type = api::FieldDef::FieldClass::STRING;
+  b.normalizer(variant, {"nfkc_cf"});
+  b.set(ch.collection());
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "names_", vecs("Zed", "Ada", "Zed")),
+                       UpdateMessage::COMMIT).success);
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery()
+      .fields({"names_", "names___self", "names___s"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("names_", vecs("Zed", "Ada", "Zed"),
+      "names___self", vecs("Zed", "Ada", "Zed"), "names___s", vecs("ada", "zed")));
+}
+
+TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
+  CollectionHelper ch;
+  SchemaBuilder b;
+  auto& text = b.field("text");
+  text.type = api::FieldDef::FieldClass::TEXT;
+  auto& string = b.field("string");
+  string.type = api::FieldDef::FieldClass::STRING;
+  string.stored = true;
+  b.set(ch.collection());
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "text", "Source", "string", "Value"),
+                       UpdateMessage::COMMIT).success);
+  auto reader = ch.getIndexWriter()->getIndexReader();
+  auto original = reader->logicalProjectableFields(ch.collection().getSchema());
+
+  // Both names occur in the old store. Only STRING has a usable fallback
+  // when a different schema selects a resource this reader does not have.
+  text.stored_resource = "_stored_cold_";
+  string.stored_resource = "_stored_cold_";
+  string.column = false;
+  auto schema = b.build(ch.collection().getSchema().get());
+  ch.collection().setSchema(schema);
+  auto current = reader->logicalProjectableFields(schema);
+  EXPECT_NE(original, current);
+  EXPECT_EQ((std::vector<std::string_view>{"id", "string"}), *current);
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"*", "string__self"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "string", "Value", "string__self", "Value"));
+}
+
+TEST_F(DocFormatTest, emptyStringAndVectorSelectorsKeepColumnsEmpty) {
+  CollectionHelper ch;
+  indexBooks(ch);
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().offset(10)
+      .fields({"id__self", "emb_v__self"});
+  req->execute();
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_EQ(0, dl->row_count);
+  EXPECT_TRUE(dl->columns.empty());
 }
 
 } // namespace luxir::test

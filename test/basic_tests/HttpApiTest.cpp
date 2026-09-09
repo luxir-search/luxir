@@ -2557,6 +2557,47 @@ TEST_F(HttpApiTest, urlParamPolicy) {
   EXPECT_EQ(200, health.result_int());
 }
 
+TEST_F(HttpApiTest, fieldVariantProjectionKeepsLogicalDiscoveryAndExactKeys) {
+  SchemaBuilder b;
+  auto& author = b.field("author");
+  author.type = api::FieldDef::FieldClass::TEXT;
+  auto& s = b.variant(author, "s");
+  s.type = api::FieldDef::FieldClass::STRING;
+  b.normalizer(s, {"nfkc_cf"});
+  author.defaults.emplace().value = "s";
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "a", "author", "Le Guin"),
+    flatdoc("id", "b", "author", "LE GUIN")
+  }, UpdateMessage::COMMIT).success);
+
+  HttpReq discovered(port());
+  discovered.matchQuery("author__s", "le guin").batchSize(1).execute();
+  ASSERT_EQ(200, discovered.status()) << discovered.rawResponse();
+  EXPECT_CONTAINS_DOC(discovered.getDocs(), flatdoc("id", "a", "author", "Le Guin"));
+  EXPECT_CONTAINS_DOC(discovered.getDocs(), flatdoc("id", "b", "author", "LE GUIN"));
+  EXPECT_EQ(std::string::npos, discovered.rawResponse().find("author__"));
+
+  HttpReq selected(port());
+  selected.matchQuery("author__s", "le guin").batchSize(1)
+      .fields({"*", "author", "author__s", "author__self", "author"}).execute();
+  ASSERT_EQ(200, selected.status()) << selected.rawResponse();
+  EXPECT_GE(selected.lineCount(), 2u);
+  EXPECT_CONTAINS_DOC(selected.getDocs(), flatdoc("id", "a", "author", "Le Guin",
+      "author__s", "le guin", "author__self", "Le Guin"));
+  EXPECT_CONTAINS_DOC(selected.getDocs(), flatdoc("id", "b", "author", "LE GUIN",
+      "author__s", "le guin", "author__self", "LE GUIN"));
+  EXPECT_EQ(std::string::npos, selected.rawResponse().find("\"columns\""));
+
+  HttpReq invalid(port());
+  invalid.matchQuery("author__s", "le guin").fields({"author__*"}).execute();
+  // Projection resolves during execution; streaming keeps HTTP 200 and
+  // reports the request error in the response body.
+  ASSERT_EQ(200, invalid.status()) << invalid.rawResponse();
+  EXPECT_NE(std::string::npos, invalid.rawResponse().find("\"error\""));
+  EXPECT_NE(std::string::npos, invalid.rawResponse().find("author__label"));
+}
+
 // A string field containing JSON-significant characters round-trips through the
 // renderer's escaping and back via the glaze parse in HttpReq.
 TEST_F(HttpApiTest, stringEscaping) {
