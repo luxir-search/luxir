@@ -8,6 +8,8 @@ land is to talk about it before writing much code.
 
 - Questions and ideas: [GitHub Discussions](https://github.com/luxir-search/luxir/discussions).
 - Bugs and feature requests: [GitHub Issues](https://github.com/luxir-search/luxir/issues).
+- Security problems: email <security@luxir.org> as described in
+  [SECURITY.md](SECURITY.md), not a public issue.
 
 A good bug report includes the commit or version, the exact request you sent,
 the response you got, and what you expected instead. A `curl` reproduction

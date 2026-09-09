@@ -6,4 +6,4 @@ Luxir follows the Apache Software Foundation's
 
 If you feel there has been a violation, please point out your concern
 publicly in a friendly and matter-of-fact manner. If that is not appropriate,
-write to the maintainers at [yseeley@gmail.com](mailto:yseeley@gmail.com).
+write to the maintainers at [private@luxir.org](mailto:private@luxir.org).
