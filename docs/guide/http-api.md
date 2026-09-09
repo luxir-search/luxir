@@ -54,7 +54,7 @@ unbounded request or response into one in-memory JSON value.
 JSON field names and enums are lowercase `snake_case`. Values use natural JSON
 forms where their message type is known. For example, a kNN query vector is an
 array of numbers, a query can be a bare expression string, and
-`{"match":{"title_w":"dune"}}` is accepted field-name sugar. Document vector
+`{"match":{"title_t":"dune"}}` is accepted field-name sugar. Document vector
 fields also accept bare number arrays. The schema interprets a number array as
 one vector and an array of number arrays as a multi-valued vector list.
 

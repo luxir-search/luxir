@@ -22,7 +22,7 @@ body field, which makes saved POST requests easy to adjust from a link.
 This is a complete browser-usable search:
 
 ```http
-GET /collections/books/_search?query=title_w:dune&limit=10&fields=id,title_s
+GET /collections/books/_search?query=title_t:dune&limit=10&fields=id,title_t
 ```
 
 The recognized request-level parameters are:
@@ -73,14 +73,14 @@ POST /collections/books/_search
 Content-Type: application/json
 
 {
-  "query": "title_w:(dune OR messiah) AND year_i:>=1965",
+  "query": "title_t:(dune OR messiah) AND year_i:>=1965",
   "filter": [
     "stock_i:>0"
   ],
   "limit": 10,
   "get_number": true,
   "get_scores": true,
-  "fields": ["id", "title_w", "year_i", "price_f"]
+  "fields": ["id", "title_t", "year_i", "price_f"]
 }
 ```
 
@@ -88,8 +88,8 @@ Content-Type: application/json
 {
   "found": 2,
   "docs": [
-    {"id":"b1","title_w":"dune","year_i":1965,"price_f":9.99,"_score_":0.73},
-    {"id":"b2","title_w":"dune messiah","year_i":1969,"price_f":8.99,"_score_":0.61}
+    {"id":"b1","title_t":"Dune","year_i":1965,"price_f":9.99,"_score_":0.73},
+    {"id":"b2","title_t":"Dune Messiah","year_i":1969,"price_f":8.99,"_score_":0.61}
   ]
 }
 ```
@@ -130,17 +130,17 @@ filters, fusion sources, or another query wrapper.
 | Query | Example | Notes |
 |---|---|---|
 | Match all | `{"all":true}` | Constant-scoring all-documents query. |
-| Match | `{"match":{"title_w":"darkness"}}` | Analyzes text; the object shown is sugar for explicit `field` and `val`. |
+| Match | `{"match":{"title_t":"kings"}}` | Analyzes text; the object shown is sugar for explicit `field` and `val`. |
 | Exists | `{"exists":{"field":"year_i"}}` | Supplied value exists; expression shorthand is `year_i:*`. |
-| Phrase | `{"phrase":{"field":"title_w","text":"left hand","slop":0}}` | Position-aware; see the [query language](query-language.md#terms-and-phrases) for slop semantics. |
+| Phrase | `{"phrase":{"field":"title_t","text":"way of kings","slop":0}}` | Position-aware; see the [query language](query-language.md#terms-and-phrases) for slop semantics. |
 | Range | `{"range":{"field":"year_i","gte":1960,"lt":1970}}` | Numeric, date, string, ID, or text term ranges. |
-| Prefix | `{"prefix":{"field":"title_w","prefix":"dark"}}` | Term prefix, not a general wildcard. |
-| Fuzzy | `{"fuzzy":{"field":"author_s","term":"leguin","max_edits":1}}` | Closest-term rewrite; `max_expansions` defaults to `50`. |
+| Prefix | `{"prefix":{"field":"title_t","prefix":"king"}}` | Term prefix, not a general wildcard. |
+| Fuzzy | `{"fuzzy":{"field":"author_s","term":"Sandersen","max_edits":1}}` | Closest-term rewrite; `max_expansions` defaults to `50`. |
 | Boolean | `{"boolean":{"required":[...],"filter":[...],"optional":[...],"prohibited":[...],"min_match":1}}` | Uniform composition of scoring and non-scoring clauses. |
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
-| Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_w"]}}` | Never-failing syntax for raw search-box input. |
-| Expression | `"title_w:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe variables. |
+| Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_t"]}}` | Never-failing syntax for raw search-box input. |
+| Expression | `"title_t:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe variables. |
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
 | Geo distance | `{"geo_distance":{"field":"location","lat":40.71,"lon":-74.01,"radius_meters":5000}}` | Inclusive great-circle radius. |
@@ -202,7 +202,7 @@ Sort a column field explicitly:
 {
   "query": {"all":true},
   "sorts": [{"expr":"year_i","dir":"desc"}],
-  "fields": ["id","title_w","year_i"]
+  "fields": ["id","title_t","year_i"]
 }
 ```
 
@@ -295,11 +295,11 @@ POST /collections/books/_search
   "ops": {
     "results": {
       "top_docs": {
-        "query": "title_w:dune",
+        "query": "title_t:dune",
         "filter": ["stock_i:>0"],
         "limit": 10,
         "get_number": true,
-        "fields": ["id","title_w","price_f"],
+        "fields": ["id","title_t","price_f"],
         "ops": {
           "categories": {
             "field_facet": {"field":"category_s","limit":10}
@@ -315,7 +315,7 @@ POST /collections/books/_search
 ```json
 {
   "found": 42,
-  "docs": [{"id":"b1","title_w":"dune","price_f":9.99}],
+  "docs": [{"id":"b1","title_t":"Dune","price_f":9.99}],
   "ops": {
     "categories": {
       "buckets": [
@@ -440,7 +440,7 @@ than response envelopes:
 ```bash
 curl -s 'http://localhost:9400/collections/books/_search?format=docs' \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"all":true},"limit":-1,"fields":["id","title_w"]}'
+  -d '{"query":{"all":true},"limit":-1,"fields":["id","title_t"]}'
 ```
 
 Each line is one bare document. If `get_number` or warnings are present, a

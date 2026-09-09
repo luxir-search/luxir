@@ -8,9 +8,9 @@ share.
 ```json
 {
   "id": "b1",
-  "title_w": "the left hand of darkness",
-  "year_i": 1969,
-  "tags_ss": ["fiction","classic"]
+  "title_t": "The Way of Kings",
+  "year_i": 2010,
+  "tags_ss": ["fantasy","epic"]
 }
 ```
 
@@ -21,7 +21,7 @@ with IDs or flatten the fields in the producer.
 
 With the default schema, a recognized suffix chooses the type:
 
-- `title_w` is analyzed text;
+- `title_t` is analyzed text;
 - `category_s` is an indexed exact string;
 - `year_i` is an integer column;
 - `tags_ss` is a multi-valued exact string;

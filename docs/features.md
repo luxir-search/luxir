@@ -11,11 +11,11 @@ The ten-second version:
 
 ```
 POST /collections/main/_search
-{"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
+{"query": {"match": {"title_t": "kings"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
 ```
 
 ```json
-{"found":1,"docs":[{"id":"1","author_s":"Le Guin","year_i":1969}]}
+{"found":1,"docs":[{"id":"1","author_s":"Sanderson","year_i":2010}]}
 ```
 
 No schema defined up front, no collection created, no client library
@@ -53,7 +53,7 @@ engine is built the way it is.
 
 ## Schema and fields
 
-- Schemaless start: field types inferred from name suffixes (`title_w`,
+- Schemaless start: field types inferred from name suffixes (`title_t`,
   `year_i`, `tags_ss`, `date_dt`, `embedding_v`, ...); no up-front schema
   required.
 - Explicit schema API over HTTP/JSON and gRPC: field definitions, per-field
@@ -139,7 +139,7 @@ clauses, as top-docs/fusion filters, and as fusion source queries.
   object.  Fielded terms and phrases (including strict quoted-phrase
   `~N` slop), AND/OR/NOT with real precedence,
   `+`/`-` prefixes, ranges (`year_i:[1960 TO 1970}`) and comparisons
-  (`year_i:>=1960`), field groups (`title_w:(a OR b)`), and function forms for
+  (`year_i:>=1960`), field groups (`title_t:(a OR b)`), and function forms for
   most structured query types (`fuzzy(smith, field=name_s, max_edits=2)`). The
   [structured query reference](guide/query-reference.md) lists fields and
   exceptions. Special characters only act

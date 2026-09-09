@@ -35,16 +35,16 @@ query, and what a value means is decided by its field, not by its shape:
 ## Terms and phrases
 
 ```
-title_w:dune                term match, analyzed like the field was
-title_w:"dune messiah"      phrase (on analyzed text fields)
-title_w:'dune messiah'      same thing; handy inside JSON
-title_w:"dune messiah"~2    phrase allowing a positional spread of 2
+title_t:dune                term match, analyzed like the field was
+title_t:"dune messiah"      phrase (on analyzed text fields)
+title_t:'dune messiah'      same thing; handy inside JSON
+title_t:"dune messiah"~2    phrase allowing a positional spread of 2
 tag_s:"in stock"            on an unanalyzed string field: one exact term
 year_i:1982                 exact numeric match
 ```
 
 A word with no field is a parse error. There is no default search field:
-either name one (`title_w:dune`), use `match(dune, field=title_w)`, or use
+either name one (`title_t:dune`), use `match(dune, field=title_t)`, or use
 `simple_query` if the text came from a search box.
 
 Phrase slop measures the spread of the query-adjusted positions: for a
@@ -75,7 +75,7 @@ most values need no escaping:
   with the constant `N`. Elsewhere `^` is a literal character.
 - Quotes start a quoted value only where a value can begin - right after
   `field:`, whitespace, `(`, a `,` or `=` in arguments. Anywhere else a
-  quote is an ordinary character, so `title_w:don't` is one word.
+  quote is an ordinary character, so `title_t:don't` is one word.
 - `\` escapes the next character when you do need one: `status_s:a\:b`.
 - Inside quotes the only escapes are `\"`, `\'`, and `\\`.
 
@@ -95,7 +95,7 @@ not change. Wildcard and regex queries will arrive as named functions
 then `AND`, then `OR`, so
 
 ```
-title_w:dune OR title_w:messiah AND status_s:live
+title_t:dune OR title_t:messiah AND status_s:live
 ```
 
 means `dune OR (messiah AND live)`. `NOT x` on its own means "everything
@@ -111,7 +111,7 @@ by spaces are optional, `+` makes one required, `-` excludes it. A sign must
 touch its clause.
 
 ```
-+status_s:live -tag_s:beta title_w:dune
++status_s:live -tag_s:beta title_t:dune
 ```
 
 One level of a query uses one style or the other. `+a AND b` and
@@ -120,7 +120,7 @@ that accept it disagree about what it means, so this one makes you pick.
 Parentheses let the styles nest:
 
 ```
-+(title_w:dune OR title_w:messiah) -tag_s:beta
++(title_t:dune OR title_t:messiah) -tag_s:beta
 ```
 
 ## Field groups
@@ -128,15 +128,15 @@ Parentheses let the styles nest:
 Parentheses after `field:` apply the field to everything inside:
 
 ```
-title_w:(dune OR messiah)        same as title_w:dune OR title_w:messiah
-title_w:(dune mess* fuzz~1)      terms, prefixes, fuzzy, all against title_w
+title_t:(dune OR messiah)        same as title_t:dune OR title_t:messiah
+title_t:(dune mess* fuzz~1)      terms, prefixes, fuzzy, all against title_t
 year_i:(>=1960 AND <1970)
-title_w:(dune OR body_w:spice)   a field named inside the group overrides it
+title_t:(dune OR body_t:spice)   a field named inside the group overrides it
 temp_i:(-5 OR 10)                on a numeric field, - is the value's sign
 ```
 
 A group is boolean structure, not a bag of words. To match the words
-together as one analyzed value, use `match(dune messiah, field=title_w)`.
+together as one analyzed value, use `match(dune messiah, field=title_t)`.
 
 In a numeric field's group, `-` in front of a number binds to the number:
 `temp_i:(-5)` matches -5 rather than excluding 5. To exclude a value there,
@@ -228,9 +228,9 @@ Juxtaposed comparisons on one field are a parse error - `year_i:(>=1960
 ## Prefix, fuzzy, existence
 
 ```
-title_w:mess*        terms starting with "mess"
-title_w:dune~        fuzzy; edit distance chosen from the term length
-title_w:dune~1       fuzzy, one edit (maximum 2; ~0 means exact)
+title_t:mess*        terms starting with "mess"
+title_t:dune~        fuzzy; edit distance chosen from the term length
+title_t:dune~1       fuzzy, one edit (maximum 2; ~0 means exact)
 year_i:*             documents with any value in the field
 exists(year_i)       the same existence query in function form
 *:*                  every document
@@ -267,9 +267,9 @@ wider scan for first-position typos.
 A score decoration applies to the clause immediately before it:
 
 ```
-title_w:dune^2
-title_w:"dune messiah"^1.5
-(title_w:dune OR title_w:messiah)^3
+title_t:dune^2
+title_t:"dune messiah"^1.5
+(title_t:dune OR title_t:messiah)^3
 status_s:active^=2
 ```
 
@@ -283,7 +283,7 @@ are not accepted as score-decoration values.
 
 The structured arm is `{"boost":{"query":...,"boost":N}}`. JSON also
 accepts a numeric `boost` sibling as input sugar:
-`{"match":{"title_w":"dune"},"boost":2}`. An object-valued `boost` is the
+`{"match":{"title_t":"dune"},"boost":2}`. An object-valued `boost` is the
 arm itself, not the sibling sugar. Request echo and other encoding always use
 the structured wrapper form.
 
@@ -301,17 +301,17 @@ name is the query's JSON name and the arguments are its JSON fields, so the
 reference:
 
 ```
-match(dune messiah, field=title_w, operator=AND, min_match=2)
-phrase(dune messiah, field=title_w)
-phrase(dune messiah, field=title_w, slop=2)
+match(dune messiah, field=title_t, operator=AND, min_match=2)
+phrase(dune messiah, field=title_t)
+phrase(dune messiah, field=title_t, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
-prefix(mess, field=title_w)
+prefix(mess, field=title_t)
 exists(year_i)
 range(field=year_i, gte=1960, lt=1970)
-boost(title_w:dune, boost=2)
+boost(title_t:dune, boost=2)
 constant_score(status_s:active AND year_i:>=1960, score=1.0)
-boolean(required=[status_s:active], optional=[title_w:dune, title_w:messiah], min_match=1)
-simple_query($user_input, fields=[title_w, body_w], operator=AND)
+boolean(required=[status_s:active], optional=[title_t:dune, title_t:messiah], min_match=1)
+simple_query($user_input, fields=[title_t, body_t], operator=AND)
 all()
 ```
 
@@ -329,8 +329,8 @@ expression instead. Values are typed by the argument: numbers,
 
 Quoting an argument protects it from the grammar but does not change what
 it means: `match("foo bar")` and `match(foo bar)` search the same text. If
-you want a phrase, say so - `phrase(foo bar, field=title_w)`. This differs
-from term position, where `title_w:"foo bar"` is a phrase.
+you want a phrase, say so - `phrase(foo bar, field=title_t)`. This differs
+from term position, where `title_t:"foo bar"` is a phrase.
 
 In `boolean(...)`, optional clauses only rank matches when a required or
 filter clause is present; set `min_match` to make the optional group a real
@@ -354,7 +354,7 @@ behaves sensibly when the text repeats words.
 
 ```
 {"query": {"expr": {
-  "q": "simple_query($input, fields=[title_w]) AND year_i:>=$year",
+  "q": "simple_query($input, fields=[title_t]) AND year_i:>=$year",
   "vars": {"input": "whatever the user typed: AND) OR *", "year": 1960}
 }}}
 ```

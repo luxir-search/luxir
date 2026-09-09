@@ -38,9 +38,9 @@ curl http://localhost:9400/health
 curl -X POST http://localhost:9400/collections/main/_update \
   -H 'Content-Type: application/json' \
   -d '{"docs":[
-        {"id":"1","title_w":"the left hand of darkness","author_s":"Le Guin","year_i":1969},
-        {"id":"2","title_w":"a wizard of earthsea","author_s":"Le Guin"},
-        {"id":"3","title_w":"the dispossessed","author_s":"Le Guin","year_i":1974}
+        {"id":"1","title_t":"The Way of Kings","author_s":"Sanderson","year_i":2010},
+        {"id":"2","title_t":"Words of Radiance","author_s":"Sanderson"},
+        {"id":"3","title_t":"Mistborn: The Final Empire","author_s":"Sanderson","year_i":2006}
       ],"commit":{}}'
 ```
 
@@ -49,10 +49,10 @@ curl -X POST http://localhost:9400/collections/main/_update \
 ```
 
 You did not define a schema, and you did not create the `main` collection -
-both just happened. **Field types come from the field name.** A `_w` suffix is
+both just happened. **Field types come from the field name.** A `_t` suffix is
 full-text (analyzed, tokenized), `_s` is an exact string, `_i` is an integer;
 there are suffixes for floats, doubles, dates, and multi-valued versions of
-each. Name a field `title_w` and it is searchable text; name it `year_i` and
+each. Name a field `title_t` and it is searchable text; name it `year_i` and
 it is a number you can range and sort on. Define an [explicit schema](schema.md)
 later when you want control - you do not need one to start.
 
@@ -64,15 +64,15 @@ later when you want control - you do not need one to start.
 
 ```
 POST /collections/main/_search
-{"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
+{"query": {"match": {"title_t": "kings"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
 ```
 
 ```json
-{"found":1,"docs":[{"id":"1","author_s":"Le Guin","year_i":1969}]}
+{"found":1,"docs":[{"id":"1","author_s":"Sanderson","year_i":2010}]}
 ```
 
-`match` analyzes your text the same way the field was indexed, so `darkness`
-finds *"the left hand of darkness"*. `fields` chooses what comes back. A
+`match` analyzes your text the same way the field was indexed, so `kings`
+finds *"The Way of Kings"*. `fields` chooses what comes back. A
 document that doesn't have a requested field simply omits that key - a doc
 object never carries `null` placeholders, so what you see is exactly what the
 document has.
@@ -90,7 +90,7 @@ not an estimate - even when you only page back a few:
 
 ```
 POST /collections/main/_search
-{"query": {"match": {"author_s": "Le Guin"}}, "fields": ["id"], "get_number": true, "limit": 2}
+{"query": {"match": {"author_s": "Sanderson"}}, "fields": ["id"], "get_number": true, "limit": 2}
 ```
 
 ```json
@@ -107,7 +107,7 @@ error - malformed input just does its best:
 
 ```
 POST /collections/main/_search
-{"query": {"simple_query": {"q": "darkness | earthsea", "fields": ["title_w"]}}, "fields": ["id"], "get_number": true}
+{"query": {"simple_query": {"q": "kings | radiance", "fields": ["title_t"]}}, "fields": ["id"], "get_number": true}
 ```
 
 ```json
@@ -123,14 +123,14 @@ types. Unlike `simple_query`, malformed input is a parse error, not a guess:
 
 ```
 POST /collections/main/_search
-{"query": "title_w:(darkness OR earthsea) AND year_i:[1960 TO 1970]", "fields": ["id"], "get_number": true}
+{"query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2020]", "fields": ["id"], "get_number": true}
 ```
 
 ```json
 {"found":1,"docs":[{"id":"1"}]}
 ```
 
-*"a wizard of earthsea"* matched the title group but has no `year_i`, so the
+*"Words of Radiance"* matched the title group but has no `year_i`, so the
 range clause excluded it.
 
 ## Bulk ingest: stream a whole file
@@ -141,8 +141,8 @@ arrives, without buffering the whole thing:
 
 ```
 POST /collections/main/_update      (Content-Type: application/x-ndjson)
-{"id": "4", "title_w": "the lathe of heaven", "author_s": "Le Guin", "year_i": 1971}
-{"id": "5", "title_w": "always coming home", "author_s": "Le Guin", "year_i": 1985}
+{"id": "4", "title_t": "Oathbringer", "author_s": "Sanderson", "year_i": 2017}
+{"id": "5", "title_t": "The Well of Ascension", "author_s": "Sanderson", "year_i": 2007}
 {"_end_": {"commit": {}}}
 ```
 
@@ -170,15 +170,15 @@ one connection; there is no scroll API or cursor token to manage:
 
 ```
 POST /collections/main/_search?format=docs
-{"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}
+{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"]}
 ```
 
 ```ndjson
-{"id":"1","title_w":"the left hand of darkness"}
-{"id":"2","title_w":"a wizard of earthsea"}
-{"id":"3","title_w":"the dispossessed"}
-{"id":"4","title_w":"the lathe of heaven"}
-{"id":"5","title_w":"always coming home"}
+{"id":"1","title_t":"The Way of Kings"}
+{"id":"2","title_t":"Words of Radiance"}
+{"id":"3","title_t":"Mistborn: The Final Empire"}
+{"id":"4","title_t":"Oathbringer"}
+{"id":"5","title_t":"The Well of Ascension"}
 ```
 
 Ask for `get_number` and a `_header_` line leads the stream so tools know the
@@ -190,7 +190,7 @@ into `/_update`:
 ```bash
 curl -s 'http://localhost:9400/collections/main/_search?format=docs' \
      -H 'Content-Type: application/json' \
-     -d '{"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}' |
+     -d '{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"]}' |
 curl -X POST 'http://localhost:9400/collections/backup/_update?commit=true' \
      -H 'Content-Type: application/x-ndjson' --data-binary @-
 ```
@@ -206,7 +206,7 @@ on first use:
 
 ```
 POST /collections/books/_update
-{"docs": [{"id": "a", "title_w": "dune"}], "commit": {}}
+{"docs": [{"id": "a", "title_t": "Dune"}], "commit": {}}
 ```
 
 ```json
@@ -215,7 +215,7 @@ POST /collections/books/_update
 
 ```
 POST /collections/books/_search
-{"query": {"match": {"title_w": "dune"}}, "fields": ["id"], "get_number": true}
+{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "get_number": true}
 ```
 
 ```json
@@ -243,11 +243,11 @@ parsed - the shorthand you sent, expanded to the full form:
 
 ```
 POST /collections/main/_search?explain=request
-{"query": {"match": {"title_w": "dune"}}}
+{"query": {"match": {"title_t": "dune"}}}
 ```
 
 ```json
-{"collection":"main","ops":{"q":{"top_docs":{"query":{"match":{"field":"title_w","val":"dune"}}}}}}
+{"collection":"main","ops":{"q":{"top_docs":{"query":{"match":{"field":"title_t","val":"dune"}}}}}}
 ```
 
 Handy for learning the API and for debugging a query that isn't matching what

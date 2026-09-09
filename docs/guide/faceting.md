@@ -12,11 +12,11 @@ POST /collections/books/_search
   "ops": {
     "results": {
       "top_docs": {
-        "query": "title_w:dune",
+        "query": "title_t:dune",
         "filter": ["stock_i:>0"],
         "limit": 10,
         "get_number": true,
-        "fields": ["id","title_w"],
+        "fields": ["id","title_t"],
         "ops": {
           "categories": {
             "field_facet": {"field":"category_s","limit":10,"missing":true}
@@ -31,7 +31,7 @@ POST /collections/books/_search
 ```json
 {
   "found": 42,
-  "docs": [{"id":"b1","title_w":"dune"}],
+  "docs": [{"id":"b1","title_t":"Dune"}],
   "ops": {
     "categories": {
       "buckets": [
@@ -80,7 +80,7 @@ as a deterministic tie break. Setting `mincount: 0` can include values that
 exist in the collection but have zero matches in the current domain.
 
 Integer and date fields facet on each distinct column value. Text fields facet
-on analyzed terms, not on the original stored text: faceting `body_w` answers
+on analyzed terms, not on the original stored text: faceting `body_t` answers
 "which indexed terms occur?", while faceting `category_s` answers "which
 category values occur?" Integer/date/text field facets currently support
 `limit`, positive `mincount`, and `missing`, but not sub-operations or custom
@@ -253,9 +253,9 @@ or a sort:
     "ops": {
       "best": {
         "top_docs": {
-          "query": "title_w:dune",
+          "query": "title_t:dune",
           "limit": 2,
-          "fields": ["id","title_w"],
+          "fields": ["id","title_t"],
           "get_number": true
         }
       }
@@ -270,12 +270,12 @@ or a sort:
     {
       "val": "science-fiction",
       "count": 31,
-      "best": {"found": 31, "docs": [{"id":"b1","title_w":"dune"}, {"id":"b7","title_w":"dune messiah"}]}
+      "best": {"found": 31, "docs": [{"id":"b1","title_t":"Dune"}, {"id":"b7","title_t":"Dune Messiah"}]}
     },
     {
       "val": "classic",
       "count": 18,
-      "best": {"found": 18, "docs": [{"id":"b3","title_w":"dune"}, {"id":"b9","title_w":"children of dune"}]}
+      "best": {"found": 18, "docs": [{"id":"b3","title_t":"Dune"}, {"id":"b9","title_t":"Children of Dune"}]}
     }
   ]
 }

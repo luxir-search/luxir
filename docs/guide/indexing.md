@@ -28,8 +28,8 @@ Content-Type: application/json
 {
   "request_id": "load-42",
   "docs": [
-    {"id": "b1", "title_w": "dune", "year_i": 1965},
-    {"id": "b2", "title_w": "dune messiah", "year_i": 1969}
+    {"id": "b1", "title_t": "Dune", "year_i": 1965},
+    {"id": "b2", "title_t": "Dune Messiah", "year_i": 1969}
   ],
   "delete_ids": ["retired-book"],
   "return_ids": true,
@@ -64,7 +64,7 @@ dump indexes as-is: no editing the file, no schema change. Point Luxir at the
 file and put the mapping on the URL:
 
 ```bash
-curl -X POST 'http://localhost:9400/collections/books/_update?field_map=bookId:id,headline:title_w&drop_unmapped=true&commit=true' \
+curl -X POST 'http://localhost:9400/collections/books/_update?field_map=bookId:id,headline:title_t&drop_unmapped=true&commit=true' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @books.ndjson
 ```
@@ -90,8 +90,8 @@ POST /collections/books/_update
 Content-Type: application/json
 
 {
-  "docs": [{"bookId": "b1", "headline": "dune"}],
-  "field_map": {"bookId": "id", "headline": "title_w"},
+  "docs": [{"bookId": "b1", "headline": "Dune"}],
+  "field_map": {"bookId": "id", "headline": "title_t"},
   "drop_unmapped": true,
   "commit": {}
 }
@@ -197,8 +197,8 @@ Set `Content-Type: application/x-ndjson` and put one document on each line:
 POST /collections/books/_update
 Content-Type: application/x-ndjson
 
-{"id":"b1","title_w":"dune","year_i":1965}
-{"id":"b2","title_w":"dune messiah","year_i":1969}
+{"id":"b1","title_t":"Dune","year_i":1965}
+{"id":"b2","title_t":"Dune Messiah","year_i":1969}
 {"_end_":{"commit":{}}}
 ```
 
@@ -225,10 +225,10 @@ For example, two independently reported groups followed by one commit:
 
 ```ndjson
 {"_update_":{"request_id":"fiction","return_ids":true}}
-{"id":"b1","kind_s":"fiction","title_w":"dune"}
+{"id":"b1","kind_s":"fiction","title_t":"Dune"}
 {}
 {"_update_":{"request_id":"nonfiction"}}
-{"id":"b2","kind_s":"nonfiction","title_w":"the making of the atomic bomb"}
+{"id":"b2","kind_s":"nonfiction","title_t":"The Making of the Atomic Bomb"}
 {"_end_":{"commit":{}}}
 ```
 

@@ -9,12 +9,12 @@ an HTTP/JSON API for humans and a typed streaming gRPC API for applications.
 POST /collections/books/_search
 Content-Type: application/json
 
-{"query":"title_w:(dune OR messiah) AND year_i:>=1965",
- "fields":["id","title_w","year_i"],"get_number":true}
+{"query":"title_t:(dune OR messiah) AND year_i:>=1965",
+ "fields":["id","title_t","year_i"],"get_number":true}
 ```
 
 ```json
-{"found":2,"docs":[{"id":"b1","title_w":"dune","year_i":1965},{"id":"b2","title_w":"dune messiah","year_i":1969}]}
+{"found":2,"docs":[{"id":"b1","title_t":"Dune","year_i":1965},{"id":"b2","title_t":"Dune Messiah","year_i":1969}]}
 ```
 
 No collection creation, schema ceremony, or client library is required to get
@@ -56,7 +56,7 @@ Index a document and commit it:
 ```bash
 curl -X POST http://localhost:9400/collections/books/_update \
   -H 'Content-Type: application/json' \
-  -d '{"docs":[{"id":"b1","title_w":"the left hand of darkness","author_s":"Le Guin","year_i":1969}],"commit":{}}'
+  -d '{"docs":[{"id":"b1","title_t":"The Way of Kings","author_s":"Sanderson","year_i":2010}],"commit":{}}'
 ```
 
 Search it:
@@ -64,7 +64,7 @@ Search it:
 ```bash
 curl -X POST http://localhost:9400/collections/books/_search \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"match":{"title_w":"darkness"}},"fields":["id","author_s","year_i"]}'
+  -d '{"query":{"match":{"title_t":"kings"}},"fields":["id","author_s","year_i"]}'
 ```
 
 Continue with the [Quickstart](docs/guide/quickstart.md), then use the

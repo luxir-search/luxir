@@ -52,7 +52,7 @@ curl http://localhost:9400/collections/books/_update \
   -d '{
     "docs": [{
       "id": "b1",
-      "title_w": "dune",
+      "title_t": "Dune",
       "embedding_v": [0.8, 0.1, 0.1],
       "passages_vs": [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1]]
     }],
@@ -67,7 +67,7 @@ equivalent protobuf text shape for the single-valued field is:
 collection { name: "books" }
 docs {
   fields { key: "id" value { s: "b1" } }
-  fields { key: "title_w" value { s: "dune" } }
+  fields { key: "title_t" value { s: "Dune" } }
   fields { key: "kind_s" value { s: "fiction" } }
   fields {
     key: "embedding_v"
@@ -97,7 +97,7 @@ POST /collections/books/_search
   },
   "limit":10,
   "get_scores":true,
-  "fields":["id","title_w"]
+  "fields":["id","title_t"]
 }
 ```
 
@@ -122,7 +122,7 @@ Put ordinary filters on the same `top_docs` operation:
   },
   "filter":["kind_s:fiction"],
   "limit":20,
-  "fields":["id","title_w"]
+  "fields":["id","title_t"]
 }
 ```
 
@@ -146,7 +146,7 @@ POST /collections/books/_search
       "fusion": {
         "sources": {
           "lexical": {
-            "query": {"match":{"title_w":"dune"}},
+            "query": {"match":{"title_t":"dune"}},
             "limit": 100
           },
           "semantic": {
@@ -164,7 +164,7 @@ POST /collections/books/_search
         "rrf": {"k":60},
         "limit": 10,
         "get_scores": true,
-        "fields": ["id","title_w"],
+        "fields": ["id","title_t"],
         "ops": {"authors": {"field_facet": {"field":"author_s"}}}
       }
     }

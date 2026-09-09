@@ -31,8 +31,8 @@ field. The expression shorthand is `year_i:*`.
 ```json
 {
   "match": {
-    "field": "title_w",
-    "val": "dune messiah",
+    "field": "title_t",
+    "val": "Dune Messiah",
     "operator": "and"
   }
 }
@@ -41,7 +41,7 @@ field. The expression shorthand is `year_i:*`.
 The HTTP dialect also accepts the field-name form:
 
 ```json
-{"match":{"title_w":"dune messiah","operator":"and"}}
+{"match":{"title_t":"dune messiah","operator":"and"}}
 ```
 
 | Field | Meaning |
@@ -61,7 +61,7 @@ rules as indexing and matched through their columns.
 {
   "boolean": {
     "required": [
-      {"match":{"title_w":"dune"}}
+      {"match":{"title_t":"dune"}}
     ],
     "filter": [
       {"range":{"field":"year_i","gte":1960}}
@@ -109,7 +109,7 @@ validation until routed filter execution is implemented.
 The common form analyzes one text value:
 
 ```json
-{"phrase":{"field":"title_w","text":"left hand","slop":0}}
+{"phrase":{"field":"title_t","text":"way of kings","slop":0}}
 ```
 
 Set exactly one input form:
@@ -130,7 +130,7 @@ costs `2`, and multi-valued text fields have a position gap of `100`. See
 ## Prefix
 
 ```json
-{"prefix":{"field":"title_w","prefix":"mess"}}
+{"prefix":{"field":"title_t","prefix":"mess"}}
 ```
 
 `prefix` is an indexed-term prefix, not a wildcard expression. Text fields
@@ -203,7 +203,7 @@ Multiply child scores without changing matches:
 ```json
 {
   "boost": {
-    "query": {"match":{"title_w":"dune"}},
+    "query": {"match":{"title_t":"dune"}},
     "boost": 2.0
   }
 }
@@ -211,7 +211,7 @@ Multiply child scores without changing matches:
 
 `boost` defaults to `1.0` and must be finite and non-negative. HTTP also
 accepts a numeric sibling as input sugar:
-`{"match":{"title_w":"dune"},"boost":2}`. Canonical output uses the wrapper.
+`{"match":{"title_t":"dune"},"boost":2}`. Canonical output uses the wrapper.
 
 ## Simple query
 
@@ -221,10 +221,10 @@ accepts a numeric sibling as input sugar:
 {
   "simple_query": {
     "q": "dune | messiah -movie",
-    "fields": ["title_w","description_t"],
+    "fields": ["title_t","description_t"],
     "operator": "or",
     "min_match": 1,
-    "allowed_fields": ["title_w","author_s"]
+    "allowed_fields": ["title_t","author_s"]
   }
 }
 ```
@@ -251,8 +251,8 @@ injection-safe values:
 ```json
 {
   "expr": {
-    "q": "title_w:$title AND year_i:>=$year",
-    "vars": {"title":"dune","year":1965}
+    "q": "title_t:$title AND year_i:>=$year",
+    "vars": {"title":"Dune","year":1965}
   }
 }
 ```

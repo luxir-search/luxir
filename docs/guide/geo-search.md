@@ -130,7 +130,7 @@ used as filters. The common search shape keeps text relevance intact:
 
 ```json
 {
-  "query": {"match":{"description_w":"coffee"}},
+  "query": {"match":{"description_t":"coffee"}},
   "filter": [
     {
       "name": "nearby",
@@ -144,7 +144,7 @@ used as filters. The common search shape keeps text relevance intact:
       }
     }
   ],
-  "fields":["id","name_s","description_w"]
+  "fields":["id","name_s","description_t"]
 }
 ```
 
