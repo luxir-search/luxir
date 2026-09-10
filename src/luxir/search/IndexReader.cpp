@@ -120,17 +120,18 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
-IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
+IndexReader::IndexReader(std::shared_ptr<PhysicalCore> core, std::shared_ptr<Schema> schema,
                          std::shared_ptr<FilterCache> filterCache)
-  // The passed cache wins over succession: the owning IndexWriter passes its
-  // CURRENT cache at every reader construction, and cache-swap events
-  // (namespace rewinds like testDeleteAllData, a future truncate) must
-  // propagate to new readers. Inheriting from previousReader here would pin
-  // the pre-swap cache forever. Succession only fills in when the caller has
-  // no cache (writerless tool/test chains).
-  : sharedFilterCache(filterCache != nullptr
-        ? std::move(filterCache)
-        : (previousReader ? previousReader->sharedFilterCache : nullptr)) {
+  : core(std::move(core)), sharedSchema(std::move(schema)),
+    sharedFilterCache(std::move(filterCache)) {}
+
+IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
+                         std::shared_ptr<FilterCache> filterCache, std::shared_ptr<Schema> schema)
+  : IndexReader(std::make_shared<PhysicalCore>(dir, previousReader ? previousReader->core.get() : nullptr),
+                std::move(schema), filterCache ? std::move(filterCache)
+                    : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
+
+IndexReader::PhysicalCore::PhysicalCore(Directory& dir, const PhysicalCore* previous) {
   // because old segments could be merged away before we have a chance to read them, we need
   // to check if there is a new index info file and retry the open if so.
   // This could be optimized by saving the segments we did read properly in case they are still in the index.
@@ -143,11 +144,11 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
   // deserialization is the expensive part; reuse keeps reopens cheap.
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevSegAuxByKey;
-  if (previousReader) {
-    for (const auto& r : previousReader->auxReadersList) {
+  if (previous) {
+    for (const auto& r : previous->auxReadersList) {
       prevAuxByName.emplace(std::string(r->getName()), r);
     }
-    for (const auto& seg : previousReader->segs) {
+    for (const auto& seg : previous->segs) {
       for (const auto& r : seg.auxReaders()) {
         prevSegAuxByKey.emplace(segmentAuxKey(seg.segInfo.seg_id, r->getName()), r);
       }
@@ -205,7 +206,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
         int32_t nDocs = segment.max_doc;
         unused(nDocs);
 
-        // TODO: instead of creating a new PostingsReader, we could check if the previousReader has it already opened.
+        // TODO: reuse PostingsReaders from the previous physical core on commit reopen.
         // Also, to be more flexible, we should probably pass in a provider interface that can provide PostingsReaders and LiveDocs
         // from other sources (like cached in IndexWriter, or from previous IndexReader).
         auto postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
@@ -313,9 +314,9 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
   while (retry);
 
   // Check if we can share ordMaps from the previous reader
-  if (previousReader && previousReader->coreGen() == this->coreGeneration) {
+  if (previous && previous->coreGeneration == this->coreGeneration) {
     IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", this->coreGeneration);
-    this->ordMaps = previousReader->ordMaps;
+    this->ordMaps = previous->ordMaps;
   } else {
     IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", this->coreGeneration);
     this->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
@@ -327,7 +328,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
 
 
 
-std::span<const IndexReader::ProjectableField> IndexReader::projectableFields() {
+std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
   std::call_once(projectableOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
@@ -369,56 +370,51 @@ std::span<const IndexReader::ProjectableField> IndexReader::projectableFields() 
   return projectable;
 }
 
-std::shared_ptr<const std::vector<std::string_view>> IndexReader::logicalProjectableFields(
-    const std::shared_ptr<Schema>& schema) {
-  std::lock_guard lock(logicalProjectableMutex);
-  if (projectableSchema == schema) return logicalProjectable;
-
-  auto names = std::make_shared<std::vector<std::string_view>>();
-  for (const auto& source : projectableFields()) {
-    auto root = source.name.substr(0, source.name.rfind("__"));
-    if (root.empty() || root[0] == '_') continue;
-    // Only the primary's own sources can admit a root. Its entry is already
-    // in this sorted catalog if present; sibling entries add no candidates.
-    if (root != source.name) continue;
-    FieldType* type;
-    try {
-      type = schema->getFieldTypePtr(root);  // physical primary, never a binding
-    } catch (const RequestError&) {
-      // A template edit may make an old concrete root invalid for this schema.
-      continue;
+std::span<const IndexReader::LogicalProjectableField> IndexReader::logicalProjectableFields() {
+  assert(sharedSchema);
+  std::call_once(logicalProjectableOnce, [this] {
+    std::vector<LogicalProjectableField> fields;
+    for (const auto& source : projectableFields()) {
+      auto root = source.name.substr(0, source.name.rfind("__"));
+      if (root.empty() || root[0] == '_') continue;
+      // Only the primary's own sources can admit a root. Its entry is already
+      // in this sorted catalog if present; sibling entries add no candidates.
+      if (root != source.name) continue;
+      FieldType* type;
+      try {
+        type = sharedSchema->getFieldTypePtr(root);  // physical primary, never a binding
+      } catch (const RequestError&) {
+        // A template edit may make an old concrete root invalid for this schema.
+        continue;
+      }
+      if (!type) continue;
+      bool stored = type->isStored() && std::ranges::find(source.storedResources,
+          std::string_view(type->storedResource_)) != source.storedResources.end();
+      bool retrievable = false;
+      switch (type->type()) {
+        case FieldType::TEXT:
+          retrievable = stored;
+          break;
+        case FieldType::STRING:
+        case FieldType::ID:
+          // Stored STRING/ID also fall back to their own older segment columns
+          // even if the current schema no longer enables a column.
+          retrievable = stored || (source.column && (type->isStored() || type->hasColumn()));
+          break;
+        case FieldType::INT:
+        case FieldType::FLOAT:
+        case FieldType::DOUBLE:
+        case FieldType::DATE:
+          retrievable = source.column && type->hasColumn();
+          break;
+        default:
+          break;
+      }
+      if (retrievable) fields.push_back({root, type});
     }
-    if (!type) continue;
-    bool stored = type->isStored() && std::ranges::find(source.storedResources,
-        std::string_view(type->storedResource_)) != source.storedResources.end();
-    bool retrievable = false;
-    switch (type->type()) {
-      case FieldType::TEXT:
-        retrievable = stored;
-        break;
-      case FieldType::STRING:
-      case FieldType::ID:
-        // Stored STRING/ID also fall back to their own older segment columns
-        // even if the current schema no longer enables a column.
-        retrievable = stored || (source.column && (type->isStored() || type->hasColumn()));
-        break;
-      case FieldType::INT:
-      case FieldType::FLOAT:
-      case FieldType::DOUBLE:
-      case FieldType::DATE:
-        retrievable = source.column && type->hasColumn();
-        break;
-      default:
-        break;
-    }
-    if (retrievable) names->push_back(root);
-  }
-  // Retain the identity, not its generation number: schemas built in memory
-  // can share a generation. Replacing one cache entry bounds retained schemas
-  // even when the reader stays open through many schema publications.
-  projectableSchema = schema;
-  logicalProjectable = std::move(names);
-  return logicalProjectable;
+    logicalFields = std::move(fields);
+  });
+  return logicalFields;
 }
 
 }

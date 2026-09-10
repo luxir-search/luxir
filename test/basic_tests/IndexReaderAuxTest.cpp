@@ -486,6 +486,55 @@ TEST_F(IndexReaderAuxTest, newSegmentGetsFreshAuxReader) {
   EXPECT_EQ(vaux2->getFaissIndex()->ntotal, 80);
 }
 
+TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
+  CollectionHelper h;
+  auto writer = h.getIndexWriter();
+  ASSERT_TRUE(h.indexAll(std::array{
+      flatdoc("id", "a", "name_s", "alpha"), flatdoc("id", "b", "name_s", "beta")}).success);
+  h.commit({std::string(TestOverlayAuxReader::NAME)});
+  ASSERT_TRUE(h.index(flatdoc("id", "c", "name_s", "gamma")).success);
+  h.commit({std::string(TestOverlayAuxReader::NAME)});
+  ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
+  auto before = writer->getIndexReader();
+  ASSERT_EQ(2u, before->segments().size());
+  ASSERT_NE(nullptr, before->segments()[0].liveDocs());
+  auto cache = writer->getFilterCache();
+  auto publications = cache->readerPublicationsForTest();
+
+  SchemaBuilder b;
+  b.field("added").type = api::FieldDef::FieldClass::STRING;
+  auto schema = b.set(h.collection());
+  auto after = writer->getIndexReader(UINT64_MAX);
+  EXPECT_NE(before, after);
+  EXPECT_EQ(schema, after->schema());
+  EXPECT_EQ(before->commitTime(), after->commitTime());
+  EXPECT_EQ(before->coreGen(), after->coreGen());
+  EXPECT_EQ(before->maxDoc(), after->maxDoc());
+  EXPECT_EQ(before->liveDocs(), after->liveDocs());
+  EXPECT_EQ(before->segments().data(), after->segments().data());
+  EXPECT_EQ(before->auxReaders().data(), after->auxReaders().data());
+  for (size_t i = 0; i < before->segments().size(); i++) {
+    auto& old = before->segments()[i];
+    auto& next = after->segments()[i];
+    EXPECT_EQ(&old.postingsReader(), &next.postingsReader());
+    EXPECT_EQ(old.liveDocs(), next.liveDocs());
+    ASSERT_FALSE(old.auxReaders().empty());
+    EXPECT_EQ(old.auxReaders().data(), next.auxReaders().data());
+  }
+  // Populate lazily through the replacement, then observe the same objects
+  // through the old reader. This checks sharing of the caches themselves.
+  auto catalog = after->projectableFields();
+  EXPECT_EQ(catalog.data(), before->projectableFields().data());
+  auto ordMap = after->getOrdMap("name_s");
+  ASSERT_NE(nullptr, ordMap);
+  EXPECT_EQ(ordMap, before->getOrdMap("name_s"));
+  EXPECT_EQ(publications, cache->readerPublicationsForTest());
+  EXPECT_EQ(after, writer->getIndexReader());
+  std::weak_ptr<IndexReader> retired = before;
+  before.reset();
+  EXPECT_TRUE(retired.expired());  // the replacement must not retain a chain
+}
+
 TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
   CollectionHelper h("main");
   auto iw = h.getIndexWriter();

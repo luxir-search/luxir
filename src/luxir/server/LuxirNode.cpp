@@ -75,10 +75,10 @@ void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
 
 void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
   newSchema->gen_ = schemaGen_.load();
-  auto previous = getSchema();
   if (shard && shard->iw) {
-    shard->iw->publishSchema(*newSchema, previous.get(), [&] { persistSchemaLocked(newSchema); });
+    shard->iw->publishSchema(newSchema, [&] { persistSchemaLocked(newSchema); });
   } else {
+    auto previous = getSchema();
     newSchema->inheritIntroductions(previous.get(), {});
     persistSchemaLocked(newSchema);
   }
@@ -115,8 +115,8 @@ void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
       throw;
     }
 
-    // indexMutex excludes admission from pre-durable validation through this
-    // atomic store. An admission after successful publication sees this schema.
+    // Publish for schema GET handlers. The writer installs its own schema
+    // before reopening admission after this callback returns.
     schema.store(std::move(newSchema));
 
     // Best-effort cleanup of older generations: the new schema is already
@@ -141,6 +141,7 @@ void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
 
 
 bool Collection::loadSchema() {
+  std::lock_guard lock(schemaMutex_);
   if (!shard || !shard->dir) return false;
 
   // Find the latest schema file by lexicographic order (sortable naming).
@@ -170,8 +171,12 @@ bool Collection::loadSchema() {
       uint64_t gen = Postings::parseSortableString(genStr);
 
       newSchema->gen_ = gen;
-      schemaGen_ = gen + 1;  // next setSchema will use gen+1
-      schema.store(std::move(newSchema));
+      auto install = [&] {
+        schemaGen_ = gen + 1;  // next setSchema will use gen+1
+        schema.store(newSchema);
+      };
+      if (shard->iw) shard->iw->publishSchema(newSchema, install);
+      else install();
       return true;
     }
 
@@ -406,16 +411,14 @@ std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name) {
   defaultSchema->gen_ = 0;
   col->schema.store(std::move(defaultSchema));
 
-  // Pass a schemaProvider that fetches the schema from the Collection
-  auto* colPtr = col.get();
+  // The writer must start with the persisted schema, including on reopen.
+  col->loadSchema();
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
-    [colPtr]() { return colPtr->getSchema(); }, &indexRamBudget,
+    col->getSchema(), &indexRamBudget,
     FilterCacheConfig{.maxBytes = config.queryCacheBytes}, config.index.merge_factor);
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
 
-  // Load the latest persisted schema if one exists.
-  col->loadSchema();
   return col;
 }
 

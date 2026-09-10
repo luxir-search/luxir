@@ -206,7 +206,7 @@ public:
 TEST_F(TextMergeFuzzTest, bulkPositionDeltaShapes) {
   auto schema = mixedSchema();
   TestIndex index;
-  index.iw = std::make_unique<IndexWriter>(index.dir, [schema] { return schema; });
+  index.iw = std::make_unique<IndexWriter>(index.dir, schema);
   index.iw->termPartitionMinBytes = 1;
   index.iw->termPartitionMinRangeBytes = 1;
   index.iw->termPartitionMaxRanges = 4;

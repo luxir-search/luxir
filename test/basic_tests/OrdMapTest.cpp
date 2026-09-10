@@ -51,14 +51,14 @@ TEST_F(OrdMapTest, EmptyIndex) {
   
   auto reader = helper->getIndexWriter()->getIndexReader();
 
-  EXPECT_EQ(reader->ordMaps->dataMap.size(), 0);
+  EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
 
   auto ordMap = reader->getOrdMap("field1_s");
 
   // OrdMap should be null for empty index
   EXPECT_EQ(ordMap, nullptr);
   // Make sure the null wasn't cached.
-  EXPECT_EQ(reader->ordMaps->dataMap.size(), 0);
+  EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
 
   // If field doesn't exist, same thing.
   helper->index({{"otherfield_s", "apple"}, {"id", "1"}}, UpdateMessage::COMMIT);
@@ -66,7 +66,7 @@ TEST_F(OrdMapTest, EmptyIndex) {
   ordMap = reader->getOrdMap("field1_s");
   EXPECT_EQ(ordMap, nullptr);
   // Make sure the null wasn't cached.
-  EXPECT_EQ(reader->ordMaps->dataMap.size(), 0);
+  EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
 }
 
 // Single Segment with Simple Terms

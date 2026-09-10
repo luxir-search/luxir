@@ -90,19 +90,17 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 //    - applying deletes to segments doesn't work well with concurrent segment merges.
 //      See see finishCommitBody() for how we handle this.
 
-IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()> schemaProvider,
+IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget,
                          FilterCacheConfig filterCacheConfig,
                          int mergeFactor)
-  : dir(dir),
-    schemaProvider_(std::move(schemaProvider)),
+  : currentSchema(schema ? std::move(schema) : Schema::createDefaultSchema()),
+    schemaIdentity(currentSchema.get()),
+    dir(dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     filterCache(std::make_shared<FilterCache>(filterCacheConfig)),
     originalFilterCacheConfig(filterCacheConfig) {
-  if (!schemaProvider_) {
-    schemaProvider_ = [schema = Schema::createDefaultSchema()] { return schema; };
-  }
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
   nextCommitInfo = std::make_unique<CommitInfo>();
@@ -536,7 +534,47 @@ bool IndexWriter::submitMergeCommit(MergeMessage& msg, bool publishOnly) {
   return true;
 }
 
-// Obtains an inverter for writing documents and sets it's updateVersion.
+std::shared_ptr<IndexReader> IndexWriter::getIndexReader(uint64_t freshness_us) {
+  if (isClosed()) throw IndexWriterClosedError("index writer is closed");
+  // TODO: a reopen blocks every other acquisition for its duration; the
+  // unchanged-reader fast path should not have to wait on it.
+  const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
+  bool reopen = !indexReader ||
+      (lastAdvertisedCommitTime > indexReader->commitTime() &&
+       (freshness_us == 0 || (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+           std::chrono::system_clock::now().time_since_epoch()).count() -
+           indexReader->commitTime() > freshness_us));
+  if (reopen) {
+    // Open outside indexMutex and the schema durability boundary. Capture the
+    // schema afterwards so a publication during the open is included.
+    auto core = std::make_shared<IndexReader::PhysicalCore>(
+        dir, indexReader ? indexReader->core.get() : nullptr);
+    Signal::emit("indexReaderOpened", this);
+    std::shared_ptr<Schema> schema;
+    {
+      std::lock_guard<std::mutex> lock(indexMutex);
+      schema = currentSchema;
+    }
+    indexReader = std::shared_ptr<IndexReader>(
+        new IndexReader(std::move(core), std::move(schema), filterCache));
+    filterCache->onReaderPublished(*indexReader);
+  } else if (schemaIdentity.load(std::memory_order_acquire) != indexReader->schema().get()) {
+    std::shared_ptr<Schema> schema;
+    {
+      std::lock_guard<std::mutex> lock(indexMutex);
+      schema = currentSchema;
+    }
+    // Record the schema actually copied, never the advisory identity. Sharing
+    // the core preserves segment identities and all physical lazy state; no
+    // filter-cache publication is needed for an unchanged physical snapshot.
+    if (schema != indexReader->schema()) {
+      indexReader = std::shared_ptr<IndexReader>(
+          new IndexReader(indexReader->core, std::move(schema), filterCache));
+    }
+  }
+  return indexReader;
+}
+
 Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Schema> pinned) {
   // IDEA: should we prefer grabbing the inverter with the most docs?  Idea would be to
   // have a couple of really large segments that will need less merging?
@@ -547,7 +585,6 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   // Existing messages must finish while publication waits. Direct clients
   // are new admissions and must wait at the gate too.
   if (!fromMessage) awaitSchemaAdmission(lock);
-  auto currentSchema = schemaProvider_();
   if (!pinned) pinned = currentSchema;
   else if (!fromMessage && pinned != currentSchema) {
     throw RequestError("An old schema pin requires an admitted update message");
@@ -699,7 +736,7 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // budget check below only ever flushes idle inverters.
 
   // if this inverter is part of a commit, initiate a flush.
-  if (inverter.commitInfo != nullptr || flush || schemaPublishing || inverter.schema != schemaProvider_()) {
+  if (inverter.commitInfo != nullptr || flush || schemaPublishing || inverter.schema != currentSchema) {
     if (inverter.commitInfo) {
       INDEX_DEBUG("inverter={} message={} triggering flush.", inverter,
                   (void*)inverter.commitInfo->updateMessage);
@@ -1439,7 +1476,10 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::vector<uint64_t> committedSegIds;
   committedSegIds.reserve(segsToKeep.size());
   for (auto* seg : segsToKeep) committedSegIds.push_back(seg->segId);
-  msg.commitInfo->schemaGen = currentSchemaGen();
+  {
+    std::lock_guard<std::mutex> lock(indexMutex);
+    msg.commitInfo->schemaGen = currentSchema->gen_;
+  }
 
   // write the segments file with only the segments that have live documents
   uint64_t commitTime = writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
@@ -1452,7 +1492,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     const std::lock_guard<std::mutex> lock(indexMutex);
     indexGen = msg.commitInfo->indexGen;
     coreGen = msg.commitInfo->coreGen;
-    schemaGen_.store(msg.commitInfo->schemaGen, std::memory_order_relaxed);
+    schemaGen_ = msg.commitInfo->schemaGen;
     oldestCommittedSchemaGen.reset();
     for (auto* seg : segsToKeep) {
       oldestCommittedSchemaGen = oldestCommittedSchemaGen
@@ -1772,11 +1812,12 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
   std::vector<std::string> vectorSelectors = collectVectorSelectors(msg.buildAuxIndexes);
   std::shared_ptr<Schema> schema;
   std::vector<std::string> stagedActiveOverlayNames;
-  if (!vectorSelectors.empty() && schemaProvider_) {
-    schema = schemaProvider_();
-    if (schema) {
-      stagedActiveOverlayNames = collectValidatedExactVectorOverlayNames(msg.buildAuxIndexes, *schema);
+  if (!vectorSelectors.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(indexMutex);
+      schema = currentSchema;
     }
+    stagedActiveOverlayNames = collectValidatedExactVectorOverlayNames(msg.buildAuxIndexes, *schema);
   }
 
   if (segsToKeep.empty()) {
@@ -2358,47 +2399,49 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
-      if (!activeOverlayNames.empty() && schemaProvider_) {
-        phase = "schema_provider";
-        auto schema = schemaProvider_();
-        if (schema) {
-          // The merged segment is private until the swap below.  Building here
-          // avoids reading live source overlays and publishes segment plus
-          // overlay entries atomically at the later commit.
-          phase = "merged_postings_reader";
-          // Test hook: a listener may throw to exercise containment of a
-          // post-merge, pre-swap failure.
-          Signal::emit("mergedPostingsReader", newSegInfo.get());
-          auto pr = getSegmentPostingsReader(*newSegInfo);
-          #ifndef NDEBUG
-          {
-            std::lock_guard<std::mutex> lock(indexMutex);
-            assert(!segInfos.contains(newSegInfo->segId));
-          }
-          #endif
-          std::vector<std::string> stagedOverlayFiles;
-          try {
-            phase = "merge_vector_overlay";
-            auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
-                                                     *schema, VectorIndexBuilder::BuildSite::MERGE,
-                                                     stagedOverlayFiles);
-            for (auto& file : stagedOverlayFiles) {
-              newSegInfo->unsyncedFiles.push_back(file);
-            }
-            for (auto& info : built) {
-              newSegInfo->auxOverlays.push_back(std::move(info));
-            }
-          } catch (const std::exception& e) {
-            deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-            LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
-                      newSegInfo->segId, e.what());
-          } catch (...) {
-            deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-            LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
-                      newSegInfo->segId);
-          }
-          phase = "after_merge_vector_overlay";
+      if (!activeOverlayNames.empty()) {
+        phase = "schema_snapshot";
+        std::shared_ptr<Schema> schema;
+        {
+          std::lock_guard<std::mutex> lock(indexMutex);
+          schema = currentSchema;
         }
+        // The merged segment is private until the swap below.  Building here
+        // avoids reading live source overlays and publishes segment plus
+        // overlay entries atomically at the later commit.
+        phase = "merged_postings_reader";
+        // Test hook: a listener may throw to exercise containment of a
+        // post-merge, pre-swap failure.
+        Signal::emit("mergedPostingsReader", newSegInfo.get());
+        auto pr = getSegmentPostingsReader(*newSegInfo);
+        #ifndef NDEBUG
+        {
+          std::lock_guard<std::mutex> lock(indexMutex);
+          assert(!segInfos.contains(newSegInfo->segId));
+        }
+        #endif
+        std::vector<std::string> stagedOverlayFiles;
+        try {
+          phase = "merge_vector_overlay";
+          auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
+                                                   *schema, VectorIndexBuilder::BuildSite::MERGE,
+                                                   stagedOverlayFiles);
+          for (auto& file : stagedOverlayFiles) {
+            newSegInfo->unsyncedFiles.push_back(file);
+          }
+          for (auto& info : built) {
+            newSegInfo->auxOverlays.push_back(std::move(info));
+          }
+        } catch (const std::exception& e) {
+          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
+                    newSegInfo->segId, e.what());
+        } catch (...) {
+          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
+                    newSegInfo->segId);
+        }
+        phase = "after_merge_vector_overlay";
       }
 
       phase = "publish_swap_prepare";
@@ -2657,6 +2700,9 @@ void IndexWriter::testDeleteAllData() {
       originalFilterCacheConfig);
 
   {
+    // Match reader acquisition's lock order and exclude it for the entire
+    // physical namespace/cache reset.
+    const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
     const std::lock_guard<std::mutex> lock(indexMutex);
     // check if there are any unflushed segments
     // TODO: just dropping the segments may not be safe in the future, it may leave stuff around in the directory
@@ -2671,10 +2717,7 @@ void IndexWriter::testDeleteAllData() {
     }
 
     // dump the current IndexReader
-    {
-      const std::lock_guard<std::mutex> lock(indexReaderMutex);
-      indexReader.reset();
-    }
+    indexReader.reset();
     filterCache = std::move(freshFilterCache);
 
     // drop all idle inverters (unflushed segments)
@@ -2784,7 +2827,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
     out.indexGen = indexGen;
     out.coreGen = coreGen;
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
-    out.schemaGen = schemaGen_.load(std::memory_order_relaxed);
+    out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
     out.segments = segInfos.size();
     out.auxIndexes.reserve(currentAuxIndexes_.size());

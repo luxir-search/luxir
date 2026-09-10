@@ -122,7 +122,7 @@ std::string wideTerm(int32_t ord) {
 
 void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   auto schema = compoundSchema();
-  IndexWriter writer(directory, [schema] { return schema; });
+  IndexWriter writer(directory, schema);
   Inverter& inverter = writer.obtainInverter();
   std::string firstTag = largeTagBytes == 0
       ? std::string("x") : patternedBytes(largeTagBytes);
@@ -237,7 +237,7 @@ void addMergeSource(IndexWriter& writer, int32_t source,
 
 void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
   auto schema = compoundSchema();
-  IndexWriter writer(directory, [schema] { return schema; });
+  IndexWriter writer(directory, schema);
   writer.mergePolicy->setMergeFactor(1000);
   for (int32_t source = 0; source < 3; source++) {
     addMergeSource(writer, source, tagBytes);
@@ -528,7 +528,7 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
     Signal::unlisten("postingsBeforeCollapse");
   });
 
-  IndexWriter writer(directory, [schema] { return schema; }, &budget);
+  IndexWriter writer(directory, schema, &budget);
   writer.mergePolicy->setMergeFactor(1000);
   Inverter& first = writer.obtainInverter();
   first.startDoc();
@@ -564,7 +564,7 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
   TempDirectory temp;
   FSDirectory directory(temp.path());
   auto schema = compoundSchema();
-  IndexWriter writer(directory, [schema] { return schema; });
+  IndexWriter writer(directory, schema);
   writer.mergePolicy->setMergeFactor(1000);
   writer.termPartitionMinBytes = 1;
   writer.termPartitionMinRangeBytes = 1;

@@ -108,7 +108,7 @@ namespace api::SchemaRequest_ { enum class Mode; }
 class Collection {
   std::string name;
   std::string unavailableReason;  // non-empty means resolution rejects the collection
-  std::atomic<std::shared_ptr<Schema>> schema;  // atomic for lock-free reader access
+  std::atomic<std::shared_ptr<Schema>> schema;  // administration/stats; searches use their reader's schema
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
   std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
@@ -119,7 +119,7 @@ public:
     return shard;
   }
 
-  // Returns current schema (lock-free read)
+  // Returns the latest published schema for administration and stats.
   std::shared_ptr<Schema> getSchema() {
     return schema.load();
   }

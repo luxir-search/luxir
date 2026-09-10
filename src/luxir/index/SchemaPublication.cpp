@@ -43,13 +43,14 @@ void IndexWriter::awaitSchemaAdmission(std::unique_lock<std::mutex>& lock) {
   if (closed.load(std::memory_order_relaxed)) throw IndexWriterClosedError("index writer is closed");
 }
 
-void IndexWriter::publishSchema(Schema& candidate, const Schema* previous,
+void IndexWriter::publishSchema(std::shared_ptr<Schema> candidate,
                                 const std::function<void()>& publish) {
   std::unique_lock<std::mutex> lock(indexMutex);
   awaitSchemaAdmission(lock);
-  auto changed = previous ? changedNames(*previous, candidate) : std::set<std::string>{};
+  auto previous = currentSchema;
+  auto changed = changedNames(*previous, *candidate);
   auto validateMaterialized = [&] {
-    auto definitions = candidate.signatures(true);
+    auto definitions = candidate->signatures(true);
     auto materialized = fieldSignatures;
     // These registries are quiescent: flush visits handlers but never adds them.
     // An idle/flushing inverter can contribute only fields it already resolved.
@@ -61,7 +62,7 @@ void IndexWriter::publishSchema(Schema& candidate, const Schema* previous,
       }
     }
     for (const auto& [name, signature] : materialized) {
-      candidate.addRootSignatures(signature.logicalName, definitions);
+      candidate->addRootSignatures(signature.logicalName, definitions);
     }
     for (const auto& [name, signature] : materialized) {
       auto it = definitions.find(name);
@@ -93,10 +94,12 @@ void IndexWriter::publishSchema(Schema& candidate, const Schema* previous,
     // their registered signatures protect that name, so no flush wait is needed.
     materialized = validateMaterialized();
   }
-  candidate.inheritIntroductions(previous, materialized);
+  candidate->inheritIntroductions(previous.get(), materialized);
   // The durable callback still runs under indexMutex, with admission closed
   // when quiescing. The guard also reopens admission on rejection or I/O error.
   publish();
+  currentSchema = std::move(candidate);
+  schemaIdentity.store(currentSchema.get(), std::memory_order_release);
 }
 
 std::string IndexWriter::resolvedSchema() {
@@ -105,7 +108,7 @@ std::string IndexWriter::resolvedSchema() {
   std::optional<uint64_t> oldest;
   {
     std::lock_guard<std::mutex> lock(indexMutex);
-    schema = schemaProvider_();
+    schema = currentSchema;
     materialized = fieldSignatures;
     oldest = oldestCommittedSchemaGen;
   }

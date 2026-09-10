@@ -1107,8 +1107,8 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
-  auto pushDiscovered = [&](std::string_view name) {
-    picked.push_back({name, name, req.schema->getFieldTypePtr(name), true});
+  auto pushDiscovered = [&](const IndexReader::LogicalProjectableField& field) {
+    picked.push_back({field.name, field.name, field.type, true});
   };
   auto pushExplicit = [&](std::string_view f) {
     for (auto& rf : picked) {
@@ -1134,16 +1134,16 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, false});
   };
   if (fields.empty()) {
-    auto catalog = req.reader->logicalProjectableFields(req.schema);
-    picked.reserve(catalog->size());
-    for (std::string_view name : *catalog) pushDiscovered(name);
+    auto catalog = req.reader->logicalProjectableFields();
+    picked.reserve(catalog.size());
+    for (const auto& field : catalog) pushDiscovered(field);
     auto idIt = std::ranges::find(picked, std::string_view("id"), &ReturnField::outputKey);
     if (idIt != picked.end()) std::rotate(picked.begin(), idIt, idIt + 1);
   } else if (std::ranges::none_of(fields, isPattern)) {
     picked.reserve(fields.size());
     for (std::string_view f : fields) pushExplicit(f);
   } else {
-    auto catalog = req.reader->logicalProjectableFields(req.schema);
+    auto catalog = req.reader->logicalProjectableFields();
     boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> taken;
     for (std::string_view f : fields) {
       if (!isPattern(f)) {
@@ -1163,13 +1163,13 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       }
       // The catalog is sorted: gallop to the pattern's literal prefix and
       // stop as soon as the prefix no longer holds.
-      if (catalog->empty()) continue;
       std::string_view prefix = f.substr(0, f.find('*'));
-      const std::string_view* end = catalog->data() + catalog->size();
-      for (const std::string_view* it = screaming::gallopLowerBound(catalog->data(), end, prefix);
-           it != end && it->starts_with(prefix); ++it) {
-        if (globMatch(f, *it) && taken.insert(*it).second) {
-          pushDiscovered(*it);
+      int64_t start = screaming::gallopLowerBound(0, (int64_t)catalog.size(), prefix,
+          [&](int64_t i) { return catalog[i].name; });
+      for (size_t i = (size_t)start; i < catalog.size() && catalog[i].name.starts_with(prefix); ++i) {
+        const auto& field = catalog[i];
+        if (globMatch(f, field.name) && taken.insert(field.name).second) {
+          pushDiscovered(field);
         }
       }
     }

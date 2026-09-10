@@ -91,9 +91,8 @@ public:
   // Query::Context (tests, non-request embedders) creates and owns its own
   // registry, while request-backed Contexts all reference this one.
   std::shared_ptr<FilterCache::UseRegistry> filterUses;
-  // Pins the collection schema snapshot for the request.  Schema instances are
-  // immutable after publication, so query objects may keep FieldType references
-  // derived from this schema for the request lifetime.
+  // The reader's schema (IndexReader::schema()): immutable, so query objects
+  // may keep FieldType references derived from it for the request lifetime.
   std::shared_ptr<Schema> schema;
   // One clock snapshot for every query tree/op in this request. Parsers are
   // short-lived and numerous, so NOW belongs here rather than in a parser.

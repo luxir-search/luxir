@@ -230,7 +230,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    IndexWriter iw(dir, [&]() { return schema; }, &budget);
+    IndexWriter iw(dir, schema, &budget);
     iw.pressureFlushFloorBytes = 1;  // every inverter is a valid victim
 
     // Three concurrently-busy inverters so obtainInverter cannot reuse an
@@ -304,7 +304,7 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    IndexWriter iw(dir, [&]() { return schema; }, &budget);
+    IndexWriter iw(dir, schema, &budget);
     iw.pressureFlushFloorBytes = 1;
     auto& inverter = iw.obtainInverter();
     for (int i = 0; i < 30; i++) {
@@ -348,7 +348,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   }
 
   IndexRamBudget budget;
-  IndexWriter iw(dir, [&]() { return schema; }, &budget);
+  IndexWriter iw(dir, schema, &budget);
   iw.mergePolicy->setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
   iw.pressureFlushFloorBytes = 1;

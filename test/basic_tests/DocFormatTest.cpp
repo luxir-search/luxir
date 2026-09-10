@@ -6,6 +6,8 @@
 #include <array>
 #include <string>
 
+#include "luxir/util/Signal.h"
+
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -557,8 +559,8 @@ TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachExactAndSourceForms) {
 TEST_F(FieldVariantsProjectionTest, logicalCatalogUsesSchemaIdentityAndPrimaryPresence) {
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto schema = helper.collection().getSchema();
-  auto catalog = reader->logicalProjectableFields(schema);
-  EXPECT_EQ(catalog, reader->logicalProjectableFields(schema));
+  auto catalog = reader->logicalProjectableFields();
+  EXPECT_EQ(catalog.data(), reader->logicalProjectableFields().data());
 
   SchemaBuilder b;
   auto& hidden = b.field("author_hidden");
@@ -569,14 +571,21 @@ TEST_F(FieldVariantsProjectionTest, logicalCatalogUsesSchemaIdentityAndPrimaryPr
   author.stored = false;
   auto other = b.build(schema.get());
   other->gen_ = schema->gen_;  // identity must distinguish equal generations
-  auto changed = reader->logicalProjectableFields(other);
-  EXPECT_NE(catalog, changed);
-  EXPECT_EQ(changed, reader->logicalProjectableFields(other));
-  EXPECT_EQ(changed->end(), std::ranges::find(*changed, std::string_view("author")));
+  helper.getIndexWriter()->publishSchema(other, [] {});
+  auto replacement = helper.getIndexWriter()->getIndexReader(UINT64_MAX);
+  EXPECT_EQ(schema, reader->schema());
+  EXPECT_EQ(other, replacement->schema());
+  auto changed = replacement->logicalProjectableFields();
+  EXPECT_NE(catalog.data(), changed.data());
+  EXPECT_EQ(changed.data(), replacement->logicalProjectableFields().data());
+  EXPECT_EQ(changed.end(), std::ranges::find(changed, std::string_view("author"),
+                                          &IndexReader::LogicalProjectableField::name));
   // author_hidden has only a sibling column in the physical catalog. Merely
   // enabling source storage in another schema cannot discover absent source.
-  EXPECT_EQ(changed->end(), std::ranges::find(*changed, std::string_view("author_hidden")));
-  EXPECT_NE(catalog->end(), std::ranges::find(*catalog, std::string_view("author")));
+  EXPECT_EQ(changed.end(), std::ranges::find(changed, std::string_view("author_hidden"),
+                                          &IndexReader::LogicalProjectableField::name));
+  EXPECT_NE(catalog.end(), std::ranges::find(catalog, std::string_view("author"),
+                                          &IndexReader::LogicalProjectableField::name));
 }
 
 TEST_F(DocFormatTest, storedPlainAndNormalizedStringsReturnSourceValues) {
@@ -644,7 +653,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   ASSERT_TRUE(ch.index(flatdoc("id", "a", "text", "Source", "string", "Value"),
                        UpdateMessage::COMMIT).success);
   auto reader = ch.getIndexWriter()->getIndexReader();
-  auto original = reader->logicalProjectableFields(ch.collection().getSchema());
+  auto original = reader->logicalProjectableFields();
 
   // Both names occur in the old store. Only STRING has a usable fallback
   // when a different schema selects a resource this reader does not have.
@@ -652,14 +661,115 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   string.stored_resource = "_stored_cold_";
   auto schema = b.build(ch.collection().getSchema().get());
   ch.collection().setSchema(schema);
-  auto current = reader->logicalProjectableFields(schema);
-  EXPECT_NE(original, current);
-  EXPECT_EQ((std::vector<std::string_view>{"id", "string"}), *current);
+  auto replacement = ch.getIndexWriter()->getIndexReader();
+  auto current = replacement->logicalProjectableFields();
+  EXPECT_NE(original.data(), current.data());
+  ASSERT_EQ(2u, current.size());
+  EXPECT_EQ("id", current[0].name);
+  EXPECT_EQ("string", current[1].name);
   auto req = localReq(ch.getSearchEngine());
   req->collection("main").topDocs("q").allQuery().fields({"*", "string__self"});
   req->execute();
   ASSERT_OK(req);
   EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "string", "Value", "string__self", "Value"));
+}
+
+TEST_F(DocFormatTest, schemaChangeUpdatesSearchAndProjectionWithoutCommit) {
+  CollectionHelper ch;
+  SchemaBuilder b;
+  auto& title = b.field("title");
+  title.type = api::FieldDef::FieldClass::TEXT;
+  b.set(ch.collection());
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "title", "Source", "year_i", 2026),
+                       UpdateMessage::COMMIT).success);
+  auto project = [&](std::initializer_list<std::string> fields, uint64_t freshness = 0) {
+    auto req = localReq(ch.getSearchEngine());
+    req->rawRequest().freshness_ms = freshness;
+    req->collection("main").topDocs("q").allQuery().fields(fields).limit(-1);
+    req->execute(false);
+    return req;
+  };
+  auto before = project({});
+  ASSERT_OK(before);
+  auto reader = before->reader;
+  auto oldSchema = reader->schema();
+
+  auto& added = b.field("added");
+  added.type = api::FieldDef::FieldClass::STRING;
+  b.variant(added, "words").type = api::FieldDef::FieldClass::TEXT;
+  title.stored = false;
+  auto schema = b.set(ch.collection());
+  EXPECT_EQ(oldSchema, reader->schema());
+  EXPECT_EQ(nullptr, oldSchema->getFieldTypePtr("added"));
+
+  auto resolved = project({"added"}, UINT64_MAX);
+  ASSERT_OK(resolved);
+  EXPECT_EQ(schema, resolved->schema);
+  EXPECT_EQ(resolved->reader->schema(), resolved->schema);
+  EXPECT_NE(nullptr, resolved->schema->getFieldTypePtr("added__words"));
+  EXPECT_EQ(reader->commitTime(), resolved->reader->commitTime());
+
+  auto checkProjection = [&] {
+    for (auto fields : {std::initializer_list<std::string>{}, {"*"}, {"id", "year*"}}) {
+      auto req = project(fields, UINT64_MAX);
+      ASSERT_OK(req);
+      EXPECT_EQ(schema, req->schema);
+      for (const auto& doc : req->getDocs()) EXPECT_EQ(nullptr, find(doc, "title"));
+      EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "year_i", (int64_t)2026));
+    }
+  };
+  checkProjection();
+  EXPECT_EQ(oldSchema, before->schema);
+  EXPECT_CONTAINS_DOC(before->getDocs(), flatdoc("id", "a", "title", "Source", "year_i", (int64_t)2026));
+  EXPECT_NE(reader->logicalProjectableFields().end(), std::ranges::find(
+      reader->logicalProjectableFields(), std::string_view("title"),
+      &IndexReader::LogicalProjectableField::name));
+
+  ASSERT_TRUE(ch.index(flatdoc("id", "b", "added", "New Value"), UpdateMessage::COMMIT).success);
+  auto fresh = project({"added"});
+  ASSERT_OK(fresh);
+  EXPECT_GT(fresh->reader->commitTime(), reader->commitTime());
+  EXPECT_CONTAINS_DOC(fresh->getDocs(), flatdoc("added", "New Value"));
+  checkProjection();
+}
+
+TEST_F(DocFormatTest, readerCapturesSchemaAfterPhysicalOpen) {
+  CollectionHelper ch;
+  indexBooks(ch);
+  auto writer = ch.getIndexWriter();
+  auto before = writer->getIndexReader();
+  ASSERT_TRUE(ch.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  std::shared_ptr<Schema> published;
+  Signal::listen("indexReaderOpened", [&](void* source, void*, void*) -> void* {
+    if (source == writer.get()) {
+      SchemaBuilder b;
+      b.field("added").type = api::FieldDef::FieldClass::STRING;
+      published = b.set(ch.collection());
+    }
+    return nullptr;
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpened"); });
+  auto after = writer->getIndexReader();
+  ASSERT_NE(nullptr, published);
+  EXPECT_EQ(published, after->schema());
+  EXPECT_NE(published, before->schema());
+  EXPECT_GT(after->commitTime(), before->commitTime());
+  EXPECT_EQ(after, writer->getIndexReader());
+}
+
+TEST_F(DocFormatTest, failedSchemaPublicationKeepsReaderAndIngestSchema) {
+  CollectionHelper ch;
+  auto writer = ch.getIndexWriter();
+  auto reader = writer->getIndexReader();
+  SchemaBuilder b;
+  b.field("added").type = api::FieldDef::FieldClass::STRING;
+  auto candidate = b.build(reader->schema().get());
+  EXPECT_THROW(writer->publishSchema(candidate, [] { throw std::runtime_error("publish failed"); }),
+               std::runtime_error);
+  EXPECT_EQ(reader, writer->getIndexReader());
+  auto& inverter = writer->obtainInverter();
+  EXPECT_EQ(reader->schema(), inverter.schema);
+  writer->releaseInverter(inverter);
 }
 
 TEST_F(DocFormatTest, emptyStringAndVectorSelectorsKeepColumnsEmpty) {

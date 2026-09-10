@@ -20,6 +20,7 @@
 // #define IREADER_DEBUG LOG_DEBUG
 
 namespace luxir {
+class FieldType;
 class FilterCache;
 class OrdMap;
 class Schema;
@@ -144,25 +145,69 @@ public:
 /// IndexReader is thread safe
 class IndexReader {
 public:
-  // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
-
   using Segment = ::luxir::Segment;
+
+  struct ProjectableField {
+    std::string_view name;
+    bool column = false;
+    std::vector<std::string_view> storedResources;
+  };
+
+  struct LogicalProjectableField {
+    std::string_view name;
+    FieldType* type;
+  };
+
+private:
+  friend class IndexWriter;
+
+  // A physical snapshot is shared directly by readers with different schemas.
+  // Its lazy catalogs and maps never retain a reader or schema.
+  struct PhysicalCore {
+    std::vector<Segment> segs;
+    std::once_flag projectableOnce;
+    std::vector<ProjectableField> projectable;
+    std::vector<std::shared_ptr<AuxReader>> auxReadersList;
+    std::shared_ptr<SharedLazyMap<std::string, OrdMap>> ordMaps;
+    uint64_t coreGeneration = 0;
+    int64_t totalMaxDoc = 0;
+    int64_t livedocs = 0;
+    uint64_t commitTimeUs = 0;
+
+    PhysicalCore(Directory& dir, const PhysicalCore* previous);
+    std::span<const ProjectableField> projectableFields();
+  };
+
+  const std::shared_ptr<PhysicalCore> core;
+  const std::shared_ptr<Schema> sharedSchema;
+  const std::shared_ptr<FilterCache> sharedFilterCache;
+  std::once_flag logicalProjectableOnce;
+  std::vector<LogicalProjectableField> logicalFields;
+
+  IndexReader(std::shared_ptr<PhysicalCore> core, std::shared_ptr<Schema> schema,
+              std::shared_ptr<FilterCache> filterCache);
+
+public:
+  const std::shared_ptr<Schema>& schema() const noexcept {
+    assert(sharedSchema);
+    return sharedSchema;
+  }
 
   // The time in microseconds when this version of the index was committed.  Guaranteed to be strictly increasing
   // with new versions of the index.
   uint64_t commitTime() const noexcept {
-    return commitTimeUs;
+    return core->commitTimeUs;
   }
 
   std::span<Segment> segments() noexcept {
-    return segs;
+    return core->segs;
   }
 
   // Aux readers for entries in the parsed IndexInfo.aux_indexes (in the same
   // order).  Unknown-kind entries are omitted, so this list may be shorter
   // than IndexInfo.aux_indexes.
   std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
-    return auxReadersList;
+    return core->auxReadersList;
   }
 
   // Returns the INDEX-LEVEL aux reader with the given name, or nullptr.
@@ -174,46 +219,40 @@ public:
   // per shard); revisit if we add many cheap aux kinds (autocomplete,
   // spell-check) so the per-query lookup count grows.
   std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
-    for (const auto& r : auxReadersList) {
+    for (const auto& r : core->auxReadersList) {
       if (r->getName() == name) return r;
     }
     return nullptr;
   }
 
   int64_t maxDoc() const noexcept {
-    return totalMaxDoc;
+    return core->totalMaxDoc;
   }
 
   int64_t liveDocs() const noexcept {
-    return livedocs;
+    return core->livedocs;
   }
   
   // Get the core generation for this index reader
   // This can be used as a cache key for structures that depend on segments but don't care about deletes.
   uint64_t coreGen() const noexcept {
-    return coreGeneration;
+    return core->coreGeneration;
   }
 
   std::shared_ptr<OrdMap> getOrdMap(std::string_view field) {
-    return ordMaps->getOrCreate(std::string(field), [this, field]() {
+    return core->ordMaps->getOrCreate(std::string(field), [this, field]() {
       return OrdMap::build(field, *this);
     });
   }
   
   // Get the number of cached OrdMaps (for testing)
   size_t getOrdMapCacheSize() const {
-    return ordMaps->dataMap.size();
+    return core->ordMaps->dataMap.size();
   }
 
   FilterCache* filterCache() const noexcept {
     return sharedFilterCache.get();
   }
-
-  struct ProjectableField {
-    std::string_view name;
-    bool column = false;
-    std::vector<std::string_view> storedResources;
-  };
 
   // Fields some segment of this reader can project into a
   // DocList: column-backed fields (COLUMN_STORED, any non-BIN type) and the
@@ -226,36 +265,20 @@ public:
   // change under a reader).  The views point into segment metadata that this
   // reader's PostingsReaders keep mapped, so they are valid for as long as the
   // caller holds the reader.
-  std::span<const ProjectableField> projectableFields();
+  std::span<const ProjectableField> projectableFields() {
+    return core->projectableFields();
+  }
 
   // Logical roots whose primary retrieval source is represented in the
-  // physical catalog, excluding vectors, geo and engine names. Sorted for
-  // wildcard prefix traversal. Cache the most recently used schema identity;
-  // callers retain the result across concurrent schema changes. Name views
-  // still point into this reader's segment metadata.
-  std::shared_ptr<const std::vector<std::string_view>> logicalProjectableFields(
-      const std::shared_ptr<Schema>& schema);
+  // physical catalog, excluding vectors, geo and engine names. Built once
+  // for this reader's schema and sorted for wildcard prefix traversal.
+  // Names and types remain valid while the caller holds the reader.
+  std::span<const LogicalProjectableField> logicalProjectableFields();
 
+  // Direct tools/tests may omit the schema if they only use physical state.
   IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
-              std::shared_ptr<FilterCache> filterCache = nullptr);
-
-private:
-  std::vector<Segment> segs;
-  std::once_flag projectableOnce;
-  std::vector<ProjectableField> projectable;
-  std::mutex logicalProjectableMutex;
-  std::shared_ptr<Schema> projectableSchema;
-  std::shared_ptr<const std::vector<std::string_view>> logicalProjectable;
-  std::vector<std::shared_ptr<AuxReader>> auxReadersList;
-  std::shared_ptr<FilterCache> sharedFilterCache;
-  uint64_t coreGeneration = 0;
-  int64_t totalMaxDoc = 0;
-  int64_t livedocs = 0;
-  uint64_t commitTimeUs = 0;
-  
-public:
-  // Made public for testing purposes only
-  std::shared_ptr<SharedLazyMap<std::string, OrdMap>> ordMaps; // field -> OrdMap
+              std::shared_ptr<FilterCache> filterCache = nullptr,
+              std::shared_ptr<Schema> schema = nullptr);
 };
 
 }

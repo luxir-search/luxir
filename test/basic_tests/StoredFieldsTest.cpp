@@ -90,7 +90,7 @@ TEST_F(StoredFieldsTest, basicSingleValued) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
 
     inv.startDoc();
@@ -143,7 +143,7 @@ TEST_F(StoredFieldsTest, multiValued) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
 
     std::vector<std::string_view> tags1 = {"red", "blue", "green"};
@@ -188,7 +188,7 @@ TEST_F(StoredFieldsTest, manyDocsMultipleChunks) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
     for (int32_t i = 0; i < N; i++) {
       inv.startDoc();
@@ -229,7 +229,7 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
   std::string big = bigStoredValue();
 
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
 
     inv.startDoc();
@@ -262,7 +262,7 @@ TEST_F(StoredFieldsTest, segmentMerge) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     // Segment 1
     {
       auto& inv = iw.obtainInverter();
@@ -318,7 +318,7 @@ TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
   std::atomic<int64_t> maxReserved{0};
 
   {
-    IndexWriter iw(dir, [&]() { return schema; }, &budget);
+    IndexWriter iw(dir, schema, &budget);
 
     {
       auto& inv = iw.obtainInverter();
@@ -375,14 +375,10 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
   // Build segment with stored fields using schemaWithStored, and segment
   // without stored fields using schemaPlain, by swapping schemas between
   // flushes.
-  auto activeSchema = schemaWithStored;
-  auto schemaProvider = [&activeSchema]() { return activeSchema; };
-
   {
-    IndexWriter iw(dir, schemaProvider);
+    IndexWriter iw(dir, schemaWithStored);
 
     // Segment 1: stored on
-    activeSchema = schemaWithStored;
     {
       auto& inv = iw.obtainInverter();
       inv.startDoc();
@@ -393,7 +389,7 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
     }
 
     // Segment 2: stored off
-    activeSchema = schemaPlain;
+    iw.publishSchema(schemaPlain, [] {});
     {
       auto& inv = iw.obtainInverter();
       inv.startDoc();
@@ -406,7 +402,7 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
       iw.commit();
     }
 
-    activeSchema = schemaWithStored;
+    iw.publishSchema(schemaWithStored, [] {});
     iw.mergeSegments();
   }
 
@@ -429,7 +425,7 @@ TEST_F(StoredFieldsTest, mergePreservesMultiValuedGrouping) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     {
       auto& inv = iw.obtainInverter();
       std::vector<std::string_view> tagsA = {"x", "y", "z"};
@@ -477,7 +473,7 @@ TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     {
       auto& inv = iw.obtainInverter();
       inv.startDoc();
@@ -549,7 +545,7 @@ TEST_F(StoredFieldsTest, columnFamilies) {
   schema->fieldTypeMap["paragraphs"] = paraFt;
 
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
 
     inv.startDoc();
@@ -609,7 +605,7 @@ TEST_F(StoredFieldsTest, manyFieldsVarintBoundary) {
   }
 
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
     inv.startDoc();
     for (int i = 0; i < N_FIELDS; i++) {
@@ -648,7 +644,7 @@ TEST_F(StoredFieldsTest, emptySegment) {
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
 
   {
-    IndexWriter iw(dir, [&]() { return schema; });
+    IndexWriter iw(dir, schema);
     auto& inv = iw.obtainInverter();
     inv.startDoc();
     inv.getIndexHandler("body").index(inv, std::string_view("not stored"));

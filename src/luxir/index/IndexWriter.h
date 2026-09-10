@@ -113,6 +113,10 @@ class IndexWriter {
   std::atomic<bool> closed = false;
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
+  // Installed under indexMutex after durable schema publication succeeds.
+  std::shared_ptr<Schema> currentSchema;
+  // Release-stored after currentSchema; search compares without taking indexMutex.
+  std::atomic<const Schema*> schemaIdentity;
   // Protected by indexMutex, shared with schema publication and admission.
   FieldSignatures fieldSignatures;
   std::map<uint64_t, std::shared_ptr<Schema>> admittedSchemas;
@@ -320,7 +324,6 @@ public:
   };  // end MergePolicy
 
   Directory& dir;
-  std::function<std::shared_ptr<Schema>()> schemaProvider_;
   std::unique_ptr<IndexRamBudget> privateIndexRamBudget;
   IndexRamBudget* indexRamBudget;
 
@@ -394,9 +397,8 @@ public:
   std::vector<uint64_t> lastCommittedSegIds;
 
   // Schema generation read from IndexInfo on startup and advanced only after
-  // a new commit is durable. Relaxed atomic because segment stamping can read
-  // it as a fallback outside indexMutex when no schema provider is installed.
-  std::atomic<uint64_t> schemaGen_ = 0;
+  // a new commit is durable. Protected by indexMutex.
+  uint64_t schemaGen_ = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // the IndexInfo file.  Read from s.olux at open, mutated only by the commit
@@ -493,20 +495,9 @@ public:
   std::unique_ptr<MergeMessageMultiFunc> mergeSegmentsNode;
 
 
-  // Returns the current schema generation from the provider, or the last known value.
-  uint64_t currentSchemaGen() {
-    if (schemaProvider_) {
-      auto schema = schemaProvider_();
-      if (schema) {
-        return schema->gen_;
-      }
-    }
-    return schemaGen_.load(std::memory_order_relaxed);
-  }
-
   // indexRamBudget is the (usually node-wide) pool that parallel merge tasks
   // reserve against; pass null for a private unlimited budget (tests, embedded).
-  explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {},
+  explicit IndexWriter(Directory &dir, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        FilterCacheConfig filterCacheConfig = {},
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR);
@@ -571,38 +562,8 @@ public:
     return closed.load(std::memory_order_relaxed);
   }
 
-    // return a copy of the shared_ptr so that the instance it points to will never change while in use.
-  std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0) {
-    if (isClosed()) throw IndexWriterClosedError("index writer is closed");
-    const std::lock_guard<std::mutex> lock(indexReaderMutex);
-    bool needNewReader = false;
-    if (!indexReader) {
-      needNewReader = true;
-    } else {
-      // is there a new commit?
-      if (lastAdvertisedCommitTime > indexReader->commitTime()) {
-        // check if we want this new commit based on freshness requirement
-        if (freshness_us == 0 || std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count() - indexReader->commitTime() > freshness_us) {
-          needNewReader = true;
-        }
-      }
-    }
-
-    // TODO: FIXME: this blocks other threads from getting the current reader.
-    // C++20 has waiting on atomic variables, that might be an easy way to prevent this.
-    // Tricky part will be handing different requests with different freshness requirements.  Multiple readers
-    // with different timestamps could be opening at once.  It's also the wrong tool if opening an IndexReader
-    // can take too long since blocking a thread won't allow other threads to perform other work.
-    // We should see if there is a TBB friendly way to do this.
-    if (needNewReader) {
-      auto oldReader = indexReader;  // Keep reference to old reader for potential ordMaps sharing
-      indexReader = std::make_shared<IndexReader>(dir, oldReader.get(), filterCache);
-      filterCache->onReaderPublished(*indexReader);
-    }
-
-    return indexReader;
-  }
+  // Pins a physical snapshot and its schema for the caller's lifetime.
+  std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0);
 
   std::shared_ptr<FilterCache> getFilterCache() const {
     return filterCache;
@@ -615,8 +576,8 @@ public:
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
 
   // Validation and the durable schema publication callback run under the same
-  // mutex as admission. The callback must install the schema before returning.
-  void publishSchema(Schema& candidate, const Schema* previous, const std::function<void()>& publish);
+  // mutex as admission. Install the writer's schema only after publish succeeds.
+  void publishSchema(std::shared_ptr<Schema> candidate, const std::function<void()>& publish);
   std::string resolvedSchema();
 
   // Releases an inverter back to the pool.
@@ -666,7 +627,7 @@ private:
     {
       std::unique_lock<std::mutex> lock(indexMutex);
       awaitSchemaAdmission(lock);
-      msg.schema = schemaProvider_();
+      msg.schema = currentSchema;
       // Allocate before consuming a sequencer number. This is the admission
       // linearization point, ordered with Collection's durable publication.
       admittedSchemas.emplace(updateNumber.load(std::memory_order_relaxed) + 1, msg.schema);
