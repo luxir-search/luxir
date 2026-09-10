@@ -377,7 +377,7 @@ public:
 
   void init() override {
     FacetReq::init();
-    auto sorts = fieldFacet.sorts;
+    auto sorts = fieldFacet.sort;
     if (!sorts.empty()) {
       if (sorts.size() > 1) {
         throw std::runtime_error("facet '" + std::string(facetName)
@@ -1520,8 +1520,8 @@ public:
       // Count and bucket-value sorts are future work; sub-op sort is supported.
       SearchOp::InlineCalculator* sortCalc = nullptr;
       bool reversed = false;
-      if (!thisOp().fieldFacet.sorts.empty()) {
-        std::string_view field = thisOp().fieldFacet.sorts[0].expr;
+      if (!thisOp().fieldFacet.sort.empty()) {
+        std::string_view field = thisOp().fieldFacet.sort[0].expr;
         for (auto* candidate : mergedData->inlineCalcs) {
           if (candidate->getOp().name == field) {
             sortCalc = candidate;
@@ -1530,7 +1530,7 @@ public:
         }
         assert(sortCalc != nullptr);
         reversed =
-            thisOp().fieldFacet.sorts[0].dir == luxir::api::SortSpec_::SortDir::DESC;
+            thisOp().fieldFacet.sort[0].dir == luxir::api::SortSpec_::SortDir::DESC;
       }
 
       auto better = [sortCalc, reversed](const auto& a, const auto& b) {
@@ -2156,7 +2156,7 @@ public:
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
     if (context.stringColumn == nullptr || ordMap == nullptr
-        || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sorts.empty()) {
+        || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
       return nullptr;
     }
     for (const auto& bucket : context.stringColumn->buckets) {

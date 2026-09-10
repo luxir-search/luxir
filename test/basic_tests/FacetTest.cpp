@@ -3843,11 +3843,11 @@ protected:
         }
       }
       int sortAvgIdx = -1;  // index into avgOps of the sort key, or -1
-      if (!facetOp.sorts.empty()) {
+      if (!facetOp.sort.empty()) {
         for (size_t k = 0; k < avgOps.size(); k++)
-          if (avgOps[k].name == facetOp.sorts[0].expr) { sortAvgIdx = (int)k; break; }
+          if (avgOps[k].name == facetOp.sort[0].expr) { sortAvgIdx = (int)k; break; }
       }
-      bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts[0].dir == luxir::api::SortSpec_::SortDir::DESC;
+      bool avgDesc = sortAvgIdx >= 0 && facetOp.sort[0].dir == luxir::api::SortSpec_::SortDir::DESC;
 
       // Count values for documents matching the domain query
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
@@ -4756,7 +4756,7 @@ TEST_F(FacetTest, selectedPinsUseInlineSubOpFinalization) {
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"json({"limit":0,"ops":{"brands":{"field_facet":{
     "field":"brand_s","limit":1,"selected":["absent","acme"],
-    "sorts":[{"expr":"avg_price","dir":"desc"}],
+    "sort":[{"expr":"avg_price","dir":"desc"}],
     "ops":{"avg_price":"avg(price_i)"}}}}})json",
     req->rawRequest(), req->mr);
   req->collection("main");

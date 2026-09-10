@@ -51,7 +51,9 @@
 //   other sugars, writes use the bare string whenever params is empty, so the
 //   common parameterless chain echoes exactly as written; only a component with
 //   params writes the object form.
-// - SortSpec reads `field` as an alias for `expr`, for the common bare-column sort.
+// - SortSpec reads a bare STRING as a clause, "expr", "expr asc", or "expr desc"
+//   (the HTTP sort parameter grammar), and `field` as an alias for `expr`. A
+//   top-docs `sort` takes one clause or a list of them.
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
 // - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
 //   repeated QueryBucket form preserves that object's document order for gRPC parity.
@@ -60,6 +62,8 @@
 
 #include <cstring>
 #include <unordered_set>
+
+#include "luxir/api/sort_clause.h"
 
 // NOTE: relies on luxir_types_json.hpp having defined the luxir::api types and included
 // <hpp_proto/json.hpp>; kept as a separate file only so JSON-dialect code has one home.
@@ -455,25 +459,48 @@ struct from<JSON, luxir::api::SearchOp> {
   }
 };
 
-// ----- SortSpec: `field` is a bare-column alias for `expr` -----
+// ----- SortSpec: a bare string is one clause ("expr", "expr asc", "expr desc");
+// in the object form `field` is a bare-column alias for `expr` -----
 template <>
 struct from<JSON, luxir::api::SortSpec> {
   template <auto Opts>
   static void op(luxir::api::SortSpec &value,
                  hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
-    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.expr, ctx, it, end);
+      if (bool(ctx.error)) return;
+      std::string_view expr;
+      std::optional<std::string_view> dir;
+      if (!luxir::api::splitSortClause(value.expr, expr, dir)) {
+        ctx.error = error_code::syntax_error;
+        return;
+      }
+      value.expr = expr;
+      if (dir) {
+        value.dir = *dir == "asc" ? luxir::api::SortSpec::SortDir::ASC
+                                  : luxir::api::SortSpec::SortDir::DESC;
+      }
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
     std::string_view key;
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
-    util::scan_object_fields<Opts, true>(
+    util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "expr" || key == "field") {
-            util::from_json<O>(value.expr, ctx, vit, vend);
+            util::from_json<V>(value.expr, ctx, vit, vend);
           } else if (key == "vars") {
             decltype(auto) vars = ::hpp_proto::detail::as_modifiable(ctx, value.vars);
-            glz::util::parse_repeated<O>(true, vars, ctx, vit, vend);
+            glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
           } else if (key == "dir") {
-            util::from_json<O>(value.dir, ctx, vit, vend);
+            util::from_json<V>(value.dir, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -483,6 +510,24 @@ struct from<JSON, luxir::api::SortSpec> {
         [](auto &, auto &) {});
   }
 };
+
+// ----- sort lists: one clause (string or object) or a list of them -----
+template <auto Opts>
+void readSortList(auto &sort, auto &ctx, auto &it, auto &end) {
+  if constexpr (!check_ws_handled(Opts)) {
+    if (skip_ws<Opts>(ctx, it, end)) {
+      return;
+    }
+  }
+  static constexpr auto O = ws_handled<Opts>();
+  if ((char)*it == '[') {
+    glz::util::parse_repeated<O>(false, sort, ctx, it, end);
+    return;
+  }
+  const std::size_t n = sort.size();
+  sort.resize(n + 1);
+  util::from_json<O>(sort[n], ctx, it, end);
+}
 
 template <>
 struct from<JSON, luxir::api::FieldVariants> {
@@ -939,9 +984,9 @@ struct from<JSON, luxir::api::TopDocs> {
           } else if (key == "fields") {
             decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
             glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
-          } else if (key == "sorts") {
-            decltype(auto) sorts = ::hpp_proto::detail::as_modifiable(ctx, value.sorts);
-            glz::util::parse_repeated<O>(false, sorts, ctx, vit, vend);
+          } else if (key == "sort") {
+            decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, value.sort);
+            readSortList<O>(sort, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
@@ -1213,11 +1258,11 @@ struct from<JSON, luxir::api::SearchRequest> {
             if (reusedShorthand) topDocs.fields = {};
             decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, topDocs.fields);
             glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
-          } else if (key == "sorts") {
+          } else if (key == "sort") {
             auto &topDocs = shorthand();
-            if (reusedShorthand) topDocs.sorts = {};
-            decltype(auto) sorts = ::hpp_proto::detail::as_modifiable(ctx, topDocs.sorts);
-            glz::util::parse_repeated<O>(false, sorts, ctx, vit, vend);
+            if (reusedShorthand) topDocs.sort = {};
+            decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, topDocs.sort);
+            readSortList<O>(sort, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
           } else if (key == "document_format") {

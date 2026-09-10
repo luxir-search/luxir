@@ -2204,7 +2204,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
         req->mr, "embedding_v", {0.0f, 0.0f}, 6, 0,
         /*exact=*/true));
     source.query = query;
-    auto* sorts = build::allocArray(source.sorts, 1, req->mr);
+    auto* sorts = build::allocArray(source.sort, 1, req->mr);
     sorts[0].expr = build::arenaStr(req->mr, "rank_i");
     sorts[0].dir = api::SortSpec_::SortDir::ASC;
 

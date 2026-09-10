@@ -3367,7 +3367,7 @@ TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
         sizeof(api::Query), alignof(api::Query));
     new (storedQuery) api::Query(query);
     source.query = storedQuery;
-    api::SortSpec* sorts = build::allocArray(source.sorts, 1, mr);
+    api::SortSpec* sorts = build::allocArray(source.sort, 1, mr);
     sorts[0].expr = build::arenaStr(mr, "sort_i");
     sorts[0].dir = api::SortSpec::SortDir::ASC;
 

@@ -62,7 +62,7 @@ protected:
   static void sortBy(OpCursor& cursor, std::string_view expr,
                      api::SortSpec::SortDir dir) {
     auto& topDocs = std::get<api::TopDocs>(cursor.rawOp().kind);
-    auto* sorts = api::build::allocArray(topDocs.sorts, 1, cursor.mr());
+    auto* sorts = api::build::allocArray(topDocs.sort, 1, cursor.mr());
     sorts[0].expr = api::build::arenaStr(cursor.mr(), expr);
     sorts[0].dir = dir;
   }
@@ -310,7 +310,7 @@ TEST_F(FacetTopDocsTest, queryFacetBucketTopDocs) {
     "query_facet":{
       "buckets":{"cheap":"price_i:[* TO 5]","dear":"price_i:[6 TO *]"},
       "ops":{"hits":{"top_docs":{"limit":2,"get_number":true,"fields":["id"],
-        "sorts":[{"field":"price_i","dir":"asc"}]}}}}}}})json",
+        "sort":[{"field":"price_i","dir":"asc"}]}}}}}}})json",
       req->rawRequest(), req->mr);
   req->collection("main");
   req->execute();
@@ -542,10 +542,10 @@ TEST_F(FacetTopDocsTest, offsetBucketChildren) {
   auto req = localReq(helper.getSearchEngine());
   parseQueryRequest(R"json({"ops":{"cats":{"field_facet":{
     "field":"cat_s","limit":-1,"ops":{
-      "hits":{"top_docs":{"sorts":[{"expr":"n_i","dir":"asc"}],
+      "hits":{"top_docs":{"sort":[{"expr":"n_i","dir":"asc"}],
         "offset":3,"limit":5,"batch_size":1,"get_number":true,"fields":["id"]}},
       "fused":{"fusion":{"sources":{"all":{"limit":10,
-        "sorts":[{"expr":"n_i","dir":"asc"}]}},"rrf":{},
+        "sort":[{"expr":"n_i","dir":"asc"}]}},"rrf":{},
         "offset":3,"limit":5,"batch_size":1,"get_number":true,"fields":["id"]}}
     }}}}})json", req->rawRequest(), req->mr);
   req->collection("main");

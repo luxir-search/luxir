@@ -103,7 +103,7 @@ public:
   //     (ConstantScore) the fluent helpers don't cover. ---
   luxir::api::Query& rawQuery();
 
-  // --- escape hatches for op fields the fluent helpers don't cover (sorts, knn, fusion
+  // --- escape hatches for op fields the fluent helpers don't cover (sort, knn, fusion
   //     sources, ...): the raw op this cursor configures, and the request build arena.
   //     Build directly on the concrete classes (see QueryBuild.h for arena helpers). ---
   luxir::api::SearchOp& rawOp() { return *op_; }

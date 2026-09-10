@@ -46,6 +46,7 @@
 #include "luxir/search/SearchRequest.h"
 #include "JsonRequest.h"
 #include "luxir/api/build.h"
+#include "luxir/api/sort_clause.h"
 #include "JsonResponse.h"
 #include "NdjsonFramer.h"
 #include "ProtoUpdateMessage.h"
@@ -1005,28 +1006,6 @@ private:
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
   }
 
-  static bool parseSortClause(std::string_view text, std::string_view& expr,
-                              std::optional<std::string_view>& dir) {
-    std::size_t end = text.size();
-    while (end > 0 && asciiWhitespace(text[end - 1])) end--;
-    if (end == 0) return false;
-
-    std::size_t tokenStart = end;
-    while (tokenStart > 0 && !asciiWhitespace(text[tokenStart - 1])) tokenStart--;
-    std::string_view token = text.substr(tokenStart, end - tokenStart);
-    if (token == "asc" || token == "desc") {
-      std::size_t exprEnd = tokenStart;
-      while (exprEnd > 0 && asciiWhitespace(text[exprEnd - 1])) exprEnd--;
-      if (exprEnd == 0) return false;
-      expr = text.substr(0, exprEnd);
-      dir = token;
-    } else {
-      expr = text.substr(0, end);
-      dir.reset();
-    }
-    return true;
-  }
-
   static bool appendFieldsParam(const std::vector<UrlParam>& params,
                                 OverlayJsonBuilder& json, SearchUrlOverlay& overlay,
                                 std::string& err) {
@@ -1076,29 +1055,24 @@ private:
     }
 
     overlay.hasTopDocs = true;
-    // The body field is plural "sorts". The singular URL name is deliberate:
-    // each repeated sort parameter contributes one ordered clause.
-    json.key("sorts");
+    // Each repeated sort parameter is one clause of the body's `sort` list, in
+    // the string form the body accepts ("expr", "expr asc", "expr desc"); the
+    // grammar lives in the dialect, and this only validates for the URL error.
+    json.key("sort");
     json.json += '[';
     if (haveNonEmpty) {
       bool first = true;
       for (std::string_view value : values) {
         std::string_view expr;
         std::optional<std::string_view> dir;
-        if (!parseSortClause(value, expr, dir)) {
+        if (!luxir::api::splitSortClause(value, expr, dir)) {
           err = "invalid URL parameter 'sort': expected a non-empty expression optionally "
                 "followed by ' asc' or ' desc', got '" + std::string(value) + "'";
           return false;
         }
         if (!first) json.json += ',';
         first = false;
-        json.json += R"({"field":)";
-        appendJsonStringLiteral(json.json, expr);
-        if (dir) {
-          json.json += R"(,"dir":)";
-          appendJsonStringLiteral(json.json, *dir);
-        }
-        json.json += '}';
+        appendJsonStringLiteral(json.json, value);
       }
     }
     json.json += ']';

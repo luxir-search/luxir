@@ -367,7 +367,7 @@ P::SearchRequest buildSortExpressionRequest(std::pmr::memory_resource& mr) {
   P::SearchRequest request;
   P::SearchOp* queryOp = B::mapSlot<P::SearchOp>(request.ops, 1, "q", mr);
   auto& top = queryOp->kind.emplace<P::TopDocs>();
-  P::SortSpec* topSort = B::allocArray(top.sorts, 1, mr);
+  P::SortSpec* topSort = B::allocArray(top.sort, 1, mr);
   topSort[0].expr = B::arenaStr(mr, "add(price_i,$factor)");
   topSort[0].dir = P::SortSpec_::SortDir::DESC;
   P::Val* factor = B::mapSlot<P::Val>(topSort[0].vars, 1, "factor", mr);
@@ -376,7 +376,7 @@ P::SearchRequest buildSortExpressionRequest(std::pmr::memory_resource& mr) {
   P::SearchOp* facetOp = B::mapSlot<P::SearchOp>(top.ops, 1, "categories", mr);
   auto& facet = facetOp->kind.emplace<P::FieldFacet>();
   facet.field = B::arenaStr(mr, "category_s");
-  P::SortSpec* facetSort = B::allocArray(facet.sorts, 1, mr);
+  P::SortSpec* facetSort = B::allocArray(facet.sort, 1, mr);
   facetSort[0].expr = B::arenaStr(mr, "count");
   facetSort[0].dir = P::SortSpec_::SortDir::ASC;
   P::Val* ignored = B::mapSlot<P::Val>(facetSort[0].vars, 1, "tie", mr);
@@ -389,9 +389,9 @@ void verifySortExpressionRequest(const P::SearchRequest& request) {
   ASSERT_NE(queryView, nullptr);
   const auto* top = std::get_if<P::TopDocs>(&(*queryView)->kind);
   ASSERT_NE(top, nullptr);
-  ASSERT_EQ(1, top->sorts.size());
-  EXPECT_EQ("add(price_i,$factor)", top->sorts[0].expr);
-  const auto* factorView = top->sorts[0].vars.find("factor");
+  ASSERT_EQ(1, top->sort.size());
+  EXPECT_EQ("add(price_i,$factor)", top->sort[0].expr);
+  const auto* factorView = top->sort[0].vars.find("factor");
   ASSERT_NE(factorView, nullptr);
   EXPECT_DOUBLE_EQ(2.5, std::get<double>((**factorView).kind));
 
@@ -399,9 +399,9 @@ void verifySortExpressionRequest(const P::SearchRequest& request) {
   ASSERT_NE(facetView, nullptr);
   const auto* facet = std::get_if<P::FieldFacet>(&(*facetView)->kind);
   ASSERT_NE(facet, nullptr);
-  ASSERT_EQ(1, facet->sorts.size());
-  EXPECT_EQ("count", facet->sorts[0].expr);
-  const auto* tieView = facet->sorts[0].vars.find("tie");
+  ASSERT_EQ(1, facet->sort.size());
+  EXPECT_EQ("count", facet->sort[0].expr);
+  const auto* tieView = facet->sort[0].vars.find("tie");
   ASSERT_NE(tieView, nullptr);
   EXPECT_EQ(7, std::get<int64_t>((**tieView).kind));
 }

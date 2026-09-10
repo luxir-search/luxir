@@ -175,7 +175,7 @@ POST /collections/books/_search
 For document `d`, RRF computes `sum(1 / (k + rank))` over sources containing
 `d`, with ranks starting at one. The fusion-level filter is shared by every
 source and computed once per segment. A source may add its own `filter`; the
-shared and source-specific filters are ANDed. Source `query`, `filter`, `sorts`,
+shared and source-specific filters are ANDed. Source `query`, `filter`, `sort`,
 and `limit` define its ranking; response-shape fields belong on the fusion.
 Ops under `fusion.ops` run over the fused candidate set: every document in any
 source's ranked list after these filters, exactly the set `found` counts.

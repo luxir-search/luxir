@@ -403,7 +403,7 @@ struct TopDocs {                                                 // all indirect
   int64_t offset = 0;
   std::optional<std::int64_t> limit;
   std::span<const std::string_view> fields;
-  std::span<const SortSpec> sorts;
+  std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
@@ -436,7 +436,7 @@ struct FieldFacet {
   std::string_view field;
   std::optional<std::int64_t> limit;
   std::optional<std::int64_t> mincount;
-  std::span<const SortSpec> sorts;
+  std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   ::hpp_proto::optional_indirect_view<Val> selected;
   SelectionMode selection_mode = SelectionMode::ANY;

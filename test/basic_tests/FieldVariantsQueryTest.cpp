@@ -110,7 +110,7 @@ TEST_F(FieldVariantsQueryTest, authorSearchAndValueOperations) {
   auto filter = run(R"({"query":{"all":true},"filter":[{"match":{"author":"Le"}}],"fields":["id"],"limit":-1})");
   EXPECT_EQ((std::vector<std::string>{"a", "c", "d"}), ids(*filter));
 
-  auto req = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"sorts":[{"expr":"author"},{"expr":"id"}],"ops":{
+  auto req = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"sort":[{"expr":"author"},{"expr":"id"}],"ops":{
     "authors":{"field_facet":{"field":"author","limit":-1}},
     "tokens":{"field_facet":{"field":"author__self","limit":-1}}
   }})");
@@ -147,7 +147,7 @@ TEST_F(FieldVariantsQueryTest, defaultNameTemplatesSearchFacetAndSort) {
   EXPECT_TRUE(expr("author_name:=\"george r.r. martin\"").empty());
 
   auto req = run(R"({"fields":["id","author_name","contributor_names"],"limit":-1,
-    "sorts":[{"expr":"author_name"}],"ops":{
+    "sort":[{"expr":"author_name"}],"ops":{
       "authors":{"field_facet":{"field":"author_name","limit":-1}},
       "contributors":{"field_facet":{"field":"contributor_names","limit":-1}}
     }})");
@@ -200,9 +200,9 @@ TEST_F(FieldVariantsQueryTest, numericMatchDoesNotRebindDuringLowering) {
   EXPECT_EQ((std::vector<std::string>{"a"}), expr("edition:\"42\""));
   EXPECT_TRUE(expr("edition:=42").empty());
   EXPECT_EQ((std::vector<std::string>{"a"}), expr("edition:=0042"));
-  auto lexical = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"sorts":[{"expr":"edition__label"}]})");
+  auto lexical = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"sort":[{"expr":"edition__label"}]})");
   EXPECT_EQ((std::vector<std::string>{"a", "d", "b", "c"}), ids(*lexical, true));
-  auto numeric = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"sorts":[{"expr":"edition__self"}]})");
+  auto numeric = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"sort":[{"expr":"edition__self"}]})");
   EXPECT_EQ((std::vector<std::string>{"c", "d", "b", "a"}), ids(*numeric, true));
 }
 
@@ -372,7 +372,7 @@ TEST_F(FieldVariantsQueryTest, hash128ExactValuesRangesFacetsAndSort) {
   }
   EXPECT_EQ("long2", expectedOrder.back()); // Original order is retained within the literal prefix.
   auto sorted = run(R"({"query":{"exists":{"field":"whole"}},"fields":["id","whole"],
-    "sorts":[{"expr":"whole"}],"ops":{"facet":{"field_facet":{"field":"whole","limit":-1}}}})");
+    "sort":[{"expr":"whole"}],"ops":{"facet":{"field_facet":{"field":"whole","limit":-1}}}})");
   EXPECT_EQ(expectedOrder, ids(*sorted, true));
   ASSERT_TRUE(sorted->ok()) << sorted->errorMsg();
   EXPECT_EQ(expectedBuckets, buckets(*sorted->docList()->ops.at("facet")->facetResult()));

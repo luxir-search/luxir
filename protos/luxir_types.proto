@@ -109,7 +109,7 @@ message TopDocs {
   // named fields win on collision and may name anything, vectors and engine
   // fields included.
   repeated string fields = 7;
-  repeated SortSpec sorts = 8;
+  repeated SortSpec sort = 8;
 
   // Maximum documents per streaming batch. Nonpositive = default (100);
   // the server caps positive values at 256. More documents produce more
@@ -127,7 +127,7 @@ message TopDocs {
 // `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
 // response shape at the top level. Per-source `ops` are rejected; put facets
 // and metrics in Fusion.ops.
-// Each source's `query`, `sorts`, `limit`, and any per-source `filter` are used
+// Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
 // to produce that source's ranked list.
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
@@ -536,7 +536,7 @@ message FieldFacet {
 
   // STRING/ID only: one metric sub-operation name. Unset sorts by count
   // descending, then bucket value ascending.
-  repeated SortSpec sorts = 5;
+  repeated SortSpec sort = 5;
   map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
 
   // Scalar or array of selected values, coerced as AnyOfQuery values. Selected

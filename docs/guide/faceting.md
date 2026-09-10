@@ -71,7 +71,7 @@ The controls are:
 | `limit` | Maximum returned buckets. Default `5`; `-1` returns all. |
 | `mincount` | Drop buckets below this domain count. |
 | `missing` | Return the count of documents with no accepted value. |
-| `sorts` | Sort a string/ID facet by one named metric sub-operation. |
+| `sort` | Sort a string/ID facet by one named metric sub-operation. |
 | `ops` | Per-bucket sub-facets, numeric metrics, or `top_docs` / `fusion` result lists on string/ID facets. |
 | `selected` | Values that refine the result set and remain visible as buckets. |
 | `selection_mode` | Match any selected value (default) or require all of them. |
@@ -242,7 +242,7 @@ Sort a string/ID facet by one of its metric operations:
     "ops": {
       "average_price": "avg(price_f)"
     },
-    "sorts": [{"expr":"average_price","dir":"desc"}]
+    "sort": ["average_price desc"]
   }
 }
 ```
@@ -251,7 +251,7 @@ Facet sort expressions are resolved contextually as metric operation names;
 document value expressions are not evaluated for buckets. Both `asc` and
 `desc` are supported, and a missing or failed metric sorts last in either
 direction. Only one facet sort key is supported. Custom count and bucket-value
-sort specifications are not yet supported; omit `sorts` for the default count
+sort specifications are not yet supported; omit `sort` for the default count
 order.
 
 Facet aggregate state is bounded by the server's
@@ -304,10 +304,10 @@ over the bucket domains as part of the original request.
 
 A `top_docs` (or `fusion`) operation under a facet returns a ranked list of
 documents for every bucket. It is an ordinary operation: a `top_docs` applies
-its own `query`, `filter`, `sorts`, `limit`, `fields`, and `get_number` to
+its own `query`, `filter`, `sort`, `limit`, `fields`, and `get_number` to
 that bucket's documents, and a `fusion` fuses its sources over them. A
 `top_docs` without a `query` selects every document in the bucket, and without
-`sorts` such a list is in index order, so give it the query whose ranking you
+`sort` such a list is in index order, so give it the query whose ranking you
 want (a text query's scores do not depend on the bucket, so repeating the
 outer query ranks each bucket's documents the way the main result list does)
 or a sort:

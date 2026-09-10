@@ -544,7 +544,7 @@ public:
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
         }
-        if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
+        if (!facetReq.ops.empty() || !facetReq.sort.empty()) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for int field facets");
         }
         auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
@@ -574,7 +574,7 @@ public:
         break;
       }
       case FieldType::Type::TEXT:
-        if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
+        if (!facetReq.ops.empty() || !facetReq.sort.empty()) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for text field facets");
         }
         facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, facetReq,
@@ -1322,7 +1322,7 @@ public:
             bool get_number = 4;          // return the number of matching documents
             bool get_scores = 5;          // return the relevancy score for each document returned
             repeated string fields = 6;   // fields to return for each document (empty: every retrievable field)
-            repeated SortSpec sorts = 7;
+            repeated SortSpec sort = 7;
     }
     */
 
@@ -1424,7 +1424,7 @@ public:
       domainQuery = req.requestPool.make<ForcePrepareQuery>(domainQuery);
     }
 
-    auto parsedSorts = parseSorts(topDocsReq.sorts);
+    auto parsedSorts = parseSorts(topDocsReq.sort);
     auto* planningContext = luxir::arenaCreate<Query::PlanningContext>(
       req.arena, req.requestPool, *req.reader, Query::PlanningContext::Limits{},
       &req.warnings,

@@ -115,7 +115,7 @@ TEST(JsonDialect, SearchRequestSecondPassOverlay) {
         "query":"title_w:body",
         "limit":20,
         "fields":["body_a","body_b"],
-        "sorts":[{"field":"old_i","dir":"asc"}]
+        "sort":[{"field":"old_i","dir":"asc"}]
       }},
       "cats":{"field_facet":{"field":"cat_s"}}
     }
@@ -125,7 +125,7 @@ TEST(JsonDialect, SearchRequestSecondPassOverlay) {
     "request_id":"url",
     "limit":3,
     "fields":["url_a"],
-    "sorts":[{"field":"new_i","dir":"desc"}]
+    "sort":[{"field":"new_i","dir":"desc"}]
   })", mr));
 
   EXPECT_EQ("url", r.request_id);
@@ -137,9 +137,47 @@ TEST(JsonDialect, SearchRequestSecondPassOverlay) {
   EXPECT_EQ("title_w:body", std::get<P::ExprQuery>(td.query->kind).q);
   ASSERT_EQ(1u, td.fields.size());
   EXPECT_EQ("url_a", td.fields[0]);
-  ASSERT_EQ(1u, td.sorts.size());
-  EXPECT_EQ("new_i", td.sorts[0].expr);
-  EXPECT_EQ(P::SortSpec::SortDir::DESC, td.sorts[0].dir);
+  ASSERT_EQ(1u, td.sort.size());
+  EXPECT_EQ("new_i", td.sort[0].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::DESC, td.sort[0].dir);
+}
+
+TEST(JsonDialect, SortClauseStringForm) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest r;
+  ASSERT_TRUE(P::read_json(r, R"({
+    "query":"title_w:dune",
+    "sort":["year_i desc", "  score  ", " add(price_i, 1) asc ", {"field":"id"}]
+  })", mr));
+  const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
+  ASSERT_EQ(4u, td.sort.size());
+  EXPECT_EQ("year_i", td.sort[0].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::DESC, td.sort[0].dir);
+  EXPECT_EQ("score", td.sort[1].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::UNKNOWN, td.sort[1].dir);
+  EXPECT_EQ("add(price_i, 1)", td.sort[2].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::ASC, td.sort[2].dir);
+  EXPECT_EQ("id", td.sort[3].expr);
+
+  P::SearchRequest one;
+  ASSERT_TRUE(P::read_json(one, R"({"query":"title_w:dune","sort":"year_i desc"})", mr));
+  const auto& td1 = std::get<P::TopDocs>((**one.ops.find("q")).kind);
+  ASSERT_EQ(1u, td1.sort.size());
+  EXPECT_EQ("year_i", td1.sort[0].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::DESC, td1.sort[0].dir);
+
+  P::SearchRequest obj;
+  ASSERT_TRUE(P::read_json(obj, R"({"ops":{"q":{"top_docs":{"sort":{"field":"id","dir":"asc"}}}}})", mr));
+  const auto& td2 = std::get<P::TopDocs>((**obj.ops.find("q")).kind);
+  ASSERT_EQ(1u, td2.sort.size());
+  EXPECT_EQ("id", td2.sort[0].expr);
+  EXPECT_EQ(P::SortSpec::SortDir::ASC, td2.sort[0].dir);
+
+  for (const char* bad : {R"({"sort":[""]})", R"({"sort":["  "]})", R"({"sort":["desc"]})",
+                          R"({"sort":[" asc "]})", R"({"sort":""})", R"({"sort":"desc"})"}) {
+    P::SearchRequest r2;
+    EXPECT_FALSE(P::read_json(r2, bad, mr)) << bad;
+  }
 }
 
 TEST(JsonDialect, SearchRequestShorthandOpsNamedQStaysSubOp) {

@@ -726,7 +726,7 @@ TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_pb_s","limit":-1,)"
       R"("ops":{"hits":{"top_docs":{"limit":1,"get_number":true,"fields":["id"],)"
-      R"("sorts":[{"field":"price_i","dir":"desc"}]}}}}}}})");
+      R"("sort":[{"field":"price_i","dir":"desc"}]}}}}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   EXPECT_EQ(
       R"({"ops":{"cats":{"buckets":[)"
@@ -2402,7 +2402,7 @@ TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
   EXPECT_EQ(5, *td["batch_size"].get_if<int64_t>());
   EXPECT_EQ("columns", *td["document_format"].get_if<std::string>());
   EXPECT_TRUE(*td["get_number"].get_if<bool>());
-  auto* sorts = td["sorts"].get_if<glz::generic_i64::array_t>();
+  auto* sorts = td["sort"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, sorts);
   ASSERT_EQ(2u, sorts->size());
   EXPECT_EQ("price_i", *(*sorts)[0]["expr"].get_if<std::string>());
@@ -2458,11 +2458,11 @@ TEST_F(HttpApiTest, searchUrlSortGrammar) {
   auto echo = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=request&sort=price_i+desc"
       "&sort=sum%28x_i%2Cy_i%29+asc",
-      R"({"sorts":[{"field":"old_i","dir":"asc"}]})");
+      R"({"sort":[{"field":"old_i","dir":"asc"}]})");
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   glz::generic_i64 root;
   ASSERT_FALSE(glz::read_json(root, echo.body())) << echo.body();
-  auto* sorts = root["ops"]["q"]["top_docs"]["sorts"].get_if<glz::generic_i64::array_t>();
+  auto* sorts = root["ops"]["q"]["top_docs"]["sort"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, sorts);
   ASSERT_EQ(2u, sorts->size());
   EXPECT_EQ("price_i", *(*sorts)[0]["expr"].get_if<std::string>());
@@ -2471,10 +2471,10 @@ TEST_F(HttpApiTest, searchUrlSortGrammar) {
 
   auto cleared = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=request&sort=",
-      R"({"sorts":[{"field":"old_i"}]})");
+      R"({"sort":[{"field":"old_i"}]})");
   ASSERT_EQ(200, cleared.result_int()) << cleared.body();
   ASSERT_FALSE(glz::read_json(root, cleared.body())) << cleared.body();
-  EXPECT_FALSE(root["ops"]["q"]["top_docs"].contains("sorts"));
+  EXPECT_FALSE(root["ops"]["q"]["top_docs"].contains("sort"));
 
   auto mixed = httpRequest(port(), http::verb::get,
       "/collections/main/_search?sort=&sort=price_i");
@@ -3836,7 +3836,7 @@ TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTa
   ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", "Le Guin", "genre", "Science Fiction"),
                            UpdateMessage::COMMIT).success);
   std::string body = R"({"query":"genre:Science AND author:=\"Le Guin\"","fields":["id"],
-    "sorts":[{"expr":"author"}],"ops":{"authors":{"field_facet":{"field":"author"}}}})";
+    "sort":[{"expr":"author"}],"ops":{"authors":{"field_facet":{"field":"author"}}}})";
   auto echo = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=resolved", body);
   ASSERT_EQ(200, echo.result_int()) << echo.body();

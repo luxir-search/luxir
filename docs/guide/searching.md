@@ -42,7 +42,7 @@ The recognized top-document parameters are:
 | `query` | Expression query string, exactly like a JSON string in the body `query` position. |
 | `limit`, `offset` | Signed 64-bit decimal integer. |
 | `fields` | Comma-separated field names. An empty value clears the body list; an empty list item is an error. |
-| `sort` | One sort clause per parameter: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
+| `sort` | One sort clause per parameter, in the body's string form: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
 | `batch_size` | Signed 32-bit decimal integer. |
 | `document_format` | Exactly `default`, `rows`, or `columns`. |
 | `get_number`, `get_scores` | Exactly `true` or `false`. |
@@ -111,7 +111,7 @@ The top-document fields are:
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `fields` | Fields to retrieve. Omitted: every retrievable field (see below). |
-| `sorts` | Value expressions used as sort keys. No list means relevance order. |
+| `sort` | One sort clause or a list of them, as `"expr desc"` strings or objects. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
 | `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match domain. |
@@ -185,7 +185,7 @@ POST /collections/names/_search
   "query": {"match":{"author":"Guin"}},
   "fields": ["id","author","author__s","author__self"],
   "get_number": true,
-  "sorts": [{"expr":"author"},{"expr":"id"}]
+  "sort": ["author", "id"]
 }
 ```
 
@@ -300,14 +300,17 @@ Sort a column field explicitly:
 ```json
 {
   "query": {"all":true},
-  "sorts": [{"expr":"year_i","dir":"desc"}],
+  "sort": "year_i desc",
   "fields": ["id","title_t","year_i"]
 }
 ```
 
-The `expr` member accepts either a bare field name or a numeric value expression.
-For a bare field sort, `field` is accepted as an input alias; responses and
-request echo use the canonical `expr` form.
+`sort` takes one clause or a list of clauses. A clause is a string, `expr`,
+`expr asc`, or `expr desc`, or an object with the same `expr` and `dir` plus a
+`vars` map for `$name` values: `{"expr": "year_i", "dir": "desc"}`. The
+expression is a bare field name or a numeric value expression. `field` is
+accepted as an input alias for `expr`; responses and request echo use the
+canonical list-of-objects form.
 Numeric, date, string, and ID field names retain the direct column-sort path.
 Use `col("name")` when a field name is reserved or is not an identifier. Sorts
 and column-expression leaves use the value binding. Analyzed TEXT has no value

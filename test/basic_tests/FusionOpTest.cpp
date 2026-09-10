@@ -99,8 +99,8 @@ protected:
   // Append a sort spec to a TopDocs source (realloc-grow preserves prior entries).
   static void addSort(luxir::api::TopDocs& src, std::string_view expr,
                       luxir::api::SortSpec::SortDir dir, std::pmr::memory_resource& mr) {
-    auto old = src.sorts;
-    luxir::api::SortSpec* a = build::allocArray(src.sorts, old.size() + 1, mr);
+    auto old = src.sort;
+    luxir::api::SortSpec* a = build::allocArray(src.sort, old.size() + 1, mr);
     for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
     a[old.size()].expr = build::arenaStr(mr, expr);
     a[old.size()].dir = dir;
@@ -595,7 +595,7 @@ TEST_F(FusionOpTest, subOpsUseFusedCandidates) {
       parseQueryRequest(R"json({"ops":{"f":{"fusion":{
         "sources":{
           "text":{"query":{"match":{"foo_w":"apple"}},"limit":2,
-                  "sorts":[{"expr":"price_i","dir":"desc"}],
+                  "sort":[{"expr":"price_i","dir":"desc"}],
                   "filter":[{"match":{"owner_s":"yes"}}]},
           "knn":{"query":{"knn":{"field":"embedding_v","query":[0],"k":2}},
                  "limit":2}},

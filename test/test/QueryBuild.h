@@ -289,7 +289,7 @@ inline OpCursor& sort(OpCursor& cur, std::string_view expr,
   auto& mr = cur.mr();
   std::span<const api::SortSpec>* sorts = nullptr;
   std::visit([&](auto& op) {
-    if constexpr (requires { op.sorts; }) sorts = &op.sorts;
+    if constexpr (requires { op.sort; }) sorts = &op.sort;
   }, cur.rawOp().kind);
   assert(sorts && "sort() on an op without sorts");
   auto old = *sorts;
@@ -310,7 +310,7 @@ inline OpCursor& sortVar(OpCursor& cur, std::string_view expr,
   sort(cur, expr, dir);
   std::span<const api::SortSpec>* sorts = nullptr;
   std::visit([&](auto& op) {
-    if constexpr (requires { op.sorts; }) sorts = &op.sorts;
+    if constexpr (requires { op.sort; }) sorts = &op.sort;
   }, cur.rawOp().kind);
   assert(sorts != nullptr && !sorts->empty());
   auto& spec = const_cast<api::SortSpec&>(sorts->back());
