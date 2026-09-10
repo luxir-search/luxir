@@ -267,7 +267,7 @@ unknown collection should be rejected.
 Changes become visible on commit. You have three ways, use whichever fits:
 
 - In a JSON update body: `"commit": {}`.
-- On an NDJSON request URL: `POST /collections/main/_update?commit=true`.
+- On the request URL, JSON or NDJSON: `POST /collections/main/_update?commit=true`.
 - At the end of a stream: `{"_end_": {"commit": {}}}`.
 
 ## See what the server understood

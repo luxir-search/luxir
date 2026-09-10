@@ -223,6 +223,17 @@ struct HttpStreamGroup {
   }
 };
 
+// /update URL parameters shared by the buffered JSON and streaming NDJSON paths.
+struct UpdateUrlParams {
+  // Field-map pair; a body/group that sets either knob owns the pair for its docs.
+  std::vector<std::pair<std::string, std::string>> fieldMap;
+  bool dropUnmapped = false;
+  // ?commit=true: the request is published before it completes.  A JSON body
+  // commits immediately (its other commit options survive); an NDJSON stream
+  // commits every writer it touched at EOF.
+  bool commit = false;
+};
+
 struct HttpStreamUpdateState {
 #ifdef NDEBUG
   static constexpr std::size_t kStreamReadBufBytes = 1024 * 1024;
@@ -256,11 +267,8 @@ struct HttpStreamUpdateState {
   std::size_t maxInFlight;
   std::uint64_t nextSubmitOrdinal = 0;
   std::uint64_t nextFoldOrdinal = 0;
-  // Stream-level field-map default from ?field_map=/?drop_unmapped= URL params; a
-  // group that sets either knob overrides the pair for its docs.
-  std::vector<std::pair<std::string, std::string>> urlFieldMap;
-  bool urlDropUnmapped = false;
-  bool urlCommit = false;
+  // url.commit is cleared once the EOF commit is submitted.
+  UpdateUrlParams url;
   bool emitAfterBatch = false;
   bool resetGroupAfterBatch = false;
   bool emittedLine = false;
@@ -527,6 +535,7 @@ private:
   std::string requestId_;  // URL param, then the parsed body
   std::vector<UrlParam> urlParams_;
   RouteMatch route_;
+  UpdateUrlParams updateUrl_;
   bool pretty_ = false;  // fixed before submitting work for this request
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
@@ -637,6 +646,7 @@ private:
   void doRead() {
     requestId_.clear();
     pretty_ = false;
+    updateUrl_ = {};
     parser_.emplace();
     // The buffered request-body cap is applied after header routing. Streaming
     // NDJSON must be able to carry an unbounded Content-Length; atomic groups are
@@ -683,25 +693,19 @@ private:
       }
     }
 
-    if (parser_->get().method() == http::verb::post && route_.route == Route::UPDATE &&
-        isNdjsonContentType(std::string_view(parser_->get()[http::field::content_type]))) {
-      bool urlCommit = false;
-      if (const std::string* commit = findParam(params, "commit")) {
-        if (*commit != "true") {
-          respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-                                     "unknown commit mode '" + *commit + "' (valid: true)"));
-          return;
-        }
-        urlCommit = true;
-      }
-      std::vector<std::pair<std::string, std::string>> urlFieldMap;
-      bool urlDropUnmapped = false;
+    // /update URL options are validated at header admission for both encodings,
+    // so an invalid value is refused before its body is read.
+    bool postUpdate = parser_->get().method() == http::verb::post && route_.route == Route::UPDATE;
+    if (postUpdate) {
       std::string paramErr;
-      if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
-          !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
+      if (!parseUpdateUrlParams(params, updateUrl_, paramErr)) {
         respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
         return;
       }
+    }
+
+    if (postUpdate &&
+        isNdjsonContentType(std::string_view(parser_->get()[http::field::content_type]))) {
       // Refuse before lifting the body limit: otherwise a read-only node reads an
       // unbounded NDJSON stream only to reject it.
       if (node_.readOnly()) {
@@ -709,7 +713,7 @@ private:
         return;
       }
       parser_->body_limit(boost::none);
-      startStreamingUpdate(std::move(route_.coll), urlCommit, std::move(urlFieldMap), urlDropUnmapped);
+      startStreamingUpdate(std::move(route_.coll), std::move(updateUrl_));
       return;
     }
 
@@ -1269,18 +1273,9 @@ private:
         }
         break;
       }
-      case Route::UPDATE: {
-        std::vector<std::pair<std::string, std::string>> urlFieldMap;
-        bool urlDropUnmapped = false;
-        std::string paramErr;
-        if (!parseFieldMapParams(params, urlFieldMap, paramErr) ||
-            !parseDropUnmappedParam(params, urlDropUnmapped, paramErr)) {
-          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
-          return;
-        }
-        handleUpdate(req.body(), coll, urlFieldMap, urlDropUnmapped);
+      case Route::UPDATE:
+        handleUpdate(req.body(), coll, updateUrl_);
         break;
-      }
       case Route::STATS: {
         bool includeSegments = false;
         if (const std::string* value = findParam(params, "segments")) {
@@ -1485,8 +1480,7 @@ private:
   }
 
   void handleUpdate(const std::string& body, const std::string& coll,
-                    const std::vector<std::pair<std::string, std::string>>& urlFieldMap,
-                    bool urlDropUnmapped) {
+                    const UpdateUrlParams& url) {
     auto state = std::make_shared<HttpUpdateState>();
     try {
       std::string err;
@@ -1497,9 +1491,15 @@ private:
       // Same unit rule as streaming groups: a body that sets either field-map knob
       // owns the pair; otherwise the URL-param default applies.
       if (state->proto.field_map.empty() && !state->proto.drop_unmapped &&
-          (!urlFieldMap.empty() || urlDropUnmapped)) {
-        copyFieldMap(state->proto, urlFieldMap, state->resource);
-        state->proto.drop_unmapped = urlDropUnmapped;
+          (!url.fieldMap.empty() || url.dropUnmapped)) {
+        copyFieldMap(state->proto, url.fieldMap, state->resource);
+        state->proto.drop_unmapped = url.dropUnmapped;
+      }
+      // ?commit=true is a publication guarantee, as at NDJSON EOF: the request
+      // commits before responding.  The body's other commit options survive.
+      if (url.commit) {
+        if (!state->proto.commit) state->proto.commit.emplace();
+        state->proto.commit->commit_within_ms = 0;
       }
       requestId_ = std::string(state->proto.request_id);
     } catch (const std::exception& e) {
@@ -1863,6 +1863,25 @@ private:
     return true;
   }
 
+  static bool parseCommitParam(const std::vector<UrlParam>& params, bool& out,
+                               std::string& err) {
+    if (const std::string* value = findParam(params, "commit")) {
+      if (*value != "true") {
+        err = "unknown commit mode '" + *value + "' (valid: true)";
+        return false;
+      }
+      out = true;
+    }
+    return true;
+  }
+
+  static bool parseUpdateUrlParams(const std::vector<UrlParam>& params, UpdateUrlParams& out,
+                                   std::string& err) {
+    return parseCommitParam(params, out.commit, err) &&
+           parseFieldMapParams(params, out.fieldMap, err) &&
+           parseDropUnmappedParam(params, out.dropUnmapped, err);
+  }
+
   static void copyFieldMap(luxir::api::UpdateRequest& proto,
                            const std::vector<std::pair<std::string, std::string>>& entries,
                            std::pmr::memory_resource& resource) {
@@ -1989,9 +2008,7 @@ private:
     return decodeStreamControlPayload(entry.first, *payload, recordBytes, control, err);
   }
 
-  void startStreamingUpdate(std::string coll, bool urlCommit,
-                            std::vector<std::pair<std::string, std::string>> urlFieldMap,
-                            bool urlDropUnmapped) {
+  void startStreamingUpdate(std::string coll, UpdateUrlParams url) {
     const auto& ingest = node_.getConfig().ingest;
     std::size_t arenaConcurrency =
         (std::size_t)std::max(1, node_.getTaskArena().max_concurrency());
@@ -2006,9 +2023,7 @@ private:
         maxInFlight);
     state->defaultCollectionName = std::move(coll);
     state->group.collectionName = state->defaultCollectionName;
-    state->urlCommit = urlCommit;
-    state->urlFieldMap = std::move(urlFieldMap);
-    state->urlDropUnmapped = urlDropUnmapped;
+    state->url = std::move(url);
     state->shardPin = makeShardPin();
 
     // http::async_read_some uses its dynamic buffer capacity to select a socket
@@ -2352,9 +2367,9 @@ private:
     if (!state.group.fieldMap().empty() || state.group.dropUnmapped()) {
       batch.proto.field_map = state.group.fieldMap();
       batch.proto.drop_unmapped = state.group.dropUnmapped();
-    } else if (!state.urlFieldMap.empty() || state.urlDropUnmapped) {
-      copyFieldMap(batch.proto, state.urlFieldMap, batch.resource);
-      batch.proto.drop_unmapped = state.urlDropUnmapped;
+    } else if (!state.url.fieldMap.empty() || state.url.dropUnmapped) {
+      copyFieldMap(batch.proto, state.url.fieldMap, batch.resource);
+      batch.proto.drop_unmapped = state.url.dropUnmapped;
     }
   }
 
@@ -2753,7 +2768,7 @@ private:
     if (!state || state->failed) return;
     parser_.reset();
 
-    if (state->urlCommit) {
+    if (state->url.commit) {
       ErrorInfo err;
       if (streamWriterTarget(state->defaultCollectionName, err) == nullptr) {
         failStreamingUpdate(std::move(err));
@@ -2781,7 +2796,7 @@ private:
     for (const auto& [name, target] : state->writerCache) {
       writers.push_back({name, target.indexWriter});
     }
-    state->urlCommit = false;
+    state->url.commit = false;
     state->urlCommitInFlight = true;
 
     auto shardPin = state->shardPin;

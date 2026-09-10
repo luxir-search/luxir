@@ -161,10 +161,12 @@ publication:
 | `wait_for_merges` | Wait for in-flight merges before publishing. |
 | `max_segments` | Force the committed data down to at most this many segments before returning. `0` means no forced merge. |
 
-Commit without adding documents by sending `{"commit":{}}`. On the NDJSON
-HTTP path, `?commit=true` is also available as a convenient end-of-stream
-commit. Frequent forced merges are expensive; `max_segments` is an explicit
-maintenance action, not a normal ingest setting.
+Commit without adding documents by sending `{"commit":{}}`. On the HTTP
+path, `?commit=true` guarantees the request is published before it
+completes: a JSON body commits immediately (`commit_within_ms` is forced to
+`0`; its other commit options still apply), and an NDJSON stream commits at
+the end of the stream. Frequent forced merges are expensive; `max_segments`
+is an explicit maintenance action, not a normal ingest setting.
 
 Each update message uses the schema pinned at admission. After a successful
 schema publication, newly admitted messages use its definitions; already

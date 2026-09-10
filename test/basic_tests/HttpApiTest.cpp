@@ -2000,6 +2000,51 @@ TEST_F(HttpApiTest, ndjsonUrlCommitCommitsAtEof) {
   EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
 }
 
+TEST_F(HttpApiTest, jsonUrlCommitCommits) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+                            R"({"docs":[{"id":"jurlc1","title_w":"jsonurlcommit token"}]})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "jsonurlcommit").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
+}
+
+// ?commit=true publishes before the response even when the body defers its commit.
+TEST_F(HttpApiTest, jsonUrlCommitOverridesDeferredBodyCommit) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+      R"({"docs":[{"id":"jurlc3","title_w":"jsonurldeferred token"}],"commit":{"commit_within_ms":60000}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "jsonurldeferred").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, jsonUrlCommitKeepsBodyCommitOptions) {
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int i = 0; i < 3; i++) {
+    helper.index(flatdoc("id", "http-url-commit-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
+  }
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+                              R"({"commit":{"max_segments":1}})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(1u, helper.durableSegmentCount());
+}
+
+TEST_F(HttpApiTest, jsonInvalidUrlCommitRejected) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=no",
+                            R"({"docs":[{"id":"jurlc2"}]})");
+  ASSERT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("unknown commit mode 'no'")) << update.body();
+}
+
 TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   LuxirNode node;
   auto writer = node.getCollection("main")->getShard()->getIndexWriter();
