@@ -350,12 +350,12 @@ values, and range bounds. Absent `normalizer` inherits; `[]` clears it.
 
 Indexed STRING values after normalization, TEXT tokens after analysis, and IDs
 share a 255-byte term space. Terms of 255 bytes or less stay unchanged. The
-default has changed from `truncate` to `hash128`: longer terms become the first
-230 bytes, backed off to a UTF-8 boundary, followed immediately by 25 base36
-characters. There is no delimiter. The suffix is unseeded XXH3_128 of the whole
-term, encoded from its canonical 16 bytes (high 64 bits then low 64 bits, both
-big-endian), using `A-Z`, `a-z`, `0-9`, `-`, and `_`, with no padding. These
-format choices are fixed for `hash128`.
+default `long_terms` is `hash128`: longer terms become the first 230 bytes,
+backed off to a UTF-8 boundary, followed immediately by 25 base36 digits. There
+is no delimiter. The suffix is unseeded XXH3_128 of the whole term, taken as
+one 128-bit number from its canonical 16 bytes (high 64 bits then low 64 bits,
+both big-endian) and written in `0-9` and `a-z`, most significant digit first,
+zero padded to 25 digits. These format choices are fixed for `hash128`.
 
 Different long values retain distinct exact matches and facet buckets except
 for hash collisions. This is not attack-resistant: xxHash is not cryptographic,

@@ -421,6 +421,42 @@ TEST_F(FieldVariantsIngestTest, hash128UsesCompleteNormalizedValueAndLeavesColum
                           flatdoc("whole", term, "column", std::string(5000, 'x'))));
 }
 
+// A stored ID and a stored indexed STRING are retrieved from their columns;
+// only rows whose term may have been fitted (MIN_FITTED_LEN bytes or more)
+// come from the stored chunk.  Every length around the boundary, in two
+// segments, must round-trip its source, including two values that share one
+// truncated term.
+TEST_F(FieldVariantsIngestTest, columnBackedRetrievalReturnsSourceForLongValues) {
+  for (auto policy : {api::FieldDef::LongTerms::HASH128, api::FieldDef::LongTerms::TRUNCATE}) {
+    SCOPED_TRACE((int)policy);
+    CollectionHelper helper("main");
+    SchemaBuilder b;
+    for (auto name : {"id", "s"}) {
+      auto& field = b.field(name);
+      field.type = std::string_view(name) == "id" ? FieldClass::ID : FieldClass::STRING;
+      field.stored = true;
+      field.long_terms = policy;
+    }
+    b.set(helper.collection());
+    std::vector<Doc> docs;
+    for (size_t len : {1u, 10u, 251u, 252u, 254u, 255u, 256u, 300u, 5000u}) {
+      std::string value(len - 1, 'x');
+      docs.push_back(flatdoc("id", value + "i", "s", value + "s"));
+    }
+    docs.push_back(flatdoc("id", std::string(300, 'x') + "a", "s", std::string(300, 'x') + "b"));
+    size_t half = docs.size() / 2;
+    ASSERT_TRUE(helper.indexAll(std::span(docs).subspan(0, half), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.indexAll(std::span(docs).subspan(half), UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().fields({"id", "s"}).limit(-1);
+    req->execute();
+    auto found = req->getDocs();
+    ASSERT_EQ(docs.size(), found.size());
+    for (const auto& doc : docs) EXPECT_TRUE(containsDoc(found, doc));
+    helper.clear();
+  }
+}
+
 TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysicalOrder) {
   CollectionHelper helper("main");
   SchemaBuilder b;

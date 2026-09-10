@@ -174,15 +174,28 @@ public:
   static constexpr uint32_t getMemSize(uint32_t size) noexcept { return size + 1; }
   static constexpr uint32_t getExactMemSize(uint32_t size) noexcept { return size + 1; }
 
-  // Truncate term bytes to MAX_LEN so they fit the one-byte length, backing up
-  // over UTF-8 continuation bytes so the cut cannot split a multi-byte sequence
-  // (a bogus continuation run longer than the cap cuts at MAX_LEN exactly).
-  // Term consumers (index handlers, query building) apply this at their
-  // boundary; producers (tokenizers, filters) never deal with the limit.
+  // Fitting a term over MAX_LEN (truncate or hashTail) never yields fewer than
+  // MIN_FITTED_LEN bytes: truncate backs over at most the three continuation
+  // bytes a UTF-8 sequence can have, and a hash tail is such a prefix plus
+  // HASH128_CHARS.  So a term below MIN_FITTED_LEN is its source value, while
+  // one at or above it may be a fitted term or a genuine value of that length;
+  // consumers that need the source (stored retrieval) re-read those rows.
+  static constexpr uint32_t MIN_FITTED_LEN = MAX_LEN - 3;
+  static_assert(HASH128_PREFIX_LEN - 3 + HASH128_CHARS == MIN_FITTED_LEN);
+  inline static bool mayBeFitted(std::string_view term) noexcept { return term.size() >= MIN_FITTED_LEN; }
+
+  // Truncate term bytes to limit so they fit the one-byte length, backing up
+  // over at most three UTF-8 continuation bytes so the cut cannot split a
+  // valid multi-byte sequence (a longer, invalid continuation run is cut where
+  // it stands).  The bound keeps the result at or above limit - 3 (see
+  // MIN_FITTED_LEN).  Term consumers (index handlers, query building) apply
+  // this at their boundary; producers (tokenizers, filters) never deal with
+  // the limit.
   inline static std::string_view truncate(std::string_view term, uint32_t limit = MAX_LEN) noexcept {
     if (term.size() <= limit) return term;
     uint32_t len = limit;
-    while (len > 0 && ((unsigned char) term[len] & 0xC0) == 0x80) len--;
+    uint32_t floor = limit > 3 ? limit - 3 : 0;
+    while (len > floor && ((unsigned char) term[len] & 0xC0) == 0x80) len--;
     return term.substr(0, len ? len : limit);
   }
 

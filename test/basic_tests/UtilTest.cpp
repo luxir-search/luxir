@@ -29,9 +29,13 @@ TEST_F(UtilTest, packedTermTruncate) {
   for (int i = 0; i < 130; i++) acc += "\xC3\xA9";
   EXPECT_EQ(acc.substr(0, 254), PackedTerm::truncate(acc));
 
-  // An invalid continuation run longer than the cap cuts at MAX_LEN exactly.
+  // An invalid continuation run backs up at most three bytes, so no fitted
+  // term is ever shorter than MIN_FITTED_LEN.
   std::string cont(300, '\x80');
-  EXPECT_EQ(cont.substr(0, PackedTerm::MAX_LEN), PackedTerm::truncate(cont));
+  EXPECT_EQ(cont.substr(0, PackedTerm::MIN_FITTED_LEN), PackedTerm::truncate(cont));
+  EXPECT_FALSE(PackedTerm::mayBeFitted(std::string(PackedTerm::MIN_FITTED_LEN - 1, 'a')));
+  EXPECT_TRUE(PackedTerm::mayBeFitted(PackedTerm::truncate(cont)));
+  EXPECT_TRUE(PackedTerm::mayBeFitted(PackedTerm::truncate(acc)));
 }
 
 TEST_F(UtilTest, packedTermHash128Format) {
@@ -60,6 +64,7 @@ TEST_F(UtilTest, packedTermHash128Format) {
       auto term = PackedTerm::fitTerm(TermPolicy::HASH128, value, scratch);
       ASSERT_TRUE(term);
       EXPECT_EQ(prefix.size() + 25, term->size());
+      EXPECT_TRUE(PackedTerm::mayBeFitted(*term));
       EXPECT_EQ(prefix, term->substr(0, prefix.size()));
       EXPECT_EQ(prefix, PackedTerm::fitPrefix(TermPolicy::HASH128, value));
     }

@@ -896,13 +896,17 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // fields sharing one resource decompress each chunk only once.
     boost::unordered_flat_map<std::string_view, std::vector<StoredReq>,
                               PackedTermHash, PackedTermEqual> storedByResource;
+    // Groups served from their columns instead, and the rows of the group
+    // being re-read from the chunk after the column loads (see below).
+    std::vector<std::pair<std::string_view, std::vector<StoredReq>>> columnGroups;
+    std::vector<RowIndex> fittedIdx, fittedRuns;
 
     // If anything below throws while loader tasks are in flight (e.g. a later
     // field's schema lookup), the task_group must be joined before unwinding
     // destroys what the tasks reference - declared HERE, after every local the
     // loader tasks touch (sortedIdx, segRunLength, scratch columns, pending
-    // cols, storedByResource), so its join runs first.  Disarmed after the
-    // normal wait below.
+    // cols, storedByResource, fittedIdx/fittedRuns), so its join runs first.
+    // Disarmed after each wait below.
     struct TgJoinGuard {
       oneapi::tbb::task_group* tg;
       ~TgJoinGuard() {
@@ -987,20 +991,25 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     }
 
     for (auto& [resourceName, reqs] : storedByResource) {
-      // Only plain single-valued column-only STRING values are source-equivalent.
-      // Indexed columns expose term bytes, which can include a hash suffix or
-      // truncation. Keep source retrieval independent of the term policy.
+      // A single-valued STRING or ID column holds the source value except
+      // where a normalizer rewrote it (every row) or the term was fitted to
+      // the term space (rows recognizable by length, re-read from the chunk
+      // after the loads).  Multi-valued columns are sorted sets and TEXT has
+      // no column, so any such member sends the whole group to the chunk.
       bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
-        return r.fieldType->type() == FieldType::STRING && !r.multi
-            && r.fieldType->hasColumn()
-            && !r.fieldType->indexed()
-            && !static_cast<StrFieldType*>(r.fieldType)->normalizer;
+        if (r.multi || !r.fieldType->hasColumn()) return false;
+        switch (r.fieldType->type()) {
+          case FieldType::ID: return true;
+          case FieldType::STRING: return !static_cast<StrFieldType*>(r.fieldType)->normalizer;
+          default: return false;
+        }
       });
       if (useColumns) {
         for (const auto& r : reqs) {
           loadStrColWithTargets(req, r.fieldName, *r.fieldType, r.starget, r.mtarget, r.present,
                                 segDocs, sortedIdx, segRunLength, tg, mr);
         }
+        columnGroups.emplace_back(resourceName, std::move(reqs));
       } else {
         loadStoredFields(req, resourceName, std::move(reqs),
                          segDocs, sortedIdx, segRunLength, tg, mr);
@@ -1020,6 +1029,35 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       tg->wait();
     }
     tgJoin.tg = nullptr;  // joined normally
+
+    // A column value of PackedTerm::MIN_FITTED_LEN bytes or more may be a
+    // term fitted to the term space rather than the source (or a genuine
+    // value of that length); re-read those rows from the stored chunk.  The
+    // subset keeps sortedIdx's segment order, so loadStoredFields serves it
+    // as a small batch with its own segment runs.
+    for (auto& [resourceName, reqs] : columnGroups) {
+      fittedIdx.clear();
+      fittedRuns.clear();
+      for (RowIndex idx : sortedIdx) {
+        bool fitted = std::ranges::any_of(reqs, [idx](const StoredReq& r) {
+          return r.present[idx] && PackedTerm::mayBeFitted(r.starget[idx]);
+        });
+        if (!fitted) continue;
+        if (!fittedIdx.empty() && segDocs[fittedIdx.back()].segment() == segDocs[idx].segment()) {
+          fittedRuns.back()++;
+        } else {
+          fittedRuns.push_back(1);
+        }
+        fittedIdx.push_back(idx);
+      }
+      if (fittedIdx.empty()) continue;
+      tgJoin.tg = tg;
+      loadStoredFields(req, resourceName, std::move(reqs), segDocs, fittedIdx, fittedRuns, tg, mr);
+      if (tg != nullptr) {
+        tg->wait();
+      }
+      tgJoin.tg = nullptr;
+    }
 
     // All slots are loaded; pick each single-valued column's exact
     // missing_val and fill its missing slots.  (ROWS mode relies on the
