@@ -1004,7 +1004,10 @@ int64_t countBulkTermDisjunctionSegment(MemPool& pool, Query::Context& qContext,
   auto optional = queryPointers(queries);
   std::span<Query*> empty;
   BooleanQuery query(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  // The caller's context memoizes plans by query address, so queries planned
+  // through it must outlive it; these helpers destroy theirs on return.
+  Query::Context planContext(pool, qContext.topReader);
+  auto* weight = query.createWeight(planContext, Query::NEED_SCORES);
   auto* supplier = weight->scorerSupplier(pool, segment);
   if (supplier == nullptr) {
     return 0;
@@ -1038,7 +1041,10 @@ int64_t countPullTermDisjunctionSegment(MemPool& pool, Query::Context& qContext,
   auto optional = queryPointers(queries);
   std::span<Query*> empty;
   BooleanQuery query(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  // The caller's context memoizes plans by query address, so queries planned
+  // through it must outlive it; these helpers destroy theirs on return.
+  Query::Context planContext(pool, qContext.topReader);
+  auto* weight = query.createWeight(planContext, Query::NEED_SCORES);
   auto* scorer = weight->createScorer(pool, segment);
   if (scorer == nullptr) {
     return 0;
@@ -1097,7 +1103,10 @@ int64_t countBulkTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
   auto mandatory = queryPointers(queries);
   std::span<Query*> empty;
   BooleanQuery query(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  // The caller's context memoizes plans by query address, so queries planned
+  // through it must outlive it; these helpers destroy theirs on return.
+  Query::Context planContext(pool, qContext.topReader);
+  auto* weight = query.createWeight(planContext, Query::NEED_SCORES);
   auto* supplier = weight->scorerSupplier(pool, segment);
   if (supplier == nullptr) {
     return 0;
@@ -1131,7 +1140,10 @@ int64_t countPullTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
   auto mandatory = queryPointers(queries);
   std::span<Query*> empty;
   BooleanQuery query(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  // The caller's context memoizes plans by query address, so queries planned
+  // through it must outlive it; these helpers destroy theirs on return.
+  Query::Context planContext(pool, qContext.topReader);
+  auto* weight = query.createWeight(planContext, Query::NEED_SCORES);
   auto* scorer = weight->createScorer(pool, segment);
   if (scorer == nullptr) {
     return 0;
@@ -1791,7 +1803,10 @@ BulkScorer* createBulkTermDisjunctionScorer(MemPool& pool, Query::Context& qCont
   auto optional = queryPointers(queries);
   std::span<Query*> empty;
   BooleanQuery query(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  // Plan through a local context: the caller's memoizes plans by query address
+  // and these queries die on return.
+  Query::Context planContext(pool, qContext.topReader);
+  auto* weight = query.createWeight(planContext, Query::NEED_SCORES);
   auto* supplier = weight->scorerSupplier(pool, segment);
   if (supplier == nullptr) {
     return nullptr;
@@ -6069,7 +6084,10 @@ TEST_F(TermScorerTest, conjunctionDenseCountMatchesPullWithFilters) {
     auto queries = makeTermQueries(terms);
     auto mandatory = queryPointers(queries);
     BooleanQuery query(mandatory, {}, {}, {});
-    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    // Each block rebuilds its queries; the shared context memoizes plans by
+    // address, so plan through a block-local context instead.
+    Query::Context blockContext(testIndex.pool, *testIndex.reader);
+    auto* weight = query.createWeight(blockContext, Query::NEED_SCORES);
     auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
     ASSERT_NE(supplier, nullptr);
     auto* countScorer = supplier->bulkScorer(testIndex.pool);
@@ -6081,7 +6099,10 @@ TEST_F(TermScorerTest, conjunctionDenseCountMatchesPullWithFilters) {
     auto queries = makeTermQueries(terms);
     auto mandatory = queryPointers(queries);
     BooleanQuery query(mandatory, {}, {}, {});
-    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    // Each block rebuilds its queries; the shared context memoizes plans by
+    // address, so plan through a block-local context instead.
+    Query::Context blockContext(testIndex.pool, *testIndex.reader);
+    auto* weight = query.createWeight(blockContext, Query::NEED_SCORES);
     auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
     ASSERT_NE(supplier, nullptr);
     auto* matchScorer = supplier->bulkScorer(testIndex.pool);
