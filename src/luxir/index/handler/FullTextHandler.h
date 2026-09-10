@@ -117,12 +117,18 @@ public:
       for (;;) {
         bool hasNext = tail.incrementToken();
         if (!hasNext) break;
-        ++numTokens;
-        pos += tok.positionIncrement;
         // The token bytes are transient (the chain may reuse the buffer on the
         // next pull); try_emplace copies them into the MemPool below.
-        // Oversized tokens index truncated; query-time term building truncates
-        // identically (QueryBuilder::copyTerm), so exact match still works.
+        if (fieldType->rejectLongTerms && tok.text.size() > PackedTerm::MAX_LEN) {
+          // Rollback marks the doc deleted but retains earlier postings. They
+          // still need a norm at flush, and their table memory must be charged.
+          finishValues(inverter, numTokens);
+          throw DocumentError(fmt::format("Field '{}': text token is {} bytes after analysis; maximum is {}",
+                                          std::string_view(fieldName), tok.text.size(), PackedTerm::MAX_LEN));
+        }
+        ++numTokens;
+        pos += tok.positionIncrement;
+        // Default truncation agrees with query-time term building.
         std::string_view term = PackedTerm::truncate(tok.text);
 
         auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
@@ -132,6 +138,11 @@ public:
       }
     }
 
+    finishValues(inverter, numTokens);
+  }
+
+private:
+  void finishValues(Inverter& inverter, int numTokens) {
     // We index the length even if all tokens were removed somehow, because we still want
     // to record that there was a doc for this field.
     // Store the SmallFloat-encoded norm byte, not the raw token count: the scorers index
@@ -140,7 +151,7 @@ public:
     // mis-scores docs over 40 tokens and wraps mod 256 above 255.
     uint8_t encodedNorm = SmallFloat::intToByte4(numTokens);
     normBytes.writeByte(inverter.pool, encodedNorm);
-    normDocsWithField.addDoc(inverter.pool, docid);
+    normDocsWithField.addDoc(inverter.pool, inverter.getDoc());
     numDocsWithField++;
 
     // termsHash values (posting streams) live in inverter.pool; only its heap table
@@ -148,6 +159,7 @@ public:
     accountExtraRam(inverter, termsHash.memSize());
   }
 
+public:
   void flush(Inverter& inverter) override {
     flushPositions(inverter);
   }

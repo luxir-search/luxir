@@ -1299,6 +1299,14 @@ message FieldDef {
   FieldVariants variants = 13;
   FieldDefaults defaults = 14;
   NormalizerDef normalizer = 15;
+
+  // STRING values after normalization and TEXT tokens after analysis.
+  // Not valid on column-only STRING; ID always truncates.
+  enum LongTerms {
+    TRUNCATE = 0;
+    REJECT = 1;
+  }
+  optional LongTerms long_terms = 16; // absent: inherit from parent, else truncate
 }
 
 message SchemaDef {

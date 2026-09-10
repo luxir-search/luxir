@@ -74,12 +74,20 @@ searched, but it cannot be overwritten or deleted by ID and has no useful
 external identity. In ordinary collections, treat `id` as required at the
 producer boundary.
 
-IDs are limited to 255 UTF-8-safe bytes in the term space. Longer IDs
-are truncated in the term space, so values that share the same first 255-byte
-prefix collide for overwrite and delete purposes. Keep IDs within that bound.
-STRING fields instead reject values over 255 bytes after normalization,
-including column-only strings. A string variant that exceeds this limit fails
-the document even if its TEXT primary accepts the source.
+IDs, indexed STRING values after normalization, and analyzed TEXT tokens
+share a 255-byte term space. By default, longer values truncate at a UTF-8
+boundary at or below that limit. Values sharing the retained prefix collide:
+IDs collide for overwrite and delete, strings share exact matches, sort keys,
+and facet buckets, and text tokens become indistinguishable in queries and
+token facets. Keep IDs within that bound. Exact query values and range bounds
+truncate consistently with ingest.
+
+The stored copy, when enabled, keeps the full source bytes before normalization
+or truncation; an indexed string's column instead returns its indexed prefix.
+Column-only strings (`index: "none"`) have no term-space limit. On indexed
+STRING or TEXT, `long_terms: "reject"` opts into a per-document error for an
+over-limit normalized value or analyzed token. A rejecting variant fails the
+whole document even if its primary accepts the source. IDs always truncate.
 
 With the normal `allow_dups: false`, another document with the same ID replaces
 the old document. Replacement is whole-document replacement: fields omitted by

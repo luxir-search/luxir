@@ -21,6 +21,7 @@ namespace luxir {
 
 using FieldClass = luxir::api::FieldDef_::FieldClass;
 using IndexMode = luxir::api::FieldDef_::IndexMode;
+using LongTerms = luxir::api::FieldDef_::LongTerms;
 using VectorMetric = luxir::api::VectorMetric;
 
 // One authored (source) entry: a name plus its FieldDef view and which map it
@@ -39,6 +40,7 @@ struct ResolvedField {
   FieldClass type = FieldClass::STRING;
   bool hasIndex = false;
   IndexMode index = IndexMode::NONE;
+  std::optional<LongTerms> longTerms;
   bool hasColumn = false;
   bool column = false;
   // The authored analyzer in force: the first non-empty AnalyzerDef in the
@@ -174,6 +176,12 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   } else {
     r.hasIndex = parentResolved.hasIndex;
     r.index = parentResolved.index;
+  }
+
+  r.longTerms = def.long_terms ? def.long_terms : parentResolved.longTerms;
+  if (r.longTerms && *r.longTerms != LongTerms::TRUNCATE && *r.longTerms != LongTerms::REJECT) {
+    throw SchemaError("unknown long_terms value " + std::to_string((int)*r.longTerms) +
+                      " (field: " + std::string(name) + "); valid: truncate, reject");
   }
 
   // column
@@ -406,6 +414,16 @@ struct FieldCompiler {
         "(field: " + std::string(name) + ")");
     }
 
+    if (r.longTerms) {
+      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT) {
+        throw SchemaError("long_terms is only valid for string or text fields (field: " + std::string(name) + ")");
+      }
+      if (r.type == FieldClass::STRING && index == IndexMode::NONE) {
+        throw SchemaError("long_terms is not valid for a string field with index=none; "
+                          "there is no term space (field: " + std::string(name) + ")");
+      }
+    }
+
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
@@ -520,6 +538,7 @@ struct FieldCompiler {
         throw SchemaError("Unsupported type for field: " + std::string(name));
     }
 
+    ft->rejectLongTerms = r.longTerms == LongTerms::REJECT;
     if (r.isTemplate) ft->flags_ |= FieldType::ABSTRACT;
     // Apply any resolved storedResource_ override; empty means "keep default".
     if (!derived && !logical.storedResource.empty()) ft->storedResource_ = logical.storedResource;

@@ -1248,6 +1248,69 @@ static std::string authoredJson(const Schema& schema) {
   return json;
 }
 
+TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
+  auto s = schemaJson(R"({"templates":{
+    "_strict":{"type":"string","long_terms":"reject"},
+    "_child":{"parent":"_strict"},
+    "_loose":{"parent":"_child","long_terms":"truncate"}
+  },"fields":{
+    "plain":"string", "text":"text", "column":{"type":"string","index":"none"},
+    "inherited":{"parent":"_child"},
+    "title":{"type":"text","long_terms":"reject","variants":{
+      "s":{"parent":"_child"}, "loose":{"parent":"_child","long_terms":"truncate"}, "raw":"string"
+    }}
+  }})");
+  for (auto name : {"inherited", "title", "title__s", "dynamic_child"}) {
+    EXPECT_TRUE(s->physical(name)->rejectLongTerms) << name;
+  }
+  for (auto name : {"plain", "text", "column", "title__loose", "title__raw", "dynamic_loose", "id"}) {
+    EXPECT_FALSE(s->physical(name)->rejectLongTerms) << name;
+  }
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef out;
+  s->toProto(&out, arena);
+  EXPECT_FALSE(out.fields.at("plain")->long_terms);
+  EXPECT_FALSE(out.fields.at("inherited")->long_terms);
+  EXPECT_EQ(api::FieldDef::LongTerms::TRUNCATE, out.templates.at("_loose")->long_terms);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(out, bytes));
+  api::SchemaDef decoded;
+  ASSERT_TRUE(api::decode(decoded, api::copyToPaddedInput(bytes, arena), arena));
+  EXPECT_EQ(s->sourceDef_, Schema::fromProto(decoded)->sourceDef_);
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find("\"long_terms\":\"truncate\""));
+  EXPECT_NE(std::string::npos, json.find("\"long_terms\":\"reject\""));
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+}
+
+TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
+  for (auto policy : {"truncate", "reject"}) {
+    for (auto type : {"int", "float", "double", "date", "bin", "vector", "geo_point", "id"}) {
+      auto json = std::format(R"({{"fields":{{"{}":{{"type":"{}","long_terms":"{}"}}}}}})",
+                              std::string_view(type) == "id" ? "id" : "bad", type, policy);
+      SCOPED_TRACE(json);
+      EXPECT_THROW(schemaJson(json), SchemaError);
+    }
+    EXPECT_THROW(schemaJson(std::format(
+        R"({{"fields":{{"bad":{{"type":"string","index":"none","long_terms":"{}"}}}}}})", policy)), SchemaError);
+  }
+  for (auto json : {
+      R"({"templates":{"_s":{"type":"string","long_terms":"reject"}},"fields":{"bad":{"parent":"_s","index":"none"}}})",
+      R"({"templates":{"_s":{"type":"string","long_terms":"reject"}},"fields":{"bad":{"parent":"_s","type":"int"}}})",
+      R"({"fields":{"bad":{"type":"text","variants":{"s":{"type":"string","index":"none","long_terms":"truncate"}}}}})"}) {
+    SCOPED_TRACE(json);
+    EXPECT_THROW(schemaJson(json), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"bad":{"type":"string","long_terms":"unknown"}}})"), std::runtime_error);
+  EXPECT_THROW(schemaJson(R"({"fields":{"bad":{"type":"string","long_terms":99}}})"), std::runtime_error);
+  SchemaBuilder b;
+  b.field("bad").type = FieldClass::TEXT;
+  b.field("bad").long_terms = (api::FieldDef::LongTerms)-1;
+  EXPECT_THROW(b.build(), SchemaError);
+  // TEXT accepts the policy independently of its index mode.
+  EXPECT_NO_THROW(schemaJson(R"({"fields":{"body":{"type":"text","index":"none","long_terms":"reject"}}})"));
+}
+
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   auto s = schemaJson(R"({"fields":{
     "author":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}},

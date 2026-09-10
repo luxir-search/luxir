@@ -4,7 +4,6 @@
 #pragma once
 
 #include "luxir/schema/FieldType.h"
-#include "luxir/util/ApiError.h"
 
 namespace luxir::handler {
 
@@ -23,15 +22,11 @@ public:
 
   bool hasNormalizer() const { return normalizer != nullptr; }
 
-  std::string_view normalize(std::string_view value, std::string_view name) {
+  std::string_view normalize(std::string_view value) {
     if (normalizer) {
       normalized.assign(value);
       normalizer->normalizeTerm(normalized);
       value = normalized;
-    }
-    if (value.size() > PackedTerm::MAX_LEN) {
-      throw DocumentError(fmt::format("Field '{}': string value is {} bytes after normalization; maximum is {}",
-                                      name, value.size(), PackedTerm::MAX_LEN));
     }
     return value;
   }

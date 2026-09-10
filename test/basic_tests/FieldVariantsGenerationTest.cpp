@@ -598,4 +598,42 @@ TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsA
   }
 }
 
+TEST_F(FieldVariantsGenerationTest, longTermsPolicyChangesPreserveSignaturesAndStoredSource) {
+  std::string source(300, 'x');
+  auto checkSource = [&](CollectionHelper& helper) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery("id", "old").fields({"tag"});
+    req->execute();
+    EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("tag", source)));
+  };
+  {
+    LuxirNode node(config());
+    CollectionHelper helper(node);
+    auto before = put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true}}})");
+    ASSERT_TRUE(helper.index(flatdoc("id", "old", "tag", source), UpdateMessage::COMMIT).success);
+    checkSource(helper);
+    auto after = put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"long_terms":"reject"}}})");
+    EXPECT_EQ(before->physical("tag")->segmentFlags(), after->physical("tag")->segmentFlags());
+    EXPECT_EQ(before->signatures().at("tag").properties, after->signatures().at("tag").properties);
+    checkSource(helper); // A current reject policy cannot make the old column source-equivalent.
+    EXPECT_FALSE(helper.index(flatdoc("id", "bad", "tag", source)).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "new", "tag", "short"), UpdateMessage::COMMIT).success);
+  }
+  {
+    LuxirNode node(config());
+    CollectionHelper helper(node);
+    EXPECT_TRUE(helper.collection().getSchema()->physical("tag")->rejectLongTerms);
+    checkSource(helper);
+    auto durable = readDurableIndexInfo(helper.getIndexWriter()->dir);
+    for (const auto& signature : durable->field_signatures) EXPECT_FALSE(signature.properties.contains("long_terms"));
+    put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"long_terms":"truncate"}}})");
+    ASSERT_TRUE(helper.index(flatdoc("id", "again", "tag", source), UpdateMessage::COMMIT).success);
+    EXPECT_EQ((std::vector<std::string>{"again", "old"}), hits(helper, "tag:=" + source));
+    CollectionHelper::UpdateBuilder merge;
+    merge.commit(true, 1);
+    ASSERT_TRUE(helper.submit(merge).success);
+    checkSource(helper);
+  }
+}
+
 } // namespace luxir::test

@@ -108,6 +108,7 @@ enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
+enum class LongTerms { TRUNCATE = 0, REJECT = 1 };
 }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
@@ -206,6 +207,7 @@ struct NormalizerDef {
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
+  using LongTerms = luxir::api::FieldDef_::LongTerms;
   using Metric = luxir::api::VectorMetric;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
@@ -215,6 +217,7 @@ struct FieldDef {
   std::optional<NormalizerDef> normalizer;
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
+  std::optional<LongTerms> long_terms;                          // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
   std::optional<bool> column;                                   // align 1 (optional<bool>s)

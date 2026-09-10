@@ -129,7 +129,7 @@ public:
   }
 
   void indexSingle(Inverter& inverter, std::string_view term) {
-    appendSingle(inverter, stringValue.normalize(term, std::string_view(fieldName)));
+    appendSingle(inverter, stringValue.normalize(term));
   }
 
   void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
@@ -145,14 +145,13 @@ public:
     // Validate every value before starting a column row. A later failure must
     // not leave the row's value count or end offsets incomplete.
     if (!stringValue.hasNormalizer()) {
-      for (auto val : vals) stringValue.normalize(val, std::string_view(fieldName));
       appendMulti(inverter, vals);
       return;
     }
     std::vector<std::string> normalized;
     normalized.reserve(vals.size());
     for (auto val : vals) {
-      normalized.emplace_back(stringValue.normalize(val, std::string_view(fieldName)));
+      normalized.emplace_back(stringValue.normalize(val));
     }
     std::vector<std::string_view> views(normalized.begin(), normalized.end());
     appendMulti(inverter, views);

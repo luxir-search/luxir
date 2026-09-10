@@ -219,6 +219,13 @@ finds the same documents as a match query for `Guin!`. A literal producing zero
 terms matches nothing. Several terms are an error suggesting match, phrase,
 or a whole-value string variant.
 
+Indexed STRING values and TEXT tokens truncate to at most 255 UTF-8-safe bytes
+by default, after normalization or analysis. Exact queries, range bounds, and
+facet selections truncate consistently, so values sharing that prefix are
+indistinguishable in the index. `long_terms: "reject"` instead fails over-limit
+ingest values and exact lookups. Sorting uses the indexed string prefix; a
+stored source still returns the full value. Column-only strings are unlimited.
+
 ## Counts and top-k work
 
 `found` is opt-in. Without `get_number`, Luxir can use block score bounds and

@@ -364,17 +364,14 @@ TEST_F(QueryAnalysisTest, oversizedTextTokenTruncatesConsistently) {
   EXPECT_EQ(1, phraseTextCount("body_w", "before " + longTok + " after"));
 }
 
-TEST_F(QueryAnalysisTest, oversizedStringValueRejectedBeforeIndexing) {
-  std::string longVal(PackedTerm::MAX_LEN + 33, 'y');
-  auto result = helper.index(flatdoc("id", "d3", "tag_s", longVal), UpdateMessage::NO_COMMIT);
-  ASSERT_EQ(api::UpdateResponse_::Status::ERROR, result.status);
-  ASSERT_EQ(1u, result.errors.size());
-  EXPECT_EQ("invalid_value", result.errors[0].code);
-  EXPECT_EQ(0, matchCount("tag_s", longVal.substr(0, PackedTerm::MAX_LEN)));
-  std::string atLimit(PackedTerm::MAX_LEN, 'y');
-  ASSERT_TRUE(helper.index(flatdoc("id", "d4", "tag_s", atLimit), UpdateMessage::COMMIT).success);
-  EXPECT_EQ(1, matchCount("tag_s", atLimit));
-  EXPECT_EQ(0, matchCount("tag_s", atLimit.substr(1)));
+TEST_F(QueryAnalysisTest, oversizedStringValuesCollideOnIndexedPrefix) {
+  std::string prefix(PackedTerm::MAX_LEN, 'y');
+  ASSERT_TRUE(helper.index(flatdoc("id", "d3", "tag_s", prefix + "first"), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "d4", "tag_s", prefix + "second"), UpdateMessage::COMMIT).success);
+  // Whole values that differ only past the indexed prefix are indistinguishable.
+  EXPECT_EQ(2, matchCount("tag_s", prefix));
+  EXPECT_EQ(2, matchCount("tag_s", prefix + "anything"));
+  EXPECT_EQ(0, matchCount("tag_s", prefix.substr(1)));
 }
 
 TEST_F(QueryAnalysisTest, oversizedIdTruncatesConsistently) {

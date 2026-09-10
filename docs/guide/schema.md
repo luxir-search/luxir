@@ -143,6 +143,7 @@ posting an authored `GET` body back keeps the same definitions under either mode
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` (none take parameters yet) |
+| `long_terms` | `string` and `text`: `truncate` (default) or `reject` for normalized whole strings or analyzed tokens over 255 bytes; invalid on `string` with `index: "none"`. Use `reject` when accepting a shared prefix as the indexed value would be incorrect. |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |
 | `variants` | Map from label to another field definition receiving the same input value. Bare type strings work here too. |
 | `defaults` | `search` and `value` bindings, each naming `self` or a variant label; both default to `self`. |
@@ -284,8 +285,8 @@ POST /collections/names/_schema
 
 `author_name` uses `_name`; `author_name__s` selects its normalized string
 variant. The root is resolved before the label, so the tail `_s` never picks
-the default string template independently. These templates are opt-in; a
-whole name still has to fit the STRING limit below.
+the default string template independently. These templates are opt-in;
+long whole names follow the STRING truncation policy below.
 
 `_name` inherits `_t` for word search; a bare `type: text` would use the
 whitespace analyzer.
@@ -312,7 +313,7 @@ without clearing an inherited binding to `s` fails with a dangling-label error.
 Within a present `defaults`, an omitted binding becomes `self`.
 
 A variant's own `parent` borrows physical settings only: type, index, column,
-analyzer, normalizer, and vector settings. It does not inherit that parent's
+analyzer, normalizer, `long_terms`, and vector settings. It does not inherit that parent's
 shape, storage, variants, or defaults. Parents name authored fields or templates,
 never derived selectors.
 
@@ -336,8 +337,9 @@ POST /collections/templates/_update
 ```
 
 This indexes `book_title` and `book_title__s`. `_title` inherits `_t`'s
-case- and accent-folding analysis. Every value using `_title` must fit the
-string variant's limit; it is suitable for short text, not arbitrary bodies.
+case- and accent-folding analysis. Long titles keep their full stored source;
+the string variant indexes a truncated prefix for sorting, faceting, and exact
+lookup.
 
 ### STRING normalization and length
 
@@ -346,12 +348,26 @@ same component syntax as analyzer filters. Each input element stays one whole
 value. Normalization applies at ingest and to query literals, facet `selected`
 values, and range bounds. Absent `normalizer` inherits; `[]` clears it.
 
-STRING values over 255 bytes after normalization fail the document. This applies
-to both indexed and column-only strings and to every element of a multi-valued
-field. Values are rejected, never truncated. Exact query literals and bounds
-over the limit are errors too; pattern queries keep their own rules.
-IDs retain their existing UTF-8-safe truncation contract. Analyzed TEXT token
-length rules are separate from this whole-value STRING limit.
+Indexed STRING values truncate to at most 255 bytes after normalization,
+backing off to a UTF-8 boundary. TEXT tokens truncate the same way after
+analysis. This applies to each element or token, not the total document length.
+Exact literals, `any_of` values, range bounds, and facet `selected` values use
+the same policy; TEXT exact membership applies it to the single analyzed term.
+Patterns keep their own rules. See [term-space limits](documents.md#ids-and-replacement)
+for prefix collisions and the stored-source contract.
+
+Set `long_terms: "reject"` to fail a document containing an over-limit string
+or token and to report a teaching error for an over-limit exact lookup or bound.
+Absent `long_terms` inherits through the parent chain, otherwise defaults to
+`truncate`; explicitly setting `truncate` overrides inherited `reject`. Variants
+may set the policy or borrow it through their own `parent`; they do not inherit
+it from their logical primary. The setting, including an inherited setting, is
+invalid on other types or on a STRING with `index: "none"`. Column-only strings
+have no term-space limit. IDs always truncate.
+
+The policy can change on a live field without reindexing. Existing terms and
+stored values keep their meaning; changing to `reject` does not undo earlier
+truncation or separate colliding prefixes.
 
 ## The operations
 

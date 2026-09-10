@@ -100,7 +100,14 @@ request order with exact counts. These appended buckets are exempt from
 sub-operation results as ordinary buckets.
 
 Selection uses the facet's resolved representation for both normalization and
-refinement. With the `names` collection from the schema example:
+refinement. Indexed STRING values and TEXT tokens truncate to at most 255
+UTF-8-safe bytes by default, after normalization or analysis; shared prefixes
+collapse into one bucket. `selected` values truncate identically. With
+`long_terms: "reject"`, over-limit values fail ingest and over-limit selections
+are request errors. Column-only strings have no term-space limit but cannot
+serve field facets.
+
+With the `names` collection from the schema example:
 
 ```http
 POST /collections/names/_search

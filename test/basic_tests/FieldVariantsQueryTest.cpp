@@ -226,8 +226,17 @@ TEST_F(FieldVariantsQueryTest, normalizerAppliesToLiteralsAndPatterns) {
 }
 
 TEST_F(FieldVariantsQueryTest, exactLengthCheckedAfterNormalization) {
+  SchemaBuilder b;
+  auto& text = b.field("strict_text");
+  text.type = api::FieldDef::FieldClass::TEXT;
+  text.long_terms = api::FieldDef::LongTerms::REJECT;
+  auto& whole = b.field("strict_string");
+  whole.type = api::FieldDef::FieldClass::STRING;
+  whole.long_terms = api::FieldDef::LongTerms::REJECT;
+  b.normalizer(whole, {"nfkc_cf", "fold"});
+  b.set(helper.collection());
   std::string longValue(256, 'x');
-  for (auto field : {"author", "author__self"}) {
+  for (auto field : {"strict_string", "strict_text"}) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main").topDocs("q").exprQuery(std::string(field) + ":=" + longValue);
     req->execute(false);
@@ -235,18 +244,30 @@ TEST_F(FieldVariantsQueryTest, exactLengthCheckedAfterNormalization) {
     for (auto detail : {"expr parse error at byte", "256 bytes after normalization", "255", "whole-value"}) {
       EXPECT_NE(std::string::npos, req->errorMsg().find(detail)) << req->errorMsg();
     }
+    for (auto query : {
+        std::format(R"({{"any_of":{{"field":"{}","values":["{}"]}}}})", field, longValue),
+        std::format(R"({{"range":{{"field":"{}","gte":"{}"}}}})", field, longValue)}) {
+      auto exact = run(std::format(R"({{"query":{}}})", query));
+      EXPECT_FALSE(exact->ok());
+      EXPECT_NE(std::string::npos, exact->errorMsg().find("maximum is 255"));
+    }
+    auto selected = run(std::format(R"({{"query":{{"all":true}},"ops":{{"facet":{{
+      "field_facet":{{"field":"{}","selected":["{}"]}}
+    }}}}}})", field, longValue));
+    EXPECT_FALSE(selected->ok());
+    EXPECT_NE(std::string::npos, selected->errorMsg().find("maximum is 255"));
   }
-  for (auto query : {std::format(R"({{"match":{{"author__s":"{}"}}}})", longValue),
-                     std::format(R"({{"range":{{"field":"author","gte":"{}"}}}})", longValue)}) {
+  for (auto query : {std::format(R"({{"match":{{"strict_string":"{}"}}}})", longValue),
+                     std::format(R"({{"range":{{"field":"strict_string","gte":"{}"}}}})", longValue)}) {
     auto req = run(std::format(R"({{"query":{}}})", query));
     EXPECT_FALSE(req->ok());
     EXPECT_NE(std::string::npos, req->errorMsg().find("255")) << req->errorMsg();
   }
   std::string folded;
   for (int i = 0; i < 200; i++) folded += "\u00e9";
-  ASSERT_TRUE(helper.index(flatdoc("id", "long", "author", folded), UpdateMessage::COMMIT).success);
-  EXPECT_EQ((std::vector<std::string>{"long"}), expr("author:=\"" + folded + "\""));
-  EXPECT_TRUE(expr("author__s:" + longValue + "*").empty());
+  ASSERT_TRUE(helper.index(flatdoc("id", "long", "strict_string", folded), UpdateMessage::COMMIT).success);
+  EXPECT_EQ((std::vector<std::string>{"long"}), expr("strict_string:=\"" + folded + "\""));
+  EXPECT_TRUE(expr("strict_string:" + longValue + "*").empty());
 }
 
 TEST_F(FieldVariantsQueryTest, longIdQueriesAgreeWithIngestTruncation) {
@@ -340,6 +361,7 @@ TEST_F(FieldVariantsQueryTest, queryLengthRejectsNormalizerExpansion) {
   SchemaBuilder b;
   auto& value = b.field("normalized");
   value.type = api::FieldDef::FieldClass::STRING;
+  value.long_terms = api::FieldDef::LongTerms::REJECT;
   b.normalizer(value, {"nfkc_cf"});
   b.set(helper.collection());
   // U+0130 expands to i plus combining dot under nfkc_cf: 170 -> 255 bytes.
@@ -352,6 +374,43 @@ TEST_F(FieldVariantsQueryTest, queryLengthRejectsNormalizerExpansion) {
   req->execute(false);
   EXPECT_FALSE(req->ok());
   EXPECT_NE(std::string::npos, req->errorMsg().find("258 bytes after normalization")) << req->errorMsg();
+}
+
+TEST_F(FieldVariantsQueryTest, longTermsTruncateAfterNormalizationAcrossValueOperations) {
+  SchemaBuilder b;
+  auto& whole = b.field("whole");
+  whole.type = api::FieldDef::FieldClass::STRING;
+  b.normalizer(whole, {"nfkc_cf"});
+  auto& text = b.field("token");
+  text.type = api::FieldDef::FieldClass::TEXT;
+  b.analyzer(text, "whitespace", {"nfkc_cf"});
+  b.set(helper.collection());
+  // Normalization expands a 255-byte input to 256 bytes. Truncation must
+  // then back off the split combining mark, leaving 254 complete UTF-8 bytes.
+  std::string input = std::string(253, 'X') + "\xc4\xb0";
+  std::string prefix = std::string(253, 'x') + "i";
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "first", "whole", input, "token", "before " + input + " after"),
+    flatdoc("id", "second", "whole", input + "tail", "token", input + "tail")
+  }, UpdateMessage::COMMIT).success);
+  for (auto field : {"whole", "token"}) {
+    SCOPED_TRACE(field);
+    for (auto value : {input, input + "anything", prefix}) {
+      auto expected = std::vector<std::string>{"first", "second"};
+      EXPECT_EQ(expected, expr(std::string(field) + ":=\"" + value + "\""));
+      EXPECT_EQ(expected, hits(std::format(R"({{"match":{{"{}":"{}"}}}})", field, value)));
+      EXPECT_EQ(expected, hits(std::format(R"({{"any_of":{{"field":"{}","values":["{}","{}"]}}}})", field, value, prefix)));
+      EXPECT_EQ(expected, hits(std::format(R"({{"range":{{"field":"{}","gte":"{}","lte":"{}"}}}})", field, value, value)));
+      EXPECT_TRUE(hits(std::format(R"({{"range":{{"field":"{}","gt":"{}","lte":"{}"}}}})", field, value, value)).empty());
+      auto req = run(std::format(R"({{"query":{{"all":true}},"fields":["id"],"limit":-1,"ops":{{
+        "selected":{{"field_facet":{{"field":"{}","limit":0,"selected":["{}","{}"]}}}}
+      }}}})", field, value, prefix));
+      EXPECT_EQ(expected, ids(*req));
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{{prefix, 2}}),
+                buckets(*req->docList()->ops.at("selected")->facetResult()));
+    }
+  }
 }
 
 TEST_F(FieldVariantsQueryTest, exactVariablesAndExplainDoNotMutateInput) {

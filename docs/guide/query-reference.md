@@ -71,8 +71,8 @@ The HTTP dialect also accepts the field-name form:
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
 
 Text values are analyzed with the resolved field analyzer. String values use
-their normalizer, if configured, and match as exact terms; IDs retain their
-truncation contract. Numeric and date values are coerced through the same
+their normalizer, if configured, and match as exact terms using their
+`long_terms` policy; IDs always truncate. Numeric and date values are coerced through the same
 rules as indexing and matched through their columns.
 
 ## Exact membership (`any_of`)
@@ -112,10 +112,12 @@ looks up `guin` and matches `b1` and `b3`, just like `"Guin"` or a match query
 for `Guin!`. A literal producing zero terms matches nothing; `"Le Guin"`
 produces several terms and is an error.
 
-Exact STRING literals and bounds over 255 bytes after normalization are
-rejected, as are overlong TEXT term bounds. For TEXT exact membership, the
-255-byte limit applies to the analyzed lookup term.
-IDs still truncate. The expression forms are `field:=value` and
+Exact STRING literals and STRING/TEXT bounds truncate to at most 255 UTF-8-safe
+bytes after normalization by default. For TEXT exact membership, truncation
+applies to the single analyzed lookup term. `long_terms: "reject"` makes these
+over-limit values teaching errors instead. The same policy applies to ingest
+and facet selections; values sharing a truncated prefix match the same terms.
+IDs always truncate. The expression forms are `field:=value` and
 `field:=(v1, v2)`; see [exact values](query-language.md#exact-values).
 
 ## Boolean

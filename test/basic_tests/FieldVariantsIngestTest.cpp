@@ -16,13 +16,14 @@ using Status = api::UpdateResponse_::Status;
 
 class FieldVariantsIngestTest : public LuxirTest {
 protected:
-  static void authorSchema(CollectionHelper& helper, bool multi = false) {
+  static void authorSchema(CollectionHelper& helper, bool multi = false, bool reject = false) {
     SchemaBuilder b;
     auto& author = b.field("author");
     author.type = FieldClass::TEXT;
     author.multi = multi;
     auto& s = b.variant(author, "s");
     s.type = FieldClass::STRING;
+    if (reject) s.long_terms = api::FieldDef::LongTerms::REJECT;
     b.normalizer(s, {"nfkc_cf", "fold"});
     b.set(helper.collection());
   }
@@ -235,6 +236,7 @@ TEST_F(FieldVariantsIngestTest, normalizedLengthLimitAndRecoveryForBothStringLay
     value.type = FieldClass::STRING;
     value.multi = true;
     value.index = indexed ? api::FieldDef::IndexMode::MATCH : api::FieldDef::IndexMode::NONE;
+    if (indexed) value.long_terms = api::FieldDef::LongTerms::REJECT;
     b.normalizer(value, {"nfkc_cf", "fold"});
     b.set(helper.collection());
     // UTF-8 e-acute folds from 256 source bytes to 128 bytes.
@@ -243,14 +245,16 @@ TEST_F(FieldVariantsIngestTest, normalizedLengthLimitAndRecoveryForBothStringLay
     std::string shrinking(254, 'x');
     shrinking += "\xc4\xb0"; // dotted capital I becomes i + combining dot, then fold removes the dot
     CollectionHelper::UpdateBuilder batch;
-    batch.add(flatdoc("id", "bad", "value", std::vector<std::string>{"first", std::string(256, 'x')}));
+    if (indexed) batch.add(flatdoc("id", "bad", "value", std::vector<std::string>{"first", std::string(256, 'x')}));
     batch.add(flatdoc("id", "good", "value", std::vector<std::string>{"CAFE", accents, std::string(255, 'x'), shrinking}));
     batch.commit();
     auto result = helper.submit(batch);
-    ASSERT_EQ(Status::PARTIAL, result.status);
-    ASSERT_EQ(1u, result.errors.size());
-    EXPECT_EQ("invalid_value", result.errors[0].code);
-    EXPECT_NE(std::string::npos, result.errors[0].error_message.find("maximum is 255"));
+    ASSERT_EQ(indexed ? Status::PARTIAL : Status::OK, result.status);
+    if (indexed) {
+      ASSERT_EQ(1u, result.errors.size());
+      EXPECT_EQ("invalid_value", result.errors[0].code);
+      EXPECT_NE(std::string::npos, result.errors[0].error_message.find("maximum is 255"));
+    }
     auto req = localReq(helper.getSearchEngine());
     req->collection("main").topDocs("q").allQuery().fields({"id", "value"});
     req->execute();
@@ -270,18 +274,75 @@ TEST_F(FieldVariantsIngestTest, normalizationCanExpandPastLimit) {
     auto& field = b.field(name);
     field.type = FieldClass::STRING;
     if (std::string_view(name) == "column") field.index = api::FieldDef::IndexMode::NONE;
+    else field.long_terms = api::FieldDef::LongTerms::REJECT;
     b.normalizer(field, {"nfkc_cf"});
   }
   b.set(helper.collection());
   std::string value = std::string(253, 'x') + "\xc4\xb0"; // 255 bytes -> 256 after folding
   for (auto name : {"indexed", "column"}) {
-    auto result = helper.index(flatdoc(name, value), UpdateMessage::NO_COMMIT);
-    ASSERT_EQ(Status::ERROR, result.status);
-    ASSERT_EQ(1u, result.errors.size());
-    EXPECT_NE(std::string::npos, result.errors[0].error_message.find("256 bytes after normalization"));
+    auto result = helper.index(flatdoc("id", name, name, value), UpdateMessage::NO_COMMIT);
+    if (std::string_view(name) == "column") {
+      ASSERT_EQ(Status::OK, result.status);
+    } else {
+      ASSERT_EQ(Status::ERROR, result.status);
+      ASSERT_EQ(1u, result.errors.size());
+      EXPECT_NE(std::string::npos, result.errors[0].error_message.find("256 bytes after normalization"));
+    }
   }
   ASSERT_TRUE(helper.index(flatdoc("indexed", "OK", "column", "OK"), UpdateMessage::COMMIT).success);
   EXPECT_EQ(1u, match(helper, "indexed", "ok").size());
+  EXPECT_TRUE(containsDoc(match(helper, "id", "column", {"column"}),
+                          flatdoc("column", std::string(253, 'x') + "i\xcc\x87")));
+}
+
+TEST_F(FieldVariantsIngestTest, rejectedTextRemainsFlushableAndAccountsRetainedMemory) {
+  RAMDir dir;
+  SchemaBuilder b;
+  auto& body = b.field("body");
+  body.type = FieldClass::TEXT;
+  body.long_terms = api::FieldDef::LongTerms::REJECT;
+  auto schema = b.build();
+  Inverter inv(dir, 1, [schema] { return schema; });
+  auto& input = inv.getIndexHandler("body");
+  std::string text;
+  for (int i = 0; i < 1000; i++) text += "word" + std::to_string(i) + " ";
+  text += std::string(256, 'x');
+  inv.startDoc();
+  auto before = inv.memSize() - inv.pool.size();
+  EXPECT_THROW(input.index(inv, std::string_view(text)), DocumentError);
+  EXPECT_GT(inv.memSize() - inv.pool.size(), before);
+  inv.deleteDoc(inv.getDoc());
+  inv.finishDoc();
+  inv.startDoc();
+  input.index(inv, std::string_view("valid"));
+  inv.finishDoc();
+  EXPECT_TRUE(inv.flush()); // Deleted partial postings still need their norm.
+  EXPECT_EQ(1, inv.liveDocs);
+}
+
+TEST_F(FieldVariantsIngestTest, textRejectChecksAnalyzedTokensAndRecovers) {
+  CollectionHelper helper("main");
+  SchemaBuilder b;
+  auto& body = b.field("body");
+  body.type = FieldClass::TEXT;
+  body.long_terms = api::FieldDef::LongTerms::REJECT;
+  b.analyzer(body, "whitespace", {"nfkc_cf"});
+  b.set(helper.collection());
+  std::string expanding = std::string(253, 'x') + "\xc4\xb0";
+  std::string manyWords;
+  for (int i = 0; i < 300; i++) manyWords += "word ";
+  CollectionHelper::UpdateBuilder batch;
+  batch.add(flatdoc("id", "bad", "body", "before " + expanding));
+  batch.add(flatdoc("id", "good", "body", manyWords + std::string(255, 'x'))).commit();
+  auto result = helper.submit(batch);
+  ASSERT_EQ(Status::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ("invalid_value", result.errors[0].code);
+  for (auto detail : {"Field 'body'", "text token", "256 bytes after analysis", "maximum is 255"}) {
+    EXPECT_NE(std::string::npos, result.errors[0].error_message.find(detail));
+  }
+  EXPECT_TRUE(match(helper, "body", "before").empty());
+  EXPECT_EQ(1u, match(helper, "body", std::string(255, 'x')).size());
 }
 
 TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysicalOrder) {
@@ -384,7 +445,7 @@ TEST_F(FieldVariantsIngestTest, logicalCardinalityIsCheckedBeforeStorageAndFanou
 
 TEST_F(FieldVariantsIngestTest, storedAuthorSurvivesLaterStringBranchFailure) {
   CollectionHelper helper("main");
-  authorSchema(helper);
+  authorSchema(helper, false, true);
   CollectionHelper::UpdateBuilder batch;
   batch.add(flatdoc("id", "same", "author", std::string(256, 'x')));
   batch.add(flatdoc("id", "same", "author", "Valid Author"));

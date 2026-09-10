@@ -299,7 +299,7 @@ private:
   }
 
   static void checkExactLength(const ResolvedFieldHandle& target, std::string_view text) {
-    if (text.size() > PackedTerm::MAX_LEN) {
+    if (target.fieldType->rejectLongTerms && text.size() > PackedTerm::MAX_LEN) {
       throw std::runtime_error(std::format(
           "Field '{}': exact value is {} bytes after normalization; maximum is {}. "
           "Use match/phrase for analyzed text or a shorter whole-value string variant",
@@ -466,6 +466,7 @@ public:
                 field));
           }
           checkExactLength(target, term);
+          term = PackedTerm::truncate(term);
         } else {
           term = normalizeLiteral(target, term, true);
           if (term.data() == buf) term = poolCopy(term);
@@ -546,7 +547,10 @@ public:
     // ID indexing, overwrite, and delete-by-ID share this term-space policy.
     if (target.fieldType->type() == FieldType::ID) return PackedTerm::truncate(text);
     if (auto* chain = fields.chain(target)) text = normalizeMultiterm(*chain, text);
-    if (exact) checkExactLength(target, text);
+    if (exact && (target.fieldType->type() != FieldType::STRING || target.fieldType->indexed())) {
+      checkExactLength(target, text);
+      text = PackedTerm::truncate(text);
+    }
     return text;
   }
 

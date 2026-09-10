@@ -987,12 +987,13 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     }
 
     for (auto& [resourceName, reqs] : storedByResource) {
-      // Only plain single-valued STRING columns are source-equivalent.
-      // ID can truncate, and STRING normalization or multi-value columns
-      // can change the source. Any such member forces the whole chunk path.
+      // Only plain single-valued column-only STRING values are source-equivalent.
+      // Indexed strings can contain truncation from an earlier schema even if
+      // the current policy rejects long terms. Any such member needs the source.
       bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
         return r.fieldType->type() == FieldType::STRING && !r.multi
             && r.fieldType->hasColumn()
+            && !r.fieldType->indexed()
             && !static_cast<StrFieldType*>(r.fieldType)->normalizer;
       });
       if (useColumns) {

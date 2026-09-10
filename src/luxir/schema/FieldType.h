@@ -74,6 +74,8 @@ public:
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
+  // Admission/query policy only, never part of segment flags or field signatures.
+  bool rejectLongTerms = false;
   // When STORED is set, raw values are routed to the stored-fields resource
   // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Shared by
   // TEXT, STRING, and ID.  Ignored by field types that don't support STORED.

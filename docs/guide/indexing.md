@@ -204,9 +204,13 @@ engine fault stopped is reported the same way with kind `internal`.
 
 A value rejected by any variant fails the entire document. The message names
 the logical field, branch label (`self` for the primary), and cause. For example,
-a 256-byte normalized string in the author example fails branch `s`, even if
-the TEXT primary accepted it. STRING values are limited to 255 bytes after
-normalization, for indexed and column-only fields alike; IDs still truncate.
+if the author example's `s` variant sets `long_terms: "reject"`, a 256-byte
+normalized string fails branch `s` even if the TEXT primary accepted it.
+By default, indexed STRING values truncate after normalization and TEXT tokens
+truncate after analysis to at most 255 UTF-8-safe bytes. The stored source
+keeps the full value. Column-only strings have no term-space limit; IDs always
+truncate. See [term-space limits](documents.md#ids-and-replacement) for prefix
+collisions and the opt-in reject policy.
 
 The response status is:
 
