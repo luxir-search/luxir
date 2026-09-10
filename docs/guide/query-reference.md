@@ -121,9 +121,10 @@ base36 hash characters. Terms of 255 bytes or less are unchanged. Ingest,
 exact queries, range bounds, and facet selections transform identically.
 
 `truncate` restores the old merge of shared 255-byte prefixes; `reject` fails
-the document and makes over-limit lookup terms teaching errors. Policies are
-immutable once data exists. Sorts and ranges compare the hash suffix after the
-kept prefix, so source-tail order is lost. Hashing is not attack-resistant.
+the document and makes over-limit lookup terms teaching errors. Policy edits do
+not validate or rewrite existing terms; use a new field or variant label and
+reindex to change the policy safely. Sorts and ranges compare the hash suffix
+after the kept prefix, so source-tail order is lost. Hashing is not attack-resistant.
 Term enumeration and facets return the stored hash term; its digits and
 lowercase letters pass through normalizers and analyzers unchanged, so it can be
 resubmitted as an exact value or `selected` entry. See

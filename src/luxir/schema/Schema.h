@@ -63,8 +63,7 @@ public:
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
-  // Concrete and template physical identities, plus materialized dynamic names
-  // whose introduction differs from the current template's introduction.
+  // Introduction generations for declared concrete and template representations.
   std::map<std::string, uint64_t, std::less<>> introducedGen;
 
 private:
@@ -90,8 +89,7 @@ public:
   FieldType* physical(std::string_view name) const;
 
   FieldSignatures signatures(bool includeTemplates = false) const;
-  void addRootSignatures(std::string_view root, FieldSignatures& out) const;
-  void inheritIntroductions(const Schema* previous, const FieldSignatures& materialized);
+  void inheritIntroductions(const Schema* previous);
   uint64_t introduction(std::string_view physicalName) const;
   std::string encodeStored() const;
   static std::shared_ptr<Schema> decodeStored(std::span<const std::byte> bytes);

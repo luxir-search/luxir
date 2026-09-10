@@ -230,9 +230,10 @@ Prefixes longer than the kept prefix return a superset by falling back to that
 prefix. Wildcard and regex queries also fall back when their common leading
 literal prefix exceeds the limit; other patterns see stored term bytes.
 `truncate` restores the old shared-prefix merges; `reject` fails documents and
-over-limit query terms. The policy is immutable once data exists. Hashing is
-not attack-resistant. Facets and term enumeration return stored hash terms;
-a stored source still returns the full value. Column-only strings are unlimited.
+over-limit query terms. Policy edits do not validate or rewrite existing terms;
+use a new field or variant label and reindex to change the policy safely.
+Hashing is not attack-resistant. Facets and term enumeration return stored hash
+terms; a stored source still returns the full value. Column-only strings are unlimited.
 See [term-space limits](documents.md#ids-and-replacement), including when to use
 the full source value instead of a returned hash term in a query or selection.
 

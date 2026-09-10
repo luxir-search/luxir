@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "FieldSignature.h"
-#include "luxir/api/build.h"
-#include "luxir/schema/Schema.h"
 #include <glaze/glaze.hpp>
 
 namespace luxir {
@@ -48,50 +46,6 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
     properties["normalize_on_write"] = vector->normalizeOnWrite() ? "true" : "false";
     properties["normalized"] = vector->metric() == VectorFieldType::METRIC_COSINE && vector->normalized()
         ? "true" : "false";
-  }
-}
-
-FieldSignature::FieldSignature(const api::PhysicalFieldSignature& wire)
-    : logicalName(wire.logical_name), label(wire.label) {
-  for (const auto& [key, value] : wire.properties) properties.emplace(key, value);
-}
-
-api::PhysicalFieldSignature FieldSignature::toWire(
-    std::string_view name, std::pmr::memory_resource& arena) const {
-  api::PhysicalFieldSignature result;
-  result.name = api::build::arenaStr(arena, name);
-  result.logical_name = api::build::arenaStr(arena, logicalName);
-  result.label = api::build::arenaStr(arena, label);
-  using Pair = std::pair<std::string_view, std::string_view>;
-  std::span<const Pair> entries;
-  auto* values = api::build::allocArray(entries, properties.size(), arena);
-  size_t i = 0;
-  for (const auto& [key, value] : properties) {
-    values[i++] = {api::build::arenaStr(arena, key), api::build::arenaStr(arena, value)};
-  }
-  result.properties = api::map_view<std::string_view, std::string_view>(entries);
-  return result;
-}
-
-void FieldSignature::checkCompatible(std::string_view name, const FieldSignature& candidate) const {
-  auto fail = [&](std::string_view property, std::string_view before, std::string_view after) {
-    throw SchemaError("Physical field '" + std::string(name) + "' cannot change " + std::string(property) +
-        " from " + std::string(before) + " to " + std::string(after) +
-        "; use a new field or variant label and reindex to change its representation");
-  };
-  if (logicalName != candidate.logicalName) fail("logical owner", logicalName, candidate.logicalName);
-  if (label != candidate.label) fail("label", label, candidate.label);
-  // Type first gives a useful explanation even when other properties also differ.
-  if (properties.at("type") != candidate.properties.at("type")) {
-    fail("type", properties.at("type"), candidate.properties.at("type"));
-  }
-  for (const auto& [property, before] : properties) {
-    auto it = candidate.properties.find(property);
-    if (it == candidate.properties.end()) fail(property, before, "absent");
-    if (it->second != before) fail(property, before, it->second);
-  }
-  for (const auto& [property, after] : candidate.properties) {
-    if (!properties.contains(property)) fail(property, "absent", after);
   }
 }
 

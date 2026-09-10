@@ -571,7 +571,7 @@ TEST_F(FieldVariantsProjectionTest, logicalCatalogUsesSchemaIdentityAndPrimaryPr
   author.stored = false;
   auto other = b.build(schema.get());
   other->gen_ = schema->gen_;  // identity must distinguish equal generations
-  helper.getIndexWriter()->publishSchema(other, [] {});
+  helper.getIndexWriter()->setSchema(other);
   auto replacement = helper.getIndexWriter()->getIndexReader(UINT64_MAX);
   EXPECT_EQ(schema, reader->schema());
   EXPECT_EQ(other, replacement->schema());
@@ -755,21 +755,6 @@ TEST_F(DocFormatTest, readerCapturesSchemaAfterPhysicalOpen) {
   EXPECT_NE(published, before->schema());
   EXPECT_GT(after->commitTime(), before->commitTime());
   EXPECT_EQ(after, writer->getIndexReader());
-}
-
-TEST_F(DocFormatTest, failedSchemaPublicationKeepsReaderAndIngestSchema) {
-  CollectionHelper ch;
-  auto writer = ch.getIndexWriter();
-  auto reader = writer->getIndexReader();
-  SchemaBuilder b;
-  b.field("added").type = api::FieldDef::FieldClass::STRING;
-  auto candidate = b.build(reader->schema().get());
-  EXPECT_THROW(writer->publishSchema(candidate, [] { throw std::runtime_error("publish failed"); }),
-               std::runtime_error);
-  EXPECT_EQ(reader, writer->getIndexReader());
-  auto& inverter = writer->obtainInverter();
-  EXPECT_EQ(reader->schema(), inverter.schema);
-  writer->releaseInverter(inverter);
 }
 
 TEST_F(DocFormatTest, emptyStringAndVectorSelectorsKeepColumnsEmpty) {

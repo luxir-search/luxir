@@ -1301,7 +1301,7 @@ message FieldDef {
   NormalizerDef normalizer = 15;
 
   // STRING values after normalization, TEXT tokens after analysis, and IDs.
-  // Not valid on column-only STRING. Immutable once data exists.
+  // Not valid on column-only STRING. Edits do not rewrite existing terms.
   enum LongTerms {
     TRUNCATE = 0;
     REJECT = 1;

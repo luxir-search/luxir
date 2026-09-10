@@ -120,8 +120,9 @@ Full-value lookups, range bounds, and facet selections transform identically
 to ingest. Sorts and ranges preserve source order only up to the kept prefix.
 
 `truncate` restores the old shared-prefix merges; `reject` fails documents and
-makes over-limit lookup terms teaching errors. The policy cannot change once
-the physical field has data. The hash is not attack-resistant. For exact
+makes over-limit lookup terms teaching errors. Policy edits do not validate or
+rewrite existing terms; use a new field or variant label and reindex to change
+the policy safely. The hash is not attack-resistant. For exact
 encoding and returned-term normalization caveats, see
 [term-space limits](documents.md#ids-and-replacement).
 

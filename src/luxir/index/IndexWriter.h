@@ -4,7 +4,6 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <deque>
 #include <optional>
 #include <string>
@@ -109,19 +108,15 @@ inline std::string format_as(const SegInfo& seg) {
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
 class IndexWriter {
-  // Set once under indexMutex, never cleared. Atomic for advisory readers.
+  // Set once when closing, never cleared.
   std::atomic<bool> closed = false;
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
-  // Installed under indexMutex after durable schema publication succeeds.
-  std::shared_ptr<Schema> currentSchema;
+  // Installed after the collection persists the schema.
+  std::atomic<std::shared_ptr<Schema>> currentSchema;
   // Release-stored after currentSchema; search compares without taking indexMutex.
   std::atomic<const Schema*> schemaIdentity;
-  // Protected by indexMutex, shared with schema publication and admission.
-  FieldSignatures fieldSignatures;
-  std::map<uint64_t, std::shared_ptr<Schema>> admittedSchemas;
-  std::condition_variable schemaCondition;
-  bool schemaPublishing = false;
+  // Protected by indexMutex.
   std::optional<uint64_t> oldestCommittedSchemaGen;
 
 public:
@@ -570,14 +565,12 @@ public:
   }
 
 
-  // Obtains an inverter for writing documents and sets it's updateVersion.
-  // Messages supply their admission pin. Direct clients omit it and pin the
-  // current schema at acquisition under the same publication mutex.
+  // Obtains an inverter for writing documents and sets its updateVersion.
+  // Messages supply their admission pin. Without a pin, use the current schema.
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
 
-  // Validation and the durable schema publication callback run under the same
-  // mutex as admission. Install the writer's schema only after publish succeeds.
-  void publishSchema(std::shared_ptr<Schema> candidate, const std::function<void()>& publish);
+  // Collection serializes schema changes and persists before handing them off.
+  void setSchema(std::shared_ptr<Schema> schema);
   std::string resolvedSchema();
 
   // Releases an inverter back to the pool.
@@ -591,7 +584,6 @@ public:
   void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
 
 private:
-  void awaitSchemaAdmission(std::unique_lock<std::mutex>& lock);
   void requestPressureCheck() noexcept;
   void pressureCheckBody();
   void pressureShedIdleLocked();
@@ -624,14 +616,7 @@ private:
     if (closed.load(std::memory_order_relaxed)) {
       throw IndexWriterClosedError("index writer is closed");
     }
-    {
-      std::unique_lock<std::mutex> lock(indexMutex);
-      awaitSchemaAdmission(lock);
-      msg.schema = currentSchema;
-      // Allocate before consuming a sequencer number. This is the admission
-      // linearization point, ordered with Collection's durable publication.
-      admittedSchemas.emplace(updateNumber.load(std::memory_order_relaxed) + 1, msg.schema);
-    }
+    msg.schema = currentSchema.load();
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
     msg.updateOrdinal = updateOrdinal++;
@@ -671,9 +656,6 @@ private:
       msg.result.setException(e);
       // message should continue flowing to finishUpdateBody so the sequencers stay happy.
     }
-    std::lock_guard<std::mutex> lock(indexMutex);
-    admittedSchemas.erase(msg.updateVersion);
-    if (schemaPublishing) schemaCondition.notify_all();
   }
 
   void finishUpdateBody(UpdateMessage& msg) {

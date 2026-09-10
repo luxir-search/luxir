@@ -5,10 +5,10 @@
 #include "test/HttpReq.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/util/Signal.h"
-#include <array>
 #include <filesystem>
 #include <future>
 #include <latch>
@@ -30,13 +30,12 @@ protected:
     return config;
   }
 
-  static std::shared_ptr<Schema> put(Collection& collection, std::string_view json,
-                                   api::SchemaRequest_::Mode mode = api::SchemaRequest_::Mode::SET) {
+  static std::shared_ptr<Schema> put(Collection& collection, std::string_view json) {
     std::pmr::monotonic_buffer_resource arena;
     api::SchemaDef def;
     std::string error;
     if (!api::read_json(def, json, arena, &error)) throw std::runtime_error(error);
-    return collection.updateSchema(def, mode);
+    return collection.updateSchema(def, api::SchemaRequest_::Mode::SET);
   }
 
   static Json view(IndexWriter& writer) {
@@ -53,20 +52,6 @@ protected:
     for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
     std::sort(ids.begin(), ids.end());
     return ids;
-  }
-
-  static void rejected(Collection& collection, std::string_view json,
-                       std::string_view field, std::string_view property) {
-    auto before = collection.getSchema();
-    try {
-      put(collection, json);
-      FAIL() << "Incompatible schema accepted";
-    } catch (const SchemaError& e) {
-      EXPECT_NE(std::string::npos, std::string(e.what()).find(field)) << e.what();
-      EXPECT_NE(std::string::npos, std::string(e.what()).find(property)) << e.what();
-      EXPECT_NE(std::string::npos, std::string(e.what()).find("reindex")) << e.what();
-    }
-    EXPECT_EQ(before, collection.getSchema());
   }
 };
 
@@ -125,8 +110,6 @@ TEST_F(FieldVariantsGenerationTest, cachedRootVariantCoverageSurvivesReopenAndMe
     LuxirNode node(config());
     CollectionHelper helper(node);
     EXPECT_EQ(introduced, readDurableIndexInfo(helper.getIndexWriter()->dir)->segments[0].schema_gen);
-    rejected(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"text"}}}})",
-             "author__s", "type");
   }
 }
 
@@ -145,44 +128,17 @@ public:
   }
   void done(IndexWriter&) override { finished.count_down(); }
   void unpause() { if (!resume.try_wait()) resume.count_down(); }
-  void finish() { unpause(); finished.wait(); }
 };
 
-// Observe real publication/admission transitions without timing sleeps or
-// blocking the writer mutex in the listener.
-class SchemaPublicationProbe {
-  IndexWriter& writer;
-  std::promise<void> quiescingPromise;
-  std::promise<void> admissionPromise;
-  std::future<void> quiescing = quiescingPromise.get_future();
-  std::future<void> admission = admissionPromise.get_future();
-  std::atomic<bool> sawQuiesce = false;
-  std::atomic<int> admissionWaits = 0;
-public:
-  explicit SchemaPublicationProbe(IndexWriter& writer) : writer(writer) {
-    Signal::listen("schemaQuiesce", [this](void* source, void*, void*) -> void* {
-      if (source == &this->writer && !sawQuiesce.exchange(true)) quiescingPromise.set_value();
-      return nullptr;
-    });
-    Signal::listen("schemaAdmissionWait", [this](void* source, void*, void*) -> void* {
-      if (source == &this->writer && admissionWaits.fetch_add(1) == 0) admissionPromise.set_value();
-      return nullptr;
-    });
-  }
-  ~SchemaPublicationProbe() {
-    Signal::unlisten("schemaQuiesce");
-    Signal::unlisten("schemaAdmissionWait");
-  }
-  int waitingAdmissions() const { return admissionWaits.load(); }
-  bool waitQuiescing() { return quiescing.wait_for(std::chrono::seconds(5)) == std::future_status::ready; }
-  bool waitAdmission() { return admission.wait_for(std::chrono::seconds(5)) == std::future_status::ready; }
-};
-
-TEST_F(FieldVariantsGenerationTest, admissionPinsBeforePublicationEvenWhenAcquisitionIsDelayed) {
+TEST_F(FieldVariantsGenerationTest, admissionPinsBeforeSchemaEditEvenWhenAcquisitionIsDelayed) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto writer = helper.getIndexWriter();
-  auto before = put(helper.collection(), R"({"fields":{"author":"text"}})");
+  SchemaBuilder b;
+  auto& author = b.field("author");
+  author.type = api::FieldDef::FieldClass::TEXT;
+  b.analyzer(author, "whitespace", {"lowercase"});
+  auto before = b.set(helper.collection());
   CollectionHelper::UpdateBuilder docs;
   docs.add(flatdoc("id", "old", "author", "Le Guin"));
   PausedSchemaUpdate paused(docs.finish());
@@ -190,10 +146,12 @@ TEST_F(FieldVariantsGenerationTest, admissionPinsBeforePublicationEvenWhenAcquis
   paused.entered.wait();
   EXPECT_EQ(before, paused.schema);
   auto publication = std::async(std::launch::async, [&] {
-    return put(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"string"}}}})");
+    b.analyzer(author, "keyword", {"lowercase"});
+    b.variant(author, "s").type = api::FieldDef::FieldClass::STRING;
+    return b.set(helper.collection());
   });
   bool ready = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-  EXPECT_TRUE(ready) << "A pure addition must not wait for the old message";
+  EXPECT_TRUE(ready) << "A schema edit must not wait for the old message";
   if (!ready) paused.unpause();
   auto after = publication.get();
   // The next message is admitted while the old message is still paused.
@@ -211,209 +169,11 @@ TEST_F(FieldVariantsGenerationTest, admissionPinsBeforePublicationEvenWhenAcquis
   EXPECT_FALSE(next.result.errored()) << next.result.what();
   helper.commit();
   EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author__s:*"));
+  EXPECT_EQ((std::vector<std::string>{"old"}), hits(helper, "author:=guin"));
+  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author:=\"le guin\""));
   auto durable = readDurableIndexInfo(writer->dir);
   ASSERT_EQ(2u, durable->segments.size());
   EXPECT_NE(durable->segments[0].schema_gen, durable->segments[1].schema_gen);
-}
-
-TEST_F(FieldVariantsGenerationTest, templateEditQuiescesUnrelatedMessageAndBlocksNewAdmission) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  auto before = put(helper.collection(), R"({"templates":{"_edit":{"type":"text",
-    "analyzer":{"tokenizer":"whitespace","filters":["lowercase"]}}}})");
-  CollectionHelper::UpdateBuilder docs;
-  docs.add(flatdoc("id", "old", "keep_w", "Old Word"));
-  PausedSchemaUpdate old(docs.finish());
-  ASSERT_TRUE(writer->submitUpdate(&old));
-  old.entered.wait();
-  SchemaPublicationProbe probe(*writer);
-  auto publication = std::async(std::launch::async, [&] {
-    return put(helper.collection(), R"({"templates":{"_edit":{"type":"text",
-      "analyzer":{"tokenizer":"keyword","filters":["lowercase"]}}}})");
-  });
-  EXPECT_TRUE(probe.waitQuiescing());
-  EXPECT_EQ(std::future_status::timeout, publication.wait_for(std::chrono::seconds(0)));
-  CollectionHelper::UpdateBuilder newDocs;
-  newDocs.add(flatdoc("id", "new", "city_edit", "New Word"));
-  PausedSchemaUpdate next(newDocs.finish());
-  EXPECT_TRUE(writer->submitUpdate(&next));
-  EXPECT_TRUE(probe.waitAdmission());
-  old.finish();
-  auto after = publication.get();
-  next.entered.wait();
-  EXPECT_EQ(before, old.schema);
-  EXPECT_EQ(after, next.schema);
-  next.finish();
-  EXPECT_FALSE(old.result.errored()) << old.result.what();
-  EXPECT_FALSE(next.result.errored()) << next.result.what();
-  helper.commit();
-  EXPECT_EQ((std::vector<std::string>{"old"}), hits(helper, "keep_w:Word"));
-  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "city_edit:=\"new word\""));
-  auto durable = readDurableIndexInfo(writer->dir);
-  ASSERT_EQ(2u, durable->segments.size());
-  EXPECT_EQ(before->gen_, durable->segments[0].schema_gen);
-  EXPECT_EQ(after->gen_, durable->segments[1].schema_gen);
-}
-
-TEST_F(FieldVariantsGenerationTest, templateEditRejectsRootMaterializedDuringQuiesce) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  auto before = put(helper.collection(), R"({"templates":{"_edit":{"type":"text",
-    "analyzer":{"tokenizer":"whitespace","filters":["lowercase"]}}}})");
-  CollectionHelper::UpdateBuilder docs;
-  docs.add(flatdoc("id", "old", "city_edit", "Old Word"));
-  PausedSchemaUpdate old(docs.finish());
-  ASSERT_TRUE(writer->submitUpdate(&old));
-  old.entered.wait();
-  SchemaPublicationProbe probe(*writer);
-  auto publication = std::async(std::launch::async, [&] {
-    return put(helper.collection(), R"({"templates":{"_edit":{"type":"text",
-      "analyzer":{"tokenizer":"keyword","filters":["lowercase"]}}}})");
-  });
-  EXPECT_TRUE(probe.waitQuiescing());
-  EXPECT_EQ(std::future_status::timeout, publication.wait_for(std::chrono::seconds(0)));
-  old.finish();
-  try {
-    publication.get();
-    FAIL() << "The drained message materialized an incompatible root";
-  } catch (const SchemaError& e) {
-    EXPECT_NE(std::string::npos, std::string(e.what()).find("city_edit"));
-    EXPECT_NE(std::string::npos, std::string(e.what()).find("analyzer"));
-  }
-  EXPECT_EQ(before, helper.collection().getSchema());
-  EXPECT_FALSE(old.result.errored()) << old.result.what();
-  // Rejection reopens admission and leaves the old analysis intact.
-  ASSERT_TRUE(helper.index(flatdoc("id", "new", "city_edit", "New Word"), UpdateMessage::COMMIT).success);
-  EXPECT_EQ((std::vector<std::string>{"new", "old"}), hits(helper, "city_edit:word"));
-  auto durable = readDurableIndexInfo(writer->dir);
-  for (const auto& segment : durable->segments) EXPECT_EQ(before->gen_, segment.schema_gen);
-}
-
-TEST_F(FieldVariantsGenerationTest, unusedFieldTypeChangeWaitsForUnrelatedIngest) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  auto before = put(helper.collection(), R"({"fields":{"mistake":"string"}})");
-  CollectionHelper::UpdateBuilder docs;
-  docs.add(flatdoc("id", "old", "keep_w", "old"));
-  PausedSchemaUpdate old(docs.finish());
-  ASSERT_TRUE(writer->submitUpdate(&old));
-  old.entered.wait();
-  SchemaPublicationProbe probe(*writer);
-  auto publication = std::async(std::launch::async, [&] {
-    return put(helper.collection(), R"({"fields":{"mistake":"int"}})");
-  });
-  EXPECT_TRUE(probe.waitQuiescing());
-  old.finish();
-  auto after = publication.get();
-  EXPECT_EQ(before, old.schema);
-  EXPECT_NE(before, after);
-  ASSERT_TRUE(helper.index(flatdoc("id", "new", "mistake", 12), UpdateMessage::COMMIT).success);
-  EXPECT_EQ((std::vector<std::string>{"old"}), hits(helper, "keep_w:old"));
-  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "mistake:=12"));
-}
-
-TEST_F(FieldVariantsGenerationTest, directClientsParticipateInQuiesceAndAdmissionGate) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  auto before = helper.collection().getSchema();
-  auto& busy = writer->obtainInverter();
-  SchemaPublicationProbe probe(*writer);
-  auto publication = std::async(std::launch::async, [&] {
-    // This explicit name previously resolved through the default _s template.
-    return put(helper.collection(), R"({"fields":{"count_s":"int"}})");
-  });
-  EXPECT_TRUE(probe.waitQuiescing());
-  EXPECT_EQ(std::future_status::timeout, publication.wait_for(std::chrono::seconds(0)));
-  auto acquisition = std::async(std::launch::async, [&] {
-    auto& next = writer->obtainInverter();
-    auto schema = next.schema;
-    writer->releaseInverter(next);
-    return schema;
-  });
-  EXPECT_TRUE(probe.waitAdmission());
-  busy.startDoc();
-  busy.getIndexHandler("id").index(busy, "old");
-  busy.finishDoc();
-  writer->releaseInverter(busy);
-  auto after = publication.get();
-  EXPECT_NE(before, after);
-  EXPECT_EQ(after, acquisition.get());
-  ASSERT_TRUE(helper.index(flatdoc("id", "new", "count_s", 12), UpdateMessage::COMMIT).success);
-  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "count_s:=12"));
-}
-
-TEST_F(FieldVariantsGenerationTest, closeAbortsPublicationAndBlockedAdmission) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  auto before = put(helper.collection(), R"({"fields":{"mistake":"string"}})");
-  CollectionHelper::UpdateBuilder docs;
-  docs.add(flatdoc("id", "old"));
-  PausedSchemaUpdate old(docs.finish());
-  ASSERT_TRUE(writer->submitUpdate(&old));
-  old.entered.wait();
-  SchemaPublicationProbe probe(*writer);
-  auto publication = std::async(std::launch::async, [&] {
-    return put(helper.collection(), R"({"fields":{"mistake":"int"}})");
-  });
-  EXPECT_TRUE(probe.waitQuiescing());
-  PausedSchemaUpdate next(docs.finish());
-  EXPECT_TRUE(writer->submitUpdate(&next));
-  EXPECT_TRUE(probe.waitAdmission());
-  auto closing = std::async(std::launch::async, [&] { writer->close(); });
-  bool aborted = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-  EXPECT_TRUE(aborted) << "Close must abort publication before the old message finishes";
-  if (!aborted) old.unpause();
-  EXPECT_THROW(publication.get(), IndexWriterClosedError);
-  next.finish();
-  EXPECT_TRUE(next.result.errored());
-  EXPECT_EQ(0u, next.updateVersion);
-  EXPECT_EQ(nullptr, next.schema);
-  EXPECT_EQ(before, helper.collection().getSchema());
-  old.finish();
-  closing.get();
-  EXPECT_FALSE(old.result.errored()) << old.result.what();
-}
-
-TEST_F(FieldVariantsGenerationTest, serialAdmissionGateHoldsQueuedMessagesUntilPublication) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  auto before = put(helper.collection(), R"({"fields":{"mistake":"string"}})");
-  auto& busy = writer->obtainInverter();
-  SchemaPublicationProbe probe(*writer);
-  // The publisher is a request thread, outside the update graph.
-  auto publication = std::async(std::launch::async, [&] {
-    return put(helper.collection(), R"({"fields":{"mistake":"int"}})");
-  });
-  EXPECT_TRUE(probe.waitQuiescing());
-  std::array<CollectionHelper::UpdateBuilder, 4> docs;
-  std::vector<std::unique_ptr<PausedSchemaUpdate>> messages;
-  for (int i = 0; i < (int)docs.size(); ++i) {
-    docs[i].add(flatdoc("id", std::to_string(i), "mistake", 12));
-    auto message = std::make_unique<PausedSchemaUpdate>(docs[i].finish());
-    message->unpause();
-    EXPECT_TRUE(writer->submitUpdate(message.get()));
-    messages.push_back(std::move(message));
-  }
-  EXPECT_TRUE(probe.waitAdmission());
-  // Concurrency 1 leaves the remaining messages queued behind the one waiter.
-  EXPECT_EQ(1, probe.waitingAdmissions());
-  writer->releaseInverter(busy);
-  auto after = publication.get();
-  EXPECT_NE(before, after);
-  for (auto& message : messages) {
-    message->finish();
-    EXPECT_EQ(after, message->schema);
-    EXPECT_FALSE(message->result.errored()) << message->result.what();
-  }
-  EXPECT_EQ(1, probe.waitingAdmissions());
-  helper.commit();
-  EXPECT_EQ((std::vector<std::string>{"0", "1", "2", "3"}), hits(helper, "mistake:=12"));
 }
 
 TEST_F(FieldVariantsGenerationTest, busyOldInverterFinishesAndRetiresWithoutRefreshingUnknownNames) {
@@ -435,7 +195,15 @@ TEST_F(FieldVariantsGenerationTest, busyOldInverterFinishesAndRetiresWithoutRefr
   old.getIndexHandler("id").index(old, "also_old");
   author.index(old, "Le Guin");
   old.finishDoc();
+  std::promise<void> flushing;
+  auto started = flushing.get_future();
+  Signal::listen("segmentFlushBody", [&](void* source, void*, void*) -> void* {
+    if (((Inverter*)source)->postingsWriter.getSegId() == oldSegment) flushing.set_value();
+    return nullptr;
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("segmentFlushBody"); });
   writer->releaseInverter(old);
+  EXPECT_EQ(std::future_status::ready, started.wait_for(std::chrono::seconds(5)));
   auto& fresh = writer->obtainInverter();
   EXPECT_EQ(after, fresh.schema);
   EXPECT_NE(oldSegment, fresh.postingsWriter.getSegId());
@@ -445,120 +213,70 @@ TEST_F(FieldVariantsGenerationTest, busyOldInverterFinishesAndRetiresWithoutRefr
   EXPECT_EQ((std::vector<std::string>{"also_old", "new", "old"}), hits(helper, "author:*"));
 }
 
-TEST_F(FieldVariantsGenerationTest, removedSignaturesAndMaterializedTemplatesSurviveRestart) {
+TEST_F(FieldVariantsGenerationTest, removedVariantAndMaterializedTemplateCanBeRedefinedAfterReopen) {
+  uint64_t before;
   {
     LuxirNode node(config());
     CollectionHelper helper(node);
-    put(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"string"}}},
-      "templates":{"_name":{"type":"text","analyzer":{"tokenizer":"whitespace","filters":["lowercase"]}}}})");
-    ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", "Le Guin", "city_name", "New York"), UpdateMessage::COMMIT).success);
+    before = put(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"string"}}},
+      "templates":{"_name":{"type":"text","analyzer":{"tokenizer":"whitespace"}}}})")->gen_;
+    ASSERT_TRUE(helper.index(flatdoc("id", "old", "author", "Le Guin", "city_name", "New York"),
+                             UpdateMessage::COMMIT).success);
     put(helper.collection(), R"({"fields":{"author":"text"}})");
-    // Reopen the newer schema alongside the existing commit manifest.
   }
   {
     LuxirNode node(config());
     CollectionHelper helper(node);
-    auto& collection = helper.collection();
-    auto durable = readDurableIndexInfo(helper.getIndexWriter()->dir);
-    bool found = false;
-    for (const auto& signature : durable->field_signatures) {
-      if (signature.name != "author__s") continue;
-      found = true;
-      EXPECT_EQ("author", signature.logical_name);
-      EXPECT_EQ("s", signature.label);
-      EXPECT_EQ("\"string\"", signature.properties.at("type"));
-    }
-    EXPECT_TRUE(found);
-    rejected(collection, R"({"fields":{"author":{"type":"text","variants":{"s":"text"}}}})", "author__s", "type");
-    rejected(collection, R"({"fields":{"author":{"type":"text","variants":{"s":{"type":"string","normalizer":["nfkc_cf"]}}}}})",
-             "author__s", "normalizer");
-    rejected(collection, R"({"templates":{"_name":{"type":"text","analyzer":{"tokenizer":"keyword","filters":["lowercase"]}}}})",
-             "city_name", "analyzer");
-    // Equivalent effective analysis through inheritance and shorthand is canonical.
-    EXPECT_NO_THROW(put(collection, R"({"templates":{"_base_":{"type":"text","analyzer":{"tokenizer":{"name":"whitespace"},"filters":[{"name":"lowercase"}]}},"_name":{"parent":"_base_","variants":{"s":"string"}},"_new":"int"},
-      "fields":{"author":{"type":"text","variants":{"s":"string","folded":{"type":"string","normalizer":["nfkc_cf"]}}},"extra":"int"}})"));
-    auto resolved = view(*helper.getIndexWriter());
-    auto& readded = resolved["fields"]["author"]["representations"]["s"];
-    EXPECT_EQ(collection.getSchema()->gen_, readded["introduced_generation"].get<uint64_t>());
-    EXPECT_FALSE(readded["coverage_complete"].get<bool>());
-    ASSERT_TRUE(helper.index(flatdoc("id", "b", "city_name", "New York", "count_new", 5), UpdateMessage::COMMIT).success);
-    EXPECT_EQ((std::vector<std::string>{"b"}), hits(helper, "city_name__s:*"));
-    rejected(collection, R"({"fields":{"city_name":{"type":"text","analyzer":{"tokenizer":"keyword"}}}})", "city_name", "analyzer");
-  }
-}
-
-TEST_F(FieldVariantsGenerationTest, signaturesRejectShapeIndexColumnAndVectorChanges) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  put(helper.collection(), R"({"fields":{"tag":"string","count":{"type":"int","index":"range"},"vec":{"type":"vector","dims":2,"metric":"l2"}}})");
-  ASSERT_TRUE(helper.index(flatdoc("id", "a", "tag", "x", "count", 1, "vec", std::vector<float>{1, 2}), UpdateMessage::COMMIT).success);
-  for (auto json : {R"({"fields":{"tag":{"type":"string","multi":true}}})",
-                    R"({"fields":{"tag":{"type":"string","column":false}}})",
-                    R"({"fields":{"count":{"type":"int","index":"none"}}})",
-                    R"({"fields":{"vec":{"type":"vector","dims":3,"metric":"l2"}}})",
-                    R"({"fields":{"vec":{"type":"vector","dims":2,"metric":"ip"}}})"}) {
-    EXPECT_THROW(put(helper.collection(), json), SchemaError) << json;
-  }
-  // Storage and binding choices are not a dictionary/column reinterpretation.
-  EXPECT_NO_THROW(put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"variants":{"text":"text"},"defaults":{"search":"text"}}}})"));
-}
-
-TEST_F(FieldVariantsGenerationTest, idleInverterDoesNotReserveUnusedTemplateInstances) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  ASSERT_TRUE(helper.index(flatdoc("id", "old")).success);
-  EXPECT_NO_THROW(put(helper.collection(), R"({"fields":{"count_s":"int"}})"));
-  ASSERT_TRUE(helper.index(flatdoc("id", "new", "count_s", 12), UpdateMessage::COMMIT).success);
-  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "count_s:=12"));
-}
-
-TEST_F(FieldVariantsGenerationTest, bufferedDynamicRootReservesItsSignatureBeforeFirstFlush) {
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto writer = helper.getIndexWriter();
-  ASSERT_TRUE(helper.index(flatdoc("id", "old", "city_t", "New York")).success);
-  for (bool flushed : {false, true}) {
-    if (flushed) helper.commit();
-    CollectionHelper::UpdateBuilder docs;
-    docs.add(flatdoc("id", flushed ? "after_flush" : "buffered"));
-    PausedSchemaUpdate old(docs.finish());
-    ASSERT_TRUE(writer->submitUpdate(&old));
-    old.entered.wait();
-    auto publication = std::async(std::launch::async, [&] {
-      rejected(helper.collection(), R"({"templates":{"_t":{"type":"text","analyzer":{"tokenizer":"keyword"}}}})",
-               "city_t", "analyzer");
-    });
-    bool ready = publication.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
-    EXPECT_TRUE(ready) << "Known materialized conflicts must reject before draining";
-    if (!ready) old.unpause();
-    publication.get();
-    old.finish();
-  }
-  helper.commit();
-  EXPECT_EQ((std::vector<std::string>{"old"}), hits(helper, "city_t:York"));
-}
-
-TEST_F(FieldVariantsGenerationTest, explicitRootRemovalIntroducesPreviouslySuppressedTemplateVariant) {
-  uint64_t introduced;
-  {
-    LuxirNode node(config());
-    CollectionHelper helper(node);
-    put(helper.collection(), R"({"fields":{"author_t":"text"},
-      "templates":{"_t":{"type":"text","variants":{"s":"string"}}}})");
-    ASSERT_TRUE(helper.index(flatdoc("id", "old", "author_t", "Le Guin")).success);
-    introduced = put(helper.collection(), R"({"templates":{"_t":{"type":"text","variants":{"s":"string"}}}})",
-                     api::SchemaRequest_::Mode::REPLACE_ALL)->gen_;
-    ASSERT_TRUE(helper.index(flatdoc("id", "new", "author_t", "Le Guin"), UpdateMessage::COMMIT).success);
-    EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author_t__s:*"));
-  }
-  {
-    LuxirNode node(config());
-    CollectionHelper helper(node);
-    auto json = view(*helper.getIndexWriter());
-    auto& rep = json["fields"]["author_t"]["representations"]["s"];
-    EXPECT_EQ(introduced, rep["introduced_generation"].get<uint64_t>());
+    auto after = put(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"text"}}},
+      "templates":{"_name":{"type":"text","analyzer":{"tokenizer":"keyword"}}}})");
+    ASSERT_TRUE(helper.index(flatdoc("id", "new", "author", "Le Guin", "city_name", "New York"),
+                             UpdateMessage::COMMIT).success);
+    auto writer = helper.getIndexWriter();
+    auto json = view(*writer);
+    auto& rep = json["fields"]["author"]["representations"]["s"];
+    EXPECT_EQ("text", rep["type"].get<std::string>());
+    EXPECT_EQ(after->gen_, rep["introduced_generation"].get<uint64_t>());
+    EXPECT_EQ(before, rep["oldest_generation"].get<uint64_t>());
     EXPECT_FALSE(rep["coverage_complete"].get<bool>());
+    EXPECT_FALSE(json["fields"].get<Json::object_t>().contains("city_name"));
+    auto durable = readDurableIndexInfo(writer->dir);
+    ASSERT_EQ(2u, durable->segments.size());
+    EXPECT_EQ(before, durable->segments[0].schema_gen);
+    EXPECT_EQ(after->gen_, durable->segments[1].schema_gen);
   }
+}
+
+TEST_F(FieldVariantsGenerationTest, staleIdleInverterFlushesOnCheckoutEvenWithAnOldPin) {
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  auto before = helper.collection().getSchema();
+  ASSERT_TRUE(helper.index(flatdoc("id", "old")).success);
+  auto& idle = writer->obtainInverter();
+  auto oldSegment = idle.postingsWriter.getSegId();
+  writer->releaseInverter(idle);
+
+  SchemaBuilder b;
+  b.field("added").type = api::FieldDef::FieldClass::STRING;
+  auto after = b.set(helper.collection());
+  std::promise<void> flushing;
+  auto started = flushing.get_future();
+  Signal::listen("segmentFlushBody", [&](void* source, void*, void*) -> void* {
+    if (((Inverter*)source)->postingsWriter.getSegId() == oldSegment) flushing.set_value();
+    return nullptr;
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("segmentFlushBody"); });
+  auto& pinned = writer->obtainInverter(0, before);
+  EXPECT_EQ(before, pinned.schema);
+  EXPECT_NE(oldSegment, pinned.postingsWriter.getSegId());
+  EXPECT_EQ(std::future_status::ready, started.wait_for(std::chrono::seconds(5)));
+  writer->releaseInverter(pinned);
+  auto& fresh = writer->obtainInverter();
+  EXPECT_EQ(after, fresh.schema);
+  writer->releaseInverter(fresh);
+  helper.commit();
+  auto durable = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, durable->segments.size());
+  EXPECT_EQ(before->gen_, durable->segments[0].schema_gen);
 }
 
 TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsAndAuthoredHttpEcho) {
@@ -598,35 +316,7 @@ TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsA
   }
 }
 
-TEST_F(FieldVariantsGenerationTest, longTermsPolicyIsImmutableOnceMaterialized) {
-  for (auto policy : {"hash128", "truncate", "reject"}) {
-    CollectionHelper helper("main");
-    auto schema = std::format(R"({{"fields":{{"tag":{{"type":"string","long_terms":"{}"}},
-      "body":{{"type":"text","long_terms":"{}"}},"id":{{"type":"id","long_terms":"{}"}}}}}})",
-      policy, policy, policy);
-    put(helper.collection(), schema);
-    ASSERT_TRUE(helper.index(flatdoc("id", "short", "tag", "short", "body", "short")).success);
-    for (bool committed : {false, true}) {
-      if (committed) helper.commit();
-      for (auto other : {"hash128", "truncate", "reject"}) {
-        if (std::string_view(other) == policy) continue;
-        for (auto [field, type] : {std::pair{"tag", "string"}, {"body", "text"}, {"id", "id"}}) {
-          rejected(helper.collection(), std::format(
-              R"({{"fields":{{"{}":{{"type":"{}","long_terms":"{}"}}}}}})", field, type, other),
-              field, "long_terms");
-        }
-      }
-      EXPECT_NO_THROW(put(helper.collection(), schema));
-      auto json = view(*helper.getIndexWriter());
-      for (auto name : {"tag", "body", "id"}) {
-        EXPECT_EQ(policy, json["fields"][name]["representations"]["self"]["long_terms"].get<std::string>());
-      }
-    }
-    helper.clear();
-  }
-}
-
-TEST_F(FieldVariantsGenerationTest, longTermsSignaturesAndStoredSourceSurviveReopenAndMerge) {
+TEST_F(FieldVariantsGenerationTest, longTermsResolvedSettingsAndStoredSourceSurviveReopenAndMerge) {
   std::string source(300, 'x');
   auto checkSource = [&](CollectionHelper& helper) {
     auto req = localReq(helper.getSearchEngine());
@@ -642,15 +332,11 @@ TEST_F(FieldVariantsGenerationTest, longTermsSignaturesAndStoredSourceSurviveReo
       ASSERT_TRUE(helper.index(flatdoc("id", "old", "tag", source), UpdateMessage::COMMIT).success);
     }
     checkSource(helper);
-    auto durable = readDurableIndexInfo(helper.getIndexWriter()->dir);
-    for (const auto& signature : durable->field_signatures) {
-      if (signature.name == "tag" || signature.name == "id") {
-        EXPECT_EQ("\"hash128\"", signature.properties.at("long_terms"));
-      }
+    auto json = view(*helper.getIndexWriter());
+    for (auto name : {"tag", "id"}) {
+      EXPECT_EQ("hash128", json["fields"][name]["representations"]["self"]["long_terms"].get<std::string>());
     }
-    rejected(helper.collection(), R"({"fields":{"tag":{"type":"string","long_terms":"reject"}}})",
-             "tag", "long_terms");
-    // Making the implicit default explicit is compatible.
+    // Making the implicit default explicit preserves the representation.
     put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"long_terms":"hash128"}}})");
     if (reopen) {
       ASSERT_TRUE(helper.index(flatdoc("id", "again", "tag", source), UpdateMessage::COMMIT).success);
@@ -661,29 +347,6 @@ TEST_F(FieldVariantsGenerationTest, longTermsSignaturesAndStoredSourceSurviveReo
       checkSource(helper);
     }
   }
-}
-
-TEST_F(FieldVariantsGenerationTest, longTermsTemplateAndRemovedVariantRemainBoundToTheirPolicy) {
-  CollectionHelper helper("main");
-  put(helper.collection(), R"({"templates":{"_name":{"type":"text","variants":{"s":"string"}}}})");
-  ASSERT_TRUE(helper.index(flatdoc("book_name", "short"), UpdateMessage::COMMIT).success);
-  rejected(helper.collection(), R"({"templates":{"_name":{"type":"text","variants":{
-    "s":{"type":"string","long_terms":"truncate"}}}}})", "book_name__s", "long_terms");
-  put(helper.collection(), R"({"templates":{"_name":{"type":"text"}}})");
-  rejected(helper.collection(), R"({"templates":{"_name":{"type":"text","variants":{
-    "s":{"type":"string","long_terms":"reject"}}}}})", "book_name__s", "long_terms");
-  // An unused name is still editable.
-  put(helper.collection(), R"({"fields":{"unused":{"type":"string","long_terms":"truncate"}}})");
-  EXPECT_NO_THROW(put(helper.collection(), R"({"fields":{"unused":{"type":"string","long_terms":"hash128"}}})"));
-}
-
-TEST_F(FieldVariantsGenerationTest, signatureDoesNotAcceptAnUnrecordedTermPolicy) {
-  auto schema = Schema::createDefaultSchema();
-  FieldSignature current("id", *schema->physical("id"));
-  auto missing = current;
-  missing.properties.erase("long_terms");
-  EXPECT_THROW(missing.checkCompatible("id", current), SchemaError);
-  EXPECT_THROW(current.checkCompatible("id", missing), SchemaError);
 }
 
 } // namespace luxir::test

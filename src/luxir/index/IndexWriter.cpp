@@ -95,7 +95,7 @@ IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
                          FilterCacheConfig filterCacheConfig,
                          int mergeFactor)
   : currentSchema(schema ? std::move(schema) : Schema::createDefaultSchema()),
-    schemaIdentity(currentSchema.get()),
+    schemaIdentity(currentSchema.load().get()),
     dir(dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
@@ -124,9 +124,6 @@ IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
     schemaGen_ = indexInfo.schema_gen;
-    for (const auto& field : indexInfo.field_signatures) {
-      fieldSignatures.emplace(std::string(field.name), FieldSignature(field));
-    }
     updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
     segInfos.reserve(indexInfo.segments.size());
     lastCommittedSegIds.reserve(indexInfo.segments.size());
@@ -178,8 +175,6 @@ IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
   // if necessary before submitting to the actual processing graph.
-  // Keep concurrency at 1: schema publication can block this node at admission,
-  // and relies on there being at most one graph worker waiting at that gate.
   startUpdateNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
@@ -324,13 +319,7 @@ void IndexWriter::close() {
   // the flag inside the graph, so a
   // message either entered before this and is waited for below, or is rejected
   // there: no update can reach storage once this returns.
-  {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    if (closed.exchange(true, std::memory_order_release)) return;
-  }
-  // Share the condition's mutex when changing its predicate, so neither a
-  // publisher nor a blocked admission can miss this wakeup before graph drain.
-  schemaCondition.notify_all();
+  if (closed.exchange(true, std::memory_order_release)) return;
 
   // Stop new budget callbacks before draining the graph.  Registration reset
   // synchronizes with a callback already copied out of the budget; any task it
@@ -534,6 +523,12 @@ bool IndexWriter::submitMergeCommit(MergeMessage& msg, bool publishOnly) {
   return true;
 }
 
+void IndexWriter::setSchema(std::shared_ptr<Schema> schema) {
+  auto* identity = schema.get();
+  currentSchema.store(std::move(schema), std::memory_order_release);
+  schemaIdentity.store(identity, std::memory_order_release);
+}
+
 std::shared_ptr<IndexReader> IndexWriter::getIndexReader(uint64_t freshness_us) {
   if (isClosed()) throw IndexWriterClosedError("index writer is closed");
   // TODO: a reopen blocks every other acquisition for its duration; the
@@ -545,25 +540,16 @@ std::shared_ptr<IndexReader> IndexWriter::getIndexReader(uint64_t freshness_us) 
            std::chrono::system_clock::now().time_since_epoch()).count() -
            indexReader->commitTime() > freshness_us));
   if (reopen) {
-    // Open outside indexMutex and the schema durability boundary. Capture the
-    // schema afterwards so a publication during the open is included.
+    // Capture the schema after opening so a schema change during the open is included.
     auto core = std::make_shared<IndexReader::PhysicalCore>(
         dir, indexReader ? indexReader->core.get() : nullptr);
     Signal::emit("indexReaderOpened", this);
-    std::shared_ptr<Schema> schema;
-    {
-      std::lock_guard<std::mutex> lock(indexMutex);
-      schema = currentSchema;
-    }
+    auto schema = currentSchema.load();
     indexReader = std::shared_ptr<IndexReader>(
         new IndexReader(std::move(core), std::move(schema), filterCache));
     filterCache->onReaderPublished(*indexReader);
   } else if (schemaIdentity.load(std::memory_order_acquire) != indexReader->schema().get()) {
-    std::shared_ptr<Schema> schema;
-    {
-      std::lock_guard<std::mutex> lock(indexMutex);
-      schema = currentSchema;
-    }
+    auto schema = currentSchema.load();
     // Record the schema actually copied, never the advisory identity. Sharing
     // the core preserves segment identities and all physical lazy state; no
     // filter-cache publication is needed for an unchanged physical snapshot.
@@ -579,24 +565,16 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   // IDEA: should we prefer grabbing the inverter with the most docs?  Idea would be to
   // have a couple of really large segments that will need less merging?
   Inverter* inverter = nullptr;
-  std::unique_lock<std::mutex> lock(indexMutex);
-  auto admitted = admittedSchemas.find(updateVersion);
-  bool fromMessage = admitted != admittedSchemas.end() && admitted->second == pinned;
-  // Existing messages must finish while publication waits. Direct clients
-  // are new admissions and must wait at the gate too.
-  if (!fromMessage) awaitSchemaAdmission(lock);
-  if (!pinned) pinned = currentSchema;
-  else if (!fromMessage && pinned != currentSchema) {
-    throw RequestError("An old schema pin requires an admitted update message");
-  }
+  std::lock_guard<std::mutex> lock(indexMutex);
+  auto current = currentSchema.load();
+  if (!pinned) pinned = current;
   for (auto it = idleInverters.begin(); it != idleInverters.end();) {
-    auto current = it++;
-    auto* idle = current->first;
-    if (idle->schema != currentSchema || idle->schema->gen_ != currentSchema->gen_) {
+    auto* idle = (it++)->first;
+    if (idle->schema != current) {
       if (!startIdleFlushLocked(*idle, false)) {
         throw std::runtime_error("Segment flush node rejected a stale inverter");
       }
-    } else if (!inverter && idle->schema == pinned && idle->schema->gen_ == pinned->gen_) {
+    } else if (!inverter && idle->schema == pinned) {
       inverter = idle;
     }
   }
@@ -736,7 +714,7 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // budget check below only ever flushes idle inverters.
 
   // if this inverter is part of a commit, initiate a flush.
-  if (inverter.commitInfo != nullptr || flush || schemaPublishing || inverter.schema != currentSchema) {
+  if (inverter.commitInfo != nullptr || flush || inverter.schema != currentSchema.load()) {
     if (inverter.commitInfo) {
       INDEX_DEBUG("inverter={} message={} triggering flush.", inverter,
                   (void*)inverter.commitInfo->updateMessage);
@@ -748,7 +726,6 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     assert(success);
     flushingIt->second->ramGuard.markDraining();
     it = busyInverters.erase(it);
-    if (schemaPublishing) schemaCondition.notify_all();
     if (!segmentFlushNode->try_put(&inverter)) {
       throw std::runtime_error("Segment flush node rejected a released inverter");
     }
@@ -758,7 +735,6 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
     // return inverter to idle pool
     idleInverters.emplace(&inverter, std::move(it->second));
     busyInverters.erase(it);
-    if (schemaPublishing) schemaCondition.notify_all();
   }
 
   // Re-evaluate even when raw reservations fit: pending merge demand may need
@@ -1072,17 +1048,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
       success = inverter.flush(&flushedFiles);
-      if (success) {
-        FieldSignatures flushedSignatures;
-        for (const auto& [name, handler] : inverter.indexHandlers) {
-          flushedSignatures.try_emplace(std::string(name), name, *inverter.schema->physical(name));
-        }
-        std::lock_guard<std::mutex> lock(indexMutex);
-        for (const auto& [name, signature] : flushedSignatures) {
-          auto [entry, added] = fieldSignatures.try_emplace(name, signature);
-          if (!added) entry->second.checkCompatible(name, signature);
-        }
-      }
     } catch (const std::exception& e) {
       LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
       inverter.fail(std::current_exception());
@@ -1476,10 +1441,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::vector<uint64_t> committedSegIds;
   committedSegIds.reserve(segsToKeep.size());
   for (auto* seg : segsToKeep) committedSegIds.push_back(seg->segId);
-  {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    msg.commitInfo->schemaGen = currentSchema->gen_;
-  }
+  msg.commitInfo->schemaGen = currentSchema.load()->gen_;
 
   // write the segments file with only the segments that have live documents
   uint64_t commitTime = writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
@@ -1813,10 +1775,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
   std::shared_ptr<Schema> schema;
   std::vector<std::string> stagedActiveOverlayNames;
   if (!vectorSelectors.empty()) {
-    {
-      std::lock_guard<std::mutex> lock(indexMutex);
-      schema = currentSchema;
-    }
+    schema = currentSchema.load();
     stagedActiveOverlayNames = collectValidatedExactVectorOverlayNames(msg.buildAuxIndexes, *schema);
   }
 
@@ -2040,11 +1999,6 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    auto* fields = api::build::allocArray(indexInfo.field_signatures, fieldSignatures.size(), iiArena);
-    size_t fieldIdx = 0;
-    for (const auto& [name, signature] : fieldSignatures) {
-      fields[fieldIdx++] = signature.toWire(name, iiArena);
-    }
     for (auto* seg : segs) {
       seg->lastCommitTime = now_us;
       if (seg->firstCommitTime == 0) seg->firstCommitTime = now_us;
@@ -2401,11 +2355,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
       if (!activeOverlayNames.empty()) {
         phase = "schema_snapshot";
-        std::shared_ptr<Schema> schema;
-        {
-          std::lock_guard<std::mutex> lock(indexMutex);
-          schema = currentSchema;
-        }
+        auto schema = currentSchema.load();
         // The merged segment is private until the swap below.  Building here
         // avoids reading live source overlays and publishes segment plus
         // overlay entries atomically at the later commit.
@@ -2722,7 +2672,6 @@ void IndexWriter::testDeleteAllData() {
 
     // drop all idle inverters (unflushed segments)
     idleInverters.clear();
-    fieldSignatures.clear();
     oldestCommittedSchemaGen.reset();
 
     // drop all segments

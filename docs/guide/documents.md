@@ -108,8 +108,9 @@ stay unlimited.
 `long_terms: "reject"` fails a document containing an over-limit normalized
 string, analyzed token, or ID; query terms, bounds, selections, and delete IDs
 are errors too. A rejecting variant fails the whole document. The effective
-policy is immutable once the physical field has data; changing it requires a
-new field or variant and reindexing.
+policy applies to updates admitted after the schema call returns. Existing
+segments are not validated against policy edits and keep their original terms;
+use a new field or variant label and reindex to change the policy safely.
 
 With the normal `allow_dups: false`, another document with the same ID replaces
 the old document. Replacement is whole-document replacement: fields omitted by

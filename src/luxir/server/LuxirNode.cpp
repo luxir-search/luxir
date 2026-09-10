@@ -75,13 +75,10 @@ void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
 
 void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
   newSchema->gen_ = schemaGen_.load();
-  if (shard && shard->iw) {
-    shard->iw->publishSchema(newSchema, [&] { persistSchemaLocked(newSchema); });
-  } else {
-    auto previous = getSchema();
-    newSchema->inheritIntroductions(previous.get(), {});
-    persistSchemaLocked(newSchema);
-  }
+  auto previous = getSchema();
+  newSchema->inheritIntroductions(previous.get());
+  persistSchemaLocked(newSchema);
+  if (shard && shard->iw) shard->iw->setSchema(std::move(newSchema));
 }
 
 void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
@@ -115,8 +112,8 @@ void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
       throw;
     }
 
-    // Publish for schema GET handlers. The writer installs its own schema
-    // before reopening admission after this callback returns.
+    // Publish for schema GET handlers. setSchemaLocked hands the same schema
+    // to the writer after persistence returns.
     schema.store(std::move(newSchema));
 
     // Best-effort cleanup of older generations: the new schema is already
@@ -171,12 +168,9 @@ bool Collection::loadSchema() {
       uint64_t gen = Postings::parseSortableString(genStr);
 
       newSchema->gen_ = gen;
-      auto install = [&] {
-        schemaGen_ = gen + 1;  // next setSchema will use gen+1
-        schema.store(newSchema);
-      };
-      if (shard->iw) shard->iw->publishSchema(newSchema, install);
-      else install();
+      schemaGen_ = gen + 1;  // next setSchema will use gen+1
+      schema.store(newSchema);
+      if (shard->iw) shard->iw->setSchema(std::move(newSchema));
       return true;
     }
 

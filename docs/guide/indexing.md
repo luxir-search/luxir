@@ -168,16 +168,17 @@ completes: a JSON body commits immediately (`commit_within_ms` is forced to
 the end of the stream. Frequent forced merges are expensive; `max_segments`
 is an explicit maintenance action, not a normal ingest setting.
 
-Each update message uses the schema pinned at admission. After a successful
-schema publication, newly admitted messages use its definitions; already
-admitted work keeps its original schema. A long NDJSON stream can span several
-messages and schema generations.
+Each update message uses the schema pinned at admission. After the schema call
+returns, newly admitted messages use its definitions; already admitted work
+keeps its original schema. A long NDJSON stream can span several messages and
+schema generations.
 
 Adding a variant does not backfill earlier documents, and merging does not
 create missing representations. Reindex the producer's input to populate them.
 The [resolved schema view](schema.md#resolved-view) reports conservative
-coverage; [live schema edits](schema.md#changes-on-a-live-collection) reject
-incompatible reuse of a physical name with materialized data.
+coverage; [live schema edits](schema.md#changes-on-a-live-collection) do not
+validate existing segments against redefinitions. Use a new field or variant
+label and reindex to change a representation safely.
 
 ## Per-document failures
 
@@ -212,8 +213,8 @@ The default `long_terms` changed from `truncate` to `hash128`: indexed STRING
 values, analyzed TEXT tokens, and IDs over 255 bytes become a UTF-8-safe prefix
 of at most 230 bytes plus 25 base36 hash characters. Shorter terms stay
 unchanged. `truncate` restores shared-prefix merges; `reject` fails the document.
-The policy is immutable once data exists. Hashing is not attack-resistant;
-sorts preserve source order only up to the prefix, and longer prefix queries
+Policy edits do not validate or rewrite existing terms. Hashing is not
+attack-resistant; sorts preserve source order only up to the prefix, and longer prefix queries
 return a superset. Stored source keeps full bytes; column-only strings stay
 unlimited. See [term-space limits](documents.md#ids-and-replacement).
 

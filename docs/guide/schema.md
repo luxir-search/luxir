@@ -143,7 +143,7 @@ posting an authored `GET` body back keeps the same definitions under either mode
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` (none take parameters yet) |
-| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Immutable once the physical field has data. |
+| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Changes do not rewrite existing terms. |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |
 | `variants` | Map from label to another field definition receiving the same input value. Bare type strings work here too. |
 | `defaults` | `search` and `value` bindings, each naming `self` or a variant label; both default to `self`. |
@@ -387,9 +387,9 @@ or borrow it through their own `parent`; they do not inherit it from their
 logical primary. An explicitly set or inherited policy is invalid on other
 types or on a STRING with `index: "none"`.
 
-The effective policy is part of the persisted physical field signature. Once
-data exists, switching between any of the three policies is rejected. Use a
-new field or variant label and reindex to change it.
+Changing the effective policy affects newly admitted updates and new queries;
+existing segments keep their original terms. Use a new field or variant label
+and reindex to change the policy safely.
 
 ## The operations
 
@@ -413,11 +413,11 @@ The resolved view is diagnostic, not a schema write body. It contains:
 | Property | Meaning |
 |---|---|
 | `generation` | Current schema generation; the initial default schema is generation `0`. |
-| `fields` | Logical concrete fields, including materialized suffix-template instances. |
+| `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
 | Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
-| `introduced_generation` | Start of this representation's current continuous availability. A compatible removed/re-added label gets a new introduction. |
+| `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
 | `coverage_complete` | True for an empty index or when that minimum reaches the introduction generation. |
 
@@ -434,21 +434,21 @@ routes new requests there. Those older documents will not match its exact
 queries or contribute to its value facets. Reindex from the producer's input
 to populate it; retrieval is not guaranteed to reproduce every branch's input.
 
-Each admitted update message pins one schema generation. Messages admitted
-after a successful publication use the new schema; earlier messages finish
-with their original one. An incompatible definition edit may briefly block
-new admission while already admitted work drains, then reject if that work
-actually used the old definition.
+Each admitted update message pins one schema generation. A schema change takes
+effect for updates admitted after the schema call returns; earlier messages
+finish with their original one. The call does not wait for those messages.
+Each inverter keeps its schema for its whole life. A stale idle inverter
+flushes at the next checkout, and a stale busy one flushes when released, so
+each segment is written under a single schema.
 
-Once a physical name has materialized data, its indexed meaning cannot change:
-type, `multi`, index/column settings, posting settings, analyzer or normalizer,
-`long_terms`, and vector parameters must remain compatible. A rejected schema edit returns
-`400` with `code: "invalid_schema"`, names the physical field and changed
-property, and leaves the current schema in place. The rule includes template
-edits affecting materialized dynamic roots. Unused definitions can be corrected.
+Schema changes are not validated against existing data. Existing segments keep
+the representation they were written with, even when a field or template is
+redefined. This applies to type, `multi`, index/column settings, posting
+settings, analyzer or normalizer, `long_terms`, and vector parameters. Accepting
+a schema edit does not establish that new queries can use the old data correctly.
 
-Removing a variant does not free its name. Successfully flushed names remain
-reserved until the index is cleared, even if their old segments disappear.
-Use a new field or variant label and reindex to change the representation.
-Stored-source settings and default bindings can change without changing the
-indexed meaning, but neither change fills missing old values.
+Removing a variant does not remove its data from existing segments. Reusing
+its label with a different definition can leave old and new representations
+under the same physical name. Use a new field or variant label and reindex to
+change a representation safely. Stored-source settings and default bindings
+can also change, but neither change fills missing old values.

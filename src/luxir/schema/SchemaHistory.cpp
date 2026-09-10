@@ -3,6 +3,7 @@
 
 #include "Schema.h"
 #include "luxir/api/build.h"
+#include "luxir/api/luxir_index.hpp"
 #include "luxir/api/padded_input.h"
 
 namespace luxir {
@@ -24,18 +25,6 @@ FieldSignatures Schema::signatures(bool includeTemplates) const {
   return result;
 }
 
-void Schema::addRootSignatures(std::string_view root, FieldSignatures& out) const {
-  auto found = findRoot(root);
-  if (!found.primary) return;
-  out.try_emplace(std::string(root), root, **found.primary);
-  if (found.owner) {
-    for (const auto& [label, type] : found.owner->variants) {
-      std::string name = std::string(root) + "__" + label;
-      out.try_emplace(name, name, *type);
-    }
-  }
-}
-
 uint64_t Schema::introduction(std::string_view physicalName) const {
   auto it = introducedGen.find(physicalName);
   if (it != introducedGen.end()) return it->second;
@@ -47,23 +36,10 @@ uint64_t Schema::introduction(std::string_view physicalName) const {
   return gen_;
 }
 
-void Schema::inheritIntroductions(const Schema* previous, const FieldSignatures& materialized) {
+void Schema::inheritIntroductions(const Schema* previous) {
   introducedGen.clear();
   auto current = signatures(true);
-  for (const auto& [name, signature] : materialized) addRootSignatures(signature.logicalName, current);
   auto before = previous ? previous->signatures(true) : FieldSignatures{};
-  // Removing an explicit root may expose a template representation that the
-  // root previously suppressed. Its introduction is this publication, even
-  // when the template itself is much older and the root has not flushed yet.
-  for (const auto& [name, signature] : before) {
-    if (validFieldName(signature.logicalName)) addRootSignatures(signature.logicalName, current);
-  }
-  if (previous) {
-    for (const auto& [name, gen] : previous->introducedGen) {
-      auto root = std::string_view(name).substr(0, name.rfind("__"));
-      if (validFieldName(root)) addRootSignatures(root, current);
-    }
-  }
   for (const auto& [name, signature] : current) {
     uint64_t gen = gen_;
     if (previous) {

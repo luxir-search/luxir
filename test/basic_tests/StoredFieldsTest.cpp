@@ -389,7 +389,7 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
     }
 
     // Segment 2: stored off
-    iw.publishSchema(schemaPlain, [] {});
+    iw.setSchema(schemaPlain);
     {
       auto& inv = iw.obtainInverter();
       inv.startDoc();
@@ -402,7 +402,7 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
       iw.commit();
     }
 
-    iw.publishSchema(schemaWithStored, [] {});
+    iw.setSchema(schemaWithStored);
     iw.mergeSegments();
   }
 
@@ -1018,7 +1018,7 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
              UpdateMessage::COMMIT);
   }
 
-  // Segment 2: enable source storage. Keep the column contract immutable and
+  // Segment 2: enable source storage. Keep the same column settings and
   // store id too, so requesting it forces the shared resource's chunk path.
   {
     auto schema = Schema::createDefaultSchema();

@@ -64,8 +64,9 @@ locations, browse `src/luxir/<area>/`.
 5. **Indexing** (`src/luxir/index/`)
    - `IndexWriter`: Handles multi-threaded indexing with TBB flow graph pipeline.
      - Manages `Inverter` instances, flushing, merging, and commits.
-     - Pins schema at update admission; validates physical-name signatures before
-       schema publication and drains admitted work for incompatible redefinitions
+     - Atomically pins schema at update admission; stale inverters flush at
+       checkout or release, keeping one schema per segment
+   - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
    - `Inverter`: Single-threaded document processing under one pinned schema.
      - `InputHandler`: One logical dispatcher per document key; stores source once
        when the primary enables it and sends the submitted value to every branch
@@ -97,8 +98,8 @@ locations, browse `src/luxir/<area>/`.
    - `Schema`: Separate logical input, operation-based request, and physical lookup;
      authored source stays sparse, resolved HTTP view exposes effective settings
      and introduction/segment generations for conservative coverage
-   - `IndexInfo.field_signatures`: Persisted physical-name semantics;
-     `SchemaInfo`: Authored definition plus introduction history
+   - `FieldSignature`: Effective properties for schema introduction history and
+     the resolved view; `SchemaInfo` persists authored definitions and introductions
 
 ## Data Organization
 

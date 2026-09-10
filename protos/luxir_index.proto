@@ -17,16 +17,6 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
-  // Reserved physical names and their immutable interpretation, including
-  // names removed from the current schema. Retained across merges and reopen.
-  repeated PhysicalFieldSignature field_signatures = 17;
-}
-
-message PhysicalFieldSignature {
-  string name = 1;
-  string logical_name = 2;
-  string label = 3;
-  map<string, string> properties = 4; // canonical JSON values, keyed by property
 }
 
 // Stored in the existing _schema_<generation> file. The public authored

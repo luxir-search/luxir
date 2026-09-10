@@ -75,7 +75,7 @@ public:
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
-  // Persisted in the field signature; determines indexed and query term bytes.
+  // Determines indexed and query term bytes.
   TermPolicy longTerms = TermPolicy::HASH128;
   // When STORED is set, raw values are routed to the stored-fields resource
   // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Shared by

@@ -114,8 +114,9 @@ queries longer than it return a superset; wildcard/regex queries also fall back
 when their common leading literal prefix exceeds it. Hashing is not
 attack-resistant. `truncate` restores the old shared-prefix bucket merge;
 `reject` fails over-limit ingest and makes over-limit selections request errors.
-The policy is immutable once data exists. Column-only strings have no term-space
-limit but cannot serve field facets.
+Policy edits do not validate or rewrite existing terms; use a new field or
+variant label and reindex to change the policy safely. Column-only strings
+have no term-space limit but cannot serve field facets.
 
 With the `names` collection from the schema example:
 
