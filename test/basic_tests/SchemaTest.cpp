@@ -1252,7 +1252,8 @@ TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
   auto s = schemaJson(R"({"templates":{
     "_strict":{"type":"string","long_terms":"reject"},
     "_child":{"parent":"_strict"},
-    "_loose":{"parent":"_child","long_terms":"truncate"}
+    "_loose":{"parent":"_child","long_terms":"truncate"},
+    "_hash":{"parent":"_child","long_terms":"hash128"}
   },"fields":{
     "plain":"string", "text":"text", "column":{"type":"string","index":"none"},
     "inherited":{"parent":"_child"},
@@ -1261,10 +1262,13 @@ TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
     }}
   }})");
   for (auto name : {"inherited", "title", "title__s", "dynamic_child"}) {
-    EXPECT_TRUE(s->physical(name)->rejectLongTerms) << name;
+    EXPECT_EQ(TermPolicy::REJECT, s->physical(name)->longTerms) << name;
   }
-  for (auto name : {"plain", "text", "column", "title__loose", "title__raw", "dynamic_loose", "id"}) {
-    EXPECT_FALSE(s->physical(name)->rejectLongTerms) << name;
+  for (auto name : {"plain", "text", "column", "title__raw", "dynamic_hash", "id"}) {
+    EXPECT_EQ(TermPolicy::HASH128, s->physical(name)->longTerms) << name;
+  }
+  for (auto name : {"title__loose", "dynamic_loose"}) {
+    EXPECT_EQ(TermPolicy::TRUNCATE, s->physical(name)->longTerms) << name;
   }
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef out;
@@ -1272,6 +1276,7 @@ TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
   EXPECT_FALSE(out.fields.at("plain")->long_terms);
   EXPECT_FALSE(out.fields.at("inherited")->long_terms);
   EXPECT_EQ(api::FieldDef::LongTerms::TRUNCATE, out.templates.at("_loose")->long_terms);
+  EXPECT_EQ(api::FieldDef::LongTerms::HASH128, out.templates.at("_hash")->long_terms);
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(out, bytes));
   api::SchemaDef decoded;
@@ -1280,17 +1285,20 @@ TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
   auto json = authoredJson(*s);
   EXPECT_NE(std::string::npos, json.find("\"long_terms\":\"truncate\""));
   EXPECT_NE(std::string::npos, json.find("\"long_terms\":\"reject\""));
+  EXPECT_NE(std::string::npos, json.find("\"long_terms\":\"hash128\""));
   EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
 }
 
 TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
-  for (auto policy : {"truncate", "reject"}) {
-    for (auto type : {"int", "float", "double", "date", "bin", "vector", "geo_point", "id"}) {
+  for (auto policy : {"hash128", "truncate", "reject"}) {
+    for (auto type : {"int", "float", "double", "date", "bin", "vector", "geo_point"}) {
       auto json = std::format(R"({{"fields":{{"{}":{{"type":"{}","long_terms":"{}"}}}}}})",
-                              std::string_view(type) == "id" ? "id" : "bad", type, policy);
+                              "bad", type, policy);
       SCOPED_TRACE(json);
       EXPECT_THROW(schemaJson(json), SchemaError);
     }
+    EXPECT_NO_THROW(schemaJson(std::format(
+        R"({{"fields":{{"id":{{"type":"id","long_terms":"{}"}}}}}})", policy)));
     EXPECT_THROW(schemaJson(std::format(
         R"({{"fields":{{"bad":{{"type":"string","index":"none","long_terms":"{}"}}}}}})", policy)), SchemaError);
   }

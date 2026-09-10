@@ -112,12 +112,18 @@ than one analyzed term is an error: `author__self:="Le Guin"` reports
 `any_of / := requires a single term per exact TEXT value` and points to
 match, phrase, or a whole-value string variant. `author:=(one two)` reports
 that the list needs a comma or closing parenthesis. These errors include the
-expression byte offset. Exact lookup terms truncate to at most 255 UTF-8-safe
-bytes by default, consistently with ingest. STRING applies the limit after
-whole-value normalization; TEXT exact membership applies it to the analyzed
-term. With `long_terms: "reject"`, an over-limit exact lookup produces a teaching
-error instead. Range bounds and facet selections use the same policy. IDs
-always truncate.
+expression byte offset. Exact lookup terms use `long_terms` after STRING
+normalization or TEXT analysis, including IDs. The default changed from
+`truncate` to `hash128`: terms over 255 bytes become a UTF-8-safe prefix of at
+most 230 bytes plus 25 base36 hash characters. Shorter terms are unchanged.
+Full-value lookups, range bounds, and facet selections transform identically
+to ingest. Sorts and ranges preserve source order only up to the kept prefix.
+
+`truncate` restores the old shared-prefix merges; `reject` fails documents and
+makes over-limit lookup terms teaching errors. The policy cannot change once
+the physical field has data. The hash is not attack-resistant. For exact
+encoding and returned-term normalization caveats, see
+[term-space limits](documents.md#ids-and-replacement).
 
 On TEXT, the single analyzed term is what is looked up. `author__self:="Guin!"`
 looks up `guin` and matches the same documents as `author__self:=Guin` or a
@@ -332,6 +338,12 @@ Prefix and fuzzy text is folded the way the field folds - `title_t:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
 string fields a configured normalizer applies without splitting the value;
 otherwise the text is used exactly as written.
+
+With `hash128`, a prefix longer than the kept prefix falls back to that prefix,
+so `field:very_long_prefix*` can return a superset. Structured wildcard and regex
+queries do the same for an overlong common leading literal prefix. Other
+patterns and fuzzy edit distance operate on stored term bytes, including hash
+suffixes; fuzzy matching does not measure similarity between discarded tails.
 
 Fuzzy matching currently requires the first byte to match exactly (the
 default `prefix_length` is 1, which bounds the scan); `hte~1` will not find

@@ -345,6 +345,82 @@ TEST_F(FieldVariantsIngestTest, textRejectChecksAnalyzedTokensAndRecovers) {
   EXPECT_EQ(1u, match(helper, "body", std::string(255, 'x')).size());
 }
 
+TEST_F(FieldVariantsIngestTest, longIdsSeparateOrMergeAccordingToPolicy) {
+  for (auto policy : {api::FieldDef::LongTerms::HASH128, api::FieldDef::LongTerms::TRUNCATE}) {
+    for (auto commit : {UpdateMessage::NO_COMMIT, UpdateMessage::COMMIT}) {
+      SCOPED_TRACE((int)policy);
+      SCOPED_TRACE(commit);
+      CollectionHelper helper("main");
+      SchemaBuilder b;
+      auto& id = b.field("id");
+      id.type = FieldClass::ID;
+      id.stored = true;
+      id.long_terms = policy;
+      b.set(helper.collection());
+      std::string first = std::string(260, 'x') + std::string(40, 'a');
+      std::string second = std::string(260, 'x') + std::string(40, 'b');
+      bool hash = policy == api::FieldDef::LongTerms::HASH128;
+      ASSERT_TRUE(helper.index(flatdoc("id", first, "state_s", "first"), commit, true).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", second, "state_s", "second"), UpdateMessage::COMMIT, true).success);
+      EXPECT_EQ(hash ? 1u : 0u, match(helper, "state_s", "first").size());
+      EXPECT_TRUE(containsDoc(match(helper, "id", first), flatdoc("id", hash ? first : second)));
+      EXPECT_TRUE(containsDoc(match(helper, "id", second), flatdoc("id", second)));
+      ASSERT_TRUE(helper.index(flatdoc("id", first, "state_s", "replacement"), UpdateMessage::COMMIT, true).success);
+      EXPECT_EQ(hash ? 1u : 0u, match(helper, "state_s", "second").size());
+      EXPECT_EQ(1u, match(helper, "state_s", "replacement").size());
+      ASSERT_TRUE(helper.deleteById(first, UpdateMessage::COMMIT).success);
+      EXPECT_TRUE(match(helper, "id", first).empty());
+      EXPECT_EQ(hash ? 1u : 0u, match(helper, "id", second).size());
+      helper.clear();
+    }
+  }
+}
+
+TEST_F(FieldVariantsIngestTest, rejectedLongIdAndDeletePreservePendingDocuments) {
+  CollectionHelper helper("main");
+  SchemaBuilder b;
+  auto& id = b.field("id");
+  id.type = FieldClass::ID;
+  id.long_terms = api::FieldDef::LongTerms::REJECT;
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "pending"), UpdateMessage::NO_COMMIT, true).success);
+  auto rejected = helper.index(flatdoc("id", std::string(300, 'x')), UpdateMessage::NO_COMMIT, true);
+  ASSERT_EQ(Status::ERROR, rejected.status);
+  ASSERT_EQ(1u, rejected.errors.size());
+  EXPECT_NE(std::string::npos, rejected.errors[0].error_message.find("id value is 300 bytes"));
+  std::vector<std::string> deletes{"pending", std::string(300, 'x')};
+  EXPECT_EQ(Status::ERROR, helper.deleteByIds(deletes).status);
+  ASSERT_TRUE(helper.index(flatdoc("id", "after"), UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(1u, match(helper, "id", "pending").size());
+  EXPECT_EQ(1u, match(helper, "id", "after").size());
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("id", std::string(300, 'x'));
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("maximum is 255"));
+}
+
+TEST_F(FieldVariantsIngestTest, hash128UsesCompleteNormalizedValueAndLeavesColumnsUnlimited) {
+  CollectionHelper helper("main");
+  SchemaBuilder b;
+  for (auto name : {"whole", "column"}) {
+    auto& field = b.field(name);
+    field.type = FieldClass::STRING;
+    if (std::string_view(name) == "column") field.index = api::FieldDef::IndexMode::NONE;
+    b.normalizer(field, {"nfkc_cf"});
+  }
+  b.set(helper.collection());
+  // The source fits; normalization expands it past 255, so it must hash.
+  std::string input = std::string(253, 'X') + "\xc4\xb0";
+  std::string normalized = std::string(253, 'x') + "i\xcc\x87";
+  std::string column(5000, 'X');
+  ASSERT_TRUE(helper.index(flatdoc("id", "long", "whole", input, "column", column), UpdateMessage::COMMIT).success);
+  PackedTerm::TermBuffer scratch;
+  std::string term(*PackedTerm::fitTerm(TermPolicy::HASH128, normalized, scratch));
+  EXPECT_TRUE(containsDoc(match(helper, "whole", input, {"whole", "column"}),
+                          flatdoc("whole", term, "column", std::string(5000, 'x'))));
+}
+
 TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysicalOrder) {
   CollectionHelper helper("main");
   SchemaBuilder b;

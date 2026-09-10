@@ -206,11 +206,14 @@ A value rejected by any variant fails the entire document. The message names
 the logical field, branch label (`self` for the primary), and cause. For example,
 if the author example's `s` variant sets `long_terms: "reject"`, a 256-byte
 normalized string fails branch `s` even if the TEXT primary accepted it.
-By default, indexed STRING values truncate after normalization and TEXT tokens
-truncate after analysis to at most 255 UTF-8-safe bytes. The stored source
-keeps the full value. Column-only strings have no term-space limit; IDs always
-truncate. See [term-space limits](documents.md#ids-and-replacement) for prefix
-collisions and the opt-in reject policy.
+The default `long_terms` changed from `truncate` to `hash128`: indexed STRING
+values, analyzed TEXT tokens, and IDs over 255 bytes become a UTF-8-safe prefix
+of at most 230 bytes plus 25 base36 hash characters. Shorter terms stay
+unchanged. `truncate` restores shared-prefix merges; `reject` fails the document.
+The policy is immutable once data exists. Hashing is not attack-resistant;
+sorts preserve source order only up to the prefix, and longer prefix queries
+return a superset. Stored source keeps full bytes; column-only strings stay
+unlimited. See [term-space limits](documents.md#ids-and-replacement).
 
 The response status is:
 

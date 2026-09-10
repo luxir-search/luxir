@@ -1300,13 +1300,14 @@ message FieldDef {
   FieldDefaults defaults = 14;
   NormalizerDef normalizer = 15;
 
-  // STRING values after normalization and TEXT tokens after analysis.
-  // Not valid on column-only STRING; ID always truncates.
+  // STRING values after normalization, TEXT tokens after analysis, and IDs.
+  // Not valid on column-only STRING. Immutable once data exists.
   enum LongTerms {
     TRUNCATE = 0;
     REJECT = 1;
+    HASH128 = 2;
   }
-  optional LongTerms long_terms = 16; // absent: inherit from parent, else truncate
+  optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
 }
 
 message SchemaDef {

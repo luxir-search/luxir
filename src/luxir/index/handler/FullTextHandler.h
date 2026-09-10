@@ -107,6 +107,7 @@ public:
     int numTokens = 0;
     int pos = -1;
     bool first = true;
+    PackedTerm::TermBuffer scratch;
     for (std::string_view val : vals) {
       if (!first) {
         pos += POSITION_INCREMENT_GAP;
@@ -119,7 +120,8 @@ public:
         if (!hasNext) break;
         // The token bytes are transient (the chain may reuse the buffer on the
         // next pull); try_emplace copies them into the MemPool below.
-        if (fieldType->rejectLongTerms && tok.text.size() > PackedTerm::MAX_LEN) {
+        auto term = PackedTerm::fitTerm(fieldType->longTerms, tok.text, scratch);
+        if (!term) {
           // Rollback marks the doc deleted but retains earlier postings. They
           // still need a norm at flush, and their table memory must be charged.
           finishValues(inverter, numTokens);
@@ -128,10 +130,7 @@ public:
         }
         ++numTokens;
         pos += tok.positionIncrement;
-        // Default truncation agrees with query-time term building.
-        std::string_view term = PackedTerm::truncate(tok.text);
-
-        auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
+        auto [entry, inserted] = termsHash.try_emplace(*term, termsHash.getMemPool(), docid, pos);
         if (!inserted) {
           entry->val().addDoc(termsHash.getMemPool(), docid, pos);
         }

@@ -277,19 +277,6 @@ private:
     }
   }
 
-  // Copy transient token bytes into the request pool. Analyzer chains reuse
-  // their output buffers across tokens (the borrow contract), so a term we keep
-  // past the next pull must be copied out. Terms are indexed truncated to
-  // PackedTerm::MAX_LEN; truncate identically here so an oversized query token
-  // matches what ingest indexed.
-  std::string_view copyTerm(std::string_view term) {
-    term = PackedTerm::truncate(term);
-    if (term.empty()) return {};
-    char* dst = pool.alloc(term.size());
-    std::memcpy(dst, term.data(), term.size());
-    return {dst, term.size()};
-  }
-
   std::string_view normalizeMultiterm(TokenChain& chain,
                                       std::string_view text) {
     std::string norm(text);
@@ -298,13 +285,16 @@ private:
     return poolCopy(norm);
   }
 
-  static void checkExactLength(const ResolvedFieldHandle& target, std::string_view text) {
-    if (target.fieldType->rejectLongTerms && text.size() > PackedTerm::MAX_LEN) {
+  std::string_view fitTerm(const ResolvedFieldHandle& target, std::string_view text) {
+    PackedTerm::TermBuffer scratch;
+    auto term = PackedTerm::fitTerm(target.fieldType->longTerms, text, scratch);
+    if (!term) {
       throw std::runtime_error(std::format(
           "Field '{}': exact value is {} bytes after normalization; maximum is {}. "
-          "Use match/phrase for analyzed text or a shorter whole-value string variant",
+          "Use match/phrase with shorter analyzed tokens or a shorter whole-value string variant",
           target.physicalName, text.size(), PackedTerm::MAX_LEN));
     }
+    return term->data() == scratch.data() ? poolCopy(*term) : *term;
   }
 
   // Collapse a term list into the right query type:
@@ -330,7 +320,7 @@ private:
     positions.reserve(inputPositions.size());
     int64_t base = inputPositions.empty() ? 0 : inputPositions[0];
     for (size_t i = 0; i < inputTerms.size(); i++) {
-      std::string_view term = PackedTerm::truncate(inputTerms[i]);
+      std::string_view term = fitTerm(target, inputTerms[i]);
       int64_t normalized = inputPositions[i] - base;
       if (normalized < 0 || normalized > std::numeric_limits<int32_t>::max()) {
         throw std::runtime_error(
@@ -465,8 +455,7 @@ public:
                 "Use match (field:value), phrase (field:\"words\"), or a whole-value string variant",
                 field));
           }
-          checkExactLength(target, term);
-          term = PackedTerm::truncate(term);
+          term = fitTerm(target, term);
         } else {
           term = normalizeLiteral(target, term, true);
           if (term.data() == buf) term = poolCopy(term);
@@ -544,12 +533,9 @@ public:
 
   std::string_view normalizeLiteral(const ResolvedFieldHandle& target,
                                     std::string_view text, bool exact) {
-    // ID indexing, overwrite, and delete-by-ID share this term-space policy.
-    if (target.fieldType->type() == FieldType::ID) return PackedTerm::truncate(text);
     if (auto* chain = fields.chain(target)) text = normalizeMultiterm(*chain, text);
     if (exact && (target.fieldType->type() != FieldType::STRING || target.fieldType->indexed())) {
-      checkExactLength(target, text);
-      text = PackedTerm::truncate(text);
+      text = fitTerm(target, text);
     }
     return text;
   }
@@ -573,9 +559,7 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
-        // Indexed terms carry at most PackedTerm::MAX_LEN bytes; a longer
-        // prefix is truncated so it matches terms of oversized source values.
-        return pool.make<PrefixQuery>(field, PackedTerm::truncate(prefix));
+        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
@@ -590,10 +574,10 @@ public:
     checkAutomatonField("Wildcard", target);
     if (auto* chain = fields.chain(target)) {
       FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field, pattern,
+      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
                                 &folder, automaton::compileWildcard);
     }
-    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", field, pattern,
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
                               nullptr, automaton::compileWildcard);
   }
 
@@ -606,10 +590,10 @@ public:
     checkAutomatonField("Regex", target);
     if (auto* chain = fields.chain(target)) {
       FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field, pattern,
+      return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
                                 &folder, automaton::compileRegex);
     }
-    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", field, pattern,
+    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
                               nullptr, automaton::compileRegex);
   }
 
@@ -639,6 +623,7 @@ private:
   }
 
   Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view label,
+                            const ResolvedFieldHandle& target,
                             std::string_view field, std::string_view pattern,
                             const automaton::CodepointFolder* folder,
                             automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
@@ -651,6 +636,13 @@ private:
       throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
                                            label, field, pattern, e.what()));
     }
+    // Do this before classify(), which treats languages requiring >255 bytes
+    // as empty. The DFA prefix already accounts for escapes and field folding.
+    auto prefixAndState = compiled.commonPrefixAndState();
+    auto kept = PackedTerm::fitPrefix(target.fieldType->longTerms, prefixAndState.first);
+    if (kept.size() < prefixAndState.first.size()) {
+      return pool.make<PrefixQuery>(field, poolCopy(kept));
+    }
     std::string exactOrPrefix;
     automaton::ByteDfaKind kind = compiled.classify(&exactOrPrefix);
     if (kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
@@ -658,7 +650,6 @@ private:
     std::string commonSuffix;
     automaton::ByteDfaView::State initialState = compiled.start();
     if (kind == automaton::ByteDfaKind::NORMAL) {
-      auto prefixAndState = compiled.commonPrefixAndState();
       commonPrefix = std::move(prefixAndState.first);
       auto state = prefixAndState.second;
       commonSuffix = compiled.commonSuffix();
@@ -708,7 +699,7 @@ public:
       default:
         throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
     }
-    term = PackedTerm::truncate(term);  // indexed terms are truncated; compare in their space
+    term = fitTerm(target, term); // Edit distance is measured in indexed term bytes.
     int resolvedEdits;
     if (!maxEdits) {
       resolvedEdits = autoMaxEdits(term.size());
@@ -764,7 +755,8 @@ public:
         tc.head.setValue(value);
         tc.reset();
         while (tail.incrementToken()) {
-          terms.push_back(copyTerm(tok.text));
+          // Analyzer buffers are borrowed until the next pull.
+          terms.push_back(poolCopy(fitTerm(target, tok.text)));
         }
 
         if (terms.empty()) {
@@ -843,7 +835,7 @@ public:
     // into the pool.  String/bytes arms view the request bytes, which already
     // outlive the query tree.
     if (text.data() == buf) {
-      text = copyTerm(text);
+      text = poolCopy(text);
     }
     return createMatchQuery(target, text, op, minMatch);
   }
@@ -908,7 +900,7 @@ public:
       auto termBound = [&](const api::Val& v) -> std::string_view {
         char buf[coerce::TEXT_BUF_SIZE];
         std::string_view t = fieldType.coerceTerm(v, field, buf);
-        if (t.data() == buf) t = copyTerm(t);  // rendered numerics live in stack buf
+        if (t.data() == buf) t = poolCopy(t);  // rendered numerics live in stack buf
         return normalizeLiteral(target, t, true);
       };
       std::optional<std::string_view> lower, upper;
@@ -1027,7 +1019,7 @@ public:
     std::vector<int64_t> positions;
 
     auto emit = [&](int64_t position) {
-      terms.push_back(copyTerm(tok.text));
+      terms.push_back(poolCopy(fitTerm(target, tok.text)));
       positions.push_back(position);
     };
 
@@ -1085,7 +1077,7 @@ public:
     }
     // Verbatim terms still honor the indexed-term length cap; rewrite entries
     // in place (the span is mutable by contract).
-    for (auto& t : terms) t = PackedTerm::truncate(t);
+    for (auto& t : terms) t = fitTerm(target, t);
 
     std::span<const int64_t> canonicalPositions;
     if (positions.empty()) {

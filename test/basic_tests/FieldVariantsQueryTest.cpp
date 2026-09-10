@@ -270,16 +270,107 @@ TEST_F(FieldVariantsQueryTest, exactLengthCheckedAfterNormalization) {
   EXPECT_TRUE(expr("strict_string:" + longValue + "*").empty());
 }
 
-TEST_F(FieldVariantsQueryTest, longIdQueriesAgreeWithIngestTruncation) {
+TEST_F(FieldVariantsQueryTest, longIdQueriesAgreeWithIngestHash128) {
   std::string id(300, 'x');
   auto indexed = helper.index(flatdoc("id", id), UpdateMessage::COMMIT);
   ASSERT_TRUE(indexed.success);
   ASSERT_TRUE(indexed.errors.empty());
-  std::vector<std::string> expected{id.substr(0, PackedTerm::MAX_LEN)};
+  std::vector<std::string> expected{std::string(230, 'x') + "131pru8lxm5t1cohchv0tgjtg"};
   EXPECT_EQ(expected, hits(std::format(R"({{"match":{{"id":"{}"}}}})", id)));
   EXPECT_EQ(expected, hits(std::format(R"({{"any_of":{{"field":"id","values":["{}"]}}}})", id)));
   EXPECT_EQ(expected, hits(std::format(R"({{"range":{{"field":"id","gte":"{}","lte":"{}"}}}})", id, id)));
   EXPECT_EQ(expected, expr("id:=" + id));
+}
+
+TEST_F(FieldVariantsQueryTest, hash128ExactValuesRangesFacetsAndSort) {
+  SchemaBuilder b;
+  auto& whole = b.field("whole");
+  whole.type = api::FieldDef::FieldClass::STRING;
+  whole.stored = true;
+  b.normalizer(whole, {"nfkc_cf"});
+  auto& token = b.field("token");
+  token.type = api::FieldDef::FieldClass::TEXT;
+  b.analyzer(token, "whitespace", {"nfkc_cf"});
+  b.set(helper.collection());
+  std::vector<std::string> values{std::string(260, 'X') + std::string(40, 'A'),
+                                 std::string(260, 'X') + std::string(40, 'B'),
+                                 std::string(300, 'Y')};
+  std::vector<std::pair<std::string, std::string>> termsAndIds;
+  for (size_t i = 0; i < values.size(); i++) {
+    auto id = "long" + std::to_string(i);
+    ASSERT_TRUE(helper.index(flatdoc("id", id, "whole", values[i], "token", values[i]),
+                             UpdateMessage::COMMIT).success);
+    std::string normalized = values[i];
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](char c) { return c + ('a' - 'A'); });
+    PackedTerm::TermBuffer scratch;
+    termsAndIds.emplace_back(*PackedTerm::fitTerm(TermPolicy::HASH128, normalized, scratch), id);
+    for (auto field : {"whole", "token"}) {
+      SCOPED_TRACE(field);
+      auto expected = std::vector<std::string>{id};
+      EXPECT_EQ(expected, expr(std::string(field) + ":=" + values[i]));
+      for (auto query : {
+          std::format(R"({{"match":{{"{}":"{}"}}}})", field, values[i]),
+          std::format(R"({{"any_of":{{"field":"{}","values":["{}"]}}}})", field, values[i]),
+          std::format(R"({{"range":{{"field":"{}","gte":"{}","lte":"{}"}}}})", field, values[i], values[i]),
+          std::format(R"({{"fuzzy":{{"field":"{}","term":"{}","max_edits":0}}}})", field, values[i])}) {
+        EXPECT_EQ(expected, hits(query)) << query;
+      }
+      EXPECT_TRUE(hits(std::format(R"({{"range":{{"field":"{}","gt":"{}","lte":"{}"}}}})",
+                                  field, values[i], values[i])).empty());
+      auto selected = run(std::format(R"({{"query":{{"all":true}},"fields":["id"],"ops":{{
+        "facet":{{"field_facet":{{"field":"{}","limit":0,"selected":["{}","{}"]}}}}
+      }}}})", field, values[i], values[i]));
+      EXPECT_EQ(expected, ids(*selected));
+      ASSERT_TRUE(selected->ok()) << selected->errorMsg();
+      EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{{termsAndIds.back().first, 1}}),
+                buckets(*selected->docList()->ops.at("facet")->facetResult()));
+    }
+  }
+  std::sort(termsAndIds.begin(), termsAndIds.end());
+  std::vector<std::string> expectedOrder;
+  std::vector<std::pair<std::string, int64_t>> expectedBuckets;
+  for (const auto& [term, id] : termsAndIds) {
+    expectedOrder.push_back(id);
+    expectedBuckets.emplace_back(term, 1);
+  }
+  EXPECT_EQ("long2", expectedOrder.back()); // Original order is retained within the literal prefix.
+  auto sorted = run(R"({"query":{"exists":{"field":"whole"}},"fields":["id","whole"],
+    "sorts":[{"expr":"whole"}],"ops":{"facet":{"field_facet":{"field":"whole","limit":-1}}}})");
+  EXPECT_EQ(expectedOrder, ids(*sorted, true));
+  ASSERT_TRUE(sorted->ok()) << sorted->errorMsg();
+  EXPECT_EQ(expectedBuckets, buckets(*sorted->docList()->ops.at("facet")->facetResult()));
+  EXPECT_TRUE(containsDoc(sorted->getDocs(), flatdoc("id", "long0", "whole", values[0])));
+}
+
+TEST_F(FieldVariantsQueryTest, hash128LongPatternsUseKeptLiteralPrefix) {
+  std::string first = std::string(260, 'x') + std::string(40, 'a');
+  std::string second = std::string(260, 'x') + std::string(40, 'b');
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "first", "value_s", first, "token_w", first),
+    flatdoc("id", "second", "value_s", second, "token_w", second),
+    flatdoc("id", "short", "value_s", std::string(240, 'x'), "token_w", std::string(240, 'x'))
+  }, UpdateMessage::COMMIT).success);
+  auto expected = std::vector<std::string>{"first", "second", "short"};
+  for (auto field : {"value_s", "token_w"}) {
+    for (size_t size : {230u, 231u, 255u, 280u, 300u}) {
+      auto prefix = first.substr(0, size);
+      EXPECT_EQ(expected, expr(std::string(field) + ":" + prefix + "*"));
+      EXPECT_EQ(expected, hits(std::format(R"({{"prefix":{{"field":"{}","prefix":"{}"}}}})", field, prefix)));
+      EXPECT_EQ(expected, hits(std::format(R"({{"wildcard":{{"field":"{}","pattern":"{}*"}}}})", field, prefix)));
+      EXPECT_EQ(expected, hits(std::format(R"({{"regex":{{"field":"{}","pattern":"{}.*"}}}})", field, prefix)));
+      if (size > 230) {
+        // A literal-only pattern is still a pattern, and also widens.
+        EXPECT_EQ(expected, hits(std::format(R"({{"wildcard":{{"field":"{}","pattern":"{}"}}}})", field, prefix)));
+        EXPECT_EQ(expected, hits(std::format(R"json({{"regex":{{"field":"{}","pattern":"{}(a|b)"}}}})json", field, prefix)));
+      }
+    }
+  }
+  std::string utf8;
+  for (int i = 0; i < 150; i++) utf8 += "\xc3\xa9";
+  ASSERT_TRUE(helper.index(flatdoc("id", "utf8", "value_s", utf8), UpdateMessage::COMMIT).success);
+  EXPECT_EQ((std::vector<std::string>{"utf8"}), expr("value_s:=" + utf8));
+  EXPECT_EQ((std::vector<std::string>{"utf8"}), hits(std::format(
+      R"({{"regex":{{"field":"value_s","pattern":"{}.*"}}}})", utf8.substr(0, 234))));
 }
 
 TEST_F(FieldVariantsQueryTest, scopesBindEachLeafAndSelectorsFreeze) {
@@ -380,9 +471,11 @@ TEST_F(FieldVariantsQueryTest, longTermsTruncateAfterNormalizationAcrossValueOpe
   SchemaBuilder b;
   auto& whole = b.field("whole");
   whole.type = api::FieldDef::FieldClass::STRING;
+  whole.long_terms = api::FieldDef::LongTerms::TRUNCATE;
   b.normalizer(whole, {"nfkc_cf"});
   auto& text = b.field("token");
   text.type = api::FieldDef::FieldClass::TEXT;
+  text.long_terms = api::FieldDef::LongTerms::TRUNCATE;
   b.analyzer(text, "whitespace", {"nfkc_cf"});
   b.set(helper.collection());
   // Normalization expands a 255-byte input to 256 bytes. Truncation must

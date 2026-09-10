@@ -598,7 +598,35 @@ TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsA
   }
 }
 
-TEST_F(FieldVariantsGenerationTest, longTermsPolicyChangesPreserveSignaturesAndStoredSource) {
+TEST_F(FieldVariantsGenerationTest, longTermsPolicyIsImmutableOnceMaterialized) {
+  for (auto policy : {"hash128", "truncate", "reject"}) {
+    CollectionHelper helper("main");
+    auto schema = std::format(R"({{"fields":{{"tag":{{"type":"string","long_terms":"{}"}},
+      "body":{{"type":"text","long_terms":"{}"}},"id":{{"type":"id","long_terms":"{}"}}}}}})",
+      policy, policy, policy);
+    put(helper.collection(), schema);
+    ASSERT_TRUE(helper.index(flatdoc("id", "short", "tag", "short", "body", "short")).success);
+    for (bool committed : {false, true}) {
+      if (committed) helper.commit();
+      for (auto other : {"hash128", "truncate", "reject"}) {
+        if (std::string_view(other) == policy) continue;
+        for (auto [field, type] : {std::pair{"tag", "string"}, {"body", "text"}, {"id", "id"}}) {
+          rejected(helper.collection(), std::format(
+              R"({{"fields":{{"{}":{{"type":"{}","long_terms":"{}"}}}}}})", field, type, other),
+              field, "long_terms");
+        }
+      }
+      EXPECT_NO_THROW(put(helper.collection(), schema));
+      auto json = view(*helper.getIndexWriter());
+      for (auto name : {"tag", "body", "id"}) {
+        EXPECT_EQ(policy, json["fields"][name]["representations"]["self"]["long_terms"].get<std::string>());
+      }
+    }
+    helper.clear();
+  }
+}
+
+TEST_F(FieldVariantsGenerationTest, longTermsSignaturesAndStoredSourceSurviveReopenAndMerge) {
   std::string source(300, 'x');
   auto checkSource = [&](CollectionHelper& helper) {
     auto req = localReq(helper.getSearchEngine());
@@ -606,34 +634,56 @@ TEST_F(FieldVariantsGenerationTest, longTermsPolicyChangesPreserveSignaturesAndS
     req->execute();
     EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("tag", source)));
   };
-  {
+  for (bool reopen : {false, true}) {
     LuxirNode node(config());
     CollectionHelper helper(node);
-    auto before = put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true}}})");
-    ASSERT_TRUE(helper.index(flatdoc("id", "old", "tag", source), UpdateMessage::COMMIT).success);
-    checkSource(helper);
-    auto after = put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"long_terms":"reject"}}})");
-    EXPECT_EQ(before->physical("tag")->segmentFlags(), after->physical("tag")->segmentFlags());
-    EXPECT_EQ(before->signatures().at("tag").properties, after->signatures().at("tag").properties);
-    checkSource(helper); // A current reject policy cannot make the old column source-equivalent.
-    EXPECT_FALSE(helper.index(flatdoc("id", "bad", "tag", source)).success);
-    ASSERT_TRUE(helper.index(flatdoc("id", "new", "tag", "short"), UpdateMessage::COMMIT).success);
-  }
-  {
-    LuxirNode node(config());
-    CollectionHelper helper(node);
-    EXPECT_TRUE(helper.collection().getSchema()->physical("tag")->rejectLongTerms);
+    if (!reopen) {
+      put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true}}})");
+      ASSERT_TRUE(helper.index(flatdoc("id", "old", "tag", source), UpdateMessage::COMMIT).success);
+    }
     checkSource(helper);
     auto durable = readDurableIndexInfo(helper.getIndexWriter()->dir);
-    for (const auto& signature : durable->field_signatures) EXPECT_FALSE(signature.properties.contains("long_terms"));
-    put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"long_terms":"truncate"}}})");
-    ASSERT_TRUE(helper.index(flatdoc("id", "again", "tag", source), UpdateMessage::COMMIT).success);
-    EXPECT_EQ((std::vector<std::string>{"again", "old"}), hits(helper, "tag:=" + source));
-    CollectionHelper::UpdateBuilder merge;
-    merge.commit(true, 1);
-    ASSERT_TRUE(helper.submit(merge).success);
-    checkSource(helper);
+    for (const auto& signature : durable->field_signatures) {
+      if (signature.name == "tag" || signature.name == "id") {
+        EXPECT_EQ("\"hash128\"", signature.properties.at("long_terms"));
+      }
+    }
+    rejected(helper.collection(), R"({"fields":{"tag":{"type":"string","long_terms":"reject"}}})",
+             "tag", "long_terms");
+    // Making the implicit default explicit is compatible.
+    put(helper.collection(), R"({"fields":{"tag":{"type":"string","stored":true,"long_terms":"hash128"}}})");
+    if (reopen) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "again", "tag", source), UpdateMessage::COMMIT).success);
+      CollectionHelper::UpdateBuilder merge;
+      merge.commit(true, 1);
+      ASSERT_TRUE(helper.submit(merge).success);
+      EXPECT_EQ((std::vector<std::string>{"again", "old"}), hits(helper, "tag:=" + source));
+      checkSource(helper);
+    }
   }
+}
+
+TEST_F(FieldVariantsGenerationTest, longTermsTemplateAndRemovedVariantRemainBoundToTheirPolicy) {
+  CollectionHelper helper("main");
+  put(helper.collection(), R"({"templates":{"_name":{"type":"text","variants":{"s":"string"}}}})");
+  ASSERT_TRUE(helper.index(flatdoc("book_name", "short"), UpdateMessage::COMMIT).success);
+  rejected(helper.collection(), R"({"templates":{"_name":{"type":"text","variants":{
+    "s":{"type":"string","long_terms":"truncate"}}}}})", "book_name__s", "long_terms");
+  put(helper.collection(), R"({"templates":{"_name":{"type":"text"}}})");
+  rejected(helper.collection(), R"({"templates":{"_name":{"type":"text","variants":{
+    "s":{"type":"string","long_terms":"reject"}}}}})", "book_name__s", "long_terms");
+  // An unused name is still editable.
+  put(helper.collection(), R"({"fields":{"unused":{"type":"string","long_terms":"truncate"}}})");
+  EXPECT_NO_THROW(put(helper.collection(), R"({"fields":{"unused":{"type":"string","long_terms":"hash128"}}})"));
+}
+
+TEST_F(FieldVariantsGenerationTest, signatureDoesNotAcceptAnUnrecordedTermPolicy) {
+  auto schema = Schema::createDefaultSchema();
+  FieldSignature current("id", *schema->physical("id"));
+  auto missing = current;
+  missing.properties.erase("long_terms");
+  EXPECT_THROW(missing.checkCompatible("id", current), SchemaError);
+  EXPECT_THROW(current.checkCompatible("id", missing), SchemaError);
 }
 
 } // namespace luxir::test

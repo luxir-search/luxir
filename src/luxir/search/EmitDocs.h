@@ -988,8 +988,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 
     for (auto& [resourceName, reqs] : storedByResource) {
       // Only plain single-valued column-only STRING values are source-equivalent.
-      // Indexed strings can contain truncation from an earlier schema even if
-      // the current policy rejects long terms. Any such member needs the source.
+      // Indexed columns expose term bytes, which can include a hash suffix or
+      // truncation. Keep source retrieval independent of the term policy.
       bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
         return r.fieldType->type() == FieldType::STRING && !r.multi
             && r.fieldType->hasColumn()

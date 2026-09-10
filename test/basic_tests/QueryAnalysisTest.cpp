@@ -350,38 +350,38 @@ TEST(QueryBuilderPhraseCanonicalization, rejectsNormalizedOverflow) {
       "body_un", std::span<const std::string_view>(&single, 1), {}, 50)));
 }
 
-// --- max term length (indexed terms truncate to PackedTerm::MAX_LEN) ----------
+// --- max term length (indexed terms fit PackedTerm::MAX_LEN) -----------------
 
-TEST_F(QueryAnalysisTest, oversizedTextTokenTruncatesConsistently) {
+TEST_F(QueryAnalysisTest, oversizedTextTokenHashesConsistently) {
   std::string longTok(PackedTerm::MAX_LEN + 17, 'x');
   helper.index(flatdoc("id", "d3", "body_w", "before " + longTok + " after"), UpdateMessage::COMMIT);
-  // Index and query time truncate identically, so the full oversized token
-  // matches, and the indexed term is exactly the MAX_LEN-byte prefix.
+  // Index and query time hash identically; the unhashed prefix is a different term.
   EXPECT_EQ(1, matchCount("body_w", longTok));
-  EXPECT_EQ(1, matchCount("body_w", longTok.substr(0, PackedTerm::MAX_LEN)));
+  EXPECT_EQ(0, matchCount("body_w", longTok.substr(0, PackedTerm::MAX_LEN)));
   EXPECT_EQ(0, matchCount("body_w", longTok.substr(PackedTerm::MAX_LEN)));  // the cut tail is not a term
-  // Truncation keeps one token per token: phrase positions stay adjacent.
+  // Hashing keeps one token per token: phrase positions stay adjacent.
   EXPECT_EQ(1, phraseTextCount("body_w", "before " + longTok + " after"));
 }
 
-TEST_F(QueryAnalysisTest, oversizedStringValuesCollideOnIndexedPrefix) {
+TEST_F(QueryAnalysisTest, oversizedStringValuesHaveDistinctHashes) {
   std::string prefix(PackedTerm::MAX_LEN, 'y');
   ASSERT_TRUE(helper.index(flatdoc("id", "d3", "tag_s", prefix + "first"), UpdateMessage::NO_COMMIT).success);
   ASSERT_TRUE(helper.index(flatdoc("id", "d4", "tag_s", prefix + "second"), UpdateMessage::COMMIT).success);
-  // Whole values that differ only past the indexed prefix are indistinguishable.
-  EXPECT_EQ(2, matchCount("tag_s", prefix));
-  EXPECT_EQ(2, matchCount("tag_s", prefix + "anything"));
+  EXPECT_EQ(1, matchCount("tag_s", prefix + "first"));
+  EXPECT_EQ(1, matchCount("tag_s", prefix + "second"));
+  EXPECT_EQ(0, matchCount("tag_s", prefix));
+  EXPECT_EQ(0, matchCount("tag_s", prefix + "anything"));
   EXPECT_EQ(0, matchCount("tag_s", prefix.substr(1)));
 }
 
-TEST_F(QueryAnalysisTest, oversizedIdTruncatesConsistently) {
+TEST_F(QueryAnalysisTest, oversizedIdHashesConsistently) {
   std::string longId(PackedTerm::MAX_LEN + 9, 'i');
   helper.index(flatdoc("id", longId, "body_w", "first"), UpdateMessage::NO_COMMIT, true /*overwrite*/);
   helper.index(flatdoc("id", longId, "body_w", "second"), UpdateMessage::COMMIT, true /*overwrite*/);
   // The same oversized id overwrites, it does not duplicate.
   EXPECT_EQ(0, matchCount("body_w", "first"));
   EXPECT_EQ(1, matchCount("body_w", "second"));
-  // Delete-by-id truncates the same way and finds the doc.
+  // Delete-by-id hashes the same way and finds the doc.
   helper.deleteById(longId, UpdateMessage::COMMIT);
   EXPECT_EQ(0, matchCount("body_w", "second"));
 }

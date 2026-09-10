@@ -19,6 +19,14 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   properties["multi"] = type.multiValued() ? "true" : "false";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
+  if (type.type() == FieldType::TEXT || type.type() == FieldType::ID
+      || (type.type() == FieldType::STRING && type.indexed())) {
+    switch (type.longTerms) {
+      case TermPolicy::HASH128: properties["long_terms"] = "\"hash128\""; break;
+      case TermPolicy::TRUNCATE: properties["long_terms"] = "\"truncate\""; break;
+      case TermPolicy::REJECT: properties["long_terms"] = "\"reject\""; break;
+    }
+  }
   // Include the term recording and norm choices for hand-built field types too.
   properties["posting_flags"] = std::to_string(type.flags_ &
       (FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::NUM_TOKENS_APPROX | FieldType::NUM_TOKENS_EXACT));
@@ -81,6 +89,9 @@ void FieldSignature::checkCompatible(std::string_view name, const FieldSignature
     auto it = candidate.properties.find(property);
     if (it == candidate.properties.end()) fail(property, before, "absent");
     if (it->second != before) fail(property, before, it->second);
+  }
+  for (const auto& [property, after] : candidate.properties) {
+    if (!properties.contains(property)) fail(property, "absent", after);
   }
 }
 

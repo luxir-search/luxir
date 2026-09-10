@@ -75,19 +75,41 @@ external identity. In ordinary collections, treat `id` as required at the
 producer boundary.
 
 IDs, indexed STRING values after normalization, and analyzed TEXT tokens
-share a 255-byte term space. By default, longer values truncate at a UTF-8
-boundary at or below that limit. Values sharing the retained prefix collide:
-IDs collide for overwrite and delete, strings share exact matches, sort keys,
-and facet buckets, and text tokens become indistinguishable in queries and
-token facets. Keep IDs within that bound. Exact query values and range bounds
-truncate consistently with ingest.
+share a 255-byte term space. Terms at or below 255 bytes stay unchanged. The
+default `long_terms` policy has changed from `truncate` to `hash128`. A longer
+term becomes its first 230 bytes, backed off to a UTF-8 boundary, plus exactly
+25 base36 characters of XXH3_128 of the whole term, with no separator or
+padding. The [hash format](schema.md#string-normalization-and-length) is fixed.
+Different long values have distinct IDs, exact matches, and facet buckets
+except for hash collisions. This is not attack-resistant: the hash is not
+cryptographic, and a short input can equal a generated term.
+
+Exact queries, range bounds, facet selections, overwrite, and delete apply the
+same policy. Sorts and ranges preserve byte order up to the kept prefix; beyond
+that prefix they compare the hash suffix rather than the source tail. A prefix
+query longer than the kept prefix matches that prefix alone, returning a
+superset. Wildcard and regex queries also fall back when their common leading
+literal prefix exceeds the limit; other patterns see the stored term bytes.
 
 The stored copy, when enabled, keeps the full source bytes before normalization
-or truncation; an indexed string's column instead returns its indexed prefix.
-Column-only strings (`index: "none"`) have no term-space limit. On indexed
-STRING or TEXT, `long_terms: "reject"` opts into a per-document error for an
-over-limit normalized value or analyzed token. A rejecting variant fails the
-whole document even if its primary accepts the source. IDs always truncate.
+or hashing. Indexed columns, term enumeration, and facet values return the
+stored term (prefix plus hash for a long value). The hash characters are
+digits and lowercase letters, and the prefix is already normalized output, so a
+returned term resubmitted to the same field as an exact query or facet
+`selected` value passes through its normalizer or analyzer unchanged and finds
+the same documents. The one exception is a whitespace-tokenized text token whose
+kept prefix ends in a script that a word segmenter splits per character; no
+current tokenizer produces such a token. There is no marker distinguishing a
+hash term from an ordinary short value. Column-only strings (`index: "none"`)
+stay unlimited.
+
+`long_terms: "truncate"` restores the old cut at a UTF-8 boundary at or below
+255 bytes. Shared prefixes then merge, including IDs for overwrite and delete.
+`long_terms: "reject"` fails a document containing an over-limit normalized
+string, analyzed token, or ID; query terms, bounds, selections, and delete IDs
+are errors too. A rejecting variant fails the whole document. The effective
+policy is immutable once the physical field has data; changing it requires a
+new field or variant and reindexing.
 
 With the normal `allow_dups: false`, another document with the same ID replaces
 the old document. Replacement is whole-document replacement: fields omitted by

@@ -72,7 +72,8 @@ The HTTP dialect also accepts the field-name form:
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms using their
-`long_terms` policy; IDs always truncate. Numeric and date values are coerced through the same
+`long_terms` policy; IDs and analyzed text tokens use their policy too. Numeric
+and date values are coerced through the same
 rules as indexing and matched through their columns.
 
 ## Exact membership (`any_of`)
@@ -112,13 +113,23 @@ looks up `guin` and matches `b1` and `b3`, just like `"Guin"` or a match query
 for `Guin!`. A literal producing zero terms matches nothing; `"Le Guin"`
 produces several terms and is an error.
 
-Exact STRING literals and STRING/TEXT bounds truncate to at most 255 UTF-8-safe
-bytes after normalization by default. For TEXT exact membership, truncation
-applies to the single analyzed lookup term. `long_terms: "reject"` makes these
-over-limit values teaching errors instead. The same policy applies to ingest
-and facet selections; values sharing a truncated prefix match the same terms.
-IDs always truncate. The expression forms are `field:=value` and
-`field:=(v1, v2)`; see [exact values](query-language.md#exact-values).
+Exact STRING literals, IDs, and STRING/TEXT bounds use the field's `long_terms`
+policy after normalization. TEXT exact membership applies it to the single
+analyzed lookup term. The default changed from `truncate` to `hash128`: a term
+over 255 bytes becomes a UTF-8-safe prefix of at most 230 bytes plus 25
+base36 hash characters. Terms of 255 bytes or less are unchanged. Ingest,
+exact queries, range bounds, and facet selections transform identically.
+
+`truncate` restores the old merge of shared 255-byte prefixes; `reject` fails
+the document and makes over-limit lookup terms teaching errors. Policies are
+immutable once data exists. Sorts and ranges compare the hash suffix after the
+kept prefix, so source-tail order is lost. Hashing is not attack-resistant.
+Term enumeration and facets return the stored hash term; its digits and
+lowercase letters pass through normalizers and analyzers unchanged, so it can be
+resubmitted as an exact value or `selected` entry. See
+[term-space limits](documents.md#ids-and-replacement).
+The expression forms are `field:=value` and `field:=(v1, v2)`; see
+[exact values](query-language.md#exact-values).
 
 ## Boolean
 
@@ -203,6 +214,12 @@ apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
 matches documents with at least one indexed term for the field.
 
+With `hash128`, prefixes longer than the kept prefix (at most 230 UTF-8-safe
+bytes) fall back to that prefix and return a superset. Wildcard and regex
+queries similarly fall back when their common leading literal prefix exceeds
+that limit, even for a literal-only pattern. Other patterns operate on the
+stored term bytes, including the hash suffix.
+
 ## Fuzzy
 
 ```json
@@ -224,6 +241,10 @@ matches documents with at least one indexed term for the field.
 | `max_edits` | Byte-wise Levenshtein distance from `0` to `2`. Unset uses `0` for terms of at most 2 bytes, `1` through 5 bytes, then `2`. |
 | `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
 | `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
+
+The term uses the field's `long_terms` policy before distance is measured.
+With `hash128`, edits compare the prefix plus hash, so similarity between
+source tails is not preserved.
 
 The engine also applies a current clause budget of `64` and may apply a lower
 operator limit. Expansion truncation is silent execution policy; the

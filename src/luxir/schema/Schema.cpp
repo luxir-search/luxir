@@ -179,9 +179,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   }
 
   r.longTerms = def.long_terms ? def.long_terms : parentResolved.longTerms;
-  if (r.longTerms && *r.longTerms != LongTerms::TRUNCATE && *r.longTerms != LongTerms::REJECT) {
+  if (r.longTerms && *r.longTerms != LongTerms::TRUNCATE && *r.longTerms != LongTerms::REJECT
+      && *r.longTerms != LongTerms::HASH128) {
     throw SchemaError("unknown long_terms value " + std::to_string((int)*r.longTerms) +
-                      " (field: " + std::string(name) + "); valid: truncate, reject");
+                      " (field: " + std::string(name) + "); valid: hash128, truncate, reject");
   }
 
   // column
@@ -415,8 +416,8 @@ struct FieldCompiler {
     }
 
     if (r.longTerms) {
-      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT) {
-        throw SchemaError("long_terms is only valid for string or text fields (field: " + std::string(name) + ")");
+      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT && r.type != FieldClass::ID) {
+        throw SchemaError("long_terms is only valid for string, text or id fields (field: " + std::string(name) + ")");
       }
       if (r.type == FieldClass::STRING && index == IndexMode::NONE) {
         throw SchemaError("long_terms is not valid for a string field with index=none; "
@@ -538,7 +539,11 @@ struct FieldCompiler {
         throw SchemaError("Unsupported type for field: " + std::string(name));
     }
 
-    ft->rejectLongTerms = r.longTerms == LongTerms::REJECT;
+    switch (r.longTerms.value_or(LongTerms::HASH128)) {
+      case LongTerms::HASH128: ft->longTerms = TermPolicy::HASH128; break;
+      case LongTerms::TRUNCATE: ft->longTerms = TermPolicy::TRUNCATE; break;
+      case LongTerms::REJECT: ft->longTerms = TermPolicy::REJECT; break;
+    }
     if (r.isTemplate) ft->flags_ |= FieldType::ABSTRACT;
     // Apply any resolved storedResource_ override; empty means "keep default".
     if (!derived && !logical.storedResource.empty()) ft->storedResource_ = logical.storedResource;

@@ -222,6 +222,9 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     }
   } releaseGuard{iw, inverter};
 
+  // Delete validation is recoverable and has no partial postings to discard.
+  // Roll back this request's queued ids on rejection, preserving documents
+  // already accumulated by earlier messages in the same inverter.
   try {
     // Process deletes before adds (shouldn't matter since we just queue deletes)
     if (!req->delete_ids.empty()) {
@@ -229,7 +232,15 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
         inverter.deleteId(id, this->updateVersion);
       }
     }
+  } catch (const DocumentError&) {
+    inverter.rollbackTo(requestMark);
+    throw;
+  } catch (...) {
+    releaseGuard.failure = std::current_exception();
+    throw;
+  }
 
+  try {
     // Process document additions
     if (!req->docs.empty()) {
       update(*this, inverter, requestMark);

@@ -81,11 +81,13 @@ public:
 
   void indexSingle(Inverter& inverter, std::string_view term) {
     term = stringValue.normalize(term);
-    if (fieldType->rejectLongTerms && term.size() > PackedTerm::MAX_LEN) {
+    PackedTerm::TermBuffer scratch;
+    auto fitted = PackedTerm::fitTerm(fieldType->longTerms, term, scratch);
+    if (!fitted) {
       throw DocumentError(fmt::format("Field '{}': string value is {} bytes after normalization; maximum is {}",
                                       std::string_view(fieldName), term.size(), PackedTerm::MAX_LEN));
     }
-    term = PackedTerm::truncate(term);
+    term = *fitted;
     // Assign this doc a field-rank the first time it contributes any value, recording
     // rank->docid in docsWithField.  All of a doc's terms then share that rank.
     int32_t doc = inverter.getDoc();

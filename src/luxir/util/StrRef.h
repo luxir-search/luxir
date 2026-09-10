@@ -32,6 +32,8 @@
 //
 
 #include <memory>
+#include <array>
+#include <optional>
 #include <string.h>
 #include <vector>
 #include <tuple>
@@ -43,6 +45,8 @@
 #include "MemPool.h"
 
 namespace luxir {
+
+enum class TermPolicy { HASH128, TRUNCATE, REJECT };
 
 // the general implementation to use for a non-owning Term references.
 class PackedTerm;
@@ -164,6 +168,9 @@ class PackedTerm {
 public:
   static constexpr uint32_t MAX_LEN = 255;  // maximum length of the string bytes (not including the size byte)
   static constexpr uint32_t MAX_BYTES = MAX_LEN + 1; // the maximum number of bytes in the data, including the size byte
+  static constexpr uint32_t HASH128_CHARS = 25;
+  static constexpr uint32_t HASH128_PREFIX_LEN = MAX_LEN - HASH128_CHARS;
+  using TermBuffer = std::array<char, MAX_LEN>;
   static constexpr uint32_t getMemSize(uint32_t size) noexcept { return size + 1; }
   static constexpr uint32_t getExactMemSize(uint32_t size) noexcept { return size + 1; }
 
@@ -172,11 +179,41 @@ public:
   // (a bogus continuation run longer than the cap cuts at MAX_LEN exactly).
   // Term consumers (index handlers, query building) apply this at their
   // boundary; producers (tokenizers, filters) never deal with the limit.
-  inline static std::string_view truncate(std::string_view term) noexcept {
-    if (term.size() <= MAX_LEN) return term;
-    uint32_t len = MAX_LEN;
+  inline static std::string_view truncate(std::string_view term, uint32_t limit = MAX_LEN) noexcept {
+    if (term.size() <= limit) return term;
+    uint32_t len = limit;
     while (len > 0 && ((unsigned char) term[len] & 0xC0) == 0x80) len--;
-    return term.substr(0, len ? len : MAX_LEN);
+    return term.substr(0, len ? len : limit);
+  }
+
+  // The returned view borrows term or scratch. Rejection returns nullopt so
+  // callers can report their field/operation context before appending anything.
+  // Only the length check is inline; the hash path is rare and lives out of line.
+  inline static std::optional<std::string_view> fitTerm(
+      TermPolicy policy, std::string_view term, TermBuffer& scratch) noexcept {
+    if (term.size() <= MAX_LEN) return term;
+    if (policy == TermPolicy::REJECT) return std::nullopt;
+    if (policy == TermPolicy::TRUNCATE) return truncate(term);
+    assert(policy == TermPolicy::HASH128);
+    return hashTail(term, scratch);
+  }
+
+  // Persisted format: unseeded XXH3_128bits of the WHOLE term, taken as one
+  // 128-bit big-endian number (high64 then low64) and written as exactly 25
+  // base36 digits (0-9a-z, zero padded, most significant first), appended to
+  // the first HASH128_PREFIX_LEN bytes (UTF-8 boundary). Digits and lowercase
+  // ASCII letters are fixed points of every normalizer and case fold, so a
+  // returned term resubmitted through its field lands on the same term. Never
+  // change this hash, byte order, alphabet, or prefix budget for HASH128.
+  // Defined in StrRef.cpp and kept out of line: over-limit terms are rare and
+  // the hash and encoding must not be inlined into every term consumer.
+  [[gnu::noinline, gnu::cold]]
+  static std::string_view hashTail(std::string_view term, TermBuffer& scratch) noexcept;
+
+  // Patterns cannot reconstruct a hash suffix. Beyond the kept literal
+  // prefix they conservatively match every term with that prefix.
+  inline static std::string_view fitPrefix(TermPolicy policy, std::string_view prefix) noexcept {
+    return truncate(prefix, policy == TermPolicy::HASH128 ? HASH128_PREFIX_LEN : MAX_LEN);
   }
 
   // returns the number of bytes written to the target... either sz+1 or sz+2

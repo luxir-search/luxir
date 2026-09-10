@@ -143,7 +143,7 @@ posting an authored `GET` body back keeps the same definitions under either mode
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` (none take parameters yet) |
-| `long_terms` | `string` and `text`: `truncate` (default) or `reject` for normalized whole strings or analyzed tokens over 255 bytes; invalid on `string` with `index: "none"`. Use `reject` when accepting a shared prefix as the indexed value would be incorrect. |
+| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Immutable once the physical field has data. |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |
 | `variants` | Map from label to another field definition receiving the same input value. Bare type strings work here too. |
 | `defaults` | `search` and `value` bindings, each naming `self` or a variant label; both default to `self`. |
@@ -190,7 +190,7 @@ POST /collections/names/_schema
   "fields": {
     "author": {
       "parent": "_t",
-      "variants": {"s": {"type":"string","normalizer":["nfkc_cf","fold"]}},
+      "variants": {"s": {"type":"string","normalizer":["nfkc_cf","fold"],"long_terms":"hash128"}},
       "defaults": {"value":"s"}
     },
     "edition": {"type":"int","index":"range","variants":{"label":"string"}},
@@ -286,7 +286,7 @@ POST /collections/names/_schema
 `author_name` uses `_name`; `author_name__s` selects its normalized string
 variant. The root is resolved before the label, so the tail `_s` never picks
 the default string template independently. These templates are opt-in;
-long whole names follow the STRING truncation policy below.
+long whole names follow the STRING term policy below.
 
 `_name` inherits `_t` for word search; a bare `type: text` would use the
 whitespace analyzer.
@@ -338,8 +338,8 @@ POST /collections/templates/_update
 
 This indexes `book_title` and `book_title__s`. `_title` inherits `_t`'s
 case- and accent-folding analysis. Long titles keep their full stored source;
-the string variant indexes a truncated prefix for sorting, faceting, and exact
-lookup.
+the string variant indexes a prefix plus hash suffix for sorting, faceting, and
+exact lookup.
 
 ### STRING normalization and length
 
@@ -348,26 +348,48 @@ same component syntax as analyzer filters. Each input element stays one whole
 value. Normalization applies at ingest and to query literals, facet `selected`
 values, and range bounds. Absent `normalizer` inherits; `[]` clears it.
 
-Indexed STRING values truncate to at most 255 bytes after normalization,
-backing off to a UTF-8 boundary. TEXT tokens truncate the same way after
-analysis. This applies to each element or token, not the total document length.
-Exact literals, `any_of` values, range bounds, and facet `selected` values use
+Indexed STRING values after normalization, TEXT tokens after analysis, and IDs
+share a 255-byte term space. Terms of 255 bytes or less stay unchanged. The
+default has changed from `truncate` to `hash128`: longer terms become the first
+230 bytes, backed off to a UTF-8 boundary, followed immediately by 25 base36
+characters. There is no delimiter. The suffix is unseeded XXH3_128 of the whole
+term, encoded from its canonical 16 bytes (high 64 bits then low 64 bits, both
+big-endian), using `A-Z`, `a-z`, `0-9`, `-`, and `_`, with no padding. These
+format choices are fixed for `hash128`.
+
+Different long values retain distinct exact matches and facet buckets except
+for hash collisions. This is not attack-resistant: xxHash is not cryptographic,
+and an ordinary short term can also equal a generated term. Sorts and ranges
+agree with source byte order up to the kept prefix; beyond it they compare the
+hash suffix, not the source tail. Term enumeration, facets, and indexed columns
+return the term as stored. Stored source keeps full bytes before normalization
+or hashing. Column-only strings have no term-space limit.
+
+Exact literals, `any_of` / `:=`, range bounds, and facet `selected` values use
 the same policy; TEXT exact membership applies it to the single analyzed term.
-Patterns keep their own rules. See [term-space limits](documents.md#ids-and-replacement)
-for prefix collisions and the stored-source contract.
+Match and phrase apply it per analyzed token. Prefix queries longer than the
+kept prefix fall back to that prefix, so they return a superset. Wildcard and
+regex queries do the same when their common leading literal prefix exceeds
+the limit; other patterns operate on stored term bytes. Fuzzy distance also
+compares transformed term bytes. See [term-space limits](documents.md#ids-and-replacement)
+for the implications of submitting returned hash terms to normalization.
 
-Set `long_terms: "reject"` to fail a document containing an over-limit string
-or token and to report a teaching error for an over-limit exact lookup or bound.
+`long_terms: "truncate"` restores the old behavior: cut at a UTF-8 boundary at
+or below 255 bytes, merging values with the same retained prefix (including IDs
+for overwrite/delete). `long_terms: "reject"` fails the document for an over-limit
+term and reports a teaching error for an over-limit query term, bound, or
+selection. A rejecting variant fails its entire document. Invalid delete IDs
+are request errors.
+
 Absent `long_terms` inherits through the parent chain, otherwise defaults to
-`truncate`; explicitly setting `truncate` overrides inherited `reject`. Variants
-may set the policy or borrow it through their own `parent`; they do not inherit
-it from their logical primary. The setting, including an inherited setting, is
-invalid on other types or on a STRING with `index: "none"`. Column-only strings
-have no term-space limit. IDs always truncate.
+`hash128`; an explicit policy overrides inheritance. Variants may set the policy
+or borrow it through their own `parent`; they do not inherit it from their
+logical primary. An explicitly set or inherited policy is invalid on other
+types or on a STRING with `index: "none"`.
 
-The policy can change on a live field without reindexing. Existing terms and
-stored values keep their meaning; changing to `reject` does not undo earlier
-truncation or separate colliding prefixes.
+The effective policy is part of the persisted physical field signature. Once
+data exists, switching between any of the three policies is rejected. Use a
+new field or variant label and reindex to change it.
 
 ## The operations
 
@@ -394,7 +416,7 @@ The resolved view is diagnostic, not a schema write body. It contains:
 | `fields` | Logical concrete fields, including materialized suffix-template instances. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
-| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
+| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
 | `introduced_generation` | Start of this representation's current continuous availability. A compatible removed/re-added label gets a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
 | `coverage_complete` | True for an empty index or when that minimum reaches the introduction generation. |
@@ -420,7 +442,7 @@ actually used the old definition.
 
 Once a physical name has materialized data, its indexed meaning cannot change:
 type, `multi`, index/column settings, posting settings, analyzer or normalizer,
-and vector parameters must remain compatible. A rejected schema edit returns
+`long_terms`, and vector parameters must remain compatible. A rejected schema edit returns
 `400` with `code: "invalid_schema"`, names the physical field and changed
 property, and leaves the current schema in place. The rule includes template
 edits affecting materialized dynamic roots. Unused definitions can be corrected.

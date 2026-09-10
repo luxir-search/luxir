@@ -34,6 +34,38 @@ TEST_F(UtilTest, packedTermTruncate) {
   EXPECT_EQ(cont.substr(0, PackedTerm::MAX_LEN), PackedTerm::truncate(cont));
 }
 
+TEST_F(UtilTest, packedTermHash128Format) {
+  PackedTerm::TermBuffer scratch;
+  // Pinned independently: XXH3_128bits(300 ASCII 'a') canonical hex is
+  // 5e563f2cb28d2005c1d17581d8eb7e21, which is 5l24htbmlaabor09i3b372fj5 in base36.
+  std::string value(300, 'a');
+  EXPECT_EQ(std::string(230, 'a') + "5l24htbmlaabor09i3b372fj5",
+            *PackedTerm::fitTerm(TermPolicy::HASH128, value, scratch));
+  EXPECT_EQ(value.substr(0, 255), *PackedTerm::fitTerm(TermPolicy::TRUNCATE, value, scratch));
+  EXPECT_FALSE(PackedTerm::fitTerm(TermPolicy::REJECT, value, scratch));
+  for (auto policy : {TermPolicy::HASH128, TermPolicy::TRUNCATE, TermPolicy::REJECT}) {
+    for (size_t size : {0u, 230u, 254u, 255u}) {
+      auto shortValue = std::string_view(value).substr(0, size);
+      auto term = PackedTerm::fitTerm(policy, shortValue, scratch);
+      ASSERT_TRUE(term);
+      EXPECT_EQ(shortValue, *term);
+      EXPECT_EQ(shortValue.data(), term->data());
+    }
+  }
+  // Backoff at byte 230 for 2-, 3-, and 4-byte UTF-8 codepoints.
+  for (auto codepoint : {"\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80"}) {
+    for (size_t split = 1; split < strlen(codepoint); split++) {
+      std::string prefix(230 - split, 'a');
+      value = prefix + codepoint + std::string(70, 'z');
+      auto term = PackedTerm::fitTerm(TermPolicy::HASH128, value, scratch);
+      ASSERT_TRUE(term);
+      EXPECT_EQ(prefix.size() + 25, term->size());
+      EXPECT_EQ(prefix, term->substr(0, prefix.size()));
+      EXPECT_EQ(prefix, PackedTerm::fitPrefix(TermPolicy::HASH128, value));
+    }
+  }
+}
+
 TEST_F(UtilTest, lazyMap) {
   // test exception handling
   {
