@@ -283,7 +283,7 @@ inline OpCursor& setQuery(OpCursor& cur, const api::Query& q) {
   return cur;
 }
 
-// Append a sort spec to the cursor op (TopDocs / FieldFacet / RangeFacet).
+// Append a sort spec to the cursor op (TopDocs / FieldFacet).
 inline OpCursor& sort(OpCursor& cur, std::string_view expr,
                       SortDir dir = SortDir::UNKNOWN) {
   auto& mr = cur.mr();

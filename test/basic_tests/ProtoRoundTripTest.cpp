@@ -285,8 +285,8 @@ void roundTripType(const char* nm) {
   X(SearchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \
   X(UpdateResponse) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                                    \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
-  X(ArrArrBin) X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
-  X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
+  X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
+  X(ColFloat) X(ColDouble) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
   X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \

@@ -5,19 +5,23 @@ syntax = "proto3";
 
 import "luxir_types.proto";
 
-option java_package = "org.apache.luxir";
+option java_package = "org.luxir";
 option java_outer_classname = "LuxirProto";
 option objc_class_prefix = "Luxir";
 
 package luxir;
 
 service Indexer {
+  // Index or delete documents, with an optional commit.
   rpc Update(UpdateRequest) returns (UpdateResponse) {}
+
+  // One response per request; request_id correlates responses with requests.
   rpc UpdateStream(stream UpdateRequest) returns (stream UpdateResponse) {}
 }
 
 service Searcher {
-  // Search is bidirectional streaming; a client may send one request and read until more is false.
+  // Each request produces one or more responses, ending with more=false.
+  // Use request_id to correlate responses when sending multiple requests.
   rpc Search(stream SearchRequest) returns (stream SearchResponse) {}
 }
 

@@ -699,7 +699,7 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
         if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
     }
     // monostate can't occur here (loaders always emplace a kind when
-    // numDocs > 0); ColMap/ArrVal are never produced by the doc loaders.
+    // numDocs > 0).
   }
   return rows;
 }

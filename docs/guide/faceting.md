@@ -83,10 +83,11 @@ exist in the collection but have zero matches in the current domain.
 Integer and date representations facet on each distinct column value. Text
 representations facet on analyzed terms, not on the original stored text: faceting `body_t` answers
 "which indexed terms occur?", while faceting `category_s` answers "which
-category values occur?" Integer/date/text field facets currently support
-`limit`, positive `mincount`, and `missing`, but not sub-operations or custom
-sorts. Use a range facet when numeric values should be bucketed rather than
-enumerated.
+category values occur?" Integer/date/text field facets support `limit`,
+`mincount`, and `missing`, but not sub-operations or custom sorts. TEXT also
+accepts `mincount: 0` to include indexed terms outside the current domain;
+INT/DATE require a positive value when set. Use a range facet when numeric
+values should be bucketed rather than enumerated.
 
 A nonempty `selected` is supported for facets directly under the query's
 `ops`: not at the root of a full-form request, under a `fusion`, or nested
@@ -404,8 +405,7 @@ string facet has the same semantics as it does under a string bucket. Empty
 range buckets therefore emit null expression metrics. The executor processes
 stateful child bindings in bounded blocks rather than retaining every bucket's
 state at once. Range facets with sub-operations are limited to 1,024 buckets.
-Custom sorts are not yet supported for range facets; buckets remain in fence
-order.
+Range facets return buckets in lower-bound order.
 
 Range facet `selected` values are generated bucket lower fences. They refine
 the result in the same way and remain in fence order; selection only exempts a

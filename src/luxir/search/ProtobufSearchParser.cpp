@@ -602,11 +602,6 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range gap or calendar_gap is required");
     }
-    if (!facetReq.sorts.empty()) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': sorts are not yet supported for range facets");
-    }
-
     auto* fieldType = target.fieldType;
     if (fieldType->type() != FieldType::Type::INT
         && fieldType->type() != FieldType::Type::DATE
@@ -754,7 +749,7 @@ public:
             : doubleToSortableInt64(canonical);
       });
       return luxir::arenaCreate<IntFacetRangeReq>(
-          req.arena, req, facetReq, facetField, facetName, parsed.values,
+          req.arena, req, facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, fieldType->type(), minCount,
           facetReq.missing, selected);
     }
@@ -801,7 +796,7 @@ public:
     });
 
     return luxir::arenaCreate<IntFacetRangeReq>(
-        req.arena, req, facetReq, facetField, facetName, parsed.values,
+        req.arena, req, facetField, facetName, parsed.values,
         parsed.affine, parsed.affineGap, fieldType->type(), minCount,
         facetReq.missing, selected);
   }

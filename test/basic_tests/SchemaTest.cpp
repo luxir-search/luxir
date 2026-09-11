@@ -1291,7 +1291,7 @@ TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
 
 TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
   for (auto policy : {"hash128", "truncate", "reject"}) {
-    for (auto type : {"int", "float", "double", "date", "bin", "vector", "geo_point"}) {
+    for (auto type : {"int", "float", "double", "date", "vector", "geo_point"}) {
       auto json = std::format(R"({{"fields":{{"{}":{{"type":"{}","long_terms":"{}"}}}}}})",
                               "bad", type, policy);
       SCOPED_TRACE(json);

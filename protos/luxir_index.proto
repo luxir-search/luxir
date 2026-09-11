@@ -19,11 +19,10 @@ message IndexInfo {
   repeated AuxIndexInfo aux_indexes = 16;
 }
 
-// Stored in the existing _schema_<generation> file. The public authored
-// SchemaDef remains unchanged; introductions must survive schema-only updates.
+// Authored schema and field introduction history stored in _schema_<generation>.
 message SchemaInfo {
-  bytes source_def = 1;
-  map<string, uint64> introduced_gen = 2;
+  bytes source_def = 1; // encoded luxir.SchemaDef
+  map<string, uint64> introduced_gen = 2; // physical field name to introduction generation
 }
 
 // An auxiliary index entry built at a particular commit. Used for both

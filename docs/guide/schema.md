@@ -178,7 +178,7 @@ posting an authored `GET` body back keeps the same definitions under either mode
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types; `column:true` is rejected for analyzed text |
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
-| `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
+| `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_` |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold`, `english_possessive`, `kstem`. Only `kstem` takes parameters: optional boolean `possessive` (default true). |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Changes do not rewrite existing terms. |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |

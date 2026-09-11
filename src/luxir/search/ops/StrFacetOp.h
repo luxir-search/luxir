@@ -377,6 +377,7 @@ public:
 
   void init() override {
     FacetReq::init();
+    auto sorts = fieldFacet.sorts;
     if (!sorts.empty()) {
       if (sorts.size() > 1) {
         throw std::runtime_error("facet '" + std::string(facetName)
@@ -2155,7 +2156,7 @@ public:
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
     if (context.stringColumn == nullptr || ordMap == nullptr
-        || !subOps.empty() || !inlineSubOps.empty() || !sorts.empty()) {
+        || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sorts.empty()) {
       return nullptr;
     }
     for (const auto& bucket : context.stringColumn->buckets) {

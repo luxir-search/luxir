@@ -2814,11 +2814,6 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
     {"text_subop", [](LocalReq& req) {
       req.facet("f", "body_w").avg("avg", "foo_i");
     }, "not yet supported for text field facets"},
-    {"range_sort", [](LocalReq& req) {
-      auto& facet = req.rangeFacet("f", "foo_i");
-      facet.range(0, 10, 1);
-      qb::sort(facet, "avg", qb::ASC);
-    }, "not yet supported for range facets"},
     {"range_mincount_negative", [](LocalReq& req) {
       req.rangeFacet("f", "foo_i").range(0, 10, 1).mincount(-1);
     }, "mincount must be >= 0"},

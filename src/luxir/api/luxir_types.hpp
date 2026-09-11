@@ -73,9 +73,9 @@ struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
-struct ArrArrDouble; struct ArrArrBin; struct Vector; struct ArrVector;
+struct ArrArrDouble; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
-struct ColFloat; struct ColDouble; struct ColMap; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
+struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
@@ -106,7 +106,7 @@ enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
@@ -343,7 +343,6 @@ struct CollectionCacheControl {                                 // needs ShardCa
 struct CacheControlResponse { std::span<const CollectionCacheControl> collections; };
 
 struct Vector { std::optional<ArrFloat> f32; };                  // needs ArrFloat
-struct ArrArrBin { std::span<const ArrBin> v; };
 struct ArrArrStr { std::span<const ArrStr> v; };
 struct ArrArrInt { std::span<const ArrInt> v; };
 struct ArrArrFloat { std::span<const ArrFloat> v; };
@@ -379,12 +378,11 @@ struct DeleteCollectionRequest { std::string_view name; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
 struct MultiVector { std::span<const ArrVector> v; };
-struct ColMap { std::span<const Map> v; };                       // span<incomplete Map> OK
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
 
 struct Column {                                                  // variant arms all complete above
   std::variant<std::monostate, ColStr, ColInt, ColFloat, ColDouble, ArrArrStr, ArrArrInt,
-               ArrArrFloat, ArrArrDouble, ColMap, ArrVal, ColVector, MultiVector>
+               ArrArrFloat, ArrArrDouble, ColVector, MultiVector>
       kind;
 };
 
@@ -508,7 +506,6 @@ struct RangeFacet {                                             // needs Val,Cal
   ::hpp_proto::optional_indirect_view<Val> start;
   ::hpp_proto::optional_indirect_view<Val> end;
   std::optional<std::int64_t> mincount;
-  std::span<const SortSpec> sorts;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::string_view time_zone;
   ::hpp_proto::optional_indirect_view<Val> selected;
@@ -636,9 +633,9 @@ LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult
 LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
-LUXIR_TD(ArrArrDouble) LUXIR_TD(ArrArrBin) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
+LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
-LUXIR_TD(ColFloat) LUXIR_TD(ColDouble) LUXIR_TD(ColMap)
+LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
@@ -677,10 +674,10 @@ LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
 LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)
-LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(ArrArrBin) LUXIR_ENTRY(Vector)
+LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(Vector)
 LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
-LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(ColMap) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
+LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)

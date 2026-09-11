@@ -178,8 +178,29 @@ see the filter:
 ]
 ```
 
-Routing wrappers are accepted by the JSON and protobuf APIs but currently fail
-validation until routed filter execution is implemented.
+The filter still restricts the document results, but the named operations in
+`TopDocs.ops` run without it. Names must be distinct, nonempty keys in that
+map. Routing is supported by both JSON and protobuf; Fusion filters and
+Fusion source filters do not accept `except_ops`.
+
+An operation directly in `SearchRequest.ops` or `TopDocs.ops` may also set a
+`domain`:
+
+```json
+"brands": {
+  "field_facet": {"field":"brand_s"},
+  "domain": {"query":"stock_s:yes", "apply_parent_filters":true}
+}
+```
+
+`domain.query` replaces the incoming document set with that query's matches
+across the collection. Without it, the operation inherits its incoming set.
+`domain.filter` adds local constraints in either case. With a replacement
+query, `apply_parent_filters: true` reapplies the immediate parent's filters,
+including facet selections, while respecting `except_ops`. It defaults to
+false and requires `domain.query`; it does not restore the parent's query or
+ancestor domain. Domain overrides are not supported directly in `Fusion.ops`
+or beneath facet buckets.
 
 ## Phrase
 

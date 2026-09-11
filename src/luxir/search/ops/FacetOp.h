@@ -41,17 +41,12 @@ public:
   int64_t minCount; // minimum count for a facet to be included in the result
   bool missing;
 
-  // Non-owning view of the request proto's repeated sorts (a trivially
-  // copyable span into the kept-alive request bytes, valid for the request
-  // lifetime).  Held by value.
-  ReqSortList sorts;
   std::string_view facetName;
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
-    int64_t limit, int64_t minCount, bool missing,
-    ReqSortList sorts)
+    int64_t limit, int64_t minCount, bool missing)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
-      sorts(sorts), facetName(facetName) {
+      facetName(facetName) {
   }
 
   virtual ~FacetReq() = default;
@@ -119,7 +114,7 @@ public:
     std::string_view fieldName, std::string_view facetName, int64_t limit,
     int64_t minCount, bool missing, std::span<const int64_t> selectedInts,
     std::span<const std::string_view> selectedStrings) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing, fieldFacet.sorts),
+  FacetReq(req, fieldName, facetName, limit, minCount, missing),
   fieldFacet(fieldFacet), selectedInts(selectedInts),
   selectedStrings(selectedStrings) {}
 
@@ -533,9 +528,9 @@ public:
   FixedBucketFacetReq(
       SearchRequest& req, std::string_view fieldName,
       std::string_view facetName, int64_t minCount, bool missing,
-      ReqSortList sorts, size_t numBuckets,
+      size_t numBuckets,
       std::span<const size_t> selectedBuckets)
-    : FacetReq(req, fieldName, facetName, -1, minCount, missing, sorts),
+    : FacetReq(req, fieldName, facetName, -1, minCount, missing),
       numBuckets(numBuckets), selectedBuckets(selectedBuckets) {}
 
   size_t bucketCount() const { return numBuckets; }
@@ -804,15 +799,13 @@ public:
 
   std::span<const int64_t> bucketFences() const { return fences; }
 
-  // rangeFacet must reference the request proto (not a temporary): FacetReq
-  // captures a span over rangeFacet.sorts that points into the request bytes.
-  IntFacetRangeReq(SearchRequest& req, const ReqRangeFacet& rangeFacet,
+  IntFacetRangeReq(SearchRequest& req,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
     FieldType::Type valueType, int64_t minCount, bool missing,
     std::span<const size_t> selectedBuckets)
   : FixedBucketFacetReq(
-        req, fieldName, facetName, minCount, missing, rangeFacet.sorts,
+        req, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
     fences(fences), affineGap(affineGap), valueType(valueType),
     affine(affine) {}
@@ -896,7 +889,7 @@ public:
       int64_t start = rangeOp().fences.front();
       int64_t end = rangeOp().fences.back();
       auto& segment = rangeOp().reader.segments()[segnum];
-      bool noSubOps = rangeOp().subOps.empty() && rangeOp().sorts.empty();
+      bool noSubOps = rangeOp().subOps.empty();
       if (!IntFacetRangeReq::disablePointsRangeFacetForTests
           && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
           && start < end) {
@@ -1005,7 +998,7 @@ public:
       std::string_view facetName, std::span<Query*> bucketQueries,
       std::span<Query::Weight*> bucketWeights)
     : FixedBucketFacetReq(
-          req, {}, facetName, 0, false, {}, queryFacet.buckets.size(), {}),
+          req, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
       queryFacet(queryFacet), bucketQueries(bucketQueries),
       bucketWeights(bucketWeights),
       preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
