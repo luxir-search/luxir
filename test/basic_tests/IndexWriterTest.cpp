@@ -29,6 +29,7 @@
 #include "luxir/reader/FieldReader.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/Signal.h"
+#include <future>
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
@@ -468,6 +469,36 @@ TEST_F(IndexWriterTest, getReader) {
   ASSERT_NE(reader, reader2);  // It's possible this could spuriously fail if the sleep wasn't long enough or the system clock is changed.
   ASSERT_EQ(2, reader2->maxDoc());
   ASSERT_EQ(2, reader2->segments().size());
+}
+
+// A request the current reader satisfies must not wait for a reopen in
+// progress: from inside the reopen (lock held), a permissive-freshness
+// acquisition on another thread returns the previous reader at once.
+TEST_F(IndexWriterTest, acquisitionSatisfiedByCurrentReaderDoesNotWaitForReopen) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  addDoc(iw);
+  iw.commit();
+  auto reader = iw.getIndexReader();
+  addDoc(iw);
+  iw.commit();
+
+  std::future<std::shared_ptr<IndexReader>> concurrent;
+  bool returnedDuringReopen = false;
+  Signal::listen("indexReaderOpened", [&](void* source, void*, void*) -> void* {
+    if (source != &iw) return nullptr;
+    concurrent = std::async(std::launch::async, [&] { return iw.getIndexReader(10'000'000); });
+    returnedDuringReopen = concurrent.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    return nullptr;
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpened"); });
+  auto fresh = iw.getIndexReader();
+  ASSERT_TRUE(concurrent.valid());
+  EXPECT_TRUE(returnedDuringReopen);
+  EXPECT_EQ(reader, concurrent.get());
+  EXPECT_NE(reader, fresh);
+  EXPECT_EQ(2, fresh->maxDoc());
+  EXPECT_EQ(fresh, iw.getIndexReader());
 }
 
 TEST_F(IndexWriterTest, filterCachePublishesOnlyInstalledReaders) {

@@ -531,34 +531,47 @@ void IndexWriter::setSchema(std::shared_ptr<Schema> schema) {
 
 std::shared_ptr<IndexReader> IndexWriter::getIndexReader(uint64_t freshness_us) {
   if (isClosed()) throw IndexWriterClosedError("index writer is closed");
-  // TODO: a reopen blocks every other acquisition for its duration; the
-  // unchanged-reader fast path should not have to wait on it.
+  // A newer commit exists and the caller wants it (freshness_us == 0: always
+  // the newest; otherwise only once the reader's commit is older than that).
+  auto stale = [&](const IndexReader& reader) {
+    if (lastAdvertisedCommitTime <= reader.commitTime()) return false;
+    if (freshness_us == 0) return true;
+    auto now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return now - reader.commitTime() > freshness_us;
+  };
+  auto schemaChanged = [&](const IndexReader& reader) {
+    return schemaIdentity.load(std::memory_order_acquire) != reader.schema().get();
+  };
+
+  // Fast path, no lock: the published reader is acceptable as it is, so a
+  // reopen in progress on another thread never delays this request.
+  auto reader = indexReader.load(std::memory_order_acquire);
+  if (reader && !stale(*reader) && !schemaChanged(*reader)) return reader;
+
+  // One thread reopens or swaps the schema; the others that need the result
+  // wait here and then find it published, so re-check under the lock.
   const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
-  bool reopen = !indexReader ||
-      (lastAdvertisedCommitTime > indexReader->commitTime() &&
-       (freshness_us == 0 || (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-           std::chrono::system_clock::now().time_since_epoch()).count() -
-           indexReader->commitTime() > freshness_us));
-  if (reopen) {
+  reader = indexReader.load(std::memory_order_acquire);
+  if (!reader || stale(*reader)) {
     // Capture the schema after opening so a schema change during the open is included.
-    auto core = std::make_shared<IndexReader::PhysicalCore>(
-        dir, indexReader ? indexReader->core.get() : nullptr);
+    auto core = std::make_shared<IndexReader::PhysicalCore>(dir, reader ? reader->core.get() : nullptr);
     Signal::emit("indexReaderOpened", this);
     auto schema = currentSchema.load();
-    indexReader = std::shared_ptr<IndexReader>(
-        new IndexReader(std::move(core), std::move(schema), filterCache));
-    filterCache->onReaderPublished(*indexReader);
-  } else if (schemaIdentity.load(std::memory_order_acquire) != indexReader->schema().get()) {
+    reader = std::shared_ptr<IndexReader>(new IndexReader(std::move(core), std::move(schema), filterCache));
+    filterCache->onReaderPublished(*reader);
+    indexReader.store(reader, std::memory_order_release);
+  } else if (schemaChanged(*reader)) {
     auto schema = currentSchema.load();
     // Record the schema actually copied, never the advisory identity. Sharing
     // the core preserves segment identities and all physical lazy state; no
     // filter-cache publication is needed for an unchanged physical snapshot.
-    if (schema != indexReader->schema()) {
-      indexReader = std::shared_ptr<IndexReader>(
-          new IndexReader(indexReader->core, std::move(schema), filterCache));
+    if (schema != reader->schema()) {
+      reader = std::shared_ptr<IndexReader>(new IndexReader(reader->core, std::move(schema), filterCache));
+      indexReader.store(reader, std::memory_order_release);
     }
   }
-  return indexReader;
+  return reader;
 }
 
 Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Schema> pinned) {
@@ -2667,7 +2680,7 @@ void IndexWriter::testDeleteAllData() {
     }
 
     // dump the current IndexReader
-    indexReader.reset();
+    indexReader.store(nullptr, std::memory_order_release);
     filterCache = std::move(freshFilterCache);
 
     // drop all idle inverters (unflushed segments)

@@ -325,7 +325,10 @@ public:
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
 
-  std::shared_ptr<IndexReader> indexReader;
+  // The reader searches use. Published under indexReaderMutex, loaded without
+  // it: a request the current reader satisfies never waits on a reopen in
+  // progress (see getIndexReader).
+  std::atomic<std::shared_ptr<IndexReader>> indexReader;
   std::shared_ptr<FilterCache> filterCache;
   // Construction-time cache config. Namespace rewinds (testDeleteAllData, a
   // future truncate) rebuild the cache from THIS, not from the installed
