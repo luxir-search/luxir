@@ -278,13 +278,16 @@ under the key `author__s`; `author__self` returns the primary under that key,
 including its stored source. Output keys deduplicate, not physical sources,
 so `author` and `author__self` can both appear.
 
-Default discovery and wildcards never expand into variants. `author*` discovers
-logical names only, while `author__*` is an error asking for an exact selector
-such as `author__s` or `author__self`. A `stored: false` TEXT primary is omitted
-from discovery even if its variant has a column. Naming an unretrievable TEXT
-representation explicitly is an error; retrieve its logical primary for source
-text. A multi-valued string variant returns a sorted, deduplicated set while
-the stored primary retains source order and duplicates.
+Default discovery and patterns without `__` never expand into variants:
+`author*` discovers logical names only. A pattern containing `__` expands over
+variants that have a column, under their physical names: `author__*` returns
+`author__s`, and `*__s` returns every `s` variant in the index. TEXT variants
+are skipped, `__self` is never discovered (name it explicitly), and a
+`stored: false` TEXT primary does not hide its variants from such patterns,
+although that primary itself is omitted from discovery. Naming an
+unretrievable TEXT representation explicitly is an error; retrieve its logical
+primary for source text. A multi-valued string variant returns a sorted,
+deduplicated set while the stored primary retains source order and duplicates.
 
 The underlying gRPC response remains a typed `DocList`: dense columns and row
 maps can coexist, `row_count` is authoritative, and `_score_` is a synthetic

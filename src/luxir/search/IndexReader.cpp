@@ -370,25 +370,25 @@ std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projec
   return projectable;
 }
 
-std::span<const IndexReader::LogicalProjectableField> IndexReader::logicalProjectableFields() {
+std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() {
   assert(sharedSchema);
-  std::call_once(logicalProjectableOnce, [this] {
-    std::vector<LogicalProjectableField> fields;
+  std::call_once(retrievableOnce, [this] {
+    std::vector<RetrievableField> fields;
     for (const auto& source : projectableFields()) {
-      auto root = source.name.substr(0, source.name.rfind("__"));
+      auto split = source.name.rfind("__");
+      bool derived = split != std::string_view::npos;
+      auto root = derived ? source.name.substr(0, split) : source.name;
       if (root.empty() || root[0] == '_') continue;
-      // Only the primary's own sources can admit a root. Its entry is already
-      // in this sorted catalog if present; sibling entries add no candidates.
-      if (root != source.name) continue;
       FieldType* type;
       try {
-        type = sharedSchema->getFieldTypePtr(root);  // physical primary, never a binding
+        type = sharedSchema->getFieldTypePtr(source.name);  // physical primary or variant, never a binding
       } catch (const RequestError&) {
         // A template edit may make an old concrete root invalid for this schema.
         continue;
       }
       if (!type) continue;
-      bool stored = type->isStored() && std::ranges::find(source.storedResources,
+      // Variants have no stored copy; only a primary's own source admits a root.
+      bool stored = !derived && type->isStored() && std::ranges::find(source.storedResources,
           std::string_view(type->storedResource_)) != source.storedResources.end();
       bool retrievable = false;
       switch (type->type()) {
@@ -410,11 +410,11 @@ std::span<const IndexReader::LogicalProjectableField> IndexReader::logicalProjec
         default:
           break;
       }
-      if (retrievable) fields.push_back({root, type});
+      if (retrievable) fields.push_back({source.name, type, derived});
     }
-    logicalFields = std::move(fields);
+    retrievable = std::move(fields);
   });
-  return logicalFields;
+  return retrievable;
 }
 
 }

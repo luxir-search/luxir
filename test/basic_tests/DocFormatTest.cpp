@@ -509,12 +509,25 @@ TEST_F(FieldVariantsProjectionTest, explicitKeysWinWildcardPlacementAndDeduplica
       "edition", (int64_t)42, "editor_name", "Other Editor"));
 }
 
-TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachExactAndSourceForms) {
-  for (const char* pattern : {"author__*", "*__s", "author*__self"}) {
-    auto req = project({pattern});
-    ASSERT_FALSE(req->ok());
-    EXPECT_NE(std::string::npos, req->errorMsg().find("exact selector"));
-  }
+// A pattern containing "__" expands over variants with a column: the TEXT
+// variant author__words is skipped, a stored: false primary does not hide its
+// variant, "__self" is a selector alias that no pattern reaches, and a
+// derived pattern never surfaces roots.
+TEST_F(FieldVariantsProjectionTest, derivedWildcardsExpandVariantsWithColumns) {
+  auto req = project({"id", "author__*", "*__label", "author*__self"});
+  ASSERT_OK(req);
+  EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "author__s", "le guin",
+      "edition__label", "0042"));
+  EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "b"));
+  auto all = project({"id", "*__s"});
+  ASSERT_OK(all);
+  EXPECT_CONTAINS_DOC(all->getDocs(), flatdoc("id", "a", "author__s", "le guin",
+      "author_hidden__s", "invisible", "authors__s", vecs("ada", "zed"),
+      "editor_name__s", "other editor"));
+  EXPECT_CONTAINS_DOC(all->getDocs(), flatdoc("id", "b", "translator_name__s", "a translator"));
+}
+
+TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachSourceForms) {
   auto stored = project({"author__words"});
   ASSERT_FALSE(stored->ok());
   EXPECT_EQ("Field 'author__words' has no retrievable value; retrieve logical root 'author' instead",
@@ -556,11 +569,11 @@ TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachExactAndSourceForms) {
   EXPECT_NE(std::string::npos, unknown->errorMsg().find("Unknown variant label"));
 }
 
-TEST_F(FieldVariantsProjectionTest, logicalCatalogUsesSchemaIdentityAndPrimaryPresence) {
+TEST_F(FieldVariantsProjectionTest, retrievableCatalogUsesSchemaIdentityAndPrimaryPresence) {
   auto reader = helper.getIndexWriter()->getIndexReader();
   auto schema = helper.collection().getSchema();
-  auto catalog = reader->logicalProjectableFields();
-  EXPECT_EQ(catalog.data(), reader->logicalProjectableFields().data());
+  auto catalog = reader->retrievableFields();
+  EXPECT_EQ(catalog.data(), reader->retrievableFields().data());
 
   SchemaBuilder b;
   auto& hidden = b.field("author_hidden");
@@ -575,17 +588,17 @@ TEST_F(FieldVariantsProjectionTest, logicalCatalogUsesSchemaIdentityAndPrimaryPr
   auto replacement = helper.getIndexWriter()->getIndexReader(UINT64_MAX);
   EXPECT_EQ(schema, reader->schema());
   EXPECT_EQ(other, replacement->schema());
-  auto changed = replacement->logicalProjectableFields();
+  auto changed = replacement->retrievableFields();
   EXPECT_NE(catalog.data(), changed.data());
-  EXPECT_EQ(changed.data(), replacement->logicalProjectableFields().data());
+  EXPECT_EQ(changed.data(), replacement->retrievableFields().data());
   EXPECT_EQ(changed.end(), std::ranges::find(changed, std::string_view("author"),
-                                          &IndexReader::LogicalProjectableField::name));
+                                          &IndexReader::RetrievableField::name));
   // author_hidden has only a sibling column in the physical catalog. Merely
   // enabling source storage in another schema cannot discover absent source.
   EXPECT_EQ(changed.end(), std::ranges::find(changed, std::string_view("author_hidden"),
-                                          &IndexReader::LogicalProjectableField::name));
+                                          &IndexReader::RetrievableField::name));
   EXPECT_NE(catalog.end(), std::ranges::find(catalog, std::string_view("author"),
-                                          &IndexReader::LogicalProjectableField::name));
+                                          &IndexReader::RetrievableField::name));
 }
 
 TEST_F(DocFormatTest, storedPlainAndNormalizedStringsReturnSourceValues) {
@@ -653,7 +666,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   ASSERT_TRUE(ch.index(flatdoc("id", "a", "text", "Source", "string", "Value"),
                        UpdateMessage::COMMIT).success);
   auto reader = ch.getIndexWriter()->getIndexReader();
-  auto original = reader->logicalProjectableFields();
+  auto original = reader->retrievableFields();
 
   // Both names occur in the old store. Only STRING has a usable fallback
   // when a different schema selects a resource this reader does not have.
@@ -662,7 +675,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   auto schema = b.build(ch.collection().getSchema().get());
   ch.collection().setSchema(schema);
   auto replacement = ch.getIndexWriter()->getIndexReader();
-  auto current = replacement->logicalProjectableFields();
+  auto current = replacement->retrievableFields();
   EXPECT_NE(original.data(), current.data());
   ASSERT_EQ(2u, current.size());
   EXPECT_EQ("id", current[0].name);
@@ -721,9 +734,9 @@ TEST_F(DocFormatTest, schemaChangeUpdatesSearchAndProjectionWithoutCommit) {
   checkProjection();
   EXPECT_EQ(oldSchema, before->schema);
   EXPECT_CONTAINS_DOC(before->getDocs(), flatdoc("id", "a", "title", "Source", "year_i", (int64_t)2026));
-  EXPECT_NE(reader->logicalProjectableFields().end(), std::ranges::find(
-      reader->logicalProjectableFields(), std::string_view("title"),
-      &IndexReader::LogicalProjectableField::name));
+  EXPECT_NE(reader->retrievableFields().end(), std::ranges::find(
+      reader->retrievableFields(), std::string_view("title"),
+      &IndexReader::RetrievableField::name));
 
   ASSERT_TRUE(ch.index(flatdoc("id", "b", "added", "New Value"), UpdateMessage::COMMIT).success);
   auto fresh = project({"added"});

@@ -153,9 +153,13 @@ public:
     std::vector<std::string_view> storedResources;
   };
 
-  struct LogicalProjectableField {
+  // One retrievable representation: a logical root (its primary's stored
+  // source or own column) or a derived variant (its own column), named by
+  // its physical name.
+  struct RetrievableField {
     std::string_view name;
     FieldType* type;
+    bool derived;
   };
 
 private:
@@ -181,8 +185,8 @@ private:
   const std::shared_ptr<PhysicalCore> core;
   const std::shared_ptr<Schema> sharedSchema;
   const std::shared_ptr<FilterCache> sharedFilterCache;
-  std::once_flag logicalProjectableOnce;
-  std::vector<LogicalProjectableField> logicalFields;
+  std::once_flag retrievableOnce;
+  std::vector<RetrievableField> retrievable;
 
   IndexReader(std::shared_ptr<PhysicalCore> core, std::shared_ptr<Schema> schema,
               std::shared_ptr<FilterCache> filterCache);
@@ -269,11 +273,12 @@ public:
     return core->projectableFields();
   }
 
-  // Logical roots whose primary retrieval source is represented in the
-  // physical catalog, excluding vectors, geo and engine names. Built once
-  // for this reader's schema and sorted for wildcard prefix traversal.
+  // The representations of the physical catalog that this reader's schema
+  // can retrieve: logical roots whose primary source is present and variants
+  // with a column, excluding vectors, geo and engine names. Built once for
+  // this reader's schema and sorted by name for wildcard prefix traversal.
   // Names and types remain valid while the caller holds the reader.
-  std::span<const LogicalProjectableField> logicalProjectableFields();
+  std::span<const RetrievableField> retrievableFields();
 
   // Direct tools/tests may omit the schema if they only use physical state.
   IndexReader(Directory& dir, IndexReader* previousReader = nullptr,

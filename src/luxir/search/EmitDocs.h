@@ -1122,10 +1122,13 @@ inline bool globMatch(std::string_view pattern, std::string_view name) {
 }
 
 // Resolve the request's returned-field selectors.  An empty list projects the
-// default set: every name in the reader's logical catalog, "id" first,
-// the rest in name order.  A selector containing '*' is a pattern: it expands
-// in place to the catalog names it matches (name order) - so patterns never
-// surface variants, vectors, geo, or engine '_' names, and a
+// default set: every logical root in the reader's retrievable catalog, "id"
+// first, the rest in name order.  A selector containing '*' is a pattern: it
+// expands in place to the catalog names it matches (name order).  A pattern
+// containing "__" expands over derived representations (variants with a
+// column, by physical name); any other pattern expands over logical roots.
+// So patterns never surface vectors, geo, or engine '_' names, "__self" (a
+// selector alias, not a representation), or variants unless asked for, and a
 // pattern matching nothing contributes nothing, never an error.  Explicit
 // names may name anything, including _version_ and vectors; an unknown name
 // throws here, before any batch is assembled.  Explicit wins on collision: a
@@ -1145,7 +1148,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
-  auto pushDiscovered = [&](const IndexReader::LogicalProjectableField& field) {
+  auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
     picked.push_back({field.name, field.name, field.type, true});
   };
   auto pushExplicit = [&](std::string_view f) {
@@ -1172,33 +1175,28 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, false});
   };
   if (fields.empty()) {
-    auto catalog = req.reader->logicalProjectableFields();
+    auto catalog = req.reader->retrievableFields();
     picked.reserve(catalog.size());
-    for (const auto& field : catalog) pushDiscovered(field);
+    for (const auto& field : catalog) {
+      if (!field.derived) pushDiscovered(field);
+    }
     auto idIt = std::ranges::find(picked, std::string_view("id"), &ReturnField::outputKey);
     if (idIt != picked.end()) std::rotate(picked.begin(), idIt, idIt + 1);
   } else if (std::ranges::none_of(fields, isPattern)) {
     picked.reserve(fields.size());
     for (std::string_view f : fields) pushExplicit(f);
   } else {
-    auto catalog = req.reader->logicalProjectableFields();
+    auto catalog = req.reader->retrievableFields();
     boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> taken;
     for (std::string_view f : fields) {
-      if (!isPattern(f)) {
-        taken.insert(f);
-      } else if (f.find("__") != std::string_view::npos) {
-        auto prefix = f.substr(0, std::min(f.find('*'), f.find("__")));
-        std::string root(prefix.empty() ? "field" : prefix);
-        throw RequestError("Returned-field wildcard '" + std::string(f) +
-                           "' cannot contain '__'; use an exact selector such as '" +
-                           root + "__label' or '" + root + "__self'", "invalid_field");
-      }
+      if (!isPattern(f)) taken.insert(f);
     }
     for (std::string_view f : fields) {
       if (!isPattern(f)) {
         pushExplicit(f);
         continue;
       }
+      bool derived = f.find("__") != std::string_view::npos;
       // The catalog is sorted: gallop to the pattern's literal prefix and
       // stop as soon as the prefix no longer holds.
       std::string_view prefix = f.substr(0, f.find('*'));
@@ -1206,7 +1204,7 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
           [&](int64_t i) { return catalog[i].name; });
       for (size_t i = (size_t)start; i < catalog.size() && catalog[i].name.starts_with(prefix); ++i) {
         const auto& field = catalog[i];
-        if (globMatch(f, field.name) && taken.insert(field.name).second) {
+        if (field.derived == derived && globMatch(f, field.name) && taken.insert(field.name).second) {
           pushDiscovered(field);
         }
       }

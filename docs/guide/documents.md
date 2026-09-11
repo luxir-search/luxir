@@ -233,7 +233,8 @@ under the selector key; a TEXT variant has no retrievable value.
 
 Omitting `fields` returns retrievable logical fields except vectors and engine
 fields; name fields, or use `*` wildcard patterns such as `"attr_*"`, to
-project a subset. Wildcards never expand variants; `author__*` is an error.
+project a subset. Patterns without `__` never expand variants; `author__*` or
+`*__s` discovers variants that have a column.
 A `stored: false` TEXT primary is omitted even if a variant can be retrieved (see
 [Searching](searching.md#field-retrieval-and-result-shape)). HTTP row format
 omits missing fields; HTTP column format includes the requested key with

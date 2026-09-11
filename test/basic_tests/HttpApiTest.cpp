@@ -2634,13 +2634,11 @@ TEST_F(HttpApiTest, fieldVariantProjectionKeepsLogicalDiscoveryAndExactKeys) {
       "author__s", "le guin", "author__self", "LE GUIN"));
   EXPECT_EQ(std::string::npos, selected.rawResponse().find("\"columns\""));
 
-  HttpReq invalid(port());
-  invalid.matchQuery("author__s", "le guin").fields({"author__*"}).execute();
-  // Projection resolves during execution; streaming keeps HTTP 200 and
-  // reports the request error in the response body.
-  ASSERT_EQ(200, invalid.status()) << invalid.rawResponse();
-  EXPECT_NE(std::string::npos, invalid.rawResponse().find("\"error\""));
-  EXPECT_NE(std::string::npos, invalid.rawResponse().find("author__label"));
+  HttpReq derived(port());
+  derived.matchQuery("author__s", "le guin").fields({"id", "author__*"}).execute();
+  ASSERT_EQ(200, derived.status()) << derived.rawResponse();
+  EXPECT_CONTAINS_DOC(derived.getDocs(), flatdoc("id", "a", "author__s", "le guin"));
+  EXPECT_CONTAINS_DOC(derived.getDocs(), flatdoc("id", "b", "author__s", "le guin"));
 }
 
 // A string field containing JSON-significant characters round-trips through the
