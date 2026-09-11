@@ -4,20 +4,29 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <format>
-#include <map>
+#include <memory>
 #include <vector>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_node_map.hpp>
 #include "luxir/schema/Schema.h"
+#include "luxir/util/StrRef.h"
 
 namespace luxir {
 
 // Parse-local handles bridge schema-aware syntax and query lowering without
 // changing request spellings. Neither names nor mutable chains enter Schema.
+// A request resolves the same few names clause after clause, so a hit must
+// not allocate: the memos find by string_view, and the node map keeps the
+// returned handles at stable addresses while later clauses add entries.
 class FieldResolver {
+  using Handles = boost::unordered_node_map<std::string, ResolvedFieldHandle,
+                                            PackedTermHash, PackedTermEqual>;
   Schema& schema;
   std::vector<std::string>* explanations;
-  std::map<std::pair<std::string, OpClass>, ResolvedFieldHandle> fields;
-  std::map<FieldType*, std::unique_ptr<TokenChain>> chains;
+  std::array<Handles, (size_t)OpClass::PRIMARY + 1> fields;  // one memo per OpClass
+  boost::unordered_flat_map<FieldType*, std::unique_ptr<TokenChain>> chains;
 
 public:
   explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr)
@@ -25,11 +34,11 @@ public:
 
   const ResolvedFieldHandle& resolve(std::string_view name, OpClass op,
                                      std::string_view context = {}) {
-    auto key = std::make_pair(std::string(name), op);
-    auto found = fields.find(key);
-    if (found == fields.end()) {
+    auto& memo = fields[(size_t)op];
+    auto found = memo.find(name);
+    if (found == memo.end()) {
       auto target = schema.resolveFor(name, op);
-      found = fields.emplace(std::move(key), std::move(target)).first;
+      found = memo.emplace(std::string(name), std::move(target)).first;
     }
     const auto& target = found->second;
     if (explanations && !context.empty() && name != target.physicalName) {

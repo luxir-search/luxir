@@ -26,7 +26,7 @@ public:
 using PhysicalFieldMap = boost::unordered_flat_map<std::string, std::shared_ptr<FieldType>,
                                                     PackedTermHash, PackedTermEqual>;
 
-enum class OpClass { SEARCH, VALUE, EXISTS, RETRIEVE, PRIMARY };
+enum class OpClass { SEARCH, VALUE, EXISTS, RETRIEVE, PRIMARY };  // PRIMARY stays last: memos are sized by it
 enum class FieldRole { PRIMARY, VARIANT };
 
 // One input shape, with source storage on the primary and independent physical bundles.
