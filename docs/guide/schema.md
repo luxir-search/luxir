@@ -374,9 +374,9 @@ the limit; other patterns operate on stored term bytes. Fuzzy distance also
 compares transformed term bytes. See [term-space limits](documents.md#ids-and-replacement)
 for the implications of submitting returned hash terms to normalization.
 
-`long_terms: "truncate"` restores the old behavior: cut at a UTF-8 boundary at
-or below 255 bytes, merging values with the same retained prefix (including IDs
-for overwrite/delete). `long_terms: "reject"` fails the document for an over-limit
+`long_terms: "truncate"` cuts at a UTF-8 boundary at or below 255 bytes
+instead, merging values with the same retained prefix (including IDs for
+overwrite/delete). `long_terms: "reject"` fails the document for an over-limit
 term and reports a teaching error for an over-limit query term, bound, or
 selection. A rejecting variant fails its entire document. Invalid delete IDs
 are request errors.

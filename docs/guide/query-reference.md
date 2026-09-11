@@ -120,8 +120,8 @@ over 255 bytes becomes a UTF-8-safe prefix of at most 230 bytes plus 25
 base36 hash characters. Terms of 255 bytes or less are unchanged. Ingest,
 exact queries, range bounds, and facet selections transform identically.
 
-`truncate` restores the old merge of shared 255-byte prefixes; `reject` fails
-the document and makes over-limit lookup terms teaching errors. Policy edits do
+`truncate` cuts at the limit instead, merging shared 255-byte prefixes;
+`reject` fails the document and makes over-limit lookup terms teaching errors. Policy edits do
 not validate or rewrite existing terms; use a new field or variant label and
 reindex to change the policy safely. Sorts and ranges compare the hash suffix
 after the kept prefix, so source-tail order is lost. Hashing is not attack-resistant.

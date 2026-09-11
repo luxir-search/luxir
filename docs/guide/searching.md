@@ -220,8 +220,8 @@ terms matches nothing. Several terms are an error suggesting match, phrase,
 or a whole-value string variant.
 
 Indexed STRING values, analyzed TEXT tokens, and IDs default to
-`long_terms: "hash128"` (previously `truncate`). After normalization/analysis,
-terms over 255 bytes become a UTF-8-safe prefix of at most 230 bytes plus 25
+`long_terms: "hash128"`. After normalization/analysis, terms over 255 bytes
+become a UTF-8-safe prefix of at most 230 bytes plus 25
 base36 hash characters; shorter terms stay unchanged. Exact queries, range
 bounds, and facet selections apply the same transform. Sorts and ranges retain
 source order only up to the prefix; the hash suffix determines the rest.
@@ -229,8 +229,8 @@ source order only up to the prefix; the hash suffix determines the rest.
 Prefixes longer than the kept prefix return a superset by falling back to that
 prefix. Wildcard and regex queries also fall back when their common leading
 literal prefix exceeds the limit; other patterns see stored term bytes.
-`truncate` restores the old shared-prefix merges; `reject` fails documents and
-over-limit query terms. Policy edits do not validate or rewrite existing terms;
+`truncate` cuts at the limit instead, merging values that share a prefix;
+`reject` fails documents and over-limit query terms. Policy edits do not validate or rewrite existing terms;
 use a new field or variant label and reindex to change the policy safely.
 Hashing is not attack-resistant. Facets and term enumeration return stored hash
 terms; a stored source still returns the full value. Column-only strings are unlimited.

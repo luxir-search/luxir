@@ -100,9 +100,8 @@ request order with exact counts. These appended buckets are exempt from
 sub-operation results as ordinary buckets.
 
 Selection uses the facet's resolved representation for both normalization and
-refinement. STRING values, TEXT tokens, and IDs default to `long_terms: "hash128"`
-(previously `truncate`). After normalization/analysis, a term over 255 bytes
-becomes a UTF-8-safe prefix of at most 230 bytes plus 25 base36 hash
+refinement. STRING values, TEXT tokens, and IDs default to `long_terms: "hash128"`.
+After normalization/analysis, a term over 255 bytes becomes a UTF-8-safe prefix of at most 230 bytes plus 25 base36 hash
 characters. Shorter terms are unchanged. Distinct long values have distinct
 buckets except for hash collisions; `selected` transforms full values identically.
 Facets and term enumeration return the term as stored, including its hash suffix.
@@ -112,8 +111,8 @@ source value for `selected`; see [term-space limits](documents.md#ids-and-replac
 Sorts and ranges retain source byte order only up to the kept prefix. Prefix
 queries longer than it return a superset; wildcard/regex queries also fall back
 when their common leading literal prefix exceeds it. Hashing is not
-attack-resistant. `truncate` restores the old shared-prefix bucket merge;
-`reject` fails over-limit ingest and makes over-limit selections request errors.
+attack-resistant. `truncate` cuts at the limit instead, merging shared-prefix
+buckets; `reject` fails over-limit ingest and makes over-limit selections request errors.
 Policy edits do not validate or rewrite existing terms; use a new field or
 variant label and reindex to change the policy safely. Column-only strings
 have no term-space limit but cannot serve field facets.

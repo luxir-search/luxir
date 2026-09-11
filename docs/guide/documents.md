@@ -76,8 +76,7 @@ producer boundary.
 
 IDs, indexed STRING values after normalization, and analyzed TEXT tokens
 share a 255-byte term space. Terms at or below 255 bytes stay unchanged. The
-default `long_terms` policy has changed from `truncate` to `hash128`. A longer
-term becomes its first 230 bytes, backed off to a UTF-8 boundary, plus exactly
+default `long_terms` policy is `hash128`: a longer term becomes its first 230 bytes, backed off to a UTF-8 boundary, plus exactly
 25 base36 characters of XXH3_128 of the whole term, with no separator or
 padding. The [hash format](schema.md#string-normalization-and-length) is fixed.
 Different long values have distinct IDs, exact matches, and facet buckets
@@ -103,8 +102,8 @@ current tokenizer produces such a token. There is no marker distinguishing a
 hash term from an ordinary short value. Column-only strings (`index: "none"`)
 stay unlimited.
 
-`long_terms: "truncate"` restores the old cut at a UTF-8 boundary at or below
-255 bytes. Shared prefixes then merge, including IDs for overwrite and delete.
+`long_terms: "truncate"` cuts at a UTF-8 boundary at or below 255 bytes
+instead. Shared prefixes then merge, including IDs for overwrite and delete.
 `long_terms: "reject"` fails a document containing an over-limit normalized
 string, analyzed token, or ID; query terms, bounds, selections, and delete IDs
 are errors too. A rejecting variant fails the whole document. The effective
