@@ -5,7 +5,10 @@
 #include "test/TestData.h"
 #include "luxir/analysis/Analyzer.h"
 #include "luxir/analysis/KStemmer.h"
+#include "luxir/api/build.h"
 #include "luxir/schema/FieldType.h"
+
+#include <optional>
 
 using namespace luxir;
 
@@ -22,13 +25,20 @@ using namespace luxir;
 //                          every offset. Upper bound on the offset cost.
 template <bool ConsumeOffset>
 static void BM_Tokenize(benchmark::State& state, std::string tokenizer,
-                        std::vector<std::string> filters) {
+                        std::vector<std::string> filters, std::optional<bool> possessive = std::nullopt) {
   Book& book = TestData::data->getBook();
   if (skipBenchIfDataMissing(state, !book.text().empty(), "book.txt")) return;
   std::string_view text = book.text();
 
-  TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS, tokenizer, std::move(filters));
-  auto chain = ft.createAnalyzer("body");
+  std::pmr::monotonic_buffer_resource arena;
+  api::AnalyzerDef def;
+  def.tokenizer.emplace().name = tokenizer;
+  auto* components = api::build::allocArray(def.filters, filters.size(), arena);
+  for (size_t i = 0; i < filters.size(); ++i) components[i].name = filters[i];
+  if (possessive.has_value()) {
+    api::build::mapSlot(components[filters.size() - 1].params, 1, "possessive", arena)->kind = *possessive;
+  }
+  auto chain = Analyzer::compile(def)->createChain();
   Token& tok = chain->head.getToken();
   TokenStream& tail = *chain->tail;
 
@@ -59,10 +69,17 @@ TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, whitespace_off, "whitespace", std::v
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, standard_text, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, standard_off, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, folded_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold"})->UseRealTime();
-TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, kstem_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold", "kstem"})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, kstem_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold", "kstem"}, false)->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, possessive_separate, "unicode_word",
+    std::vector<std::string>{"nfkc_cf", "fold", "english_possessive", "kstem"}, false)->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, possessive_integrated, "unicode_word",
+    std::vector<std::string>{"nfkc_cf", "fold", "kstem"})->UseRealTime();
 
 // Isolate stemming from segmentation/folding, preserving the book's token
 // distribution. Tokens own their bytes because the analysis chain is transient.
+enum class PossessiveMode { NONE, SEPARATE, INTEGRATED };
+
+template <PossessiveMode Mode>
 static void BM_KStem(benchmark::State& state) {
   Book& book = TestData::data->getBook();
   if (skipBenchIfDataMissing(state, !book.text().empty(), "book.txt")) return;
@@ -75,9 +92,16 @@ static void BM_KStem(benchmark::State& state) {
   while (chain->tail->incrementToken()) terms.emplace_back(chain->head.getToken().text);
   KStemmer stemmer;
   for (auto _ : state) {
-    for (const auto& term : terms) benchmark::DoNotOptimize(stemmer.stem(term));
+    for (const auto& term : terms) {
+      if constexpr (Mode == PossessiveMode::INTEGRATED) benchmark::DoNotOptimize(stemmer.stem<true>(term));
+      else if constexpr (Mode == PossessiveMode::SEPARATE) {
+        benchmark::DoNotOptimize(stemmer.stem<false>(removeEnglishPossessive(term)));
+      } else benchmark::DoNotOptimize(stemmer.stem<false>(term));
+    }
   }
   state.counters["tok_rate"] =
       benchmark::Counter(terms.size() * state.iterations(), benchmark::Counter::kIsRate);
 }
-TUNING_BENCHMARK(BM_KStem)->UseRealTime();
+TUNING_BENCHMARK(BM_KStem<PossessiveMode::NONE>)->UseRealTime();
+TUNING_BENCHMARK(BM_KStem<PossessiveMode::SEPARATE>)->UseRealTime();
+TUNING_BENCHMARK(BM_KStem<PossessiveMode::INTEGRATED>)->UseRealTime();

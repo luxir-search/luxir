@@ -102,6 +102,17 @@ TEST_F(QueryAnalysisTest, defaultTextStemsAtIndexAndQueryTime) {
   EXPECT_EQ(0, req->getMatchCount()); // explicit terms stay verbatim
 }
 
+TEST_F(QueryAnalysisTest, defaultTextRemovesPossessivesBeforeStemming) {
+  helper.index(flatdoc("id", "title", "title_t", "Winter's Tale American\xe2\x80\x99s",
+                       "title_un", "Winter's Tale"), UpdateMessage::COMMIT);
+  EXPECT_EQ(1, matchCount("title_t", "winter"));
+  EXPECT_EQ(1, matchCount("title_t", "WINTER\xef\xbc\x87S"));
+  EXPECT_EQ(1, phraseTextCount("title_t", "Winter Tale"));
+  EXPECT_EQ(1, matchCount("title_t", "american")); // american -> america after stripping
+  EXPECT_EQ(1, matchCount("title_t", "AMERICAN'S"));
+  EXPECT_EQ(0, matchCount("title_un", "winter"));
+}
+
 TEST_F(QueryAnalysisTest, textPhraseOrderMatters) {
   // Reversed order is not an adjacent phrase in either doc.
   EXPECT_EQ(0, phraseTextCount("body_un", "Anderson Thomas"));

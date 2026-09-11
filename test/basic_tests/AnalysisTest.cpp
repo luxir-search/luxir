@@ -66,6 +66,79 @@ Analysis analyze(TokenChain& tc, std::string_view val) {
 
 class AnalysisTest : public LuxirTest {};
 
+TEST_F(AnalysisTest, englishPossessive) {
+  TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "keyword", {"english_possessive"});
+  auto chain = ft.createAnalyzer("body");
+  for (auto [input, expected] : {
+         std::pair{"Winter's", "Winter"}, {"JAMES'S", "JAMES"},
+         {"Winter\xe2\x80\x99s", "Winter"}, {"Winter\xef\xbc\x87S", "Winter"},
+         {"'s", ""}, {"\xe2\x80\x99S", ""}, {"\xef\xbc\x87s", ""},
+         {"it's", "it"}, {"don't", "don't"}, {"dogs'", "dogs'"},
+         {"dogs\xe2\x80\x99", "dogs\xe2\x80\x99"},
+         {"winter\xe2\x80\x98s", "winter\xe2\x80\x98s"},
+         {"winter's's", "winter's"}, {"s", "s"}, {"'", "'"}}) {
+    std::string source = input;
+    auto out = analyze(*chain, source);
+    EXPECT_EQ((std::vector<std::string>{expected}), out.terms) << input;
+    EXPECT_EQ((std::vector<int>{0}), out.positions);
+    EXPECT_EQ((std::vector<int>{0}), out.starts);
+    EXPECT_EQ((std::vector<int>{(int) source.size()}), out.ends);
+    EXPECT_EQ(input, source);
+    EXPECT_EQ(source.data(), chain->head.getToken().text.data());
+  }
+  EXPECT_TRUE(analyze(*chain, "").terms.empty());
+}
+
+TEST_F(AnalysisTest, possessiveKstemConfigurationAndChainParity) {
+  std::shared_ptr<const Analyzer> fused;
+  {
+    std::pmr::monotonic_buffer_resource arena;
+    api::AnalyzerDef def;
+    ASSERT_TRUE(api::read_json(def, R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold",
+      {"name":"kstem","params":{"possessive":true}}]})", arena));
+    fused = Analyzer::compile(def);
+  } // factory owns its option, independent of the authored arena
+  auto integrated = fused->createChain();
+  std::unique_ptr<TokenChain> separate;
+  {
+    std::pmr::monotonic_buffer_resource arena;
+    api::AnalyzerDef def;
+    ASSERT_TRUE(api::read_json(def, R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold",
+      "english_possessive",{"name":"kstem","params":{"possessive":false}}]})", arena));
+    separate = Analyzer::compile(def)->createChain();
+  }
+  std::string source = "WINTER'S Tale American\xe2\x80\x99s PONIES\xef\xbc\x87S winter's's";
+  auto expected = analyze(*separate, source);
+  auto actual = analyze(*integrated, source);
+  EXPECT_EQ((std::vector<std::string>{"winter", "tale", "america", "pony", "winter's"}), actual.terms);
+  EXPECT_EQ(expected.terms, actual.terms);
+  EXPECT_EQ(expected.positions, actual.positions);
+  EXPECT_EQ(expected.starts, actual.starts);
+  EXPECT_EQ(expected.ends, actual.ends);
+  for (auto* chain : {separate.get(), integrated.get()}) {
+    std::string term = "AMERICAN'S";
+    chain->normalizeTerm(term);
+    EXPECT_EQ("american's", term); // neither strips nor stems multiterm literals
+  }
+
+  for (auto [params, expected] : {
+         std::pair{"{}", "america"}, {R"({"possessive":true})", "america"},
+         {R"({"possessive":false})", "american's"}}) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::AnalyzerDef def;
+    ASSERT_TRUE(api::read_json(def, std::string(R"({"filters":[{"name":"kstem","params":)") + params + "}]}", arena));
+    auto chain = Analyzer::compile(def)->createChain();
+    EXPECT_EQ((std::vector<std::string>{expected, "pony"}), analyze(*chain, "american's ponies").terms);
+  }
+  for (auto params : {R"({"possessive":"true"})", R"({"possessive":1})", R"({"possessive":null})",
+                      R"({"possessive":[]})", R"({"possessive":{}})", R"({"unknown":true})"}) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::AnalyzerDef def;
+    ASSERT_TRUE(api::read_json(def, std::string(R"({"filters":[{"name":"kstem","params":)") + params + "}]}", arena));
+    EXPECT_THROW(Analyzer::compile(def), std::invalid_argument) << params;
+  }
+}
+
 TEST_F(AnalysisTest, kstemPreservesSourceOffsetsAndPositions) {
   TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS,
                    "unicode_word", {"nfkc_cf", "fold", "kstem"});
@@ -85,6 +158,8 @@ TEST_F(AnalysisTest, kstemPreservesSourceOffsetsAndPositions) {
   chain->normalizeTerm(term);
   EXPECT_EQ("ponies", term); // multiterm normalization folds without stemming
   EXPECT_EQ((std::vector<std::string>{"pony"}), analyze(*chain, "PONIES").terms);
+  EXPECT_EQ((std::vector<std::string>{"america", "winter's"}),
+            analyze(*chain, "AMERICAN'S winter's's").terms); // bare kstem removes one possessive
 }
 
 TEST_F(AnalysisTest, whitespaceBasic) {
@@ -260,7 +335,8 @@ TEST_F(AnalysisTest, unknownComponentIsRejected) {
     TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace", {"stemmer"});
     FAIL() << "unknown filter accepted";
   } catch (const std::invalid_argument& e) {
-    EXPECT_EQ("unknown filter 'stemmer'; valid filters: lowercase, nfkc_cf, fold, kstem", std::string(e.what()));
+    EXPECT_EQ("unknown filter 'stemmer'; valid filters: lowercase, nfkc_cf, fold, english_possessive, kstem",
+              std::string(e.what()));
   }
 }
 

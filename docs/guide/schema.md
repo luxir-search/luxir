@@ -64,7 +64,7 @@ The complete suffix set is:
 | `_wl` | Stored text split on whitespace, Unicode-lowercased; no normalization or accent folding. |
 | `_u` | Stored Unicode-word text, case- and accent-sensitive. |
 | `_un` | Stored Unicode-word text with NFKC case folding; accents preserved. |
-| `_t` | Stored Unicode-word text with NFKC case folding, accent folding, and KStem English stemming. |
+| `_t` | Stored Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. |
 | `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
 
 Numeric suffixes are column-backed but do not build a points index by default;
@@ -75,12 +75,35 @@ unambiguous explicit definition.
 
 The `kstem` filter uses Lucene's dictionary-based Krovetz English stemmer:
 for example, `ponies` becomes `pony`, while recognized dictionary words are
-preserved. It runs at both index and query time for `_t` fields. In custom
+preserved or replaced by their dictionary mapping. It runs at both index and query time for `_t` fields. In custom
 analyzers, put it after `lowercase` or `nfkc_cf`, and after `fold` if used.
 Tokens containing anything outside lowercase ASCII letters, or with lengths
-outside 3-49 letters, pass through. Prefix, wildcard, regex, and fuzzy query
-normalization applies case/accent folding without stemming. KStem is not
-available in STRING normalizers.
+outside 3-49 letters, pass through stemming.
+
+`english_possessive` removes one trailing apostrophe followed by `s` or `S`,
+matching Lucene's EnglishPossessiveFilter. It accepts ASCII apostrophes, right
+single quotation marks (U+2019), and fullwidth apostrophes (U+FF07). Other
+apostrophes and a bare trailing apostrophe are unchanged. For example,
+`Winter's` becomes `Winter`; `don't` and `dogs'` remain unchanged by the filter.
+The tokenizer may already discard a trailing apostrophe before filtering.
+
+Bare `"kstem"` includes equivalent possessive removal by default, stripping
+the suffix before stemming within one filter stage. `_t` uses this default.
+To request stemming alone, disable possessive removal explicitly:
+
+```json
+{"name":"kstem","params":{"possessive":false}}
+```
+
+The standalone filter is useful without stemming. When placing it before
+`kstem`, set `possessive: false` on KStem so removal happens only once.
+Possessive removal applies even when the remaining word is non-ASCII or
+outside KStem's length range. Source spelling, offsets, and positions are
+preserved. Thus `title_t:winter` matches `Winter's Tale`.
+
+Prefix, wildcard, regex, and fuzzy query normalization applies case/accent
+folding without possessive removal or stemming. Neither `english_possessive`
+nor `kstem` is available in STRING normalizers.
 
 For Unicode text without English stemming, use `_un`, or configure
 `unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
@@ -154,7 +177,7 @@ posting an authored `GET` body back keeps the same definitions under either mode
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
-| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold`, `kstem` (none take parameters yet) |
+| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold`, `english_possessive`, `kstem`. Only `kstem` takes parameters: optional boolean `possessive` (default true). |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Changes do not rewrite existing terms. |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |
 | `variants` | Map from label to another field definition receiving the same input value. Bare type strings work here too. |
@@ -286,8 +309,9 @@ POST /collections/names/_schema
 {
   "templates": {
     "_name": {
-      "parent": "_t",
-      "variants": {"s":{"parent":"_s","normalizer":["nfkc_cf","fold"]}},
+      "type": "text",
+      "analyzer": {"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},
+      "variants": {"s":{"parent":"_s"}},
       "defaults": {"value":"s"}
     },
     "_names": {"parent":"_name","multi":true}
@@ -295,13 +319,15 @@ POST /collections/names/_schema
 }
 ```
 
-`author_name` uses `_name`; `author_name__s` selects its normalized string
+`author_name` uses `_name`; `author_name__s` selects its original whole-name string
 variant. The root is resolved before the label, so the tail `_s` never picks
 the default string template independently. These templates are opt-in;
 long whole names follow the STRING term policy below.
 
-`_name` inherits `_t` for word search; a bare `type: text` would use the
-whitespace analyzer.
+`_name` explicitly selects word search with case and accent folding, without
+English stemming or possessive removal. Its string variant preserves the
+supplied spelling for facets and sorting; name normalization belongs upstream.
+A bare `type: text` would use the whitespace analyzer.
 
 `variants` and `defaults` each inherit atomically: absent inherits, present
 replaces the whole object, and `{}` clears it. There is no per-label merge.

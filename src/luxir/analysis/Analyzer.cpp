@@ -402,6 +402,24 @@ std::unique_ptr<TokenStream> makeLowercaseFilter(std::unique_ptr<TokenStream> so
   return std::make_unique<LowercaseFilter>(std::move(source));
 }
 
+class EnglishPossessiveFilter : public TokenFilter {
+public:
+  EnglishPossessiveFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    token.text = removeEnglishPossessive(token.text);
+    return true;
+  }
+
+  // Like stemming, possessive removal is analysis-only, not normalization.
+};
+
+std::unique_ptr<TokenStream> makeEnglishPossessiveFilter(std::unique_ptr<TokenStream> source) {
+  return std::make_unique<EnglishPossessiveFilter>(std::move(source));
+}
+
+template <bool Possessive>
 class KStemFilter : public TokenFilter {
   KStemmer stemmer;
 public:
@@ -409,15 +427,35 @@ public:
 
   bool incrementToken() override {
     if (!source().incrementToken()) return false;
-    token.text = stemmer.stem(token.text);
+    token.text = stemmer.stem<Possessive>(token.text);
     return true;
   }
 
   // Inherit normalization forwarding: multiterm input is folded, never stemmed.
 };
 
-std::unique_ptr<TokenStream> makeKStemFilter(std::unique_ptr<TokenStream> source) {
-  return std::make_unique<KStemFilter>(std::move(source));
+std::unique_ptr<const TokenFilterFactory> kstemFilter(const api::AnalyzerComponent& def) {
+  struct Factory : TokenFilterFactory {
+    bool possessive = true;
+
+    std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+      if (possessive) return std::make_unique<KStemFilter<true>>(std::move(source));
+      return std::make_unique<KStemFilter<false>>(std::move(source));
+    }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = std::string(def.name);
+  factory->normalizing = false;
+  for (const auto& [key, value] : def.params) {
+    if (key != "possessive") {
+      throw std::invalid_argument("filter 'kstem': unknown parameter '" + std::string(key) +
+                                  "'; valid parameters: possessive");
+    }
+    auto* flag = std::get_if<bool>(&value->kind);
+    if (!flag) throw std::invalid_argument("filter 'kstem': parameter 'possessive' must be a boolean");
+    factory->possessive = *flag;
+  }
+  return factory;
 }
 
 void requireNoParams(const api::AnalyzerComponent& def, std::string_view kind) {
@@ -483,7 +521,8 @@ constexpr FilterEntry FILTERS[] = {
   {"lowercase", plainFilter<makeLowercaseFilter>},
   {"nfkc_cf", plainFilter<makeNfkcCasefoldFilter>},
   {"fold", plainFilter<makeAccentFoldFilter>},
-  {"kstem", plainFilter<makeKStemFilter, false>},
+  {"english_possessive", plainFilter<makeEnglishPossessiveFilter, false>},
+  {"kstem", kstemFilter},
 };
 
 template <class Entry, size_t N>

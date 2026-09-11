@@ -938,9 +938,9 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   //   _u   Unicode word segmentation, raw (case- and accent-sensitive)
   //   _un  Unicode word segmentation + NFKC_CF, accents PRESERVED (the opt-out
   //        for accent-sensitive languages: Swedish a-ring, Spanish n-tilde, ...)
-  //   _t   the general default: _un + accent fold + KStem English stemming.
-  //        cafe matches cafe-with-accent; ponies matches pony. Non-ASCII tokens
-  //        pass through KStem; use _un to preserve accents and skip stemming.
+  //   _t   the general default: _un + accent fold + English possessive removal
+  //        and KStem. winter matches Winter's; ponies matches pony. Use _un
+  //        to preserve accents and skip possessive removal and stemming.
   setAnalyzer(add(templates, "_w", FieldClass::TEXT), "whitespace");
   setAnalyzer(add(templates, "_wl", FieldClass::TEXT), "whitespace", {"lowercase"});
   setAnalyzer(add(templates, "_u", FieldClass::TEXT), "unicode_word");

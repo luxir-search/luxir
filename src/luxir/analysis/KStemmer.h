@@ -6,11 +6,13 @@
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include "luxir/analysis/EnglishPossessive.h"
 
 namespace luxir {
 
 // Lucene's dictionary-based Krovetz English stemmer. Input must already be
-// lowercase ASCII; other tokens and lengths outside [3, 49] pass through.
+// lowercase ASCII; plain stemming passes through other tokens and lengths
+// outside [3, 49]. Optional possessive removal applies before those limits.
 // Each instance owns scratch space and is not thread-safe. The dictionary is
 // immutable and shared by all instances. No per-token allocations.
 class KStemmer {
@@ -31,7 +33,11 @@ public:
 
   // Borrows unchanged input, static dictionary storage, or this instance's
   // scratch buffer. The result is valid until the next stem() call.
+  // Possessive=true is equivalent to stem<false>(removeEnglishPossessive(term)).
+  // Select it at chain construction, leaving no runtime option on each token.
+  template <bool Possessive = true>
   std::string_view stem(std::string_view term) {
+    if constexpr (Possessive) term = removeEnglishPossessive(term);
     if (term.size() < 3 || term.size() >= MaxWordLen) return term;
     // A false result proves identity; candidates still go through the dictionary.
     unsigned last = (unsigned char) term.back() - 'a';
