@@ -891,7 +891,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   std::vector<Pair> fields;
   std::vector<Pair> templates;
 
-  auto add = [&](std::vector<Pair>& out, const char* name, FieldClass fc) -> luxir::api::FieldDef& {
+  auto add = [&](std::vector<Pair>& out, const char* name,
+                 std::optional<FieldClass> fc = std::nullopt) -> luxir::api::FieldDef& {
     auto* def = api::build::allocMessage<api::FieldDef>(arena);
     def->type = fc;
     out.push_back({name, def});
@@ -946,6 +947,19 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   setAnalyzer(add(templates, "_u", FieldClass::TEXT), "unicode_word");
   setAnalyzer(add(templates, "_un", FieldClass::TEXT), "unicode_word", {"nfkc_cf"});
   setAnalyzer(add(templates, "_t", FieldClass::TEXT), "unicode_word", {"nfkc_cf", "fold", "kstem"});
+
+  // Names search as folded words and use the original whole value for facets/sort.
+  auto& name = add(templates, "_name", FieldClass::TEXT);
+  setAnalyzer(name, "unicode_word", {"nfkc_cf", "fold"});
+  auto* wholeName = api::build::allocMessage<api::FieldDef>(arena);
+  wholeName->parent = "_s";
+  auto* variants = api::build::allocArray(name.variants.emplace().entries, 1, arena);
+  variants[0] = {"s", wholeName};
+  name.defaults.emplace().value = "s";
+  auto& names = add(templates, "_names");
+  names.parent = "_name";
+  names.multi = true;
+
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the template; concrete fields may pin it.
   add(templates, "_v", FieldClass::VECTOR);

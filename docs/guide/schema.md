@@ -65,6 +65,8 @@ The complete suffix set is:
 | `_u` | Stored Unicode-word text, case- and accent-sensitive. |
 | `_un` | Stored Unicode-word text with NFKC case folding; accents preserved. |
 | `_t` | Stored Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. |
+| `_name` | Stored Unicode-word text with case/accent folding and no stemming; original whole-name string variant for facets and sorting. |
+| `_names` | Multi-valued form of `_name`. |
 | `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
 
 Numeric suffixes are column-backed but do not build a points index by default;
@@ -300,12 +302,10 @@ for query and projection examples.
 
 ### Templates and inheritance
 
-Templates can carry variants and defaults. A template for names, with a
-multi-valued form inheriting the same representations:
+Templates can carry variants and defaults. The default schema includes
+`_name` and its multi-valued form `_names` with these definitions:
 
-```http
-POST /collections/names/_schema
-
+```json
 {
   "templates": {
     "_name": {
@@ -321,8 +321,8 @@ POST /collections/names/_schema
 
 `author_name` uses `_name`; `author_name__s` selects its original whole-name string
 variant. The root is resolved before the label, so the tail `_s` never picks
-the default string template independently. These templates are opt-in;
-long whole names follow the STRING term policy below.
+the default string template independently. No schema setup is needed to use
+these suffixes. Long whole names follow the STRING term policy below.
 
 `_name` explicitly selects word search with case and accent folding, without
 English stemming or possessive removal. Its string variant preserves the
@@ -331,7 +331,7 @@ A bare `type: text` would use the whitespace analyzer.
 
 `variants` and `defaults` each inherit atomically: absent inherits, present
 replaces the whole object, and `{}` clears it. There is no per-label merge.
-For example, after defining `_name`:
+For example, using the default `_name` template:
 
 ```http
 POST /collections/names/_schema

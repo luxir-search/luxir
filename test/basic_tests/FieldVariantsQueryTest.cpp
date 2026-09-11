@@ -124,6 +124,43 @@ TEST_F(FieldVariantsQueryTest, authorSearchAndValueOperations) {
   EXPECT_TRUE(std::ranges::contains(tokens, std::pair<std::string, int64_t>{"le", 3}));
 }
 
+TEST_F(FieldVariantsQueryTest, defaultNameTemplatesSearchFacetAndSort) {
+  helper.clear();
+  const std::string george = "George R.R. Martin";
+  const std::string andre = "Andr\u00e9 Winters";
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "a", "author_name", george, "contributor_names", vecs(george)),
+    flatdoc("id", "b", "author_name", andre, "contributor_names", vecs(andre, george)),
+    flatdoc("id", "c", "author_name", "Winter's", "contributor_names", vecs("Winter's")),
+  }, UpdateMessage::COMMIT).success);
+
+  EXPECT_EQ(vecs("a"), expr("author_name:(george AND martin)"));
+  EXPECT_EQ(vecs("a", "b"), expr("contributor_names:(george AND martin)"));
+  for (auto field : {"author_name", "contributor_names"}) {
+    SCOPED_TRACE(field);
+    EXPECT_EQ(vecs("b"), expr(std::string(field) + ":ANDRE"));
+    EXPECT_EQ(vecs("b"), expr(std::string(field) + ":winters"));
+    EXPECT_TRUE(expr(std::string(field) + ":winter").empty());
+    EXPECT_EQ(vecs("c"), expr(std::string(field) + ":\"Winter's\""));
+  }
+  EXPECT_EQ(vecs("a"), expr("author_name:=\"George R.R. Martin\""));
+  EXPECT_TRUE(expr("author_name:=\"george r.r. martin\"").empty());
+
+  auto req = run(R"({"fields":["id","author_name","contributor_names"],"limit":-1,
+    "sorts":[{"expr":"author_name"}],"ops":{
+      "authors":{"field_facet":{"field":"author_name","limit":-1}},
+      "contributors":{"field_facet":{"field":"contributor_names","limit":-1}}
+    }})");
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(vecs("b", "a", "c"), ids(*req, true));
+  EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("id", "b", "author_name", andre,
+                                               "contributor_names", vecs(andre, george))));
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{{andre, 1}, {george, 1}, {"Winter's", 1}}),
+            buckets(*req->docList()->ops.at("authors")->facetResult()));
+  EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{{andre, 1}, {george, 2}, {"Winter's", 1}}),
+            buckets(*req->docList()->ops.at("contributors")->facetResult()));
+}
+
 TEST_F(FieldVariantsQueryTest, facetSelectionUsesItsOwnValueTarget) {
   auto req = run(R"({"query":{"all":true},"fields":["id"],"limit":-1,"ops":{
     "authors":{"field_facet":{"field":"author","limit":0,"selected":["URSULA K. LE GUIN"]}}
