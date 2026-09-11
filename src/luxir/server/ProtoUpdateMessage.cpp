@@ -109,10 +109,8 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       // dedup duplicate field keys post-mapping, last-wins
       for (const auto& [fname, fval] :
            lastWins(doc.fields, [&](std::string_view name) { return fieldMap.resolve(name); })) {
-        if (fname.find("__") != std::string_view::npos) {
-          throw DocumentError("Derived field is not a logical document key: " + std::string(fname),
-                              "invalid_field_name");
-        }
+        // A cached handler proves its name was accepted; creation validates a
+        // new name (a derived selector is not a document key).
         auto handler = handlers[idx];
         if (handler == nullptr || *handler != fname) {
           handlers[idx] = handler = &inverter.getIndexHandler(fname);

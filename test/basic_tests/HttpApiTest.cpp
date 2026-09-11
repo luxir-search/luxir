@@ -1215,7 +1215,7 @@ TEST_F(HttpApiTest, derivedInputKeysAndMapTargets) {
 
   auto bad = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"author__s":"bad"}]})");
-  EXPECT_NE(std::string::npos, bad.body().find("Derived field is not a logical document key"));
+  EXPECT_NE(std::string::npos, bad.body().find("derived selectors are not input fields"));
   auto buffered = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"buffered","external__author":"Mapped"}],"field_map":{"external__author":"author"},"commit":{}})");
   ASSERT_EQ(200, buffered.result_int()) << buffered.body();
@@ -1223,7 +1223,7 @@ TEST_F(HttpApiTest, derivedInputKeysAndMapTargets) {
       "/collections/main/_update?field_map=external__author:author&commit=true",
       R"({"id":"streamed","external__author":"Mapped"})" "\n"
       R"({"id":"bad","author__s":"bad"})" "\n", "application/x-ndjson");
-  EXPECT_NE(std::string::npos, streamed.body().find("Derived field is not a logical document key"));
+  EXPECT_NE(std::string::npos, streamed.body().find("derived selectors are not input fields"));
   for (auto contentType : {"application/json", "application/x-ndjson"}) {
     auto target = httpRequest(port(), http::verb::post,
         "/collections/main/_update?field_map=external:author__s", "{}", contentType);
