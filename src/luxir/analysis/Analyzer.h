@@ -308,6 +308,9 @@ public:
 
 class TokenFilterFactory : public TokenStreamFactory {
 public:
+  // True when normalizeTerm applies this filter's transformation. Only these
+  // filters may appear in STRING normalizers; stemmers are analysis-only.
+  bool normalizing = false;
   virtual std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const = 0;
 };
 

@@ -28,6 +28,16 @@ under its own license as noted. Their license texts are kept alongside them.
 
 This product also contains code adapted from:
 
+  Apache Lucene KStem (src/luxir/analysis/KStemmer.cpp, KStemData.h,
+    and test/basic_tests/data/kstem_examples.txt)
+    Apache Lucene, Copyright 2001-2025 The Apache Software Foundation
+    https://lucene.apache.org/
+    Apache License 2.0 (see LICENSE)
+    The KStem stemmer was developed by Bob Krovetz and Sergio Guzman-Lara
+    (CIIR-UMass Amherst) under the BSD license. The original copyright notice,
+    conditions, and disclaimer are retained in KStemmer.cpp and KStemData.h.
+    Adapted to C++ with a shared immutable dictionary and per-instance scratch.
+
   Romu random number generators, by Mark Overton
     https://www.romu-random.org/
     Apache License 2.0 (src/luxir/util/random.h)

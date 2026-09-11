@@ -1683,6 +1683,7 @@ TEST_F(SchemaTest, stringNormalizerSchemaValidation) {
       R"({"type":"string","normalizer":["whitespace"]})", R"({"type":"string","normalizer":["keyword"]})",
       R"({"type":"string","normalizer":["unicode_word"]})", R"({"type":"string","normalizer":["unknown"]})",
       R"({"type":"string","normalizer":[{}]})",
+      R"({"type":"string","normalizer":["kstem"]})",
       R"({"type":"string","normalizer":[{"name":"fold","params":{"invalid":true}}]})",
       R"({"type":"string","analyzer":{"tokenizer":"keyword"}})",
       R"({"type":"text","variants":{"s":{"type":"string","normalizer":["keyword"]}}})"}) {

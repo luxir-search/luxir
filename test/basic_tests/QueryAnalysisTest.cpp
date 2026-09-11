@@ -75,6 +75,33 @@ TEST_F(QueryAnalysisTest, textPhraseAnalyzedAndCaseFolded) {
   EXPECT_EQ(1, phraseTextCount("body_un", "THOMAS ANDERSON"));
 }
 
+TEST_F(QueryAnalysisTest, defaultTextStemsAtIndexAndQueryTime) {
+  helper.index(flatdoc("id", "stem", "body_t", "PONIES aided Italians CAF\xc3\x89S",
+                       "raw_un", "PONIES aided Italians"), UpdateMessage::COMMIT);
+  EXPECT_EQ(1, matchCount("body_t", "pony"));
+  EXPECT_EQ(1, matchCount("body_t", "PONIES"));
+  EXPECT_EQ(1, matchCount("body_t", "italy"));
+  EXPECT_EQ(1, matchCount("body_t", "cafe"));
+  EXPECT_EQ(1, phraseTextCount("body_t", "PONY AID ITALIAN"));
+  EXPECT_EQ(0, phraseTextCount("body_t", "aid pony"));
+  EXPECT_EQ(0, matchCount("raw_un", "pony"));
+  EXPECT_EQ(1, matchCount("raw_un", "PONIES"));
+
+  for (auto [prefix, count] : {std::pair{"PONY", 1}, {"PONIES", 0}}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").prefixQuery("body_t", prefix).withStats();
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(count, req->getMatchCount()); // prefixes fold without stemming
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").phraseTerms("body_t", {"ponies", "aided"}).withStats();
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(0, req->getMatchCount()); // explicit terms stay verbatim
+}
+
 TEST_F(QueryAnalysisTest, textPhraseOrderMatters) {
   // Reversed order is not an adjacent phrase in either doc.
   EXPECT_EQ(0, phraseTextCount("body_un", "Anderson Thomas"));

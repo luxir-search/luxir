@@ -34,7 +34,7 @@ curl http://localhost:9400/collections/main/_schema
       "type": "text",
       "analyzer": {
         "tokenizer": "unicode_word",
-        "filters": ["nfkc_cf", "fold"]
+        "filters": ["nfkc_cf", "fold", "kstem"]
       }
     },
     "_w": {
@@ -64,7 +64,7 @@ The complete suffix set is:
 | `_wl` | Stored text split on whitespace, Unicode-lowercased; no normalization or accent folding. |
 | `_u` | Stored Unicode-word text, case- and accent-sensitive. |
 | `_un` | Stored Unicode-word text with NFKC case folding; accents preserved. |
-| `_t` | Stored Unicode-word text with NFKC case and accent folding. |
+| `_t` | Stored Unicode-word text with NFKC case folding, accent folding, and KStem English stemming. |
 | `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
 
 Numeric suffixes are column-backed but do not build a points index by default;
@@ -72,6 +72,18 @@ range and exact-match queries still work by scanning the column. Define a
 concrete field with `index: "range"` when those operations need a points index.
 There is no default geo suffix because coordinate fields benefit from an
 unambiguous explicit definition.
+
+The `kstem` filter uses Lucene's dictionary-based Krovetz English stemmer:
+for example, `ponies` becomes `pony`, while recognized dictionary words are
+preserved. It runs at both index and query time for `_t` fields. In custom
+analyzers, put it after `lowercase` or `nfkc_cf`, and after `fold` if used.
+Tokens containing anything outside lowercase ASCII letters, or with lengths
+outside 3-49 letters, pass through. Prefix, wildcard, regex, and fuzzy query
+normalization applies case/accent folding without stemming. KStem is not
+available in STRING normalizers.
+
+For Unicode text without English stemming, use `_un`, or configure
+`unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
 
 Two sections:
 
@@ -142,7 +154,7 @@ posting an authored `GET` body back keeps the same definitions under either mode
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field column family; empty uses the default `_stored_` resource |
-| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold` (none take parameters yet) |
+| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold`, `kstem` (none take parameters yet) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Changes do not rewrite existing terms. |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |
 | `variants` | Map from label to another field definition receiving the same input value. Bare type strings work here too. |
@@ -337,7 +349,7 @@ POST /collections/templates/_update
 ```
 
 This indexes `book_title` and `book_title__s`. `_title` inherits `_t`'s
-case- and accent-folding analysis. Long titles keep their full stored source;
+case folding, accent folding, and English stemming. Long titles keep their full stored source;
 the string variant indexes a prefix plus hash suffix for sorting, faceting, and
 exact lookup.
 

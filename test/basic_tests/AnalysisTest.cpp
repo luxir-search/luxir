@@ -66,6 +66,27 @@ Analysis analyze(TokenChain& tc, std::string_view val) {
 
 class AnalysisTest : public LuxirTest {};
 
+TEST_F(AnalysisTest, kstemPreservesSourceOffsetsAndPositions) {
+  TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS,
+                   "unicode_word", {"nfkc_cf", "fold", "kstem"});
+  auto chain = ft.createAnalyzer("body");
+  std::string source = "PONIES aided Italians";
+  auto out = analyze(*chain, source);
+  EXPECT_EQ((std::vector<std::string>{"pony", "aid", "italy"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 1, 2}), out.positions);
+  EXPECT_EQ((std::vector<int>{0, 7, 13}), out.starts);
+  EXPECT_EQ((std::vector<int>{6, 12, 21}), out.ends);
+  EXPECT_EQ("PONIES aided Italians", source);
+  EXPECT_TRUE(analyze(*chain, "...").terms.empty());
+  EXPECT_EQ((std::vector<std::string>{"canonical", "cafe", "\xe4\xb8\xad", "\xe6\x96\x87"}),
+            analyze(*chain, "CANONIC CAF\xc3\x89S \xe4\xb8\xad\xe6\x96\x87").terms);
+
+  std::string term = "PONIES";
+  chain->normalizeTerm(term);
+  EXPECT_EQ("ponies", term); // multiterm normalization folds without stemming
+  EXPECT_EQ((std::vector<std::string>{"pony"}), analyze(*chain, "PONIES").terms);
+}
+
 TEST_F(AnalysisTest, whitespaceBasic) {
   WhitespaceTokenizer tok;
   auto out = analyze(tok, tok, "the quick brown fox");
@@ -239,7 +260,7 @@ TEST_F(AnalysisTest, unknownComponentIsRejected) {
     TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace", {"stemmer"});
     FAIL() << "unknown filter accepted";
   } catch (const std::invalid_argument& e) {
-    EXPECT_EQ("unknown filter 'stemmer'; valid filters: lowercase, nfkc_cf, fold", std::string(e.what()));
+    EXPECT_EQ("unknown filter 'stemmer'; valid filters: lowercase, nfkc_cf, fold, kstem", std::string(e.what()));
   }
 }
 
@@ -452,7 +473,7 @@ TEST_F(AnalysisTest, chainUnicodeWordNfkcCf) {
   EXPECT_EQ((std::vector<int>{0, 1, 2, 3, 4, 5}), out.positions);
 }
 
-// The default _t chain: unicode_word + nfkc_cf + fold. Accents are removed so an
+// unicode_word + nfkc_cf + fold. Accents are removed so an
 // accented word matches its bare form; CJK and case still handled.
 TEST_F(AnalysisTest, chainUnicodeWordFold) {
   TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf", "fold"});
@@ -461,7 +482,7 @@ TEST_F(AnalysisTest, chainUnicodeWordFold) {
   EXPECT_EQ((std::vector<std::string>{"cafe", "naive", "senor", "strasse", "中", "文"}), out.terms);
 }
 
-// fold (_t) vs no-fold (_un): the accent is dropped with fold, preserved without.
+// fold vs no-fold: the accent is dropped with fold, preserved without.
 TEST_F(AnalysisTest, foldVsPreserveAccents) {
   TextFieldType folding("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf", "fold"});
   TextFieldType preserving("un", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});

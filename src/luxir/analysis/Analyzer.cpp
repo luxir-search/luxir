@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/analysis/KStemmer.h"
 
 #include <algorithm>
 #include <memory>
@@ -401,6 +402,24 @@ std::unique_ptr<TokenStream> makeLowercaseFilter(std::unique_ptr<TokenStream> so
   return std::make_unique<LowercaseFilter>(std::move(source));
 }
 
+class KStemFilter : public TokenFilter {
+  KStemmer stemmer;
+public:
+  KStemFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    token.text = stemmer.stem(token.text);
+    return true;
+  }
+
+  // Inherit normalization forwarding: multiterm input is folded, never stemmed.
+};
+
+std::unique_ptr<TokenStream> makeKStemFilter(std::unique_ptr<TokenStream> source) {
+  return std::make_unique<KStemFilter>(std::move(source));
+}
+
 void requireNoParams(const api::AnalyzerComponent& def, std::string_view kind) {
   if (def.params.empty()) return;
   std::string got;
@@ -427,7 +446,8 @@ std::unique_ptr<const TokenizerFactory> plainTokenizer(const api::AnalyzerCompon
   return factory;
 }
 
-template <std::unique_ptr<TokenStream> (*Make)(std::unique_ptr<TokenStream>), bool Stateful = false>
+template <std::unique_ptr<TokenStream> (*Make)(std::unique_ptr<TokenStream>),
+          bool Normalizing = true, bool Stateful = false>
 std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerComponent& def) {
   requireNoParams(def, "filter");
   struct Factory : TokenFilterFactory {
@@ -438,6 +458,7 @@ std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerCompone
   auto factory = std::make_unique<Factory>();
   factory->name = std::string(def.name);
   factory->stateful = Stateful;
+  factory->normalizing = Normalizing;
   return factory;
 }
 
@@ -462,6 +483,7 @@ constexpr FilterEntry FILTERS[] = {
   {"lowercase", plainFilter<makeLowercaseFilter>},
   {"nfkc_cf", plainFilter<makeNfkcCasefoldFilter>},
   {"fold", plainFilter<makeAccentFoldFilter>},
+  {"kstem", plainFilter<makeKStemFilter, false>},
 };
 
 template <class Entry, size_t N>

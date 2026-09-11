@@ -4,6 +4,7 @@
 #include "bench/luxir_bench.h"
 #include "test/TestData.h"
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/analysis/KStemmer.h"
 #include "luxir/schema/FieldType.h"
 
 using namespace luxir;
@@ -57,3 +58,26 @@ TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, whitespace_text, "whitespace", std:
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, whitespace_off, "whitespace", std::vector<std::string>{})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, standard_text, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
 TUNING_BENCHMARK_CAPTURE(BM_Tokenize<true>, standard_off, "unicode_word", std::vector<std::string>{"nfkc_cf"})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, folded_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold"})->UseRealTime();
+TUNING_BENCHMARK_CAPTURE(BM_Tokenize<false>, kstem_text, "unicode_word", std::vector<std::string>{"nfkc_cf", "fold", "kstem"})->UseRealTime();
+
+// Isolate stemming from segmentation/folding, preserving the book's token
+// distribution. Tokens own their bytes because the analysis chain is transient.
+static void BM_KStem(benchmark::State& state) {
+  Book& book = TestData::data->getBook();
+  if (skipBenchIfDataMissing(state, !book.text().empty(), "book.txt")) return;
+  TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS,
+                   "unicode_word", {"nfkc_cf", "fold"});
+  auto chain = ft.createAnalyzer("body");
+  chain->head.setValue(book.text());
+  chain->reset();
+  std::vector<std::string> terms;
+  while (chain->tail->incrementToken()) terms.emplace_back(chain->head.getToken().text);
+  KStemmer stemmer;
+  for (auto _ : state) {
+    for (const auto& term : terms) benchmark::DoNotOptimize(stemmer.stem(term));
+  }
+  state.counters["tok_rate"] =
+      benchmark::Counter(terms.size() * state.iterations(), benchmark::Counter::kIsRate);
+}
+TUNING_BENCHMARK(BM_KStem)->UseRealTime();
