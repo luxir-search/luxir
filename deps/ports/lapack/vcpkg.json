@@ -1,0 +1,11 @@
+{
+  "name": "lapack",
+  "version-date": "2023-06-10",
+  "port-version": 5,
+  "description": "LAPACK supplied by the C LAPACK build of OpenBLAS",
+  "license": null,
+  "supports": "linux & x64",
+  "dependencies": [
+    "openblas"
+  ]
+}

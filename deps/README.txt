@@ -1,7 +1,10 @@
 Building
 --------
 
-Use the vcpkg checkout recorded in vcpkg-revision.txt for both the normal and
+For the shared Ubuntu 22.04 container, see ../docs/dev/container-build.md.
+The instructions below describe the native setup.
+
+Use the vcpkg checkout recorded as builtin-baseline in vcpkg.json for both the normal and
 ASan roots. See ../docs/dev/build-setup.md for checkout and update commands.
 The revision records the upstream ports; the patches below remain required.
 
@@ -57,9 +60,8 @@ make_deps.sh clones this; details for reference:
   support. Cloned into deps/FastPFOR (gitignored).
 - Compiled by the main CMakeLists.txt: the `fastpfor` static-lib target builds
   just the bit-packing sources we use (bitpacking.cpp, simdbitpacking.cpp,
-  simdunalignedbitpacking.cpp) with headers from deps/FastPFOR/headers. We do
-  NOT compile streamvbyte.c / varintdecode.c / codecfactory.cpp (their C
-  symbols are unused and were the only real clash risk). So there is no manual
+  simdunalignedbitpacking.cpp) with headers from deps/FastPFOR/headers. streamvbyte.c is also compiled for the postings-tail SIMD varint path.
+  varintdecode.c and codecfactory.cpp are unused and excluded. So there is no manual
   lib-build step.
 - No local patches are needed at present. If one becomes necessary, drop it in
   patches/ as fastpfor*.diff and apply_patches.sh will apply it on the next run.
@@ -68,8 +70,8 @@ uni-algo
 --------
 Vendored in-repo (v1.2.0, Unicode 15.1.0; see uni-algo/VENDORED.txt) and
 compiled by the main CMakeLists.txt (uni_algo target from src/data.cpp), so
-nothing to do here. make_deps.sh can re-fetch the identical subset from the
-upstream tag if the directory is ever removed; apply_patches.sh then re-applies
+nothing to do here. fetch_sources.sh can re-fetch the identical subset from the
+upstream tag if the directory is ever removed and applies
 the local fix in patches/uni-algo-word-only-newline-leak.patch (the vendored
 copy in git already has it applied - see the apply_patches.sh header for what
 it fixes and why).

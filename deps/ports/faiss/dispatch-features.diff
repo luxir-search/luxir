@@ -1,0 +1,42 @@
+--- a/faiss/utils/simd_levels.cpp
++++ b/faiss/utils/simd_levels.cpp
+@@ -112,6 +112,9 @@
+                  : "a"(eax), "c"(ecx));
+ 
+     bool has_avx = (ecx & (1 << 28)) != 0;
++    // All AVX kernels are also compiled with -mfma and -mf16c.
++    bool has_fma_f16c = (ecx & ((1u << 12) | (1u << 29))) ==
++            ((1u << 12) | (1u << 29));
+ 
+     bool has_xsave_osxsave =
+             (ecx & ((1 << 26) | (1 << 27))) == ((1 << 26) | (1 << 27));
+@@ -123,7 +126,7 @@
+         avx_supported = (xcr0 & 6) == 6;
+     }
+ 
+-    if (avx_supported) {
++    if (avx_supported && has_fma_f16c) {
+         eax = 7;
+         ecx = 0;
+         asm volatile("cpuid"
+@@ -147,7 +150,7 @@
+         bool cpu_has_avx512f = (ebx & (1 << 16)) != 0;
+         bool os_supports_avx512 = (xcr0 & 0xE0) == 0xE0;
+         bool has_avx512f = cpu_has_avx512f && os_supports_avx512;
+-        if (has_avx512f) {
++        if (has_avx512f && has_avx2) {
+             bool has_avx512cd = (ebx & (1 << 28)) != 0;
+             bool has_avx512vl = (ebx & (1 << 31)) != 0;
+             bool has_avx512dq = (ebx & (1 << 17)) != 0;
+@@ -174,7 +177,10 @@
+                              : "=a"(eax1), "=b"(ebx1), "=c"(ecx1), "=d"(edx1)
+                              : "a"(eax1), "c"(ecx1));
+                 bool has_avx512_bf16 = (eax1 & (1 << 5)) != 0;
+-                if (has_avx512_bf16 && has_avx512_fp16) {
++                bool has_avx512_vnni = (ecx & (1u << 11)) != 0;
++                bool has_avx512_vpopcntdq = (ecx & (1u << 14)) != 0;
++                if (has_avx512_bf16 && has_avx512_fp16 &&
++                    has_avx512_vnni && has_avx512_vpopcntdq) {
+                     detected_level = SIMDLevel::AVX512_SPR;
+                     supported_simd_levels |=
+                             (1 << static_cast<int>(SIMDLevel::AVX512_SPR));

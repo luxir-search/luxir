@@ -6,6 +6,33 @@ project(Luxir VERSION 0.1)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
+set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(LUXIR_CPU_TARGET STREQUAL "native")
+    set(_luxir_cpu_tune native)
+  else()
+    set(_luxir_cpu_tune generic)
+  endif()
+  add_compile_options("-march=${LUXIR_CPU_TARGET}" "-mtune=${_luxir_cpu_tune}")
+endif()
+
+option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
+if(LUXIR_STATIC_RUNTIME)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux")
+  endif()
+  add_link_options(-static-libstdc++ -static-libgcc -static-libasan -Wl,--as-needed)
+  # FindOpenMP otherwise selects the compiler's shared libgomp.
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.a
+                  OUTPUT_VARIABLE _luxir_gomp OUTPUT_STRIP_TRAILING_WHITESPACE
+                  COMMAND_ERROR_IS_FATAL ANY)
+  if(NOT EXISTS "${_luxir_gomp}")
+    message(FATAL_ERROR "The selected GCC does not supply libgomp.a")
+  endif()
+  set(OpenMP_gomp_LIBRARY "${_luxir_gomp}" CACHE FILEPATH "OpenMP runtime" FORCE)
+endif()
+
 option(LUXIR_PROBE_CONSTANT_HOOKS
        "Compile probe-constant same-binary measurement hooks" ON)
 option(LUXIR_FULL_INLINE_DECODED_SUCCESSOR
@@ -29,7 +56,7 @@ option(LUXIR_PROBE_WRAPPER_TRIMS
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
   set(_LUXIR_CCACHE_LAUNCHER
-      "${CCACHE_PROGRAM};sloppiness=pch_defines,time_macros")
+      "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=pch_defines,time_macros;${CCACHE_PROGRAM}")
   set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
   set(CMAKE_CXX_COMPILER_LAUNCHER "${_LUXIR_CCACHE_LAUNCHER}")
   message(STATUS "Luxir: ccache enabled (${CCACHE_PROGRAM})")
@@ -111,9 +138,6 @@ add_library(fastpfor STATIC
   deps/FastPFOR/src/streamvbyte.c)
 target_include_directories(fastpfor PUBLIC deps/FastPFOR/headers)
 set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
-# streamvbyte.c is C, so CMAKE_CXX_FLAGS does not reach it. Set the arch flags
-# on the target so its SSSE3/SSE4.1 intrinsics are enabled for both C and C++.
-target_compile_options(fastpfor PRIVATE -march=native -mtune=native)
 
 #Print out all env vars... useful while build system is in development
 get_cmake_property(_variableNames VARIABLES)
@@ -136,22 +160,9 @@ endforeach()
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -O3 -DNDEBUG -fstrict-aliasing")
 
 message(STATUS "CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}")
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")
-  add_compile_options(
-          "$<$<CONFIG:RELEASE>:-g1>"
-#          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
-  )
-  # -Wno-unused-parameter: many virtual overrides must keep base-class signature; renaming params would just be noise.
-  # -Werror debug-only: NDEBUG (release) strips assert(), which turns every assert-only
-  # local into a false-positive -Wunused-variable; not worth chasing there.
-  add_compile_options(-Wall -Wextra -Wno-unused-parameter "$<$<CONFIG:DEBUG>:-Werror>")
-elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")   # native just for dev... lock down more later?
-  add_compile_options(
-          "$<$<CONFIG:RELEASE>:-g1>"
-#          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
-  )
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Virtual overrides retain base signatures. NDEBUG also creates unused
+  # assert-only variables, so warnings are fatal only in debug builds.
   add_compile_options(-Wall -Wextra -Wno-unused-parameter "$<$<CONFIG:DEBUG>:-Werror>")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
@@ -171,12 +182,30 @@ endif()
 # (GB/job) down once the serializer is moved out-of-line and per-TU memory drops.
 # Measured peak RSS of the heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at
 # -Og with ASan. The divisor covers the plain -Og case; an ASan build on a RAM-bound box
-# wants an explicit -DLUXIR_COMPILE_JOBS. Only the RAM arm moves - on a box with more
-# than ~3G per physical core the core count still binds.
+# uses a 4G/job divisor. Both account for the container memory limit.
+# On a box with enough RAM per physical core the core count still binds.
 if(NOT DEFINED LUXIR_COMPILE_JOBS)
   cmake_host_system_information(RESULT _ncores QUERY NUMBER_OF_PHYSICAL_CORES)
   cmake_host_system_information(RESULT _rammb  QUERY TOTAL_PHYSICAL_MEMORY)
-  math(EXPR _ram_jobs "${_rammb} / 3000")   # ~3.0G per concurrent heavy compile (measured -Og peak)
+  # Host memory may exceed Docker's allowance. Honor either cgroup version.
+  foreach(_limit_file /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes)
+    if(EXISTS "${_limit_file}")
+      file(READ "${_limit_file}" _memory_limit)
+      string(STRIP "${_memory_limit}" _memory_limit)
+      if(_memory_limit MATCHES "^[0-9]+$" AND _memory_limit LESS 9223372036854771712)
+        math(EXPR _limit_mb "${_memory_limit} / 1048576")
+        if(_limit_mb LESS _rammb)
+          set(_rammb ${_limit_mb})
+        endif()
+      endif()
+    endif()
+  endforeach()
+  if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=address")
+    set(_ram_per_job 4000)
+  else()
+    set(_ram_per_job 3000)
+  endif()
+  math(EXPR _ram_jobs "${_rammb} / ${_ram_per_job}")
   set(LUXIR_COMPILE_JOBS ${_ncores})
   if(_ram_jobs LESS LUXIR_COMPILE_JOBS)
     set(LUXIR_COMPILE_JOBS ${_ram_jobs})
@@ -187,8 +216,10 @@ if(NOT DEFINED LUXIR_COMPILE_JOBS)
   if(LUXIR_COMPILE_JOBS LESS 1)
     set(LUXIR_COMPILE_JOBS 1)
   endif()
+  message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
+else()
+  message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (configured)")
 endif()
-message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
 set_property(GLOBAL PROPERTY JOB_POOLS luxir_compile=${LUXIR_COMPILE_JOBS})
 set(CMAKE_JOB_POOL_COMPILE luxir_compile)
 
@@ -268,6 +299,15 @@ find_path(GTL_INCLUDE_DIRS "gtl/bit_vector.hpp")
 target_include_directories(luxir_lib PRIVATE ${GTL_INCLUDE_DIRS})
 
 target_link_libraries(luxir_lib PRIVATE TBB::tbb)
+get_target_property(_luxir_tbb_type TBB::tbb TYPE)
+if(_luxir_tbb_type STREQUAL "STATIC_LIBRARY")
+  # Preserve TBB's internal allocator when its weak references cannot dlopen
+  # tbbmalloc. This does not replace the application's malloc/free.
+  target_link_libraries(luxir_lib PRIVATE TBB::tbbmalloc)
+  target_link_options(luxir_lib INTERFACE
+    -Wl,-u,scalable_malloc -Wl,-u,scalable_free
+    -Wl,-u,scalable_aligned_malloc -Wl,-u,scalable_aligned_free)
+endif()
 target_link_libraries(luxir_lib PRIVATE xxHash::xxhash)
 target_link_libraries(luxir_lib PUBLIC Boost::core Boost::thread Boost::sort)
 target_link_libraries(luxir_lib PRIVATE fastpfor)

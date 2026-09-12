@@ -1,0 +1,13 @@
+{
+  "name": "Luxir Ubuntu 22.04 / GCC 16.2",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "target": "dev"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/luxir,type=bind",
+  "workspaceFolder": "/workspace/luxir",
+  "remoteUser": "dev",
+  "runArgs": ["--init", "--cap-add=SYS_PTRACE"],
+  "postCreateCommand": "git submodule update --init && ./deps/fetch_sources.sh"
+}

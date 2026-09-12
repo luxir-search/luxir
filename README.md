@@ -83,6 +83,9 @@ cmake --build --preset gcc-release
 ./build/gcc-release/bin/luxir
 ```
 
+The [development container](docs/dev/container-build.md) supplies Ubuntu 22.04,
+GCC 16.2, and the pinned normal/ASan dependencies for a shared build environment.
+
 The project is licensed under the [Apache License 2.0](LICENSE). Third-party
 components and their licenses are listed in [NOTICE](NOTICE).
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report problems and

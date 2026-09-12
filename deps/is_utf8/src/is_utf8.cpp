@@ -5424,7 +5424,7 @@ implementation::validate_utf8(const char *buf, size_t len) const noexcept {
 } // namespace icelake
 } // namespace is_utf8_internals
 
-IS_UTF8_UNTARGET_REGION
+IS_UTF8_UNTARGET_ICELAKE
 
 #if IS_UTF8_GCC11ORMORE // workaround for
                         // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105593

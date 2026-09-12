@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "$0")/.." && pwd)
+engine=${CONTAINER_ENGINE:-docker}
+image=${LUXIR_DEV_IMAGE:-luxir-dev:jammy-gcc16}
+
+if [[ ${1:-} == build-image ]]; then
+  shift
+  exec "$engine" build -f "$repo_dir/.devcontainer/Dockerfile" -t "$image" "$@" "$repo_dir"
+fi
+if [[ ${1:-} == --help ]]; then
+  cat <<'HELP'
+Usage: tools/dev-container build-image [docker build options]
+       tools/dev-container [command [arguments...]]
+
+Without a command, opens a shell. Source and build outputs stay in this checkout.
+Use container-debug, container-release, or container-asan CMake presets.
+Set CONTAINER_ENGINE, LUXIR_DEV_IMAGE, or Docker's standard DOCKER_CONTEXT to override defaults.
+HELP
+  exit 0
+fi
+
+cache_dir="$repo_dir/build/container-cache/$(id -u)"
+mkdir -p "$cache_dir/home" "$cache_dir/ccache"
+run_options=(--rm --init -i --cap-add=SYS_PTRACE --user "$(id -u):$(id -g)"
+  --mount "type=bind,source=$repo_dir,target=/workspace/luxir"
+  --workdir /workspace/luxir
+  --env "HOME=/workspace/luxir/build/container-cache/$(id -u)/home"
+  --env "CCACHE_DIR=/workspace/luxir/build/container-cache/$(id -u)/ccache")
+if [[ -t 0 && -t 1 ]]; then
+  run_options+=(-t)
+fi
+if [[ $# == 0 ]]; then
+  set -- bash
+fi
+exec "$engine" run "${run_options[@]}" "$image" "$@"

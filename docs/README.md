@@ -45,6 +45,8 @@ does Luxir do today?"
 - [Codebase map](dev/codebase-map.md) traces source components and request flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,
   and runtime time-zone data.
+- [Container build](dev/container-build.md) provides the shared Ubuntu 22.04
+  compiler and dependency environment, including ASan.
 
 Rule of thumb: a page that assumes a source checkout belongs in `dev/` or
 `design/`. Pages in `guide/` start from a running server and a client.

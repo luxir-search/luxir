@@ -7,3 +7,6 @@ Vendored UTF-8 validation used by hpp-proto's serializer (utf8_validation field 
 - Files: include/is_utf8.h, src/is_utf8.cpp (self-contained, std-only includes)
 
 Update by re-copying these two files from the upstream tag.
+
+Local fix: close the Ice Lake region with `IS_UTF8_UNTARGET_ICELAKE` so GCC's
+target pragmas remain balanced when that instruction set is already enabled.

@@ -1,0 +1,33 @@
+{
+  "name": "luxir-dependencies",
+  "version-string": "0.1",
+  "builtin-baseline": "a1cae005c39be7b18ba319fced856b68d7276271",
+  "dependencies": [
+    "boost-core",
+    "boost-sort",
+    "boost-thread",
+    "boost-beast",
+    "gtest",
+    "benchmark",
+    "xxhash",
+    "gtl",
+    "protobuf",
+    {
+      "name": "grpc",
+      "features": ["codegen"]
+    },
+    "spdlog",
+    "lz4",
+    "cli11",
+    "glaze",
+    "faiss",
+    "tbb",
+    {
+      "name": "openblas",
+      "default-features": false,
+      "features": [
+        "dynamic-arch"
+      ]
+    }
+  ]
+}

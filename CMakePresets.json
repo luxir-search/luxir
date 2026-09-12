@@ -30,7 +30,7 @@
       "hidden": true,
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -ftrivial-auto-var-init=uninitialized"
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -g1 -DNDEBUG -ftrivial-auto-var-init=uninitialized"
       }
     },
     {
@@ -89,6 +89,62 @@
       "inherits": ["base", "base-gcc", "base-release", "features-asan"],
       "displayName": "GCC Release ASAN",
       "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "base-container",
+      "hidden": true,
+      "inherits": [
+        "base",
+        "base-gcc"
+      ],
+      "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_MANIFEST_MODE": "OFF",
+        "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-v2",
+        "VCPKG_HOST_TRIPLET": "x64-linux-luxir-v2",
+        "LUXIR_CPU_TARGET": "x86-64-v2",
+        "LUXIR_STATIC_RUNTIME": "ON",
+        "CMAKE_C_FLAGS_DEBUG": "-g -Og -fno-omit-frame-pointer",
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -g -DNDEBUG"
+      }
+    },
+    {
+      "name": "container-debug",
+      "inherits": [
+        "base-container",
+        "base-debug"
+      ],
+      "displayName": "Ubuntu 22.04 GCC debug",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
+      }
+    },
+    {
+      "name": "container-release",
+      "inherits": [
+        "base-container",
+        "base-release"
+      ],
+      "displayName": "Ubuntu 22.04 GCC release",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -g -DNDEBUG -ftrivial-auto-var-init=uninitialized"
+      }
+    },
+    {
+      "name": "container-asan",
+      "inherits": [
+        "base-container",
+        "base-debug",
+        "features-asan"
+      ],
+      "displayName": "Ubuntu 22.04 GCC asan",
+      "cacheVariables": {
+        "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-asan",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-v2-asan",
+        "CMAKE_C_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
+      }
     }
   ],
 
@@ -96,6 +152,9 @@
     { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Recommended iteration build. Concurrent compiles are capped adaptively (physical cores + RAM, <=16) via the luxir_compile Ninja pool in CMakeLists, so a plain -j is safe here and on smaller laptops." },
     { "name": "gcc-debug-asan",   "configurePreset": "gcc-debug-asan",   "description": "Memory-check build (pre-commit)." },
     { "name": "gcc-release",      "configurePreset": "gcc-release" },
-    { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" }
+    { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" },
+    {"name": "container-debug", "configurePreset": "container-debug"},
+    {"name": "container-release", "configurePreset": "container-release"},
+    {"name": "container-asan", "configurePreset": "container-asan"}
   ]
 }

@@ -1,0 +1,10 @@
+**
+!.devcontainer/
+!.devcontainer/**
+!deps/
+!deps/vcpkg.json
+!deps/vcpkg-configuration.json
+!deps/triplets/
+!deps/triplets/**
+!deps/ports/
+!deps/ports/**

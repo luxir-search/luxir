@@ -2,13 +2,12 @@
 
 Detailed build and environment notes for a source checkout.
 
-Luxir does not yet have a packaged binary, container image, or turnkey
-clean-machine installer. The checked-in presets describe the current developer
-environment rather than a portable distribution: Linux/x86-64, GCC, and vcpkg
-roots at `/opt/vcpkg` (plus `/opt/vcpkg_asan` for ASan). The commands below are
-the shape of that environment. The vcpkg checkout is recorded in
-[deps/vcpkg-revision.txt](../../deps/vcpkg-revision.txt); the compiler snapshot
-is not pinned by this repository yet.
+For a reusable Ubuntu 22.04/GCC 16.2 environment with normal and ASan
+dependencies, use the [container build](container-build.md). The instructions
+below describe the existing native environment: GCC and vcpkg roots at
+`/opt/vcpkg` and `/opt/vcpkg_asan`. Its dependencies and compiler are built for
+the native host. Both workflows use the vcpkg revision recorded as
+`builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.json).
 
 ## Development Requirements
 
@@ -38,7 +37,7 @@ part of the current GCC presets:
 ```bash
 sudo git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg
 sudo chown -R "$(id -un):$(id -gn)" /opt/vcpkg
-read -r luxir_vcpkg_revision < deps/vcpkg-revision.txt
+luxir_vcpkg_revision=$(python3 -c 'import json; print(json.load(open("deps/vcpkg.json"))["builtin-baseline"])')
 git -C /opt/vcpkg checkout --detach "$luxir_vcpkg_revision"
 /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 ```
