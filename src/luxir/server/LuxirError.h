@@ -7,6 +7,7 @@
 #include <string>
 #include <exception>
 #include <execinfo.h>
+#include <unwind.h>
 #include <cxxabi.h>
 #include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
@@ -16,12 +17,24 @@ namespace luxir {
 // Helper function to get stack trace
 inline std::string getStackTrace() {
   constexpr int maxFrames = 20;
-  void* array[maxFrames];
-  int size = backtrace(array, maxFrames);
-  char** strings = backtrace_symbols(array, size);
+  struct Frames {
+    void* addresses[maxFrames];
+    int size = 0;
+  } frames;
+  // glibc's backtrace() dlopens libgcc_s even with a statically linked GCC
+  // runtime. Capture through the linked unwinder; symbolization stays in glibc.
+  _Unwind_Backtrace([](_Unwind_Context* context, void* data) {
+    auto& frames = *static_cast<Frames*>(data);
+    auto address = _Unwind_GetIP(context);
+    if (address == 0) return _URC_END_OF_STACK;
+    frames.addresses[frames.size++] = reinterpret_cast<void*>(address);
+    return frames.size == maxFrames ? _URC_END_OF_STACK : _URC_NO_REASON;
+  }, &frames);
+  char** strings = backtrace_symbols(frames.addresses, frames.size);
+  if (strings == nullptr) return {};
 
   std::string result;
-  for (int i = 0; i < size; i++) {
+  for (int i = 0; i < frames.size; i++) {
     // Try to demangle C++ names
     char* mangled_name = nullptr;
     char* offset_begin = nullptr;
@@ -56,6 +69,10 @@ inline std::string getStackTrace() {
         result += ")\n";
         free(real_name);
       } else {
+        // Preserve addresses when a stripped/static binary has no symbol name.
+        *(mangled_name - 1) = '(';
+        *(offset_begin - 1) = '+';
+        *offset_end = ')';
         result += "  ";
         result += strings[i];
         result += "\n";
