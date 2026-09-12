@@ -1,6 +1,10 @@
 Building
 --------
 
+Use the vcpkg checkout recorded in vcpkg-revision.txt for both the normal and
+ASan roots. See ../docs/dev/build-setup.md for checkout and update commands.
+The revision records the upstream ports; the patches below remain required.
+
 0) System Build Tools
   # gcc/g++-16 (fortran is for building FAISS deps)
   sudo apt install gcc-16 g++-16 gfortran-16

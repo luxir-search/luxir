@@ -6,8 +6,9 @@ Luxir does not yet have a packaged binary, container image, or turnkey
 clean-machine installer. The checked-in presets describe the current developer
 environment rather than a portable distribution: Linux/x86-64, GCC, and vcpkg
 roots at `/opt/vcpkg` (plus `/opt/vcpkg_asan` for ASan). The commands below are
-the reproducible shape of that environment, but vcpkg itself and the compiler
-snapshot are not pinned by this repository yet.
+the shape of that environment. The vcpkg checkout is recorded in
+[deps/vcpkg-revision.txt](../../deps/vcpkg-revision.txt); the compiler snapshot
+is not pinned by this repository yet.
 
 ## Development Requirements
 
@@ -37,6 +38,8 @@ part of the current GCC presets:
 ```bash
 sudo git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg
 sudo chown -R "$(id -un):$(id -gn)" /opt/vcpkg
+read -r luxir_vcpkg_revision < deps/vcpkg-revision.txt
+git -C /opt/vcpkg checkout --detach "$luxir_vcpkg_revision"
 /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 ```
 
@@ -55,6 +58,15 @@ cd /opt/vcpkg
   xxhash gtl protobuf grpc spdlog lz4 cli11 faiss glaze
 ```
 
+For an existing installation, update the checkout to the recorded revision
+while preserving Luxir's triplet/port patches, bootstrap vcpkg again, and rerun
+`deps/apply_patches.sh` from the Luxir checkout. Run `./vcpkg upgrade` in the
+vcpkg root to inspect the changes, then
+`./vcpkg upgrade --no-dry-run --no-keep-going` to rebuild the affected packages.
+Update the ASan root to the same revision and apply its instrumented triplet.
+Perform the two dependency builds sequentially, then rebuild and test Luxir's
+corresponding presets.
+
 On Ubuntu, the remaining host packages include TBB, pkg-config, Ninja, and a
 Fortran compiler whose major matches GCC:
 
@@ -65,7 +77,8 @@ sudo apt install libtbb-dev pkg-config ninja-build "gfortran-$(gcc -dumpversion)
 See [deps/README.txt](../../deps/README.txt) for why the local vcpkg patches and
 the matching Fortran compiler are correctness requirements, not optional
 tuning. A clean-machine setup can still require adjustment as upstream vcpkg
-ports move; this is the principal source-distribution gap today.
+is updated or host tools differ; the recorded checkout does not yet pin the
+complete build environment.
 
 The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker
 (mold), and a precompiled header are used when available. Each preset builds
@@ -108,10 +121,10 @@ cmake --build --preset gcc-release
 Before committing memory-sensitive work, run the ASan build:
 
 The ASan presets use a separate `/opt/vcpkg_asan` root whose dependencies must
-also be built with ASan. Clone and bootstrap a second vcpkg tree, rerun
-`deps/make_deps.sh /opt/vcpkg /opt/vcpkg_asan`, and install the same package set
-there before configuring the preset. See `deps/README.txt` for the required
-instrumented triplet.
+also be built with ASan. Clone a second vcpkg tree at the recorded revision,
+bootstrap it, rerun `deps/make_deps.sh /opt/vcpkg /opt/vcpkg_asan`, and install
+the same package set there before configuring the preset. See
+`deps/README.txt` for the required instrumented triplet.
 
 ```bash
 cmake --preset gcc-debug-asan
