@@ -11,13 +11,17 @@ namespace fs=std::filesystem;
 
 std::unique_ptr<TestData> TestData::data = std::make_unique<TestData>();
 
+fs::path testDataPath(const char* name) {
+  return fs::path(LUXIR_TEST_DATA_DIR) / name;
+}
+
 Book::Book() {
   readFile();
   parse();
 }
 
 void Book::readFile() {
-  auto fname = fs::temp_directory_path() / "luxir" / "book.txt";
+  auto fname = testDataPath("book.txt");
   std::ifstream file(fname, std::ios::binary);
   if (!file) {
     LOG_ERROR("Couldn't read file '{}', try reloading cmake project to download it.", (std::string)fname);
@@ -104,4 +108,3 @@ void Book::parse() {
   // std::cout << "FIRST PARA:" << text().substr(paraOffsets[0], paraSizes[0]) << std::endl;
   // std::cout << "LAST PARA:" << text().substr(paraOffsets.back(), paraSizes.back()) << std::endl;
 }
-

@@ -451,7 +451,8 @@ public:
       auto nested = qb::boolean(
         mr, {nestedBoost(mr, inner, spec.factor)}, {}, {term(5)}, {term(0)});
       auto twin = qb::boolean(
-        mr, {}, flatOptional, {term(5)}, {term(0)}, std::max(1, spec.minMatch));
+        mr, {}, flatOptional, std::array{term(5)}, std::array{term(0)},
+        std::max(1, spec.minMatch));
       return {nested, twin};
     }
     if (spec.kind == 4) {
@@ -500,7 +501,7 @@ TEST_F(BooleanFuzzTest, optionalRanksUnlessMinMatchConstrains) {
         /*required=*/{},
         /*optional=*/optionals,
         /*prohibited=*/{},
-        /*filter=*/{qb::match(cur.mr(), "body_w", filterTerm)}, minMatch);
+        /*filter=*/std::array{qb::match(cur.mr(), "body_w", filterTerm)}, minMatch);
     req->execute();
     std::set<std::string> got;
     for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));

@@ -53,21 +53,36 @@ target_compile_definitions(decoded_successor_scalar_test PRIVATE
 
 
 function(download fname url hash)
-  if(NOT EXISTS ${fname})
-    file(DOWNLOAD ${url} ${fname} TIMEOUT 20 EXPECTED_HASH SHA256=${hash} TLS_VERIFY ON)
+  if(EXISTS "${fname}")
+    file(SHA256 "${fname}" actual_hash)
+    if(actual_hash STREQUAL hash)
+      return()
+    endif()
+    file(REMOVE "${fname}")
   endif()
+  file(DOWNLOAD "${url}" "${fname}.part" TIMEOUT 20 TLS_VERIFY ON STATUS result)
+  list(GET result 0 status)
+  if(status EQUAL 0)
+    file(SHA256 "${fname}.part" actual_hash)
+    if(actual_hash STREQUAL hash)
+      file(RENAME "${fname}.part" "${fname}")
+      return()
+    endif()
+    set(result "SHA256 mismatch: expected ${hash}, received ${actual_hash}")
+  endif()
+  file(REMOVE "${fname}.part")
+  message(WARNING "Test data unavailable: ${url}: ${result}")
 endfunction(download)
 
-if(NOT DEFINED $ENV{TMP})
-  set(ENV{TMP} /tmp)
-endif()
-
-set(LUXIR_TMP "$ENV{TMP}/luxir")
-file(MAKE_DIRECTORY ${LUXIR_TMP})
-download("${LUXIR_TMP}/book.txt" http://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
+# Keep downloaded fixtures with the build, including across disposable containers.
+set(LUXIR_TEST_DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data")
+file(MAKE_DIRECTORY "${LUXIR_TEST_DATA_DIR}")
+set_property(SOURCE test/TestData.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+  "LUXIR_TEST_DATA_DIR=\"${LUXIR_TEST_DATA_DIR}\"")
+download("${LUXIR_TEST_DATA_DIR}/book.txt" https://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
 
 # Unicode 15.1.0 conformance files for AnalysisTest (must match uni-algo's
 # pinned Unicode version: deps/uni-algo/include/uni_algo/impl/impl_unicode_version.h).
 # If a download fails (offline), the conformance tests GTEST_SKIP rather than fail.
-download("${LUXIR_TMP}/WordBreakTest-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/auxiliary/WordBreakTest.txt 69506b2253b8defb1f15b1476397376285cfda3bafd9304ee50d48bbfa0a2ab4)
-download("${LUXIR_TMP}/CaseFolding-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/CaseFolding.txt 4e55acfdc32825a22e87670e9056a3bf94ad7c5400065778e9e10f8314372bcf)
+download("${LUXIR_TEST_DATA_DIR}/WordBreakTest-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/auxiliary/WordBreakTest.txt 69506b2253b8defb1f15b1476397376285cfda3bafd9304ee50d48bbfa0a2ab4)
+download("${LUXIR_TEST_DATA_DIR}/CaseFolding-15.1.0.txt" https://www.unicode.org/Public/15.1.0/ucd/CaseFolding.txt 4e55acfdc32825a22e87670e9056a3bf94ad7c5400065778e9e10f8314372bcf)

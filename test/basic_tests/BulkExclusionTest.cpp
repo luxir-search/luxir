@@ -276,7 +276,7 @@ TopRun runExclusionShape(CollectionHelper& helper, ExclusionShape shape,
     prohibited.push_back(qb::all());
   }
   top.rawQuery() = qb::boolean(
-      top.mr(), {qb::match(top.mr(), "body_w", "left")}, {}, prohibited);
+      top.mr(), std::array{qb::match(top.mr(), "body_w", "left")}, {}, prohibited);
   req->execute(false);
   EXPECT_TRUE(req->ok()) << req->errorMsg();
   return collectTopRun(*req);

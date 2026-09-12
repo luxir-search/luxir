@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -129,7 +130,7 @@ int64_t runCount(CollectionHelper& helper, bool disableWindowPath,
     prohibited.push_back(qb::match(top.mr(), "body_w", "termex"));
   }
   top.rawQuery() = qb::boolean(
-      top.mr(), {qb::match(top.mr(), "body_w", "positive")}, {},
+      top.mr(), std::array{qb::match(top.mr(), "body_w", "positive")}, {},
       prohibited);
   req->execute(false);
   EXPECT_TRUE(req->ok()) << req->errorMsg();

@@ -24,6 +24,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/FieldType.h"
 #include "test/LuxirTest.h"
+#include "test/TestData.h"
 
 using namespace luxir;
 
@@ -367,16 +368,11 @@ TEST_F(AnalysisTest, analyzerOutlivesDefinition) {
 // are built on top of uni-algo: validates that the pinned library actually
 // passes UAX#29 word segmentation and Unicode full case folding, plus a few
 // shipped-behavior sanity checks. The two file-driven tests consume the official
-// Unicode data files that cmake downloads into $TMP/luxir; they GTEST_SKIP when
+// Unicode data files that cmake downloads into the build tree; they GTEST_SKIP when
 // the files are absent (offline) rather than fail.
 // ---------------------------------------------------------------------------
 namespace {
 namespace fs = std::filesystem;
-
-// Path to a Unicode conformance file (cmake downloads these next to book.txt).
-fs::path unicodeDataPath(const char* name) {
-  return fs::temp_directory_path() / "luxir" / name;
-}
 
 // toNFKC_Casefold approximation for the spike: case-fold, then NFKC. The
 // single-pass NFKC_CF mapping is a later optimization; this two-pass form
@@ -445,7 +441,7 @@ TEST_F(AnalysisTest, nfkcCfOnAsciiIsLowercase) {
 // Each line encodes break (U+00F7) / no-break (U+00D7) positions between code
 // points; we compare uni-algo's segment boundaries to the expected set.
 TEST_F(AnalysisTest, uax29WordBreakConformance) {
-  fs::path path = unicodeDataPath("WordBreakTest-15.1.0.txt");
+  fs::path path = testDataPath("WordBreakTest-15.1.0.txt");
   std::ifstream in(path, std::ios::binary);
   if (!in) GTEST_SKIP() << "missing " << path << " (reconfigure cmake to download)";
 
@@ -487,7 +483,7 @@ TEST_F(AnalysisTest, uax29WordBreakConformance) {
 // in CaseFolding.txt must round-trip through to_casefold_utf8. (S simple / T
 // Turkic rows are intentionally skipped - we fold locale-independently.)
 TEST_F(AnalysisTest, caseFoldingConformance) {
-  fs::path path = unicodeDataPath("CaseFolding-15.1.0.txt");
+  fs::path path = testDataPath("CaseFolding-15.1.0.txt");
   std::ifstream in(path, std::ios::binary);
   if (!in) GTEST_SKIP() << "missing " << path << " (reconfigure cmake to download)";
 
@@ -655,7 +651,7 @@ TEST_F(AnalysisTest, standardFusionAdversarialEquivalence) {
 // CR LF, WSegSpace) and stress-tests the safe-split region scanner against
 // codepoints it must route to the conformant path.
 TEST_F(AnalysisTest, standardFusionMatchesComposedOnWordBreakCorpus) {
-  fs::path path = unicodeDataPath("WordBreakTest-15.1.0.txt");
+  fs::path path = testDataPath("WordBreakTest-15.1.0.txt");
   std::ifstream in(path, std::ios::binary);
   if (!in) GTEST_SKIP() << "missing " << path << " (reconfigure cmake to download)";
 

@@ -12,6 +12,7 @@
 #include "luxir/api/build.h"
 #include "luxir/api/padded_input.h"
 #include "LocalReq.h"
+#include <initializer_list>
 #include <memory_resource>
 
 #include "luxir/util/thread.h"
@@ -263,8 +264,15 @@ public:
   // all_or_none, return_ids, mixed adds + deletes); build docs with builder.add().
   IndexResult submit(UpdateBuilder& builder) { return runSync(builder.finish()); }
 
-  // NOTE: distinct name (not an `index` overload) - std::span's initializer_list ctor would
-  // make index({{"id","1"}}) ambiguous. Mirrors deleteById / deleteByIds.
+  // Distinct names keep a single document's braced fields unambiguous.
+  // Consume initializer lists synchronously, before their backing array expires.
+  IndexResult indexAll(std::initializer_list<Doc> docs,
+                       UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
+                       bool overwrite = false, uint32_t maxSegments = 0) {
+    return indexAll(std::span<const Doc>(docs.begin(), docs.size()),
+                    commitType, overwrite, maxSegments);
+  }
+
   IndexResult indexAll(std::span<const Doc> docs,
                        UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
                        bool overwrite = false, uint32_t maxSegments = 0) {
@@ -273,6 +281,13 @@ public:
     if (commitType != UpdateMessage::NO_COMMIT) b.commit(false, maxSegments);
     b.overwrite(overwrite);
     return runSync(b.finish());
+  }
+
+  IndexResult deleteByIds(std::initializer_list<std::string> ids,
+                          UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
+                          uint32_t maxSegments = 0) {
+    return deleteByIds(std::span<const std::string>(ids.begin(), ids.size()),
+                       commitType, maxSegments);
   }
 
   IndexResult deleteByIds(std::span<const std::string> ids,

@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <filesystem>
 #include <gtest/gtest.h>
 
+std::filesystem::path testDataPath(const char* name);
 
 class Book {
   std::string str;

@@ -39,17 +39,12 @@ inline int32_t java_string_hashcode(std::string_view sv) {
 // to do things that will mess up timings in the name of better test coverage.)
 extern bool unit_tests;
 
-// Benchmark data files (e.g. book.txt) are fetched at cmake configure time and
-// resolved at runtime under the temp dir, so they can be absent when $TMPDIR
-// differs from the configure-time location.  A missing *benchmark* data file is
-// not a correctness failure - skip the benchmark with a message rather than
-// erroring, so Benchmarks.all does not go red based purely on the environment.
-// (A real TEST that depends on the data should hard-fail instead, to flag the
-// lost coverage.)  Returns true (and skips) when the data is absent; callers
-// should `return` immediately.
+// Optional benchmark corpora can be absent on an offline or minimal setup.
+// Skip with a message so Benchmarks.all still covers the available corpora.
+// Returns true (and skips) when data is absent; callers should return immediately.
 inline bool skipBenchIfDataMissing(benchmark::State& state, bool present, std::string_view what) {
   if (present) return false;
-  state.SkipWithMessage(std::string(what) + " not available (downloaded at cmake configure time; check $TMPDIR)");
+  state.SkipWithMessage(std::string(what) + " not available; see the test-data setup");
   return true;
 }
 

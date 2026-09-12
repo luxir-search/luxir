@@ -467,7 +467,7 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
   }
   EXPECT_FALSE(resolveTimeZone(embeddedNul).has_value());
 
-  auto alias = resolveTimeZone("EST5EDT");
+  auto alias = resolveTimeZone("US/Eastern");
   ASSERT_TRUE(alias.has_value());
   EXPECT_TRUE(alias->isIana());
   EXPECT_EQ("America/New_York", alias->name());  // chrono returns the canonical target
