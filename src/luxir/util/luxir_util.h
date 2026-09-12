@@ -9,6 +9,10 @@
 #include <vector>
 #include <memory.h>
 
+// Use memcpy loads. xxHash's typed unaligned loads can violate aliasing and
+// cause optimized scalar hash inputs to be discarded (observed with GCC 16.2).
+#define XXH_FORCE_MEMORY_ACCESS 0
+
 // GCC -Og cannot compile xxHash's forced-inline AVX-512 dispatch path. Keep
 // the existing header-inlined implementation for optimized builds, but use the
 // linked implementation in Debug. The streaming-state layout is requested by
