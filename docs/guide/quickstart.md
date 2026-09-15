@@ -1,9 +1,10 @@
 # Quickstart
 
-Luxir speaks plain JSON over HTTP. Start the server, `curl` a document in,
-`curl` a search out. There is no schema to define up front, no client library
-to install, and no cluster to stand up first. Once the source build is ready,
-this page gets you to a working search in a few commands.
+Luxir has a JSON API over HTTP. This page starts the server, indexes a few
+documents with `curl`, and searches them. No schema, client library, or
+cluster setup is needed first. It then covers exact counts, facets and
+metrics in the same request, `simple_query` for search boxes, the query
+language, and streaming import and export of files of any size.
 
 ## Get Luxir
 
@@ -34,31 +35,59 @@ curl http://localhost:9400/health
 
 ## Index documents
 
+Index three books with sample prices in dollars:
+
 ```bash
 curl -X POST http://localhost:9400/collections/main/_update \
   -H 'Content-Type: application/json' \
-  -d '{"docs":[
-        {"id":"1","title_t":"The Way of Kings","author_s":"Sanderson","year_i":2010},
-        {"id":"2","title_t":"Words of Radiance","author_s":"Sanderson"},
-        {"id":"3","title_t":"Mistborn: The Final Empire","author_s":"Sanderson","year_i":2006}
-      ],"commit":{}}'
+  -d '{
+    "docs": [
+      {
+        "id": "1",
+        "title_t": "The Way of Kings",
+        "author_s": "Sanderson",
+        "series_s": "Stormlight",
+        "year_i": 2010,
+        "price_f": 12.5
+      },
+      {
+        "id": "2",
+        "title_t": "Words of Radiance",
+        "author_s": "Sanderson",
+        "series_s": "Stormlight",
+        "year_i": 2014,
+        "price_f": 15.0
+      },
+      {
+        "id": "3",
+        "title_t": "Mistborn: The Final Empire",
+        "author_s": "Sanderson",
+        "series_s": "Mistborn",
+        "year_i": 2006,
+        "price_f": 8.5
+      }
+    ],
+    "commit": {}
+  }'
 ```
 
 ```json
 {"update_version":1,"status":"ok"}
 ```
 
-You did not define a schema, and you did not create the `main` collection -
-both just happened. **Field types come from the field name.** A `_t` suffix is
-full-text (analyzed, tokenized), `_s` is an exact string, `_i` is an integer;
-there are suffixes for floats, doubles, dates, and multi-valued versions of
-each. Name a field `title_t` and it is searchable text; name it `year_i` and
-it is a number you can range and sort on. Define an [explicit schema](schema.md)
-later when you want control - you do not need one to start.
+The write created the `main` collection, and **built-in field templates**
+supplied the field types: `_t` is searchable text, `_s` is an exact string, and
+`_i` is an integer you can range and sort on, and `_f` stores floating-point
+numbers. You did not need to define your own schema.
+
+Templates also handle fields you do not know about yet. For example, a custom
+`_attr` template can cover new product attributes as an ecommerce catalog
+grows. You can combine templates with explicit field definitions and choose
+your own names. See [Schema](schema.md#field-templates-for-dynamic-fields).
 
 When one input should support both word search and whole-value facets or sorts,
-define [field variants](schema.md#field-variants). The schema example supplies
-`author` once and chooses text for search and a normalized string for values.
+use [field variants](documents.md#field-variants). The author example uses
+`_name` to search individual words and facet on whole names.
 
 > **Reading the rest of this page:** requests are shown as HTTP: method, path,
 > and body. On the website, every request block has a **Copy as curl** button
@@ -72,11 +101,15 @@ define [field variants](schema.md#field-variants). The schema example supplies
 ```http
 POST /collections/main/_search
 
-{"query": {"match": {"title_t": "kings"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
+{
+  "query": "title_t:kings",
+  "fields": ["id", "title_t", "author_s", "year_i"],
+  "get_number": true
+}
 ```
 
 ```json
-{"found":1,"docs":[{"id":"1","author_s":"Sanderson","year_i":2010}]}
+{"found":1,"docs":[{"id":"1","title_t":"The Way of Kings","author_s":"Sanderson","year_i":2010}]}
 ```
 
 Add `?pretty` to the search URL (`/collections/main/_search?pretty`) for
@@ -88,6 +121,7 @@ readable output:
   "docs": [
     {
       "id": "1",
+      "title_t": "The Way of Kings",
       "author_s": "Sanderson",
       "year_i": 2010
     }
@@ -97,49 +131,87 @@ readable output:
 
 Alternatively, pipe the curl response through `| jq`.
 
-`match` analyzes your text the same way the field was indexed, so `kings`
-finds *"The Way of Kings"*. `fields` chooses what comes back. A
-document that doesn't have a requested field simply omits that key - a doc
-object never carries `null` placeholders, so what you see is exactly what the
-document has.
+`title_t:kings` searches the title field for `kings`, using the same text
+analysis as indexing, so it finds *"The Way of Kings"*. The equivalent
+[structured form](query-reference.md#match) is
+`"query": {"match": {"title_t": "kings"}}`. You can use either form anywhere
+a query is accepted.
 
-Prefer a uniform shape instead? Add `"document_format": "columns"` to the
-request and every supported projected field appears in every doc, with an
-explicit `null` where the document has no value - handy when feeding rows into
-a table. (Over gRPC, responses are natively columnar; this setting picks the
-placement there too.)
+`fields` chooses what comes back. A document that doesn't have a requested
+field omits that key; no `null` placeholder is written.
+
+To get the same keys in every doc, add `"document_format": "columns"` to the
+request. Every supported projected field then appears in every doc, with an
+explicit `null` where the document has no value, which is convenient when
+feeding rows into a table. (Over gRPC, responses are natively columnar; this
+setting picks the placement there too.)
 
 ### Counts are exact
 
-Add `get_number` and the response tells you exactly how many documents match,
-not an estimate - even when you only page back a few:
+Add `get_number` and `found` is the total number of matching documents,
+regardless of `limit`:
 
 ```http
 POST /collections/main/_search
 
-{"query": {"match": {"author_s": "Sanderson"}}, "fields": ["id"], "get_number": true, "limit": 2}
+{
+  "query": {"match": {"author_s": "Sanderson"}},
+  "fields": ["id", "title_t"],
+  "get_number": true,
+  "limit": 2
+}
 ```
 
 ```json
-{"found":3,"docs":[{"id":"1"},{"id":"2"}]}
+{
+  "found": 3,
+  "docs": [
+    {
+      "id": "1",
+      "title_t": "The Way of Kings"
+    },
+    {
+      "id": "2",
+      "title_t": "Words of Radiance"
+    }
+  ]
+}
 ```
 
-Three match; you asked for two. `found` is the real total.
+`found` is 3 even though `limit` was 2.
 
 ### Forgiving end-user search
 
 For a search box where a human types whatever they want, use `simple_query`.
-It parses operators, quotes, and field terms, and it never returns a parse
-error - malformed input just does its best:
+It understands operators, quotes, and field terms, and it never returns a
+parse error, so malformed input still runs as a search:
 
 ```http
 POST /collections/main/_search
 
-{"query": {"simple_query": {"q": "kings | radiance", "fields": ["title_t"]}}, "fields": ["id"], "get_number": true}
+{
+  "query": {
+    "simple_query": {"q": "kings | radiance", "fields": ["title_t"]}
+  },
+  "fields": ["id", "title_t"],
+  "get_number": true
+}
 ```
 
 ```json
-{"found":2,"docs":[{"id":"2"},{"id":"1"}]}
+{
+  "found": 2,
+  "docs": [
+    {
+      "id": "2",
+      "title_t": "Words of Radiance"
+    },
+    {
+      "id": "1",
+      "title_t": "The Way of Kings"
+    }
+  ]
+}
 ```
 
 ### The query language
@@ -147,57 +219,141 @@ POST /collections/main/_search
 When you're the one writing the query, a bare string anywhere a query object
 goes is an expression in the [Luxir query language](query-language.md):
 fielded terms, AND/OR/NOT, ranges, and function forms for most structured query
-types. Unlike `simple_query`, malformed input is a parse error, not a guess:
+types:
 
 ```http
 POST /collections/main/_search
 
-{"query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2020]", "fields": ["id"], "get_number": true}
+{
+  "query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2013]",
+  "fields": ["id", "title_t"],
+  "get_number": true
+}
 ```
 
 ```json
-{"found":1,"docs":[{"id":"1"}]}
+{
+  "found": 1,
+  "docs": [
+    {
+      "id": "1",
+      "title_t": "The Way of Kings"
+    }
+  ]
+}
 ```
 
-*"Words of Radiance"* matched the title group but has no `year_i`, so the
-range clause excluded it.
+*"Words of Radiance"* matched the title group, but its `year_i` is `2014`,
+outside the requested range of `2010` through `2013`.
+
+### Facets and metrics, in the same request
+
+The same request can return books, count them by series, and calculate their
+average price. This example also includes the lowest price per series:
+
+```http
+POST /collections/main/_search
+
+{
+  "query": {
+    "match": {
+      "author_s": "Sanderson"
+    }
+  },
+  "fields": ["id", "title_t", "price_f"],
+  "limit": 2,
+  "get_number": true,
+  "ops": {
+    "series": {
+      "field_facet": {
+        "field": "series_s",
+        "ops": {
+          "lowest_price": "min(price_f)"
+        }
+      }
+    },
+    "average_price": "avg(price_f)"
+  }
+}
+```
+
+```json
+{
+  "found": 3,
+  "docs": [
+    {
+      "id": "1",
+      "title_t": "The Way of Kings",
+      "price_f": 12.5
+    },
+    {
+      "id": "2",
+      "title_t": "Words of Radiance",
+      "price_f": 15
+    }
+  ],
+  "ops": {
+    "average_price": 12,
+    "series": {
+      "buckets": [
+        {
+          "val": "Stormlight",
+          "count": 2,
+          "lowest_price": 12.5
+        },
+        {
+          "val": "Mistborn",
+          "count": 1,
+          "lowest_price": 8.5
+        }
+      ]
+    }
+  }
+}
+```
+
+Operations nest: `lowest_price` runs once per series bucket, while
+`average_price` summarizes all three matches, including the book beyond
+`limit: 2`. One round trip returns the documents, facet counts, and aggregate
+metrics over one consistent view of the index.
+[Faceting](faceting.md) covers range and date buckets, nested facets, and top
+documents per bucket.
 
 ## Bulk ingest: stream a whole file
 
 Set the content type to `application/x-ndjson` and send one document per line.
 The stream is unbounded - pipe in a file of any size and Luxir indexes it as it
-arrives, without buffering the whole thing:
+arrives, without buffering the whole thing. `?commit=true` commits at the end
+of the stream, making the documents searchable before the request completes:
 
 ```http
-POST /collections/main/_update
+POST /collections/main/_update?commit=true
 Content-Type: application/x-ndjson
 
-{"id": "4", "title_t": "Oathbringer", "author_s": "Sanderson", "year_i": 2017}
-{"id": "5", "title_t": "The Well of Ascension", "author_s": "Sanderson", "year_i": 2007}
-{"_end_": {"commit": {}}}
+{"id": "4", "title_t": "Oathbringer", "author_s": "Sanderson", "series_s": "Stormlight", "year_i": 2017, "price_f": 17.5}
+{"id": "5", "title_t": "The Well of Ascension", "author_s": "Sanderson", "series_s": "Mistborn", "year_i": 2007, "price_f": 10.0}
 ```
 
 ```json
 {"update_version":2,"status":"ok"}
 ```
 
-Lines starting with `_update_` or `_end_` are control objects, not documents.
-`_update_` opens a group and sets options for the documents that follow
-(`allow_dups`, `all_or_none`, a different `collection`, ...); `_end_` closes the
-group and can commit. Everything in between is just documents. To index an
-NDJSON file you already have:
+To index an NDJSON file you already have:
 
 ```bash
-curl -X POST http://localhost:9400/collections/main/_update \
+curl -X POST 'http://localhost:9400/collections/main/_update?commit=true' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @books.ndjson
 ```
 
-## Bulk export: stream every match, no cursor
+The optional `_update_` and `_end_` control records let you group updates and
+set options within a stream. See [Indexing](indexing.md#unbounded-ndjson-ingest).
 
-Add `?format=docs` to a query and the response is bare NDJSON documents - one
-per line, no envelope, no paging. `limit: -1` means every match, streamed over
-one connection; there is no scroll API or cursor token to manage:
+## Bulk export
+
+Add `?format=docs` to a query and the response is NDJSON, one document per
+line with no envelope. `limit: -1` returns every match, streamed over one
+connection, so there is no scroll API or cursor token to manage:
 
 ```http
 POST /collections/main/_search?format=docs
@@ -213,11 +369,11 @@ POST /collections/main/_search?format=docs
 {"id":"5","title_t":"The Well of Ascension"}
 ```
 
-Ask for `get_number` and a `_header_` line leads the stream so tools know the
-total up front: `{"_header_":{"found":5}}`. Execution warnings, when there are
-any, also arrive in a `_header_` - degraded execution is never silent. Header
-lines are recognized (and skipped) by ingest, so export pipes straight back
-into `/_update`:
+With `get_number`, a `_header_` line starts the stream so a consumer knows
+the total before reading the documents: `{"_header_":{"found":5}}`.
+Execution warnings, when there are any, also arrive in a `_header_` line.
+Ingest recognizes and skips header lines, so an export can be piped straight
+back into `/_update`:
 
 ```bash
 curl -s 'http://localhost:9400/collections/main/_search?format=docs' \
@@ -228,13 +384,13 @@ curl -X POST 'http://localhost:9400/collections/backup/_update?commit=true' \
 ```
 
 If anything fails mid-stream, the chunked response ends without its
-terminator, so HTTP clients report truncation instead of quietly delivering a
-partial result. A cleanly finished body is a complete result set.
+terminating chunk, so HTTP clients report a truncated body. A response that
+terminates normally is complete.
 
-## Many collections, one endpoint
+## Multiple collections
 
-You never pre-create collections. Index to any name and it comes into existence
-on first use:
+Collections do not need to be created in advance. The first update to a new
+collection name creates it:
 
 ```http
 POST /collections/books/_update
@@ -249,11 +405,23 @@ POST /collections/books/_update
 ```http
 POST /collections/books/_search
 
-{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "get_number": true}
+{
+  "query": {"match": {"title_t": "dune"}},
+  "fields": ["id", "title_t"],
+  "get_number": true
+}
 ```
 
 ```json
-{"found":1,"docs":[{"id":"a"}]}
+{
+  "found": 1,
+  "docs": [
+    {
+      "id": "a",
+      "title_t": "Dune"
+    }
+  ]
+}
 ```
 
 The same server holds multiple collections as independent index namespaces.
@@ -282,11 +450,26 @@ POST /collections/main/_search?explain=request
 ```
 
 ```json
-{"collection":"main","ops":{"q":{"top_docs":{"query":{"match":{"field":"title_t","val":"dune"}}}}}}
+{
+  "collection": "main",
+  "ops": {
+    "q": {
+      "top_docs": {
+        "query": {
+          "match": {
+            "field": "title_t",
+            "val": "dune"
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
-Handy for learning the API and for debugging a query that isn't matching what
-you expect.
+This is useful for learning the API and for debugging a query that isn't
+matching what you expect: type the short form, read back the full one, and
+you have the request your code should generate.
 
 Use [`?explain=resolved`](http-api.md#explain-modes) to inspect which physical
 fields a request uses. It returns `request` and `resolved_fields`, and runs

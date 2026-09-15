@@ -1,247 +1,381 @@
 # Luxir Features
 
-Luxir is a high-performance hybrid search engine: full-text relevance,
-vector similarity, and faceted analytics in one native-code core. Requests
-share one composable request tree - queries, filters, facets, statistics, and
-fusion - served over gRPC and a JSON/HTTP API designed for humans.
-Built from scratch for modern hardware and cloud economics, with a work
-stealing task scheduler, async IO, and SIMD acceleration.
+Luxir is a native-code search engine with full-text relevance, vector
+similarity, faceting, analytics, and geo search in one index. Queries,
+filters, facets, statistics, and rank fusion go in one request, over a
+JSON/HTTP API that is easy to write by hand and a gRPC API for programs. It
+is written for modern hardware: a work-stealing scheduler, asynchronous IO,
+SIMD codecs, and an index served from memory-mapped files.
 
-The ten-second version:
+The simplest search:
 
 ```http
 POST /collections/main/_search
 
-{"query": {"match": {"title_t": "kings"}}, "fields": ["id", "author_s", "year_i"], "get_number": true}
+{
+  "query": {
+    "match": {
+      "title_t": "kings"
+    }
+  },
+  "fields": ["id", "author_s", "year_i"],
+  "get_number": true
+}
 ```
 
 ```json
-{"found":1,"docs":[{"id":"1","author_s":"Sanderson","year_i":2010}]}
+{
+  "found": 1,
+  "docs": [
+    {
+      "id": "1",
+      "author_s": "Sanderson",
+      "year_i": 2010
+    }
+  ]
+}
 ```
 
-No schema defined up front, no collection created, no client library
-installed. The [Quickstart](guide/quickstart.md) gets you here in a few
-commands; the [architecture](design/architecture.md) explains why the
-engine is built the way it is.
+Add `ops` to return documents, counts by series, and the average price of all
+matches in one request:
+
+```http
+POST /collections/main/_search
+
+{
+  "query": {
+    "match": {
+      "author_s": "Sanderson"
+    }
+  },
+  "fields": ["id", "title_t", "price_f"],
+  "limit": 2,
+  "get_number": true,
+  "ops": {
+    "series": {
+      "field_facet": {
+        "field": "series_s"
+      }
+    },
+    "average_price": "avg(price_f)"
+  }
+}
+```
+
+```json
+{
+  "found": 3,
+  "docs": [
+    {
+      "id": "1",
+      "title_t": "The Way of Kings",
+      "price_f": 12.5
+    },
+    {
+      "id": "2",
+      "title_t": "Words of Radiance",
+      "price_f": 15
+    }
+  ],
+  "ops": {
+    "average_price": 12,
+    "series": {
+      "buckets": [
+        {
+          "val": "Stormlight",
+          "count": 2
+        },
+        {
+          "val": "Mistborn",
+          "count": 1
+        }
+      ]
+    }
+  }
+}
+```
+
+That works with no schema or collection created ahead of time and no client
+library. The [Quickstart](guide/quickstart.md) gets you here in a few
+commands with these same documents, and the
+[architecture](design/architecture.md) page explains why the engine is built
+the way it is. This page lists what ships today.
 
 ## Highlights
 
-- **Hybrid search, natively.** A kNN query is a query like any other: it
-  composes with boolean logic and filters in one tree, filters apply
-  *inside* the vector search rather than after a fixed unfiltered top-k, and
-  rank fusion combines lexical and vector sources in the same request.
-- **One request, one round trip.** Top docs, facets with nested sub-ops,
-  statistics, and fusion as named ops in a single request, executed in parallel
-  over one index view.
-- **Fast top-k that doesn't cheat.** Requests that don't require an exact
-  count run with block-max pruning (MaxScore skipping); requests that require
-  a count are counted exhaustively.
-- **JSON you can type.** snake_case, untagged values, shorthands with
-  exact structured equivalents, and unknown keys are errors with
-  positions, not silence. `?explain=request` echoes your terse request
-  back in canonical form - the API teaches the API.
-- **Streaming everything.** NDJSON ingest with no stream-size or bulk-request
-  ceiling (individual records and explicit atomic groups remain bounded); the
-  server frames internal mini-batches. Responses are chunked, and long-lived
-  HTTP and streaming gRPC connections use asynchronous network IO. Unary gRPC
-  updates currently wait on the update worker before releasing their handler.
-- **Frugal by design.** Native code, no garbage collector, and a
-  memory-mapped index. One process is designed to scale up across a large
-  modern machine.
-- **Crash-safe commit structure.** Immutable segments and atomic commit
-  points mean a crash reopens the previous published commit, never a
-  half-published view.
+**One request returns a whole results page.** Top documents, facets with
+nested sub-operations, statistics, and hybrid fusion are named operations in
+a single request, all executed over one consistent view of the index. The
+example above is the simple case. The same request shape can nest facets
+under facets, put metrics and ranked documents under every bucket, and run
+facets over a fused ranking.
+
+- Counts are exact by default: `found` and every facet count are real
+  totals. A request that asks for a count is counted exhaustively; one that
+  does not runs top-k with block-max pruning.
+
+**Text and vector search work together, with the same filters and
+analytics.** A kNN query is a query like any other: it goes under boolean
+clauses and takes the same filters, and those filters apply inside the vector
+search rather than after a fixed unfiltered top-k. Reciprocal rank fusion
+merges lexical and vector rankings in the same request, with facets over the
+fused set. Vectors are stored in the index beside the documents, so there is
+no separate vector store to keep in sync.
+
+- Exact kNN over the vector column, or per-segment approximate indexes built
+  at commit and rescored at full precision from the column.
+
+**Native code that uses the whole machine.** No garbage collector and no heap
+ceiling, an index served from memory-mapped files, a work-stealing scheduler
+shared by indexing, merging, and search, and SIMD codecs on the hot paths.
+One process is meant to scale up across a large machine. Benchmark results
+are not yet published; the [architecture](design/architecture.md) page
+explains what each part is for.
+
+- Streaming in and out: NDJSON ingest with no stream-size limit and no bulk
+  size to choose, and every match streamed out over one connection with no
+  scroll state. An export can be piped straight back into ingest.
+- Crash-safe commits: segments are immutable and commit points are atomic, so
+  after a crash the index reopens at the previous commit.
+
+Requests are structured JSON, or protobuf over gRPC. Wherever a request takes
+a query, the query can be either a structured object or a string in the Luxir
+query language, such as `title_t:dune AND year_i:>=1965`. Both forms build
+the same query tree, so `?explain=request` shows the structured form of any
+expression, and most structured query types can also be called as functions
+with named arguments inside an expression. A parse error in either form
+reports its position. `$vars` are substituted as values rather than syntax,
+so user input cannot inject operators, and raw search-box text can go through
+`simple_query`, which never fails to parse.
 
 ## Schema and fields
 
-- Schemaless start: field types inferred from name suffixes (`title_t`,
-  `year_i`, `tags_ss`, `date_dt`, `embedding_v`, ...); no up-front schema
-  required.
-- Explicit schema API over HTTP/JSON and gRPC: field definitions, per-field
-  analyzers, field inheritance (templates). `GET /collections/{c}/_schema`
-  returns the authored schema and the output is itself a valid write body;
-  `POST` sets the named definitions (`mode=set`, the default) or replaces the
-  whole schema (`mode=replace_all` - the destructive operation must be typed,
-  never implied by an HTTP verb). Reserved fields (`id`, `_version_`) are
-  always materialized, so a replace cannot brick a collection.
-- Field types: analyzed text, string, int, float, double, date (ISO-8601
-  in, epoch-millis storage), id, vector, geo point (lat/lon;
-  values ingest as `[lon, lat]` arrays, GeoJSON coordinate order,
-  quantized to ~1cm).
-- Per-field choices: index mode (match / range acceleration), multi-valued, column-stored (for sorting,
-  faceting, and analytics), stored (for document retrieval; LZ4-compressed
-  chunks).
+- Field templates: built-in suffix rules (`title_t`, `year_i`, `tags_ss`, ...)
+  let you start without defining your own schema. Templates also handle
+  fields you cannot enumerate ahead of time, such as new product attributes
+  in an ecommerce catalog. Define the rule once; new matching fields work
+  automatically. [Templates](guide/schema.md#field-templates-for-dynamic-fields)
+  can be customized and combined with explicit field definitions, which take
+  precedence.
+- Field types: analyzed text, string, int, float, double, date (ISO-8601 in,
+  epoch-millis storage), id, vector, geo point.
+- Explicit schema API over HTTP/JSON and gRPC. `GET` returns the authored
+  schema, and the output is itself a valid write body; `POST` sets the named
+  definitions (`mode=set`) or replaces the whole schema (`mode=replace_all`;
+  the destructive form has to be spelled out rather than implied by an HTTP
+  verb).
+- Fields and templates can inherit settings with `parent`. The built-in
+  `_name` and `_names` templates support people and titles:
+  word search plus a whole-value variant for facets and sorting.
+- Field variants: one input value indexed under several representations
+  (`author` for word search, `author__s` for exact facets and sorts), with
+  per-operation default bindings so a bare field name does the right thing.
+- Per-field choices: index mode (match, or range acceleration), multi-valued,
+  column-stored (sorting, faceting, analytics), stored source (retrieval, in
+  LZ4-compressed chunks).
+- Numeric, date, and geo fields with `index: "range"` build a points index;
+  without it the same queries run off the column with the same results.
 - Floats and doubles are stored order-preserving, so numeric sorting and
   ranges over columns need no decode step.
+- Long terms: strings, tokens, and IDs over 255 bytes follow a per-field
+  policy (hash the tail by default, truncate, or reject).
 
 ## Text analysis
 
-- Tokenizers: Unicode word segmentation (UAX#29), whitespace, and keyword.
-  The common `unicode_word` plus `nfkc_cf` chain is fused internally into one
-  analysis pass; it is not a separate tokenizer name in the schema.
-- Token filters: NFKC case folding (normalized to a fixpoint), ASCII
-  lowercase, accent/diacritic folding.
+- Tokenizers: Unicode word segmentation (UAX#29), whitespace, keyword.
+- Token filters: NFKC case folding, ASCII lowercase, accent and diacritic
+  folding, English possessive removal, and KStem English stemming (the
+  dictionary-based Krovetz stemmer).
+- The default `_t` field applies Unicode words, case folding, accent folding,
+  possessive removal, and KStem. `_un` is Unicode text without stemming, `_u`
+  keeps case and accents, and `_w`/`_wl` split on whitespace.
+- Analyzer components carry typed parameters
+  (`{"name": "kstem", "params": {"possessive": false}}`); string fields take a
+  normalizer (filters only, applied to the whole value).
+- Query-time analysis matches index-time analysis, so `match` finds what was
+  indexed.
 
 ## Indexing and ingest
 
-- Streaming ingest on both surfaces: gRPC bidirectional stream, and HTTP
-  NDJSON with no stream-size limit - documents are parsed and indexed as bytes
-  arrive. Clients do not need to choose a bounded bulk-request size; several
-  streams are currently needed to saturate a many-core host. Individual HTTP
-  records and explicit atomic groups remain bounded.
-- Vector documents use bare number arrays over HTTP and typed
-  `Val.vec`/`arr_vec` arms over gRPC. Multi-valued vector fields accept an
-  array of number arrays, or a bare array as a one-vector list.
-- Row documents through `UpdateRequest.docs`.
-- Update/overwrite by id, delete by id, duplicate-allowed mode, and
+- Streaming ingest on both surfaces: HTTP NDJSON with no stream-size limit,
+  and a gRPC bidirectional update stream. Individual records and explicit
+  atomic groups are bounded; the stream is not.
+- Stream grammar: `_update_` opens a group with options (`allow_dups`,
+  `all_or_none`, `return_ids`, a different `collection`), `_end_` closes it
+  and can commit. One connection can feed several collections.
+- Field mapping at ingest (`field_map`, `drop_unmapped`): index a foreign dump
+  as-is, renaming or dropping keys per request, with no file editing and no
+  schema change.
+- Update and overwrite by id, delete by id, a duplicate-allowed mode, and
   optional per-request atomicity (all-or-none with rollback).
+- Per-document failures are reported by id and index with the same error
+  object used everywhere else; the other documents in the request are still
+  indexed.
 - Collections auto-create on first write (can be disabled).
-- Indexing memory is capped and flushes automatically; merges run in the
-  background and never stall ingest or search.
+- Commits publish a new view: immediate, `commit_within_ms`, `?commit=true` on
+  the URL, or at the end of a stream. Indexing memory is budgeted and flushes
+  automatically; merges run in the background and never stall ingest or
+  search.
 
 ## Queries
 
-All query types are nodes in one tree and compose freely under boolean
-clauses, as top-docs/fusion filters, and as fusion source queries.
+Every query type is a node in one tree and composes freely under boolean
+clauses, as non-scoring filters, as facet domains, and as fusion sources.
+Anywhere a query goes, it can be a structured object or an expression string.
 
-- `match` (analyzed; AND/OR operator; minimum-match; over numeric fields,
-  equality against the column), `boolean` (required / optional /
-  prohibited / filter clauses, minimum-match), `phrase` (position-based,
-  with optional slop measured as the spread of query-adjusted positions;
-  reordered terms are allowed, an adjacent transposition costs 2, and the
-  multi-value position gap of 100 can be crossed at slop 100 or more),
-  `range` over numeric, date, and term-backed fields (`gte`/`gt`/`lte`/`lt`,
-  any side open-ended; dates accept ISO-8601, epoch millis, or combined
-  Solr/OpenSearch date math with request-stable `NOW`/`now`, evaluated in
-  an optional request time zone (IANA or fixed offset), and a partial
-  date means the window it names - equality on `2024-06-25` matches the
-  whole day; string/text fields range over their indexed terms in byte
-  order, constant-scoring; with no bounds it matches every document that
-  has a value - a field-exists query),
-  `prefix`, `fuzzy`, `constant_score`, match-all, `geo_box` (bounding-box
-  over geo point fields, dateline-aware), `geo_distance` (inclusive radius
-  in meters), and `knn` (vector search is just a query).
-- Numeric, date, and geo fields declared with `index: "range"` build a points
-  index that answers ranges, boxes, and whole-index range facets far
-  faster than a column scan; without it the same queries still run off
-  the column.
-- Fuzzy matching rewrites to the closest terms with a default expansion cap of
-  50. Callers can set `max_expansions`; a lower operator/clause-budget clamp is
-  declared in response warnings. Blended scoring keeps rare misspellings from
-  outranking the exact term, and fuzzy clauses participate in block-max pruning
-  like any other clause.
-- `simple_query`: a never-fails search-box syntax for end-user input
-  (`+`/`-`, `|`, quoted phrases with an optional `~N` slop, grouping,
-  trailing-`*` prefix, `~N` fuzzy terms, and `field:value` terms - including exact numeric and date
-  matches like `price:10` or `created:2024-01-01`) - invalid syntax
-  degrades to terms, never to an error.
-- `expr`: the [query language](guide/query-language.md) for developers
-  writing queries - a bare string anywhere the JSON API takes a query
-  object.  Fielded terms and phrases (including strict quoted-phrase
-  `~N` slop), AND/OR/NOT with real precedence,
-  `+`/`-` prefixes, ranges (`year_i:[1960 TO 1970}`) and comparisons
-  (`year_i:>=1960`), field groups (`title_t:(a OR b)`), and function forms for
-  most structured query types (`fuzzy(smith, field=name_s, max_edits=2)`). The
-  [structured query reference](guide/query-reference.md) lists fields and
-  exceptions. Special characters only act
-  in the position where they mean something, so `url_s:https://x` needs no
-  escaping; `$vars` substitute request values without re-parsing them, so
-  user input cannot inject syntax.  Strict grammar, byte-offset parse
-  errors; degrading gracefully is `simple_query`'s job.
-- Non-scoring filters on top-docs and fusion sources - and a filter is where
-  an expression string shines: `"filter": ["status_s:active AND year_i:>=1960"]`.
+- `match` (analyzed, AND/OR operator, minimum-match; numeric and date
+  equality through columns), `phrase` (positional, with slop), `boolean`
+  (required, optional, prohibited, and filter clauses with minimum-match),
+  `any_of` (exact value-set membership), `exists`, and match-all.
+- `range` over numeric, date, string, ID, and text fields, either side open.
+  Date bounds accept ISO-8601, epoch millis, partial dates that mean the
+  window they name (`2024-06` is all of June), and date math
+  (`NOW/DAY-30DAYS`, `2024-06-25||+2d/d`) with a request-stable `NOW`,
+  evaluated in a request time zone (IANA name or fixed offset).
+- `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term), and
+  `fuzzy` (edit distance up to 2, with blended scoring so a rare misspelling
+  never outranks the exact term; fuzzy clauses take part in block-max pruning
+  like any other clause).
+- `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
+  each score with a value expression over columns and the original score
+  (`score * def(popularity_i, 1)`).
+- `knn` vector search, `geo_box`, and `geo_distance`.
+- `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
+  quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
+  terms, and `field:value` terms against an allowlist).
+- `expr`, the [query language](guide/query-language.md) for developers: a
+  bare string anywhere the JSON API takes a query. Fielded terms and phrases,
+  AND/OR/NOT with real precedence, `+`/`-`, ranges (`year_i:[1960 TO 1970}`)
+  and comparisons (`year_i:>=1960`), exact values
+  (`category_s:=(classic, fiction)`), field groups (`title_t:(a OR b)`),
+  per-clause boosts, and function forms for most structured query types
+  (`fuzzy(smith, field=name_s, max_edits=2)`; vector and geo queries stay
+  structured). Special characters act only
+  where they mean something, so most values need no escaping. Strict grammar
+  with byte-offset errors; `$vars` substitute values without re-parsing them.
+- Non-scoring filters on top-docs and fusion sources, routable past named
+  sub-operations (`except_ops`). Expression strings are convenient as
+  filters: `"filter": ["status_s:active AND year_i:>=1960"]`.
+- A filter cache that ranks entries by rebuild cost per byte, so under memory
+  pressure it evicts cheap single-term filters before expensive compound
+  ones.
 
 ## Search and ranking
 
-- BM25 relevance scoring.
-- Adaptive execution: requests that do not consume an exact total run with
-  block-max pruning (per-block score bounds + MaxScore skipping); requests
-  that ask for exact counts run exhaustively.
-- Lexicographic sorting by column values, query score, and reader-local
-  `(segment, docid)`, with ascending/descending directions, result limits, and
-  field projection: named fields, `*` wildcard patterns, or every retrievable
-  field when `fields` is omitted. Ordered page-after pagination is not
-  implemented yet.
-- Row- or column-oriented results per request (`document_format`): JSON
-  defaults to row-oriented docs (missing field = absent key), gRPC to dense
-  columns (missing = per-column sentinel) for analytics-friendly decoding.
-- Multiple named search ops in one request, executed in parallel over the same
-  index view; chunked streaming responses for large result sets.
-- Opt-in execution profiles expose per-segment strategy, selection inputs,
-  timing, and human-readable decisions for instrumented operations (currently
-  string facets). Requests can also force single-threaded execution when
-  isolating scheduler effects.
-- Count-only and aggregate-only requests: `limit: 0` with `get_number: true`
-  returns the exact count and any facets/metrics without fetching documents.
-- Numeric `avg`, `sum`, `min`, and `max` operations at query level or per string-facet
-  bucket.
-- Hybrid fusion op: reciprocal rank fusion (RRF) over named sources (e.g.
-  a lexical and a vector query), with shared and per-source filters.
-- A search warnings channel: declared query-time degradations carry a code and
-  message in the response rather than silently substituting query behavior.
+- BM25 relevance with block-max pruning (per-block score bounds plus MaxScore
+  skipping) whenever the request does not consume an exact count; exhaustive
+  counting when it does.
+- Sorting by column values, query score, value expressions
+  (`popularity_i + score * $weight`), and reader order; ascending or
+  descending; lexicographic over several keys; `offset` and `limit` paging.
+- Field projection: named fields, `*` wildcard patterns, or every retrievable
+  field when `fields` is omitted. Row- or column-oriented documents per
+  request (`document_format`): HTTP defaults to rows (a missing field is an
+  absent key), gRPC to dense columns.
+- Several named operations in one request over the same index view, executed
+  in parallel; a request's single result list is promoted to `found` and
+  `docs` in the HTTP envelope.
+- Count-only and analytics-only requests: `limit: 0` with `get_number: true`
+  loads no document fields.
+- Hybrid fusion: reciprocal rank fusion over named sources with shared and
+  per-source filters, `limit` and `offset` over the fused list, and facets and
+  metrics over the fused candidate set.
+- A warnings channel: declared degradations (a clamped fuzzy distance, a
+  skipped calendar bucket) carry a code and a message in the response instead
+  of silently changing the query.
+- Opt-in execution profiles (`profile: true`) with per-segment strategy,
+  inputs, and timing for instrumented operations (string facets today), and
+  `max_parallel` to force serial execution when isolating scheduler effects.
 
 ## Facets and analytics
 
-- Field (terms) facets over string, text, int, and date fields; range facets
-  over int, float, double, and date fields.
-- Date histograms: calendar gaps (day/week/month/quarter/year) stepped in
-  a request-level or per-facet time zone (IANA or fixed offset), bounds
-  accept date math (`NOW/DAY-30DAYS`), every bucket returned in order with
-  zero counts included.
-- Facet controls: limit, mincount, and missing bucket; string/ID facets can
-  sort by one named metric sub-op.
-- Nested sub-ops under string/ID facets: sub-facets and metrics per bucket.
-- Counts are exact by default, never estimated.
+- Field facets over string, ID, int, date, and text fields; range facets over
+  int, float, double, and date fields with fixed or calendar gaps; query
+  facets with arbitrary named query buckets.
+- Date histograms: calendar gaps (day, week, month, quarter, year) stepped in
+  a request or per-facet time zone, date-math bounds, every bucket returned in
+  order with zero counts included, daylight-saving changes handled.
+- Nesting: sub-facets under buckets, metrics per bucket, and a ranked
+  `top_docs` (or `fusion`) list per bucket, all in one request.
+- Expression metrics: `avg`, `sum`, `min`, and `max` over value expressions
+  (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per bucket; facets
+  can sort by a named metric.
+- Easy [multi-select navigation](guide/faceting.md#easy-multi-select-with-selected):
+  put choices in each facet's `selected` array. Luxir builds the filters and
+  automatically counts alternatives with the other facets' selections applied.
+  `domain` overrides and `except_ops` routing allow custom filtering behavior.
+- Facet controls: limit, mincount, and a missing bucket. Counts are exact by
+  default.
 
 ## Vector search
 
-- Dense float32 vector fields; the column store is the source of truth.
-  Metrics: L2, inner product, cosine (with normalize-on-write by default).
-- Exact kNN (full-precision column scan) and ANN via per-segment IVF+PQ
-  indexes, mixed per segment by a size gate; approximate candidates are
-  rescored at full precision.
+- Dense float32 vector fields, single- or multi-valued; the column store is
+  the source of truth. Metrics: L2, inner product, cosine (normalize-on-write
+  by default).
+- Exact kNN (full-precision column scan) and approximate search through
+  per-segment IVF+PQ indexes, mixed per segment by a size gate. Approximate
+  candidates are rescored at full precision straight from the column, so the
+  recall recovery costs no extra storage.
 - Filtered kNN applies filters inside the vector search and adaptively deepens
-  ANN breadth instead of post-filtering a fixed unfiltered top-k. `exact: true`
-  gives the true filtered top-k contract.
-- Multi-valued vector fields with max-similarity collapse per document.
+  ANN breadth instead of post-filtering. `exact: true` gives the exact
+  filtered top-k, which also serves as the ground truth for measuring recall.
+- Multi-valued vector fields collapse to one hit per document at its best
+  similarity, with adaptive over-fetch so `k` documents still come back.
 - ANN indexes are segment overlays: built at commit from the vector column and
   carried through merges automatically, without reindexing documents.
-- Effort knobs: `k`, `refine_candidates`, an `exact` switch, and per-engine
-  knobs under `ivf` (`nprobe`, `min_scan_fraction`).
-- Deterministic execution: parallel vector search returns bit-identical
-  results to serial.
+- Effort knobs: `k`, `refine_candidates`, `exact`, and per-engine knobs under
+  `ivf` (`nprobe`, `min_scan_fraction`).
+- Deterministic: parallel vector search returns bit-identical results to a
+  serial run.
+
+## Geo
+
+- Geo point fields (`[lon, lat]` arrays in GeoJSON coordinate order,
+  quantized to about a centimeter), single- or multi-valued, with an optional
+  two-dimensional points index.
+- Bounding-box queries (dateline-aware) and great-circle distance queries,
+  usable as the main query, as a non-scoring filter, or as a boolean clause.
 
 ## API surfaces
 
-- gRPC: streaming search, unary and streaming update, schema admin,
-  known-symbol server reflection, and health checks.
-- HTTP/JSON: query, update (JSON and NDJSON), schema, health. The JSON is
-  designed for humans: snake_case, untagged values, lowercase enum names,
-  shorthands with exact structured equivalents.
-- `?explain=request` echo mode: send the terse form, get back the
-  canonical structured form.
-- Strict validation everywhere: unknown keys are errors, not silence;
-  depth and size limits are built in (the public port is treated as
-  hostile).
-- One error shape everywhere: `{kind, code, message}`, in-band and in
-  HTTP error bodies and gRPC status details alike; `kind` fixes the
-  transport status, `code` is the stable key.
-- Request/response correlation ids on gRPC streams and updates; per-request
-  freshness bound (`freshness_ms`) on reads.
+- HTTP/JSON: search (GET with URL parameters for a bookmarkable search, or
+  POST), update (JSON and NDJSON), schema, collection create, delete, and
+  list, stats, and health. `?pretty` for humans; every body ends with a
+  newline.
+- gRPC: streaming search, unary and streaming update, schema and collection
+  admin, stats, the standard health service, and known-symbol reflection.
+  Search results are natively columnar.
+- One vocabulary: both surfaces share the protobuf message model, so a shape
+  learned over HTTP is the message a generated client sends.
+- Strict validation everywhere: unknown keys are errors, nesting depth and
+  sizes are bounded, and the public port is treated as hostile input.
+- One error shape everywhere: `{kind, code, message}`, in-band and in HTTP
+  error bodies and gRPC status details alike. `kind` fixes the transport
+  status; `code` is the stable key.
+- Request and response correlation ids, and a per-request freshness bound
+  (`freshness_ms`) on reads.
 
 ## Operations
 
-- Storage: filesystem (memory-mapped reads) or in-memory.
-- Crash-safe commits: files are written, synced, and atomically renamed; a
-  crash lands on the previous commit point, never in between.
-- Background merging with node-wide indexing-RAM budgeting.
+- Storage: filesystem (memory-mapped reads) or in-memory. Collections are
+  independent indexes below one data directory.
+- Crash-safe commits: files are written, synced, and atomically renamed, so a
+  crash lands on the previous commit point. An optional checked-directory
+  mode diagnoses filesystems that break the sync assumptions.
+- One writer per data directory, enforced by a lock; `--read-only` nodes serve
+  a directory that another process is writing.
+- Background merging that parallelizes inside a single merge, admitted
+  against a node-wide indexing-RAM budget. `--max-ram-mb` sizes the whole node
+  from one number (25% of system or cgroup RAM by default).
+- Operational statistics per node and per collection (`/_stats`): segments,
+  live documents, bytes, merge activity, and cache counters.
 - No built-in authentication or TLS yet: run the server inside your own
   network boundary.
 
 ## Status
 
 Luxir is pre-1.0 and moving fast; interfaces can change without
-back-compat. It is currently a single-node engine with no replication,
-distributed query execution, authentication, or TLS. This page lists shipped
-capabilities; the [operations guide](guide/operations.md) states the deployment
-boundary and current limitations.
+back-compat. It is a single-node engine with no replication, distributed
+query execution, authentication, or TLS. This page lists shipped
+capabilities; the [operations guide](guide/operations.md) states the
+deployment boundary and the current limitations.

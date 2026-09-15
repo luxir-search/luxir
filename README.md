@@ -14,40 +14,59 @@ Content-Type: application/json
 ```
 
 ```json
-{"found":2,"docs":[{"id":"b1","title_t":"Dune","year_i":1965},{"id":"b2","title_t":"Dune Messiah","year_i":1969}]}
+{
+  "found": 2,
+  "docs": [
+    {
+      "id": "b1",
+      "title_t": "Dune",
+      "year_i": 1965
+    },
+    {
+      "id": "b2",
+      "title_t": "Dune Messiah",
+      "year_i": 1969
+    }
+  ]
+}
 ```
 
-No collection creation, schema ceremony, or client library is required to get
-there. Field-name suffixes provide useful defaults, a write to a new collection
-creates it, and a terse request can always be echoed back in its canonical form.
+No collection creation, schema, or client library is required to get
+there. Built-in field templates provide useful defaults. Templates also
+handle new field names as your data grows, and can be combined with explicit
+field definitions. A write to a new collection creates it, and a
+terse request can always be echoed back in its canonical form.
 
 ## Why Luxir
 
-- **Hybrid is a property of the query tree, not a pipeline.** kNN composes with
-  boolean logic and filters, and reciprocal-rank fusion combines lexical and
-  vector rankings in the same request.
-- **One request describes the page.** Return ranked documents, exact counts,
-  facets with nested sub-facets, and numeric metrics in one round trip.
-- **The API is meant to be written.** JSON values are untagged, names are
-  `snake_case`, shorthands have exact structured equivalents, and unknown keys
-  are errors rather than ignored typos.
-- **Large transfers are streams, not cursor protocols.** Feed unbounded NDJSON
-  to the update endpoint and export every match as document-per-line NDJSON over
-  one connection.
-- **Efficiency is the product.** Cloud makes inefficiency a recurring bill.
-  Luxir is built to use one large modern machine well: native code, memory-mapped
-  immutable segments, work-stealing parallelism, and SIMD-aware data paths.
+Luxir is a new search engine from Yonik Seeley, the original author of Apache
+Solr and a longtime Lucene/Solr committer.
+
+- Native code, designed for high throughput and efficient memory use, with parallel
+  indexing, merging, and search.
+- Text and vector search work together, with shared filters and built-in
+  rank fusion.
+- One request can return several result lists, facets, and statistics, all
+  over the same view of the index.
+- Queries can be structured JSON or protobuf, or expressions such as
+  `title_t:dune AND year_i:>=1965`. Variables let you reuse a query with
+  different input without constructing or escaping query strings.
+- Multi-select faceting handles filtering and facet counts automatically:
+  send the chosen values in `selected`. Facets can also contain metrics,
+  nested facets, and top matching documents.
+- Stream any number of documents in or out. Load a dataset in one request,
+  retrieve all matches, or pipe results into another collection or server.
 
 The complete shipped capability list is in [Luxir Features](docs/features.md).
 For the design rationale, see [Architecture](docs/design/architecture.md).
 
 ## Try it
 
-Download a release from <https://luxir.org/download/>, put the `luxir`
-binary on your `PATH`, start it, and check the HTTP endpoint:
+Download a single binary from <https://luxir.org/download/>,
+start it, and check the HTTP endpoint:
 
 ```bash
-luxir
+./luxir
 curl http://localhost:9400/health
 ```
 
@@ -56,7 +75,17 @@ Index a document and commit it:
 ```bash
 curl -X POST http://localhost:9400/collections/books/_update \
   -H 'Content-Type: application/json' \
-  -d '{"docs":[{"id":"b1","title_t":"The Way of Kings","author_s":"Sanderson","year_i":2010}],"commit":{}}'
+  -d '{
+    "docs": [
+      {
+        "id": "b1",
+        "title_t": "The Way of Kings",
+        "author_s": "Sanderson",
+        "year_i": 2010
+      }
+    ],
+    "commit": {}
+  }'
 ```
 
 Search it:
@@ -73,7 +102,7 @@ Continue with the [Quickstart](docs/guide/quickstart.md), then use the
 ## Build from source
 
 Releases with binaries are published on the [download page](https://luxir.org/download/).
-To build from source instead, Luxir requires a C++26-capable compiler, CMake,
+To build from source instead, Luxir requires a C++26-capable compiler (gcc16), CMake,
 Ninja, vcpkg, and the native dependencies listed in
 [Build Setup](docs/dev/build-setup.md). With those dependencies installed:
 
@@ -98,8 +127,6 @@ on-disk index format change without notice, and there is no compatibility
 guarantee before 1.0: expect to reindex when upgrading. It is currently a
 single-node engine with no built-in authentication or TLS; deploy it behind
 your own network and security boundary. Replication, distributed query
-execution, packaged clients, and a collection-management API are not shipped
-yet. Binary releases target Linux on x86-64; other platforms build from source
-and assume a prepared Linux/GCC/vcpkg environment. The
-[operations guide](docs/guide/operations.md) covers the production boundary
-honestly.
+execution, and packaged clients are not shipped
+yet. Binary releases target Linux on x86-64 currently.
+See more in the [operations guide](docs/guide/operations.md).

@@ -57,7 +57,7 @@ locations, browse `src/luxir/<area>/`.
      with one mutable analysis/normalization chain per field descriptor;
      lowering retains the resolved physical target
    - String parsers emit `api::Query` subtrees and lower through the same path:
-     `SimpleQueryParser` (never-fails search-box input) and `ExprParser` (the rigorous
+     `SimpleQueryParser` (lenient search-box input that never fails to parse) and `ExprParser` (the strict
      `expr` query language; `Cursor` is its bounds-checked input, `ExprFunctions.h` the
      reflection-driven function-form registry)
 
@@ -127,9 +127,10 @@ locations, browse `src/luxir/<area>/`.
 ## Proto Files
 
 Protocol buffer definitions are in `protos/`:
-- `luxir.proto`: Public service definitions only
-- `luxir_types.proto`: Public request, response, and value definitions
-- `luxir_index.proto`: Internal on-disk commit manifest, excluded from gRPC reflection
+
+- [luxir.proto](../../protos/luxir.proto): Public service definitions only
+- [luxir_types.proto](../../protos/luxir_types.proto): Public request, response, and value definitions
+- [luxir_index.proto](../../protos/luxir_index.proto): Internal on-disk commit manifest, excluded from gRPC reflection
 
 The public and internal wire structs are handwritten in `src/luxir/api/`.
 hpp-proto generates their binary and JSON metadata into the build directory.

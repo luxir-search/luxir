@@ -1,11 +1,15 @@
 # The Luxir query language (`expr`)
 
-`expr` is the query string aimed at developers: the thing you type into a
-curl body, a dashboard, or a filter. It has a strict grammar and reports
-parse errors with a byte offset. It is not meant for raw end-user input -
-a search box should send its text through
-[`simple_query`](quickstart.md#forgiving-end-user-search), which never fails
-to parse. `expr` would rather error than guess.
+`expr` is the string form of a query: what you type into a curl body, a
+dashboard, or a filter. The structured JSON or protobuf form builds the same
+tree, and anywhere a request takes a query, either form works. The syntax is
+close to Lucene's but without its warts: `AND`/`OR`/`NOT` have real
+precedence, special characters only act in the position where they mean
+something, most structured query types are callable as functions, and
+`$vars` substitute values without being parsed as syntax. The grammar is strict and reports parse errors with a byte offset. It
+is not meant for raw end-user input; a search box should send its text through
+[`simple_query`](quickstart.md#forgiving-end-user-search), which never fails to
+parse.
 
 Anywhere the JSON API takes a query object, a bare string is an expression:
 
@@ -15,7 +19,28 @@ POST /collections/main/_search
 {"query": "status_s:active AND year_i:>=1960", "fields": ["id"]}
 ```
 
-Filters take them too:
+The forms at a glance:
+
+```
+title_t:dune                          term, analyzed like the field
+title_t:"dune messiah"                phrase
+title_t:"dune messiah"~2              phrase with slop
+status_s:=live                        exact whole value, no analysis
+title_t:dune AND NOT status_s:draft   AND, OR, NOT with real precedence
++title_t:dune -tag_s:beta             search-box style: required, prohibited
+title_t:(dune OR kings)               field group
+year_i:[1960 TO 1970]                 range; { } excludes an endpoint
+year_i:>=1965                         comparison
+created_dt:>=NOW/DAY-30DAYS           date math
+title_t:mess*                         prefix
+author_s:Herbet~1                     fuzzy, one edit
+year_i:*                              field has a value
+title_t:dune^2                        boost
+fuzzy(Herbet, field=author_s, max_edits=2)   any query type as a function
+author_s:=$authors                    a value from vars, never parsed as syntax
+```
+
+Filters take expressions too, and a filter is often clearest as a string:
 
 ```
 {"query": {...}, "filter": ["status_s:active AND year_i:[1960 TO 1970]"]}
@@ -26,17 +51,16 @@ The string form is shorthand for the `expr` arm:
 the request back in the structured form.
 
 An expression is plain shorthand: it builds the same query the equivalent
-structured JSON would. The syntax contributes structure - which fields, how
-clauses combine, ranges - and nothing else. Your search words reach the
-field's analyzer untouched, exactly as they would from a structured `match`
-query, and what a value means is decided by its field, not by its shape:
-`zip_s:02134` stays the string "02134", leading zero and all, because
-`zip_s` is a string field.
+structured JSON would. The syntax only supplies structure: which fields,
+how clauses combine, and ranges. Your search words reach the field's
+analyzer untouched, exactly as they would from a structured `match` query,
+and a value's meaning is decided by its field type: `zip_s:02134` stays the
+string "02134", leading zero included, because `zip_s` is a string field.
 
-On a field with [variants](schema.md#field-variants), the operation also
-chooses a representation: terms and phrases use `defaults.search`; `:=`
-and ranges use `defaults.value`. Both default to the primary (`self`).
-`field__label` and `field__self` explicitly select one representation.
+On a field with [variants](schema.md#field-variants), terms and phrases use
+the field's `search` binding and `:=` and ranges use its `value` binding;
+`field__label` and `field__self` select one representation explicitly. See
+[default bindings](schema.md#default-bindings).
 
 ## Terms and phrases
 
@@ -49,9 +73,8 @@ tag_s:"in stock"            on an unanalyzed string field: one exact term
 year_i:1982                 exact numeric match
 ```
 
-A word with no field is a parse error. There is no default search field:
-either name one (`title_t:dune`), use `match(dune, field=title_t)`, or use
-`simple_query` if the text came from a search box.
+There is no default search field: name one (`title_t:dune`), use
+`match(dune, field=title_t)`, or use `simple_query` for search-box input.
 
 Phrase slop measures the spread of the query-adjusted positions: for a
 candidate occurrence of every phrase term, subtract that term's query
@@ -70,31 +93,41 @@ absolute boundary: a phrase can cross adjacent values at slop 100 or more.
 binding, so a whole-author filter can use the same bare field as text search:
 
 ```http
-POST /collections/names/_search
+POST /collections/authors/_search
 
-{"query":"author:=(\"Ursula K. Le Guin\", \"George R.R. Martin\")","fields":["id"],"get_number":true}
+{
+  "query": "author_name:=(\"Neal Asher\", \"Neal Stephenson\")",
+  "fields": ["id"],
+  "get_number": true,
+  "sort": "id"
+}
 ```
 
-With the `names` collection from [Schema](schema.md#field-variants), this returns
-`b1` and `b2`. The forms are:
+Using the [author example](documents.md#field-variants), this returns the five
+books by Asher and Stephenson. The forms are:
 
 | Form | Meaning |
 |---|---|
-| `author:="Ursula K. Le Guin"` | One whole value through `author__s`. |
-| `author:=("Ursula K. Le Guin", "George R.R. Martin")` | Any listed value. Lists need commas, at least one value, and no trailing comma. |
-| `author__self:=Guin` | Exact token membership on the primary TEXT representation. |
-| `author:=$authors` | A scalar or list from `vars`; the contents are values, never query syntax. |
+| `author_name:="Neal Asher"` | One whole value through `author_name__s`. |
+| `author_name:=("Neal Asher", "Neal Stephenson")` | Any listed value. Lists need commas, at least one value, and no trailing comma. |
+| `author_name__self:=Neal` | Exact token membership on the primary TEXT representation. |
+| `author_name:=$authors` | A scalar or list from `vars`; the contents are values, never query syntax. |
 
 ```http
-POST /collections/names/_search
+POST /collections/authors/_search
 
 {
-  "query": {"expr": {
-    "q": "author:=$authors",
-    "vars": {"authors":["Ursula K. Le Guin","George R.R. Martin"]}
-  }},
+  "query": {
+    "expr": {
+      "q": "author_name:=$authors",
+      "vars": {
+        "authors": ["Neal Asher", "Neal Stephenson"]
+      }
+    }
+  },
   "fields": ["id"],
-  "get_number": true
+  "get_number": true,
+  "sort": "id"
 }
 ```
 
@@ -107,28 +140,13 @@ In an unquoted exact value, pattern and score suffix bytes stay literal:
 `tag_s:=x^2` matches `x^2`. To decorate the query's score, delimit the value:
 `tag_s:="x^2"^3` or `tag_s:=("x^2", "mess*")^2`.
 
-STRING applies its whole-value normalizer. On TEXT, a literal producing more
-than one analyzed term is an error: `author__self:="Le Guin"` reports
-`any_of / := requires a single term per exact TEXT value` and points to
-match, phrase, or a whole-value string variant. `author:=(one two)` reports
-that the list needs a comma or closing parenthesis. These errors include the
-expression byte offset. Exact lookup terms use `long_terms` after STRING
-normalization or TEXT analysis, including IDs. The default changed from
-`truncate` to `hash128`: terms over 255 bytes become a UTF-8-safe prefix of at
-most 230 bytes plus 25 base36 hash characters. Shorter terms are unchanged.
-Full-value lookups, range bounds, and facet selections transform identically
-to ingest. Sorts and ranges preserve source order only up to the kept prefix.
-
-`truncate` cuts at the limit instead, merging shared prefixes; `reject` fails
-documents and makes over-limit lookup terms teaching errors. Policy edits do not validate or
-rewrite existing terms; use a new field or variant label and reindex to change
-the policy safely. The hash is not attack-resistant. For exact
-encoding and returned-term normalization caveats, see
-[term-space limits](documents.md#ids-and-replacement).
-
-On TEXT, the single analyzed term is what is looked up. `author__self:="Guin!"`
-looks up `guin` and matches the same documents as `author__self:=Guin` or a
-match query for `Guin!`. A literal that analyzes to zero terms matches nothing.
+STRING applies its whole-value normalizer. On TEXT, the single analyzed term
+is what is looked up: `author_name__self:="Neal!"` looks up `neal` and matches
+the same documents as `author_name__self:=Neal` or a match query for `Neal!`.
+Each TEXT value must analyze to at most one term; an empty result matches nothing.
+For multiple terms, use match, phrase, or a whole-value string variant.
+Lookup terms over 255 bytes follow the field's
+[`long_terms` policy](schema.md#string-normalization-and-length).
 
 ## Special characters
 
@@ -136,7 +154,7 @@ A character is only special in the position where its meaning applies, so
 most values need no escaping. Outside the exact-value forms above:
 
 - `:` separates the field name at the first colon only.
-  `url_s:https://x.com/a?b=1` and `time_s:12:30:00` parse as you'd hope.
+  `url_s:https://x.com/a?b=1` and `time_s:12:30:00` parse as expected.
 - `*` is a wildcard only at the end of a term. `mess*` is a prefix query;
   `a*b` is the literal term `a*b`.
 - `~` after a quoted TEXT phrase sets phrase slop; after an unquoted term it
@@ -156,10 +174,10 @@ them - or anything else you don't want the grammar to see - quote the whole
 value. Inside quotes, nothing is special except the closing quote and the
 three escapes above.
 
-Coming from Lucene or Solr: `?` and mid-word `*` are **not** wildcards here,
-and `/re/` is not a regex - all three are ordinary characters, and that will
-not change. Wildcard and regex queries will arrive as named functions
-(`wildcard(...)`, `regex(...)`) when the engine grows the query types.
+Coming from Lucene or Solr: `?` and mid-word `*` are **not** wildcards in a
+term, and `/re/` is not a regex; all three are ordinary characters.
+Wildcards and regular expressions are the named functions
+`wildcard(...)` and `regex(...)` described [below](#wildcards-and-regular-expressions).
 
 ## AND, OR, NOT, and +/-
 
@@ -186,10 +204,7 @@ touch its clause.
 +status_s:live -tag_s:beta title_t:dune
 ```
 
-One level of a query uses one style or the other. `+a AND b` and
-`a b AND c` are parse errors - mixing the styles is ambiguous, and parsers
-that accept it disagree about what it means, so this one makes you pick.
-Parentheses let the styles nest:
+Use one style per query level. Parentheses let the styles nest:
 
 ```
 +(title_t:dune OR title_t:messiah) -tag_s:beta
@@ -214,12 +229,13 @@ In a numeric field's group, `-` in front of a number binds to the number:
 `temp_i:(-5)` matches -5 rather than excluding 5. To exclude a value there,
 use `NOT`: `temp_i:(NOT 5)`.
 
-Logical field scopes distribute to each leaf before binding. For the author
-example, `author:(Martin AND >=M)` searches `Martin` on the primary and ranges
-on `author__s`; it returns no documents because `george r.r. martin` sorts
-before `m`. `author__self:(Martin AND >=M)` freezes both leaves on the primary
-and returns `b2`, whose tokens include `martin`. A field named inside the group
-still overrides the enclosing scope.
+Logical field scopes distribute to each leaf before binding. In the
+[author example](documents.md#field-variants), `author_name:(Stephenson AND >=O)`
+searches `Stephenson` on the primary and ranges on `author_name__s`. It returns
+no documents because `Neal Stephenson` sorts before `O`. Using
+`author_name__self:(Stephenson AND >=O)` keeps both leaves on the primary and
+returns `b3` and `b5`, whose tokens include `stephenson`. A field named inside
+the group still overrides the enclosing scope.
 
 ## Ranges and comparisons
 
@@ -232,79 +248,29 @@ year_i:{1960 TO 1970}
 year_i:[1960 TO 1970}
 year_i:[* TO 1970]
 created_dt:[2020-01-01T10:30:00Z TO *]
+created_dt:>=NOW/DAY-30DAYS      date math works wherever a date does
 id:[user_100 TO user_200]        string/text fields range over their terms
 year_i:>=1960                    also >, <=, <
 ```
 
-On string, id, and text fields the range runs over the indexed terms in
-plain byte order (no collation), and uses the positional constant-scoring
-rule described below. Text
-endpoints fold the way the field folds, like prefix and fuzzy text. STRING
-bounds pass through its normalizer, if present. Bare ranges use the value
-binding, including comparisons inside a field group.
-
 Endpoints are converted exactly the way field values are at indexing time,
-so querying a literal finds the documents indexed with it.
+so querying a literal finds the documents indexed with it. On string, id,
+and text fields the range runs over the indexed terms in plain byte order
+(no collation) and uses the positional constant-scoring rule described
+below. Text endpoints fold the way the field folds, like prefix and fuzzy
+text; STRING bounds pass through the field's normalizer. Bare ranges use the
+value binding, including comparisons inside a field group.
 
 A date literal means the window it names: `created_dt:2024-06-25` matches
 the whole day, `created_dt:2024-06` the whole month, and range endpoints
-include the granule they name - `[2024-01 TO 2024-06]` covers January
-through June, `{... TO 2024-06}` excludes all of June. A full timestamp is
-still a single instant.
+include the granule they name, so `[2024-01 TO 2024-06]` covers January
+through June. Date math (`NOW-30DAYS`, `NOW/DAY`, `NOW-1MONTH/MONTH`) works
+anywhere a date does, with one clock snapshot per request. Set `time_zone` on
+the request to interpret dates and date math in another time zone.
+[Dates and time zones](dates.md) explains the rules; the
+[details below](#dates-in-expressions) cover the grammar corners.
 
-Date fields accept both Solr and OpenSearch date math. `NOW` and `now` use one
-clock snapshot for the entire search request or update message. Commands are
-evaluated left-to-right;
-accepted forms include `NOW-1DAY/DAY`, `2024-01-01T00:00:00Z+2MONTHS`, and
-`2024-01-01T00:00:00Z||+2M`. Solr word units are
-case-insensitive (`YEARS`, `MONTHS`, `WEEKS`, `DAYS`/`DATE`, `HOURS`,
-`MINUTES`, `SECONDS`, and the millisecond aliases). `WEEK`/`WEEKS` is a
-Luxir extension beyond Solr's own grammar, coherent with the `w` abbreviation
-and civil week rounding. OpenSearch abbreviations are
-case-sensitive: `y`, `M`, `w`, `d`, `h`/`H`, `m`, and `s`, so `M` means month
-while `m` means minute. Week rounding starts Monday.
-
-`SearchRequest.time_zone` sets the civil frame for every query in the request.
-The default (`""`), `Z`, and `UTC` mean UTC. Fixed offsets accept `+hh`,
-`+hhmm`, or `+hh:mm` (and negative forms) through `+/-18:00`; otherwise the
-value is a case-sensitive IANA name such as `America/Denver`. An invalid zone
-rejects the whole request, even when the request contains no date clause.
-
-Offset-less literals are local civil times in that frame, as are rounding and
-calendar additions (`YEAR`, `MONTH`, `WEEK`, and `DAY`). Hour, minute, second,
-and millisecond additions are physical durations. `NOW` and epoch millis are
-instants and do not move when the frame changes. A literal with `Z` or its own
-numeric offset also names that offset's instant; subsequent math rebases the
-instant into the request frame.
-
-At a daylight-saving or political clock change, a nonexistent local time is
-shifted forward by the size of the gap. An ambiguous local time uses the
-earlier occurrence initially; later civil operations retain the source
-occurrence when its offset is still valid. A zone can skip a whole civil
-granule (for example, a dateline change can remove a day). The query keeps the
-gap-shifted result and returns a `date_granule_skipped` warning rather than
-silently hiding the substitution.
-
-Updates have no time-zone setting: ingest date math and offset-less ingest
-literals remain UTC. Consequently, under a zoned search request the same
-offset-less text is interpreted in the request zone at query time but in UTC
-at ingest. Use an explicit `Z` or numeric offset when the instant must be
-identical on both paths.
-
-The direct Solr suffix and OpenSearch `||` separator are both accepted. Prefer
-`||` when a truncated time or numeric zone offset makes the anchor boundary
-hard to read; direct suffix parsing otherwise chooses the longest valid anchor.
-
-Without math, a partial literal retains the window described above. Once a
-math suffix begins, its anchor is the start instant of that literal; a `/unit`
-command creates a window. This makes `gte`, `gt`, `lte`, and `lt` around rounded
-date math select the same lower/upper edges as OpenSearch. Math commands cannot
-contain whitespace; they can otherwise be bare field values in `expr` and
-`simple_query`.
-
-Juxtaposed comparisons on one field are a parse error - `year_i:(>=1960
-<1970)` would mean "either side", which is never what anyone wants; write
-`AND` (or `OR` if you do want either).
+Join comparisons with `AND` or `OR`, for example `year_i:(>=1960 AND <1970)`.
 
 ## Prefix, fuzzy, existence
 
@@ -332,24 +298,46 @@ so `+field:*^3` still contributes `0`; use `^=N` (constant_score) when a
 required clause should score, for example `+field:*^=2`.
 
 The same positional rule applies to match-all, numeric and geo ranges, prefix,
-and term-range queries: their default constant is `1` and a required clause
-contributes `0`. Filter and prohibited clauses never score.
+wildcard, regex, and term-range queries: their default constant is `1` and a
+required clause contributes `0`. Filter and prohibited clauses never score.
 
 Prefix and fuzzy text is folded the way the field folds - `title_t:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
 string fields a configured normalizer applies without splitting the value;
-otherwise the text is used exactly as written.
-
-With `hash128`, a prefix longer than the kept prefix falls back to that prefix,
-so `field:very_long_prefix*` can return a superset. Structured wildcard and regex
-queries do the same for an overlong common leading literal prefix. Other
-patterns and fuzzy edit distance operate on stored term bytes, including hash
-suffixes; fuzzy matching does not measure similarity between discarded tails.
+otherwise the text is used exactly as written, so `author_s:Herbet~1` finds
+`Herbert` while `author_s:herbet~1` does not on a string field with no
+normalizer.
 
 Fuzzy matching currently requires the first byte to match exactly (the
 default `prefix_length` is 1, which bounds the scan); `hte~1` will not find
 "the". Pass `prefix_length=0` through the `fuzzy(...)` function to trade a
-wider scan for first-position typos.
+wider scan for first-position typos. A prefix longer than the kept prefix of
+a [long term](schema.md#string-normalization-and-length) returns a superset,
+and fuzzy distance is measured on the stored term bytes.
+
+## Wildcards and regular expressions
+
+Wildcard and regular-expression matching are functions, so their pattern
+characters never collide with the rest of the grammar:
+
+```
+wildcard(du*, field=title_t)         * matches any bytes, ? matches one codepoint
+wildcard(d?ne, field=title_t)
+regex(dune|kings, field=title_t)     anchored: the whole indexed term must match
+regex(mess.*, field=title_t)
+```
+
+Both match entire indexed terms. In a wildcard pattern `\` escapes the next
+character. A regex supports `|`, concatenation, groups, repetition, `.`, and
+character classes; `^` and `$` are literals because the match is already
+anchored, so `regex(mess, ...)` does not match `messiah` but `regex(mess.*,
+...)` does. On TEXT fields, literal characters fold the way the field folds
+text while the pattern syntax, escapes, character classes, and ranges are
+codepoint-exact and never fold; STRING fields normalize literal characters
+through their normalizer; ID fields use literals verbatim. Both queries are
+constant-scoring. Quote the pattern when it contains characters the argument
+grammar would otherwise see, such as a comma or a parenthesis. See the
+[structured reference](query-reference.md#wildcard) for the JSON arms.
 
 ## Per-clause scores
 
@@ -382,6 +370,20 @@ filter or prohibited context because those clauses are built without scores.
 Inside `constant_score`, a child boost is discarded; a boost outside
 `constant_score` multiplies the constant.
 
+For score shaping beyond a multiplier, `rescore` replaces each hit's score
+with a value expression over the child score and column values:
+
+```
+rescore(title_t:dune, expr=score * log1p(popularity_i))
+```
+
+`score` is the child query's score, and any numeric column can appear
+beside it. The expression must produce a value for every matched document;
+`def(popularity_i, 0)` or an `exists()` clause in the child query makes it
+total. `$name` variables inside the expression bind from the surrounding
+expression's `vars`. The value-expression language is the one sorting uses;
+see [Searching](searching.md#sorting).
+
 ## Functions
 
 Most structured query types can be written as a function call. The function
@@ -395,34 +397,33 @@ phrase(dune messiah, field=title_t)
 phrase(dune messiah, field=title_t, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_t)
+wildcard(du*, field=title_t)
+regex(dune|kings, field=title_t)
 exists(year_i)
 range(field=year_i, gte=1960, lt=1970)
+any_of(("Neal Asher", "Neal Stephenson"), field=author_name)
 boost(title_t:dune, boost=2)
 constant_score(status_s:active AND year_i:>=1960, score=1.0)
+rescore(title_t:dune, expr=score * log1p(popularity_i))
 boolean(required=[status_s:active], optional=[title_t:dune, title_t:messiah], min_match=1)
 simple_query($user_input, fields=[title_t, body_t], operator=AND)
 all()
 ```
 
-Exact membership is also callable:
-`any_of(("Ursula K. Le Guin", "George R.R. Martin"), field=author)`.
-It has the same value binding and literal rules as `author:=(...)`.
-
-`expr` is already the surrounding language and is written inline. `geo_box`
-and `geo_distance` currently have no function form; use their structured JSON
-objects. New structured query arms are not automatically callable until their
-expression behavior is declared.
+`any_of(...)` has the same value binding and literal rules as `author_name:=(...)`.
+`expr` is already the surrounding language and is written inline.
 
 Arguments work like Python's: at most one positional argument, then
 `name=value` pairs. The positional slot is the query's main value and takes
 raw text up to the closing `,` or `)`; where the slot is itself a query
-(`boost`, `constant_score`, or lists like `required=[...]`), it takes a full
-expression instead. Values are typed by the argument: numbers,
-`true`/`false`, `AND`/`OR`, `[lists]`, quoted strings.
+(`boost`, `constant_score`, `rescore`, or lists like `required=[...]`), it
+takes a full expression instead. Values are typed by the argument: numbers,
+`true`/`false`, `AND`/`OR`, `[lists]`, quoted strings; `rescore`'s `expr`
+takes a value expression.
 
 Quoting an argument protects it from the grammar but does not change what
-it means: `match("foo bar")` and `match(foo bar)` search the same text. If
-you want a phrase, say so - `phrase(foo bar, field=title_t)`. This differs
+it means: `match("foo bar")` and `match(foo bar)` search the same text. Use
+`phrase(foo bar, field=title_t)` for a phrase. This differs
 from term position, where `title_t:"foo bar"` is a phrase.
 
 In `boolean(...)`, optional clauses only rank matches when a required or
@@ -431,15 +432,15 @@ constraint ("at least N of these"). With only optional clauses, at least
 one must match.
 
 Duplicate optional clauses are merged into a single weighted clause, and
-`min_match` adjusts by the intent its value expresses. A `min_match` above
-half the clauses ("10 clauses, `min_match=9`") is a miss budget - you allowed
-one absence - so each merged-away duplicate decrements it (never below 1),
-and a document matching the duplicated clause behaves exactly as if the
-duplicates were kept. A `min_match` at or below half ("10 clauses,
-`min_match=2`") means "match at least that many distinct words" and stays
-as-is, capped at the number of distinct clauses. Either way, `min_match`
-computed from raw token counts (for example, a percentage of pasted text)
-behaves sensibly when the text repeats words.
+`min_match` is adjusted to match. A `min_match` above half the clauses ("10
+clauses, `min_match=9`") allows a fixed number of misses, so each merged
+duplicate decrements it (never below 1), and a document matching the
+duplicated clause is treated exactly as if the duplicates were kept. A
+`min_match` at or below half ("10 clauses, `min_match=2`") means "match at
+least that many distinct words" and stays as-is, capped at the number of
+distinct clauses. Either way, a `min_match` computed from raw token counts
+(for example, a percentage of pasted text) still works when the text repeats
+words.
 
 ## Variables
 
@@ -452,21 +453,78 @@ behaves sensibly when the text repeats words.
 }}}
 ```
 
-A variable's contents are used as a value, never read as more query syntax:
-operators, quotes, and parentheses inside it are just text to search for.
-That makes `$name` the safe way to hand user input to an expression - as in
-the example above, where the injection attempt searches for its own
-punctuation. A `$` inside quotes or inside a word is an ordinary character
+A variable's contents are used as a value and are not parsed as query
+syntax: operators, quotes, and parentheses inside it are just text to search
+for. That makes `$name` the safe way to pass user input to an expression, as
+in the example above, where the operators in the input are searched for as
+text. A `$` inside quotes or inside a word is an ordinary character
 (`status_s:costs$5`).
+
+## Dates in expressions
+
+Details of the date grammar. [Dates and time zones](dates.md) explains the
+model.
+
+- Two spellings of date math are accepted: Solr-style word units appended
+  directly to the anchor (`NOW-1DAY/DAY`, `2024-01-01T00:00:00Z+2MONTHS`),
+  and one-letter units after a `||` separator (`2024-01-01T00:00:00Z||+2M`).
+  Word units are case-insensitive (`YEARS`, `MONTHS`, `WEEKS`, `DAYS`/`DATE`,
+  `HOURS`, `MINUTES`, `SECONDS`, and the millisecond aliases); `WEEK`/`WEEKS`
+  is a Luxir extension of the Solr grammar, coherent with the `w`
+  abbreviation and civil week rounding. One-letter units are case-sensitive:
+  `y`, `M`, `w`, `d`, `h`/`H`, `m`, and `s`, so `M` means month while `m`
+  means minute. Week rounding starts on Monday.
+- `NOW` and `now` use one clock snapshot for the entire search request or
+  update message. Commands are evaluated left to right. Prefer `||` when a
+  truncated time or numeric zone offset makes the anchor boundary hard to
+  read; direct suffix parsing otherwise chooses the longest valid anchor.
+- Without math, a partial literal keeps its window. Once a math suffix
+  begins, its anchor is the start instant of that literal, and a `/unit`
+  command creates a window again, so `gte`, `gt`, `lte`, and `lt` around
+  rounded date math select the edge you would expect. Math commands cannot
+  contain whitespace; they can otherwise be bare field values in `expr` and
+  `simple_query`.
+- `time_zone` is a request-level setting. The default (`""`), `Z`, and `UTC`
+  mean UTC. Fixed offsets accept `+hh`, `+hhmm`, or `+hh:mm` (and negative
+  forms) through `+/-18:00`; otherwise the value is a case-sensitive IANA
+  name such as `America/Denver`.
+- In a zoned request, offset-less literals are local civil times, as are
+  rounding and calendar additions (`YEAR`, `MONTH`, `WEEK`, `DAY`). Hour,
+  minute, second, and millisecond additions are physical durations. `NOW`
+  and epoch millis are instants and do not move when the frame changes. A
+  literal with `Z` or its own numeric offset names that offset's instant;
+  subsequent math rebases the instant into the request frame.
+- At a daylight-saving or political clock change, a nonexistent local time
+  is shifted forward by the size of the gap. An ambiguous local time uses
+  the earlier occurrence initially; later civil operations retain the source
+  occurrence when its offset is still valid. A zone can skip a whole civil
+  granule (a dateline change can remove a day); the query keeps the
+  gap-shifted result and returns a `date_granule_skipped` warning.
+- Updates have no time-zone setting: ingest date math and offset-less ingest
+  literals are UTC. Under a zoned search request the same offset-less text
+  is therefore interpreted in the request zone at query time but in UTC at
+  ingest. Use an explicit `Z` or numeric offset when the instant must be
+  identical on both paths.
 
 ## Errors
 
-Parse errors report the byte offset and the surrounding text:
+Parse errors report the byte offset, the surrounding text, and what to do
+instead:
 
 ```
-expr parse error at byte 12: +/- prefixes cannot mix with AND/OR at the same
-level; use NOT or parentheses (context: "status_s:live <HERE>+tag_s:beta")
+expr parse error at byte 18: +/- prefixes cannot mix with AND/OR at the same
+level; use NOT or parentheses (context: "status_s:live AND <HERE>+tag_s:beta")
 ```
 
-Nesting depth is limited per request, and expressions nested inside other
-query nodes count against the same limit; exceeding it is an error as well.
+## Limits
+
+- There is no default search field.
+- `?` and mid-word `*` in a term are literal characters, and `/re/` is not a
+  regex; use `wildcard(...)` and `regex(...)`.
+- `geo_box` and `geo_distance` have no function form; use their structured
+  JSON objects. New structured query arms are not automatically callable
+  until their expression behavior is declared.
+- `$variables` are values only: they cannot supply a score decoration, a
+  field name, or a fragment of expression syntax.
+- Nesting depth is bounded per request, including expressions nested inside
+  structured query nodes.

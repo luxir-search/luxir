@@ -1,16 +1,56 @@
 # Schema
 
-Luxir works without a schema: field types come from name suffixes (`title_t`,
-`year_i`, `tags_ss` - see the [Quickstart](quickstart.md)). When you want real
-field names without suffixes, a custom analyzer, or typed vector fields, you
-define a schema. The schema API speaks the same JSON in both directions: what
-`GET` returns is a valid `POST` body, and posting it back keeps the same
-definitions (each successful publication advances the schema generation).
+The schema defines field types, text analysis, storage, and indexes. You can
+define fields individually, use field templates for names that share a suffix,
+or combine both. Built-in templates let you start without writing your own
+schema. Templates also handle new fields as your data grows.
+
+## Field types
+
+Choose a type based on how you want to search and use the values:
+
+| Type | Description and typical uses |
+|---|---|
+| `text` | Analyzed text for full-text search: titles, descriptions, and article bodies. An analyzer splits each value into searchable tokens for word and phrase queries. |
+| `string` | A whole value for exact matching, filtering, sorting, and faceting: categories, tags, and product codes. Values are not split into words. |
+| `int` | Signed 64-bit integer: counts, quantities, and years. |
+| `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
+| `double` | 64-bit floating-point number for greater precision than `float`. |
+| `date` | Timestamp with millisecond precision, supplied as ISO-8601 text or epoch milliseconds. Supports date queries, ranges, and calendar facets. See [Dates](dates.md). |
+| `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
+| `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+
+### `text` versus `string`
+
+Both accept text values, but they make different things searchable. Suppose
+you index `"Red Bicycle"` using the built-in templates:
+
+- **`title_t` (`text`)** indexes the words `red` and `bicycle`.
+  `title_t:bicycle` matches, as does `title_t:"red bicycle"`.
+- **`title_s` (`string`)** indexes the whole value `Red Bicycle`.
+  `title_s:"Red Bicycle"` matches; `title_s:bicycle` does not.
+  Sorting and faceting use the whole value too.
+
+The analyzer controls how `text` is split and normalized. Bare `"type": "text"`
+defaults to splitting on whitespace with no filters; the `_t` template adds
+Unicode word segmentation, case and accent folding, and English stemming.
+See [Text analysis](#text-analysis) for the available components.
+
+`string` preserves case and accents by default. An optional
+[normalizer](#string-normalization-and-length) can fold them while keeping
+each value whole. When one value needs both full-text search and whole-value
+sorting or faceting, use a `text` field with a `string`
+[variant](#field-variants). The built-in `_name` template provides this
+combination for names.
 
 ## Read the schema
 
-```bash
-curl http://localhost:9400/collections/main/_schema
+The schema API uses the same JSON in both directions: what `GET` returns is
+a valid `POST` body, and posting it back keeps the same definitions.
+
+```http
+GET /collections/main/_schema
 ```
 
 ```json
@@ -37,19 +77,38 @@ curl http://localhost:9400/collections/main/_schema
         "filters": ["nfkc_cf", "fold", "kstem"]
       }
     },
-    "_w": {
+    "_name": {
       "type": "text",
       "analyzer": {
-        "tokenizer": "whitespace"
+        "tokenizer": "unicode_word",
+        "filters": ["nfkc_cf", "fold"]
+      },
+      "variants": {
+        "s": {
+          "parent": "_s"
+        }
+      },
+      "defaults": {
+        "value": "s"
       }
     }
   }
 }
 ```
 
-(Abbreviated - the default schema defines templates for every suffix.)
+(Abbreviated: the default schema defines a template for every suffix.)
 
-The complete suffix set is:
+Two sections:
+
+- **`fields`** define individual fields. A document field named `title` uses
+  `fields.title`. Explicit definitions take precedence over templates.
+- **`templates`** define shared settings for fields whose names end in a
+  matching suffix. A field named `anything_t` with no explicit definition uses
+  the `_t` template. Matching uses the suffix from the final underscore.
+  Templates are never usable as document fields themselves, and any definition
+  can name one as `parent` to inherit its properties.
+
+The built-in templates are:
 
 | Suffix | Type and default behavior |
 |---|---|
@@ -60,374 +119,450 @@ The complete suffix set is:
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
-| `_w` | Stored text split on whitespace, case- and accent-sensitive. |
-| `_wl` | Stored text split on whitespace, Unicode-lowercased; no normalization or accent folding. |
-| `_u` | Stored Unicode-word text, case- and accent-sensitive. |
-| `_un` | Stored Unicode-word text with NFKC case folding; accents preserved. |
-| `_t` | Stored Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. |
-| `_name` | Stored Unicode-word text with case/accent folding and no stemming; original whole-name string variant for facets and sorting. |
+| `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
+| `_u` | Unicode-word text, case- and accent-sensitive. |
+| `_un` | Unicode-word text with NFKC case folding; accents preserved, no stemming. |
+| `_w` | Text split on whitespace, case- and accent-sensitive. |
+| `_wl` | Text split on whitespace, Unicode-lowercased; no normalization or accent folding. |
+| `_name` | Unicode-word text with case and accent folding and no stemming, plus a whole-value string variant for facets and sorting. |
 | `_names` | Multi-valued form of `_name`. |
 | `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
 
+Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
-range and exact-match queries still work by scanning the column. Define a
+range and exact-match queries still work by quickly scanning the column. Define a
 concrete field with `index: "range"` when those operations need a points index.
-There is no default geo suffix because coordinate fields benefit from an
-unambiguous explicit definition.
+There is no default geo suffix; define geo fields explicitly.
 
-The `kstem` filter uses Lucene's dictionary-based Krovetz English stemmer:
-for example, `ponies` becomes `pony`, while recognized dictionary words are
-preserved or replaced by their dictionary mapping. It runs at both index and query time for `_t` fields. In custom
-analyzers, put it after `lowercase` or `nfkc_cf`, and after `fold` if used.
-Tokens containing anything outside lowercase ASCII letters, or with lengths
-outside 3-49 letters, pass through stemming.
+## Field templates for dynamic fields
 
-`english_possessive` removes one trailing apostrophe followed by `s` or `S`,
-matching Lucene's EnglishPossessiveFilter. It accepts ASCII apostrophes, right
-single quotation marks (U+2019), and fullwidth apostrophes (U+FF07). Other
-apostrophes and a bare trailing apostrophe are unchanged. For example,
-`Winter's` becomes `Winter`; `don't` and `dogs'` remain unchanged by the filter.
-The tokenizer may already discard a trailing apostrophe before filtering.
+Templates are useful when you do not know every field name ahead of time. An
+ecommerce catalog can gain new product classes, each with its own attributes.
+Define their shared settings once, and new matching fields work automatically.
 
-Bare `"kstem"` includes equivalent possessive removal by default, stripping
-the suffix before stemming within one filter stage. `_t` uses this default.
-To request stemming alone, disable possessive removal explicitly:
+This schema combines an explicit `productname` field with a custom `_attr` template
+for string attributes. The built-in templates remain available:
 
-```json
-{"name":"kstem","params":{"possessive":false}}
+```http
+POST /collections/catalog/_schema
+
+{
+  "fields": {"productname": {"parent": "_t"}},
+  "templates": {"_attr": "string"}
+}
 ```
 
-The standalone filter is useful without stemming. When placing it before
-`kstem`, set `possessive: false` on KStem so removal happens only once.
-Possessive removal applies even when the remaining word is non-ASCII or
-outside KStem's length range. Source spelling, offsets, and positions are
-preserved. Thus `title_t:winter` matches `Winter's Tale`.
+Index a product with a `shoe_width_attr` field:
 
-Prefix, wildcard, regex, and fuzzy query normalization applies case/accent
-folding without possessive removal or stemming. Neither `english_possessive`
-nor `kstem` is available in STRING normalizers.
+```http
+POST /collections/catalog/_update
 
-For Unicode text without English stemming, use `_un`, or configure
-`unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
+{"docs": [{"id": "shoe1", "productname": "Trail shoes", "shoe_width_attr": "wide"}], "commit": {}}
+```
 
-Two sections:
+Later, a new product class introduces `socket_attr`. No schema update is
+needed:
 
-- **`fields`** are concrete: a document field named `title` uses
-  `fields.title`, exactly.
-- **`templates`** are the suffix rules. A field named `anything_t` that has no
-  exact entry in `fields` picks up the `_t` template. Templates are never
-  usable as document fields themselves, and any definition can name one as
-  `parent` to inherit its properties.
+```http
+POST /collections/catalog/_update
+
+{"docs": [{"id": "cpu1", "productname": "Desktop processor", "socket_attr": "AM5"}], "commit": {}}
+```
+
+Both attribute fields use `_attr`'s string settings, so you can filter, sort,
+and facet on them immediately after the commit:
+
+```http
+POST /collections/catalog/_search
+
+{"query": "socket_attr:AM5", "fields": ["id", "productname", "socket_attr"]}
+```
+
+```json
+{
+  "docs": [
+    {
+      "id": "cpu1",
+      "productname": "Desktop processor",
+      "socket_attr": "AM5"
+    }
+  ]
+}
+```
+
+An explicit definition overrides a template for that field. You can also
+define every field individually if the field names are known in advance.
 
 ## Define fields
 
-Writes are `POST`; the operation is the `mode` query parameter, visible right
-in the URL. The default, `mode=set`, sets each named definition and leaves
-everything else alone:
+Use `POST` to define fields. The default, `mode=set`, sets each named
+definition and leaves everything else alone:
 
-```bash
-curl http://localhost:9400/collections/main/_schema -d '{
+```http
+POST /collections/main/_schema
+
+{
   "fields": {
-    "title": {"type": "text", "stored": true,
-              "analyzer": {"tokenizer": "unicode_word", "filters": ["nfkc_cf", "fold"]}},
-    "year":  {"type": "int", "index": "range"},
-    "vec":   {"type": "vector", "dims": 768, "metric": "cosine"}
+    "title": {
+      "type": "text",
+      "stored": true,
+      "analyzer": {
+        "tokenizer": "unicode_word",
+        "filters": ["nfkc_cf", "fold"]
+      }
+    },
+    "year": {
+      "type": "int",
+      "index": "range"
+    },
+    "vec": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine"
+    }
   }
-}'
+}
 ```
 
-The response is the full resulting schema - the same shape `GET` returns.
-
-`set` works at whole-definition granularity: setting a name that already
-exists replaces that field's entire definition with what you sent (it never
-merges individual properties into the old one). Setting `title` to
-`{"stored": false}` doesn't keep the old type and analyzer - it defines a
-field with only `stored`, which fails with a "no type" error.
+The response is the full resulting schema, the same shape `GET` returns.
 
 When a definition only needs a type, a bare string works:
 
-```bash
-curl http://localhost:9400/collections/main/_schema \
-  -d '{"fields": {"year": "int", "author": "string"}}'
+```http
+POST /collections/main/_schema
+
+{"fields": {"year": "int", "author": "string"}}
 ```
 
-Analyzer components work the same way. Each tokenizer or filter is
-`{"name": ..., "params": {...}}`; a component with no parameters can be
-written as its bare name, which is what the `title` example above does, and
-reads back the same way. Parameters are typed JSON values (a string, number,
-bool, or list), and a component that takes none rejects any.
+Setting an existing field replaces its entire definition.
 
-`mode=replace_all` replaces the whole schema with exactly what you send:
+Each tokenizer or filter is `{"name": ..., "params": {...}}`. Components
+without parameters can use a bare name, as in the `title` example above.
+Parameters are typed JSON values (a string, number, bool, or list).
 
-```bash
-curl 'http://localhost:9400/collections/main/_schema?mode=replace_all' -d @schema.json
+`mode=replace_all` replaces the whole schema:
+
+```http
+POST /collections/main/_schema?mode=replace_all
+
+{"fields": {"title": "text", "year": "int"}}
 ```
 
-The reserved `id` and `_version_` fields are materialized automatically if you
-omit them, so a minimal `replace_all` cannot break indexing - but one that
-doesn't re-list the suffix templates removes them (strict-schema mode, in
-effect). Start from `GET` output if you want to edit rather than replace:
-posting an authored `GET` body back keeps the same definitions under either mode.
+The reserved `id` and `_version_` fields are added automatically if omitted.
+Omitting templates removes them, leaving a schema with only explicit fields.
+To edit the existing schema, start from `GET` output. Each successful
+publication advances the schema generation.
 
 ## Field properties
 
 | Key | Meaning |
 |---|---|
-| `type` | `string`, `text`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
-| `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types; `column:true` is rejected for analyzed text |
+| `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_` |
-| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`, a component being `{"name": ..., "params": {...}}` or a bare name; tokenizers: `whitespace` (default), `keyword`, `unicode_word`; filters: `lowercase`, `nfkc_cf`, `fold`, `english_possessive`, `kstem`. Only `kstem` takes parameters: optional boolean `possessive` (default true). |
-| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis. Inherits from `parent`; invalid on column-only strings and other types. Changes do not rewrite existing terms. |
-| `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer. |
-| `variants` | Map from label to another field definition receiving the same input value. Bare type strings work here too. |
-| `defaults` | `search` and `value` bindings, each naming `self` or a variant label; both default to `self`. |
+| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
+| `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
+| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [STRING normalization and length](#string-normalization-and-length) |
+| `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
+| `defaults` | Choose `self` or a variant label for `search` and `value` operations; only useful with variants; both default to `self`; see [Default bindings](#default-bindings) |
 | `parent` | inherit any unset properties from a field or template |
-| `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none` |
+| `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 
 Every property is optional. Absent means "inherit from `parent`, else the
-type's default" - and the schema you read back stays as sparse as the one you
+type's default", and the schema you read back stays as sparse as the one you
 wrote.
 
 `analyzer` inherits as one unit: an empty `{}` inherits the parent's analyzer,
-while naming a tokenizer or listing any filter replaces the whole chain (filters
-alone get the `whitespace` tokenizer). A tokenizer component you do write must
-have a name.
+while naming a tokenizer or listing any filter replaces the whole chain
+(filters alone get the `whitespace` tokenizer).
 
 `column` and `stored` solve different problems. A column is a typed,
 per-field structure used by sorting, faceting, analytics, numeric/geo queries,
 and vector search. Stored fields keep canonical source text for retrieval in
 compressed chunks. Analyzed text has postings and stored retrieval but no
-per-document value column; use a `string` variant when the same source
-value must also sort or facet. Scalar types generally return their values from
-columns without a second stored copy.
+per-document value column; use a `string` variant when the same source value
+must also sort or facet. Scalar types return their values from columns without
+a second stored copy.
 
-Mistakes are errors, not surprises: an unknown property, type, tokenizer, or
-filter name gets a `400` naming the valid choices; redefining `id` as anything
-but an id field is rejected.
+## Text analysis
+
+A text analyzer is one tokenizer followed by a list of filters:
+
+| Component | Meaning |
+|---|---|
+| `unicode_word` | Tokenizer: Unicode word segmentation (UAX#29). |
+| `whitespace` | Tokenizer: split on whitespace. The default when an analyzer lists filters but no tokenizer. |
+| `keyword` | Tokenizer: the whole value as one token. |
+| `nfkc_cf` | Filter: NFKC case folding, normalized to a fixpoint. |
+| `lowercase` | Filter: Unicode lowercasing only. |
+| `fold` | Filter: accent and diacritic folding. |
+| `english_possessive` | Filter: remove a trailing `'s`. |
+| `kstem` | Filter: KStem English stemming; the only component with parameters. |
+
+Prefer `nfkc_cf` to `lowercase` on Unicode-segmented text: bare lowercasing
+leaves equal-looking strings unequal (composed versus decomposed forms, final
+sigma), while NFKC case folding makes them compare equal.
+
+`kstem` implements Bob Krovetz's dictionary-based English stemming algorithm:
+`ponies` becomes `pony`, while recognized dictionary words are preserved or
+replaced by their dictionary mapping. It runs at both index and query time
+for `_t` fields. In custom analyzers, put it after `lowercase` or `nfkc_cf`,
+and after `fold` if used. Tokens containing anything outside lowercase ASCII
+letters, or with lengths outside 3-49 letters, pass through unstemmed.
+
+`english_possessive` removes one trailing apostrophe followed by `s` or `S`,
+matching Lucene's EnglishPossessiveFilter. It accepts ASCII apostrophes, right
+single quotation marks (U+2019), and fullwidth apostrophes (U+FF07). Other
+apostrophes and a bare trailing apostrophe are unchanged: `Winter's` becomes
+`Winter`; `don't` and `dogs'` are left alone. The tokenizer may already discard
+a trailing apostrophe before filtering.
+
+Bare `"kstem"` includes equivalent possessive removal by default, stripping
+the suffix before stemming within one filter stage. `_t` uses this default, so
+`title_t:winter` matches `Winter's Tale`. To request stemming alone, disable
+possessive removal explicitly:
+
+```json
+{"name": "kstem", "params": {"possessive": false}}
+```
+
+The standalone filter is useful without stemming. When placing it before
+`kstem`, set `possessive: false` on KStem so removal happens only once.
+Possessive removal applies even when the remaining word is non-ASCII or outside
+KStem's length range. Source spelling, offsets, and positions are preserved.
+
+Prefix, wildcard, regex, and fuzzy query terms receive the field's case and
+accent folding without possessive removal or stemming. Neither
+`english_possessive` nor `kstem` is available in STRING normalizers.
+
+For Unicode text without English stemming, use `_un`, or configure
+`unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
 
 ## Field variants
 
-A document supplies one value per logical field. The primary keeps the field's
-name; each variant indexes the same submitted value under `<field>__<label>`.
-For example, create a collection with text search and whole-author values:
+A document supplies one value per logical field, and the schema can index that
+value several ways. The primary keeps the field's name; each variant indexes
+the same submitted value under `<field>__<label>`.
 
-```http
-POST /collections/_create
+See [Documents and values](documents.md#field-variants) for the worked example:
+searching author names by word and faceting on their whole values with the
+built-in `_name` template. Its [schema definition](#templates-and-inheritance)
+is shown below, followed by the rules for inheritance and customization.
 
-{"name":"names"}
-```
-
-```http
-POST /collections/names/_schema
-
-{
-  "fields": {
-    "author": {
-      "parent": "_t",
-      "variants": {"s": {"type":"string","normalizer":["nfkc_cf","fold"],"long_terms":"hash128"}},
-      "defaults": {"value":"s"}
-    },
-    "edition": {"type":"int","index":"range","variants":{"label":"string"}},
-    "genre": {"type":"string","variants":{"t":{"parent":"_t"}},"defaults":{"search":"t"}}
-  }
-}
-```
-
-```http
-POST /collections/names/_update
-
-{
-  "docs": [
-    {"id":"b1","author":"Ursula K. Le Guin","edition":"0042","genre":"Science Fiction"},
-    {"id":"b2","author":"George R.R. Martin","edition":10,"genre":"Fantasy"},
-    {"id":"b3","author":"LE GUIN","edition":2,"genre":"Science Fiction"}
-  ],
-  "commit": {}
-}
-```
-
-`author` searches analyzed text; exact membership, facets, ranges, and sorts
-use `author__s`. Retrieval of `author` returns the source spelling.
-`genre` searches through `genre__t` and uses its primary for value operations.
-`edition` coerces `"0042"` to numeric `42`, while `edition__label` keeps `"0042"`.
-Every branch converts the submitted value itself.
-
-### Names and shape
+### Variant names and constraints
 
 Labels are ASCII: a letter first, then letters, digits, or single underscores.
 `self` is reserved case-insensitively, and labels differing only by case
 collide. Label lookup otherwise uses the authored case. `__` is reserved in
 authored field names, template names, labels, and final document keys after
 field mapping. It is only used in requests to select a representation.
-`author__self` selects the primary; it does not create another physical field.
+`author_name__self` selects the primary; it does not create another physical
+field.
 
-Physical names are limited to 127 bytes. Concrete definitions that exceed the
-limit are schema errors. A template's maximum instance name length is
-`127 - 2 - longest label length`; an overlong instance fails the document or
-request that first resolves it. The `__self` selector is not a physical name
-and does not consume that budget.
+Physical names are limited to 127 bytes. With variants, a template's maximum
+instance name length is `127 - 2 - longest label length`. The `__self`
+selector is not a physical name and does not consume that budget.
 
 `multi`, `stored`, and `stored_resource` belong to the logical field. A variant
-may not set any of them, even to `false` or an empty string. It also may not
-declare nested `variants` or `defaults`. There is one stored source on the
-primary when storage is enabled. Neither `id` nor `_version_` may have variants,
-including inherited ones, and a variant cannot have type `id`.
+may not set them or declare nested `variants` or `defaults`. There is one stored
+source on the primary when storage is enabled. Neither `id` nor `_version_`
+may have variants, including inherited ones, and a variant cannot have type `id`.
 
-The primary and every variant must belong to the same shape family:
+The primary and every variant must use types from the same group:
 
-| Family | Allowed types |
+| Group | Allowed types |
 |---|---|
 | Scalar | `text`, `string`, `int`, `float`, `double`, `date`. |
-| Vector | `vector`; every branch must resolve to the same positive `dims`. Inferred dimensions (`0`) are not allowed with variants. |
+| Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
 
 ### Default bindings
 
-Each binding defaults to `self`; adding a variant does not select it
-automatically. An explicit selector such as `author__s` or `author__self`
-bypasses both bindings.
+Default bindings choose which representation to use when a request names a
+field without a variant selector, such as `author_name`. Without variants,
+both bindings use `self` (the primary field), and there is nothing to
+configure.
+
+With variants, `defaults.search` selects the representation for text search,
+and `defaults.value` selects it for operations such as sorting and faceting.
+Both default to `self`; adding a variant does not select it automatically.
+For example, the `_name` template sets `defaults.value` to `s`, so
+`author_name` searches its analyzed text but sorts and facets on its whole-name
+string variant.
 
 | Operation | Bare field name uses |
 |---|---|
-| Match, phrase, simple query, expression terms/phrases, prefix, fuzzy, wildcard, regex | `defaults.search`, including matches inside filters. |
-| `any_of`, `:=`, ranges, field/range facets, sort, column expressions, metrics | `defaults.value`, then the operation's capability checks. |
-| Retrieval, exists, kNN, geo | The primary; retrieval uses its source store or its own typed column. |
+| Match, phrase, simple query, expression terms and phrases, prefix, fuzzy, wildcard, regex | `defaults.search`, including a match inside a filter. |
+| `any_of` / `:=`, ranges, field and range facets, sort, column expressions, metrics | `defaults.value`, then the operation's normal type and capability checks. |
+| Exists (`f:*`), kNN, geo | The primary physical field. |
+| Retrieval | The primary's source store, else its own typed column; never the value default. |
 
-A binding names a local label, not another field. A label missing from the
-effective variant map is a schema error. See [Searching](searching.md#field-bindings)
-for query and projection examples.
+An explicit selector bypasses both bindings: `author_name__s` selects that
+variant and `author_name__self` selects the primary. Exists on a bare name
+tests primary presence; an explicit selector tests that representation, which
+can differ for documents indexed before it was added.
+
+A binding names `self` or a label in the field's effective variant map. See
+[Searching](searching.md#field-bindings) for query and projection examples,
+and use [`?explain=resolved`](http-api.md#explain-modes) to see which physical
+field a request used.
 
 ### Templates and inheritance
 
 Templates can carry variants and defaults. The default schema includes
-`_name` and its multi-valued form `_names` with these definitions:
+`_name` and its multi-valued form `_names`:
 
 ```json
 {
   "templates": {
     "_name": {
       "type": "text",
-      "analyzer": {"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},
-      "variants": {"s":{"parent":"_s"}},
-      "defaults": {"value":"s"}
+      "analyzer": {"tokenizer": "unicode_word", "filters": ["nfkc_cf", "fold"]},
+      "variants": {"s": {"parent": "_s"}},
+      "defaults": {"value": "s"}
     },
-    "_names": {"parent":"_name","multi":true}
+    "_names": {"parent": "_name", "multi": true}
   }
 }
 ```
 
-`author_name` uses `_name`; `author_name__s` selects its original whole-name string
-variant. The root is resolved before the label, so the tail `_s` never picks
-the default string template independently. No schema setup is needed to use
-these suffixes. Long whole names follow the STRING term policy below.
+`author_name` uses `_name`; `author_name__s` selects its original whole-name
+string variant. The root is resolved before the label, so the tail `_s` never
+picks the default string template independently. Long whole names follow the
+STRING term policy below.
 
-`_name` explicitly selects word search with case and accent folding, without
-English stemming or possessive removal. Its string variant preserves the
-supplied spelling for facets and sorting; name normalization belongs upstream.
+`_name` uses word search with case and accent folding, without English
+stemming or possessive removal. Its string variant preserves the supplied
+spelling for facets and sorting, so normalize names before indexing if you
+need to.
 A bare `type: text` would use the whitespace analyzer.
 
 `variants` and `defaults` each inherit atomically: absent inherits, present
 replaces the whole object, and `{}` clears it. There is no per-label merge.
-For example, using the default `_name` template:
+For example, add fields to the
+[`authors` collection](documents.md#field-variants) using the default `_name`
+template:
 
 ```http
-POST /collections/names/_schema
+POST /collections/authors/_schema
 
 {
   "fields": {
-    "inherited": {"parent":"_name"},
-    "replaced": {"parent":"_name","variants":{"raw":"string"},"defaults":{"value":"raw"}},
-    "cleared": {"parent":"_name","variants":{},"defaults":{}}
+    "inherited": {
+      "parent": "_name"
+    },
+    "replaced": {
+      "parent": "_name",
+      "variants": {
+        "raw": "string"
+      },
+      "defaults": {
+        "value": "raw"
+      }
+    },
+    "cleared": {
+      "parent": "_name",
+      "variants": {},
+      "defaults": {}
+    }
   }
 }
 ```
 
 `inherited` keeps `s` and the value binding. `replaced` has only `raw`.
-`cleared` has only its primary and both bindings are `self`. Clearing variants
-without clearing an inherited binding to `s` fails with a dangling-label error.
-Within a present `defaults`, an omitted binding becomes `self`.
+`cleared` clears both the variants and their inherited defaults, leaving only
+the primary. Within a present `defaults`, an omitted binding becomes `self`.
 
 A variant's own `parent` borrows physical settings only: type, index, column,
-analyzer, normalizer, `long_terms`, and vector settings. It does not inherit that parent's
-shape, storage, variants, or defaults. Parents name authored fields or templates,
-never derived selectors.
+analyzer, normalizer, `long_terms`, and vector settings. It does not inherit
+that parent's shape, storage, variants, or defaults. Parents name authored
+fields or templates, never derived selectors.
 
-A new suffix can inherit `_t`'s word analysis and add a whole-value variant:
+A new suffix can inherit `_t`'s word analysis and add a whole-value variant.
+Templates can be supplied when the collection is created:
 
 ```http
 POST /collections/_create
 
 {
   "name": "templates",
-  "schema": {"templates": {
-    "_title": {"parent":"_t","variants":{"s":"string"},"defaults":{"value":"s"}}
-  }}
+  "schema": {
+    "templates": {
+      "_title": {
+        "parent": "_t",
+        "variants": {
+          "s": "string"
+        },
+        "defaults": {
+          "value": "s"
+        }
+      }
+    }
+  }
 }
 ```
 
-```http
-POST /collections/templates/_update
+A field named `book_title` now indexes both `book_title` and `book_title__s`.
+The `_title` template inherits `_t`'s case folding, accent folding, and English
+stemming; its string variant keeps the whole value for sorting, faceting,
+and exact lookup. See [field retrieval](searching.md#field-retrieval-and-result-shape)
+for retrieving a particular variant.
 
-{"docs":[{"id":"t1","book_title":"Dune"}],"commit":{}}
-```
-
-This indexes `book_title` and `book_title__s`. `_title` inherits `_t`'s
-case folding, accent folding, and English stemming. Long titles keep their full stored source;
-the string variant indexes a prefix plus hash suffix for sorting, faceting, and
-exact lookup.
-
-### STRING normalization and length
+## STRING normalization and length
 
 `normalizer` takes filters only: `lowercase`, `nfkc_cf`, and `fold`, using the
 same component syntax as analyzer filters. Each input element stays one whole
 value. Normalization applies at ingest and to query literals, facet `selected`
-values, and range bounds. Absent `normalizer` inherits; `[]` clears it.
+values, and range bounds, so a literal accepted at ingest finds its document
+later. Absent `normalizer` inherits; `[]` clears it.
 
-Indexed STRING values after normalization, TEXT tokens after analysis, and IDs
-share a 255-byte term space. Terms of 255 bytes or less stay unchanged. The
-default `long_terms` is `hash128`: longer terms become the first 230 bytes,
-backed off to a UTF-8 boundary, followed immediately by 25 base36 digits. There
-is no delimiter. The suffix is unseeded XXH3_128 of the whole term, taken as
-one 128-bit number from its canonical 16 bytes (high 64 bits then low 64 bits,
+### Long terms
+
+IDs, indexed STRING values after normalization, and analyzed TEXT tokens share
+a 255-byte term space. Terms of 255 bytes or less stay unchanged. The
+`long_terms` policy says what happens to longer ones; the default, `hash128`,
+keeps long values distinct with no limit on value length:
+
+| Policy | Over-limit term becomes |
+|---|---|
+| `hash128` (default) | The first 230 bytes, backed off to a UTF-8 boundary, followed immediately by 25 base36 characters hashing the whole term. |
+| `truncate` | The first 255 bytes, backed off to a UTF-8 boundary. Values sharing that prefix merge, including IDs for overwrite and delete. |
+| `reject` | Reject documents and requests containing over-limit terms. |
+
+The `hash128` suffix is unseeded XXH3_128 of the whole term, taken as one
+128-bit number from its canonical 16 bytes (high 64 bits then low 64 bits,
 both big-endian) and written in `0-9` and `a-z`, most significant digit first,
-zero padded to 25 digits. These format choices are fixed for `hash128`.
+zero padded to 25 digits.  A
+300-byte value in a `_s` field therefore facets as its first 230 bytes plus a
+25-character tail such as `...131pru8lxm5t1cohchv0tgjtg`.
 
-Different long values retain distinct exact matches and facet buckets except
-for hash collisions. This is not attack-resistant: xxHash is not cryptographic,
-and an ordinary short term can also equal a generated term. Sorts and ranges
-agree with source byte order up to the kept prefix; beyond it they compare the
-hash suffix, not the source tail. Term enumeration, facets, and indexed columns
-return the term as stored. Stored source keeps full bytes before normalization
-or hashing. Column-only strings have no term-space limit.
+What the policy means at query time:
 
-Exact literals, `any_of` / `:=`, range bounds, and facet `selected` values use
-the same policy; TEXT exact membership applies it to the single analyzed term.
-Match and phrase apply it per analyzed token. Prefix queries longer than the
-kept prefix fall back to that prefix, so they return a superset. Wildcard and
-regex queries do the same when their common leading literal prefix exceeds
-the limit; other patterns operate on stored term bytes. Fuzzy distance also
-compares transformed term bytes. See [term-space limits](documents.md#ids-and-replacement)
-for the implications of submitting returned hash terms to normalization.
-
-`long_terms: "truncate"` cuts at a UTF-8 boundary at or below 255 bytes
-instead, merging values with the same retained prefix (including IDs for
-overwrite/delete). `long_terms: "reject"` fails the document for an over-limit
-term and reports a teaching error for an over-limit query term, bound, or
-selection. A rejecting variant fails its entire document. Invalid delete IDs
-are request errors.
+- Exact queries (`any_of`, `:=`), range bounds, facet `selected` values,
+  overwrite, and delete apply the same transform as ingest, so full values
+  round-trip. TEXT exact membership applies it to the single analyzed term;
+  match and phrase apply it per analyzed token.
+- Different long values keep distinct IDs, exact matches, and facet buckets
+  except for hash collisions.
+- A prefix query longer than the kept prefix falls back to that prefix and
+  returns a superset. Wildcard and regex queries do the same when their common
+  leading literal prefix exceeds the limit; other patterns operate on the
+  stored term bytes, hash suffix included. Fuzzy distance also compares
+  transformed bytes, so similarity between discarded tails is not measured.
+- The stored source, when enabled, keeps the full bytes before normalization
+  or hashing and is used to return the exact value if its column representation
+  was truncated.
+- Column-only strings (`index: "none"`) have no term-space limit,
+  but cannot serve field facets or exact queries.
 
 Absent `long_terms` inherits through the parent chain, otherwise defaults to
 `hash128`; an explicit policy overrides inheritance. Variants may set the policy
 or borrow it through their own `parent`; they do not inherit it from their
-logical primary. An explicitly set or inherited policy is invalid on other
-types or on a STRING with `index: "none"`.
-
-Changing the effective policy affects newly admitted updates and new queries;
-existing segments keep their original terms. Use a new field or variant label
-and reindex to change the policy safely.
+logical primary. The policy applies only to ID, TEXT, and indexed STRING
+representations.
 
 ## The operations
 
@@ -437,16 +572,73 @@ and reindex to change the policy safely.
 | `GET /collections/{c}/_schema?view=resolved` | effective representations, bindings, and schema coverage (HTTP only) |
 | `POST /collections/{c}/_schema` | `mode=set` (default): set the named definitions, keep the rest |
 | `POST /collections/{c}/_schema?mode=replace_all` | replace the whole schema |
+| `POST /collections/_create` | create a collection, optionally with a `schema` installed before it becomes visible |
+
+The same operations are available over gRPC as `luxir.Admin/GetSchema`,
+`SetSchema`, and `CreateCollection`; see the [gRPC API](grpc.md).
 
 ### Resolved view
 
+The default `GET`, also available as `?view=authored`, stays sparse: explicit
+parents, variants, and defaults are returned without inheritance expansion.
+The resolved view expands everything, per physical representation. After
+adding the fields in [Templates and inheritance](#templates-and-inheritance),
+inspect the `authors` collection:
+
 ```http
-GET /collections/names/_schema?view=resolved
+GET /collections/authors/_schema?view=resolved
 ```
 
-The default GET, also available as `?view=authored`, stays sparse: explicit
-parents, variants, and defaults are returned without inheritance expansion.
-The resolved view is diagnostic, not a schema write body. It contains:
+```json
+{
+  "generation": 1,
+  "fields": {
+    "inherited": {
+      "bindings": {
+        "search": "inherited",
+        "value": "inherited__s"
+      },
+      "representations": {
+        "s": {
+          "analyzer": null,
+          "column": true,
+          "coverage_complete": false,
+          "index": "match",
+          "introduced_generation": 1,
+          "long_terms": "hash128",
+          "multi": false,
+          "name": "inherited__s",
+          "normalizer": [],
+          "oldest_generation": 0,
+          "stored": false,
+          "type": "string"
+        },
+        "self": {
+          "analyzer": {
+            "filters": ["nfkc_cf", "fold"],
+            "tokenizer": "unicode_word"
+          },
+          "column": false,
+          "coverage_complete": false,
+          "index": "match",
+          "introduced_generation": 1,
+          "long_terms": "hash128",
+          "multi": false,
+          "name": "inherited",
+          "normalizer": null,
+          "oldest_generation": 0,
+          "stored": true,
+          "stored_resource": "_stored_",
+          "type": "text"
+        }
+      }
+    }
+  }
+}
+```
+
+(Abbreviated to the `inherited` field; the real response lists every declared
+field.) The resolved view is diagnostic, not a schema write body. It contains:
 
 | Property | Meaning |
 |---|---|
@@ -459,34 +651,32 @@ The resolved view is diagnostic, not a schema write body. It contains:
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
 | `coverage_complete` | True for an empty index or when that minimum reaches the introduction generation. |
 
-Coverage is conservative schema provenance, not a count of documents containing
-the field. Merges keep the minimum input generation and cannot establish
+Coverage is derived from segment schema generations, not from counting
+documents that contain the field. Merges keep the minimum input generation and cannot establish
 backfill. Deleting some documents from an old segment does not refine its
 generation.
 
-### Changes on a live collection
+### Changes to a live collection
 
-Schema changes do not rewrite existing documents. Adding `author__s` leaves
-older documents without it; switching `defaults.value` to `s` immediately
-routes new requests there. Those older documents will not match its exact
-queries or contribute to its value facets. Reindex from the producer's input
-to populate it; retrieval is not guaranteed to reproduce every branch's input.
+Schema changes apply to new requests and do not rewrite existing documents.
 
-Each admitted update message pins one schema generation. A schema change takes
-effect for updates admitted after the schema call returns; earlier messages
-finish with their original one. The call does not wait for those messages.
-Each inverter keeps its schema for its whole life. A stale idle inverter
-flushes at the next checkout, and a stale busy one flushes when released, so
-each segment is written under a single schema.
+Adding a field or variant leaves older documents without its values. Reindex
+from your source data to populate them before switching queries or default
+bindings to the new representation. For example, older documents without a
+new `author__s` variant will not match its exact queries or appear in its facet
+buckets.
 
-Schema changes are not validated against existing data. Existing segments keep
-the representation they were written with, even when a field or template is
-redefined. This applies to type, `multi`, index/column settings, posting
-settings, analyzer or normalizer, `long_terms`, and vector parameters. Accepting
-a schema edit does not establish that new queries can use the old data correctly.
+Schema edits are not checked for compatibility with existing data. To change
+a field's type or analysis, use a new field or variant label and reindex.
+Removing and reusing a name does not erase its old indexed values.
 
-Removing a variant does not remove its data from existing segments. Reusing
-its label with a different definition can leave old and new representations
-under the same physical name. Use a new field or variant label and reindex to
-change a representation safely. Stored-source settings and default bindings
-can also change, but neither change fills missing old values.
+## Limits
+
+- Schema edits do not rewrite existing documents; see
+  [Changes to a live collection](#changes-to-a-live-collection).
+- Analyzed text has no value column; use
+  a string variant when the same value must sort or facet.
+- `english_possessive` and `kstem` are analyzer filters only; STRING
+  normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
+- There is no default geo suffix; geo fields need an explicit definition (see
+  [Geo search](geo-search.md)).

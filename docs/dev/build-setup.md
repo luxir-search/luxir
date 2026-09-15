@@ -135,9 +135,9 @@ The binaries for every preset are under `build/<preset>/bin/`.
 
 ## Measure on your workload
 
-Luxir does not yet publish a portable performance envelope. Hardware, corpus,
-query mix, vector model, and requested exactness all materially change the
-result, so evaluate the release build on representative inputs.
+There are no published performance numbers yet. Hardware, corpus, query mix,
+vector model, and requested exactness all change the result, so evaluate the
+release build on representative inputs.
 
 The built-in benchmark mode creates production-scale corpora and can take
 substantial setup time and memory:

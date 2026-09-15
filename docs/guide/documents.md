@@ -1,9 +1,7 @@
 # Documents and values
 
-A Luxir document is a flat map from field name to typed value. The schema says
-how each value is indexed and retained; the document itself carries no type
-tags. This page defines the boundary that indexing, querying, and retrieval
-share.
+A Luxir document is a flat JSON object with field names and values. The
+schema defines each field's type and how it is indexed and stored:
 
 ```json
 {
@@ -14,12 +12,14 @@ share.
 }
 ```
 
-Nested objects and nested documents are not a field type. Model relationships
-with IDs or flatten the fields in the producer.
+This page covers field templates, variants, IDs, and the values you can
+send and retrieve.
 
-## Field names choose the contract
+## Field templates: types from field names
 
-With the default schema, a recognized suffix chooses the type:
+Field templates apply a type and other settings to fields with a matching
+name suffix. Luxir's built-in templates let you start indexing without
+defining your own schema:
 
 - `title_t` is analyzed text;
 - `category_s` is an indexed exact string;
@@ -28,120 +28,159 @@ With the default schema, a recognized suffix chooses the type:
 - `published_dt` is a date column;
 - `embedding_v` is a vector column.
 
-An unknown field with no matching suffix is a per-document error, not an
-ignored property. Define a concrete field or template through the
-[schema API](schema.md) when suffixes are not the desired public names.
+Templates also handle fields you cannot enumerate ahead of time. An ecommerce
+catalog might define an `_attr` template for product attributes. New product
+classes can then introduce fields such as `shoe_width_attr` or `socket_attr`
+without a schema change for each new name. Define the rule once; new matching
+fields work automatically. See the
+[product attributes example](schema.md#field-templates-for-dynamic-fields).
 
-A field with [variants](schema.md#field-variants) still takes one input value
-(or one array for a multi-valued field). Send `author` once; its primary and
-variants each convert that submitted value. Derived names such as `author__s`
-and `author__self` are request selectors, never document keys. A final document
-key containing `__` is a per-document error.
+You can combine templates with explicit field definitions, choosing which
+fields to define individually and which to cover with a naming rule. Explicit
+definitions take precedence over templates. The
+[schema guide](schema.md#read-the-schema) lists the built-in suffixes and
+explains how to customize fields and templates.
 
-[`field_map`](indexing.md#field-mapping) may rename an external key containing
-`__` onto a logical field, or drop it. It may not target a variant, a `__self`
-selector, or an abstract template name; an invalid target fails the whole
-request. Mapping is rename-or-drop, and the logical field supplies the variants.
+## Field variants
 
-Request objects follow a separate but related rule: unknown request keys are
-errors. Luxir does not silently accept a misspelled query option.
+A field can index the same input in several ways. For example, you might want
+to search an author's name by individual words, but facet and sort by the
+whole name. [Field variants](schema.md#field-variants) let one field do both.
 
-## Missing, null, and empty
+The built-in `_name` template already sets this up. Index these books with an
+`author_name` field:
 
-For every field type, an absent field and an explicit JSON `null` both mean
-that the document has no value for that field. The document does not enter the
-field's postings or column, `exists` does not match it, and row-format retrieval
-omits the key.
+```http
+POST /collections/authors/_update
 
-An empty array on a multi-valued field likewise supplies no values. Use a
-single value for a single-valued field and an array for a field declared
-`multi`. For vectors, `[]` supplies no vectors to a multi-valued field but is
-an invalid empty vector on a single-valued field. Supplying several values to
-a single-valued field is an update error.
+{
+  "docs": [
+    {
+      "id": "b1",
+      "title_t": "Gridlinked",
+      "author_name": "Neal Asher"
+    },
+    {
+      "id": "b2",
+      "title_t": "The Skinner",
+      "author_name": "Neal Asher"
+    },
+    {
+      "id": "b3",
+      "title_t": "Snow Crash",
+      "author_name": "Neal Stephenson"
+    },
+    {
+      "id": "b4",
+      "title_t": "Prador Moon",
+      "author_name": "Neal Asher"
+    },
+    {
+      "id": "b5",
+      "title_t": "Anathem",
+      "author_name": "Neal Stephenson"
+    },
+    {
+      "id": "b6",
+      "title_t": "Scythe",
+      "author_name": "Neal Shusterman"
+    }
+  ],
+  "commit": {}
+}
+```
 
-Missing values do not acquire a schema default. Search result columns use a
-type-specific missing sentinel internally; HTTP column-format output renders
-the missing cell as `null`.
+Search for `neal`, return the first three matches by ID, and facet on the
+same author field:
+
+```http
+POST /collections/authors/_search
+
+{
+  "query": "author_name:neal",
+  "fields": ["title_t", "author_name"],
+  "sort": "id",
+  "limit": 3,
+  "get_number": true,
+  "ops": {
+    "authors": {
+      "field_facet": {
+        "field": "author_name"
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "found": 6,
+  "docs": [
+    {
+      "title_t": "Gridlinked",
+      "author_name": "Neal Asher"
+    },
+    {
+      "title_t": "The Skinner",
+      "author_name": "Neal Asher"
+    },
+    {
+      "title_t": "Snow Crash",
+      "author_name": "Neal Stephenson"
+    }
+  ],
+  "ops": {
+    "authors": {
+      "buckets": [
+        {
+          "val": "Neal Asher",
+          "count": 3
+        },
+        {
+          "val": "Neal Stephenson",
+          "count": 2
+        },
+        {
+          "val": "Neal Shusterman",
+          "count": 1
+        }
+      ]
+    }
+  }
+}
+```
+
+The word `neal` matches all six books. The facet groups them by the full
+author name: three by Neal Asher, two by Neal Stephenson, and one by Neal
+Shusterman. Facet counts include every match, so Shusterman appears in the
+facet even though his book is beyond the first three results.
+
+The template creates an analyzed text field for word search and a string
+variant, `author_name__s`, for whole-name facets and sorting. Both operations
+use `author_name` in the request; the template chooses the appropriate
+representation. You only supply the name once when indexing.
+
+Use `_names` for a multi-valued field, such as `author_names` for books with
+several authors. You can also [define your own variants](schema.md#field-variants)
+on explicitly named fields.
 
 ## IDs and replacement
 
 `id` is the reserved unique-ID field. String and numeric values are accepted;
-numeric IDs use their canonical string rendering, so `123` and `"123"` name
+numeric IDs use their canonical string rendering, so `123` and `"123"` are
 the same ID.
 
-An ID is not currently required. A document with an absent or null ID can be
-searched, but it cannot be overwritten or deleted by ID and has no useful
-external identity. In ordinary collections, treat `id` as required at the
-producer boundary.
+With the default `allow_dups: false`, another document with the same ID
+replaces the old document. Replacement is whole-document replacement: fields
+omitted by the new version disappear.  Set `allow_dups: true` only when
+you know you are sending unique documents.
 
-IDs, indexed STRING values after normalization, and analyzed TEXT tokens
-share a 255-byte term space. Terms at or below 255 bytes stay unchanged. The
-default `long_terms` policy is `hash128`: a longer term becomes its first 230 bytes, backed off to a UTF-8 boundary, plus exactly
-25 base36 characters of XXH3_128 of the whole term, with no separator or
-padding. The [hash format](schema.md#string-normalization-and-length) is fixed.
-Different long values have distinct IDs, exact matches, and facet buckets
-except for hash collisions. This is not attack-resistant: the hash is not
-cryptographic, and a short input can equal a generated term.
+An ID is not required. A document with an absent or null ID can be searched,
+but it cannot be overwritten or deleted by ID and has no useful external
+identity.  `_version_` is reserved for internal overwrite ordering and is not
+an application field.
 
-Exact queries, range bounds, facet selections, overwrite, and delete apply the
-same policy. Sorts and ranges preserve byte order up to the kept prefix; beyond
-that prefix they compare the hash suffix rather than the source tail. A prefix
-query longer than the kept prefix matches that prefix alone, returning a
-superset. Wildcard and regex queries also fall back when their common leading
-literal prefix exceeds the limit; other patterns see the stored term bytes.
-
-The stored copy, when enabled, keeps the full source bytes before normalization
-or hashing. Indexed columns, term enumeration, and facet values return the
-stored term (prefix plus hash for a long value). The hash characters are
-digits and lowercase letters, and the prefix is already normalized output, so a
-returned term resubmitted to the same field as an exact query or facet
-`selected` value passes through its normalizer or analyzer unchanged and finds
-the same documents. The one exception is a whitespace-tokenized text token whose
-kept prefix ends in a script that a word segmenter splits per character; no
-current tokenizer produces such a token. There is no marker distinguishing a
-hash term from an ordinary short value. Column-only strings (`index: "none"`)
-stay unlimited.
-
-`long_terms: "truncate"` cuts at a UTF-8 boundary at or below 255 bytes
-instead. Shared prefixes then merge, including IDs for overwrite and delete.
-`long_terms: "reject"` fails a document containing an over-limit normalized
-string, analyzed token, or ID; query terms, bounds, selections, and delete IDs
-are errors too. A rejecting variant fails the whole document. The effective
-policy applies to updates admitted after the schema call returns. Existing
-segments are not validated against policy edits and keep their original terms;
-use a new field or variant label and reindex to change the policy safely.
-
-With the normal `allow_dups: false`, another document with the same ID replaces
-the old document. Replacement is whole-document replacement: fields omitted by
-the new version disappear. Luxir does not currently implement field patches.
-Set `allow_dups: true` only when duplicate IDs are intentionally append-only.
-
-`_version_` is reserved for internal overwrite ordering and is not an
-application field.
-
-## Scalar coercion
-
-Index-time and query-time coercion share one implementation: a literal accepted
-for a field at ingest can be used to match or bound that field later.
-
-- String, text, and ID fields accept strings. Numeric and boolean scalars are
-  converted to their canonical text rendering.
-- Integer fields accept JSON integers, integral floating-point numbers, and
-  strings that parse to an integral value. Fractional or out-of-range values
-  are errors.
-- Float and double fields accept JSON numbers and numeric strings.
-- Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and
-  date math. Update messages interpret offset-less date text in UTC; search
-  requests may supply a query time zone. See [Dates](dates.md).
-- Geo points and vectors have array shapes described in their dedicated guides;
-  they are not generic numeric multi-value fields. A vector is a number array;
-  integer elements are accepted, while doubles must narrow to finite float32.
-
-Coercion is deliberately not a best-effort parser: trailing garbage, an object
-where a scalar is expected, a wrong vector dimension, or an invalid coordinate
-is a per-document error.
-
-## Multi-valued shapes
+## Multi-valued fields
 
 The outer JSON shape follows the schema:
 
@@ -154,46 +193,11 @@ The outer JSON shape follows the schema:
 }
 ```
 
-String, text, numeric, and date multi-fields use an array of scalar values. A
-multi-geo field uses an array of `[lon,lat]` points. A multi-vector field uses
-an array of number arrays. A bare number array is also accepted as a
+String, text, numeric, and date multi-fields use an array of scalar values.
+A multi-geo field uses an array of `[lon,lat]` points. A multi-vector field
+uses an array of number arrays; a bare number array is also accepted as a
 one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
 `_fs`, `_ds`, `_dts`, and `_vs` default suffixes already are.
-
-A multi-valued text field analyzes each input value separately and inserts a
-position gap of `100` between values. A phrase therefore does not cross values
-unless its slop reaches that gap.
-
-With the `_name` and `_names` templates from
-[Schema](schema.md#templates-and-inheritance), one input list supplies both
-representations:
-
-```http
-POST /collections/names/_update
-
-{
-  "docs": [{
-    "id":"n1",
-    "author_name":"Ursula K. Le Guin",
-    "author_names":["Le Guin","LE GUIN","Martin"]
-  }],
-  "commit": {}
-}
-```
-
-```http
-POST /collections/names/_search
-
-{
-  "query": "id:n1",
-  "fields": ["author_name","author_name__s","author_names","author_names__s"],
-  "get_number": true
-}
-```
-
-```json
-{"found":1,"docs":[{"author_name":"Ursula K. Le Guin","author_name__s":"ursula k. le guin","author_names":["Le Guin","LE GUIN","Martin"],"author_names__s":["le guin","martin"]}]}
-```
 
 ## What is returned
 
@@ -201,45 +205,71 @@ Columns and stored fields solve different problems:
 
 - A column retains a typed per-document value for sorting, faceting, numeric
   and geo queries, vector search, and retrieval where that type is supported.
-- A stored TEXT, STRING, or ID primary retains canonical source text in
-  compressed chunks, before analysis or normalization. Numeric and boolean
-  inputs become text: a numeric `42` stored as TEXT returns `"42"`. Text
-  defaults to stored.
+- Stored text, string, and ID fields keep source text before analysis or
+  normalization. Text fields are stored by default, so searching individual
+  words still lets you retrieve the original title or author name.
+
+Use `fields` to choose which values to return, as in the example above. You
+can also use `*` wildcard patterns such as `"attr_*"`. Omitting `fields`
+returns every retrievable logical field except vectors and engine fields.
+See [field retrieval](searching.md#field-retrieval-and-result-shape) for the
+full projection rules.
+
+## Details
+
+### Scalar coercion
+
+Index-time and query-time coercion use the same rules: a literal accepted for
+a field at ingest can be used to match or bound that field later.
+
+- String, text, and ID fields accept strings. Numeric and boolean scalars are
+  converted to their canonical text rendering.
+- Integer fields accept JSON integers, integral floating-point numbers, and
+  strings that parse to an integer within the signed 64-bit range.
+- Float and double fields accept JSON numbers and numeric strings.
+- Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and
+  date math. Update messages interpret offset-less date text in UTC; search
+  requests may supply a query time zone. See [Dates](dates.md).
+- Geo points and vectors have array shapes described in their dedicated
+  guides; they are not generic numeric multi-value fields. A vector is a
+  number array; integer elements are accepted, while doubles must narrow to
+  finite float32.
 
 Numeric primaries return their typed column; `stored` is ignored for them.
-Using the `names` collection from [Schema](schema.md#field-variants):
+Each variant converts the submitted value independently. For example, an
+integer field `edition` with a string variant `label` converts `"0042"` to
+numeric `42`, while `edition__label` keeps `"0042"`. Reindexing needs the
+producer's input, not just the primary's retrieved value.
 
-```http
-POST /collections/names/_search
+### Stored values and variant retrieval
 
-{"query":"id:b1","fields":["edition","edition__label"],"get_number":true}
-```
-
-```json
-{"found":1,"docs":[{"edition":42,"edition__label":"0042"}]}
-```
-
-The submitted `"0042"` is not preserved by the numeric primary. Each branch
-converted the input independently; reindexing needs the producer's input, not
-just the primary's retrieved value.
+Stored text, string, and ID fields retain canonical source text. Numeric and
+boolean inputs become text: a numeric `42` stored as TEXT returns `"42"`.
 
 Bare retrieval and `__self` use the primary's stored source when enabled,
 otherwise its own column. A normalized STRING primary without storage returns
-its normalized column value. Multi-valued string columns are sorted,
-deduplicated sets; stored source lists retain order and duplicates. Variants
-have no stored copy. An exact selector returns that representation's column
-under the selector key; a TEXT variant has no retrievable value.
+its normalized column value. Variants have no stored copy: an exact selector
+returns that representation's column under the selector key, and a TEXT
+variant has no retrievable value.
 
-Omitting `fields` returns retrievable logical fields except vectors and engine
-fields; name fields, or use `*` wildcard patterns such as `"attr_*"`, to
-project a subset. Patterns without `__` never expand variants; `author__*` or
-`*__s` discovers variants that have a column.
-A `stored: false` TEXT primary is omitted even if a variant can be retrieved (see
-[Searching](searching.md#field-retrieval-and-result-shape)). HTTP row format
-omits missing fields; HTTP column format includes the requested key with
-`null`. Geo columns are a current
-exception: they participate in queries but are not yet decoded by document
-projection. See [Geo search](geo-search.md#current-limits).
+Patterns without `__` never expand variants; `author__*` or `*__s` discovers
+variants that have a column. HTTP row format omits missing fields; HTTP
+column format includes the requested key with `null`.
 
-Binary is reserved in the wire/schema enum but is not a usable engine field
-type in the current release.
+For a multi-valued field, stored values keep source order and duplicates;
+a string column is a sorted, deduplicated set.
+
+### Multi-valued text and phrases
+
+A multi-valued text field analyzes each input value separately and inserts a
+position gap of `100` between values, so a phrase does not cross values
+unless its slop reaches that gap.
+
+## Limits
+
+- Nested objects and nested documents are not a field type. Model
+  relationships with IDs or flatten the fields in the producer.
+- Geo columns participate in queries but are not yet decoded by document
+  projection; see [Geo search](geo-search.md#current-limits).
+- Binary is reserved in the wire/schema enum but is not a usable engine field
+  type in the current release.

@@ -1,30 +1,46 @@
 # Structured query reference
 
-Every structured query is a JSON object with exactly one query arm. Query
-objects compose uniformly inside boolean clauses, filters, wrappers, kNN
-filter domains, and fusion sources. This page is the field-level reference;
-[Searching](searching.md) covers result collection and the
-[query language](query-language.md) covers the strict expression shorthand.
+Every structured query is a JSON object with exactly one query arm, and every
+arm is a node that composes anywhere: under boolean clauses, in filters, inside
+wrappers, as a kNN filter domain, or as a fusion source. The
+[query language](query-language.md) is a string syntax for the same tree.
+This page is the field-level reference for the arms. It doubles as the
+function reference for
+the [query language](query-language.md): a function's name is the arm's JSON
+name and its arguments are the arm's fields, so `fuzzy(smith, field=name_s,
+max_edits=2)` and the JSON below mean the same thing.
+[Queries and search operations](searching.md#queries-and-search-operations)
+explains how a query selects and scores documents while operations collect
+results, and links the protobuf definitions shared by JSON and gRPC.
 
-Unknown arms and unknown fields are errors. Add `?explain=request` to an HTTP
-query to see the canonical request after shorthand expansion.
+```http
+POST /collections/books/_search
 
-Bare fields use the schema's operation-specific bindings; explicit `f__label`
-and `f__self` select one representation directly:
+{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "get_number": true}
+```
 
-| Operation | Bare name |
-|---|---|
-| Match, phrase, simple query, prefix, fuzzy, wildcard, regex | `search`, even inside a filter. |
-| `any_of`, range, field/range facets, sort, column expressions, metrics | `value`, then the operation's capability checks. |
-| Exists, kNN, geo | Primary physical field. |
-| Retrieval | Primary source store or its own column; never the value default. |
+```json
+{
+  "found": 2,
+  "docs": [
+    {
+      "id": "b1"
+    },
+    {
+      "id": "b2"
+    }
+  ]
+}
+```
 
-Both bindings default to `self`. There is no automatic fallback to a variant
-with different capabilities. [Searching](searching.md#field-bindings) has a
-worked example, including retrieval under explicit selector keys. Default
-projection and wildcards discover logical names only; `author__*` is an error.
-TEXT cannot sort or supply a column expression; `col()` does not bypass that
-check. Numeric metrics still require numeric expressions.
+Add `?explain=request` to an HTTP query to see the canonical request after
+shorthand expansion.
+
+A bare field name picks a representation by operation: text operations use
+the field's `search` binding, value operations (`any_of`, ranges, facets,
+sorts, metrics) use its `value` binding, and `f__label` or `f__self` selects
+one representation directly. See [default bindings](schema.md#default-bindings)
+and the [worked example](searching.md#field-bindings).
 
 ## Match all and exists
 
@@ -71,28 +87,47 @@ The HTTP dialect also accepts the field-name form:
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
 
 Text values are analyzed with the resolved field analyzer. String values use
-their normalizer, if configured, and match as exact terms using their
-`long_terms` policy; IDs and analyzed text tokens use their policy too. Numeric
-and date values are coerced through the same
-rules as indexing and matched through their columns.
+their normalizer, if configured, and match as exact terms. Numeric and date
+values are coerced through the same rules as indexing and matched through
+their columns. Terms over 255 bytes follow the field's
+[`long_terms` policy](schema.md#string-normalization-and-length).
 
 ## Exact membership (`any_of`)
 
-`any_of` matches any listed value in the value representation. With the `names`
-collection from [Schema](schema.md#field-variants):
+`any_of` matches any listed value in the value representation. With the
+`authors` collection from [Documents and values](documents.md#field-variants):
 
 ```http
-POST /collections/names/_search
+POST /collections/authors/_search
 
 {
-  "query": {"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}},
+  "query": {
+    "any_of": {
+      "field": "author_name",
+      "values": ["Neal Asher"]
+    }
+  },
   "fields": ["id"],
-  "get_number": true
+  "get_number": true,
+  "sort": "id"
 }
 ```
 
 ```json
-{"found":1,"docs":[{"id":"b1"}]}
+{
+  "found": 3,
+  "docs": [
+    {
+      "id": "b1"
+    },
+    {
+      "id": "b2"
+    },
+    {
+      "id": "b4"
+    }
+  ]
+}
 ```
 
 | Field | Meaning |
@@ -101,34 +136,16 @@ POST /collections/names/_search
 | `values` | Exact values; any matching value admits the document. |
 
 STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
-representations can use their columns. A column-only STRING can sort but
-cannot serve `any_of`.
+representations can use their columns.
 
 STRING literals are whole values and use the same normalizer as ingest. TEXT
-literals are exact token membership: analysis producing more than one term
-is rejected with `any_of / := requires a single term per exact TEXT value`
-and a suggestion to use match, phrase, or a whole-value string variant.
-Lookup uses the single analyzed term. For example, `author__self` with `"Guin!"`
-looks up `guin` and matches `b1` and `b3`, just like `"Guin"` or a match query
-for `Guin!`. A literal producing zero terms matches nothing; `"Le Guin"`
-produces several terms and is an error.
+literals use exact token membership: each value must analyze to at most one
+term. For example, `author_name__self` with `"Neal!"` looks up `neal` and
+matches all six books. A value producing zero terms matches nothing. For
+multiple terms, use match, phrase, or a whole-value string variant. Literals
+over 255 bytes follow the field's
+[`long_terms` policy](schema.md#string-normalization-and-length).
 
-Exact STRING literals, IDs, and STRING/TEXT bounds use the field's `long_terms`
-policy after normalization. TEXT exact membership applies it to the single
-analyzed lookup term. The default changed from `truncate` to `hash128`: a term
-over 255 bytes becomes a UTF-8-safe prefix of at most 230 bytes plus 25
-base36 hash characters. Terms of 255 bytes or less are unchanged. Ingest,
-exact queries, range bounds, and facet selections transform identically.
-
-`truncate` cuts at the limit instead, merging shared 255-byte prefixes;
-`reject` fails the document and makes over-limit lookup terms teaching errors. Policy edits do
-not validate or rewrite existing terms; use a new field or variant label and
-reindex to change the policy safely. Sorts and ranges compare the hash suffix
-after the kept prefix, so source-tail order is lost. Hashing is not attack-resistant.
-Term enumeration and facets return the stored hash term; its digits and
-lowercase letters pass through normalizers and analyzers unchanged, so it can be
-resubmitted as an exact value or `selected` entry. See
-[term-space limits](documents.md#ids-and-replacement).
 The expression forms are `field:=value` and `field:=(v1, v2)`; see
 [exact values](query-language.md#exact-values).
 
@@ -167,9 +184,12 @@ but do not constrain the match set by default. With only optional clauses, at
 least one must match. Set `min_match` to make the optional group an explicit
 constraint.
 
-The query's `filter` list accepts bare query strings and structured query
-objects. A routing wrapper adds `except_ops` when sibling operations should not
-see the filter:
+## Filters, routing, and domains
+
+The `filter` list of a `top_docs` operation (and of the request shorthand)
+holds non-scoring queries ANDed with the main query. Each entry is a bare
+expression string, a structured query object, or a routing wrapper that adds
+`except_ops` when sibling operations should not see the filter:
 
 ```json
 "filter":[
@@ -179,8 +199,9 @@ see the filter:
 ```
 
 The filter still restricts the document results, but the named operations in
-`TopDocs.ops` run without it. Names must be distinct, nonempty keys in that
-map. Routing is supported by both JSON and protobuf; Fusion filters and
+`TopDocs.ops` run without it: a `brands` facet keeps showing every brand while
+the result list is narrowed to one. Names must be distinct, nonempty keys in
+that map. Routing is supported by both JSON and protobuf; Fusion filters and
 Fusion source filters do not accept `except_ops`.
 
 An operation directly in `SearchRequest.ops` or `TopDocs.ops` may also set a
@@ -234,13 +255,49 @@ costs `2`, and multi-valued text fields have a position gap of `100`. See
 `prefix` is an indexed-term prefix, not a wildcard expression. Text fields
 apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
-matches documents with at least one indexed term for the field.
+matches documents with at least one indexed term for the field. A prefix
+longer than the kept prefix of a
+[long term](schema.md#string-normalization-and-length) falls back to that
+prefix and returns a superset.
 
-With `hash128`, prefixes longer than the kept prefix (at most 230 UTF-8-safe
-bytes) fall back to that prefix and return a superset. Wildcard and regex
-queries similarly fall back when their common leading literal prefix exceeds
-that limit, even for a literal-only pattern. Other patterns operate on the
-stored term bytes, including the hash suffix.
+## Wildcard
+
+```json
+{"wildcard":{"field":"title_t","pattern":"du*"}}
+```
+
+| Field | Meaning |
+|---|---|
+| `field` | Indexed term field. Required. |
+| `pattern` | `*` matches any bytes, `?` matches one codepoint, `\` escapes the next character. Required. |
+
+The pattern matches an entire indexed term. On TEXT fields, literal characters
+fold the way the field folds text, while `*`, `?`, and escapes are syntax and
+never fold; STRING fields also normalize literal characters; ID fields use
+literals verbatim. Wildcard queries are constant-scoring. A pattern whose
+leading literal prefix exceeds the kept prefix of a
+[long term](schema.md#string-normalization-and-length) falls back to that
+prefix; otherwise the pattern sees the stored term bytes. The expression form
+is `wildcard(du*, field=title_t)`.
+
+## Regex
+
+```json
+{"regex":{"field":"title_t","pattern":"dune|kings"}}
+```
+
+| Field | Meaning |
+|---|---|
+| `field` | Indexed term field. Required. |
+| `pattern` | Anchored whole-term regular expression: `\|`, concatenation, groups, repetition, `.`, and character classes. Required. |
+
+The match is anchored to the whole indexed term, so `mess` does not match
+`messiah` but `mess.*` does; `^` and `$` are literal characters. On TEXT
+fields, literal characters fold the way the field folds text; character
+classes and ranges are codepoint-exact. STRING fields also normalize literal
+characters; ID fields use literals verbatim. Regex queries are
+constant-scoring and follow the same long-term prefix fallback as wildcards.
+The expression form is `regex(dune|kings, field=title_t)`.
 
 ## Fuzzy
 
@@ -264,16 +321,14 @@ stored term bytes, including the hash suffix.
 | `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
 | `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
 
-The term uses the field's `long_terms` policy before distance is measured.
-With `hash128`, edits compare the prefix plus hash, so similarity between
-source tails is not preserved.
-
 The engine also applies a current clause budget of `64` and may apply a lower
-operator limit. Expansion truncation is silent execution policy; the
-dictionary-dependent result does not change response metadata. Scoring uses
+operator limit. Truncation is not reported in the response. Scoring uses
 blended BM25 statistics; filter context is constant-scoring, but both use the
 same expansion set and match set. Simple-query syntax still warns when it
 clamps an unsupported edit distance before constructing the fuzzy query.
+Distance is measured on stored term bytes, so a
+[long term](schema.md#string-normalization-and-length) compares its prefix
+plus hash.
 
 ## Range
 
@@ -322,9 +377,38 @@ Multiply child scores without changing matches:
 accepts a numeric sibling as input sugar:
 `{"match":{"title_t":"dune"},"boost":2}`. Canonical output uses the wrapper.
 
+## Rescore
+
+Keep the child query's matches and replace each hit's score with a value
+expression:
+
+```json
+{
+  "rescore": {
+    "query": {"match":{"title_t":"dune"}},
+    "expr": "score * $weight + log1p(popularity_i)",
+    "vars": {"weight": 10}
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `query` | The child query. Its matches are the rescored set. Required. |
+| `expr` | A numeric value expression; `score` is the child's score and column names read the document's values. Required. |
+| `vars` | Scalar values for `$name` references in `expr`. |
+
+The expression uses the same value-expression language as sorting (arithmetic,
+`def`, unary math, and reducers; see [Searching](searching.md#sorting)) and
+must produce a finite value for every matched document. Handle missing values
+with `def()` or exclude them with an `exists()` clause in the child query.
+The expression form is
+`rescore(title_t:dune, expr=score * log1p(popularity_i))`, whose `$vars`
+bind from the surrounding expression's `vars` map.
+
 ## Simple query
 
-`simple_query` is for raw search-box input whose syntax must never fail:
+`simple_query` is for raw search-box input and never fails to parse:
 
 ```json
 {
@@ -346,21 +430,19 @@ accepts a numeric sibling as input sugar:
 | `min_match` | Minimum top-level optional clauses when the parsed shape can apply it. |
 | `allowed_fields` | Optional allowlist for `field:value`; empty permits every queryable schema field. |
 
-The never-failing promise applies to the contents of `q`, not to the request
-envelope: an empty `fields` list or an unknown schema field is still a request
-error. Constructs that cannot be honored degrade to literal terms or produce a
-declared search warning. The [Quickstart](quickstart.md#forgiving-end-user-search)
+Unsupported syntax in `q` degrades to literal terms or produces a search
+warning. The [Quickstart](quickstart.md#forgiving-end-user-search)
 shows the intended search-box use.
 
 Expansion fields are resolved through `search` and deduplicated by physical
-identity: `author` and `author__self` in the example produce one expansion.
+identity: `author_name` and `author_name__self` from the
+[author example](documents.md#field-variants) produce one expansion.
 `allowed_fields` restricts exact resolved search targets; allowing one
 representation does not grant access to its siblings.
 
 ## Expression
 
-The structured expression arm carries strict developer-authored syntax and
-injection-safe values:
+The `expr` arm holds a query-language string and its variables:
 
 ```json
 {
@@ -371,20 +453,29 @@ injection-safe values:
 }
 ```
 
-A bare JSON string is sugar for `expr.q`. Variables are values and are never
-parsed as query syntax. See [Query language](query-language.md) for the full
+A bare JSON string is sugar for `expr.q`. Variables are substituted as values,
+not parsed as query syntax. See [Query language](query-language.md) for the full
 grammar and the function-call subset.
 
 ## Vector and geo
 
-Vector and geographic queries use the same `Query` node but have enough field
-and execution semantics to warrant their own guides:
+Vector and geographic queries use the same `Query` node and are documented
+in their own guides:
 
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, and the per-engine `ivf` object (`nprobe`, `min_scan_fraction`).
 - [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
   inclusive boundaries, dateline crossing, and distance units.
 
-These query types are structured-only. Expression functions cannot currently
-represent vector or coordinate-list arguments, so use the objects shown in the
-vector and geo guides.
+## Limits
+
+- `knn`, `geo_box`, and `geo_distance` are structured-only: expression
+  functions cannot currently represent vector or coordinate-list arguments,
+  so use the objects shown in the vector and geo guides.
+- New structured arms are not automatically callable from the query language
+  until their expression behavior is declared.
+- `except_ops` routing is not accepted on Fusion filters or Fusion source
+  filters, and `domain` overrides are not supported directly in `Fusion.ops`
+  or beneath facet buckets.
+- Fuzzy expansion truncation (the `64` clause budget and any lower operator
+  limit) is not reported in the response.

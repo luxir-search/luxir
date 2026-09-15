@@ -1,8 +1,8 @@
 # HTTP API conventions
 
-The HTTP surface is plain JSON for bounded messages and NDJSON for streams. It
-is deliberately small: collection names live in the path and the request body
-uses the same vocabulary as protobuf.
+The HTTP surface is plain JSON for bounded messages and NDJSON for streams.
+Collection names live in the path, and the request body uses the same field
+names as the protobuf messages.
 
 ## Endpoints
 
@@ -24,12 +24,10 @@ Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update
 does by default unless `--no-indexing.auto-create-collection` is set.
 
-`_create` is strict: creating a name that already exists is a `409` error, and
-the optional `schema` (same shape as a `_schema` set) is installed before the
-collection becomes visible, so no request can observe the collection with only
-the default schema. `_delete` names its target in the body, never falls back to
-a default collection, and returns `404` for a missing name. See the operations
-guide for deletion semantics under concurrent use.
+`_create` installs the optional `schema` (same shape as a `_schema` set)
+before the collection becomes visible. See
+[Collection lifecycle](operations.md#collection-lifecycle) for deletion
+semantics under concurrent use.
 
 ## Content types and framing
 
@@ -53,9 +51,8 @@ every JSON body of the request, errors and ingest acknowledgements included.
 Schema, collection list, and stats responses default to pretty; every other
 route defaults to compact. Indentation is two spaces but is not part of the
 contract. A pretty stream is sent as `application/json`, still chunked, with
-one pretty JSON text per batch separated by blank lines: it is for eyes, not
-for parsers expecting a single document, though `jq` reads the sequence
-directly. Pretty is ignored for `format=docs`, whether selected by URL or
+one pretty JSON text per batch separated by blank lines. It is not a single
+JSON document, though `jq` reads the sequence directly. Pretty is ignored for `format=docs`, whether selected by URL or
 body, which stays NDJSON.
 
 The server applies backpressure to streaming producers. It does not buffer an
@@ -70,12 +67,9 @@ array of numbers, a query can be a bare expression string, and
 fields also accept bare number arrays. The schema interprets a number array as
 one vector and an array of number arrays as a multi-valued vector list.
 
-Unknown JSON keys, unknown oneof arms, invalid enum names, excessive nesting,
-and wrong value shapes are request errors. A body typo is not ignored. URL
-query parameters are intentionally an open middleware channel: unknown
-parameters are currently accepted and ignored, while recognized parameters
-validate their lexical values (including `pretty`). Add `?explain=request` to
-a query to return the canonical effective request, including URL overlays,
+JSON bodies are validated strictly, with positions reported for typos. Unknown
+URL parameters are ignored, allowing middleware metadata. Add `?explain=request`
+to a query to return the canonical effective request, including URL overlays,
 without executing it; posting the result back has the same semantics.
 
 The HTTP path collection is authoritative. Canonical echo may show it as
@@ -88,24 +82,41 @@ request, including URL overlays, without acquiring readers or running semantic
 preparation. The entire response can be posted back as a request.
 
 `?explain=resolved` returns the request together with field-binding notes.
-Using the `names` collection from [Schema](schema.md#field-variants):
+Using the [author example](documents.md#field-variants):
 
 ```http
-POST /collections/names/_search?explain=resolved
+POST /collections/authors/_search?explain=resolved
 
-{"query":{"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}},"fields":["id"]}
+{
+  "query": {
+    "any_of": {
+      "field": "author_name",
+      "values": ["Neal Asher"]
+    }
+  },
+  "fields": ["id"]
+}
 ```
 
 ```json
 {
   "request": {
-    "collection": "names",
-    "ops": {"q":{"top_docs":{
-      "query":{"any_of":{"field":"author","values":["URSULA K. LE GUIN"]}},
-      "fields":["id"]
-    }}}
+    "collection": "authors",
+    "ops": {
+      "q": {
+        "top_docs": {
+          "query": {
+            "any_of": {
+              "field": "author_name",
+              "values": ["Neal Asher"]
+            }
+          },
+          "fields": ["id"]
+        }
+      }
+    }
   },
-  "resolved_fields": ["q: author -> author__s"]
+  "resolved_fields": ["q: author_name -> author_name__s"]
 }
 ```
 
@@ -116,26 +127,28 @@ not a serialized execution plan.
 
 Resolved explain runs ordinary search preparation: it acquires readers,
 respects freshness, validates semantics, and may do dictionary, weight, and
-cache work. It does not execute result collection or calculators. It therefore
-needs a usable collection and rejects errors such as a negative offset, which
-request echo can return unchanged. Projection errors that arise during document
-emission are not checked by this mode. Unknown explain modes are request errors.
+cache work. It requires a usable collection but does not execute result
+collection, calculators, or document emission, so it does not validate
+retrieval fully.
 
 ## Errors
 
 Every failure has one shape, wherever it appears:
 
 ```json
-{"request_id": "q7", "error": {"kind": "invalid_request", "code": "unknown_field", "message": "Field not found: titel"}}
+{
+  "request_id": "q7",
+  "error": {
+    "kind": "invalid_request",
+    "code": "unknown_field",
+    "message": "Field not found: titel"
+  }
+}
 ```
 
-`kind` is the coarse class. It fixes the HTTP status and tells a client
-whether to fix the request, the target, or retry, even for a `code` it has
-never seen. `code` is the stable machine key; new codes appear under existing
-kinds without changing the shape. `message` is human detail whose wording is
-not part of the contract. `request_id` is echoed whenever the request carried
-one, in the body or as a `?request_id=` URL parameter, and is omitted
-otherwise.
+`kind` classifies the failure and determines its HTTP status. `code` is the
+stable machine key; `message` is human-readable detail. `request_id` is echoed
+when supplied in the body or as a URL parameter.
 
 | `kind` | HTTP status | Meaning |
 |---|---|---|
@@ -147,19 +160,8 @@ otherwise.
 | `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
 | `internal` | 500 | A server-side failure the request did not cause. |
 
-Codes today: `invalid_request`, `invalid_json`, `invalid_schema`,
-`invalid_collection_name`, `invalid_field_name`, `invalid_field`, `invalid_value`, `unknown_field`,
-`invalid_expression`, `method_not_allowed`, `request_too_large`,
-`request_memory_exceeded`, `not_found`, `collection_not_found`,
-`collection_unavailable`, `collection_exists`, `read_only`, `writer_closed`,
-and `internal`. A failure that no more specific code describes carries its
-kind's name as the code.
-
-A failure detected before a request is submitted (malformed JSON, a bad URL
-parameter, an unknown or invalid collection name, a wrong method) is answered
-with the kind's HTTP status and this body. Method handling is uniform: every
-known path answers a wrong method with `405` and an `Allow` header, and only
-an unknown path is `404`.
+A failure detected before submission returns the kind's HTTP status and this
+body. A wrong method on a known path returns `405` with an `Allow` header.
 
 Once a chunked response has begun, its HTTP status cannot change, so a search
 that fails after submission arrives with HTTP 200 as the final NDJSON line in

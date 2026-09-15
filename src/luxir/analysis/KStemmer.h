@@ -10,9 +10,10 @@
 
 namespace luxir {
 
-// Lucene's dictionary-based Krovetz English stemmer. Input must already be
-// lowercase ASCII; plain stemming passes through other tokens and lengths
-// outside [3, 49]. Optional possessive removal applies before those limits.
+// Dictionary-based Krovetz English stemmer, ported from Apache Lucene.
+// Input must already be lowercase ASCII. Plain stemming passes through other
+// tokens and lengths outside [3, 49]. Optional possessive removal applies
+// before those limits.
 // Each instance owns scratch space and is not thread-safe. The dictionary is
 // immutable and shared by all instances. No per-token allocations.
 class KStemmer {

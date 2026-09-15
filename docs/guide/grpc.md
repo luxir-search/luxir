@@ -12,6 +12,9 @@ are the source of truth:
 Both files use the `luxir` package, so services and their request and response
 types share one namespace (for example, `luxir.SearchRequest`).
 
+For how `SearchRequest`, `SearchOp`, and `Query` fit together, see
+[Queries and search operations](searching.md#queries-and-search-operations).
+
 The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 `9400`. Override it with `--server.grpc.port`.
 
@@ -76,13 +79,11 @@ One request contains:
   pool - `1` for serial, `-1` for unlimited. `0` (the default) lets the
   engine decide; today that runs the request serially, inline on the
   completion-queue thread that received it (no scheduler handoff; occupies
-  that thread for the request's duration). Larger values are reserved and
-  rejected.
+  that thread for the request's duration). Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line
-`response_format=docs`; gRPC messages are already framed, and setting that
-format is rejected.
+`response_format=docs`; gRPC messages are already framed.
 
 Returned documents default to `DocFormat.COLUMNS`. `DocList.row_count` is the
 authoritative number of rows. Each requested dense column has that many slots
@@ -110,8 +111,7 @@ A unary method fails with a gRPC status whose code follows the error's
 The status message is the human detail, and the status details
 (`grpc-status-details-bin`) carry a `google.rpc.Status` whose single detail is
 the `luxir.Error` message, so a generated client reads the stable `code`
-and `kind` without parsing text. A request that does not decode as its
-method's message is `INVALID_ARGUMENT`.
+and `kind` without parsing text.
 
 Streaming methods report a failure of an accepted request in-band with the
 same `Error` message: `SearchResponse.error` (the response then carries no
@@ -128,15 +128,14 @@ table.
 
 ## HTTP JSON versus protobuf values
 
-The HTTP surface is a deliberate JSON dialect over the protobuf model: a
+The HTTP JSON accepts shorthands that the protobuf messages do not: a
 `Val` is an untagged JSON value, match queries accept field-name sugar, a bare
 query string means `expr`, and a root object can stand for one `top_docs`
 operation. Generated gRPC clients use the protobuf messages directly, so they
 set the relevant oneof fields and maps rather than those JSON conveniences.
 
-The semantics still line up. `?explain=request` on HTTP is useful for seeing
-which canonical request message a shorthand becomes before translating that
-shape into generated-client calls.
+`?explain=request` on HTTP shows the canonical request message a shorthand
+becomes, which is the message a generated client should build.
 
 ## Transport and deployment boundary
 

@@ -1,13 +1,15 @@
 # Operating Luxir
 
-Luxir currently has a deliberately narrow deployment model: one process uses
-one machine well and can host many isolated collections. Scale the machine for
-capacity. Replication, sharding across nodes, failover orchestration, snapshots,
-and a collection-management API are not built into the server yet.
+Luxir runs as one process on one machine and hosts many isolated
+collections. Capacity comes from the size of that machine.
+Replication, sharding across nodes, failover orchestration, and snapshots are
+not built into the server yet; the
+[production boundary](#current-production-boundary) at the end of this page
+lists what is missing.
 
-That boundary matters more than a long tuning checklist. The defaults are good
-for evaluation; persistence and network isolation are the two settings to make
-explicit before keeping real data.
+The defaults are good for evaluation. Before you keep real data, decide on
+persistence and network isolation. The other settings on this page can stay
+at their defaults until you have a reason to change them.
 
 ## Persistent storage
 
@@ -43,19 +45,17 @@ luxir --store.backend=fs --store.data-dir=/srv/luxir/data \
 ```
 
 Valid modes are `off`, `warn`, and `throw`. `throw` turns a failed durability
-check into an operation failure; use it deliberately rather than discovering a
-filesystem incompatibility under load.
+check into an operation failure.
 
 There is no online snapshot API. For a conservative current backup procedure,
 stop writes, publish a commit, stop the process, and copy the data directory as
-a unit. Do not infer a supported live-backup protocol merely from immutable
-segment files: the metadata and files still need one consistent capture point.
+a unit. Immutable segment files alone do not make a live copy safe: the
+metadata and files still need one consistent capture point.
 
 ## Read-only nodes
 
-A data directory has exactly one writer. The owning process takes `write.lock`
-under the data directory at startup and holds it until exit, so a second writer
-against the same directory fails to start rather than corrupting the index.
+A data directory has exactly one writer, which holds `write.lock` from startup
+until exit.
 
 `--read-only` opens an existing data directory without that lock:
 
@@ -63,17 +63,11 @@ against the same directory fails to start rather than corrupting the index.
 luxir --read-only --store.backend=fs --store.data-dir=/srv/luxir/data
 ```
 
-A read-only node writes nothing at all - no lock file, no trash directory, not
-even the data directory itself, which must already exist. It serves searches,
-schema reads, and `_stats`. Every mutation is refused: updates, NDJSON streams,
-schema writes, and collection create/delete return HTTP `403` (gRPC
-`FAILED_PRECONDITION`) with error code `read_only`, and collections are never
-auto-created. The refusal is
-enforced twice - once at request dispatch for a clean error, and again at the
-storage layer, which rejects any write regardless of the path that reached it.
+A read-only node requires an existing data directory and writes no files.
+It serves searches, schema reads, and `_stats`.
 
 Use it to query a directory another instance is writing, or to inspect one
-offline without risking a stray write. Three current limitations matter:
+offline without risking a stray write. Current limitations:
 
 - **The view does not advance.** A read-only node pins its index view the first
   time it serves a query and never reopens, so commits the writer publishes
@@ -99,12 +93,9 @@ per-collection detail.
 
 Deletion is synchronous and wins over concurrent use. When the call returns,
 the name resolves to nothing, the on-disk data is gone, and the name can be
-recreated as a fresh empty collection. Requests racing the deletion fail
-cleanly per request: an update batch or NDJSON stream that arrives after
-deletion starts receives an `unavailable` error (HTTP `503`, code
-`collection_unavailable`), as does a search that resolves the collection after
-that point. A search already executing is unaffected - it
-holds its index view for the whole request and completes with correct results.
+recreated as a fresh empty collection. New requests receive
+`collection_unavailable` while deletion is in progress. Searches already
+executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
@@ -118,7 +109,8 @@ its broken on-disk state.
 
 ## Visibility policy
 
-Commits are the freshness boundary. An immediate `"commit": {}` waits until a
+Updates become visible to searches at commit. An
+immediate `"commit": {}` waits until a
 new index view is published. `commit_within_ms` can coalesce publication and
 return before the update is visible while still bounding staleness.
 
@@ -129,7 +121,7 @@ latest commit. Decide these together:
   commit.
 - Sustained feeds should use a positive commit interval rather than publishing
   a new view for every small update.
-- Exact publication latency is a workload choice; forced merging is not.
+- Forced merges are a maintenance action, not part of a routine commit.
 
 `max_segments` and `wait_for_merges` are explicit maintenance controls. A
 normal commit lets background merging choose the layout while ingest and search
@@ -149,14 +141,9 @@ yet. Disable HTTP with `--no-http`. The gRPC server always starts.
 
 Luxir does **not** provide TLS, authentication, authorization, per-tenant
 quotas, or a permission model. Do not expose either port directly to an
-untrusted network. Bindings currently make network policy mandatory: place the
+untrusted network. Network policy is mandatory: place the
 process in a private network namespace, firewall both ports, or front them with
 an authenticated TLS proxy/service mesh.
-
-The public parser is still treated as hostile input: unknown JSON keys are
-errors, request/record sizes are bounded, parser nesting is limited, and
-streaming output is backpressured. Those are robustness properties, not a
-substitute for an identity and authorization layer.
 
 ## Health and logging
 
@@ -230,8 +217,8 @@ luxir --server.http.threads=8 --server.grpc.threads=8
 count; each shard owns one `io_context` and one runner. Connections are
 assigned round-robin at accept and remain pinned to their shard. These and the
 Search requests default to serial execution directly on the transport thread
-that received them (an HTTP io shard or gRPC completion-queue thread): no
-scheduler handoff, no idle-worker wakeups, at the cost of occupying that
+that received them (an HTTP io shard or gRPC completion-queue thread). This
+avoids a scheduler handoff and idle-worker wakeups but occupies that
 connection's thread for the query's duration. The request-level `max_parallel`
 moves a request onto the shared work-stealing scheduler instead: `1` runs it
 serially there (use this for requests expected to be expensive, so they do not
@@ -275,8 +262,9 @@ luxir \
   largest idle inverter. It defaults to half of `--max-ram-mb`, and to none at
   all on a `--read-only` node, which never indexes. `0` leaves it unlimited.
 - `indexing.max-inverter-ram-mb` flushes one inverter to a segment when it grows
-  past that size, checked at the end of an update batch. Total indexing RAM is
-  `indexing.max-ram-mb`'s job, so this cap defaults to that shared cap: one
+  past that size, checked at the end of an update batch. Total indexing RAM
+  is bounded by `indexing.max-ram-mb`, so this cap defaults to it:
+  one
   inverter may hold the whole indexing budget (with a single stream there is
   nothing else holding it) but no more. It is clamped to 3814 MiB - an inverter's
   memory pool can address at most 4 GiB, and the clamp leaves headroom for one
@@ -293,7 +281,8 @@ luxir \
   --indexing.max-request-body=32MB \
   --indexing.max-record=32MB \
   --indexing.stream-batch-size=1MB \
-  --indexing.stream-batch-docs=10000
+  --indexing.stream-batch-docs=10000 \
+  --indexing.max-inflight-batches=0
 ```
 
 - `max-request-body` caps buffered JSON requests and atomic NDJSON groups.
@@ -301,10 +290,28 @@ luxir \
   memory without bound. It inherits `max-request-body` when unset.
 - `stream-batch-size` and `stream-batch-docs` are internal handoff thresholds,
   not limits on the number of documents in one HTTP stream.
+- `max-inflight-batches` bounds the number of internal batches one connection
+  can submit concurrently. `0` (the default) uses task-arena concurrency plus
+  two; `1` makes batch submission serial. Reads pause when the limit is
+  reached and resume as batches complete. A larger limit uses more staging
+  memory.
 
-A single NDJSON connection does not yet fan several internal batches into the
-index concurrently. Several producer streams are currently required to drive
-maximum ingest throughput on a many-core machine.
+Search has its own limits:
+
+```bash
+luxir \
+  --search.request-memory-max-bytes=0 \
+  --search.max-op-depth=8 \
+  --query-cache-bytes=64MB
+```
+
+- `search.request-memory-max-bytes` is a per-request breaker for query memory
+  such as facet aggregate state; `0` (the default) is unlimited.
+- `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
+  disables it). Cached filters are evicted by rebuild cost per byte, so under
+  pressure the cache keeps expensive compound filters and drops cheap ones
+  first. Cache counters appear in `_stats`.
 
 ## Time-zone data
 
@@ -336,11 +343,11 @@ features it does not yet supply:
 
 - single node, with no replication or distributed query execution;
 - no built-in TLS/authentication/authorization;
-- no online snapshot, restore, list, create, or delete collection APIs;
+- no online snapshot or restore API;
 - no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 
-These are product boundaries, not hidden deployment modes. The engine already
-has the pieces that should remain stable as those layers arrive: immutable
-commits, isolated collections, transport-independent request messages, and a
-node-wide scheduler/memory model.
+None of these can be enabled by configuration. The pieces those layers will
+build on are already in place: immutable commits, isolated collections,
+transport-independent request messages, and a node-wide scheduler and memory
+model.

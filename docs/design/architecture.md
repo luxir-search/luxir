@@ -8,27 +8,23 @@ For a class-by-class map of the source tree, see
 
 ## Design goals
 
-Luxir started from a premise about cloud economics: compute is no longer a
-sunk cost. You pay for inefficiency every month, forever - and instance
-pricing is linear up to very large machines, so one big node is now the
-economical unit of capacity that clusters of small machines once were. Both
-facts reward deep engineering investment in a single efficient process that
-can use an entire modern machine.
+Luxir starts from the economics of cloud compute. Inefficiency is a
+recurring cost rather than a one-time hardware purchase, and instance pricing
+is roughly linear up to very large machines, so one big node is now as
+economical a unit of capacity as a cluster of small ones. Both facts favor a
+single efficient process that can use an entire modern machine.
 
 - **Built for modern hardware.** Many cores, large memories, fast NVMe, and
-  SIMD are assumptions, not afterthoughts: work-stealing parallelism
-  throughout, memory-mapped immutable data, vectorized codecs, and
-  allocation discipline on every hot path.
+  SIMD are baseline assumptions: work-stealing parallelism throughout,
+  memory-mapped immutable data, vectorized codecs, and allocation discipline
+  on every hot path.
 - **Scales up before it scales out.** One process is designed around large
   machines, many cores, and a memory-mapped address space, with no managed-heap
-  ceiling or per-node coordination tax. Maximum validated machine size and
-  workload-specific throughput are not yet published claims.
-  Capacity comes from scaling up first. Replication and scale-to-zero are
-  separate future layers rather than reasons to shard first; neither is
-  shipped in the current single-node server.
-- **One engine, one algebra.** Lexical queries, vector similarity, filters,
-  facets, statistics, and fusion are nodes in one request tree. A result page
-  with ranking and analytics is one request and one round trip.
+  ceiling or per-node coordination tax. Replication and scale-to-zero are
+  separate future layers rather than reasons to shard first.
+- **One request tree.** Lexical queries, vector similarity, filters, facets,
+  statistics, and fusion are nodes in one request tree. A result page with
+  ranking and analytics is one request and one round trip.
 - **Frugal with memory.** Native code with no garbage collector, arenas and
   pools instead of general-purpose allocation on hot paths, and an index
   served from memory-mapped files.
@@ -39,15 +35,15 @@ Documents live in **collections**. A collection is stored as a **shard**
 holding one index; an index is a set of **immutable segments** plus a small
 metadata file naming the current commit point.
 
-Immutability is the load-bearing decision:
+Most of what follows depends on segments being immutable:
 
 - Writers never modify what readers are using. A search pins a consistent
   snapshot for its whole lifetime; new commits swap in atomically without
   pausing queries.
-- Crash safety is structural: files are written to a temporary name, synced,
-  and atomically renamed, and a commit point is published only after the
-  files it names are durable. A crash lands on the previous commit, never in
-  between.
+- Crash safety comes from the write protocol: files are written to a
+  temporary name, synced, and atomically renamed, and a commit point is
+  published only after the files it names are durable. After a crash the
+  index reopens at the previous commit.
 - Compaction is concurrent merging: merges produce new segments in the
   background and never stall ingest or search.
 
@@ -59,14 +55,14 @@ All parallelism runs on a work-stealing task scheduler, which keeps
 every core busy even when work is skewed.
 
 - **Search** parallelizes across segments (and within segments) and
-  across the independent ops of
+  across the independent operations in
   a request; cores that finish small segments steal work from large ones.
 - **Indexing** is a flow-graph pipeline: document processing, inversion,
   segment flushing, merging, and commit sequencing are independent stages.
   Ingest never waits behind a merge, and a commit does not stop the world.
-  Independent updates are automatically parallelized. The HTTP NDJSON path
-  currently allows one internal batch in flight per connection, so several
-  producer streams are needed to saturate a many-core host.
+  Independent updates are automatically parallelized. A single HTTP NDJSON
+  connection submits multiple internal batches for concurrent indexing, with
+  a bounded number in flight and backpressure when that limit is reached.
 - **Merging** parallelizes inside a single merge, not just across merges:
   every field merges as its own task, because the segment format does not
   tie index structures to specific files - concurrent tasks write their own
@@ -129,10 +125,11 @@ from memory, a cold one faults in on demand.
 
 A request is a tree of named **ops** - top-docs, facets, statistics, and
 fusion - over a query tree. Top-docs can own facets and statistics over their
-complete match domain; string/ID facets can own per-bucket metrics and nested
-string/ID facets; fusion consumes ranked top-docs sources. One request
-describes the whole page you want to render; the engine executes its named
-operations in parallel over the same index view.
+complete match domain; facets can own per-bucket metrics, nested facets, and a
+ranked document list per bucket; fusion consumes ranked top-docs sources and
+can carry facets over the fused set. One request describes the whole page you
+want to render; the engine executes its named operations in parallel over the
+same index view.
 
 Execution profiling follows that tree rather than wrapping the engine in a
 black-box timer. Instrumented operations emit per-segment strategy, selection
@@ -144,15 +141,22 @@ Execution adapts to what the request actually consumes. A top-k request
 that does not ask for an exact total runs with block-max pruning: postings
 carry per-block score upper bounds, and a MaxScore-based scorer skips
 blocks and documents that cannot reach the current top k. A request that
-consumes an exact count runs exhaustively, because that is the only honest
-way to count. The choice is per-request and follows from the contract, not
-from a hidden accuracy knob.
+consumes an exact count runs exhaustively, because an exact count requires
+it. The choice is made per request from what the request asks for; there is
+no separate accuracy setting.
 
 Vector search composes the same way. A kNN query is just a query, with a
 scorer that participates in the boolean tree like any term. Filters apply
 inside the vector search rather than as a post-pass over a fixed unfiltered
 top-k, and hybrid ranking combines lexical and vector evidence in a single
 request.
+
+Filters are cached per collection as document sets. Entries are ranked by
+how expensive they are to rebuild per byte, so under pressure a cheap
+single-term filter is evicted before a compound boolean or a kNN membership
+set. Cached sets are consumed in
+bulk windows, which is faster than re-decoding postings even for a filter that
+is a single term.
 
 ## Vector search, natively integrated
 
@@ -161,22 +165,21 @@ approximate search uses per-segment ANN indexes (currently IVF+PQ) built as
 segment overlays, which follow the segment lifecycle and are served
 zero-copy from memory-mapped files like everything else. Approximate
 candidates are rescored at full precision. Because the ANN index is part of
-the segment, there is no second system to keep in sync with your documents:
-deletes, updates, and merges apply to vectors the same way they apply to
-text.
+the segment, there is no separate vector store to keep in sync with your
+documents: deletes, updates, and merges apply to vectors the same way they
+apply to text.
 
 See [vector-search.md](vector-search.md) for the overlay internals and
 [../guide/vector-search.md](../guide/vector-search.md) for the user
 contract.
 
-## API surfaces from one source of truth
+## API surfaces
 
 The engine speaks gRPC and JSON over HTTP. Both share the protobuf message
-vocabulary and semantic model, while HTTP deliberately applies its own public
-JSON dialect. That dialect is human-writable and template-friendly,
-snake_case throughout, uses untagged values, and reports unknown keys with
-positions so typos are caught instead of ignored. Not every protobuf value has
-an HTTP spelling yet; vector document values are the notable current gap.
-Shorthand request forms echo back as their canonical structured equivalents
-(`?explain=request`), so the API teaches the API. Ingest streams over gRPC or
-HTTP (NDJSON).
+vocabulary and semantic model, while HTTP applies its own public JSON dialect
+designed to be written by hand. Requests are structured; wherever a request
+takes a query, the query can also be written in the Luxir query language,
+and both forms build the same tree. Unknown keys are reported with positions,
+so a typo is an error rather than silently ignored, and `?explain=request`
+echoes the canonical structured form of whatever was sent. Ingest streams
+over gRPC or HTTP (NDJSON).

@@ -1,21 +1,16 @@
 # Indexing
 
-Luxir has one update model with two HTTP encodings. Use a JSON request when a
-group of documents is naturally bounded or must be atomic. Use NDJSON for a
-feed or file of any size. The latter is a real stream: documents enter the
-indexing pipeline while later bytes are still arriving, so a client does not
-have to invent a user-visible bulk size.
+Send documents in a JSON request, or stream them as NDJSON. A JSON request is
+useful for a batch of documents, including a batch that must be atomic. An
+NDJSON stream can carry a feed or a file of any size: documents are indexed
+as the bytes arrive, with no bulk size to choose and no stream-size limit.
+Either way, a write to a collection that does not exist yet creates it.
 
 Both forms use:
 
 ```
 POST /collections/{collection}/_update
 ```
-
-A write to a missing collection creates it by default. Collection names are a
-single path component and names beginning with `_` are reserved. Disable
-automatic creation with `--no-indexing.auto-create-collection` when collection
-names must be provisioned elsewhere.
 
 ## JSON updates
 
@@ -38,10 +33,16 @@ Content-Type: application/json
 ```
 
 ```json
-{"request_id":"load-42","update_version":1,"status":"ok","ids":["b1","b2"]}
+{
+  "request_id": "load-42",
+  "update_version": 1,
+  "status": "ok",
+  "ids": ["b1", "b2"]
+}
 ```
 
-The request fields are:
+One request can add documents, delete by id, and commit. The request fields
+are:
 
 | Field | Meaning |
 |---|---|
@@ -55,72 +56,128 @@ The request fields are:
 | `field_map` | Rename input document keys onto schema fields for this request. |
 | `drop_unmapped` | Drop doc keys not present in `field_map` instead of indexing them. |
 
-Send row maps through `docs`. See [gRPC API](grpc.md).
+Built-in field templates give `title_t` its text type and `year_i` its integer
+type. You can also define fields explicitly or add templates for new groups
+of fields; see [Documents and values](documents.md#field-templates-types-from-field-names).
+Over gRPC the same request is `Indexer.Update` with row maps in `docs`; see
+the [gRPC API](grpc.md).
 
-## Field mapping
+## Unbounded NDJSON ingest
 
-`field_map` reshapes a foreign document stream at ingest, so an existing NDJSON
-dump indexes as-is: no editing the file, no schema change. Point Luxir at the
-file and put the mapping on the URL:
+Set `Content-Type: application/x-ndjson` and put one document on each line:
+
+```http
+POST /collections/books/_update
+Content-Type: application/x-ndjson
+
+{"id":"b1","title_t":"Dune","year_i":1965}
+{"id":"b2","title_t":"Dune Messiah","year_i":1969}
+{"_end_":{"commit":{}}}
+```
+
+```json
+{"update_version":2,"status":"ok"}
+```
+
+There is no stream-size limit. Luxir frames records as bytes arrive and
+splits ordinary input into internal batches, so a client does not choose a
+bulk size or hold a batch in memory. Size limits apply to a single record and
+to an `all_or_none` group, not to the stream.
+
+A single connection can have several internal batches indexing concurrently.
+The server pauses reading when the limit on batches in flight is reached and
+resumes as batches complete, keeping buffering bounded as the stream grows.
+
+To send a file you already have, let `curl` stream it without reinterpreting
+newlines:
 
 ```bash
-curl -X POST 'http://localhost:9400/collections/books/_update?field_map=bookId:id,headline:title_t&drop_unmapped=true&commit=true' \
+curl -X POST 'http://localhost:9400/collections/books/_update?commit=true' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @books.ndjson
 ```
 
-Each `from:to` entry indexes input key `from` under schema field `to`. The last
-`:` in an entry splits it, so input keys may contain colons; an empty target
-(`internal_notes:`) drops that key. The parameter repeats
-(`?field_map=a:b&field_map=c:d`) if one value gets long; input keys containing
-commas need the body form below. `drop_unmapped=true` drops every key not in
-the map, so only the mapped keys index -- note that includes `id`, so map your
-id key explicitly (`id:id` if the input already uses that name).
+### Stream grammar
 
-Keys not in the map index under their own name by default. After mapping, a
-name appearing more than once in a document keeps the last occurrence, the same
-last-wins rule as a duplicated key. Mapping applies to top-level keys of each
-document; it does not flatten nested objects.
+Three record forms make up a stream:
 
-Targets must be logical field names. A variant selector (`author__s`), primary
-selector (`author__self`), or abstract template name is an invalid target and
-fails the request. An external key containing `__` can be renamed or dropped;
-only the final non-dropped document keys must obey the logical naming rule.
-Each surviving key fans out once through its schema variants.
+- A normal JSON object is a document.
+- `{"_update_": {...}}` opens a group and supplies normal update options such
+  as `request_id`, `allow_dups`, `all_or_none`, `return_ids`, `field_map`,
+  `drop_unmapped`, or a collection override.
+- `{"_end_": {...}}` closes the group and may commit. An empty object is a
+  checkpoint that closes and reports the current group without ending the
+  HTTP stream.
 
-The same two knobs are fields of the update request itself (and of a streaming
-`_update_` control object, where they apply to that group's documents):
+Options do not leak from one group into the next. For example, two
+independently reported groups followed by one commit:
 
 ```http
 POST /collections/books/_update
-Content-Type: application/json
+Content-Type: application/x-ndjson
 
-{
-  "docs": [{"bookId": "b1", "headline": "Dune"}],
-  "field_map": {"bookId": "id", "headline": "title_t"},
-  "drop_unmapped": true,
-  "commit": {}
-}
+{"_update_":{"request_id":"fiction","return_ids":true}}
+{"id":"b1","kind_s":"fiction","title_t":"Dune"}
+{}
+{"_update_":{"request_id":"nonfiction"}}
+{"id":"b2","kind_s":"nonfiction","title_t":"The Making of the Atomic Bomb"}
+{"_end_":{"commit":{}}}
 ```
 
-A request or group that sets either knob owns both, and the URL default is
-ignored for it; otherwise the URL values apply. The mapping is a property of
-the load, not the collection: the same dump can be re-shaped differently per
-request.
-
-For the `names` collection from [Schema](schema.md#field-variants):
-
-```http
-POST /collections/names/_update
-
-{
-  "docs": [{"bookId":"mapped","external__author":"Octavia Butler","discard__key":"ignored"}],
-  "field_map": {"bookId":"id","external__author":"author","discard__key":""},
-  "commit": {}
-}
+```jsonl
+{"request_id":"fiction","update_version":3,"status":"ok","ids":["b1"]}
+{"request_id":"nonfiction","update_version":4,"status":"ok"}
 ```
 
-This supplies `author` once and populates both `author` and `author__s`.
+The response is NDJSON too, one update response per completed group. The URL
+collection is the default; a control object can set
+`"collection":"archive"` for the following group, so one connection can feed
+several collections.
+
+A stream may retain only the first 100 returned IDs and errors for a group;
+indexing and `total_errors` are not capped by that reporting bound. A
+request-level failure ends the stream: its response line carries
+`status: "error"` and the `error` object alongside whatever the group had
+already reported, and no later records from that connection are accepted.
+
+The document-per-line [search export](searching.md#stream-every-match) uses
+this same framing, and its `_header_` records are recognized and skipped, so
+an export pipes straight back into `_update`. Export logical field names for
+ingestion: explicit variant selectors are not document keys, and a retrieved
+primary may have lost input that a variant needs, so a pipe is not a general
+replacement for reindexing from the producer's source.
+
+## Visibility and commits
+
+An accepted update is searchable once a commit publishes a new index view.
+Commit whichever way fits:
+
+- In a JSON update body: `"commit": {}`.
+- On the request URL, JSON or NDJSON: `POST /collections/main/_update?commit=true`.
+- At the end of a stream: `{"_end_": {"commit": {}}}`.
+- With no documents at all: `{"commit": {}}` as the whole body.
+
+An empty commit object commits immediately and the response waits for
+publication. `commit` may contain:
+
+| Field | Meaning |
+|---|---|
+| `commit_within_ms` | Publish within this many milliseconds. `0` is immediate; a positive value lets the update response return before publication. |
+| `build_aux_indexes` | Missing vector overlays to build, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. |
+| `wait_for_merges` | Wait for in-flight merges before publishing. |
+| `max_segments` | Force the committed data down to at most this many segments before returning. `0` means no forced merge. |
+
+On the HTTP path, `?commit=true` guarantees the request is published before
+it completes: a JSON body commits immediately (`commit_within_ms` is forced
+to `0`; its other commit options still apply), and an NDJSON stream commits
+at the end of the stream.
+
+Commits are crash-safe: segments are immutable and a commit point is
+published atomically, so a crash reopens the previous commit rather than a
+half-published view. Frequent forced merges are expensive; `max_segments` is
+an explicit maintenance action, not a normal ingest setting. See
+[Operating Luxir](operations.md#visibility-policy) for choosing a commit
+interval.
 
 ## IDs, overwrites, and deletes
 
@@ -140,92 +197,127 @@ POST /collections/books/_update
 {"delete_ids":["b1","b2"],"commit":{}}
 ```
 
-Delete-by-query and field-level partial updates are not implemented.
-
-## Visibility and commits
-
-An accepted update is not searchable until a commit publishes a new index
-view. An empty commit object commits immediately and the response waits for
-publication:
-
 ```json
-{"commit":{}}
+{"update_version":2,"status":"ok"}
 ```
 
-`commit` may contain:
+IDs over 255 bytes follow the field's
+[`long_terms` policy](schema.md#string-normalization-and-length); overwrite
+and delete apply the same transform as indexing, so a long ID still names
+one document.
 
-| Field | Meaning |
-|---|---|
-| `commit_within_ms` | Publish within this many milliseconds. `0` is immediate; a positive value lets the update response return before publication. |
-| `build_aux_indexes` | Missing vector overlays to build, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. |
-| `wait_for_merges` | Wait for in-flight merges before publishing. |
-| `max_segments` | Force the committed data down to at most this many segments before returning. `0` means no forced merge. |
+## Field mapping
 
-Commit without adding documents by sending `{"commit":{}}`. On the HTTP
-path, `?commit=true` guarantees the request is published before it
-completes: a JSON body commits immediately (`commit_within_ms` is forced to
-`0`; its other commit options still apply), and an NDJSON stream commits at
-the end of the stream. Frequent forced merges are expensive; `max_segments`
-is an explicit maintenance action, not a normal ingest setting.
+`field_map` renames input keys at ingest, so an existing NDJSON dump can be
+indexed without rewriting the file or changing the schema. Put the mapping on
+the URL:
 
-Each update message uses the schema pinned at admission. After the schema call
-returns, newly admitted messages use its definitions; already admitted work
-keeps its original schema. A long NDJSON stream can span several messages and
-schema generations.
+```bash
+curl -X POST 'http://localhost:9400/collections/books/_update?field_map=bookId:id,headline:title_t&drop_unmapped=true&commit=true' \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @books.ndjson
+```
 
-Adding a variant does not backfill earlier documents, and merging does not
-create missing representations. Reindex the producer's input to populate them.
-The [resolved schema view](schema.md#resolved-view) reports conservative
-coverage; [live schema edits](schema.md#changes-on-a-live-collection) do not
-validate existing segments against redefinitions. Use a new field or variant
-label and reindex to change a representation safely.
+Each `from:to` entry indexes input key `from` under schema field `to`. The
+last `:` in an entry splits it, so input keys may contain colons; an empty
+target (`internal_notes:`) drops that key. The parameter repeats
+(`?field_map=a:b&field_map=c:d`) if one value gets long; input keys
+containing commas need the body form below. `drop_unmapped=true` drops every
+key not in the map, so only the mapped keys index. That includes `id`, so map
+your id key explicitly (`id:id` if the input already uses that name).
+
+Keys not in the map index under their own name by default. After mapping, a
+name appearing more than once in a document keeps the last occurrence, the
+same last-wins rule as a duplicated key. Mapping applies to top-level keys of
+each document; it does not flatten nested objects.
+
+The same two knobs are fields of the update request itself (and of a
+streaming `_update_` control object, where they apply to that group's
+documents):
+
+```http
+POST /collections/books/_update
+
+{
+  "docs": [{"bookId": "b1", "headline": "Dune"}],
+  "field_map": {"bookId": "id", "headline": "title_t"},
+  "drop_unmapped": true,
+  "commit": {}
+}
+```
+
+If a request or group sets either `field_map` or `drop_unmapped`, the URL
+values for both are ignored for it; otherwise the URL values apply. The
+mapping is per request and is not stored with the collection, so the same
+dump can be mapped differently on each load.
+
+Targets are logical field names, such as `author_name`, rather than variant
+selectors or template names. External keys containing `__` can be renamed or
+dropped before indexing. Each surviving key fans out once through its schema
+[variants](schema.md#field-variants). Using the `authors` collection from
+[Documents and values](documents.md#field-variants):
+
+```http
+POST /collections/authors/_update
+
+{
+  "docs": [
+    {
+      "bookId": "mapped",
+      "external__author": "Octavia Butler",
+      "discard__key": "ignored"
+    }
+  ],
+  "field_map": {
+    "bookId": "id",
+    "external__author": "author_name",
+    "discard__key": ""
+  },
+  "commit": {}
+}
+```
+
+This supplies `author_name` once and populates both `author_name` and
+`author_name__s`.
 
 ## Per-document failures
 
-Unless `all_or_none` is set, document validation failures do not poison their
-neighbors. A failed document has no effect and an older version with the same
-ID remains intact:
+Unless `all_or_none` is set, valid documents are indexed even if others fail.
+A failed document leaves any older version with the same ID intact:
 
 ```json
 {
   "update_version": 9,
   "status": "partial",
   "errors": [
-    {"id": "b2", "index": 1, "error": {"kind": "invalid_request", "code": "unknown_field", "message": "..."}}
+    {
+      "id": "b2",
+      "index": 1,
+      "error": {
+        "kind": "invalid_request",
+        "code": "unknown_field",
+        "message": "Field not found: nosuffix"
+      }
+    }
   ],
   "total_errors": 1
 }
 ```
 
 Each entry names the document by `id` and by `index` in the request and
-carries the same `error` object every Luxir error uses: `kind`, a stable
-`code` (`invalid_value` for a value the field rejects, `unknown_field` for a
-field the schema does not define), and a human `message`. A document that an
-engine fault stopped is reported the same way with kind `internal`.
+carries the standard [error object](http-api.md#errors).
 `total_errors` counts every failed document; it exceeds the length of
 `errors` only when a transport retained a prefix of them.
 
-A value rejected by any variant fails the entire document. The message names
-the logical field, branch label (`self` for the primary), and cause. For example,
-if the author example's `s` variant sets `long_terms: "reject"`, a 256-byte
-normalized string fails branch `s` even if the TEXT primary accepted it.
-The default `long_terms` changed from `truncate` to `hash128`: indexed STRING
-values, analyzed TEXT tokens, and IDs over 255 bytes become a UTF-8-safe prefix
-of at most 230 bytes plus 25 base36 hash characters. Shorter terms stay
-unchanged. `truncate` restores shared-prefix merges; `reject` fails the document.
-Policy edits do not validate or rewrite existing terms. Hashing is not
-attack-resistant; sorts preserve source order only up to the prefix, and longer prefix queries
-return a superset. Stored source keeps full bytes; column-only strings stay
-unlimited. See [term-space limits](documents.md#ids-and-replacement).
+A value rejected by any [variant](schema.md#field-variants) fails the entire
+document.
 
 The response status is:
 
 - `ok`: every attempted change succeeded.
 - `partial`: some documents succeeded and some failed.
-- `error`: no document took effect, or a request-level failure occurred. A
-  request-level failure (a bad `field_map`, the commit pipeline, a closed
-  writer) also sets the top-level `error` object; per-document failures leave
-  it unset.
+- `error`: no document took effect, or a request-level failure occurred. Only
+  request-level failures set the top-level `error` object.
 
 With `all_or_none: true`, processing stops at the first bad document and rolls
 back documents and deletes already applied by that request. Atomicity covers
@@ -233,79 +325,15 @@ one update request or one explicit NDJSON group; it never spans independent
 requests.
 
 Always inspect the response body. Per-document failures are a valid HTTP
-exchange and therefore do not rely on the HTTP status code to express the
-update result.
+exchange, so the HTTP status code does not express the update result.
 
-## Unbounded NDJSON ingest
+## Atomic groups are bounded
 
-Set `Content-Type: application/x-ndjson` and put one document on each line:
-
-```http
-POST /collections/books/_update
-Content-Type: application/x-ndjson
-
-{"id":"b1","title_t":"Dune","year_i":1965}
-{"id":"b2","title_t":"Dune Messiah","year_i":1969}
-{"_end_":{"commit":{}}}
-```
-
-There is no stream-size limit. Luxir frames records as bytes arrive and cuts
-ordinary non-atomic input into internal mini-batches. The limits are on one
-record and on explicitly atomic material, not on the stream.
-
-Three record forms make up the stream grammar:
-
-- A normal JSON object is a document.
-- `{"_update_": {...}}` opens a group and supplies normal update options such
-  as `request_id`, `allow_dups`, `all_or_none`, `return_ids`, `field_map`,
-  `drop_unmapped`, or a collection override.
-- `{"_end_": {...}}` closes the group and may commit. An empty object is a
-  checkpoint that closes and reports the current group without ending the
-  HTTP stream.
-
-The URL collection is the default. A control object can set
-`"collection":"archive"` for the following group, which lets one
-connection feed several collections. Options do not leak from one group into
-the next.
-
-For example, two independently reported groups followed by one commit:
-
-```jsonl
-{"_update_":{"request_id":"fiction","return_ids":true}}
-{"id":"b1","kind_s":"fiction","title_t":"Dune"}
-{}
-{"_update_":{"request_id":"nonfiction"}}
-{"id":"b2","kind_s":"nonfiction","title_t":"The Making of the Atomic Bomb"}
-{"_end_":{"commit":{}}}
-```
-
-The response is NDJSON too, one update response per completed group. A stream
-may retain only the first 100 returned IDs and errors for a group; indexing
-and `total_errors` are not capped by that reporting bound. A request-level
-failure ends the stream: its response line carries `status: "error"` and the
-`error` object alongside whatever the group had already reported, and no later
-records from that connection are accepted.
-
-To send an existing file without letting `curl` reinterpret newlines:
-
-```bash
-curl -X POST http://localhost:9400/collections/books/_update \
-  -H 'Content-Type: application/x-ndjson' \
-  --data-binary @books.ndjson
-```
-
-The document-per-line [search export](searching.md#stream-every-match) uses this
-input framing. Its `_header_` records are recognized and skipped. Export logical
-field names for ingestion: explicit variant selectors are not document keys.
-Retrieved primaries may have lost lexical input needed by variants, so a pipe
-is not a general replacement for reindexing from the producer's source.
-
-## Atomic streams are deliberately bounded
-
-An unbounded stream and all-or-none atomicity cannot both be promised: rollback
-requires retaining the atomic unit. An NDJSON group with `all_or_none: true` is
-therefore accumulated as one bounded request and is subject to
-`--indexing.max-request-body`. Ordinary streaming groups remain unbounded.
+Rollback requires retaining the whole atomic unit, so an atomic group cannot
+be unbounded. An NDJSON group with
+`all_or_none: true` is therefore accumulated as one bounded request and is
+subject to `--indexing.max-request-body`. Ordinary streaming groups remain
+unbounded.
 
 The relevant server controls are:
 
@@ -313,10 +341,15 @@ The relevant server controls are:
   (default `32MB`).
 - `--indexing.max-record` for one NDJSON record (defaults to the buffered-body
   limit).
-- `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for internal
-  non-atomic handoff granularity.
+- `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for
+  internal non-atomic handoff granularity.
+- `--indexing.max-inflight-batches` for the number of internal batches a
+  connection can submit concurrently (`0` selects an automatic limit based
+  on task-arena concurrency; `1` makes batch submission serial).
 
-At present a single HTTP NDJSON connection pipelines storage and indexing but
-does not fan several internal batches into the engine concurrently. Use
-several input streams when maximum ingest throughput matters. This is a
-throughput detail, not a size limit or a client-visible batch contract.
+## Limits
+
+- Delete-by-query and field-level partial updates are not implemented.
+- Each admitted update message pins the schema in force at admission, and a
+  schema change never rewrites or backfills existing documents; see
+  [changes to a live collection](schema.md#changes-to-a-live-collection).

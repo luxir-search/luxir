@@ -142,13 +142,12 @@ same query.
 
 ## What This Means for Users
 
-- Bulk ANN index data is never forced into process RAM: residency is managed
-  by the OS page cache, so memory use stays predictable and indexes larger
-  than RAM degrade gracefully instead of failing.
+- Bulk ANN index data is paged by the OS rather than loaded into process
+  RAM, so indexes larger than RAM still work.
 - Because the column is the source of truth, ANN indexes can be rebuilt or
   retuned per segment without reindexing any documents.
-- Small segments are served exactly rather than through a poorly trained ANN
-  index, and a failed build never leaves partial state - the fallback is
-  always exact search over the column.
+- Segments below the training threshold, and segments whose build failed,
+  are searched exactly from the column. A failed build leaves no partial
+  state.
 - Parallelism is purely a speed knob: results are bit-identical to serial
   execution.

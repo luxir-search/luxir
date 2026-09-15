@@ -1,27 +1,30 @@
 # Geo search
 
-Luxir represents a location as a typed `geo_point` and answers bounding-box
-and radius queries inside the normal query tree. A geo query can be the main
-query, a non-scoring filter on text or vector retrieval, or a boolean clause.
-There is no post-filter stage with a different idea of the result set.
+A location is a typed `geo_point`, and a geo query can go anywhere another
+query can: as the main query, as a non-scoring filter on text or vector
+retrieval, or as one boolean clause among several. "Coffee within five
+kilometers" is a text query with a distance filter beside it, evaluated as
+one query with no post-filter stage.
 
 ## Define a point field
 
 Geo fields need an explicit schema definition; the default suffix templates
 do not include one:
 
-```bash
-curl http://localhost:9400/collections/places/_schema -d '{
+```http
+POST /collections/places/_schema
+
+{
   "fields": {
     "location": {"type":"geo_point","index":"range"}
   }
-}'
+}
 ```
 
 `column` defaults to `true`. `index: "range"` builds a two-dimensional points
 index for boxes and circles. If it is omitted, the same queries remain correct
-and scan the point column instead. The indexed and scan paths have the same
-contract, so the choice is about cost rather than behavior.
+and scan the point column instead. The indexed and scan paths return the
+same results; only the cost differs.
 
 For a document with several locations, set `multi: true`:
 
@@ -47,8 +50,6 @@ POST /collections/places/_update
 
 Longitude must be within `[-180,180]` and latitude within `[-90,90]`. Luxir
 quantizes each coordinate into a 32-bit grid, roughly centimeter resolution.
-Invalid shapes, non-finite numbers, and out-of-range coordinates are
-per-document update errors.
 
 A multi-valued field takes an array of point arrays:
 
@@ -95,7 +96,7 @@ the box intentionally crosses the international date line:
 ```
 
 That matches the band from 170 degrees east through 180/-180 to 170 degrees
-west, rather than rejecting the apparent reversal.
+west.
 
 ## Distance queries
 
@@ -126,25 +127,37 @@ when any point is inside the circle, and the document is returned once.
 ## Combine place with relevance
 
 Geo queries are constant-scoring when used as queries and non-scoring when
-used as filters. The common search shape keeps text relevance intact:
+used as filters. The usual pattern is a text query with a geo filter, so text relevance is
+unaffected:
 
-```json
+```http
+POST /collections/places/_search
+
 {
   "query": {"match":{"description_t":"coffee"}},
   "filter": [
     {
-      "name": "nearby",
-      "query": {
-        "geo_distance": {
-          "field":"location",
-          "lat":40.7128,
-          "lon":-74.0060,
-          "radius_meters":5000
-        }
+      "geo_distance": {
+        "field":"location",
+        "lat":40.7128,
+        "lon":-74.0060,
+        "radius_meters":5000
       }
     }
   ],
   "fields":["id","name_s","description_t"]
+}
+```
+
+```json
+{
+  "docs": [
+    {
+      "id": "nyc",
+      "name_s": "New York",
+      "description_t": "coffee and bagels"
+    }
+  ]
 }
 ```
 

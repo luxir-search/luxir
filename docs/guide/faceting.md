@@ -1,9 +1,26 @@
 # Faceting and metrics
 
-Facets are search operations over a document domain. Put them in the `ops`
-of a query and they see every document matched by that query and its filters,
-not merely the hits returned by `limit`. That lets one request return the
-documents for a page and the analytics used to navigate it.
+Faceted search groups matching documents into **buckets** and returns
+information about each bucket. A book search might group matches by category,
+price range, or publication year. Each bucket has a count; you can also compute
+metrics such as average price, group its documents into sub-buckets, or retrieve
+its top matching documents.
+Buckets can overlap: a book can belong to both science-fiction and classics.
+
+In a search UI, these summaries become choices such as "Science fiction (31)"
+or "Under $20 (18)". Users can see how results are distributed and select
+values to narrow their search.
+
+One request returns the top documents for a page along with the facets and
+metrics for it. Put facets and metrics in the **sub operations** `ops` of a
+query and they see every document the query and its filters match, not just
+the hits returned by `limit`. The ranked documents, the facet counts, and the
+total come back in one round trip, over one consistent view of the index.
+Counts are exact by default.
+
+For an interactive facet sidebar, start with
+[`selected`](#easy-multi-select-with-selected): put the user's choices on each
+facet and Luxir builds the filters and handles multi-select counts automatically.
 
 ```http
 POST /collections/books/_search
@@ -17,7 +34,8 @@ POST /collections/books/_search
   "ops": {
     "categories": {
       "field_facet": {"field":"category_s","limit":10,"missing":true}
-    }
+    },
+    "average_price": "avg(price_f)"
   }
 }
 ```
@@ -25,21 +43,102 @@ POST /collections/books/_search
 ```json
 {
   "found": 42,
-  "docs": [{"id":"b1","title_t":"Dune"}],
+  "docs": [
+    {
+      "id": "b1",
+      "title_t": "Dune"
+    }
+  ],
   "ops": {
     "categories": {
       "buckets": [
-        {"val":"science-fiction","count":31},
-        {"val":"classic","count":18}
+        {
+          "val": "science-fiction",
+          "count": 31
+        },
+        {
+          "val": "classic",
+          "count": 9
+        }
       ],
       "missing": 2
-    }
+    },
+    "average_price": 11.72
   }
 }
 ```
 
-Counts are exact. A multi-valued field contributes its document to each value
-it contains, but never more than once to the same bucket.
+Every entry in `ops` is a named operation, and operations nest. A facet's own
+`ops` run once per bucket, so one category facet can return the average
+price, a publisher breakdown, and the two best documents of every category.
+The whole tree executes as part of the original request rather than as a
+follow-up query per bucket.
+
+The operation kinds on this page:
+
+| Operation | Groups by |
+|---|---|
+| `field_facet` | Each distinct value of a field. |
+| `range_facet` | Fixed-width or calendar buckets over a numeric or date field. |
+| `query_facet` | Named buckets you define with arbitrary queries. |
+| Expression metric (`"avg(price_f)"`) | Nothing; one number over the incoming documents. |
+| `top_docs` / `fusion` | Nothing; a ranked document list per bucket. |
+
+## Easy multi-select with `selected`
+
+Use `selected` to send the current choices along with each facet. Luxir turns
+them into filters for the results and excludes each facet's own selection
+when counting that facet's buckets, so the alternatives stay visible.
+
+Here the user has checked two categories and one format:
+
+```http
+POST /collections/books/_search
+
+{
+  "query": {"all":true},
+  "filter": ["stock_i:>0"],
+  "limit": 10,
+  "get_number": true,
+  "fields": ["id","title_t"],
+  "ops": {
+    "categories": {
+      "field_facet": {
+        "field": "category_s",
+        "limit": 10,
+        "selected": ["science-fiction","fantasy"]
+      }
+    },
+    "formats": {
+      "field_facet": {
+        "field": "format_s",
+        "limit": 10,
+        "selected": ["paperback"]
+      }
+    },
+    "average_price": "avg(price_f)"
+  }
+}
+```
+
+The default `selection_mode: "any"` combines choices with **OR within a facet**
+and **AND across facets**. Luxir applies the query and the stock filter
+everywhere, then handles the selections for each part of the response:
+
+| Result | Selections applied |
+|---|---|
+| `docs`, `found`, and `average_price` | Science-fiction or fantasy, and paperback. |
+| `categories` buckets | Paperback; count all categories so the user can choose more. |
+| `formats` buckets | Science-fiction or fantasy; count all formats so the user can choose more. |
+
+Each facet ignores only its own selection when counting its buckets. Update
+its `selected` array as the user checks or unchecks values; omit it or send
+`[]` to clear that facet's selection. Selected buckets stay in the response
+even when outside `limit`, so the UI can keep showing the checked choices.
+
+The same API works for field, range, and query facets directly under the
+query's `ops`. See [Multi-select navigation](#multi-select-navigation) for
+selection values, normalization, and the stricter `selection_mode: "all"`.
 
 ## Field facets
 
@@ -56,155 +155,116 @@ A `field_facet` groups by distinct field value:
 }
 ```
 
-A bare field name uses its `defaults.value` binding. With the author schema
-from [Schema](schema.md#field-variants), faceting `author` counts normalized
-whole-author values from `author__s`. Use `author__self` to facet the primary's
-analyzed tokens. An explicit selector uses exactly that representation and
-fails if it lacks the required structures; a STRING facet needs both indexed
-terms and an ord column, so a column-only string cannot serve it.
-
-The controls are:
-
 | Field | Meaning |
 |---|---|
 | `field` | Field to group. Required. |
 | `limit` | Maximum returned buckets. Default `5`; `-1` returns all. |
-| `mincount` | Drop buckets below this domain count. |
-| `missing` | Return the count of documents with no accepted value. |
-| `sort` | Sort a string/ID facet by one named metric sub-operation. |
-| `ops` | Per-bucket sub-facets, numeric metrics, or `top_docs` / `fusion` result lists on string/ID facets. |
-| `selected` | Values that refine the result set and remain visible as buckets. |
-| `selection_mode` | Match any selected value (default) or require all of them. |
+| `mincount` | Drop buckets below this count. |
+| `missing` | Also return the count of documents with no value in the field. |
+| `sort` | Sort a string/ID facet by one of its metric sub-operations: a one-element list such as `["name desc"]` or `["name asc"]`. Default: count descending. |
+| `ops` | Per-bucket sub-facets, metrics, or `top_docs` / `fusion` lists on string/ID facets. |
+| `selected` | Values that refine the result set and stay visible as buckets. See [Multi-select navigation](#multi-select-navigation). |
+| `selection_mode` | `any` (default) or `all`: match any selected value, or require every one. |
 
-String and ID facets default to count descending, then bucket value ascending
-as a deterministic tie break. Setting `mincount: 0` can include values that
-exist in the collection but have zero matches in the current domain.
+String and ID facets return buckets in count-descending order, with bucket
+value ascending as a deterministic tie break. A multi-valued field contributes
+its document to each value it holds, but never twice to the same bucket.
+`mincount: 0` includes values that exist in the collection but have zero
+matches in the current result set, which keeps a sidebar stable while the user
+narrows a search.
 
-Integer and date representations facet on each distinct column value. Text
-representations facet on analyzed terms, not on the original stored text: faceting `body_t` answers
-"which indexed terms occur?", while faceting `category_s` answers "which
-category values occur?" Integer/date/text field facets support `limit`,
-`mincount`, and `missing`, but not sub-operations or custom sorts. TEXT also
-accepts `mincount: 0` to include indexed terms outside the current domain;
-INT/DATE require a positive value when set. Use a range facet when numeric
-values should be bucketed rather than enumerated.
+Integer and date fields facet on each distinct column value. Text fields facet
+on analyzed terms, not on the stored text: a facet on `body_t` returns
+indexed words, while a facet on `category_s` returns whole category values.
+Integer, date, and text facets support `limit`, `mincount`, `missing`, and
+`selected`, but not `ops` or `sort`; text also accepts `mincount: 0`, while
+int and date require a positive value when set. Use a
+range facet when numbers should be bucketed rather than enumerated.
 
-A nonempty `selected` is supported for facets directly under the query's
-`ops`: not at the root of a full-form request, under a `fusion`, or nested
-inside another facet. The selected values refine the document result;
-`selection_mode: "all"` requires every value instead of the default any-value
-match. The field facet's ordinary page is still finalized over all buckets. A
-selected value that lands in that page appears once at its natural sorted
-position. After the page, selected values not already emitted append in
-request order with exact counts. These appended buckets are exempt from
-`mincount`, may name values absent from the index, and carry the same
-sub-operation results as ordinary buckets.
-
-Selection uses the facet's resolved representation for both normalization and
-refinement. STRING values, TEXT tokens, and IDs default to `long_terms: "hash128"`.
-After normalization/analysis, a term over 255 bytes becomes a UTF-8-safe prefix of at most 230 bytes plus 25 base36 hash
-characters. Shorter terms are unchanged. Distinct long values have distinct
-buckets except for hash collisions; `selected` transforms full values identically.
-Facets and term enumeration return the term as stored, including its hash suffix.
-If normalization or analysis would alter that returned term, submit the full
-source value for `selected`; see [term-space limits](documents.md#ids-and-replacement).
-
-Sorts and ranges retain source byte order only up to the kept prefix. Prefix
-queries longer than it return a superset; wildcard/regex queries also fall back
-when their common leading literal prefix exceeds it. Hashing is not
-attack-resistant. `truncate` cuts at the limit instead, merging shared-prefix
-buckets; `reject` fails over-limit ingest and makes over-limit selections request errors.
-Policy edits do not validate or rewrite existing terms; use a new field or
-variant label and reindex to change the policy safely. Column-only strings
-have no term-space limit but cannot serve field facets.
-
-With the `names` collection from the schema example:
+A bare field name uses the field's value binding. The
+[author example](documents.md#field-variants) facets on `author_name` to count
+whole names through its string variant. Using that collection, facet on
+`author_name__self` to count the words of the analyzed primary:
 
 ```http
-POST /collections/names/_search
+POST /collections/authors/_search
 
 {
-  "query": {"all":true},
-  "fields": ["id"],
+  "query": {
+    "all": true
+  },
+  "limit": 0,
   "get_number": true,
   "ops": {
-    "authors": {"field_facet": {
-      "field":"author","limit":10,"selected":["URSULA K. LE GUIN"]
-    }}
+    "words": {
+      "field_facet": {
+        "field": "author_name__self",
+        "limit": -1
+      }
+    }
   }
 }
 ```
 
-The result list contains only `b1`, the same document selected by bare
-`any_of` on `author` with that value (or `author:="URSULA K. LE GUIN"`). The
-bucket is normalized to `ursula k. le guin`. In the default `any` mode, this
-facet's own buckets are counted without its selection filter, so the other
-author buckets remain visible. Sibling operations see the refinement.
-
-To count words instead:
-
-```http
-POST /collections/names/_search
-
+```json
 {
-  "query": {"all":true},
-  "fields": ["id"],
-  "get_number": true,
-  "limit": 0,
-  "ops": {"words":{"field_facet":{"field":"author__self","limit":-1}}}
+  "found": 6,
+  "docs": [],
+  "ops": {
+    "words": {
+      "buckets": [
+        {
+          "val": "neal",
+          "count": 6
+        },
+        {
+          "val": "asher",
+          "count": 3
+        },
+        {
+          "val": "stephenson",
+          "count": 2
+        },
+        {
+          "val": "shusterman",
+          "count": 1
+        }
+      ]
+    }
+  }
 }
 ```
 
-The token buckets include `guin` and `le`, each with count `2`. A `selected`
-value on this facet uses TEXT exact-token membership; a literal producing
-several terms is an error, just as with `any_of` on `author__self`.
+An explicit selector uses that representation. A string facet needs indexed
+terms and a column. Terms over 255 bytes follow the
+field's [`long_terms` policy](schema.md#string-normalization-and-length), and
+facets return the term as stored.
 
 ## Expression metrics
 
-An expression metric folds document values over its incoming domain. `avg`,
-`sum`, `min`, and `max` are the bucket aggregates. The shortest JSON form is a
-bare expression string in an operation position:
+An expression metric folds document values over its incoming documents. The
+shortest form is a bare expression string in an operation position:
 
 ```json
 "average_price": "avg(price_f)"
 ```
 
-Column leaves use the value binding, then require the appropriate numeric/date
-column. TEXT has no value column, and a string variant does not make numeric
-metrics legal: `min(author)` in the author example is an error.
-
-The equivalent explicit forms are
-`{"expr_op":"avg(price_f)"}` and
-`{"expr_op":{"expr":"avg(price_f)"}}`. The object form also accepts a
-`vars` map for scalar `$name` values.
-
-Aggregate arguments use the same numeric value-expression language as sort and
-rescore expressions, including arithmetic, parentheses, `def`, unary math, and
-explicit per-document array reducers. This makes composite metrics direct:
+`avg`, `sum`, `min`, and `max` are the aggregates. Their arguments use the same
+value-expression language as [sort expressions](searching.md#sorting):
+arithmetic, parentheses, `def`, unary math, and per-document array reducers.
+A composite metric is a single expression:
 
 ```json
 "weighted_price": "sum(price_f * qty_i) / sum(qty_i)"
 ```
 
-A bare multi-valued column is not implicitly pooled. For example,
-`avg(prices_fs)` is rejected; use `avg(avg(prices_fs))` to average each
-document's array first and then average those per-document values across the
-bucket. Missing document values are skipped by an aggregate. `def(value, 0)`
-can opt a missing value back into its denominator or sum.
+The explicit forms are `{"expr_op":"avg(price_f)"}` and
+`{"expr_op":{"expr":"avg(price_f)","vars":{...}}}`; the object form takes a
+`vars` map for scalar `$name` values.
 
-Integer `sum`, `min`, and `max` results are returned as int64 values; integer
-sums accumulate exactly. `avg` and any floating-point expression return a
-double. A domain with no contributing values returns `null`. Data-dependent
-overflow or a non-finite aggregate also returns `null` and adds a response
-warning rather than failing the request.
-
-For DATE values, `avg`, `min`, and `max` are legal and retain date meaning;
-`sum(DATE)` is rejected as a unit clash. Multiplication, division, unary minus,
-and unary math demote a DATE expression to an ordinary number.
-
-Directly under the query's `ops` (or at the root of a full-form request), the
-result is one scalar over the incoming domain. Nested under a string or ID
-facet, it is evaluated independently for each bucket:
+Directly under the query's `ops` (or at the root of a full-form request), a
+metric is one scalar over the whole match set. Nested under a facet, it is
+evaluated independently for each bucket and returned beside the bucket:
 
 ```json
 "categories": {
@@ -212,59 +272,71 @@ facet, it is evaluated independently for each bucket:
     "field": "category_s",
     "limit": 10,
     "ops": {
-      "average_price": {
-        "expr_op": "avg(price_f)"
-      },
+      "average_price": "avg(price_f)",
       "lowest_price": "min(price_f)"
     }
   }
 }
 ```
 
-The HTTP response keeps each metric beside its bucket:
-
 ```json
 {
   "buckets": [
-    {"val":"paperback","count":20,"average_price":11.25,"lowest_price":5.99},
-    {"val":"hardcover","count":8,"average_price":24.50,"lowest_price":15.00}
+    {
+      "val": "paperback",
+      "count": 20,
+      "average_price": 11.25,
+      "lowest_price": 5.99
+    },
+    {
+      "val": "hardcover",
+      "count": 8,
+      "average_price": 24.50,
+      "lowest_price": 15.00
+    }
   ]
 }
 ```
 
-Sort a string/ID facet by one of its metric operations:
+Sort a string or ID facet by one of its metrics:
 
 ```json
 {
   "field_facet": {
     "field": "category_s",
     "limit": 5,
-    "ops": {
-      "average_price": "avg(price_f)"
-    },
+    "ops": {"average_price": "avg(price_f)"},
     "sort": ["average_price desc"]
   }
 }
 ```
 
-Facet sort expressions are resolved contextually as metric operation names;
-document value expressions are not evaluated for buckets. Both `asc` and
-`desc` are supported, and a missing or failed metric sorts last in either
-direction. Only one facet sort key is supported. Custom count and bucket-value
-sort specifications are not yet supported; omit `sort` for the default count
-order.
+Facet `sort` names a metric operation of that facet; `asc` and `desc` are both
+supported, and a bucket whose metric is missing or failed sorts last either
+way.
 
-Facet aggregate state is bounded by the server's
-`search.request-memory-max-bytes` per-request query-memory ceiling. The engine
-charges the resolved state stride for every simultaneously resident bucket. A
-metric needed to sort candidates cannot be deferred; if its estimated state
-would exceed the ceiling, the request-memory breaker reports its attempted
-total and ceiling together with the facet and metric names.
+The typing rules:
+
+- Column leaves use the field's value binding and require a numeric or date
+  column.
+- Reduce multi-valued columns within each document first:
+  `avg(avg(prices_fs))` averages each document's prices, then averages those
+  across the bucket.
+- Missing document values are skipped. `def(value, 0)` counts a missing value
+  as 0 in a sum or a denominator.
+- Integer `sum`, `min`, and `max` return int64 values and accumulate exactly;
+  `avg` and any floating-point expression return a double. A bucket with no
+  contributing values returns `null`. Data-dependent overflow or a non-finite
+  result also returns `null` and adds a response warning rather than failing
+  the request.
+- `avg`, `min`, and `max` of a date keep their date meaning; `sum` requires
+  numeric values. Multiplication, division, unary minus, and unary math turn
+  a date into a plain number.
 
 ## Nested facets
 
-String and ID facets can contain other string/ID facets. Each sub-facet sees
-only the documents in its parent bucket:
+String and ID facets can contain other string or ID facets. Each sub-facet
+sees only the documents in its parent bucket:
 
 ```json
 "category": {
@@ -288,8 +360,14 @@ only the documents in its parent bucket:
       "count": 31,
       "publisher": {
         "buckets": [
-          {"val":"ace","count":12},
-          {"val":"orb","count":7}
+          {
+            "val": "ace",
+            "count": 12
+          },
+          {
+            "val": "orb",
+            "count": 7
+          }
         ]
       }
     }
@@ -297,20 +375,15 @@ only the documents in its parent bucket:
 }
 ```
 
-This is one tree, not a follow-up query per bucket. Sub-facets and metrics run
-over the bucket domains as part of the original request.
+Nesting is not limited to one level, and metrics sit beside sub-facets in the
+same `ops` map.
 
 ## Top documents per bucket
 
-A `top_docs` (or `fusion`) operation under a facet returns a ranked list of
-documents for every bucket. It is an ordinary operation: a `top_docs` applies
-its own `query`, `filter`, `sort`, `limit`, `fields`, and `get_number` to
-that bucket's documents, and a `fusion` fuses its sources over them. A
-`top_docs` without a `query` selects every document in the bucket, and without
-`sort` such a list is in index order, so give it the query whose ranking you
-want (a text query's scores do not depend on the bucket, so repeating the
-outer query ranks each bucket's documents the way the main result list does)
-or a sort:
+A `top_docs` (or `fusion`) operation under a facet returns a ranked document
+list for every bucket: the best few products per category, the latest post per
+author. It is an ordinary operation with its own `query`, `filter`, `sort`,
+`limit`, `fields`, and `get_number`, applied to that bucket's documents:
 
 ```json
 "category": {
@@ -337,26 +410,54 @@ or a sort:
     {
       "val": "science-fiction",
       "count": 31,
-      "best": {"found": 31, "docs": [{"id":"b1","title_t":"Dune"}, {"id":"b7","title_t":"Dune Messiah"}]}
+      "best": {
+        "found": 31,
+        "docs": [
+          {
+            "id": "b1",
+            "title_t": "Dune"
+          },
+          {
+            "id": "b7",
+            "title_t": "Dune Messiah"
+          }
+        ]
+      }
     },
     {
       "val": "classic",
       "count": 18,
-      "best": {"found": 18, "docs": [{"id":"b3","title_t":"Dune"}, {"id":"b9","title_t":"Children of Dune"}]}
+      "best": {
+        "found": 18,
+        "docs": [
+          {
+            "id": "b3",
+            "title_t": "Dune"
+          },
+          {
+            "id": "b9",
+            "title_t": "Children of Dune"
+          }
+        ]
+      }
     }
   ]
 }
 ```
 
+A `top_docs` without a `query`
+selects every document in the bucket, and without a `sort` that list is in
+index order. A text query's scores do not depend on the bucket, so repeating
+the outer query ranks each bucket the way the main result list is ranked.
+
 Per-bucket lists work under string/ID, range, and query facets. A per-bucket
 `top_docs` may carry its own `ops`, which see every document in the bucket
-that matches that `top_docs` (its query and filters), regardless of its
-`limit`; `fusion` accepts no `ops`. Two differences from a top-level list: it
-is never streamed in batches, so `batch_size` is ignored and every requested
-row arrives in the final response; and a `document_format` left at the default
-follows the transport default rather than the enclosing operation's format.
-Each bucket is ranked independently, which costs one pass over the bucket's
-documents per bucket.
+that its query and filters match, regardless of its `limit`; a per-bucket
+`fusion` accepts no `ops`. Two differences from a top-level list: it is never
+streamed in batches (`batch_size` is ignored and every row arrives in the final
+response), and a `document_format` left at the default follows the transport
+default rather than the enclosing operation's. Each bucket is ranked
+independently, which costs one pass over the bucket's documents per bucket.
 
 ## Range facets
 
@@ -379,50 +480,51 @@ float, double, or date field:
 ```json
 {
   "buckets": [
-    {"val":[0,10],"count":4},
-    {"val":[10,20],"count":9},
-    {"val":[20,30],"count":0}
+    {
+      "val": [0, 10],
+      "count": 4
+    },
+    {
+      "val": [10, 20],
+      "count": 9
+    },
+    {
+      "val": [20, 30],
+      "count": 0
+    }
   ],
   "missing": 2
 }
 ```
 
-A bare field uses its value binding. That representation must still be numeric
-or date; a STRING value default does not become a numeric range facet.
+| Field | Meaning |
+|---|---|
+| `field` | Numeric or date field. Required; its value binding must be numeric or date. |
+| `start`, `end` | Bounds of the bucketed range. Required. |
+| `gap` | Fixed bucket width (milliseconds for dates). Exactly one of `gap` or `calendar_gap` is required. |
+| `calendar_gap` | `{"n": 1, "unit": "month"}` for civil buckets over dates; see [Date histograms](#date-histograms). |
+| `mincount` | `0` (default) keeps every bucket in order, zero counts included; a positive value filters after counting. |
+| `missing` | Also return the count of documents with no value. |
+| `ops` | Per-bucket metrics, nested facets, or `top_docs`. |
+| `selected` | Lower fences of buckets that refine the result set. See [Multi-select navigation](#multi-select-navigation). |
+| `time_zone` | Time zone for bounds without an explicit offset and for calendar buckets; empty inherits the request's. |
 
-`start` and `end` are required, and exactly one of `gap` or `calendar_gap`
-must be present. The final bucket is shortened if the gap does not divide the
-range evenly. At most 100,000 buckets may be requested.
+Every in-range bucket is returned in lower-bound order, including zero counts,
+so the result plots directly as a histogram. The final bucket is shortened if the gap does
+not divide the range evenly. NaN and infinity fall outside every floating-point
+bucket. The gap must be large enough to advance the field's numeric
+representation at that magnitude. At most 100,000 buckets may be requested;
+range facets with sub-operations are limited to 1,024. Sub-operations have the
+same semantics as under a string bucket, so an empty range bucket yields
+`null` metrics.
 
-Every in-range bucket is returned in fence order by default, including zero
-counts. `mincount: 0` retains all of them; a positive value filters after
-counting. NaN and infinity values fall outside every floating-point bucket, and
-a gap too fine for the field's representation at that magnitude is rejected.
-
-Range facets accept sub-operations. Each retained range bucket supplies its
-document domain to the child operation, so an expression metric or nested
-string facet has the same semantics as it does under a string bucket. Empty
-range buckets therefore emit null expression metrics. The executor processes
-stateful child bindings in bounded blocks rather than retaining every bucket's
-state at once. Range facets with sub-operations are limited to 1,024 buckets.
-Range facets return buckets in lower-bound order.
-
-Range facet `selected` values are generated bucket lower fences. They refine
-the result in the same way and remain in fence order; selection only exempts a
-range bucket from `mincount` admission. This is the same union rule as field
-facets, whose natural order is their requested sort rather than fence order.
-
-The HTTP renderer currently emits `null` for float/double range bucket bounds
-even though counts and the typed gRPC bounds are correct; integer and date
-bounds render normally over HTTP.
-
-For numeric/date fields declared with `index: "range"`, a points index can
+For numeric and date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
-column. The result contract is the same without the index.
+column. The result is the same either way; only the cost differs.
 
 ## Date histograms
 
-Date bounds accept epoch milliseconds, ISO-8601, and date math. Use
+Date bounds accept epoch milliseconds, ISO-8601 text, and date math. Use
 `calendar_gap` when buckets should follow civil days, weeks, months, quarters,
 or years:
 
@@ -443,28 +545,24 @@ inherits the request time zone; `UTC` explicitly overrides it. IANA zone names
 and fixed offsets are accepted. Bucket IDs remain raw epoch-millisecond fence
 pairs, because they identify instants unambiguously.
 
-Calendar fences are derived from the original start rather than repeatedly
-adding to the previous fence. A sequence starting on January 31 therefore
-produces February 28 or 29 and then March 31 instead of drifting. Days across a
-daylight-saving change can be 23 or 25 physical hours. Week buckets begin on
-Monday.
+Calendar fences are derived from the original start rather than by repeatedly
+adding to the previous fence, so a sequence starting on January 31 produces
+February 28 or 29 and then March 31 instead of drifting. Days across a
+daylight-saving change are 23 or 25 physical hours. Week buckets begin on
+Monday. When a zone change removes a whole nominal bucket, Luxir drops the
+zero-width bucket and returns a `calendar_bucket_skipped` warning.
+[Dates and time zones](dates.md) has the
+date-math and civil-time contract.
 
 For a fixed UTC epoch-day number in the value-expression language, use
-`floor(when_dt / 86400000)`. Use a date range facet with `calendar_gap` instead
-when day bucketing must follow a civil time zone and daylight-saving changes.
-
-Nonexistent civil fences shift forward through the zone transition. If a zone
-change removes a whole nominal bucket, Luxir removes the zero-width bucket and
-returns a `calendar_bucket_skipped` warning rather than silently changing the
-calendar. See [Dates and Time Zones](dates.md) for the date-math and civil-time
-contract.
+`floor(when_dt / 86400000)`; use a calendar gap when day bucketing must follow
+a civil time zone.
 
 ## Query facets
 
-A `query_facet` names an ordered set of arbitrary query buckets. In JSON,
-`buckets` is an object: each object key is the bucket name and each value is a
-query. A bare string uses the `expr` query syntax; structured queries use their
-ordinary object form.
+A `query_facet` names an ordered set of buckets, each defined by a query. In
+JSON, `buckets` is an object: each key is the bucket name and each value is a
+query, as an expression string or a structured object:
 
 ```json
 "price_tiers": {
@@ -481,36 +579,134 @@ ordinary object form.
 }
 ```
 
-The response keeps request order and retains every requested bucket, including
-zero counts:
-
 ```json
 {
   "buckets": [
-    {"val":"budget","count":12,"average_price":72.5},
-    {"val":"mid","count":31,"average_price":340.0},
-    {"val":"nearby","count":0,"average_price":null}
+    {
+      "val": "budget",
+      "count": 12,
+      "average_price": 72.5
+    },
+    {
+      "val": "mid",
+      "count": 31,
+      "average_price": 340.0
+    },
+    {
+      "val": "nearby",
+      "count": 0,
+      "average_price": null
+    }
   ]
 }
 ```
 
-Query buckets count documents, not value occurrences. A document contributes
-at most once to a query bucket even when several field values make its query
-match. Field and range facets instead count matching field values, so one
+The response keeps request order and retains every requested bucket, including
+zero counts. Any query kind can define a bucket: boolean, range, expression,
+geo, or kNN. A kNN bucket prepares against the facet's complete incoming
+domain, so its `k` nearest documents are chosen from the same filtered set the
+facet sees. There is no bucket-count limit beyond request size.
+
+Query buckets count documents, not value occurrences: a document contributes
+at most once to a bucket even when several of its values make the query match.
+Field and range facets count matching field values instead, so one
 multi-valued document can contribute to several value-derived counts.
 
-Any query kind can define a bucket, including boolean, range, expression, and
-kNN queries. A kNN bucket prepares against the facet's complete incoming
-domain, so its `k` nearest documents are chosen from the same filtered domain
-the facet sees. Query facets have no bucket-count limit; request size is the
-natural bound.
+The `ops` map runs independently over each bucket's documents and accepts the
+same metrics, nested facets, and per-bucket `top_docs` as the other facets.
 
-The `ops` map runs independently over each bucket's document domain. It accepts
-the same expression metrics, nested facets, and per-bucket `top_docs` as other
-fixed-bucket facets.
+## Multi-select navigation
 
-For multi-select navigation, put a nonempty `selected` on a query facet
-directly under the query's `ops`. Values are bucket names:
+A faceted UI usually lets a user pick a value and still see the sibling values
+they could have picked. Put the chosen values in the facet's `selected` list:
+the result set is refined to them, and in the default `any` mode the facet's
+own buckets are counted *without* that refinement, so the alternatives stay
+visible with their counts. Sibling operations see the refinement.
+
+Using the [author example](documents.md#field-variants), select Neal Asher:
+
+```http
+POST /collections/authors/_search
+
+{
+  "query": {
+    "all": true
+  },
+  "fields": ["id"],
+  "get_number": true,
+  "ops": {
+    "authors": {
+      "field_facet": {
+        "field": "author_name",
+        "limit": 10,
+        "selected": ["Neal Asher"]
+      }
+    }
+  },
+  "sort": "id"
+}
+```
+
+```json
+{
+  "found": 3,
+  "docs": [
+    {
+      "id": "b1"
+    },
+    {
+      "id": "b2"
+    },
+    {
+      "id": "b4"
+    }
+  ],
+  "ops": {
+    "authors": {
+      "buckets": [
+        {
+          "val": "Neal Asher",
+          "count": 3
+        },
+        {
+          "val": "Neal Stephenson",
+          "count": 2
+        },
+        {
+          "val": "Neal Shusterman",
+          "count": 1
+        }
+      ]
+    }
+  }
+}
+```
+
+The document list holds Asher's three books, while the facet still shows all
+three authors. Selection uses the facet's resolved representation for both
+normalization and refinement, so a returned bucket value can be sent back as
+a selection.
+
+`selection_mode: "all"` requires every selected value instead of any of them,
+and then the facet's own buckets are counted over that strict set too.
+
+The rules that apply to every facet kind:
+
+- `selected` is supported on facets directly under the query's `ops`: not at
+  the root of a full-form request, not under a `fusion`, and not nested inside
+  another facet.
+- Field facets take values, range facets take bucket lower fences as plain
+  numbers (`"selected": [25]` picks the bucket that starts at 25), and query
+  facets take bucket names.
+- A selected value that lands in the facet's ordinary page appears once, at its
+  natural position. Selected values outside the page are appended afterwards
+  in request order with exact counts; range facets keep fence order. Appended
+  buckets are exempt from `mincount`, may name values absent from the index,
+  and carry the same sub-operation results as ordinary buckets.
+- Selecting on a text facet uses exact-token membership, with the same
+  single-term rule as [`any_of`](query-reference.md#exact-membership-any_of).
+
+For a query facet, values are bucket names:
 
 ```json
 "price_tiers": {
@@ -525,7 +721,20 @@ directly under the query's `ops`. Values are bucket names:
 }
 ```
 
-The default `any` mode refines the result list to the union while computing
-this facet sideways, without its own derived filter. Sibling operations see
-the filter. `selection_mode: "all"` requires every selected bucket and uses
-the resulting strict incoming domain for this facet as well.
+## Limits
+
+- Facet sorting takes one key, which must be a metric operation of that facet.
+  Custom count or bucket-value sort orders are not yet supported; omit `sort`
+  for the default count order.
+- Integer, date, and text field facets do not accept `ops` or `sort`.
+- `selected` is not accepted at the root of a full-form request, under a
+  `fusion`, or on a nested facet.
+- Range facets with sub-operations are limited to 1,024 buckets; a range facet
+  without them may request at most 100,000.
+- The HTTP renderer currently emits `null` for float and double range bucket
+  bounds; the counts and the typed gRPC bounds are correct, and integer and
+  date bounds render normally.
+- Facet aggregate state is bounded by the server's
+  `search.request-memory-max-bytes` per-request ceiling. The engine charges the
+  aggregate state for every simultaneously resident bucket, including metrics
+  used to sort candidates.
