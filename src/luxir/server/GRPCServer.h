@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <thread>
 #include <latch>
+#include <oneapi/tbb/info.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
 #include "LuxirNode.h"
@@ -14,12 +16,12 @@ namespace luxir {
 class GRPCServer {
 public:
   // gRPC performance guidelines suggest having numcpu threads and 2 threads per completion queue.
-  // Are those real cpu cores, or the hyper-threaded cores that hardware_concurrency reports?
+  // Default to half the available logical CPUs, respecting CPU affinity.
   // https://grpc.io/docs/guides/performance/
   // port: The port to listen on. Use 0 for dynamic port allocation (useful for testing).
   // streamBufferBytes <= 0 means "use server.stream_buffer_bytes from the node
   // config" (per-connection response buffering cap; see ServerConfig).
-  GRPCServer(LuxirNode& node, int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2),
+  GRPCServer(LuxirNode& node, int nthreads = std::max(1, oneapi::tbb::info::default_concurrency() / 2),
              int port = 0, int64_t streamBufferBytes = -1);
 
   /// Per-call cap on buffered response bytes (flow-control high-water mark).

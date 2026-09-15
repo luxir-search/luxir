@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include <oneapi/tbb/info.h>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/none.hpp>
@@ -3172,7 +3173,7 @@ void HttpServer::start() {
   if (started) return;
   shutdownRequested.store(false, std::memory_order_release);
   int n = nthreads > 0 ? nthreads
-                       : (int)std::max(1u, std::thread::hardware_concurrency());
+                       : std::max(1, oneapi::tbb::info::default_concurrency());
 
   std::string host = requestedPort == 0 ? "127.0.0.1" : "0.0.0.0";
   tcp::endpoint ep(net::ip::make_address(host), (unsigned short)requestedPort);

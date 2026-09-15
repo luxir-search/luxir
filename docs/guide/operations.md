@@ -216,9 +216,11 @@ Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
 
 ## Threads and streaming backpressure
 
-HTTP defaults to one connection-I/O shard per detected hardware thread, with a
+HTTP defaults to one connection-I/O shard per available logical CPU, with a
 minimum of one, plus one dedicated accept thread. gRPC defaults to half the
-detected hardware threads, also with a minimum of one:
+available logical CPUs, also with a minimum of one. Automatic sizing respects
+the process's CPU affinity, so a server restricted to 28 logical CPUs defaults
+to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 
 ```bash
 luxir --server.http.threads=8 --server.grpc.threads=8

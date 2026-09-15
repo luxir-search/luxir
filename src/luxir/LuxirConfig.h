@@ -3,10 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
-#include <thread>
 #include <CLI/CLI.hpp>
+#include <oneapi/tbb/info.h>
 
 namespace luxir {
 
@@ -24,10 +25,10 @@ struct ServerConfig {
     int port = -1;
     int threads = 0;  // 0 = auto
 
-    /// Resolve threads: 0 means auto (hw_concurrency/2, minimum 1).
+    /// Resolve threads: 0 means auto (affinity-aware concurrency / 2, minimum 1).
     int resolveThreads() const {
       if (threads > 0) return threads;
-      return std::max(1u, std::thread::hardware_concurrency() / 2);
+      return std::max(1, oneapi::tbb::info::default_concurrency() / 2);
     }
   } grpc;
 
@@ -36,10 +37,10 @@ struct ServerConfig {
     int port = 9400;
     int threads = 0;  // 0 = auto
 
-    /// Resolve shards: 0 means auto (hw_concurrency, minimum 1).
+    /// Resolve shards: 0 means auto (affinity-aware concurrency, minimum 1).
     int resolveThreads() const {
       if (threads > 0) return threads;
-      return std::max(1u, std::thread::hardware_concurrency());
+      return std::max(1, oneapi::tbb::info::default_concurrency());
     }
   } http;
 };

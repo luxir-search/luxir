@@ -27,8 +27,8 @@ class HttpServer {
 public:
   // port == 0 binds 127.0.0.1 on an OS-assigned port (tests); otherwise binds
   // 0.0.0.0 on the given port. threads is the number of connection I/O shards;
-  // threads <= 0 means auto (hw_concurrency, minimum 1). The dedicated accept
-  // thread is additional.
+  // threads <= 0 means auto (affinity-aware concurrency, minimum 1).
+  // The dedicated accept thread is additional.
   // streamBufferBytes <= 0 means "use server.stream_buffer_bytes from the node
   // config" (per-connection response buffering cap; see ServerConfig).
   // shardIdlePeriod controls how long an unused non-floor shard stays alive;
