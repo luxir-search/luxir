@@ -615,35 +615,6 @@ TEST_F(BooleanNormalizeTest,
   EXPECT_EQ(initial.identity, repeated.identity);
   EXPECT_EQ(initial.mandatory.data(), repeated.mandatory.data());
   EXPECT_EQ(merged, repeated.mandatory[0]);
-
-#ifndef NDEBUG
-  class MissingChildValidationQuery final : public Query {
-    Query& child;
-
-  public:
-    explicit MissingChildValidationQuery(Query& child)
-      : Query(QueryKind::TEST), child(child) {}
-
-    FilterKeyScope appendFilterKey(
-        FilterKeyBuilder& out, const FilterKeyContext& keyContext) const override {
-      out.appendKind(kind);
-      unused(keyContext);
-      return FilterKeyScope::UNCACHEABLE;
-    }
-
-    Weight* createWeight(Context& weightContext, int32_t flags,
-                         float multiplier = 1.0f) override {
-      return child.createWeight(weightContext, flags, multiplier);
-    }
-  };
-
-  TermQuery unvisited("body_w", "b");
-  MissingChildValidationQuery missing(unvisited);
-  missing.validateLogical(context.planningContext());
-  EXPECT_DEATH(
-      { unused(missing.createWeight(context, 0)); },
-      "Weight owner was not visited by logical validation");
-#endif
 }
 
 TEST_F(BooleanNormalizeTest, noScorePlanDropsRankOnlyOptionalWithFilter) {

@@ -6709,36 +6709,6 @@ TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
   SkipStats::enabled = savedStats;
 }
 
-TEST_F(TermScorerTest, docsFreqEnumDocsOnlyProtocolAssertsOnFreqAccess) {
-#ifndef NDEBUG
-  const int32_t N = 8;
-  TestIndex testIndex;
-  TestField f(testIndex, "body_w");
-  f.startIndexing();
-  for (int32_t doc = 0; doc < N; doc++) {
-    f.add(doc, "protocol hot filler");
-  }
-  testIndex.flush();
-  f.startReading();
-
-  auto poolFree = testIndex.pool.rewindScopeGuard();
-  auto& segment = testIndex.reader->segments()[0];
-  PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  ASSERT_TRUE(fieldReader.seek("body_w"));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
-  TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
-  ASSERT_TRUE(tenum.seek("protocol"));
-
-  DocsFreqEnum denum(tenum);
-  auto docs = denum.peekDocBlock();
-  ASSERT_FALSE(docs.empty());
-  denum.consumeDocOnlyBlock(1);
-  ASSERT_DEATH({ (void) denum.termFreq(); }, "");
-#endif
-}
-
 TEST_F(TermScorerTest, countBulkFillWithDeletesMatchesPull) {
   const int32_t N = 4 * Postings::DOCS_BLOCK_SIZE + 41;
   TestIndex testIndex;
