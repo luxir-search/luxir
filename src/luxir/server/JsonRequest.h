@@ -25,6 +25,8 @@ namespace luxir {
 // shorthand must spell out top_docs).  The caller sets `out`'s collection target
 // from the URL path afterwards (a body-supplied "collection" is overwritten).
 // Unknown keys are rejected.
+// out.json_shorthand records whether parsing created the implicit q, for
+// HTTP response shaping; canonical JSON always writes the explicit ops form.
 //
 // Throws std::runtime_error with a client-facing message on malformed input.
 void parseQueryRequest(std::string_view body, luxir::api::SearchRequest& out,

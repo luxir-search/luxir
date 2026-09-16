@@ -273,8 +273,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   request (`document_format`): HTTP defaults to rows (a missing field is an
   absent key), gRPC to dense columns.
 - Several named operations in one request over the same index view, executed
-  in parallel; a request's single result list is promoted to `found` and
-  `docs` in the HTTP envelope.
+  in parallel; HTTP responses preserve their names and nesting under `ops`.
+  Root query shorthand returns `found` and `docs` directly in the HTTP envelope.
 - Count-only and analytics-only requests: `limit: 0` with `get_number: true`
   loads no document fields.
 - Hybrid fusion: reciprocal rank fusion over named sources with shared and

@@ -200,8 +200,8 @@ POST /collections/books/_search
 }
 ```
 
-The document list is promoted to `found` and `docs` in the HTTP envelope;
-operation results appear under `ops` by name. Expression metrics fold `avg`,
+With root query shorthand, `found` and `docs` appear in the HTTP envelope;
+the query's sub-operation results appear under `ops` by name. Expression metrics fold `avg`,
 `sum`, `min`, or `max` over value expressions and ignore missing document
 values. Integer results stay integers; averages and floating-point results are
 doubles. An empty metric domain renders as `null` in JSON.
@@ -490,12 +490,22 @@ operation in a request-level `ops` map:
 }
 ```
 
-The response is the same. Use the full form when a request needs several
-independent operations, such as a `fusion` beside a `top_docs`, two result
-lists, or a facet over the whole collection with no query. Any top-document
-key at the root selects the shorthand, and `ops` then holds that query's
-sub-operations rather than request operations. `?explain=request` echoes the
-full form of any request.
+The full form preserves every operation's name and nesting in the response.
+Here the documents are at `ops.q.docs`, the count at `ops.q.found`, and the
+facet and metric at `ops.q.ops.categories` and `ops.q.ops.average_price`.
+Even a single named operation stays under `ops`, including one named `q`.
+Each streaming batch preserves these same result paths.
+
+Use the full form when a request needs several independent operations, such
+as a `fusion` beside a `top_docs`, two result lists, or a facet over the whole
+collection with no query. Any top-document key at the root selects the
+shorthand, and `ops` then holds that query's sub-operations rather than
+request operations. Only shorthand unwraps its implicit `q` result into
+top-level `found`, `docs`, and `ops`.
+
+`?explain=request` echoes the full form of any request. Posting that echo
+back executes the same query; an expanded shorthand request now returns
+its results under `ops.q`.
 
 ## URL request-field overlay
 
@@ -562,6 +572,10 @@ operation shape.
 
 Unknown URL parameters are ignored, allowing middleware metadata.
 `format=docs` controls response framing and is not a request-field overlay.
+URL overlays preserve the body's response shape: updating an explicit
+`ops.q` keeps its result under `ops.q`. A query created entirely from URL
+parameters uses the shorthand response shape.
+
 `explain=request` returns the effective request, overlay included, as a body
 that can be posted back for identical results; `explain=resolved` also shows
 field bindings. See [HTTP explain modes](http-api.md#explain-modes).

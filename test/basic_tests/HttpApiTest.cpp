@@ -227,19 +227,19 @@ TEST_F(HttpApiTest, prettySearchMultipleBatches) {
     EXPECT_FALSE(res.body().ends_with("\n\n"));
     auto records = prettyRecords(res.body());
     ASSERT_GT(records.size(), 1u);
-    std::size_t docs = 0;
+    std::map<std::string, std::size_t> docsByOp;
     for (const auto& record : records) {
       expectJsonObject(record, true);
       glz::generic_i64 root;
       ASSERT_FALSE(glz::read_json(root, record));
-      if (root.contains("docs")) docs += root["docs"].get_array().size();
+      EXPECT_FALSE(root.contains("docs"));
       if (root.contains("ops")) {
         for (const auto& [name, op] : root["ops"].get_object()) {
-          if (op.contains("docs")) docs += op["docs"].get_array().size();
+          if (op.contains("docs")) docsByOp[name] += op["docs"].get_array().size();
         }
       }
     }
-    EXPECT_EQ(6u, docs);
+    EXPECT_EQ((std::map<std::string, std::size_t>{{"a", 3}, {"b", 3}}), docsByOp);
   }
 }
 
@@ -2215,7 +2215,8 @@ TEST_F(HttpApiTest, rootShorthand) {
   HttpReq full(port());
   full.matchQuery("status_s", "active").fields({"id"}).execute();
   ASSERT_EQ(200, full.status());
-  EXPECT_EQ(res.body(), full.rawResponse());
+  EXPECT_EQ("{\"ops\":{\"q\":" + res.body().substr(0, res.body().size() - 1) + "}}\n",
+            full.rawResponse());
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
   // an unknown root key is rejected with a client-facing error
@@ -2225,8 +2226,116 @@ TEST_F(HttpApiTest, rootShorthand) {
   EXPECT_NE(bad.body().find(R"("error")"), std::string::npos);
 }
 
+TEST_F(HttpApiTest, namedOpsPreserveNestedResultsAcrossBatches) {
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "cat_s", "x", "price_f", 12.5),
+    flatdoc("id", "2", "cat_s", "x", "price_f", 15.0),
+    flatdoc("id", "3", "cat_s", "y", "price_f", 8.5),
+  }, UpdateMessage::COMMIT);
+
+  for (int batchSize : {1, 100}) {
+    for (int parallel : {0, -1}) {
+      auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+          R"({"request_id":"named","max_parallel":)" + std::to_string(parallel) +
+          R"(,"ops":{
+            "q1":{"top_docs":{"query":"cat_s:x","fields":["id"],"get_number":true,
+              "batch_size":)" + std::to_string(batchSize) + R"json(,
+              "ops":{"metric":"min(price_f)","q2":"max(price_f)"}}},
+            "q2":{"top_docs":{"query":"id:3","fields":["id"]}},
+            "metric":"avg(price_f)"
+          }})json");
+      ASSERT_EQ(200, res.result_int()) << res.body();
+      auto lines = splitLines(res.body());
+      EXPECT_EQ(batchSize == 1, lines.size() > 1) << res.body();
+      std::map<std::string, std::set<std::string>> ids;
+      bool sawFound = false, sawNested = false, sawMetric = false;
+      for (std::size_t i = 0; i < lines.size(); i++) {
+        glz::generic_i64 root;
+        ASSERT_FALSE(glz::read_json(root, lines[i])) << lines[i];
+        EXPECT_EQ("named", root["request_id"].get_string());
+        EXPECT_FALSE(root.contains("docs"));
+        EXPECT_FALSE(root.contains("found"));
+        EXPECT_EQ(i + 1 < lines.size(), root.contains("more"));
+        ASSERT_TRUE(root.contains("ops")) << lines[i];
+        for (const auto& [name, op] : root["ops"].get_object()) {
+          if (name == "metric") {
+            EXPECT_EQ(12, op.as_number());
+            sawMetric = true;
+            continue;
+          }
+          ASSERT_TRUE(name == "q1" || name == "q2") << lines[i];
+          ASSERT_TRUE(op.contains("docs")) << lines[i];
+          for (const auto& doc : op["docs"].get_array()) ids[name].insert(doc["id"].get_string());
+          if (name == "q1" && op.contains("found")) {
+            EXPECT_EQ(2, op["found"].as_number());
+            sawFound = true;
+          }
+          if (op.contains("ops")) {
+            EXPECT_EQ("q1", name);
+            EXPECT_EQ(12.5, op["ops"]["metric"].as_number());
+            EXPECT_EQ(15, op["ops"]["q2"].as_number());
+            sawNested = true;
+          }
+        }
+      }
+      EXPECT_EQ((std::set<std::string>{"1", "2"}), ids["q1"]);
+      EXPECT_EQ((std::set<std::string>{"3"}), ids["q2"]);
+      EXPECT_TRUE(sawFound && sawNested && sawMetric) << res.body();
+    }
+  }
+}
+
+TEST_F(HttpApiTest, urlOverlaysPreserveExplicitResponseShape) {
+  helper.index(flatdoc("id", "1"), UpdateMessage::COMMIT);
+  const std::string target = "/collections/main/_search?fields=id";
+  for (const char* body : {"{}", R"({"time_zone":"UTC"})", R"({"query":"id:1"})"}) {
+    auto res = httpRequest(port(), http::verb::post, target, body);
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_EQ("{\"docs\":[{\"id\":\"1\"}]}\n", res.body());
+  }
+  for (const char* body : {R"({"ops":{"q":{"top_docs":{}}}})",
+                           R"json({"ops":{"q":{"top_docs":{}},"metric":"sum(1)"}})json"}) {
+    auto res = httpRequest(port(), http::verb::post, target, body);
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body()));
+    EXPECT_FALSE(root.contains("docs"));
+    ASSERT_TRUE(root.contains("ops"));
+    ASSERT_TRUE(root["ops"].contains("q"));
+    EXPECT_EQ("1", root["ops"]["q"]["docs"][0]["id"].get_string());
+  }
+}
+
+TEST_F(HttpApiTest, shorthandKeepsRootResultsAcrossBatches) {
+  helper.indexAll(std::array{flatdoc("id", "1"), flatdoc("id", "2"), flatdoc("id", "3")},
+                  UpdateMessage::COMMIT);
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"json({"fields":["id"],"batch_size":1,"get_number":true,"ops":{"q":"sum(1)"}})json");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_GT(lines.size(), 1u);
+  std::set<std::string> ids;
+  bool sawFound = false, sawMetric = false;
+  for (const auto& line : lines) {
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, line)) << line;
+    ASSERT_TRUE(root.contains("docs")) << line;
+    for (const auto& doc : root["docs"].get_array()) ids.insert(doc["id"].get_string());
+    if (root.contains("found")) {
+      EXPECT_EQ(3, root["found"].as_number());
+      sawFound = true;
+    }
+    if (root.contains("ops")) {
+      EXPECT_EQ(3, root["ops"]["q"].as_number());
+      sawMetric = true;
+    }
+  }
+  EXPECT_EQ((std::set<std::string>{"1", "2", "3"}), ids);
+  EXPECT_TRUE(sawFound && sawMetric) << res.body();
+}
+
 // ?explain=request echoes the canonical form of the parsed request instead of
-// executing it. The echo is itself a valid request body (POST-back equivalence)
+// executing it. The echo is itself a valid request body (same query results)
 // and echoing the echo is a fixpoint.
 TEST_F(HttpApiTest, explainRequestEcho) {
   helper.indexAll(std::array{
@@ -2252,11 +2361,12 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_EQ(canonical.find(R"("docs")"), std::string::npos) << canonical;
   EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;
 
-  // POST-back equivalence: the echo output runs identically to the original body.
+  // The echo makes q explicit: same result, now wrapped under ops.q.
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_search", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
-  EXPECT_EQ(direct.body(), viaEcho.body());
+  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+            viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
   auto echo2 = httpRequest(port(), http::verb::post,
@@ -2371,7 +2481,8 @@ TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   auto postback = httpRequest(port(), http::verb::post, "/collections/main/_search", echo.body());
   ASSERT_EQ(200, postback.result_int()) << postback.body();
-  EXPECT_EQ(direct.body(), postback.body());
+  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+            postback.body());
 
   auto echo2 = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=request", echo.body());
@@ -3852,7 +3963,8 @@ TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTa
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto replay = httpRequest(port(), http::verb::post, "/collections/main/_search", explainedRequest(echo));
   ASSERT_EQ(200, direct.result_int()) << direct.body();
-  EXPECT_EQ(direct.body(), replay.body());
+  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+            replay.body());
   auto again = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=resolved", explainedRequest(echo));
   ASSERT_EQ(200, again.result_int()) << again.body();

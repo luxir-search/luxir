@@ -106,7 +106,7 @@ TEST_F(JsonResponseTest, stringEscapingSimdPathMatchesScalar) {
     expected += '}';
   }
   expected += "]}";
-  EXPECT_EQ(expected, renderSearchResponseBody(resp));
+  EXPECT_EQ(expected, renderSearchResponseBody(resp, true));
 }
 
 TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
@@ -275,11 +275,11 @@ TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
 
   // Row maps signal missing structurally: doc 2 has no cat_s/n_i keys.
   EXPECT_EQ(
-      R"({"docs":[{"id":"1","cat_s":"x","n_i":5},{"id":"2"}]})",
+      R"({"ops":{"q":{"docs":[{"id":"1","cat_s":"x","n_i":5},{"id":"2"}]}}})",
       renderSearchResponseBody(req->responses[0]->proto));
 }
 
-TEST_F(JsonResponseTest, firstDocListIsPromotedAndFacetRemains) {
+TEST_F(JsonResponseTest, namedDocListAndFacetRemainUnderOps) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "1", "cat_s", "x"),
@@ -295,11 +295,11 @@ TEST_F(JsonResponseTest, firstDocListIsPromotedAndFacetRemains) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":3,"docs":[{"id":"1"},{"id":"2"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
+      R"({"ops":{"hits":{"found":3,"docs":[{"id":"1"},{"id":"2"}]},"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
       renderSearchResponseBody(req->responses[0]->proto));
 }
 
-TEST_F(JsonResponseTest, promotedDocListNestedOpsHoistIntoOps) {
+TEST_F(JsonResponseTest, shorthandUnwrapsImplicitQ) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "1", "cat_s", "x"),
@@ -317,6 +317,9 @@ TEST_F(JsonResponseTest, promotedDocListNestedOpsHoistIntoOps) {
 
   EXPECT_EQ(
       R"({"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
+      renderSearchResponseBody(req->responses[0]->proto, true));
+  EXPECT_EQ(
+      R"({"ops":{"q":{"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}}}})",
       renderSearchResponseBody(req->responses[0]->proto));
 }
 
@@ -337,11 +340,11 @@ TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":2,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":1},{"val":"y","count":1}]}}}}})",
+      R"({"ops":{"first":{"found":2,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":1},{"val":"y","count":1}]}}}}})",
       renderSearchResponseBody(req->responses[0]->proto));
 }
 
-TEST_F(JsonResponseTest, secondDocListRendersUnderOps) {
+TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
   CollectionHelper helper;
   helper.indexAll(std::array{
     flatdoc("id", "1"),
@@ -357,7 +360,7 @@ TEST_F(JsonResponseTest, secondDocListRendersUnderOps) {
   ASSERT_OK(req);
 
   EXPECT_EQ(
-      R"({"found":3,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
+      R"({"ops":{"first":{"found":3,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
       renderSearchResponseBody(req->responses[0]->proto));
 }
 

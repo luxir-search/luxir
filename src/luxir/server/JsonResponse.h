@@ -14,17 +14,20 @@ namespace luxir {
 // newline; the HTTP transport owns framing. Columnar DocList and FacetResult values are
 // flattened to row-major JSON; missing and non-finite slots render as JSON null.
 //
-// Shape:
-//   {"request_id": "...", "found": <count>, "docs": [ {<field>: <val>, ...}, ... ],
-//    "ops": {<name>: <row-shaped value>, ...},
+// Named-op shape:
+//   {"request_id": "...", "ops": {<name>: <row-shaped value>, ...},
 //    "warnings": [ {"code": ..., "message": ...}, ... ],
 //    "profile": {"ops": [...]}, "more": true}
 // Optional keys are omitted when absent (request_id when the request set
-// none). The first DocList is promoted to found/docs; all remaining response
-// ops stay under ops in response order.  On engine error:
+// none). By default every result stays under its name in ops. For a root
+// shorthand request, unwrap its single implicit q into found/docs/ops:
+//   {"found": <count>, "docs": [{<field>: <val>, ...}], "ops": {...}, ...}
+// The caller selects shorthand once from the request, for every batch.
+// On engine error:
 //   {"request_id": "...", "error": {"kind": ..., "code": ..., "message": ...},
 //    "warnings": [...]}
-std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp);
+std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp,
+                                    bool shorthand = false);
 
 // The JSON error body (no trailing newline) for a failure answered with an
 // HTTP error status - the same {request_id, error} shape as an in-band error

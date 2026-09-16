@@ -72,6 +72,7 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
   // full form: ops binds to the request
   { P::SearchRequest r;
     ASSERT_TRUE(P::read_json(r, R"({"ops":{"a":{"top_docs":{"limit":3}}},"time_zone":"UTC"})", mr));
+    EXPECT_FALSE(r.json_shorthand);
     ASSERT_EQ(1u, r.ops.size());
     EXPECT_EQ(3, *std::get<P::TopDocs>((**r.ops.find("a")).kind).limit);
     EXPECT_EQ("UTC", r.time_zone); }
@@ -80,6 +81,7 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
   { P::SearchRequest r;
     ASSERT_TRUE(P::read_json(r,
         R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","get_number":true})", mr));
+    EXPECT_TRUE(r.json_shorthand);
     EXPECT_EQ(-1, r.max_parallel);
     EXPECT_EQ("UTC", r.time_zone);
     ASSERT_EQ(1u, r.ops.size());
@@ -93,6 +95,7 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
   { P::SearchRequest r;
     ASSERT_TRUE(P::read_json(r,
         R"({"ops":{"cats":{"field_facet":{"field":"cat_s"}}},"query":"title_w:dune"})", mr));
+    EXPECT_TRUE(r.json_shorthand);
     ASSERT_EQ(1u, r.ops.size());
     const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
     ASSERT_EQ(1u, td.ops.size());
@@ -129,6 +132,7 @@ TEST(JsonDialect, SearchRequestSecondPassOverlay) {
   })", mr));
 
   EXPECT_EQ("url", r.request_id);
+  EXPECT_FALSE(r.json_shorthand);
   ASSERT_EQ(2u, r.ops.size());
   EXPECT_EQ("cat_s", std::get<P::FieldFacet>((**r.ops.find("cats")).kind).field);
   const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);

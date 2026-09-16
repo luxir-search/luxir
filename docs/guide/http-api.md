@@ -45,6 +45,10 @@ Each normal line is one complete response batch. A small default-limit search
 usually has one line and therefore also parses as an ordinary JSON object. Use
 `?format=docs` for document-per-line export without response envelopes.
 
+Explicit request `ops` return named results under response `ops`, preserving
+their hierarchy in every batch. Root query shorthand returns its implicit
+query's `found`, `docs`, and sub-`ops` directly in the response envelope.
+
 Every JSON body ends with a newline. `?pretty` (bare, or `?pretty=true` /
 `?pretty=false`) is a URL-only, best-effort formatting hint that applies to
 every JSON body of the request, errors and ingest acknowledgements included.
@@ -70,7 +74,9 @@ one vector and an array of number arrays as a multi-valued vector list.
 JSON bodies are validated strictly, with positions reported for typos. Unknown
 URL parameters are ignored, allowing middleware metadata. Add `?explain=request`
 to a query to return the canonical effective request, including URL overlays,
-without executing it; posting the result back has the same semantics.
+without executing it; posting the result back executes the same operations.
+The echo expands shorthand into an explicit `ops.q`, so replaying it uses
+the named response shape.
 
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":"books"` even when the original body omitted it.

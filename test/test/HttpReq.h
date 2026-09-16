@@ -104,13 +104,15 @@ public:
     return n;
   }
 
-  // "found" from the first response line (0 if absent).
+  // q's "found" from the first response line carrying it (0 if absent).
   int64_t found() const {
     for (auto& line : splitLines()) {
       Json root;
       if (glz::read_json(root, line)) continue;
-      if (!root.is_object() || !root.contains("found")) continue;
-      if (auto* f = root["found"].get_if<int64_t>()) return *f;
+      if (!root.is_object() || !root.contains("ops") || !root["ops"].contains("q")) continue;
+      const auto& q = root["ops"]["q"];
+      if (!q.contains("found")) continue;
+      if (auto* f = q["found"].get_if<int64_t>()) return *f;
     }
     return 0;
   }
@@ -122,8 +124,10 @@ public:
     for (auto& line : splitLines()) {
       Json root;
       if (glz::read_json(root, line)) continue;
-      if (!root.is_object() || !root.contains("docs")) continue;
-      auto* docs = root["docs"].get_if<Json::array_t>();
+      if (!root.is_object() || !root.contains("ops") || !root["ops"].contains("q")) continue;
+      const auto& q = root["ops"]["q"];
+      if (!q.contains("docs")) continue;
+      auto* docs = q["docs"].get_if<Json::array_t>();
       if (!docs) continue;
       for (const Json& d : *docs) {
         auto* obj = d.get_if<Json::object_t>();

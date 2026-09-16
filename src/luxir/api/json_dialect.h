@@ -1292,6 +1292,7 @@ struct from<JSON, luxir::api::SearchRequest> {
     auto *pair = new (addr) OpPair{"q", ::hpp_proto::indirect_view<api::SearchOp>(shorthandOp)};
     value.ops = api::map_view<std::string_view, ::hpp_proto::indirect_view<api::SearchOp>>(
         std::span<const OpPair>(pair, 1));
+    value.json_shorthand = true;
   }
 };
 

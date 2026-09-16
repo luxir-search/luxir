@@ -461,6 +461,10 @@ struct SearchRequest {
   ResponseFormat response_format = ResponseFormat::ENVELOPE;
   bool profile = false;
   std::int32_t max_parallel = 0;
+  // JSON parsing metadata, absent from the wire schema and canonical JSON.
+  // Only a root TopDocs shorthand creates this implicit q; an explicit op
+  // named q (including one modified by a URL overlay) keeps its wrapper.
+  bool json_shorthand = false;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct DocList {                                                // needs Column (map by value)

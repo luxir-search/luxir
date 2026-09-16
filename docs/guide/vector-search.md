@@ -250,35 +250,39 @@ POST /collections/books/_search
 
 ```json
 {
-  "docs": [
-    {
-      "id": "b1",
-      "title_t": "Dune",
-      "_score_": 0.032786883
-    },
-    {
-      "id": "b2",
-      "title_t": "Dune Messiah",
-      "_score_": 0.032258064
-    }
-  ],
   "ops": {
-    "authors": {
-      "buckets": [
+    "hybrid": {
+      "docs": [
         {
-          "val": "Herbert",
-          "count": 2
+          "id": "b1",
+          "title_t": "Dune",
+          "_score_": 0.032786883
+        },
+        {
+          "id": "b2",
+          "title_t": "Dune Messiah",
+          "_score_": 0.032258064
         }
-      ]
+      ],
+      "ops": {
+        "authors": {
+          "buckets": [
+            {
+              "val": "Herbert",
+              "count": 2
+            }
+          ]
+        }
+      }
     }
   }
 }
 ```
 
 Both documents came first and second in both sources, so their fused scores
-are `1/61 + 1/61` and `1/62 + 1/62`. A sole fusion operation is promoted to
-the top of the HTTP response the way a sole `top_docs` is; `fusion` has no
-root shorthand, so it is always written under `ops`.
+are `1/61 + 1/61` and `1/62 + 1/62`. The fusion result stays under its name,
+`ops.hybrid`, with the authors facet at `ops.hybrid.ops.authors`. `fusion`
+has no root shorthand, so both request and response use named `ops`.
 
 | Field | Meaning |
 |---|---|

@@ -392,8 +392,24 @@ void appendExecutionProfile(std::string& out, const luxir::api::ExecutionProfile
   out += "]}";
 }
 
-void appendDocList(std::string& out, const luxir::api::DocList& docs) {
+void appendOps(std::string& out,
+               const luxir::api::map_view<std::string_view, ::hpp_proto::indirect_view<luxir::api::Val>>& ops) {
   out += '{';
+  bool first = true;
+  for (const auto& [name, val] : ops) {
+    if (!first) out += ',';
+    first = false;
+    appendJsonString(out, name);
+    out += ':';
+    appendOpVal(out, *val);
+  }
+  out += '}';
+}
+
+// Members shared by a named DocList and an unwrapped shorthand response.
+void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
+  // "found" is opt-in: omit it when absent so "not requested" is distinct
+  // from "zero found".
   if (docs.found.has_value()) {
     out += R"("found":)";
     appendInt(out, *docs.found);
@@ -402,17 +418,14 @@ void appendDocList(std::string& out, const luxir::api::DocList& docs) {
   out += R"("docs":)";
   appendDocs(out, docs);
   if (!docs.ops.empty()) {
-    out += R"(,"ops":{)";
-    bool firstOp = true;
-    for (const auto& [name, val] : docs.ops) {
-      if (!firstOp) out += ',';
-      firstOp = false;
-      appendJsonString(out, name);
-      out += ':';
-      appendOpVal(out, *val);
-    }
-    out += '}';
+    out += R"(,"ops":)";
+    appendOps(out, docs.ops);
   }
+}
+
+void appendDocList(std::string& out, const luxir::api::DocList& docs) {
+  out += '{';
+  appendDocListMembers(out, docs);
   out += '}';
 }
 
@@ -491,7 +504,7 @@ void appendOpVal(std::string& out, const luxir::api::Val& val) {
 
 } // namespace
 
-std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp) {
+std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, bool shorthand) {
   std::string out;
   out += '{';
   bool first = true;
@@ -519,49 +532,18 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp) {
   }
 
   const luxir::api::DocList* docs = nullptr;
-  size_t promotedIndex = resp.ops.size();
-  size_t opIndex = 0;
-  for (const auto& [name, val] : resp.ops) {
-    if (auto* docList = std::get_if<luxir::api::DocList>(&val->kind)) {
-      docs = docList;
-      promotedIndex = opIndex;
-      break;
-    }
-    opIndex++;
+  if (shorthand && resp.ops.size() == 1 && resp.ops.begin()->first == "q") {
+    docs = std::get_if<luxir::api::DocList>(&resp.ops.begin()->second->kind);
   }
+  // Unwrapping shorthand replaces the root with q's result. Explicit ops
+  // retain their hierarchy; child ops are never merged with sibling ops.
   if (docs) {
-    // "found" is opt-in: set only when get_number was requested (an exact
-    // count forgoes dynamic pruning).  Omit the key when absent rather than
-    // rendering 0, so "not requested" is not confused with "zero found".
-    if (docs->found.has_value()) {
-      appendKey("found");
-      appendInt(out, *docs->found);
-    }
-    appendKey("docs");
-    appendDocs(out, *docs);
-  }
-  // The promoted DocList's nested op results are hoisted into the same "ops"
-  // object as the remaining sibling ops, mirroring the found/docs promotion.
-  if (resp.ops.size() > (docs ? 1 : 0) || (docs && !docs->ops.empty())) {
+    if (!first) out += ',';
+    first = false;
+    appendDocListMembers(out, *docs);
+  } else if (!resp.ops.empty()) {
     appendKey("ops");
-    out += '{';
-    bool firstOp = true;
-    auto appendOp = [&](std::string_view name, const luxir::api::Val& val) {
-      if (!firstOp) out += ',';
-      firstOp = false;
-      appendJsonString(out, name);
-      out += ':';
-      appendOpVal(out, val);
-    };
-    if (docs) {
-      for (const auto& [name, val] : docs->ops) appendOp(name, *val);
-    }
-    opIndex = 0;
-    for (const auto& [name, val] : resp.ops) {
-      if (opIndex++ == promotedIndex) continue;
-      appendOp(name, *val);
-    }
-    out += '}';
+    appendOps(out, resp.ops);
   }
   if (!resp.warnings.empty()) {
     // declared degradations (the request was served, but not exactly as written)

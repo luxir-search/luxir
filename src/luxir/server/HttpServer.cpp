@@ -3044,7 +3044,8 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
     if (session->aborted()) {
       status = ReplyStatus::CANCEL;  // connection failed; skip the render
     } else {
-      int64_t queued = session->enqueueJson(renderSearchResponseBody(response.proto), last);
+      int64_t queued = session->enqueueJson(
+          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand), last);
       outputCommitted = true;
       if (queued > session->highWater()) status = ReplyStatus::PAUSE;
     }
