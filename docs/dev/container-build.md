@@ -107,8 +107,10 @@ runtime is needed by the resulting Luxir executable.
 Debug and ASan builds contain debug information and frame pointers, including
 dependency debug information. Release retains full Luxir debug information so
 packaging can later split symbols from the exact optimized executable; its
-dependency libraries use vcpkg's normal Release symbol settings. Dependency
-source trees are omitted from the image; retrieve the matching sources when
+dependency libraries use vcpkg's normal Release symbol settings.
+ASan Release dependency libraries use `-g1` for stack traces and line numbers;
+ASan Debug libraries retain full variable information. Dependency source trees
+are omitted from the image; retrieve the matching sources when
 stepping into them in GDB.
 
 Release packaging, final CPU-tier selection, and execution checks on older
@@ -129,5 +131,7 @@ An image can also be stored in a registry; set `LUXIR_DEV_IMAGE` to its pinned
 registry digest. No registry publication is part of the local build.
 
 When updating dependencies, change the manifest baseline, review the overlay
-ports against that checkout, and rebuild/test the image. Do not run the native
-`make_deps.sh` patching workflow against the image's vcpkg installation.
+ports against that checkout, and rebuild/test the image. Native builds share
+these ports and the manifest, using native CPU triplets and separate install
+directories. `deps/make_deps.sh` builds those native variants on the host; the
+Dockerfile builds the portable variants for this image.

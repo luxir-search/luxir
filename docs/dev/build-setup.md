@@ -3,11 +3,13 @@
 Detailed build and environment notes for a source checkout.
 
 The instructions below describe the native GCC/vcpkg environment used by the
-`gcc-*` presets, with vcpkg roots at `/opt/vcpkg` and `/opt/vcpkg_asan`.
-Its dependencies and compiler are built for the native host. The
+`gcc-*` presets, with one vcpkg checkout at `/opt/vcpkg`. Its dependencies and
+compiler are built for the native host. The
 [development container](container-build.md) provides an alternative with the
 compiler and normal/ASan dependencies included. Both workflows use the vcpkg
-revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.json).
+revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.json),
+the same manifest, and the same overlay ports. Native dependencies are installed
+in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 
 ## Development Requirements
 
@@ -15,13 +17,17 @@ revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.js
   uses a GCC 16 development snapshot
 - CMake 3.25+ (the preset file uses schema version 6) and Ninja
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
-- Host tools: pkg-config and gfortran matching the selected GCC major version
+- Host tools: pkg-config, Python 3, curl, zip, unzip, and tar
 - Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog, CLI11,
   LZ4, FAISS, glaze, GTL, GoogleTest, and Google Benchmark. The compiler
   supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
 
 The build uses `-march=native`; a release binary is intended for the machine
 class on which its dependencies and Luxir itself were built.
+TBB and its internal tbbmalloc allocator are static vcpkg libraries. Application
+malloc/free remain glibc's. OpenBLAS supplies C LAPACK, so neither a Fortran
+compiler nor a Fortran runtime is required. Native builds retain shared GCC
+runtimes; the container's static runtime setting is a separate packaging choice.
 
 ## Prepare a checkout
 
@@ -42,42 +48,77 @@ git -C /opt/vcpkg checkout --detach "$luxir_vcpkg_revision"
 /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 ```
 
-Run Luxir's dependency setup before installing packages. It fetches pinned
-FastPFOR and applies the required triplet and FAISS patches to the vcpkg root:
+Install the host tools (in addition to GCC/G++, CMake, and Ninja):
 
 ```bash
-./deps/make_deps.sh /opt/vcpkg
+sudo apt install pkg-config python3 curl zip unzip tar
 ```
 
-Then install the current vcpkg set:
+Build both native dependency variants:
 
 ```bash
-cd /opt/vcpkg
-./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark \
-  xxhash gtl protobuf grpc spdlog lz4 cli11 faiss glaze
+./deps/make_deps.sh
 ```
 
-For an existing installation, update the checkout to the recorded revision
-while preserving Luxir's triplet/port patches, bootstrap vcpkg again, and rerun
-`deps/apply_patches.sh` from the Luxir checkout. Run `./vcpkg upgrade` in the
-vcpkg root to inspect the changes, then
-`./vcpkg upgrade --no-dry-run --no-keep-going` to rebuild the affected packages.
-Update the ASan root to the same revision and apply its instrumented triplet.
-Perform the two dependency builds sequentially, then rebuild and test Luxir's
-corresponding presets.
+The script fetches pinned FastPFOR sources, checks the vcpkg revision, and installs
+the manifest sequentially with `x64-linux-luxir-native` and
+`x64-linux-luxir-native-asan`. It defaults to 12 dependency build jobs; override
+`VCPKG_MAX_CONCURRENCY` for the machine's memory budget. Both variants include
+Debug and Release libraries. ASan uses unsanitized host tools from the
+Release-only `x64-linux-luxir-native-host` triplet, avoiding duplicated normal
+Debug libraries in the ASan install. Normal native builds reuse their target
+triplet for host tools.
 
-On Ubuntu, the remaining host packages include TBB, pkg-config, Ninja, and a
-Fortran compiler whose major matches GCC:
+The script fingerprints the selected GCC compilers' effective native CPU options
+for vcpkg's binary cache, so a package built on one CPU is not reused on another
+with different native settings. Use this script when updating dependencies;
+direct native-triplet installs require that fingerprint. `CC` and `CXX` default
+to `gcc` and `g++`, matching the presets. If overriding them, select the same
+compilers when configuring Luxir.
+
+After changing the manifest or overlays, rerun the script. To update vcpkg itself,
+change the manifest baseline, check out that revision in `/opt/vcpkg`, bootstrap
+again, then rerun the script. No changes to upstream ports or triplets are needed.
+
+When migrating an existing build from the old classic-mode dependencies, reset
+the CMake caches so cached package paths cannot retain system TBB or the old
+Fortran LAPACK provider:
 
 ```bash
-sudo apt install libtbb-dev pkg-config ninja-build "gfortran-$(gcc -dumpversion)"
+cmake --fresh --preset gcc-debug
+cmake --fresh --preset gcc-release
+cmake --fresh --preset gcc-debug-asan
 ```
 
-See [deps/README.txt](../../deps/README.txt) for why the local vcpkg patches and
-the matching Fortran compiler are correctness requirements, not optional
-tuning. A clean-machine setup can still require adjustment as upstream vcpkg
-is updated or host tools differ; the recorded checkout does not yet pin the
-complete build environment.
+Reapply local CMake options such as `-DLUXIR_LOCAL_TARGETS=ON` when refreshing.
+The new installs do not modify `/opt/vcpkg/installed` or `/opt/vcpkg_asan`.
+Those legacy installations can be removed after migrating their consumers.
+See [deps/README.txt](../../deps/README.txt) for the dependency configuration.
+The host compiler and system packages are not pinned by this workflow.
+
+### Deferring the Release-only host migration
+
+Changing the scripts and presets does not rebuild or remove installed packages.
+Existing native build trees can keep using their current dependencies. If the
+ASan install still contains host tools under `x64-linux-luxir-native`, use this
+temporary override when configuring before the next dependency setup run:
+
+```bash
+cmake --preset gcc-debug-asan -DVCPKG_HOST_TRIPLET=x64-linux-luxir-native
+```
+
+Use the same override for `gcc-release-asan` if needed. Normal native presets
+need no override. When ready to migrate:
+
+```bash
+./deps/make_deps.sh
+cmake --fresh --preset gcc-debug-asan
+```
+
+The setup run replaces the ASan install's old host packages with Release-only
+host packages and can rebuild affected dependencies. Refresh any other native
+ASan build trees too, reapplying local CMake options. This clears cached paths
+to the old host tools. The disk-space saving occurs during this migration.
 
 The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker
 (mold), and a precompiled header are used when available. Each preset builds
@@ -106,7 +147,7 @@ When working with the native toolchain, use the non-ASan debug build for iterati
 ```bash
 cmake --preset gcc-debug
 cmake --build --preset gcc-debug
-./build/gcc-debug/bin/luxir_test
+./build/gcc-debug/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
 
 Build the optimized server with:
@@ -119,16 +160,13 @@ cmake --build --preset gcc-release
 
 Before committing memory-sensitive work, run the ASan build:
 
-The ASan presets use a separate `/opt/vcpkg_asan` root whose dependencies must
-also be built with ASan. Clone a second vcpkg tree at the recorded revision,
-bootstrap it, rerun `deps/make_deps.sh /opt/vcpkg /opt/vcpkg_asan`, and install
-the same package set there before configuring the preset. See
-`deps/README.txt` for the required instrumented triplet.
+The ASan presets use the instrumented dependencies in
+`/opt/vcpkg/installed-native-asan`, built by the same setup script.
 
 ```bash
 cmake --preset gcc-debug-asan
 cmake --build --preset gcc-debug-asan
-ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/luxir_test
+ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
 
 The binaries for every preset are under `build/<preset>/bin/`.

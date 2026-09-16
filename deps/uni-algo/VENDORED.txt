@@ -1,2 +1,2 @@
 v1.2.0 (Unicode 15.1.0), vendored from https://github.com/uni-algo/uni-algo tag v1.2.0
-Locally patched: patches/uni-algo-word-only-newline-leak.patch (word_only emitted newline runs after a word; see apply_patches.sh header)
+Locally patched: patches/uni-algo-word-only-newline-leak.patch (word_only emitted newline runs after a word)

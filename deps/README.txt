@@ -1,78 +1,78 @@
 Building
 --------
 
-For the shared Ubuntu 22.04 container, see ../docs/dev/container-build.md.
-The instructions below describe the native setup.
+Native GCC setup: ../docs/dev/build-setup.md
+Ubuntu 22.04 container: ../docs/dev/container-build.md
 
-Use the vcpkg checkout recorded as builtin-baseline in vcpkg.json for both the normal and
-ASan roots. See ../docs/dev/build-setup.md for checkout and update commands.
-The revision records the upstream ports; the patches below remain required.
+Both builds use vcpkg.json, its builtin-baseline, and the ports/ overlays.
+No upstream vcpkg files need patching. After bootstrapping /opt/vcpkg at the
+recorded revision, run from this directory:
 
-0) System Build Tools
-  # gcc/g++-16 (fortran is for building FAISS deps)
-  sudo apt install gcc-16 g++-16 gfortran-16
-  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-16 50 --slave /usr/bin/g++ g++ /usr/bin/g++-16
-  sudo update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-16 50 
+  ./make_deps.sh
 
-  # we currently use system tbb
-  sudo apt install libtbb-dev
-  # build tools
-  sudo apt install pkg-config cmake ninja-build
-  # recommended, but not required
-  sudo apt install gdb ccache mold
+This fetches pinned sources and installs normal and ASan dependencies
+sequentially into /opt/vcpkg/installed-native and installed-native-asan.
+An optional first argument selects another vcpkg checkout; adjust the CMake
+presets' toolchain and install paths accordingly. VCPKG_MAX_CONCURRENCY defaults
+to 12. Sources and binary caches are shared; completed build trees are cleaned.
 
-1) One-shot setup (idempotent; safe to re-run):
- 
-   TODO: this patches existing checkouts in vcpkg, so not sure
-   How to bootstrap w/o compiling first :-(
-
-$ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
-
-   This fetches pinned FastPFOR sources if absent (and restores the
-   normally-vendored uni-algo if it is ever missing) and applies Luxir's local
-   patches to the vcpkg roots (and FastPFOR, if any patches exist). FastPFOR
-   itself is compiled by the main CMakeLists.txt, so there is no static-lib
-   build step. Run it BEFORE installing vcpkg packages, or reinstall any
-   already-built package afterwards so it picks up the patched triplet/port
-   (e.g. ./vcpkg remove faiss && ./vcpkg install faiss).
-
-   apply_patches.sh is the patch-application piece on its own; patches/ holds
-   one file per change, and the script headers document what each one does.
-
-   Why the triplet flags are required, not optional: the -march=native family
-   of flags must match the project's own release CXXFLAGS. abseil's hash
-   changes under these flags, so a mismatched protobuf builds a
-   protobuf::Map<string,...> whose find() silently returns end() for entries
-   that iteration sees (release builds only). The asan-root triplet also
-   builds all dependencies with ASan; without that, newer gRPC/protobuf hit
-   "use after poison" errors under the asan presets.
-
-2) Install dependencies via vcpkg (repeat in the asan root for asan presets):
-
-$ cd /opt/vcpkg
-$ ./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 glaze faiss
-
-FastPFOR
+Triplets
 --------
-make_deps.sh clones this; details for reference:
 
-- Pinned to tag v0.5.0 (fast-pack/FastPFOR), the release with ARM NEON
-  support. Cloned into deps/FastPFOR (gitignored).
-- Compiled by the main CMakeLists.txt: the `fastpfor` static-lib target builds
-  just the bit-packing sources we use (bitpacking.cpp, simdbitpacking.cpp,
-  simdunalignedbitpacking.cpp) with headers from deps/FastPFOR/headers. streamvbyte.c is also compiled for the postings-tail SIMD varint path.
-  varintdecode.c and codecfactory.cpp are unused and excluded. So there is no manual
-  lib-build step.
-- No local patches are needed at present. If one becomes necessary, drop it in
-  patches/ as fastpfor*.diff and apply_patches.sh will apply it on the next run.
+triplets/x64-linux-luxir-native*.cmake use -march=native -mtune=native for C and
+C++. The setup script records the compilers' effective CPU options in the
+binary-cache ABI, preventing reuse across incompatible native CPU settings.
+triplets/x64-linux-luxir-v2*.cmake provide the container's x86-64-v2 baseline.
+The common fragments select static libraries and disable the IPO configuration
+unsupported by static oneTBB. ASan variants instrument all target dependencies;
+host code generators run unsanitized. Native ASan uses the Release-only
+x64-linux-luxir-native-host triplet for host packages, avoiding another copy of
+the normal Debug libraries. Normal native builds reuse their target triplet for
+host tools; container ASan uses x64-linux-luxir-v2 for host tools.
+ASan Debug libraries retain full debug information. Optimized ASan libraries
+use -g1 for stack traces and line numbers, avoiding expensive GCC tracking of
+optimized local variables.
 
-uni-algo
---------
-Vendored in-repo (v1.2.0, Unicode 15.1.0; see uni-algo/VENDORED.txt) and
-compiled by the main CMakeLists.txt (uni_algo target from src/data.cpp), so
-nothing to do here. fetch_sources.sh can re-fetch the identical subset from the
-upstream tag if the directory is ever removed and applies
-the local fix in patches/uni-algo-word-only-newline-leak.patch (the vendored
-copy in git already has it applied - see the apply_patches.sh header for what
-it fixes and why).
+Use matching CPU flags for Luxir and native dependencies. Some inline library
+implementations select behavior based on compiler feature macros; historically,
+mismatched abseil/protobuf hashing flags broke protobuf::Map lookups. For a
+controlled compilation experiment, audit those interfaces before changing one
+side independently.
 
+Libraries
+---------
+
+- TBB and tbbmalloc come from the pinned vcpkg port. Luxir retains the static
+  allocator entry points needed by TBB. Application malloc/free remain glibc's.
+- The FAISS overlay enables runtime SIMD dispatch (FAISS_OPT_LEVEL=dd) and
+  checks the CPU features required by each dispatched kernel.
+- OpenBLAS includes C LAPACK with 32-bit LAPACK integers. No Fortran compiler
+  or runtime is needed. BLAS is single-threaded with locking for concurrent
+  callers; CPU-specific kernels are selected at runtime. ASan disables the
+  AVX-512 OpenBLAS kernels whose inline assembly GCC cannot instrument.
+  The overlay preserves caller CPU flags for common code and C LAPACK; upstream
+  otherwise strips -march=native as a workaround for older GCC versions.
+- The lapack overlay directs FAISS to the LAPACK routines inside OpenBLAS.
+
+For dependency changes, rerun make_deps.sh, then rebuild and test Luxir. Old
+classic installs under /opt/vcpkg/installed and /opt/vcpkg_asan are not used by
+the presets. On migration, configure each native preset once with --fresh to
+discard cached package locations.
+
+The Release-only native host change takes effect on the next make_deps.sh run,
+which migrates the ASan install and can rebuild affected dependencies. Existing
+build trees can still use the current installation until then. For an ASan
+configure before migration, override VCPKG_HOST_TRIPLET=x64-linux-luxir-native.
+After migration, configure native ASan presets with --fresh to clear cached
+tool paths. See ../docs/dev/build-setup.md for the commands.
+
+Vendored sources
+----------------
+
+fetch_sources.sh clones FastPFOR at v0.5.0 (fast-pack/FastPFOR) if absent. The
+main CMakeLists.txt builds its selected bit-packing and streamvbyte sources.
+
+uni-algo is vendored at v1.2.0 (Unicode 15.1.0). fetch_sources.sh restores it
+if absent and applies patches/uni-algo-word-only-newline-leak.patch. The fix
+resets the word property accumulator at newline breaks, preventing word_only
+from emitting newline runs after a word. Word boundaries are unchanged.

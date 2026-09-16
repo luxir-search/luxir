@@ -56,6 +56,7 @@
       "name": "features-asan",
       "hidden": true,
       "cacheVariables": {
+        "CMAKE_C_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
         "CMAKE_CXX_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address",
         "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address",
@@ -64,31 +65,50 @@
     },
 
     {
+      "name": "base-native",
+      "hidden": true,
+      "inherits": ["base", "base-gcc"],
+      "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_MANIFEST_MODE": "OFF",
+        "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-native",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-native",
+        "VCPKG_HOST_TRIPLET": "x64-linux-luxir-native",
+        "LUXIR_CPU_TARGET": "native"
+      }
+    },
+    {
+      "name": "native-asan",
+      "hidden": true,
+      "inherits": "features-asan",
+      "cacheVariables": {
+        "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-native-asan",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-native-asan",
+        "VCPKG_HOST_TRIPLET": "x64-linux-luxir-native-host"
+      }
+    },
+    {
       "name": "gcc-debug",
-      "inherits": ["base", "base-gcc", "base-debug"],
+      "inherits": ["base-native", "base-debug"],
       "displayName": "Native GCC Debug",
-      "description": "Non-ASan debug build with the native GCC/vcpkg toolchain. Uses -Og, PCH, and ccache when available. For debugging that needs every local variable materialized, override CMAKE_CXX_FLAGS_DEBUG with -g -ftrivial-auto-var-init=pattern.",
-      "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      "description": "Non-ASan debug build with the native GCC/vcpkg toolchain. Uses -Og, PCH, and ccache when available. For debugging that needs every local variable materialized, override CMAKE_CXX_FLAGS_DEBUG with -g -ftrivial-auto-var-init=pattern."
     },
     {
       "name": "gcc-release",
-      "inherits": ["base", "base-gcc", "base-release"],
+      "inherits": ["base-native", "base-release"],
       "displayName": "GCC Release",
-      "description": "Optimized build for benchmarking and release-perf checks (non-ASan).",
-      "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      "description": "Optimized build for benchmarking and release-perf checks (non-ASan)."
     },
     {
       "name": "gcc-debug-asan",
-      "inherits": ["base", "base-gcc", "base-debug", "features-asan"],
+      "inherits": ["native-asan", "base-native", "base-debug"],
       "displayName": "GCC Debug ASAN (memory checks only)",
-      "description": "Use before committing or when chasing a crash/UB (use-after-free, leaks, OOB). NOT the default iteration build: ASan adds ~50% to a cold build and makes the suite ~4x slower (24s vs 6s).",
-      "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
+      "description": "Use before committing or when chasing a crash/UB (use-after-free, leaks, OOB)."
     },
     {
       "name": "gcc-release-asan",
-      "inherits": ["base", "base-gcc", "base-release", "features-asan"],
-      "displayName": "GCC Release ASAN",
-      "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
+      "inherits": ["native-asan", "base-native", "base-release"],
+      "displayName": "GCC Release ASAN"
     },
     {
       "name": "base-container",
@@ -142,7 +162,6 @@
       "cacheVariables": {
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-asan",
         "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-v2-asan",
-        "CMAKE_C_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
         "CMAKE_CXX_FLAGS_DEBUG": "-g -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
       }
     }

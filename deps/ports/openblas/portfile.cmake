@@ -10,6 +10,9 @@ vcpkg_from_github(
         system-check-msvc.diff
         win32-uwp.diff
         android-exclude-sme.diff
+        # GCC 16 honors later kernel-specific -march flags. Preserve caller
+        # CPU flags for common code and C LAPACK, including native builds.
+        caller-cpu-flags.diff
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS OPTIONS

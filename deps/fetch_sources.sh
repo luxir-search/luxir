@@ -34,7 +34,7 @@ else
   cp -r "${srcdir[0]}/include" "${srcdir[0]}/src" "${srcdir[0]}/LICENSE.md" uni-algo/
   echo "${UNI_ALGO_TAG} (Unicode 15.1.0), vendored from https://github.com/uni-algo/uni-algo tag ${UNI_ALGO_TAG}" \
     > uni-algo/VENDORED.txt
-  echo "Locally patched: patches/uni-algo-word-only-newline-leak.patch (word_only emitted newline runs after a word; see apply_patches.sh header)" \
+  echo "Locally patched: patches/uni-algo-word-only-newline-leak.patch (word_only emitted newline runs after a word)" \
     >> uni-algo/VENDORED.txt
   git -C .. apply "$(pwd)/patches/uni-algo-word-only-newline-leak.patch"
 fi
