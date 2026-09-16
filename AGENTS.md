@@ -6,9 +6,18 @@ See [docs/dev/codebase-map.md](docs/dev/codebase-map.md) for the component/class
 
 ## Build Commands
 
-Use the **gcc** presets (FAISS is only in the gcc vcpkg repos). Each preset
-builds into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`. See
-[docs/dev/build-setup.md](docs/dev/build-setup.md) for requirements and IDE/clangd setup.
+Use the workflow configured for the checkout:
+
+- Native GCC/vcpkg: use the `gcc-*` presets; see
+  [docs/dev/build-setup.md](docs/dev/build-setup.md).
+- Development container: use the `container-*` presets; see
+  [docs/dev/container-build.md](docs/dev/container-build.md). From the host, run
+  commands through `./tools/dev-container`. Inside an IDE dev container, run
+  CMake and test binaries directly.
+
+Each preset builds into `build/<preset-name>/`, with binaries in
+`build/<preset-name>/bin/`. The examples below use the native presets; the
+container guide has the corresponding container commands.
 
 For a full/clean rebuild redirect to a log to avoid cluttering your context.
 Then always grep for warnings and only dump the full tail on failure.
@@ -22,15 +31,15 @@ grep -n "warning:" /tmp/build.log
 ### Iterate (default): non-ASan, fastest edit-build-test
 
 ```bash
-cmake --preset gcc-debug          # configure build/gcc-debug/ (first time only)
-cmake --build --preset gcc-debug  # binaries in build/gcc-debug/bin/
+cmake --preset gcc-debug
+cmake --build --preset gcc-debug
 ```
 
 ### Memory checks: ASan (run before committing, or when debugging a crash/UB)
 
 ```bash
 cmake --preset gcc-debug-asan
-cmake --build --preset gcc-debug-asan   # binaries in build/gcc-debug-asan/bin/
+cmake --build --preset gcc-debug-asan
 ```
 
 Fresh checkout or after `rm -rf build/`: build once before IDE code-insight works (the
@@ -51,10 +60,10 @@ per-test/per-suite lines otherwise burn context on every green run.
 ./build/gcc-debug/bin/luxir_test --gtest_filter="IndexWriterTest.*" --gtest_brief=1 --gtest_print_time=0
 
 # Run benchmarks (NOTE: builds production-scale corpora - slow setup, use
-# gcc-release and memory caps (ulimit -v 32000000) for real measurements.
+# gcc-release and memory caps appropriate to the machine for real measurements.
 # For quick iteration/coverage use the small-corpus unit-test mode instead:
-#   ./build/gcc-debug/bin/luxir_test --gtest_filter="Benchmarks.all"
-./build/gcc-debug/bin/luxir_test --bench
+#   ./build/gcc-debug/bin/luxir_test --gtest_filter="Benchmarks.all" --gtest_brief=1 --gtest_print_time=0
+./build/gcc-release/bin/luxir_test --bench
 
 # Run all benchmarks except the slow vector ones (HNSW/IVFPQ builds dominate
 # wall-clock). Negative google-benchmark filter excludes the BM_Vector* family:
@@ -85,4 +94,5 @@ per-test/per-suite lines otherwise burn context on every green run.
 
 ## Environment
 
-- vcpkg toolchains located at `/opt/vcpkg/`, look there for source code for dependencies
+- Locate dependency sources using the selected preset's vcpkg toolchain and
+  installation paths; host and container paths can differ.

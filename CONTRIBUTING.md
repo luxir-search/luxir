@@ -21,10 +21,10 @@ against a fresh, empty collection is ideal; the
 1. For anything beyond a small fix, open an issue or discussion first and say
    what you plan to change. Design questions are cheaper to settle before the
    code exists, and parts of the engine are being reshaped.
-2. Build and test locally. [Build setup](docs/dev/build-setup.md) covers the
-   toolchain and presets; the [Codebase map](docs/dev/codebase-map.md) explains
-   where things live. The default iteration build is `gcc-debug`; run the
-   `gcc-debug-asan` build as well before submitting.
+2. Build and test using the [development container](docs/dev/container-build.md)
+   or a [native toolchain](docs/dev/build-setup.md). Use the corresponding
+   non-ASan debug preset for iteration and ASan preset before submitting.
+   [Codebase map](docs/dev/codebase-map.md) explains where things live.
 3. Add or extend tests for behavior you change. Tests use the helpers in
    `test/test/` (`CollectionHelper.h`, `TestUtils.h`, `LocalReq.h`) rather
    than mocks, and stay short.

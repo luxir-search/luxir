@@ -2,12 +2,12 @@
 
 Detailed build and environment notes for a source checkout.
 
-For a reusable Ubuntu 22.04/GCC 16.2 environment with normal and ASan
-dependencies, use the [container build](container-build.md). The instructions
-below describe the existing native environment: GCC and vcpkg roots at
-`/opt/vcpkg` and `/opt/vcpkg_asan`. Its dependencies and compiler are built for
-the native host. Both workflows use the vcpkg revision recorded as
-`builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.json).
+The instructions below describe the native GCC/vcpkg environment used by the
+`gcc-*` presets, with vcpkg roots at `/opt/vcpkg` and `/opt/vcpkg_asan`.
+Its dependencies and compiler are built for the native host. The
+[development container](container-build.md) provides an alternative with the
+compiler and normal/ASan dependencies included. Both workflows use the vcpkg
+revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.json).
 
 ## Development Requirements
 
@@ -101,7 +101,7 @@ Delete any non-preset CLion "Debug" profile -- it has no vcpkg toolchain and wil
 
 ## Build and test
 
-Use the non-ASan debug build for normal iteration:
+When working with the native toolchain, use the non-ASan debug build for iteration:
 
 ```bash
 cmake --preset gcc-debug

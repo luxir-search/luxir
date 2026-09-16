@@ -13,10 +13,14 @@ removing one variant's packages while installing the other.
 Editors supporting the Dev Container specification can also open the checkout
 using `.devcontainer/devcontainer.json`. Select `container-debug` as the editor's
 CMake preset and build once to generate the API headers used by code insight.
+Inside the dev container, run CMake and test binaries directly; the
+`tools/dev-container` wrapper is for commands launched from the host.
 
 ## Build the image
 
-Install Docker with BuildKit, then run from a source checkout:
+Install Docker with BuildKit and confirm that `docker info` works in your current
+login. If you just joined the `docker` group, start a new login session to activate
+that membership. Then run from a source checkout:
 
 ```bash
 git submodule update --init

@@ -66,8 +66,8 @@
     {
       "name": "gcc-debug",
       "inherits": ["base", "base-gcc", "base-debug"],
-      "displayName": "GCC Debug (recommended for iteration)",
-      "description": "Default for the edit-build-test loop. Non-ASan: cold build ~137s vs ~204s for gcc-debug-asan, and the suite runs ~4x faster (6s vs 24s). PCH + ccache + mold auto-enabled. Built at -Og, not -O0: costs ~6% build time and a few scalar locals that gdb reports as <optimized out>, buys a 3x faster suite and GCC's dataflow warnings (-Wmaybe-uninitialized and friends), which -O0 cannot emit at all. For a session where you need every local materialized, reconfigure one build dir with -DCMAKE_CXX_FLAGS_DEBUG=\"-g -ftrivial-auto-var-init=pattern\".",
+      "displayName": "Native GCC Debug",
+      "description": "Non-ASan debug build with the native GCC/vcpkg toolchain. Uses -Og, PCH, and ccache when available. For debugging that needs every local variable materialized, override CMAKE_CXX_FLAGS_DEBUG with -g -ftrivial-auto-var-init=pattern.",
       "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"
     },
     {
@@ -149,7 +149,7 @@
   ],
 
   "buildPresets": [
-    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Recommended iteration build. Concurrent compiles are capped adaptively (physical cores + RAM, <=16) via the luxir_compile Ninja pool in CMakeLists, so a plain -j is safe here and on smaller laptops." },
+    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Native non-ASan debug build. Concurrent compilation is limited by the luxir_compile Ninja pool; override with LUXIR_COMPILE_JOBS when configuring." },
     { "name": "gcc-debug-asan",   "configurePreset": "gcc-debug-asan",   "description": "Memory-check build (pre-commit)." },
     { "name": "gcc-release",      "configurePreset": "gcc-release" },
     { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" },

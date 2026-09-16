@@ -102,18 +102,18 @@ Continue with the [Quickstart](docs/guide/quickstart.md), then use the
 ## Build from source
 
 Releases with binaries are published on the [download page](https://luxir.org/download/).
-To build from source instead, Luxir requires a C++26-capable compiler (gcc16), CMake,
-Ninja, vcpkg, and the native dependencies listed in
-[Build Setup](docs/dev/build-setup.md). With those dependencies installed:
+Build with the [development container](docs/dev/container-build.md) or a
+[native toolchain](docs/dev/build-setup.md). The container supplies Ubuntu 22.04,
+GCC 16.2, CMake, and the pinned normal/ASan dependencies. After building or
+importing the image as described in the container guide:
 
 ```bash
-cmake --preset gcc-release
-cmake --build --preset gcc-release
-./build/gcc-release/bin/luxir
+./tools/dev-container cmake --preset container-release
+./tools/dev-container cmake --build --preset container-release
+./build/container-release/bin/luxir
 ```
 
-The [development container](docs/dev/container-build.md) supplies Ubuntu 22.04,
-GCC 16.2, and the pinned normal/ASan dependencies for a shared build environment.
+The resulting executable can run directly on a supported Linux host.
 
 The project is licensed under the [Apache License 2.0](LICENSE). Third-party
 components and their licenses are listed in [NOTICE](NOTICE).
