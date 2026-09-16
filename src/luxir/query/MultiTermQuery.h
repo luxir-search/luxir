@@ -11,6 +11,7 @@
 #include <variant>
 #include <vector>
 
+#include "DocSetBulkScorer.h"
 #include "PostingsUnion.h"
 #include "Query.h"
 #include "luxir/reader/FilteredTermsEnum.h"
@@ -244,10 +245,8 @@ public:
     static void addPostingsToBitset(
         FixedBitSet& bits, const TermsEnum::PostingsState& state) {
       DocsOnlyEnum docsEnum(state);
-      for (int32_t doc = docsEnum.nextDoc();
-           doc != PostingsReader::END; doc = docsEnum.nextDoc()) {
-        bits.set(doc);
-      }
+      docsEnum.intoBitSet(
+          {bits.words, FixedBitSet::sizeInWords(bits.size())}, 0, bits.size());
     }
 
     static ExpansionFacts* findExpansionFacts(
@@ -350,20 +349,24 @@ public:
       return *facts;
     }
 
-    Query::Scorer* createEagerScorer(
-        MemPool& targetPool,
-        std::span<const TermsEnum::PostingsState> states,
+    FixedBitSet materializeEagerBitset(
+        MemPool& targetPool, const ExpansionFacts& facts,
         int32_t maxDoc) {
+      if (facts.matchState == Query::MatchState::EMPTY) {
+        return FixedBitSet(nullptr, 0);
+      }
+      if (facts.hasBitset()) {
+        return FixedBitSet(facts.bitWords(), maxDoc);
+      }
       size_t nWords = FixedBitSet::sizeInWords(maxDoc);
       auto* words = (uint64_t*)targetPool.alloc(
           nWords * sizeof(uint64_t), alignof(uint64_t));
       memset(words, 0, nWords * sizeof(uint64_t));
       FixedBitSet bits(words, maxDoc);
-      for (const auto& state : states) {
+      for (const auto& state : facts.states()) {
         addPostingsToBitset(bits, state);
       }
-      return targetPool.make<MultiTermQuery::Scorer>(
-          bits, maxDoc, boost);
+      return bits;
     }
 
     Query::Scorer* createScorerFromPlan(
@@ -372,10 +375,9 @@ public:
       unused(facts.sumDocFreq);
       if (facts.matchState == Query::MatchState::EMPTY) return nullptr;
       int32_t maxDoc = segment.postingsReader().maxDoc();
-      if (facts.hasBitset()) {
-        assert(mode == ExpansionMode::EAGER);
+      if (mode == ExpansionMode::EAGER) {
         return targetPool.make<MultiTermQuery::Scorer>(
-            FixedBitSet(facts.bitWords(), maxDoc), maxDoc, boost);
+            materializeEagerBitset(targetPool, facts, maxDoc), maxDoc, boost);
       }
       const ExpansionFacts::States& states = facts.states();
       assert(facts.termCount == states.size());
@@ -401,14 +403,22 @@ public:
         return targetPool.make<UnionLazyScorer>(
             std::span(docsEnums, facts.termCount), windowBits, maxDoc, boost);
       }
-      return createEagerScorer(
-          targetPool, states, maxDoc);
+      std::unreachable();
     }
 
     class Supplier final : public Query::ScorerSupplier {
       Weight& weight;
       IndexReader::Segment& segment;
       MemPool& scratchPool;
+
+      struct BulkState : BulkBuildState {
+        Query::PlanContext context;
+
+        BulkState(Supplier& supplier, BulkUse use)
+          : BulkBuildState{&supplier},
+            context(Weight::scorerBuildContext(Query::Demand::fromLeadCost(
+                std::numeric_limits<int64_t>::max(), use))) {}
+      };
 
       static Query::ScorerShape shapeFor(
           Query::MatchState matchState, ExpansionMode mode,
@@ -549,6 +559,37 @@ public:
       Query::PlanContext makePlanContext(
           const Query::Demand& demand) const override {
         return Weight::scorerBuildContext(demand);
+      }
+
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        // Keep pruned consumers on the lazy union. Eager consumers already
+        // pay to materialize membership, so preserve that set through COUNT
+        // and window collection instead of enumerating its bits again.
+        if (weight.canUseLazy || bulkContext.requireConstantCount
+            || bulkContext.requireFilterConsumption) {
+          return {};
+        }
+        auto* state = scratchPool.make<BulkState>(*this, use);
+        return {
+          BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
+          BulkAnswer::NO, state,
+        };
+      }
+
+      BulkScorer* buildBulk(
+          MemPool& targetPool, const BulkPlan& plan) override {
+        assert(plan.available == BulkAnswer::YES);
+        assert(!plan.hasConstantCount());
+        assert(plan.buildState != nullptr && plan.buildState->owner == this);
+        const auto& state = *static_cast<const BulkState*>(plan.buildState);
+        const ExpansionFacts& facts = weight.expansionFacts(
+            targetPool, segment, state.context);
+        FixedBitSet bits = weight.materializeEagerBitset(
+            targetPool, facts, segment.maxDoc());
+        auto* docs = luxir::arenaCreate<BitDocSet>(weight.memoArena, bits);
+        return targetPool.make<DocSetBulkScorer>(
+            targetPool, docs, bits.size(), weight.boost);
       }
 
     };

@@ -803,6 +803,107 @@ TEST_F(MultiTermScorerModesTest,
 }
 
 TEST_F(MultiTermScorerModesTest,
+       eagerBulkPlansKeepBudgetAndIndependentCounts) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+  auto& segment = ti.reader->segments()[0];
+  RAMBitDocSet filter(segment.maxDoc());
+  for (int32_t doc = 0; doc < segment.maxDoc(); doc += 3) {
+    filter.mutableBits().set(doc);
+  }
+
+  for (size_t maxStates : {0u, 1000u}) {
+    auto guard = ti.pool.rewindScopeGuard();
+    Query::Context context(ti.pool, *ti.reader);
+    PrefixQuery prefix("body_w", "q");
+    auto* weight = (MultiTermQuery::Weight*) prefix.createWeight(
+        context, Query::NEED_SCORES, 3.5f);
+    auto* supplier = weight->scorerSupplier(ti.pool, segment);
+    SkipStatsGuard stats;
+    auto makePlan = [&](Query::ExecutionUse use) {
+      StateBudgetGuard budget(maxStates * sizeof(TermsEnum::PostingsState));
+      return supplier->planBulk(use, {});
+    };
+    auto plan = makePlan(Query::ExecutionUse::COUNT_WINDOWS);
+    EXPECT_EQ(0, SkipStats::multitermExpansions);
+    ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+    EXPECT_FALSE(plan.hasConstantCount());
+    auto* bulk = supplier->buildBulk(ti.pool, plan);
+    ASSERT_NE(nullptr, bulk);
+    EXPECT_EQ(maxStates == 0, weight->expansionMemoUsesBitsetForTests(segment));
+    EXPECT_TRUE(bulk->willCountDense());
+    EXPECT_EQ(3000, countMatchesWindowed(bulk, nullptr, nullptr, segment.maxDoc()));
+    EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
+
+    auto secondPlan = makePlan(Query::ExecutionUse::MATCH_WINDOWS);
+    auto* second = supplier->buildBulk(ti.pool, secondPlan);
+    ASSERT_NE(nullptr, second);
+    DocSetBuilder builder(segment.maxDoc());
+    EXPECT_EQ(1000, countMatchesWindowed(second, &filter, &builder, segment.maxDoc()));
+    auto docs = builder.build();
+    ASSERT_EQ(1000, docs->card());
+    for (int32_t doc = 0; doc < segment.maxDoc(); doc++) {
+      EXPECT_EQ(doc % 3 == 0, docs->get(doc));
+    }
+    auto* scored = supplier->buildBulk(
+        ti.pool, makePlan(Query::ExecutionUse::SCORED_WINDOWS));
+    ScoreWindow window;
+    scored->scoreNextWindow(window, nullptr, 0, segment.maxDoc(), 3.0f);
+    ASSERT_GT(window.size, 0);
+    for (int32_t i = 0; i < window.size; i++) {
+      EXPECT_EQ(i, window.docs[(size_t) i]);
+      EXPECT_FLOAT_EQ(3.5f, window.scores[(size_t) i]);
+    }
+    EXPECT_EQ(1, SkipStats::multitermExpansions);
+  }
+}
+
+TEST_F(MultiTermScorerModesTest, bulkPlanningPreservesLazyAndConstraintContracts) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, {{0, "qalpha qbeta"}, {1, "other"}});
+  Query::Context context(ti.pool, *ti.reader);
+  PrefixQuery prefix("body_w", "q");
+  auto& segment = ti.reader->segments()[0];
+  SkipStatsGuard stats;
+  auto* lazy = prefix.createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
+      ->scorerSupplier(ti.pool, segment);
+  EXPECT_EQ(Query::ScorerSupplier::BulkAnswer::NO,
+            lazy->planBulk(Query::ExecutionUse::SCORED_WINDOWS, {}).available);
+  auto* eager = prefix.createWeight(context, 0)->scorerSupplier(ti.pool, segment);
+  for (bool constant : {false, true}) {
+    Query::ScorerSupplier::BulkScorerContext constraints;
+    constraints.requireConstantCount = constant;
+    constraints.requireFilterConsumption = !constant;
+    auto plan = eager->planBulk(Query::ExecutionUse::COUNT_WINDOWS, constraints);
+    EXPECT_EQ(Query::ScorerSupplier::BulkAnswer::NO, plan.available);
+    EXPECT_FALSE(plan.hasConstantCount());
+  }
+  EXPECT_EQ(0, SkipStats::multitermExpansions);
+}
+
+TEST_F(MultiTermScorerModesTest, emptyExpansionKeepsFilterOnlyBulkValid) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, {{0, "qalpha"}, {1, "other"}});
+  for (std::string_view name : {"body_w", "missing_w"}) {
+    auto guard = ti.pool.rewindScopeGuard();
+    Query::Context context(ti.pool, *ti.reader);
+    PrefixQuery prefix(name, "absent");
+    Query* filters[] = {&prefix};
+    BooleanQuery query({}, {}, {}, filters);
+    auto& segment = context.topReader.segments()[0];
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(ti.pool, segment);
+    auto plan = supplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {});
+    ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+    auto* bulk = supplier->buildBulk(ti.pool, plan);
+    ASSERT_NE(nullptr, bulk);
+    EXPECT_EQ(0, countMatchesWindowed(bulk, nullptr, nullptr, segment.maxDoc()));
+  }
+}
+
+TEST_F(MultiTermScorerModesTest,
        supplierCostStaysMaxDocUntilExpansionMemoIsFilled) {
   TestIndex ti;
   TestField field(ti, "body_w");

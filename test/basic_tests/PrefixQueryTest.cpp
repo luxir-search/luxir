@@ -135,6 +135,7 @@ struct PrefixDecodeRun {
   std::vector<TopDocsCollector::ScoreDoc> docs;
   int64_t hits;
   int64_t blocks;
+  int64_t wordBlocks;
 };
 
 static PrefixDecodeRun runPrefixDecode(
@@ -165,7 +166,7 @@ static PrefixDecodeRun runPrefixDecode(
   }
   auto sorted = collector.sort();
   return {{sorted.begin(), sorted.end()}, collector.totalHits(),
-          SkipStats::docBlocksDecoded};
+          SkipStats::docBlocksDecoded, SkipStats::countBulkFillWordBlocks};
 }
 
 TEST_F(PrefixQueryTest, singleSegment) {
@@ -289,6 +290,62 @@ TEST_F(PrefixQueryTest, lazyScoredPathMatchesMaterialized) {
   ASSERT_EQ(10u, top10.size());
   ASSERT_GE(top1000.size(), top10.size());
   expectSamePrefixTopK(top10, std::span(top1000).first(top10.size()));
+}
+
+TEST_F(PrefixQueryTest, exactCountKeepsDeletesAndFiltersAcrossSegments) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "d1", "body_w", "prealpha prebeta", "keep_s", "yes"),
+      flatdoc("id", "d2", "body_w", "prebeta", "keep_s", "yes"),
+      flatdoc("id", "d3", "body_w", "other", "keep_s", "yes"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "d4", "body_w", "prealpha", "keep_s", "no"),
+      flatdoc("id", "d5", "body_w", "prebeta predelta", "keep_s", "yes"),
+      flatdoc("id", "d6", "body_w", "other", "keep_s", "no"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("d2", UpdateMessage::COMMIT).success);
+
+  for (bool parallel : {false, true}) {
+    for (bool filtered : {false, true}) {
+      for (int32_t limit : {0, 2}) {
+        SCOPED_TRACE(::testing::Message() << "parallel=" << parallel
+            << " filtered=" << filtered << " limit=" << limit);
+        auto req = localReq(helper.getSearchEngine());
+        req->collection("main");
+        auto& top = req->topDocs("q").exprQuery("body_w:pre*")
+            .getNumber().getScores().fields({"id"}).limit(limit);
+        if (filtered) top.matchFilter("keep_s", "yes");
+        req->execute(parallel);
+        ASSERT_TRUE(req->ok()) << req->errorMsg();
+        EXPECT_EQ(filtered ? 2 : 3, req->getMatchCount("q"));
+        auto docs = req->getDocs("q");
+        ASSERT_EQ((size_t) limit, docs.size());
+        std::vector<std::string> ids;
+        for (const auto& doc : docs) {
+          const auto* id = find(doc, "id");
+          ASSERT_NE(nullptr, id);
+          ids.push_back(std::get<std::string>(*id));
+          EXPECT_TRUE(ids.back() == "d1" || ids.back() == "d5"
+                      || (!filtered && ids.back() == "d4"));
+        }
+        if (limit == 2) {
+          EXPECT_NE(ids[0], ids[1]);
+          const auto* result = req->docList("q");
+          ASSERT_NE(nullptr, result);
+          const auto* column = result->columns.find("_score_");
+          ASSERT_NE(nullptr, column);
+          const auto* scores = std::get_if<api::ColFloat>(&column->kind);
+          ASSERT_NE(nullptr, scores);
+          ASSERT_EQ(docs.size(), scores->v.size());
+          // Folded filters make prefix a required AUTO_UNIFORM clause.
+          for (float score : scores->v) {
+            EXPECT_FLOAT_EQ(filtered ? 0.0f : 1.0f, score);
+          }
+        }
+      }
+    }
+  }
 }
 
 TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
@@ -463,7 +520,7 @@ TEST_F(PrefixQueryTest, lazyRoutingPinsPruningLeadAndDecodeVolume) {
   expectSamePrefixTopK(eager.docs, lazy.docs);
   expectSamePrefixTopK(eager.docs, heap.docs);
   EXPECT_EQ(10, heap.hits);
-  EXPECT_LE(heap.blocks, eager.blocks);
+  EXPECT_LE(heap.blocks, lazyUnfilled.blocks);
   expectSamePrefixTopK(eager.docs, exactCount.docs);
   expectSamePrefixTopK(exactCount.docs, exactCountKnob.docs);
   expectSamePrefixTopK(driven.docs, drivenKnob.docs);
@@ -475,12 +532,17 @@ TEST_F(PrefixQueryTest, lazyRoutingPinsPruningLeadAndDecodeVolume) {
   EXPECT_EQ(10, driven.hits);
   EXPECT_EQ(docCount, lazyUnfilled.hits);
   EXPECT_GT(eager.blocks, 0);
-  EXPECT_LT(lazy.blocks, eager.blocks);
+  // Eager union can OR dense blocks without decoding them. Compare pruning
+  // against exhaustive lazy iteration, and check eager work is independent
+  // of whether the collector fills.
+  EXPECT_GT(eager.wordBlocks, 0);
   EXPECT_EQ(exactCount.blocks, exactCountKnob.blocks);
   EXPECT_EQ(exactCount.blocks, eager.blocks);
+  EXPECT_EQ(exactCount.wordBlocks, eager.wordBlocks);
   EXPECT_EQ(driven.blocks, drivenKnob.blocks);
   EXPECT_LT(lazy.blocks, lazyUnfilled.blocks);
-  EXPECT_LE(lazyUnfilled.blocks, eagerUnfilled.blocks);
+  EXPECT_EQ(eager.blocks, eagerUnfilled.blocks);
+  EXPECT_EQ(eager.wordBlocks, eagerUnfilled.wordBlocks);
 }
 
 // QueryBuilder validates that prefix queries only run on term-backed fields.
