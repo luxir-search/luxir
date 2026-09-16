@@ -7,37 +7,29 @@ JSON/HTTP API that is easy to write by hand and a gRPC API for programs. It
 is written for modern hardware: a work-stealing scheduler, asynchronous IO,
 SIMD codecs, and an index served from memory-mapped files.
 
-The simplest search:
+The simplest search is a URL:
 
 ```http
-POST /collections/main/_search
-
-{
-  "query": {
-    "match": {
-      "title_t": "kings"
-    }
-  },
-  "fields": ["id", "author_s", "year_i"],
-  "get_number": true
-}
+GET /collections/main/_search?query=title_t:kings
 ```
 
 ```json
 {
-  "found": 1,
   "docs": [
     {
       "id": "1",
-      "author_s": "Sanderson",
+      "author_name": "Brandon Sanderson",
+      "price_f": 12.5,
+      "series_s": "Stormlight",
+      "title_t": "The Way of Kings",
       "year_i": 2010
     }
   ]
 }
 ```
 
-Add `ops` to return documents, counts by series, and the average price of all
-matches in one request:
+A JSON body takes the same fields and adds `ops`. This one returns documents,
+counts by series, and the average price of all matches in one request:
 
 ```http
 POST /collections/main/_search
@@ -45,7 +37,7 @@ POST /collections/main/_search
 {
   "query": {
     "match": {
-      "author_s": "Sanderson"
+      "author_name": "sanderson"
     }
   },
   "fields": ["id", "title_t", "price_f"],

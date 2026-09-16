@@ -45,7 +45,7 @@ curl -X POST http://localhost:9400/collections/main/_update \
       {
         "id": "1",
         "title_t": "The Way of Kings",
-        "author_s": "Sanderson",
+        "author_name": "Brandon Sanderson",
         "series_s": "Stormlight",
         "year_i": 2010,
         "price_f": 12.5
@@ -53,7 +53,7 @@ curl -X POST http://localhost:9400/collections/main/_update \
       {
         "id": "2",
         "title_t": "Words of Radiance",
-        "author_s": "Sanderson",
+        "author_name": "Brandon Sanderson",
         "series_s": "Stormlight",
         "year_i": 2014,
         "price_f": 15.0
@@ -61,7 +61,7 @@ curl -X POST http://localhost:9400/collections/main/_update \
       {
         "id": "3",
         "title_t": "Mistborn: The Final Empire",
-        "author_s": "Sanderson",
+        "author_name": "Brandon Sanderson",
         "series_s": "Mistborn",
         "year_i": 2006,
         "price_f": 8.5
@@ -76,18 +76,54 @@ curl -X POST http://localhost:9400/collections/main/_update \
 ```
 
 The write created the `main` collection, and **built-in field templates**
-supplied the field types: `_t` is searchable text, `_s` is an exact string, and
-`_i` is an integer you can range and sort on, and `_f` stores floating-point
-numbers. You did not need to define your own schema.
+supplied the field types: `_t` is searchable text, `_name` is a name that
+supports word search plus whole-name facets and sorting, `_s` is an exact
+string, `_i` is an integer you can range and sort on, and `_f` stores
+floating-point numbers. You did not need to define your own schema.
 
 Templates also handle fields you do not know about yet. For example, a custom
 `_attr` template can cover new product attributes as an ecommerce catalog
 grows. You can combine templates with explicit field definitions and choose
 your own names. See [Schema](schema.md#field-templates-for-dynamic-fields).
 
-When one input should support both word search and whole-value facets or sorts,
-use [field variants](documents.md#field-variants). The author example uses
-`_name` to search individual words and facet on whole names.
+`author_name` is one input indexed two ways: `author_name:sanderson` matches a
+word of the name, while a facet or sort on `author_name` uses the whole value
+`Brandon Sanderson`. [Field variants](documents.md#field-variants) shows how
+the template does this and how to define your own.
+
+## Search
+
+The simplest search is a URL:
+
+```bash
+curl 'http://localhost:9400/collections/main/_search?pretty&query=title_t:kings'
+```
+
+```json
+{
+  "docs": [
+    {
+      "id": "1",
+      "author_name": "Brandon Sanderson",
+      "price_f": 12.5,
+      "series_s": "Stormlight",
+      "title_t": "The Way of Kings",
+      "year_i": 2010
+    }
+  ]
+}
+```
+
+`title_t:kings` searches the title field for `kings`, using the same text
+analysis as indexing, so it finds *"The Way of Kings"*. `query` is an
+expression in the [Luxir query language](query-language.md). `pretty` formats
+the response for reading; leave it off and a program gets one compact line.
+The same URL works in a browser, and it can be bookmarked or shared. `fields`,
+`sort`, `limit`, and the other common request fields have
+[URL parameter forms](searching.md#url-request-field-overlay) too.
+
+Requests with more structure, such as facets and metrics, are JSON bodies.
+The rest of this page uses them.
 
 > **Reading the rest of this page:** requests are shown as HTTP: method, path,
 > and body. On the website, every request block has a **Copy as curl** button
@@ -96,24 +132,18 @@ use [field variants](documents.md#field-variants). The author example uses
 > yourself as above:
 > `curl -X POST 'http://localhost:9400<path>?pretty' -H 'Content-Type: application/json' -d '<body>'`.
 
-## Search
+The same search as JSON, choosing which fields come back and asking for the
+exact match count:
 
 ```http
 POST /collections/main/_search
 
 {
   "query": "title_t:kings",
-  "fields": ["id", "title_t", "author_s", "year_i"],
+  "fields": ["id", "title_t", "author_name", "year_i"],
   "get_number": true
 }
 ```
-
-```json
-{"found":1,"docs":[{"id":"1","title_t":"The Way of Kings","author_s":"Sanderson","year_i":2010}]}
-```
-
-Add `?pretty` to the search URL (`/collections/main/_search?pretty`) for
-readable output:
 
 ```json
 {
@@ -122,23 +152,20 @@ readable output:
     {
       "id": "1",
       "title_t": "The Way of Kings",
-      "author_s": "Sanderson",
+      "author_name": "Brandon Sanderson",
       "year_i": 2010
     }
   ]
 }
 ```
 
-Alternatively, pipe the curl response through `| jq`.
-
-`title_t:kings` searches the title field for `kings`, using the same text
-analysis as indexing, so it finds *"The Way of Kings"*. The equivalent
-[structured form](query-reference.md#match) is
+The equivalent [structured form](query-reference.md#match) of the query is
 `"query": {"match": {"title_t": "kings"}}`. You can use either form anywhere
 a query is accepted.
 
-`fields` chooses what comes back. A document that doesn't have a requested
-field omits that key; no `null` placeholder is written.
+`fields` chooses what comes back; without it, every retrievable field is
+returned. A document that doesn't have a requested field omits that key; no
+`null` placeholder is written.
 
 To get the same keys in every doc, add `"document_format": "columns"` to the
 request. Every supported projected field then appears in every doc, with an
@@ -155,7 +182,7 @@ regardless of `limit`:
 POST /collections/main/_search
 
 {
-  "query": {"match": {"author_s": "Sanderson"}},
+  "query": {"match": {"author_name": "sanderson"}},
   "fields": ["id", "title_t"],
   "get_number": true,
   "limit": 2
@@ -257,7 +284,7 @@ POST /collections/main/_search
 {
   "query": {
     "match": {
-      "author_s": "Sanderson"
+      "author_name": "sanderson"
     }
   },
   "fields": ["id", "title_t", "price_f"],
@@ -330,8 +357,8 @@ of the stream, making the documents searchable before the request completes:
 POST /collections/main/_update?commit=true
 Content-Type: application/x-ndjson
 
-{"id": "4", "title_t": "Oathbringer", "author_s": "Sanderson", "series_s": "Stormlight", "year_i": 2017, "price_f": 17.5}
-{"id": "5", "title_t": "The Well of Ascension", "author_s": "Sanderson", "series_s": "Mistborn", "year_i": 2007, "price_f": 10.0}
+{"id": "4", "title_t": "Oathbringer", "author_name": "Brandon Sanderson", "series_s": "Stormlight", "year_i": 2017, "price_f": 17.5}
+{"id": "5", "title_t": "The Well of Ascension", "author_name": "Brandon Sanderson", "series_s": "Mistborn", "year_i": 2007, "price_f": 10.0}
 ```
 
 ```json

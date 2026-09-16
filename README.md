@@ -80,7 +80,7 @@ curl -X POST http://localhost:9400/collections/books/_update \
       {
         "id": "b1",
         "title_t": "The Way of Kings",
-        "author_s": "Sanderson",
+        "author_name": "Brandon Sanderson",
         "year_i": 2010
       }
     ],
@@ -93,7 +93,7 @@ Search it:
 ```bash
 curl -X POST 'http://localhost:9400/collections/books/_search?pretty' \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"match":{"title_t":"kings"}},"fields":["id","author_s","year_i"]}'
+  -d '{"query":{"match":{"title_t":"kings"}},"fields":["id","author_name","year_i"]}'
 ```
 
 Continue with the [Quickstart](docs/guide/quickstart.md), then use the
