@@ -4,8 +4,7 @@ Luxir is a native-code search engine with full-text relevance, vector
 similarity, faceting, analytics, and geo search in one index. Queries,
 filters, facets, statistics, and rank fusion go in one request, over a
 JSON/HTTP API that is easy to write by hand and a gRPC API for programs. It
-is written for modern hardware: a work-stealing scheduler, asynchronous IO,
-SIMD codecs, and an index served from memory-mapped files.
+is native code written for modern hardware.
 
 The simplest search is a URL:
 
@@ -93,52 +92,42 @@ commands with these same documents, and the
 [architecture](design/architecture.md) page explains why the engine is built
 the way it is. This page lists what ships today.
 
-## Highlights
+## Performance
 
-**One request returns a whole results page.** Top documents, facets with
-nested sub-operations, statistics, and hybrid fusion are named operations in
-a single request, all executed over one consistent view of the index. The
-example above is the simple case. The same request shape can nest facets
-under facets, put metrics and ranked documents under every bucket, and run
-facets over a fused ranking.
+Native code with no garbage collector and no heap ceiling, built to use a
+whole machine. Designed from the start for parallelism on modern hardware.
 
-- Counts are exact by default: `found` and every facet count are real
-  totals. A request that asks for a count is counted exhaustively; one that
-  does not runs top-k with block-max pruning.
-
-**Text and vector search work together, with the same filters and
-analytics.** A kNN query is a query like any other: it goes under boolean
-clauses and takes the same filters, and those filters apply inside the vector
-search rather than after a fixed unfiltered top-k. Reciprocal rank fusion
-merges lexical and vector rankings in the same request, with facets over the
-fused set. Vectors are stored in the index beside the documents, so there is
-no separate vector store to keep in sync.
-
-- Exact kNN over the vector column, or per-segment approximate indexes built
-  at commit and rescored at full precision from the column.
-
-**Native code that uses the whole machine.** No garbage collector and no heap
-ceiling, an index served from memory-mapped files, a work-stealing scheduler
-shared by indexing, merging, and search, and SIMD codecs on the hot paths.
-One process is meant to scale up across a large machine. Benchmark results
-are not yet published; the [architecture](design/architecture.md) page
-explains what each part is for.
-
-- Streaming in and out: NDJSON ingest with no stream-size limit and no bulk
-  size to choose, and every match streamed out over one connection with no
-  scroll state. An export can be piped straight back into ingest.
-- Crash-safe commits: segments are immutable and commit points are atomic, so
-  after a crash the index reopens at the previous commit.
-
-Requests are structured JSON, or protobuf over gRPC. Wherever a request takes
-a query, the query can be either a structured object or a string in the Luxir
-query language, such as `title_t:dune AND year_i:>=1965`. Both forms build
-the same query tree, so `?explain=request` shows the structured form of any
-expression, and most structured query types can also be called as functions
-with named arguments inside an expression. A parse error in either form
-reports its position. `$vars` are substituted as values rather than syntax,
-so user input cannot inject operators, and raw search-box text can go through
-`simple_query`, which never fails to parse.
+- Parallelism: A Work-stealing scheduler shared by indexing, merging, and search.
+- Indexing is a pipeline of independent stages, so ingest never waits behind
+  a merge and a commit does not stop the world. Send one NDJSON stream and
+  indexing parallelizes across all available cores automatically.
+- Merges parallelize inside a single merge, and increase the parallelism
+  as long as indexing is under its RAM budget.
+- Memory-mapped, zero-copy reads: the on-disk format is the in-memory format,
+  so postings, columns, and vector indexes are consumed in place with no
+  deserialization step.
+- Asynchronous network IO on both surfaces. Cheap queries can run inline on the
+  connection thread with no scheduler handoff, and a request can opt onto the
+  shared scheduler so an expensive query does not occupy its connection.
+- SIMD codecs for postings and numeric data (FastPFOR-based bit-packing,
+  StreamVByte), roaring-style two-level bitsets for document sets, and BM25
+  hot loops written to auto-vectorize.
+- Block-max pruning for lightning fast top-k queries.
+  Pareto frontiers in the index facilitate skipping whole groups of documents
+  that won't be competitive.
+- Sort pruning: numeric columns store per-block min and max zone maps. A
+  field-sorted top-k skips whole blocks of values that can't be competitive,
+  even without a points (BKD) index.
+- Range queries without a points (BKD) index use the same zone maps: a numeric
+  range or value set skips column blocks it cannot intersect, accepts whole
+  blocks it covers, and decodes only the blocks that cross a bound.
+- Adaptive facet counting picks among many strategies to best balance 
+  performance and RAM usage.
+- Filter cache ranked by rebuild cost per byte, so cheap filters are evicted
+  before expensive ones.
+- Allocation discipline: indexing runs on rollback-capable memory pools, and
+  requests decode into arena-backed message objects with no per-field heap
+  allocation on the way in.
 
 ## Schema and fields
 
@@ -244,13 +233,13 @@ Anywhere a query goes, it can be a structured object or an expression string.
   (`fuzzy(smith, field=name_s, max_edits=2)`; vector and geo queries stay
   structured). Special characters act only
   where they mean something, so most values need no escaping. Strict grammar
-  with byte-offset errors; `$vars` substitute values without re-parsing them.
+  with byte-offset errors; `$vars` substitute values without re-parsing them,
+  so user input cannot inject operators.
+- Both forms build the same query tree, so `?explain=request` returns the
+  structured form of any request, expression strings included.
 - Non-scoring filters on top-docs and fusion sources, routable past named
   sub-operations (`except_ops`). Expression strings are convenient as
   filters: `"filter": ["status_s:active AND year_i:>=1960"]`.
-- A filter cache that ranks entries by rebuild cost per byte, so under memory
-  pressure it evicts cheap single-term filters before expensive compound
-  ones.
 
 ## Search and ranking
 
@@ -264,11 +253,15 @@ Anywhere a query goes, it can be a structured object or an expression string.
   field when `fields` is omitted. Row- or column-oriented documents per
   request (`document_format`): HTTP defaults to rows (a missing field is an
   absent key), gRPC to dense columns.
-- Several named operations in one request over the same index view, executed
-  in parallel; HTTP responses preserve their names and nesting under `ops`.
+- Any number of named operations in one request over the same index view:
+  ranked lists, facets, metrics, and fusion, nested to any depth and executed
+  in parallel. HTTP responses preserve their names and nesting under `ops`.
   Root query shorthand returns `found` and `docs` directly in the HTTP envelope.
 - Count-only and analytics-only requests: `limit: 0` with `get_number: true`
   loads no document fields.
+- Stream every match: `limit: -1` with `?format=docs` returns one document
+  per line over one connection, with no cursor, scroll state, or page size.
+  The output pipes straight back into NDJSON ingest.
 - Hybrid fusion: reciprocal rank fusion over named sources with shared and
   per-source filters, `limit` and `offset` over the fused list, and facets and
   metrics over the fused candidate set.
@@ -302,8 +295,9 @@ Anywhere a query goes, it can be a structured object or an expression string.
 ## Vector search
 
 - Dense float32 vector fields, single- or multi-valued; the column store is
-  the source of truth. Metrics: L2, inner product, cosine (normalize-on-write
-  by default).
+  the source of truth, so there is no separate vector store to keep in sync
+  and deletes, updates, and merges apply to vectors as they do to text.
+  Metrics: L2, inner product, cosine (normalize-on-write by default).
 - Exact kNN (full-precision column scan) and approximate search through
   per-segment IVF+PQ indexes, mixed per segment by a size gate. Approximate
   candidates are rescored at full precision straight from the column, so the
@@ -368,6 +362,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 
 Luxir is pre-1.0 and moving fast; interfaces can change without
 back-compat. It is a single-node engine with no replication, distributed
-query execution, authentication, or TLS. This page lists shipped
+query execution, authentication, or TLS. Benchmark results are not yet
+published. This page lists shipped
 capabilities; the [operations guide](guide/operations.md) states the
 deployment boundary and the current limitations.
