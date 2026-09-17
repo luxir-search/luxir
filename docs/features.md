@@ -97,35 +97,40 @@ the way it is. This page lists what ships today.
 Native code with no garbage collector and no heap ceiling, built to use a
 whole machine. Designed from the start for parallelism on modern hardware.
 
-- Parallelism: A Work-stealing scheduler shared by indexing, merging, and search.
-- Indexing is a pipeline of independent stages, so ingest never waits behind
-  a merge and a commit does not stop the world. Send one NDJSON stream and
-  indexing parallelizes across all available cores automatically.
-- Merges parallelize inside a single merge, and increase the parallelism
-  as long as indexing is under its RAM budget.
-- Memory-mapped, zero-copy reads: the on-disk format is the in-memory format,
-  so postings, columns, and vector indexes are consumed in place with no
-  deserialization step.
-- Asynchronous network IO on both surfaces. Cheap queries can run inline on the
-  connection thread with no scheduler handoff, and a request can opt onto the
-  shared scheduler so an expensive query does not occupy its connection.
-- SIMD codecs for postings and numeric data (FastPFOR-based bit-packing,
+- **Work-stealing parallelism:** A shared scheduler balances indexing,
+  merging, and search across cores. Idle workers steal tasks from busy workers.
+- **Pipelined indexing:** A pipeline of independent stages, so ingest never
+  waits behind a merge and a commit does not stop the world.
+- **Automatic parallel indexing:** Send one NDJSON stream (or one gRPC
+  stream); Luxir spreads the indexing work across available cores.
+- **Multicore merges:** Even a single merge runs across multiple cores,
+  with concurrency governed by the indexing RAM budget.
+- **Zero-copy reads:** The on-disk format is the in-memory format. Queries
+  consume postings, columns, and vector indexes directly from memory-mapped
+  files, with no deserialization or extra copy from the OS page cache.
+- **Asynchronous IO:** HTTP/JSON and gRPC handle many connections without
+  requiring a thread per connection. Cheap queries execute inline with no
+  scheduler handoff; requests can opt onto the shared worker pool for
+  parallel execution or to keep long computations off the IO threads.
+- **SIMD codecs** for postings and numeric data (FastPFOR-based bit-packing,
   StreamVByte), roaring-style two-level bitsets for document sets, and BM25
   hot loops written to auto-vectorize.
-- Block-max pruning for lightning fast top-k queries.
-  Pareto frontiers in the index facilitate skipping whole groups of documents
-  that won't be competitive.
-- Sort pruning: numeric columns store per-block min and max zone maps. A
-  field-sorted top-k skips whole blocks of values that can't be competitive,
+- **Block-max pruning:** Skips whole blocks of documents that cannot enter
+  the top k. Pareto frontiers provide score bounds that eliminate scoring
+  work while preserving exact top-k results.
+- **Sort pruning:** Field-sorted top-k queries skip whole blocks of values
+  that cannot be competitive. Per-block min/max zone maps enable pruning
   even without a points (BKD) index.
-- Range queries without a points (BKD) index use the same zone maps: a numeric
-  range or value set skips column blocks it cannot intersect, accepts whole
-  blocks it covers, and decodes only the blocks that cross a bound.
-- Adaptive facet counting picks among many strategies to best balance 
-  performance and RAM usage.
-- Filter cache ranked by rebuild cost per byte, so cheap filters are evicted
-  before expensive ones.
-- Allocation discipline: indexing runs on rollback-capable memory pools, and
+- **Range pruning:** Numeric ranges and value sets skip irrelevant column
+  blocks, accept fully covered blocks, and decode only blocks requiring
+  closer inspection. The same zone maps enable this without a points (BKD)
+  index.
+- **Adaptive facet execution:** Dynamically selects counting strategies and
+  counter representations to suit the matching documents and field
+  cardinality, balancing speed and memory use.
+- **Cost-aware filter cache:** Favors filters that are expensive to rebuild
+  relative to their size, saving more computation per byte of cache.
+- **Arena allocation:** Indexing runs on rollback-capable memory pools, and
   requests decode into arena-backed message objects with no per-field heap
   allocation on the way in.
 
