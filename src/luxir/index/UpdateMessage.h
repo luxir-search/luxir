@@ -14,8 +14,7 @@ class IndexWriter;
 class UpdateMessage;
 
 // CommitInfo is used to track information about a commit.  This is internally used by the IndexWriter.
-// The IndexWriter has a global/next CommitInfo used to track deletions, and when a commit message is
-// received, it is moved to that message and a new CommitInfo is created for the next commit.
+// Each commit message owns the coordination state for its flushes and merge waits.
 // This really belongs internally to the IndexWriter, but since UpdateMessage isn't scoped within IndexWriter,
 // this can't be either (can't forward declare IndexWriter::CommitInfo).
 class CommitInfo {
@@ -40,7 +39,6 @@ public:
   // inverter->updateMessage, among other things.
   uint32_t leftToFlush = 0;
 
-  MultiDeletesData multiDeletesData;  // the deletes data for this commit, if any.  This is moved from the Inverter when the segment is flushed.
 };
 
 // An update message to be processed by the TBB update flow graph.

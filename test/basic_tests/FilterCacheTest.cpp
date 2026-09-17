@@ -6036,6 +6036,8 @@ void validateConcurrentSweepPurgeAccounting() {
 class FilterCacheConcurrencyTest : public LuxirTest {};
 
 TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
+  SCOPED_TRACE("gtest seed=" + std::to_string(global_random_seed)
+               + " test seed=" + std::to_string(rng_seed));
   ASSERT_NO_THROW(validateConcurrentByproductPublication());
   ASSERT_NO_THROW(validateStalePublicationRejection());
   ASSERT_NO_THROW(validateConcurrentSweepPurgeAccounting());
@@ -6158,7 +6160,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
   auto all = runSearch(node.getSearchEngine(), collection, std::nullopt);
   ASSERT_TRUE(all.valid) << all.error;
   ASSERT_EQ(std::set<int32_t>(all.ids.begin(), all.ids.end()).size(),
-            all.ids.size());
+            all.ids.size()) << "ids=" << ::testing::PrintToString(all.ids);
   for (size_t i = 0; i < (size_t)FilterKind::COUNT; i++) {
     auto kind = (FilterKind)i;
     std::vector<int32_t> expected;

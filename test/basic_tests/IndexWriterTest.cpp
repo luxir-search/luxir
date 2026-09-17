@@ -2033,6 +2033,241 @@ TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
 }
 
 
+TEST_F(IndexWriterTest, overwriteSurvivesCommitAheadOfOlderUpdate) {
+  using namespace luxir::test;
+  class GatedUpdate final : public ProtoUpdateMessage {
+  public:
+    std::promise<void> entered;
+    std::promise<void> handled;
+    std::latch* gate = nullptr;
+    using ProtoUpdateMessage::ProtoUpdateMessage;
+    void handle(IndexWriter& iw) override {
+      entered.set_value();
+      if (gate) gate->wait();
+      ProtoUpdateMessage::handle(iw);
+      handled.set_value();
+    }
+    void done(IndexWriter&) override {}
+  };
+
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  ASSERT_TRUE(helper.index(flatdoc("id", "seed")).success);
+
+  TimedCommitMessage earlyCommit;
+  CollectionHelper::UpdateBuilder olderRequest, newerRequest;
+  olderRequest.add(flatdoc("id", "dup")).overwrite().commitWithin(60000);
+  newerRequest.add(flatdoc("id", "dup")).overwrite();
+  GatedUpdate older(&olderRequest.finish()), newer(&newerRequest.finish());
+  std::latch releaseCommit(1), releaseOlder(1);
+  std::promise<void> commitEntered;
+  older.gate = &releaseOlder;
+  auto cleanup = scope_guard([&] {
+    if (!releaseCommit.try_wait()) releaseCommit.count_down();
+    if (!releaseOlder.try_wait()) releaseOlder.count_down();
+    iw->updateGraph.wait_for_all();
+    Signal::unlisten("initiateCommit");
+  });
+  Signal::listen("initiateCommit", [&](void* msg, void*, void*) -> void* {
+    if (msg == &earlyCommit) {
+      commitEntered.set_value();
+      releaseCommit.wait();
+    }
+    return nullptr;
+  });
+
+  ASSERT_TRUE(iw->submitUpdate(&earlyCommit));
+  ASSERT_EQ(std::future_status::ready, commitEntered.get_future().wait_for(5s));
+  ASSERT_TRUE(iw->submitUpdate(&older));
+  ASSERT_EQ(std::future_status::ready, older.entered.get_future().wait_for(5s));
+  ASSERT_TRUE(iw->submitUpdate(&newer));
+  ASSERT_EQ(std::future_status::ready, newer.handled.get_future().wait_for(5s));
+
+  // The newer request reuses the seed's inverter. This early commit flushes
+  // both, even though the intervening older request has not obtained an inverter.
+  releaseCommit.count_down();
+  ASSERT_TRUE(earlyCommit.waitFor(5s));
+  ASSERT_FALSE(earlyCommit.result.errored());
+  ASSERT_EQ(2, iw->getIndexReader()->liveDocs());
+  {
+    std::lock_guard<std::mutex> lock(iw->autoCommitMutex);
+    EXPECT_TRUE(iw->autoCommitPending);
+  }
+  releaseOlder.count_down();
+  iw->updateGraph.wait_for_all();
+  ASSERT_FALSE(older.result.errored());
+  ASSERT_FALSE(newer.result.errored());
+  helper.commit();
+  EXPECT_TRUE(iw->pendingDeletes.empty());
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("id", "dup").fields({"_version_"});
+  req->execute();
+  auto docs = req->getDocs();
+  ASSERT_EQ(1, docs.size());
+  ASSERT_NE(nullptr, find(docs[0], "_version_"));
+  EXPECT_EQ((int64_t)newer.updateVersion, std::get<int64_t>(*find(docs[0], "_version_")));
+}
+
+TEST_F(IndexWriterTest, overwriteKeepsNewestVersionWithinInverter) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(flatdoc("id", "seed")).success);
+  // Requests receive versions at intake, but may obtain the same inverter in
+  // the opposite order.
+  for (uint64_t version : {3, 2}) {
+    auto& inv = iw->obtainInverter(version);
+    inv.overwrite = true;
+    inv.startDoc();
+    inv.getIndexHandler("id").index(inv, "dup");
+    inv.finishDoc();
+    iw->releaseInverter(inv);
+  }
+  helper.commit();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("id", "dup").fields({"_version_"});
+  req->execute();
+  auto docs = req->getDocs();
+  ASSERT_EQ(1, docs.size());
+  ASSERT_NE(nullptr, find(docs[0], "_version_"));
+  EXPECT_EQ(3, std::get<int64_t>(*find(docs[0], "_version_")));
+}
+
+TEST_F(IndexWriterTest, publicationSnapshotsDeletesAndRetainsUnflushedPrefix) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(1000);
+  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+
+  auto& older = iw->obtainInverter(2);
+  auto& newer = iw->obtainInverter(3);
+  for (auto* inv : {&older, &newer}) {
+    inv->overwrite = true;
+    inv->startDoc();
+    inv->getIndexHandler("id").index(*inv, "dup");
+    inv->finishDoc();
+  }
+  iw->releaseInverter(older);
+  iw->releaseInverter(newer, true);
+  iw->updateGraph.wait_for_all();
+  ASSERT_EQ(1, iw->pendingDeletes.size());
+  std::weak_ptr<const SortedDeletes> batch = *iw->pendingDeletes.deletes.begin();
+
+  // A merge publication snapshots the future auto-flush, including its delete
+  // of the original doc, but does not flush the older buffered overwrite.
+  for (int i = 0; i < 2; i++) {
+    TimedCommitMessage publication;
+    publication.publishOnly = true;
+    ASSERT_TRUE(iw->submitUpdate(&publication));
+    iw->updateGraph.wait_for_all();
+    ASSERT_FALSE(publication.result.errored());
+    EXPECT_EQ(1, iw->getIndexReader()->liveDocs());
+    EXPECT_FALSE(batch.expired());
+  }
+  helper.commit();
+  EXPECT_EQ(1, iw->getIndexReader()->liveDocs());
+  EXPECT_TRUE(iw->pendingDeletes.empty());
+  EXPECT_TRUE(batch.expired());
+}
+
+TEST_F(IndexWriterTest, failedDeleteApplicationRetainsDeletesForRetry) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+  Signal::listen("deleteAppliedToSegment", [](void*, void*, void*) -> void* {
+    throw std::runtime_error("injected delete application failure");
+  });
+  {
+    ExpectLog quiet("injected delete application failure");
+    EXPECT_FALSE(helper.deleteById("dup", UpdateMessage::COMMIT).success);
+  }
+  iw->updateGraph.wait_for_all();
+  Signal::unlisten("deleteAppliedToSegment");
+  EXPECT_FALSE(iw->pendingDeletes.empty());
+  EXPECT_EQ(1, iw->getIndexReader()->liveDocs());
+  helper.commit();
+  EXPECT_EQ(0, iw->getIndexReader()->liveDocs());
+  EXPECT_TRUE(iw->pendingDeletes.empty());
+}
+
+TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {
+  using namespace luxir::test;
+  RAMDir dir;
+  {
+    IndexWriter iw(dir);
+    auto& future = iw.obtainInverter(1);
+    future.startDoc();
+    future.getIndexHandler("id").index(future, "dup");
+    future.finishDoc();
+    iw.releaseInverter(future);
+    // A later no-op request reuses the inverter and advances its envelope.
+    auto& noOp = iw.obtainInverter(10);
+    iw.releaseInverter(noOp, true);
+    iw.updateGraph.wait_for_all();
+    iw.commit();
+    ASSERT_EQ(10, readDurableIndexInfo(dir)->update_version);
+
+    // Dropping the segment that carries the high-water must not decrease the
+    // manifest's update version.
+    auto& del = iw.obtainInverter(2);
+    del.deleteId("dup", 2);
+    iw.releaseInverter(del);
+    iw.commit();
+    ASSERT_EQ(0, iw.getIndexReader()->liveDocs());
+    EXPECT_EQ(10, readDurableIndexInfo(dir)->update_version);
+
+    auto& deleteOnly = iw.obtainInverter(20);
+    deleteOnly.deleteId("absent", 20);
+    iw.releaseInverter(deleteOnly, true);
+    iw.updateGraph.wait_for_all();
+    iw.commit();
+    EXPECT_EQ(20, readDurableIndexInfo(dir)->update_version);
+  }
+  IndexWriter reopened(dir);
+  reopened.commit();
+  EXPECT_EQ(21, readDurableIndexInfo(dir)->update_version);
+}
+
+TEST_F(IndexWriterTest, mergingDeleteListsPreservesSharedInputs) {
+  using namespace luxir::test;
+  for (bool reverse : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+    iw->updateGraph.wait_for_all();
+    ASSERT_EQ(1, iw->segInfos.size());
+
+    auto pool = std::make_unique<MemPool>();
+    auto& idPool = *pool;
+    auto deletes = std::make_shared<SortedDeletes>(std::move(pool));
+    std::array<uint64_t, 2> versions = reverse
+        ? std::array<uint64_t, 2>{3, 2} : std::array<uint64_t, 2>{2, 3};
+    for (uint64_t version : versions) {
+      TermValHash<IdEntry> hash(idPool, 4);
+      hash.try_emplace("dup"sv, -1, version);
+      hash.destructiveCompress();
+      deletes->addList(hash.detachTable(), 1, version, version);
+    }
+    iw->segInfos.begin()->second->personalDeletes.deletes.insert(deletes);
+    helper.commit();
+    EXPECT_EQ(0, iw->getIndexReader()->liveDocs());
+    // These inputs can be shared by other segments' parallel delete tasks.
+    EXPECT_EQ(versions[0], deletes->lists()[0][0].val().version);
+    EXPECT_EQ(versions[1], deletes->lists()[1][0].val().version);
+    EXPECT_EQ(2, deletes->getSmallestVersion());
+    EXPECT_EQ(3, deletes->getLargestVersion());
+  }
+}
+
 // Test that fields are removed from the index after document deletion and merging
 TEST_F(IndexWriterTest, removeFields) {
   using namespace luxir::test;

@@ -7,6 +7,7 @@
 #include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "luxir/util/MemPool.h"
 #include "luxir/util/TermValHash.h"
@@ -105,10 +106,18 @@ public:
 };
 
 
-/// SortedDeletes from multiple inverters.
+/// Immutable delete batches from multiple inverters, deduplicated by identity.
+/// Pending commits and concurrent merges share the same batches.
 class MultiDeletesData {
 public:
-  std::vector<std::unique_ptr<SortedDeletes>> deletes;
+  boost::unordered_flat_set<std::shared_ptr<const SortedDeletes>> deletes;
+
+  void addAll(const MultiDeletesData& other) {
+    deletes.insert(other.deletes.begin(), other.deletes.end());
+  }
+
+  void clear() { deletes.clear(); }
+  size_t size() const { return deletes.size(); }
 
   uint64_t getLargestVersion() const {
     uint64_t largest = 0;

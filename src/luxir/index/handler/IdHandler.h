@@ -148,18 +148,24 @@ private:
 
     auto [entry, inserted] = termsHash.try_emplace(id, inverter.getDoc(), version);
     if (!inserted) {
-      undoLog_.push_back({*entry, entry->val(), false});
-      if (version > 0 && entry->val().docId != inverter.getDoc()) {
-        // Overwrite of an id already indexed in this inverter: the previous doc is
-        // superseded and must be marked deleted here.  applyDeletes can never reach
-        // it - the id postings written at flush only list the latest doc per id.
-        inverter.deleteDoc(entry->val().docId);
-      }
-      // Same id indexed again. update to latest doc and version.
-      entry->val().docId = inverter.getDoc();
-      // Keep the overwrite version if we had one, otherwise update
-      if (version > 0 || entry->val().version == 0) {
-        entry->val().version = version;
+      if (version > 0 && version < entry->val().version) {
+        // Intake versions are ordered, but requests can obtain this inverter in
+        // either order. Keep the newer doc and its overwrite delete watermark.
+        inverter.deleteDoc(inverter.getDoc());
+      } else {
+        undoLog_.push_back({*entry, entry->val(), false});
+        if (version > 0 && entry->val().docId != inverter.getDoc()) {
+          // Overwrite of an id already indexed in this inverter: the previous doc is
+          // superseded and must be marked deleted here. applyDeletes can never reach
+          // it - the id postings written at flush only list the latest doc per id.
+          inverter.deleteDoc(entry->val().docId);
+        }
+        // Equal versions use document order within a request.
+        entry->val().docId = inverter.getDoc();
+        // Keep the overwrite version if we had one, otherwise update.
+        if (version > 0 || entry->val().version == 0) {
+          entry->val().version = version;
+        }
       }
     } else {
       undoLog_.push_back({*entry, IdEntry(0, 0), true});

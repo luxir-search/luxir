@@ -85,10 +85,25 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 //
 // Deletes strategy:
 //  - Each inverter has its own delete queue.
-//  - When a segment is flushed, it's deletes are moved to the current CommitInfo.
-//  - When a commit happens, the deletes are applied to all segments.
+//  - A flush publishes its segment and immutable delete batch together.
+//  - A commit snapshots both, applies the deletes, and retires batches only
+//    when every request through their largest version has finished and flushed.
 //    - applying deletes to segments doesn't work well with concurrent segment merges.
 //      See see finishCommitBody() for how we handle this.
+//
+// Why applying a delete once is not enough (versions assigned at intake):
+//  1. Index seed@1, then receive commit C@2, overwrite x@3, and overwrite x@4.
+//  2. C pauses before selecting inverters; x@3 stalls before obtaining one.
+//     x@4 runs first and reuses the seed's inverter.
+//  3. C resumes and flushes that inverter because its minVersion is 1. This
+//     publishes x@4 and applies its delete (ID x with version < 4), but x@3
+//     has not been indexed yet, so the delete cannot reach it.
+//  4. x@3 resumes into another inverter and is flushed by a later commit.
+//     If C discarded x@4's delete, both docs survive: x@3's own delete only
+//     removes versions < 3 and correctly leaves x@4 alone.
+// Keep x@4's delete through C@2. A successful normal commit with cutoff >= 4
+// flushes the older work and applies the retained delete before retiring it.
+// Covered by IndexWriterTest.overwriteSurvivesCommitAheadOfOlderUpdate.
 
 IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget,
@@ -103,7 +118,6 @@ IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
     originalFilterCacheConfig(filterCacheConfig) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  nextCommitInfo = std::make_unique<CommitInfo>();
   std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
   if (segFile.get() == nullptr) {
     lastSegId = 0;
@@ -125,6 +139,7 @@ IndexWriter::IndexWriter(Directory& dir, std::shared_ptr<Schema> schema,
     coreGen = indexInfo.core_gen;
     schemaGen_ = indexInfo.schema_gen;
     updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
+    durableUpdateVersion = indexInfo.update_version;
     segInfos.reserve(indexInfo.segments.size());
     lastCommittedSegIds.reserve(indexInfo.segments.size());
 
@@ -951,9 +966,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
       return;
     }
 
-    // Grab the global commit info and move it to the UpdateMessage.
-    msg.commitInfo = std::move(nextCommitInfo);
-    nextCommitInfo = std::move(emptyCommitInfo);
+    msg.commitInfo = std::move(emptyCommitInfo);
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
 
@@ -1022,7 +1035,6 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
         if (msg.waitForMerges) {
           std::erase(waitingForMerges, &msg);
         }
-        nextCommitInfo = std::move(msg.commitInfo);
         throw;
       }
     }
@@ -1108,12 +1120,22 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   }
 
   std::unique_ptr<Inverter> inverterPtr;
+  std::shared_ptr<const SortedDeletes> deletes;
+  if (!aborted && inverter.hasDeletions()) {
+    deletes = std::move(inverter.sortedDeletes);
+  }
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     INDEX_DEBUG("segmentFlushBody: inverter {} flushed. Adding {}", (void*)&inverter,
                 segInfo ? format_as(*segInfo)
                         : std::string(aborted ? "(aborted segment)" : "(empty segment, dropped)"));
+
+    // Reserve the segment map, then register deletes before exposing the segment.
+    // The delete-set insertion may allocate. Holding indexMutex across both
+    // registrations keeps segment snapshots consistent with their deletes.
+    if (success) segInfos.reserve(segInfos.size() + 1);
+    if (deletes) pendingDeletes.deletes.insert(std::move(deletes));
 
     // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
     std::pair<SegMap::iterator, bool> iter;
@@ -1129,14 +1151,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
     inverterPtr = std::move(it->second);
     flushingInverters.erase(it);
-
-    // move any deletes from the inverter to the relevant commit info.
-    if (!aborted && inverter.hasDeletions()) {
-      CommitInfo& commitInfo = inverter.commitInfo ? *inverter.commitInfo : *nextCommitInfo;
-      INDEX_DEBUG("segmentFlushBody: inverter={} moving deletes to commitInfo={}", inverter,
-                  (void*)&commitInfo);
-      commitInfo.multiDeletesData.deletes.emplace_back(std::move(inverter.sortedDeletes));
-    }
 
     // Check if we should merge anything.  Must happen *before* the leftToFlush
     // decrement: if this flush triggers a merge and the inverter's commit is
@@ -1206,15 +1220,18 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // in finishCommitBody().
 
 
-  auto maxDeleteVersion = msg.commitInfo->multiDeletesData.getLargestVersion();
-  msg.commitInfo->highestUpdateVersion = msg.updateVersion;
+  MultiDeletesData commitDeletes;
+  uint64_t maxDeleteVersion;
 
   std::vector<SegInfo*> segs;
   std::vector<SegInfo*> segsToApplyDeletes;
-  // std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    commitDeletes = pendingDeletes;
+    maxDeleteVersion = commitDeletes.getLargestVersion();
+    msg.commitInfo->highestUpdateVersion =
+      std::max({durableUpdateVersion, msg.updateVersion, maxDeleteVersion});
     segs.reserve(segInfos.size());
     // grab all segments and mark them as being part of a commit.
     for (auto& [segId, seg] : segInfos) {
@@ -1246,7 +1263,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // Can personal deletes be mutated elsewhere?
     // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
     // so we will either see the new segment with its personal deletes, or not see the segment at all.
-    applyDeletes(segsToApplyDeletes, commitInfo.multiDeletesData);
+    applyDeletes(segsToApplyDeletes, commitDeletes);
   }
 
 
@@ -1264,7 +1281,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
     std::vector<SegInfo*> startedMergingOldVersions;
     std::vector<SegInfo*> finishedMergingOldVersions;
-    std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
+    MultiDeletesData personalDeletes;
     // personal deletes from segments that finished merging too early.
 
     // Check if any segments were merged before deletes were applied.
@@ -1290,9 +1307,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
           finishedMergingOldVersions.push_back(seg);
           // since this segment was already merged, we can just move it's personal deletes off
-          personalDeletes.insert(personalDeletes.end(),
-                                 std::make_move_iterator(seg->personalDeletes.begin()),
-                                 std::make_move_iterator(seg->personalDeletes.end()));
+          personalDeletes.addAll(seg->personalDeletes);
           seg->personalDeletes.clear();
         }
       }
@@ -1307,28 +1322,17 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     }
 
     if (!startedMergingOldVersions.empty() || !finishedMergingOldVersions.empty()) {
-      // add personal deletes to all new segments that could be applicable.
-      // first make a shared_ptr from the commit info to it.
-      CommitInfo& commitInfo = *msg.commitInfo;
-
-      // queued (and applied) deletes for the current commit.
-      std::shared_ptr<MultiDeletesData> multiDeletesDataPtr = std::make_shared<MultiDeletesData>(
-        std::move(commitInfo.multiDeletesData));
-
       // Since only one merge can happen at once, we only need to add personal deletes to
       // one of the segments that are being merged to get them transferred to the new segment when it is done.
       if (!startedMergingOldVersions.empty()) {
         auto& seg = *startedMergingOldVersions.front();
         // no segments were merged, so we can just apply deletes to the new segments.
-        INDEX_DEBUG("finishCommitBody: Added personal deletes currently merging {} deletes={}", seg,
-                  (void*)multiDeletesDataPtr.get());
-        seg.personalDeletes.push_back(multiDeletesDataPtr); // copy the shared_ptr
+        INDEX_DEBUG("finishCommitBody: Added personal deletes currently merging {}", seg);
+        seg.personalDeletes.addAll(commitDeletes);
 
 #if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_TRACE
-        for (auto& s : seg.personalDeletes) {
-          for (auto& d : s->deletes) {
-            INDEX_TRACE("\tpersonal deletes: {}", d->toString());
-          }
+        for (auto& d : seg.personalDeletes.deletes) {
+          INDEX_TRACE("\tpersonal deletes: {}", d->toString());
         }
 #endif
       }
@@ -1336,13 +1340,10 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
       // For segments that were already merged, look for new segments to attach personal deletes to.
       // They won't be applied immediately, but will be the next time this commit code is entered.
-      // First add multiDeletesDataPtr to the personal deletes we previously collected and find the max delete version
+      // Add the applied batches to the personal deletes we previously collected and find the max delete version
       // since it is possible for personal deletes to be higher than commit deletes.
-      personalDeletes.push_back(multiDeletesDataPtr);
-      auto maxAllDeleteVersion = maxDeleteVersion; // max including those in personalDeletes.
-      for (auto& deletes : personalDeletes) {
-        maxAllDeleteVersion = std::max(maxAllDeleteVersion, deletes->getLargestVersion());
-      }
+      personalDeletes.addAll(commitDeletes);
+      auto maxAllDeleteVersion = personalDeletes.getLargestVersion();
       auto numSegmentsMissingDeletes = 0; // sanity check - we should find some.
       for (auto& [segId, seg] : segInfos) {
         // TODO: is it possible for any personal deletes to be higher than the maxDeletedVersion here?
@@ -1351,7 +1352,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
           // this segment has deletes that need to be applied, so append to its personal deletes.
           numSegmentsMissingDeletes++;
           // *copy* all of the collected delete sets
-          seg->personalDeletes.append_range(personalDeletes);
+          seg->personalDeletes.addAll(personalDeletes);
           INDEX_DEBUG("finishCommitBody: Added personal deletes for {}", *seg);
         }
       }
@@ -1480,11 +1481,21 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     currentSegmentOverlays_ = std::move(segmentOverlayInfos);
     lastCommitTime = commitTime;
     lastAdvertisedCommitTime = commitTime;
+    durableUpdateVersion = commitInfo.highestUpdateVersion;
+    if (!msg.publishOnly) {
+      // Retire only batches in this snapshot. Later flushes may have registered
+      // more while deletes were applied. Merge catch-up owns its own references.
+      for (const auto& batch : commitDeletes.deletes) {
+        if (batch->getLargestVersion() <= msg.updateVersion) {
+          pendingDeletes.deletes.erase(batch);
+        }
+      }
+    }
     commitCount.fetch_add(1, std::memory_order_relaxed);
   }
   // publishOnly commits publish a merge layout without flushing later-arrived
   // inverter state, so they must not satisfy deferred-commit deadlines.
-  if (!msg.publishOnly) deferredCommitPublished(msg.commitInfo->highestUpdateVersion);
+  if (!msg.publishOnly) deferredCommitPublished(msg.updateVersion);
 
   // Files from the previous lists that aren't in the new commit are now
   // unreferenced. The commit is already visible, so cleanup is best-effort.
@@ -2421,7 +2432,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         for (auto segInfo : segs) {
           personalDeleteCount += segInfo->personalDeletes.size();
         }
-        newSegInfo->personalDeletes.reserve(personalDeleteCount);
+        newSegInfo->personalDeletes.deletes.reserve(personalDeleteCount);
 
         phase = "publish_swap";
         for (auto segInfo : segs) {
@@ -2435,7 +2446,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // The deletes will be applied before the new segment is used in a commit.
           if (!segInfo->personalDeletes.empty()) {
             INDEX_DEBUG("Will merge personal deletes from {} to {}", *segInfo, *newSegInfo);
-            newSegInfo->personalDeletes.append_range(segInfo->personalDeletes);
+            newSegInfo->personalDeletes.addAll(segInfo->personalDeletes);
           }
 
           // remove from the index: move from segInfos to segmentsToDelete
@@ -2649,6 +2660,7 @@ void IndexWriter::mergeSegments() {
 bool IndexWriter::testIsEmpty() {
   const std::lock_guard<std::mutex> lock(indexMutex);
   return segInfos.empty()
+         && pendingDeletes.empty()
          && segmentsToDelete.empty()
          && idleInverters.empty()
          && busyInverters.empty()
@@ -2706,7 +2718,8 @@ void IndexWriter::testDeleteAllData() {
     currentSegmentOverlays_.clear();
     activeVectorOverlayNames.clear();
     lastMergeFailure.reset();
-    nextCommitInfo = std::make_unique<CommitInfo>();
+    pendingDeletes.clear();
+    durableUpdateVersion = 0;
 
     lastCommitTime = lastAdvertisedCommitTime = 0;
   }
@@ -2932,7 +2945,6 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
     // Copy the entry - the reference into the span's backing memory remains valid after
     // advance/removeTop since entries live in detached TermValHash tables, not in the cursor.
     Entry entry = top.current();
-    uint64_t bestVersion = entry.val().version;
 
     top.advance();
     if (top.exhausted()) {
@@ -2943,8 +2955,8 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
 
     // Drain any duplicates with the same id from other cursors, keeping highest version
     while (pq.size() > 0 && (std::string_view)pq.top().current() == (std::string_view)entry) {
-      uint64_t v = pq.top().current().val().version;
-      if (v > bestVersion) bestVersion = v;
+      const auto& candidate = pq.top().current();
+      if (candidate.val().version > entry.val().version) entry = candidate;
 
       pq.top().advance();
       if (pq.top().exhausted()) {
@@ -2955,8 +2967,7 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
     }
 
     // version==0 marks ids indexed without overwrite - not deletes
-    if (bestVersion > 0) {
-      entry.val().version = bestVersion;
+    if (entry.val().version > 0) {
       out.push_back(entry);
     }
   }
@@ -2966,7 +2977,7 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
 
 } // anonymous namespace
 
-void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
+void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData) {
   // Collect commit-level spans
   boost::container::small_vector<SortedDeletes::EntrySpan, 4> commitSpans;
   for (const auto& sd : multiDeletesData.deletes) {
@@ -3011,11 +3022,9 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   std::vector<SortedDeletes::Entry> segMergedBuf;
 
   if (!seg.personalDeletes.empty()) {
-    for (const auto& personalDelete : seg.personalDeletes) {
-      for (const auto& sd : personalDelete->deletes) {
-        for (auto& span : sd->lists()) {
-          allSpans.push_back(span);
-        }
+    for (const auto& sd : seg.personalDeletes.deletes) {
+      for (auto& span : sd->lists()) {
+        allSpans.push_back(span);
       }
     }
     if (!commitDeletes.empty()) {

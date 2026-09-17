@@ -70,11 +70,8 @@ public:
 
     // "personal" deletes to be applied to this segment.  Only used to catch up when merging was happening concurrently
     // with applying deletions and hence they could not be applied to this segment yet.  See finishCommitBody()
-    // where deletes are applied.  This is a shared_ptr because multiple merges may have been done that need to
-    // apply deletes.  We don't really need the thread safety of shared_ptr, could switch to boost::intrusive_ptr
-    // for straight ref counting.
-    using PersonalDeletes = std::vector<std::shared_ptr<MultiDeletesData>>;
-    PersonalDeletes personalDeletes;
+    // where deletes are applied. Immutable inverter batches are shared with pending commits.
+    MultiDeletesData personalDeletes;
 
     // Filenames written for this segment that have not yet been fsynced.
     // Populated by PostingsWriter::finish() and drained at commit time.
@@ -429,9 +426,11 @@ public:
   // indexMutex.
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
 
-  // commit info for the index, used to track deletes.
-  // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
-  std::unique_ptr<CommitInfo> nextCommitInfo;
+  // Registered atomically with flushed segments and snapshotted with them.
+  // A batch survives until a normal commit has flushed every request through
+  // its largest version. Protected by indexMutex.
+  MultiDeletesData pendingDeletes;
+  uint64_t durableUpdateVersion = 0;
 
   // In an update response, we could return an update number, or a commit number, or even a monotonic time.
   // This would allow a searching client to specify a time to search up to.
@@ -741,7 +740,7 @@ private:
                               const std::vector<AuxInfo>& newList);
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
-  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
+  void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);
   void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
