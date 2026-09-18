@@ -1,0 +1,32 @@
+name: Check protobuf reference
+
+on:
+  pull_request:
+    paths: ['protos/luxir.proto', 'protos/luxir_types.proto', 'tools/proto-docs/**', 'docs/reference/protobuf.md', '.github/workflows/proto-docs.yml']
+  push:
+    paths: ['protos/luxir.proto', 'protos/luxir_types.proto', 'tools/proto-docs/**', 'docs/reference/protobuf.md', '.github/workflows/proto-docs.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install documentation tools
+        run: |
+          python -m pip install -r tools/proto-docs/requirements.txt
+          curl --fail --silent --show-error --location \
+            https://github.com/protocolbuffers/protobuf/releases/download/v33.4/protoc-33.4-linux-x86_64.zip \
+            --output "$RUNNER_TEMP/protoc.zip"
+          echo "c0040ea9aef08fdeb2c74ca609b18d5fdbfc44ea0042fcfbfb38860d35f7dd66  $RUNNER_TEMP/protoc.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+      - name: Test generation and check for stale output
+        run: |
+          python -m unittest discover -s tools/proto-docs -p 'test_*.py'
+          python tools/proto-docs/generate.py --check
