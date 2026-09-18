@@ -38,7 +38,7 @@ curl http://localhost:9400/health
 Index three books with sample prices in dollars:
 
 ```bash
-curl -X POST http://localhost:9400/collections/main/_update \
+curl -X POST http://localhost:9400/collections/books/_update \
   -H 'Content-Type: application/json' \
   -d '{
     "docs": [
@@ -71,11 +71,13 @@ curl -X POST http://localhost:9400/collections/main/_update \
   }'
 ```
 
+Ingest response:
+
 ```json
 {"update_version":1,"status":"ok"}
 ```
 
-The write created the `main` collection, and **built-in field templates**
+The write created the `books` collection, and **built-in field templates**
 supplied the field types: `_t` is searchable text, `_name` is a name that
 supports word search plus whole-name facets and sorting, `_s` is an exact
 string, `_i` is an integer you can range and sort on, and `_f` stores
@@ -96,7 +98,7 @@ the template does this and how to define your own.
 The simplest search is a URL:
 
 ```bash
-curl 'http://localhost:9400/collections/main/_search?pretty&query=title_t:kings'
+curl 'http://localhost:9400/collections/books/_search?pretty&query=title_t:kings'
 ```
 
 ```json
@@ -136,7 +138,7 @@ The same search as JSON, choosing which fields come back and asking for the
 exact match count:
 
 ```http
-POST /collections/main/_search
+POST /collections/books/_search
 
 {
   "query": "title_t:kings",
@@ -179,7 +181,7 @@ Add `get_number` and `found` is the total number of matching documents,
 regardless of `limit`:
 
 ```http
-POST /collections/main/_search
+POST /collections/books/_search
 
 {
   "query": {"match": {"author_name": "sanderson"}},
@@ -214,7 +216,7 @@ It understands operators, quotes, and field terms, and it never returns a
 parse error, so malformed input still runs as a search:
 
 ```http
-POST /collections/main/_search
+POST /collections/books/_search
 
 {
   "query": {
@@ -249,7 +251,7 @@ fielded terms, AND/OR/NOT, ranges, and function forms for most structured query
 types:
 
 ```http
-POST /collections/main/_search
+POST /collections/books/_search
 
 {
   "query": "title_t:(kings OR radiance) AND year_i:[2010 TO 2013]",
@@ -279,7 +281,7 @@ The same request can return books, count them by series, and calculate their
 average price. This example also includes the lowest price per series:
 
 ```http
-POST /collections/main/_search
+POST /collections/books/_search
 
 {
   "query": {
@@ -354,7 +356,7 @@ arrives, without buffering the whole thing. `?commit=true` commits at the end
 of the stream, making the documents searchable before the request completes:
 
 ```http
-POST /collections/main/_update?commit=true
+POST /collections/books/_update?commit=true
 Content-Type: application/x-ndjson
 
 {"id": "4", "title_t": "Oathbringer", "author_name": "Brandon Sanderson", "series_s": "Stormlight", "year_i": 2017, "price_f": 17.5}
@@ -368,7 +370,7 @@ Content-Type: application/x-ndjson
 To index an NDJSON file you already have:
 
 ```bash
-curl -X POST 'http://localhost:9400/collections/main/_update?commit=true' \
+curl -X POST 'http://localhost:9400/collections/books/_update?commit=true' \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @books.ndjson
 ```
@@ -383,7 +385,7 @@ line with no envelope. `limit: -1` returns every match, streamed over one
 connection, so there is no scroll API or cursor token to manage:
 
 ```http
-POST /collections/main/_search?format=docs
+POST /collections/books/_search?format=docs
 
 {"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"]}
 ```
@@ -403,7 +405,7 @@ Ingest recognizes and skips header lines, so an export can be piped straight
 back into `/_update`:
 
 ```bash
-curl -s 'http://localhost:9400/collections/main/_search?format=docs' \
+curl -s 'http://localhost:9400/collections/books/_search?format=docs' \
      -H 'Content-Type: application/json' \
      -d '{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"]}' |
 curl -X POST 'http://localhost:9400/collections/backup/_update?commit=true' \
@@ -420,9 +422,9 @@ Collections do not need to be created in advance. The first update to a new
 collection name creates it:
 
 ```http
-POST /collections/books/_update
+POST /collections/movies/_update
 
-{"docs": [{"id": "a", "title_t": "Dune"}], "commit": {}}
+{"docs": [{"id": "a", "title_t": "The Good, the Bad and the Ugly"}], "commit": {}}
 ```
 
 ```json
@@ -430,10 +432,10 @@ POST /collections/books/_update
 ```
 
 ```http
-POST /collections/books/_search
+POST /collections/movies/_search
 
 {
-  "query": {"match": {"title_t": "dune"}},
+  "query": {"match": {"title_t": "ugly"}},
   "fields": ["id", "title_t"],
   "get_number": true
 }
@@ -445,7 +447,7 @@ POST /collections/books/_search
   "docs": [
     {
       "id": "a",
-      "title_t": "Dune"
+      "title_t": "The Good, the Bad and the Ugly"
     }
   ]
 }
@@ -462,7 +464,7 @@ unknown collection should be rejected.
 Changes become visible on commit. You have three ways, use whichever fits:
 
 - In a JSON update body: `"commit": {}`.
-- On the request URL, JSON or NDJSON: `POST /collections/main/_update?commit=true`.
+- On the request URL, JSON or NDJSON: `POST /collections/books/_update?commit=true`.
 - At the end of a stream: `{"_end_": {"commit": {}}}`.
 
 ## See what the server understood
@@ -471,21 +473,21 @@ Add `?explain=request` to a query and Luxir echoes back the canonical request it
 parsed - the shorthand you sent, expanded to the full form:
 
 ```http
-POST /collections/main/_search?explain=request
+POST /collections/books/_search?explain=request
 
-{"query": {"match": {"title_t": "dune"}}}
+{"query": {"match": {"title_t": "kings"}}}
 ```
 
 ```json
 {
-  "collection": "main",
+  "collection": "books",
   "ops": {
     "q": {
       "top_docs": {
         "query": {
           "match": {
             "field": "title_t",
-            "val": "dune"
+            "val": "kings"
           }
         }
       }
