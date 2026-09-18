@@ -236,9 +236,7 @@ POST /collections/authors/_search
 ```
 
 An explicit selector uses that representation. A string facet needs indexed
-terms and a column. Terms over 255 bytes follow the
-field's [`long_terms` policy](schema.md#string-normalization-and-length), and
-facets return the term as stored.
+terms and a column. Facets return the term as stored.
 
 ## Expression metrics
 

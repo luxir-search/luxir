@@ -265,7 +265,7 @@ publication advances the schema generation.
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_` |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
-| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [STRING normalization and length](#string-normalization-and-length) |
+| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | Choose `self` or a variant label for `search` and `value` operations; only useful with variants; both default to `self`; see [Default bindings](#default-bindings) |
 | `parent` | inherit any unset properties from a field or template |
@@ -431,8 +431,7 @@ Templates can carry variants and defaults. The default schema includes
 
 `author_name` uses `_name`; `author_name__s` selects its original whole-name
 string variant. The root is resolved before the label, so the tail `_s` never
-picks the default string template independently. Long whole names follow the
-STRING term policy below.
+picks the default string template independently.
 
 `_name` uses word search with case and accent folding, without English
 stemming or possessive removal. Its string variant preserves the supplied

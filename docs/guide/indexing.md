@@ -49,7 +49,7 @@ are:
 | `request_id` | Opaque correlation value echoed in the response. |
 | `docs` | Row-oriented JSON documents. |
 | `delete_ids` | IDs to delete; an absent ID is a successful no-op. |
-| `allow_dups` | Skip ID overwrite/deduplication. Default `false`. |
+| `allow_dups` | Skip ID overwrite/deduplication for faster indexing when IDs are known to be unique. Default `false`. |
 | `all_or_none` | Roll back the whole request if one document fails. Default `false`. |
 | `return_ids` | Include successfully indexed IDs in request order. |
 | `commit` | Make changes visible, with optional commit controls. |
@@ -102,9 +102,10 @@ curl -X POST 'http://localhost:9400/collections/books/_update?commit=true' \
 Three record forms make up a stream:
 
 - A normal JSON object is a document.
-- `{"_update_": {...}}` opens a group and supplies normal update options such
-  as `request_id`, `allow_dups`, `all_or_none`, `return_ids`, `field_map`,
-  `drop_unmapped`, or a collection override.
+- `{"_update_": {...}}` opens a group. The inner object is the HTTP JSON form
+  of the protobuf [`UpdateRequest`](../reference/protobuf.md#message-luxir.updaterequest) message,
+  with options such as `request_id`, `allow_dups`, `all_or_none`, `return_ids`,
+  `field_map`, `drop_unmapped`, or a collection override.
 - `{"_end_": {...}}` closes the group and may commit. An empty object is a
   checkpoint that closes and reports the current group without ending the
   HTTP stream.
@@ -142,10 +143,7 @@ already reported, and no later records from that connection are accepted.
 
 The document-per-line [search export](searching.md#stream-every-match) uses
 this same framing, and its `_header_` records are recognized and skipped, so
-an export pipes straight back into `_update`. Export logical field names for
-ingestion: explicit variant selectors are not document keys, and a retrieved
-primary may have lost input that a variant needs, so a pipe is not a general
-replacement for reindexing from the producer's source.
+an export can pipe straight back into `_update`.
 
 ## Visibility and commits
 
@@ -185,9 +183,9 @@ By default, indexing a document whose `id` already exists replaces the old
 document. Replacement is whole-document replacement, not a field patch: a
 field omitted by the new version is absent from the new document.
 
-Set `allow_dups: true` for append-only data where duplicate ID values are
-intentional. That turns off overwrite semantics for the request; it does not
-change how other requests behave.
+When you know the incoming IDs are unique and do not already exist in the
+collection, set `allow_dups: true` to improve indexing performance by skipping
+ID overwrite/deduplication. This disables overwrites for that request.
 
 Delete by ID with no document body:
 
@@ -200,11 +198,6 @@ POST /collections/books/_update
 ```json
 {"update_version":2,"status":"ok"}
 ```
-
-IDs over 255 bytes follow the field's
-[`long_terms` policy](schema.md#string-normalization-and-length); overwrite
-and delete apply the same transform as indexing, so a long ID still names
-one document.
 
 ## Field mapping
 

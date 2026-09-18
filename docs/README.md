@@ -65,6 +65,11 @@ state, and commits are crash-safe on immutable segments.
     budgets, read-only nodes, and the current security and availability
     boundary.
 
+## Reference
+
+- [Protobuf API reference](reference/protobuf.md) - messages, fields, enums,
+  and RPCs generated from the API definitions.
+
 ## Understand or contribute
 
 - [Architecture](design/architecture.md) explains how the engine is put
@@ -78,6 +83,8 @@ state, and commits are crash-safe on immutable segments.
   and runtime time-zone data.
 - [Container build](dev/container-build.md) provides the shared Ubuntu 22.04
   compiler and dependency environment, including ASan.
+- [Documentation](dev/documentation.md) covers editing the guides and
+  regenerating the API reference.
 
 Rule of thumb: a page that assumes a source checkout belongs in `dev/` or
 `design/`. Pages in `guide/` start from a running server and a client.

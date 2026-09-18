@@ -172,8 +172,9 @@ the same ID.
 
 With the default `allow_dups: false`, another document with the same ID
 replaces the old document. Replacement is whole-document replacement: fields
-omitted by the new version disappear.  Set `allow_dups: true` only when
-you know you are sending unique documents.
+omitted by the new version disappear. For faster indexing when incoming IDs
+are known to be new and unique, see
+[`allow_dups`](indexing.md#ids-overwrites-and-deletes).
 
 An ID is not required. A document with an absent or null ID can be searched,
 but it cannot be overwritten or deleted by ID and has no useful external

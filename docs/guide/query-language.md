@@ -145,8 +145,6 @@ is what is looked up: `author_name__self:="Neal!"` looks up `neal` and matches
 the same documents as `author_name__self:=Neal` or a match query for `Neal!`.
 Each TEXT value must analyze to at most one term; an empty result matches nothing.
 For multiple terms, use match, phrase, or a whole-value string variant.
-Lookup terms over 255 bytes follow the field's
-[`long_terms` policy](schema.md#string-normalization-and-length).
 
 ## Special characters
 
@@ -311,9 +309,7 @@ normalizer.
 Fuzzy matching currently requires the first byte to match exactly (the
 default `prefix_length` is 1, which bounds the scan); `hte~1` will not find
 "the". Pass `prefix_length=0` through the `fuzzy(...)` function to trade a
-wider scan for first-position typos. A prefix longer than the kept prefix of
-a [long term](schema.md#string-normalization-and-length) returns a superset,
-and fuzzy distance is measured on the stored term bytes.
+wider scan for first-position typos.
 
 ## Wildcards and regular expressions
 

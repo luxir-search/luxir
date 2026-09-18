@@ -89,8 +89,7 @@ The HTTP dialect also accepts the field-name form:
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
-their columns. Terms over 255 bytes follow the field's
-[`long_terms` policy](schema.md#string-normalization-and-length).
+their columns.
 
 ## Exact membership (`any_of`)
 
@@ -142,9 +141,7 @@ STRING literals are whole values and use the same normalizer as ingest. TEXT
 literals use exact token membership: each value must analyze to at most one
 term. For example, `author_name__self` with `"Neal!"` looks up `neal` and
 matches all six books. A value producing zero terms matches nothing. For
-multiple terms, use match, phrase, or a whole-value string variant. Literals
-over 255 bytes follow the field's
-[`long_terms` policy](schema.md#string-normalization-and-length).
+multiple terms, use match, phrase, or a whole-value string variant.
 
 The expression forms are `field:=value` and `field:=(v1, v2)`; see
 [exact values](query-language.md#exact-values).
@@ -255,10 +252,7 @@ costs `2`, and multi-valued text fields have a position gap of `100`. See
 `prefix` is an indexed-term prefix, not a wildcard expression. Text fields
 apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
-matches documents with at least one indexed term for the field. A prefix
-longer than the kept prefix of a
-[long term](schema.md#string-normalization-and-length) falls back to that
-prefix and returns a superset.
+matches documents with at least one indexed term for the field.
 
 ## Wildcard
 
@@ -274,10 +268,7 @@ prefix and returns a superset.
 The pattern matches an entire indexed term. On TEXT fields, literal characters
 fold the way the field folds text, while `*`, `?`, and escapes are syntax and
 never fold; STRING fields also normalize literal characters; ID fields use
-literals verbatim. Wildcard queries are constant-scoring. A pattern whose
-leading literal prefix exceeds the kept prefix of a
-[long term](schema.md#string-normalization-and-length) falls back to that
-prefix; otherwise the pattern sees the stored term bytes. The expression form
+literals verbatim. Wildcard queries are constant-scoring. The expression form
 is `wildcard(du*, field=title_t)`.
 
 ## Regex
@@ -296,7 +287,7 @@ The match is anchored to the whole indexed term, so `mess` does not match
 fields, literal characters fold the way the field folds text; character
 classes and ranges are codepoint-exact. STRING fields also normalize literal
 characters; ID fields use literals verbatim. Regex queries are
-constant-scoring and follow the same long-term prefix fallback as wildcards.
+constant-scoring.
 The expression form is `regex(dune|kings, field=title_t)`.
 
 ## Fuzzy
@@ -326,9 +317,6 @@ operator limit. Truncation is not reported in the response. Scoring uses
 blended BM25 statistics; filter context is constant-scoring, but both use the
 same expansion set and match set. Simple-query syntax still warns when it
 clamps an unsupported edit distance before constructing the fuzzy query.
-Distance is measured on stored term bytes, so a
-[long term](schema.md#string-normalization-and-length) compares its prefix
-plus hash.
 
 ## Range
 

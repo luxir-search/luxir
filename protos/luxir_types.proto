@@ -257,11 +257,12 @@ message KnnQuery {
 
   // Search effort for IVF indexes.
   message Ivf {
-    int32 nprobe = 1;      // merge-stable IVF effort: lists to probe if this field
-                           // were one IVF index with nlist=sqrt(live vectors).
-                           // 0 = adaptive default; positive values cap search effort.
-    float min_scan_fraction = 2; // minimum fraction of live vectors to scan,
-                           // in [0,1]. 0 = no floor.
+    // Merge-stable IVF effort: lists to probe if this field were one IVF index
+    // with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap
+    // search effort.
+    int32 nprobe = 1;
+    // Minimum fraction of live vectors to scan, in [0,1]. 0 = no floor.
+    float min_scan_fraction = 2;
   }
 }
 
@@ -756,6 +757,7 @@ message CommitParams {
   uint32 max_segments = 4;
 }
 
+// Index or delete documents, with an optional commit.
 message UpdateRequest {
   // Optional opaque identifier, echoed in the response for correlation.
   string request_id = 1;
@@ -768,7 +770,8 @@ message UpdateRequest {
   // is a no-op.
   repeated string delete_ids = 6;
 
-  // If true, allow documents with duplicate IDs (skip overwrite/dedupe).
+  // Skip overwrite/dedupe for faster indexing when incoming IDs are known to be
+  // unique and do not already exist in the collection.
   // Default (false) overwrites any existing document with the same ID.
   bool allow_dups = 7;
 
@@ -812,11 +815,11 @@ message UpdateResponse {
     UNKNOWN = 0;          // the default
     OK = 1;               // the update was successful
     PARTIAL = 2;          // part of the request took effect, part failed (see errors)
-    ERROR = 3;            // the request failed.  If error is unset, the failure was
-                          // per-document (see errors) and the request had no visible effect
-                          // on the index.  If error is set, the failure was request-level
-                          // (e.g. commit pipeline) and the effect of individual documents
-                          // is indeterminate beyond what errors lists.
+    // The request failed. If error is unset, the failure was per-document (see
+    // errors) and the request had no visible effect on the index. If error is
+    // set, the failure was request-level (e.g. commit pipeline) and the effect
+    // of individual documents is indeterminate beyond what errors lists.
+    ERROR = 3;
   }
 
   Status status = 3;

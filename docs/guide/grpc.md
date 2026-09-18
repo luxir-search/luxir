@@ -2,8 +2,9 @@
 
 HTTP is the fastest way to explore Luxir; gRPC is the typed, binary surface for
 applications that want long-lived bidirectional streams and columnar search
-results. Both reach the same request and execution model. The protobuf files
-are the source of truth:
+results. Both reach the same request and execution model. The
+[Protobuf API reference](../reference/protobuf.md) documents each message,
+field, enum, and service from the source definitions:
 
 - [`protos/luxir.proto`](../../protos/luxir.proto) defines services.
 - [`protos/luxir_types.proto`](../../protos/luxir_types.proto) defines search,
@@ -22,14 +23,14 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 
 | Service and method | Shape | Purpose |
 |---|---|---|
-| `luxir.Indexer/Update` | unary | One bounded update request and response. |
-| `luxir.Indexer/UpdateStream` | bidirectional stream | A stream of independently acknowledged update requests. |
-| `luxir.Searcher/Search` | bidirectional stream | Several search requests per call, with one or more response batches per request. |
-| `luxir.Admin/SetSchema` | unary | Set named definitions or replace a collection schema. |
-| `luxir.Admin/GetSchema` | unary | Read a collection schema. |
-| `luxir.Admin/CreateCollection` | unary | Create a collection, optionally with a schema. |
-| `luxir.Admin/DeleteCollection` | unary | Delete a collection and its stored data. |
-| `luxir.Admin/Stats` | unary | Read node-wide or collection index statistics. |
+| [`luxir.Indexer/Update`](../reference/protobuf.md#method-luxir.indexer.update) | unary | One bounded update request and response. |
+| [`luxir.Indexer/UpdateStream`](../reference/protobuf.md#method-luxir.indexer.updatestream) | bidirectional stream | A stream of independently acknowledged update requests. |
+| [`luxir.Searcher/Search`](../reference/protobuf.md#method-luxir.searcher.search) | bidirectional stream | Several search requests per call, with one or more response batches per request. |
+| [`luxir.Admin/SetSchema`](../reference/protobuf.md#method-luxir.admin.setschema) | unary | Set named definitions or replace a collection schema. |
+| [`luxir.Admin/GetSchema`](../reference/protobuf.md#method-luxir.admin.getschema) | unary | Read a collection schema. |
+| [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |
+| [`luxir.Admin/DeleteCollection`](../reference/protobuf.md#method-luxir.admin.deletecollection) | unary | Delete a collection and its stored data. |
+| [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node-wide or collection index statistics. |
 
 The server also registers the standard gRPC health service and descriptor
 reflection. Luxir implements the application services through gRPC's generic
@@ -94,9 +95,11 @@ placed in a dense column. A document row is the merge of `columns[i]` and
 
 ## Update streams
 
-`Indexer.UpdateStream` accepts a series of normal `UpdateRequest` messages and
-returns one `UpdateResponse` for each. Each message has its own overwrite,
-atomicity, return-ID, and commit settings; all-or-none never spans messages.
+`Indexer.UpdateStream` accepts a series of
+[`UpdateRequest`](../reference/protobuf.md#message-luxir.updaterequest) messages and
+returns one [`UpdateResponse`](../reference/protobuf.md#message-luxir.updateresponse)
+for each. Each message has its own overwrite, atomicity, return-ID, and commit
+settings; all-or-none never spans messages.
 `request_id` is echoed so responses can be associated without depending on
 completion timing. Responses may complete out of request order.
 

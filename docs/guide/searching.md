@@ -14,22 +14,27 @@ POST /collections/{collection}/_search
 
 ## Queries and search operations
 
-A **query** (`Query`) defines which documents match and how they score.
+A **query** ([`Query`](../reference/protobuf.md#message-luxir.query)) defines which
+documents match and how they score.
 `match`, `range`, `boolean`, and `knn` are query kinds. Queries compose with
 other queries, and a filter uses a query without contributing to the score.
 
-A **search operation** (`SearchOp`) defines what to compute or return:
+A **search operation** ([`SearchOp`](../reference/protobuf.md#message-luxir.searchop))
+defines what to compute or return:
 `top_docs` returns ranked documents for a query, facets return buckets, `expr_op` computes
-metrics, and `fusion` combines ranked lists. A request (`SearchRequest`)
+metrics, and `fusion` combines ranked lists. A request
+([`SearchRequest`](../reference/protobuf.md#message-luxir.searchrequest))
 contains a map of named operations in `ops`.
 
-`top_docs` (`TopDocs`) connects the two: its `query` and `filter` select the
-documents, while `sort`, `limit`, and `fields` control the returned list. Its
-child `ops` can compute facets and metrics over the complete match set,
+`top_docs` ([`TopDocs`](../reference/protobuf.md#message-luxir.topdocs)) connects the
+two: its `query` and `filter` select the documents, while `sort`, `limit`, and
+`fields` control the returned list. Its child `ops` can compute facets and
+metrics over the complete match set,
 regardless of that list's `limit`. Operations can nest further: a facet can
 contain another facet or a `top_docs` list for each bucket.
 
-These messages are defined in
+The [Protobuf API reference](../reference/protobuf.md) lists each message and
+its fields. The definitions live in
 [`protos/luxir_types.proto`](../../protos/luxir_types.proto), the shared model
 for the JSON and gRPC APIs. [`protos/luxir.proto`](../../protos/luxir.proto)
 defines the services, including `Searcher.Search`. Generated gRPC clients use

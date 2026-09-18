@@ -163,8 +163,6 @@ whole machine. Designed from the start for parallelism on modern hardware.
   without it the same queries run off the column with the same results.
 - Floats and doubles are stored order-preserving, so numeric sorting and
   ranges over columns need no decode step.
-- Long terms: strings, tokens, and IDs over 255 bytes follow a per-field
-  policy (hash the tail by default, truncate, or reject).
 
 ## Text analysis
 
