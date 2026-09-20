@@ -142,18 +142,53 @@ selection values, normalization, and the stricter `selection_mode: "all"`.
 
 ## Field facets
 
-A `field_facet` groups by distinct field value:
+A `field_facet` groups by distinct field value. For example, count books in
+each category:
 
-```json
+```http
+POST /collections/books/_search
+
 {
-  "field_facet": {
-    "field": "category_s",
-    "limit": 10,
-    "mincount": 1,
-    "missing": true
+  "query": {"all": true},
+  "limit": 0,
+  "ops": {
+    "categories": {
+      "field_facet": {
+        "field": "category_s",
+        "limit": 10,
+        "missing": true
+      }
+    }
   }
 }
 ```
+
+The response contains a bucket for each category and its document count:
+
+```json
+{
+  "docs": [],
+  "ops": {
+    "categories": {
+      "buckets": [
+        {
+          "val": "science-fiction",
+          "count": 31
+        },
+        {
+          "val": "classic",
+          "count": 9
+        }
+      ],
+      "missing": 2
+    }
+  }
+}
+```
+
+Here, 31 books have category `science-fiction`, 9 have category `classic`,
+and 2 have no category. The request's `limit: 0` omits individual books;
+the facet's `limit: 10` returns up to ten categories.
 
 | Field | Meaning |
 |---|---|
@@ -181,62 +216,9 @@ Integer, date, and text facets support `limit`, `mincount`, `missing`, and
 int and date require a positive value when set. Use a
 range facet when numbers should be bucketed rather than enumerated.
 
-A bare field name uses the field's value binding. The
-[author example](documents.md#field-variants) facets on `author_name` to count
-whole names through its string variant. Using that collection, facet on
-`author_name__self` to count the words of the analyzed primary:
-
-```http
-POST /collections/authors/_search
-
-{
-  "query": {
-    "all": true
-  },
-  "limit": 0,
-  "get_number": true,
-  "ops": {
-    "words": {
-      "field_facet": {
-        "field": "author_name__self",
-        "limit": -1
-      }
-    }
-  }
-}
-```
-
-```json
-{
-  "found": 6,
-  "docs": [],
-  "ops": {
-    "words": {
-      "buckets": [
-        {
-          "val": "neal",
-          "count": 6
-        },
-        {
-          "val": "asher",
-          "count": 3
-        },
-        {
-          "val": "stephenson",
-          "count": 2
-        },
-        {
-          "val": "shusterman",
-          "count": 1
-        }
-      ]
-    }
-  }
-}
-```
-
-An explicit selector uses that representation. A string facet needs indexed
-terms and a column. Facets return the term as stored.
+A string facet needs indexed terms and a column. Facets return the term as
+stored. For fields with multiple representations, see
+[Field variants](#field-variants).
 
 ## Expression metrics
 
@@ -630,7 +612,7 @@ POST /collections/authors/_search
   "query": {
     "all": true
   },
-  "fields": ["id"],
+  "fields": ["id", "title_t", "author_name"],
   "get_number": true,
   "ops": {
     "authors": {
@@ -650,13 +632,19 @@ POST /collections/authors/_search
   "found": 3,
   "docs": [
     {
-      "id": "b1"
+      "id": "b1",
+      "title_t": "Gridlinked",
+      "author_name": "Neal Asher"
     },
     {
-      "id": "b2"
+      "id": "b2",
+      "title_t": "The Skinner",
+      "author_name": "Neal Asher"
     },
     {
-      "id": "b4"
+      "id": "b4",
+      "title_t": "Prador Moon",
+      "author_name": "Neal Asher"
     }
   ],
   "ops": {
@@ -719,6 +707,70 @@ For a query facet, values are bucket names:
 }
 ```
 
+## Field variants
+
+A bare field name uses the field's
+[value binding](schema.md#default-bindings). In the
+[author example](documents.md#field-variants), the `_name` template sets
+`defaults.value` to `s`, so a facet on `author_name` uses the string variant
+and counts whole names such as `Neal Asher`.
+
+To count individual words instead, use `author_name__self`. The `__self`
+selector bypasses that default and selects the primary analyzed text:
+
+```http
+POST /collections/authors/_search
+
+{
+  "query": {
+    "all": true
+  },
+  "limit": 0,
+  "get_number": true,
+  "ops": {
+    "words": {
+      "field_facet": {
+        "field": "author_name__self",
+        "limit": -1
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "found": 6,
+  "docs": [],
+  "ops": {
+    "words": {
+      "buckets": [
+        {
+          "val": "neal",
+          "count": 6
+        },
+        {
+          "val": "asher",
+          "count": 3
+        },
+        {
+          "val": "stephenson",
+          "count": 2
+        },
+        {
+          "val": "shusterman",
+          "count": 1
+        }
+      ]
+    }
+  }
+}
+```
+
+An explicit variant selector such as `author_name__s` also bypasses the
+default binding. For a text field whose value binding already selects the
+primary, the bare field name counts words without needing `__self`.
+
 ## Limits
 
 - Facet sorting takes one key, which must be a metric operation of that facet.
@@ -729,9 +781,6 @@ For a query facet, values are bucket names:
   `fusion`, or on a nested facet.
 - Range facets with sub-operations are limited to 1,024 buckets; a range facet
   without them may request at most 100,000.
-- The HTTP renderer currently emits `null` for float and double range bucket
-  bounds; the counts and the typed gRPC bounds are correct, and integer and
-  date bounds render normally.
 - Facet aggregate state is bounded by the server's
   `search.request-memory-max-bytes` per-request ceiling. The engine charges the
   aggregate state for every simultaneously resident bucket, including metrics

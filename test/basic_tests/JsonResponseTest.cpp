@@ -194,6 +194,29 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
       renderSearchResponseBody(req->responses[0]->proto));
 }
 
+TEST_F(JsonResponseTest, rangeFacetRowsUseFloatingBounds) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "1", "price_f", -0.25f, "price_d", -0.25),
+    flatdoc("id", "2", "price_f", 0.0f, "price_d", 0.0),
+    flatdoc("id", "3", "price_f", 0.25f, "price_d", 0.25),
+    flatdoc("id", "4", "price_f", 0.75f, "price_d", 0.75),
+  }, UpdateMessage::COMMIT).success);
+
+  for (const char* field : {"price_f", "price_d"}) {
+    SCOPED_TRACE(field);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("prices", field).rangeFp(-0.5, 0.75, 0.5);
+    req->execute(false);
+    ASSERT_OK(req);
+
+    EXPECT_EQ(
+        R"({"ops":{"prices":{"buckets":[{"val":[-0.5,0],"count":1},{"val":[0,0.5],"count":2},{"val":[0.5,0.75],"count":0}]}}})",
+        renderSearchResponseBody(req->responses[0]->proto));
+  }
+}
+
 TEST_F(JsonResponseTest, facetMetricsRenderPerBucketAndEmptyAsNull) {
   CollectionHelper helper;
   helper.indexAll(std::array{
