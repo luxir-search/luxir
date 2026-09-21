@@ -2,43 +2,18 @@
 
 Luxir has a JSON API over HTTP. This page starts the server, indexes a few
 documents with `curl`, and searches them. No schema, client library, or
-cluster setup is needed first. It then covers exact counts, facets and
-metrics in the same request, `simple_query` for search boxes, the query
-language, and streaming import and export of files of any size.
+cluster setup is needed first.
 
 ## Get Luxir
 
-Download the standalone executable for your platform from
-<https://luxir.org/download/>. No unpacking is needed. Releases are built for
-Linux on x86-64 with glibc 2.35 or newer (Ubuntu 22.04 or newer, for example).
-Choose the highest CPU tier your system supports: v2, v3 (AVX2), or v4
-(AVX-512). To see the supported tiers on a glibc system, run:
-
-```bash
-/lib64/ld-linux-x86-64.so.2 --help
-```
-
-Look for `x86-64-v2`, `x86-64-v3`, and `x86-64-v4` marked as supported. Use v2
-when unsure; even v2 requires a CPU newer than the original x86-64 baseline.
-The standalone downloads have names such as `luxir-0.1.0-linux-x86_64-v2`.
-Archives are also available with documentation, licenses, and build metadata.
-The `-debug`, `-asan`, and `-symbols` archives are for diagnosing problems.
-
-For example, download the v2 build directly as `luxir`, make it executable,
-and confirm its version and CPU tier:
+Download the single standalone executable for your platform from
+<https://luxir.org/download/>. No unpacking is needed.
 
 ```bash
 curl -fL https://github.com/luxir-search/luxir/releases/download/v0.1.0/luxir-0.1.0-linux-x86_64-v2 -o luxir
 chmod +x luxir
 ./luxir --version
 ```
-
-To check the download, compare `sha256sum luxir` with the selected asset's
-entry in the release's `SHA256SUMS` file.
-
-If you would rather build it yourself, or want to work on the
-engine, [Build Setup](../dev/build-setup.md) covers the toolchain and presets;
-the result is `build/gcc-release/bin/luxir`.
 
 ## Start the server
 
@@ -97,7 +72,7 @@ curl -X POST http://localhost:9400/collections/books/_update \
   }'
 ```
 
-Ingest response:
+You should get a response that looks something like the following:
 
 ```json
 {"update_version":1,"status":"ok"}
@@ -146,8 +121,7 @@ curl 'http://localhost:9400/collections/books/_search?pretty&query=title_t:kings
 analysis as indexing, so it finds *"The Way of Kings"*. `query` is an
 expression in the [Luxir query language](query-language.md). `pretty` formats
 the response for reading; leave it off and a program gets one compact line.
-The same URL works in a browser, and it can be bookmarked or shared. `fields`,
-`sort`, `limit`, and the other common request fields have
+`fields`, `sort`, `limit`, and the other common request fields have
 [URL parameter forms](searching.md#url-request-field-overlay) too.
 
 Requests with more structure, such as facets and metrics, are JSON bodies.
@@ -156,7 +130,7 @@ The rest of this page uses them.
 > **Reading the rest of this page:** requests are shown as HTTP: method, path,
 > and body. On the website, every request block has a **Copy as curl** button
 > that copies the runnable command, with `?pretty` added to the URL so the
-> output reads well in a terminal. Reading the Markdown source, wrap one
+> output reads well in a terminal. If you are reading the Markdown source, wrap one
 > yourself as above:
 > `curl -X POST 'http://localhost:9400<path>?pretty' -H 'Content-Type: application/json' -d '<body>'`.
 
@@ -191,9 +165,8 @@ The equivalent [structured form](query-reference.md#match) of the query is
 `"query": {"match": {"title_t": "kings"}}`. You can use either form anywhere
 a query is accepted.
 
-`fields` chooses what comes back; without it, every retrievable field is
-returned. A document that doesn't have a requested field omits that key; no
-`null` placeholder is written.
+`fields` chooses what comes back; by default, every retrievable field is
+returned.
 
 To get the same keys in every doc, add `"document_format": "columns"` to the
 request. Every supported projected field then appears in every doc, with an
@@ -427,8 +400,9 @@ POST /collections/books/_search?format=docs
 With `get_number`, a `_header_` line starts the stream so a consumer knows
 the total before reading the documents: `{"_header_":{"found":5}}`.
 Execution warnings, when there are any, also arrive in a `_header_` line.
-Ingest recognizes and skips header lines, so an export can be piped straight
-back into `/_update`:
+
+Ingest recognizes and skips header lines, so **an export can be piped straight
+back into `/_update`:**
 
 ```bash
 curl -s 'http://localhost:9400/collections/books/_search?format=docs' \
@@ -437,10 +411,6 @@ curl -s 'http://localhost:9400/collections/books/_search?format=docs' \
 curl -X POST 'http://localhost:9400/collections/backup/_update?commit=true' \
      -H 'Content-Type: application/x-ndjson' --data-binary @-
 ```
-
-If anything fails mid-stream, the chunked response ends without its
-terminating chunk, so HTTP clients report a truncated body. A response that
-terminates normally is complete.
 
 ## Multiple collections
 
@@ -480,10 +450,7 @@ POST /collections/movies/_search
 ```
 
 The same server holds multiple collections as independent index namespaces.
-They share the process scheduler and memory, and Luxir does not currently
-provide per-collection tenant quotas or authorization boundaries. Auto-create
-is on by default; set `--no-indexing.auto-create-collection` if a write to an
-unknown collection should be rejected.
+Auto-create is on by default; set `--no-indexing.auto-create-collection` if you don't want it.
 
 ## Committing
 
@@ -523,8 +490,7 @@ POST /collections/books/_search?explain=request
 ```
 
 This is useful for learning the API and for debugging a query that isn't
-matching what you expect: type the short form, read back the full one, and
-you have the request your code should generate.
+matching what you expect: type the short form, read back the full one.
 
 Use [`?explain=resolved`](http-api.md#explain-modes) to inspect which physical
 fields a request uses. It returns `request` and `resolved_fields`, and runs

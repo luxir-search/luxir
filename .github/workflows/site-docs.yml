@@ -1,10 +1,12 @@
-# Rebuild luxir.org when documentation changes on main. The site imports docs/
+# Rebuild luxir.org when documentation changes on main (the development docs)
+# or on the maintenance branch the released docs follow. The site imports docs/
 # at build time; this just asks Cloudflare Workers Builds to run that build.
+# GitHub reads this file from the branch being pushed, so it must be on both.
 name: Rebuild site docs
 
 on:
   push:
-    branches: [main]
+    branches: [main, v0.1]
     paths: ['docs/**']
 
 jobs:
