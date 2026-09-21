@@ -747,7 +747,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 
 ### luxir.FieldDefaults
 
-Default representations for bare field names. Each binding names "self" or a local variant label. Absent inherits the parent's defaults; present replaces both bindings, with omitted bindings selecting self. Explicit &lt;field&gt;\_\_&lt;label&gt; and &lt;field&gt;\_\_self selectors bypass these defaults.
+Default representations for bare field names. Each binding names "self" or a local variant label. Absent inherits the parent's defaults; present replaces both bindings. An omitted value binding on a TEXT primary selects its sole STRING variant; an omitted search binding on a STRING primary selects its sole TEXT variant. Multiple candidates require an explicit binding. With no candidate, or for other type combinations, use self. Inference uses resolved types; operations still check index/column support. Explicit &lt;field&gt;\_\_&lt;label&gt; and &lt;field&gt;\_\_self selectors bypass these defaults.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -770,7 +770,7 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.limit"></a>[`limit`](#field-luxir.fieldfacet.limit) | 2 | `sint64` | optional | Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all. Selected buckets outside the ordinary page are appended after it. |
 | <a id="field-luxir.fieldfacet.mincount"></a>[`mincount`](#field-luxir.fieldfacet.mincount) | 3 | `int64` | optional | Minimum bucket count. Unset includes only buckets with matches. STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain. INT/DATE require a positive value when set. |
 | <a id="field-luxir.fieldfacet.missing"></a>[`missing`](#field-luxir.fieldfacet.missing) | 4 | `bool` | singular | return the count of documents without a value |
-| <a id="field-luxir.fieldfacet.sort"></a>[`sort`](#field-luxir.fieldfacet.sort) | 5 | [`SortSpec`](#message-luxir.sortspec) | repeated | STRING/ID only: one metric sub-operation name. Unset sorts by count descending, then bucket value ascending. |
+| <a id="field-luxir.fieldfacet.sort"></a>[`sort`](#field-luxir.fieldfacet.sort) | 5 | [`SortSpec`](#message-luxir.sortspec) | repeated | One metric sub-operation name. Unset sorts by count descending, then bucket value ascending. |
 | <a id="field-luxir.fieldfacet.ops"></a>[`ops`](#field-luxir.fieldfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.fieldfacet.selected"></a>[`selected`](#field-luxir.fieldfacet.selected) | 7 | [`Val`](#message-luxir.val) | singular | Scalar or array of selected values, coerced as AnyOfQuery values. Selected buckets missing from the ordinary page append in input order with exact counts, even below mincount or absent from the index. Null is an error. |
 | <a id="field-luxir.fieldfacet.selection_mode"></a>[`selection_mode`](#field-luxir.fieldfacet.selection_mode) | 8 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | ALL requires a nonempty selection |

@@ -20,7 +20,7 @@ exits:
 luxir
 ```
 
-Use the filesystem backend for durable data:
+Use the filesystem backend on local storage for durable data:
 
 ```bash
 luxir --store.backend=fs --store.data-dir=/srv/luxir/data
@@ -30,27 +30,13 @@ Each collection is an independent index below the data directory. Collections
 present there are discovered at startup; a write to a new collection creates
 its storage by default.
 
-Segments are immutable and read with `mmap`. A commit writes and syncs new
-files, publishes the metadata commit point with an atomic rename, then makes
-the view available to readers. A crash during publication therefore leaves the
-previous commit point, not a half-named view. Updates accepted after the last
-published commit can be lost on process or machine failure.
-
-Use local storage with reliable `fsync` and atomic-rename behavior. The optional
-checked-directory mode diagnoses filesystems that violate the sync assumptions:
-
-```bash
-luxir --store.backend=fs --store.data-dir=/srv/luxir/data \
-      --store.checked-dir.sync=warn
-```
-
-Valid modes are `off`, `warn`, and `throw`. `throw` turns a failed durability
-check into an operation failure.
+A commit makes updates durable and visible to searches. After a crash, Luxir
+reopens the last durable commit. Updates accepted since that commit can be lost.
 
 There is no online snapshot API. For a conservative current backup procedure,
-stop writes, publish a commit, stop the process, and copy the data directory as
-a unit. Immutable segment files alone do not make a live copy safe: the
-metadata and files still need one consistent capture point.
+stop writes, publish a commit, stop the process, and copy the entire data
+directory. Copying the directory while Luxir is writing to it is not a safe
+backup.
 
 ## Read-only nodes
 

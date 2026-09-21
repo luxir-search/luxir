@@ -535,7 +535,7 @@ message FieldFacet {
   optional int64 mincount = 3;
   bool missing = 4; // return the count of documents without a value
 
-  // STRING/ID only: one metric sub-operation name. Unset sorts by count
+  // One metric sub-operation name. Unset sorts by count
   // descending, then bucket value ascending.
   repeated SortSpec sort = 5;
   map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
@@ -1225,8 +1225,12 @@ message FieldVariants {
 
 // Default representations for bare field names. Each binding names "self"
 // or a local variant label. Absent inherits the parent's defaults; present
-// replaces both bindings, with omitted bindings selecting self. Explicit
-// <field>__<label> and <field>__self selectors bypass these defaults.
+// replaces both bindings. An omitted value binding on a TEXT primary selects
+// its sole STRING variant; an omitted search binding on a STRING primary
+// selects its sole TEXT variant. Multiple candidates require an explicit
+// binding. With no candidate, or for other type combinations, use self.
+// Inference uses resolved types; operations still check index/column support.
+// Explicit <field>__<label> and <field>__self selectors bypass these defaults.
 message FieldDefaults {
   // Match, phrase, simple query, expression terms, prefix, fuzzy, wildcard,
   // and regex queries, including their use in filters.

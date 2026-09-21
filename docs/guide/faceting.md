@@ -196,8 +196,8 @@ the facet's `limit: 10` returns up to ten categories.
 | `limit` | Maximum returned buckets. Default `5`; `-1` returns all. |
 | `mincount` | Drop buckets below this count. |
 | `missing` | Also return the count of documents with no value in the field. |
-| `sort` | Sort a string/ID facet by one of its metric sub-operations: a one-element list such as `["name desc"]` or `["name asc"]`. Default: count descending. |
-| `ops` | Per-bucket sub-facets, metrics, or `top_docs` / `fusion` lists on string/ID facets. |
+| `sort` | Sort buckets by one of the facet's metric sub-operations: a one-element list such as `["name desc"]` or `["name asc"]`. Default: count descending. |
+| `ops` | Per-bucket sub-facets, metrics, or `top_docs` / `fusion` lists. |
 | `selected` | Values that refine the result set and stay visible as buckets. See [Multi-select navigation](#multi-select-navigation). |
 | `selection_mode` | `any` (default) or `all`: match any selected value, or require every one. |
 
@@ -211,10 +211,9 @@ narrows a search.
 Integer and date fields facet on each distinct column value. Text fields facet
 on analyzed terms, not on the stored text: a facet on `body_t` returns
 indexed words, while a facet on `category_s` returns whole category values.
-Integer, date, and text facets support `limit`, `mincount`, `missing`, and
-`selected`, but not `ops` or `sort`; text also accepts `mincount: 0`, while
-int and date require a positive value when set. Use a
-range facet when numbers should be bucketed rather than enumerated.
+Text facets also accept `mincount: 0`, while integer and date facets require
+a positive value when set. Use a range facet when numbers should be bucketed
+rather than enumerated.
 
 A string facet needs indexed terms and a column. Facets return the term as
 stored. For fields with multiple representations, see
@@ -278,7 +277,7 @@ evaluated independently for each bucket and returned beside the bucket:
 }
 ```
 
-Sort a string or ID facet by one of its metrics:
+Sort a field facet by one of its metrics:
 
 ```json
 {
@@ -291,7 +290,7 @@ Sort a string or ID facet by one of its metrics:
 }
 ```
 
-Facet `sort` names a metric operation of that facet; `asc` and `desc` are both
+Field facet `sort` names a metric operation of that facet; `asc` and `desc` are both
 supported, and a bucket whose metric is missing or failed sorts last either
 way.
 
@@ -315,7 +314,7 @@ The typing rules:
 
 ## Nested facets
 
-String and ID facets can contain other string or ID facets. Each sub-facet
+Facets can contain other facets. Each sub-facet
 sees only the documents in its parent bucket:
 
 ```json
@@ -430,7 +429,7 @@ selects every document in the bucket, and without a `sort` that list is in
 index order. A text query's scores do not depend on the bucket, so repeating
 the outer query ranks each bucket the way the main result list is ranked.
 
-Per-bucket lists work under string/ID, range, and query facets. A per-bucket
+Per-bucket lists work under field, range, and query facets. A per-bucket
 `top_docs` may carry its own `ops`, which see every document in the bucket
 that its query and filters match, regardless of its `limit`; a per-bucket
 `fusion` accepts no `ops`. Two differences from a top-level list: it is never
@@ -504,7 +503,8 @@ column. The result is the same either way; only the cost differs.
 
 ## Date histograms
 
-Date bounds accept epoch milliseconds, ISO-8601 text, and date math. Use
+Date bounds accept epoch milliseconds, ISO-8601 text, and both Solr and
+Elasticsearch/OpenSearch [date-math syntax](dates.md#date-math). Use
 `calendar_gap` when buckets should follow civil days, weeks, months, quarters,
 or years:
 
@@ -710,7 +710,7 @@ For a query facet, values are bucket names:
 ## Field variants
 
 A bare field name uses the field's
-[value binding](schema.md#default-bindings). In the
+[value binding](schema.md#default-bindings-for-variants). In the
 [author example](documents.md#field-variants), the `_name` template sets
 `defaults.value` to `s`, so a facet on `author_name` uses the string variant
 and counts whole names such as `Neal Asher`.
@@ -773,15 +773,10 @@ primary, the bare field name counts words without needing `__self`.
 
 ## Limits
 
-- Facet sorting takes one key, which must be a metric operation of that facet.
+- Field facet sorting takes one key, which must be a metric operation of that facet.
   Custom count or bucket-value sort orders are not yet supported; omit `sort`
   for the default count order.
-- Integer, date, and text field facets do not accept `ops` or `sort`.
 - `selected` is not accepted at the root of a full-form request, under a
   `fusion`, or on a nested facet.
 - Range facets with sub-operations are limited to 1,024 buckets; a range facet
   without them may request at most 100,000.
-- Facet aggregate state is bounded by the server's
-  `search.request-memory-max-bytes` per-request ceiling. The engine charges the
-  aggregate state for every simultaneously resident bucket, including metrics
-  used to sort candidates.

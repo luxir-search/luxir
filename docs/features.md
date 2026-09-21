@@ -348,9 +348,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 
 - Storage: filesystem (memory-mapped reads) or in-memory. Collections are
   independent indexes below one data directory.
-- Crash-safe commits: files are written, synced, and atomically renamed, so a
-  crash lands on the previous commit point. An optional checked-directory
-  mode diagnoses filesystems that break the sync assumptions.
+- Crash-safe commits: after a crash, Luxir reopens the last durable commit.
 - One writer per data directory, enforced by a lock; `--read-only` nodes serve
   a directory that another process is writing.
 - Background merging that parallelizes inside a single merge, admitted

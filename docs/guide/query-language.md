@@ -60,7 +60,7 @@ string "02134", leading zero included, because `zip_s` is a string field.
 On a field with [variants](schema.md#field-variants), terms and phrases use
 the field's `search` binding and `:=` and ranges use its `value` binding;
 `field__label` and `field__self` select one representation explicitly. See
-[default bindings](schema.md#default-bindings).
+[default bindings for variants](schema.md#default-bindings-for-variants).
 
 ## Terms and phrases
 
@@ -461,9 +461,12 @@ text. A `$` inside quotes or inside a word is an ordinary character
 Details of the date grammar. [Dates and time zones](dates.md) explains the
 model.
 
-- Two spellings of date math are accepted: Solr-style word units appended
-  directly to the anchor (`NOW-1DAY/DAY`, `2024-01-01T00:00:00Z+2MONTHS`),
-  and one-letter units after a `||` separator (`2024-01-01T00:00:00Z||+2M`).
+- Both Solr and Elasticsearch/OpenSearch date-math syntaxes are accepted:
+  Solr-style word units appended directly to the anchor (`NOW-1DAY/DAY`,
+  `2024-01-01T00:00:00Z+2MONTHS`),
+  and Elasticsearch/OpenSearch one-letter units (`now-1d/d`,
+  `2024-01-01T00:00:00Z||+2M`). The `||` separator goes between a literal
+  date and its math; `now` needs no separator.
   Word units are case-insensitive (`YEARS`, `MONTHS`, `WEEKS`, `DAYS`/`DATE`,
   `HOURS`, `MINUTES`, `SECONDS`, and the millisecond aliases); `WEEK`/`WEEKS`
   is a Luxir extension of the Solr grammar, coherent with the `w`

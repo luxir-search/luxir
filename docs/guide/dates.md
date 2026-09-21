@@ -1,10 +1,11 @@
 # Dates and time zones
 
-Date fields support queries, ranges, sorting, and facets. Use the built-in
-`_dt` template (`_dts` for multiple dates), or define a date field explicitly.
-Dates can be ISO-8601 text, epoch milliseconds, partial dates that match the
-whole day or month they name, or date math like `NOW/DAY-30DAYS`. Set
-`time_zone` on a request for local date queries and calendar buckets. Dates
+Luxir accepts ISO-8601 dates, epoch milliseconds, and both Solr and
+Elasticsearch/OpenSearch date-math syntax. Date fields support queries,
+ranges, sorting, and facets. Use the built-in `_dt` template (`_dts` for
+multiple dates), or define a date field explicitly. Partial dates match the
+whole day or month they name. Set `time_zone` on a request for local date
+queries and calendar buckets. Dates
 are stored as int64 milliseconds since the Unix epoch. This page covers the
 accepted forms, date math, and time zones; the
 [query language](query-language.md#dates-in-expressions) has the grammar
@@ -30,21 +31,23 @@ A partial date names its whole window at its own granularity. Querying
 
 ## Date math
 
-Anywhere a date is accepted in a query, date math is too. An expression is an
-anchor (`NOW`, or any literal above) followed by add, subtract, and round
-commands, evaluated left to right:
+Anywhere a date is accepted in a query, date math is too. Both Solr and
+Elasticsearch/OpenSearch syntaxes work without configuration. An expression
+is an anchor (`NOW` / `now`, or any literal above) followed by add, subtract,
+and round commands, evaluated left to right:
 
-```
-NOW-30DAYS              thirty days ago
-NOW/DAY                 today, as a whole-day window
-NOW-1MONTH/MONTH        all of last month
-2024-06-25||+2d/d       one-letter units after a || separator
-2024-06-25T00:00:00Z+6MONTHS   Solr style: word units appended directly
-```
+| Solr | Elasticsearch/OpenSearch | Meaning in Luxir |
+|---|---|---|
+| `NOW-30DAYS` | `now-30d` | Thirty days ago. |
+| `NOW/DAY` | `now/d` | Today, as a whole-day window. |
+| `NOW-1MONTH/MONTH` | `now-1M/M` | All of last month. |
+| `2024-06-25T00:00:00Z+6MONTHS` | `2024-06-25T00:00:00Z\|\|+6M` | Six months after the given date. |
 
-Both spellings work: Solr word units (`DAYS`, `MONTHS`, case-insensitive;
-`WEEKS` is a Luxir extension) appended to the anchor, and one-letter units
-(`d`, `M`, case-sensitive: `M` is month, `m` is minute) after `||`. `NOW` is one clock snapshot for the whole
+Solr syntax appends word units directly to the anchor (`DAYS`, `MONTHS`,
+case-insensitive; `WEEKS` is a Luxir extension). Elasticsearch/OpenSearch
+syntax uses one-letter units (`d`, `M`, case-sensitive: `M` is month, `m` is
+minute), with `||` separating a literal date from its math. Math after `now`
+needs no separator. `NOW` and `now` use one clock snapshot for the whole
 request, so every clause in a request sees the same instant.
 
 Rounding produces a window, and a range endpoint uses the appropriate edge

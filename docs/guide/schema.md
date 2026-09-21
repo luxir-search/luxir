@@ -30,16 +30,20 @@ you index `"Red Bicycle"` using the built-in templates:
   `title_t:bicycle` matches, as does `title_t:"red bicycle"`.
 - **`title_s` (`string`)** indexes the whole value `Red Bicycle`.
   `title_s:"Red Bicycle"` matches; `title_s:bicycle` does not.
-  Sorting and faceting use the whole value too.
+
+Sorting text values requires a whole-value column, which `string` provides.
+Faceting can use analyzed terms from a `text` field, but whole values are
+often more appropriate, such as complete author names or categories.
 
 The analyzer controls how `text` is split and normalized. Bare `"type": "text"`
 defaults to splitting on whitespace with no filters; the `_t` template adds
 Unicode word segmentation, case and accent folding, and English stemming.
 See [Text analysis](#text-analysis) for the available components.
 
-`string` preserves case and accents by default. An optional
-[normalizer](#string-normalization-and-length) can fold them while keeping
-each value whole. When one value needs both full-text search and whole-value
+`string` keeps values verbatim by default. You can configure a
+[normalizer](#string-normalization-and-length) to transform them, for example
+by folding case or accents, without splitting them into words.
+When one value needs both full-text search and whole-value
 sorting or faceting, use a `text` field with a `string`
 [variant](#field-variants). The built-in `_name` template provides this
 combination for names.
@@ -267,7 +271,7 @@ publication advances the schema generation.
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
-| `defaults` | Choose `self` or a variant label for `search` and `value` operations; only useful with variants; both default to `self`; see [Default bindings](#default-bindings) |
+| `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 
@@ -379,19 +383,39 @@ The primary and every variant must use types from the same group:
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
 
-### Default bindings
+### Default bindings for variants
 
-Default bindings choose which representation to use when a request names a
-field without a variant selector, such as `author_name`. Without variants,
-both bindings use `self` (the primary field), and there is nothing to
-configure.
+For a field with variants, default bindings choose which representation to
+use when a request names the field without a variant selector, such as
+`author_name`. Fields without variants use the field itself; there is nothing
+to configure.
 
 With variants, `defaults.search` selects the representation for text search,
 and `defaults.value` selects it for operations such as sorting and faceting.
-Both default to `self`; adding a variant does not select it automatically.
-For example, the `_name` template sets `defaults.value` to `s`, so
-`author_name` searches its analyzed text but sorts and facets on its whole-name
-string variant.
+Explicit bindings, including inherited ones, take precedence. An omitted
+binding is inferred from the resolved field types:
+
+| Primary type | Search binding | Value binding |
+|---|---|---|
+| `text` | `self` | Its sole `string` variant, or `self` if none exists. |
+| `string` | Its sole `text` variant, or `self` if none exists. | `self` |
+| Other types | `self` | `self` |
+
+A text field with one string variant therefore searches words but sorts and
+facets on whole values without a `defaults` block. A string field with one
+text variant searches words through that variant and uses the primary for
+whole-value operations.
+
+If a text primary has multiple string variants, set `defaults.value`; if a
+string primary has multiple text variants, set `defaults.search`. Otherwise,
+the schema is rejected as ambiguous. Use `"self"` to keep an operation class
+on the primary, or a variant label to select a particular representation.
+The `_name` template explicitly sets `defaults.value` to `s`, preserving that
+choice even if another string variant is added.
+
+Inference uses types after inheritance. Each operation still checks the
+chosen representation's index and column capabilities; it does not look for
+an alternative if those checks fail.
 
 | Operation | Bare field name uses |
 |---|---|
@@ -458,9 +482,7 @@ POST /collections/authors/_schema
       "variants": {
         "raw": "string"
       },
-      "defaults": {
-        "value": "raw"
-      }
+      "defaults": {}
     },
     "cleared": {
       "parent": "_name",
@@ -471,9 +493,12 @@ POST /collections/authors/_schema
 }
 ```
 
-`inherited` keeps `s` and the value binding. `replaced` has only `raw`.
+`inherited` keeps `s` and the value binding. `replaced` has only `raw`; clearing
+the inherited defaults lets its value binding infer `raw`.
 `cleared` clears both the variants and their inherited defaults, leaving only
-the primary. Within a present `defaults`, an omitted binding becomes `self`.
+the primary. Within a present `defaults`, an omitted binding follows the
+inference rules above. An empty `defaults: {}` restores inference; use an
+explicit `"self"` binding to pin the primary.
 
 A variant's own `parent` borrows physical settings only: type, index, column,
 analyzer, normalizer, `long_terms`, and vector settings. It does not inherit
@@ -494,9 +519,6 @@ POST /collections/_create
         "parent": "_t",
         "variants": {
           "s": "string"
-        },
-        "defaults": {
-          "value": "s"
         }
       }
     }
@@ -507,7 +529,8 @@ POST /collections/_create
 A field named `book_title` now indexes both `book_title` and `book_title__s`.
 The `_title` template inherits `_t`'s case folding, accent folding, and English
 stemming; its string variant keeps the whole value for sorting, faceting,
-and exact lookup. See [field retrieval](searching.md#field-retrieval-and-result-shape)
+and exact lookup through the inferred value binding. See
+[field retrieval](searching.md#field-retrieval-and-result-shape)
 for retrieving a particular variant.
 
 ## STRING normalization and length
@@ -659,11 +682,15 @@ generation.
 
 Schema changes apply to new requests and do not rewrite existing documents.
 
-Adding a field or variant leaves older documents without its values. Reindex
-from your source data to populate them before switching queries or default
-bindings to the new representation. For example, older documents without a
-new `author__s` variant will not match its exact queries or appear in its facet
-buckets.
+Adding a field or variant leaves older documents without its values. Adding
+a variant can also change an inferred binding immediately. For a staged
+rollout, explicitly pin the affected binding to its current representation
+(for example, `"defaults": {"value": "self"}`) when adding the variant.
+Reindex from your source data, then select the new variant explicitly or set
+`defaults: {}` to restore inference for both bindings. To keep one binding
+pinned, retain it in the `defaults` object and omit only the other. Older
+documents without a new `author__s` variant will not match its exact queries
+or appear in its facet buckets.
 
 Schema edits are not checked for compatibility with existing data. To change
 a field's type or analysis, use a new field or variant label and reindex.
@@ -673,8 +700,8 @@ Removing and reusing a name does not erase its old indexed values.
 
 - Schema edits do not rewrite existing documents; see
   [Changes to a live collection](#changes-to-a-live-collection).
-- Analyzed text has no value column; use
-  a string variant when the same value must sort or facet.
+- Analyzed text has no value column; use a string variant to sort text values
+  or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
 - There is no default geo suffix; geo fields need an explicit definition (see

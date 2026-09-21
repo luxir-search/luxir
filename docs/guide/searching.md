@@ -266,7 +266,7 @@ A bare field name selects a representation by operation: text operations
 field's `search` binding, and value operations (`any_of`, ranges, facets,
 sorts, metrics) use its `value` binding. `f__label` selects a variant
 exactly and `f__self` forces the primary. The rules live in
-[Schema: default bindings](schema.md#default-bindings).
+[Schema: default bindings for variants](schema.md#default-bindings-for-variants).
 
 The [author example](documents.md#field-variants) shows word search and
 whole-name facets using `author_name`. To retrieve specific representations,

@@ -39,7 +39,7 @@ shorthand expansion.
 A bare field name picks a representation by operation: text operations use
 the field's `search` binding, value operations (`any_of`, ranges, facets,
 sorts, metrics) use its `value` binding, and `f__label` or `f__self` selects
-one representation directly. See [default bindings](schema.md#default-bindings)
+one representation directly. See [default bindings for variants](schema.md#default-bindings-for-variants)
 and the [worked example](searching.md#field-bindings).
 
 ## Match all and exists
