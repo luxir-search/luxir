@@ -10,7 +10,23 @@ language, and streaming import and export of files of any size.
 
 Download the release for your platform from <https://luxir.org/download/>,
 unpack it, and put the `luxir` binary on your `PATH`. Releases are built for
-Linux on x86-64. If you would rather build it yourself, or want to work on the
+Linux on x86-64 with glibc 2.35 or newer (Ubuntu 22.04 or newer, for example).
+Choose the highest CPU tier your system supports: v2, v3 (AVX2), or v4
+(AVX-512). To see the supported tiers on a glibc system, run:
+
+```bash
+/lib64/ld-linux-x86-64.so.2 --help
+```
+
+Look for `x86-64-v2`, `x86-64-v3`, and `x86-64-v4` marked as supported. Use v2
+when unsure; even v2 requires a CPU newer than the original x86-64 baseline.
+The `-debug`, `-asan`, and `-symbols` archives are for diagnosing problems;
+choose an archive without those suffixes for normal use.
+
+Check the download with `sha256sum -c SHA256SUMS --ignore-missing`, then run
+`luxir --version` to confirm the version and CPU tier.
+
+If you would rather build it yourself, or want to work on the
 engine, [Build Setup](../dev/build-setup.md) covers the toolchain and presets;
 the result is `build/gcc-release/bin/luxir`.
 

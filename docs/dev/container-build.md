@@ -113,8 +113,9 @@ ASan Debug libraries retain full variable information. Dependency source trees
 are omitted from the image; retrieve the matching sources when
 stepping into them in GDB.
 
-Release packaging, final CPU-tier selection, and execution checks on older
-CPUs are separate work.
+`container-release-v3` and `container-release-v4` select the other optimized
+CPU tiers. See [Building a release](releases.md) for packaging, symbols, and
+CPU compatibility validation.
 
 ## Share an already-built environment
 

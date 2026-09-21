@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Package an already tested container build. Run through tools/dev-container."""
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import tempfile
+
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def run(*args):
+    return subprocess.check_output(args, text=True, cwd=ROOT).strip()
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def copy(source, target):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+
+def build_id(path):
+    return re.search(r"Build ID: (\w+)", run("readelf", "-n", str(path)))[1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("build_dir", type=pathlib.Path)
+    parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--builder-image", required=True, help="Immutable Docker image ID or digest")
+    args = parser.parse_args()
+    if not re.search(r"sha256:[0-9a-f]{64}$", args.builder_image):
+        parser.error("--builder-image must identify immutable image content")
+    if run("git", "status", "--porcelain", "--untracked-files=normal"):
+        parser.error("commit source changes before packaging")
+    status = subprocess.check_output(["git", "submodule", "status"], cwd=ROOT, text=True)
+    if any(line[0] != " " for line in status.splitlines()):
+        parser.error("initialize submodules at their recorded revisions")
+    if run("git", "-C", "deps/FastPFOR", "status", "--porcelain"):
+        parser.error("FastPFOR sources must also be clean")
+    # Container installs are intentionally outside manifest mode. Detect a stale
+    # image before attributing its dependencies to the checkout's source pins.
+    for name in ("vcpkg.json", "vcpkg-configuration.json", "ports", "triplets"):
+        source = ROOT / "deps" / name
+        paths = sorted(source.rglob("*")) if source.is_dir() else [source]
+        for path in paths:
+            if path.is_file():
+                installed = pathlib.Path("/opt/luxir-deps") / path.relative_to(ROOT / "deps")
+                if not installed.is_file() or sha256(path) != sha256(installed):
+                    parser.error(f"rebuild the container: dependency recipe differs at {path}")
+
+    directory = args.build_dir.resolve()
+    cache = dict(re.findall(r"^([^/#\r\n][^:=\r\n]*):[^=\r\n]+=(.*)$",
+                            (directory / "CMakeCache.txt").read_text(), re.MULTILINE))
+    if pathlib.Path(cache["CMAKE_HOME_DIRECTORY"]).resolve() != ROOT:
+        parser.error("the build directory belongs to a different checkout")
+    if cache.get("LUXIR_LOCAL_TARGETS") == "ON":
+        parser.error("release packaging does not allow LocalTargets.cmake customizations")
+    version = cache["CMAKE_PROJECT_VERSION"]
+    tier = cache["LUXIR_CPU_TARGET"]
+    config = cache["CMAKE_BUILD_TYPE"]
+    asan = "-fsanitize=address" in cache["CMAKE_CXX_FLAGS"]
+    if tier not in ("x86-64-v2", "x86-64-v3", "x86-64-v4"):
+        parser.error("release packaging requires an explicit CPU tier")
+    if cache.get("LUXIR_STATIC_RUNTIME") != "ON" or config not in ("Release", "Debug"):
+        parser.error("use a container Release or Debug configuration with static runtimes")
+    if (asan or config == "Debug") and tier != "x86-64-v2":
+        parser.error("public diagnostic packages use x86-64-v2")
+    if asan and config != "Debug":
+        parser.error("public ASan packages use Debug")
+
+    # Refresh only the build graph (including CMake's source-glob checks).
+    # Compiling here would invalidate the tests of the supplied executable.
+    if cache.get("CMAKE_GENERATOR") != "Ninja":
+        parser.error("release packaging requires the Ninja container presets")
+    subprocess.run(["ninja", "-C", str(directory), "build.ninja"], check=True)
+    # Ninja 1.10 stops a dry run at CMake's always-dirty glob check. Read the
+    # refreshed graph from stdin so Ninja checks targets without regenerating it.
+    pending = subprocess.check_output(
+        ["ninja", "-C", str(directory), "-f", "/dev/stdin", "-n"],
+        input=(directory / "build.ninja").read_text(), text=True)
+    if not pending.strip().endswith("ninja: no work to do."):
+        parser.error("the build is stale; rebuild and test before packaging")
+    binary = directory / "bin/luxir"
+    if run(str(binary), "--version") != f"Luxir {version} ({tier})":
+        parser.error("the executable version does not match its build configuration")
+    notes = run("readelf", "-n", str(binary))
+    needed_tiers = re.findall(r"x86-64-v[234]", notes)
+    if not needed_tiers or max(needed_tiers) != tier:
+        parser.error("the executable's required ISA note does not match its CPU tier")
+    dynamic = run("readelf", "-d", str(binary))
+    libraries = re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic)
+    if set(libraries) - {"libc.so.6", "libm.so.6", "ld-linux-x86-64.so.2"}:
+        parser.error(f"unexpected runtime libraries: {libraries}")
+    versions = re.findall(r"\bGLIBC_(\d+)\.(\d+)(?:\.(\d+))?\b",
+                          run("readelf", "--version-info", str(binary)))
+    glibc = max(tuple(int(part or 0) for part in item) for item in versions)
+    if glibc > (2, 35, 0):
+        parser.error(f"glibc requirement exceeds 2.35: {glibc}")
+
+    suffix = "-asan" if asan else "-debug" if config == "Debug" else ""
+    name = f"luxir-{version}-linux-x86_64-{tier.rsplit('-', 1)[1]}{suffix}"
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    archive_names = [name] + ([name + "-symbols"] if config == "Release" else [])
+    if any((output / (item + ".tar.gz")).exists() for item in archive_names):
+        parser.error("output archives already exist; choose a fresh output directory")
+
+    install = pathlib.Path(cache["VCPKG_INSTALLED_DIR"])
+    triplet = cache["VCPKG_TARGET_TRIPLET"]
+    revision = run("git", "rev-parse", "HEAD")
+    epoch = run("git", "show", "-s", "--format=%ct", "HEAD")
+    manifest = {
+        "version": version, "source_commit": revision,
+        "source_commit_subject": run("git", "show", "-s", "--format=%s", "HEAD"),
+        "source_commit_date": run("git", "show", "-s", "--format=%cI", "HEAD"),
+        "builder_image": args.builder_image,
+        "compiler": run(cache["CMAKE_CXX_COMPILER"], "--version").splitlines()[0],
+        "cpu_target": tier, "build_type": config, "address_sanitizer": asan,
+        "build_id": build_id(binary), "minimum_glibc": "2.35",
+        "dynamic_libraries": libraries, "vcpkg_triplet": triplet,
+        "vcpkg_baseline": json.loads((ROOT / "deps/vcpkg.json").read_text())["builtin-baseline"],
+        "submodules": run("git", "submodule", "status"),
+        "fastpfor_commit": run("git", "-C", "deps/FastPFOR", "rev-parse", "HEAD"),
+        "c_flags": cache["CMAKE_C_FLAGS"] + " " + cache["CMAKE_C_FLAGS_" + config.upper()],
+        "cxx_flags": cache["CMAKE_CXX_FLAGS"] + " " + cache["CMAKE_CXX_FLAGS_" + config.upper()],
+        "dispatch": "FAISS and OpenBLAS select kernels at runtime; OpenBLAS is single-threaded",
+        "asan_exclusions": ["OpenBLAS AVX-512 assembly kernels"] if asan else [],
+    }
+    with tempfile.TemporaryDirectory(prefix=".package-", dir=output) as temporary:
+        staging = pathlib.Path(temporary)
+        package = staging / name
+        package.mkdir()
+        executable = package / "luxir"
+        copy(binary, executable)
+        if config == "Release":
+            symbols = staging / (name + "-symbols") / name
+            symbols.mkdir(parents=True)
+            debug = symbols / "luxir.debug"
+            subprocess.run(["objcopy", "--only-keep-debug", str(executable), str(debug)], check=True)
+            subprocess.run(["strip", "--strip-unneeded", str(executable)], check=True)
+            subprocess.run(["objcopy", "--add-gnu-debuglink=" + str(debug), str(executable)], check=True)
+            if build_id(executable) != build_id(debug):
+                raise RuntimeError("executable and symbols have different build IDs")
+            symbol_manifest = dict(manifest, symbols_sha256=sha256(debug))
+            (symbols / "BUILD-symbols.json").write_text(json.dumps(symbol_manifest, indent=2) + "\n")
+        manifest["executable_sha256"] = sha256(executable)
+        (package / "BUILD.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        for filename in ("LICENSE", "NOTICE"):
+            copy(ROOT / filename, package / filename)
+        shutil.copytree(ROOT / "docs", package / "docs")
+        shutil.copytree(ROOT / "protos", package / "protos",
+                        ignore=shutil.ignore_patterns("CMakeLists.txt"))
+        shutil.copytree(ROOT / "deps/runtime-licenses", package / "licenses/runtime")
+        for dependency, filename in (("uni-algo", "LICENSE.md"), ("is_utf8", "LICENSE"),
+                                     ("hpp-proto", "LICENSE"), ("FastPFOR", "LICENSE")):
+            copy(ROOT / "deps" / dependency / filename, package / "licenses" / dependency / filename)
+        copy(ROOT / "deps/uni-algo/include/uni_algo/impl/data/LICENSE.txt",
+             package / "licenses/uni-algo/Unicode-LICENSE.txt")
+        for path in sorted((install / triplet / "share").glob("*/copyright")):
+            copy(path, package / "licenses/vcpkg" / path.parent.name / "copyright")
+        for filename in ("src/luxir/analysis/KStemmer.cpp", "src/luxir/analysis/KStemData.h",
+                         "src/luxir/util/random.h", "src/luxir/util/luxir_util.h"):
+            copy(ROOT / filename, package / "licenses/adapted" / filename)
+        copy(install / "vcpkg/status", package / "BUILD-dependencies.txt")
+        (package / "README.txt").write_text(
+            f"Luxir {version} for Linux {tier}\n\n"
+            "Requires glibc 2.35 or newer and the named CPU level.\n"
+            "Install system tzdata for IANA time-zone names; UTC and fixed\n"
+            "offsets work without it.\n"
+            "Run /lib64/ld-linux-x86-64.so.2 --help to inspect supported CPU levels.\n"
+            "Run ./luxir --version or ./luxir --help. Start with ./luxir.\n"
+            "The HTTP API listens on port 9400; see docs/guide/quickstart.md.\n"
+            "Documentation: https://luxir.org/docs/\n\n"
+            "For persistent data: ./luxir --store.backend=fs --store.data-dir=./data\n\n"
+            "Extract the matching symbols archive beside this package to place\n"
+            "luxir.debug next to luxir. In GDB, use 'set substitute-path\n"
+            "/workspace/luxir /path/to/matching/source' for Luxir source lines.\n"
+            "Optimized dependencies retain their available function symbols;\n"
+            "their source-level debug information is not included.\n\n"
+            "Debug and ASan downloads include embedded debugging information.\n"
+            "ASan symbolization: install addr2line (binutils) and run with\n"
+            "ASAN_OPTIONS=detect_leaks=1:allow_addr2line=1.\n\n"
+            "BUILD.json identifies the source and builder; BUILD-dependencies.txt\n"
+            "records the installed dependency packages, including build tools.\n"
+            "Third-party notices and runtime licenses are under licenses/.\n")
+        for item in archive_names:
+            archive = staging / (item + ".tar.gz")
+            subprocess.run(["tar", "--sort=name", "--mtime=@" + epoch, "--owner=0",
+                            "--group=0", "--numeric-owner", "-czf", str(archive),
+                            "-C", str(staging / item if item.endswith("-symbols") else staging),
+                            name], check=True)
+            shutil.move(archive, output / archive.name)
+    checksums = "".join(f"{sha256(path)}  {path.name}\n" for path in sorted(output.glob("*.tar.gz")))
+    (output / "SHA256SUMS").write_text(checksums)
+    print(f"Packaged {name} into {output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -22,11 +22,10 @@ namespace fs = std::filesystem;
 using namespace luxir;
 
 int luxir_main(int argc, char** argv) {
-  std::cout << luxir_banner() << std::endl;
-
   spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
 
   CLI::App app{"Luxir search engine"};
+  app.set_version_flag("--version", "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")");
   LuxirConfig config;
   config.addOptions(app);
 
@@ -35,6 +34,7 @@ int luxir_main(int argc, char** argv) {
   } catch (const CLI::ParseError &e) {
     return app.exit(e);
   }
+  std::cout << luxir_banner() << std::endl;
 
 #ifdef __GLIBC__
   // An explicit mallopt permanently disables glibc's dynamic mmap-threshold
@@ -96,7 +96,7 @@ int luxir_main(int argc, char** argv) {
 
 std::string luxir_banner() {
   std::stringstream ss;
-  ss << "luxir (insert cool ascii art here ;-) ";
+  ss << "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")";
 #ifdef NDEBUG
   ss << " Release (NDEBUG)";
 #else

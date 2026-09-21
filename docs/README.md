@@ -83,6 +83,8 @@ state, and commits are crash-safe on immutable segments.
   and runtime time-zone data.
 - [Container build](dev/container-build.md) provides the shared Ubuntu 22.04
   compiler and dependency environment, including ASan.
+- [Building a release](dev/releases.md) covers branches, tags, CPU tiers,
+  validation, and binary packaging.
 - [Documentation](dev/documentation.md) covers editing the guides and
   regenerating the API reference.
 

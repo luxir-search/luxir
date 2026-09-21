@@ -152,6 +152,18 @@
       }
     },
     {
+      "name": "container-release-v3",
+      "inherits": "container-release",
+      "displayName": "Ubuntu 22.04 GCC release (x86-64-v3)",
+      "cacheVariables": {"LUXIR_CPU_TARGET": "x86-64-v3"}
+    },
+    {
+      "name": "container-release-v4",
+      "inherits": "container-release",
+      "displayName": "Ubuntu 22.04 GCC release (x86-64-v4)",
+      "cacheVariables": {"LUXIR_CPU_TARGET": "x86-64-v4"}
+    },
+    {
       "name": "container-asan",
       "inherits": [
         "base-container",
@@ -174,6 +186,8 @@
     { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" },
     {"name": "container-debug", "configurePreset": "container-debug"},
     {"name": "container-release", "configurePreset": "container-release"},
+    {"name": "container-release-v3", "configurePreset": "container-release-v3"},
+    {"name": "container-release-v4", "configurePreset": "container-release-v4"},
     {"name": "container-asan", "configurePreset": "container-asan"}
   ]
 }
