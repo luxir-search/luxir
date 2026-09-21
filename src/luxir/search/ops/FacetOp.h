@@ -1507,10 +1507,14 @@ public:
       }
       rangeOp().facetSegIntCol(
           domain, segnum, data.missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t val) LUXIR_INLINE {
+          // Captured by value: through a by-reference capture the counts
+          // store may alias the op's fences and the count vector itself, so
+          // each value would reload them.
+          [start, end, counts = std::span(data.counts), &range = rangeOp()]
+          (int32_t docid, int64_t val) LUXIR_INLINE {
             unused(docid);
             if (val < start || val >= end) return;
-            data.counts[rangeOp().bucketOf(val)]++;
+            counts[range.bucketOf(val)]++;
           });
     }
 
