@@ -467,6 +467,7 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
   auto& col = b.variant(a, "col");
   col.type = FieldClass::STRING;
   col.index = api::FieldDef::IndexMode::NONE;
+  a.defaults.emplace().value = "s";
   b.field("aB").type = FieldClass::INT; // sorts between the primary and its variants
   auto& point = b.field("point");
   point.type = FieldClass::GEO_POINT;

@@ -1257,7 +1257,7 @@ TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
   },"fields":{
     "plain":"string", "text":"text", "column":{"type":"string","index":"none"},
     "inherited":{"parent":"_child"},
-    "title":{"type":"text","long_terms":"reject","variants":{
+    "title":{"type":"text","long_terms":"reject","defaults":{"value":"self"},"variants":{
       "s":{"parent":"_child"}, "loose":{"parent":"_child","long_terms":"truncate"}, "raw":"string"
     }}
   }})");
@@ -1321,8 +1321,8 @@ TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
 
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   auto s = schemaJson(R"({"fields":{
-    "author":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}},
-    "genre":{"type":"string","variants":{"t":"text"},"defaults":{"search":"t"}},
+    "author":{"type":"text","variants":{"s":"string"}},
+    "genre":{"type":"string","variants":{"t":"text"}},
     "edition":{"type":"int","index":"range","variants":{"label":"string"}},
     "self":"string", "f_":{"type":"text","variants":{"s":"string"}}
   }})");
@@ -1362,6 +1362,85 @@ TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   EXPECT_THROW(s->physical("author__self"), RequestError);
   EXPECT_EQ(nullptr, s->getFieldTypePtr("author__self"));
   EXPECT_FALSE(s->fieldTypeMap.contains("author__self"));
+}
+
+TEST_F(SchemaTest, ambiguousVariantBindingsRequireExplicitChoice) {
+  for (auto primary : {FieldClass::TEXT, FieldClass::STRING}) {
+    bool text = primary == FieldClass::TEXT;
+    std::string key = text ? "value" : "search";
+    SCOPED_TRACE(key);
+    SchemaBuilder b;
+    auto& field = b.field("choice");
+    field.type = primary;
+    for (auto label : {"first", "second"}) {
+      b.variant(field, label).type = text ? FieldClass::STRING : FieldClass::TEXT;
+    }
+    try {
+      b.build();
+      FAIL() << "ambiguous binding accepted";
+    } catch (const SchemaError& e) {
+      std::string message = e.what();
+      for (auto part : {"defaults." + key, std::string("choice"),
+                        std::string("first"), std::string("second")}) {
+        EXPECT_NE(std::string::npos, message.find(part)) << message;
+      }
+    }
+    auto& defaults = field.defaults.emplace();
+    EXPECT_THROW(b.build(), SchemaError); // {} restores inference
+    (text ? defaults.search : defaults.value) = "self";
+    EXPECT_THROW(b.build(), SchemaError); // the other binding does not resolve ambiguity
+    b.field("inherited").parent = "choice";
+    for (auto label : {"SELF", "second"}) {
+      (text ? defaults.value : defaults.search) = label;
+      auto s = b.build();
+      for (auto name : {"choice", "inherited"}) {
+        std::string expected = std::string(name) + (label == std::string_view("SELF") ? "" : "__second");
+        EXPECT_EQ(expected, s->resolveFor(name, text ? OpClass::VALUE : OpClass::SEARCH).physicalName);
+      }
+    }
+  }
+}
+
+TEST_F(SchemaTest, variantInferenceUsesResolvedTypesAndSurvivesRoundTrips) {
+  auto s = schemaJson(R"({"templates":{
+    "_whole":{"type":"string"},
+    "_words":{"type":"text","variants":{"raw":{"parent":"_whole"}}}
+  },"fields":{
+    "author":{"parent":"_words"},
+    "replaced":{"parent":"_words","variants":{"whole":{"parent":"_whole"}}},
+    "genre":{"type":"string","variants":{"words":{"parent":"_words"}}},
+    "numeric":{"parent":"_words","type":"int"}
+  }})");
+  auto json = authoredJson(*s);
+  EXPECT_EQ(std::string::npos, json.find("\"defaults\"")); // inferred choices stay out of authored definitions
+  auto stored = s->encodeStored();
+  for (const auto& copy : {s, schemaJson(json), Schema::decodeStored(std::as_bytes(std::span(stored)))}) {
+    EXPECT_EQ(s->sourceDef_, copy->sourceDef_);
+    EXPECT_EQ("author__raw", copy->resolveFor("author", OpClass::VALUE).physicalName);
+    EXPECT_EQ("book_words__raw", copy->resolveFor("book_words", OpClass::VALUE).physicalName);
+    EXPECT_EQ("replaced__whole", copy->resolveFor("replaced", OpClass::VALUE).physicalName);
+    EXPECT_EQ("genre__words", copy->resolveFor("genre", OpClass::SEARCH).physicalName);
+    EXPECT_EQ("numeric", copy->resolveFor("numeric", OpClass::VALUE).physicalName);
+  }
+  auto changed = schemaJson(R"({"templates":{"_whole":{"type":"int"}}})", s.get());
+  EXPECT_EQ("author", changed->resolveFor("author", OpClass::VALUE).physicalName);
+  EXPECT_EQ("book_words", changed->resolveFor("book_words", OpClass::VALUE).physicalName);
+}
+
+TEST_F(SchemaTest, variantInferenceLeavesOtherTypeCombinationsOnPrimary) {
+  auto s = schemaJson(R"({"fields":{
+    "words":{"type":"text","variants":{"alternate":"text","number":"int"}},
+    "whole":{"type":"string","variants":{"raw":"string","number":"int"}},
+    "number":{"type":"int","variants":{"raw":"string","words":"text"}},
+    "fraction":{"type":"float","variants":{"raw":"string","words":"text"}},
+    "precise":{"type":"double","variants":{"raw":"string","words":"text"}},
+    "when":{"type":"date","variants":{"raw":"string","words":"text"}}
+  }})");
+  for (auto name : {"words", "whole", "number", "fraction", "precise", "when"}) {
+    for (auto op : {OpClass::SEARCH, OpClass::VALUE}) {
+      EXPECT_EQ(name, s->resolveFor(name, op).physicalName);
+    }
+  }
 }
 
 TEST_F(SchemaTest, variantSelectorErrorsAndInputSeparation) {
@@ -1427,7 +1506,11 @@ TEST_F(SchemaTest, variantsAtomicInheritanceAndDefaultsClearing) {
     "inherited":{"parent":"_child"},
     "replaced":{"parent":"_base","variants":{"x":"float"},"defaults":{}},
     "cleared":{"parent":"_base","variants":{},"defaults":{}},
-    "partial":{"parent":"_base","defaults":{"value":"s"}}
+    "partial":{"parent":"_base","defaults":{"value":"s"}},
+    "inferred":{"parent":"_base","defaults":{}},
+    "searchOnly":{"parent":"_base","defaults":{"search":"s"}},
+    "pinned":{"parent":"_base","defaults":{"value":"self"}},
+    "pinnedChild":{"parent":"pinned"}
   }})");
   EXPECT_EQ("inherited__s", s->resolveFor("inherited", OpClass::SEARCH).physicalName);
   EXPECT_EQ("inherited__i", s->resolveFor("inherited", OpClass::VALUE).physicalName);
@@ -1439,6 +1522,11 @@ TEST_F(SchemaTest, variantsAtomicInheritanceAndDefaultsClearing) {
   EXPECT_EQ("cleared", s->resolveFor("cleared", OpClass::SEARCH).physicalName);
   EXPECT_EQ("partial", s->resolveFor("partial", OpClass::SEARCH).physicalName);
   EXPECT_EQ("partial__s", s->resolveFor("partial", OpClass::VALUE).physicalName);
+  EXPECT_EQ("inferred", s->resolveFor("inferred", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("inferred__s", s->resolveFor("inferred", OpClass::VALUE).physicalName);
+  EXPECT_EQ("searchOnly__s", s->resolveFor("searchOnly", OpClass::SEARCH).physicalName);
+  EXPECT_EQ("searchOnly__s", s->resolveFor("searchOnly", OpClass::VALUE).physicalName);
+  EXPECT_EQ("pinnedChild", s->resolveFor("pinnedChild", OpClass::VALUE).physicalName);
 }
 
 TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
@@ -1463,7 +1551,7 @@ TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
   EXPECT_EQ(2u, input.owner->variants.size());
   EXPECT_TRUE(s->physical("b__t")->multiValued());
   EXPECT_FALSE(s->physical("b__t")->isStored()); // TEXT type default belongs to owner
-  EXPECT_EQ("a", s->resolveFor("a", OpClass::VALUE).physicalName);
+  EXPECT_EQ("a__s", s->resolveFor("a", OpClass::VALUE).physicalName);
   auto* str = (StrFieldType*)s->physical("a__s");
   std::string value = "Whole VALUE";
   str->normalize(value);

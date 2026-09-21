@@ -562,12 +562,39 @@ static LogicalField::Shape shapeFamily(FieldClass type) {
   return LogicalField::Shape::SCALAR;
 }
 
-static std::string binding(std::optional<std::string_view> label, const LogicalField& logical) {
-  if (!label || foldName(*label) == "self") return "self";
-  if (!logical.variants.contains(*label)) {
-    throw SchemaError("dangling defaults label '" + std::string(*label) + "' on field: " + logical.name);
+static std::string binding(std::optional<std::string_view> label,
+                           const LogicalField& logical, OpClass op) {
+  if (label) {
+    if (foldName(*label) == "self") return "self";
+    if (!logical.variants.contains(*label)) {
+      throw SchemaError("dangling defaults label '" + std::string(*label) + "' on field: " + logical.name);
+    }
+    return std::string(*label);
   }
-  return std::string(*label);
+
+  // Infer only the complementary text/string representation, after resolving
+  // inheritance. Operations still check the chosen representation's capabilities.
+  FieldType::Type preferred;
+  if (op == OpClass::VALUE && logical.primary->type() == FieldType::TEXT) {
+    preferred = FieldType::STRING;
+  } else if (op == OpClass::SEARCH && logical.primary->type() == FieldType::STRING) {
+    preferred = FieldType::TEXT;
+  } else {
+    return "self";
+  }
+  std::string selected;
+  for (const auto& [name, type] : logical.variants) {
+    if (type->type() != preferred) continue;
+    if (!selected.empty()) {
+      auto key = op == OpClass::SEARCH ? "search" : "value";
+      throw SchemaError(std::format(
+          "ambiguous defaults.{} on field '{}': variants '{}' and '{}'; "
+          "set defaults.{} to a variant label or 'self'",
+          key, logical.name, selected, name, key));
+    }
+    selected = name;
+  }
+  return selected.empty() ? "self" : selected;
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
@@ -754,10 +781,10 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
         logical->variants.emplace(label, std::move(ft));
       }
     }
-    if (owned.defaults) {
-      logical->search = binding(owned.defaults->search, *logical);
-      logical->value = binding(owned.defaults->value, *logical);
-    }
+    logical->search = binding(owned.defaults ? owned.defaults->search : std::nullopt,
+                              *logical, OpClass::SEARCH);
+    logical->value = binding(owned.defaults ? owned.defaults->value : std::nullopt,
+                             *logical, OpClass::VALUE);
     // Abstract variant prototypes are kept only in their logical template.
     // Concrete physical entries are also exposed through the legacy registry.
     schema->fieldTypeMap.emplace(e.name, logical->primary);

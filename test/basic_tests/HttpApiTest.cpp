@@ -3940,8 +3940,8 @@ static std::string explainedRequest(const http::response<http::string_body>& res
 
 TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTargets) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({"fields":{
-    "author":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}},
-    "genre":{"type":"string","variants":{"t":"text"},"defaults":{"search":"t"}}
+    "author":{"type":"text","variants":{"s":"string"}},
+    "genre":{"type":"string","variants":{"t":"text"}}
   }})");
   ASSERT_EQ(200, schema.result_int()) << schema.body();
   ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", "Le Guin", "genre", "Science Fiction"),

@@ -169,8 +169,8 @@ TEST_F(FieldVariantsGenerationTest, admissionPinsBeforeSchemaEditEvenWhenAcquisi
   EXPECT_FALSE(next.result.errored()) << next.result.what();
   helper.commit();
   EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author__s:*"));
-  EXPECT_EQ((std::vector<std::string>{"old"}), hits(helper, "author:=guin"));
-  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author:=\"le guin\""));
+  EXPECT_EQ((std::vector<std::string>{"old"}), hits(helper, "author__self:=guin"));
+  EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author__self:=\"le guin\""));
   auto durable = readDurableIndexInfo(writer->dir);
   ASSERT_EQ(2u, durable->segments.size());
   EXPECT_NE(durable->segments[0].schema_gen, durable->segments[1].schema_gen);
@@ -284,7 +284,7 @@ TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsA
   {
     LuxirNode node(config());
     CollectionHelper helper(node);
-    introduced = put(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"string"},"defaults":{"value":"s"}}}})")->gen_;
+    introduced = put(helper.collection(), R"({"fields":{"author":{"type":"text","variants":{"s":"string"}}}})")->gen_;
     put(helper.collection(), R"({"fields":{"later":"int"}})");
   }
   {

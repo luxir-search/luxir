@@ -24,7 +24,6 @@ protected:
     auto& whole = b.variant(author, "s");
     whole.type = api::FieldDef::FieldClass::STRING;
     b.normalizer(whole, {"nfkc_cf", "fold"});
-    author.defaults.emplace().value = "s";
 
     auto& title = b.field("title");
     title.type = api::FieldDef::FieldClass::TEXT;
@@ -45,7 +44,6 @@ protected:
     auto& text = b.variant(genre, "t");
     text.type = api::FieldDef::FieldClass::TEXT;
     b.analyzer(text, "unicode_word", {"nfkc_cf"});
-    genre.defaults.emplace().search = "t";
 
     auto& dynamic = b.templ("_number");
     dynamic.type = api::FieldDef::FieldClass::TEXT;
@@ -122,6 +120,32 @@ TEST_F(FieldVariantsQueryTest, authorSearchAndValueOperations) {
       buckets(*docs->ops.at("authors")->facetResult()));
   auto tokens = buckets(*docs->ops.at("tokens")->facetResult());
   EXPECT_TRUE(std::ranges::contains(tokens, std::pair<std::string, int64_t>{"le", 3}));
+}
+
+TEST_F(FieldVariantsQueryTest, addedVariantKeepsPinnedBindingUntilCleared) {
+  SchemaBuilder b;
+  auto& field = b.field("rollout");
+  field.type = api::FieldDef::FieldClass::TEXT;
+  b.analyzer(field, "unicode_word", {"nfkc_cf"});
+  field.defaults.emplace().value = "self";
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "old", "rollout", "Red Bicycle"),
+                           UpdateMessage::COMMIT).success);
+
+  b.variant(field, "whole").type = api::FieldDef::FieldClass::STRING;
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "new", "rollout", "Red Bicycle"),
+                           UpdateMessage::COMMIT).success);
+  EXPECT_EQ(vecs("new", "old"), expr("rollout:=red"));
+  EXPECT_EQ(vecs("new"), expr("rollout__whole:=\"Red Bicycle\""));
+
+  field.defaults.reset();
+  b.set(helper.collection());
+  EXPECT_EQ(vecs("new", "old"), expr("rollout:red"));
+  EXPECT_EQ(vecs("new"), expr("rollout:=\"Red Bicycle\""));
+  ASSERT_TRUE(helper.index(flatdoc("id", "old", "rollout", "Red Bicycle"),
+                           UpdateMessage::COMMIT).success);
+  EXPECT_EQ(vecs("new", "old"), expr("rollout:=\"Red Bicycle\""));
 }
 
 TEST_F(FieldVariantsQueryTest, defaultNameTemplatesSearchFacetAndSort) {
@@ -436,6 +460,30 @@ TEST_F(FieldVariantsQueryTest, simpleQueryDeduplicatesAliasesAndRestrictsExactTa
   auto searchDefault = run(R"({"query":{"simple_query":{"q":"genre__t:Science","fields":["genre","genre__t"],"allowed_fields":["genre"]}},"fields":["id"],"limit":-1})");
   EXPECT_EQ((std::vector<std::string>{"a", "c"}), ids(*searchDefault));
   EXPECT_FALSE(searchDefault->hasWarning("field_narrowed"));
+}
+
+TEST_F(FieldVariantsQueryTest, inferredBindingsStillEnforceOperationCapabilities) {
+  SchemaBuilder b;
+  auto& title = b.field("uncolumned");
+  title.type = api::FieldDef::FieldClass::TEXT;
+  auto& whole = b.variant(title, "whole");
+  whole.type = api::FieldDef::FieldClass::STRING;
+  whole.column = false;
+  auto& label = b.field("unindexed");
+  label.type = api::FieldDef::FieldClass::STRING;
+  auto& words = b.variant(label, "words");
+  words.type = api::FieldDef::FieldClass::TEXT;
+  words.index = api::FieldDef::IndexMode::NONE;
+  auto schema = b.set(helper.collection());
+  EXPECT_EQ("uncolumned__whole", schema->resolveFor("uncolumned", OpClass::VALUE).physicalName);
+  EXPECT_EQ("unindexed__words", schema->resolveFor("unindexed", OpClass::SEARCH).physicalName);
+
+  auto sort = run(R"({"sort":"uncolumned"})");
+  EXPECT_FALSE(sort->ok());
+  EXPECT_NE(std::string::npos, sort->errorMsg().find("column")) << sort->errorMsg();
+  auto prefix = run(R"({"query":{"prefix":{"field":"unindexed","prefix":"Red"}}})");
+  EXPECT_FALSE(prefix->ok());
+  EXPECT_NE(std::string::npos, prefix->errorMsg().find("indexed field: unindexed__words")) << prefix->errorMsg();
 }
 
 TEST_F(FieldVariantsQueryTest, columnCapabilitiesAndDynamicValueStats) {
