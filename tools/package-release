@@ -117,8 +117,11 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     archive_names = [name] + ([name + "-symbols"] if config == "Release" else [])
-    if any((output / (item + ".tar.gz")).exists() for item in archive_names):
-        parser.error("output archives already exist; choose a fresh output directory")
+    asset_names = [item + ".tar.gz" for item in archive_names]
+    if config == "Release":
+        asset_names.append(name)
+    if any((output / item).exists() for item in asset_names):
+        parser.error("output assets already exist; choose a fresh output directory")
 
     install = pathlib.Path(cache["VCPKG_INSTALLED_DIR"])
     triplet = cache["VCPKG_TARGET_TRIPLET"]
@@ -205,7 +208,11 @@ def main():
                             "-C", str(staging / item if item.endswith("-symbols") else staging),
                             name], check=True)
             shutil.move(archive, output / archive.name)
-    checksums = "".join(f"{sha256(path)}  {path.name}\n" for path in sorted(output.glob("*.tar.gz")))
+        if config == "Release":
+            copy(executable, output / name)
+    checksums = "".join(f"{sha256(path)}  {path.name}\n"
+                        for path in sorted(output.glob(f"luxir-{version}-linux-x86_64-*"))
+                        if path.is_file())
     (output / "SHA256SUMS").write_text(checksums)
     print(f"Packaged {name} into {output}")
 

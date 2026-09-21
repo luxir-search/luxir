@@ -8,8 +8,8 @@ language, and streaming import and export of files of any size.
 
 ## Get Luxir
 
-Download the release for your platform from <https://luxir.org/download/>,
-unpack it, and put the `luxir` binary on your `PATH`. Releases are built for
+Download the standalone executable for your platform from
+<https://luxir.org/download/>. No unpacking is needed. Releases are built for
 Linux on x86-64 with glibc 2.35 or newer (Ubuntu 22.04 or newer, for example).
 Choose the highest CPU tier your system supports: v2, v3 (AVX2), or v4
 (AVX-512). To see the supported tiers on a glibc system, run:
@@ -20,11 +20,21 @@ Choose the highest CPU tier your system supports: v2, v3 (AVX2), or v4
 
 Look for `x86-64-v2`, `x86-64-v3`, and `x86-64-v4` marked as supported. Use v2
 when unsure; even v2 requires a CPU newer than the original x86-64 baseline.
-The `-debug`, `-asan`, and `-symbols` archives are for diagnosing problems;
-choose an archive without those suffixes for normal use.
+The standalone downloads have names such as `luxir-0.1.0-linux-x86_64-v2`.
+Archives are also available with documentation, licenses, and build metadata.
+The `-debug`, `-asan`, and `-symbols` archives are for diagnosing problems.
 
-Check the download with `sha256sum -c SHA256SUMS --ignore-missing`, then run
-`luxir --version` to confirm the version and CPU tier.
+For example, download the v2 build directly as `luxir`, make it executable,
+and confirm its version and CPU tier:
+
+```bash
+curl -fL https://github.com/luxir-search/luxir/releases/download/v0.1.0/luxir-0.1.0-linux-x86_64-v2 -o luxir
+chmod +x luxir
+./luxir --version
+```
+
+To check the download, compare `sha256sum luxir` with the selected asset's
+entry in the release's `SHA256SUMS` file.
 
 If you would rather build it yourself, or want to work on the
 engine, [Build Setup](../dev/build-setup.md) covers the toolchain and presets;
@@ -33,14 +43,14 @@ the result is `build/gcc-release/bin/luxir`.
 ## Start the server
 
 ```bash
-luxir
+./luxir
 ```
 
 That's it. The HTTP/JSON API is listening on port `9400`, storing data in
 memory. To keep data across restarts, point it at a directory:
 
 ```bash
-luxir --store.backend=fs --store.data-dir=./data
+./luxir --store.backend=fs --store.data-dir=./data
 ```
 
 Check it's alive:

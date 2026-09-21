@@ -17,13 +17,13 @@ The default backend is in-memory and loses every collection when the process
 exits:
 
 ```bash
-luxir
+./luxir
 ```
 
 Use the filesystem backend on local storage for durable data:
 
 ```bash
-luxir --store.backend=fs --store.data-dir=/srv/luxir/data
+./luxir --store.backend=fs --store.data-dir=/srv/luxir/data
 ```
 
 Each collection is an independent index below the data directory. Collections
@@ -46,7 +46,7 @@ until exit.
 `--read-only` opens an existing data directory without that lock:
 
 ```bash
-luxir --read-only --store.backend=fs --store.data-dir=/srv/luxir/data
+./luxir --read-only --store.backend=fs --store.data-dir=/srv/luxir/data
 ```
 
 A read-only node requires an existing data directory and writes no files.
@@ -181,7 +181,7 @@ on disk (`index_gen`, `core_gen`, `update_version`) stay numeric.
 Set log verbosity with:
 
 ```bash
-luxir --log-level=info
+./luxir --log-level=info
 ```
 
 Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
@@ -196,7 +196,7 @@ the process's CPU affinity, so a server restricted to 28 logical CPUs defaults
 to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 
 ```bash
-luxir --server.http.threads=8 --server.grpc.threads=8
+./luxir --server.http.threads=8 --server.grpc.threads=8
 ```
 
 `--server.http.threads` sets the number of shards, not the total HTTP thread
@@ -230,14 +230,14 @@ from it, so raising or lowering this one value moves them together. `0` leaves
 the node unlimited. The resolved values are logged at startup.
 
 ```bash
-luxir --max-ram-mb=16384          # node budget; indexing gets 8192
-luxir --indexing.max-ram-mb=4096  # override just the indexing share
+./luxir --max-ram-mb=16384          # node budget; indexing gets 8192
+./luxir --indexing.max-ram-mb=4096  # override just the indexing share
 ```
 
 ## Indexing memory and request limits
 
 ```bash
-luxir \
+./luxir \
   --indexing.max-ram-mb=8192 \
   --indexing.max-inverter-ram-mb=2048
 ```
@@ -263,7 +263,7 @@ luxir \
 The HTTP request limits distinguish bounded material from streams:
 
 ```bash
-luxir \
+./luxir \
   --indexing.max-request-body=32MB \
   --indexing.max-record=32MB \
   --indexing.stream-batch-size=1MB \
@@ -285,7 +285,7 @@ luxir \
 Search has its own limits:
 
 ```bash
-luxir \
+./luxir \
   --search.request-memory-max-bytes=0 \
   --search.max-op-depth=8 \
   --query-cache-bytes=64MB

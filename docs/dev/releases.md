@@ -61,8 +61,14 @@ for preset in container-release container-release-v3 container-release-v4 \
 done
 ```
 
-The result is five executable archives, three matching symbol archives, and
-`SHA256SUMS`. Each executable package contains its build manifest, installed
+The result is three standalone stripped executables, five executable archives,
+three matching symbol archives, and `SHA256SUMS`. The standalone executables
+are named `luxir-0.1.0-linux-x86_64-v2`, `-v3`, and `-v4`, without an archive
+suffix. They are byte-for-byte identical to the executables inside the
+corresponding archives, and are included in the checksums. Downloading one
+requires only `chmod +x` before running it; no unpacking is needed.
+
+Each executable package contains its build manifest, installed
 dependency inventory, license notices, API definitions, and guides. The
 manifest records the source revision, CPU target, flags, compiler, dependency
 pins, builder image, executable checksum, and ELF build ID.
@@ -76,7 +82,7 @@ Optimized dependency archives retain available function symbols but lack full
 source-level debugging information. Debug/ASan downloads include their
 dependency debug information.
 
-Verify extracted archives and checksums, then tag that same commit:
+Verify extracted archives, standalone executables, and checksums, then tag that same commit:
 
 ```bash
 git tag -a v0.1.0 -m 'Luxir 0.1.0'
