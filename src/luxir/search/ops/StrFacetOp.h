@@ -110,7 +110,6 @@ class StrFacetOp : public FieldFacetReq {
     int64_t indexDocFreq;
   };
   std::vector<PinnedBucket> pinnedBuckets;
-  std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
   bool inlineAllCandidate = false;
 
 public:
@@ -315,38 +314,6 @@ public:
     }
   };
 
-  class MergeableStrFacetInline : public MergeableData {
-  public:
-    // Keyed by GLOBAL term ordinal, which is what makes this mergeable across
-    // segments.  It used to key by the term text, because when the inline path
-    // was written a segment ord was the only ord there was and text was the
-    // only cross-segment-stable key - which cost a dictionary seek and a string
-    // hash for every document counted.  Global ords (OrdMap) removed that
-    // constraint; term text is now resolved once per emitted bucket, in
-    // facetResult2, exactly as the non-inline path does it.
-    OrdinalFacetEntryTable counts;
-    int64_t missing_num = 0; // number of missing values in this segment
-    std::vector<SearchOp::InlineCalculator*> inlineCalcs;
-    static MergeableStrFacetInline* merge(MergeableStrFacetInline* a, MergeableStrFacetInline* b) {
-      // Mixed representations always merge into dense. Otherwise merge the
-      // smaller touched set into the larger one; dense/dense therefore walks
-      // the smaller touched list without scanning the ordinal space.
-      if (a->counts.dense() != b->counts.dense()) {
-        if (b->counts.dense()) std::swap(a, b);
-      } else if (a->counts.size() < b->counts.size()) {
-        std::swap(a, b);
-      }
-
-      a->counts.merge(b->counts);
-      a->missing_num += b->missing_num;
-      return a;
-    }
-    ~MergeableStrFacetInline() {
-      for (auto* calc : inlineCalcs) {
-        delete calc; // clean up the inline calculators
-      }
-    }
-  };
 
 public:
 
@@ -376,29 +343,7 @@ public:
   }
 
   void init() override {
-    FacetReq::init();
-    auto sorts = fieldFacet.sort;
-    if (!sorts.empty()) {
-      if (sorts.size() > 1) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': multiple sort fields are not yet supported");
-      }
-      for (auto& sort : sorts) {
-        auto iter = subOps.find(sort.expr);
-        if (iter == subOps.end()) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': unknown sort field '" + std::string(sort.expr) + "'");
-        }
-        if (!iter->second->canInline()) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': cannot sort by a subop without inline support: "
-              + std::string(iter->second->name));
-        }
-        inlineSubOps.push_back(*iter);
-        subOps.erase(iter);
-      }
-    }
-
+    FieldFacetReq::init();
     // Whether the REMAINING sub-ops join the count pass or stay behind for the
     // post-selection bucket-domain feed. limit==-1 still inlines all because
     // every bucket is returned. A finite limit that covers the index-wide
@@ -414,29 +359,12 @@ public:
     // that trade has not been measured. LUXIR_FACET_SUBOP_INLINE=all is how to
     // measure it.
     int64_t buckets = ordMap ? ordMap->numOrds() : 0;
-    bool inlineAll = limit == -1;
     inlineAllCandidate = limit != -1 && !inlineSubOps.empty()
         && limit >= buckets
+        && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
         && std::ranges::any_of(subOps, [](const auto& subOp) {
              return subOp.second->canInline();
            });
-    if (forcedFacetSubOpInline == FacetSubOpInlineMode::ALL) {
-      inlineAll = true;
-    } else if (forcedFacetSubOpInline == FacetSubOpInlineMode::SORT_KEY_ONLY) {
-      inlineAll = false;
-      inlineAllCandidate = false;
-    }
-    if (inlineAll) {
-      inlineAllCandidate = false;
-      std::vector<std::string_view> moved;
-      for (auto& subOp : subOps) {
-        if (subOp.second->canInline()) {
-          inlineSubOps.push_back(subOp);
-          moved.push_back(subOp.first);
-        }
-      }
-      for (auto& name : moved) subOps.erase(name);
-    }
   }
 
   // pinCounts carries the count each selected value was found to have, read by
@@ -497,14 +425,14 @@ public:
     return page;
   }
 
-  class Calc : public Calculator {
+  class Calc : public FieldFacetReq::Calc {
     ExecutionProfileRun* profileRun;
     std::vector<DomainHandle> input;
     std::vector<std::pair<const std::string_view, SearchOp*>> inlineOps;
     std::vector<std::pair<const std::string_view, SearchOp*>> feedOps;
     std::vector<uint8_t> topTermsSegments;
     SegmentMergeDriver<MergeableStrData> driver;
-    SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
+    SegmentMergeDriver<MergeableFieldFacetInline> inlineDriver;
     std::atomic<int32_t> gatheredDomainsSeen{0};
     int64_t inlineExpectedValues = -1;
     bool inlinePlanResolved = false;
@@ -517,37 +445,10 @@ public:
           ? std::numeric_limits<int64_t>::max() : (int64_t)scaled;
     }
 
-    class InlineSegmentScope {
-      std::span<SearchOp::InlineCalculator*> calculators;
-      int32_t segnum;
-      size_t started = 0;
 
-    public:
-      InlineSegmentScope(
-          std::span<SearchOp::InlineCalculator*> calculators,
-          int32_t segnum)
-          : calculators(calculators), segnum(segnum) {
-        try {
-          for (; started < calculators.size(); started++) {
-            calculators[started]->startSeg(segnum);
-          }
-        } catch (...) {
-          for (size_t i = 0; i < started; i++) {
-            calculators[i]->endSeg(segnum);
-          }
-          throw;
-        }
-      }
-
-      ~InlineSegmentScope() {
-        for (size_t i = 0; i < started; i++) {
-          calculators[i]->endSeg(segnum);
-        }
-      }
-    };
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : Calculator(op, parent, slot, numSlots),
+      : FieldFacetReq::Calc(op, parent, slot, numSlots),
         profileRun(op.addExecutionProfileRun()),
         inlineOps(((StrFacetOp&)op).inlineSubOps),
         feedOps(((StrFacetOp&)op).subOps.begin(),
@@ -555,24 +456,12 @@ public:
         driver(op.req.reader->segments().size(),
                [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
         inlineDriver(op.req.reader->segments().size(),
-                     [this](std::unique_ptr<MergeableStrFacetInline> m){ facetResult2(std::move(m)); }) {
+                     [this](std::unique_ptr<MergeableFieldFacetInline> m){ facetResult2(std::move(m)); }) {
       input.resize(op.req.reader->segments().size());
       topTermsSegments.resize(op.req.reader->segments().size());
       inlineDriver.setCreator([this]() {
-        auto* p = new MergeableStrFacetInline;
-        for (auto& [key, subop] : inlineOps) {
-          auto* calc = subop->createInlineCalculator(this, -1, -1);
-          p->inlineCalcs.push_back(calc);
-        }
-        std::string detail = p->inlineCalcs.size() == 1
-            ? std::format("facet '{}' metric '{}'", thisOp().facetName,
-                          p->inlineCalcs.front()->getOp().name)
-            : std::format("facet '{}' inline metrics", thisOp().facetName);
-        p->counts.configure(
-            p->inlineCalcs, thisOp().req.memoryTracker,
-            thisOp().ordMap ? thisOp().ordMap->numOrds() : 0,
-            std::move(detail), inlineFacetEntryStatsForTests);
-        return p;
+        return createInlineData(inlineOps,
+            thisOp().ordMap ? thisOp().ordMap->numOrds() : 0);
       });
     }
 
@@ -646,25 +535,6 @@ public:
     }
 
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
-      luxir::api::Val* target = nullptr;
-      routeTarget<luxir::api::ArrVal>(*ourVal, resp->mr,
-          [&](luxir::api::Val& val) { target = &val; });
-      ourVal = target;
-      // the Val should either be unset, or have a FacetResult
-      assert(
-        ourVal != nullptr && (std::holds_alternative<luxir::api::FacetResult>(ourVal->kind)
-          || std::holds_alternative<std::monostate>(ourVal->kind)));
-      auto& fr = oneofMut<luxir::api::FacetResult>(*ourVal);
-      // Cap = max distinct sub-op Vals written into this FacetResult's ops map.
-      // Both post-selection sub-ops and inline calculators bubble through
-      // here. Their calculator-local partitions are disjoint, so the backing
-      // array must be sized for their sum or opsSlot's pre-sized array
-      // overflows.
-      std::size_t cap = feedOps.size() + inlineOps.size();
-      return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
-    };
     void calcAll(oneapi::tbb::task_group* tg,
                  std::span<const DomainHandle> domains) override {
       resolveInlinePlan(domains);
@@ -728,8 +598,7 @@ public:
 
     void calc2(int32_t segnum, DocSet* domain,
                ExecutionProfilePieceState* profile) {
-      inlineDriver.contribute([&](MergeableStrFacetInline& data) {
-        auto poolGuard = MemPool::threadLocalPoolGuard();
+      inlineDriver.contribute([&](MergeableFieldFacetInline& data) {
         InlineSegmentScope inlineScope(data.inlineCalcs, segnum);
         SegFieldInfo segFieldInfo;
         PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
@@ -1496,196 +1365,21 @@ public:
     }
 
 
-    void facetResult2(std::unique_ptr<MergeableStrFacetInline> mergedData) {
-      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
-      luxir::api::FacetResult* result = nullptr;
-      getTarget(nullptr, [&](luxir::api::Val& val) {
-        routeTarget<luxir::api::ArrVal>(val, mr, [&](luxir::api::Val& target) {
-          result = &oneofMut<luxir::api::FacetResult>(target);
-        });
-      });
-      auto& facetResultProto = *result;
-      auto minCount = thisOp().minCount;
-      auto limit = thisOp().limit;
-      auto missing = thisOp().missing;
-      mergedData->counts.finalize();
-
-      struct InlinePayload {
-        char* entry;
-        size_t finalizedSlot;
-      };
-      auto& counts = mergedData->counts;
-      auto missing_count = mergedData->missing_num;
-
-      // Count and bucket-value sorts are future work; sub-op sort is supported.
-      SearchOp::InlineCalculator* sortCalc = nullptr;
-      bool reversed = false;
-      if (!thisOp().fieldFacet.sort.empty()) {
-        std::string_view field = thisOp().fieldFacet.sort[0].expr;
-        for (auto* candidate : mergedData->inlineCalcs) {
-          if (candidate->getOp().name == field) {
-            sortCalc = candidate;
-            break;
-          }
-        }
-        assert(sortCalc != nullptr);
-        reversed =
-            thisOp().fieldFacet.sort[0].dir == luxir::api::SortSpec_::SortDir::DESC;
-      }
-
-      auto better = [sortCalc, reversed](const auto& a, const auto& b) {
-        if (sortCalc == nullptr) {
-          if (a.count != b.count) return a.count > b.count;
-          return a.key < b.key;
-        }
-        bool aMissing = sortCalc->isMissing(a.payload.finalizedSlot);
-        bool bMissing = sortCalc->isMissing(b.payload.finalizedSlot);
-        if (aMissing != bMissing) return !aMissing;
-        if (aMissing) return a.key < b.key;
-        int cmp = sortCalc->compare(a.payload.finalizedSlot,
-                                    b.payload.finalizedSlot);
-        if (cmp == 0) return a.key < b.key;
-        return reversed ? cmp > 0 : cmp < 0;
-      };
-
-      FieldBucketFinalizer<int64_t, InlinePayload, decltype(better)> finalizer(
-          minCount, 0, limit, better);
-
-      // A selected value's metrics live in the entry the one enumeration below
-      // already visits, and its finalized slot is that enumeration's index, so
-      // both are captured in passing. A facet with nothing selected never
-      // enters the branch.
-      boost::unordered_flat_map<int64_t, size_t> pinByOrd;
-      std::vector<std::optional<int64_t>> pinKeys;
-      std::vector<PinnedBucketValue<InlinePayload>> pinValues(
-          thisOp().pinnedBuckets.size());
-      pinKeys.reserve(thisOp().pinnedBuckets.size());
-      for (size_t i = 0; i < thisOp().pinnedBuckets.size(); i++) {
-        const auto& pin = thisOp().pinnedBuckets[i];
-        pinKeys.push_back(pin.ord);
-        if (pin.ord.has_value()) pinByOrd.emplace(*pin.ord, i);
-      }
-      const bool capturePins = !pinByOrd.empty();
-
-      size_t finalizedSlot = 0;
-      if (finalizer.needsCandidates()) {
-        counts.forEachEntry([&](int64_t key, char* entry) {
-          int64_t count = loadUnaligned<int64_t>(entry);
-          finalizer.add({key, count, {entry, finalizedSlot}});
-          if (capturePins) {
-            auto pin = pinByOrd.find(key);
-            if (pin != pinByOrd.end()) {
-              pinValues[pin->second] =
-                  {count, InlinePayload{entry, finalizedSlot}};
-            }
-          }
-          finalizedSlot++;
-        });
-        assert(finalizedSlot == counts.size());
-      }
-      auto finalized = finalizer.finish();
-      mergePinnedBuckets<int64_t, InlinePayload>(finalized, pinKeys, pinValues);
-
-      // Term text for the buckets that survived selection, and only those -
-      // ordToStr seeks the dictionary once per bucket instead of once per
-      // counted document.  Its result is valid only until the next call, so
-      // each is copied out; the copies back the string_views handed to result
-      // children below, so they outlive the pool guard.
+    void facetResult2(std::unique_ptr<MergeableFieldFacetInline> mergedData) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
-                          *thisOp().req.reader, thisOp().fieldName);
-      std::vector<std::string> keys;
-      keys.reserve(finalized.size());
-      for (const auto& bucket : finalized) {
-        if (bucket.pinned()) {
-          keys.emplace_back(thisOp().pinnedBuckets[bucket.pinIndex].key);
-        } else {
-          assert(bucket.key.has_value());
-          keys.emplace_back(ordMapStr.ordToStr(*bucket.key));
-        }
-      }
-
-      // fill in the facet result proto (non-owning: size known up front)
-      auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
-      size_t n = finalized.size();
-      std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
-      int64_t* countArr = build::allocArray(facetResultProto.counts, n, mr);
-      for (size_t i = 0; i < n; i++) {
-        ids[i] = build::arenaStr(mr, keys[i]);  // copy the (transient) string into the arena
-        countArr[i] = finalized[i].count;
-      }
-      if (missing) {
-        facetResultProto.missing = missing_count;
-      }
-
-      // fill in results from inline calculators
-      std::vector<char*> results;
-      std::vector<int64_t> resultCounts;
-      results.reserve(finalized.size());
-      resultCounts.reserve(finalized.size());
-      for (const auto& bucket : finalized) {
-        results.push_back(bucket.payload.has_value()
-            ? bucket.payload->entry + sizeof(int64_t) : nullptr);
-        resultCounts.push_back(bucket.count);
-      }
-      for (auto calc : mergedData->inlineCalcs) {
-        calc->fillResult(results, resultCounts);
-      }
-
-      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
-      selectedBuckets.reserve(finalized.size());
-      for (size_t i = 0; i < finalized.size(); i++) {
-        std::optional<FacetBucketId> id;
-        FacetBucketFlags flags = FacetBucketFlags::NONE;
-        if (finalized[i].key.has_value()) {
-          id = FacetBucketId{*finalized[i].key};
-        }
-        if (finalized[i].pinned()) flags = FacetBucketFlags::PINNED;
-        selectedBuckets.push_back({
-            .key = keys[i],
-            .id = id,
-            .count = finalized[i].count,
-            .owner = FacetOwnerSlot{(int32_t)i},
-            .output = FacetOutputSlot{(int32_t)i},
-            .flags = flags,
-        });
-      }
-      // Inline results and sort comparisons are complete. Release their
-      // per-bucket state before any selected-bucket child bindings allocate
-      // their own state.
-      mergedData.reset();
-      executeResultChildren(selectedBuckets);
+      OrdMapStr labels(poolGuard.pool(), thisOp().ordMap.get(),
+                       thisOp().reader, thisOp().fieldName);
+      std::vector<std::optional<int64_t>> pins;
+      pins.reserve(thisOp().pinnedBuckets.size());
+      for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
+      inlineResult<std::string>(std::move(mergedData), pins,
+          [&](const auto& bucket) {
+            return std::string(bucket.pinned()
+                ? thisOp().pinnedBuckets[bucket.pinIndex].key
+                : labels.ordToStr(*bucket.key));
+          }, [this](auto& buckets) { executeResultChildren(buckets); });
     }
 
-    DomainHandle materializeBucketDomain(
-        int32_t segnum,
-        const SelectedFacetBucket<std::string_view>& bucket) {
-      SegFieldInfo segFieldInfo;
-      auto& postingsReader =
-          thisOp().reader.segments()[(size_t)segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(postingsReader);
-      std::unique_ptr<DocSet> domain;
-      if (fieldReader.seek(thisOp().fieldName)) {
-        fieldReader.readFieldInfo(segFieldInfo);
-        TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
-        if (terms.seek(bucket.key)) {
-          int32_t docFreq = terms.docFreq();
-          DocsOnlyEnum postings(terms);
-          domain = materializePostingsIntersection(
-              postings, docFreq, input[(size_t)segnum].get(), maxDoc);
-        }
-      }
-
-      // A null domain means all documents, never an empty owner. Preserve an
-      // explicit empty set when the field or selected value is absent.
-      if (domain == nullptr) {
-        DocSetBuilder empty(maxDoc);
-        domain = empty.build();
-      }
-      return DomainHandle(std::move(domain));
-    }
 
     // Build every returned bucket's domain for every segment in one pass over
     // the facet field's ord column, instead of one term seek plus postings
@@ -1854,7 +1548,7 @@ public:
               return built[(size_t)segment * buckets.size()
                            + (size_t)bucket.owner.value];
             }
-            return materializeBucketDomain(segment, bucket);
+            return materializeTermDomain(segment, bucket.key, input[(size_t)segment].get());
           });
     }
   };

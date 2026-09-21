@@ -43,6 +43,11 @@ inline size_t saturatingAdd(size_t a, size_t b) {
       ? std::numeric_limits<size_t>::max() : a + b;
 }
 
+inline size_t saturatingMultiply(size_t a, size_t b) {
+  return b != 0 && a > std::numeric_limits<size_t>::max() / b
+      ? std::numeric_limits<size_t>::max() : a * b;
+}
+
 struct CollectionRequirements {
   bool needRankedDocs = false;
   bool needExactCount = false;
@@ -99,6 +104,10 @@ public:
   virtual bool canInline() {
     return false;
   }
+
+  // Packed state size belongs to the resolved plan, so scheduling can budget
+  // inline buckets without constructing their runtime calculators.
+  virtual uint32_t inlineEntryBytes() const { return 0; }
 
   virtual bool canEmitAsBucketChild() const {
     return false;
@@ -323,7 +332,9 @@ public:
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};
-    virtual uint32_t fixedEntryBytes() const = 0;
+    // Document ids restart: the next insert/update may name an earlier
+    // document than the previous one in this segment.
+    virtual void rewind() {}
     virtual void insert(void* entry, int32_t docid) = 0;
     virtual void update(void* entry, int32_t docid) = 0;
     virtual void merge(void* target, void* from) = 0;
@@ -343,30 +354,35 @@ public:
 
 };
 
-// Fixed-stride inline facet entries keyed by global ordinal. Dense entries use
-// one flat ordinal-indexed allocation plus touched order; sparse entries use map
+// Fixed-stride inline facet entries keyed by int64 bucket key. A positive dense
+// key-space size permits keys in [0, size); zero permits arbitrary signed keys
+// with sparse storage. Dense entries use one flat key-indexed allocation plus
+// touched order; sparse entries use map
 // iteration order. Each representation keeps one stable order from finalize
 // through selection and result fill.
-class OrdinalFacetEntryTable {
+class FacetEntryTable {
   enum class Rep { UNINITIALIZED, SPARSE, DENSE };
 
   // Initial, refittable crossover constants. The 64 MiB entry-array cap admits
-  // the target 2M-ord average (25-byte stride = 50 MiB) per collector. Small
+  // the target 2M-key average (25-byte stride = 50 MiB) per collector. Small
   // tables are dense unconditionally; above that, expected values must cover
-  // at least one quarter of the ordinal space before direct indexing repays
+  // at least one quarter of the key space before direct indexing repays
   // dense storage. Forced modes keep both sides measurable.
   static constexpr size_t DENSE_ENTRY_BYTES_CAP = 64 * 1024 * 1024;
-  static constexpr int64_t DENSE_SMALL_ORDS = 4 * 1024;
+  static constexpr int64_t DENSE_SMALL_KEYS = 4 * 1024;
   static constexpr uint32_t MAX_SPARSE_ENTRY_BYTES =
       MemPool::BYTE_BLOCK_SIZE - MemPool::HEADER_SIZE;
   // boost::unordered_flat_map's open-addressed slot array needs spare slots;
-  // two value slots per touched ordinal is a conservative budget reservation.
+  // two value slots per touched key is a conservative budget reservation.
   static constexpr size_t SPARSE_HASH_BYTES_PER_ENTRY =
       2 * (sizeof(std::pair<int64_t, char*>) + 1);
   static constexpr std::string_view BREAKER = "facet aggregate state";
 
   boost::unordered_flat_map<int64_t, char*> sparseEntries;
-  std::vector<int64_t> touchedOrds;
+  // The entry header counts documents delivered to metrics. Repeated values
+  // add only facet occurrences, without changing compact metric denominators.
+  boost::unordered_flat_map<char*, int64_t> extraOccurrences;
+  std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
   MappedAlloc denseMapping;
@@ -380,7 +396,7 @@ class OrdinalFacetEntryTable {
   size_t touchedCapacityCharged = 0;
   size_t denseStorageBytesCharged = 0;
   size_t stride = sizeof(int64_t);
-  int64_t numOrds = 0;
+  int64_t keySpaceSize = 0;
   Rep rep = Rep::UNINITIALIZED;
 
   void charge(size_t bytes) {
@@ -392,8 +408,8 @@ class OrdinalFacetEntryTable {
   }
 
   void reserveTouchedCapacity(size_t newCapacity) {
-    if (newCapacity <= touchedOrds.capacity()) return;
-    size_t oldCapacity = touchedOrds.capacity();
+    if (newCapacity <= touchedKeys.capacity()) return;
+    size_t oldCapacity = touchedKeys.capacity();
     if (newCapacity > std::numeric_limits<size_t>::max()
                           / sizeof(int64_t)) {
       tracker->chargeOverflow(BREAKER, chargeDetail);
@@ -401,7 +417,7 @@ class OrdinalFacetEntryTable {
     size_t bytes = (newCapacity - oldCapacity) * sizeof(int64_t);
     charge(bytes);
     try {
-      touchedOrds.reserve(newCapacity);
+      touchedKeys.reserve(newCapacity);
     } catch (...) {
       releaseCharge(bytes);
       throw;
@@ -410,8 +426,8 @@ class OrdinalFacetEntryTable {
   }
 
   void ensureTouchedCapacity() {
-    if (touchedOrds.size() < touchedOrds.capacity()) return;
-    reserveTouchedCapacity(std::max<size_t>(8, touchedOrds.capacity() * 2));
+    if (touchedKeys.size() < touchedKeys.capacity()) return;
+    reserveTouchedCapacity(std::max<size_t>(8, touchedKeys.capacity() * 2));
   }
 
   char* denseEntryForIndex(size_t index) {
@@ -433,7 +449,7 @@ class OrdinalFacetEntryTable {
     size_t reservation = storageBytes + touchedBytes;
     if (!tracker->tryCharge(reservation)) return false;
     try {
-      if (expectedTouched != 0) touchedOrds.reserve(expectedTouched);
+      if (expectedTouched != 0) touchedKeys.reserve(expectedTouched);
       if (!mapped) {
         denseMalloc = (char*)std::malloc(logicalBytes);
         if (denseMalloc == nullptr) throw std::bad_alloc();
@@ -449,7 +465,7 @@ class OrdinalFacetEntryTable {
       denseMalloc = nullptr;
       denseBase = nullptr;
       releaseCharge(reservation);
-      std::vector<int64_t>().swap(touchedOrds);
+      std::vector<int64_t>().swap(touchedKeys);
       throw;
     }
     touchedCapacityCharged = touchedBytes;
@@ -464,40 +480,40 @@ class OrdinalFacetEntryTable {
     }
   }
 
-  char* sparseFirstTouch(int64_t ord) {
+  char* sparseFirstTouch(int64_t key) {
     size_t bytes = stride + SPARSE_HASH_BYTES_PER_ENTRY;
     charge(bytes);
     sparseBytesCharged += bytes;
     char* entry = entryPool.alloc(stride);
-    auto [iter, inserted] = sparseEntries.emplace(ord, entry);
+    auto [iter, inserted] = sparseEntries.emplace(key, entry);
     unused(iter);
     assert(inserted);
     return entry;
   }
 
-  char* findEntry(int64_t ord) {
+  char* LUXIR_INLINE findEntry(int64_t key) {
     if (rep == Rep::DENSE) {
-      assert(ord >= 0 && ord < numOrds);
-      char* entry = denseEntryForIndex((size_t)ord);
+      assert(key >= 0 && key < keySpaceSize);
+      char* entry = denseEntryForIndex((size_t)key);
       // Zero count is the absence sentinel. Inline mincount=0 deliberately
-      // remains touched-only; untouched global ords are not synthesized.
+      // remains touched-only; untouched keys are not synthesized.
       return loadUnaligned<int64_t>(entry) == 0 ? nullptr : entry;
     }
-    auto iter = sparseEntries.find(ord);
+    auto iter = sparseEntries.find(key);
     return iter == sparseEntries.end() ? nullptr : iter->second;
   }
 
-  char* firstTouch(int64_t ord) {
+  char* firstTouch(int64_t key) {
     if (rep == Rep::DENSE) {
-      assert(ord >= 0 && ord < numOrds);
+      assert(key >= 0 && key < keySpaceSize);
       ensureTouchedCapacity();
-      touchedOrds.push_back(ord);
-      return denseEntryForIndex((size_t)ord);
+      touchedKeys.push_back(key);
+      return denseEntryForIndex((size_t)key);
     }
-    return sparseFirstTouch(ord);
+    return sparseFirstTouch(key);
   }
 
-  void insertEntry(char* entry, int32_t docid) {
+  void LUXIR_INLINE insertEntry(char* entry, int32_t docid) {
     storeUnaligned<int64_t>(entry, 1);
     char* ptr = entry + sizeof(int64_t);
     if (calcs.size() == 1) {
@@ -512,7 +528,7 @@ class OrdinalFacetEntryTable {
     assert((size_t)(ptr - entry) == stride);
   }
 
-  void updateEntry(char* entry, int32_t docid) {
+  void LUXIR_INLINE updateEntry(char* entry, int32_t docid) {
     storeUnaligned<int64_t>(entry, loadUnaligned<int64_t>(entry) + 1);
     char* ptr = entry + sizeof(int64_t);
     if (calcs.size() == 1) {
@@ -549,11 +565,17 @@ class OrdinalFacetEntryTable {
   }
 
 public:
-  OrdinalFacetEntryTable() = default;
-  OrdinalFacetEntryTable(const OrdinalFacetEntryTable&) = delete;
-  OrdinalFacetEntryTable& operator=(const OrdinalFacetEntryTable&) = delete;
+  // Fixed allocation for a dense key space. Sparse entries and touched-key
+  // lists depend on bucket content and cannot be priced per binding here.
+  static size_t residentBytes(size_t stride, int64_t denseKeys) {
+    return saturatingMultiply((size_t)denseKeys, stride);
+  }
 
-  ~OrdinalFacetEntryTable() {
+  FacetEntryTable() = default;
+  FacetEntryTable(const FacetEntryTable&) = delete;
+  FacetEntryTable& operator=(const FacetEntryTable&) = delete;
+
+  ~FacetEntryTable() {
     std::free(denseMalloc);
     if (tracker != nullptr) {
       releaseCharge(denseStorageBytesCharged + sparseBytesCharged
@@ -562,21 +584,21 @@ public:
   }
 
   void configure(std::span<SearchOp::InlineCalculator*> calculators,
-                 RequestMemTracker& memoryTracker, int64_t globalOrds,
+                 RequestMemTracker& memoryTracker, int64_t denseKeySpaceSize,
                  std::string detail, InlineFacetEntryStats* entryStats) {
     assert(rep == Rep::UNINITIALIZED);
     calcs = calculators;
     tracker = &memoryTracker;
     stats = entryStats;
-    assert(globalOrds >= 0);
-    numOrds = globalOrds;
+    assert(denseKeySpaceSize >= 0);
+    keySpaceSize = denseKeySpaceSize;
     chargeDetail = std::move(detail);
     // Preserve the existing packed layout. Calculator state already uses
     // unaligned accessors, so padding 17-byte average state to 24/32 bytes
     // would spend bandwidth without buying legal aligned access.
     calcEntryBytes.reserve(calcs.size());
     for (auto* calc : calcs) {
-      uint32_t bytes = calc->fixedEntryBytes();
+      uint32_t bytes = calc->getOp().inlineEntryBytes();
       calcEntryBytes.push_back(bytes);
       if (bytes > std::numeric_limits<size_t>::max() - stride) {
         tracker->chargeOverflow(BREAKER, chargeDetail);
@@ -597,18 +619,18 @@ public:
     assert(!(forceDense && forceSparse));
     expectedValues = std::max<int64_t>(expectedValues, 0);
     size_t expectedTouched =
-        (size_t)std::min<int64_t>(expectedValues, numOrds);
-    bool denseSizeValid = numOrds >= 0 && stride != 0
-        && (size_t)numOrds <= std::numeric_limits<size_t>::max() / stride;
-    size_t denseBytes = denseSizeValid ? (size_t)numOrds * stride : 0;
+        (size_t)std::min<int64_t>(expectedValues, keySpaceSize);
+    bool denseSizeValid = keySpaceSize >= 0 && stride != 0
+        && (size_t)keySpaceSize <= std::numeric_limits<size_t>::max() / stride;
+    size_t denseBytes = denseSizeValid ? (size_t)keySpaceSize * stride : 0;
     bool denseFitsCap = denseSizeValid
         && denseBytes <= DENSE_ENTRY_BYTES_CAP;
-    int64_t quarterOrds = numOrds / 4 + (numOrds % 4 != 0);
-    bool likelyDense = numOrds <= DENSE_SMALL_ORDS
-        || expectedValues >= quarterOrds;
+    int64_t quarterKeys = keySpaceSize / 4 + (keySpaceSize % 4 != 0);
+    bool likelyDense = keySpaceSize <= DENSE_SMALL_KEYS
+        || expectedValues >= quarterKeys;
     bool wantDense = !forceSparse
         && (forceDense || (denseFitsCap && likelyDense));
-    if (wantDense && numOrds > 0) {
+    if (wantDense && keySpaceSize > 0) {
       if (denseSizeValid && tryInitializeDense(denseBytes, expectedTouched)) {
         rep = Rep::DENSE;
         if (stats != nullptr) {
@@ -623,17 +645,63 @@ public:
     selectSparseRep();
   }
 
-  void add(int64_t ord, int32_t docid) {
+  // Resolve once when many documents share a key. The caller must touch a
+  // new entry before resolving it again; zero marks uninitialized metric state.
+  char* resolveEntry(int64_t key) {
     assert(rep != Rep::UNINITIALIZED);
-    char* entry = findEntry(ord);
+    char* entry = findEntry(key);
     if (entry == nullptr) {
-      insertEntry(firstTouch(ord), docid);
+      entry = firstTouch(key);
+      storeUnaligned<int64_t>(entry, 0);
+    }
+    return entry;
+  }
+
+  void touchEntry(char* entry, int32_t docid) {
+    if (loadUnaligned<int64_t>(entry) == 0) insertEntry(entry, docid);
+    else updateEntry(entry, docid);
+  }
+
+  // The per-document path: one probe decides insert versus update, with no
+  // zero-count store or reload in between. Deliberately one out-of-line
+  // function with its helpers folded in: the column walks that call it are
+  // instantiated per domain and column shape, and inlining add() into those
+  // large bodies leaves the inliner no budget to fold the devirtualized
+  // calculator update in here, turning it into a virtual call per document.
+  void LUXIR_NOINLINE add(int64_t key, int32_t docid) {
+    assert(rep != Rep::UNINITIALIZED);
+    char* entry = findEntry(key);
+    if (entry == nullptr) {
+      insertEntry(firstTouch(key), docid);
     } else {
       updateEntry(entry, docid);
     }
   }
 
-  void merge(OrdinalFacetEntryTable& other) {
+  void addOccurrence(char* entry, int64_t count = 1) {
+    assert(loadUnaligned<int64_t>(entry) > 0);
+    auto it = extraOccurrences.find(entry);
+    if (it != extraOccurrences.end()) {
+      it->second += count;
+    } else {
+      constexpr size_t bytes = 2 * (sizeof(std::pair<char*, int64_t>) + 1);
+      charge(bytes);
+      sparseBytesCharged += bytes;
+      extraOccurrences.emplace(entry, count);
+    }
+  }
+
+  int64_t occurrenceCount(char* entry) const {
+    int64_t count = loadUnaligned<int64_t>(entry);
+    if (!extraOccurrences.empty()) {
+      auto it = extraOccurrences.find(entry);
+      if (it != extraOccurrences.end()) count += it->second;
+    }
+    return count;
+  }
+
+  template <typename RemapKey>
+  void merge(FacetEntryTable& other, RemapKey&& remapKey) {
     assert(rep != Rep::UNINITIALIZED || other.empty());
     if (rep == Rep::DENSE && !other.empty() && stats != nullptr) {
       stats->denseMerges.fetch_add(1, std::memory_order_relaxed);
@@ -641,20 +709,31 @@ public:
         stats->mixedMerges.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    other.forEachEntry([&](int64_t ord, char* from) {
-      char* target = findEntry(ord);
+    const bool carryOccurrences = !other.extraOccurrences.empty();
+    other.forEachEntry([&](int64_t key, char* from) {
+      int64_t targetKey = remapKey(key);
+      char* target = findEntry(targetKey);
       if (target == nullptr) {
-        mergeNewEntry(firstTouch(ord), from);
+        target = firstTouch(targetKey);
+        mergeNewEntry(target, from);
       } else {
         mergeEntry(target, from);
+      }
+      if (carryOccurrences) {
+        auto it = other.extraOccurrences.find(from);
+        if (it != other.extraOccurrences.end()) addOccurrence(target, it->second);
       }
     });
   }
 
+  void merge(FacetEntryTable& other) {
+    merge(other, [](int64_t key) { return key; });
+  }
+
   void finalize() {
     for (auto* calc : calcs) calc->beginFinalize(size());
-    forEachEntry([&](int64_t ord, char* entry) {
-      unused(ord);
+    forEachEntry([&](int64_t key, char* entry) {
+      unused(key);
       int64_t count = loadUnaligned<int64_t>(entry);
       char* ptr = entry + sizeof(int64_t);
       for (size_t i = 0; i < calcs.size(); i++) {
@@ -667,17 +746,17 @@ public:
   template<typename Accept>
   void forEachEntry(Accept&& accept) {
     if (rep == Rep::DENSE) {
-      for (int64_t ord : touchedOrds) {
-        size_t index = (size_t)ord;
-        accept(ord, denseBase + index * stride);
+      for (int64_t key : touchedKeys) {
+        size_t index = (size_t)key;
+        accept(key, denseBase + index * stride);
       }
       return;
     }
-    for (auto& [ord, entry] : sparseEntries) accept(ord, entry);
+    for (auto& [key, entry] : sparseEntries) accept(key, entry);
   }
 
   size_t size() const {
-    return rep == Rep::SPARSE ? sparseEntries.size() : touchedOrds.size();
+    return rep == Rep::SPARSE ? sparseEntries.size() : touchedKeys.size();
   }
   bool empty() const { return size() == 0; }
   bool dense() const { return rep == Rep::DENSE; }

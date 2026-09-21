@@ -730,8 +730,8 @@ TEST_F(AggregateExprTest, budgetedInlineFacetTableMergesSparseIntoDense) {
   RequestMemTracker tracker(1200);
   InlineFacetEntryStats stats;
   {
-    OrdinalFacetEntryTable dense;
-    OrdinalFacetEntryTable sparse;
+    FacetEntryTable dense;
+    FacetEntryTable sparse;
     std::span<SearchOp::InlineCalculator*> calculators;
     dense.configure(calculators, tracker, 100, "dense", &stats);
     sparse.configure(calculators, tracker, 100, "sparse", &stats);

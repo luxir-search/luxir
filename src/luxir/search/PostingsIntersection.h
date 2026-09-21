@@ -25,6 +25,47 @@ inline bool shouldDrivePostingsFromArray(int32_t docFreq,
           > (int64_t) domainCard * Postings::DOCS_BLOCK_SIZE;
 }
 
+// Visit matching document ids without materializing a bucket domain. Sparse
+// arrays drive postings skips; other domains intersect decoded blocks.
+template <typename Accept>
+void forEachPostingInDomain(DocsOnlyEnum& postings, int32_t docFreq,
+                            DocSet* domain, Accept&& accept) {
+  if (docFreq == 0 || (domain != nullptr && domain->cachedCard() == 0)) return;
+  if (domain != nullptr && domain->type == DocSet::ARRAY
+      && shouldDrivePostingsFromArray(docFreq, domain->card())) {
+    std::span<const int32_t> docs = ((ArrDocSet*) domain)->docs();
+    const int32_t* p = docs.data();
+    const int32_t* end = p + docs.size();
+    while (p != end) {
+      int32_t target = *p;
+      if (postings.docId() < target
+          && postings.advance(target) == DocsEnumMeta::END) {
+        break;
+      }
+      int32_t landing = postings.docId();
+      if (landing == target) {
+        accept(target);
+        p++;
+      } else {
+        assert(landing > target);
+        p = screaming::gallopLowerBound(p + 1, end, landing);
+      }
+    }
+    return;
+  }
+
+  DocSetProbe probe(domain);
+  for (;;) {
+    std::span<const int32_t> docs = postings.peekDocBlock();
+    if (docs.empty()) {
+      break;
+    }
+    probe.intersect(docs,
+        [&](int32_t doc, int32_t) LUXIR_INLINE { accept(doc); });
+    postings.consumeDocBlock((int32_t) docs.size());
+  }
+}
+
 // Materialize the intersection of one term's postings and a segment domain.
 // The postings cursor is consumed. A null domain means all segment docs.
 //
@@ -50,24 +91,8 @@ inline std::unique_ptr<DocSet> materializePostingsIntersection(
 
   if (domain != nullptr && domain->type == DocSet::ARRAY
       && shouldDrivePostingsFromArray(docFreq, domain->card())) {
-    std::span<const int32_t> docs = ((ArrDocSet*) domain)->docs();
-    const int32_t* p = docs.data();
-    const int32_t* end = p + docs.size();
-    while (p != end) {
-      int32_t target = *p;
-      if (postings.docId() < target
-          && postings.advance(target) == DocsEnumMeta::END) {
-        break;
-      }
-      int32_t landing = postings.docId();
-      if (landing == target) {
-        builder.add(target);
-        p++;
-      } else {
-        assert(landing > target);
-        p = screaming::gallopLowerBound(p + 1, end, landing);
-      }
-    }
+    forEachPostingInDomain(postings, docFreq, domain,
+        [&](int32_t doc) LUXIR_INLINE { builder.add(doc); });
     return builder.build();
   }
 
@@ -121,16 +146,8 @@ inline std::unique_ptr<DocSet> materializePostingsIntersection(
     return builder.build();
   }
 
-  DocSetProbe probe(domain);
-  for (;;) {
-    std::span<const int32_t> docs = postings.peekDocBlock();
-    if (docs.empty()) {
-      break;
-    }
-    probe.intersect(docs,
-        [&](int32_t doc, int32_t) LUXIR_INLINE { builder.add(doc); });
-    postings.consumeDocBlock((int32_t) docs.size());
-  }
+  forEachPostingInDomain(postings, docFreq, domain,
+      [&](int32_t doc) LUXIR_INLINE { builder.add(doc); });
   return builder.build();
 }
 

@@ -544,13 +544,9 @@ public:
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
         }
-        if (!facetReq.ops.empty() || !facetReq.sort.empty()) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for int field facets");
-        }
         auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
         facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, facetReq,
-            facetField, facetName, limit, minCount, missing, range.min,
-            range.max, range.useVector, selectedInts);
+            facetField, facetName, limit, minCount, missing, range, selectedInts);
         break;
       }
       case FieldType::Type::ID:
@@ -574,9 +570,6 @@ public:
         break;
       }
       case FieldType::Type::TEXT:
-        if (!facetReq.ops.empty() || !facetReq.sort.empty()) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for text field facets");
-        }
         facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing, selectedStrings);
         break;

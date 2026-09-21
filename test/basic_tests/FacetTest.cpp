@@ -98,6 +98,15 @@ void setSelected(OpCursor& cursor, std::span<const std::string> values,
   facet.selection_mode = mode;
 }
 
+void setSelected(OpCursor& cursor, std::span<const int64_t> values) {
+  auto& facet = std::get<api::FieldFacet>(cursor.rawOp().kind);
+  auto* sequence = api::build::allocMessage<api::Val>(cursor.mr());
+  auto& integers = sequence->kind.emplace<api::ArrInt>();
+  auto* selected = api::build::allocArray(integers.v, values.size(), cursor.mr());
+  std::copy(values.begin(), values.end(), selected);
+  facet.selected = sequence;
+}
+
 std::span<const api::Val> metricValues(const api::FacetResult& result,
                                        std::string_view name) {
   return std::get<api::ArrVal>(result.ops.at(name)->kind).v;
@@ -2787,6 +2796,392 @@ TEST_F(FacetTest, rangeFacetSubOpsChunkedBudgetMatchesDefault) {
   EXPECT_EQ(expected, run(1));
 }
 
+TEST_F(FacetTest, numericFacetSubOpsAndEntryRepresentations) {
+  SearchOverridesGuard guard(forcedInlineFacetEntryMode, inlineFacetEntryStatsForTests);
+  CollectionHelper helper;
+  constexpr int64_t lo = std::numeric_limits<int64_t>::min();
+  constexpr int64_t hi = std::numeric_limits<int64_t>::max();
+  helper.indexAll(std::array{
+      flatdoc("id", "a", "n_i", -2, "many_is", vec_i(-2, -1), "wide_i", lo,
+              "when_dt", (int64_t)1700000000000, "score_i", 10, "cat_s", "x"),
+      flatdoc("id", "b", "n_i", -1, "many_is", vec_i(-1), "wide_i", hi,
+              "when_dt", (int64_t)1700000000001, "score_i", 20, "cat_s", "y"),
+      flatdoc("id", "deleted", "n_i", -2, "score_i", 999),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+      flatdoc("id", "c", "n_i", -2, "many_is", vec_i(-2), "wide_i", lo,
+              "when_dt", (int64_t)1700000000000, "score_i", 30, "cat_s", "y"),
+      flatdoc("id", "d", "n_i", 0, "many_is", vec_i(0), "wide_i", (int64_t)0,
+              "when_dt", (int64_t)1700000000002, "cat_s", "z"),
+  }, UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "missing", "cat_s", "z"), UpdateMessage::COMMIT);
+  helper.deleteById("deleted", UpdateMessage::COMMIT);
+
+  for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
+    forcedInlineFacetEntryMode = mode;
+    for (std::string_view field : {"n_i", "many_is", "wide_i", "when_dt"}) {
+      for (auto dir : {qb::ASC, qb::DESC}) {
+        SCOPED_TRACE(std::string(field));
+        InlineFacetEntryStats stats;
+        inlineFacetEntryStatsForTests = &stats;
+        auto req = localReq(helper.getSearchEngine());
+        auto& facet = req->collection("main").facet("f", field).limit(-1);
+        std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+        facet.sum("total", "score_i").avg("mean", "score_i");
+        facet.facet("cats", "cat_s").limit(-1);
+        facet.rangeFacet("ranges", "score_i").range(0, 40, 20);
+        facet.topDocs("hits").allQuery().limit(1).getNumber().fields({"id"});
+        auto& query = facet.facet("queries", field).rawOp().kind.emplace<api::QueryFacet>();
+        auto* queryBuckets = api::build::allocArray(query.buckets, 1, req->mr);
+        queryBuckets[0].name = "all";
+        auto* all = api::build::allocMessage<api::Query>(req->mr);
+        all->kind = true;
+        queryBuckets[0].query = all;
+        qb::sort(facet, "total", dir);
+        req->execute(true);
+        ASSERT_OK(req);
+        const auto& result = rootFacetResult(*req, "f");
+        auto ids = std::get<api::ColInt>(result.bucket_ids->kind).v;
+        ASSERT_EQ(3u, ids.size());
+        int64_t first = field == "wide_i" ? lo : field == "when_dt" ? 1700000000000 : -2;
+        int64_t second = field == "wide_i" ? hi : field == "when_dt" ? 1700000000001 : -1;
+        // many_is has total 30 for -1; every other field has total 20.
+        EXPECT_EQ(dir == qb::ASC ? second : first, ids[0]);
+        EXPECT_EQ(dir == qb::ASC ? first : second, ids[1]);
+        EXPECT_EQ(field == "when_dt" ? 1700000000002 : 0, ids[2]);
+        EXPECT_EQ(1, result.missing.value_or(-1));
+        auto totals = metricValues(result, "total");
+        EXPECT_EQ(40, totals[dir == qb::ASC ? 1 : 0].asInt());
+        EXPECT_TRUE(totals[2].isNull());
+        for (size_t i = 0; i < ids.size(); i++) {
+          const auto& hits = *metricValues(result, "hits")[i].docList();
+          EXPECT_EQ(result.counts[i], hits.found.value_or(-1));
+          const auto& queries = *metricValues(result, "queries")[i].facetResult();
+          ASSERT_EQ(1u, queries.counts.size());
+          EXPECT_EQ(result.counts[i], queries.counts[0]);
+          const auto& cats = *metricValues(result, "cats")[i].facetResult();
+          EXPECT_EQ(result.counts[i], std::accumulate(cats.counts.begin(), cats.counts.end(), int64_t{0}));
+          const auto& ranges = *metricValues(result, "ranges")[i].facetResult();
+          EXPECT_EQ(i == 2 ? 0 : result.counts[i],
+                    std::accumulate(ranges.counts.begin(), ranges.counts.end(), int64_t{0}));
+        }
+        EXPECT_EQ(0u, req->memoryTracker.bytes());
+        if (field == "wide_i" || mode == InlineFacetEntryMode::FORCE_SPARSE) {
+          EXPECT_GT(stats.sparseTables.load(), 0u);
+          EXPECT_EQ(0u, stats.denseTables.load());
+        } else {
+          EXPECT_GT(stats.denseTables.load(), 0u);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, numericFacetPinnedMetricsAndEmptyDomains) {
+  CollectionHelper helper;
+  for (bool empty : {true, false}) {
+    if (!empty) {
+      helper.indexAll(std::array{
+          flatdoc("id", "a", "n_i", 5, "score_i", 10),
+          flatdoc("id", "b", "n_i", 6, "score_i", 20),
+          flatdoc("id", "c", "n_i", 7, "score_i", 10),
+      }, UpdateMessage::COMMIT);
+    }
+    for (int64_t limit : {-1, 0, 1, 10}) {
+      for (bool sort : {false, true}) {
+        auto req = localReq(helper.getSearchEngine());
+        auto& facet = req->collection("main").topDocs("q").allQuery().limit(0)
+            .facet("f", "n_i").limit(limit);
+        std::array<int64_t, 2> pins{5, std::numeric_limits<int64_t>::min()};
+        setSelected(facet, pins);
+        facet.sum("total", "score_i");
+        facet.topDocs("hits").allQuery().limit(0).getNumber();
+        if (sort) qb::sort(facet, "total", qb::ASC);
+        req->execute();
+        ASSERT_OK(req);
+        const auto& result = topFacetResult(*req, "q", "f");
+        auto ids = std::get<api::ColInt>(result.bucket_ids->kind).v;
+        auto totals = metricValues(result, "total");
+        ASSERT_GE(ids.size(), 2u);
+        for (size_t i = 0; i < ids.size(); i++) {
+          bool absent = empty || ids[i] == pins[1];
+          EXPECT_EQ(absent ? 0 : 1, result.counts[i]);
+          if (absent) EXPECT_TRUE(totals[i].isNull());
+          else EXPECT_EQ(ids[i] == 6 ? 20 : 10, totals[i].asInt());
+          EXPECT_EQ(result.counts[i], metricValues(result, "hits")[i].docList()->found.value_or(-1));
+        }
+        if (!empty && sort && (limit == -1 || limit == 10)) {
+          EXPECT_EQ(5, ids[0]);
+          EXPECT_EQ(7, ids[1]);
+          EXPECT_EQ(6, ids[2]);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, numericFacetInlineMemoryBreaker) {
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  CollectionHelper helper;
+  helper.index(flatdoc("n_i", 5, "score_i", 10), UpdateMessage::COMMIT);
+  forcedRequestMemoryMaxBytes = 1;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").facet("f", "n_i").limit(-1).sum("total", "score_i");
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("request memory breaker 'facet aggregate state'"));
+  EXPECT_NE(std::string::npos, req->errorMsg().find("facet 'f' metric 'total'"));
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
+}
+
+TEST_F(FacetTest, nestedNumericFacetBindingsRespectResidentBudget) {
+  SearchOverridesGuard guard(forcedRangeFacetBindingStateChunkBytes,
+                             rangeFacetBindingBlockCounter);
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+      flatdoc("parent_i", 0, "n_i", 0, "score_i", 10),
+      flatdoc("parent_i", 1, "n_i", 99999, "score_i", 20),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+      flatdoc("parent_i", 0, "n_i", 99999, "score_i", 30),
+      flatdoc("parent_i", 1, "n_i", 0, "score_i", 40),
+  }, UpdateMessage::COMMIT);
+  // Each inner count vector alone exceeds this budget, so each outer bucket
+  // must finish all segments before the next binding opens.
+  forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
+  size_t blocks = 0;
+  rangeFacetBindingBlockCounter = &blocks;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").rangeFacet("outer", "parent_i").range(0, 2, 1)
+      .facet("inner", "n_i").limit(2).sum("total", "score_i");
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(2u, blocks);
+  auto children = metricValues(rootFacetResult(*req, "outer"), "inner");
+  ASSERT_EQ(2u, children.size());
+  for (size_t i = 0; i < children.size(); i++) {
+    const auto& child = *children[i].facetResult();
+    auto sums = metricValues(child, "total");
+    ASSERT_EQ(2u, sums.size());
+    EXPECT_EQ(i == 0 ? 10 : 40, sums[0].asInt());
+    EXPECT_EQ(i == 0 ? 30 : 20, sums[1].asInt());
+  }
+}
+
+TEST_F(FacetTest, numericFacetDuplicateOccurrencesAndUniqueFeedDomains) {
+  SearchOverridesGuard guard(forcedInlineFacetEntryMode);
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+      flatdoc("n_is", vec_i(20, 20, 10, 20), "score_i", 10),
+      flatdoc("n_is", vec_i(20), "score_i", 20),
+  }, UpdateMessage::COMMIT);
+  helper.index(flatdoc("n_is", vec_i(20, 10, 20), "score_i", 30), UpdateMessage::COMMIT);
+  for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
+    forcedInlineFacetEntryMode = mode;
+    for (int64_t limit : {1, -1}) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& facet = req->collection("main").facet("f", "n_is").limit(limit);
+      facet.sum("total", "score_i").avg("mean", "score_i");
+      req->execute();
+      ASSERT_OK(req);
+      const auto& result = rootFacetResult(*req, "f");
+      ASSERT_FALSE(result.counts.empty());
+      EXPECT_EQ(20, std::get<api::ColInt>(result.bucket_ids->kind).v[0]);
+      EXPECT_EQ(6, result.counts[0]);
+      EXPECT_EQ(60, metricValues(result, "total")[0].asInt());
+      EXPECT_DOUBLE_EQ(20, metricValues(result, "mean")[0].asDouble());
+      EXPECT_EQ(0u, req->memoryTracker.bytes());
+    }
+  }
+}
+
+TEST_F(FacetTest, wideNumericChildKeepsSharedBindingBlock) {
+  SearchOverridesGuard guard(forcedRangeFacetBindingStateChunkBytes,
+                             rangeFacetBindingBlockCounter);
+  CollectionHelper helper;
+  for (int seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 1000; i++) {
+      docs.push_back(flatdoc("parent_i", i % 4, "wide_i", (int64_t)(seg * 1000 + i) * 100001));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
+  size_t blocks = 0;
+  rangeFacetBindingBlockCounter = &blocks;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").rangeFacet("outer", "parent_i").range(0, 4, 1)
+      .facet("inner", "wide_i").limit(1);
+  req->execute(false);
+  ASSERT_OK(req);
+  // Index-wide value counts must not be charged to each independent binding.
+  EXPECT_EQ(1u, blocks);
+  auto children = metricValues(rootFacetResult(*req, "outer"), "inner");
+  ASSERT_EQ(4u, children.size());
+  for (size_t i = 0; i < children.size(); i++) {
+    const auto& child = *children[i].facetResult();
+    ASSERT_EQ(1u, child.counts.size());
+    EXPECT_EQ(1, child.counts[0]);
+    EXPECT_EQ((int64_t)i * 100001, std::get<api::ColInt>(child.bucket_ids->kind).v[0]);
+  }
+}
+
+TEST_F(FacetTest, textFacetSubOpsSortPinsAndDomains) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+      flatdoc("id", "a", "body_w", "zulu zulu beta", "score_i", 10, "group_i", 1, "keep_s", "yes"),
+      flatdoc("id", "b", "body_w", "beta", "score_i", 20, "group_i", 1, "keep_s", "yes"),
+      flatdoc("id", "deleted", "body_w", "alpha beta", "score_i", 999, "keep_s", "yes"),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+      flatdoc("id", "c", "body_w", "alpha zulu", "score_i", 30, "group_i", 2, "keep_s", "yes"),
+      flatdoc("id", "d", "body_w", "gamma", "group_i", 2, "keep_s", "yes"),
+      flatdoc("id", "out", "body_w", "outside", "score_i", 50, "group_i", 2, "keep_s", "no"),
+  }, UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "missing", "group_i", 2, "keep_s", "yes"), UpdateMessage::COMMIT);
+  helper.deleteById("deleted", UpdateMessage::COMMIT);
+
+  struct Row { std::string term; int64_t count; std::optional<int64_t> sum; };
+  for (int64_t limit : {0, 1, -1}) {
+    for (int sort : {-1, 0, 1}) {
+      for (int64_t mincount : {0, 2}) {
+        SCOPED_TRACE(std::format("limit={} sort={} mincount={}", limit, sort, mincount));
+        auto req = localReq(helper.getSearchEngine());
+        auto& facet = req->collection("main").topDocs("q").matchQuery("keep_s", "yes").limit(0)
+            .facet("f", "body_w").limit(limit).mincount(mincount);
+        std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+        std::array<std::string, 2> pins{"beta", "absent"};
+        setSelected(facet, pins);
+        facet.sum("total", "score_i").avg("mean", "score_i");
+        facet.expr("shifted", "sum(score_i + 1)");
+        facet.facet("groups", "group_i").limit(-1).avg("mean", "score_i");
+        facet.rangeFacet("ranges", "score_i").range(0, 40, 20);
+        facet.topDocs("hits").allQuery().limit(1).getNumber().fields({"id"});
+        if (sort >= 0) qb::sort(facet, "total", sort == 0 ? qb::ASC : qb::DESC);
+        req->execute(true);
+        ASSERT_OK(req);
+        std::vector<Row> rows{{"alpha", 1, 30}, {"beta", 2, 30},
+                              {"gamma", 1, {}}, {"zulu", 2, 40}};
+        std::erase_if(rows, [&](const Row& row) { return row.count < mincount; });
+        std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+          if (sort < 0) {
+            if (a.count != b.count) return a.count > b.count;
+          } else {
+            if (a.sum.has_value() != b.sum.has_value()) return a.sum.has_value();
+            if (a.sum && a.sum != b.sum) return sort == 0 ? *a.sum < *b.sum : *a.sum > *b.sum;
+          }
+          return a.term < b.term;
+        });
+        if (limit >= 0 && rows.size() > (size_t)limit) rows.resize((size_t)limit);
+        if (std::ranges::none_of(rows, [](const Row& row) { return row.term == "beta"; })) {
+          rows.push_back({"beta", 2, 30});
+        }
+        rows.push_back({"absent", 0, {}});
+        SCOPED_TRACE(req->toString());
+        const auto& result = topFacetResult(*req, "q", "f");
+        auto ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+        ASSERT_EQ(rows.size(), ids.size());
+        EXPECT_EQ(1, result.missing.value_or(-1));
+        for (size_t i = 0; i < rows.size(); i++) {
+          EXPECT_EQ(rows[i].term, ids[i]);
+          EXPECT_EQ(rows[i].count, result.counts[i]);
+          auto total = metricValues(result, "total")[i];
+          auto mean = metricValues(result, "mean")[i];
+          auto shifted = metricValues(result, "shifted")[i];
+          if (rows[i].sum) {
+            EXPECT_EQ(*rows[i].sum, total.asInt());
+            EXPECT_DOUBLE_EQ((double)*rows[i].sum / rows[i].count, mean.asDouble());
+            EXPECT_EQ(*rows[i].sum + rows[i].count, shifted.asInt());
+          } else {
+            EXPECT_TRUE(total.isNull());
+            EXPECT_TRUE(mean.isNull());
+            EXPECT_TRUE(shifted.isNull());
+          }
+          EXPECT_EQ(rows[i].count, metricValues(result, "hits")[i].docList()->found.value_or(-1));
+          const auto& groups = *metricValues(result, "groups")[i].facetResult();
+          EXPECT_EQ(rows[i].count, std::accumulate(groups.counts.begin(), groups.counts.end(), int64_t{0}));
+          const auto& ranges = *metricValues(result, "ranges")[i].facetResult();
+          EXPECT_EQ(rows[i].sum ? rows[i].count : 0,
+                    std::accumulate(ranges.counts.begin(), ranges.counts.end(), int64_t{0}));
+        }
+        EXPECT_EQ(0u, req->memoryTracker.bytes());
+      }
+    }
+  }
+
+  // TEXT results and their metrics occupy the right slots under each parent.
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").facet("strings", "keep_s").limit(-1)
+      .facet("text", "body_w").limit(-1).sum("total", "score_i");
+  req->facet("ints", "group_i").limit(-1)
+      .facet("text", "body_w").limit(-1).sum("total", "score_i");
+  req->rangeFacet("ranges", "group_i").range(1, 3, 1)
+      .facet("text", "body_w").limit(-1).sum("total", "score_i");
+  req->execute();
+  ASSERT_OK(req);
+  for (std::string_view parent : {"strings", "ints", "ranges"}) {
+    auto children = metricValues(rootFacetResult(*req, parent), "text");
+    ASSERT_EQ(2u, children.size());
+    for (const auto& child : children) {
+      const auto& result = *child.facetResult();
+      auto ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+      auto totals = metricValues(result, "total");
+      ASSERT_EQ(ids.size(), totals.size());
+      for (size_t i = 0; i < ids.size(); i++) {
+        if (ids[i] == "beta") { EXPECT_EQ(30, totals[i].asInt()); }
+        if (ids[i] == "outside") { EXPECT_EQ(50, totals[i].asInt()); }
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, textFacetEmptyAndMissingInlineDomains) {
+  CollectionHelper helper;
+  for (bool absentSegment : {false, true}) {
+    if (absentSegment) helper.index(flatdoc("keep_s", "yes"), UpdateMessage::COMMIT);
+    for (int64_t limit : {1, -1}) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& facet = req->collection("main").topDocs("q").allQuery().limit(0)
+          .facet("f", "body_w").limit(limit).mincount(0);
+      std::array<std::string, 1> pins{"absent"};
+      setSelected(facet, pins);
+      std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+      facet.avg("mean", "score_i");
+      facet.topDocs("hits").allQuery().limit(0).getNumber();
+      if (limit == -1) qb::sort(facet, "mean", qb::DESC);
+      req->execute();
+      ASSERT_OK(req);
+      const auto& result = topFacetResult(*req, "q", "f");
+      EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{{"absent", 0}}), stringFacetRows(result));
+      EXPECT_EQ((int64_t)absentSegment, result.missing.value_or(-1));
+      EXPECT_TRUE(metricValues(result, "mean")[0].isNull());
+      EXPECT_EQ(0, metricValues(result, "hits")[0].docList()->found.value_or(-1));
+    }
+  }
+  helper.index(flatdoc("body_w", "unmatched", "keep_s", "no"), UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("keep_s", "yes")
+      .facet("f", "body_w").limit(-1).mincount(0).avg("mean", "score_i");
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_TRUE(topFacetResult(*req, "q", "f").counts.empty());
+}
+
+TEST_F(FacetTest, textFacetInlineMemoryBreaker) {
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  CollectionHelper helper;
+  helper.index(flatdoc("body_w", "alpha beta", "score_i", 10), UpdateMessage::COMMIT);
+  for (size_t budget : {1, 120}) {
+    forcedRequestMemoryMaxBytes = budget;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").facet("f", "body_w").limit(-1).sum("total", "score_i");
+    req->execute(false);
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("request memory breaker 'facet aggregate state'"));
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}
+
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   CollectionHelper helper;
   helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha", "raw_sc", "x"),
@@ -2801,19 +3196,30 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   };
 
   std::vector<Case> cases = {
-    {"int_subop", [](LocalReq& req) {
-      req.facet("f", "foo_i").avg("avg", "foo_i");
-    }, "not yet supported for int field facets"},
-    {"int_sort", [](LocalReq& req) {
+    {"int_unknown_sort", [](LocalReq& req) {
+      qb::sort(req.facet("f", "foo_i"), "avg", qb::ASC);
+    }, "unknown sort field 'avg'"},
+    {"int_two_sorts", [](LocalReq& req) {
       auto& facet = req.facet("f", "foo_i");
-      qb::sort(facet, "avg", qb::ASC);
-    }, "not yet supported for int field facets"},
+      qb::sort(facet, "first", qb::ASC);
+      qb::sort(facet, "second", qb::DESC);
+    }, "multiple sort fields"},
+    {"int_noninline_sort", [](LocalReq& req) {
+      auto& facet = req.facet("f", "foo_i");
+      facet.facet("nested", "cat_s");
+      qb::sort(facet, "nested", qb::ASC);
+    }, "cannot sort by a subop without inline support: nested"},
     {"int_mincount_zero", [](LocalReq& req) {
       req.facet("f", "foo_i").mincount(0);
     }, "not supported for int field facets"},
-    {"text_subop", [](LocalReq& req) {
-      req.facet("f", "body_w").avg("avg", "foo_i");
-    }, "not yet supported for text field facets"},
+    {"text_unknown_sort", [](LocalReq& req) {
+      qb::sort(req.facet("f", "body_w"), "unknown", qb::ASC);
+    }, "unknown sort field 'unknown'"},
+    {"text_noninline_sort", [](LocalReq& req) {
+      auto& facet = req.facet("f", "body_w");
+      facet.facet("nested", "foo_i");
+      qb::sort(facet, "nested", qb::ASC);
+    }, "cannot sort by a subop without inline support: nested"},
     {"range_mincount_negative", [](LocalReq& req) {
       req.rangeFacet("f", "foo_i").range(0, 10, 1).mincount(-1);
     }, "mincount must be >= 0"},
@@ -3445,6 +3851,8 @@ protected:
     int numUniqueValues;
     int maxValuesPerDoc;
     int sparsityPercent;  // 0 = always missing, 100 = always present
+    int64_t scale = 1;
+    int64_t offset = 0;
   };
   
   // No need for FacetRequest struct anymore - we read the built request directly.
@@ -3816,166 +4224,96 @@ protected:
       int64_t mincount = hasMin ? std::max<int64_t>(*facetOp.mincount, 1) : 1;
       bool includeMissing = facetOp.missing;
 
-      // Determine field type from field name convention
-      bool isIntField = fieldName.ends_with("_i") || fieldName.ends_with("_is");
+      bool isIntField = fieldName.ends_with("_i") || fieldName.ends_with("_is")
+          || fieldName.ends_with("_dt");
       bool showZeros = !isIntField && hasMin && *facetOp.mincount == 0;
-
-      // avg() sub-ops (string/id parent only; the parser rejects sub-ops on
-      // int/range/text). There can be several; at most one is the sort key.
-      struct AvgOpDef {
-        std::string name;
-        size_t fieldOrd;
-      };
+      struct AvgOpDef { std::string name; size_t fieldOrd; };
       std::vector<AvgOpDef> avgOps;
-      for (const auto& [opName, subPtr] : facetOp.ops) {
-        const auto& sub = *subPtr;
-        if (auto field = avgExpressionField(sub)) {
-          avgOps.push_back({std::string(opName), fieldOrdinal(*field)});
+      for (const auto& [name, sub] : facetOp.ops) {
+        if (auto field = avgExpressionField(*sub)) {
+          avgOps.push_back({std::string(name), fieldOrdinal(*field)});
         }
       }
-      bool hasAvg = !avgOps.empty();
-      bool hasSubFacet = false;
-      for (const auto& [opName, subPtr] : facetOp.ops) {
-        unused(opName);
-        if (std::holds_alternative<luxir::api::FieldFacet>(subPtr->kind)) {
-          hasSubFacet = true;
-          break;
-        }
-      }
-      int sortAvgIdx = -1;  // index into avgOps of the sort key, or -1
+      int sortAvgIdx = -1;
       if (!facetOp.sort.empty()) {
-        for (size_t k = 0; k < avgOps.size(); k++)
-          if (avgOps[k].name == facetOp.sort[0].expr) { sortAvgIdx = (int)k; break; }
+        for (size_t k = 0; k < avgOps.size(); k++) {
+          if (avgOps[k].name == facetOp.sort[0].expr) sortAvgIdx = (int)k;
+        }
       }
-      bool avgDesc = sortAvgIdx >= 0 && facetOp.sort[0].dir == luxir::api::SortSpec_::SortDir::DESC;
+      bool desc = sortAvgIdx >= 0
+          && facetOp.sort[0].dir == api::SortSpec_::SortDir::DESC;
 
-      // Count values for documents matching the domain query
-      boost::unordered_flat_map<int64_t, int64_t> intCounts;
-      boost::unordered_flat_map<std::string, int64_t> strCounts;
-      boost::unordered_flat_map<std::string, std::vector<int64_t>> strAvgSums; // bucket -> sum per avgOp
-      boost::unordered_flat_map<std::string, std::vector<size_t>> strBucketDocs;
-      int64_t missingCount = 0;
-
-      if (showZeros) {
-        for (size_t docIdx = 0; docIdx < docs.size(); docIdx++) {
-          for (const auto& nv : values(docIdx, fieldOrd)) {
-            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
-              strCounts.try_emplace(*strVal, 0);
+      auto calculate = [&]<typename Key>(std::vector<Key>& ids) {
+        struct Bucket {
+          int64_t count = 0;
+          std::vector<size_t> docs;
+          std::vector<int64_t> sums;
+        };
+        std::map<Key, Bucket> buckets;
+        if (showZeros) {
+          for (size_t d = 0; d < docs.size(); d++) {
+            for (const auto& nv : values(d, fieldOrd)) {
+              if (auto* key = std::get_if<Key>(&nv.val)) buckets[*key];
             }
           }
         }
-      }
-
-      for (auto docIdx : domainDocs) {
-        boost::container::small_vector<int64_t, 2> avs(avgOps.size(), 0);
-        for (size_t k = 0; k < avgOps.size(); k++)
-          if (auto* p = findOne(docIdx, avgOps[k].fieldOrd))
-            if (auto* iv = std::get_if<int64_t>(p)) avs[k] = *iv;
-        bool hasField = false;
-        for (const auto& nv : values(docIdx, fieldOrd)) {
-          if (isIntField) {
-            if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
-              intCounts[*intVal]++;
-              hasField = true;
-            }
-          } else {
-            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
-              strCounts[*strVal]++;
-              if (hasSubFacet) {
-                auto& bucketDocs = strBucketDocs[*strVal];
-                if (bucketDocs.empty() || bucketDocs.back() != docIdx) {
-                  bucketDocs.push_back(docIdx);
-                }
-              }
-              if (hasAvg) {
-                auto& sums = strAvgSums[*strVal];
-                if (sums.empty()) sums.resize(avgOps.size(), 0);
-                for (size_t k = 0; k < avgOps.size(); k++) sums[k] += avs[k];
-              }
-              hasField = true;
+        int64_t missingCount = 0;
+        for (size_t d : domainDocs) {
+          auto vals = values(d, fieldOrd);
+          if (vals.empty()) missingCount++;
+          for (const auto& nv : vals) {
+            auto& b = buckets[std::get<Key>(nv.val)];
+            b.count++;
+            b.docs.push_back(d);
+            b.sums.resize(avgOps.size());
+            for (size_t k = 0; k < avgOps.size(); k++) {
+              b.sums[k] += std::get<int64_t>(*findOne(d, avgOps[k].fieldOrd));
             }
           }
         }
-        if (!hasField) {
-          missingCount++;
+        for (const auto& [key, b] : buckets) {
+          if (b.count >= (showZeros ? 0 : mincount)) ids.push_back(key);
         }
-      }
-
-      // Apply mincount, sort, and limit, then populate the expected result
-      if (isIntField) {
-        out.intBuckets = true;
-        auto sorted = sortAndLimitFacets(intCounts, limit, mincount);
-        for (const auto& [val, count] : sorted) {
-          out.intIds.push_back(val);
-          out.counts.push_back(count);
+        std::sort(ids.begin(), ids.end(), [&](const Key& a, const Key& b) {
+          const auto& aa = buckets.at(a);
+          const auto& bb = buckets.at(b);
+          if (sortAvgIdx >= 0) {
+            double av = (double)aa.sums[sortAvgIdx] / aa.count;
+            double bv = (double)bb.sums[sortAvgIdx] / bb.count;
+            if (av != bv) return desc ? av > bv : av < bv;
+          } else if (aa.count != bb.count) {
+            return aa.count > bb.count;
+          }
+          return a < b;
+        });
+        if (limit >= 0 && ids.size() > (size_t)limit) ids.resize((size_t)limit);
+        if constexpr (std::is_same_v<Key, int64_t>) {
+          if (facetOp.selected) {
+            for (int64_t pin : std::get<api::ArrInt>(facetOp.selected->kind).v) {
+              if (std::ranges::find(ids, pin) == ids.end()) ids.push_back(pin);
+            }
+          }
         }
-      } else if (hasAvg) {
-        // avg fields (avgval_i / avgval2_i) are always present, so every bucket
-        // has count values per avgOp and avg = sum/count (no empty-bucket
-        // zero-vs-null seam). One avgOp may be the sort key; the rest are annotations.
-        struct B { std::string val; int64_t count; std::vector<int64_t> sums; };
-        std::vector<B> buckets;
-        for (const auto& [val, count] : strCounts) {
-          if (count >= mincount) buckets.push_back({val, count, strAvgSums.at(val)});
-        }
-        if (sortAvgIdx >= 0) {
-          std::sort(buckets.begin(), buckets.end(), [&](const B& a, const B& b) {
-            double aa = (double)a.sums[sortAvgIdx] / (double)a.count;
-            double ba = (double)b.sums[sortAvgIdx] / (double)b.count;
-            if (aa != ba) return avgDesc ? aa > ba : aa < ba;
-            return a.val < b.val; // tie-break by bucket value asc (matches facetResult2)
-          });
-        } else {
-          std::sort(buckets.begin(), buckets.end(), [](const B& a, const B& b) {
-            if (a.count != b.count) return a.count > b.count;
-            return a.val < b.val;
-          });
-        }
-        if (limit >= 0 && (int64_t)buckets.size() > limit) buckets.resize(limit);
-        // Only emit sub-op results when there are buckets (the engine's post-hoc
-        // path creates no ops entry for an empty facet). One vector per avgOp;
-        // the push_back below creates each entry on the first bucket.
-        for (const auto& b : buckets) {
-          out.strIds.push_back(b.val);
+        for (const auto& key : ids) {
+          const auto& b = buckets[key];
           out.counts.push_back(b.count);
-          for (size_t k = 0; k < avgOps.size(); k++)
-            out.avgOps[avgOps[k].name].push_back((double)b.sums[k] / (double)b.count);
-        }
-      } else {
-        auto sorted = sortAndLimitFacets(strCounts, limit, showZeros ? 0 : mincount);
-        for (const auto& [val, count] : sorted) {
-          out.strIds.push_back(val);
-          out.counts.push_back(count);
-        }
-      }
-
-      // Set missing count if requested
-      if (includeMissing) {
-        out.missing = missingCount;
-      }
-
-      // Nested sub-facets (string/id parent only; the engine supports facet
-      // sub-ops there). One sub-facet per RETURNED bucket, parallel to
-      // bucket_ids: ops[name].arr.v[i].facet over that bucket's sub-domain.
-      if (!isIntField) {
-        const std::vector<std::string>& parentVals = out.strIds;
-        if (parentVals.empty()) return out;  // engine emits no sub-op for an empty parent
-        for (const auto& [opName, subPtr] : facetOp.ops) {
-          const auto& sub = *subPtr;
-          if (!std::holds_alternative<luxir::api::FieldFacet>(sub.kind)) continue;
-          auto& arr = out.subFacetOps[std::string(opName)];
-          for (const auto& bval : parentVals) {
-            auto bucketIt = strBucketDocs.find(bval);
-            if (bucketIt == strBucketDocs.end()) {
-              ADD_FAILURE() << "missing model documents for facet bucket " << bval;
-              arr.emplace_back();
-              continue;
+          for (size_t k = 0; k < avgOps.size(); k++) {
+            out.avgOps[avgOps[k].name].push_back(b.count == 0
+                ? std::numeric_limits<double>::quiet_NaN()
+                : (double)b.sums[k] / b.count);
+          }
+          for (const auto& [name, sub] : facetOp.ops) {
+            if (auto* nested = std::get_if<api::FieldFacet>(&sub->kind)) {
+              out.subFacetOps[std::string(name)].push_back(
+                  calculateFieldFacet(*nested, b.docs));
             }
-            arr.push_back(calculateFieldFacet(
-                std::get<luxir::api::FieldFacet>(sub.kind), bucketIt->second));
           }
         }
-      }
+        if (includeMissing) out.missing = missingCount;
+      };
+      out.intBuckets = isIntField;
+      if (isIntField) calculate(out.intIds);
+      else calculate(out.strIds);
 
       return out;
     }
@@ -4031,7 +4369,8 @@ protected:
     for (const auto& field : fields) {
       if (!field.isInt) continue;
       auto& def = b.field(field.name);
-      def.type = api::FieldDef::FieldClass::INT;
+      def.type = field.name.ends_with("_dt") ? api::FieldDef::FieldClass::DATE
+                                             : api::FieldDef::FieldClass::INT;
       def.index = api::FieldDef::IndexMode::RANGE;
       def.multi = field.multiValued;
     }
@@ -4125,12 +4464,13 @@ protected:
               if (field.multiValued) {
                 int count = segRng.rint(1, field.maxValuesPerDoc + 1);
                 auto vals = sampleDistinctInts(segRng, field.numUniqueValues, count);
+                for (auto& val : vals) val = val * field.scale + field.offset;
                 handlers[fieldIdx]->index(inverter, std::span<const int64_t>(vals.data(), vals.size()));
                 for (auto val : vals) {
                   doc.push_back({field.name, val});
                 }
               } else {
-                int64_t val = segRng.rint(field.numUniqueValues);
+                int64_t val = segRng.rint(field.numUniqueValues) * field.scale + field.offset;
                 handlers[fieldIdx]->index(inverter, val);
                 doc.push_back({field.name, val});
               }
@@ -4226,7 +4566,7 @@ protected:
   // `cur` is the RangeFacet cursor (its field is already set).
   static void generateRandomRangeFacet(Rng& rng, OpCursor& cur, const FieldDef& field) {
     int n = field.numUniqueValues;
-    int64_t start = (int64_t)rng.rint(std::max(3, n / 2 + 3)) - 2;  // [-2, ...)
+    int64_t start = field.offset + (int64_t)rng.rint(std::max(3, n / 2 + 3)) - 2;
     int64_t end = start + 1 + rng.rint(n + 4);                      // > start
     int64_t gap = 1 + rng.rint(std::max(1, n / 3));                 // >= 1
     cur.range(start, end, gap);
@@ -4242,7 +4582,7 @@ protected:
   static void addFacetOp(Rng& rng, Parent& parent,
                          const std::string& name, const FieldDef& field,
                          const std::vector<FieldDef>& allFields) {
-    if (field.isInt && rng.rint(100) < 40) {
+    if (field.isInt && !field.name.ends_with("_dt") && field.scale == 1 && rng.rint(100) < 40) {
       generateRandomRangeFacet(rng, parent.rangeFacet(name, field.name), field);
     } else {
       generateRandomFacet(rng, parent.facet(name, field.name), field, allFields);
@@ -4285,33 +4625,25 @@ protected:
     // Random missing
     ff.missing = rng.rbool();
 
-    // Sub-ops only on string/id facets (parser rejects them on int/range/text)
-    // and only at the top level (bounds nesting). May attach several at once:
-    // 1-2 avgs (distinct always-present int fields) and/or a sub-facet.
-    if (depth == 0 && !field.isInt && !field.isText) {
-      bool wantAvg = rng.rint(100) < 45;
-      bool wantSubFacet = rng.rint(100) < 25;
-      if ((wantAvg || wantSubFacet) && ff.mincount.has_value() && *ff.mincount == 0) {
-        cur.mincount(1);  // sub-ops + mincount=0 is an untested combo; avoid it
+    // Field facets share metrics and bucket children. Metrics
+    // also run on nested facets; only another level of facets is suppressed.
+    bool wantAvg = rng.rint(100) < 45;
+    bool wantSubFacet = depth == 0 && rng.rint(100) < 25;
+    if ((wantAvg || wantSubFacet) && ff.mincount.has_value() && *ff.mincount == 0) {
+      cur.mincount(1);  // sub-ops + mincount=0 is an untested combo; avoid it
+    }
+    if (wantAvg) {
+      cur.avg("av", "avgval_i");
+      bool twoAvgs = rng.rbool();
+      if (twoAvgs) cur.avg("av2", "avgval2_i");
+      if (rng.rint(100) < 50) {  // sort by one of the avgs (at most one sort field)
+        std::string_view sortField = (twoAvgs && rng.rbool()) ? "av2" : "av";
+        qb::sort(cur, sortField, rng.rbool() ? qb::DESC : qb::ASC);
       }
-      if (wantAvg) {
-        cur.avg("av", "avgval_i");
-        bool twoAvgs = rng.rbool();
-        if (twoAvgs) cur.avg("av2", "avgval2_i");
-        if (rng.rint(100) < 50) {  // sort by one of the avgs (at most one sort field)
-          std::string_view sortField = (twoAvgs && rng.rbool()) ? "av2" : "av";
-          qb::sort(cur, sortField, rng.rbool() ? qb::DESC : qb::ASC);
-        }
-      }
-      if (wantSubFacet) {
-        std::vector<int> strFields;
-        for (int i = 0; i < (int)allFields.size(); i++)
-          if (!allFields[i].isInt && !allFields[i].isText) strFields.push_back(i);  // string sub-facets only
-        if (!strFields.empty()) {
-          const auto& sf = allFields[strFields[rng.rint((int)strFields.size())]];
-          generateRandomFacet(rng, cur.facet("sf", sf.name), sf, allFields, depth + 1);
-        }
-      }
+    }
+    if (wantSubFacet) {
+      const auto& sf = allFields[rng.rint((int)allFields.size())];
+      generateRandomFacet(rng, cur.facet("sf", sf.name), sf, allFields, depth + 1);
     }
   }
 
@@ -4349,6 +4681,11 @@ public:
           field.isInt = false;
           field.isText = true;
           field.multiValued = false;
+        }
+        if (i == 5) field.name = "field5_dt";
+        if (field.isInt) {
+          field.scale = i >= 5 ? 1000003 : 1;
+          field.offset = i == 5 ? 1700000000000 : -500;
         }
         field.maxValuesPerDoc = field.multiValued ? 2 + rng.rint(3) : 1;
         int cardClass = i % 3;
@@ -4428,6 +4765,18 @@ public:
               }
             }
 
+            // An isolated selection container leaves this facet's domain
+            // unchanged by its own pins, including one absent value.
+            const auto& pinField = fields[(testNum % 2) == 0 ? 0 : 5];
+            auto& pins = req->topDocs("pins").allQuery().limit(0)
+                .facet("f", pinField.name);
+            generateRandomFacet(localRng, pins, pinField, fields);
+            pins.avg("pinned_avg", "avgval_i");
+            std::array<int64_t, 2> selected{
+                pinField.offset + localRng.rint(pinField.numUniqueValues) * pinField.scale,
+                std::numeric_limits<int64_t>::max()};
+            setSelected(pins, selected);
+
             // Execute the request
             bool para = (localRng.rint(100) < PERCENT_PARA);
             req->execute(para);
@@ -4472,8 +4821,10 @@ public:
                   const auto& aArr = std::get<luxir::api::ArrVal>(actual.ops.at(opName)->kind);
                   const auto& eArr = expected.avgOps.at(std::string(opName));
                   ASSERT_EQ(aArr.v.size(), eArr.size()) << "avg arr size: " << ctx << "\n" << req->toString();
-                  for (int i = 0; i < (int)eArr.size(); i++)
-                    EXPECT_DOUBLE_EQ(aArr.v[i].asDouble(), eArr[i]) << "avg[" << i << "]: " << ctx;
+                  for (int i = 0; i < (int)eArr.size(); i++) {
+                    if (std::isnan(eArr[i])) EXPECT_TRUE(aArr.v[i].isNull()) << ctx;
+                    else EXPECT_DOUBLE_EQ(aArr.v[i].asDouble(), eArr[i]) << "avg[" << i << "]: " << ctx;
+                  }
                 }
               }
               // Nested sub-facet results: ops[name].arr.v[i].facet, one per bucket.

@@ -323,10 +323,7 @@ public:
         : InlineCalculator(op, parent, slot, numSlots),
           denseFacetState(static_cast<ExprStatsOp&>(op).denseFacetState),
           resultType(static_cast<ExprStatsOp&>(op).aggregate.root().type),
-          entryBytes(denseFacetState != nullptr
-              ? denseFacetState->bytes
-              : AggregateStateView::bytes(
-                    static_cast<ExprStatsOp&>(op).aggregate)) {
+          entryBytes(op.inlineEntryBytes()) {
       if (inlineAggregateStatsForTests != nullptr) {
         inlineAggregateStatsForTests->stateBytesPerBucket.store(
             entryBytes, std::memory_order_relaxed);
@@ -340,8 +337,6 @@ public:
             trackedFinalizedBytes, std::memory_order_relaxed);
       }
     }
-
-    uint32_t fixedEntryBytes() const override { return entryBytes; }
 
     void insert(void* entry, int32_t docid) override {
       if (denseFacetState != nullptr) {
@@ -412,6 +407,18 @@ public:
       } catch (const ValueEvaluationError&) {
         bindings.clear();
         segmentFailure = AggregateFailure::VALUE_EVALUATION;
+      }
+    }
+
+    void LUXIR_NOINLINE rewind() override {
+      // Bare-column inputs bypass the expression reader's restart detection.
+      // Rebuild only those iterators when the driver starts another doc walk.
+      for (BoundAggregateInput& binding : bindings) {
+        if (binding.columnIterator == nullptr) continue;
+        auto& node = binding.values->nodes[binding.leaf->input->rootNode];
+        node.bulkIterator.reset();
+        node.bulkIterator.emplace(*node.column);
+        binding.columnIterator = &*node.bulkIterator;
       }
     }
 
@@ -686,6 +693,11 @@ public:
   }
 
   bool canInline() override { return true; }
+
+  uint32_t inlineEntryBytes() const override {
+    return denseFacetState != nullptr ? denseFacetState->bytes
+                                     : AggregateStateView::bytes(aggregate);
+  }
 
   size_t facetBucketResidentBytes() const override {
     return AggregateStateView::bytes(aggregate);
