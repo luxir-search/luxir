@@ -237,6 +237,8 @@ public:
 private:
 
   void createSingletons();
+  void observeCollection(const std::string& name, Collection& collection);
+  std::shared_ptr<Collection> makeCollection(const std::string& name, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema = {},
                                              std::shared_ptr<Directory> directory = {});
   // Returns the collection unchanged, or throws if it is unavailable.

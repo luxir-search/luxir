@@ -66,6 +66,9 @@ public:
     reject("sync");
   }
 
+  Directory& underlying() override { return delegate_->underlying(); }
+  void linkFile(Directory&, std::string_view) override { reject("linkFile"); }
+
   void clear() override {
     reject("clear");
   }
@@ -89,8 +92,8 @@ public:
     // Backends materialize storage for an unknown collection on create() (and
     // are entitled to), so refuse before delegating rather than after.  For one
     // that already exists, create() only opens what is there.
-    auto existing = delegate_->listCollections();
-    if (std::find(existing.begin(), existing.end(), collectionName) == existing.end()) {
+    auto existing = delegate_->listDirectories();
+    if (std::find(existing.begin(), existing.end(), collectionName.substr(0, collectionName.find('/'))) == existing.end()) {
       throw ReadOnlyError("read-only data directory: collection '" +
                           std::string(collectionName) + "' does not exist and cannot be created");
     }
@@ -98,8 +101,8 @@ public:
                                                std::string(collectionName));
   }
 
-  std::vector<std::string> listCollections() override {
-    return delegate_->listCollections();
+  std::vector<std::string> listDirectories(std::string_view parent = {}) override {
+    return delegate_->listDirectories(parent);
   }
 
   void remove(std::string_view collectionName) override {

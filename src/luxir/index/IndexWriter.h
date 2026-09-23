@@ -455,7 +455,7 @@ public:
   // A nonnull schema is for creation only; reopening loads the manifest schema.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR);
+                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {});
   ~IndexWriter();
   void close();
 

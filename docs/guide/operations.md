@@ -83,9 +83,10 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
-On the filesystem backend a deleted collection is first renamed into `trash/`
-under the data directory and then removed; `trash/` is purged again at startup,
-so a crash mid-deletion cannot resurrect a partially deleted collection. If
+On the filesystem backend collections use `c/<name>/<incarnation>/`, selected
+by an atomically replaced `CURRENT` file in `c/<name>/`. Deletion removes and
+syncs `CURRENT` before removing the directory tree, so an interrupted deletion
+cannot reopen the partially deleted index. If
 deletion fails partway (for example an I/O error), the name stays unavailable
 with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -105,6 +106,26 @@ public:
     return total;
   }
 
+  virtual Directory& underlying() { return *this; }
+  // Install an immutable file without copying its bytes (same storage backend).
+  virtual void linkFile(Directory& source, std::string_view name) = 0;
+
+  // Only descriptors from a published snapshot authorize reuse; filenames alone
+  // are not identities across collection incarnations.
+  std::vector<FileDescriptor> reuseFiles(Directory& source, std::span<const FileDescriptor> available,
+                                        std::span<const FileDescriptor> wanted) {
+    std::map<std::string_view, const FileDescriptor*> byName;
+    for (const auto& file : available) byName.emplace(file.name, &file);
+    std::vector<FileDescriptor> reused;
+    for (const auto& file : wanted) {
+      auto it = byName.find(file.name);
+      if (it == byName.end() || *it->second != file) continue;
+      if (!openFile(file.name)) linkFile(source, file.name);
+      else continue; // An unpublished candidate must be verified by its caller.
+      reused.push_back(file);
+    }
+    return reused;
+  }
   virtual ~Directory() = default;
 };
 
@@ -205,6 +226,13 @@ public:
     auto value = std::move(it->second);
     files.erase(it);
     files[std::string(to)] = std::move(value);
+  }
+
+  void linkFile(Directory& source, std::string_view name) override {
+    auto input = std::dynamic_pointer_cast<RAMInputFile>(source.openFile(name, true));
+    if (!input) throw std::runtime_error("RAM link source missing or incompatible");
+    std::lock_guard lock(mutex);
+    files[std::string(name)] = std::move(input);
   }
 
   void clear() override {

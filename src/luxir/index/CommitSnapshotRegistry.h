@@ -68,15 +68,19 @@ private:
   void enforceBudgetLocked(std::vector<std::string>& retired);
   void unlink(std::span<const std::string> names) noexcept;
   void unlinkFiles(std::span<const std::string> names) noexcept;
+  void retireUnreferenced(std::span<const Directory::FileInfo> listing);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
       : now(std::move(now)), dir(dir), readers(dir, current, config) {}
   ~CommitSnapshotRegistry() { close(); }
   void close() noexcept;
+  // Stop reservations and join retirement while admitted searches retain readers.
+  void detach() noexcept;
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::shared_ptr<const CommitSnapshot> snapshot() const { return current.load(); }
   void openLocalSnapshot();
   void sweepOrphans(const Manifest& manifest);
+  void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
       const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained = {});
   // Reservations outlive requests and are shared by all clients of a commit.

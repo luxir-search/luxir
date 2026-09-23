@@ -108,7 +108,7 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 // Covered by IndexWriterTest.overwriteSurvivesCommitAheadOfOlderUpdate.
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
-                         IndexRamBudget* sharedIndexRamBudget, int mergeFactor)
+                         IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
@@ -119,7 +119,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   nextManifestGen = manifest.highestGeneration;
   manifestNames = std::move(manifest.names);
   if (!manifest.bytes) {
-    incarnation = newUuid();
+    incarnation = initialIncarnation.empty() ? newUuid() : std::move(initialIncarnation);
     lastSegId = 0;
   } else {
     std::pmr::monotonic_buffer_resource iiArena;
@@ -184,7 +184,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     publish(initial, arena, schema ? schema : Schema::createDefaultSchema());
   } else if (manifest.generation != manifest.highestGeneration) {
     // A recovered older root must not advertise a regressed generation under
-    // the old identity.
+    // the old identity. Collection storage also switches incarnation directories.
     incarnation = newUuid();
     std::pmr::monotonic_buffer_resource arena;
     auto recovered = Manifest::decode(manifest.bytes, arena);

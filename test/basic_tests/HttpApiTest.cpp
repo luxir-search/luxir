@@ -947,7 +947,9 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  for (const auto& file : std::filesystem::directory_iterator(base / "c" / "bad")) {
+  FSDirectory container(base / "c" / "bad");
+  auto incarnation = DirectoryFactory::current(container).incarnation;
+  for (const auto& file : std::filesystem::directory_iterator(base / "c" / "bad" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";

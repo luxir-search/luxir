@@ -293,13 +293,10 @@ TEST_F(CollectionAdminApiTest, restartKeepsDeletedCollectionAbsentAndPurgesTrash
     EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_restart"));
   }
 
-  std::filesystem::create_directories(data.path() / "trash" / "interrupted");
-  std::ofstream(data.path() / "trash" / "interrupted" / "file") << "stale";
 
   {
     LuxirNode restarted(config);
     EXPECT_THROW(restarted.getCollection("admin_restart"), CollectionNotFoundError);
-    EXPECT_TRUE(std::filesystem::is_empty(data.path() / "trash"));
   }
 }
 
@@ -314,11 +311,13 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
     CollectionHelper helper(node, "admin_corrupt");
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
   }
-  for (const auto& file : std::filesystem::directory_iterator(data.path() / "c" / "admin_corrupt")) {
+  FSDirectory container(data.path() / "c" / "admin_corrupt");
+  auto incarnation = DirectoryFactory::current(container).incarnation;
+  auto indexPath = data.path() / "c" / "admin_corrupt" / incarnation;
+  for (const auto& file : std::filesystem::directory_iterator(indexPath)) {
     if (Manifest::generationOf(file.path().filename().string())) std::filesystem::remove(file.path());
   }
-  std::ofstream(data.path() / "c" / "admin_corrupt" /
-                Manifest::name(1),
+  std::ofstream(indexPath / Manifest::name(1),
                 std::ios::binary | std::ios::trunc)
       << "\xff\xff\xff\xff\xff\xff\xff\xff";
 
@@ -428,6 +427,28 @@ TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
   }
   EXPECT_THROW(node.createCollection(nullptr, "unregistered"), std::filesystem::filesystem_error);
   EXPECT_EQ(incarnation, test::readDurableIndexInfo(existing)->incarnation);
+}
+
+TEST_F(CollectionAdminApiTest, missingCurrentDoesNotCreateOverExistingIndex) {
+  CollectionAdminDataDir data("luxir_collection_unselected");
+  auto config = fsConfig(data);
+  std::string incarnation;
+  {
+    LuxirNode node(config);
+    incarnation = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation;
+  }
+  std::filesystem::remove(data.path() / "c" / "main" / "CURRENT");
+  LuxirNode reopened(config);
+  EXPECT_THROW(reopened.getCollection("main"), CollectionUnavailableError);
+  EXPECT_TRUE(std::filesystem::exists(data.path() / "c" / "main" / incarnation / Manifest::name(1)));
+}
+
+TEST_F(CollectionAdminApiTest, emptyUnselectedCollectionIsNotRecreatedAtStartup) {
+  CollectionAdminDataDir data("luxir_collection_interrupted_delete");
+  FSDirectory empty(data.path() / "c" / "gone");
+  LuxirNode node(fsConfig(data));
+  EXPECT_THROW(node.getCollection("gone"), CollectionUnavailableError);
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "gone" / "CURRENT"));
 }
 
 } // namespace luxir::test

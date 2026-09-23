@@ -133,7 +133,11 @@ public:
   }
 
   /// Access the underlying directory.
-  Directory& underlying() { return *delegate_; }
+  Directory& underlying() override { return delegate_->underlying(); }
+  void linkFile(Directory& source, std::string_view name) override {
+    source.openFile(name, true);
+    delegate_->linkFile(source, name);
+  }
 };
 
 
@@ -152,8 +156,8 @@ public:
     return std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
   }
 
-  std::vector<std::string> listCollections() override {
-    return delegate_->listCollections();
+  std::vector<std::string> listDirectories(std::string_view parent = {}) override {
+    return delegate_->listDirectories(parent);
   }
 
   void remove(std::string_view collectionName) override {

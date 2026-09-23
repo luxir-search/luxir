@@ -70,7 +70,7 @@ TEST(DirLockTest, unownedFactoryOpensAlongsideTheWriter) {
   writer.create("main");
 
   FSDirFactory reader(tempDir.path(), /*unowned=*/true);
-  EXPECT_EQ(reader.listCollections(), std::vector<std::string>{"main"});
+  EXPECT_EQ(reader.listDirectories(), std::vector<std::string>{"main"});
   // The reader must not have left a lock behind either.
   EXPECT_NO_THROW({ FSDirFactory alsoUnowned(tempDir.path(), /*unowned=*/true); });
 }

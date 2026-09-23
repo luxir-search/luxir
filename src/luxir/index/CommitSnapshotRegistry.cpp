@@ -42,11 +42,22 @@ void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest) {
               manifest.generation, manifest.highestGeneration);
     return;
   }
+  retireUnreferenced(manifest.listing);
+}
+
+void CommitSnapshotRegistry::sweepOrphans() {
+  std::vector<Directory::FileInfo> listing;
+  dir.listFiles(listing);
+  retireUnreferenced(listing);
+}
+
+void CommitSnapshotRegistry::retireUnreferenced(std::span<const Directory::FileInfo> listing) {
   boost::unordered_flat_set<std::string> retained;
-  retained.insert(Manifest::name(manifest.generation));
-  for (const auto& file : snapshot()->files) retained.insert(file.name);
+  auto installed = snapshot();
+  retained.insert(Manifest::name(installed->id.index_gen));
+  for (const auto& file : installed->files) retained.insert(file.name);
   std::vector<std::string> obsolete;
-  for (const auto& file : manifest.listing) {
+  for (const auto& file : listing) {
     if (Manifest::indexFile(file.name) && !retained.contains(file.name)) {
       obsolete.push_back(file.name);
     }
@@ -294,11 +305,15 @@ void CommitSnapshotRegistry::unlinkFiles(std::span<const std::string> names) noe
 }
 
 void CommitSnapshotRegistry::close() noexcept {
+  readers.close();
+  detach();
+}
+
+void CommitSnapshotRegistry::detach() noexcept {
   {
     std::lock_guard lock(mutex);
     closed = true;
   }
-  readers.close();
   // Wait out directory access. A release already holding collected names can
   // arrive later, but unlink() will see closed and never touch a reused path.
   std::lock_guard retirementLock(retirementMutex);

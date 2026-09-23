@@ -5,6 +5,8 @@
 #include "LuxirNode.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/InputStream.h"
+#include "luxir/store/Manifest.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/reader/Postings.h"
@@ -295,30 +297,68 @@ void LuxirNode::deleteCollection(std::string_view name) {
 
 std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema,
                                                        std::shared_ptr<Directory> directory) {
-  auto col = std::make_shared<Collection>();
-  col->name = name;
-  col->shard = std::make_shared<Shard>(*col);
-  col->shard->dir = directory ? std::move(directory) : dirFactory->create(name);
-
-  col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
-      FilterCacheConfig{.maxBytes = config.queryCacheBytes});
+  auto container = directory ? std::move(directory) : dirFactory->create(name);
+  auto selection = DirectoryFactory::current(*container);
+  bool creating = selection.incarnation.empty();
+  if (creating) {
+    std::vector<Directory::FileInfo> files;
+    container->listFiles(files);
+    if (!files.empty() || !dirFactory->listDirectories(name).empty()) throw std::runtime_error("Collection files exist without CURRENT");
+    if (config.read_only) throw ReadOnlyError("Collection has no CURRENT");
+    selection.incarnation = newUuid();
+  }
+  if (!creating && !config.read_only) {
+    auto selected = dirFactory->create(name + "/" + selection.incarnation);
+    auto manifest = Manifest::load(*selected);
+    if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
+      auto recovered = dirFactory->copySnapshot(name, selection, manifest);
+      LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
+                name, manifest.generation, manifest.highestGeneration, recovered.incarnation);
+      dirFactory->select(name, recovered);
+      selection = std::move(recovered);
+    }
+  }
+  auto col = makeCollection(name, dirFactory->create(name + "/" + selection.incarnation));
+  if (!creating && !Manifest::load(*col->shard->dir).bytes) throw std::runtime_error("CURRENT selects an empty index directory");
   if (config.read_only) {
     col->shard->snapshots->openLocalSnapshot();
   } else {
     col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
       std::move(initialSchema), &indexRamBudget,
-      config.index.merge_factor);
+      config.index.merge_factor, creating ? selection.incarnation : std::string{});
     col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
     col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   }
+  if (col->shard->snapshots->snapshot()->id.incarnation != selection.incarnation) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
+  if (creating) dirFactory->select(name, selection);
+  if (!config.read_only) for (const auto& incarnation : dirFactory->listDirectories(name)) {
+    if (incarnation == selection.incarnation) continue;
+    try { dirFactory->remove(name + "/" + incarnation); }
+    catch (const std::exception& e) { LOG_WARN("Unselected incarnation cleanup '{}' failed: {}", name, e.what()); }
+  }
+  observeCollection(name, *col);
+  Signal::emit("collectionInitialized", col.get());
+  return col;
+}
+
+std::shared_ptr<Collection> LuxirNode::makeCollection(const std::string& name, std::shared_ptr<Directory> directory) {
+  auto col = std::make_shared<Collection>();
+  col->name = name;
+  col->shard = std::make_shared<Shard>(*col);
+  col->shard->dir = std::move(directory);
+
+  col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
+      FilterCacheConfig{.maxBytes = config.queryCacheBytes});
   auto& snapshots = *col->shard->snapshots;
   const auto& policy = config.replication;
   snapshots.setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
-  snapshots.onPublish = [catalog = replication, name](const CommitSnapshot& snapshot) noexcept {
+  return col;
+}
+
+void LuxirNode::observeCollection(const std::string& name, Collection& collection) {
+  collection.getShard()->getSnapshots().onPublish = [catalog = replication, name](const CommitSnapshot& snapshot) noexcept {
     catalog->changed(name, snapshot.id.incarnation);
   };
-  Signal::emit("collectionInitialized", col.get());
-  return col;
 }
 
 void LuxirNode::createSingletons() {
@@ -341,14 +381,16 @@ void LuxirNode::createSingletons() {
   root = std::make_shared<Library>();
 
   // Discover existing collections from the store, or create default "main".
-  auto existing = dirFactory->listCollections();
-  if (existing.empty()) {
-    existing.emplace_back(kDefaultCollectionName);
-  }
+  auto existing = dirFactory->listDirectories();
+  bool createDefault = existing.empty();
+  if (createDefault) existing.emplace_back(kDefaultCollectionName);
 
   for (const auto& name : existing) {
     try {
       validateCollectionName(name);
+      if (!createDefault && DirectoryFactory::current(*dirFactory->create(name)).incarnation.empty()) {
+        throw std::runtime_error("Collection has no CURRENT");
+      }
       root->collections.getOrCreate(name, [&]() {
         return initCollection(name);
       });
