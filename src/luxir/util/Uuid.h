@@ -6,8 +6,19 @@
 #include <cstdint>
 #include <random>
 #include <string>
+#include <string_view>
+#include <cctype>
 
 namespace luxir {
+
+inline bool isUuid(std::string_view value) {
+  if (value.size() != 36) return false;
+  for (size_t i = 0; i < value.size(); i++) {
+    bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+    if (dash ? value[i] != '-' : !std::isxdigit((unsigned char)value[i])) return false;
+  }
+  return true;
+}
 
 inline std::string newUuid() {
   std::random_device random;

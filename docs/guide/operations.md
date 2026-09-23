@@ -65,6 +65,9 @@ offline without risking a stray write. Current limitations:
   attributes to no visible file.
 
 Restart the read-only node to pick up newer commits and release pinned files.
+For a continuously refreshed copy with its own storage, use
+[`--replicate-from http://writer:9400`](replication.md). Followers own their local
+data directory and install verified snapshots without constructing an index writer.
 
 ## Collection lifecycle
 
@@ -357,9 +360,9 @@ detected when the affected reader is opened.
 Before treating Luxir as a production service, account explicitly for the
 features it does not yet supply:
 
-- single node, with no replication or distributed query execution;
+- no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
-- no online snapshot or restore API;
+- no managed backup/restore workflow (the replication API exports snapshots);
 - no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 

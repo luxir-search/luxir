@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
 
 #include <cassert>
@@ -1276,6 +1277,7 @@ private:
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
         api::ReplicationStatus status;
+        if (auto follower = node_.getFollower()) follower->stats(status, arena);
         auto followers = node_.getReplication().stats(node_);
         auto* rows = api::build::allocArray(status.followers, followers.size(), arena);
         for (size_t i = 0; i < followers.size(); i++) {

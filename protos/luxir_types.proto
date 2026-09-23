@@ -1037,14 +1037,29 @@ message StatsRequest {
   bool segments = 2;
 }
 
-message ReplicationStatus {
-  repeated FollowerStats followers = 6;
-}
-
 message StatsResponse {
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   IndexRamStats indexing_ram = 3;
+}
+
+message ReplicationCollectionStatus {
+  string name = 1;
+  string source_commit = 2;
+  string serving_commit = 3;
+  string state = 4; // syncing, serving, waiting, stale, orphan, error
+  uint64 bytes_downloaded = 5;
+  uint64 bytes_total = 6;
+  string last_error = 7;
+  uint64 next_retry = 8; // Unix milliseconds; zero when not backing off
+}
+message ReplicationStatus {
+  string source = 1;
+  string follower = 2;
+  optional bool connected = 3;
+  uint64 last_contact = 4; // Unix milliseconds
+  repeated ReplicationCollectionStatus collections = 5;
+  repeated FollowerStats followers = 6;
 }
 
 message FollowerStats {

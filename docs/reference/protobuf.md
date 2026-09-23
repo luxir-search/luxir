@@ -128,6 +128,8 @@ defaults and constraints are described in the comments and guides.
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
 - [`RegexQuery`](#message-luxir.regexquery)
+- [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus)
+- [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`RescoreQuery`](#message-luxir.rescorequery)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
@@ -1182,6 +1184,37 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.regexquery.field"></a>[`field`](#field-luxir.regexquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
 
+<a id="message-luxir.replicationcollectionstatus"></a>
+
+### luxir.ReplicationCollectionStatus
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationcollectionstatus.name"></a>[`name`](#field-luxir.replicationcollectionstatus.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.source_commit"></a>[`source_commit`](#field-luxir.replicationcollectionstatus.source_commit) | 2 | `string` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.serving_commit"></a>[`serving_commit`](#field-luxir.replicationcollectionstatus.serving_commit) | 3 | `string` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.state"></a>[`state`](#field-luxir.replicationcollectionstatus.state) | 4 | `string` | singular | syncing, serving, waiting, stale, orphan, error |
+| <a id="field-luxir.replicationcollectionstatus.bytes_downloaded"></a>[`bytes_downloaded`](#field-luxir.replicationcollectionstatus.bytes_downloaded) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.bytes_total"></a>[`bytes_total`](#field-luxir.replicationcollectionstatus.bytes_total) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.last_error"></a>[`last_error`](#field-luxir.replicationcollectionstatus.last_error) | 7 | `string` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.next_retry"></a>[`next_retry`](#field-luxir.replicationcollectionstatus.next_retry) | 8 | `uint64` | singular | Unix milliseconds; zero when not backing off |
+
+<a id="message-luxir.replicationstatus"></a>
+
+### luxir.ReplicationStatus
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationstatus.source"></a>[`source`](#field-luxir.replicationstatus.source) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationstatus.follower"></a>[`follower`](#field-luxir.replicationstatus.follower) | 2 | `string` | singular |  |
+| <a id="field-luxir.replicationstatus.connected"></a>[`connected`](#field-luxir.replicationstatus.connected) | 3 | `bool` | optional |  |
+| <a id="field-luxir.replicationstatus.last_contact"></a>[`last_contact`](#field-luxir.replicationstatus.last_contact) | 4 | `uint64` | singular | Unix milliseconds |
+| <a id="field-luxir.replicationstatus.collections"></a>[`collections`](#field-luxir.replicationstatus.collections) | 5 | [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus) | repeated |  |
+
 <a id="message-luxir.rescorequery"></a>
 
 ### luxir.RescoreQuery
@@ -1399,6 +1432,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.indexing_ram"></a>[`indexing_ram`](#field-luxir.statsresponse.indexing_ram) | 3 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.statsresponse.followers"></a>[`followers`](#field-luxir.statsresponse.followers) | 4 | [`FollowerStats`](#message-luxir.followerstats) | repeated |  |
+| <a id="field-luxir.statsresponse.replication"></a>[`replication`](#field-luxir.statsresponse.replication) | 5 | [`ReplicationStatus`](#message-luxir.replicationstatus) | singular |  |
 
 <a id="message-luxir.statstotals"></a>
 

@@ -96,3 +96,93 @@ The current snapshot and files still owned by indexing/merges do not count towar
 the retained-byte budget. Over budget, oldest reservations are revoked first.
 One server timer schedules expiry on the task arena, including on idle nodes.
 Reservations, acknowledgments and discovery cursors are process-local.
+
+## Running a follower
+
+```sh
+luxir --replicate-from http://writer:9400 --store.backend=fs --store.data-dir=reader-data
+curl localhost:9400/_replication/status
+curl localhost:9400/_stats
+```
+
+`replication.source` follows the source's entire namespace. The follower takes
+its normal data-directory write lock and starts only with an empty directory or
+one already bound to that URL. The binding and generated follower id persist on
+FS; generated RAM follower ids are new each process. `--replication.follower-id` optionally
+sets the initial id. `--replication.downloads` bounds concurrent collection
+transfers per node (default 2). One independent long-poll keeps discovery and
+liveness active during downloads. Source URLs use HTTP and may include a port;
+paths and credentials in the URL are not supported.
+
+Followers construct no index writers and do not auto-create `main`. Searches
+use ordinary local readers. Updates, schema changes and collection creation are
+rejected. The normal delete-collection API accepts an orphan only after a
+successful, currently connected discovery reports its name absent. Same-boot
+absence deletes automatically; different-boot absence leaves an orphan.
+
+A never-populated source collection does not appear locally. Its first physical
+publication makes it eligible; create, empty commit and schema-only publications
+alone do not. A later empty snapshot of an index that has had physical data is
+eligible. After a source incarnation changes, the follower keeps serving the old
+copy until the new incarnation qualifies and is completely installed. Ineligible
+collections report `waiting`, including never-populated collections.
+
+Files are reused by name, size and xxh3 digest. Connection failures retry with
+Range from the partial offset within the current process; a lost reservation
+restarts from the latest snapshot and keeps fully verified files. Partial-file
+resume across process restarts is not supported. Downloads and checksums run on
+bounded dedicated workers, outside search/indexing workers. Each worker reuses a
+connection and I/O context. Ready collections run longest-waiting first. Failures
+back off per collection from one second to at most 60 seconds. A lost reservation
+restarts immediately unless it repeats without verified-file progress; checksum
+failures retain the other verified files. RAM uses the same
+Directory operations; known-size allocation and storage memory limits are separate
+work.
+
+An installer syncs data and directory entries, opens the candidate reader, then
+writes and syncs its local manifest before swapping readers and acknowledging.
+Writers and followers share `c/<name>/<incarnation>/`. The collection's `CURRENT`
+file selects its incarnation and records the last observed source boot. It is
+written, fsynced, atomically renamed and directory-fsynced only after the new
+root is durable. An interrupted new incarnation leaves the old selection intact.
+A follower directory opens on a writer with `--promote`, or directly on a
+`--read-only` node. The node-level `replication.json` holds only the source URL and follower id.
+
+Obsolete files retire through the snapshot registry. Replacing an incarnation
+cancels old reservations and removes the old directory; admitted searches keep
+their old reader manager and mapped files. Startup discards broken local follower
+collections and fetches them again. Same-incarnation snapshots whose generation
+is not newer than the serving snapshot are refused with `source went backwards`.
+
+Status reports the source URL, follower id, connection state and last contact
+(Unix milliseconds). Each collection reports `source_commit`, `serving_commit`,
+`state` (`syncing`, `serving`, `waiting`, `stale`, `orphan`, or `error`),
+`bytes_downloaded`, `bytes_total`, `last_error`, and `next_retry` (Unix milliseconds,
+zero when no retry is scheduled). `serving_commit` identifies the old copy still
+serving during a download or while waiting for a new incarnation. Byte progress
+counts network bytes for the current attempt; total includes reused files. A
+failed transfer leaves the old reader serving. Inspect and explicitly delete any
+unwanted orphans.
+
+Manual failover: stop the old writer, stop a follower, and start a writer on that
+follower's data directory with `--promote` (omit `--replicate-from`). A writer
+refuses a follower-bound directory without this explicit flag. Promotion republishes every
+collection still marked as a follower in `CURRENT` under a fresh incarnation,
+including empty collections. A failed collection stays unavailable; restart with
+`--promote` to retry it. Already promoted collections keep their identity. The
+source binding is removed only after all collections succeed, and the node logs
+`promoted from follower of <url>`. With no binding, `--promote` has nothing to do.
+Point the other
+followers at the new writer using fresh data directories; an existing follower
+binding deliberately rejects a different URL. A stable source URL can instead
+be repointed to the promoted writer. Followers reuse matching immutable files
+across incarnations (hard links on FS, shared buffers on RAM), downloading only
+files whose name, size or digest changed.
+A read-only node opens the same directory without promotion.
+
+Discovery includes unavailable source collections with `state: "unavailable"`
+and their last commit token when known. Followers retain their local copy and
+report `stale`; unavailability is never interpreted as deletion. Reused HTTP
+connections retry once fresh on EOF, connection reset or broken pipe before any
+response bytes arrive. Read timeouts count as failures.
+Orphan deletion fails immediately while a transfer owns the collection.

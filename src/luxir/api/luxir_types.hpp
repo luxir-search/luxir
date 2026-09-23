@@ -317,8 +317,23 @@ struct FollowerStats {
   uint64_t last_seen = 0;
   std::optional<uint64_t> lag;
 };
+struct ReplicationCollectionStatus {
+  std::string_view name;
+  std::string_view source_commit;
+  std::string_view serving_commit;
+  std::string_view state;
+  uint64_t bytes_downloaded = 0;
+  uint64_t bytes_total = 0;
+  std::string_view last_error;
+  uint64_t next_retry = 0;
+};
 struct ReplicationStatus {
   std::span<const FollowerStats> followers;
+  std::string_view source;
+  std::string_view follower;
+  std::optional<bool> connected;
+  uint64_t last_contact = 0;
+  std::span<const ReplicationCollectionStatus> collections;
 };
 struct StatsResponse {
   StatsTotals totals;
@@ -661,7 +676,7 @@ LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocEr
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
-LUXIR_TD(ReplicationStatus) LUXIR_TD(FollowerStats) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
+LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStats) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(IndexRamStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
@@ -702,7 +717,7 @@ LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
-LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(FollowerStats) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
+LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStats) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(IndexRamStats)

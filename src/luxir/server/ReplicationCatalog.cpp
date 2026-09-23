@@ -10,7 +10,7 @@
 
 namespace luxir {
 namespace {
-struct CatalogCollection { std::string commit; };
+struct CatalogCollection { std::string commit; std::string state; };
 struct CatalogResponse {
   std::string boot;
   std::string cursor;
@@ -135,7 +135,13 @@ std::string ReplicationCatalog::catalog(LuxirNode& node) {
     response.boot = boot;
     response.cursor = boot + ":" + std::to_string(revision);
   }
-  for (const auto& [name, id] : node.replicationCollections()) response.collections.emplace(name, CatalogCollection{id.token()});
+  for (const auto& entry : node.collectionEntries()) {
+    CatalogCollection value{{}, entry.error.empty() ? "available" : "unavailable"};
+    if (auto shard = entry.collection->getShard()) {
+      if (auto snapshot = shard->getSnapshots().snapshot()) value.commit = snapshot->id.token();
+    }
+    response.collections.emplace(entry.name, std::move(value));
+  }
   return glz::write_json(response).value();
 }
 

@@ -3,6 +3,7 @@
 
 #include "luxir/server/ReplicationCatalog.h"
 #include "Stats.h"
+#include "ReplicationFollower.h"
 
 #include <cassert>
 #include <string_view>

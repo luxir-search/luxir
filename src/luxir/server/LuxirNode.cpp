@@ -3,10 +3,12 @@
 
 #include "luxir/server/ReplicationCatalog.h"
 #include "LuxirNode.h"
+#include "ReplicationFollower.h"
+#include "ReplicationState.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/store/Manifest.h"
-#include "luxir/util/Uuid.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/reader/Postings.h"
@@ -67,6 +69,8 @@ LuxirNode::LuxirNode(LuxirConfig config)
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
   // created by createSingletons() take a pointer to the budget.
+  if (this->config.promote && !this->config.replication.source.empty()) throw std::invalid_argument("--promote cannot be combined with --replicate-from");
+  if (this->config.promote && this->config.store.backend == "ram") throw std::invalid_argument("--promote requires the FS backend");
   this->config.resolveRamBudgets();
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
@@ -76,9 +80,11 @@ LuxirNode::LuxirNode(LuxirConfig config)
   preWarmTimeZoneDatabase();
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
+  if (follower) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  if (follower) follower->stop();
 }
 
 std::shared_ptr<Collection> LuxirNode::getCollection(std::string_view name) {
@@ -130,6 +136,7 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(std::string_view na
 }
 
 std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, std::string_view name) {
+  if (following()) return getCollection(library, name);
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
     throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
@@ -177,14 +184,16 @@ std::vector<LuxirNode::CollectionEntry> LuxirNode::collectionEntries() {
 std::map<std::string, CommitId> LuxirNode::replicationCollections() {
   std::map<std::string, CommitId> result;
   for (const auto& entry : collectionEntries()) {
-    if (!entry.error.empty()) continue;
-    if (auto snapshot = entry.collection->getShard()->getSnapshots().snapshot()) result.emplace(entry.name, snapshot->id);
+    if (auto shard = entry.collection->getShard()) {
+      if (auto snapshot = shard->getSnapshots().snapshot()) result.emplace(entry.name, snapshot->id);
+    }
   }
   return result;
 }
 
 std::shared_ptr<Collection> LuxirNode::createCollection(
     Library* library, std::string_view name, const api::SchemaDef* schema) {
+  if (following()) throw ReadOnlyError("cannot create collections on a follower");
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
     throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
@@ -238,6 +247,11 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
 }
 
 void LuxirNode::deleteCollection(std::string_view name) {
+  if (follower) { follower->deleteOrphan(name); return; }
+  deleteLocalCollection(name);
+}
+
+void LuxirNode::deleteLocalCollection(std::string_view name) {
   if (!root) throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
 
   // Empty means the request never named a collection - a malformed request,
@@ -288,11 +302,11 @@ void LuxirNode::deleteCollection(std::string_view name) {
     throw;
   }
 
-  replication->remove(collectionName);
   if (!root->collections.erase(collectionName, tombstone)) {
     throw std::runtime_error(
         "collection '" + collectionName + "' tombstone disappeared during deletion");
   }
+  replication->remove(collectionName);
 }
 
 std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema,
@@ -380,6 +394,51 @@ void LuxirNode::createSingletons() {
 
   root = std::make_shared<Library>();
 
+  if (following()) {
+    if (config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
+    follower = std::make_unique<ReplicationFollower>(*this);
+    return;
+  }
+
+  std::map<std::string, std::string> promotionErrors;
+  // Promotion is a storage operation before any writer opens the replicas.
+  // Hard links retain immutable data without copying it. CURRENT still selects
+  // the old complete snapshot until the new root and directory are durable.
+  if (!config.read_only && config.store.backend == "fs") {
+    FSDirectory metadata(config.store.data_dir);
+    if (auto binding = metadata.openFile("replication.json")) {
+      if (!config.promote) throw std::runtime_error("Follower-bound data directory: use --promote to start a writer");
+      auto state = ReplicationState::read(*binding);
+      for (const auto& name : dirFactory->listDirectories()) {
+        try {
+          auto selection = DirectoryFactory::current(*dirFactory->create(name));
+          if (selection.incarnation.empty()) continue;
+          auto& promoted = state.collections[name].promoted;
+          if (promoted.empty()) {
+            Signal::emit("replicationPromotingCollection", (void*)&name);
+            auto old = dirFactory->create(name + "/" + selection.incarnation);
+            auto next = dirFactory->copySnapshot(name, selection, Manifest::load(*old));
+            promoted = next.incarnation;
+            state.write(metadata);
+          }
+          if (selection.incarnation != promoted) dirFactory->select(name, {promoted});
+        } catch (const std::exception& e) {
+          promotionErrors.emplace(name, "promotion failed: " + std::string(e.what()));
+        }
+      }
+      if (promotionErrors.empty()) {
+        metadata.deleteFile("replication.json");
+        std::array<std::string, 1> directory{"."};
+        metadata.sync(directory);
+        LOG_INFO("promoted from follower of {}", state.source);
+      } else {
+        LOG_WARN("Promotion from follower of {} incomplete; restart with --promote to retry failed collections", state.source);
+      }
+    } else if (config.promote) {
+      LOG_INFO("No follower binding; nothing to promote");
+    }
+  }
+
   // Discover existing collections from the store, or create default "main".
   auto existing = dirFactory->listDirectories();
   bool createDefault = existing.empty();
@@ -388,7 +447,17 @@ void LuxirNode::createSingletons() {
   for (const auto& name : existing) {
     try {
       validateCollectionName(name);
+      if (auto failed = promotionErrors.find(name); failed != promotionErrors.end()) throw std::runtime_error(failed->second);
       if (!createDefault && DirectoryFactory::current(*dirFactory->create(name)).incarnation.empty()) {
+        auto container = dirFactory->create(name);
+        std::vector<Directory::FileInfo> files;
+        container->listFiles(files);
+        auto children = dirFactory->listDirectories(name);
+        if (!config.read_only && files.empty() && std::ranges::all_of(children, isUuid)) {
+          dirFactory->remove(name);
+          LOG_INFO("Removed unselected collection: {}", name);
+          continue;
+        }
         throw std::runtime_error("Collection has no CURRENT");
       }
       root->collections.getOrCreate(name, [&]() {

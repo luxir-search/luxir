@@ -429,7 +429,7 @@ TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
   EXPECT_EQ(incarnation, test::readDurableIndexInfo(existing)->incarnation);
 }
 
-TEST_F(CollectionAdminApiTest, missingCurrentDoesNotCreateOverExistingIndex) {
+TEST_F(CollectionAdminApiTest, missingCurrentDiscardsUnselectedIncarnations) {
   CollectionAdminDataDir data("luxir_collection_unselected");
   auto config = fsConfig(data);
   std::string incarnation;
@@ -439,15 +439,15 @@ TEST_F(CollectionAdminApiTest, missingCurrentDoesNotCreateOverExistingIndex) {
   }
   std::filesystem::remove(data.path() / "c" / "main" / "CURRENT");
   LuxirNode reopened(config);
-  EXPECT_THROW(reopened.getCollection("main"), CollectionUnavailableError);
-  EXPECT_TRUE(std::filesystem::exists(data.path() / "c" / "main" / incarnation / Manifest::name(1)));
+  EXPECT_THROW(reopened.getCollection("main"), CollectionNotFoundError);
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "main"));
 }
 
 TEST_F(CollectionAdminApiTest, emptyUnselectedCollectionIsNotRecreatedAtStartup) {
   CollectionAdminDataDir data("luxir_collection_interrupted_delete");
   FSDirectory empty(data.path() / "c" / "gone");
   LuxirNode node(fsConfig(data));
-  EXPECT_THROW(node.getCollection("gone"), CollectionUnavailableError);
+  EXPECT_THROW(node.getCollection("gone"), CollectionNotFoundError);
   EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "gone" / "CURRENT"));
 }
 

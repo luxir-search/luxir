@@ -34,6 +34,7 @@ class Library;
 class Collection;
 class LuxirNode;
 class ReplicationCatalog;
+class ReplicationFollower;
 
 // Resolving a request's collection target failed.  The concrete subclasses fix
 // the classification; the base is thrown directly only for internal invariants
@@ -109,6 +110,7 @@ public:
   friend class Collection;
   friend class Library;
   friend class LuxirNode;
+  friend class ReplicationFollower;
 };
 
 class Schema;
@@ -150,6 +152,7 @@ public:
 
   friend class Library;
   friend class LuxirNode;
+  friend class ReplicationFollower;
 };
 
 
@@ -167,13 +170,18 @@ private:
   std::string name;
   SharedLazyMap<std::string, Collection> collections;
   friend class LuxirNode;
+  friend class ReplicationFollower;
 };
 
 
 
 class LuxirNode {
   std::shared_ptr<ReplicationCatalog> replication;
+  std::unique_ptr<ReplicationFollower> follower;
+  friend class ReplicationFollower;
 public:
+  ReplicationFollower* getFollower() { return follower.get(); }
+  bool following() const { return !config.replication.source.empty(); }
   ReplicationCatalog& getReplication() { return *replication; }
   static constexpr std::string_view kDefaultCollectionName = "main";
 
@@ -238,6 +246,7 @@ private:
 
   void createSingletons();
   void observeCollection(const std::string& name, Collection& collection);
+  void deleteLocalCollection(std::string_view name);
   std::shared_ptr<Collection> makeCollection(const std::string& name, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema = {},
                                              std::shared_ptr<Directory> directory = {});

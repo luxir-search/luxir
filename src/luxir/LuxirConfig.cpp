@@ -60,6 +60,10 @@ void ReplicationConfig::validate() const {
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
+  app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
+  app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");
+  app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
+  app.add_flag("--promote", promote, "Promote a follower directory to an independent writer");
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
@@ -185,7 +189,7 @@ void LuxirConfig::resolveRamBudgets() {
     // being the search-side caches and reader structures.  A read-only node
     // never indexes, so it carves out nothing (0 is also "unlimited" for the
     // budget object, which is moot when nothing ever reserves against it).
-    index.max_ram_mb = read_only ? 0 : max_ram_mb / 2;
+    index.max_ram_mb = (read_only || !replication.source.empty()) ? 0 : max_ram_mb / 2;
   }
 
   if (index.max_inverter_ram_mb < 0) {
