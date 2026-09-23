@@ -33,10 +33,9 @@ its storage by default.
 A commit makes updates durable and visible to searches. After a crash, Luxir
 reopens the last durable commit. Updates accepted since that commit can be lost.
 
-There is no online snapshot API. For a conservative current backup procedure,
-stop writes, publish a commit, stop the process, and copy the entire data
-directory. Copying the directory while Luxir is writing to it is not a safe
-backup.
+Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
+then `--promote` to restore it as a writer under new collection incarnations.
+Do not restore a raw directory copy over an existing writer identity.
 
 ## Read-only nodes
 
@@ -187,19 +186,12 @@ it does not hash data files. Torn candidates are skipped. Fallback candidates
 also require their referenced files to be present with matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
-Transfer reservations are keyed by `(incarnation, index_gen)` and survive
-individual requests. Clients downloading the same commit share one reservation;
-release revokes that reservation for all of them. `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops`, and
-`pin_budget_drops` report reservation state and policy drops. Retained bytes
-count unique files whose only remaining owners are pins; current-snapshot
-files and files still owned by indexing or merges do not count. The oldest
-reservations are revoked first when the budget is exceeded. Snapshot acquisition renews the reservation; file transfers renew on byte
-progress, at most once per second. A node-wide HTTP server timer checks expiry
-every half idle-timeout on the task arena. Acquire, file open, retirement and
-stats also check expiry; touch only updates the timestamp. Revocation aborts open
-transfers, and each socket write has an idle deadline. Without an HTTP server,
-internal reservations expire on activity. See [replication settings](replication.md).
-Reservations are process-local; writer startup removes leftover unreferenced
+Replication reservation counters are described in the
+[replication reference](replication.md#reference). Every HTTP response has a fixed
+60 s idle deadline per socket write, reset as writes complete. Waiting for a
+query, commit barrier or catalog change does not start a write deadline.
+
+Writer startup removes leftover unreferenced
 index files using the directory listing, without reading their contents. If
 startup falls back below the highest manifest generation, it logs an error and
 skips this sweep, preserving newer files for recovery.
@@ -346,7 +338,10 @@ Engine/server components have drainable shutdown paths, but the current
 them. A normal `SIGTERM`/`SIGINT` therefore terminates the process rather than
 waiting for in-flight requests. Before a planned stop, quiesce producers and
 publish an immediate commit. After an unplanned stop, the filesystem backend
-reopens the last durable commit.
+reopens the last durable commit. If recovery selects an older valid root, a writer
+publishes it under a new incarnation so followers cannot confuse it with an
+older generation of their current source. File retirement does not fsync removals:
+reappearing obsolete files are harmless and a later sweep reclaims them.
 
 At startup, a collection whose top-level index metadata cannot be parsed is
 kept as a tombstone rather than preventing healthy collections from loading.
@@ -362,7 +357,7 @@ features it does not yet supply:
 
 - no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
-- no managed backup/restore workflow (the replication API exports snapshots);
+- no scheduled backups or automatic restore (use `luxir pull` and `--promote`);
 - no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 
@@ -370,8 +365,3 @@ None of these can be enabled by configuration. The pieces those layers will
 build on are already in place: immutable commits, isolated collections,
 transport-independent request messages, and a node-wide scheduler and memory
 model.
-
-Startup orphan cleanup is skipped when root selection falls back from a torn
-newest manifest. A later durable publication removes the invalid roots; the
-next restart then reclaims remaining orphans. Cleanup is shared by snapshot
-owners, so installers can use the same rules.
