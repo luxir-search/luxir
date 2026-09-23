@@ -485,6 +485,9 @@ public:
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
   virtual std::string_view read() = 0;
 
+  // Advisory asynchronous readahead; memory-backed inputs need no work.
+  virtual void prefetch(size_t offset, size_t length) { (void)offset; (void)length; }
+
   virtual InputStream getInputStream() = 0;
 
   friend std::ostream &operator<<(std::ostream &out, InputFile &inf) {

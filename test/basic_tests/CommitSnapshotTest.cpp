@@ -105,6 +105,21 @@ TEST_F(CommitSnapshotTest, idleExpiryIsLazyAndOnlyBytesRenew) {
   EXPECT_EQ(0u, snapshots.stats().pins);
 }
 
+TEST_F(CommitSnapshotTest, reacquireRenewsSharedReservation) {
+  RAMDir dir;
+  auto time = CommitSnapshotRegistry::Clock::now();
+  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; });
+  IndexWriter writer(snapshots);
+  snapshots.setPolicy({100ms, UINT64_MAX});
+  auto first = snapshots.acquire();
+  time += 90ms;
+  EXPECT_EQ(first, snapshots.acquire());
+  time += 90ms;
+  EXPECT_EQ(1u, snapshots.stats().pins);
+  time += 10ms;
+  EXPECT_EQ(0u, snapshots.stats().pins);
+}
+
 TEST_F(CommitSnapshotTest, currentAndSchemaOnlySnapshotsDoNotConsumeBudget) {
   LuxirNode node;
   CollectionHelper h(node, "main");
@@ -117,7 +132,7 @@ TEST_F(CommitSnapshotTest, currentAndSchemaOnlySnapshotsDoNotConsumeBudget) {
   EXPECT_NE(pin->id.index_gen, reader->commitId());
   EXPECT_EQ(0u, w->snapshots.stats().budgetDrops);
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
-  EXPECT_THROW(w->snapshots.openFile(pin->id, "../write.lock"), std::invalid_argument);
+  EXPECT_THROW(w->snapshots.openFile(pin->id, "../write.lock"), ApiError);
   w->snapshots.evictOldest();
   EXPECT_THROW(w->snapshots.openFile(pin->id, pin->files.front().name), SnapshotExpiredError);
   EXPECT_EQ(1, reader->liveDocs());
@@ -317,4 +332,15 @@ TEST_F(CommitSnapshotTest, segmentNamesSurviveEmptySnapshotAndRestart) {
   auto info = readDurableIndexInfo(h.getIndexWriter()->dir);
   EXPECT_EQ(incarnation, info->incarnation);
   EXPECT_GT(info->segments.front().seg_id, oldSegment);
+}
+
+TEST_F(CommitSnapshotTest, observerFailureDoesNotFailDurablePublication) {
+  LuxirNode node;
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  writer->snapshots.onPublish = [](const CommitSnapshot&) { throw std::runtime_error("observer failure"); };
+  auto before = writer->snapshots.snapshot()->id;
+  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  EXPECT_GT(writer->snapshots.snapshot()->id.index_gen, before.index_gen);
+  EXPECT_FALSE(writer->isClosed());
 }

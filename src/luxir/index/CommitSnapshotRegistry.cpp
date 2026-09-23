@@ -11,8 +11,11 @@ namespace luxir {
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
   // No reservation lock: a large acquire or slow file open cannot stall publication.
-  if (opened) readers.installOpened(std::move(snapshot), std::move(opened));
-  else readers.install(std::move(snapshot));
+  if (opened) readers.installOpened(snapshot, std::move(opened));
+  else readers.install(snapshot);
+  try { if (onPublish) onPublish(*snapshot); }
+  catch (const std::exception& e) { LOG_ERROR("Snapshot observer failed: {}", e.what()); }
+  catch (...) { LOG_ERROR("Snapshot observer failed"); }
 }
 
 void CommitSnapshotRegistry::openLocalSnapshot() {
@@ -32,23 +35,62 @@ void CommitSnapshotRegistry::openLocalSnapshot() {
   }
 }
 
-std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire() {
+void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest) {
+  if (!manifest.bytes) return;
+  if (manifest.generation != manifest.highestGeneration) {
+    LOG_ERROR("Recovered snapshot {} below newest generation {}; skipping orphan cleanup",
+              manifest.generation, manifest.highestGeneration);
+    return;
+  }
+  boost::unordered_flat_set<std::string> retained;
+  retained.insert(Manifest::name(manifest.generation));
+  for (const auto& file : snapshot()->files) retained.insert(file.name);
+  std::vector<std::string> obsolete;
+  for (const auto& file : manifest.listing) {
+    if (Manifest::indexFile(file.name) && !retained.contains(file.name)) {
+      obsolete.push_back(file.name);
+    }
+  }
+  retire(obsolete);
+}
+
+std::vector<std::string> CommitSnapshotRegistry::obsoleteFiles(const CommitSnapshot& previous,
+    const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained) {
+  for (const auto& file : next.files) retained.insert(file.name);
+  std::vector<std::string> result;
+  for (const auto& file : previous.files) {
+    if (!retained.contains(file.name)) result.push_back(file.name);
+  }
+  return result;
+}
+
+std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_token* cancellation) {
   std::vector<std::string> retired;
   auto cleanup = scope_guard([&] { unlink(retired); });
   std::lock_guard lock(mutex);
   expireLocked(retired);
   auto commit = current.load();
   if (closed || !commit) throw SnapshotExpiredError();
-  if (reservations.contains(commit->id)) return commit;
+  if (auto it = reservations.find(commit->id); it != reservations.end()) {
+    it->second.lastRead = now();
+    if (cancellation) *cancellation = it->second.cancellation.get_token();
+    return commit;
+  }
+  auto time = now();
+  Reservation reservation{commit, {}, time, time, {}};
+  if (cancellation) *cancellation = reservation.cancellation.get_token();
   size_t added = 0;
   try {
+    // Transfer lookup belongs to the reservation, so local publications pay
+    // nothing for it. Views borrow immutable names from its owning snapshot.
+    reservation.fileNames.reserve(commit->files.size());
     for (const auto& file : commit->files) {
+      reservation.fileNames.insert(file.name);
       auto [it, inserted] = files.try_emplace(file.name, FileRef{file.size});
       it->second.pins++;
       added++;
     }
-    auto time = now();
-    reservations.emplace(commit->id, Reservation{commit, time, time});
+    reservations.emplace(commit->id, std::move(reservation));
   } catch (...) {
     for (size_t i = 0; i < added; i++) {
       auto it = files.find(commit->files[i].name);
@@ -59,7 +101,7 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire() {
   return commit;
 }
 
-std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, std::string_view name) {
+std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation) {
   // Validate against revocation before opening; eviction may then revoke the
   // reservation, but cannot unlink until this in-flight open owns its file.
   std::lock_guard retirementLock(retirementMutex);
@@ -70,10 +112,10 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
     expireLocked(retired);
     auto it = reservations.find(id);
     if (closed || it == reservations.end()) throw SnapshotExpiredError();
-    if (std::ranges::none_of(it->second.snapshot->files,
-        [&](const auto& file) { return file.name == name; })) {
-      throw std::invalid_argument("file is not in the reserved snapshot");
+    if (!it->second.fileNames.contains(name)) {
+      throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the reserved snapshot");
     }
+    if (cancellation) *cancellation = it->second.cancellation.get_token();
   }
   auto file = dir.openFile(name, true);
   if (!file) throw std::runtime_error("reserved snapshot file is missing");
@@ -81,13 +123,12 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
 }
 
 bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {
-  std::vector<std::string> retired;
-  auto cleanup = scope_guard([&] { unlink(retired); });
   std::lock_guard lock(mutex);
-  expireLocked(retired);
   auto it = reservations.find(id);
   if (closed || it == reservations.end()) return false;
-  if (bytes != 0) it->second.lastRead = now();
+  auto time = now();
+  if (time - it->second.lastRead >= policy.idleTimeout) return false;
+  if (bytes != 0) it->second.lastRead = time;
   return true;
 }
 
@@ -105,6 +146,7 @@ void CommitSnapshotRegistry::releaseLocked(const CommitId& id, std::vector<std::
       } else files.erase(it);
     }
   }
+  pin->second.cancellation.request_stop();
   reservations.erase(pin);
 }
 
@@ -260,10 +302,11 @@ void CommitSnapshotRegistry::close() noexcept {
   // Wait out directory access. A release already holding collected names can
   // arrive later, but unlink() will see closed and never touch a reused path.
   std::lock_guard retirementLock(retirementMutex);
-  // Shutdown needs no allocations even when many reservations remain.
+  // Move retained-file bookkeeping out without allocating during cleanup.
   decltype(files) retired;
   {
     std::lock_guard lock(mutex);
+    for (auto& [id, reservation] : reservations) reservation.cancellation.request_stop();
     reservations.clear();
     retired.swap(files);
     counters.retainedBytes = 0;

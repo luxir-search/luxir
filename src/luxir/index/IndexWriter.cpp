@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <typeinfo>
-#include <random>
 
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -24,6 +23,7 @@
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include "luxir/util/heap.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
 #include "VectorIndexBuilder.h"
@@ -33,23 +33,6 @@
 namespace luxir {
 
 namespace {
-
-std::string newIncarnation() {
-  std::random_device random;
-  std::array<uint8_t, 16> bytes;
-  for (auto& byte : bytes) byte = (uint8_t)random();
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  constexpr char hex[] = "0123456789abcdef";
-  std::string uuid;
-  uuid.reserve(36);
-  for (size_t i = 0; i < bytes.size(); i++) {
-    if (i == 4 || i == 6 || i == 8 || i == 10) uuid += '-';
-    uuid += hex[bytes[i] >> 4];
-    uuid += hex[bytes[i] & 15];
-  }
-  return uuid;
-}
 
 void setForceMergeError(UpdateMessage& origin, std::string_view detail) {
   std::string message =
@@ -136,7 +119,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   nextManifestGen = manifest.highestGeneration;
   manifestNames = std::move(manifest.names);
   if (!manifest.bytes) {
-    incarnation = newIncarnation();
+    incarnation = newUuid();
     lastSegId = 0;
   } else {
     std::pmr::monotonic_buffer_resource iiArena;
@@ -202,26 +185,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   } else if (manifest.generation != manifest.highestGeneration) {
     // A recovered older root must not advertise a regressed generation under
     // the old identity.
-    incarnation = newIncarnation();
+    incarnation = newUuid();
     std::pmr::monotonic_buffer_resource arena;
     auto recovered = Manifest::decode(manifest.bytes, arena);
     publish(recovered, arena);
   }
-  // No reservations survive a process restart. Reuse the root selection's
-  // listing to reclaim files left by interrupted commits or expired processes.
-  if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
-    LOG_ERROR("Recovered snapshot {} below newest generation {}; skipping orphan cleanup",
-              manifest.generation, manifest.highestGeneration);
-  } else if (manifest.bytes) {
-    boost::unordered_flat_set<std::string> retained;
-    retained.emplace(Manifest::name(manifest.generation));
-    for (const auto& file : lastSnapshot.load()->files) retained.emplace(file.name);
-    std::vector<std::string> obsolete;
-    for (const auto& file : manifest.listing) {
-      if (Manifest::indexFile(file.name) && !retained.contains(file.name)) obsolete.push_back(file.name);
-    }
-    snapshots.retire(obsolete);
-  }
+  snapshots.sweepOrphans(manifest);
   {
     std::lock_guard<std::mutex> lock(indexMutex);
     seedActiveVectorOverlayNamesFromManifestLocked();
@@ -1932,9 +1901,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   std::pmr::monotonic_buffer_resource retirementArena;
   api::IndexInfo obsolete;
   if (previous) obsolete = Manifest::decode(previous->bytes, retirementArena);
-  auto obsoleteFiles = previous ? std::span<const FileDescriptor>(previous->files) : std::span<const FileDescriptor>();
   boost::unordered_flat_set<std::string> retainedFiles;
-  for (const auto& file : snapshot->files) retainedFiles.insert(file.name);
   if (previous) {
     boost::unordered_flat_set<uint64_t> ownedSegments;
     {
@@ -1996,12 +1963,12 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       commitCount.fetch_add(1, std::memory_order_relaxed);
     }
     lastSnapshot.store(snapshot);
-    snapshots.publish(std::move(snapshot));
+    snapshots.publish(snapshot);
   } catch (...) {
     if (durable) {
       failureReason = std::move(failure);
       failed.store(true, std::memory_order_release);
-      snapshots.readers.close();
+      snapshots.close();
     } else {
       // A failed candidate can be complete but unacknowledged. Its dependencies
       // are durable, so even a crash during cleanup is recoverable. Never reuse
@@ -2022,10 +1989,10 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   // Retirement is best-effort after durability. Reappearing obsolete names
   // after a crash are harmless; the newest root never references them.
   try {
-    for (const auto& file : obsoleteFiles) {
-      if (!retainedFiles.contains(file.name)) {
-        pendingRetirement.push_back(file.name);
-      }
+    if (previous) {
+      auto names = CommitSnapshotRegistry::obsoleteFiles(*previous, *snapshot, std::move(retainedFiles));
+      pendingRetirement.insert(pendingRetirement.end(),
+          std::make_move_iterator(names.begin()), std::make_move_iterator(names.end()));
     }
     std::erase_if(manifestNames, [&](const auto& name) {
       auto gen = Manifest::generationOf(name);
@@ -2692,7 +2659,7 @@ void IndexWriter::testDeleteAllData() {
     // swap or epoch the filter cache before reusing those namespaces.
     lastSegId = 0;
     indexGen = 0;
-    incarnation = newIncarnation();
+    incarnation = newUuid();
     coreGen = 0;
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();

@@ -12,6 +12,8 @@ namespace luxir {
 struct CommitId {
   std::string incarnation;
   uint64_t index_gen = 0;
+  std::string token() const;
+  static CommitId parse(std::string_view token);
   auto operator<=>(const CommitId&) const = default;
 };
 

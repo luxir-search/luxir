@@ -3,12 +3,16 @@
 #pragma once
 
 #include <chrono>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <functional>
 #include <map>
+#include <stop_token>
 #include <unordered_map>
 #include "luxir/search/ReaderManager.h"
 
 namespace luxir {
+
+struct Manifest;
 
 class SnapshotExpiredError : public ApiError {
 public:
@@ -34,8 +38,10 @@ public:
 private:
   struct Reservation {
     std::shared_ptr<const CommitSnapshot> snapshot;
+    boost::unordered_flat_set<std::string_view> fileNames;
     Clock::time_point created;
     Clock::time_point lastRead;
+    std::stop_source cancellation;
   };
   struct FileRef {
     uint64_t size;
@@ -54,6 +60,8 @@ private:
 public:
   Directory& dir;
   ReaderManager readers;
+  // Set once by the collection before admitting requests.
+  std::function<void(const CommitSnapshot&)> onPublish;
 private:
   void releaseLocked(const CommitId& id, std::vector<std::string>& retired);
   void expireLocked(std::vector<std::string>& retired);
@@ -68,9 +76,14 @@ public:
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::shared_ptr<const CommitSnapshot> snapshot() const { return current.load(); }
   void openLocalSnapshot();
+  void sweepOrphans(const Manifest& manifest);
+  static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
+      const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained = {});
   // Reservations outlive requests and are shared by all clients of a commit.
-  std::shared_ptr<const CommitSnapshot> acquire();
-  std::shared_ptr<InputFile> openFile(const CommitId& id, std::string_view name);
+  // Stop callbacks run under the reservation mutex: only schedule cancellation;
+  // never re-enter the registry or perform I/O from a callback.
+  std::shared_ptr<const CommitSnapshot> acquire(std::stop_token* cancellation = nullptr);
+  std::shared_ptr<InputFile> openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation = nullptr);
   bool touch(const CommitId& id, uint64_t bytes);
   bool evictOldest();
   void setPolicy(Policy value);

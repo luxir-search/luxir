@@ -37,6 +37,13 @@ public:
 
   size_t size() override { return sz_; }
 
+  void prefetch(size_t offset, size_t length) override {
+    if (offset >= sz_ || length == 0) return;
+    static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    size_t start = offset / pageSize * pageSize;
+    (void)madvise(data_ + start, offset - start + std::min(length, sz_ - offset), MADV_WILLNEED);
+  }
+
   std::string_view read() override {
     return {data_, sz_};
   }
